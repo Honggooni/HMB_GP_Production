@@ -19,10 +19,3 @@
 - 배포물은 `resources/build_release.py`로 생성한
   `HMB_GP_Production.zip`, `release-manifest.json`, `SHA256SUMS` 세 파일을
   함께 관리합니다.
-- 같은 소스의 연속 빌드는 동일한 ZIP SHA-256을 생성해야 합니다.
-- `resources/tests/HMB_Public_Release_Security_Regression.py`로 API 키,
-  자격 증명 파일, 정책 payload, private key, 로컬 생성물 및 금지 경로가
-  ZIP에 없는지 확인합니다.
-- 정책을 변경할 때는 offline signing-key 보관소에서 서명하거나 명시적인
-  public-key rotation 절차를 사용합니다. RSA 공개키는 암호화 또는
-  복호화 키가 아니라 무결성 검증용입니다.
