@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.14 - 2026-08-05
+
+- Made server-searched MP4 imports publish a verified active-project copy even
+  when no Maya scene is open. Picker cards and the main viewport now stream that
+  local project copy instead of an inaccessible UNC/file URL.
+- Treated explicit absolute and UNC video paths as filesystem authorities during
+  media validation, preventing readable server references from being incorrectly
+  resolved as missing active-project files.
+- Added an Activity Log horizontal scrollbar, preserved its position during
+  state refreshes, and kept long one-line diagnostics horizontally inspectable.
+
 ## 0.5.13 - 2026-08-05
 
 - Revalidated every selected local/project video before Picker publication.

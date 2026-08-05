@@ -38,6 +38,12 @@ with tempfile.TemporaryDirectory() as temporary:
     local_video = temporary_path / "verified-local.mp4"
     local_video.write_bytes(b"\x00\x00\x00\x18ftypmp42verified-local")
 
+    # Explicit filesystem paths are authorities in their own right and must
+    # not be reinterpreted as active-project-relative paths.
+    resolved_absolute = picker._resolve_readable_video_reference(str(local_video))
+    assert resolved_absolute is not None
+    assert resolved_absolute.resolve() == local_video.resolve()
+
     # A valid project macro remains the emitted authority, not its expanded
     # machine-specific path.
     project_macro = "inputs/videos/verified-project.mp4"

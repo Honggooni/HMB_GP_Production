@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.5.13"
+EXPECTED_RELEASE_VERSION = "0.5.14"
 EXPECTED_POLICY_VERSION = "2026-08-01.goal-final-authority.v2"
 EXPECTED_CONTRACT_SHA256 = "a17809e4103628c1b0ab0b96081f6325faf9d16703a5fac57ef7d1eaa7d043bf"
 BASE_MASTER_SEEDS = (

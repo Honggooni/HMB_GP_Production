@@ -321,8 +321,8 @@ assert len({item["video_uid"] for item in appended_again["videos"]}) == 3
 
 
 # MP4 import is an append-only catalog operation. With no Maya scene selected,
-# it keeps the user's exact source file in place and can add that source more
-# than once as separately identified history records.
+# it preserves the user's source as provenance while still publishing a browser-
+# playable copy into the active Griptape project for every history record.
 assert callable(picker._choose_video_asset_file)
 assert callable(getattr(picker.HMBVideoPickerLibrary, "_import_video_asset", None))
 picker_source = MODULE_PATH.read_text(encoding="utf-8")
@@ -362,16 +362,38 @@ with tempfile.TemporaryDirectory(
         else:
             os.environ["HMB_VIDEO_ASSET_TEST_SELECTION"] = prior_test_selection
 
-    imported_once = node._import_video_asset(
-        picker._parse_state({"videos": []}),
-        source_mp4,
-        label="User Reference",
-    )
-    imported_twice = node._import_video_asset(
-        imported_once,
-        source_mp4,
-        label="User Reference Take 2",
-    )
+    project_copies = []
+
+    def copy_to_test_project(
+        _node,
+        path,
+        _slot,
+        *,
+        transaction_records=None,
+        backup_folder=None,
+    ):
+        assert transaction_records is not None
+        assert backup_folder is not None
+        target = Path(temporary) / f"project_copy_{len(project_copies) + 1}.mp4"
+        target.write_bytes(Path(path).read_bytes())
+        project_copies.append(target)
+        return type("Artifact", (), {"meta": {"source": "test-project"}})(), str(target)
+
+    original_project_copy = picker._copy_video_to_griptape_project
+    picker._copy_video_to_griptape_project = copy_to_test_project
+    try:
+        imported_once = node._import_video_asset(
+            picker._parse_state({"videos": []}),
+            source_mp4,
+            label="User Reference",
+        )
+        imported_twice = node._import_video_asset(
+            imported_once,
+            source_mp4,
+            label="User Reference Take 2",
+        )
+    finally:
+        picker._copy_video_to_griptape_project = original_project_copy
     imported_records = [
         item
         for item in imported_twice["videos"]
@@ -388,6 +410,14 @@ with tempfile.TemporaryDirectory(
         item["video_path"] == expected_source_path
         and item["import_source_path"] == expected_source_path
         for item in imported_records
+    )
+    assert len(project_copies) == 2
+    assert [Path(item["project_video_path"]).resolve() for item in imported_records] == [
+        path.resolve() for path in project_copies
+    ]
+    assert all(
+        project_copies[index].name in item["video_url"]
+        for index, item in enumerate(imported_records)
     )
     assert source_mp4.read_bytes() == source_bytes
 

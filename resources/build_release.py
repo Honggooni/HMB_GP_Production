@@ -16,7 +16,7 @@ from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_VERSION = "0.5.13"
+RELEASE_VERSION = "0.5.14"
 POLICY_VERSION = "2026-08-01.goal-final-authority.v2"
 CONTRACT_SHA256 = "a17809e4103628c1b0ab0b96081f6325faf9d16703a5fac57ef7d1eaa7d043bf"
 AGENT_POLICY_PATH_ENV = "HMB_AGENT_POLICY_PATH"

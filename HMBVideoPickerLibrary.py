@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -6167,14 +6168,30 @@ def _resolve_readable_video_reference(value: Any) -> Optional[Path]:
     text = _clean(value)
     if not text or _is_remote_video_reference(text):
         return None
-    try:
-        from griptape_nodes.files.file import File  # type: ignore
+    parsed = urlparse(text)
+    is_explicit_path = bool(
+        parsed.scheme.lower() == "file"
+        or Path(text).is_absolute()
+        or re.match(r"^[A-Za-z]:[\\/]", text)
+        or text.startswith(("\\\\", "//"))
+    )
+    if is_explicit_path:
+        # Absolute local and UNC paths are already authoritative. Sending them
+        # through Griptape's project File resolver can reinterpret a server
+        # share as a project-relative path and incorrectly report it missing.
+        try:
+            resolved = _norm_path(text)
+        except Exception:
+            return None
+    else:
+        try:
+            from griptape_nodes.files.file import File  # type: ignore
 
-        resolved = Path(File(text).resolve())
-    except Exception:
-        # Relative project paths must never fall back to the process working
-        # directory. Griptape's File resolver is the active-project authority.
-        return None
+            resolved = Path(File(text).resolve())
+        except Exception:
+            # Relative project paths must never fall back to the process working
+            # directory. Griptape's File resolver is the active-project authority.
+            return None
     try:
         if not resolved.is_file() or resolved.stat().st_size <= 0:
             return None
@@ -10575,17 +10592,19 @@ class HMBVideoPickerLibrary(DataNode):
         )
         local_video = source
         project_video_path = ""
+        preview_video = source
         video_metadata: Dict[str, Any] = {}
         import_warning = ""
+        token = hashlib.sha1(
+            f"import|{source}|{time.time_ns()}|{uuid.uuid4().hex}".encode(
+                "utf-8"
+            )
+        ).hexdigest()[:12]
+        output_folder: Optional[Path] = None
         if scene_text:
             scene_path = _norm_path(scene_text)
             if scene_path.is_file() and scene_path.suffix.lower() in {".ma", ".mb"}:
                 output_folder = _ensure_scene_output_folder(scene_path)
-                token = hashlib.sha1(
-                    f"import|{source}|{time.time_ns()}|{uuid.uuid4().hex}".encode(
-                        "utf-8"
-                    )
-                ).hexdigest()[:12]
                 target = output_folder / (
                     f"{_safe_scene_name(source.stem)}_import_{token}.mp4"
                 )
@@ -10595,50 +10614,65 @@ class HMBVideoPickerLibrary(DataNode):
                     )
                 shutil.copy2(source, target)
                 local_video = target
-                backup_folder = (
-                    output_folder
-                    / ".hmb_video_picker"
-                    / f"import_video_{token}"
+
+        # Browser media elements cannot reliably play a UNC/file URL selected
+        # from a server search. Always publish an active-project copy, even when
+        # no Maya scene is open, and serve that verified local copy instead.
+        backup_folder = (
+            output_folder / ".hmb_video_picker" / f"import_video_{token}"
+            if output_folder is not None
+            else Path(tempfile.gettempdir()).resolve()
+            / ".hmb_video_picker"
+            / f"import_video_{token}"
+        )
+        _assert_safe_private_path(backup_folder)
+        project_records: List[tuple[Path, Path, bool]] = []
+        try:
+            project_artifact, project_video_path = _copy_video_to_griptape_project(
+                self,
+                local_video,
+                1,
+                transaction_records=project_records,
+                backup_folder=backup_folder,
+            )
+            video_metadata = dict(getattr(project_artifact, "meta", {}) or {})
+            resolved_project_video = _resolve_readable_video_reference(
+                project_video_path
+            )
+            if resolved_project_video is None:
+                raise RuntimeError(
+                    "The active-project video copy could not be read after publication."
                 )
-                project_records: List[tuple[Path, Path, bool]] = []
-                try:
-                    project_artifact, project_video_path = (
-                        _copy_video_to_griptape_project(
-                            self,
-                            local_video,
-                            1,
-                            transaction_records=project_records,
-                            backup_folder=backup_folder,
-                        )
-                    )
-                    video_metadata = dict(
-                        getattr(project_artifact, "meta", {}) or {}
-                    )
-                except Exception as exc:
-                    # The immutable shot-local copy is still a valid catalog
-                    # asset when no Griptape project is open or project copy is
-                    # unavailable. Keep that useful result and report the copy.
-                    project_video_path = ""
-                    import_warning = (
-                        "Imported MP4 was retained shot-locally because the "
-                        "optional Griptape project copy failed: "
-                        f"{_clean(exc) or exc.__class__.__name__}"
-                    )
-                finally:
-                    try:
-                        if backup_folder.is_dir():
-                            _safe_remove_private_tree(backup_folder)
-                    except Exception as exc:
-                        _diagnostic_exception(
-                            "Imported-video transaction cleanup failed",
-                            exc,
-                        )
+            preview_video = resolved_project_video
+        except Exception as exc:
+            # Preserve the immutable source/shot-local asset for recovery and
+            # downstream absolute-path use, but report that browser playback is
+            # unavailable until a project copy can be created.
+            if project_records:
+                HMBVideoPickerLibrary._restore_playblast_bundle(project_records)
+            project_video_path = ""
+            preview_video = local_video
+            import_warning = (
+                "Imported MP4 was retained at its source location because the "
+                "active Griptape project copy failed; browser playback may be "
+                "unavailable: "
+                f"{_clean(exc) or exc.__class__.__name__}"
+            )
+        finally:
+            try:
+                if backup_folder.is_dir():
+                    _safe_remove_private_tree(backup_folder)
+            except Exception as exc:
+                _diagnostic_exception(
+                    "Imported-video transaction cleanup failed",
+                    exc,
+                )
 
         item = {
             "video_path": str(local_video.resolve()).replace("\\", "/"),
             "project_video_path": project_video_path,
             "video_metadata": video_metadata,
-            "video_url": _external_media_url(local_video),
+            "video_url": _external_media_url(preview_video),
             "scene_path": scene_text,
             "markers": [],
             "generation_role": "imported",
