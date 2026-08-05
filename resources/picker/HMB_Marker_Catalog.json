@@ -1,0 +1,42 @@
+{
+  "schema": "hmb-marker-catalog",
+  "version": 4,
+  "character": [
+    {"name": "Red", "kind": "solid", "rgb": [1.0, 0.0, 0.0]},
+    {"name": "Green", "kind": "solid", "rgb": [0.0, 1.0, 0.0]},
+    {"name": "Blue", "kind": "solid", "rgb": [0.0, 0.0, 1.0]},
+    {"name": "Yellow", "kind": "solid", "rgb": [1.0, 0.90, 0.0]},
+    {"name": "Orange", "kind": "solid", "rgb": [1.0, 0.52, 0.18]},
+    {"name": "Purple", "kind": "solid", "rgb": [0.57, 0.28, 1.0]},
+    {"name": "Pink", "kind": "solid", "rgb": [0.91, 0.30, 0.57]}
+  ],
+  "background": [
+    {"name": "Sky Blue", "kind": "solid", "rgb": [0.36, 0.72, 1.0]},
+    {"name": "Mint", "kind": "solid", "rgb": [0.40, 0.92, 0.73]},
+    {"name": "Beige", "kind": "solid", "rgb": [0.86, 0.78, 0.64]},
+    {
+      "name": "Direction Checker",
+      "kind": "pattern",
+      "pattern": "direction_checker",
+      "screen_space_id_rgb": [255, 0, 255]
+    },
+    {
+      "name": "Sky Grid",
+      "kind": "pattern",
+      "pattern": "sky_grid",
+      "screen_space_id_rgb": [0, 255, 255]
+    },
+    {
+      "name": "Floor Grid",
+      "kind": "pattern",
+      "pattern": "floor_grid",
+      "screen_space_id_rgb": [255, 255, 255]
+    },
+    {
+      "name": "Position Pattern",
+      "kind": "pattern",
+      "pattern": "position_pattern",
+      "screen_space_id_rgb": [0, 255, 127]
+    }
+  ]
+}

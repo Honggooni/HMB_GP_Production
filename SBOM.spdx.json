@@ -1,0 +1,76 @@
+{
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "name": "HMB_GP_Production-0.5.13",
+  "documentNamespace": "https://hmb.local/spdx/HMB_GP_Production/0.5.13",
+  "creationInfo": {
+    "created": "2026-08-05T00:00:00Z",
+    "creators": ["Organization: HMB Pipeline", "Tool: Codex release audit"]
+  },
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-HMB-GP-Production",
+      "name": "hmb-gp-production",
+      "versionInfo": "0.5.13",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "LicenseRef-HMB-Internal-1.0",
+      "licenseDeclared": "LicenseRef-HMB-Internal-1.0",
+      "copyrightText": "Copyright (c) 2026 HMB Pipeline"
+    },
+    {
+      "SPDXID": "SPDXRef-Pillow",
+      "name": "Pillow",
+      "versionInfo": "12.3.0",
+      "downloadLocation": "https://pypi.org/project/Pillow/12.3.0/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT-CMU",
+      "licenseDeclared": "MIT-CMU",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "SPDXID": "SPDXRef-imageio-ffmpeg",
+      "name": "imageio-ffmpeg",
+      "versionInfo": "0.6.0",
+      "downloadLocation": "https://pypi.org/project/imageio-ffmpeg/0.6.0/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-2-Clause",
+      "licenseDeclared": "BSD-2-Clause",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "SPDXID": "SPDXRef-httpx",
+      "name": "httpx",
+      "versionInfo": "0.28.1",
+      "downloadLocation": "https://pypi.org/project/httpx/0.28.1/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "SPDXID": "SPDXRef-volcengine-tos",
+      "name": "tos",
+      "versionInfo": "2.9.2",
+      "downloadLocation": "https://pypi.org/project/tos/2.9.2/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "copyrightText": "NOASSERTION"
+    }
+  ],
+  "relationships": [
+    {"spdxElementId": "SPDXRef-DOCUMENT", "relationshipType": "DESCRIBES", "relatedSpdxElement": "SPDXRef-HMB-GP-Production"},
+    {"spdxElementId": "SPDXRef-HMB-GP-Production", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-Pillow"},
+    {"spdxElementId": "SPDXRef-HMB-GP-Production", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-imageio-ffmpeg"},
+    {"spdxElementId": "SPDXRef-HMB-GP-Production", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-httpx"},
+    {"spdxElementId": "SPDXRef-HMB-GP-Production", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-volcengine-tos"}
+  ],
+  "hasExtractedLicensingInfos": [
+    {
+      "licenseId": "LicenseRef-HMB-Internal-1.0",
+      "extractedText": "Internal use, copy and modification are permitted only for personnel and contractors explicitly authorized by HMB Pipeline or Composite Team. External redistribution requires prior written permission."
+    }
+  ]
+}

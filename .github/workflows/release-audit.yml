@@ -1,0 +1,104 @@
+name: release-audit
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+jobs:
+  windows-release-audit:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Reject private or generated tracked content
+        shell: pwsh
+        run: |
+          $tracked = @(git ls-files)
+          $forbidden = @($tracked | Where-Object {
+            $_ -match '(^|/)(\.tmp|\.venv|backups|dist|GriptapeNodes|resources/agent|resources/policy)/' -or
+            $_ -match '(^|/)hmb_agent_core\.dat$' -or
+            $_ -match '(^|/)\.env($|\.)' -or
+            $_ -match '(^|/)(credentials|secrets)[^/]*\.json$' -or
+            $_ -match '(^|/)(id_rsa|id_ed25519)[^/]*$' -or
+            $_ -match '\.(jwk|key|p12|pem|pfx|secret|token|zip)$'
+          })
+          if ($forbidden.Count -ne 0) {
+            throw "Forbidden private/generated tracked paths: $($forbidden -join ', ')"
+          }
+      - name: Install pinned direct dependencies
+        run: python -m pip install "Pillow==12.3.0" "imageio-ffmpeg==0.6.0" "httpx==0.28.1" "tos==2.9.2"
+      - name: PowerShell policy administration syntax
+        shell: pwsh
+        run: |
+          $scripts = @(
+            "resources/admin/Configure_HMB_Agent_Policy_Share.ps1",
+            "resources/admin/Test_HMB_Agent_Policy_Share.ps1",
+            "resources/admin/Finalize_HMB_Agent_Policy_Migration.ps1"
+          )
+          foreach ($script in $scripts) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script).Path,
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -ne 0) { throw "PowerShell parse failed: $script" }
+          }
+      - name: Python release regressions
+        shell: pwsh
+        env:
+          HMB_IMAGE_PROJECTS_ROOT: ${{ github.workspace }}
+        run: |
+          # Policy-content and live-host regressions run only on internal hosts
+          # configured with HMB_AGENT_POLICY_PATH and Griptape Nodes.
+          $tests = @(
+            "HMB_External_Policy_Boundary_Regression.py",
+            "HMB_Agent_Policy_Share_Security_Regression.py",
+            "HMB_State_Normalization_Property_Regression.py",
+            "HMB_Image_Asset_Import_Order_Regression.py",
+            "HMB_Image_Asset_Resolved_Selection_Regression.py",
+            "HMB_Prompt_No_Loss_Connection_Regression.py",
+            "HMB_Image_Asset_Registration_Regression.py",
+            "HMB_Image_Asset_Server_Sharing_Regression.py",
+            "HMB_Image_Asset_Process_Lock_Regression.py",
+            "HMB_Cutout_Transparency_Regression.py",
+            "HMB_Depth_Companion_Regression.py",
+            "HMB_Depth_Visual_Contract_Regression.py",
+            "HMB_Maya_Runner_Performance_Regression.py",
+            "HMB_Mouth_Card_Inner_Patch_Regression.py",
+            "HMB_Motion_Guide_Regression.py",
+            "HMB_Picker_State_Compaction_Regression.py",
+            "HMB_VideoPicker_Media_Availability_Regression.py",
+            "HMB_VideoPicker_High_Quality_Original_Regression.py",
+            "HMB_VideoPicker_Reliability_Regression.py",
+            "HMB_Typed_Auxiliary_Video_Slots_Regression.py"
+          )
+          foreach ($test in $tests) {
+            python (Join-Path "resources/tests" $test)
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: JavaScript widget regressions
+        shell: pwsh
+        run: |
+          Get-ChildItem resources/tests -Filter "*.mjs" | Sort-Object Name | ForEach-Object {
+            node $_.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Reproducible release build
+        shell: pwsh
+        run: |
+          python resources/build_release.py
+          $first = (Get-FileHash dist/HMB_GP_Production.zip -Algorithm SHA256).Hash
+          python resources/build_release.py
+          $second = (Get-FileHash dist/HMB_GP_Production.zip -Algorithm SHA256).Hash
+          if ($first -ne $second) { throw "Release ZIP is not reproducible." }
+          python resources/tests/HMB_Public_Release_Security_Regression.py

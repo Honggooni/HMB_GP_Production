@@ -1,0 +1,351 @@
+{
+  "name": "HMB_GP_Production",
+  "library_schema_version": "0.10.0",
+  "metadata": {
+    "author": "HMB Pipeline",
+    "description": "HMB_GP_Production provides four independently usable, composable core libraries for image assets, Maya playblast, prompt design, and a generator-neutral Agent, plus the existing HMB Seedance 2.0 generator upgraded for direct Volcengine Ark execution. Every one-, two-, three-, and four-core-library combination is valid. HMBPromptLibrary is the single canonical integration parent: it accepts arbitrary readable sources in four equal Prompt modes, while HMBAgentLibrary activates HMB automation only from its exact direct PROMPT_OUT edge. HMB Seedance retains its node identity, accepts Image Asset Library and Video Picker ordered selections through one list port each, keeps hidden scalar-video fallbacks for saved workflows, and retains its audio list. It uses ARK_API_KEY only from Griptape Secrets, can publish local video references through either its existing storage path or a private Volcengine TOS bucket with temporary signed HTTPS URLs, submits each billable Ark create POST at most once, polls tasks, and immediately saves the signed result as a local MP4. Only this HMB generator writes its hidden, per-login monthly usage ledger; task events are durably queued locally, de-duplicated by task ID, and atomically synchronized without prompts, credentials, or media URLs. Its property-only result preview and sole VIDEO_OUT connector share one artifact, and Status includes GET-only refresh/recovery. Volcengine limits are enforced before submission: nine images, three videos, and three audio references. Connections add optional evidence and synchronization without creating prerequisites; the user's goal remains the final authority.",
+    "library_version": "0.5.13",
+    "engine_version": "0.93.0",
+    "tags": [
+      "Griptape",
+      "HMB",
+      "Production",
+      "Maya",
+      "Prompt",
+      "Library",
+      "CustomWidget",
+      "PromptOut",
+      "PromptOnlyDashboard",
+      "RoleBinding",
+      "ManualImageSlots",
+      "HMBImageAssetLibrary",
+      "ProjectImageAssetTree",
+      "ProjectCatalogDiscovery",
+      "ProjectScopedUserImports",
+      "ManifestBackedAssetRegistration",
+      "AssetPassport",
+      "OrderedImageMediaOutput",
+      "SharedImageTaxonomy",
+      "PromptOptionalImageGuidance",
+      "VideoAssetCatalog",
+      "StableSourceIDs",
+      "ColorPickMarkers",
+      "UserOrderedVideoSelection",
+      "AuxiliaryVideoRoles",
+      "KeepOutRules",
+      "VIDEO_VFX",
+      "HMBVideoPickerLibrary",
+      "MayaAutoDetect",
+      "ExactSourceTiming",
+      "HighQualityBT709Proxy",
+      "MarkerCatalog14",
+      "TransactionalPlayblast",
+      "TypedAuxiliaryVideoAssets",
+      "AppendOnlyVideoHistory",
+      "StableVideoUIDs",
+      "Max10VideoSelection",
+      "RowMajorVideoOrder",
+      "SingleVideoListOutput",
+      "MP4VideoImport",
+      "MetadataOnlyVideoDelete",
+      "ColorPlayblastProxyAppearanceScope",
+      "AssignedVisibleOnlyPlayblast",
+      "AuthoredMayaVisibility",
+      "PickerEyeExclusion",
+      "AuthoredReferenceState",
+      "PerArtifactAtomicMayaPublish",
+      "ZeroPaddedCreateNewCompatibility",
+      "KoreanLabels",
+      "ExactIdentifierPreservation",
+      "OriginalPlayblast",
+      "OriginalAuthoredViewport",
+      "BestEffortViewportQuality",
+      "BestEffortSmoothPreview3",
+      "ScreenSpacePatterns",
+      "UVIndependentPatterns",
+      "PairedDepthPlayblast",
+      "DynamicDepthCompanion",
+      "CameraSpaceDepth",
+      "DepthV7",
+      "CutoutAlphaPreservation",
+      "MotionGuideV5",
+      "BlendShapeFaceSemantics",
+      "NurbsCurveControllerProvenance",
+      "VisibleFaceLandmarks",
+      "IndependentAuxiliaryPublish",
+      "FFprobeValidation",
+      "NoBoundingBoxFallback",
+      "PreserveAuthoredMayaProxy",
+      "AuxiliaryWithoutColorAssignment",
+      "DepthSurfaceScope",
+      "MouthCardInnerPatch",
+      "CompactActivityLog",
+      "MotionGuideSidecarFrames",
+      "OptionalArtifactFailureIsolation",
+      "NativeAgentWithoutHMBPrompt",
+      "CanonicalHMBPolicyFailClosed",
+      "NestedPropReferences",
+      "LazyOriginalPlayblast",
+      "FrameSnapshot",
+      "VideoTransportControls",
+      "MayaOnlyPicker",
+      "GeneratorNeutralAgent",
+      "FourRuleBehaviors",
+      "GoalFirstShotComposition",
+      "ControlOnlyBindings",
+      "NonBlockingSourceNormalization",
+      "SignedExternalPolicy",
+      "CompactPublicPrompt",
+      "FinalTextBoundary",
+      "AgentStateChainOnly",
+      "IndependentLibraryOperation",
+      "ComposableHybridWorkflow",
+      "SubsetSafeAutomation",
+      "FullFourLibraryAutomation",
+      "All15LibraryCombinations",
+      "OptionalSourceConnections",
+      "GoalFirstGeneration",
+      "NoConnectionPrerequisites",
+      "PromptFourModes",
+      "PromptAssetImageAddLock",
+      "CanonicalPromptParent",
+      "ExactPromptEdgeAgentPolicy",
+      "KeyboardDeleteProtection",
+      "InstantColorAssignment",
+      "HMBSeedance20VideoGeneration",
+      "VolcengineArk",
+      "DirectArkTransport",
+      "SecureArkAPIKey",
+      "SingleWireReferenceImages",
+      "SingleWireVideoReferences",
+      "ReferenceImageCapacity9",
+      "VideoReferenceCapacity3",
+      "AudioReferenceCapacity3",
+      "ImmediateLocalMP4",
+      "ResumableArkTask",
+      "StreamingSignedDownload",
+      "DownloadSSRFGuard",
+      "TemporaryVideoPublication",
+      "SeparateGriptapeCloudKey",
+      "VolcengineTOSUpload",
+      "SeedanceStandard4K",
+      "SingleVideoPreview",
+      "GetOnlyTaskRecovery",
+      "AmbiguousSubmissionSafety",
+      "PrivatePerUserMonthlyUsageLedger",
+      "OfflineUsageQueue",
+      "AtomicUsageLedger"
+    ],
+    "dependencies": {
+      "pip_dependencies": [
+        "imageio-ffmpeg==0.6.0",
+        "Pillow==12.3.0",
+        "httpx==0.28.1"
+      ]
+    },
+    "declarations": [
+      {
+        "type": "worker_mode_compatibility",
+        "compatibility": "INCOMPATIBLE"
+      },
+      {
+        "type": "suggested_worker_mode",
+        "mode": "ORCHESTRATOR"
+      }
+    ]
+  },
+  "settings": [
+    {
+      "description": "The HMB Seedance 2.0 node reads the user-owned Volcengine Ark API key from Griptape Secrets at execution time. Local reference videos may use either the existing separately scoped storage key or a least-privilege Volcengine TOS IAM key and private bucket. Secret values are never stored in node parameters, outputs, logs, manifests, or release archives.",
+      "category": "app_events.on_app_initialization_complete",
+      "contents": {
+        "secrets_to_register": {
+          "ARK_API_KEY": "",
+          "GT_CLOUD_API_KEY": "",
+          "GT_CLOUD_BUCKET_ID": "",
+          "TOS_ACCESS_KEY_ID": "",
+          "TOS_SECRET_ACCESS_KEY": "",
+          "TOS_BUCKET_NAME": ""
+        }
+      }
+    }
+  ],
+  "categories": [
+    {
+      "HMB_GP_Production": {
+        "color": "border-purple-500",
+        "title": "HMB_GP_Production",
+        "description": "HMB_GP_Production nodes",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "HMBAgentLibrary",
+      "file_path": "HMBAgentLibrary.py",
+      "metadata": {
+        "category": "HMB_GP_Production",
+        "description": "Native Griptape Agent that remains a stock Standard Library Agent for every request not directly connected from the exact registered HMBPromptLibrary PROMPT_OUT port. That one canonical edge requires runtime-only injection of four project rules plus four shot rules; copied text, Image Asset, Video Picker, relays, and look-alike nodes cannot activate it. Prompt-only, Prompt-plus-Asset, Prompt-plus-Picker, and Prompt-plus-both are equally valid because the Agent never identifies or requires upstream siblings. If the canonical edge exists but the signed policy is missing or invalid, execution stops with a visible configuration error before any native Agent or model call. FINAL TEXT remains protected from private Agent state while valid runs retain the downstream model, tools, memory, schema, and native execution path.",
+        "display_name": "HMBAgentLibrary"
+      }
+    },
+    {
+      "class_name": "HMBImageAssetLibrary",
+      "file_path": "HMBImageAssetLibrary.py",
+      "metadata": {
+        "category": "HMB_GP_Production",
+        "description": "Project image asset library using the canonical _hmb_common.py optional Main Type and Sub Type taxonomy. The compact Project Set and reload controls discover direct-child project folders. Scanned images remain unregistered until the Add passport writes a validated project manifest entry with Image Name and Asset ID; Main Type and Sub Type are optional metadata. Optional IMAGE_IMPORT_IN media remains ordinary external media and can be used immediately; Add requires an existing child Asset Folder and copies the image directly there without creating an Asset ID directory. The ordered selection tray keeps ASSET_OUT metadata and Video Generation Out media aligned without imposing a Prompt or other-library prerequisite.",
+        "display_name": "HMBImageAssetLibrary",
+        "width": 1400,
+        "height": 1200,
+        "default_width": 1400,
+        "default_height": 1200,
+        "preferred_width": 1400,
+        "preferred_height": 1200,
+        "initial_width": 1400,
+        "initial_height": 1200,
+        "min_width": 760,
+        "min_height": 560,
+        "resizable": true,
+        "ui_options": {
+          "width": 1400,
+          "height": 1200,
+          "default_width": 1400,
+          "default_height": 1200,
+          "preferred_width": 1400,
+          "preferred_height": 1200,
+          "initial_width": 1400,
+          "initial_height": 1200,
+          "min_width": 760,
+          "min_height": 560,
+          "resizable": true
+        }
+      }
+    },
+    {
+      "class_name": "HMBSeedance20VideoGeneration",
+      "file_path": "HMBSeedance20VideoGeneration.py",
+      "metadata": {
+        "category": "HMB_GP_Production",
+        "description": "The existing HMB Seedance 2.0 node upgraded in place to the official Volcengine Ark asynchronous API. It submits each billable POST /contents/generations/tasks at most once, polls GET /contents/generations/tasks/{id}, immediately streams content.video_url to a bounded local MP4, and publishes one property-only preview plus the sole VIDEO_OUT connector. Resume Task ID and the Status-group Refresh / Retrieve Result control reuse accepted tasks without another create POST; Refresh performs GET only and can list candidates after an ambiguous response without choosing one. Its public media surface accepts Image Asset Library Video Generation Out through one ordered list input of up to 9 reference images and Video Picker VIDEO_OUT through one ordered list input of up to 3 reference videos, while hidden reference_video_1/reference_video_2/reference_video_3 parameters remain saved-workflow fallbacks. It also keeps a ParameterList of up to 3 reference audio items. Local images and MP3/WAV audio are encoded within Ark limits; project-relative paths resolve against the active workspace. Local video references are lazily published through a selectable upload service. Volcengine TOS mode uploads to a private bucket, creates a 24-hour signed HTTPS URL, and deletes the temporary object best-effort after execution; ambiguous submissions retain it for up to 30 minutes. Existing public URLs and asset:// references bypass upload. ARK_API_KEY and all storage credentials are read only from Griptape Secrets.",
+        "display_name": "HMB Seedance 2.0 Video Generation",
+        "icon": "Sparkles",
+        "group": "create",
+        "tags": [
+          "video",
+          "generation",
+          "ai",
+          "seedance",
+          "multimodal",
+          "HMB",
+          "ordered-image-list",
+          "single-wire-video-input",
+          "video-reference-capacity-3",
+          "audio-default-off",
+          "volcengine-ark",
+          "direct-ark-api",
+          "standard-4k",
+          "secure-ark-key",
+          "temporary-video-publication",
+          "griptape-cloud-storage",
+          "single-video-preview",
+          "get-only-task-recovery",
+          "ambiguous-submission-safety",
+          "local-mp4-output"
+        ]
+      }
+    },
+    {
+      "class_name": "HMBPromptLibrary",
+      "file_path": "HMBPromptLibrary.py",
+      "metadata": {
+        "category": "HMB_GP_Production",
+        "description": "Canonical goal-first prompt parent with four equal modes: independent Prompt only, Prompt plus Image Asset, Prompt plus Video Picker, and Prompt plus both. While IMAGE_ASSET_IN is connected, only selected Asset-managed rows own active @imageN slots and strictly follow upstream add, remove, and reorder operations so Prompt order stays aligned with Video Generation Out; the Prompt image + button is locked until disconnect because new visible rows must be selected upstream. Native/manual rows remain dormant and return after disconnect; deselected managed settings resume only by exact source_uid. Verified assets bind registered Main Type and Sub Type while Target keeps a Main-Type-aware editable default, and unverified or unknown readable input remains ordinary intent. PICKER_IN synchronizes recognized metadata without creating a required companion or library combination. PROMPT_OUT remains available in every mode and is the only HMB automation gateway recognized by HMBAgentLibrary.",
+        "display_name": "HMBPromptLibrary",
+        "width": 1800,
+        "height": 1193,
+        "default_width": 1800,
+        "default_height": 1193,
+        "initial_width": 1800,
+        "initial_height": 1193,
+        "min_width": 760,
+        "min_height": 1193,
+        "resizable": true,
+        "ui_options": {
+          "width": 1800,
+          "height": 1193,
+          "default_width": 1800,
+          "default_height": 1193,
+          "initial_width": 1800,
+          "initial_height": 1193,
+          "preferred_width": 1800,
+          "preferred_height": 1193,
+          "min_width": 760,
+          "min_height": 1193,
+          "resizable": true
+        }
+      }
+    },
+    {
+      "class_name": "HMBVideoPickerLibrary",
+      "file_path": "HMBVideoPickerLibrary.py",
+      "metadata": {
+        "category": "HMB_GP_Production",
+        "description": "Maya HMB playblast picker and current-cut video catalog. READ loads Outliner, camera, and timeline metadata without rendering video. Original, Mask (legacy Color Assignment), Depth, and Motion Guide checkboxes are inert selections; only Generate Playblast executes work, and every successful checked result is appended as a new immutable catalog asset instead of replacing a numbered slot. Imported MP4 files join the same history. Video cards use static thumbnails: the centered play button routes playback to the main Preview and toggles play/pause there, while the entire lower information area selects or deselects the card. Selected cards use a thicker, brighter neon outline; delete remains at the upper-right. Dragging selected cards changes their @video1..@videoN order, and metadata-only deletion never leaves the Picker stuck in a busy state. Snapshot and Video share the main viewport: stable Snapshot history is navigated by the left/right controls, the center control alone plays or pauses Video with ▶/Ⅱ, and the redundant local Open action is removed in favor of current-cut Load. Up to ten selected assets publish synchronized Prompt metadata through PICKER_OUT and the same ordered media paths through one VIDEO_OUT list[str] generator connection. Mask remains limited to Maya-authored visible geometry with enabled Color Assignment and Picker eye state. When no Color Assignment exists, optional Depth and Motion Guide independently use authored-visible, Picker-eye-enabled geometry without forcing hidden objects or changing saved reference/proxy state. Depth v7 and the shared viewport path preserve authored cutout alpha while applying camera-space grayscale or Smooth Preview. Motion Guide v5 adds bounded render-scope eye/eyelid semantic-mesh evidence to Sidecar-v2 final Blend Shape values, controller-value provenance, front-visible surface landmarks, and cached selective visibility checks. Full-detail and Smooth Preview preparation is best-effort, while exact frame-map, raster, H.264, and BT.709 validation remains mandatory.",
+        "display_name": "HMBVideoPickerLibrary",
+        "width": 1400,
+        "height": 1200,
+        "default_width": 1400,
+        "default_height": 1200,
+        "preferred_width": 1400,
+        "preferred_height": 1200,
+        "initial_width": 1400,
+        "initial_height": 1200,
+        "min_width": 760,
+        "min_height": 1151,
+        "resizable": true,
+        "ui_options": {
+          "width": 1400,
+          "height": 1200,
+          "default_width": 1400,
+          "default_height": 1200,
+          "min_width": 760,
+          "min_height": 1151,
+          "resizable": true,
+          "preferred_width": 1400,
+          "preferred_height": 1200,
+          "initial_width": 1400,
+          "initial_height": 1200
+        }
+      }
+    }
+  ],
+  "widgets": [
+    {
+      "name": "HMBAgentLibraryWidget",
+      "path": "widgets/HMBAgentLibraryWidget.js",
+      "description": "Compact HMBAgentLibrary header that identifies FINAL TEXT as the display/generator output and Agent State as chain-only while leaving native Agent controls unchanged."
+    },
+    {
+      "name": "HMBImageAssetLibraryWidget",
+      "path": "widgets/HMBImageAssetLibraryWidget.js",
+      "description": "Project catalog and image asset browser backed by the canonical _hmb_common.py taxonomy, with compact Project Set/reload icons, manifest-backed Add registration that copies external media directly into a selected child Asset Folder, explicit registered/unregistered thumbnail footers, and a compact draggable @image1-@image50 generator-order tray."
+    },
+    {
+      "name": "HMBPromptLibraryScopedBindingWidget",
+      "path": "widgets/HMBPromptLibraryScopedBindingWidget.js",
+      "description": "Goal-first Prompt dashboard where verified Asset Sub Type remains registered and Target stays editable from a Main-Type default. The image + button is locked only while IMAGE_ASSET_IN is connected and automatically returns after disconnect; video, Picker, Color Pick, VIDEO VFX, and Keep Out data remain optional without downstream prerequisites."
+    },
+    {
+      "name": "HMBVideoPickerCommandBridgeWidget",
+      "path": "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
+      "description": "Hidden minimal JSON command transport for HMBVideoPickerLibrary; execution commands remain separate from persistent dashboard state."
+    },
+    {
+      "name": "HMBVideoPickerLibraryWidget",
+      "path": "widgets/HMBVideoPickerLibraryWidget_v032.js",
+      "description": "Maya playblast viewport and current-cut asset catalog with static card thumbnails. Each centered card button plays or pauses that asset only in the main Preview; the entire lower information area selects or deselects it. Selected cards have a thicker, brighter neon outline, deletion stays at the upper-right, and dragging selected cards changes the @video1..@videoN order. Metadata-only deletion cannot leave the Picker stuck in a busy state. Snapshot and Video share the viewport: stable Snapshot history uses left/right navigation, the center control alone toggles Video ▶/Ⅱ, and current-cut Load replaces the retired local Open action. Original/Mask/Depth/Motion Guide remain inert selections until the explicit Generate trigger; PICKER_OUT and one ordered VIDEO_OUT list are the only public Picker outputs."
+    }
+  ]
+}

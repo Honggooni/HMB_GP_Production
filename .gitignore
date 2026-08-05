@@ -1,0 +1,49 @@
+# Local runtimes, caches, and generated state
+.venv/
+.tmp/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+GriptapeNodes/
+.cache/
+.codex/
+.agents/
+
+# Local backups and generated release artifacts
+backups/
+dist/
+*.zip
+
+# Agent policy payloads are managed on the internal network share
+resources/agent/
+resources/policy/
+**/hmb_agent_core.dat
+
+# Credentials and machine-local configuration
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jwk
+credentials*.json
+secrets*.json
+*.secret
+*.token
+id_rsa*
+id_ed25519*
+
+# Test and coverage output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
