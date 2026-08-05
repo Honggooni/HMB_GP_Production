@@ -66,22 +66,30 @@ with tempfile.TemporaryDirectory() as temporary:
 
     # If only the project copy is stale, the verified source file takes over
     # and stale project metadata is not exposed downstream.
-    fallback_payload, fallback_media = picker._build_synchronized_video_outputs(
-        {
-            "videos": [
-                selected_item(
-                    "fallback-video",
-                    1,
-                    project_video_path="inputs/videos/missing-project-copy.mp4",
-                    video_path=str(local_video),
-                    video_url="http://127.0.0.1:8123/external/stale-preview.mp4",
-                )
-            ]
-        },
-        enforce_media_availability=True,
-    )
-    assert fallback_media == [str(local_video)]
-    assert fallback_payload["videos"][0]["video_path"] == str(local_video)
+    original_resolver = picker._resolve_readable_video_reference
+    try:
+        picker._resolve_readable_video_reference = (
+            lambda value: local_video if value == str(local_video) else None
+        )
+        fallback_payload, fallback_media = picker._build_synchronized_video_outputs(
+            {
+                "videos": [
+                    selected_item(
+                        "fallback-video",
+                        1,
+                        project_video_path="inputs/videos/missing-project-copy.mp4",
+                        video_path=str(local_video),
+                        video_url="http://127.0.0.1:8123/external/stale-preview.mp4",
+                    )
+                ]
+            },
+            enforce_media_availability=True,
+        )
+    finally:
+        picker._resolve_readable_video_reference = original_resolver
+    assert len(fallback_media) == 1
+    assert Path(fallback_media[0]).resolve() == local_video.resolve()
+    assert fallback_payload["videos"][0]["video_path"] == fallback_media[0]
     assert "project_video_path" not in fallback_payload["videos"][0]
 
     # One missing member blocks the entire ordered selection. Valid members
