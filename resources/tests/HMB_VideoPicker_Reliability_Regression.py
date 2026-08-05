@@ -1866,11 +1866,17 @@ with tempfile.TemporaryDirectory() as temp_dir:
         assert len(captured_ffmpeg_commands) == 1
         assert any("scale=1920:1080:flags=lanczos" in part for part in captured_ffmpeg_commands[0])
         assert first_original_state["original_preview_enabled"] is True
-        assert Path(first_original_state["original_video_path"]) == expected_original
+        assert (
+            Path(first_original_state["original_video_path"]).resolve()
+            == expected_original.resolve()
+        )
         assert expected_original.is_file()
         assert expected_sidecar.is_file()
         assert first_original_state["original_video_url"]
-        assert Path(first_original_state["video_path"]) == expected_original
+        assert (
+            Path(first_original_state["video_path"]).resolve()
+            == expected_original.resolve()
+        )
         assert first_original_state["video_url"]
 
         # The same explicit request is a validated cache hit. It must not launch
@@ -1884,8 +1890,14 @@ with tempfile.TemporaryDirectory() as temp_dir:
         assert len(captured_maya_jobs) == maya_job_count
         assert len(captured_ffmpeg_commands) == ffmpeg_count
         assert second_original_state["original_preview_enabled"] is True
-        assert Path(second_original_state["original_video_path"]) == expected_original
-        assert Path(second_original_state["video_path"]) == expected_original
+        assert (
+            Path(second_original_state["original_video_path"]).resolve()
+            == expected_original.resolve()
+        )
+        assert (
+            Path(second_original_state["video_path"]).resolve()
+            == expected_original.resolve()
+        )
         full_read_node._cleanup_transient_paths()
     finally:
         picker._find_mayabatch = original_find_mayabatch
