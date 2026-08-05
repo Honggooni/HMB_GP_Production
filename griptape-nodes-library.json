@@ -3,8 +3,8 @@
   "library_schema_version": "0.10.0",
   "metadata": {
     "author": "HMB Pipeline",
-    "description": "HMB_GP_Production provides four independently usable, composable core libraries for image assets, Maya playblast, prompt design, and a generator-neutral Agent, plus the existing HMB Seedance 2.0 generator upgraded for direct Volcengine Ark execution. Every one-, two-, three-, and four-core-library combination is valid. HMBPromptLibrary is the single canonical integration parent: it accepts arbitrary readable sources in four equal Prompt modes, while HMBAgentLibrary activates HMB automation only from its exact direct PROMPT_OUT edge. HMB Seedance retains its node identity, accepts Image Asset Library and Video Picker ordered selections through one list port each, keeps hidden scalar-video fallbacks for saved workflows, and retains its audio list. It uses ARK_API_KEY only from Griptape Secrets, can publish local video references through either its existing storage path or a private Volcengine TOS bucket with temporary signed HTTPS URLs, submits each billable Ark create POST at most once, polls tasks, and immediately saves the signed result as a local MP4. Only this HMB generator writes its hidden, per-login monthly usage ledger; task events are durably queued locally, de-duplicated by task ID, and atomically synchronized without prompts, credentials, or media URLs. Its property-only result preview and sole VIDEO_OUT connector share one artifact, and Status includes GET-only refresh/recovery. Volcengine limits are enforced before submission: nine images, three videos, and three audio references. Connections add optional evidence and synchronization without creating prerequisites; the user's goal remains the final authority.",
-    "library_version": "0.5.13",
+    "description": "Funny HMB_GP_Production",
+    "library_version": "0.5.14",
     "engine_version": "0.93.0",
     "tags": [
       "Griptape",

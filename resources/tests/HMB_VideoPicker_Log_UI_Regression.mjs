@@ -104,9 +104,11 @@ assert.match(widgetSource, /id="activity-log-view" class="activity-log-view" rol
 assert.match(widgetSource, /\.activity-log-row\[data-level="ERROR"\]\{color:#fb7185\}/);
 assert.match(widgetSource, /\.activity-log-row\[data-level="WARNING"\]\{color:#fbbf24\}/);
 assert.match(widgetSource, /\.activity-body\{[^}]*overflow:hidden;[^}]*contain:layout paint/);
-assert.match(widgetSource, /\.activity-log-view\{[^}]*overflow-x:hidden;overflow-y:auto/);
-assert.match(widgetSource, /\.activity-log-row\{[^}]*height:18px;min-height:18px;max-height:18px;[^}]*white-space:nowrap/);
-assert.match(widgetSource, /\.activity-log-message\{[^}]*text-overflow:ellipsis;white-space:nowrap/);
+assert.match(widgetSource, /\.activity-log-view\{[^}]*overflow-x:auto;overflow-y:auto;scrollbar-gutter:stable both-edges/);
+assert.match(widgetSource, /\.activity-log-row\{[^}]*width:max-content;min-width:100%;[^}]*height:18px;min-height:18px;max-height:18px;[^}]*white-space:nowrap/);
+assert.match(widgetSource, /\.activity-log-message\{[^}]*min-width:max-content;max-width:none;[^}]*text-overflow:clip;white-space:nowrap/);
+assert.match(widgetSource, /const scrollLeft = Number\(logView\.scrollLeft \|\| 0\);/);
+assert.match(widgetSource, /logView\.scrollLeft = scrollLeft;/);
 assert.doesNotMatch(widgetSource, /id="activity-log-editor"|<textarea[^>]*activity/);
 assert.doesNotMatch(widgetSource, /<span>\$\{escapeHtml\(state\.message\)\}<\/span>/,
   "Critical messages must not leak into empty Outliner or viewport layout surfaces.");

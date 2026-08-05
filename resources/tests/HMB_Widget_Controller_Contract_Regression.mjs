@@ -1182,8 +1182,12 @@ assert.match(videoSource, /\.activity-log-row\[data-level="ERROR"\]\{color:#fb71
   "Activity Log errors must render as red text.");
 assert.match(videoSource, /\.activity-log-row\[data-level="WARNING"\]\{color:#fbbf24\}/,
   "Activity Log warnings must render with a distinct warning color.");
-assert.match(videoSource, /\.activity-log-message\{[^}]*overflow:hidden;[^}]*text-overflow:ellipsis;[^}]*white-space:nowrap/,
-  "Long log messages must remain one clipped row instead of expanding the Picker layout.");
+assert.match(videoSource, /\.activity-log-view\{[^}]*overflow-x:auto;overflow-y:auto;scrollbar-gutter:stable both-edges/,
+  "Long log messages must expose a stable horizontal scrollbar.");
+assert.match(videoSource, /\.activity-log-row\{[^}]*width:max-content;min-width:100%;[^}]*white-space:nowrap/,
+  "Long log messages must remain one intrinsically wide row.");
+assert.match(videoSource, /\.activity-log-message\{[^}]*min-width:max-content;max-width:none;[^}]*text-overflow:clip;white-space:nowrap/,
+  "Long log messages must remain horizontally inspectable instead of being ellipsized.");
 assert.match(videoSource, /\.outliner-palette\{padding:8px;border-bottom:/);
 assert.ok(
   videoSource.indexOf('<div class="outliner-palette">')
