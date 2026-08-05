@@ -13,9 +13,3 @@
 환경변수나 관리자 설정으로 치환하고 전체 릴리스 보안 검사를 다시
 통과해야 합니다.
 
-
-## Release verification
-
-- 배포물은 `resources/build_release.py`로 생성한
-  `HMB_GP_Production.zip`, `release-manifest.json`, `SHA256SUMS` 세 파일을
-  함께 관리합니다.
