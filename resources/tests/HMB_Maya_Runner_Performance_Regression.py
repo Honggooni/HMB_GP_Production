@@ -2120,9 +2120,9 @@ with tempfile.TemporaryDirectory(prefix="hmb_maya_depth_run_") as temp_dir:
     assert run_result["ok"] is True
     assert run_result["frame_count"] == 1
     assert run_result["depth_frame_count"] == 1
-    assert run_result["depth_frames_folder"] == str(depth_frames.resolve())
+    assert Path(run_result["depth_frames_folder"]).resolve() == depth_frames.resolve()
     assert run_result["depth_output_name"] == "shot_depth"
-    assert run_result["depth_sidecar_path"] == str(depth_sidecar.resolve())
+    assert Path(run_result["depth_sidecar_path"]).resolve() == depth_sidecar.resolve()
     assert run_result["depth_profile"] == runner.DEPTH_PLAYBLAST_PROFILE
     assert run_result["depth_range_report"]["near"] == 1.0
     assert color_sidecar.is_file()
