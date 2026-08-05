@@ -499,25 +499,11 @@ for anchor in (
     if anchor not in init_text:
         raise AssertionError(f"HMB Seedance package export missing: {anchor}")
 for anchor in (
-    "calls the official\nVolcengine Ark asynchronous API directly",
-    "Settings > Secrets > ARK_API_KEY",
-    "Auto Publish Local Videos",
-    "Local Video Upload = Volcengine TOS",
-    "TOS_ACCESS_KEY_ID",
-    "TOS_SECRET_ACCESS_KEY",
-    "TOS_BUCKET_NAME",
-    "The result UI displays one video preview",
-    "Refresh performs GET requests only",
-    "Create POSTs are attempted exactly once",
-    "maintains an invisible per-login usage ledger",
-    "other video generators are",
-    "Video Generation Out -> HMB Seedance 2.0 Video Generation.Reference Images",
-    "HMBVideoPickerLibrary.VIDEO_OUT -> HMB Seedance 2.0 Video Generation.Reference Videos",
-    "A populated `Reference Videos` list always takes",
-    "`VIDEO_OUT` is the single output connector",
+    "**Private repository only.**",
+    "Do not make the GitHub repository or release assets public",
 ):
     if anchor not in readme_text:
-        raise AssertionError(f"HMB Seedance operator guidance missing: {anchor}")
+        raise AssertionError(f"Private repository warning missing: {anchor}")
 for anchor in (
     'get_library_info_by_library_name(',
     'LibraryRegistry.get_library("Griptape Nodes Library")',
