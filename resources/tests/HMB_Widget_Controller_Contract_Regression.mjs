@@ -239,6 +239,11 @@ assert.match(promptSource, /function renderSubtypeControls\(item, state, locked 
 assert.match(promptSource, /data-field="owner">\$\{targetSelectOptions\(item, images, state\)\}<\/select>/, "Verified Asset Target must remain freely editable.");
 assert.match(promptSource, /renderSubtypeControls\(item, state, Boolean\(verifiedAsset && verifiedRegisteredSubtype\(item\)\)\)/, "Only verified assets with a registered Sub Type should lock the Prompt subtype control.");
 const promptImageRowSource = promptSource.match(/function renderImageRow\([\s\S]*?\n\}\n\nfunction renderVideoRow/)?.[0] || "";
+assert.doesNotMatch(
+  promptImageRowSource,
+  /Asset ID: \$\{escapeHtml\(item\.asset_id\)\}/,
+  "Prompt Image rows must not spend vertical space on a duplicate Asset ID label.",
+);
 assert.match(
   promptImageRowSource,
   /image-main-type-cell[\s\S]*?binding-scope-cell[\s\S]*?image-target-cell[\s\S]*?color-pick-cell/,
@@ -275,6 +280,11 @@ assert.match(assetSource, /canvasPanRoots\.forEach\(\(element\) => \{\s*element\
 assert.match(assetSource, /container\.innerHTML = hmbScopeWidgetStyleMarkup\(render\([\s\S]*?container\.__hmbImageAssetRegistrationDraft \|\| null,[\s\S]*?\), "\.hmb-image-assets"\);[\s\S]*?hmbPrepareImageAssetCanvasGestures\(container\);/, "Every Asset remount must render scoped local registration state, apply modal isolation when needed, and restore canvas wheel behavior.");
 assert.match(assetSource, /container\.__hmbImageAssetApplyProps/, "Asset must reuse one mounted controller across host refreshes.");
 assert.match(assetSource, /if \(currentValue === nextValue\) return;/, "An identical Asset state update must not rebuild the dashboard.");
+assert.match(
+  assetSource,
+  /if \(hmbDeferImageAssetPropsDuringRegistration\(container, props\)\) return;/,
+  "Host props must not remount the Asset registration dialog while its text fields are being edited.",
+);
 assert.match(assetSource, /detachReusableImageAssets\(container\)[\s\S]*?restoreReusableImageAssets\(container, reusableImages\)/, "Asset remounts must reuse loaded thumbnail elements.");
 assert.match(assetSource, /IMAGE_ASSET_AUTO_SYNC_MS = 10000/, "Asset must probe the shared manifest every ten seconds.");
 assert.match(assetSource, /__hmb_manifest_poll_nonce/, "Asset auto-sync probes must use a transient backend nonce.");
@@ -401,6 +411,49 @@ assert.equal(externalRegistrationDraftProbe.source_kind, "user");
 assert.equal(externalRegistrationDraftProbe.source_uid, "import:source");
 assert.equal(externalRegistrationDraftProbe.target_folder, "");
 assert.equal(externalRegistrationDraftProbe.target_folder_confirmed, false);
+const deferredRegistrationContainer = {
+  __hmbImageAssetRegistrationDraft: {
+    image_name: "Typing Hero Beauty",
+    asset_id: "Typing_Hero",
+  },
+};
+const firstDeferredRegistrationProps = { value: JSON.stringify({ scan_revision: 1 }) };
+const latestDeferredRegistrationProps = { value: JSON.stringify({ scan_revision: 2 }) };
+assert.equal(
+  assetModule.hmbDeferImageAssetPropsDuringRegistration({}, firstDeferredRegistrationProps),
+  false,
+  "Normal host refreshes must remain immediate when no Add passport is open.",
+);
+assert.equal(
+  assetModule.hmbDeferImageAssetPropsDuringRegistration(
+    deferredRegistrationContainer,
+    firstDeferredRegistrationProps,
+  ),
+  true,
+  "An open Add passport must defer a host refresh instead of replacing its live text controls.",
+);
+assert.equal(
+  assetModule.hmbDeferImageAssetPropsDuringRegistration(
+    deferredRegistrationContainer,
+    latestDeferredRegistrationProps,
+  ),
+  true,
+);
+assert.equal(
+  deferredRegistrationContainer.__hmbImageAssetRegistrationDraft.image_name,
+  "Typing Hero Beauty",
+  "Deferring host props must preserve the exact in-progress Image Name draft.",
+);
+assert.equal(
+  assetModule.hmbTakeDeferredImageAssetProps(deferredRegistrationContainer),
+  latestDeferredRegistrationProps,
+  "Only the latest deferred host state should be applied after Add closes or submits.",
+);
+assert.equal(
+  assetModule.hmbTakeDeferredImageAssetProps(deferredRegistrationContainer),
+  null,
+  "Deferred host props must be consumed exactly once.",
+);
 const legacyUnclassifiedProbe = assetModule.hmbNormalizeImageAssetState({
   assets: [{
     asset_library_id: "legacy-import",

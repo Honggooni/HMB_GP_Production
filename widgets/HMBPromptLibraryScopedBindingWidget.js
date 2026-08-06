@@ -3237,10 +3237,10 @@ function renderImageRow(item, index, images, state) {
     : (rowManaged
       ? "Generator order is controlled by HMBImageAssetLibrary; Name and Prompt fields remain editable"
       : (item.asset_id ? `Asset ID: ${item.asset_id}` : ""));
-  const expandedLeftFields = clean(item.binding_scopes[0]) === "Custom scope" || Boolean(clean(item.asset_id));
+  const expandedLeftFields = clean(item.binding_scopes[0]) === "Custom scope";
   return `<div class="source-row image ${item.present ? "active" : "next"} ${rowManaged ? "asset-order-managed" : ""} ${verifiedAsset ? "asset-authority-managed" : ""} ${expandedLeftFields ? "image-expanded-left-fields" : ""}" data-kind="image" data-index="${index}">
     <div class="source-num image-index-cell image-drag-handle nodrag" data-image-drag-handle draggable="${dragEnabled ? "true" : "false"}" role="button" tabindex="${dragEnabled ? "0" : "-1"}" aria-label="${escapeHtml(dragEnabled ? uiText(state, "drag_image_row", "Drag or use arrow keys to reorder image source") : (orderManaged ? "Order is controlled by HMBImageAssetLibrary" : ""))}" title="${escapeHtml(dragEnabled ? uiText(state, "drag_image_row", "Drag to reorder image source") : (orderManaged ? "Order is controlled by HMBImageAssetLibrary" : ""))}">${String(item.slot).padStart(2, "0")}</div>
-    <div class="source-label image-name-cell"><input class="source-label-input" data-field="label" maxlength="${MAX_IDENTIFIER_CHARS}" value="${escapeHtml(item.label)}" placeholder="${escapeHtml(uiText(state, "name", "Name"))}" title="${escapeHtml(identityTitle)}" ${verifiedAsset ? "readonly" : ""}/>${item.asset_id ? `<small>${verifiedAsset ? "ASSET · " : ""}Asset ID: ${escapeHtml(item.asset_id)}</small>` : ""}</div>
+    <div class="source-label image-name-cell"><input class="source-label-input" data-field="label" maxlength="${MAX_IDENTIFIER_CHARS}" value="${escapeHtml(item.label)}" placeholder="${escapeHtml(uiText(state, "name", "Name"))}" title="${escapeHtml(identityTitle)}" ${verifiedAsset ? "readonly" : ""}/></div>
     <div class="source-role image-main-type-cell"><select class="source-select" data-field="source_type" ${verifiedAsset ? "disabled" : ""}>${options(sourceTypeChoices, item.source_type, "", state)}</select></div>
     <div class="source-role binding-scope-cell">${renderSubtypeControls(item, state, Boolean(verifiedAsset && verifiedRegisteredSubtype(item)))}</div>
     <div class="source-role image-target-cell"><select class="source-select source-target-select" data-field="owner">${targetSelectOptions(item, images, state)}</select></div>
@@ -3327,7 +3327,6 @@ function render(state) {
     .image-drag-handle:active{cursor:grabbing}
     .source-row.asset-order-managed .image-drag-handle{cursor:default;color:#f9a8d4;border-color:rgba(236,72,153,.2);background:rgba(131,24,67,.08)}
     .source-row.asset-authority-managed .image-name-cell input[readonly],.source-row.asset-authority-managed .image-main-type-cell select:disabled,.source-row.asset-authority-managed .binding-scope-cell select:disabled{border-color:rgba(236,72,153,.28);background:rgba(46,16,35,.28);color:#fbcfe8;opacity:1;cursor:default}
-    .source-row.asset-order-managed .image-name-cell small{color:#f9a8d4}
     .source-row.image-row-dragging{opacity:.42}
     .source-row.image-drop-before{box-shadow:inset 0 3px 0 #67e8f9}
     .source-row.image-drop-after{box-shadow:inset 0 -3px 0 #67e8f9}
