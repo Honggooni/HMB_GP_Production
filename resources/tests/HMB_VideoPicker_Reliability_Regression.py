@@ -657,7 +657,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.5.16"
+assert manifest["metadata"]["library_version"] == "0.5.17"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
@@ -724,14 +724,14 @@ assert hashlib.sha256(bundled_agent_policy.read_bytes()).hexdigest() == (
 )
 expected_agent_hashes = {
     "HMBAgentLibrary.py": "12a00bf11e5376998192a09f9a2e3b9fe4bab9d04e986fe1adc7be78946b81c6",
-    "HMBPromptLibrary.py": "a6f92d4e1727219d41fce7cc65b8cdd804b6637f86b98da91f6d03529d3f1e79",
+    "HMBPromptLibrary.py": "6c5a6ee5b9febdd4ce342477a253a810b7956a76f6fdac98337b874cf1b456c6",
     "HMBVideoPickerLibrary.py": "95acd3f94a7986e381b83db6683441ec42900df8a0d1f607f1240e0aea442eb6",
     "_hmb_common.py": "1e4a6e1447e6ab08279d3f17f677974ce703602ed3b54185dd8fc755c0d2530d",
     "widgets/HMBAgentLibraryWidget.js": "61ea9416adc1cbfb7e8fbfbc068ad1a444c3f6d4b4c6b59569a1815a013dc193",
-    "resources/tests/HMB_Agent_Policy_Integration_Regression.py": "42fb8936937134cbe1a3c2c793b5116fb35381d07b0d1dd3a0c79f9c9c870e26",
+    "resources/tests/HMB_Agent_Policy_Integration_Regression.py": "decd2258635a18aa1edad5690b2465df5007cae27d225eb97652e476d66c6c16",
     "resources/tests/HMB_Frame_Range_Regression.py": "4f9c0f7022b5db5bfa760e41f747ecbf95c99f0b06525553248fe3af9e2b1091",
     "resources/tests/HMB_Output_Sanitizer_Regression.py": "390406b1903f28583ff29882b5fab2ef9befbfb13684de9e551d37f3ab6ce524",
-    "resources/tests/HMB_Final_Policy_Recursive_Probabilistic_Regression.py": "8f7e3397eec536072536c7cae6b4a22ec715a5cde17cc9ac872cb00e5114e85a",
+    "resources/tests/HMB_Final_Policy_Recursive_Probabilistic_Regression.py": "4a7f7a3c96ba49b13f290913e629098d06cc7c445d34ba52ddd251c8ff9eeb86",
 }
 for relative_path, expected_hash in expected_agent_hashes.items():
     actual_hash = hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest()

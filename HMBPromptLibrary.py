@@ -6992,40 +6992,6 @@ def _build_prompt_package(state: Dict[str, Any]) -> str:
 
     lines.append("TARGET GENERATOR:")
     lines.append("This prompt is written for the active downstream target generator or execution system.")
-    lines.append("Interpret all source bindings, video shot-control instructions, timing notes, VFX placement, visibility states, occlusion behavior, and continuity requirements as production replacement re-render instructions.")
-    lines.append("")
-
-    lines.append("PRODUCTION INTEGRATION DEFAULTS:")
-    lines.append(
-        "Focus = Unless an explicit scoped instruction changes it, stable deep focus uses camera-relative "
-        "scene depth. Characters and environment within the same focus range receive the same optical "
-        "response. Do not selectively focus or blur only characters or only environment by semantic "
-        "object class, and do not invent focus pumping or rack focus."
-    )
-    lines.append(
-        "Lighting = If an environment map or IBL is explicitly approved as lighting authority, use it "
-        "only within its stated scope. If supplied but not approved, treat it only as implementation "
-        "evidence for the approved background or sequence look. If none is usable, infer only low-frequency "
-        "sky and ground illumination, broad light direction, color temperature, contrast, and weather cues "
-        "conservatively from the approved background; do not invent an HDRI or dramatic light source."
-    )
-    lines.append(
-        "Environment = Environment dummies carry macro layout, volume, distribution, height, path, depth, "
-        "occlusion, and structural density; the approved background owns micro-density, surface appearance, "
-        "palette, and atmosphere."
-    )
-    lines.append(
-        "Character integration = Relight characters under shared scene lighting, exposure, atmosphere, "
-        "white balance, and grade; preserve intrinsic identity and material evidence and add no unstated "
-        "character-only lift, fill, saturation, contrast boost, or beautification."
-    )
-    lines.append(
-        "Effects = Scene-space effects require bidirectional contact, occlusion, shadow, reflected light, "
-        "atmospheric scattering, and vegetation response where meaningful. Camera, lens, and post effects "
-        "have no world contact and cast no world shadow. Direct optical illumination and shadow follow onset, "
-        "peak, and falloff; secondary physical response may use causal inertia, diffusion, delay, damping, "
-        "dissipation, and recovery."
-    )
     lines.append("")
 
     lines.append("IMAGE SOURCE:")

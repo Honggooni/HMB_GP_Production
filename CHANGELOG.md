@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.17 - 2026-08-06
+
+- Reduced the public `TARGET GENERATOR` preamble to target identification only.
+  Detailed production integration defaults are no longer duplicated in the
+  compiled user-visible Prompt and remain exclusively enforced by the bundled,
+  signed v3 Agent policy.
+- Added regressions that reject future policy-detail exposure in public Prompt
+  text while confirming the signed local policy remains the runtime authority.
+
 ## 0.5.16 - 2026-08-06
 
 - Replaced the Agent policy with signed policy
