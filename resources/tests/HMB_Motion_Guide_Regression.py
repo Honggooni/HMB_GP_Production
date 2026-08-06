@@ -50,7 +50,10 @@ motion_spec = prompt.SELF_SCOPED_AUXILIARY_REFERENCE_SPECS[
     )
 ]
 assert motion_spec["authority_domain"] == "derived_motion_decoding"
-assert "explicit current user goals" in motion_spec["authority"]
+assert "explicit scoped instruction" in motion_spec["authority"]
+assert "named property" in motion_spec["authority"]
+assert "if no temporal subset is stated or clearly implied, it applies to the whole shot" in motion_spec["authority"]
+assert "otherwise only to that subset" in motion_spec["authority"]
 assert "zero independent motion" not in motion_spec["authority"]
 
 

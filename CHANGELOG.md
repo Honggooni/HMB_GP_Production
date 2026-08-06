@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.16 - 2026-08-06
+
+- Replaced the Agent policy with signed policy
+  `2026-08-06.animation-look-continuity.v3`, contract SHA-256
+  `ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93`,
+  and envelope SHA-256
+  `6152355dd51d68da33d4df197e6ac52f2c13b37d9644aa50efd9ba8c2cf13619`.
+- Removed external and network-share policy resolution. The Agent now reads and
+  verifies only the `resources/agent/hmb_agent_core.dat` installed beside the
+  library, with no policy-path environment variable or fallback order.
+- Deferred the required team-project `{_index}` output macro until Griptape's
+  collision-safe write stage, preventing Seedance generation and Refresh from
+  failing before the engine assigns the output index. Other missing macro
+  variables and destination errors still fail before task submission.
+- Reduced the production ZIP to exactly 25 allowlisted runtime files. The signed
+  `.dat` is included; `CHANGELOG.md`, `resources/build_release.py`, policy
+  administration scripts, private keys, credentials, tokens, and every other
+  `.dat` are excluded. The release audit verifies the exact policy hash and
+  source security boundary; release preparation also verifies two identical
+  reproducible builds and the complete archive security regression.
+
 ## 0.5.15 - 2026-08-06
 
 - Bundled the exact signed Agent policy

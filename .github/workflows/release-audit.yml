@@ -26,7 +26,7 @@ jobs:
         run: |
           $tracked = @(git ls-files)
           $bundledPolicy = "resources/agent/hmb_agent_core.dat"
-          $bundledPolicySha256 = "94533d84ab914971026f624634c2553a0c7abba298f6dd76242d996ee5c9137f"
+          $bundledPolicySha256 = "6152355dd51d68da33d4df197e6ac52f2c13b37d9644aa50efd9ba8c2cf13619"
           $forbidden = @($tracked | Where-Object {
             $_ -ne $bundledPolicy -and (
               $_ -match '(^|/)(\.tmp|\.venv|backups|dist|GriptapeNodes|resources/agent|resources/policy)/' -or
@@ -49,24 +49,6 @@ jobs:
           }
       - name: Install pinned direct dependencies
         run: python -m pip install "Pillow==12.3.0" "imageio-ffmpeg==0.6.0" "httpx==0.28.1" "tos==2.9.2"
-      - name: PowerShell policy administration syntax
-        shell: pwsh
-        run: |
-          $scripts = @(
-            "resources/admin/Configure_HMB_Agent_Policy_Share.ps1",
-            "resources/admin/Test_HMB_Agent_Policy_Share.ps1",
-            "resources/admin/Finalize_HMB_Agent_Policy_Migration.ps1"
-          )
-          foreach ($script in $scripts) {
-            $tokens = $null
-            $errors = $null
-            [void][System.Management.Automation.Language.Parser]::ParseFile(
-              (Resolve-Path $script).Path,
-              [ref]$tokens,
-              [ref]$errors
-            )
-            if ($errors.Count -ne 0) { throw "PowerShell parse failed: $script" }
-          }
       - name: Python release regressions
         shell: pwsh
         env:
@@ -76,7 +58,10 @@ jobs:
           # Griptape Nodes; signed-policy boundaries are verified below.
           $tests = @(
             "HMB_External_Policy_Boundary_Regression.py",
-            "HMB_Agent_Policy_Share_Security_Regression.py",
+            "HMB_Agent_Policy_Integration_Regression.py",
+            "HMB_Look_Attribute_Scope_Regression.py",
+            "HMB_Output_Sanitizer_Regression.py",
+            "HMB_Parent_Prompt_Agent_Contract_Regression.py",
             "HMB_State_Normalization_Property_Regression.py",
             "HMB_Image_Asset_Import_Order_Regression.py",
             "HMB_Image_Asset_Resolved_Selection_Regression.py",
@@ -107,12 +92,5 @@ jobs:
             node $_.FullName
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-      - name: Reproducible release build
-        shell: pwsh
-        run: |
-          python resources/build_release.py
-          $first = (Get-FileHash dist/HMB_GP_Production.zip -Algorithm SHA256).Hash
-          python resources/build_release.py
-          $second = (Get-FileHash dist/HMB_GP_Production.zip -Algorithm SHA256).Hash
-          if ($first -ne $second) { throw "Release ZIP is not reproducible." }
-          python resources/tests/HMB_Public_Release_Security_Regression.py
+      - name: Bundled policy release security regression
+        run: python resources/tests/HMB_Public_Release_Security_Regression.py

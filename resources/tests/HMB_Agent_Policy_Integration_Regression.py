@@ -11,10 +11,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.5.15"
-EXPECTED_POLICY_VERSION = "2026-08-01.goal-final-authority.v2"
-EXPECTED_CONTRACT_SHA256 = "a17809e4103628c1b0ab0b96081f6325faf9d16703a5fac57ef7d1eaa7d043bf"
-EXPECTED_BUNDLED_POLICY_SHA256 = "94533d84ab914971026f624634c2553a0c7abba298f6dd76242d996ee5c9137f"
+EXPECTED_RELEASE_VERSION = "0.5.16"
+EXPECTED_POLICY_VERSION = "2026-08-06.animation-look-continuity.v3"
+EXPECTED_CONTRACT_SHA256 = "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93"
+EXPECTED_BUNDLED_POLICY_SHA256 = "6152355dd51d68da33d4df197e6ac52f2c13b37d9644aa50efd9ba8c2cf13619"
+EXPECTED_SIGNING_KEY_ID = "hmb-policy-release-2026-08-r2"
 SHARED_MARKERS = (
     "HYBRID COMPOSITION INDEPENDENCE:",
     "MISSING SOURCE AUTHORITY:",
@@ -76,11 +77,16 @@ for rules in (policy, binding):
     assert "current explicit user goal" in normalized_rules
     assert "unreadable or corrupt file" in normalized_rules
     assert "never downgrade supplied content to context-only" in normalized_rules
+    assert "explicit scoped exception" in normalized_rules
+    assert "named target or clearly scene-wide scope" in normalized_rules
+    assert "stable default focus" in normalized_rules
+    assert "explicit user goal may use any visible property" not in normalized_rules
+    assert "may broaden, narrow, or reframe" not in normalized_rules
+    assert "target-property-time" not in normalized_rules
     assert "hidden rules" in normalized_rules
 
-# The signed/compressed v2 envelope is bundled as an offline fallback. A valid
-# external policy remains preferred, while no plaintext policy or signing key
-# is distributed.
+# The signed/compressed v3 envelope is the sole local runtime policy. No
+# plaintext policy or private signing key is distributed.
 bundled_policy_path = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
 assert bundled_policy_path.is_file()
 assert hashlib.sha256(bundled_policy_path.read_bytes()).hexdigest() == (
@@ -96,6 +102,7 @@ envelope = json.loads(sealed.decode("utf-8"))
 assert envelope["schema"] == agent._hmb._AGENT_POLICY_ENVELOPE_SCHEMA
 assert envelope["algorithm"] == agent._hmb._AGENT_POLICY_SIGNATURE_ALGORITHM
 assert envelope["key_id"] == agent._hmb._AGENT_POLICY_SIGNING_KEY_ID
+assert envelope["key_id"] == EXPECTED_SIGNING_KEY_ID
 assert envelope["payload_sha256"]
 assert envelope["signature"]
 payload = agent._hmb._decode_signed_agent_policy_envelope(sealed)
@@ -300,7 +307,6 @@ def exercise_agent_block(
     assert node.parameter_output_values["agent"] == {}
     assert node.parameter_output_values["output"] == error_text
     assert "fin-rcomp1" not in error_text.casefold()
-    assert "hmb_agent_core.dat" not in error_text.casefold()
     return error_text
 
 
@@ -415,20 +421,20 @@ signature_text = str(tampered_envelope["signature"])
 tampered_envelope["signature"] = (
     ("A" if signature_text[:1] != "A" else "B") + signature_text[1:]
 )
-original_policy_path = agent._hmb.AGENT_RULE_DATA_PATH
+original_policy_path = agent._hmb._BUNDLED_AGENT_POLICY_FILE
 with tempfile.TemporaryDirectory() as temporary_directory:
     corrupt_policy_path = Path(temporary_directory) / "hmb_agent_core.dat"
     corrupt_policy_path.write_text(
         json.dumps(tampered_envelope, separators=(",", ":")),
         encoding="utf-8",
     )
-    agent._hmb.AGENT_RULE_DATA_PATH = corrupt_policy_path
+    agent._hmb._BUNDLED_AGENT_POLICY_FILE = corrupt_policy_path
     try:
         assert exercise_agent_block(empty_hmb_prompt) == (
             agent._HMB_POLICY_UNAVAILABLE_MESSAGE
         )
     finally:
-        agent._hmb.AGENT_RULE_DATA_PATH = original_policy_path
+        agent._hmb._BUNDLED_AGENT_POLICY_FILE = original_policy_path
 
 # Runtime source documents carry the new contract marker check while output
 # state and hidden-rule sanitization remain in their established code paths.

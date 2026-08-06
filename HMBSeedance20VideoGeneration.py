@@ -2562,6 +2562,35 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         )
 
     @staticmethod
+    def _preflight_output_destination(destination: Any) -> None:
+        """Validate an output target without rejecting engine-assigned versions.
+
+        Some team project templates require ``{_index}`` in their output macro.
+        The Griptape write path assigns that version immediately before writing,
+        so an earlier plain ``resolve()`` cannot supply it.  Ignore only that
+        single expected preflight failure; every other destination error still
+        fails before a task can be submitted.
+        """
+        try:
+            destination.resolve()
+        except Exception as exc:
+            marker = "missing required variables:"
+            details = str(exc)
+            if marker not in details:
+                raise
+            missing = {
+                name.strip()
+                for name in details.rsplit(marker, 1)[1].split(",")
+                if name.strip()
+            }
+            if missing != {"_index"}:
+                raise
+            logger.debug(
+                "Output preflight deferred because the project assigns {_index} "
+                "when the completed video is written."
+            )
+
+    @staticmethod
     def _task_items(response: dict[str, Any]) -> list[dict[str, Any]]:
         items = response.get("items")
         if not isinstance(items, list):
@@ -2692,7 +2721,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
             if status == "succeeded":
                 self._record_usage_task(task, generation_id, status)
                 destination = self._output_file.build_file()
-                destination.resolve()
+                self._preflight_output_destination(destination)
                 await self._save_completed_task(task, generation_id, destination)
                 return
             if status in TERMINAL_FAILURE_STATUSES:
@@ -2758,8 +2787,9 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
 
         # Resolve the save target before the billable POST. This catches missing
         # project/macro configuration without creating or overwriting a file.
+        # A required {_index} is deferred to the engine's collision-safe write.
         destination = self._output_file.build_file()
-        destination.resolve()
+        self._preflight_output_destination(destination)
 
         self._prepare_usage_tracking(
             params, existing_task=bool(resume_generation_id)

@@ -7,19 +7,17 @@
 
 ## Agent policy availability
 
-Release `0.5.15` includes exactly one signed production fallback policy at
-`resources/agent/hmb_agent_core.dat`. The runtime first tries the optional
-administrator path configured through `HMB_AGENT_POLICY_PATH`; if that path is
-missing, unavailable, or invalid, it verifies and uses the bundled policy. Team
-members can therefore install the complete ZIP and run the canonical
-`HMBPromptLibrary -> HMBAgentLibrary` flow without configuring a network-share
-environment variable.
+Release `0.5.16` includes exactly one signed production policy at
+`resources/agent/hmb_agent_core.dat`. The runtime reads, verifies, and uses only
+this file from the installed library. Team members can install the complete ZIP
+and run the canonical `HMBPromptLibrary -> HMBAgentLibrary` flow without a
+network policy share or policy-path environment variable.
 
 The bundled envelope is policy version
-`2026-08-01.goal-final-authority.v2`, contract SHA-256
-`a17809e4103628c1b0ab0b96081f6325faf9d16703a5fac57ef7d1eaa7d043bf`,
+`2026-08-06.animation-look-continuity.v3`, contract SHA-256
+`ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93`,
 and file SHA-256
-`94533d84ab914971026f624634c2553a0c7abba298f6dd76242d996ee5c9137f`.
-It contains no signing private key or API credentials. Existing external-policy
-deployment remains supported and has priority when its signature and contract
-are valid.
+`6152355dd51d68da33d4df197e6ac52f2c13b37d9644aa50efd9ba8c2cf13619`.
+It contains no signing private key or API credentials. The release ZIP contains
+exactly 25 allowlisted runtime files and does not include `CHANGELOG.md` or
+`resources/build_release.py`.

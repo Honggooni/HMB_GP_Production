@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -11,6 +12,9 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[2]
+EXPECTED_POLICY_VERSION = "2026-08-06.animation-look-continuity.v3"
+EXPECTED_CONTRACT_SHA256 = "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93"
+EXPECTED_POLICY_SHA256 = "6152355dd51d68da33d4df197e6ac52f2c13b37d9644aa50efd9ba8c2cf13619"
 
 
 def load(filename: str, alias: str):
@@ -260,10 +264,15 @@ try:
     policy = agent_library.get_internal_policy_rules()
     policy_identity = common.get_internal_policy_identity()
     assert policy
-    assert len(policy_identity["contract_sha256"]) == 64
+    assert policy_identity == {
+        "version": EXPECTED_POLICY_VERSION,
+        "contract_sha256": EXPECTED_CONTRACT_SHA256,
+    }
     bundled_policy_path = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
     assert bundled_policy_path.is_file()
-    assert policy.encode("utf-8") not in bundled_policy_path.read_bytes()
+    bundled_policy = bundled_policy_path.read_bytes()
+    assert hashlib.sha256(bundled_policy).hexdigest() == EXPECTED_POLICY_SHA256
+    assert policy.encode("utf-8") not in bundled_policy
 finally:
     shutil.rmtree(project_root, ignore_errors=True)
 

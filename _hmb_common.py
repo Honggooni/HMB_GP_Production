@@ -61,11 +61,7 @@ except Exception:  # Local validation fallback only.
 
 
 ROOT = Path(__file__).resolve().parent
-AGENT_RULE_DATA_PATH_ENV = "HMB_AGENT_POLICY_PATH"
-# Test-only/runtime override. Production resolves the external policy location
-# from AGENT_RULE_DATA_PATH_ENV so no internal server path enters public source.
-AGENT_RULE_DATA_PATH: Optional[Path] = None
-_BUNDLED_AGENT_RULE_DATA_PATH = (
+_BUNDLED_AGENT_POLICY_FILE = (
     ROOT / "resources" / "agent" / "hmb_agent_core.dat"
 )
 _AGENT_POLICY_MAX_ENVELOPE_BYTES = 128 * 1024
@@ -75,14 +71,21 @@ WARN_LOG_PREFIX = "[HMB_PRODUCTION][WARN]"
 
 _AGENT_POLICY_ENVELOPE_SCHEMA = "hmb-agent-policy-envelope-v3"
 _AGENT_POLICY_SCHEMA = "hmb-agent-policy-v3"
-_AGENT_POLICY_VERSION = "2026-08-01.goal-final-authority.v2"
+_AGENT_POLICY_VERSION = "2026-08-06.animation-look-continuity.v3"
 _AGENT_POLICY_CONTRACT_SHA256 = (
-    "a17809e4103628c1b0ab0b96081f6325faf9d16703a5fac57ef7d1eaa7d043bf"
+    "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93"
 )
 _AGENT_POLICY_SIGNATURE_ALGORITHM = "RSASSA-PKCS1-v1_5-SHA256"
-_AGENT_POLICY_SIGNING_KEY_ID = "hmb-policy-release-2026-08"
+_AGENT_POLICY_SIGNING_KEY_ID = "hmb-policy-release-2026-08-r2"
 _AGENT_POLICY_RSA_MODULUS_B64 = (
-    "rk4bQ5PdonrKTsz1vHNFVxClgRlC2fVj5WKE2JV0Bq7yWCU+5u5sc/G+UpSwiOQcWu179+Xw1h9UdmwhVL7DvLZgByGSEkv1X+1Tlf6/7NQBklGAoywudUE3eADlfxfoqxxDfnscXLrNRSucZvoAN2lgyY8STMa0EAKOsmr4yC+wSc73nFLVjBVMLbKgZ3IcviT8rh5iUxhBLWGW3kkM3T1MEVFYwpFxZVn2ag5P0e4EMBUA4ML07bwFBpc6cHpL/TFRoQORjHFobMjvfKvwa2lVYGaGka9IdOXT8l+Y8il9svJAAfj2c73G95kcn7uwjYupSmaCKRjEVH9clKCL27zXQqxzXZ+ugeQLs92Uqeu1IsxneWr9VZlmc5jSKLf6sq8Sg+9Zc8rgMLwJ9HqI090Ov0Vs48deKcwPN9tGqmgRZOGRF1i7PjTyyJ02MbMQLnAHhPXIvWPbzzZ6ZHDFr747Eh0JsYlwn3zCTp7HeGKQjxIRbD9uKoNyGTu/caT1"
+    "qxFfkj7CcIH0dsYioONQF7NGo75tSNqj6RxN6rqC72zph7ghqImGb+gQPcdOy3ui"
+    "hALs3D2wkcqqw3B9qhp3Or1PLtO7tIyIvMIfjK4uXyzGxirYdF0b/zlxOl5SKsdz"
+    "gB+rY9uvKgFEngIc5aSKcEVPebIhv77AGe6/AS39YV7kidShQvQPG9XRAGbm7ca/G"
+    "gqXk0kTFnGpx4nsPaQNdv/oh71t1qzQbUSZRpSqzz2/RCXc2So9ywo+l6DY0uuA4"
+    "rPj6U/7k4R6pwWyN/xgYDXHcTLXG6iZ8pUIS+4gLLCwyMBYmy3mFGcLif9MLZKZ9"
+    "7Rp6cxLixm9X6iaf0vBOt4CvoFTPcqXyl+uJTzRcjD1RnZHBmcDR5toCNIRU4myoN"
+    "6gu4M9Xs573/ipfqya2aWYSitCuj0pU/uAvhTcywZGmR3rgS/dZC4fNymykYoiD/t"
+    "7isLt+2LE2v8ADkeZszbJLQuh6jyqyINxirwlddIBEIR6rWqmK0qEm9pJ0uvV"
 )
 _AGENT_POLICY_RSA_EXPONENT = 65537
 
@@ -363,26 +366,9 @@ def _verify_agent_policy_signature(payload_bytes: bytes, signature: bytes) -> bo
         return False
 
 
-def _resolve_agent_rule_data_path() -> Path:
-    override = AGENT_RULE_DATA_PATH
-    if override is not None:
-        return Path(override)
-    configured_value = str(os.environ.get(AGENT_RULE_DATA_PATH_ENV, "")).strip()
-    if not configured_value or "\x00" in configured_value or len(configured_value) > 4096:
-        raise RuntimeError("external policy path is not configured")
-    candidate = Path(configured_value)
-    if (
-        not candidate.is_absolute()
-        or configured_value.startswith(("\\\\?\\", "\\\\.\\"))
-        or candidate.suffix.casefold() != ".dat"
-    ):
-        raise RuntimeError("external policy path is invalid")
-    return candidate
-
-
-def _read_agent_policy_envelope(path: Path) -> bytes:
-    """Read no more than the signed-envelope budget from external storage."""
-    with Path(path).open("rb") as stream:
+def _read_agent_policy_envelope() -> bytes:
+    """Bound the only policy read to the signed file shipped with the library."""
+    with _BUNDLED_AGENT_POLICY_FILE.open("rb") as stream:
         encoded = stream.read(_AGENT_POLICY_MAX_ENVELOPE_BYTES + 1)
     if not encoded or len(encoded) > _AGENT_POLICY_MAX_ENVELOPE_BYTES:
         raise RuntimeError("HMB_GP_Agent_Library policy envelope has an invalid size.")
@@ -502,34 +488,13 @@ def _validate_agent_policy_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _load_agent_rule_payload_from_path(path: Path) -> Dict[str, Any]:
-    """Load and verify one signed Agent policy without selecting a fallback."""
-    try:
-        encoded = _read_agent_policy_envelope(path)
-    except Exception as exc:
-        raise RuntimeError(
-            "HMB_GP_Agent_Library internal rule payload could not be loaded."
-        ) from exc
-    return _validate_agent_policy_payload(
-        _decode_signed_agent_policy_envelope(encoded)
-    )
-
-
 def _load_agent_rule_payload() -> Dict[str, Any]:
-    """Prefer a valid external policy, then verify the bundled signed policy."""
-    # ``AGENT_RULE_DATA_PATH`` is an explicit test/runtime override.  Keeping it
-    # outside the production fallback path ensures a broken override fails
-    # visibly instead of being hidden by the bundled policy.
-    if AGENT_RULE_DATA_PATH is not None:
-        return _load_agent_rule_payload_from_path(_resolve_agent_rule_data_path())
-
+    """Load, verify, and validate the one policy shipped with the library."""
     try:
-        return _load_agent_rule_payload_from_path(_resolve_agent_rule_data_path())
-    except Exception:
-        pass
-
-    try:
-        return _load_agent_rule_payload_from_path(_BUNDLED_AGENT_RULE_DATA_PATH)
+        encoded = _read_agent_policy_envelope()
+        return _validate_agent_policy_payload(
+            _decode_signed_agent_policy_envelope(encoded)
+        )
     except Exception as exc:
         raise RuntimeError(
             "HMB_GP_Agent_Library internal rule payload could not be loaded."
