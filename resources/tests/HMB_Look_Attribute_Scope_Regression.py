@@ -57,10 +57,16 @@ assert "HMB_AGENT_POLICY_PATH" not in agent_source
 assert "내부 정책 공유폴더" not in agent_source
 assert "사용자 로컬에 동봉된 hmb_agent_core.dat" in agent_source
 assert "_assert_prompt_policy_identity_matches_signed_runtime()" in agent_source
-# Prompt-only mode still carries the integration defaults needed to finish one
-# coherent animation shot even when no image or video library is connected.
+# The public Prompt package identifies only its downstream target. Detailed
+# production defaults belong exclusively to the signed Agent policy and must
+# not be exposed or duplicated in user-visible Prompt text.
 prompt_only = prompt._build_prompt_package(prompt._default_widget_state())
-for anchor in (
+assert (
+    "TARGET GENERATOR:\n"
+    "This prompt is written for the active downstream target generator or execution system.\n"
+) in prompt_only
+for hidden_policy_detail in (
+    "Interpret all source bindings",
     "PRODUCTION INTEGRATION DEFAULTS:",
     "Unless an explicit scoped instruction changes it, stable deep focus uses camera-relative scene depth",
     "Characters and environment within the same focus range receive the same optical response",
@@ -79,8 +85,30 @@ for anchor in (
     "Direct optical illumination and shadow follow onset, peak, and falloff",
     "secondary physical response may use causal inertia, diffusion, delay, damping, dissipation, and recovery",
 ):
-    assert anchor in prompt_only, anchor
+    assert hidden_policy_detail not in prompt_only, hidden_policy_detail
 assert "subject-only blur" not in prompt_only.casefold()
+
+# The bundled signed v3 policy remains the authority for the removed public
+# defaults; the Prompt compiler must not become their second policy store.
+signed_policy = "\n".join(str(document) for document in prompt._hmb.get_internal_policy_documents())
+for policy_anchor in (
+    "camera-relative scene depth",
+    "semantic object class",
+    "environment map",
+    "macro layout",
+    "structural density",
+    "shared scene lighting",
+    "beautification",
+    "bidirectional contact",
+    "onset, peak, and falloff",
+    "inertia",
+    "diffusion",
+    "delay",
+    "damping",
+    "dissipation",
+    "recovery",
+):
+    assert policy_anchor.casefold() in signed_policy.casefold(), policy_anchor
 
 # A narrow optional role label cannot silently discard the animator-authored
 # full-shot state. It remains an emphasis unless the user supplies a scoped
