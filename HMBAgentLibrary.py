@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 import hashlib
 import importlib.util
@@ -67,11 +68,23 @@ _HMB_TOPOLOGY_WARNING_NAME = "HMB_AGENT_CONNECTION_CHECK_WARNING"
 _FINAL_TEXT_DISPLAY_NAME = "FINAL TEXT · GENERATOR"
 _AGENT_STATE_DISPLAY_NAME = "AGENT STATE · CHAIN ONLY"
 _HMB_POLICY_UNAVAILABLE_MESSAGE = (
-    "[HMB POLICY REQUIRED] HMB Agent 정책이 없거나 검증되지 않았습니다. "
-    "HMBPromptLibrary가 연결된 실행은 순정 Agent로 대체하지 않고 중단했습니다. "
-    "HMB_AGENT_POLICY_PATH, 내부 정책 공유폴더 접근 권한 및 파일 상태를 확인한 뒤 "
+    "[HMB LOCAL POLICY REQUIRED] 사용자 로컬에 동봉된 hmb_agent_core.dat가 "
+    "누락되었거나 손상되어 검증할 수 없습니다. HMBPromptLibrary가 연결된 실행은 "
+    "순정 Agent로 대체하지 않고 중단했습니다. HMB_GP_Production을 다시 설치하거나 "
+    "업데이트한 뒤 Griptape를 다시 시작하고 재시도하십시오."
+)
+_HMB_POLICY_IDENTITY_MISMATCH_MESSAGE = (
+    "[HMB POLICY VERSION MISMATCH] HMBPromptLibrary의 정책 소스와 "
+    "서명된 Agent 런타임 정책 버전이 일치하지 않습니다. "
+    "HMB_GP_Production을 동일한 배포 버전으로 다시 설치하거나 업데이트한 뒤 "
     "Griptape를 다시 시작하고 재시도하십시오."
 )
+
+
+class _HMBPolicyIdentityMismatchError(RuntimeError):
+    """Internal typed signal for the public fail-closed version diagnostic."""
+
+
 _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE = (
     "[HMB CONNECTION CHECK FAILED] Prompt 연결 상태를 안전하게 확인할 수 없어 "
     "Agent 실행을 중단했습니다. 연결 상태를 확인한 뒤 재시도하십시오."
@@ -516,6 +529,77 @@ def _is_hmb_prompt_library_payload(value: Any) -> bool:
     if not all(marker in text for marker in _HMB_REQUIRED_MARKERS):
         return False
     return any(marker in text for marker in _HMB_ANY_BINDING_MARKERS)
+
+
+def _prompt_policy_source_identity(
+    source_path: Path | None = None,
+) -> tuple[str, str]:
+    """Read the Prompt compiler's declared policy identity without importing it.
+
+    HMBPromptLibrary can advance to a reviewed source candidate before the
+    authorized signer produces a matching runtime envelope. Reading the two
+    literal assignments through the AST avoids circular imports and prevents a
+    comment or unrelated legacy digest from satisfying the runtime guard.
+    """
+
+    path = Path(source_path) if source_path is not None else _THIS_DIR / "HMBPromptLibrary.py"
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except Exception as exc:
+        raise RuntimeError("HMB Prompt policy source identity could not be read.") from exc
+    wanted = {
+        "PROMPT_POLICY_SOURCE_VERSION": "",
+        "PROMPT_POLICY_SOURCE_CONTRACT_SHA256": "",
+    }
+    seen: set[str] = set()
+    for node in tree.body:
+        targets: list[ast.expr] = []
+        value_node: ast.expr | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value_node = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value_node = node.value
+        if value_node is None:
+            continue
+        for target in targets:
+            if not isinstance(target, ast.Name) or target.id not in wanted:
+                continue
+            if target.id in seen:
+                raise RuntimeError(f"Duplicate HMB Prompt policy identity: {target.id}")
+            seen.add(target.id)
+            try:
+                value = ast.literal_eval(value_node)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"HMB Prompt policy identity is not a string literal: {target.id}"
+                ) from exc
+            if not isinstance(value, str):
+                raise RuntimeError(
+                    f"HMB Prompt policy identity is not a string literal: {target.id}"
+                )
+            wanted[target.id] = value.strip()
+    version = wanted["PROMPT_POLICY_SOURCE_VERSION"]
+    contract = wanted["PROMPT_POLICY_SOURCE_CONTRACT_SHA256"].lower()
+    if not version or not re.fullmatch(r"[0-9a-f]{64}", contract):
+        raise RuntimeError("HMB Prompt policy source identity is incomplete.")
+    return version, contract
+
+
+def _assert_prompt_policy_identity_matches_signed_runtime() -> tuple[str, str]:
+    """Fail closed before one HMB execution can mix compiler/policy versions."""
+
+    prompt_identity = _prompt_policy_source_identity()
+    runtime_identity = (
+        str(_hmb._AGENT_POLICY_VERSION),
+        str(_hmb._AGENT_POLICY_CONTRACT_SHA256).lower(),
+    )
+    if prompt_identity != runtime_identity:
+        raise _HMBPolicyIdentityMismatchError(
+            _HMB_POLICY_IDENTITY_MISMATCH_MESSAGE
+        )
+    return prompt_identity
 
 
 def _is_direct_hmb_prompt_library_connection(
@@ -1252,6 +1336,19 @@ class HMBAgentLibrary(_BaseAgent):
             self._clear_hmb_runtime_policy()
             self._hide_hmb_policy_warning()
             return (yield from self._run_native_agent_once())
+
+        try:
+            _assert_prompt_policy_identity_matches_signed_runtime()
+        except _HMBPolicyIdentityMismatchError:
+            self._publish_hmb_execution_block(
+                _HMB_POLICY_IDENTITY_MISMATCH_MESSAGE
+            )
+            raise RuntimeError(
+                _HMB_POLICY_IDENTITY_MISMATCH_MESSAGE
+            ) from None
+        except Exception:
+            self._publish_hmb_execution_block(_HMB_POLICY_UNAVAILABLE_MESSAGE)
+            raise RuntimeError(_HMB_POLICY_UNAVAILABLE_MESSAGE) from None
 
         try:
             (

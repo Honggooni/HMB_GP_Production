@@ -12,9 +12,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.5.15"
-EXPECTED_POLICY_VERSION = "2026-08-01.goal-final-authority.v2"
-EXPECTED_CONTRACT_SHA256 = "a17809e4103628c1b0ab0b96081f6325faf9d16703a5fac57ef7d1eaa7d043bf"
+EXPECTED_RELEASE_VERSION = "0.5.16"
+EXPECTED_POLICY_VERSION = "2026-08-06.animation-look-continuity.v3"
+EXPECTED_CONTRACT_SHA256 = "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93"
 BASE_MASTER_SEEDS = (
     20260729,
     0x484D42,
@@ -93,7 +93,12 @@ for rules in (policy, binding):
     assert "final creative authority" in normalized_rules
     assert "interpretation hint" in normalized_rules
     assert "never downgrade supplied content to context-only" in normalized_rules
-    assert "explicit user goal may use any visible property" in normalized_rules
+    assert "explicit scoped exception" in normalized_rules
+    assert "named target or clearly scene-wide scope" in normalized_rules
+    assert "stable default focus" in normalized_rules
+    assert "explicit user goal may use any visible property" not in normalized_rules
+    assert "may broaden, narrow, or reframe" not in normalized_rules
+    assert "target-property-time" not in normalized_rules
 
 # Every non-empty library composition is represented, while Agent routing has
 # only two legitimate modes: native for compositions without Prompt, and the

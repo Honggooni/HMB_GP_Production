@@ -64,6 +64,10 @@ except Exception:
 
 MAX_IMAGES = 50
 MAX_VIDEOS = 10
+PROMPT_POLICY_SOURCE_VERSION = "2026-08-06.animation-look-continuity.v3"
+PROMPT_POLICY_SOURCE_CONTRACT_SHA256 = (
+    "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93"
+)
 PICKER_DEPTH_PROFILE = "hmb_camera_space_depth_v7"
 PICKER_MOTION_GUIDE_PROFILE = "hmb_target_neutral_motion_guide_v5"
 PICKER_LEGACY_MOTION_GUIDE_PROFILES = frozenset({
@@ -187,45 +191,45 @@ VIDEO_ROLE_COMPATIBILITY = {
 SELF_SCOPED_AUXILIARY_REFERENCE_SPECS = {
     ("Maya Preview / Playblast", "Spatial Alignment Verification Only"): {
         "authority_domain": "playblast_spatial_verification",
-        "fields": "default interpretation: camera-space alignment, framing, composition, relative depth, occlusion, and spatial ordering",
+        "fields": "protected animator-authored acting, motion, pose, timing, trajectory, contact, camera, framing, visibility, occlusion, relative depth, and spatial arrangement; the selected role emphasizes spatial verification without narrowing that shot state",
         "time_mapping": "source-local timing as supplied; cross-source alignment applies only to an explicitly declared Picker companion bundle",
-        "authority": "default spatial-verification interpretation; explicit current user goals may broaden, narrow, or reframe use",
+        "authority": "the role label is an interpretation emphasis, not a cross-attribute override; an explicit scoped instruction may change only its named property for a named target or clearly scene-wide scope; if no temporal subset is stated or clearly implied, it applies to the whole shot, otherwise only to that subset",
     },
     ("Camera / Layout Reference", "Spatial Alignment Verification Only"): {
         "authority_domain": "camera_layout_verification",
         "fields": "default interpretation: camera, layout, framing, composition, screen position, and spatial alignment",
         "time_mapping": "source-local timing as supplied; cross-source alignment applies only to an explicitly declared Picker companion bundle",
-        "authority": "default camera/layout-verification interpretation; explicit current user goals may broaden, narrow, or reframe use",
+        "authority": "default camera/layout-verification interpretation; an explicit scoped instruction may change only its named property for a named target or clearly scene-wide scope; if no temporal subset is stated or clearly implied, it applies to the whole shot, otherwise only to that subset",
     },
     ("Depth / Spatial Reference", "Spatial Alignment Verification Only"): {
         "authority_domain": "depth_spatial_verification",
         "fields": "default interpretation: relative depth, occlusion, and spatial ordering",
         "time_mapping": "source-local timing as supplied; cross-source alignment applies only to an explicitly declared Picker companion bundle",
-        "authority": "default depth/spatial interpretation; explicit current user goals may broaden, narrow, or reframe use",
+        "authority": "default depth/spatial interpretation; an explicit scoped instruction may change only its named property for a named target or clearly scene-wide scope; if no temporal subset is stated or clearly implied, it applies to the whole shot, otherwise only to that subset",
     },
     ("Motion Guide / Retargeting Reference", "Derived Motion Decoding Only"): {
         "authority_domain": "derived_motion_decoding",
         "fields": "default interpretation: target-neutral root, joint, contact, trajectory, and rigid-transform decoding of supplied source motion",
         "time_mapping": "source-local timing as supplied; exact bundle correspondence applies only when Picker provenance explicitly declares a companion source",
-        "authority": "default motion-decoding/retargeting interpretation; explicit current user goals may broaden, narrow, or reframe use",
+        "authority": "default motion-decoding/retargeting interpretation; an explicit scoped instruction may change only its named property for a named target or clearly scene-wide scope; if no temporal subset is stated or clearly implied, it applies to the whole shot, otherwise only to that subset",
     },
     ("Maya Preview / Playblast", "Timing Only"): {
         "authority_domain": "playblast_timing_verification",
-        "fields": "default interpretation: full-shot source-time alignment and timing cues",
+        "fields": "protected animator-authored acting, motion, pose, timing, trajectory, contact, camera, framing, visibility, occlusion, relative depth, and spatial arrangement; the selected role emphasizes timing verification without narrowing that shot state",
         "time_mapping": "source-local timing as supplied; cross-source alignment applies only to an explicitly declared Picker companion bundle",
-        "authority": "default timing-verification interpretation; explicit current user goals may broaden, narrow, or reframe use",
+        "authority": "the role label is an interpretation emphasis, not a cross-attribute override; an explicit scoped instruction may change only its named property for a named target or clearly scene-wide scope; if no temporal subset is stated or clearly implied, it applies to the whole shot, otherwise only to that subset",
     },
     ("Timing / Edit Reference", "Timing Only"): {
         "authority_domain": "timing_edit_verification",
         "fields": "default interpretation: full-shot edit cadence, cut position, source-time alignment, and timing cues",
         "time_mapping": "source-local timing as supplied; cross-source alignment applies only to an explicitly declared Picker companion bundle",
-        "authority": "default timing/edit interpretation; explicit current user goals may broaden, narrow, or reframe use",
+        "authority": "default timing/edit interpretation; an explicit scoped instruction may change only its named property for a named target or clearly scene-wide scope; if no temporal subset is stated or clearly implied, it applies to the whole shot, otherwise only to that subset",
     },
     ("Lighting / Look Reference", "Lighting / Look Only"): {
         "authority_domain": "integration_lighting_look_reference",
         "fields": "default interpretation: full-shot integration lighting and atmosphere consistency",
         "time_mapping": "source-local timing as supplied; cross-source alignment applies only to an explicitly declared Picker companion bundle",
-        "authority": "default lighting/look-reference interpretation; explicit current user goals may broaden, narrow, or reframe use",
+        "authority": "default lighting/look-reference interpretation; an explicit scoped instruction may change only its named property for a named target or clearly scene-wide scope; if no temporal subset is stated or clearly implied, it applies to the whole shot, otherwise only to that subset",
     },
 }
 
@@ -1725,7 +1729,10 @@ def _format_control_only_binding(entry: Dict[str, Any]) -> str:
     return (
         f"@video{int(entry['video'])} / Target = {entry['target']} / Function = {entry['function']}"
         f"{marker} / Control Boundary = {entry['boundary']} / Default interpretation = control cue; "
-        "the explicit current user goal may use any visible or supplied property"
+        "an explicit scoped instruction may use a named visible or supplied property only for its "
+        "named Target and declared Control Boundary; if no separate temporal subset is stated or "
+        "clearly implied, it applies to the whole shot, otherwise only to that subset; it does not expand into "
+        "unrelated identity, material, lighting, motion, camera, or final-look attributes"
     )
 
 
@@ -2572,15 +2579,25 @@ def _image_role_line(item: Dict[str, Any], seq: int) -> str:
     def line_for(scope: str) -> str:
         suffix = _detail_suffix(scope)
         if st_choice == "Character Appearance":
-            return f"{owner} / Approved final appearance source = {token}{suffix}"
+            return (
+                f"{owner} / Approved final appearance source = {token}{suffix} / "
+                "Authority = intrinsic identity, color, pattern, and material character; white backdrop, "
+                "studio lighting, baked highlight/shadow, matte spill, and halo are not scene-light authority"
+            )
         if st_choice == "Partial Character Detail":
             return f"{owner} / Partial character detail source = {token}{suffix}"
         if st_choice == "Prop / Accessory":
-            return f"{owner} prop / accessory source = {token}{suffix}{_target_function_suffix(scope)}"
+            return (
+                f"{owner} prop / accessory source = {token}{suffix}{_target_function_suffix(scope)} / "
+                "Authority = intrinsic prop appearance only; reference lighting is not inherited"
+            )
         if st_choice == "Costume / Clothing":
             return f"{owner} costume / clothing source = {token}{suffix}"
         if st_choice == "Environment / Background":
-            return f"{owner} / Environment / background source = {token}{suffix}"
+            return (
+                f"{owner} / Environment / background source = {token}{suffix} / "
+                "Authority = continuous environment appearance and target lighting context, including dummy regions"
+            )
         if st_choice == "Sky / Exterior Background":
             return f"{owner} / Sky / exterior background source = {token}{suffix}"
         if st_choice == "Set / Structure":
@@ -2592,14 +2609,18 @@ def _image_role_line(item: Dict[str, Any], seq: int) -> str:
         if st_choice == "Color + Look + Lighting Mood Reference":
             return f"{owner} / Color / look / lighting reference = {token}{suffix}"
         if st_choice == "Lighting / Atmosphere Reference":
-            return f"{owner} / Lighting / atmosphere source = {token}{suffix}"
+            return (
+                f"{owner} / Lighting / atmosphere source = {token}{suffix} / "
+                "Default = implementation evidence for the approved background or sequence look unless explicitly approved as lighting authority"
+            )
         if st_choice == "Scale / Composition Reference":
             return f"{owner} / Scale / composition reference = {token}{suffix}"
         if st_choice == "Custom":
             return f"{owner} / {st} = {token}{suffix}"
         return (
             f"Unclassified image idea reference = {token} / No missing role is inferred / "
-            "Use the supplied content according to the current user goal"
+            "Use every attribute supported by readable evidence or an explicit scoped exception; "
+            "do not infer unrelated identity, material, lighting, motion, camera, or final-look authority"
         )
 
     lines: List[str] = []
@@ -2702,7 +2723,7 @@ def _self_scoped_auxiliary_reference(item: Dict[str, Any], seq: int) -> Dict[str
             "authority_domain": "descriptive_context",
             "fields": "default interpretation: descriptive shot context",
             "time_mapping": "source-local timing as supplied; no cross-source mapping is inferred",
-            "authority": "default context interpretation; explicit current user goals may broaden, narrow, or reframe use",
+            "authority": "default context interpretation; an explicit scoped instruction may change only its named property for a named target or clearly scene-wide scope; if no temporal subset is stated or clearly implied, it applies to the whole shot, otherwise only to that subset",
         }
     spec = SELF_SCOPED_AUXILIARY_REFERENCE_SPECS.get((source_type, role))
     return dict(spec) if isinstance(spec, dict) else None
@@ -3100,8 +3121,9 @@ def _video_role_line(
             f"{token} self-scoped reference = Reference Domain = Current shot / Boundary = Full shot / "
             f"Fields = {self_scoped['fields']} / Time Mapping = {self_scoped['time_mapping']} / "
             f"Authority = {self_scoped['authority']}",
-            f"{token} default role interpretation is advisory; an explicit current user goal governs "
-            "broader, narrower, or different use of the supplied source.",
+            f"{token} default role interpretation is advisory; an explicit scoped instruction may change "
+            "only its named property for a named target or clearly scene-wide scope; if no temporal "
+            "subset is stated or clearly implied, it applies to the whole shot, otherwise only to that subset.",
         ]
     elif role == "Primary Unified Shot Control":
         lines = [
@@ -3112,15 +3134,17 @@ def _video_role_line(
         lines = [
             f"{token} = {st} / {role or 'Unspecified optional role'} / "
             "Exact local bindings add Target + Control Boundary when supplied; their absence does not "
-            "limit use of this source for the current user goal"
+            "invalidate readable source attributes or create a connection gate"
         ]
     if st == "Maya Preview / Playblast":
         lines.append(
-            f"{token} Color Playblast scope = directly usable alone, with an optional Motion Guide, "
-            "or with any other supplied source according to the user goal / Proxy marker colors and "
-            "temporary Maya materials = default tracking/control labels; they do not by themselves establish "
-            "final appearance, while the explicit current user goal governs intended spatial, motion, timing, "
-            "visibility, and other use / "
+            f"{token} Color Playblast scope = animator-authored acting, motion, pose, timing, trajectory, "
+            "contact, camera, framing, visibility, occlusion, relative depth, and spatial arrangement are "
+            "protected shot state by default; a role label alone does not narrow them / Proxy marker colors, "
+            "Color Pick markers, temporary Maya materials, dummy shading, and temporary lighting = routing "
+            "or tracking controls, not final identity, material, lighting, or look authority / An explicit "
+            "scoped instruction may change only its named property for a named Target or clearly scene-wide "
+            "scope; if no temporal subset is stated or clearly implied, it applies to the whole shot, otherwise only to that subset / "
             "Image bindings and PROJECT_STYLE_LOOK add their declared authority only when supplied; "
             "their absence creates no dependency"
         )
@@ -6971,6 +6995,39 @@ def _build_prompt_package(state: Dict[str, Any]) -> str:
     lines.append("Interpret all source bindings, video shot-control instructions, timing notes, VFX placement, visibility states, occlusion behavior, and continuity requirements as production replacement re-render instructions.")
     lines.append("")
 
+    lines.append("PRODUCTION INTEGRATION DEFAULTS:")
+    lines.append(
+        "Focus = Unless an explicit scoped instruction changes it, stable deep focus uses camera-relative "
+        "scene depth. Characters and environment within the same focus range receive the same optical "
+        "response. Do not selectively focus or blur only characters or only environment by semantic "
+        "object class, and do not invent focus pumping or rack focus."
+    )
+    lines.append(
+        "Lighting = If an environment map or IBL is explicitly approved as lighting authority, use it "
+        "only within its stated scope. If supplied but not approved, treat it only as implementation "
+        "evidence for the approved background or sequence look. If none is usable, infer only low-frequency "
+        "sky and ground illumination, broad light direction, color temperature, contrast, and weather cues "
+        "conservatively from the approved background; do not invent an HDRI or dramatic light source."
+    )
+    lines.append(
+        "Environment = Environment dummies carry macro layout, volume, distribution, height, path, depth, "
+        "occlusion, and structural density; the approved background owns micro-density, surface appearance, "
+        "palette, and atmosphere."
+    )
+    lines.append(
+        "Character integration = Relight characters under shared scene lighting, exposure, atmosphere, "
+        "white balance, and grade; preserve intrinsic identity and material evidence and add no unstated "
+        "character-only lift, fill, saturation, contrast boost, or beautification."
+    )
+    lines.append(
+        "Effects = Scene-space effects require bidirectional contact, occlusion, shadow, reflected light, "
+        "atmospheric scattering, and vegetation response where meaningful. Camera, lens, and post effects "
+        "have no world contact and cast no world shadow. Direct optical illumination and shadow follow onset, "
+        "peak, and falloff; secondary physical response may use causal inertia, diffusion, delay, damping, "
+        "dissipation, and recovery."
+    )
+    lines.append("")
+
     lines.append("IMAGE SOURCE:")
     if active_images:
         for item in active_images:
@@ -6983,6 +7040,10 @@ def _build_prompt_package(state: Dict[str, Any]) -> str:
             lines.append(
                 f"@image{seq} = {label}{asset_id_suffix}{color_suffix}"
             )
+        lines.append(
+            "Color Pick values = target, mask, and reference-routing addresses; not final intrinsic "
+            "color, material, lighting, or background appearance authority"
+        )
     else:
         lines.append("No image source assigned in HMBPromptLibrary.")
     lines.append("")
@@ -7049,8 +7110,9 @@ def _build_prompt_package(state: Dict[str, Any]) -> str:
             lines.append("Every active video slot is independent; no slot, companion, Color Pick, image source, or local binding is required merely because another video is present.")
             lines.append("Explicit reciprocal image or structured control-only bindings add exact local Targets and boundaries when supplied.")
             lines.append(
-                "Recognized self-scoped role tuples provide a default verification/context interpretation; "
-                "an explicit current user goal may broaden, narrow, or reframe their use."
+                "Recognized self-scoped role tuples provide a default attribute interpretation; an explicit "
+                "scoped instruction may change only its named property for a named target or clearly scene-wide "
+                "scope; if no temporal subset is stated or clearly implied, it applies to the whole shot, otherwise only to that subset."
             )
             lines.append("Decoded metadata is validated for internal file/schema integrity. Cross-source alignment is enforced only when explicit Picker companion provenance declares those files as one bundle.")
             lines.append("Missing optional metadata or bindings never invents data and never blocks use of the sources that are present.")
@@ -7167,8 +7229,8 @@ def _build_prompt_package(state: Dict[str, Any]) -> str:
         for note in interpretation_notes:
             lines.append(f"- {note}")
         lines.append(
-            "These notes describe ambiguity without deleting or constraining supplied ideas; every source "
-            "remains available and the current user goal governs its use."
+            "These notes describe ambiguity without deleting supplied ideas; every source remains available "
+            "within the attributes its readable evidence supports or an explicit scoped exception."
         )
         lines.append("")
     if technical_errors:

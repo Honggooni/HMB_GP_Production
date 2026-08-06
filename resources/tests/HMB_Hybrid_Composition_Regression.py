@@ -232,8 +232,12 @@ for composition_name, composition_state in prompt_states.items():
     assert_prompt_is_additive(composition_state, composition_name)
 
 color_direct_prompt = prompt._build_prompt_package(prompt_states["VP"])
-assert "Color Playblast scope = directly usable alone" in color_direct_prompt
-assert "with an optional Motion Guide" in color_direct_prompt
+assert "Color Playblast scope = animator-authored acting" in color_direct_prompt
+assert "protected shot state by default" in color_direct_prompt
+assert "a role label alone does not narrow them" in color_direct_prompt
+assert "Proxy marker colors, Color Pick markers" in color_direct_prompt
+assert "not final identity, material, lighting, or look authority" in color_direct_prompt
+assert "explicit scoped instruction" in color_direct_prompt
 assert "Generator exposure prohibited" not in color_direct_prompt
 assert "must not be connected" not in color_direct_prompt
 

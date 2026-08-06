@@ -657,7 +657,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.5.15"
+assert manifest["metadata"]["library_version"] == "0.5.16"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
@@ -715,19 +715,23 @@ for native_size_key in (
 ):
     assert native_size_key not in agent_manifest["metadata"]
 
-# Approved Agent/runtime baseline hashes. The exact signed v2 policy is bundled
-# for offline fallback; private signing material remains external.
-assert (ROOT / "resources" / "agent" / "hmb_agent_core.dat").is_file()
+# Approved Agent/runtime baseline hashes. The exact signed v3 policy is the sole
+# local runtime policy; private signing material is not distributed.
+bundled_agent_policy = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
+assert bundled_agent_policy.is_file()
+assert hashlib.sha256(bundled_agent_policy.read_bytes()).hexdigest() == (
+    "6152355dd51d68da33d4df197e6ac52f2c13b37d9644aa50efd9ba8c2cf13619"
+)
 expected_agent_hashes = {
-    "HMBAgentLibrary.py": "1bd306735727af3313daf28e17af796f715b562e523d7bc049e78920eb754684",
-    "HMBPromptLibrary.py": "a90b36fdce5522210205fc4a584172aac804752e5ba8a139d1465438b0fb9de2",
+    "HMBAgentLibrary.py": "12a00bf11e5376998192a09f9a2e3b9fe4bab9d04e986fe1adc7be78946b81c6",
+    "HMBPromptLibrary.py": "a6f92d4e1727219d41fce7cc65b8cdd804b6637f86b98da91f6d03529d3f1e79",
     "HMBVideoPickerLibrary.py": "95acd3f94a7986e381b83db6683441ec42900df8a0d1f607f1240e0aea442eb6",
-    "_hmb_common.py": "25429b7af838e6a3958770782b7a8f04cef329ad9491c7847ca90e7d1080e240",
+    "_hmb_common.py": "1e4a6e1447e6ab08279d3f17f677974ce703602ed3b54185dd8fc755c0d2530d",
     "widgets/HMBAgentLibraryWidget.js": "61ea9416adc1cbfb7e8fbfbc068ad1a444c3f6d4b4c6b59569a1815a013dc193",
-    "resources/tests/HMB_Agent_Policy_Integration_Regression.py": "9cbc14e8aaf3bf9541ecb9793cac4184f0b29e76974c4efdf05c014840ffad43",
+    "resources/tests/HMB_Agent_Policy_Integration_Regression.py": "42fb8936937134cbe1a3c2c793b5116fb35381d07b0d1dd3a0c79f9c9c870e26",
     "resources/tests/HMB_Frame_Range_Regression.py": "4f9c0f7022b5db5bfa760e41f747ecbf95c99f0b06525553248fe3af9e2b1091",
-    "resources/tests/HMB_Output_Sanitizer_Regression.py": "a3744627240dc719670dc8790a2c1c5b1edd9ffd9f6b3fc1402933b1d0560229",
-    "resources/tests/HMB_Final_Policy_Recursive_Probabilistic_Regression.py": "ea8c781b65c9acec82e3c08731c6e807548efe34cb7868c4ca747de879e55b04",
+    "resources/tests/HMB_Output_Sanitizer_Regression.py": "390406b1903f28583ff29882b5fab2ef9befbfb13684de9e551d37f3ab6ce524",
+    "resources/tests/HMB_Final_Policy_Recursive_Probabilistic_Regression.py": "8f7e3397eec536072536c7cae6b4a22ec715a5cde17cc9ac872cb00e5114e85a",
 }
 for relative_path, expected_hash in expected_agent_hashes.items():
     actual_hash = hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest()

@@ -6,9 +6,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.5.15"
-EXPECTED_VERSION = "2026-08-01.goal-final-authority.v2"
-EXPECTED_CONTRACT_SHA256 = "a17809e4103628c1b0ab0b96081f6325faf9d16703a5fac57ef7d1eaa7d043bf"
+EXPECTED_RELEASE_VERSION = "0.5.16"
+EXPECTED_VERSION = "2026-08-06.animation-look-continuity.v3"
+EXPECTED_CONTRACT_SHA256 = "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93"
 OPTIONAL_MARKER = "OPTIONAL VIDEO CONTROL:"
 ISOLATION_MARKER = "COLOR PLAYBLAST ISOLATION WITHOUT DEPENDENCY:"
 FORBIDDEN_DEPENDENCIES = (
@@ -51,11 +51,15 @@ for rules in (policy, binding):
     assert "@video1 is not a prerequisite" in rules
     assert "Motion Guide, Depth, Color Playblast" in rules
     assert "generated companions are optional evidence" in rules
-    assert "proxy colors and temporary materials" in rules
-    assert "default interpretation, not a prohibition" in rules
-    assert "explicit user goal may use any visible property" in rules
+    assert "proxy colors" in rules
+    assert "temporary materials" in rules
+    assert "default production authority" in rules
+    assert "explicit scoped instruction" in rules
+    assert "named target or clearly scene-wide scope" in rules
+    assert "scoped exception never converts control visualization" in rules
     assert "separate image binding or Motion Guide is optional" in rules
-    assert "no source is rejected, narrowed, or omitted" in rules
+    assert "no source is rejected, narrowed, or omitted solely" in rules
+    assert "explicit user goal may use any visible property" not in rules
     for forbidden in FORBIDDEN_DEPENDENCIES:
         assert forbidden.casefold() not in rules.casefold(), forbidden
 
@@ -78,13 +82,17 @@ for clause in isolation_clauses:
     assert binding.count(clause) == 1
     assert clause.encode("utf-8") not in sealed
 
-# Proxy appearance has a safe default interpretation, but the user's explicit
-# goal remains able to override it without a media dependency or output gate.
+# Proxy appearance remains control visualization. Only an explicit property,
+# target, and temporal scope may create a local exception without a dependency
+# or output gate.
 isolation = isolation_clauses[1]
 assert "proxy colors" in isolation
-assert "default interpretation, not a prohibition" in isolation
-assert "explicit user goal may use any visible property" in isolation
-assert "no source is rejected, narrowed, or omitted" in isolation
+assert "default production authority" in isolation
+assert "named visible property" in isolation
+assert "named target or clearly scene-wide scope" in isolation
+assert "scoped exception never converts control visualization" in isolation
+assert "no source is rejected, narrowed, or omitted solely" in isolation
+assert "explicit user goal may use any visible property" not in isolation
 assert "zero identity or final-look authority" not in isolation
 assert "stop" not in isolation.casefold()
 assert "error" not in isolation.casefold()

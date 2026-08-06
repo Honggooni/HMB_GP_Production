@@ -146,6 +146,52 @@ VIDEO SOURCE:
 No video source assigned in HMBPromptLibrary.
 """
 
+EXPECTED_V3_POLICY_IDENTITY = (
+    "2026-08-06.animation-look-continuity.v3",
+    "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93",
+)
+SIGNED_RUNTIME_POLICY_IDENTITY = (
+    str(module._hmb._AGENT_POLICY_VERSION),
+    str(module._hmb._AGENT_POLICY_CONTRACT_SHA256).lower(),
+)
+actual_prompt_identity_reader = module._prompt_policy_source_identity
+actual_prompt_identity = actual_prompt_identity_reader()
+assert SIGNED_RUNTIME_POLICY_IDENTITY == EXPECTED_V3_POLICY_IDENTITY
+assert actual_prompt_identity == EXPECTED_V3_POLICY_IDENTITY
+assert module._assert_prompt_policy_identity_matches_signed_runtime() == (
+    EXPECTED_V3_POLICY_IDENTITY
+)
+
+# A stale or partially updated Prompt compiler must fail before loading or
+# executing the signed v3 runtime.
+def synthetic_stale_prompt_identity(_source_path=None):
+    return (
+        "2026-08-01.goal-final-authority.v2",
+        "0" * 64,
+    )
+
+
+module._prompt_policy_source_identity = synthetic_stale_prompt_identity
+identity_mismatch = canonical_hmb_agent()
+identity_mismatch.set_parameter_value("prompt", hmb_payload)
+try:
+    list(identity_mismatch.process())
+except RuntimeError as exc:
+    assert exc.__cause__ is None
+    assert str(exc) == module._HMB_POLICY_IDENTITY_MISMATCH_MESSAGE
+else:
+    raise AssertionError("A stale Prompt/signed-v3 runtime mismatch was accepted.")
+assert identity_mismatch.native_calls == 0
+assert identity_mismatch.parameter_output_values["agent"] == {}
+assert identity_mismatch.parameter_output_values["output"] == (
+    module._HMB_POLICY_IDENTITY_MISMATCH_MESSAGE
+)
+
+module._prompt_policy_source_identity = actual_prompt_identity_reader
+assert module._assert_prompt_policy_identity_matches_signed_runtime() == (
+    EXPECTED_V3_POLICY_IDENTITY
+)
+
 node = canonical_hmb_agent()
 assert module._AGENT_WIDGET_PARAMETER in node.parameters
 assert node.get_parameter_by_name("output").ui_options["display_name"] == (
@@ -456,5 +502,7 @@ assert "PROJECT_IDENTITY_SOURCE_AUTHORITY_AND_LANGUAGE" not in str(
 
 for obsolete in ("PROJECT", "project", "episode", "shot", "projects_root", "project_load_path", "Task"):
     assert obsolete not in node.parameters
+
+module._prompt_policy_source_identity = actual_prompt_identity_reader
 
 print("HMB native single-execution and hidden-rule protection regression: PASS")

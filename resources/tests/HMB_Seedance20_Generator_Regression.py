@@ -103,6 +103,20 @@ class FakeOutputFile:
         return self.destination
 
 
+class IndexedMacroDestination(FakeDestination):
+    def __init__(self, missing_variables: str = "_index") -> None:
+        super().__init__()
+        self.missing_variables = missing_variables
+        self.resolve_attempts = 0
+
+    def resolve(self) -> str:
+        self.resolve_attempts += 1
+        raise RuntimeError(
+            "Attempted to resolve macro path. Failed because missing required "
+            f"variables: {self.missing_variables}"
+        )
+
+
 class ScriptedNode(target.HMBSeedance20VideoGeneration):
     TEST_KEY = "regression-secret-key"
 
@@ -1112,6 +1126,44 @@ def assert_scripted_success_flow() -> None:
     )
 
 
+def assert_indexed_output_macro_contract() -> None:
+    # Required {_index} slots are allocated by ProjectFileDestination's write
+    # path. The node's non-writing preflight must not reject that valid setup.
+    node = ScriptedNode(
+        [
+            {
+                "id": "task-regression-1",
+                "status": "succeeded",
+                "content": {"video_url": "https://cdn.example/indexed.mp4"},
+            }
+        ]
+    )
+    indexed_destination = IndexedMacroDestination()
+    node.destination = indexed_destination
+    node._output_file = FakeOutputFile(indexed_destination)
+    node.set_parameter_value("prompt", "required output index regression")
+    asyncio.run(node._process_generation())
+
+    assert indexed_destination.resolve_attempts == 1
+    assert indexed_destination.written == b"\x00\x00\x00\x18ftypmp42regression-video"
+    assert [request["method"] for request in node.requests] == ["POST", "GET"]
+    assert node.parameter_output_values["was_successful"] is True
+
+    # No other missing macro variable may bypass the pre-billing validation.
+    invalid = ScriptedNode([])
+    invalid_destination = IndexedMacroDestination("_index, shot_name")
+    invalid.destination = invalid_destination
+    invalid._output_file = FakeOutputFile(invalid_destination)
+    invalid.set_parameter_value("prompt", "invalid output macro regression")
+    try:
+        asyncio.run(invalid._process_generation_impl())
+    except RuntimeError as exc:
+        assert "_index, shot_name" in str(exc)
+    else:
+        raise AssertionError("An unrelated missing output macro variable was accepted")
+    assert invalid.requests == []
+
+
 class FakeCloudDriver:
     def __init__(self) -> None:
         self.uploads: list[dict] = []
@@ -1846,6 +1898,7 @@ assert_video_picker_single_wire_host_contract()
 assert_secret_manager_contract()
 assert_payload_and_media_contract()
 assert_scripted_success_flow()
+assert_indexed_output_macro_contract()
 assert_local_video_temporary_publication()
 assert_tos_local_video_temporary_publication()
 assert_resume_flow_skips_post()
