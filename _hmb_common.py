@@ -65,6 +65,9 @@ AGENT_RULE_DATA_PATH_ENV = "HMB_AGENT_POLICY_PATH"
 # Test-only/runtime override. Production resolves the external policy location
 # from AGENT_RULE_DATA_PATH_ENV so no internal server path enters public source.
 AGENT_RULE_DATA_PATH: Optional[Path] = None
+_BUNDLED_AGENT_RULE_DATA_PATH = (
+    ROOT / "resources" / "agent" / "hmb_agent_core.dat"
+)
 _AGENT_POLICY_MAX_ENVELOPE_BYTES = 128 * 1024
 _AGENT_POLICY_MAX_DECOMPRESSED_BYTES = 512 * 1024
 PATH_LOG_PREFIX = "[HMB_PRODUCTION][PATH]"
@@ -499,10 +502,10 @@ def _validate_agent_policy_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _load_agent_rule_payload() -> Dict[str, Any]:
-    """Load a signed Agent policy on demand; invalid data is never injected."""
+def _load_agent_rule_payload_from_path(path: Path) -> Dict[str, Any]:
+    """Load and verify one signed Agent policy without selecting a fallback."""
     try:
-        encoded = _read_agent_policy_envelope(_resolve_agent_rule_data_path())
+        encoded = _read_agent_policy_envelope(path)
     except Exception as exc:
         raise RuntimeError(
             "HMB_GP_Agent_Library internal rule payload could not be loaded."
@@ -510,6 +513,27 @@ def _load_agent_rule_payload() -> Dict[str, Any]:
     return _validate_agent_policy_payload(
         _decode_signed_agent_policy_envelope(encoded)
     )
+
+
+def _load_agent_rule_payload() -> Dict[str, Any]:
+    """Prefer a valid external policy, then verify the bundled signed policy."""
+    # ``AGENT_RULE_DATA_PATH`` is an explicit test/runtime override.  Keeping it
+    # outside the production fallback path ensures a broken override fails
+    # visibly instead of being hidden by the bundled policy.
+    if AGENT_RULE_DATA_PATH is not None:
+        return _load_agent_rule_payload_from_path(_resolve_agent_rule_data_path())
+
+    try:
+        return _load_agent_rule_payload_from_path(_resolve_agent_rule_data_path())
+    except Exception:
+        pass
+
+    try:
+        return _load_agent_rule_payload_from_path(_BUNDLED_AGENT_RULE_DATA_PATH)
+    except Exception as exc:
+        raise RuntimeError(
+            "HMB_GP_Agent_Library internal rule payload could not be loaded."
+        ) from exc
 
 
 def get_internal_policy_rules() -> str:

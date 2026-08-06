@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.15 - 2026-08-06
+
+- Bundled the exact signed Agent policy
+  `2026-08-01.goal-final-authority.v2` as the verified offline fallback so team
+  installations remain usable when the configured network policy path is
+  missing, unavailable, or invalid. A valid external policy remains first in
+  the resolution order.
+- Pinned the bundled envelope to SHA-256
+  `94533d84ab914971026f624634c2553a0c7abba298f6dd76242d996ee5c9137f`
+  and retained the v2 contract SHA-256
+  `a17809e4103628c1b0ab0b96081f6325faf9d16703a5fac57ef7d1eaa7d043bf`.
+  Release creation now verifies the RSA signature, policy identity, internal
+  field digests, and runtime fallback path before packaging.
+- Expanded the complete production ZIP to exactly 26 files: the prior 25-file
+  allowlist plus one `resources/agent/hmb_agent_core.dat`. CI and archive
+  regressions reject every other `.dat`, private key, credential, token, or
+  secret file. No private signing key or API credential is included.
+
 ## 0.5.14 - 2026-08-05
 
 - Made server-searched MP4 imports publish a verified active-project copy even

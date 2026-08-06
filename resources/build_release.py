@@ -16,11 +16,14 @@ from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_VERSION = "0.5.14"
+RELEASE_VERSION = "0.5.15"
 POLICY_VERSION = "2026-08-01.goal-final-authority.v2"
 CONTRACT_SHA256 = "a17809e4103628c1b0ab0b96081f6325faf9d16703a5fac57ef7d1eaa7d043bf"
 AGENT_POLICY_PATH_ENV = "HMB_AGENT_POLICY_PATH"
-REQUIRE_EXTERNAL_POLICY_ENV = "HMB_REQUIRE_EXTERNAL_POLICY"
+BUNDLED_POLICY_RELATIVE = "resources/agent/hmb_agent_core.dat"
+BUNDLED_POLICY_SHA256 = (
+    "94533d84ab914971026f624634c2553a0c7abba298f6dd76242d996ee5c9137f"
+)
 
 ALLOWLIST = (
     "__init__.py",
@@ -48,6 +51,7 @@ ALLOWLIST = (
     "resources/maya/HMB_Maya_Binding_Setup.py",
     "resources/maya/HMBVideoPicker_Maya_Guide.txt",
     "resources/picker/HMB_Marker_Catalog.json",
+    BUNDLED_POLICY_RELATIVE,
 )
 PYTHON_COMPILE_TARGETS = (
     "__init__.py",
@@ -86,8 +90,8 @@ def assert_safe_relative(path_text: str) -> None:
         raise AssertionError(f"Unsafe release path: {path_text}")
 
 
-if len(ALLOWLIST) != 25 or len(set(ALLOWLIST)) != 25:
-    raise AssertionError("The release allowlist must contain 25 unique files.")
+if len(ALLOWLIST) != 26 or len(set(ALLOWLIST)) != 26:
+    raise AssertionError("The release allowlist must contain 26 unique files.")
 for relative in ALLOWLIST:
     assert_safe_relative(relative)
     source = ROOT / Path(relative)
@@ -1808,83 +1812,77 @@ if common_module._AGENT_POLICY_CONTRACT_SHA256 != CONTRACT_SHA256:
 if common_module.AGENT_RULE_DATA_PATH_ENV != AGENT_POLICY_PATH_ENV:
     raise AssertionError("Runtime external Agent policy environment name mismatch.")
 if common_module.AGENT_RULE_DATA_PATH is not None:
-    raise AssertionError("Runtime must not retain a bundled Agent policy fallback path.")
+    raise AssertionError("Runtime Agent policy override must be unset in production source.")
 
-bundled_policy_path = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
-if bundled_policy_path.exists():
-    raise AssertionError("Agent policy must not be bundled in the public source tree.")
+bundled_policy_path = (ROOT / Path(BUNDLED_POLICY_RELATIVE)).resolve()
+runtime_bundled_policy_path = Path(
+    common_module._BUNDLED_AGENT_RULE_DATA_PATH
+).resolve()
+if runtime_bundled_policy_path != bundled_policy_path:
+    raise AssertionError("Runtime bundled Agent policy path mismatch.")
+agent_data = common_module._read_agent_policy_envelope(bundled_policy_path)
+if digest(agent_data) != BUNDLED_POLICY_SHA256:
+    raise AssertionError("Bundled Agent policy envelope digest mismatch.")
+sealed_payload = common_module._decode_signed_agent_policy_envelope(agent_data)
+common_module._validate_agent_policy_payload(sealed_payload)
+if sealed_payload.get("schema") != common_module._AGENT_POLICY_SCHEMA:
+    raise AssertionError("Unexpected signed Agent payload schema.")
+if sealed_payload.get("final_policy_version") != POLICY_VERSION:
+    raise AssertionError("Signed Agent policy version mismatch.")
+if sealed_payload.get("final_motion_look_policy_sha256") != CONTRACT_SHA256:
+    raise AssertionError("Signed Agent contract digest mismatch.")
+for field in ("policy", "binding"):
+    rules = str(sealed_payload[field])
+    if digest(rules.encode("utf-8")) != sealed_payload[f"{field}_sha256"]:
+        raise AssertionError(f"Signed Agent {field} digest mismatch.")
+    if not rules.strip():
+        raise AssertionError(f"Sealed Agent {field} is empty.")
+    normalized_rules = rules.casefold()
+    for anchor in (
+        "final creative authority",
+        "interpretation hint",
+        "never downgrade supplied content to context-only",
+        "explicit user goal may use any visible property",
+    ):
+        if anchor not in normalized_rules:
+            raise AssertionError(
+                f"Sealed Agent goal-final-authority anchor missing: {anchor}"
+            )
+    for forbidden in (
+        "a missing role falls back to context-only use",
+        "a missing local binding prevents local control authority",
+        "zero identity or final-look authority",
+    ):
+        if forbidden in normalized_rules:
+            raise AssertionError(
+                f"Sealed Agent connection restriction remains: {forbidden}"
+            )
 
-external_policy_report = {
-    "bundled": False,
+agent_policy_report = {
+    "bundled": True,
+    "bundled_path": BUNDLED_POLICY_RELATIVE,
+    "envelope_sha256": BUNDLED_POLICY_SHA256,
+    "validated": True,
+    "policy_version": POLICY_VERSION,
+    "contract_sha256": CONTRACT_SHA256,
     "path_env": AGENT_POLICY_PATH_ENV,
+    "resolution_order": ["external", "bundled"],
     "envelope_schema": common_module._AGENT_POLICY_ENVELOPE_SCHEMA,
     "signature_algorithm": common_module._AGENT_POLICY_SIGNATURE_ALGORITHM,
     "signing_key_id": common_module._AGENT_POLICY_SIGNING_KEY_ID,
     "maximum_envelope_bytes": common_module._AGENT_POLICY_MAX_ENVELOPE_BYTES,
     "maximum_decompressed_bytes": common_module._AGENT_POLICY_MAX_DECOMPRESSED_BYTES,
 }
-sealed_policy_fragments: tuple[bytes, ...] = ()
-external_policy_path_text = str(os.environ.get(AGENT_POLICY_PATH_ENV, "")).strip()
-require_external_policy = str(
-    os.environ.get(REQUIRE_EXTERNAL_POLICY_ENV, "")
-).strip().casefold() in {"1", "true", "yes", "on"}
-if external_policy_path_text:
-    try:
-        agent_data = common_module._read_agent_policy_envelope(
-            Path(external_policy_path_text)
-        )
-    except Exception:
-        raise AssertionError(
-            "Configured external Agent policy could not be read."
-        ) from None
-    sealed_payload = common_module._decode_signed_agent_policy_envelope(agent_data)
-    common_module._validate_agent_policy_payload(sealed_payload)
-    if sealed_payload.get("schema") != common_module._AGENT_POLICY_SCHEMA:
-        raise AssertionError("Unexpected signed Agent payload schema.")
-    if sealed_payload.get("final_policy_version") != POLICY_VERSION:
-        raise AssertionError("Signed Agent policy version mismatch.")
-    if sealed_payload.get("final_motion_look_policy_sha256") != CONTRACT_SHA256:
-        raise AssertionError("Signed Agent contract digest mismatch.")
-    for field in ("policy", "binding"):
-        rules = str(sealed_payload[field])
-        if digest(rules.encode("utf-8")) != sealed_payload[f"{field}_sha256"]:
-            raise AssertionError(f"Signed Agent {field} digest mismatch.")
-        if not rules.strip():
-            raise AssertionError(f"Sealed Agent {field} is empty.")
-        normalized_rules = rules.casefold()
-        for anchor in (
-            "final creative authority",
-            "interpretation hint",
-            "never downgrade supplied content to context-only",
-            "explicit user goal may use any visible property",
-        ):
-            if anchor not in normalized_rules:
-                raise AssertionError(
-                    f"Sealed Agent goal-final-authority anchor missing: {anchor}"
-                )
-        for forbidden in (
-            "a missing role falls back to context-only use",
-            "a missing local binding prevents local control authority",
-            "zero identity or final-look authority",
-        ):
-            if forbidden in normalized_rules:
-                raise AssertionError(
-                    f"Sealed Agent connection restriction remains: {forbidden}"
-                )
-    sealed_policy_fragments = tuple(
-        str(item).encode("utf-8")
-        for item in (
-            *sealed_payload.get("final_motion_look_policy_clauses", ()),
-            *sealed_payload.get("video_appearance_isolation_clauses", ()),
-        )
-        if str(item)
+sealed_policy_fragments = tuple(
+    str(item).encode("utf-8")
+    for item in (
+        *sealed_payload.get("final_motion_look_policy_clauses", ()),
+        *sealed_payload.get("video_appearance_isolation_clauses", ()),
     )
-    if not sealed_policy_fragments:
-        raise AssertionError("Signed Agent policy contract is incomplete.")
-elif require_external_policy:
-    raise AssertionError(
-        f"{AGENT_POLICY_PATH_ENV} is required for this internal release audit."
-    )
+    if str(item)
+)
+if not sealed_policy_fragments:
+    raise AssertionError("Signed Agent policy contract is incomplete.")
 
 for relative in ALLOWLIST:
     source_bytes = (ROOT / relative).read_bytes()
@@ -1893,10 +1891,20 @@ for relative in ALLOWLIST:
 
 for relative in ALLOWLIST:
     lowered = relative.casefold()
-    if (
-        lowered.endswith("hmb_agent_core.dat")
-        or Path(relative).suffix.casefold() in {".env", ".jwk", ".key", ".p12", ".pem", ".pfx"}
-    ):
+    suffix = Path(relative).suffix.casefold()
+    if lowered == BUNDLED_POLICY_RELATIVE.casefold():
+        continue
+    if suffix in {
+        ".dat",
+        ".env",
+        ".jwk",
+        ".key",
+        ".p12",
+        ".pem",
+        ".pfx",
+        ".secret",
+        ".token",
+    }:
         raise AssertionError(f"Sensitive file type entered the release allowlist: {relative}")
 
 source_hashes = {
@@ -2009,7 +2017,7 @@ release_manifest = {
     "release_version": RELEASE_VERSION,
     "policy_version": POLICY_VERSION,
     "contract_sha256": CONTRACT_SHA256,
-    "external_agent_policy": external_policy_report,
+    "agent_policy": agent_policy_report,
     "reproducible_zip": {
         "member_timestamp": "2020-01-01T00:00:00Z",
         "member_mode": "100644",

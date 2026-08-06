@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.5.14"
+EXPECTED_RELEASE_VERSION = "0.5.15"
 EXPECTED_VERSION = "2026-08-01.goal-final-authority.v2"
 EXPECTED_CONTRACT_SHA256 = "a17809e4103628c1b0ab0b96081f6325faf9d16703a5fac57ef7d1eaa7d043bf"
 OPTIONAL_MARKER = "OPTIONAL VIDEO CONTROL:"
@@ -59,9 +59,9 @@ for rules in (policy, binding):
     for forbidden in FORBIDDEN_DEPENDENCIES:
         assert forbidden.casefold() not in rules.casefold(), forbidden
 
-data_path = agent._hmb._resolve_agent_rule_data_path()
-assert not (ROOT / "resources" / "agent" / "hmb_agent_core.dat").exists()
-sealed = data_path.read_bytes()
+bundled_policy_path = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
+assert bundled_policy_path.is_file()
+sealed = bundled_policy_path.read_bytes()
 assert OPTIONAL_MARKER.encode("utf-8") not in sealed
 assert ISOLATION_MARKER.encode("utf-8") not in sealed
 payload = agent._hmb._decode_signed_agent_policy_envelope(sealed)
