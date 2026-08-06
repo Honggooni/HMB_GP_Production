@@ -15,10 +15,12 @@ backups/
 dist/
 *.zip
 
-# Agent policy payloads are managed on the internal network share
-resources/agent/
+# Only the signed production fallback is tracked. Policy sources and every
+# other policy payload remain private/external.
+resources/agent/*
 resources/policy/
 **/hmb_agent_core.dat
+!resources/agent/hmb_agent_core.dat
 
 # Credentials and machine-local configuration
 .env

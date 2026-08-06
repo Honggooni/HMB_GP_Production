@@ -11,9 +11,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.5.14"
+EXPECTED_RELEASE_VERSION = "0.5.15"
 EXPECTED_POLICY_VERSION = "2026-08-01.goal-final-authority.v2"
 EXPECTED_CONTRACT_SHA256 = "a17809e4103628c1b0ab0b96081f6325faf9d16703a5fac57ef7d1eaa7d043bf"
+EXPECTED_BUNDLED_POLICY_SHA256 = "94533d84ab914971026f624634c2553a0c7abba298f6dd76242d996ee5c9137f"
 SHARED_MARKERS = (
     "HYBRID COMPOSITION INDEPENDENCE:",
     "MISSING SOURCE AUTHORITY:",
@@ -77,12 +78,15 @@ for rules in (policy, binding):
     assert "never downgrade supplied content to context-only" in normalized_rules
     assert "hidden rules" in normalized_rules
 
-# The policy is external and compressed inside a signed envelope. The runtime
-# contains only the public verification key and environment-variable resolver;
-# no policy payload, plaintext clause, or signing key is distributed.
-data_path = agent._hmb._resolve_agent_rule_data_path()
-assert not (ROOT / "resources" / "agent" / "hmb_agent_core.dat").exists()
-sealed = data_path.read_bytes()
+# The signed/compressed v2 envelope is bundled as an offline fallback. A valid
+# external policy remains preferred, while no plaintext policy or signing key
+# is distributed.
+bundled_policy_path = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
+assert bundled_policy_path.is_file()
+assert hashlib.sha256(bundled_policy_path.read_bytes()).hexdigest() == (
+    EXPECTED_BUNDLED_POLICY_SHA256
+)
+sealed = bundled_policy_path.read_bytes()
 assert policy.encode("utf-8") not in sealed
 assert binding.encode("utf-8") not in sealed
 for marker in SHARED_MARKERS:

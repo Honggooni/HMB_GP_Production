@@ -2,17 +2,17 @@
   "SPDXID": "SPDXRef-DOCUMENT",
   "spdxVersion": "SPDX-2.3",
   "dataLicense": "CC0-1.0",
-  "name": "HMB_GP_Production-0.5.14",
-  "documentNamespace": "https://hmb.local/spdx/HMB_GP_Production/0.5.14",
+  "name": "HMB_GP_Production-0.5.15",
+  "documentNamespace": "https://hmb.local/spdx/HMB_GP_Production/0.5.15",
   "creationInfo": {
-    "created": "2026-08-05T00:00:00Z",
+    "created": "2026-08-06T00:00:00Z",
     "creators": ["Organization: HMB Pipeline", "Tool: Codex release audit"]
   },
   "packages": [
     {
       "SPDXID": "SPDXRef-HMB-GP-Production",
       "name": "hmb-gp-production",
-      "versionInfo": "0.5.14",
+      "versionInfo": "0.5.15",
       "downloadLocation": "NOASSERTION",
       "filesAnalyzed": false,
       "licenseConcluded": "LicenseRef-HMB-Internal-1.0",

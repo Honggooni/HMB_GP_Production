@@ -261,8 +261,9 @@ try:
     policy_identity = common.get_internal_policy_identity()
     assert policy
     assert len(policy_identity["contract_sha256"]) == 64
-    assert policy.encode("utf-8") not in common._resolve_agent_rule_data_path().read_bytes()
-    assert not (ROOT / "resources" / "agent" / "hmb_agent_core.dat").exists()
+    bundled_policy_path = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
+    assert bundled_policy_path.is_file()
+    assert policy.encode("utf-8") not in bundled_policy_path.read_bytes()
 finally:
     shutil.rmtree(project_root, ignore_errors=True)
 
