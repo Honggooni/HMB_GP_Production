@@ -367,13 +367,18 @@ assert.doesNotMatch(subtypeSource, /binding_scopes\.map/);
 assert.doesNotMatch(promptSource, /function renderCustomScopeControls/);
 assert.match(
   promptSource,
-  /clean\(item\.binding_scopes\[0\]\) === "Custom scope" \|\| Boolean\(clean\(item\.asset_id\)\)/,
-  "Custom Sub Type input and Asset ID rows must be marked as expanded left-side content.",
+  /const expandedLeftFields = clean\(item\.binding_scopes\[0\]\) === "Custom scope";/,
+  "Only the visible Custom Sub Type input should expand the left-side content.",
 );
 assert.match(
   promptSource,
   /\.source-row\.image\.image-expanded-left-fields>\.frame-binding-row\{margin-top:72px\}/,
-  "Range must move below the Custom Sub Type input or Asset ID instead of overlapping it.",
+  "Range must move below the visible Custom Sub Type input instead of overlapping it.",
+);
+assert.doesNotMatch(
+  imageRowSource,
+  /<small>[\s\S]*?Asset ID:[\s\S]*?<\/small>/,
+  "Prompt Image rows must not render the redundant Asset ID helper line.",
 );
 
 const previewSource = promptSource.slice(

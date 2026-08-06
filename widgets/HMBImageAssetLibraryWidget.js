@@ -531,6 +531,19 @@ function emit(props, state) {
   return normalized;
 }
 
+export function hmbDeferImageAssetPropsDuringRegistration(container, nextProps = {}) {
+  if (!container?.__hmbImageAssetRegistrationDraft) return false;
+  container.__hmbImageAssetDeferredProps = nextProps || {};
+  return true;
+}
+
+export function hmbTakeDeferredImageAssetProps(container) {
+  if (!container) return null;
+  const deferred = container.__hmbImageAssetDeferredProps || null;
+  delete container.__hmbImageAssetDeferredProps;
+  return deferred;
+}
+
 export function hmbImageAssetAutoSyncPayload(value, nonce) {
   const payload = normalizeState(value);
   payload.__hmb_manifest_poll_nonce = clean(nonce).slice(0, 128);
@@ -1523,9 +1536,10 @@ function installEvents(container, state, props, remount, listeners) {
   };
   const closeRegistration = () => {
     const returnFocus = container.__hmbImageAssetRegistrationReturnFocus;
+    const deferredProps = hmbTakeDeferredImageAssetProps(container);
     delete container.__hmbImageAssetRegistrationDraft;
     delete container.__hmbImageAssetRegistrationReturnFocus;
-    remount(state);
+    remount(deferredProps ? normalizeState(deferredProps?.value) : state);
     restoreRegistrationOpener(returnFocus);
   };
   container.querySelectorAll("[data-registration-cancel]").forEach((button) => {
@@ -1586,6 +1600,8 @@ function installEvents(container, state, props, remount, listeners) {
     event.stopPropagation();
     const draft = container.__hmbImageAssetRegistrationDraft;
     if (!registrationDraftIsComplete(draft)) return;
+    const deferredProps = hmbTakeDeferredImageAssetProps(container);
+    if (deferredProps) state = normalizeState(deferredProps?.value);
     state.asset_registration_request = {
       request_id: `asset-registration-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
       project_uid: state.project_uid,
@@ -1604,7 +1620,7 @@ function installEvents(container, state, props, remount, listeners) {
     const returnFocus = container.__hmbImageAssetRegistrationReturnFocus;
     delete container.__hmbImageAssetRegistrationDraft;
     delete container.__hmbImageAssetRegistrationReturnFocus;
-    state = emit(props, state);
+    state = emit(deferredProps || props, state);
     remount(state);
     restoreRegistrationOpener(returnFocus);
   });
@@ -1792,6 +1808,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     const nextValue = JSON.stringify(nextState);
     props = nextProps || {};
     if (currentValue === nextValue) return;
+    if (hmbDeferImageAssetPropsDuringRegistration(container, props)) return;
     remount(nextState);
   };
   container.__hmbImageAssetApplyProps = applyProps;
@@ -1873,6 +1890,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     delete container.__hmbImageAssetDragging;
     delete container.__hmbImageAssetRegistrationDraft;
     delete container.__hmbImageAssetRegistrationReturnFocus;
+    delete container.__hmbImageAssetDeferredProps;
     container.removeAttribute?.("data-hmb-node-delete-protected");
     container.innerHTML = "";
   };

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.18 - 2026-08-06
+
+- Removed the redundant visible `ASSET · Asset ID` helper line beneath Image
+  Name in HMBPromptLibrary while preserving Asset ID data, binding authority,
+  tooltip diagnostics, and compiled `PROMPT_OUT` behavior.
+- Reclaimed the helper line's unused vertical space so frame-range controls no
+  longer shift downward merely because an image carries an Asset ID.
+- Kept the HMBImageAssetLibrary Add passport and its in-progress text intact
+  across asynchronous host/catalog updates. The latest deferred state is
+  applied once the dialog is cancelled or submitted instead of remounting its
+  live input controls while the user is typing.
+
 ## 0.5.17 - 2026-08-06
 
 - Reduced the public `TARGET GENERATOR` preamble to target identification only.
