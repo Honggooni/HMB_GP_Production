@@ -407,6 +407,10 @@ def assert_constructor_and_public_contract() -> None:
     assert type(audio_parameter).__name__ == "ParameterList"
     assert audio_parameter._max_items == 3
     assert node.get_parameter_value("auto_publish_local_videos") is True
+    assert node.get_parameter_value("model_id") == target.MODEL_NAME_SEEDANCE_2_0_FAST
+    assert target.BROKER_SUPPORTED_MODEL_IDS == frozenset(
+        {target.SEEDANCE_2_0_FAST_MODEL_ID}
+    )
     assert (
         node.get_parameter_value("local_video_upload_service")
         == target.LOCAL_VIDEO_UPLOAD_GRIPTAPE
@@ -483,7 +487,7 @@ def assert_constructor_and_public_contract() -> None:
     assert "PublicArtifactUrlParameter" not in source
     assert "GriptapeCloudStorageDriver" in source
     assert 'importlib.import_module("tos")' in source
-    assert 'Options(choices=["480p", "720p", "1080p", "4k"])' in source
+    assert 'Options(choices=["480p", "720p"])' in source
 
 
 def assert_image_asset_single_wire_host_contract() -> None:
@@ -1103,36 +1107,26 @@ def assert_payload_and_media_contract() -> None:
     else:
         raise AssertionError("Fast model accepted 1080p")
 
-    params = node._get_parameters()
-    params.update(
-        {
-            "model_id": target.SEEDANCE_2_0_MODEL_ID,
-            "resolution": "4k",
-            "prompt": "standard 4k",
-        }
-    )
-    standard_4k_payload = node._build_payload(params)
-    assert standard_4k_payload["model"] == target.SEEDANCE_2_0_MODEL_ID
-    assert standard_4k_payload["resolution"] == "4k"
-
-    for restricted_model in (
-        target.SEEDANCE_2_0_FAST_MODEL_ID,
+    for unsupported_model in (
+        target.SEEDANCE_2_0_MODEL_ID,
         target.SEEDANCE_2_0_MINI_MODEL_ID,
     ):
         params = node._get_parameters()
         params.update(
             {
-                "model_id": restricted_model,
-                "resolution": "4k",
-                "prompt": "restricted 4k",
+                "model_id": unsupported_model,
+                "resolution": "720p",
+                "prompt": "unsupported Broker model",
             }
         )
         try:
-            node._validate_parameters(params)
+            node._build_broker_payload(params)
         except ValueError as exc:
-            assert "does not support 4k" in str(exc)
+            assert "currently supports Seedance 2.0 Fast only" in str(exc)
         else:
-            raise AssertionError(f"Restricted model accepted 4k: {restricted_model}")
+            raise AssertionError(
+                f"Unsupported Broker model was accepted: {unsupported_model}"
+            )
 
     params = node._get_parameters()
     params.update(
@@ -1216,9 +1210,9 @@ def assert_broker_generation_contract() -> None:
     ) == ""
 
     bridge_contract = target._HMBAIBrokerBridge()
-    full_payload = {
+    fast_payload = {
         "provider": "volcengine_ark",
-        "model": target.SEEDANCE_2_0_MODEL_ID,
+        "model": target.SEEDANCE_2_0_FAST_MODEL_ID,
         "prompt": "Broker schema regression",
         "input_mode": target.INPUT_MODE_MULTIMODAL_REFERENCES,
         "duration_seconds": 5,
@@ -1228,49 +1222,46 @@ def assert_broker_generation_contract() -> None:
         "watermark": False,
         "return_last_frame": False,
         "execution_expires_after": 172800,
-        "priority": 0,
     }
     with mock.patch.object(
         bridge_contract,
         "_request_json",
         return_value={"status": "pending", "job_id": "schema-job-1"},
     ) as request_json:
-        bridge_contract.generate_seedance(full_payload, timeout=30)
+        bridge_contract.generate_seedance(fast_payload, timeout=30)
     submitted = request_json.call_args.kwargs["payload"]
     assert set(submitted) == {
         "provider",
         "model",
         "prompt",
+        "input_mode",
         "duration_seconds",
         "quality",
         "aspect_ratio",
         "generate_audio",
         "watermark",
-    }
-    assert not {
-        "input_mode",
         "return_last_frame",
         "execution_expires_after",
-        "priority",
-    } & set(submitted)
+    }
+    assert "input_mode" in submitted
+    assert "return_last_frame" in submitted
+    assert "execution_expires_after" in submitted
 
-    fast_payload = dict(full_payload)
-    fast_payload.update(
+    framed_fast_payload = dict(fast_payload)
+    framed_fast_payload.update(
         {
-            "model": target.SEEDANCE_2_0_FAST_MODEL_ID,
             "input_mode": target.INPUT_MODE_FIRST_LAST_FRAME,
             "first_frame": ["https://cdn.example/first.png"],
             "last_frame": ["https://cdn.example/last.png"],
             "return_last_frame": True,
         }
     )
-    fast_payload.pop("priority")
     with mock.patch.object(
         bridge_contract,
         "_request_json",
         return_value={"status": "pending", "job_id": "schema-job-2"},
     ) as request_json:
-        bridge_contract.generate_seedance(fast_payload, timeout=30)
+        bridge_contract.generate_seedance(framed_fast_payload, timeout=30)
     fast_submitted = request_json.call_args.kwargs["payload"]
     for field in (
         "input_mode",
@@ -1282,18 +1273,16 @@ def assert_broker_generation_contract() -> None:
         assert field in fast_submitted
 
     rejected_payloads = []
-    for field, value in (
-        ("first_frame", ["https://cdn.example/first.png"]),
-        ("return_last_frame", True),
-        ("execution_expires_after", 3600),
-        ("priority", 1),
+    for unsupported_model in (
+        target.SEEDANCE_2_0_MODEL_ID,
+        target.SEEDANCE_2_0_MINI_MODEL_ID,
     ):
-        invalid = dict(full_payload)
-        invalid[field] = value
+        invalid = dict(fast_payload)
+        invalid["model"] = unsupported_model
         rejected_payloads.append(invalid)
-    promptless = dict(full_payload)
-    promptless["prompt"] = ""
-    rejected_payloads.append(promptless)
+    priority_payload = dict(fast_payload)
+    priority_payload["priority"] = 1
+    rejected_payloads.append(priority_payload)
     for invalid in rejected_payloads:
         with mock.patch.object(
             bridge_contract,
@@ -1338,7 +1327,7 @@ def assert_broker_generation_contract() -> None:
     assert len(bridge.generate_payloads) == 1
     payload = bridge.generate_payloads[0]
     assert payload["provider"] == "volcengine_ark"
-    assert payload["model"] == target.SEEDANCE_2_0_MODEL_ID
+    assert payload["model"] == target.SEEDANCE_2_0_FAST_MODEL_ID
     assert payload["prompt"] == "Broker-only Seedance regression"
     assert payload["duration_seconds"] == 5
     assert payload["quality"] == "720p"
@@ -2013,7 +2002,7 @@ def assert_ambiguous_submission_status_contract() -> None:
     diagnostic = node.parameter_output_values["provider_response"][
         "submission_diagnostic"
     ]
-    assert diagnostic["model"] == target.SEEDANCE_2_0_MODEL_ID
+    assert diagnostic["model"] == target.SEEDANCE_2_0_FAST_MODEL_ID
     assert "safe ambiguous submission" in node.parameter_output_values[
         "result_details"
     ]
