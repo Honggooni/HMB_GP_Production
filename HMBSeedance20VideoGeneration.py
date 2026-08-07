@@ -117,6 +117,11 @@ SEEDANCE_2_0_MODEL_ID = "doubao-seedance-2-0-260128"
 SEEDANCE_2_0_FAST_MODEL_ID = "doubao-seedance-2-0-fast-260128"
 SEEDANCE_2_0_MINI_MODEL_ID = "doubao-seedance-2-0-mini-260615"
 
+# The current FN AI Broker server has a verified asynchronous video-generation
+# adapter only for Seedance 2.0 Fast. The other discovered model entries are
+# catalog metadata, not runnable Broker contracts, and currently return HTTP 400.
+BROKER_SUPPORTED_MODEL_IDS = frozenset({SEEDANCE_2_0_FAST_MODEL_ID})
+
 # Old display and BytePlus model values remain accepted so saved workflows migrate
 # without silently submitting an obsolete provider model id.
 MODEL_ID_ALIASES = {
@@ -569,7 +574,6 @@ class _HMBAIBrokerBridge:
         }
     )
     _MODEL_GENERATION_FIELDS = {
-        SEEDANCE_2_0_MODEL_ID: _COMMON_SEEDANCE_FIELDS,
         SEEDANCE_2_0_FAST_MODEL_ID: _COMMON_SEEDANCE_FIELDS
         | frozenset(
             {
@@ -580,11 +584,8 @@ class _HMBAIBrokerBridge:
                 "execution_expires_after",
             }
         ),
-        SEEDANCE_2_0_MINI_MODEL_ID: _COMMON_SEEDANCE_FIELDS,
     }
-    _PROMPT_REQUIRED_MODELS = frozenset(
-        {SEEDANCE_2_0_MODEL_ID, SEEDANCE_2_0_MINI_MODEL_ID}
-    )
+    _PROMPT_REQUIRED_MODELS: frozenset[str] = frozenset()
 
     def __init__(self, *, opener: Any | None = None) -> None:
         self._opener = opener or urllib.request.build_opener(
@@ -881,16 +882,15 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         self.add_parameter(
             ParameterString(
                 name="model_id",
-                default_value=MODEL_NAME_SEEDANCE_2_0,
-                tooltip="Volcengine Seedance 2.0 model variant.",
+                default_value=MODEL_NAME_SEEDANCE_2_0_FAST,
+                tooltip=(
+                    "Seedance 2.0 Fast is the model currently verified by the "
+                    "FN AI Broker video-generation adapter."
+                ),
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
                 traits={
                     Options(
-                        choices=[
-                            MODEL_NAME_SEEDANCE_2_0,
-                            MODEL_NAME_SEEDANCE_2_0_FAST,
-                            MODEL_NAME_SEEDANCE_2_0_MINI,
-                        ]
+                        choices=[MODEL_NAME_SEEDANCE_2_0_FAST]
                     )
                 },
                 ui_options={"display_name": "Model"},
@@ -1067,9 +1067,9 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
             ParameterString(
                 name="resolution",
                 default_value="720p",
-                tooltip="480p/720p; Standard also supports 1080p and 4k.",
+                tooltip="Seedance 2.0 Fast supports 480p and 720p.",
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
-                traits={Options(choices=["480p", "720p", "1080p", "4k"])},
+                traits={Options(choices=["480p", "720p"])},
             )
             ParameterString(
                 name="ratio",
@@ -1550,7 +1550,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         ]
 
     def _get_parameters(self) -> dict[str, Any]:
-        raw_model = self.get_parameter_value("model_id") or MODEL_NAME_SEEDANCE_2_0
+        raw_model = self.get_parameter_value("model_id") or MODEL_NAME_SEEDANCE_2_0_FAST
         model_id = MODEL_ID_ALIASES.get(str(raw_model), str(raw_model))
         legacy_video_slots = [
             self.get_parameter_value(f"reference_video_{index}")
@@ -2253,10 +2253,21 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
                 "Use priority 0 for Fast or Mini."
             )
 
+    @staticmethod
+    def _validate_broker_model(model_id: Any) -> None:
+        if model_id not in BROKER_SUPPORTED_MODEL_IDS:
+            raise ValueError(
+                "FN AI Broker currently supports Seedance 2.0 Fast only. "
+                "Select 'Seedance 2.0 Fast' in Model."
+            )
+
     def validate_before_node_run(self) -> list[Exception] | None:
         exceptions = super().validate_before_node_run() or []
         try:
-            self._validate_parameters(self._get_parameters())
+            params = self._get_parameters()
+            self._validate_parameters(params)
+            if not params.get("resume_generation_id"):
+                self._validate_broker_model(params.get("model_id"))
         except Exception as exc:
             exceptions.append(exc)
         return exceptions or None
@@ -2832,6 +2843,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
     def _build_broker_payload(self, params: dict[str, Any]) -> dict[str, Any]:
         """Map the HMB media contract to the FN AI Broker Seedance schema."""
         self._validate_parameters(params)
+        self._validate_broker_model(params.get("model_id"))
         payload: dict[str, Any] = {
             "provider": "volcengine_ark",
             "model": params["model_id"],

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.23 - 2026-08-07
+
+- Matched the Seedance node to the replacement FN AI Broker's verified runtime
+  contract. The server currently exposes catalog metadata for Full, Fast, and
+  Mini, but only `doubao-seedance-2-0-fast-260128` has the asynchronous video
+  generation adapter and a confirmed successful production request.
+- Made `Seedance 2.0 Fast` the node default and the only selectable Broker
+  model, with its verified 480p/720p resolution choices. Saved workflows that
+  still contain Full or Mini now fail locally with an actionable model message
+  instead of reaching the server and returning an opaque HTTP 400.
+- Added regression coverage for the Fast-only Broker boundary while preserving
+  legacy internal payload helpers. No provider key, Broker token, usage, quota,
+  or key-registration UI/state was added or exposed.
+
 ## 0.5.22 - 2026-08-07
 
 - Changed the default FN AI Broker origin from
