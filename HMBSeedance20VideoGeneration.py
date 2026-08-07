@@ -553,6 +553,38 @@ class _HMBAIBrokerBridge:
             "priority",
         }
     )
+    _COMMON_SEEDANCE_FIELDS = frozenset(
+        {
+            "provider",
+            "model",
+            "prompt",
+            "image_urls",
+            "video_urls",
+            "audio_urls",
+            "duration_seconds",
+            "quality",
+            "aspect_ratio",
+            "generate_audio",
+            "watermark",
+        }
+    )
+    _MODEL_GENERATION_FIELDS = {
+        SEEDANCE_2_0_MODEL_ID: _COMMON_SEEDANCE_FIELDS,
+        SEEDANCE_2_0_FAST_MODEL_ID: _COMMON_SEEDANCE_FIELDS
+        | frozenset(
+            {
+                "input_mode",
+                "first_frame",
+                "last_frame",
+                "return_last_frame",
+                "execution_expires_after",
+            }
+        ),
+        SEEDANCE_2_0_MINI_MODEL_ID: _COMMON_SEEDANCE_FIELDS,
+    }
+    _PROMPT_REQUIRED_MODELS = frozenset(
+        {SEEDANCE_2_0_MODEL_ID, SEEDANCE_2_0_MINI_MODEL_ID}
+    )
 
     def __init__(self, *, opener: Any | None = None) -> None:
         self._opener = opener or urllib.request.build_opener(
@@ -689,8 +721,46 @@ class _HMBAIBrokerBridge:
             if value is not None and value != []
         }
         request_payload["provider"] = "volcengine_ark"
-        if not str(request_payload.get("model") or "").strip():
+        model = str(request_payload.get("model") or "").strip()
+        if not model:
             raise _BrokerProtocolError("Seedance Broker model is missing.")
+        model_fields = self._MODEL_GENERATION_FIELDS.get(model)
+        if model_fields is None:
+            raise _BrokerProtocolError(
+                "Selected Seedance model is not supported by the HMB Broker contract."
+            )
+        if model in self._PROMPT_REQUIRED_MODELS and not str(
+            request_payload.get("prompt") or ""
+        ).strip():
+            raise _BrokerProtocolError(
+                "The selected FN AI Broker Seedance model requires a prompt."
+            )
+        if model != SEEDANCE_2_0_FAST_MODEL_ID:
+            if request_payload.get("first_frame") or request_payload.get("last_frame"):
+                raise _BrokerProtocolError(
+                    "First/Last Frame mode currently requires Seedance 2.0 Fast "
+                    "on FN AI Broker."
+                )
+            if request_payload.get("return_last_frame") is True:
+                raise _BrokerProtocolError(
+                    "Return Last Frame currently requires Seedance 2.0 Fast "
+                    "on FN AI Broker."
+                )
+            expires = request_payload.get("execution_expires_after")
+            if expires not in (None, 172800):
+                raise _BrokerProtocolError(
+                    "Custom task expiry currently requires Seedance 2.0 Fast "
+                    "on FN AI Broker."
+                )
+        priority = request_payload.get("priority")
+        if priority not in (None, 0):
+            raise _BrokerProtocolError(
+                "Task priority is not supported by the current FN AI Broker "
+                "Seedance schema."
+            )
+        request_payload = {
+            key: value for key, value in request_payload.items() if key in model_fields
+        }
         return self._request_json(
             "POST",
             "/api/v1/generate/video",
