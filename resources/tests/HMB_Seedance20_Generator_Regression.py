@@ -1424,6 +1424,8 @@ def assert_broker_generation_contract() -> None:
 
 
 def assert_broker_account_and_button_contract() -> None:
+    assert target.AI_BROKER_SERVER_URL == "http://192.168.203.245:8080"
+    assert target._broker_validated_server_url() == target.AI_BROKER_SERVER_URL
     assert target.AI_BROKER_CGTW_SERVERS == frozenset(
         {
             "192.168.200.18:8383",

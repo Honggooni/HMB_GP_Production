@@ -66,7 +66,7 @@ TOS_BUCKET_NAME_SECRET = "TOS_BUCKET_NAME"
 ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 CREATE_TASK_PATH = "/contents/generations/tasks"
 AI_BROKER_SERVER_URL = os.environ.get(
-    "HMB_AI_BROKER_URL", "http://192.168.204.242:8080"
+    "HMB_AI_BROKER_URL", "http://192.168.203.245:8080"
 ).rstrip("/")
 AI_BROKER_CGTW_SERVERS = frozenset(
     {
