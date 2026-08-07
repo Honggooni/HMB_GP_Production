@@ -537,6 +537,7 @@ def _broker_auto_login() -> dict[str, Any]:
 
 
 class _HMBAIBrokerBridge:
+    _MAX_ERROR_CLASSIFICATION_BYTES = 64 * 1024
     _ALLOWED_GENERATION_FIELDS = frozenset(
         {
             "provider",
@@ -550,9 +551,12 @@ class _HMBAIBrokerBridge:
             "audio_urls",
             "duration_seconds",
             "quality",
+            "resolution",
             "aspect_ratio",
             "generate_audio",
             "watermark",
+            "web_search",
+            "content_filter",
             "return_last_frame",
             "execution_expires_after",
             "priority",
@@ -568,9 +572,12 @@ class _HMBAIBrokerBridge:
             "audio_urls",
             "duration_seconds",
             "quality",
+            "resolution",
             "aspect_ratio",
             "generate_audio",
             "watermark",
+            "web_search",
+            "content_filter",
         }
     )
     _MODEL_GENERATION_FIELDS = {
@@ -620,6 +627,57 @@ class _HMBAIBrokerBridge:
                 return account
         return cls._account_from_mapping(value.get("user"))
 
+    @classmethod
+    def _safe_http_error_message(cls, exc: urllib.error.HTTPError) -> str:
+        status_code = int(getattr(exc, "code", 0) or 0)
+        if status_code != 400:
+            return f"FN AI Broker request failed with HTTP {status_code}."
+        try:
+            body = exc.read(cls._MAX_ERROR_CLASSIFICATION_BYTES + 1)
+        except Exception:
+            body = b""
+        if len(body) > cls._MAX_ERROR_CLASSIFICATION_BYTES:
+            body = b""
+        lowered = body.decode("utf-8", "replace").casefold()
+        if any(
+            token in lowered
+            for token in (
+                "image_url",
+                "video_url",
+                "audio_url",
+                "reference",
+                "base64",
+                "data uri",
+                "data_uri",
+            )
+        ):
+            return (
+                "FN AI Broker rejected the reference-media fields (HTTP 400). "
+                "Check the connected image, video, and audio inputs."
+            )
+        if any(
+            token in lowered
+            for token in (
+                "duration",
+                "quality",
+                "resolution",
+                "aspect_ratio",
+                "generate_audio",
+                "content_filter",
+                "web_search",
+            )
+        ):
+            return (
+                "FN AI Broker rejected the generation settings (HTTP 400). "
+                "Check duration, resolution, ratio, and audio settings."
+            )
+        if "model" in lowered:
+            return "FN AI Broker rejected the selected model (HTTP 400)."
+        return (
+            "FN AI Broker rejected the generation request (HTTP 400). "
+            "Check the model settings and connected reference media."
+        )
+
     def _request_json(
         self,
         method: str,
@@ -661,7 +719,7 @@ class _HMBAIBrokerBridge:
                     "FN AI Broker login has expired.", status_code=401
                 ) from exc
             raise _BrokerError(
-                f"FN AI Broker request failed with HTTP {exc.code}.",
+                self._safe_http_error_message(exc),
                 status_code=exc.code,
             ) from exc
         except _BrokerError:
@@ -2844,6 +2902,11 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         """Map the HMB media contract to the FN AI Broker Seedance schema."""
         self._validate_parameters(params)
         self._validate_broker_model(params.get("model_id"))
+        broker_resolution = (
+            "720x1280"
+            if params["ratio"] in {"9:16", "3:4"}
+            else "1280x720"
+        )
         payload: dict[str, Any] = {
             "provider": "volcengine_ark",
             "model": params["model_id"],
@@ -2851,9 +2914,12 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
             "input_mode": params["input_mode"],
             "duration_seconds": params["duration"],
             "quality": params["resolution"],
+            "resolution": broker_resolution,
             "aspect_ratio": params["ratio"],
             "generate_audio": params["generate_audio"],
             "watermark": params["watermark"],
+            "web_search": False,
+            "content_filter": True,
             "return_last_frame": params["return_last_frame"],
             "execution_expires_after": params["execution_expires_after"],
         }

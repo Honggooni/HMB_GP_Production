@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.24 - 2026-08-07
+
+- Aligned HMB's Fast-model Broker request with the server's confirmed successful
+  generation contract by including the required pixel `resolution` plus the
+  explicit `web_search=false` and `content_filter=true` defaults. Portrait
+  ratios use `720x1280`; all other supported ratios use `1280x720`.
+- Fixed the remaining immediate HTTP 400 seen only from HMB clients. Admin
+  access logs showed the HMB requests being rejected in roughly 30-40 ms,
+  before provider execution or usage recording, while the server-native Fast
+  request containing these common fields succeeded.
+- Added bounded, allowlisted HTTP 400 classification. Broker response bodies are
+  never copied to node state or logs; users receive only a fixed safe category
+  for settings, reference media, or model validation.
+
 ## 0.5.23 - 2026-08-07
 
 - Matched the Seedance node to the replacement FN AI Broker's verified runtime

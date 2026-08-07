@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import importlib.util
 import json
 import sys
@@ -1210,6 +1211,17 @@ def assert_broker_generation_contract() -> None:
     ) == ""
 
     bridge_contract = target._HMBAIBrokerBridge()
+    settings_error = target.urllib.error.HTTPError(
+        "http://broker.invalid/api/v1/generate/video",
+        400,
+        "Bad Request",
+        {},
+        io.BytesIO(b'{"detail":"resolution is invalid","token":"secret-canary"}'),
+    )
+    safe_error_message = bridge_contract._safe_http_error_message(settings_error)
+    assert "generation settings" in safe_error_message
+    assert "secret-canary" not in safe_error_message
+
     fast_payload = {
         "provider": "volcengine_ark",
         "model": target.SEEDANCE_2_0_FAST_MODEL_ID,
@@ -1217,9 +1229,12 @@ def assert_broker_generation_contract() -> None:
         "input_mode": target.INPUT_MODE_MULTIMODAL_REFERENCES,
         "duration_seconds": 5,
         "quality": "720p",
+        "resolution": "1280x720",
         "aspect_ratio": "adaptive",
         "generate_audio": False,
         "watermark": False,
+        "web_search": False,
+        "content_filter": True,
         "return_last_frame": False,
         "execution_expires_after": 172800,
     }
@@ -1237,9 +1252,12 @@ def assert_broker_generation_contract() -> None:
         "input_mode",
         "duration_seconds",
         "quality",
+        "resolution",
         "aspect_ratio",
         "generate_audio",
         "watermark",
+        "web_search",
+        "content_filter",
         "return_last_frame",
         "execution_expires_after",
     }
@@ -1331,7 +1349,16 @@ def assert_broker_generation_contract() -> None:
     assert payload["prompt"] == "Broker-only Seedance regression"
     assert payload["duration_seconds"] == 5
     assert payload["quality"] == "720p"
+    assert payload["resolution"] == "1280x720"
     assert payload["aspect_ratio"] == "adaptive"
+    assert payload["web_search"] is False
+    assert payload["content_filter"] is True
+    portrait = BrokerScriptedNode(FakeBrokerBridge([]))
+    portrait_params = portrait._get_parameters()
+    portrait_params.update({"prompt": "portrait", "ratio": "9:16"})
+    assert portrait._build_broker_payload(portrait_params)["resolution"] == (
+        "720x1280"
+    )
     assert not any(
         sensitive in key.lower()
         for key in payload
