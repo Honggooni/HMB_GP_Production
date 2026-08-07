@@ -117,10 +117,16 @@ SEEDANCE_2_0_MODEL_ID = "doubao-seedance-2-0-260128"
 SEEDANCE_2_0_FAST_MODEL_ID = "doubao-seedance-2-0-fast-260128"
 SEEDANCE_2_0_MINI_MODEL_ID = "doubao-seedance-2-0-mini-260615"
 
-# The current FN AI Broker server has a verified asynchronous video-generation
-# adapter only for Seedance 2.0 Fast. The other discovered model entries are
-# catalog metadata, not runnable Broker contracts, and currently return HTTP 400.
-BROKER_SUPPORTED_MODEL_IDS = frozenset({SEEDANCE_2_0_FAST_MODEL_ID})
+# The FN AI Broker Volcengine adapter accepts the full, Fast, and Mini Seedance
+# 2.0 endpoints. Keep this allowlist explicit so an arbitrary catalog entry can
+# never be submitted merely because it contains "seedance" in its name.
+BROKER_SUPPORTED_MODEL_IDS = frozenset(
+    {
+        SEEDANCE_2_0_MODEL_ID,
+        SEEDANCE_2_0_FAST_MODEL_ID,
+        SEEDANCE_2_0_MINI_MODEL_ID,
+    }
+)
 
 # Old display and BytePlus model values remain accepted so saved workflows migrate
 # without silently submitting an obsolete provider model id.
@@ -137,9 +143,15 @@ MODEL_ID_ALIASES = {
 }
 
 MODEL_RESOLUTIONS = {
-    SEEDANCE_2_0_MODEL_ID: ("480p", "720p", "1080p", "4k"),
-    SEEDANCE_2_0_FAST_MODEL_ID: ("480p", "720p"),
-    SEEDANCE_2_0_MINI_MODEL_ID: ("480p", "720p"),
+    SEEDANCE_2_0_MODEL_ID: ("4k", "1080p", "720p", "480p"),
+    SEEDANCE_2_0_FAST_MODEL_ID: ("720p", "480p"),
+    SEEDANCE_2_0_MINI_MODEL_ID: ("720p", "480p"),
+}
+
+MODEL_DEFAULT_RESOLUTIONS = {
+    SEEDANCE_2_0_MODEL_ID: "4k",
+    SEEDANCE_2_0_FAST_MODEL_ID: "720p",
+    SEEDANCE_2_0_MINI_MODEL_ID: "720p",
 }
 
 # Public list prices in CNY per one million tokens. They are stored with every
@@ -580,19 +592,27 @@ class _HMBAIBrokerBridge:
             "content_filter",
         }
     )
+    _REFERENCE_MODE_FIELDS = frozenset(
+        {
+            "input_mode",
+            "first_frame",
+            "last_frame",
+            "return_last_frame",
+            "execution_expires_after",
+        }
+    )
     _MODEL_GENERATION_FIELDS = {
+        SEEDANCE_2_0_MODEL_ID: _COMMON_SEEDANCE_FIELDS
+        | _REFERENCE_MODE_FIELDS
+        | frozenset({"priority"}),
         SEEDANCE_2_0_FAST_MODEL_ID: _COMMON_SEEDANCE_FIELDS
-        | frozenset(
-            {
-                "input_mode",
-                "first_frame",
-                "last_frame",
-                "return_last_frame",
-                "execution_expires_after",
-            }
-        ),
+        | _REFERENCE_MODE_FIELDS,
+        SEEDANCE_2_0_MINI_MODEL_ID: _COMMON_SEEDANCE_FIELDS
+        | _REFERENCE_MODE_FIELDS,
     }
-    _PROMPT_REQUIRED_MODELS: frozenset[str] = frozenset()
+    _PROMPT_REQUIRED_MODELS: frozenset[str] = frozenset(
+        {SEEDANCE_2_0_MODEL_ID, SEEDANCE_2_0_MINI_MODEL_ID}
+    )
 
     def __init__(self, *, opener: Any | None = None) -> None:
         self._opener = opener or urllib.request.build_opener(
@@ -794,28 +814,10 @@ class _HMBAIBrokerBridge:
             raise _BrokerProtocolError(
                 "The selected FN AI Broker Seedance model requires a prompt."
             )
-        if model != SEEDANCE_2_0_FAST_MODEL_ID:
-            if request_payload.get("first_frame") or request_payload.get("last_frame"):
-                raise _BrokerProtocolError(
-                    "First/Last Frame mode currently requires Seedance 2.0 Fast "
-                    "on FN AI Broker."
-                )
-            if request_payload.get("return_last_frame") is True:
-                raise _BrokerProtocolError(
-                    "Return Last Frame currently requires Seedance 2.0 Fast "
-                    "on FN AI Broker."
-                )
-            expires = request_payload.get("execution_expires_after")
-            if expires not in (None, 172800):
-                raise _BrokerProtocolError(
-                    "Custom task expiry currently requires Seedance 2.0 Fast "
-                    "on FN AI Broker."
-                )
         priority = request_payload.get("priority")
-        if priority not in (None, 0):
+        if model != SEEDANCE_2_0_MODEL_ID and priority not in (None, 0):
             raise _BrokerProtocolError(
-                "Task priority is not supported by the current FN AI Broker "
-                "Seedance schema."
+                "Task priority is supported only by the full Seedance 2.0 model."
             )
         request_payload = {
             key: value for key, value in request_payload.items() if key in model_fields
@@ -940,15 +942,19 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         self.add_parameter(
             ParameterString(
                 name="model_id",
-                default_value=MODEL_NAME_SEEDANCE_2_0_FAST,
+                default_value=MODEL_NAME_SEEDANCE_2_0,
                 tooltip=(
-                    "Seedance 2.0 Fast is the model currently verified by the "
-                    "FN AI Broker video-generation adapter."
+                    "Volcengine Seedance 2.0 model. The full model defaults to "
+                    "4K; Fast and Mini support up to 720p."
                 ),
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
                 traits={
                     Options(
-                        choices=[MODEL_NAME_SEEDANCE_2_0_FAST]
+                        choices=[
+                            MODEL_NAME_SEEDANCE_2_0,
+                            MODEL_NAME_SEEDANCE_2_0_FAST,
+                            MODEL_NAME_SEEDANCE_2_0_MINI,
+                        ]
                     )
                 },
                 ui_options={"display_name": "Model"},
@@ -1124,10 +1130,13 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         with ParameterGroup(name="Generation Settings") as generation_settings:
             ParameterString(
                 name="resolution",
-                default_value="720p",
-                tooltip="Seedance 2.0 Fast supports 480p and 720p.",
+                default_value="4k",
+                tooltip=(
+                    "Full Seedance 2.0 defaults to 4K. Fast and Mini support "
+                    "480p and 720p."
+                ),
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
-                traits={Options(choices=["480p", "720p"])},
+                traits={Options(choices=list(MODEL_RESOLUTIONS[SEEDANCE_2_0_MODEL_ID]))},
             )
             ParameterString(
                 name="ratio",
@@ -1398,6 +1407,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
     def after_value_set(self, parameter: Parameter, value: Any) -> None:
         """Mirror Standard Seedance media visibility for the selected mode."""
         if parameter.name in {
+            "model_id",
             "input_mode",
             "local_video_upload_service",
         }:
@@ -1529,6 +1539,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         return bridge
 
     def _update_parameter_visibility(self) -> None:
+        self._synchronize_model_resolution()
         input_mode = self.get_parameter_value("input_mode") or INPUT_MODE_MULTIMODAL_REFERENCES
         if input_mode == INPUT_MODE_MULTIMODAL_REFERENCES:
             self.hide_parameter_by_name("first_frame")
@@ -1567,6 +1578,30 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
             self.hide_parameter_by_name(
                 ["tos_region", "tos_endpoint", "tos_url_validity_seconds"]
             )
+
+    def _synchronize_model_resolution(self) -> str:
+        """Apply the selected Volcengine model's exact resolution contract."""
+        raw_model = self.get_parameter_value("model_id") or MODEL_NAME_SEEDANCE_2_0
+        model_id = MODEL_ID_ALIASES.get(str(raw_model), str(raw_model))
+        supported = MODEL_RESOLUTIONS.get(model_id)
+        if supported is None:
+            return model_id
+
+        parameter = self.get_parameter_by_name("resolution")
+        if parameter is not None:
+            choices = list(supported)
+            if parameter.ui_options.get("simple_dropdown") != choices:
+                parameter.ui_options = {
+                    **parameter.ui_options,
+                    "simple_dropdown": choices,
+                }
+
+        current = str(self.get_parameter_value("resolution") or "")
+        if current not in supported:
+            self.set_parameter_value(
+                "resolution", MODEL_DEFAULT_RESOLUTIONS[model_id]
+            )
+        return model_id
 
     @staticmethod
     def _as_list(value: Any) -> list[Any]:
@@ -1608,8 +1643,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         ]
 
     def _get_parameters(self) -> dict[str, Any]:
-        raw_model = self.get_parameter_value("model_id") or MODEL_NAME_SEEDANCE_2_0_FAST
-        model_id = MODEL_ID_ALIASES.get(str(raw_model), str(raw_model))
+        model_id = self._synchronize_model_resolution()
         legacy_video_slots = [
             self.get_parameter_value(f"reference_video_{index}")
             for index in range(1, MAX_VIDEO_REFERENCES + 1)
@@ -1642,7 +1676,10 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
             "video_reference_slots": video_reference_slots,
             "video_references": video_references,
             "reference_audio": self._get_list_input("reference_audio"),
-            "resolution": str(self.get_parameter_value("resolution") or "720p"),
+            "resolution": str(
+                self.get_parameter_value("resolution")
+                or MODEL_DEFAULT_RESOLUTIONS.get(model_id, "4k")
+            ),
             "ratio": str(self.get_parameter_value("ratio") or "adaptive"),
             "duration": self.get_parameter_value("duration"),
             "generate_audio": bool(self.get_parameter_value("generate_audio")),
@@ -2315,8 +2352,8 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
     def _validate_broker_model(model_id: Any) -> None:
         if model_id not in BROKER_SUPPORTED_MODEL_IDS:
             raise ValueError(
-                "FN AI Broker currently supports Seedance 2.0 Fast only. "
-                "Select 'Seedance 2.0 Fast' in Model."
+                "FN AI Broker supports the Volcengine Seedance 2.0, Fast, and "
+                "Mini model IDs only."
             )
 
     def validate_before_node_run(self) -> list[Exception] | None:

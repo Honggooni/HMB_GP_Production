@@ -330,18 +330,18 @@ def assert_constructor_and_public_contract() -> None:
     assert target.MAX_REFERENCE_AUDIO == 3
     assert target.ARK_BASE_URL == "https://ark.cn-beijing.volces.com/api/v3"
     assert target.MODEL_RESOLUTIONS[target.SEEDANCE_2_0_MODEL_ID] == (
-        "480p",
-        "720p",
-        "1080p",
         "4k",
+        "1080p",
+        "720p",
+        "480p",
     )
     assert target.MODEL_RESOLUTIONS[target.SEEDANCE_2_0_FAST_MODEL_ID] == (
-        "480p",
         "720p",
+        "480p",
     )
     assert target.MODEL_RESOLUTIONS[target.SEEDANCE_2_0_MINI_MODEL_ID] == (
-        "480p",
         "720p",
+        "480p",
     )
 
     image_parameter = node.get_parameter_by_name("reference_images")
@@ -408,10 +408,44 @@ def assert_constructor_and_public_contract() -> None:
     assert type(audio_parameter).__name__ == "ParameterList"
     assert audio_parameter._max_items == 3
     assert node.get_parameter_value("auto_publish_local_videos") is True
-    assert node.get_parameter_value("model_id") == target.MODEL_NAME_SEEDANCE_2_0_FAST
+    assert node.get_parameter_value("model_id") == target.MODEL_NAME_SEEDANCE_2_0
+    assert node.get_parameter_value("resolution") == "4k"
     assert target.BROKER_SUPPORTED_MODEL_IDS == frozenset(
-        {target.SEEDANCE_2_0_FAST_MODEL_ID}
+        {
+            target.SEEDANCE_2_0_MODEL_ID,
+            target.SEEDANCE_2_0_FAST_MODEL_ID,
+            target.SEEDANCE_2_0_MINI_MODEL_ID,
+        }
     )
+    assert target.MODEL_DEFAULT_RESOLUTIONS == {
+        target.SEEDANCE_2_0_MODEL_ID: "4k",
+        target.SEEDANCE_2_0_FAST_MODEL_ID: "720p",
+        target.SEEDANCE_2_0_MINI_MODEL_ID: "720p",
+    }
+    model_choices = node.get_parameter_by_name("model_id").ui_options[
+        "simple_dropdown"
+    ]
+    assert model_choices == [
+        target.MODEL_NAME_SEEDANCE_2_0,
+        target.MODEL_NAME_SEEDANCE_2_0_FAST,
+        target.MODEL_NAME_SEEDANCE_2_0_MINI,
+    ]
+    assert node.get_parameter_by_name("resolution").ui_options[
+        "simple_dropdown"
+    ] == ["4k", "1080p", "720p", "480p"]
+    node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0_FAST)
+    assert node.get_parameter_value("resolution") == "720p"
+    assert node.get_parameter_by_name("resolution").ui_options[
+        "simple_dropdown"
+    ] == ["720p", "480p"]
+    node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0_MINI)
+    assert node.get_parameter_by_name("resolution").ui_options[
+        "simple_dropdown"
+    ] == ["720p", "480p"]
+    node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0)
+    assert node.get_parameter_by_name("resolution").ui_options[
+        "simple_dropdown"
+    ] == ["4k", "1080p", "720p", "480p"]
     assert (
         node.get_parameter_value("local_video_upload_service")
         == target.LOCAL_VIDEO_UPLOAD_GRIPTAPE
@@ -488,7 +522,8 @@ def assert_constructor_and_public_contract() -> None:
     assert "PublicArtifactUrlParameter" not in source
     assert "GriptapeCloudStorageDriver" in source
     assert 'importlib.import_module("tos")' in source
-    assert 'Options(choices=["480p", "720p"])' in source
+    assert "MODEL_DEFAULT_RESOLUTIONS" in source
+    assert "MODEL_RESOLUTIONS[SEEDANCE_2_0_MODEL_ID]" in source
 
 
 def assert_image_asset_single_wire_host_contract() -> None:
@@ -1108,26 +1143,38 @@ def assert_payload_and_media_contract() -> None:
     else:
         raise AssertionError("Fast model accepted 1080p")
 
-    for unsupported_model in (
+    for supported_model in (
         target.SEEDANCE_2_0_MODEL_ID,
         target.SEEDANCE_2_0_MINI_MODEL_ID,
     ):
         params = node._get_parameters()
         params.update(
             {
-                "model_id": unsupported_model,
-                "resolution": "720p",
-                "prompt": "unsupported Broker model",
+                "model_id": supported_model,
+                "resolution": (
+                    "4k"
+                    if supported_model == target.SEEDANCE_2_0_MODEL_ID
+                    else "720p"
+                ),
+                "prompt": "supported Broker model",
             }
         )
-        try:
-            node._build_broker_payload(params)
-        except ValueError as exc:
-            assert "currently supports Seedance 2.0 Fast only" in str(exc)
-        else:
-            raise AssertionError(
-                f"Unsupported Broker model was accepted: {unsupported_model}"
-            )
+        assert node._build_broker_payload(params)["model"] == supported_model
+
+    unsupported = node._get_parameters()
+    unsupported.update(
+        {
+            "model_id": "doubao-seedance-2-0-unknown",
+            "resolution": "720p",
+            "prompt": "unsupported Broker model",
+        }
+    )
+    try:
+        node._build_broker_payload(unsupported)
+    except ValueError as exc:
+        assert "Unsupported Volcengine Seedance model" in str(exc)
+    else:
+        raise AssertionError("Unknown Broker model was accepted")
 
     params = node._get_parameters()
     params.update(
@@ -1290,17 +1337,37 @@ def assert_broker_generation_contract() -> None:
     ):
         assert field in fast_submitted
 
-    rejected_payloads = []
-    for unsupported_model in (
-        target.SEEDANCE_2_0_MODEL_ID,
-        target.SEEDANCE_2_0_MINI_MODEL_ID,
+    for supported_model, quality in (
+        (target.SEEDANCE_2_0_MODEL_ID, "4k"),
+        (target.SEEDANCE_2_0_MINI_MODEL_ID, "720p"),
     ):
-        invalid = dict(fast_payload)
-        invalid["model"] = unsupported_model
-        rejected_payloads.append(invalid)
+        valid = dict(fast_payload)
+        valid["model"] = supported_model
+        valid["quality"] = quality
+        valid["prompt"] = "required prompt"
+        if supported_model == target.SEEDANCE_2_0_MODEL_ID:
+            valid["priority"] = 1
+        with mock.patch.object(
+            bridge_contract,
+            "_request_json",
+            return_value={"status": "pending", "job_id": "all-models-job"},
+        ) as request_json:
+            bridge_contract.generate_seedance(valid, timeout=30)
+        submitted = request_json.call_args.kwargs["payload"]
+        assert submitted["model"] == supported_model
+        assert submitted["quality"] == quality
+        assert ("priority" in submitted) is (
+            supported_model == target.SEEDANCE_2_0_MODEL_ID
+        )
+
+    rejected_payloads = []
     priority_payload = dict(fast_payload)
     priority_payload["priority"] = 1
     rejected_payloads.append(priority_payload)
+    missing_mini_prompt = dict(fast_payload)
+    missing_mini_prompt["model"] = target.SEEDANCE_2_0_MINI_MODEL_ID
+    missing_mini_prompt["prompt"] = ""
+    rejected_payloads.append(missing_mini_prompt)
     for invalid in rejected_payloads:
         with mock.patch.object(
             bridge_contract,
@@ -1345,10 +1412,10 @@ def assert_broker_generation_contract() -> None:
     assert len(bridge.generate_payloads) == 1
     payload = bridge.generate_payloads[0]
     assert payload["provider"] == "volcengine_ark"
-    assert payload["model"] == target.SEEDANCE_2_0_FAST_MODEL_ID
+    assert payload["model"] == target.SEEDANCE_2_0_MODEL_ID
     assert payload["prompt"] == "Broker-only Seedance regression"
     assert payload["duration_seconds"] == 5
-    assert payload["quality"] == "720p"
+    assert payload["quality"] == "4k"
     assert payload["resolution"] == "1280x720"
     assert payload["aspect_ratio"] == "adaptive"
     assert payload["web_search"] is False
@@ -2029,7 +2096,7 @@ def assert_ambiguous_submission_status_contract() -> None:
     diagnostic = node.parameter_output_values["provider_response"][
         "submission_diagnostic"
     ]
-    assert diagnostic["model"] == target.SEEDANCE_2_0_FAST_MODEL_ID
+    assert diagnostic["model"] == target.SEEDANCE_2_0_MODEL_ID
     assert "safe ambiguous submission" in node.parameter_output_values[
         "result_details"
     ]

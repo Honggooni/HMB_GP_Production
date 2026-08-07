@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.25 - 2026-08-07
+
+- Expanded the FN AI Broker generation contract to the exact Volcengine
+  Seedance 2.0 Full, Fast, and Mini endpoint IDs; arbitrary catalog models and
+  non-Volcengine providers remain rejected locally.
+- Made Full Seedance 2.0 the default at 4K. Full exposes
+  4K/1080p/720p/480p, while Fast and Mini default to 720p and expose only
+  720p/480p. Switching models immediately updates and safely coerces the
+  resolution selector.
+- Kept the collapsed AI Broker panel limited to connection and account state.
+  No provider key, masked key characters, registration/update control, usage,
+  quota, or credit field is stored or displayed by the node.
+- Fixed the client/server request contract so HMB's auxiliary pixel-resolution
+  compatibility field is ignored by schema validation while the selected
+  Seedance quality remains authoritative, preventing the pre-provider HTTP 400.
+
 ## 0.5.24 - 2026-08-07
 
 - Aligned HMB's Fast-model Broker request with the server's confirmed successful
