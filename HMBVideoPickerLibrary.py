@@ -4761,12 +4761,29 @@ def _normalize_assignment_bindings(value: Any, video_slot: Optional[int] = None)
     if not isinstance(value, list):
         return bindings
     fallback_slot = max(1, min(MAX_VIDEO_SLOTS, int(video_slot or 1)))
+    seen_objects: set[tuple[str, str]] = set()
     for index, raw in enumerate(value, start=1):
         if not isinstance(raw, dict):
             continue
         full_dag_path = _clean(raw.get("full_dag_path") or raw.get("subject_root"))
         group_name = _clean(raw.get("group_name") or raw.get("display_name") or full_dag_path)
         maya_uuid = _clean(raw.get("maya_uuid"))
+        # A catalog-selection collapse or an older widget echo could merge the
+        # same editable Mask row into @video1 more than once.  Color edits then
+        # replaced only the first copy and left the stale shader assignment in
+        # the Maya job.  Maya UUID is the authoritative identity; exact DAG path
+        # is the compatibility fallback for legacy rows without UUID metadata.
+        object_identity = (
+            ("uuid", maya_uuid.lower())
+            if maya_uuid
+            else ("path", full_dag_path.replace("\\", "/").lower())
+            if full_dag_path
+            else ("", "")
+        )
+        if object_identity[0] and object_identity in seen_objects:
+            continue
+        if object_identity[0]:
+            seen_objects.add(object_identity)
         reference_node = _clean(raw.get("reference_node"))
         reference_file = _clean(raw.get("reference_file"))
         proxy_manager = _clean(raw.get("proxy_manager"))
@@ -4847,7 +4864,16 @@ def _normalize_slot_assignments(
                     "picker_order": max(1, int(marker.get("picker_order") or index)),
                 })
             by_slot[slot] = inferred
-    return [{"video_slot": slot, "bindings": by_slot.get(slot, [])} for slot in range(1, active_count + 1)]
+    return [
+        {
+            "video_slot": slot,
+            "bindings": _normalize_assignment_bindings(
+                by_slot.get(slot, []),
+                slot,
+            ),
+        }
+        for slot in range(1, active_count + 1)
+    ]
 
 
 def _slot_assignment_bindings(state: Dict[str, Any], slot: int) -> List[Dict[str, Any]]:

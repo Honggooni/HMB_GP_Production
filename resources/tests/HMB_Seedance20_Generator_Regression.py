@@ -6,6 +6,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -174,12 +175,99 @@ class ScriptedNode(target.HMBSeedance20VideoGeneration):
     def _monotonic(self) -> float:
         return 0.0
 
+    async def _process_generation_impl(self) -> None:
+        """Keep legacy transport assertions isolated from the Broker contract."""
+        await self._process_direct_generation_impl()
+
+    async def _refresh_async(self) -> None:
+        await self._refresh_direct_async()
+
+
+class FakeBrokerBridge:
+    SECRET_VALUES = (
+        "broker-access-token-canary",
+        "provider-api-key-canary",
+        "authorization-canary",
+    )
+
+    def __init__(self, refresh_responses: list[dict]) -> None:
+        self.refresh_responses = list(refresh_responses)
+        self.account_calls = 0
+        self.generate_payloads: list[dict] = []
+        self.refresh_ids: list[str] = []
+
+    def account_snapshot(self, *, connect: bool):
+        assert connect is True
+        self.account_calls += 1
+        return target._BrokerAccountSnapshot(
+            state="connected",
+            connected=True,
+            account="Broker Artist",
+        )
+
+    def generate_seedance(self, payload: dict, *, timeout: float) -> dict:
+        assert timeout > 0
+        self.generate_payloads.append(dict(payload))
+        return {
+            "status": "pending",
+            "job_id": "broker-job-1",
+            "token": self.SECRET_VALUES[0],
+            "api_key": self.SECRET_VALUES[1],
+            "authorization": self.SECRET_VALUES[2],
+            "nested": {"credential": self.SECRET_VALUES[1]},
+        }
+
+    def refresh_job(self, job_id: str, *, timeout: float = 60) -> dict:
+        assert timeout > 0
+        self.refresh_ids.append(job_id)
+        if not self.refresh_responses:
+            raise AssertionError("Unexpected extra Broker refresh")
+        return self.refresh_responses.pop(0)
+
+    @staticmethod
+    def is_trusted_broker_url(_url: str) -> bool:
+        return False
+
+
+class BrokerScriptedNode(target.HMBSeedance20VideoGeneration):
+    def __init__(self, bridge: FakeBrokerBridge) -> None:
+        super().__init__(name="HMB Seedance Broker Scripted Regression")
+        self.bridge = bridge
+        self.destination = FakeDestination()
+        self._output_file = FakeOutputFile(self.destination)
+        self.downloads: list[str] = []
+        self.sleeps: list[float] = []
+
+    def _create_broker_bridge(self):
+        return self.bridge
+
+    def _capture_usage_identity(self):
+        return None
+
+    async def _download_video(self, url: str) -> bytes:
+        self.downloads.append(url)
+        return b"\x00\x00\x00\x18ftypmp42broker-regression-video"
+
+    async def _sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+
+    def _monotonic(self) -> float:
+        return 0.0
+
 
 def assert_constructor_and_public_contract() -> None:
     with mock.patch.object(
         target.GriptapeNodes,
         "SecretsManager",
         side_effect=AssertionError("constructor read a secret"),
+    ), mock.patch.object(
+        target._HMBAIBrokerBridge,
+        "_request_json",
+        side_effect=AssertionError("constructor performed a Broker request"),
+    ), mock.patch.object(
+        target.urllib.request,
+        "urlopen",
+        side_effect=AssertionError("constructor performed a network request"),
     ):
         node = target.HMBSeedance20VideoGeneration(name="Constructor Regression")
 
@@ -212,6 +300,10 @@ def assert_constructor_and_public_contract() -> None:
         "generation_id",
         "generation_status",
         "generation_refresh",
+        "broker_connection_status",
+        "broker_account",
+        "broker_connect_refresh",
+        "broker_notice",
         "provider_response",
         "video_url",
         "VIDEO_OUT",
@@ -352,11 +444,41 @@ def assert_constructor_and_public_contract() -> None:
     assert type(refresh_parameter).__name__ == "ParameterButton"
     assert refresh_parameter.label == "Refresh / Retrieve Result"
 
+    root_children = list(node.root_ui_element.children)
+    root_names = [element.name for element in root_children]
+    assert root_names[-2:] == ["Status", "AI Broker"]
+    broker_group = root_children[-1]
+    assert type(broker_group).__name__ == "ParameterGroup"
+    assert broker_group.ui_options == {"collapsed": True}
+    assert [child.name for child in broker_group.children] == [
+        "broker_connection_status",
+        "broker_account",
+        "broker_connect_refresh",
+        "broker_notice",
+    ]
+    assert not any(
+        text in child.name.lower()
+        for child in broker_group.children
+        for text in ("api_key", "token", "usage", "quota", "credit", "register")
+    )
+    for name in ("broker_connection_status", "broker_account", "broker_notice"):
+        parameter = node.get_parameter_by_name(name)
+        assert parameter.allowed_modes == {target.ParameterMode.PROPERTY}
+        assert parameter.settable is False
+        assert parameter.serializable is False
+    assert node.get_parameter_by_name("broker_connect_refresh").label == (
+        "Connect / Refresh"
+    )
+
     source = MODULE_PATH.read_text(encoding="utf-8")
     assert "_BaseSeedance20" not in source
     assert "GriptapeProxyNode" not in source
     assert "ProxyAuthProviderParameter" not in source
     assert "HMB_GRIPTAPE_STANDARD_LIBRARY_PATH" not in source
+    assert "from fn_ai_auth_v2" not in source
+    assert "import fn_ai_auth_v2" not in source
+    assert "from _hmb_broker_bridge" not in source
+    assert "import _hmb_broker_bridge" not in source
     assert "def _list_parameter(" not in source
     assert "PublicArtifactUrlParameter" not in source
     assert "GriptapeCloudStorageDriver" in source
@@ -1070,6 +1192,236 @@ def assert_payload_and_media_contract() -> None:
         assert "at most 3 reference audio" in str(exc)
     else:
         raise AssertionError("Four reference audio files were accepted")
+
+
+def assert_broker_generation_contract() -> None:
+    status_cases = {
+        "pending": "queued",
+        "submitted": "queued",
+        "running": "running",
+        "in-progress": "running",
+        "completed": "succeeded",
+        "success": "succeeded",
+        "failed": "failed",
+        "rejected": "failed",
+        "cancelled": "cancelled",
+        "expired": "expired",
+    }
+    for raw, expected in status_cases.items():
+        assert target.HMBSeedance20VideoGeneration._normalize_broker_status(raw) == (
+            expected
+        )
+    assert target.HMBSeedance20VideoGeneration._normalize_broker_status(
+        "provider-api-key-canary"
+    ) == ""
+
+    completed = {
+        "status": "completed",
+        "job_id": "broker-job-1",
+        "output": "https://cdn.example/broker-result.mp4",
+        "token": FakeBrokerBridge.SECRET_VALUES[0],
+        "api_key": FakeBrokerBridge.SECRET_VALUES[1],
+        "authorization": FakeBrokerBridge.SECRET_VALUES[2],
+    }
+    bridge = FakeBrokerBridge([completed])
+    node = BrokerScriptedNode(bridge)
+    node.set_parameter_value("prompt", "Broker-only Seedance regression")
+    with mock.patch.object(
+        node,
+        "_get_api_key",
+        side_effect=AssertionError("Broker flow read ARK_API_KEY"),
+    ), mock.patch.object(
+        node,
+        "_prepare_usage_tracking",
+        side_effect=AssertionError("Broker flow collected usage"),
+    ), mock.patch.object(
+        node,
+        "_record_usage_task",
+        side_effect=AssertionError("Broker flow recorded usage"),
+    ):
+        asyncio.run(node._process_generation())
+
+    assert bridge.account_calls == 1
+    assert bridge.refresh_ids == ["broker-job-1"]
+    assert len(bridge.generate_payloads) == 1
+    payload = bridge.generate_payloads[0]
+    assert payload["provider"] == "volcengine_ark"
+    assert payload["model"] == target.SEEDANCE_2_0_MODEL_ID
+    assert payload["prompt"] == "Broker-only Seedance regression"
+    assert payload["duration_seconds"] == 5
+    assert payload["quality"] == "720p"
+    assert payload["aspect_ratio"] == "adaptive"
+    assert not any(
+        sensitive in key.lower()
+        for key in payload
+        for sensitive in ("api_key", "token", "secret", "credential")
+    )
+    assert node.parameter_output_values["generation_id"] == "broker-job-1"
+    assert node.parameter_output_values["generation_status"] == "succeeded"
+    assert node.parameter_output_values["provider_response"] == {
+        "transport": "fn_ai_broker",
+        "id": "broker-job-1",
+        "status": "succeeded",
+    }
+    assert node.get_parameter_value("broker_connection_status") == "Connected"
+    assert node.get_parameter_value("broker_account") == "Broker Artist"
+    assert node.downloads == ["https://cdn.example/broker-result.mp4"]
+    assert node.parameter_output_values["VIDEO_OUT"].value == node.destination.location
+
+    public_state = json.dumps(
+        {
+            "parameters": node.parameter_values,
+            "outputs": node.parameter_output_values,
+        },
+        default=str,
+        ensure_ascii=False,
+    )
+    for secret in FakeBrokerBridge.SECRET_VALUES:
+        assert secret not in public_state
+    assert "••••" not in public_state
+
+    resume_bridge = FakeBrokerBridge(
+        [
+            {
+                "status": "completed",
+                "job_id": "broker-resume-9",
+                "output": "https://cdn.example/resumed-broker.mp4",
+                "token": FakeBrokerBridge.SECRET_VALUES[0],
+            }
+        ]
+    )
+    resumed = BrokerScriptedNode(resume_bridge)
+    resumed.set_parameter_value("resume_generation_id", "broker-resume-9")
+    with mock.patch.object(
+        resumed,
+        "_prepare_usage_tracking",
+        side_effect=AssertionError("Broker resume collected usage"),
+    ), mock.patch.object(
+        resumed,
+        "_record_usage_task",
+        side_effect=AssertionError("Broker resume recorded usage"),
+    ):
+        asyncio.run(resumed._process_generation())
+    assert resume_bridge.generate_payloads == []
+    assert resume_bridge.refresh_ids == ["broker-resume-9"]
+    assert resumed.downloads == ["https://cdn.example/resumed-broker.mp4"]
+
+    refresh_bridge = FakeBrokerBridge(
+        [
+            {
+                "status": "completed",
+                "job_id": "broker-refresh-3",
+                "output": "https://cdn.example/refreshed-broker.mp4",
+            }
+        ]
+    )
+    refreshed = BrokerScriptedNode(refresh_bridge)
+    refreshed.parameter_output_values["generation_id"] = "broker-refresh-3"
+    with mock.patch.object(
+        refreshed,
+        "_prepare_usage_tracking",
+        side_effect=AssertionError("Broker refresh collected usage"),
+    ), mock.patch.object(
+        refreshed,
+        "_record_usage_task",
+        side_effect=AssertionError("Broker refresh recorded usage"),
+    ):
+        asyncio.run(refreshed._refresh_async())
+    assert refresh_bridge.refresh_ids == ["broker-refresh-3"]
+    assert refreshed.downloads == ["https://cdn.example/refreshed-broker.mp4"]
+
+
+def assert_broker_account_and_button_contract() -> None:
+    secrets = {
+        "token": "account-token-canary",
+        "api_key": "account-provider-key-canary",
+        "authorization": "account-authorization-canary",
+    }
+    bridge = target._HMBAIBrokerBridge()
+    safe_me = {
+        "display_name": "Broker Artist",
+        **secrets,
+        "credentials": {"provider_key": "nested-provider-key-canary"},
+    }
+    with mock.patch.object(
+        bridge, "_request_json", return_value=safe_me
+    ) as request_json:
+        snapshot = bridge.account_snapshot(connect=False)
+    assert request_json.call_count == 1
+    assert snapshot == target._BrokerAccountSnapshot(
+        state="connected",
+        connected=True,
+        account="Broker Artist",
+    )
+    snapshot_dump = json.dumps(snapshot.__dict__, ensure_ascii=False)
+    for secret in (*secrets.values(), "nested-provider-key-canary"):
+        assert secret not in snapshot_dump
+
+    with mock.patch.object(
+        bridge,
+        "_request_json",
+        side_effect=target._BrokerUnavailableError("safe unavailable"),
+    ), mock.patch.object(
+        target,
+        "_broker_auto_login",
+        side_effect=AssertionError("server outage triggered a login exchange"),
+    ):
+        try:
+            bridge.account_snapshot(connect=True)
+        except target._BrokerUnavailableError:
+            pass
+        else:
+            raise AssertionError("Broker outage was treated as a logged-out session")
+
+    assert bridge.is_trusted_broker_url(target.AI_BROKER_SERVER_URL + "/result.mp4")
+    assert not bridge.is_trusted_broker_url(
+        target.AI_BROKER_SERVER_URL + ".evil.example/result.mp4"
+    )
+    assert target.HMBSeedance20VideoGeneration._broker_result_url(
+        "/downloads/result.mp4"
+    ) == (target.AI_BROKER_SERVER_URL + "/downloads/result.mp4")
+
+    class BlockingBridge:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.returned = threading.Event()
+            self.calls = 0
+
+        def account_snapshot(self, *, connect: bool):
+            assert connect is True
+            self.calls += 1
+            self.started.set()
+            assert self.release.wait(2.0)
+            self.returned.set()
+            return target._BrokerAccountSnapshot(
+                state="connected",
+                connected=True,
+                account="Threaded Artist",
+            )
+
+    blocking_bridge = BlockingBridge()
+    node = target.HMBSeedance20VideoGeneration(name="Broker Button Regression")
+    node._broker_bridge_instance = blocking_bridge
+    no_engine_loop = SimpleNamespace(event_loop=None, put_event=lambda _event: None)
+    with mock.patch.object(
+        target.GriptapeNodes, "EventManager", return_value=no_engine_loop
+    ):
+        started_at = time.monotonic()
+        node._on_broker_connect_clicked(None, None)
+        assert time.monotonic() - started_at < 0.25
+        assert blocking_bridge.started.wait(1.0)
+        node._on_broker_connect_clicked(None, None)
+        assert blocking_bridge.calls == 1
+        blocking_bridge.release.set()
+        assert blocking_bridge.returned.wait(1.0)
+        deadline = time.monotonic() + 1.0
+        while node._broker_action_running and time.monotonic() < deadline:
+            time.sleep(0.01)
+    assert blocking_bridge.calls == 1
+    assert node._broker_action_running is False
+    assert node.get_parameter_value("broker_connection_status") == "Connected"
+    assert node.get_parameter_value("broker_account") == "Threaded Artist"
 
 
 def assert_scripted_success_flow() -> None:
@@ -1897,6 +2249,8 @@ assert_image_asset_single_wire_host_contract()
 assert_video_picker_single_wire_host_contract()
 assert_secret_manager_contract()
 assert_payload_and_media_contract()
+assert_broker_generation_contract()
+assert_broker_account_and_button_contract()
 assert_scripted_success_flow()
 assert_indexed_output_macro_contract()
 assert_local_video_temporary_publication()
@@ -1907,4 +2261,4 @@ assert_ambiguous_submission_status_contract()
 assert_http_transport_contract()
 assert_private_monthly_usage_ledger_contract()
 
-print("HMB Seedance 2.0 Volcengine Ark regression: PASS")
+print("HMB Seedance 2.0 FN AI Broker regression: PASS")

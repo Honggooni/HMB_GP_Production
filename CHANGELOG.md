@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.19 - 2026-08-07
+
+- Routed HMB Seedance 2.0 generation, task refresh, resume, and trusted result
+  downloads through the authenticated FN AI Broker at the configured server
+  origin. Provider API keys remain server-side and are never placed in node
+  parameters, outputs, logs, or serialized state.
+- Added a collapsed `AI Broker` group directly below Status with connection
+  state, account, and one nonblocking `Connect / Refresh` action. Key values,
+  key-registration controls, usage, quota, and reset information are absent;
+  Broker renders also perform no usage collection or local usage recording.
+- Made Picker Depth use Maya-authored visibility plus the Picker eye state
+  independently of Color Assignment, and made Mask recoloring replace stale
+  duplicate bindings by Maya UUID or exact DAG path.
+- Added Broker credential-boundary, async-button, generation/resume/refresh,
+  Picker visibility, Depth, and Mask recolor regressions.
+
 ## 0.5.18 - 2026-08-06
 
 - Removed the redundant visible `ASSET · Asset ID` helper line beneath Image

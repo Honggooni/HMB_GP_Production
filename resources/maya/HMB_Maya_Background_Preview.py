@@ -2128,7 +2128,7 @@ def _release_temporary_render_scope_layer(report):
 
 
 def _prepare_unassigned_auxiliary_scope(job, hidden_paths, color_scope_report):
-    """Activate the no-Color-assignment scope for optional auxiliary passes.
+    """Activate the visibility-driven scope for optional auxiliary passes.
 
     Depth shaders can be assigned only to polygon meshes and NURBS surfaces.
     The authored-visible fallback used to retain controller curves, locators,
@@ -2204,7 +2204,7 @@ def _prepare_unassigned_auxiliary_scope(job, hidden_paths, color_scope_report):
                 )
             )
     report = {
-        "policy": "maya_authored_visible_and_picker_visible_without_color_requirement",
+        "policy": "maya_visibility_on_and_picker_visible_independent_of_color_assignment",
         "supported_surface_types": list(supported_types),
         "allowed_shape_path_count": len(allowed),
         "excluded_shape_path_count": len(excluded),
@@ -14302,16 +14302,22 @@ def run(job_path):
                         original_mouth_report
                     )
             artifact_status["color"]["ok"] = True
-            if (generate_depth_playblast or generate_motion_guide) and not bindings:
+            # Depth is a scene-space pass, not a Color Assignment pass.  After
+            # the assignment-scoped Mask has rendered, release its disposable
+            # exclusion layer and rebuild Depth from Maya-authored visibility
+            # plus the Picker eye state even when Color bindings exist.
+            # Motion Guide retains its prior no-binding fallback behavior.
+            if generate_depth_playblast or (generate_motion_guide and not bindings):
                 try:
                     _prepare_unassigned_auxiliary_scope(
                         job,
                         hidden_paths,
                         render_scope_report,
                     )
-                    auxiliary_bindings = _unassigned_motion_bindings(
-                        hidden_paths=hidden_paths
-                    )
+                    if not bindings:
+                        auxiliary_bindings = _unassigned_motion_bindings(
+                            hidden_paths=hidden_paths
+                        )
                 except Exception as exc:
                     auxiliary_scope_error = _clean(exc) or exc.__class__.__name__
                     warning = (

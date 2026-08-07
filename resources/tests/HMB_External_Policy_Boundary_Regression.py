@@ -300,7 +300,6 @@ manifest = json.loads(
 )
 registered_secrets = manifest["settings"][0]["contents"]["secrets_to_register"]
 assert registered_secrets == {
-    "ARK_API_KEY": "",
     "GT_CLOUD_API_KEY": "",
     "GT_CLOUD_BUCKET_ID": "",
     "TOS_ACCESS_KEY_ID": "",
