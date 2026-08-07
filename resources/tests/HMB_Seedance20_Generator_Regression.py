@@ -1332,6 +1332,31 @@ def assert_broker_generation_contract() -> None:
 
 
 def assert_broker_account_and_button_contract() -> None:
+    assert target.AI_BROKER_CGTW_SERVERS == frozenset(
+        {
+            "192.168.200.18:8383",
+            "cgteamwork.funnyflux.kr:443",
+        }
+    )
+    for raw, expected in (
+        ("192.168.200.18:8383", "192.168.200.18:8383"),
+        ("http://192.168.200.18:8383/", "192.168.200.18:8383"),
+        ("cgteamwork.funnyflux.kr:443", "cgteamwork.funnyflux.kr:443"),
+        ("HTTPS://CGTEAMWORK.FUNNYFLUX.KR/", "cgteamwork.funnyflux.kr:443"),
+    ):
+        assert target._broker_normalize_cgtw_server(raw) == expected
+        assert expected in target.AI_BROKER_CGTW_SERVERS
+    for rejected in (
+        "",
+        "ftp://cgteamwork.funnyflux.kr:443",
+        "https://user@cgteamwork.funnyflux.kr/",
+        "https://cgteamwork.funnyflux.kr/path",
+        "cgteamwork.funnyflux.kr:443.evil.example",
+    ):
+        assert target._broker_normalize_cgtw_server(rejected) not in (
+            target.AI_BROKER_CGTW_SERVERS
+        )
+
     secrets = {
         "token": "account-token-canary",
         "api_key": "account-provider-key-canary",

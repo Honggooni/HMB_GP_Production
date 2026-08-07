@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.20 - 2026-08-07
+
+- Allowed the current production CGTeamwork origin
+  `cgteamwork.funnyflux.kr:443` alongside the legacy internal origin when
+  starting FN AI Broker approval, while retaining an exact normalized
+  allowlist and rejecting user-info, path, query, fragment, and lookalike-host
+  inputs.
+- Added regression coverage for both approved CGTeamwork origins and unsafe
+  origin variants so `Connect / Refresh` can create the `comp` approval request
+  without weakening the credential boundary.
+
 ## 0.5.19 - 2026-08-07
 
 - Routed HMB Seedance 2.0 generation, task refresh, resume, and trusted result

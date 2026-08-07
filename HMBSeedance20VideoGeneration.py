@@ -68,7 +68,12 @@ CREATE_TASK_PATH = "/contents/generations/tasks"
 AI_BROKER_SERVER_URL = os.environ.get(
     "HMB_AI_BROKER_URL", "http://192.168.204.242:8080"
 ).rstrip("/")
-AI_BROKER_CGTW_SERVER = "192.168.200.18:8383"
+AI_BROKER_CGTW_SERVERS = frozenset(
+    {
+        "192.168.200.18:8383",
+        "cgteamwork.funnyflux.kr:443",
+    }
+)
 AI_BROKER_MAX_JSON_BYTES = 16 * 1024 * 1024
 
 USAGE_GENERATOR_ID = "HMBSeedance20VideoGeneration"
@@ -362,6 +367,38 @@ def _broker_load_token() -> str:
     return token
 
 
+def _broker_normalize_cgtw_server(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw if "://" in raw else f"//{raw}")
+        scheme = parsed.scheme.lower()
+        if scheme not in {"", "http", "https"}:
+            return ""
+        if (
+            parsed.username is not None
+            or parsed.password is not None
+            or not parsed.hostname
+            or parsed.path not in {"", "/"}
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
+            return ""
+        port = parsed.port
+    except (TypeError, ValueError):
+        return ""
+
+    hostname = parsed.hostname.lower().rstrip(".")
+    if port is None:
+        if scheme == "https":
+            port = 443
+        elif scheme == "http":
+            port = 80
+    return f"{hostname}:{port}" if port is not None else hostname
+
+
 def _broker_cgtw_session() -> tuple[Any, str]:
     cgtw_base = r"C:\CgTeamWork_v7\bin\base"
     if cgtw_base not in sys.path:
@@ -374,14 +411,8 @@ def _broker_cgtw_session() -> tuple[Any, str]:
         ) from exc
     session = cgtw2.tw()
     token = str(session.login.token() or "")
-    server = (
-        str(session.login.http_server_ip() or "")
-        .lower()
-        .replace("https://", "")
-        .replace("http://", "")
-        .rstrip("/")
-    )
-    if not token or server != AI_BROKER_CGTW_SERVER:
+    server = _broker_normalize_cgtw_server(session.login.http_server_ip())
+    if not token or server not in AI_BROKER_CGTW_SERVERS:
         raise _BrokerAuthenticationError(
             "CGTeamwork login is required for FN AI Broker."
         )
