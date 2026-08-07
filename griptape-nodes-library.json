@@ -4,7 +4,7 @@
   "metadata": {
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.5.18",
+    "library_version": "0.5.19",
     "engine_version": "0.93.0",
     "tags": [
       "Griptape",
@@ -114,15 +114,16 @@
       "InstantColorAssignment",
       "HMBSeedance20VideoGeneration",
       "VolcengineArk",
-      "DirectArkTransport",
-      "SecureArkAPIKey",
+      "FNAIBroker",
+      "ServerManagedProviderCredentials",
+      "DPAPIProtectedBrokerSession",
       "SingleWireReferenceImages",
       "SingleWireVideoReferences",
       "ReferenceImageCapacity9",
       "VideoReferenceCapacity3",
       "AudioReferenceCapacity3",
       "ImmediateLocalMP4",
-      "ResumableArkTask",
+      "ResumableBrokerTask",
       "StreamingSignedDownload",
       "DownloadSSRFGuard",
       "TemporaryVideoPublication",
@@ -130,17 +131,15 @@
       "VolcengineTOSUpload",
       "SeedanceStandard4K",
       "SingleVideoPreview",
-      "GetOnlyTaskRecovery",
-      "AmbiguousSubmissionSafety",
-      "PrivatePerUserMonthlyUsageLedger",
-      "OfflineUsageQueue",
-      "AtomicUsageLedger"
+      "BrokerTaskRefresh",
+      "AmbiguousSubmissionSafety"
     ],
     "dependencies": {
       "pip_dependencies": [
         "imageio-ffmpeg==0.6.0",
         "Pillow==12.3.0",
-        "httpx==0.28.1"
+        "httpx==0.28.1",
+        "cryptography==50.0.0"
       ]
     },
     "declarations": [
@@ -156,11 +155,10 @@
   },
   "settings": [
     {
-      "description": "The HMB Seedance 2.0 node reads the user-owned Volcengine Ark API key from Griptape Secrets at execution time. Local reference videos may use either the existing separately scoped storage key or a least-privilege Volcengine TOS IAM key and private bucket. Secret values are never stored in node parameters, outputs, logs, manifests, or release archives.",
+      "description": "HMB Seedance 2.0 authenticates to the FN AI Broker with the active CGTeamwork account. Provider API keys remain exclusively on the Broker server; the node exposes no provider-key input, registration state, usage, quota, or reset data. The Broker access token is protected with Windows DPAPI and never stored in node parameters, outputs, logs, manifests, or release archives. Local reference videos may still use separately scoped Griptape Cloud or least-privilege Volcengine TOS storage credentials.",
       "category": "app_events.on_app_initialization_complete",
       "contents": {
         "secrets_to_register": {
-          "ARK_API_KEY": "",
           "GT_CLOUD_API_KEY": "",
           "GT_CLOUD_BUCKET_ID": "",
           "TOS_ACCESS_KEY_ID": "",
@@ -228,7 +226,7 @@
       "file_path": "HMBSeedance20VideoGeneration.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "The existing HMB Seedance 2.0 node upgraded in place to the official Volcengine Ark asynchronous API. It submits each billable POST /contents/generations/tasks at most once, polls GET /contents/generations/tasks/{id}, immediately streams content.video_url to a bounded local MP4, and publishes one property-only preview plus the sole VIDEO_OUT connector. Resume Task ID and the Status-group Refresh / Retrieve Result control reuse accepted tasks without another create POST; Refresh performs GET only and can list candidates after an ambiguous response without choosing one. Its public media surface accepts Image Asset Library Video Generation Out through one ordered list input of up to 9 reference images and Video Picker VIDEO_OUT through one ordered list input of up to 3 reference videos, while hidden reference_video_1/reference_video_2/reference_video_3 parameters remain saved-workflow fallbacks. It also keeps a ParameterList of up to 3 reference audio items. Local images and MP3/WAV audio are encoded within Ark limits; project-relative paths resolve against the active workspace. Local video references are lazily published through a selectable upload service. Volcengine TOS mode uploads to a private bucket, creates a 24-hour signed HTTPS URL, and deletes the temporary object best-effort after execution; ambiguous submissions retain it for up to 30 minutes. Existing public URLs and asset:// references bypass upload. ARK_API_KEY and all storage credentials are read only from Griptape Secrets.",
+        "description": "HMB Seedance 2.0 submits generation to the authenticated FN AI Broker, refreshes or resumes known Broker jobs without creating replacements, downloads same-origin results with Broker authorization, and never forwards that authorization to external result URLs. Provider API keys remain server-side. A collapsed AI Broker group below Status shows only connection state, account, and one nonblocking Connect / Refresh action; it exposes no key characters, key-registration control, usage, quota, or reset data, and Broker renders perform no usage recording. The public media surface accepts up to 9 ordered reference images, up to 3 ordered Picker video references, and up to 3 audio items. Local media publication and output preflight remain bounded and occur before billable submission; successful results publish one local preview and the sole VIDEO_OUT connector.",
         "display_name": "HMB Seedance 2.0 Video Generation",
         "icon": "Sparkles",
         "group": "create",
@@ -244,13 +242,14 @@
           "video-reference-capacity-3",
           "audio-default-off",
           "volcengine-ark",
-          "direct-ark-api",
+          "fn-ai-broker",
           "standard-4k",
-          "secure-ark-key",
+          "server-managed-provider-credentials",
+          "dpapi-protected-broker-session",
           "temporary-video-publication",
           "griptape-cloud-storage",
           "single-video-preview",
-          "get-only-task-recovery",
+          "broker-task-refresh",
           "ambiguous-submission-safety",
           "local-mp4-output"
         ]
@@ -292,7 +291,7 @@
       "file_path": "HMBVideoPickerLibrary.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "Maya HMB playblast picker and current-cut video catalog. READ loads Outliner, camera, and timeline metadata without rendering video. Original, Mask (legacy Color Assignment), Depth, and Motion Guide checkboxes are inert selections; only Generate Playblast executes work, and every successful checked result is appended as a new immutable catalog asset instead of replacing a numbered slot. Imported MP4 files join the same history. Video cards use static thumbnails: the centered play button routes playback to the main Preview and toggles play/pause there, while the entire lower information area selects or deselects the card. Selected cards use a thicker, brighter neon outline; delete remains at the upper-right. Dragging selected cards changes their @video1..@videoN order, and metadata-only deletion never leaves the Picker stuck in a busy state. Snapshot and Video share the main viewport: stable Snapshot history is navigated by the left/right controls, the center control alone plays or pauses Video with ▶/Ⅱ, and the redundant local Open action is removed in favor of current-cut Load. Up to ten selected assets publish synchronized Prompt metadata through PICKER_OUT and the same ordered media paths through one VIDEO_OUT list[str] generator connection. Mask remains limited to Maya-authored visible geometry with enabled Color Assignment and Picker eye state. When no Color Assignment exists, optional Depth and Motion Guide independently use authored-visible, Picker-eye-enabled geometry without forcing hidden objects or changing saved reference/proxy state. Depth v7 and the shared viewport path preserve authored cutout alpha while applying camera-space grayscale or Smooth Preview. Motion Guide v5 adds bounded render-scope eye/eyelid semantic-mesh evidence to Sidecar-v2 final Blend Shape values, controller-value provenance, front-visible surface landmarks, and cached selective visibility checks. Full-detail and Smooth Preview preparation is best-effort, while exact frame-map, raster, H.264, and BT.709 validation remains mandatory.",
+        "description": "Maya HMB playblast picker and current-cut video catalog. READ loads Outliner, camera, and timeline metadata without rendering video. Original, Mask (legacy Color Assignment), Depth, and Motion Guide checkboxes are inert selections; only Generate Playblast executes work, and every successful checked result is appended as a new immutable catalog asset instead of replacing a numbered slot. Imported MP4 files join the same history. Video cards use static thumbnails: the centered play button routes playback to the main Preview and toggles play/pause there, while the entire lower information area selects or deselects the card. Selected cards use a thicker, brighter neon outline; delete remains at the upper-right. Dragging selected cards changes their @video1..@videoN order, and metadata-only deletion never leaves the Picker stuck in a busy state. Snapshot and Video share the main viewport: stable Snapshot history is navigated by the left/right controls, the center control alone plays or pauses Video with ▶/Ⅱ, and the redundant local Open action is removed in favor of current-cut Load. Up to ten selected assets publish synchronized Prompt metadata through PICKER_OUT and the same ordered media paths through one VIDEO_OUT list[str] generator connection. Mask remains limited to Maya-authored visible geometry with enabled Color Assignment and Picker eye state; repeated recoloring replaces stale duplicate bindings by Maya UUID or exact DAG path. Depth always derives its surface scope from Maya-authored visibility plus the Picker eye state, independently of Color Assignment. Motion Guide retains the visibility-driven fallback when no Color Assignment exists. Depth v7 and the shared viewport path preserve authored cutout alpha while applying camera-space grayscale or Smooth Preview. Motion Guide v5 adds bounded render-scope eye/eyelid semantic-mesh evidence to Sidecar-v2 final Blend Shape values, controller-value provenance, front-visible surface landmarks, and cached selective visibility checks. Full-detail and Smooth Preview preparation is best-effort, while exact frame-map, raster, H.264, and BT.709 validation remains mandatory.",
         "display_name": "HMBVideoPickerLibrary",
         "width": 1400,
         "height": 1200,
