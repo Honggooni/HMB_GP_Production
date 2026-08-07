@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.22 - 2026-08-07
+
+- Changed the default FN AI Broker origin from
+  `http://192.168.204.242:8080` to `http://192.168.203.245:8080` after
+  confirming the replacement server health, CGTeamwork public-key endpoint,
+  and all three Volcengine Seedance 2.0 model definitions.
+- Preserved `HMB_AI_BROKER_URL` as the explicit installation override and kept
+  the existing strict origin validation and credential boundary unchanged.
+
 ## 0.5.21 - 2026-08-07
 
 - Aligned HMB Seedance requests with each FN AI Broker model schema. The full
