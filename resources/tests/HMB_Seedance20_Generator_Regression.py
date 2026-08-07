@@ -1215,6 +1215,98 @@ def assert_broker_generation_contract() -> None:
         "provider-api-key-canary"
     ) == ""
 
+    bridge_contract = target._HMBAIBrokerBridge()
+    full_payload = {
+        "provider": "volcengine_ark",
+        "model": target.SEEDANCE_2_0_MODEL_ID,
+        "prompt": "Broker schema regression",
+        "input_mode": target.INPUT_MODE_MULTIMODAL_REFERENCES,
+        "duration_seconds": 5,
+        "quality": "720p",
+        "aspect_ratio": "adaptive",
+        "generate_audio": False,
+        "watermark": False,
+        "return_last_frame": False,
+        "execution_expires_after": 172800,
+        "priority": 0,
+    }
+    with mock.patch.object(
+        bridge_contract,
+        "_request_json",
+        return_value={"status": "pending", "job_id": "schema-job-1"},
+    ) as request_json:
+        bridge_contract.generate_seedance(full_payload, timeout=30)
+    submitted = request_json.call_args.kwargs["payload"]
+    assert set(submitted) == {
+        "provider",
+        "model",
+        "prompt",
+        "duration_seconds",
+        "quality",
+        "aspect_ratio",
+        "generate_audio",
+        "watermark",
+    }
+    assert not {
+        "input_mode",
+        "return_last_frame",
+        "execution_expires_after",
+        "priority",
+    } & set(submitted)
+
+    fast_payload = dict(full_payload)
+    fast_payload.update(
+        {
+            "model": target.SEEDANCE_2_0_FAST_MODEL_ID,
+            "input_mode": target.INPUT_MODE_FIRST_LAST_FRAME,
+            "first_frame": ["https://cdn.example/first.png"],
+            "last_frame": ["https://cdn.example/last.png"],
+            "return_last_frame": True,
+        }
+    )
+    fast_payload.pop("priority")
+    with mock.patch.object(
+        bridge_contract,
+        "_request_json",
+        return_value={"status": "pending", "job_id": "schema-job-2"},
+    ) as request_json:
+        bridge_contract.generate_seedance(fast_payload, timeout=30)
+    fast_submitted = request_json.call_args.kwargs["payload"]
+    for field in (
+        "input_mode",
+        "first_frame",
+        "last_frame",
+        "return_last_frame",
+        "execution_expires_after",
+    ):
+        assert field in fast_submitted
+
+    rejected_payloads = []
+    for field, value in (
+        ("first_frame", ["https://cdn.example/first.png"]),
+        ("return_last_frame", True),
+        ("execution_expires_after", 3600),
+        ("priority", 1),
+    ):
+        invalid = dict(full_payload)
+        invalid[field] = value
+        rejected_payloads.append(invalid)
+    promptless = dict(full_payload)
+    promptless["prompt"] = ""
+    rejected_payloads.append(promptless)
+    for invalid in rejected_payloads:
+        with mock.patch.object(
+            bridge_contract,
+            "_request_json",
+            side_effect=AssertionError("invalid payload reached FN AI Broker"),
+        ):
+            try:
+                bridge_contract.generate_seedance(invalid, timeout=30)
+            except target._BrokerProtocolError:
+                pass
+            else:
+                raise AssertionError("Invalid Broker payload was accepted")
+
     completed = {
         "status": "completed",
         "job_id": "broker-job-1",

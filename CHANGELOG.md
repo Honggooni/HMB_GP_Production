@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.21 - 2026-08-07
+
+- Aligned HMB Seedance requests with each FN AI Broker model schema. The full
+  and mini models no longer receive Fast-only or unsupported `input_mode`,
+  last-frame, expiry, or priority fields, eliminating the HTTP 400 response on
+  otherwise valid default requests.
+- Added pre-submission validation for model-specific prompt, First/Last Frame,
+  Last Frame return, custom expiry, and priority support. Unsupported choices
+  now fail locally with a safe explanation before any billable request.
+- Added regressions that verify the exact full-model payload, preserve the Fast
+  frame contract, and prevent invalid model-field combinations from reaching
+  FN AI Broker.
+
 ## 0.5.20 - 2026-08-07
 
 - Allowed the current production CGTeamwork origin
