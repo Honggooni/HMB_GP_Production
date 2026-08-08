@@ -14,6 +14,15 @@
 - Added concurrency and no-loss regressions for stale host echoes, IME editing,
   video source switching, command submission guards, output propagation, and
   the complete four-library composition contract.
+- Replaced the Seedance node's CGTeamwork token exchange with the Broker's
+  one-time browser authorization and Windows DPAPI-protected permanent token.
+- Added one stable client request ID and matching idempotency header per render,
+  allowing lost responses to recover the same server task without duplicate
+  submission or billing.
+- Aligned Refresh and terminal-expiry handling with the durable Broker job API;
+  Refresh checks only the existing job and never creates a replacement render.
+- Added server-contract regressions for device authorization, idempotent retry,
+  provisional job aliases, and expired retained results.
 
 ## 0.5.26 - 2026-08-08
 

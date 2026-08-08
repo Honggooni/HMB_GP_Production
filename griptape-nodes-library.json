@@ -155,7 +155,7 @@
   },
   "settings": [
     {
-      "description": "HMB Seedance 2.0 authenticates to the FN AI Broker with the active CGTeamwork account. Provider API keys remain exclusively on the Broker server; the node exposes no provider-key input, registration state, usage, quota, or reset data. The Broker access token is protected with Windows DPAPI and never stored in node parameters, outputs, logs, manifests, or release archives. Local reference videos may still use separately scoped Griptape Cloud or least-privilege Volcengine TOS storage credentials.",
+      "description": "HMB Seedance 2.0 authenticates through the FN AI Broker's one-time browser authorization. Provider API keys remain exclusively on the Broker server; the node exposes no provider-key input, registration state, usage, quota, or reset data. The permanent Broker access token is protected with Windows DPAPI and never stored in node parameters, outputs, logs, manifests, or release archives. Local reference videos may still use separately scoped Griptape Cloud or least-privilege Volcengine TOS storage credentials.",
       "category": "app_events.on_app_initialization_complete",
       "contents": {
         "secrets_to_register": {

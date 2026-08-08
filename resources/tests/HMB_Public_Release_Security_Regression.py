@@ -69,6 +69,9 @@ assert manifest["metadata"]["library_version"] == "0.5.27"
 registered_secrets = manifest["settings"][0]["contents"]["secrets_to_register"]
 assert set(registered_secrets) == EXPECTED_SECRET_NAMES
 assert all(value == "" for value in registered_secrets.values())
+manifest_description = manifest["settings"][0]["description"]
+assert "one-time browser authorization" in manifest_description
+assert "CGTeamwork" not in manifest_description
 
 # The two full Seedance transport regressions require a live Griptape host. Keep
 # their critical output-macro boundary enforced in source-only CI as well:
@@ -113,6 +116,75 @@ for execution_method_name in ("_refresh_async", "_process_generation_impl"):
         and node.func.attr == "resolve"
         for node in ast.walk(execution_method)
     )
+
+# Keep the API SERVER durable-job contract enforced on public CI without
+# importing the host-only griptape_nodes runtime.
+assert "CGTeamwork" not in seedance_source
+module_functions = {
+    node.name: node
+    for node in seedance_tree.body
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+}
+device_login_source = (
+    ast.get_source_segment(seedance_source, module_functions["_broker_device_login"])
+    or ""
+)
+for endpoint in ('"/api/device/start"', '"/api/device/token"'):
+    assert endpoint in device_login_source
+assert "_broker_same_origin(verification_url, server_url)" in device_login_source
+assert "_broker_save_token(access_token)" in device_login_source
+
+broker_class = next(
+    node
+    for node in seedance_tree.body
+    if isinstance(node, ast.ClassDef) and node.name == "_HMBAIBrokerBridge"
+)
+broker_methods = {
+    node.name: node
+    for node in broker_class.body
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+}
+request_source = ast.get_source_segment(
+    seedance_source, broker_methods["_request_json"]
+) or ""
+assert 'headers["Idempotency-Key"] = idempotency_key' in request_source
+assert "exc.code == 410 and not submission" in request_source
+assert "BROKER_EXPIRED_STATUSES" in request_source
+account_source = ast.get_source_segment(
+    seedance_source, broker_methods["account_snapshot"]
+) or ""
+assert '"GET", "/api/me"' in account_source
+generate_source = ast.get_source_segment(
+    seedance_source, broker_methods["generate_seedance"]
+) or ""
+assert '"/api/v1/generate/video"' in generate_source
+assert "idempotency_key=client_request_id" in generate_source
+refresh_job_source = ast.get_source_segment(
+    seedance_source, broker_methods["refresh_job"]
+) or ""
+assert '"/api/v1/jobs/"' in refresh_job_source
+
+process_source = ast.get_source_segment(
+    seedance_source, seedance_methods["_process_generation_impl"]
+) or ""
+assert "_ensure_broker_connected" in process_source
+assert "_get_api_key" not in process_source
+assert 'payload["client_request_id"] = client_request_id' in process_source
+refresh_source = ast.get_source_segment(
+    seedance_source, seedance_methods["_refresh_async"]
+) or ""
+for recovery_marker in (
+    "retry_same_request",
+    'retry_payload.get("client_request_id") == generation_id',
+    "bridge.generate_seedance",
+):
+    assert recovery_marker in refresh_source
+download_source = ast.get_source_segment(
+    seedance_source, seedance_methods["_download_broker_video"]
+) or ""
+assert "bridge.is_trusted_broker_url(url)" in download_source
+assert "bridge.download_trusted_result" in download_source
+assert "return await self._download_video(url)" in download_source
 
 source_policy_path = ROOT / Path(POLICY_RELATIVE)
 source_policy = source_policy_path.read_bytes()
