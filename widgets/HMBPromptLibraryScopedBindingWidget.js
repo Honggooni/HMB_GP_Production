@@ -233,6 +233,7 @@ const HMB_UI_KO = {
   custom_video_role: "사용자 지정 비디오 세부 유형 입력",
   output: "출력",
   only_real_output: "이 노드의 실제 출력만",
+  connection_guide: "연결 안내",
   connect_agent: "HMBAgentLibrary 프롬프트 입력에 연결",
   not_included: "포함되지 않음",
   no_image_output: "이미지 출력 포트 없음",
@@ -1822,31 +1823,65 @@ export function normalizeState(input) {
   };
 }
 
-function emit(props, state) {
-  if (props && typeof props.onChange === "function") {
-    props.onChange(JSON.stringify(normalizeState(state)));
-  }
+function emit(props, state, container = null) {
+  return hmbPublishPromptStateValue(
+    container,
+    props,
+    JSON.stringify(normalizeState(state)),
+    false,
+  );
 }
 
-function hmbScheduleImmediateStateCommit(container, props, state) {
+export function hmbEmitPromptState(container, props, state) {
+  return emit(props, state, container);
+}
+
+function hmbClearImmediateStateCommit(container) {
+  if (!container) return false;
+  const timer = container.__hmbPromptLibraryCommitTimer;
+  try { if (timer) clearTimeout(timer); } catch (_e) {}
+  try { container.__hmbPromptLibraryCommitTimer = null; } catch (_e) {}
+  const pending = Boolean(container.__hmbPromptLibraryCommitPending);
+  try { container.__hmbPromptLibraryCommitPending = false; } catch (_e) {}
+  return pending;
+}
+
+export function hmbScheduleImmediateStateCommit(container, props, state) {
   if (!container) return;
+  // Any newly edited draft supersedes an exact-payload transport retry that
+  // may still be waiting from the preceding publication.
+  hmbInvalidatePromptPublication(container);
   hmbCaptureTextEditingState(container);
-  try {
-    if (container.__hmbPromptLibraryCommitTimer) clearTimeout(container.__hmbPromptLibraryCommitTimer);
-  } catch (_e) {}
-  container.__hmbPromptLibraryCommitTimer = setTimeout(() => {
-    try {
-      // Emitting through the host can remount the complete custom widget. Do
-      // not replace a live input/textarea while the user is typing or while a
-      // Korean/IME composition owns that control. Every editable field already
-      // performs its final emit on blur/change.
-      if (hmbShouldDeferPromptTextCommit(container)) return;
-      hmbCaptureUiBeforeStateEmit(container, state);
-      emit(props, state);
-    } finally {
-      try { container.__hmbPromptLibraryCommitTimer = null; } catch (_e) {}
+  const active = typeof document !== "undefined" ? document.activeElement : null;
+  if (active && container.contains?.(active)) {
+    hmbRememberPromptDirtyTextControl(container, active, state);
+  }
+  hmbClearImmediateStateCommit(container);
+  container.__hmbPromptLibraryCommitPending = true;
+  const timer = setTimeout(() => {
+    if (container.__hmbPromptLibraryCommitTimer !== timer) return;
+    container.__hmbPromptLibraryCommitTimer = null;
+    if (hmbShouldDeferPromptTextCommit(container)) {
+      // A composing IME value is not final. Keep one trailing commit armed;
+      // ordinary focus is intentionally not a blocker because users can run a
+      // downstream node without blurring the current Prompt field first.
+      hmbScheduleImmediateStateCommit(container, props, state);
+      return;
     }
+    container.__hmbPromptLibraryCommitPending = false;
+    hmbCaptureUiBeforeStateEmit(container, state);
+    // Register the exact local value before calling the host. A synchronous
+    // props echo can then be consumed without replacing the focused control.
+    hmbEmitLocalPromptState(container, props, state);
   }, 260);
+  container.__hmbPromptLibraryCommitTimer = timer;
+}
+
+export function hmbFlushImmediateStateCommit(container, props, state) {
+  if (!hmbClearImmediateStateCommit(container)) return false;
+  hmbCaptureUiBeforeStateEmit(container, state);
+  hmbEmitLocalPromptState(container, props, state);
+  return true;
 }
 
 function hmbIsEditableTextControl(element) {
@@ -1856,9 +1891,14 @@ function hmbIsEditableTextControl(element) {
 
 
 export function hmbShouldDeferPromptTextCommit(container) {
-  if (!container || typeof document === "undefined") return false;
-  const active = document.activeElement;
-  return Boolean(active && container.contains?.(active) && hmbIsEditableTextControl(active));
+  return Boolean(container && container.__hmbPromptLibraryCompositionActive);
+}
+
+export function hmbReleasePromptCompositionLatch(container) {
+  if (!container) return false;
+  const wasActive = Boolean(container.__hmbPromptLibraryCompositionActive);
+  try { container.__hmbPromptLibraryCompositionActive = false; } catch (_e) {}
+  return wasActive;
 }
 
 function hmbTextControlIdentity(element) {
@@ -1876,6 +1916,184 @@ function hmbTextControlIdentity(element) {
     return `row:${kind}:${index}:${field}:${arrayField}:${arrayIndex}:domain:${frameDomain}`;
   }
   return "";
+}
+
+function hmbPromptSourceDirtyKey(item, kind) {
+  if (!item || typeof item !== "object") return "";
+  if (kind === "image") {
+    const sourceUid = clean(item.asset_source_uid);
+    if (sourceUid) return `asset-source:${sourceUid}`;
+    const libraryId = clean(item.asset_library_id);
+    if (libraryId) return `asset-library:${libraryId}`;
+    return "";
+  }
+  const sourceUid = clean(item.video_uid || item.source_uid);
+  return sourceUid ? `video-source:${sourceUid}` : "";
+}
+
+function hmbPromptSourceAuthority(item, kind) {
+  if (!item || typeof item !== "object") return "unknown";
+  if (hmbPromptSourceDirtyKey(item, kind)) return "managed";
+  if (kind === "image" && (item.asset_managed || item.asset_verified)) return "managed";
+  if (kind === "video" && item.picker_managed) return "managed";
+  return "manual";
+}
+
+function hmbPromptDirtyTextEntries(container) {
+  const dirty = container && container.__hmbPromptLibraryDirtyText;
+  return dirty instanceof Map ? [...dirty.values()] : [];
+}
+
+function hmbClearPromptDirtyText(container) {
+  if (!container) return;
+  try { delete container.__hmbPromptLibraryDirtyText; } catch (_e) {}
+}
+
+export function hmbRememberPromptDirtyTextControl(container, element, state) {
+  if (!container || !hmbIsEditableTextControl(element)) return false;
+  const textKey = clean(element.getAttribute?.("data-text-key"));
+  let entry = null;
+  if (textKey) {
+    entry = {
+      kind: "text",
+      key: textKey,
+      value: String(element.value ?? ""),
+    };
+  } else {
+    const row = element.closest?.(".source-row");
+    const sourceKind = clean(row?.getAttribute?.("data-kind"));
+    const index = Number(row?.getAttribute?.("data-index"));
+    const rows = sourceKind === "image"
+      ? state?.images
+      : sourceKind === "video"
+        ? state?.videos
+        : null;
+    const source = Array.isArray(rows) && Number.isInteger(index) ? rows[index] : null;
+    const field = clean(element.getAttribute?.("data-field"));
+    const arrayField = clean(element.getAttribute?.("data-custom-array"));
+    if (source && (field || arrayField)) {
+      const sourceAuthority = hmbPromptSourceAuthority(source, sourceKind);
+      const manualIndex = sourceAuthority === "manual"
+        ? rows.slice(0, index + 1).filter((item) => (
+            hmbPromptSourceAuthority(item, sourceKind) === "manual"
+          )).length - 1
+        : -1;
+      entry = {
+        kind: "source",
+        sourceKind,
+        sourceKey: hmbPromptSourceDirtyKey(source, sourceKind),
+        sourceAuthority,
+        manualIndex,
+        index,
+        slot: Math.max(1, Number(source.slot) || index + 1),
+        field,
+        arrayField,
+        arrayIndex: Math.max(0, Number(element.getAttribute?.("data-custom-index")) || 0),
+        replicateArray: sourceKind === "image" && arrayField === "binding_custom_scopes",
+        value: String(element.value ?? ""),
+      };
+    }
+  }
+  if (!entry) return false;
+  const dirty = container.__hmbPromptLibraryDirtyText instanceof Map
+    ? container.__hmbPromptLibraryDirtyText
+    : new Map();
+  const identity = entry.kind === "text"
+    ? `text:${entry.key}`
+    : [
+        "source",
+        entry.sourceKind,
+        entry.sourceKey || `slot:${entry.slot}:index:${entry.index}`,
+        entry.field,
+        entry.arrayField,
+        entry.arrayIndex,
+      ].join(":");
+  dirty.set(identity, entry);
+  container.__hmbPromptLibraryDirtyText = dirty;
+  return true;
+}
+
+function hmbFindPromptDirtySource(state, entry) {
+  const rows = entry?.sourceKind === "image" ? state?.images : state?.videos;
+  if (!Array.isArray(rows)) return null;
+  const authority = clean(entry.sourceAuthority)
+    || (entry.sourceKey ? "managed" : "manual");
+  if (authority === "managed") {
+    if (!entry.sourceKey) return null;
+    const active = rows.find((item) => (
+      hmbPromptSourceDirtyKey(item, entry.sourceKind) === entry.sourceKey
+    ));
+    if (active) return active;
+    const dormant = entry.sourceKind === "image"
+      ? state?.image_asset?.dormant_asset_rows
+      : state?.picker?.dormant_video_rows;
+    return (Array.isArray(dormant) ? dormant : []).find((item) => (
+      hmbPromptSourceDirtyKey(item, entry.sourceKind) === entry.sourceKey
+    )) || null;
+  }
+  if (authority !== "manual") return null;
+  const slot = Math.max(1, Number(entry.slot) || Number(entry.index) + 1);
+  const sameAuthority = (item) => (
+    hmbPromptSourceAuthority(item, entry.sourceKind) === "manual"
+  );
+  const activeBySlot = rows.find((item) => (
+    Number(item?.slot) === slot && sameAuthority(item)
+  ));
+  if (activeBySlot) return activeBySlot;
+  const activeByIndex = rows[Math.max(0, Number(entry.index) || 0)];
+  if (sameAuthority(activeByIndex)) return activeByIndex;
+  const dormant = entry.sourceKind === "image"
+    ? state?.image_asset?.dormant_manual_rows
+    : state?.picker?.dormant_manual_rows;
+  if (!Array.isArray(dormant)) return null;
+  const manualIndex = Math.max(0, Number(entry.manualIndex) || 0);
+  const dormantBySlot = entry.sourceKind === "image"
+    ? dormant.find((item) => Number(item?.slot) === slot && sameAuthority(item))
+    : null;
+  if (dormantBySlot) return dormantBySlot;
+  const dormantByIndex = dormant[manualIndex];
+  return sameAuthority(dormantByIndex) ? dormantByIndex : null;
+}
+
+export function hmbMergePromptDirtyTextState(authoritativeValue, dirtyEntries) {
+  const next = normalizeState(authoritativeValue);
+  const entries = dirtyEntries instanceof Map
+    ? [...dirtyEntries.values()]
+    : Array.isArray(dirtyEntries)
+      ? dirtyEntries
+      : [];
+  entries.forEach((entry) => {
+    if (!entry || typeof entry !== "object") return;
+    const value = String(entry.value ?? "");
+    if (entry.kind === "text") {
+      const key = clean(entry.key);
+      if (key && next.text && Object.prototype.hasOwnProperty.call(next.text, key)) {
+        next.text[key] = value;
+      }
+      return;
+    }
+    if (entry.kind !== "source") return;
+    const source = hmbFindPromptDirtySource(next, entry);
+    if (!source) return;
+    const arrayField = clean(entry.arrayField);
+    if (arrayField) {
+      if (!Array.isArray(source[arrayField])) return;
+      if (entry.replicateArray) {
+        source[arrayField] = source[arrayField].map(() => value);
+      } else {
+        const index = Math.max(0, Number(entry.arrayIndex) || 0);
+        if (index < source[arrayField].length) source[arrayField][index] = value;
+      }
+      return;
+    }
+    const field = clean(entry.field);
+    if (!field || !Object.prototype.hasOwnProperty.call(source, field)) return;
+    source[field] = value;
+    if (field === "label" && entry.sourceKind === "video") {
+      source.picker_auto_label = "";
+    }
+  });
+  return normalizeState(next);
 }
 
 function hmbCaptureTextEditingState(container) {
@@ -1939,12 +2157,7 @@ export function hmbPromptBlurStaysInsideEditable(container, event) {
 
 export function hmbFinalizePromptTextBlur(container, event, finalize) {
   if (hmbPromptBlurStaysInsideEditable(container, event)) return false;
-  try {
-    if (container && container.__hmbPromptLibraryCommitTimer) {
-      clearTimeout(container.__hmbPromptLibraryCommitTimer);
-      container.__hmbPromptLibraryCommitTimer = null;
-    }
-  } catch (_e) {}
+  hmbClearImmediateStateCommit(container);
   hmbClearTextEditingState(container);
   if (typeof finalize === "function") finalize();
   return true;
@@ -2521,6 +2734,24 @@ function hmbSyncFrameRangeRowDom(row, item, state) {
 const HMB_PROMPT_LOCAL_ECHO_TTL_MS = 750;
 const HMB_PROMPT_LOCAL_ECHO_MAX_CONSUMES = 3;
 const HMB_PROMPT_LOCAL_ECHO_QUEUE_LIMIT = 12;
+const HMB_PROMPT_TRANSPORT_RETRY_MS = 32;
+let hmbPromptPublicationSequence = 0;
+
+export function hmbInvalidatePromptPublication(container) {
+  hmbClearPromptTransportRetry(container);
+  const publicationToken = ++hmbPromptPublicationSequence;
+  if (container) container.__hmbPromptLibraryPublicationOwner = publicationToken;
+  return publicationToken;
+}
+
+function hmbClearPromptTransportRetry(container) {
+  if (!container) return false;
+  const timer = container.__hmbPromptLibraryTransportRetryTimer;
+  const hadTimer = timer !== null && timer !== undefined;
+  try { if (hadTimer) clearTimeout(timer); } catch (_error) {}
+  try { container.__hmbPromptLibraryTransportRetryTimer = null; } catch (_error) {}
+  return hadTimer;
+}
 
 function hmbClearPendingPromptStateEchoes(container) {
   if (!container) return;
@@ -2541,12 +2772,20 @@ function hmbPendingPromptEchoIsLive(item, now) {
   return !Number.isFinite(expiresAt) || expiresAt > now;
 }
 
-function hmbEmitLocalPromptState(container, props, state) {
-  const value = JSON.stringify(normalizeState(state));
+function hmbPromptDirtySnapshot(container) {
+  const dirty = container && container.__hmbPromptLibraryDirtyText;
+  return dirty instanceof Map
+    ? new Map([...dirty.entries()].map(([key, entry]) => [key, { ...entry }]))
+    : new Map();
+}
+
+function hmbRegisterPendingPromptStateEcho(container, value, disabled, publicationToken) {
+  if (!container) return;
   const now = Date.now();
   const pending = {
     value,
-    disabled: Boolean(state && state.disabled),
+    disabled: Boolean(disabled),
+    publicationToken,
     expiresAt: now + HMB_PROMPT_LOCAL_ECHO_TTL_MS,
     remainingEchoes: HMB_PROMPT_LOCAL_ECHO_MAX_CONSUMES,
   };
@@ -2569,19 +2808,144 @@ function hmbEmitLocalPromptState(container, props, state) {
       hmbClearPendingPromptStateEchoes(container);
     }, HMB_PROMPT_LOCAL_ECHO_TTL_MS);
   } catch (_error) {}
-  if (props && typeof props.onChange === "function") props.onChange(value);
+}
+
+function hmbRemovePendingPromptStateEcho(container, publicationToken) {
+  if (!container) return;
+  const queue = (Array.isArray(container.__hmbPromptPendingLocalValues)
+    ? container.__hmbPromptPendingLocalValues
+    : []).filter((item) => item?.publicationToken !== publicationToken);
+  try {
+    if (container.__hmbPromptPendingLocalTimer) {
+      clearTimeout(container.__hmbPromptPendingLocalTimer);
+    }
+  } catch (_error) {}
+  if (!queue.length) {
+    hmbClearPendingPromptStateEchoes(container);
+    return;
+  }
+  container.__hmbPromptPendingLocalValues = queue;
+  container.__hmbPromptPendingLocalTimer = setTimeout(() => {
+    hmbClearPendingPromptStateEchoes(container);
+  }, HMB_PROMPT_LOCAL_ECHO_TTL_MS);
+}
+
+function hmbRestorePromptDirtySnapshot(container, dirtySnapshot) {
+  if (!container) return;
+  const restored = dirtySnapshot instanceof Map ? new Map(dirtySnapshot) : new Map();
+  const current = container.__hmbPromptLibraryDirtyText;
+  if (current instanceof Map) {
+    current.forEach((entry, key) => restored.set(key, entry));
+  }
+  if (restored.size) container.__hmbPromptLibraryDirtyText = restored;
+  container.__hmbPromptLibraryCommitPending = true;
+}
+
+function hmbReportPromptPublicationFailure(container, error, publicationToken) {
+  const message = String(error?.message || error || "Prompt state publication failed");
+  if (container) {
+    container.__hmbPromptLibraryLastPublishError = {
+      message,
+      publicationToken,
+      at: Date.now(),
+    };
+  }
+  try { console?.error?.("[HMBPromptLibrary] state publication failed", error); } catch (_e) {}
+}
+
+function hmbPublishPromptStateValue(
+  container,
+  props,
+  value,
+  registerEcho = false,
+  retryBudget = 1,
+) {
+  hmbClearPromptTransportRetry(container);
+  const publicationToken = ++hmbPromptPublicationSequence;
+  const dirtySnapshot = hmbPromptDirtySnapshot(container);
+  if (container) container.__hmbPromptLibraryPublicationOwner = publicationToken;
+  hmbClearPromptDirtyText(container);
+  if (registerEcho) {
+    hmbRegisterPendingPromptStateEcho(
+      container,
+      value,
+      Boolean(props?.disabled),
+      publicationToken,
+    );
+  }
+  const fail = (error) => {
+    // Even a superseded failure owns its exact echo entry. Removing that token
+    // cannot disturb a newer publication and prevents a failed stale payload
+    // from being mistaken for a later authoritative host echo.
+    if (registerEcho) hmbRemovePendingPromptStateEcho(container, publicationToken);
+    if (!container || container.__hmbPromptLibraryPublicationOwner !== publicationToken) {
+      return false;
+    }
+    hmbRestorePromptDirtySnapshot(container, dirtySnapshot);
+    hmbReportPromptPublicationFailure(container, error, publicationToken);
+    if (retryBudget > 0 && typeof setTimeout === "function") {
+      const timer = setTimeout(() => {
+        if (container.__hmbPromptLibraryTransportRetryTimer !== timer) return;
+        container.__hmbPromptLibraryTransportRetryTimer = null;
+        if (container.__hmbPromptLibraryPublicationOwner !== publicationToken) return;
+        // This exact retry now owns the pending dirty snapshot. Clear the
+        // failure marker before publishing; another failure restores it.
+        container.__hmbPromptLibraryCommitPending = false;
+        hmbPublishPromptStateValue(
+          container,
+          props,
+          value,
+          registerEcho,
+          retryBudget - 1,
+        );
+      }, HMB_PROMPT_TRANSPORT_RETRY_MS);
+      container.__hmbPromptLibraryTransportRetryTimer = timer;
+    }
+    return false;
+  };
+  const succeed = () => {
+    if (container?.__hmbPromptLibraryPublicationOwner === publicationToken) {
+      delete container.__hmbPromptLibraryLastPublishError;
+    }
+    return true;
+  };
+  if (!props || typeof props.onChange !== "function") return succeed();
+  try {
+    const result = props.onChange(value);
+    if (result && typeof result.then === "function") {
+      Promise.resolve(result).then(succeed, fail);
+    } else {
+      succeed();
+    }
+  } catch (error) {
+    fail(error);
+  }
+  return publicationToken;
+}
+
+export function hmbEmitLocalPromptState(container, props, state) {
+  return hmbPublishPromptStateValue(
+    container,
+    props,
+    JSON.stringify(normalizeState(state)),
+    true,
+  );
 }
 
 // Structural source edits must repaint from their own local state. Griptape
 // does not guarantee an immediate props echo when PromptLibrary is used by
-// itself, so waiting for a Picker/Asset update makes added rows appear to be
-// queued. Register the canonical local echo first, persist it, then remount;
-// a later matching host echo is consumed without rebuilding the dashboard.
+// itself, so waiting for a Picker/Asset update makes added rows appear queued.
+// Paint first, then register/persist the canonical local echo. A synchronous
+// host echo is still consumed, while the user sees the structural result before
+// any retained-mode transaction can delay the feedback.
 export function hmbCommitLocalPromptStructure(container, props, state, remount) {
+  hmbClearImmediateStateCommit(container);
   hmbCaptureUiBeforeStateEmit(container, state);
-  hmbEmitLocalPromptState(container, props, state);
-  if (typeof remount === "function") remount();
+  let committedState = state;
+  if (typeof remount === "function") committedState = remount() || state;
   else hmbRestoreSourceScroll(container);
+  hmbEmitLocalPromptState(container, props, committedState);
+  return committedState;
 }
 
 export function hmbConsumePendingPromptStateEcho(container, nextProps) {
@@ -3317,7 +3681,7 @@ function render(state) {
   return `<style>
     .hmb-dashboard-clip{width:100%;height:100%;min-width:0;min-height:0;max-width:none;max-height:none;overflow:hidden;background:#050812;box-sizing:border-box;display:flex;flex-direction:column;flex:1 1 auto}
     .hmb-dashboard{--bg:#0b0f19;--panel:#0f172a;--muted:#94a3b8;--line:rgba(148,163,184,.18);--pink:#ec4899;--orange:#f97316;--cyan:#06b6d4;--green:#22c55e;--purple:#a855f7;--safe-x:16px;width:100%;height:100%;min-width:0;min-height:0;max-width:none;max-height:none;padding-left:var(--safe-x);padding-right:var(--safe-x);overflow:hidden;display:flex;flex-direction:column;flex:1 1 auto;background:radial-gradient(circle at 15% 0%,rgba(14,165,233,.16),transparent 34%),linear-gradient(180deg,#0b1120,#050812);color:#e2e8f0;font-family:"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif;border:1px solid rgba(148,163,184,.2);border-radius:11px;box-shadow:0 0 34px rgba(14,165,233,.12);box-sizing:border-box;resize:none;container-type:inline-size}
-    .hmb-dashboard *{box-sizing:border-box;min-width:0}.topbar{height:40px;flex:0 0 40px;padding:6px 12px 6px 16px;border-bottom:1px solid rgba(148,163,184,.14);background:linear-gradient(90deg,rgba(30,41,59,.92),rgba(15,23,42,.78))}.title{display:flex;align-items:center;gap:8px;overflow:hidden;color:#f8fafc;font-size:15px;font-weight:850;letter-spacing:.01em;white-space:nowrap;text-overflow:ellipsis}.title>span:last-child{overflow:hidden;text-overflow:ellipsis}.title-mark{flex:0 0 27px;width:27px;height:27px;display:grid;place-items:center;border:1px solid rgba(244,114,182,.5);border-radius:7px;background:linear-gradient(145deg,rgba(190,24,93,.28),rgba(88,28,135,.22));color:#f9a8d4;font-size:9px;font-weight:950;letter-spacing:.04em;box-shadow:inset 0 0 0 1px rgba(255,255,255,.035),0 0 10px rgba(168,85,247,.13)}.topbar{display:flex;align-items:center;justify-content:space-between;gap:10px}.language-select{width:auto;min-width:92px;height:28px;border-radius:7px;border:1px solid rgba(148,163,184,.28);background:#090d16;color:#e2e8f0;padding:3px 7px;font-size:11px;outline:none}.language-select:focus{border-color:rgba(34,211,238,.75)}.layout{display:grid;grid-template-columns:minmax(112px,.12fr) minmax(0,1fr) minmax(112px,.12fr);gap:8px;flex:1 1 auto;min-height:0;height:100%;overflow:hidden;padding:8px}.rail,.center{min-height:0;border:1px solid var(--line);border-radius:10px;background:linear-gradient(180deg,rgba(15,23,42,.74),rgba(2,6,23,.72))}.rail{padding:10px 8px;overflow:auto}.rail h3{margin:0 0 12px;font-size:12px;letter-spacing:.07em;color:#67e8f9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.rail.left h3{color:#fb7185}.rail-section{border-top:1px solid rgba(148,163,184,.13);padding-top:10px;margin-top:10px}.rail-title{font-size:10px;font-weight:800;color:#cbd5e1;margin-bottom:7px}.token,.empty-token{min-height:34px;display:flex;flex-direction:column;gap:3px;border:1px solid rgba(148,163,184,.13);background:rgba(15,23,42,.56);border-radius:7px;margin-bottom:7px;padding:7px;font-size:10px}.token b{font-size:11px}.token span{color:#94a3b8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.token.image{border-color:rgba(236,72,153,.3)}.token.video{border-color:rgba(249,115,22,.3)}.token.picker-connected{border-color:rgba(34,197,94,.5);color:#bbf7d0}.empty-token{color:#64748b}.prompt-out{border-color:rgba(34,197,94,.5);color:#bbf7d0}.center{padding:8px;overflow:hidden;scrollbar-gutter:auto;display:flex;flex-direction:column;gap:7px;align-content:stretch}.group-card{margin:0;border:1px solid var(--line);border-radius:10px;background:rgba(2,6,23,.54);overflow:hidden;display:flex;flex-direction:column;min-height:0;max-height:none;flex:0 0 auto}.group-card h3{margin:0;padding:8px 12px;font-size:12px;letter-spacing:.04em;border-bottom:1px solid rgba(148,163,184,.14);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 0 auto}.group-card h3 b{font-size:10px;color:#94a3b8;font-weight:600}.group-body{flex:1 1 auto;min-height:0;overflow:hidden}.source-scrollbox{overflow:auto;scrollbar-gutter:stable;overscroll-behavior:contain}.source-scrollbox .source-header{position:sticky;top:0;z-index:5;background:linear-gradient(180deg,rgba(8,13,26,.98),rgba(8,13,26,.94));backdrop-filter:blur(2px)}.source-scrollbox .source-row:last-child{border-bottom:1px solid rgba(148,163,184,.1)}.group-resize-bar{flex:0 0 10px;min-height:10px;border-top:1px solid rgba(148,163,184,.16);background:linear-gradient(90deg,transparent,rgba(148,163,184,.18),transparent);cursor:ns-resize;touch-action:none;user-select:none;position:relative}.group-resize-bar::before{content:"";position:absolute;left:50%;top:3px;width:38px;height:3px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.52)}.group-resize-bar:hover::before{background:#67e8f9}.keep-out-resize-shell{display:flex;flex-direction:column;width:100%;min-height:0}.keep-out-field .source-note-input{height:34px;min-height:34px;max-height:34px;resize:none;border-radius:7px 7px 0 0}.keep-out-resize-bar{height:9px;min-height:9px;border:1px solid rgba(148,163,184,.24);border-top:0;border-radius:0 0 7px 7px;background:linear-gradient(90deg,transparent,rgba(148,163,184,.18),transparent);cursor:ns-resize;touch-action:none;user-select:none;position:relative}.keep-out-resize-bar::before{content:"";position:absolute;left:50%;top:3px;width:28px;height:2px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.52)}.keep-out-resize-bar:hover::before{background:#67e8f9}.image-card{border-color:rgba(236,72,153,.58)}.image-card h3{color:#fb7185}.imgtext{border-color:rgba(168,85,247,.55)}.imgtext h3{color:#c084fc}.video-card{border-color:rgba(249,115,22,.7)}.video-card h3{color:#fb923c}.vtext{border-color:rgba(59,130,246,.55)}.vtext h3{color:#60a5fa}.source-header,.source-row{display:grid;gap:8px;align-items:start}.image-header,.source-row.image{grid-template-columns:2.75rem minmax(0,.78fr) minmax(0,.95fr) minmax(0,.82fr) minmax(0,.82fr) minmax(0,.92fr) 3.6rem}.video-header,.source-row.video{grid-template-columns:2.75rem minmax(0,.84fr) minmax(0,.95fr) minmax(0,.95fr) minmax(0,1.36fr) 3rem}.source-header{min-height:22px;padding:5px 10px;color:#b6c5d2;font-size:10px;font-weight:800;border-bottom:1px solid rgba(148,163,184,.11)}.source-header span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-row{padding:6px 10px;border-bottom:1px solid rgba(148,163,184,.1)}.source-row:last-child{border-bottom:none}.source-num{font-weight:800;color:#f8fafc;font-size:11px;line-height:1.3;overflow:hidden;text-overflow:ellipsis}.source-num b{font-size:9px;color:#94a3b8}.source-label,.source-role,.text-field{min-width:0}.source-label input,.source-label textarea,.source-select,.source-target-input,.text-field textarea,.text-field input{width:100%;min-width:0;border-radius:7px;border:1px solid rgba(148,163,184,.24);background:#090d16;color:#e2e8f0;padding:8px;font-size:11px;outline:none}.source-label input,.source-label textarea,.text-field textarea,.text-field input,.custom-inline-input,.custom-fields-panel input{caret-color:#67e8f9}.source-label input::selection,.source-label textarea::selection,.text-field textarea::selection,.text-field input::selection,.custom-inline-input::selection,.custom-fields-panel input::selection{background:rgba(34,211,238,.34);color:#f8fafc}.source-label input:focus,.source-label textarea:focus,.source-select:focus,.source-target-input:focus,.text-field textarea:focus,.text-field input:focus{border-color:#22d3ee;box-shadow:0 0 0 1px rgba(34,211,238,.38),inset 0 0 0 1px rgba(34,211,238,.08);background:#07111b}.source-label small,.source-role small{display:block;margin-top:5px;color:#94a3b8;font-size:9px;line-height:1.25;overflow:hidden;text-overflow:ellipsis}.source-label textarea{resize:none;min-height:34px;line-height:1.35}.source-note-input{height:34px;min-height:34px;max-height:34px;resize:none}.source-status{display:flex;gap:6px;align-items:center;justify-content:flex-end}.source-actions{display:flex;gap:4px;align-items:center;justify-content:flex-end}.source-actions.image-actions{display:grid;grid-template-columns:24px 24px;grid-template-rows:28px 28px;gap:4px;align-items:center;justify-content:flex-end}.image-order-controls{display:grid;width:24px;height:28px;grid-template-rows:1fr 1fr;gap:2px}.source-actions.image-actions .image-order-controls button{width:24px;height:13px;min-height:0;padding:0;border-radius:5px;font-size:8px;line-height:1}.binding-scope-stack,.color-pick-stack{display:flex;flex-direction:column;gap:4px}.binding-scope-entry,.color-binding-entry{display:flex;flex-direction:column;gap:4px}.color-binding-entry{display:block}.binding-scope-cell select,.color-pick-cell select{height:30px;padding:5px 6px}.video-color-pick-wrap{display:grid;grid-template-columns:2rem minmax(0,1fr);gap:4px;align-items:start}.video-color-pick-wrap .image-video-index{height:30px;padding:0 2px;text-align:center;text-align-last:center;font-weight:800}.video-color-pick-wrap .image-video-index:disabled{opacity:.55;cursor:not-allowed}.binding-video-index{padding:0 2px!important;text-align:center;text-align-last:center;font-weight:800}.custom-inline-input,.custom-fields-panel input{width:100%;border-radius:7px;border:1px solid rgba(34,211,238,.28);background:#07111b;color:#dbeafe;padding:7px;font-size:10px;outline:none}.custom-inline-input:focus,.custom-fields-panel input:focus{border-color:#22d3ee}.custom-fields-panel{grid-column:2 / 7;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:6px 8px;border:1px solid rgba(34,211,238,.22);border-radius:8px;background:rgba(8,47,73,.12)}.custom-fields-panel label{display:flex;flex-direction:column;gap:4px}.custom-fields-panel span{font-size:9px;font-weight:800;color:#67e8f9}.video-custom-panel{grid-column:2 / 6}.source-row.image-add-row,.source-row.video-add-row{border-bottom:1px solid rgba(148,163,184,.1);padding-top:6px;padding-bottom:6px}.source-actions button{flex:0 0 24px;width:24px;height:28px;border-radius:7px;border:1px solid rgba(148,163,184,.22);background:#0b1220;color:#94a3b8;cursor:pointer;font-weight:800;line-height:1}.source-actions button:hover{border-color:#67e8f9;color:#67e8f9}.source-actions button.clear-source:hover{border-color:#fb7185;color:#fb7185}.source-actions button:disabled{opacity:.35;cursor:not-allowed}.clear-source{}.add-note{margin:10px;border:1px dashed rgba(148,163,184,.25);border-radius:8px;padding:9px;text-align:center;color:#94a3b8;font-size:11px}.notes{margin:0 10px 10px;color:#cbd5e1;font-size:10px;line-height:1.45}.text-grid{display:grid;grid-template-columns:1fr;align-items:stretch;align-content:stretch;gap:7px;padding:7px;height:100%;min-height:0}.imgtext .text-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.vtext .text-grid{grid-template-columns:1fr}.imgtext .group-body,.vtext .group-body{overflow:hidden;min-height:0}.text-field{display:flex;flex-direction:column;min-width:0;min-height:0}.text-field span{display:block;font-size:10px;color:#cbd5e1;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.text-field textarea{resize:none;display:block;flex:1 1 auto;height:100%;min-height:0;max-height:none}.warning{margin:10px 0 0;padding:8px;border:1px solid rgba(249,115,22,.35);border-radius:8px;color:#fed7aa;background:rgba(124,45,18,.16);font-size:10px;line-height:1.4}
+    .hmb-dashboard *{box-sizing:border-box;min-width:0}.topbar{height:40px;flex:0 0 40px;padding:6px 12px 6px 16px;border-bottom:1px solid rgba(148,163,184,.14);background:linear-gradient(90deg,rgba(30,41,59,.92),rgba(15,23,42,.78))}.title{display:flex;align-items:center;gap:8px;overflow:hidden;color:#f8fafc;font-size:15px;font-weight:850;letter-spacing:.01em;white-space:nowrap;text-overflow:ellipsis}.title>span:last-child{overflow:hidden;text-overflow:ellipsis}.title-mark{flex:0 0 27px;width:27px;height:27px;display:grid;place-items:center;border:1px solid rgba(244,114,182,.5);border-radius:7px;background:linear-gradient(145deg,rgba(190,24,93,.28),rgba(88,28,135,.22));color:#f9a8d4;font-size:9px;font-weight:950;letter-spacing:.04em;box-shadow:inset 0 0 0 1px rgba(255,255,255,.035),0 0 10px rgba(168,85,247,.13)}.topbar{display:flex;align-items:center;justify-content:space-between;gap:10px}.language-select{width:auto;min-width:92px;height:28px;border-radius:7px;border:1px solid rgba(148,163,184,.28);background:#090d16;color:#e2e8f0;padding:3px 7px;font-size:11px;outline:none}.language-select:focus{border-color:rgba(34,211,238,.75)}.layout{display:grid;grid-template-columns:minmax(112px,.12fr) minmax(0,1fr) minmax(112px,.12fr);gap:8px;flex:1 1 auto;min-height:0;height:100%;overflow:hidden;padding:8px}.rail,.center{min-height:0;border:1px solid var(--line);border-radius:10px;background:linear-gradient(180deg,rgba(15,23,42,.74),rgba(2,6,23,.72))}.rail{padding:10px 8px;overflow:auto}.rail h3{margin:0 0 12px;font-size:12px;letter-spacing:.07em;color:#67e8f9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.rail.left h3{color:#fb7185}.rail-section{border-top:1px solid rgba(148,163,184,.13);padding-top:10px;margin-top:10px}.rail-title{font-size:10px;font-weight:800;color:#cbd5e1;margin-bottom:7px}.token,.empty-token{min-height:34px;display:flex;flex-direction:column;gap:3px;border:1px solid rgba(148,163,184,.13);background:rgba(15,23,42,.56);border-radius:7px;margin-bottom:7px;padding:7px;font-size:10px}.token b{font-size:11px}.token span{color:#94a3b8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.token.image{border-color:rgba(236,72,153,.3)}.token.video{border-color:rgba(249,115,22,.3)}.token.picker-connected{border-color:rgba(34,197,94,.5);color:#bbf7d0}.empty-token{color:#64748b}.output-guide{min-height:42px;display:flex;flex-direction:column;gap:4px;margin-bottom:7px;padding:8px;border:1px dashed rgba(34,197,94,.42);border-radius:7px;background:rgba(15,23,42,.34);color:#94a3b8;cursor:default;user-select:text}.output-guide b{font-size:9px;letter-spacing:.08em;color:#86efac}.output-guide span{font-size:9px;line-height:1.35;white-space:normal}.output-guide code{padding:1px 3px;border-radius:3px;background:rgba(34,197,94,.1);color:#bbf7d0;font:800 9px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace}.center{padding:8px;overflow:hidden;scrollbar-gutter:auto;display:flex;flex-direction:column;gap:7px;align-content:stretch}.group-card{margin:0;border:1px solid var(--line);border-radius:10px;background:rgba(2,6,23,.54);overflow:hidden;display:flex;flex-direction:column;min-height:0;max-height:none;flex:0 0 auto}.group-card h3{margin:0;padding:8px 12px;font-size:12px;letter-spacing:.04em;border-bottom:1px solid rgba(148,163,184,.14);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 0 auto}.group-card h3 b{font-size:10px;color:#94a3b8;font-weight:600}.group-body{flex:1 1 auto;min-height:0;overflow:hidden}.source-scrollbox{overflow:auto;scrollbar-gutter:stable;overscroll-behavior:contain}.source-scrollbox .source-header{position:sticky;top:0;z-index:5;background:linear-gradient(180deg,rgba(8,13,26,.98),rgba(8,13,26,.94));backdrop-filter:blur(2px)}.source-scrollbox .source-row:last-child{border-bottom:1px solid rgba(148,163,184,.1)}.group-resize-bar{flex:0 0 10px;min-height:10px;border-top:1px solid rgba(148,163,184,.16);background:linear-gradient(90deg,transparent,rgba(148,163,184,.18),transparent);cursor:ns-resize;touch-action:none;user-select:none;position:relative}.group-resize-bar::before{content:"";position:absolute;left:50%;top:3px;width:38px;height:3px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.52)}.group-resize-bar:hover::before{background:#67e8f9}.keep-out-resize-shell{display:flex;flex-direction:column;width:100%;min-height:0}.keep-out-field .source-note-input{height:34px;min-height:34px;max-height:34px;resize:none;border-radius:7px 7px 0 0}.keep-out-resize-bar{height:9px;min-height:9px;border:1px solid rgba(148,163,184,.24);border-top:0;border-radius:0 0 7px 7px;background:linear-gradient(90deg,transparent,rgba(148,163,184,.18),transparent);cursor:ns-resize;touch-action:none;user-select:none;position:relative}.keep-out-resize-bar::before{content:"";position:absolute;left:50%;top:3px;width:28px;height:2px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.52)}.keep-out-resize-bar:hover::before{background:#67e8f9}.image-card{border-color:rgba(236,72,153,.58)}.image-card h3{color:#fb7185}.imgtext{border-color:rgba(168,85,247,.55)}.imgtext h3{color:#c084fc}.video-card{border-color:rgba(249,115,22,.7)}.video-card h3{color:#fb923c}.vtext{border-color:rgba(59,130,246,.55)}.vtext h3{color:#60a5fa}.source-header,.source-row{display:grid;gap:8px;align-items:start}.image-header,.source-row.image{grid-template-columns:2.75rem minmax(0,.78fr) minmax(0,.95fr) minmax(0,.82fr) minmax(0,.82fr) minmax(0,.92fr) 3.6rem}.video-header,.source-row.video{grid-template-columns:2.75rem minmax(0,.84fr) minmax(0,.95fr) minmax(0,.95fr) minmax(0,1.36fr) 3rem}.source-header{min-height:22px;padding:5px 10px;color:#b6c5d2;font-size:10px;font-weight:800;border-bottom:1px solid rgba(148,163,184,.11)}.source-header span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-row{padding:6px 10px;border-bottom:1px solid rgba(148,163,184,.1)}.source-row:last-child{border-bottom:none}.source-num{font-weight:800;color:#f8fafc;font-size:11px;line-height:1.3;overflow:hidden;text-overflow:ellipsis}.source-num b{font-size:9px;color:#94a3b8}.source-label,.source-role,.text-field{min-width:0}.source-label input,.source-label textarea,.source-select,.source-target-input,.text-field textarea,.text-field input{width:100%;min-width:0;border-radius:7px;border:1px solid rgba(148,163,184,.24);background:#090d16;color:#e2e8f0;padding:8px;font-size:11px;outline:none}.source-label input,.source-label textarea,.text-field textarea,.text-field input,.custom-inline-input,.custom-fields-panel input{caret-color:#67e8f9}.source-label input::selection,.source-label textarea::selection,.text-field textarea::selection,.text-field input::selection,.custom-inline-input::selection,.custom-fields-panel input::selection{background:rgba(34,211,238,.34);color:#f8fafc}.source-label input:focus,.source-label textarea:focus,.source-select:focus,.source-target-input:focus,.text-field textarea:focus,.text-field input:focus{border-color:#22d3ee;box-shadow:0 0 0 1px rgba(34,211,238,.38),inset 0 0 0 1px rgba(34,211,238,.08);background:#07111b}.source-label small,.source-role small{display:block;margin-top:5px;color:#94a3b8;font-size:9px;line-height:1.25;overflow:hidden;text-overflow:ellipsis}.source-label textarea{resize:none;min-height:34px;line-height:1.35}.source-note-input{height:34px;min-height:34px;max-height:34px;resize:none}.source-status{display:flex;gap:6px;align-items:center;justify-content:flex-end}.source-actions{display:flex;gap:4px;align-items:center;justify-content:flex-end}.source-actions.image-actions{display:grid;grid-template-columns:24px 24px;grid-template-rows:28px 28px;gap:4px;align-items:center;justify-content:flex-end}.image-order-controls{display:grid;width:24px;height:28px;grid-template-rows:1fr 1fr;gap:2px}.source-actions.image-actions .image-order-controls button{width:24px;height:13px;min-height:0;padding:0;border-radius:5px;font-size:8px;line-height:1}.binding-scope-stack,.color-pick-stack{display:flex;flex-direction:column;gap:4px}.binding-scope-entry,.color-binding-entry{display:flex;flex-direction:column;gap:4px}.color-binding-entry{display:block}.binding-scope-cell select,.color-pick-cell select{height:30px;padding:5px 6px}.video-color-pick-wrap{display:grid;grid-template-columns:2rem minmax(0,1fr);gap:4px;align-items:start}.video-color-pick-wrap .image-video-index{height:30px;padding:0 2px;text-align:center;text-align-last:center;font-weight:800}.video-color-pick-wrap .image-video-index:disabled{opacity:.55;cursor:not-allowed}.binding-video-index{padding:0 2px!important;text-align:center;text-align-last:center;font-weight:800}.custom-inline-input,.custom-fields-panel input{width:100%;border-radius:7px;border:1px solid rgba(34,211,238,.28);background:#07111b;color:#dbeafe;padding:7px;font-size:10px;outline:none}.custom-inline-input:focus,.custom-fields-panel input:focus{border-color:#22d3ee}.custom-fields-panel{grid-column:2 / 7;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:6px 8px;border:1px solid rgba(34,211,238,.22);border-radius:8px;background:rgba(8,47,73,.12)}.custom-fields-panel label{display:flex;flex-direction:column;gap:4px}.custom-fields-panel span{font-size:9px;font-weight:800;color:#67e8f9}.video-custom-panel{grid-column:2 / 6}.source-row.image-add-row,.source-row.video-add-row{border-bottom:1px solid rgba(148,163,184,.1);padding-top:6px;padding-bottom:6px}.source-actions button{flex:0 0 24px;width:24px;height:28px;border-radius:7px;border:1px solid rgba(148,163,184,.22);background:#0b1220;color:#94a3b8;cursor:pointer;font-weight:800;line-height:1}.source-actions button:hover{border-color:#67e8f9;color:#67e8f9}.source-actions button.clear-source:hover{border-color:#fb7185;color:#fb7185}.source-actions button:disabled{opacity:.35;cursor:not-allowed}.clear-source{}.add-note{margin:10px;border:1px dashed rgba(148,163,184,.25);border-radius:8px;padding:9px;text-align:center;color:#94a3b8;font-size:11px}.notes{margin:0 10px 10px;color:#cbd5e1;font-size:10px;line-height:1.45}.text-grid{display:grid;grid-template-columns:1fr;align-items:stretch;align-content:stretch;gap:7px;padding:7px;height:100%;min-height:0}.imgtext .text-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.vtext .text-grid{grid-template-columns:1fr}.imgtext .group-body,.vtext .group-body{overflow:hidden;min-height:0}.text-field{display:flex;flex-direction:column;min-width:0;min-height:0}.text-field span{display:block;font-size:10px;color:#cbd5e1;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.text-field textarea{resize:none;display:block;flex:1 1 auto;height:100%;min-height:0;max-height:none}.warning{margin:10px 0 0;padding:8px;border:1px solid rgba(249,115,22,.35);border-radius:8px;color:#fed7aa;background:rgba(124,45,18,.16);font-size:10px;line-height:1.4}
     .video-color-pick-wrap{display:block}.color-binding-entry{display:grid;grid-template-columns:2rem minmax(0,1fr);gap:4px;align-items:start}
     .topbar-controls .language-button{min-width:58px;height:28px;padding:0 11px;border:1px solid rgba(148,163,184,.24);border-radius:8px;background:#090d16;color:#e2e8f0;font-size:11px;font-weight:800;cursor:pointer}.topbar-controls .language-button:hover,.topbar-controls .language-button:focus-visible{border-color:#22d3ee;color:#67e8f9;outline:none;box-shadow:0 0 0 1px rgba(34,211,238,.28)}
     .source-row{transition:opacity 120ms ease,box-shadow 120ms ease,background-color 120ms ease}
@@ -3393,7 +3757,7 @@ function render(state) {
     .hmb-dashboard[data-theme] .imgtext{border-color:var(--hmb-line-strong)}.hmb-dashboard[data-theme] .imgtext h3{color:var(--hmb-group-context)}
     .hmb-dashboard[data-theme] .video-card{border-color:var(--hmb-line-strong)}.hmb-dashboard[data-theme] .video-card h3{color:var(--hmb-group-video)}
     .hmb-dashboard[data-theme] .vtext{border-color:var(--hmb-line-strong)}.hmb-dashboard[data-theme] .vtext h3{color:var(--hmb-group-vfx)}
-    .hmb-dashboard[data-theme] .token.image,.hmb-dashboard[data-theme] .token.video,.hmb-dashboard[data-theme] .token.picker-connected,.hmb-dashboard[data-theme] .prompt-out{border-color:var(--hmb-line);color:var(--hmb-text)}
+    .hmb-dashboard[data-theme] .token.image,.hmb-dashboard[data-theme] .token.video,.hmb-dashboard[data-theme] .token.picker-connected{border-color:var(--hmb-line);color:var(--hmb-text)}.hmb-dashboard[data-theme] .output-guide{border-color:var(--hmb-line);color:var(--hmb-muted)}.hmb-dashboard[data-theme] .output-guide b,.hmb-dashboard[data-theme] .output-guide code{color:var(--hmb-text)}
     .hmb-dashboard[data-theme] .source-actions button:hover{border-color:var(--hmb-focus);color:var(--hmb-text);box-shadow:0 0 12px var(--hmb-glow)}
     .hmb-dashboard[data-theme] .source-actions button.clear-source:hover{border-color:var(--hmb-selection);color:var(--hmb-text)}
     .hmb-dashboard[data-theme] .warning{color:#fcd34d;background:rgba(120,53,15,.1);border-color:rgba(251,191,36,.22)}
@@ -3414,7 +3778,7 @@ function render(state) {
         <section class="group-card video-card" data-group-id="videoSources" ${hVideoSources}><h3>${escapeHtml(uiText(state, "video_source_binding", "VIDEO SOURCE BINDING"))} <b>${state.status.active_videos} / ${state.status.max_videos}</b></h3><div class="group-body source-scrollbox" data-scroll-id="videoSources"><div class="source-header video-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "keep_out", "KEEP OUT"))}</span><span></span></div>${videos.map((item, idx) => renderVideoRow(item, idx, images, state)).join("")}${renderVideoAddRow(videos, state)}</div><div class="group-resize-bar nodrag" data-resize-group="videoSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card vtext" data-group-id="videoText" ${hVideoText}><h3>${escapeHtml(uiText(state, "video_vfx", "VIDEO VFX"))}</h3><div class="group-body"><div class="text-grid">${groupDFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="videoText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
       </main>
-      <aside class="rail right"><h3>${escapeHtml(uiText(state, "output", "OUTPUT"))}</h3><div class="rail-title">${escapeHtml(uiText(state, "only_real_output", "ONLY REAL OUTPUT"))}${uiLanguage(state) === "en" ? "<br/>from this node" : ""}</div><div class="token prompt-out"><b>PROMPT_OUT</b><span>${escapeHtml(uiText(state, "connect_agent", "Connect to HMBAgentLibrary prompt input"))}</span></div><div class="rail-section"><div class="rail-title">${escapeHtml(uiText(state, "not_included", "NOT INCLUDED"))}</div><div class="empty-token">${escapeHtml(uiText(state, "no_image_output", "No IMAGE output ports"))}</div><div class="empty-token">${escapeHtml(uiText(state, "no_video_output", "No VIDEO output ports"))}</div></div></aside>
+      <aside class="rail right"><h3>${escapeHtml(uiText(state, "output", "OUTPUT"))}</h3><div class="rail-title">${escapeHtml(uiText(state, "only_real_output", "ONLY REAL OUTPUT"))}${uiLanguage(state) === "en" ? "<br/>from this node" : ""}</div><div class="output-guide" role="note" aria-label="PROMPT_OUT connection guide"><b>${escapeHtml(uiText(state, "connection_guide", "CONNECTION GUIDE"))}</b><span><code>PROMPT_OUT</code> · ${escapeHtml(uiText(state, "connect_agent", "Connect to HMBAgentLibrary prompt input"))}</span></div><div class="rail-section"><div class="rail-title">${escapeHtml(uiText(state, "not_included", "NOT INCLUDED"))}</div><div class="empty-token">${escapeHtml(uiText(state, "no_image_output", "No IMAGE output ports"))}</div><div class="empty-token">${escapeHtml(uiText(state, "no_video_output", "No VIDEO output ports"))}</div></div></aside>
     </div>
   </div></div>`;
 }
@@ -3432,6 +3796,30 @@ function hmbFindSafeReactFlowNode(container) {
     current = current.parentElement;
   }
   return null;
+}
+
+export function hmbRequestPromptHostResize(container, shell = null) {
+  if (!container) return false;
+  const wasPending = Boolean(container.__hmbPromptHostResizeTimer);
+  if (container.__hmbPromptHostResizeTimer) {
+    clearTimeout(container.__hmbPromptHostResizeTimer);
+  }
+  container.__hmbPromptHostResizeTimer = setTimeout(() => {
+    container.__hmbPromptHostResizeTimer = null;
+    try {
+      // Force layout before notifying ReactFlow/host listeners. ResizeObserver
+      // remains the primary geometry signal; the standard window resize event
+      // safely invalidates hosts that cache node bounds outside that observer.
+      // A short trailing delay keeps pointer-resize and structural edits from
+      // broadcasting one global resize event per animation frame.
+      const target = shell || hmbFindSafeReactFlowNode(container);
+      if (target) void target.offsetHeight;
+      if (typeof window !== "undefined" && typeof window.dispatchEvent === "function" && typeof Event === "function") {
+        window.dispatchEvent(new Event("resize"));
+      }
+    } catch (_e) {}
+  }, 80);
+  return !wasPending;
 }
 
 function hmbPromptNodeIsSelected(root) {
@@ -3483,6 +3871,7 @@ function hmbApplyInitialNodeSizeOnce(container) {
     shell.style.overflow = "visible";
     shell.style.boxSizing = "border-box";
     if (shell.dataset) shell.dataset.hmbPromptLibraryInitialSizeApplied = "1";
+    if (needsWidth || needsHeight) hmbRequestPromptHostResize(container, shell);
   } catch (_e) {}
 }
 
@@ -3736,6 +4125,7 @@ function hmbApplyOuterNodeHeight(container, height) {
   const shell = hmbFindSafeReactFlowNode(container);
   if (!shell || !shell.style) return null;
   const nextHeight = Math.max(HMB_MIN_NODE_HEIGHT, Math.min(6000, Math.round(Number(height) || HMB_DEFAULT_NODE_HEIGHT)));
+  const previousHeight = hmbNodeShellHeight(shell);
   try {
     shell.style.height = `${nextHeight}px`;
     shell.style.minHeight = `${HMB_MIN_NODE_HEIGHT}px`;
@@ -3743,6 +4133,9 @@ function hmbApplyOuterNodeHeight(container, height) {
     shell.style.overflow = "visible";
     shell.style.boxSizing = "border-box";
   } catch (_e) {}
+  if (!previousHeight || Math.abs(nextHeight - previousHeight) > 1) {
+    hmbRequestPromptHostResize(container, shell);
+  }
   return { shell, height: nextHeight };
 }
 
@@ -3971,7 +4364,7 @@ function hmbInstallGroupResizers(container, state, props, listeners) {
         hmbApplyOuterNodeHeight(container, lastNodeHeight);
 
         hmbCaptureUiBeforeStateEmit(container, state);
-        emit(props, state);
+        emit(props, state, container);
 
         const raf = typeof requestAnimationFrame === "function" ? requestAnimationFrame : (fn) => setTimeout(fn, 0);
         raf(() => {
@@ -4132,7 +4525,7 @@ function hmbInstallKeepOutResizers(container, state, props, listeners) {
         hmbApplyOuterNodeHeight(container, lastNodeHeight);
 
         hmbCaptureUiBeforeStateEmit(container, state);
-        emit(props, state);
+        emit(props, state, container);
 
         const raf = typeof requestAnimationFrame === "function" ? requestAnimationFrame : (fn) => setTimeout(fn, 0);
         raf(() => {
@@ -4232,6 +4625,18 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
   const remount = () => {
     hmbClearActivePromptResize(container);
     try { container.__hmbFrameRangeDragCleanup?.(); } catch (_e) {}
+    const preserveActiveText = Boolean(
+      container.__hmbPromptLibraryCommitPending
+      || container.__hmbPromptLibraryCompositionActive
+    );
+    const activeText = typeof document !== "undefined" ? document.activeElement : null;
+    if (preserveActiveText && activeText && container.contains?.(activeText)) {
+      hmbRememberPromptDirtyTextControl(container, activeText, state);
+    }
+    // Replacing a composing control prevents the browser from delivering its
+    // compositionend event. Explicitly end the old DOM session so the trailing
+    // commit cannot remain permanently deferred after a remount.
+    hmbReleasePromptCompositionLatch(container);
     hmbCaptureTextEditingState(container);
     hmbCapturePromptControlFocus(container);
     hmbCaptureUiBeforeStateEmit(container, state);
@@ -4262,6 +4667,21 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
     };
     container.addEventListener("focusin", clearPendingTextTargetOnFocusIn);
     listeners.push([container, "focusin", clearPendingTextTargetOnFocusIn]);
+    const compositionStart = (event) => {
+      if (!hmbIsEditableTextControl(event && event.target)) return;
+      container.__hmbPromptLibraryCompositionActive = true;
+      hmbRememberPromptDirtyTextControl(container, event.target, state);
+    };
+    const compositionEnd = (event) => {
+      if (!hmbIsEditableTextControl(event && event.target)) return;
+      hmbRememberPromptDirtyTextControl(container, event.target, state);
+      hmbReleasePromptCompositionLatch(container);
+      hmbScheduleImmediateStateCommit(container, props, state);
+    };
+    container.addEventListener("compositionstart", compositionStart);
+    container.addEventListener("compositionend", compositionEnd);
+    listeners.push([container, "compositionstart", compositionStart]);
+    listeners.push([container, "compositionend", compositionEnd]);
     const applySharedUiTheme = (value) => {
       const root = container.querySelector(".hmb-dashboard");
       if (!root) return;
@@ -4314,6 +4734,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
             if (kind === "video") hmbRefreshImageColorControls(container, state);
             if (kind === "image") refreshImageTargetControls(container, state);
           }
+          hmbRememberPromptDirtyTextControl(container, input, state);
           hmbScheduleImmediateStateCommit(container, props, state);
         }
       };
@@ -4326,10 +4747,11 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
             target[index].present = Boolean(input.value.trim());
             if (kind === "video") hmbRefreshImageColorControls(container, state);
           }
+          hmbRememberPromptDirtyTextControl(container, input, state);
           if (event && event.type === "blur") {
             hmbFinalizePromptTextBlur(container, event, () => {
               hmbCaptureUiBeforeStateEmit(container, state);
-              emit(props, state);
+              emit(props, state, container);
               hmbRestoreSourceScroll(container);
             });
           } else {
@@ -4370,11 +4792,12 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
         } else {
           target[index][input.getAttribute("data-field")] = input.value;
         }
+        hmbRememberPromptDirtyTextControl(container, input, state);
         hmbScheduleImmediateStateCommit(container, props, state);
         if (emitAfter) {
           hmbFinalizePromptTextBlur(container, event, () => {
             hmbCaptureUiBeforeStateEmit(container, state);
-            emit(props, state);
+            emit(props, state, container);
             hmbRestoreSourceScroll(container);
           });
         }
@@ -4727,7 +5150,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
         hmbPublishSharedUiTheme(theme);
         applySharedUiTheme(theme);
         hmbCaptureUiBeforeStateEmit(container, state);
-        emit(props, state);
+        emit(props, state, container);
       };
       button.addEventListener("click", handler);
       listeners.push([button, "click", handler]);
@@ -4740,10 +5163,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
         event.stopPropagation();
         state.ui = state.ui && typeof state.ui === "object" ? state.ui : defaultUi();
         state.ui.language = uiLanguage(state) === "ko" ? "en" : "ko";
-        hmbCaptureUiBeforeStateEmit(container, state);
-        emit(props, state);
-        remount();
-        hmbRestoreSourceScroll(container);
+        hmbCommitLocalPromptStructure(container, props, state, remount);
       };
       languageButton.addEventListener("click", handler);
       listeners.push([languageButton, "click", handler]);
@@ -4763,12 +5183,17 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
 
     container.querySelectorAll("[data-text-key]").forEach((field) => {
       const key = field.getAttribute("data-text-key");
-      const inputHandler = () => { state.text[key] = field.value; hmbScheduleImmediateStateCommit(container, props, state); };
+      const inputHandler = () => {
+        state.text[key] = field.value;
+        hmbRememberPromptDirtyTextControl(container, field, state);
+        hmbScheduleImmediateStateCommit(container, props, state);
+      };
       const blurHandler = (event) => {
         state.text[key] = field.value;
+        hmbRememberPromptDirtyTextControl(container, field, state);
         hmbFinalizePromptTextBlur(container, event, () => {
           hmbCaptureUiBeforeStateEmit(container, state);
-          emit(props, state);
+          emit(props, state, container);
           hmbRestoreSourceScroll(container);
         });
       };
@@ -4777,6 +5202,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
       listeners.push([field, "input", inputHandler]);
       listeners.push([field, "blur", blurHandler]);
     });
+    return state;
   };
   remount();
   const applyProps = (nextProps = {}) => {
@@ -4786,7 +5212,29 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
       container.querySelector?.(".hmb-dashboard")?.classList?.toggle("disabled", state.disabled);
       return;
     }
-    const nextState = hmbMergeStoredGroupHeights(container, parseValue(nextProps?.value));
+    hmbInvalidatePromptPublication(container);
+    const hadUncommittedText = Boolean(
+      container.__hmbPromptLibraryCommitPending
+      || container.__hmbPromptLibraryCompositionActive
+      || container.__hmbPromptLibraryDirtyText instanceof Map
+    );
+    if (hadUncommittedText) {
+      const activeText = typeof document !== "undefined" ? document.activeElement : null;
+      if (activeText && container.contains?.(activeText)) {
+        hmbRememberPromptDirtyTextControl(container, activeText, state);
+      }
+    }
+    const dirtyText = hmbPromptDirtyTextEntries(container);
+    if (hadUncommittedText) {
+      hmbClearImmediateStateCommit(container);
+      // The old composing DOM may be replaced below, so explicitly finish that
+      // session and arm a fresh trailing commit against the merged state.
+      hmbReleasePromptCompositionLatch(container);
+    }
+    let nextState = hmbMergeStoredGroupHeights(container, parseValue(nextProps?.value));
+    if (dirtyText.length) {
+      nextState = hmbMergePromptDirtyTextState(nextState, dirtyText);
+    }
     nextState.disabled = Boolean(nextProps?.disabled);
     nextState.ui = nextState.ui && typeof nextState.ui === "object" ? nextState.ui : defaultUi();
     nextState.ui.theme = hmbReadSharedUiTheme(nextState.ui.theme);
@@ -4794,17 +5242,34 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
     const nextValue = JSON.stringify(normalizeState(nextState));
     const disabledChanged = Boolean(state.disabled) !== Boolean(nextState.disabled);
     props = nextProps || {};
-    if (currentValue === nextValue && !disabledChanged) return;
+    if (currentValue === nextValue && !disabledChanged) {
+      if (dirtyText.length) hmbScheduleImmediateStateCommit(container, props, state);
+      return;
+    }
     state = nextState;
     remount();
+    if (dirtyText.length) hmbScheduleImmediateStateCommit(container, props, state);
   };
   container.__hmbPromptLibraryApplyProps = applyProps;
   const cleanup = () => {
+    hmbInvalidatePromptPublication(container);
     try { hmbClearActivePromptResize(container); } catch (_e) {}
     try { hmbCaptureTextEditingState(container); } catch (_e) {}
-    try { if (container.__hmbPromptLibraryCommitTimer) clearTimeout(container.__hmbPromptLibraryCommitTimer); } catch (_e) {}
+    try { hmbFlushImmediateStateCommit(container, props, state); } catch (_e) {}
+    // A flush can create a new asynchronous publication owner.  Invalidate it
+    // before clearing DOM/dirty state so a late rejection cannot restore a
+    // disposed editor or re-arm its commit timer.
+    hmbInvalidatePromptPublication(container);
     try { hmbClearPendingPromptStateEchoes(container); } catch (_e) {}
+    try { hmbClearPromptDirtyText(container); } catch (_e) {}
     try { container.__hmbPromptLibraryPointerTextTarget = null; } catch (_e) {}
+    try { hmbReleasePromptCompositionLatch(container); } catch (_e) {}
+    try {
+      if (container.__hmbPromptHostResizeTimer) {
+        clearTimeout(container.__hmbPromptHostResizeTimer);
+      }
+      container.__hmbPromptHostResizeTimer = null;
+    } catch (_e) {}
     try { container.__hmbFrameRangeDragCleanup?.(); } catch (_e) {}
     try { stopFluidSync && stopFluidSync(); } catch (_e) {}
     for (const [el, event, handler, options] of listeners.splice(0)) {

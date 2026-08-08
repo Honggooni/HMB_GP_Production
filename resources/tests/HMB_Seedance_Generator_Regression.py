@@ -36,7 +36,7 @@ from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE_PATH = ROOT / "HMBSeedance20VideoGeneration.py"
+MODULE_PATH = ROOT / "HMBSeedanceGeneration.py"
 IMAGE_ASSET_MODULE_PATH = ROOT / "HMBImageAssetLibrary.py"
 VIDEO_PICKER_MODULE_PATH = ROOT / "HMBVideoPickerLibrary.py"
 
@@ -270,9 +270,18 @@ def assert_constructor_and_public_contract() -> None:
         "urlopen",
         side_effect=AssertionError("constructor performed a network request"),
     ):
-        node = target.HMBSeedance20VideoGeneration(name="Constructor Regression")
+        node = target.HMBSeedanceGeneration(name="Constructor Regression")
 
-    assert target.HMBSeedance20VideoGeneration.__mro__[1].__name__ == "SuccessFailureNode"
+    assert target.HMBSeedanceGeneration.__mro__[1].__name__ == "SuccessFailureNode"
+    assert target.HMBSeedance20VideoGeneration.__mro__[1] is target.HMBSeedanceGeneration
+    assert target.HMBSeedance20VideoGeneration.__name__ == (
+        "HMBSeedance20VideoGeneration"
+    )
+    assert not {
+        name
+        for name, value in target.HMBSeedance20VideoGeneration.__dict__.items()
+        if callable(value) and name not in {"__module__"}
+    }, "The saved-workflow compatibility wrapper must not override behavior."
     names = [parameter.name for parameter in node.parameters]
     for required in (
         "exec_in",
@@ -538,6 +547,10 @@ def assert_constructor_and_public_contract() -> None:
     )
 
     source = MODULE_PATH.read_text(encoding="utf-8")
+    assert "CGTeamwork" not in source
+    assert '"/api/device/start"' in source
+    assert '"/api/device/token"' in source
+    assert 'headers["Idempotency-Key"]' in source
     assert "_BaseSeedance20" not in source
     assert "GriptapeProxyNode" not in source
     assert "ProxyAuthProviderParameter" not in source
@@ -1329,6 +1342,34 @@ def assert_broker_generation_contract() -> None:
     assert "oversized reference-media request" in oversized_message
     assert "secret-canary" not in oversized_message
 
+    class ExpiredOpener:
+        @staticmethod
+        def open(_request, *, timeout: float):
+            assert timeout > 0
+            raise target.urllib.error.HTTPError(
+                "http://broker.invalid/api/v1/jobs/expired-job/refresh",
+                410,
+                "Gone",
+                {},
+                io.BytesIO(
+                    b'{"status":"expired","job_id":"expired-job"}'
+                ),
+            )
+
+    expired_bridge = target._HMBAIBrokerBridge(opener=ExpiredOpener())
+    with mock.patch.object(target, "_broker_load_token", return_value="saved-token"):
+        expired_result = expired_bridge._request_json(
+            "POST",
+            "/api/v1/jobs/expired-job/refresh",
+            payload=None,
+            timeout=30,
+        )
+    assert expired_result == {
+        "status": "expired",
+        "job_id": "expired-job",
+        "_http_status": 410,
+    }
+
     fast_payload = {
         "provider": "volcengine_ark",
         "model": target.SEEDANCE_2_0_FAST_MODEL_ID,
@@ -1344,6 +1385,7 @@ def assert_broker_generation_contract() -> None:
         "content_filter": True,
         "return_last_frame": False,
         "execution_expires_after": 172800,
+        "client_request_id": "hmb-schema-request-1",
     }
     with mock.patch.object(
         bridge_contract,
@@ -1367,10 +1409,15 @@ def assert_broker_generation_contract() -> None:
         "content_filter",
         "return_last_frame",
         "execution_expires_after",
+        "client_request_id",
     }
     assert "input_mode" in submitted
     assert "return_last_frame" in submitted
     assert "execution_expires_after" in submitted
+    assert submitted["client_request_id"] == "hmb-schema-request-1"
+    assert request_json.call_args.kwargs["idempotency_key"] == (
+        "hmb-schema-request-1"
+    )
 
     framed_fast_payload = dict(fast_payload)
     framed_fast_payload.update(
@@ -1493,6 +1540,7 @@ def assert_broker_generation_contract() -> None:
     assert payload["aspect_ratio"] == "adaptive"
     assert payload["web_search"] is False
     assert payload["content_filter"] is True
+    assert target._TASK_ID_PATTERN.fullmatch(payload["client_request_id"])
     portrait = BrokerScriptedNode(FakeBrokerBridge([]))
     portrait_params = portrait._get_parameters()
     portrait_params.update({"prompt": "portrait", "ratio": "9:16"})
@@ -1578,6 +1626,41 @@ def assert_broker_generation_contract() -> None:
     assert refresh_bridge.refresh_ids == ["broker-refresh-3"]
     assert refreshed.downloads == ["https://cdn.example/refreshed-broker.mp4"]
 
+    class SameKeyRetryBridge(FakeBrokerBridge):
+        def refresh_job(self, job_id: str, *, timeout: float = 60) -> dict:
+            assert timeout > 0
+            self.refresh_ids.append(job_id)
+            raise target._BrokerError("not registered", status_code=404)
+
+        def generate_seedance(self, payload: dict, *, timeout: float) -> dict:
+            assert timeout > 0
+            self.generate_payloads.append(dict(payload))
+            return {
+                "status": "pending",
+                "job_id": payload["client_request_id"],
+            }
+
+    stable_request_id = "hmb-stable-request-123"
+    retry_bridge = SameKeyRetryBridge([])
+    retry_node = BrokerScriptedNode(retry_bridge)
+    retry_payload = {
+        "provider": "volcengine_ark",
+        "model": target.SEEDANCE_2_0_MODEL_ID,
+        "prompt": "same idempotent request",
+        "client_request_id": stable_request_id,
+    }
+    retry_node._last_broker_payload = dict(retry_payload)
+    retry_node.parameter_output_values["generation_id"] = stable_request_id
+    retry_node.parameter_output_values["generation_status"] = "submission_unknown"
+    asyncio.run(retry_node._refresh_async())
+    assert retry_bridge.refresh_ids == [stable_request_id]
+    assert retry_bridge.generate_payloads == [retry_payload]
+    assert retry_node.parameter_output_values["generation_id"] == stable_request_id
+    assert retry_node.parameter_output_values["generation_status"] == "queued"
+    assert "never starts a duplicate render" in retry_node.parameter_output_values[
+        "result_details"
+    ]
+
 
 def assert_refresh_during_submission_contract() -> None:
     bridge = FakeBrokerBridge([])
@@ -1620,30 +1703,82 @@ def assert_refresh_during_submission_contract() -> None:
 def assert_broker_account_and_button_contract() -> None:
     assert target.AI_BROKER_SERVER_URL == "http://192.168.203.245:8080"
     assert target._broker_validated_server_url() == target.AI_BROKER_SERVER_URL
-    assert target.AI_BROKER_CGTW_SERVERS == frozenset(
-        {
-            "192.168.200.18:8383",
-            "cgteamwork.funnyflux.kr:443",
-        }
+
+    class DeviceResponse(io.BytesIO):
+        def __init__(self, status: int, payload: dict) -> None:
+            super().__init__(json.dumps(payload).encode("utf-8"))
+            self.status = status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+            return False
+
+    class DeviceOpener:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, dict]] = []
+            self.responses = [
+                DeviceResponse(
+                    201,
+                    {
+                        "device_code": "device-code-1",
+                        "device_secret": "device-secret-abcdefghijklmnopqrstuvwxyz",
+                        "verification_url": (
+                            target.AI_BROKER_SERVER_URL + "/?device=device-code-1"
+                        ),
+                    },
+                ),
+                DeviceResponse(202, {"status": "pending"}),
+                DeviceResponse(200, {"access_token": "permanent-device-token"}),
+            ]
+
+        def open(self, request, *, timeout: float):
+            assert timeout > 0
+            body = json.loads(request.data or b"{}")
+            self.requests.append((request.full_url, body))
+            return self.responses.pop(0)
+
+    device_opener = DeviceOpener()
+    with mock.patch.object(target.webbrowser, "open", return_value=True) as browser_open, mock.patch.object(
+        target, "_broker_save_token"
+    ) as save_token, mock.patch.object(target.time, "sleep") as poll_sleep:
+        login_result = target._broker_device_login(opener=device_opener)
+    assert login_result == {"status": "connected"}
+    assert [url for url, _body in device_opener.requests] == [
+        target.AI_BROKER_SERVER_URL + "/api/device/start",
+        target.AI_BROKER_SERVER_URL + "/api/device/token",
+        target.AI_BROKER_SERVER_URL + "/api/device/token",
+    ]
+    assert device_opener.requests[0][1] == {}
+    assert device_opener.requests[1][1] == device_opener.requests[2][1]
+    assert device_opener.requests[1][1]["device_code"] == "device-code-1"
+    browser_open.assert_called_once_with(
+        target.AI_BROKER_SERVER_URL + "/?device=device-code-1",
+        new=2,
+        autoraise=True,
     )
-    for raw, expected in (
-        ("192.168.200.18:8383", "192.168.200.18:8383"),
-        ("http://192.168.200.18:8383/", "192.168.200.18:8383"),
-        ("cgteamwork.funnyflux.kr:443", "cgteamwork.funnyflux.kr:443"),
-        ("HTTPS://CGTEAMWORK.FUNNYFLUX.KR/", "cgteamwork.funnyflux.kr:443"),
-    ):
-        assert target._broker_normalize_cgtw_server(raw) == expected
-        assert expected in target.AI_BROKER_CGTW_SERVERS
-    for rejected in (
-        "",
-        "ftp://cgteamwork.funnyflux.kr:443",
-        "https://user@cgteamwork.funnyflux.kr/",
-        "https://cgteamwork.funnyflux.kr/path",
-        "cgteamwork.funnyflux.kr:443.evil.example",
-    ):
-        assert target._broker_normalize_cgtw_server(rejected) not in (
-            target.AI_BROKER_CGTW_SERVERS
-        )
+    poll_sleep.assert_called_once_with(target.AI_BROKER_DEVICE_POLL_SECONDS)
+    save_token.assert_called_once_with("permanent-device-token")
+
+    declined_opener = DeviceOpener()
+    with mock.patch.object(
+        target.webbrowser, "open", return_value=False
+    ), mock.patch.object(target, "_broker_save_token") as declined_save, mock.patch.object(
+        target.time, "sleep"
+    ) as declined_sleep:
+        try:
+            target._broker_device_login(opener=declined_opener)
+        except target._BrokerUnavailableError as exc:
+            assert "authorization page" in str(exc)
+        else:
+            raise AssertionError("Browser-open refusal entered the polling loop")
+    assert [url for url, _body in declined_opener.requests] == [
+        target.AI_BROKER_SERVER_URL + "/api/device/start"
+    ]
+    declined_save.assert_not_called()
+    declined_sleep.assert_not_called()
 
     secrets = {
         "token": "account-token-canary",
@@ -1658,8 +1793,12 @@ def assert_broker_account_and_button_contract() -> None:
     }
     with mock.patch.object(
         bridge, "_request_json", return_value=safe_me
-    ) as request_json:
-        snapshot = bridge.account_snapshot(connect=False)
+    ) as request_json, mock.patch.object(
+        target,
+        "_broker_device_login",
+        side_effect=AssertionError("saved token fast path opened device login"),
+    ):
+        snapshot = bridge.account_snapshot(connect=True)
     assert request_json.call_count == 1
     assert snapshot == target._BrokerAccountSnapshot(
         state="connected",
@@ -1673,11 +1812,29 @@ def assert_broker_account_and_button_contract() -> None:
     with mock.patch.object(
         bridge,
         "_request_json",
+        side_effect=[
+            target._BrokerAuthenticationError("login required"),
+            {"display_name": "Direct Signup Artist"},
+        ],
+    ), mock.patch.object(
+        target, "_broker_device_login", return_value={"status": "connected"}
+    ) as device_login:
+        direct_snapshot = bridge.account_snapshot(connect=True)
+    assert direct_snapshot == target._BrokerAccountSnapshot(
+        state="connected",
+        connected=True,
+        account="Direct Signup Artist",
+    )
+    device_login.assert_called_once_with()
+
+    with mock.patch.object(
+        bridge,
+        "_request_json",
         side_effect=target._BrokerUnavailableError("safe unavailable"),
     ), mock.patch.object(
         target,
-        "_broker_auto_login",
-        side_effect=AssertionError("server outage triggered a login exchange"),
+        "_broker_device_login",
+        side_effect=AssertionError("server outage opened device authorization"),
     ):
         try:
             bridge.account_snapshot(connect=True)
@@ -2575,4 +2732,4 @@ assert_ambiguous_submission_status_contract()
 assert_http_transport_contract()
 assert_private_monthly_usage_ledger_contract()
 
-print("HMB Seedance 2.0 FN AI Broker regression: PASS")
+print("HMB Seedance FN AI Broker regression: PASS")

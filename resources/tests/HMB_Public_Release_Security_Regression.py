@@ -65,25 +65,51 @@ common_spec.loader.exec_module(common)
 manifest = json.loads(
     (ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8")
 )
-assert manifest["metadata"]["library_version"] == "0.5.26"
+assert manifest["metadata"]["library_version"] == "0.5.27"
 registered_secrets = manifest["settings"][0]["contents"]["secrets_to_register"]
 assert set(registered_secrets) == EXPECTED_SECRET_NAMES
 assert all(value == "" for value in registered_secrets.values())
+manifest_description = manifest["settings"][0]["description"]
+assert "one-time browser authorization" in manifest_description
+assert "CGTeamwork" not in manifest_description
+seedance_entries = [
+    item
+    for item in manifest["nodes"]
+    if item["metadata"]["display_name"] == "HMB Seedance Generation"
+]
+assert len(seedance_entries) == 1
+seedance_entry = seedance_entries[0]
+assert seedance_entry["class_name"] == "HMBSeedance20VideoGeneration"
+assert seedance_entry["file_path"] == "HMBSeedanceGeneration.py"
+assert not (ROOT / "HMBSeedance20VideoGeneration.py").exists()
 
 # The two full Seedance transport regressions require a live Griptape host. Keep
 # their critical output-macro boundary enforced in source-only CI as well:
 # normal generation and Refresh must both use the shared preflight, and only the
 # engine-assigned {_index} variable may be deferred until the write stage.
-seedance_source = (ROOT / "HMBSeedance20VideoGeneration.py").read_text(
+seedance_source = (ROOT / "HMBSeedanceGeneration.py").read_text(
     encoding="utf-8"
 )
-seedance_tree = ast.parse(seedance_source, filename="HMBSeedance20VideoGeneration.py")
+seedance_tree = ast.parse(seedance_source, filename="HMBSeedanceGeneration.py")
 seedance_class = next(
+    node
+    for node in seedance_tree.body
+    if isinstance(node, ast.ClassDef)
+    and node.name == "HMBSeedanceGeneration"
+)
+legacy_seedance_class = next(
     node
     for node in seedance_tree.body
     if isinstance(node, ast.ClassDef)
     and node.name == "HMBSeedance20VideoGeneration"
 )
+assert len(legacy_seedance_class.bases) == 1
+assert isinstance(legacy_seedance_class.bases[0], ast.Name)
+assert legacy_seedance_class.bases[0].id == "HMBSeedanceGeneration"
+assert not any(
+    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    for node in legacy_seedance_class.body
+), "The saved-workflow compatibility wrapper must not override behavior."
 seedance_methods = {
     node.name: node
     for node in seedance_class.body
@@ -113,6 +139,75 @@ for execution_method_name in ("_refresh_async", "_process_generation_impl"):
         and node.func.attr == "resolve"
         for node in ast.walk(execution_method)
     )
+
+# Keep the API SERVER durable-job contract enforced on public CI without
+# importing the host-only griptape_nodes runtime.
+assert "CGTeamwork" not in seedance_source
+module_functions = {
+    node.name: node
+    for node in seedance_tree.body
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+}
+device_login_source = (
+    ast.get_source_segment(seedance_source, module_functions["_broker_device_login"])
+    or ""
+)
+for endpoint in ('"/api/device/start"', '"/api/device/token"'):
+    assert endpoint in device_login_source
+assert "_broker_same_origin(verification_url, server_url)" in device_login_source
+assert "_broker_save_token(access_token)" in device_login_source
+
+broker_class = next(
+    node
+    for node in seedance_tree.body
+    if isinstance(node, ast.ClassDef) and node.name == "_HMBAIBrokerBridge"
+)
+broker_methods = {
+    node.name: node
+    for node in broker_class.body
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+}
+request_source = ast.get_source_segment(
+    seedance_source, broker_methods["_request_json"]
+) or ""
+assert 'headers["Idempotency-Key"] = idempotency_key' in request_source
+assert "exc.code == 410 and not submission" in request_source
+assert "BROKER_EXPIRED_STATUSES" in request_source
+account_source = ast.get_source_segment(
+    seedance_source, broker_methods["account_snapshot"]
+) or ""
+assert '"GET", "/api/me"' in account_source
+generate_source = ast.get_source_segment(
+    seedance_source, broker_methods["generate_seedance"]
+) or ""
+assert '"/api/v1/generate/video"' in generate_source
+assert "idempotency_key=client_request_id" in generate_source
+refresh_job_source = ast.get_source_segment(
+    seedance_source, broker_methods["refresh_job"]
+) or ""
+assert '"/api/v1/jobs/"' in refresh_job_source
+
+process_source = ast.get_source_segment(
+    seedance_source, seedance_methods["_process_generation_impl"]
+) or ""
+assert "_ensure_broker_connected" in process_source
+assert "_get_api_key" not in process_source
+assert 'payload["client_request_id"] = client_request_id' in process_source
+refresh_source = ast.get_source_segment(
+    seedance_source, seedance_methods["_refresh_async"]
+) or ""
+for recovery_marker in (
+    "retry_same_request",
+    'retry_payload.get("client_request_id") == generation_id',
+    "bridge.generate_seedance",
+):
+    assert recovery_marker in refresh_source
+download_source = ast.get_source_segment(
+    seedance_source, seedance_methods["_download_broker_video"]
+) or ""
+assert "bridge.is_trusted_broker_url(url)" in download_source
+assert "bridge.download_trusted_result" in download_source
+assert "return await self._download_video(url)" in download_source
 
 source_policy_path = ROOT / Path(POLICY_RELATIVE)
 source_policy = source_policy_path.read_bytes()
@@ -161,7 +256,7 @@ if all(output_presence):
         "signing_key_id": POLICY_SIGNING_KEY_ID,
         "validated": True,
     }
-    assert release_manifest["release_version"] == "0.5.26"
+    assert release_manifest["release_version"] == "0.5.27"
     assert release_manifest["policy_version"] == POLICY_VERSION
     assert release_manifest["contract_sha256"] == POLICY_CONTRACT_SHA256
     source_files = {

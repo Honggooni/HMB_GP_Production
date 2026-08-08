@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.5.27 - 2026-08-08
+
+- Renamed the public node file to `HMBSeedanceGeneration.py` and the Griptape
+  palette label to `HMB Seedance Generation` so future Broker render options are
+  not tied to one model version. The legacy serialized node type remains as an
+  override-free compatibility wrapper, preserving existing saved workflows.
+- Made Image Asset, Video Picker, and Prompt selections paint locally before
+  their authoritative host round trip, while preserving the existing state
+  schemas, parameter names, saved-workflow format, and Agent connection flow.
+- Removed large-grid listener/remount hot paths, cached immutable widget CSS
+  and manifest parses with bounded lifetimes, and coalesced repeated Prompt
+  output/resize work to eliminate click stalls and visible flicker.
+- Published the Image pair, `PICKER_OUT`, and `PROMPT_OUT` explicitly so every
+  connected Prompt/Agent consumer receives one coherent current snapshot;
+  generation settings and render behavior remain unchanged.
+- Added concurrency and no-loss regressions for stale host echoes, IME editing,
+  video source switching, command submission guards, output propagation, and
+  the complete four-library composition contract.
+- Replaced the Seedance node's CGTeamwork token exchange with the Broker's
+  one-time browser authorization and Windows DPAPI-protected permanent token.
+- Added one stable client request ID and matching idempotency header per render,
+  allowing lost responses to recover the same server task without duplicate
+  submission or billing.
+- Aligned Refresh and terminal-expiry handling with the durable Broker job API;
+  Refresh checks only the existing job and never creates a replacement render.
+- Added server-contract regressions for device authorization, idempotent retry,
+  provisional job aliases, and expired retained results.
+
 ## 0.5.26 - 2026-08-08
 
 - Changed only the new Full Seedance 2.0 node default from 4K to the existing

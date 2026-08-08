@@ -102,8 +102,12 @@ for (const [name, source] of [
   );
 }
 
+assert.match(
+  videoSource,
+  /stopDelegatedInteraction[\s\S]*?target\?\.closest\?\.\(interactionSelector\)[\s\S]*?if \(!interaction\) return;[\s\S]*?event\.stopPropagation\?\.\(\)/,
+  "VideoPicker delegates control isolation once while keeping panel backgrounds available to the canvas.",
+);
 for (const [name, source] of [
-  ["VideoPicker", videoSource],
   ["PromptLibrary", promptSource],
   ["AgentLibrary", agentSource],
   ["ImageAssetLibrary", assetSource],
@@ -288,17 +292,19 @@ assert.match(
 assert.match(assetSource, /detachReusableImageAssets\(container\)[\s\S]*?restoreReusableImageAssets\(container, reusableImages\)/, "Asset remounts must reuse loaded thumbnail elements.");
 assert.match(assetSource, /IMAGE_ASSET_AUTO_SYNC_MS = 10000/, "Asset must probe the shared manifest every ten seconds.");
 assert.match(assetSource, /__hmb_manifest_poll_nonce/, "Asset auto-sync probes must use a transient backend nonce.");
+assert.match(assetSource, /IMAGE_ASSET_AUTO_SYNC_PENDING_MS = 5000/, "Rapid wake events must share one bounded in-flight Asset manifest probe.");
+assert.match(assetSource, /now >= autoSyncPendingUntil[\s\S]*?autoSyncPendingUntil = now \+ IMAGE_ASSET_AUTO_SYNC_PENDING_MS/, "Asset auto-sync must not stack host round trips while a recent probe is pending.");
 assert.match(assetSource, /clearAutoSyncTimer\(\)[\s\S]*?removeEventListener/, "Asset cleanup must stop its sync timer and global listeners.");
 assert.match(assetSource, /\.asset-scroll\{[^}]*scrollbar-gutter:stable/, "Asset scrollbars must reserve stable layout space.");
 assert.doesNotMatch(assetSource, /data-asset-selected|type="checkbox" data-asset-selected/, "Asset selection must use the card outline, not per-card checkboxes.");
 assert.doesNotMatch(assetSource, /candidate-list|writing-mode/, "Removed color chips and rotated slot text must not return.");
 assert.match(assetSource, /String\(index \+ 1\)\.padStart\(2, "0"\)/, "Selected cards must use horizontal 01/02 numbering.");
 assert.doesNotMatch(assetSource, /IMAGE_IMPORT_IN →[\s\S]*?Video Generation Out → Generator/, "The removed header flow-help text must not return.");
-const selectedCardMarkup = assetSource.match(/function renderSelectedCard\([\s\S]*?\n\}\n\nfunction displayWindowsPath/)?.[0] || "";
+const selectedCardMarkup = assetSource.match(/function renderSelectedCard\([\s\S]*?\n\}\n\nexport function hmbApplyImageAssetSelectionFeedback/)?.[0] || "";
 assert.match(selectedCardMarkup, /class="slot"[\s\S]*?data-move="-1"[\s\S]*?data-move="1"[\s\S]*?data-remove-selected[\s\S]*?selected-thumb/, "Compact selected cards must keep number, left, right, delete, and image controls inside one box.");
 assert.doesNotMatch(selectedCardMarkup, /drag-handle|selected-copy/, "Compact selected cards must not render drag hints or metadata text.");
 assert.match(selectedCardMarkup, /externalImport[\s\S]*?disconnectPending[\s\S]*?remove_external_selection/, "External selected-card X must describe its guarded graph disconnect.");
-assert.match(assetSource, /state\.disconnect_import_uid = asset\.source_uid;[\s\S]*?state = emit\(props, state\);[\s\S]*?return;/, "External selected-card X must submit the source UID without optimistically deselecting the card.");
+assert.match(assetSource, /state\.disconnect_import_uid = asset\.source_uid;[\s\S]*?state = emit\(props, state, container\);[\s\S]*?return;/, "External selected-card X must submit the source UID without optimistically deselecting the card.");
 assert.match(assetSource, /Disconnect this external image from IMAGE_IMPORT_IN\. Multi-image or ambiguous links must be removed at the input port\./, "The external X tooltip must explain the exact safe-disconnect boundary.");
 assert.match(assetSource, /이 외부 이미지를 IMAGE_IMPORT_IN에서 연결 해제합니다\./, "The external X connection explanation must be available in Korean too.");
 assert.match(assetSource, /\.selected-card\{flex-basis:120px;width:120px;height:118px;grid-template-rows:23px minmax\(0,1fr\)\}/, "Selected cards must match the confirmed 120x118 blue-box footprint.");
@@ -349,6 +355,88 @@ assert.deepEqual(
     .map((item) => item.asset_library_id)
     .slice(0, 3),
   ["asset-2", "asset-3", "asset-1"],
+);
+const feedbackClasses = new Set();
+const feedbackAttributes = new Map([["data-asset-key", "asset-feedback"]]);
+const feedbackCard = {
+  classList: {
+    toggle(name, enabled) {
+      if (enabled) feedbackClasses.add(name);
+      else feedbackClasses.delete(name);
+    },
+  },
+  getAttribute(name) { return feedbackAttributes.get(name) || ""; },
+  setAttribute(name, value) { feedbackAttributes.set(name, String(value)); },
+};
+const feedbackTrayCount = { textContent: "" };
+const feedbackTray = { innerHTML: "", scrollLeft: 17 };
+const feedbackStatusAttributes = new Map();
+const feedbackStatus = {
+  textContent: "",
+  setAttribute(name, value) { feedbackStatusAttributes.set(name, String(value)); },
+};
+const feedbackContainer = {
+  querySelectorAll(selector) { return selector === "[data-asset-key]" ? [feedbackCard] : []; },
+  querySelector(selector) {
+    return new Map([
+      [".tray-head em", feedbackTrayCount],
+      [".tray-scroll", feedbackTray],
+      [".toolbar-status strong", feedbackStatus],
+    ]).get(selector) || null;
+  },
+};
+const feedbackState = assetModule.hmbNormalizeImageAssetState({
+  assets: [{
+    asset_library_id: "asset-feedback",
+    source_uid: "project:asset-feedback",
+    source_kind: "project",
+    registered: true,
+    asset_id: "Feedback",
+    image_name: "Feedback Image",
+    selected: true,
+    selection_order: 1,
+  }],
+});
+assetModule.hmbApplyImageAssetSelectionFeedback(feedbackContainer, feedbackState);
+assert.equal(feedbackClasses.has("selected"), true, "Local feedback must outline the clicked card immediately.");
+assert.equal(feedbackAttributes.get("aria-pressed"), "true");
+assert.equal(feedbackTrayCount.textContent, "1/50");
+assert.match(feedbackTray.innerHTML, /data-selected-key="asset-feedback"/, "Local feedback must populate the selected tray before the host round trip.");
+assert.equal(feedbackTray.scrollLeft, 17, "Local tray feedback must preserve its horizontal position.");
+assert.match(feedbackStatus.textContent, /1\/50 SEL/);
+assert.deepEqual(
+  feedbackState,
+  assetModule.hmbNormalizeImageAssetState(feedbackState),
+  "Local selection feedback must keep the live state canonical so an exact host echo skips remount.",
+);
+const assetInstallEventsSource = assetSource.match(/function installEvents\([\s\S]*?\n\}\n\nexport default function HMBImageAssetLibraryWidget/)?.[0] || "";
+assert.match(assetInstallEventsSource, /const assetsByLibraryId = new Map\(/, "Asset event installation must index cards in one linear pass.");
+assert.doesNotMatch(assetInstallEventsSource, /state\.assets\.find\(/, "Per-card event installation must not rescan the full asset array.");
+const assetToggleSource = assetInstallEventsSource.match(/const toggle = \(\) => \{[\s\S]*?\n    \};/)?.[0] || "";
+assert.ok(
+  assetToggleSource.indexOf("hmbApplyImageAssetSelectionFeedback(container, state)")
+    < assetToggleSource.indexOf("hmbScheduleImageAssetSelectionCommit(container"),
+  "Card/tray feedback must update locally before publishing state to the host.",
+);
+assert.doesNotMatch(
+  assetToggleSource,
+  /remount\(state\)/,
+  "A grid card selection must not rebuild the full 5,000-card dashboard.",
+);
+assert.match(
+  assetInstallEventsSource,
+  /const selectedTray = container\.querySelector\("\.tray-scroll"\)[\s\S]*?on\(selectedTray, "dragstart"[\s\S]*?on\(selectedTray, "drop"[\s\S]*?on\(selectedTray, "click"/,
+  "Delegated tray controls and drag events must survive selection-only tray replacement.",
+);
+assert.match(
+  assetSource,
+  /export function hmbScheduleImageAssetSelectionCommit\([\s\S]*?requestAnimationFrame\(\(\) => \{[\s\S]*?requestAnimationFrame\(run\)/,
+  "Asset selection must paint one local frame before the host publish/remount path.",
+);
+assert.match(
+  assetSource,
+  /&& !container\.__hmbImageAssetSelectionCommitPending/,
+  "Manifest auto-sync must yield while an immediate local selection commit is pending.",
 );
 const unverifiedAssetProbe = assetModule.hmbNormalizeImageAssetState({
   assets: [{
@@ -610,7 +698,6 @@ assert.doesNotMatch(
 );
 
 for (const [name, source] of [
-  ["VideoPicker", videoSource],
   ["PromptLibrary", promptSource],
   ["AgentLibrary", agentSource],
   ["ImageAssetLibrary", assetSource],
@@ -638,7 +725,6 @@ assert.match(videoSource, /window\.removeEventListener\("keydown", stopSelectedN
 assert.match(promptSource, /listeners\.push\(\[window, "keydown", stopSelectedNodeDeleteShortcut, true\]\)/);
 assert.match(assetSource, /on\(window, "keydown", stopSelectedNodeDeleteShortcut, true\)/);
 for (const [name, source] of [
-  ["VideoPicker", videoSource],
   ["PromptLibrary", promptSource],
   ["AgentLibrary", agentSource],
   ["ImageAssetLibrary", assetSource],
@@ -649,6 +735,21 @@ for (const [name, source] of [
     `${name} must reserve whole-node selection and resize activation for the native title bar.`,
   );
 }
+assert.match(
+  videoSource,
+  /export function hmbInstallPickerInteractionIsolation\(container, cleanupList\)/,
+  "VideoPicker must keep one delegated interaction-isolation controller.",
+);
+assert.match(
+  videoSource,
+  /const delegatedEvents = \["pointerdown", "mousedown", "click", "dblclick"\]/,
+  "VideoPicker must delegate pointer isolation instead of installing listeners per row.",
+);
+assert.match(
+  videoSource,
+  /stopDelegatedInteraction[\s\S]*?target\?\.closest\?\.\(interactionSelector\)[\s\S]*?if \(!interaction\) return;[\s\S]*?event\.stopPropagation\?\.\(\)/,
+  "VideoPicker control events stay isolated without consuming panel-background gestures.",
+);
 
 // Each custom widget updates only its own parameter. The visible picker commits
 // HMB_PICKER_STATE; the hidden bridge commits only HMB_PICKER_COMMAND.
@@ -816,13 +917,23 @@ assert.doesNotMatch(
   "Catalog play controls must route only the main preview player.",
 );
 const pickerSearchHandler = videoSource.slice(
-  videoSource.indexOf('on(container.querySelector("#outliner-search")'),
-  videoSource.indexOf('container.querySelectorAll("[data-group-path]")'),
+  videoSource.indexOf('const outlinerSearchInput = container.querySelector("#outliner-search")'),
+  videoSource.indexOf('const outlinerScroll = container.querySelector(".outliner-scroll")'),
 );
-assert.doesNotMatch(
+assert.match(
   pickerSearchHandler,
-  /suppressMatchingEcho:\s*true/,
-  "Outliner search needs the normal morph to rebuild the filtered rows.",
+  /dueAtMs: Date\.now\(\) \+ 180/,
+  "Outliner search publication must remain debounced.",
+);
+assert.match(
+  pickerSearchHandler,
+  /hmbRenderPickerOutlinerLocal\([\s\S]*?container,[\s\S]*?localState,[\s\S]*?tr,[\s\S]*?pickerLocalInteractionLocked\(localState\),[\s\S]*?\)/,
+  "Outliner search must filter its visible rows immediately.",
+);
+assert.match(
+  pickerSearchHandler,
+  /suppressMatchingEcho: true/,
+  "Outliner search may consume only its exact fully-rendered echo.",
 );
 const pickerCameraHandler = videoSource.slice(
   videoSource.indexOf('container.querySelectorAll("[data-camera-path]")'),
@@ -835,7 +946,7 @@ assert.doesNotMatch(
 );
 const pickerClearLogHandler = videoSource.slice(
   videoSource.indexOf('on(container.querySelector("#clear-activity-log")'),
-  videoSource.indexOf('on(container.querySelector("#outliner-search")'),
+  videoSource.indexOf('const outlinerSearchInput = container.querySelector("#outliner-search")'),
 );
 assert.doesNotMatch(
   pickerClearLogHandler,
@@ -843,13 +954,13 @@ assert.doesNotMatch(
   "Clearing the activity log needs the normal morph to clear visible text, message, and button state.",
 );
 const pickerVisibilityHandler = videoSource.slice(
-  videoSource.indexOf('container.querySelectorAll("[data-visibility-path]")'),
-  videoSource.indexOf('container.querySelectorAll("[data-camera-path]")'),
+  videoSource.indexOf('const toggleOutlinerVisibility = (path) =>'),
+  videoSource.indexOf('on(outlinerScroll, "pointerdown"'),
 );
-assert.doesNotMatch(
+assert.match(
   pickerVisibilityHandler,
-  /suppressMatchingEcho:\s*true/,
-  "Visibility changes need the normal morph to refresh the authoritative message and dependent state.",
+  /availability\.operationBusy \|\| container\.__hmbPickerOperationSubmissionPending[\s\S]*?hmbRenderPickerOutlinerLocal[\s\S]*?suppressMatchingEcho: outlinerUpdated/,
+  "Visibility is guarded during active work and publishes only after the local Outliner is complete.",
 );
 assert.doesNotMatch(
   videoSource,
@@ -858,15 +969,15 @@ assert.doesNotMatch(
 );
 assert.equal(
   (promptSource.match(/\bremount\(\);/g) || []).length,
-  4,
-  "PromptLibrary may additionally remount for translated labels and standalone structural source edits.",
+  2,
+  "PromptLibrary must keep only initial and authoritative-props full remounts.",
 );
 assert.match(
   promptSource,
-  /export function hmbCommitLocalPromptStructure[\s\S]*?hmbEmitLocalPromptState\(container, props, state\);[\s\S]*?remount\(\);/,
-  "Prompt structural source edits must repaint immediately without waiting for a Picker props event.",
+  /export function hmbCommitLocalPromptStructure[\s\S]*?committedState = remount\(\) \|\| state[\s\S]*?hmbEmitLocalPromptState\(container, props, committedState\);/,
+  "Prompt structural source edits must repaint before publishing without waiting for a Picker props event.",
 );
-assert.match(promptSource, /if \(currentValue === nextValue && !disabledChanged\) return;[\s\S]*?state = nextState;\s*remount\(\);/);
+assert.match(promptSource, /if \(currentValue === nextValue && !disabledChanged\) \{[\s\S]*?return;[\s\S]*?\}[\s\S]*?state = nextState;\s*remount\(\);/);
 assert.match(promptSource, /hmbCapturePromptControlFocus\(container\)[\s\S]*?hmbRestorePromptControlFocus\(container\)/, "Prompt structural refreshes must preserve non-text control focus.");
 assert.match(promptSource, /container\.__hmbPromptLibraryApplyProps/, "Prompt must reuse one mounted controller across host refreshes.");
 assert.match(promptSource, /data-image-drag-handle draggable=/);
@@ -1051,8 +1162,8 @@ assert.match(videoSource, /output_height: Number\(currentLocal\.output_height \|
 assert.match(videoSource, /function hmbApplyPickerInitialNodeSizeOnce\(container\)/);
 assert.match(
   videoSource,
-  /stopInteriorNodeSelection/,
-  "Picker interior clicks must not select or resize the node; the native title bar owns activation.",
+  /stopDelegatedInteraction/,
+  "Picker delegated interior clicks must not select or resize the node; the native title bar owns activation.",
 );
 assert.match(
   videoSource,
@@ -1085,12 +1196,17 @@ assert.match(
   /imageSourceBinding\?\.classList\?\.remove\("nodrag", "nopan", "nowheel"\);/,
   "IMAGE SOURCE BINDING must release its former full-card gesture isolation.",
 );
+assert.match(
+  promptSource,
+  /\["pointerdown", "mousedown", "click", "dblclick"\]\.forEach\(\(eventName\) => \{/,
+  "Prompt controls must still stop node/canvas pointer gestures.",
+);
+assert.match(
+  videoSource,
+  /delegatedEvents\.forEach\(\(eventName\) => \{/,
+  "Picker controls must keep delegated node/canvas pointer isolation.",
+);
 for (const source of [videoSource, promptSource]) {
-  assert.match(
-    source,
-    /\["pointerdown", "mousedown", "click", "dblclick"\]\.forEach\(\(eventName\) => \{/,
-    "Concrete widget controls must still stop node/canvas pointer gestures.",
-  );
   assert.match(
     source,
     /element\.classList\?\.add\("nodrag", "nopan", "nowheel"\);/,
@@ -1160,7 +1276,7 @@ assert.match(videoSource, /resizeObserver\.observe\(container\)/);
 assert.match(videoSource, /resizeObserver\.observe\(rightStackForResizeSync\)/);
 assert.match(videoSource, /resizeObserver\.observe\(centerStackForResizeSync\)/);
 assert.doesNotMatch(videoSource, /resizeObserver\.observe\(shell/);
-assert.match(videoSource, /hmbCollapseNativeMayaLayoutRows\(container\)/);
+assert.match(videoSource, /hmbCollapseNativeMayaLayoutRows\(container, hosts\)/);
 assert.doesNotMatch(videoSource, /transition-property:height,flex-basis/);
 assert.doesNotMatch(
   videoSource,
@@ -1250,7 +1366,7 @@ assert.ok(
 assert.doesNotMatch(videoSource, /id="apply-color"|class="selected-target"|\.apply-button/);
 assert.match(
   videoSource,
-  /container\.querySelectorAll\("\[data-color\]"\)[\s\S]*?if \(selectedNode\) applyColor\(color\)/,
+  /container\.querySelectorAll\("\[data-color\]"\)[\s\S]*?if \(liveSelectedNode\) applyColor\(color\)/,
   "A palette click must continue to assign its color immediately after removing the redundant Target/APPLY row.",
 );
 assert.doesNotMatch(videoSource, /assignmentHtml\(|id="clear-colors"|No color assignments/);

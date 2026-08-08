@@ -179,6 +179,8 @@ const pickerGuardClip = fakeElement(pickerGuardContainer, "hmbvp-clip");
 const pickerGuardDashboard = fakeElement(pickerGuardClip, "hmbvp");
 const pickerGuardControl = fakeElement(pickerGuardDashboard, "picker-control");
 const pickerBroadPanel = fakeElement(pickerGuardDashboard, "right-stack");
+pickerGuardDashboard.closest = () => null;
+pickerGuardControl.closest = () => pickerGuardControl;
 for (const element of [pickerGuardContainer, pickerGuardClip, pickerGuardDashboard]) {
   element.classList.add("nodrag", "nopan", "nowheel");
 }
@@ -189,8 +191,8 @@ pickerGuardContainer.querySelector = (selector) => {
   return null;
 };
 pickerGuardContainer.querySelectorAll = (selector) => {
-  if (selector === "button") return [pickerGuardControl];
   if (selector === ".right-stack") return [pickerBroadPanel];
+  if (String(selector).includes("button")) return [pickerGuardControl];
   return [];
 };
 const pickerGuardCleanup = [];
@@ -211,18 +213,27 @@ for (const className of ["nodrag", "nopan", "nowheel"]) {
 assert.equal(
   typeof pickerGuardContainer.handler("pointerdown"),
   "function",
-  "Picker interior pointerdown must stay local so only the native title bar selects the node.",
+  "Picker uses one delegated pointerdown handler instead of one handler per control.",
 );
 let pickerRootStops = 0;
 pickerGuardContainer.handler("pointerdown")({
+  type: "pointerdown",
+  target: pickerGuardDashboard,
   stopPropagation() { pickerRootStops += 1; },
 });
-assert.equal(pickerRootStops, 1);
+assert.equal(pickerRootStops, 0, "Picker panel backgrounds keep canvas pan/select gestures responsive.");
 assert.equal(
-  pickerGuardContainer.handler("click"),
-  undefined,
-  "Picker background clicks are not swallowed by the widget root.",
+  typeof pickerGuardContainer.handler("click"),
+  "function",
+  "Picker uses one delegated click handler instead of one handler per control.",
 );
+let pickerBackgroundStops = 0;
+pickerGuardContainer.handler("click")({
+  type: "click",
+  target: { closest() { return null; } },
+  stopPropagation() { pickerBackgroundStops += 1; },
+});
+assert.equal(pickerBackgroundStops, 0, "Picker background clicks still reach the canvas.");
 assert.equal(pickerGuardContainer.handler("wheel"), undefined);
 assert.equal(pickerBroadPanel.classList.contains("nopan"), false);
 assert.equal(pickerBroadPanel.classList.contains("nowheel"), false);
@@ -238,10 +249,14 @@ for (const className of ["nodrag", "nopan", "nowheel"]) {
   );
 }
 let pickerInteriorStops = 0;
-pickerGuardControl.handler("pointerdown")({
+pickerGuardContainer.handler("pointerdown")({
+  type: "pointerdown",
+  target: pickerGuardControl,
   stopPropagation() { pickerInteriorStops += 1; },
 });
-pickerGuardControl.handler("click")({
+pickerGuardContainer.handler("click")({
+  type: "click",
+  target: pickerGuardControl,
   stopPropagation() { pickerInteriorStops += 1; },
 });
 assert.equal(
@@ -249,7 +264,8 @@ assert.equal(
   2,
   "Picker controls remain local while their surrounding panel backgrounds pan the canvas.",
 );
-assert.equal(pickerGuardCleanup.length, 2, "Picker controls and title-bar-only selection guard are registered for cleanup.");
+assert.equal(pickerGuardControl.handler("click"), undefined, "Controls do not own per-element listeners.");
+assert.equal(pickerGuardCleanup.length, 1, "One cleanup owns the delegated interaction and delete guards.");
 
 const startShell = fakeElement(null, "react-flow__node");
 startShell.offsetHeight = 1200;
@@ -736,9 +752,16 @@ assert.equal(stopped, 3, "Mouse-down does not select the whole library node.");
 globalThis.document.activeElement = textInput;
 assert.equal(
   prompt.hmbShouldDeferPromptTextCommit(promptContainer),
-  true,
-  "A focused text bar defers host remounts so continuous typing and IME composition stay intact.",
+  false,
+  "Focus alone must not suppress the trailing Prompt state publish.",
 );
+promptContainer.__hmbPromptLibraryCompositionActive = true;
+assert.equal(
+  prompt.hmbShouldDeferPromptTextCommit(promptContainer),
+  true,
+  "Only an active IME composition defers the trailing Prompt state publish.",
+);
+promptContainer.__hmbPromptLibraryCompositionActive = false;
 const promptDeleteCapture = windowHandlers.get("keydown:true");
 assert.equal(typeof promptDeleteCapture, "function", "Selected Prompt nodes need a capture-phase delete guard.");
 let captureStopped = 0;

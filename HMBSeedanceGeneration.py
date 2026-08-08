@@ -11,14 +11,13 @@ import logging
 import mimetypes
 import os
 import re
-import secrets
 import shutil
 import socket
-import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 from contextlib import contextmanager, suppress
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -68,14 +67,12 @@ CREATE_TASK_PATH = "/contents/generations/tasks"
 AI_BROKER_SERVER_URL = os.environ.get(
     "HMB_AI_BROKER_URL", "http://192.168.203.245:8080"
 ).rstrip("/")
-AI_BROKER_CGTW_SERVERS = frozenset(
-    {
-        "192.168.200.18:8383",
-        "cgteamwork.funnyflux.kr:443",
-    }
-)
 AI_BROKER_MAX_JSON_BYTES = 16 * 1024 * 1024
+AI_BROKER_DEVICE_AUTH_TIMEOUT_SECONDS = 5 * 60
+AI_BROKER_DEVICE_POLL_SECONDS = 2.0
 
+# Stable persistence identifier for existing usage ledgers and saved workflows.
+# The public file, implementation class, and palette label are version-neutral.
 USAGE_GENERATOR_ID = "HMBSeedance20VideoGeneration"
 USAGE_SCHEMA_VERSION = 1
 USAGE_LEDGER_ROOT = Path(
@@ -384,58 +381,6 @@ def _broker_load_token() -> str:
     return token
 
 
-def _broker_normalize_cgtw_server(value: Any) -> str:
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    try:
-        parsed = urlparse(raw if "://" in raw else f"//{raw}")
-        scheme = parsed.scheme.lower()
-        if scheme not in {"", "http", "https"}:
-            return ""
-        if (
-            parsed.username is not None
-            or parsed.password is not None
-            or not parsed.hostname
-            or parsed.path not in {"", "/"}
-            or parsed.params
-            or parsed.query
-            or parsed.fragment
-        ):
-            return ""
-        port = parsed.port
-    except (TypeError, ValueError):
-        return ""
-
-    hostname = parsed.hostname.lower().rstrip(".")
-    if port is None:
-        if scheme == "https":
-            port = 443
-        elif scheme == "http":
-            port = 80
-    return f"{hostname}:{port}" if port is not None else hostname
-
-
-def _broker_cgtw_session() -> tuple[Any, str]:
-    cgtw_base = r"C:\CgTeamWork_v7\bin\base"
-    if cgtw_base not in sys.path:
-        sys.path.insert(0, cgtw_base)
-    try:
-        import cgtw2  # type: ignore[import-not-found]
-    except Exception as exc:
-        raise _BrokerAuthenticationError(
-            "CGTeamwork is unavailable for FN AI Broker login."
-        ) from exc
-    session = cgtw2.tw()
-    token = str(session.login.token() or "")
-    server = _broker_normalize_cgtw_server(session.login.http_server_ip())
-    if not token or server not in AI_BROKER_CGTW_SERVERS:
-        raise _BrokerAuthenticationError(
-            "CGTeamwork login is required for FN AI Broker."
-        )
-    return session, token
-
-
 def _broker_read_json(response: Any, *, max_bytes: int) -> Any:
     raw = response.read(max_bytes + 1)
     if len(raw) > max_bytes:
@@ -446,106 +391,138 @@ def _broker_read_json(response: Any, *, max_bytes: int) -> Any:
         raise _BrokerProtocolError("FN AI Broker returned invalid JSON.") from exc
 
 
-def _broker_auto_login() -> dict[str, Any]:
-    """Exchange CGTeamwork auth and return only non-sensitive account state."""
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import padding
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+def _broker_same_origin(url: str, origin_url: str) -> bool:
+    def _origin(value: str) -> tuple[str, str, int]:
+        parsed = urlparse(value)
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise ValueError("invalid origin")
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+        return parsed.scheme.lower(), (parsed.hostname or "").lower(), port
 
-    _, cgtw_token = _broker_cgtw_session()
-    server_url = _broker_validated_server_url()
-    opener = urllib.request.build_opener(_BrokerNoRedirectHandler())
     try:
-        with opener.open(
-            server_url + "/api/auth/cgtw/public-key", timeout=8
-        ) as response:
-            key_data = _broker_read_json(response, max_bytes=2 * 1024 * 1024)
-    except _BrokerError:
-        raise
-    except Exception as exc:
-        raise _BrokerUnavailableError(
-            "FN AI Broker authentication service is unavailable."
-        ) from exc
-    if not isinstance(key_data, dict) or not isinstance(
-        key_data.get("public_key"), str
-    ):
-        raise _BrokerProtocolError(
-            "FN AI Broker public-key response was invalid."
-        )
-    response_key = os.urandom(32)
-    public_key = serialization.load_pem_public_key(key_data["public_key"].encode())
-    encrypted = public_key.encrypt(
-        json.dumps(
-            {
-                "token": cgtw_token,
-                "issued_at": int(time.time()),
-                "nonce": secrets.token_urlsafe(24),
-                "response_key": base64.b64encode(response_key).decode("ascii"),
-                "retry_rejected": True,
-                "widget_flow_id": "hmb-seedance-2-0",
-            },
-            separators=(",", ":"),
-        ).encode("utf-8"),
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None,
-        ),
+        return _origin(url) == _origin(origin_url)
+    except (TypeError, ValueError):
+        return False
+
+
+def _broker_device_login(*, opener: Any | None = None) -> dict[str, Any]:
+    """Authorize this Windows account once and persist the resulting Broker token."""
+    server_url = _broker_validated_server_url()
+    request_opener = opener or urllib.request.build_opener(
+        _BrokerNoRedirectHandler()
     )
-    request = urllib.request.Request(
-        server_url + "/api/auth/cgtw",
-        json.dumps(
-            {"encrypted_payload": base64.b64encode(encrypted).decode("ascii")}
-        ).encode("utf-8"),
-        {"Content-Type": "application/json", "Accept": "application/json"},
+
+    start_request = urllib.request.Request(
+        server_url + "/api/device/start",
+        data=b"{}",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )
     try:
-        with opener.open(request, timeout=15) as response:
-            wrapped = _broker_read_json(response, max_bytes=2 * 1024 * 1024)
+        with request_opener.open(start_request, timeout=10) as response:
+            start_result = _broker_read_json(
+                response, max_bytes=2 * 1024 * 1024
+            )
     except urllib.error.HTTPError as exc:
-        try:
-            detail = json.loads(exc.read(2 * 1024 * 1024) or b"{}")
-        except Exception:
-            detail = {}
-        status = str(detail.get("request_status") or "").strip().lower()
-        if status in {"pending", "rejected", "blocked"}:
-            return {"status": status}
         raise _BrokerAuthenticationError(
-            "FN AI Broker CGTeamwork authentication failed.",
+            "FN AI Broker device authorization could not be started.",
             status_code=exc.code,
         ) from exc
     except _BrokerError:
         raise
+    except (TimeoutError, urllib.error.URLError, OSError) as exc:
+        raise _BrokerUnavailableError(
+            "FN AI Broker device authorization service is unavailable."
+        ) from exc
+
+    if not isinstance(start_result, dict):
+        raise _BrokerProtocolError(
+            "FN AI Broker device authorization response was invalid."
+        )
+    device_code = str(start_result.get("device_code") or "").strip()
+    device_secret = str(start_result.get("device_secret") or "").strip()
+    verification_url = str(start_result.get("verification_url") or "").strip()
+    if (
+        _TASK_ID_PATTERN.fullmatch(device_code) is None
+        or len(device_secret) < 20
+        or not _broker_same_origin(verification_url, server_url)
+    ):
+        raise _BrokerProtocolError(
+            "FN AI Broker device authorization response was invalid."
+        )
+
+    try:
+        browser_opened = webbrowser.open(verification_url, new=2, autoraise=True)
     except Exception as exc:
         raise _BrokerUnavailableError(
-            "FN AI Broker authentication service is unavailable."
+            "Could not open the FN AI Broker authorization page."
         ) from exc
-    if not isinstance(wrapped, dict):
-        raise _BrokerProtocolError(
-            "FN AI Broker authentication response was invalid."
+    if not browser_opened:
+        raise _BrokerUnavailableError(
+            "Could not open the FN AI Broker authorization page."
         )
-    try:
-        clear = AESGCM(response_key).decrypt(
-            base64.b64decode(wrapped["iv"]),
-            base64.b64decode(wrapped["encrypted_response"]),
-            b"fn-ai-cgtw-v1",
+
+    token_payload = json.dumps(
+        {"device_code": device_code, "device_secret": device_secret},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    deadline = time.monotonic() + AI_BROKER_DEVICE_AUTH_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        token_request = urllib.request.Request(
+            server_url + "/api/device/token",
+            data=token_payload,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
         )
-        result = json.loads(clear)
-    except Exception as exc:
+        try:
+            with request_opener.open(token_request, timeout=10) as response:
+                token_result = _broker_read_json(
+                    response, max_bytes=2 * 1024 * 1024
+                )
+                status_code = int(getattr(response, "status", 200))
+        except urllib.error.HTTPError as exc:
+            if exc.code in {404, 410}:
+                raise _BrokerAuthenticationError(
+                    "FN AI Broker authorization expired. Connect again.",
+                    status_code=exc.code,
+                ) from exc
+            raise _BrokerAuthenticationError(
+                "FN AI Broker device authorization failed.",
+                status_code=exc.code,
+            ) from exc
+        except _BrokerError:
+            raise
+        except (TimeoutError, urllib.error.URLError, OSError) as exc:
+            raise _BrokerUnavailableError(
+                "FN AI Broker authorization polling was interrupted."
+            ) from exc
+
+        if not isinstance(token_result, dict):
+            raise _BrokerProtocolError(
+                "FN AI Broker device token response was invalid."
+            )
+        if status_code == 202 or str(token_result.get("status") or "").lower() == "pending":
+            time.sleep(AI_BROKER_DEVICE_POLL_SECONDS)
+            continue
+        access_token = str(token_result.get("access_token") or "").strip()
+        if status_code == 200 and access_token:
+            _broker_save_token(access_token)
+            return {"status": "connected"}
         raise _BrokerProtocolError(
-            "FN AI Broker authentication response was invalid."
-        ) from exc
-    if not isinstance(result, dict):
-        raise _BrokerProtocolError(
-            "FN AI Broker authentication response was invalid."
+            "FN AI Broker device token response was invalid."
         )
-    _broker_save_token(str(result.get("access_token") or ""))
-    display_name = result.get("display_name")
-    return {
-        "status": "connected",
-        "display_name": display_name if isinstance(display_name, str) else "",
-    }
+
+    raise _BrokerAuthenticationError(
+        "FN AI Broker authorization timed out. Connect again."
+    )
 
 
 class _HMBAIBrokerBridge:
@@ -572,6 +549,7 @@ class _HMBAIBrokerBridge:
             "return_last_frame",
             "execution_expires_after",
             "priority",
+            "client_request_id",
         }
     )
     _COMMON_SEEDANCE_FIELDS = frozenset(
@@ -590,6 +568,7 @@ class _HMBAIBrokerBridge:
             "watermark",
             "web_search",
             "content_filter",
+            "client_request_id",
         }
     )
     _REFERENCE_MODE_FIELDS = frozenset(
@@ -725,6 +704,7 @@ class _HMBAIBrokerBridge:
         payload: dict[str, Any] | None,
         timeout: float,
         submission: bool = False,
+        idempotency_key: str = "",
     ) -> dict[str, Any]:
         if not path.startswith("/") or path.startswith("//"):
             raise _BrokerProtocolError("FN AI Broker request path is invalid.")
@@ -733,6 +713,12 @@ class _HMBAIBrokerBridge:
             "Accept": "application/json",
             "Authorization": "Bearer " + _broker_load_token(),
         }
+        if idempotency_key:
+            if _TASK_ID_PATTERN.fullmatch(idempotency_key) is None:
+                raise _BrokerProtocolError(
+                    "FN AI Broker idempotency key is invalid."
+                )
+            headers["Idempotency-Key"] = idempotency_key
         if payload is not None:
             body = json.dumps(
                 payload, ensure_ascii=False, separators=(",", ":")
@@ -757,6 +743,20 @@ class _HMBAIBrokerBridge:
                 raise _BrokerAuthenticationError(
                     "FN AI Broker login has expired.", status_code=401
                 ) from exc
+            if exc.code == 410 and not submission:
+                try:
+                    expired_result = json.loads(
+                        exc.read(self._MAX_ERROR_CLASSIFICATION_BYTES) or b"{}"
+                    )
+                except (UnicodeError, json.JSONDecodeError):
+                    expired_result = {}
+                if (
+                    isinstance(expired_result, dict)
+                    and str(expired_result.get("status") or "").strip().lower()
+                    in BROKER_EXPIRED_STATUSES
+                ):
+                    expired_result["_http_status"] = 410
+                    return expired_result
             raise _BrokerError(
                 self._safe_http_error_message(exc),
                 status_code=exc.code,
@@ -790,7 +790,7 @@ class _HMBAIBrokerBridge:
         if not logged_in:
             if not connect:
                 return _BrokerAccountSnapshot("login_required", False, "")
-            login_result = _broker_auto_login()
+            login_result = _broker_device_login()
             status = str(login_result.get("status") or "").strip().lower()
             if status in {"pending", "rejected", "blocked"}:
                 return _BrokerAccountSnapshot("approval_" + status, False, "")
@@ -835,12 +835,20 @@ class _HMBAIBrokerBridge:
         request_payload = {
             key: value for key, value in request_payload.items() if key in model_fields
         }
+        client_request_id = str(
+            request_payload.get("client_request_id") or ""
+        ).strip()
+        if client_request_id and _TASK_ID_PATTERN.fullmatch(client_request_id) is None:
+            raise _BrokerProtocolError(
+                "Seedance Broker client request ID is invalid."
+            )
         return self._request_json(
             "POST",
             "/api/v1/generate/video",
             payload=request_payload,
             timeout=timeout,
             submission=True,
+            idempotency_key=client_request_id,
         )
 
     def refresh_job(self, job_id: str, *, timeout: float = 60) -> dict[str, Any]:
@@ -922,8 +930,8 @@ class VolcengineAPIError(RuntimeError):
         self.submission_outcome = submission_outcome
 
 
-class HMBSeedance20VideoGeneration(SuccessFailureNode):
-    """Generate Seedance 2.0 video through the authenticated FN AI Broker.
+class HMBSeedanceGeneration(SuccessFailureNode):
+    """Generate video with a supported Seedance model through FN AI Broker.
 
     This retains the existing HMB node identity, accepts ordered image and video
     lists from the HMB media libraries, and keeps provider credentials on the
@@ -936,8 +944,8 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         super().__init__(**kwargs)
         self.category = "HMB_GP_Production"
         self.description = (
-            "Generate Seedance 2.0 video through the authenticated FN AI Broker "
-            "using server-managed provider credentials."
+            "Generate video with a supported Seedance model through the "
+            "authenticated FN AI Broker using server-managed provider credentials."
         )
         self._temporary_video_uploads: list[
             tuple[GriptapeCloudStorageDriver, Path]
@@ -947,6 +955,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         self._usage_identity: dict[str, str] | None = None
         self._usage_context: dict[str, Any] = {}
         self._broker_bridge_instance: _HMBAIBrokerBridge | None = None
+        self._last_broker_payload: dict[str, Any] | None = None
         self._broker_action_lock = threading.Lock()
         self._broker_action_running = False
         self._generation_refresh_lock = threading.Lock()
@@ -999,7 +1008,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
             ParameterString(
                 name="prompt",
                 default_value="",
-                tooltip="Text prompt for Seedance 2.0.",
+                tooltip="Text prompt for the selected Seedance model.",
                 multiline=True,
                 placeholder_text="Describe the desired video...",
                 allow_output=False,
@@ -1083,7 +1092,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
                 title="Media Upload",
                 message=(
                     "Local video files are temporarily uploaded through the selected "
-                    "service so Volcengine Seedance 2.0 can read them. The temporary "
+                    "service so the selected Seedance model can read them. The temporary "
                     "object is deleted when this node execution ends."
                 ),
                 hide_clear_button=False,
@@ -1323,7 +1332,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         self._output_file = ProjectFileParameter(
             node=self,
             name="output_file",
-            default_filename="volcengine_seedance_2_0_video.mp4",
+            default_filename="volcengine_seedance_video.mp4",
         )
         self._output_file.add_parameter()
         self._create_status_parameters(
@@ -1365,8 +1374,8 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
                 variant="secondary",
                 full_width=True,
                 tooltip=(
-                    "Use safe GET requests to re-check a known task or list "
-                    "candidates after an ambiguous submission."
+                    "Re-check this exact Broker task. Refresh never submits a "
+                    "replacement render or creates a second charge."
                 ),
                 on_click=self._on_refresh_clicked,
             )
@@ -1397,16 +1406,17 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
                 variant="secondary",
                 full_width=True,
                 tooltip=(
-                    "Connect with the active CGTeamwork account or refresh the "
-                    "current FN AI Broker session."
+                    "Use the saved permanent token, or open the one-time Broker "
+                    "authorization page when this Windows account is not connected."
                 ),
                 on_click=self._on_broker_connect_clicked,
             )
             ParameterString(
                 name="broker_notice",
                 default_value=(
-                    "Provider credentials stay on the Broker server and are never "
-                    "stored in this node."
+                    "Sign up once in the Browser. This Windows account stores only "
+                    "a protected permanent access token; provider credentials and "
+                    "usage controls remain on the Broker server."
                 ),
                 tooltip="FN AI Broker credential boundary.",
                 allowed_modes={ParameterMode.PROPERTY},
@@ -2183,7 +2193,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
 
         thread = threading.Thread(
             target=_runner,
-            name="HMBSeedance20-usage-sync",
+            name="HMBSeedance-usage-sync",
             daemon=True,
         )
         thread.start()
@@ -2417,20 +2427,20 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         if isinstance(value, dict):
             for key in ("value", "url", "path", "location"):
                 if key in value and value[key] is not None:
-                    return HMBSeedance20VideoGeneration._coerce_reference_value(
+                    return HMBSeedanceGeneration._coerce_reference_value(
                         value[key], depth=depth + 1
                     )
         to_dict = getattr(value, "to_dict", None)
         if callable(to_dict):
             serialized = to_dict()
             if serialized is not value:
-                return HMBSeedance20VideoGeneration._coerce_reference_value(
+                return HMBSeedanceGeneration._coerce_reference_value(
                     serialized, depth=depth + 1
                 )
         for attribute in ("value", "location", "path"):
             candidate = getattr(value, attribute, None)
             if candidate is not None and candidate is not value:
-                return HMBSeedance20VideoGeneration._coerce_reference_value(
+                return HMBSeedanceGeneration._coerce_reference_value(
                     candidate, depth=depth + 1
                 )
         raise ValueError(
@@ -3133,18 +3143,18 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
                     if str(key).lower() in {"video_url", "last_frame_url"}
                     else "[REDACTED]"
                     if _SENSITIVE_FIELD_PATTERN.search(str(key))
-                    else HMBSeedance20VideoGeneration._redact_sensitive(item, secret)
+                    else HMBSeedanceGeneration._redact_sensitive(item, secret)
                 )
                 for key, item in value.items()
             }
         if isinstance(value, list):
             return [
-                HMBSeedance20VideoGeneration._redact_sensitive(item, secret)
+                HMBSeedanceGeneration._redact_sensitive(item, secret)
                 for item in value
             ]
         if isinstance(value, tuple):
             return tuple(
-                HMBSeedance20VideoGeneration._redact_sensitive(item, secret)
+                HMBSeedanceGeneration._redact_sensitive(item, secret)
                 for item in value
             )
         if isinstance(value, str):
@@ -3855,6 +3865,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
 
     async def _refresh_async(self) -> None:
         """Refresh one Broker job without ever creating a replacement task."""
+        generation_id = ""
         try:
             generation_id = str(
                 self.parameter_output_values.get("generation_id")
@@ -3874,11 +3885,39 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
                 return
             bridge = await self._ensure_broker_connected()
             generation_id = self._validate_task_id(generation_id)
-            response = await asyncio.to_thread(
-                bridge.refresh_job,
-                generation_id,
-                timeout=60,
-            )
+            try:
+                response = await asyncio.to_thread(
+                    bridge.refresh_job,
+                    generation_id,
+                    timeout=60,
+                )
+            except _BrokerError as exc:
+                retry_payload = self._last_broker_payload
+                retry_same_request = (
+                    exc.status_code == 404
+                    and self.parameter_output_values.get("generation_status")
+                    == "submission_unknown"
+                    and isinstance(retry_payload, dict)
+                    and retry_payload.get("client_request_id") == generation_id
+                )
+                if not retry_same_request:
+                    raise
+                self._set_broker_task_outputs(
+                    {"id": generation_id, "status": "retrying_same_request"},
+                    generation_id=generation_id,
+                    status="retrying_same_request",
+                )
+                try:
+                    response = await asyncio.to_thread(
+                        bridge.generate_seedance,
+                        dict(retry_payload),
+                        timeout=60,
+                    )
+                except _BrokerError:
+                    self.parameter_output_values["generation_status"] = (
+                        "submission_unknown"
+                    )
+                    raise
             task = self._normalize_broker_task(
                 response,
                 fallback_job_id=generation_id,
@@ -3905,8 +3944,10 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
             self._set_status_results(
                 was_successful=False,
                 result_details=(
-                    f"FN AI Broker task {generation_id} is still {status}. "
-                    "Click Refresh / Retrieve Result again later."
+                    f"FN AI Broker task {generation_id} is still {status} on the "
+                    "server. Rendering continues even if this node disconnects. "
+                    "Refresh / Retrieve Result checks this same job only and never "
+                    "starts a duplicate render."
                 ),
             )
         except Exception as exc:
@@ -3916,7 +3957,10 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
             self._set_status_results(
                 was_successful=False,
                 result_details=(
-                    "Broker refresh failed safely without creating a task: "
+                    "The Broker connection is currently unavailable, but the existing "
+                    f"task {generation_id or 'ID'} may still be rendering. Refresh / "
+                    "Retrieve Result checks the same job without creating a duplicate. "
+                    "Details: "
                     + safe_detail
                 ),
             )
@@ -4003,6 +4047,14 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         else:
             params = self._prepare_video_references_for_run(params)
             payload = self._build_broker_payload(params)
+            client_request_id = "hmb-" + uuid4().hex
+            payload["client_request_id"] = client_request_id
+            self._last_broker_payload = dict(payload)
+            self._set_broker_task_outputs(
+                {"id": client_request_id, "status": "submitting"},
+                generation_id=client_request_id,
+                status="submitting",
+            )
             try:
                 response = await asyncio.to_thread(
                     bridge.generate_seedance,
@@ -4017,6 +4069,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
                     )
                     self.parameter_output_values["provider_response"] = {
                         "transport": "fn_ai_broker",
+                        "id": client_request_id,
                         "status": "submission_unknown",
                     }
                 raise
@@ -4045,15 +4098,16 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
             if self.is_cancellation_requested:
                 self.parameter_output_values["generation_status"] = "cancelled_locally"
                 raise asyncio.CancelledError(
-                    "Local Broker polling was cancelled. The remote task may continue."
+                    "Local Broker polling stopped, but the server render continues. "
+                    "Use Refresh / Retrieve Result for this same task."
                 )
             now = self._monotonic()
             if now >= deadline:
                 self.parameter_output_values["generation_status"] = "timed_out"
                 raise TimeoutError(
                     f"FN AI Broker task {generation_id} did not finish within "
-                    f"{timeout} seconds. Put this ID into Resume Task ID to continue "
-                    "without creating another billed task."
+                    f"{timeout} seconds. The server render continues; use Refresh / "
+                    "Retrieve Result for this same ID instead of starting a new render."
                 )
 
             response = await asyncio.to_thread(
@@ -4264,7 +4318,8 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
                 self.parameter_output_values.get("generation_id") or ""
             ).strip()
             resume_guidance = (
-                f" Use Resume Task ID {generation_id} to continue without a new POST."
+                f" Use Refresh / Retrieve Result for the same task {generation_id}; "
+                "it never starts a replacement render."
                 if generation_id
                 else ""
             )
@@ -4273,7 +4328,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
                 result_details=(
                     (
                         "CANCELLED: Local Seedance polling stopped. The FN AI Broker "
-                        "task may continue remotely and may still incur charges."
+                        "task continues remotely and may still incur charges."
                         if generation_id
                         else "CANCELLED: Generation stopped before a task ID was received."
                     )
@@ -4289,8 +4344,9 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
             ).strip()
             if generation_id:
                 safe_message += (
-                    f"\nExisting task ID: {generation_id}. Set Resume Task ID to this "
-                    "value before rerunning so the node does not create a duplicate task."
+                    f"\nExisting task ID: {generation_id}. The server render can "
+                    "continue after a disconnect. Use Refresh / Retrieve Result to "
+                    "check this same task without creating a duplicate."
                 )
             submission_unknown = (
                 isinstance(exc, VolcengineAPIError)
@@ -4304,6 +4360,9 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
                     "submission_unknown"
                 )
                 safe_message += (
+                    "\nRefresh / Retrieve Result will use the same client request ID. "
+                    "If the server never received the first POST, it repeats the exact "
+                    "request with that same idempotency key, never a new key."
                     "\nTemporary local video uploads are being retained for up to "
                     "30 minutes so an accepted remote task can still fetch them."
                 )
@@ -4317,6 +4376,17 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
             )
             self._record_current_usage_status()
             self._handle_failure_exception(RuntimeError(safe_message))
+
+
+class HMBSeedance20VideoGeneration(HMBSeedanceGeneration):
+    """Compatibility node type for workflows saved before the generic rename.
+
+    Griptape serializes ``node.__class__.__name__``. The manifest intentionally
+    registers this override-free wrapper while exposing only the generic node
+    label, so existing workflows resolve without duplicating the palette entry.
+    """
+
+
 __all__ = [
     "ARK_API_KEY_SECRET",
     "GT_CLOUD_API_KEY_SECRET",
@@ -4324,6 +4394,7 @@ __all__ = [
     "TOS_ACCESS_KEY_ID_SECRET",
     "TOS_SECRET_ACCESS_KEY_SECRET",
     "TOS_BUCKET_NAME_SECRET",
+    "HMBSeedanceGeneration",
     "HMBSeedance20VideoGeneration",
     "LOCAL_VIDEO_UPLOAD_GRIPTAPE",
     "LOCAL_VIDEO_UPLOAD_TOS",

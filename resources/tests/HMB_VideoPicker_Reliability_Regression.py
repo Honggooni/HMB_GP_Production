@@ -657,7 +657,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.5.26"
+assert manifest["metadata"]["library_version"] == "0.5.27"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
@@ -724,14 +724,14 @@ assert hashlib.sha256(bundled_agent_policy.read_bytes()).hexdigest() == (
 )
 expected_agent_hashes = {
     "HMBAgentLibrary.py": "12a00bf11e5376998192a09f9a2e3b9fe4bab9d04e986fe1adc7be78946b81c6",
-    "HMBPromptLibrary.py": "462be74dd2405baf05339d6c16d88fe4bac7060c4799b4c9ee9c6d3d1a789652",
-    "HMBVideoPickerLibrary.py": "b6a0fc3d5abdf16e81c31dfb999d8fb628ea8c844f5c8a50d0d9d4ee6f3b4e8c",
+    "HMBPromptLibrary.py": "d6ff9975cad8e44296905417bc324ee43945c5a62d0d08136571911ac4fb214e",
+    "HMBVideoPickerLibrary.py": "138afc3f72a5d8f4267897e335b8601f8c97e4047b6789caeba84804cf205ddf",
     "_hmb_common.py": "1e4a6e1447e6ab08279d3f17f677974ce703602ed3b54185dd8fc755c0d2530d",
     "widgets/HMBAgentLibraryWidget.js": "61ea9416adc1cbfb7e8fbfbc068ad1a444c3f6d4b4c6b59569a1815a013dc193",
-    "resources/tests/HMB_Agent_Policy_Integration_Regression.py": "92aff93a241f1781e74dbcbc7737288935236dc12b3003aac33953d51a1cb7cd",
+    "resources/tests/HMB_Agent_Policy_Integration_Regression.py": "8bf44efab36784676a8669a6a75a539457cdbece9ae68dd915fae72838c4ee4a",
     "resources/tests/HMB_Frame_Range_Regression.py": "4f9c0f7022b5db5bfa760e41f747ecbf95c99f0b06525553248fe3af9e2b1091",
     "resources/tests/HMB_Output_Sanitizer_Regression.py": "390406b1903f28583ff29882b5fab2ef9befbfb13684de9e551d37f3ab6ce524",
-    "resources/tests/HMB_Final_Policy_Recursive_Probabilistic_Regression.py": "9653a7977541d616d6398b1d348c26d800a6e981ebaade95a788aed8cf579556",
+    "resources/tests/HMB_Final_Policy_Recursive_Probabilistic_Regression.py": "b885612878a95960ecf41931ae598b431e2719a64ca3d971ef0431cf86ae56ec",
 }
 for relative_path, expected_hash in expected_agent_hashes.items():
     actual_hash = hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest()
@@ -760,11 +760,12 @@ assert "def _apply_widget_action(" not in picker_source
 assert "commitAndRemount" not in widget_source
 assert "HMBVideoPickerLibraryWidget(container, {" not in widget_source
 assert "emit(props, state);\n          remount();" not in prompt_widget_source
-assert prompt_widget_source.count("emit(props, state);\n        remount();") == 1
 assert 'state.ui.language = uiLanguage(state) === "ko" ? "en" : "ko";' in prompt_widget_source
-assert prompt_widget_source.count("remount();") == 4
+assert prompt_widget_source.count("remount();") == 2
 assert "hmbCommitLocalPromptStructure(container, props, state, remount)" in prompt_widget_source
-assert "if (currentValue === nextValue && !disabledChanged) return;" in prompt_widget_source
+assert "committedState = remount() || state" in prompt_widget_source
+assert "hmbEmitLocalPromptState(container, props, committedState);" in prompt_widget_source
+assert "if (currentValue === nextValue && !disabledChanged) {" in prompt_widget_source
 assert 'pending_action: "read_scene"' not in widget_source
 assert 'pending_action: "run_video"' not in widget_source
 assert 'pending_action: "render_snapshot"' not in widget_source

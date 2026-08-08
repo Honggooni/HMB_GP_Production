@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -368,18 +369,19 @@ def main() -> int:
                         "Live PLAYBLAST retained an oversized UI warning."
                     )
             video_path = Path(str(playblast_state.get("video_path") or ""))
-            expected_playblast = scene_copy.parent / scene_copy.stem / f"{scene_copy.stem}_playblast_1.mp4"
-            expected_playblast_sidecar = (
-                scene_copy.parent
-                / scene_copy.stem
-                / f"{scene_copy.stem}_playblast_1.hmb.json"
+            output_folder = scene_copy.parent / scene_copy.stem
+            playblast_match = re.fullmatch(
+                rf"{re.escape(scene_copy.stem)}_playblast_([0-9a-f]{{12}})\.mp4",
+                video_path.name,
             )
             if str(playblast_state.get("status") or "").upper() != "VIDEO_READY":
                 raise RuntimeError(
                     f"Live PLAYBLAST did not retain VIDEO_READY: {playblast_state.get('message')}"
                 )
-            if video_path != expected_playblast:
+            if video_path.parent != output_folder or playblast_match is None:
                 raise RuntimeError(f"Live PLAYBLAST used the wrong output name: {video_path}")
+            playblast_token = playblast_match.group(1)
+            expected_playblast_sidecar = video_path.with_suffix(".hmb.json")
             if not video_path.is_file() or video_path.stat().st_size <= 0:
                 raise RuntimeError(f"Live PLAYBLAST did not create a video: {video_path}")
             if not expected_playblast_sidecar.is_file():
@@ -416,8 +418,19 @@ def main() -> int:
                 playblast_state.get("output_frame_count") or 0
             ):
                 raise RuntimeError("Live PLAYBLAST sidecar frame count disagrees with Picker state.")
-            if playblast_state.get("snapshot_active") or snapshot_path.exists():
-                raise RuntimeError("Live PLAYBLAST did not clear the snapshot cache.")
+            if playblast_state.get("snapshot_active"):
+                raise RuntimeError("Live PLAYBLAST did not return the viewport to video mode.")
+            retained_snapshot = next(
+                (
+                    item for item in playblast_state.get("snapshots", [])
+                    if Path(str(item.get("path") or "")) == snapshot_path
+                ),
+                None,
+            )
+            if retained_snapshot is None or not snapshot_path.is_file():
+                raise RuntimeError(
+                    "Live PLAYBLAST did not preserve the reusable snapshot history."
+                )
             result["playblast"]["video_size"] = video_path.stat().st_size
             if args.depth:
                 depth_slot = int(playblast_state.get("depth_video_slot") or 0)
@@ -427,14 +440,12 @@ def main() -> int:
                         f"{depth_slot}"
                     )
                 expected_depth = (
-                    scene_copy.parent
-                    / scene_copy.stem
-                    / f"{scene_copy.stem}_depth_playblast_{depth_slot}.mp4"
+                    output_folder
+                    / f"{scene_copy.stem}_depth_playblast_{playblast_token}.mp4"
                 )
                 expected_depth_sidecar = (
-                    scene_copy.parent
-                    / scene_copy.stem
-                    / f"{scene_copy.stem}_depth_playblast_{depth_slot}.hmb.json"
+                    output_folder
+                    / f"{scene_copy.stem}_depth_playblast_{playblast_token}.hmb.json"
                 )
                 if not expected_depth.is_file() or expected_depth.stat().st_size <= 0:
                     raise RuntimeError(
@@ -506,7 +517,7 @@ def main() -> int:
                     None,
                 )
                 if (
-                    picker_payload.get("schema_version") != 4
+                    picker_payload.get("schema_version") != 5
                     or not depth_payload
                     or depth_payload.get("source_type_hint")
                     != picker.DEPTH_SOURCE_TYPE
@@ -541,14 +552,12 @@ def main() -> int:
                         "Live Motion Guide and Depth occupied the same auxiliary slot."
                     )
                 expected_motion = (
-                    scene_copy.parent
-                    / scene_copy.stem
-                    / f"{scene_copy.stem}_motion_guide_{motion_slot}.mp4"
+                    output_folder
+                    / f"{scene_copy.stem}_motion_guide_{playblast_token}.mp4"
                 )
                 expected_motion_sidecar = (
-                    scene_copy.parent
-                    / scene_copy.stem
-                    / f"{scene_copy.stem}_motion_guide_{motion_slot}.hmb.json"
+                    output_folder
+                    / f"{scene_copy.stem}_motion_guide_{playblast_token}.hmb.json"
                 )
                 if (
                     not expected_motion.is_file()
@@ -642,7 +651,7 @@ def main() -> int:
                     None,
                 )
                 if (
-                    picker_payload.get("schema_version") != 4
+                    picker_payload.get("schema_version") != 5
                     or not motion_payload
                     or motion_payload.get("source_type_hint")
                     != picker.MOTION_GUIDE_SOURCE_TYPE

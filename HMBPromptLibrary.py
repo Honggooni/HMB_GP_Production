@@ -7290,6 +7290,89 @@ def _build_prompt_package(state: Dict[str, Any]) -> str:
     return _compile_prompt_with_budget(lines)
 
 
+def _prompt_semantic_fingerprint(state: Dict[str, Any]) -> str:
+    """Return a stable identity for fields that can affect PROMPT_OUT.
+
+    ``ui`` is persisted workflow geometry/presentation and ``status`` is fully
+    derived by normalization. Neither is read by the prompt compiler, so those
+    updates must not rebuild or propagate an identical paid-Agent input.
+    """
+    normalized = _normalize_state(state)
+    semantic_state = {
+        key: value
+        for key, value in normalized.items()
+        if key not in {"ui", "status"}
+    }
+    canonical = json.dumps(
+        semantic_state,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _stage_and_notify_prompt_output(
+    node: Any,
+    value: Any,
+    *,
+    stage_output: bool = True,
+    replace_pending: bool = True,
+) -> None:
+    """Stage PROMPT_OUT before notifying an already-connected downstream node."""
+    if stage_output:
+        set_output(node, "PROMPT_OUT", value)
+    if replace_pending:
+        generation = (
+            int(getattr(node, "_hmb_prompt_notification_generation", 0)) + 1
+        )
+        node._hmb_prompt_notification_generation = generation
+        node._hmb_pending_prompt_notification = (generation, value)
+    publisher = getattr(node, "publish_update_to_parameter", None)
+    if not callable(publisher):
+        node._hmb_pending_prompt_notification = None
+        return
+    pending = getattr(node, "_hmb_pending_prompt_notification", None)
+    if not isinstance(pending, tuple) or len(pending) != 2:
+        return
+    owner_generation, pending_value = pending
+    current_pending = getattr(node, "_hmb_pending_prompt_notification", None)
+    if (
+        not isinstance(current_pending, tuple)
+        or len(current_pending) != 2
+        or current_pending[0] != owner_generation
+        or current_pending is not pending
+    ):
+        return
+    try:
+        publisher("PROMPT_OUT", pending_value)
+    except Exception:
+        # A synchronous subscriber may re-enter this node and publish a newer
+        # generation before the older callback returns (or throws).  Only the
+        # still-owned generation may remain pending or surface its failure.
+        current_pending = getattr(
+            node,
+            "_hmb_pending_prompt_notification",
+            None,
+        )
+        if (
+            isinstance(current_pending, tuple)
+            and len(current_pending) == 2
+            and current_pending[0] == owner_generation
+            and current_pending is pending
+        ):
+            raise
+        return
+    current_pending = getattr(node, "_hmb_pending_prompt_notification", None)
+    if (
+        isinstance(current_pending, tuple)
+        and len(current_pending) == 2
+        and current_pending[0] == owner_generation
+        and current_pending is pending
+    ):
+        node._hmb_pending_prompt_notification = None
+
+
 class HMBPromptLibrary(DataNode):
     """HMBPromptLibrary.
 
@@ -7323,6 +7406,10 @@ class HMBPromptLibrary(DataNode):
         self._hmb_image_asset_connected = False
         self._hmb_sync_lock = threading.RLock()
         self._hmb_sync_generation = 0
+        self._hmb_last_prompt_semantic_fingerprint = ""
+        self._hmb_last_prompt_output = None
+        self._hmb_prompt_notification_generation = 0
+        self._hmb_pending_prompt_notification = None
         try:
             self.ui_options = {"width": 1800, "height": PROMPT_START_HEIGHT, "default_width": 1800, "default_height": PROMPT_START_HEIGHT, "preferred_width": 1800, "preferred_height": PROMPT_START_HEIGHT, "initial_width": 1800, "initial_height": PROMPT_START_HEIGHT, "node_size": {"width": 1800, "height": PROMPT_START_HEIGHT}, "default_size": {"width": 1800, "height": PROMPT_START_HEIGHT}, "initial_size": {"width": 1800, "height": PROMPT_START_HEIGHT}, "min_width": 760, "min_height": PROMPT_MIN_HEIGHT, "resizable": True}
             self.width = 1800
@@ -7405,9 +7492,46 @@ class HMBPromptLibrary(DataNode):
         editor losing focus first.
         """
         state = self._write_dashboard_state()
+        fingerprint = _prompt_semantic_fingerprint(state)
+        output_values = getattr(self, "parameter_output_values", {})
+        output_getter = getattr(output_values, "get", None)
+        current_output = output_getter("PROMPT_OUT") if callable(output_getter) else None
+        cached_output = getattr(self, "_hmb_last_prompt_output", None)
+        if (
+            fingerprint
+            == getattr(self, "_hmb_last_prompt_semantic_fingerprint", "")
+            and cached_output is not None
+        ):
+            if current_output != cached_output:
+                _stage_and_notify_prompt_output(self, cached_output)
+            elif getattr(self, "_hmb_pending_prompt_notification", None):
+                _stage_and_notify_prompt_output(
+                    self,
+                    cached_output,
+                    stage_output=False,
+                    replace_pending=False,
+                )
+            return state
+
         prompt = _build_prompt_package(state)
-        set_output(self, "PROMPT_OUT", prompt)
+        self._hmb_last_prompt_semantic_fingerprint = fingerprint
+        self._hmb_last_prompt_output = prompt
+        if current_output != prompt:
+            _stage_and_notify_prompt_output(self, prompt)
+        elif getattr(self, "_hmb_pending_prompt_notification", None):
+            _stage_and_notify_prompt_output(
+                self,
+                prompt,
+                stage_output=False,
+                replace_pending=False,
+            )
         return state
+
+    def _sync_prompt_output_now(self) -> Dict[str, Any]:
+        """Invalidate queued callbacks and commit one authoritative snapshot."""
+        with self._hmb_sync_lock:
+            self._hmb_sync_generation += 1
+            return self._sync_prompt_output_from_state()
 
     def _schedule_prompt_sync(self) -> None:
         """Schedule on the host loop, or synchronize on the current host thread.
@@ -7422,11 +7546,11 @@ class HMBPromptLibrary(DataNode):
             generation = self._hmb_sync_generation
 
         def run_sync() -> None:
-            with self._hmb_sync_lock:
-                if generation != self._hmb_sync_generation:
-                    return
             try:
-                self._sync_prompt_output_from_state()
+                with self._hmb_sync_lock:
+                    if generation != self._hmb_sync_generation:
+                        return
+                    self._sync_prompt_output_from_state()
             except Exception as exc:
                 _diagnostic_exception("Deferred PROMPT_OUT synchronization failed", exc)
 
@@ -7501,7 +7625,7 @@ class HMBPromptLibrary(DataNode):
                             value = sentinel
                 if value is not sentinel:
                     _set_parameter_value(self, target_name, value)
-                self._sync_prompt_output_from_state()
+                self._sync_prompt_output_now()
         except Exception as exc:
             _diagnostic_exception("Incoming source connection synchronization failed", exc)
         try:
@@ -7530,7 +7654,7 @@ class HMBPromptLibrary(DataNode):
                     _set_parameter_value(self, target_name, "")
                 except Exception as exc:
                     _diagnostic_exception("Source input clear failed", exc)
-                self._sync_prompt_output_from_state()
+                self._sync_prompt_output_now()
         except Exception as exc:
             _diagnostic_exception("Picker disconnect synchronization failed", exc)
         try:
@@ -7549,7 +7673,7 @@ class HMBPromptLibrary(DataNode):
             payload = _parse_picker_payload(_get_parameter_raw(self, PICKER_INPUT_PARAMETER_NAME))
             if payload:
                 self._hmb_picker_connected = True
-            self._sync_prompt_output_from_state()
+            self._sync_prompt_output_now()
         except Exception as exc:
             _diagnostic_exception("Picker connection state restore failed", exc)
 
@@ -7585,5 +7709,5 @@ class HMBPromptLibrary(DataNode):
 
     def process(self) -> None:
         self._ensure_prompt_output()
-        self._sync_prompt_output_from_state()
+        self._sync_prompt_output_now()
         return None

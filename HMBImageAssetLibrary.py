@@ -163,6 +163,11 @@ _LOGGER = logging.getLogger("griptape_nodes")
 _DIAGNOSTIC_PREFIX = "[HMB_GP_Production][HMBImageAssetLibrary]"
 _ASSET_MANIFEST_LOCK_GUARD = threading.Lock()
 _ASSET_MANIFEST_LOCKS: Dict[str, threading.Lock] = {}
+_ASSET_MANIFEST_CACHE_LOCK = threading.Lock()
+_ASSET_MANIFEST_CACHE: Dict[
+    tuple[str, str], Dict[str, Dict[str, Any]]
+] = {}
+_ASSET_MANIFEST_CACHE_LIMIT = 32
 _ASSET_THUMBNAIL_LOCK = threading.Lock()
 _ASSET_THUMBNAIL_URLS: Dict[str, str] = {}
 
@@ -1090,6 +1095,7 @@ def _is_user_import_relative_path(value: Any) -> bool:
 def _verified_project_relative_path(
     asset: Dict[str, Any],
     state: Dict[str, Any],
+    manifest_records: Dict[str, Dict[str, Any]] | None = None,
 ) -> str:
     """Return the trusted project-relative path, or blank for non-assets.
 
@@ -1135,9 +1141,12 @@ def _verified_project_relative_path(
     ):
         return ""
     try:
-        manifest_record = _read_asset_manifest(resolved_root).get(
-            relative_text.casefold()
+        records = (
+            manifest_records
+            if isinstance(manifest_records, dict)
+            else _read_asset_manifest(resolved_root)
         )
+        manifest_record = records.get(relative_text.casefold())
     except Exception:
         return ""
     if not isinstance(manifest_record, dict):
@@ -1318,6 +1327,24 @@ def _asset_manifest_signature(root: Path) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
+def _asset_manifest_cache_root_key(root: Path) -> str:
+    return os.path.normcase(str(root.resolve()))
+
+
+def _invalidate_asset_manifest_cache(root: Path) -> None:
+    """Drop cached parses for one project after a local manifest write."""
+    try:
+        root_key = _asset_manifest_cache_root_key(root)
+    except Exception:
+        return
+    with _ASSET_MANIFEST_CACHE_LOCK:
+        stale_keys = [
+            key for key in _ASSET_MANIFEST_CACHE if key[0] == root_key
+        ]
+        for key in stale_keys:
+            _ASSET_MANIFEST_CACHE.pop(key, None)
+
+
 def _load_asset_manifest_document(
     root: Path,
 ) -> tuple[Path, Any, List[Any]]:
@@ -1444,33 +1471,59 @@ def _write_asset_manifest_record_locked(
         except Exception:
             pass
         raise
+    _invalidate_asset_manifest_cache(root)
     _cleanup_legacy_asset_metadata(root)
     return manifest_path
 
 
 def _read_asset_manifest(root: Path) -> Dict[str, Dict[str, Any]]:
-    manifest_path = _existing_asset_manifest_path(root)
+    resolved_root = root.resolve()
+    signature = _asset_manifest_signature(resolved_root)
+    root_key = _asset_manifest_cache_root_key(resolved_root)
+    cache_key = (root_key, signature)
+    with _ASSET_MANIFEST_CACHE_LOCK:
+        cached = _ASSET_MANIFEST_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
+    manifest_path = _existing_asset_manifest_path(resolved_root)
     if manifest_path is None:
-        return {}
-    try:
-        if manifest_path.stat().st_size > 2 * 1024 * 1024:
-            raise ValueError("Image asset manifest exceeds 2 MiB.")
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise ValueError(f"Unable to read {manifest_path.name}: {exc}") from exc
-    records = payload.get("assets") if isinstance(payload, dict) else payload
-    if not isinstance(records, list):
-        raise ValueError(f"{manifest_path.name} must contain an assets list.")
-    overrides: Dict[str, Dict[str, Any]] = {}
-    for raw in records[:MAX_ASSETS]:
-        if not isinstance(raw, dict):
-            continue
-        relative_text = _clean(raw.get("path") or raw.get("relative_path")).replace(
-            "\\",
-            "/",
-        )
-        if relative_text:
-            overrides[relative_text.casefold()] = raw
+        overrides: Dict[str, Dict[str, Any]] = {}
+    else:
+        try:
+            if manifest_path.stat().st_size > 2 * 1024 * 1024:
+                raise ValueError("Image asset manifest exceeds 2 MiB.")
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(f"Unable to read {manifest_path.name}: {exc}") from exc
+        records = payload.get("assets") if isinstance(payload, dict) else payload
+        if not isinstance(records, list):
+            raise ValueError(f"{manifest_path.name} must contain an assets list.")
+        overrides = {}
+        for raw in records[:MAX_ASSETS]:
+            if not isinstance(raw, dict):
+                continue
+            relative_text = _clean(
+                raw.get("path") or raw.get("relative_path")
+            ).replace(
+                "\\",
+                "/",
+            )
+            if relative_text:
+                overrides[relative_text.casefold()] = raw
+
+    # Do not cache a parse under an obsolete signature if another workstation
+    # atomically replaces the shared manifest while this process is reading it.
+    if _asset_manifest_signature(resolved_root) == signature:
+        with _ASSET_MANIFEST_CACHE_LOCK:
+            stale_keys = [
+                key for key in _ASSET_MANIFEST_CACHE if key[0] == root_key
+            ]
+            for key in stale_keys:
+                _ASSET_MANIFEST_CACHE.pop(key, None)
+            while len(_ASSET_MANIFEST_CACHE) >= _ASSET_MANIFEST_CACHE_LIMIT:
+                _ASSET_MANIFEST_CACHE.pop(next(iter(_ASSET_MANIFEST_CACHE)))
+            _ASSET_MANIFEST_CACHE[cache_key] = dict(overrides)
     return overrides
 
 
@@ -3028,6 +3081,22 @@ def _resolve_selected_assets(
         ],
         key=lambda asset: _non_negative_int(asset.get("selection_order")),
     )[:MAX_SELECTED_IMAGES]
+    manifest_records: Dict[str, Dict[str, Any]] | None = None
+    if any(
+        _clean(asset.get("source_kind")).casefold() == "project"
+        and bool(asset.get("registered"))
+        for asset in ordered
+    ):
+        try:
+            project_root = _clean(normalized.get("project_root"))
+            manifest_records = (
+                _read_asset_manifest(Path(project_root)) if project_root else {}
+            )
+        except Exception:
+            # One failed shared-manifest read invalidates all project selections
+            # in this immutable resolution snapshot; retrying it per card only
+            # multiplies network latency and cannot produce a consistent result.
+            manifest_records = {}
     resolved: List[Dict[str, Any]] = []
     unresolved: List[Dict[str, Any]] = []
     for asset in ordered:
@@ -3039,7 +3108,11 @@ def _resolve_selected_assets(
         media_value = ""
         reason = ""
         if source_kind == "project":
-            relative_path = _verified_project_relative_path(asset, normalized)
+            relative_path = _verified_project_relative_path(
+                asset,
+                normalized,
+                manifest_records,
+            )
             if relative_path:
                 media_value = _resolved_media_value(asset.get("path"))
             else:
@@ -3107,24 +3180,40 @@ def _selection_id(
             if isinstance(item, dict) and isinstance(item.get("asset"), dict)
         ]
     else:
+        ordered_assets = sorted(
+            [
+                asset
+                for asset in state.get("assets", [])
+                if isinstance(asset, dict) and bool(asset.get("selected"))
+            ],
+            key=lambda asset: _non_negative_int(asset.get("selection_order")),
+        )
+        manifest_records: Dict[str, Dict[str, Any]] | None = None
+        if any(
+            _clean(asset.get("source_kind")).casefold() == "project"
+            and bool(asset.get("registered"))
+            for asset in ordered_assets
+        ):
+            try:
+                project_root = _clean(state.get("project_root"))
+                manifest_records = (
+                    _read_asset_manifest(Path(project_root)) if project_root else {}
+                )
+            except Exception:
+                manifest_records = {}
         selected_assets = [
             {
                 "asset": asset,
                 "selection_order": _non_negative_int(
                     asset.get("selection_order")
                 ),
-                "relative_path": _verified_project_relative_path(asset, state),
-            }
-            for asset in sorted(
-                [
-                    asset
-                    for asset in state.get("assets", [])
-                    if isinstance(asset, dict) and bool(asset.get("selected"))
-                ],
-                key=lambda asset: _non_negative_int(
-                    asset.get("selection_order")
+                "relative_path": _verified_project_relative_path(
+                    asset,
+                    state,
+                    manifest_records,
                 ),
-            )
+            }
+            for asset in ordered_assets
         ]
     selected: List[Dict[str, Any]] = []
     for resolved_item in selected_assets:
@@ -3288,6 +3377,77 @@ def _build_synchronized_outputs(
         ),
         [item["media"] for item in selection["resolved"]],
     )
+
+
+_OUTPUT_FINGERPRINT_ASSET_FIELDS = (
+    "asset_library_id",
+    "source_uid",
+    "source_kind",
+    "asset_project_uid",
+    "asset_id",
+    "image_name",
+    "path",
+    "relative_path",
+    "width",
+    "height",
+    "source_type",
+    "custom_source_type",
+    "scope_candidate",
+    "registered",
+    "selection_order",
+    "media_ref_kind",
+    "connected",
+)
+
+
+def _project_output_fingerprint(state: Dict[str, Any]) -> str | None:
+    """Fingerprint an in-memory project-only output resolution snapshot.
+
+    UI fields are intentionally excluded so a search, language, or panel click
+    does not touch the filesystem. Manifest polling advances the state signature
+    for normal UI updates, while ``process()`` forces a fresh filesystem-backed
+    resolution before execution. Imported media is deliberately ineligible
+    because host artifact objects can change without a stable state signature.
+    """
+    selected = sorted(
+        [
+            asset
+            for asset in state.get("assets", [])
+            if isinstance(asset, dict) and bool(asset.get("selected"))
+        ],
+        key=lambda asset: _non_negative_int(asset.get("selection_order")),
+    )[:MAX_SELECTED_IMAGES]
+    if any(
+        _clean(asset.get("source_kind")).casefold() != "project"
+        for asset in selected
+    ):
+        return None
+
+    selected_payload: List[Dict[str, Any]] = []
+    for asset in selected:
+        item = {
+            field: asset.get(field)
+            for field in _OUTPUT_FINGERPRINT_ASSET_FIELDS
+        }
+        item["color_pick_candidates"] = list(
+            asset.get("color_pick_candidates") or []
+        )
+        selected_payload.append(item)
+
+    canonical = json.dumps(
+        {
+            "project_root": _clean(state.get("project_root")),
+            "project_id": _clean(state.get("project_id")),
+            "project_uid": _clean(state.get("project_uid")),
+            "manifest_signature": _clean(state.get("manifest_signature")),
+            "scan_revision": _non_negative_int(state.get("scan_revision")),
+            "selected": selected_payload,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _repair_output_port(
@@ -3619,6 +3779,116 @@ def _add_widget_state(node: Any) -> None:
     node.add_parameter(parameter)
 
 
+def _stage_and_notify_image_output_pair(
+    node: Any,
+    asset_output: Any,
+    media_output: Any,
+    *,
+    stage_outputs: bool = True,
+    replace_pending: bool = True,
+) -> None:
+    """Stage both sibling caches, then independently notify live connections."""
+    synchronized_outputs = (
+        (OUTPUT_PARAMETER, asset_output),
+        (MEDIA_OUTPUT_PARAMETER, media_output),
+    )
+    # A synchronous subscriber to the first notification can read the sibling
+    # port immediately, so both retained-mode caches must already be current.
+    if stage_outputs:
+        for name, value in synchronized_outputs:
+            set_output(node, name, value)
+
+    if replace_pending:
+        generation = (
+            int(getattr(node, "_hmb_output_notification_generation", 0)) + 1
+        )
+        node._hmb_output_notification_generation = generation
+        node._hmb_pending_output_notifications = {
+            name: (generation, value)
+            for name, value in synchronized_outputs
+        }
+
+    publisher = getattr(node, "publish_update_to_parameter", None)
+    if not callable(publisher):
+        node._hmb_pending_output_notifications = {}
+        return
+    pending = getattr(node, "_hmb_pending_output_notifications", {})
+    if not isinstance(pending, dict) or not pending:
+        return
+    notification_errors: List[tuple[str, Exception]] = []
+    for name, pending_item in list(pending.items()):
+        if (
+            not isinstance(pending_item, tuple)
+            or len(pending_item) != 2
+        ):
+            continue
+        owner_generation, value = pending_item
+        current_pending = getattr(
+            node,
+            "_hmb_pending_output_notifications",
+            {},
+        )
+        current_item = (
+            current_pending.get(name)
+            if isinstance(current_pending, dict)
+            else None
+        )
+        if (
+            not isinstance(current_item, tuple)
+            or len(current_item) != 2
+            or current_item[0] != owner_generation
+            or current_item is not pending_item
+        ):
+            continue
+        try:
+            publisher(name, value)
+        except Exception as error:
+            current_pending = getattr(
+                node,
+                "_hmb_pending_output_notifications",
+                {},
+            )
+            current_item = (
+                current_pending.get(name)
+                if isinstance(current_pending, dict)
+                else None
+            )
+            if (
+                isinstance(current_item, tuple)
+                and len(current_item) == 2
+                and current_item[0] == owner_generation
+                and current_item is pending_item
+            ):
+                notification_errors.append((name, error))
+        else:
+            current_pending = getattr(
+                node,
+                "_hmb_pending_output_notifications",
+                {},
+            )
+            current_item = (
+                current_pending.get(name)
+                if isinstance(current_pending, dict)
+                else None
+            )
+            if (
+                isinstance(current_item, tuple)
+                and len(current_item) == 2
+                and current_item[0] == owner_generation
+                and current_item is pending_item
+            ):
+                current_pending.pop(name, None)
+    if notification_errors:
+        failed_ports = ", ".join(
+            f"{name} ({type(error).__name__})"
+            for name, error in notification_errors
+        )
+        raise RuntimeError(
+            "Synchronized image output notification failed after both output "
+            f"caches were staged: {failed_ports}."
+        ) from notification_errors[0][1]
+
+
 class HMBImageAssetLibrary(DataNode):
     """Independent project image library and optional metadata source.
 
@@ -3697,6 +3967,10 @@ class HMBImageAssetLibrary(DataNode):
 
         self._hmb_import_media_by_uid: Dict[str, Any] = {}
         self._hmb_last_resolution_warning = ""
+        self._hmb_last_output_fingerprint = ""
+        self._hmb_last_output_pair: tuple[Any, Any] | None = None
+        self._hmb_output_notification_generation = 0
+        self._hmb_pending_output_notifications: Dict[str, tuple[int, Any]] = {}
         self._ensure_parameters()
         root_value = _project_root_text(
             _get_parameter_raw(self, PROJECT_ROOT_PARAMETER)
@@ -3715,26 +3989,99 @@ class HMBImageAssetLibrary(DataNode):
             _get_parameter_raw(self, WIDGET_STATE_PARAMETER)
         )
 
-    def _sync_output(self, state: Dict[str, Any]) -> Dict[str, Any]:
+    def _sync_output(
+        self,
+        state: Dict[str, Any],
+        *,
+        force: bool = False,
+    ) -> Dict[str, Any]:
         normalized = _normalize_state(state)
+        output_fingerprint = _project_output_fingerprint(normalized)
+        cached_pair = getattr(self, "_hmb_last_output_pair", None)
+        if (
+            not force
+            and
+            output_fingerprint
+            and output_fingerprint
+            == getattr(self, "_hmb_last_output_fingerprint", "")
+            and isinstance(cached_pair, tuple)
+            and len(cached_pair) == 2
+        ):
+            output_values = getattr(self, "parameter_output_values", {})
+            output_getter = getattr(output_values, "get", None)
+            current_asset_output = (
+                output_getter(OUTPUT_PARAMETER)
+                if callable(output_getter)
+                else None
+            )
+            current_media_output = (
+                output_getter(MEDIA_OUTPUT_PARAMETER)
+                if callable(output_getter)
+                else None
+            )
+            cached_asset_output, cached_media_output = cached_pair
+            if (
+                current_asset_output != cached_asset_output
+                or current_media_output != cached_media_output
+            ):
+                # Treat the metadata/media branches as one synchronized pair.
+                # If either host port was cleared or replaced, republish both
+                # last-good values without touching the filesystem.
+                _stage_and_notify_image_output_pair(
+                    self,
+                    cached_asset_output,
+                    (
+                        list(cached_media_output)
+                        if isinstance(cached_media_output, list)
+                        else cached_media_output
+                    ),
+                )
+            elif getattr(self, "_hmb_pending_output_notifications", None):
+                _stage_and_notify_image_output_pair(
+                    self,
+                    cached_asset_output,
+                    cached_media_output,
+                    stage_outputs=False,
+                    replace_pending=False,
+                )
+            return normalized
         output_payload, media_values = _build_synchronized_outputs(
             normalized,
             self._hmb_import_media_by_uid,
         )
-        set_output(
-            self,
-            OUTPUT_PARAMETER,
-            _json_text(output_payload),
-        )
-        set_output(
-            self,
-            MEDIA_OUTPUT_PARAMETER,
-            media_values,
+        asset_output_value = _json_text(output_payload)
+        media_output_value = (
+            list(media_values) if isinstance(media_values, list) else media_values
         )
         warning_signature = "\n".join(output_payload.get("warnings", []))
         if warning_signature and warning_signature != self._hmb_last_resolution_warning:
             _diagnostic_warning("Selected media resolution", warning_signature)
         self._hmb_last_resolution_warning = warning_signature
+        resolution = output_payload.get("media_resolution")
+        cacheable_fingerprint = (
+            output_fingerprint
+            if output_fingerprint
+            and not warning_signature
+            and isinstance(resolution, dict)
+            and _non_negative_int(resolution.get("unresolved_count")) == 0
+            else ""
+        )
+        self._hmb_last_output_fingerprint = cacheable_fingerprint
+        self._hmb_last_output_pair = (
+            (
+                asset_output_value,
+                list(media_output_value)
+                if isinstance(media_output_value, list)
+                else media_output_value,
+            )
+            if cacheable_fingerprint
+            else None
+        )
+        _stage_and_notify_image_output_pair(
+            self,
+            asset_output_value,
+            media_output_value,
+        )
         return normalized
 
     def _publish_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -4229,4 +4576,5 @@ class HMBImageAssetLibrary(DataNode):
         import_value = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
         if _flatten_import_values(import_value):
             self._apply_import_value(import_value)
+        self._sync_output(self._current_state(), force=True)
         return None
