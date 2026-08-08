@@ -69,6 +69,7 @@ jobs:
             "HMB_Image_Asset_Registration_Regression.py",
             "HMB_Image_Asset_Server_Sharing_Regression.py",
             "HMB_Image_Asset_Process_Lock_Regression.py",
+            "HMB_Prompt_Output_Coalescing_Regression.py",
             "HMB_Cutout_Transparency_Regression.py",
             "HMB_Depth_Companion_Regression.py",
             "HMB_Depth_Visual_Contract_Regression.py",
@@ -77,6 +78,7 @@ jobs:
             "HMB_Motion_Guide_Regression.py",
             "HMB_Picker_State_Compaction_Regression.py",
             "HMB_VideoPicker_Media_Availability_Regression.py",
+            "HMB_VideoPicker_Live_Output_Regression.py",
             "HMB_VideoPicker_High_Quality_Original_Regression.py",
             "HMB_VideoPicker_Reliability_Regression.py",
             "HMB_Typed_Auxiliary_Video_Slots_Regression.py"

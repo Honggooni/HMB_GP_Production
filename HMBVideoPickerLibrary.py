@@ -6965,12 +6965,17 @@ def _request_parameter_value(node: Any, name: str, value: Any, data_type: str) -
     raise RuntimeError(details or f"Griptape rejected the {name} state publication.")
 
 
-def _publish_parameter_update(node: Any, name: str, value: Any) -> None:
-    """Set an output and propagate late async results across existing connections."""
-    set_output(node, name, value)
+def _notify_parameter_update(node: Any, name: str, value: Any) -> None:
+    """Notify existing connections after the caller has staged output caches."""
     publisher = getattr(node, "publish_update_to_parameter", None)
     if callable(publisher):
         publisher(name, value)
+
+
+def _publish_parameter_update(node: Any, name: str, value: Any) -> None:
+    """Set one output and propagate late async results across existing connections."""
+    set_output(node, name, value)
+    _notify_parameter_update(node, name, value)
 
 
 def _norm_path(value: Any) -> Path:
@@ -9378,10 +9383,33 @@ class HMBVideoPickerLibrary(DataNode):
             enforce_media_availability=enforce_media_availability,
         )
         text = _json_text(payload)
-        _publish_parameter_update(self, VIDEO_OUTPUT_PARAMETER, media_values)
-        set_output(self, "PICKER_OUT", text)
+        synchronized_outputs = (
+            (VIDEO_OUTPUT_PARAMETER, media_values),
+            ("PICKER_OUT", text),
+        )
+        # A synchronous connection callback may read either sibling output.
+        # Stage both caches first so every observer sees one coherent snapshot,
+        # then notify each port independently because the host has no atomic
+        # multi-parameter publication API.
+        for name, value in synchronized_outputs:
+            set_output(self, name, value)
+        notification_errors: List[tuple[str, Exception]] = []
+        for name, value in synchronized_outputs:
+            try:
+                _notify_parameter_update(self, name, value)
+            except Exception as error:
+                notification_errors.append((name, error))
         _retire_legacy_video_slot_outputs(self)
         _reorder_video_picker_parameters(self)
+        if notification_errors:
+            failed_ports = ", ".join(
+                f"{name} ({type(error).__name__})"
+                for name, error in notification_errors
+            )
+            raise RuntimeError(
+                "Synchronized picker output notification failed after both "
+                f"output caches were staged: {failed_ports}."
+            ) from notification_errors[0][1]
         if payload.get("media_blocked"):
             raise RuntimeError(
                 _clean(payload.get("blocking_error"))

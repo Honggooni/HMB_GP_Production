@@ -18,9 +18,11 @@ const container = fakeContainer();
 let emitted = "";
 let matchingEchoConsumed = false;
 let remounts = 0;
+let commitOrder = [];
 const props = {
   disabled: false,
   onChange(value) {
+    commitOrder.push("emit");
     emitted = value;
     // Reproduce Griptape's synchronous value echo. The local echo guard must
     // consume it while the explicit local remount still repaints the row.
@@ -85,10 +87,15 @@ assert.match(
 );
 
 state.images.push({ slot: 2, label: "", present: false, manual: true });
-widget.hmbCommitLocalPromptStructure(container, props, state, () => { remounts += 1; });
+widget.hmbCommitLocalPromptStructure(container, props, state, () => {
+  commitOrder.push("remount");
+  remounts += 1;
+  return state;
+});
 
 assert.equal(matchingEchoConsumed, true, "A matching synchronous props echo must be consumed.");
 assert.equal(remounts, 1, "A structural edit must repaint locally even when the host echo is consumed.");
+assert.deepEqual(commitOrder, ["remount", "emit"], "Structural feedback must paint before the host transaction.");
 assert.equal(JSON.parse(emitted).images.length, 2, "The locally repainted image row must also be persisted.");
 assert.equal(JSON.parse(emitted).images[1].manual, true);
 
@@ -109,8 +116,8 @@ assert.equal(JSON.parse(emitted).images.length, 1, "Deletion must repaint and pe
 
 assert.match(
   source,
-  /export function hmbCommitLocalPromptStructure[\s\S]*?hmbCaptureUiBeforeStateEmit\(container, state\);[\s\S]*?hmbEmitLocalPromptState\(container, props, state\);[\s\S]*?remount\(\)/,
-  "Structural commits must capture UI geometry, queue the local echo, persist, and remount in that order.",
+  /export function hmbCommitLocalPromptStructure[\s\S]*?hmbCaptureUiBeforeStateEmit\(container, state\);[\s\S]*?remount\(\)[\s\S]*?hmbEmitLocalPromptState\(container, props, committedState\)/,
+  "Structural commits must capture geometry, repaint locally, then persist through the host.",
 );
 assert.match(
   source,

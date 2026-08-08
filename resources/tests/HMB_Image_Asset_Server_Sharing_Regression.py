@@ -86,6 +86,27 @@ with tempfile.TemporaryDirectory(prefix="hmb_asset_share_", dir=TEMP_ROOT) as te
     registered_signature = asset_library._asset_manifest_signature(project_root)
     assert registered_signature != missing_signature
 
+    original_json_loads = asset_library.json.loads
+    manifest_parse_count = 0
+
+    def counted_json_loads(value, *args, **kwargs):
+        global manifest_parse_count
+        manifest_parse_count += 1
+        return original_json_loads(value, *args, **kwargs)
+
+    with asset_library._ASSET_MANIFEST_CACHE_LOCK:
+        asset_library._ASSET_MANIFEST_CACHE.clear()
+    asset_library.json.loads = counted_json_loads
+    try:
+        first_manifest = asset_library._read_asset_manifest(project_root)
+        second_manifest = asset_library._read_asset_manifest(project_root)
+    finally:
+        asset_library.json.loads = original_json_loads
+    assert first_manifest == second_manifest
+    assert manifest_parse_count == 1, (
+        "An unchanged manifest signature must reuse one parsed snapshot."
+    )
+
     registered_state = asset_library._load_project_catalog(catalog_root, prepared)
     hero_asset = next(
         item for item in registered_state["assets"] if item["relative_path"] == "Hero.png"
@@ -129,6 +150,12 @@ with tempfile.TemporaryDirectory(prefix="hmb_asset_share_", dir=TEMP_ROOT) as te
                 "scope": "Head / face only",
             },
         )
+        root_cache_key = asset_library._asset_manifest_cache_root_key(project_root)
+        with asset_library._ASSET_MANIFEST_CACHE_LOCK:
+            assert not any(
+                key[0] == root_cache_key
+                for key in asset_library._ASSET_MANIFEST_CACHE
+            ), "A local atomic manifest write must invalidate the old parsed snapshot."
         refreshed = node._apply_manifest_poll(registered_state)
         assert scan_count == 1
         assert refreshed["status"]["registered_asset_count"] == 2

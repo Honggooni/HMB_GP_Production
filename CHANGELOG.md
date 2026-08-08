@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.27 - 2026-08-08
+
+- Made Image Asset, Video Picker, and Prompt selections paint locally before
+  their authoritative host round trip, while preserving the existing state
+  schemas, parameter names, saved-workflow format, and Agent connection flow.
+- Removed large-grid listener/remount hot paths, cached immutable widget CSS
+  and manifest parses with bounded lifetimes, and coalesced repeated Prompt
+  output/resize work to eliminate click stalls and visible flicker.
+- Published the Image pair, `PICKER_OUT`, and `PROMPT_OUT` explicitly so every
+  connected Prompt/Agent consumer receives one coherent current snapshot;
+  generation settings and render behavior remain unchanged.
+- Added concurrency and no-loss regressions for stale host echoes, IME editing,
+  video source switching, command submission guards, output propagation, and
+  the complete four-library composition contract.
+
 ## 0.5.26 - 2026-08-08
 
 - Changed only the new Full Seedance 2.0 node default from 4K to the existing

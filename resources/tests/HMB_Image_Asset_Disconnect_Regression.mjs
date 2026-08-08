@@ -20,11 +20,11 @@ assert.equal(
 );
 
 const selectedHandler = source.match(
-  /on\(card\.querySelector\("\[data-remove-selected\]"\)[\s\S]*?compactSelectionOrder\(state\.assets\);/,
+  /on\(selectedTray, "click"[\s\S]*?\n  \}\);/,
 )?.[0] || "";
 assert.match(
   selectedHandler,
-  /externalImport[\s\S]*?state\.disconnect_import_uid = asset\.source_uid;[\s\S]*?state = emit\(props, state\);[\s\S]*?return;/,
+  /assetsByLibraryId\.get\(key\)[\s\S]*?externalImport[\s\S]*?state\.disconnect_import_uid = asset\.source_uid;[\s\S]*?state = emit\(props, state, container\);[\s\S]*?return;/,
   "An external X must request a graph disconnect and keep selection until acknowledgement.",
 );
 assert.match(

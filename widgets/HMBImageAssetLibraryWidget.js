@@ -54,6 +54,12 @@ const ROOT_FOLDER_KEY = "$root";
 const IMAGE_ASSET_STATE_VERSION = 4;
 const IMAGE_ASSET_AUTO_SYNC_MS = 10000;
 const IMAGE_ASSET_AUTO_SYNC_JITTER_MS = 2000;
+const IMAGE_ASSET_AUTO_SYNC_PENDING_MS = 5000;
+const IMAGE_ASSET_SELECTION_COMMIT_FALLBACK_MS = 120;
+let imageAssetWidgetMountSequence = 0;
+let imageAssetSelectionCommitSequence = 0;
+let imageAssetPublicationSequence = 0;
+const IMAGE_ASSET_TRANSPORT_RETRY_MS = 32;
 const UNCLASSIFIED_SOURCE_TYPES = new Set([
   "",
   "Role Required / Select Source Type",
@@ -499,6 +505,60 @@ function selectedAssets(state) {
     .sort((left, right) => left.selection_order - right.selection_order);
 }
 
+export function hmbImageAssetSelectionSnapshot(state) {
+  if (!state || !Array.isArray(state.assets)) return [];
+  return selectedAssets(state).map((asset) => ({
+    asset_library_id: clean(asset.asset_library_id),
+    selection_order: Math.max(0, Number(asset.selection_order) || 0),
+  }));
+}
+
+export function hmbMergeImageAssetSelectionDelta(
+  authoritativeValue,
+  baseSelection,
+  localValue,
+) {
+  const authoritative = normalizeState(authoritativeValue);
+  const local = normalizeState(localValue);
+  const baseById = new Map(
+    (Array.isArray(baseSelection) ? baseSelection : [])
+      .map((item) => [
+        clean(item?.asset_library_id),
+        Math.max(0, Number(item?.selection_order) || 0),
+      ])
+      .filter(([key]) => key),
+  );
+  const localById = new Map(
+    hmbImageAssetSelectionSnapshot(local)
+      .map((item) => [item.asset_library_id, item.selection_order]),
+  );
+  const authoritativeById = new Map(
+    authoritative.assets.map((asset) => [clean(asset.asset_library_id), asset]),
+  );
+  const changedKeys = new Set([...baseById.keys(), ...localById.keys()]);
+
+  changedKeys.forEach((key) => {
+    const asset = authoritativeById.get(key);
+    if (!asset) return;
+    const wasSelected = baseById.has(key);
+    const isSelected = localById.has(key);
+    if (wasSelected !== isSelected) {
+      asset.selected = isSelected && hmbImageAssetCanSelect(asset);
+      asset.selection_order = asset.selected ? localById.get(key) : 0;
+      return;
+    }
+    if (
+      isSelected
+      && asset.selected
+      && baseById.get(key) !== localById.get(key)
+    ) {
+      asset.selection_order = localById.get(key);
+    }
+  });
+  compactSelectionOrder(authoritative.assets);
+  return normalizeState(authoritative);
+}
+
 export function hmbImageAssetCanSelect(asset) {
   return Boolean(
     asset
@@ -523,12 +583,103 @@ export function hmbMoveSelectedAsset(state, sourceKey, targetKey) {
   return true;
 }
 
-function emit(props, state) {
+export function hmbPublishImageAssetState(
+  container,
+  props,
+  state,
+  onFailure = null,
+) {
+  hmbClearImageAssetTransportRetry(container);
   const normalized = normalizeState(state);
-  if (props && typeof props.onChange === "function") {
-    props.onChange(JSON.stringify(normalized));
-  }
+  const value = JSON.stringify(normalized);
+  const publicationToken = ++imageAssetPublicationSequence;
+  if (container) container.__hmbImageAssetPublicationOwner = publicationToken;
+  let attemptCount = 0;
+  const maxRetries = typeof onFailure === "function" ? 0 : 1;
+  const scheduleRetry = () => {
+    if (
+      !container
+      || container.__hmbImageAssetPublicationOwner !== publicationToken
+      || attemptCount > maxRetries
+      || typeof setTimeout !== "function"
+    ) {
+      return false;
+    }
+    const timer = setTimeout(() => {
+      if (container.__hmbImageAssetTransportRetryTimer !== timer) return;
+      container.__hmbImageAssetTransportRetryTimer = null;
+      if (container.__hmbImageAssetPublicationOwner !== publicationToken) return;
+      attemptPublish();
+    }, IMAGE_ASSET_TRANSPORT_RETRY_MS);
+    container.__hmbImageAssetTransportRetryTimer = timer;
+    return true;
+  };
+  const fail = (error) => {
+    if (!container || container.__hmbImageAssetPublicationOwner !== publicationToken) {
+      return false;
+    }
+    container.__hmbImageAssetLastPublishError = {
+      message: String(error?.message || error || "Image asset state publication failed"),
+      publicationToken,
+      at: Date.now(),
+    };
+    try { console?.error?.("[HMBImageAssetLibrary] state publication failed", error); } catch (_e) {}
+    if (typeof onFailure === "function") {
+      try { onFailure(error, normalized); } catch (_error) {}
+    } else {
+      // Generic semantic actions have already updated their local retained
+      // state. Retry the exact canonical payload once on the next task so a
+      // transient host transport failure cannot leave backend/output state old.
+      scheduleRetry();
+    }
+    return false;
+  };
+  const succeed = () => {
+    if (container?.__hmbImageAssetPublicationOwner === publicationToken) {
+      delete container.__hmbImageAssetLastPublishError;
+    }
+    return true;
+  };
+  const attemptPublish = () => {
+    if (!container || container.__hmbImageAssetPublicationOwner !== publicationToken) {
+      return false;
+    }
+    attemptCount += 1;
+    if (!props || typeof props.onChange !== "function") return succeed();
+    try {
+      const result = props.onChange(value);
+      if (result && typeof result.then === "function") {
+        Promise.resolve(result).then(succeed, fail);
+      } else {
+        succeed();
+      }
+    } catch (error) {
+      fail(error);
+    }
+    return true;
+  };
+  attemptPublish();
   return normalized;
+}
+
+function hmbClearImageAssetTransportRetry(container) {
+  if (!container) return false;
+  const timer = container.__hmbImageAssetTransportRetryTimer;
+  const hadTimer = timer !== null && timer !== undefined;
+  try { if (hadTimer) clearTimeout(timer); } catch (_error) {}
+  try { container.__hmbImageAssetTransportRetryTimer = null; } catch (_error) {}
+  return hadTimer;
+}
+
+export function hmbInvalidateImageAssetPublication(container) {
+  hmbClearImageAssetTransportRetry(container);
+  const publicationToken = ++imageAssetPublicationSequence;
+  if (container) container.__hmbImageAssetPublicationOwner = publicationToken;
+  return publicationToken;
+}
+
+function emit(props, state, container = null, onFailure = null) {
+  return hmbPublishImageAssetState(container, props, state, onFailure);
 }
 
 export function hmbDeferImageAssetPropsDuringRegistration(container, nextProps = {}) {
@@ -944,6 +1095,135 @@ function renderSelectedCard(asset, index, selected, state) {
       </div>
     </article>
   `;
+}
+
+export function hmbApplyImageAssetSelectionFeedback(container, state) {
+  if (!container || !state || !Array.isArray(state.assets)) return;
+  const selected = selectedAssets(state);
+  const selectedCount = selected.length;
+  state.status = {
+    ...(state.status || {}),
+    selected_count: selectedCount,
+  };
+  const assetsByLibraryId = new Map(
+    state.assets.map((asset) => [clean(asset.asset_library_id), asset]),
+  );
+
+  container.querySelectorAll?.("[data-asset-key]").forEach((card) => {
+    const asset = assetsByLibraryId.get(clean(card.getAttribute?.("data-asset-key")));
+    if (!asset) return;
+    const selectable = hmbImageAssetCanSelect(asset);
+    const selectionBlocked = selectable && !asset.selected && selectedCount >= MAX_SELECTED_IMAGES;
+    card.classList?.toggle("selected", Boolean(asset.selected));
+    card.classList?.toggle("selection-blocked", selectionBlocked);
+    card.setAttribute?.("data-selection-disabled", selectionBlocked ? "1" : "0");
+    if (selectable) {
+      card.setAttribute?.("aria-pressed", asset.selected ? "true" : "false");
+    }
+    const title = !selectable
+      ? imageAssetText(state, "register_before_select")
+      : selectionBlocked
+        ? imageAssetText(state, "image_limit")
+        : imageAssetText(state, "click_select");
+    card.setAttribute?.("title", title);
+  });
+
+  const trayCount = container.querySelector?.(".tray-head em");
+  if (trayCount) trayCount.textContent = `${selectedCount}/${MAX_SELECTED_IMAGES}`;
+  const tray = container.querySelector?.(".tray-scroll");
+  if (tray) {
+    const scrollLeft = Number(tray.scrollLeft || 0);
+    const reusableImages = detachReusableImageAssets(tray);
+    tray.innerHTML = selected
+      .map((asset, index) => renderSelectedCard(asset, index, selected, state))
+      .join("") || `<div class="tray-empty">${escapeHtml(imageAssetText(state, "tray_empty"))}</div>`;
+    restoreReusableImageAssets(tray, reusableImages);
+    tray.scrollLeft = scrollLeft;
+  }
+  const status = container.querySelector?.(".toolbar-status strong");
+  if (status && !state.error && !state.asset_registration_result?.message) {
+    const summary = hmbImageAssetStatusSummary(state);
+    status.textContent = summary;
+    status.setAttribute?.("title", summary);
+  }
+}
+
+function hmbCancelImageAssetSelectionJobHandles(job) {
+  if (!job) return;
+  if (job.fallbackTimer != null && typeof clearTimeout === "function") {
+    try { clearTimeout(job.fallbackTimer); } catch (_error) {}
+  }
+  if (typeof cancelAnimationFrame === "function") {
+    [job.firstFrame, job.secondFrame].forEach((handle) => {
+      if (handle == null) return;
+      try { cancelAnimationFrame(handle); } catch (_error) {}
+    });
+  }
+  job.fallbackTimer = null;
+  job.firstFrame = null;
+  job.secondFrame = null;
+}
+
+function hmbSettleImageAssetSelectionCommit(container, job, publish) {
+  if (!container || !job || job.settled) return false;
+  if (container.__hmbImageAssetSelectionCommitJob !== job) return false;
+  const currentMountToken = Number(container.__hmbImageAssetMountToken) || 0;
+  if (job.mountToken && currentMountToken !== job.mountToken) publish = false;
+  job.settled = true;
+  hmbCancelImageAssetSelectionJobHandles(job);
+  delete container.__hmbImageAssetSelectionCommitJob;
+  container.__hmbImageAssetSelectionCommitPending = false;
+  if (!publish) return false;
+  container.__hmbImageAssetSelectionCommitRunning = true;
+  try {
+    job.commit(job.token);
+  } finally {
+    container.__hmbImageAssetSelectionCommitRunning = false;
+  }
+  return true;
+}
+
+export function hmbCancelImageAssetSelectionCommit(container) {
+  const job = container && container.__hmbImageAssetSelectionCommitJob;
+  return hmbSettleImageAssetSelectionCommit(container, job, false);
+}
+
+export function hmbFlushImageAssetSelectionCommit(container) {
+  const job = container && container.__hmbImageAssetSelectionCommitJob;
+  return hmbSettleImageAssetSelectionCommit(container, job, true);
+}
+
+export function hmbScheduleImageAssetSelectionCommit(container, commit) {
+  if (!container || typeof commit !== "function") return 0;
+  hmbCancelImageAssetSelectionCommit(container);
+  const token = ++imageAssetSelectionCommitSequence;
+  const job = {
+    token,
+    mountToken: Number(container.__hmbImageAssetMountToken) || 0,
+    commit,
+    settled: false,
+    firstFrame: null,
+    secondFrame: null,
+    fallbackTimer: null,
+  };
+  container.__hmbImageAssetSelectionCommitJob = job;
+  container.__hmbImageAssetSelectionCommitPending = true;
+  const run = () => hmbSettleImageAssetSelectionCommit(container, job, true);
+  if (typeof setTimeout === "function") {
+    // requestAnimationFrame can stop entirely in a background tab. The bounded
+    // fallback preserves the click even when no paint callbacks are delivered.
+    job.fallbackTimer = setTimeout(run, IMAGE_ASSET_SELECTION_COMMIT_FALLBACK_MS);
+  }
+  if (typeof requestAnimationFrame === "function") {
+    // The first frame paints local card/tray feedback; the second publishes.
+    job.firstFrame = requestAnimationFrame(() => {
+      if (job.settled || container.__hmbImageAssetSelectionCommitJob !== job) return;
+      job.secondFrame = requestAnimationFrame(run);
+    });
+  } else if (job.fallbackTimer == null) {
+    run();
+  }
+  return token;
 }
 
 function displayWindowsPath(value) {
@@ -1396,6 +1676,9 @@ function installEvents(container, state, props, remount, listeners) {
   if (typeof window !== "undefined") on(window, "keydown", stopSelectedNodeDeleteShortcut, true);
   const stopInteriorNodeSelection = (event) => event.stopPropagation();
   on(container, "pointerdown", stopInteriorNodeSelection);
+  const assetsByLibraryId = new Map(
+    state.assets.map((asset) => [clean(asset.asset_library_id), asset]),
+  );
 
   const projectSelect = container.querySelector("[data-project-select]");
   on(projectSelect, "change", () => {
@@ -1409,7 +1692,7 @@ function installEvents(container, state, props, remount, listeners) {
     state.selected_main_type = "";
     state.selected_sub_type = "";
     state.selected_source_view = "project";
-    state = emit(props, state);
+    state = emit(props, state, container);
     remount(state);
   });
 
@@ -1417,14 +1700,14 @@ function installEvents(container, state, props, remount, listeners) {
     event.preventDefault();
     event.stopPropagation();
     state.language = imageAssetLanguage(state) === "ko" ? "en" : "ko";
-    state = emit(props, state);
+    state = emit(props, state, container);
     remount(state);
   });
   on(container.querySelector("[data-asset-view-toggle]"), "click", (event) => {
     event.preventDefault();
     event.stopPropagation();
     state.asset_view_mode = state.asset_view_mode === "detail" ? "image" : "detail";
-    state = emit(props, state);
+    state = emit(props, state, container);
     remount(state);
   });
   on(container.querySelector("[data-project-set]"), "click", (event) => {
@@ -1436,7 +1719,7 @@ function installEvents(container, state, props, remount, listeners) {
     event.preventDefault();
     event.stopPropagation();
     state.refresh_revision = Math.max(0, Number(state.refresh_revision) || 0) + 1;
-    state = emit(props, state);
+    state = emit(props, state, container);
     remount(state);
   });
 
@@ -1455,7 +1738,7 @@ function installEvents(container, state, props, remount, listeners) {
       else expanded.add(key);
       state.expanded_folders = [...expanded];
     }
-    state = emit(props, state);
+    state = emit(props, state, container);
     remount(state);
   };
   on(container, "click", onTreeClick);
@@ -1468,14 +1751,14 @@ function installEvents(container, state, props, remount, listeners) {
   });
   const commitSearch = () => {
     state.search = String(search?.value || "").slice(0, 256);
-    state = emit(props, state);
+    state = emit(props, state, container);
     delete container.__hmbImageAssetSearchDraft;
   };
   on(search, "change", commitSearch);
 
   container.querySelectorAll("[data-asset-key]").forEach((card) => {
     const key = clean(card.getAttribute("data-asset-key"));
-    const asset = state.assets.find((item) => item.asset_library_id === key);
+    const asset = assetsByLibraryId.get(key);
     if (!asset) return;
     on(card.querySelector("[data-asset-add]"), "click", (event) => {
       event.preventDefault();
@@ -1499,13 +1782,46 @@ function installEvents(container, state, props, remount, listeners) {
       if (!hmbImageAssetCanSelect(asset)) return;
       const selected = selectedAssets(state);
       if (!asset.selected && selected.length >= MAX_SELECTED_IMAGES) return;
+      // A visible newer click owns transport recovery immediately, even before
+      // its two-frame publication. An older Promise rejection cannot roll it back.
+      hmbInvalidateImageAssetPublication(container);
+      if (!container.__hmbImageAssetSelectionCommitPending) {
+        container.__hmbImageAssetSelectionBase = hmbImageAssetSelectionSnapshot(state);
+        container.__hmbImageAssetSelectionBaseState = normalizeState(state);
+        container.__hmbImageAssetSelectionBaseValue = JSON.stringify(
+          container.__hmbImageAssetSelectionBaseState,
+        );
+      }
       asset.selected = !asset.selected;
       asset.selection_order = asset.selected
         ? Math.max(0, ...selected.map((item) => item.selection_order)) + 1
         : 0;
       compactSelectionOrder(state.assets);
-      state = emit(props, state);
-      remount(state);
+      hmbApplyImageAssetSelectionFeedback(container, state);
+      hmbScheduleImageAssetSelectionCommit(container, () => {
+        const pending = container.__hmbImageAssetPendingAuthoritativeProps;
+        const baseSelection = container.__hmbImageAssetSelectionBase || [];
+        const baseState = container.__hmbImageAssetSelectionBaseState || normalizeState(state);
+        delete container.__hmbImageAssetPendingAuthoritativeProps;
+        delete container.__hmbImageAssetSelectionBase;
+        delete container.__hmbImageAssetSelectionBaseState;
+        delete container.__hmbImageAssetSelectionBaseValue;
+        let publishedState = state;
+        let rollbackState = baseState;
+        if (pending) {
+          const merged = hmbMergeImageAssetSelectionDelta(
+            pending.state,
+            baseSelection,
+            state,
+          );
+          if (JSON.stringify(merged) !== JSON.stringify(state)) remount(merged);
+          publishedState = merged;
+          rollbackState = pending.state;
+        }
+        emit(props, publishedState, container, () => {
+          remount(rollbackState);
+        });
+      });
     };
     on(card, "click", (event) => {
       if (event.target?.closest?.("input,button,select,textarea,a")) return;
@@ -1620,7 +1936,7 @@ function installEvents(container, state, props, remount, listeners) {
     const returnFocus = container.__hmbImageAssetRegistrationReturnFocus;
     delete container.__hmbImageAssetRegistrationDraft;
     delete container.__hmbImageAssetRegistrationReturnFocus;
-    state = emit(deferredProps || props, state);
+    state = emit(deferredProps || props, state, container);
     remount(state);
     restoreRegistrationOpener(returnFocus);
   });
@@ -1650,87 +1966,103 @@ function installEvents(container, state, props, remount, listeners) {
     }
   });
 
-  container.querySelectorAll("img").forEach((image) => {
-    on(image, "error", () => {
-      image.closest?.(".asset-thumb,.selected-thumb,.passport-photo")?.classList?.add("fallback");
-    }, { once: true });
-  });
+  on(container, "error", (event) => {
+    const image = event.target;
+    if (!image?.matches?.("img")) return;
+    image.closest?.(".asset-thumb,.selected-thumb,.passport-photo")?.classList?.add("fallback");
+  }, true);
 
   let draggedKey = "";
-  container.querySelectorAll("[data-selected-key]").forEach((card) => {
+  const selectedTray = container.querySelector(".tray-scroll");
+  const selectedCardForEvent = (event) => {
+    const card = event.target?.closest?.("[data-selected-key]");
+    return card && selectedTray?.contains?.(card) ? card : null;
+  };
+  on(selectedTray, "dragstart", (event) => {
+    const card = selectedCardForEvent(event);
+    if (!card) return;
     const key = clean(card.getAttribute("data-selected-key"));
-    on(card, "dragstart", (event) => {
-      draggedKey = key;
-      container.__hmbImageAssetDragging = true;
-      card.classList.add("dragging");
-      try {
-        event.dataTransfer.effectAllowed = "move";
-        event.dataTransfer.setData("text/plain", key);
-      } catch (_error) {}
+    draggedKey = key;
+    container.__hmbImageAssetDragging = true;
+    card.classList.add("dragging");
+    try {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", key);
+    } catch (_error) {}
+  });
+  on(selectedTray, "dragend", () => {
+    draggedKey = "";
+    container.__hmbImageAssetDragging = false;
+    selectedTray?.querySelectorAll?.("[data-selected-key]").forEach((item) => {
+      item.classList.remove("dragging", "drop-target");
     });
-    on(card, "dragend", () => {
-      draggedKey = "";
-      container.__hmbImageAssetDragging = false;
-      container.querySelectorAll("[data-selected-key]").forEach((item) => {
-        item.classList.remove("dragging", "drop-target");
-      });
-    });
-    on(card, "dragover", (event) => {
-      event.preventDefault();
-      if (draggedKey && draggedKey !== key) card.classList.add("drop-target");
-    });
-    on(card, "dragleave", () => card.classList.remove("drop-target"));
-    on(card, "drop", (event) => {
-      event.preventDefault();
-      container.__hmbImageAssetDragging = false;
-      card.classList.remove("drop-target");
-      const sourceKey = draggedKey || clean(event.dataTransfer?.getData?.("text/plain"));
-      if (!sourceKey || sourceKey === key || !hmbMoveSelectedAsset(state, sourceKey, key)) return;
-      state = emit(props, state);
-      remount(state);
-    });
-    on(card.querySelector("[data-remove-selected]"), "click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      const asset = state.assets.find((item) => item.asset_library_id === key);
-      if (!asset) return;
+  });
+  on(selectedTray, "dragover", (event) => {
+    const card = selectedCardForEvent(event);
+    if (!card) return;
+    event.preventDefault();
+    const key = clean(card.getAttribute("data-selected-key"));
+    if (draggedKey && draggedKey !== key) card.classList.add("drop-target");
+  });
+  on(selectedTray, "dragleave", (event) => {
+    selectedCardForEvent(event)?.classList?.remove("drop-target");
+  });
+  on(selectedTray, "drop", (event) => {
+    const card = selectedCardForEvent(event);
+    if (!card) return;
+    event.preventDefault();
+    container.__hmbImageAssetDragging = false;
+    card.classList.remove("drop-target");
+    const key = clean(card.getAttribute("data-selected-key"));
+    const sourceKey = draggedKey || clean(event.dataTransfer?.getData?.("text/plain"));
+    if (!sourceKey || sourceKey === key || !hmbMoveSelectedAsset(state, sourceKey, key)) return;
+    state = emit(props, state, container);
+    remount(state);
+  });
+  on(selectedTray, "click", (event) => {
+    const action = event.target?.closest?.("[data-remove-selected],[data-move]");
+    const card = selectedCardForEvent(event);
+    if (!action || !card) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const key = clean(card.getAttribute("data-selected-key"));
+    const asset = assetsByLibraryId.get(key);
+    if (!asset) return;
+    if (action.matches?.("[data-remove-selected]")) {
       const externalImport = asset.source_kind === "user" && Number(asset.import_index || 0) > 0;
       if (externalImport) {
         if (state.disconnect_import_uid) return;
         state.disconnect_import_uid = asset.source_uid;
         state.error = "";
-        state = emit(props, state);
+        state = emit(props, state, container);
         remount(state);
         return;
       }
       asset.selected = false;
       asset.selection_order = 0;
       compactSelectionOrder(state.assets);
-      state = emit(props, state);
+      state = emit(props, state, container);
       remount(state);
+      return;
+    }
+    const direction = Number.parseInt(action.getAttribute("data-move") || "0", 10);
+    const ordered = selectedAssets(state);
+    const index = ordered.findIndex((item) => item.asset_library_id === key);
+    const target = index + direction;
+    if (index < 0 || target < 0 || target >= ordered.length) return;
+    [ordered[index], ordered[target]] = [ordered[target], ordered[index]];
+    ordered.forEach((item, order) => {
+      item.selection_order = order + 1;
     });
-    card.querySelectorAll("[data-move]").forEach((button) => {
-      on(button, "click", () => {
-        const direction = Number.parseInt(button.getAttribute("data-move") || "0", 10);
-        const ordered = selectedAssets(state);
-        const index = ordered.findIndex((asset) => asset.asset_library_id === key);
-        const target = index + direction;
-        if (index < 0 || target < 0 || target >= ordered.length) return;
-        [ordered[index], ordered[target]] = [ordered[target], ordered[index]];
-        ordered.forEach((asset, order) => {
-          asset.selection_order = order + 1;
-        });
-        state = emit(props, state);
-        remount(state);
-      });
-    });
+    state = emit(props, state, container);
+    remount(state);
   });
 
   const syncNativeRoot = () => {
     const nativePath = clean(nativeProjectRootValue(container)).replaceAll("\\", "/");
     if (!nativePath || nativePath.toLowerCase() === state.catalog_root.toLowerCase()) return;
     state.catalog_root = nativePath;
-    state = emit(props, state);
+    state = emit(props, state, container);
     remount(state);
   };
   const nodeRoot = findNodeRoot(container);
@@ -1758,11 +2090,17 @@ export default function HMBImageAssetLibraryWidget(container, props) {
   }
   const previousCleanup = container.__hmbImageAssetCleanup;
   if (typeof previousCleanup === "function") previousCleanup();
+  const mountToken = ++imageAssetWidgetMountSequence;
+  container.__hmbImageAssetMountToken = mountToken;
   container.setAttribute?.("data-hmb-node-delete-protected", "true");
   let state = normalizeState(props?.value);
   let listeners = [];
   let autoSyncTimer = null;
+  let autoSyncPendingUntil = 0;
+  let autoSyncRequestSequence = 0;
+  let autoSyncActiveRequest = 0;
   let disposed = false;
+  let renderRevision = 0;
   const autoSyncListeners = [];
 
   const clearListeners = () => {
@@ -1775,6 +2113,17 @@ export default function HMBImageAssetLibraryWidget(container, props) {
   };
 
   const remount = (nextState = state) => {
+    const revisionBeforeFlush = renderRevision;
+    if (
+      container.__hmbImageAssetSelectionCommitPending
+      && !container.__hmbImageAssetSelectionCommitRunning
+    ) {
+      hmbFlushImageAssetSelectionCommit(container);
+      // An authoritative selection merge can perform the required remount from
+      // inside the flushed job. Do not then paint the stale outer snapshot.
+      if (renderRevision !== revisionBeforeFlush) return state;
+    }
+    renderRevision += 1;
     const uiMemory = captureImageAssetUi(container, state);
     const reusableImages = detachReusableImageAssets(container);
     container.__hmbImageAssetDragging = false;
@@ -1800,12 +2149,34 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     concealNativeProjectRootPicker(container);
     installEvents(container, state, props, remount, listeners);
     restoreImageAssetUi(container, state, uiMemory);
+    return state;
   };
 
   const applyProps = (nextProps = {}) => {
+    hmbInvalidateImageAssetPublication(container);
+    autoSyncRequestSequence += 1;
+    autoSyncActiveRequest = 0;
+    if (container.__hmbImageAssetSelectionCommitPending) {
+      // Preserve the latest authoritative snapshot and merge only the local
+      // selection delta into it when the optimistic click is published.
+      autoSyncPendingUntil = 0;
+      props = nextProps || {};
+      const nextState = normalizeState(nextProps?.value);
+      const baseValue = clean(container.__hmbImageAssetSelectionBaseValue);
+      if (baseValue && JSON.stringify(nextState) === baseValue) {
+        // This is the exact pre-click echo. It carries no new authority and
+        // must not replace a newer backend/manifest snapshot already queued.
+        return;
+      }
+      container.__hmbImageAssetPendingAuthoritativeProps = {
+        state: nextState,
+      };
+      return;
+    }
     const nextState = normalizeState(nextProps?.value);
-    const currentValue = JSON.stringify(normalizeState(state));
+    const currentValue = JSON.stringify(state);
     const nextValue = JSON.stringify(nextState);
+    autoSyncPendingUntil = 0;
     props = nextProps || {};
     if (currentValue === nextValue) return;
     if (hmbDeferImageAssetPropsDuringRegistration(container, props)) return;
@@ -1834,14 +2205,59 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     && !(typeof navigator !== "undefined" && navigator.onLine === false)
     && !container.__hmbImageAssetRegistrationDraft
     && !container.__hmbImageAssetDragging
+    && !container.__hmbImageAssetSelectionCommitPending
   );
   function runAutoSync() {
     autoSyncTimer = null;
-    if (!disposed && canAutoSync() && typeof props?.onChange === "function") {
-      const nonce = `manifest-poll-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-      props.onChange(hmbImageAssetAutoSyncPayload(state, nonce));
+    const now = Date.now();
+    let nextDelay = null;
+    try {
+      if (
+        !disposed
+        && canAutoSync()
+        && now >= autoSyncPendingUntil
+        && typeof props?.onChange === "function"
+      ) {
+        const nonce = `manifest-poll-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        const requestToken = ++autoSyncRequestSequence;
+        autoSyncActiveRequest = requestToken;
+        autoSyncPendingUntil = now + IMAGE_ASSET_AUTO_SYNC_PENDING_MS;
+        const settle = (error = null) => {
+          if (disposed || autoSyncActiveRequest !== requestToken) return false;
+          autoSyncActiveRequest = 0;
+          if (error) {
+            autoSyncPendingUntil = Date.now() + 1000;
+            container.__hmbImageAssetAutoSyncError = String(error?.message || error);
+            scheduleAutoSync(1000);
+          } else {
+            autoSyncPendingUntil = 0;
+            delete container.__hmbImageAssetAutoSyncError;
+          }
+          return true;
+        };
+        try {
+          const result = props.onChange(hmbImageAssetAutoSyncPayload(state, nonce));
+          if (result && typeof result.then === "function") {
+            Promise.resolve(result).then(
+              () => settle(),
+              (error) => settle(error),
+            );
+          } else {
+            settle();
+          }
+        } catch (error) {
+          if (autoSyncActiveRequest === requestToken) {
+            autoSyncActiveRequest = 0;
+            autoSyncPendingUntil = Date.now() + 1000;
+            container.__hmbImageAssetAutoSyncError = String(error?.message || error);
+            nextDelay = 1000;
+          }
+        }
+      }
+    } finally {
+      // A transport exception must never terminate the polling loop.
+      scheduleAutoSync(nextDelay);
     }
-    scheduleAutoSync();
   }
   const wakeAutoSync = () => {
     if (canAutoSync()) scheduleAutoSync(250);
@@ -1869,7 +2285,17 @@ export default function HMBImageAssetLibraryWidget(container, props) {
   }
 
   const cleanup = () => {
+    hmbInvalidateImageAssetPublication(container);
+    autoSyncRequestSequence += 1;
+    autoSyncActiveRequest = 0;
+    try { hmbFlushImageAssetSelectionCommit(container); } catch (_error) {
+      hmbCancelImageAssetSelectionCommit(container);
+    }
+    // The flush can start a fresh asynchronous publication.  Teardown owns a
+    // later token so its eventual rejection cannot repaint disposed DOM.
+    hmbInvalidateImageAssetPublication(container);
     disposed = true;
+    autoSyncPendingUntil = 0;
     clearAutoSyncTimer();
     autoSyncListeners.forEach(([target, type, handler]) => {
       try {
@@ -1891,6 +2317,17 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     delete container.__hmbImageAssetRegistrationDraft;
     delete container.__hmbImageAssetRegistrationReturnFocus;
     delete container.__hmbImageAssetDeferredProps;
+    delete container.__hmbImageAssetSelectionCommitPending;
+    delete container.__hmbImageAssetSelectionCommitRunning;
+    delete container.__hmbImageAssetSelectionCommitJob;
+    delete container.__hmbImageAssetSelectionBase;
+    delete container.__hmbImageAssetSelectionBaseState;
+    delete container.__hmbImageAssetSelectionBaseValue;
+    delete container.__hmbImageAssetPendingAuthoritativeProps;
+    delete container.__hmbImageAssetAutoSyncError;
+    if (Number(container.__hmbImageAssetMountToken) === mountToken) {
+      delete container.__hmbImageAssetMountToken;
+    }
     container.removeAttribute?.("data-hmb-node-delete-protected");
     container.innerHTML = "";
   };
