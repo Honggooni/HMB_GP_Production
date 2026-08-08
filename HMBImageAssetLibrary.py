@@ -4220,7 +4220,7 @@ class HMBImageAssetLibrary(DataNode):
             self._apply_import_value(import_value)
         return result
 
-    def process(self):
+    def process(self) -> None:
         self._ensure_parameters()
         root_value = _project_root_text(
             _get_parameter_raw(self, PROJECT_ROOT_PARAMETER)
@@ -4228,19 +4228,5 @@ class HMBImageAssetLibrary(DataNode):
         state = self._load_catalog(root_value or str(DEFAULT_PROJECTS_ROOT))
         import_value = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
         if _flatten_import_values(import_value):
-            state = self._apply_import_value(import_value)
-        output_payload, media_values = _build_synchronized_outputs(
-            state,
-            self._hmb_import_media_by_uid,
-        )
-        return {
-            "project_id": state.get("project_id", ""),
-            "asset_count": state.get("status", {}).get("asset_count", 0),
-            "selected_count": state.get("status", {}).get("selected_count", 0),
-            "media_count": len(media_values),
-            "unresolved_media_count": output_payload["media_resolution"][
-                "unresolved_count"
-            ],
-            "warnings": list(output_payload.get("warnings", [])),
-            "mode": "image_asset",
-        }
+            self._apply_import_value(import_value)
+        return None

@@ -7583,11 +7583,7 @@ class HMBPromptLibrary(DataNode):
         self._restore_picker_connection_state()
         return result
 
-    def process(self):
+    def process(self) -> None:
         self._ensure_prompt_output()
-        state = self._sync_prompt_output_from_state()
-        return {
-            "active_images": state.get("status", {}).get("active_images", 0),
-            "active_videos": state.get("status", {}).get("active_videos", 0),
-            "mode": MODE_NAME,
-        }
+        self._sync_prompt_output_from_state()
+        return None

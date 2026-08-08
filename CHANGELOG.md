@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.5.26 - 2026-08-08
+
+- Changed only the new Full Seedance 2.0 node default from 4K to the existing
+  `1080p` (1K) option. Explicitly saved 4K selections remain supported, and
+  the selected value is passed unchanged through Broker validation to
+  Volcengine.
+- Removed Griptape `process() returned unexpected type: dict` warnings from the
+  Image Asset, Video Picker, and Prompt data nodes while preserving their real
+  output-parameter payloads.
+- Prevented Refresh from overwriting an active Seedance render status while the
+  Broker submission is still waiting for its task ID.
+
+- Fixed FN AI Broker HTTP 400 failures caused by embedded reference media.
+  Seedance generation requests now share a tested 64 MiB client/server limit;
+  ordinary API endpoints retain their 2 MiB limit.
+- Aligned media-only Full/Fast/Mini generation, smart duration `-1`, and
+  first/last-frame validation across HMB, the Broker schema, and the Volcengine
+  payload adapter.
+- Added credential-safe HTTP 400/413 classification. Response bodies, provider
+  keys, and tokens are never copied into node state or logs.
+- Added a real HTTP regression with a Base64 reference payload larger than
+  2 MiB, while keeping the billable Volcengine call stubbed.
+
 ## 0.5.25 - 2026-08-07
 
 - Expanded the FN AI Broker generation contract to the exact Volcengine

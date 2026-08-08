@@ -149,7 +149,7 @@ MODEL_RESOLUTIONS = {
 }
 
 MODEL_DEFAULT_RESOLUTIONS = {
-    SEEDANCE_2_0_MODEL_ID: "4k",
+    SEEDANCE_2_0_MODEL_ID: "1080p",
     SEEDANCE_2_0_FAST_MODEL_ID: "720p",
     SEEDANCE_2_0_MINI_MODEL_ID: "720p",
 }
@@ -610,10 +610,6 @@ class _HMBAIBrokerBridge:
         SEEDANCE_2_0_MINI_MODEL_ID: _COMMON_SEEDANCE_FIELDS
         | _REFERENCE_MODE_FIELDS,
     }
-    _PROMPT_REQUIRED_MODELS: frozenset[str] = frozenset(
-        {SEEDANCE_2_0_MODEL_ID, SEEDANCE_2_0_MINI_MODEL_ID}
-    )
-
     def __init__(self, *, opener: Any | None = None) -> None:
         self._opener = opener or urllib.request.build_opener(
             _BrokerNoRedirectHandler()
@@ -650,15 +646,33 @@ class _HMBAIBrokerBridge:
     @classmethod
     def _safe_http_error_message(cls, exc: urllib.error.HTTPError) -> str:
         status_code = int(getattr(exc, "code", 0) or 0)
-        if status_code != 400:
-            return f"FN AI Broker request failed with HTTP {status_code}."
         try:
             body = exc.read(cls._MAX_ERROR_CLASSIFICATION_BYTES + 1)
         except Exception:
             body = b""
         if len(body) > cls._MAX_ERROR_CLASSIFICATION_BYTES:
             body = b""
+        try:
+            detail = json.loads(body or b"{}")
+        except (UnicodeError, json.JSONDecodeError):
+            detail = {}
+        error_code = (
+            str(detail.get("error_code") or "").strip().casefold()
+            if isinstance(detail, dict)
+            else ""
+        )
         lowered = body.decode("utf-8", "replace").casefold()
+        if status_code == 413 or error_code == "request_body_too_large" or any(
+            token in lowered
+            for token in ("request body", "too large", "payload", "너무 큽")
+        ):
+            return (
+                "FN AI Broker rejected an oversized reference-media request "
+                f"(HTTP {status_code}). Update/restart the Broker media build or "
+                "reduce embedded image/audio data."
+            )
+        if status_code != 400:
+            return f"FN AI Broker request failed with HTTP {status_code}."
         if any(
             token in lowered
             for token in (
@@ -690,6 +704,11 @@ class _HMBAIBrokerBridge:
             return (
                 "FN AI Broker rejected the generation settings (HTTP 400). "
                 "Check duration, resolution, ratio, and audio settings."
+            )
+        if "prompt" in lowered:
+            return (
+                "FN AI Broker rejected the prompt/content combination (HTTP 400). "
+                "Provide a prompt or supported reference media."
             )
         if "model" in lowered:
             return "FN AI Broker rejected the selected model (HTTP 400)."
@@ -807,12 +826,6 @@ class _HMBAIBrokerBridge:
         if model_fields is None:
             raise _BrokerProtocolError(
                 "Selected Seedance model is not supported by the HMB Broker contract."
-            )
-        if model in self._PROMPT_REQUIRED_MODELS and not str(
-            request_payload.get("prompt") or ""
-        ).strip():
-            raise _BrokerProtocolError(
-                "The selected FN AI Broker Seedance model requires a prompt."
             )
         priority = request_payload.get("priority")
         if model != SEEDANCE_2_0_MODEL_ID and priority not in (None, 0):
@@ -938,6 +951,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         self._broker_action_running = False
         self._generation_refresh_lock = threading.Lock()
         self._generation_refresh_running = False
+        self._generation_run_active = threading.Event()
 
         self.add_parameter(
             ParameterString(
@@ -945,7 +959,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
                 default_value=MODEL_NAME_SEEDANCE_2_0,
                 tooltip=(
                     "Volcengine Seedance 2.0 model. The full model defaults to "
-                    "4K; Fast and Mini support up to 720p."
+                    "1080p (1K); Fast and Mini support up to 720p."
                 ),
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
                 traits={
@@ -1130,9 +1144,9 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         with ParameterGroup(name="Generation Settings") as generation_settings:
             ParameterString(
                 name="resolution",
-                default_value="4k",
+                default_value=MODEL_DEFAULT_RESOLUTIONS[SEEDANCE_2_0_MODEL_ID],
                 tooltip=(
-                    "Full Seedance 2.0 defaults to 4K. Fast and Mini support "
+                    "Full Seedance 2.0 defaults to 1080p (1K). Fast and Mini support "
                     "480p and 720p."
                 ),
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
@@ -1678,7 +1692,9 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
             "reference_audio": self._get_list_input("reference_audio"),
             "resolution": str(
                 self.get_parameter_value("resolution")
-                or MODEL_DEFAULT_RESOLUTIONS.get(model_id, "4k")
+                or MODEL_DEFAULT_RESOLUTIONS.get(
+                    model_id, MODEL_DEFAULT_RESOLUTIONS[SEEDANCE_2_0_MODEL_ID]
+                )
             ),
             "ratio": str(self.get_parameter_value("ratio") or "adaptive"),
             "duration": self.get_parameter_value("duration"),
@@ -2312,6 +2328,8 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
                 raise ValueError(
                     "First/Last Frame mode does not accept multimodal reference lists."
                 )
+            if params["last_frame"] and not params["first_frame"]:
+                raise ValueError("Last Frame requires First Frame to be connected first.")
             if not has_frames and not params["prompt"].strip():
                 raise ValueError(
                     "First/Last Frame mode requires a prompt or at least one frame."
@@ -3838,13 +3856,14 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
     async def _refresh_async(self) -> None:
         """Refresh one Broker job without ever creating a replacement task."""
         try:
-            bridge = await self._ensure_broker_connected()
             generation_id = str(
                 self.parameter_output_values.get("generation_id")
                 or self.get_parameter_value("resume_generation_id")
                 or ""
             ).strip()
             if not generation_id:
+                if self._generation_run_active.is_set():
+                    return
                 self._set_status_results(
                     was_successful=False,
                     result_details=(
@@ -3853,6 +3872,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
                     ),
                 )
                 return
+            bridge = await self._ensure_broker_connected()
             generation_id = self._validate_task_id(generation_id)
             response = await asyncio.to_thread(
                 bridge.refresh_job,
@@ -4229,6 +4249,13 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         await self._save_completed_task(final_task, generation_id, destination)
 
     async def aprocess(self) -> None:
+        self._generation_run_active.set()
+        try:
+            await self._aprocess_impl()
+        finally:
+            self._generation_run_active.clear()
+
+    async def _aprocess_impl(self) -> None:
         self._clear_execution_status()
         try:
             await self._process_generation()

@@ -14689,7 +14689,7 @@ class HMBVideoPickerLibrary(DataNode):
             ),
         }
 
-    def process(self):
+    def process(self) -> None:
         """Refresh Picker/Video outputs without starting Maya or FFmpeg.
 
         Playblast is an explicit dashboard-button action.  A downstream graph run
@@ -14698,30 +14698,5 @@ class HMBVideoPickerLibrary(DataNode):
         """
         self._ensure_parameters()
         state = self._apply_selected_view_fields(self._picker_state())
-        picker_text = self._sync_outputs_from_state(state)
-        return {
-            "mode": "maya",
-            "action": "sync_outputs",
-            "active_slot_count": int(state.get("selected_video_count") or 0),
-            "selected_video_count": int(state.get("selected_video_count") or 0),
-            "catalog_video_count": len(
-                [item for item in state.get("videos", []) if isinstance(item, dict)]
-            ),
-            "selected_video_slot": int(state.get("selected_video_slot") or 1),
-            "video_count": len(
-                [
-                    item
-                    for item in state.get("videos", [])
-                    if isinstance(item, dict)
-                    and any(
-                        _clean(item.get(field))
-                        for field in (
-                            "project_video_path",
-                            "video_path",
-                            "video_url",
-                        )
-                    )
-                ]
-            ),
-            "picker": picker_text,
-        }
+        self._sync_outputs_from_state(state)
+        return None

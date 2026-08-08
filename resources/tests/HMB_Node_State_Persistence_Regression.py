@@ -25,6 +25,11 @@ def load(name: str):
 picker = load("HMBVideoPickerLibrary")
 prompt = load("HMBPromptLibrary")
 
+# This regression validates serialization, not filesystem availability. Treat
+# its synthetic Windows references as readable so runtime media preflight does
+# not replace the state-persistence assertion with a missing-file failure.
+picker._resolve_readable_video_reference = lambda reference: Path(str(reference))
+
 
 # Simulate Griptape's load order: construct a fresh node, then assign the
 # serialized property value from the saved workflow.
@@ -208,10 +213,11 @@ picker_node._maya_mode = forbidden_playblast
 before_run = copy.deepcopy(picker_node._picker_state())
 run_result = picker_node.process()
 after_run = picker_node._picker_state()
-assert run_result["action"] == "sync_outputs"
-assert run_result["active_slot_count"] == 3
-assert run_result["selected_video_slot"] == 2
-assert run_result["video_count"] == 3
+assert run_result is None
+run_payload = json.loads(picker_node.parameter_output_values["PICKER_OUT"])
+assert run_payload["active_slot_count"] == 3
+assert after_run["selected_video_slot"] == 2
+assert len(run_payload["videos"]) == 3
 assert after_run["workspace_view"] == before_run["workspace_view"]
 assert after_run["node_width"] == before_run["node_width"]
 assert after_run["node_height"] == before_run["node_height"]

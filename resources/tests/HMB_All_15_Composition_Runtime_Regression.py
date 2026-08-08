@@ -250,15 +250,20 @@ try:
 
             if "I" in composition:
                 image_node = image.HMBImageAssetLibrary(name=f"all15_image_{label}")
-                image_output = image_node.process()
+                assert image_node.process() is None
+                image_output = json.loads(
+                    image_node.parameter_output_values[image.OUTPUT_PARAMETER]
+                )
                 assert image_output["mode"] == "image_asset", label
                 outputs["I"] = image_output
 
             if "V" in composition:
                 video_node = video.HMBVideoPickerLibrary(name=f"all15_video_{label}")
-                video_output = video_node.process()
+                assert video_node.process() is None
+                video_output = json.loads(
+                    video_node.parameter_output_values["PICKER_OUT"]
+                )
                 assert video_output["mode"] == "maya", label
-                assert video_output["action"] == "sync_outputs", label
                 outputs["V"] = video_output
 
             compiled = ""

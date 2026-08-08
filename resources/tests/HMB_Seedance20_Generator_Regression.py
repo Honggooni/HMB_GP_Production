@@ -409,7 +409,18 @@ def assert_constructor_and_public_contract() -> None:
     assert audio_parameter._max_items == 3
     assert node.get_parameter_value("auto_publish_local_videos") is True
     assert node.get_parameter_value("model_id") == target.MODEL_NAME_SEEDANCE_2_0
-    assert node.get_parameter_value("resolution") == "4k"
+    assert node.get_parameter_value("resolution") == "1080p"
+    assert (
+        node.get_parameter_value("input_mode")
+        == target.INPUT_MODE_MULTIMODAL_REFERENCES
+    )
+    assert node.get_parameter_by_name("input_mode").ui_options[
+        "simple_dropdown"
+    ] == [
+        target.INPUT_MODE_TEXT_ONLY,
+        target.INPUT_MODE_FIRST_LAST_FRAME,
+        target.INPUT_MODE_MULTIMODAL_REFERENCES,
+    ]
     assert target.BROKER_SUPPORTED_MODEL_IDS == frozenset(
         {
             target.SEEDANCE_2_0_MODEL_ID,
@@ -418,7 +429,7 @@ def assert_constructor_and_public_contract() -> None:
         }
     )
     assert target.MODEL_DEFAULT_RESOLUTIONS == {
-        target.SEEDANCE_2_0_MODEL_ID: "4k",
+        target.SEEDANCE_2_0_MODEL_ID: "1080p",
         target.SEEDANCE_2_0_FAST_MODEL_ID: "720p",
         target.SEEDANCE_2_0_MINI_MODEL_ID: "720p",
     }
@@ -433,6 +444,23 @@ def assert_constructor_and_public_contract() -> None:
     assert node.get_parameter_by_name("resolution").ui_options[
         "simple_dropdown"
     ] == ["4k", "1080p", "720p", "480p"]
+    assert node.get_parameter_value("ratio") == "adaptive"
+    assert node.get_parameter_by_name("ratio").ui_options["simple_dropdown"] == list(
+        target.RATIOS
+    )
+    assert node.get_parameter_value("duration") == 5
+    assert node.get_parameter_by_name("duration").ui_options["simple_dropdown"] == [
+        -1,
+        *range(4, 16),
+    ]
+    assert node.get_parameter_value("generate_audio") is False
+    assert node.get_parameter_value("resume_generation_id") == ""
+    assert node.get_parameter_value("watermark") is False
+    assert node.get_parameter_value("return_last_frame") is False
+    assert node.get_parameter_value("execution_expires_after") == 172800
+    assert node.get_parameter_value("priority") == 0
+    assert node.get_parameter_value("poll_interval_seconds") == 30
+    assert node.get_parameter_value("generation_timeout_seconds") == 3600
     node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0_FAST)
     assert node.get_parameter_value("resolution") == "720p"
     assert node.get_parameter_by_name("resolution").ui_options[
@@ -1235,6 +1263,25 @@ def assert_payload_and_media_contract() -> None:
     else:
         raise AssertionError("Four reference audio files were accepted")
 
+    params = node._get_parameters()
+    params.update(
+        {
+            "input_mode": target.INPUT_MODE_FIRST_LAST_FRAME,
+            "prompt": "",
+            "first_frame": None,
+            "last_frame": "https://cdn.example/last.png",
+            "reference_images": [],
+            "video_references": [],
+            "reference_audio": [],
+        }
+    )
+    try:
+        node._validate_parameters(params)
+    except ValueError as exc:
+        assert "Last Frame requires First Frame" in str(exc)
+    else:
+        raise AssertionError("Last Frame without First Frame was accepted")
+
 
 def assert_broker_generation_contract() -> None:
     status_cases = {
@@ -1268,6 +1315,19 @@ def assert_broker_generation_contract() -> None:
     safe_error_message = bridge_contract._safe_http_error_message(settings_error)
     assert "generation settings" in safe_error_message
     assert "secret-canary" not in safe_error_message
+
+    oversized_error = target.urllib.error.HTTPError(
+        "http://broker.invalid/api/v1/generate/video",
+        413,
+        "Payload Too Large",
+        {},
+        io.BytesIO(
+            b'{"error_code":"request_body_too_large","token":"secret-canary"}'
+        ),
+    )
+    oversized_message = bridge_contract._safe_http_error_message(oversized_error)
+    assert "oversized reference-media request" in oversized_message
+    assert "secret-canary" not in oversized_message
 
     fast_payload = {
         "provider": "volcengine_ark",
@@ -1360,14 +1420,27 @@ def assert_broker_generation_contract() -> None:
             supported_model == target.SEEDANCE_2_0_MODEL_ID
         )
 
+    media_only_mini = dict(fast_payload)
+    media_only_mini.update(
+        {
+            "model": target.SEEDANCE_2_0_MINI_MODEL_ID,
+            "prompt": "",
+            "image_urls": ["data:image/png;base64,AA=="],
+        }
+    )
+    with mock.patch.object(
+        bridge_contract,
+        "_request_json",
+        return_value={"status": "pending", "job_id": "media-only-job"},
+    ) as request_json:
+        bridge_contract.generate_seedance(media_only_mini, timeout=30)
+    assert request_json.call_args.kwargs["payload"]["prompt"] == ""
+    assert request_json.call_args.kwargs["payload"]["image_urls"]
+
     rejected_payloads = []
     priority_payload = dict(fast_payload)
     priority_payload["priority"] = 1
     rejected_payloads.append(priority_payload)
-    missing_mini_prompt = dict(fast_payload)
-    missing_mini_prompt["model"] = target.SEEDANCE_2_0_MINI_MODEL_ID
-    missing_mini_prompt["prompt"] = ""
-    rejected_payloads.append(missing_mini_prompt)
     for invalid in rejected_payloads:
         with mock.patch.object(
             bridge_contract,
@@ -1415,7 +1488,7 @@ def assert_broker_generation_contract() -> None:
     assert payload["model"] == target.SEEDANCE_2_0_MODEL_ID
     assert payload["prompt"] == "Broker-only Seedance regression"
     assert payload["duration_seconds"] == 5
-    assert payload["quality"] == "4k"
+    assert payload["quality"] == "1080p"
     assert payload["resolution"] == "1280x720"
     assert payload["aspect_ratio"] == "adaptive"
     assert payload["web_search"] is False
@@ -1504,6 +1577,44 @@ def assert_broker_generation_contract() -> None:
         asyncio.run(refreshed._refresh_async())
     assert refresh_bridge.refresh_ids == ["broker-refresh-3"]
     assert refreshed.downloads == ["https://cdn.example/refreshed-broker.mp4"]
+
+
+def assert_refresh_during_submission_contract() -> None:
+    bridge = FakeBrokerBridge([])
+    node = BrokerScriptedNode(bridge)
+    node._generation_run_active.set()
+    with mock.patch.object(
+        node,
+        "_ensure_broker_connected",
+        side_effect=AssertionError("Refresh connected before a task ID existed"),
+    ), mock.patch.object(
+        node,
+        "_set_status_results",
+        side_effect=AssertionError("Refresh overwrote the active render status"),
+    ):
+        asyncio.run(node._refresh_async())
+    node._generation_run_active.clear()
+    assert bridge.account_calls == 0
+
+    observed = BrokerScriptedNode(FakeBrokerBridge([]))
+
+    async def observe_active_run() -> None:
+        assert observed._generation_run_active.is_set()
+
+    observed._aprocess_impl = observe_active_run
+    asyncio.run(observed.aprocess())
+    assert not observed._generation_run_active.is_set()
+
+    idle = BrokerScriptedNode(FakeBrokerBridge([]))
+    with mock.patch.object(
+        idle,
+        "_ensure_broker_connected",
+        side_effect=AssertionError("Empty idle refresh contacted the Broker"),
+    ):
+        asyncio.run(idle._refresh_async())
+    assert "No FN AI Broker task ID is available" in idle.parameter_output_values[
+        "result_details"
+    ]
 
 
 def assert_broker_account_and_button_contract() -> None:
@@ -2452,6 +2563,7 @@ assert_video_picker_single_wire_host_contract()
 assert_secret_manager_contract()
 assert_payload_and_media_contract()
 assert_broker_generation_contract()
+assert_refresh_during_submission_contract()
 assert_broker_account_and_button_contract()
 assert_scripted_success_flow()
 assert_indexed_output_macro_contract()

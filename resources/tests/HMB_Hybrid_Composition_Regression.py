@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from itertools import combinations
 from pathlib import Path
+import asyncio
 import importlib.util
 import inspect
 import json
+import logging
 import copy
 import sys
 import tempfile
@@ -415,9 +417,12 @@ assert "Final prompt generation is blocked" not in long_prompt
 with tempfile.TemporaryDirectory(prefix="hmb-hybrid-composition-") as temp_root:
     image.DEFAULT_PROJECTS_ROOT = Path(temp_root)
     image_node = image.HMBImageAssetLibrary(name="hybrid_composition_image")
-    image_result = image_node.process()
-    assert image_result["mode"] == "image_asset"
-    assert image_result["asset_count"] == 0
+    assert image_node.process() is None
+    image_payload = json.loads(
+        image_node.parameter_output_values[image.OUTPUT_PARAMETER]
+    )
+    assert image_payload["mode"] == "image_asset"
+    assert image_payload["media_resolution"]["selected_count"] == 0
 
 picker_node = picker.HMBVideoPickerLibrary(name="hybrid_composition_picker")
 
@@ -439,10 +444,10 @@ finally:
     picker.subprocess.Popen = original_popen
     picker.subprocess.run = original_run
 
-assert picker_result["mode"] == "maya"
-assert picker_result["action"] == "sync_outputs"
-assert picker_result["video_count"] == 0
-picker_payload = json.loads(picker_result["picker"])
+assert picker_result is None
+picker_payload = json.loads(picker_node.parameter_output_values["PICKER_OUT"])
+assert picker_payload["mode"] == "maya"
+assert picker_payload["catalog_video_count"] == 0
 assert picker_payload["media_ready"] is False
 assert picker_payload["active_slot_count"] == 0
 assert picker_payload["videos"] == []
@@ -454,10 +459,31 @@ for forbidden_token in ("Popen", "subprocess.run", "mayabatch", "ffmpeg", "Threa
 
 prompt_node = prompt.HMBPromptLibrary(name="hybrid_composition_prompt")
 prompt_result = prompt_node.process()
-assert prompt_result["mode"] == prompt.MODE_NAME
-assert prompt_result["active_images"] == 0
-assert prompt_result["active_videos"] == 0
+assert prompt_result is None
 assert prompt_node.parameter_output_values["PROMPT_OUT"]
+
+
+class _ProcessContractWarningCapture(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        if "process() returned unexpected type" in message:
+            self.messages.append(message)
+
+
+process_warning_capture = _ProcessContractWarningCapture()
+root_logger = logging.getLogger()
+root_logger.addHandler(process_warning_capture)
+try:
+    asyncio.run(image_node.aprocess())
+    asyncio.run(picker_node.aprocess())
+    asyncio.run(prompt_node.aprocess())
+finally:
+    root_logger.removeHandler(process_warning_capture)
+assert process_warning_capture.messages == []
 
 
 # A plain prompt keeps the untouched Standard Library Agent execution path and
