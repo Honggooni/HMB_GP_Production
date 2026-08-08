@@ -71,6 +71,8 @@ AI_BROKER_MAX_JSON_BYTES = 16 * 1024 * 1024
 AI_BROKER_DEVICE_AUTH_TIMEOUT_SECONDS = 5 * 60
 AI_BROKER_DEVICE_POLL_SECONDS = 2.0
 
+# Stable persistence identifier for existing usage ledgers and saved workflows.
+# The public file, implementation class, and palette label are version-neutral.
 USAGE_GENERATOR_ID = "HMBSeedance20VideoGeneration"
 USAGE_SCHEMA_VERSION = 1
 USAGE_LEDGER_ROOT = Path(
@@ -928,8 +930,8 @@ class VolcengineAPIError(RuntimeError):
         self.submission_outcome = submission_outcome
 
 
-class HMBSeedance20VideoGeneration(SuccessFailureNode):
-    """Generate Seedance 2.0 video through the authenticated FN AI Broker.
+class HMBSeedanceGeneration(SuccessFailureNode):
+    """Generate video with a supported Seedance model through FN AI Broker.
 
     This retains the existing HMB node identity, accepts ordered image and video
     lists from the HMB media libraries, and keeps provider credentials on the
@@ -942,8 +944,8 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         super().__init__(**kwargs)
         self.category = "HMB_GP_Production"
         self.description = (
-            "Generate Seedance 2.0 video through the authenticated FN AI Broker "
-            "using server-managed provider credentials."
+            "Generate video with a supported Seedance model through the "
+            "authenticated FN AI Broker using server-managed provider credentials."
         )
         self._temporary_video_uploads: list[
             tuple[GriptapeCloudStorageDriver, Path]
@@ -1006,7 +1008,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
             ParameterString(
                 name="prompt",
                 default_value="",
-                tooltip="Text prompt for Seedance 2.0.",
+                tooltip="Text prompt for the selected Seedance model.",
                 multiline=True,
                 placeholder_text="Describe the desired video...",
                 allow_output=False,
@@ -1090,7 +1092,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
                 title="Media Upload",
                 message=(
                     "Local video files are temporarily uploaded through the selected "
-                    "service so Volcengine Seedance 2.0 can read them. The temporary "
+                    "service so the selected Seedance model can read them. The temporary "
                     "object is deleted when this node execution ends."
                 ),
                 hide_clear_button=False,
@@ -1330,7 +1332,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         self._output_file = ProjectFileParameter(
             node=self,
             name="output_file",
-            default_filename="volcengine_seedance_2_0_video.mp4",
+            default_filename="volcengine_seedance_video.mp4",
         )
         self._output_file.add_parameter()
         self._create_status_parameters(
@@ -2191,7 +2193,7 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
 
         thread = threading.Thread(
             target=_runner,
-            name="HMBSeedance20-usage-sync",
+            name="HMBSeedance-usage-sync",
             daemon=True,
         )
         thread.start()
@@ -2425,20 +2427,20 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
         if isinstance(value, dict):
             for key in ("value", "url", "path", "location"):
                 if key in value and value[key] is not None:
-                    return HMBSeedance20VideoGeneration._coerce_reference_value(
+                    return HMBSeedanceGeneration._coerce_reference_value(
                         value[key], depth=depth + 1
                     )
         to_dict = getattr(value, "to_dict", None)
         if callable(to_dict):
             serialized = to_dict()
             if serialized is not value:
-                return HMBSeedance20VideoGeneration._coerce_reference_value(
+                return HMBSeedanceGeneration._coerce_reference_value(
                     serialized, depth=depth + 1
                 )
         for attribute in ("value", "location", "path"):
             candidate = getattr(value, attribute, None)
             if candidate is not None and candidate is not value:
-                return HMBSeedance20VideoGeneration._coerce_reference_value(
+                return HMBSeedanceGeneration._coerce_reference_value(
                     candidate, depth=depth + 1
                 )
         raise ValueError(
@@ -3141,18 +3143,18 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
                     if str(key).lower() in {"video_url", "last_frame_url"}
                     else "[REDACTED]"
                     if _SENSITIVE_FIELD_PATTERN.search(str(key))
-                    else HMBSeedance20VideoGeneration._redact_sensitive(item, secret)
+                    else HMBSeedanceGeneration._redact_sensitive(item, secret)
                 )
                 for key, item in value.items()
             }
         if isinstance(value, list):
             return [
-                HMBSeedance20VideoGeneration._redact_sensitive(item, secret)
+                HMBSeedanceGeneration._redact_sensitive(item, secret)
                 for item in value
             ]
         if isinstance(value, tuple):
             return tuple(
-                HMBSeedance20VideoGeneration._redact_sensitive(item, secret)
+                HMBSeedanceGeneration._redact_sensitive(item, secret)
                 for item in value
             )
         if isinstance(value, str):
@@ -4374,6 +4376,17 @@ class HMBSeedance20VideoGeneration(SuccessFailureNode):
             )
             self._record_current_usage_status()
             self._handle_failure_exception(RuntimeError(safe_message))
+
+
+class HMBSeedance20VideoGeneration(HMBSeedanceGeneration):
+    """Compatibility node type for workflows saved before the generic rename.
+
+    Griptape serializes ``node.__class__.__name__``. The manifest intentionally
+    registers this override-free wrapper while exposing only the generic node
+    label, so existing workflows resolve without duplicating the palette entry.
+    """
+
+
 __all__ = [
     "ARK_API_KEY_SECRET",
     "GT_CLOUD_API_KEY_SECRET",
@@ -4381,6 +4394,7 @@ __all__ = [
     "TOS_ACCESS_KEY_ID_SECRET",
     "TOS_SECRET_ACCESS_KEY_SECRET",
     "TOS_BUCKET_NAME_SECRET",
+    "HMBSeedanceGeneration",
     "HMBSeedance20VideoGeneration",
     "LOCAL_VIDEO_UPLOAD_GRIPTAPE",
     "LOCAL_VIDEO_UPLOAD_TOS",

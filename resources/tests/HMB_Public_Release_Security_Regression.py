@@ -72,21 +72,44 @@ assert all(value == "" for value in registered_secrets.values())
 manifest_description = manifest["settings"][0]["description"]
 assert "one-time browser authorization" in manifest_description
 assert "CGTeamwork" not in manifest_description
+seedance_entries = [
+    item
+    for item in manifest["nodes"]
+    if item["metadata"]["display_name"] == "HMB Seedance Generation"
+]
+assert len(seedance_entries) == 1
+seedance_entry = seedance_entries[0]
+assert seedance_entry["class_name"] == "HMBSeedance20VideoGeneration"
+assert seedance_entry["file_path"] == "HMBSeedanceGeneration.py"
+assert not (ROOT / "HMBSeedance20VideoGeneration.py").exists()
 
 # The two full Seedance transport regressions require a live Griptape host. Keep
 # their critical output-macro boundary enforced in source-only CI as well:
 # normal generation and Refresh must both use the shared preflight, and only the
 # engine-assigned {_index} variable may be deferred until the write stage.
-seedance_source = (ROOT / "HMBSeedance20VideoGeneration.py").read_text(
+seedance_source = (ROOT / "HMBSeedanceGeneration.py").read_text(
     encoding="utf-8"
 )
-seedance_tree = ast.parse(seedance_source, filename="HMBSeedance20VideoGeneration.py")
+seedance_tree = ast.parse(seedance_source, filename="HMBSeedanceGeneration.py")
 seedance_class = next(
+    node
+    for node in seedance_tree.body
+    if isinstance(node, ast.ClassDef)
+    and node.name == "HMBSeedanceGeneration"
+)
+legacy_seedance_class = next(
     node
     for node in seedance_tree.body
     if isinstance(node, ast.ClassDef)
     and node.name == "HMBSeedance20VideoGeneration"
 )
+assert len(legacy_seedance_class.bases) == 1
+assert isinstance(legacy_seedance_class.bases[0], ast.Name)
+assert legacy_seedance_class.bases[0].id == "HMBSeedanceGeneration"
+assert not any(
+    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    for node in legacy_seedance_class.body
+), "The saved-workflow compatibility wrapper must not override behavior."
 seedance_methods = {
     node.name: node
     for node in seedance_class.body

@@ -36,7 +36,7 @@ from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE_PATH = ROOT / "HMBSeedance20VideoGeneration.py"
+MODULE_PATH = ROOT / "HMBSeedanceGeneration.py"
 IMAGE_ASSET_MODULE_PATH = ROOT / "HMBImageAssetLibrary.py"
 VIDEO_PICKER_MODULE_PATH = ROOT / "HMBVideoPickerLibrary.py"
 
@@ -270,9 +270,18 @@ def assert_constructor_and_public_contract() -> None:
         "urlopen",
         side_effect=AssertionError("constructor performed a network request"),
     ):
-        node = target.HMBSeedance20VideoGeneration(name="Constructor Regression")
+        node = target.HMBSeedanceGeneration(name="Constructor Regression")
 
-    assert target.HMBSeedance20VideoGeneration.__mro__[1].__name__ == "SuccessFailureNode"
+    assert target.HMBSeedanceGeneration.__mro__[1].__name__ == "SuccessFailureNode"
+    assert target.HMBSeedance20VideoGeneration.__mro__[1] is target.HMBSeedanceGeneration
+    assert target.HMBSeedance20VideoGeneration.__name__ == (
+        "HMBSeedance20VideoGeneration"
+    )
+    assert not {
+        name
+        for name, value in target.HMBSeedance20VideoGeneration.__dict__.items()
+        if callable(value) and name not in {"__module__"}
+    }, "The saved-workflow compatibility wrapper must not override behavior."
     names = [parameter.name for parameter in node.parameters]
     for required in (
         "exec_in",
@@ -2723,4 +2732,4 @@ assert_ambiguous_submission_status_contract()
 assert_http_transport_contract()
 assert_private_monthly_usage_ledger_contract()
 
-print("HMB Seedance 2.0 FN AI Broker regression: PASS")
+print("HMB Seedance FN AI Broker regression: PASS")

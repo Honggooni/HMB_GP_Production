@@ -2,6 +2,10 @@
 
 ## 0.5.27 - 2026-08-08
 
+- Renamed the public node file to `HMBSeedanceGeneration.py` and the Griptape
+  palette label to `HMB Seedance Generation` so future Broker render options are
+  not tied to one model version. The legacy serialized node type remains as an
+  override-free compatibility wrapper, preserving existing saved workflows.
 - Made Image Asset, Video Picker, and Prompt selections paint locally before
   their authoritative host round trip, while preserving the existing state
   schemas, parameter names, saved-workflow format, and Agent connection flow.
