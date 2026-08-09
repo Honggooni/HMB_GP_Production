@@ -198,6 +198,8 @@ const TEXT = {
     motionGuide: "Motion Guide",
     frameLabel: "Frame",
     presetActor: "Preset Actor",
+    presetGhost: "Preset Ghost",
+    presetGhostScope: "Available for Actor and Background",
     presetObject: "Preset Object",
     playblastSettings: "PLAYBLAST SETTINGS",
     resolution: "Resolution",
@@ -293,6 +295,8 @@ const TEXT = {
     frameLabel: "프레임",
     colorAssignment: "컬러 지정",
     presetActor: "프리셋 액터",
+    presetGhost: "프리셋 고스트",
+    presetGhostScope: "캐릭터와 배경에 공통 적용",
     presetObject: "프리셋 오브젝트",
     target: "대상",
     color: "컬러",
@@ -2341,6 +2345,34 @@ function markerCatalogRows(markerCatalog) {
   ];
 }
 
+export function hmbPickerPaletteGroups(markerCatalog) {
+  const catalog = markerCatalog && typeof markerCatalog === "object" ? markerCatalog : {};
+  const characterRows = Array.isArray(catalog.character) ? catalog.character : [];
+  const backgroundRows = Array.isArray(catalog.background) ? catalog.background : [];
+  const names = (rows) => rows.map((item) => clean(item?.name)).filter(Boolean);
+  const actor = names(characterRows);
+  const ghost = names(backgroundRows.filter(
+    (item) => clean(item?.kind).toLowerCase() === "solid",
+  ));
+  const object = names(backgroundRows.filter(
+    (item) => clean(item?.kind).toLowerCase() === "pattern",
+  ));
+  const ordered = [...actor, ...ghost, ...object];
+  if (
+    actor.length === 7
+    && ghost.length === 3
+    && object.length === 4
+    && new Set(ordered).size === 14
+  ) {
+    return { actor, ghost, object };
+  }
+  return {
+    actor: FALLBACK_MARKER_OPTIONS.slice(0, 7),
+    ghost: FALLBACK_MARKER_OPTIONS.slice(7, 10),
+    object: FALLBACK_MARKER_OPTIONS.slice(10, 14),
+  };
+}
+
 export function hmbPickerMarkerAllowsRepeat(name, markerCatalog) {
   const markerName = clean(name);
   const catalog = markerCatalog && typeof markerCatalog === "object" ? markerCatalog : {};
@@ -4014,11 +4046,10 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   const maskChecked = !!state.mask_enabled;
   const depthChecked = !!state.depth_enabled;
   const motionGuideChecked = !!state.motion_guide_enabled;
-  const markerOptions = Array.isArray(state.marker_catalog?.options) && state.marker_catalog.options.length === 14
-    ? state.marker_catalog.options
-    : FALLBACK_MARKER_OPTIONS;
-  const actorOptions = markerOptions.slice(0, 7);
-  const objectOptions = markerOptions.slice(7, 14);
+  const paletteGroups = hmbPickerPaletteGroups(state.marker_catalog);
+  const actorOptions = paletteGroups.actor;
+  const ghostOptions = paletteGroups.ghost;
+  const objectOptions = paletteGroups.object;
   container.__hmbAuthoritativePickerState = normalize(state);
   let resizeObserver = null;
   let activeCleanup = [];
@@ -4257,6 +4288,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
           <div class="outliner-palette">
             <div class="palette-head">
               <div class="palette-group"><div class="palette-label">${escapeHtml(tr.presetActor)}</div><div class="palette-grid" data-palette-kind="actor">${actorOptions.map((name) => `<button type="button" class="palette-button ${state.selected_color === name ? "active" : ""}" data-color="${escapeHtml(name)}" title="${escapeHtml(name)}" aria-label="${escapeHtml(`${tr.presetActor}: ${name}`)}" style="${hmbPickerColorStyle(name, state.marker_catalog)}" ${locked || !selectedNode ? "disabled" : ""}></button>`).join("")}</div></div>
+              <div class="palette-group"><div class="palette-label" title="${escapeHtml(tr.presetGhostScope)}">${escapeHtml(tr.presetGhost)}</div><div class="palette-grid" data-palette-kind="ghost" data-palette-scope="actor-background">${ghostOptions.map((name) => `<button type="button" class="palette-button ${state.selected_color === name ? "active" : ""}" data-color="${escapeHtml(name)}" title="${escapeHtml(`${name} · ${tr.presetGhostScope}`)}" aria-label="${escapeHtml(`${tr.presetGhost}: ${name}. ${tr.presetGhostScope}`)}" style="${hmbPickerColorStyle(name, state.marker_catalog)}" ${locked || !selectedNode ? "disabled" : ""}></button>`).join("")}</div></div>
               <div class="palette-group"><div class="palette-label">${escapeHtml(tr.presetObject)}</div><div class="palette-grid" data-palette-kind="object">${objectOptions.map((name) => `<button type="button" class="palette-button ${state.selected_color === name ? "active" : ""}" data-color="${escapeHtml(name)}" title="${escapeHtml(name)}" aria-label="${escapeHtml(`${tr.presetObject}: ${name}`)}" style="${hmbPickerColorStyle(name, state.marker_catalog)}" ${locked || !selectedNode ? "disabled" : ""}></button>`).join("")}</div></div>
             </div>
           </div>

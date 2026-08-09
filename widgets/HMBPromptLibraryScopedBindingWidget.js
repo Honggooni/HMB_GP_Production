@@ -680,7 +680,10 @@ function applyImageTaxonomy(input) {
   if (objectColors.length) OBJECT_COLOR_PICK_CHOICES = objectColors;
   if (actorTypes.length) ACTOR_COLOR_PICK_SOURCE_TYPES = new Set(actorTypes);
   if (objectTypes.length) OBJECT_COLOR_PICK_SOURCE_TYPES = new Set(objectTypes);
-  COLOR_PICK_CHOICES = [...ACTOR_COLOR_PICK_CHOICES, ...OBJECT_COLOR_PICK_CHOICES];
+  COLOR_PICK_CHOICES = [...new Set([
+    ...ACTOR_COLOR_PICK_CHOICES,
+    ...OBJECT_COLOR_PICK_CHOICES,
+  ])];
 
   return {
     source_type_choices: [...IMAGE_SOURCE_TYPES],
@@ -695,7 +698,7 @@ function applyImageTaxonomy(input) {
   };
 }
 
-function colorPickChoicesForSourceType(sourceType) {
+export function colorPickChoicesForSourceType(sourceType) {
   const value = clean(sourceType);
   if (ACTOR_COLOR_PICK_SOURCE_TYPES.has(value)) return [...ACTOR_COLOR_PICK_CHOICES];
   if (OBJECT_COLOR_PICK_SOURCE_TYPES.has(value)) return [...OBJECT_COLOR_PICK_CHOICES];

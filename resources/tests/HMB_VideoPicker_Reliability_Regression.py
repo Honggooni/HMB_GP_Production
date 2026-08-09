@@ -880,9 +880,9 @@ assert hashlib.sha256(bundled_agent_policy.read_bytes()).hexdigest() == (
 )
 expected_agent_hashes = {
     "HMBAgentLibrary.py": "12a00bf11e5376998192a09f9a2e3b9fe4bab9d04e986fe1adc7be78946b81c6",
-    "HMBPromptLibrary.py": "d6ff9975cad8e44296905417bc324ee43945c5a62d0d08136571911ac4fb214e",
+    "HMBPromptLibrary.py": "c315bf70000ef569194a8fe224ee409567b5dbe98371d51e4acefb180400a843",
     "HMBVideoPickerLibrary.py": "266df52f055eb65ddf16fa552c6495304fd73286dd5748c09adf73b6b3f0d823",
-    "_hmb_common.py": "1e4a6e1447e6ab08279d3f17f677974ce703602ed3b54185dd8fc755c0d2530d",
+    "_hmb_common.py": "2b4dd7e15602d9fbd70a7cc5530c2f46b99f548f14dadab2288777c2840cefb0",
     "widgets/HMBAgentLibraryWidget.js": "61ea9416adc1cbfb7e8fbfbc068ad1a444c3f6d4b4c6b59569a1815a013dc193",
     "resources/tests/HMB_Agent_Policy_Integration_Regression.py": "8bf44efab36784676a8669a6a75a539457cdbece9ae68dd915fae72838c4ee4a",
     "resources/tests/HMB_Frame_Range_Regression.py": "4f9c0f7022b5db5bfa760e41f747ecbf95c99f0b06525553248fe3af9e2b1091",
@@ -1007,14 +1007,21 @@ expected_object = [
     "Sky Blue", "Mint", "Beige",
     "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern",
 ]
+expected_ghost = expected_object[:3]
 assert character == expected_actor
 assert background == expected_object
 assert picker.MARKER_ORDER == expected_actor + expected_object
 assert prompt.ACTOR_COLOR_PICK_CHOICES == expected_actor
 assert prompt.OBJECT_COLOR_PICK_CHOICES == expected_object
 assert prompt.COLOR_PICK_CHOICES == picker.MARKER_ORDER
-assert prompt._color_pick_choices_for_source_type("Character Appearance") == expected_actor
+assert prompt._color_pick_choices_for_source_type("Character Appearance") == (
+    expected_actor + expected_ghost
+)
 assert prompt._color_pick_choices_for_source_type("Prop / Accessory") == expected_object
+assert prompt._color_pick_choices_for_source_type("Custom") == expected_actor + expected_object
+prompt_taxonomy = prompt._image_taxonomy_payload()
+assert prompt_taxonomy["actor_color_pick_choices"] == expected_actor + expected_ghost
+assert prompt_taxonomy["object_color_pick_choices"] == expected_object
 
 original_mayabatch_candidates = picker._mayabatch_candidates
 try:
@@ -1548,8 +1555,13 @@ assert "URL.createObjectURL" not in widget_source
 assert "URL.revokeObjectURL" not in widget_source
 assert 'data-visibility-path=' in widget_source
 assert "slot_visibility" in widget_source
-assert "const actorOptions = markerOptions.slice(0, 7)" in widget_source
-assert "const objectOptions = markerOptions.slice(7, 14)" in widget_source
+assert "export function hmbPickerPaletteGroups(markerCatalog)" in widget_source
+assert "const actorOptions = paletteGroups.actor" in widget_source
+assert "const ghostOptions = paletteGroups.ghost" in widget_source
+assert "const objectOptions = paletteGroups.object" in widget_source
+assert 'data-palette-kind="actor"' in widget_source
+assert 'data-palette-kind="ghost"' in widget_source
+assert 'data-palette-kind="object"' in widget_source
 assert 'id="create-snapshot"' in widget_source
 assert 'id="delete-snapshot"' in widget_source
 assert 'id="snapshot-prev"' in widget_source

@@ -243,15 +243,18 @@ ACTOR_COLOR_PICK_CHOICES = [
     "Purple",
     "Pink",
 ]
-OBJECT_COLOR_PICK_CHOICES = [
+GHOST_COLOR_PICK_CHOICES = [
     "Sky Blue",
     "Mint",
     "Beige",
+]
+PATTERN_COLOR_PICK_CHOICES = [
     "Direction Checker",
     "Sky Grid",
     "Floor Grid",
     "Position Pattern",
 ]
+OBJECT_COLOR_PICK_CHOICES = GHOST_COLOR_PICK_CHOICES + PATTERN_COLOR_PICK_CHOICES
 COLOR_PICK_CHOICES = ACTOR_COLOR_PICK_CHOICES + OBJECT_COLOR_PICK_CHOICES
 ACTOR_COLOR_PICK_SOURCE_TYPES = {
     "Character Appearance",
@@ -282,7 +285,7 @@ def image_color_pick_choices_for_source_type(source_type: Any) -> List[str]:
     """Return the Video Picker Color Pick candidates allowed by a Main Type."""
     key = str(source_type or "").strip()
     if key in ACTOR_COLOR_PICK_SOURCE_TYPES:
-        return list(ACTOR_COLOR_PICK_CHOICES)
+        return list(ACTOR_COLOR_PICK_CHOICES + GHOST_COLOR_PICK_CHOICES)
     if key in OBJECT_COLOR_PICK_SOURCE_TYPES:
         return list(OBJECT_COLOR_PICK_CHOICES)
     if key == "Custom":

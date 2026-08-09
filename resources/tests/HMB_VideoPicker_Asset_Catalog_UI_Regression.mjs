@@ -370,8 +370,15 @@ const mainEnd = widgetSource.indexOf("</main>", mainStart);
 assert.ok(mainStart >= 0 && mainEnd > mainStart, "Picker main dashboard markup is present.");
 const mainMarkup = widgetSource.slice(mainStart, mainEnd);
 const paletteIndex = mainMarkup.indexOf('data-palette-kind="actor"');
+const ghostPaletteIndex = mainMarkup.indexOf('data-palette-kind="ghost"');
+const objectPaletteIndex = mainMarkup.indexOf('data-palette-kind="object"');
 const outlinerIndex = mainMarkup.indexOf('id="outliner-search"');
-assert.ok(paletteIndex >= 0, "The compact Actor/Object Color Assignment palette remains available.");
+assert.ok(
+  paletteIndex >= 0
+    && paletteIndex < ghostPaletteIndex
+    && ghostPaletteIndex < objectPaletteIndex,
+  "The compact Actor/Ghost/Object Color Assignment rows remain ordered 7/3/4.",
+);
 assert.ok(outlinerIndex >= 0, "The asset-root Outliner remains available for cut authoring.");
 assert.ok(
   paletteIndex < outlinerIndex,
