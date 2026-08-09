@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import re
 import shutil
@@ -24,6 +25,10 @@ try:
 except Exception:
     ControlFlow = None
     GriptapeNodes = None
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def compact_state(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -95,6 +100,8 @@ def main() -> int:
     test_root = Path(tempfile.mkdtemp(prefix="HMBVideoPicker_Live_"))
     scene_copy = test_root / source_scene.name
     shutil.copy2(source_scene, scene_copy)
+    source_hash_before = sha256(source_scene)
+    scene_copy_hash_before = sha256(scene_copy)
     transitions: List[Dict[str, Any]] = []
     result: Dict[str, Any] = {
         "ok": False,
@@ -402,15 +409,32 @@ def main() -> int:
                 raise RuntimeError(
                     "Live PLAYBLAST did not verify full-detail Smooth Preview 3."
                 )
-            screen_report = playblast_metadata.get("screen_space_postprocess") or {}
+            world_report = playblast_metadata.get("world_pattern_report") or {}
             if (
-                screen_report.get("profile")
-                != picker.SCREEN_SPACE_PATTERN_PROFILE
-                or bool(screen_report.get("uv_dependent"))
-                or screen_report.get("phase") != "frame_top_left"
+                playblast_metadata.get("world_pattern_profile")
+                != picker.MAYA_WORLD_PATTERN_PROFILE
+                or world_report.get("profile")
+                != picker.MAYA_WORLD_PATTERN_PROFILE
+                or world_report.get("coordinate_space") != "background_root"
+                or world_report.get("camera_anchored") is not False
+                or world_report.get("uv_dependent") is not False
+                or world_report.get("root_scale_followed") is not True
+                or world_report.get("world_cell_scale_compensated") is not True
+                or float(world_report.get("base_cell_world_units") or 0.0) != 15.0
+                or float(world_report.get("density_multiplier") or 0.0) != 3.0
+                or float(world_report.get("cell_size_world_units") or 0.0) != 5.0
+                or "reference_frame" not in world_report
             ):
                 raise RuntimeError(
-                    "Live PLAYBLAST did not publish the screen-space pattern contract."
+                    "Live PLAYBLAST did not publish the world/root pattern contract."
+                )
+            if (
+                "screen_space_postprocess" in playblast_metadata
+                or "screen_space_postprocess_pending" in playblast_metadata
+            ):
+                raise RuntimeError(
+                    "Production world-pattern PLAYBLAST unexpectedly ran the "
+                    "legacy screen-space postprocess."
                 )
             if (playblast_metadata.get("video_format") or {}).get("crf") != picker.PROXY_ENCODER_CRF:
                 raise RuntimeError("Live PLAYBLAST did not use the high-quality CRF profile.")
@@ -682,6 +706,22 @@ def main() -> int:
         result["error"] = f"{exc.__class__.__name__}: {exc}"
         result["terminal_state"] = compact_state(node._picker_state())
     finally:
+        source_hash_after = sha256(source_scene)
+        scene_copy_hash_after = sha256(scene_copy)
+        result["scene_immutability"] = {
+            "source_sha256_before": source_hash_before,
+            "source_sha256_after": source_hash_after,
+            "copy_sha256_before": scene_copy_hash_before,
+            "copy_sha256_after": scene_copy_hash_after,
+        }
+        if (
+            source_hash_after != source_hash_before
+            or scene_copy_hash_after != scene_copy_hash_before
+        ):
+            result["ok"] = False
+            result["error"] = (
+                "Source scene bytes changed during read-only Maya preview."
+            )
         result["transitions"] = transitions
         summary_path = test_root / "live_maya_smoke_summary.json"
         summary_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

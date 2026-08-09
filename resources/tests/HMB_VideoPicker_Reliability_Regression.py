@@ -2,6 +2,7 @@ from pathlib import Path
 import copy
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import queue
@@ -80,6 +81,79 @@ agent = load("HMBAgentLibrary")
 
 assert prompt.PICKER_DEPTH_PROFILE == picker.DEPTH_PLAYBLAST_PROFILE
 assert picker.DEPTH_PLAYBLAST_PROFILE == "hmb_camera_space_depth_v7"
+assert picker.MAYA_WORLD_PATTERN_PROFILE == "hmb_maya_world_root_projection_v1"
+assert picker.WORLD_PATTERN_BASE_CELL_WORLD_UNITS == 15.0
+assert picker.WORLD_PATTERN_DENSITY_MULTIPLIER == 3.0
+assert picker.WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS == 5.0
+assert picker.MAYA_WORLD_PATTERN_PROJECTIONS == {
+    "floor_grid": ("Planar", "XZ"),
+    "direction_checker": ("TriPlanar", "XYZ"),
+    "position_pattern": ("TriPlanar", "XYZ"),
+    "sky_grid": ("TriPlanar", "XYZ"),
+}
+
+world_pattern_rows = []
+for pattern, (projection_type, projection_axis) in (
+    picker.MAYA_WORLD_PATTERN_PROJECTIONS.items()
+):
+    token = pattern.replace("_", "_").title().replace("_", "")
+    world_pattern_rows.append({
+        "pattern": pattern,
+        "projection_type": projection_type,
+        "projection_axis": projection_axis,
+        "reference_frame": 101.0,
+        "camera_anchored": False,
+        "uv_dependent": False,
+        "root_scale_followed": True,
+        "world_cell_scale_compensated": True,
+        "projection_node": "HMB_{0}_Projection".format(token),
+        "projector_node": "HMB_{0}_Projector".format(token),
+        "anchor_node": "HMB_{0}_RootAnchor".format(token),
+        "constraint_node": "HMB_{0}_parentConstraint".format(token),
+        "scale_constraint_node": "HMB_{0}_scaleConstraint".format(token),
+        "scale_compensator_node": "HMB_{0}_ScaleCompensator".format(token),
+    })
+world_pattern_report = {
+    "profile": picker.MAYA_WORLD_PATTERN_PROFILE,
+    "coordinate_space": "background_root",
+    "camera_anchored": False,
+    "uv_dependent": False,
+    "root_scale_followed": True,
+    "world_cell_scale_compensated": True,
+    "base_cell_world_units": 15.0,
+    "density_multiplier": 3.0,
+    "cell_size_world_units": 5.0,
+    "reference_frame": 101.0,
+    "pattern_binding_count": 4,
+    "projection_node_count": 4,
+    "projector_node_count": 4,
+    "patterns": world_pattern_rows,
+}
+world_pattern_options = {
+    "output_transform_disabled": True,
+    "multisample_disabled": True,
+    "line_aa_disabled": True,
+    "ssao_disabled": True,
+    "motion_blur_disabled": True,
+}
+world_confirmation = {
+    "world_pattern_profile": picker.MAYA_WORLD_PATTERN_PROFILE,
+    "world_pattern_report": world_pattern_report,
+    "world_pattern_render_options": world_pattern_options,
+}
+assert picker._validate_world_pattern_runner_confirmation(
+    world_confirmation,
+) == world_pattern_report
+invalid_world_confirmation = copy.deepcopy(world_confirmation)
+invalid_world_confirmation["world_pattern_report"]["camera_anchored"] = True
+try:
+    picker._validate_world_pattern_runner_confirmation(
+        invalid_world_confirmation,
+    )
+except RuntimeError as exc:
+    assert "camera independence" in str(exc)
+else:
+    raise AssertionError("Camera-anchored patterns must fail closed.")
 
 # Generate Playblast owns the only execution trigger. Four inert choices pack
 # their validated results in Original -> Mask -> Depth -> Motion Guide order.
@@ -881,7 +955,7 @@ assert hashlib.sha256(bundled_agent_policy.read_bytes()).hexdigest() == (
 expected_agent_hashes = {
     "HMBAgentLibrary.py": "12a00bf11e5376998192a09f9a2e3b9fe4bab9d04e986fe1adc7be78946b81c6",
     "HMBPromptLibrary.py": "c315bf70000ef569194a8fe224ee409567b5dbe98371d51e4acefb180400a843",
-    "HMBVideoPickerLibrary.py": "266df52f055eb65ddf16fa552c6495304fd73286dd5748c09adf73b6b3f0d823",
+    "HMBVideoPickerLibrary.py": "04330ae13ea82cd3962f993d371c74fd37a6de3998b11eaf108e1d10eea736be",
     "_hmb_common.py": "2b4dd7e15602d9fbd70a7cc5530c2f46b99f548f14dadab2288777c2840cefb0",
     "widgets/HMBAgentLibraryWidget.js": "61ea9416adc1cbfb7e8fbfbc068ad1a444c3f6d4b4c6b59569a1815a013dc193",
     "resources/tests/HMB_Agent_Policy_Integration_Regression.py": "8bf44efab36784676a8669a6a75a539457cdbece9ae68dd915fae72838c4ee4a",
@@ -1586,6 +1660,24 @@ for retired_field in (
     assert retired_field not in widget_source
 
 maya_runner_source = (ROOT / "resources/maya/HMB_Maya_Background_Preview.py").read_text(encoding="utf-8")
+maya_guide_source = (
+    ROOT / "resources/maya/HMBVideoPicker_Maya_Guide.txt"
+).read_text(encoding="utf-8")
+changelog_head = "\n".join(
+    (ROOT / "CHANGELOG.md").read_text(encoding="utf-8").splitlines()[:30]
+)
+assert "hmb_maya_world_root_projection_v1" in maya_guide_source
+for documentation_source in (maya_guide_source, changelog_head):
+    assert "Floor Grid" in documentation_source
+    assert "top-planar" in documentation_source
+    assert "triplanar" in documentation_source
+    assert "5 Maya world" in documentation_source
+    assert "3x" in documentation_source
+assert "first output frame" in maya_guide_source
+assert "never linked to the output camera" in maya_guide_source
+assert "never saved" in maya_guide_source
+assert "explicit legacy fallback" in maya_guide_source
+assert "one frame-global screen-space canvas anchored" not in maya_guide_source
 assert "def _apply_assigned_render_scope" in maya_runner_source
 assert "def _validated_picker_hidden_paths" in maya_runner_source
 assert "def _apply_hidden_paths" not in maya_runner_source
@@ -1612,6 +1704,9 @@ assert '("hardwareRenderingGlobals.multiSampleEnable", 0)' in maya_runner_source
 assert '("hardwareRenderingGlobals.lineAAEnable", 0)' in maya_runner_source
 assert '"hardwareRenderingGlobals.lightingMode", 0' in maya_runner_source
 assert '"hardwareRenderingGlobals.renderMode", 4' in maya_runner_source
+assert "def _world_projected_pattern_group(" in maya_runner_source
+assert "marker_group, pattern_record, projection = (" in maya_runner_source
+assert '"world_pattern_report"' in maya_runner_source
 assert "marker_group = _screen_space_pattern_shader(" in maya_runner_source
 assert "MARKER_PATTERN_IDS.get(color)" in maya_runner_source
 assert "enableMultisample" in maya_runner_source
@@ -1627,6 +1722,28 @@ assert '"generate_original_video": False' in picker_source
 assert '"original_video": ""' in picker_source
 assert 'if action == "render_original_preview":' in picker_source
 assert 'if action == "hide_original_preview":' in picker_source
+
+snapshot_mode_source = inspect.getsource(
+    picker.HMBVideoPickerLibrary._snapshot_mode
+)
+maya_mode_source = inspect.getsource(picker.HMBVideoPickerLibrary._maya_mode)
+for production_mode_source in (snapshot_mode_source, maya_mode_source):
+    assert '"world_space_patterns": True' in production_mode_source
+    assert '"world_pattern_profile": MAYA_WORLD_PATTERN_PROFILE' in (
+        production_mode_source
+    )
+    assert '"world_pattern_cell_units": WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS' in (
+        production_mode_source
+    )
+    assert '"world_pattern_density_multiplier": WORLD_PATTERN_DENSITY_MULTIPLIER' in (
+        production_mode_source
+    )
+    assert '"screen_space_patterns": False' in production_mode_source
+    assert "_world_pattern_preflight(" in production_mode_source
+    assert "_validate_world_pattern_runner_confirmation(" in (
+        production_mode_source
+    )
+    assert "_postprocess_screen_space_frames(" not in production_mode_source
 
 class FakeCompletedProcess:
     @staticmethod
@@ -2560,8 +2677,30 @@ for solid_background_payload in marker_payload_probe[1:4]:
     assert solid_background_payload["shading_profile"] == marker_payload_probe[0]["shading_profile"]
 for pattern_payload in marker_payload_probe[4:]:
     assert pattern_payload["shader_model"] == "surfaceShader"
-    assert pattern_payload["visual_profile"] == "hmb_screen_space_pattern_post_v2"
+    assert pattern_payload["visual_profile"] == maya_runner.MAYA_WORLD_PATTERN_PROFILE
     assert pattern_payload["out_rim"] == ""
+    assert pattern_payload["shading_profile"]["pattern_space"] == "background_root"
+    expected_projection = maya_runner._world_pattern_projection_type(
+        pattern_payload["shading_profile"]["pattern"]
+    )
+    assert (
+        pattern_payload["shading_profile"]["projection_type"],
+        pattern_payload["shading_profile"]["projection_axis"],
+    ) == expected_projection
+    assert pattern_payload["shading_profile"]["base_cell_world_units"] == 15.0
+    assert pattern_payload["shading_profile"]["density_multiplier"] == 3.0
+    assert pattern_payload["shading_profile"]["cell_size_world_units"] == 5.0
+    assert pattern_payload["shading_profile"]["camera_anchored"] is False
+    assert pattern_payload["shading_profile"]["uv_dependent"] is False
+
+# The old top-left compositor is retained solely as an explicit compatibility
+# fallback; production payload metadata must never claim it by default.
+fallback_payload_probe = maya_runner._marker_payload(
+    marker_payload_records,
+    pattern_profile=maya_runner.SCREEN_SPACE_PATTERN_PROFILE,
+)
+for pattern_payload in fallback_payload_probe[4:]:
+    assert pattern_payload["visual_profile"] == maya_runner.SCREEN_SPACE_PATTERN_PROFILE
     assert pattern_payload["shading_profile"]["pattern_space"] == "screen"
     assert pattern_payload["shading_profile"]["phase_origin"] == "frame_top_left"
     assert pattern_payload["shading_profile"]["linear_scale_divisor"] == 3

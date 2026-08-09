@@ -74,6 +74,7 @@ jobs:
             "HMB_Depth_Companion_Regression.py",
             "HMB_Depth_Visual_Contract_Regression.py",
             "HMB_Maya_Runner_Performance_Regression.py",
+            "HMB_Screen_Space_Pattern_Regression.py",
             "HMB_Mouth_Card_Inner_Patch_Regression.py",
             "HMB_Motion_Guide_Regression.py",
             "HMB_Picker_State_Compaction_Regression.py",

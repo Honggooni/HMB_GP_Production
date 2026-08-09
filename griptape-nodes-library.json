@@ -61,7 +61,7 @@
       "OriginalAuthoredViewport",
       "BestEffortViewportQuality",
       "BestEffortSmoothPreview3",
-      "ScreenSpacePatterns",
+      "WorldRootProjectedPatterns",
       "UVIndependentPatterns",
       "PairedDepthPlayblast",
       "DynamicDepthCompanion",

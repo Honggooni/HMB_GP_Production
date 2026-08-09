@@ -380,8 +380,9 @@ assert "uv_coordinate" not in source_without_required_report_key
 assert "object_coordinate" not in source_without_required_report_key
 
 
-# Picker integration must preflight Pillow before Maya, then replace the raw
-# categorical PNGs before a snapshot copy or FFmpeg command can consume them.
+# The module above is the explicit legacy fallback. Production Snapshot and
+# Playblast must use Maya world/root projection and publish the OGS frames
+# directly, without a frame-top-left compositor pass.
 picker_path = ROOT / "HMBVideoPickerLibrary.py"
 picker_source = picker_path.read_text(encoding="utf-8")
 picker_tree = ast.parse(picker_source, filename=str(picker_path))
@@ -406,20 +407,27 @@ encode_source = _function_source("_encode_playblast_sequence")
 for function_source in (snapshot_source, playblast_source):
     assert '"force_high_quality_viewport": True' in function_source
     assert '"require_full_smooth_geometry": True' in function_source
-    assert '"screen_space_patterns": True' in function_source
-    assert "_screen_space_preflight(" in function_source
-assert snapshot_source.index("_postprocess_screen_space_frames(") < snapshot_source.index(
-    "shutil.copy2(rendered_path, staged_cache_path)"
-)
-assert playblast_source.index("_postprocess_screen_space_frames(") < playblast_source.index(
-    "self._encode_playblast_sequence("
-)
+    assert '"world_space_patterns": True' in function_source
+    assert '"world_pattern_profile": MAYA_WORLD_PATTERN_PROFILE' in function_source
+    assert '"world_pattern_cell_units": WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS' in (
+        function_source
+    )
+    assert '"world_pattern_density_multiplier": WORLD_PATTERN_DENSITY_MULTIPLIER' in (
+        function_source
+    )
+    assert '"screen_space_patterns": False' in function_source
+    assert "_world_pattern_preflight(" in function_source
+    assert "_validate_world_pattern_runner_confirmation(" in function_source
+    assert "_screen_space_preflight(" not in function_source
+    assert "_postprocess_screen_space_frames(" not in function_source
+assert "shutil.copy2(rendered_path, staged_cache_path)" in snapshot_source
+assert "self._encode_playblast_sequence(" in playblast_source
 assert "_build_ffmpeg_encode_command(" in encode_source
 
 
 print(
-    "HMB screen-space pattern regression passed: lazy Pillow, strict catalog IDs, "
-    "global top-left phase, four visible patterns at one-third linear scale, "
-    "non-square streaming, exact beauty pixel preservation, atomic PNG publish, "
-    "and fail-closed frame validation."
+    "HMB explicit screen-space fallback regression passed: lazy Pillow, strict "
+    "catalog IDs, global top-left phase, four visible fallback patterns at "
+    "one-third linear scale, and production Picker world-projection/no-postprocess "
+    "isolation."
 )
