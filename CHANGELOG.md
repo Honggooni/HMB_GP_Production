@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Established GitHub and GitHub Releases as the permanent public team
+  distribution channel. Repository visibility is no longer treated as a
+  security boundary; release audits continue to reject credentials, tokens,
+  private signing keys, and non-public media.
+
 ## 0.5.28 - 2026-08-09
 
 - Advanced the manifest, Python package, README, SBOM, and release-security

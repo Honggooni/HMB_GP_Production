@@ -50,6 +50,24 @@ COMMON_TOKEN_PATTERNS = (
 )
 
 
+# GitHub and GitHub Releases are the permanent team distribution channel.
+# Visibility must never be used in place of removing secrets from the source.
+readme_text = (ROOT / "README.md").read_text(encoding="utf-8")
+security_text = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
+assert "Public team distribution repository" in readme_text
+assert "Keep this repository and its GitHub" in readme_text
+assert "Releases public" in readme_text
+assert "Public 팀 배포 저장소" in security_text
+assert "GitHub Release는 Public을" in security_text
+for forbidden_visibility_policy in (
+    "Private repository only",
+    "반드시\n**Private**",
+    "릴리스를 Private으로 유지",
+):
+    assert forbidden_visibility_policy not in readme_text
+    assert forbidden_visibility_policy not in security_text
+
+
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
