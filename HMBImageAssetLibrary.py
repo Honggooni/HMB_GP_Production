@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 import base64
@@ -168,6 +169,7 @@ _ASSET_MANIFEST_CACHE: Dict[
     tuple[str, str], Dict[str, Dict[str, Any]]
 ] = {}
 _ASSET_MANIFEST_CACHE_LIMIT = 32
+_ASSET_RESOLUTION_CACHE_LIMIT = 256
 _ASSET_THUMBNAIL_LOCK = threading.Lock()
 _ASSET_THUMBNAIL_URLS: Dict[str, str] = {}
 
@@ -3060,9 +3062,166 @@ def _resolved_media_value(media_value: Any) -> str:
     return ""
 
 
+_PROJECT_RESOLUTION_KEY_FIELDS = (
+    "asset_library_id",
+    "source_uid",
+    "source_kind",
+    "asset_project_uid",
+    "asset_id",
+    "image_name",
+    "path",
+    "relative_path",
+    "extension",
+    "source_type",
+    "custom_source_type",
+    "scope_candidate",
+    "registered",
+    "media_ref_kind",
+    "connected",
+)
+
+
+def _media_resolution_identity(value: Any, import_revision: int) -> Dict[str, Any]:
+    """Describe imported media without decoding or copying its payload.
+
+    IMAGE_IMPORT_IN updates advance ``import_revision``.  Object identity is
+    therefore sufficient for opaque host artifacts, while immutable textual
+    references use a bounded digest so a large data URI never becomes a cache
+    key itself.
+    """
+    if isinstance(value, Path):
+        value = str(value)
+    if isinstance(value, str):
+        encoded = value.encode("utf-8", errors="surrogatepass")
+        return {
+            "kind": "str",
+            "length": len(encoded),
+            "digest": hashlib.sha256(encoded).hexdigest(),
+        }
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {
+            "kind": type(value).__name__,
+            "length": len(value),
+            "object_id": id(value),
+            "import_revision": _non_negative_int(import_revision),
+        }
+    return {
+        "kind": type(value).__name__,
+        "object_id": id(value),
+        "import_revision": _non_negative_int(import_revision),
+    }
+
+
+def _asset_resolution_cache_key(
+    asset: Dict[str, Any],
+    state: Dict[str, Any],
+    import_revision: int,
+) -> str:
+    source_kind = _clean(asset.get("source_kind")).casefold()
+    if source_kind == "project":
+        payload: Dict[str, Any] = {
+            "kind": "project",
+            "project_root": _clean(state.get("project_root")),
+            "project_id": _clean(state.get("project_id")),
+            "project_uid": _clean(state.get("project_uid")),
+            "manifest_signature": _clean(state.get("manifest_signature")),
+            "scan_revision": _non_negative_int(state.get("scan_revision")),
+            "asset": {
+                field: asset.get(field)
+                for field in _PROJECT_RESOLUTION_KEY_FIELDS
+            },
+        }
+    else:
+        source_uid = _clean(asset.get("source_uid"))
+        payload = {
+            "kind": "user",
+            "source_uid": source_uid,
+            "asset_library_id": _clean(asset.get("asset_library_id")),
+            "path": _clean(asset.get("path")),
+            "media_ref_kind": _clean(asset.get("media_ref_kind")),
+            "connected": bool(asset.get("connected", True)),
+            "import_revision": _non_negative_int(import_revision),
+        }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _resolution_cache_get(
+    cache: OrderedDict[str, Dict[str, Any]] | None,
+    key: str,
+) -> Dict[str, Any] | None:
+    if not isinstance(cache, OrderedDict) or not key:
+        return None
+    cached = cache.get(key)
+    if not isinstance(cached, dict):
+        return None
+    cache.move_to_end(key)
+    return cached
+
+
+def _resolution_cache_put(
+    cache: OrderedDict[str, Dict[str, Any]] | None,
+    key: str,
+    value: Dict[str, Any],
+) -> None:
+    if not isinstance(cache, OrderedDict) or not key:
+        return
+    cache[key] = dict(value)
+    cache.move_to_end(key)
+    while len(cache) > _ASSET_RESOLUTION_CACHE_LIMIT:
+        cache.popitem(last=False)
+
+
+def _import_media_map_identity(media_by_uid: Dict[str, Any]) -> str:
+    payload = [
+        (
+            _clean(source_uid),
+            _media_resolution_identity(media_value, 0),
+        )
+        for source_uid, media_value in sorted(
+            (media_by_uid or {}).items(),
+            key=lambda item: _clean(item[0]),
+        )
+    ]
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _resolution_cache_state_identity(state: Dict[str, Any]) -> str:
+    canonical = json.dumps(
+        {
+            "catalog_root": _clean(state.get("catalog_root")),
+            "project_root": _clean(state.get("project_root")),
+            "project_id": _clean(state.get("project_id")),
+            "project_uid": _clean(state.get("project_uid")),
+            "manifest_signature": _clean(state.get("manifest_signature")),
+            "scan_revision": _non_negative_int(state.get("scan_revision")),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _resolve_selected_assets(
     state: Dict[str, Any],
     media_by_uid: Dict[str, Any] | None = None,
+    *,
+    resolution_cache: OrderedDict[str, Dict[str, Any]] | None = None,
+    import_revision: int = 0,
+    force: bool = False,
 ) -> Dict[str, Any]:
     """Resolve one authoritative selection for metadata and generator media.
 
@@ -3082,21 +3241,7 @@ def _resolve_selected_assets(
         key=lambda asset: _non_negative_int(asset.get("selection_order")),
     )[:MAX_SELECTED_IMAGES]
     manifest_records: Dict[str, Dict[str, Any]] | None = None
-    if any(
-        _clean(asset.get("source_kind")).casefold() == "project"
-        and bool(asset.get("registered"))
-        for asset in ordered
-    ):
-        try:
-            project_root = _clean(normalized.get("project_root"))
-            manifest_records = (
-                _read_asset_manifest(Path(project_root)) if project_root else {}
-            )
-        except Exception:
-            # One failed shared-manifest read invalidates all project selections
-            # in this immutable resolution snapshot; retrying it per card only
-            # multiplies network latency and cannot produce a consistent result.
-            manifest_records = {}
+    manifest_loaded = False
     resolved: List[Dict[str, Any]] = []
     unresolved: List[Dict[str, Any]] = []
     for asset in ordered:
@@ -3104,25 +3249,58 @@ def _resolve_selected_assets(
         source_uid = _clean(asset.get("source_uid"))
         image_name = _clean(asset.get("image_name"))
         source_kind = _clean(asset.get("source_kind")).casefold()
-        relative_path = ""
-        media_value = ""
-        reason = ""
-        if source_kind == "project":
-            relative_path = _verified_project_relative_path(
-                asset,
-                normalized,
-                manifest_records,
-            )
-            if relative_path:
-                media_value = _resolved_media_value(asset.get("path"))
+        cache_key = _asset_resolution_cache_key(
+            asset,
+            normalized,
+            import_revision,
+        )
+        cached = (
+            None
+            if force
+            else _resolution_cache_get(resolution_cache, cache_key)
+        )
+        if cached is None:
+            relative_path = ""
+            media_value = ""
+            reason = ""
+            if source_kind == "project":
+                if not manifest_loaded:
+                    manifest_loaded = True
+                    try:
+                        project_root = _clean(normalized.get("project_root"))
+                        manifest_records = (
+                            _read_asset_manifest(Path(project_root))
+                            if project_root
+                            else {}
+                        )
+                    except Exception:
+                        # One failed shared-manifest read invalidates all project
+                        # selections in this immutable resolution snapshot.
+                        manifest_records = {}
+                relative_path = _verified_project_relative_path(
+                    asset,
+                    normalized,
+                    manifest_records,
+                )
+                if relative_path:
+                    media_value = _resolved_media_value(asset.get("path"))
+                else:
+                    reason = "project_asset_verification_failed"
             else:
-                reason = "project_asset_verification_failed"
-        else:
-            media_value = _resolved_media_value(asset.get("path"))
-            if not media_value:
-                media_value = _resolved_media_value(media_lookup.get(source_uid))
-            if not media_value:
-                reason = "external_media_unavailable"
+                media_value = _resolved_media_value(asset.get("path"))
+                if not media_value:
+                    media_value = _resolved_media_value(media_lookup.get(source_uid))
+                if not media_value:
+                    reason = "external_media_unavailable"
+            cached = {
+                "relative_path": relative_path,
+                "media": media_value,
+                "reason": reason,
+            }
+            _resolution_cache_put(resolution_cache, cache_key, cached)
+        relative_path = _clean(cached.get("relative_path"))
+        media_value = _clean(cached.get("media"))
+        reason = _clean(cached.get("reason"))
         if not media_value:
             unresolved.append(
                 {
@@ -3366,9 +3544,19 @@ def _build_output_payload(
 def _build_synchronized_outputs(
     state: Dict[str, Any],
     media_by_uid: Dict[str, Any],
+    *,
+    resolution_cache: OrderedDict[str, Dict[str, Any]] | None = None,
+    import_revision: int = 0,
+    force: bool = False,
 ) -> tuple[Dict[str, Any], List[str]]:
     """Build both public outputs from one immutable resolution snapshot."""
-    selection = _resolve_selected_assets(state, media_by_uid)
+    selection = _resolve_selected_assets(
+        state,
+        media_by_uid,
+        resolution_cache=resolution_cache,
+        import_revision=import_revision,
+        force=force,
+    )
     return (
         _build_output_payload(
             selection["state"],
@@ -3400,14 +3588,17 @@ _OUTPUT_FINGERPRINT_ASSET_FIELDS = (
 )
 
 
-def _project_output_fingerprint(state: Dict[str, Any]) -> str | None:
-    """Fingerprint an in-memory project-only output resolution snapshot.
+def _project_output_fingerprint(
+    state: Dict[str, Any],
+    media_by_uid: Dict[str, Any] | None = None,
+    import_revision: int = 0,
+) -> str:
+    """Fingerprint an in-memory output-resolution snapshot.
 
     UI fields are intentionally excluded so a search, language, or panel click
     does not touch the filesystem. Manifest polling advances the state signature
     for normal UI updates, while ``process()`` forces a fresh filesystem-backed
-    resolution before execution. Imported media is deliberately ineligible
-    because host artifact objects can change without a stable state signature.
+    resolution before execution.
     """
     selected = sorted(
         [
@@ -3417,12 +3608,6 @@ def _project_output_fingerprint(state: Dict[str, Any]) -> str | None:
         ],
         key=lambda asset: _non_negative_int(asset.get("selection_order")),
     )[:MAX_SELECTED_IMAGES]
-    if any(
-        _clean(asset.get("source_kind")).casefold() != "project"
-        for asset in selected
-    ):
-        return None
-
     selected_payload: List[Dict[str, Any]] = []
     for asset in selected:
         item = {
@@ -3432,6 +3617,8 @@ def _project_output_fingerprint(state: Dict[str, Any]) -> str | None:
         item["color_pick_candidates"] = list(
             asset.get("color_pick_candidates") or []
         )
+        if _clean(asset.get("source_kind")).casefold() != "project":
+            item["import_revision"] = _non_negative_int(import_revision)
         selected_payload.append(item)
 
     canonical = json.dumps(
@@ -3966,6 +4153,10 @@ class HMBImageAssetLibrary(DataNode):
             _diagnostic_exception("Image asset node UI sizing failed", exc)
 
         self._hmb_import_media_by_uid: Dict[str, Any] = {}
+        self._hmb_import_revision = 0
+        self._hmb_import_media_identity = _import_media_map_identity({})
+        self._hmb_resolution_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+        self._hmb_resolution_cache_identity = ""
         self._hmb_last_resolution_warning = ""
         self._hmb_last_output_fingerprint = ""
         self._hmb_last_output_pair: tuple[Any, Any] | None = None
@@ -3989,6 +4180,26 @@ class HMBImageAssetLibrary(DataNode):
             _get_parameter_raw(self, WIDGET_STATE_PARAMETER)
         )
 
+    def _replace_import_media(self, media_by_uid: Dict[str, Any] | None) -> None:
+        """Install one authoritative import snapshot and retire stale resolutions."""
+        normalized_media = (
+            dict(media_by_uid) if isinstance(media_by_uid, dict) else {}
+        )
+        identity = _import_media_map_identity(normalized_media)
+        if identity != getattr(self, "_hmb_import_media_identity", ""):
+            self._hmb_import_revision = (
+                _non_negative_int(getattr(self, "_hmb_import_revision", 0)) + 1
+            )
+            cache = getattr(self, "_hmb_resolution_cache", None)
+            if isinstance(cache, OrderedDict):
+                cache.clear()
+            self._hmb_resolution_cache_identity = ""
+            # Keep the last pair staged until its replacement is complete, but
+            # never treat it as current after IMAGE_IMPORT_IN changed.
+            self._hmb_last_output_fingerprint = ""
+            self._hmb_import_media_identity = identity
+        self._hmb_import_media_by_uid = normalized_media
+
     def _sync_output(
         self,
         state: Dict[str, Any],
@@ -3996,7 +4207,29 @@ class HMBImageAssetLibrary(DataNode):
         force: bool = False,
     ) -> Dict[str, Any]:
         normalized = _normalize_state(state)
-        output_fingerprint = _project_output_fingerprint(normalized)
+        resolution_cache = getattr(self, "_hmb_resolution_cache", None)
+        if not isinstance(resolution_cache, OrderedDict):
+            resolution_cache = OrderedDict()
+            self._hmb_resolution_cache = resolution_cache
+        resolution_identity = _resolution_cache_state_identity(normalized)
+        if resolution_identity != getattr(
+            self,
+            "_hmb_resolution_cache_identity",
+            "",
+        ):
+            resolution_cache.clear()
+            self._hmb_resolution_cache_identity = resolution_identity
+        import_media = getattr(self, "_hmb_import_media_by_uid", {})
+        if not isinstance(import_media, dict):
+            import_media = {}
+        import_revision = _non_negative_int(
+            getattr(self, "_hmb_import_revision", 0)
+        )
+        output_fingerprint = _project_output_fingerprint(
+            normalized,
+            import_media,
+            import_revision,
+        )
         cached_pair = getattr(self, "_hmb_last_output_pair", None)
         if (
             not force
@@ -4047,7 +4280,10 @@ class HMBImageAssetLibrary(DataNode):
             return normalized
         output_payload, media_values = _build_synchronized_outputs(
             normalized,
-            self._hmb_import_media_by_uid,
+            import_media,
+            resolution_cache=resolution_cache,
+            import_revision=import_revision,
+            force=force,
         )
         asset_output_value = _json_text(output_payload)
         media_output_value = (
@@ -4148,11 +4384,11 @@ class HMBImageAssetLibrary(DataNode):
     def _apply_import_value(self, value: Any) -> Dict[str, Any]:
         state = self._current_state()
         if not _flatten_import_values(value):
-            self._hmb_import_media_by_uid = {}
+            self._replace_import_media({})
             return self._publish_state(_remove_live_imports(state))
         try:
             state, media_by_uid = _merge_import_input(state, value)
-            self._hmb_import_media_by_uid = media_by_uid
+            self._replace_import_media(media_by_uid)
             return self._publish_state(state)
         except Exception as exc:
             state = dict(state)
@@ -4192,7 +4428,7 @@ class HMBImageAssetLibrary(DataNode):
                     refreshed,
                     import_value,
                 )
-                self._hmb_import_media_by_uid = media_by_uid
+                self._replace_import_media(media_by_uid)
             self._hmb_last_manifest_poll_error = ""
             return self._publish_state(refreshed)
         except Exception as exc:
@@ -4248,7 +4484,9 @@ class HMBImageAssetLibrary(DataNode):
                         == disconnect_import_uid
                     )
                 ]
-                self._hmb_import_media_by_uid.pop(disconnect_import_uid, None)
+                remaining_media = dict(self._hmb_import_media_by_uid)
+                remaining_media.pop(disconnect_import_uid, None)
+                self._replace_import_media(remaining_media)
                 state["scan_revision"] = _non_negative_int(
                     state.get("scan_revision")
                 ) + 1
@@ -4273,7 +4511,7 @@ class HMBImageAssetLibrary(DataNode):
                         state,
                         import_value,
                     )
-                    self._hmb_import_media_by_uid = media_by_uid
+                    self._replace_import_media(media_by_uid)
                 return self._publish_state(state)
             except Exception as exc:
                 state["asset_registration_result"] = {
@@ -4321,7 +4559,7 @@ class HMBImageAssetLibrary(DataNode):
                         state,
                         import_value,
                     )
-                    self._hmb_import_media_by_uid = media_by_uid
+                    self._replace_import_media(media_by_uid)
                 return self._publish_state(state)
             except Exception as exc:
                 state["catalog_root"] = current_catalog.replace("\\", "/")
@@ -4340,7 +4578,7 @@ class HMBImageAssetLibrary(DataNode):
                         state,
                         import_value,
                     )
-                    self._hmb_import_media_by_uid = media_by_uid
+                    self._replace_import_media(media_by_uid)
                 return self._publish_state(state)
             except Exception as exc:
                 state["error"] = str(exc)
@@ -4377,7 +4615,7 @@ class HMBImageAssetLibrary(DataNode):
                         state,
                         import_value,
                     )
-                    self._hmb_import_media_by_uid = media_by_uid
+                    self._replace_import_media(media_by_uid)
                 return self._publish_state(state)
             except Exception as exc:
                 state["error"] = str(exc)
@@ -4396,37 +4634,73 @@ class HMBImageAssetLibrary(DataNode):
         if name == WIDGET_STATE_PARAMETER:
             raw_state = dict(_parse_mapping(value))
             poll_nonce = _clean(raw_state.pop("__hmb_manifest_poll_nonce", ""))[:128]
-            self._hmb_manifest_poll_received = bool(poll_nonce)
-            if poll_nonce and poll_nonce != self._hmb_last_manifest_poll_nonce:
-                self._hmb_last_manifest_poll_nonce = poll_nonce
-                self._hmb_manifest_poll_pending = False
-                candidate = _normalize_state(raw_state)
-                try:
-                    catalog = _discover_project_catalog(candidate.get("catalog_root"))
-                    selected = _match_catalog_project(
-                        catalog["projects"],
-                        previous_path=candidate.get("project_root"),
-                        previous_uid=candidate.get("project_uid"),
-                        previous_project_id=candidate.get("project_id"),
+            # Poll flags describe this exact value-set only.  In particular,
+            # never leave a pending flag behind when an unchanged canonical
+            # value is suppressed by the host and no post-set hook follows.
+            self._hmb_manifest_poll_received = False
+            self._hmb_manifest_poll_pending = False
+            if not poll_nonce:
+                return _json_text(_normalize_state(raw_state))
+
+            current_raw = dict(
+                _parse_mapping(
+                    _get_parameter_raw(self, WIDGET_STATE_PARAMETER)
+                )
+            )
+            # Older tests/hosts may not expose the pre-set value.  A full
+            # legacy poll payload remains a valid fallback, while lightweight
+            # polls merge only their identity fields into this authoritative
+            # current snapshot and never normalize a client-sent catalog.
+            candidate = _normalize_state(current_raw or raw_state)
+            if poll_nonce == getattr(self, "_hmb_last_manifest_poll_nonce", ""):
+                return _json_text(candidate)
+            self._hmb_last_manifest_poll_nonce = poll_nonce
+
+            identity_matches = True
+            for field in (
+                "catalog_root",
+                "project_root",
+                "project_id",
+                "project_uid",
+                "manifest_signature",
+            ):
+                supplied = _clean(raw_state.get(field))
+                if not supplied:
+                    continue
+                authoritative = _clean(candidate.get(field))
+                if field in {"catalog_root", "project_root"}:
+                    supplied = _project_root_text(supplied).replace("\\", "/").casefold()
+                    authoritative = (
+                        _project_root_text(authoritative)
+                        .replace("\\", "/")
+                        .casefold()
                     )
-                    if selected is not None:
-                        signature = _asset_manifest_signature(Path(selected["path"]))
-                        if signature != _clean(candidate.get("manifest_signature")):
-                            # Guarantee a real parameter-value change so hosts
-                            # that suppress identical values still invoke the
-                            # post-set refresh hook.
-                            candidate["scan_revision"] = (
-                                _non_negative_int(candidate.get("scan_revision")) + 1
-                            )
-                            self._hmb_manifest_poll_pending = True
-                    self._hmb_last_manifest_poll_error = ""
-                except Exception as exc:
-                    message = _clean(exc)
-                    if message != self._hmb_last_manifest_poll_error:
-                        _diagnostic_exception("Shared manifest probe failed", exc)
-                        self._hmb_last_manifest_poll_error = message
-                raw_state = candidate
-            return _json_text(_normalize_state(raw_state))
+                if supplied != authoritative:
+                    identity_matches = False
+                    break
+            if not identity_matches:
+                return _json_text(candidate)
+
+            try:
+                project_root = _clean(candidate.get("project_root"))
+                if project_root:
+                    signature = _asset_manifest_signature(Path(project_root))
+                    if signature != _clean(candidate.get("manifest_signature")):
+                        # Guarantee a real parameter-value change so hosts
+                        # that suppress identical values still invoke the
+                        # post-set refresh hook.
+                        candidate["scan_revision"] = (
+                            _non_negative_int(candidate.get("scan_revision")) + 1
+                        )
+                        self._hmb_manifest_poll_received = True
+                        self._hmb_manifest_poll_pending = True
+                self._hmb_last_manifest_poll_error = ""
+            except Exception as exc:
+                message = _clean(exc)
+                if message != self._hmb_last_manifest_poll_error:
+                    _diagnostic_exception("Shared manifest probe failed", exc)
+                    self._hmb_last_manifest_poll_error = message
+            return _json_text(_normalize_state(candidate))
         if name == PROJECT_ROOT_PARAMETER:
             return _project_root_text(value)
         return value

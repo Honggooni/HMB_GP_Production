@@ -10,6 +10,68 @@ const assetSource = fs.readFileSync(ASSET_WIDGET_PATH, "utf8");
 const assetWidget = await import(ASSET_WIDGET_PATH);
 
 
+const makeSelectedTrayCard = (asset) => {
+  const attributes = new Map([["data-selected-key", asset.asset_library_id]]);
+  const classes = new Set(["selected-card"]);
+  const control = () => ({
+    disabled: false,
+    attributes: new Map(),
+    setAttribute(name, value) { this.attributes.set(name, String(value)); },
+    removeAttribute(name) { this.attributes.delete(name); },
+  });
+  const slot = { textContent: "" };
+  const moveLeft = control();
+  const moveRight = control();
+  const remove = control();
+  return {
+    imageIdentity: {},
+    parentTray: null,
+    classList: {
+      toggle(name, enabled) {
+        if (enabled) classes.add(name);
+        else classes.delete(name);
+      },
+    },
+    getAttribute(name) { return attributes.get(name) || ""; },
+    setAttribute(name, value) { attributes.set(name, String(value)); },
+    querySelector(selector) {
+      if (selector === ".slot") return slot;
+      if (selector === '[data-move="-1"]') return moveLeft;
+      if (selector === '[data-move="1"]') return moveRight;
+      if (selector === "[data-remove-selected]") return remove;
+      return null;
+    },
+    remove() { this.parentTray?.removeChild?.(this); },
+  };
+};
+
+const makeSelectedTray = (scrollLeft = 0) => ({
+  children: [],
+  scrollLeft,
+  querySelectorAll(selector) {
+    return selector === "[data-selected-key]"
+      ? this.children.filter((child) => child.getAttribute?.("data-selected-key"))
+      : [];
+  },
+  querySelector(selector) {
+    if (selector === ".tray-empty") {
+      return this.children.find((child) => child.className === "tray-empty") || null;
+    }
+    return null;
+  },
+  appendChild(child) {
+    this.removeChild(child);
+    child.parentTray = this;
+    this.children.push(child);
+    return child;
+  },
+  removeChild(child) {
+    const index = this.children.indexOf(child);
+    if (index >= 0) this.children.splice(index, 1);
+    if (child?.parentTray === this) child.parentTray = null;
+  },
+});
+
 const feedbackClasses = new Set();
 const feedbackAttributes = new Map([["data-asset-key", "asset-feedback"]]);
 const feedbackCard = {
@@ -23,7 +85,7 @@ const feedbackCard = {
   setAttribute(name, value) { feedbackAttributes.set(name, String(value)); },
 };
 const trayCount = { textContent: "" };
-const tray = { innerHTML: "", scrollLeft: 19 };
+const tray = makeSelectedTray(19);
 const statusAttributes = new Map();
 const status = {
   textContent: "",
@@ -53,7 +115,9 @@ const feedbackState = assetWidget.hmbNormalizeImageAssetState({
   }],
 });
 
-assetWidget.hmbApplyImageAssetSelectionFeedback(feedbackContainer, feedbackState);
+assetWidget.hmbApplyImageAssetSelectionFeedback(feedbackContainer, feedbackState, {
+  createSelectedCard: makeSelectedTrayCard,
+});
 assert.equal(
   feedbackClasses.has("selected"),
   true,
@@ -61,9 +125,9 @@ assert.equal(
 );
 assert.equal(feedbackAttributes.get("aria-pressed"), "true");
 assert.equal(trayCount.textContent, "1/50");
-assert.match(
-  tray.innerHTML,
-  /data-selected-key="asset-feedback"/,
+assert.equal(
+  tray.children[0]?.getAttribute?.("data-selected-key"),
+  "asset-feedback",
   "A click must populate the selected tray locally.",
 );
 assert.equal(tray.scrollLeft, 19, "Local tray replacement must retain scroll position.");
@@ -73,6 +137,176 @@ assert.deepEqual(
   assetWidget.hmbNormalizeImageAssetState(feedbackState),
   "Local feedback must remain canonical so an exact host echo skips remount.",
 );
+const canonicalStamp = assetWidget.hmbImageAssetAuthorityStamp(feedbackState);
+const exactEchoContainer = {};
+let exactEchoValue = "";
+const publishedCanonical = assetWidget.hmbPublishImageAssetState(
+  exactEchoContainer,
+  { onChange(value) { exactEchoValue = value; } },
+  feedbackState,
+  null,
+  { suppressMatchingEcho: true },
+);
+assert.equal(publishedCanonical, feedbackState, "A canonical local state must not be normalized again before publish.");
+assert.equal(assetWidget.hmbImageAssetAuthorityStamp(publishedCanonical), canonicalStamp);
+assert.equal(assetWidget.hmbConsumeImageAssetStateEcho(exactEchoContainer, { value: exactEchoValue }), true);
+assert.equal(assetWidget.hmbConsumeImageAssetStateEcho(exactEchoContainer, { value: exactEchoValue }), false);
+
+// A production-sized catalog must keep the same bounded foreground work on
+// clicks 3/6/9/12. The former path cloned and stringified all 5,000 records,
+// touched every grid card, and rebuilt all selected thumbnail nodes per click.
+const cadenceAssetCount = 5000;
+const cadenceState = assetWidget.hmbNormalizeImageAssetState({
+  project_root: "C:/cadence-project",
+  project_id: "cadence-project",
+  project_uid: "cadence-project-uid",
+  assets: Array.from({ length: cadenceAssetCount }, (_, index) => ({
+    asset_library_id: `cadence-${index}`,
+    source_uid: `project:cadence-${index}`,
+    source_kind: "project",
+    asset_project_uid: "cadence-project-uid",
+    registered: true,
+    asset_id: `Cadence_${index}`,
+    image_name: `Cadence ${index}`,
+    selected: false,
+    selection_order: 0,
+  })),
+});
+let cadenceFullCardScans = 0;
+let cadenceRootRemounts = 0;
+const cadenceGridCards = cadenceState.assets.map((asset) => {
+  const attributes = new Map([["data-asset-key", asset.asset_library_id]]);
+  return {
+    writes: 0,
+    classList: { toggle() { this.owner.writes += 1; }, owner: null },
+    getAttribute(name) { return attributes.get(name) || ""; },
+    setAttribute(name, value) {
+      attributes.set(name, String(value));
+      this.writes += 1;
+    },
+  };
+});
+cadenceGridCards.forEach((card) => { card.classList.owner = card; });
+const cadenceTray = makeSelectedTray(41);
+const cadenceTrayCount = { textContent: "" };
+const cadenceStatus = { textContent: "", setAttribute() {} };
+const cadenceContainer = {
+  querySelectorAll(selector) {
+    if (selector === "[data-asset-key]") {
+      cadenceFullCardScans += 1;
+      return cadenceGridCards;
+    }
+    return [];
+  },
+  querySelector(selector) {
+    if (selector === ".tray-scroll") return cadenceTray;
+    if (selector === ".tray-head em") return cadenceTrayCount;
+    if (selector === ".toolbar-status strong") return cadenceStatus;
+    return null;
+  },
+};
+Object.defineProperty(cadenceContainer, "innerHTML", {
+  configurable: true,
+  get() { return ""; },
+  set() { cadenceRootRemounts += 1; },
+});
+
+const cadenceFrames = new Map();
+const cadenceTimers = new Map();
+let cadenceHandle = 0;
+let cadencePublishCount = 0;
+const cadenceSavedAnimationFrame = globalThis.requestAnimationFrame;
+const cadenceSavedCancelAnimationFrame = globalThis.cancelAnimationFrame;
+const cadenceSavedSetTimeout = globalThis.setTimeout;
+const cadenceSavedClearTimeout = globalThis.clearTimeout;
+globalThis.requestAnimationFrame = (callback) => {
+  const id = ++cadenceHandle;
+  cadenceFrames.set(id, callback);
+  return id;
+};
+globalThis.cancelAnimationFrame = (id) => cadenceFrames.delete(id);
+globalThis.setTimeout = (callback) => {
+  const id = ++cadenceHandle;
+  cadenceTimers.set(id, callback);
+  return id;
+};
+globalThis.clearTimeout = (id) => cadenceTimers.delete(id);
+try {
+  let cadenceSelected = [];
+  const retainedIdentity = new Map();
+  const cadenceCheckpoints = [];
+  for (let click = 1; click <= 12; click += 1) {
+    const asset = cadenceState.assets[click - 1];
+    const card = cadenceGridCards[click - 1];
+    const previousSelectedCount = cadenceSelected.length;
+    asset.selected = true;
+    asset.selection_order = click;
+    cadenceSelected = [...cadenceSelected, asset];
+    card.writes = 0;
+    const result = assetWidget.hmbApplyImageAssetSelectionFeedback(
+      cadenceContainer,
+      cadenceState,
+      {
+        changedAsset: asset,
+        changedCard: card,
+        previousSelectedCount,
+        selectedAssets: cadenceSelected,
+        createSelectedCard: makeSelectedTrayCard,
+      },
+    );
+    assert.equal(result.cardScanCount, 0);
+    assert.deepEqual(result.tray, { created: 1, removed: 0, retained: click - 1 });
+    assert.equal(card.writes, 5, "Only the clicked grid card may receive selection writes.");
+    cadenceTray.children.forEach((trayCard) => {
+      const key = trayCard.getAttribute("data-selected-key");
+      if (retainedIdentity.has(key)) {
+        assert.equal(trayCard, retainedIdentity.get(key).card);
+        assert.equal(trayCard.imageIdentity, retainedIdentity.get(key).image);
+      } else {
+        retainedIdentity.set(key, { card: trayCard, image: trayCard.imageIdentity });
+      }
+    });
+    assetWidget.hmbScheduleImageAssetSelectionCommit(cadenceContainer, () => {
+      cadencePublishCount += 1;
+    });
+    if (click % 3 === 0) {
+      cadenceCheckpoints.push({
+        click,
+        cardWrites: card.writes,
+        fullCardScans: cadenceFullCardScans,
+        rootRemounts: cadenceRootRemounts,
+        created: result.tray.created,
+        removed: result.tray.removed,
+      });
+    }
+  }
+  while (cadenceFrames.size) {
+    const [id, callback] = cadenceFrames.entries().next().value;
+    cadenceFrames.delete(id);
+    callback();
+  }
+  assert.equal(cadencePublishCount, 1, "Twelve rapid clicks must publish one coalesced state.");
+  assert.equal(cadenceTimers.size, 0, "The successful commit must cancel its fallback timer.");
+  assert.deepEqual(
+    cadenceCheckpoints,
+    [3, 6, 9, 12].map((click) => ({
+      click,
+      cardWrites: 5,
+      fullCardScans: 0,
+      rootRemounts: 0,
+      created: 1,
+      removed: 0,
+    })),
+    "Clicks 3/6/9/12 must retain identical bounded foreground work.",
+  );
+} finally {
+  if (cadenceSavedAnimationFrame === undefined) delete globalThis.requestAnimationFrame;
+  else globalThis.requestAnimationFrame = cadenceSavedAnimationFrame;
+  if (cadenceSavedCancelAnimationFrame === undefined) delete globalThis.cancelAnimationFrame;
+  else globalThis.cancelAnimationFrame = cadenceSavedCancelAnimationFrame;
+  globalThis.setTimeout = cadenceSavedSetTimeout;
+  globalThis.clearTimeout = cadenceSavedClearTimeout;
+}
 
 const scheduledFrames = [];
 let commitCount = 0;
@@ -414,6 +648,10 @@ const installEventsSource = assetSource.match(
 const toggleSource = installEventsSource.match(
   /const toggle = \(\) => \{[\s\S]*?\n    \};/,
 )?.[0] || "";
+const ordinaryToggleSource = toggleSource.slice(
+  0,
+  toggleSource.indexOf("hmbScheduleImageAssetSelectionCommit(container"),
+);
 assert.match(
   installEventsSource,
   /const assetsByLibraryId = new Map\(/,
@@ -425,14 +663,14 @@ assert.doesNotMatch(
   "Per-card installation must not rescan the full asset list.",
 );
 assert.ok(
-  toggleSource.indexOf("hmbApplyImageAssetSelectionFeedback(container, state)")
+  toggleSource.indexOf("hmbApplyImageAssetSelectionFeedback(container, state")
     < toggleSource.indexOf("hmbScheduleImageAssetSelectionCommit(container"),
   "Local card/tray feedback must precede host publication.",
 );
 assert.doesNotMatch(
-  toggleSource,
-  /remount\(state\)/,
-  "Grid selection must not rebuild the complete 5,000-card DOM.",
+  ordinaryToggleSource,
+  /normalizeState\(|JSON\.stringify\(|compactSelectionOrder\(|remount\(/,
+  "Ordinary grid feedback must not clone state, stringify the catalog, compact 5,000 rows, or remount the dashboard.",
 );
 assert.match(
   installEventsSource,
@@ -456,7 +694,7 @@ assert.match(
 );
 assert.match(
   assetSource,
-  /if \(baseValue && JSON\.stringify\(nextState\) === baseValue\)[\s\S]*?return;[\s\S]*?__hmbImageAssetPendingAuthoritativeProps = \{\s*state: nextState/,
+  /__hmbImageAssetSelectionBasePropValue[\s\S]*?nextProps\?\.value === container\.__hmbImageAssetSelectionBasePropValue[\s\S]*?return;[\s\S]*?__hmbImageAssetPendingAuthoritativeProps = \{\s*state: nextState/,
   "Only an exact pre-click echo may be consumed; newer authority must be retained for selection-delta merge.",
 );
 assert.match(
@@ -471,8 +709,8 @@ assert.match(
 );
 assert.match(
   toggleSource,
-  /rollbackState = pending\.state[\s\S]*?emit\(props, publishedState, container, \(\) => \{\s*remount\(rollbackState\);/,
-  "A latest selection transport failure must repaint the prior authoritative snapshot.",
+  /rollbackState = pending\.state[\s\S]*?if \(rollbackState\) \{\s*remount\(rollbackState\);[\s\S]*?hmbRestoreImageAssetSelectionSnapshot\(state, baseSelection\)/,
+  "A latest selection transport failure must restore pending authority or the compact base selection snapshot.",
 );
 assert.match(
   assetSource,
@@ -481,7 +719,7 @@ assert.match(
 );
 assert.match(
   assetSource,
-  /function emit\(props, state, container = null, onFailure = null\) \{\s*return hmbPublishImageAssetState\(container, props, state, onFailure\);/,
+  /function emit\(props, state, container = null, onFailure = null, options = \{\}\) \{\s*return hmbPublishImageAssetState\(container, props, state, onFailure, options\);/,
   "Every generic Image state emit must pass through the owner-guarded transport retry boundary.",
 );
 assert.match(

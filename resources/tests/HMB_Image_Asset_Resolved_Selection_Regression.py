@@ -55,9 +55,37 @@ state["assets"] = [
 ]
 state = asset_library._normalize_state(state)
 media_by_uid = {"import:third": b"third-image-bytes"}
-assert asset_library._project_output_fingerprint(state) is None, (
-    "Dynamic IMAGE_IMPORT_IN artifacts must never enter the project-file cache."
+import_fingerprint = asset_library._project_output_fingerprint(
+    state,
+    media_by_uid,
+    1,
 )
+assert import_fingerprint == asset_library._project_output_fingerprint(
+    state,
+    media_by_uid,
+    1,
+), "An unchanged import snapshot must have a stable output fingerprint."
+assert import_fingerprint != asset_library._project_output_fingerprint(
+    state,
+    {"import:third": b"replacement-image-bytes"},
+    2,
+), "An import revision/media replacement must invalidate the output fingerprint."
+
+# Large embedded imports are fingerprinted once when the authoritative import
+# snapshot changes. Ordinary selection/reorder sync must use that revision and
+# never hash the complete data URI again on the UI request path.
+original_media_identity = asset_library._media_resolution_identity
+asset_library._media_resolution_identity = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+    AssertionError("Selection sync re-hashed the imported payload.")
+)
+try:
+    assert asset_library._project_output_fingerprint(
+        state,
+        {"import:third": "data:image/png;base64," + ("A" * 1_000_000)},
+        7,
+    )
+finally:
+    asset_library._media_resolution_identity = original_media_identity
 
 # One resolution snapshot drives both public outputs.  A missing middle image
 # cannot leave its metadata in @image2 while Third silently becomes fan-out #2.
@@ -224,9 +252,9 @@ with tempfile.TemporaryDirectory(prefix="hmb_asset_output_cache_", dir=temp_root
     original_build = asset_library._build_synchronized_outputs
     original_set_output = asset_library.set_output
 
-    def counted_build(state_value, media_value):
+    def counted_build(state_value, media_value, **kwargs):
         build_calls.append(1)
-        return original_build(state_value, media_value)
+        return original_build(state_value, media_value, **kwargs)
 
     asset_library._build_synchronized_outputs = counted_build
     def recorded_set_output(node, name, value):
@@ -413,5 +441,197 @@ with tempfile.TemporaryDirectory(prefix="hmb_asset_output_cache_", dir=temp_root
     finally:
         asset_library._build_synchronized_outputs = original_build
         asset_library.set_output = original_set_output
+
+
+# A node-local resolution cache verifies/encodes only the newly selected asset.
+# Selection order is output state, not file/media identity, while force=True is
+# the execution-time security boundary and therefore revalidates every item.
+def cache_test_node(media_by_uid: dict, import_revision: int = 0):
+    node = object.__new__(asset_library.HMBImageAssetLibrary)
+    node._hmb_import_media_by_uid = dict(media_by_uid)
+    node._hmb_import_revision = import_revision
+    node._hmb_import_media_identity = asset_library._import_media_map_identity(
+        media_by_uid
+    )
+    node._hmb_resolution_cache = asset_library.OrderedDict()
+    node._hmb_resolution_cache_identity = ""
+    node._hmb_last_resolution_warning = ""
+    node._hmb_last_output_fingerprint = ""
+    node._hmb_last_output_pair = None
+    node._hmb_output_notification_generation = 0
+    node._hmb_pending_output_notifications = {}
+    node.parameter_output_values = {}
+    node.publish_update_to_parameter = lambda _name, _value: None
+    return node
+
+
+def selection_state(base_state: dict, count: int, order=None) -> dict:
+    selected_state = asset_library._normalize_state(base_state)
+    order = list(order or range(1, len(selected_state["assets"]) + 1))
+    for index, item in enumerate(selected_state["assets"]):
+        item["selected"] = index < count
+        item["selection_order"] = order[index] if index < count else 0
+    return asset_library._normalize_state(selected_state)
+
+
+original_set_output = asset_library.set_output
+asset_library.set_output = (
+    lambda node, name, value: node.parameter_output_values.__setitem__(name, value)
+)
+try:
+    with tempfile.TemporaryDirectory(
+        prefix="hmb_asset_incremental_resolution_",
+        dir=temp_root,
+    ) as temporary:
+        project_root = Path(temporary)
+        metadata_root = project_root / asset_library.ASSET_METADATA_DIRECTORY_NAME
+        metadata_root.mkdir()
+        names = ["Hero", "Sidekick", "Prop"]
+        manifest_records = []
+        project_assets = []
+        project_id = project_root.name
+        project_uid = asset_library._project_uid(project_root)
+        for name in names:
+            relative_path = f"{name}.png"
+            image_path = project_root / relative_path
+            image_path.write_bytes(f"{name}-image".encode("ascii"))
+            manifest_records.append(
+                {
+                    "path": relative_path,
+                    "asset_id": name,
+                    "image_name": name,
+                    "source_type": "Character Appearance",
+                    "custom_source_type": "",
+                    "scope": "Head / face only",
+                }
+            )
+            project_assets.append(
+                {
+                    "asset_library_id": asset_library._asset_library_id(
+                        project_id,
+                        relative_path,
+                    ),
+                    "source_uid": f"project:{name.casefold()}",
+                    "source_kind": "project",
+                    "asset_project_uid": project_uid,
+                    "asset_id": name,
+                    "image_name": name,
+                    "path": str(image_path),
+                    "relative_path": relative_path,
+                    "extension": ".png",
+                    "width": 1,
+                    "height": 1,
+                    "source_type": "Character Appearance",
+                    "custom_source_type": "",
+                    "scope_candidate": "Head / face only",
+                    "registered": True,
+                    "selected": False,
+                    "selection_order": 0,
+                }
+            )
+        (metadata_root / asset_library.MANIFEST_NAMES[0]).write_text(
+            json.dumps({"assets": manifest_records}),
+            encoding="utf-8",
+        )
+        project_base = asset_library._default_state()
+        project_base.update(
+            {
+                "project_root": str(project_root),
+                "project_id": project_id,
+                "project_uid": project_uid,
+                "manifest_signature": asset_library._asset_manifest_signature(
+                    project_root
+                ),
+                "scan_revision": 9,
+                "assets": project_assets,
+            }
+        )
+        project_base = asset_library._normalize_state(project_base)
+        project_node = cache_test_node({})
+        verification_counts = []
+        original_verify = asset_library._verified_project_relative_path
+
+        def counted_verify(*args, **kwargs):
+            verification_counts.append(1)
+            return original_verify(*args, **kwargs)
+
+        asset_library._verified_project_relative_path = counted_verify
+        try:
+            for selected_count in (1, 2, 3):
+                project_node._sync_output(
+                    selection_state(project_base, selected_count)
+                )
+                assert len(verification_counts) == selected_count, (
+                    "Each added project selection must cause exactly one new "
+                    "authoritative file verification."
+                )
+            reordered_project = selection_state(project_base, 3, [3, 2, 1])
+            project_node._sync_output(reordered_project)
+            assert len(verification_counts) == 3, (
+                "Reordering must reuse verified project resolutions."
+            )
+            project_node._sync_output(reordered_project, force=True)
+            assert len(verification_counts) == 6, (
+                "force=True must freshly verify every selected project asset."
+            )
+            revised_catalog = asset_library._normalize_state(reordered_project)
+            revised_catalog["scan_revision"] += 1
+            project_node._sync_output(revised_catalog)
+            assert len(verification_counts) == 9, (
+                "A catalog/manifest revision must invalidate cached project "
+                "resolutions."
+            )
+        finally:
+            asset_library._verified_project_relative_path = original_verify
+
+    import_media = {
+        "import:first": b"first-bytes",
+        "import:second": b"second-bytes",
+        "import:third": b"third-bytes",
+    }
+    import_base = asset_library._default_state()
+    import_base["scan_revision"] = 4
+    import_base["assets"] = [
+        external_asset("First", 0),
+        external_asset("Second", 0),
+        external_asset("Third", 0),
+    ]
+    import_base = asset_library._normalize_state(import_base)
+    import_node = cache_test_node(import_media, import_revision=1)
+    encode_counts = []
+    original_b64encode = asset_library.base64.b64encode
+
+    def counted_b64encode(value, *args, **kwargs):
+        encode_counts.append(1)
+        return original_b64encode(value, *args, **kwargs)
+
+    asset_library.base64.b64encode = counted_b64encode
+    try:
+        for selected_count in (1, 2, 3):
+            import_node._sync_output(selection_state(import_base, selected_count))
+            assert len(encode_counts) == selected_count, (
+                "Each added import must be base64-encoded exactly once."
+            )
+        reordered_import = selection_state(import_base, 3, [3, 2, 1])
+        import_node._sync_output(reordered_import)
+        assert len(encode_counts) == 3, (
+            "Reordering must not re-encode unchanged imported bytes."
+        )
+        import_node._sync_output(reordered_import, force=True)
+        assert len(encode_counts) == 6, (
+            "force=True must freshly resolve every selected import."
+        )
+        replacement_media = dict(import_media)
+        replacement_media["import:third"] = b"replacement-third-bytes"
+        import_node._replace_import_media(replacement_media)
+        import_node._sync_output(reordered_import)
+        assert len(encode_counts) == 9, (
+            "An IMAGE_IMPORT_IN revision must invalidate cached import media."
+        )
+    finally:
+        asset_library.base64.b64encode = original_b64encode
+finally:
+    asset_library.set_output = original_set_output
+
 
 print("HMB Image Asset resolved-selection regression passed.")

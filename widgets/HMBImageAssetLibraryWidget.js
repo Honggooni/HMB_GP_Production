@@ -56,10 +56,13 @@ const IMAGE_ASSET_AUTO_SYNC_MS = 10000;
 const IMAGE_ASSET_AUTO_SYNC_JITTER_MS = 2000;
 const IMAGE_ASSET_AUTO_SYNC_PENDING_MS = 5000;
 const IMAGE_ASSET_SELECTION_COMMIT_FALLBACK_MS = 120;
+const IMAGE_ASSET_ECHO_EXPIRY_MS = 1500;
 let imageAssetWidgetMountSequence = 0;
 let imageAssetSelectionCommitSequence = 0;
 let imageAssetPublicationSequence = 0;
+let imageAssetAuthoritySequence = 0;
 const IMAGE_ASSET_TRANSPORT_RETRY_MS = 32;
+const IMAGE_ASSET_AUTHORITY_STAMP = Symbol("hmbImageAssetAuthorityStamp");
 const UNCLASSIFIED_SOURCE_TYPES = new Set([
   "",
   "Role Required / Select Source Type",
@@ -403,6 +406,25 @@ function normalizedFolders(inputFolders, assets) {
   }));
 }
 
+function markCanonicalImageAssetState(state) {
+  if (!state || typeof state !== "object") return state;
+  Object.defineProperty(state, IMAGE_ASSET_AUTHORITY_STAMP, {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: ++imageAssetAuthoritySequence,
+  });
+  return state;
+}
+
+function imageAssetAuthorityStamp(state) {
+  return Number(state?.[IMAGE_ASSET_AUTHORITY_STAMP]) || 0;
+}
+
+function isCanonicalImageAssetState(state) {
+  return imageAssetAuthorityStamp(state) > 0;
+}
+
 function normalizeState(value) {
   const input = parseValue(value);
   const taxonomyInput = input.taxonomy && typeof input.taxonomy === "object"
@@ -448,7 +470,7 @@ function normalizeState(value) {
   const selectedSourceView = clean(input.selected_source_view).toLowerCase() === "user"
     ? "user"
     : "project";
-  return {
+  return markCanonicalImageAssetState({
     schema: "hmb-image-asset-library-state",
     version: IMAGE_ASSET_STATE_VERSION,
     catalog_root: clean(
@@ -492,7 +514,7 @@ function normalizeState(value) {
         (asset) => asset.source_kind === "project" && !asset.registered,
       ).length,
     },
-  };
+  });
 }
 
 export function hmbNormalizeImageAssetState(value) {
@@ -511,6 +533,34 @@ export function hmbImageAssetSelectionSnapshot(state) {
     asset_library_id: clean(asset.asset_library_id),
     selection_order: Math.max(0, Number(asset.selection_order) || 0),
   }));
+}
+
+export function hmbRestoreImageAssetSelectionSnapshot(state, snapshot) {
+  if (!state || !Array.isArray(state.assets)) return state;
+  const selectedById = new Map(
+    (Array.isArray(snapshot) ? snapshot : [])
+      .map((item) => [
+        clean(item?.asset_library_id),
+        Math.max(0, Number(item?.selection_order) || 0),
+      ])
+      .filter(([key, order]) => key && order > 0),
+  );
+  let restoredCount = 0;
+  state.assets.forEach((asset) => {
+    const order = selectedById.get(clean(asset.asset_library_id)) || 0;
+    asset.selected = order > 0 && hmbImageAssetCanSelect(asset);
+    asset.selection_order = asset.selected ? order : 0;
+    if (asset.selected) restoredCount += 1;
+  });
+  compactSelectionOrder(state.assets);
+  if (state.status && typeof state.status === "object") {
+    state.status.selected_count = restoredCount;
+  }
+  return state;
+}
+
+export function hmbImageAssetAuthorityStamp(state) {
+  return imageAssetAuthorityStamp(state);
 }
 
 export function hmbMergeImageAssetSelectionDelta(
@@ -583,17 +633,70 @@ export function hmbMoveSelectedAsset(state, sourceKey, targetKey) {
   return true;
 }
 
+function hmbForgetImageAssetStateEcho(container, publicationToken = null) {
+  if (!container) return false;
+  const prior = Array.isArray(container.__hmbImageAssetPendingStateEchoes)
+    ? container.__hmbImageAssetPendingStateEchoes
+    : [];
+  const next = publicationToken == null
+    ? []
+    : prior.filter((item) => item?.publicationToken !== publicationToken);
+  if (next.length) container.__hmbImageAssetPendingStateEchoes = next;
+  else delete container.__hmbImageAssetPendingStateEchoes;
+  if (!next.length && container.__hmbImageAssetStateEchoTimer != null) {
+    try { clearTimeout(container.__hmbImageAssetStateEchoTimer); } catch (_error) {}
+    delete container.__hmbImageAssetStateEchoTimer;
+  }
+  return next.length !== prior.length;
+}
+
+function hmbRememberImageAssetStateEcho(container, value, publicationToken) {
+  if (!container || typeof value !== "string") return false;
+  const prior = Array.isArray(container.__hmbImageAssetPendingStateEchoes)
+    ? container.__hmbImageAssetPendingStateEchoes
+    : [];
+  container.__hmbImageAssetPendingStateEchoes = [
+    ...prior.filter((item) => item?.value !== value),
+    { value, publicationToken },
+  ].slice(-16);
+  if (container.__hmbImageAssetStateEchoTimer != null) {
+    try { clearTimeout(container.__hmbImageAssetStateEchoTimer); } catch (_error) {}
+  }
+  if (typeof setTimeout === "function") {
+    container.__hmbImageAssetStateEchoTimer = setTimeout(() => {
+      hmbForgetImageAssetStateEcho(container);
+    }, IMAGE_ASSET_ECHO_EXPIRY_MS);
+  }
+  return true;
+}
+
+export function hmbConsumeImageAssetStateEcho(container, nextProps = {}) {
+  const incoming = nextProps?.value;
+  const pending = container?.__hmbImageAssetPendingStateEchoes;
+  if (typeof incoming !== "string" || !Array.isArray(pending) || !pending.length) {
+    return false;
+  }
+  const match = pending.find((item) => item?.value === incoming);
+  if (!match) return false;
+  hmbForgetImageAssetStateEcho(container, match.publicationToken);
+  return true;
+}
+
 export function hmbPublishImageAssetState(
   container,
   props,
   state,
   onFailure = null,
+  options = {},
 ) {
   hmbClearImageAssetTransportRetry(container);
-  const normalized = normalizeState(state);
+  const normalized = isCanonicalImageAssetState(state) ? state : normalizeState(state);
   const value = JSON.stringify(normalized);
   const publicationToken = ++imageAssetPublicationSequence;
   if (container) container.__hmbImageAssetPublicationOwner = publicationToken;
+  if (options?.suppressMatchingEcho === true) {
+    hmbRememberImageAssetStateEcho(container, value, publicationToken);
+  }
   let attemptCount = 0;
   const maxRetries = typeof onFailure === "function" ? 0 : 1;
   const scheduleRetry = () => {
@@ -618,6 +721,7 @@ export function hmbPublishImageAssetState(
     if (!container || container.__hmbImageAssetPublicationOwner !== publicationToken) {
       return false;
     }
+    hmbForgetImageAssetStateEcho(container, publicationToken);
     container.__hmbImageAssetLastPublishError = {
       message: String(error?.message || error || "Image asset state publication failed"),
       publicationToken,
@@ -678,8 +782,8 @@ export function hmbInvalidateImageAssetPublication(container) {
   return publicationToken;
 }
 
-function emit(props, state, container = null, onFailure = null) {
-  return hmbPublishImageAssetState(container, props, state, onFailure);
+function emit(props, state, container = null, onFailure = null, options = {}) {
+  return hmbPublishImageAssetState(container, props, state, onFailure, options);
 }
 
 export function hmbDeferImageAssetPropsDuringRegistration(container, nextProps = {}) {
@@ -696,9 +800,15 @@ export function hmbTakeDeferredImageAssetProps(container) {
 }
 
 export function hmbImageAssetAutoSyncPayload(value, nonce) {
-  const payload = normalizeState(value);
-  payload.__hmb_manifest_poll_nonce = clean(nonce).slice(0, 128);
-  return JSON.stringify(payload);
+  const state = isCanonicalImageAssetState(value) ? value : normalizeState(value);
+  return JSON.stringify({
+    __hmb_manifest_poll_nonce: clean(nonce).slice(0, 128),
+    catalog_root: clean(state.catalog_root),
+    project_root: clean(state.project_root),
+    project_id: clean(state.project_id),
+    project_uid: clean(state.project_uid),
+    manifest_signature: clean(state.manifest_signature),
+  });
 }
 
 function projectOptions(state) {
@@ -1097,55 +1207,175 @@ function renderSelectedCard(asset, index, selected, state) {
   `;
 }
 
-export function hmbApplyImageAssetSelectionFeedback(container, state) {
-  if (!container || !state || !Array.isArray(state.assets)) return;
-  const selected = selectedAssets(state);
+function hmbApplyImageAssetCardFeedback(card, asset, selectedCount, state) {
+  if (!card || !asset) return false;
+  const selectable = hmbImageAssetCanSelect(asset);
+  const selectionBlocked = selectable && !asset.selected && selectedCount >= MAX_SELECTED_IMAGES;
+  card.classList?.toggle("selected", Boolean(asset.selected));
+  card.classList?.toggle("selection-blocked", selectionBlocked);
+  card.setAttribute?.("data-selection-disabled", selectionBlocked ? "1" : "0");
+  if (selectable) card.setAttribute?.("aria-pressed", asset.selected ? "true" : "false");
+  const title = !selectable
+    ? imageAssetText(state, "register_before_select")
+    : selectionBlocked
+      ? imageAssetText(state, "image_limit")
+      : imageAssetText(state, "click_select");
+  card.setAttribute?.("title", title);
+  return true;
+}
+
+function hmbCreateSelectedAssetCard(tray, asset, index, selected, state, factory = null) {
+  if (typeof factory === "function") {
+    return factory(asset, index, selected, state, renderSelectedCard(asset, index, selected, state));
+  }
+  const ownerDocument = tray?.ownerDocument || (typeof document !== "undefined" ? document : null);
+  if (!ownerDocument?.createElement) return null;
+  const template = ownerDocument.createElement("template");
+  template.innerHTML = renderSelectedCard(asset, index, selected, state).trim();
+  return template.content?.firstElementChild || null;
+}
+
+function hmbUpdateSelectedAssetCard(card, asset, index, selected, state) {
+  if (!card || !asset) return false;
+  const number = String(index + 1).padStart(2, "0");
+  const externalImport = asset.source_kind === "user" && Number(asset.import_index || 0) > 0;
+  const disconnectPending = externalImport && state.disconnect_import_uid === asset.source_uid;
+  const removeKey = disconnectPending
+    ? "disconnecting_external_import"
+    : externalImport
+      ? "remove_external_selection"
+      : "remove_selection";
+  const removeTitle = imageAssetText(state, removeKey);
+  card.classList?.toggle("missing", !asset.connected);
+  card.setAttribute?.("data-selected-key", asset.asset_library_id);
+  card.setAttribute?.("aria-label", `${number} ${asset.image_name}`);
+  card.setAttribute?.("title", asset.image_name);
+  const slot = card.querySelector?.(".slot");
+  if (slot) slot.textContent = number;
+  const moveLeft = card.querySelector?.('[data-move="-1"]');
+  if (moveLeft) moveLeft.disabled = index === 0;
+  const moveRight = card.querySelector?.('[data-move="1"]');
+  if (moveRight) moveRight.disabled = index >= selected.length - 1;
+  const remove = card.querySelector?.("[data-remove-selected]");
+  if (remove) {
+    remove.disabled = disconnectPending;
+    remove.setAttribute?.("title", removeTitle);
+    remove.setAttribute?.("aria-label", removeTitle);
+    if (disconnectPending) remove.setAttribute?.("aria-busy", "true");
+    else remove.removeAttribute?.("aria-busy");
+  }
+  return true;
+}
+
+function hmbCreateSelectedAssetTrayEmpty(tray, state, factory = null) {
+  if (typeof factory === "function") return factory(state);
+  const ownerDocument = tray?.ownerDocument || (typeof document !== "undefined" ? document : null);
+  if (!ownerDocument?.createElement) return null;
+  const empty = ownerDocument.createElement("div");
+  empty.className = "tray-empty";
+  empty.textContent = imageAssetText(state, "tray_empty");
+  return empty;
+}
+
+export function hmbReconcileImageAssetSelectionTray(tray, selected, state, options = {}) {
+  if (!tray) return { created: 0, removed: 0, retained: 0 };
+  const ordered = Array.isArray(selected) ? selected : [];
+  const scrollLeft = Number(tray.scrollLeft || 0);
+  const existingCards = Array.from(tray.querySelectorAll?.("[data-selected-key]") || []);
+  const cardsByKey = new Map();
+  existingCards.forEach((card) => {
+    const key = clean(card.getAttribute?.("data-selected-key"));
+    if (key && !cardsByKey.has(key)) cardsByKey.set(key, card);
+    else card.remove?.();
+  });
+  let created = 0;
+  let retained = 0;
+  let removed = 0;
+  const empty = tray.querySelector?.(".tray-empty");
+  if (ordered.length) empty?.remove?.();
+
+  ordered.forEach((asset, index) => {
+    const key = clean(asset.asset_library_id);
+    let card = cardsByKey.get(key) || null;
+    if (card) {
+      cardsByKey.delete(key);
+      retained += 1;
+    } else {
+      card = hmbCreateSelectedAssetCard(
+        tray,
+        asset,
+        index,
+        ordered,
+        state,
+        options.createSelectedCard,
+      );
+      if (!card) return;
+      created += 1;
+    }
+    hmbUpdateSelectedAssetCard(card, asset, index, ordered, state);
+    tray.appendChild?.(card);
+  });
+  cardsByKey.forEach((card) => {
+    card.remove?.();
+    removed += 1;
+  });
+  if (!ordered.length && !tray.querySelector?.(".tray-empty")) {
+    const trayEmpty = hmbCreateSelectedAssetTrayEmpty(
+      tray,
+      state,
+      options.createTrayEmpty,
+    );
+    if (trayEmpty) tray.appendChild?.(trayEmpty);
+  }
+  try { tray.scrollLeft = scrollLeft; } catch (_error) {}
+  return { created, removed, retained };
+}
+
+export function hmbApplyImageAssetSelectionFeedback(container, state, options = {}) {
+  if (!container || !state || !Array.isArray(state.assets)) return null;
+  const selected = Array.isArray(options.selectedAssets)
+    ? options.selectedAssets
+    : selectedAssets(state);
   const selectedCount = selected.length;
   state.status = {
     ...(state.status || {}),
     selected_count: selectedCount,
   };
-  const assetsByLibraryId = new Map(
-    state.assets.map((asset) => [clean(asset.asset_library_id), asset]),
+  const previousSelectedCount = Number(options.previousSelectedCount);
+  const crossedSelectionLimit = Number.isFinite(previousSelectedCount) && (
+    (previousSelectedCount < MAX_SELECTED_IMAGES && selectedCount >= MAX_SELECTED_IMAGES)
+    || (previousSelectedCount >= MAX_SELECTED_IMAGES && selectedCount < MAX_SELECTED_IMAGES)
   );
-
-  container.querySelectorAll?.("[data-asset-key]").forEach((card) => {
-    const asset = assetsByLibraryId.get(clean(card.getAttribute?.("data-asset-key")));
-    if (!asset) return;
-    const selectable = hmbImageAssetCanSelect(asset);
-    const selectionBlocked = selectable && !asset.selected && selectedCount >= MAX_SELECTED_IMAGES;
-    card.classList?.toggle("selected", Boolean(asset.selected));
-    card.classList?.toggle("selection-blocked", selectionBlocked);
-    card.setAttribute?.("data-selection-disabled", selectionBlocked ? "1" : "0");
-    if (selectable) {
-      card.setAttribute?.("aria-pressed", asset.selected ? "true" : "false");
-    }
-    const title = !selectable
-      ? imageAssetText(state, "register_before_select")
-      : selectionBlocked
-        ? imageAssetText(state, "image_limit")
-        : imageAssetText(state, "click_select");
-    card.setAttribute?.("title", title);
-  });
+  let cardScanCount = 0;
+  if (options.changedCard && options.changedAsset && !crossedSelectionLimit) {
+    hmbApplyImageAssetCardFeedback(
+      options.changedCard,
+      options.changedAsset,
+      selectedCount,
+      state,
+    );
+  } else {
+    const assetsByLibraryId = options.assetsByLibraryId instanceof Map
+      ? options.assetsByLibraryId
+      : new Map(state.assets.map((asset) => [clean(asset.asset_library_id), asset]));
+    container.querySelectorAll?.("[data-asset-key]").forEach((card) => {
+      cardScanCount += 1;
+      const asset = assetsByLibraryId.get(clean(card.getAttribute?.("data-asset-key")));
+      if (asset) hmbApplyImageAssetCardFeedback(card, asset, selectedCount, state);
+    });
+  }
 
   const trayCount = container.querySelector?.(".tray-head em");
   if (trayCount) trayCount.textContent = `${selectedCount}/${MAX_SELECTED_IMAGES}`;
   const tray = container.querySelector?.(".tray-scroll");
-  if (tray) {
-    const scrollLeft = Number(tray.scrollLeft || 0);
-    const reusableImages = detachReusableImageAssets(tray);
-    tray.innerHTML = selected
-      .map((asset, index) => renderSelectedCard(asset, index, selected, state))
-      .join("") || `<div class="tray-empty">${escapeHtml(imageAssetText(state, "tray_empty"))}</div>`;
-    restoreReusableImageAssets(tray, reusableImages);
-    tray.scrollLeft = scrollLeft;
-  }
+  const trayResult = hmbReconcileImageAssetSelectionTray(tray, selected, state, options);
   const status = container.querySelector?.(".toolbar-status strong");
   if (status && !state.error && !state.asset_registration_result?.message) {
     const summary = hmbImageAssetStatusSummary(state);
     status.textContent = summary;
     status.setAttribute?.("title", summary);
   }
+  return { cardScanCount, selectedCount, tray: trayResult };
 }
 
 function hmbCancelImageAssetSelectionJobHandles(job) {
@@ -1787,27 +2017,36 @@ function installEvents(container, state, props, remount, listeners) {
       hmbInvalidateImageAssetPublication(container);
       if (!container.__hmbImageAssetSelectionCommitPending) {
         container.__hmbImageAssetSelectionBase = hmbImageAssetSelectionSnapshot(state);
-        container.__hmbImageAssetSelectionBaseState = normalizeState(state);
-        container.__hmbImageAssetSelectionBaseValue = JSON.stringify(
-          container.__hmbImageAssetSelectionBaseState,
-        );
+        container.__hmbImageAssetSelectionBaseAuthority = imageAssetAuthorityStamp(state);
+        container.__hmbImageAssetSelectionBasePropValue = props?.value;
       }
       asset.selected = !asset.selected;
       asset.selection_order = asset.selected
         ? Math.max(0, ...selected.map((item) => item.selection_order)) + 1
         : 0;
-      compactSelectionOrder(state.assets);
-      hmbApplyImageAssetSelectionFeedback(container, state);
+      const nextSelected = asset.selected
+        ? [...selected, asset]
+        : selected.filter((item) => item !== asset);
+      nextSelected.forEach((item, index) => {
+        item.selection_order = index + 1;
+      });
+      hmbApplyImageAssetSelectionFeedback(container, state, {
+        assetsByLibraryId,
+        changedAsset: asset,
+        changedCard: card,
+        previousSelectedCount: selected.length,
+        selectedAssets: nextSelected,
+      });
       hmbScheduleImageAssetSelectionCommit(container, () => {
         const pending = container.__hmbImageAssetPendingAuthoritativeProps;
         const baseSelection = container.__hmbImageAssetSelectionBase || [];
-        const baseState = container.__hmbImageAssetSelectionBaseState || normalizeState(state);
+        const baseAuthority = Number(container.__hmbImageAssetSelectionBaseAuthority) || 0;
         delete container.__hmbImageAssetPendingAuthoritativeProps;
         delete container.__hmbImageAssetSelectionBase;
-        delete container.__hmbImageAssetSelectionBaseState;
-        delete container.__hmbImageAssetSelectionBaseValue;
+        delete container.__hmbImageAssetSelectionBaseAuthority;
+        delete container.__hmbImageAssetSelectionBasePropValue;
         let publishedState = state;
-        let rollbackState = baseState;
+        let rollbackState = null;
         if (pending) {
           const merged = hmbMergeImageAssetSelectionDelta(
             pending.state,
@@ -1819,8 +2058,13 @@ function installEvents(container, state, props, remount, listeners) {
           rollbackState = pending.state;
         }
         emit(props, publishedState, container, () => {
-          remount(rollbackState);
-        });
+          if (rollbackState) {
+            remount(rollbackState);
+          } else if (imageAssetAuthorityStamp(state) === baseAuthority) {
+            hmbRestoreImageAssetSelectionSnapshot(state, baseSelection);
+            remount(state);
+          }
+        }, { suppressMatchingEcho: true });
       });
     };
     on(card, "click", (event) => {
@@ -2153,31 +2397,46 @@ export default function HMBImageAssetLibraryWidget(container, props) {
   };
 
   const applyProps = (nextProps = {}) => {
-    hmbInvalidateImageAssetPublication(container);
-    autoSyncRequestSequence += 1;
-    autoSyncActiveRequest = 0;
+    if (hmbConsumeImageAssetStateEcho(container, nextProps)) {
+      props = nextProps || {};
+      return;
+    }
     if (container.__hmbImageAssetSelectionCommitPending) {
       // Preserve the latest authoritative snapshot and merge only the local
       // selection delta into it when the optimistic click is published.
       autoSyncPendingUntil = 0;
       props = nextProps || {};
-      const nextState = normalizeState(nextProps?.value);
-      const baseValue = clean(container.__hmbImageAssetSelectionBaseValue);
-      if (baseValue && JSON.stringify(nextState) === baseValue) {
-        // This is the exact pre-click echo. It carries no new authority and
-        // must not replace a newer backend/manifest snapshot already queued.
+      const hasBasePropValue = Object.prototype.hasOwnProperty.call(
+        container,
+        "__hmbImageAssetSelectionBasePropValue",
+      );
+      if (
+        hasBasePropValue
+        && nextProps?.value === container.__hmbImageAssetSelectionBasePropValue
+      ) {
+        // The exact pre-click prop is already represented by the retained
+        // authority stamp. It cannot supersede the newer local selection.
         return;
       }
+      hmbInvalidateImageAssetPublication(container);
+      autoSyncRequestSequence += 1;
+      autoSyncActiveRequest = 0;
+      const nextState = normalizeState(nextProps?.value);
       container.__hmbImageAssetPendingAuthoritativeProps = {
         state: nextState,
       };
       return;
     }
+    const previousPropValue = props?.value;
+    props = nextProps || {};
+    if (nextProps?.value === previousPropValue) return;
+    hmbInvalidateImageAssetPublication(container);
+    autoSyncRequestSequence += 1;
+    autoSyncActiveRequest = 0;
     const nextState = normalizeState(nextProps?.value);
     const currentValue = JSON.stringify(state);
     const nextValue = JSON.stringify(nextState);
     autoSyncPendingUntil = 0;
-    props = nextProps || {};
     if (currentValue === nextValue) return;
     if (hmbDeferImageAssetPropsDuringRegistration(container, props)) return;
     remount(nextState);
@@ -2294,6 +2553,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     // The flush can start a fresh asynchronous publication.  Teardown owns a
     // later token so its eventual rejection cannot repaint disposed DOM.
     hmbInvalidateImageAssetPublication(container);
+    hmbForgetImageAssetStateEcho(container);
     disposed = true;
     autoSyncPendingUntil = 0;
     clearAutoSyncTimer();
@@ -2321,8 +2581,8 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     delete container.__hmbImageAssetSelectionCommitRunning;
     delete container.__hmbImageAssetSelectionCommitJob;
     delete container.__hmbImageAssetSelectionBase;
-    delete container.__hmbImageAssetSelectionBaseState;
-    delete container.__hmbImageAssetSelectionBaseValue;
+    delete container.__hmbImageAssetSelectionBaseAuthority;
+    delete container.__hmbImageAssetSelectionBasePropValue;
     delete container.__hmbImageAssetPendingAuthoritativeProps;
     delete container.__hmbImageAssetAutoSyncError;
     if (Number(container.__hmbImageAssetMountToken) === mountToken) {
