@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.28 - 2026-08-09
+
+- Advanced the manifest, Python package, README, SBOM, and release-security
+  contract to `0.5.28` so Griptape Nodes update discovery no longer treats the
+  validated world-projection/team release as the already installed `0.5.27`.
+- Republished the exact validated four-library runtime and Video Picker render
+  behavior without changing node types, saved state, ports, Broker payloads,
+  Maya output roles, or signed Agent policy identity.
+
 ## 0.5.27 - 2026-08-08
 
 - Split the Video Picker color palette into Actor 7, shared Ghost 3, and
