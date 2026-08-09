@@ -1,11 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.5.29 - 2026-08-09
 
 - Established GitHub and GitHub Releases as the permanent public team
   distribution channel. Repository visibility is no longer treated as a
   security boundary; release audits continue to reject credentials, tokens,
   private signing keys, and non-public media.
+- Removed Image Asset selection cadence stalls by updating only the clicked
+  card, retaining keyed tray nodes and decoded thumbnails, and moving canonical
+  state publication after the immediate visual response.
+- Replaced full-catalog background manifest polling with a lightweight identity
+  probe and reused bounded verified project/import resolutions across ordinary
+  selection changes. Explicit execution still performs fresh validation.
 
 ## 0.5.28 - 2026-08-09
 

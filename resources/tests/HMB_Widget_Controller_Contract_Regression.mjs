@@ -386,7 +386,48 @@ const feedbackCard = {
   setAttribute(name, value) { feedbackAttributes.set(name, String(value)); },
 };
 const feedbackTrayCount = { textContent: "" };
-const feedbackTray = { innerHTML: "", scrollLeft: 17 };
+const makeFeedbackSelectedCard = (asset) => {
+  const attributes = new Map([["data-selected-key", asset.asset_library_id]]);
+  const control = () => ({
+    disabled: false,
+    setAttribute() {},
+    removeAttribute() {},
+  });
+  const controls = {
+    ".slot": { textContent: "" },
+    '[data-move="-1"]': control(),
+    '[data-move="1"]': control(),
+    "[data-remove-selected]": control(),
+  };
+  return {
+    parentTray: null,
+    classList: { toggle() {} },
+    getAttribute(name) { return attributes.get(name) || ""; },
+    setAttribute(name, value) { attributes.set(name, String(value)); },
+    querySelector(selector) { return controls[selector] || null; },
+    remove() { this.parentTray?.removeChild?.(this); },
+  };
+};
+const feedbackTray = {
+  children: [],
+  scrollLeft: 17,
+  querySelectorAll(selector) {
+    return selector === "[data-selected-key]" ? this.children : [];
+  },
+  querySelector(selector) {
+    return selector === ".tray-empty" ? null : null;
+  },
+  appendChild(child) {
+    this.removeChild(child);
+    child.parentTray = this;
+    this.children.push(child);
+  },
+  removeChild(child) {
+    const index = this.children.indexOf(child);
+    if (index >= 0) this.children.splice(index, 1);
+    if (child?.parentTray === this) child.parentTray = null;
+  },
+};
 const feedbackStatusAttributes = new Map();
 const feedbackStatus = {
   textContent: "",
@@ -414,11 +455,13 @@ const feedbackState = assetModule.hmbNormalizeImageAssetState({
     selection_order: 1,
   }],
 });
-assetModule.hmbApplyImageAssetSelectionFeedback(feedbackContainer, feedbackState);
+assetModule.hmbApplyImageAssetSelectionFeedback(feedbackContainer, feedbackState, {
+  createSelectedCard: makeFeedbackSelectedCard,
+});
 assert.equal(feedbackClasses.has("selected"), true, "Local feedback must outline the clicked card immediately.");
 assert.equal(feedbackAttributes.get("aria-pressed"), "true");
 assert.equal(feedbackTrayCount.textContent, "1/50");
-assert.match(feedbackTray.innerHTML, /data-selected-key="asset-feedback"/, "Local feedback must populate the selected tray before the host round trip.");
+assert.equal(feedbackTray.children[0]?.getAttribute?.("data-selected-key"), "asset-feedback", "Local feedback must populate the selected tray before the host round trip.");
 assert.equal(feedbackTray.scrollLeft, 17, "Local tray feedback must preserve its horizontal position.");
 assert.match(feedbackStatus.textContent, /1\/50 SEL/);
 assert.deepEqual(
@@ -430,15 +473,19 @@ const assetInstallEventsSource = assetSource.match(/function installEvents\([\s\
 assert.match(assetInstallEventsSource, /const assetsByLibraryId = new Map\(/, "Asset event installation must index cards in one linear pass.");
 assert.doesNotMatch(assetInstallEventsSource, /state\.assets\.find\(/, "Per-card event installation must not rescan the full asset array.");
 const assetToggleSource = assetInstallEventsSource.match(/const toggle = \(\) => \{[\s\S]*?\n    \};/)?.[0] || "";
+const assetOrdinaryToggleSource = assetToggleSource.slice(
+  0,
+  assetToggleSource.indexOf("hmbScheduleImageAssetSelectionCommit(container"),
+);
 assert.ok(
-  assetToggleSource.indexOf("hmbApplyImageAssetSelectionFeedback(container, state)")
+  assetToggleSource.indexOf("hmbApplyImageAssetSelectionFeedback(container, state")
     < assetToggleSource.indexOf("hmbScheduleImageAssetSelectionCommit(container"),
   "Card/tray feedback must update locally before publishing state to the host.",
 );
 assert.doesNotMatch(
-  assetToggleSource,
-  /remount\(state\)/,
-  "A grid card selection must not rebuild the full 5,000-card dashboard.",
+  assetOrdinaryToggleSource,
+  /normalizeState\(|JSON\.stringify\(|compactSelectionOrder\(|remount\(/,
+  "A grid card selection must not clone/stringify/compact or rebuild the 5,000-card dashboard.",
 );
 assert.match(
   assetInstallEventsSource,
@@ -607,6 +654,19 @@ const autoSyncPayloadProbe = JSON.parse(assetModule.hmbImageAssetAutoSyncPayload
 }, "poll-1"));
 assert.equal(autoSyncPayloadProbe.__hmb_manifest_poll_nonce, "poll-1");
 assert.equal(autoSyncPayloadProbe.manifest_signature, "signature-a");
+assert.deepEqual(
+  Object.keys(autoSyncPayloadProbe).sort(),
+  [
+    "__hmb_manifest_poll_nonce",
+    "catalog_root",
+    "manifest_signature",
+    "project_id",
+    "project_root",
+    "project_uid",
+  ].sort(),
+  "Asset auto-sync must send only identity fields, never the full catalog.",
+);
+assert.equal(autoSyncPayloadProbe.assets, undefined);
 assert.match(promptSource, /asset_verified:\s*false/, "Prompt rows must default to unverified.");
 assert.match(promptSource, /item\.asset_verified/, "Prompt metadata locking must require verified provenance.");
 assert.match(promptSource, /Name and Prompt fields remain editable/, "External imported Prompt rows must remain editable.");

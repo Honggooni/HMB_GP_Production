@@ -182,24 +182,69 @@ with tempfile.TemporaryDirectory(prefix="hmb_asset_share_", dir=TEMP_ROOT) as te
     no_op_node._hmb_last_manifest_poll_error = ""
     no_op_node._hmb_refresh_revision = refreshed["refresh_revision"]
     no_op_node._hmb_import_media_by_uid = {}
+    no_op_node._hmb_import_revision = 0
+    no_op_node._hmb_import_media_identity = asset_library._import_media_map_identity({})
+    no_op_node._hmb_resolution_cache = asset_library.OrderedDict()
+    no_op_node._hmb_resolution_cache_identity = ""
+    no_op_node._hmb_last_resolution_warning = ""
+    no_op_node._hmb_last_output_fingerprint = ""
+    no_op_node._hmb_last_output_pair = None
+    no_op_node._hmb_output_notification_generation = 0
+    no_op_node._hmb_pending_output_notifications = {}
+    no_op_node.parameter_output_values = {}
+    no_op_node.publish_update_to_parameter = lambda _name, _value: None
     no_op_node.get_parameter_value = lambda name: (
         refreshed["catalog_root"]
         if name == asset_library.PROJECT_ROOT_PARAMETER
+        else json.dumps(refreshed)
+        if name == asset_library.WIDGET_STATE_PARAMETER
         else []
     )
-    no_op_node._sync_output = lambda _state: (_ for _ in ()).throw(
-        AssertionError("An unchanged manifest probe must not rebuild outputs.")
+    original_build_outputs = asset_library._build_synchronized_outputs
+    original_set_output = asset_library.set_output
+    output_build_count = 0
+
+    def counted_build_outputs(*args, **kwargs):
+        global output_build_count
+        output_build_count += 1
+        return original_build_outputs(*args, **kwargs)
+
+    asset_library._build_synchronized_outputs = counted_build_outputs
+    asset_library.set_output = (
+        lambda target, name, value: target.parameter_output_values.__setitem__(
+            name,
+            value,
+        )
     )
-    no_op_payload = dict(refreshed)
-    no_op_payload["__hmb_manifest_poll_nonce"] = "poll-no-change"
-    no_op_canonical = no_op_node.before_value_set(
-        widget_parameter,
-        json.dumps(no_op_payload),
-    )
-    assert no_op_node._hmb_manifest_poll_received is True
-    assert no_op_node._hmb_manifest_poll_pending is False
-    no_op_result = no_op_node._apply_widget_state(no_op_canonical)
-    assert no_op_result["manifest_signature"] == refreshed["manifest_signature"]
+    try:
+        no_op_node._sync_output(refreshed)
+        assert output_build_count == 1
+        no_op_payload = {
+            "__hmb_manifest_poll_nonce": "poll-no-change",
+            "catalog_root": refreshed["catalog_root"],
+            "project_root": refreshed["project_root"],
+            "project_id": refreshed["project_id"],
+            "project_uid": refreshed["project_uid"],
+            "manifest_signature": refreshed["manifest_signature"],
+        }
+        no_op_canonical = no_op_node.before_value_set(
+            widget_parameter,
+            json.dumps(no_op_payload),
+        )
+        canonical_poll_state = json.loads(no_op_canonical)
+        assert len(canonical_poll_state["assets"]) == len(refreshed["assets"]), (
+            "A lightweight poll must merge with the authoritative current state."
+        )
+        assert no_op_node._hmb_manifest_poll_received is False
+        assert no_op_node._hmb_manifest_poll_pending is False
+        no_op_result = no_op_node._apply_widget_state(no_op_canonical)
+        assert no_op_result["manifest_signature"] == refreshed["manifest_signature"]
+        assert output_build_count == 1, (
+            "An unchanged lightweight manifest probe must not rebuild outputs."
+        )
+    finally:
+        asset_library._build_synchronized_outputs = original_build_outputs
+        asset_library.set_output = original_set_output
 
     captured_thumbnail_bytes = []
 
