@@ -4125,6 +4125,49 @@ def _assign(shapes, shading_group):
     return failures
 
 
+def _is_redshift_proxy_placeholder_mesh(shape):
+    """Identify only Redshift proxy placeholder meshes for command fallback."""
+    leaf = _clean(shape).rsplit("|", 1)[-1].rsplit(":", 1)[-1]
+    if re.fullmatch(
+        r"redshiftProxyPlaceholderShape\d*",
+        leaf,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    try:
+        source_plugs = cmds.listConnections(
+            shape + ".inMesh",
+            source=True,
+            destination=False,
+            plugs=True,
+        ) or []
+    except Exception:
+        source_plugs = []
+    for source_plug in source_plugs:
+        source_node = _clean(source_plug).split(".", 1)[0]
+        if not source_node:
+            continue
+        try:
+            if _clean(cmds.nodeType(source_node)).lower() != "unknown":
+                continue
+        except Exception:
+            continue
+        evidence = []
+        for query_flag in ("realClassName", "plugin"):
+            try:
+                evidence.append(_clean(cmds.unknownNode(
+                    source_node,
+                    query=True,
+                    **{query_flag: True}
+                )))
+            except Exception:
+                pass
+        evidence_text = " ".join(evidence).lower()
+        if "redshiftproxy" in evidence_text or "redshift" in evidence_text:
+            return True
+    return False
+
+
 def _verify_depth_shader_assignment(shapes_or_assignments, shading_group=None):
     """Verify each full DAG path against its exact expected depth SG.
 
@@ -4149,6 +4192,7 @@ def _verify_depth_shader_assignment(shapes_or_assignments, shading_group=None):
         "mesh_path_count": 0,
         "nurbs_surface_path_count": 0,
         "verified_shape_path_count": 0,
+        "verified_proxy_placeholder_path_count": 0,
         "verified_mesh_face_count": 0,
     }
     target_objects = {}
@@ -4170,6 +4214,43 @@ def _verify_depth_shader_assignment(shapes_or_assignments, shading_group=None):
             report["mesh_path_count"] += 1
             try:
                 mesh_om, dag_path, mesh_function = _depth_mesh_api(shape)
+            except Exception as exc:
+                if not _is_redshift_proxy_placeholder_mesh(shape):
+                    failures.append("{0}: {1}".format(shape, exc))
+                    continue
+                try:
+                    connected_sets = sorted(set(
+                        _clean(item)
+                        for item in (
+                            cmds.listSets(type=1, object=shape) or []
+                        )
+                        if _clean(item)
+                    ))
+                    if connected_sets != [expected_group]:
+                        raise RuntimeError(
+                            "expected only shadingEngine {0}; connected: {1}".format(
+                                expected_group,
+                                ", ".join(connected_sets) or "<none>",
+                            )
+                        )
+                    face_count = int(cmds.polyEvaluate(shape, face=True) or 0)
+                    if face_count <= 0:
+                        raise RuntimeError(
+                            "polyEvaluate returned {0} faces".format(face_count)
+                        )
+                    report["verified_shape_path_count"] += 1
+                    report[
+                        "verified_proxy_placeholder_path_count"
+                    ] += 1
+                    report["verified_mesh_face_count"] += face_count
+                except Exception as fallback_exc:
+                    failures.append(
+                        "{0}: proxy placeholder whole-object verification "
+                        "failed after MFnMesh construction was unavailable "
+                        "({1}); {2}".format(shape, exc, fallback_exc)
+                    )
+                continue
+            try:
                 target_object = target_objects.get(expected_group)
                 if target_object is None:
                     selection = mesh_om.MSelectionList()
@@ -6265,6 +6346,7 @@ def _apply_depth_shader(
             shape_type_counts.get("nurbsSurface") or 0
         ),
         "verified_shape_path_count": 0,
+        "verified_proxy_placeholder_path_count": 0,
         "verified_mesh_face_count": 0,
         "rendered_frame_count": 0,
         "expected_frame_assignment_count": 0,
@@ -6431,6 +6513,21 @@ def _apply_depth_shader(
                 assignment_verification["verified_shape_path_count"] = max(
                     int(assignment_verification["verified_shape_path_count"]),
                     int(verified.get("verified_shape_path_count") or 0),
+                )
+                assignment_verification[
+                    "verified_proxy_placeholder_path_count"
+                ] = max(
+                    int(
+                        assignment_verification[
+                            "verified_proxy_placeholder_path_count"
+                        ]
+                    ),
+                    int(
+                        verified.get(
+                            "verified_proxy_placeholder_path_count"
+                        )
+                        or 0
+                    ),
                 )
                 active_alpha_cutout_shapes = [
                     shape

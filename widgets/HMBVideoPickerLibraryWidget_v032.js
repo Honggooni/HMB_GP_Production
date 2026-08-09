@@ -31,7 +31,7 @@ const HMB_PLAYBLAST_RESOLUTIONS = [
 ];
 const HMB_UI_THEME_STORAGE_KEY = "hmb_gp_production_ui_theme";
 const HMB_UI_THEME_EVENT = "hmb-gp-production-theme-change";
-const HMB_RIGHT_SECTION_DEFAULT_HEIGHTS = { settings: 285, color: 628, log: 208 };
+const HMB_RIGHT_SECTION_DEFAULT_HEIGHTS = { settings: 217, color: 628, log: 208 };
 const HMB_ACTIVITY_LOG_MAX_ROWS = 80;
 const HMB_ACTIVITY_LOG_MESSAGE_MAX_CHARS = 260;
 const HMB_PICKER_MAX_SELECTED_VIDEOS = 10;
@@ -1545,7 +1545,7 @@ function defaultState() {
     outliner_panel_height: 0,
     viewport_panel_height: 0,
     right_section_heights: { ...HMB_RIGHT_SECTION_DEFAULT_HEIGHTS },
-    ui_layout_version: 5,
+    ui_layout_version: 6,
     ui_theme: "P",
     selected_outliner_path: "",
     selected_outliner_name: "",
@@ -1864,7 +1864,14 @@ function normalize(value) {
   } else {
     state.right_section_heights = hmbNormalizeRightSectionHeights(state.right_section_heights);
   }
-  state.ui_layout_version = 5;
+  if (sourceLayoutVersion === 5) {
+    state.right_section_heights.settings = clamp(
+      Number(state.right_section_heights.settings || 285) - 68,
+      96,
+      900,
+    );
+  }
+  state.ui_layout_version = 6;
   state.ui_theme = hmbNormalizeUiTheme(state.ui_theme);
   state.selected_outliner_path = clean(state.selected_outliner_path);
   state.selected_outliner_name = clean(state.selected_outliner_name);
@@ -3545,9 +3552,12 @@ export function hmbApplyPickerCameraSelectionToDom(container, state) {
 }
 
 export function hmbApplyPickerResolutionToDom(container, width, height) {
-  const value = container?.querySelector?.(".settings-grid > .setting-value");
-  if (!value) return false;
-  value.textContent = `${Math.max(1, Number(width || 0))} × ${Math.max(1, Number(height || 0))}`;
+  const select = container?.querySelector?.("#playblast-resolution");
+  if (!select) return false;
+  const requested = `${Math.max(1, Number(width || 0))}x${Math.max(1, Number(height || 0))}`;
+  const matched = Array.from(select.options || []).some((option) => option.value === requested);
+  if (!matched) return false;
+  select.value = requested;
   return true;
 }
 
@@ -4130,7 +4140,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       .hmbvp-clip{width:100%;height:100%;min-width:0;min-height:0;max-width:none;max-height:none;overflow:hidden;background:#050812;box-sizing:border-box;display:flex;flex-direction:column;flex:1 1 auto}
       .hmbvp{--safe-x:16px;position:relative;width:100%;height:100%;min-width:0;min-height:960px;max-width:none;max-height:none;padding-left:var(--safe-x);padding-right:var(--safe-x);display:flex;flex-direction:column;flex:1 1 auto;background:#101820;color:#dbe4ec;border:1px solid rgba(148,163,184,.2);border-radius:11px;box-shadow:0 0 34px rgba(14,165,233,.12);overflow:hidden;resize:none;container-type:inline-size;font-family:"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif;font-size:12px}
       .hmbvp *{box-sizing:border-box;min-width:0}.hmbvp button,.hmbvp select,.hmbvp input,.hmbvp textarea{font:inherit;pointer-events:auto}.hmbvp button{color:inherit}.hmbvp .nodrag{touch-action:auto}.app-header{position:relative;z-index:30}.header-actions{position:relative;z-index:31}
-      .settings-grid>span:nth-child(2){display:none}.settings-grid>.setting-select{grid-row:1;grid-column:2}.setting-select{width:100%;height:27px;padding:0 8px;border:1px solid #2c3b46;border-radius:2px;background:#202d36;color:#d7dfe4;cursor:pointer;outline:0}.setting-select:disabled{opacity:.5;cursor:not-allowed}
+      .setting-select{width:100%;height:27px;padding:0 8px;border:1px solid #2c3b46;border-radius:2px;background:#202d36;color:#d7dfe4;cursor:pointer;outline:0}.setting-select:disabled{opacity:.5;cursor:not-allowed}
       .hmbvp button,.hmbvp input,.hmbvp select{transition:border-color 80ms ease,color 80ms ease}
       .hmbvp .side-section,.hmbvp .viewport-panel{transition-property:background-color,border-color,opacity;transition-duration:140ms;transition-timing-function:ease}.viewport-panel.is-switching .viewport-stage{opacity:.78}.viewport-panel.is-switching .viewport-title small:after{content:" …"}
       .preview-load-status{position:absolute;z-index:8;left:12px;right:12px;bottom:12px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 11px;border:1px solid rgba(251,113,133,.72);border-radius:7px;background:rgba(64,14,26,.94);color:#ffe4e8;font-size:10px;line-height:1.35;box-shadow:0 8px 22px rgba(0,0,0,.36)}.preview-load-status[hidden]{display:none}.preview-load-status span{flex:1}.preview-load-status button{height:27px;flex:0 0 auto;padding:0 10px;border:1px solid rgba(255,255,255,.3);border-radius:5px;background:#71283a;color:#fff;cursor:pointer;font-weight:800}
@@ -4146,7 +4156,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       .outliner-palette{padding:8px;border-bottom:1px solid #29343d;background:#111a21}.outliner-toolbar{display:flex;gap:6px;padding:8px;border-bottom:1px solid #29343d}.search-input{width:100%;height:29px;background:#101820;border:1px solid #2b3944;color:#dce5eb;padding:0 9px;border-radius:3px}.column-head{height:28px;display:flex;align-items:center;padding:0 8px;border-bottom:1px solid #2b353d;color:#b7c1c9;font-size:11px}.outliner-scroll{flex:1;min-height:0;overflow:auto;padding:3px}.outliner-list{display:flex;flex-direction:column}.outliner-row{display:flex;align-items:center;min-height:29px;padding-right:5px;color:#d2d9df;border-radius:2px;cursor:pointer}.outliner-row:hover{background:#1c2a35}.outliner-row.selected{background:#25517e}.outliner-row.output-off{opacity:.48}.tree-toggle{width:19px;height:25px;border:0;background:transparent;padding:0;color:#a8b4bd;cursor:pointer}.tree-toggle.leaf{cursor:default}.eye-toggle{width:25px;height:25px;display:grid;place-items:center;border:0;background:transparent;padding:4px;cursor:pointer}.eye-toggle svg{width:17px;height:17px;fill:none;stroke:#68d26d;stroke-width:1.8}.eye-toggle.on svg circle{fill:#68d26d;stroke:none}.eye-toggle.off svg{stroke:#dd5c60}.node-icon{font-size:9px;color:#bcc6ce;margin-right:5px}.group-name{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ref-tag{font-size:9px;border:1px solid #5c6b76;border-radius:3px;padding:1px 4px;margin-right:5px;color:#adb8c0}.assigned-chip{width:14px;height:14px;border:1px solid rgba(255,255,255,.4);border-radius:2px;margin-right:6px}
       .viewport-panel{background:#131c23}.output-scope-inline{position:relative;z-index:20;min-height:38px;display:flex;align-items:center;justify-content:flex-start;gap:12px;padding:4px 10px;border-bottom:1px solid #2a353e;background:#151f27;white-space:nowrap;overflow:visible}.output-scope-title{font-size:10px;font-weight:800;color:#d7dfe5;flex:0 0 auto;text-align:center}.output-scope-options{display:flex;align-items:center;justify-content:flex-start;gap:14px;min-width:max-content}.output-scope-option{display:flex;align-items:center;gap:5px;font-size:10px;color:#d7dfe5;cursor:pointer}.output-scope-option input{margin:0;accent-color:#4c8fd7}.output-scope-option span{white-space:nowrap}.output-camera-inline{display:flex;align-items:center;gap:7px;margin-left:auto;flex:0 0 auto}.output-camera-label{font-size:10px;font-weight:800;color:#d7dfe5}.camera-fixed,.camera-dropdown{position:relative;min-width:200px}.camera-fixed{height:28px;display:flex;align-items:center;gap:7px;padding:0 9px;background:#111a21;border:1px solid #33414c;border-radius:3px}.camera-fixed b{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.camera-fixed em{font-size:9px;color:#79aee4;font-style:normal}.camera-fixed.disabled{opacity:.5}.camera-dropdown summary{list-style:none;height:29px;display:flex;align-items:center;gap:7px;padding:0 9px;background:#111a21;border:1px solid #33414c;border-radius:3px;cursor:pointer}.camera-dropdown summary::-webkit-details-marker{display:none}.camera-dropdown summary b{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.camera-menu{position:absolute;z-index:60;left:0;right:0;top:32px;max-height:240px;overflow:auto;background:#17232c;border:1px solid #3b4a56;box-shadow:0 8px 18px rgba(0,0,0,.5);padding:4px}.camera-menu button{width:100%;display:flex;justify-content:space-between;align-items:center;border:0;background:transparent;padding:8px;text-align:left;cursor:pointer}.camera-menu button:hover,.camera-menu button.active{background:#24415e}.camera-menu button span{font-size:9px;color:#9dacb6}.viewport-stage{position:relative;flex:1;min-height:0;background:radial-gradient(circle at 50% 44%,#5a5a59 0,#373b3d 36%,#20282d 80%);display:flex;align-items:center;justify-content:center;overflow:hidden}.preview-image{width:100%;height:100%;object-fit:contain;background:#232a2e}.viewport-empty{position:relative;width:82%;height:76%;border:1px solid #3fa578;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#b5c0c8;text-align:center;gap:7px;background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(0,0,0,.08))}.viewport-empty .camera-frame{position:absolute;inset:5% 6%;border:1px solid rgba(65,173,124,.8)}.viewport-empty b,.viewport-empty span{position:relative;z-index:2}.viewport-empty span{max-width:420px;color:#93a0aa}.preview-nav{height:42px;flex:0 0 42px;border-top:1px solid #2b363e;background:#111a21;display:grid;grid-template-columns:38px minmax(0,1fr) 38px;align-items:center;gap:8px;padding:6px 10px}.preview-nav button{height:28px;border:1px solid #303e49;background:#1b2730;border-radius:3px;cursor:pointer;font-weight:800}.preview-nav button:disabled{opacity:.35;cursor:not-allowed}.preview-frame-label{min-width:0;text-align:center;color:#aeb9c1;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       .right-stack{display:flex;flex-direction:column;gap:8px;min-height:0;overflow:hidden;background:transparent}.side-section{position:relative;flex:0 0 auto;min-height:96px;background:#151f27;border:1px solid #2c3740;border-radius:10px;display:flex;flex-direction:column;overflow:hidden}.playblast-settings-section{min-height:150px}.video-assets-section{min-height:240px;flex:1 1 0}.section-head{height:34px;flex:0 0 34px;display:flex;align-items:center;padding:0 10px;border-bottom:1px solid #2c3740;background:#18232b;font-weight:700}.section-head .grow{flex:1}.section-head .section-tools{margin-left:auto;display:flex;align-items:center;gap:5px}.video-selected-count{margin-left:auto;color:#aeb9c1;font-size:10px;font-variant-numeric:tabular-nums}.import-video-button{height:24px;margin-left:8px;padding:0 8px;border:1px solid #35434e;border-radius:6px;background:#111a21;color:#dce5eb;cursor:pointer;font-size:9px}.activity-section{min-height:150px}.activity-section .section-head{justify-content:flex-start}.activity-clear{height:23px;border:1px solid #35434e;background:#111a21;color:#c7d0d7;border-radius:7px;padding:0 8px;cursor:pointer;font-size:9px}.activity-elapsed{min-width:74px;text-align:right;font-size:9px;color:#aeb9c1;font-variant-numeric:tabular-nums}.activity-body{flex:1;min-width:0;min-height:0;overflow:hidden;padding:0;background:#0e161d;contain:layout paint}.activity-log-view{display:block;width:100%;height:100%;min-width:0;min-height:0;max-width:100%;margin:0;padding:6px 8px;overflow-x:auto;overflow-y:auto;scrollbar-gutter:stable both-edges;color:#cbd5dc;background:transparent;font:10px/1.5 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;user-select:text;-webkit-user-select:text;pointer-events:auto}.activity-log-row{display:grid;grid-template-columns:68px 58px max-content;align-items:center;width:max-content;min-width:100%;height:18px;min-height:18px;max-height:18px;overflow:visible;white-space:nowrap;color:#cbd5dc}.activity-log-time{overflow:hidden;color:#7f8e99;font-variant-numeric:tabular-nums}.activity-log-level{overflow:hidden;font-weight:800}.activity-log-message{display:block;min-width:max-content;max-width:none;overflow:visible;text-overflow:clip;white-space:nowrap}.activity-log-row[data-level="ERROR"]{color:#fb7185}.activity-log-row[data-level="ERROR"] .activity-log-time{color:#fb7185}.activity-log-row[data-level="WARNING"]{color:#fbbf24}.activity-log-row[data-level="WARNING"] .activity-log-time{color:#d6a51d}.activity-log-row[data-level="SUCCESS"]{color:#4ade80}.activity-log-row[data-level="SUCCESS"] .activity-log-time{color:#3bbd6b}.activity-log-empty{padding:4px 0;color:#7f8e99;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.section-resize-handle{position:relative;left:auto;right:auto;bottom:auto;flex:0 0 10px;min-height:10px;height:10px;border-top:1px solid #2c3740;cursor:ns-resize;background:linear-gradient(90deg,transparent,rgba(148,163,184,.16),transparent);touch-action:none}.section-resize-handle:before{content:"";position:absolute;left:50%;top:3px;width:44px;height:3px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.48)}.section-resize-handle:hover:before{background:#fff}.section-body{padding:9px}.side-section>.section-body{flex:1;min-height:0;overflow:auto;padding-bottom:9px}.palette-head{display:flex;flex-direction:column;align-items:stretch;gap:7px;min-width:0}.palette-group{display:grid;grid-template-columns:minmax(82px,92px) minmax(0,1fr);align-items:center;gap:6px;min-width:0}.palette-label{height:26px;min-width:0;display:flex;align-items:center;padding:0 7px;background:#26343f;border:1px solid #364652;border-radius:7px;color:#d5dde3;white-space:nowrap;font-size:10px}.palette-grid{display:flex;gap:4px;flex-wrap:wrap;min-width:0}.palette-button{width:20px;height:20px;border:2px solid transparent;border-radius:3px;cursor:pointer;padding:0}.palette-button.active{border-color:#f4f7f9;box-shadow:0 0 0 1px #111}.video-assets-body{flex:1;min-height:0;overflow:auto;padding:8px}.video-asset-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-content:start;gap:8px}.video-assets-empty{grid-column:1/-1;min-height:130px;display:grid;place-items:center;padding:16px;border:1px dashed #35434e;border-radius:8px;color:#8998a3;text-align:center}.video-asset-card{position:relative;overflow:hidden;border:1px solid var(--hmb-line-soft,#344550);border-radius:9px;background:linear-gradient(145deg,rgba(255,255,255,.025),rgba(255,255,255,.006)),var(--hmb-field,#101820);transition:border-color 100ms ease,box-shadow 100ms ease}.video-asset-card[draggable="true"]{cursor:grab}.video-asset-card.dragging{opacity:.5;transform:scale(.985)}.video-asset-card.drop-target{border-color:rgb(var(--selection-rgb));box-shadow:0 0 0 1px rgba(var(--selection-rgb),.35)}.video-asset-card.selected{border-color:rgb(var(--selection-rgb));background:linear-gradient(145deg,rgba(var(--selection-rgb),.12),var(--selection-card));box-shadow:0 0 0 1px rgba(var(--selection-rgb),.16),0 0 18px rgba(var(--selection-rgb),.12)}.video-asset-thumb{position:relative;aspect-ratio:16/9;overflow:hidden;background:#080d14}.video-asset-thumb-media{width:100%;height:100%;object-fit:cover;pointer-events:none}.video-asset-thumb-fallback{position:absolute;inset:0;display:grid;place-items:center;color:#667684;font-size:10px;font-weight:800}.video-asset-role,.selected-video-order{position:absolute;top:7px;padding:3px 6px;border-radius:5px;background:rgba(5,8,18,.82);color:#fff;font-size:9px;font-weight:800}.video-asset-role{left:7px}.selected-video-order{right:7px;color:var(--selection-strong)}.video-asset-play{position:absolute;left:50%;top:50%;width:38px;height:38px;transform:translate(-50%,-50%);display:grid;place-items:center;border:1px solid rgba(255,255,255,.30);border-radius:50%;background:rgba(5,8,18,.76);color:#fff;cursor:pointer}.video-asset-delete{position:absolute;right:7px;bottom:7px;width:26px;height:26px;border:1px solid rgba(251,113,133,.45);border-radius:6px;background:rgba(76,5,25,.80);color:#ffe4e8;cursor:pointer}.video-asset-copy{padding:8px}.video-asset-copy>b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#edf2f5}.video-asset-footer{display:flex;align-items:center;gap:6px;margin-top:6px}.video-asset-footer>span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8f9da7;font-size:9px}.video-asset-footer button,.video-order-actions button{height:25px;padding:0 7px;border:1px solid #35434e;border-radius:6px;background:#111a21;color:#dce5eb;cursor:pointer;font-size:9px}.video-order-actions{display:flex;justify-content:flex-end;gap:4px;margin-top:5px}.video-order-hint{flex:0 0 auto;padding:5px 8px;border-top:1px solid #2c3740;color:#7f8e99;font-size:9px;text-align:center}
-      .radio-list{display:flex;flex-direction:column;gap:9px}.radio-row{display:grid;grid-template-columns:18px 1fr;align-items:start;cursor:pointer}.radio-row input{margin-top:3px;accent-color:#4c8fd7}.radio-row b{display:block;font-size:11px}.radio-row span{display:block;font-size:9px;color:#8f9ca6;margin-top:2px}.settings-action{position:sticky;top:0;z-index:4;padding:0 0 8px;background:linear-gradient(180deg,var(--hmb-panel-top,#151f27) 82%,rgba(21,31,39,0));}.settings-action .setting-checks{margin-top:7px}.settings-grid{display:grid;grid-template-columns:78px 1fr;gap:7px 8px;align-items:center;font-size:10px}.setting-value{height:27px;display:flex;align-items:center;padding:0 8px;background:#202d36;border:1px solid #2c3b46;color:#d7dfe4;border-radius:2px}.setting-value.split{justify-content:space-between}.setting-checks{display:flex;gap:12px;margin-top:0;font-size:9px;color:#aab6bf}.setting-checks label{display:flex;align-items:center;gap:5px}.setting-checks input{accent-color:#4c8fd7}.generate-button{width:100%;height:34px;margin:0;border:1px solid #346ba4;background:#285b91;color:#fff;font-weight:700;cursor:pointer}.generate-button:disabled,.palette-button:disabled{opacity:.4;cursor:not-allowed}
+      .radio-list{display:flex;flex-direction:column;gap:9px}.radio-row{display:grid;grid-template-columns:18px 1fr;align-items:start;cursor:pointer}.radio-row input{margin-top:3px;accent-color:#4c8fd7}.radio-row b{display:block;font-size:11px}.radio-row span{display:block;font-size:9px;color:#8f9ca6;margin-top:2px}.settings-action{position:sticky;top:0;z-index:4;padding:0 0 8px;background:linear-gradient(180deg,var(--hmb-panel-top,#151f27) 82%,rgba(21,31,39,0));}.settings-action .setting-checks{margin-top:7px}.settings-grid{display:grid;grid-template-columns:78px minmax(0,1fr);gap:7px 8px;align-items:center;font-size:10px}.setting-value{height:27px;display:flex;align-items:center;padding:0 8px;background:#202d36;border:1px solid #2c3b46;color:#d7dfe4;border-radius:2px}.setting-value.split{justify-content:space-between}.settings-compact-row{grid-column:1/-1;display:grid;grid-template-columns:minmax(0,.72fr) minmax(0,1.28fr) minmax(0,1fr);gap:5px;min-width:0}.settings-compact-item{height:27px;min-width:0;display:flex;align-items:center;justify-content:space-between;gap:4px;padding:0 6px;background:#202d36;border:1px solid #2c3b46;color:#d7dfe4;border-radius:2px;white-space:nowrap;overflow:hidden}.settings-compact-item b{flex:0 0 auto;font-size:8px;color:#8f9ca6}.settings-compact-item span{min-width:0;overflow:hidden;text-overflow:ellipsis}.setting-checks{display:flex;gap:12px;margin-top:0;font-size:9px;color:#aab6bf}.setting-checks label{display:flex;align-items:center;gap:5px}.setting-checks input{accent-color:#4c8fd7}.generate-button{width:100%;height:34px;margin:0;border:1px solid #346ba4;background:#285b91;color:#fff;font-weight:700;cursor:pointer}.generate-button:disabled,.palette-button:disabled{opacity:.4;cursor:not-allowed}
       .empty-pane{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;color:#8998a3;text-align:center;padding:20px}.empty-pane b{color:#c9d2d8}
       .video-asset-grid{grid-template-columns:repeat(auto-fill,minmax(132px,1fr))}
       .video-asset-thumb{cursor:pointer;outline:0}.video-asset-thumb:focus-visible{box-shadow:inset 0 0 0 2px var(--hmb-focus),inset 0 0 18px var(--hmb-glow)}.video-asset-thumb.is-playing .video-asset-play{border-color:var(--hmb-focus);background:rgba(5,8,18,.88);box-shadow:0 0 14px var(--hmb-glow)}.video-asset-play{z-index:3;pointer-events:none;font-size:15px;font-weight:900}.video-asset-delete{top:7px;right:7px;bottom:auto;z-index:5}.selected-video-order{top:auto;right:7px;bottom:7px}.video-asset-copy{display:grid;gap:3px;padding:7px 8px 8px}.video-asset-title{display:block;width:100%;min-width:0;padding:0;border:0;background:transparent;color:#edf2f5;font:inherit;font-size:11px;font-weight:800;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}.video-asset-title:not(:disabled):hover{color:var(--selection-strong)}.video-asset-title:disabled{opacity:.48;cursor:not-allowed}.video-asset-details{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8f9da7;font-size:9px}.import-video-button{display:inline-flex;align-items:center;justify-content:center;gap:5px;font-weight:800}.import-video-icon{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
@@ -4270,16 +4280,13 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
           <section class="side-section playblast-settings-section" data-section-key="settings" style="${hmbSectionHeightStyle(rightSectionHeights, "settings")}"><div class="section-head">${escapeHtml(tr.playblastSettings)}</div><div class="section-body">
             <div class="settings-action"><button type="button" class="generate-button" id="run-video" ${!buttonAvailability.playblastEnabled ? "disabled" : ""}>▶&nbsp; ${escapeHtml(tr.generate)}</button></div>
             <div class="settings-grid">
-              <span>${escapeHtml(tr.resolution)}</span><span class="setting-value">${Number(state.output_width || 1280)} × ${Number(state.output_height || 720)}</span>
+              <span>${escapeHtml(tr.resolution)}</span><select id="playblast-resolution" class="setting-select" ${runningOperation ? "disabled" : ""}>${HMB_PLAYBLAST_RESOLUTIONS.map((item) => `<option value="${item.value}" ${item.width === Number(state.output_width) && item.height === Number(state.output_height) ? "selected" : ""}>${item.label}</option>`).join("")}</select>
               <span>${escapeHtml(tr.frameRange)}</span><span class="setting-value split"><b>${escapeHtml(frameStartText)}</b><span>–</span><b>${escapeHtml(frameEndText)}</b></span>
-              <select id="playblast-resolution" class="setting-select" ${runningOperation ? "disabled" : ""}>${HMB_PLAYBLAST_RESOLUTIONS.map((item) => `<option value="${item.value}" ${item.width === Number(state.output_width) && item.height === Number(state.output_height) ? "selected" : ""}>${item.label}</option>`).join("")}</select>
-              <span>${escapeHtml(tr.fps)}</span><span class="setting-value">${escapeHtml(fpsText)}</span>
-              <span>${escapeHtml(tr.format)}</span><span class="setting-value">MPEG-4 / H.264</span>
-              <span>${escapeHtml(tr.mayaVersion)}</span><span class="setting-value">${escapeHtml(state.maya_version ? `Maya ${state.maya_version}` : tr.autoDetect)}</span>
+              <div class="settings-compact-row"><span class="settings-compact-item" title="${escapeHtml(`${tr.fps}: ${fpsText}`)}"><b>${escapeHtml(tr.fps)}</b><span>${escapeHtml(fpsText)}</span></span><span class="settings-compact-item" title="${escapeHtml(`${tr.format}: MPEG-4 / H.264`)}"><b>${escapeHtml(tr.format)}</b><span>H.264</span></span><span class="settings-compact-item" title="${escapeHtml(`${tr.mayaVersion}: ${state.maya_version ? `Maya ${state.maya_version}` : tr.autoDetect}`)}"><b>${escapeHtml(tr.mayaVersion)}</b><span>${escapeHtml(state.maya_version || tr.autoDetect)}</span></span></div>
             </div>
           </div><div class="section-resize-handle nodrag" data-resize-section="settings" title="${escapeHtml(tr.resizeSection)}"></div></section>
           <section class="side-section video-assets-section" data-section-key="color" style="${hmbSectionHeightStyle(rightSectionHeights, "color")}">
-            <div class="section-head"><span class="grow">${escapeHtml(tr.cutVideoHistory)}</span><span class="video-selected-count">${selectedAssets.length}/${HMB_PICKER_MAX_SELECTED_VIDEOS}</span><input type="file" id="import-video-asset" accept="video/mp4,video/*" hidden/><button type="button" class="import-video-button" id="import-video-button" ${locked ? "disabled" : ""}><svg class="import-video-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m16 16 4 4"></path></svg><span>${escapeHtml(tr.importVideoAsset)}</span></button></div>
+            <div class="section-head"><span class="grow">${escapeHtml(tr.cutVideoHistory)}</span><span class="video-selected-count">${selectedAssets.length}/${HMB_PICKER_MAX_SELECTED_VIDEOS}</span><input type="file" id="import-video-asset" accept=".mp4,video/mp4" multiple hidden/><button type="button" class="import-video-button" id="import-video-button" ${locked ? "disabled" : ""}><svg class="import-video-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m16 16 4 4"></path></svg><span>${escapeHtml(tr.importVideoAsset)}</span></button></div>
             <div class="video-assets-body"><div class="video-asset-grid">${videoAssetMarkup}</div></div>
             <div class="video-order-hint">${escapeHtml(tr.dragVideoOrder)}</div>
             <div class="section-resize-handle nodrag" data-resize-section="color" title="${escapeHtml(tr.resizeSection)}"></div>
@@ -5368,6 +5375,22 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       include_mask: maskEnabled,
       include_depth: depthEnabled,
       include_motion_guide: motionGuideEnabled,
+      authoring_state: {
+        state_revision: Number(currentLocal.state_revision || 0),
+        selected_camera: clean(currentLocal.selected_camera || currentLocal.camera),
+        slot_assignments: Array.isArray(currentLocal.slot_assignments)
+          ? currentLocal.slot_assignments
+          : [],
+        slot_visibility: Array.isArray(currentLocal.slot_visibility)
+          ? currentLocal.slot_visibility
+          : [],
+        original_enabled: originalEnabled,
+        mask_enabled: maskEnabled,
+        depth_enabled: depthEnabled,
+        motion_guide_enabled: motionGuideEnabled,
+        output_width: Number(currentLocal.output_width || 1280),
+        output_height: Number(currentLocal.output_height || 720),
+      },
     }, "", { reserveVisibility: true });
     if (!result.delivered) {
       appendImmediateLogLine("ERROR", "PLAYBLAST could not be delivered to HMB_PICKER_COMMAND.");
@@ -5603,24 +5626,32 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     container.querySelector("#import-video-asset")?.click?.();
   });
   on(container.querySelector("#import-video-asset"), "change", (event) => {
-    const file = event.target?.files?.[0];
-    if (!file) return;
-    const sourcePath = clean(file.path || file.webkitRelativePath);
-    if (!sourcePath) {
-      appendImmediateLogLine("ERROR", "The selected MP4 did not expose a local file path. Use the native MP4 browser button.");
+    const files = Array.from(event.target?.files || []);
+    if (!files.length) return;
+    const sources = files.map((file) => ({
+      source_path: clean(file.path || file.webkitRelativePath),
+      label: clean(file.name),
+    })).filter((item) => item.source_path);
+    if (sources.length !== files.length) {
+      appendImmediateLogLine(
+        "WARNING",
+        `${files.length - sources.length} selected MP4 file(s) did not expose a local path and were skipped.`,
+      );
+    }
+    if (!sources.length) {
+      appendImmediateLogLine("ERROR", "The selected MP4 files did not expose local paths. Use the native MP4 browser button.");
       event.target.value = "";
       return;
     }
-    const result = dispatchCommand("import_video_asset", {
-      source_path: sourcePath,
-      label: clean(file.name),
+    const result = dispatchCommand("import_video_assets", {
+      sources,
       select_if_capacity: true,
     });
     appendImmediateLogLine(
       result.delivered ? "INFO" : "ERROR",
       result.delivered
-        ? `Import requested: ${clean(file.name) || sourcePath}.`
-        : "The MP4 import request could not be delivered.",
+        ? `Batch import requested for ${sources.length} MP4 file(s).`
+        : "The MP4 batch import request could not be delivered.",
     );
     event.target.value = "";
   });

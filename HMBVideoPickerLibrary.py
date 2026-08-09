@@ -153,6 +153,7 @@ ORIGINAL_MEDIA_KIND = "maya_original_playblast"
 MASK_MEDIA_KIND = "maya_color_assignment_mask"
 PRIMARY_COLOR_VIDEO_SLOT = 1
 MAX_SELECTED_VIDEOS = 10
+MAX_VIDEO_IMPORT_BATCH = 100
 MAX_SNAPSHOT_HISTORY = 10
 # ``MAX_VIDEO_SLOTS`` remains as a compatibility name for the Maya staging and
 # legacy widget command code.  Public media is no longer represented by fixed
@@ -1301,6 +1302,15 @@ def _validate_depth_companion_inputs(
             "verified_frame_assignment_count",
         )
     }
+    assignment_counts["verified_proxy_placeholder_path_count"] = (
+        required_nonnegative_integer(
+            assignment_verification.get(
+                "verified_proxy_placeholder_path_count",
+                0,
+            ),
+            "shader assignment verification verified_proxy_placeholder_path_count",
+        )
+    )
     renderable_shape_count = required_nonnegative_integer(
         range_report.get("renderable_shape_count"),
         "renderable shape count",
@@ -1328,6 +1338,8 @@ def _validate_depth_companion_inputs(
         != nurbs_surface_shape_count
         or assignment_counts["verified_shape_path_count"]
         != renderable_shape_count
+        or assignment_counts["verified_proxy_placeholder_path_count"]
+        > mesh_shape_count
         or assignment_counts["rendered_frame_count"] != expected_frame_count
         or assignment_counts["expected_frame_assignment_count"]
         != expected_frame_count * renderable_shape_count
@@ -3829,11 +3841,11 @@ def _default_widget_state() -> Dict[str, Any]:
         "outliner_panel_height": 0,
         "viewport_panel_height": 0,
         "right_section_heights": {
-            "settings": 285,
+            "settings": 217,
             "color": 628,
             "log": 208,
         },
-        "ui_layout_version": 5,
+        "ui_layout_version": 6,
         "ui_theme": "P",
         "workspace_view": "outliner",
         "selected_outliner_path": "",
@@ -5833,7 +5845,7 @@ def _parse_state(value: Any) -> Dict[str, Any]:
         except Exception:
             value = 0
         state[key] = max(minimum, min(6000, value)) if value > 0 else 0
-    right_section_defaults = {"settings": 285, "color": 628, "log": 208}
+    right_section_defaults = {"settings": 217, "color": 628, "log": 208}
     try:
         source_layout_version = max(1, int(float(source.get("ui_layout_version") or 1)))
     except Exception:
@@ -5879,8 +5891,16 @@ def _parse_state(value: Any) -> Dict[str, Any]:
         except Exception:
             value = default
         normalized_right_section_heights[key] = max(96, min(900, value))
+    if source_layout_version == 5:
+        normalized_right_section_heights["settings"] = max(
+            96,
+            min(
+                900,
+                normalized_right_section_heights["settings"] - 68,
+            ),
+        )
     state["right_section_heights"] = normalized_right_section_heights
-    state["ui_layout_version"] = 5
+    state["ui_layout_version"] = 6
     state["ui_theme"] = "T" if _clean(state.get("ui_theme")).upper() == "T" else "P"
     reserved_video_control_slots: set[int] = set()
     for raw in (
@@ -7456,11 +7476,30 @@ def _choose_maya_scene_file(initial_value: Any = "") -> str:
     return str(_norm_path(selected)) if _clean(selected) else ""
 
 
-def _choose_video_asset_file(initial_value: Any = "") -> str:
-    """Open an OS-native MP4 dialog for the current cut history."""
+def _choose_video_asset_files(initial_value: Any = "") -> List[str]:
+    """Open one OS-native multi-select MP4 dialog in deterministic order."""
+    test_selections = _clean(
+        os.environ.get("HMB_VIDEO_ASSET_TEST_SELECTIONS")
+    )
+    if test_selections:
+        try:
+            decoded = json.loads(test_selections)
+        except Exception as exc:
+            raise ValueError(
+                "HMB_VIDEO_ASSET_TEST_SELECTIONS must be a JSON list."
+            ) from exc
+        if not isinstance(decoded, list):
+            raise ValueError(
+                "HMB_VIDEO_ASSET_TEST_SELECTIONS must be a JSON list."
+            )
+        return [
+            str(_norm_path(item))
+            for item in decoded[:MAX_VIDEO_IMPORT_BATCH]
+            if _clean(item)
+        ]
     test_selection = _clean(os.environ.get("HMB_VIDEO_ASSET_TEST_SELECTION"))
     if test_selection:
-        return str(_norm_path(test_selection))
+        return [str(_norm_path(test_selection))]
     initial_path = _norm_path(initial_value) if _clean(initial_value) else None
     initial_dir = initial_path.parent if initial_path and initial_path.suffix else initial_path
     try:
@@ -7474,9 +7513,9 @@ def _choose_video_asset_file(initial_value: Any = "") -> str:
         except Exception as exc:
             _diagnostic_exception("Native video dialog topmost configuration failed", exc)
         try:
-            selected = filedialog.askopenfilename(
+            selected = filedialog.askopenfilenames(
                 parent=root,
-                title="Import MP4 Video",
+                title="Import MP4 Videos",
                 initialdir=(
                     str(initial_dir)
                     if initial_dir and initial_dir.is_dir()
@@ -7498,11 +7537,11 @@ def _choose_video_asset_file(initial_value: Any = "") -> str:
         script = (
             "Add-Type -AssemblyName System.Windows.Forms; "
             "$d=New-Object System.Windows.Forms.OpenFileDialog; "
-            "$d.Title='Import MP4 Video'; "
+            "$d.Title='Import MP4 Videos'; "
             "$d.Filter='MP4 Video (*.mp4)|*.mp4'; "
-            "$d.Multiselect=$false; "
+            "$d.Multiselect=$true; "
             f"$d.InitialDirectory='{escaped_initial}'; "
-            "if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Out.Write($d.FileName)}"
+            "if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){$d.FileNames | ForEach-Object {[Console]::Out.WriteLine($_)}}"
         )
         completed = subprocess.run(
             ["powershell.exe", "-NoProfile", "-STA", "-Command", script],
@@ -7512,13 +7551,29 @@ def _choose_video_asset_file(initial_value: Any = "") -> str:
             creationflags=_creation_flags(),
             check=False,
         )
-        selected = _clean(completed.stdout)
+        selected = [
+            line.strip()
+            for line in str(completed.stdout or "").splitlines()
+            if line.strip()
+        ]
         if completed.returncode != 0:
             raise RuntimeError(
                 _clean(completed.stderr)
                 or "The Windows MP4 file dialog failed."
             ) from tkinter_exc
-    return str(_norm_path(selected)) if _clean(selected) else ""
+    if isinstance(selected, (str, Path)):
+        selected = [selected] if _clean(selected) else []
+    return [
+        str(_norm_path(item))
+        for item in list(selected or [])[:MAX_VIDEO_IMPORT_BATCH]
+        if _clean(item)
+    ]
+
+
+def _choose_video_asset_file(initial_value: Any = "") -> str:
+    """Compatibility wrapper returning the first selected MP4, if any."""
+    selected = _choose_video_asset_files(initial_value)
+    return selected[0] if selected else ""
 
 
 def _command_text(command: Sequence[str]) -> str:
@@ -9592,6 +9647,31 @@ class HMBVideoPickerLibrary(DataNode):
             self._write_state(state)
             self._sync_outputs_from_state(state)
             return
+        if operation_kind in {"run_video", "render_snapshot"} and bool(
+            state.get("native_read_ready")
+        ):
+            ready_stage = "VIDEO_READY" if state.get("videos") else "OUTLINER_READY"
+            state.update({
+                "status": ready_stage,
+                "scene_stage": ready_stage,
+                "scene_request_status": "COMPLETE",
+                "message": (
+                    "The current generation was stopped. Completed READ metadata, "
+                    "Color Pick assignments, and existing outputs were preserved."
+                ),
+                "pending_action": "",
+                "pending_action_id": "",
+                "active_process_pid": 0,
+                "active_process_kind": "",
+            })
+            _append_activity_log(
+                state,
+                "WARNING",
+                f"Generation stopped after {state.get('last_operation_seconds', 0.0):.1f} seconds; authoring state remains ready for retry.",
+            )
+            self._write_state(state)
+            self._sync_outputs_from_state(state)
+            return
         if operation_kind == "read_scene":
             message = "사용자가 읽기 작업을 정지했습니다." if korean else "READ stopped by the user."
             log_message = (
@@ -9646,6 +9726,33 @@ class HMBVideoPickerLibrary(DataNode):
                 state,
                 "WARNING",
                 "Stale original preview result discarded; completed READ metadata, bindings, videos, and successful artifacts were preserved.",
+            )
+            self._write_state(state)
+            self._sync_outputs_from_state(state)
+            return
+        if context.kind in {"run_video", "render_snapshot"} and bool(
+            state.get("native_read_ready")
+        ):
+            ready_stage = "VIDEO_READY" if state.get("videos") else "OUTLINER_READY"
+            state.update({
+                "status": ready_stage,
+                "scene_stage": ready_stage,
+                "scene_request_status": "COMPLETE",
+                "message": (
+                    _clean(reason)
+                    or "The stale generation result was discarded; authoring state remains ready for retry."
+                ),
+                "operation_invalidated": False,
+                "operation_invalidation_reason": "",
+                "pending_action": "",
+                "pending_action_id": "",
+                "active_process_pid": 0,
+                "active_process_kind": "",
+            })
+            _append_activity_log(
+                state,
+                "WARNING",
+                "Stale generation result discarded; existing Color Pick assignments and outputs remain ready for retry.",
             )
             self._write_state(state)
             self._sync_outputs_from_state(state)
@@ -9842,6 +9949,8 @@ class HMBVideoPickerLibrary(DataNode):
             _append_activity_log(incoming, "INFO", log_message)
         worker_name = threading.current_thread().name
         _append_activity_log(incoming, "INFO", f"Background worker thread started: {worker_name}.")
+        terminal_success_state: Optional[Dict[str, Any]] = None
+        pending_selection_to_schedule: Optional[tuple[str, str]] = None
         try:
             self._write_state(incoming)
             self._cleanup_transient_paths()
@@ -10060,8 +10169,11 @@ class HMBVideoPickerLibrary(DataNode):
                 )
                 final_state = self._mark_operation_finished(final_state)
                 final_state = self._apply_selected_view_fields(final_state)
-                self._write_state(final_state)
-                self._sync_outputs_from_state(final_state)
+                # Keep the widget visibly busy until process cleanup and all
+                # in-memory operation reservations have been retired. Without
+                # this terminal boundary, an immediate post-success recolor can
+                # be mistaken for a mutation of the already-finished run.
+                terminal_success_state = final_state
         except _StaleOperationError as exc:
             if bool(self._picker_state().get("operation_invalidated")):
                 self._set_stale_discarded_state(context, str(exc))
@@ -10093,7 +10205,21 @@ class HMBVideoPickerLibrary(DataNode):
             pending_selection = self._hmb_pending_scene_selection
             self._hmb_pending_scene_selection = None
             if pending_selection:
-                pending_path, pending_source = pending_selection
+                pending_selection_to_schedule = pending_selection
+        try:
+            if terminal_success_state is not None:
+                self._write_state(terminal_success_state)
+                self._sync_outputs_from_state(terminal_success_state)
+        except Exception as exc:
+            # Preserve the former terminal-publication error path while keeping
+            # operation teardown ahead of the visible ready state.
+            self._set_failed_state(exc)
+        finally:
+            # A Maya scene selected during generation must start after the old
+            # operation's terminal state is published, otherwise that terminal
+            # echo can overwrite the newly scheduled READ state.
+            if pending_selection_to_schedule:
+                pending_path, pending_source = pending_selection_to_schedule
                 try:
                     self._schedule_scene_selection(pending_path, pending_source)
                 except Exception as exc:
@@ -10796,6 +10922,32 @@ class HMBVideoPickerLibrary(DataNode):
         state["backend_ack_action_id"] = action_id
         state["pending_action"] = ""
         state["pending_action_id"] = ""
+        if action == "run_video" and isinstance(
+            payload.get("authoring_state"),
+            dict,
+        ):
+            authoring_state = dict(payload["authoring_state"])
+            # WIDGET_STATE and HMB_PICKER_COMMAND are independent transports.
+            # Freeze the exact authoring snapshot visible when Generate was
+            # clicked so a just-applied color/visibility edit cannot arrive
+            # behind the command and invalidate or misconfigure this run.
+            for field in (
+                "selected_camera",
+                "slot_assignments",
+                "slot_visibility",
+                "original_enabled",
+                "mask_enabled",
+                "depth_enabled",
+                "motion_guide_enabled",
+                "output_width",
+                "output_height",
+            ):
+                if field in authoring_state:
+                    state[field] = copy.deepcopy(authoring_state[field])
+            state = _parse_state(state)
+            state["backend_ack_action_id"] = action_id
+            state["pending_action"] = ""
+            state["pending_action_id"] = ""
         # Only Maya/FFmpeg work owns the transient busy stage. Metadata and UI
         # commands (notably catalog deletion) must retain the last stable stage;
         # otherwise the widget interprets their terminal echo as a permanently
@@ -10994,23 +11146,101 @@ class HMBVideoPickerLibrary(DataNode):
         if action == "open_log_folder":
             self._handle_open_log_folder_action(state)
             return
-        if action in {"browse_video_asset", "import_video_asset", "import_video"}:
-            source_path = _clean(
-                payload.get("source_path")
-                or payload.get("file_path")
-                or payload.get("path")
-            )
+        if action in {
+            "browse_video_asset",
+            "import_video_asset",
+            "import_video_assets",
+            "import_video",
+        }:
+            sources: List[Dict[str, str]] = []
             if action == "browse_video_asset":
-                source_path = _choose_video_asset_file(source_path)
-            if not source_path:
+                initial_path = _clean(
+                    payload.get("source_path")
+                    or payload.get("file_path")
+                    or payload.get("path")
+                )
+                sources = [
+                    {"source_path": source_path, "label": ""}
+                    for source_path in _choose_video_asset_files(initial_path)
+                ]
+            elif isinstance(payload.get("sources"), list):
+                for raw_source in payload["sources"][:MAX_VIDEO_IMPORT_BATCH]:
+                    if isinstance(raw_source, dict):
+                        source_path = _clean(
+                            raw_source.get("source_path")
+                            or raw_source.get("file_path")
+                            or raw_source.get("path")
+                        )
+                        label = _clean(
+                            raw_source.get("label") or raw_source.get("name")
+                        )
+                    else:
+                        source_path = _clean(raw_source)
+                        label = ""
+                    if source_path:
+                        sources.append({
+                            "source_path": source_path,
+                            "label": label,
+                        })
+            else:
+                source_path = _clean(
+                    payload.get("source_path")
+                    or payload.get("file_path")
+                    or payload.get("path")
+                )
+                if source_path:
+                    sources = [{
+                        "source_path": source_path,
+                        "label": _clean(
+                            payload.get("label") or payload.get("name")
+                        ),
+                    }]
+            if not sources:
                 state["message"] = "MP4 import was cancelled."
                 self._write_state(state)
                 return
-            state = self._import_video_asset(
-                state,
-                source_path,
-                label=payload.get("label") or payload.get("name"),
+            imported_count = 0
+            import_failures: List[str] = []
+            for source in sources:
+                source_path = source["source_path"]
+                try:
+                    state = self._import_video_asset(
+                        state,
+                        source_path,
+                        label=source.get("label"),
+                    )
+                    imported_count += 1
+                except Exception as exc:
+                    source_label = _clean(source.get("label")) or Path(
+                        source_path
+                    ).name
+                    import_failures.append(
+                        f"{source_label or 'MP4'}: "
+                        f"{_clean(exc) or exc.__class__.__name__}"
+                    )
+            if imported_count <= 0:
+                raise RuntimeError(
+                    "No selected MP4 could be imported. "
+                    + " | ".join(import_failures[:5])
+                )
+            state["message"] = (
+                f"Imported {imported_count} MP4 file(s) into the cut history."
             )
+            _append_activity_log(state, "SUCCESS", state["message"])
+            if import_failures:
+                warning = (
+                    f"Skipped {len(import_failures)} MP4 file(s): "
+                    + " | ".join(import_failures[:5])
+                )
+                warnings = [
+                    _clean(item)
+                    for item in state.get("warnings", [])
+                    if _clean(item)
+                ]
+                if warning not in warnings:
+                    warnings.append(warning)
+                state["warnings"] = warnings[-20:]
+                _append_activity_log(state, "WARNING", warning)
             self._write_state(state)
             self._sync_outputs_from_state(state)
             return
@@ -11174,7 +11404,14 @@ class HMBVideoPickerLibrary(DataNode):
                 int(merged.get("state_revision") or 0),
             )
             active_context = self._hmb_active_operation
-            if active_context is not None:
+            active_context_still_owned = bool(
+                active_context is not None
+                and _clean(previous_state.get("operation_id"))
+                == active_context.operation_id
+                and _clean(previous_state.get("operation_kind"))
+                == active_context.kind
+            )
+            if active_context_still_owned and active_context is not None:
                 current_scene = self._current_scene_text(active_context.scene_path)
                 current_digest = _operation_input_digest(
                     active_context.kind,

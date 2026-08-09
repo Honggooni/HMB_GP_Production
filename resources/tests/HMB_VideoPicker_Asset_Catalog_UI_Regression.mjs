@@ -416,7 +416,11 @@ assert.ok(
 );
 assert.match(importVideoInput, /type="file"/);
 assert.match(importVideoInput, /hidden/);
+assert.match(importVideoInput, /\bmultiple\b/);
 assert.match(importVideoInput, /accept="[^"]*video\/mp4/);
+assert.doesNotMatch(widgetSource, /files\?\.\[0\]/);
+assert.match(widgetSource, /Array\.from\(event\.target\?\.files \|\| \[\]\)/);
+assert.match(widgetSource, /dispatchCommand\("import_video_assets", \{[\s\S]*?sources,/);
 const selectedVideoCardTags = widgetSource.match(
   /<[^>]*data-selected-video-uid=[^>]*>/g,
 ) || [];

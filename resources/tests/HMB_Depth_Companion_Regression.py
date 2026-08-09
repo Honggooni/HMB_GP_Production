@@ -158,6 +158,7 @@ def shader_depth_range_report(frame_values=None) -> dict:
             "mesh_path_count": 2,
             "nurbs_surface_path_count": 0,
             "verified_shape_path_count": 2,
+            "verified_proxy_placeholder_path_count": 0,
             "verified_mesh_face_count": 24,
             "rendered_frame_count": len(evaluated_frames),
             "expected_frame_assignment_count": 2 * len(evaluated_frames),
@@ -1525,6 +1526,19 @@ with tempfile.TemporaryDirectory() as temp_dir:
         result=result_matching_range(incomplete_assignment_verification),
         color_sidecar=color_sidecar,
         depth_sidecar=incomplete_assignment_verification,
+        color_frame_paths=color_frames,
+        depth_frame_paths=depth_frames,
+    )
+
+    invalid_proxy_assignment_verification = copy.deepcopy(depth_sidecar)
+    invalid_proxy_assignment_verification["depth_range_report"][
+        "assignment_verification"
+    ]["verified_proxy_placeholder_path_count"] = 3
+    assert_depth_invalid(
+        "proxy placeholder verification exceeds mesh count",
+        result=result_matching_range(invalid_proxy_assignment_verification),
+        color_sidecar=color_sidecar,
+        depth_sidecar=invalid_proxy_assignment_verification,
         color_frame_paths=color_frames,
         depth_frame_paths=depth_frames,
     )
