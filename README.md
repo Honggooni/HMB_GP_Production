@@ -1,9 +1,15 @@
 # HMB GP Production
 
-> **Private repository only.** This source tree and its production release keep
-> authorized internal host/share defaults required by the HMB team workflow.
-> Do not make the GitHub repository or release assets public without replacing
-> those defaults and repeating the release security audit.
+> **Public team distribution repository.** Keep this repository and its GitHub
+> Releases public so every HMB team member can clone, fetch, and install updates
+> without per-user repository access. Repository visibility is not a security
+> boundary: never commit API keys, access tokens, passwords, private signing
+> keys, credentials, or non-public media.
+
+The source includes internal host and share defaults used for team routing.
+Those values grant no access by themselves; authentication and authorization
+remain the responsibility of the referenced services. Every change must still
+pass the release security audit before it reaches `main`.
 
 ## Agent policy availability
 
