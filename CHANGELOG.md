@@ -2,6 +2,12 @@
 
 ## 0.5.27 - 2026-08-08
 
+- Split the Video Picker color palette into Actor 7, shared Ghost 3, and
+  Object-pattern 4 rows. Existing marker names, repeat behavior, saved
+  bindings, and Lambert/SurfaceShader rendering remain unchanged.
+- Exposed the shared Ghost 3 colors to Prompt and Image Asset character
+  sources while keeping object/background choices at Ghost 3 plus Pattern 4
+  and preserving the unique 14-choice Custom order.
 - Compacted Video Picker FPS, format, and Maya information into one settings
   row and reassigned the recovered 68 px to the initial Current Cut Videos
   area, with a one-time saved-layout migration.

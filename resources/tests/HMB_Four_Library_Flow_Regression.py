@@ -101,7 +101,9 @@ try:
     )
     assert hero["source_type"] == "Character Appearance"
     assert hero["scope_candidate"] == "Full body / full appearance"
-    assert hero["color_pick_candidates"] == common.ACTOR_COLOR_PICK_CHOICES
+    assert hero["color_pick_candidates"] == (
+        common.image_color_pick_choices_for_source_type("Character Appearance")
+    )
     assert hero["registered"] is True
     assert background["source_type"] == "Environment / Background"
     assert background["scope_candidate"] == "Main background"
@@ -239,7 +241,9 @@ try:
     assert prompt_row["scope"] == "Full body / full appearance"
     assert prompt_row["color_picks"] == ["Blue"]
     assert prompt_row["asset_scope_candidate"] == "Full body / full appearance"
-    assert prompt_row["asset_color_pick_candidates"] == common.ACTOR_COLOR_PICK_CHOICES
+    assert prompt_row["asset_color_pick_candidates"] == (
+        common.image_color_pick_choices_for_source_type("Character Appearance")
+    )
 
     # Video Picker markers bind against the exact Asset ID even when Image Name
     # differs; legacy rows still fall back to Image Name.

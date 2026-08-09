@@ -87,6 +87,23 @@ const directionCheckerStyle = pickerModule.hmbPickerColorStyle("Direction Checke
 assert.match(directionCheckerStyle, /background-color:#000/);
 assert.match(directionCheckerStyle, /#fff/);
 assert.doesNotMatch(directionCheckerStyle, /#111|#f5f5f5/);
+const paletteGroups = pickerModule.hmbPickerPaletteGroups({
+  character: [
+    "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink",
+  ].map((name) => ({ name, kind: "solid" })),
+  background: [
+    "Sky Blue", "Mint", "Beige",
+  ].map((name) => ({ name, kind: "solid" })).concat([
+    "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern",
+  ].map((name) => ({ name, kind: "pattern" }))),
+});
+assert.deepEqual(paletteGroups.actor, [
+  "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink",
+]);
+assert.deepEqual(paletteGroups.ghost, ["Sky Blue", "Mint", "Beige"]);
+assert.deepEqual(paletteGroups.object, [
+  "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern",
+]);
 
 for (const [name, source] of [
   ["VideoPicker", videoSource],
@@ -1364,8 +1381,20 @@ assert.match(videoSource, /\.outliner-palette\{padding:8px;border-bottom:/);
 assert.ok(
   videoSource.indexOf('<div class="outliner-palette">')
     < videoSource.indexOf('<div class="outliner-toolbar">'),
-  "The compact actor/object palette must sit directly above the Outliner controls.",
+  "The compact actor/ghost/object palette must sit directly above the Outliner controls.",
 );
+const actorPaletteIndex = videoSource.indexOf('data-palette-kind="actor"');
+const ghostPaletteIndex = videoSource.indexOf('data-palette-kind="ghost"');
+const objectPaletteIndex = videoSource.indexOf('data-palette-kind="object"');
+assert.ok(
+  actorPaletteIndex >= 0
+    && actorPaletteIndex < ghostPaletteIndex
+    && ghostPaletteIndex < objectPaletteIndex,
+  "Picker palette rows must render as Actor 7, Ghost 3, then Object patterns 4.",
+);
+assert.match(videoSource, /presetGhost: "Preset Ghost"/);
+assert.match(videoSource, /presetGhost: "프리셋 고스트"/);
+assert.match(videoSource, /data-palette-kind="ghost" data-palette-scope="actor-background"/);
 assert.doesNotMatch(videoSource, /id="apply-color"|class="selected-target"|\.apply-button/);
 assert.match(
   videoSource,

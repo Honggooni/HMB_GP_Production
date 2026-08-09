@@ -779,8 +779,12 @@ def _image_taxonomy_payload() -> Dict[str, Any]:
             key: list(values)
             for key, values in IMAGE_SCOPE_CHOICES_BY_SOURCE_TYPE.items()
         },
-        "actor_color_pick_choices": list(ACTOR_COLOR_PICK_CHOICES),
-        "object_color_pick_choices": list(OBJECT_COLOR_PICK_CHOICES),
+        "actor_color_pick_choices": image_color_pick_choices_for_source_type(
+            "Character Appearance"
+        ),
+        "object_color_pick_choices": image_color_pick_choices_for_source_type(
+            "Prop / Accessory"
+        ),
         "actor_color_pick_source_types": sorted(ACTOR_COLOR_PICK_SOURCE_TYPES),
         "object_color_pick_source_types": sorted(OBJECT_COLOR_PICK_SOURCE_TYPES),
     }
