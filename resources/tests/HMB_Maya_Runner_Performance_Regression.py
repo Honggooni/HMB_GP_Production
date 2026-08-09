@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import inspect
 import sys
@@ -27,6 +28,57 @@ assert spec and spec.loader
 spec.loader.exec_module(runner)
 
 runner_source = RUNNER_PATH.read_text(encoding="utf-8")
+runner_tree = ast.parse(runner_source, filename=str(RUNNER_PATH))
+assert runner.MAYA_WORLD_PATTERN_PROFILE == "hmb_maya_world_root_projection_v1"
+assert runner.WORLD_PATTERN_BASE_CELL_WORLD_UNITS == 15.0
+assert runner.WORLD_PATTERN_DENSITY_MULTIPLIER == 3.0
+assert runner.WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS == 5.0
+assert (
+    runner.WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS
+    * runner.WORLD_PATTERN_DENSITY_MULTIPLIER
+    == runner.WORLD_PATTERN_BASE_CELL_WORLD_UNITS
+), "The approved grid must remain exactly three times denser than the base grid."
+world_group_source = inspect.getsource(runner._world_projected_pattern_group)
+projected_surface_source = inspect.getsource(runner._projected_surface_group)
+assert '"projection"' in world_group_source
+assert '"place3dTexture"' in world_group_source
+assert '".placementMatrix"' in world_group_source
+assert "parentConstraint(" in world_group_source
+assert "scaleConstraint(" in world_group_source
+assert '"multiplyDivide"' in world_group_source
+assert '"camera_anchored": False' in world_group_source
+assert '"uv_dependent": False' in world_group_source
+assert '"root_scale_followed": True' in world_group_source
+assert '"world_cell_scale_compensated": True' in world_group_source
+assert "cmds.file" not in world_group_source
+# The report key is the only legitimate use of the word camera in this helper.
+assert "camera" not in world_group_source.replace('"camera_anchored"', "")
+assert "_connect_authored_transparency(" in projected_surface_source
+run_source = inspect.getsource(runner.run)
+reference_frame_statement = (
+    'job["_world_pattern_reference_frame"] = float(frames[0])'
+)
+assert reference_frame_statement in run_source
+assert run_source.index(reference_frame_statement) < run_source.index(
+    "_apply_marker_shaders(bindings, job)"
+)
+
+# All render-time shader and projector nodes are temporary in the opened Maya
+# process. The source scene may be opened and queried, but never renamed/saved.
+for candidate in ast.walk(runner_tree):
+    if not isinstance(candidate, ast.Call):
+        continue
+    if not (
+        isinstance(candidate.func, ast.Attribute)
+        and isinstance(candidate.func.value, ast.Name)
+        and candidate.func.value.id == "cmds"
+        and candidate.func.attr == "file"
+    ):
+        continue
+    keyword_names = {keyword.arg for keyword in candidate.keywords}
+    assert not ({"save", "saveAs", "rename"} & keyword_names), (
+        "The Maya preview runner must never save or rename the user's source scene."
+    )
 assert runner.SCREEN_SPACE_PATTERN_PROFILE == "hmb_screen_space_pattern_post_v2"
 assert runner.SCREEN_SPACE_PATTERN_LINEAR_SCALE_DIVISOR == 3
 assert runner.SCREEN_SPACE_PATTERN_CELL_DIVISOR == 24
@@ -107,6 +159,12 @@ runner._load_marker_catalog({
     "marker_catalog_path": str(CATALOG_PATH),
     "marker_catalog_version": 4,
 })
+assert runner.MARKER_PATTERNS == {
+    "Direction Checker": "direction_checker",
+    "Sky Grid": "sky_grid",
+    "Floor Grid": "floor_grid",
+    "Position Pattern": "position_pattern",
+}
 payload_binding = [{
     "color": "Red",
     "asset_id": "Hero",
@@ -207,6 +265,8 @@ assert [item[1] for item in shader_calls["lambert"]] == [
     runner.MARKER_COLORS["Beige"],
 ]
 assert shader_calls["pattern"] == []
+# This block intentionally exercises the legacy compositor. Its categorical
+# shader may only be selected by the explicit screen_space_patterns flag.
 assert [item[0] for item in shader_calls["screen_pattern"]] == [
     "HMB_Direction_Checker", "HMB_Sky_Grid", "HMB_Floor_Grid", "HMB_Position_Pattern",
 ]
@@ -217,6 +277,455 @@ assert [item[1] for item in shader_calls["screen_pattern"]] == [
     runner.MARKER_PATTERN_IDS["Position Pattern"],
 ]
 assert sum(1 for _shapes, group in shader_calls["assign"] if group == "lambert:HMB_Sky_Blue") == 2
+try:
+    runner._apply_marker_shaders([], {
+        "screen_space_patterns": True,
+        "world_space_patterns": True,
+    })
+except RuntimeError as exc:
+    assert "cannot be enabled together" in str(exc)
+else:
+    raise AssertionError(
+        "Legacy screen fallback and world projection must be mutually exclusive."
+    )
+
+
+class WorldPatternCmds:
+    """Minimal deterministic Maya cmds model for the projected pattern graph."""
+
+    ENUMS = (
+        "Off:Planar:Spherical:Cylindrical:Ball:Cubic:TriPlanar:"
+        "Concentric:Perspective"
+    )
+
+    def __init__(self):
+        self.nodes = []
+        self.attributes = []
+        self.connections = []
+        self.constraints = []
+        self.scale_constraints = []
+        self.parents = []
+        self.transforms = []
+        self.set_nodes = []
+
+    def objExists(self, _node):
+        return True
+
+    def nodeType(self, node):
+        leaf = str(node).rsplit("|", 1)[-1]
+        if leaf in {"Ground", "Set", "Dome", "Backdrop"}:
+            return "transform"
+        if leaf.endswith("_Checker"):
+            return "checker"
+        if leaf.endswith("_Grid"):
+            return "grid"
+        if leaf.endswith("_File"):
+            return "file"
+        if leaf.endswith("_Projection"):
+            return "projection"
+        if leaf.endswith("_Projector"):
+            return "place3dTexture"
+        if leaf.endswith("_Place2d"):
+            return "place2dTexture"
+        return "transform"
+
+    def exactWorldBoundingBox(self, _shapes, **_kwargs):
+        # Non-square dimensions expose accidental repeat/axis swaps.
+        return [0.0, 0.0, 0.0, 30.0, 10.0, 45.0]
+
+    def shadingNode(self, node_type, **kwargs):
+        name = str(kwargs.get("name") or node_type)
+        self.nodes.append((node_type, name, tuple(sorted(kwargs.items()))))
+        return name
+
+    def createNode(self, node_type, **kwargs):
+        name = str(kwargs.get("name") or node_type)
+        self.nodes.append((node_type, name, tuple(sorted(kwargs.items()))))
+        return name
+
+    def sets(self, *_args, **kwargs):
+        name = str(kwargs.get("name") or "WorldPatternSG")
+        self.set_nodes.append((name, tuple(sorted(kwargs.items()))))
+        return name
+
+    def attributeQuery(self, _attribute, **_kwargs):
+        return [self.ENUMS]
+
+    def setAttr(self, plug, *values, **kwargs):
+        self.attributes.append((plug, values, tuple(sorted(kwargs.items()))))
+
+    def getAttr(self, plug, **_kwargs):
+        if plug.endswith("_RootAnchor.scale"):
+            # Non-uniform scale makes axis mistakes observable while the
+            # multiplyDivide graph preserves a five-world-unit cell.
+            return [(2.0, 3.0, 4.0)]
+        return 0.0
+
+    def connectAttr(self, source, target, **kwargs):
+        self.connections.append((source, target, tuple(sorted(kwargs.items()))))
+
+    def parentConstraint(self, source, target, **kwargs):
+        name = target + "_parentConstraint"
+        self.constraints.append((source, target, tuple(sorted(kwargs.items()))))
+        return [name]
+
+    def scaleConstraint(self, source, target, **kwargs):
+        name = target + "_scaleConstraint"
+        self.scale_constraints.append(
+            (source, target, tuple(sorted(kwargs.items())))
+        )
+        return [name]
+
+    def parent(self, child, parent, **kwargs):
+        self.parents.append((child, parent, tuple(sorted(kwargs.items()))))
+        return [child]
+
+    def xform(self, node, **kwargs):
+        self.transforms.append((node, tuple(sorted(kwargs.items()))))
+
+
+def build_world_pattern(pattern, root, name, texture_folder):
+    fake = WorldPatternCmds()
+    original_cmds = runner.cmds
+    runner.cmds = fake
+    try:
+        group, report, projection = runner._world_projected_pattern_group(
+            name,
+            pattern,
+            root,
+            [root + "|shape"],
+            str(texture_folder),
+            runner.WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS,
+        )
+    finally:
+        runner.cmds = original_cmds
+    return fake, group, report, projection
+
+
+with tempfile.TemporaryDirectory(prefix="hmb_world_pattern_graph_") as temp_dir:
+    graph_root = Path(temp_dir)
+    projection_contract = {
+        "direction_checker": ("TriPlanar", "XYZ"),
+        "sky_grid": ("TriPlanar", "XYZ"),
+        "floor_grid": ("Planar", "XZ"),
+        "position_pattern": ("TriPlanar", "XYZ"),
+    }
+    graph_snapshots = {}
+    for index, (pattern, expected_projection) in enumerate(
+        projection_contract.items(),
+        start=1,
+    ):
+        name = "HMB_World_{0}".format(pattern)
+        root = "|" + ("Ground" if pattern == "floor_grid" else "Set")
+        fake, group, report, projection = build_world_pattern(
+            pattern,
+            root,
+            name,
+            graph_root,
+        )
+        assert group == name + "_SurfaceShaderSG"
+        assert projection == name + "_Projection"
+        assert (report["projection_type"], report["projection_axis"]) == (
+            expected_projection
+        )
+        assert report["cell_size_world_units"] == 5.0
+        assert report["camera_anchored"] is False
+        assert report["uv_dependent"] is False
+        assert report["subject_root"] == root
+        assert report["projection_node"] == name + "_Projection"
+        assert report["projector_node"] == name + "_Projector"
+        assert report["anchor_node"] == name + "_RootAnchor"
+        if pattern == "floor_grid":
+            # XZ dimensions are 30 x 45. The 5-unit cell yields 6 x 9
+            # repeats; the former 15-unit grid yielded only 2 x 3.
+            assert report["baked_repeat_count"] == [6.0, 9.0]
+            assert report["projector_extent_world_units"] == [30.0, 45.0, 20.0]
+        else:
+            assert report["baked_repeat_count"] == [9.0, 9.0]
+            assert report["projector_extent_world_units"] == [45.0, 45.0, 45.0]
+
+        node_types = [record[0] for record in fake.nodes]
+        assert node_types.count("projection") == 1
+        assert node_types.count("place3dTexture") == 1
+        assert node_types.count("place2dTexture") == 1
+        assert node_types.count("surfaceShader") == 1
+        assert node_types.count("transform") == 1
+        assert node_types.count("multiplyDivide") == 1
+        assert len(fake.set_nodes) == 1
+        assert len(fake.constraints) == 1
+        assert len(fake.scale_constraints) == 1
+        assert fake.constraints[0][0] == root
+        assert fake.constraints[0][1] == name + "_RootAnchor"
+        assert fake.scale_constraints[0][0] == root
+        assert fake.scale_constraints[0][1] == name + "_RootAnchor"
+        assert report["root_scale_followed"] is True
+        assert report["world_cell_scale_compensated"] is True
+        assert report["scale_constraint_node"] == (
+            name + "_RootAnchor_scaleConstraint"
+        )
+        assert report["scale_compensator_node"] == (
+            name + "_WorldScaleCompensator"
+        )
+        assert (
+            name + "_Projector.worldInverseMatrix[0]",
+            name + "_Projection.placementMatrix",
+        ) in [(source, target) for source, target, _kwargs in fake.connections]
+        placement_sources = [
+            source
+            for source, target, _kwargs in fake.connections
+            if target.endswith(".placementMatrix")
+        ]
+        assert placement_sources == [
+            name + "_Projector.worldInverseMatrix[0]"
+        ]
+        assert not any(
+            "camera" in (source + " " + target).lower()
+            for source, target, _kwargs in fake.constraints
+        )
+
+        graph_snapshot = (
+            tuple(fake.nodes),
+            tuple(fake.attributes),
+            tuple(fake.connections),
+            tuple(fake.constraints),
+            tuple(fake.scale_constraints),
+            tuple(fake.parents),
+            tuple(fake.transforms),
+            tuple(fake.set_nodes),
+        )
+        graph_snapshots[pattern] = graph_snapshot
+        repeated_fake, _group, repeated_report, _projection = build_world_pattern(
+            pattern,
+            root,
+            name,
+            graph_root,
+        )
+        repeated_snapshot = (
+            tuple(repeated_fake.nodes),
+            tuple(repeated_fake.attributes),
+            tuple(repeated_fake.connections),
+            tuple(repeated_fake.constraints),
+            tuple(repeated_fake.scale_constraints),
+            tuple(repeated_fake.parents),
+            tuple(repeated_fake.transforms),
+            tuple(repeated_fake.set_nodes),
+        )
+        assert repeated_snapshot == graph_snapshot
+        assert repeated_report == report
+
+    assert len(graph_snapshots) == 4
+
+
+# A projected cutout variant must reuse the same projection output while
+# reconnecting the scene-authored alpha source. A flat-color variant would
+# preserve the silhouette but silently destroy the selected pattern.
+cutout_calls = {"surface": [], "assign": []}
+cutout_originals = {
+    "_ensure_authored_cutout_snapshot": runner._ensure_authored_cutout_snapshot,
+    "_projected_surface_group": runner._projected_surface_group,
+    "_assign": runner._assign,
+    "_long_names": runner._long_names,
+}
+try:
+    runner._ensure_authored_cutout_snapshot = lambda _job, _shapes: {
+        "|Set|OpaqueShape": {
+            "shape": "|Set|OpaqueShape",
+            "alpha_driven": False,
+        },
+        "|Set|LeafCardShape": {
+            "shape": "|Set|LeafCardShape",
+            "alpha_driven": True,
+            "source_plug": "leafFile.outTransparency",
+        },
+    }
+    runner._projected_surface_group = (
+        lambda name, projection, transparency_source="": (
+            cutout_calls["surface"].append(
+                (name, projection, transparency_source)
+            )
+            or (name + "SG")
+        )
+    )
+    runner._assign = lambda shapes, group: (
+        cutout_calls["assign"].append((tuple(shapes), group)) or []
+    )
+    runner._long_names = lambda nodes: list(nodes)
+    cutout_job = {}
+    cutout_cache = {}
+    cutout_warnings, opaque_shapes, verified_cutouts = (
+        runner._assign_world_pattern_preserving_cutouts(
+            ["|Set|OpaqueShape", "|Set|LeafCardShape"],
+            "HMB_World_SharedSG",
+            "HMB_World_Pattern",
+            "HMB_World_Pattern_Projection",
+            cutout_job,
+            cutout_cache,
+        )
+    )
+finally:
+    for name, value in cutout_originals.items():
+        setattr(runner, name, value)
+
+assert cutout_warnings == []
+assert opaque_shapes == ["|Set|OpaqueShape"]
+assert verified_cutouts == ["|Set|LeafCardShape"]
+cutout_token = runner._cutout_variant_token("leafFile.outTransparency")
+assert cutout_calls["surface"] == [(
+    "HMB_World_Pattern_Cutout_" + cutout_token,
+    "HMB_World_Pattern_Projection",
+    "leafFile.outTransparency",
+)]
+assert cutout_calls["assign"] == [
+    (("|Set|OpaqueShape",), "HMB_World_SharedSG"),
+    (
+        ("|Set|LeafCardShape",),
+        "HMB_World_Pattern_Cutout_" + cutout_token + "SG",
+    ),
+]
+
+
+# High-level dispatch must select Maya world projection by default when the
+# explicit production flag is present and publish one deterministic report
+# row per bound pattern. The legacy screen compositor remains opt-in only.
+world_dispatch_calls = {
+    "world": [],
+    "assign_world": [],
+    "screen": [],
+    "assign": [],
+}
+world_dispatch_originals = {
+    "_world_projected_pattern_group": runner._world_projected_pattern_group,
+    "_assign_world_pattern_preserving_cutouts": (
+        runner._assign_world_pattern_preserving_cutouts
+    ),
+    "_screen_space_pattern_shader": runner._screen_space_pattern_shader,
+    "_assign": runner._assign,
+    "_all_renderable_shapes": runner._all_renderable_shapes,
+    "_marker_renderable_shapes": runner._marker_renderable_shapes,
+    "_descendant_shapes": runner._descendant_shapes,
+    "_ensure_authored_cutout_snapshot": (
+        runner._ensure_authored_cutout_snapshot
+    ),
+    "_long_names": runner._long_names,
+}
+
+
+def fake_world_group(name, pattern, root, shapes, _folder, cell_units):
+    projection_type, projection_axis = runner._world_pattern_projection_type(
+        pattern
+    )
+    world_dispatch_calls["world"].append(
+        (name, pattern, root, tuple(shapes), cell_units)
+    )
+    projection = name + "_Projection"
+    return name + "SG", {
+        "pattern": pattern,
+        "subject_root": root,
+        "projection_type": projection_type,
+        "projection_axis": projection_axis,
+        "cell_size_world_units": cell_units,
+        "projection_node": projection,
+        "projector_node": name + "_Projector",
+        "anchor_node": name + "_RootAnchor",
+        "constraint_node": name + "_RootAnchor_parentConstraint",
+        "scale_constraint_node": name + "_RootAnchor_scaleConstraint",
+        "scale_compensator_node": name + "_WorldScaleCompensator",
+        "root_scale_followed": True,
+        "world_cell_scale_compensated": True,
+        "camera_anchored": False,
+        "uv_dependent": False,
+    }, projection
+
+
+try:
+    runner._world_projected_pattern_group = fake_world_group
+    runner._assign_world_pattern_preserving_cutouts = (
+        lambda shapes, group, name, projection, _job, _cache: (
+            world_dispatch_calls["assign_world"].append(
+                (tuple(shapes), group, name, projection)
+            )
+            or ([], list(shapes), [])
+        )
+    )
+    runner._screen_space_pattern_shader = (
+        lambda name, rgb: world_dispatch_calls["screen"].append((name, rgb))
+        or (name + "ScreenSG")
+    )
+    runner._assign = lambda shapes, group: (
+        world_dispatch_calls["assign"].append((tuple(shapes), group)) or []
+    )
+    runner._all_renderable_shapes = lambda: []
+    runner._marker_renderable_shapes = lambda shapes: list(shapes)
+    runner._descendant_shapes = lambda root: [root + "|shape"]
+    runner._ensure_authored_cutout_snapshot = lambda _job, shapes: {
+        shape: {"shape": shape, "alpha_driven": False}
+        for shape in shapes
+    }
+    runner._long_names = lambda nodes: list(nodes)
+    world_job = {
+        "result_path": "C:/tmp/hmb-world-result.json",
+        "world_space_patterns": True,
+        "world_pattern_profile": runner.MAYA_WORLD_PATTERN_PROFILE,
+        "world_pattern_cell_units": 5.0,
+        "world_pattern_density_multiplier": 3.0,
+        "_world_pattern_reference_frame": 101.0,
+        "require_full_smooth_geometry": True,
+    }
+    world_bindings = [
+        {
+            "color": color,
+            "subject_root": "|Pattern{0}".format(index),
+            "asset_id": "Pattern{0}".format(index),
+        }
+        for index, color in enumerate(
+            (
+                "Direction Checker",
+                "Sky Grid",
+                "Floor Grid",
+                "Position Pattern",
+            ),
+            start=1,
+        )
+    ]
+    assert runner._apply_marker_shaders(world_bindings, world_job) == []
+finally:
+    for name, value in world_dispatch_originals.items():
+        setattr(runner, name, value)
+
+assert len(world_dispatch_calls["world"]) == 4
+assert len(world_dispatch_calls["assign_world"]) == 4
+assert world_dispatch_calls["screen"] == []
+assert all(call[-1] == 5.0 for call in world_dispatch_calls["world"])
+world_report = world_job["_world_pattern_report"]
+assert world_report["profile"] == runner.MAYA_WORLD_PATTERN_PROFILE
+assert world_report["coordinate_space"] == "background_root"
+assert world_report["camera_anchored"] is False
+assert world_report["uv_dependent"] is False
+assert world_report["root_scale_followed"] is True
+assert world_report["world_cell_scale_compensated"] is True
+assert world_report["base_cell_world_units"] == 15.0
+assert world_report["density_multiplier"] == 3.0
+assert world_report["cell_size_world_units"] == 5.0
+assert world_report["reference_frame"] == 101.0
+assert world_report["pattern_binding_count"] == 4
+assert world_report["projection_node_count"] == 4
+assert world_report["projector_node_count"] == 4
+assert [
+    (
+        row["pattern"],
+        row["projection_type"],
+        row["projection_axis"],
+        row["reference_frame"],
+        row["root_scale_followed"],
+        row["world_cell_scale_compensated"],
+    )
+    for row in world_report["patterns"]
+] == [
+    ("direction_checker", "TriPlanar", "XYZ", 101.0, True, True),
+    ("sky_grid", "TriPlanar", "XYZ", 101.0, True, True),
+    ("floor_grid", "Planar", "XZ", 101.0, True, True),
+    ("position_pattern", "TriPlanar", "XYZ", 101.0, True, True),
+]
 
 
 class AssignedScopeCmds:

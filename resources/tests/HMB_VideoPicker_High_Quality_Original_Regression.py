@@ -112,7 +112,11 @@ assert original_job.get(MOUTH_PATCH_POLICY_FIELD) is not None
 assert color_job.get("apply_marker_shaders") is True
 assert color_job.get(FORCE_JOB_FIELD) is True
 assert color_job.get("require_full_smooth_geometry") is True
-assert color_job.get("screen_space_patterns") is True
+assert color_job.get("world_space_patterns") is True
+assert color_job.get("world_pattern_profile") is not None
+assert color_job.get("world_pattern_cell_units") is not None
+assert color_job.get("world_pattern_density_multiplier") is not None
+assert color_job.get("screen_space_patterns") is False
 
 # The runner must gate the override from the explicit job field and restore it
 # in a finally-protected path. These static pins make accidental unconditional

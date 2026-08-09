@@ -98,6 +98,18 @@ ORIGINAL_VIEWPORT_QUALITY_PROFILE = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
 MOUTH_CARD_INNER_PATCH_POLICY = "temporary_mouth_alpha_inner_patch_v1"
 SCREEN_SPACE_PATTERN_PROFILE = "hmb_screen_space_pattern_post_v2"
 SCREEN_SPACE_PATTERN_LINEAR_SCALE_DIVISOR = 3
+MAYA_WORLD_PATTERN_PROFILE = "hmb_maya_world_root_projection_v1"
+WORLD_PATTERN_BASE_CELL_WORLD_UNITS = 15.0
+WORLD_PATTERN_DENSITY_MULTIPLIER = 3.0
+WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS = (
+    WORLD_PATTERN_BASE_CELL_WORLD_UNITS / WORLD_PATTERN_DENSITY_MULTIPLIER
+)
+MAYA_WORLD_PATTERN_PROJECTIONS = {
+    "floor_grid": ("Planar", "XZ"),
+    "direction_checker": ("TriPlanar", "XYZ"),
+    "position_pattern": ("TriPlanar", "XYZ"),
+    "sky_grid": ("TriPlanar", "XYZ"),
+}
 DEPTH_PLAYBLAST_PROFILE = "hmb_camera_space_depth_v7"
 LEGACY_DEPTH_PLAYBLAST_PROFILES = frozenset({
     "hmb_camera_space_depth_v1",
@@ -456,6 +468,139 @@ def _validate_screen_space_runner_confirmation(
     return options
 
 
+def _validate_world_pattern_runner_confirmation(
+    result: Dict[str, Any],
+    sidecar: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Fail closed unless Maya confirms root-projected, UV-free patterns."""
+    sidecar_payload = sidecar if isinstance(sidecar, dict) else {}
+    profile = _clean(
+        result.get("world_pattern_profile")
+        or sidecar_payload.get("world_pattern_profile")
+    )
+    report_value = (
+        result.get("world_pattern_report")
+        if isinstance(result.get("world_pattern_report"), dict)
+        else sidecar_payload.get("world_pattern_report")
+    )
+    report = dict(report_value) if isinstance(report_value, dict) else {}
+    options_value = (
+        result.get("world_pattern_render_options")
+        if isinstance(result.get("world_pattern_render_options"), dict)
+        else sidecar_payload.get("world_pattern_render_options")
+    )
+    options = dict(options_value) if isinstance(options_value, dict) else {}
+    errors: List[str] = []
+    if profile != MAYA_WORLD_PATTERN_PROFILE:
+        errors.append("profile")
+    if _clean(report.get("profile")) != MAYA_WORLD_PATTERN_PROFILE:
+        errors.append("report profile")
+    if _clean(report.get("coordinate_space")) != "background_root":
+        errors.append("background-root coordinate space")
+    if report.get("camera_anchored") is not False:
+        errors.append("camera independence")
+    if report.get("uv_dependent") is not False:
+        errors.append("UV independence")
+    if report.get("root_scale_followed") is not True:
+        errors.append("background-root scale follow")
+    if report.get("world_cell_scale_compensated") is not True:
+        errors.append("world-cell scale compensation")
+    if not math.isclose(
+        float(report.get("base_cell_world_units") or 0.0),
+        WORLD_PATTERN_BASE_CELL_WORLD_UNITS,
+        rel_tol=0.0,
+        abs_tol=1.0e-9,
+    ):
+        errors.append("15-unit base cell")
+    if not math.isclose(
+        float(report.get("density_multiplier") or 0.0),
+        WORLD_PATTERN_DENSITY_MULTIPLIER,
+        rel_tol=0.0,
+        abs_tol=1.0e-9,
+    ):
+        errors.append("3x density")
+    if not math.isclose(
+        float(report.get("cell_size_world_units") or 0.0),
+        WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS,
+        rel_tol=0.0,
+        abs_tol=1.0e-9,
+    ):
+        errors.append("5-unit effective cell")
+    try:
+        reference_frame = float(report.get("reference_frame"))
+    except (TypeError, ValueError):
+        reference_frame = float("nan")
+    if not math.isfinite(reference_frame):
+        errors.append("reference frame")
+    pattern_rows = report.get("patterns")
+    if not isinstance(pattern_rows, list):
+        pattern_rows = []
+        errors.append("pattern rows")
+    for row in pattern_rows:
+        if not isinstance(row, dict):
+            errors.append("pattern row schema")
+            continue
+        pattern = _clean(row.get("pattern"))
+        expected = MAYA_WORLD_PATTERN_PROJECTIONS.get(pattern)
+        actual = (
+            _clean(row.get("projection_type")),
+            _clean(row.get("projection_axis")),
+        )
+        if expected is None or actual != expected:
+            errors.append(f"{pattern or '<blank>'} projection mapping")
+        if row.get("camera_anchored") is not False:
+            errors.append(f"{pattern or '<blank>'} camera independence")
+        if row.get("uv_dependent") is not False:
+            errors.append(f"{pattern or '<blank>'} UV independence")
+        if row.get("root_scale_followed") is not True:
+            errors.append(f"{pattern or '<blank>'} root scale follow")
+        if row.get("world_cell_scale_compensated") is not True:
+            errors.append(f"{pattern or '<blank>'} scale compensation")
+        try:
+            row_reference_frame = float(row.get("reference_frame"))
+        except (TypeError, ValueError):
+            row_reference_frame = float("nan")
+        if not math.isclose(
+            row_reference_frame,
+            reference_frame,
+            rel_tol=0.0,
+            abs_tol=1.0e-9,
+        ):
+            errors.append(f"{pattern or '<blank>'} reference frame")
+        for node_field in (
+            "projection_node",
+            "projector_node",
+            "anchor_node",
+            "constraint_node",
+            "scale_constraint_node",
+            "scale_compensator_node",
+        ):
+            if not _clean(row.get(node_field)):
+                errors.append(f"{pattern or '<blank>'} {node_field}")
+    pattern_count = len(pattern_rows)
+    if int(report.get("pattern_binding_count") or 0) != pattern_count:
+        errors.append("pattern binding count")
+    if int(report.get("projection_node_count") or 0) != pattern_count:
+        errors.append("projection node count")
+    if int(report.get("projector_node_count") or 0) != pattern_count:
+        errors.append("projector node count")
+    for field in (
+        "output_transform_disabled",
+        "multisample_disabled",
+        "line_aa_disabled",
+        "ssao_disabled",
+        "motion_blur_disabled",
+    ):
+        if options.get(field) is not True:
+            errors.append(field)
+    if errors:
+        raise RuntimeError(
+            "Maya did not confirm the production world-pattern contract "
+            f"({', '.join(dict.fromkeys(errors))})."
+        )
+    return report
+
+
 def _load_marker_catalog() -> Dict[str, Any]:
     with MARKER_CATALOG_PATH.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
@@ -526,6 +671,21 @@ def _screen_space_preflight(bindings: Sequence[Dict[str, Any]]) -> tuple[str, ..
     )
     if active:
         _screen_space.preflight_pillow()
+    return active
+
+
+def _world_pattern_preflight(
+    bindings: Sequence[Dict[str, Any]],
+) -> tuple[str, ...]:
+    active = _screen_space.active_patterns_from_bindings(
+        bindings,
+        MARKER_CATALOG,
+    )
+    unsupported = sorted(set(active).difference(MAYA_WORLD_PATTERN_PROJECTIONS))
+    if unsupported:
+        raise RuntimeError(
+            "Unsupported Maya world pattern(s): " + ", ".join(unsupported)
+        )
     return active
 
 
@@ -13229,7 +13389,7 @@ class HMBVideoPickerLibrary(DataNode):
         state = self._picker_state()
         output_width, output_height = _playblast_resolution(state)
         bindings = self._selected_slot_job_bindings(state, video_slot)
-        _screen_space_preflight(bindings)
+        _world_pattern_preflight(bindings)
         start_frame = float(state.get("start_frame") or 0.0)
         end_frame = float(state.get("end_frame") or start_frame)
         frame = max(start_frame, min(end_frame, float(state.get("snapshot_frame") or start_frame)))
@@ -13284,8 +13444,11 @@ class HMBVideoPickerLibrary(DataNode):
             "viewport_quality_profile": FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE,
             "mouth_card_inner_patch_policy": MOUTH_CARD_INNER_PATCH_POLICY,
             "require_full_smooth_geometry": True,
-            "screen_space_patterns": True,
-            "screen_space_pattern_profile": SCREEN_SPACE_PATTERN_PROFILE,
+            "world_space_patterns": True,
+            "world_pattern_profile": MAYA_WORLD_PATTERN_PROFILE,
+            "world_pattern_cell_units": WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS,
+            "world_pattern_density_multiplier": WORLD_PATTERN_DENSITY_MULTIPLIER,
+            "screen_space_patterns": False,
             "expected_maya_major": maya_version if maya_version.isdigit() else "",
             "marker_catalog_path": str(MARKER_CATALOG_PATH),
             "marker_catalog_version": int(MARKER_CATALOG["version"]),
@@ -13365,7 +13528,7 @@ class HMBVideoPickerLibrary(DataNode):
             runner_sidecar,
             label=f"@video{video_slot} Snapshot",
         )
-        _validate_screen_space_runner_confirmation(
+        _validate_world_pattern_runner_confirmation(
             result,
             runner_sidecar,
         )
@@ -13373,18 +13536,6 @@ class HMBVideoPickerLibrary(DataNode):
         rendered_path = rendered_folder / f"{output_name}.000000.png"
         if not rendered_path.is_file() or rendered_path.stat().st_size <= 0:
             raise RuntimeError(f"Maya did not create the requested snapshot frame. See {log_path}")
-        screen_space_report = _postprocess_screen_space_frames(
-            [rendered_path],
-            bindings=bindings,
-            width=output_width,
-            height=output_height,
-        )
-        if runner_sidecar:
-            runner_sidecar.update({
-                "screen_space_postprocess_pending": False,
-                "screen_space_postprocess": screen_space_report,
-            })
-            _write_json(sidecar_path, runner_sidecar)
         shutil.copy2(rendered_path, staged_cache_path)
         self._assert_operation_current(context, "SNAPSHOT atomic publish")
         os.replace(staged_cache_path, cache_path)
@@ -13638,7 +13789,7 @@ class HMBVideoPickerLibrary(DataNode):
             state,
             mask_authoring_slot,
         )
-        _screen_space_preflight(job_bindings)
+        _world_pattern_preflight(job_bindings)
 
         _write_json(job_path, {
             "operation": "render",
@@ -13661,8 +13812,11 @@ class HMBVideoPickerLibrary(DataNode):
             "viewport_quality_profile": FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE,
             "mouth_card_inner_patch_policy": MOUTH_CARD_INNER_PATCH_POLICY,
             "require_full_smooth_geometry": True,
-            "screen_space_patterns": True,
-            "screen_space_pattern_profile": SCREEN_SPACE_PATTERN_PROFILE,
+            "world_space_patterns": True,
+            "world_pattern_profile": MAYA_WORLD_PATTERN_PROFILE,
+            "world_pattern_cell_units": WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS,
+            "world_pattern_density_multiplier": WORLD_PATTERN_DENSITY_MULTIPLIER,
+            "screen_space_patterns": False,
             "expected_maya_major": maya_version if maya_version.isdigit() else "",
             "video_container": "MPEG-4",
             "video_codec": "H.264",
@@ -13991,7 +14145,7 @@ class HMBVideoPickerLibrary(DataNode):
             runner_sidecar,
             label="Mask / legacy Color Assignment Playblast",
         )
-        _validate_screen_space_runner_confirmation(
+        _validate_world_pattern_runner_confirmation(
             result,
             runner_sidecar,
         )
@@ -14034,18 +14188,6 @@ class HMBVideoPickerLibrary(DataNode):
             actual_frames_folder / f"{output_name}.{index:06d}.png"
             for index in range(output_frame_count)
         ]
-        screen_space_report = _postprocess_screen_space_frames(
-            expected_frame_paths,
-            bindings=job_bindings,
-            width=output_width,
-            height=output_height,
-        )
-        runner_sidecar.update({
-            "screen_space_postprocess_pending": False,
-            "screen_space_postprocess": screen_space_report,
-        })
-        _write_json(actual_sidecar, runner_sidecar)
-
         if depth_succeeded:
             try:
                 expected_depth_frame_paths = [

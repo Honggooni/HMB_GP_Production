@@ -4,7 +4,15 @@
 
 - Split the Video Picker color palette into Actor 7, shared Ghost 3, and
   Object-pattern 4 rows. Existing marker names, repeat behavior, saved
-  bindings, and Lambert/SurfaceShader rendering remain unchanged.
+  bindings, and solid-color Lambert rendering remain unchanged.
+- Replaced the four Object patterns' frame-locked screen-space compositor with
+  temporary UV-independent Maya projection graphs. Floor Grid uses top-planar
+  XZ projection while Direction Checker, Sky Grid, and Position Pattern use
+  triplanar XYZ projection; all four follow the selected background root and
+  retain camera perspective without modifying or saving authored UVs.
+- Fixed the projected pattern density at 3x the 15-unit baseline (5 Maya world
+  units per cell), with first-output-frame anchoring, root scale compensation,
+  cutout-alpha preservation, and fail-closed runner metadata validation.
 - Exposed the shared Ghost 3 colors to Prompt and Image Asset character
   sources while keeping object/background choices at Ghost 3 plus Pattern 4
   and preserving the unique 14-choice Custom order.
