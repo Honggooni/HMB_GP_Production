@@ -1151,9 +1151,12 @@ assert.match(
 );
 assert.match(
   videoSource,
-  /const HMB_RIGHT_SECTION_DEFAULT_HEIGHTS = \{ settings: 285, color: 628, log: 208 \};/,
-  "Playblast Settings must start 50 percent taller.",
+  /const HMB_RIGHT_SECTION_DEFAULT_HEIGHTS = \{ settings: 217, color: 628, log: 208 \};/,
+  "Compacted Playblast Settings must give Current Cut Videos the reclaimed 68 pixels.",
 );
+assert.match(videoSource, /class="settings-compact-row"/);
+assert.equal((videoSource.match(/class="settings-compact-item"/g) || []).length, 3);
+assert.match(videoSource, /querySelector\?\.\("#playblast-resolution"\)/);
 assert.match(videoSource, /value: "1280x720", width: 1280, height: 720/);
 assert.match(videoSource, /value: "1920x1080", width: 1920, height: 1080/);
 assert.match(videoSource, /id="playblast-resolution"/);

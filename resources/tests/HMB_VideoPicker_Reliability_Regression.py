@@ -361,9 +361,16 @@ with tempfile.TemporaryDirectory() as orchestration_temp_text:
         picker.HMBVideoPickerLibrary(name="four_role_orchestration")
     )
     orchestration_syncs = []
-    orchestration_node._sync_outputs_from_state = (
-        lambda state: orchestration_syncs.append(copy.deepcopy(state)) or ""
-    )
+    orchestration_terminal_boundaries = []
+    def capture_orchestration_sync(state):
+        orchestration_syncs.append(copy.deepcopy(state))
+        orchestration_terminal_boundaries.append({
+            "active_retired": orchestration_node._hmb_active_operation is None,
+            "process_lock_released": not orchestration_node._hmb_process_lock.locked(),
+        })
+        return ""
+
+    orchestration_node._sync_outputs_from_state = capture_orchestration_sync
     orchestration_state = orchestration_node._picker_state()
     orchestration_state.update({
         "scene_path": str(orchestration_scene),
@@ -445,6 +452,10 @@ with tempfile.TemporaryDirectory() as orchestration_temp_text:
         "original", "mask", "depth", "motion_guide",
     ]
     assert len(orchestration_syncs) == 1
+    assert orchestration_terminal_boundaries == [{
+        "active_retired": True,
+        "process_lock_released": True,
+    }]
 
     # A selected Original failure is terminal. The shared core stage must not
     # run and no subset of the remaining three checked roles may be published.
@@ -581,6 +592,151 @@ with tempfile.TemporaryDirectory() as orchestration_temp_text:
         "message"
     ]
     assert snapshot_failure_syncs == []
+
+# A terminal state must no longer be invalidatable by the previous in-memory
+# context. This reproduces the former post-success recolor -> CANCELLING race.
+terminal_race_node = install_direct_picker_state_writes(
+    picker.HMBVideoPickerLibrary(name="terminal_recolor_race")
+)
+terminal_race_state = terminal_race_node._picker_state()
+terminal_race_state.update({
+    "native_read_ready": True,
+    "original_enabled": False,
+    "mask_enabled": True,
+    "slot_assignments": [{
+        "video_slot": 1,
+        "bindings": [{
+            "group_name": "Actor",
+            "full_dag_path": "|Actor",
+            "color": "Red",
+            "enabled": True,
+        }],
+    }],
+})
+terminal_context = terminal_race_node._create_operation_context(
+    "run_video",
+    "C:/terminal/recolor.mb",
+    terminal_race_state,
+    1,
+)
+terminal_race_node._hmb_active_operation = terminal_context
+terminal_running_state = terminal_race_node._mark_operation_started(
+    terminal_race_state,
+    "run_video",
+)
+terminal_running_state.update({
+    "operation_id": terminal_context.operation_id,
+    "operation_input_digest": terminal_context.input_digest,
+    "operation_scene_fingerprint": terminal_context.scene_fingerprint,
+})
+terminal_finished_state = terminal_race_node._mark_operation_finished(
+    terminal_running_state
+)
+terminal_finished_state.update({
+    "status": "OUTLINER_READY",
+    "scene_stage": "OUTLINER_READY",
+})
+terminal_race_node._write_state(terminal_finished_state)
+terminal_invalidations = []
+terminal_race_node._invalidate_active_operation = (
+    lambda *args, **kwargs: terminal_invalidations.append((args, kwargs))
+)
+terminal_recolor_state = terminal_race_node._picker_state()
+terminal_recolor_state["slot_assignments"][0]["bindings"][0]["color"] = "Pink"
+terminal_race_node.after_value_set(
+    picker.WIDGET_STATE_PARAMETER,
+    terminal_recolor_state,
+)
+assert terminal_invalidations == []
+assert terminal_race_node._picker_state()["slot_assignments"][0]["bindings"][0][
+    "color"
+] == "Pink"
+terminal_race_node._hmb_active_operation = None
+
+# Generate carries the exact visible authoring snapshot so an immediately
+# preceding recolor cannot be overtaken by the independent command transport.
+snapshot_command_node = install_direct_picker_state_writes(
+    picker.HMBVideoPickerLibrary(name="generate_authoring_snapshot")
+)
+snapshot_command_state = snapshot_command_node._picker_state()
+snapshot_command_state.update({
+    "original_enabled": False,
+    "mask_enabled": True,
+    "slot_assignments": [{
+        "video_slot": 1,
+        "bindings": [{
+            "group_name": "Actor",
+            "full_dag_path": "|Actor",
+            "color": "Red",
+            "enabled": True,
+        }],
+    }],
+})
+snapshot_command_node._write_state(snapshot_command_state)
+accepted_authoring_states = []
+def capture_authoring_operation(action, state):
+    accepted_authoring_states.append((action, copy.deepcopy(state)))
+    with snapshot_command_node._hmb_operation_control_lock:
+        snapshot_command_node._hmb_pending_operation_id = ""
+
+snapshot_command_node._start_ui_operation = capture_authoring_operation
+snapshot_command_node._handle_picker_command({
+    "schema": picker.COMMAND_SCHEMA,
+    "version": picker.COMMAND_VERSION,
+    "runtime_instance_id": snapshot_command_node._hmb_runtime_instance_id,
+    "action": "run_video",
+    "action_id": "authoring-snapshot-run",
+    "payload": {
+        "include_original": True,
+        "include_mask": True,
+        "include_depth": True,
+        "include_motion_guide": True,
+        "authoring_state": {
+            "original_enabled": True,
+            "mask_enabled": True,
+            "depth_enabled": True,
+            "motion_guide_enabled": True,
+            "slot_assignments": [{
+                "video_slot": 1,
+                "bindings": [{
+                    "group_name": "Actor",
+                    "full_dag_path": "|Actor",
+                    "color": "Pink",
+                    "enabled": True,
+                }],
+            }],
+            "slot_visibility": [{"video_slot": 1, "hidden_paths": []}],
+            "output_width": 1920,
+            "output_height": 1080,
+        },
+    },
+})
+assert len(accepted_authoring_states) == 1
+accepted_action, accepted_state = accepted_authoring_states[0]
+assert accepted_action == "run_video"
+assert picker._generation_choice_roles(accepted_state) == [
+    "original", "mask", "depth", "motion_guide",
+]
+assert accepted_state["slot_assignments"][0]["bindings"][0]["color"] == "Pink"
+assert (accepted_state["output_width"], accepted_state["output_height"]) == (
+    1920, 1080,
+)
+
+cancel_retry_node = install_direct_picker_state_writes(
+    picker.HMBVideoPickerLibrary(name="cancel_retry_ready")
+)
+cancel_retry_state = cancel_retry_node._picker_state()
+cancel_retry_state.update({
+    "native_read_ready": True,
+    "operation_kind": "run_video",
+    "operation_started_at_ms": int(time.time() * 1000),
+})
+cancel_retry_node._write_state(cancel_retry_state)
+cancel_retry_node._sync_outputs_from_state = lambda _state: ""
+cancel_retry_node._set_cancelled_state()
+assert cancel_retry_node._picker_state()["status"] == "OUTLINER_READY"
+assert cancel_retry_node._picker_state()["scene_stage"] == "OUTLINER_READY"
+assert cancel_retry_node._picker_state()["operation_kind"] == ""
 
 # Private multi-stage generation may write its staging state, but it must not
 # publish VIDEO/PICKER outputs until the final packed commit.
@@ -725,7 +881,7 @@ assert hashlib.sha256(bundled_agent_policy.read_bytes()).hexdigest() == (
 expected_agent_hashes = {
     "HMBAgentLibrary.py": "12a00bf11e5376998192a09f9a2e3b9fe4bab9d04e986fe1adc7be78946b81c6",
     "HMBPromptLibrary.py": "d6ff9975cad8e44296905417bc324ee43945c5a62d0d08136571911ac4fb214e",
-    "HMBVideoPickerLibrary.py": "138afc3f72a5d8f4267897e335b8601f8c97e4047b6789caeba84804cf205ddf",
+    "HMBVideoPickerLibrary.py": "266df52f055eb65ddf16fa552c6495304fd73286dd5748c09adf73b6b3f0d823",
     "_hmb_common.py": "1e4a6e1447e6ab08279d3f17f677974ce703602ed3b54185dd8fc755c0d2530d",
     "widgets/HMBAgentLibraryWidget.js": "61ea9416adc1cbfb7e8fbfbc068ad1a444c3f6d4b4c6b59569a1815a013dc193",
     "resources/tests/HMB_Agent_Policy_Integration_Regression.py": "8bf44efab36784676a8669a6a75a539457cdbece9ae68dd915fae72838c4ee4a",
@@ -798,7 +954,7 @@ assert "function hmbApplyPickerInitialNodeSizeOnce(container)" in widget_source
 assert "hmbApplyPickerInitialNodeSizeOnce(container);\n  concealNativeMayaPicker(container);" in widget_source
 assert "currentWidth < HMB_DEFAULT_NODE_WIDTH - 1" not in widget_source
 assert "currentHeight < HMB_DEFAULT_NODE_HEIGHT - 1" not in widget_source
-assert "const HMB_RIGHT_SECTION_DEFAULT_HEIGHTS = { settings: 285, color: 628, log: 208 };" in widget_source
+assert "const HMB_RIGHT_SECTION_DEFAULT_HEIGHTS = { settings: 217, color: 628, log: 208 };" in widget_source
 assert '{ value: "1920x1080", width: 1920, height: 1080' in widget_source
 assert 'id="playblast-resolution"' in widget_source
 assert "(1920, 1080)" in picker_source
@@ -1101,6 +1257,22 @@ normalized_legacy = picker._parse_state(legacy_state)
 assert normalized_legacy["viewport_panel_height"] == 684
 assert normalized_legacy["right_section_heights"]["color"] == 628
 assert picker._parse_state(normalized_legacy) == normalized_legacy
+
+version_five_layout = picker._default_widget_state()
+version_five_layout["ui_layout_version"] = 5
+version_five_layout["right_section_heights"] = {
+    "settings": 285,
+    "color": 628,
+    "log": 208,
+}
+normalized_version_five = picker._parse_state(version_five_layout)
+assert normalized_version_five["ui_layout_version"] == 6
+assert normalized_version_five["right_section_heights"] == {
+    "settings": 217,
+    "color": 628,
+    "log": 208,
+}
+assert picker._parse_state(normalized_version_five) == normalized_version_five
 
 for malformed in (None, [], {}, "bad", float("nan"), float("inf"), -99, 999):
     parsed = picker._parse_state({

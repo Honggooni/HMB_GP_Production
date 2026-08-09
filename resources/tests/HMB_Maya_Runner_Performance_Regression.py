@@ -485,6 +485,7 @@ assert depth_report["assignment_verification"] == {
     "mesh_path_count": 1,
     "nurbs_surface_path_count": 1,
     "verified_shape_path_count": 2,
+    "verified_proxy_placeholder_path_count": 0,
     "verified_mesh_face_count": 24,
     "rendered_frame_count": 2,
     "expected_frame_assignment_count": 4,
@@ -977,6 +978,95 @@ for case_name, source_faces, locked_plug, api_faces, expected_text in (
     )
     assert case_report["candidate_shape_count"] == 1
     assert case_report["recovered_shape_count"] in (0, 1)
+
+
+class ProxyDepthAssignmentCmds:
+    shape = "|Proxy|redshiftProxyPlaceholderShape"
+    source = "redshiftProxy1"
+
+    def __init__(self, sets=None, faces=24, proxy=True):
+        self.sets = list(sets if sets is not None else ["depthSG"])
+        self.faces = faces
+        self.proxy = proxy
+
+    def nodeType(self, node):
+        return "unknown" if node == self.source else "mesh"
+
+    def listConnections(self, plug, **_kwargs):
+        if self.proxy and plug == self.shape + ".inMesh":
+            return [self.source + ".outMesh"]
+        return []
+
+    def unknownNode(self, _node, query=False, **kwargs):
+        assert query is True
+        return (
+            "RedshiftProxyMesh"
+            if kwargs.get("realClassName")
+            else "redshift4maya" if kwargs.get("plugin") else ""
+        )
+
+    def listSets(self, type=None, object=None):
+        assert type == 1 and object == self.shape
+        return list(self.sets)
+
+    def polyEvaluate(self, shape, face=False):
+        assert shape == self.shape and face is True
+        return self.faces
+
+
+proxy_assignment_originals = {
+    "cmds": runner.cmds,
+    "_depth_mesh_api": runner._depth_mesh_api,
+}
+try:
+    proxy_assignment_cmds = ProxyDepthAssignmentCmds()
+    runner.cmds = proxy_assignment_cmds
+    runner._depth_mesh_api = lambda _shape: (_ for _ in ()).throw(
+        RuntimeError("MFnMesh constructor unsupported")
+    )
+    proxy_assignment_report = runner._verify_depth_shader_assignment({
+        proxy_assignment_cmds.shape: "depthSG",
+    })
+finally:
+    for name, value in proxy_assignment_originals.items():
+        setattr(runner, name, value)
+
+assert proxy_assignment_report == {
+    "shape_path_count": 1,
+    "mesh_path_count": 1,
+    "nurbs_surface_path_count": 0,
+    "verified_shape_path_count": 1,
+    "verified_proxy_placeholder_path_count": 1,
+    "verified_mesh_face_count": 24,
+}
+
+for shape, sets, faces, proxy, expected_text in (
+    (ProxyDepthAssignmentCmds.shape, ["wrongSG"], 24, True, "expected only shadingEngine depthSG"),
+    (ProxyDepthAssignmentCmds.shape, ["depthSG", "otherSG"], 24, True, "expected only shadingEngine depthSG"),
+    (ProxyDepthAssignmentCmds.shape, ["depthSG"], 0, True, "polyEvaluate returned 0 faces"),
+    ("|proxy_GRP|bodyShape", ["depthSG"], 24, False, "MFnMesh constructor unsupported"),
+):
+    try:
+        case_cmds = ProxyDepthAssignmentCmds(
+            sets=sets,
+            faces=faces,
+            proxy=proxy,
+        )
+        case_cmds.shape = shape
+        runner.cmds = case_cmds
+        runner._depth_mesh_api = lambda _shape: (_ for _ in ()).throw(
+            RuntimeError("MFnMesh constructor unsupported")
+        )
+        runner._verify_depth_shader_assignment({
+            shape: "depthSG",
+        })
+    except RuntimeError as exc:
+        assert expected_text in str(exc)
+    else:
+        raise AssertionError("Depth verification must fail closed.")
+    finally:
+        for name, value in proxy_assignment_originals.items():
+            setattr(runner, name, value)
 
 
 class UnsupportedDrawableCmds:

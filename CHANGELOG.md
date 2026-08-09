@@ -2,6 +2,19 @@
 
 ## 0.5.27 - 2026-08-08
 
+- Compacted Video Picker FPS, format, and Maya information into one settings
+  row and reassigned the recovered 68 px to the initial Current Cut Videos
+  area, with a one-time saved-layout migration.
+- Added one-dialog ordered MP4 multi-selection on Windows and one atomic batch
+  import, preserving the 10-active-video limit while retaining overflow files
+  in the catalog.
+- Made Generate carry the exact visible camera, Color Pick, visibility, output
+  role, and resolution snapshot; terminal cleanup now completes before the
+  ready state is published, so immediate recoloring and consecutive renders
+  cannot strand the picker in a stale busy state.
+- Added strict Redshift proxy-placeholder Depth verification for drawable proxy
+  meshes that accept the expected whole-object shading group but do not expose
+  an `MFnMesh`, while keeping ordinary mesh and per-face checks fail-closed.
 - Renamed the public node file to `HMBSeedanceGeneration.py` and the Griptape
   palette label to `HMB Seedance Generation` so future Broker render options are
   not tied to one model version. The legacy serialized node type remains as an
