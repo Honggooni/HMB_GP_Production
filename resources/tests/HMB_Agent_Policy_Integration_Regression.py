@@ -11,10 +11,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.5.33"
-EXPECTED_POLICY_VERSION = "2026-08-06.animation-look-continuity.v3"
-EXPECTED_CONTRACT_SHA256 = "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93"
-EXPECTED_BUNDLED_POLICY_SHA256 = "6152355dd51d68da33d4df197e6ac52f2c13b37d9644aa50efd9ba8c2cf13619"
+EXPECTED_RELEASE_VERSION = "0.5.70"
+EXPECTED_POLICY_VERSION = "2026-08-11.agent-shot-quality.v4"
+EXPECTED_CONTRACT_SHA256 = "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5"
+EXPECTED_BUNDLED_POLICY_SHA256 = "e46328be5f3bf9d0bc05d52b12cc6b14cc71b3125297d01efc2100e47276c914"
 EXPECTED_SIGNING_KEY_ID = "hmb-policy-release-2026-08-r2"
 SHARED_MARKERS = (
     "HYBRID COMPOSITION INDEPENDENCE:",
@@ -75,17 +75,20 @@ for rules in (policy, binding):
     assert "not a prerequisite" in normalized_rules
     assert "interpretation hint" in normalized_rules
     assert "current explicit user goal" in normalized_rules
-    assert "unreadable or corrupt file" in normalized_rules
+    assert (
+        "technical status explicitly reported in prompt_out as unreadable, corrupt, "
+        "unsafe or unavailable"
+    ) in normalized_rules
     assert "never downgrade supplied content to context-only" in normalized_rules
     assert "explicit scoped exception" in normalized_rules
     assert "named target or clearly scene-wide scope" in normalized_rules
-    assert "stable default focus" in normalized_rules
+    assert "stable camera-relative focus" in normalized_rules
     assert "explicit user goal may use any visible property" not in normalized_rules
     assert "may broaden, narrow, or reframe" not in normalized_rules
     assert "target-property-time" not in normalized_rules
     assert "hidden rules" in normalized_rules
 
-# The signed/compressed v3 envelope is the sole local runtime policy. No
+# The signed/compressed v4 policy envelope is the sole local runtime policy. No
 # plaintext policy or private signing key is distributed.
 bundled_policy_path = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
 assert bundled_policy_path.is_file()
@@ -136,7 +139,7 @@ def assert_policy_rejected(encoded: bytes) -> None:
 
 
 # Any envelope/payload mutation fails before policy injection. Removing a
-# required inner digest is also rejected by the fixed v3 contract validator.
+# required inner digest is also rejected by the fixed signed-payload validator.
 for envelope_field in ("signature", "payload_sha256", "algorithm", "key_id"):
     altered_envelope = dict(envelope)
     altered_envelope.pop(envelope_field)

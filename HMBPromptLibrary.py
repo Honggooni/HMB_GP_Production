@@ -64,9 +64,9 @@ except Exception:
 
 MAX_IMAGES = 50
 MAX_VIDEOS = 10
-PROMPT_POLICY_SOURCE_VERSION = "2026-08-06.animation-look-continuity.v3"
+PROMPT_POLICY_SOURCE_VERSION = "2026-08-11.agent-shot-quality.v4"
 PROMPT_POLICY_SOURCE_CONTRACT_SHA256 = (
-    "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93"
+    "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5"
 )
 PICKER_DEPTH_PROFILE = "hmb_camera_space_depth_v7"
 PICKER_MOTION_GUIDE_PROFILE = "hmb_target_neutral_motion_guide_v5"

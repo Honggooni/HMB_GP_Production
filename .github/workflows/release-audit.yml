@@ -45,7 +45,7 @@ jobs:
             throw "Retired Composite Team source-share references remain: $($retiredShareMatches -join ', ')"
           }
           $bundledPolicy = "resources/agent/hmb_agent_core.dat"
-          $bundledPolicySha256 = "6152355dd51d68da33d4df197e6ac52f2c13b37d9644aa50efd9ba8c2cf13619"
+          $bundledPolicySha256 = "e46328be5f3bf9d0bc05d52b12cc6b14cc71b3125297d01efc2100e47276c914"
           $forbidden = @($tracked | Where-Object {
             $_ -ne $bundledPolicy -and (
               $_ -match '(^|/)(\.tmp|\.venv|backups|dist|GriptapeNodes|resources/agent|resources/policy)/' -or
@@ -78,6 +78,7 @@ jobs:
           $tests = @(
             "HMB_Bundled_Policy_Boundary_Regression.py",
             "HMB_Agent_Policy_Integration_Regression.py",
+            "HMB_V4_Policy_Semantics_Regression.py",
             "HMB_Look_Attribute_Scope_Regression.py",
             "HMB_Output_Sanitizer_Regression.py",
             "HMB_Parent_Prompt_Agent_Contract_Regression.py",

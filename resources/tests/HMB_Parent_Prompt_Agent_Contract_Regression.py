@@ -27,20 +27,20 @@ prompt = load("HMBPromptLibrary")
 agent = load("HMBAgentLibrary")
 
 # This topology/4+4 behavior test supplies synthetic policy documents, while
-# the compiler and sealed runtime identity must remain the real synchronized v3
+# the compiler and sealed runtime identity must remain the synchronized current
 # release identity.
-EXPECTED_V3_POLICY_IDENTITY = (
-    "2026-08-06.animation-look-continuity.v3",
-    "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93",
+EXPECTED_POLICY_IDENTITY = (
+    "2026-08-11.agent-shot-quality.v4",
+    "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5",
 )
 SIGNED_RUNTIME_POLICY_IDENTITY = (
     str(agent._hmb._AGENT_POLICY_VERSION),
     str(agent._hmb._AGENT_POLICY_CONTRACT_SHA256).lower(),
 )
-assert SIGNED_RUNTIME_POLICY_IDENTITY == EXPECTED_V3_POLICY_IDENTITY
-assert agent._prompt_policy_source_identity() == EXPECTED_V3_POLICY_IDENTITY
+assert SIGNED_RUNTIME_POLICY_IDENTITY == EXPECTED_POLICY_IDENTITY
+assert agent._prompt_policy_source_identity() == EXPECTED_POLICY_IDENTITY
 assert agent._assert_prompt_policy_identity_matches_signed_runtime() == (
-    EXPECTED_V3_POLICY_IDENTITY
+    EXPECTED_POLICY_IDENTITY
 )
 
 

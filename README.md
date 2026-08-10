@@ -33,16 +33,16 @@ already current or is no longer a valid Git checkout with the GitHub `origin`.
 
 ## Agent policy availability
 
-Release `0.5.33` includes exactly one signed production policy at
+Release `0.5.70` includes exactly one signed production policy at
 `resources/agent/hmb_agent_core.dat`. The runtime reads, verifies, and uses only
 this file from the installed Git library. The canonical
 `HMBPromptLibrary -> HMBAgentLibrary` flow requires no network policy share or
 policy-path environment variable.
 
 The bundled envelope is policy version
-`2026-08-06.animation-look-continuity.v3`, contract SHA-256
-`ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93`,
+`2026-08-11.agent-shot-quality.v4`, contract SHA-256
+`b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5`,
 and file SHA-256
-`6152355dd51d68da33d4df197e6ac52f2c13b37d9644aa50efd9ba8c2cf13619`.
+`e46328be5f3bf9d0bc05d52b12cc6b14cc71b3125297d01efc2100e47276c914`.
 It is a signed, compressed policy envelope rather than a confidentiality
 encryption boundary, and contains no signing private key or API credentials.

@@ -146,9 +146,9 @@ VIDEO SOURCE:
 No video source assigned in HMBPromptLibrary.
 """
 
-EXPECTED_V3_POLICY_IDENTITY = (
-    "2026-08-06.animation-look-continuity.v3",
-    "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93",
+EXPECTED_POLICY_IDENTITY = (
+    "2026-08-11.agent-shot-quality.v4",
+    "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5",
 )
 SIGNED_RUNTIME_POLICY_IDENTITY = (
     str(module._hmb._AGENT_POLICY_VERSION),
@@ -156,14 +156,14 @@ SIGNED_RUNTIME_POLICY_IDENTITY = (
 )
 actual_prompt_identity_reader = module._prompt_policy_source_identity
 actual_prompt_identity = actual_prompt_identity_reader()
-assert SIGNED_RUNTIME_POLICY_IDENTITY == EXPECTED_V3_POLICY_IDENTITY
-assert actual_prompt_identity == EXPECTED_V3_POLICY_IDENTITY
+assert SIGNED_RUNTIME_POLICY_IDENTITY == EXPECTED_POLICY_IDENTITY
+assert actual_prompt_identity == EXPECTED_POLICY_IDENTITY
 assert module._assert_prompt_policy_identity_matches_signed_runtime() == (
-    EXPECTED_V3_POLICY_IDENTITY
+    EXPECTED_POLICY_IDENTITY
 )
 
 # A stale or partially updated Prompt compiler must fail before loading or
-# executing the signed v3 runtime.
+# executing the signed current runtime.
 def synthetic_stale_prompt_identity(_source_path=None):
     return (
         "2026-08-01.goal-final-authority.v2",
@@ -180,7 +180,7 @@ except RuntimeError as exc:
     assert exc.__cause__ is None
     assert str(exc) == module._HMB_POLICY_IDENTITY_MISMATCH_MESSAGE
 else:
-    raise AssertionError("A stale Prompt/signed-v3 runtime mismatch was accepted.")
+    raise AssertionError("A stale Prompt/signed runtime mismatch was accepted.")
 assert identity_mismatch.native_calls == 0
 assert identity_mismatch.parameter_output_values["agent"] == {}
 assert identity_mismatch.parameter_output_values["output"] == (
@@ -189,7 +189,7 @@ assert identity_mismatch.parameter_output_values["output"] == (
 
 module._prompt_policy_source_identity = actual_prompt_identity_reader
 assert module._assert_prompt_policy_identity_matches_signed_runtime() == (
-    EXPECTED_V3_POLICY_IDENTITY
+    EXPECTED_POLICY_IDENTITY
 )
 
 node = canonical_hmb_agent()

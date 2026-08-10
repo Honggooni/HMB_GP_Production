@@ -12,9 +12,9 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_POLICY_VERSION = "2026-08-06.animation-look-continuity.v3"
-EXPECTED_CONTRACT_SHA256 = "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93"
-EXPECTED_POLICY_SHA256 = "6152355dd51d68da33d4df197e6ac52f2c13b37d9644aa50efd9ba8c2cf13619"
+EXPECTED_POLICY_VERSION = "2026-08-11.agent-shot-quality.v4"
+EXPECTED_CONTRACT_SHA256 = "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5"
+EXPECTED_POLICY_SHA256 = "e46328be5f3bf9d0bc05d52b12cc6b14cc71b3125297d01efc2100e47276c914"
 
 
 def load(filename: str, alias: str):

@@ -16,10 +16,13 @@ RELEASE_MANIFEST = DIST / "release-manifest.json"
 RELEASE_ARCHIVE = DIST / "HMB_GP_Production.zip"
 RELEASE_CHECKSUMS = DIST / "SHA256SUMS"
 POLICY_RELATIVE = "resources/agent/hmb_agent_core.dat"
-POLICY_SHA256 = "6152355dd51d68da33d4df197e6ac52f2c13b37d9644aa50efd9ba8c2cf13619"
-POLICY_VERSION = "2026-08-06.animation-look-continuity.v3"
+POLICY_SEMANTIC_REGRESSION_RELATIVE = (
+    "resources/tests/HMB_V4_Policy_Semantics_Regression.py"
+)
+POLICY_SHA256 = "e46328be5f3bf9d0bc05d52b12cc6b14cc71b3125297d01efc2100e47276c914"
+POLICY_VERSION = "2026-08-11.agent-shot-quality.v4"
 POLICY_CONTRACT_SHA256 = (
-    "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93"
+    "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5"
 )
 POLICY_SIGNING_KEY_ID = "hmb-policy-release-2026-08-r2"
 EXPECTED_SECRET_NAMES = {
@@ -110,7 +113,7 @@ common_spec.loader.exec_module(common)
 manifest = json.loads(
     (ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8")
 )
-assert manifest["metadata"]["library_version"] == "0.5.33"
+assert manifest["metadata"]["library_version"] == "0.5.70"
 registered_secrets = manifest["settings"][0]["contents"]["secrets_to_register"]
 assert set(registered_secrets) == EXPECTED_SECRET_NAMES
 assert all(value == "" for value in registered_secrets.values())
@@ -478,14 +481,18 @@ if all(output_presence):
         "signing_key_id": POLICY_SIGNING_KEY_ID,
         "validated": True,
     }
-    assert release_manifest["release_version"] == "0.5.33"
+    assert release_manifest["release_version"] == "0.5.70"
     assert release_manifest["policy_version"] == POLICY_VERSION
     assert release_manifest["contract_sha256"] == POLICY_CONTRACT_SHA256
     source_files = {
         str(item["path"]): item for item in release_manifest["source_files"]
     }
-    assert len(source_files) == 25
+    assert len(source_files) == 26
     assert source_files[POLICY_RELATIVE]["sha256"] == POLICY_SHA256
+    assert POLICY_SEMANTIC_REGRESSION_RELATIVE in source_files
+    assert source_files[POLICY_SEMANTIC_REGRESSION_RELATIVE]["sha256"] == digest(
+        (ROOT / POLICY_SEMANTIC_REGRESSION_RELATIVE).read_bytes()
+    )
     assert "CHANGELOG.md" not in source_files
     assert "resources/build_release.py" not in source_files
     assert not any(
@@ -498,9 +505,15 @@ if all(output_presence):
     assert archive_names == [RELEASE_ARCHIVE.name]
     with zipfile.ZipFile(RELEASE_ARCHIVE, "r") as archive:
         infos = archive.infolist()
-        assert len(infos) == 25
+        assert len(infos) == 26
         assert not archive.testzip()
         expected_policy_member = f"HMB_GP_Production/{POLICY_RELATIVE}"
+        expected_semantic_regression_member = (
+            f"HMB_GP_Production/{POLICY_SEMANTIC_REGRESSION_RELATIVE}"
+        )
+        assert expected_semantic_regression_member in {
+            info.filename for info in infos
+        }
         dat_members = [
             info.filename
             for info in infos
@@ -560,5 +573,5 @@ if all(output_presence):
         assert digest((DIST / filename).read_bytes()) == expected_hash
     archive_verified = True
 
-mode = "source and 25-file archive" if archive_verified else "source-only"
+mode = "source and 26-file archive" if archive_verified else "source-only"
 print(f"HMB bundled-policy release/credential boundary regression: PASS ({mode})")

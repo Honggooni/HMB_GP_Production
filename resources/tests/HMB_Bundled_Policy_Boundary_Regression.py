@@ -10,9 +10,9 @@ from types import MethodType
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_POLICY_VERSION = "2026-08-06.animation-look-continuity.v3"
+EXPECTED_POLICY_VERSION = "2026-08-11.agent-shot-quality.v4"
 EXPECTED_POLICY_CONTRACT = (
-    "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93"
+    "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5"
 )
 EXPECTED_SIGNING_KEY_ID = "hmb-policy-release-2026-08-r2"
 LOAD_FAILURE = "HMB_GP_Agent_Library internal rule payload could not be loaded."
@@ -36,7 +36,7 @@ assert not hasattr(common, "_resolve_agent_rule_data_path")
 assert not hasattr(common, "_load_agent_rule_payload_from_path")
 
 
-def assert_v3_payload(payload: dict[str, object]) -> None:
+def assert_current_payload(payload: dict[str, object]) -> None:
     assert payload["final_policy_version"] == EXPECTED_POLICY_VERSION
     assert payload["final_motion_look_policy_sha256"] == EXPECTED_POLICY_CONTRACT
     assert str(payload["policy"]).strip()
@@ -54,7 +54,7 @@ def recording_open(path: Path, *args, **kwargs):
 
 Path.open = recording_open
 try:
-    assert_v3_payload(common._load_agent_rule_payload())
+    assert_current_payload(common._load_agent_rule_payload())
 finally:
     Path.open = original_path_open
 
@@ -189,7 +189,7 @@ def exercise_public_route(
 
 
 def assert_public_routes() -> None:
-    # A canonical HMB route verifies the library-local v3 policy.
+    # A canonical HMB route verifies the library-local v4 policy.
     bundled_result, bundled_native_calls, _bundled_outputs, bundled_cause = (
         exercise_public_route(canonical_hmb_prompt=True)
     )

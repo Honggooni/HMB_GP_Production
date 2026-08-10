@@ -14,10 +14,13 @@ ARCHIVE = DIST / "HMB_GP_Production.zip"
 MANIFEST = DIST / "release-manifest.json"
 CHECKSUMS = DIST / "SHA256SUMS"
 POLICY_RELATIVE = "resources/agent/hmb_agent_core.dat"
-POLICY_SHA256 = "6152355dd51d68da33d4df197e6ac52f2c13b37d9644aa50efd9ba8c2cf13619"
-POLICY_VERSION = "2026-08-06.animation-look-continuity.v3"
+POLICY_SEMANTIC_REGRESSION_RELATIVE = (
+    "resources/tests/HMB_V4_Policy_Semantics_Regression.py"
+)
+POLICY_SHA256 = "e46328be5f3bf9d0bc05d52b12cc6b14cc71b3125297d01efc2100e47276c914"
+POLICY_VERSION = "2026-08-11.agent-shot-quality.v4"
 POLICY_CONTRACT_SHA256 = (
-    "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93"
+    "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5"
 )
 POLICY_SIGNING_KEY_ID = "hmb-policy-release-2026-08-r2"
 RETIRED_SHARE_MARKER = b"".join((b"00", b".", b"CompSource"))
@@ -47,6 +50,7 @@ SOURCE_FILES = (
     "resources/maya/HMBVideoPicker_Maya_Guide.txt",
     "resources/picker/HMB_Marker_Catalog.json",
     POLICY_RELATIVE,
+    POLICY_SEMANTIC_REGRESSION_RELATIVE,
 )
 
 

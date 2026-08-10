@@ -36,9 +36,9 @@ for legacy in legacy_scope_phrases:
     assert legacy.casefold() not in source.casefold(), legacy
     assert legacy.casefold() not in guide.casefold(), legacy
 
-assert prompt.PROMPT_POLICY_SOURCE_VERSION == "2026-08-06.animation-look-continuity.v3"
+assert prompt.PROMPT_POLICY_SOURCE_VERSION == "2026-08-11.agent-shot-quality.v4"
 assert prompt.PROMPT_POLICY_SOURCE_CONTRACT_SHA256 == (
-    "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93"
+    "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5"
 )
 assert prompt.PROMPT_POLICY_SOURCE_VERSION == prompt._hmb._AGENT_POLICY_VERSION
 assert (
@@ -87,7 +87,7 @@ for hidden_policy_detail in (
     assert hidden_policy_detail not in prompt_only, hidden_policy_detail
 assert "subject-only blur" not in prompt_only.casefold()
 
-# The bundled signed v3 policy remains the authority for the removed public
+# The bundled signed v4 policy remains the authority for the removed public
 # defaults; the Prompt compiler must not become their second policy store.
 signed_policy = "\n".join(str(document) for document in prompt._hmb.get_internal_policy_documents())
 for policy_anchor in (

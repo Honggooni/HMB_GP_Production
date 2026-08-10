@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.70 - 2026-08-11
+
+- Activated signed Agent policy `2026-08-11.agent-shot-quality.v4` with its
+  matching runtime, Prompt, release-builder, CI, documentation, and regression
+  identities. The bundled policy remains the only production policy source.
+- Added pre-generation policy boundaries for Actor 7, Ghost 3, Pattern 4,
+  scale authority, character-color continuity, children's TV readability, and
+  temporal identity stability. The policy explicitly does not claim generated
+  video inspection, defect grading, approval, rejection, or regeneration.
+- Added a signed-payload semantic regression to the release workflow and the
+  bounded 26-file CI validation archive. It verifies v4 meaning without
+  exposing a private signing key or introducing an external policy path.
+
 ## 0.5.33 - 2026-08-11
 
 - Restored the established team rollout contract: approved changes reach the

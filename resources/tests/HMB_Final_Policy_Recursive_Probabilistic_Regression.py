@@ -12,9 +12,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.5.33"
-EXPECTED_POLICY_VERSION = "2026-08-06.animation-look-continuity.v3"
-EXPECTED_CONTRACT_SHA256 = "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93"
+EXPECTED_RELEASE_VERSION = "0.5.70"
+EXPECTED_POLICY_VERSION = "2026-08-11.agent-shot-quality.v4"
+EXPECTED_CONTRACT_SHA256 = "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5"
 BASE_MASTER_SEEDS = (
     20260729,
     0x484D42,
@@ -95,7 +95,7 @@ for rules in (policy, binding):
     assert "never downgrade supplied content to context-only" in normalized_rules
     assert "explicit scoped exception" in normalized_rules
     assert "named target or clearly scene-wide scope" in normalized_rules
-    assert "stable default focus" in normalized_rules
+    assert "stable camera-relative focus" in normalized_rules
     assert "explicit user goal may use any visible property" not in normalized_rules
     assert "may broaden, narrow, or reframe" not in normalized_rules
     assert "target-property-time" not in normalized_rules
