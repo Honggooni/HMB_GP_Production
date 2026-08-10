@@ -19,8 +19,9 @@ Library by using the following repository URL:
 
 The registered library directory must retain its `.git` metadata and track the
 `main` branch. After a maintainer pushes or merges an approved version to
-`main`, team members only need to refresh Griptape's Library view and click the
-Library **Update** button.
+`main`, team members open Library Management, choose **Check for Updates** (or
+Settings > Libraries > **Check Now**), and then click **Update** for this
+Library.
 
 Do not edit tracked files inside the registered Library. Development changes
 belong in a separate clone; local edits can cause Griptape to block an update
@@ -28,8 +29,9 @@ instead of overwriting the installation.
 
 Do not replace the registered library directory with a downloaded ZIP or a
 copied folder. Those copies have no Git metadata, so Griptape cannot discover
-or apply future updates. If the Update button is absent, the library is either
-already current or is no longer a valid Git checkout with the GitHub `origin`.
+or apply future updates. If **Check for Updates** is absent, the library is not
+a valid Git checkout with the GitHub `origin`; if **Update** remains absent
+after a successful check, the library is already current.
 
 ## Agent policy availability
 
