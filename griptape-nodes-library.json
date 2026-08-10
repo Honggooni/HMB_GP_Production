@@ -4,7 +4,7 @@
   "metadata": {
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.5.31",
+    "library_version": "0.5.32",
     "engine_version": "0.93.0",
     "tags": [
       "Griptape",
@@ -94,7 +94,7 @@
       "GoalFirstShotComposition",
       "ControlOnlyBindings",
       "NonBlockingSourceNormalization",
-      "SignedExternalPolicy",
+      "SignedBundledPolicy",
       "CompactPublicPrompt",
       "FinalTextBoundary",
       "AgentStateChainOnly",
@@ -116,6 +116,7 @@
       "VolcengineArk",
       "FNAIBroker",
       "ServerManagedProviderCredentials",
+      "BrokerServerUsageAccounting",
       "DPAPIProtectedBrokerSession",
       "SingleWireReferenceImages",
       "SingleWireVideoReferences",
@@ -155,7 +156,7 @@
   },
   "settings": [
     {
-      "description": "HMB Seedance Generation authenticates through the FN AI Broker's one-time browser authorization. Provider API keys remain exclusively on the Broker server; the node exposes no provider-key input, registration state, usage, quota, or reset data. The permanent Broker access token is protected with Windows DPAPI and never stored in node parameters, outputs, logs, manifests, or release archives. Local reference videos may still use separately scoped Griptape Cloud or least-privilege Volcengine TOS storage credentials.",
+      "description": "HMB Seedance Generation authenticates through the FN AI Broker's one-time browser authorization. Provider API keys remain exclusively on the Broker server. The client performs no secondary usage recording; the Broker is the sole usage, quota, and accounting authority. The node exposes no provider-key input, registration state, quota, or reset data. The permanent Broker access token is protected with Windows DPAPI and never stored in node parameters, outputs, logs, manifests, or release archives. Local reference videos may still use separately scoped Griptape Cloud or least-privilege Volcengine TOS storage credentials.",
       "category": "app_events.on_app_initialization_complete",
       "contents": {
         "secrets_to_register": {
@@ -226,7 +227,7 @@
       "file_path": "HMBSeedanceGeneration.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "HMB Seedance Generation submits the selected supported model to the authenticated FN AI Broker, refreshes or resumes known Broker jobs without creating replacements, downloads same-origin results with Broker authorization, and never forwards that authorization to external result URLs. Provider API keys remain server-side. A collapsed AI Broker group below Status shows only connection state, account, and one nonblocking Connect / Refresh action; it exposes no key characters, key-registration control, usage, quota, or reset data, and Broker renders perform no usage recording. The public media surface accepts up to 9 ordered reference images, up to 3 ordered Picker video references, and up to 3 audio items. Local media publication and output preflight remain bounded and occur before billable submission; successful results publish one local preview and the sole VIDEO_OUT connector.",
+        "description": "HMB Seedance Generation submits the selected supported model to the authenticated FN AI Broker, refreshes or resumes known Broker jobs without creating replacements, downloads same-origin results with Broker authorization, and never forwards that authorization to external result URLs. Provider API keys remain server-side. The client performs no secondary usage recording; the Broker is the sole usage, quota, and accounting authority. A collapsed AI Broker group below Status shows only connection state, account, and one nonblocking Connect / Refresh action; it exposes no key characters, key-registration control, quota, or reset data. The public media surface accepts up to 9 ordered reference images, up to 3 ordered Picker video references, and up to 3 audio items. Local media publication and output preflight remain bounded and occur before billable submission; successful results publish one local preview and the sole VIDEO_OUT connector.",
         "display_name": "HMB Seedance Generation",
         "icon": "Sparkles",
         "group": "create",

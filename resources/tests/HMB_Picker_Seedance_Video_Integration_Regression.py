@@ -221,23 +221,25 @@ def assert_host_connection_reorder_and_payload() -> None:
         # Four selected videos must fail before any billable POST, and no item may
         # be silently discarded to fit Seedance's three-video provider limit.
         destination.set_parameter_value("prompt", "four-video preflight rejection")
-        request_calls: list[tuple[Any, ...]] = []
+        broker_calls: list[tuple[Any, ...]] = []
 
-        async def forbidden_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
-            request_calls.append((*args, kwargs))
-            raise AssertionError("Provider request occurred before preflight rejection")
+        async def forbidden_broker_connection(
+            *args: Any, **kwargs: Any
+        ) -> dict[str, Any]:
+            broker_calls.append((*args, kwargs))
+            raise AssertionError("Broker connection occurred before preflight rejection")
 
-        destination._request_json = forbidden_request
+        destination._ensure_broker_connected = forbidden_broker_connection
         try:
             asyncio.run(destination._process_generation_impl())
         except ValueError as exc:
             assert "at most 3 reference videos" in str(exc)
         else:
             raise AssertionError("Four connected Picker videos were accepted")
-        assert request_calls == []
+        assert broker_calls == []
 
         # Deselecting only the fourth-position item leaves the requested 4->1
-        # order intact. The resulting three URLs become Ark content in that order.
+        # order intact. The resulting three URLs become Broker media in that order.
         ordered_three = submit_picker_order(source, (4, 1, 2))
         assert destination.get_parameter_value(
             seedance.VIDEO_REFERENCES_PARAMETER
@@ -246,13 +248,8 @@ def assert_host_connection_reorder_and_payload() -> None:
         assert params["video_references"] == ordered_three
         assert params["video_reference_slots"] == []
         destination._validate_parameters(params)
-        payload = destination._build_payload(params)
-        payload_videos = [
-            item["video_url"]["url"]
-            for item in payload["content"]
-            if item["type"] == "video_url"
-        ]
-        assert payload_videos == ordered_three
+        payload = destination._build_broker_payload(params)
+        assert payload["video_urls"] == ordered_three
     finally:
         deleted = asyncio.run(
             GriptapeNodes.ahandle_request(

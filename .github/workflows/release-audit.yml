@@ -34,6 +34,16 @@ jobs:
         shell: pwsh
         run: |
           $tracked = @(git ls-files)
+          $retiredShareMarker = "00" + "." + "CompSource"
+          $retiredShareMatches = @(git grep -n -I -F $retiredShareMarker -- .)
+          $retiredShareExitCode = $LASTEXITCODE
+          if ($retiredShareExitCode -gt 1) {
+            throw "Retired-share scan failed with git exit code $retiredShareExitCode."
+          }
+          $global:LASTEXITCODE = 0
+          if ($retiredShareMatches.Count -ne 0) {
+            throw "Retired Composite Team source-share references remain: $($retiredShareMatches -join ', ')"
+          }
           $bundledPolicy = "resources/agent/hmb_agent_core.dat"
           $bundledPolicySha256 = "6152355dd51d68da33d4df197e6ac52f2c13b37d9644aa50efd9ba8c2cf13619"
           $forbidden = @($tracked | Where-Object {
@@ -56,7 +66,7 @@ jobs:
           if ($actualPolicySha256 -ne $bundledPolicySha256) {
             throw "Bundled Agent policy SHA-256 mismatch."
           }
-      - name: Install pinned direct dependencies
+      - name: Install pinned runtime dependencies
         run: python -m pip install "cryptography==50.0.0" "Pillow==12.3.0" "imageio-ffmpeg==0.6.0" "httpx==0.28.1" "tos==2.9.2"
       - name: Python release regressions
         shell: pwsh
@@ -66,7 +76,7 @@ jobs:
           # Live-host regressions run only on internal hosts configured with
           # Griptape Nodes; signed-policy boundaries are verified below.
           $tests = @(
-            "HMB_External_Policy_Boundary_Regression.py",
+            "HMB_Bundled_Policy_Boundary_Regression.py",
             "HMB_Agent_Policy_Integration_Regression.py",
             "HMB_Look_Attribute_Scope_Regression.py",
             "HMB_Output_Sanitizer_Regression.py",
@@ -105,4 +115,14 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: Bundled policy release security regression
-        run: python resources/tests/HMB_Public_Release_Security_Regression.py
+        shell: pwsh
+        run: |
+          python resources/build_release.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $first = (Get-FileHash dist/HMB_GP_Production.zip -Algorithm SHA256).Hash
+          python resources/build_release.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $second = (Get-FileHash dist/HMB_GP_Production.zip -Algorithm SHA256).Hash
+          if ($first -ne $second) { throw "Release ZIP is not reproducible." }
+          python resources/tests/HMB_Public_Release_Security_Regression.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
