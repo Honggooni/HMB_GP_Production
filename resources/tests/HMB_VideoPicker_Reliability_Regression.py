@@ -887,7 +887,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.5.31"
+assert manifest["metadata"]["library_version"] == "0.5.32"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
@@ -958,10 +958,10 @@ expected_agent_hashes = {
     "HMBVideoPickerLibrary.py": "04330ae13ea82cd3962f993d371c74fd37a6de3998b11eaf108e1d10eea736be",
     "_hmb_common.py": "2b4dd7e15602d9fbd70a7cc5530c2f46b99f548f14dadab2288777c2840cefb0",
     "widgets/HMBAgentLibraryWidget.js": "61ea9416adc1cbfb7e8fbfbc068ad1a444c3f6d4b4c6b59569a1815a013dc193",
-    "resources/tests/HMB_Agent_Policy_Integration_Regression.py": "93b69cc49d111d0f41ee3ab77835402463db672101f9ce6f6663f33e0e037b83",
+    "resources/tests/HMB_Agent_Policy_Integration_Regression.py": "c88e8889a5f878d5f02cc2e522e25a9a4192e78fae0c65cb6165fc0637b07b31",
     "resources/tests/HMB_Frame_Range_Regression.py": "4f9c0f7022b5db5bfa760e41f747ecbf95c99f0b06525553248fe3af9e2b1091",
     "resources/tests/HMB_Output_Sanitizer_Regression.py": "390406b1903f28583ff29882b5fab2ef9befbfb13684de9e551d37f3ab6ce524",
-    "resources/tests/HMB_Final_Policy_Recursive_Probabilistic_Regression.py": "2028c82b5bc7eaaa254ca6e485bc77ca21cc6597b78adf461a6645f34506cf10",
+    "resources/tests/HMB_Final_Policy_Recursive_Probabilistic_Regression.py": "0529afef17bc27fd6ff73c2312fdd5ea2a2a55dfe8d6e5f6c14e68e51cdf838a",
 }
 for relative_path, expected_hash in expected_agent_hashes.items():
     actual_hash = hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest()

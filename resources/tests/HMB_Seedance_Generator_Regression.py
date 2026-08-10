@@ -122,69 +122,6 @@ class IndexedMacroDestination(FakeDestination):
         )
 
 
-class ScriptedNode(target.HMBSeedance20VideoGeneration):
-    TEST_KEY = "regression-secret-key"
-
-    def __init__(self, scripted_gets: list[dict]) -> None:
-        super().__init__(name="HMB Volcengine Scripted Regression")
-        self.scripted_gets = list(scripted_gets)
-        self.requests: list[dict] = []
-        self.downloads: list[str] = []
-        self.sleeps: list[float] = []
-        self.destination = FakeDestination()
-        self._output_file = FakeOutputFile(self.destination)
-
-    @staticmethod
-    def _get_api_key() -> str:
-        return ScriptedNode.TEST_KEY
-
-    def _capture_usage_identity(self):
-        # General transport tests must never touch a real login or network
-        # usage share. Dedicated ledger tests exercise that contract below.
-        return None
-
-    async def _request_json(
-        self,
-        method: str,
-        path: str,
-        api_key: str,
-        payload: dict | None = None,
-        *,
-        retry: bool = False,
-        deadline: float | None = None,
-    ) -> dict:
-        self.requests.append(
-            {
-                "method": method,
-                "path": path,
-                "api_key": api_key,
-                "payload": payload,
-                "retry": retry,
-                "deadline": deadline,
-            }
-        )
-        if method == "POST":
-            return {"id": "task-regression-1", "status": "queued"}
-        if not self.scripted_gets:
-            raise AssertionError("Unexpected extra task poll")
-        return self.scripted_gets.pop(0)
-
-    async def _download_video(self, url: str) -> bytes:
-        self.downloads.append(url)
-        return b"\x00\x00\x00\x18ftypmp42regression-video"
-
-    async def _sleep(self, seconds: float) -> None:
-        self.sleeps.append(seconds)
-
-    def _monotonic(self) -> float:
-        return 0.0
-
-    async def _process_generation_impl(self) -> None:
-        """Keep legacy transport assertions isolated from the Broker contract."""
-        await self._process_direct_generation_impl()
-
-    async def _refresh_async(self) -> None:
-        await self._refresh_direct_async()
 
 
 class FakeBrokerBridge:
@@ -244,9 +181,6 @@ class BrokerScriptedNode(target.HMBSeedance20VideoGeneration):
 
     def _create_broker_bridge(self):
         return self.bridge
-
-    def _capture_usage_identity(self):
-        return None
 
     async def _download_video(self, url: str) -> bytes:
         self.downloads.append(url)
@@ -340,7 +274,6 @@ def assert_constructor_and_public_contract() -> None:
     assert target.MAX_REFERENCE_IMAGES == 9
     assert target.MAX_VIDEO_REFERENCES == 3
     assert target.MAX_REFERENCE_AUDIO == 3
-    assert target.ARK_BASE_URL == "https://ark.cn-beijing.volces.com/api/v3"
     assert target.MODEL_RESOLUTIONS[target.SEEDANCE_2_0_MODEL_ID] == (
         "4k",
         "1080p",
@@ -550,6 +483,15 @@ def assert_constructor_and_public_contract() -> None:
     )
 
     source = MODULE_PATH.read_text(encoding="utf-8")
+    for forbidden_symbol in (
+        "ARK" + "_API_KEY",
+        "ARK" + "_BASE_URL",
+        "CREATE" + "_TASK_PATH",
+        "Volcengine" + "APIError",
+        "_process_" + "direct",
+        "_refresh_" + "direct",
+    ):
+        assert forbidden_symbol not in source
     assert "CGTeamwork" not in source
     assert '"/api/device/start"' in source
     assert '"/api/device/token"' in source
@@ -644,12 +586,8 @@ def assert_image_asset_single_wire_host_contract() -> None:
             params = destination._get_parameters()
             assert params["reference_images"] == ordered
             destination._validate_parameters(params)
-            payload = destination._build_payload(params)
-            assert [
-                item["image_url"]["url"]
-                for item in payload["content"]
-                if item["type"] == "image_url"
-            ] == ordered
+            payload = destination._build_broker_payload(params)
+            assert payload["image_urls"] == ordered
 
             reordered = [ordered[2], ordered[0], ordered[4]]
             reordered_positions = {
@@ -810,12 +748,8 @@ def assert_video_picker_single_wire_host_contract() -> None:
         assert params["video_references"] == ordered
         assert params["video_reference_slots"] == []
         destination._validate_parameters(params)
-        payload = destination._build_payload(params)
-        assert [
-            item["video_url"]["url"]
-            for item in payload["content"]
-            if item["type"] == "video_url"
-        ] == ordered
+        payload = destination._build_broker_payload(params)
+        assert payload["video_urls"] == ordered
 
         listed = GriptapeNodes.handle_request(
             ListConnectionsForNodeRequest(node_name=destination.name)
@@ -846,35 +780,6 @@ def assert_video_picker_single_wire_host_contract() -> None:
         assert not context_manager.has_current_flow()
 
 
-def assert_secret_manager_contract() -> None:
-    calls: list[str] = []
-
-    class FakeSecrets:
-        @staticmethod
-        def get_secret(name: str):
-            calls.append(name)
-            return "  user-owned-ark-key  "
-
-    with mock.patch.object(
-        target.GriptapeNodes, "SecretsManager", return_value=FakeSecrets()
-    ):
-        assert target.HMBSeedance20VideoGeneration._get_api_key() == "user-owned-ark-key"
-    assert calls == ["ARK_API_KEY"]
-
-    class MissingSecrets:
-        @staticmethod
-        def get_secret(_name: str):
-            return "  "
-
-    with mock.patch.object(
-        target.GriptapeNodes, "SecretsManager", return_value=MissingSecrets()
-    ):
-        try:
-            target.HMBSeedance20VideoGeneration._get_api_key()
-        except ValueError as exc:
-            assert "ARK_API_KEY is missing" in str(exc)
-        else:
-            raise AssertionError("Blank ARK_API_KEY was accepted")
 
 
 def assert_payload_and_media_contract() -> None:
@@ -907,29 +812,19 @@ def assert_payload_and_media_contract() -> None:
                 "return_last_frame": True,
             }
         )
-        payload = node._build_payload(params)
+        payload = node._build_broker_payload(params)
 
         assert payload["model"] == "doubao-seedance-2-0-260128"
-        assert payload["resolution"] == "1080p"
-        assert payload["ratio"] == "16:9"
-        assert payload["duration"] == 8
+        assert payload["quality"] == "1080p"
+        assert payload["aspect_ratio"] == "16:9"
+        assert payload["duration_seconds"] == 8
         assert payload["generate_audio"] is True
         assert payload["watermark"] is False
-        assert [item["type"] for item in payload["content"]] == [
-            "text",
-            "image_url",
-            "image_url",
-            "video_url",
-            "audio_url",
-        ]
-        assert payload["content"][1]["role"] == "reference_image"
-        assert payload["content"][3] == {
-            "type": "video_url",
-            "video_url": {"url": "asset://video-asset-1"},
-            "role": "reference_video",
-        }
-        encoded_image = payload["content"][1]["image_url"]["url"]
-        encoded_audio = payload["content"][4]["audio_url"]["url"]
+        assert payload["prompt"] == "A precise regression shot"
+        assert payload["video_urls"] == ["asset://video-asset-1"]
+        encoded_image = payload["image_urls"][0]
+        assert payload["image_urls"][1] == "https://cdn.example/ref.jpg"
+        encoded_audio = payload["audio_urls"][0]
         assert encoded_image.startswith("data:image/png;base64,")
         assert base64.b64decode(encoded_image.split(",", 1)[1]) == image_bytes
         assert encoded_audio.startswith("data:audio/wav;base64,")
@@ -996,12 +891,10 @@ def assert_payload_and_media_contract() -> None:
     ordered_video_params = ordered_list_node._get_parameters()
     assert ordered_video_params["video_references"] == ordered_videos
     assert ordered_video_params["video_reference_slots"] == []
-    ordered_video_payload = ordered_list_node._build_payload(ordered_video_params)
-    assert [
-        item["video_url"]["url"]
-        for item in ordered_video_payload["content"]
-        if item["type"] == "video_url"
-    ] == ordered_videos
+    ordered_video_payload = ordered_list_node._build_broker_payload(
+        ordered_video_params
+    )
+    assert ordered_video_payload["video_urls"] == ordered_videos
 
     overflow_video_node = target.HMBSeedance20VideoGeneration(
         name="Picker Video Overflow Regression"
@@ -1027,21 +920,10 @@ def assert_payload_and_media_contract() -> None:
     scalar_node.set_parameter_value(
         "reference_video_2", {"value": "asset://scalar-video-2"}
     )
-    scalar_payload = scalar_node._build_payload(scalar_node._get_parameters())
-    scalar_video_content = [
-        item for item in scalar_payload["content"] if item["type"] == "video_url"
-    ]
-    assert scalar_video_content == [
-        {
-            "type": "video_url",
-            "video_url": {"url": "https://cdn.example/scalar-1.mp4"},
-            "role": "reference_video",
-        },
-        {
-            "type": "video_url",
-            "video_url": {"url": "asset://scalar-video-2"},
-            "role": "reference_video",
-        },
+    scalar_payload = scalar_node._build_broker_payload(scalar_node._get_parameters())
+    assert scalar_payload["video_urls"] == [
+        "https://cdn.example/scalar-1.mp4",
+        "asset://scalar-video-2",
     ]
 
     gap_params = node._get_parameters()
@@ -1075,7 +957,7 @@ def assert_payload_and_media_contract() -> None:
         "VIDEO_REFERENCES",
         ["https://cdn.example/scalar-1.mp4", "asset://scalar-video-2"],
     )
-    assert equivalent_legacy_node._build_payload(
+    assert equivalent_legacy_node._build_broker_payload(
         equivalent_legacy_node._get_parameters()
     ) == scalar_payload
 
@@ -1127,19 +1009,11 @@ def assert_payload_and_media_contract() -> None:
     ordered_image_node.set_parameter_value("prompt", "single wire list order")
     assert ordered_image_node.get_parameter_value("reference_images") == ordered_images
     assert ordered_image_node._get_parameters()["reference_images"] == ordered_images
-    ordered_list_payload = ordered_image_node._build_payload(
+    ordered_list_payload = ordered_image_node._build_broker_payload(
         ordered_image_node._get_parameters()
     )
-    assert [
-        item["image_url"]["url"]
-        for item in ordered_list_payload["content"]
-        if item["type"] == "image_url"
-    ] == ordered_images
-    assert [item["type"] for item in ordered_list_payload["content"]] == [
-        "text",
-        "image_url",
-        "image_url",
-    ]
+    assert ordered_list_payload["image_urls"] == ordered_images
+    assert ordered_list_payload["prompt"] == "single wire list order"
 
     empty_child_node = target.HMBSeedance20VideoGeneration(
         name="Empty Single Image List Regression"
@@ -1151,10 +1025,10 @@ def assert_payload_and_media_contract() -> None:
     empty_child_params = empty_child_node._get_parameters()
     assert empty_child_params["reference_images"] == []
     assert empty_child_params["reference_audio"] == []
-    empty_child_payload = empty_child_node._build_payload(empty_child_params)
-    assert empty_child_payload["content"] == [
-        {"type": "text", "text": "empty child is ignored"}
-    ]
+    empty_child_payload = empty_child_node._build_broker_payload(empty_child_params)
+    assert empty_child_payload["prompt"] == "empty child is ignored"
+    assert "image_urls" not in empty_child_payload
+    assert "audio_urls" not in empty_child_payload
 
     connected_parent_list_node = target.HMBSeedance20VideoGeneration(
         name="Connected Parent List Regression"
@@ -1229,7 +1103,7 @@ def assert_payload_and_media_contract() -> None:
             "prompt": "fast priority omission",
         }
     )
-    fast_payload = node._build_payload(params)
+    fast_payload = node._build_broker_payload(params)
     assert "priority" not in fast_payload
 
     params = node._get_parameters()
@@ -1515,20 +1389,8 @@ def assert_broker_generation_contract() -> None:
     bridge = FakeBrokerBridge([completed])
     node = BrokerScriptedNode(bridge)
     node.set_parameter_value("prompt", "Broker-only Seedance regression")
-    with mock.patch.object(
-        node,
-        "_get_api_key",
-        side_effect=AssertionError("Broker flow read ARK_API_KEY"),
-    ), mock.patch.object(
-        node,
-        "_prepare_usage_tracking",
-        side_effect=AssertionError("Broker flow collected usage"),
-    ), mock.patch.object(
-        node,
-        "_record_usage_task",
-        side_effect=AssertionError("Broker flow recorded usage"),
-    ):
-        asyncio.run(node._process_generation())
+    assert not hasattr(node, "_get_" + "api_key")
+    asyncio.run(node._process_generation())
 
     assert bridge.account_calls == 1
     assert bridge.refresh_ids == ["broker-job-1"]
@@ -1591,16 +1453,7 @@ def assert_broker_generation_contract() -> None:
     )
     resumed = BrokerScriptedNode(resume_bridge)
     resumed.set_parameter_value("resume_generation_id", "broker-resume-9")
-    with mock.patch.object(
-        resumed,
-        "_prepare_usage_tracking",
-        side_effect=AssertionError("Broker resume collected usage"),
-    ), mock.patch.object(
-        resumed,
-        "_record_usage_task",
-        side_effect=AssertionError("Broker resume recorded usage"),
-    ):
-        asyncio.run(resumed._process_generation())
+    asyncio.run(resumed._process_generation())
     assert resume_bridge.generate_payloads == []
     assert resume_bridge.refresh_ids == ["broker-resume-9"]
     assert resumed.downloads == ["https://cdn.example/resumed-broker.mp4"]
@@ -1616,16 +1469,7 @@ def assert_broker_generation_contract() -> None:
     )
     refreshed = BrokerScriptedNode(refresh_bridge)
     refreshed.parameter_output_values["generation_id"] = "broker-refresh-3"
-    with mock.patch.object(
-        refreshed,
-        "_prepare_usage_tracking",
-        side_effect=AssertionError("Broker refresh collected usage"),
-    ), mock.patch.object(
-        refreshed,
-        "_record_usage_task",
-        side_effect=AssertionError("Broker refresh recorded usage"),
-    ):
-        asyncio.run(refreshed._refresh_async())
+    asyncio.run(refreshed._refresh_async())
     assert refresh_bridge.refresh_ids == ["broker-refresh-3"]
     assert refreshed.downloads == ["https://cdn.example/refreshed-broker.mp4"]
 
@@ -2354,72 +2198,21 @@ def assert_broker_account_and_button_contract() -> None:
     assert node.get_parameter_value("broker_account") == "Threaded Artist"
 
 
-def assert_scripted_success_flow() -> None:
-    node = ScriptedNode(
-        [
-            {"id": "task-regression-1", "status": "queued"},
-            {"id": "task-regression-1", "status": "running"},
-            {
-                "id": "task-regression-1",
-                "status": "succeeded",
-                "content": {
-                    "video_url": "https://cdn.example/result.mp4",
-                    "last_frame_url": "https://cdn.example/last.jpg",
-                },
-                "authorization": "Bearer regression-secret-key",
-            },
-        ]
-    )
-    node.set_parameter_value("prompt", "A complete Volcengine flow")
-    node.set_parameter_value("poll_interval_seconds", 30)
-    asyncio.run(node._process_generation())
-
-    assert node.destination.resolved is True
-    assert node.destination.written == b"\x00\x00\x00\x18ftypmp42regression-video"
-    assert [request["method"] for request in node.requests] == [
-        "POST",
-        "GET",
-        "GET",
-        "GET",
-    ]
-    assert node.requests[0]["path"] == "/contents/generations/tasks"
-    assert node.requests[0]["retry"] is False
-    assert all(request["retry"] is True for request in node.requests[1:])
-    assert all(request["deadline"] == 3600 for request in node.requests[1:])
-    assert all(
-        request["path"]
-        == "/contents/generations/tasks/task-regression-1"
-        for request in node.requests[1:]
-    )
-    assert node.sleeps == [30, 30]
-    assert node.downloads == ["https://cdn.example/result.mp4"]
-    assert node.parameter_output_values["generation_id"] == "task-regression-1"
-    assert node.parameter_output_values["generation_status"] == "succeeded"
-    assert node.parameter_output_values["video_url"].value == node.destination.location
-    assert node.parameter_output_values["VIDEO_OUT"].value == node.destination.location
-    assert node.parameter_output_values["last_frame_url"] == "https://cdn.example/last.jpg"
-    assert node.parameter_output_values["was_successful"] is True
-    provider_response = node.parameter_output_values["provider_response"]
-    assert provider_response["authorization"] == "[REDACTED]"
-    assert provider_response["content"]["video_url"] == "[SIGNED_URL_REDACTED]"
-    assert provider_response["content"]["last_frame_url"] == "[SIGNED_URL_REDACTED]"
-    assert ScriptedNode.TEST_KEY not in json.dumps(
-        node.parameter_output_values, default=str
-    )
 
 
 def assert_indexed_output_macro_contract() -> None:
     # Required {_index} slots are allocated by ProjectFileDestination's write
     # path. The node's non-writing preflight must not reject that valid setup.
-    node = ScriptedNode(
+    bridge = FakeBrokerBridge(
         [
             {
-                "id": "task-regression-1",
-                "status": "succeeded",
-                "content": {"video_url": "https://cdn.example/indexed.mp4"},
+                "job_id": "broker-job-1",
+                "status": "completed",
+                "output": "https://cdn.example/indexed.mp4",
             }
         ]
     )
+    node = BrokerScriptedNode(bridge)
     indexed_destination = IndexedMacroDestination()
     node.destination = indexed_destination
     node._output_file = FakeOutputFile(indexed_destination)
@@ -2427,12 +2220,14 @@ def assert_indexed_output_macro_contract() -> None:
     asyncio.run(node._process_generation())
 
     assert indexed_destination.resolve_attempts == 1
-    assert indexed_destination.written == b"\x00\x00\x00\x18ftypmp42regression-video"
-    assert [request["method"] for request in node.requests] == ["POST", "GET"]
+    assert indexed_destination.written == b"\x00\x00\x00\x18ftypmp42broker-regression-video"
+    assert len(bridge.generate_payloads) == 1
+    assert bridge.refresh_ids == ["broker-job-1"]
     assert node.parameter_output_values["was_successful"] is True
 
     # No other missing macro variable may bypass the pre-billing validation.
-    invalid = ScriptedNode([])
+    invalid_bridge = FakeBrokerBridge([])
+    invalid = BrokerScriptedNode(invalid_bridge)
     invalid_destination = IndexedMacroDestination("_index, shot_name")
     invalid.destination = invalid_destination
     invalid._output_file = FakeOutputFile(invalid_destination)
@@ -2443,7 +2238,7 @@ def assert_indexed_output_macro_contract() -> None:
         assert "_index, shot_name" in str(exc)
     else:
         raise AssertionError("An unrelated missing output macro variable was accepted")
-    assert invalid.requests == []
+    assert invalid_bridge.generate_payloads == []
 
 
 class FakeCloudDriver:
@@ -2517,15 +2312,16 @@ def assert_local_video_temporary_publication() -> None:
         local_bytes = b"\x00\x00\x00\x18ftypmp42local-reference"
         local_video.write_bytes(local_bytes)
         driver = FakeCloudDriver()
-        node = ScriptedNode(
+        bridge = FakeBrokerBridge(
             [
                 {
-                    "id": "task-regression-1",
-                    "status": "succeeded",
-                    "content": {"video_url": "https://cdn.example/result.mp4"},
+                    "job_id": "broker-job-1",
+                    "status": "completed",
+                    "output": "https://cdn.example/result.mp4",
                 }
             ]
         )
+        node = BrokerScriptedNode(bridge)
         node.set_parameter_value("prompt", "temporary local publication")
         original_artifact = target.VideoUrlArtifact(str(local_video))
         node.set_parameter_value("reference_video_1", original_artifact)
@@ -2540,18 +2336,9 @@ def assert_local_video_temporary_publication() -> None:
         assert upload["path"].name == "picker-reference.mp4"
         assert driver.deletes == [upload["path"]]
         assert node.get_parameter_value("reference_video_1") is original_artifact
-        post_payload = node.requests[0]["payload"]
-        video_content = [
-            item for item in post_payload["content"] if item["type"] == "video_url"
-        ]
-        assert video_content == [
-            {
-                "type": "video_url",
-                "video_url": {
-                    "url": "https://storage.example/reference.mp4?signature=temporary-secret"
-                },
-                "role": "reference_video",
-            }
+        post_payload = bridge.generate_payloads[0]
+        assert post_payload["video_urls"] == [
+            "https://storage.example/reference.mp4?signature=temporary-secret"
         ]
         output_dump = json.dumps(node.parameter_output_values, default=str)
         assert "temporary-secret" not in output_dump
@@ -2573,7 +2360,8 @@ def assert_local_video_temporary_publication() -> None:
             "https://cdn.example/already-public.mp4"
         ]
 
-        missing_node = ScriptedNode([])
+        missing_bridge = FakeBrokerBridge([])
+        missing_node = BrokerScriptedNode(missing_bridge)
         missing_node.set_parameter_value("prompt", "missing local video diagnosis")
         missing_path = Path(temporary) / "missing-picker-reference.mp4"
         missing_node.set_parameter_value(
@@ -2593,7 +2381,7 @@ def assert_local_video_temporary_publication() -> None:
             assert "credentials" not in str(exc)
         else:
             raise AssertionError("Missing local video received a generic upload error")
-        assert missing_node.requests == []
+        assert missing_bridge.generate_payloads == []
 
         disabled_node = target.HMBSeedance20VideoGeneration(
             name="Disabled Local Publication Regression"
@@ -2610,14 +2398,14 @@ def assert_local_video_temporary_publication() -> None:
             raise AssertionError("Disabled local-video publication was bypassed")
 
         failing_driver = FakeCloudDriver()
-        failing_node = ScriptedNode([])
+        failing_bridge = FakeBrokerBridge([])
+        failing_node = BrokerScriptedNode(failing_bridge)
         failing_node.set_parameter_value("reference_video_1", original_artifact)
         failing_node._create_gt_cloud_storage_driver = lambda: failing_driver
 
-        async def fail_create_task(*_args, **_kwargs):
-            raise RuntimeError("simulated create failure")
-
-        failing_node._request_json = fail_create_task
+        failing_bridge.generate_seedance = mock.Mock(
+            side_effect=target._BrokerError("simulated create failure")
+        )
         try:
             asyncio.run(failing_node._process_generation())
         except RuntimeError as exc:
@@ -2633,15 +2421,16 @@ def assert_tos_local_video_temporary_publication() -> None:
         local_video = Path(temporary) / "team-reference.mp4"
         local_video.write_bytes(b"\x00\x00\x00\x18ftypmp42tos-reference")
         tos_client = FakeTosClient()
-        node = ScriptedNode(
+        bridge = FakeBrokerBridge(
             [
                 {
-                    "id": "task-regression-1",
-                    "status": "succeeded",
-                    "content": {"video_url": "https://cdn.example/result.mp4"},
+                    "job_id": "broker-job-1",
+                    "status": "completed",
+                    "output": "https://cdn.example/result.mp4",
                 }
             ]
         )
+        node = BrokerScriptedNode(bridge)
         node.set_parameter_value("prompt", "temporary TOS publication")
         node.set_parameter_value(
             "reference_video_1", target.VideoUrlArtifact(str(local_video))
@@ -2674,12 +2463,8 @@ def assert_tos_local_video_temporary_publication() -> None:
         ]
         assert tos_client.deletes == [("team-bucket", upload["key"])]
         assert tos_client.close_count == 1
-        post_payload = node.requests[0]["payload"]
-        reference_url = next(
-            item["video_url"]["url"]
-            for item in post_payload["content"]
-            if item["type"] == "video_url"
-        )
+        post_payload = bridge.generate_payloads[0]
+        reference_url = post_payload["video_urls"][0]
         assert reference_url.startswith(
             "https://team-bucket.tos-cn-beijing.volces.com/"
         )
@@ -2709,244 +2494,24 @@ def assert_tos_local_video_temporary_publication() -> None:
                 raise AssertionError(f"Unsafe TOS endpoint accepted: {invalid_endpoint}")
 
 
-def assert_resume_flow_skips_post() -> None:
-    node = ScriptedNode(
-        [
-            {
-                "id": "task-existing-9",
-                "status": "succeeded",
-                "content": {"video_url": "https://cdn.example/existing.mp4"},
-            }
-        ]
-    )
-    node.set_parameter_value("resume_generation_id", "task-existing-9")
-    node.set_parameter_value(
-        "reference_video_1", target.VideoUrlArtifact("missing-local-video.mp4")
-    )
-    node._create_gt_cloud_storage_driver = lambda: (_ for _ in ()).throw(
-        AssertionError("Resume initialized Griptape Cloud storage")
-    )
-    asyncio.run(node._process_generation())
-    assert [request["method"] for request in node.requests] == ["GET"]
-    assert node.requests[0]["path"].endswith("/task-existing-9")
-    assert node.parameter_output_values["generation_id"] == "task-existing-9"
-    assert node.parameter_output_values["generation_status"] == "succeeded"
-    assert node.downloads == ["https://cdn.example/existing.mp4"]
 
 
-def assert_refresh_recovery_contract() -> None:
-    known = ScriptedNode(
-        [
-            {
-                "id": "task-refresh-1",
-                "status": "succeeded",
-                "content": {"video_url": "https://cdn.example/refreshed.mp4"},
-            }
-        ]
-    )
-    known.parameter_output_values["generation_id"] = "task-refresh-1"
-    asyncio.run(known._refresh_async())
-    assert [request["method"] for request in known.requests] == ["GET"]
-    assert known.requests[0]["path"].endswith("/task-refresh-1")
-    assert known.downloads == ["https://cdn.example/refreshed.mp4"]
-    assert known.parameter_output_values["video_url"].value == known.destination.location
-    assert known.parameter_output_values["VIDEO_OUT"].value == known.destination.location
-
-    ambiguous = ScriptedNode(
-        [
-            {
-                "items": [
-                    {
-                        "id": "task-candidate-7",
-                        "model": target.SEEDANCE_2_0_MODEL_ID,
-                        "status": "running",
-                        "created_at": 1_780_000_060,
-                    },
-                    {
-                        "id": "task-other-model",
-                        "model": target.SEEDANCE_2_0_FAST_MODEL_ID,
-                        "status": "running",
-                        "created_at": 1_780_000_060,
-                    },
-                ]
-            }
-        ]
-    )
-    ambiguous.parameter_output_values["generation_status"] = "submission_unknown"
-    ambiguous.parameter_output_values["provider_response"] = {
-        "submission_diagnostic": {
-            "submission_outcome": "unknown",
-            "started_at_epoch": 1_780_000_000,
-            "model": target.SEEDANCE_2_0_MODEL_ID,
-        }
-    }
-    asyncio.run(ambiguous._refresh_async())
-    assert [request["method"] for request in ambiguous.requests] == ["GET"]
-    assert "page_num=1" in ambiguous.requests[0]["path"]
-    assert "task-candidate-7" in ambiguous.parameter_output_values["result_details"]
-    assert "task-other-model" not in ambiguous.parameter_output_values["result_details"]
-    assert "copy its ID into Resume Task ID" in ambiguous.parameter_output_values[
-        "result_details"
-    ]
 
 
-def assert_ambiguous_submission_status_contract() -> None:
-    node = ScriptedNode([])
-    node.set_parameter_value("prompt", "ambiguous submission regression")
-
-    async def ambiguous_request(
-        method: str,
-        _path: str,
-        _api_key: str,
-        _payload: dict | None = None,
-        **_kwargs,
-    ) -> dict:
-        assert method == "POST"
-        raise target.VolcengineAPIError(
-            "safe ambiguous submission",
-            response_json={
-                "submission_diagnostic": {
-                    "submission_outcome": "unknown",
-                    "network_error_type": "ReadError",
-                    "network_phase": "response-receive",
-                    "started_at_epoch": 1_780_000_000,
-                }
-            },
-            submission_outcome="unknown",
-        )
-
-    node._request_json = ambiguous_request
-    try:
-        asyncio.run(node.aprocess())
-    except Exception:
-        pass
-    assert node.parameter_output_values["generation_status"] == "submission_unknown"
-    diagnostic = node.parameter_output_values["provider_response"][
-        "submission_diagnostic"
-    ]
-    assert diagnostic["model"] == target.SEEDANCE_2_0_MODEL_ID
-    assert "safe ambiguous submission" in node.parameter_output_values[
-        "result_details"
-    ]
-    assert "30 minutes" in node.parameter_output_values["result_details"]
 
 
-class FastSleepNode(target.HMBSeedance20VideoGeneration):
+class BrokerResultDownloadNode(target.HMBSeedance20VideoGeneration):
     def __init__(self) -> None:
-        super().__init__(name="HTTPX Transport Regression")
+        super().__init__(name="Broker Result Download Regression")
         self.sleeps: list[float] = []
 
     async def _sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
 
 
-def assert_http_transport_contract() -> None:
-    node = FastSleepNode()
+def assert_broker_result_download_contract() -> None:
+    node = BrokerResultDownloadNode()
     original_async_client = target.httpx.AsyncClient
-    request_log: list[httpx.Request] = []
-    get_attempts = 0
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal get_attempts
-        request_log.append(request)
-        if request.method == "POST":
-            return httpx.Response(503, json={"error": {"message": "busy"}})
-        get_attempts += 1
-        if get_attempts < 3:
-            return httpx.Response(503, json={"error": {"message": "retry"}})
-        return httpx.Response(200, json={"id": "task-httpx", "status": "running"})
-
-    transport = httpx.MockTransport(handler)
-
-    def client_factory(*args, **kwargs):
-        kwargs["transport"] = transport
-        return original_async_client(*args, **kwargs)
-
-    with mock.patch.object(target.httpx, "AsyncClient", side_effect=client_factory):
-        try:
-            asyncio.run(
-                node._request_json(
-                    "POST",
-                    target.CREATE_TASK_PATH,
-                    "transport-secret",
-                    {"model": "test"},
-                    retry=True,
-                )
-            )
-        except target.VolcengineAPIError as exc:
-            assert exc.status_code == 503
-            assert exc.submission_outcome == "unknown"
-        else:
-            raise AssertionError("POST 503 was accepted")
-        assert len(request_log) == 1
-
-        result = asyncio.run(
-            node._request_json(
-                "GET",
-                "/contents/generations/tasks/task-httpx",
-                "transport-secret",
-                retry=True,
-            )
-        )
-    assert result["status"] == "running"
-    assert len(request_log) == 4
-    assert get_attempts == 3
-    assert node.sleeps == [1, 2]
-    assert str(request_log[0].url) == (
-        "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
-    )
-    assert request_log[0].headers["authorization"] == "Bearer transport-secret"
-
-    request_error_cases = [
-        (httpx.ConnectError, "connection"),
-        (httpx.ReadError, "response-receive"),
-        (httpx.WriteError, "request-send"),
-        (httpx.ReadTimeout, "response-receive"),
-        (httpx.RemoteProtocolError, "response-receive"),
-        (httpx.DecodingError, "response-receive"),
-    ]
-    for error_class, expected_phase in request_error_cases:
-        error_requests: list[httpx.Request] = []
-
-        async def error_handler(request: httpx.Request) -> httpx.Response:
-            error_requests.append(request)
-            raise error_class(
-                "raw transport detail must remain hidden transport-secret",
-                request=request,
-            )
-
-        error_transport = httpx.MockTransport(error_handler)
-
-        def error_client_factory(*args, **kwargs):
-            kwargs["transport"] = error_transport
-            return original_async_client(*args, **kwargs)
-
-        with mock.patch.object(
-            target.httpx, "AsyncClient", side_effect=error_client_factory
-        ):
-            try:
-                asyncio.run(
-                    node._request_json(
-                        "POST",
-                        target.CREATE_TASK_PATH,
-                        "transport-secret",
-                        {"prompt": "private prompt"},
-                        retry=True,
-                    )
-                )
-            except target.VolcengineAPIError as exc:
-                assert exc.submission_outcome == "unknown"
-                assert error_class.__name__ in str(exc)
-                assert expected_phase in str(exc)
-                assert "raw transport detail" not in str(exc)
-                assert "transport-secret" not in str(exc)
-                diagnostic = exc.response_json["submission_diagnostic"]
-                assert diagnostic["network_error_type"] == error_class.__name__
-                assert diagnostic["network_phase"] == expected_phase
-                assert "private prompt" not in json.dumps(exc.response_json)
-            else:
-                raise AssertionError(f"{error_class.__name__} POST was accepted")
-        assert len(error_requests) == 1
 
     download_requests: list[httpx.Request] = []
 
@@ -3007,190 +2572,85 @@ def assert_http_transport_contract() -> None:
     assert len(redirect_requests) == 1
 
 
-def assert_private_monthly_usage_ledger_contract() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        temporary_path = Path(temporary)
-        share_root = temporary_path / "Griptape_list"
-        queue_root = temporary_path / "local-queue"
-        user_id = "user-regression-123"
-        node = target.HMBSeedance20VideoGeneration(name="Usage Ledger Regression")
-        node._usage_identity = {"user_id": user_id}
-        node._usage_context = {
-            "identity": {"user_id": user_id},
-            "model": target.SEEDANCE_2_0_MODEL_ID,
-            "resolution": "1080p",
-            "ratio": "16:9",
-            "duration": 5,
-            "generate_audio": True,
-            "has_video_input": True,
+def assert_broker_server_accounting_contract() -> None:
+    module_source = MODULE_PATH.read_text(encoding="utf-8")
+    retired_ledger_name = "".join(("Griptape_", "list"))
+    retired_share = "".join(
+        (r"\\fin-rcomp1\Composite_Team", "\\", "00", ".", "CompSource")
+    )
+    for forbidden in (
+        "USAGE_LEDGER_ROOT",
+        "USAGE_LOCAL_QUEUE_ROOT",
+        "USAGE_PRICE_CNY_PER_MILLION",
+        "_prepare_usage_tracking",
+        "_record_usage_task",
+        "_record_current_usage_status",
+        "_build_usage_event",
+        "_flush_usage_queue",
+        retired_ledger_name,
+        retired_share,
+    ):
+        assert forbidden not in module_source
+
+    assert not {
+        name
+        for name in vars(target)
+        if name.startswith("USAGE_") or name.startswith("_USAGE_")
+    }
+    for runtime_class in (
+        target.HMBSeedanceGeneration,
+        target.HMBSeedance20VideoGeneration,
+    ):
+        assert not {
+            name for name in dir(runtime_class) if "usage" in name.casefold()
         }
-        provider_task = {
-            "id": "task-usage-regression-1",
-            "status": "succeeded",
-            "model": target.SEEDANCE_2_0_MODEL_ID,
-            "resolution": "1080p",
-            "ratio": "16:9",
-            "duration": 5,
-            "updated_at": 1785861000,
-            "usage": {
-                "completion_tokens": 35800,
-                "total_tokens": 35800,
-            },
-            "content": {"video_url": "https://private.example/result.mp4"},
-            "authorization": "Bearer must-never-be-recorded",
-            "prompt": "must-never-be-recorded",
-        }
-        event = node._build_usage_event(
-            provider_task,
-            "task-usage-regression-1",
-            "succeeded",
-        )
-        assert event is not None
-        event_dump = json.dumps(event)
-        assert "must-never-be-recorded" not in event_dump
-        assert "private.example" not in event_dump
-        assert event["generator"] == "HMBSeedance20VideoGeneration"
-        assert event["total_tokens"] == 35800
-        assert event["rate_cny_per_million_tokens"] == "28"
-        assert event["estimated_cost_cny"] == "1.0024"
-        event["recorded_at"] = "2026-08-05T00:00:00+09:00"
 
-        with mock.patch.object(target, "USAGE_LEDGER_ROOT", share_root), mock.patch.object(
-            target, "USAGE_LOCAL_QUEUE_ROOT", queue_root
-        ):
-            queued = node._enqueue_usage_event(event)
-            assert queued.is_file()
-            node._flush_usage_queue()
-            assert not queued.exists()
+    bridge = FakeBrokerBridge(
+        [
+            {
+                "status": "completed",
+                "job_id": "broker-job-1",
+                "output": "https://cdn.example/broker-accounting.mp4",
+            }
+        ]
+    )
+    node = BrokerScriptedNode(bridge)
+    node.set_parameter_value("prompt", "Broker accounting authority regression")
+    asyncio.run(node._process_generation())
+    assert len(bridge.generate_payloads) == 1
+    assert bridge.refresh_ids == ["broker-job-1"]
+    assert node.parameter_output_values["generation_status"] == "succeeded"
+    assert not {name for name in vars(node) if "usage" in name.casefold()}
 
-            ledger_path = share_root / user_id / f"{user_id}.json"
-            assert ledger_path.is_file()
-            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-            assert ledger["generator"] == "HMBSeedance20VideoGeneration"
-            assert ledger["user_id"] == user_id
-            assert len(ledger["months"]) == 1
-            month_key = next(iter(ledger["months"]))
-            month = ledger["months"][month_key]
-            assert month["summary"]["task_count"] == 1
-            assert month["summary"]["succeeded"] == 1
-            assert month["summary"]["total_tokens"] == 35800
-            assert month["summary"]["estimated_cost_cny"] == "1.0024"
-            assert list(month["tasks"]) == ["task-usage-regression-1"]
-            assert "content" not in month["tasks"]["task-usage-regression-1"]
-            assert "authorization" not in ledger_path.read_text(encoding="utf-8")
-
-            # Replaying a task updates it instead of increasing the count.
-            replay = dict(event)
-            replay["recorded_at"] = "2026-08-05T23:59:59+09:00"
-            node._enqueue_usage_event(replay)
-            node._flush_usage_queue()
-            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-            month = next(iter(ledger["months"].values()))
-            assert month["summary"]["task_count"] == 1
-            assert month["summary"]["total_tokens"] == 35800
-
-            # A newer completion month moves the same task; it is never duplicated.
-            next_month = dict(event)
-            next_month["billing_month"] = "2026-09"
-            next_month["recorded_at"] = "2026-09-01T00:00:01+09:00"
-            node._enqueue_usage_event(next_month)
-            node._flush_usage_queue()
-            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-            assert list(ledger["months"]) == ["2026-09"]
-            assert ledger["months"]["2026-09"]["summary"]["task_count"] == 1
-
-            # A disconnected/unusable share retains the local event for retry.
-            offline_root = temporary_path / "offline-root"
-            offline_root.write_text("not a directory", encoding="utf-8")
-            retry_event = dict(event)
-            retry_event["task_id"] = "task-usage-regression-2"
-            retry_event["billing_month"] = "2026-09"
-            retry_event["recorded_at"] = "2026-09-02T00:00:01+09:00"
-            with mock.patch.object(target, "USAGE_LEDGER_ROOT", offline_root):
-                retry_path = node._enqueue_usage_event(retry_event)
-                node._flush_usage_queue()
-                assert retry_path.is_file()
-            node._flush_usage_queue()
-            assert not retry_path.exists()
-            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-            assert ledger["months"]["2026-09"]["summary"]["task_count"] == 2
-
-            foreign = dict(event)
-            foreign["generator"] = "AnotherSeedanceGenerator"
-            try:
-                node._enqueue_usage_event(foreign)
-            except ValueError as exc:
-                assert "different generator" in str(exc)
-            else:
-                raise AssertionError("Another generator entered the HMB usage queue")
-
-            assert not list(share_root.rglob("*.tmp"))
-            assert not list(queue_root.rglob("*.tmp"))
-
-        integration_share = temporary_path / "integration-share"
-        integration_queue = temporary_path / "integration-queue"
-
-        class UsageScriptedNode(ScriptedNode):
-            def _capture_usage_identity(self):
-                self._usage_identity = {"user_id": user_id}
-                return dict(self._usage_identity)
-
-        integration_node = UsageScriptedNode(
-            [
-                {
-                    "id": "task-regression-1",
-                    "status": "succeeded",
-                    "model": target.SEEDANCE_2_0_MODEL_ID,
-                    "resolution": "720p",
-                    "duration": 5,
-                    "usage": {"completion_tokens": 1000, "total_tokens": 1000},
-                    "content": {"video_url": "https://cdn.example/result.mp4"},
-                }
-            ]
-        )
-        integration_node.set_parameter_value("prompt", "private integration prompt")
-        with mock.patch.object(
-            target, "USAGE_LEDGER_ROOT", integration_share
-        ), mock.patch.object(
-            target, "USAGE_LOCAL_QUEUE_ROOT", integration_queue
-        ), mock.patch.object(
-            UsageScriptedNode, "_schedule_usage_flush", return_value=None
-        ):
-            asyncio.run(integration_node._process_generation())
-            assert len(list(integration_queue.glob("*/*.json"))) == 2
-            integration_node._flush_usage_queue()
-            integration_ledger_path = (
-                integration_share / user_id / f"{user_id}.json"
-            )
-            integration_ledger = json.loads(
-                integration_ledger_path.read_text(encoding="utf-8")
-            )
-            integration_month = next(iter(integration_ledger["months"].values()))
-            assert integration_month["summary"]["task_count"] == 1
-            assert integration_month["summary"]["succeeded"] == 1
-            assert integration_month["summary"]["total_tokens"] == 1000
-            integration_dump = json.dumps(integration_ledger)
-            assert "private integration prompt" not in integration_dump
-            assert "cdn.example" not in integration_dump
+    manifest = json.loads(
+        (ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8")
+    )
+    tags = set(manifest["metadata"]["tags"])
+    assert not {
+        "PrivatePerUserMonthlyUsageLedger",
+        "OfflineUsageQueue",
+        "AtomicUsageLedger",
+    } & tags
+    assert "BrokerServerUsageAccounting" in tags
+    manifest_text = json.dumps(manifest, ensure_ascii=False)
+    assert (
+        "The client performs no secondary usage recording; the Broker is the sole "
+        "usage, quota, and accounting authority."
+    ) in manifest_text
 
 
 assert_constructor_and_public_contract()
 assert_image_asset_single_wire_host_contract()
 assert_video_picker_single_wire_host_contract()
-assert_secret_manager_contract()
 assert_payload_and_media_contract()
 assert_broker_generation_contract()
 assert_refresh_during_submission_contract()
 assert_broker_direct_transport_resilience_contract()
 assert_broker_account_and_button_contract()
-assert_scripted_success_flow()
 assert_indexed_output_macro_contract()
 assert_local_video_temporary_publication()
 assert_tos_local_video_temporary_publication()
-assert_resume_flow_skips_post()
-assert_refresh_recovery_contract()
-assert_ambiguous_submission_status_contract()
-assert_http_transport_contract()
-assert_private_monthly_usage_ledger_contract()
+assert_broker_result_download_contract()
+assert_broker_server_accounting_contract()
 
 print("HMB Seedance FN AI Broker regression: PASS")

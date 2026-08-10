@@ -4,18 +4,12 @@ import base64
 import io
 import importlib.util
 import json
-import os
 import sys
-import tempfile
 from pathlib import Path
 from types import MethodType
 
 
 ROOT = Path(__file__).resolve().parents[2]
-POLICY_ENV_NAMES = (
-    "HMB_AGENT_POLICY_PATH",
-    "AGENT_RULE_DATA_PATH",
-)
 EXPECTED_POLICY_VERSION = "2026-08-06.animation-look-continuity.v3"
 EXPECTED_POLICY_CONTRACT = (
     "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93"
@@ -38,8 +32,6 @@ agent = load("HMBAgentLibrary")
 bundled_policy_path = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
 assert common._BUNDLED_AGENT_POLICY_FILE == bundled_policy_path
 assert bundled_policy_path.is_file()
-assert not hasattr(common, "AGENT_RULE_DATA_PATH_ENV")
-assert not hasattr(common, "AGENT_RULE_DATA_PATH")
 assert not hasattr(common, "_resolve_agent_rule_data_path")
 assert not hasattr(common, "_load_agent_rule_payload_from_path")
 
@@ -51,37 +43,24 @@ def assert_v3_payload(payload: dict[str, object]) -> None:
     assert str(payload["binding"]).strip()
 
 
-original_env = {name: os.environ.get(name) for name in POLICY_ENV_NAMES}
+original_path_open = Path.open
+read_calls: list[Path] = []
+
+
+def recording_open(path: Path, *args, **kwargs):
+    read_calls.append(Path(path))
+    return original_path_open(path, *args, **kwargs)
+
+
+Path.open = recording_open
 try:
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        external_policy = Path(temporary_directory) / "external-policy.dat"
-        external_policy.write_bytes(b"external-policy-must-not-be-opened")
-        os.environ["HMB_AGENT_POLICY_PATH"] = str(external_policy)
-        os.environ["AGENT_RULE_DATA_PATH"] = str(external_policy)
-
-        original_path_open = Path.open
-        read_calls: list[Path] = []
-
-        def recording_open(path: Path, *args, **kwargs):
-            read_calls.append(Path(path))
-            return original_path_open(path, *args, **kwargs)
-
-        Path.open = recording_open
-        try:
-            assert_v3_payload(common._load_agent_rule_payload())
-        finally:
-            Path.open = original_path_open
-
-        # Legacy environment variables, including the former server path, have
-        # no influence on runtime reads. Only the library-local signed file opens.
-        assert read_calls == [bundled_policy_path]
-        assert external_policy not in read_calls
+    assert_v3_payload(common._load_agent_rule_payload())
 finally:
-    for name, value in original_env.items():
-        if value is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = value
+    Path.open = original_path_open
+
+# The loader opens exactly one library-local signed file and exposes no path
+# argument or runtime override surface.
+assert read_calls == [bundled_policy_path]
 
 
 with bundled_policy_path.open("rb") as stream:
@@ -209,13 +188,8 @@ def exercise_public_route(
         )
 
 
-route_env = {name: os.environ.get(name) for name in POLICY_ENV_NAMES}
-try:
-    os.environ["HMB_AGENT_POLICY_PATH"] = r"C:\untrusted\legacy-policy.dat"
-    os.environ["AGENT_RULE_DATA_PATH"] = r"C:\untrusted\policy.dat"
-
-    # A canonical HMB route verifies the library-local v3 policy even when old
-    # external-path configuration remains on the workstation.
+def assert_public_routes() -> None:
+    # A canonical HMB route verifies the library-local v3 policy.
     bundled_result, bundled_native_calls, _bundled_outputs, bundled_cause = (
         exercise_public_route(canonical_hmb_prompt=True)
     )
@@ -263,12 +237,9 @@ try:
     )
     assert native_result == "native-complete"
     assert native_calls == 1
-finally:
-    for name, value in route_env.items():
-        if value is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = value
+
+
+assert_public_routes()
 
 
 common_source = (ROOT / "_hmb_common.py").read_text(encoding="utf-8")
@@ -276,8 +247,6 @@ agent_source = (ROOT / "HMBAgentLibrary.py").read_text(encoding="utf-8")
 assert "_BUNDLED_AGENT_POLICY_FILE" in common_source
 assert 'ROOT / "resources" / "agent" / "hmb_agent_core.dat"' in common_source
 for forbidden in (
-    "HMB_AGENT_POLICY_PATH",
-    "AGENT_RULE_DATA_PATH",
     "_resolve_agent_rule_data_path",
     "_load_agent_rule_payload_from_path",
 ):

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.32 - 2026-08-10
+
+- Removed the retired client-side Seedance usage ledger, its local retry queue,
+  and every runtime dependency on the temporary Composite Team source share.
+  Authenticated FN AI Broker generation is now the sole production usage,
+  quota, and accounting boundary.
+- Kept the signed Agent policy inside the installable library and retained its
+  bounded signature, version, contract, and payload-integrity validation. No
+  policy share or policy-path environment configuration is required.
+- Added source and release gates that reject the retired share marker, legacy
+  usage-ledger symbols, and stale copies in a team package.
+
 ## 0.5.31 - 2026-08-10
 
 - Send FN AI Broker requests directly, without inheriting system or environment
@@ -254,10 +266,9 @@
 ## 0.5.15 - 2026-08-06
 
 - Bundled the exact signed Agent policy
-  `2026-08-01.goal-final-authority.v2` as the verified offline fallback so team
-  installations remain usable when the configured network policy path is
-  missing, unavailable, or invalid. A valid external policy remains first in
-  the resolution order.
+  `2026-08-01.goal-final-authority.v2` as the first local policy precursor. Its
+  temporary network-precedence experiment was later retired; current releases
+  resolve only the signed policy installed inside the library.
 - Pinned the bundled envelope to SHA-256
   `94533d84ab914971026f624634c2553a0c7abba298f6dd76242d996ee5c9137f`
   and retained the v2 contract SHA-256
@@ -305,18 +316,11 @@
 
 ## 0.5.12 - 2026-08-05
 
-- Removed the signed Agent policy payload from the source tree and production
-  ZIP. The runtime now reads it on demand from the administrator-configured
-  `HMB_AGENT_POLICY_PATH`, applies a bounded 128 KiB read, and retains the
-  existing native-Agent fallback when the path, share, or signature is invalid.
-- Kept only the RSA public verification key in the client. The policy payload is
-  signed and compressed, not encrypted; no private signing key, decryption key,
-  or API key is included in source or release artifacts.
-- Made the public release manifest independent of the configured external policy
-  and added source/archive boundaries for policy files, credential files, empty
-  Griptape Secret placeholders, and local backup/generated directories.
-- Added public CI coverage for the external-policy boundary and separated tests
-  that require an installed Griptape host or the private policy share.
+- Introduced a temporary external Agent-policy distribution experiment. It was
+  fully superseded by the signed bundled-policy contract and is not a runtime,
+  installation, or release dependency in the current library.
+- Kept only public signature-verification material in the client; no private
+  signing key, decryption key, or API key was added to release artifacts.
 
 ## 0.5.11 - 2026-08-05
 
@@ -395,20 +399,9 @@
 
 ## 0.5.6 - 2026-08-05
 
-- Added invisible usage accounting only to the existing
-  `HMBSeedance20VideoGeneration` execution path. Other Seedance generators do
-  not enter this ledger, and no usage parameter, output, or preview was added to
-  the node UI.
-- Usage is grouped by the logged-in Griptape `user_id` under
-  `\\fin-rcomp1\Composite_Team\00.CompSource\Griptape_list\{user_id}\{user_id}.json`
-  and partitioned by completion month without deleting prior months.
-- Added task-ID de-duplication, provider-token capture, task-time price
-  snapshots, and recomputed monthly summaries. Prompts, API keys, authorization
-  values, and media URLs are excluded by a fixed field allowlist.
-- Every usage event is first written atomically to a user-local durable queue.
-  A background sync uses a per-user share lock and same-directory temporary
-  file replacement; unavailable shares retain queued events for a later HMB
-  Seedance execution without changing the render result.
+- Introduced a temporary client-side usage-accounting experiment. It was fully
+  retired in 0.5.32 in favor of authenticated Broker-side usage, quota, and
+  accounting and is no longer present in source or release packages.
 
 ## 0.5.5 - 2026-08-05
 

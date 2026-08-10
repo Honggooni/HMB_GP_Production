@@ -48,6 +48,29 @@ COMMON_TOKEN_PATTERNS = (
     re.compile(rb"gh[opsu]_[A-Za-z0-9]{30,}"),
     re.compile(rb"sk-[A-Za-z0-9_-]{20,}"),
 )
+RETIRED_SHARE_MARKER = b"".join((b"00", b".", b"CompSource"))
+RETIRED_USAGE_SYMBOLS = (
+    "USAGE_LEDGER_ROOT",
+    "USAGE_LOCAL_QUEUE_ROOT",
+    "_prepare_usage_tracking",
+    "_record_usage_task",
+    "_record_current_usage_status",
+)
+RETIRED_DIRECT_PROVIDER_SYMBOLS = (
+    "ARK_API_KEY_SECRET",
+    "ARK_BASE_URL",
+    "CREATE_TASK_PATH",
+    "_process_direct_generation_impl",
+    "_refresh_direct_async",
+)
+
+for candidate in ROOT.rglob("*"):
+    if not candidate.is_file() or any(
+        part.casefold() in {".git", ".venv", "dist", "__pycache__", ".pytest_cache"}
+        for part in candidate.parts
+    ):
+        continue
+    assert RETIRED_SHARE_MARKER not in candidate.read_bytes(), candidate
 
 
 # GitHub and GitHub Releases are the permanent team distribution channel.
@@ -83,7 +106,7 @@ common_spec.loader.exec_module(common)
 manifest = json.loads(
     (ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8")
 )
-assert manifest["metadata"]["library_version"] == "0.5.31"
+assert manifest["metadata"]["library_version"] == "0.5.32"
 registered_secrets = manifest["settings"][0]["contents"]["secrets_to_register"]
 assert set(registered_secrets) == EXPECTED_SECRET_NAMES
 assert all(value == "" for value in registered_secrets.values())
@@ -108,6 +131,9 @@ assert not (ROOT / "HMBSeedance20VideoGeneration.py").exists()
 seedance_source = (ROOT / "HMBSeedanceGeneration.py").read_text(
     encoding="utf-8"
 )
+assert RETIRED_SHARE_MARKER not in seedance_source.encode("utf-8")
+assert all(symbol not in seedance_source for symbol in RETIRED_USAGE_SYMBOLS)
+assert all(symbol not in seedance_source for symbol in RETIRED_DIRECT_PROVIDER_SYMBOLS)
 seedance_tree = ast.parse(seedance_source, filename="HMBSeedanceGeneration.py")
 seedance_class = next(
     node
@@ -448,7 +474,7 @@ if all(output_presence):
         "signing_key_id": POLICY_SIGNING_KEY_ID,
         "validated": True,
     }
-    assert release_manifest["release_version"] == "0.5.31"
+    assert release_manifest["release_version"] == "0.5.32"
     assert release_manifest["policy_version"] == POLICY_VERSION
     assert release_manifest["contract_sha256"] == POLICY_CONTRACT_SHA256
     source_files = {
@@ -496,6 +522,11 @@ if all(output_presence):
             )
             assert not re.search(r"(^|/)(?:id_rsa|id_ed25519)[^/]*$", lowered)
             content = archive.read(info)
+            relative = info.filename.removeprefix("HMB_GP_Production/")
+            assert content == (ROOT / Path(relative)).read_bytes(), (
+                f"Archive member is stale: {relative}"
+            )
+            assert RETIRED_SHARE_MARKER not in content
             assert PRIVATE_KEY_HEADER.search(content) is None
             assert not any(pattern.search(content) for pattern in COMMON_TOKEN_PATTERNS)
             assert not any(secret in content for secret in configured_secret_values)
