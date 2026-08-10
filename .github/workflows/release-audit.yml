@@ -36,6 +36,11 @@ jobs:
           $tracked = @(git ls-files)
           $retiredShareMarker = "00" + "." + "CompSource"
           $retiredShareMatches = @(git grep -n -I -F $retiredShareMarker -- .)
+          $retiredShareExitCode = $LASTEXITCODE
+          if ($retiredShareExitCode -gt 1) {
+            throw "Retired-share scan failed with git exit code $retiredShareExitCode."
+          }
+          $global:LASTEXITCODE = 0
           if ($retiredShareMatches.Count -ne 0) {
             throw "Retired Composite Team source-share references remain: $($retiredShareMatches -join ', ')"
           }
