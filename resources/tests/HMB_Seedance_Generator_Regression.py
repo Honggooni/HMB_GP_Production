@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import http.server
 import io
 import importlib.util
 import json
+import os
+import socket
 import sys
 import tempfile
 import threading
@@ -1720,6 +1723,443 @@ def assert_refresh_during_submission_contract() -> None:
     ]
 
 
+def assert_broker_direct_transport_resilience_contract() -> None:
+    assert target.AI_BROKER_DEVICE_START_BACKOFF_SECONDS == (0.0, 0.5, 1.5)
+    assert target.AI_BROKER_DEVICE_AUTH_TIMEOUT_SECONDS == 5 * 60
+    assert target.AI_BROKER_DEVICE_POLL_MAX_CONSECUTIVE_TRANSPORT_ERRORS == 3
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    assert "urllib.request.install_opener" not in source
+
+    class CountingOriginHandler(http.server.BaseHTTPRequestHandler):
+        request_count = 0
+
+        def do_GET(self) -> None:
+            type(self).request_count += 1
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+
+        def log_message(self, _format: str, *_args) -> None:
+            return None
+
+    class CountingProxyHandler(http.server.BaseHTTPRequestHandler):
+        request_count = 0
+
+        def do_GET(self) -> None:
+            type(self).request_count += 1
+            self.send_response(502)
+            self.end_headers()
+
+        def log_message(self, _format: str, *_args) -> None:
+            return None
+
+    origin_server = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), CountingOriginHandler
+    )
+    proxy_server = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), CountingProxyHandler
+    )
+    origin_thread = threading.Thread(target=origin_server.serve_forever, daemon=True)
+    proxy_thread = threading.Thread(target=proxy_server.serve_forever, daemon=True)
+    origin_thread.start()
+    proxy_thread.start()
+    try:
+        proxy_url = f"http://127.0.0.1:{proxy_server.server_port}"
+        direct_host = "broker-direct-regression.invalid"
+        direct_url = f"http://{direct_host}:{origin_server.server_port}"
+        original_getaddrinfo = socket.getaddrinfo
+
+        def regression_getaddrinfo(host, *args, **kwargs):
+            if host == direct_host:
+                host = "127.0.0.1"
+            return original_getaddrinfo(host, *args, **kwargs)
+
+        proxy_environment = {
+            "HTTP_PROXY": proxy_url,
+            "HTTPS_PROXY": proxy_url,
+            "http_proxy": proxy_url,
+            "https_proxy": proxy_url,
+        }
+        with mock.patch.dict(os.environ, proxy_environment, clear=False):
+            for name in ("NO_PROXY", "no_proxy"):
+                os.environ.pop(name, None)
+            assert target.urllib.request.getproxies()["http"] == proxy_url
+            with mock.patch.object(
+                target.urllib.request,
+                "build_opener",
+                wraps=target.urllib.request.build_opener,
+            ) as build_opener:
+                opener = target._broker_build_opener()
+            handlers = build_opener.call_args.args
+            assert len(handlers) == 2
+            assert isinstance(handlers[0], target.urllib.request.ProxyHandler)
+            assert handlers[0].proxies == {}
+            assert isinstance(handlers[1], target._BrokerNoRedirectHandler)
+            with mock.patch.object(
+                socket, "getaddrinfo", side_effect=regression_getaddrinfo
+            ):
+                with opener.open(direct_url + "/api/health", timeout=2) as response:
+                    assert response.status == 200
+                    assert json.loads(response.read()) == {"status": "ok"}
+        assert CountingOriginHandler.request_count == 1
+        assert CountingProxyHandler.request_count == 0
+    finally:
+        origin_server.shutdown()
+        proxy_server.shutdown()
+        origin_server.server_close()
+        proxy_server.server_close()
+        origin_thread.join(timeout=2)
+        proxy_thread.join(timeout=2)
+
+    class JsonResponse(io.BytesIO):
+        def __init__(self, status: int, payload) -> None:
+            super().__init__(json.dumps(payload).encode("utf-8"))
+            self.status = status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+            return False
+
+    class ScriptedOpener:
+        def __init__(self, events: list) -> None:
+            self.events = list(events)
+            self.requests: list[dict] = []
+
+        def open(self, request, *, timeout: float):
+            assert 0 < timeout <= 10
+            self.requests.append(
+                {
+                    "url": request.full_url,
+                    "body": json.loads(request.data or b"{}"),
+                    "headers": {
+                        key.lower(): value for key, value in request.header_items()
+                    },
+                }
+            )
+            if not self.events:
+                raise AssertionError("Unexpected extra Broker transport request")
+            event = self.events.pop(0)
+            if isinstance(event, BaseException):
+                raise event
+            status, payload = event
+            return JsonResponse(status, payload)
+
+    server_url = target.AI_BROKER_SERVER_URL
+
+    def start_payload(code: str, secret: str) -> dict:
+        return {
+            "device_code": code,
+            "device_secret": secret,
+            "verification_url": server_url + "/?device=" + code,
+        }
+
+    retry_code = "device-code-start-retry"
+    retry_secret = "device-secret-start-retry-canary"
+    retry_opener = ScriptedOpener(
+        [
+            TimeoutError("start-secret-canary"),
+            target.urllib.error.URLError(OSError(10060, "proxy-secret-canary")),
+            (201, start_payload(retry_code, retry_secret)),
+            (200, {"access_token": "permanent-token-after-start-retry"}),
+        ]
+    )
+    with mock.patch.object(
+        target, "_broker_build_opener", return_value=retry_opener
+    ) as opener_factory, mock.patch.object(
+        target.webbrowser, "open", return_value=True
+    ) as retry_browser, mock.patch.object(
+        target, "_broker_save_token"
+    ) as retry_save, mock.patch.object(
+        target.time, "sleep"
+    ) as retry_sleep, mock.patch.object(target.logger, "warning"):
+        assert target._broker_device_login() == {"status": "connected"}
+    opener_factory.assert_called_once_with()
+    assert [request["url"] for request in retry_opener.requests].count(
+        server_url + "/api/device/start"
+    ) == 3
+    assert [request["url"] for request in retry_opener.requests].count(
+        server_url + "/api/device/token"
+    ) == 1
+    assert retry_sleep.call_args_list == [mock.call(0.5), mock.call(1.5)]
+    retry_browser.assert_called_once_with(
+        server_url + "/?device=" + retry_code,
+        new=2,
+        autoraise=True,
+    )
+    retry_save.assert_called_once_with("permanent-token-after-start-retry")
+
+    poll_code = "device-code-poll-recovery"
+    poll_secret = "device-secret-poll-recovery-canary"
+    poll_opener = ScriptedOpener(
+        [
+            (201, start_payload(poll_code, poll_secret)),
+            target.urllib.error.URLError(OSError(10054, "poll-secret-one")),
+            OSError(10060, "poll-secret-two"),
+            (202, {"status": "pending"}),
+            (200, {"access_token": "permanent-token-after-poll-recovery"}),
+        ]
+    )
+    with mock.patch.object(
+        target.webbrowser, "open", return_value=True
+    ) as poll_browser, mock.patch.object(
+        target, "_broker_save_token"
+    ) as poll_save, mock.patch.object(
+        target.time, "sleep"
+    ) as poll_sleep, mock.patch.object(target.logger, "warning"):
+        assert target._broker_device_login(opener=poll_opener) == {
+            "status": "connected"
+        }
+    start_requests = [
+        request
+        for request in poll_opener.requests
+        if request["url"].endswith("/api/device/start")
+    ]
+    token_requests = [
+        request
+        for request in poll_opener.requests
+        if request["url"].endswith("/api/device/token")
+    ]
+    assert len(start_requests) == 1
+    assert len(token_requests) == 4
+    assert all(
+        request["body"]
+        == {"device_code": poll_code, "device_secret": poll_secret}
+        for request in token_requests
+    )
+    assert all("/api/v1/generate/" not in request["url"] for request in poll_opener.requests)
+    assert poll_sleep.call_count == 3
+    poll_browser.assert_called_once_with(
+        server_url + "/?device=" + poll_code,
+        new=2,
+        autoraise=True,
+    )
+    poll_save.assert_called_once_with("permanent-token-after-poll-recovery")
+
+    failed_poll_code = "device-code-bounded-poll"
+    failed_poll_secret = "device-secret-bounded-poll-canary"
+    failed_poll_opener = ScriptedOpener(
+        [
+            (201, start_payload(failed_poll_code, failed_poll_secret)),
+            TimeoutError("poll-failure-one"),
+            target.urllib.error.URLError(OSError(10054, "poll-failure-two")),
+            OSError(10060, "poll-failure-three"),
+        ]
+    )
+    with mock.patch.object(
+        target.webbrowser, "open", return_value=True
+    ) as failed_poll_browser, mock.patch.object(
+        target, "_broker_save_token"
+    ) as failed_poll_save, mock.patch.object(
+        target.time, "sleep"
+    ), mock.patch.object(target.logger, "warning"):
+        failed_at = time.monotonic()
+        try:
+            target._broker_device_login(opener=failed_poll_opener)
+        except target._BrokerUnavailableError as exc:
+            assert "polling was interrupted" in str(exc)
+        else:
+            raise AssertionError("Unbounded device-token polling was accepted")
+        assert time.monotonic() - failed_at < 1.0
+    assert len(failed_poll_opener.requests) == 4
+    assert sum(
+        request["url"].endswith("/api/device/start")
+        for request in failed_poll_opener.requests
+    ) == 1
+    assert sum(
+        request["url"].endswith("/api/device/token")
+        for request in failed_poll_opener.requests
+    ) == target.AI_BROKER_DEVICE_POLL_MAX_CONSECUTIVE_TRANSPORT_ERRORS
+    failed_poll_browser.assert_called_once()
+    failed_poll_save.assert_not_called()
+
+    failed_start_opener = ScriptedOpener(
+        [
+            TimeoutError("bounded-start-one"),
+            target.urllib.error.URLError(OSError(10060, "bounded-start-two")),
+            OSError(10013, "bounded-start-three"),
+        ]
+    )
+    with mock.patch.object(
+        target.webbrowser,
+        "open",
+        side_effect=AssertionError("Failed start opened a browser"),
+    ), mock.patch.object(target.time, "sleep") as failed_start_sleep, mock.patch.object(
+        target.logger, "warning"
+    ):
+        try:
+            target._broker_device_login(opener=failed_start_opener)
+        except target._BrokerUnavailableError as exc:
+            assert "authorization service is unavailable" in str(exc)
+        else:
+            raise AssertionError("Unbounded device-start retry was accepted")
+    assert len(failed_start_opener.requests) == len(
+        target.AI_BROKER_DEVICE_START_BACKOFF_SECONDS
+    )
+    assert all(
+        request["url"].endswith("/api/device/start")
+        for request in failed_start_opener.requests
+    )
+    assert failed_start_sleep.call_args_list == [mock.call(0.5), mock.call(1.5)]
+
+    http_error = target.urllib.error.HTTPError(
+        server_url + "/api/device/start",
+        503,
+        "Service Unavailable",
+        {},
+        io.BytesIO(b'{"device_secret":"must-not-be-retried"}'),
+    )
+    http_error_opener = ScriptedOpener([http_error])
+    with mock.patch.object(
+        target.webbrowser,
+        "open",
+        side_effect=AssertionError("HTTP failure opened a browser"),
+    ), mock.patch.object(target.time, "sleep") as http_error_sleep:
+        try:
+            target._broker_device_login(opener=http_error_opener)
+        except target._BrokerAuthenticationError as exc:
+            assert exc.status_code == 503
+        else:
+            raise AssertionError("Device-start HTTP error was retried")
+    assert len(http_error_opener.requests) == 1
+    http_error_sleep.assert_not_called()
+
+    invalid_opener = ScriptedOpener([(201, ["not", "a", "mapping"])])
+    with mock.patch.object(
+        target.webbrowser,
+        "open",
+        side_effect=AssertionError("Invalid response opened a browser"),
+    ), mock.patch.object(target.time, "sleep") as invalid_sleep:
+        try:
+            target._broker_device_login(opener=invalid_opener)
+        except target._BrokerProtocolError:
+            pass
+        else:
+            raise AssertionError("Invalid device-start response was retried")
+    assert len(invalid_opener.requests) == 1
+    invalid_sleep.assert_not_called()
+
+    persisted_token = "persisted-dpapi-token-canary"
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        appdata_root = Path(temporary_directory)
+        token_path = appdata_root / "FNAIBroker" / "access_token_v2.dpapi"
+        token_path.parent.mkdir(parents=True)
+        token_path.write_bytes(b"encrypted-dpapi-token")
+        persisted_opener = ScriptedOpener(
+            [(200, {"display_name": "Persisted Token Artist"})]
+        )
+        with mock.patch.dict(
+            target.os.environ, {"APPDATA": str(appdata_root)}, clear=False
+        ), mock.patch.object(
+            target, "_broker_dpapi", return_value=persisted_token.encode("utf-8")
+        ), mock.patch.object(
+            target,
+            "_broker_device_login",
+            side_effect=AssertionError("Valid DPAPI token started device login"),
+        ) as persisted_device_login, mock.patch.object(
+            target.webbrowser,
+            "open",
+            side_effect=AssertionError("Valid DPAPI token opened a browser"),
+        ) as persisted_browser, mock.patch.object(
+            target, "_broker_clear_token"
+        ) as clear_token:
+            persisted_bridge = target._HMBAIBrokerBridge(opener=persisted_opener)
+            persisted_snapshot = persisted_bridge.account_snapshot(connect=True)
+            assert target._broker_token_path() == token_path
+        assert persisted_snapshot == target._BrokerAccountSnapshot(
+            state="connected",
+            connected=True,
+            account="Persisted Token Artist",
+        )
+        assert len(persisted_opener.requests) == 1
+        assert persisted_opener.requests[0]["url"] == server_url + "/api/me"
+        assert persisted_opener.requests[0]["headers"]["authorization"] == (
+            "Bearer " + persisted_token
+        )
+        persisted_device_login.assert_not_called()
+        persisted_browser.assert_not_called()
+        clear_token.assert_not_called()
+        assert token_path.read_bytes() == b"encrypted-dpapi-token"
+
+        transport_failure_opener = ScriptedOpener(
+            [target.urllib.error.URLError(OSError(10054, "token-must-survive"))]
+        )
+        with mock.patch.dict(
+            target.os.environ, {"APPDATA": str(appdata_root)}, clear=False
+        ), mock.patch.object(
+            target, "_broker_dpapi", return_value=persisted_token.encode("utf-8")
+        ), mock.patch.object(
+            target, "_broker_clear_token"
+        ) as transport_clear, mock.patch.object(
+            target,
+            "_broker_device_login",
+            side_effect=AssertionError("Transport failure forced device login"),
+        ) as transport_device_login, mock.patch.object(
+            target.webbrowser,
+            "open",
+            side_effect=AssertionError("Transport failure opened a browser"),
+        ) as transport_browser, mock.patch.object(target.logger, "warning"):
+            transport_bridge = target._HMBAIBrokerBridge(
+                opener=transport_failure_opener
+            )
+            try:
+                transport_bridge.account_snapshot(connect=True)
+            except target._BrokerUnavailableError:
+                pass
+            else:
+                raise AssertionError("Broker transport failure was accepted")
+        transport_clear.assert_not_called()
+        transport_device_login.assert_not_called()
+        transport_browser.assert_not_called()
+        assert token_path.read_bytes() == b"encrypted-dpapi-token"
+
+    sentinel_opener = object()
+    with mock.patch.object(
+        target, "_broker_build_opener", return_value=sentinel_opener
+    ) as bridge_factory:
+        default_bridge = target._HMBAIBrokerBridge()
+    bridge_factory.assert_called_once_with()
+    assert default_bridge._opener is sentinel_opener
+
+    sensitive_reason = OSError(13, "device-secret-and-proxy-password-canary")
+    sensitive_reason.winerror = 10013
+    sensitive_error = target.urllib.error.URLError(sensitive_reason)
+    with mock.patch.object(target.logger, "warning") as safe_warning:
+        target._broker_log_transport_error(
+            stage="device_token_poll",
+            attempt=2,
+            exc=sensitive_error,
+            server_url=(
+                "http://proxy-user:proxy-password-canary@192.168.203.245:8080"
+            ),
+        )
+    safe_warning.assert_called_once()
+    log_format, *log_values = safe_warning.call_args.args
+    rendered_log = log_format % tuple(log_values)
+    assert "stage=device_token_poll" in rendered_log
+    assert "attempt=2" in rendered_log
+    assert "exception=URLError" in rendered_log
+    assert f"reason={type(sensitive_reason).__name__}" in rendered_log
+    assert "errno=13" in rendered_log
+    assert "winerror=10013" in rendered_log
+    assert "host=192.168.203.245" in rendered_log
+    assert "port=8080" in rendered_log
+    for sensitive_value in (
+        "device-secret-and-proxy-password-canary",
+        "proxy-user",
+        "proxy-password-canary",
+        persisted_token,
+        retry_secret,
+        poll_secret,
+        failed_poll_secret,
+        "Authorization",
+    ):
+        assert sensitive_value not in rendered_log
+
+
 def assert_broker_account_and_button_contract() -> None:
     assert target.AI_BROKER_SERVER_URL == "http://192.168.203.245:8080"
     assert target._broker_validated_server_url() == target.AI_BROKER_SERVER_URL
@@ -2741,6 +3181,7 @@ assert_secret_manager_contract()
 assert_payload_and_media_contract()
 assert_broker_generation_contract()
 assert_refresh_during_submission_contract()
+assert_broker_direct_transport_resilience_contract()
 assert_broker_account_and_button_contract()
 assert_scripted_success_flow()
 assert_indexed_output_macro_contract()

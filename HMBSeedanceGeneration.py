@@ -70,6 +70,8 @@ AI_BROKER_SERVER_URL = os.environ.get(
 AI_BROKER_MAX_JSON_BYTES = 16 * 1024 * 1024
 AI_BROKER_DEVICE_AUTH_TIMEOUT_SECONDS = 5 * 60
 AI_BROKER_DEVICE_POLL_SECONDS = 2.0
+AI_BROKER_DEVICE_START_BACKOFF_SECONDS = (0.0, 0.5, 1.5)
+AI_BROKER_DEVICE_POLL_MAX_CONSECUTIVE_TRANSPORT_ERRORS = 3
 
 # Stable persistence identifier for existing usage ledgers and saved workflows.
 # The public file, implementation class, and palette label are version-neutral.
@@ -286,6 +288,59 @@ class _BrokerNoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _broker_build_opener() -> Any:
+    """Build a Broker-only opener that never inherits machine proxy settings."""
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _BrokerNoRedirectHandler(),
+    )
+
+
+def _broker_log_transport_error(
+    *,
+    stage: str,
+    attempt: int,
+    exc: BaseException,
+    server_url: str,
+) -> None:
+    """Log transport diagnostics without values that can contain credentials."""
+    parsed = urlparse(server_url)
+    host = re.sub(r"[^A-Za-z0-9.:-]", "?", parsed.hostname or "")[:253]
+    try:
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    except ValueError:
+        port = 0
+
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else None
+
+    def _error_number(value: Any) -> int | None:
+        return (
+            value
+            if isinstance(value, int) and not isinstance(value, bool)
+            else None
+        )
+
+    errno_value = _error_number(getattr(reason, "errno", None))
+    if errno_value is None:
+        errno_value = _error_number(getattr(exc, "errno", None))
+    winerror_value = _error_number(getattr(reason, "winerror", None))
+    if winerror_value is None:
+        winerror_value = _error_number(getattr(exc, "winerror", None))
+
+    logger.warning(
+        "FN AI Broker transport failure stage=%s attempt=%d "
+        "exception=%s reason=%s errno=%s winerror=%s host=%s port=%d",
+        stage,
+        attempt,
+        type(exc).__name__,
+        type(reason).__name__ if reason is not None else "none",
+        errno_value,
+        winerror_value,
+        host,
+        port,
+    )
+
+
 def _broker_validated_server_url() -> str:
     parsed = urlparse(AI_BROKER_SERVER_URL)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -413,32 +468,47 @@ def _broker_same_origin(url: str, origin_url: str) -> bool:
 def _broker_device_login(*, opener: Any | None = None) -> dict[str, Any]:
     """Authorize this Windows account once and persist the resulting Broker token."""
     server_url = _broker_validated_server_url()
-    request_opener = opener or urllib.request.build_opener(
-        _BrokerNoRedirectHandler()
-    )
+    request_opener = opener if opener is not None else _broker_build_opener()
 
-    start_request = urllib.request.Request(
-        server_url + "/api/device/start",
-        data=b"{}",
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
-    try:
-        with request_opener.open(start_request, timeout=10) as response:
-            start_result = _broker_read_json(
-                response, max_bytes=2 * 1024 * 1024
+    for start_attempt, backoff_seconds in enumerate(
+        AI_BROKER_DEVICE_START_BACKOFF_SECONDS,
+        start=1,
+    ):
+        if backoff_seconds:
+            time.sleep(backoff_seconds)
+        start_request = urllib.request.Request(
+            server_url + "/api/device/start",
+            data=b"{}",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with request_opener.open(start_request, timeout=10) as response:
+                start_result = _broker_read_json(
+                    response, max_bytes=2 * 1024 * 1024
+                )
+            break
+        except urllib.error.HTTPError as exc:
+            raise _BrokerAuthenticationError(
+                "FN AI Broker device authorization could not be started.",
+                status_code=exc.code,
+            ) from exc
+        except _BrokerError:
+            raise
+        except (TimeoutError, urllib.error.URLError, OSError) as exc:
+            _broker_log_transport_error(
+                stage="device_start",
+                attempt=start_attempt,
+                exc=exc,
+                server_url=server_url,
             )
-    except urllib.error.HTTPError as exc:
-        raise _BrokerAuthenticationError(
-            "FN AI Broker device authorization could not be started.",
-            status_code=exc.code,
-        ) from exc
-    except _BrokerError:
-        raise
-    except (TimeoutError, urllib.error.URLError, OSError) as exc:
-        raise _BrokerUnavailableError(
-            "FN AI Broker device authorization service is unavailable."
-        ) from exc
+            if start_attempt == len(AI_BROKER_DEVICE_START_BACKOFF_SECONDS):
+                raise _BrokerUnavailableError(
+                    "FN AI Broker device authorization service is unavailable."
+                ) from exc
 
     if not isinstance(start_result, dict):
         raise _BrokerProtocolError(
@@ -472,7 +542,11 @@ def _broker_device_login(*, opener: Any | None = None) -> dict[str, Any]:
         separators=(",", ":"),
     ).encode("utf-8")
     deadline = time.monotonic() + AI_BROKER_DEVICE_AUTH_TIMEOUT_SECONDS
+    consecutive_transport_errors = 0
     while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         token_request = urllib.request.Request(
             server_url + "/api/device/token",
             data=token_payload,
@@ -483,7 +557,10 @@ def _broker_device_login(*, opener: Any | None = None) -> dict[str, Any]:
             method="POST",
         )
         try:
-            with request_opener.open(token_request, timeout=10) as response:
+            with request_opener.open(
+                token_request,
+                timeout=min(10.0, remaining),
+            ) as response:
                 token_result = _broker_read_json(
                     response, max_bytes=2 * 1024 * 1024
                 )
@@ -501,10 +578,26 @@ def _broker_device_login(*, opener: Any | None = None) -> dict[str, Any]:
         except _BrokerError:
             raise
         except (TimeoutError, urllib.error.URLError, OSError) as exc:
-            raise _BrokerUnavailableError(
-                "FN AI Broker authorization polling was interrupted."
-            ) from exc
+            consecutive_transport_errors += 1
+            _broker_log_transport_error(
+                stage="device_token_poll",
+                attempt=consecutive_transport_errors,
+                exc=exc,
+                server_url=server_url,
+            )
+            if (
+                consecutive_transport_errors
+                >= AI_BROKER_DEVICE_POLL_MAX_CONSECUTIVE_TRANSPORT_ERRORS
+            ):
+                raise _BrokerUnavailableError(
+                    "FN AI Broker authorization polling was interrupted."
+                ) from exc
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(AI_BROKER_DEVICE_POLL_SECONDS, remaining))
+            continue
 
+        consecutive_transport_errors = 0
         if not isinstance(token_result, dict):
             raise _BrokerProtocolError(
                 "FN AI Broker device token response was invalid."
@@ -590,9 +683,7 @@ class _HMBAIBrokerBridge:
         | _REFERENCE_MODE_FIELDS,
     }
     def __init__(self, *, opener: Any | None = None) -> None:
-        self._opener = opener or urllib.request.build_opener(
-            _BrokerNoRedirectHandler()
-        )
+        self._opener = opener if opener is not None else _broker_build_opener()
 
     @property
     def server_url(self) -> str:
@@ -764,6 +855,12 @@ class _HMBAIBrokerBridge:
         except _BrokerError:
             raise
         except (TimeoutError, urllib.error.URLError, OSError) as exc:
+            _broker_log_transport_error(
+                stage="broker_submission" if submission else "broker_request",
+                attempt=1,
+                exc=exc,
+                server_url=self.server_url,
+            )
             raise _BrokerUnavailableError(
                 "FN AI Broker did not respond.",
                 submission_outcome_unknown=submission,
@@ -897,6 +994,12 @@ class _HMBAIBrokerBridge:
                 status_code=exc.code,
             ) from exc
         except (TimeoutError, urllib.error.URLError, OSError) as exc:
+            _broker_log_transport_error(
+                stage="broker_result_download",
+                attempt=1,
+                exc=exc,
+                server_url=self.server_url,
+            )
             raise _BrokerUnavailableError(
                 "FN AI Broker result download failed."
             ) from exc

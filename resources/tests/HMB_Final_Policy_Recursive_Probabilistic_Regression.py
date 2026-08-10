@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.5.30"
+EXPECTED_RELEASE_VERSION = "0.5.31"
 EXPECTED_POLICY_VERSION = "2026-08-06.animation-look-continuity.v3"
 EXPECTED_CONTRACT_SHA256 = "ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93"
 BASE_MASTER_SEEDS = (

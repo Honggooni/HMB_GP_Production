@@ -57,7 +57,7 @@ jobs:
             throw "Bundled Agent policy SHA-256 mismatch."
           }
       - name: Install pinned direct dependencies
-        run: python -m pip install "Pillow==12.3.0" "imageio-ffmpeg==0.6.0" "httpx==0.28.1" "tos==2.9.2"
+        run: python -m pip install "cryptography==50.0.0" "Pillow==12.3.0" "imageio-ffmpeg==0.6.0" "httpx==0.28.1" "tos==2.9.2"
       - name: Python release regressions
         shell: pwsh
         env:
