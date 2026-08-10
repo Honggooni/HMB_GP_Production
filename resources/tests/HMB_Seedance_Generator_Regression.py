@@ -1657,9 +1657,29 @@ def assert_broker_generation_contract() -> None:
     assert retry_bridge.generate_payloads == [retry_payload]
     assert retry_node.parameter_output_values["generation_id"] == stable_request_id
     assert retry_node.parameter_output_values["generation_status"] == "queued"
+    assert retry_node.parameter_output_values["was_successful"] is False
+    assert retry_node._execution_succeeded is None
+    assert "display_name" not in (
+        retry_node.status_component.get_parameter_group().ui_options
+    )
     assert "never starts a duplicate render" in retry_node.parameter_output_values[
         "result_details"
     ]
+
+    failed_bridge = FakeBrokerBridge(
+        [{"status": "failed", "job_id": "broker-refresh-failed-4"}]
+    )
+    failed_refresh = BrokerScriptedNode(failed_bridge)
+    failed_refresh.parameter_output_values["generation_id"] = (
+        "broker-refresh-failed-4"
+    )
+    asyncio.run(failed_refresh._refresh_async())
+    assert failed_refresh.parameter_output_values["generation_status"] == "failed"
+    assert failed_refresh.parameter_output_values["was_successful"] is False
+    assert failed_refresh._execution_succeeded is False
+    assert "display_name" in (
+        failed_refresh.status_component.get_parameter_group().ui_options
+    )
 
 
 def assert_refresh_during_submission_contract() -> None:
