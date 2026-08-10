@@ -3941,14 +3941,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     ),
                 )
                 return
-            self._set_status_results(
-                was_successful=False,
-                result_details=(
+            self.status_component.clear_execution_status(
+                initial_message=(
                     f"FN AI Broker task {generation_id} is still {status} on the "
                     "server. Rendering continues even if this node disconnects. "
                     "Refresh / Retrieve Result checks this same job only and never "
                     "starts a duplicate render."
-                ),
+                )
             )
         except Exception as exc:
             safe_detail = (

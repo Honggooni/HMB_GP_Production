@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.30 - 2026-08-10
+
+- Display FN AI Broker `queued` and `running` refresh results as neutral
+  in-progress status instead of a false warning, while preserving warnings for
+  actual terminal failures and connection errors.
+
 ## 0.5.29 - 2026-08-09
 
 - Established GitHub and GitHub Releases as the permanent public team
