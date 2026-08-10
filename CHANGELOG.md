@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.33 - 2026-08-11
+
+- Restored the established team rollout contract: approved changes reach the
+  public GitHub `main` branch, and team members apply them with Griptape's
+  Git-backed Library Update button.
+- Bumped the library version so existing Git installations can discover this
+  update, and documented that the registered Library must retain `.git`, its
+  GitHub `origin`, and the `main` tracking branch.
+- Retired ZIP replacement, copied-folder, network-drive, and SMB rollout as
+  installation paths. Generated archives remain bounded CI validation outputs,
+  are not installation packages, and must not replace a registered Git Library.
+
 ## 0.5.32 - 2026-08-10
 
 - Removed the retired client-side Seedance usage ledger, its local retry queue,

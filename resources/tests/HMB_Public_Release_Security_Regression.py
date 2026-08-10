@@ -73,15 +73,19 @@ for candidate in ROOT.rglob("*"):
     assert RETIRED_SHARE_MARKER not in candidate.read_bytes(), candidate
 
 
-# GitHub and GitHub Releases are the permanent team distribution channel.
-# Visibility must never be used in place of removing secrets from the source.
+# GitHub main and Griptape's Git-backed updater are the permanent team rollout
+# channel. Visibility must never replace removing secrets from the source.
 readme_text = (ROOT / "README.md").read_text(encoding="utf-8")
 security_text = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
-assert "Public team distribution repository" in readme_text
-assert "Keep this repository and its GitHub" in readme_text
-assert "Releases public" in readme_text
-assert "Public 팀 배포 저장소" in security_text
-assert "GitHub Release는 Public을" in security_text
+assert "Public team Git repository" in readme_text
+assert "Git-backed Library updater" in readme_text
+assert "Do not replace the registered library directory" in readme_text
+assert "https://github.com/Honggooni/HMB_GP_Production.git" in readme_text
+assert "GitHub" in security_text
+assert "`main`" in security_text
+assert "Griptape Library" in security_text
+assert "Update" in security_text
+assert "CI" in security_text
 for forbidden_visibility_policy in (
     "Private repository only",
     "반드시\n**Private**",
@@ -106,7 +110,7 @@ common_spec.loader.exec_module(common)
 manifest = json.loads(
     (ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8")
 )
-assert manifest["metadata"]["library_version"] == "0.5.32"
+assert manifest["metadata"]["library_version"] == "0.5.33"
 registered_secrets = manifest["settings"][0]["contents"]["secrets_to_register"]
 assert set(registered_secrets) == EXPECTED_SECRET_NAMES
 assert all(value == "" for value in registered_secrets.values())
@@ -474,7 +478,7 @@ if all(output_presence):
         "signing_key_id": POLICY_SIGNING_KEY_ID,
         "validated": True,
     }
-    assert release_manifest["release_version"] == "0.5.32"
+    assert release_manifest["release_version"] == "0.5.33"
     assert release_manifest["policy_version"] == POLICY_VERSION
     assert release_manifest["contract_sha256"] == POLICY_CONTRACT_SHA256
     source_files = {
