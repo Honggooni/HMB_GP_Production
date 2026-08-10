@@ -83,7 +83,7 @@ common_spec.loader.exec_module(common)
 manifest = json.loads(
     (ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8")
 )
-assert manifest["metadata"]["library_version"] == "0.5.30"
+assert manifest["metadata"]["library_version"] == "0.5.31"
 registered_secrets = manifest["settings"][0]["contents"]["secrets_to_register"]
 assert set(registered_secrets) == EXPECTED_SECRET_NAMES
 assert all(value == "" for value in registered_secrets.values())
@@ -166,14 +166,169 @@ module_functions = {
     for node in seedance_tree.body
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
 }
+module_assignments = {
+    node.targets[0].id: node.value
+    for node in seedance_tree.body
+    if (
+        isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+    )
+}
+
+# Public CI cannot import the Griptape-hosted generator, so keep the Broker
+# transport boundary enforceable from its AST. Broker traffic must bypass
+# machine proxy discovery locally; no global opener or environment mutation is
+# permitted, and non-Broker internet clients remain untouched.
+opener_factory = module_functions["_broker_build_opener"]
+opener_factory_source = (
+    ast.get_source_segment(seedance_source, opener_factory) or ""
+)
+assert "os.environ" not in opener_factory_source
+assert "getproxies" not in opener_factory_source
+build_opener_calls = [
+    node
+    for node in ast.walk(seedance_tree)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "build_opener"
+    )
+]
+assert len(build_opener_calls) == 1
+assert (
+    opener_factory.lineno
+    <= build_opener_calls[0].lineno
+    <= opener_factory.end_lineno
+)
+proxy_handlers = [
+    argument
+    for argument in build_opener_calls[0].args
+    if (
+        isinstance(argument, ast.Call)
+        and isinstance(argument.func, ast.Attribute)
+        and argument.func.attr == "ProxyHandler"
+    )
+]
+assert len(proxy_handlers) == 1
+assert len(proxy_handlers[0].args) == 1
+assert isinstance(proxy_handlers[0].args[0], ast.Dict)
+assert proxy_handlers[0].args[0].keys == []
+assert proxy_handlers[0].args[0].values == []
+assert any(
+    isinstance(argument, ast.Call)
+    and isinstance(argument.func, ast.Name)
+    and argument.func.id == "_BrokerNoRedirectHandler"
+    for argument in build_opener_calls[0].args
+)
+assert not any(
+    isinstance(node, ast.Call)
+    and isinstance(node.func, ast.Attribute)
+    and node.func.attr == "install_opener"
+    for node in ast.walk(seedance_tree)
+)
+factory_calls = [
+    node
+    for node in ast.walk(seedance_tree)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_broker_build_opener"
+    )
+]
+assert len(factory_calls) == 2
+
+assert ast.literal_eval(
+    module_assignments["AI_BROKER_DEVICE_START_BACKOFF_SECONDS"]
+) == (0.0, 0.5, 1.5)
+assert ast.literal_eval(
+    module_assignments[
+        "AI_BROKER_DEVICE_POLL_MAX_CONSECUTIVE_TRANSPORT_ERRORS"
+    ]
+) == 3
+
 device_login_source = (
     ast.get_source_segment(seedance_source, module_functions["_broker_device_login"])
     or ""
 )
 for endpoint in ('"/api/device/start"', '"/api/device/token"'):
     assert endpoint in device_login_source
+assert device_login_source.count('server_url + "/api/device/start"') == 1
+assert device_login_source.count("webbrowser.open(") == 1
+assert device_login_source.count("_broker_build_opener()") == 1
+assert "AI_BROKER_DEVICE_START_BACKOFF_SECONDS" in device_login_source
+assert "AI_BROKER_DEVICE_POLL_MAX_CONSECUTIVE_TRANSPORT_ERRORS" in (
+    device_login_source
+)
+assert 'stage="device_start"' in device_login_source
+assert 'stage="device_token_poll"' in device_login_source
+assert "consecutive_transport_errors = 0" in device_login_source
+assert "data=token_payload" in device_login_source
+assert "_broker_clear_token" not in device_login_source
 assert "_broker_same_origin(verification_url, server_url)" in device_login_source
 assert "_broker_save_token(access_token)" in device_login_source
+
+start_retry_loop = next(
+    node
+    for node in module_functions["_broker_device_login"].body
+    if isinstance(node, ast.For)
+    and "AI_BROKER_DEVICE_START_BACKOFF_SECONDS"
+    in (ast.get_source_segment(seedance_source, node) or "")
+)
+assert any(isinstance(node, ast.Break) for node in ast.walk(start_retry_loop))
+browser_open_call = next(
+    node
+    for node in ast.walk(module_functions["_broker_device_login"])
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "open"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "webbrowser"
+    )
+)
+assert browser_open_call.lineno > start_retry_loop.end_lineno
+token_poll_loop = next(
+    node
+    for node in module_functions["_broker_device_login"].body
+    if isinstance(node, ast.While)
+)
+assert browser_open_call.lineno < token_poll_loop.lineno
+
+token_path_source = (
+    ast.get_source_segment(seedance_source, module_functions["_broker_token_path"])
+    or ""
+)
+assert '"FNAIBroker"' in token_path_source
+assert '"access_token_v2.dpapi"' in token_path_source
+
+transport_log_source = (
+    ast.get_source_segment(
+        seedance_source, module_functions["_broker_log_transport_error"]
+    )
+    or ""
+)
+for safe_field in (
+    "stage=%s",
+    "attempt=%d",
+    "exception=%s",
+    "reason=%s",
+    "errno=%s",
+    "winerror=%s",
+    "host=%s",
+    "port=%d",
+):
+    assert safe_field in transport_log_source
+for forbidden_log_value in (
+    "Authorization",
+    "access_token",
+    "device_secret",
+    "response_body",
+    "proxy_password",
+):
+    assert forbidden_log_value not in transport_log_source
+assert "type(exc).__name__" in transport_log_source
+assert "type(reason).__name__" in transport_log_source
 
 broker_class = next(
     node
@@ -185,6 +340,10 @@ broker_methods = {
     for node in broker_class.body
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
 }
+broker_init_source = (
+    ast.get_source_segment(seedance_source, broker_methods["__init__"]) or ""
+)
+assert broker_init_source.count("_broker_build_opener()") == 1
 request_source = ast.get_source_segment(
     seedance_source, broker_methods["_request_json"]
 ) or ""
@@ -195,11 +354,26 @@ account_source = ast.get_source_segment(
     seedance_source, broker_methods["account_snapshot"]
 ) or ""
 assert '"GET", "/api/me"' in account_source
+assert account_source.index('"GET", "/api/me"') < account_source.index(
+    "_broker_device_login()"
+)
+assert request_source.count("_broker_clear_token()") == 1
+assert "if exc.code == 401:" in request_source
+transport_handler_source = next(
+    ast.get_source_segment(seedance_source, handler) or ""
+    for node in ast.walk(broker_methods["_request_json"])
+    if isinstance(node, ast.Try)
+    for handler in node.handlers
+    if "TimeoutError" in (ast.get_source_segment(seedance_source, handler) or "")
+)
+assert "_broker_clear_token" not in transport_handler_source
 generate_source = ast.get_source_segment(
     seedance_source, broker_methods["generate_seedance"]
 ) or ""
 assert '"/api/v1/generate/video"' in generate_source
 assert "idempotency_key=client_request_id" in generate_source
+assert generate_source.count("self._request_json(") == 1
+assert "_broker_device_login" not in generate_source
 refresh_job_source = ast.get_source_segment(
     seedance_source, broker_methods["refresh_job"]
 ) or ""
@@ -274,7 +448,7 @@ if all(output_presence):
         "signing_key_id": POLICY_SIGNING_KEY_ID,
         "validated": True,
     }
-    assert release_manifest["release_version"] == "0.5.30"
+    assert release_manifest["release_version"] == "0.5.31"
     assert release_manifest["policy_version"] == POLICY_VERSION
     assert release_manifest["contract_sha256"] == POLICY_CONTRACT_SHA256
     source_files = {

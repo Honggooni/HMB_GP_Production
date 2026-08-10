@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.31 - 2026-08-10
+
+- Send FN AI Broker requests directly, without inheriting system or environment
+  proxies, while leaving all non-Broker internet traffic unchanged.
+- Retry bounded device-authorization start transport failures and recover
+  transient token-polling failures on the same device request without opening
+  duplicate browser windows or creating duplicate render jobs.
+- Preserve valid per-user DPAPI tokens across transport failures and add
+  credential-safe diagnostics for Broker connection failures.
+
 ## 0.5.30 - 2026-08-10
 
 - Display FN AI Broker `queued` and `running` refresh results as neutral

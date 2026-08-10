@@ -13,7 +13,7 @@ pass the release security audit before it reaches `main`.
 
 ## Agent policy availability
 
-Release `0.5.30` includes exactly one signed production policy at
+Release `0.5.31` includes exactly one signed production policy at
 `resources/agent/hmb_agent_core.dat`. The runtime reads, verifies, and uses only
 this file from the installed library. Team members can install the complete ZIP
 and run the canonical `HMBPromptLibrary -> HMBAgentLibrary` flow without a
