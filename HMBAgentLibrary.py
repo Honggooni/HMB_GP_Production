@@ -85,9 +85,10 @@ _HMB_POLICY_IDENTITY_MISMATCH_MESSAGE = (
     "Griptape를 다시 시작하고 재시도하십시오."
 )
 _HMB_SOURCE_CONTRACT_INVALID_MESSAGE = (
-    "[HMB SOURCE CONTRACT INVALID] FX/Timing 소스의 역할, emitter 지점 또는 "
-    "이미지 Range 프레임 계약이 누락되었거나 일치하지 않아 실행을 중단했습니다. "
-    "HMBPromptLibrary와 HMBVideoPickerLibrary의 선택 상태를 확인하십시오."
+    "[HMB SOURCE CONTRACT INVALID] 구조화된 HMB 소스 데이터의 형식 또는 주소가 "
+    "일치하지 않아 실행을 중단했습니다. Frame Range OFF/미설정, 선택 역할 미지정 "
+    "및 emitter 미지정은 정상적인 선택 상태이며 이 오류의 원인이 아닙니다. "
+    "HMBPromptLibrary와 HMBVideoPickerLibrary의 구조화 데이터 연결 상태를 확인하십시오."
 )
 _FX_TIMING_CONTRACT_HEADER = "FX/TIMING SOURCE DATA (JSON):"
 _FX_TIMING_CONTRACT_SCHEMA = "hmb-fx-timing-source-facts"
@@ -1207,6 +1208,10 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
             and isinstance(domain_end, int)
             and not isinstance(domain_end, bool)
             and domain_start > domain_end
+            and (
+                item.get("valid") is True
+                or "domain_order_invalid" not in item.get("error_codes", [])
+            )
         ):
             raise RuntimeError("HMB frame-range domain order is invalid.")
         if (
@@ -1219,6 +1224,10 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
                 or not isinstance(domain_end, int)
                 or isinstance(domain_end, bool)
                 or domain_count != domain_end - domain_start + 1
+            )
+            and (
+                item.get("valid") is True
+                or "frame_domain_invalid" not in item.get("error_codes", [])
             )
         ):
             raise RuntimeError("HMB frame-range domain count is invalid.")

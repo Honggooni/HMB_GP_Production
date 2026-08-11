@@ -72,6 +72,7 @@ jobs:
             "HMB_Data_Only_Prompt_Security_Regression.py",
             "HMB_Agent_Paired_Prompt_Snapshot_Regression.py",
             "HMB_FX_Timing_Range_Contract_Regression.py",
+            "HMB_Optional_Frame_Range_Contract_Regression.py",
             "HMB_Four_Library_Generator_Neutrality_Regression.py",
             "HMB_State_Normalization_Property_Regression.py",
             "HMB_Image_Asset_Import_Order_Regression.py",

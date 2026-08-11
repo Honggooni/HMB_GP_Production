@@ -3418,6 +3418,10 @@ export function hmbCanAddPromptImageRow(state, images = state?.images) {
   return !Boolean(state?.image_asset?.enabled) && (images || []).length < MAX_IMAGES;
 }
 
+export function hmbCanAddPromptVideoRow(state, videos = state?.videos) {
+  return !Boolean(state?.picker?.enabled) && (videos || []).length < MAX_VIDEOS;
+}
+
 function renderImageAddRow(images, state) {
   const assetLocked = Boolean(state?.image_asset?.enabled);
   const canAdd = hmbCanAddPromptImageRow(state, images);
@@ -3432,7 +3436,7 @@ function renderImageAddRow(images, state) {
 }
 
 function renderVideoAddRow(videos, state) {
-  const canAdd = (videos || []).length < MAX_VIDEOS;
+  const canAdd = hmbCanAddPromptVideoRow(state, videos);
   const label = uiText(state, "add_video_row", "Add video source row");
   return `<div class="source-row video video-add-row" data-kind="video-add"><div></div><div></div><div></div><div></div><div></div><div class="source-status"><div class="source-actions"><button class="add-video-source" ${canAdd ? "" : "disabled"} title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}">+</button></div></div></div>`;
 }
@@ -5280,7 +5284,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
 
     container.querySelectorAll(".add-video-source").forEach((button) => {
       const handler = () => {
-        if ((state.videos || []).length >= MAX_VIDEOS) return;
+        if (!hmbCanAddPromptVideoRow(state)) return;
         const next = defaultVideo((state.videos || []).length + 1);
         next.manual = true;
         state.videos.push(next);

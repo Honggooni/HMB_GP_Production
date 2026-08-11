@@ -35,15 +35,15 @@ after a successful check, the library is already current.
 
 ## Agent policy availability
 
-The `v0.6.20` release includes exactly one
+The `v0.6.21` release includes exactly one
 signed runtime artifact at `resources/agent/hmb_agent_core.dat`. The canonical
 `HMBPromptLibrary -> HMBAgentLibrary` execution reads and verifies only that
 file installed with the Git-backed Library. Environment variables, server
 shares, administrative shares, and retired paths cannot replace it.
 
 The `.dat` remains a signed and compressed integrity artifact; it is not an
-encryption boundary. Each Agent execution obtains one fresh server snapshot
-and verifies the trusted signer, strict envelope and payload schemas, payload
+encryption boundary. Each Agent execution obtains one fresh snapshot of that
+bundled file and verifies the trusted signer, strict envelope and payload schemas, payload
 self-hashes, stable Prompt/Agent contract, signed version syntax, and exact
 Behavior 1/2 four-rule structure. Unsigned, missing, or directly edited files
 fail closed before native Agent/model execution. Canonical English policy and

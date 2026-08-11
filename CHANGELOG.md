@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.21 - 2026-08-12
+
+- Keep Frame Range optional for `FX Reference` and `Timing / Edit Reference`:
+  Range OFF or unset uses the full source, a valid Range ON selection takes
+  temporal priority, and an invalid Range ON selection leaves only that image
+  binding unresolved instead of blocking the Agent run.
+- Clarify the protected Agent error so an absent role, emitter cue, or Frame
+  Range is not described as a required input.
+- Lock the Video Source `+` button while `PICKER_IN` is connected, matching the
+  existing Image Asset connection lock, and restore it immediately on Picker
+  disconnect.
+
 ## 0.6.20 - 2026-08-12
 
 - Preserve the complete `0.5.74` user-facing feature and UI contract while

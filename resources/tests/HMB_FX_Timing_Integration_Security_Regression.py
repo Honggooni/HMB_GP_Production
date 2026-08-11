@@ -25,6 +25,8 @@ for required_signed_semantic in (
     "Discard every visible color and appearance property from that video",
     "Timing / Edit Reference is a separate Main Type and contributes only readable edit and timing cues",
     "valid Range ON segments as their common allowed time boundary",
+    "When Range is OFF and no other valid explicit time scope exists, retain source-local full-shot timing.",
+    "An invalid ON range leaves only the affected typed binding unresolved",
 ):
     assert required_signed_semantic in SEALED_RUNTIME_TEXT
 

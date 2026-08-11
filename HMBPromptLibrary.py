@@ -7102,6 +7102,18 @@ def _public_job_data_contract(
                         "end_frame": end,
                         "error_code": error_code,
                     })
+            # An invalid ON range remains a local unresolved instruction. Keep
+            # its machine record internally self-consistent so Agent can ignore
+            # only this binding instead of turning optional Range metadata into
+            # a generation-wide contract failure. Validation may return early
+            # for a bad manual domain, so segment diagnostics are completed here
+            # from the submitted ranges that the public record actually carries.
+            for unresolved_segment in unresolved_segments:
+                unresolved_code = _clean_string(
+                    unresolved_segment.get("error_code")
+                )
+                if unresolved_code and unresolved_code not in error_codes:
+                    error_codes.append(unresolved_code)
             frame_ranges.append({
                 "image": image_token,
                 "video": f"@video{slot}",

@@ -86,6 +86,54 @@ assert.match(
   "The click path must reject stale or forced clicks while Image Asset is connected.",
 );
 
+const independentVideoAddState = widget.normalizeState({
+  videos: [{ label: "Manual video", present: true, manual: true }],
+  picker: { enabled: false, awaiting_data: false },
+});
+assert.equal(
+  widget.hmbCanAddPromptVideoRow(independentVideoAddState),
+  true,
+  "Prompt-only mode must keep the video + button available.",
+);
+const connectedVideoAddState = widget.normalizeState({
+  videos: [{ label: "Picker video", present: true, manual: false }],
+  picker: { enabled: true, awaiting_data: false },
+});
+assert.equal(
+  widget.hmbCanAddPromptVideoRow(connectedVideoAddState),
+  false,
+  "A Picker connection must lock the Prompt video + button.",
+);
+connectedVideoAddState.picker.enabled = false;
+assert.equal(
+  widget.hmbCanAddPromptVideoRow(connectedVideoAddState),
+  true,
+  "Disconnecting Picker must immediately restore the Prompt video + button.",
+);
+const fullIndependentVideoState = widget.normalizeState({
+  videos: Array.from({ length: 10 }, (_value, index) => ({
+    label: `Manual video ${index + 1}`,
+    present: true,
+    manual: true,
+  })),
+  picker: { enabled: false, awaiting_data: false },
+});
+assert.equal(
+  widget.hmbCanAddPromptVideoRow(fullIndependentVideoState),
+  false,
+  "The existing maximum-video lock must remain active without a Picker connection.",
+);
+assert.match(
+  source,
+  /function renderVideoAddRow[\s\S]*?hmbCanAddPromptVideoRow\(state, videos\)[\s\S]*?disabled/,
+  "The rendered video + button must apply the Picker connection lock.",
+);
+assert.match(
+  source,
+  /querySelectorAll\("\.add-video-source"\)[\s\S]*?if \(!hmbCanAddPromptVideoRow\(state\)\) return;/,
+  "The video click path must reject stale or forced clicks while Picker is connected.",
+);
+
 state.images.push({ slot: 2, label: "", present: false, manual: true });
 widget.hmbCommitLocalPromptStructure(container, props, state, () => {
   commitOrder.push("remount");
