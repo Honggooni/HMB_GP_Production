@@ -322,8 +322,18 @@ assert.match(
 );
 assert.match(
   assetSource,
-  /on\(assetScroll, "pointerdown",[\s\S]*?button\) !== 1[\s\S]*?setPointerCapture[\s\S]*?on\(assetScroll, "pointermove"[\s\S]*?scrollTop/,
+  /const beginMiddlePan[\s\S]*?setPointerCapture[\s\S]*?const moveMiddlePan[\s\S]*?scrollTop[\s\S]*?on\(assetScroll, "pointerdown",[\s\S]*?button\) !== 1[\s\S]*?beginMiddlePan\(event, true\)[\s\S]*?on\(assetScroll, "pointermove", moveMiddlePan\)/,
   "Middle-button drag must pan only the Asset viewport without changing left-click selection.",
+);
+assert.match(
+  assetSource,
+  /on\(assetScroll, "mousedown",[\s\S]*?button\) !== 1[\s\S]*?stopImmediatePropagation[\s\S]*?capture:\s*true/,
+  "Asset middle mousedown must be isolated before React Flow/D3 can claim canvas panning.",
+);
+assert.match(
+  assetSource,
+  /on\(globalPanTarget, "pointermove", moveMiddlePan,[\s\S]*?on\(globalPanTarget, "mousemove", moveMiddlePan,[\s\S]*?on\(globalPanTarget, "mouseup", endMiddlePan/,
+  "Middle pan must survive pointer-capture loss and legacy embedded-WebView mouse streams.",
 );
 assert.doesNotMatch(assetSource, /data-asset-selected|type="checkbox" data-asset-selected/, "Asset selection must use the card outline, not per-card checkboxes.");
 assert.doesNotMatch(assetSource, /candidate-list|writing-mode/, "Removed color chips and rotated slot text must not return.");
