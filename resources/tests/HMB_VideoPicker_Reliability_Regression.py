@@ -887,7 +887,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.6.22"
+assert manifest["metadata"]["library_version"] == "0.6.23"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
@@ -952,7 +952,7 @@ bundled_agent_policy = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
 assert bundled_agent_policy.is_file()
 assert list(ROOT.rglob("hmb_agent_core.dat")) == [bundled_agent_policy]
 assert hashlib.sha256(bundled_agent_policy.read_bytes()).hexdigest() == (
-    "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
+    "7171bef7169df8894ed24ae7a9b4d9d145957c5110c963b7435372b2695fd251"
 )
 
 widget_source = (ROOT / "widgets/HMBVideoPickerLibraryWidget_v032.js").read_text(encoding="utf-8")

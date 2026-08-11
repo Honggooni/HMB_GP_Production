@@ -14,18 +14,18 @@ from types import MethodType
 ROOT = Path(__file__).resolve().parents[2]
 POLICY_ENV = "HMB_AGENT_POLICY_PATH"
 EXPECTED_BUNDLED_POLICY = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
-EXPECTED_VERSION = "2026-08-11.agent-shot-quality.v4.1"
+EXPECTED_VERSION = "2026-08-12.agent-shot-quality.v4.2"
 EXPECTED_ENVELOPE_SHA256 = (
-    "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
+    "7171bef7169df8894ed24ae7a9b4d9d145957c5110c963b7435372b2695fd251"
 )
 EXPECTED_PROJECT_SHA256 = (
-    "8bbf296eefd5fa7baf3aa43a66735fa6ce004e95859e09f7b48accb7b7beebc3"
+    "ee06fac0bc8825e29c3c49b755de3770bbe6241f7b4a7c41eba22f97f41c72c2"
 )
 EXPECTED_BINDING_SHA256 = (
-    "6a362ed04eba75caabcbe81944b0e2dd56a67120bc0dde1518e82aa80d9764d0"
+    "5cba8f59f6332c4ff881b27991bc724ff8dbba470bd59046ac2b96b6dbe66e64"
 )
 EXPECTED_CONTRACT_SHA256 = (
-    "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
+    "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
 )
 LOAD_FAILURE = "HMB_GP_Agent_Library internal rule payload could not be loaded."
 
@@ -105,7 +105,7 @@ try:
             str(EXPECTED_BUNDLED_POLICY),
         ]
 
-    # Verify the shipped v4.1 RSA signature and signed 4+4 self-hashes.
+    # Verify the shipped v4.2 RSA signature and signed 4+4 self-hashes.
     signed_bytes = EXPECTED_BUNDLED_POLICY.read_bytes()
     assert hashlib.sha256(signed_bytes).hexdigest() == EXPECTED_ENVELOPE_SHA256
     payload = common._load_agent_rule_payload()

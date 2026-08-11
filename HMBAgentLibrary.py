@@ -255,6 +255,22 @@ _PUBLIC_OUTPUT_STATE_KEYS = frozenset(
         "allowed_segments",
     }
 )
+# These names are either sealed-policy containers or HMB-derived runtime
+# addresses. Their presence is independently sufficient evidence of private
+# state. The remaining names are common in legitimate generator documents and
+# require a compound Agent-wrapper shape before they are blocked.
+_HMB_UNIQUE_RUNTIME_STATE_KEYS = frozenset(
+    {
+        "internal_policy",
+        "policy_injection",
+        "policy_vault",
+        "rulesets",
+        "runtime_scope",
+        "shared_windows",
+        "allowed_segments",
+    }
+)
+_GENERIC_AGENT_STATE_KEYS = _PUBLIC_OUTPUT_STATE_KEYS - _HMB_UNIQUE_RUNTIME_STATE_KEYS
 _SEALED_POLICY_STATE_KEYS = frozenset(
     {
         "internal_policy",
@@ -281,25 +297,6 @@ _HMB_ISOLATED_SCALAR_INPUTS = frozenset(
     }
 )
 _HMB_ISOLATED_LIST_INPUTS = frozenset({"tool", "tools"})
-_PUBLIC_OUTPUT_STATE_KEY_PATTERN = re.compile(
-    r"""(?ix)
-    (?:
-        ["']\s*
-        (?:
-            agent_memory|memory|conversation_memory|messages|internal_policy|policy_injection|
-            policy_vault|rulesets|instructions|system|system_prompt|tool|tools|
-            tool_call|tool_calls|tool_result|tool_results|trace|traces|runtime_scope|
-            shared_windows|allowed_segments
-        )
-        \s*["']
-        |
-        \b(?:agent_memory|memory|conversation_memory|messages|internal_policy|policy_injection|
-        policy_vault|rulesets|instructions|system_prompt|tool|tools|tool_call|tool_calls|
-        tool_result|tool_results|trace|traces|runtime_scope|shared_windows|allowed_segments)\b
-    )
-    \s*:
-    """
-)
 _AGENT_WRAPPER_KEY_PATTERN = re.compile(
     r"""(?ix)
     ["']\s*agent\s*["']\s*:\s*
@@ -315,6 +312,20 @@ _AGENT_WRAPPER_KEY_PATTERN = re.compile(
 _SANITIZER_MAX_DEPTH = 64
 _SANITIZER_MAX_NODES = 10_000
 _SANITIZER_MAX_JSON_CHARS = 1_000_000
+_SANITIZER_SECRET_WINDOW_CHARS = 160
+_SANITIZER_SIGNATURE_CACHE_MAX = 8
+# Process-local keyed digests let repeated output checks reuse the sealed
+# document signatures without retaining policy plaintext in a module cache.
+_SANITIZER_SIGNATURE_KEY = secrets.token_bytes(32)
+_SANITIZER_ROLLING_BASE = 257 + (2 * secrets.randbelow(32_768))
+_SANITIZER_ROLLING_MASK = (1 << 64) - 1
+_SANITIZER_SIGNATURE_CACHE: dict[
+    bytes,
+    tuple[
+        dict[int, frozenset[bytes]],
+        tuple[tuple[int, dict[int, frozenset[bytes]]], ...],
+    ],
+] = {}
 
 
 def _safe_parameter_name(name: str) -> str:
@@ -2153,39 +2164,136 @@ def _normalized_leak_text(value: Any) -> str:
     return " ".join(str(value or "").casefold().split())
 
 
+def _sanitizer_signature_digest(value: str) -> bytes:
+    """Return a process-local, non-reversible signature for normalized text."""
+
+    return hashlib.blake2s(
+        value.encode("utf-8"),
+        key=_SANITIZER_SIGNATURE_KEY,
+        digest_size=16,
+    ).digest()
+
+
+def _rolling_text_windows(value: str, length: int):
+    """Yield (offset, keyed-process rolling hash) for fixed-size text windows."""
+
+    if length <= 0 or len(value) < length:
+        return
+    base = _SANITIZER_ROLLING_BASE
+    mask = _SANITIZER_ROLLING_MASK
+    high_factor = pow(base, length - 1, mask + 1)
+    rolling = 0
+    for character in value[:length]:
+        rolling = ((rolling * base) + ord(character) + 1) & mask
+    yield 0, rolling
+    for index in range(length, len(value)):
+        outgoing = ord(value[index - length]) + 1
+        incoming = ord(value[index]) + 1
+        rolling = (rolling - (outgoing * high_factor)) & mask
+        rolling = ((rolling * base) + incoming) & mask
+        yield index - length + 1, rolling
+
+
+def _freeze_digest_buckets(
+    buckets: dict[int, set[bytes]],
+) -> dict[int, frozenset[bytes]]:
+    return {key: frozenset(values) for key, values in buckets.items()}
+
+
 def _secret_leak_signatures(
     policy: str, binding: str
-) -> tuple[frozenset[str], frozenset[str]]:
-    """Derive in-memory exact-fragment guards without publishing secret text."""
+) -> tuple[
+    dict[int, frozenset[bytes]],
+    tuple[tuple[int, dict[int, frozenset[bytes]]], ...],
+]:
+    """Derive keyed 160-character and exact-heading leak signatures.
 
-    fragments: set[str] = set()
-    shingles: set[str] = set()
+    Common production language can legitimately overlap short policy phrases.
+    A prose leak therefore requires one normalized, contiguous 160-character
+    policy window. Exact numbered-rule headings remain protected independently.
+    Only keyed digests are retained between calls; plaintext exists solely in
+    this bounded runtime derivation while the signed documents are already live.
+    """
+
+    cache_key = _sanitizer_signature_digest(
+        "\x00".join((str(policy or ""), str(binding or "")))
+    )
+    cached = _SANITIZER_SIGNATURE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    secret_windows: dict[int, set[bytes]] = {}
+    heading_signatures: dict[int, dict[int, set[bytes]]] = {}
     for document in (policy, binding):
         normalized_document = _normalized_leak_text(document)
-        words = normalized_document.split()
-        if len(words) >= 12:
-            shingles.update(
-                " ".join(words[index : index + 12])
-                for index in range(len(words) - 11)
-            )
+        if len(normalized_document) >= _SANITIZER_SECRET_WINDOW_CHARS:
+            for index, rolling in _rolling_text_windows(
+                normalized_document, _SANITIZER_SECRET_WINDOW_CHARS
+            ):
+                window = normalized_document[
+                    index : index + _SANITIZER_SECRET_WINDOW_CHARS
+                ]
+                secret_windows.setdefault(rolling, set()).add(
+                    _sanitizer_signature_digest(window)
+                )
         for raw_part in re.split(r"[\r\n]+", str(document or "")):
-            part = _normalized_leak_text(raw_part)
             heading = re.sub(r"^\s*\d+\.\s*", "", raw_part).strip().rstrip(":")
             if (
                 len(heading) >= 12
                 and re.fullmatch(r"[A-Z][A-Z0-9_ /-]*", heading)
             ):
-                fragments.add(_normalized_leak_text(heading))
-            if len(part) < 40:
-                continue
-            if len(part) <= 192:
-                fragments.add(part)
-                continue
-            fragments.update(
-                part[index : index + 96]
-                for index in range(0, max(1, len(part) - 95), 48)
-            )
-    return frozenset(fragments), frozenset(shingles)
+                normalized_heading = _normalized_leak_text(heading)
+                _offset, rolling = next(
+                    _rolling_text_windows(
+                        normalized_heading, len(normalized_heading)
+                    )
+                )
+                heading_signatures.setdefault(
+                    len(normalized_heading), {}
+                ).setdefault(rolling, set()).add(
+                    _sanitizer_signature_digest(normalized_heading)
+                )
+    signatures = (
+        _freeze_digest_buckets(secret_windows),
+        tuple(
+            (length, _freeze_digest_buckets(buckets))
+            for length, buckets in sorted(heading_signatures.items())
+        ),
+    )
+    if len(_SANITIZER_SIGNATURE_CACHE) >= _SANITIZER_SIGNATURE_CACHE_MAX:
+        _SANITIZER_SIGNATURE_CACHE.pop(next(iter(_SANITIZER_SIGNATURE_CACHE)))
+    _SANITIZER_SIGNATURE_CACHE[cache_key] = signatures
+    return signatures
+
+
+def _normalized_text_matches_secret_signatures(
+    normalized: str,
+    secret_windows: dict[int, frozenset[bytes]],
+    heading_signatures: tuple[
+        tuple[int, dict[int, frozenset[bytes]]], ...
+    ],
+) -> bool:
+    """Match exact headings or any contiguous 160-character policy window."""
+
+    if len(normalized) >= _SANITIZER_SECRET_WINDOW_CHARS:
+        for index, rolling in _rolling_text_windows(
+            normalized, _SANITIZER_SECRET_WINDOW_CHARS
+        ):
+            digests = secret_windows.get(rolling)
+            if digests and _sanitizer_signature_digest(
+                normalized[index : index + _SANITIZER_SECRET_WINDOW_CHARS]
+            ) in digests:
+                return True
+    for length, buckets in heading_signatures:
+        if len(normalized) < length:
+            continue
+        for index, rolling in _rolling_text_windows(normalized, length):
+            digests = buckets.get(rolling)
+            if digests and _sanitizer_signature_digest(
+                normalized[index : index + length]
+            ) in digests:
+                return True
+    return False
 
 
 _ZERO_WIDTH_AND_BIDI_CONTROLS = re.compile(
@@ -2217,8 +2325,10 @@ def _bounded_decompressed_values(value: bytes) -> list[bytes]:
 
 def _string_contains_internal_rule_text(
     value: str,
-    fragments: frozenset[str],
-    secret_shingles: frozenset[str],
+    secret_windows: dict[int, frozenset[bytes]],
+    heading_signatures: tuple[
+        tuple[int, dict[int, frozenset[bytes]]], ...
+    ],
     decode_budget: int = 2,
 ) -> bool:
     """Detect plaintext and bounded reversible encodings of sealed rules.
@@ -2233,16 +2343,10 @@ def _string_contains_internal_rule_text(
     normalized = _normalized_leak_text(text)
     if not normalized:
         return False
-    if any(fragment in normalized for fragment in fragments):
+    if _normalized_text_matches_secret_signatures(
+        normalized, secret_windows, heading_signatures
+    ):
         return True
-    words = normalized.split()
-    if len(words) >= 12:
-        public_shingles = {
-            " ".join(words[index : index + 12])
-            for index in range(len(words) - 11)
-        }
-        if public_shingles & secret_shingles:
-            return True
 
     if decode_budget <= 0:
         return False
@@ -2256,10 +2360,12 @@ def _string_contains_internal_rule_text(
             decoded_json = json.loads(stripped_json)
         except Exception:
             decoded_json = None
-        reconstructed = ""
+        reconstructed_values: list[str] = []
         if isinstance(decoded_json, list) and decoded_json:
             if all(isinstance(item, str) for item in decoded_json):
-                reconstructed = "".join(decoded_json)
+                reconstructed_values.extend(
+                    ("".join(decoded_json), " ".join(decoded_json))
+                )
             elif all(
                 isinstance(item, int)
                 and not isinstance(item, bool)
@@ -2267,24 +2373,31 @@ def _string_contains_internal_rule_text(
                 for item in decoded_json
             ):
                 try:
-                    reconstructed = "".join(chr(item) for item in decoded_json)
+                    reconstructed_values.append(
+                        "".join(chr(item) for item in decoded_json)
+                    )
                 except Exception:
-                    reconstructed = ""
-        if reconstructed and reconstructed != text and _string_contains_internal_rule_text(
-            reconstructed,
-            fragments,
-            secret_shingles,
-            decode_budget - 1,
-        ):
-            return True
+                    reconstructed_values = []
+        for reconstructed in reconstructed_values:
+            if (
+                reconstructed
+                and reconstructed != text
+                and _string_contains_internal_rule_text(
+                    reconstructed,
+                    secret_windows,
+                    heading_signatures,
+                    decode_budget - 1,
+                )
+            ):
+                return True
 
     # Invisible Unicode and bidi controls can make an exact policy fragment
     # render normally while defeating ordinary substring comparison.
     visible_text = _ZERO_WIDTH_AND_BIDI_CONTROLS.sub("", text)
     if visible_text != text and _string_contains_internal_rule_text(
         visible_text,
-        fragments,
-        secret_shingles,
+        secret_windows,
+        heading_signatures,
         decode_budget - 1,
     ):
         return True
@@ -2299,8 +2412,8 @@ def _string_contains_internal_rule_text(
             percent_decoded = ""
         if percent_decoded and percent_decoded != text and _string_contains_internal_rule_text(
             percent_decoded,
-            fragments,
-            secret_shingles,
+            secret_windows,
+            heading_signatures,
             decode_budget - 1,
         ):
             return True
@@ -2310,8 +2423,8 @@ def _string_contains_internal_rule_text(
         rot13_text = text
     if rot13_text != text and _string_contains_internal_rule_text(
         rot13_text,
-        fragments,
-        secret_shingles,
+        secret_windows,
+        heading_signatures,
         decode_budget - 1,
     ):
         return True
@@ -2319,8 +2432,8 @@ def _string_contains_internal_rule_text(
     reversed_text = text[::-1]
     if reversed_text != text and _string_contains_internal_rule_text(
         reversed_text,
-        fragments,
-        secret_shingles,
+        secret_windows,
+        heading_signatures,
         0,
     ):
         return True
@@ -2394,8 +2507,8 @@ def _string_contains_internal_rule_text(
                     continue
                 if _string_contains_internal_rule_text(
                     decoded_text,
-                    fragments,
-                    secret_shingles,
+                    secret_windows,
+                    heading_signatures,
                     decode_budget - 1,
                 ):
                     return True
@@ -2403,11 +2516,18 @@ def _string_contains_internal_rule_text(
 
 
 
-def _contains_internal_rule_text(value: Any, policy: str, binding: str) -> bool:
+def _value_contains_secret_signatures(
+    value: Any,
+    secret_windows: dict[int, frozenset[bytes]],
+    heading_signatures: tuple[
+        tuple[int, dict[int, frozenset[bytes]]], ...
+    ],
+) -> bool:
+    """Boundedly inspect one arbitrary value with caller-selected signatures."""
+
     stack: list[tuple[Any, int]] = [(value, 0)]
     visited: set[int] = set()
     inspected = 0
-    fragments, secret_shingles = _secret_leak_signatures(policy, binding)
     aggregate_parts: list[str] = []
     while stack:
         item, depth = stack.pop()
@@ -2417,7 +2537,7 @@ def _contains_internal_rule_text(value: Any, policy: str, binding: str) -> bool:
         if isinstance(item, str):
             aggregate_parts.append(item)
             if _string_contains_internal_rule_text(
-                item, fragments, secret_shingles
+                item, secret_windows, heading_signatures
             ):
                 return True
             continue
@@ -2442,7 +2562,7 @@ def _contains_internal_rule_text(value: Any, policy: str, binding: str) -> bool:
             if sequence and all(isinstance(nested, str) for nested in sequence):
                 for candidate in ("".join(sequence), " ".join(sequence)):
                     if _string_contains_internal_rule_text(
-                        candidate, fragments, secret_shingles
+                        candidate, secret_windows, heading_signatures
                     ):
                         return True
             elif sequence and all(
@@ -2456,16 +2576,75 @@ def _contains_internal_rule_text(value: Any, policy: str, binding: str) -> bool:
                 except Exception:
                     return True
                 if _string_contains_internal_rule_text(
-                    candidate, fragments, secret_shingles
+                    candidate, secret_windows, heading_signatures
                 ):
                     return True
             stack.extend((nested, depth + 1) for nested in reversed(sequence))
     if aggregate_parts:
         for candidate in ("".join(aggregate_parts), " ".join(aggregate_parts)):
             if _string_contains_internal_rule_text(
-                candidate, fragments, secret_shingles
+                candidate, secret_windows, heading_signatures
             ):
                 return True
+    return False
+
+
+def _contains_internal_rule_text(value: Any, policy: str, binding: str) -> bool:
+    secret_windows, heading_signatures = _secret_leak_signatures(policy, binding)
+    return _value_contains_secret_signatures(
+        value,
+        secret_windows,
+        heading_signatures,
+    )
+
+
+def _string_contains_raw_policy_window(
+    value: str, policy: str, binding: str
+) -> bool:
+    """Detect only strong raw-policy evidence on the public text boundary.
+
+    Short headings and common production phrases are valid generator wording.
+    FINAL TEXT therefore uses the same reversible decoder as the private guard
+    but only against contiguous normalized 160-character policy signatures.
+    """
+
+    secret_windows, _heading_signatures = _secret_leak_signatures(policy, binding)
+    return _string_contains_internal_rule_text(
+        value,
+        secret_windows,
+        (),
+    )
+
+
+def _contains_raw_policy_material(value: Any, policy: str, binding: str) -> bool:
+    """Recursively detect 160+ raw policy material without heading matching."""
+
+    secret_windows, _heading_signatures = _secret_leak_signatures(policy, binding)
+    if _value_contains_secret_signatures(value, secret_windows, ()):
+        return True
+    # A final text value may JSON-wrap a structured character/code-point/chunk
+    # representation. Decode at most twice, within the existing sanitizer
+    # budget, then apply the same raw-only recursive detector to the full tree.
+    decoded = value
+    for _ in range(2):
+        if not isinstance(decoded, str):
+            break
+        text = decoded.strip()
+        if (
+            not text
+            or len(text) > _SANITIZER_MAX_JSON_CHARS
+            or not text.startswith(("{", "[", '"'))
+        ):
+            break
+        try:
+            nested = json.loads(text)
+        except Exception:
+            break
+        if nested == decoded:
+            break
+        if _value_contains_secret_signatures(nested, secret_windows, ()):
+            return True
+        decoded = nested
     return False
 
 
@@ -2497,7 +2676,9 @@ def _mapping_contains_agent_state(value: Any, decode_budget: int = 2) -> bool:
             except Exception:
                 return True
             keys = {key for key, _nested in normalized_items}
-            if keys & _PUBLIC_OUTPUT_STATE_KEYS:
+            if keys & _HMB_UNIQUE_RUNTIME_STATE_KEYS:
+                return True
+            if len(keys & _GENERIC_AGENT_STATE_KEYS) >= 2:
                 return True
             if "agent" in keys:
                 agent_value = next(
@@ -2524,7 +2705,7 @@ def _mapping_contains_agent_state(value: Any, decode_budget: int = 2) -> bool:
             continue
         if isinstance(item, str):
             text = item.strip()
-            if _PUBLIC_OUTPUT_STATE_KEY_PATTERN.search(text) or _AGENT_WRAPPER_KEY_PATTERN.search(text):
+            if _AGENT_WRAPPER_KEY_PATTERN.search(text):
                 return True
             if (
                 remaining_decodes > 0
@@ -2541,9 +2722,13 @@ def _mapping_contains_agent_state(value: Any, decode_budget: int = 2) -> bool:
 
 
 def _contains_public_output_state_leak(value: Any, policy: str, binding: str) -> bool:
-    """Fail closed only for internal state mistakenly published as final text."""
-    if _contains_internal_rule_text(value, policy, binding):
-        return True
+    """Detect native state shapes without treating policy wording as a leak.
+
+    FINAL TEXT is the generator document. Signed policy may legitimately shape
+    or appear in that result, so only runtime scope and Agent wrapper/state
+    structures are private on this port. ``policy`` and ``binding`` remain in
+    the call signature for compatibility with the strict Agent-port sanitizer.
+    """
     if isinstance(value, (dict, list, tuple)):
         return _mapping_contains_agent_state(value)
     if not isinstance(value, str):
@@ -2557,8 +2742,6 @@ def _contains_public_output_state_leak(value: Any, policy: str, binding: str) ->
         or "runtime-shared-" in text.casefold()
     ):
         return True
-    if _PUBLIC_OUTPUT_STATE_KEY_PATTERN.search(text):
-        return True
     if _AGENT_WRAPPER_KEY_PATTERN.search(text):
         return True
 
@@ -2570,9 +2753,7 @@ def _contains_public_output_state_leak(value: Any, policy: str, binding: str) ->
             decoded = json.loads(decoded)
         except Exception:
             break
-        if _mapping_contains_agent_state(decoded) or _contains_internal_rule_text(
-            decoded, policy, binding
-        ):
+        if _mapping_contains_agent_state(decoded):
             return True
         if not isinstance(decoded, str):
             break
@@ -2626,7 +2807,7 @@ def _strip_internal_rules_from_agent_wrapper(
 def _replace_leaked_strings(value: Any, policy: str, binding: str, replacement: str) -> Any:
     visited: set[int] = set()
     budget = [0]
-    fragments, secret_shingles = _secret_leak_signatures(policy, binding)
+    secret_windows, heading_signatures = _secret_leak_signatures(policy, binding)
 
     def scrub(item: Any, depth: int) -> Any:
         budget[0] += 1
@@ -2636,7 +2817,7 @@ def _replace_leaked_strings(value: Any, policy: str, binding: str, replacement: 
             return (
                 replacement
                 if _string_contains_internal_rule_text(
-                    item, fragments, secret_shingles
+                    item, secret_windows, heading_signatures
                 )
                 else item
             )
@@ -3136,23 +3317,44 @@ class HMBAgentLibrary(_BaseAgent):
                         self._hmb_binding_rules,
                     )
                     _strip_runtime_scope_from_agent_wrapper(current)
-                sanitized = _replace_leaked_strings(
-                    current,
-                    self._hmb_policy,
-                    self._hmb_binding,
-                    blocked,
-                )
-                leak_detected = (
-                    _contains_internal_rule_text(
-                        sanitized, self._hmb_policy, self._hmb_binding
-                    )
-                    if key == "agent"
-                    else _contains_public_output_state_leak(
+                if key == "output":
+                    sanitized = current
+                    # Shot-tailored policy results, paraphrases, and common
+                    # production language are valid FINAL TEXT. Block only
+                    # strong raw-policy evidence (a normalized contiguous
+                    # 160-character window, including reversible encodings) or
+                    # an actual runtime/Agent-state structure. Length itself is
+                    # never a limit and accepted text is never rewritten.
+                    leak_detected = _contains_public_output_state_leak(
                         sanitized,
                         self._hmb_policy,
                         self._hmb_binding,
                     )
-                )
+                    leak_detected = leak_detected or (
+                        _contains_raw_policy_material(
+                            sanitized,
+                            self._hmb_policy,
+                            self._hmb_binding,
+                        )
+                    )
+                else:
+                    sanitized = _replace_leaked_strings(
+                        current,
+                        self._hmb_policy,
+                        self._hmb_binding,
+                        blocked,
+                    )
+                    leak_detected = _contains_internal_rule_text(
+                        sanitized, self._hmb_policy, self._hmb_binding
+                    )
+                    if key != "agent":
+                        leak_detected = leak_detected or (
+                            _contains_public_output_state_leak(
+                                sanitized,
+                                self._hmb_policy,
+                                self._hmb_binding,
+                            )
+                        )
                 if leak_detected:
                     sanitized = {} if key == "agent" else blocked
                 outputs[key] = sanitized
@@ -3162,9 +3364,11 @@ class HMBAgentLibrary(_BaseAgent):
                 # callback boundary; streaming writes were privately buffered.
                 self._set_visible_output(visible_output)
         except Exception:
-            # Sanitizer bugs must neither expose partial state nor replace the
-            # native Agent result/exception with a second failure.
+            # A broken detector cannot establish that FINAL TEXT is free of a
+            # raw policy dump. Fail closed without exposing partial state.
             outputs["agent"] = {}
+            if "logs" in outputs:
+                outputs["logs"] = ""
             self._set_visible_output(blocked)
             try:
                 print("[HMB_PRODUCTION][WARN] Agent output sanitizer failed closed.")
@@ -3268,14 +3472,6 @@ class HMBAgentLibrary(_BaseAgent):
             )
             self._publish_hmb_execution_block(_HMB_SOURCE_CONTRACT_INVALID_MESSAGE)
             raise RuntimeError(_HMB_SOURCE_CONTRACT_INVALID_MESSAGE) from None
-        if any(
-            _contains_internal_rule_text(
-                candidate, self._hmb_policy, self._hmb_binding
-            )
-            for candidate in (prompt_value, machine_prompt)
-        ):
-            self._publish_hmb_execution_block(_PUBLIC_OUTPUT_BLOCKED)
-            raise RuntimeError(_PUBLIC_OUTPUT_BLOCKED) from None
         self._hide_hmb_policy_warning()
         self._hmb_rules_active = True
 
@@ -3295,13 +3491,15 @@ class HMBAgentLibrary(_BaseAgent):
             try:
                 self._secure_hmb_outputs()
             except Exception:
-                # Preserve the native return value or native exception even if a
-                # future sanitizer implementation unexpectedly raises.
+                # A replaced/future sanitizer can still raise outside its own
+                # guard. Without a completed raw-policy check, fail closed.
                 try:
                     self._set_visible_output(_PUBLIC_OUTPUT_BLOCKED)
                     outputs = getattr(self, "parameter_output_values", None)
                     if isinstance(outputs, dict):
                         outputs["agent"] = {}
+                        if "logs" in outputs:
+                            outputs["logs"] = ""
                     print(
                         "[HMB_PRODUCTION][WARN] Agent output sanitizer failed closed."
                     )

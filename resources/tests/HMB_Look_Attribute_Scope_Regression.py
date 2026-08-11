@@ -36,9 +36,9 @@ for legacy in legacy_scope_phrases:
     assert legacy.casefold() not in source.casefold(), legacy
     assert legacy.casefold() not in guide.casefold(), legacy
 
-assert prompt.PROMPT_POLICY_SOURCE_VERSION == "2026-08-11.agent-shot-quality.v4.1"
+assert prompt.PROMPT_POLICY_SOURCE_VERSION == "2026-08-12.agent-shot-quality.v4.2"
 assert prompt.PROMPT_POLICY_SOURCE_CONTRACT_SHA256 == (
-    "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
+    "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
 )
 assert prompt.PROMPT_POLICY_SOURCE_VERSION == prompt._hmb._AGENT_POLICY_VERSION
 assert (

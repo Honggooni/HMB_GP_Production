@@ -35,7 +35,7 @@ jobs:
         run: |
           $tracked = @(git ls-files)
           $bundledPolicy = "resources/agent/hmb_agent_core.dat"
-          $bundledPolicySha256 = "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
+          $bundledPolicySha256 = "7171bef7169df8894ed24ae7a9b4d9d145957c5110c963b7435372b2695fd251"
           $forbidden = @($tracked | Where-Object {
             $_ -ne $bundledPolicy -and (
             $_ -match '(^|/)(\.tmp|\.venv|backups|dist|GriptapeNodes|resources/agent|resources/policy|policies?)/' -or

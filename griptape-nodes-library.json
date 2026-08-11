@@ -4,7 +4,7 @@
   "metadata": {
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.6.22",
+    "library_version": "0.6.23",
     "engine_version": "0.93.0",
     "tags": [
       "Griptape",
@@ -185,7 +185,7 @@
       "file_path": "HMBAgentLibrary.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "Native Griptape Agent that remains a stock Standard Library Agent for every request not directly connected from the exact registered HMBPromptLibrary PROMPT_OUT port. That one canonical edge requires runtime-only injection of four project rules plus four shot rules; copied text, Image Asset, Video Picker, relays, and look-alike nodes cannot activate it. Prompt-only, Prompt-plus-Asset, Prompt-plus-Picker, and Prompt-plus-both are equally valid because the Agent never identifies or requires upstream siblings. If the canonical edge exists but the signed policy is missing or invalid, execution stops with a visible configuration error before any native Agent or model call. FINAL TEXT remains protected from private Agent state while valid runs retain the downstream model, tools, memory, schema, and native execution path.",
+        "description": "Native Griptape Agent that remains a stock Standard Library Agent for every request not directly connected from the exact registered HMBPromptLibrary PROMPT_OUT port. That canonical edge validates the user-readable PROMPT_OUT against its atomically paired same-generation private machine snapshot and injects four project rules plus four shot rules at runtime; visible prose is never reverse-parsed. Prompt-only, Prompt-plus-Asset, Prompt-plus-Picker, and Prompt-plus-both remain equally valid. FINAL generator output may apply, summarize, paraphrase, translate, or infer the signed rules over Prompt-selected facts and include every generator-required detail and source name without an output-length or conciseness cap. Only verbatim raw or reconstructable policy-artifact dumps, system instructions, and private Agent objects, memory, validation state, and logs remain blocked. Missing or invalid signed policy fails closed before any native Agent or model call; valid runs retain the downstream model, tools, memory, schema, and native execution path.",
         "display_name": "HMBAgentLibrary"
       }
     },

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.23 - 2026-08-12
+
+- Activate signed Agent policy `2026-08-12.agent-shot-quality.v4.2`, under
+  which shot-specific policy application, summary, paraphrase, translation,
+  and inference over Prompt-selected facts are expected generator output and
+  are not private-policy disclosure.
+- Preserve every generator-required detail with no total output length,
+  source-name, token, character, paragraph, or conciseness cap and no automatic
+  truncation or omission of normal production wording.
+- Keep verbatim raw or reconstructable policy-artifact dumps, system
+  instructions, and private Agent objects, memory, validation state, and logs
+  fail-closed, without blocking policy-derived production instructions.
+- Retain the user-readable sectioned `PROMPT_OUT` and consume only its
+  atomically paired, same-generation private machine snapshot; never
+  reverse-parse visible prose into structured facts.
+
 ## 0.6.22 - 2026-08-12
 
 - Recover the paired Prompt snapshot when Griptape `initial_setup` hydrates

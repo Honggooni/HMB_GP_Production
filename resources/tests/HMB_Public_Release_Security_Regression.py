@@ -10,14 +10,14 @@ from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[2]
-POLICY_VERSION = "2026-08-11.agent-shot-quality.v4.1"
+POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
 POLICY_CONTRACT_SHA256 = (
-    "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
+    "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
 )
 POLICY_RELATIVE = "resources/agent/hmb_agent_core.dat"
-POLICY_SHA256 = "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
-RELEASE_LABEL = "v0.6.22"
-RELEASE_VERSION = "0.6.22"
+POLICY_SHA256 = "7171bef7169df8894ed24ae7a9b4d9d145957c5110c963b7435372b2695fd251"
+RELEASE_LABEL = "v0.6.23"
+RELEASE_VERSION = "0.6.23"
 EXPECTED_SOURCE_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
@@ -174,7 +174,7 @@ assert first_archive == second_archive
 builder.validate_archive(first_archive, records)
 assert builder.module_string_constant(
     ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_CANDIDATE_VERSION"
-) == "2026-08-11.agent-shot-quality.v4.1"
+) == "2026-08-12.agent-shot-quality.v4.2"
 assert builder.module_string_constant(
     ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_CANDIDATE_CONTRACT_SHA256"
 ) == POLICY_CONTRACT_SHA256

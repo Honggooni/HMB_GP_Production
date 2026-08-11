@@ -205,8 +205,20 @@ secret = (
     "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima "
     "mike november oscar papa"
 )
-for exposed in (secret, json.dumps(secret), json.dumps(json.dumps(secret))):
-    assert agent._contains_public_output_state_leak(exposed, secret, secret)
+shot_derived_output = (
+    "Render @image1 in the shot controlled by @video1 while preserving authored "
+    "motion, timing, framing, visibility, occlusion, and spatial continuity."
+)
+for exposed in (
+    secret,
+    json.dumps(secret),
+    json.dumps(json.dumps(secret)),
+    shot_derived_output,
+):
+    # Short/common or policy-applied production prose is neither native Agent
+    # state nor 160+ characters of raw policy material.
+    assert not agent._contains_public_output_state_leak(exposed, secret, secret)
+    assert not agent._contains_raw_policy_material(exposed, secret, secret)
 
 # Structured-connector catch-all text and technical JSON never enter USER DATA.
 connector_state = prompt_library._default_widget_state()
