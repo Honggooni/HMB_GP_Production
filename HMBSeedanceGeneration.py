@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import threading
 import time
 import urllib.error
@@ -81,6 +82,9 @@ LOCAL_VIDEO_UPLOAD_SERVICES = (
 )
 DEFAULT_TOS_REGION = "cn-beijing"
 DEFAULT_TOS_ENDPOINT = "tos-cn-beijing.volces.com"
+MP4_DECODE_PROBE_TIMEOUT_SECONDS = 20.0
+MP4_DECODE_PROBE_MAX_OUTPUT_BYTES = 64 * 1024
+MP4_DECODE_PROBE_PACKET_LIMIT = 128
 
 
 def _is_structurally_valid_mp4(value: bytes | bytearray) -> bool:
@@ -118,6 +122,116 @@ def _is_structurally_valid_mp4(value: bytes | bytearray) -> bool:
         offset += size
         boxes += 1
     return offset == len(data) and saw_movie_box and saw_media_data_box
+
+
+def _resolve_ffprobe_executable() -> Path:
+    """Resolve the installed ffprobe without a shell or network fallback."""
+
+    discovered = shutil.which("ffprobe")
+    if not discovered:
+        raise RuntimeError(
+            "MP4 decode verifier is unavailable; generated result was not published."
+        )
+    try:
+        executable = Path(discovered).resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "MP4 decode verifier is unavailable; generated result was not published."
+        ) from exc
+    if not executable.is_file():
+        raise RuntimeError(
+            "MP4 decode verifier is unavailable; generated result was not published."
+        )
+    return executable
+
+
+def _validate_decodable_mp4_file(path: str | Path) -> None:
+    """Decode a bounded sample with ffprobe before the staged MP4 is published."""
+
+    try:
+        source = Path(path).resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "Generated result could not be staged for MP4 decode verification."
+        ) from exc
+    if not source.is_file() or source.stat().st_size <= 0:
+        raise RuntimeError(
+            "Generated result could not be staged for MP4 decode verification."
+        )
+
+    executable = _resolve_ffprobe_executable()
+    command = [
+        str(executable),
+        "-v",
+        "error",
+        "-threads",
+        "1",
+        "-select_streams",
+        "v:0",
+        "-read_intervals",
+        f"%+#{MP4_DECODE_PROBE_PACKET_LIMIT}",
+        "-show_frames",
+        "-show_entries",
+        "frame=media_type,width,height",
+        "-of",
+        "json",
+        "-i",
+        str(source),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=MP4_DECODE_PROBE_TIMEOUT_SECONDS,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "MP4 decode verification timed out; generated result was not published."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            "MP4 decode verifier could not start; generated result was not published."
+        ) from exc
+
+    stdout = completed.stdout
+    stderr = completed.stderr
+    if not isinstance(stdout, bytes) or not isinstance(stderr, bytes):
+        raise RuntimeError(
+            "MP4 decode verifier returned an invalid response; generated result was not published."
+        )
+    if (
+        len(stdout) + len(stderr) > MP4_DECODE_PROBE_MAX_OUTPUT_BYTES
+        or completed.returncode != 0
+        or bool(stderr.strip())
+    ):
+        raise RuntimeError(
+            "Generated result failed MP4 decode verification and was not published."
+        )
+    try:
+        payload = json.loads(stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "MP4 decode verifier returned an invalid response; generated result was not published."
+        ) from exc
+    frames = payload.get("frames") if isinstance(payload, dict) else None
+    if not isinstance(frames, list) or not any(
+        isinstance(frame, dict)
+        and frame.get("media_type") == "video"
+        and isinstance(frame.get("width"), int)
+        and not isinstance(frame.get("width"), bool)
+        and frame["width"] > 0
+        and isinstance(frame.get("height"), int)
+        and not isinstance(frame.get("height"), bool)
+        and frame["height"] > 0
+        for frame in frames
+    ):
+        raise RuntimeError(
+            "Generated result contains no decodable video frame and was not published."
+        )
 
 
 DEFAULT_TOS_URL_VALIDITY_SECONDS = 24 * 60 * 60
@@ -1038,6 +1152,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         ] = []
         self._temporary_tos_video_uploads: list[tuple[Any, str, str]] = []
         self._submission_outcome_unknown = False
+        self._detached_submission_tasks: set[asyncio.Task[Any]] = set()
         self._broker_bridge_instance: _HMBAIBrokerBridge | None = None
         self._last_broker_payload: dict[str, Any] | None = None
         self._broker_action_lock = threading.Lock()
@@ -3101,19 +3216,45 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         *args: Any,
         **kwargs: Any,
     ) -> tuple[Any, bool]:
-        """Recover a started billable submission even after local cancellation."""
+        """Return promptly on cancellation while the started POST finishes off-task."""
 
         operation = asyncio.create_task(
             asyncio.to_thread(function, *args, **kwargs)
         )
-        cancellation_requested = False
-        while True:
-            try:
-                return await asyncio.shield(operation), cancellation_requested
-            except asyncio.CancelledError:
-                cancellation_requested = True
-                self._submission_outcome_unknown = True
-                continue
+        try:
+            return await asyncio.shield(operation), False
+        except asyncio.CancelledError:
+            # A running Python worker thread cannot be reclaimed safely. Detach it,
+            # retain a strong reference until completion, and expose the only safe
+            # remote-state claim: this idempotent submission may have been accepted.
+            self._submission_outcome_unknown = True
+            generation_id = str(
+                self.parameter_output_values.get("generation_id") or ""
+            ).strip()
+            if generation_id:
+                self._set_broker_task_outputs(
+                    {"id": generation_id, "status": "submission_unknown"},
+                    generation_id=generation_id,
+                    status="submission_unknown",
+                )
+            self._detached_submission_tasks.add(operation)
+
+            def consume_detached_result(completed: asyncio.Task[Any]) -> None:
+                self._detached_submission_tasks.discard(completed)
+                try:
+                    completed.result()
+                except asyncio.CancelledError:
+                    return
+                except Exception as exc:
+                    logger.warning(
+                        "%s detached Broker submission finished after local "
+                        "cancellation with %s; remote state remains unknown.",
+                        self.name,
+                        type(exc).__name__,
+                    )
+
+            operation.add_done_callback(consume_detached_result)
+            raise
 
     @classmethod
     async def _atomic_publish_completed_mp4(
@@ -3154,6 +3295,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     raise OSError(
                         "Generated-video staging file was not written completely."
                     )
+                # Container structure alone cannot prove that the compressed
+                # video stream is decodable. Probe the complete sibling stage
+                # before either overwrite or create-new publication can expose
+                # it at the final destination.
+                await asyncio.to_thread(_validate_decodable_mp4_file, stage)
                 if policy is ExistingFilePolicy.OVERWRITE:
                     await cls._await_filesystem_commit(os.replace, stage, candidate)
                     claimed = True

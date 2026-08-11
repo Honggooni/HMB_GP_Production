@@ -90,6 +90,12 @@ target = load_target()
 image_asset_target = load_image_asset_target()
 video_picker_target = load_video_picker_target()
 
+# Most generator cases use a deliberately minimal structural MP4 fixture. Keep
+# those tests independent of a host codec binary; the real probe implementation
+# is exercised with bounded subprocess mocks below.
+REAL_MP4_DECODE_PROBE = target._validate_decodable_mp4_file
+target._validate_decodable_mp4_file = lambda _path: None
+
 
 class FakeDestination:
     def __init__(self) -> None:
@@ -2375,6 +2381,87 @@ class AtomicLocalDestination:
         raise AssertionError("Completed MP4 used a non-atomic destination writer")
 
 
+def assert_bounded_mp4_decode_probe_contract() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        staged = Path(temporary) / "staged.mp4"
+        staged.write_bytes(VALID_MP4_BYTES)
+        success = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "frames": [
+                        {"media_type": "video", "width": 64, "height": 64}
+                    ]
+                }
+            ).encode("utf-8"),
+            stderr=b"",
+        )
+        with mock.patch.object(
+            target,
+            "_resolve_ffprobe_executable",
+            return_value=Path("C:/ffmpeg/bin/ffprobe.exe"),
+        ), mock.patch.object(target.subprocess, "run", return_value=success) as run:
+            REAL_MP4_DECODE_PROBE(staged)
+        command = run.call_args.args[0]
+        kwargs = run.call_args.kwargs
+        assert command[0].lower().endswith("ffprobe.exe")
+        assert command[-2:] == ["-i", str(staged.resolve())]
+        assert "-show_frames" in command
+        assert f"%+#{target.MP4_DECODE_PROBE_PACKET_LIMIT}" in command
+        assert kwargs["stdin"] is target.subprocess.DEVNULL
+        assert kwargs["stdout"] is target.subprocess.PIPE
+        assert kwargs["stderr"] is target.subprocess.PIPE
+        assert kwargs["check"] is False
+        assert kwargs["timeout"] == target.MP4_DECODE_PROBE_TIMEOUT_SECONDS
+
+        def rejected(completed=None, *, side_effect=None) -> None:
+            with mock.patch.object(
+                target,
+                "_resolve_ffprobe_executable",
+                return_value=Path("C:/ffmpeg/bin/ffprobe.exe"),
+            ), mock.patch.object(
+                target.subprocess,
+                "run",
+                return_value=completed,
+                side_effect=side_effect,
+            ):
+                try:
+                    REAL_MP4_DECODE_PROBE(staged)
+                except RuntimeError:
+                    return
+            raise AssertionError("Invalid ffprobe result was accepted")
+
+        rejected(SimpleNamespace(returncode=1, stdout=b"", stderr=b"decode"))
+        rejected(SimpleNamespace(returncode=0, stdout=b"not-json", stderr=b""))
+        rejected(
+            SimpleNamespace(
+                returncode=0,
+                stdout=b'{"frames":[]}',
+                stderr=b"",
+            )
+        )
+        rejected(
+            SimpleNamespace(
+                returncode=0,
+                stdout=b"x" * (target.MP4_DECODE_PROBE_MAX_OUTPUT_BYTES + 1),
+                stderr=b"",
+            )
+        )
+        rejected(
+            side_effect=target.subprocess.TimeoutExpired(
+                ["ffprobe"], target.MP4_DECODE_PROBE_TIMEOUT_SECONDS
+            )
+        )
+
+    with mock.patch.object(target.shutil, "which", return_value=None):
+        try:
+            target._resolve_ffprobe_executable()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Missing ffprobe did not fail closed")
+
+
 def assert_atomic_output_and_submission_safety() -> None:
     assert target._is_structurally_valid_mp4(VALID_MP4_BYTES)
     assert not target._is_structurally_valid_mp4(
@@ -2397,16 +2484,27 @@ def assert_atomic_output_and_submission_safety() -> None:
         )
         real_replace = target.os.replace
         observations: list[Path] = []
+        probe_observations: list[Path] = []
+
+        def observed_probe(source) -> None:
+            source_path = Path(source)
+            assert source_path.parent == root
+            assert source_path.read_bytes() == VALID_MP4_BYTES
+            assert final_path.read_bytes() == old_bytes
+            probe_observations.append(source_path)
 
         def observed_replace(source, target_path) -> None:
             source_path = Path(source)
+            assert probe_observations == [source_path]
             assert source_path.parent == Path(target_path).parent == root
             assert source_path.read_bytes() == VALID_MP4_BYTES
             assert final_path.read_bytes() == old_bytes
             observations.append(source_path)
             real_replace(source_path, target_path)
 
-        with mock.patch.object(target.os, "replace", side_effect=observed_replace):
+        with mock.patch.object(
+            target, "_validate_decodable_mp4_file", side_effect=observed_probe
+        ), mock.patch.object(target.os, "replace", side_effect=observed_replace):
             saved = asyncio.run(
                 target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
                     destination,
@@ -2414,10 +2512,31 @@ def assert_atomic_output_and_submission_safety() -> None:
                 )
             )
         assert observations
+        assert probe_observations
         assert final_path.read_bytes() == VALID_MP4_BYTES
         assert Path(saved.resolve()) == final_path
         assert not list(root.glob(".*.partial.mp4"))
         assert not list(root.glob(".*.output-probe"))
+
+        final_path.write_bytes(old_bytes)
+        with mock.patch.object(
+            target,
+            "_validate_decodable_mp4_file",
+            side_effect=RuntimeError("simulated undecodable stream"),
+        ):
+            try:
+                asyncio.run(
+                    target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                        destination,
+                        VALID_MP4_BYTES,
+                    )
+                )
+            except RuntimeError as exc:
+                assert "undecodable" in str(exc)
+            else:
+                raise AssertionError("Undecodable staged MP4 was published")
+        assert final_path.read_bytes() == old_bytes
+        assert not list(root.glob(".*.partial.mp4"))
 
     bridge = FakeBrokerBridge([])
     node = BrokerScriptedNode(bridge)
@@ -2439,23 +2558,59 @@ def assert_atomic_output_and_submission_safety() -> None:
     async def cancellation_case() -> None:
         started = threading.Event()
         release = threading.Event()
+        worker_finished = threading.Event()
 
         def blocking_submit() -> dict:
             started.set()
             assert release.wait(2.0)
+            worker_finished.set()
             return {"job_id": "broker-job-cancel", "status": "pending"}
 
-        operation = asyncio.create_task(
-            node._await_submission_result(blocking_submit)
+        request_id = "hmb-cancelled-submit-1"
+        node.parameter_output_values["generation_id"] = request_id
+        node.parameter_output_values["generation_status"] = "submitting"
+        cleanup_events: list[str] = []
+        node._cleanup_temporary_video_uploads = lambda: cleanup_events.append(
+            "eager_cleanup"
         )
+        node._defer_temporary_video_upload_cleanup = lambda: cleanup_events.append(
+            "deferred_cleanup"
+        )
+
+        async def submit_only() -> None:
+            await node._await_submission_result(blocking_submit)
+
+        node._process_generation_impl = submit_only
+        operation = asyncio.create_task(node._process_generation())
         assert await asyncio.to_thread(started.wait, 1.0)
+        cancelled_at = time.monotonic()
         operation.cancel()
-        await asyncio.sleep(0.02)
-        assert not operation.done()
+        try:
+            await operation
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("Cancelled submission waited for its worker thread")
+        assert time.monotonic() - cancelled_at < 0.5
+        assert not worker_finished.is_set()
+        assert node._submission_outcome_unknown is True
+        assert node.parameter_output_values["generation_id"] == request_id
+        assert node.parameter_output_values["generation_status"] == "submission_unknown"
+        assert node.parameter_output_values["provider_response"] == {
+            "transport": "fn_ai_broker",
+            "id": request_id,
+            "status": "submission_unknown",
+        }
+        assert cleanup_events == ["eager_cleanup", "deferred_cleanup"]
+        assert len(node._detached_submission_tasks) == 1
+
         release.set()
-        response, cancellation_requested = await operation
-        assert response["job_id"] == "broker-job-cancel"
-        assert cancellation_requested is True
+        for _ in range(100):
+            if worker_finished.is_set() and not node._detached_submission_tasks:
+                break
+            await asyncio.sleep(0.01)
+        assert worker_finished.is_set()
+        assert not node._detached_submission_tasks
 
     asyncio.run(cancellation_case())
 
@@ -2867,6 +3022,7 @@ assert_refresh_during_submission_contract()
 assert_broker_direct_transport_resilience_contract()
 assert_broker_account_and_button_contract()
 assert_indexed_output_macro_contract()
+assert_bounded_mp4_decode_probe_contract()
 assert_atomic_output_and_submission_safety()
 assert_local_video_temporary_publication()
 assert_tos_local_video_temporary_publication()
