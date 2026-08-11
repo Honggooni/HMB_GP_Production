@@ -16,8 +16,8 @@ POLICY_CONTRACT_SHA256 = (
 )
 POLICY_RELATIVE = "resources/agent/hmb_agent_core.dat"
 POLICY_SHA256 = "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
-RELEASE_LABEL = "v0.6.01"
-RELEASE_VERSION = "0.6.1"
+RELEASE_LABEL = "v0.6.20"
+RELEASE_VERSION = "0.6.20"
 EXPECTED_SOURCE_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
@@ -156,10 +156,7 @@ assert next(
     item for item in sbom["packages"]
     if item["SPDXID"] == "SPDXRef-HMB-GP-Production"
 )["versionInfo"] == RELEASE_VERSION
-assert (
-    f"## `{RELEASE_LABEL}` (technical version `{RELEASE_VERSION}`) — Unreleased"
-    in changelog
-)
+assert f"## {RELEASE_VERSION} - 2026-08-12" in changelog
 
 release_version, records = builder.validate_sources()
 record_paths = tuple(str(record["path"]) for record in records)

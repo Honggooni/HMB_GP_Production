@@ -7,6 +7,7 @@ const MAX_VIDEO_VFX_CHARS = 20000;
 const MAX_KEEP_OUT_CHARS = 4000;
 const MAX_FRAME_RANGES_PER_BINDING = 100;
 const MAX_MANUAL_FRAME_NUMBER = 9999;
+const MAX_SOURCE_SYNC_REVISION = Number.MAX_SAFE_INTEGER;
 let ACTOR_COLOR_PICK_CHOICES = [];
 let OBJECT_COLOR_PICK_CHOICES = [];
 let COLOR_PICK_CHOICES = [];
@@ -558,6 +559,7 @@ function defaultState() {
   return normalizeState({
     schema: "prompt-library-state",
     mode: "prompt_only_role_dashboard",
+    source_sync_revision: 0,
     images: [defaultImage(1), defaultImage(2), defaultImage(3), defaultImage(4)],
     videos: [defaultVideo(1)],
     text: Object.fromEntries(TEXT_FIELDS.map(([key]) => [key, ""])),
@@ -608,6 +610,12 @@ function parseValue(value) {
 
 function clean(value) {
   return String(value || "").trim();
+}
+
+function normalizeSourceSyncRevision(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.min(MAX_SOURCE_SYNC_REVISION, Math.floor(parsed)));
 }
 
 function normalizeSourceIntentFallbacks(value) {
@@ -1811,6 +1819,7 @@ export function normalizeState(input) {
   return {
     schema: "prompt-library-state",
     mode: "prompt_only_role_dashboard",
+    source_sync_revision: normalizeSourceSyncRevision(input?.source_sync_revision),
     theme: "dark-neon",
     image_taxonomy: imageTaxonomy,
     images,
@@ -2783,6 +2792,7 @@ function hmbClearPendingPromptStateEchoes(container) {
   } catch (_error) {}
   try {
     delete container.__hmbPromptPendingLocalValues;
+    delete container.__hmbPromptSupersededLocalValues;
     delete container.__hmbPromptPendingLocalTimer;
   } catch (_error) {}
 }
@@ -2791,6 +2801,23 @@ function hmbPendingPromptEchoIsLive(item, now) {
   if (!item || typeof item.value !== "string") return false;
   const expiresAt = Number(item.expiresAt);
   return !Number.isFinite(expiresAt) || expiresAt > now;
+}
+
+function hmbPromptStateRevisionFromSerialized(value) {
+  try {
+    const parsed = typeof value === "string" ? JSON.parse(value) : value;
+    return normalizeSourceSyncRevision(parsed?.source_sync_revision);
+  } catch (_error) {
+    return 0;
+  }
+}
+
+function hmbPendingPromptSourceRevision(item) {
+  if (!item) return 0;
+  if (item.sourceSyncRevision !== undefined) {
+    return normalizeSourceSyncRevision(item.sourceSyncRevision);
+  }
+  return hmbPromptStateRevisionFromSerialized(item.value);
 }
 
 function hmbPromptDirtySnapshot(container) {
@@ -2807,6 +2834,7 @@ function hmbRegisterPendingPromptStateEcho(container, value, disabled, publicati
     value,
     disabled: Boolean(disabled),
     publicationToken,
+    sourceSyncRevision: hmbPromptStateRevisionFromSerialized(value),
     expiresAt: now + HMB_PROMPT_LOCAL_ECHO_TTL_MS,
     remainingEchoes: HMB_PROMPT_LOCAL_ECHO_MAX_CONSUMES,
   };
@@ -2970,15 +2998,56 @@ export function hmbCommitLocalPromptStructure(container, props, state, remount) 
 }
 
 export function hmbConsumePendingPromptStateEcho(container, nextProps) {
-  const pending = container && container.__hmbPromptPendingLocalValues;
-  if (!Array.isArray(pending) || !pending.length || !nextProps) return false;
+  if (!container || !nextProps) return false;
+  const pending = Array.isArray(container.__hmbPromptPendingLocalValues)
+    ? container.__hmbPromptPendingLocalValues
+    : [];
+  const superseded = Array.isArray(container.__hmbPromptSupersededLocalValues)
+    ? container.__hmbPromptSupersededLocalValues
+    : [];
+  if (!pending.length && !superseded.length) return false;
   let incoming = "";
+  let incomingState = null;
   try {
-    incoming = JSON.stringify(normalizeState(parseValue(nextProps.value)));
+    incomingState = normalizeState(parseValue(nextProps.value));
+    incoming = JSON.stringify(incomingState);
   } catch (_error) {
     return false;
   }
   const now = Date.now();
+  const liveSuperseded = superseded.filter((item) => hmbPendingPromptEchoIsLive(item, now));
+  const supersededMatchIndex = liveSuperseded.findIndex((item) => (
+    item
+    && incoming === item.value
+    && Boolean(nextProps.disabled) === Boolean(item.disabled)
+  ));
+  if (supersededMatchIndex >= 0) {
+    const matched = liveSuperseded[supersededMatchIndex];
+    const configuredRemaining = Number(matched.remainingEchoes);
+    const remaining = (Number.isFinite(configuredRemaining)
+      ? Math.max(1, Math.trunc(configuredRemaining))
+      : 1) - 1;
+    if (remaining > 0) {
+      liveSuperseded[supersededMatchIndex] = { ...matched, remainingEchoes: remaining };
+    } else {
+      liveSuperseded.splice(supersededMatchIndex, 1);
+    }
+    if (liveSuperseded.length) {
+      container.__hmbPromptSupersededLocalValues = liveSuperseded;
+    } else {
+      delete container.__hmbPromptSupersededLocalValues;
+    }
+    // A newer authoritative Picker/Asset revision has already repainted the
+    // widget. Ignore only the exact delayed echo of the older local revision;
+    // a real disconnect carries a newer revision and remains authoritative.
+    return true;
+  }
+  if (liveSuperseded.length) {
+    container.__hmbPromptSupersededLocalValues = liveSuperseded;
+  } else {
+    delete container.__hmbPromptSupersededLocalValues;
+  }
+  if (!pending.length) return false;
   const livePending = pending.filter((item) => hmbPendingPromptEchoIsLive(item, now));
   const matchIndex = livePending.findIndex((item) => (
     item
@@ -2986,10 +3055,25 @@ export function hmbConsumePendingPromptStateEcho(container, nextProps) {
     && Boolean(nextProps.disabled) === Boolean(item.disabled)
   ));
   if (matchIndex < 0) {
-    // Any different canonical value or disabled flag is authoritative host
-    // state. Invalidate the complete local window so a later stale echo can
-    // never hide that newer external update.
-    hmbClearPendingPromptStateEchoes(container);
+    // A different canonical value or disabled flag is authoritative host
+    // state. Quarantine only local publications whose source revision is older
+    // than the incoming Picker/Asset revision. Ordinary same-revision edits and
+    // explicit newer disconnects must never be swallowed.
+    const incomingSourceRevision = normalizeSourceSyncRevision(
+      incomingState?.source_sync_revision,
+    );
+    const quarantined = [
+      ...liveSuperseded,
+      ...livePending.filter(
+        (item) => hmbPendingPromptSourceRevision(item) < incomingSourceRevision,
+      ),
+    ];
+    if (quarantined.length) {
+      container.__hmbPromptSupersededLocalValues = quarantined.slice(
+        -HMB_PROMPT_LOCAL_ECHO_QUEUE_LIMIT,
+      );
+    }
+    delete container.__hmbPromptPendingLocalValues;
     return false;
   }
   try {
@@ -3459,12 +3543,16 @@ function hmbSetVisible(element, visible) {
   element.setAttribute?.("aria-hidden", visible ? "false" : "true");
 }
 
+export function hmbImageRowHasExpandedLeftFields(item) {
+  return clean(item?.binding_scopes?.[0]) === "Custom scope";
+}
+
 function hmbRefreshImageSubtypeControls(row, item, state) {
   if (!row || !item) return;
   normalizeImageBindingFields(item, videoSlotCount(state));
   row.classList?.toggle(
     "image-expanded-left-fields",
-    clean(item.binding_scopes[0]) === "Custom scope" || Boolean(clean(item.asset_id)),
+    hmbImageRowHasExpandedLeftFields(item),
   );
   row.querySelectorAll?.('select[data-field="binding_scopes"]').forEach((select) => {
     const bindingIndex = Number(select.getAttribute("data-binding-index") || 0);
@@ -3622,7 +3710,7 @@ function renderImageRow(item, index, images, state) {
     : (rowManaged
       ? "Generator order is controlled by HMBImageAssetLibrary; Name and Prompt fields remain editable"
       : (item.asset_id ? `Asset ID: ${item.asset_id}` : ""));
-  const expandedLeftFields = clean(item.binding_scopes[0]) === "Custom scope";
+  const expandedLeftFields = hmbImageRowHasExpandedLeftFields(item);
   return `<div class="source-row image ${item.present ? "active" : "next"} ${rowManaged ? "asset-order-managed" : ""} ${verifiedAsset ? "asset-authority-managed" : ""} ${expandedLeftFields ? "image-expanded-left-fields" : ""}" data-kind="image" data-index="${index}">
     <div class="source-num image-index-cell image-drag-handle nodrag" data-image-drag-handle draggable="${dragEnabled ? "true" : "false"}" role="button" tabindex="${dragEnabled ? "0" : "-1"}" aria-label="${escapeHtml(dragEnabled ? uiText(state, "drag_image_row", "Drag or use arrow keys to reorder image source") : (orderManaged ? "Order is controlled by HMBImageAssetLibrary" : ""))}" title="${escapeHtml(dragEnabled ? uiText(state, "drag_image_row", "Drag to reorder image source") : (orderManaged ? "Order is controlled by HMBImageAssetLibrary" : ""))}">${String(item.slot).padStart(2, "0")}</div>
     <div class="source-label image-name-cell"><input class="source-label-input" data-field="label" maxlength="${MAX_IDENTIFIER_CHARS}" value="${escapeHtml(item.label)}" placeholder="${escapeHtml(uiText(state, "name", "Name"))}" title="${escapeHtml(identityTitle)}" ${verifiedAsset ? "readonly" : ""}/></div>

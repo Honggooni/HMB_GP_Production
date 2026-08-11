@@ -239,7 +239,7 @@ legacy_state["videos"][0].update(
         "control_role": "Primary Unified Shot Control",
     }
 )
-baseline_prompt = prompt._build_prompt_package(legacy_state)
+baseline_prompt = prompt._build_data_only_prompt_package(legacy_state)
 dormant_state = json.loads(json.dumps(legacy_state))
 dormant_state["images"][0]["frame_range_enabled"] = False
 dormant_state["images"][0]["frame_range_bindings"] = {
@@ -250,7 +250,7 @@ dormant_state["images"][0]["frame_range_bindings"] = {
         "ranges": [{"start": 1, "end": 48}],
     }
 }
-assert prompt._build_prompt_package(dormant_state) == baseline_prompt
+assert prompt._build_data_only_prompt_package(dormant_state) == baseline_prompt
 normalized_dormant = prompt._normalize_state(dormant_state)["images"][0]
 assert normalized_dormant["frame_range_bindings"] == {
     "@video1::Green": {
@@ -311,7 +311,10 @@ image["frame_range_bindings"] = {
         "ranges": [{"start": 30, "end": 40}],
     },
 }
-compiled = prompt._build_prompt_package(prompt_state)
+readable = prompt._build_prompt_package(prompt_state)
+assert "VIDEO SOURCE:" in readable
+assert "HMB JOB DATA (JSON):" not in readable
+compiled = prompt._build_data_only_prompt_package(prompt_state)
 compiled_lines = compiled.splitlines()
 assert len(compiled_lines) == 7
 assert compiled_lines[1] == "HMB JOB DATA (JSON):"
@@ -342,7 +345,7 @@ assert normalized_image["frame_range_bindings"]["@video3::Blue"]["ranges"] == [
 
 range_off_state = json.loads(json.dumps(prompt_state))
 range_off_state["images"][0]["frame_range_enabled"] = False
-assert "FRAME RANGE BINDING:" not in prompt._build_prompt_package(range_off_state)
+assert "FRAME RANGE BINDING:" not in prompt._build_data_only_prompt_package(range_off_state)
 normalized_range_off = prompt._normalize_state(range_off_state)["images"][0]
 assert set(normalized_range_off["frame_range_bindings"]) == {
     "@video1::Green",
@@ -369,14 +372,14 @@ assert normalized_range_restarted["frame_range_bindings"]["@video2::Green"]["ran
 assert normalized_range_restarted["frame_range_binding"] == normalized_range_restarted[
     "frame_range_bindings"
 ]["@video2::Green"]
-assert "FRAME RANGE BINDING:" not in prompt._build_prompt_package(range_restarted_state)
+assert "FRAME RANGE BINDING:" not in prompt._build_data_only_prompt_package(range_restarted_state)
 
 image["frame_range_bindings"]["@video2::Green"]["ranges"] = [{"start": 1, "end": 145}]
-assert "FRAME RANGE BINDING:" not in prompt._build_prompt_package(prompt_state)
+assert "FRAME RANGE BINDING:" not in prompt._build_data_only_prompt_package(prompt_state)
 
 missing_metadata_state = json.loads(json.dumps(prompt_state))
 missing_metadata_state["picker"]["frame_metadata"] = []
-assert "FRAME RANGE BINDING:" not in prompt._build_prompt_package(missing_metadata_state)
+assert "FRAME RANGE BINDING:" not in prompt._build_data_only_prompt_package(missing_metadata_state)
 
 
 # Picker metadata is optional when the user supplies an explicit manual frame
@@ -413,7 +416,7 @@ assert manual_metadata is not None
 assert manual_metadata["origin"] == "manual"
 assert manual_metadata["fps"] == 0.0
 assert (manual_metadata["start_frame"], manual_metadata["end_frame"]) == (1001, 1120)
-manual_compiled = prompt._build_prompt_package(manual_state)
+manual_compiled = prompt._build_data_only_prompt_package(manual_state)
 assert "FRAME RANGE BINDING:" not in manual_compiled
 assert "Frame domain = @video2 / Manual / Frames 1001–1120" not in manual_compiled
 assert "during Frames 1010–1020 and 1100–1110 only." not in manual_compiled
@@ -426,6 +429,6 @@ assert normalized_manual_binding["end_frame"] == 1120
 
 missing_manual_end = json.loads(json.dumps(manual_state))
 missing_manual_end["images"][0]["frame_range_bindings"]["@video2::Green"]["end_frame"] = None
-assert "FRAME RANGE BINDING:" not in prompt._build_prompt_package(missing_manual_end)
+assert "FRAME RANGE BINDING:" not in prompt._build_data_only_prompt_package(missing_manual_end)
 
 print("HMB Picker frame metadata and Prompt multi-frame range regression: PASS")

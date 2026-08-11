@@ -137,7 +137,7 @@ assert depth["picker_companion_kind"] == "depth"
 assert depth["picker_companion_source_uid"] == "mask"
 assert depth["picker_companion_source_slot"] == 3
 assert depth["picker_companion_validated"] is True
-compiled = prompt._build_prompt_package(reordered)
+compiled = prompt._build_data_only_prompt_package(reordered)
 compiled_job = prompt_job(compiled)
 assert compiled_job["videos"][0]["video"] == "@video1"
 assert compiled_job["videos"][0]["source_type"] == "Depth / Spatial Reference"
@@ -147,7 +147,7 @@ assert resolved_companion_video(compiled_job) == "@video3"
 # Stable UID wins over a stale serialized transient source slot.
 uid_authoritative = copy.deepcopy(reordered)
 uid_authoritative["videos"][0]["picker_companion_source_slot"] = 1
-uid_authoritative_prompt = prompt._build_prompt_package(uid_authoritative)
+uid_authoritative_prompt = prompt._build_data_only_prompt_package(uid_authoritative)
 uid_authoritative_job = prompt_job(uid_authoritative_prompt)
 assert uid_authoritative_job["videos"][0]["companion"]["source_uid"] == "mask"
 assert resolved_companion_video(uid_authoritative_job) == "@video3"
@@ -164,7 +164,7 @@ mismatched = prompt._apply_picker_payload(
     mismatch_contract,
     connected=True,
 )
-mismatch_prompt = prompt._build_prompt_package(mismatched)
+mismatch_prompt = prompt._build_data_only_prompt_package(mismatched)
 mismatch_job = prompt_job(mismatch_prompt)
 assert mismatch_job["videos"][0]["companion"]["source_uid"] == "mask"
 assert resolved_companion_video(mismatch_job) == "@video3"
@@ -189,7 +189,7 @@ motion = prompt._apply_picker_payload(
     motion_contract,
     connected=True,
 )
-motion_prompt = prompt._build_prompt_package(motion)
+motion_prompt = prompt._build_data_only_prompt_package(motion)
 assert motion["videos"][0]["picker_companion_kind"] == "motion_guide"
 assert motion["videos"][0]["picker_companion_source_slot"] == 3
 motion_job = prompt_job(motion_prompt)
@@ -203,7 +203,7 @@ standalone = prompt._apply_picker_payload(
     picker_payload(["depth"], standalone=True),
     connected=True,
 )
-standalone_prompt = prompt._build_prompt_package(standalone)
+standalone_prompt = prompt._build_data_only_prompt_package(standalone)
 assert standalone["videos"][0]["picker_companion_source_slot"] == 0
 standalone_companion = prompt_job(standalone_prompt)["videos"][0]["companion"]
 assert standalone_companion == {
@@ -220,7 +220,7 @@ missing = prompt._apply_picker_payload(
     picker_payload(["depth"], missing_source=True),
     connected=True,
 )
-missing_prompt = prompt._build_prompt_package(missing)
+missing_prompt = prompt._build_data_only_prompt_package(missing)
 assert missing["videos"][0]["picker_companion_source_slot"] == -1
 assert missing["videos"][0]["picker_companion_source_uid"] == "mask"
 assert "companion" not in prompt_job(missing_prompt)["videos"][0]
@@ -241,7 +241,7 @@ assert depth_after["slot"] == 3
 assert depth_after["keep_out"] == "Preserve the authored Depth exclusion."
 assert depth_after["picker_companion_source_uid"] == "mask"
 assert depth_after["picker_companion_source_slot"] == 1
-compiled_again = prompt._build_prompt_package(reordered_again)
+compiled_again = prompt._build_data_only_prompt_package(reordered_again)
 compiled_again_job = prompt_job(compiled_again)
 depth_job_after = next(
     item for item in compiled_again_job["videos"] if item["identity"]["video_uid"] == "depth"

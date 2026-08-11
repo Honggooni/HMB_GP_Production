@@ -63,7 +63,21 @@ timing.update(
 )
 state["videos"] = [fx, timing]
 
-compiled = prompt_library._build_prompt_package(state)
+visible = prompt_library._build_prompt_package(state)
+assert visible.startswith("HMB_GP_Production\n\nTARGET GENERATOR:\n")
+assert "IMAGE SOURCE:" in visible
+assert "IMAGE ROLE MAP:" in visible
+assert "VIDEO SOURCE:" in visible
+for hidden_machine_marker in (
+    "HMB JOB DATA (JSON):",
+    "FX/TIMING SOURCE DATA (JSON):",
+    "USER DESCRIPTION DATA (JSON):",
+    '"source_uid"',
+    '"video_uid"',
+):
+    assert hidden_machine_marker not in visible
+
+compiled = prompt_library._build_data_only_prompt_package(state)
 lines = [line for line in compiled.splitlines() if line.strip()]
 assert len(lines) == 7
 assert lines[0] == "HMB_GP_Production"
@@ -149,7 +163,7 @@ for forbidden_policy_phrase in (
 assert json.loads(lines[6])["SCENE_CONTEXT"] == "User-authored scene note."
 
 empty_contract = agent._assert_fx_timing_source_contract(
-    prompt_library._build_prompt_package(prompt_library._default_widget_state())
+    prompt_library._build_data_only_prompt_package(prompt_library._default_widget_state())
 )
 assert empty_contract["sources"] == []
 agent._assert_fx_candidate_matches_signed_runtime(empty_contract)
@@ -208,7 +222,7 @@ connector_state["source_intent_fallbacks"] = [
         "text": '{"decoded_frame_count":62,"maya_start_frame":101}',
     },
 ]
-connector_output = prompt_library._build_prompt_package(connector_state)
+connector_output = prompt_library._build_data_only_prompt_package(connector_state)
 assert "MALICIOUS CONNECTOR DESCRIPTION" not in connector_output
 assert "decoded_frame_count" not in connector_output
 assert json.loads(connector_output.splitlines()[6]) == {}
@@ -247,7 +261,7 @@ range_image.update(
 )
 range_state["videos"] = [range_video]
 range_state["images"] = [range_image]
-range_output = prompt_library._build_prompt_package(range_state)
+range_output = prompt_library._build_data_only_prompt_package(range_state)
 range_job = agent._assert_public_job_data_contract(range_output)
 range_fx = agent._assert_fx_timing_source_contract(range_output)
 range_record = range_job["frame_ranges"][0]
@@ -306,7 +320,7 @@ inactive_range_image.update(
     }
 )
 inactive_range_state["images"] = [inactive_range_image]
-inactive_range_output = prompt_library._build_prompt_package(inactive_range_state)
+inactive_range_output = prompt_library._build_data_only_prompt_package(inactive_range_state)
 inactive_range_job = agent._assert_public_job_data_contract(inactive_range_output)
 agent._assert_fx_timing_source_contract(inactive_range_output)
 inactive_record = inactive_range_job["frame_ranges"][0]
@@ -347,7 +361,7 @@ for separator in ("\u2028", "\u2029", "\u0085"):
     unicode_state = prompt_library._default_widget_state()
     expected_unicode_text = f"alpha{separator}beta"
     unicode_state["text"]["SCENE_CONTEXT"] = expected_unicode_text
-    unicode_output = prompt_library._build_prompt_package(unicode_state)
+    unicode_output = prompt_library._build_data_only_prompt_package(unicode_state)
     unicode_job = agent._assert_public_job_data_contract(unicode_output)
     assert unicode_job["schema"] == "hmb-public-job-data"
     assert json.loads(unicode_output.split("\n")[6])["SCENE_CONTEXT"] == (
@@ -370,7 +384,7 @@ for separator in ("\u2028", "\u2029", "\u0085"):
         }
     )
     fx_unicode_state["videos"] = [fx_unicode_video]
-    fx_unicode_output = prompt_library._build_prompt_package(fx_unicode_state)
+    fx_unicode_output = prompt_library._build_data_only_prompt_package(fx_unicode_state)
     fx_unicode_job = agent._assert_public_job_data_contract(fx_unicode_output)
     fx_unicode_contract = agent._assert_fx_timing_source_contract(
         fx_unicode_output
@@ -450,7 +464,7 @@ def range_capacity_state(
 
 # Six ordinary images with 100 selected ranges each must not hit the former
 # 500-segment Agent gate.
-six_hundred_output = prompt_library._build_prompt_package(
+six_hundred_output = prompt_library._build_data_only_prompt_package(
     range_capacity_state(6, 1, 100, "capacity-id")
 )
 six_hundred_fx = agent._assert_fx_timing_source_contract(six_hundred_output)
@@ -459,7 +473,7 @@ assert len(six_hundred_fx["sources"][0]["range_segments"]) == 600
 # Multiple Color Pick bindings on one Image/Video address receive stable,
 # content-addressed IDs rather than colliding on their local range ordinal.
 multi_color_state = range_capacity_state(1, 2, 1, "multi-color-id")
-multi_color_output = prompt_library._build_prompt_package(multi_color_state)
+multi_color_output = prompt_library._build_data_only_prompt_package(multi_color_state)
 multi_color_fx = agent._assert_fx_timing_source_contract(multi_color_output)
 multi_color_segments = multi_color_fx["sources"][0]["range_segments"]
 multi_color_ids = {segment["segment_id"] for segment in multi_color_segments}
@@ -479,7 +493,7 @@ reordered_image["frame_range_bindings"] = dict(
     reversed(list(reordered_image["frame_range_bindings"].items()))
 )
 reordered_fx = agent._assert_fx_timing_source_contract(
-    prompt_library._build_prompt_package(multi_color_state)
+    prompt_library._build_data_only_prompt_package(multi_color_state)
 )
 assert {
     segment["segment_id"]
@@ -557,7 +571,7 @@ cue_video.update(
 )
 cue_state["videos"] = [cue_video]
 cue_contract = agent._assert_fx_timing_source_contract(
-    prompt_library._build_prompt_package(cue_state)
+    prompt_library._build_data_only_prompt_package(cue_state)
 )
 assert len(cue_contract["sources"][0]["timing_cues"]) == 2
 
@@ -579,7 +593,7 @@ maximum_state["text"].update(
         "PRESERVED_TEXT": "\\" * prompt_library.MAX_DESCRIPTION_CHARS,
     }
 )
-maximum_output = prompt_library._build_prompt_package(maximum_state)
+maximum_output = prompt_library._build_data_only_prompt_package(maximum_state)
 maximum_lines = maximum_output.split("\n")
 maximum_fx = json.loads(maximum_lines[4])
 maximum_segments = maximum_fx["sources"][0]["range_segments"]

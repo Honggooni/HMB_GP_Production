@@ -246,7 +246,7 @@ goal_state["images"] = [{
     "binding_video_slots": [3],
 }]
 goal_state["text"]["SCENE_CONTEXT"] = "Resolve @video5 as a dream-memory rhythm"
-goal_prompt = prompt._build_prompt_package(goal_state)
+goal_prompt = prompt._build_data_only_prompt_package(goal_state)
 assert goal_state["images"][0]["legacy_relationship_targets"] == [
     "Door lock",
     "Memory echo",
@@ -273,7 +273,7 @@ assert goal_user == {
 
 malformed_text_state = prompt._default_widget_state()
 malformed_text_state["text"]["PRESERVED_TEXT"] = "free readable words\n[Future Tag] exact future phrase"
-malformed_prompt = prompt._build_prompt_package(malformed_text_state)
+malformed_prompt = prompt._build_data_only_prompt_package(malformed_text_state)
 assert "PRESERVED_TEXT_DESCRIPTIVE_FALLBACK" not in malformed_prompt
 malformed_user = json.loads(malformed_prompt.splitlines()[6])
 assert malformed_user == {

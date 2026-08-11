@@ -585,7 +585,7 @@ try:
         for item in selected_hero["image_asset"]["dormant_manual_rows"]
         if item["owner"]
     } == {"manual owner-only target"}
-    selected_prompt = prompt_library._build_prompt_package(selected_hero)
+    selected_prompt = prompt_library._build_data_only_prompt_package(selected_hero)
     selected_lines = selected_prompt.splitlines()
     assert len(selected_lines) == 7
     selected_job = json.loads(selected_lines[2])

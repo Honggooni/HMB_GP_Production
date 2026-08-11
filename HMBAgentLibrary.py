@@ -97,6 +97,17 @@ _PUBLIC_JOB_CONTRACT_SCHEMA = "hmb-public-job-data"
 _PUBLIC_JOB_CONTRACT_VERSION = 1
 _USER_DESCRIPTION_DATA_HEADER = "USER DESCRIPTION DATA (JSON):"
 _RUNTIME_FX_SCOPE_HEADER = "HMB VERIFIED FX/TIMING RUNTIME SCOPE (JSON):"
+_PAIRED_PROMPT_SNAPSHOT_SCHEMA = "hmb-prompt-paired-snapshot"
+_PAIRED_PROMPT_SNAPSHOT_VERSION = 1
+_PAIRED_PROMPT_SNAPSHOT_KEYS = frozenset({
+    "schema",
+    "version",
+    "generation",
+    "visible_sha256",
+    "machine_sha256",
+    "machine_prompt",
+})
+_VERIFIED_PROMPT_SOURCE_ATTRIBUTE = "_hmb_verified_prompt_source_node"
 _TIMING_CUE_PHASES = frozenset({"point", "onset", "peak", "falloff", "end"})
 _LOCAL_POINT_UNITS = frozenset({
     "scene_unit", "millimeter", "centimeter", "meter", "inch", "foot"
@@ -202,6 +213,11 @@ _HMB_ANY_BINDING_MARKERS = (
     _PUBLIC_JOB_CONTRACT_HEADER,
     _FX_TIMING_CONTRACT_HEADER,
     _USER_DESCRIPTION_DATA_HEADER,
+)
+_HMB_READABLE_PROMPT_MARKERS = (
+    "TARGET GENERATOR:",
+    "IMAGE SOURCE:",
+    "VIDEO SOURCE:",
 )
 _LEGACY_HMB_ELEMENTS = {
     "PROJECT",
@@ -646,9 +662,14 @@ def _is_hmb_prompt_library_payload(value: Any) -> bool:
     text = str(value or "").strip()
     if not text or not text.startswith(_HMB_TITLE):
         return False
-    if not all(marker in text for marker in _HMB_REQUIRED_MARKERS):
-        return False
-    return any(marker in text for marker in _HMB_ANY_BINDING_MARKERS)
+    machine_envelope = all(marker in text for marker in _HMB_REQUIRED_MARKERS)
+    readable_document = all(
+        marker in text for marker in _HMB_READABLE_PROMPT_MARKERS
+    )
+    return bool(
+        (machine_envelope and any(marker in text for marker in _HMB_ANY_BINDING_MARKERS))
+        or readable_document
+    )
 
 
 def _prompt_policy_source_identity(
@@ -1919,6 +1940,9 @@ def _is_direct_hmb_prompt_library_connection(
     """
 
     try:
+        # Never let a source retained by an earlier verification survive a
+        # missing, foreign, or malformed edge on the next execution.
+        setattr(node, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
         node_name = str(getattr(node, "name", "") or "").strip()
         if not node_name:
             raise RuntimeError("Agent node identity is unavailable.")
@@ -1982,14 +2006,88 @@ def _is_direct_hmb_prompt_library_connection(
         metadata = getattr(source_node, "metadata", None)
         if not isinstance(metadata, dict):
             return False
-        return (
+        verified = (
             str(metadata.get("library") or "") == _HMB_LIBRARY_NAME
             and str(metadata.get("node_type") or "") == _HMB_PROMPT_NODE_TYPE
         )
+        if not verified:
+            return False
+        # The exact registered source instance is the private paired-data
+        # transport. PROMPT_OUT itself remains an ordinary human-readable str.
+        setattr(node, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, source_node)
+        return True
     except Exception as exc:
         raise RuntimeError(
             "HMBAgentLibrary Prompt connection topology could not be verified."
         ) from exc
+
+
+def _prompt_transport_text(prompt_value: Any) -> str:
+    value = getattr(prompt_value, "value", prompt_value)
+    return str(value or "")
+
+
+def _prompt_text_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _paired_machine_prompt(node: Any, prompt_value: Any) -> str:
+    """Return the machine envelope paired with one visible ``PROMPT_OUT``.
+
+    A verified live HMB Prompt source must provide an exact, hashed paired
+    snapshot. Tests and legacy in-process mocks that bypass graph resolution
+    have no retained source instance, so they may use the input itself only
+    when it already passes the complete legacy seven-line machine contract.
+    """
+
+    visible_prompt = _prompt_transport_text(prompt_value)
+    source_node = getattr(node, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
+    if source_node is None:
+        # Compatibility is deliberately narrow: readable prose, copied text,
+        # and partially shaped JSON cannot become an HMB machine contract.
+        _assert_public_job_data_contract(visible_prompt)
+        _assert_fx_timing_source_contract(visible_prompt)
+        return visible_prompt
+
+    snapshot_getter = getattr(source_node, "_hmb_agent_prompt_snapshot", None)
+    if not callable(snapshot_getter):
+        raise RuntimeError("HMB Prompt paired snapshot is unavailable.")
+    snapshot = snapshot_getter(visible_prompt)
+    if (
+        not isinstance(snapshot, dict)
+        or set(snapshot) != _PAIRED_PROMPT_SNAPSHOT_KEYS
+        or snapshot.get("schema") != _PAIRED_PROMPT_SNAPSHOT_SCHEMA
+        or snapshot.get("version") != _PAIRED_PROMPT_SNAPSHOT_VERSION
+        or not isinstance(snapshot.get("generation"), int)
+        or isinstance(snapshot.get("generation"), bool)
+        or snapshot.get("generation") < 1
+    ):
+        raise RuntimeError("HMB Prompt paired snapshot shape is invalid.")
+
+    visible_sha256 = snapshot.get("visible_sha256")
+    machine_sha256 = snapshot.get("machine_sha256")
+    machine_prompt = snapshot.get("machine_prompt")
+    if (
+        not visible_prompt
+        or not isinstance(visible_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", visible_sha256) is None
+        or not isinstance(machine_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", machine_sha256) is None
+        or not isinstance(machine_prompt, str)
+        or not machine_prompt
+    ):
+        raise RuntimeError("HMB Prompt paired snapshot fields are invalid.")
+    if not hmac.compare_digest(
+        visible_sha256,
+        _prompt_text_sha256(visible_prompt),
+    ):
+        raise RuntimeError("HMB Prompt visible snapshot identity is invalid.")
+    if not hmac.compare_digest(
+        machine_sha256,
+        _prompt_text_sha256(machine_prompt),
+    ):
+        raise RuntimeError("HMB Prompt machine snapshot identity is invalid.")
+    return machine_prompt
 
 
 def _ruleset_contains_exact_rule(item: Any, rule_text: str) -> bool:
@@ -2661,6 +2759,7 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_ruleset_names: tuple[str, str] = ("", "")
         self._hmb_policy_identity: dict[str, str] = {}
         self._hmb_runtime_prompt = ""
+        self._hmb_verified_prompt_source_node = None
         self._hmb_native_calls_this_process = 0
         self._hmb_capture_publications = False
         self._hmb_publication_buffer: dict[str, str] = {
@@ -2891,6 +2990,7 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_ruleset_names = ("", "")
         self._hmb_policy_identity = {}
         self._hmb_runtime_prompt = ""
+        self._hmb_verified_prompt_source_node = None
         self._hmb_publication_buffer = {"output": "", "logs": ""}
         self._hmb_scheduler_step_failed = False
 
@@ -3120,19 +3220,21 @@ class HMBAgentLibrary(_BaseAgent):
 
         try:
             prompt_value = self.get_parameter_value(_AGENT_PROMPT_INPUT_PARAMETER)
-            _assert_public_job_data_contract(prompt_value)
-            fx_timing_contract = _assert_fx_timing_source_contract(prompt_value)
+            machine_prompt = _paired_machine_prompt(self, prompt_value)
+            _assert_public_job_data_contract(machine_prompt)
+            fx_timing_contract = _assert_fx_timing_source_contract(machine_prompt)
             _assert_fx_candidate_matches_signed_runtime(fx_timing_contract)
-            # The public contract contains only raw selections and validated
-            # addresses. Shared boundaries and range-scoped cues are derived
-            # only now, after the signed 4+4 runtime has loaded successfully.
+            # The paired machine contract contains only raw selections and
+            # validated addresses. Human-readable PROMPT_OUT prose is never
+            # parsed. Shared boundaries and range-scoped cues are derived only
+            # now, after the signed 4+4 runtime has loaded successfully.
             runtime_scope = _derive_fx_timing_runtime_scope(
                 fx_timing_contract,
                 policy_rules=self._hmb_policy_rules,
                 binding_rules=self._hmb_binding_rules,
             )
             self._hmb_runtime_prompt = _compose_hmb_runtime_prompt(
-                prompt_value, runtime_scope
+                machine_prompt, runtime_scope
             )
         except _HMBPolicyIdentityMismatchError:
             self._publish_hmb_execution_block(
@@ -3146,8 +3248,11 @@ class HMBAgentLibrary(_BaseAgent):
             # fragments. The public message is fixed and policy-free.
             self._publish_hmb_execution_block(_HMB_SOURCE_CONTRACT_INVALID_MESSAGE)
             raise RuntimeError(_HMB_SOURCE_CONTRACT_INVALID_MESSAGE) from None
-        if _contains_internal_rule_text(
-            prompt_value, self._hmb_policy, self._hmb_binding
+        if any(
+            _contains_internal_rule_text(
+                candidate, self._hmb_policy, self._hmb_binding
+            )
+            for candidate in (prompt_value, machine_prompt)
         ):
             self._publish_hmb_execution_block(_PUBLIC_OUTPUT_BLOCKED)
             raise RuntimeError(_PUBLIC_OUTPUT_BLOCKED) from None

@@ -367,10 +367,47 @@ const subtypeSource = promptSource.slice(
 assert.match(subtypeSource, /<div class="binding-scope-entry">[\s\S]*?\$\{customInput\}<\/div>/);
 assert.doesNotMatch(subtypeSource, /binding_scopes\.map/);
 assert.doesNotMatch(promptSource, /function renderCustomScopeControls/);
+const singlePickAssetRow = {
+  asset_id: "registered-character",
+  binding_scopes: ["Full body / full appearance"],
+  color_picks: ["Red"],
+};
+const twoPickAssetRow = {
+  ...singlePickAssetRow,
+  color_picks: ["Red", "Yellow"],
+};
+assert.equal(
+  prompt.hmbImageRowHasExpandedLeftFields(singlePickAssetRow),
+  false,
+  "One Color Pick must not push Range down for a registered asset with no visible expanded field.",
+);
+assert.equal(
+  prompt.hmbImageRowHasExpandedLeftFields(twoPickAssetRow),
+  false,
+  "Adding a second Color Pick must not change Range geometry.",
+);
+assert.equal(
+  prompt.hmbImageRowHasExpandedLeftFields({
+    ...singlePickAssetRow,
+    binding_scopes: ["Custom scope"],
+  }),
+  true,
+  "Only the visible Custom Sub Type input should expand the left-side content.",
+);
 assert.match(
   promptSource,
-  /const expandedLeftFields = clean\(item\.binding_scopes\[0\]\) === "Custom scope";/,
-  "Only the visible Custom Sub Type input should expand the left-side content.",
+  /const expandedLeftFields = hmbImageRowHasExpandedLeftFields\(item\);/,
+  "Initial render and live refresh must share one Range-layout predicate.",
+);
+const liveSubtypeRefreshSource = promptSource.slice(
+  promptSource.indexOf("function hmbRefreshImageSubtypeControls"),
+  promptSource.indexOf("function hmbRefreshImageCustomPanel"),
+);
+assert.match(liveSubtypeRefreshSource, /hmbImageRowHasExpandedLeftFields\(item\)/);
+assert.doesNotMatch(
+  liveSubtypeRefreshSource,
+  /asset_id/,
+  "A hidden Asset ID must never select the 72px expanded Range offset during live Picker refresh.",
 );
 assert.match(
   promptSource,
@@ -493,12 +530,86 @@ assert.equal(
 );
 assert.equal(externalUpdateContainer.__hmbPromptPendingLocalValues, undefined);
 assert.equal(
+  externalUpdateContainer.__hmbPromptSupersededLocalValues,
+  undefined,
+  "A same-revision ordinary external edit must not create a source-echo quarantine.",
+);
+assert.equal(
   prompt.hmbConsumePendingPromptStateEcho(
     externalUpdateContainer,
     { value: canonicalEchoValue, disabled: false },
   ),
   false,
-  "A stale local value must not be swallowed after a newer external update.",
+  "A legitimate same-revision external revert must remain authoritative.",
+);
+
+const beforePickerConnect = prompt.normalizeState({
+  source_sync_revision: 0,
+  images: [{
+    label: "Jett",
+    source_type: "Character Appearance",
+    color_picks: ["Red"],
+    binding_video_slots: [1],
+  }],
+  videos: [{ label: "", source_type: "Role Required / Select Video Type" }],
+  picker: { enabled: false },
+});
+const afterPickerConnect = prompt.normalizeState({
+  ...beforePickerConnect,
+  source_sync_revision: 1,
+  videos: [
+    { label: "shot-color", source_type: "Maya Preview / Playblast", present: true },
+    { label: "shot-mask", source_type: "Mask / Control Reference", present: true },
+    { label: "shot-depth", source_type: "Depth / Spatial Reference", present: true },
+  ],
+  picker: {
+    enabled: true,
+    run_id: "picker-first-ready",
+    selected_video_count: 3,
+    ordered_video_uids: ["color", "mask", "depth"],
+    order_managed: true,
+  },
+});
+const beforePickerValue = JSON.stringify(beforePickerConnect);
+const afterPickerValue = JSON.stringify(afterPickerConnect);
+const firstPickerConnectContainer = {
+  __hmbPromptPendingLocalValues: [{
+    value: beforePickerValue,
+    disabled: false,
+    expiresAt: Date.now() + 5000,
+    remainingEchoes: 3,
+  }],
+};
+assert.equal(prompt.hmbImagePickerEnabled(beforePickerConnect), false);
+assert.equal(prompt.hmbImagePickerEnabled(afterPickerConnect), true);
+assert.equal(
+  prompt.hmbConsumePendingPromptStateEcho(
+    firstPickerConnectContainer,
+    { value: afterPickerValue, disabled: false },
+  ),
+  false,
+  "The first populated PICKER_IN payload must reach applyProps and activate Video Source Binding immediately.",
+);
+assert.equal(firstPickerConnectContainer.__hmbPromptSupersededLocalValues.length, 1);
+const afterAuthoritativeDisconnect = prompt.normalizeState({
+  ...beforePickerConnect,
+  source_sync_revision: 2,
+});
+assert.equal(
+  prompt.hmbConsumePendingPromptStateEcho(
+    firstPickerConnectContainer,
+    { value: JSON.stringify(afterAuthoritativeDisconnect), disabled: false },
+  ),
+  false,
+  "A newer source revision must allow a real Picker disconnect immediately.",
+);
+assert.equal(
+  prompt.hmbConsumePendingPromptStateEcho(
+    firstPickerConnectContainer,
+    { value: beforePickerValue, disabled: false },
+  ),
+  true,
+  "A late pre-connection echo must not deactivate the newly populated video rows.",
 );
 
 const expiredEchoContainer = {

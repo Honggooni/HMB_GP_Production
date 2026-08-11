@@ -151,7 +151,10 @@ assert without_picker["picker"]["enabled"] is False
 
 
 def assert_prompt_is_additive(state, label: str) -> str:
-    compiled = prompt._build_prompt_package(state)
+    readable = prompt._build_prompt_package(state)
+    assert "TARGET GENERATOR:" in readable, label
+    assert "HMB JOB DATA (JSON):" not in readable, label
+    compiled = prompt._build_data_only_prompt_package(state)
     job, fx_contract, user_data = prompt_sections(compiled)
     assert job["schema"] == "hmb-public-job-data", label
     assert fx_contract["schema"] == "hmb-fx-timing-source-facts", label
@@ -247,7 +250,7 @@ prompt_states["IVPA"] = copy.deepcopy(prompt_states["IVP"])
 for composition_name, composition_state in prompt_states.items():
     assert_prompt_is_additive(composition_state, composition_name)
 
-color_direct_prompt = prompt._build_prompt_package(prompt_states["VP"])
+color_direct_prompt = prompt._build_data_only_prompt_package(prompt_states["VP"])
 color_direct_job, color_direct_fx, color_direct_user = prompt_sections(
     color_direct_prompt
 )
@@ -271,7 +274,7 @@ technical_error_state = prompt._default_widget_state()
 technical_error_state["picker"]["contract_errors"] = [
     "PICKER_OUT contains duplicate rows for @video2."
 ]
-technical_error_prompt = prompt._build_prompt_package(technical_error_state)
+technical_error_prompt = prompt._build_data_only_prompt_package(technical_error_state)
 technical_job, technical_fx, technical_user = prompt_sections(technical_error_prompt)
 assert technical_job["images"] == []
 assert technical_job["videos"] == []
@@ -344,7 +347,7 @@ prompt._remap_image_source_references_in_state(preserved_state, {2: 1})
 assert "[On-screen Text] @image2 literal" in preserved_state["text"]["PRESERVED_TEXT"]
 assert "untagged @image2 descriptive words" in preserved_state["text"]["PRESERVED_TEXT"]
 assert preserved_state["text"]["SCENE_CONTEXT"] == "Follow @image1 composition."
-preserved_prompt = prompt._build_prompt_package(preserved_state)
+preserved_prompt = prompt._build_data_only_prompt_package(preserved_state)
 preserved_user = prompt_sections(preserved_prompt)[2]
 assert preserved_user == {
     "SCENE_CONTEXT": "Follow @image1 composition.",
@@ -427,7 +430,7 @@ long_state["text"].update({
     "EMOTION_INTENT": "E" * prompt.MAX_DESCRIPTION_CHARS,
     "VIDEO_VFX": "V" * prompt.MAX_VIDEO_VFX_CHARS,
 })
-long_prompt = prompt._build_prompt_package(long_state)
+long_prompt = prompt._build_data_only_prompt_package(long_state)
 long_job, long_fx, long_user = prompt_sections(long_prompt)
 assert len(long_job["videos"]) == prompt.MAX_VIDEOS
 assert long_fx["sources"] == []

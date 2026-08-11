@@ -288,7 +288,7 @@ assert motion_row["picker_motion_guide_summary"] == {
     "final_blendshape_values_in_sidecar": True,
     "raw_curve_geometry_rendered": False,
 }
-compiled_prompt = prompt._build_prompt_package(applied)
+compiled_prompt = prompt._build_data_only_prompt_package(applied)
 compiled_lines = compiled_prompt.splitlines()
 assert len(compiled_lines) == 7
 assert compiled_lines[0] == "HMB_GP_Production"

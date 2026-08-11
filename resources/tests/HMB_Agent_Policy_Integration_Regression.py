@@ -12,7 +12,7 @@ from _hmb_private_policy_fixture import install_private_policy_reader
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.6.1"
+EXPECTED_RELEASE_VERSION = "0.6.20"
 EXPECTED_POLICY_VERSION = "2026-08-11.agent-shot-quality.v4.1"
 EXPECTED_CONTRACT_SHA256 = "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
 EXPECTED_SERVER_POLICY_SHA256 = "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
@@ -138,7 +138,9 @@ for required_field in (
 # opts into the structured 4+4 Behaviors. Plain text, copied HMB text, and direct
 # Image/Video payloads remain stock native Agent requests.
 plain_prompt = "Independent designer request using the currently available inputs."
-empty_hmb_prompt = prompt._build_prompt_package(prompt._default_widget_state())
+empty_hmb_prompt = prompt._build_data_only_prompt_package(
+    prompt._default_widget_state()
+)
 assert not agent._is_hmb_prompt_library_payload(plain_prompt)
 assert agent._is_hmb_prompt_library_payload(empty_hmb_prompt)
 assert policy not in empty_hmb_prompt
@@ -343,9 +345,9 @@ mixed_state["videos"][0].update({
 })
 payload_variants = (
     empty_hmb_prompt,
-    prompt._build_prompt_package(image_state),
-    prompt._build_prompt_package(video_state),
-    prompt._build_prompt_package(mixed_state),
+    prompt._build_data_only_prompt_package(image_state),
+    prompt._build_data_only_prompt_package(video_state),
+    prompt._build_data_only_prompt_package(mixed_state),
 )
 for variant in payload_variants:
     assert agent._is_hmb_prompt_library_payload(variant)

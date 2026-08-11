@@ -887,7 +887,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.6.1"
+assert manifest["metadata"]["library_version"] == "0.6.20"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
@@ -2527,7 +2527,7 @@ assert applied["videos"][0]["label"] == "shot_playblast_1"
 assert applied["videos"][1]["label"] == "shot_playblast_2"
 assert applied["videos"][0]["source_type"] == "Maya Preview / Playblast"
 assert applied["videos"][0]["control_role"] == ""
-compiled_picker_prompt = prompt._build_prompt_package(applied)
+compiled_picker_prompt = prompt._build_data_only_prompt_package(applied)
 assert agent._is_hmb_prompt_library_payload(compiled_picker_prompt)
 
 # The four patterns use reserved categorical Surface Shader IDs. A host-side

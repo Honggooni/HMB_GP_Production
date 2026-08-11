@@ -660,7 +660,7 @@ legacy_invalid_state = prompt._apply_picker_payload(
 assert_auto_depth_preserved_as_independent_media(legacy_invalid_state)
 legacy_invalid_state["videos"][1]["label"] = "manual-new-label"
 legacy_invalid_state["videos"][1]["present"] = True
-legacy_reactivated_prompt = prompt._build_prompt_package(legacy_invalid_state)
+legacy_reactivated_prompt = prompt._build_data_only_prompt_package(legacy_invalid_state)
 legacy_lines = [line for line in legacy_reactivated_prompt.splitlines() if line]
 assert len(legacy_lines) == 7
 assert legacy_lines[0] == "HMB_GP_Production"

@@ -92,6 +92,8 @@ MAX_FRAME_RANGES_PER_BINDING = 100
 MAX_MANUAL_FRAME_NUMBER = 9999
 VIDEO_REFERENCE_CAPABILITIES_SCHEMA = "hmb-video-reference-capabilities"
 VIDEO_REFERENCE_CAPABILITIES_VERSION = 1
+VIDEO_FRAME_DOMAIN_SCHEMA = "hmb-video-frame-domain"
+VIDEO_FRAME_DOMAIN_VERSION = 1
 FX_TIMING_CONTRACT_SCHEMA = "hmb-fx-timing-source-facts"
 FX_TIMING_CONTRACT_VERSION = 3
 FX_TIMING_CONTRACT_HEADER = "FX/TIMING SOURCE DATA (JSON):"
@@ -131,6 +133,8 @@ WIDGET_NAME = "HMBPromptLibraryScopedBindingWidget"
 WIDGET_LIBRARY_NAME = "HMB_GP_Production"
 STATE_SCHEMA = "prompt-library-state"
 MODE_NAME = "prompt_only_role_dashboard"
+SOURCE_SYNC_REVISION_KEY = "source_sync_revision"
+MAX_SOURCE_SYNC_REVISION = (1 << 53) - 1
 UI_RESIZE_MODE = "stacked_outer_1000"
 GROUP_START_HEIGHTS = {
     "imageSources": 500,
@@ -1233,6 +1237,7 @@ def _default_widget_state() -> Dict[str, Any]:
     return {
         "schema": STATE_SCHEMA,
         "mode": MODE_NAME,
+        SOURCE_SYNC_REVISION_KEY: 0,
         "image_taxonomy": _image_taxonomy_payload(),
         "images": [_default_image_item(slot) for slot in range(1, 5)],
         "videos": [_default_video_item(1)],
@@ -2719,6 +2724,14 @@ def _normalize_dormant_video_rows(
 
 
 def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        source_sync_revision = int(state.get(SOURCE_SYNC_REVISION_KEY) or 0)
+    except Exception:
+        source_sync_revision = 0
+    source_sync_revision = max(
+        0,
+        min(MAX_SOURCE_SYNC_REVISION, source_sync_revision),
+    )
     source_intent_fallbacks = _normalize_source_intent_fallbacks(
         state.get(_SOURCE_INTENT_FALLBACKS_KEY)
     )
@@ -2887,6 +2900,7 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "schema": STATE_SCHEMA,
         "mode": MODE_NAME,
+        SOURCE_SYNC_REVISION_KEY: source_sync_revision,
         "theme": "dark-neon",
         "image_taxonomy": _image_taxonomy_payload(),
         "images": images,
@@ -2910,6 +2924,209 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
 def _subject_number(owner: str) -> int | None:
     m = re.match(r"^Subject\s+(\d+)$", owner or "")
     return int(m.group(1)) if m else None
+
+
+def _target_text(owner: str, default: str) -> str:
+    owner = _clean_string(owner)
+    if _subject_number(owner):
+        return f"image {_subject_number(owner)}"
+    return owner or default
+
+
+def _detail_suffix(scope: str, extra_detail: str = "") -> str:
+    parts = [_clean_string(scope), _clean_string(extra_detail)]
+    parts = [part for part in parts if part]
+    return " / " + " / ".join(parts) if parts else ""
+
+
+def _target_function(scope: str) -> str:
+    if scope == "Handheld prop":
+        return "holder"
+    if scope == "Attached accessory":
+        return "attachment subject"
+    if scope == "Interactive scene prop":
+        return "interaction subject"
+    return "production subject"
+
+
+def _target_function_suffix(scope: str) -> str:
+    if scope not in {
+        "Handheld prop",
+        "Attached accessory",
+        "Interactive scene prop",
+    }:
+        return ""
+    return f" / Target function = {_target_function(scope)}"
+
+
+def _image_role_line(item: Dict[str, Any], seq: int) -> str:
+    """Render one user-readable image role without transport metadata."""
+
+    token = f"@image{seq}"
+    source_type_choice = _public_single_line(item.get("source_type"))
+    source_type = _public_single_line(_effective_image_source_type(item))
+    owner = _public_single_line(_effective_target(item, f"image {seq}"))
+    scopes = [
+        _public_single_line(scope)
+        for scope in (_non_empty_binding_scopes(item) or [""])
+    ]
+
+    def line_for(scope: str) -> str:
+        suffix = _detail_suffix(scope)
+        if source_type_choice == "Character Appearance":
+            return (
+                f"{owner} / Approved final appearance source = {token}{suffix} / "
+                "Authority = intrinsic identity, color, pattern, and material character; "
+                "white backdrop, studio lighting, baked highlight/shadow, matte spill, "
+                "and halo are not scene-light authority"
+            )
+        if source_type_choice == "Partial Character Detail":
+            return f"{owner} / Partial character detail source = {token}{suffix}"
+        if source_type_choice == "Prop / Accessory":
+            return (
+                f"{owner} prop / accessory source = {token}{suffix}"
+                f"{_target_function_suffix(scope)} / Authority = intrinsic prop appearance "
+                "only; reference lighting is not inherited"
+            )
+        if source_type_choice == "Costume / Clothing":
+            return f"{owner} costume / clothing source = {token}{suffix}"
+        if source_type_choice == "Environment / Background":
+            return (
+                f"{owner} / Environment / background source = {token}{suffix} / "
+                "Authority = continuous environment appearance and target lighting context, "
+                "including dummy regions"
+            )
+        if source_type_choice == "Sky / Exterior Background":
+            return f"{owner} / Sky / exterior background source = {token}{suffix}"
+        if source_type_choice == "Set / Structure":
+            return f"{owner} / Set / structure source = {token}{suffix}"
+        if source_type_choice == "Foreground / Ground":
+            return f"{owner} / Foreground / ground source = {token}{suffix}"
+        if source_type_choice == "Color / Look Reference":
+            return f"{owner} / Color / look reference = {token}{suffix}"
+        if source_type_choice == "Color + Look + Lighting Mood Reference":
+            return f"{owner} / Color / look / lighting reference = {token}{suffix}"
+        if source_type_choice == "Lighting / Atmosphere Reference":
+            return f"{owner} / Lighting / atmosphere source = {token}{suffix}"
+        if source_type_choice == "Scale / Composition Reference":
+            return f"{owner} / Scale / composition reference = {token}{suffix}"
+        if source_type_choice == "Custom":
+            return f"{owner} / {source_type} = {token}{suffix}"
+        return f"{owner} / Unspecified image role = {token}{suffix}"
+
+    lines: List[str] = []
+    for scope in scopes:
+        line = line_for(scope)
+        if line not in lines:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _clean_replacement_marker(marker: Any, image_seq: int) -> str:
+    marker_text = _clean_string(marker)
+    if not marker_text:
+        return ""
+    if "=" in marker_text:
+        marker_text = marker_text.split("=", 1)[1].strip()
+    token_pattern = r"\s*/\s*@image\d+\b\s*"
+    previous = None
+    while previous != marker_text:
+        previous = marker_text
+        marker_text = re.sub(token_pattern + r"$", "", marker_text).strip()
+    return re.sub(r"\s+", " ", marker_text).strip(" /\t")
+
+
+def _image_replacement_line(item: Dict[str, Any], seq: int) -> str | None:
+    """Render only explicit marker bindings; blank marker addresses stay omitted."""
+
+    explicit_marker = _clean_replacement_marker(item.get("preview_marker"), seq)
+    source_type = _public_single_line(item.get("source_type"))
+    owner = _public_single_line(_effective_target(item, f"image {seq}"))
+
+    def format_line(marker: str, scope: str) -> str:
+        if source_type == "Character Appearance":
+            label = f"{owner} / {scope}" if scope else owner
+            return f"{label} replaces = {marker} / @image{seq}"
+        if source_type == "Partial Character Detail":
+            return (
+                f"{owner} partial detail guides = {marker} / @image{seq} / "
+                f"{scope or 'specified detail only'}"
+            )
+        if source_type in ("Prop / Accessory", "Costume / Clothing"):
+            label = scope or (
+                "prop / accessory"
+                if source_type == "Prop / Accessory"
+                else "costume / clothing detail"
+            )
+            target_suffix = (
+                _target_function_suffix(scope)
+                if source_type == "Prop / Accessory"
+                else ""
+            )
+            return f"{owner} {label} replaces = {marker} / @image{seq}{target_suffix}"
+        if source_type == "Environment / Background":
+            return (
+                f"{owner} environment / background replaces = {marker} / @image{seq}"
+                f"{_detail_suffix(scope)}"
+            )
+        if source_type == "Sky / Exterior Background":
+            return (
+                f"{owner} sky / exterior background replaces = {marker} / @image{seq}"
+                f"{_detail_suffix(scope)}"
+            )
+        if source_type == "Set / Structure":
+            return (
+                f"{owner} set / structure replaces = {marker} / @image{seq}"
+                f"{_detail_suffix(scope)}"
+            )
+        if source_type == "Foreground / Ground":
+            return (
+                f"{owner} foreground / ground replaces = {marker} / @image{seq}"
+                f"{_detail_suffix(scope)}"
+            )
+        if source_type in {
+            "Color / Look Reference",
+            "Color + Look + Lighting Mood Reference",
+            "Lighting / Atmosphere Reference",
+            "Scale / Composition Reference",
+        }:
+            return (
+                f"{source_type} applies to = {marker} / @image{seq}"
+                f"{_detail_suffix(scope)}"
+            )
+        if source_type == "Custom":
+            return (
+                f"{_effective_image_source_type(item)} applies to {owner} = {marker} / "
+                f"@image{seq}{_detail_suffix(scope)}"
+            )
+        return (
+            f"Unclassified image marker association = {marker} / @image{seq}"
+            f"{_detail_suffix(scope)}"
+        )
+
+    lines: List[str] = []
+    if explicit_marker:
+        first_scope = _public_single_line(next(
+            (
+                entry["scope"]
+                for entry in _image_binding_entries(item)
+                if entry["scope"]
+            ),
+            "",
+        ))
+        lines.append(format_line(explicit_marker, first_scope))
+    for entry in _image_binding_entries(item):
+        color = _public_single_line(entry["color"])
+        scope = _public_single_line(entry["scope"])
+        if not color:
+            continue
+        marker = (
+            f"Color Pick marker: @video{entry['marker_video']} / {color}"
+        )
+        line = format_line(marker, scope)
+        if line not in lines:
+            lines.append(line)
+    return "\n".join(lines) if lines else None
 
 
 
@@ -6709,6 +6926,36 @@ def _nonempty_identity(values: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _valid_public_frame_domain_for_prompt(value: Any) -> bool:
+    """Return whether an optional frame domain is safe to publish to Agent."""
+
+    if not isinstance(value, dict) or set(value) != {
+        "schema",
+        "version",
+        "timebase",
+        "start_frame",
+        "end_frame",
+        "frame_count",
+        "range_addressable",
+    }:
+        return False
+    start = value.get("start_frame")
+    end = value.get("end_frame")
+    count = value.get("frame_count")
+    return bool(
+        value.get("schema") == VIDEO_FRAME_DOMAIN_SCHEMA
+        and value.get("version") == VIDEO_FRAME_DOMAIN_VERSION
+        and isinstance(value.get("timebase"), str)
+        and all(
+            isinstance(item, int) and not isinstance(item, bool)
+            for item in (start, end, count)
+        )
+        and start <= end
+        and count == end - start + 1
+        and isinstance(value.get("range_addressable"), bool)
+    )
+
+
 def _public_job_data_contract(
     state: Dict[str, Any],
     active_images: List[Dict[str, Any]],
@@ -6781,7 +7028,10 @@ def _public_job_data_contract(
         frame_domain = _normalize_video_frame_domain(item.get("frame_domain"))
         if capabilities:
             record["reference_capabilities"] = capabilities
-        if frame_domain:
+        # Picker uses 1..0/count=0 as an internal "not addressable" sentinel.
+        # The Agent's optional public field is a real domain only, so omit that
+        # sentinel instead of turning one unavailable source into a global gate.
+        if _valid_public_frame_domain_for_prompt(frame_domain):
             record["frame_domain"] = frame_domain
         if bool(item.get("picker_companion_validated")):
             record["companion"] = _nonempty_identity({
@@ -6947,39 +7197,138 @@ def _build_data_only_prompt_package(state: Dict[str, Any]) -> str:
     ])
 
 
+def _compile_prompt_with_budget(lines: List[str]) -> str:
+    """Compile the bounded user-readable view without machine metadata."""
+
+    safe_lines = [
+        _public_single_line(line, MAX_PUBLIC_PROMPT_LINE_CHARS)
+        for line in lines
+    ]
+    compiled = "\n".join(safe_lines).strip() + "\n"
+    if len(compiled) <= MAX_PROMPT_CHARS:
+        return compiled
+
+    notice = "[Additional source lines omitted from the display view.]"
+    kept: List[str] = []
+    used = len(notice) + 2
+    for line in safe_lines:
+        added = len(line) + 1
+        if used + added > MAX_PROMPT_CHARS:
+            break
+        kept.append(line)
+        used += added
+    while kept and not kept[-1]:
+        kept.pop()
+    kept.extend(["", notice])
+    return "\n".join(kept).strip() + "\n"
+
+
+def _build_user_readable_prompt_package(state: Dict[str, Any]) -> str:
+    """Render the documented source map shown on the public PROMPT_OUT port."""
+
+    state = _normalize_state(state)
+    active_images = _active_image_rows_for_state(state["images"], state)
+    active_videos = [item for item in state["videos"] if _is_active_video(item)]
+    lines: List[str] = ["HMB_GP_Production", ""]
+
+    lines.extend([
+        "TARGET GENERATOR:",
+        "This prompt is written for the active downstream target generator or execution system.",
+        "",
+        "IMAGE SOURCE:",
+    ])
+    if active_images:
+        for item in active_images:
+            seq = int(item.get("slot") or 1)
+            label = _public_path_basename(
+                item.get("label"),
+                f"image source {seq}",
+                strip_extension=False,
+            )
+            asset_id = _public_path_basename(
+                item.get("asset_id"),
+                "",
+                strip_extension=False,
+            )
+            asset_suffix = f" / Asset ID: {asset_id}" if asset_id else ""
+            color_text = _public_single_line(_color_pick_text(item))
+            color_suffix = f" / Color Pick: {color_text}" if color_text else ""
+            lines.append(f"@image{seq} = {label}{asset_suffix}{color_suffix}")
+        lines.append(
+            "Color Pick values = target, mask, and reference-routing addresses; "
+            "not final intrinsic color, material, lighting, or background appearance authority"
+        )
+    else:
+        lines.append("No image source assigned in HMBPromptLibrary.")
+    lines.append("")
+
+    if active_images:
+        lines.append("IMAGE ROLE MAP:")
+        for item in active_images:
+            seq = int(item.get("slot") or 1)
+            for role_line in _image_role_line(item, seq).splitlines():
+                if _clean_string(role_line):
+                    lines.append(role_line)
+        lines.append("")
+
+        replacement_lines: List[str] = []
+        for item in active_images:
+            seq = int(item.get("slot") or 1)
+            replacement = _image_replacement_line(item, seq)
+            if not replacement:
+                continue
+            for replacement_line in replacement.splitlines():
+                if replacement_line and replacement_line not in replacement_lines:
+                    replacement_lines.append(replacement_line)
+        if replacement_lines:
+            lines.append("REPLACEMENT BINDING:")
+            lines.extend(replacement_lines)
+            lines.append("")
+
+    lines.append("VIDEO SOURCE:")
+    if active_videos:
+        lines.append(
+            "Active video slots = "
+            + ", ".join(
+                f"@video{int(item.get('slot') or 1)}" for item in active_videos
+            )
+        )
+        for item in active_videos:
+            seq = int(item.get("slot") or 1)
+            label = _public_path_basename(
+                item.get("label"),
+                f"video source {seq}",
+                strip_extension=bool(_clean_string(item.get("picker_auto_label"))),
+            )
+            lines.append(f"@video{seq} = {label}")
+    else:
+        lines.append("No video source assigned in HMBPromptLibrary.")
+    lines.append("")
+    return _compile_prompt_with_budget(lines)
+
+
 def _build_prompt_package(state: Dict[str, Any]) -> str:
-    # The canonical edge carries only typed job data and user-authored text.
-    # Signed behavior stays inside HMBAgentLibrary's transient rulesets.
-    return _build_data_only_prompt_package(state)
+    # PROMPT_OUT is the concise, user-verifiable source map. The exact typed
+    # machine envelope is paired privately by HMBPromptLibrary and consumed only
+    # by the directly connected HMBAgentLibrary.
+    return _build_user_readable_prompt_package(state)
 
-def _prompt_semantic_fingerprint(state: Dict[str, Any]) -> str:
-    """Return a stable identity for fields that can affect PROMPT_OUT.
+def _prompt_semantic_fingerprint(
+    state: Dict[str, Any],
+    public_prompt: str | None = None,
+    machine_prompt: str | None = None,
+) -> str:
+    """Identify the atomic visible/machine pair, excluding irrelevant UI state."""
 
-    Dashboard descriptions, Picker diagnostics, and connected-source fallback
-    data remain local state in the public five-section contract.  They join UI
-    geometry and derived status as fields that must not rebuild or propagate an
-    identical downstream Agent input.
-    """
-    normalized = _normalize_state(state)
-    semantic_state = {
-        key: value
-        for key, value in normalized.items()
-        if key
-        not in {
-            "ui",
-            "status",
-            "text",
-            "picker",
-            _SOURCE_INTENT_FALLBACKS_KEY,
-        }
-    }
-    canonical = json.dumps(
-        semantic_state,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    visible = public_prompt
+    if visible is None:
+        visible = _build_user_readable_prompt_package(state)
+    machine = machine_prompt
+    if machine is None:
+        machine = _build_data_only_prompt_package(state)
+    return hashlib.sha256(
+        (str(visible) + "\0" + str(machine)).encode("utf-8")
+    ).hexdigest()
 
 
 def _stage_and_notify_prompt_output(
@@ -7078,6 +7427,8 @@ class HMBPromptLibrary(DataNode):
         self._hmb_sync_generation = 0
         self._hmb_last_prompt_semantic_fingerprint = ""
         self._hmb_last_prompt_output = None
+        self._hmb_last_machine_prompt_output = None
+        self._hmb_prompt_snapshot_generation = 0
         self._hmb_prompt_notification_generation = 0
         self._hmb_pending_prompt_notification = None
         try:
@@ -7127,6 +7478,8 @@ class HMBPromptLibrary(DataNode):
             raw_widget_value = _get_parameter_raw(self, WIDGET_PARAMETER_NAME)
             current_state = self._current_state()
             state = _normalize_state(current_state)
+            source_sync_revision = int(state.get(SOURCE_SYNC_REVISION_KEY) or 0)
+            state_before_source_sync = _json_dumps(state)
             image_asset_payload = _parse_image_asset_payload(
                 _get_parameter_raw(self, IMAGE_ASSET_INPUT_PARAMETER_NAME)
             )
@@ -7142,6 +7495,11 @@ class HMBPromptLibrary(DataNode):
             picker_payload = _parse_picker_payload(_get_parameter_raw(self, PICKER_INPUT_PARAMETER_NAME))
             picker_connected = bool(getattr(self, "_hmb_picker_connected", False) or picker_payload)
             state = _apply_picker_payload(state, picker_payload, connected=picker_connected)
+            if _json_dumps(state) != state_before_source_sync:
+                state[SOURCE_SYNC_REVISION_KEY] = min(
+                    MAX_SOURCE_SYNC_REVISION,
+                    source_sync_revision + 1,
+                )
             # A widget edit has already stored its complete canonical state before
             # this deferred synchronization runs. Writing the same value back
             # produces a second frontend props update and can remount the full
@@ -7162,15 +7520,23 @@ class HMBPromptLibrary(DataNode):
         editor losing focus first.
         """
         state = self._write_dashboard_state()
-        fingerprint = _prompt_semantic_fingerprint(state)
+        prompt = _build_prompt_package(state)
+        machine_prompt = _build_data_only_prompt_package(state)
+        fingerprint = _prompt_semantic_fingerprint(
+            state,
+            public_prompt=prompt,
+            machine_prompt=machine_prompt,
+        )
         output_values = getattr(self, "parameter_output_values", {})
         output_getter = getattr(output_values, "get", None)
         current_output = output_getter("PROMPT_OUT") if callable(output_getter) else None
         cached_output = getattr(self, "_hmb_last_prompt_output", None)
+        cached_machine = getattr(self, "_hmb_last_machine_prompt_output", None)
         if (
             fingerprint
             == getattr(self, "_hmb_last_prompt_semantic_fingerprint", "")
             and cached_output is not None
+            and cached_machine is not None
         ):
             if current_output != cached_output:
                 _stage_and_notify_prompt_output(self, cached_output)
@@ -7183,19 +7549,60 @@ class HMBPromptLibrary(DataNode):
                 )
             return state
 
-        prompt = _build_prompt_package(state)
+        # Pair both representations before publishing PROMPT_OUT. Publication can
+        # synchronously re-enter the connected Agent, which must never observe a
+        # new visible document with an older machine envelope.
+        self._hmb_prompt_snapshot_generation = (
+            int(getattr(self, "_hmb_prompt_snapshot_generation", 0)) + 1
+        )
         self._hmb_last_prompt_semantic_fingerprint = fingerprint
         self._hmb_last_prompt_output = prompt
+        self._hmb_last_machine_prompt_output = machine_prompt
         if current_output != prompt:
             _stage_and_notify_prompt_output(self, prompt)
-        elif getattr(self, "_hmb_pending_prompt_notification", None):
+        else:
+            # Machine-only changes (for example USER DESCRIPTION or a validated
+            # Range fact) keep the same concise display but must still wake the
+            # directly connected Agent with the newly paired generation.
             _stage_and_notify_prompt_output(
                 self,
                 prompt,
                 stage_output=False,
-                replace_pending=False,
             )
         return state
+
+    def _hmb_agent_prompt_snapshot(self, expected_visible: Any) -> Dict[str, Any]:
+        """Return the exact private envelope paired with one visible PROMPT_OUT."""
+
+        incoming = getattr(expected_visible, "value", expected_visible)
+        incoming_text = str(incoming or "")
+        with self._hmb_sync_lock:
+            visible = getattr(self, "_hmb_last_prompt_output", None)
+            machine = getattr(self, "_hmb_last_machine_prompt_output", None)
+            generation = int(
+                getattr(self, "_hmb_prompt_snapshot_generation", 0) or 0
+            )
+            if (
+                not isinstance(visible, str)
+                or not isinstance(machine, str)
+                or not visible
+                or not machine
+                or generation < 1
+                or incoming_text != visible
+            ):
+                raise RuntimeError("HMB Prompt paired snapshot is unavailable.")
+            return {
+                "schema": "hmb-prompt-paired-snapshot",
+                "version": 1,
+                "generation": generation,
+                "visible_sha256": hashlib.sha256(
+                    visible.encode("utf-8")
+                ).hexdigest(),
+                "machine_sha256": hashlib.sha256(
+                    machine.encode("utf-8")
+                ).hexdigest(),
+                "machine_prompt": machine,
+            }
 
     def _sync_prompt_output_now(self) -> Dict[str, Any]:
         """Invalidate queued callbacks and commit one authoritative snapshot."""

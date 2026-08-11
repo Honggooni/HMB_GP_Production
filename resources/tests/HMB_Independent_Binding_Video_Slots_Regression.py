@@ -135,7 +135,7 @@ assert [
     (3, "Green", "Full body / full appearance"),
 ]
 
-compiled = prompt._build_prompt_package(normalized)
+compiled = prompt._build_data_only_prompt_package(normalized)
 compiled_job = prompt_json_section(compiled, "HMB JOB DATA (JSON):")
 assert compiled_job["images"][0]["bindings"] == [
     {
@@ -211,7 +211,7 @@ assert validated_binding is not None
 assert validated_binding["video_slot"] == "@video3"
 assert metadata is not None
 assert metadata["video_slot"] == "@video3"
-range_compiled = prompt._build_prompt_package(range_state)
+range_compiled = prompt._build_data_only_prompt_package(range_state)
 assert prompt_json_section(
     range_compiled,
     "HMB JOB DATA (JSON):",

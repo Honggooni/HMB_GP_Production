@@ -190,7 +190,12 @@ try:
     assert default_bound_row["asset_default_target"] == "Hero Beauty"
     assert default_bound_row["binding_scopes"] == ["Full body / full appearance"]
     assert default_bound_row["scope"] == "Full body / full appearance"
-    default_bound_prompt = prompt_library._build_prompt_package(default_bound_state)
+    default_bound_readable = prompt_library._build_prompt_package(default_bound_state)
+    assert "IMAGE SOURCE:" in default_bound_readable
+    assert "HMB JOB DATA (JSON):" not in default_bound_readable
+    default_bound_prompt = prompt_library._build_data_only_prompt_package(
+        default_bound_state
+    )
     default_bound_job = prompt_json_section(
         default_bound_prompt,
         "HMB JOB DATA (JSON):",
@@ -276,7 +281,7 @@ try:
         {"asset_id": "Hero Beauty"},
         set(),
     )
-    compiled_prompt = prompt_library._build_prompt_package(prompt_state)
+    compiled_prompt = prompt_library._build_data_only_prompt_package(prompt_state)
     compiled_job = prompt_json_section(compiled_prompt, "HMB JOB DATA (JSON):")
     compiled_image = compiled_job["images"][0]
     assert compiled_image["image"] == "@image1"

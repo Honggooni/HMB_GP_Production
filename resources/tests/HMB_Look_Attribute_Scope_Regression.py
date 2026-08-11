@@ -70,7 +70,7 @@ def prompt_sections(payload: str):
 
 # Public Prompt output is typed job data only; look policy remains exclusively
 # in the signed Agent runtime.
-prompt_only = prompt._build_prompt_package(prompt._default_widget_state())
+prompt_only = prompt._build_data_only_prompt_package(prompt._default_widget_state())
 job, fx_contract, user_data = prompt_sections(prompt_only)
 assert job["images"] == []
 assert job["videos"] == []
@@ -84,6 +84,11 @@ for forbidden in (
     "relationship interpretation",
 ):
     assert forbidden not in prompt_only
+
+for forbidden in (
+    "PRODUCTION INTEGRATION DEFAULTS:",
+    "relationship interpretation",
+):
     assert forbidden not in source
 
 # A regular Playblast row exposes source identity and the selected role, but no
@@ -95,7 +100,9 @@ state["videos"][0].update({
     "source_type": "Maya Preview / Playblast",
     "control_role": "Timing Only",
 })
-job, fx_contract, user_data = prompt_sections(prompt._build_prompt_package(state))
+job, fx_contract, user_data = prompt_sections(
+    prompt._build_data_only_prompt_package(state)
+)
 assert job["videos"][0]["source_type"] == "Maya Preview / Playblast"
 assert job["videos"][0]["control_role"] == "Timing Only"
 assert fx_contract["sources"] == []
@@ -109,7 +116,7 @@ control_state["text"]["SCENE_CONTEXT"] = (
     "Marker = Red | Boundary = Frames 48-72"
 )
 job, _fx_contract, user_data = prompt_sections(
-    prompt._build_prompt_package(control_state)
+    prompt._build_data_only_prompt_package(control_state)
 )
 assert job["control_only_bindings"] == [{
     "source_field": "SCENE_CONTEXT",
@@ -132,7 +139,7 @@ fx_state["videos"][0].update({
     "control_role": "Context Only",
 })
 job, fx_contract, _user_data = prompt_sections(
-    prompt._build_prompt_package(fx_state)
+    prompt._build_data_only_prompt_package(fx_state)
 )
 assert job["videos"][0]["control_role"] == "Context Only"
 fx_source = fx_contract["sources"][0]
@@ -163,7 +170,7 @@ image_state["images"][0].update({
     "color_picks": ["Red"],
 })
 job, _fx_contract, _user_data = prompt_sections(
-    prompt._build_prompt_package(image_state)
+    prompt._build_data_only_prompt_package(image_state)
 )
 image = job["images"][0]
 assert image["target_id"] == "Hero_A"
@@ -191,7 +198,7 @@ second.update({
 })
 multi["videos"].append(second)
 job, _fx_contract, _user_data = prompt_sections(
-    prompt._build_prompt_package(multi)
+    prompt._build_data_only_prompt_package(multi)
 )
 assert [(video["video"], video["source_type"], video["control_role"]) for video in job["videos"]] == [
     ("@video1", "Maya Preview / Playblast", "Spatial Alignment Verification Only"),

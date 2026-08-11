@@ -1,20 +1,28 @@
 # Changelog
 
-## `v0.6.01` (technical version `0.6.1`) — Unreleased
+## 0.6.20 - 2026-08-12
 
 - Preserve the complete `0.5.74` user-facing feature and UI contract while
   distributing exactly one signed Agent runtime artifact with the Library at
   `resources/agent/hmb_agent_core.dat`.
-- Keep `hmb_agent_core.dat` as a signed, compressed integrity artifact. A
-  each installed artifact is freshly verified for Agent execution; missing or
+- Keep `hmb_agent_core.dat` as a signed, compressed integrity artifact. Each
+  installed artifact is freshly verified for Agent execution; missing or
   unsigned edits, schema or contract drift, and malformed Behavior 1/2
   structures fail closed.
-- Upgrade Prompt-to-Agent transport to a closed data-only JOB/FX/USER envelope.
-  USER DESCRIPTION contains only the five fields directly authored in the
-  Prompt UI; connected transport metadata and policy prose are excluded.
+- Restore the concise, user-readable Target Generator, Image Source, Image
+  Role, Replacement Binding, and Video Source view on `PROMPT_OUT`, while the
+  directly connected Agent consumes an atomically paired, private, closed
+  JOB/FX/USER machine envelope from the same Prompt state. USER DESCRIPTION
+  contains only the five fields directly authored in the Prompt UI; connected
+  transport metadata and policy prose remain excluded from the machine input.
 - Apply the reviewed v4.1 FX Reference, Timing/Edit, exact emitter point, and
   Range ON contract internally without changing existing controls, ports,
   defaults, layouts, or saved-state behavior.
+- Activate Video Source Binding immediately on the first populated `PICKER_IN`
+  update by preventing a delayed pre-connection widget echo from restoring the
+  older empty state. Keep the Frame Range row at one stable vertical position
+  for one or multiple Color Picks, expanding it only when a visible Custom
+  Scope input actually requires the extra row height.
 - Keep the four shared libraries generator-neutral and register only the final
   `HMBSeedanceGeneration` module/class name.
 - Harden non-billable output preflight, cancellation handling, atomic MP4

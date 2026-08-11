@@ -279,4 +279,3 @@ for forbidden in (
 
 
 print("HMB FX/Timing/Range typed upstream contract regression: PASS")
-

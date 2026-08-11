@@ -736,7 +736,7 @@ assert any(
     "mismatched generated Depth provenance" in error
     for error in unverified_depth["picker"].get("contract_errors", [])
 )
-unverified_depth_prompt = prompt._build_prompt_package(unverified_depth)
+unverified_depth_prompt = prompt._build_data_only_prompt_package(unverified_depth)
 assert "SOURCE DATA WARNINGS:" not in unverified_depth_prompt
 assert "mismatched generated Depth provenance" not in unverified_depth_prompt
 unverified_depth_lines = unverified_depth_prompt.splitlines()
@@ -832,7 +832,7 @@ for companions in ([], [depth_video(4)]):
         },
         connected=True,
     )
-    compiled = prompt._build_prompt_package(applied)
+    compiled = prompt._build_data_only_prompt_package(applied)
     assert motion_required_text not in compiled
     assert "Final prompt generation is blocked" not in compiled
 
@@ -846,7 +846,7 @@ motion_ready = prompt._apply_picker_payload(
     },
     connected=True,
 )
-assert motion_required_text not in prompt._build_prompt_package(motion_ready)
+assert motion_required_text not in prompt._build_data_only_prompt_package(motion_ready)
 
 
 print(
