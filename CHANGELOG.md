@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.73 - 2026-08-11
+
+- Corrected the v0.5.72 middle-button interpretation: the ImageAsset viewport no longer captures or scrolls its own grid during a middle-button drag.
+- Kept wheel rotation as local image-list scrolling while passing middle-button pointer and mouse gestures through to Griptape's native whole-canvas pan, including at high canvas zoom.
+- Preserved left-click image selection, the v0.5.71 manifest-poll flicker fix, and non-middle interaction isolation inside the red asset viewport.
+
 ## 0.5.72 - 2026-08-11
 
 - Restored hold-to-drag middle-button panning inside the ImageAsset viewport by isolating React Flow's compatibility `mousedown` before it can claim the gesture.
