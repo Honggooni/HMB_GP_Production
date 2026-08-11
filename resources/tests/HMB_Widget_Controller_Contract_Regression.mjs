@@ -313,27 +313,32 @@ assert.match(assetSource, /IMAGE_ASSET_AUTO_SYNC_PENDING_MS = 5000/, "Rapid wake
 assert.match(assetSource, /now >= autoSyncPendingUntil[\s\S]*?autoSyncPendingUntil = now \+ IMAGE_ASSET_AUTO_SYNC_PENDING_MS/, "Asset auto-sync must not stack host round trips while a recent probe is pending.");
 assert.match(assetSource, /clearAutoSyncTimer\(\)[\s\S]*?removeEventListener/, "Asset cleanup must stop its sync timer and global listeners.");
 assert.match(assetSource, /\.asset-scroll\{[^}]*scrollbar-gutter:stable/, "Asset scrollbars must reserve stable layout space.");
-assert.match(assetSource, /class="asset-scroll nodrag nopan nowheel" data-asset-scroll/, "Only the red Asset viewport must suppress canvas zoom and pan.");
-assert.match(assetSource, /hmbInstallImageAssetScrollGestures\(container, on\)/, "Every Asset remount must restore local wheel and middle-pan handlers.");
+assert.match(assetSource, /class="asset-scroll nodrag nopan nowheel" data-asset-scroll/, "Only the red Asset viewport must suppress wheel zoom and non-middle local pan.");
+assert.match(assetSource, /hmbInstallImageAssetScrollGestures\(container, on\)/, "Every Asset remount must restore local wheel scrolling.");
 assert.match(
   assetSource,
   /on\(assetScroll, "wheel",[\s\S]*?scrollTop[\s\S]*?stopLocalGesture\(event\)[\s\S]*?\{ passive: false \}/,
   "Wheel input over the Asset viewport must scroll locally and remain non-passive.",
 );
-assert.match(
+assert.doesNotMatch(
   assetSource,
-  /const beginMiddlePan[\s\S]*?setPointerCapture[\s\S]*?const moveMiddlePan[\s\S]*?scrollTop[\s\S]*?on\(assetScroll, "pointerdown",[\s\S]*?button\) !== 1[\s\S]*?beginMiddlePan\(event, true\)[\s\S]*?on\(assetScroll, "pointermove", moveMiddlePan\)/,
-  "Middle-button drag must pan only the Asset viewport without changing left-click selection.",
+  /beginMiddlePan|moveMiddlePan|endMiddlePan|setPointerCapture|globalPanTarget|__hmbImageAssetViewportPanning|__hmbImageAssetCancelViewportPan/,
+  "The Asset viewport must not own, capture, or mutate middle-button drag state.",
+);
+assert.doesNotMatch(
+  assetSource,
+  /on\(assetScroll, "(?:pointerdown|pointermove|pointerup|pointercancel|mousedown|mousemove|mouseup|auxclick)"/,
+  "Middle pointer and mouse events over an image card must pass through to Griptape.",
 );
 assert.match(
   assetSource,
-  /on\(assetScroll, "mousedown",[\s\S]*?button\) !== 1[\s\S]*?stopImmediatePropagation[\s\S]*?capture:\s*true/,
-  "Asset middle mousedown must be isolated before React Flow/D3 can claim canvas panning.",
+  /const stopInteriorNodeSelection = \(event\) => \{\s*if \(Number\(event\?\.button\) !== 1\) event\.stopPropagation\(\);\s*\};/,
+  "The generic card pointer guard must pass middle-button input to the canvas while retaining left-click isolation.",
 );
 assert.match(
   assetSource,
-  /on\(globalPanTarget, "pointermove", moveMiddlePan,[\s\S]*?on\(globalPanTarget, "mousemove", moveMiddlePan,[\s\S]*?on\(globalPanTarget, "mouseup", endMiddlePan/,
-  "Middle pan must survive pointer-capture loss and legacy embedded-WebView mouse streams.",
+  /on\(card, "click", \(event\) => \{[\s\S]*?toggle\(\);\s*\}\);/,
+  "Passing middle-button gestures through must not remove left-click image selection.",
 );
 assert.doesNotMatch(assetSource, /data-asset-selected|type="checkbox" data-asset-selected/, "Asset selection must use the card outline, not per-card checkboxes.");
 assert.doesNotMatch(assetSource, /candidate-list|writing-mode/, "Removed color chips and rotated slot text must not return.");

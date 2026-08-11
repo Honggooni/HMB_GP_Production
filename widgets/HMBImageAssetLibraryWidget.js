@@ -1765,89 +1765,14 @@ export function hmbInstallImageAssetScrollGestures(container, on) {
   if (!assetScroll || typeof on !== "function") return null;
   // React Flow treats `nowheel` as a local no-zoom island. It is deliberately
   // scoped to the asset viewport; the rest of the node keeps canvas zoom.
+  // Middle-button gestures are deliberately left untouched so Griptape owns
+  // whole-canvas panning even when the pointer is over an image card. The
+  // host's middle-button path bypasses `nopan`; other local drag gestures do not.
   assetScroll.classList?.add("nowheel");
-  let middlePan = null;
-  const globalPanTarget = assetScroll.ownerDocument?.defaultView
-    || (typeof window !== "undefined" ? window : null);
 
   const stopLocalGesture = (event) => {
     event?.preventDefault?.();
     event?.stopPropagation?.();
-  };
-  const endMiddlePan = (event) => {
-    if (!middlePan) return false;
-    if (
-      event?.pointerId != null
-      && middlePan.pointerId != null
-      && event.pointerId !== middlePan.pointerId
-    ) return false;
-    const pointerId = middlePan.pointerId;
-    const priorCursor = middlePan.priorCursor;
-    const priorUserSelect = middlePan.priorUserSelect;
-    middlePan = null;
-    container.__hmbImageAssetViewportPanning = false;
-    assetScroll.classList?.remove("is-middle-panning");
-    if (assetScroll.style) {
-      assetScroll.style.cursor = priorCursor;
-      assetScroll.style.userSelect = priorUserSelect;
-    }
-    if (pointerId != null) {
-      try { assetScroll.releasePointerCapture?.(pointerId); } catch (_error) {}
-    }
-    stopLocalGesture(event);
-    return true;
-  };
-  const beginMiddlePan = (event, capturePointer) => {
-    if (middlePan) return false;
-    const pointerId = capturePointer && event?.pointerId != null
-      ? event.pointerId
-      : null;
-    middlePan = {
-      pointerId,
-      clientX: Number(event?.clientX) || 0,
-      clientY: Number(event?.clientY) || 0,
-      scrollLeft: Number(assetScroll.scrollLeft) || 0,
-      scrollTop: Number(assetScroll.scrollTop) || 0,
-      priorCursor: clean(assetScroll.style?.cursor),
-      priorUserSelect: clean(assetScroll.style?.userSelect),
-      pointerCaptured: false,
-    };
-    container.__hmbImageAssetViewportPanning = true;
-    assetScroll.classList?.add("is-middle-panning");
-    if (assetScroll.style) {
-      assetScroll.style.cursor = "grabbing";
-      assetScroll.style.userSelect = "none";
-    }
-    if (
-      pointerId != null
-      && typeof assetScroll.setPointerCapture === "function"
-    ) {
-      try {
-        assetScroll.setPointerCapture(pointerId);
-        middlePan.pointerCaptured = typeof assetScroll.hasPointerCapture === "function"
-          ? Boolean(assetScroll.hasPointerCapture(pointerId))
-          : true;
-      } catch (_error) {}
-    }
-    return true;
-  };
-  const moveMiddlePan = (event) => {
-    if (!middlePan) return false;
-    if (
-      event?.pointerId != null
-      && middlePan.pointerId != null
-      && event.pointerId !== middlePan.pointerId
-    ) return false;
-    if (event?.buttons != null && !(Number(event.buttons) & 4)) {
-      endMiddlePan(event);
-      return false;
-    }
-    assetScroll.scrollLeft = middlePan.scrollLeft
-      - ((Number(event?.clientX) || 0) - middlePan.clientX);
-    assetScroll.scrollTop = middlePan.scrollTop
-      - ((Number(event?.clientY) || 0) - middlePan.clientY);
-    stopLocalGesture(event);
-    return true;
   };
 
   on(assetScroll, "wheel", (event) => {
@@ -1857,52 +1782,6 @@ export function hmbInstallImageAssetScrollGestures(container, on) {
     assetScroll.scrollTop = (Number(assetScroll.scrollTop) || 0) + delta.top;
     stopLocalGesture(event);
   }, { passive: false });
-  // React Flow owns middle-button mousedown separately from Pointer Events and
-  // otherwise starts canvas panning before this viewport can consume the drag.
-  // Isolate only the asset viewport's middle-button compatibility event; left
-  // clicks still select cards and middle drags outside this viewport still pan
-  // the Griptape canvas.
-  on(assetScroll, "mousedown", (event) => {
-    if (Number(event?.button) !== 1) return;
-    // Some embedded WebViews expose only the legacy mouse stream. Start the
-    // same bounded pan session when Pointer Events did not already start it.
-    beginMiddlePan(event, false);
-    stopLocalGesture(event);
-    event?.stopImmediatePropagation?.();
-  }, { capture: true, passive: false });
-  on(assetScroll, "pointerdown", (event) => {
-    if (Number(event?.button) !== 1) return;
-    beginMiddlePan(event, true);
-    stopLocalGesture(event);
-  });
-  on(assetScroll, "pointermove", moveMiddlePan);
-  ["pointerup", "pointercancel"].forEach((eventName) => {
-    on(assetScroll, eventName, endMiddlePan);
-  });
-  on(assetScroll, "lostpointercapture", (event) => {
-    if (
-      middlePan
-      && (event?.pointerId == null || event.pointerId === middlePan.pointerId)
-    ) middlePan.pointerCaptured = false;
-  });
-  if (globalPanTarget && globalPanTarget !== assetScroll) {
-    on(globalPanTarget, "pointermove", moveMiddlePan, { capture: true, passive: false });
-    on(globalPanTarget, "pointerup", endMiddlePan, { capture: true, passive: false });
-    on(globalPanTarget, "pointercancel", endMiddlePan, { capture: true, passive: false });
-    on(globalPanTarget, "mousemove", moveMiddlePan, { capture: true, passive: false });
-    on(globalPanTarget, "mouseup", endMiddlePan, { capture: true, passive: false });
-    on(globalPanTarget, "blur", () => endMiddlePan(null), true);
-  } else {
-    on(assetScroll, "mousemove", moveMiddlePan);
-    on(assetScroll, "mouseup", endMiddlePan);
-    on(assetScroll, "pointerleave", (event) => {
-      if (middlePan && !middlePan.pointerCaptured) endMiddlePan(event);
-    });
-  }
-  on(assetScroll, "auxclick", (event) => {
-    if (Number(event?.button) === 1) stopLocalGesture(event);
-  });
-  container.__hmbImageAssetCancelViewportPan = () => endMiddlePan(null);
   return assetScroll;
 }
 
@@ -2101,7 +1980,9 @@ function installEvents(container, state, props, remount, listeners) {
   on(container, "keydown", stopNodeDeleteShortcut);
   const stopSelectedNodeDeleteShortcut = (event) => hmbGuardSelectedNodeKeyboardDelete(container, event);
   if (typeof window !== "undefined") on(window, "keydown", stopSelectedNodeDeleteShortcut, true);
-  const stopInteriorNodeSelection = (event) => event.stopPropagation();
+  const stopInteriorNodeSelection = (event) => {
+    if (Number(event?.button) !== 1) event.stopPropagation();
+  };
   on(container, "pointerdown", stopInteriorNodeSelection);
   const assetsByLibraryId = new Map(
     state.assets.map((asset) => [clean(asset.asset_library_id), asset]),
@@ -2570,8 +2451,6 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     const uiMemory = captureImageAssetUi(container, state);
     const reusableImages = detachReusableImageAssets(container);
     container.__hmbImageAssetDragging = false;
-    container.__hmbImageAssetCancelViewportPan?.();
-    container.__hmbImageAssetViewportPanning = false;
     clearListeners();
     state = normalizeState(nextState);
     if (typeof container.__hmbImageAssetSearchDraft === "string") {
@@ -2674,7 +2553,6 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     && !(typeof navigator !== "undefined" && navigator.onLine === false)
     && !container.__hmbImageAssetRegistrationDraft
     && !container.__hmbImageAssetDragging
-    && !container.__hmbImageAssetViewportPanning
     && !container.__hmbImageAssetSelectionCommitPending
   );
   function runAutoSync() {
@@ -2766,8 +2644,6 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     hmbInvalidateImageAssetPublication(container);
     hmbForgetImageAssetStateEcho(container);
     disposed = true;
-    container.__hmbImageAssetCancelViewportPan?.();
-    container.__hmbImageAssetViewportPanning = false;
     autoSyncPendingUntil = 0;
     clearAutoSyncTimer();
     autoSyncListeners.forEach(([target, type, handler]) => {
@@ -2786,7 +2662,6 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     if (container.__hmbImageAssetApplyProps === applyProps) {
       delete container.__hmbImageAssetApplyProps;
     }
-    delete container.__hmbImageAssetCancelViewportPan;
     delete container.__hmbImageAssetDragging;
     delete container.__hmbImageAssetRegistrationDraft;
     delete container.__hmbImageAssetRegistrationReturnFocus;
