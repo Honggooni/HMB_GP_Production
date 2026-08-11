@@ -95,8 +95,26 @@ try:
     assert set_calls == [], "UI-only state must not propagate an identical PROMPT_OUT."
     assert notify_calls == [], "UI-only state must not notify a connected Agent."
 
-    semantic_state = copy.deepcopy(base_state)
-    semantic_state["text"]["SCENE_CONTEXT"] = "A real semantic edit."
+    dashboard_only_state = copy.deepcopy(base_state)
+    dashboard_only_state["text"]["SCENE_CONTEXT"] = "Local dashboard description."
+    dashboard_only_state["source_intent_fallbacks"] = [
+        {"source": "PICKER_IN", "reason": "diagnostic", "text": "local only"}
+    ]
+    node._write_dashboard_state = lambda: copy.deepcopy(dashboard_only_state)
+    node._sync_prompt_output_from_state()
+    assert build_calls == [], "Local descriptions must not rebuild public PROMPT_OUT."
+    assert set_calls == []
+    assert notify_calls == []
+
+    semantic_state = copy.deepcopy(dashboard_only_state)
+    semantic_state["images"][0].update(
+        {
+            "present": True,
+            "label": "CoalescingHero",
+            "source_type": "Character Appearance",
+            "owner": "CoalescingHero",
+        }
+    )
     node._write_dashboard_state = lambda: copy.deepcopy(semantic_state)
     node._sync_prompt_output_from_state()
     assert len(build_calls) == 1
@@ -117,7 +135,7 @@ try:
     # A distinct semantic fingerprint can still compile to byte-identical text.
     # Equality at the output boundary must suppress downstream propagation.
     equal_compile_state = copy.deepcopy(semantic_state)
-    equal_compile_state["text"]["EMOTION_INTENT"] = "Mocked equal compile."
+    equal_compile_state["images"][0]["asset_id"] = "MockedEqualCompile"
     node._write_dashboard_state = lambda: copy.deepcopy(equal_compile_state)
     prompt._build_prompt_package = lambda state: (
         build_calls.append(copy.deepcopy(state)) or semantic_output
@@ -147,7 +165,7 @@ try:
         raise ValueError("simulated Agent notification failure")
 
     failure_state = copy.deepcopy(equal_compile_state)
-    failure_state["text"]["VIDEO_VFX"] = "New semantic value for failure boundary."
+    failure_state["images"][0]["label"] = "NotificationFailureHero"
     node._write_dashboard_state = lambda: copy.deepcopy(failure_state)
     prompt._build_prompt_package = counting_build
     node.publish_update_to_parameter = failing_notify

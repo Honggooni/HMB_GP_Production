@@ -86,6 +86,7 @@ jobs:
             "HMB_Image_Asset_Import_Order_Regression.py",
             "HMB_Image_Asset_Resolved_Selection_Regression.py",
             "HMB_Prompt_No_Loss_Connection_Regression.py",
+            "HMB_Prompt_Public_Prompt_Boundary_Regression.py",
             "HMB_Image_Asset_Registration_Regression.py",
             "HMB_Image_Asset_Server_Sharing_Regression.py",
             "HMB_Image_Asset_Process_Lock_Regression.py",

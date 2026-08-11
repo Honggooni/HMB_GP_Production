@@ -312,9 +312,10 @@ image["frame_range_bindings"] = {
     },
 }
 compiled = prompt._build_prompt_package(prompt_state)
-assert "FRAME RANGE BINDING:" in compiled
-assert "Timebase = @video2 / 24 FPS / Frames 1–144" in compiled
-assert "Frames 1–48 and 97–144 only." in compiled
+assert "FRAME RANGE BINDING:" not in compiled
+assert "REPLACEMENT BINDING:" in compiled
+assert "Color Pick marker: @video2 / Green" in compiled
+assert "Frames 1–48 and 97–144 only." not in compiled
 assert "Frames 10–20 only." not in compiled
 assert "Frames 30–40 only." not in compiled
 
@@ -355,7 +356,7 @@ assert normalized_range_restarted["frame_range_bindings"]["@video2::Green"]["ran
 assert normalized_range_restarted["frame_range_binding"] == normalized_range_restarted[
     "frame_range_bindings"
 ]["@video2::Green"]
-assert "FRAME RANGE BINDING:" in prompt._build_prompt_package(range_restarted_state)
+assert "FRAME RANGE BINDING:" not in prompt._build_prompt_package(range_restarted_state)
 
 image["frame_range_bindings"]["@video2::Green"]["ranges"] = [{"start": 1, "end": 145}]
 assert "FRAME RANGE BINDING:" not in prompt._build_prompt_package(prompt_state)
@@ -400,9 +401,9 @@ assert manual_metadata["origin"] == "manual"
 assert manual_metadata["fps"] == 0.0
 assert (manual_metadata["start_frame"], manual_metadata["end_frame"]) == (1001, 1120)
 manual_compiled = prompt._build_prompt_package(manual_state)
-assert "FRAME RANGE BINDING:" in manual_compiled
-assert "Frame domain = @video2 / Manual / Frames 1001–1120" in manual_compiled
-assert "during Frames 1010–1020 and 1100–1110 only." in manual_compiled
+assert "FRAME RANGE BINDING:" not in manual_compiled
+assert "Frame domain = @video2 / Manual / Frames 1001–1120" not in manual_compiled
+assert "during Frames 1010–1020 and 1100–1110 only." not in manual_compiled
 assert "0 FPS" not in manual_compiled
 
 normalized_manual = prompt._normalize_state(manual_state)["images"][0]

@@ -35,7 +35,7 @@ after a successful check, the library is already current.
 
 ## Agent policy availability
 
-Release `0.5.73` includes exactly one signed production policy at
+Release `0.5.74` includes exactly one signed production policy at
 `resources/agent/hmb_agent_core.dat`. The runtime reads, verifies, and uses only
 this file from the installed Git library. The canonical
 `HMBPromptLibrary -> HMBAgentLibrary` flow requires no network policy share or

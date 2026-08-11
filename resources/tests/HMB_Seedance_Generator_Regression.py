@@ -1528,6 +1528,106 @@ def assert_broker_generation_contract() -> None:
         failed_refresh.status_component.get_parameter_group().ui_options
     )
 
+    submission_unknown_response = {
+        "status": "failed",
+        "job_id": "job-submission-unknown-5",
+        "provider_job_id": "",
+        "error_code": "submission_unknown",
+        "error": "server detail must not be copied into public node state",
+        "message": "server guidance must not be copied into public node state",
+        "terminal": True,
+        "resubmit_allowed": False,
+        "recovery_action": "contact_admin",
+        "token": FakeBrokerBridge.SECRET_VALUES[0],
+    }
+    normalized_unknown = (
+        target.HMBSeedance20VideoGeneration._normalize_broker_task(
+            submission_unknown_response
+        )
+    )
+    assert normalized_unknown == {
+        "id": "job-submission-unknown-5",
+        "status": "failed",
+        "broker_status": "failed",
+        "error_code": "submission_unknown",
+        "terminal": True,
+        "resubmit_allowed": False,
+        "recovery_action": "contact_admin",
+        "provider_task_registered": False,
+    }
+
+    class TerminalSubmissionUnknownBridge(FakeBrokerBridge):
+        def generate_seedance(self, payload: dict, *, timeout: float) -> dict:
+            assert timeout > 0
+            self.generate_payloads.append(dict(payload))
+            response = dict(submission_unknown_response)
+            response["job_id"] = payload["client_request_id"]
+            return response
+
+    terminal_bridge = TerminalSubmissionUnknownBridge([])
+    terminal_node = BrokerScriptedNode(terminal_bridge)
+    terminal_node.set_parameter_value("prompt", "terminal submission regression")
+    try:
+        asyncio.run(terminal_node._aprocess_impl())
+    except RuntimeError as exc:
+        terminal_message = str(exc)
+    else:
+        raise AssertionError("A terminal submission_unknown response was accepted")
+    assert terminal_node.parameter_output_values["generation_status"] == "failed"
+    assert terminal_node.parameter_output_values["provider_response"] == {
+        "transport": "fn_ai_broker",
+        "id": terminal_node.parameter_output_values["generation_id"],
+        "status": "failed",
+        "error_code": "submission_unknown",
+        "terminal": True,
+        "resubmit_allowed": False,
+        "recovery_action": "contact_admin",
+        "provider_task_registered": False,
+    }
+    assert "Broker error code: submission_unknown" in terminal_message
+    assert "no provider task ID was returned" in terminal_message
+    assert "automatic resubmission is disabled" in terminal_message
+    assert "This Broker job is terminal" in terminal_message
+    assert "server render can continue" not in terminal_message
+    assert "server detail must not be copied" not in terminal_message
+    assert "server guidance must not be copied" not in terminal_message
+    assert FakeBrokerBridge.SECRET_VALUES[0] not in terminal_message
+    assert terminal_bridge.refresh_ids == []
+    assert len(terminal_bridge.generate_payloads) == 1
+
+    class OfflineTerminalRefreshBridge(FakeBrokerBridge):
+        def refresh_job(self, job_id: str, *, timeout: float = 60) -> dict:
+            assert timeout > 0
+            self.refresh_ids.append(job_id)
+            raise target._BrokerUnavailableError("offline terminal refresh")
+
+    offline_bridge = OfflineTerminalRefreshBridge([])
+    offline_terminal = BrokerScriptedNode(offline_bridge)
+    offline_terminal.parameter_output_values.update(
+        {
+            "generation_id": "job-submission-unknown-offline-6",
+            "generation_status": "failed",
+            "provider_response": {
+                "transport": "fn_ai_broker",
+                "id": "job-submission-unknown-offline-6",
+                "status": "failed",
+                "error_code": "submission_unknown",
+                "terminal": True,
+                "resubmit_allowed": False,
+                "recovery_action": "contact_admin",
+                "provider_task_registered": False,
+            },
+        }
+    )
+    asyncio.run(offline_terminal._refresh_async())
+    offline_message = offline_terminal.parameter_output_values["result_details"]
+    assert offline_bridge.refresh_ids == ["job-submission-unknown-offline-6"]
+    assert offline_bridge.generate_payloads == []
+    assert "known terminal job" in offline_message
+    assert "did not resume, restart, or duplicate" in offline_message
+    assert "may still be rendering" not in offline_message
+    assert "automatic resubmission is disabled" in offline_message
+
 
 def assert_refresh_during_submission_contract() -> None:
     bridge = FakeBrokerBridge([])

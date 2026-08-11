@@ -524,13 +524,14 @@ for preserved_token in (
     "KEEP_FOREIGN_PICKER_INTENT",
 ):
     assert preserved_token in foreign_blob
-    assert preserved_token in foreign_compiled
+    assert preserved_token not in foreign_compiled
+assert "USER DESCRIPTION DATA (JSON):" not in foreign_compiled
 assert foreign_state["status"]["active_images"] == 0
 assert foreign_state["status"]["active_videos"] == 0
 
 
 # Known HMB payloads remain semantic while unknown extension fields survive in
-# the same compiled Prompt, proving recognition and no-loss behavior coexist.
+# local fallback state without crossing the five-section public Prompt boundary.
 extended_asset = {
     **asset_payload,
     "vendor_extension": "KEEP_ASSET_EXTENSION",
@@ -549,10 +550,17 @@ extended_state = prompt._apply_picker_payload(
     connected=True,
 )
 extended_compiled = prompt._build_prompt_package(extended_state)
+extended_fallback_blob = json.dumps(
+    extended_state[prompt._SOURCE_INTENT_FALLBACKS_KEY],
+    ensure_ascii=False,
+    sort_keys=True,
+)
 assert extended_state["status"]["active_images"] == 1
 assert extended_state["status"]["active_videos"] == 1
-assert "KEEP_ASSET_EXTENSION" in extended_compiled
-assert "KEEP_PICKER_EXTENSION" in extended_compiled
+assert "KEEP_ASSET_EXTENSION" in extended_fallback_blob
+assert "KEEP_PICKER_EXTENSION" in extended_fallback_blob
+assert "KEEP_ASSET_EXTENSION" not in extended_compiled
+assert "KEEP_PICKER_EXTENSION" not in extended_compiled
 
 
 print(

@@ -122,6 +122,7 @@ state["videos"][0].update(
     }
 )
 compiled = prompt._build_prompt_package(state)
+video_role = prompt._video_role_line(state["videos"][0], 1)
 for anchor in (
     "protected animator-authored acting, motion, pose, timing, trajectory, contact",
     "camera, framing, visibility, occlusion, relative depth, and spatial arrangement",
@@ -134,7 +135,10 @@ for anchor in (
     "if no temporal subset is stated or clearly implied, it applies to the whole shot",
     "otherwise only to that subset",
 ):
-    assert anchor in compiled, anchor
+    assert anchor in video_role, anchor
+assert "@video1 = animator_color_playblast.mp4" in compiled
+assert "VIDEO ROLE MAP:" not in compiled
+assert "protected animator-authored acting" not in compiled
 
 # Structured control-only instructions stay usable, but their override cannot
 # spill from one target/boundary into unrelated appearance or motion fields.
@@ -208,8 +212,8 @@ lighting_role = prompt._image_role_line(
 assert "implementation evidence for the approved background or sequence look" in lighting_role
 assert "explicitly approved as lighting authority" in lighting_role
 
-# Multi-video output must carry the bounded scope rule and preserve source
-# independence without promoting optional metadata into an authority gate.
+# Multi-video output is limited to source identities. The bounded scope rule
+# remains available to the signed runtime/helper contract but is not public prose.
 multi = prompt._default_widget_state()
 multi["videos"][0].update(
     {
@@ -230,10 +234,11 @@ second.update(
 )
 multi["videos"].append(second)
 multi_compiled = prompt._build_prompt_package(multi)
-assert "ADDITIVE MULTI-VIDEO BINDING SCHEMA:" in multi_compiled
-assert "default attribute interpretation" in multi_compiled
-assert "explicit scoped instruction may change only its named property" in multi_compiled
-assert "Missing optional metadata or bindings never invents data" in multi_compiled
+assert "Active video slots = @video1, @video2" in multi_compiled
+assert "@video1 = animator_color_playblast.mp4" in multi_compiled
+assert "@video2 = lighting_reference.mp4" in multi_compiled
+assert "ADDITIVE MULTI-VIDEO BINDING SCHEMA:" not in multi_compiled
+assert "default attribute interpretation" not in multi_compiled
 
 print(
     "HMB look attribute-scope compiler regression: PASS "
