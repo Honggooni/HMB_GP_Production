@@ -4,7 +4,7 @@
   "metadata": {
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.5.74",
+    "library_version": "0.6.1",
     "engine_version": "0.93.0",
     "tags": [
       "Griptape",
@@ -223,7 +223,7 @@
       }
     },
     {
-      "class_name": "HMBSeedance20VideoGeneration",
+      "class_name": "HMBSeedanceGeneration",
       "file_path": "HMBSeedanceGeneration.py",
       "metadata": {
         "category": "HMB_GP_Production",

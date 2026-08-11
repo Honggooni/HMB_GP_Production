@@ -18,7 +18,9 @@ import time
 import urllib.error
 import urllib.request
 import webbrowser
+from collections.abc import Iterator
 from contextlib import suppress
+from copy import deepcopy
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +51,9 @@ from griptape_nodes.exe_types.param_types.parameter_int import ParameterInt
 from griptape_nodes.exe_types.param_types.parameter_string import ParameterString
 from griptape_nodes.exe_types.param_types.parameter_video import ParameterVideo
 from griptape_nodes.files.file import File, FileLoadError
+from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
+from griptape_nodes.retained_mode.events.project_events import MacroPath
+from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import write_sidecar
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.traits.options import Options
 
@@ -76,6 +81,45 @@ LOCAL_VIDEO_UPLOAD_SERVICES = (
 )
 DEFAULT_TOS_REGION = "cn-beijing"
 DEFAULT_TOS_ENDPOINT = "tos-cn-beijing.volces.com"
+
+
+def _is_structurally_valid_mp4(value: bytes | bytearray) -> bool:
+    """Require complete top-level ftyp, moov, and mdat boxes before publish."""
+
+    data = bytes(value)
+    if len(data) < 32:
+        return False
+    offset = 0
+    boxes = 0
+    saw_movie_box = False
+    saw_media_data_box = False
+    while offset + 8 <= len(data) and boxes < 4096:
+        size = int.from_bytes(data[offset : offset + 4], "big")
+        box_type = data[offset + 4 : offset + 8]
+        header_size = 8
+        if size == 1:
+            if offset + 16 > len(data):
+                return False
+            size = int.from_bytes(data[offset + 8 : offset + 16], "big")
+            header_size = 16
+        elif size == 0:
+            size = len(data) - offset
+        if size < header_size or offset + size > len(data):
+            return False
+        if boxes == 0:
+            if box_type != b"ftyp" or size < header_size + 8:
+                return False
+            if (size - header_size - 8) % 4 != 0:
+                return False
+        elif box_type == b"moov" and size > header_size:
+            saw_movie_box = True
+        elif box_type == b"mdat" and size > header_size:
+            saw_media_data_box = True
+        offset += size
+        boxes += 1
+    return offset == len(data) and saw_movie_box and saw_media_data_box
+
+
 DEFAULT_TOS_URL_VALIDITY_SECONDS = 24 * 60 * 60
 MIN_TOS_URL_VALIDITY_SECONDS = 60 * 60
 MAX_TOS_URL_VALIDITY_SECONDS = 30 * 24 * 60 * 60
@@ -154,6 +198,7 @@ MAX_IMAGE_BYTES = 30 * 1024 * 1024
 MAX_AUDIO_BYTES = 15 * 1024 * 1024
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024
+MAX_ATOMIC_OUTPUT_CANDIDATES = 10_000
 AMBIGUOUS_UPLOAD_CLEANUP_DELAY_SECONDS = 30 * 60
 
 VIDEO_REFERENCES_PARAMETER = "VIDEO_REFERENCES"
@@ -2814,7 +2859,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if not content:
                 raise RuntimeError("Volcengine returned an empty video file.")
             video_bytes = bytes(content)
-            if len(video_bytes) < 12 or video_bytes[4:8] != b"ftyp":
+            if not _is_structurally_valid_mp4(video_bytes):
                 raise RuntimeError(
                     "Downloaded result is not a valid MP4 container."
                 )
@@ -2872,6 +2917,304 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     async def _sleep(self, seconds: float) -> None:
         await asyncio.sleep(seconds)
 
+    @staticmethod
+    def _output_destination_policy(destination: Any) -> ExistingFilePolicy:
+        policy = getattr(
+            destination,
+            "_existing_file_policy",
+            ExistingFilePolicy.OVERWRITE,
+        )
+        if isinstance(policy, ExistingFilePolicy):
+            return policy
+        try:
+            return ExistingFilePolicy(str(policy).strip().lower())
+        except ValueError as exc:
+            raise RuntimeError(
+                "Output destination has an unsupported collision policy."
+            ) from exc
+
+    @staticmethod
+    def _normalized_mp4_output_path(value: str | Path) -> Path:
+        path = Path(value)
+        if path.suffix.lower() not in {".mp4", ".m4v"}:
+            path = path.with_suffix(".mp4")
+        return path
+
+    @classmethod
+    def _output_destination_candidate_records(
+        cls,
+        destination: Any,
+    ) -> Iterator[tuple[Path, int | None]]:
+        """Yield collision candidates and any project-macro index they bind."""
+
+        destination_file = getattr(destination, "_file", None)
+        file_path = getattr(destination_file, "_file_path", None)
+        if isinstance(file_path, MacroPath):
+            index_segment = next(
+                (
+                    segment
+                    for segment in file_path.parsed_macro.segments
+                    if getattr(getattr(segment, "info", None), "name", "")
+                    == "_index"
+                ),
+                None,
+            )
+            if index_segment is not None:
+                variables = dict(file_path.variables)
+                bound_index = variables.get("_index")
+                if isinstance(bound_index, int) and not isinstance(bound_index, bool):
+                    start_index = bound_index
+                elif bool(getattr(index_segment.info, "is_required", False)):
+                    start_index = 1
+                else:
+                    yield cls._normalized_mp4_output_path(destination.resolve()), None
+                    start_index = 1
+                for index in range(
+                    start_index,
+                    start_index + MAX_ATOMIC_OUTPUT_CANDIDATES,
+                ):
+                    indexed_path = MacroPath(
+                        parsed_macro=file_path.parsed_macro,
+                        variables={**variables, "_index": index},
+                    )
+                    yield (
+                        cls._normalized_mp4_output_path(File(indexed_path).resolve()),
+                        index,
+                    )
+                return
+
+        base_path = cls._normalized_mp4_output_path(destination.resolve())
+        yield base_path, None
+        for index in range(1, MAX_ATOMIC_OUTPUT_CANDIDATES + 1):
+            yield (
+                base_path.with_name(f"{base_path.stem}_{index}{base_path.suffix}"),
+                None,
+            )
+
+    @classmethod
+    def _output_destination_candidates(
+        cls,
+        destination: Any,
+    ) -> Iterator[Path]:
+        """Yield collision candidates without reserving or writing a file."""
+
+        for candidate, _macro_index in cls._output_destination_candidate_records(
+            destination
+        ):
+            yield candidate
+
+    @classmethod
+    def _preflight_output_destination(cls, destination: Any) -> Path:
+        """Resolve and write-probe the local target before any billable POST."""
+
+        if bool(getattr(destination, "_append", False)):
+            raise ValueError("Generated MP4 output does not support append mode.")
+        policy = cls._output_destination_policy(destination)
+        candidates = cls._output_destination_candidate_records(destination)
+        selected: Path | None = None
+        for candidate, _macro_index in candidates:
+            if policy is not ExistingFilePolicy.CREATE_NEW or not candidate.exists():
+                selected = candidate
+                break
+        if selected is None:
+            raise FileExistsError(
+                "No unused generated-video output filename is available."
+            )
+        if policy is ExistingFilePolicy.FAIL and selected.exists():
+            raise FileExistsError(f"Generated-video output already exists: {selected}")
+        if selected.exists() and not selected.is_file():
+            raise IsADirectoryError(f"Generated-video output is not a file: {selected}")
+        create_parents = bool(getattr(destination, "_create_parents", True))
+        if not selected.parent.exists():
+            if not create_parents:
+                raise FileNotFoundError(
+                    "Generated-video output directory does not exist: "
+                    f"{selected.parent}"
+                )
+            selected.parent.mkdir(parents=True, exist_ok=True)
+        if not selected.parent.is_dir():
+            raise NotADirectoryError(
+                f"Generated-video output parent is not a directory: {selected.parent}"
+            )
+        cls._probe_output_parent_writable(selected.parent)
+        return selected
+
+    @staticmethod
+    def _probe_output_parent_writable(parent: Path) -> None:
+        """Verify sibling staging is writable before a billable submission."""
+
+        probe = parent / f".hmb-seedance.{uuid4().hex}.output-probe"
+        try:
+            with probe.open("xb") as stream:
+                if stream.write(b"\x00") != 1:
+                    raise OSError(
+                        "Generated-video output write probe was incomplete."
+                    )
+                stream.flush()
+        finally:
+            with suppress(FileNotFoundError):
+                probe.unlink()
+
+    @staticmethod
+    def _publish_output_without_overwrite(stage: Path, destination: Path) -> bool:
+        """Publish a complete sibling file while refusing an existing name."""
+
+        try:
+            os.link(stage, destination)
+        except FileExistsError:
+            return False
+        except OSError:
+            if os.name != "nt":
+                raise
+            try:
+                os.rename(stage, destination)
+            except FileExistsError:
+                return False
+        else:
+            with suppress(OSError):
+                stage.unlink()
+        return True
+
+    @staticmethod
+    async def _await_filesystem_commit(function: Any, *args: Any) -> Any:
+        """Finish a started atomic filesystem operation before cancellation."""
+
+        operation = asyncio.create_task(asyncio.to_thread(function, *args))
+        cancellation_requested = False
+        while True:
+            try:
+                result = await asyncio.shield(operation)
+                break
+            except asyncio.CancelledError:
+                cancellation_requested = True
+                continue
+        if cancellation_requested:
+            logger.warning(
+                "Cancellation arrived during generated-video publication; "
+                "the atomic commit completed before success was returned."
+            )
+        return result
+
+    async def _await_submission_result(
+        self,
+        function: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[Any, bool]:
+        """Recover a started billable submission even after local cancellation."""
+
+        operation = asyncio.create_task(
+            asyncio.to_thread(function, *args, **kwargs)
+        )
+        cancellation_requested = False
+        while True:
+            try:
+                return await asyncio.shield(operation), cancellation_requested
+            except asyncio.CancelledError:
+                cancellation_requested = True
+                self._submission_outcome_unknown = True
+                continue
+
+    @classmethod
+    async def _atomic_publish_completed_mp4(
+        cls,
+        destination: Any,
+        content: bytes,
+    ) -> File:
+        if not _is_structurally_valid_mp4(content):
+            raise RuntimeError("Generated result is not a valid MP4 container.")
+        cls._preflight_output_destination(destination)
+        policy = cls._output_destination_policy(destination)
+        candidates = cls._output_destination_candidate_records(destination)
+        published: Path | None = None
+        published_macro_index: int | None = None
+        for candidate, macro_index in candidates:
+            if policy is ExistingFilePolicy.CREATE_NEW and candidate.exists():
+                continue
+            create_parents = bool(getattr(destination, "_create_parents", True))
+            if not candidate.parent.exists():
+                if not create_parents:
+                    raise FileNotFoundError(
+                        "Generated-video output directory does not exist: "
+                        f"{candidate.parent}"
+                    )
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+            stage = candidate.parent / (
+                f".{candidate.stem}.{uuid4().hex}.partial{candidate.suffix}"
+            )
+            try:
+                written_stage = await File(str(stage)).awrite_bytes(
+                    content,
+                    existing_file_policy=ExistingFilePolicy.FAIL,
+                    append=False,
+                    create_parents=False,
+                    coerce_extension_to_match_bytes=False,
+                )
+                if Path(written_stage) != stage or stage.stat().st_size != len(content):
+                    raise OSError(
+                        "Generated-video staging file was not written completely."
+                    )
+                if policy is ExistingFilePolicy.OVERWRITE:
+                    await cls._await_filesystem_commit(os.replace, stage, candidate)
+                    claimed = True
+                else:
+                    claimed = await cls._await_filesystem_commit(
+                        cls._publish_output_without_overwrite,
+                        stage,
+                        candidate,
+                    )
+                if claimed:
+                    published = candidate
+                    published_macro_index = macro_index
+                    break
+                if policy is ExistingFilePolicy.FAIL:
+                    raise FileExistsError(
+                        f"Generated-video output already exists: {candidate}"
+                    )
+            finally:
+                with suppress(OSError):
+                    stage.unlink()
+            if policy is not ExistingFilePolicy.CREATE_NEW:
+                break
+        if published is None:
+            raise FileExistsError(
+                "No unused generated-video output filename is available."
+            )
+
+        metadata = getattr(
+            getattr(destination, "_file", None),
+            "_file_metadata",
+            None,
+        )
+        if metadata is not None:
+            metadata = deepcopy(metadata)
+            situation = getattr(metadata, "situation", None)
+            variables = getattr(situation, "variables", None)
+            if isinstance(variables, dict):
+                if "file_extension" in variables:
+                    variables["file_extension"] = published.suffix.lstrip(".")
+                if published_macro_index is not None:
+                    variables["_index"] = published_macro_index
+            try:
+                write_sidecar(published, metadata)
+            except Exception as exc:
+                logger.warning(
+                    "Generated MP4 was saved, but its metadata sidecar could not "
+                    "be written: %s",
+                    type(exc).__name__,
+                )
+        saved = File(str(published))
+        mapper = getattr(destination, "_map_to_macro_file", None)
+        if callable(mapper):
+            try:
+                saved = mapper(saved)
+            except Exception as exc:
+                logger.warning(
+                    "Could not map generated MP4 to a project macro: %s",
+                    type(exc).__name__,
+                )
+        return saved
+
     async def _save_completed_task(
         self, final_task: dict[str, Any], generation_id: str, destination: Any
     ) -> None:
@@ -2881,7 +3224,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "FN AI Broker task succeeded but the video URL was missing."
             )
         video_bytes = await self._download_broker_video(video_download_url)
-        saved = await destination.awrite_bytes(video_bytes)
+        saved = await self._atomic_publish_completed_mp4(destination, video_bytes)
         artifact = VideoUrlArtifact(value=saved.location, name=saved.name)
         self.parameter_output_values["video_url"] = artifact
         self.parameter_output_values["VIDEO_OUT"] = artifact
@@ -2895,36 +3238,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 f"Saved MP4: {saved.location}"
             ),
         )
-
-    @staticmethod
-    def _preflight_output_destination(destination: Any) -> None:
-        """Validate an output target without rejecting engine-assigned versions.
-
-        Some team project templates require ``{_index}`` in their output macro.
-        The Griptape write path assigns that version immediately before writing,
-        so an earlier plain ``resolve()`` cannot supply it.  Ignore only that
-        single expected preflight failure; every other destination error still
-        fails before a task can be submitted.
-        """
-        try:
-            destination.resolve()
-        except Exception as exc:
-            marker = "missing required variables:"
-            details = str(exc)
-            if marker not in details:
-                raise
-            missing = {
-                name.strip()
-                for name in details.rsplit(marker, 1)[1].split(",")
-                if name.strip()
-            }
-            if missing != {"_index"}:
-                raise
-            logger.debug(
-                "Output preflight deferred because the project assigns {_index} "
-                "when the completed video is written."
-            )
-
 
     async def _refresh_async(self) -> None:
         """Refresh one Broker job without ever creating a replacement task."""
@@ -3143,7 +3456,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 status="submitting",
             )
             try:
-                response = await asyncio.to_thread(
+                response, submission_cancelled = await self._await_submission_result(
                     bridge.generate_seedance,
                     payload,
                     timeout=min(float(timeout), 1200.0),
@@ -3163,6 +3476,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             task = self._normalize_broker_task(response)
             generation_id = str(task["id"])
             status = str(task["status"])
+            self._submission_outcome_unknown = False
             self._set_broker_task_outputs(
                 task,
                 generation_id=generation_id,
@@ -3179,6 +3493,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             elif status in TERMINAL_FAILURE_STATUSES:
                 raise RuntimeError(
                     self._broker_terminal_failure_message(task, generation_id)
+                )
+            if submission_cancelled:
+                self.parameter_output_values["generation_status"] = "cancelled_locally"
+                raise asyncio.CancelledError(
+                    "Local cancellation arrived during submission. The FN AI Broker "
+                    f"task ID was recovered as {generation_id}; use Refresh / Retrieve "
+                    "Result for this same task."
                 )
 
         while final_task is None:
@@ -3317,16 +3638,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
             self._handle_failure_exception(RuntimeError(safe_message))
 
-
-class HMBSeedance20VideoGeneration(HMBSeedanceGeneration):
-    """Compatibility node type for workflows saved before the generic rename.
-
-    Griptape serializes ``node.__class__.__name__``. The manifest intentionally
-    registers this override-free wrapper while exposing only the generic node
-    label, so existing workflows resolve without duplicating the palette entry.
-    """
-
-
 __all__ = [
     "GT_CLOUD_API_KEY_SECRET",
     "GT_CLOUD_BUCKET_ID_SECRET",
@@ -3334,7 +3645,6 @@ __all__ = [
     "TOS_SECRET_ACCESS_KEY_SECRET",
     "TOS_BUCKET_NAME_SECRET",
     "HMBSeedanceGeneration",
-    "HMBSeedance20VideoGeneration",
     "LOCAL_VIDEO_UPLOAD_GRIPTAPE",
     "LOCAL_VIDEO_UPLOAD_TOS",
     "MAX_REFERENCE_IMAGES",

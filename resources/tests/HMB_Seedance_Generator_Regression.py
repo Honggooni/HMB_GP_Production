@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import httpx
+from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
     CreateConnectionResultSuccess,
@@ -42,6 +43,11 @@ ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "HMBSeedanceGeneration.py"
 IMAGE_ASSET_MODULE_PATH = ROOT / "HMBImageAssetLibrary.py"
 VIDEO_PICKER_MODULE_PATH = ROOT / "HMBVideoPickerLibrary.py"
+VALID_MP4_BYTES = (
+    b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+    b"\x00\x00\x00\x10moov\x00\x00\x00\x08mvhd"
+    b"\x00\x00\x00\x10mdat12345678"
+)
 
 
 def load_target():
@@ -87,7 +93,10 @@ video_picker_target = load_video_picker_target()
 
 class FakeDestination:
     def __init__(self) -> None:
-        self.location = str(ROOT / ".tmp" / "volcengine-regression.mp4")
+        self._temporary_directory = tempfile.TemporaryDirectory()
+        self.location = str(
+            Path(self._temporary_directory.name) / "volcengine-regression.mp4"
+        )
         self.resolved = False
         self.written: bytes | None = None
 
@@ -113,6 +122,18 @@ class IndexedMacroDestination(FakeDestination):
         super().__init__()
         self.missing_variables = missing_variables
         self.resolve_attempts = 0
+        if missing_variables == "_index":
+            parsed_macro = ParsedMacro(
+                Path(self._temporary_directory.name).as_posix()
+                + "/take_{###}/volcengine-regression.mp4"
+            )
+            self._file = SimpleNamespace(
+                _file_path=target.MacroPath(parsed_macro, {}),
+                _file_metadata=None,
+            )
+            self._existing_file_policy = target.ExistingFilePolicy.CREATE_NEW
+            self._create_parents = True
+            self._append = False
 
     def resolve(self) -> str:
         self.resolve_attempts += 1
@@ -170,7 +191,7 @@ class FakeBrokerBridge:
         return False
 
 
-class BrokerScriptedNode(target.HMBSeedance20VideoGeneration):
+class BrokerScriptedNode(target.HMBSeedanceGeneration):
     def __init__(self, bridge: FakeBrokerBridge) -> None:
         super().__init__(name="HMB Seedance Broker Scripted Regression")
         self.bridge = bridge
@@ -184,7 +205,7 @@ class BrokerScriptedNode(target.HMBSeedance20VideoGeneration):
 
     async def _download_video(self, url: str) -> bytes:
         self.downloads.append(url)
-        return b"\x00\x00\x00\x18ftypmp42broker-regression-video"
+        return VALID_MP4_BYTES
 
     async def _sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
@@ -210,15 +231,10 @@ def assert_constructor_and_public_contract() -> None:
         node = target.HMBSeedanceGeneration(name="Constructor Regression")
 
     assert target.HMBSeedanceGeneration.__mro__[1].__name__ == "SuccessFailureNode"
-    assert target.HMBSeedance20VideoGeneration.__mro__[1] is target.HMBSeedanceGeneration
-    assert target.HMBSeedance20VideoGeneration.__name__ == (
-        "HMBSeedance20VideoGeneration"
-    )
-    assert not {
-        name
-        for name, value in target.HMBSeedance20VideoGeneration.__dict__.items()
-        if callable(value) and name not in {"__module__"}
-    }, "The saved-workflow compatibility wrapper must not override behavior."
+    assert target.HMBSeedanceGeneration.__name__ == "HMBSeedanceGeneration"
+    retired_class_name = "HMB" + "Seedance" + "20VideoGeneration"
+    assert not hasattr(target, retired_class_name)
+    assert retired_class_name not in target.__all__
     names = [parameter.name for parameter in node.parameters]
     for required in (
         "exec_in",
@@ -428,7 +444,7 @@ def assert_constructor_and_public_contract() -> None:
     assert node.get_parameter_value("tos_url_validity_seconds") == 86400
     assert node.get_parameter_by_name("tos_region").hide is True
     assert node.get_parameter_value("generate_audio") is False
-    saved_audio_node = target.HMBSeedance20VideoGeneration(
+    saved_audio_node = target.HMBSeedanceGeneration(
         name="Saved Generate Audio Regression"
     )
     saved_audio_node.set_parameter_value("generate_audio", True, initial_setup=True)
@@ -496,7 +512,7 @@ def assert_constructor_and_public_contract() -> None:
     assert '"/api/device/start"' in source
     assert '"/api/device/token"' in source
     assert 'headers["Idempotency-Key"]' in source
-    assert "_BaseSeedance20" not in source
+    assert ("_Base" + "Seedance" + "20") not in source
     assert "GriptapeProxyNode" not in source
     assert "ProxyAuthProviderParameter" not in source
     assert "HMB_GRIPTAPE_STANDARD_LIBRARY_PATH" not in source
@@ -569,7 +585,7 @@ def assert_image_asset_single_wire_host_contract() -> None:
             source = image_asset_target.HMBImageAssetLibrary(
                 name=f"ImageAssetBatch_{stamp}"
             )
-            destination = target.HMBSeedance20VideoGeneration(
+            destination = target.HMBSeedanceGeneration(
                 name=f"SeedanceBatch_{stamp}"
             )
             register(source)
@@ -635,7 +651,7 @@ def assert_image_asset_single_wire_host_contract() -> None:
             overflow_source = image_asset_target.HMBImageAssetLibrary(
                 name=f"ImageAssetOverflow_{stamp}"
             )
-            overflow_destination = target.HMBSeedance20VideoGeneration(
+            overflow_destination = target.HMBSeedanceGeneration(
                 name=f"SeedanceOverflow_{stamp}"
             )
             register(overflow_source)
@@ -703,7 +719,7 @@ def assert_video_picker_single_wire_host_contract() -> None:
         source = video_picker_target.HMBVideoPickerLibrary(
             name=f"VideoPickerBatch_{stamp}"
         )
-        destination = target.HMBSeedance20VideoGeneration(
+        destination = target.HMBSeedanceGeneration(
             name=f"SeedanceVideoBatch_{stamp}"
         )
         register(source)
@@ -783,7 +799,7 @@ def assert_video_picker_single_wire_host_contract() -> None:
 
 
 def assert_payload_and_media_contract() -> None:
-    node = target.HMBSeedance20VideoGeneration(name="Payload Regression")
+    node = target.HMBSeedanceGeneration(name="Payload Regression")
     with tempfile.TemporaryDirectory() as temporary:
         temporary_path = Path(temporary)
         image_path = temporary_path / "reference.png"
@@ -870,7 +886,7 @@ def assert_payload_and_media_contract() -> None:
         target.VideoUrlArtifact("asset://video-asset-2"),
     )
     collected = node._get_parameters()
-    assert [target.HMBSeedance20VideoGeneration._coerce_reference_value(item) for item in collected["video_references"]] == [
+    assert [target.HMBSeedanceGeneration._coerce_reference_value(item) for item in collected["video_references"]] == [
         "https://cdn.example/video-1.mp4",
         "asset://video-asset-2",
     ]
@@ -878,7 +894,7 @@ def assert_payload_and_media_contract() -> None:
     assert node.get_parameter_by_name("reference_video_2").hide is True
     assert node.get_parameter_by_name("reference_video_3").hide is True
 
-    ordered_list_node = target.HMBSeedance20VideoGeneration(
+    ordered_list_node = target.HMBSeedanceGeneration(
         name="Picker Ordered Video List Regression"
     )
     ordered_list_node.set_parameter_value("prompt", "preserve picker order")
@@ -896,7 +912,7 @@ def assert_payload_and_media_contract() -> None:
     )
     assert ordered_video_payload["video_urls"] == ordered_videos
 
-    overflow_video_node = target.HMBSeedance20VideoGeneration(
+    overflow_video_node = target.HMBSeedanceGeneration(
         name="Picker Video Overflow Regression"
     )
     overflow_video_node.set_parameter_value("prompt", "reject four videos")
@@ -911,7 +927,7 @@ def assert_payload_and_media_contract() -> None:
     else:
         raise AssertionError("A four-video Picker batch was accepted")
 
-    scalar_node = target.HMBSeedance20VideoGeneration(name="Scalar Video Regression")
+    scalar_node = target.HMBSeedanceGeneration(name="Scalar Video Regression")
     scalar_node.set_parameter_value("prompt", "ordered scalar videos")
     scalar_node.set_parameter_value(
         "reference_video_1",
@@ -941,7 +957,7 @@ def assert_payload_and_media_contract() -> None:
     else:
         raise AssertionError("A gap before reference_video_2 was accepted")
 
-    legacy_node = target.HMBSeedance20VideoGeneration(name="Legacy List Regression")
+    legacy_node = target.HMBSeedanceGeneration(name="Legacy List Regression")
     legacy_node.set_parameter_value(
         "VIDEO_REFERENCES", ["https://cdn.example/legacy.mp4"]
     )
@@ -949,7 +965,7 @@ def assert_payload_and_media_contract() -> None:
         "https://cdn.example/legacy.mp4"
     ]
 
-    equivalent_legacy_node = target.HMBSeedance20VideoGeneration(
+    equivalent_legacy_node = target.HMBSeedanceGeneration(
         name="Legacy and Scalar Payload Equivalence Regression"
     )
     equivalent_legacy_node.set_parameter_value("prompt", "ordered scalar videos")
@@ -961,7 +977,7 @@ def assert_payload_and_media_contract() -> None:
         equivalent_legacy_node._get_parameters()
     ) == scalar_payload
 
-    mixed_node = target.HMBSeedance20VideoGeneration(
+    mixed_node = target.HMBSeedanceGeneration(
         name="Public Video List Overrides Hidden Scalar Regression"
     )
     mixed_node.set_parameter_value(
@@ -972,12 +988,12 @@ def assert_payload_and_media_contract() -> None:
         target.VideoUrlArtifact("https://cdn.example/new-scalar.mp4"),
     )
     assert [
-        target.HMBSeedance20VideoGeneration._coerce_reference_value(item)
+        target.HMBSeedanceGeneration._coerce_reference_value(item)
         for item in mixed_node._get_parameters()["video_references"]
     ] == ["https://cdn.example/public-list.mp4"]
     assert mixed_node._get_parameters()["video_reference_slots"] == []
 
-    serialized_list_node = target.HMBSeedance20VideoGeneration(
+    serialized_list_node = target.HMBSeedanceGeneration(
         name="Serialized List Compatibility Regression"
     )
     serialized_list_node.set_parameter_value(
@@ -998,7 +1014,7 @@ def assert_payload_and_media_contract() -> None:
         "https://cdn.example/legacy-audio.mp3"
     ]
 
-    ordered_image_node = target.HMBSeedance20VideoGeneration(
+    ordered_image_node = target.HMBSeedanceGeneration(
         name="Single Wire Ordered Image Regression"
     )
     ordered_images = [
@@ -1015,7 +1031,7 @@ def assert_payload_and_media_contract() -> None:
     assert ordered_list_payload["image_urls"] == ordered_images
     assert ordered_list_payload["prompt"] == "single wire list order"
 
-    empty_child_node = target.HMBSeedance20VideoGeneration(
+    empty_child_node = target.HMBSeedanceGeneration(
         name="Empty Single Image List Regression"
     )
     empty_child_node.get_parameter_by_name("reference_audio").append_child_parameter()
@@ -1030,7 +1046,7 @@ def assert_payload_and_media_contract() -> None:
     assert "image_urls" not in empty_child_payload
     assert "audio_urls" not in empty_child_payload
 
-    connected_parent_list_node = target.HMBSeedance20VideoGeneration(
+    connected_parent_list_node = target.HMBSeedanceGeneration(
         name="Connected Parent List Regression"
     )
     connected_parent_list_node.set_parameter_value(
@@ -1187,10 +1203,10 @@ def assert_broker_generation_contract() -> None:
         "expired": "expired",
     }
     for raw, expected in status_cases.items():
-        assert target.HMBSeedance20VideoGeneration._normalize_broker_status(raw) == (
+        assert target.HMBSeedanceGeneration._normalize_broker_status(raw) == (
             expected
         )
-    assert target.HMBSeedance20VideoGeneration._normalize_broker_status(
+    assert target.HMBSeedanceGeneration._normalize_broker_status(
         "provider-api-key-canary"
     ) == ""
 
@@ -1541,7 +1557,7 @@ def assert_broker_generation_contract() -> None:
         "token": FakeBrokerBridge.SECRET_VALUES[0],
     }
     normalized_unknown = (
-        target.HMBSeedance20VideoGeneration._normalize_broker_task(
+        target.HMBSeedanceGeneration._normalize_broker_task(
             submission_unknown_response
         )
     )
@@ -2251,7 +2267,7 @@ def assert_broker_account_and_button_contract() -> None:
     assert not bridge.is_trusted_broker_url(
         target.AI_BROKER_SERVER_URL + ".evil.example/result.mp4"
     )
-    assert target.HMBSeedance20VideoGeneration._broker_result_url(
+    assert target.HMBSeedanceGeneration._broker_result_url(
         "/downloads/result.mp4"
     ) == (target.AI_BROKER_SERVER_URL + "/downloads/result.mp4")
 
@@ -2275,7 +2291,7 @@ def assert_broker_account_and_button_contract() -> None:
             )
 
     blocking_bridge = BlockingBridge()
-    node = target.HMBSeedance20VideoGeneration(name="Broker Button Regression")
+    node = target.HMBSeedanceGeneration(name="Broker Button Regression")
     node._broker_bridge_instance = blocking_bridge
     no_engine_loop = SimpleNamespace(event_loop=None, put_event=lambda _event: None)
     with mock.patch.object(
@@ -2301,8 +2317,8 @@ def assert_broker_account_and_button_contract() -> None:
 
 
 def assert_indexed_output_macro_contract() -> None:
-    # Required {_index} slots are allocated by ProjectFileDestination's write
-    # path. The node's non-writing preflight must not reject that valid setup.
+    # Required {_index} slots are resolved before submission without exposing a
+    # partial final file.
     bridge = FakeBrokerBridge(
         [
             {
@@ -2319,8 +2335,12 @@ def assert_indexed_output_macro_contract() -> None:
     node.set_parameter_value("prompt", "required output index regression")
     asyncio.run(node._process_generation())
 
-    assert indexed_destination.resolve_attempts == 1
-    assert indexed_destination.written == b"\x00\x00\x00\x18ftypmp42broker-regression-video"
+    assert indexed_destination.resolve_attempts == 0
+    published = list(
+        Path(indexed_destination._temporary_directory.name).rglob("*.mp4")
+    )
+    assert len(published) == 1
+    assert published[0].read_bytes() == VALID_MP4_BYTES
     assert len(bridge.generate_payloads) == 1
     assert bridge.refresh_ids == ["broker-job-1"]
     assert node.parameter_output_values["was_successful"] is True
@@ -2339,6 +2359,105 @@ def assert_indexed_output_macro_contract() -> None:
     else:
         raise AssertionError("An unrelated missing output macro variable was accepted")
     assert invalid_bridge.generate_payloads == []
+
+
+class AtomicLocalDestination:
+    def __init__(self, path: Path, policy) -> None:
+        self.location = str(path)
+        self._existing_file_policy = policy
+        self._create_parents = True
+        self._append = False
+
+    def resolve(self) -> str:
+        return self.location
+
+    async def awrite_bytes(self, _content: bytes):
+        raise AssertionError("Completed MP4 used a non-atomic destination writer")
+
+
+def assert_atomic_output_and_submission_safety() -> None:
+    assert target._is_structurally_valid_mp4(VALID_MP4_BYTES)
+    assert not target._is_structurally_valid_mp4(
+        b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+        b"\x00\x00\x00\x10mdat12345678"
+    )
+    assert not target._is_structurally_valid_mp4(
+        b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+        b"\x00\x00\x00\x10moov\x00\x00\x00\x08mvhd"
+    )
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        final_path = root / "atomic.mp4"
+        old_bytes = b"previous-complete-output"
+        final_path.write_bytes(old_bytes)
+        destination = AtomicLocalDestination(
+            final_path,
+            target.ExistingFilePolicy.OVERWRITE,
+        )
+        real_replace = target.os.replace
+        observations: list[Path] = []
+
+        def observed_replace(source, target_path) -> None:
+            source_path = Path(source)
+            assert source_path.parent == Path(target_path).parent == root
+            assert source_path.read_bytes() == VALID_MP4_BYTES
+            assert final_path.read_bytes() == old_bytes
+            observations.append(source_path)
+            real_replace(source_path, target_path)
+
+        with mock.patch.object(target.os, "replace", side_effect=observed_replace):
+            saved = asyncio.run(
+                target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                    destination,
+                    VALID_MP4_BYTES,
+                )
+            )
+        assert observations
+        assert final_path.read_bytes() == VALID_MP4_BYTES
+        assert Path(saved.resolve()) == final_path
+        assert not list(root.glob(".*.partial.mp4"))
+        assert not list(root.glob(".*.output-probe"))
+
+    bridge = FakeBrokerBridge([])
+    node = BrokerScriptedNode(bridge)
+    node.set_parameter_value("prompt", "preflight must precede billing")
+    with mock.patch.object(
+        target.HMBSeedanceGeneration,
+        "_probe_output_parent_writable",
+        side_effect=PermissionError("simulated unwritable output parent"),
+    ):
+        try:
+            asyncio.run(node._process_generation_impl())
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("Unwritable output reached Broker submission")
+    assert bridge.account_calls == 0
+    assert bridge.generate_payloads == []
+
+    async def cancellation_case() -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_submit() -> dict:
+            started.set()
+            assert release.wait(2.0)
+            return {"job_id": "broker-job-cancel", "status": "pending"}
+
+        operation = asyncio.create_task(
+            node._await_submission_result(blocking_submit)
+        )
+        assert await asyncio.to_thread(started.wait, 1.0)
+        operation.cancel()
+        await asyncio.sleep(0.02)
+        assert not operation.done()
+        release.set()
+        response, cancellation_requested = await operation
+        assert response["job_id"] == "broker-job-cancel"
+        assert cancellation_requested is True
+
+    asyncio.run(cancellation_case())
 
 
 class FakeCloudDriver:
@@ -2443,7 +2562,7 @@ def assert_local_video_temporary_publication() -> None:
         output_dump = json.dumps(node.parameter_output_values, default=str)
         assert "temporary-secret" not in output_dump
 
-        public_node = target.HMBSeedance20VideoGeneration(
+        public_node = target.HMBSeedanceGeneration(
             name="Public Video Bypasses Cloud Regression"
         )
         public_node.set_parameter_value(
@@ -2483,7 +2602,7 @@ def assert_local_video_temporary_publication() -> None:
             raise AssertionError("Missing local video received a generic upload error")
         assert missing_bridge.generate_payloads == []
 
-        disabled_node = target.HMBSeedance20VideoGeneration(
+        disabled_node = target.HMBSeedanceGeneration(
             name="Disabled Local Publication Regression"
         )
         disabled_node.set_parameter_value("reference_video_1", original_artifact)
@@ -2574,7 +2693,7 @@ def assert_tos_local_video_temporary_publication() -> None:
         )
 
         assert (
-            target.HMBSeedance20VideoGeneration._normalize_tos_endpoint(
+            target.HMBSeedanceGeneration._normalize_tos_endpoint(
                 "https://tos-cn-beijing.volces.com/"
             )
             == "tos-cn-beijing.volces.com"
@@ -2585,7 +2704,7 @@ def assert_tos_local_video_temporary_publication() -> None:
             "https://tos-cn-beijing.volces.com/private",
         ):
             try:
-                target.HMBSeedance20VideoGeneration._normalize_tos_endpoint(
+                target.HMBSeedanceGeneration._normalize_tos_endpoint(
                     invalid_endpoint
                 )
             except ValueError:
@@ -2600,7 +2719,7 @@ def assert_tos_local_video_temporary_publication() -> None:
 
 
 
-class BrokerResultDownloadNode(target.HMBSeedance20VideoGeneration):
+class BrokerResultDownloadNode(target.HMBSeedanceGeneration):
     def __init__(self) -> None:
         super().__init__(name="Broker Result Download Regression")
         self.sleeps: list[float] = []
@@ -2619,7 +2738,7 @@ def assert_broker_result_download_contract() -> None:
         download_requests.append(request)
         return httpx.Response(
             200,
-            content=b"\x00\x00\x00\x18ftypmp42transport-video",
+            content=VALID_MP4_BYTES,
             headers={"content-type": "video/mp4"},
         )
 
@@ -2699,7 +2818,7 @@ def assert_broker_server_accounting_contract() -> None:
     }
     for runtime_class in (
         target.HMBSeedanceGeneration,
-        target.HMBSeedance20VideoGeneration,
+        target.HMBSeedanceGeneration,
     ):
         assert not {
             name for name in dir(runtime_class) if "usage" in name.casefold()
@@ -2748,6 +2867,7 @@ assert_refresh_during_submission_contract()
 assert_broker_direct_transport_resilience_contract()
 assert_broker_account_and_button_contract()
 assert_indexed_output_macro_contract()
+assert_atomic_output_and_submission_safety()
 assert_local_video_temporary_publication()
 assert_tos_local_video_temporary_publication()
 assert_broker_result_download_contract()

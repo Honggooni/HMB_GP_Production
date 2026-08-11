@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 from pathlib import Path
 
 
@@ -229,8 +230,9 @@ unknown_result = prompt._apply_picker_payload(unknown_state, unknown_payload, co
 assert unknown_result["images"][0]["color_picks"] == ["Infrared dream marker"]
 
 
-# Dormant addresses and relationship Targets remain local state. The public
-# role/replacement sections keep the active Prop target and its selected slot.
+# Dormant relationship Targets remain local state. The typed public job keeps
+# the active Prop target and selected source binding, while the direct Prompt
+# UI text remains in the five-field USER DESCRIPTION object.
 goal_state = prompt._default_widget_state()
 goal_state["images"] = [{
     **prompt._default_image_item(1),
@@ -249,20 +251,34 @@ assert goal_state["images"][0]["legacy_relationship_targets"] == [
     "Door lock",
     "Memory echo",
 ]
-assert "Hero hand prop / accessory source" in goal_prompt
-assert "Color Pick marker: @video3 / Custom brass marker" in goal_prompt
+goal_lines = goal_prompt.splitlines()
+assert len(goal_lines) == 7
+goal_job = json.loads(goal_lines[2])
+goal_user = json.loads(goal_lines[6])
+goal_image = goal_job["images"][0]
+assert goal_image["source_type"] == "Prop / Accessory"
+assert goal_image["target_id"] == "Hero hand"
+assert goal_image["bindings"] == [{
+    "video": "@video3",
+    "marker_color": "Custom brass marker",
+    "target_scope": "Handheld prop",
+}]
+assert goal_image["relationship_targets"] == []
 assert "Door lock" not in goal_prompt
 assert "Memory echo" not in goal_prompt
 assert "follow @video1" not in goal_prompt
-assert "USER DESCRIPTION DATA (JSON):" not in goal_prompt
-assert "dream-memory rhythm" not in goal_prompt
+assert goal_user == {
+    "SCENE_CONTEXT": "Resolve @video5 as a dream-memory rhythm",
+}
 
 malformed_text_state = prompt._default_widget_state()
 malformed_text_state["text"]["PRESERVED_TEXT"] = "free readable words\n[Future Tag] exact future phrase"
 malformed_prompt = prompt._build_prompt_package(malformed_text_state)
 assert "PRESERVED_TEXT_DESCRIPTIVE_FALLBACK" not in malformed_prompt
-assert "free readable words" not in malformed_prompt
-assert "exact future phrase" not in malformed_prompt
+malformed_user = json.loads(malformed_prompt.splitlines()[6])
+assert malformed_user == {
+    "PRESERVED_TEXT": "free readable words\n[Future Tag] exact future phrase",
+}
 assert "SOURCE DATA WARNINGS" not in malformed_prompt
 
 source = (ROOT / "HMBPromptLibrary.py").read_text(encoding="utf-8")

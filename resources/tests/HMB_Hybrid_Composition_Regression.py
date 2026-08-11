@@ -31,6 +31,16 @@ prompt = load("HMBPromptLibrary")
 agent = load("HMBAgentLibrary")
 
 
+def prompt_sections(payload: str):
+    lines = payload.splitlines()
+    assert lines[0] == "HMB_GP_Production"
+    assert len(lines) == 7
+    assert lines[1] == "HMB JOB DATA (JSON):"
+    assert lines[3] == "FX/TIMING SOURCE DATA (JSON):"
+    assert lines[5] == "USER DESCRIPTION DATA (JSON):"
+    return json.loads(lines[2]), json.loads(lines[4]), json.loads(lines[6])
+
+
 # The hybrid product supports every non-empty composition of its four nodes.
 # Keep this list explicit: deleting even one supported composition must fail this
 # regression instead of being hidden by a generated powerset.
@@ -142,10 +152,10 @@ assert without_picker["picker"]["enabled"] is False
 
 def assert_prompt_is_additive(state, label: str) -> str:
     compiled = prompt._build_prompt_package(state)
-    assert "SOURCE AUTHORITY CONFLICTS:" not in compiled, label
-    assert "requires one validated Motion Guide" not in compiled, label
-    assert "@video1 Color Playblast is required" not in compiled, label
-    assert "Final prompt generation is blocked" not in compiled, label
+    job, fx_contract, user_data = prompt_sections(compiled)
+    assert job["schema"] == "hmb-public-job-data", label
+    assert fx_contract["schema"] == "hmb-fx-timing-source-facts", label
+    assert isinstance(user_data, dict), label
     return compiled
 
 
@@ -163,9 +173,11 @@ manual_primary = prompt._normalize_state(manual_primary)
 assert manual_primary["videos"][0]["source_type"] == "Motion Reference"
 assert manual_primary["videos"][0]["control_role"] == "Local Motion Detail Only"
 manual_primary_compiled = assert_prompt_is_additive(manual_primary, "P manual @video1")
-assert "@video1 = manual-motion-reference.mp4" in manual_primary_compiled
-assert "VIDEO ROLE MAP:" not in manual_primary_compiled
-assert "Local Motion Detail Only" not in manual_primary_compiled
+manual_primary_job = prompt_sections(manual_primary_compiled)[0]
+assert manual_primary_job["videos"][0]["video"] == "@video1"
+assert manual_primary_job["videos"][0]["source_type"] == "Motion Reference"
+assert manual_primary_job["videos"][0]["control_role"] == "Local Motion Detail Only"
+assert manual_primary_job["control_only_bindings"] == []
 
 auxiliary_only = prompt._default_widget_state()
 auxiliary_only["videos"].append(prompt._default_video_item(2))
@@ -177,7 +189,9 @@ auxiliary_only["videos"][1].update({
     "manual": True,
 })
 auxiliary_compiled = assert_prompt_is_additive(auxiliary_only, "P auxiliary-only")
-assert "Active video slots = @video2" in auxiliary_compiled
+assert [video["video"] for video in prompt_sections(auxiliary_compiled)[0]["videos"]] == [
+    "@video2",
+]
 
 asset_payload = {
     "mode": "image_asset",
@@ -234,11 +248,12 @@ for composition_name, composition_state in prompt_states.items():
     assert_prompt_is_additive(composition_state, composition_name)
 
 color_direct_prompt = prompt._build_prompt_package(prompt_states["VP"])
-assert "@video1 = color-only" in color_direct_prompt
-assert "VIDEO ROLE MAP:" not in color_direct_prompt
-assert "Color Playblast scope = animator-authored acting" not in color_direct_prompt
-assert "Generator exposure prohibited" not in color_direct_prompt
-assert "must not be connected" not in color_direct_prompt
+color_direct_job, color_direct_fx, color_direct_user = prompt_sections(
+    color_direct_prompt
+)
+assert color_direct_job["videos"][0]["source_type"] == "Maya Preview / Playblast"
+assert color_direct_fx["sources"] == []
+assert color_direct_user == {}
 
 color_depth_state = prompt._apply_picker_payload(
     prompt._default_widget_state(), picker_depth_payload, connected=True
@@ -249,17 +264,19 @@ color_depth_state["videos"][1].update({
 })
 assert_prompt_is_additive(color_depth_state, "VP Color+Depth without Motion")
 
-# Technical Picker/schema issues remain local state and do not expand the
-# five-section public Prompt or create a global prompt-generation block.
+# Technical Picker/schema issues reduce or ignore only the affected record.
+# They remain visible as warnings while the rest of the hybrid composition and
+# user goal continue without a global prompt-generation block.
 technical_error_state = prompt._default_widget_state()
 technical_error_state["picker"]["contract_errors"] = [
     "PICKER_OUT contains duplicate rows for @video2."
 ]
 technical_error_prompt = prompt._build_prompt_package(technical_error_state)
-assert technical_error_state["picker"]["contract_errors"]
-assert "SOURCE DATA WARNINGS:" not in technical_error_prompt
-assert "PICKER_OUT contains duplicate rows" not in technical_error_prompt
-assert "Final prompt generation is blocked" not in technical_error_prompt
+technical_job, technical_fx, technical_user = prompt_sections(technical_error_prompt)
+assert technical_job["images"] == []
+assert technical_job["videos"] == []
+assert technical_fx["valid"] is True
+assert technical_user == {}
 
 # Picker connections merge their evidence into the current state. A shorter
 # payload must not delete independent manual video rows or bindings that point
@@ -307,12 +324,16 @@ unnamed_state["videos"][0].update({
     "control_role": "Context Only",
 })
 unnamed_prompt = assert_prompt_is_additive(unnamed_state, "P unnamed sources")
-assert "@image1 = image source 1" in unnamed_prompt
-assert "@video1 = video source 1" in unnamed_prompt
+unnamed_job = prompt_sections(unnamed_prompt)[0]
+assert unnamed_job["images"][0]["image"] == "@image1"
+assert unnamed_job["images"][0]["label"] == ""
+assert unnamed_job["images"][0]["custom_source_type"] == "Unnamed image idea"
+assert unnamed_job["videos"][0]["video"] == "@video1"
+assert unnamed_job["videos"][0]["label"] == ""
 
-# Malformed exact-text rows remain local dashboard state. Exact literals are
-# never rewritten when image rows are reordered and are never serialized into
-# the five-section public Prompt.
+# Malformed exact-text rows lose only exact-literal authority; their wording is
+# preserved as descriptive intent. Exact literals are never rewritten when
+# image rows are reordered.
 preserved_state = prompt._default_widget_state()
 preserved_state["text"]["PRESERVED_TEXT"] = (
     "[On-screen Text] @image2 literal\n"
@@ -324,8 +345,14 @@ assert "[On-screen Text] @image2 literal" in preserved_state["text"]["PRESERVED_
 assert "untagged @image2 descriptive words" in preserved_state["text"]["PRESERVED_TEXT"]
 assert preserved_state["text"]["SCENE_CONTEXT"] == "Follow @image1 composition."
 preserved_prompt = prompt._build_prompt_package(preserved_state)
-assert "PRESERVED_TEXT_DESCRIPTIVE_FALLBACK" not in preserved_prompt
-assert "untagged @image2 descriptive words" not in preserved_prompt
+preserved_user = prompt_sections(preserved_prompt)[2]
+assert preserved_user == {
+    "SCENE_CONTEXT": "Follow @image1 composition.",
+    "PRESERVED_TEXT": (
+        "[On-screen Text] @image2 literal\n"
+        "untagged @image2 descriptive words"
+    ),
+}
 assert (
     prompt._remap_image_source_references("Use @image2 silhouette", {2: 0})
     == "Use [deselected image source #2] silhouette"
@@ -355,8 +382,8 @@ assert future_video["custom_source_type"] == "Future Video"
 assert future_video["control_role"] == "Custom Role"
 assert future_video["custom_control_role"] == "Future Role"
 
-# Enabling an incomplete optional Range preserves local state, but Range intent
-# is not serialized into the five-section public Prompt.
+# Enabling an incomplete optional Range preserves it as an unresolved typed
+# constraint. Missing optional fields are not technical corruption and add no warning.
 incomplete_range_state = prompt._default_widget_state()
 incomplete_range_state["images"][0].update({
     "present": True,
@@ -373,13 +400,14 @@ incomplete_range_prompt = assert_prompt_is_additive(
     incomplete_range_state,
     "P incomplete optional Range",
 )
-assert "@image1 = Range-independent idea" in incomplete_range_prompt
-assert '"FRAME_RANGE_INTENT"' not in incomplete_range_prompt
-assert "Optional frame-range instruction ignored" not in incomplete_range_prompt
-assert "SOURCE DATA WARNINGS:" not in incomplete_range_prompt
+incomplete_job = prompt_sections(incomplete_range_prompt)[0]
+assert incomplete_job["images"][0]["label"] == "Range-independent idea"
+assert incomplete_job["videos"][0]["label"] == "range-source.mp4"
+assert incomplete_job["frame_ranges"] == []
 
-# Large descriptive and Keep Out state remains local; the public Prompt stays
-# bounded to source/role/replacement sections without a diagnostic appendix.
+# Exceeding the advisory production budget no longer replaces the user goal
+# with a conflict-only response. The complete prompt remains available with a
+# non-blocking late-context warning.
 long_state = prompt._default_widget_state()
 long_state["videos"] = []
 for slot in range(1, prompt.MAX_VIDEOS + 1):
@@ -400,12 +428,13 @@ long_state["text"].update({
     "VIDEO_VFX": "V" * prompt.MAX_VIDEO_VFX_CHARS,
 })
 long_prompt = prompt._build_prompt_package(long_state)
-assert len(long_prompt) < prompt.MAX_PROMPT_CHARS
-assert "GOAL_SENTINEL" not in long_prompt
-assert "PROMPT BUDGET NOTICE:" not in long_prompt
-assert "USER DESCRIPTION DATA (JSON):" not in long_prompt
-assert "SOURCE AUTHORITY CONFLICTS:" not in long_prompt
-assert "Final prompt generation is blocked" not in long_prompt
+long_job, long_fx, long_user = prompt_sections(long_prompt)
+assert len(long_job["videos"]) == prompt.MAX_VIDEOS
+assert long_fx["sources"] == []
+assert long_user["PROJECT_STYLE_LOOK"].startswith("GOAL_SENTINEL ")
+assert len(long_user["SCENE_CONTEXT"]) == prompt.MAX_DESCRIPTION_CHARS
+assert len(long_user["EMOTION_INTENT"]) == prompt.MAX_DESCRIPTION_CHARS
+assert len(long_user["VIDEO_VFX"]) == prompt.MAX_VIDEO_VFX_CHARS
 
 
 # Instantiate and execute the three cheap standalone data paths. Use an empty
@@ -472,15 +501,15 @@ class _ProcessContractWarningCapture(logging.Handler):
 
 process_warning_capture = _ProcessContractWarningCapture()
 root_logger = logging.getLogger()
-async_nodes = (image_node, picker_node, prompt_node)
-if all(callable(getattr(node, "aprocess", None)) for node in async_nodes):
-    root_logger.addHandler(process_warning_capture)
-    try:
-        for node in async_nodes:
-            asyncio.run(node.aprocess())
-    finally:
-        root_logger.removeHandler(process_warning_capture)
-    assert process_warning_capture.messages == []
+root_logger.addHandler(process_warning_capture)
+try:
+    for node in (image_node, picker_node, prompt_node):
+        async_process = getattr(node, "aprocess", None)
+        if callable(async_process):
+            asyncio.run(async_process())
+finally:
+    root_logger.removeHandler(process_warning_capture)
+assert process_warning_capture.messages == []
 
 
 # A plain prompt keeps the untouched Standard Library Agent execution path and
@@ -493,10 +522,9 @@ assert agent._is_hmb_prompt_library_payload(plain_prompt) is False
 # a model request or skips the non-HMB branch contract.
 agent_node = object.__new__(agent.HMBAgentLibrary)
 agent_node._hmb_rules_active = False
-agent_node._hmb_structured_rules_active = False
-agent_node._hmb_goal_first_rules = []
+agent_node._hmb_ruleset_names = ("", "")
 agent_node._hmb_native_calls_this_process = 0
-native_calls: list[tuple[str, bool, bool, int]] = []
+native_calls: list[tuple[str, bool, int]] = []
 secure_calls: list[bool] = []
 
 
@@ -505,8 +533,7 @@ def fake_native_once(self):
         (
             plain_prompt,
             bool(self._hmb_rules_active),
-            bool(self._hmb_structured_rules_active),
-            len(self._hmb_goal_first_rules),
+            sum(bool(name) for name in self._hmb_ruleset_names),
         )
     )
     if False:
@@ -535,7 +562,7 @@ except StopIteration as stop:
     agent_result = stop.value
 
 assert agent_result == "native-path-complete"
-assert native_calls == [(plain_prompt, False, False, 0)]
+assert native_calls == [(plain_prompt, False, 0)]
 assert secure_calls == []
 assert agent_node._hmb_rules_active is False
 assert agent_node._hmb_native_calls_this_process == 0  # Stub owns this isolated call.
@@ -543,7 +570,6 @@ assert agent_node._hmb_native_calls_this_process == 0  # Stub owns this isolated
 agent_process_source = inspect.getsource(agent.HMBAgentLibrary.process)
 assert "is_hmb = self._has_canonical_hmb_prompt_connection()" in agent_process_source
 assert "_is_hmb_prompt_library_payload(prompt)" not in agent_process_source
-assert "_extract_goal_first_rule" in agent_process_source
 assert "yield from self._run_native_agent_once()" in agent_process_source
 assert "self._secure_hmb_outputs()" in agent_process_source.split("finally:", 1)[1]
 

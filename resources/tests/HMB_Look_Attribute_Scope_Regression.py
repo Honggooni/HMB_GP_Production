@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -24,7 +25,6 @@ agent_source = (ROOT / "HMBAgentLibrary.py").read_text(encoding="utf-8")
 guide = (ROOT / "resources" / "maya" / "HMBVideoPicker_Maya_Guide.txt").read_text(
     encoding="utf-8-sig"
 )
-
 legacy_scope_phrases = (
     "explicit user goal may use any visible property",
     "explicit current user goal may use any visible or supplied property",
@@ -36,9 +36,9 @@ for legacy in legacy_scope_phrases:
     assert legacy.casefold() not in source.casefold(), legacy
     assert legacy.casefold() not in guide.casefold(), legacy
 
-assert prompt.PROMPT_POLICY_SOURCE_VERSION == "2026-08-11.agent-shot-quality.v4"
+assert prompt.PROMPT_POLICY_SOURCE_VERSION == "2026-08-11.agent-shot-quality.v4.1"
 assert prompt.PROMPT_POLICY_SOURCE_CONTRACT_SHA256 == (
-    "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5"
+    "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
 )
 assert prompt.PROMPT_POLICY_SOURCE_VERSION == prompt._hmb._AGENT_POLICY_VERSION
 assert (
@@ -53,192 +53,149 @@ assert agent._assert_prompt_policy_identity_matches_signed_runtime() == (
     prompt.PROMPT_POLICY_SOURCE_VERSION,
     prompt.PROMPT_POLICY_SOURCE_CONTRACT_SHA256,
 )
-assert "내부 정책 공유폴더" not in agent_source
-assert "사용자 로컬에 동봉된 hmb_agent_core.dat" in agent_source
+assert "[HMB SERVER POLICY REQUIRED]" in agent_source
+assert "사용자 로컬에 동봉된 hmb_agent_core.dat" not in agent_source
 assert "_assert_prompt_policy_identity_matches_signed_runtime()" in agent_source
-# The public Prompt package identifies only its downstream target. Detailed
-# production defaults belong exclusively to the signed Agent policy and must
-# not be exposed or duplicated in user-visible Prompt text.
+
+def prompt_sections(payload: str):
+    lines = payload.splitlines()
+    assert lines[0] == "HMB_GP_Production"
+    assert len(lines) == 7
+    assert lines[1] == "HMB JOB DATA (JSON):"
+    assert lines[3] == "FX/TIMING SOURCE DATA (JSON):"
+    assert lines[5] == "USER DESCRIPTION DATA (JSON):"
+    return json.loads(lines[2]), json.loads(lines[4]), json.loads(lines[6])
+
+
+# Public Prompt output is typed job data only; look policy remains exclusively
+# in the signed Agent runtime.
 prompt_only = prompt._build_prompt_package(prompt._default_widget_state())
-assert (
-    "TARGET GENERATOR:\n"
-    "This prompt is written for the active downstream target generator or execution system.\n"
-) in prompt_only
-for hidden_policy_detail in (
-    "Interpret all source bindings",
+job, fx_contract, user_data = prompt_sections(prompt_only)
+assert job["images"] == []
+assert job["videos"] == []
+assert job["control_only_bindings"] == []
+assert fx_contract["sources"] == []
+assert user_data == {}
+for forbidden in (
     "PRODUCTION INTEGRATION DEFAULTS:",
-    "Unless an explicit scoped instruction changes it, stable deep focus uses camera-relative scene depth",
-    "Characters and environment within the same focus range receive the same optical response",
-    "Do not selectively focus or blur only characters or only environment by semantic object class",
-    "do not invent focus pumping or rack focus",
-    "environment map or IBL is explicitly approved as lighting authority",
-    "If supplied but not approved, treat it only as implementation evidence",
-    "If none is usable, infer only low-frequency sky and ground illumination, broad light direction, color temperature, contrast, and weather cues",
-    "do not invent an HDRI or dramatic light source",
-    "Environment dummies carry macro layout, volume, distribution, height, path, depth, occlusion, and structural density",
-    "approved background owns micro-density, surface appearance, palette, and atmosphere",
-    "Relight characters under shared scene lighting, exposure, atmosphere, white balance, and grade",
-    "no unstated character-only lift, fill, saturation, contrast boost, or beautification",
-    "Scene-space effects require bidirectional contact, occlusion, shadow, reflected light, atmospheric scattering",
-    "Camera, lens, and post effects have no world contact and cast no world shadow",
-    "Direct optical illumination and shadow follow onset, peak, and falloff",
-    "secondary physical response may use causal inertia, diffusion, delay, damping, dissipation, and recovery",
+    "Approved final appearance source",
+    "Proxy marker colors",
+    "relationship interpretation",
 ):
-    assert hidden_policy_detail not in prompt_only, hidden_policy_detail
-assert "subject-only blur" not in prompt_only.casefold()
+    assert forbidden not in prompt_only
+    assert forbidden not in source
 
-# The bundled signed v4 policy remains the authority for the removed public
-# defaults; the Prompt compiler must not become their second policy store.
-signed_policy = "\n".join(str(document) for document in prompt._hmb.get_internal_policy_documents())
-for policy_anchor in (
-    "camera-relative scene depth",
-    "semantic object class",
-    "environment map",
-    "macro layout",
-    "structural density",
-    "shared scene lighting",
-    "beautification",
-    "bidirectional contact",
-    "onset, peak, and falloff",
-    "inertia",
-    "diffusion",
-    "delay",
-    "damping",
-    "dissipation",
-    "recovery",
-):
-    assert policy_anchor.casefold() in signed_policy.casefold(), policy_anchor
-
-# A narrow optional role label cannot silently discard the animator-authored
-# full-shot state. It remains an emphasis unless the user supplies a scoped
-# property assignment.
+# A regular Playblast row exposes source identity and the selected role, but no
+# policy explanation.
 state = prompt._default_widget_state()
-state["videos"][0].update(
-    {
-        "present": True,
-        "label": "animator_color_playblast.mp4",
-        "source_type": "Maya Preview / Playblast",
-        "control_role": "Timing Only",
-    }
-)
-compiled = prompt._build_prompt_package(state)
-video_role = prompt._video_role_line(state["videos"][0], 1)
-for anchor in (
-    "protected animator-authored acting, motion, pose, timing, trajectory, contact",
-    "camera, framing, visibility, occlusion, relative depth, and spatial arrangement",
-    "selected role emphasizes timing verification without narrowing that shot state",
-    "a role label alone does not narrow them",
-    "Proxy marker colors, Color Pick markers, temporary Maya materials, dummy shading",
-    "not final identity, material, lighting, or look authority",
-    "explicit scoped instruction may change only its named property",
-    "named Target or clearly scene-wide scope",
-    "if no temporal subset is stated or clearly implied, it applies to the whole shot",
-    "otherwise only to that subset",
-):
-    assert anchor in video_role, anchor
-assert "@video1 = animator_color_playblast.mp4" in compiled
-assert "VIDEO ROLE MAP:" not in compiled
-assert "protected animator-authored acting" not in compiled
+state["videos"][0].update({
+    "present": True,
+    "label": "animator_color_playblast.mp4",
+    "source_type": "Maya Preview / Playblast",
+    "control_role": "Timing Only",
+})
+job, fx_contract, user_data = prompt_sections(prompt._build_prompt_package(state))
+assert job["videos"][0]["source_type"] == "Maya Preview / Playblast"
+assert job["videos"][0]["control_role"] == "Timing Only"
+assert fx_contract["sources"] == []
+assert user_data == {}
 
-# Structured control-only instructions stay usable, but their override cannot
-# spill from one target/boundary into unrelated appearance or motion fields.
-control_line = prompt._format_control_only_binding(
-    {
-        "video": 1,
-        "target": "Hero_A",
-        "function": "Focus",
-        "marker": "Red",
-        "boundary": "Frames 48-72",
-    }
+# Structured control-only data is transported as fields while its direct UI
+# source remains user-authored text.
+control_state = prompt._default_widget_state()
+control_state["text"]["SCENE_CONTEXT"] = (
+    "CONTROL_ONLY_BINDING: @video1 | Target = Hero_A | Function = Focus | "
+    "Marker = Red | Boundary = Frames 48-72"
 )
-for anchor in (
-    "named visible or supplied property",
-    "named Target and declared Control Boundary",
-    "if no separate temporal subset is stated or clearly implied, it applies to the whole shot",
-    "otherwise only to that subset",
-    "does not expand into unrelated identity, material, lighting, motion, camera",
-):
-    assert anchor in control_line, anchor
-
-# Every self-scoped auxiliary role uses the same bounded override vocabulary;
-# a missing role or binding remains non-gating without becoming unlimited use.
-for spec in prompt.SELF_SCOPED_AUXILIARY_REFERENCE_SPECS.values():
-    authority = str(spec["authority"])
-    assert "explicit scoped instruction" in authority
-    assert "named property" in authority
-    assert "named target or clearly scene-wide scope" in authority
-    assert "if no temporal subset is stated or clearly implied, it applies to the whole shot" in authority
-    assert "otherwise only to that subset" in authority
-context = prompt._self_scoped_auxiliary_reference(
-    {
-        "source_type": "FX Reference",
-        "control_role": "Context Only",
-    },
-    2,
+job, _fx_contract, user_data = prompt_sections(
+    prompt._build_prompt_package(control_state)
 )
-assert context is not None
-assert "default context interpretation" in context["authority"]
-assert "explicit scoped instruction" in context["authority"]
+assert job["control_only_bindings"] == [{
+    "source_field": "SCENE_CONTEXT",
+    "line": 1,
+    "video": "@video1",
+    "target_id": "Hero_A",
+    "function": "Focus",
+    "marker_color": "Red",
+    "boundary": "Frames 48-72",
+}]
+assert user_data == {"SCENE_CONTEXT": control_state["text"]["SCENE_CONTEXT"]}
 
-# Image-role output exposes the same appearance/lighting boundary even before
-# the sealed Agent policy is injected. Color Pick remains an address.
+# FX Main Type has full readable FX-behavior authority but never video look or
+# color authority. Policy-derived authority and preservation rules stay sealed.
+fx_state = prompt._default_widget_state()
+fx_state["videos"][0].update({
+    "present": True,
+    "label": "fx_reference.mp4",
+    "source_type": "FX Reference",
+    "control_role": "Context Only",
+})
+job, fx_contract, _user_data = prompt_sections(
+    prompt._build_prompt_package(fx_state)
+)
+assert job["videos"][0]["control_role"] == "Context Only"
+fx_source = fx_contract["sources"][0]
+assert fx_source["source_type"] == "FX Reference"
+assert fx_source["selected_role"] == "Context Only"
+assert set(fx_source).issubset({
+    "video",
+    "video_uid",
+    "source_type",
+    "selected_role",
+    "role_selected",
+    "validation_codes",
+    "range_on",
+    "range_segments",
+    "emitter_binding_declared",
+    "timing_cues",
+})
+
+# Image look intent and routing remain explicit fields, without generated
+# appearance-policy prose.
 image_state = prompt._default_widget_state()
-image_state["images"][0].update(
-    {
-        "present": True,
-        "label": "hero_character_sheet.png",
-        "source_type": "Character Appearance",
-        "owner": "Hero_A",
-        "color_picks": ["Red"],
-    }
+image_state["images"][0].update({
+    "present": True,
+    "label": "hero_character_sheet.png",
+    "source_type": "Character Appearance",
+    "owner": "Hero_A",
+    "binding_scopes": ["Full body / full appearance"],
+    "color_picks": ["Red"],
+})
+job, _fx_contract, _user_data = prompt_sections(
+    prompt._build_prompt_package(image_state)
 )
-image_compiled = prompt._build_prompt_package(image_state)
-for anchor in (
-    "Color Pick values = target, mask, and reference-routing addresses",
-    "not final intrinsic color, material, lighting, or background appearance authority",
-    "intrinsic identity, color, pattern, and material character",
-    "studio lighting, baked highlight/shadow, matte spill, and halo are not scene-light authority",
-):
-    assert anchor in image_compiled, anchor
+image = job["images"][0]
+assert image["target_id"] == "Hero_A"
+assert image["source_type"] == "Character Appearance"
+assert image["bindings"] == [{
+    "video": "@video1",
+    "marker_color": "Red",
+    "target_scope": "Full body / full appearance",
+}]
 
-environment_role = prompt._image_role_line(
-    {"source_type": "Environment / Background", "owner": "Scene / Environment"}, 2
-)
-assert "continuous environment appearance and target lighting context" in environment_role
-assert "including dummy regions" in environment_role
-lighting_role = prompt._image_role_line(
-    {"source_type": "Lighting / Atmosphere Reference", "owner": "Global Look"}, 3
-)
-assert "implementation evidence for the approved background or sequence look" in lighting_role
-assert "explicitly approved as lighting authority" in lighting_role
-
-# Multi-video output is limited to source identities. The bounded scope rule
-# remains available to the signed runtime/helper contract but is not public prose.
+# Multiple video sources remain independent rows in one closed job schema.
 multi = prompt._default_widget_state()
-multi["videos"][0].update(
-    {
-        "present": True,
-        "label": "animator_color_playblast.mp4",
-        "source_type": "Maya Preview / Playblast",
-        "control_role": "Spatial Alignment Verification Only",
-    }
-)
+multi["videos"][0].update({
+    "present": True,
+    "label": "animator_color_playblast.mp4",
+    "source_type": "Maya Preview / Playblast",
+    "control_role": "Spatial Alignment Verification Only",
+})
 second = prompt._default_video_item(2)
-second.update(
-    {
-        "present": True,
-        "label": "lighting_reference.mp4",
-        "source_type": "Lighting / Look Reference",
-        "control_role": "Lighting / Look Only",
-    }
-)
+second.update({
+    "present": True,
+    "label": "lighting_reference.mp4",
+    "source_type": "Lighting / Look Reference",
+    "control_role": "Lighting / Look Only",
+})
 multi["videos"].append(second)
-multi_compiled = prompt._build_prompt_package(multi)
-assert "Active video slots = @video1, @video2" in multi_compiled
-assert "@video1 = animator_color_playblast.mp4" in multi_compiled
-assert "@video2 = lighting_reference.mp4" in multi_compiled
-assert "ADDITIVE MULTI-VIDEO BINDING SCHEMA:" not in multi_compiled
-assert "default attribute interpretation" not in multi_compiled
+job, _fx_contract, _user_data = prompt_sections(
+    prompt._build_prompt_package(multi)
+)
+assert [(video["video"], video["source_type"], video["control_role"]) for video in job["videos"]] == [
+    ("@video1", "Maya Preview / Playblast", "Spatial Alignment Verification Only"),
+    ("@video2", "Lighting / Look Reference", "Lighting / Look Only"),
+]
 
 print(
     "HMB look attribute-scope compiler regression: PASS "

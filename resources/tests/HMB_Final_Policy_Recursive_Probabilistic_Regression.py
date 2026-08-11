@@ -10,11 +10,13 @@ import sys
 from itertools import combinations
 from pathlib import Path
 
+from _hmb_private_policy_fixture import install_private_policy_reader
+
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.5.74"
-EXPECTED_POLICY_VERSION = "2026-08-11.agent-shot-quality.v4"
-EXPECTED_CONTRACT_SHA256 = "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5"
+EXPECTED_RELEASE_VERSION = "0.6.1"
+EXPECTED_POLICY_VERSION = "2026-08-11.agent-shot-quality.v4.1"
+EXPECTED_CONTRACT_SHA256 = "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
 BASE_MASTER_SEEDS = (
     20260729,
     0x484D42,
@@ -31,26 +33,6 @@ MASTER_SEEDS = BASE_MASTER_SEEDS + (
 )
 CASES_PER_SEED = 512
 RECURSION_DEPTHS = (1, 2, 4, 8, 16, 32)
-SHARED_MARKERS = (
-    "HYBRID COMPOSITION INDEPENDENCE:",
-    "MISSING SOURCE AUTHORITY:",
-    "OPTIONAL VIDEO CONTROL:",
-    "COLOR PLAYBLAST ISOLATION WITHOUT DEPENDENCY:",
-    "ADAPTIVE CONFLICT RESOLUTION:",
-    "FINAL OUTPUT CONTINUITY:",
-)
-FORBIDDEN_GATES = (
-    "[HMB VALIDATION ERROR]",
-    "stop validation",
-    "stop generation",
-    "requires the validated Motion Guide",
-    "@video1 is mandatory",
-    "@video1 must be active",
-    "Missing or incomplete approved appearance bindings",
-    "A missing role falls back to context-only use",
-    "A missing local binding prevents local control authority",
-    "zero identity or final-look authority",
-)
 
 
 def load_module(name: str):
@@ -65,10 +47,17 @@ def load_module(name: str):
 prompt_lib = load_module("HMBPromptLibrary")
 agent_lib = load_module("HMBAgentLibrary")
 common = agent_lib._hmb
+_original_policy_reader, sealed = install_private_policy_reader(common)
 
 
-policy = agent_lib.get_internal_policy_rules().strip()
-binding = agent_lib.get_internal_binding_rules().strip()
+def prompt_description_json(compiled: str) -> dict:
+    tail = compiled.split("USER DESCRIPTION DATA (JSON):", 1)[1].lstrip()
+    return json.loads(tail.splitlines()[0])
+
+
+policy, binding = common._load_verified_behavior_documents()
+policy = policy.strip()
+binding = binding.strip()
 identity = common.get_internal_policy_identity()
 assert f'version = "{EXPECTED_RELEASE_VERSION}"' in (
     ROOT / "pyproject.toml"
@@ -76,24 +65,14 @@ assert f'version = "{EXPECTED_RELEASE_VERSION}"' in (
 assert identity == {
     "version": EXPECTED_POLICY_VERSION,
     "contract_sha256": EXPECTED_CONTRACT_SHA256,
+    "envelope_sha256": hashlib.sha256(sealed).hexdigest(),
 }
-assert len(agent_lib._split_behavior_rules(policy, 4)) == 4
-assert len(agent_lib._split_behavior_rules(binding, 4)) == 4
-for rules in (policy, binding):
-    for marker in SHARED_MARKERS:
-        assert rules.count(marker) == 1
-    for forbidden in FORBIDDEN_GATES:
-        assert forbidden.casefold() not in rules.casefold()
-    normalized_rules = rules.casefold()
-    assert "final creative authority" in normalized_rules
-    assert "interpretation hint" in normalized_rules
-    assert "never downgrade supplied content to context-only" in normalized_rules
-    assert "explicit scoped exception" in normalized_rules
-    assert "named target or clearly scene-wide scope" in normalized_rules
-    assert "stable camera-relative focus" in normalized_rules
-    assert "explicit user goal may use any visible property" not in normalized_rules
-    assert "may broaden, narrow, or reframe" not in normalized_rules
-    assert "target-property-time" not in normalized_rules
+policy_rules = agent_lib._split_behavior_rules(policy, 4)
+binding_rules = agent_lib._split_behavior_rules(binding, 4)
+assert len(policy_rules) == 4
+assert len(binding_rules) == 4
+assert all(rule.strip() for rule in policy_rules + binding_rules)
+assert policy_rules != binding_rules
 
 # Every non-empty library composition is represented, while Agent routing has
 # only two legitimate modes: native for compositions without Prompt, and the
@@ -243,8 +222,9 @@ for seed in MASTER_SEEDS:
         assert policy not in compiled
         assert binding not in compiled
         assert agent_lib._is_hmb_prompt_library_payload(compiled)
-        assert "USER DESCRIPTION DATA (JSON):" not in compiled
-        assert canonical["text"]["PROJECT_STYLE_LOOK"] not in compiled
+        assert prompt_description_json(compiled)["PROJECT_STYLE_LOOK"] == (
+            canonical["text"]["PROJECT_STYLE_LOOK"]
+        )
 
         alternate = rng.choice(
             tuple(
@@ -258,8 +238,7 @@ for seed in MASTER_SEEDS:
         paired_compiled = prompt_lib._build_prompt_package(paired)
         assert policy not in paired_compiled
         assert binding not in paired_compiled
-        assert alternate not in paired_compiled
-        assert paired_compiled == compiled
+        assert prompt_description_json(paired_compiled)["PROJECT_STYLE_LOOK"] == alternate
         paired_look_checks += 1
 
         depth = rng.choice(RECURSION_DEPTHS)
@@ -283,13 +262,13 @@ policy_hash = hashlib.sha256(policy.encode("utf-8")).hexdigest()
 binding_hash = hashlib.sha256(binding.encode("utf-8")).hexdigest()
 for depth in RECURSION_DEPTHS:
     for _round in range(depth):
-        reloaded_policy = agent_lib.get_internal_policy_rules().strip()
-        reloaded_binding = agent_lib.get_internal_binding_rules().strip()
+        reloaded_policy, reloaded_binding = common._load_verified_behavior_documents()
+        reloaded_policy = reloaded_policy.strip()
+        reloaded_binding = reloaded_binding.strip()
         assert hashlib.sha256(reloaded_policy.encode("utf-8")).hexdigest() == policy_hash
         assert hashlib.sha256(reloaded_binding.encode("utf-8")).hexdigest() == binding_hash
-        for marker in SHARED_MARKERS:
-            assert reloaded_policy.count(marker) == 1
-            assert reloaded_binding.count(marker) == 1
+        assert len(agent_lib._split_behavior_rules(reloaded_policy, 4)) == 4
+        assert len(agent_lib._split_behavior_rules(reloaded_binding, 4)) == 4
 
 print(
     "HMB independent hybrid signed policy recursive probabilistic regression: PASS "

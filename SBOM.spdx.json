@@ -2,8 +2,8 @@
   "SPDXID": "SPDXRef-DOCUMENT",
   "spdxVersion": "SPDX-2.3",
   "dataLicense": "CC0-1.0",
-  "name": "HMB_GP_Production-0.5.74",
-  "documentNamespace": "https://hmb.local/spdx/HMB_GP_Production/0.5.74",
+  "name": "HMB_GP_Production-0.6.1",
+  "documentNamespace": "https://hmb.local/spdx/HMB_GP_Production/0.6.1",
   "creationInfo": {
     "created": "2026-08-11T00:00:00Z",
     "creators": ["Organization: HMB Pipeline", "Tool: Codex release audit"]
@@ -12,11 +12,12 @@
     {
       "SPDXID": "SPDXRef-HMB-GP-Production",
       "name": "hmb-gp-production",
-      "versionInfo": "0.5.74",
+      "versionInfo": "0.6.1",
       "downloadLocation": "NOASSERTION",
       "filesAnalyzed": false,
       "licenseConcluded": "LicenseRef-HMB-Internal-1.0",
       "licenseDeclared": "LicenseRef-HMB-Internal-1.0",
+      "packageComment": "The distribution includes exactly one signed runtime artifact at resources/agent/hmb_agent_core.dat. Canonical English policy sources and Korean review documents are excluded.",
       "copyrightText": "Copyright (c) 2026 HMB Pipeline"
     },
     {

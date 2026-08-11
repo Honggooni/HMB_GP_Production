@@ -586,8 +586,12 @@ try:
         if item["owner"]
     } == {"manual owner-only target"}
     selected_prompt = prompt_library._build_prompt_package(selected_hero)
-    assert "@image1 = Hero" in selected_prompt
-    assert "manual named target" in selected_prompt
+    selected_lines = selected_prompt.splitlines()
+    assert len(selected_lines) == 7
+    selected_job = json.loads(selected_lines[2])
+    assert selected_job["images"][0]["image"] == "@image1"
+    assert selected_job["images"][0]["label"] == "Hero"
+    assert selected_job["images"][0]["target_id"] == "manual named target"
     assert "manual owner-only target" not in selected_prompt
 
     # A stale or forced frontend value cannot create a visible manual row while

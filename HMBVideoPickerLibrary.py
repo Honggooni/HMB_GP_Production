@@ -177,6 +177,13 @@ MAX_VIDEO_SLOTS = MAX_SELECTED_VIDEOS
 # become output ports, and cannot limit or reorder the catalog selection.
 AUXILIARY_VIDEO_SLOTS = (2, 3, 4, 5)
 VIDEO_OUTPUT_PARAMETER = "VIDEO_OUT"
+VIDEO_REFERENCE_CAPABILITY_SCHEMA = "hmb-video-reference-capabilities"
+VIDEO_REFERENCE_CAPABILITY_VERSION = 1
+VIDEO_FRAME_DOMAIN_SCHEMA = "hmb-video-frame-domain"
+VIDEO_FRAME_DOMAIN_VERSION = 1
+VIDEO_TIMING_CUE_SCHEMA = "hmb-video-emitter-timing-cue"
+VIDEO_TIMING_CUE_VERSION = 1
+MAX_VIDEO_TIMING_CUES = 256
 ORIGINAL_DEPENDENCY_MANIFEST_SCHEMA = "hmb-maya-scene-dependencies-v1"
 ORIGINAL_DEPENDENCY_MANIFEST_VERSION = 1
 PLAYBLAST_RESOLUTIONS = (
@@ -4353,6 +4360,323 @@ def _video_frame_metadata(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
     }
 
 
+def _video_frame_domain(frame_metadata: Any) -> Dict[str, Any]:
+    """Return the bounded frame-addressing contract used by typed bindings."""
+
+    metadata = frame_metadata if isinstance(frame_metadata, dict) else {}
+    try:
+        start_frame = int(metadata.get("start_frame"))
+        end_frame = int(metadata.get("end_frame"))
+        frame_count = max(0, int(metadata.get("frame_count") or 0))
+    except (TypeError, ValueError, OverflowError):
+        start_frame = 1
+        end_frame = 0
+        frame_count = 0
+    valid = bool(
+        frame_count > 0
+        and end_frame >= start_frame
+        and not bool(metadata.get("conflict"))
+    )
+    return {
+        "schema": VIDEO_FRAME_DOMAIN_SCHEMA,
+        "version": VIDEO_FRAME_DOMAIN_VERSION,
+        "timebase": _clean(metadata.get("timebase")),
+        "start_frame": start_frame,
+        "end_frame": end_frame,
+        "frame_count": frame_count,
+        "range_addressable": valid,
+    }
+
+
+def _emitter_identity_from_cue(
+    value: Any,
+    markers: Sequence[Dict[str, Any]],
+) -> Dict[str, str]:
+    """Resolve one cue emitter without promoting unrelated metadata to intent."""
+
+    source = value if isinstance(value, dict) else {}
+    marker_color = _clean(source.get("marker_color") or source.get("color"))
+    maya_uuid = _clean(source.get("maya_uuid"))
+    subject_root = _clean(
+        source.get("subject_root") or source.get("full_dag_path")
+    )
+    asset_id = _clean(source.get("asset_id"))
+
+    matched: Optional[Dict[str, Any]] = None
+    for marker in markers:
+        if not isinstance(marker, dict):
+            continue
+        if maya_uuid and _clean(marker.get("maya_uuid")).casefold() == maya_uuid.casefold():
+            matched = marker
+            break
+        if (
+            subject_root
+            and _clean(
+                marker.get("subject_root") or marker.get("full_dag_path")
+            ).casefold()
+            == subject_root.casefold()
+        ):
+            matched = marker
+            break
+        if (
+            asset_id
+            and marker_color
+            and _clean(marker.get("asset_id")).casefold() == asset_id.casefold()
+            and _clean(marker.get("color")).casefold() == marker_color.casefold()
+        ):
+            matched = marker
+            break
+
+    if matched is None and marker_color and not asset_id:
+        color_matches = [
+            marker
+            for marker in markers
+            if isinstance(marker, dict)
+            and _clean(marker.get("color")).casefold() == marker_color.casefold()
+        ]
+        if len(color_matches) == 1:
+            matched = color_matches[0]
+
+    if matched is None:
+        return {}
+
+    marker_color = _clean(matched.get("color"))
+    maya_uuid = _clean(matched.get("maya_uuid"))
+    subject_root = _clean(
+        matched.get("subject_root") or matched.get("full_dag_path")
+    )
+    asset_id = _clean(matched.get("asset_id"))
+    if not marker_color and not maya_uuid and not subject_root:
+        return {}
+    if marker_color and marker_color not in MARKER_ORDER:
+        return {}
+    return {
+        "marker_color": marker_color,
+        "asset_id": asset_id,
+        "subject_root": subject_root,
+        "maya_uuid": maya_uuid,
+    }
+
+
+def _normalize_emitter_local_point(value: Any) -> Dict[str, Any]:
+    """Validate one explicit emitter-local spatial point."""
+
+    if not isinstance(value, dict):
+        return {}
+    kind = _clean(value.get("kind")).casefold()
+    if kind == "locator":
+        locator_id = _clean(value.get("locator_id") or value.get("maya_uuid"))[:256]
+        locator_path = _clean(
+            value.get("locator_path")
+            or value.get("full_dag_path")
+            or value.get("path")
+        )[:512]
+        if not locator_id and not locator_path:
+            return {}
+        if any(
+            ord(character) < 32 or ord(character) == 127
+            for character in f"{locator_id}{locator_path}"
+        ):
+            return {}
+        return {
+            "kind": "locator",
+            "locator_id": locator_id,
+            "locator_path": locator_path,
+        }
+
+    if kind != "coordinates":
+        return {}
+    space = _clean(value.get("space")).casefold()
+    if space not in {"local", "object"}:
+        return {}
+    unit_aliases = {
+        "scene_unit": "scene_unit",
+        "scene unit": "scene_unit",
+        "mm": "millimeter",
+        "millimeter": "millimeter",
+        "millimeters": "millimeter",
+        "cm": "centimeter",
+        "centimeter": "centimeter",
+        "centimeters": "centimeter",
+        "m": "meter",
+        "meter": "meter",
+        "meters": "meter",
+        "in": "inch",
+        "inch": "inch",
+        "inches": "inch",
+        "ft": "foot",
+        "foot": "foot",
+        "feet": "foot",
+    }
+    unit = unit_aliases.get(_clean(value.get("unit")).casefold(), "")
+    if not unit:
+        return {}
+    raw_xyz = value.get("xyz")
+    if isinstance(raw_xyz, (list, tuple)) and len(raw_xyz) == 3:
+        candidates = list(raw_xyz)
+    elif all(axis in value for axis in ("x", "y", "z")):
+        candidates = [value.get("x"), value.get("y"), value.get("z")]
+    else:
+        return {}
+    coordinates: List[float] = []
+    for candidate in candidates:
+        if isinstance(candidate, bool):
+            return {}
+        try:
+            coordinate = float(candidate)
+        except (TypeError, ValueError, OverflowError):
+            return {}
+        if not math.isfinite(coordinate):
+            return {}
+        coordinates.append(coordinate)
+    return {
+        "kind": "coordinates",
+        "space": space,
+        "unit": unit,
+        "xyz": coordinates,
+    }
+
+
+def _normalize_timing_cues(
+    value: Any,
+    markers: Sequence[Dict[str, Any]],
+    frame_domain: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Validate exact emitter/frame cues carried by a Picker video record."""
+
+    if not isinstance(value, list):
+        return []
+    if not bool(frame_domain.get("range_addressable")):
+        return []
+    start_frame = int(frame_domain["start_frame"])
+    end_frame = int(frame_domain["end_frame"])
+    cues: List[Dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for raw in value[:MAX_VIDEO_TIMING_CUES]:
+        if not isinstance(raw, dict):
+            continue
+        raw_frame = raw.get("frame")
+        if raw_frame in (None, ""):
+            raw_frame = raw.get("maya_frame")
+        try:
+            frame_value = float(raw_frame)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(frame_value) or not (
+            start_frame <= frame_value <= end_frame
+        ):
+            continue
+        rounded_frame = round(frame_value)
+        if abs(frame_value - rounded_frame) > 1e-6:
+            continue
+
+        emitter_source = (
+            raw.get("emitter")
+            if isinstance(raw.get("emitter"), dict)
+            else raw
+        )
+        emitter = _emitter_identity_from_cue(emitter_source, markers)
+        if not emitter:
+            continue
+        local_point = _normalize_emitter_local_point(raw.get("local_point"))
+        if not local_point:
+            continue
+        cue_phase = _clean(
+            raw.get("cue_phase") or raw.get("phase") or "point"
+        ).casefold()
+        if cue_phase not in {"point", "onset", "peak", "falloff", "end"}:
+            continue
+        normalized_frame = int(rounded_frame)
+        signature = (
+            normalized_frame,
+            cue_phase,
+            emitter["marker_color"].casefold(),
+            emitter["maya_uuid"].casefold(),
+            emitter["subject_root"].casefold(),
+            json.dumps(
+                local_point,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        cue_id = _clean(raw.get("cue_id"))[:128]
+        if not cue_id:
+            digest = hashlib.sha256(
+                json.dumps(
+                    signature,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()[:20]
+            cue_id = f"emitter-cue-{digest}"
+        cue: Dict[str, Any] = {
+            "schema": VIDEO_TIMING_CUE_SCHEMA,
+            "version": VIDEO_TIMING_CUE_VERSION,
+            "cue_id": cue_id,
+            "cue_type": "emitter_point",
+            "cue_phase": cue_phase,
+            "frame": normalized_frame,
+            "emitter": emitter,
+            "local_point": local_point,
+        }
+        description = _clean(raw.get("description"))[:512]
+        if description:
+            cue["description"] = description
+        cues.append(cue)
+
+    # Distinct cues may arrive with the same external cue_id. Canonicalize all
+    # members of that collision by content so IDs are unique and independent of
+    # Picker row order while remaining within the producer's 128-char bound.
+    cue_id_counts: Dict[str, int] = {}
+    for cue in cues:
+        cue_id = _clean(cue.get("cue_id"))
+        cue_id_counts[cue_id] = cue_id_counts.get(cue_id, 0) + 1
+    for cue in cues:
+        cue_id = _clean(cue.get("cue_id"))
+        if not cue_id or cue_id_counts.get(cue_id, 0) < 2:
+            continue
+        content = {
+            key: nested
+            for key, nested in cue.items()
+            if key != "cue_id"
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                content,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        prefix = cue_id[: 128 - len(digest) - 1]
+        cue["cue_id"] = f"{prefix}-{digest}"
+    return cues
+
+
+def _video_reference_capabilities(
+    frame_domain: Dict[str, Any],
+    timing_cues: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Describe typed support without choosing an interpretation role."""
+
+    frame_addressable = bool(frame_domain.get("range_addressable"))
+    return {
+        "schema": VIDEO_REFERENCE_CAPABILITY_SCHEMA,
+        "version": VIDEO_REFERENCE_CAPABILITY_VERSION,
+        "frame_addressable": frame_addressable,
+        "exact_emitter_cues": bool(timing_cues),
+        "image_source_frame_ranges": frame_addressable,
+        "marker_instance_identity_fields": [
+            "maya_uuid",
+            "full_dag_path",
+        ],
+    }
+
+
 def _parameter_name(parameter: Any) -> str:
     if isinstance(parameter, str):
         return _clean(parameter)
@@ -4880,7 +5204,7 @@ def _normalize_markers(value: Any, video_slot: Optional[int] = None) -> List[Dic
     if not isinstance(value, list):
         return markers
     seen_colors = set()
-    seen_assets = set()
+    seen_instances: set[tuple[str, ...]] = set()
     fallback_slot = max(1, min(MAX_VIDEO_SLOTS, int(video_slot or 1)))
     for index, raw in enumerate(value, start=1):
         if not isinstance(raw, dict):
@@ -4889,12 +5213,28 @@ def _normalize_markers(value: Any, video_slot: Optional[int] = None) -> List[Dic
         asset_id = _clean(raw.get("asset_id"))
         if color not in MARKER_ORDER or not asset_id:
             continue
-        if asset_id in seen_assets:
+        maya_uuid = _clean(raw.get("maya_uuid"))
+        full_dag_path = _clean(
+            raw.get("full_dag_path") or raw.get("subject_root")
+        )
+        reference_node = _clean(raw.get("reference_node"))
+        instance_identity = (
+            ("uuid", maya_uuid.casefold())
+            if maya_uuid
+            else ("dag", full_dag_path.replace("\\", "/").casefold())
+            if full_dag_path
+            else (
+                "legacy_asset",
+                reference_node.casefold(),
+                asset_id.casefold(),
+            )
+        )
+        if instance_identity in seen_instances:
             continue
         if color in seen_colors and color not in REPEATABLE_MARKERS:
             continue
         seen_colors.add(color)
-        seen_assets.add(asset_id)
+        seen_instances.add(instance_identity)
         try:
             marker_slot = max(1, min(MAX_VIDEO_SLOTS, int(raw.get("video_slot") or fallback_slot)))
         except Exception:
@@ -4906,11 +5246,11 @@ def _normalize_markers(value: Any, video_slot: Optional[int] = None) -> List[Dic
         markers.append({
             "color": color,
             "asset_id": asset_id,
-            "subject_root": _clean(raw.get("subject_root") or raw.get("full_dag_path")),
+            "subject_root": full_dag_path,
             "group_name": _clean(raw.get("group_name")) or asset_id,
-            "full_dag_path": _clean(raw.get("full_dag_path") or raw.get("subject_root")),
-            "maya_uuid": _clean(raw.get("maya_uuid")),
-            "reference_node": _clean(raw.get("reference_node")),
+            "full_dag_path": full_dag_path,
+            "maya_uuid": maya_uuid,
+            "reference_node": reference_node,
             "reference_file": _clean(raw.get("reference_file")),
             "proxy_manager": _clean(raw.get("proxy_manager")),
             "proxy_tag": _clean(raw.get("proxy_tag")),
@@ -5195,6 +5535,12 @@ def _normalize_video_items(
             )
         )
         item["frame_metadata"] = _video_frame_metadata(item, marker_slot)
+        frame_domain = _video_frame_domain(item["frame_metadata"])
+        item["timing_cues"] = _normalize_timing_cues(
+            raw.get("timing_cues"),
+            item["markers"],
+            frame_domain,
+        )
         raw_selection_order = _positive_int(raw.get("selection_order"))
         if has_catalog_selection:
             item["selected"] = bool(
@@ -5248,6 +5594,12 @@ def _normalize_video_items(
         item["frame_metadata"] = _video_frame_metadata(
             item,
             order or _positive_int(item.get("legacy_video_slot")) or 1,
+        )
+        frame_domain = _video_frame_domain(item["frame_metadata"])
+        item["timing_cues"] = _normalize_timing_cues(
+            item.get("timing_cues"),
+            item.get("markers") if isinstance(item.get("markers"), list) else [],
+            frame_domain,
         )
     return records
 
@@ -6551,6 +6903,16 @@ def _build_synchronized_video_outputs(
         frame_metadata["source_uid"] = uid
         frame_metadata["selection_order"] = slot
         frame_metadata_payload.append(frame_metadata)
+        frame_domain = _video_frame_domain(frame_metadata)
+        timing_cues = _normalize_timing_cues(
+            item.get("timing_cues"),
+            markers,
+            frame_domain,
+        )
+        reference_capabilities = _video_reference_capabilities(
+            frame_domain,
+            timing_cues,
+        )
         local_video_path = _clean(item.get("video_path"))
         project_video_path = _clean(item.get("project_video_path"))
         video_payload: Dict[str, Any] = {
@@ -6575,6 +6937,9 @@ def _build_synchronized_video_outputs(
             "height": frame_metadata["height"],
             "available_color_picks": frame_metadata["available_color_picks"],
             "frame_metadata": frame_metadata,
+            "frame_domain": frame_domain,
+            "timing_cues": timing_cues,
+            "reference_capabilities": reference_capabilities,
         }
         if local_video_path and local_video_path != media:
             video_payload["local_video_path"] = local_video_path
@@ -6673,6 +7038,12 @@ def _build_synchronized_video_outputs(
         "markers": aggregate_markers,
         "frame_metadata": frame_metadata_payload,
         "frame_metadata_schema_version": 1,
+        "reference_capability_schema": VIDEO_REFERENCE_CAPABILITY_SCHEMA,
+        "reference_capability_schema_version": (
+            VIDEO_REFERENCE_CAPABILITY_VERSION
+        ),
+        "timing_cue_schema": VIDEO_TIMING_CUE_SCHEMA,
+        "timing_cue_schema_version": VIDEO_TIMING_CUE_VERSION,
     }
     if media_blocked:
         unavailable_labels = ", ".join(
@@ -9432,7 +9803,7 @@ class HMBVideoPickerLibrary(DataNode):
         errors: List[str] = []
         seen_colors = set()
         seen_groups = set()
-        seen_assets = set()
+        seen_instances: set[tuple[str, str]] = set()
         enabled_rows = [item for item in bindings if bool(item.get("enabled", True))]
         if not enabled_rows:
             return []
@@ -9469,9 +9840,19 @@ class HMBVideoPickerLibrary(DataNode):
             asset_id = self._derive_asset_id(group_name or full_dag_path)
             if not asset_id:
                 errors.append(f"Assignment row {index} could not derive Asset ID from Group Name: {group_name}")
-            elif asset_id in seen_assets:
-                errors.append(f"Duplicate derived Asset ID in @video{slot}: {asset_id}")
-            seen_assets.add(asset_id)
+            instance_identity = (
+                ("uuid", maya_uuid.casefold())
+                if maya_uuid
+                else ("dag", full_dag_path.replace("\\", "/").casefold())
+                if full_dag_path
+                else ("group", group_name.casefold())
+            )
+            if instance_identity in seen_instances:
+                errors.append(
+                    f"Duplicate Maya instance in @video{slot}: "
+                    f"{full_dag_path or group_name}"
+                )
+            seen_instances.add(instance_identity)
             normalized.append({
                 "group_name": group_name or self._derive_asset_id(full_dag_path),
                 "full_dag_path": full_dag_path,

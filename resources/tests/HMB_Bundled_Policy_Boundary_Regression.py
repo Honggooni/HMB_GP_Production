@@ -1,20 +1,32 @@
 from __future__ import annotations
 
-import base64
-import io
+import hashlib
 import importlib.util
 import json
+import os
+import re
 import sys
+import tempfile
 from pathlib import Path
 from types import MethodType
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_POLICY_VERSION = "2026-08-11.agent-shot-quality.v4"
-EXPECTED_POLICY_CONTRACT = (
-    "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5"
+POLICY_ENV = "HMB_AGENT_POLICY_PATH"
+EXPECTED_BUNDLED_POLICY = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
+EXPECTED_VERSION = "2026-08-11.agent-shot-quality.v4.1"
+EXPECTED_ENVELOPE_SHA256 = (
+    "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
 )
-EXPECTED_SIGNING_KEY_ID = "hmb-policy-release-2026-08-r2"
+EXPECTED_PROJECT_SHA256 = (
+    "8bbf296eefd5fa7baf3aa43a66735fa6ce004e95859e09f7b48accb7b7beebc3"
+)
+EXPECTED_BINDING_SHA256 = (
+    "6a362ed04eba75caabcbe81944b0e2dd56a67120bc0dde1518e82aa80d9764d0"
+)
+EXPECTED_CONTRACT_SHA256 = (
+    "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
+)
 LOAD_FAILURE = "HMB_GP_Agent_Library internal rule payload could not be loaded."
 
 
@@ -29,251 +41,302 @@ def load(name: str):
 
 common = load("_hmb_common")
 agent = load("HMBAgentLibrary")
-bundled_policy_path = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
-assert common._BUNDLED_AGENT_POLICY_FILE == bundled_policy_path
-assert bundled_policy_path.is_file()
+
+assert not hasattr(common, "AGENT_RULE_DATA_PATH_ENV")
+assert common._BUNDLED_AGENT_POLICY_FILE == EXPECTED_BUNDLED_POLICY
+assert EXPECTED_BUNDLED_POLICY.is_file()
 assert not hasattr(common, "_resolve_agent_rule_data_path")
-assert not hasattr(common, "_load_agent_rule_payload_from_path")
+assert common._AGENT_POLICY_VERSION == EXPECTED_VERSION
+assert common._AGENT_POLICY_CONTRACT_SHA256 == EXPECTED_CONTRACT_SHA256
+assert not hasattr(common, "_AGENT_POLICY_ENVELOPE_SHA256")
+assert not hasattr(common, "_AGENT_POLICY_PROJECT_SHA256")
+assert not hasattr(common, "_AGENT_POLICY_BINDING_SHA256")
 
 
-def assert_current_payload(payload: dict[str, object]) -> None:
-    assert payload["final_policy_version"] == EXPECTED_POLICY_VERSION
-    assert payload["final_motion_look_policy_sha256"] == EXPECTED_POLICY_CONTRACT
-    assert str(payload["policy"]).strip()
-    assert str(payload["binding"]).strip()
-
-
-original_path_open = Path.open
-read_calls: list[Path] = []
-
-
-def recording_open(path: Path, *args, **kwargs):
-    read_calls.append(Path(path))
-    return original_path_open(path, *args, **kwargs)
-
-
-Path.open = recording_open
+original_env = os.environ.get(POLICY_ENV)
 try:
-    assert_current_payload(common._load_agent_rule_payload())
-finally:
-    Path.open = original_path_open
+    # Machine/process environment cannot redirect the fixed bundled loader.
+    for hostile_path in (
+        "",
+        r"D:\agent\hmb_agent_core.dat",
+        r"Z:\hmb_agent_core.dat",
+        r"\\FIN-RCOMP7\D$\agent\hmb_agent_core.dat",
+        r"\\FIN-RCOMP1\HMB_AgentPolicy$\hmb_agent_core.dat",
+        r"\\192.168.203.245\HMB_AgentPolicy$\hmb_agent_core.dat",
+        r"\\?\UNC\FIN-RCOMP7\HMB_AgentPolicy$\hmb_agent_core.dat",
+        r"\\.\UNC\FIN-RCOMP7\HMB_AgentPolicy$\hmb_agent_core.dat",
+    ):
+        os.environ[POLICY_ENV] = hostile_path
+        assert common._BUNDLED_AGENT_POLICY_FILE == EXPECTED_BUNDLED_POLICY
+    os.environ.pop(POLICY_ENV, None)
+    assert common._BUNDLED_AGENT_POLICY_FILE == EXPECTED_BUNDLED_POLICY
 
-# The loader opens exactly one library-local signed file and exposes no path
-# argument or runtime override surface.
-assert read_calls == [bundled_policy_path]
-
-
-with bundled_policy_path.open("rb") as stream:
-    bundled_policy_bytes = stream.read(common._AGENT_POLICY_MAX_ENVELOPE_BYTES + 1)
-assert bundled_policy_bytes
-assert len(bundled_policy_bytes) <= common._AGENT_POLICY_MAX_ENVELOPE_BYTES
-signed_envelope = json.loads(bundled_policy_bytes.decode("utf-8"))
-assert signed_envelope["schema"] == "hmb-agent-policy-envelope-v3"
-assert signed_envelope["key_id"] == EXPECTED_SIGNING_KEY_ID
-
-wrong_signature_envelope = dict(signed_envelope)
-wrong_signature = bytearray(base64.b64decode(wrong_signature_envelope["signature"]))
-wrong_signature[-1] ^= 1
-wrong_signature_envelope["signature"] = base64.b64encode(wrong_signature).decode(
-    "ascii"
-)
-wrong_signature_bytes = json.dumps(
-    wrong_signature_envelope,
-    ensure_ascii=False,
-    separators=(",", ":"),
-).encode("utf-8")
-
-
-def assert_bundle_failure(
-    label: str,
-    *,
-    encoded: bytes | None = None,
-    open_error: BaseException | None = None,
-) -> None:
     original_path_open = Path.open
-    open_calls: list[Path] = []
-    read_sizes: list[int] = []
+    synthetic_bytes = b'{"bundled_reader_fixture":true}'
+    signed_bytes = synthetic_bytes
 
-    class ObservedStream(io.BytesIO):
-        def read(self, size: int = -1) -> bytes:
-            read_sizes.append(size)
-            return super().read(size)
+    # Exercise bounded, fresh bundled reads with inert changing bytes. Trust is
+    # decided after each read by signature,
+    # schema, self-hashes, 4+4 shape, and the stable contract rather than a
+    # package-pinned whole-file digest.
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        synthetic_fixture = Path(temporary_directory) / "reader-fixture.bin"
+        synthetic_fixture.write_bytes(synthetic_bytes)
+        bundle_open_calls: list[str] = []
 
-    def fixture_open(path: Path, *args, **kwargs):
-        open_calls.append(Path(path))
-        if open_error is not None:
-            raise open_error
-        assert encoded is not None
-        return ObservedStream(encoded)
+        def synthetic_fixture_open(path: Path, *args, **kwargs):
+            bundle_open_calls.append(str(path))
+            assert Path(path) == EXPECTED_BUNDLED_POLICY
+            return original_path_open(synthetic_fixture, *args, **kwargs)
 
-    Path.open = fixture_open
-    try:
+        Path.open = synthetic_fixture_open
+        try:
+            assert common._read_agent_policy_envelope() == synthetic_bytes
+            with original_path_open(synthetic_fixture, "wb") as stream:
+                stream.write(synthetic_bytes + b"\n")
+            assert common._read_agent_policy_envelope() == synthetic_bytes + b"\n"
+        finally:
+            Path.open = original_path_open
+
+        # No process-global payload cache: every protected execution takes a
+        # fresh bundled snapshot.
+        assert bundle_open_calls == [
+            str(EXPECTED_BUNDLED_POLICY),
+            str(EXPECTED_BUNDLED_POLICY),
+        ]
+
+    # Verify the shipped v4.1 RSA signature and signed 4+4 self-hashes.
+    signed_bytes = EXPECTED_BUNDLED_POLICY.read_bytes()
+    assert hashlib.sha256(signed_bytes).hexdigest() == EXPECTED_ENVELOPE_SHA256
+    payload = common._load_agent_rule_payload()
+    assert payload["final_policy_version"] == EXPECTED_VERSION
+    assert payload["final_motion_look_policy_sha256"] == EXPECTED_CONTRACT_SHA256
+    assert payload["envelope_sha256"] == EXPECTED_ENVELOPE_SHA256
+    assert hashlib.sha256(str(payload["policy"]).encode("utf-8")).hexdigest() == (
+        EXPECTED_PROJECT_SHA256
+    )
+    assert hashlib.sha256(str(payload["binding"]).encode("utf-8")).hexdigest() == (
+        EXPECTED_BINDING_SHA256
+    )
+
+    def assert_open_failure(error: BaseException) -> None:
+        def failing_open(_path: Path, *_args, **_kwargs):
+            raise error
+
+        Path.open = failing_open
         try:
             common._load_agent_rule_payload()
         except RuntimeError as exc:
             assert str(exc) == LOAD_FAILURE
-            assert exc.__cause__ is not None
         else:
-            raise AssertionError(f"{label} bundled policy was accepted.")
-    finally:
-        Path.open = original_path_open
+            raise AssertionError(f"bundled read failure was accepted: {error!r}")
+        finally:
+            Path.open = original_path_open
 
-    assert open_calls == [bundled_policy_path]
-    if encoded is None:
-        assert read_sizes == []
-    else:
-        assert read_sizes == [common._AGENT_POLICY_MAX_ENVELOPE_BYTES + 1]
+    for simulated_error in (
+        FileNotFoundError("simulated missing bundled policy"),
+        PermissionError("simulated bundled policy read denial"),
+        OSError(5, "simulated bundled policy I/O failure"),
+    ):
+        assert_open_failure(simulated_error)
 
+    def assert_file_bytes_rejected(label: str, data: bytes) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture = Path(temporary_directory) / "fixture.bin"
+            fixture.write_bytes(data)
 
-assert_bundle_failure(
-    "missing",
-    open_error=FileNotFoundError("simulated missing bundled policy"),
-)
-assert_bundle_failure("corrupt", encoded=b"not-a-signed-policy")
-assert_bundle_failure(
-    "oversized",
-    encoded=b"x" * (common._AGENT_POLICY_MAX_ENVELOPE_BYTES + 2),
-)
-assert_bundle_failure("wrong-signature", encoded=wrong_signature_bytes)
+            def fixture_open(_path: Path, *args, **kwargs):
+                return original_path_open(fixture, *args, **kwargs)
 
+            Path.open = fixture_open
+            try:
+                common._load_agent_rule_payload()
+            except RuntimeError as exc:
+                assert str(exc) == LOAD_FAILURE
+            else:
+                raise AssertionError(f"{label} bundled policy was accepted")
+            finally:
+                Path.open = original_path_open
 
-def exercise_public_route(
-    *,
-    canonical_hmb_prompt: bool,
-    topology_failure: bool = False,
-) -> tuple[str, int, dict[str, object], BaseException | None]:
-    node = object.__new__(agent.HMBAgentLibrary)
-    node._hmb_rules_active = False
-    node._hmb_structured_rules_active = False
-    node._hmb_policy = ""
-    node._hmb_binding = ""
-    node._hmb_policy_rules = []
-    node._hmb_binding_rules = []
-    node._hmb_goal_first_rules = []
-    node._hmb_native_calls_this_process = 0
-    node.parameter_output_values = {"agent": {"stale": True}, "output": "stale"}
-    native_calls: list[bool] = []
-
-    def native_once(self):
-        native_calls.append(True)
-        if False:
-            yield None
-        return "native-complete"
-
-    node._run_native_agent_once = MethodType(native_once, node)
-
-    def topology(_self):
-        if topology_failure:
-            raise RuntimeError("private topology detail")
-        return canonical_hmb_prompt
-
-    node._has_canonical_hmb_prompt_connection = MethodType(topology, node)
-    iterator = node.process()
-    try:
-        while True:
-            next(iterator)
-    except RuntimeError as exc:
-        return (
-            str(exc),
-            len(native_calls),
-            dict(node.parameter_output_values),
-            exc.__cause__,
-        )
-    except StopIteration as stop:
-        return (
-            str(stop.value),
-            len(native_calls),
-            dict(node.parameter_output_values),
-            None,
-        )
-
-
-def assert_public_routes() -> None:
-    # A canonical HMB route verifies the library-local v4 policy.
-    bundled_result, bundled_native_calls, _bundled_outputs, bundled_cause = (
-        exercise_public_route(canonical_hmb_prompt=True)
+    assert_file_bytes_rejected("empty", b"")
+    assert_file_bytes_rejected(
+        "oversized",
+        b"x" * (common._AGENT_POLICY_MAX_ENVELOPE_BYTES + 1),
     )
-    assert bundled_result == "native-complete"
-    assert bundled_native_calls == 1
-    assert bundled_cause is None
+    tampered = bytearray(signed_bytes)
+    tampered[len(tampered) // 2] ^= 1
+    assert_file_bytes_rejected("tampered signed envelope", bytes(tampered))
 
-    # A missing local bundle stops the HMB route before the native Agent runs.
-    original_agent_reader = agent._hmb._read_agent_policy_envelope
+    # Simulate a namespace/content race by returning a different file identity
+    # for the post-read fstat. The loader must reject before decode/injection.
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        first_file = Path(temporary_directory) / "first.bin"
+        second_file = Path(temporary_directory) / "second.bin"
+        first_file.write_bytes(signed_bytes)
+        second_file.write_bytes(signed_bytes)
 
-    def unavailable_bundle_reader() -> bytes:
-        raise FileNotFoundError("simulated missing bundled policy")
+        class RacingStream:
+            def __init__(self) -> None:
+                self._first = original_path_open(first_file, "rb")
+                self._second = original_path_open(second_file, "rb")
+                self._fileno_calls = 0
 
-    agent._hmb._read_agent_policy_envelope = unavailable_bundle_reader
-    try:
-        public_error, public_native_calls, public_outputs, public_cause = (
-            exercise_public_route(canonical_hmb_prompt=True)
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self._first.close()
+                self._second.close()
+
+            def fileno(self) -> int:
+                self._fileno_calls += 1
+                return (
+                    self._first.fileno()
+                    if self._fileno_calls == 1
+                    else self._second.fileno()
+                )
+
+            def read(self, size: int = -1) -> bytes:
+                return self._first.read(size)
+
+        Path.open = lambda _path, *_args, **_kwargs: RacingStream()
+        try:
+            common._load_agent_rule_payload()
+        except RuntimeError as exc:
+            assert str(exc) == LOAD_FAILURE
+        else:
+            raise AssertionError("bundled policy identity race was accepted")
+        finally:
+            Path.open = original_path_open
+
+    canonical_empty_prompt = "\n".join(
+        (
+            "HMB_GP_Production",
+            agent._PUBLIC_JOB_CONTRACT_HEADER,
+            json.dumps(
+                {
+                    "schema": agent._PUBLIC_JOB_CONTRACT_SCHEMA,
+                    "version": agent._PUBLIC_JOB_CONTRACT_VERSION,
+                    "images": [],
+                    "videos": [],
+                    "control_only_bindings": [],
+                    "frame_ranges": [],
+                    "connections": {"image_asset": False, "picker": False},
+                },
+                separators=(",", ":"),
+            ),
+            agent._FX_TIMING_CONTRACT_HEADER,
+            json.dumps(
+                {
+                    "schema": agent._FX_TIMING_CONTRACT_SCHEMA,
+                    "version": agent._FX_TIMING_CONTRACT_VERSION,
+                    "valid": True,
+                    "errors": [],
+                    "sources": [],
+                },
+                separators=(",", ":"),
+            ),
+            agent._USER_DESCRIPTION_DATA_HEADER,
+            "{}",
         )
-    finally:
-        agent._hmb._read_agent_policy_envelope = original_agent_reader
+    )
+
+    def exercise_route(*, canonical: bool, bundle_failure: bool) -> tuple[str, int, dict]:
+        node = object.__new__(agent.HMBAgentLibrary)
+        node._hmb_rules_active = False
+        node._hmb_policy = ""
+        node._hmb_binding = ""
+        node._hmb_policy_rules = []
+        node._hmb_binding_rules = []
+        node._hmb_ruleset_names = ("", "")
+        node._hmb_native_calls_this_process = 0
+        node.parameter_output_values = {"agent": {"stale": True}, "output": "stale"}
+        native_calls: list[bool] = []
+
+        def get_parameter_value(_self, name: str):
+            assert name == "prompt"
+            return canonical_empty_prompt
+
+        def native_once(_self):
+            native_calls.append(True)
+            if False:
+                yield None
+            return "native-complete"
+
+        node.get_parameter_value = MethodType(get_parameter_value, node)
+        node._run_native_agent_once = MethodType(native_once, node)
+        node._has_canonical_hmb_prompt_connection = MethodType(
+            lambda _self: canonical,
+            node,
+        )
+
+        original_identity_reader = agent._prompt_policy_source_identity
+        original_envelope_reader = agent._hmb._read_agent_policy_envelope
+        agent._prompt_policy_source_identity = lambda _source_path=None: (
+            EXPECTED_VERSION,
+            EXPECTED_CONTRACT_SHA256,
+        )
+        if bundle_failure:
+            agent._hmb._read_agent_policy_envelope = lambda: (_ for _ in ()).throw(
+                FileNotFoundError("private bundled policy detail")
+            )
+        else:
+            agent._hmb._read_agent_policy_envelope = lambda: (_ for _ in ()).throw(
+                AssertionError("plain Agent read the bundled HMB policy")
+            )
+        try:
+            iterator = node.process()
+            while True:
+                next(iterator)
+        except RuntimeError as exc:
+            return str(exc), len(native_calls), dict(node.parameter_output_values)
+        except StopIteration as stop:
+            return str(stop.value), len(native_calls), dict(node.parameter_output_values)
+        finally:
+            agent._prompt_policy_source_identity = original_identity_reader
+            agent._hmb._read_agent_policy_envelope = original_envelope_reader
+
+    public_error, native_calls, public_outputs = exercise_route(
+        canonical=True,
+        bundle_failure=True,
+    )
     assert public_error == agent._HMB_POLICY_UNAVAILABLE_MESSAGE
-    assert public_native_calls == 0
+    assert native_calls == 0
     assert public_outputs == {
         "agent": {},
         "output": agent._HMB_POLICY_UNAVAILABLE_MESSAGE,
     }
-    assert public_cause is None
 
-    topology_error, topology_native_calls, topology_outputs, topology_cause = (
-        exercise_public_route(
-            canonical_hmb_prompt=False,
-            topology_failure=True,
-        )
-    )
-    assert topology_error == agent._HMB_TOPOLOGY_UNAVAILABLE_MESSAGE
-    assert topology_native_calls == 0
-    assert topology_outputs == {
-        "agent": {},
-        "output": agent._HMB_TOPOLOGY_UNAVAILABLE_MESSAGE,
-    }
-    assert topology_cause is None
-
-    native_result, native_calls, _native_outputs, _native_cause = (
-        exercise_public_route(canonical_hmb_prompt=False)
+    native_result, native_calls, _native_outputs = exercise_route(
+        canonical=False,
+        bundle_failure=False,
     )
     assert native_result == "native-complete"
     assert native_calls == 1
-
-
-assert_public_routes()
+finally:
+    if original_env is None:
+        os.environ.pop(POLICY_ENV, None)
+    else:
+        os.environ[POLICY_ENV] = original_env
 
 
 common_source = (ROOT / "_hmb_common.py").read_text(encoding="utf-8")
 agent_source = (ROOT / "HMBAgentLibrary.py").read_text(encoding="utf-8")
 assert "_BUNDLED_AGENT_POLICY_FILE" in common_source
 assert 'ROOT / "resources" / "agent" / "hmb_agent_core.dat"' in common_source
-for forbidden in (
-    "_resolve_agent_rule_data_path",
-    "_load_agent_rule_payload_from_path",
-):
-    assert forbidden not in common_source
-read_start = common_source.index("def _read_agent_policy_envelope")
-read_end = common_source.index("def _decode_signed_agent_policy_envelope")
-read_source = common_source[read_start:read_end]
-assert "_BUNDLED_AGENT_POLICY_FILE.open(\"rb\")" in read_source
-assert "read(_AGENT_POLICY_MAX_ENVELOPE_BYTES + 1)" in read_source
-assert ".read_bytes()" not in common_source[
-    read_start : common_source.index("def get_internal_policy_rules")
-]
-assert "zlib.decompress(" not in common_source
-assert "continuing with the native Agent" not in agent_source
-assert "_HMB_POLICY_UNAVAILABLE_MESSAGE" in agent_source
-assert "raise RuntimeError(_HMB_POLICY_UNAVAILABLE_MESSAGE)" in agent_source
+assert "_resolve_agent_rule_data_path" not in common_source
+assert r"\\FIN-RCOMP7\D$\agent" not in common_source
+assert "192.168.203.245" not in common_source
+assert "FIN-RCOMP7.funnyflux.local" not in common_source
+assert "HMB_AgentPolicy$" not in common_source
+assert POLICY_ENV not in common_source
+assert re.search(r"(?m)^AGENT_RULE_DATA_PATH\s*=", common_source) is None
+assert "lru_cache" not in common_source
+assert "_AGENT_POLICY_ENVELOPE_SHA256" not in common_source
+assert "_AGENT_POLICY_PROJECT_SHA256" not in common_source
+assert "_AGENT_POLICY_BINDING_SHA256" not in common_source
+assert "HMB LOCAL POLICY REQUIRED" not in agent_source
+assert "_BUNDLED_AGENT_POLICY_FILE" not in agent_source
+assert "resources/agent/hmb_agent_core.dat" not in agent_source
 
-manifest = json.loads(
-    (ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8")
-)
-registered_secrets = manifest["settings"][0]["contents"]["secrets_to_register"]
-assert registered_secrets == {
-    "GT_CLOUD_API_KEY": "",
-    "GT_CLOUD_BUCKET_ID": "",
-    "TOS_ACCESS_KEY_ID": "",
-    "TOS_SECRET_ACCESS_KEY": "",
-    "TOS_BUCKET_NAME": "",
-}
-
-print("HMB local bundled Agent policy boundary regression: PASS")
+print("HMB fixed bundled Agent policy boundary regression: PASS")

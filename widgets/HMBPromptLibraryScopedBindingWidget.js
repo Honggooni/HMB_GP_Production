@@ -825,7 +825,7 @@ function normalizeFrameDomainEndpoint(value) {
   return Math.max(0, Math.min(MAX_MANUAL_FRAME_NUMBER, frame));
 }
 
-function normalizeFrameRangeBindings(value, legacyBinding = null) {
+export function normalizeFrameRangeBindings(value, legacyBinding = null) {
   const out = {};
   const candidates = [];
   if (legacyBinding && typeof legacyBinding === "object") candidates.push(["", legacyBinding]);
@@ -839,6 +839,7 @@ function normalizeFrameRangeBindings(value, legacyBinding = null) {
     const color = clean(raw.color_pick || raw.color || keyParts[1]);
     const key = frameBindingKey(slot, color);
     const previous = out[key] && typeof out[key] === "object" ? out[key] : {};
+    const hasEnabled = Object.prototype.hasOwnProperty.call(raw, "enabled");
     const hasStart = Object.prototype.hasOwnProperty.call(raw, "start_frame")
       || Object.prototype.hasOwnProperty.call(raw, "manual_start_frame");
     const hasEnd = Object.prototype.hasOwnProperty.call(raw, "end_frame")
@@ -846,6 +847,11 @@ function normalizeFrameRangeBindings(value, legacyBinding = null) {
     out[key] = {
       video_slot: `@video${slot}`,
       color_pick: color,
+      enabled: hasEnabled
+        ? Boolean(raw.enabled)
+        : Object.prototype.hasOwnProperty.call(previous, "enabled")
+          ? Boolean(previous.enabled)
+          : true,
       origin: clean(raw.origin) || "manual",
       ranges: normalizeFrameRanges(raw.ranges),
       start_frame: hasStart
@@ -954,6 +960,7 @@ function currentFrameRangeSelection(item) {
         ? {
           video_slot: `@video${slot}`,
           color_pick: color,
+          enabled: true,
           origin: "manual",
           ranges: [],
           start_frame: null,
@@ -2576,6 +2583,7 @@ export function storeCurrentFrameRanges(item, ranges, selectedIndex = -1) {
   const binding = {
     video_slot: `@video${selection.slot}`,
     color_pick: selection.color,
+    enabled: true,
     origin: "manual",
     ranges: normalizedRanges,
     start_frame: normalizeFrameDomainEndpoint(selection.binding && selection.binding.start_frame),
@@ -2599,6 +2607,7 @@ export function storeCurrentFrameDomain(item, startFrame, endFrame) {
   const binding = {
     video_slot: `@video${selection.slot}`,
     color_pick: selection.color,
+    enabled: true,
     origin: clean(selection.binding && selection.binding.origin) || "manual",
     ranges: normalizeFrameRanges(selection.binding && selection.binding.ranges),
     start_frame: normalizeFrameDomainEndpoint(startFrame),
@@ -2617,10 +2626,19 @@ export function setFrameRangeEnabled(item, enabled) {
   normalizeImageBindingFields(item, MAX_VIDEOS);
   item.frame_range_enabled = Boolean(enabled);
   if (!item.frame_range_enabled) item.frame_range_selected_index = -1;
-  if (item.frame_range_enabled && !currentFrameRangeSelection(item).binding) {
-    storeCurrentFrameRanges(item, [], -1);
-  }
-  else syncCurrentFrameRangeBinding(item);
+  if (item.frame_range_enabled) {
+    const selection = currentFrameRangeSelection(item);
+    if (!selection.binding) {
+      storeCurrentFrameRanges(item, [], -1);
+    } else {
+      const binding = { ...selection.binding, enabled: true };
+      item.frame_range_bindings = {
+        ...selection.bindings,
+        [selection.key]: binding,
+      };
+      item.frame_range_binding = { ...binding };
+    }
+  } else syncCurrentFrameRangeBinding(item);
   return item.frame_range_enabled;
 }
 

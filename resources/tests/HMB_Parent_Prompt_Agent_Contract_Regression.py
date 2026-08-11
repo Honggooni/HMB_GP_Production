@@ -7,6 +7,8 @@ from types import MethodType, SimpleNamespace
 from typing import Any, Callable
 import sys
 
+from _hmb_private_policy_fixture import install_private_policy_reader
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -25,22 +27,25 @@ def load(name: str):
 
 prompt = load("HMBPromptLibrary")
 agent = load("HMBAgentLibrary")
+install_private_policy_reader(agent._hmb)
 
-# This topology/4+4 behavior test supplies synthetic policy documents, while
-# the compiler and sealed runtime identity must remain the synchronized current
-# release identity.
-EXPECTED_POLICY_IDENTITY = (
-    "2026-08-11.agent-shot-quality.v4",
-    "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5",
-)
-SIGNED_RUNTIME_POLICY_IDENTITY = (
+
+def prompt_json_section(payload: str, header: str):
+    lines = payload.splitlines()
+    assert lines[0] == "HMB_GP_Production"
+    assert len(lines) == 7
+    return json.loads(lines[lines.index(header) + 1])
+
+# This topology/4+4 behavior test supplies synthetic policy documents while the
+# compiler/runtime identity remains synchronized to the checked-in signed v4
+# baseline.
+SYNTHETIC_SIGNED_V4_PROMPT_IDENTITY = (
     str(agent._hmb._AGENT_POLICY_VERSION),
     str(agent._hmb._AGENT_POLICY_CONTRACT_SHA256).lower(),
 )
-assert SIGNED_RUNTIME_POLICY_IDENTITY == EXPECTED_POLICY_IDENTITY
-assert agent._prompt_policy_source_identity() == EXPECTED_POLICY_IDENTITY
+assert agent._prompt_policy_source_identity() == SYNTHETIC_SIGNED_V4_PROMPT_IDENTITY
 assert agent._assert_prompt_policy_identity_matches_signed_runtime() == (
-    EXPECTED_POLICY_IDENTITY
+    SYNTHETIC_SIGNED_V4_PROMPT_IDENTITY
 )
 
 
@@ -232,7 +237,7 @@ else:
     raise AssertionError("Missing Agent identity was accepted as native.")
 
 
-policy_document, binding_document = agent.get_internal_policy_documents()
+policy_document, binding_document = agent._hmb._load_verified_behavior_documents()
 policy_rules = agent._split_behavior_rules(policy_document, 4)
 binding_rules = agent._split_behavior_rules(binding_document, 4)
 
@@ -242,6 +247,7 @@ def exercise_agent_route(
     *,
     direct_prompt_edge: bool,
     policy_failure: bool = False,
+    expected_contract_error: bool = False,
 ) -> tuple[bool, bool, int, int, int, bool, int, int]:
     node = object.__new__(agent.HMBAgentLibrary)
     node._hmb_rules_active = False
@@ -249,8 +255,9 @@ def exercise_agent_route(
     node._hmb_binding = "stale-binding" if policy_failure else ""
     node._hmb_policy_rules = ["stale-project"] if policy_failure else []
     node._hmb_binding_rules = ["stale-shot"] if policy_failure else []
-    node._hmb_goal_first_rules = ["stale-goal"] if policy_failure else []
-    node._hmb_structured_rules_active = False
+    node._hmb_ruleset_names = (
+        ("stale-a", "stale-b") if policy_failure else ("", "")
+    )
     node._hmb_native_calls_this_process = 0
     node.parameter_output_values = {
         "agent": {"stale": True},
@@ -261,11 +268,26 @@ def exercise_agent_route(
     policy_loads: list[bool] = []
 
     def native_once(self):
+        names = tuple(self._hmb_ruleset_names)
+        if self._hmb_rules_active:
+            assert agent._RUNTIME_FX_SCOPE_HEADER in self._hmb_runtime_prompt
+            assert len(
+                [
+                    line
+                    for line in prompt_value.splitlines()
+                    if line.strip()
+                ]
+            ) == 7
         observations.append(
             (
                 bool(self._hmb_rules_active),
-                bool(self._hmb_structured_rules_active),
-                len(self._hmb_goal_first_rules),
+                len(set(names)) == 2
+                and all(
+                    len(name) == 32
+                    and all(character in "0123456789abcdef" for character in name)
+                    for name in names
+                ),
+                sum(bool(name) for name in names),
                 len(self._hmb_policy_rules),
                 len(self._hmb_binding_rules),
             )
@@ -305,6 +327,24 @@ def exercise_agent_route(
         while True:
             next(iterator)
     except RuntimeError as exc:
+        if expected_contract_error:
+            assert exc.__cause__ is None
+            assert str(exc) == agent._HMB_SOURCE_CONTRACT_INVALID_MESSAGE
+            assert observations == []
+            # Contract interpretation occurs only after the signed 4+4 policy
+            # has loaded; malformed public data still fails before native work.
+            assert policy_loads == [True]
+            assert node._hmb_native_calls_this_process == 0
+            assert node.parameter_output_values == {
+                "agent": {},
+                "output": agent._HMB_SOURCE_CONTRACT_INVALID_MESSAGE,
+            }
+            assert node._hmb_policy == ""
+            assert node._hmb_binding == ""
+            assert node._hmb_policy_rules == []
+            assert node._hmb_binding_rules == []
+            assert node._hmb_runtime_prompt == ""
+            return (False, False, 0, 0, 0, False, 1, 0)
         if not policy_failure:
             raise
         assert exc.__cause__ is None
@@ -316,26 +356,27 @@ def exercise_agent_route(
             "output": agent._HMB_POLICY_UNAVAILABLE_MESSAGE,
         }
         assert node._hmb_rules_active is False
-        assert node._hmb_structured_rules_active is False
         assert node._hmb_policy == ""
         assert node._hmb_binding == ""
         assert node._hmb_policy_rules == []
         assert node._hmb_binding_rules == []
-        assert node._hmb_goal_first_rules == []
+        assert node._hmb_ruleset_names == ("", "")
+        assert node._hmb_runtime_prompt == ""
         return (False, False, 0, 0, 0, False, len(policy_loads), 0)
     except StopIteration as stop:
         assert stop.value == "native-complete"
 
     assert len(observations) == 1
-    active, structured, goal_count, project_count, shot_count = observations[0]
+    active, opaque_names, name_count, project_count, shot_count = observations[0]
     assert node._hmb_rules_active is False
-    assert node._hmb_structured_rules_active is False
     assert node._hmb_policy == ""
     assert node._hmb_binding == ""
+    assert node._hmb_ruleset_names == ("", "")
+    assert node._hmb_runtime_prompt == ""
     return (
         active,
-        structured,
-        goal_count,
+        opaque_names,
+        name_count,
         project_count,
         shot_count,
         bool(secured),
@@ -346,7 +387,7 @@ def exercise_agent_route(
 
 compiled_prompt_copy = prompt._build_prompt_package(prompt._default_widget_state())
 native_route = (False, False, 0, 0, 0, False, 0, 1)
-hmb_route = (True, True, 1, 4, 4, True, 1, 1)
+hmb_route = (True, True, 2, 4, 4, True, 1, 1)
 
 assert exercise_agent_route(
     compiled_prompt_copy,
@@ -361,21 +402,27 @@ assert exercise_agent_route(
     direct_prompt_edge=False,
 ) == native_route
 
-# Topology alone activates HMB. A future Prompt wording change, a plain-looking
-# package, or an empty transitional value cannot silently demote the exact edge.
-for topology_owned_payload in (
+# Topology activates HMB, but the canonical edge must also carry the current
+# typed source envelope. Missing or stale Prompt packages fail closed instead
+# of bypassing the FX/Timing contract.
+for invalid_topology_owned_payload in (
     "",
     "future Prompt package with no legacy headings",
-    compiled_prompt_copy,
 ):
     assert exercise_agent_route(
-        topology_owned_payload,
+        invalid_topology_owned_payload,
         direct_prompt_edge=True,
-    ) == hmb_route
+        expected_contract_error=True,
+    ) == (False, False, 0, 0, 0, False, 1, 0)
+
+assert exercise_agent_route(
+    compiled_prompt_copy,
+    direct_prompt_edge=True,
+) == hmb_route
 
 # The canonical HMB route requires the signed policy and blocks before native.
 assert exercise_agent_route(
-    "future Prompt package",
+    compiled_prompt_copy,
     direct_prompt_edge=True,
     policy_failure=True,
 ) == (False, False, 0, 0, 0, False, 1, 0)
@@ -446,20 +493,43 @@ for mode_name, (state, expected_counts) in four_prompt_modes.items():
         int(status["active_videos"]),
     ) == expected_counts, mode_name
     compiled = prompt._build_prompt_package(state)
-    assert compiled.startswith("HMB_GP_Production\n"), mode_name
-    assert "[HMB VALIDATION ERROR]" not in compiled, mode_name
+    assert len([line for line in compiled.splitlines() if line.strip()]) == 7
+    prompt_json_section(compiled, "HMB JOB DATA (JSON):")
+    fx_facts = prompt_json_section(compiled, "FX/TIMING SOURCE DATA (JSON):")
+    assert set(fx_facts) == {"schema", "version", "valid", "errors", "sources"}
+    prompt_json_section(compiled, "USER DESCRIPTION DATA (JSON):")
     compiled_modes[mode_name] = compiled
 
-assert "@image1 = Hero.png" in compiled_modes["prompt+asset"]
-assert "@video1 = main" in compiled_modes["prompt+picker"]
-assert "@image1 = Hero.png" in compiled_modes["prompt+asset+picker"]
-assert "@video1 = main" in compiled_modes["prompt+asset+picker"]
+asset_job = prompt_json_section(
+    compiled_modes["prompt+asset"],
+    "HMB JOB DATA (JSON):",
+)
+picker_job = prompt_json_section(
+    compiled_modes["prompt+picker"],
+    "HMB JOB DATA (JSON):",
+)
+combined_job = prompt_json_section(
+    compiled_modes["prompt+asset+picker"],
+    "HMB JOB DATA (JSON):",
+)
+assert [(item["image"], item["label"]) for item in asset_job["images"]] == [
+    ("@image1", "Hero.png"),
+]
+assert [(item["video"], item["label"]) for item in picker_job["videos"]] == [
+    ("@video1", "main"),
+]
+assert [(item["image"], item["label"]) for item in combined_job["images"]] == [
+    ("@image1", "Hero.png"),
+]
+assert [(item["video"], item["label"]) for item in combined_job["videos"]] == [
+    ("@video1", "main"),
+]
 assert len(set(compiled_modes.values())) == 4
 
 
 # Both semantic input ports use the engine's official `any` wildcard. The
-# Prompt accepts arbitrary source classes and preserves foreign readable data
-# as ordinary intent instead of pretending it came from Asset or Picker.
+# Prompt accepts arbitrary source classes at the host port, but connector data
+# without verified user-authored provenance cannot enter USER DESCRIPTION.
 if not hasattr(prompt.DataNode, "after_incoming_connection"):
     setattr(
         prompt.DataNode,
@@ -516,22 +586,22 @@ prompt_node.after_incoming_connection(
 foreign_state = prompt._parse_state(
     prompt._get_parameter_raw(prompt_node, prompt.WIDGET_PARAMETER_NAME)
 )
-foreign_entries = foreign_state[prompt._SOURCE_INTENT_FALLBACKS_KEY]
-foreign_blob = json.dumps(foreign_entries, ensure_ascii=False, sort_keys=True)
 foreign_compiled = prompt_node.parameter_output_values["PROMPT_OUT"]
 for preserved_token in (
     "KEEP_FOREIGN_ASSET_INTENT",
     "KEEP_FOREIGN_PICKER_INTENT",
 ):
-    assert preserved_token in foreign_blob
     assert preserved_token not in foreign_compiled
-assert "USER DESCRIPTION DATA (JSON):" not in foreign_compiled
+assert prompt_json_section(
+    foreign_compiled,
+    "USER DESCRIPTION DATA (JSON):",
+) == {}
 assert foreign_state["status"]["active_images"] == 0
 assert foreign_state["status"]["active_videos"] == 0
 
 
-# Known HMB payloads remain semantic while unknown extension fields survive in
-# local fallback state without crossing the five-section public Prompt boundary.
+# Known HMB payloads remain semantic, while arbitrary unknown extension fields
+# are treated as transport metadata rather than promoted to user intent.
 extended_asset = {
     **asset_payload,
     "vendor_extension": "KEEP_ASSET_EXTENSION",
@@ -550,15 +620,8 @@ extended_state = prompt._apply_picker_payload(
     connected=True,
 )
 extended_compiled = prompt._build_prompt_package(extended_state)
-extended_fallback_blob = json.dumps(
-    extended_state[prompt._SOURCE_INTENT_FALLBACKS_KEY],
-    ensure_ascii=False,
-    sort_keys=True,
-)
 assert extended_state["status"]["active_images"] == 1
 assert extended_state["status"]["active_videos"] == 1
-assert "KEEP_ASSET_EXTENSION" in extended_fallback_blob
-assert "KEEP_PICKER_EXTENSION" in extended_fallback_blob
 assert "KEEP_ASSET_EXTENSION" not in extended_compiled
 assert "KEEP_PICKER_EXTENSION" not in extended_compiled
 

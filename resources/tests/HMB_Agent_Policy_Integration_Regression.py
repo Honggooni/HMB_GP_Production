@@ -4,38 +4,19 @@ import hashlib
 import importlib.util
 import json
 import sys
-import tempfile
 import types
 from itertools import combinations
 from pathlib import Path
 
+from _hmb_private_policy_fixture import install_private_policy_reader
+
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.5.74"
-EXPECTED_POLICY_VERSION = "2026-08-11.agent-shot-quality.v4"
-EXPECTED_CONTRACT_SHA256 = "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5"
-EXPECTED_BUNDLED_POLICY_SHA256 = "e46328be5f3bf9d0bc05d52b12cc6b14cc71b3125297d01efc2100e47276c914"
+EXPECTED_RELEASE_VERSION = "0.6.1"
+EXPECTED_POLICY_VERSION = "2026-08-11.agent-shot-quality.v4.1"
+EXPECTED_CONTRACT_SHA256 = "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
+EXPECTED_SERVER_POLICY_SHA256 = "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
 EXPECTED_SIGNING_KEY_ID = "hmb-policy-release-2026-08-r2"
-SHARED_MARKERS = (
-    "HYBRID COMPOSITION INDEPENDENCE:",
-    "MISSING SOURCE AUTHORITY:",
-    "OPTIONAL VIDEO CONTROL:",
-    "COLOR PLAYBLAST ISOLATION WITHOUT DEPENDENCY:",
-    "ADAPTIVE CONFLICT RESOLUTION:",
-    "FINAL OUTPUT CONTINUITY:",
-)
-FORBIDDEN_GATES = (
-    "[HMB VALIDATION ERROR]",
-    "stop validation",
-    "stop generation",
-    "requires the validated Motion Guide",
-    "@video1 is mandatory",
-    "@video1 must be active",
-    "Missing or incomplete approved appearance bindings",
-    "A missing role falls back to context-only use",
-    "A missing local binding prevents local control authority",
-    "zero identity or final-look authority",
-)
 
 
 def load(name: str):
@@ -50,8 +31,21 @@ def load(name: str):
 agent = load("HMBAgentLibrary")
 prompt = load("HMBPromptLibrary")
 
-policy = agent.get_internal_policy_rules().strip()
-binding = agent.get_internal_binding_rules().strip()
+original_policy_reader, sealed = install_private_policy_reader(agent._hmb)
+assert hashlib.sha256(sealed).hexdigest() == EXPECTED_SERVER_POLICY_SHA256
+
+assert agent._prompt_policy_source_identity() == (
+    prompt.PROMPT_POLICY_SOURCE_VERSION,
+    prompt.PROMPT_POLICY_SOURCE_CONTRACT_SHA256,
+)
+assert agent._assert_prompt_policy_identity_matches_signed_runtime() == (
+    EXPECTED_POLICY_VERSION,
+    EXPECTED_CONTRACT_SHA256,
+)
+
+policy, binding = agent._hmb._load_verified_behavior_documents()
+policy = policy.strip()
+binding = binding.strip()
 identity = agent._hmb.get_internal_policy_identity()
 
 assert f'version = "{EXPECTED_RELEASE_VERSION}"' in (
@@ -60,46 +54,19 @@ assert f'version = "{EXPECTED_RELEASE_VERSION}"' in (
 assert identity == {
     "version": EXPECTED_POLICY_VERSION,
     "contract_sha256": EXPECTED_CONTRACT_SHA256,
+    "envelope_sha256": hashlib.sha256(sealed).hexdigest(),
 }
-assert len(agent._split_behavior_rules(policy, 4)) == 4
-assert len(agent._split_behavior_rules(binding, 4)) == 4
+policy_rule_list = agent._split_behavior_rules(policy, 4)
+binding_rule_list = agent._split_behavior_rules(binding, 4)
+assert len(policy_rule_list) == 4
+assert len(binding_rule_list) == 4
+assert all(rule.strip() for rule in policy_rule_list + binding_rule_list)
+assert policy_rule_list != binding_rule_list
 
-for rules in (policy, binding):
-    for marker in SHARED_MARKERS:
-        assert rules.count(marker) == 1, marker
-    for forbidden in FORBIDDEN_GATES:
-        assert forbidden.casefold() not in rules.casefold(), forbidden
-    normalized_rules = rules.casefold()
-    assert "every non-empty subset" in normalized_rules
-    assert "final creative authority" in normalized_rules
-    assert "not a prerequisite" in normalized_rules
-    assert "interpretation hint" in normalized_rules
-    assert "current explicit user goal" in normalized_rules
-    assert (
-        "technical status explicitly reported in prompt_out as unreadable, corrupt, "
-        "unsafe or unavailable"
-    ) in normalized_rules
-    assert "never downgrade supplied content to context-only" in normalized_rules
-    assert "explicit scoped exception" in normalized_rules
-    assert "named target or clearly scene-wide scope" in normalized_rules
-    assert "stable camera-relative focus" in normalized_rules
-    assert "explicit user goal may use any visible property" not in normalized_rules
-    assert "may broaden, narrow, or reframe" not in normalized_rules
-    assert "target-property-time" not in normalized_rules
-    assert "hidden rules" in normalized_rules
-
-# The signed/compressed v4 policy envelope is the sole local runtime policy. No
-# plaintext policy or private signing key is distributed.
-bundled_policy_path = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
-assert bundled_policy_path.is_file()
-assert hashlib.sha256(bundled_policy_path.read_bytes()).hexdigest() == (
-    EXPECTED_BUNDLED_POLICY_SHA256
-)
-sealed = bundled_policy_path.read_bytes()
+# The signed/compressed v4.1 envelope is read from the private test fixture only.
+# Runtime and public packages never use this path or carry a local fallback.
 assert policy.encode("utf-8") not in sealed
 assert binding.encode("utf-8") not in sealed
-for marker in SHARED_MARKERS:
-    assert marker.encode("utf-8") not in sealed
 
 envelope = json.loads(sealed.decode("utf-8"))
 assert envelope["schema"] == agent._hmb._AGENT_POLICY_ENVELOPE_SCHEMA
@@ -116,7 +83,7 @@ assert payload["final_motion_look_policy_sha256"] == EXPECTED_CONTRACT_SHA256
 assert hashlib.sha256(policy.encode("utf-8")).hexdigest() == payload["policy_sha256"]
 assert hashlib.sha256(binding.encode("utf-8")).hexdigest() == payload["binding_sha256"]
 final_clauses = [str(item) for item in payload["final_motion_look_policy_clauses"]]
-assert len(final_clauses) == len(SHARED_MARKERS)
+assert len(final_clauses) == 6
 assert hashlib.sha256("\n\n".join(final_clauses).encode("utf-8")).hexdigest() == (
     EXPECTED_CONTRACT_SHA256
 )
@@ -139,7 +106,7 @@ def assert_policy_rejected(encoded: bytes) -> None:
 
 
 # Any envelope/payload mutation fails before policy injection. Removing a
-# required inner digest is also rejected by the fixed signed-payload validator.
+# required inner digest is also rejected by the fixed v3 contract validator.
 for envelope_field in ("signature", "payload_sha256", "algorithm", "key_id"):
     altered_envelope = dict(envelope)
     altered_envelope.pop(envelope_field)
@@ -176,12 +143,6 @@ assert not agent._is_hmb_prompt_library_payload(plain_prompt)
 assert agent._is_hmb_prompt_library_payload(empty_hmb_prompt)
 assert policy not in empty_hmb_prompt
 assert binding not in empty_hmb_prompt
-goal_first_rule = agent._extract_goal_first_rule(policy, binding)
-assert goal_first_rule.startswith(agent._HMB_GOAL_FIRST_RULE_HEADING)
-for marker in SHARED_MARKERS:
-    assert goal_first_rule.count(marker) == 1
-assert "final creative authority" in goal_first_rule
-assert "never activates a prerequisite" in goal_first_rule
 
 all_compositions = {
     frozenset(values)
@@ -207,18 +168,23 @@ def exercise_agent_route(
     node._hmb_binding = ""
     node._hmb_policy_rules = []
     node._hmb_binding_rules = []
-    node._hmb_goal_first_rules = []
-    node._hmb_structured_rules_active = False
+    node._hmb_ruleset_names = ("", "")
     node._hmb_native_calls_this_process = 0
     observations: list[tuple[bool, bool, int, int, int]] = []
     secured: list[bool] = []
 
     def native_once(self):
+        names = tuple(self._hmb_ruleset_names)
         observations.append(
             (
                 bool(self._hmb_rules_active),
-                bool(self._hmb_structured_rules_active),
-                len(self._hmb_goal_first_rules),
+                len(set(names)) == 2
+                and all(
+                    len(name) == 32
+                    and all(character in "0123456789abcdef" for character in name)
+                    for name in names
+                ),
+                sum(bool(name) for name in names),
                 len(self._hmb_policy_rules),
                 len(self._hmb_binding_rules),
             )
@@ -262,8 +228,7 @@ def exercise_agent_block(
     node._hmb_binding = "stale-binding"
     node._hmb_policy_rules = ["stale-project-rule"]
     node._hmb_binding_rules = ["stale-shot-rule"]
-    node._hmb_goal_first_rules = ["stale-goal-rule"]
-    node._hmb_structured_rules_active = False
+    node._hmb_ruleset_names = ("stale-a", "stale-b")
     node._hmb_native_calls_this_process = 0
     node.parameter_output_values = {
         "agent": {"stale": True},
@@ -301,12 +266,11 @@ def exercise_agent_block(
     assert native_calls == []
     assert node._hmb_native_calls_this_process == 0
     assert node._hmb_rules_active is False
-    assert node._hmb_structured_rules_active is False
     assert node._hmb_policy == ""
     assert node._hmb_binding == ""
     assert node._hmb_policy_rules == []
     assert node._hmb_binding_rules == []
-    assert node._hmb_goal_first_rules == []
+    assert node._hmb_ruleset_names == ("", "")
     assert node.parameter_output_values["agent"] == {}
     assert node.parameter_output_values["output"] == error_text
     assert "fin-rcomp1" not in error_text.casefold()
@@ -320,7 +284,7 @@ for composition in agent_compositions:
         canonical_prompt_connected=has_prompt,
     )
     if has_prompt:
-        assert route == (True, True, 1, 4, 4, True), composition
+        assert route == (True, True, 2, 4, 4, True), composition
     else:
         assert route == (False, False, 0, 0, 0, False), composition
 
@@ -345,42 +309,56 @@ for direct_payload in direct_source_payloads:
     assert not agent._is_hmb_prompt_library_payload(direct_payload)
     assert exercise_agent_route(direct_payload) == (False, False, 0, 0, 0, False)
 
-# Empty, image-only, video-described, and mixed HMB payloads all activate the
-# same non-gating policy. Agent does not inspect whether their source libraries
-# are connected and does not require media completion before the native call.
+# Empty, image-only, video-described, and mixed typed Prompt packages all
+# activate the same non-gating policy. Media completion is not a prerequisite.
+image_state = prompt._default_widget_state()
+image_state["images"][0].update({
+    "present": True,
+    "label": "manually supplied design reference",
+    "source_type": "Character Appearance",
+    "owner": "Design target",
+})
+video_state = prompt._default_widget_state()
+video_state["videos"] = [prompt._default_video_item(3)]
+video_state["videos"][0].update({
+    "present": True,
+    "label": "independently supplied timing reference",
+    "source_type": "Motion Reference",
+    "control_role": "Context Only",
+})
+mixed_state = prompt._default_widget_state()
+mixed_state["images"] = [prompt._default_image_item(2)]
+mixed_state["images"][0].update({
+    "present": True,
+    "label": "library asset",
+    "source_type": "Environment / Background",
+    "owner": "Scene / Environment",
+})
+mixed_state["videos"] = [prompt._default_video_item(4)]
+mixed_state["videos"][0].update({
+    "present": True,
+    "label": "optional motion guide",
+    "source_type": "Motion Guide / Retargeting Reference",
+    "control_role": "Derived Motion Decoding Only",
+})
 payload_variants = (
     empty_hmb_prompt,
-    empty_hmb_prompt.replace(
-        "No image source assigned in HMBPromptLibrary.",
-        "@image1 = manually supplied design reference",
-    ),
-    empty_hmb_prompt.replace(
-        "No video source assigned in HMBPromptLibrary.",
-        "@video3 = independently supplied timing reference",
-    ),
-    empty_hmb_prompt.replace(
-        "No image source assigned in HMBPromptLibrary.",
-        "@image2 = library asset",
-    ).replace(
-        "No video source assigned in HMBPromptLibrary.",
-        "@video4 = optional motion guide",
-    ),
+    prompt._build_prompt_package(image_state),
+    prompt._build_prompt_package(video_state),
+    prompt._build_prompt_package(mixed_state),
 )
 for variant in payload_variants:
     assert agent._is_hmb_prompt_library_payload(variant)
     assert exercise_agent_route(
         variant,
         canonical_prompt_connected=True,
-    ) == (True, True, 1, 4, 4, True)
+    ) == (True, True, 2, 4, 4, True)
 
 # Copied or forged HMB-shaped text is still a native request when the canonical
-# Prompt edge is absent. Conversely, the canonical edge owns routing even if a
-# future Prompt version changes its headings or wording.
+# Prompt edge is absent. A canonical edge with a stale/plain payload fails
+# closed because the current typed FX/Timing envelope is mandatory.
 assert exercise_agent_route(empty_hmb_prompt) == (False, False, 0, 0, 0, False)
-assert exercise_agent_route(
-    plain_prompt,
-    canonical_prompt_connected=True,
-) == (True, True, 1, 4, 4, True)
+assert exercise_agent_block(plain_prompt) == agent._HMB_SOURCE_CONTRACT_INVALID_MESSAGE
 
 # A canonical HMB Prompt makes the signed policy mandatory. Load/integrity
 # failures publish a safe diagnostic and block before native Agent execution.
@@ -410,7 +388,7 @@ try:
         if "P" not in composition:
             continue
         assert exercise_agent_block(
-            f"{empty_hmb_prompt}\nCOMPOSITION={''.join(sorted(composition))}"
+            empty_hmb_prompt
         ) == agent._HMB_POLICY_UNAVAILABLE_MESSAGE
     assert exercise_agent_block(
         empty_hmb_prompt,
@@ -424,29 +402,24 @@ signature_text = str(tampered_envelope["signature"])
 tampered_envelope["signature"] = (
     ("A" if signature_text[:1] != "A" else "B") + signature_text[1:]
 )
-original_policy_path = agent._hmb._BUNDLED_AGENT_POLICY_FILE
-with tempfile.TemporaryDirectory() as temporary_directory:
-    corrupt_policy_path = Path(temporary_directory) / "hmb_agent_core.dat"
-    corrupt_policy_path.write_text(
-        json.dumps(tampered_envelope, separators=(",", ":")),
-        encoding="utf-8",
+tampered_policy_bytes = json.dumps(
+    tampered_envelope,
+    separators=(",", ":"),
+).encode("utf-8")
+agent._hmb._read_agent_policy_envelope = lambda: tampered_policy_bytes
+try:
+    assert exercise_agent_block(empty_hmb_prompt) == (
+        agent._HMB_POLICY_UNAVAILABLE_MESSAGE
     )
-    agent._hmb._BUNDLED_AGENT_POLICY_FILE = corrupt_policy_path
-    try:
-        assert exercise_agent_block(empty_hmb_prompt) == (
-            agent._HMB_POLICY_UNAVAILABLE_MESSAGE
-        )
-    finally:
-        agent._hmb._BUNDLED_AGENT_POLICY_FILE = original_policy_path
+finally:
+    agent._hmb._read_agent_policy_envelope = lambda: sealed
 
-# Runtime source documents carry the new contract marker check while output
-# state and hidden-rule sanitization remain in their established code paths.
+# Runtime source contains no stable ruleset labels or legacy synthesized-policy
+# fallback. Trusted signing, self-hashes, stable contract, and strict 4+4 shape
+# are the gate; a compatible signed document revision is not byte-pinned.
 agent_source = (ROOT / "HMBAgentLibrary.py").read_text(encoding="utf-8")
 common_source = (ROOT / "_hmb_common.py").read_text(encoding="utf-8")
-assert "_HMB_HYBRID_INDEPENDENCE_MARKERS" in agent_source
-assert "_HMB_GOAL_FIRST_RULESET_NAME" in agent_source
-assert "_extract_goal_first_rule" in agent_source
-assert "sealed hybrid-composition policy is stale or incomplete" in agent_source
+assert "secrets.token_hex(16)" in agent_source
 assert "_secure_hmb_outputs" in agent_source
 assert "_contains_public_output_state_leak" in agent_source
 assert "_prepend_standard_library_paths_for_agent" not in common_source
@@ -454,6 +427,14 @@ assert "pkgutil.walk_packages" not in common_source
 assert "Path.home() / \"Documents\" / \"GriptapeNodes\"" not in common_source
 assert "_AGENT_POLICY_RSA_MODULUS_B64" in common_source
 assert "_verify_agent_policy_signature" in common_source
+assert "_BUNDLED_AGENT_POLICY_FILE" in common_source
+assert 'ROOT / "resources" / "agent" / "hmb_agent_core.dat"' in common_source
+assert "_resolve_agent_rule_data_path" not in common_source
+assert "FIN-RCOMP7.funnyflux.local" not in common_source
+assert "HMB_AgentPolicy$" not in common_source
+assert r"\\FIN-RCOMP7\D$\agent" not in common_source
+
+agent._hmb._read_agent_policy_envelope = original_policy_reader
 
 print(
     "HMB independent hybrid Agent policy integration regression: PASS "

@@ -35,16 +35,16 @@ after a successful check, the library is already current.
 
 ## Agent policy availability
 
-Release `0.5.74` includes exactly one signed production policy at
-`resources/agent/hmb_agent_core.dat`. The runtime reads, verifies, and uses only
-this file from the installed Git library. The canonical
-`HMBPromptLibrary -> HMBAgentLibrary` flow requires no network policy share or
-policy-path environment variable.
+The prepared `v0.6.01` update (technical version `0.6.1`) includes exactly one
+signed runtime artifact at `resources/agent/hmb_agent_core.dat`. The canonical
+`HMBPromptLibrary -> HMBAgentLibrary` execution reads and verifies only that
+file installed with the Git-backed Library. Environment variables, server
+shares, administrative shares, and retired paths cannot replace it.
 
-The bundled envelope is policy version
-`2026-08-11.agent-shot-quality.v4`, contract SHA-256
-`b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5`,
-and file SHA-256
-`e46328be5f3bf9d0bc05d52b12cc6b14cc71b3125297d01efc2100e47276c914`.
-It is a signed, compressed policy envelope rather than a confidentiality
-encryption boundary, and contains no signing private key or API credentials.
+The `.dat` remains a signed and compressed integrity artifact; it is not an
+encryption boundary. Each Agent execution obtains one fresh server snapshot
+and verifies the trusted signer, strict envelope and payload schemas, payload
+self-hashes, stable Prompt/Agent contract, signed version syntax, and exact
+Behavior 1/2 four-rule structure. Unsigned, missing, or directly edited files
+fail closed before native Agent/model execution. Canonical English policy and
+Korean review documents are not included.

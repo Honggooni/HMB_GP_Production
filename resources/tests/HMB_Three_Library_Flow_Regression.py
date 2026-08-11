@@ -3,6 +3,8 @@ import importlib.util
 import json
 import sys
 
+from _hmb_private_policy_fixture import install_private_policy_reader
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -19,6 +21,14 @@ def load(name):
 picker = load("HMBVideoPickerLibrary")
 prompt = load("HMBPromptLibrary")
 agent = load("HMBAgentLibrary")
+install_private_policy_reader(agent._hmb)
+
+
+def prompt_json_section(payload: str, header: str):
+    lines = payload.splitlines()
+    assert lines[0] == "HMB_GP_Production"
+    assert len(lines) == 7
+    return json.loads(lines[lines.index(header) + 1])
 
 # VideoPicker publishes one ordered catalog snapshot to Prompt and the exact
 # same media order through a single VIDEO_OUT list.
@@ -125,18 +135,23 @@ for video in prompt_state["videos"][1:]:
 prompt_state["videos"][1]["source_type"] = "Motion Guide / Retargeting Reference"
 prompt_state["videos"][1]["control_role"] = "Derived Motion Decoding Only"
 compiled_prompt = prompt._build_prompt_package(prompt_state)
-assert "Hero" in compiled_prompt
-assert "@video1" in compiled_prompt
-assert "@video1 = flow_test_playblast_1" in compiled_prompt
-assert "C:/shots/flow_test/flow_test_playblast_1.mp4" not in compiled_prompt
-assert "Red" in compiled_prompt
-assert "SOURCE AUTHORITY CONFLICTS:" not in compiled_prompt
+compiled_job = prompt_json_section(compiled_prompt, "HMB JOB DATA (JSON):")
+assert compiled_job["images"][0]["label"] == "Hero"
+assert compiled_job["images"][0]["bindings"][0] == {
+    "video": "@video1",
+    "marker_color": "Red",
+    "target_scope": "Full body / full appearance",
+}
+assert compiled_job["videos"][0]["video"] == "@video1"
+assert compiled_job["videos"][0]["label"] == "flow_test_playblast_1"
+assert "video_path" not in compiled_job["videos"][0]
 
 # AgentLibrary recognizes the Prompt output and prepares exactly four rules from
 # each internal behavior without changing the downstream native Agent contract.
 assert agent._is_hmb_prompt_library_payload(compiled_prompt)
-policy_rules = agent._split_behavior_rules(agent.get_internal_policy_rules(), 4)
-binding_rules = agent._split_behavior_rules(agent.get_internal_binding_rules(), 4)
+policy_document, binding_document = agent._hmb._load_verified_behavior_documents()
+policy_rules = agent._split_behavior_rules(policy_document, 4)
+binding_rules = agent._split_behavior_rules(binding_document, 4)
 assert len(policy_rules) == 4
 assert len(binding_rules) == 4
 

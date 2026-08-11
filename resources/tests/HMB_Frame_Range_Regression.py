@@ -312,12 +312,25 @@ image["frame_range_bindings"] = {
     },
 }
 compiled = prompt._build_prompt_package(prompt_state)
+compiled_lines = compiled.splitlines()
+assert len(compiled_lines) == 7
+assert compiled_lines[1] == "HMB JOB DATA (JSON):"
+job_data = json.loads(compiled_lines[2])
+assert job_data["frame_ranges"] == [
+    {
+        **job_data["frame_ranges"][0],
+        "image": "@image1",
+        "video": "@video2",
+        "marker_color": "Green",
+        "enabled": True,
+        "segments": [
+            {"start_frame": 1, "end_frame": 48},
+            {"start_frame": 97, "end_frame": 144},
+        ],
+    }
+]
 assert "FRAME RANGE BINDING:" not in compiled
-assert "REPLACEMENT BINDING:" in compiled
-assert "Color Pick marker: @video2 / Green" in compiled
-assert "Frames 1–48 and 97–144 only." not in compiled
-assert "Frames 10–20 only." not in compiled
-assert "Frames 30–40 only." not in compiled
+assert "REPLACEMENT BINDING:" not in compiled
 
 normalized_image = prompt._normalize_state(prompt_state)["images"][0]
 assert normalized_image["frame_range_bindings"]["@video1::Green"]["ranges"] == [

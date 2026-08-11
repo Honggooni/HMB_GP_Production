@@ -253,12 +253,13 @@ assert.deepEqual(
   {
     video_slot: "@video3",
     color_pick: "Green",
+    enabled: true,
     origin: "manual",
     ranges: [{ start: 1010, end: 1020 }],
     start_frame: 12,
     end_frame: 34,
   },
-  "Range ON resumes the preserved manual domain.",
+  "Range ON resumes the preserved manual domain and marks that address active.",
 );
 
 const dormantImage = {
@@ -276,6 +277,7 @@ assert.deepEqual(
   {
     video_slot: "@video5",
     color_pick: "",
+    enabled: true,
     origin: "manual",
     ranges: [],
     start_frame: 1001,

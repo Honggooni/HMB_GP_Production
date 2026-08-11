@@ -15,10 +15,13 @@ backups/
 dist/
 *.zip
 
-# Only the signed production policy is tracked. Review sources and build-only
-# policy materials are excluded from the installable package.
+# Track exactly one signed runtime artifact. Canonical English sources and
+# Korean review documents remain outside Git and release packages.
 resources/agent/*
+!resources/agent/hmb_agent_core.dat
 resources/policy/
+policies/
+*.dat
 **/hmb_agent_core.dat
 !resources/agent/hmb_agent_core.dat
 

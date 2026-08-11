@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import ast
-import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -11,20 +10,41 @@ from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DIST = ROOT / "dist"
-RELEASE_MANIFEST = DIST / "release-manifest.json"
-RELEASE_ARCHIVE = DIST / "HMB_GP_Production.zip"
-RELEASE_CHECKSUMS = DIST / "SHA256SUMS"
-POLICY_RELATIVE = "resources/agent/hmb_agent_core.dat"
-POLICY_SEMANTIC_REGRESSION_RELATIVE = (
-    "resources/tests/HMB_V4_Policy_Semantics_Regression.py"
-)
-POLICY_SHA256 = "e46328be5f3bf9d0bc05d52b12cc6b14cc71b3125297d01efc2100e47276c914"
-POLICY_VERSION = "2026-08-11.agent-shot-quality.v4"
+POLICY_VERSION = "2026-08-11.agent-shot-quality.v4.1"
 POLICY_CONTRACT_SHA256 = (
-    "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5"
+    "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
 )
-POLICY_SIGNING_KEY_ID = "hmb-policy-release-2026-08-r2"
+POLICY_RELATIVE = "resources/agent/hmb_agent_core.dat"
+POLICY_SHA256 = "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
+RELEASE_LABEL = "v0.6.01"
+RELEASE_VERSION = "0.6.1"
+EXPECTED_SOURCE_FILES = (
+    "__init__.py",
+    "griptape-nodes-library.json",
+    "pyproject.toml",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "SBOM.spdx.json",
+    "HMBAgentLibrary.py",
+    "HMBImageAssetLibrary.py",
+    "HMBPromptLibrary.py",
+    "HMBSeedanceGeneration.py",
+    "HMBVideoPickerLibrary.py",
+    "_hmb_common.py",
+    "_hmb_screen_space.py",
+    "widgets/HMBAgentLibraryWidget.js",
+    "widgets/HMBImageAssetLibraryWidget.js",
+    "widgets/HMBPromptLibraryScopedBindingWidget.js",
+    "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
+    "widgets/HMBVideoPickerLibraryWidget_v032.js",
+    "resources/maya/HMB_Maya_Background_Preview.py",
+    "resources/maya/HMB_Maya_Binding_Setup.py",
+    "resources/maya/HMBVideoPicker_Maya_Guide.txt",
+    "resources/picker/HMB_Marker_Catalog.json",
+    POLICY_RELATIVE,
+)
 EXPECTED_SECRET_NAMES = {
     "GT_CLOUD_API_KEY",
     "GT_CLOUD_BUCKET_ID",
@@ -51,527 +71,230 @@ COMMON_TOKEN_PATTERNS = (
     re.compile(rb"gh[opsu]_[A-Za-z0-9]{30,}"),
     re.compile(rb"sk-[A-Za-z0-9_-]{20,}"),
 )
-RETIRED_SHARE_MARKER = b"".join((b"00", b".", b"CompSource"))
-RETIRED_USAGE_SYMBOLS = (
-    "USAGE_LEDGER_ROOT",
-    "USAGE_LOCAL_QUEUE_ROOT",
-    "_prepare_usage_tracking",
-    "_record_usage_task",
-    "_record_current_usage_status",
+FORBIDDEN_PACKAGE_POLICY_MARKERS = (
+    b"resources/policy/HMB_GP_Production_Rule",
 )
-RETIRED_DIRECT_PROVIDER_SYMBOLS = (
-    "ARK_API_KEY_SECRET",
-    "ARK_BASE_URL",
-    "CREATE_TASK_PATH",
-    "_process_direct_generation_impl",
-    "_refresh_direct_async",
+RETIRED_USAGE_MARKERS = (
+    b"00" + bytes((46,)) + b"CompSource",
+    b"USAGE_LEDGER_ROOT",
+    b"USAGE_LOCAL_QUEUE_ROOT",
+    b"USAGE_PRICE_CNY_PER_MILLION",
+    b"_prepare_usage_tracking",
+    b"_record_usage_task",
+    b"_record_current_usage_status",
+    b"_build_usage_event",
+    b"_flush_usage_queue",
+)
+RETIRED_DIRECT_PROVIDER_MARKERS = (
+    b"ARK_API_KEY_SECRET",
+    b"ARK_BASE_URL",
+    b"CREATE_TASK_PATH",
+    b"POST_REQUEST_TIMEOUT_SECONDS",
+    b"VolcengineAPIError",
+    b"_build_payload",
+    b"_get_api_key",
+    b"_provider_error_detail",
+    b"_network_error_phase",
+    b"_submission_diagnostic",
+    b"_refresh_direct_async",
+    b"_process_direct_generation_impl",
+    b"ark.cn-beijing.volces.com/api/v3/contents/generations/tasks",
 )
 
-for candidate in ROOT.rglob("*"):
-    if not candidate.is_file() or any(
-        part.casefold() in {".git", ".venv", "dist", "__pycache__", ".pytest_cache"}
-        for part in candidate.parts
-    ):
-        continue
-    assert RETIRED_SHARE_MARKER not in candidate.read_bytes(), candidate
+
+def load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-# GitHub main and Griptape's Git-backed updater are the permanent team rollout
-# channel. Visibility must never replace removing secrets from the source.
-readme_text = (ROOT / "README.md").read_text(encoding="utf-8")
-security_text = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
-assert "Public team Git repository" in readme_text
-assert "Git-backed Library updater" in readme_text
-assert "Do not replace the registered library directory" in readme_text
-assert "https://github.com/Honggooni/HMB_GP_Production.git" in readme_text
-assert "GitHub" in security_text
-assert "`main`" in security_text
-assert "Griptape Library" in security_text
-assert "Update" in security_text
-assert "CI" in security_text
-for forbidden_visibility_policy in (
-    "Private repository only",
-    "반드시\n**Private**",
-    "릴리스를 Private으로 유지",
-):
-    assert forbidden_visibility_policy not in readme_text
-    assert forbidden_visibility_policy not in security_text
+def zip_bytes(members: dict[str, bytes]) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in members.items():
+            archive.writestr(name, content)
+    return output.getvalue()
 
 
-def digest(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+def assert_forbidden_archive(encoded: bytes) -> None:
+    try:
+        builder.validate_no_policy_artifacts_in_zip(encoded)
+    except RuntimeError:
+        return
+    raise AssertionError("A policy artifact or policy document entered a release ZIP.")
 
 
-common_spec = importlib.util.spec_from_file_location(
-    "_hmb_public_release_policy_verifier",
-    ROOT / "_hmb_common.py",
+builder = load_module(
+    "_hmb_public_release_in_memory_builder",
+    ROOT / "resources" / "build_release.py",
 )
-assert common_spec is not None and common_spec.loader is not None
-common = importlib.util.module_from_spec(common_spec)
-common_spec.loader.exec_module(common)
+
+assert tuple(builder.SOURCE_FILES) == EXPECTED_SOURCE_FILES
+assert len(EXPECTED_SOURCE_FILES) == 25
+assert builder.RELEASE_LABEL == RELEASE_LABEL
+assert builder.RELEASE_VERSION == RELEASE_VERSION
+assert builder.ARCHIVE_NAME == "HMB_GP_Production.zip"
+assert builder.POLICY_VERSION == POLICY_VERSION
+assert builder.POLICY_CONTRACT_SHA256 == POLICY_CONTRACT_SHA256
+assert builder.POLICY_DELIVERY == "bundled"
+assert builder.POLICY_RELATIVE == POLICY_RELATIVE
+assert builder.POLICY_SHA256 == POLICY_SHA256
 
 manifest = json.loads(
     (ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8")
 )
-assert manifest["metadata"]["library_version"] == "0.5.74"
+sbom = json.loads((ROOT / "SBOM.spdx.json").read_text(encoding="utf-8"))
+changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 registered_secrets = manifest["settings"][0]["contents"]["secrets_to_register"]
 assert set(registered_secrets) == EXPECTED_SECRET_NAMES
 assert all(value == "" for value in registered_secrets.values())
-manifest_description = manifest["settings"][0]["description"]
-assert "one-time browser authorization" in manifest_description
-assert "CGTeamwork" not in manifest_description
-seedance_entries = [
-    item
-    for item in manifest["nodes"]
-    if item["metadata"]["display_name"] == "HMB Seedance Generation"
-]
-assert len(seedance_entries) == 1
-seedance_entry = seedance_entries[0]
-assert seedance_entry["class_name"] == "HMBSeedance20VideoGeneration"
-assert seedance_entry["file_path"] == "HMBSeedanceGeneration.py"
-assert not (ROOT / "HMBSeedance20VideoGeneration.py").exists()
-
-# The two full Seedance transport regressions require a live Griptape host. Keep
-# their critical output-macro boundary enforced in source-only CI as well:
-# normal generation and Refresh must both use the shared preflight, and only the
-# engine-assigned {_index} variable may be deferred until the write stage.
-seedance_source = (ROOT / "HMBSeedanceGeneration.py").read_text(
-    encoding="utf-8"
-)
-assert RETIRED_SHARE_MARKER not in seedance_source.encode("utf-8")
-assert all(symbol not in seedance_source for symbol in RETIRED_USAGE_SYMBOLS)
-assert all(symbol not in seedance_source for symbol in RETIRED_DIRECT_PROVIDER_SYMBOLS)
-seedance_tree = ast.parse(seedance_source, filename="HMBSeedanceGeneration.py")
-seedance_class = next(
-    node
-    for node in seedance_tree.body
-    if isinstance(node, ast.ClassDef)
-    and node.name == "HMBSeedanceGeneration"
-)
-legacy_seedance_class = next(
-    node
-    for node in seedance_tree.body
-    if isinstance(node, ast.ClassDef)
-    and node.name == "HMBSeedance20VideoGeneration"
-)
-assert len(legacy_seedance_class.bases) == 1
-assert isinstance(legacy_seedance_class.bases[0], ast.Name)
-assert legacy_seedance_class.bases[0].id == "HMBSeedanceGeneration"
-assert not any(
-    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    for node in legacy_seedance_class.body
-), "The saved-workflow compatibility wrapper must not override behavior."
-seedance_methods = {
-    node.name: node
-    for node in seedance_class.body
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-}
-preflight_method = seedance_methods["_preflight_output_destination"]
-preflight_source = ast.get_source_segment(seedance_source, preflight_method) or ""
-assert 'marker = "missing required variables:"' in preflight_source
-assert 'if missing != {"_index"}:' in preflight_source
-assert sum(
-    isinstance(node, ast.Call)
-    and isinstance(node.func, ast.Attribute)
-    and node.func.attr == "resolve"
-    for node in ast.walk(preflight_method)
-) == 1
-for execution_method_name in ("_refresh_async", "_process_generation_impl"):
-    execution_method = seedance_methods[execution_method_name]
-    assert sum(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_preflight_output_destination"
-        for node in ast.walk(execution_method)
-    ) == 1
-    assert not any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "resolve"
-        for node in ast.walk(execution_method)
-    )
-
-# Keep the API SERVER durable-job contract enforced on public CI without
-# importing the host-only griptape_nodes runtime.
-assert "CGTeamwork" not in seedance_source
-module_functions = {
-    node.name: node
-    for node in seedance_tree.body
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-}
-module_assignments = {
-    node.targets[0].id: node.value
-    for node in seedance_tree.body
-    if (
-        isinstance(node, ast.Assign)
-        and len(node.targets) == 1
-        and isinstance(node.targets[0], ast.Name)
-    )
-}
-
-# Public CI cannot import the Griptape-hosted generator, so keep the Broker
-# transport boundary enforceable from its AST. Broker traffic must bypass
-# machine proxy discovery locally; no global opener or environment mutation is
-# permitted, and non-Broker internet clients remain untouched.
-opener_factory = module_functions["_broker_build_opener"]
-opener_factory_source = (
-    ast.get_source_segment(seedance_source, opener_factory) or ""
-)
-assert "os.environ" not in opener_factory_source
-assert "getproxies" not in opener_factory_source
-build_opener_calls = [
-    node
-    for node in ast.walk(seedance_tree)
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "build_opener"
-    )
-]
-assert len(build_opener_calls) == 1
+assert sbom["name"] == f"HMB_GP_Production-{RELEASE_VERSION}"
+assert sbom["documentNamespace"].endswith(f"/{RELEASE_VERSION}")
+assert next(
+    item for item in sbom["packages"]
+    if item["SPDXID"] == "SPDXRef-HMB-GP-Production"
+)["versionInfo"] == RELEASE_VERSION
 assert (
-    opener_factory.lineno
-    <= build_opener_calls[0].lineno
-    <= opener_factory.end_lineno
+    f"## `{RELEASE_LABEL}` (technical version `{RELEASE_VERSION}`) — Unreleased"
+    in changelog
 )
-proxy_handlers = [
-    argument
-    for argument in build_opener_calls[0].args
-    if (
-        isinstance(argument, ast.Call)
-        and isinstance(argument.func, ast.Attribute)
-        and argument.func.attr == "ProxyHandler"
-    )
-]
-assert len(proxy_handlers) == 1
-assert len(proxy_handlers[0].args) == 1
-assert isinstance(proxy_handlers[0].args[0], ast.Dict)
-assert proxy_handlers[0].args[0].keys == []
-assert proxy_handlers[0].args[0].values == []
-assert any(
-    isinstance(argument, ast.Call)
-    and isinstance(argument.func, ast.Name)
-    and argument.func.id == "_BrokerNoRedirectHandler"
-    for argument in build_opener_calls[0].args
-)
-assert not any(
-    isinstance(node, ast.Call)
-    and isinstance(node.func, ast.Attribute)
-    and node.func.attr == "install_opener"
-    for node in ast.walk(seedance_tree)
-)
-factory_calls = [
-    node
-    for node in ast.walk(seedance_tree)
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "_broker_build_opener"
-    )
-]
-assert len(factory_calls) == 2
 
-assert ast.literal_eval(
-    module_assignments["AI_BROKER_DEVICE_START_BACKOFF_SECONDS"]
-) == (0.0, 0.5, 1.5)
-assert ast.literal_eval(
-    module_assignments[
-        "AI_BROKER_DEVICE_POLL_MAX_CONSECUTIVE_TRANSPORT_ERRORS"
-    ]
-) == 3
+release_version, records = builder.validate_sources()
+record_paths = tuple(str(record["path"]) for record in records)
+assert record_paths == EXPECTED_SOURCE_FILES
+assert len(records) == len(EXPECTED_SOURCE_FILES)
+assert release_version == manifest["metadata"]["library_version"]
+assert release_version == RELEASE_VERSION
+record_by_path = {str(record["path"]): record for record in records}
+assert set(record_by_path) == set(EXPECTED_SOURCE_FILES)
+assert record_by_path[POLICY_RELATIVE]["sha256"] == POLICY_SHA256
 
-device_login_source = (
-    ast.get_source_segment(seedance_source, module_functions["_broker_device_login"])
-    or ""
-)
-for endpoint in ('"/api/device/start"', '"/api/device/token"'):
-    assert endpoint in device_login_source
-assert device_login_source.count('server_url + "/api/device/start"') == 1
-assert device_login_source.count("webbrowser.open(") == 1
-assert device_login_source.count("_broker_build_opener()") == 1
-assert "AI_BROKER_DEVICE_START_BACKOFF_SECONDS" in device_login_source
-assert "AI_BROKER_DEVICE_POLL_MAX_CONSECUTIVE_TRANSPORT_ERRORS" in (
-    device_login_source
-)
-assert 'stage="device_start"' in device_login_source
-assert 'stage="device_token_poll"' in device_login_source
-assert "consecutive_transport_errors = 0" in device_login_source
-assert "data=token_payload" in device_login_source
-assert "_broker_clear_token" not in device_login_source
-assert "_broker_same_origin(verification_url, server_url)" in device_login_source
-assert "_broker_save_token(access_token)" in device_login_source
-
-start_retry_loop = next(
-    node
-    for node in module_functions["_broker_device_login"].body
-    if isinstance(node, ast.For)
-    and "AI_BROKER_DEVICE_START_BACKOFF_SECONDS"
-    in (ast.get_source_segment(seedance_source, node) or "")
-)
-assert any(isinstance(node, ast.Break) for node in ast.walk(start_retry_loop))
-browser_open_call = next(
-    node
-    for node in ast.walk(module_functions["_broker_device_login"])
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "open"
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "webbrowser"
-    )
-)
-assert browser_open_call.lineno > start_retry_loop.end_lineno
-token_poll_loop = next(
-    node
-    for node in module_functions["_broker_device_login"].body
-    if isinstance(node, ast.While)
-)
-assert browser_open_call.lineno < token_poll_loop.lineno
-
-token_path_source = (
-    ast.get_source_segment(seedance_source, module_functions["_broker_token_path"])
-    or ""
-)
-assert '"FNAIBroker"' in token_path_source
-assert '"access_token_v2.dpapi"' in token_path_source
-
-transport_log_source = (
-    ast.get_source_segment(
-        seedance_source, module_functions["_broker_log_transport_error"]
-    )
-    or ""
-)
-for safe_field in (
-    "stage=%s",
-    "attempt=%d",
-    "exception=%s",
-    "reason=%s",
-    "errno=%s",
-    "winerror=%s",
-    "host=%s",
-    "port=%d",
-):
-    assert safe_field in transport_log_source
-for forbidden_log_value in (
-    "Authorization",
-    "access_token",
-    "device_secret",
-    "response_body",
-    "proxy_password",
-):
-    assert forbidden_log_value not in transport_log_source
-assert "type(exc).__name__" in transport_log_source
-assert "type(reason).__name__" in transport_log_source
-
-broker_class = next(
-    node
-    for node in seedance_tree.body
-    if isinstance(node, ast.ClassDef) and node.name == "_HMBAIBrokerBridge"
-)
-broker_methods = {
-    node.name: node
-    for node in broker_class.body
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-}
-broker_init_source = (
-    ast.get_source_segment(seedance_source, broker_methods["__init__"]) or ""
-)
-assert broker_init_source.count("_broker_build_opener()") == 1
-request_source = ast.get_source_segment(
-    seedance_source, broker_methods["_request_json"]
-) or ""
-assert 'headers["Idempotency-Key"] = idempotency_key' in request_source
-assert "exc.code == 410 and not submission" in request_source
-assert "BROKER_EXPIRED_STATUSES" in request_source
-account_source = ast.get_source_segment(
-    seedance_source, broker_methods["account_snapshot"]
-) or ""
-assert '"GET", "/api/me"' in account_source
-assert account_source.index('"GET", "/api/me"') < account_source.index(
-    "_broker_device_login()"
-)
-assert request_source.count("_broker_clear_token()") == 1
-assert "if exc.code == 401:" in request_source
-transport_handler_source = next(
-    ast.get_source_segment(seedance_source, handler) or ""
-    for node in ast.walk(broker_methods["_request_json"])
-    if isinstance(node, ast.Try)
-    for handler in node.handlers
-    if "TimeoutError" in (ast.get_source_segment(seedance_source, handler) or "")
-)
-assert "_broker_clear_token" not in transport_handler_source
-generate_source = ast.get_source_segment(
-    seedance_source, broker_methods["generate_seedance"]
-) or ""
-assert '"/api/v1/generate/video"' in generate_source
-assert "idempotency_key=client_request_id" in generate_source
-assert generate_source.count("self._request_json(") == 1
-assert "_broker_device_login" not in generate_source
-refresh_job_source = ast.get_source_segment(
-    seedance_source, broker_methods["refresh_job"]
-) or ""
-assert '"/api/v1/jobs/"' in refresh_job_source
-
-process_source = ast.get_source_segment(
-    seedance_source, seedance_methods["_process_generation_impl"]
-) or ""
-assert "_ensure_broker_connected" in process_source
-assert "_get_api_key" not in process_source
-assert 'payload["client_request_id"] = client_request_id' in process_source
-refresh_source = ast.get_source_segment(
-    seedance_source, seedance_methods["_refresh_async"]
-) or ""
-for recovery_marker in (
-    "retry_same_request",
-    'retry_payload.get("client_request_id") == generation_id',
-    "bridge.generate_seedance",
-):
-    assert recovery_marker in refresh_source
-download_source = ast.get_source_segment(
-    seedance_source, seedance_methods["_download_broker_video"]
-) or ""
-assert "bridge.is_trusted_broker_url(url)" in download_source
-assert "bridge.download_trusted_result" in download_source
-assert "return await self._download_video(url)" in download_source
-
-source_policy_path = ROOT / Path(POLICY_RELATIVE)
-source_policy = source_policy_path.read_bytes()
-assert digest(source_policy) == POLICY_SHA256
-assert common._AGENT_POLICY_VERSION == POLICY_VERSION
-assert common._AGENT_POLICY_CONTRACT_SHA256 == POLICY_CONTRACT_SHA256
-assert common._AGENT_POLICY_SIGNING_KEY_ID == POLICY_SIGNING_KEY_ID
-assert Path(common._BUNDLED_AGENT_POLICY_FILE).resolve() == source_policy_path.resolve()
-assert common._read_agent_policy_envelope() == source_policy
-source_payload = common._decode_signed_agent_policy_envelope(source_policy)
-common._validate_agent_policy_payload(source_payload)
-assert source_payload["final_policy_version"] == POLICY_VERSION
-assert source_payload["final_motion_look_policy_sha256"] == POLICY_CONTRACT_SHA256
+first_archive = builder.make_archive(records)
+second_archive = builder.make_archive(records)
+assert first_archive == second_archive
+builder.validate_archive(first_archive, records)
+assert builder.module_string_constant(
+    ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_CANDIDATE_VERSION"
+) == "2026-08-11.agent-shot-quality.v4.1"
+assert builder.module_string_constant(
+    ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_CANDIDATE_CONTRACT_SHA256"
+) == POLICY_CONTRACT_SHA256
+assert builder.module_string_constant(
+    ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_CANDIDATE_STATUS"
+) == "active"
+check_result = builder.check()
+assert check_result["validated"] is True
+assert check_result["policy_delivery"] == "bundled"
+assert check_result["policy_version"] == POLICY_VERSION
+assert check_result["policy_contract_sha256"] == POLICY_CONTRACT_SHA256
+assert check_result["release_label"] == RELEASE_LABEL
+assert check_result["release_version"] == RELEASE_VERSION
 
 configured_secret_values = tuple(
     value.encode("utf-8")
     for name in EXPECTED_SECRET_NAMES
     if len(value := os.environ.get(name, "")) >= 8
 )
-source_policy_path_bytes = str(source_policy_path.resolve()).encode("utf-8")
 
-# A clean checkout has no generated dist directory. Validate the immutable
-# source boundary in that mode, and additionally validate every release output
-# whenever a complete local build is present.
-release_outputs = (RELEASE_MANIFEST, RELEASE_ARCHIVE, RELEASE_CHECKSUMS)
-output_presence = tuple(path.is_file() for path in release_outputs)
-assert not any(output_presence) or all(output_presence), (
-    "Release outputs must be either absent or present as a complete set."
+with zipfile.ZipFile(io.BytesIO(first_archive), "r") as archive:
+    infos = archive.infolist()
+    assert len(infos) == len(EXPECTED_SOURCE_FILES)
+    assert archive.testzip() is None
+    expected_names = [
+        f"{builder.ARCHIVE_ROOT}/{relative}" for relative in EXPECTED_SOURCE_FILES
+    ]
+    assert [info.filename for info in infos] == expected_names
+    dat_members = [
+        info for info in infos
+        if PurePosixPath(info.filename).suffix.casefold() == ".dat"
+    ]
+    assert [info.filename for info in dat_members] == [
+        f"{builder.ARCHIVE_ROOT}/{POLICY_RELATIVE}"
+    ]
+    assert builder.digest(archive.read(dat_members[0])) == POLICY_SHA256
+
+    for info in infos:
+        member = PurePosixPath(info.filename)
+        lowered = info.filename.casefold()
+        relative = member.relative_to(builder.ARCHIVE_ROOT).as_posix()
+        if relative != POLICY_RELATIVE:
+            assert member.suffix.casefold() != ".dat"
+            assert "/resources/agent/" not in f"/{lowered}"
+        assert member.suffix.casefold() not in FORBIDDEN_SUFFIXES
+        assert "/resources/policy/" not in f"/{lowered}"
+        assert "/policies/" not in f"/{lowered}"
+        assert not re.search(
+            r"(^|/)(?:credentials|secrets)[^/]*\.json$",
+            lowered,
+        )
+        assert not re.search(r"(^|/)(?:id_rsa|id_ed25519)[^/]*$", lowered)
+        content = archive.read(info)
+        assert content == record_by_path[relative]["data"]
+        assert PRIVATE_KEY_HEADER.search(content) is None
+        assert not any(pattern.search(content) for pattern in COMMON_TOKEN_PATTERNS)
+        assert not any(secret in content for secret in configured_secret_values)
+        assert not any(marker in content for marker in FORBIDDEN_PACKAGE_POLICY_MARKERS)
+        assert not any(marker in content for marker in RETIRED_USAGE_MARKERS)
+        assert not any(marker in content for marker in RETIRED_DIRECT_PROVIDER_MARKERS)
+
+# Exactly one direct signed data file is allowed. English/Korean policy documents
+# and additional or nested .dat artifacts remain forbidden.
+safe_nested = zip_bytes({"docs/readme.txt": b"safe"})
+builder.validate_no_policy_artifacts_in_zip(
+    zip_bytes({"package/safe.zip": safe_nested})
 )
-archive_verified = False
-if all(output_presence):
-    release_manifest_bytes = RELEASE_MANIFEST.read_bytes()
-    release_manifest = json.loads(release_manifest_bytes.decode("utf-8"))
-    agent_policy = release_manifest["agent_policy"]
-    assert agent_policy == {
-        "bundled": True,
-        "bundled_path": POLICY_RELATIVE,
-        "contract_sha256": POLICY_CONTRACT_SHA256,
-        "envelope_schema": "hmb-agent-policy-envelope-v3",
-        "envelope_sha256": POLICY_SHA256,
-        "maximum_decompressed_bytes": 512 * 1024,
-        "maximum_envelope_bytes": 128 * 1024,
-        "policy_version": POLICY_VERSION,
-        "resolution_order": ["bundled"],
-        "signature_algorithm": "RSASSA-PKCS1-v1_5-SHA256",
-        "signing_key_id": POLICY_SIGNING_KEY_ID,
-        "validated": True,
-    }
-    assert release_manifest["release_version"] == "0.5.74"
-    assert release_manifest["policy_version"] == POLICY_VERSION
-    assert release_manifest["contract_sha256"] == POLICY_CONTRACT_SHA256
-    source_files = {
-        str(item["path"]): item for item in release_manifest["source_files"]
-    }
-    assert len(source_files) == 26
-    assert source_files[POLICY_RELATIVE]["sha256"] == POLICY_SHA256
-    assert POLICY_SEMANTIC_REGRESSION_RELATIVE in source_files
-    assert source_files[POLICY_SEMANTIC_REGRESSION_RELATIVE]["sha256"] == digest(
-        (ROOT / POLICY_SEMANTIC_REGRESSION_RELATIVE).read_bytes()
-    )
-    assert "CHANGELOG.md" not in source_files
-    assert "resources/build_release.py" not in source_files
-    assert not any(
-        PurePosixPath(path).name.casefold() == "build_release.py"
-        for path in source_files
-    )
-    assert source_policy_path_bytes not in release_manifest_bytes
-
-    archive_names = [str(item["name"]) for item in release_manifest["archives"]]
-    assert archive_names == [RELEASE_ARCHIVE.name]
-    with zipfile.ZipFile(RELEASE_ARCHIVE, "r") as archive:
-        infos = archive.infolist()
-        assert len(infos) == 26
-        assert not archive.testzip()
-        expected_policy_member = f"HMB_GP_Production/{POLICY_RELATIVE}"
-        expected_semantic_regression_member = (
-            f"HMB_GP_Production/{POLICY_SEMANTIC_REGRESSION_RELATIVE}"
-        )
-        assert expected_semantic_regression_member in {
-            info.filename for info in infos
-        }
-        dat_members = [
-            info.filename
-            for info in infos
-            if PurePosixPath(info.filename).suffix.casefold() == ".dat"
-        ]
-        assert dat_members == [expected_policy_member]
-        assert "HMB_GP_Production/CHANGELOG.md" not in {
-            info.filename for info in infos
-        }
-        assert not any(
-            PurePosixPath(info.filename).name.casefold() == "build_release.py"
-            for info in infos
-        )
-        for info in infos:
-            member = PurePosixPath(info.filename)
-            lowered = info.filename.casefold()
-            assert member.suffix.casefold() not in FORBIDDEN_SUFFIXES
-            if "/resources/agent/" in f"/{lowered}":
-                assert info.filename == expected_policy_member
-            assert not re.search(
-                r"(^|/)(?:credentials|secrets)[^/]*\.json$",
-                lowered,
+assert_forbidden_archive(zip_bytes({"package/hmb_agent_core.dat": b"sealed"}))
+builder.assert_release_member_allowed(
+    PurePosixPath(POLICY_RELATIVE),
+    allow_bundled_policy=True,
+)
+try:
+    builder.assert_release_member_allowed(PurePosixPath(POLICY_RELATIVE))
+except RuntimeError:
+    pass
+else:
+    raise AssertionError("The generic boundary accepted an unapproved .dat record.")
+assert_forbidden_archive(
+    zip_bytes(
+        {
+            "package/library.zip": zip_bytes(
+                {"HMB_GP_Production/resources/agent/hmb_agent_core.dat": b"sealed"}
             )
-            assert not re.search(r"(^|/)(?:id_rsa|id_ed25519)[^/]*$", lowered)
-            content = archive.read(info)
-            relative = info.filename.removeprefix("HMB_GP_Production/")
-            assert content == (ROOT / Path(relative)).read_bytes(), (
-                f"Archive member is stale: {relative}"
+        }
+    )
+)
+assert_forbidden_archive(
+    zip_bytes(
+        {
+            "package/library.zip": zip_bytes(
+                {"policies/HMB_Agent_Policies_8_KO.txt": b"review"}
             )
-            assert RETIRED_SHARE_MARKER not in content
-            assert PRIVATE_KEY_HEADER.search(content) is None
-            assert not any(pattern.search(content) for pattern in COMMON_TOKEN_PATTERNS)
-            assert not any(secret in content for secret in configured_secret_values)
-            assert source_policy_path_bytes not in content
-        archived_policy = archive.read(expected_policy_member)
-        assert archived_policy == source_policy
-        assert digest(archived_policy) == POLICY_SHA256
-        archived_payload = common._decode_signed_agent_policy_envelope(
-            archived_policy
-        )
-        common._validate_agent_policy_payload(archived_payload)
-        assert archived_payload["final_policy_version"] == POLICY_VERSION
-        assert (
-            archived_payload["final_motion_look_policy_sha256"]
-            == POLICY_CONTRACT_SHA256
-        )
+        }
+    )
+)
+assert_forbidden_archive(
+    zip_bytes({"resources/policy/canonical/HMB_Agent_Policies_8_EN.txt": b"source"})
+)
+assert_forbidden_archive(zip_bytes({"package/policy/canonical.txt": b"source"}))
+assert_forbidden_archive(zip_bytes({"HMB_Agent_Policies_8_EN.txt": b"source"}))
+assert_forbidden_archive(zip_bytes({"HMB_Agent_Policy.txt": b"source"}))
+assert_forbidden_archive(
+    zip_bytes(
+        {
+            "package/library.zip": zip_bytes(
+                {"HMB_Agent_Policies_8_EN.txt": b"source"}
+            )
+        }
+    )
+)
 
-    checksum_records = {}
-    for line in RELEASE_CHECKSUMS.read_text(encoding="utf-8").splitlines():
-        expected_hash, filename = line.split("  ", 1)
-        checksum_records[filename] = expected_hash
-    assert set(checksum_records) == {
-        RELEASE_ARCHIVE.name,
-        RELEASE_MANIFEST.name,
-    }
-    for filename, expected_hash in checksum_records.items():
-        assert digest((DIST / filename).read_bytes()) == expected_hash
-    archive_verified = True
+gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+assert "resources/agent/" in gitignore
+assert "resources/policy/" in gitignore
+assert "policies/" in gitignore
+assert "**/hmb_agent_core.dat" in gitignore
+assert "!resources/agent/hmb_agent_core.dat" in gitignore
 
-mode = "source and 26-file archive" if archive_verified else "source-only"
-print(f"HMB bundled-policy release/credential boundary regression: PASS ({mode})")
+print("HMB in-memory bundled-policy release/credential boundary regression: PASS")

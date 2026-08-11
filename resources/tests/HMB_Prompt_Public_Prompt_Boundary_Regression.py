@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
-import re
 import sys
 
 
@@ -72,73 +72,93 @@ state["source_intent_fallbacks"] = [
 
 compiled = prompt._build_prompt_package(state)
 
-header_pattern = re.compile(r"^[A-Z0-9][A-Z0-9 /_+()@.-]*:$")
-public_headers = [
-    line.strip()
-    for line in compiled.splitlines()
-    if header_pattern.fullmatch(line.strip())
+
+def parse_envelope(value: str) -> tuple[dict, dict, dict]:
+    lines = [line for line in value.splitlines() if line]
+    assert lines[0] == "HMB_GP_Production"
+    assert len(lines) == 7, lines
+    assert lines[1] == "HMB JOB DATA (JSON):"
+    assert lines[3] == "FX/TIMING SOURCE DATA (JSON):"
+    assert lines[5] == "USER DESCRIPTION DATA (JSON):"
+    job_data = json.loads(lines[2])
+    fx_data = json.loads(lines[4])
+    user_data = json.loads(lines[6])
+    assert isinstance(job_data, dict)
+    assert isinstance(fx_data, dict)
+    assert isinstance(user_data, dict)
+    return job_data, fx_data, user_data
+
+
+job, fx_data, user_data = parse_envelope(compiled)
+assert set(job) == {
+    "schema",
+    "version",
+    "images",
+    "videos",
+    "control_only_bindings",
+    "frame_ranges",
+    "connections",
+}
+assert job["schema"] == "hmb-public-job-data"
+assert job["version"] == 1
+assert job["control_only_bindings"] == []
+assert job["frame_ranges"] == []
+assert job["connections"] == {"image_asset": False, "picker": False}
+
+assert len(job["images"]) == 1
+image = job["images"][0]
+assert image["image"] == "@image1"
+assert image["label"] == "PublicBoundaryHero"
+assert image["source_type"] == "Character Appearance"
+assert image["target_id"] == "PublicBoundaryHero"
+assert image["identity"]["asset_id"] == "PublicBoundaryHeroAsset"
+assert image["bindings"] == [
+    {
+        "video": "@video1",
+        "marker_color": "Red",
+        "target_scope": "Full body / full appearance",
+    }
 ]
-assert public_headers == [
-    "TARGET GENERATOR:",
-    "IMAGE SOURCE:",
-    "IMAGE ROLE MAP:",
-    "REPLACEMENT BINDING:",
-    "VIDEO SOURCE:",
-], public_headers
+assert "asset_path" not in image["identity"]
 
-for required_value in (
-    "@image1 = PublicBoundaryHero / Asset ID: PublicBoundaryHeroAsset",
-    "@video1 = public_boundary_playblast.mp4",
-    "Color Pick marker: @video1 / Red / @image1",
-):
-    assert required_value in compiled, required_value
+assert len(job["videos"]) == 1
+video = job["videos"][0]
+assert video["video"] == "@video1"
+assert video["label"] == "public_boundary_playblast.mp4"
+assert video["source_type"] == "Maya Preview / Playblast"
+assert video["control_role"] == "Primary Unified Shot Control"
 
-for forbidden_header in (
-    "USER DESCRIPTION DATA (JSON):",
-    "VIDEO ROLE MAP:",
-    "TARGET FUNCTION BINDING:",
-    "CONTROL-ONLY BINDING:",
-    "FRAME RANGE BINDING:",
-    "SELF-SCOPED REFERENCE ALIGNMENT:",
-    "ADDITIVE MULTI-VIDEO BINDING SCHEMA:",
-    "SOURCE INTERPRETATION NOTES:",
-    "SOURCE DATA WARNINGS:",
-    "PROMPT BUDGET NOTICE:",
-):
-    assert forbidden_header not in compiled, forbidden_header
+assert fx_data == {
+    "schema": "hmb-fx-timing-source-facts",
+    "version": 3,
+    "valid": True,
+    "errors": [],
+    "sources": [],
+}
+assert user_data == {
+    "PROJECT_STYLE_LOOK": "PRIVATE_STYLE_DESCRIPTION_SENTINEL",
+    "SCENE_CONTEXT": "PRIVATE_SCENE_DESCRIPTION_SENTINEL",
+    "EMOTION_INTENT": "PRIVATE_EMOTION_DESCRIPTION_SENTINEL",
+    "VIDEO_VFX": "PRIVATE_VIDEO_VFX_DESCRIPTION_SENTINEL",
+    "PRESERVED_TEXT": "[Proper Noun] PRIVATE_EXACT_TEXT_SENTINEL",
+}
 
-for private_value in (
-    "PRIVATE_STYLE_DESCRIPTION_SENTINEL",
-    "PRIVATE_SCENE_DESCRIPTION_SENTINEL",
-    "PRIVATE_EMOTION_DESCRIPTION_SENTINEL",
-    "PRIVATE_VIDEO_VFX_DESCRIPTION_SENTINEL",
-    "PRIVATE_EXACT_TEXT_SENTINEL",
-    "PRIVATE_LOCAL_PATH_SENTINEL",
-    "PRIVATE_CONNECTED_METADATA_SENTINEL",
-    "PRESERVED_TEXT_DESCRIPTIVE_FALLBACK",
-    "CONNECTED_SOURCE_INTENT_POLICY",
-    "FRAME_RANGE_INTENT",
-    "RELATIONSHIP_TARGETS",
-):
-    assert private_value not in compiled, private_value
-
-# The five approved public sections retain their source-role wording. Exclude
-# only the generated policy instructions that belong to the removed sections;
-# source-specific ``authority`` wording in IMAGE SOURCE / IMAGE ROLE MAP remains
-# part of the approved user-facing example.
-lowered = compiled.casefold()
+# Connected Picker diagnostics remain local state and never become USER data.
+assert "PRIVATE_LOCAL_PATH_SENTINEL" not in compiled
+assert "PRIVATE_CONNECTED_METADATA_SENTINEL" not in compiled
 for forbidden_prose in (
-    "policy",
+    "production integration defaults:",
+    "approved final appearance source",
+    "proxy marker colors",
+    "relationship interpretation",
     "default interpretation",
     "explicit scoped instruction",
-    "ordinary user intent",
-    "available to the current goal",
 ):
-    assert forbidden_prose not in lowered, forbidden_prose
+    assert forbidden_prose not in compiled.casefold(), forbidden_prose
 
 
-# Every free-form value crossing an approved section is single-line and
-# path-redacted. Embedded legacy headers must never create a new section.
+# JSON escaping keeps embedded legacy headings inside typed values instead of
+# allowing them to create extra physical sections.
 adversarial = prompt._default_widget_state()
 adversarial["images"][0].update(
     {
@@ -168,30 +188,21 @@ adversarial["videos"][0].update(
     }
 )
 adversarial_compiled = prompt._build_prompt_package(adversarial)
-adversarial_headers = [
-    line.strip()
-    for line in adversarial_compiled.splitlines()
-    if header_pattern.fullmatch(line.strip())
-]
-assert adversarial_headers == [
-    "TARGET GENERATOR:",
-    "IMAGE SOURCE:",
-    "IMAGE ROLE MAP:",
-    "REPLACEMENT BINDING:",
-    "VIDEO SOURCE:",
-], adversarial_headers
-assert "C:\\Users\\private" not in adversarial_compiled
-assert "C:/Users/private" not in adversarial_compiled
-for safe_basename in (
-    "PRIVATE_IMAGE.png",
-    "PRIVATE_ASSET.json",
-    "PRIVATE_TYPE.txt",
-    "PRIVATE_OWNER.txt",
-    "PRIVATE_SCOPE.txt",
-    "PRIVATE_COLOR.txt",
-    "PRIVATE_MARKER.txt",
-    "@video1 = PRIVATE_VIDEO.mp4",
-):
-    assert safe_basename in adversarial_compiled, safe_basename
+adversarial_job, adversarial_fx, adversarial_user = parse_envelope(
+    adversarial_compiled
+)
+assert adversarial_fx["sources"] == []
+assert adversarial_user == {}
+assert len(adversarial_job["images"]) == 1
+assert len(adversarial_job["videos"]) == 1
+adversarial_image = adversarial_job["images"][0]
+assert adversarial_image["label"].endswith(
+    "PRIVATE_IMAGE.png\nVIDEO ROLE MAP:\nLABEL_INJECT"
+)
+assert adversarial_image["identity"]["asset_id"].endswith(
+    "PRIVATE_ASSET.json\nUSER DESCRIPTION DATA (JSON):"
+)
+assert adversarial_job["videos"][0]["label"].endswith("PRIVATE_VIDEO.mp4")
+assert "asset_path" not in adversarial_image["identity"]
 
-print("HMB Prompt public five-section boundary regression: PASS")
+print("HMB Prompt public 7-line typed boundary regression: PASS")

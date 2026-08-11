@@ -289,8 +289,41 @@ assert motion_row["picker_motion_guide_summary"] == {
     "raw_curve_geometry_rendered": False,
 }
 compiled_prompt = prompt._build_prompt_package(applied)
-assert "@video1 = color" in compiled_prompt
-assert "@video2 = motion" in compiled_prompt
+compiled_lines = compiled_prompt.splitlines()
+assert len(compiled_lines) == 7
+assert compiled_lines[0] == "HMB_GP_Production"
+assert compiled_lines[1] == prompt.PUBLIC_JOB_CONTRACT_HEADER
+assert compiled_lines[3] == prompt.FX_TIMING_CONTRACT_HEADER
+assert compiled_lines[5] == prompt.USER_DESCRIPTION_DATA_HEADER
+
+compiled_job = json.loads(compiled_lines[2])
+compiled_fx = json.loads(compiled_lines[4])
+compiled_user = json.loads(compiled_lines[6])
+assert compiled_job["schema"] == prompt.PUBLIC_JOB_CONTRACT_SCHEMA
+assert compiled_job["version"] == prompt.PUBLIC_JOB_CONTRACT_VERSION
+compiled_videos = {item["video"]: item for item in compiled_job["videos"]}
+assert set(compiled_videos) == {"@video1", "@video2"}
+assert compiled_videos["@video1"]["label"] == "color"
+assert compiled_videos["@video1"]["source_type"] == "Maya Preview / Playblast"
+assert compiled_videos["@video2"]["label"] == "motion"
+assert compiled_videos["@video2"]["source_type"] == (
+    "Motion Guide / Retargeting Reference"
+)
+assert compiled_videos["@video2"]["control_role"] == (
+    "Derived Motion Decoding Only"
+)
+assert compiled_videos["@video2"]["companion"] == {
+    "kind": "motion_guide",
+    "source_slot": 1,
+    "source_uid": "motion-regression-color",
+    "validated": True,
+}
+assert compiled_job["connections"] == {"image_asset": False, "picker": True}
+assert compiled_fx["schema"] == prompt.FX_TIMING_CONTRACT_SCHEMA
+assert compiled_fx["version"] == prompt.FX_TIMING_CONTRACT_VERSION
+assert compiled_fx["valid"] is True
+assert compiled_fx["errors"] == []
+assert compiled_user == {}
 assert "verified semantic face summary" not in compiled_prompt
 assert "final Blend Shape channel(s)" not in compiled_prompt
 assert "raw NURBS curve geometry" not in compiled_prompt

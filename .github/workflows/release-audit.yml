@@ -34,26 +34,18 @@ jobs:
         shell: pwsh
         run: |
           $tracked = @(git ls-files)
-          $retiredShareMarker = "00" + "." + "CompSource"
-          $retiredShareMatches = @(git grep -n -I -F $retiredShareMarker -- .)
-          $retiredShareExitCode = $LASTEXITCODE
-          if ($retiredShareExitCode -gt 1) {
-            throw "Retired-share scan failed with git exit code $retiredShareExitCode."
-          }
-          $global:LASTEXITCODE = 0
-          if ($retiredShareMatches.Count -ne 0) {
-            throw "Retired Composite Team source-share references remain: $($retiredShareMatches -join ', ')"
-          }
           $bundledPolicy = "resources/agent/hmb_agent_core.dat"
-          $bundledPolicySha256 = "e46328be5f3bf9d0bc05d52b12cc6b14cc71b3125297d01efc2100e47276c914"
+          $bundledPolicySha256 = "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
           $forbidden = @($tracked | Where-Object {
             $_ -ne $bundledPolicy -and (
-              $_ -match '(^|/)(\.tmp|\.venv|backups|dist|GriptapeNodes|resources/agent|resources/policy)/' -or
-              $_ -match '\.dat$' -or
-              $_ -match '(^|/)\.env($|\.)' -or
-              $_ -match '(^|/)(credentials|secrets)[^/]*\.json$' -or
-              $_ -match '(^|/)(id_rsa|id_ed25519)[^/]*$' -or
-              $_ -match '\.(jwk|key|p12|pem|pfx|secret|token|zip)$'
+            $_ -match '(^|/)(\.tmp|\.venv|backups|dist|GriptapeNodes|resources/agent|resources/policy|policies?)/' -or
+            $_ -match '\.dat$' -or
+            $_ -match '(policy|policies).*(?:_ko(?:\.|$)|korean)' -or
+            $_ -match 'HMB_Agent_Policies.*\.txt$' -or
+            $_ -match '(^|/)\.env($|\.)' -or
+            $_ -match '(^|/)(credentials|secrets)[^/]*\.json$' -or
+            $_ -match '(^|/)(id_rsa|id_ed25519)[^/]*$' -or
+            $_ -match '\.(dat|jwk|key|p12|pem|pfx|secret|token|zip)$'
             )
           })
           if ($forbidden.Count -ne 0) {
@@ -74,19 +66,20 @@ jobs:
           HMB_IMAGE_PROJECTS_ROOT: ${{ github.workspace }}
         run: |
           # Live-host regressions run only on internal hosts configured with
-          # Griptape Nodes; signed-policy boundaries are verified below.
+          # Griptape Nodes; the bundled-policy package boundary is verified below.
           $tests = @(
             "HMB_Bundled_Policy_Boundary_Regression.py",
-            "HMB_Agent_Policy_Integration_Regression.py",
-            "HMB_V4_Policy_Semantics_Regression.py",
-            "HMB_Look_Attribute_Scope_Regression.py",
-            "HMB_Output_Sanitizer_Regression.py",
-            "HMB_Parent_Prompt_Agent_Contract_Regression.py",
+            "HMB_Data_Only_Prompt_Security_Regression.py",
+            "HMB_FX_Timing_Range_Contract_Regression.py",
+            "HMB_Four_Library_Generator_Neutrality_Regression.py",
             "HMB_State_Normalization_Property_Regression.py",
             "HMB_Image_Asset_Import_Order_Regression.py",
             "HMB_Image_Asset_Resolved_Selection_Regression.py",
+            "HMB_Hybrid_Composition_Regression.py",
+            "HMB_Independent_Binding_Video_Slots_Regression.py",
             "HMB_Prompt_No_Loss_Connection_Regression.py",
             "HMB_Prompt_Public_Prompt_Boundary_Regression.py",
+            "HMB_Prompt_UID_Companion_Alignment_Regression.py",
             "HMB_Image_Asset_Registration_Regression.py",
             "HMB_Image_Asset_Server_Sharing_Regression.py",
             "HMB_Image_Asset_Process_Lock_Regression.py",
@@ -116,15 +109,20 @@ jobs:
             node $_.FullName
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-      - name: Bundled policy release security regression
+      - name: Bundled-policy release security regression
         shell: pwsh
         run: |
+          python resources/build_release.py --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python resources/build_release.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $first = (Get-FileHash dist/HMB_GP_Production.zip -Algorithm SHA256).Hash
+          $firstManifest = (Get-FileHash dist/release-manifest.json -Algorithm SHA256).Hash
           python resources/build_release.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $second = (Get-FileHash dist/HMB_GP_Production.zip -Algorithm SHA256).Hash
+          $secondManifest = (Get-FileHash dist/release-manifest.json -Algorithm SHA256).Hash
           if ($first -ne $second) { throw "Release ZIP is not reproducible." }
+          if ($firstManifest -ne $secondManifest) { throw "Release manifest is not reproducible." }
           python resources/tests/HMB_Public_Release_Security_Regression.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

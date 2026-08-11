@@ -1,5 +1,29 @@
 # Changelog
 
+## `v0.6.01` (technical version `0.6.1`) — Unreleased
+
+- Preserve the complete `0.5.74` user-facing feature and UI contract while
+  distributing exactly one signed Agent runtime artifact with the Library at
+  `resources/agent/hmb_agent_core.dat`.
+- Keep `hmb_agent_core.dat` as a signed, compressed integrity artifact. A
+  each installed artifact is freshly verified for Agent execution; missing or
+  unsigned edits, schema or contract drift, and malformed Behavior 1/2
+  structures fail closed.
+- Upgrade Prompt-to-Agent transport to a closed data-only JOB/FX/USER envelope.
+  USER DESCRIPTION contains only the five fields directly authored in the
+  Prompt UI; connected transport metadata and policy prose are excluded.
+- Apply the reviewed v4.1 FX Reference, Timing/Edit, exact emitter point, and
+  Range ON contract internally without changing existing controls, ports,
+  defaults, layouts, or saved-state behavior.
+- Keep the four shared libraries generator-neutral and register only the final
+  `HMBSeedanceGeneration` module/class name.
+- Harden non-billable output preflight, cancellation handling, atomic MP4
+  publication, and bounded `ftyp`/`moov`/`mdat` validation without changing the
+  existing Generator UI or normal job flow.
+- Exclude every additional `.dat` and every English/Korean policy document from
+  GitHub release packages, including nested archives; Korean review files
+  remain local-only.
+
 ## 0.5.74 - 2026-08-11
 
 - Reduced `HMBPromptLibrary.PROMPT_OUT` to the five user-verifiable Target Generator, Image Source, Image Role, Replacement Binding, and Video Source sections. Internal interpretation, authority, alignment, and multi-video policy prose is no longer serialized; the signed Agent v4 policy remains unchanged and runtime-only.
@@ -526,7 +550,7 @@
 
 ## 0.5.0 - 2026-08-04
 
-- Upgraded the existing `HMBSeedance20VideoGeneration` node in place from a
+- Upgraded the existing HMB Seedance generator node in place from a
   Standard/BytePlus wrapper to the official Volcengine Ark asynchronous task
   API. The file, class, display name, and established HMB input/output names are
   retained, so no second generator node is introduced.
@@ -704,8 +728,8 @@
 
 ## 0.4.14 - 2026-08-03
 
-- Added `HMBSeedance20VideoGeneration`, a thin extension of the exact registered
-  Standard Library `Seedance20VideoGeneration`. The node replaces only the
+- Added the predecessor HMB video generator as a thin extension of the
+  registered Standard Library video-generation node. The node replaces only the
   editor-facing `reference_images` `ParameterList` with one compatible ordered
   `list[...]` input, allowing `HMBImageAssetLibrary` Video Generation Out to
   connect with a single wire.

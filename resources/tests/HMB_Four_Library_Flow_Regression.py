@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import importlib.util
 import json
 import os
@@ -10,11 +9,10 @@ import shutil
 import sys
 import tempfile
 
+from _hmb_private_policy_fixture import install_private_policy_reader
+
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_POLICY_VERSION = "2026-08-11.agent-shot-quality.v4"
-EXPECTED_CONTRACT_SHA256 = "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5"
-EXPECTED_POLICY_SHA256 = "e46328be5f3bf9d0bc05d52b12cc6b14cc71b3125297d01efc2100e47276c914"
 
 
 def load(filename: str, alias: str):
@@ -27,6 +25,13 @@ def load(filename: str, alias: str):
 
 
 common = load("_hmb_common", "hmb_four_flow_common")
+
+
+def prompt_json_section(payload: str, header: str):
+    lines = payload.splitlines()
+    assert lines[0] == "HMB_GP_Production"
+    assert len(lines) == 7
+    return json.loads(lines[lines.index(header) + 1])
 asset_library = load("HMBImageAssetLibrary", "hmb_four_flow_image_asset")
 prompt_library = load("HMBPromptLibrary", "hmb_four_flow_prompt")
 agent_library = load("HMBAgentLibrary", "hmb_four_flow_agent")
@@ -101,9 +106,16 @@ try:
     )
     assert hero["source_type"] == "Character Appearance"
     assert hero["scope_candidate"] == "Full body / full appearance"
-    assert hero["color_pick_candidates"] == (
+    expected_actor_color_candidates = (
         common.image_color_pick_choices_for_source_type("Character Appearance")
     )
+    assert expected_actor_color_candidates == (
+        common.ACTOR_COLOR_PICK_CHOICES + common.GHOST_COLOR_PICK_CHOICES
+    )
+    assert not set(expected_actor_color_candidates).intersection(
+        common.PATTERN_COLOR_PICK_CHOICES
+    )
+    assert hero["color_pick_candidates"] == expected_actor_color_candidates
     assert hero["registered"] is True
     assert background["source_type"] == "Environment / Background"
     assert background["scope_candidate"] == "Main background"
@@ -134,17 +146,19 @@ try:
             "selection_order": 1,
         }
     ]
-    assert "final creative authority" in output_payload["authority"][
-        "current_user_goal"
-    ].casefold()
-    assert output_payload["authority"]["optional_downstream_refinement"] == [
-        "Target",
-        "Color Pick",
+    assert "authority" not in output_payload
+    assert output_payload["authority_scope"]["schema"] == (
+        "hmb-image-source-authority-scope"
+    )
+    assert output_payload["authority_scope"]["downstream_binding_fields"] == [
+        "target",
+        "color_pick",
+        "image_source_frame_range",
     ]
-    assert "registered main type and image sub type" in output_payload["authority"][
-        "connection_policy"
-    ].casefold()
-    assert "prompt_final" not in output_payload["authority"]
+    assert output_payload["binding_contract"]["image_source_frame_range"] == {
+        "supported": True,
+        "enabled_by_default": False,
+    }
 
     tree = image_state["tree"]
     assert tree["kind"] == "root"
@@ -177,10 +191,17 @@ try:
     assert default_bound_row["binding_scopes"] == ["Full body / full appearance"]
     assert default_bound_row["scope"] == "Full body / full appearance"
     default_bound_prompt = prompt_library._build_prompt_package(default_bound_state)
-    assert (
-        "Hero Beauty / Approved final appearance source = @image1 / "
-        "Full body / full appearance"
-    ) in default_bound_prompt
+    default_bound_job = prompt_json_section(
+        default_bound_prompt,
+        "HMB JOB DATA (JSON):",
+    )
+    assert default_bound_job["images"][0]["target_id"] == "Hero Beauty"
+    assert default_bound_job["images"][0]["bindings"] == [{
+        "video": "@video1",
+        "marker_color": "",
+        "target_scope": "Full body / full appearance",
+    }]
+    assert default_bound_job["images"][0]["identity"]["asset_id"] == "HeroRig"
     default_bound_row["owner"] = ""
     default_bound_row["color_picks"] = ["Red", "Green"]
     cleared_target_state = prompt_library._apply_image_asset_payload(
@@ -241,9 +262,7 @@ try:
     assert prompt_row["scope"] == "Full body / full appearance"
     assert prompt_row["color_picks"] == ["Blue"]
     assert prompt_row["asset_scope_candidate"] == "Full body / full appearance"
-    assert prompt_row["asset_color_pick_candidates"] == (
-        common.image_color_pick_choices_for_source_type("Character Appearance")
-    )
+    assert prompt_row["asset_color_pick_candidates"] == expected_actor_color_candidates
 
     # Video Picker markers bind against the exact Asset ID even when Image Name
     # differs; legacy rows still fall back to Image Name.
@@ -258,25 +277,28 @@ try:
         set(),
     )
     compiled_prompt = prompt_library._build_prompt_package(prompt_state)
-    assert "@image1 = Hero Beauty / Asset ID: HeroRig" in compiled_prompt
-    assert (
-        "Hero Custom Target / Approved final appearance source = @image1 / "
-        "Full body / full appearance"
-    ) in compiled_prompt
+    compiled_job = prompt_json_section(compiled_prompt, "HMB JOB DATA (JSON):")
+    compiled_image = compiled_job["images"][0]
+    assert compiled_image["image"] == "@image1"
+    assert compiled_image["label"] == "Hero Beauty"
+    assert compiled_image["target_id"] == "Hero Custom Target"
+    assert compiled_image["identity"]["asset_id"] == "HeroRig"
+    assert compiled_image["bindings"] == [{
+        "video": "@video1",
+        "marker_color": "Blue",
+        "target_scope": "Full body / full appearance",
+    }]
 
     # The fourth stage receives its rules only through the signed Agent payload.
-    policy = agent_library.get_internal_policy_rules()
+    _original_policy_reader, sealed_policy = install_private_policy_reader(common)
+    policy, _binding = common._load_verified_behavior_documents()
     policy_identity = common.get_internal_policy_identity()
     assert policy
-    assert policy_identity == {
-        "version": EXPECTED_POLICY_VERSION,
-        "contract_sha256": EXPECTED_CONTRACT_SHA256,
-    }
-    bundled_policy_path = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
-    assert bundled_policy_path.is_file()
-    bundled_policy = bundled_policy_path.read_bytes()
-    assert hashlib.sha256(bundled_policy).hexdigest() == EXPECTED_POLICY_SHA256
-    assert policy.encode("utf-8") not in bundled_policy
+    assert len(policy_identity["contract_sha256"]) == 64
+    assert policy.encode("utf-8") not in sealed_policy
+    assert common._AGENT_POLICY_SERVER_UNC == (
+        r"\\FIN-RCOMP7.funnyflux.local\HMB_AgentPolicy$\hmb_agent_core.dat"
+    )
 finally:
     shutil.rmtree(project_root, ignore_errors=True)
 

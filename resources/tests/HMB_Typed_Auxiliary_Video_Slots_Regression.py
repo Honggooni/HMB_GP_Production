@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 import sys
 
@@ -738,7 +739,42 @@ assert any(
 unverified_depth_prompt = prompt._build_prompt_package(unverified_depth)
 assert "SOURCE DATA WARNINGS:" not in unverified_depth_prompt
 assert "mismatched generated Depth provenance" not in unverified_depth_prompt
-assert "@video2 = depth_2" in unverified_depth_prompt
+unverified_depth_lines = unverified_depth_prompt.splitlines()
+assert len(unverified_depth_lines) == 7
+assert unverified_depth_lines[0] == "HMB_GP_Production"
+assert unverified_depth_lines[1] == prompt.PUBLIC_JOB_CONTRACT_HEADER
+assert unverified_depth_lines[3] == prompt.FX_TIMING_CONTRACT_HEADER
+assert unverified_depth_lines[5] == prompt.USER_DESCRIPTION_DATA_HEADER
+
+unverified_depth_job = json.loads(unverified_depth_lines[2])
+unverified_depth_fx = json.loads(unverified_depth_lines[4])
+unverified_depth_user = json.loads(unverified_depth_lines[6])
+assert unverified_depth_job["schema"] == prompt.PUBLIC_JOB_CONTRACT_SCHEMA
+assert unverified_depth_job["version"] == prompt.PUBLIC_JOB_CONTRACT_VERSION
+unverified_depth_videos = {
+    item["video"]: item for item in unverified_depth_job["videos"]
+}
+assert set(unverified_depth_videos) == {"@video1", "@video2"}
+assert unverified_depth_videos["@video2"]["label"] == "depth_2"
+assert unverified_depth_videos["@video2"]["source_type"] == (
+    "Depth / Spatial Reference"
+)
+assert unverified_depth_videos["@video2"]["control_role"] == (
+    "Spatial Alignment Verification Only"
+)
+assert unverified_depth_videos["@video2"]["identity"]["video_uid"] == (
+    "typed-depth-wrong-bundle-2"
+)
+assert "companion" not in unverified_depth_videos["@video2"]
+assert unverified_depth_job["connections"] == {
+    "image_asset": False,
+    "picker": True,
+}
+assert unverified_depth_fx["schema"] == prompt.FX_TIMING_CONTRACT_SCHEMA
+assert unverified_depth_fx["version"] == prompt.FX_TIMING_CONTRACT_VERSION
+assert unverified_depth_fx["valid"] is True
+assert unverified_depth_fx["errors"] == []
+assert unverified_depth_user == {}
 assert "Final prompt generation is blocked" not in unverified_depth_prompt
 
 

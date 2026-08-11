@@ -17,12 +17,10 @@ except Exception:
 
 try:
     from .HMBSeedanceGeneration import (
-        HMBSeedance20VideoGeneration,
         HMBSeedanceGeneration,
     )
 except Exception:
     HMBSeedanceGeneration = None  # type: ignore
-    HMBSeedance20VideoGeneration = None  # type: ignore
 
 try:
     from .HMBVideoPickerLibrary import HMBVideoPickerLibrary
@@ -34,6 +32,5 @@ __all__ = [
     "HMBImageAssetLibrary",
     "HMBPromptLibrary",
     "HMBSeedanceGeneration",
-    "HMBSeedance20VideoGeneration",
     "HMBVideoPickerLibrary",
 ]

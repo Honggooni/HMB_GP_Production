@@ -661,10 +661,37 @@ assert_auto_depth_preserved_as_independent_media(legacy_invalid_state)
 legacy_invalid_state["videos"][1]["label"] = "manual-new-label"
 legacy_invalid_state["videos"][1]["present"] = True
 legacy_reactivated_prompt = prompt._build_prompt_package(legacy_invalid_state)
-assert "@video2 = manual-new-label" in legacy_reactivated_prompt
-assert "Depth / Spatial Reference" not in legacy_reactivated_prompt
-assert "Spatial Alignment Verification Only" not in legacy_reactivated_prompt
-assert "Final prompt generation is blocked" not in legacy_reactivated_prompt
+legacy_lines = [line for line in legacy_reactivated_prompt.splitlines() if line]
+assert len(legacy_lines) == 7
+assert legacy_lines[0] == "HMB_GP_Production"
+assert legacy_lines[1] == "HMB JOB DATA (JSON):"
+assert legacy_lines[3] == "FX/TIMING SOURCE DATA (JSON):"
+assert legacy_lines[5] == "USER DESCRIPTION DATA (JSON):"
+legacy_job = json.loads(legacy_lines[2])
+legacy_fx = json.loads(legacy_lines[4])
+legacy_user = json.loads(legacy_lines[6])
+assert legacy_job["schema"] == "hmb-public-job-data"
+assert legacy_job["version"] == 1
+legacy_video2 = next(
+    item for item in legacy_job["videos"] if item["video"] == "@video2"
+)
+assert legacy_video2["label"] == "manual-new-label"
+assert legacy_video2["source_type"] == "Depth / Spatial Reference"
+assert (
+    legacy_video2["control_role"]
+    == "Spatial Alignment Verification Only"
+)
+# Invalid generated-pair provenance removes companion authority while retaining
+# the independently readable source row as typed data.
+assert "companion" not in legacy_video2
+assert legacy_fx == {
+    "schema": "hmb-fx-timing-source-facts",
+    "version": 3,
+    "valid": True,
+    "errors": [],
+    "sources": [],
+}
+assert legacy_user == {}
 
 
 # Manual values that existed before Picker temporarily classified @video2 as

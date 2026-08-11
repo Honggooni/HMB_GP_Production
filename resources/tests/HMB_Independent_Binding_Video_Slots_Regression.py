@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -20,6 +21,13 @@ def load(name: str):
 
 prompt = load("HMBPromptLibrary")
 agent = load("HMBAgentLibrary")
+
+
+def prompt_json_section(payload: str, header: str):
+    lines = payload.splitlines()
+    assert lines[0] == "HMB_GP_Production"
+    assert len(lines) == 7
+    return json.loads(lines[lines.index(header) + 1])
 
 
 def active_video(slot: int, label: str, source_type: str, control_role: str):
@@ -128,11 +136,19 @@ assert [
 ]
 
 compiled = prompt._build_prompt_package(normalized)
-assert "Color Pick marker: @video1 / Red" in compiled
-assert "Color Pick marker: @video3 / Green" in compiled
-assert "SOURCE AUTHORITY CONFLICTS:" not in compiled
-assert "Final prompt generation is blocked" not in compiled
-assert "requires one validated Motion Guide" not in compiled
+compiled_job = prompt_json_section(compiled, "HMB JOB DATA (JSON):")
+assert compiled_job["images"][0]["bindings"] == [
+    {
+        "video": "@video1",
+        "marker_color": "Red",
+        "target_scope": "Full body / full appearance",
+    },
+    {
+        "video": "@video3",
+        "marker_color": "Green",
+        "target_scope": "Full body / full appearance",
+    },
+]
 assert agent._is_hmb_prompt_library_payload(compiled)
 
 
@@ -196,9 +212,27 @@ assert validated_binding["video_slot"] == "@video3"
 assert metadata is not None
 assert metadata["video_slot"] == "@video3"
 range_compiled = prompt._build_prompt_package(range_state)
-assert "FRAME RANGE BINDING:" not in range_compiled
-assert "Color Pick marker: @video3 / Green" in range_compiled
-assert "during Frames" not in range_compiled
+assert prompt_json_section(
+    range_compiled,
+    "HMB JOB DATA (JSON):",
+)["frame_ranges"] == [{
+    "image": "@image1",
+    "video": "@video3",
+    "marker_color": "Green",
+    "enabled": True,
+    "origin": "manual",
+    "domain": {
+        "start_frame": 1,
+        "end_frame": 24,
+        "frame_count": 24,
+        "timebase": "24/1",
+        "fps": 24.0,
+    },
+    "segments": [{"start_frame": 5, "end_frame": 12}],
+    "unresolved_segments": [],
+    "valid": True,
+    "error_codes": [],
+}]
 
 
 # Deactivating @video3 makes its binding dormant without deleting user intent.

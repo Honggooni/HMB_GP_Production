@@ -887,7 +887,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.5.74"
+assert manifest["metadata"]["library_version"] == "0.6.1"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
@@ -945,27 +945,11 @@ for native_size_key in (
 ):
     assert native_size_key not in agent_manifest["metadata"]
 
-# Approved Agent/runtime baseline hashes. The exact signed v4 policy is the sole
-# local runtime policy; private signing material is not distributed.
+# Agent policy is server-only. Public source/packages must not freeze or bundle
+# a local policy artifact, while all UI behavior assertions below remain exact.
 bundled_agent_policy = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
-assert bundled_agent_policy.is_file()
-assert hashlib.sha256(bundled_agent_policy.read_bytes()).hexdigest() == (
-    "e46328be5f3bf9d0bc05d52b12cc6b14cc71b3125297d01efc2100e47276c914"
-)
-expected_agent_hashes = {
-    "HMBAgentLibrary.py": "12a00bf11e5376998192a09f9a2e3b9fe4bab9d04e986fe1adc7be78946b81c6",
-    "HMBPromptLibrary.py": "a99852457c5e61c5cad6b22414a6fccfed3ff339856cb5d0c4fa30f17e19b39b",
-    "HMBVideoPickerLibrary.py": "04330ae13ea82cd3962f993d371c74fd37a6de3998b11eaf108e1d10eea736be",
-    "_hmb_common.py": "fddb2e303d210c354066e9f903ad459b7263a4743d11c6ea52477167fe78506f",
-    "widgets/HMBAgentLibraryWidget.js": "61ea9416adc1cbfb7e8fbfbc068ad1a444c3f6d4b4c6b59569a1815a013dc193",
-    "resources/tests/HMB_Agent_Policy_Integration_Regression.py": "0d9c38a0e6cbcab855a5dfe0c7190753ae85968f9f5ef5be2a20b4463495e9b8",
-    "resources/tests/HMB_Frame_Range_Regression.py": "27b66e29a562358b71ceb5874ac06ed5a6433ef40c6e9abee173a162229363bb",
-    "resources/tests/HMB_Output_Sanitizer_Regression.py": "50cd3f02c54940178274c7dbdc6ace216046da87b662830312e9237d7274065c",
-    "resources/tests/HMB_Final_Policy_Recursive_Probabilistic_Regression.py": "d6b7433d99e5e689e0d434e69efbc4779fa31e4677067b5c7040302a728345da",
-}
-for relative_path, expected_hash in expected_agent_hashes.items():
-    actual_hash = hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest()
-    assert actual_hash == expected_hash, f"Agent freeze violation: {relative_path}"
+assert not bundled_agent_policy.exists()
+assert not list(ROOT.rglob("hmb_agent_core.dat"))
 
 widget_source = (ROOT / "widgets/HMBVideoPickerLibraryWidget_v032.js").read_text(encoding="utf-8")
 command_widget_source = (ROOT / "widgets/HMBVideoPickerCommandBridgeWidget_v032.js").read_text(encoding="utf-8")
