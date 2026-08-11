@@ -313,6 +313,18 @@ assert.match(assetSource, /IMAGE_ASSET_AUTO_SYNC_PENDING_MS = 5000/, "Rapid wake
 assert.match(assetSource, /now >= autoSyncPendingUntil[\s\S]*?autoSyncPendingUntil = now \+ IMAGE_ASSET_AUTO_SYNC_PENDING_MS/, "Asset auto-sync must not stack host round trips while a recent probe is pending.");
 assert.match(assetSource, /clearAutoSyncTimer\(\)[\s\S]*?removeEventListener/, "Asset cleanup must stop its sync timer and global listeners.");
 assert.match(assetSource, /\.asset-scroll\{[^}]*scrollbar-gutter:stable/, "Asset scrollbars must reserve stable layout space.");
+assert.match(assetSource, /class="asset-scroll nodrag nopan nowheel" data-asset-scroll/, "Only the red Asset viewport must suppress canvas zoom and pan.");
+assert.match(assetSource, /hmbInstallImageAssetScrollGestures\(container, on\)/, "Every Asset remount must restore local wheel and middle-pan handlers.");
+assert.match(
+  assetSource,
+  /on\(assetScroll, "wheel",[\s\S]*?scrollTop[\s\S]*?stopLocalGesture\(event\)[\s\S]*?\{ passive: false \}/,
+  "Wheel input over the Asset viewport must scroll locally and remain non-passive.",
+);
+assert.match(
+  assetSource,
+  /on\(assetScroll, "pointerdown",[\s\S]*?button\) !== 1[\s\S]*?setPointerCapture[\s\S]*?on\(assetScroll, "pointermove"[\s\S]*?scrollTop/,
+  "Middle-button drag must pan only the Asset viewport without changing left-click selection.",
+);
 assert.doesNotMatch(assetSource, /data-asset-selected|type="checkbox" data-asset-selected/, "Asset selection must use the card outline, not per-card checkboxes.");
 assert.doesNotMatch(assetSource, /candidate-list|writing-mode/, "Removed color chips and rotated slot text must not return.");
 assert.match(assetSource, /String\(index \+ 1\)\.padStart\(2, "0"\)/, "Selected cards must use horizontal 01/02 numbering.");
