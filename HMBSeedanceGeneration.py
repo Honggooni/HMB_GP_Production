@@ -185,6 +185,7 @@ AUDIO_MIME_ALIASES = {
 }
 
 _TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_BROKER_PUBLIC_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _TOS_BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
 _BEARER_PATTERN = re.compile(r"(?i)Bearer\s+[A-Za-z0-9._~+/=-]+")
 _SENSITIVE_FIELD_PATTERN = re.compile(
@@ -2569,9 +2570,50 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "status": status,
             "broker_status": str(raw_status or status).strip().lower(),
         }
+        error_code = str(response.get("error_code") or "").strip().lower()
+        if _BROKER_PUBLIC_CODE_PATTERN.fullmatch(error_code):
+            task["error_code"] = error_code
+        if status in TERMINAL_FAILURE_STATUSES or response.get("terminal") is True:
+            task["terminal"] = True
+        if isinstance(response.get("resubmit_allowed"), bool):
+            task["resubmit_allowed"] = response["resubmit_allowed"]
+        recovery_action = str(response.get("recovery_action") or "").strip().lower()
+        if _BROKER_PUBLIC_CODE_PATTERN.fullmatch(recovery_action):
+            task["recovery_action"] = recovery_action
+        if "provider_job_id" in response:
+            task["provider_task_registered"] = bool(
+                str(response.get("provider_job_id") or "").strip()
+            )
         if video_url:
             task["content"] = {"video_url": video_url}
         return task
+
+    @staticmethod
+    def _broker_terminal_failure_message(
+        task: dict[str, Any], generation_id: str
+    ) -> str:
+        status = str(task.get("status") or "failed")
+        error_code = str(task.get("error_code") or "")
+        parts = [
+            f"FN AI Broker task {generation_id} ended with status {status}."
+        ]
+        if error_code:
+            parts.append(f"Broker error code: {error_code}.")
+        if error_code == "submission_unknown":
+            parts.append(
+                "Provider acceptance could not be confirmed because no provider "
+                "task ID was returned. This Broker job is terminal and automatic "
+                "resubmission is disabled. Contact an administrator to verify "
+                "provider-side activity before starting another render."
+            )
+        elif task.get("resubmit_allowed") is False:
+            parts.append("Automatic resubmission is disabled for this terminal job.")
+        if (
+            task.get("recovery_action") == "contact_admin"
+            and error_code != "submission_unknown"
+        ):
+            parts.append("Contact an administrator before starting another render.")
+        return " ".join(parts)
 
     def _set_broker_task_outputs(
         self,
@@ -2582,11 +2624,21 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     ) -> None:
         self.parameter_output_values["generation_id"] = generation_id
         self.parameter_output_values["generation_status"] = status
-        self.parameter_output_values["provider_response"] = {
+        provider_response = {
             "transport": "fn_ai_broker",
             "id": generation_id,
             "status": status,
         }
+        for name in (
+            "error_code",
+            "terminal",
+            "resubmit_allowed",
+            "recovery_action",
+            "provider_task_registered",
+        ):
+            if name in task:
+                provider_response[name] = task[name]
+        self.parameter_output_values["provider_response"] = provider_response
 
     async def _download_broker_video(self, url: str) -> bytes:
         bridge = self._get_broker_bridge()
@@ -2947,8 +2999,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if status in TERMINAL_FAILURE_STATUSES:
                 self._set_status_results(
                     was_successful=False,
-                    result_details=(
-                        f"FN AI Broker task {generation_id} ended with status {status}."
+                    result_details=self._broker_terminal_failure_message(
+                        task, generation_id
                     ),
                 )
                 return
@@ -2964,15 +3016,41 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             safe_detail = (
                 str(exc) if isinstance(exc, _BrokerError) else type(exc).__name__
             )
-            self._set_status_results(
-                was_successful=False,
-                result_details=(
+            known_status = str(
+                self.parameter_output_values.get("generation_status") or ""
+            ).strip().lower()
+            known_response = self.parameter_output_values.get("provider_response")
+            known_terminal = known_status in TERMINAL_FAILURE_STATUSES or bool(
+                isinstance(known_response, dict)
+                and known_response.get("terminal") is True
+            )
+            if known_terminal:
+                terminal_task = (
+                    dict(known_response)
+                    if isinstance(known_response, dict)
+                    else {}
+                )
+                terminal_task["status"] = known_status or "failed"
+                detail = (
+                    self._broker_terminal_failure_message(
+                        terminal_task,
+                        generation_id or "ID",
+                    )
+                    + " Refresh could not contact the Broker and did not resume, "
+                    "restart, or duplicate this known terminal job. Details: "
+                    + safe_detail
+                )
+            else:
+                detail = (
                     "The Broker connection is currently unavailable, but the existing "
                     f"task {generation_id or 'ID'} may still be rendering. Refresh / "
                     "Retrieve Result checks the same job without creating a duplicate. "
                     "Details: "
                     + safe_detail
-                ),
+                )
+            self._set_status_results(
+                was_successful=False,
+                result_details=detail,
             )
 
     def _on_refresh_clicked(self, _button: Any, _details: Any) -> None:
@@ -3100,7 +3178,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 final_task = task
             elif status in TERMINAL_FAILURE_STATUSES:
                 raise RuntimeError(
-                    f"FN AI Broker task ended with status {status}."
+                    self._broker_terminal_failure_message(task, generation_id)
                 )
 
         while final_task is None:
@@ -3147,7 +3225,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 break
             if status in TERMINAL_FAILURE_STATUSES:
                 raise RuntimeError(
-                    f"FN AI Broker task ended with status {status}."
+                    self._broker_terminal_failure_message(task, generation_id)
                 )
             remaining = deadline - self._monotonic()
             if remaining > 0:
@@ -3195,12 +3273,28 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             generation_id = str(
                 self.parameter_output_values.get("generation_id") or ""
             ).strip()
+            generation_status = str(
+                self.parameter_output_values.get("generation_status") or ""
+            ).strip()
+            provider_response = self.parameter_output_values.get("provider_response")
+            terminal = generation_status in TERMINAL_FAILURE_STATUSES or (
+                isinstance(provider_response, dict)
+                and provider_response.get("terminal") is True
+            )
             if generation_id:
-                safe_message += (
-                    f"\nExisting task ID: {generation_id}. The server render can "
-                    "continue after a disconnect. Use Refresh / Retrieve Result to "
-                    "check this same task without creating a duplicate."
-                )
+                if terminal:
+                    safe_message += (
+                        f"\nExisting task ID: {generation_id}. This Broker job is "
+                        "terminal. Refresh / Retrieve Result only retrieves the same "
+                        "final state; it does not resume, restart, or duplicate "
+                        "a render."
+                    )
+                else:
+                    safe_message += (
+                        f"\nExisting task ID: {generation_id}. The server render can "
+                        "continue after a disconnect. Use Refresh / Retrieve Result to "
+                        "check this same task without creating a duplicate."
+                    )
             submission_unknown = (
                 isinstance(exc, _BrokerError) and exc.submission_outcome_unknown
             )

@@ -661,8 +661,9 @@ assert_auto_depth_preserved_as_independent_media(legacy_invalid_state)
 legacy_invalid_state["videos"][1]["label"] = "manual-new-label"
 legacy_invalid_state["videos"][1]["present"] = True
 legacy_reactivated_prompt = prompt._build_prompt_package(legacy_invalid_state)
-assert "Depth / Spatial Reference" in legacy_reactivated_prompt
-assert "Spatial Alignment Verification Only" in legacy_reactivated_prompt
+assert "@video2 = manual-new-label" in legacy_reactivated_prompt
+assert "Depth / Spatial Reference" not in legacy_reactivated_prompt
+assert "Spatial Alignment Verification Only" not in legacy_reactivated_prompt
 assert "Final prompt generation is blocked" not in legacy_reactivated_prompt
 
 

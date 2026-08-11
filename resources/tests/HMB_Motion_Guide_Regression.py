@@ -289,9 +289,11 @@ assert motion_row["picker_motion_guide_summary"] == {
     "raw_curve_geometry_rendered": False,
 }
 compiled_prompt = prompt._build_prompt_package(applied)
-assert "verified semantic face summary" in compiled_prompt
-assert "1 final Blend Shape channel(s)" in compiled_prompt
-assert "raw NURBS curve geometry is never rendered" in compiled_prompt
+assert "@video1 = color" in compiled_prompt
+assert "@video2 = motion" in compiled_prompt
+assert "verified semantic face summary" not in compiled_prompt
+assert "final Blend Shape channel(s)" not in compiled_prompt
+assert "raw NURBS curve geometry" not in compiled_prompt
 
 bad_payload = copy.deepcopy(picker_payload)
 bad_payload["videos"][1]["bundle_run_id"] = "other-bundle"

@@ -153,13 +153,24 @@ def assert_user_state_survives(state: dict, label: str) -> None:
 
 
 def assert_goal_first_prompt(compiled: str, label: str) -> None:
-    assert "ALL15_USER_GOAL_SENTINEL" in compiled, label
+    # Dashboard descriptions remain in state but the public Agent payload is
+    # limited to the five user-verifiable source/binding sections.
+    assert "ALL15_USER_GOAL_SENTINEL" not in compiled, label
     assert "MANUAL_VIDEO2_SENTINEL.mp4" in compiled, label
     assert "MANUAL_VIDEO5_SENTINEL.mp4" in compiled, label
-    assert "free-form exact words must survive" in compiled, label
-    assert "[Unknown User Type] keep this line too" in compiled, label
-    assert "@image9" in compiled, label
-    assert "@video4" in compiled, label
+    if "I" in label:
+        assert "Connected optional idea" in compiled, label
+        assert "Whole imagined world" not in compiled, label
+    else:
+        assert "Whole imagined world" in compiled, label
+        assert "User invented image role" in compiled, label
+        assert "User invented scope" in compiled, label
+    assert "free-form exact words must survive" not in compiled, label
+    assert "[Unknown User Type] keep this line too" not in compiled, label
+    assert "@image9" not in compiled, label
+    assert "@video4" not in compiled, label
+    assert "USER DESCRIPTION DATA (JSON):" not in compiled, label
+    assert "VIDEO ROLE MAP:" not in compiled, label
     for forbidden in (
         "Final prompt generation is blocked",
         "requires one validated Motion Guide",

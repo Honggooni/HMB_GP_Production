@@ -229,8 +229,8 @@ unknown_result = prompt._apply_picker_payload(unknown_state, unknown_payload, co
 assert unknown_result["images"][0]["color_picks"] == ["Infrared dream marker"]
 
 
-# Dormant addresses and every Target are expressly available now; Prop does not
-# hardcode @video1 when the user bound a different source.
+# Dormant addresses and relationship Targets remain local state. The public
+# role/replacement sections keep the active Prop target and its selected slot.
 goal_state = prompt._default_widget_state()
 goal_state["images"] = [{
     **prompt._default_image_item(1),
@@ -245,20 +245,24 @@ goal_state["images"] = [{
 }]
 goal_state["text"]["SCENE_CONTEXT"] = "Resolve @video5 as a dream-memory rhythm"
 goal_prompt = prompt._build_prompt_package(goal_state)
-assert "Target = Hero hand" in goal_prompt
-assert "Target = Door lock" in goal_prompt
-assert "Target = Memory echo" in goal_prompt
-assert "Supplied video bindings = @video3" in goal_prompt
+assert goal_state["images"][0]["legacy_relationship_targets"] == [
+    "Door lock",
+    "Memory echo",
+]
+assert "Hero hand prop / accessory source" in goal_prompt
+assert "Color Pick marker: @video3 / Custom brass marker" in goal_prompt
+assert "Door lock" not in goal_prompt
+assert "Memory echo" not in goal_prompt
 assert "follow @video1" not in goal_prompt
-assert "immediately usable user intent" in goal_prompt
-assert "without a slot prerequisite" in goal_prompt
+assert "USER DESCRIPTION DATA (JSON):" not in goal_prompt
+assert "dream-memory rhythm" not in goal_prompt
 
 malformed_text_state = prompt._default_widget_state()
 malformed_text_state["text"]["PRESERVED_TEXT"] = "free readable words\n[Future Tag] exact future phrase"
 malformed_prompt = prompt._build_prompt_package(malformed_text_state)
-assert "PRESERVED_TEXT_DESCRIPTIVE_FALLBACK" in malformed_prompt
-assert "free readable words" in malformed_prompt
-assert "exact future phrase" in malformed_prompt
+assert "PRESERVED_TEXT_DESCRIPTIVE_FALLBACK" not in malformed_prompt
+assert "free readable words" not in malformed_prompt
+assert "exact future phrase" not in malformed_prompt
 assert "SOURCE DATA WARNINGS" not in malformed_prompt
 
 source = (ROOT / "HMBPromptLibrary.py").read_text(encoding="utf-8")

@@ -4,7 +4,7 @@
   "metadata": {
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.5.73",
+    "library_version": "0.5.74",
     "engine_version": "0.93.0",
     "tags": [
       "Griptape",
@@ -261,7 +261,7 @@
       "file_path": "HMBPromptLibrary.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "Canonical goal-first prompt parent with four equal modes: independent Prompt only, Prompt plus Image Asset, Prompt plus Video Picker, and Prompt plus both. While IMAGE_ASSET_IN is connected, only selected Asset-managed rows own active @imageN slots and strictly follow upstream add, remove, and reorder operations so Prompt order stays aligned with Video Generation Out; the Prompt image + button is locked until disconnect because new visible rows must be selected upstream. Native/manual rows remain dormant and return after disconnect; deselected managed settings resume only by exact source_uid. Verified assets bind registered Main Type and Sub Type while Target keeps a Main-Type-aware editable default, and unverified or unknown readable input remains ordinary intent. PICKER_IN synchronizes recognized metadata without creating a required companion or library combination. PROMPT_OUT remains available in every mode and is the only HMB automation gateway recognized by HMBAgentLibrary.",
+        "description": "Canonical goal-first prompt parent with four equal modes: independent Prompt only, Prompt plus Image Asset, Prompt plus Video Picker, and Prompt plus both. While IMAGE_ASSET_IN is connected, only selected Asset-managed rows own active @imageN slots and strictly follow upstream add, remove, and reorder operations so Prompt order stays aligned with Video Generation Out; the Prompt image + button is locked until disconnect because new visible rows must be selected upstream. Native/manual rows remain dormant and return after disconnect; deselected managed settings resume only by exact source_uid. Verified assets bind registered Main Type and Sub Type while Target keeps a Main-Type-aware editable default; unverified or unknown connected values remain local dashboard state and are not serialized into PROMPT_OUT. PICKER_IN synchronizes recognized metadata without creating a required companion or library combination. PROMPT_OUT contains only the user-verifiable Target Generator, Image Source, Image Role, Replacement Binding, and Video Source sections, remains available in every mode, and is the only HMB automation gateway recognized by HMBAgentLibrary.",
         "display_name": "HMBPromptLibrary",
         "width": 1800,
         "height": 1193,

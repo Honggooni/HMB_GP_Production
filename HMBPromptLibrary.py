@@ -84,11 +84,17 @@ MAX_KEEP_OUT_CHARS = 4000
 MAX_PROMPT_CHARS = 55000
 MAX_FRAME_RANGES_PER_BINDING = 100
 MAX_MANUAL_FRAME_NUMBER = 9999
-_OPTIONAL_PROMPT_SECTION_PRIORITY = (
-    "SOURCE INTERPRETATION NOTES:",
-    "SELF-SCOPED REFERENCE ALIGNMENT:",
-    "ADDITIVE MULTI-VIDEO BINDING SCHEMA:",
-    "SOURCE DATA WARNINGS:",
+MAX_PUBLIC_PROMPT_FIELD_CHARS = 512
+MAX_PUBLIC_PROMPT_LINE_CHARS = 4096
+_PUBLIC_PROMPT_SECTION_HEADERS = (
+    "TARGET GENERATOR:",
+    "IMAGE SOURCE:",
+    "IMAGE ROLE MAP:",
+    "REPLACEMENT BINDING:",
+    "VIDEO SOURCE:",
+)
+_PUBLIC_WINDOWS_PATH_PATTERN = re.compile(
+    r"(?i)(?<![A-Z0-9_])(?:[A-Z]:[\\/]|\\\\)[^|;]*?(?=\s+/\s+|\s+\|\s+|;|$)"
 )
 IMAGE_SOURCE_TYPE_CHOICES = _hmb.IMAGE_SOURCE_TYPE_CHOICES
 IMAGE_SCOPE_CHOICES = _hmb.IMAGE_SCOPE_CHOICES
@@ -417,6 +423,35 @@ def _video_file_stem(value: Any) -> str:
         return text
     stem = Path(filename).stem
     return stem or filename
+
+
+def _public_single_line(value: Any, max_chars: int = MAX_PUBLIC_PROMPT_FIELD_CHARS) -> str:
+    """Normalize untrusted public Prompt text to one bounded, control-free line."""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+
+    def replace_local_path(match: re.Match[str]) -> str:
+        raw = match.group(0).strip().replace("\\", "/").rstrip("/")
+        filename = raw.rsplit("/", 1)[-1].strip(" \t\"'")
+        return filename or "[local path]"
+
+    text = _PUBLIC_WINDOWS_PATH_PATTERN.sub(replace_local_path, text)
+    return text[: max(0, int(max_chars))].rstrip()
+
+
+def _public_path_basename(value: Any, fallback: str, *, strip_extension: bool) -> str:
+    """Return a safe display label without publishing a local or remote path."""
+    text = _public_single_line(value, MAX_PUBLIC_PROMPT_FIELD_CHARS)
+    if not text:
+        text = _public_single_line(fallback, MAX_PUBLIC_PROMPT_FIELD_CHARS)
+    clean_path = text.split("?", 1)[0].split("#", 1)[0].replace("\\", "/").rstrip("/")
+    filename = clean_path.rsplit("/", 1)[-1] or _public_single_line(
+        fallback,
+        MAX_PUBLIC_PROMPT_FIELD_CHARS,
+    )
+    if strip_extension:
+        filename = Path(filename).stem or filename
+    return _public_single_line(filename, MAX_PUBLIC_PROMPT_FIELD_CHARS)
 
 
 def _color_pick_choices_for_source_type(source_type: Any) -> List[str]:
@@ -3518,7 +3553,7 @@ def _find_source_authority_conflicts(
 def _picker_input_kwargs() -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {
         "name": PICKER_INPUT_PARAMETER_NAME,
-        "tooltip": "Connect HMBVideoPickerLibrary PICKER_OUT to add available video slots, decoded metadata, generated paths, and Asset ID-to-Image Name Color Pick relationships. Other readable connected values are retained as ordinary prompt intent. Every source and every user Target remains independently usable. Missing companions, slots, metadata, Color Picks, or local bindings are optional and never block Prompt output. Explicit Picker companion provenance alone activates cross-file bundle integrity checks.",
+        "tooltip": "Connect HMBVideoPickerLibrary PICKER_OUT to synchronize available video slots, source labels, and Asset ID-to-Image Name Color Pick relationships used by the public source and replacement sections. Decoded metadata, diagnostics, descriptive control data, and unknown connected values remain local dashboard state and are not serialized into PROMPT_OUT. Missing companions, slots, metadata, Color Picks, or local bindings are optional and never block Prompt output.",
         "default_value": "",
         "type": "str",
         "input_types": ["any"],
@@ -3548,8 +3583,8 @@ def _image_asset_input_kwargs() -> Dict[str, Any]:
             "and Color Pick candidates. The registered Sub Type stays bound to the "
             "asset; Target receives a Main-Type default and remains editable. "
             "IMAGE_IMPORT_IN sources provide only Image Name and generator order. "
-            "Color Pick and custom ideas remain editable and available to the current goal. "
-            "Other readable connected values are retained as ordinary prompt intent."
+            "Recognized source, role, Color Pick, and replacement fields compile into the public Prompt sections. "
+            "Other connected or descriptive values remain local dashboard state and are not serialized into PROMPT_OUT."
         ),
         "default_value": "",
         "type": "str",
@@ -6935,62 +6970,37 @@ def _valid_frame_range_bindings(
     return out
 
 
-def _prompt_section_end(lines: List[str], start: int) -> int:
-    """Return the first following production section header or EOF."""
-    for index in range(start + 1, len(lines)):
-        text = _clean_string(lines[index])
-        if text and text.endswith(":") and re.fullmatch(r"[A-Z0-9][A-Z0-9 /_+()@.-]*:", text):
-            return index
-    return len(lines)
-
-
 def _compile_prompt_with_budget(lines: List[str]) -> str:
-    """Compact generated diagnostics without truncating canonical user intent.
+    """Compile the public generator prompt without diagnostic or state sections."""
+    safe_lines = [
+        _public_single_line(line, MAX_PUBLIC_PROMPT_LINE_CHARS)
+        for line in lines
+    ]
+    return "\n".join(safe_lines).strip() + "\n"
 
-    The dashboard state and USER DESCRIPTION DATA remain untouched.  When the
-    protected user-authored payload itself exceeds the advisory budget, the
-    prompt remains over budget rather than silently deleting the user's goal.
-    """
-    working = list(lines)
-    compacted: List[str] = []
-    for header in _OPTIONAL_PROMPT_SECTION_PRIORITY:
-        prompt = "\n".join(working).strip() + "\n"
-        if len(prompt) <= MAX_PROMPT_CHARS:
-            return prompt
-        try:
-            start = working.index(header)
-        except ValueError:
-            continue
-        end = _prompt_section_end(working, start)
-        detail_count = sum(1 for line in working[start + 1 : end] if _clean_string(line))
-        replacement = [
-            header,
-            f"- {detail_count} generated diagnostic line(s) compacted for transport; canonical dashboard state is retained.",
-            "",
-        ]
-        working[start:end] = replacement
-        compacted.append(header[:-1])
 
-    prompt = "\n".join(working).strip() + "\n"
-    if compacted and len(prompt) <= MAX_PROMPT_CHARS:
-        return prompt
-    if len(prompt) > MAX_PROMPT_CHARS:
-        prompt += (
-            "\nPROMPT BUDGET NOTICE:\n"
-            f"- The protected user-authored payload exceeds {MAX_PROMPT_CHARS} characters. "
-            "It was preserved without truncation; generated optional diagnostics were compacted first.\n"
-        )
-    return prompt
+def _public_prompt_lines(lines: List[str]) -> List[str]:
+    """Return only the approved public generator sections, in compiler order."""
+    public_lines: List[str] = ["HMB_GP_Production", ""]
+    allowed = set(_PUBLIC_PROMPT_SECTION_HEADERS)
+    include = False
+    for line in lines[2:]:
+        text = _clean_string(line)
+        if text and text.endswith(":") and re.fullmatch(r"[A-Z0-9][A-Z0-9 /_+()@.-]*:", text):
+            include = text in allowed
+        if include:
+            public_lines.append(
+                text
+                if text in allowed
+                else _public_single_line(line, MAX_PUBLIC_PROMPT_LINE_CHARS)
+            )
+    return public_lines
 
 
 def _build_prompt_package(state: Dict[str, Any]) -> str:
     state = _normalize_state(state)
-    text = state["text"]
     active_images = _active_image_rows_for_state(state["images"], state)
     active_videos = [item for item in state["videos"] if _is_active_video(item)]
-    control_only_bindings = _parse_control_only_bindings(text)[0]
-    picker_state = state.get("picker") if isinstance(state.get("picker"), dict) else {}
-    frame_metadata = picker_state.get("frame_metadata", [])
 
     lines: List[str] = ["HMB_GP_Production", ""]
 
@@ -7002,10 +7012,18 @@ def _build_prompt_package(state: Dict[str, Any]) -> str:
     if active_images:
         for item in active_images:
             seq = int(item.get("slot") or 1)
-            label = _clean_string(item.get("label")) or f"image source {seq}"
-            asset_id = _clean_string(item.get("asset_id"))
+            label = _public_path_basename(
+                item.get("label"),
+                f"image source {seq}",
+                strip_extension=False,
+            )
+            asset_id = _public_path_basename(
+                item.get("asset_id"),
+                "",
+                strip_extension=False,
+            )
             asset_id_suffix = f" / Asset ID: {asset_id}" if asset_id else ""
-            color_text = _color_pick_text(item)
+            color_text = _public_single_line(_color_pick_text(item))
             color_suffix = f" / Color Pick: {color_text}" if color_text else ""
             lines.append(
                 f"@image{seq} = {label}{asset_id_suffix}{color_suffix}"
@@ -7022,29 +7040,24 @@ def _build_prompt_package(state: Dict[str, Any]) -> str:
         lines.append("IMAGE ROLE MAP:")
         for item in active_images:
             seq = int(item.get("slot") or 1)
-            lines.append(_image_role_line(item, seq))
+            lines.append(
+                _public_single_line(
+                    _image_role_line(item, seq),
+                    MAX_PUBLIC_PROMPT_LINE_CHARS,
+                )
+            )
         lines.append("")
 
-        repl = [line for item in active_images for line in [_image_replacement_line(item, int(item.get("slot") or 1))] if line]
+        repl = [
+            _public_single_line(line, MAX_PUBLIC_PROMPT_LINE_CHARS)
+            for item in active_images
+            for line in [_image_replacement_line(item, int(item.get("slot") or 1))]
+            if line
+        ]
         if repl:
             lines.append("REPLACEMENT BINDING:")
             lines.extend(repl)
             lines.append("")
-
-        target_function_bindings = [
-            line
-            for item in active_images
-            for line in _image_target_function_lines(item, int(item.get("slot") or 1))
-        ]
-        if target_function_bindings:
-            lines.append("TARGET FUNCTION BINDING:")
-            lines.extend(target_function_bindings)
-            lines.append("")
-
-    if control_only_bindings:
-        lines.append("CONTROL-ONLY BINDING:")
-        lines.extend(_format_control_only_binding(entry) for entry in control_only_bindings)
-        lines.append("")
 
     lines.append("VIDEO SOURCE:")
     if active_videos:
@@ -7052,260 +7065,39 @@ def _build_prompt_package(state: Dict[str, Any]) -> str:
         lines.append(f"Active video slots = {active_slots_text}")
         for item in active_videos:
             seq = int(item.get("slot") or 1)
-            label = _clean_string(item.get("label")) or f"video source {seq}"
-            if _clean_string(item.get("picker_auto_label")):
-                label = _video_file_stem(label)
-            lines.append(f"@video{seq} = {label}")
-        lines.append("")
-        lines.append("VIDEO ROLE MAP:")
-        for item in active_videos:
-            seq = int(item.get("slot") or 1)
-            lines.append(_video_role_line(item, seq, active_images, control_only_bindings))
-            semantic_summary = _motion_guide_semantic_summary_line(item, seq)
-            if semantic_summary:
-                lines.append(semantic_summary)
-        lines.append("")
-        alignment_lines, _alignment_conflicts = _self_scoped_alignment_evaluation(
-            active_images,
-            active_videos,
-            control_only_bindings,
-            frame_metadata,
-        )
-        if alignment_lines:
-            lines.append("SELF-SCOPED REFERENCE ALIGNMENT:")
-            lines.extend(alignment_lines)
-            lines.append("")
-        if any(int(item.get("slot") or 1) > 1 for item in active_videos):
-            lines.append("ADDITIVE MULTI-VIDEO BINDING SCHEMA:")
-            lines.append("Every active video slot is independent; no slot, companion, Color Pick, image source, or local binding is required merely because another video is present.")
-            lines.append("Explicit reciprocal image or structured control-only bindings add exact local Targets and boundaries when supplied.")
-            lines.append(
-                "Recognized self-scoped role tuples provide a default attribute interpretation; an explicit "
-                "scoped instruction may change only its named property for a named target or clearly scene-wide "
-                "scope; if no temporal subset is stated or clearly implied, it applies to the whole shot, otherwise only to that subset."
+            label = _public_path_basename(
+                item.get("label"),
+                f"video source {seq}",
+                strip_extension=bool(_clean_string(item.get("picker_auto_label"))),
             )
-            lines.append("Decoded metadata is validated for internal file/schema integrity. Cross-source alignment is enforced only when explicit Picker companion provenance declares those files as one bundle.")
-            lines.append("Missing optional metadata or bindings never invents data and never blocks use of the sources that are present.")
-            lines.append("")
+            lines.append(f"@video{seq} = {label}")
     else:
         lines.append("No video source assigned in HMBPromptLibrary.")
     lines.append("")
 
-    valid_frame_bindings = _valid_frame_range_bindings(
-        state,
-        active_images,
-        active_videos,
-    )
-    if valid_frame_bindings:
-        lines.append("FRAME RANGE BINDING:")
-        emitted_timebases: set[int] = set()
-        for _item, binding, metadata in valid_frame_bindings:
-            slot = _video_slot_number(binding.get("video_slot"), MAX_VIDEOS)
-            if slot in emitted_timebases:
-                continue
-            emitted_timebases.add(slot)
-            fps = float(metadata.get("fps") or 0.0)
-            start_frame = int(metadata.get("start_frame"))
-            end_frame = int(metadata.get("end_frame"))
-            if fps > 0:
-                lines.append(
-                    f"Timebase = @video{slot} / {fps:g} FPS / "
-                    f"Frames {start_frame}–{end_frame}"
-                )
-            else:
-                lines.append(
-                    f"Frame domain = @video{slot} / Manual / "
-                    f"Frames {start_frame}–{end_frame}"
-                )
-        for item, binding, _metadata in valid_frame_bindings:
-            image_slot = int(item.get("slot") or 1)
-            slot = _video_slot_number(binding.get("video_slot"), MAX_VIDEOS)
-            color = _clean_string(binding.get("color_pick"))
-            ranges = binding.get("ranges") if isinstance(binding.get("ranges"), list) else []
-            range_text = " and ".join(
-                f"{int(frame_range.get('start') or 0)}–{int(frame_range.get('end') or 0)}"
-                for frame_range in ranges
-            )
-            lines.append(
-                f"@image{image_slot} replaces the @video{slot} {color} marker "
-                f"during Frames {range_text} only."
-            )
-        lines.append("")
-
-    preserved_entries, preserved_errors = _parse_preserved_text(text.get("PRESERVED_TEXT"))
-    unverified_preserved_text = _unverified_preserved_text_lines(text.get("PRESERVED_TEXT"))
-    authority_diagnostics = _find_source_authority_conflicts(
-        active_images,
-        active_videos,
-        text,
-        frame_metadata,
-    )
-    _control_bindings, control_binding_errors = _parse_control_only_bindings(text)
-    _alignment_reports, alignment_errors = _self_scoped_alignment_evaluation(
-        active_images,
-        active_videos,
-        _control_bindings,
-        frame_metadata,
-    )
-    active_video_slots = {
-        int(item.get("slot") or 1)
-        for item in active_videos
-    }
-    frame_range_warnings: List[str] = []
-    for item in active_images:
-        _binding, _metadata, range_errors = _frame_range_binding_validation(
-            state,
-            item,
-            active_video_slots,
-        )
-        token = f"@image{int(item.get('slot') or 1)}"
-        frame_range_warnings.extend(
-            f"{token} {error}"
-            for error in range_errors
-        )
-    picker_state = state.get("picker") if isinstance(state.get("picker"), dict) else {}
-    technical_frame_errors = [
-        error
-        for error in frame_range_warnings
-        if any(
-            marker in error
-            for marker in (
-                "conflicting or incomplete",
-                "START after END",
-                "Invalid frame range",
-                " is outside ",
-            )
-        )
-    ]
-    technical_errors = [*alignment_errors, *technical_frame_errors]
-    technical_errors.extend(
-        _clean_string(item)
-        for item in picker_state.get("contract_errors", [])
-        if _clean_string(item)
-    )
-    technical_errors.extend(
-        diagnostic
-        for diagnostic in authority_diagnostics
-        if " exceeds " in diagnostic
-    )
-    technical_errors = list(dict.fromkeys(technical_errors))
-    interpretation_notes = [
-        diagnostic
-        for diagnostic in authority_diagnostics
-        if diagnostic not in technical_errors
-    ]
-    if interpretation_notes:
-        lines.append("SOURCE INTERPRETATION NOTES:")
-        for note in interpretation_notes:
-            lines.append(f"- {note}")
-        lines.append(
-            "These notes describe ambiguity without deleting supplied ideas; every source remains available "
-            "within the attributes its readable evidence supports or an explicit scoped exception."
-        )
-        lines.append("")
-    if technical_errors:
-        lines.append("SOURCE DATA WARNINGS:")
-        for conflict in technical_errors:
-            lines.append(f"- {conflict}")
-        lines.append(
-            "Exact schema, provenance, or matched-authority interpretation is withheld only where it cannot "
-            "be verified. Every supplied source and the user goal remain independently usable."
-        )
-        lines.append("")
-
-    description_payload: Dict[str, Any] = {}
-    for key in TEXT_FIELD_NAMES:
-        if key == "PRESERVED_TEXT":
-            continue
-        value = _clean_string(text.get(key))
-        if key in ("SCENE_CONTEXT", "VIDEO_VFX"):
-            value = _strip_control_only_binding_lines(value)
-        if value:
-            description_payload[key] = value
-    if preserved_entries:
-        description_payload["PRESERVED_TEXT"] = preserved_entries
-    connected_source_fallbacks = [
-        f"[{entry['source']} / {entry['reason']}] {entry['text']}"
-        for entry in _normalize_source_intent_fallbacks(
-            state.get(_SOURCE_INTENT_FALLBACKS_KEY)
-        )
-    ]
-    descriptive_fallbacks = list(dict.fromkeys([
-        *unverified_preserved_text,
-        *connected_source_fallbacks,
-    ]))
-    if descriptive_fallbacks:
-        description_payload["PRESERVED_TEXT_DESCRIPTIVE_FALLBACK"] = descriptive_fallbacks
-        description_payload["CONNECTED_SOURCE_INTENT_POLICY"] = (
-            "Every readable fallback is ordinary user intent available to the current goal immediately; "
-            "it is not a prerequisite, lower-priority idea, or reason to block output."
-        )
-    frame_range_intent = {
-        f"@image{int(item.get('slot') or 1)}": {
-            "selected_color_index": int(item.get("frame_range_color_index") or 0),
-            "bindings": _normalize_frame_range_bindings(
-                item.get("frame_range_bindings"),
-                item.get("frame_range_binding"),
-            ),
-        }
-        for item in active_images
-        if bool(item.get("frame_range_enabled"))
-    }
-    if frame_range_intent:
-        description_payload["FRAME_RANGE_INTENT"] = {
-            "policy": (
-                "Every readable range remains available to the current goal immediately; inactive addresses or "
-                "missing metadata do not erase or demote it."
-            ),
-            "sources": frame_range_intent,
-        }
-    legacy_relationship_payload = {
-        f"@image{int(item.get('slot') or 1)}": [
-            _clean_string(value)
-            for value in item.get("legacy_relationship_targets", [])
-            if _clean_string(value)
-        ]
-        for item in active_images
-        if any(
-            _clean_string(value)
-            for value in item.get("legacy_relationship_targets", [])
-        )
-    }
-    if legacy_relationship_payload:
-        description_payload["RELATIONSHIP_TARGETS"] = {
-            "interpretation": (
-                "Every supplied Target is available to the current user goal immediately. The first Target is "
-                "the dashboard selection, while additional Targets remain equally usable relationship intent."
-            ),
-            "sources": legacy_relationship_payload,
-        }
-    keep_out_payload = {
-        f"@video{int(item.get('slot') or 1)}": _clean_string(item.get("keep_out"))
-        for item in active_videos
-        if _clean_string(item.get("keep_out"))
-    }
-    if keep_out_payload:
-        description_payload["KEEP_OUT"] = keep_out_payload
-    if description_payload:
-        lines.append("USER DESCRIPTION DATA (JSON):")
-        lines.append(json.dumps(description_payload, ensure_ascii=False, separators=(",", ":")))
-        lines.append("")
-
-    return _compile_prompt_with_budget(lines)
+    return _compile_prompt_with_budget(_public_prompt_lines(lines))
 
 
 def _prompt_semantic_fingerprint(state: Dict[str, Any]) -> str:
     """Return a stable identity for fields that can affect PROMPT_OUT.
 
-    ``ui`` is persisted workflow geometry/presentation and ``status`` is fully
-    derived by normalization. Neither is read by the prompt compiler, so those
-    updates must not rebuild or propagate an identical paid-Agent input.
+    Dashboard descriptions, Picker diagnostics, and connected-source fallback
+    data remain local state in the public five-section contract.  They join UI
+    geometry and derived status as fields that must not rebuild or propagate an
+    identical downstream Agent input.
     """
     normalized = _normalize_state(state)
     semantic_state = {
         key: value
         for key, value in normalized.items()
-        if key not in {"ui", "status"}
+        if key
+        not in {
+            "ui",
+            "status",
+            "text",
+            "picker",
+            _SOURCE_INTENT_FALLBACKS_KEY,
+        }
     }
     canonical = json.dumps(
         semantic_state,

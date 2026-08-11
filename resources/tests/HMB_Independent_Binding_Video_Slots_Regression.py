@@ -196,8 +196,9 @@ assert validated_binding["video_slot"] == "@video3"
 assert metadata is not None
 assert metadata["video_slot"] == "@video3"
 range_compiled = prompt._build_prompt_package(range_state)
-assert "FRAME RANGE BINDING:" in range_compiled
-assert "@image1 replaces the @video3 Green marker" in range_compiled
+assert "FRAME RANGE BINDING:" not in range_compiled
+assert "Color Pick marker: @video3 / Green" in range_compiled
+assert "during Frames" not in range_compiled
 
 
 # Deactivating @video3 makes its binding dormant without deleting user intent.

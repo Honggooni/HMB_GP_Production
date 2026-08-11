@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.74 - 2026-08-11
+
+- Reduced `HMBPromptLibrary.PROMPT_OUT` to the five user-verifiable Target Generator, Image Source, Image Role, Replacement Binding, and Video Source sections. Internal interpretation, authority, alignment, and multi-video policy prose is no longer serialized; the signed Agent v4 policy remains unchanged and runtime-only.
+- Removed the complete `USER DESCRIPTION DATA (JSON)` block and connected-source diagnostic fallback payloads from public Prompt output, preventing local paths, scene identifiers, render reports, and transport diagnostics from entering Agent conversation input.
+- Corrected terminal Seedance failure reporting so an unconfirmed provider submission is not described as a render that may still continue, while preserving the existing task ID and fail-closed no-resubmit contract.
+
 ## 0.5.73 - 2026-08-11
 
 - Corrected the v0.5.72 middle-button interpretation: the ImageAsset viewport no longer captures or scrolls its own grid during a middle-button drag.

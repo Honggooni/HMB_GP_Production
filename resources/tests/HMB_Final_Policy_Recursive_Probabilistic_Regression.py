@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.5.73"
+EXPECTED_RELEASE_VERSION = "0.5.74"
 EXPECTED_POLICY_VERSION = "2026-08-11.agent-shot-quality.v4"
 EXPECTED_CONTRACT_SHA256 = "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5"
 BASE_MASTER_SEEDS = (
@@ -65,11 +65,6 @@ def load_module(name: str):
 prompt_lib = load_module("HMBPromptLibrary")
 agent_lib = load_module("HMBAgentLibrary")
 common = agent_lib._hmb
-
-
-def prompt_description_json(compiled: str) -> dict:
-    tail = compiled.split("USER DESCRIPTION DATA (JSON):", 1)[1].lstrip()
-    return json.loads(tail.splitlines()[0])
 
 
 policy = agent_lib.get_internal_policy_rules().strip()
@@ -248,9 +243,8 @@ for seed in MASTER_SEEDS:
         assert policy not in compiled
         assert binding not in compiled
         assert agent_lib._is_hmb_prompt_library_payload(compiled)
-        assert prompt_description_json(compiled)["PROJECT_STYLE_LOOK"] == (
-            canonical["text"]["PROJECT_STYLE_LOOK"]
-        )
+        assert "USER DESCRIPTION DATA (JSON):" not in compiled
+        assert canonical["text"]["PROJECT_STYLE_LOOK"] not in compiled
 
         alternate = rng.choice(
             tuple(
@@ -264,7 +258,8 @@ for seed in MASTER_SEEDS:
         paired_compiled = prompt_lib._build_prompt_package(paired)
         assert policy not in paired_compiled
         assert binding not in paired_compiled
-        assert prompt_description_json(paired_compiled)["PROJECT_STYLE_LOOK"] == alternate
+        assert alternate not in paired_compiled
+        assert paired_compiled == compiled
         paired_look_checks += 1
 
         depth = rng.choice(RECURSION_DEPTHS)
