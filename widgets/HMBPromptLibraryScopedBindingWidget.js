@@ -202,6 +202,27 @@ const TEXT_FIELDS = [
   ["PRESERVED_TEXT", "EXACT TEXT / PROPER NOUNS", "one item per line: [Proper Noun], [Dialogue], [Lip-sync Speech], [Lyrics], [Chant], or [On-screen Text] followed by the exact original text", "image"],
 ];
 
+const MANUAL_VIDEO_CONTEXT_VERSION = 1;
+const MANUAL_VIDEO_CONTEXT_TEXT_FIELDS = Object.freeze(
+  TEXT_FIELDS.map(([key]) => key).filter((key) => key !== "PRESERVED_TEXT"),
+);
+const MANUAL_VIDEO_CONTEXT_IMAGE_FIELDS = Object.freeze([
+  "color_picks",
+  "binding_scopes",
+  "binding_custom_scopes",
+  "binding_video_slots",
+  "marker_video",
+  "preview_marker",
+  "picker_auto_video",
+  "picker_auto_color",
+  "picker_auto_source",
+  "frame_range_enabled",
+  "frame_range_color_index",
+  "frame_range_bindings",
+  "frame_range_binding",
+  "frame_range_selected_index",
+]);
+
 const HMB_UI_KO = {
   external_sources: "외부 소스",
   picker: "피커",
@@ -575,6 +596,7 @@ function defaultState() {
       order_managed: false,
       dormant_video_rows: [],
       dormant_manual_rows: [],
+      manual_video_context: {},
       slot_suppressions: {},
       scene: "",
       video_path: "",
@@ -1670,6 +1692,231 @@ function normalizeUi(input) {
   return { group_heights, textarea_heights, resize_mode: HMB_RESIZE_MODE, language, theme };
 }
 
+function boundedClean(value, maxChars = MAX_IDENTIFIER_CHARS) {
+  return clean(value).slice(0, Math.max(0, Number(maxChars) || 0));
+}
+
+function normalizeManualVideoContextFrameRanges(value) {
+  const bounded = (Array.isArray(value) ? value : [])
+    .slice(0, MAX_FRAME_RANGES_PER_BINDING)
+    .flatMap((raw) => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+      const start = normalizeFrameDomainEndpoint(raw.start);
+      const end = normalizeFrameDomainEndpoint(raw.end);
+      return start === null || end === null ? [] : [{ start, end }];
+    });
+  return normalizeFrameRanges(bounded);
+}
+
+function normalizeManualVideoContextSelectedRange(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return -1;
+  return Math.max(
+    -1,
+    Math.min(MAX_FRAME_RANGES_PER_BINDING - 1, Math.floor(parsed)),
+  );
+}
+
+function manualVideoContextFrameBindingInput(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const out = {
+    video_slot: boundedClean(value.video_slot || value.video),
+    color_pick: boundedClean(value.color_pick || value.color),
+    origin: boundedClean(value.origin) || "manual",
+    ranges: normalizeManualVideoContextFrameRanges(value.ranges),
+  };
+  if (Object.prototype.hasOwnProperty.call(value, "enabled")) {
+    out.enabled = Boolean(value.enabled);
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(value, "start_frame")
+    || Object.prototype.hasOwnProperty.call(value, "manual_start_frame")
+  ) {
+    out.start_frame = normalizeFrameDomainEndpoint(
+      Object.prototype.hasOwnProperty.call(value, "start_frame")
+        ? value.start_frame
+        : value.manual_start_frame,
+    );
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(value, "end_frame")
+    || Object.prototype.hasOwnProperty.call(value, "manual_end_frame")
+  ) {
+    out.end_frame = normalizeFrameDomainEndpoint(
+      Object.prototype.hasOwnProperty.call(value, "end_frame")
+        ? value.end_frame
+        : value.manual_end_frame,
+    );
+  }
+  return out;
+}
+
+function normalizeManualVideoContextFrameBindings(value, legacyBinding = null) {
+  const limited = {};
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    let inspected = 0;
+    for (const rawKey in value) {
+      if (!Object.prototype.hasOwnProperty.call(value, rawKey)) continue;
+      if (inspected >= MAX_COLOR_PICKS) break;
+      inspected += 1;
+      const binding = manualVideoContextFrameBindingInput(value[rawKey]);
+      if (!binding) continue;
+      limited[boundedClean(rawKey, (MAX_IDENTIFIER_CHARS * 2) + 32)] = binding;
+    }
+  }
+  const normalized = normalizeFrameRangeBindings(
+    limited,
+    manualVideoContextFrameBindingInput(legacyBinding),
+  );
+  const out = {};
+  for (const [key, binding] of Object.entries(normalized)) {
+    if (Object.keys(out).length >= MAX_COLOR_PICKS) break;
+    out[key] = {
+      video_slot: boundedClean(binding.video_slot),
+      color_pick: boundedClean(binding.color_pick),
+      enabled: Boolean(binding.enabled),
+      origin: boundedClean(binding.origin) || "manual",
+      ranges: normalizeManualVideoContextFrameRanges(binding.ranges),
+      start_frame: normalizeFrameDomainEndpoint(binding.start_frame),
+      end_frame: normalizeFrameDomainEndpoint(binding.end_frame),
+    };
+  }
+  return out;
+}
+
+function normalizeManualVideoContextImageFields(value, index) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const colorPicks = normalizeColorPicks(source.color_picks)
+    .map((item) => boundedClean(item));
+  const bindingScopes = normalizeBindingScopes(source.binding_scopes, "", colorPicks.length)
+    .map((item) => boundedClean(item));
+  const bindingCustomScopes = normalizeParallelTextList(
+    source.binding_custom_scopes,
+    colorPicks.length,
+    MAX_COLOR_PICKS,
+  ).map((item) => boundedClean(item));
+  const bindingVideoSlots = normalizeBindingVideoSlots(
+    source.binding_video_slots,
+    source.marker_video,
+    colorPicks.length,
+    MAX_VIDEOS,
+  );
+  const boundedBindings = normalizeManualVideoContextFrameBindings(
+    source.frame_range_bindings,
+    source.frame_range_binding,
+  );
+  const normalizedItem = migrateImage({
+    color_picks: colorPicks,
+    binding_scopes: bindingScopes,
+    binding_custom_scopes: bindingCustomScopes,
+    binding_video_slots: bindingVideoSlots,
+    marker_video: normalizeMarkerVideo(source.marker_video, MAX_VIDEOS),
+    preview_marker: boundedClean(source.preview_marker),
+    picker_auto_video: Math.max(
+      0,
+      Math.min(MAX_VIDEOS, Math.floor(Number(source.picker_auto_video) || 0)),
+    ),
+    picker_auto_color: boundedClean(source.picker_auto_color),
+    picker_auto_source: boundedClean(source.picker_auto_source),
+    frame_range_enabled: Boolean(source.frame_range_enabled),
+    frame_range_color_index: Math.max(
+      0,
+      Math.min(MAX_COLOR_PICKS - 1, Math.floor(Number(source.frame_range_color_index) || 0)),
+    ),
+    frame_range_bindings: boundedBindings,
+    frame_range_binding: null,
+    frame_range_selected_index: normalizeManualVideoContextSelectedRange(
+      source.frame_range_selected_index,
+    ),
+  }, index + 1);
+  const normalizedBindings = normalizeManualVideoContextFrameBindings(
+    normalizedItem.frame_range_bindings,
+  );
+  const normalizedCurrentBinding = Object.values(
+    normalizeManualVideoContextFrameBindings({}, normalizedItem.frame_range_binding),
+  )[0] || null;
+  const fields = {
+    color_picks: normalizedItem.color_picks.map((item) => boundedClean(item)).slice(0, MAX_COLOR_PICKS),
+    binding_scopes: normalizedItem.binding_scopes.map((item) => boundedClean(item)).slice(0, MAX_COLOR_PICKS),
+    binding_custom_scopes: normalizedItem.binding_custom_scopes.map((item) => boundedClean(item)).slice(0, MAX_COLOR_PICKS),
+    binding_video_slots: normalizedItem.binding_video_slots.slice(0, MAX_COLOR_PICKS),
+    marker_video: normalizeMarkerVideo(normalizedItem.marker_video, MAX_VIDEOS),
+    preview_marker: boundedClean(normalizedItem.preview_marker),
+    picker_auto_video: Math.max(
+      0,
+      Math.min(MAX_VIDEOS, Math.floor(Number(normalizedItem.picker_auto_video) || 0)),
+    ),
+    picker_auto_color: boundedClean(normalizedItem.picker_auto_color),
+    picker_auto_source: boundedClean(normalizedItem.picker_auto_source),
+    frame_range_enabled: Boolean(normalizedItem.frame_range_enabled),
+    frame_range_color_index: Math.max(
+      0,
+      Math.min(MAX_COLOR_PICKS - 1, Math.floor(Number(normalizedItem.frame_range_color_index) || 0)),
+    ),
+    frame_range_bindings: normalizedBindings,
+    frame_range_binding: normalizedCurrentBinding,
+    frame_range_selected_index: normalizeManualVideoContextSelectedRange(
+      normalizedItem.frame_range_selected_index,
+    ),
+  };
+  return Object.fromEntries(
+    MANUAL_VIDEO_CONTEXT_IMAGE_FIELDS.map((field) => [field, fields[field]]),
+  );
+}
+
+function normalizeManualVideoContextSnapshot(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const textSource = source.text && typeof source.text === "object" && !Array.isArray(source.text)
+    ? source.text
+    : {};
+  const text = Object.fromEntries(MANUAL_VIDEO_CONTEXT_TEXT_FIELDS.map((key) => [
+    key,
+    boundedClean(
+      textSource[key],
+      key === "VIDEO_VFX" ? MAX_VIDEO_VFX_CHARS : MAX_DESCRIPTION_CHARS,
+    ),
+  ]));
+  const images = [];
+  const rawImages = Array.isArray(source.images) ? source.images.slice(0, MAX_IMAGES) : [];
+  rawImages.forEach((raw, fallbackIndex) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+    const parsedIndex = Number(raw.index);
+    const index = Number.isInteger(parsedIndex)
+      ? Math.max(0, Math.min(MAX_IMAGES - 1, parsedIndex))
+      : fallbackIndex;
+    images.push({
+      identity: boundedClean(raw.identity) || `slot:${index + 1}`,
+      index,
+      fields: normalizeManualVideoContextImageFields(raw.fields, index),
+    });
+  });
+  const textareaHeights = normalizeUi({
+    resize_mode: HMB_RESIZE_MODE,
+    textarea_heights: source.textarea_heights && typeof source.textarea_heights === "object"
+      ? source.textarea_heights
+      : {},
+  }).textarea_heights;
+  return { text, images, textarea_heights: textareaHeights };
+}
+
+function normalizeManualVideoContext(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  if (
+    value.version !== MANUAL_VIDEO_CONTEXT_VERSION
+    || !value.before
+    || typeof value.before !== "object"
+    || Array.isArray(value.before)
+    || !value.after
+    || typeof value.after !== "object"
+    || Array.isArray(value.after)
+  ) return {};
+  return {
+    version: MANUAL_VIDEO_CONTEXT_VERSION,
+    before: normalizeManualVideoContextSnapshot(value.before),
+    after: normalizeManualVideoContextSnapshot(value.after),
+  };
+}
+
 function hmbTextareaKey(kind, indexOrKey, field) {
   return `${String(kind || "text")}:${String(indexOrKey || "0")}:${String(field || "value")}`;
 }
@@ -1778,6 +2025,7 @@ export function normalizeState(input) {
       pickerInput.dormant_manual_rows,
       false,
     ),
+    manual_video_context: normalizeManualVideoContext(pickerInput.manual_video_context),
     slot_suppressions: normalizePickerSlotSuppressions(pickerInput.slot_suppressions),
     scene: clean(pickerInput.scene),
     video_path: clean(pickerInput.video_path),
@@ -2485,8 +2733,36 @@ function options(list, value, blankLabel, state) {
   }).join("");
 }
 
+export function hmbSyncSelectOptions(select, list, value, blankLabel, state) {
+  if (!select) return false;
+  const desired = (Array.isArray(list) ? list : []).map((item) => ({
+    value: String(item == null ? "" : item),
+    label: String(item === "" ? blankLabel : optionLabel(item, state)),
+  }));
+  const current = Array.from(select.options || []);
+  const optionsChanged = current.length !== desired.length || desired.some((item, index) => {
+    const option = current[index];
+    if (!option) return true;
+    const label = option.textContent != null ? option.textContent : option.text;
+    return String(option.value) !== item.value || String(label == null ? "" : label) !== item.label;
+  });
+  if (optionsChanged) {
+    select.innerHTML = options(
+      desired.map((item) => item.value),
+      String(value == null ? "" : value),
+      blankLabel,
+      state,
+    );
+  }
+  const nextValue = String(value == null ? "" : value);
+  if (String(select.value == null ? "" : select.value) !== nextValue) {
+    select.value = nextValue;
+  }
+  return optionsChanged;
+}
 
-function colorPickOptions(images, rowIndex, pickIndex, videoCount, state) {
+
+function colorPickChoices(images, rowIndex, pickIndex, videoCount) {
   const row = (images || [])[rowIndex] || {};
   normalizeImageBindingFields(row, MAX_VIDEOS);
   const markerVideo = normalizeMarkerVideo(row.binding_video_slots[pickIndex], MAX_VIDEOS);
@@ -2506,7 +2782,19 @@ function colorPickOptions(images, rowIndex, pickIndex, videoCount, state) {
     ...(current && !allowed.includes(current) ? [current] : []),
     ...allowed.filter((item) => item === current || !used.includes(item)),
   ];
-  return options(uniqueList(choices), current, "—", state);
+  return uniqueList(choices);
+}
+
+function colorPickOptions(images, rowIndex, pickIndex, videoCount, state) {
+  const row = (images || [])[rowIndex] || {};
+  normalizeImageBindingFields(row, MAX_VIDEOS);
+  const current = clean(row.color_picks[pickIndex]);
+  return options(
+    colorPickChoices(images, rowIndex, pickIndex, videoCount),
+    current,
+    "—",
+    state,
+  );
 }
 
 function verifiedRegisteredSubtype(item) {
@@ -3279,13 +3567,17 @@ function renderColorPickControls(item, rowIndex, images, state) {
   return `<div class="video-color-pick-wrap"><div class="color-pick-stack">${item.color_picks.map((pick, pickIndex) => `<div class="color-binding-entry"><select class="source-select image-video-index binding-video-index" data-field="binding_video_slots" data-binding-index="${pickIndex}" title="${title}" aria-label="${title}">${videoNumberOptions(state, item.binding_video_slots[pickIndex])}</select><select class="source-select color-pick-select" data-field="color_picks" data-color-index="${pickIndex}" aria-label="${escapeHtml(uiText(state, "video_color_pick", "Video / Color Pick"))}">${colorPickOptions(images, rowIndex, pickIndex, count, state)}</select></div>`).join("")}</div></div>`;
 }
 
-function videoNumberOptions(state, current) {
+function videoNumberChoices(current) {
   const choices = editableVideoSlotChoices();
   const savedValue = String(normalizeMarkerVideo(current, MAX_VIDEOS));
-  const displayChoices = choices.includes(savedValue)
+  return uniqueList(choices.includes(savedValue)
     ? choices
-    : [savedValue, ...choices];
-  return options(uniqueList(displayChoices), savedValue, "1", state);
+    : [savedValue, ...choices]);
+}
+
+function videoNumberOptions(state, current) {
+  const savedValue = String(normalizeMarkerVideo(current, MAX_VIDEOS));
+  return options(videoNumberChoices(current), savedValue, "1", state);
 }
 
 function renderImageActions(item, state, index, imageCount) {
@@ -3410,16 +3702,27 @@ export function removeImageRowAndPromote(state, sourceIndex) {
 }
 
 function renderVideoActions(state) {
-  const label = uiText(state, "delete_video_row", "Delete video source row");
-  return `<div class="source-actions"><button class="clear-source" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}">X</button></div>`;
+  const pickerLocked = hmbPromptVideoRowsLocked(state);
+  const label = pickerLocked
+    ? uiText(
+      state,
+      "delete_video_row_picker_locked",
+      "Video rows cannot be deleted while Picker is connected",
+    )
+    : uiText(state, "delete_video_row", "Delete video source row");
+  return `<div class="source-actions"><button class="clear-source" data-picker-locked="${pickerLocked ? "true" : "false"}" ${pickerLocked ? "disabled" : ""} title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}">X</button></div>`;
 }
 
 export function hmbCanAddPromptImageRow(state, images = state?.images) {
   return !Boolean(state?.image_asset?.enabled) && (images || []).length < MAX_IMAGES;
 }
 
+export function hmbPromptVideoRowsLocked(state) {
+  return Boolean(state?.picker?.enabled);
+}
+
 export function hmbCanAddPromptVideoRow(state, videos = state?.videos) {
-  return !Boolean(state?.picker?.enabled) && (videos || []).length < MAX_VIDEOS;
+  return !hmbPromptVideoRowsLocked(state) && (videos || []).length < MAX_VIDEOS;
 }
 
 function renderImageAddRow(images, state) {
@@ -3497,8 +3800,13 @@ function refreshImageTargetControls(container, state) {
       const item = images[index];
       const select = row.querySelector('select[data-field="owner"]');
       if (!item || !select) return;
-      select.innerHTML = targetSelectOptions(item, images, state);
-      select.value = clean(item.owner);
+      hmbSyncSelectOptions(
+        select,
+        imageTargetChoicesForRow(item, images),
+        clean(item.owner),
+        uiText(state, "blank_target", "— blank / no target —"),
+        state,
+      );
     });
   } catch (_e) {}
 }
@@ -3561,13 +3869,13 @@ function hmbRefreshImageSubtypeControls(row, item, state) {
   row.querySelectorAll?.('select[data-field="binding_scopes"]').forEach((select) => {
     const bindingIndex = Number(select.getAttribute("data-binding-index") || 0);
     const scope = clean(item.binding_scopes[bindingIndex]);
-    select.innerHTML = options(
+    hmbSyncSelectOptions(
+      select,
       imageScopeChoicesForRow(item, scope),
       scope,
       uiText(state, "blank_subtype", "— blank / no subtype —"),
       state,
     );
-    select.value = scope;
     const input = select.closest?.(".binding-scope-entry")?.querySelector?.(".custom-inline-input");
     if (input) {
       input.value = clean(item.binding_custom_scopes[bindingIndex]);
@@ -3593,13 +3901,13 @@ function hmbRefreshVideoDependentControls(row, item, index, state) {
   const roleSelect = row.querySelector?.('select[data-field="control_role"]');
   if (roleSelect) {
     const blankRole = uiText(state, "blank_control_role", "— optional / choose role —");
-    roleSelect.innerHTML = options(
+    hmbSyncSelectOptions(
+      roleSelect,
       compatibleVideoRoleChoices(item, primaryVideo),
       item.control_role,
       blankRole,
       state,
     );
-    roleSelect.value = clean(item.control_role);
   }
   const panel = row.querySelector?.(".video-custom-panel");
   const sourceVisible = item.source_type === "Custom";
@@ -3626,16 +3934,26 @@ function hmbRefreshImageColorControls(container, state) {
     row.querySelectorAll?.('select[data-field="binding_video_slots"]').forEach((select) => {
       const bindingIndex = Number(select.getAttribute("data-binding-index") || 0);
       const videoSlot = item.binding_video_slots[bindingIndex];
-      select.innerHTML = videoNumberOptions(state, videoSlot);
-      select.value = String(videoSlot);
+      hmbSyncSelectOptions(
+        select,
+        videoNumberChoices(videoSlot),
+        String(normalizeMarkerVideo(videoSlot, MAX_VIDEOS)),
+        "1",
+        state,
+      );
       select.disabled = false;
       select.setAttribute?.("data-hmb-base-disabled", "0");
     });
     row.querySelectorAll?.('select[data-field="color_picks"]').forEach((select) => {
       const pickIndex = Number(select.getAttribute("data-color-index") || 0);
       const pick = clean(item.color_picks[pickIndex]);
-      select.innerHTML = colorPickOptions(images, rowIndex, pickIndex, count, state);
-      select.value = pick;
+      hmbSyncSelectOptions(
+        select,
+        colorPickChoices(images, rowIndex, pickIndex, count),
+        pick,
+        "—",
+        state,
+      );
       select.disabled = false;
       select.setAttribute?.("data-hmb-base-disabled", "0");
     });
@@ -5114,6 +5432,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
       const kind = row ? row.getAttribute("data-kind") : "";
       const index = row ? Number(row.getAttribute("data-index")) : -1;
       const handler = () => {
+        if (kind === "video" && hmbPromptVideoRowsLocked(state)) return;
         const target = kind === "image" ? state.images : state.videos;
         if (target[index]) {
           if (kind === "image") {

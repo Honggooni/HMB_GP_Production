@@ -104,11 +104,21 @@ assert.equal(
   false,
   "A Picker connection must lock the Prompt video + button.",
 );
+assert.equal(
+  widget.hmbPromptVideoRowsLocked(connectedVideoAddState),
+  true,
+  "A Picker connection must lock all Prompt-owned video row structure.",
+);
 connectedVideoAddState.picker.enabled = false;
 assert.equal(
   widget.hmbCanAddPromptVideoRow(connectedVideoAddState),
   true,
   "Disconnecting Picker must immediately restore the Prompt video + button.",
+);
+assert.equal(
+  widget.hmbPromptVideoRowsLocked(connectedVideoAddState),
+  false,
+  "Disconnecting Picker must immediately restore video row deletion too.",
 );
 const fullIndependentVideoState = widget.normalizeState({
   videos: Array.from({ length: 10 }, (_value, index) => ({
@@ -133,6 +143,231 @@ assert.match(
   /querySelectorAll\("\.add-video-source"\)[\s\S]*?if \(!hmbCanAddPromptVideoRow\(state\)\) return;/,
   "The video click path must reject stale or forced clicks while Picker is connected.",
 );
+assert.match(
+  source,
+  /function renderVideoActions\(state\)[\s\S]*?hmbPromptVideoRowsLocked\(state\)[\s\S]*?data-picker-locked=[\s\S]*?disabled/,
+  "The rendered video X button must apply the same Picker connection lock.",
+);
+assert.match(
+  source,
+  /querySelectorAll\("\.clear-source"\)[\s\S]*?if \(kind === "video" && hmbPromptVideoRowsLocked\(state\)\) return;/,
+  "The video delete click path must reject stale or forced clicks while Picker is connected.",
+);
+
+const selectState = widget.normalizeState({ ui: { language: "en" } });
+const stableRoleSelect = {
+  options: [
+    { value: "", textContent: "optional" },
+    { value: "Timing Only", textContent: "Timing Only" },
+  ],
+  value: "Timing Only",
+  writes: 0,
+  set innerHTML(_value) { this.writes += 1; },
+};
+assert.equal(
+  widget.hmbSyncSelectOptions(
+    stableRoleSelect,
+    ["", "Timing Only"],
+    "Timing Only",
+    "optional",
+    selectState,
+  ),
+  false,
+  "An unchanged Main/Sub Type option list must keep its live DOM nodes.",
+);
+assert.equal(stableRoleSelect.writes, 0, "An unchanged select must not rewrite innerHTML and flicker.");
+assert.equal(stableRoleSelect.value, "Timing Only");
+
+assert.equal(
+  widget.hmbSyncSelectOptions(
+    stableRoleSelect,
+    ["", "FX Behavior Only"],
+    "FX Behavior Only",
+    "optional",
+    selectState,
+  ),
+  true,
+  "A genuinely changed taxonomy must rebuild the option list once.",
+);
+assert.equal(stableRoleSelect.writes, 1);
+assert.equal(stableRoleSelect.value, "FX Behavior Only");
+
+const manualContextImageFields = [
+  "color_picks",
+  "binding_scopes",
+  "binding_custom_scopes",
+  "binding_video_slots",
+  "marker_video",
+  "preview_marker",
+  "picker_auto_video",
+  "picker_auto_color",
+  "picker_auto_source",
+  "frame_range_enabled",
+  "frame_range_color_index",
+  "frame_range_bindings",
+  "frame_range_binding",
+  "frame_range_selected_index",
+];
+const contextImage = {
+  identity: "x".repeat(300),
+  index: 999,
+  unknown_record_field: "drop",
+  fields: {
+    color_picks: ["Red", "Green", "Blue", "drop"],
+    binding_scopes: ["Full body / full appearance", "ignored", "ignored"],
+    binding_custom_scopes: ["", "ignored", "ignored"],
+    binding_video_slots: [2, 3, 4, 10],
+    marker_video: 2,
+    preview_marker: "marker",
+    picker_auto_video: 2,
+    picker_auto_color: "Red",
+    picker_auto_source: "picker-run",
+    frame_range_enabled: true,
+    frame_range_color_index: 1,
+    frame_range_bindings: {
+      "@video2::Red": {
+        video_slot: "@video2",
+        color_pick: "Red",
+        enabled: true,
+        origin: "manual",
+        ranges: [{ start: -50, end: 12000 }],
+        start_frame: -50,
+        end_frame: 12000,
+        unknown_binding_field: "drop",
+      },
+      "@video3::Green": {
+        video_slot: "@video3",
+        color_pick: "Green",
+        enabled: true,
+        origin: "manual",
+        ranges: [{ start: 101, end: 110 }],
+        start_frame: 101,
+        end_frame: 110,
+      },
+      "@video4::Blue": {
+        video_slot: "@video4",
+        color_pick: "Blue",
+        enabled: false,
+        ranges: [],
+      },
+      "@video5::drop": {
+        video_slot: "@video5",
+        color_pick: "drop",
+        enabled: true,
+        ranges: [],
+      },
+    },
+    frame_range_binding: {
+      video_slot: "@video3",
+      color_pick: "Green",
+      enabled: true,
+      origin: "manual",
+      ranges: [{ start: 101, end: 110 }],
+      start_frame: 101,
+      end_frame: 110,
+    },
+    frame_range_selected_index: 999,
+    unknown_image_field: "drop",
+  },
+};
+const manualContextInput = {
+  version: 1,
+  unknown_context_field: "drop",
+  before: {
+    text: {
+      PROJECT_STYLE_LOOK: "P".repeat(6100),
+      SCENE_CONTEXT: "forest",
+      EMOTION_INTENT: "focused",
+      VIDEO_VFX: "F".repeat(20100),
+      PRESERVED_TEXT: "must not be cached",
+      UNKNOWN_TEXT: "drop",
+    },
+    images: [
+      contextImage,
+      ...Array.from({ length: 54 }, (_value, index) => ({
+        identity: `slot:${index + 2}`,
+        index: index + 1,
+        fields: {},
+      })),
+    ],
+    textarea_heights: {
+      "video:1:keep_out": 120,
+      "video:11:keep_out": 120,
+      unknown: 120,
+    },
+    unknown_snapshot_field: "drop",
+  },
+  after: {
+    text: { PROJECT_STYLE_LOOK: "after" },
+    images: [contextImage],
+    textarea_heights: { "video:2:keep_out": 80 },
+  },
+};
+const manualContextState = widget.normalizeState({
+  picker: { manual_video_context: manualContextInput },
+});
+const manualContext = manualContextState.picker.manual_video_context;
+assert.deepEqual(Object.keys(manualContext).sort(), ["after", "before", "version"]);
+assert.deepEqual(
+  Object.keys(manualContext.before).sort(),
+  ["images", "text", "textarea_heights"],
+  "The cached snapshot must be a closed object.",
+);
+assert.deepEqual(
+  Object.keys(manualContext.before.text).sort(),
+  ["EMOTION_INTENT", "PROJECT_STYLE_LOOK", "SCENE_CONTEXT", "VIDEO_VFX"],
+  "PRESERVED_TEXT and unknown text fields must not enter the remap cache.",
+);
+assert.equal(manualContext.before.text.PROJECT_STYLE_LOOK.length, 6000);
+assert.equal(manualContext.before.text.VIDEO_VFX.length, 20000);
+assert.equal(manualContext.before.images.length, 50, "The remap cache must remain image-count bounded.");
+assert.equal(manualContext.before.images[0].identity.length, 256);
+assert.equal(manualContext.before.images[0].index, 49);
+assert.deepEqual(Object.keys(manualContext.before.images[0].fields), manualContextImageFields);
+assert.ok(
+  Object.keys(manualContext.before.images[0].fields.frame_range_bindings).length <= 3,
+  "Only one bounded binding per Color Pick may survive in the cache.",
+);
+assert.deepEqual(
+  manualContext.before.images[0].fields.frame_range_bindings["@video2::Red"].ranges,
+  [{ start: 0, end: 9999 }],
+);
+assert.equal(manualContext.before.images[0].fields.frame_range_selected_index, 99);
+assert.deepEqual(manualContext.before.textarea_heights, { "video:1:keep_out": 120 });
+assert.deepEqual(
+  widget.normalizeState(JSON.parse(JSON.stringify(manualContextState))).picker.manual_video_context,
+  manualContext,
+  "A host JSON echo must preserve the complete closed manual-video snapshot losslessly.",
+);
+assert.deepEqual(
+  widget.normalizeState({ picker: { manual_video_context: { ...manualContextInput, version: "1" } } })
+    .picker.manual_video_context,
+  {},
+  "Non-numeric context versions must fail closed.",
+);
+assert.deepEqual(
+  widget.normalizeState({ picker: { manual_video_context: { version: 1, before: [], after: {} } } })
+    .picker.manual_video_context,
+  {},
+  "Malformed snapshot containers must fail closed.",
+);
+
+const targetRefreshSource = source.slice(
+  source.indexOf("function refreshImageTargetControls"),
+  source.indexOf("function imageScopeChoicesForRow"),
+);
+assert.match(targetRefreshSource, /hmbSyncSelectOptions\(/);
+assert.doesNotMatch(targetRefreshSource, /\.innerHTML\s*=/);
+const colorRefreshSource = source.slice(
+  source.indexOf("function hmbRefreshImageColorControls"),
+  source.indexOf("function hmbRefreshSourceSummaries"),
+);
+assert.equal(
+  (colorRefreshSource.match(/hmbSyncSelectOptions\(/g) || []).length,
+  2,
+  "Video-slot and Color Pick selects must both use option-diff synchronization.",
+);
+assert.doesNotMatch(colorRefreshSource, /select\.innerHTML\s*=/);
 
 state.images.push({ slot: 2, label: "", present: false, manual: true });
 widget.hmbCommitLocalPromptStructure(container, props, state, () => {

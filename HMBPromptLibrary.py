@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 import hashlib
 import importlib.util
@@ -134,6 +135,7 @@ WIDGET_LIBRARY_NAME = "HMB_GP_Production"
 STATE_SCHEMA = "prompt-library-state"
 MODE_NAME = "prompt_only_role_dashboard"
 SOURCE_SYNC_REVISION_KEY = "source_sync_revision"
+MANUAL_VIDEO_CONTEXT_KEY = "manual_video_context"
 MAX_SOURCE_SYNC_REVISION = (1 << 53) - 1
 UI_RESIZE_MODE = "stacked_outer_1000"
 GROUP_START_HEIGHTS = {
@@ -1260,6 +1262,7 @@ def _default_widget_state() -> Dict[str, Any]:
             "order_managed": False,
             "dormant_video_rows": [],
             "dormant_manual_rows": [],
+            MANUAL_VIDEO_CONTEXT_KEY: {},
             "slot_suppressions": {},
             "scene": "",
             "video_path": "",
@@ -2723,6 +2726,315 @@ def _normalize_dormant_video_rows(
     return normalized
 
 
+_MANUAL_VIDEO_CONTEXT_IMAGE_FIELDS = (
+    "color_picks",
+    "binding_scopes",
+    "binding_custom_scopes",
+    "binding_video_slots",
+    "marker_video",
+    "preview_marker",
+    "picker_auto_video",
+    "picker_auto_color",
+    "picker_auto_source",
+    "frame_range_enabled",
+    "frame_range_color_index",
+    "frame_range_bindings",
+    "frame_range_binding",
+    "frame_range_selected_index",
+)
+
+
+def _manual_video_context_image_identity(
+    item: Dict[str, Any],
+    index: int,
+) -> str:
+    source_uid = _clean_string(
+        item.get("asset_source_uid") or item.get("source_uid")
+    )
+    if source_uid:
+        return f"uid:{source_uid}"
+    asset_id = _clean_string(item.get("asset_id"))
+    if asset_id:
+        return f"asset:{asset_id}"
+    return f"slot:{index + 1}"
+
+
+def _manual_video_context_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Capture only fields that video-slot remapping may mutate."""
+
+    text_source = state.get("text") if isinstance(state.get("text"), dict) else {}
+    text = {
+        key: copy.deepcopy(text_source.get(key, ""))
+        for key in TEXT_FIELD_DEFAULTS
+        if key != "PRESERVED_TEXT"
+    }
+    images: List[Dict[str, Any]] = []
+    for index, item in enumerate(
+        state.get("images", []) if isinstance(state.get("images"), list) else []
+    ):
+        if not isinstance(item, dict) or index >= MAX_IMAGES:
+            continue
+        images.append({
+            "identity": _manual_video_context_image_identity(item, index),
+            "index": index,
+            "fields": {
+                field: copy.deepcopy(item.get(field))
+                for field in _MANUAL_VIDEO_CONTEXT_IMAGE_FIELDS
+            },
+        })
+    ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
+    textarea_heights = (
+        ui.get("textarea_heights")
+        if isinstance(ui.get("textarea_heights"), dict)
+        else {}
+    )
+    return {
+        "text": text,
+        "images": images,
+        "textarea_heights": copy.deepcopy(textarea_heights),
+    }
+
+
+def _normalize_manual_video_context_snapshot(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        value = {}
+    text_source = value.get("text") if isinstance(value.get("text"), dict) else {}
+    text = {
+        key: _clean_string(text_source.get(key))[:MAX_PROMPT_CHARS]
+        for key in TEXT_FIELD_DEFAULTS
+        if key != "PRESERVED_TEXT"
+    }
+    images: List[Dict[str, Any]] = []
+    raw_images = value.get("images") if isinstance(value.get("images"), list) else []
+    for fallback_index, raw in enumerate(raw_images[:MAX_IMAGES]):
+        if not isinstance(raw, dict):
+            continue
+        try:
+            index = max(0, min(MAX_IMAGES - 1, int(raw.get("index", fallback_index))))
+        except Exception:
+            index = fallback_index
+        fields_source = raw.get("fields") if isinstance(raw.get("fields"), dict) else {}
+        normalized_item = _migrate_old_image_item(fields_source, index + 1)
+        images.append({
+            "identity": _clean_string(raw.get("identity")) or f"slot:{index + 1}",
+            "index": index,
+            "fields": {
+                field: copy.deepcopy(normalized_item.get(field))
+                for field in _MANUAL_VIDEO_CONTEXT_IMAGE_FIELDS
+            },
+        })
+    textarea_source = (
+        value.get("textarea_heights")
+        if isinstance(value.get("textarea_heights"), dict)
+        else {}
+    )
+    textarea_heights = _normalize_ui({
+        "ui": {
+            "textarea_heights": textarea_source,
+            "resize_mode": UI_RESIZE_MODE,
+        },
+    }).get("textarea_heights", {})
+    return {
+        "text": text,
+        "images": images,
+        "textarea_heights": textarea_heights,
+    }
+
+
+def _normalize_manual_video_context(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    version = value.get("version")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != 1
+        or not isinstance(value.get("before"), dict)
+        or not isinstance(
+        value.get("after"), dict
+        )
+    ):
+        return {}
+    return {
+        "version": 1,
+        "before": _normalize_manual_video_context_snapshot(value.get("before")),
+        "after": _normalize_manual_video_context_snapshot(value.get("after")),
+    }
+
+
+def _mapping_entry_matches(
+    left: Dict[str, Any],
+    right: Dict[str, Any],
+    key: str,
+) -> bool:
+    return (key in left) == (key in right) and left.get(key) == right.get(key)
+
+
+def _replace_mapping_entry(
+    target: Dict[str, Any],
+    source: Dict[str, Any],
+    key: str,
+) -> None:
+    if key in source:
+        target[key] = copy.deepcopy(source[key])
+    else:
+        target.pop(key, None)
+
+
+def _manual_video_context_image_records(
+    snapshot: Dict[str, Any],
+) -> Dict[tuple[str, Any], Dict[str, Any]]:
+    raw_records = [
+        record
+        for record in snapshot.get("images", [])
+        if isinstance(record, dict)
+    ]
+    stable_identity_counts: Dict[str, int] = {}
+    for record in raw_records:
+        identity = _clean_string(record.get("identity"))
+        if identity.startswith(("uid:", "asset:")):
+            stable_identity_counts[identity] = (
+                stable_identity_counts.get(identity, 0) + 1
+            )
+
+    records: Dict[tuple[str, Any], Dict[str, Any]] = {}
+    for fallback_index, record in enumerate(raw_records):
+        if not isinstance(record, dict):
+            continue
+        try:
+            index = int(record.get("index", fallback_index))
+        except Exception:
+            index = fallback_index
+        identity = _clean_string(record.get("identity")) or f"slot:{index + 1}"
+        # Asset/source identity survives ImageAsset reorder.  Index is only a
+        # fallback for anonymous or duplicate rows where identity cannot pick
+        # one record unambiguously.
+        key: tuple[str, Any] = (
+            ("identity", identity)
+            if identity.startswith(("uid:", "asset:"))
+            and stable_identity_counts.get(identity) == 1
+            else ("index", index)
+        )
+        records[key] = record
+    return records
+
+
+def _advance_manual_video_context(
+    current_context: Any,
+    before_sync: Dict[str, Any],
+    after_sync: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Advance automatic baselines without claiming user-authored edits."""
+
+    normalized = _normalize_manual_video_context(current_context)
+    if not normalized:
+        return {
+            "version": 1,
+            "before": copy.deepcopy(before_sync),
+            "after": copy.deepcopy(after_sync),
+        }
+    old_after = normalized["after"]
+    next_after = copy.deepcopy(old_after)
+    old_text = old_after.get("text", {})
+    before_text = before_sync.get("text", {})
+    after_text = after_sync.get("text", {})
+    next_text = next_after.setdefault("text", {})
+    for key in set(old_text) | set(before_text) | set(after_text):
+        if _mapping_entry_matches(before_text, old_text, key):
+            _replace_mapping_entry(next_text, after_text, key)
+
+    old_images = _manual_video_context_image_records(old_after)
+    before_images = _manual_video_context_image_records(before_sync)
+    after_images = _manual_video_context_image_records(after_sync)
+    next_images = _manual_video_context_image_records(next_after)
+    for record_key, old_record in old_images.items():
+        before_record = before_images.get(record_key)
+        after_record = after_images.get(record_key)
+        next_record = next_images.get(record_key)
+        if not before_record or not after_record or not next_record:
+            continue
+        old_fields = old_record.get("fields", {})
+        before_fields = before_record.get("fields", {})
+        after_fields = after_record.get("fields", {})
+        next_fields = next_record.setdefault("fields", {})
+        for field in _MANUAL_VIDEO_CONTEXT_IMAGE_FIELDS:
+            if _mapping_entry_matches(before_fields, old_fields, field):
+                _replace_mapping_entry(next_fields, after_fields, field)
+
+    old_heights = old_after.get("textarea_heights", {})
+    before_heights = before_sync.get("textarea_heights", {})
+    after_heights = after_sync.get("textarea_heights", {})
+    next_heights = next_after.setdefault("textarea_heights", {})
+    for key in set(old_heights) | set(before_heights) | set(after_heights):
+        if _mapping_entry_matches(before_heights, old_heights, key):
+            _replace_mapping_entry(next_heights, after_heights, key)
+    return {
+        "version": 1,
+        "before": normalized["before"],
+        "after": next_after,
+    }
+
+
+def _restore_manual_video_context(
+    state: Dict[str, Any],
+    context: Any,
+) -> None:
+    """Three-way restore automatic remaps while preserving later user edits."""
+
+    normalized = _normalize_manual_video_context(context)
+    if not normalized:
+        return
+    original = normalized["before"]
+    automatic = normalized["after"]
+    current = _manual_video_context_snapshot(state)
+
+    state_text = state.get("text") if isinstance(state.get("text"), dict) else {}
+    state["text"] = state_text
+    original_text = original.get("text", {})
+    automatic_text = automatic.get("text", {})
+    current_text = current.get("text", {})
+    for key in set(original_text) | set(automatic_text):
+        if _mapping_entry_matches(current_text, automatic_text, key):
+            _replace_mapping_entry(state_text, original_text, key)
+
+    original_images = _manual_video_context_image_records(original)
+    automatic_images = _manual_video_context_image_records(automatic)
+    current_images = _manual_video_context_image_records(current)
+    state_images = state.get("images") if isinstance(state.get("images"), list) else []
+    for record_key, automatic_record in automatic_images.items():
+        original_record = original_images.get(record_key)
+        current_record = current_images.get(record_key)
+        if not original_record or not current_record:
+            continue
+        try:
+            index = int(current_record.get("index", -1))
+        except Exception:
+            continue
+        if index < 0 or index >= len(state_images) or not isinstance(state_images[index], dict):
+            continue
+        automatic_fields = automatic_record.get("fields", {})
+        original_fields = original_record.get("fields", {})
+        current_fields = current_record.get("fields", {})
+        for field in _MANUAL_VIDEO_CONTEXT_IMAGE_FIELDS:
+            if _mapping_entry_matches(current_fields, automatic_fields, field):
+                _replace_mapping_entry(state_images[index], original_fields, field)
+
+    ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
+    state["ui"] = ui
+    state_heights = (
+        ui.get("textarea_heights")
+        if isinstance(ui.get("textarea_heights"), dict)
+        else {}
+    )
+    ui["textarea_heights"] = state_heights
+    original_heights = original.get("textarea_heights", {})
+    automatic_heights = automatic.get("textarea_heights", {})
+    current_heights = current.get("textarea_heights", {})
+    for key in set(original_heights) | set(automatic_heights):
+        if _mapping_entry_matches(current_heights, automatic_heights, key):
+            _replace_mapping_entry(state_heights, original_heights, key)
+
+
 def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
     try:
         source_sync_revision = int(state.get(SOURCE_SYNC_REVISION_KEY) or 0)
@@ -2827,6 +3139,9 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "dormant_manual_rows": _normalize_dormant_video_rows(
             picker_source.get("dormant_manual_rows"),
             managed=False,
+        ),
+        MANUAL_VIDEO_CONTEXT_KEY: _normalize_manual_video_context(
+            picker_source.get(MANUAL_VIDEO_CONTEXT_KEY)
         ),
         "slot_suppressions": _normalize_picker_slot_suppressions(
             picker_source.get("slot_suppressions")
@@ -3096,7 +3411,8 @@ def _image_replacement_line(item: Dict[str, Any], seq: int) -> str | None:
             )
         if source_type == "Custom":
             return (
-                f"{_effective_image_source_type(item)} applies to {owner} = {marker} / "
+                f"{_public_single_line(_effective_image_source_type(item))} "
+                f"applies to {owner} = {marker} / "
                 f"@image{seq}{_detail_suffix(scope)}"
             )
         return (
@@ -4463,7 +4779,16 @@ def _upsert_dormant_video_row(
     row = _migrate_old_video_item(item, len(rows) + 1)
     row["video_uid"] = uid
     row["source_uid"] = uid
-    row["selection_order"] = 0
+    try:
+        previous_selection_order = int(
+            item.get("selection_order") or item.get("slot") or 0
+        )
+    except Exception:
+        previous_selection_order = 0
+    row["selection_order"] = max(
+        0,
+        min(MAX_VIDEOS, previous_selection_order),
+    )
     row["order_key"] = uid
     row["picker_managed"] = True
     row["slot"] = 0
@@ -4479,7 +4804,12 @@ def _upsert_dormant_video_row(
 def _prepare_uid_managed_video_rows(
     state: Dict[str, Any],
     payload_videos: List[Dict[str, Any]],
-) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> tuple[
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    Dict[str, Any],
+]:
     """Merge selected Picker rows by UID and derive their transient slots."""
     picker = state.get("picker") if isinstance(state.get("picker"), dict) else {}
     old_rows = [
@@ -4495,6 +4825,9 @@ def _prepare_uid_managed_video_rows(
         picker.get("dormant_manual_rows"),
         managed=False,
     )
+    manual_context = _normalize_manual_video_context(
+        picker.get(MANUAL_VIDEO_CONTEXT_KEY)
+    )
     candidates_by_uid: Dict[str, Dict[str, Any]] = {}
     for item in [*dormant, *old_rows]:
         uid = _picker_video_uid(item)
@@ -4502,6 +4835,30 @@ def _prepare_uid_managed_video_rows(
             candidates_by_uid[uid] = item
 
     previously_uid_managed = bool(picker.get("order_managed"))
+    generated_empty_placeholder = bool(
+        int(picker.get("selected_video_count") or 0) == 0
+        and len(old_rows) == 1
+        and _migrate_old_video_item(old_rows[0], 1)
+        == _migrate_old_video_item(_default_video_item(1), 1)
+    )
+    if not previously_uid_managed:
+        # Snapshot every native row before positional Picker adoption assigns a
+        # UID to it.  The old implementation cached only rows outside the new
+        # selected count, so @video1 could never return on disconnect.
+        manual_cache = (
+            []
+            if generated_empty_placeholder
+            else _normalize_dormant_video_rows(
+                old_rows,
+                managed=False,
+            )[:MAX_VIDEOS]
+        )
+        entry_snapshot = _manual_video_context_snapshot(state)
+        manual_context = {
+            "version": 1,
+            "before": copy.deepcopy(entry_snapshot),
+            "after": copy.deepcopy(entry_snapshot),
+        }
     used_old_row_ids: set[int] = set()
     new_slot_by_old_row_id: Dict[int, int] = {}
     selected_rows: List[Dict[str, Any]] = []
@@ -4537,12 +4894,30 @@ def _prepare_uid_managed_video_rows(
         uid = _picker_video_uid(item)
         if uid and uid not in selected_uids:
             _upsert_dormant_video_row(dormant_out, item)
-        elif not uid and id(item) not in used_old_row_ids:
-            manual_cache.append(_migrate_old_video_item(item, len(manual_cache) + 1))
+        # While UID order is managed, Prompt's add/delete controls are locked.
+        # Any UID-less visible row is a transient placeholder, never a new
+        # manual asset to append to the immutable pre-connection snapshot.
 
     new_slot_by_uid = {
         _picker_video_uid(item): slot
         for slot, item in enumerate(selected_rows, start=1)
+    }
+    previous_picker_slot_by_uid: Dict[str, int] = {}
+    for item in [*dormant, *old_rows]:
+        uid = _picker_video_uid(item)
+        if not uid:
+            continue
+        try:
+            previous_slot = int(
+                item.get("selection_order") or item.get("slot") or 0
+            )
+        except Exception:
+            previous_slot = 0
+        if previous_slot > 0:
+            previous_picker_slot_by_uid[uid] = previous_slot
+    picker_row_slot_map = {
+        previous_slot: new_slot_by_uid.get(uid, 0)
+        for uid, previous_slot in previous_picker_slot_by_uid.items()
     }
     slot_map: Dict[int, int] = {}
     for old_slot, item in enumerate(old_rows, start=1):
@@ -4554,13 +4929,19 @@ def _prepare_uid_managed_video_rows(
         else:
             slot_map[old_slot] = 0
     if any(old != new for old, new in slot_map.items()):
+        context_before_sync = _manual_video_context_snapshot(state)
         _remap_video_source_references_in_state(state, slot_map)
         for item in selected_rows:
             item["keep_out"] = _remap_video_source_references(
                 item.get("keep_out"),
-                slot_map,
+                picker_row_slot_map or slot_map,
             )
-    return selected_rows, dormant_out, manual_cache
+        manual_context = _advance_manual_video_context(
+            manual_context,
+            context_before_sync,
+            _manual_video_context_snapshot(state),
+        )
+    return selected_rows, dormant_out, manual_cache[:MAX_VIDEOS], manual_context
 
 
 _PICKER_AUTO_DEPTH_FIELDS = (
@@ -5233,6 +5614,49 @@ def _picker_companion_expected_run_id(
     ) or None
 
 
+def _release_picker_video_row_provenance(
+    item: Dict[str, Any],
+    slot: int,
+) -> Dict[str, Any]:
+    """Convert one connected Picker row back into an ordinary Prompt row."""
+
+    row = _migrate_old_video_item(item, slot)
+    _invalidate_picker_generated_depth(row)
+    _invalidate_picker_generated_motion_guide(row)
+    row.update({
+        "slot": slot,
+        "token": f"@video{slot}",
+        "name": _slot_name("VIDEO", slot),
+        "video_uid": "",
+        "source_uid": "",
+        "selection_order": 0,
+        "order_key": "",
+        "picker_managed": False,
+        "picker_companion_kind": "",
+        "picker_companion_source_slot": -1,
+        "picker_companion_source_uid": "",
+        "picker_companion_validated": False,
+        "manual": True,
+    })
+    return row
+
+
+def _renumber_video_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        _release_picker_video_row_provenance(item, slot)
+        if bool(item.get("picker_managed") or _picker_video_uid(item))
+        else {
+            **_migrate_old_video_item(item, slot),
+            "slot": slot,
+            "token": f"@video{slot}",
+            "name": _slot_name("VIDEO", slot),
+            "manual": True,
+        }
+        for slot, item in enumerate(rows[:MAX_VIDEOS], start=1)
+        if isinstance(item, dict)
+    ]
+
+
 def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connected: bool = False) -> Dict[str, Any]:
     """Apply Maya binding data while preserving manual Color Pick edits.
 
@@ -5509,7 +5933,12 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
         and not legacy_video_path
     )
     if authoritative_empty_uid_selection:
-        _, dormant_video_rows, dormant_manual_rows = (
+        (
+            _,
+            dormant_video_rows,
+            dormant_manual_rows,
+            manual_video_context,
+        ) = (
             _prepare_uid_managed_video_rows(normalized, [])
         )
         normalized["videos"] = [_default_video_item(1)]
@@ -5523,6 +5952,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             "order_managed": True,
             "dormant_video_rows": dormant_video_rows,
             "dormant_manual_rows": dormant_manual_rows,
+            MANUAL_VIDEO_CONTEXT_KEY: manual_video_context,
             "slot_suppressions": {},
             "scene": _clean_string(payload.get("scene") or payload.get("scene_path")),
             "video_path": "",
@@ -5540,11 +5970,57 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
                     connected or previous_picker.get("enabled")
                 )
             return _normalize_state(normalized)
+        previous_enabled = bool(previous_picker.get("enabled"))
+        previous_order_managed = bool(previous_picker.get("order_managed"))
+        dormant_video_rows = _normalize_dormant_video_rows(
+            previous_picker.get("dormant_video_rows"),
+            managed=True,
+        )
+        dormant_manual_rows = _normalize_dormant_video_rows(
+            previous_picker.get("dormant_manual_rows"),
+            managed=False,
+        )
+        manual_video_context = _normalize_manual_video_context(
+            previous_picker.get(MANUAL_VIDEO_CONTEXT_KEY)
+        )
+        has_manual_restore_snapshot = bool(manual_video_context)
+        if (
+            not connected
+            and previous_enabled
+            and (previous_order_managed or has_manual_restore_snapshot)
+        ):
+            selected_picker_rows = [
+                item
+                for item in normalized.get("videos", [])
+                if isinstance(item, dict)
+                and bool(item.get("picker_managed") or _picker_video_uid(item))
+            ]
+            for item in selected_picker_rows:
+                _upsert_dormant_video_row(dormant_video_rows, item)
+            if manual_video_context:
+                # New states carry a complete pre-connection snapshot,
+                # including rows that were positionally adopted by Picker.
+                restored_rows = dormant_manual_rows
+            else:
+                # Backward-compatible recovery for workflows saved before the
+                # complete snapshot existed: adopted rows were not in the old
+                # manual cache, so release them ahead of the cached tail.
+                restored_rows = [
+                    _release_picker_video_row_provenance(item, slot)
+                    for slot, item in enumerate(selected_picker_rows, start=1)
+                ]
+                restored_rows.extend(dormant_manual_rows)
+            normalized["videos"] = (
+                _renumber_video_rows(restored_rows)
+                or [_default_video_item(1)]
+            )
+            _restore_manual_video_context(normalized, manual_video_context)
+            manual_video_context = {}
+
         # Release only fields previously auto-authored by Picker companion
-        # provenance. Native/manual rows are untouched, so a workflow with no
-        # Picker input retains its original Prompt state.  A connected semantic
-        # payload containing only empty UI slot placeholders follows this same
-        # path: it is awaiting data, not authoritative media lifecycle data.
+        # provenance. A connected semantic payload containing only empty UI
+        # placeholders remains awaiting data; only a true edge disconnect takes
+        # the restoration branch above.
         for video_item in normalized.get("videos", []):
             if isinstance(video_item, dict):
                 _invalidate_picker_generated_depth(video_item)
@@ -5560,11 +6036,16 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             "selection_id": "",
             "selected_video_count": 0,
             "ordered_video_uids": [],
-            "order_managed": bool(previous_picker.get("order_managed")),
-            "dormant_video_rows": previous_picker.get("dormant_video_rows", []),
-            "dormant_manual_rows": previous_picker.get("dormant_manual_rows", []),
-            "slot_suppressions": _normalize_picker_slot_suppressions(
-                previous_picker.get("slot_suppressions")
+            "order_managed": bool(connected and previous_order_managed),
+            "dormant_video_rows": dormant_video_rows,
+            "dormant_manual_rows": dormant_manual_rows,
+            MANUAL_VIDEO_CONTEXT_KEY: manual_video_context,
+            "slot_suppressions": (
+                _normalize_picker_slot_suppressions(
+                    previous_picker.get("slot_suppressions")
+                )
+                if connected
+                else {}
             ),
             "scene": "",
             "video_path": "",
@@ -5594,11 +6075,40 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
 
     dormant_video_rows = previous_picker.get("dormant_video_rows", [])
     dormant_manual_rows = previous_picker.get("dormant_manual_rows", [])
+    manual_video_context = previous_picker.get(MANUAL_VIDEO_CONTEXT_KEY, {})
+    if (
+        not uid_order_managed
+        and not _normalize_manual_video_context(manual_video_context)
+    ):
+        # Legacy Picker payloads have no stable video UID/order contract, but
+        # disconnect must still be lossless. Snapshot their pre-connection
+        # manual rows and every remap-affected Prompt field before applying the
+        # first connected payload.
+        dormant_manual_rows = _normalize_dormant_video_rows(
+            normalized.get("videos"),
+            managed=False,
+        )[:MAX_VIDEOS]
+        legacy_entry_snapshot = _manual_video_context_snapshot(normalized)
+        manual_video_context = {
+            "version": 1,
+            "before": copy.deepcopy(legacy_entry_snapshot),
+            "after": copy.deepcopy(legacy_entry_snapshot),
+        }
     if uid_order_managed:
-        selected_rows, dormant_video_rows, dormant_manual_rows = (
+        (
+            selected_rows,
+            dormant_video_rows,
+            dormant_manual_rows,
+            manual_video_context,
+        ) = (
             _prepare_uid_managed_video_rows(normalized, payload_videos)
         )
         normalized["videos"] = selected_rows or [_default_video_item(1)]
+    picker_automatic_context_before = (
+        _manual_video_context_snapshot(normalized)
+        if _normalize_manual_video_context(manual_video_context)
+        else None
+    )
 
     payload_videos_by_slot: Dict[int, Dict[str, Any]] = {}
     for raw_video in payload_videos:
@@ -6288,6 +6798,13 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             assigned_marker_ids.add(marker_index)
             assigned_marker_addresses.add(marker_address)
 
+    if picker_automatic_context_before is not None:
+        manual_video_context = _advance_manual_video_context(
+            manual_video_context,
+            picker_automatic_context_before,
+            _manual_video_context_snapshot(normalized),
+        )
+
     normalized["picker"] = {
         "enabled": True,
         "awaiting_data": False,
@@ -6302,6 +6819,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
         "order_managed": uid_order_managed,
         "dormant_video_rows": dormant_video_rows,
         "dormant_manual_rows": dormant_manual_rows,
+        MANUAL_VIDEO_CONTEXT_KEY: manual_video_context,
         "slot_suppressions": slot_suppressions,
         "scene": _clean_string(payload.get("scene") or payload.get("scene_path")),
         "video_path": video_path,
@@ -7343,6 +7861,139 @@ def _prompt_semantic_fingerprint(
     ).hexdigest()
 
 
+def _prompt_output_side_effect_local(node: Any) -> Any:
+    local = getattr(node, "_hmb_output_side_effect_local", None)
+    if local is None:
+        local = threading.local()
+        setattr(node, "_hmb_output_side_effect_local", local)
+    return local
+
+
+def _is_prompt_output_side_effect_callback(node: Any) -> bool:
+    return int(
+        getattr(_prompt_output_side_effect_local(node), "depth", 0) or 0
+    ) > 0
+
+
+def _begin_prompt_output_side_effect_callback(node: Any) -> None:
+    local = _prompt_output_side_effect_local(node)
+    local.depth = int(getattr(local, "depth", 0) or 0) + 1
+
+
+def _end_prompt_output_side_effect_callback(node: Any) -> None:
+    local = _prompt_output_side_effect_local(node)
+    local.depth = max(0, int(getattr(local, "depth", 0) or 0) - 1)
+
+
+def _propagate_prompt_output_to_connections(
+    node: Any,
+    value: Any,
+    *,
+    owner_pending: Any = None,
+) -> None:
+    """Forward a late PROMPT_OUT publication through retained-mode edges."""
+
+    def still_owned() -> bool:
+        return (
+            owner_pending is None
+            or getattr(node, "_hmb_pending_prompt_notification", None)
+            is owner_pending
+        )
+
+    try:
+        from griptape_nodes.retained_mode.events.connection_events import (  # type: ignore
+            ListConnectionsForNodeRequest,
+            ListConnectionsForNodeResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.parameter_events import (  # type: ignore
+            SetParameterValueRequest,
+            SetParameterValueResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import (  # type: ignore
+            GriptapeNodes,
+        )
+    except Exception:
+        return
+
+    node_name = _clean_string(getattr(node, "name", ""))
+    if not node_name:
+        return
+    try:
+        registered_node = GriptapeNodes.NodeManager().get_node_by_name(
+            node_name
+        )
+    except Exception:
+        return
+    if registered_node is not node:
+        return
+    if not still_owned():
+        return
+
+    connections_result = GriptapeNodes.handle_request(
+        ListConnectionsForNodeRequest(
+            node_name=node_name,
+            broadcast_result=False,
+            failure_log_level=logging.DEBUG,
+        )
+    )
+    if not isinstance(connections_result, ListConnectionsForNodeResultSuccess):
+        details = _clean_string(
+            getattr(connections_result, "result_details", "")
+        )
+        raise RuntimeError(
+            details or "Griptape could not inspect outgoing PROMPT_OUT connections."
+        )
+
+    source_parameter = _get_parameter_obj(node, "PROMPT_OUT")
+    data_type = _clean_string(
+        getattr(source_parameter, "output_type", "")
+    ) or _clean_string(getattr(source_parameter, "type", ""))
+    for connection in connections_result.outgoing_connections:
+        if not still_owned():
+            return
+        if _clean_string(
+            getattr(connection, "source_parameter_name", "")
+        ) != "PROMPT_OUT":
+            continue
+        target_node_name = _clean_string(
+            getattr(connection, "target_node_name", "")
+        )
+        target_parameter_name = _clean_string(
+            getattr(connection, "target_parameter_name", "")
+        )
+        if not target_node_name or not target_parameter_name:
+            continue
+        try:
+            target_node = GriptapeNodes.NodeManager().get_node_by_name(
+                target_node_name
+            )
+        except Exception:
+            target_node = None
+        if bool(getattr(target_node, "lock", False)):
+            continue
+        set_result = GriptapeNodes.handle_request(
+            SetParameterValueRequest(
+                node_name=target_node_name,
+                parameter_name=target_parameter_name,
+                value=value,
+                data_type=data_type or None,
+                incoming_connection_source_node_name=node_name,
+                incoming_connection_source_parameter_name="PROMPT_OUT",
+            )
+        )
+        if not still_owned():
+            return
+        if not isinstance(set_result, SetParameterValueResultSuccess):
+            details = _clean_string(getattr(set_result, "result_details", ""))
+            raise RuntimeError(
+                details
+                or (
+                    f"Griptape rejected {node_name}.PROMPT_OUT propagation to "
+                    f"{target_node_name}.{target_parameter_name}."
+                )
+            )
+
+
 def _stage_and_notify_prompt_output(
     node: Any,
     value: Any,
@@ -7360,9 +8011,6 @@ def _stage_and_notify_prompt_output(
         node._hmb_prompt_notification_generation = generation
         node._hmb_pending_prompt_notification = (generation, value)
     publisher = getattr(node, "publish_update_to_parameter", None)
-    if not callable(publisher):
-        node._hmb_pending_prompt_notification = None
-        return
     pending = getattr(node, "_hmb_pending_prompt_notification", None)
     if not isinstance(pending, tuple) or len(pending) != 2:
         return
@@ -7376,7 +8024,29 @@ def _stage_and_notify_prompt_output(
     ):
         return
     try:
-        publisher("PROMPT_OUT", pending_value)
+        if callable(publisher):
+            publisher("PROMPT_OUT", pending_value)
+        current_pending = getattr(
+            node,
+            "_hmb_pending_prompt_notification",
+            None,
+        )
+        if (
+            not isinstance(current_pending, tuple)
+            or len(current_pending) != 2
+            or current_pending[0] != owner_generation
+            or current_pending is not pending
+        ):
+            # A synchronous subscriber published a newer paired generation.
+            # The superseded callback may never forward its older visible text
+            # after the newer generation has reached downstream nodes.
+            return
+        if not _is_prompt_output_side_effect_callback(node):
+            _propagate_prompt_output_to_connections(
+                node,
+                pending_value,
+                owner_pending=pending,
+            )
     except Exception:
         # A synchronous subscriber may re-enter this node and publish a newer
         # generation before the older callback returns (or throws).  Only the
@@ -7436,6 +8106,7 @@ class HMBPromptLibrary(DataNode):
         self._hmb_picker_connected = False
         self._hmb_image_asset_connected = False
         self._hmb_sync_lock = threading.RLock()
+        self._hmb_output_side_effect_local = threading.local()
         self._hmb_sync_generation = 0
         self._hmb_last_prompt_semantic_fingerprint = ""
         self._hmb_last_prompt_output = None
@@ -7475,6 +8146,168 @@ class HMBPromptLibrary(DataNode):
         except Exception as exc:
             _diagnostic_exception("PROMPT_OUT parameter setup failed", exc)
 
+    def _reconcile_connected_source_inputs_from_graph(self) -> bool:
+        """Refresh source inputs from their actual connected output caches.
+
+        Saved workflows create edges before hydrating output values, and
+        ``initial_setup`` deliberately skips normal value propagation.  The
+        separately serialized target input may therefore be stale.  Inspecting
+        the real incoming edges at the end of Prompt state hydration makes the
+        connected source authoritative without accepting or repairing a stale
+        target-side payload.
+        """
+
+        try:
+            from griptape_nodes.retained_mode.events.connection_events import (  # type: ignore
+                ListConnectionsForNodeRequest,
+                ListConnectionsForNodeResultSuccess,
+            )
+            from griptape_nodes.retained_mode.griptape_nodes import (  # type: ignore
+                GriptapeNodes,
+            )
+        except Exception:
+            return False
+
+        node_name = _clean_string(getattr(self, "name", ""))
+        if not node_name:
+            return False
+        try:
+            registered_node = GriptapeNodes.NodeManager().get_node_by_name(
+                node_name
+            )
+        except Exception:
+            return False
+        if registered_node is not self:
+            return False
+        request_handler = getattr(GriptapeNodes, "handle_request", None)
+        if not callable(request_handler):
+            return False
+        try:
+            result = request_handler(
+                ListConnectionsForNodeRequest(
+                    node_name=node_name,
+                    broadcast_result=False,
+                    failure_log_level=logging.DEBUG,
+                )
+            )
+        except Exception:
+            return False
+        if not isinstance(result, ListConnectionsForNodeResultSuccess):
+            return False
+
+        source_targets = {
+            PICKER_INPUT_PARAMETER_NAME,
+            IMAGE_ASSET_INPUT_PARAMETER_NAME,
+        }
+        incoming_by_target = {
+            _clean_string(getattr(connection, "target_parameter_name", "")): connection
+            for connection in result.incoming_connections
+            if _clean_string(getattr(connection, "target_parameter_name", ""))
+            in source_targets
+        }
+        self._hmb_picker_connected = PICKER_INPUT_PARAMETER_NAME in incoming_by_target
+        self._hmb_image_asset_connected = (
+            IMAGE_ASSET_INPUT_PARAMETER_NAME in incoming_by_target
+        )
+        sentinel = object()
+        parent_setter = getattr(super(), "set_parameter_value", None)
+        if not callable(parent_setter):
+            return True
+        # Once graph inspection succeeds, a missing edge is authoritative too.
+        # Saved target-side input values are merely connection transport caches;
+        # retaining one after its edge is absent can make ``or payload`` below
+        # resurrect a disconnected Picker/ImageAsset during hydration.
+        for target_name in source_targets - incoming_by_target.keys():
+            if ParameterMode is None:
+                parent_setter(target_name, "")
+            else:
+                parent_setter(target_name, "", initial_setup=True)
+        for target_name, connection in incoming_by_target.items():
+            source_node_name = _clean_string(
+                getattr(connection, "source_node_name", "")
+            )
+            source_parameter_name = _clean_string(
+                getattr(connection, "source_parameter_name", "")
+            )
+            if not source_node_name or not source_parameter_name:
+                continue
+            try:
+                source_node = GriptapeNodes.NodeManager().get_node_by_name(
+                    source_node_name
+                )
+            except Exception:
+                continue
+            value: Any = sentinel
+            output_values = getattr(source_node, "parameter_output_values", {})
+            if source_parameter_name in output_values:
+                value = output_values[source_parameter_name]
+            else:
+                parameter_values = getattr(source_node, "parameter_values", {})
+                if source_parameter_name in parameter_values:
+                    value = parameter_values[source_parameter_name]
+                else:
+                    try:
+                        value = source_node.get_parameter_value(
+                            source_parameter_name
+                        )
+                    except Exception:
+                        value = sentinel
+            if value is sentinel:
+                continue
+            if ParameterMode is None:
+                parent_setter(target_name, value)
+            else:
+                # Bypass this class's hydration reconciliation and all normal
+                # before/after hooks while retaining parameter conversion.
+                parent_setter(target_name, value, initial_setup=True)
+        return True
+
+    def set_parameter_value(
+        self,
+        param_name: str,
+        value: Any,
+        *,
+        initial_setup: bool = False,
+        emit_change: bool = True,
+        skip_before_value_set: bool = False,
+    ) -> None:
+        """Reconcile real source caches after initial Prompt hydration writes."""
+
+        parent_setter = getattr(super(), "set_parameter_value")
+        if ParameterMode is None:
+            parent_setter(param_name, value)
+        else:
+            parent_setter(
+                param_name,
+                value,
+                initial_setup=initial_setup,
+                emit_change=emit_change,
+                skip_before_value_set=skip_before_value_set,
+            )
+        if (
+            not initial_setup
+            or param_name
+            not in {
+                WIDGET_PARAMETER_NAME,
+                PICKER_INPUT_PARAMETER_NAME,
+                IMAGE_ASSET_INPUT_PARAMETER_NAME,
+            }
+            or getattr(self, "_hmb_hydration_reconciling", False)
+            or not hasattr(self, "_hmb_sync_lock")
+        ):
+            return
+        try:
+            self._hmb_hydration_reconciling = True
+            if self._reconcile_connected_source_inputs_from_graph():
+                self._sync_prompt_output_now()
+        except Exception as exc:
+            _diagnostic_exception(
+                "Initial connected source hydration reconciliation failed",
+                exc,
+            )
+        finally:
+            self._hmb_hydration_reconciling = False
+
     def _current_state(self) -> Dict[str, Any]:
         self._ensure_prompt_output()
         state = _parse_state(_get_parameter_raw(self, WIDGET_PARAMETER_NAME))
@@ -7487,6 +8320,7 @@ class HMBPromptLibrary(DataNode):
             return self._current_state()
         try:
             self._hmb_ui_syncing = True
+            self._reconcile_connected_source_inputs_from_graph()
             raw_widget_value = _get_parameter_raw(self, WIDGET_PARAMETER_NAME)
             current_state = self._current_state()
             state = _normalize_state(current_state)
@@ -7531,13 +8365,8 @@ class HMBPromptLibrary(DataNode):
         must therefore never depend on a separate HMBPromptLibrary run or on the
         editor losing focus first.
         """
-        state = self._write_dashboard_state()
-        prompt = _build_prompt_package(state)
-        machine_prompt = _build_data_only_prompt_package(state)
-        fingerprint = _prompt_semantic_fingerprint(
-            state,
-            public_prompt=prompt,
-            machine_prompt=machine_prompt,
+        state, prompt, machine_prompt, fingerprint = (
+            self._compile_current_prompt_pair()
         )
         output_values = getattr(self, "parameter_output_values", {})
         output_getter = getattr(output_values, "get", None)
@@ -7583,32 +8412,87 @@ class HMBPromptLibrary(DataNode):
             )
         return state
 
+    def _compile_current_prompt_pair(
+        self,
+    ) -> tuple[Dict[str, Any], str, str, str]:
+        """Compile both Prompt representations from one current-state snapshot.
+
+        Griptape hydrates persisted parameter values after constructing a node.
+        This pure publication-free compiler lets the Agent recover the private
+        pair from those hydrated values without parsing the human document or
+        publishing a second output during Agent resolution.
+        """
+
+        state = self._write_dashboard_state()
+        prompt = _build_prompt_package(state)
+        machine_prompt = _build_data_only_prompt_package(state)
+        fingerprint = _prompt_semantic_fingerprint(
+            state,
+            public_prompt=prompt,
+            machine_prompt=machine_prompt,
+        )
+        return state, prompt, machine_prompt, fingerprint
+
+    def _cache_prompt_pair(
+        self,
+        prompt: str,
+        machine_prompt: str,
+        fingerprint: str,
+    ) -> int:
+        """Atomically retain one compiled human/machine generation."""
+
+        changed = bool(
+            prompt != getattr(self, "_hmb_last_prompt_output", None)
+            or machine_prompt
+            != getattr(self, "_hmb_last_machine_prompt_output", None)
+            or fingerprint
+            != getattr(self, "_hmb_last_prompt_semantic_fingerprint", "")
+            or int(getattr(self, "_hmb_prompt_snapshot_generation", 0) or 0) < 1
+        )
+        if changed:
+            self._hmb_prompt_snapshot_generation = (
+                int(getattr(self, "_hmb_prompt_snapshot_generation", 0) or 0)
+                + 1
+            )
+        self._hmb_last_prompt_semantic_fingerprint = fingerprint
+        self._hmb_last_prompt_output = prompt
+        self._hmb_last_machine_prompt_output = machine_prompt
+        return int(self._hmb_prompt_snapshot_generation)
+
     def _hmb_agent_prompt_snapshot(self, expected_visible: Any) -> Dict[str, Any]:
         """Return the exact private envelope paired with one visible PROMPT_OUT."""
 
         incoming = getattr(expected_visible, "value", expected_visible)
         incoming_text = str(incoming or "")
         with self._hmb_sync_lock:
-            visible = getattr(self, "_hmb_last_prompt_output", None)
-            machine = getattr(self, "_hmb_last_machine_prompt_output", None)
-            generation = int(
-                getattr(self, "_hmb_prompt_snapshot_generation", 0) or 0
-            )
-            if (
-                not isinstance(visible, str)
-                or not isinstance(machine, str)
-                or not visible
-                or not machine
-                or generation < 1
-                or incoming_text != visible
-            ):
+            # Parameter hydration bypasses after_value_set and the host does not
+            # call this library's deserialize/load hooks. Recompile on every
+            # Agent snapshot request so a constructor-time default cache can
+            # never be paired with later hydrated state. This also catches a
+            # machine-only state change whose concise visible text is unchanged.
+            (
+                _state,
+                visible,
+                machine,
+                fingerprint,
+            ) = self._compile_current_prompt_pair()
+            # Griptape's execution hydration removes terminal line separators
+            # from a string output. Treat that transport-only normalization as
+            # equivalent while keeping every document character before it
+            # exact; embedded line breaks and section text remain protected.
+            if incoming_text.rstrip("\r\n") != visible.rstrip("\r\n"):
                 raise RuntimeError("HMB Prompt paired snapshot is unavailable.")
+            generation = self._cache_prompt_pair(
+                visible,
+                machine,
+                fingerprint,
+            )
             return {
                 "schema": "hmb-prompt-paired-snapshot",
                 "version": 1,
                 "generation": generation,
                 "visible_sha256": hashlib.sha256(
-                    visible.encode("utf-8")
+                    incoming_text.encode("utf-8")
                 ).hexdigest(),
                 "machine_sha256": hashlib.sha256(
                     machine.encode("utf-8")
@@ -7656,30 +8540,34 @@ class HMBPromptLibrary(DataNode):
         run_sync()
 
     def after_value_set(self, parameter: Any, value: Any) -> Any:
-        result = None
+        _begin_prompt_output_side_effect_callback(self)
         try:
-            parent_hook = getattr(super(), "after_value_set", None)
-            if callable(parent_hook):
-                result = parent_hook(parameter, value)
-        except AttributeError:
             result = None
-        except Exception as exc:
-            _diagnostic_exception("Parent after_value_set failed", exc)
-        try:
-            name = getattr(parameter, "name", "") or ""
-            if name == PICKER_INPUT_PARAMETER_NAME and _clean_string(value):
-                self._hmb_picker_connected = True
-            if name == IMAGE_ASSET_INPUT_PARAMETER_NAME and _clean_string(value):
-                self._hmb_image_asset_connected = True
-            if name in {
-                WIDGET_PARAMETER_NAME,
-                PICKER_INPUT_PARAMETER_NAME,
-                IMAGE_ASSET_INPUT_PARAMETER_NAME,
-            } and not getattr(self, "_hmb_ui_syncing", False):
-                self._schedule_prompt_sync()
-        except Exception as exc:
-            _diagnostic_exception("after_value_set scheduling failed", exc)
-        return result
+            try:
+                parent_hook = getattr(super(), "after_value_set", None)
+                if callable(parent_hook):
+                    result = parent_hook(parameter, value)
+            except AttributeError:
+                result = None
+            except Exception as exc:
+                _diagnostic_exception("Parent after_value_set failed", exc)
+            try:
+                name = getattr(parameter, "name", "") or ""
+                if name == PICKER_INPUT_PARAMETER_NAME and _clean_string(value):
+                    self._hmb_picker_connected = True
+                if name == IMAGE_ASSET_INPUT_PARAMETER_NAME and _clean_string(value):
+                    self._hmb_image_asset_connected = True
+                if name in {
+                    WIDGET_PARAMETER_NAME,
+                    PICKER_INPUT_PARAMETER_NAME,
+                    IMAGE_ASSET_INPUT_PARAMETER_NAME,
+                } and not getattr(self, "_hmb_ui_syncing", False):
+                    self._schedule_prompt_sync()
+            except Exception as exc:
+                _diagnostic_exception("after_value_set scheduling failed", exc)
+            return result
+        finally:
+            _end_prompt_output_side_effect_callback(self)
 
     def after_incoming_connection(
         self,
@@ -7798,5 +8686,10 @@ class HMBPromptLibrary(DataNode):
 
     def process(self) -> None:
         self._ensure_prompt_output()
-        self._sync_prompt_output_now()
+        # The workflow executor owns normal process-output propagation.
+        _begin_prompt_output_side_effect_callback(self)
+        try:
+            self._sync_prompt_output_now()
+        finally:
+            _end_prompt_output_side_effect_callback(self)
         return None

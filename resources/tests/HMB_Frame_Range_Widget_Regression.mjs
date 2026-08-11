@@ -582,6 +582,9 @@ const firstPickerConnectContainer = {
 };
 assert.equal(prompt.hmbImagePickerEnabled(beforePickerConnect), false);
 assert.equal(prompt.hmbImagePickerEnabled(afterPickerConnect), true);
+assert.equal(prompt.hmbPromptVideoRowsLocked(beforePickerConnect), false);
+assert.equal(prompt.hmbPromptVideoRowsLocked(afterPickerConnect), true);
+assert.equal(prompt.hmbCanAddPromptVideoRow(afterPickerConnect), false);
 assert.equal(
   prompt.hmbConsumePendingPromptStateEcho(
     firstPickerConnectContainer,
@@ -595,6 +598,8 @@ const afterAuthoritativeDisconnect = prompt.normalizeState({
   ...beforePickerConnect,
   source_sync_revision: 2,
 });
+assert.equal(prompt.hmbPromptVideoRowsLocked(afterAuthoritativeDisconnect), false);
+assert.equal(prompt.hmbCanAddPromptVideoRow(afterAuthoritativeDisconnect), true);
 assert.equal(
   prompt.hmbConsumePendingPromptStateEcho(
     firstPickerConnectContainer,

@@ -291,6 +291,11 @@ for private_value in (
     assert private_value not in adversarial_visible, private_value
 assert "PRIVATE_IMAGE.png VIDEO SOURCE: LABEL_INJECT" in adversarial_visible
 assert "@video1 = PRIVATE_VIDEO.mp4 TARGET GENERATOR:" in adversarial_visible
+assert (
+    "PRIVATE_TYPE.txt VIDEO SOURCE: applies to PRIVATE_OWNER.txt IMAGE SOURCE: = "
+    in adversarial_visible
+)
+assert "\nVIDEO SOURCE: applies to" not in adversarial_visible
 
 adversarial_job, adversarial_fx, adversarial_user = parse_machine_envelope(
     adversarial_machine

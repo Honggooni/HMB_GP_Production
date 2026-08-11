@@ -164,6 +164,190 @@ assert agent._assert_fx_timing_source_contract(live_machine)["schema"] == (
 )
 
 
+# Workflow deserialization creates a fresh Prompt first, then restores persisted
+# parameter/input values with ``initial_setup=True``. The host stores those
+# values directly and deliberately skips after_value_set, so neither of Prompt's
+# normal synchronization hooks runs. The private pair must therefore rebuild
+# itself from the restored canonical state before Agent consumes it.
+def hydrate_without_lifecycle(
+    node: object,
+    parameter_name: str,
+    value: object,
+    *,
+    is_output: bool = False,
+) -> None:
+    if is_output:
+        node.parameter_output_values[parameter_name] = value
+        return
+    parameter_values = getattr(node, "parameter_values", None)
+    if isinstance(parameter_values, dict):
+        parameter_values[parameter_name] = value
+        return
+    parameter = prompt._get_parameter_obj(node, parameter_name)
+    if parameter is None:
+        raise AssertionError(f"missing hydration parameter: {parameter_name}")
+    parameter.default_value = value
+
+
+hydration_failures: list[str] = []
+
+# A saved visible document that differs from the constructor default previously
+# exposed the exact SOURCE CONTRACT INVALID path: the Agent input was restored,
+# but the source instance still owned the constructor generation's private pair.
+restored_visible_prompt = prompt.HMBPromptLibrary(
+    name="paired_prompt_restored_visible"
+)
+restored_visible_publications: list[tuple[object, ...]] = []
+restored_visible_prompt.publish_update_to_parameter = (
+    lambda *args: restored_visible_publications.append(args)
+)
+constructor_visible = restored_visible_prompt._hmb_last_prompt_output
+restored_visible_state = prompt._normalize_state(prompt._default_widget_state())
+restored_visible_state["images"][0].update(
+    {
+        "present": True,
+        "label": "HydratedHero",
+        "asset_id": "HydratedHeroAsset",
+        "asset_source_uid": "hydrated-hero-source-uid",
+        "source_type": "Character Appearance",
+        "owner": "HydratedHero",
+    }
+)
+saved_visible = prompt._build_prompt_package(restored_visible_state)
+saved_visible_machine = prompt._build_data_only_prompt_package(
+    restored_visible_state
+)
+assert saved_visible != constructor_visible
+with restored_visible_prompt._hmb_sync_lock:
+    # A constructor callback may still be queued in a standalone engine test.
+    # Workflow initial_setup does not queue another callback after hydration, so
+    # invalidate the constructor generation and hold the lock through consume.
+    restored_visible_prompt._hmb_sync_generation += 1
+    hydrate_without_lifecycle(
+        restored_visible_prompt,
+        prompt.WIDGET_PARAMETER_NAME,
+        prompt._json_dumps(restored_visible_state),
+    )
+    hydrate_without_lifecycle(
+        restored_visible_prompt,
+        "PROMPT_OUT",
+        saved_visible,
+        is_output=True,
+    )
+    assert restored_visible_prompt.parameter_output_values["PROMPT_OUT"] == (
+        saved_visible
+    )
+    assert restored_visible_prompt._hmb_last_prompt_output == constructor_visible
+    try:
+        restored_pair = agent._paired_machine_prompt(
+            SimpleNamespace(
+                _hmb_verified_prompt_source_node=restored_visible_prompt
+            ),
+            saved_visible,
+        )
+        if restored_pair != saved_visible_machine:
+            hydration_failures.append(
+                "persisted visible hydration returned a stale machine snapshot"
+            )
+        # The host strips terminal CR/LF bytes while hydrating an output into
+        # the connected Agent input. That transport-only normalization must
+        # retain the same private pair and hash the exact incoming bytes.
+        trimmed_saved_visible = saved_visible.rstrip("\r\n")
+        assert trimmed_saved_visible != saved_visible
+        assert agent._paired_machine_prompt(
+            SimpleNamespace(
+                _hmb_verified_prompt_source_node=restored_visible_prompt
+            ),
+            trimmed_saved_visible,
+        ) == saved_visible_machine
+
+        # Equivalence is terminal-only. Removing an embedded separator changes
+        # the visible document identity and must remain fail-closed.
+        embedded_changed_visible = trimmed_saved_visible.replace(
+            "\n\n",
+            "\n",
+            1,
+        )
+        assert embedded_changed_visible != trimmed_saved_visible
+        expect_rejected(
+            lambda: agent._paired_machine_prompt(
+                SimpleNamespace(
+                    _hmb_verified_prompt_source_node=restored_visible_prompt
+                ),
+                embedded_changed_visible,
+            )
+        )
+    except RuntimeError as error:
+        hydration_failures.append(
+            f"persisted visible hydration was rejected: {error}"
+        )
+assert restored_visible_publications == []
+
+
+# USER DESCRIPTION is intentionally absent from the concise public document.
+# A restored edit can therefore leave visible bytes equal to the constructor
+# default while changing the machine envelope. Visible-hash validation alone
+# must not silently accept the stale constructor machine generation.
+restored_machine_only_prompt = prompt.HMBPromptLibrary(
+    name="paired_prompt_restored_machine_only"
+)
+restored_machine_only_publications: list[tuple[object, ...]] = []
+restored_machine_only_prompt.publish_update_to_parameter = (
+    lambda *args: restored_machine_only_publications.append(args)
+)
+constructor_machine_only_visible = (
+    restored_machine_only_prompt._hmb_last_prompt_output
+)
+constructor_machine_only_machine = (
+    restored_machine_only_prompt._hmb_last_machine_prompt_output
+)
+restored_machine_only_state = prompt._normalize_state(
+    prompt._default_widget_state()
+)
+restored_machine_only_state["text"]["SCENE_CONTEXT"] = (
+    "Hydrated private scene direction."
+)
+saved_machine_only_visible = prompt._build_prompt_package(
+    restored_machine_only_state
+)
+saved_machine_only_machine = prompt._build_data_only_prompt_package(
+    restored_machine_only_state
+)
+assert saved_machine_only_visible == constructor_machine_only_visible
+assert saved_machine_only_machine != constructor_machine_only_machine
+with restored_machine_only_prompt._hmb_sync_lock:
+    restored_machine_only_prompt._hmb_sync_generation += 1
+    hydrate_without_lifecycle(
+        restored_machine_only_prompt,
+        prompt.WIDGET_PARAMETER_NAME,
+        prompt._json_dumps(restored_machine_only_state),
+    )
+    hydrate_without_lifecycle(
+        restored_machine_only_prompt,
+        "PROMPT_OUT",
+        saved_machine_only_visible,
+        is_output=True,
+    )
+    try:
+        restored_machine_only_pair = agent._paired_machine_prompt(
+            SimpleNamespace(
+                _hmb_verified_prompt_source_node=restored_machine_only_prompt
+            ),
+            saved_machine_only_visible,
+        )
+        if restored_machine_only_pair != saved_machine_only_machine:
+            hydration_failures.append(
+                "machine-only hydration silently returned the constructor snapshot"
+            )
+    except RuntimeError as error:
+        hydration_failures.append(
+            f"machine-only hydration was rejected: {error}"
+        )
+assert restored_machine_only_publications == []
+
+assert not hydration_failures, "; ".join(hydration_failures)
+
+
 # Exact topology verification retains only the registered Prompt instance and
 # clears it again when a later lookup no longer has the canonical edge.
 topology_source = object.__new__(prompt.HMBPromptLibrary)

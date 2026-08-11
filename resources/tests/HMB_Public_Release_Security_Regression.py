@@ -16,8 +16,8 @@ POLICY_CONTRACT_SHA256 = (
 )
 POLICY_RELATIVE = "resources/agent/hmb_agent_core.dat"
 POLICY_SHA256 = "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
-RELEASE_LABEL = "v0.6.21"
-RELEASE_VERSION = "0.6.21"
+RELEASE_LABEL = "v0.6.22"
+RELEASE_VERSION = "0.6.22"
 EXPECTED_SOURCE_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",

@@ -3227,21 +3227,27 @@ class HMBAgentLibrary(_BaseAgent):
             self._publish_hmb_execution_block(_HMB_POLICY_UNAVAILABLE_MESSAGE)
             raise RuntimeError(_HMB_POLICY_UNAVAILABLE_MESSAGE) from None
 
+        source_contract_stage = "paired_snapshot"
         try:
             prompt_value = self.get_parameter_value(_AGENT_PROMPT_INPUT_PARAMETER)
             machine_prompt = _paired_machine_prompt(self, prompt_value)
+            source_contract_stage = "public_job"
             _assert_public_job_data_contract(machine_prompt)
+            source_contract_stage = "fx_contract"
             fx_timing_contract = _assert_fx_timing_source_contract(machine_prompt)
+            source_contract_stage = "signed_candidate"
             _assert_fx_candidate_matches_signed_runtime(fx_timing_contract)
             # The paired machine contract contains only raw selections and
             # validated addresses. Human-readable PROMPT_OUT prose is never
             # parsed. Shared boundaries and range-scoped cues are derived only
             # now, after the signed 4+4 runtime has loaded successfully.
+            source_contract_stage = "runtime_scope"
             runtime_scope = _derive_fx_timing_runtime_scope(
                 fx_timing_contract,
                 policy_rules=self._hmb_policy_rules,
                 binding_rules=self._hmb_binding_rules,
             )
+            source_contract_stage = "runtime_prompt"
             self._hmb_runtime_prompt = _compose_hmb_runtime_prompt(
                 machine_prompt, runtime_scope
             )
@@ -3254,7 +3260,12 @@ class HMBAgentLibrary(_BaseAgent):
             ) from None
         except Exception:
             # Do not echo parser details, runtime derivations, or job payload
-            # fragments. The public message is fixed and policy-free.
+            # fragments. The public message is fixed and policy-free; the
+            # bounded stage code is safe operational evidence for future bugs.
+            print(
+                "[HMB_PRODUCTION][ERROR] "
+                f"SOURCE_CONTRACT_STAGE={source_contract_stage}"
+            )
             self._publish_hmb_execution_block(_HMB_SOURCE_CONTRACT_INVALID_MESSAGE)
             raise RuntimeError(_HMB_SOURCE_CONTRACT_INVALID_MESSAGE) from None
         if any(

@@ -35,7 +35,7 @@ after a successful check, the library is already current.
 
 ## Agent policy availability
 
-The `v0.6.21` release includes exactly one
+The `v0.6.22` release includes exactly one
 signed runtime artifact at `resources/agent/hmb_agent_core.dat`. The canonical
 `HMBPromptLibrary -> HMBAgentLibrary` execution reads and verifies only that
 file installed with the Git-backed Library. Environment variables, server

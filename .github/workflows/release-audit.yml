@@ -86,6 +86,8 @@ jobs:
             "HMB_Image_Asset_Server_Sharing_Regression.py",
             "HMB_Image_Asset_Process_Lock_Regression.py",
             "HMB_Prompt_Output_Coalescing_Regression.py",
+            "HMB_Prompt_Picker_Disconnect_Restore_Regression.py",
+            "HMB_Picker_Prompt_Agent_Live_Host_Regression.py",
             "HMB_Cutout_Transparency_Regression.py",
             "HMB_Depth_Companion_Regression.py",
             "HMB_Depth_Visual_Contract_Regression.py",

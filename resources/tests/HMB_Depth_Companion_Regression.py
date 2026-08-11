@@ -581,7 +581,27 @@ disconnected_prompt_state = prompt._apply_picker_payload(
     {},
     connected=False,
 )
-assert_removed_picker_depth_source_released(disconnected_prompt_state)
+assert disconnected_prompt_state["videos"] == prompt._normalize_state(
+    prompt._default_widget_state()
+)["videos"]
+assert {
+    item["video_uid"]
+    for item in disconnected_prompt_state["picker"]["dormant_video_rows"]
+} == {"depth-regression-mask", "depth-regression-depth"}
+reconnected_prompt_state = prompt._apply_picker_payload(
+    copy.deepcopy(disconnected_prompt_state),
+    valid_prompt_payload,
+    connected=True,
+)
+assert reconnected_prompt_state["videos"][0]["video_uid"] == (
+    "depth-regression-mask"
+)
+assert reconnected_prompt_state["videos"][1]["video_uid"] == (
+    "depth-regression-depth"
+)
+assert reconnected_prompt_state["videos"][1]["source_type"] == (
+    "Depth / Spatial Reference"
+)
 
 non_maya_prompt_payload = copy.deepcopy(valid_prompt_payload)
 non_maya_prompt_payload["mode"] = "external_video"

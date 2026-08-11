@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.6.22 - 2026-08-12
+
+- Recover the paired Prompt snapshot when Griptape `initial_setup` hydrates
+  persisted state without invoking the Prompt lifecycle hook, leaving the
+  constructor-time cache stale.
+- Keep `PROMPT_OUT` as the user-readable sectioned document and normalize only
+  terminal LF transport differences during exact visible-prompt matching.
+- Rebuild the visible document and private Agent snapshot atomically from the
+  same current source state when recovery is safe, while preserving fail-closed
+  pairing for genuine state mismatches.
+- Add safe stage-code logging for source-contract failures without exposing
+  private prompt content, structured payloads, or internal exception details.
+- Propagate late Video Picker output through the real retained-mode graph so
+  `PICKER_OUT -> PICKER_IN -> PROMPT_OUT -> Agent` updates immediately, while
+  discarding superseded re-entrant publications instead of restoring stale
+  values.
+- Restore the complete pre-connection manual video state when Picker is
+  disconnected, including video rows, image bindings, Frame Range state,
+  text references, and textarea sizing, while retaining edits made during the
+  connection and dormant Picker settings for a later reconnect.
+- Lock both add and delete controls for video rows while Picker owns their
+  order, and avoid rebuilding unchanged Main Type/Sub Type option DOM so
+  selection changes no longer flicker.
+
 ## 0.6.21 - 2026-08-12
 
 - Keep Frame Range optional for `FX Reference` and `Timing / Edit Reference`:

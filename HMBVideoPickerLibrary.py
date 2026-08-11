@@ -7478,6 +7478,36 @@ def _is_state_syncing(node: Any) -> bool:
     return int(getattr(_state_sync_local(node), "depth", 0) or 0) > 0
 
 
+def _is_output_side_effect_callback(node: Any) -> bool:
+    """Return whether output changes are inside a host value-set transaction.
+
+    Griptape's NodeManager snapshots output values around ``after_value_set``
+    and propagates changes itself.  Late worker publications happen outside
+    that transaction and must explicitly forward their values to connected
+    inputs.  Keeping this marker thread-local prevents a worker publication
+    from being mistaken for a simultaneous host callback on another thread.
+    """
+
+    return int(
+        getattr(_state_sync_local(node), "output_side_effect_depth", 0) or 0
+    ) > 0
+
+
+def _begin_output_side_effect_callback(node: Any) -> None:
+    local = _state_sync_local(node)
+    local.output_side_effect_depth = int(
+        getattr(local, "output_side_effect_depth", 0) or 0
+    ) + 1
+
+
+def _end_output_side_effect_callback(node: Any) -> None:
+    local = _state_sync_local(node)
+    local.output_side_effect_depth = max(
+        0,
+        int(getattr(local, "output_side_effect_depth", 0) or 0) - 1,
+    )
+
+
 def _begin_state_sync(node: Any) -> None:
     local = _state_sync_local(node)
     local.depth = int(getattr(local, "depth", 0) or 0) + 1
@@ -7523,10 +7553,112 @@ def _notify_parameter_update(node: Any, name: str, value: Any) -> None:
         publisher(name, value)
 
 
+def _propagate_parameter_update_to_connections(
+    node: Any,
+    name: str,
+    value: Any,
+) -> None:
+    """Forward one late output value through real retained-mode graph edges.
+
+    ``BaseNode.publish_update_to_parameter`` emits a display/execution event,
+    but it does not issue the ``SetParameterValueRequest`` that updates a
+    connected input.  Picker workers finish after the initiating host request
+    has returned, so NodeManager's synchronous output-side-effect propagation
+    cannot see those changes.  Use only public connection/result payloads and
+    preserve the upstream identity fields required for connected INPUT+PROPERTY
+    targets.
+    """
+
+    try:
+        from griptape_nodes.retained_mode.events.connection_events import (  # type: ignore
+            ListConnectionsForNodeRequest,
+            ListConnectionsForNodeResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.parameter_events import (  # type: ignore
+            SetParameterValueRequest,
+            SetParameterValueResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import (  # type: ignore
+            GriptapeNodes,
+        )
+    except Exception:
+        return
+
+    node_name = _clean(getattr(node, "name", ""))
+    if not node_name:
+        return
+    try:
+        registered_node = GriptapeNodes.NodeManager().get_node_by_name(
+            node_name
+        )
+    except Exception:
+        # Unit probes and constructor-time synchronization legitimately run
+        # before the node belongs to a retained-mode graph.  There cannot be
+        # an outgoing edge to forward in that state.
+        return
+    if registered_node is not node:
+        return
+    connections_result = GriptapeNodes.handle_request(
+        ListConnectionsForNodeRequest(
+            node_name=node_name,
+            broadcast_result=False,
+            failure_log_level=logging.DEBUG,
+        )
+    )
+    if not isinstance(connections_result, ListConnectionsForNodeResultSuccess):
+        details = _clean(getattr(connections_result, "result_details", ""))
+        raise RuntimeError(
+            details or f"Griptape could not inspect outgoing {name} connections."
+        )
+
+    source_parameter = _get_parameter_obj(node, name)
+    data_type = _clean(getattr(source_parameter, "output_type", "")) or _clean(
+        getattr(source_parameter, "type", "")
+    )
+    for connection in connections_result.outgoing_connections:
+        if _clean(getattr(connection, "source_parameter_name", "")) != name:
+            continue
+        target_node_name = _clean(getattr(connection, "target_node_name", ""))
+        target_parameter_name = _clean(
+            getattr(connection, "target_parameter_name", "")
+        )
+        if not target_node_name or not target_parameter_name:
+            continue
+        try:
+            target_node = GriptapeNodes.NodeManager().get_node_by_name(
+                target_node_name
+            )
+        except Exception:
+            target_node = None
+        if bool(getattr(target_node, "lock", False)):
+            continue
+        set_result = GriptapeNodes.handle_request(
+            SetParameterValueRequest(
+                node_name=target_node_name,
+                parameter_name=target_parameter_name,
+                value=value,
+                data_type=data_type or None,
+                incoming_connection_source_node_name=node_name,
+                incoming_connection_source_parameter_name=name,
+            )
+        )
+        if not isinstance(set_result, SetParameterValueResultSuccess):
+            details = _clean(getattr(set_result, "result_details", ""))
+            raise RuntimeError(
+                details
+                or (
+                    f"Griptape rejected {node_name}.{name} propagation to "
+                    f"{target_node_name}.{target_parameter_name}."
+                )
+            )
+
+
 def _publish_parameter_update(node: Any, name: str, value: Any) -> None:
     """Set one output and propagate late async results across existing connections."""
     set_output(node, name, value)
     _notify_parameter_update(node, name, value)
+    if not _is_output_side_effect_callback(node):
+        _propagate_parameter_update_to_connections(node, name, value)
 
 
 def _norm_path(value: Any) -> Path:
@@ -9973,6 +10105,7 @@ class HMBVideoPickerLibrary(DataNode):
         state: Dict[str, Any],
         *,
         enforce_media_availability: bool = True,
+        propagate_connections: bool | None = None,
     ) -> str:
         payload, media_values = _build_synchronized_video_outputs(
             state,
@@ -9995,6 +10128,21 @@ class HMBVideoPickerLibrary(DataNode):
                 _notify_parameter_update(self, name, value)
             except Exception as error:
                 notification_errors.append((name, error))
+        should_propagate_connections = (
+            not _is_output_side_effect_callback(self)
+            if propagate_connections is None
+            else bool(propagate_connections)
+        )
+        if should_propagate_connections:
+            for name, value in synchronized_outputs:
+                try:
+                    _propagate_parameter_update_to_connections(
+                        self,
+                        name,
+                        value,
+                    )
+                except Exception as error:
+                    notification_errors.append((f"{name} graph", error))
         _retire_legacy_video_slot_outputs(self)
         _reorder_video_picker_parameters(self)
         if notification_errors:
@@ -11882,9 +12030,12 @@ class HMBVideoPickerLibrary(DataNode):
         value: Any,
     ) -> None:
         """Process state and one-shot commands only after the current transaction."""
+        output_side_effect_callback_started = False
         try:
             if _is_state_syncing(self):
                 return
+            _begin_output_side_effect_callback(self)
+            output_side_effect_callback_started = True
             name = _parameter_name(parameter)
             _diagnostic(f"after_value_set entered: {name or '<unknown>'}")
 
@@ -11982,6 +12133,8 @@ class HMBVideoPickerLibrary(DataNode):
             except Exception as nested:
                 _diagnostic_exception("failed to publish after_value_set error", nested)
         finally:
+            if output_side_effect_callback_started:
+                _end_output_side_effect_callback(self)
             try:
                 parent_hook = getattr(super(), "after_value_set", None)
                 if callable(parent_hook):
@@ -15486,5 +15639,7 @@ class HMBVideoPickerLibrary(DataNode):
         """
         self._ensure_parameters()
         state = self._apply_selected_view_fields(self._picker_state())
-        self._sync_outputs_from_state(state)
+        # The workflow executor propagates process outputs through the graph.
+        # Explicit late-worker forwarding here would deliver every value twice.
+        self._sync_outputs_from_state(state, propagate_connections=False)
         return None
