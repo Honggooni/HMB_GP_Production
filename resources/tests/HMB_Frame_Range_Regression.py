@@ -20,6 +20,13 @@ picker = load("HMBVideoPickerLibrary")
 prompt = load("HMBPromptLibrary")
 
 
+def prompt_json_section(payload: str, header: str):
+    lines = payload.splitlines()
+    assert lines[0] == "HMB_GP_Production"
+    assert len(lines) == 7
+    return json.loads(lines[lines.index(header) + 1])
+
+
 # Maya display frames and zero-based decoded indices remain distinct.
 maya_metadata = picker._video_frame_metadata(
     {
@@ -312,11 +319,28 @@ image["frame_range_bindings"] = {
     },
 }
 compiled = prompt._build_prompt_package(prompt_state)
-assert "FRAME RANGE BINDING:" in compiled
-assert "Timebase = @video2 / 24 FPS / Frames 1–144" in compiled
-assert "Frames 1–48 and 97–144 only." in compiled
-assert "Frames 10–20 only." not in compiled
-assert "Frames 30–40 only." not in compiled
+compiled_job = prompt_json_section(compiled, "HMB JOB DATA (JSON):")
+assert compiled_job["frame_ranges"] == [{
+    "image": "@image1",
+    "video": "@video2",
+    "marker_color": "Green",
+    "enabled": True,
+    "origin": "manual",
+    "domain": {
+        "start_frame": 1,
+        "end_frame": 144,
+        "frame_count": 144,
+        "timebase": "24/1",
+        "fps": 24.0,
+    },
+    "segments": [
+        {"start_frame": 1, "end_frame": 48},
+        {"start_frame": 97, "end_frame": 144},
+    ],
+    "unresolved_segments": [],
+    "valid": True,
+    "error_codes": [],
+}]
 
 normalized_image = prompt._normalize_state(prompt_state)["images"][0]
 assert normalized_image["frame_range_bindings"]["@video1::Green"]["ranges"] == [
@@ -328,7 +352,10 @@ assert normalized_image["frame_range_bindings"]["@video3::Blue"]["ranges"] == [
 
 range_off_state = json.loads(json.dumps(prompt_state))
 range_off_state["images"][0]["frame_range_enabled"] = False
-assert "FRAME RANGE BINDING:" not in prompt._build_prompt_package(range_off_state)
+assert prompt_json_section(
+    prompt._build_prompt_package(range_off_state),
+    "HMB JOB DATA (JSON):",
+)["frame_ranges"] == []
 normalized_range_off = prompt._normalize_state(range_off_state)["images"][0]
 assert set(normalized_range_off["frame_range_bindings"]) == {
     "@video1::Green",
@@ -355,14 +382,39 @@ assert normalized_range_restarted["frame_range_bindings"]["@video2::Green"]["ran
 assert normalized_range_restarted["frame_range_binding"] == normalized_range_restarted[
     "frame_range_bindings"
 ]["@video2::Green"]
-assert "FRAME RANGE BINDING:" in prompt._build_prompt_package(range_restarted_state)
+assert prompt_json_section(
+    prompt._build_prompt_package(range_restarted_state),
+    "HMB JOB DATA (JSON):",
+)["frame_ranges"][0]["segments"] == [
+    {"start_frame": 1, "end_frame": 48},
+    {"start_frame": 97, "end_frame": 144},
+]
 
 image["frame_range_bindings"]["@video2::Green"]["ranges"] = [{"start": 1, "end": 145}]
-assert "FRAME RANGE BINDING:" not in prompt._build_prompt_package(prompt_state)
+invalid_range = prompt_json_section(
+    prompt._build_prompt_package(prompt_state),
+    "HMB JOB DATA (JSON):",
+)["frame_ranges"][0]
+assert invalid_range["segments"] == []
+assert invalid_range["unresolved_segments"] == [{
+    "start_frame": 1,
+    "end_frame": 145,
+    "error_code": "segment_out_of_domain",
+}]
+assert invalid_range["valid"] is False
 
 missing_metadata_state = json.loads(json.dumps(prompt_state))
 missing_metadata_state["picker"]["frame_metadata"] = []
-assert "FRAME RANGE BINDING:" not in prompt._build_prompt_package(missing_metadata_state)
+missing_metadata_range = prompt_json_section(
+    prompt._build_prompt_package(missing_metadata_state),
+    "HMB JOB DATA (JSON):",
+)["frame_ranges"][0]
+assert missing_metadata_range["segments"] == []
+assert missing_metadata_range["valid"] is False
+assert missing_metadata_range["error_codes"] == [
+    "domain_start_missing",
+    "domain_end_missing",
+]
 
 
 # Picker metadata is optional when the user supplies an explicit manual frame
@@ -400,10 +452,21 @@ assert manual_metadata["origin"] == "manual"
 assert manual_metadata["fps"] == 0.0
 assert (manual_metadata["start_frame"], manual_metadata["end_frame"]) == (1001, 1120)
 manual_compiled = prompt._build_prompt_package(manual_state)
-assert "FRAME RANGE BINDING:" in manual_compiled
-assert "Frame domain = @video2 / Manual / Frames 1001–1120" in manual_compiled
-assert "during Frames 1010–1020 and 1100–1110 only." in manual_compiled
-assert "0 FPS" not in manual_compiled
+manual_range = prompt_json_section(
+    manual_compiled,
+    "HMB JOB DATA (JSON):",
+)["frame_ranges"][0]
+assert manual_range["domain"] == {
+    "start_frame": 1001,
+    "end_frame": 1120,
+    "frame_count": 120,
+    "fps": 0.0,
+}
+assert manual_range["segments"] == [
+    {"start_frame": 1010, "end_frame": 1020},
+    {"start_frame": 1100, "end_frame": 1110},
+]
+assert manual_range["valid"] is True
 
 normalized_manual = prompt._normalize_state(manual_state)["images"][0]
 normalized_manual_binding = normalized_manual["frame_range_bindings"]["@video2::Green"]
@@ -412,6 +475,12 @@ assert normalized_manual_binding["end_frame"] == 1120
 
 missing_manual_end = json.loads(json.dumps(manual_state))
 missing_manual_end["images"][0]["frame_range_bindings"]["@video2::Green"]["end_frame"] = None
-assert "FRAME RANGE BINDING:" not in prompt._build_prompt_package(missing_manual_end)
+missing_manual_range = prompt_json_section(
+    prompt._build_prompt_package(missing_manual_end),
+    "HMB JOB DATA (JSON):",
+)["frame_ranges"][0]
+assert missing_manual_range["segments"] == []
+assert missing_manual_range["valid"] is False
+assert "domain_end_missing" in missing_manual_range["error_codes"]
 
 print("HMB Picker frame metadata and Prompt multi-frame range regression: PASS")

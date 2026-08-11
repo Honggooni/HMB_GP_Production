@@ -185,8 +185,8 @@ const VIDEO_ROLE_COMPATIBILITY = {
   "Camera / Layout Reference": ["Spatial Alignment Verification Only", "Local Composition Check Only", "Context Only"],
   "Depth / Spatial Reference": ["Spatial Alignment Verification Only", "Mask / Guide Only", "Context Only"],
   "Motion Guide / Retargeting Reference": ["Derived Motion Decoding Only"],
-  "FX Reference": ["FX Behavior Only", "Timing Only", "Context Only"],
-  "Timing / Edit Reference": ["Timing Only", "Context Only"],
+  "FX Reference": ["FX Behavior Only"],
+  "Timing / Edit Reference": ["Timing Only"],
   "Lighting / Look Reference": ["Lighting / Look Only", "Context Only"],
   "Simulation Reference": ["Secondary Motion Only", "FX Behavior Only", "Context Only"],
   "Mask / Control Reference": ["Mask / Guide Only", "Context Only"],
@@ -560,7 +560,6 @@ function defaultState() {
     images: [defaultImage(1), defaultImage(2), defaultImage(3), defaultImage(4)],
     videos: [defaultVideo(1)],
     text: Object.fromEntries(TEXT_FIELDS.map(([key]) => [key, ""])),
-    source_intent_fallbacks: [],
     ui: defaultUi(),
     picker: {
       enabled: false,
@@ -607,31 +606,6 @@ function parseValue(value) {
 
 function clean(value) {
   return String(value || "").trim();
-}
-
-function normalizeSourceIntentFallbacks(value) {
-  const source = Array.isArray(value) ? value : (value == null ? [] : [value]);
-  const out = [];
-  const seen = new Set();
-  source.forEach((raw) => {
-    const entry = raw && typeof raw === "object" && !Array.isArray(raw)
-      ? {
-        source: clean(raw.source) || "CONNECTED_SOURCE",
-        reason: clean(raw.reason) || "readable unstructured input",
-        text: clean(raw.text),
-      }
-      : {
-        source: "CONNECTED_SOURCE",
-        reason: "readable unstructured input",
-        text: clean(raw),
-      };
-    if (!entry.text) return;
-    const signature = `${entry.source}\u0000${entry.reason}\u0000${entry.text}`;
-    if (seen.has(signature)) return;
-    seen.add(signature);
-    out.push(entry);
-  });
-  return out;
 }
 
 function isKnownColorPick(value) {
@@ -712,6 +686,23 @@ const VIDEO_ROLE_ALIASES = {
 function canonicalVideoRole(value) {
   const role = clean(value);
   return VIDEO_ROLE_ALIASES[role] || role;
+}
+
+export function applyVideoRoleDefaultForSourceType(item) {
+  if (!item || typeof item !== "object") return "";
+  const currentRole = canonicalVideoRole(item.control_role);
+  const sourceType = clean(item.source_type);
+  const defaultRole = sourceType === "FX Reference"
+    ? "FX Behavior Only"
+    : sourceType === "Timing / Edit Reference"
+      ? "Timing Only"
+      : "";
+  if (!defaultRole) {
+    item.control_role = currentRole;
+    return currentRole;
+  }
+  item.control_role = defaultRole;
+  return defaultRole;
 }
 
 function primaryVideoTypeChoices(_current) {
@@ -821,7 +812,7 @@ function normalizeFrameDomainEndpoint(value) {
   return Math.max(0, Math.min(MAX_MANUAL_FRAME_NUMBER, frame));
 }
 
-function normalizeFrameRangeBindings(value, legacyBinding = null) {
+export function normalizeFrameRangeBindings(value, legacyBinding = null) {
   const out = {};
   const candidates = [];
   if (legacyBinding && typeof legacyBinding === "object") candidates.push(["", legacyBinding]);
@@ -835,6 +826,7 @@ function normalizeFrameRangeBindings(value, legacyBinding = null) {
     const color = clean(raw.color_pick || raw.color || keyParts[1]);
     const key = frameBindingKey(slot, color);
     const previous = out[key] && typeof out[key] === "object" ? out[key] : {};
+    const hasEnabled = Object.prototype.hasOwnProperty.call(raw, "enabled");
     const hasStart = Object.prototype.hasOwnProperty.call(raw, "start_frame")
       || Object.prototype.hasOwnProperty.call(raw, "manual_start_frame");
     const hasEnd = Object.prototype.hasOwnProperty.call(raw, "end_frame")
@@ -842,6 +834,14 @@ function normalizeFrameRangeBindings(value, legacyBinding = null) {
     out[key] = {
       video_slot: `@video${slot}`,
       color_pick: color,
+      // Existing bindings predate this flag and were active whenever the
+      // image-level Range switch was ON.  Preserve that legacy meaning while
+      // retaining an explicit per-address false value during later round trips.
+      enabled: hasEnabled
+        ? Boolean(raw.enabled)
+        : Object.prototype.hasOwnProperty.call(previous, "enabled")
+          ? Boolean(previous.enabled)
+          : true,
       origin: clean(raw.origin) || "manual",
       ranges: normalizeFrameRanges(raw.ranges),
       start_frame: hasStart
@@ -950,6 +950,7 @@ function currentFrameRangeSelection(item) {
         ? {
           video_slot: `@video${slot}`,
           color_pick: color,
+          enabled: true,
           origin: "manual",
           ranges: [],
           start_frame: null,
@@ -1805,9 +1806,6 @@ export function normalizeState(input) {
     images,
     videos,
     text,
-    source_intent_fallbacks: normalizeSourceIntentFallbacks(
-      input && input.source_intent_fallbacks,
-    ),
     ui: normalizeUi(input && input.ui),
     picker,
     image_asset: imageAsset,
@@ -2360,6 +2358,7 @@ export function storeCurrentFrameRanges(item, ranges, selectedIndex = -1) {
   const binding = {
     video_slot: `@video${selection.slot}`,
     color_pick: selection.color,
+    enabled: true,
     origin: "manual",
     ranges: normalizedRanges,
     start_frame: normalizeFrameDomainEndpoint(selection.binding && selection.binding.start_frame),
@@ -2383,6 +2382,7 @@ export function storeCurrentFrameDomain(item, startFrame, endFrame) {
   const binding = {
     video_slot: `@video${selection.slot}`,
     color_pick: selection.color,
+    enabled: true,
     origin: clean(selection.binding && selection.binding.origin) || "manual",
     ranges: normalizeFrameRanges(selection.binding && selection.binding.ranges),
     start_frame: normalizeFrameDomainEndpoint(startFrame),
@@ -2401,10 +2401,21 @@ export function setFrameRangeEnabled(item, enabled) {
   normalizeImageBindingFields(item, MAX_VIDEOS);
   item.frame_range_enabled = Boolean(enabled);
   if (!item.frame_range_enabled) item.frame_range_selected_index = -1;
-  if (item.frame_range_enabled && !currentFrameRangeSelection(item).binding) {
-    storeCurrentFrameRanges(item, [], -1);
-  }
-  else syncCurrentFrameRangeBinding(item);
+  if (item.frame_range_enabled) {
+    const selection = currentFrameRangeSelection(item);
+    if (!selection.binding) {
+      storeCurrentFrameRanges(item, [], -1);
+    } else {
+      // The image switch enables the currently addressed binding without
+      // clearing any other active @video/ColorPick address.
+      const binding = { ...selection.binding, enabled: true };
+      item.frame_range_bindings = {
+        ...selection.bindings,
+        [selection.key]: binding,
+      };
+      item.frame_range_binding = { ...binding };
+    }
+  } else syncCurrentFrameRangeBinding(item);
   return item.frame_range_enabled;
 }
 
@@ -4448,6 +4459,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
             }
             if (kind === "video" && field === "source_type") {
               if (select.value !== "Custom") target[index].custom_source_type = "";
+              applyVideoRoleDefaultForSourceType(target[index]);
               if (select.value === "Ignore / Unused") {
                 hmbSuppressPickerVideoSlot(state, target[index].slot || index + 1);
               } else {

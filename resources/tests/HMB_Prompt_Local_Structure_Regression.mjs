@@ -166,7 +166,7 @@ const noLossRoundTrip = widget.normalizeState({
 });
 assert.equal(noLossRoundTrip.images[0].color_picks[0], "Infrared dream marker");
 assert.ok(noLossRoundTrip.images[0].frame_range_bindings["@video5::Infrared dream marker"]);
-assert.equal(noLossRoundTrip.source_intent_fallbacks[0].text, "Use the impossible reflection rhythm");
+assert.equal("source_intent_fallbacks" in noLossRoundTrip, false);
 
 const pickerUidEcho = widget.normalizeState(JSON.parse(JSON.stringify(widget.normalizeState({
   videos: [

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 from pathlib import Path
 
 
@@ -15,6 +16,13 @@ prompt = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(prompt)
 
 
+def prompt_json_section(payload: str, header: str):
+    lines = payload.splitlines()
+    assert lines[0] == "HMB_GP_Production"
+    assert len(lines) == 7
+    return json.loads(lines[lines.index(header) + 1])
+
+
 def fallback_texts(state):
     return [
         str(entry.get("text") or "")
@@ -23,27 +31,28 @@ def fallback_texts(state):
     ]
 
 
-# Readable malformed/non-object connected values are ordinary intent, never {}.
+# Structured connectors do not have verified user-authored text provenance.
+# Malformed/non-object values therefore cannot enter USER DESCRIPTION.
 raw_asset = "Use the brass key as the hero's emotional anchor"
 parsed_asset = prompt._parse_image_asset_payload(raw_asset)
-assert parsed_asset
+assert parsed_asset == {}
 asset_state = prompt._apply_image_asset_payload(
     prompt._default_widget_state(),
     parsed_asset,
     connected=True,
 )
-assert raw_asset in fallback_texts(asset_state)
+assert raw_asset not in fallback_texts(asset_state)
 assert asset_state["image_asset"]["enabled"] is True
 
 raw_picker = '["slow orbit", {"mood":"hesitant"}]'
 parsed_picker = prompt._parse_picker_payload(raw_picker)
-assert parsed_picker
+assert parsed_picker == {}
 picker_state = prompt._apply_picker_payload(
     prompt._default_widget_state(),
     parsed_picker,
     connected=True,
 )
-assert "slow orbit" in "\n".join(fallback_texts(picker_state))
+assert "slow orbit" not in "\n".join(fallback_texts(picker_state))
 assert picker_state["picker"]["enabled"] is True
 
 
@@ -72,7 +81,12 @@ foreign_picker = {
 foreign_result = prompt._apply_picker_payload(existing, foreign_picker, connected=True)
 assert foreign_result["videos"][0]["label"] == "manual_color"
 assert foreign_result["picker"]["run_id"] == "keep-run"
-assert "Use every reflection" in "\n".join(fallback_texts(foreign_result))
+assert "Use every reflection" not in "\n".join(fallback_texts(foreign_result))
+foreign_user = prompt_json_section(
+    prompt._build_prompt_package(foreign_result),
+    "USER DESCRIPTION DATA (JSON):",
+)
+assert foreign_user == {}
 
 
 # A shorter connected Asset selection removes only the deselected upstream-owned
@@ -129,7 +143,7 @@ assert not any(
     for item in short_result["images"]
 )
 assert short_result["images"][0]["asset_source_uid"] == "uid-a"
-assert "a handwritten third image idea" in fallback_texts(short_result)
+assert "a handwritten third image idea" not in fallback_texts(short_result)
 
 
 # Unknown upstream scope/Color candidates stay readable and available.
@@ -165,8 +179,8 @@ custom_row = custom_result["images"][0]
 assert custom_row["asset_scope_candidate"] == "Invented cinematic scope"
 assert custom_row["asset_color_pick_candidates"] == ["Red", "Infrared dream marker"]
 fallback_blob = "\n".join(fallback_texts(custom_result))
-assert "Invented cinematic scope" in fallback_blob
-assert "Infrared dream marker" in fallback_blob
+assert "Invented cinematic scope" not in fallback_blob
+assert "Infrared dream marker" not in fallback_blob
 
 
 # Picker refresh may replace only its auto marker, never the user's frame range.
@@ -245,21 +259,27 @@ goal_state["images"] = [{
 }]
 goal_state["text"]["SCENE_CONTEXT"] = "Resolve @video5 as a dream-memory rhythm"
 goal_prompt = prompt._build_prompt_package(goal_state)
-assert "Target = Hero hand" in goal_prompt
-assert "Target = Door lock" in goal_prompt
-assert "Target = Memory echo" in goal_prompt
-assert "Supplied video bindings = @video3" in goal_prompt
-assert "follow @video1" not in goal_prompt
-assert "immediately usable user intent" in goal_prompt
-assert "without a slot prerequisite" in goal_prompt
+goal_job = prompt_json_section(goal_prompt, "HMB JOB DATA (JSON):")
+goal_image = goal_job["images"][0]
+assert goal_image["target_id"] == "Hero hand"
+assert goal_image["relationship_targets"] == ["Door lock", "Memory echo"]
+assert goal_image["bindings"] == [{
+    "video": "@video3",
+    "marker_color": "Custom brass marker",
+    "target_scope": "Handheld prop",
+}]
+goal_user = prompt_json_section(goal_prompt, "USER DESCRIPTION DATA (JSON):")
+assert goal_user == {"SCENE_CONTEXT": "Resolve @video5 as a dream-memory rhythm"}
 
 malformed_text_state = prompt._default_widget_state()
 malformed_text_state["text"]["PRESERVED_TEXT"] = "free readable words\n[Future Tag] exact future phrase"
 malformed_prompt = prompt._build_prompt_package(malformed_text_state)
-assert "PRESERVED_TEXT_DESCRIPTIVE_FALLBACK" in malformed_prompt
-assert "free readable words" in malformed_prompt
-assert "exact future phrase" in malformed_prompt
-assert "SOURCE DATA WARNINGS" not in malformed_prompt
+assert prompt_json_section(
+    malformed_prompt,
+    "USER DESCRIPTION DATA (JSON):",
+) == {
+    "PRESERVED_TEXT": "free readable words\n[Future Tag] exact future phrase",
+}
 
 source = (ROOT / "HMBPromptLibrary.py").read_text(encoding="utf-8")
 for forbidden in (
@@ -271,4 +291,4 @@ for forbidden in (
 ):
     assert forbidden not in source
 
-print("HMB Prompt connection no-loss and goal-first regression: PASS")
+print("HMB Prompt connection data-boundary regression: PASS")

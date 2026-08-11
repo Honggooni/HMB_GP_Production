@@ -81,6 +81,93 @@ assert.deepEqual(image.frame_range_bindings["@video3::Green"].ranges, [
   { start: 1, end: 48 },
   { start: 97, end: 144 },
 ]);
+
+const normalizedEnabledBindings = prompt.normalizeFrameRangeBindings({
+  "@video1::Red": {
+    video_slot: "@video1",
+    color_pick: "Red",
+    enabled: true,
+    origin: "picker",
+    ranges: [{ start: 1, end: 12 }],
+  },
+  "@video2::Blue": {
+    video_slot: "@video2",
+    color_pick: "Blue",
+    enabled: true,
+    origin: "picker",
+    ranges: [{ start: 20, end: 32 }],
+  },
+  "@video3::Green": {
+    video_slot: "@video3",
+    color_pick: "Green",
+    enabled: false,
+    origin: "picker",
+    ranges: [{ start: 40, end: 44 }],
+  },
+});
+assert.equal(normalizedEnabledBindings["@video1::Red"].enabled, true);
+assert.equal(normalizedEnabledBindings["@video2::Blue"].enabled, true);
+assert.equal(normalizedEnabledBindings["@video3::Green"].enabled, false);
+
+const multiActiveImage = {
+  ...image,
+  color_picks: ["Red", "Blue"],
+  binding_video_slots: [1, 2],
+  marker_video: 1,
+  frame_range_color_index: 0,
+  frame_range_bindings: normalizedEnabledBindings,
+  frame_range_binding: null,
+};
+prompt.storeCurrentFrameRanges(multiActiveImage, [{ start: 3, end: 8 }], 0);
+assert.equal(multiActiveImage.frame_range_bindings["@video1::Red"].enabled, true);
+assert.equal(
+  multiActiveImage.frame_range_bindings["@video2::Blue"].enabled,
+  true,
+  "Saving one Range address must retain a second active @video/ColorPick binding.",
+);
+assert.equal(prompt.setFrameRangeEnabled(multiActiveImage, false), false);
+assert.equal(multiActiveImage.frame_range_bindings["@video1::Red"].enabled, true);
+assert.equal(multiActiveImage.frame_range_bindings["@video2::Blue"].enabled, true);
+multiActiveImage.frame_range_color_index = 1;
+assert.equal(prompt.setFrameRangeEnabled(multiActiveImage, true), true);
+assert.equal(multiActiveImage.frame_range_bindings["@video1::Red"].enabled, true);
+assert.equal(multiActiveImage.frame_range_bindings["@video2::Blue"].enabled, true);
+
+const normalizedMultiActiveState = prompt.normalizeState({
+  ...state,
+  images: [JSON.parse(JSON.stringify(multiActiveImage))],
+});
+assert.equal(normalizedMultiActiveState.images[0].frame_range_bindings["@video1::Red"].enabled, true);
+assert.equal(normalizedMultiActiveState.images[0].frame_range_bindings["@video2::Blue"].enabled, true);
+
+assert.equal(
+  prompt.applyVideoRoleDefaultForSourceType({ source_type: "FX Reference", control_role: "" }),
+  "FX Behavior Only",
+);
+assert.equal(
+  prompt.applyVideoRoleDefaultForSourceType({ source_type: "Timing / Edit Reference", control_role: "" }),
+  "Timing Only",
+);
+const preservedTimingRole = { source_type: "FX Reference", control_role: "Timing Only" };
+assert.equal(
+  prompt.applyVideoRoleDefaultForSourceType(preservedTimingRole),
+  "FX Behavior Only",
+  "FX Main Type always owns readable FX behavior regardless of a stale narrower role.",
+);
+const preservedContextRole = { source_type: "Timing / Edit Reference", control_role: "Context Only" };
+assert.equal(
+  prompt.applyVideoRoleDefaultForSourceType(preservedContextRole),
+  "Timing Only",
+  "Timing/Edit Main Type always canonicalizes to its cue-only role.",
+);
+const incompatibleMotionRole = { source_type: "FX Reference", control_role: "Local Motion Detail Only" };
+assert.equal(
+  prompt.applyVideoRoleDefaultForSourceType(incompatibleMotionRole),
+  "FX Behavior Only",
+  "Changing Main Type replaces an incompatible prior role with the target type default.",
+);
+const incompatibleFxRole = { source_type: "Timing / Edit Reference", control_role: "FX Behavior Only" };
+assert.equal(prompt.applyVideoRoleDefaultForSourceType(incompatibleFxRole), "Timing Only");
 assert.equal(prompt.frameRangeUiStatus(state, image).canEnable, true);
 assert.equal(prompt.frameRangeUiStatus(state, image).status, "2 RANGES");
 
@@ -253,6 +340,7 @@ assert.deepEqual(
   {
     video_slot: "@video3",
     color_pick: "Green",
+    enabled: true,
     origin: "manual",
     ranges: [{ start: 1010, end: 1020 }],
     start_frame: 12,
@@ -276,6 +364,7 @@ assert.deepEqual(
   {
     video_slot: "@video5",
     color_pick: "",
+    enabled: true,
     origin: "manual",
     ranges: [],
     start_frame: 1001,

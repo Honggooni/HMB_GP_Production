@@ -4,7 +4,7 @@
   "metadata": {
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.5.14",
+    "library_version": "0.6.1",
     "engine_version": "0.93.0",
     "tags": [
       "Griptape",
@@ -94,7 +94,7 @@
       "GoalFirstShotComposition",
       "ControlOnlyBindings",
       "NonBlockingSourceNormalization",
-      "SignedExternalPolicy",
+      "SignedServerPolicy",
       "CompactPublicPrompt",
       "FinalTextBoundary",
       "AgentStateChainOnly",
@@ -112,17 +112,19 @@
       "ExactPromptEdgeAgentPolicy",
       "KeyboardDeleteProtection",
       "InstantColorAssignment",
-      "HMBSeedance20VideoGeneration",
+      "HMBSeedanceGeneration",
       "VolcengineArk",
-      "DirectArkTransport",
-      "SecureArkAPIKey",
+      "FNAIBroker",
+      "ServerManagedProviderCredentials",
+      "BrokerServerUsageAccounting",
+      "DPAPIProtectedBrokerSession",
       "SingleWireReferenceImages",
       "SingleWireVideoReferences",
       "ReferenceImageCapacity9",
       "VideoReferenceCapacity3",
       "AudioReferenceCapacity3",
       "ImmediateLocalMP4",
-      "ResumableArkTask",
+      "ResumableBrokerTask",
       "StreamingSignedDownload",
       "DownloadSSRFGuard",
       "TemporaryVideoPublication",
@@ -130,17 +132,16 @@
       "VolcengineTOSUpload",
       "SeedanceStandard4K",
       "SingleVideoPreview",
-      "GetOnlyTaskRecovery",
-      "AmbiguousSubmissionSafety",
-      "PrivatePerUserMonthlyUsageLedger",
-      "OfflineUsageQueue",
-      "AtomicUsageLedger"
+      "BrokerTaskRefresh",
+      "AmbiguousSubmissionSafety"
     ],
     "dependencies": {
       "pip_dependencies": [
         "imageio-ffmpeg==0.6.0",
         "Pillow==12.3.0",
-        "httpx==0.28.1"
+        "httpx==0.28.1",
+        "cryptography==50.0.0",
+        "tos==2.9.2"
       ]
     },
     "declarations": [
@@ -156,11 +157,10 @@
   },
   "settings": [
     {
-      "description": "The HMB Seedance 2.0 node reads the user-owned Volcengine Ark API key from Griptape Secrets at execution time. Local reference videos may use either the existing separately scoped storage key or a least-privilege Volcengine TOS IAM key and private bucket. Secret values are never stored in node parameters, outputs, logs, manifests, or release archives.",
+      "description": "HMB Seedance authenticates through the FN AI Broker's one-time browser authorization. Provider API keys remain exclusively on the Broker server. The client performs no secondary usage recording; the Broker is the sole usage, quota, and accounting authority. The permanent Broker access token is protected with Windows DPAPI and never stored in node parameters, outputs, logs, manifests, or release archives. Local reference videos may still use separately scoped Griptape Cloud or least-privilege Volcengine TOS storage credentials.",
       "category": "app_events.on_app_initialization_complete",
       "contents": {
         "secrets_to_register": {
-          "ARK_API_KEY": "",
           "GT_CLOUD_API_KEY": "",
           "GT_CLOUD_BUCKET_ID": "",
           "TOS_ACCESS_KEY_ID": "",
@@ -224,12 +224,12 @@
       }
     },
     {
-      "class_name": "HMBSeedance20VideoGeneration",
-      "file_path": "HMBSeedance20VideoGeneration.py",
+      "class_name": "HMBSeedanceGeneration",
+      "file_path": "HMBSeedanceGeneration.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "The existing HMB Seedance 2.0 node upgraded in place to the official Volcengine Ark asynchronous API. It submits each billable POST /contents/generations/tasks at most once, polls GET /contents/generations/tasks/{id}, immediately streams content.video_url to a bounded local MP4, and publishes one property-only preview plus the sole VIDEO_OUT connector. Resume Task ID and the Status-group Refresh / Retrieve Result control reuse accepted tasks without another create POST; Refresh performs GET only and can list candidates after an ambiguous response without choosing one. Its public media surface accepts Image Asset Library Video Generation Out through one ordered list input of up to 9 reference images and Video Picker VIDEO_OUT through one ordered list input of up to 3 reference videos, while hidden reference_video_1/reference_video_2/reference_video_3 parameters remain saved-workflow fallbacks. It also keeps a ParameterList of up to 3 reference audio items. Local images and MP3/WAV audio are encoded within Ark limits; project-relative paths resolve against the active workspace. Local video references are lazily published through a selectable upload service. Volcengine TOS mode uploads to a private bucket, creates a 24-hour signed HTTPS URL, and deletes the temporary object best-effort after execution; ambiguous submissions retain it for up to 30 minutes. Existing public URLs and asset:// references bypass upload. ARK_API_KEY and all storage credentials are read only from Griptape Secrets.",
-        "display_name": "HMB Seedance 2.0 Video Generation",
+        "description": "The existing HMB Seedance node submits supported models exclusively through the authenticated FN AI Broker, resumes and refreshes the same Broker job without creating replacements, downloads same-origin results with Broker authorization, and never forwards that authorization to external result URLs. Provider credentials and usage, quota, and accounting remain server-side. Its ordered image, Picker video, audio, Griptape Cloud, TOS, output-preflight, and local MP4 contracts remain intact.",
+        "display_name": "HMB Seedance Generation",
         "icon": "Sparkles",
         "group": "create",
         "tags": [
@@ -244,13 +244,14 @@
           "video-reference-capacity-3",
           "audio-default-off",
           "volcengine-ark",
-          "direct-ark-api",
+          "fn-ai-broker",
           "standard-4k",
-          "secure-ark-key",
+          "server-managed-provider-credentials",
+          "dpapi-protected-broker-session",
           "temporary-video-publication",
           "griptape-cloud-storage",
           "single-video-preview",
-          "get-only-task-recovery",
+          "broker-task-refresh",
           "ambiguous-submission-safety",
           "local-mp4-output"
         ]

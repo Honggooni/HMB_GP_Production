@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import importlib.util
 import json
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import httpx
+from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
     CreateConnectionResultSuccess,
@@ -34,9 +37,14 @@ from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE_PATH = ROOT / "HMBSeedance20VideoGeneration.py"
+MODULE_PATH = ROOT / "HMBSeedanceGeneration.py"
 IMAGE_ASSET_MODULE_PATH = ROOT / "HMBImageAssetLibrary.py"
 VIDEO_PICKER_MODULE_PATH = ROOT / "HMBVideoPickerLibrary.py"
+VALID_MP4_BYTES = (
+    b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+    b"\x00\x00\x00\x10moov\x00\x00\x00\x08mvhd"
+    b"\x00\x00\x00\x10mdat12345678"
+)
 
 
 def load_target():
@@ -82,7 +90,10 @@ video_picker_target = load_video_picker_target()
 
 class FakeDestination:
     def __init__(self) -> None:
-        self.location = str(ROOT / ".tmp" / "volcengine-regression.mp4")
+        self._temporary = tempfile.TemporaryDirectory()
+        self.location = str(
+            Path(self._temporary.name) / "volcengine-regression.mp4"
+        )
         self.resolved = False
         self.written: bytes | None = None
 
@@ -91,8 +102,7 @@ class FakeDestination:
         return self.location
 
     async def awrite_bytes(self, content: bytes):
-        self.written = bytes(content)
-        return SimpleNamespace(location=self.location, name="volcengine-regression.mp4")
+        raise AssertionError("Completed MP4 bypassed atomic sibling publication")
 
 
 class FakeOutputFile:
@@ -103,56 +113,69 @@ class FakeOutputFile:
         return self.destination
 
 
-class ScriptedNode(target.HMBSeedance20VideoGeneration):
-    TEST_KEY = "regression-secret-key"
 
-    def __init__(self, scripted_gets: list[dict]) -> None:
-        super().__init__(name="HMB Volcengine Scripted Regression")
-        self.scripted_gets = list(scripted_gets)
-        self.requests: list[dict] = []
-        self.downloads: list[str] = []
-        self.sleeps: list[float] = []
-        self.destination = FakeDestination()
-        self._output_file = FakeOutputFile(self.destination)
+
+class FakeBrokerBridge:
+    SECRET_VALUES = (
+        "broker-access-token-canary",
+        "provider-api-key-canary",
+        "authorization-canary",
+    )
+
+    def __init__(self, refresh_responses: list[dict]) -> None:
+        self.refresh_responses = list(refresh_responses)
+        self.account_calls = 0
+        self.generate_payloads: list[dict] = []
+        self.refresh_ids: list[str] = []
+
+    def account_snapshot(self, *, connect: bool):
+        assert connect is True
+        self.account_calls += 1
+        return target._BrokerAccountSnapshot(
+            state="connected",
+            connected=True,
+            account="Broker Artist",
+        )
+
+    def generate_seedance(self, payload: dict, *, timeout: float) -> dict:
+        assert timeout > 0
+        self.generate_payloads.append(dict(payload))
+        return {
+            "status": "pending",
+            "job_id": "broker-job-1",
+            "token": self.SECRET_VALUES[0],
+            "api_key": self.SECRET_VALUES[1],
+            "authorization": self.SECRET_VALUES[2],
+            "nested": {"credential": self.SECRET_VALUES[1]},
+        }
+
+    def refresh_job(self, job_id: str, *, timeout: float = 60) -> dict:
+        assert timeout > 0
+        self.refresh_ids.append(job_id)
+        if not self.refresh_responses:
+            raise AssertionError("Unexpected extra Broker refresh")
+        return self.refresh_responses.pop(0)
 
     @staticmethod
-    def _get_api_key() -> str:
-        return ScriptedNode.TEST_KEY
+    def is_trusted_broker_url(_url: str) -> bool:
+        return False
 
-    def _capture_usage_identity(self):
-        # General transport tests must never touch a real login or network
-        # usage share. Dedicated ledger tests exercise that contract below.
-        return None
 
-    async def _request_json(
-        self,
-        method: str,
-        path: str,
-        api_key: str,
-        payload: dict | None = None,
-        *,
-        retry: bool = False,
-        deadline: float | None = None,
-    ) -> dict:
-        self.requests.append(
-            {
-                "method": method,
-                "path": path,
-                "api_key": api_key,
-                "payload": payload,
-                "retry": retry,
-                "deadline": deadline,
-            }
-        )
-        if method == "POST":
-            return {"id": "task-regression-1", "status": "queued"}
-        if not self.scripted_gets:
-            raise AssertionError("Unexpected extra task poll")
-        return self.scripted_gets.pop(0)
+class BrokerScriptedNode(target.HMBSeedanceGeneration):
+    def __init__(self, bridge: FakeBrokerBridge) -> None:
+        super().__init__(name="HMB Seedance Broker Scripted Regression")
+        self.bridge = bridge
+        self.destination = FakeDestination()
+        self._output_file = FakeOutputFile(self.destination)
+        self.downloads: list[str] = []
+        self.sleeps: list[float] = []
+
+    def _create_broker_bridge(self):
+        return self.bridge
 
     async def _download_video(self, url: str) -> bytes:
         self.downloads.append(url)
-        return b"\x00\x00\x00\x18ftypmp42regression-video"
+        return VALID_MP4_BYTES
 
     async def _sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
@@ -166,10 +189,18 @@ def assert_constructor_and_public_contract() -> None:
         target.GriptapeNodes,
         "SecretsManager",
         side_effect=AssertionError("constructor read a secret"),
+    ), mock.patch.object(
+        target._HMBAIBrokerBridge,
+        "_request_json",
+        side_effect=AssertionError("constructor performed a Broker request"),
+    ), mock.patch.object(
+        target.urllib.request,
+        "urlopen",
+        side_effect=AssertionError("constructor performed a network request"),
     ):
-        node = target.HMBSeedance20VideoGeneration(name="Constructor Regression")
+        node = target.HMBSeedanceGeneration(name="Constructor Regression")
 
-    assert target.HMBSeedance20VideoGeneration.__mro__[1].__name__ == "SuccessFailureNode"
+    assert target.HMBSeedanceGeneration.__mro__[1].__name__ == "SuccessFailureNode"
     names = [parameter.name for parameter in node.parameters]
     for required in (
         "exec_in",
@@ -198,6 +229,10 @@ def assert_constructor_and_public_contract() -> None:
         "generation_id",
         "generation_status",
         "generation_refresh",
+        "broker_connection_status",
+        "broker_account",
+        "broker_connect_refresh",
+        "broker_notice",
         "provider_response",
         "video_url",
         "VIDEO_OUT",
@@ -221,21 +256,26 @@ def assert_constructor_and_public_contract() -> None:
     assert target.MAX_REFERENCE_IMAGES == 9
     assert target.MAX_VIDEO_REFERENCES == 3
     assert target.MAX_REFERENCE_AUDIO == 3
-    assert target.ARK_BASE_URL == "https://ark.cn-beijing.volces.com/api/v3"
+    assert target.AI_BROKER_SERVER_URL == "http://192.168.203.245:8080"
     assert target.MODEL_RESOLUTIONS[target.SEEDANCE_2_0_MODEL_ID] == (
-        "480p",
-        "720p",
-        "1080p",
         "4k",
+        "1080p",
+        "720p",
+        "480p",
     )
     assert target.MODEL_RESOLUTIONS[target.SEEDANCE_2_0_FAST_MODEL_ID] == (
-        "480p",
         "720p",
+        "480p",
     )
     assert target.MODEL_RESOLUTIONS[target.SEEDANCE_2_0_MINI_MODEL_ID] == (
-        "480p",
         "720p",
+        "480p",
     )
+    assert target.MODEL_DEFAULT_RESOLUTIONS == {
+        target.SEEDANCE_2_0_MODEL_ID: "1080p",
+        target.SEEDANCE_2_0_FAST_MODEL_ID: "720p",
+        target.SEEDANCE_2_0_MINI_MODEL_ID: "720p",
+    }
 
     image_parameter = node.get_parameter_by_name("reference_images")
     assert type(image_parameter).__name__ == "Parameter"
@@ -309,8 +349,58 @@ def assert_constructor_and_public_contract() -> None:
     assert node.get_parameter_value("tos_endpoint") == "tos-cn-beijing.volces.com"
     assert node.get_parameter_value("tos_url_validity_seconds") == 86400
     assert node.get_parameter_by_name("tos_region").hide is True
+    assert node.get_parameter_value("model_id") == target.MODEL_NAME_SEEDANCE_2_0
+    assert node.get_parameter_by_name("model_id").ui_options["simple_dropdown"] == [
+        target.MODEL_NAME_SEEDANCE_2_0,
+        target.MODEL_NAME_SEEDANCE_2_0_FAST,
+        target.MODEL_NAME_SEEDANCE_2_0_MINI,
+    ]
+    assert (
+        node.get_parameter_value("input_mode")
+        == target.INPUT_MODE_MULTIMODAL_REFERENCES
+    )
+    assert node.get_parameter_by_name("input_mode").ui_options[
+        "simple_dropdown"
+    ] == [
+        target.INPUT_MODE_TEXT_ONLY,
+        target.INPUT_MODE_FIRST_LAST_FRAME,
+        target.INPUT_MODE_MULTIMODAL_REFERENCES,
+    ]
     assert node.get_parameter_value("generate_audio") is False
-    saved_audio_node = target.HMBSeedance20VideoGeneration(
+    assert node.get_parameter_value("resolution") == "1080p"
+    assert node.get_parameter_by_name("resolution").ui_options["simple_dropdown"] == [
+        "4k",
+        "1080p",
+        "720p",
+        "480p",
+    ]
+    assert node.get_parameter_value("ratio") == "adaptive"
+    assert node.get_parameter_by_name("ratio").ui_options["simple_dropdown"] == list(
+        target.RATIOS
+    )
+    assert node.get_parameter_value("duration") == 5
+    assert node.get_parameter_by_name("duration").ui_options["simple_dropdown"] == [
+        -1,
+        *range(4, 16),
+    ]
+    assert node.get_parameter_value("resume_generation_id") == ""
+    assert node.get_parameter_value("watermark") is False
+    assert node.get_parameter_value("return_last_frame") is False
+    assert node.get_parameter_value("execution_expires_after") == 172800
+    assert node.get_parameter_value("priority") == 0
+    assert node.get_parameter_value("poll_interval_seconds") == 30
+    assert node.get_parameter_value("generation_timeout_seconds") == 3600
+    node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0_FAST)
+    assert node._get_parameters()["model_id"] == target.SEEDANCE_2_0_FAST_MODEL_ID
+    assert node.get_parameter_value("resolution") == "720p"
+    assert node.get_parameter_by_name("resolution").ui_options["simple_dropdown"] == [
+        "720p",
+        "480p",
+    ]
+    node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0_MINI)
+    assert node._get_parameters()["model_id"] == target.SEEDANCE_2_0_MINI_MODEL_ID
+    assert node.get_parameter_value("resolution") == "720p"
+    saved_audio_node = target.HMBSeedanceGeneration(
         name="Saved Generate Audio Regression"
     )
     saved_audio_node.set_parameter_value("generate_audio", True, initial_setup=True)
@@ -338,16 +428,65 @@ def assert_constructor_and_public_contract() -> None:
     assert type(refresh_parameter).__name__ == "ParameterButton"
     assert refresh_parameter.label == "Refresh / Retrieve Result"
 
+    root_children = list(node.root_ui_element.children)
+    root_names = [element.name for element in root_children]
+    assert root_names[-2:] == ["Status", "AI Broker"]
+    broker_group = root_children[-1]
+    assert type(broker_group).__name__ == "ParameterGroup"
+    assert broker_group.ui_options == {"collapsed": True}
+    assert [child.name for child in broker_group.children] == [
+        "broker_connection_status",
+        "broker_account",
+        "broker_connect_refresh",
+        "broker_notice",
+    ]
+    assert not any(
+        text in child.name.lower()
+        for child in broker_group.children
+        for text in ("api_key", "token", "usage", "quota", "credit", "register")
+    )
+    for name in ("broker_connection_status", "broker_account", "broker_notice"):
+        parameter = node.get_parameter_by_name(name)
+        assert parameter.allowed_modes == {target.ParameterMode.PROPERTY}
+        assert parameter.settable is False
+        assert parameter.serializable is False
+    assert node.get_parameter_by_name("broker_connect_refresh").label == (
+        "Connect / Refresh"
+    )
+
     source = MODULE_PATH.read_text(encoding="utf-8")
-    assert "_BaseSeedance20" not in source
+    for forbidden_symbol in (
+        "ARK" + "_API_KEY",
+        "ARK" + "_BASE_URL",
+        "CREATE" + "_TASK_PATH",
+        "Volcengine" + "APIError",
+        "_process_" + "direct",
+        "_refresh_" + "direct",
+        "USAGE" + "_LEDGER_ROOT",
+        "Griptape_" + "list",
+    ):
+        assert forbidden_symbol not in source
+    assert not {
+        name
+        for name in dir(target.HMBSeedanceGeneration)
+        if "usage" in name.casefold() or "direct" in name.casefold()
+    }
+    assert "_BaseSeedance" not in source
     assert "GriptapeProxyNode" not in source
     assert "ProxyAuthProviderParameter" not in source
     assert "HMB_GRIPTAPE_STANDARD_LIBRARY_PATH" not in source
+    assert "from fn_ai_auth_v2" not in source
+    assert "import fn_ai_auth_v2" not in source
+    assert "from _hmb_broker_bridge" not in source
+    assert "import _hmb_broker_bridge" not in source
     assert "def _list_parameter(" not in source
     assert "PublicArtifactUrlParameter" not in source
     assert "GriptapeCloudStorageDriver" in source
     assert 'importlib.import_module("tos")' in source
-    assert 'Options(choices=["480p", "720p", "1080p", "4k"])' in source
+    assert (
+        "Options(choices=list(MODEL_RESOLUTIONS[SEEDANCE_2_0_MODEL_ID]))"
+        in source
+    )
 
 
 def assert_image_asset_single_wire_host_contract() -> None:
@@ -407,7 +546,7 @@ def assert_image_asset_single_wire_host_contract() -> None:
             source = image_asset_target.HMBImageAssetLibrary(
                 name=f"ImageAssetBatch_{stamp}"
             )
-            destination = target.HMBSeedance20VideoGeneration(
+            destination = target.HMBSeedanceGeneration(
                 name=f"SeedanceBatch_{stamp}"
             )
             register(source)
@@ -424,12 +563,8 @@ def assert_image_asset_single_wire_host_contract() -> None:
             params = destination._get_parameters()
             assert params["reference_images"] == ordered
             destination._validate_parameters(params)
-            payload = destination._build_payload(params)
-            assert [
-                item["image_url"]["url"]
-                for item in payload["content"]
-                if item["type"] == "image_url"
-            ] == ordered
+            payload = destination._build_broker_payload(params)
+            assert payload["image_urls"] == ordered
 
             reordered = [ordered[2], ordered[0], ordered[4]]
             reordered_positions = {
@@ -477,7 +612,7 @@ def assert_image_asset_single_wire_host_contract() -> None:
             overflow_source = image_asset_target.HMBImageAssetLibrary(
                 name=f"ImageAssetOverflow_{stamp}"
             )
-            overflow_destination = target.HMBSeedance20VideoGeneration(
+            overflow_destination = target.HMBSeedanceGeneration(
                 name=f"SeedanceOverflow_{stamp}"
             )
             register(overflow_source)
@@ -545,7 +680,7 @@ def assert_video_picker_single_wire_host_contract() -> None:
         source = video_picker_target.HMBVideoPickerLibrary(
             name=f"VideoPickerBatch_{stamp}"
         )
-        destination = target.HMBSeedance20VideoGeneration(
+        destination = target.HMBSeedanceGeneration(
             name=f"SeedanceVideoBatch_{stamp}"
         )
         register(source)
@@ -590,12 +725,8 @@ def assert_video_picker_single_wire_host_contract() -> None:
         assert params["video_references"] == ordered
         assert params["video_reference_slots"] == []
         destination._validate_parameters(params)
-        payload = destination._build_payload(params)
-        assert [
-            item["video_url"]["url"]
-            for item in payload["content"]
-            if item["type"] == "video_url"
-        ] == ordered
+        payload = destination._build_broker_payload(params)
+        assert payload["video_urls"] == ordered
 
         listed = GriptapeNodes.handle_request(
             ListConnectionsForNodeRequest(node_name=destination.name)
@@ -626,39 +757,10 @@ def assert_video_picker_single_wire_host_contract() -> None:
         assert not context_manager.has_current_flow()
 
 
-def assert_secret_manager_contract() -> None:
-    calls: list[str] = []
-
-    class FakeSecrets:
-        @staticmethod
-        def get_secret(name: str):
-            calls.append(name)
-            return "  user-owned-ark-key  "
-
-    with mock.patch.object(
-        target.GriptapeNodes, "SecretsManager", return_value=FakeSecrets()
-    ):
-        assert target.HMBSeedance20VideoGeneration._get_api_key() == "user-owned-ark-key"
-    assert calls == ["ARK_API_KEY"]
-
-    class MissingSecrets:
-        @staticmethod
-        def get_secret(_name: str):
-            return "  "
-
-    with mock.patch.object(
-        target.GriptapeNodes, "SecretsManager", return_value=MissingSecrets()
-    ):
-        try:
-            target.HMBSeedance20VideoGeneration._get_api_key()
-        except ValueError as exc:
-            assert "ARK_API_KEY is missing" in str(exc)
-        else:
-            raise AssertionError("Blank ARK_API_KEY was accepted")
 
 
 def assert_payload_and_media_contract() -> None:
-    node = target.HMBSeedance20VideoGeneration(name="Payload Regression")
+    node = target.HMBSeedanceGeneration(name="Payload Regression")
     with tempfile.TemporaryDirectory() as temporary:
         temporary_path = Path(temporary)
         image_path = temporary_path / "reference.png"
@@ -687,29 +789,19 @@ def assert_payload_and_media_contract() -> None:
                 "return_last_frame": True,
             }
         )
-        payload = node._build_payload(params)
+        payload = node._build_broker_payload(params)
 
         assert payload["model"] == "doubao-seedance-2-0-260128"
-        assert payload["resolution"] == "1080p"
-        assert payload["ratio"] == "16:9"
-        assert payload["duration"] == 8
+        assert payload["quality"] == "1080p"
+        assert payload["aspect_ratio"] == "16:9"
+        assert payload["duration_seconds"] == 8
         assert payload["generate_audio"] is True
         assert payload["watermark"] is False
-        assert [item["type"] for item in payload["content"]] == [
-            "text",
-            "image_url",
-            "image_url",
-            "video_url",
-            "audio_url",
-        ]
-        assert payload["content"][1]["role"] == "reference_image"
-        assert payload["content"][3] == {
-            "type": "video_url",
-            "video_url": {"url": "asset://video-asset-1"},
-            "role": "reference_video",
-        }
-        encoded_image = payload["content"][1]["image_url"]["url"]
-        encoded_audio = payload["content"][4]["audio_url"]["url"]
+        assert payload["prompt"] == "A precise regression shot"
+        assert payload["video_urls"] == ["asset://video-asset-1"]
+        encoded_image = payload["image_urls"][0]
+        assert payload["image_urls"][1] == "https://cdn.example/ref.jpg"
+        encoded_audio = payload["audio_urls"][0]
         assert encoded_image.startswith("data:image/png;base64,")
         assert base64.b64decode(encoded_image.split(",", 1)[1]) == image_bytes
         assert encoded_audio.startswith("data:audio/wav;base64,")
@@ -755,7 +847,7 @@ def assert_payload_and_media_contract() -> None:
         target.VideoUrlArtifact("asset://video-asset-2"),
     )
     collected = node._get_parameters()
-    assert [target.HMBSeedance20VideoGeneration._coerce_reference_value(item) for item in collected["video_references"]] == [
+    assert [target.HMBSeedanceGeneration._coerce_reference_value(item) for item in collected["video_references"]] == [
         "https://cdn.example/video-1.mp4",
         "asset://video-asset-2",
     ]
@@ -763,7 +855,7 @@ def assert_payload_and_media_contract() -> None:
     assert node.get_parameter_by_name("reference_video_2").hide is True
     assert node.get_parameter_by_name("reference_video_3").hide is True
 
-    ordered_list_node = target.HMBSeedance20VideoGeneration(
+    ordered_list_node = target.HMBSeedanceGeneration(
         name="Picker Ordered Video List Regression"
     )
     ordered_list_node.set_parameter_value("prompt", "preserve picker order")
@@ -776,14 +868,12 @@ def assert_payload_and_media_contract() -> None:
     ordered_video_params = ordered_list_node._get_parameters()
     assert ordered_video_params["video_references"] == ordered_videos
     assert ordered_video_params["video_reference_slots"] == []
-    ordered_video_payload = ordered_list_node._build_payload(ordered_video_params)
-    assert [
-        item["video_url"]["url"]
-        for item in ordered_video_payload["content"]
-        if item["type"] == "video_url"
-    ] == ordered_videos
+    ordered_video_payload = ordered_list_node._build_broker_payload(
+        ordered_video_params
+    )
+    assert ordered_video_payload["video_urls"] == ordered_videos
 
-    overflow_video_node = target.HMBSeedance20VideoGeneration(
+    overflow_video_node = target.HMBSeedanceGeneration(
         name="Picker Video Overflow Regression"
     )
     overflow_video_node.set_parameter_value("prompt", "reject four videos")
@@ -798,7 +888,7 @@ def assert_payload_and_media_contract() -> None:
     else:
         raise AssertionError("A four-video Picker batch was accepted")
 
-    scalar_node = target.HMBSeedance20VideoGeneration(name="Scalar Video Regression")
+    scalar_node = target.HMBSeedanceGeneration(name="Scalar Video Regression")
     scalar_node.set_parameter_value("prompt", "ordered scalar videos")
     scalar_node.set_parameter_value(
         "reference_video_1",
@@ -807,21 +897,10 @@ def assert_payload_and_media_contract() -> None:
     scalar_node.set_parameter_value(
         "reference_video_2", {"value": "asset://scalar-video-2"}
     )
-    scalar_payload = scalar_node._build_payload(scalar_node._get_parameters())
-    scalar_video_content = [
-        item for item in scalar_payload["content"] if item["type"] == "video_url"
-    ]
-    assert scalar_video_content == [
-        {
-            "type": "video_url",
-            "video_url": {"url": "https://cdn.example/scalar-1.mp4"},
-            "role": "reference_video",
-        },
-        {
-            "type": "video_url",
-            "video_url": {"url": "asset://scalar-video-2"},
-            "role": "reference_video",
-        },
+    scalar_payload = scalar_node._build_broker_payload(scalar_node._get_parameters())
+    assert scalar_payload["video_urls"] == [
+        "https://cdn.example/scalar-1.mp4",
+        "asset://scalar-video-2",
     ]
 
     gap_params = node._get_parameters()
@@ -839,7 +918,7 @@ def assert_payload_and_media_contract() -> None:
     else:
         raise AssertionError("A gap before reference_video_2 was accepted")
 
-    legacy_node = target.HMBSeedance20VideoGeneration(name="Legacy List Regression")
+    legacy_node = target.HMBSeedanceGeneration(name="Legacy List Regression")
     legacy_node.set_parameter_value(
         "VIDEO_REFERENCES", ["https://cdn.example/legacy.mp4"]
     )
@@ -847,7 +926,7 @@ def assert_payload_and_media_contract() -> None:
         "https://cdn.example/legacy.mp4"
     ]
 
-    equivalent_legacy_node = target.HMBSeedance20VideoGeneration(
+    equivalent_legacy_node = target.HMBSeedanceGeneration(
         name="Legacy and Scalar Payload Equivalence Regression"
     )
     equivalent_legacy_node.set_parameter_value("prompt", "ordered scalar videos")
@@ -855,11 +934,11 @@ def assert_payload_and_media_contract() -> None:
         "VIDEO_REFERENCES",
         ["https://cdn.example/scalar-1.mp4", "asset://scalar-video-2"],
     )
-    assert equivalent_legacy_node._build_payload(
+    assert equivalent_legacy_node._build_broker_payload(
         equivalent_legacy_node._get_parameters()
     ) == scalar_payload
 
-    mixed_node = target.HMBSeedance20VideoGeneration(
+    mixed_node = target.HMBSeedanceGeneration(
         name="Public Video List Overrides Hidden Scalar Regression"
     )
     mixed_node.set_parameter_value(
@@ -870,12 +949,12 @@ def assert_payload_and_media_contract() -> None:
         target.VideoUrlArtifact("https://cdn.example/new-scalar.mp4"),
     )
     assert [
-        target.HMBSeedance20VideoGeneration._coerce_reference_value(item)
+        target.HMBSeedanceGeneration._coerce_reference_value(item)
         for item in mixed_node._get_parameters()["video_references"]
     ] == ["https://cdn.example/public-list.mp4"]
     assert mixed_node._get_parameters()["video_reference_slots"] == []
 
-    serialized_list_node = target.HMBSeedance20VideoGeneration(
+    serialized_list_node = target.HMBSeedanceGeneration(
         name="Serialized List Compatibility Regression"
     )
     serialized_list_node.set_parameter_value(
@@ -896,7 +975,7 @@ def assert_payload_and_media_contract() -> None:
         "https://cdn.example/legacy-audio.mp3"
     ]
 
-    ordered_image_node = target.HMBSeedance20VideoGeneration(
+    ordered_image_node = target.HMBSeedanceGeneration(
         name="Single Wire Ordered Image Regression"
     )
     ordered_images = [
@@ -907,21 +986,13 @@ def assert_payload_and_media_contract() -> None:
     ordered_image_node.set_parameter_value("prompt", "single wire list order")
     assert ordered_image_node.get_parameter_value("reference_images") == ordered_images
     assert ordered_image_node._get_parameters()["reference_images"] == ordered_images
-    ordered_list_payload = ordered_image_node._build_payload(
+    ordered_list_payload = ordered_image_node._build_broker_payload(
         ordered_image_node._get_parameters()
     )
-    assert [
-        item["image_url"]["url"]
-        for item in ordered_list_payload["content"]
-        if item["type"] == "image_url"
-    ] == ordered_images
-    assert [item["type"] for item in ordered_list_payload["content"]] == [
-        "text",
-        "image_url",
-        "image_url",
-    ]
+    assert ordered_list_payload["image_urls"] == ordered_images
+    assert ordered_list_payload["prompt"] == "single wire list order"
 
-    empty_child_node = target.HMBSeedance20VideoGeneration(
+    empty_child_node = target.HMBSeedanceGeneration(
         name="Empty Single Image List Regression"
     )
     empty_child_node.get_parameter_by_name("reference_audio").append_child_parameter()
@@ -931,12 +1002,12 @@ def assert_payload_and_media_contract() -> None:
     empty_child_params = empty_child_node._get_parameters()
     assert empty_child_params["reference_images"] == []
     assert empty_child_params["reference_audio"] == []
-    empty_child_payload = empty_child_node._build_payload(empty_child_params)
-    assert empty_child_payload["content"] == [
-        {"type": "text", "text": "empty child is ignored"}
-    ]
+    empty_child_payload = empty_child_node._build_broker_payload(empty_child_params)
+    assert empty_child_payload["prompt"] == "empty child is ignored"
+    assert "image_urls" not in empty_child_payload
+    assert "audio_urls" not in empty_child_payload
 
-    connected_parent_list_node = target.HMBSeedance20VideoGeneration(
+    connected_parent_list_node = target.HMBSeedanceGeneration(
         name="Connected Parent List Regression"
     )
     connected_parent_list_node.set_parameter_value(
@@ -975,9 +1046,9 @@ def assert_payload_and_media_contract() -> None:
             "prompt": "standard 4k",
         }
     )
-    standard_4k_payload = node._build_payload(params)
+    standard_4k_payload = node._build_broker_payload(params)
     assert standard_4k_payload["model"] == target.SEEDANCE_2_0_MODEL_ID
-    assert standard_4k_payload["resolution"] == "4k"
+    assert standard_4k_payload["quality"] == "4k"
 
     for restricted_model in (
         target.SEEDANCE_2_0_FAST_MODEL_ID,
@@ -1007,7 +1078,7 @@ def assert_payload_and_media_contract() -> None:
             "prompt": "fast priority omission",
         }
     )
-    fast_payload = node._build_payload(params)
+    fast_payload = node._build_broker_payload(params)
     assert "priority" not in fast_payload
 
     params = node._get_parameters()
@@ -1057,59 +1128,280 @@ def assert_payload_and_media_contract() -> None:
     else:
         raise AssertionError("Four reference audio files were accepted")
 
-
-def assert_scripted_success_flow() -> None:
-    node = ScriptedNode(
-        [
-            {"id": "task-regression-1", "status": "queued"},
-            {"id": "task-regression-1", "status": "running"},
-            {
-                "id": "task-regression-1",
-                "status": "succeeded",
-                "content": {
-                    "video_url": "https://cdn.example/result.mp4",
-                    "last_frame_url": "https://cdn.example/last.jpg",
-                },
-                "authorization": "Bearer regression-secret-key",
-            },
-        ]
+    params = node._get_parameters()
+    params.update(
+        {
+            "input_mode": target.INPUT_MODE_FIRST_LAST_FRAME,
+            "prompt": "",
+            "first_frame": None,
+            "last_frame": "https://cdn.example/last.png",
+            "reference_images": [],
+            "video_references": [],
+            "reference_audio": [],
+        }
     )
-    node.set_parameter_value("prompt", "A complete Volcengine flow")
-    node.set_parameter_value("poll_interval_seconds", 30)
+    try:
+        node._validate_parameters(params)
+    except ValueError as exc:
+        assert "Last Frame requires First Frame" in str(exc)
+    else:
+        raise AssertionError("Last Frame without First Frame was accepted")
+
+
+def assert_broker_generation_contract() -> None:
+    status_cases = {
+        "pending": "queued",
+        "submitted": "queued",
+        "running": "running",
+        "in-progress": "running",
+        "completed": "succeeded",
+        "success": "succeeded",
+        "failed": "failed",
+        "rejected": "failed",
+        "cancelled": "cancelled",
+        "expired": "expired",
+    }
+    for raw, expected in status_cases.items():
+        assert target.HMBSeedanceGeneration._normalize_broker_status(raw) == (
+            expected
+        )
+    assert target.HMBSeedanceGeneration._normalize_broker_status(
+        "provider-api-key-canary"
+    ) == ""
+
+    oversized_error = target.urllib.error.HTTPError(
+        "http://broker.invalid/api/v1/generate/video",
+        413,
+        "Payload Too Large",
+        {},
+        io.BytesIO(
+            b'{"error_code":"request_body_too_large","token":"secret-canary"}'
+        ),
+    )
+    safe_error_message = target._HMBAIBrokerBridge._safe_http_error_message(
+        oversized_error
+    )
+    assert "oversized reference-media request" in safe_error_message
+    assert "secret-canary" not in safe_error_message
+
+    completed = {
+        "status": "completed",
+        "job_id": "broker-job-1",
+        "output": "https://cdn.example/broker-result.mp4",
+        "token": FakeBrokerBridge.SECRET_VALUES[0],
+        "api_key": FakeBrokerBridge.SECRET_VALUES[1],
+        "authorization": FakeBrokerBridge.SECRET_VALUES[2],
+    }
+    bridge = FakeBrokerBridge([completed])
+    node = BrokerScriptedNode(bridge)
+    node.set_parameter_value("prompt", "Broker-only Seedance regression")
+    assert not hasattr(node, "_get_" + "api_key")
+    assert not {name for name in dir(node) if "usage" in name.casefold()}
     asyncio.run(node._process_generation())
 
-    assert node.destination.resolved is True
-    assert node.destination.written == b"\x00\x00\x00\x18ftypmp42regression-video"
-    assert [request["method"] for request in node.requests] == [
-        "POST",
-        "GET",
-        "GET",
-        "GET",
-    ]
-    assert node.requests[0]["path"] == "/contents/generations/tasks"
-    assert node.requests[0]["retry"] is False
-    assert all(request["retry"] is True for request in node.requests[1:])
-    assert all(request["deadline"] == 3600 for request in node.requests[1:])
-    assert all(
-        request["path"]
-        == "/contents/generations/tasks/task-regression-1"
-        for request in node.requests[1:]
+    assert bridge.account_calls == 1
+    assert bridge.refresh_ids == ["broker-job-1"]
+    assert len(bridge.generate_payloads) == 1
+    payload = bridge.generate_payloads[0]
+    assert payload["provider"] == "volcengine_ark"
+    assert payload["model"] == target.SEEDANCE_2_0_MODEL_ID
+    assert payload["prompt"] == "Broker-only Seedance regression"
+    assert payload["duration_seconds"] == 5
+    assert payload["quality"] == "1080p"
+    assert payload["aspect_ratio"] == "adaptive"
+    assert not any(
+        sensitive in key.lower()
+        for key in payload
+        for sensitive in ("api_key", "token", "secret", "credential")
     )
-    assert node.sleeps == [30, 30]
-    assert node.downloads == ["https://cdn.example/result.mp4"]
-    assert node.parameter_output_values["generation_id"] == "task-regression-1"
+    assert node.parameter_output_values["generation_id"] == "broker-job-1"
     assert node.parameter_output_values["generation_status"] == "succeeded"
-    assert node.parameter_output_values["video_url"].value == node.destination.location
+    assert node.parameter_output_values["provider_response"] == {
+        "transport": "fn_ai_broker",
+        "id": "broker-job-1",
+        "status": "succeeded",
+    }
+    assert node.get_parameter_value("broker_connection_status") == "Connected"
+    assert node.get_parameter_value("broker_account") == "Broker Artist"
+    assert node.downloads == ["https://cdn.example/broker-result.mp4"]
     assert node.parameter_output_values["VIDEO_OUT"].value == node.destination.location
-    assert node.parameter_output_values["last_frame_url"] == "https://cdn.example/last.jpg"
-    assert node.parameter_output_values["was_successful"] is True
-    provider_response = node.parameter_output_values["provider_response"]
-    assert provider_response["authorization"] == "[REDACTED]"
-    assert provider_response["content"]["video_url"] == "[SIGNED_URL_REDACTED]"
-    assert provider_response["content"]["last_frame_url"] == "[SIGNED_URL_REDACTED]"
-    assert ScriptedNode.TEST_KEY not in json.dumps(
-        node.parameter_output_values, default=str
+
+    public_state = json.dumps(
+        {
+            "parameters": node.parameter_values,
+            "outputs": node.parameter_output_values,
+        },
+        default=str,
+        ensure_ascii=False,
     )
+    for secret in FakeBrokerBridge.SECRET_VALUES:
+        assert secret not in public_state
+    assert "••••" not in public_state
+
+    resume_bridge = FakeBrokerBridge(
+        [
+            {
+                "status": "completed",
+                "job_id": "broker-resume-9",
+                "output": "https://cdn.example/resumed-broker.mp4",
+                "token": FakeBrokerBridge.SECRET_VALUES[0],
+            }
+        ]
+    )
+    resumed = BrokerScriptedNode(resume_bridge)
+    resumed.set_parameter_value("resume_generation_id", "broker-resume-9")
+    asyncio.run(resumed._process_generation())
+    assert resume_bridge.generate_payloads == []
+    assert resume_bridge.refresh_ids == ["broker-resume-9"]
+    assert resumed.downloads == ["https://cdn.example/resumed-broker.mp4"]
+
+    refresh_bridge = FakeBrokerBridge(
+        [
+            {
+                "status": "completed",
+                "job_id": "broker-refresh-3",
+                "output": "https://cdn.example/refreshed-broker.mp4",
+            }
+        ]
+    )
+    refreshed = BrokerScriptedNode(refresh_bridge)
+    refreshed.parameter_output_values["generation_id"] = "broker-refresh-3"
+    asyncio.run(refreshed._refresh_async())
+    assert refresh_bridge.refresh_ids == ["broker-refresh-3"]
+    assert refreshed.downloads == ["https://cdn.example/refreshed-broker.mp4"]
+
+
+def assert_refresh_during_submission_contract() -> None:
+    bridge = FakeBrokerBridge([])
+    node = BrokerScriptedNode(bridge)
+    node._generation_run_active.set()
+    with mock.patch.object(
+        node,
+        "_ensure_broker_connected",
+        side_effect=AssertionError("Refresh connected before a task ID existed"),
+    ), mock.patch.object(
+        node,
+        "_set_status_results",
+        side_effect=AssertionError("Refresh overwrote the active render status"),
+    ):
+        asyncio.run(node._refresh_async())
+    node._generation_run_active.clear()
+    assert bridge.account_calls == 0
+
+    observed = BrokerScriptedNode(FakeBrokerBridge([]))
+
+    async def observe_active_run() -> None:
+        assert observed._generation_run_active.is_set()
+
+    observed._aprocess_impl = observe_active_run
+    asyncio.run(observed.aprocess())
+    assert not observed._generation_run_active.is_set()
+
+    idle = BrokerScriptedNode(FakeBrokerBridge([]))
+    with mock.patch.object(
+        idle,
+        "_ensure_broker_connected",
+        side_effect=AssertionError("Empty idle refresh contacted the Broker"),
+    ):
+        asyncio.run(idle._refresh_async())
+    assert "No FN AI Broker task ID is available" in idle.parameter_output_values[
+        "result_details"
+    ]
+
+
+def assert_broker_account_and_button_contract() -> None:
+    secrets = {
+        "token": "account-token-canary",
+        "api_key": "account-provider-key-canary",
+        "authorization": "account-authorization-canary",
+    }
+    bridge = target._HMBAIBrokerBridge()
+    safe_me = {
+        "display_name": "Broker Artist",
+        **secrets,
+        "credentials": {"provider_key": "nested-provider-key-canary"},
+    }
+    with mock.patch.object(
+        bridge, "_request_json", return_value=safe_me
+    ) as request_json:
+        snapshot = bridge.account_snapshot(connect=False)
+    assert request_json.call_count == 1
+    assert snapshot == target._BrokerAccountSnapshot(
+        state="connected",
+        connected=True,
+        account="Broker Artist",
+    )
+    snapshot_dump = json.dumps(snapshot.__dict__, ensure_ascii=False)
+    for secret in (*secrets.values(), "nested-provider-key-canary"):
+        assert secret not in snapshot_dump
+
+    with mock.patch.object(
+        bridge,
+        "_request_json",
+        side_effect=target._BrokerUnavailableError("safe unavailable"),
+    ), mock.patch.object(
+        target,
+        "_broker_auto_login",
+        side_effect=AssertionError("server outage triggered a login exchange"),
+    ):
+        try:
+            bridge.account_snapshot(connect=True)
+        except target._BrokerUnavailableError:
+            pass
+        else:
+            raise AssertionError("Broker outage was treated as a logged-out session")
+
+    assert bridge.is_trusted_broker_url(target.AI_BROKER_SERVER_URL + "/result.mp4")
+    assert not bridge.is_trusted_broker_url(
+        target.AI_BROKER_SERVER_URL + ".evil.example/result.mp4"
+    )
+    assert target.HMBSeedanceGeneration._broker_result_url(
+        "/downloads/result.mp4"
+    ) == (target.AI_BROKER_SERVER_URL + "/downloads/result.mp4")
+
+    class BlockingBridge:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.returned = threading.Event()
+            self.calls = 0
+
+        def account_snapshot(self, *, connect: bool):
+            assert connect is True
+            self.calls += 1
+            self.started.set()
+            assert self.release.wait(2.0)
+            self.returned.set()
+            return target._BrokerAccountSnapshot(
+                state="connected",
+                connected=True,
+                account="Threaded Artist",
+            )
+
+    blocking_bridge = BlockingBridge()
+    node = target.HMBSeedanceGeneration(name="Broker Button Regression")
+    node._broker_bridge_instance = blocking_bridge
+    no_engine_loop = SimpleNamespace(event_loop=None, put_event=lambda _event: None)
+    with mock.patch.object(
+        target.GriptapeNodes, "EventManager", return_value=no_engine_loop
+    ):
+        started_at = time.monotonic()
+        node._on_broker_connect_clicked(None, None)
+        assert time.monotonic() - started_at < 0.25
+        assert blocking_bridge.started.wait(1.0)
+        node._on_broker_connect_clicked(None, None)
+        assert blocking_bridge.calls == 1
+        blocking_bridge.release.set()
+        assert blocking_bridge.returned.wait(1.0)
+        deadline = time.monotonic() + 1.0
+        while node._broker_action_running and time.monotonic() < deadline:
+            time.sleep(0.01)
+    assert blocking_bridge.calls == 1
+    assert node._broker_action_running is False
+    assert node.get_parameter_value("broker_connection_status") == "Connected"
+    assert node.get_parameter_value("broker_account") == "Threaded Artist"
+
+
 
 
 class FakeCloudDriver:
@@ -1183,15 +1475,16 @@ def assert_local_video_temporary_publication() -> None:
         local_bytes = b"\x00\x00\x00\x18ftypmp42local-reference"
         local_video.write_bytes(local_bytes)
         driver = FakeCloudDriver()
-        node = ScriptedNode(
+        bridge = FakeBrokerBridge(
             [
                 {
-                    "id": "task-regression-1",
-                    "status": "succeeded",
-                    "content": {"video_url": "https://cdn.example/result.mp4"},
+                    "job_id": "broker-job-1",
+                    "status": "completed",
+                    "output": "https://cdn.example/result.mp4",
                 }
             ]
         )
+        node = BrokerScriptedNode(bridge)
         node.set_parameter_value("prompt", "temporary local publication")
         original_artifact = target.VideoUrlArtifact(str(local_video))
         node.set_parameter_value("reference_video_1", original_artifact)
@@ -1206,23 +1499,14 @@ def assert_local_video_temporary_publication() -> None:
         assert upload["path"].name == "picker-reference.mp4"
         assert driver.deletes == [upload["path"]]
         assert node.get_parameter_value("reference_video_1") is original_artifact
-        post_payload = node.requests[0]["payload"]
-        video_content = [
-            item for item in post_payload["content"] if item["type"] == "video_url"
-        ]
-        assert video_content == [
-            {
-                "type": "video_url",
-                "video_url": {
-                    "url": "https://storage.example/reference.mp4?signature=temporary-secret"
-                },
-                "role": "reference_video",
-            }
+        post_payload = bridge.generate_payloads[0]
+        assert post_payload["video_urls"] == [
+            "https://storage.example/reference.mp4?signature=temporary-secret"
         ]
         output_dump = json.dumps(node.parameter_output_values, default=str)
         assert "temporary-secret" not in output_dump
 
-        public_node = target.HMBSeedance20VideoGeneration(
+        public_node = target.HMBSeedanceGeneration(
             name="Public Video Bypasses Cloud Regression"
         )
         public_node.set_parameter_value(
@@ -1239,7 +1523,8 @@ def assert_local_video_temporary_publication() -> None:
             "https://cdn.example/already-public.mp4"
         ]
 
-        missing_node = ScriptedNode([])
+        missing_bridge = FakeBrokerBridge([])
+        missing_node = BrokerScriptedNode(missing_bridge)
         missing_node.set_parameter_value("prompt", "missing local video diagnosis")
         missing_path = Path(temporary) / "missing-picker-reference.mp4"
         missing_node.set_parameter_value(
@@ -1259,9 +1544,9 @@ def assert_local_video_temporary_publication() -> None:
             assert "credentials" not in str(exc)
         else:
             raise AssertionError("Missing local video received a generic upload error")
-        assert missing_node.requests == []
+        assert missing_bridge.generate_payloads == []
 
-        disabled_node = target.HMBSeedance20VideoGeneration(
+        disabled_node = target.HMBSeedanceGeneration(
             name="Disabled Local Publication Regression"
         )
         disabled_node.set_parameter_value("reference_video_1", original_artifact)
@@ -1276,14 +1561,14 @@ def assert_local_video_temporary_publication() -> None:
             raise AssertionError("Disabled local-video publication was bypassed")
 
         failing_driver = FakeCloudDriver()
-        failing_node = ScriptedNode([])
+        failing_bridge = FakeBrokerBridge([])
+        failing_node = BrokerScriptedNode(failing_bridge)
         failing_node.set_parameter_value("reference_video_1", original_artifact)
         failing_node._create_gt_cloud_storage_driver = lambda: failing_driver
 
-        async def fail_create_task(*_args, **_kwargs):
-            raise RuntimeError("simulated create failure")
-
-        failing_node._request_json = fail_create_task
+        failing_bridge.generate_seedance = mock.Mock(
+            side_effect=target._BrokerError("simulated create failure")
+        )
         try:
             asyncio.run(failing_node._process_generation())
         except RuntimeError as exc:
@@ -1293,21 +1578,118 @@ def assert_local_video_temporary_publication() -> None:
         assert len(failing_driver.uploads) == 1
         assert failing_driver.deletes == [failing_driver.uploads[0]["path"]]
 
+        unknown_driver = FakeCloudDriver()
+        unknown_bridge = FakeBrokerBridge([])
+        unknown_node = BrokerScriptedNode(unknown_bridge)
+        unknown_node.set_parameter_value("prompt", "ambiguous submission outcome")
+        unknown_node.set_parameter_value("reference_video_1", original_artifact)
+        unknown_node._create_gt_cloud_storage_driver = lambda: unknown_driver
+        unknown_bridge.generate_seedance = mock.Mock(
+            side_effect=target._BrokerUnavailableError(
+                "simulated submission transport loss",
+                submission_outcome_unknown=True,
+            )
+        )
+        unknown_deferred_uploads: list[tuple[object, Path]] = []
+
+        def capture_unknown_deferred_cleanup() -> None:
+            unknown_deferred_uploads.extend(unknown_node._temporary_video_uploads)
+            unknown_node._temporary_video_uploads = []
+
+        unknown_node._defer_temporary_video_upload_cleanup = (
+            capture_unknown_deferred_cleanup
+        )
+        try:
+            asyncio.run(unknown_node._process_generation())
+        except target._BrokerUnavailableError as exc:
+            assert exc.submission_outcome_unknown is True
+        else:
+            raise AssertionError("Ambiguous submission transport loss was accepted")
+        assert unknown_bridge.generate_seedance.call_count == 1
+        assert unknown_node.parameter_output_values["generation_id"] == ""
+        assert unknown_node.parameter_output_values["generation_status"] == (
+            "submission_unknown"
+        )
+        assert unknown_driver.deletes == []
+        assert len(unknown_deferred_uploads) == 1
+        assert unknown_deferred_uploads[0][1] == unknown_driver.uploads[0]["path"]
+
+        class BlockingSubmissionBridge(FakeBrokerBridge):
+            def __init__(self) -> None:
+                super().__init__([])
+                self.started = threading.Event()
+                self.release = threading.Event()
+                self.returned = threading.Event()
+
+            def generate_seedance(self, payload: dict, *, timeout: float) -> dict:
+                assert timeout > 0
+                self.generate_payloads.append(dict(payload))
+                self.started.set()
+                assert self.release.wait(2.0)
+                self.returned.set()
+                return {
+                    "job_id": "broker-job-cancelled-submit",
+                    "status": "pending",
+                }
+
+        blocking_driver = FakeCloudDriver()
+        blocking_bridge = BlockingSubmissionBridge()
+        blocking_node = BrokerScriptedNode(blocking_bridge)
+        blocking_node.set_parameter_value("prompt", "cancelled submit retention")
+        blocking_node.set_parameter_value("reference_video_1", original_artifact)
+        blocking_node._create_gt_cloud_storage_driver = lambda: blocking_driver
+        deferred_uploads: list[tuple[object, Path]] = []
+
+        def capture_deferred_cleanup() -> None:
+            deferred_uploads.extend(blocking_node._temporary_video_uploads)
+            blocking_node._temporary_video_uploads = []
+
+        blocking_node._defer_temporary_video_upload_cleanup = capture_deferred_cleanup
+
+        async def cancel_started_submission() -> None:
+            process = asyncio.create_task(blocking_node._process_generation())
+            started = await asyncio.to_thread(blocking_bridge.started.wait, 1.0)
+            assert started
+            process.cancel()
+            await asyncio.sleep(0.05)
+            assert not process.done(), "Submit coroutine outran its blocking POST worker"
+            blocking_bridge.release.set()
+            try:
+                await process
+            except asyncio.CancelledError:
+                pass
+            else:
+                raise AssertionError("Cancellation during submit was swallowed")
+
+        asyncio.run(cancel_started_submission())
+        assert blocking_bridge.returned.is_set()
+        assert len(blocking_bridge.generate_payloads) == 1
+        assert (
+            blocking_node.parameter_output_values["generation_id"]
+            == "broker-job-cancelled-submit"
+        )
+        assert blocking_node._submission_outcome_unknown is False
+        assert blocking_node._remote_task_may_be_active is True
+        assert blocking_driver.deletes == []
+        assert len(deferred_uploads) == 1
+        assert deferred_uploads[0][1] == blocking_driver.uploads[0]["path"]
+
 
 def assert_tos_local_video_temporary_publication() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         local_video = Path(temporary) / "team-reference.mp4"
         local_video.write_bytes(b"\x00\x00\x00\x18ftypmp42tos-reference")
         tos_client = FakeTosClient()
-        node = ScriptedNode(
+        bridge = FakeBrokerBridge(
             [
                 {
-                    "id": "task-regression-1",
-                    "status": "succeeded",
-                    "content": {"video_url": "https://cdn.example/result.mp4"},
+                    "job_id": "broker-job-1",
+                    "status": "completed",
+                    "output": "https://cdn.example/result.mp4",
                 }
             ]
         )
+        node = BrokerScriptedNode(bridge)
         node.set_parameter_value("prompt", "temporary TOS publication")
         node.set_parameter_value(
             "reference_video_1", target.VideoUrlArtifact(str(local_video))
@@ -1340,12 +1722,8 @@ def assert_tos_local_video_temporary_publication() -> None:
         ]
         assert tos_client.deletes == [("team-bucket", upload["key"])]
         assert tos_client.close_count == 1
-        post_payload = node.requests[0]["payload"]
-        reference_url = next(
-            item["video_url"]["url"]
-            for item in post_payload["content"]
-            if item["type"] == "video_url"
-        )
+        post_payload = bridge.generate_payloads[0]
+        reference_url = post_payload["video_urls"][0]
         assert reference_url.startswith(
             "https://team-bucket.tos-cn-beijing.volces.com/"
         )
@@ -1355,7 +1733,7 @@ def assert_tos_local_video_temporary_publication() -> None:
         )
 
         assert (
-            target.HMBSeedance20VideoGeneration._normalize_tos_endpoint(
+            target.HMBSeedanceGeneration._normalize_tos_endpoint(
                 "https://tos-cn-beijing.volces.com/"
             )
             == "tos-cn-beijing.volces.com"
@@ -1366,7 +1744,7 @@ def assert_tos_local_video_temporary_publication() -> None:
             "https://tos-cn-beijing.volces.com/private",
         ):
             try:
-                target.HMBSeedance20VideoGeneration._normalize_tos_endpoint(
+                target.HMBSeedanceGeneration._normalize_tos_endpoint(
                     invalid_endpoint
                 )
             except ValueError:
@@ -1375,244 +1753,37 @@ def assert_tos_local_video_temporary_publication() -> None:
                 raise AssertionError(f"Unsafe TOS endpoint accepted: {invalid_endpoint}")
 
 
-def assert_resume_flow_skips_post() -> None:
-    node = ScriptedNode(
-        [
-            {
-                "id": "task-existing-9",
-                "status": "succeeded",
-                "content": {"video_url": "https://cdn.example/existing.mp4"},
-            }
-        ]
-    )
-    node.set_parameter_value("resume_generation_id", "task-existing-9")
-    node.set_parameter_value(
-        "reference_video_1", target.VideoUrlArtifact("missing-local-video.mp4")
-    )
-    node._create_gt_cloud_storage_driver = lambda: (_ for _ in ()).throw(
-        AssertionError("Resume initialized Griptape Cloud storage")
-    )
-    asyncio.run(node._process_generation())
-    assert [request["method"] for request in node.requests] == ["GET"]
-    assert node.requests[0]["path"].endswith("/task-existing-9")
-    assert node.parameter_output_values["generation_id"] == "task-existing-9"
-    assert node.parameter_output_values["generation_status"] == "succeeded"
-    assert node.downloads == ["https://cdn.example/existing.mp4"]
 
 
-def assert_refresh_recovery_contract() -> None:
-    known = ScriptedNode(
-        [
-            {
-                "id": "task-refresh-1",
-                "status": "succeeded",
-                "content": {"video_url": "https://cdn.example/refreshed.mp4"},
-            }
-        ]
-    )
-    known.parameter_output_values["generation_id"] = "task-refresh-1"
-    asyncio.run(known._refresh_async())
-    assert [request["method"] for request in known.requests] == ["GET"]
-    assert known.requests[0]["path"].endswith("/task-refresh-1")
-    assert known.downloads == ["https://cdn.example/refreshed.mp4"]
-    assert known.parameter_output_values["video_url"].value == known.destination.location
-    assert known.parameter_output_values["VIDEO_OUT"].value == known.destination.location
-
-    ambiguous = ScriptedNode(
-        [
-            {
-                "items": [
-                    {
-                        "id": "task-candidate-7",
-                        "model": target.SEEDANCE_2_0_MODEL_ID,
-                        "status": "running",
-                        "created_at": 1_780_000_060,
-                    },
-                    {
-                        "id": "task-other-model",
-                        "model": target.SEEDANCE_2_0_FAST_MODEL_ID,
-                        "status": "running",
-                        "created_at": 1_780_000_060,
-                    },
-                ]
-            }
-        ]
-    )
-    ambiguous.parameter_output_values["generation_status"] = "submission_unknown"
-    ambiguous.parameter_output_values["provider_response"] = {
-        "submission_diagnostic": {
-            "submission_outcome": "unknown",
-            "started_at_epoch": 1_780_000_000,
-            "model": target.SEEDANCE_2_0_MODEL_ID,
-        }
-    }
-    asyncio.run(ambiguous._refresh_async())
-    assert [request["method"] for request in ambiguous.requests] == ["GET"]
-    assert "page_num=1" in ambiguous.requests[0]["path"]
-    assert "task-candidate-7" in ambiguous.parameter_output_values["result_details"]
-    assert "task-other-model" not in ambiguous.parameter_output_values["result_details"]
-    assert "copy its ID into Resume Task ID" in ambiguous.parameter_output_values[
-        "result_details"
-    ]
 
 
-def assert_ambiguous_submission_status_contract() -> None:
-    node = ScriptedNode([])
-    node.set_parameter_value("prompt", "ambiguous submission regression")
-
-    async def ambiguous_request(
-        method: str,
-        _path: str,
-        _api_key: str,
-        _payload: dict | None = None,
-        **_kwargs,
-    ) -> dict:
-        assert method == "POST"
-        raise target.VolcengineAPIError(
-            "safe ambiguous submission",
-            response_json={
-                "submission_diagnostic": {
-                    "submission_outcome": "unknown",
-                    "network_error_type": "ReadError",
-                    "network_phase": "response-receive",
-                    "started_at_epoch": 1_780_000_000,
-                }
-            },
-            submission_outcome="unknown",
-        )
-
-    node._request_json = ambiguous_request
-    try:
-        asyncio.run(node.aprocess())
-    except Exception:
-        pass
-    assert node.parameter_output_values["generation_status"] == "submission_unknown"
-    diagnostic = node.parameter_output_values["provider_response"][
-        "submission_diagnostic"
-    ]
-    assert diagnostic["model"] == target.SEEDANCE_2_0_MODEL_ID
-    assert "safe ambiguous submission" in node.parameter_output_values[
-        "result_details"
-    ]
-    assert "30 minutes" in node.parameter_output_values["result_details"]
 
 
-class FastSleepNode(target.HMBSeedance20VideoGeneration):
+class BrokerResultDownloadNode(target.HMBSeedanceGeneration):
     def __init__(self) -> None:
-        super().__init__(name="HTTPX Transport Regression")
+        super().__init__(name="Broker Result Download Regression")
         self.sleeps: list[float] = []
 
     async def _sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
 
 
-def assert_http_transport_contract() -> None:
-    node = FastSleepNode()
+def assert_broker_result_download_contract() -> None:
+    node = BrokerResultDownloadNode()
     original_async_client = target.httpx.AsyncClient
-    request_log: list[httpx.Request] = []
-    get_attempts = 0
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal get_attempts
-        request_log.append(request)
-        if request.method == "POST":
-            return httpx.Response(503, json={"error": {"message": "busy"}})
-        get_attempts += 1
-        if get_attempts < 3:
-            return httpx.Response(503, json={"error": {"message": "retry"}})
-        return httpx.Response(200, json={"id": "task-httpx", "status": "running"})
-
-    transport = httpx.MockTransport(handler)
-
-    def client_factory(*args, **kwargs):
-        kwargs["transport"] = transport
-        return original_async_client(*args, **kwargs)
-
-    with mock.patch.object(target.httpx, "AsyncClient", side_effect=client_factory):
-        try:
-            asyncio.run(
-                node._request_json(
-                    "POST",
-                    target.CREATE_TASK_PATH,
-                    "transport-secret",
-                    {"model": "test"},
-                    retry=True,
-                )
-            )
-        except target.VolcengineAPIError as exc:
-            assert exc.status_code == 503
-            assert exc.submission_outcome == "unknown"
-        else:
-            raise AssertionError("POST 503 was accepted")
-        assert len(request_log) == 1
-
-        result = asyncio.run(
-            node._request_json(
-                "GET",
-                "/contents/generations/tasks/task-httpx",
-                "transport-secret",
-                retry=True,
-            )
-        )
-    assert result["status"] == "running"
-    assert len(request_log) == 4
-    assert get_attempts == 3
-    assert node.sleeps == [1, 2]
-    assert str(request_log[0].url) == (
-        "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
+    assert target._is_structurally_valid_mp4(VALID_MP4_BYTES)
+    assert not target._is_structurally_valid_mp4(b"\x00\x00\x00\x0cftypmp42")
+    assert not target._is_structurally_valid_mp4(
+        b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+        b"\x00\x00\x00\x10mdat12345678"
     )
-    assert request_log[0].headers["authorization"] == "Bearer transport-secret"
-
-    request_error_cases = [
-        (httpx.ConnectError, "connection"),
-        (httpx.ReadError, "response-receive"),
-        (httpx.WriteError, "request-send"),
-        (httpx.ReadTimeout, "response-receive"),
-        (httpx.RemoteProtocolError, "response-receive"),
-        (httpx.DecodingError, "response-receive"),
-    ]
-    for error_class, expected_phase in request_error_cases:
-        error_requests: list[httpx.Request] = []
-
-        async def error_handler(request: httpx.Request) -> httpx.Response:
-            error_requests.append(request)
-            raise error_class(
-                "raw transport detail must remain hidden transport-secret",
-                request=request,
-            )
-
-        error_transport = httpx.MockTransport(error_handler)
-
-        def error_client_factory(*args, **kwargs):
-            kwargs["transport"] = error_transport
-            return original_async_client(*args, **kwargs)
-
-        with mock.patch.object(
-            target.httpx, "AsyncClient", side_effect=error_client_factory
-        ):
-            try:
-                asyncio.run(
-                    node._request_json(
-                        "POST",
-                        target.CREATE_TASK_PATH,
-                        "transport-secret",
-                        {"prompt": "private prompt"},
-                        retry=True,
-                    )
-                )
-            except target.VolcengineAPIError as exc:
-                assert exc.submission_outcome == "unknown"
-                assert error_class.__name__ in str(exc)
-                assert expected_phase in str(exc)
-                assert "raw transport detail" not in str(exc)
-                assert "transport-secret" not in str(exc)
-                diagnostic = exc.response_json["submission_diagnostic"]
-                assert diagnostic["network_error_type"] == error_class.__name__
-                assert diagnostic["network_phase"] == expected_phase
-                assert "private prompt" not in json.dumps(exc.response_json)
-            else:
-                raise AssertionError(f"{error_class.__name__} POST was accepted")
-        assert len(error_requests) == 1
+    assert not target._is_structurally_valid_mp4(
+        b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+    )
+    assert not target._is_structurally_valid_mp4(
+        b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+        b"\xff\xff\xff\xffmdat"
+    )
 
     download_requests: list[httpx.Request] = []
 
@@ -1620,7 +1791,7 @@ def assert_http_transport_contract() -> None:
         download_requests.append(request)
         return httpx.Response(
             200,
-            content=b"\x00\x00\x00\x18ftypmp42transport-video",
+            content=VALID_MP4_BYTES,
             headers={"content-type": "video/mp4"},
         )
 
@@ -1673,185 +1844,370 @@ def assert_http_transport_contract() -> None:
     assert len(redirect_requests) == 1
 
 
-def assert_private_monthly_usage_ledger_contract() -> None:
+class AtomicLocalDestination:
+    def __init__(self, path: Path, policy) -> None:
+        self.location = str(path)
+        self._existing_file_policy = policy
+        self._create_parents = True
+        self._append = False
+
+    def resolve(self) -> str:
+        return self.location
+
+    async def awrite_bytes(self, _content: bytes):
+        raise AssertionError("Completed MP4 used the non-atomic destination writer")
+
+
+def assert_atomic_final_output_publication() -> None:
+    video_bytes = VALID_MP4_BYTES
+    old_bytes = b"previous-complete-output"
     with tempfile.TemporaryDirectory() as temporary:
-        temporary_path = Path(temporary)
-        share_root = temporary_path / "Griptape_list"
-        queue_root = temporary_path / "local-queue"
-        user_id = "user-regression-123"
-        node = target.HMBSeedance20VideoGeneration(name="Usage Ledger Regression")
-        node._usage_identity = {"user_id": user_id}
-        node._usage_context = {
-            "identity": {"user_id": user_id},
-            "model": target.SEEDANCE_2_0_MODEL_ID,
-            "resolution": "1080p",
-            "ratio": "16:9",
-            "duration": 5,
-            "generate_audio": True,
-            "has_video_input": True,
-        }
-        provider_task = {
-            "id": "task-usage-regression-1",
-            "status": "succeeded",
-            "model": target.SEEDANCE_2_0_MODEL_ID,
-            "resolution": "1080p",
-            "ratio": "16:9",
-            "duration": 5,
-            "updated_at": 1785861000,
-            "usage": {
-                "completion_tokens": 35800,
-                "total_tokens": 35800,
-            },
-            "content": {"video_url": "https://private.example/result.mp4"},
-            "authorization": "Bearer must-never-be-recorded",
-            "prompt": "must-never-be-recorded",
-        }
-        event = node._build_usage_event(
-            provider_task,
-            "task-usage-regression-1",
-            "succeeded",
+        root = Path(temporary)
+        final_path = root / "atomic.mp4"
+        destination = AtomicLocalDestination(
+            final_path,
+            target.ExistingFilePolicy.OVERWRITE,
         )
-        assert event is not None
-        event_dump = json.dumps(event)
-        assert "must-never-be-recorded" not in event_dump
-        assert "private.example" not in event_dump
-        assert event["generator"] == "HMBSeedance20VideoGeneration"
-        assert event["total_tokens"] == 35800
-        assert event["rate_cny_per_million_tokens"] == "28"
-        assert event["estimated_cost_cny"] == "1.0024"
-        event["recorded_at"] = "2026-08-05T00:00:00+09:00"
 
-        with mock.patch.object(target, "USAGE_LEDGER_ROOT", share_root), mock.patch.object(
-            target, "USAGE_LOCAL_QUEUE_ROOT", queue_root
+        final_path.write_bytes(old_bytes)
+        real_replace = target.os.replace
+        replacement_observations: list[tuple[Path, Path]] = []
+
+        def observed_replace(source, target_path) -> None:
+            source_path = Path(source)
+            destination_path = Path(target_path)
+            assert source_path.parent == destination_path.parent == root
+            assert source_path.read_bytes() == video_bytes
+            assert final_path.read_bytes() == old_bytes
+            replacement_observations.append((source_path, destination_path))
+            real_replace(source_path, destination_path)
+
+        with mock.patch.object(target.os, "replace", side_effect=observed_replace):
+            saved = asyncio.run(
+                target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                    destination,
+                    video_bytes,
+                )
+            )
+        assert replacement_observations
+        assert final_path.read_bytes() == video_bytes
+        assert Path(saved.resolve()) == final_path
+        assert not list(root.glob(".*.partial.mp4"))
+        assert not list(root.glob(".*.output-probe"))
+
+        final_path.write_bytes(old_bytes)
+        commit_started = threading.Event()
+        commit_release = threading.Event()
+
+        def blocking_replace(source, target_path) -> None:
+            commit_started.set()
+            assert commit_release.wait(2.0)
+            real_replace(source, target_path)
+
+        async def cancel_during_commit():
+            with mock.patch.object(
+                target.os,
+                "replace",
+                side_effect=blocking_replace,
+            ):
+                publication = asyncio.create_task(
+                    target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                        destination,
+                        video_bytes,
+                    )
+                )
+                started = await asyncio.to_thread(commit_started.wait, 1.0)
+                assert started
+                publication.cancel()
+                await asyncio.sleep(0.05)
+                assert not publication.done(), "Commit cancellation outran os.replace"
+                assert final_path.read_bytes() == old_bytes
+                commit_release.set()
+                return await publication
+
+        cancellation_saved = asyncio.run(cancel_during_commit())
+        assert Path(cancellation_saved.resolve()) == final_path
+        assert final_path.read_bytes() == video_bytes
+        assert not list(root.glob(".*.partial.mp4"))
+
+        final_path.write_bytes(old_bytes)
+        with mock.patch.object(
+            target.os,
+            "replace",
+            side_effect=OSError("simulated atomic replacement failure"),
         ):
-            queued = node._enqueue_usage_event(event)
-            assert queued.is_file()
-            node._flush_usage_queue()
-            assert not queued.exists()
-
-            ledger_path = share_root / user_id / f"{user_id}.json"
-            assert ledger_path.is_file()
-            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-            assert ledger["generator"] == "HMBSeedance20VideoGeneration"
-            assert ledger["user_id"] == user_id
-            assert len(ledger["months"]) == 1
-            month_key = next(iter(ledger["months"]))
-            month = ledger["months"][month_key]
-            assert month["summary"]["task_count"] == 1
-            assert month["summary"]["succeeded"] == 1
-            assert month["summary"]["total_tokens"] == 35800
-            assert month["summary"]["estimated_cost_cny"] == "1.0024"
-            assert list(month["tasks"]) == ["task-usage-regression-1"]
-            assert "content" not in month["tasks"]["task-usage-regression-1"]
-            assert "authorization" not in ledger_path.read_text(encoding="utf-8")
-
-            # Replaying a task updates it instead of increasing the count.
-            replay = dict(event)
-            replay["recorded_at"] = "2026-08-05T23:59:59+09:00"
-            node._enqueue_usage_event(replay)
-            node._flush_usage_queue()
-            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-            month = next(iter(ledger["months"].values()))
-            assert month["summary"]["task_count"] == 1
-            assert month["summary"]["total_tokens"] == 35800
-
-            # A newer completion month moves the same task; it is never duplicated.
-            next_month = dict(event)
-            next_month["billing_month"] = "2026-09"
-            next_month["recorded_at"] = "2026-09-01T00:00:01+09:00"
-            node._enqueue_usage_event(next_month)
-            node._flush_usage_queue()
-            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-            assert list(ledger["months"]) == ["2026-09"]
-            assert ledger["months"]["2026-09"]["summary"]["task_count"] == 1
-
-            # A disconnected/unusable share retains the local event for retry.
-            offline_root = temporary_path / "offline-root"
-            offline_root.write_text("not a directory", encoding="utf-8")
-            retry_event = dict(event)
-            retry_event["task_id"] = "task-usage-regression-2"
-            retry_event["billing_month"] = "2026-09"
-            retry_event["recorded_at"] = "2026-09-02T00:00:01+09:00"
-            with mock.patch.object(target, "USAGE_LEDGER_ROOT", offline_root):
-                retry_path = node._enqueue_usage_event(retry_event)
-                node._flush_usage_queue()
-                assert retry_path.is_file()
-            node._flush_usage_queue()
-            assert not retry_path.exists()
-            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-            assert ledger["months"]["2026-09"]["summary"]["task_count"] == 2
-
-            foreign = dict(event)
-            foreign["generator"] = "AnotherSeedanceGenerator"
             try:
-                node._enqueue_usage_event(foreign)
-            except ValueError as exc:
-                assert "different generator" in str(exc)
+                asyncio.run(
+                    target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                        destination,
+                        video_bytes,
+                    )
+                )
+            except OSError as exc:
+                assert "replacement failure" in str(exc)
             else:
-                raise AssertionError("Another generator entered the HMB usage queue")
+                raise AssertionError("Atomic replacement failure was accepted")
+        assert final_path.read_bytes() == old_bytes
+        assert not list(root.glob(".*.partial.mp4"))
 
-            assert not list(share_root.rglob("*.tmp"))
-            assert not list(queue_root.rglob("*.tmp"))
+        async def partial_stage_failure(file, content: bytes, **_kwargs):
+            Path(file.location).write_bytes(content[:8])
+            raise OSError("simulated staging write failure")
 
-        integration_share = temporary_path / "integration-share"
-        integration_queue = temporary_path / "integration-queue"
+        with mock.patch.object(
+            target.File,
+            "awrite_bytes",
+            autospec=True,
+            side_effect=partial_stage_failure,
+        ):
+            try:
+                asyncio.run(
+                    target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                        destination,
+                        video_bytes,
+                    )
+                )
+            except OSError as exc:
+                assert "staging write failure" in str(exc)
+            else:
+                raise AssertionError("Partial staging write failure was accepted")
+        assert final_path.read_bytes() == old_bytes
+        assert not list(root.glob(".*.partial.mp4"))
 
-        class UsageScriptedNode(ScriptedNode):
-            def _capture_usage_identity(self):
-                self._usage_identity = {"user_id": user_id}
-                return dict(self._usage_identity)
+        create_new_destination = AtomicLocalDestination(
+            final_path,
+            target.ExistingFilePolicy.CREATE_NEW,
+        )
+        created = asyncio.run(
+            target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                create_new_destination,
+                video_bytes,
+            )
+        )
+        indexed_path = root / "atomic_1.mp4"
+        assert final_path.read_bytes() == old_bytes
+        assert indexed_path.read_bytes() == video_bytes
+        assert Path(created.resolve()) == indexed_path
+        assert not list(root.glob(".*.partial.mp4"))
 
-        integration_node = UsageScriptedNode(
+        fail_destination = AtomicLocalDestination(
+            final_path,
+            target.ExistingFilePolicy.FAIL,
+        )
+        try:
+            asyncio.run(
+                target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                    fail_destination,
+                    video_bytes,
+                )
+            )
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("FAIL collision policy overwrote an existing MP4")
+        assert final_path.read_bytes() == old_bytes
+        assert not list(root.glob(".*.partial.mp4"))
+
+    macro_node = target.HMBSeedanceGeneration(name="Atomic Macro Candidate Regression")
+    macro_destination = macro_node._output_file.build_file()
+    macro_candidate = next(
+        target.HMBSeedanceGeneration._output_destination_candidates(
+            macro_destination
+        )
+    )
+    assert macro_candidate.name.endswith("_v001.mp4")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        parsed_macro = ParsedMacro(
+            root.as_posix() + "/take_{###}/directory-indexed.mp4"
+        )
+        metadata = SimpleNamespace(
+            situation=SimpleNamespace(variables={"file_extension": "mp4"})
+        )
+        macro_destination = SimpleNamespace(
+            _file=SimpleNamespace(
+                _file_path=target.MacroPath(parsed_macro, {}),
+                _file_metadata=metadata,
+            ),
+            _existing_file_policy=target.ExistingFilePolicy.CREATE_NEW,
+            _create_parents=True,
+            _append=False,
+        )
+        first_macro_path = root / "take_001" / "directory-indexed.mp4"
+        first_macro_path.parent.mkdir(parents=True)
+        first_macro_path.write_bytes(old_bytes)
+        sidecars: list[tuple[Path, object]] = []
+        with mock.patch.object(
+            target,
+            "write_sidecar",
+            side_effect=lambda path, value: sidecars.append((Path(path), value)),
+        ):
+            macro_saved = asyncio.run(
+                target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                    macro_destination,
+                    video_bytes,
+                )
+            )
+        second_macro_path = root / "take_002" / "directory-indexed.mp4"
+        assert first_macro_path.read_bytes() == old_bytes
+        assert second_macro_path.read_bytes() == video_bytes
+        assert Path(macro_saved.resolve()) == second_macro_path
+        assert sidecars[0][0] == second_macro_path
+        assert sidecars[0][1].situation.variables["_index"] == 2
+        assert "_index" not in metadata.situation.variables
+        assert not list(root.rglob(".*.partial.mp4"))
+        assert not list(root.rglob(".*.output-probe"))
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        sidecar_failure_path = root / "sidecar-failure.mp4"
+        metadata = SimpleNamespace(
+            situation=SimpleNamespace(variables={"file_extension": "mp4"})
+        )
+        sidecar_failure_destination = SimpleNamespace(
+            _file=SimpleNamespace(_file_metadata=metadata),
+            _existing_file_policy=target.ExistingFilePolicy.OVERWRITE,
+            _create_parents=True,
+            _append=False,
+            resolve=lambda: str(sidecar_failure_path),
+        )
+        with mock.patch.object(
+            target,
+            "write_sidecar",
+            side_effect=PermissionError("simulated sidecar failure"),
+        ):
+            saved_after_sidecar_failure = asyncio.run(
+                target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                    sidecar_failure_destination,
+                    video_bytes,
+                )
+            )
+        assert Path(saved_after_sidecar_failure.resolve()) == sidecar_failure_path
+        assert sidecar_failure_path.read_bytes() == video_bytes
+        assert not list(root.glob(".*.partial.mp4"))
+        assert not list(root.glob(".*.output-probe"))
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        requested_path = root / "project-parameter.mp4"
+        requested_path.write_bytes(old_bytes)
+        bridge = FakeBrokerBridge(
             [
                 {
-                    "id": "task-regression-1",
-                    "status": "succeeded",
-                    "model": target.SEEDANCE_2_0_MODEL_ID,
-                    "resolution": "720p",
-                    "duration": 5,
-                    "usage": {"completion_tokens": 1000, "total_tokens": 1000},
-                    "content": {"video_url": "https://cdn.example/result.mp4"},
+                    "status": "completed",
+                    "job_id": "broker-job-1",
+                    "output": "https://cdn.example/atomic-project-result.mp4",
                 }
             ]
         )
-        integration_node.set_parameter_value("prompt", "private integration prompt")
-        with mock.patch.object(
-            target, "USAGE_LEDGER_ROOT", integration_share
-        ), mock.patch.object(
-            target, "USAGE_LOCAL_QUEUE_ROOT", integration_queue
-        ), mock.patch.object(
-            UsageScriptedNode, "_schedule_usage_flush", return_value=None
-        ):
-            asyncio.run(integration_node._process_generation())
-            assert len(list(integration_queue.glob("*/*.json"))) == 2
-            integration_node._flush_usage_queue()
-            integration_ledger_path = (
-                integration_share / user_id / f"{user_id}.json"
-            )
-            integration_ledger = json.loads(
-                integration_ledger_path.read_text(encoding="utf-8")
-            )
-            integration_month = next(iter(integration_ledger["months"].values()))
-            assert integration_month["summary"]["task_count"] == 1
-            assert integration_month["summary"]["succeeded"] == 1
-            assert integration_month["summary"]["total_tokens"] == 1000
-            integration_dump = json.dumps(integration_ledger)
-            assert "private integration prompt" not in integration_dump
-            assert "cdn.example" not in integration_dump
+        project_node = target.HMBSeedanceGeneration(
+            name="Atomic ProjectFileParameter Regression"
+        )
+        project_node._broker_bridge_instance = bridge
+        project_node.set_parameter_value("prompt", "atomic project output")
+        project_node.set_parameter_value("output_file", str(requested_path))
+
+        async def project_download(_url: str) -> bytes:
+            return video_bytes
+
+        async def no_wait(_seconds: float) -> None:
+            return None
+
+        project_node._download_video = project_download
+        project_node._sleep = no_wait
+        project_node._monotonic = lambda: 0.0
+        asyncio.run(project_node._process_generation())
+
+        indexed_project_path = root / "project-parameter_1.mp4"
+        assert requested_path.read_bytes() == old_bytes
+        assert indexed_project_path.read_bytes() == video_bytes
+        assert (
+            Path(project_node.parameter_output_values["VIDEO_OUT"].value)
+            == indexed_project_path
+        )
+        assert (
+            project_node.parameter_output_values["video_url"]
+            is project_node.parameter_output_values["VIDEO_OUT"]
+        )
+        assert indexed_project_path.is_absolute()
+        assert indexed_project_path.is_file()
+        assert indexed_project_path.suffix == ".mp4"
+        assert indexed_project_path.read_bytes() == video_bytes
+        assert len(bridge.generate_payloads) == 1
+        assert not list(root.glob(".*.partial.mp4"))
+        assert not list(root.glob(".*.output-probe"))
+
+
+def assert_unwritable_output_is_rejected_before_submission() -> None:
+    bridge = FakeBrokerBridge([])
+    node = BrokerScriptedNode(bridge)
+    node.set_parameter_value("prompt", "preflight must precede billing")
+    with mock.patch.object(
+        target.HMBSeedanceGeneration,
+        "_probe_output_parent_writable",
+        side_effect=PermissionError("simulated unwritable output parent"),
+    ):
+        try:
+            asyncio.run(node._process_generation())
+        except PermissionError as exc:
+            assert "unwritable output parent" in str(exc)
+        else:
+            raise AssertionError("Unwritable output parent reached Broker submission")
+    assert bridge.account_calls == 0
+    assert bridge.generate_payloads == []
+
+
+def assert_broker_server_accounting_contract() -> None:
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    forbidden_markers = (
+        "USAGE" + "_LEDGER_ROOT",
+        "USAGE" + "_LOCAL_QUEUE_ROOT",
+        "USAGE" + "_PRICE_CNY_PER_MILLION",
+        "_prepare_" + "usage_tracking",
+        "_record_" + "usage_task",
+        "_build_" + "usage_event",
+        "_flush_" + "usage_queue",
+        r"\\fin-rcomp1\Composite_Team" + "\\" + "00" + "." + "CompSource",
+    )
+    assert not {marker for marker in forbidden_markers if marker in source}
+    assert (
+        "The Broker generation request is the sole "
+        "usage/quota/accounting authority."
+    ) in source
+
+    bridge = FakeBrokerBridge(
+        [
+            {
+                "status": "completed",
+                "job_id": "broker-job-1",
+                "output": "https://cdn.example/broker-accounting.mp4",
+            }
+        ]
+    )
+    node = BrokerScriptedNode(bridge)
+    node.set_parameter_value("prompt", "Broker accounting authority regression")
+    asyncio.run(node._process_generation())
+    assert len(bridge.generate_payloads) == 1
+    assert bridge.refresh_ids == ["broker-job-1"]
+    assert node.parameter_output_values["generation_status"] == "succeeded"
+    assert not {name for name in vars(node) if "usage" in name.casefold()}
+
+
 
 
 assert_constructor_and_public_contract()
 assert_image_asset_single_wire_host_contract()
 assert_video_picker_single_wire_host_contract()
-assert_secret_manager_contract()
 assert_payload_and_media_contract()
-assert_scripted_success_flow()
+assert_broker_generation_contract()
+assert_refresh_during_submission_contract()
+assert_broker_account_and_button_contract()
 assert_local_video_temporary_publication()
 assert_tos_local_video_temporary_publication()
-assert_resume_flow_skips_post()
-assert_refresh_recovery_contract()
-assert_ambiguous_submission_status_contract()
-assert_http_transport_contract()
-assert_private_monthly_usage_ledger_contract()
+assert_broker_result_download_contract()
+assert_atomic_final_output_publication()
+assert_unwritable_output_is_rejected_before_submission()
+assert_broker_server_accounting_contract()
 
-print("HMB Seedance 2.0 Volcengine Ark regression: PASS")
+print("HMB Seedance Generation FN AI Broker regression: PASS")

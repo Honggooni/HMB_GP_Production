@@ -49,7 +49,7 @@ picker = load_module(
 )
 seedance = load_module(
     "hmb_picker_seedance_video_integration_seedance",
-    "HMBSeedance20VideoGeneration.py",
+    "HMBSeedanceGeneration.py",
 )
 
 
@@ -170,7 +170,7 @@ def assert_host_connection_reorder_and_payload() -> None:
 
     try:
         source = picker.HMBVideoPickerLibrary(name=f"VideoPicker_{stamp}")
-        destination = seedance.HMBSeedance20VideoGeneration(
+        destination = seedance.HMBSeedanceGeneration(
             name=f"Seedance_{stamp}"
         )
         register_node(flow, source)
@@ -246,13 +246,8 @@ def assert_host_connection_reorder_and_payload() -> None:
         assert params["video_references"] == ordered_three
         assert params["video_reference_slots"] == []
         destination._validate_parameters(params)
-        payload = destination._build_payload(params)
-        payload_videos = [
-            item["video_url"]["url"]
-            for item in payload["content"]
-            if item["type"] == "video_url"
-        ]
-        assert payload_videos == ordered_three
+        payload = destination._build_broker_payload(params)
+        assert payload["video_urls"] == ordered_three
     finally:
         deleted = asyncio.run(
             GriptapeNodes.ahandle_request(

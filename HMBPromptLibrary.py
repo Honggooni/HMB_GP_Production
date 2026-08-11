@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
 import re
 import sys
 import threading
@@ -64,6 +65,15 @@ except Exception:
 
 MAX_IMAGES = 50
 MAX_VIDEOS = 10
+PROMPT_POLICY_SOURCE_VERSION = "2026-08-11.agent-shot-quality.v4.1"
+PROMPT_POLICY_SOURCE_CONTRACT_SHA256 = (
+    "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
+)
+PROMPT_POLICY_CANDIDATE_VERSION = "2026-08-11.agent-shot-quality.v4.1"
+PROMPT_POLICY_CANDIDATE_CONTRACT_SHA256 = (
+    "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
+)
+PROMPT_POLICY_CANDIDATE_STATUS = "active"
 PICKER_DEPTH_PROFILE = "hmb_camera_space_depth_v7"
 PICKER_MOTION_GUIDE_PROFILE = "hmb_target_neutral_motion_guide_v5"
 PICKER_LEGACY_MOTION_GUIDE_PROFILES = frozenset({
@@ -77,15 +87,17 @@ MAX_IDENTIFIER_CHARS = 256
 MAX_DESCRIPTION_CHARS = 6000
 MAX_VIDEO_VFX_CHARS = 20000
 MAX_KEEP_OUT_CHARS = 4000
-MAX_PROMPT_CHARS = 55000
 MAX_FRAME_RANGES_PER_BINDING = 100
 MAX_MANUAL_FRAME_NUMBER = 9999
-_OPTIONAL_PROMPT_SECTION_PRIORITY = (
-    "SOURCE INTERPRETATION NOTES:",
-    "SELF-SCOPED REFERENCE ALIGNMENT:",
-    "ADDITIVE MULTI-VIDEO BINDING SCHEMA:",
-    "SOURCE DATA WARNINGS:",
-)
+VIDEO_REFERENCE_CAPABILITIES_SCHEMA = "hmb-video-reference-capabilities"
+VIDEO_REFERENCE_CAPABILITIES_VERSION = 1
+FX_TIMING_CONTRACT_SCHEMA = "hmb-fx-timing-source-facts"
+FX_TIMING_CONTRACT_VERSION = 3
+FX_TIMING_CONTRACT_HEADER = "FX/TIMING SOURCE DATA (JSON):"
+PUBLIC_JOB_CONTRACT_SCHEMA = "hmb-public-job-data"
+PUBLIC_JOB_CONTRACT_VERSION = 1
+PUBLIC_JOB_CONTRACT_HEADER = "HMB JOB DATA (JSON):"
+USER_DESCRIPTION_DATA_HEADER = "USER DESCRIPTION DATA (JSON):"
 IMAGE_SOURCE_TYPE_CHOICES = _hmb.IMAGE_SOURCE_TYPE_CHOICES
 IMAGE_SCOPE_CHOICES = _hmb.IMAGE_SCOPE_CHOICES
 IMAGE_SCOPE_CHOICES_BY_SOURCE_TYPE = _hmb.IMAGE_SCOPE_CHOICES_BY_SOURCE_TYPE
@@ -131,8 +143,7 @@ KEEP_OUT_TEXTAREA_MIN_HEIGHT = 34
 KEEP_OUT_TEXTAREA_MAX_HEIGHT = 1200
 
 # Target is the dashboard's compact relationship field. Saved/custom Targets
-# and additional relationship Targets remain ordinary user intent; suggestions
-# never limit how the current goal may use them.
+# and additional relationship Targets remain direct UI data.
 VIDEO_SOURCE_TYPE_CHOICES = [
     "Role Required / Select Video Type",
     "Ignore / Unused",
@@ -176,58 +187,14 @@ VIDEO_ROLE_COMPATIBILITY = {
     "Camera / Layout Reference": {"Spatial Alignment Verification Only", "Local Composition Check Only", "Context Only"},
     "Depth / Spatial Reference": {"Spatial Alignment Verification Only", "Mask / Guide Only", "Context Only"},
     "Motion Guide / Retargeting Reference": {"Derived Motion Decoding Only"},
-    "FX Reference": {"FX Behavior Only", "Timing Only", "Context Only"},
-    "Timing / Edit Reference": {"Timing Only", "Context Only"},
+    "FX Reference": {"FX Behavior Only"},
+    "Timing / Edit Reference": {"Timing Only"},
     "Lighting / Look Reference": {"Lighting / Look Only", "Context Only"},
     "Simulation Reference": {"Secondary Motion Only", "FX Behavior Only", "Context Only"},
     "Mask / Control Reference": {"Mask / Guide Only", "Context Only"},
     "Custom": {"Custom Role", "Context Only"},
 }
 
-SELF_SCOPED_AUXILIARY_REFERENCE_SPECS = {
-    ("Maya Preview / Playblast", "Spatial Alignment Verification Only"): {
-        "authority_domain": "playblast_spatial_verification",
-        "fields": "default interpretation: camera-space alignment, framing, composition, relative depth, occlusion, and spatial ordering",
-        "time_mapping": "source-local timing as supplied; cross-source alignment applies only to an explicitly declared Picker companion bundle",
-        "authority": "default spatial-verification interpretation; explicit current user goals may broaden, narrow, or reframe use",
-    },
-    ("Camera / Layout Reference", "Spatial Alignment Verification Only"): {
-        "authority_domain": "camera_layout_verification",
-        "fields": "default interpretation: camera, layout, framing, composition, screen position, and spatial alignment",
-        "time_mapping": "source-local timing as supplied; cross-source alignment applies only to an explicitly declared Picker companion bundle",
-        "authority": "default camera/layout-verification interpretation; explicit current user goals may broaden, narrow, or reframe use",
-    },
-    ("Depth / Spatial Reference", "Spatial Alignment Verification Only"): {
-        "authority_domain": "depth_spatial_verification",
-        "fields": "default interpretation: relative depth, occlusion, and spatial ordering",
-        "time_mapping": "source-local timing as supplied; cross-source alignment applies only to an explicitly declared Picker companion bundle",
-        "authority": "default depth/spatial interpretation; explicit current user goals may broaden, narrow, or reframe use",
-    },
-    ("Motion Guide / Retargeting Reference", "Derived Motion Decoding Only"): {
-        "authority_domain": "derived_motion_decoding",
-        "fields": "default interpretation: target-neutral root, joint, contact, trajectory, and rigid-transform decoding of supplied source motion",
-        "time_mapping": "source-local timing as supplied; exact bundle correspondence applies only when Picker provenance explicitly declares a companion source",
-        "authority": "default motion-decoding/retargeting interpretation; explicit current user goals may broaden, narrow, or reframe use",
-    },
-    ("Maya Preview / Playblast", "Timing Only"): {
-        "authority_domain": "playblast_timing_verification",
-        "fields": "default interpretation: full-shot source-time alignment and timing cues",
-        "time_mapping": "source-local timing as supplied; cross-source alignment applies only to an explicitly declared Picker companion bundle",
-        "authority": "default timing-verification interpretation; explicit current user goals may broaden, narrow, or reframe use",
-    },
-    ("Timing / Edit Reference", "Timing Only"): {
-        "authority_domain": "timing_edit_verification",
-        "fields": "default interpretation: full-shot edit cadence, cut position, source-time alignment, and timing cues",
-        "time_mapping": "source-local timing as supplied; cross-source alignment applies only to an explicitly declared Picker companion bundle",
-        "authority": "default timing/edit interpretation; explicit current user goals may broaden, narrow, or reframe use",
-    },
-    ("Lighting / Look Reference", "Lighting / Look Only"): {
-        "authority_domain": "integration_lighting_look_reference",
-        "fields": "default interpretation: full-shot integration lighting and atmosphere consistency",
-        "time_mapping": "source-local timing as supplied; cross-source alignment applies only to an explicitly declared Picker companion bundle",
-        "authority": "default lighting/look-reference interpretation; explicit current user goals may broaden, narrow, or reframe use",
-    },
-}
 
 TEXT_FIELD_NAMES = [
     "PROJECT_STYLE_LOOK",
@@ -249,54 +216,8 @@ PRESERVED_TEXT_TYPES = {
 }
 _PRESERVED_TEXT_LINE_RE = re.compile(r"^\s*\[([^]\r\n]+)\]\s*(.+?)\s*$")
 
-def _parse_preserved_text(value: Any) -> tuple[List[Dict[str, str]], List[str]]:
-    entries: List[Dict[str, str]] = []
-    errors: List[str] = []
-    seen: set[tuple[str, str]] = set()
-    for line_number, raw_line in enumerate(str(value or "").splitlines(), 1):
-        line = raw_line.strip()
-        if not line:
-            continue
-        match = _PRESERVED_TEXT_LINE_RE.match(line)
-        if not match:
-            errors.append(f"PRESERVED_TEXT line {line_number} must use [Type] exact text.")
-            continue
-        item_type = match.group(1).strip()
-        literal = match.group(2).strip()
-        if item_type not in PRESERVED_TEXT_TYPES:
-            errors.append(f"PRESERVED_TEXT line {line_number} uses unsupported type: {item_type}.")
-            continue
-        if not literal:
-            errors.append(f"PRESERVED_TEXT line {line_number} has no exact text.")
-            continue
-        key=(item_type,literal)
-        if key in seen:
-            continue
-        seen.add(key)
-        entries.append({"type": item_type, "value": literal})
-    return entries, errors
 
 
-def _unverified_preserved_text_lines(value: Any) -> List[str]:
-    """Keep malformed exact-text rows as ordinary descriptive user intent.
-
-    A malformed or unknown tag cannot receive exact-literal authority, but that
-    technical limitation must never erase the words the user supplied.
-    """
-    out: List[str] = []
-    for raw_line in str(value or "").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        match = _PRESERVED_TEXT_LINE_RE.match(line)
-        if not match:
-            out.append(line)
-            continue
-        item_type = match.group(1).strip()
-        literal = match.group(2).strip()
-        if item_type not in PRESERVED_TEXT_TYPES or not literal:
-            out.append(line)
-    return list(dict.fromkeys(out))
 
 VIDEO_ROLE_ALIASES = {
     "Strongest Unified Shot-Control": "Primary Unified Shot Control",
@@ -437,7 +358,36 @@ def _json_dumps(data: Any) -> str:
 
 
 _UNSTRUCTURED_INPUT_KEY = "__hmb_unstructured_input__"
-_SOURCE_INTENT_FALLBACKS_KEY = "source_intent_fallbacks"
+_STRUCTURED_CONNECTOR_SOURCES = frozenset({
+    PICKER_INPUT_PARAMETER_NAME,
+    IMAGE_ASSET_INPUT_PARAMETER_NAME,
+})
+_EXPLICIT_CONNECTED_USER_TEXT_KEYS = frozenset({
+    "user_text",
+    "user_description",
+    "user_instruction",
+    "creative_intent",
+    "creative_note",
+    "description",
+    "instruction",
+    "note",
+    "caption",
+    "dialogue",
+    "scene_context",
+    "emotion_intent",
+    "video_vfx",
+    "fx_additional_instruction",
+    "keep_out",
+    "preserved_text",
+})
+def _is_explicit_connected_user_text_key(value: Any) -> bool:
+    key = str(value or "").strip().casefold()
+    return bool(
+        key in _EXPLICIT_CONNECTED_USER_TEXT_KEYS
+        or re.fullmatch(
+            r"[a-z0-9_]+_(?:note|instruction|intent|description|text)", key
+        )
+    )
 _IMAGE_ASSET_PAYLOAD_KEYS = frozenset({
     "schema",
     "version",
@@ -576,6 +526,9 @@ _PICKER_VIDEO_ROW_KEYS = frozenset({
     "companion_video_uid",
     "depth_range_report",
     "motion_guide_report",
+    "reference_capabilities",
+    "frame_domain",
+    "timing_cues",
     "conflict",
     "valid",
     "warnings",
@@ -629,37 +582,9 @@ def _readable_original(value: Any) -> str:
 
 
 def _source_intent_entry(source: Any, reason: Any, value: Any) -> Dict[str, str] | None:
-    text = _readable_original(value)
-    if not text:
-        return None
-    return {
-        "source": _clean_string(source) or "CONNECTED_SOURCE",
-        "reason": _clean_string(reason) or "readable unstructured input",
-        "text": text,
-    }
+    """Legacy compatibility hook: connected fallback text is never retained."""
 
-
-def _normalize_source_intent_fallbacks(value: Any) -> List[Dict[str, str]]:
-    raw_entries = value if isinstance(value, (list, tuple)) else [value]
-    out: List[Dict[str, str]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for raw in raw_entries:
-        if isinstance(raw, dict):
-            entry = _source_intent_entry(
-                raw.get("source"),
-                raw.get("reason"),
-                raw.get("text"),
-            )
-        else:
-            entry = _source_intent_entry("CONNECTED_SOURCE", "readable unstructured input", raw)
-        if entry is None:
-            continue
-        signature = (entry["source"], entry["reason"], entry["text"])
-        if signature in seen:
-            continue
-        seen.add(signature)
-        out.append(entry)
-    return out
+    return None
 
 
 def _append_source_intent(
@@ -668,13 +593,7 @@ def _append_source_intent(
     reason: Any,
     value: Any,
 ) -> None:
-    entries = _normalize_source_intent_fallbacks(
-        state.get(_SOURCE_INTENT_FALLBACKS_KEY)
-    )
-    entry = _source_intent_entry(source, reason, value)
-    if entry is not None:
-        entries = _normalize_source_intent_fallbacks([*entries, entry])
-    state[_SOURCE_INTENT_FALLBACKS_KEY] = entries
+    return
 
 
 def _append_unconsumed_connected_fields(
@@ -683,20 +602,9 @@ def _append_unconsumed_connected_fields(
     payload: Dict[str, Any],
     consumed_keys: frozenset[str],
 ) -> None:
-    """Preserve every readable field that a known HMB schema does not consume."""
+    """Structured connector extensions never become descriptive text."""
 
-    extras = {
-        key: value
-        for key, value in payload.items()
-        if key not in consumed_keys and key != _UNSTRUCTURED_INPUT_KEY
-    }
-    if extras:
-        _append_source_intent(
-            state,
-            source,
-            "additional connected fields retained as ordinary user intent",
-            extras,
-        )
+    return
 
 
 def _append_unconsumed_connected_rows(
@@ -707,31 +615,286 @@ def _append_unconsumed_connected_rows(
     row_label: str,
     limit: int,
 ) -> None:
-    """Preserve readable extension fields nested inside structured rows."""
+    """Structured connector rows never become descriptive text."""
 
-    if not isinstance(rows, (list, tuple)):
-        return
-    for index, row in enumerate(rows[: max(0, int(limit))], start=1):
-        if not isinstance(row, dict):
-            continue
-        extras = {
-            key: value
-            for key, value in row.items()
-            if key not in consumed_keys
-        }
-        if extras:
-            _append_source_intent(
-                state,
-                source,
-                f"{row_label} {index} additional fields retained as ordinary user intent",
-                extras,
-            )
+    return
 
 
 def _unstructured_payload_entries(payload: Any) -> List[Dict[str, str]]:
-    if not isinstance(payload, dict):
+    return []
+
+
+_TIMING_CUE_PHASES = frozenset({"point", "onset", "peak", "falloff", "end"})
+_LOCAL_POINT_UNITS = frozenset({
+    "scene_unit", "millimeter", "centimeter", "meter", "inch", "foot"
+})
+_LOCAL_POINT_UNIT_ALIASES = {
+    "scene_unit": "scene_unit",
+    "scene unit": "scene_unit",
+    "mm": "millimeter",
+    "millimeter": "millimeter",
+    "millimeters": "millimeter",
+    "cm": "centimeter",
+    "centimeter": "centimeter",
+    "centimeters": "centimeter",
+    "m": "meter",
+    "meter": "meter",
+    "meters": "meter",
+    "in": "inch",
+    "inch": "inch",
+    "inches": "inch",
+    "ft": "foot",
+    "foot": "foot",
+    "feet": "foot",
+}
+_MAX_TIMING_CUES_PER_VIDEO = 256
+
+
+def _strict_int(value: Any) -> int | None:
+    """Return an exact integer without coercing arbitrary transport text."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _normalize_video_reference_capabilities(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict) or not value:
+        return {}
+    version = _strict_int(value.get("version"))
+    identity_fields = value.get("marker_instance_identity_fields")
+    return {
+        "schema": _clean_string(value.get("schema")),
+        "version": version,
+        "frame_addressable": value.get("frame_addressable")
+        if isinstance(value.get("frame_addressable"), bool)
+        else None,
+        "exact_emitter_cues": value.get("exact_emitter_cues")
+        if isinstance(value.get("exact_emitter_cues"), bool)
+        else None,
+        "image_source_frame_ranges": value.get("image_source_frame_ranges")
+        if isinstance(value.get("image_source_frame_ranges"), bool)
+        else None,
+        "marker_instance_identity_fields": [
+            _clean_string(field)
+            for field in identity_fields
+            if _clean_string(field)
+        ][:4]
+        if isinstance(identity_fields, (list, tuple))
+        else [],
+    }
+
+
+def _normalize_video_frame_domain(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict) or not value:
+        return {}
+    return {
+        "schema": _clean_string(value.get("schema")),
+        "version": _strict_int(value.get("version")),
+        "timebase": _clean_string(value.get("timebase")),
+        "start_frame": _strict_int(value.get("start_frame")),
+        "end_frame": _strict_int(value.get("end_frame")),
+        "frame_count": _strict_int(value.get("frame_count")),
+        "range_addressable": value.get("range_addressable")
+        if isinstance(value.get("range_addressable"), bool)
+        else None,
+    }
+
+
+def _normalize_emitter(value: Any) -> Dict[str, str]:
+    raw = value if isinstance(value, dict) else {}
+    return {
+        key: _clean_string(raw.get(key))
+        for key in (
+            "marker_color", "asset_id", "subject_root", "maya_uuid", "full_dag_path"
+        )
+        if _clean_string(raw.get(key))
+    }
+
+
+def _normalize_local_point(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    kind = _clean_string(value.get("kind")).casefold()
+    if kind == "locator":
+        locator_id = _clean_string(value.get("locator_id"))[:MAX_IDENTIFIER_CHARS]
+        locator_path = _clean_string(value.get("locator_path"))[:MAX_DESCRIPTION_CHARS]
+        if not locator_id and not locator_path:
+            return {}
+        return {
+            "kind": "locator",
+            "locator_id": locator_id,
+            "locator_path": locator_path,
+        }
+    if kind == "coordinates":
+        space = _clean_string(value.get("space")).casefold()
+        raw_unit = _clean_string(value.get("unit")).casefold()
+        unit = _LOCAL_POINT_UNIT_ALIASES.get(raw_unit, "")
+        xyz = value.get("xyz")
+        if (
+            space not in {"local", "object"}
+            or unit not in _LOCAL_POINT_UNITS
+            or not isinstance(xyz, (list, tuple))
+            or len(xyz) != 3
+            or any(
+                isinstance(component, bool)
+                or not isinstance(component, (int, float))
+                or not math.isfinite(float(component))
+                for component in xyz
+            )
+        ):
+            return {}
+        return {
+            "kind": "coordinates",
+            "space": space,
+            "unit": unit,
+            "xyz": [float(component) for component in xyz],
+        }
+    return {}
+
+
+def _normalize_video_timing_cues(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, (list, tuple)):
         return []
-    return _normalize_source_intent_fallbacks(payload.get(_UNSTRUCTURED_INPUT_KEY))
+    out: List[Dict[str, Any]] = []
+    seen: set[
+        tuple[str, int | None, str, tuple[tuple[str, str], ...], str]
+    ] = set()
+    for raw in value[:_MAX_TIMING_CUES_PER_VIDEO]:
+        if not isinstance(raw, dict):
+            continue
+        emitter = _normalize_emitter(raw.get("emitter"))
+        local_point = _normalize_local_point(raw.get("local_point"))
+        cue = {
+            "schema": _clean_string(raw.get("schema")),
+            "version": _strict_int(raw.get("version")),
+            "cue_id": _clean_string(raw.get("cue_id"))[:MAX_IDENTIFIER_CHARS],
+            "cue_type": _clean_string(raw.get("cue_type")),
+            "cue_phase": _clean_string(raw.get("cue_phase")).casefold(),
+            "frame": _strict_int(raw.get("frame")),
+            "emitter": emitter,
+            "local_point": local_point,
+        }
+        description = _clean_string(raw.get("description"))
+        if description:
+            cue["description"] = description[:MAX_DESCRIPTION_CHARS]
+        signature = (
+            cue["cue_id"],
+            cue["frame"],
+            cue["cue_phase"],
+            tuple(sorted(emitter.items())),
+            _json_dumps(local_point),
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        out.append(cue)
+    return out
+
+
+def _video_reference_transport_errors(item: Dict[str, Any]) -> List[str]:
+    """Validate Picker transport fields without treating them as creative text."""
+
+    errors: List[str] = []
+    capabilities = item.get("reference_capabilities")
+    if capabilities not in (None, "", {}) and not isinstance(capabilities, dict):
+        errors.append("reference_capabilities must be an object")
+    elif isinstance(capabilities, dict) and capabilities:
+        if (
+            capabilities.get("schema") != VIDEO_REFERENCE_CAPABILITIES_SCHEMA
+            or capabilities.get("version") != VIDEO_REFERENCE_CAPABILITIES_VERSION
+        ):
+            errors.append("reference_capabilities schema/version is invalid")
+        for key in (
+            "frame_addressable",
+            "exact_emitter_cues",
+            "image_source_frame_ranges",
+        ):
+            if not isinstance(capabilities.get(key), bool):
+                errors.append(f"reference_capabilities.{key} must be boolean")
+        identity_fields = capabilities.get("marker_instance_identity_fields")
+        allowed_identity_fields = {
+            "marker_color", "asset_id", "subject_root", "maya_uuid", "full_dag_path"
+        }
+        if not isinstance(identity_fields, list) or any(
+            field not in allowed_identity_fields for field in identity_fields
+        ):
+            errors.append(
+                "reference_capabilities.marker_instance_identity_fields is invalid"
+            )
+
+    frame_domain = item.get("frame_domain")
+    if frame_domain not in (None, "", {}) and not isinstance(frame_domain, dict):
+        errors.append("frame_domain must be an object")
+    elif isinstance(frame_domain, dict) and frame_domain:
+        if (
+            frame_domain.get("schema") != "hmb-video-frame-domain"
+            or frame_domain.get("version") != 1
+        ):
+            errors.append("frame_domain schema/version is invalid")
+        start = frame_domain.get("start_frame")
+        end = frame_domain.get("end_frame")
+        count = frame_domain.get("frame_count")
+        if not all(isinstance(value, int) and not isinstance(value, bool) for value in (start, end, count)):
+            errors.append("frame_domain requires integer start/end/count")
+        elif start > end or count != end - start + 1:
+            errors.append("frame_domain start/end/count do not agree")
+        if not isinstance(frame_domain.get("range_addressable"), bool):
+            errors.append("frame_domain.range_addressable must be boolean")
+
+    cues = item.get("timing_cues")
+    if cues not in (None, "", []) and not isinstance(cues, list):
+        errors.append("timing_cues must be a list")
+    elif isinstance(cues, list):
+        for index, cue in enumerate(cues, start=1):
+            prefix = f"timing_cues[{index}]"
+            if (
+                not isinstance(cue, dict)
+                or cue.get("schema") != "hmb-video-emitter-timing-cue"
+                or cue.get("version") != 1
+            ):
+                errors.append(f"{prefix} schema/version is invalid")
+                continue
+            if not _clean_string(cue.get("cue_id")):
+                errors.append(f"{prefix}.cue_id is required")
+            if cue.get("cue_type") != "emitter_point":
+                errors.append(f"{prefix}.cue_type must be emitter_point")
+            if cue.get("cue_phase") not in _TIMING_CUE_PHASES:
+                errors.append(f"{prefix}.cue_phase is invalid")
+            frame = cue.get("frame")
+            if not isinstance(frame, int) or isinstance(frame, bool):
+                errors.append(f"{prefix}.frame must be an integer")
+            emitter = cue.get("emitter")
+            if (
+                not isinstance(emitter, dict)
+                or not _clean_string(emitter.get("marker_color"))
+                or not any(
+                    _clean_string(emitter.get(key))
+                    for key in (
+                        "asset_id", "subject_root", "maya_uuid", "full_dag_path"
+                    )
+                )
+            ):
+                errors.append(f"{prefix}.emitter requires an exact address")
+            if not _normalize_local_point(cue.get("local_point")):
+                errors.append(f"{prefix}.local_point requires an exact locator or coordinates")
+            if (
+                isinstance(frame, int)
+                and isinstance(frame_domain, dict)
+                and isinstance(frame_domain.get("start_frame"), int)
+                and isinstance(frame_domain.get("end_frame"), int)
+                and not (
+                    int(frame_domain["start_frame"])
+                    <= frame
+                    <= int(frame_domain["end_frame"])
+                )
+            ):
+                errors.append(f"{prefix}.frame is outside frame_domain")
+    return list(dict.fromkeys(errors))
 
 
 def _parse_state(value: Any) -> Dict[str, Any]:
@@ -742,25 +905,10 @@ def _parse_state(value: Any) -> Dict[str, Any]:
             parsed = json.loads(value) if value.strip() else {}
             if isinstance(parsed, dict):
                 return parsed
-            entry = _source_intent_entry(
-                WIDGET_PARAMETER_NAME,
-                "readable non-object dashboard state",
-                parsed,
-            )
-            return {_SOURCE_INTENT_FALLBACKS_KEY: [entry] if entry else []}
+            return {}
         except Exception:
-            entry = _source_intent_entry(
-                WIDGET_PARAMETER_NAME,
-                "readable non-JSON dashboard state",
-                value,
-            )
-            return {_SOURCE_INTENT_FALLBACKS_KEY: [entry] if entry else []}
-    entry = _source_intent_entry(
-        WIDGET_PARAMETER_NAME,
-        "readable non-object dashboard state",
-        value,
-    )
-    return {_SOURCE_INTENT_FALLBACKS_KEY: [entry] if entry else []}
+            return {}
+    return {}
 
 
 def _slot_name(prefix: str, index: int) -> str:
@@ -852,6 +1000,13 @@ def _default_video_item(slot: int) -> Dict[str, Any]:
         "picker_auto_depth": {},
         "picker_auto_motion_guide": {},
         "picker_motion_guide_summary": {},
+        # Picker-authored transport data for FX Reference and Timing / Edit
+        # Reference. Prompt's source_type/control_role selection remains the
+        # semantic authority; these values only make source capability, emitter
+        # points, and source-local time addresses machine-verifiable.
+        "reference_capabilities": {},
+        "frame_domain": {},
+        "timing_cues": [],
         # Stable companion provenance.  These fields describe the Picker
         # relationship; ``slot`` remains only the current transient address.
         "picker_companion_kind": "",
@@ -872,7 +1027,6 @@ def _default_widget_state() -> Dict[str, Any]:
         "images": [_default_image_item(slot) for slot in range(1, 5)],
         "videos": [_default_video_item(1)],
         "text": dict(TEXT_FIELD_DEFAULTS),
-        _SOURCE_INTENT_FALLBACKS_KEY: [],
         "ui": {
             "group_heights": {},
             "textarea_heights": {},
@@ -1088,7 +1242,7 @@ def _normalize_frame_range_bindings(value: Any, legacy_binding: Any = None) -> D
         previous = out.get(key) if isinstance(out.get(key), dict) else {}
         has_start = "start_frame" in raw or "manual_start_frame" in raw
         has_end = "end_frame" in raw or "manual_end_frame" in raw
-        out[key] = {
+        normalized_binding = {
             "video_slot": f"@video{slot}",
             "color_pick": color,
             "origin": _clean_string(raw.get("origin")) or "manual",
@@ -1112,6 +1266,13 @@ def _normalize_frame_range_bindings(value: Any, legacy_binding: Any = None) -> D
             ),
             "ranges": _normalize_frame_ranges(raw.get("ranges")),
         }
+        if "enabled" in raw or "enabled" in previous:
+            normalized_binding["enabled"] = (
+                raw.get("enabled") is True
+                if "enabled" in raw
+                else previous.get("enabled") is True
+            )
+        out[key] = normalized_binding
     return out
 
 
@@ -1280,6 +1441,37 @@ def _current_frame_range_binding(item: Dict[str, Any]) -> Dict[str, Any] | None:
             "ranges": [],
         }
     return None
+
+
+def _active_frame_range_bindings(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return current Range ON plus explicitly enabled additional bindings."""
+
+    if not bool(item.get("frame_range_enabled")):
+        return []
+    current = _current_frame_range_binding(item)
+    bindings = _normalize_frame_range_bindings(
+        item.get("frame_range_bindings"),
+        item.get("frame_range_binding"),
+    )
+    out: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    if isinstance(current, dict):
+        key = _frame_binding_key(
+            current.get("video_slot"), current.get("color_pick")
+        )
+        seen.add(key)
+        out.append(dict(current))
+    for binding in bindings.values():
+        if not isinstance(binding, dict) or binding.get("enabled") is not True:
+            continue
+        key = _frame_binding_key(
+            binding.get("video_slot"), binding.get("color_pick")
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dict(binding))
+    return out
 
 
 def _legacy_relationship_targets(item: Dict[str, Any]) -> List[str]:
@@ -1617,16 +1809,6 @@ def _reset_images_bound_to_inactive_videos(
         _normalize_image_binding_fields(item, MAX_VIDEOS)
     return images, False
 
-def _color_pick_text(item: Dict[str, Any], include_video: bool = True) -> str:
-    parts: List[str] = []
-    for entry in _image_binding_entries(item):
-        color = entry["color"]
-        if not color:
-            continue
-        marker = f"@video{entry['marker_video']} / {color}" if include_video else color
-        scope = entry["scope"]
-        parts.append(f"{scope} = {marker}" if scope else marker)
-    return "; ".join(parts)
 
 _CONTROL_ONLY_BINDING_PREFIX_RE = re.compile(
     r"^\s*(?:CONTROL_ONLY_BINDING|VFX_CONTROL_BINDING)\s*:\s*(.+?)\s*$",
@@ -1695,38 +1877,12 @@ def _parse_control_only_bindings(descriptive_fields: Dict[str, Any] | None) -> t
     return entries, errors
 
 
-def _strip_control_only_binding_lines(value: Any) -> str:
-    preserved: List[str] = []
-    for line in str(value or "").splitlines():
-        match = _CONTROL_ONLY_BINDING_PREFIX_RE.match(line)
-        if not match:
-            preserved.append(line)
-            continue
-        payload = match.group(1).strip()
-        video_match = re.search(r"@video(10|[1-9])\b", payload, re.IGNORECASE)
-        has_structured_fields = all(
-            _control_binding_value(payload, key)
-            for key in ("Target", "Function", "Boundary")
-        )
-        # Only a fully structured line is extracted into CONTROL-ONLY BINDING.
-        # Malformed lines stay verbatim as ordinary user intent. A formatting
-        # convention never becomes a prerequisite or warning by itself.
-        if not video_match or not has_structured_fields:
-            preserved.append(line)
-    return "\n".join(preserved).strip()
 
 
 def _control_bindings_for_video(entries: List[Dict[str, Any]], video_slot: int) -> List[Dict[str, Any]]:
     return [entry for entry in entries if int(entry.get("video") or 0) == int(video_slot)]
 
 
-def _format_control_only_binding(entry: Dict[str, Any]) -> str:
-    marker = f" / Marker = {entry['marker']}" if _clean_string(entry.get("marker")) else ""
-    return (
-        f"@video{int(entry['video'])} / Target = {entry['target']} / Function = {entry['function']}"
-        f"{marker} / Control Boundary = {entry['boundary']} / Default interpretation = control cue; "
-        "the explicit current user goal may use any visible or supplied property"
-    )
 
 
 def _normalize_text(state: Dict[str, Any]) -> Dict[str, str]:
@@ -1973,6 +2129,15 @@ def _migrate_old_video_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
         _normalize_picker_motion_guide_summary(
             item.get("picker_motion_guide_summary")
         )
+    )
+    out["reference_capabilities"] = _normalize_video_reference_capabilities(
+        item.get("reference_capabilities")
+    )
+    out["frame_domain"] = _normalize_video_frame_domain(
+        item.get("frame_domain")
+    )
+    out["timing_cues"] = _normalize_video_timing_cues(
+        item.get("timing_cues")
     )
     companion_kind = _clean_string(item.get("picker_companion_kind")).casefold()
     if companion_kind not in {"depth", "motion_guide"}:
@@ -2303,34 +2468,6 @@ def _normalize_dormant_video_rows(
 
 
 def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
-    source_intent_fallbacks = _normalize_source_intent_fallbacks(
-        state.get(_SOURCE_INTENT_FALLBACKS_KEY)
-    )
-    for row_group in ("images", "videos"):
-        raw_rows = state.get(row_group)
-        if not isinstance(raw_rows, list):
-            if raw_rows not in (None, ""):
-                entry = _source_intent_entry(
-                    WIDGET_PARAMETER_NAME,
-                    f"readable non-list {row_group} value",
-                    raw_rows,
-                )
-                if entry is not None:
-                    source_intent_fallbacks.append(entry)
-            continue
-        for row_index, raw_row in enumerate(raw_rows, start=1):
-            if isinstance(raw_row, dict) or raw_row in (None, ""):
-                continue
-            entry = _source_intent_entry(
-                WIDGET_PARAMETER_NAME,
-                f"readable non-object {row_group} row {row_index}",
-                raw_row,
-            )
-            if entry is not None:
-                source_intent_fallbacks.append(entry)
-    source_intent_fallbacks = _normalize_source_intent_fallbacks(
-        source_intent_fallbacks
-    )
     videos = _normalize_items(state, "videos", MAX_VIDEOS)
 
     # Legacy dashboard states may still contain old global video-control
@@ -2476,7 +2613,6 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "images": images,
         "videos": videos,
         "text": _normalize_text(state),
-        _SOURCE_INTENT_FALLBACKS_KEY: source_intent_fallbacks,
         "ui": _normalize_ui(state),
         "picker": picker,
         "image_asset": image_asset,
@@ -2503,994 +2639,41 @@ def _target_text(owner: str, default: str) -> str:
     return owner or default
 
 
-def _detail_suffix(scope: str, extra_detail: str = "") -> str:
-    parts = [_clean_string(scope), _clean_string(extra_detail)]
-    parts = [p for p in parts if p]
-    return " / " + " / ".join(parts) if parts else ""
 
 
-def _target_function(scope: str) -> str:
-    if scope == "Handheld prop":
-        return "holder"
-    if scope == "Attached accessory":
-        return "attachment subject"
-    if scope == "Interactive scene prop":
-        return "interaction subject"
-    return "production subject"
 
 
-def _target_function_suffix(scope: str) -> str:
-    if scope not in {"Handheld prop", "Attached accessory", "Interactive scene prop"}:
-        return ""
-    return f" / Target function = {_target_function(scope)}"
 
 
-def _image_target_function_lines(item: Dict[str, Any], seq: int) -> List[str]:
-    if _clean_string(item.get("source_type")) != "Prop / Accessory":
-        return []
-    targets = list(dict.fromkeys(
-        value
-        for value in [
-            _effective_target(item, f"image {seq}"),
-            *_legacy_relationship_targets(item),
-        ]
-        if _clean_string(value)
-    ))
-    lines: List[str] = []
-    for scope in _relationship_scopes(item):
-        matching_video_slots = list(dict.fromkeys(
-            int(entry.get("marker_video") or 1)
-            for entry in _image_binding_entries(item, MAX_VIDEOS)
-            if _clean_string(entry.get("color"))
-            and (entry.get("scope_choice") == scope or entry.get("scope") == scope)
-        ))
-        binding_note = (
-            " / Supplied video bindings = "
-            + ", ".join(f"@video{slot}" for slot in matching_video_slots)
-            if matching_video_slots
-            else ""
-        )
-        for target in targets:
-            line = (
-                f"@image{seq} / Target = {target} / Image Sub Type = {scope} / "
-                f"Target defines the {_target_function(scope)}; contact, grip, release, attachment, "
-                "deformation, visibility, occlusion, and separation follow the current user goal"
-                f"{binding_note}"
-            )
-            if line not in lines:
-                lines.append(line)
-    return lines
 
 
-def _image_role_line(item: Dict[str, Any], seq: int) -> str:
-    token = f"@image{seq}"
-    st_choice = _clean_string(item.get("source_type"))
-    st = _effective_image_source_type(item)
-    owner = _effective_target(item, f"image {seq}")
-    scopes = _non_empty_binding_scopes(item) or [""]
 
-    def line_for(scope: str) -> str:
-        suffix = _detail_suffix(scope)
-        if st_choice == "Character Appearance":
-            return f"{owner} / Approved final appearance source = {token}{suffix}"
-        if st_choice == "Partial Character Detail":
-            return f"{owner} / Partial character detail source = {token}{suffix}"
-        if st_choice == "Prop / Accessory":
-            return f"{owner} prop / accessory source = {token}{suffix}{_target_function_suffix(scope)}"
-        if st_choice == "Costume / Clothing":
-            return f"{owner} costume / clothing source = {token}{suffix}"
-        if st_choice == "Environment / Background":
-            return f"{owner} / Environment / background source = {token}{suffix}"
-        if st_choice == "Sky / Exterior Background":
-            return f"{owner} / Sky / exterior background source = {token}{suffix}"
-        if st_choice == "Set / Structure":
-            return f"{owner} / Set / structure source = {token}{suffix}"
-        if st_choice == "Foreground / Ground":
-            return f"{owner} / Foreground / ground source = {token}{suffix}"
-        if st_choice == "Color / Look Reference":
-            return f"{owner} / Color / look reference = {token}{suffix}"
-        if st_choice == "Color + Look + Lighting Mood Reference":
-            return f"{owner} / Color / look / lighting reference = {token}{suffix}"
-        if st_choice == "Lighting / Atmosphere Reference":
-            return f"{owner} / Lighting / atmosphere source = {token}{suffix}"
-        if st_choice == "Scale / Composition Reference":
-            return f"{owner} / Scale / composition reference = {token}{suffix}"
-        if st_choice == "Custom":
-            return f"{owner} / {st} = {token}{suffix}"
-        return (
-            f"Unclassified image idea reference = {token} / No missing role is inferred / "
-            "Use the supplied content according to the current user goal"
-        )
 
-    lines: List[str] = []
-    for scope in scopes:
-        for line in line_for(scope).splitlines():
-            if line not in lines:
-                lines.append(line)
-    return "\n".join(lines)
 
-def _clean_replacement_marker(marker: str, image_seq: int) -> str:
-    marker = _clean_string(marker)
-    if not marker:
-        return ""
-    if "=" in marker:
-        marker = marker.split("=", 1)[1].strip()
-    token_pattern = r"\s*/\s*@image\d+\b\s*"
-    previous = None
-    while previous != marker:
-        previous = marker
-        marker = re.sub(token_pattern + r"$", "", marker).strip()
-    marker = re.sub(r"\s+", " ", marker).strip(" /\t")
-    return marker
 
 
-def _image_replacement_line(item: Dict[str, Any], seq: int) -> str | None:
-    explicit_marker = _clean_replacement_marker(item.get("preview_marker"), seq)
-    st = _clean_string(item.get("source_type"))
-    owner = _effective_target(item, f"image {seq}")
 
-    def format_line(marker: str, scope: str) -> str:
-        if st == "Character Appearance":
-            label = f"{owner} / {scope}" if scope else owner
-            return f"{label} replaces = {marker} / @image{seq}"
-        if st == "Partial Character Detail":
-            return f"{owner} partial detail guides = {marker} / @image{seq} / {scope or 'specified detail only'}"
-        if st in ("Prop / Accessory", "Costume / Clothing"):
-            label = scope or ("prop / accessory" if st == "Prop / Accessory" else "costume / clothing detail")
-            target_function_suffix = _target_function_suffix(scope) if st == "Prop / Accessory" else ""
-            return f"{owner} {label} replaces = {marker} / @image{seq}{target_function_suffix}"
-        if st == "Environment / Background":
-            return f"{owner} environment / background replaces = {marker} / @image{seq}{_detail_suffix(scope)}"
-        if st == "Sky / Exterior Background":
-            return f"{owner} sky / exterior background replaces = {marker} / @image{seq}{_detail_suffix(scope)}"
-        if st == "Set / Structure":
-            return f"{owner} set / structure replaces = {marker} / @image{seq}{_detail_suffix(scope)}"
-        if st == "Foreground / Ground":
-            return f"{owner} foreground / ground replaces = {marker} / @image{seq}{_detail_suffix(scope)}"
-        if st in ("Color / Look Reference", "Color + Look + Lighting Mood Reference", "Lighting / Atmosphere Reference", "Scale / Composition Reference"):
-            return f"{st} applies to = {marker} / @image{seq}{_detail_suffix(scope)}"
-        if st == "Custom":
-            return f"{_effective_image_source_type(item)} applies to {owner} = {marker} / @image{seq}{_detail_suffix(scope)}"
-        return (
-            f"Unclassified image marker association = {marker} / @image{seq}"
-            f"{_detail_suffix(scope)} / No missing role is inferred / "
-            "Use the supplied association according to the current user goal"
-        )
 
-    lines: List[str] = []
-    if explicit_marker:
-        first_scope = next((entry["scope"] for entry in _image_binding_entries(item) if entry["scope"]), "")
-        lines.append(format_line(explicit_marker, first_scope))
-    for entry in _image_binding_entries(item):
-        if not entry["color"]:
-            continue
-        marker = f"Color Pick marker: @video{entry['marker_video']} / {entry['color']}"
-        line = format_line(marker, entry["scope"])
-        if line not in lines:
-            lines.append(line)
-    return "\n".join(lines) if lines else None
 
-def _video_reverse_binding_entries(active_images: List[Dict[str, Any]], video_slot: int) -> List[Dict[str, str]]:
-    bindings: List[Dict[str, str]] = []
-    for item in active_images:
-        image_slot = int(item.get("slot") or 1)
-        target = _effective_target(item, f"image {image_slot}")
-        for entry in _image_binding_entries(item, MAX_VIDEOS):
-            if entry["marker_video"] != video_slot or not entry["color"]:
-                continue
-            bindings.append({
-                "image": f"@image{image_slot}",
-                "target": target,
-                "scope": entry["scope"] or "Unspecified Sub Type",
-                "color": entry["color"],
-            })
-    return bindings
 
 
-def _video_reverse_bindings(active_images: List[Dict[str, Any]], video_slot: int) -> List[str]:
-    return [
-        f"{entry['image']} / Target = {entry['target']} / Image Sub Type = {entry['scope']} / Color Pick = {entry['color']}"
-        for entry in _video_reverse_binding_entries(active_images, video_slot)
-    ]
 
 
-def _self_scoped_auxiliary_reference(item: Dict[str, Any], seq: int) -> Dict[str, str] | None:
-    source_type = _clean_string(item.get("source_type"))
-    role = _clean_string(item.get("control_role"))
-    if role == "Context Only" and role in VIDEO_ROLE_COMPATIBILITY.get(source_type, set()):
-        return {
-            "authority_domain": "descriptive_context",
-            "fields": "default interpretation: descriptive shot context",
-            "time_mapping": "source-local timing as supplied; no cross-source mapping is inferred",
-            "authority": "default context interpretation; explicit current user goals may broaden, narrow, or reframe use",
-        }
-    spec = SELF_SCOPED_AUXILIARY_REFERENCE_SPECS.get((source_type, role))
-    return dict(spec) if isinstance(spec, dict) else None
 
 
-def _self_scoped_alignment_evaluation(
-    active_images: List[Dict[str, Any]],
-    active_videos: List[Dict[str, Any]],
-    control_only_bindings: List[Dict[str, Any]],
-    frame_metadata: Any,
-) -> tuple[List[str], List[str]]:
-    """Evaluate source-local and explicitly declared Picker companion contracts.
 
-    Video numbers are transient selection addresses. A Depth or Motion Guide
-    may therefore appear in any slot, including ``@video1``. Matched-bundle
-    authority follows only its stable source UID and/or its explicitly remapped
-    source slot; it never falls back to an unrelated ``@video1``.
-    """
-    normalized_metadata = _normalize_frame_metadata(frame_metadata)
-    metadata_by_slot = {
-        _video_slot_number(item.get("video_slot"), MAX_VIDEOS): item
-        for item in normalized_metadata
-    }
-    metadata_by_uid = {
-        _clean_string(item.get("video_uid") or item.get("source_uid")): item
-        for item in normalized_metadata
-        if _clean_string(item.get("video_uid") or item.get("source_uid"))
-    }
-    active_video_slots = {
-        int(item.get("slot") or 1)
-        for item in active_videos
-    }
-    active_slot_by_uid = {
-        _clean_string(item.get("video_uid") or item.get("source_uid")): int(
-            item.get("slot") or 1
-        )
-        for item in active_videos
-        if _clean_string(item.get("video_uid") or item.get("source_uid"))
-    }
-    reports: List[str] = []
-    conflicts: List[str] = []
 
-    def contract(
-        item: Dict[str, Any] | None,
-    ) -> tuple[Dict[str, Any] | None, str, str]:
-        if not isinstance(item, dict):
-            return None, "absent", "metadata is not connected"
-        try:
-            fps = float(item.get("fps") or 0.0)
-            frame_count = int(item.get("frame_count") or 0)
-            duration = float(item.get("duration_seconds") or 0.0)
-            width = int(item.get("width") or 0)
-            height = int(item.get("height") or 0)
-        except Exception:
-            return None, "invalid", "metadata contains non-numeric values"
-        if not bool(item.get("valid")):
-            return None, "invalid", "metadata is marked invalid or internally conflicting"
-        if duration <= 0 and fps > 0 and frame_count > 0:
-            duration = frame_count / fps
-        if fps <= 0 or frame_count <= 0 or duration <= 0:
-            return None, "incomplete", "frame count, FPS, or duration is unavailable"
-        expected_duration = frame_count / fps
-        if abs(duration - expected_duration) > 0.001:
-            return (
-                None,
-                "invalid",
-                f"duration {duration:.6f}s is inconsistent with "
-                f"{frame_count} frames / {fps:g} FPS ({expected_duration:.6f}s)",
-            )
-        if width <= 0 or height <= 0:
-            return None, "incomplete", "decoded width or height is unavailable"
-        return (
-            {
-                "fps": fps,
-                "frame_count": frame_count,
-                "duration_seconds": duration,
-                "width": width,
-                "height": height,
-            },
-            "complete",
-            "",
-        )
 
-    def metadata_for(item: Dict[str, Any], slot: int) -> Dict[str, Any] | None:
-        uid = _clean_string(item.get("video_uid") or item.get("source_uid"))
-        return metadata_by_uid.get(uid) if uid in metadata_by_uid else metadata_by_slot.get(slot)
 
-    def companion_provenance(
-        item: Dict[str, Any],
-        seq: int,
-    ) -> tuple[str, bool, int, str, bool]:
-        depth_auto = _normalize_picker_auto_depth(item.get("picker_auto_depth"))
-        motion_auto = _normalize_picker_auto_motion_guide(
-            item.get("picker_auto_motion_guide")
-        )
-        kind = _clean_string(item.get("picker_companion_kind")).casefold()
-        if kind not in {"depth", "motion_guide"}:
-            if depth_auto and not motion_auto:
-                kind = "depth"
-            elif motion_auto and not depth_auto:
-                kind = "motion_guide"
-            else:
-                kind = ""
-        validated = bool(
-            item.get("picker_companion_validated")
-            or depth_auto
-            or motion_auto
-        )
-        source_uid = _clean_string(
-            item.get("picker_companion_source_uid")
-            or item.get("source_video_uid")
-            or item.get("companion_of_video_uid")
-            or item.get("companion_video_uid")
-        )
-        try:
-            source_slot = int(
-                item.get("picker_companion_source_slot")
-                if item.get("picker_companion_source_slot") not in (None, "")
-                else _picker_companion_source_slot(item)
-            )
-        except Exception:
-            source_slot = -1
 
-        legacy_primary = False
-        if source_uid:
-            resolved_uid_slot = active_slot_by_uid.get(source_uid, -1)
-            if resolved_uid_slot < 1:
-                source_slot = -1
-            elif source_slot > 0 and source_slot != resolved_uid_slot:
-                # Stable UID is authoritative when a serialized transient slot
-                # still reflects the previous drag order.
-                source_slot = resolved_uid_slot
-            elif source_slot == 0:
-                # Standalone provenance cannot simultaneously name a source.
-                source_slot = -1
-            else:
-                source_slot = resolved_uid_slot
-        elif source_slot not in range(0, MAX_VIDEOS + 1):
-            source_slot = -1
 
-        # Legacy states did not persist a source address. Their auto-provenance
-        # was produced only after validating the historical @video1 bundle.
-        # Permit that narrow shape only for rows with no stable UID and never
-        # for a companion already occupying @video1.
-        item_uid = _clean_string(item.get("video_uid") or item.get("source_uid"))
-        if (
-            kind
-            and validated
-            and source_slot < 0
-            and not source_uid
-            and not item_uid
-            and seq > 1
-        ):
-            source_slot = 1
-            legacy_primary = True
-        return kind, validated, source_slot, source_uid, legacy_primary
 
-    for item in active_videos:
-        seq = int(item.get("slot") or 1)
-        self_scoped = _self_scoped_auxiliary_reference(item, seq)
-        if not self_scoped or self_scoped["authority_domain"] == "descriptive_context":
-            continue
 
-        token = f"@video{seq}"
-        auxiliary_contract, auxiliary_status, auxiliary_detail = contract(
-            metadata_for(item, seq)
-        )
-        (
-            companion_kind,
-            companion_validated,
-            source_slot,
-            source_uid,
-            legacy_primary,
-        ) = companion_provenance(item, seq)
-        explicit_picker_companion = bool(companion_kind)
-        if not explicit_picker_companion and _video_reverse_binding_entries(
-            active_images, seq
-        ):
-            continue
-        if not explicit_picker_companion and _control_bindings_for_video(
-            control_only_bindings, seq
-        ):
-            continue
-
-        if not explicit_picker_companion:
-            if auxiliary_status == "invalid":
-                conflicts.append(
-                    f"{token} has invalid declared source metadata: "
-                    f"{auxiliary_detail}. Metadata-derived authority is ignored; "
-                    "the source remains independently usable."
-                )
-                reports.append(
-                    f"{token} source metadata = UNVERIFIED / {auxiliary_detail} / "
-                    "source-local use remains available"
-                )
-            elif auxiliary_contract is None:
-                reports.append(
-                    f"{token} source metadata = OPTIONAL / "
-                    "use the connected source as supplied without requiring another video slot"
-                )
-            else:
-                reports.append(
-                    f"{token} source-local contract = "
-                    f"{auxiliary_contract['frame_count']} decoded frames / "
-                    f"{auxiliary_contract['fps']:g} FPS / "
-                    f"{auxiliary_contract['duration_seconds']:.6f} seconds / "
-                    f"{auxiliary_contract['width']}x{auxiliary_contract['height']} / "
-                    "no cross-source correspondence inferred"
-                )
-            continue
-
-        companion_label = "Depth" if companion_kind == "depth" else "Motion Guide"
-        if source_slot == 0:
-            if auxiliary_contract is None:
-                if auxiliary_status == "invalid":
-                    conflicts.append(
-                        f"{token} standalone {companion_label} has invalid metadata: "
-                        f"{auxiliary_detail}. Matched-bundle authority is not claimed."
-                    )
-                reports.append(
-                    f"{token} standalone Picker companion contract = INCOMPLETE / "
-                    f"{auxiliary_detail or 'decoded metadata is unavailable'} / "
-                    "no matched source is required"
-                )
-            elif companion_validated:
-                reports.append(
-                    f"{token} standalone Picker companion contract = VALIDATED / "
-                    f"{auxiliary_contract['frame_count']} decoded frames / "
-                    f"{auxiliary_contract['fps']:g} FPS / "
-                    f"{auxiliary_contract['duration_seconds']:.6f} seconds / "
-                    f"{auxiliary_contract['width']}x{auxiliary_contract['height']} / "
-                    "no matched source is required"
-                )
-            else:
-                reports.append(
-                    f"{token} standalone Picker companion contract = UNVERIFIED / "
-                    "source-local use remains available"
-                )
-            continue
-
-        if source_slot < 1:
-            source_detail = (
-                f"source UID {source_uid} is not selected"
-                if source_uid
-                else "the declared source is missing or no longer selected"
-            )
-            reports.append(
-                f"{token} explicit Picker companion contract = INCOMPLETE / "
-                f"{source_detail} / matched-bundle authority is disabled / "
-                "independent source use remains available"
-            )
-            continue
-
-        source_token = f"@video{source_slot}"
-        if source_slot == seq or source_slot not in active_video_slots:
-            reports.append(
-                f"{token} explicit Picker companion contract = INCOMPLETE / "
-                f"declared source {source_token} is not an independent active source / "
-                "matched-bundle authority is disabled"
-            )
-            continue
-        source_item = next(
-            (
-                source
-                for source in active_videos
-                if int(source.get("slot") or 1) == source_slot
-            ),
-            None,
-        )
-        source_contract, source_status, source_detail = contract(
-            metadata_for(source_item, source_slot)
-            if isinstance(source_item, dict)
-            else None
-        )
-        if not companion_validated:
-            reports.append(
-                f"{token} declared {companion_label} companion against {source_token} = "
-                "UNVERIFIED / matched-bundle authority is disabled / "
-                "independent source use remains available"
-            )
-            continue
-        if source_contract is None:
-            if source_status == "invalid":
-                conflicts.append(
-                    f"{token} loses declared {source_token} matched-bundle authority because "
-                    f"{source_detail}. Both sources remain independently usable."
-                )
-                reports.append(
-                    f"{token} alignment = UNVERIFIED / {source_token} {source_detail} / "
-                    "independent source use remains available"
-                )
-            else:
-                reports.append(
-                    f"{token} explicit Picker companion contract = INCOMPLETE / "
-                    f"the declared bundle source metadata for {source_token} is unavailable"
-                )
-            continue
-        if auxiliary_contract is None:
-            if auxiliary_status == "invalid":
-                conflicts.append(
-                    f"{token} has invalid declared alignment metadata: {auxiliary_detail}. "
-                    "Matched-bundle authority is ignored; the source remains independently usable."
-                )
-                reports.append(
-                    f"{token} alignment = UNVERIFIED / {auxiliary_detail} / "
-                    "independent source use remains available"
-                )
-            else:
-                reports.append(
-                    f"{token} explicit Picker companion contract = INCOMPLETE / "
-                    "this companion's decoded metadata is unavailable"
-                )
-            continue
-
-        mismatches: List[str] = []
-        if auxiliary_contract["frame_count"] != source_contract["frame_count"]:
-            mismatches.append(
-                f"frame count {auxiliary_contract['frame_count']} != {source_contract['frame_count']}"
-            )
-        if abs(auxiliary_contract["fps"] - source_contract["fps"]) > 0.001:
-            mismatches.append(
-                f"FPS {auxiliary_contract['fps']:g} != {source_contract['fps']:g}"
-            )
-        if (
-            abs(
-                auxiliary_contract["duration_seconds"]
-                - source_contract["duration_seconds"]
-            )
-            > 0.001
-        ):
-            mismatches.append(
-                "duration "
-                f"{auxiliary_contract['duration_seconds']:.6f}s != "
-                f"{source_contract['duration_seconds']:.6f}s"
-            )
-        if (
-            auxiliary_contract["width"] != source_contract["width"]
-            or auxiliary_contract["height"] != source_contract["height"]
-        ):
-            mismatches.append(
-                "raster "
-                f"{auxiliary_contract['width']}x{auxiliary_contract['height']} != "
-                f"{source_contract['width']}x{source_contract['height']}"
-            )
-
-        if mismatches:
-            conflicts.append(
-                f"{token} self-scoped alignment does not match {source_token}: "
-                + "; ".join(mismatches)
-                + ". Matched-bundle authority is disabled; the source remains independently usable."
-            )
-            reports.append(
-                f"{token} alignment = NOT MATCHED / "
-                + "; ".join(mismatches)
-                + " / independent source use remains available"
-            )
-            continue
-
-        reports.append(
-            f"{token} Picker slot contract = MATCHED against {source_token} / "
-            f"{auxiliary_contract['frame_count']} decoded frames / "
-            f"{auxiliary_contract['fps']:g} FPS / "
-            f"{auxiliary_contract['duration_seconds']:.6f} seconds / "
-            f"{auxiliary_contract['width']}x{auxiliary_contract['height']} / "
-            f"source indices 0-{auxiliary_contract['frame_count'] - 1} / "
-            + ("legacy explicit bundle provenance / " if legacy_primary else "")
-            + "this contract records the verified match; a changed downstream file remains "
-            "independently usable but loses matched-bundle authority"
-        )
-    return reports, conflicts
-
-
-def _video_role_line(
-    item: Dict[str, Any],
-    seq: int,
-    active_images: List[Dict[str, Any]] | None = None,
-    control_only_bindings: List[Dict[str, Any]] | None = None,
-) -> str:
-    token = f"@video{seq}"
-    st = _effective_video_source_type(item)
-    role = _effective_video_role(item)
-    image_links = _video_reverse_bindings(active_images or [], seq)
-    control_links = [
-        _format_control_only_binding(entry)
-        for entry in _control_bindings_for_video(control_only_bindings or [], seq)
-    ]
-    self_scoped = (
-        _self_scoped_auxiliary_reference(item, seq)
-        if not image_links and not control_links
-        else None
-    )
-    if self_scoped:
-        lines = [
-            f"{token} = {st} / {role or 'Unspecified optional role'} / Binding Mode = Recognized self-scoped full-shot reference",
-            f"{token} self-scoped reference = Reference Domain = Current shot / Boundary = Full shot / "
-            f"Fields = {self_scoped['fields']} / Time Mapping = {self_scoped['time_mapping']} / "
-            f"Authority = {self_scoped['authority']}",
-            f"{token} default role interpretation is advisory; an explicit current user goal governs "
-            "broader, narrower, or different use of the supplied source.",
-        ]
-    elif role == "Primary Unified Shot Control":
-        lines = [
-            f"{token} = {st} / {role} / Target = Current shot / "
-            "Control Boundary = Full shot / Authority comes from the explicitly supplied role"
-        ]
-    else:
-        lines = [
-            f"{token} = {st} / {role or 'Unspecified optional role'} / "
-            "Exact local bindings add Target + Control Boundary when supplied; their absence does not "
-            "limit use of this source for the current user goal"
-        ]
-    if st == "Maya Preview / Playblast":
-        lines.append(
-            f"{token} Color Playblast scope = directly usable alone, with an optional Motion Guide, "
-            "or with any other supplied source according to the user goal / Proxy marker colors and "
-            "temporary Maya materials = default tracking/control labels; they do not by themselves establish "
-            "final appearance, while the explicit current user goal governs intended spatial, motion, timing, "
-            "visibility, and other use / "
-            "Image bindings and PROJECT_STYLE_LOOK add their declared authority only when supplied; "
-            "their absence creates no dependency"
-        )
-    if image_links:
-        lines.append(f"{token} image-derived control bindings = " + "; ".join(image_links))
-    if control_links:
-        lines.append(f"{token} control-only bindings = " + "; ".join(control_links))
-    if (
-        not image_links
-        and not control_links
-        and not self_scoped
-        and role != "Primary Unified Shot Control"
-    ):
-        lines.append(
-            f"{token} local control binding = not supplied; use the supplied source for the user goal "
-            "without inventing a Target, boundary, or missing semantic field"
-        )
-    return "\n".join(lines)
-
-
-def _motion_guide_semantic_summary_line(
-    item: Dict[str, Any],
-    seq: int,
-) -> str:
-    summary = _normalize_picker_motion_guide_summary(
-        item.get("picker_motion_guide_summary")
-    )
-    if not summary:
-        return ""
-    if not summary["semantic_face"]:
-        return (
-            f"@video{seq} verified Motion Guide profile = "
-            f"{summary['profile']} / semantic face data = unavailable / "
-            "the motion source remains independently usable"
-        )
-    groups = ", ".join(summary["semantic_groups"]) or "none"
-    return (
-        f"@video{seq} verified semantic face summary = "
-        f"{summary['target_count']} target(s) / "
-        f"{summary['channel_count']} final Blend Shape channel(s) / "
-        f"{summary['driver_count']} connected numeric curve driver(s) / "
-        f"{summary['landmark_count']} surface-pinned landmark(s) / "
-        f"groups {groups} / "
-        f"{summary['rasterized_sample_count']} visible raster sample(s) / "
-        f"{summary['hidden_or_occluded_sample_count']} sidecar-only hidden or "
-        "occluded sample(s) / raw NURBS curve geometry is never rendered"
-    )
-
-def _authority_scope(value: Any, fallback: str) -> str:
-    return _clean_string(value) or fallback
-
-
-def _canonical_authority_domain(source_type: str, scope: str) -> tuple[str, int, str, str]:
-    """Return canonical function, rank, label, and comparison scope.
-
-    Equivalent functions reached through different Main Type paths must land in
-    the same domain. Broad combined references use a lower rank than dedicated
-    single-function sources for the same exact Target.
-    """
-    source_type = _clean_string(source_type)
-    scope = _clean_string(scope)
-
-    exact_scope_map = {
-        "Full body / full appearance": ("character_appearance", 300, "approved final character appearance", "full body / full appearance"),
-        "Head / face only": ("head_face", 400 if source_type == "Partial Character Detail" else 300, "head / face", "head / face"),
-        "Eye / expression detail": ("eye_expression", 400, "eye / expression detail", "eye / expression detail"),
-        "Eyes / iris / pupil detail": ("eyes_iris_pupil", 400, "eyes / iris / pupil detail", "eyes / iris / pupil detail"),
-        "Hand / foot / body part detail": ("body_part_detail", 400, "hand / foot / body part detail", "hand / foot / body part detail"),
-        "Hair / fur detail": ("hair_fur_detail", 400, "hair / fur detail", "hair / fur detail"),
-        "Costume detail": ("costume_detail", 400, "costume detail", "costume detail"),
-        "Full outfit / complete costume": ("complete_costume", 300, "full outfit / complete costume", "full outfit / complete costume"),
-        "Handheld prop": ("handheld_prop", 300, "handheld prop", "handheld prop"),
-        "Attached accessory": ("attached_accessory", 300, "attached accessory", "attached accessory"),
-        "Interactive scene prop": ("interactive_scene_prop", 300, "interactive scene prop", "interactive scene prop"),
-        "Independent scene prop": ("independent_scene_prop", 300, "independent scene prop", "independent scene prop"),
-        "Main background": ("environment_background", 300, "main environment / background", "main background"),
-        "Sky / exterior area": ("sky_exterior", 300, "sky / exterior background", "sky / exterior area"),
-        "Set geometry / structure only": ("set_structure", 300, "set geometry / structure", "set geometry / structure"),
-        "Ground / floor": ("ground_floor", 300, "ground / floor", "ground / floor"),
-        "Foreground element": ("foreground_element", 300, "foreground element", "foreground element"),
-        "Color mood only": ("color_mood", 300, "color mood", "assigned target function"),
-        "Lighting mood only": ("lighting_mood", 300, "lighting mood", "assigned target function"),
-        "Render look only": ("render_look", 300, "render look", "assigned target function"),
-        "Scale only": ("scale", 300, "scale", "assigned target function"),
-        "Composition only": ("composition", 300, "composition", "assigned target function"),
-    }
-    if scope in exact_scope_map:
-        return exact_scope_map[scope]
-
-    if scope == "All color + look + lighting functions":
-        return ("combined_look", 200, "combined color / look / lighting", "assigned target function")
-    if scope == "Scale + composition":
-        return ("scale_composition", 200, "scale + composition", "assigned target function")
-
-    if scope and scope != "unspecified scope":
-        key = re.sub(r"\s+", " ", scope.casefold()).strip()
-        return (f"custom_scope:{key}", 300, scope, scope)
-
-    mapping = {
-        "Character Appearance": ("character_appearance", 300, "approved final character appearance", "unspecified character appearance"),
-        "Partial Character Detail": ("character_detail", 400, "partial character detail", "unspecified character detail"),
-        "Prop / Accessory": ("prop_accessory", 300, "prop / accessory design", "unspecified prop / accessory"),
-        "Costume / Clothing": ("costume_clothing", 300, "costume / clothing", "unspecified costume"),
-        "Environment / Background": ("environment_background", 300, "environment / background", "unspecified environment"),
-        "Sky / Exterior Background": ("sky_exterior", 300, "sky / exterior background", "unspecified sky / exterior"),
-        "Set / Structure": ("set_structure", 300, "set / structure", "unspecified set / structure"),
-        "Foreground / Ground": ("foreground_ground", 300, "foreground / ground", "unspecified foreground / ground"),
-        "Color / Look Reference": ("color_look", 300, "color / look", "assigned target function"),
-        "Color + Look + Lighting Mood Reference": ("combined_look", 200, "combined color / look / lighting", "assigned target function"),
-        "Lighting / Atmosphere Reference": ("lighting_mood", 300, "lighting / atmosphere", "assigned target function"),
-        "Scale / Composition Reference": ("scale_composition", 300, "scale / composition", "assigned target function"),
-        "Custom": ("custom_image_role", 300, "custom image role", "unspecified custom scope"),
-    }
-    return mapping.get(source_type, ("unspecified_image_role", 0, "unspecified image role", "unspecified scope"))
-
-
-def _image_authority_entries(item: Dict[str, Any], seq: int) -> List[tuple]:
-    token = f"@image{seq}"
-    source_type_choice = _clean_string(item.get("source_type"))
-    target = _effective_target(item, f"image {seq}")
-    entries: List[tuple] = []
-    for binding in _image_binding_entries(item):
-        scope = _authority_scope(binding["scope"], "unspecified scope")
-        domain, rank, label, comparison_scope = _canonical_authority_domain(source_type_choice, scope)
-        if source_type_choice == "Custom":
-            custom_main = re.sub(r"\s+", " ", _effective_image_source_type(item).casefold()).strip()
-            custom_scope = re.sub(r"\s+", " ", scope.casefold()).strip()
-            domain = f"custom_main_type:{custom_main}"
-            comparison_scope = f"custom_scope:{custom_scope}"
-            label = _effective_image_source_type(item)
-        if scope == "All color + look + lighting functions":
-            for sub_domain, sub_label in (("color_mood", "color mood"), ("render_look", "render look"), ("lighting_mood", "lighting mood")):
-                entries.append((sub_domain, target, comparison_scope, 200, token, sub_label))
-        elif scope == "Scale + composition":
-            for sub_domain, sub_label in (("scale", "scale"), ("composition", "composition")):
-                entries.append((sub_domain, target, comparison_scope, 200, token, sub_label))
-        else:
-            entries.append((domain, target, comparison_scope, rank, token, label))
-    return entries
-
-def _description_source_reference_conflicts(
-    label: str,
-    value: Any,
-    active_image_slots: set[int],
-    active_video_slots: set[int],
-) -> List[str]:
-    conflicts: List[str] = []
-    for prefix, number in re.findall(r"@(image|video)(\d+)", _clean_string(value), flags=re.IGNORECASE):
-        slot = int(number)
-        if prefix.lower() == "image" and slot not in active_image_slots:
-            conflicts.append(
-                f"{label} references currently unsupplied @image{slot}; retain the address as immediately "
-                "usable user intent, with the current goal governing how it is resolved."
-            )
-        elif prefix.lower() == "video" and slot not in active_video_slots:
-            conflicts.append(
-                f"{label} references currently unsupplied @video{slot}; retain the address as immediately "
-                "usable user intent, with the current goal governing how it is resolved."
-            )
-    return conflicts
-
-
-def _find_source_authority_conflicts(
-    active_images: List[Dict[str, Any]],
-    active_videos: List[Dict[str, Any]],
-    descriptive_fields: Dict[str, Any] | None = None,
-    frame_metadata: Any = None,
-) -> List[str]:
-    groups: Dict[tuple, List[tuple]] = {}
-    conflicts: List[str] = []
-    descriptive_fields = descriptive_fields if isinstance(descriptive_fields, dict) else {}
-    active_image_slots = {int(item.get("slot") or 1) for item in active_images}
-    active_video_slots = {int(item.get("slot") or 1) for item in active_videos}
-    active_names = [_clean_string(item.get("label")) for item in active_images if _clean_string(item.get("label"))]
-    control_only_bindings, _control_binding_notes = _parse_control_only_bindings(descriptive_fields)
-    allowed_control_targets = set(active_names) | set(IMAGE_SYSTEM_TARGETS)
-    for entry in control_only_bindings:
-        token = f"{entry['field']} control-only binding line {entry['line']}"
-        if int(entry["video"]) not in active_video_slots:
-            conflicts.append(
-                f"{token} references currently unsupplied @video{entry['video']}; the tuple remains "
-                "immediately usable under the current user goal without a slot prerequisite."
-            )
-        if entry["target"] not in allowed_control_targets:
-            conflicts.append(
-                f"{token} uses a user-defined Target outside the current suggestions; preserve it exactly "
-                "and apply it according to the current user goal."
-            )
-        for key in ("target", "function", "marker", "boundary"):
-            if len(_clean_string(entry.get(key))) > MAX_IDENTIFIER_CHARS:
-                conflicts.append(f"{token} {key} exceeds {MAX_IDENTIFIER_CHARS} characters.")
-    duplicate_names = sorted({name for name in active_names if active_names.count(name) > 1})
-    for name in duplicate_names:
-        conflicts.append(
-            f"Image Name {name!r} appears in multiple slots; each source remains distinct by its @image token."
-        )
-
-    full_appearance_targets: set[str] = set()
-    for item in active_images:
-        if _clean_string(item.get("source_type")) != "Character Appearance":
-            continue
-        scopes = {_clean_string(entry.get("scope")) for entry in _image_binding_entries(item)}
-        if "Full body / full appearance" in scopes:
-            full_appearance_targets.add(_effective_target(item, ""))
-
-    for item in active_images:
-        seq = int(item.get("slot") or 1)
-        token = f"@image{seq}"
-        source_type = _clean_string(item.get("source_type"))
-        name = _clean_string(item.get("label"))
-        owner_choice = _clean_string(item.get("owner"))
-        effective_target = _effective_target(item, "")
-
-        if len(name) > MAX_IDENTIFIER_CHARS:
-            conflicts.append(f"{token} Name exceeds {MAX_IDENTIFIER_CHARS} characters.")
-        if len(_clean_string(item.get("custom_source_type"))) > MAX_IDENTIFIER_CHARS:
-            conflicts.append(f"{token} Custom Main Type exceeds {MAX_IDENTIFIER_CHARS} characters.")
-        if owner_choice and owner_choice not in _image_target_choices_for_row(item, active_images):
-            conflicts.append(
-                f"{token} Target is outside the current suggestions; preserve the supplied Target and let "
-                "the user goal govern its interpretation."
-            )
-        if len(owner_choice) > MAX_IDENTIFIER_CHARS:
-            conflicts.append(f"{token} Target exceeds {MAX_IDENTIFIER_CHARS} characters.")
-
-        for entry in _image_binding_entries(item):
-            if len(_clean_string(entry.get("custom_scope"))) > MAX_IDENTIFIER_CHARS:
-                conflicts.append(f"{token} binding {entry['index'] + 1} Custom scope exceeds {MAX_IDENTIFIER_CHARS} characters.")
-            if entry["color"] and entry["marker_video"] not in active_video_slots:
-                conflicts.append(
-                    f"{token} binding {entry['index'] + 1} names currently unsupplied "
-                    f"@video{entry['marker_video']} / {entry['color']}; retain it as immediately usable "
-                    "user intent without a slot prerequisite."
-                )
-            allowed_colors = _color_pick_choices_for_source_type(source_type)
-            if entry["color"] and entry["color"] not in allowed_colors:
-                conflicts.append(
-                    f"{token} binding {entry['index'] + 1} uses {entry['color']} outside the current "
-                    f"suggested palette for {source_type or 'an unselected Main Type'}; preserve the marker "
-                    "as supplied."
-                )
-
-        for domain, target, scope, rank, authority_token, label in _image_authority_entries(item, seq):
-            groups.setdefault((domain, target, scope), []).append((rank, authority_token, label))
-
-    auxiliary_groups: Dict[tuple[str, str, str], List[str]] = {}
-    for item in active_videos:
-        seq = int(item.get("slot") or 1)
-        token = f"@video{seq}"
-        source_type = _clean_string(item.get("source_type"))
-        role = _clean_string(item.get("control_role"))
-        name = _clean_string(item.get("label"))
-
-        if len(name) > MAX_IDENTIFIER_CHARS:
-            conflicts.append(f"{token} Name exceeds {MAX_IDENTIFIER_CHARS} characters.")
-        if len(_clean_string(item.get("custom_source_type"))) > MAX_IDENTIFIER_CHARS:
-            conflicts.append(f"{token} Custom Main Type exceeds {MAX_IDENTIFIER_CHARS} characters.")
-        if len(_clean_string(item.get("custom_control_role"))) > MAX_IDENTIFIER_CHARS:
-            conflicts.append(f"{token} Custom Role exceeds {MAX_IDENTIFIER_CHARS} characters.")
-        if source_type in VIDEO_ROLE_COMPATIBILITY and role and role not in VIDEO_ROLE_COMPATIBILITY[source_type]:
-            conflicts.append(
-                f"{token} uses an uncommon video Main Type / Video Sub Type pair: {source_type} / {role}; "
-                "preserve both values and let the user goal govern their combined use."
-            )
-        reverse_bindings = _video_reverse_binding_entries(active_images, seq)
-        control_bindings = _control_bindings_for_video(control_only_bindings, seq)
-        self_scoped = (
-            _self_scoped_auxiliary_reference(item, seq)
-            if not reverse_bindings and not control_bindings
-            else None
-        )
-        # Exact local/reverse bindings retain their historical auxiliary-slot
-        # treatment. Self-scoped full-shot roles are slot-agnostic because a
-        # selected Depth or Motion Guide can legitimately be @video1.
-        if seq > 1:
-            for binding in reverse_bindings:
-                auxiliary_groups.setdefault(
-                    (_effective_video_role(item), binding["target"], binding["scope"]),
-                    [],
-                ).append(token)
-            for binding in control_bindings:
-                auxiliary_groups.setdefault(
-                    (_effective_video_role(item), binding["target"], binding["boundary"]),
-                    [],
-                ).append(token)
-        if self_scoped and self_scoped["authority_domain"] != "descriptive_context":
-            auxiliary_groups.setdefault(
-                (self_scoped["authority_domain"], "Current shot", "Full shot"),
-                [],
-            ).append(token)
-        if len(_clean_string(item.get("keep_out"))) > MAX_KEEP_OUT_CHARS:
-            conflicts.append(f"{token} Keep Out exceeds {MAX_KEEP_OUT_CHARS} characters.")
-
-    for (role, target, scope), tokens in auxiliary_groups.items():
-        unique_tokens = list(dict.fromkeys(tokens))
-        if len(unique_tokens) > 1:
-            conflicts.append(
-                f"{', '.join(unique_tokens)} describe overlapping auxiliary authority for {target} / "
-                f"{scope} / {role}; preserve all supplied sources and let the user goal govern the combination."
-            )
-
-    _alignment_reports, alignment_conflicts = _self_scoped_alignment_evaluation(
-        active_images,
-        active_videos,
-        control_only_bindings,
-        frame_metadata,
-    )
-    conflicts.extend(alignment_conflicts)
-
-    used_markers: Dict[tuple[int, str], str] = {}
-    for item in active_images:
-        seq = int(item.get("slot") or 1)
-        for entry in _image_binding_entries(item):
-            color = _clean_string(entry.get("color"))
-            if not color:
-                continue
-            key = (int(entry.get("marker_video") or 1), color)
-            token = f"@image{seq} binding {int(entry.get('index') or 0) + 1}"
-            if key in used_markers:
-                conflicts.append(f"{token} duplicates {used_markers[key]} at @video{key[0]} / {color}.")
-            else:
-                used_markers[key] = token
-
-    for entry in control_only_bindings:
-        marker = _clean_string(entry.get("marker"))
-        if not marker:
-            continue
-        key = (int(entry.get("video") or 1), marker)
-        token = f"{entry['field']} control-only binding line {entry['line']}"
-        if key in used_markers:
-            conflicts.append(
-                f"{token} overlaps {used_markers[key]} at @video{key[0]} / {marker}; preserve both supplied "
-                "bindings and let the user goal govern their combination."
-            )
-        else:
-            used_markers[key] = token
-
-    for field_name in TEXT_FIELD_NAMES:
-        value = _clean_string(descriptive_fields.get(field_name))
-        field_limit = MAX_VIDEO_VFX_CHARS if field_name == "VIDEO_VFX" else MAX_DESCRIPTION_CHARS
-        if len(value) > field_limit:
-            conflicts.append(f"{field_name} exceeds {field_limit} characters.")
-        conflicts.extend(_description_source_reference_conflicts(field_name, value, active_image_slots, active_video_slots))
-    for item in active_videos:
-        seq = int(item.get("slot") or 1)
-        conflicts.extend(_description_source_reference_conflicts(f"@video{seq} Keep Out", item.get("keep_out"), active_image_slots, active_video_slots))
-
-    seen = set()
-    for (domain, target, scope), entries in groups.items():
-        max_rank = max(rank for rank, _token, _label in entries)
-        highest = [(token, label) for rank, token, label in entries if rank == max_rank]
-        unique_tokens = list(dict.fromkeys(token for token, _label in highest))
-        labels = list(dict.fromkeys(label for _token, label in highest))
-        if len(unique_tokens) < 2:
-            continue
-        signature = (tuple(unique_tokens), target, scope, tuple(labels))
-        if signature in seen:
-            continue
-        seen.add(signature)
-        conflicts.append(
-            f"{', '.join(unique_tokens)} describe overlapping image authority for {target} / "
-            f"{' / '.join(labels)} / {scope}; preserve all supplied sources and let the user goal govern "
-            "their combination."
-        )
-    return list(dict.fromkeys(conflicts))
 
 def _picker_input_kwargs() -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {
         "name": PICKER_INPUT_PARAMETER_NAME,
-        "tooltip": "Connect HMBVideoPickerLibrary PICKER_OUT to add available video slots, decoded metadata, generated paths, and Asset ID-to-Image Name Color Pick relationships. Other readable connected values are retained as ordinary prompt intent. Every source and every user Target remains independently usable. Missing companions, slots, metadata, Color Picks, or local bindings are optional and never block Prompt output. Explicit Picker companion provenance alone activates cross-file bundle integrity checks.",
+        "tooltip": "Connect HMBVideoPickerLibrary PICKER_OUT to add allowlisted typed video slots, frame domains, generated-media provenance, and Asset ID-to-Image Name Color Pick relationships. Unrecognized connected values and transport metadata are not promoted to USER DESCRIPTION DATA or creative authority. Every source and every user Target remains independently usable. Missing companions, slots, metadata, Color Picks, or local bindings are optional and never block Prompt output. Explicit Picker companion provenance alone activates cross-file bundle integrity checks.",
         "default_value": "",
         "type": "str",
         "input_types": ["any"],
@@ -3521,7 +2704,8 @@ def _image_asset_input_kwargs() -> Dict[str, Any]:
             "asset; Target receives a Main-Type default and remains editable. "
             "IMAGE_IMPORT_IN sources provide only Image Name and generator order. "
             "Color Pick and custom ideas remain editable and available to the current goal. "
-            "Other readable connected values are retained as ordinary prompt intent."
+            "Unrecognized connected values and transport metadata are omitted from "
+            "typed Prompt data and never promoted to USER DESCRIPTION DATA or authority."
         ),
         "default_value": "",
         "type": "str",
@@ -3624,20 +2808,10 @@ def _parse_connected_payload(value: Any, source_name: str) -> Dict[str, Any]:
     try:
         payload = json.loads(text)
     except Exception:
-        entry = _source_intent_entry(
-            source_name,
-            "readable non-JSON connected input",
-            value,
-        )
-        return {_UNSTRUCTURED_INPUT_KEY: [entry] if entry else []}
+        return {}
     if isinstance(payload, dict):
         return payload
-    entry = _source_intent_entry(
-        source_name,
-        "readable non-object connected input",
-        payload,
-    )
-    return {_UNSTRUCTURED_INPUT_KEY: [entry] if entry else []}
+    return {}
 
 
 def _parse_picker_payload(value: Any) -> Dict[str, Any]:
@@ -3881,19 +3055,11 @@ def _apply_image_asset_payload(
         )
     )
     if payload and (payload_has_foreign_identity or not payload_has_asset_identity):
-        _append_source_intent(
+        _append_unconsumed_connected_fields(
             normalized,
             IMAGE_ASSET_INPUT_PARAMETER_NAME,
-            (
-                "foreign mode or schema retained as ordinary user intent"
-                if payload_has_foreign_identity
-                else "readable connected object retained as ordinary user intent"
-            ),
-            {
-                key: value
-                for key, value in payload.items()
-                if key != _UNSTRUCTURED_INPUT_KEY
-            },
+            payload,
+            frozenset(),
         )
         previous = normalized.get("image_asset")
         if isinstance(previous, dict):
@@ -4052,7 +3218,7 @@ def _apply_image_asset_payload(
             IMAGE_ASSET_INPUT_PARAMETER_NAME,
             (
                 f"image row {overflow_index} exceeds the structured "
-                f"@image1 through @image{MAX_IMAGES} capacity and remains ordinary intent"
+                f"@image1 through @image{MAX_IMAGES} capacity and is omitted"
             ),
             overflow_row,
         )
@@ -4066,7 +3232,7 @@ def _apply_image_asset_payload(
                 IMAGE_ASSET_INPUT_PARAMETER_NAME,
                 (
                     f"verified asset row {overflow_index} exceeds the structured "
-                    f"@image1 through @image{MAX_IMAGES} capacity and remains ordinary intent"
+                    f"@image1 through @image{MAX_IMAGES} capacity and is omitted"
                 ),
                 overflow_row,
             )
@@ -4211,7 +3377,7 @@ def _apply_image_asset_payload(
             _append_source_intent(
                 normalized,
                 IMAGE_ASSET_INPUT_PARAMETER_NAME,
-                f"image row {selection_order} lacks a structured address but remains ordinary intent",
+                f"image row {selection_order} lacks a structured address and is omitted",
                 raw,
             )
             continue
@@ -4222,7 +3388,7 @@ def _apply_image_asset_payload(
             _append_source_intent(
                 normalized,
                 IMAGE_ASSET_INPUT_PARAMETER_NAME,
-                f"duplicate image row {selection_order} retained as ordinary intent",
+                f"duplicate image row {selection_order} is omitted",
                 raw,
             )
             continue
@@ -5633,19 +4799,11 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
         )
     )
     if payload and (payload_has_foreign_identity or not payload_has_picker_identity):
-        _append_source_intent(
+        _append_unconsumed_connected_fields(
             normalized,
             PICKER_INPUT_PARAMETER_NAME,
-            (
-                "foreign mode or schema retained as ordinary user intent"
-                if payload_has_foreign_identity
-                else "readable connected object retained as ordinary user intent"
-            ),
-            {
-                key: value
-                for key, value in payload.items()
-                if key != _UNSTRUCTURED_INPUT_KEY
-            },
+            payload,
+            frozenset(),
         )
         if isinstance(previous_picker, dict):
             previous_picker["enabled"] = bool(
@@ -5715,7 +4873,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
         if uid_order_managed and item.get("selected") is False:
             error = (
                 f"PICKER_OUT UID-managed video row {video_index} is not selected; "
-                "the row remains ordinary intent."
+                "the row is omitted from typed Prompt data."
             )
             rejected_video_contract_errors.append(error)
             _append_source_intent(
@@ -5729,7 +4887,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             has_readable_unstructured_video_rows = True
             error = (
                 f"PICKER_OUT UID-managed video row {video_index} has no video_uid; "
-                "the row remains ordinary intent."
+                "the row is omitted from typed Prompt data."
             )
             rejected_video_contract_errors.append(error)
             _append_source_intent(
@@ -5742,7 +4900,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
         if item_uid and item_uid in accepted_payload_uids:
             error = (
                 f"PICKER_OUT contains an additional row for video_uid {item_uid}; "
-                "the first valid row remains structured and this row remains ordinary intent."
+                "the first valid row remains structured and this row is omitted."
             )
             rejected_video_contract_errors.append(error)
             _append_source_intent(
@@ -5759,7 +4917,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
                 has_readable_unstructured_video_rows = True
                 error = (
                     f"PICKER_OUT video row {video_index} has an invalid video_slot; "
-                    "the row remains ordinary intent."
+                    "the row is omitted from typed Prompt data."
                 )
                 rejected_video_contract_errors.append(error)
                 _append_source_intent(
@@ -5773,7 +4931,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
                 has_readable_unstructured_video_rows = True
                 error = (
                     f"PICKER_OUT video_slot {raw_slot} is outside @video1 through "
-                    f"@video{MAX_VIDEOS}; the row remains ordinary intent."
+                    f"@video{MAX_VIDEOS}; the row is omitted."
                 )
                 rejected_video_contract_errors.append(error)
                 _append_source_intent(
@@ -5786,7 +4944,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             if raw_slot in accepted_payload_slots:
                 error = (
                     f"PICKER_OUT contains an additional row for @video{raw_slot}; "
-                    "the first valid row remains structured and this row remains ordinary intent."
+                    "the first valid row remains structured and this row is omitted."
                 )
                 rejected_video_contract_errors.append(error)
                 _append_source_intent(
@@ -5804,7 +4962,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             _append_source_intent(
                 normalized,
                 PICKER_INPUT_PARAMETER_NAME,
-                f"video row {video_index} without concrete media retained as ordinary intent",
+                f"video row {video_index} without concrete media is omitted",
                 item,
             )
     if uid_order_managed:
@@ -5992,6 +5150,10 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             )
         candidate_slot = max(1, min(MAX_VIDEOS, raw_slot))
         raw_slot_counts[candidate_slot] = raw_slot_counts.get(candidate_slot, 0) + 1
+        picker_contract_errors.extend(
+            f"@video{candidate_slot} {error}."
+            for error in _video_reference_transport_errors(raw_video)
+        )
         if _picker_video_claims_generated_depth(
             raw_video,
             candidate_slot,
@@ -6091,7 +5253,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             _append_source_intent(
                 normalized,
                 PICKER_INPUT_PARAMETER_NAME,
-                f"marker row {order_index} without a structured color retained as ordinary intent",
+                f"marker row {order_index} without a structured color is omitted",
                 raw,
             )
             continue
@@ -6107,7 +5269,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             _append_source_intent(
                 normalized,
                 PICKER_INPUT_PARAMETER_NAME,
-                f"marker row {order_index} has an invalid video_slot and remains ordinary intent",
+                f"marker row {order_index} has an invalid video_slot and is omitted",
                 raw,
             )
             continue
@@ -6117,7 +5279,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
                 PICKER_INPUT_PARAMETER_NAME,
                 (
                     f"marker row {order_index} targets @video{video_slot}, outside "
-                    f"@video1 through @video{MAX_VIDEOS}, and remains ordinary intent"
+                    f"@video1 through @video{MAX_VIDEOS}, and is omitted"
                 ),
                 raw,
             )
@@ -6236,7 +5398,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
         except Exception:
             error = (
                 f"frame metadata row {metadata_index} has an invalid video_slot and "
-                "remains ordinary intent"
+                "is omitted"
             )
             picker_contract_errors.append(error)
             _append_source_intent(
@@ -6249,7 +5411,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
         if metadata_slot < 1 or metadata_slot > MAX_VIDEOS:
             error = (
                 f"frame metadata row {metadata_index} targets @video{metadata_slot}, outside "
-                f"@video1 through @video{MAX_VIDEOS}, and remains ordinary intent"
+                f"@video1 through @video{MAX_VIDEOS}, and is omitted"
             )
             picker_contract_errors.append(error)
             _append_source_intent(
@@ -6262,7 +5424,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
         if metadata_slot in seen_frame_metadata_slots:
             error = (
                 f"frame metadata row {metadata_index} duplicates @video{metadata_slot}; "
-                "the first valid row remains structured and this row remains ordinary intent"
+                "the first valid row remains structured and this row is omitted"
             )
             picker_contract_errors.append(error)
             _append_source_intent(
@@ -6336,6 +5498,9 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             video_item["picker_companion_source_slot"] = -1
             video_item["picker_companion_source_uid"] = ""
             video_item["picker_companion_validated"] = False
+            video_item["reference_capabilities"] = {}
+            video_item["frame_domain"] = {}
+            video_item["timing_cues"] = []
             video_item["manual"] = True
     for slot in payload_slots:
         if (
@@ -6359,6 +5524,17 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
         video_item = videos[slot - 1]
         if _clean_string(video_item.get("source_type")) == "Ignore / Unused":
             continue
+        video_item["reference_capabilities"] = (
+            _normalize_video_reference_capabilities(
+                raw_video.get("reference_capabilities")
+            )
+        )
+        video_item["frame_domain"] = _normalize_video_frame_domain(
+            raw_video.get("frame_domain")
+        )
+        video_item["timing_cues"] = _normalize_video_timing_cues(
+            raw_video.get("timing_cues")
+        )
         row_uid = _picker_video_uid(raw_video)
         if row_uid:
             video_item["video_uid"] = row_uid
@@ -6727,7 +5903,7 @@ def _add_widget_state_parameter(node: Any) -> None:
         return
     kwargs: Dict[str, Any] = {
         "name": WIDGET_PARAMETER_NAME,
-        "tooltip": "HMB_GP_Production additive source-binding dashboard. Supplied Image Target, Sub Type, video role, Color Pick, and optional local bindings add authority without making another source or slot mandatory. Missing semantic fields remain unspecified. Explicit Picker companion provenance alone activates cross-file bundle integrity checks.",
+        "tooltip": "HMB source, role, target, marker, range, and user-text dashboard.",
         "default_value": _json_dumps(_default_widget_state()),
         "type": "str",
         "input_types": [],
@@ -6789,12 +5965,17 @@ def _frame_range_binding_validation(
     state: Dict[str, Any],
     item: Dict[str, Any],
     active_video_slots: set[int] | None = None,
+    binding_override: Dict[str, Any] | None = None,
 ) -> tuple[Dict[str, Any] | None, Dict[str, Any] | None, List[str]]:
     errors: List[str] = []
     if not bool(item.get("frame_range_enabled")):
         return None, None, errors
 
-    binding = _current_frame_range_binding(item)
+    binding = (
+        dict(binding_override)
+        if isinstance(binding_override, dict)
+        else _current_frame_range_binding(item)
+    )
     if not binding:
         errors.append(
             "Optional frame-range instruction ignored: select a Video and Color Pick to define it."
@@ -6868,6 +6049,7 @@ def _frame_range_binding_validation(
         )
     minimum = int(metadata.get("start_frame"))
     maximum = int(metadata.get("end_frame"))
+    valid_ranges: List[Dict[str, int]] = []
     for frame_range in ranges:
         start = int(frame_range.get("start") or 0)
         end = int(frame_range.get("end") or 0)
@@ -6877,11 +6059,13 @@ def _frame_range_binding_validation(
             errors.append(
                 f"Frame range {start}–{end} is outside @video{slot} Frames {minimum}–{maximum}."
             )
+        else:
+            valid_ranges.append({"start": start, "end": end})
     binding = {
         **binding,
         "video_slot": f"@video{slot}",
         "color_pick": color,
-        "ranges": ranges,
+        "ranges": valid_ranges,
     }
     return binding, metadata, errors
 
@@ -6897,370 +6081,598 @@ def _valid_frame_range_bindings(
     }
     out: List[tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]] = []
     for item in active_images:
-        binding, metadata, errors = _frame_range_binding_validation(
-            state,
-            item,
-            active_video_slots,
-        )
-        if binding is not None and metadata is not None and not errors:
-            out.append((item, binding, metadata))
+        for active_binding in _active_frame_range_bindings(item):
+            binding, metadata, errors = _frame_range_binding_validation(
+                state,
+                item,
+                active_video_slots,
+                active_binding,
+            )
+            error_codes = set(_frame_range_error_codes(errors))
+            segment_only_errors = {
+                "segment_order_invalid", "segment_out_of_domain"
+            }
+            if (
+                binding is not None
+                and metadata is not None
+                and bool(binding.get("ranges"))
+                and error_codes.issubset(segment_only_errors)
+            ):
+                out.append((item, binding, metadata))
     return out
 
 
-def _prompt_section_end(lines: List[str], start: int) -> int:
-    """Return the first following production section header or EOF."""
-    for index in range(start + 1, len(lines)):
-        text = _clean_string(lines[index])
-        if text and text.endswith(":") and re.fullmatch(r"[A-Z0-9][A-Z0-9 /_+()@.-]*:", text):
-            return index
-    return len(lines)
+def _control_binding_timing_cues(
+    entries: List[Dict[str, Any]], video_slot: int
+) -> List[Dict[str, Any]]:
+    """Translate an exact manual emitter binding into the typed cue shape."""
 
-
-def _compile_prompt_with_budget(lines: List[str]) -> str:
-    """Compact generated diagnostics without truncating canonical user intent.
-
-    The dashboard state and USER DESCRIPTION DATA remain untouched.  When the
-    protected user-authored payload itself exceeds the advisory budget, the
-    prompt remains over budget rather than silently deleting the user's goal.
-    """
-    working = list(lines)
-    compacted: List[str] = []
-    for header in _OPTIONAL_PROMPT_SECTION_PRIORITY:
-        prompt = "\n".join(working).strip() + "\n"
-        if len(prompt) <= MAX_PROMPT_CHARS:
-            return prompt
-        try:
-            start = working.index(header)
-        except ValueError:
+    cues: List[Dict[str, Any]] = []
+    for entry in entries:
+        if int(entry.get("video") or 0) != int(video_slot):
             continue
-        end = _prompt_section_end(working, start)
-        detail_count = sum(1 for line in working[start + 1 : end] if _clean_string(line))
-        replacement = [
-            header,
-            f"- {detail_count} generated diagnostic line(s) compacted for transport; canonical dashboard state is retained.",
-            "",
-        ]
-        working[start:end] = replacement
-        compacted.append(header[:-1])
-
-    prompt = "\n".join(working).strip() + "\n"
-    if compacted and len(prompt) <= MAX_PROMPT_CHARS:
-        return prompt
-    if len(prompt) > MAX_PROMPT_CHARS:
-        prompt += (
-            "\nPROMPT BUDGET NOTICE:\n"
-            f"- The protected user-authored payload exceeds {MAX_PROMPT_CHARS} characters. "
-            "It was preserved without truncation; generated optional diagnostics were compacted first.\n"
+        if "emitter" not in _clean_string(entry.get("function")).casefold():
+            continue
+        boundary = _clean_string(entry.get("boundary"))
+        frame_match = re.search(
+            r"\b(?:frame|f)\s*[:=#@-]?\s*([0-9]+)\b",
+            boundary,
+            re.IGNORECASE,
         )
-    return prompt
+        if frame_match is None:
+            continue
+        local_point: Dict[str, Any] = {}
+        locator_match = re.search(
+            r"\bLocator(?:\s+(?:ID|Path))?\s*=\s*([^,;]+)",
+            boundary,
+            re.IGNORECASE,
+        )
+        if locator_match is not None:
+            locator_value = _clean_string(locator_match.group(1))
+            local_point = _normalize_local_point({
+                "kind": "locator",
+                (
+                    "locator_path"
+                    if "|" in locator_value or "/" in locator_value
+                    else "locator_id"
+                ): locator_value,
+            })
+        if not local_point:
+            number = r"[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?"
+            coordinate_match = re.search(
+                rf"\b(Local|Object)\s+XYZ\s*=\s*({number})\s*,\s*({number})\s*,\s*({number})\s+([A-Za-z_ ]+?)(?=\s*,\s*Frame\b|\s*;|$)",
+                boundary,
+                re.IGNORECASE,
+            )
+            if coordinate_match is not None:
+                local_point = _normalize_local_point({
+                    "kind": "coordinates",
+                    "space": coordinate_match.group(1),
+                    "unit": coordinate_match.group(5),
+                    "xyz": [
+                        float(coordinate_match.group(axis)) for axis in (2, 3, 4)
+                    ],
+                })
+        # A prose phrase such as "exact local point" is not a resolvable point.
+        if not local_point:
+            continue
+        marker_color = _clean_string(entry.get("marker"))
+        target_id = _clean_string(entry.get("target"))
+        if not marker_color or not target_id:
+            continue
+        emitter = {
+            key: value
+            for key, value in {
+                "marker_color": marker_color,
+                "subject_root": target_id,
+            }.items()
+            if value
+        }
+        if not emitter:
+            continue
+        cues.append({
+            "schema": "hmb-video-emitter-timing-cue",
+            "version": 1,
+            "cue_id": (
+                f"manual-{_clean_string(entry.get('field')).casefold()}-"
+                f"{int(entry.get('line') or 0)}"
+            ),
+            "cue_type": "emitter_point",
+            "cue_phase": "point",
+            "frame": int(frame_match.group(1)),
+            "emitter": emitter,
+            "local_point": local_point,
+            "description": boundary,
+        })
+    return _normalize_video_timing_cues(cues)
 
 
-def _build_prompt_package(state: Dict[str, Any]) -> str:
+def _fx_timing_range_segments(
+    valid_bindings: List[tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]],
+    video_slot: int,
+) -> List[Dict[str, Any]]:
+    segments: List[Dict[str, Any]] = []
+    for item, binding, _metadata in valid_bindings:
+        if _video_slot_number(binding.get("video_slot"), MAX_VIDEOS) != video_slot:
+            continue
+        image_slot = int(item.get("slot") or 1)
+        marker_color = _clean_string(binding.get("color_pick"))
+        image_source_uid = _clean_string(
+            item.get("asset_source_uid") or item.get("source_uid")
+        )
+        image_asset_id = _clean_string(item.get("asset_id"))
+        target_id = _clean_string(item.get("owner"))
+        binding_entry = next(
+            (
+                entry
+                for entry in _image_binding_entries(item)
+                if int(entry.get("marker_video") or 0) == video_slot
+                and _clean_string(entry.get("color")).casefold()
+                == marker_color.casefold()
+            ),
+            {},
+        )
+        target_scope = _clean_string(binding_entry.get("scope"))
+        ranges = (
+            binding.get("ranges")
+            if isinstance(binding.get("ranges"), list)
+            else []
+        )
+        for range_index, frame_range in enumerate(ranges, start=1):
+            start = _strict_int(frame_range.get("start"))
+            end = _strict_int(frame_range.get("end"))
+            if start is None or end is None or start > end:
+                continue
+            segment: Dict[str, Any] = {
+                "segment_id": f"image{image_slot}-video{video_slot}-{range_index}",
+                "image": f"@image{image_slot}",
+                "video": f"@video{video_slot}",
+                "marker_color": marker_color,
+                "target_id": target_id,
+                "target_scope": target_scope,
+                "start_frame": start,
+                "end_frame": end,
+            }
+            if image_source_uid:
+                segment["image_source_uid"] = image_source_uid
+            if image_asset_id:
+                segment["image_asset_id"] = image_asset_id
+            segments.append(segment)
+    return segments
+
+
+def _build_fx_timing_source_contract(
+    state: Dict[str, Any],
+    active_images: List[Dict[str, Any]],
+    active_videos: List[Dict[str, Any]],
+    control_only_bindings: List[Dict[str, Any]],
+    valid_frame_bindings: List[
+        tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]
+    ],
+) -> Dict[str, Any]:
+    """Compile typed FX/Timing source facts without policy interpretation.
+
+    The package carries source identity, user selections, validated ranges, and
+    exact emitter cues. Behavior authority and preservation rules remain solely
+    in the signed Agent policy and are never serialized into ``PROMPT_OUT``.
+    """
+
+    sources: List[Dict[str, Any]] = []
+    active_video_slots = {
+        int(item.get("slot") or 1) for item in active_videos
+    }
+    for item in active_videos:
+        source_type = _clean_string(item.get("source_type"))
+        if source_type not in {"FX Reference", "Timing / Edit Reference"}:
+            continue
+        slot = int(item.get("slot") or 1)
+        token = f"@video{slot}"
+        # Serialize the selected UI value exactly as data.  Main-Type policy
+        # meaning (including whether this role can narrow it) belongs to the
+        # signed Agent runtime, not to the Prompt compiler.
+        selected_role = _clean_string(item.get("control_role"))
+        role_selected = bool(selected_role)
+        validation_codes: List[str] = []
+
+        relevant_range_enabled = False
+        range_errors_for_source: List[str] = []
+        for image in active_images:
+            for binding in _active_frame_range_bindings(image):
+                if _video_slot_number(binding.get("video_slot"), MAX_VIDEOS) != slot:
+                    continue
+                relevant_range_enabled = True
+                _binding, _metadata, range_errors = _frame_range_binding_validation(
+                    state,
+                    image,
+                    active_video_slots,
+                    binding,
+                )
+                range_errors_for_source.extend(
+                    f"{token} image-range binding: {error}" for error in range_errors
+                )
+
+        segments = _fx_timing_range_segments(valid_frame_bindings, slot)
+        if relevant_range_enabled and not segments:
+            range_errors_for_source.append(
+                f"{token} Range ON has no valid image-source segment"
+            )
+
+        capabilities = (
+            item.get("reference_capabilities")
+            if isinstance(item.get("reference_capabilities"), dict)
+            else {}
+        )
+        transport_errors = _video_reference_transport_errors(item)
+        if transport_errors:
+            validation_codes.append("transport")
+        if capabilities:
+            if segments and capabilities.get("frame_addressable") is not True:
+                range_errors_for_source.append(
+                    f"{token} is not frame-addressable for Range ON"
+                )
+            if (
+                segments
+                and capabilities.get("image_source_frame_ranges") is not True
+            ):
+                range_errors_for_source.append(
+                    f"{token} does not support image-source frame ranges"
+                )
+
+        raw_timing_cues = _normalize_video_timing_cues(item.get("timing_cues"))
+        manual_timing_cues = _control_binding_timing_cues(
+            control_only_bindings, slot
+        )
+        emitter_binding_declared = bool(raw_timing_cues) or any(
+            int(entry.get("video") or 0) == slot
+            and "emitter" in _clean_string(entry.get("function")).casefold()
+            for entry in control_only_bindings
+        )
+        timing_cues = _normalize_video_timing_cues([
+            *raw_timing_cues,
+            *manual_timing_cues,
+        ])
+        timing_cues = [
+            cue
+            for cue in timing_cues
+            if not _video_reference_transport_errors({
+                "timing_cues": [cue],
+                "frame_domain": item.get("frame_domain"),
+            })
+        ]
+        if emitter_binding_declared and not timing_cues:
+            validation_codes.append("emitter_cue")
+        if (
+            emitter_binding_declared
+            and capabilities
+            and capabilities.get("exact_emitter_cues") is not True
+        ):
+            validation_codes.append("emitter_cue")
+
+        if range_errors_for_source:
+            validation_codes.append("range")
+        validation_codes = list(dict.fromkeys(validation_codes))
+
+        source: Dict[str, Any] = {
+            "video": token,
+            "source_type": source_type,
+            "selected_role": selected_role,
+            "role_selected": role_selected,
+            "validation_codes": validation_codes,
+            "range_on": relevant_range_enabled,
+            "range_segments": segments,
+            "emitter_binding_declared": emitter_binding_declared,
+            "timing_cues": timing_cues,
+        }
+        video_uid = _clean_string(item.get("video_uid") or item.get("source_uid"))
+        if video_uid:
+            source["video_uid"] = video_uid
+        sources.append(source)
+
+    error_records: List[Dict[str, str]] = []
+    seen_error_records: set[tuple[str, str]] = set()
+    for source in sources:
+        video = _clean_string(source.get("video"))
+        for code in source.get("validation_codes", []):
+            signature = (video, _clean_string(code))
+            if not all(signature) or signature in seen_error_records:
+                continue
+            seen_error_records.add(signature)
+            error_records.append({"video": signature[0], "code": signature[1]})
+    return {
+        "schema": FX_TIMING_CONTRACT_SCHEMA,
+        "version": FX_TIMING_CONTRACT_VERSION,
+        "valid": not error_records,
+        "errors": error_records,
+        "sources": sources,
+    }
+
+
+def _frame_range_error_codes(errors: List[str]) -> List[str]:
+    """Map internal diagnostics to stable data-only codes."""
+
+    codes: List[str] = []
+    for raw in errors:
+        error = _clean_string(raw).casefold()
+        if "does not exist as an active video source" in error:
+            code = "video_inactive"
+        elif "color pick is not selected" in error:
+            code = "marker_missing"
+        elif "conflicting or incomplete" in error:
+            code = "frame_domain_invalid"
+        elif "is not available" in error and "picker metadata" in error:
+            code = "marker_unavailable"
+        elif "start frame is not supplied" in error:
+            code = "domain_start_missing"
+        elif "end frame is not supplied" in error:
+            code = "domain_end_missing"
+        elif "start after end" in error:
+            code = "domain_order_invalid"
+        elif "no range is selected" in error:
+            code = "segment_missing"
+        elif "invalid frame range" in error:
+            code = "segment_order_invalid"
+        elif " is outside " in error:
+            code = "segment_out_of_domain"
+        elif "select a video and color pick" in error:
+            code = "binding_address_missing"
+        else:
+            code = "binding_invalid"
+        if code not in codes:
+            codes.append(code)
+    return codes
+
+
+def _nonempty_identity(values: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in values.items()
+        if value not in (None, "", [], {})
+    }
+
+
+def _public_job_data_contract(
+    state: Dict[str, Any],
+    active_images: List[Dict[str, Any]],
+    active_videos: List[Dict[str, Any]],
+    control_only_bindings: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build source, role, target, and range addresses without policy prose."""
+
+    images: List[Dict[str, Any]] = []
+    for item in active_images:
+        slot = int(item.get("slot") or 1)
+        bindings = [
+            {
+                "video": f"@video{int(entry.get('marker_video') or 1)}",
+                "marker_color": _clean_string(entry.get("color")),
+                "target_scope": _clean_string(entry.get("scope")),
+            }
+            for entry in _image_binding_entries(item)
+            if _clean_string(entry.get("color"))
+            or _clean_string(entry.get("scope"))
+        ]
+        images.append({
+            "image": f"@image{slot}",
+            "label": _clean_string(item.get("label")),
+            "source_type": _clean_string(item.get("source_type")),
+            "custom_source_type": _clean_string(item.get("custom_source_type")),
+            "target_id": _clean_string(item.get("owner")),
+            "relationship_targets": list(dict.fromkeys(
+                _clean_string(value)
+                for value in item.get("legacy_relationship_targets", [])
+                if _clean_string(value)
+            )),
+            "bindings": bindings,
+            "identity": _nonempty_identity({
+                "asset_id": _clean_string(item.get("asset_id")),
+                "asset_library_id": _clean_string(item.get("asset_library_id")),
+                "source_uid": _clean_string(
+                    item.get("asset_source_uid") or item.get("source_uid")
+                ),
+                "project_uid": _clean_string(item.get("asset_project_uid")),
+                "selection_order": int(item.get("asset_selection_order") or 0),
+                "source_kind": _clean_string(item.get("asset_source_kind")),
+                "verified": bool(item.get("asset_verified")),
+            }),
+        })
+
+    videos: List[Dict[str, Any]] = []
+    for item in active_videos:
+        slot = int(item.get("slot") or 1)
+        source_type = _clean_string(item.get("source_type"))
+        selected_role = _clean_string(item.get("control_role"))
+        record: Dict[str, Any] = {
+            "video": f"@video{slot}",
+            "label": _clean_string(item.get("label")),
+            "source_type": source_type,
+            "custom_source_type": _clean_string(item.get("custom_source_type")),
+            "control_role": selected_role,
+            "custom_control_role": _clean_string(item.get("custom_control_role")),
+            "control_role_explicit": bool(selected_role),
+            "keep_out": _clean_string(item.get("keep_out")),
+            "identity": _nonempty_identity({
+                "video_uid": _clean_string(item.get("video_uid")),
+                "source_uid": _clean_string(item.get("source_uid")),
+                "order_key": _clean_string(item.get("order_key")),
+                "selection_order": int(item.get("selection_order") or 0),
+            }),
+        }
+        capabilities = _normalize_video_reference_capabilities(
+            item.get("reference_capabilities")
+        )
+        frame_domain = _normalize_video_frame_domain(item.get("frame_domain"))
+        if capabilities:
+            record["reference_capabilities"] = capabilities
+        if frame_domain:
+            record["frame_domain"] = frame_domain
+        if bool(item.get("picker_companion_validated")):
+            record["companion"] = _nonempty_identity({
+                "kind": _clean_string(item.get("picker_companion_kind")),
+                "source_slot": int(item.get("picker_companion_source_slot") or 0),
+                "source_uid": _clean_string(item.get("picker_companion_source_uid")),
+                "validated": True,
+            })
+        videos.append(record)
+
+    active_video_slots = {int(item.get("slot") or 1) for item in active_videos}
+    frame_ranges: List[Dict[str, Any]] = []
+    for item in active_images:
+        image_token = f"@image{int(item.get('slot') or 1)}"
+        for active_binding in _active_frame_range_bindings(item):
+            binding, metadata, errors = _frame_range_binding_validation(
+                state,
+                item,
+                active_video_slots,
+                active_binding,
+            )
+            selected = binding if isinstance(binding, dict) else active_binding
+            slot = _video_slot_number(selected.get("video_slot"), MAX_VIDEOS)
+            valid_ranges = _normalize_frame_ranges(selected.get("ranges"))
+            submitted_ranges = _normalize_frame_ranges(active_binding.get("ranges"))
+            error_codes = _frame_range_error_codes(errors)
+            segment_error_codes = {
+                "segment_order_invalid", "segment_out_of_domain"
+            }
+            usable = bool(
+                binding is not None
+                and metadata is not None
+                and valid_ranges
+                and set(error_codes).issubset(segment_error_codes)
+            )
+            domain: Dict[str, Any] = {}
+            if isinstance(metadata, dict):
+                domain = _nonempty_identity({
+                    "start_frame": _strict_int(metadata.get("start_frame")),
+                    "end_frame": _strict_int(metadata.get("end_frame")),
+                    "frame_count": _strict_int(metadata.get("frame_count")),
+                    "timebase": _clean_string(metadata.get("timebase")),
+                    "fps": float(metadata.get("fps") or 0.0),
+                })
+            else:
+                domain = _nonempty_identity({
+                    "start_frame": _strict_int(selected.get("start_frame")),
+                    "end_frame": _strict_int(selected.get("end_frame")),
+                })
+            minimum = _strict_int(domain.get("start_frame"))
+            maximum = _strict_int(domain.get("end_frame"))
+            unresolved_segments: List[Dict[str, Any]] = []
+            for frame_range in submitted_ranges:
+                start = int(frame_range.get("start") or 0)
+                end = int(frame_range.get("end") or 0)
+                error_code = ""
+                if start > end:
+                    error_code = "segment_order_invalid"
+                elif (
+                    minimum is not None
+                    and maximum is not None
+                    and (start < minimum or end > maximum)
+                ):
+                    error_code = "segment_out_of_domain"
+                if error_code:
+                    unresolved_segments.append({
+                        "start_frame": start,
+                        "end_frame": end,
+                        "error_code": error_code,
+                    })
+            frame_ranges.append({
+                "image": image_token,
+                "video": f"@video{slot}",
+                "marker_color": _clean_string(selected.get("color_pick")),
+                "enabled": True,
+                "origin": _clean_string(selected.get("origin")) or "manual",
+                "domain": domain,
+                "segments": [
+                    {
+                        "start_frame": int(frame_range.get("start") or 0),
+                        "end_frame": int(frame_range.get("end") or 0),
+                    }
+                    for frame_range in valid_ranges
+                ] if usable else [],
+                "unresolved_segments": [
+                    dict(segment) for segment in unresolved_segments
+                ],
+                "valid": usable,
+                "error_codes": error_codes,
+            })
+
+    controls = [
+        {
+            "source_field": _clean_string(entry.get("field")),
+            "line": int(entry.get("line") or 0),
+            "video": f"@video{int(entry.get('video') or 1)}",
+            "target_id": _clean_string(entry.get("target")),
+            "function": _clean_string(entry.get("function")),
+            "marker_color": _clean_string(entry.get("marker")),
+            "boundary": _clean_string(entry.get("boundary")),
+        }
+        for entry in control_only_bindings
+    ]
+    return {
+        "schema": PUBLIC_JOB_CONTRACT_SCHEMA,
+        "version": PUBLIC_JOB_CONTRACT_VERSION,
+        "images": images,
+        "videos": videos,
+        "control_only_bindings": controls,
+        "frame_ranges": frame_ranges,
+        "connections": {
+            "image_asset": _image_asset_connection_enabled(state),
+            "picker": bool(
+                isinstance(state.get("picker"), dict)
+                and state["picker"].get("enabled")
+            ),
+        },
+    }
+
+
+def _public_user_description_data(
+    state: Dict[str, Any], text: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Return user-authored text verbatim after ordinary field normalization."""
+
+    payload: Dict[str, Any] = {}
+    for key in TEXT_FIELD_NAMES:
+        value = _clean_string(text.get(key))
+        if value:
+            payload[key] = value
+    return payload
+
+
+def _build_data_only_prompt_package(state: Dict[str, Any]) -> str:
     state = _normalize_state(state)
     text = state["text"]
     active_images = _active_image_rows_for_state(state["images"], state)
     active_videos = [item for item in state["videos"] if _is_active_video(item)]
     control_only_bindings = _parse_control_only_bindings(text)[0]
-    picker_state = state.get("picker") if isinstance(state.get("picker"), dict) else {}
-    frame_metadata = picker_state.get("frame_metadata", [])
-
-    lines: List[str] = ["HMB_GP_Production", ""]
-
-    lines.append("TARGET GENERATOR:")
-    lines.append("This prompt is written for the active downstream target generator or execution system.")
-    lines.append("Interpret all source bindings, video shot-control instructions, timing notes, VFX placement, visibility states, occlusion behavior, and continuity requirements as production replacement re-render instructions.")
-    lines.append("")
-
-    lines.append("IMAGE SOURCE:")
-    if active_images:
-        for item in active_images:
-            seq = int(item.get("slot") or 1)
-            label = _clean_string(item.get("label")) or f"image source {seq}"
-            asset_id = _clean_string(item.get("asset_id"))
-            asset_id_suffix = f" / Asset ID: {asset_id}" if asset_id else ""
-            color_text = _color_pick_text(item)
-            color_suffix = f" / Color Pick: {color_text}" if color_text else ""
-            lines.append(
-                f"@image{seq} = {label}{asset_id_suffix}{color_suffix}"
-            )
-    else:
-        lines.append("No image source assigned in HMBPromptLibrary.")
-    lines.append("")
-
-    if active_images:
-        lines.append("IMAGE ROLE MAP:")
-        for item in active_images:
-            seq = int(item.get("slot") or 1)
-            lines.append(_image_role_line(item, seq))
-        lines.append("")
-
-        repl = [line for item in active_images for line in [_image_replacement_line(item, int(item.get("slot") or 1))] if line]
-        if repl:
-            lines.append("REPLACEMENT BINDING:")
-            lines.extend(repl)
-            lines.append("")
-
-        target_function_bindings = [
-            line
-            for item in active_images
-            for line in _image_target_function_lines(item, int(item.get("slot") or 1))
-        ]
-        if target_function_bindings:
-            lines.append("TARGET FUNCTION BINDING:")
-            lines.extend(target_function_bindings)
-            lines.append("")
-
-    if control_only_bindings:
-        lines.append("CONTROL-ONLY BINDING:")
-        lines.extend(_format_control_only_binding(entry) for entry in control_only_bindings)
-        lines.append("")
-
-    lines.append("VIDEO SOURCE:")
-    if active_videos:
-        active_slots_text = ", ".join(f"@video{int(item.get('slot') or 1)}" for item in active_videos)
-        lines.append(f"Active video slots = {active_slots_text}")
-        for item in active_videos:
-            seq = int(item.get("slot") or 1)
-            label = _clean_string(item.get("label")) or f"video source {seq}"
-            if _clean_string(item.get("picker_auto_label")):
-                label = _video_file_stem(label)
-            lines.append(f"@video{seq} = {label}")
-        lines.append("")
-        lines.append("VIDEO ROLE MAP:")
-        for item in active_videos:
-            seq = int(item.get("slot") or 1)
-            lines.append(_video_role_line(item, seq, active_images, control_only_bindings))
-            semantic_summary = _motion_guide_semantic_summary_line(item, seq)
-            if semantic_summary:
-                lines.append(semantic_summary)
-        lines.append("")
-        alignment_lines, _alignment_conflicts = _self_scoped_alignment_evaluation(
-            active_images,
-            active_videos,
-            control_only_bindings,
-            frame_metadata,
-        )
-        if alignment_lines:
-            lines.append("SELF-SCOPED REFERENCE ALIGNMENT:")
-            lines.extend(alignment_lines)
-            lines.append("")
-        if any(int(item.get("slot") or 1) > 1 for item in active_videos):
-            lines.append("ADDITIVE MULTI-VIDEO BINDING SCHEMA:")
-            lines.append("Every active video slot is independent; no slot, companion, Color Pick, image source, or local binding is required merely because another video is present.")
-            lines.append("Explicit reciprocal image or structured control-only bindings add exact local Targets and boundaries when supplied.")
-            lines.append(
-                "Recognized self-scoped role tuples provide a default verification/context interpretation; "
-                "an explicit current user goal may broaden, narrow, or reframe their use."
-            )
-            lines.append("Decoded metadata is validated for internal file/schema integrity. Cross-source alignment is enforced only when explicit Picker companion provenance declares those files as one bundle.")
-            lines.append("Missing optional metadata or bindings never invents data and never blocks use of the sources that are present.")
-            lines.append("")
-    else:
-        lines.append("No video source assigned in HMBPromptLibrary.")
-    lines.append("")
-
     valid_frame_bindings = _valid_frame_range_bindings(
+        state, active_images, active_videos
+    )
+    job_data = _public_job_data_contract(
+        state, active_images, active_videos, control_only_bindings
+    )
+    fx_timing_contract = _build_fx_timing_source_contract(
         state,
         active_images,
         active_videos,
+        control_only_bindings,
+        valid_frame_bindings,
     )
-    if valid_frame_bindings:
-        lines.append("FRAME RANGE BINDING:")
-        emitted_timebases: set[int] = set()
-        for _item, binding, metadata in valid_frame_bindings:
-            slot = _video_slot_number(binding.get("video_slot"), MAX_VIDEOS)
-            if slot in emitted_timebases:
-                continue
-            emitted_timebases.add(slot)
-            fps = float(metadata.get("fps") or 0.0)
-            start_frame = int(metadata.get("start_frame"))
-            end_frame = int(metadata.get("end_frame"))
-            if fps > 0:
-                lines.append(
-                    f"Timebase = @video{slot} / {fps:g} FPS / "
-                    f"Frames {start_frame}–{end_frame}"
-                )
-            else:
-                lines.append(
-                    f"Frame domain = @video{slot} / Manual / "
-                    f"Frames {start_frame}–{end_frame}"
-                )
-        for item, binding, _metadata in valid_frame_bindings:
-            image_slot = int(item.get("slot") or 1)
-            slot = _video_slot_number(binding.get("video_slot"), MAX_VIDEOS)
-            color = _clean_string(binding.get("color_pick"))
-            ranges = binding.get("ranges") if isinstance(binding.get("ranges"), list) else []
-            range_text = " and ".join(
-                f"{int(frame_range.get('start') or 0)}–{int(frame_range.get('end') or 0)}"
-                for frame_range in ranges
-            )
-            lines.append(
-                f"@image{image_slot} replaces the @video{slot} {color} marker "
-                f"during Frames {range_text} only."
-            )
-        lines.append("")
+    user_data = _public_user_description_data(state, text)
+    return "\n".join([
+        "HMB_GP_Production",
+        PUBLIC_JOB_CONTRACT_HEADER,
+        json.dumps(job_data, ensure_ascii=False, separators=(",", ":")),
+        FX_TIMING_CONTRACT_HEADER,
+        json.dumps(fx_timing_contract, ensure_ascii=False, separators=(",", ":")),
+        USER_DESCRIPTION_DATA_HEADER,
+        json.dumps(user_data, ensure_ascii=False, separators=(",", ":")),
+        "",
+    ])
 
-    preserved_entries, preserved_errors = _parse_preserved_text(text.get("PRESERVED_TEXT"))
-    unverified_preserved_text = _unverified_preserved_text_lines(text.get("PRESERVED_TEXT"))
-    authority_diagnostics = _find_source_authority_conflicts(
-        active_images,
-        active_videos,
-        text,
-        frame_metadata,
-    )
-    _control_bindings, control_binding_errors = _parse_control_only_bindings(text)
-    _alignment_reports, alignment_errors = _self_scoped_alignment_evaluation(
-        active_images,
-        active_videos,
-        _control_bindings,
-        frame_metadata,
-    )
-    active_video_slots = {
-        int(item.get("slot") or 1)
-        for item in active_videos
-    }
-    frame_range_warnings: List[str] = []
-    for item in active_images:
-        _binding, _metadata, range_errors = _frame_range_binding_validation(
-            state,
-            item,
-            active_video_slots,
-        )
-        token = f"@image{int(item.get('slot') or 1)}"
-        frame_range_warnings.extend(
-            f"{token} {error}"
-            for error in range_errors
-        )
-    picker_state = state.get("picker") if isinstance(state.get("picker"), dict) else {}
-    technical_frame_errors = [
-        error
-        for error in frame_range_warnings
-        if any(
-            marker in error
-            for marker in (
-                "conflicting or incomplete",
-                "START after END",
-                "Invalid frame range",
-                " is outside ",
-            )
-        )
-    ]
-    technical_errors = [*alignment_errors, *technical_frame_errors]
-    technical_errors.extend(
-        _clean_string(item)
-        for item in picker_state.get("contract_errors", [])
-        if _clean_string(item)
-    )
-    technical_errors.extend(
-        diagnostic
-        for diagnostic in authority_diagnostics
-        if " exceeds " in diagnostic
-    )
-    technical_errors = list(dict.fromkeys(technical_errors))
-    interpretation_notes = [
-        diagnostic
-        for diagnostic in authority_diagnostics
-        if diagnostic not in technical_errors
-    ]
-    if interpretation_notes:
-        lines.append("SOURCE INTERPRETATION NOTES:")
-        for note in interpretation_notes:
-            lines.append(f"- {note}")
-        lines.append(
-            "These notes describe ambiguity without deleting or constraining supplied ideas; every source "
-            "remains available and the current user goal governs its use."
-        )
-        lines.append("")
-    if technical_errors:
-        lines.append("SOURCE DATA WARNINGS:")
-        for conflict in technical_errors:
-            lines.append(f"- {conflict}")
-        lines.append(
-            "Exact schema, provenance, or matched-authority interpretation is withheld only where it cannot "
-            "be verified. Every supplied source and the user goal remain independently usable."
-        )
-        lines.append("")
 
-    description_payload: Dict[str, Any] = {}
-    for key in TEXT_FIELD_NAMES:
-        if key == "PRESERVED_TEXT":
-            continue
-        value = _clean_string(text.get(key))
-        if key in ("SCENE_CONTEXT", "VIDEO_VFX"):
-            value = _strip_control_only_binding_lines(value)
-        if value:
-            description_payload[key] = value
-    if preserved_entries:
-        description_payload["PRESERVED_TEXT"] = preserved_entries
-    connected_source_fallbacks = [
-        f"[{entry['source']} / {entry['reason']}] {entry['text']}"
-        for entry in _normalize_source_intent_fallbacks(
-            state.get(_SOURCE_INTENT_FALLBACKS_KEY)
-        )
-    ]
-    descriptive_fallbacks = list(dict.fromkeys([
-        *unverified_preserved_text,
-        *connected_source_fallbacks,
-    ]))
-    if descriptive_fallbacks:
-        description_payload["PRESERVED_TEXT_DESCRIPTIVE_FALLBACK"] = descriptive_fallbacks
-        description_payload["CONNECTED_SOURCE_INTENT_POLICY"] = (
-            "Every readable fallback is ordinary user intent available to the current goal immediately; "
-            "it is not a prerequisite, lower-priority idea, or reason to block output."
-        )
-    frame_range_intent = {
-        f"@image{int(item.get('slot') or 1)}": {
-            "selected_color_index": int(item.get("frame_range_color_index") or 0),
-            "bindings": _normalize_frame_range_bindings(
-                item.get("frame_range_bindings"),
-                item.get("frame_range_binding"),
-            ),
-        }
-        for item in active_images
-        if bool(item.get("frame_range_enabled"))
-    }
-    if frame_range_intent:
-        description_payload["FRAME_RANGE_INTENT"] = {
-            "policy": (
-                "Every readable range remains available to the current goal immediately; inactive addresses or "
-                "missing metadata do not erase or demote it."
-            ),
-            "sources": frame_range_intent,
-        }
-    legacy_relationship_payload = {
-        f"@image{int(item.get('slot') or 1)}": [
-            _clean_string(value)
-            for value in item.get("legacy_relationship_targets", [])
-            if _clean_string(value)
-        ]
-        for item in active_images
-        if any(
-            _clean_string(value)
-            for value in item.get("legacy_relationship_targets", [])
-        )
-    }
-    if legacy_relationship_payload:
-        description_payload["RELATIONSHIP_TARGETS"] = {
-            "interpretation": (
-                "Every supplied Target is available to the current user goal immediately. The first Target is "
-                "the dashboard selection, while additional Targets remain equally usable relationship intent."
-            ),
-            "sources": legacy_relationship_payload,
-        }
-    keep_out_payload = {
-        f"@video{int(item.get('slot') or 1)}": _clean_string(item.get("keep_out"))
-        for item in active_videos
-        if _clean_string(item.get("keep_out"))
-    }
-    if keep_out_payload:
-        description_payload["KEEP_OUT"] = keep_out_payload
-    if description_payload:
-        lines.append("USER DESCRIPTION DATA (JSON):")
-        lines.append(json.dumps(description_payload, ensure_ascii=False, separators=(",", ":")))
-        lines.append("")
-
-    return _compile_prompt_with_budget(lines)
-
+def _build_prompt_package(state: Dict[str, Any]) -> str:
+    # The canonical edge carries only typed job data and user-authored text.
+    # Signed behavior stays inside HMBAgentLibrary's transient rulesets.
+    return _build_data_only_prompt_package(state)
 
 class HMBPromptLibrary(DataNode):
     """HMBPromptLibrary.
@@ -7555,11 +6967,7 @@ class HMBPromptLibrary(DataNode):
         self._restore_picker_connection_state()
         return result
 
-    def process(self):
+    def process(self) -> None:
         self._ensure_prompt_output()
-        state = self._sync_prompt_output_from_state()
-        return {
-            "active_images": state.get("status", {}).get("active_images", 0),
-            "active_videos": state.get("status", {}).get("active_videos", 0),
-            "mode": MODE_NAME,
-        }
+        self._sync_prompt_output_from_state()
+        return None

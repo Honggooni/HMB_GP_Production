@@ -117,6 +117,10 @@ STATE_SCHEMA = "hmb-image-asset-library-state"
 OUTPUT_SCHEMA = "hmb-image-asset-library-binding"
 STATE_VERSION = 4
 OUTPUT_VERSION = 4
+IMAGE_BINDING_CAPABILITY_SCHEMA = "hmb-image-source-binding-capabilities"
+IMAGE_BINDING_CAPABILITY_VERSION = 1
+IMAGE_AUTHORITY_SCOPE_SCHEMA = "hmb-image-source-authority-scope"
+IMAGE_AUTHORITY_SCOPE_VERSION = 1
 MAX_ASSETS = 5000
 MAX_FOLDERS = 5000
 MAX_PROJECTS = 500
@@ -3214,6 +3218,11 @@ def _build_output_payload(
                 "scope_candidate": asset["scope_candidate"],
                 "color_pick_candidates": list(asset["color_pick_candidates"]),
                 "selection_order": output_index,
+                "binding_capabilities": {
+                    "schema": IMAGE_BINDING_CAPABILITY_SCHEMA,
+                    "version": IMAGE_BINDING_CAPABILITY_VERSION,
+                    "image_source_frame_range": True,
+                },
             }
         )
     return {
@@ -3228,6 +3237,15 @@ def _build_output_payload(
         "verified_assets": verified_assets,
         "selected_assets": verified_assets,
         "imported_images": imported_images,
+        "binding_contract": {
+            "schema": IMAGE_BINDING_CAPABILITY_SCHEMA,
+            "version": IMAGE_BINDING_CAPABILITY_VERSION,
+            "source_identity_fields": ["source_uid", "order_key"],
+            "image_source_frame_range": {
+                "supported": True,
+                "enabled_by_default": False,
+            },
+        },
         "media_resolution": {
             "selected_count": selection["selected_count"],
             "resolved_count": len(selection["resolved"]),
@@ -3244,32 +3262,27 @@ def _build_output_payload(
             "unresolved": [dict(item) for item in selection["unresolved"]],
         },
         "warnings": list(selection["warnings"]),
-        "authority": {
-            "current_user_goal": (
-                "Final creative authority in standalone and connected use; every "
-                "readable selected image remains available for any use the goal supports."
-            ),
-            "verified_project_assets_add_context": [
-                "Project",
-                "Main Type",
-                "Asset ID",
-                "Image Name",
-                "Registered Image Sub Type",
-                "Color Pick candidates",
+        "authority_scope": {
+            "schema": IMAGE_AUTHORITY_SCOPE_SCHEMA,
+            "version": IMAGE_AUTHORITY_SCOPE_VERSION,
+            "verified_metadata_fields": [
+                "project_uid",
+                "source_type",
+                "asset_id",
+                "image_name",
+                "scope_candidate",
+                "color_pick_candidates",
             ],
-            "external_imports_add_context": [
-                "Image Name",
-                "Generator order",
+            "external_metadata_fields": [
+                "source_uid",
+                "image_name",
+                "selection_order",
             ],
-            "optional_downstream_refinement": [
-                "Target",
-                "Color Pick",
+            "downstream_binding_fields": [
+                "target",
+                "color_pick",
+                "image_source_frame_range",
             ],
-            "connection_policy": (
-                "ASSET_OUT synchronizes a verified asset's registered Main Type and "
-                "Image Sub Type. Target remains freely editable, and no downstream "
-                "library is a creative prerequisite."
-            ),
         },
     }
 
@@ -4220,7 +4233,7 @@ class HMBImageAssetLibrary(DataNode):
             self._apply_import_value(import_value)
         return result
 
-    def process(self):
+    def process(self) -> None:
         self._ensure_parameters()
         root_value = _project_root_text(
             _get_parameter_raw(self, PROJECT_ROOT_PARAMETER)
@@ -4228,19 +4241,5 @@ class HMBImageAssetLibrary(DataNode):
         state = self._load_catalog(root_value or str(DEFAULT_PROJECTS_ROOT))
         import_value = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
         if _flatten_import_values(import_value):
-            state = self._apply_import_value(import_value)
-        output_payload, media_values = _build_synchronized_outputs(
-            state,
-            self._hmb_import_media_by_uid,
-        )
-        return {
-            "project_id": state.get("project_id", ""),
-            "asset_count": state.get("status", {}).get("asset_count", 0),
-            "selected_count": state.get("status", {}).get("selected_count", 0),
-            "media_count": len(media_values),
-            "unresolved_media_count": output_payload["media_resolution"][
-                "unresolved_count"
-            ],
-            "warnings": list(output_payload.get("warnings", [])),
-            "mode": "image_asset",
-        }
+            self._apply_import_value(import_value)
+        return None

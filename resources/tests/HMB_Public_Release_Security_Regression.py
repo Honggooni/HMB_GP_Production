@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
+import io
 import json
 import os
 import re
@@ -8,16 +10,56 @@ from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[2]
-RELEASE_MANIFEST = ROOT / "dist" / "release-manifest.json"
+POLICY_VERSION = "2026-08-11.agent-shot-quality.v4.1"
+POLICY_CONTRACT_SHA256 = (
+    "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
+)
+RELEASE_LABEL = "v0.6.01"
+RELEASE_VERSION = "0.6.1"
+EXPECTED_SOURCE_FILES = (
+    "__init__.py",
+    "griptape-nodes-library.json",
+    "pyproject.toml",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "SBOM.spdx.json",
+    "HMBAgentLibrary.py",
+    "HMBImageAssetLibrary.py",
+    "HMBPromptLibrary.py",
+    "HMBSeedanceGeneration.py",
+    "HMBVideoPickerLibrary.py",
+    "_hmb_common.py",
+    "_hmb_screen_space.py",
+    "widgets/HMBAgentLibraryWidget.js",
+    "widgets/HMBImageAssetLibraryWidget.js",
+    "widgets/HMBPromptLibraryScopedBindingWidget.js",
+    "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
+    "widgets/HMBVideoPickerLibraryWidget_v032.js",
+    "resources/maya/HMB_Maya_Background_Preview.py",
+    "resources/maya/HMB_Maya_Binding_Setup.py",
+    "resources/maya/HMBVideoPicker_Maya_Guide.txt",
+    "resources/picker/HMB_Marker_Catalog.json",
+)
 EXPECTED_SECRET_NAMES = {
-    "ARK_API_KEY",
     "GT_CLOUD_API_KEY",
     "GT_CLOUD_BUCKET_ID",
     "TOS_ACCESS_KEY_ID",
     "TOS_SECRET_ACCESS_KEY",
     "TOS_BUCKET_NAME",
 }
-FORBIDDEN_SUFFIXES = {".env", ".jwk", ".key", ".p12", ".pem", ".pfx"}
+FORBIDDEN_SUFFIXES = {
+    ".dat",
+    ".env",
+    ".jwk",
+    ".key",
+    ".p12",
+    ".pem",
+    ".pfx",
+    ".secret",
+    ".token",
+}
 PRIVATE_KEY_HEADER = re.compile(
     rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
 )
@@ -27,58 +69,224 @@ COMMON_TOKEN_PATTERNS = (
     re.compile(rb"gh[opsu]_[A-Za-z0-9]{30,}"),
     re.compile(rb"sk-[A-Za-z0-9_-]{20,}"),
 )
+FORBIDDEN_PACKAGE_POLICY_MARKERS = (
+    b"_BUNDLED_AGENT_POLICY_FILE",
+    b"resources/agent/hmb_agent_core.dat",
+    b"resources\\agent\\hmb_agent_core.dat",
+    b"resources/policy/HMB_GP_Production_Rule",
+)
+RETIRED_USAGE_MARKERS = (
+    b"00" + bytes((46,)) + b"CompSource",
+    b"USAGE_LEDGER_ROOT",
+    b"USAGE_LOCAL_QUEUE_ROOT",
+    b"USAGE_PRICE_CNY_PER_MILLION",
+    b"_prepare_usage_tracking",
+    b"_record_usage_task",
+    b"_record_current_usage_status",
+    b"_build_usage_event",
+    b"_flush_usage_queue",
+)
+RETIRED_DIRECT_PROVIDER_MARKERS = (
+    b"ARK_API_KEY_SECRET",
+    b"ARK_BASE_URL",
+    b"CREATE_TASK_PATH",
+    b"POST_REQUEST_TIMEOUT_SECONDS",
+    b"VolcengineAPIError",
+    b"_build_payload",
+    b"_get_api_key",
+    b"_provider_error_detail",
+    b"_network_error_phase",
+    b"_submission_diagnostic",
+    b"_refresh_direct_async",
+    b"_process_direct_generation_impl",
+    b"ark.cn-beijing.volces.com/api/v3/contents/generations/tasks",
+)
 
+
+def load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def zip_bytes(members: dict[str, bytes]) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in members.items():
+            archive.writestr(name, content)
+    return output.getvalue()
+
+
+def assert_forbidden_archive(encoded: bytes) -> None:
+    try:
+        builder.validate_no_policy_artifacts_in_zip(encoded)
+    except RuntimeError:
+        return
+    raise AssertionError("A policy artifact or policy document entered a release ZIP.")
+
+
+builder = load_module(
+    "_hmb_public_release_in_memory_builder",
+    ROOT / "resources" / "build_developer_release.py",
+)
+
+assert tuple(builder.SOURCE_FILES) == EXPECTED_SOURCE_FILES
+assert len(EXPECTED_SOURCE_FILES) == 24
+assert builder.RELEASE_LABEL == RELEASE_LABEL
+assert builder.RELEASE_VERSION == RELEASE_VERSION
+assert builder.ARCHIVE_NAME == "HMB_GP_Production_DEV_0.6.1.zip"
+assert builder.POLICY_VERSION == POLICY_VERSION
+assert builder.POLICY_CONTRACT_SHA256 == POLICY_CONTRACT_SHA256
+assert builder.POLICY_DELIVERY == "server-only"
+for retired_name in ("POLICY_RELATIVE", "POLICY_SHA256", "POLICY_SIGNING_KEY_ID"):
+    assert not hasattr(builder, retired_name)
 
 manifest = json.loads(
     (ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8")
 )
+sbom = json.loads((ROOT / "SBOM.spdx.json").read_text(encoding="utf-8"))
+changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 registered_secrets = manifest["settings"][0]["contents"]["secrets_to_register"]
 assert set(registered_secrets) == EXPECTED_SECRET_NAMES
 assert all(value == "" for value in registered_secrets.values())
-assert not (ROOT / "resources" / "agent" / "hmb_agent_core.dat").exists()
-release_manifest_bytes = RELEASE_MANIFEST.read_bytes()
-release_manifest = json.loads(release_manifest_bytes.decode("utf-8"))
-external_policy = release_manifest["external_agent_policy"]
-assert external_policy == {
-    "bundled": False,
-    "envelope_schema": "hmb-agent-policy-envelope-v3",
-    "maximum_decompressed_bytes": 512 * 1024,
-    "maximum_envelope_bytes": 128 * 1024,
-    "path_env": "HMB_AGENT_POLICY_PATH",
-    "signature_algorithm": "RSASSA-PKCS1-v1_5-SHA256",
-    "signing_key_id": "hmb-policy-release-2026-08",
-}
-assert "validated" not in external_policy
-assert "envelope_sha256" not in external_policy
+assert sbom["name"] == f"HMB_GP_Production-{RELEASE_VERSION}"
+assert sbom["documentNamespace"].endswith(f"/{RELEASE_VERSION}")
+assert next(
+    item for item in sbom["packages"]
+    if item["SPDXID"] == "SPDXRef-HMB-GP-Production"
+)["versionInfo"] == RELEASE_VERSION
+assert (
+    f"## `{RELEASE_LABEL}` (technical version `{RELEASE_VERSION}`) — Unreleased"
+    in changelog
+)
+
+release_version, records = builder.validate_sources()
+record_paths = tuple(str(record["path"]) for record in records)
+assert record_paths == EXPECTED_SOURCE_FILES
+assert len(records) == len(EXPECTED_SOURCE_FILES)
+assert release_version == manifest["metadata"]["library_version"]
+assert release_version == RELEASE_VERSION
+record_by_path = {str(record["path"]): record for record in records}
+assert set(record_by_path) == set(EXPECTED_SOURCE_FILES)
+
+first_archive = builder.make_archive(records)
+second_archive = builder.make_archive(records)
+assert first_archive == second_archive
+builder.validate_archive(first_archive, records)
+assert builder.module_string_constant(
+    ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_CANDIDATE_VERSION"
+) == "2026-08-11.agent-shot-quality.v4.1"
+assert builder.module_string_constant(
+    ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_CANDIDATE_CONTRACT_SHA256"
+) == POLICY_CONTRACT_SHA256
+assert builder.module_string_constant(
+    ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_CANDIDATE_STATUS"
+) == "active"
+check_result = builder.check()
+assert check_result["validated"] is True
+assert check_result["policy_delivery"] == "server-only"
+assert check_result["policy_version"] == POLICY_VERSION
+assert check_result["policy_contract_sha256"] == POLICY_CONTRACT_SHA256
+assert check_result["release_label"] == RELEASE_LABEL
+assert check_result["release_version"] == RELEASE_VERSION
 
 configured_secret_values = tuple(
     value.encode("utf-8")
     for name in EXPECTED_SECRET_NAMES
     if len(value := os.environ.get(name, "")) >= 8
 )
-configured_policy_path = os.environ.get("HMB_AGENT_POLICY_PATH", "").encode("utf-8")
-if configured_policy_path:
-    assert configured_policy_path not in release_manifest_bytes
 
-archive_names = [str(item["name"]) for item in release_manifest["archives"]]
-assert archive_names == ["HMB_GP_Production.zip"]
-for archive_name in archive_names:
-    assert Path(archive_name).name == archive_name
-    archive_path = ROOT / "dist" / archive_name
-    assert archive_path.is_file(), f"Release archive is missing: {archive_name}"
-    with zipfile.ZipFile(archive_path, "r") as archive:
-        infos = archive.infolist()
-        assert len(infos) == 25
-        assert not archive.testzip()
-        for info in infos:
-            member = PurePosixPath(info.filename)
-            lowered = info.filename.casefold()
-            assert member.name.casefold() != "hmb_agent_core.dat"
-            assert member.suffix.casefold() not in FORBIDDEN_SUFFIXES
-            assert "/resources/agent/" not in f"/{lowered}"
-            content = archive.read(info)
-            assert PRIVATE_KEY_HEADER.search(content) is None
-            assert not any(pattern.search(content) for pattern in COMMON_TOKEN_PATTERNS)
-            assert not any(secret in content for secret in configured_secret_values)
+with zipfile.ZipFile(io.BytesIO(first_archive), "r") as archive:
+    infos = archive.infolist()
+    assert len(infos) == len(EXPECTED_SOURCE_FILES)
+    assert archive.testzip() is None
+    expected_names = [
+        f"{builder.ARCHIVE_ROOT}/{relative}" for relative in EXPECTED_SOURCE_FILES
+    ]
+    assert [info.filename for info in infos] == expected_names
+    assert not any(
+        PurePosixPath(info.filename).suffix.casefold() == ".dat" for info in infos
+    )
 
-print("HMB public release policy/credential boundary regression: PASS")
+    for info in infos:
+        member = PurePosixPath(info.filename)
+        lowered = info.filename.casefold()
+        relative = member.relative_to(builder.ARCHIVE_ROOT).as_posix()
+        assert member.suffix.casefold() not in FORBIDDEN_SUFFIXES
+        assert "/resources/agent/" not in f"/{lowered}"
+        assert "/resources/policy/" not in f"/{lowered}"
+        assert "/policies/" not in f"/{lowered}"
+        assert not re.search(
+            r"(^|/)(?:credentials|secrets)[^/]*\.json$",
+            lowered,
+        )
+        assert not re.search(r"(^|/)(?:id_rsa|id_ed25519)[^/]*$", lowered)
+        content = archive.read(info)
+        assert content == record_by_path[relative]["data"]
+        assert PRIVATE_KEY_HEADER.search(content) is None
+        assert not any(pattern.search(content) for pattern in COMMON_TOKEN_PATTERNS)
+        assert not any(secret in content for secret in configured_secret_values)
+        assert not any(marker in content for marker in FORBIDDEN_PACKAGE_POLICY_MARKERS)
+        assert not any(marker in content for marker in RETIRED_USAGE_MARKERS)
+        assert not any(marker in content for marker in RETIRED_DIRECT_PROVIDER_MARKERS)
+
+# The server-path contract is allowed in source, but no package layer may carry
+# the signed data file or English/Korean policy documents. Inspect nested ZIPs
+# because the team installer wraps the library ZIP in another ZIP.
+safe_nested = zip_bytes({"docs/readme.txt": b"safe"})
+builder.validate_no_policy_artifacts_in_zip(
+    zip_bytes({"package/safe.zip": safe_nested})
+)
+assert_forbidden_archive(zip_bytes({"package/hmb_agent_core.dat": b"sealed"}))
+try:
+    builder.make_archive(
+        [{"path": "resources/agent/hmb_agent_core.dat", "data": b"sealed"}]
+    )
+except RuntimeError:
+    pass
+else:
+    raise AssertionError("The archive builder accepted a direct .dat record.")
+assert_forbidden_archive(
+    zip_bytes(
+        {
+            "package/library.zip": zip_bytes(
+                {"HMB_GP_Production/resources/agent/hmb_agent_core.dat": b"sealed"}
+            )
+        }
+    )
+)
+assert_forbidden_archive(
+    zip_bytes(
+        {
+            "package/library.zip": zip_bytes(
+                {"policies/HMB_Agent_Policies_8_KO.txt": b"review"}
+            )
+        }
+    )
+)
+assert_forbidden_archive(
+    zip_bytes({"resources/policy/canonical/HMB_Agent_Policies_8_EN.txt": b"source"})
+)
+assert_forbidden_archive(zip_bytes({"package/policy/canonical.txt": b"source"}))
+assert_forbidden_archive(zip_bytes({"HMB_Agent_Policies_8_EN.txt": b"source"}))
+assert_forbidden_archive(zip_bytes({"HMB_Agent_Policy.txt": b"source"}))
+assert_forbidden_archive(
+    zip_bytes(
+        {
+            "package/library.zip": zip_bytes(
+                {"HMB_Agent_Policies_8_EN.txt": b"source"}
+            )
+        }
+    )
+)
+
+gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+assert "resources/agent/" in gitignore
+assert "resources/policy/" in gitignore
+assert "policies/" in gitignore
+assert "**/hmb_agent_core.dat" in gitignore
+assert "!resources/agent/hmb_agent_core.dat" not in gitignore
+
+print("HMB in-memory server-only release/credential boundary regression: PASS")

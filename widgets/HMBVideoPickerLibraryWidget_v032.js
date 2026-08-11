@@ -1509,6 +1509,33 @@ function normalizeBinding(item, fallbackSlot = 1, order = 1) {
   };
 }
 
+function hmbPickerBindingIdentity(item) {
+  const mayaUuid = clean(item?.maya_uuid).toLowerCase();
+  if (mayaUuid) return `uuid:${mayaUuid}`;
+  const fullPath = clean(item?.full_dag_path || item?.subject_root)
+    .replace(/\\/g, "/")
+    .toLowerCase();
+  return fullPath ? `path:${fullPath}` : "";
+}
+
+function hmbDedupePickerBindings(items, fallbackSlot = 1) {
+  const seen = new Set();
+  const result = [];
+  (Array.isArray(items) ? items : []).forEach((item, index) => {
+    const binding = normalizeBinding(item, fallbackSlot, index + 1);
+    if (!binding) return;
+    const identity = hmbPickerBindingIdentity(binding);
+    if (identity && seen.has(identity)) return;
+    if (identity) seen.add(identity);
+    result.push({
+      ...binding,
+      video_slot: fallbackSlot,
+      picker_order: result.length + 1,
+    });
+  });
+  return result;
+}
+
 function normalizeVideo(item, catalogIndex = 0) {
   if (!item || typeof item !== "object") return null;
   const rawSlot = Math.floor(Number(item.video_slot || item.selection_order || 0));
@@ -1642,9 +1669,7 @@ function normalizeAssignments(value, activeCount, videos) {
     value.forEach((entry) => {
       if (!entry || typeof entry !== "object") return;
       const slot = clamp(entry.video_slot || 1, 1, activeCount);
-      const bindings = Array.isArray(entry.bindings)
-        ? entry.bindings.map((binding, index) => normalizeBinding(binding, slot, index + 1)).filter(Boolean)
-        : [];
+      const bindings = hmbDedupePickerBindings(entry.bindings, slot);
       bySlot.set(slot, bindings);
     });
   }
@@ -2023,7 +2048,7 @@ function previewVideo(state) {
 function selectedBindings(state, slot) {
   const item = state.slot_assignments.find((entry) => Number(entry.video_slot || 0) === slot);
   return item && Array.isArray(item.bindings)
-    ? item.bindings.map((binding, index) => normalizeBinding(binding, slot, index + 1)).filter(Boolean)
+    ? hmbDedupePickerBindings(item.bindings, slot)
     : [];
 }
 
@@ -2154,9 +2179,10 @@ function setSlotBindings(state, slot, bindings) {
       const currentSlot = index + 1;
       return {
         video_slot: currentSlot,
-        bindings: (currentSlot === slot ? bindings : selectedBindings(state, currentSlot))
-          .map((binding, row) => ({ ...normalizeBinding(binding, currentSlot, row + 1), video_slot: currentSlot, picker_order: row + 1 }))
-          .filter(Boolean),
+        bindings: hmbDedupePickerBindings(
+          currentSlot === slot ? bindings : selectedBindings(state, currentSlot),
+          currentSlot,
+        ),
       };
     }),
   };
@@ -4250,12 +4276,21 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     const liveState = currentWidgetState();
     const liveSlot = 1;
     const current = selectedBindings(liveState, liveSlot);
-    const duplicateColor = current.find((item) => clean(item.color) === color && clean(item.full_dag_path) !== clean(selectedNode.full_path));
+    const selectedIdentity = hmbPickerBindingIdentity({
+      maya_uuid: selectedNode.maya_uuid,
+      full_dag_path: selectedNode.full_path,
+    });
+    const duplicateColor = current.find((item) => (
+      clean(item.color) === color
+      && hmbPickerBindingIdentity(item) !== selectedIdentity
+    ));
     if (duplicateColor && !hmbPickerMarkerAllowsRepeat(color, liveState.marker_catalog)) {
       commit({ ...liveState, selected_color: color, message: `Color ${color} is already used by ${duplicateColor.group_name} in the current cut.` });
       return;
     }
-    const existingIndex = current.findIndex((item) => clean(item.full_dag_path) === clean(selectedNode.full_path));
+    const existingIndex = current.findIndex((item) => (
+      hmbPickerBindingIdentity(item) === selectedIdentity
+    ));
     const nextBinding = {
       group_name: clean(selectedNode.name),
       full_dag_path: clean(selectedNode.full_path),
@@ -4269,9 +4304,23 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       video_slot: liveSlot,
       picker_order: existingIndex >= 0 ? current[existingIndex].picker_order : current.length + 1,
     };
-    if (existingIndex >= 0) current[existingIndex] = nextBinding;
-    else current.push(nextBinding);
-    const next = setSlotBindings({ ...liveState }, liveSlot, current);
+    const withoutSelectedObject = current.filter((item) => (
+      hmbPickerBindingIdentity(item) !== selectedIdentity
+    ));
+    if (existingIndex >= 0) {
+      withoutSelectedObject.splice(
+        Math.min(existingIndex, withoutSelectedObject.length),
+        0,
+        nextBinding,
+      );
+    } else {
+      withoutSelectedObject.push(nextBinding);
+    }
+    const next = setSlotBindings(
+      { ...liveState },
+      liveSlot,
+      withoutSelectedObject,
+    );
     next.selected_color = color;
     next.status = "READY";
     next.message = `${clean(selectedNode.name)} → ${color} ${existingIndex >= 0 ? "updated" : "added"} for the current cut.`;

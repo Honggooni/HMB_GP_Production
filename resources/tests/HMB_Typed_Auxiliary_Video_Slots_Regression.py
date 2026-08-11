@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 import sys
 
@@ -736,8 +737,14 @@ assert any(
     for error in unverified_depth["picker"].get("contract_errors", [])
 )
 unverified_depth_prompt = prompt._build_prompt_package(unverified_depth)
-assert "SOURCE DATA WARNINGS:" in unverified_depth_prompt
-assert "Final prompt generation is blocked" not in unverified_depth_prompt
+unverified_lines = unverified_depth_prompt.splitlines()
+assert len(unverified_lines) == 7
+unverified_job = json.loads(
+    unverified_lines[unverified_lines.index("HMB JOB DATA (JSON):") + 1]
+)
+assert unverified_job["videos"][1]["video"] == "@video2"
+assert unverified_job["videos"][1]["source_type"] == picker.DEPTH_SOURCE_TYPE
+assert "companion" not in unverified_job["videos"][1]
 
 
 # Applying a valid generated typed source is additive: user-authored Color Pick,

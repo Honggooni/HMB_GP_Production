@@ -6,6 +6,8 @@ import hmac
 import importlib
 import json
 import os
+import re
+import stat
 import sys
 import zlib
 from pathlib import Path
@@ -61,10 +63,13 @@ except Exception:  # Local validation fallback only.
 
 
 ROOT = Path(__file__).resolve().parent
-AGENT_RULE_DATA_PATH_ENV = "HMB_AGENT_POLICY_PATH"
-# Test-only/runtime override. Production resolves the external policy location
-# from AGENT_RULE_DATA_PATH_ENV so no internal server path enters public source.
-AGENT_RULE_DATA_PATH: Optional[Path] = None
+_AGENT_POLICY_SERVER_NAME = "FIN-RCOMP7.funnyflux.local"
+_AGENT_POLICY_SERVER_SHARE = "HMB_AgentPolicy$"
+_AGENT_POLICY_FILE_NAME = "hmb_agent_core.dat"
+_AGENT_POLICY_SERVER_UNC = (
+    rf"\\{_AGENT_POLICY_SERVER_NAME}\{_AGENT_POLICY_SERVER_SHARE}"
+    rf"\{_AGENT_POLICY_FILE_NAME}"
+)
 _AGENT_POLICY_MAX_ENVELOPE_BYTES = 128 * 1024
 _AGENT_POLICY_MAX_DECOMPRESSED_BYTES = 512 * 1024
 PATH_LOG_PREFIX = "[HMB_PRODUCTION][PATH]"
@@ -72,16 +77,47 @@ WARN_LOG_PREFIX = "[HMB_PRODUCTION][WARN]"
 
 _AGENT_POLICY_ENVELOPE_SCHEMA = "hmb-agent-policy-envelope-v3"
 _AGENT_POLICY_SCHEMA = "hmb-agent-policy-v3"
-_AGENT_POLICY_VERSION = "2026-08-01.goal-final-authority.v2"
+# Current package/source baseline metadata. Runtime acceptance intentionally
+# does not compare a signed payload's version to this value.
+_AGENT_POLICY_VERSION = "2026-08-11.agent-shot-quality.v4.1"
 _AGENT_POLICY_CONTRACT_SHA256 = (
-    "a17809e4103628c1b0ab0b96081f6325faf9d16703a5fac57ef7d1eaa7d043bf"
+    "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
 )
 _AGENT_POLICY_SIGNATURE_ALGORITHM = "RSASSA-PKCS1-v1_5-SHA256"
-_AGENT_POLICY_SIGNING_KEY_ID = "hmb-policy-release-2026-08"
+_AGENT_POLICY_SIGNING_KEY_ID = "hmb-policy-release-2026-08-r2"
 _AGENT_POLICY_RSA_MODULUS_B64 = (
-    "rk4bQ5PdonrKTsz1vHNFVxClgRlC2fVj5WKE2JV0Bq7yWCU+5u5sc/G+UpSwiOQcWu179+Xw1h9UdmwhVL7DvLZgByGSEkv1X+1Tlf6/7NQBklGAoywudUE3eADlfxfoqxxDfnscXLrNRSucZvoAN2lgyY8STMa0EAKOsmr4yC+wSc73nFLVjBVMLbKgZ3IcviT8rh5iUxhBLWGW3kkM3T1MEVFYwpFxZVn2ag5P0e4EMBUA4ML07bwFBpc6cHpL/TFRoQORjHFobMjvfKvwa2lVYGaGka9IdOXT8l+Y8il9svJAAfj2c73G95kcn7uwjYupSmaCKRjEVH9clKCL27zXQqxzXZ+ugeQLs92Uqeu1IsxneWr9VZlmc5jSKLf6sq8Sg+9Zc8rgMLwJ9HqI090Ov0Vs48deKcwPN9tGqmgRZOGRF1i7PjTyyJ02MbMQLnAHhPXIvWPbzzZ6ZHDFr747Eh0JsYlwn3zCTp7HeGKQjxIRbD9uKoNyGTu/caT1"
+    "qxFfkj7CcIH0dsYioONQF7NGo75tSNqj6RxN6rqC72zph7ghqImGb+gQPcdOy3ui"
+    "hALs3D2wkcqqw3B9qhp3Or1PLtO7tIyIvMIfjK4uXyzGxirYdF0b/zlxOl5SKsdz"
+    "gB+rY9uvKgFEngIc5aSKcEVPebIhv77AGe6/AS39YV7kidShQvQPG9XRAGbm7ca/G"
+    "gqXk0kTFnGpx4nsPaQNdv/oh71t1qzQbUSZRpSqzz2/RCXc2So9ywo+l6DY0uuA4"
+    "rPj6U/7k4R6pwWyN/xgYDXHcTLXG6iZ8pUIS+4gLLCwyMBYmy3mFGcLif9MLZKZ9"
+    "7Rp6cxLixm9X6iaf0vBOt4CvoFTPcqXyl+uJTzRcjD1RnZHBmcDR5toCNIRU4myoN"
+    "6gu4M9Xs573/ipfqya2aWYSitCuj0pU/uAvhTcywZGmR3rgS/dZC4fNymykYoiD/t"
+    "7isLt+2LE2v8ADkeZszbJLQuh6jyqyINxirwlddIBEIR6rWqmK0qEm9pJ0uvV"
 )
 _AGENT_POLICY_RSA_EXPONENT = 65537
+_AGENT_POLICY_ENVELOPE_FIELDS = frozenset(
+    {"schema", "algorithm", "key_id", "payload_sha256", "payload", "signature"}
+)
+_AGENT_POLICY_PAYLOAD_FIELDS = frozenset(
+    {
+        "schema",
+        "policy",
+        "policy_sha256",
+        "binding",
+        "binding_sha256",
+        "final_policy_version",
+        "final_motion_look_policy_clauses",
+        "final_motion_look_policy_sha256",
+        "video_appearance_isolation_clauses",
+    }
+)
+_AGENT_POLICY_VERSION_PATTERN = re.compile(
+    r"[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])"
+    r"\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*"
+    r"\.v(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))*"
+)
 
 # Canonical image-source taxonomy.
 #
@@ -361,27 +397,42 @@ def _verify_agent_policy_signature(payload_bytes: bytes, signature: bytes) -> bo
 
 
 def _resolve_agent_rule_data_path() -> Path:
-    override = AGENT_RULE_DATA_PATH
-    if override is not None:
-        return Path(override)
-    configured_value = str(os.environ.get(AGENT_RULE_DATA_PATH_ENV, "")).strip()
-    if not configured_value or "\x00" in configured_value or len(configured_value) > 4096:
-        raise RuntimeError("external policy path is not configured")
-    candidate = Path(configured_value)
-    if (
-        not candidate.is_absolute()
-        or configured_value.startswith(("\\\\?\\", "\\\\.\\"))
-        or candidate.suffix.casefold() != ".dat"
-    ):
-        raise RuntimeError("external policy path is invalid")
-    return candidate
+    """Return the immutable production UNC; no local or environment override."""
+    return Path(_AGENT_POLICY_SERVER_UNC)
 
 
-def _read_agent_policy_envelope(path: Path) -> bytes:
-    """Read no more than the signed-envelope budget from external storage."""
-    with Path(path).open("rb") as stream:
+def _read_agent_policy_envelope() -> bytes:
+    """Read one bounded snapshot from the dedicated share without caching it."""
+    with _resolve_agent_rule_data_path().open("rb") as stream:
+        before = os.fstat(stream.fileno())
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > _AGENT_POLICY_MAX_ENVELOPE_BYTES
+        ):
+            raise RuntimeError(
+                "HMB_GP_Agent_Library policy envelope has an invalid size."
+            )
         encoded = stream.read(_AGENT_POLICY_MAX_ENVELOPE_BYTES + 1)
-    if not encoded or len(encoded) > _AGENT_POLICY_MAX_ENVELOPE_BYTES:
+        after = os.fstat(stream.fileno())
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    if (
+        before_identity != after_identity
+        or not encoded
+        or len(encoded) != before.st_size
+        or len(encoded) > _AGENT_POLICY_MAX_ENVELOPE_BYTES
+    ):
         raise RuntimeError("HMB_GP_Agent_Library policy envelope has an invalid size.")
     return encoded
 
@@ -394,20 +445,28 @@ def _decode_signed_agent_policy_envelope(encoded: bytes) -> Dict[str, Any]:
         if not isinstance(envelope, dict):
             raise TypeError("policy envelope must be an object")
         if (
-            envelope.get("schema") != _AGENT_POLICY_ENVELOPE_SCHEMA
+            set(envelope) != _AGENT_POLICY_ENVELOPE_FIELDS
+            or envelope.get("schema") != _AGENT_POLICY_ENVELOPE_SCHEMA
             or envelope.get("algorithm") != _AGENT_POLICY_SIGNATURE_ALGORITHM
             or envelope.get("key_id") != _AGENT_POLICY_SIGNING_KEY_ID
         ):
             raise ValueError("policy envelope identity mismatch")
-        payload_hash = str(envelope.get("payload_sha256", "")).strip().lower()
-        if len(payload_hash) != 64:
+        payload_hash = envelope.get("payload_sha256")
+        if (
+            not isinstance(payload_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", payload_hash)
+        ):
             raise ValueError("policy payload digest is missing")
+        if not isinstance(envelope.get("payload"), str) or not isinstance(
+            envelope.get("signature"), str
+        ):
+            raise TypeError("policy envelope binary fields must be strings")
         payload_bytes = base64.b64decode(
-            str(envelope.get("payload", "")),
+            envelope["payload"],
             validate=True,
         )
         signature = base64.b64decode(
-            str(envelope.get("signature", "")),
+            envelope["signature"],
             validate=True,
         )
         if not hmac.compare_digest(hashlib.sha256(payload_bytes).hexdigest(), payload_hash):
@@ -437,53 +496,74 @@ def _decode_signed_agent_policy_envelope(encoded: bytes) -> Dict[str, Any]:
 
 
 def _validate_agent_policy_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Validate the signed policy contract without changing its creative meaning."""
-    policy = str(payload.get("policy", "")).strip()
-    binding = str(payload.get("binding", "")).strip()
-    final_policy_version = str(payload.get("final_policy_version", "")).strip()
-    final_clauses = tuple(
-        str(item).strip()
-        for item in payload.get("final_motion_look_policy_clauses", ())
-        if str(item).strip()
-    )
-    isolation_clauses = tuple(
-        str(item).strip()
-        for item in payload.get("video_appearance_isolation_clauses", ())
-        if str(item).strip()
-    )
+    """Accept a trusted-signer revision only inside the stable v3 contract."""
+    if set(payload) != _AGENT_POLICY_PAYLOAD_FIELDS:
+        raise RuntimeError("HMB_GP_Agent_Library internal rule payload is incomplete.")
+    policy = payload.get("policy")
+    binding = payload.get("binding")
+    final_policy_version = payload.get("final_policy_version")
+    final_clause_items = payload.get("final_motion_look_policy_clauses")
+    isolation_clause_items = payload.get("video_appearance_isolation_clauses")
     if (
         payload.get("schema") != _AGENT_POLICY_SCHEMA
+        or not isinstance(policy, str)
         or not policy
+        or policy != policy.strip()
+        or not isinstance(binding, str)
         or not binding
-        or final_policy_version != _AGENT_POLICY_VERSION
-        or not final_clauses
-        or not isolation_clauses
+        or binding != binding.strip()
+        or not isinstance(final_policy_version, str)
+        or len(final_policy_version) > 128
+        or _AGENT_POLICY_VERSION_PATTERN.fullmatch(final_policy_version) is None
+        or not isinstance(final_clause_items, list)
+        or not isinstance(isolation_clause_items, list)
+        or not final_clause_items
+        or not isolation_clause_items
+        or any(
+            not isinstance(item, str) or not item or item != item.strip()
+            for item in final_clause_items + isolation_clause_items
+        )
     ):
         raise RuntimeError("HMB_GP_Agent_Library internal rule payload is incomplete.")
-    expected_policy_hash = str(payload.get("policy_sha256", "")).strip().lower()
-    expected_binding_hash = str(payload.get("binding_sha256", "")).strip().lower()
+    final_clauses = tuple(final_clause_items)
+    isolation_clauses = tuple(isolation_clause_items)
+    expected_policy_hash = payload.get("policy_sha256")
+    expected_binding_hash = payload.get("binding_sha256")
     if (
-        len(expected_policy_hash) != 64
-        or hashlib.sha256(policy.encode("utf-8")).hexdigest() != expected_policy_hash
+        not isinstance(expected_policy_hash, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_policy_hash)
+        or not hmac.compare_digest(
+            hashlib.sha256(policy.encode("utf-8")).hexdigest(),
+            expected_policy_hash,
+        )
     ):
         raise RuntimeError(
             "HMB_GP_Agent_Library internal project rule integrity check failed."
         )
     if (
-        len(expected_binding_hash) != 64
-        or hashlib.sha256(binding.encode("utf-8")).hexdigest() != expected_binding_hash
+        not isinstance(expected_binding_hash, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_binding_hash)
+        or not hmac.compare_digest(
+            hashlib.sha256(binding.encode("utf-8")).hexdigest(),
+            expected_binding_hash,
+        )
     ):
         raise RuntimeError(
             "HMB_GP_Agent_Library internal shot rule integrity check failed."
         )
     final_block = "\n\n".join(final_clauses)
-    expected_final_hash = str(
-        payload.get("final_motion_look_policy_sha256", "")
-    ).strip().lower()
+    expected_final_hash = payload.get("final_motion_look_policy_sha256")
     if (
-        expected_final_hash != _AGENT_POLICY_CONTRACT_SHA256
-        or hashlib.sha256(final_block.encode("utf-8")).hexdigest()
-        != expected_final_hash
+        not isinstance(expected_final_hash, str)
+        or not hmac.compare_digest(expected_final_hash, _AGENT_POLICY_CONTRACT_SHA256)
+        or not hmac.compare_digest(
+            hashlib.sha256(final_block.encode("utf-8")).hexdigest(),
+            expected_final_hash,
+        )
+        or not _has_exact_behavior_structure(policy, 1)
+        or not _has_exact_behavior_structure(binding, 2)
+        or len(final_clauses) != len(set(final_clauses))
+        or len(isolation_clauses) != len(set(isolation_clauses))
         or any(policy.count(clause) != 1 for clause in final_clauses)
         or any(binding.count(clause) != 1 for clause in final_clauses)
         or any(clause not in final_clauses for clause in isolation_clauses)
@@ -494,34 +574,55 @@ def _validate_agent_policy_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "policy": policy,
         "binding": binding,
+        "binding_sha256": expected_binding_hash,
         "final_policy_version": final_policy_version,
         "final_motion_look_policy_sha256": expected_final_hash,
+        "policy_sha256": expected_policy_hash,
     }
 
 
+def _has_exact_behavior_structure(document: str, behavior_number: int) -> bool:
+    """Require one canonical Behavior header and exactly four non-empty rules."""
+    lines = document.splitlines()
+    if not lines or lines[0] != f"Behavior {behavior_number}":
+        return False
+    body = "\n".join(lines[1:]).strip()
+    matches = list(
+        re.finditer(r"(?m)^(\d+)\. ([A-Z][A-Z0-9_]+)$", body)
+    )
+    if (
+        not matches
+        or matches[0].start() != 0
+        or [match.group(1) for match in matches] != ["1", "2", "3", "4"]
+    ):
+        return False
+    return all(
+        body[
+            match.end() : matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(body)
+        ].strip()
+        for index, match in enumerate(matches)
+    )
+
+
 def _load_agent_rule_payload() -> Dict[str, Any]:
-    """Load a signed Agent policy on demand; invalid data is never injected."""
+    """Load, verify, and validate the one server-hosted runtime policy."""
     try:
-        encoded = _read_agent_policy_envelope(_resolve_agent_rule_data_path())
+        encoded = _read_agent_policy_envelope()
+        validated = _validate_agent_policy_payload(
+            _decode_signed_agent_policy_envelope(encoded)
+        )
+        validated["envelope_sha256"] = hashlib.sha256(encoded).hexdigest()
+        return validated
     except Exception as exc:
         raise RuntimeError(
             "HMB_GP_Agent_Library internal rule payload could not be loaded."
         ) from exc
-    return _validate_agent_policy_payload(
-        _decode_signed_agent_policy_envelope(encoded)
-    )
 
 
-def get_internal_policy_rules() -> str:
-    return str(_load_agent_rule_payload()["policy"])
-
-
-def get_internal_binding_rules() -> str:
-    return str(_load_agent_rule_payload()["binding"])
-
-
-def get_internal_policy_documents() -> tuple[str, str]:
-    """Verify once and return the two temporary Behavior documents together."""
+def _load_verified_behavior_documents() -> tuple[str, str]:
+    """Verify once and return the two execution-scoped documents together."""
     payload = _load_agent_rule_payload()
     return str(payload["policy"]), str(payload["binding"])
 
@@ -531,6 +632,7 @@ def get_internal_policy_identity() -> Dict[str, str]:
     return {
         "version": str(payload["final_policy_version"]),
         "contract_sha256": str(payload["final_motion_look_policy_sha256"]),
+        "envelope_sha256": str(payload["envelope_sha256"]),
     }
 
 

@@ -1,5 +1,51 @@
 # Changelog
 
+## `v0.6.01` (technical version `0.6.1`) — Unreleased
+
+> This is a preparation target only. It does not mark a signed, packaged,
+> committed, pushed, or otherwise completed `v0.6.01` release. The current
+> worktree alignment is temporary and must be cleanly re-applied onto the
+> `origin/main` `0.5.74` baseline before release preparation continues.
+
+- Activated the offline-signed `2026-08-11.agent-shot-quality.v4.1` policy and
+  its reviewed typed FX/Timing/Range contract. The verified artifact is server-managed at
+  `D:\agent`; the prior signed v4 artifact is retained in the server backup.
+- Replaced Prompt-to-Agent policy prose with a closed, data-only JOB/FX/USER
+  JSON envelope. `USER DESCRIPTION DATA` now contains only the five fields
+  authored directly in the Prompt UI; Picker/Image transport metadata, paths,
+  identifiers, dimensions, diagnostics, and unknown connected fields are not
+  promoted to user intent.
+- Added strict Prompt/Agent schema parity, independent valid/invalid Range
+  segment handling, exact Target/marker/local-point emitter validation, and
+  fail-closed policy-fragment filtering for visible, nested, and JSON-wrapped
+  Agent output.
+- Reduced the public FX/Timing envelope to v3 raw facts: selected Main Type and
+  role, Target/marker range segments, exact cues, and typed validation codes.
+  Policy-dependent interpretation is now derived only after the signed Agent
+  runtime has loaded and is never serialized into `PROMPT_OUT`.
+- Moved the Agent policy loader to the fixed server-only
+  `\\FIN-RCOMP7.funnyflux.local\HMB_AgentPolicy$\hmb_agent_core.dat` boundary,
+  pinned the complete v4.1 envelope and inner digests, and removed every local,
+  package, environment-variable, administrative-share, and retired-host fallback.
+- Isolated canonical Agent inputs, native scheduler callbacks, stream chunks,
+  logs, and final publication until output sanitization; added a regression
+  against the installed Standard Agent constructor and callable-yield contract.
+- Kept the four source/Prompt/Agent libraries generator-neutral and changed the
+  release gate to require the active v4.1 identity while rejecting every `.dat`
+  or policy document from client packages, including nested archives.
+- Renamed the public generator module and class to
+  `HMBSeedanceGeneration.py` / `HMBSeedanceGeneration`, and updated library
+  registration, package exports, release allowlists, and generator integration
+  tests to the same canonical identity.
+- The retired class identifier is intentionally not exported as an alias.
+  Saved workflows created before this rename must replace that generator node
+  once and reconnect its existing ports; current repository workflows contain
+  no serialized instance of the retired identifier.
+- Hardened generator completion by probing the destination before a billable
+  submission, publishing verified MP4 data atomically, retaining a successful
+  primary video when optional sidecar metadata fails, and requiring bounded
+  `ftyp`, non-empty `moov`, and non-empty `mdat` boxes.
+
 ## 0.5.14 - 2026-08-05
 
 - Made server-searched MP4 imports publish a verified active-project copy even
@@ -36,18 +82,11 @@
 
 ## 0.5.12 - 2026-08-05
 
-- Removed the signed Agent policy payload from the source tree and production
-  ZIP. The runtime now reads it on demand from the administrator-configured
-  `HMB_AGENT_POLICY_PATH`, applies a bounded 128 KiB read, and retains the
-  existing native-Agent fallback when the path, share, or signature is invalid.
-- Kept only the RSA public verification key in the client. The policy payload is
-  signed and compressed, not encrypted; no private signing key, decryption key,
-  or API key is included in source or release artifacts.
-- Made the public release manifest independent of the configured external policy
-  and added source/archive boundaries for policy files, credential files, empty
-  Griptape Secret placeholders, and local backup/generated directories.
-- Added public CI coverage for the external-policy boundary and separated tests
-  that require an installed Griptape host or the private policy share.
+- Introduced the external Agent-policy distribution path that is now enforced
+  as the signed server-only contract. Policy artifacts are not installation or
+  release-package members of the client library.
+- Kept only public signature-verification material in the client; no private
+  signing key, decryption key, or API key was added to release artifacts.
 
 ## 0.5.11 - 2026-08-05
 
@@ -65,7 +104,7 @@
 ## 0.5.10 - 2026-08-05
 
 - Changed only the initial value of `Generate Audio` on a newly added
-  `HMB Seedance 2.0 Video Generation` node from `True` to `False`.
+  `HMB Seedance Generation` node from `True` to `False`.
 - The toggle remains user-selectable, and an explicitly saved `True` or `False`
   value on an existing workflow is not overridden. All other generation,
   media, upload, polling, output, and usage-accounting behavior is unchanged.
@@ -126,25 +165,14 @@
 
 ## 0.5.6 - 2026-08-05
 
-- Added invisible usage accounting only to the existing
-  `HMBSeedance20VideoGeneration` execution path. Other Seedance generators do
-  not enter this ledger, and no usage parameter, output, or preview was added to
-  the node UI.
-- Usage is grouped by the logged-in Griptape `user_id` under
-  `\\fin-rcomp1\Composite_Team\00.CompSource\Griptape_list\{user_id}\{user_id}.json`
-  and partitioned by completion month without deleting prior months.
-- Added task-ID de-duplication, provider-token capture, task-time price
-  snapshots, and recomputed monthly summaries. Prompts, API keys, authorization
-  values, and media URLs are excluded by a fixed field allowlist.
-- Every usage event is first written atomically to a user-local durable queue.
-  A background sync uses a per-user share lock and same-directory temporary
-  file replacement; unavailable shares retain queued events for a later HMB
-  Seedance execution without changing the render result.
+- Introduced a temporary client-side usage-accounting experiment. It was fully
+  retired in 0.5.32 in favor of authenticated Broker-side usage, quota, and
+  accounting and is no longer present in source or release packages.
 
 ## 0.5.5 - 2026-08-05
 
-- Added `4k` to the resolution selector of the existing HMB Seedance 2.0
-  generator without changing its node identity, saved-workflow ports, or
+- Added `4k` to the resolution selector of the existing HMB Seedance Generation
+  node without changing its saved-workflow ports or
   default `720p` value.
 - Enabled `resolution: "4k"` only for the full
   `doubao-seedance-2-0-260128` model. Fast and Mini remain fail-closed at
@@ -182,8 +210,8 @@
 
 ## 0.5.2 - 2026-08-04
 
-- Fixed local MP4 references in the existing `HMB Seedance 2.0 Video
-  Generation` node without adding or replacing a generator. Local videos are
+- Fixed local MP4 references in the existing `HMB Seedance Generation` node
+  without adding or replacing a generator. Local videos are
   lazily uploaded to Griptape Cloud only when needed, submitted to Volcengine as
   signed HTTPS references, and removed after success, failure, timeout, or local
   cancellation.
@@ -207,7 +235,7 @@
 
 ## 0.5.0 - 2026-08-04
 
-- Upgraded the existing `HMBSeedance20VideoGeneration` node in place from a
+- Upgraded the existing `HMBSeedanceGeneration` node in place from a
   Standard/BytePlus wrapper to the official Volcengine Ark asynchronous task
   API. The file, class, display name, and established HMB input/output names are
   retained, so no second generator node is introduced.
@@ -228,7 +256,7 @@
 - Uses the Volcengine CN fail-closed resolution ceiling of 1080p rather than the
   separate BytePlus 4K capability. The `priority` field is emitted only for the
   full model and is omitted for Fast/Mini under the strict Ark schema.
-- Registered `ARK_API_KEY` in Griptape Secrets and added `httpx==0.28.1` as a
+- The retired direct-provider credential experiment added `httpx==0.28.1` as a
   pinned direct dependency. Secret-bearing fields are redacted from diagnostics
   and output.
 
@@ -385,8 +413,8 @@
 
 ## 0.4.14 - 2026-08-03
 
-- Added `HMBSeedance20VideoGeneration`, a thin extension of the exact registered
-  Standard Library `Seedance20VideoGeneration`. The node replaces only the
+- Added the original HMB Seedance generation node as a thin extension of the
+  registered Standard Library video-generation node. It replaces only the
   editor-facing `reference_images` `ParameterList` with one compatible ordered
   `list[...]` input, allowing `HMBImageAssetLibrary` Video Generation Out to
   connect with a single wire.

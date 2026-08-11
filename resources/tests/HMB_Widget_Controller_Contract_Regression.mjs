@@ -497,8 +497,8 @@ assert.match(
 );
 assert.doesNotMatch(
   agentSource,
-  /PROJECT_IDENTITY_SOURCE_AUTHORITY_AND_LANGUAGE|SHOT_ACTIVATION_IDENTIFIERS_IMAGE_AND_MARKER_BINDING/,
-  "Agent widget source must not contain internal policy identifiers.",
+  /hmb_agent_core\.dat|rulesets|Behavior\s+[12]/i,
+  "Agent widget source must not contain sealed-policy transport or rule containers.",
 );
 assert.match(agentSource, /<b>HMBAgentLibrary<\/b>/, "Agent must use the HMBAgentLibrary title.");
 assert.match(agentSource, /DISPLAY → FINAL TEXT/, "Agent header must identify the public text output.");

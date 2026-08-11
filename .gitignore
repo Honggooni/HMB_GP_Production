@@ -15,9 +15,11 @@ backups/
 dist/
 *.zip
 
-# Agent policy payloads are managed on the internal network share
+# Agent policy artifacts are server-managed and never enter this repository or
+# an installable package. Policy source/review material also remains separate.
 resources/agent/
 resources/policy/
+policies/
 **/hmb_agent_core.dat
 
 # Credentials and machine-local configuration

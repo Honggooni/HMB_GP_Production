@@ -586,9 +586,19 @@ try:
         if item["owner"]
     } == {"manual owner-only target"}
     selected_prompt = prompt_library._build_prompt_package(selected_hero)
-    assert "@image1 = Hero" in selected_prompt
-    assert "manual named target" in selected_prompt
-    assert "manual owner-only target" not in selected_prompt
+    selected_lines = selected_prompt.splitlines()
+    assert len(selected_lines) == 7
+    selected_job = json.loads(
+        selected_lines[selected_lines.index("HMB JOB DATA (JSON):") + 1]
+    )
+    assert [(item["image"], item["label"]) for item in selected_job["images"]] == [
+        ("@image1", "Hero"),
+    ]
+    assert selected_job["images"][0]["target_id"] == "manual named target"
+    assert all(
+        item.get("target_id") != "manual owner-only target"
+        for item in selected_job["images"]
+    )
 
     # A stale or forced frontend value cannot create a visible manual row while
     # ASSET_IN is connected. Preserve it only in the dormant cache so disconnect

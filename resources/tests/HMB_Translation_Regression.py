@@ -2,6 +2,8 @@ from pathlib import Path
 import importlib.util
 import sys
 
+from _hmb_private_policy_fixture import install_private_policy_reader
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -16,11 +18,17 @@ def load(name):
 
 common = load("_hmb_common")
 agent = load("HMBAgentLibrary")
+prompt = load("HMBPromptLibrary")
+install_private_policy_reader(common)
+if agent._hmb is not common:
+    install_private_policy_reader(agent._hmb)
 
-policy_file = common.get_internal_policy_rules().strip()
-binding_file = common.get_internal_binding_rules().strip()
-assert common.get_internal_policy_rules() == policy_file
-assert common.get_internal_binding_rules() == binding_file
+policy_file, binding_file = common._load_verified_behavior_documents()
+policy_file = policy_file.strip()
+binding_file = binding_file.strip()
+reloaded_policy, reloaded_binding = common._load_verified_behavior_documents()
+assert reloaded_policy.strip() == policy_file
+assert reloaded_binding.strip() == binding_file
 for retired_name in (
     "add_string",
     "add_choice",
@@ -48,6 +56,7 @@ for text in (policy_file, binding_file):
         "exact identifier" in lower
         or "exact active identifier" in lower
         or "preserve every provided name" in lower
+        or ("preserve" in lower and "provided name" in lower)
     )
     assert "hidden rule text" in lower or "hidden rules" in lower
     assert "seedance" not in lower
@@ -55,21 +64,16 @@ for text in (policy_file, binding_file):
 assert len(agent._split_behavior_rules(policy_file, 4)) == 4
 assert len(agent._split_behavior_rules(binding_file, 4)) == 4
 
-hmb_payload = """HMB_GP_Production
-TARGET GENERATOR:
-Active downstream generator
-IMAGE SOURCE:
-@image1 = 제이민
-IMAGE ROLE MAP:
-제이민 / Approved final appearance source = @image1
-REPLACEMENT BINDING:
-제이민
-VIDEO SOURCE:
-No video source assigned in HMBPromptLibrary.
-USER DESCRIPTION DATA (JSON):
-{"SCENE_CONTEXT":"어두운 창고"}
-"""
+prompt_state = prompt._default_widget_state()
+prompt_state["text"]["SCENE_CONTEXT"] = "어두운 창고"
+hmb_payload = prompt._build_prompt_package(prompt_state)
 assert agent._is_hmb_prompt_library_payload(hmb_payload)
+payload_lines = hmb_payload.splitlines()
+assert len(payload_lines) == 7
+assert payload_lines[5] == "USER DESCRIPTION DATA (JSON):"
+assert __import__("json").loads(payload_lines[6]) == {
+    "SCENE_CONTEXT": "어두운 창고",
+}
 assert not agent._is_hmb_prompt_library_payload("ordinary standalone prompt")
 assert not agent._is_hmb_prompt_library_payload("HMB_GP_Production\nTARGET GENERATOR:\nonly")
 

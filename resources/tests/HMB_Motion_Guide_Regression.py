@@ -43,15 +43,6 @@ assert "Derived Motion Decoding Only" in prompt.VIDEO_CONTROL_ROLE_CHOICES
 assert prompt.VIDEO_ROLE_COMPATIBILITY[
     "Motion Guide / Retargeting Reference"
 ] == {"Derived Motion Decoding Only"}
-motion_spec = prompt.SELF_SCOPED_AUXILIARY_REFERENCE_SPECS[
-    (
-        "Motion Guide / Retargeting Reference",
-        "Derived Motion Decoding Only",
-    )
-]
-assert motion_spec["authority_domain"] == "derived_motion_decoding"
-assert "explicit current user goals" in motion_spec["authority"]
-assert "zero independent motion" not in motion_spec["authority"]
 
 
 # A companion request always binds generation identity to @video1.
@@ -286,9 +277,16 @@ assert motion_row["picker_motion_guide_summary"] == {
     "raw_curve_geometry_rendered": False,
 }
 compiled_prompt = prompt._build_prompt_package(applied)
-assert "verified semantic face summary" in compiled_prompt
-assert "1 final Blend Shape channel(s)" in compiled_prompt
-assert "raw NURBS curve geometry is never rendered" in compiled_prompt
+compiled_lines = compiled_prompt.splitlines()
+assert len(compiled_lines) == 7
+compiled_job = json.loads(
+    compiled_lines[compiled_lines.index("HMB JOB DATA (JSON):") + 1]
+)
+compiled_motion = compiled_job["videos"][1]
+assert compiled_motion["source_type"] == "Motion Guide / Retargeting Reference"
+assert compiled_motion["control_role"] == "Derived Motion Decoding Only"
+assert compiled_motion["companion"]["kind"] == "motion_guide"
+assert compiled_motion["companion"]["validated"] is True
 
 bad_payload = copy.deepcopy(picker_payload)
 bad_payload["videos"][1]["bundle_run_id"] = "other-bundle"

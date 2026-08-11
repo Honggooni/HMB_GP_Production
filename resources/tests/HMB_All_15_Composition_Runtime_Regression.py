@@ -9,6 +9,8 @@ import types
 from itertools import combinations
 from pathlib import Path
 
+from _hmb_private_policy_fixture import install_private_policy_reader
+
 
 ROOT = Path(__file__).resolve().parents[2]
 ORDER = ("I", "V", "P", "A")
@@ -27,6 +29,7 @@ image = load("HMBImageAssetLibrary")
 video = load("HMBVideoPickerLibrary")
 prompt = load("HMBPromptLibrary")
 agent = load("HMBAgentLibrary")
+install_private_policy_reader(agent._hmb)
 
 COMPOSITIONS = tuple(
     frozenset(values)
@@ -152,7 +155,7 @@ def assert_user_state_survives(state: dict, label: str) -> None:
     assert "@video4" in state["text"]["SCENE_CONTEXT"], label
 
 
-def assert_goal_first_prompt(compiled: str, label: str) -> None:
+def assert_data_only_prompt(compiled: str, label: str) -> None:
     assert "ALL15_USER_GOAL_SENTINEL" in compiled, label
     assert "MANUAL_VIDEO2_SENTINEL.mp4" in compiled, label
     assert "MANUAL_VIDEO5_SENTINEL.mp4" in compiled, label
@@ -185,17 +188,22 @@ def exercise_agent_once(
     node._hmb_binding = ""
     node._hmb_policy_rules = []
     node._hmb_binding_rules = []
-    node._hmb_goal_first_rules = []
-    node._hmb_structured_rules_active = False
+    node._hmb_ruleset_names = ("", "")
     node._hmb_native_calls_this_process = 0
     calls: list[tuple[bool, bool, int, int, int]] = []
 
     def native_once(self):
+        names = tuple(self._hmb_ruleset_names)
         calls.append(
             (
                 bool(self._hmb_rules_active),
-                bool(self._hmb_structured_rules_active),
-                len(self._hmb_goal_first_rules),
+                len(set(names)) == 2
+                and all(
+                    len(name) == 32
+                    and all(character in "0123456789abcdef" for character in name)
+                    for name in names
+                ),
+                sum(bool(name) for name in names),
                 len(self._hmb_policy_rules),
                 len(self._hmb_binding_rules),
             )
@@ -221,8 +229,8 @@ def exercise_agent_once(
     except StopIteration as stop:
         assert stop.value == "agent-output"
     assert len(calls) == 1
-    active, structured, goal_rules, project_rules, shot_rules = calls[0]
-    return len(calls), active, structured, goal_rules, project_rules, shot_rules
+    active, opaque_names, name_count, project_rules, shot_rules = calls[0]
+    return len(calls), active, opaque_names, name_count, project_rules, shot_rules
 
 
 runtime_results: dict[str, dict] = {}
@@ -250,15 +258,20 @@ try:
 
             if "I" in composition:
                 image_node = image.HMBImageAssetLibrary(name=f"all15_image_{label}")
-                image_output = image_node.process()
+                assert image_node.process() is None
+                image_output = json.loads(
+                    image_node.parameter_output_values[image.OUTPUT_PARAMETER]
+                )
                 assert image_output["mode"] == "image_asset", label
                 outputs["I"] = image_output
 
             if "V" in composition:
                 video_node = video.HMBVideoPickerLibrary(name=f"all15_video_{label}")
-                video_output = video_node.process()
+                assert video_node.process() is None
+                video_output = json.loads(
+                    video_node.parameter_output_values["PICKER_OUT"]
+                )
                 assert video_output["mode"] == "maya", label
-                assert video_output["action"] == "sync_outputs", label
                 outputs["V"] = video_output
 
             compiled = ""
@@ -281,7 +294,7 @@ try:
                     edges.add("V->P")
                 assert_user_state_survives(state, f"{label}:connected")
                 compiled = prompt._build_prompt_package(state)
-                assert_goal_first_prompt(compiled, label)
+                assert_data_only_prompt(compiled, label)
                 assert bool(state["image_asset"]["enabled"]) is ("I" in composition), label
                 assert bool(state["picker"]["enabled"]) is ("V" in composition), label
                 outputs["P"] = compiled
@@ -299,7 +312,7 @@ try:
                         connected=True,
                     )
                     assert_user_state_survives(reverse, f"{label}:reverse")
-                    assert_goal_first_prompt(prompt._build_prompt_package(reverse), f"{label}:reverse")
+                    assert_data_only_prompt(prompt._build_prompt_package(reverse), f"{label}:reverse")
 
             agent_calls = 0
             if "A" in composition:
@@ -312,7 +325,7 @@ try:
                 assert route[0] == 1, label
                 if "P" in composition:
                     edges.add("P->A")
-                    assert route[1:] == (True, True, 1, 4, 4), label
+                    assert route[1:] == (True, True, 2, 4, 4), label
                 else:
                     assert route[1:] == (False, False, 0, 0, 0), label
                 outputs["A"] = "agent-output"

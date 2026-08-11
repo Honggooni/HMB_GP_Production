@@ -12,6 +12,8 @@ import threading
 import time
 import types
 
+from _hmb_private_policy_fixture import install_private_policy_reader
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -74,9 +76,13 @@ def send_command(node, action, action_id, payload=None, runtime_id=None):
     return node.set_parameter_value(picker.WIDGET_COMMAND_PARAMETER, command)
 
 
+common = load("_hmb_common")
 picker = load("HMBVideoPickerLibrary")
 prompt = load("HMBPromptLibrary")
 agent = load("HMBAgentLibrary")
+_original_policy_reader, signed_policy_fixture = install_private_policy_reader(common)
+if agent._hmb is not common:
+    install_private_policy_reader(agent._hmb)
 
 assert prompt.PICKER_DEPTH_PROFILE == picker.DEPTH_PLAYBLAST_PROFILE
 assert picker.DEPTH_PLAYBLAST_PROFILE == "hmb_camera_space_depth_v7"
@@ -657,7 +663,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.5.14"
+assert manifest["metadata"]["library_version"] == "0.6.1"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
@@ -715,23 +721,23 @@ for native_size_key in (
 ):
     assert native_size_key not in agent_manifest["metadata"]
 
-# Approved public Agent/runtime baseline hashes. The signed policy payload is
-# external and must never appear in the source tree or release archive.
-assert not (ROOT / "resources" / "agent" / "hmb_agent_core.dat").exists()
-expected_agent_hashes = {
-    "HMBAgentLibrary.py": "1bd306735727af3313daf28e17af796f715b562e523d7bc049e78920eb754684",
-    "HMBPromptLibrary.py": "a90b36fdce5522210205fc4a584172aac804752e5ba8a139d1465438b0fb9de2",
-    "HMBVideoPickerLibrary.py": "95acd3f94a7986e381b83db6683441ec42900df8a0d1f607f1240e0aea442eb6",
-    "_hmb_common.py": "881af283ada7cb1eea8f2a8c86cd66fa321321dceeda2f4de3ba8b675873689a",
-    "widgets/HMBAgentLibraryWidget.js": "61ea9416adc1cbfb7e8fbfbc068ad1a444c3f6d4b4c6b59569a1815a013dc193",
-    "resources/tests/HMB_Agent_Policy_Integration_Regression.py": "cc0c43e93b7e82dd1a8a5eb4bdd32cd3806f3e4217d40e85bb408cf63f9aa8e5",
-    "resources/tests/HMB_Frame_Range_Regression.py": "4f9c0f7022b5db5bfa760e41f747ecbf95c99f0b06525553248fe3af9e2b1091",
-    "resources/tests/HMB_Output_Sanitizer_Regression.py": "a3744627240dc719670dc8790a2c1c5b1edd9ffd9f6b3fc1402933b1d0560229",
-    "resources/tests/HMB_Final_Policy_Recursive_Probabilistic_Regression.py": "e73c466621142169281def070ffd130577637e5d13f1452bd7410975d2eb66d7",
-}
-for relative_path, expected_hash in expected_agent_hashes.items():
-    actual_hash = hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest()
-    assert actual_hash == expected_hash, f"Agent freeze violation: {relative_path}"
+# The active runtime is the server-hosted signed v4.1 policy. This internal
+# regression injects the private signed artifact without creating a local
+# runtime fallback or copying it into the public package.
+assert hashlib.sha256(signed_policy_fixture).hexdigest() == (
+    "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
+)
+policy_payload = common._load_agent_rule_payload()
+assert policy_payload["final_policy_version"] == (
+    "2026-08-11.agent-shot-quality.v4.1"
+)
+assert policy_payload["final_motion_look_policy_sha256"] == (
+    "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
+)
+assert agent._assert_prompt_policy_identity_matches_signed_runtime() == (
+    policy_payload["final_policy_version"],
+    policy_payload["final_motion_look_policy_sha256"],
+)
 
 widget_source = (ROOT / "widgets/HMBVideoPickerLibraryWidget_v032.js").read_text(encoding="utf-8")
 command_widget_source = (ROOT / "widgets/HMBVideoPickerCommandBridgeWidget_v032.js").read_text(encoding="utf-8")

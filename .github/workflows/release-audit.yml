@@ -5,6 +5,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   windows-release-audit:
     runs-on: windows-latest
@@ -23,46 +26,35 @@ jobs:
         run: |
           $tracked = @(git ls-files)
           $forbidden = @($tracked | Where-Object {
-            $_ -match '(^|/)(\.tmp|\.venv|backups|dist|GriptapeNodes|resources/agent|resources/policy)/' -or
+            $_ -match '(^|/)(\.tmp|\.venv|backups|dist|GriptapeNodes|resources/agent|resources/policy|policies?)/' -or
             $_ -match '(^|/)hmb_agent_core\.dat$' -or
+            $_ -match '(policy|policies).*(?:_ko(?:\.|$)|korean)' -or
             $_ -match '(^|/)\.env($|\.)' -or
             $_ -match '(^|/)(credentials|secrets)[^/]*\.json$' -or
             $_ -match '(^|/)(id_rsa|id_ed25519)[^/]*$' -or
-            $_ -match '\.(jwk|key|p12|pem|pfx|secret|token|zip)$'
+            $_ -match '\.(dat|jwk|key|p12|pem|pfx|secret|token|zip)$'
           })
           if ($forbidden.Count -ne 0) {
             throw "Forbidden private/generated tracked paths: $($forbidden -join ', ')"
           }
       - name: Install pinned direct dependencies
         run: python -m pip install "Pillow==12.3.0" "imageio-ffmpeg==0.6.0" "httpx==0.28.1" "tos==2.9.2"
-      - name: PowerShell policy administration syntax
-        shell: pwsh
-        run: |
-          $scripts = @(
-            "resources/admin/Configure_HMB_Agent_Policy_Share.ps1",
-            "resources/admin/Test_HMB_Agent_Policy_Share.ps1",
-            "resources/admin/Finalize_HMB_Agent_Policy_Migration.ps1"
-          )
-          foreach ($script in $scripts) {
-            $tokens = $null
-            $errors = $null
-            [void][System.Management.Automation.Language.Parser]::ParseFile(
-              (Resolve-Path $script).Path,
-              [ref]$tokens,
-              [ref]$errors
-            )
-            if ($errors.Count -ne 0) { throw "PowerShell parse failed: $script" }
-          }
       - name: Python release regressions
         shell: pwsh
         env:
           HMB_IMAGE_PROJECTS_ROOT: ${{ github.workspace }}
         run: |
-          # Policy-content and live-host regressions run only on internal hosts
-          # configured with HMB_AGENT_POLICY_PATH and Griptape Nodes.
+          # Live-host policy-content regressions run only on protected internal
+          # hosts. Public CI verifies the server-only loader and package boundary.
           $tests = @(
-            "HMB_External_Policy_Boundary_Regression.py",
-            "HMB_Agent_Policy_Share_Security_Regression.py",
+            "HMB_Look_Attribute_Scope_Regression.py",
+            "HMB_Data_Only_Prompt_Security_Regression.py",
+            "HMB_FX_Timing_Range_Contract_Regression.py",
+            "HMB_Four_Library_Generator_Neutrality_Regression.py",
+            "HMB_Real_Standard_Agent_Boundary_Regression.py",
+            "HMB_Server_Policy_Boundary_Regression.py",
+            "HMB_Signed_Policy_Hot_Update_Regression.py",
+            "HMB_Public_Release_Security_Regression.py",
             "HMB_State_Normalization_Property_Regression.py",
             "HMB_Image_Asset_Import_Order_Regression.py",
             "HMB_Image_Asset_Resolved_Selection_Regression.py",
@@ -79,7 +71,6 @@ jobs:
             "HMB_Picker_State_Compaction_Regression.py",
             "HMB_VideoPicker_Media_Availability_Regression.py",
             "HMB_VideoPicker_High_Quality_Original_Regression.py",
-            "HMB_VideoPicker_Reliability_Regression.py",
             "HMB_Typed_Auxiliary_Video_Slots_Regression.py"
           )
           foreach ($test in $tests) {
@@ -93,12 +84,15 @@ jobs:
             node $_.FullName
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-      - name: Reproducible release build
+      - name: Server policy administration static regression
+        shell: powershell
+        run: >-
+          powershell -NoProfile -ExecutionPolicy Bypass -File
+          resources/tests/HMB_Agent_Policy_Admin_Scripts_Static_Regression.ps1
+      - name: Release builder static syntax audit
         shell: pwsh
         run: |
-          python resources/build_release.py
-          $first = (Get-FileHash dist/HMB_GP_Production.zip -Algorithm SHA256).Hash
-          python resources/build_release.py
-          $second = (Get-FileHash dist/HMB_GP_Production.zip -Algorithm SHA256).Hash
-          if ($first -ne $second) { throw "Release ZIP is not reproducible." }
-          python resources/tests/HMB_Public_Release_Security_Regression.py
+          # Public CI never receives or materializes a signed policy artifact or
+          # policy review document. This check builds only an in-memory ZIP.
+          python -m py_compile resources/build_developer_release.py
+          python resources/build_developer_release.py --check

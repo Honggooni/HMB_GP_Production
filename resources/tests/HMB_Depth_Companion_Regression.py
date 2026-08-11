@@ -590,11 +590,12 @@ non_maya_prompt_state = prompt._apply_picker_payload(
     connected=True,
 )
 assert non_maya_prompt_state["videos"] == valid_prompt_state["videos"]
-assert any(
-    "external_video" in str(entry.get("text") or "")
-    for entry in non_maya_prompt_state.get("source_intent_fallbacks", [])
-    if isinstance(entry, dict)
-)
+assert non_maya_prompt_state.get("source_intent_fallbacks", []) == []
+non_maya_lines = prompt._build_prompt_package(non_maya_prompt_state).splitlines()
+assert len(non_maya_lines) == 7
+assert json.loads(
+    non_maya_lines[non_maya_lines.index("USER DESCRIPTION DATA (JSON):") + 1]
+) == {}
 
 # Legacy local slot suppression cannot override a UID-managed Picker order.
 # Selection/deletion is authored in the catalog, so reconnecting the same
@@ -660,9 +661,13 @@ assert_auto_depth_preserved_as_independent_media(legacy_invalid_state)
 legacy_invalid_state["videos"][1]["label"] = "manual-new-label"
 legacy_invalid_state["videos"][1]["present"] = True
 legacy_reactivated_prompt = prompt._build_prompt_package(legacy_invalid_state)
-assert "Depth / Spatial Reference" in legacy_reactivated_prompt
-assert "Spatial Alignment Verification Only" in legacy_reactivated_prompt
-assert "Final prompt generation is blocked" not in legacy_reactivated_prompt
+legacy_lines = legacy_reactivated_prompt.splitlines()
+legacy_job = json.loads(
+    legacy_lines[legacy_lines.index("HMB JOB DATA (JSON):") + 1]
+)
+legacy_depth = legacy_job["videos"][1]
+assert legacy_depth["source_type"] == "Depth / Spatial Reference"
+assert legacy_depth["control_role"] == "Spatial Alignment Verification Only"
 
 
 # Manual values that existed before Picker temporarily classified @video2 as
@@ -729,11 +734,13 @@ manual_non_maya = prompt._apply_picker_payload(
     connected=True,
 )
 assert manual_non_maya["videos"] == manual_then_valid["videos"]
-assert any(
-    "external_video" in str(entry.get("text") or "")
-    for entry in manual_non_maya.get("source_intent_fallbacks", [])
-    if isinstance(entry, dict)
-)
+assert manual_non_maya.get("source_intent_fallbacks", []) == []
+manual_non_maya_lines = prompt._build_prompt_package(manual_non_maya).splitlines()
+assert json.loads(
+    manual_non_maya_lines[
+        manual_non_maya_lines.index("USER DESCRIPTION DATA (JSON):") + 1
+    ]
+) == {}
 
 manual_deleted_source = copy.deepcopy(manual_then_valid)
 manual_deleted_source["videos"][1] = prompt._default_video_item(2)

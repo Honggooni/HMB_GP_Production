@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -15,6 +16,22 @@ assert SPEC is not None and SPEC.loader is not None
 prompt = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = prompt
 SPEC.loader.exec_module(prompt)
+
+
+def prompt_job(payload: str) -> dict:
+    lines = payload.splitlines()
+    assert lines[0] == "HMB_GP_Production"
+    assert len(lines) == 7
+    return json.loads(lines[lines.index("HMB JOB DATA (JSON):") + 1])
+
+
+def resolved_companion_video(job: dict, video_index: int = 0) -> str:
+    companion_uid = job["videos"][video_index]["companion"]["source_uid"]
+    return next(
+        video["video"]
+        for video in job["videos"]
+        if video["identity"].get("source_uid") == companion_uid
+    )
 
 
 def frame_metadata(uid: str, slot: int) -> dict:
@@ -121,16 +138,19 @@ assert depth["picker_companion_source_uid"] == "mask"
 assert depth["picker_companion_source_slot"] == 3
 assert depth["picker_companion_validated"] is True
 compiled = prompt._build_prompt_package(reordered)
-assert "@video1 = Depth / Spatial Reference" in compiled
-assert "@video1 Picker slot contract = MATCHED against @video3" in compiled
-assert "@video1 Picker slot contract = MATCHED against @video1" not in compiled
+compiled_job = prompt_job(compiled)
+assert compiled_job["videos"][0]["video"] == "@video1"
+assert compiled_job["videos"][0]["source_type"] == "Depth / Spatial Reference"
+assert compiled_job["videos"][0]["companion"]["validated"] is True
+assert resolved_companion_video(compiled_job) == "@video3"
 
 # Stable UID wins over a stale serialized transient source slot.
 uid_authoritative = copy.deepcopy(reordered)
 uid_authoritative["videos"][0]["picker_companion_source_slot"] = 1
 uid_authoritative_prompt = prompt._build_prompt_package(uid_authoritative)
-assert "@video1 Picker slot contract = MATCHED against @video3" in uid_authoritative_prompt
-assert "MATCHED against @video1" not in uid_authoritative_prompt
+uid_authoritative_job = prompt_job(uid_authoritative_prompt)
+assert uid_authoritative_job["videos"][0]["companion"]["source_uid"] == "mask"
+assert resolved_companion_video(uid_authoritative_job) == "@video3"
 
 
 # The compiled conflict path also names the declared source, never a positional
@@ -145,8 +165,9 @@ mismatched = prompt._apply_picker_payload(
     connected=True,
 )
 mismatch_prompt = prompt._build_prompt_package(mismatched)
-assert "@video1 self-scoped alignment does not match @video3" in mismatch_prompt
-assert "does not match @video1" not in mismatch_prompt
+mismatch_job = prompt_job(mismatch_prompt)
+assert mismatch_job["videos"][0]["companion"]["source_uid"] == "mask"
+assert resolved_companion_video(mismatch_job) == "@video3"
 
 
 # Motion Guide uses the same UID/source resolution and may also occupy slot 1.
@@ -171,7 +192,9 @@ motion = prompt._apply_picker_payload(
 motion_prompt = prompt._build_prompt_package(motion)
 assert motion["videos"][0]["picker_companion_kind"] == "motion_guide"
 assert motion["videos"][0]["picker_companion_source_slot"] == 3
-assert "@video1 Picker slot contract = MATCHED against @video3" in motion_prompt
+motion_job = prompt_job(motion_prompt)
+assert motion_job["videos"][0]["companion"]["kind"] == "motion_guide"
+assert resolved_companion_video(motion_job) == "@video3"
 
 
 # A standalone Depth may itself be @video1 and requires no matched Mask.
@@ -182,9 +205,12 @@ standalone = prompt._apply_picker_payload(
 )
 standalone_prompt = prompt._build_prompt_package(standalone)
 assert standalone["videos"][0]["picker_companion_source_slot"] == 0
-assert "@video1 standalone Picker companion contract = VALIDATED" in standalone_prompt
-assert "no matched source is required" in standalone_prompt
-assert "MATCHED against @video1" not in standalone_prompt
+standalone_companion = prompt_job(standalone_prompt)["videos"][0]["companion"]
+assert standalone_companion == {
+    "kind": "depth",
+    "source_slot": 0,
+    "validated": True,
+}
 
 
 # A deselected source is represented by -1 and cannot silently rebind to the
@@ -197,8 +223,7 @@ missing = prompt._apply_picker_payload(
 missing_prompt = prompt._build_prompt_package(missing)
 assert missing["videos"][0]["picker_companion_source_slot"] == -1
 assert missing["videos"][0]["picker_companion_source_uid"] == "mask"
-assert "source UID mask is not selected" in missing_prompt
-assert "MATCHED against @video1" not in missing_prompt
+assert "companion" not in prompt_job(missing_prompt)["videos"][0]
 
 
 # Prompt settings follow the stable Depth UID while both source and companion
@@ -217,7 +242,16 @@ assert depth_after["keep_out"] == "Preserve the authored Depth exclusion."
 assert depth_after["picker_companion_source_uid"] == "mask"
 assert depth_after["picker_companion_source_slot"] == 1
 compiled_again = prompt._build_prompt_package(reordered_again)
-assert "@video3 Picker slot contract = MATCHED against @video1" in compiled_again
+compiled_again_job = prompt_job(compiled_again)
+depth_job_after = next(
+    item for item in compiled_again_job["videos"] if item["identity"]["video_uid"] == "depth"
+)
+assert depth_job_after["video"] == "@video3"
+assert depth_job_after["companion"]["source_uid"] == "mask"
+assert resolved_companion_video(
+    compiled_again_job,
+    compiled_again_job["videos"].index(depth_job_after),
+) == "@video1"
 
 
 print("HMB Prompt UID companion alignment regression: PASS")
