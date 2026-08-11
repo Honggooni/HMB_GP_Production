@@ -120,18 +120,24 @@ assetScrollViewport.releasePointerCapture = (pointerId) => { releasedPointer = p
 assetScrollContainer.querySelector = (selector) => (
   selector === "[data-asset-scroll]" ? assetScrollViewport : null
 );
+const assetScrollListenerOptions = new Map();
 assetWidget.hmbInstallImageAssetScrollGestures(
   assetScrollContainer,
-  (target, type, handler) => target.addEventListener(type, handler),
+  (target, type, handler, options) => {
+    if (target === assetScrollViewport) assetScrollListenerOptions.set(type, options);
+    target.addEventListener(type, handler, options);
+  },
 );
 assert.equal(assetScrollViewport.classList.contains("nowheel"), true);
 assert.equal(assetScrollContainer.__hmbImageAssetViewportPanning, undefined);
 assert.equal(assetScrollContainer.handler("wheel"), undefined, "Canvas zoom remains available outside the asset viewport.");
 let localStops = 0;
 let localPrevents = 0;
+let localImmediateStops = 0;
 const localEvent = (overrides = {}) => ({
   preventDefault() { localPrevents += 1; },
   stopPropagation() { localStops += 1; },
+  stopImmediatePropagation() { localImmediateStops += 1; },
   ...overrides,
 });
 assetScrollViewport.handler("wheel")(localEvent({ deltaY: 120, deltaX: 0, deltaMode: 0 }));
@@ -147,6 +153,9 @@ assetScrollViewport.handler("pointerdown")(localEvent({
   clientY: 300,
 }));
 assert.equal(capturedPointer, null, "Left-click selection must not start middle-button panning.");
+const stopsBeforeLeftMouse = localStops;
+assetScrollViewport.handler("mousedown")(localEvent({ button: 0 }));
+assert.equal(localStops, stopsBeforeLeftMouse, "Left mousedown must remain available to image selection.");
 assetScrollViewport.handler("pointerdown")(localEvent({
   button: 1,
   pointerId: 7,
@@ -158,6 +167,13 @@ assert.equal(assetScrollContainer.__hmbImageAssetViewportPanning, true);
 assert.equal(assetScrollViewport.classList.contains("is-middle-panning"), true);
 assert.equal(assetScrollViewport.style.cursor, "grabbing");
 assert.equal(assetScrollViewport.style.userSelect, "none");
+assert.equal(assetScrollListenerOptions.get("mousedown")?.capture, true);
+assetScrollViewport.handler("mousedown")(localEvent({
+  button: 1,
+  clientX: 900,
+  clientY: 900,
+}));
+assert.equal(localImmediateStops, 1, "Middle compatibility mousedown must not reach React Flow/D3.");
 assetScrollViewport.handler("pointermove")(localEvent({
   pointerId: 7,
   buttons: 4,
@@ -173,7 +189,7 @@ assert.equal(assetScrollViewport.classList.contains("is-middle-panning"), false)
 assert.equal(assetScrollViewport.style.cursor, "");
 assert.equal(assetScrollViewport.style.userSelect, "");
 assetScrollViewport.handler("auxclick")(localEvent({ button: 1 }));
-assert.ok(localStops >= 6, "Middle pan and auxiliary click stay inside the asset viewport.");
+assert.ok(localStops >= 7, "Middle pan and auxiliary click stay inside the asset viewport.");
 assetScrollViewport.handler("pointerdown")(localEvent({
   button: 1,
   pointerId: 9,
@@ -191,11 +207,62 @@ assetScrollViewport.handler("pointerdown")(localEvent({
   clientY: 50,
 }));
 assert.equal(assetScrollContainer.__hmbImageAssetViewportPanning, true);
-assetScrollViewport.handler("pointerleave")(localEvent({ pointerId: 8 }));
+const globalPointerMove = windowHandlers.get("pointermove:[object Object]");
+const globalPointerUp = windowHandlers.get("pointerup:[object Object]");
+assert.equal(typeof globalPointerMove, "function");
+assert.equal(typeof globalPointerUp, "function");
+const scrollBeforeGlobalMove = assetScrollViewport.scrollTop;
+globalPointerMove(localEvent({
+  pointerId: 8,
+  buttons: 4,
+  clientX: 30,
+  clientY: 20,
+}));
+assert.notEqual(
+  assetScrollViewport.scrollTop,
+  scrollBeforeGlobalMove,
+  "Window capture must keep middle panning alive when pointer capture is unavailable.",
+);
+globalPointerUp(localEvent({ pointerId: 8, button: 1, buttons: 0 }));
 assert.equal(
   assetScrollContainer.__hmbImageAssetViewportPanning,
   false,
-  "A capture failure must release local pan state when the pointer leaves the viewport.",
+  "Global pointerup must release local pan state after a capture failure.",
+);
+
+assetScrollViewport.handler("mousedown")(localEvent({
+  button: 1,
+  clientX: 80,
+  clientY: 90,
+}));
+const globalMouseMove = windowHandlers.get("mousemove:[object Object]");
+const globalMouseUp = windowHandlers.get("mouseup:[object Object]");
+const scrollBeforeLegacyMove = assetScrollViewport.scrollTop;
+globalMouseMove(localEvent({ buttons: 4, clientX: 60, clientY: 40 }));
+assert.notEqual(
+  assetScrollViewport.scrollTop,
+  scrollBeforeLegacyMove,
+  "Legacy middle mousedown/mousemove must pan in embedded WebViews.",
+);
+globalMouseUp(localEvent({ button: 1, buttons: 0 }));
+assert.equal(assetScrollContainer.__hmbImageAssetViewportPanning, false);
+
+assetScrollViewport.handler("pointerdown")(localEvent({
+  button: 1,
+  pointerId: 10,
+  clientX: 70,
+  clientY: 80,
+}));
+globalPointerMove(localEvent({
+  pointerId: 10,
+  buttons: 0,
+  clientX: 65,
+  clientY: 75,
+}));
+assert.equal(
+  assetScrollContainer.__hmbImageAssetViewportPanning,
+  false,
+  "A move with the middle button released must not leave a stuck pan session.",
 );
 
 const agentGestureContainer = fakeElement();

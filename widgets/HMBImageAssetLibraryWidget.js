@@ -1767,6 +1767,8 @@ export function hmbInstallImageAssetScrollGestures(container, on) {
   // scoped to the asset viewport; the rest of the node keeps canvas zoom.
   assetScroll.classList?.add("nowheel");
   let middlePan = null;
+  const globalPanTarget = assetScroll.ownerDocument?.defaultView
+    || (typeof window !== "undefined" ? window : null);
 
   const stopLocalGesture = (event) => {
     event?.preventDefault?.();
@@ -1795,20 +1797,15 @@ export function hmbInstallImageAssetScrollGestures(container, on) {
     stopLocalGesture(event);
     return true;
   };
-
-  on(assetScroll, "wheel", (event) => {
-    const delta = hmbImageAssetWheelPixels(event, assetScroll.clientHeight);
-    if (!delta.left && !delta.top) return;
-    assetScroll.scrollLeft = (Number(assetScroll.scrollLeft) || 0) + delta.left;
-    assetScroll.scrollTop = (Number(assetScroll.scrollTop) || 0) + delta.top;
-    stopLocalGesture(event);
-  }, { passive: false });
-  on(assetScroll, "pointerdown", (event) => {
-    if (Number(event?.button) !== 1) return;
+  const beginMiddlePan = (event, capturePointer) => {
+    if (middlePan) return false;
+    const pointerId = capturePointer && event?.pointerId != null
+      ? event.pointerId
+      : null;
     middlePan = {
-      pointerId: event.pointerId,
-      clientX: Number(event.clientX) || 0,
-      clientY: Number(event.clientY) || 0,
+      pointerId,
+      clientX: Number(event?.clientX) || 0,
+      clientY: Number(event?.clientY) || 0,
       scrollLeft: Number(assetScroll.scrollLeft) || 0,
       scrollTop: Number(assetScroll.scrollTop) || 0,
       priorCursor: clean(assetScroll.style?.cursor),
@@ -1821,34 +1818,87 @@ export function hmbInstallImageAssetScrollGestures(container, on) {
       assetScroll.style.cursor = "grabbing";
       assetScroll.style.userSelect = "none";
     }
-    if (typeof assetScroll.setPointerCapture === "function") {
+    if (
+      pointerId != null
+      && typeof assetScroll.setPointerCapture === "function"
+    ) {
       try {
-        assetScroll.setPointerCapture(event.pointerId);
+        assetScroll.setPointerCapture(pointerId);
         middlePan.pointerCaptured = typeof assetScroll.hasPointerCapture === "function"
-          ? Boolean(assetScroll.hasPointerCapture(event.pointerId))
+          ? Boolean(assetScroll.hasPointerCapture(pointerId))
           : true;
       } catch (_error) {}
     }
-    stopLocalGesture(event);
-  });
-  on(assetScroll, "pointermove", (event) => {
-    if (!middlePan) return;
+    return true;
+  };
+  const moveMiddlePan = (event) => {
+    if (!middlePan) return false;
+    if (
+      event?.pointerId != null
+      && middlePan.pointerId != null
+      && event.pointerId !== middlePan.pointerId
+    ) return false;
     if (event?.buttons != null && !(Number(event.buttons) & 4)) {
       endMiddlePan(event);
-      return;
+      return false;
     }
     assetScroll.scrollLeft = middlePan.scrollLeft
-      - ((Number(event.clientX) || 0) - middlePan.clientX);
+      - ((Number(event?.clientX) || 0) - middlePan.clientX);
     assetScroll.scrollTop = middlePan.scrollTop
-      - ((Number(event.clientY) || 0) - middlePan.clientY);
+      - ((Number(event?.clientY) || 0) - middlePan.clientY);
+    stopLocalGesture(event);
+    return true;
+  };
+
+  on(assetScroll, "wheel", (event) => {
+    const delta = hmbImageAssetWheelPixels(event, assetScroll.clientHeight);
+    if (!delta.left && !delta.top) return;
+    assetScroll.scrollLeft = (Number(assetScroll.scrollLeft) || 0) + delta.left;
+    assetScroll.scrollTop = (Number(assetScroll.scrollTop) || 0) + delta.top;
+    stopLocalGesture(event);
+  }, { passive: false });
+  // React Flow owns middle-button mousedown separately from Pointer Events and
+  // otherwise starts canvas panning before this viewport can consume the drag.
+  // Isolate only the asset viewport's middle-button compatibility event; left
+  // clicks still select cards and middle drags outside this viewport still pan
+  // the Griptape canvas.
+  on(assetScroll, "mousedown", (event) => {
+    if (Number(event?.button) !== 1) return;
+    // Some embedded WebViews expose only the legacy mouse stream. Start the
+    // same bounded pan session when Pointer Events did not already start it.
+    beginMiddlePan(event, false);
+    stopLocalGesture(event);
+    event?.stopImmediatePropagation?.();
+  }, { capture: true, passive: false });
+  on(assetScroll, "pointerdown", (event) => {
+    if (Number(event?.button) !== 1) return;
+    beginMiddlePan(event, true);
     stopLocalGesture(event);
   });
-  ["pointerup", "pointercancel", "lostpointercapture"].forEach((eventName) => {
+  on(assetScroll, "pointermove", moveMiddlePan);
+  ["pointerup", "pointercancel"].forEach((eventName) => {
     on(assetScroll, eventName, endMiddlePan);
   });
-  on(assetScroll, "pointerleave", (event) => {
-    if (middlePan && !middlePan.pointerCaptured) endMiddlePan(event);
+  on(assetScroll, "lostpointercapture", (event) => {
+    if (
+      middlePan
+      && (event?.pointerId == null || event.pointerId === middlePan.pointerId)
+    ) middlePan.pointerCaptured = false;
   });
+  if (globalPanTarget && globalPanTarget !== assetScroll) {
+    on(globalPanTarget, "pointermove", moveMiddlePan, { capture: true, passive: false });
+    on(globalPanTarget, "pointerup", endMiddlePan, { capture: true, passive: false });
+    on(globalPanTarget, "pointercancel", endMiddlePan, { capture: true, passive: false });
+    on(globalPanTarget, "mousemove", moveMiddlePan, { capture: true, passive: false });
+    on(globalPanTarget, "mouseup", endMiddlePan, { capture: true, passive: false });
+    on(globalPanTarget, "blur", () => endMiddlePan(null), true);
+  } else {
+    on(assetScroll, "mousemove", moveMiddlePan);
+    on(assetScroll, "mouseup", endMiddlePan);
+    on(assetScroll, "pointerleave", (event) => {
+      if (middlePan && !middlePan.pointerCaptured) endMiddlePan(event);
+    });
+  }
   on(assetScroll, "auxclick", (event) => {
     if (Number(event?.button) === 1) stopLocalGesture(event);
   });

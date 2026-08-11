@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.72 - 2026-08-11
+
+- Restored hold-to-drag middle-button panning inside the ImageAsset viewport by isolating React Flow's compatibility `mousedown` before it can claim the gesture.
+- Kept an active local pan across pointer-capture loss and legacy embedded-WebView mouse streams, with bounded window-level cleanup on release, cancel, blur, or widget teardown.
+- Preserved the v0.5.71 flicker fix, local wheel scrolling, image selection behavior, and canvas zoom/pan outside the red asset viewport.
+
 ## 0.5.71 - 2026-08-11
 
 - Prevented the Image Asset Library's lightweight 10-12 second manifest poll
