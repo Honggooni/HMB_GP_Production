@@ -53,7 +53,8 @@ assert agent._assert_prompt_policy_identity_matches_signed_runtime() == (
     prompt.PROMPT_POLICY_SOURCE_VERSION,
     prompt.PROMPT_POLICY_SOURCE_CONTRACT_SHA256,
 )
-assert "[HMB SERVER POLICY REQUIRED]" in agent_source
+assert "[HMB BUNDLED SIGNED POLICY REQUIRED]" in agent_source
+assert "[HMB SERVER POLICY REQUIRED]" not in agent_source
 assert "사용자 로컬에 동봉된 hmb_agent_core.dat" not in agent_source
 assert "_assert_prompt_policy_identity_matches_signed_runtime()" in agent_source
 
