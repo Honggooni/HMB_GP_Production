@@ -945,11 +945,15 @@ for native_size_key in (
 ):
     assert native_size_key not in agent_manifest["metadata"]
 
-# Agent policy is server-only. Public source/packages must not freeze or bundle
-# a local policy artifact, while all UI behavior assertions below remain exact.
+# The signed Agent policy is bundled with the matching library release. Keep
+# exactly one artifact at the fixed runtime path while the UI assertions below
+# remain exact.
 bundled_agent_policy = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
-assert not bundled_agent_policy.exists()
-assert not list(ROOT.rglob("hmb_agent_core.dat"))
+assert bundled_agent_policy.is_file()
+assert list(ROOT.rglob("hmb_agent_core.dat")) == [bundled_agent_policy]
+assert hashlib.sha256(bundled_agent_policy.read_bytes()).hexdigest() == (
+    "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
+)
 
 widget_source = (ROOT / "widgets/HMBVideoPickerLibraryWidget_v032.js").read_text(encoding="utf-8")
 command_widget_source = (ROOT / "widgets/HMBVideoPickerCommandBridgeWidget_v032.js").read_text(encoding="utf-8")
