@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.71 - 2026-08-11
+
+- Prevented the Image Asset Library's lightweight 10-12 second manifest poll
+  echo from being normalized as an empty catalog and remounting the full asset
+  grid. Unchanged polls now preserve cards, loaded thumbnails, selection,
+  focus, and scroll position; real manifest changes still remount once.
+- Added vertical wheel scrolling and middle-button drag panning only inside the
+  main asset viewport. Griptape canvas zoom remains unchanged everywhere
+  outside that viewport, and left-click selection plus tray ordering are
+  preserved.
+- Added deterministic regressions for raw string/object poll echoes, canonical
+  authority updates, callback replacement, pointer capture failure and cleanup,
+  local wheel isolation, and middle-button movement.
+
 ## 0.5.70 - 2026-08-11
 
 - Activated signed Agent policy `2026-08-11.agent-shot-quality.v4` with its

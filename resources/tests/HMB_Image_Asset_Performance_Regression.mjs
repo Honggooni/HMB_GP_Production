@@ -151,6 +151,51 @@ assert.equal(publishedCanonical, feedbackState, "A canonical local state must no
 assert.equal(assetWidget.hmbImageAssetAuthorityStamp(publishedCanonical), canonicalStamp);
 assert.equal(assetWidget.hmbConsumeImageAssetStateEcho(exactEchoContainer, { value: exactEchoValue }), true);
 assert.equal(assetWidget.hmbConsumeImageAssetStateEcho(exactEchoContainer, { value: exactEchoValue }), false);
+const manifestPollEcho = assetWidget.hmbImageAssetAutoSyncPayload(
+  feedbackState,
+  "manifest-poll-regression",
+);
+assert.equal(
+  assetWidget.hmbIsImageAssetManifestPollEcho(manifestPollEcho),
+  true,
+  "The exact lightweight manifest envelope must be recognized before normalization.",
+);
+assert.equal(
+  assetWidget.hmbIsImageAssetManifestPollEcho(JSON.parse(manifestPollEcho)),
+  true,
+  "Hosts that decode JSON before echoing must receive the same transport-only guard.",
+);
+assert.equal(
+  assetWidget.hmbIsImageAssetManifestPollEcho(JSON.stringify({
+    ...JSON.parse(manifestPollEcho),
+    assets: [],
+  })),
+  false,
+  "A canonical state carrying asset data must never be consumed as a lightweight echo.",
+);
+const oldCallback = () => "old";
+const newCallback = () => "new";
+const retainedProps = { value: exactEchoValue, onChange: oldCallback };
+assert.equal(
+  assetWidget.hmbUpdateImageAssetPropsReference(
+    retainedProps,
+    { value: manifestPollEcho, onChange: newCallback },
+    true,
+  ),
+  retainedProps,
+  "No-remount prop updates must retain the object captured by installed event handlers.",
+);
+assert.equal(retainedProps.value, exactEchoValue, "A poll echo must not replace canonical props.value.");
+assert.equal(retainedProps.onChange, newCallback, "A poll echo must refresh the callback used by card events.");
+assert.equal(
+  assetWidget.hmbUpdateImageAssetPropsReference(retainedProps, { value: exactEchoValue }),
+  retainedProps,
+);
+assert.equal(
+  Object.hasOwn(retainedProps, "onChange"),
+  false,
+  "Stable prop identity must preserve replace semantics when the host removes a callback.",
+);
 
 // A production-sized catalog must keep the same bounded foreground work on
 // clicks 3/6/9/12. The former path cloned and stringified all 5,000 records,
@@ -395,6 +440,74 @@ const makeAutoSyncContainer = () => ({
   addEventListener() {},
   removeEventListener() {},
 });
+{
+  let rootWrites = 0;
+  let markup = "";
+  const container = makeAutoSyncContainer();
+  Object.defineProperty(container, "innerHTML", {
+    configurable: true,
+    get() { return markup; },
+    set(value) {
+      markup = String(value || "");
+      rootWrites += 1;
+    },
+  });
+  const authoritative = assetWidget.hmbNormalizeImageAssetState({
+    catalog_root: "C:/projects",
+    project_root: "C:/projects/project-a",
+    project_id: "project-a",
+    project_uid: "project-a-uid",
+    manifest_signature: "manifest-stable",
+    assets: [{
+      asset_library_id: "poll-asset",
+      source_uid: "project:poll-asset",
+      source_kind: "project",
+      registered: true,
+      asset_id: "poll-asset",
+      image_name: "Poll Asset",
+    }],
+  });
+  const controller = assetWidget.default(container, { value: authoritative, onChange() {} });
+  const writesAfterMount = rootWrites;
+  const pollValue = assetWidget.hmbImageAssetAutoSyncPayload(
+    authoritative,
+    "manifest-poll-raw-host-echo",
+  );
+  controller.update({ value: pollValue, onChange() {} });
+  assert.equal(
+    rootWrites,
+    writesAfterMount,
+    "A raw optimistic manifest-poll echo must not empty and remount the asset grid.",
+  );
+  controller.update({ value: JSON.stringify(authoritative), onChange() {} });
+  assert.equal(
+    rootWrites,
+    writesAfterMount,
+    "The unchanged canonical response after a poll must also preserve DOM/image identity.",
+  );
+  const changedCanonical = assetWidget.hmbNormalizeImageAssetState({
+    ...authoritative,
+    manifest_signature: "manifest-changed",
+    assets: [
+      ...authoritative.assets,
+      {
+        asset_library_id: "poll-asset-new",
+        source_uid: "project:poll-asset-new",
+        source_kind: "project",
+        registered: true,
+        asset_id: "poll-asset-new",
+        image_name: "New Poll Asset",
+      },
+    ],
+  });
+  controller.update({ value: JSON.stringify(changedCanonical), onChange() {} });
+  assert.equal(
+    rootWrites,
+    writesAfterMount + 1,
+    "A real canonical manifest change must still remount exactly once.",
+  );
+  controller.cleanup();
+}
 const exerciseAutoSyncFailure = async (failureKind) => {
   const timers = new Map();
   let timerSequence = 0;
@@ -686,6 +799,11 @@ assert.match(
   assetSource,
   /now >= autoSyncPendingUntil[\s\S]*?autoSyncPendingUntil = now \+ IMAGE_ASSET_AUTO_SYNC_PENDING_MS/,
   "Rapid auto-sync wakeups must not stack host round trips.",
+);
+assert.match(
+  assetSource,
+  /if \(!value\.slice\(0, 256\)\.includes\('"__hmb_manifest_poll_nonce"'\)\) return false;[\s\S]*?JSON\.parse\(value\)/,
+  "Canonical catalog props must bypass the poll guard without another full JSON parse.",
 );
 assert.match(
   assetSource,

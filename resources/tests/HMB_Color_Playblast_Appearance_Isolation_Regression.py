@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.5.70"
+EXPECTED_RELEASE_VERSION = "0.5.71"
 EXPECTED_VERSION = "2026-08-11.agent-shot-quality.v4"
 EXPECTED_CONTRACT_SHA256 = "b9f6a430737ad266022d1b53da99b1afb7defbc0348f88a59ebf6da5b7e1dec5"
 OPTIONAL_MARKER = "OPTIONAL VIDEO CONTROL:"

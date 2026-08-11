@@ -811,6 +811,44 @@ export function hmbImageAssetAutoSyncPayload(value, nonce) {
   });
 }
 
+export function hmbIsImageAssetManifestPollEcho(value) {
+  let parsed = null;
+  if (typeof value === "string") {
+    // Normal canonical states can contain thousands of assets.  Reject them
+    // without parsing so this transport guard adds no catalog-sized work.
+    if (!value.slice(0, 256).includes('"__hmb_manifest_poll_nonce"')) return false;
+    try { parsed = JSON.parse(value); } catch (_error) { return false; }
+  } else if (value && !Array.isArray(value) && typeof value === "object") {
+    if (!clean(value.__hmb_manifest_poll_nonce)) return false;
+    parsed = value;
+  } else {
+    return false;
+  }
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") return false;
+  if (!clean(parsed.__hmb_manifest_poll_nonce)) return false;
+  const allowed = new Set([
+    "__hmb_manifest_poll_nonce",
+    "catalog_root",
+    "project_root",
+    "project_id",
+    "project_uid",
+    "manifest_signature",
+  ]);
+  return Object.keys(parsed).every((key) => allowed.has(key));
+}
+
+export function hmbUpdateImageAssetPropsReference(current, next, preserveValue = false) {
+  const target = current && typeof current === "object" ? current : {};
+  const authoritativeValue = target.value;
+  const replacement = next && typeof next === "object"
+    ? (next === target ? { ...next } : next)
+    : {};
+  Object.keys(target).forEach((key) => { delete target[key]; });
+  Object.assign(target, replacement);
+  if (preserveValue) target.value = authoritativeValue;
+  return target;
+}
+
 function projectOptions(state) {
   const options = [`<option value="">${escapeHtml(imageAssetText(state, "select_project"))}</option>`];
   state.projects.forEach((project) => {
@@ -1667,7 +1705,7 @@ function render(state, registrationDraft = null) {
             <div class="toolbar-status" data-count-digits="4" aria-live="polite"><strong title="${escapeHtml(statusText)}">${escapeHtml(statusText)}</strong></div>
             <span class="filter-chip">${escapeHtml(filterLabel)}</span>
           </div>
-          <div class="asset-scroll">
+          <div class="asset-scroll nodrag nopan nowheel" data-asset-scroll>
             <div class="asset-grid">${assets.map((asset) => renderAssetCard(asset, selected.length, state.search, state)).join("")}<div class="empty" data-search-empty ${visibleAssets.length ? "hidden" : ""}>${escapeHtml(imageAssetText(state, "no_match"))}</div></div>
           </div>
           ${state.warnings.length ? `<div class="warnings">${state.warnings.map((item) => `<div>${escapeHtml(item)}</div>`).join("")}</div>` : ""}
@@ -1707,6 +1745,115 @@ export function hmbPrepareImageAssetCanvasGestures(container) {
     element.classList?.remove("nopan", "nowheel");
     element.classList?.add("nodrag");
   });
+}
+
+function hmbImageAssetWheelPixels(event, viewportHeight) {
+  const mode = Number(event?.deltaMode) || 0;
+  const unit = mode === 1
+    ? 40
+    : mode === 2
+      ? Math.max(1, Number(viewportHeight) || 1)
+      : 1;
+  return {
+    left: (Number(event?.deltaX) || 0) * unit,
+    top: (Number(event?.deltaY) || 0) * unit,
+  };
+}
+
+export function hmbInstallImageAssetScrollGestures(container, on) {
+  const assetScroll = container?.querySelector?.("[data-asset-scroll]");
+  if (!assetScroll || typeof on !== "function") return null;
+  // React Flow treats `nowheel` as a local no-zoom island. It is deliberately
+  // scoped to the asset viewport; the rest of the node keeps canvas zoom.
+  assetScroll.classList?.add("nowheel");
+  let middlePan = null;
+
+  const stopLocalGesture = (event) => {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+  };
+  const endMiddlePan = (event) => {
+    if (!middlePan) return false;
+    if (
+      event?.pointerId != null
+      && middlePan.pointerId != null
+      && event.pointerId !== middlePan.pointerId
+    ) return false;
+    const pointerId = middlePan.pointerId;
+    const priorCursor = middlePan.priorCursor;
+    const priorUserSelect = middlePan.priorUserSelect;
+    middlePan = null;
+    container.__hmbImageAssetViewportPanning = false;
+    assetScroll.classList?.remove("is-middle-panning");
+    if (assetScroll.style) {
+      assetScroll.style.cursor = priorCursor;
+      assetScroll.style.userSelect = priorUserSelect;
+    }
+    if (pointerId != null) {
+      try { assetScroll.releasePointerCapture?.(pointerId); } catch (_error) {}
+    }
+    stopLocalGesture(event);
+    return true;
+  };
+
+  on(assetScroll, "wheel", (event) => {
+    const delta = hmbImageAssetWheelPixels(event, assetScroll.clientHeight);
+    if (!delta.left && !delta.top) return;
+    assetScroll.scrollLeft = (Number(assetScroll.scrollLeft) || 0) + delta.left;
+    assetScroll.scrollTop = (Number(assetScroll.scrollTop) || 0) + delta.top;
+    stopLocalGesture(event);
+  }, { passive: false });
+  on(assetScroll, "pointerdown", (event) => {
+    if (Number(event?.button) !== 1) return;
+    middlePan = {
+      pointerId: event.pointerId,
+      clientX: Number(event.clientX) || 0,
+      clientY: Number(event.clientY) || 0,
+      scrollLeft: Number(assetScroll.scrollLeft) || 0,
+      scrollTop: Number(assetScroll.scrollTop) || 0,
+      priorCursor: clean(assetScroll.style?.cursor),
+      priorUserSelect: clean(assetScroll.style?.userSelect),
+      pointerCaptured: false,
+    };
+    container.__hmbImageAssetViewportPanning = true;
+    assetScroll.classList?.add("is-middle-panning");
+    if (assetScroll.style) {
+      assetScroll.style.cursor = "grabbing";
+      assetScroll.style.userSelect = "none";
+    }
+    if (typeof assetScroll.setPointerCapture === "function") {
+      try {
+        assetScroll.setPointerCapture(event.pointerId);
+        middlePan.pointerCaptured = typeof assetScroll.hasPointerCapture === "function"
+          ? Boolean(assetScroll.hasPointerCapture(event.pointerId))
+          : true;
+      } catch (_error) {}
+    }
+    stopLocalGesture(event);
+  });
+  on(assetScroll, "pointermove", (event) => {
+    if (!middlePan) return;
+    if (event?.buttons != null && !(Number(event.buttons) & 4)) {
+      endMiddlePan(event);
+      return;
+    }
+    assetScroll.scrollLeft = middlePan.scrollLeft
+      - ((Number(event.clientX) || 0) - middlePan.clientX);
+    assetScroll.scrollTop = middlePan.scrollTop
+      - ((Number(event.clientY) || 0) - middlePan.clientY);
+    stopLocalGesture(event);
+  });
+  ["pointerup", "pointercancel", "lostpointercapture"].forEach((eventName) => {
+    on(assetScroll, eventName, endMiddlePan);
+  });
+  on(assetScroll, "pointerleave", (event) => {
+    if (middlePan && !middlePan.pointerCaptured) endMiddlePan(event);
+  });
+  on(assetScroll, "auxclick", (event) => {
+    if (Number(event?.button) === 1) stopLocalGesture(event);
+  });
+  container.__hmbImageAssetCancelViewportPan = () => endMiddlePan(null);
+  return assetScroll;
 }
 
 function isSelectedNodeRoot(root) {
@@ -1909,6 +2056,7 @@ function installEvents(container, state, props, remount, listeners) {
   const assetsByLibraryId = new Map(
     state.assets.map((asset) => [clean(asset.asset_library_id), asset]),
   );
+  hmbInstallImageAssetScrollGestures(container, on);
 
   const projectSelect = container.querySelector("[data-project-select]");
   on(projectSelect, "change", () => {
@@ -2337,6 +2485,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
   const mountToken = ++imageAssetWidgetMountSequence;
   container.__hmbImageAssetMountToken = mountToken;
   container.setAttribute?.("data-hmb-node-delete-protected", "true");
+  props = hmbUpdateImageAssetPropsReference({}, props);
   let state = normalizeState(props?.value);
   let listeners = [];
   let autoSyncTimer = null;
@@ -2371,6 +2520,8 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     const uiMemory = captureImageAssetUi(container, state);
     const reusableImages = detachReusableImageAssets(container);
     container.__hmbImageAssetDragging = false;
+    container.__hmbImageAssetCancelViewportPan?.();
+    container.__hmbImageAssetViewportPanning = false;
     clearListeners();
     state = normalizeState(nextState);
     if (typeof container.__hmbImageAssetSearchDraft === "string") {
@@ -2397,15 +2548,24 @@ export default function HMBImageAssetLibraryWidget(container, props) {
   };
 
   const applyProps = (nextProps = {}) => {
+    if (hmbIsImageAssetManifestPollEcho(nextProps?.value)) {
+      // Some hosts optimistically echo the lightweight poll payload before
+      // Python replaces it with the canonical state.  Treating that six-field
+      // transport envelope as a full state empties the grid for one frame.
+      // Keep callbacks from the new props, but retain the last authoritative
+      // value until the backend sends a canonical snapshot.
+      props = hmbUpdateImageAssetPropsReference(props, nextProps, true);
+      return;
+    }
     if (hmbConsumeImageAssetStateEcho(container, nextProps)) {
-      props = nextProps || {};
+      props = hmbUpdateImageAssetPropsReference(props, nextProps);
       return;
     }
     if (container.__hmbImageAssetSelectionCommitPending) {
       // Preserve the latest authoritative snapshot and merge only the local
       // selection delta into it when the optimistic click is published.
       autoSyncPendingUntil = 0;
-      props = nextProps || {};
+      props = hmbUpdateImageAssetPropsReference(props, nextProps);
       const hasBasePropValue = Object.prototype.hasOwnProperty.call(
         container,
         "__hmbImageAssetSelectionBasePropValue",
@@ -2428,7 +2588,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
       return;
     }
     const previousPropValue = props?.value;
-    props = nextProps || {};
+    props = hmbUpdateImageAssetPropsReference(props, nextProps);
     if (nextProps?.value === previousPropValue) return;
     hmbInvalidateImageAssetPublication(container);
     autoSyncRequestSequence += 1;
@@ -2464,6 +2624,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     && !(typeof navigator !== "undefined" && navigator.onLine === false)
     && !container.__hmbImageAssetRegistrationDraft
     && !container.__hmbImageAssetDragging
+    && !container.__hmbImageAssetViewportPanning
     && !container.__hmbImageAssetSelectionCommitPending
   );
   function runAutoSync() {
@@ -2555,6 +2716,8 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     hmbInvalidateImageAssetPublication(container);
     hmbForgetImageAssetStateEcho(container);
     disposed = true;
+    container.__hmbImageAssetCancelViewportPan?.();
+    container.__hmbImageAssetViewportPanning = false;
     autoSyncPendingUntil = 0;
     clearAutoSyncTimer();
     autoSyncListeners.forEach(([target, type, handler]) => {
@@ -2573,6 +2736,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     if (container.__hmbImageAssetApplyProps === applyProps) {
       delete container.__hmbImageAssetApplyProps;
     }
+    delete container.__hmbImageAssetCancelViewportPan;
     delete container.__hmbImageAssetDragging;
     delete container.__hmbImageAssetRegistrationDraft;
     delete container.__hmbImageAssetRegistrationReturnFocus;
