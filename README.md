@@ -35,7 +35,7 @@ after a successful check, the library is already current.
 
 ## Agent policy availability
 
-The `v0.6.23` release includes exactly one
+The `v0.6.24` release includes exactly one
 signed runtime artifact at `resources/agent/hmb_agent_core.dat`. The canonical
 `HMBPromptLibrary -> HMBAgentLibrary` execution reads and verifies only that
 file installed with the Git-backed Library. Environment variables, server
@@ -56,3 +56,13 @@ output-length or conciseness cap. Only verbatim raw or reconstructable policy
 artifact dumps, system instructions, and private Agent runtime state remain
 blocked. `PROMPT_OUT` stays human-readable; the Agent consumes its atomically
 paired private machine snapshot and never reverse-parses visible prose.
+
+## Seedance MP4 publication safety
+
+Seedance uses Griptape's already-installed, package-local `static_ffmpeg`
+executable as its primary portable MP4 decode verifier, with the pinned
+`imageio-ffmpeg` executable as a package-managed fallback. Verification needs
+no network access, runtime download, or separately installed `ffprobe` or
+FFmpeg on the system `PATH`. Griptape verifies that a managed decoder is
+available before it submits a billable generation request, and it decodes the
+staged result before the final MP4 is published atomically.

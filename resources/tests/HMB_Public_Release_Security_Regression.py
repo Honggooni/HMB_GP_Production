@@ -16,8 +16,8 @@ POLICY_CONTRACT_SHA256 = (
 )
 POLICY_RELATIVE = "resources/agent/hmb_agent_core.dat"
 POLICY_SHA256 = "7171bef7169df8894ed24ae7a9b4d9d145957c5110c963b7435372b2695fd251"
-RELEASE_LABEL = "v0.6.23"
-RELEASE_VERSION = "0.6.23"
+RELEASE_LABEL = "v0.6.24"
+RELEASE_VERSION = "0.6.24"
 EXPECTED_SOURCE_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
@@ -33,6 +33,7 @@ EXPECTED_SOURCE_FILES = (
     "HMBSeedanceGeneration.py",
     "HMBVideoPickerLibrary.py",
     "_hmb_common.py",
+    "_hmb_mp4_verify.py",
     "_hmb_screen_space.py",
     "widgets/HMBAgentLibraryWidget.js",
     "widgets/HMBImageAssetLibraryWidget.js",
@@ -132,7 +133,7 @@ builder = load_module(
 )
 
 assert tuple(builder.SOURCE_FILES) == EXPECTED_SOURCE_FILES
-assert len(EXPECTED_SOURCE_FILES) == 25
+assert len(EXPECTED_SOURCE_FILES) == 26
 assert builder.RELEASE_LABEL == RELEASE_LABEL
 assert builder.RELEASE_VERSION == RELEASE_VERSION
 assert builder.ARCHIVE_NAME == "HMB_GP_Production.zip"

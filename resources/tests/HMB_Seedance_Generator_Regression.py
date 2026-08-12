@@ -40,6 +40,8 @@ from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 MODULE_PATH = ROOT / "HMBSeedanceGeneration.py"
 IMAGE_ASSET_MODULE_PATH = ROOT / "HMBImageAssetLibrary.py"
 VIDEO_PICKER_MODULE_PATH = ROOT / "HMBVideoPickerLibrary.py"
@@ -89,12 +91,18 @@ def load_video_picker_target():
 target = load_target()
 image_asset_target = load_image_asset_target()
 video_picker_target = load_video_picker_target()
+mp4_verify_target = sys.modules["_hmb_mp4_verify"]
 
 # Most generator cases use a deliberately minimal structural MP4 fixture. Keep
 # those tests independent of a host codec binary; the real probe implementation
 # is exercised with bounded subprocess mocks below.
 REAL_MP4_DECODE_PROBE = target._validate_decodable_mp4_file
-target._validate_decodable_mp4_file = lambda _path: None
+REAL_MP4_DECODE_VERIFIER_RESOLVER = target._resolve_mp4_decode_verifier
+target._validate_decodable_mp4_file = lambda _path, _verifier=None: None
+target._resolve_mp4_decode_verifier = lambda: target._MP4DecodeVerifier(
+    "ffprobe",
+    Path("C:/managed-test-tools/ffprobe.exe"),
+)
 
 
 class FakeDestination:
@@ -1475,7 +1483,12 @@ def assert_broker_generation_contract() -> None:
     )
     resumed = BrokerScriptedNode(resume_bridge)
     resumed.set_parameter_value("resume_generation_id", "broker-resume-9")
-    asyncio.run(resumed._process_generation())
+    with mock.patch.object(
+        target,
+        "_resolve_mp4_decode_verifier",
+        side_effect=AssertionError("Resume performed a new-render verifier preflight"),
+    ):
+        asyncio.run(resumed._process_generation())
     assert resume_bridge.generate_payloads == []
     assert resume_bridge.refresh_ids == ["broker-resume-9"]
     assert resumed.downloads == ["https://cdn.example/resumed-broker.mp4"]
@@ -2385,6 +2398,10 @@ def assert_bounded_mp4_decode_probe_contract() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         staged = Path(temporary) / "staged.mp4"
         staged.write_bytes(VALID_MP4_BYTES)
+        ffprobe_verifier = target._MP4DecodeVerifier(
+            "ffprobe",
+            Path("C:/managed-test-tools/ffprobe.exe"),
+        )
         success = SimpleNamespace(
             returncode=0,
             stdout=json.dumps(
@@ -2397,43 +2414,44 @@ def assert_bounded_mp4_decode_probe_contract() -> None:
             stderr=b"",
         )
         with mock.patch.object(
-            target,
-            "_resolve_ffprobe_executable",
-            return_value=Path("C:/ffmpeg/bin/ffprobe.exe"),
-        ), mock.patch.object(target.subprocess, "run", return_value=success) as run:
-            REAL_MP4_DECODE_PROBE(staged)
+            mp4_verify_target.subprocess, "run", return_value=success
+        ) as run:
+            REAL_MP4_DECODE_PROBE(staged, ffprobe_verifier)
         command = run.call_args.args[0]
         kwargs = run.call_args.kwargs
         assert command[0].lower().endswith("ffprobe.exe")
         assert command[-2:] == ["-i", str(staged.resolve())]
         assert "-show_frames" in command
         assert f"%+#{target.MP4_DECODE_PROBE_PACKET_LIMIT}" in command
-        assert kwargs["stdin"] is target.subprocess.DEVNULL
-        assert kwargs["stdout"] is target.subprocess.PIPE
-        assert kwargs["stderr"] is target.subprocess.PIPE
+        assert kwargs["stdin"] is mp4_verify_target.subprocess.DEVNULL
+        assert kwargs["stdout"] is mp4_verify_target.subprocess.PIPE
+        assert kwargs["stderr"] is mp4_verify_target.subprocess.PIPE
         assert kwargs["check"] is False
         assert kwargs["timeout"] == target.MP4_DECODE_PROBE_TIMEOUT_SECONDS
 
-        def rejected(completed=None, *, side_effect=None) -> None:
+        def rejected(verifier, completed=None, *, side_effect=None) -> None:
             with mock.patch.object(
-                target,
-                "_resolve_ffprobe_executable",
-                return_value=Path("C:/ffmpeg/bin/ffprobe.exe"),
-            ), mock.patch.object(
-                target.subprocess,
+                mp4_verify_target.subprocess,
                 "run",
                 return_value=completed,
                 side_effect=side_effect,
             ):
                 try:
-                    REAL_MP4_DECODE_PROBE(staged)
+                    REAL_MP4_DECODE_PROBE(staged, verifier)
                 except RuntimeError:
                     return
-            raise AssertionError("Invalid ffprobe result was accepted")
+            raise AssertionError("Invalid MP4 decode result was accepted")
 
-        rejected(SimpleNamespace(returncode=1, stdout=b"", stderr=b"decode"))
-        rejected(SimpleNamespace(returncode=0, stdout=b"not-json", stderr=b""))
         rejected(
+            ffprobe_verifier,
+            SimpleNamespace(returncode=1, stdout=b"", stderr=b"decode"),
+        )
+        rejected(
+            ffprobe_verifier,
+            SimpleNamespace(returncode=0, stdout=b"not-json", stderr=b""),
+        )
+        rejected(
+            ffprobe_verifier,
             SimpleNamespace(
                 returncode=0,
                 stdout=b'{"frames":[]}',
@@ -2441,6 +2459,7 @@ def assert_bounded_mp4_decode_probe_contract() -> None:
             )
         )
         rejected(
+            ffprobe_verifier,
             SimpleNamespace(
                 returncode=0,
                 stdout=b"x" * (target.MP4_DECODE_PROBE_MAX_OUTPUT_BYTES + 1),
@@ -2448,18 +2467,219 @@ def assert_bounded_mp4_decode_probe_contract() -> None:
             )
         )
         rejected(
-            side_effect=target.subprocess.TimeoutExpired(
+            ffprobe_verifier,
+            side_effect=mp4_verify_target.subprocess.TimeoutExpired(
                 ["ffprobe"], target.MP4_DECODE_PROBE_TIMEOUT_SECONDS
             )
         )
 
-    with mock.patch.object(target.shutil, "which", return_value=None):
+        ffmpeg_verifier = target._MP4DecodeVerifier(
+            "ffmpeg",
+            Path("C:/managed-test-tools/ffmpeg.exe"),
+        )
+        decoded_pixel = SimpleNamespace(
+            returncode=0,
+            stdout=b"\x10\x20\x30",
+            stderr=b"",
+        )
+        with mock.patch.object(
+            mp4_verify_target.subprocess,
+            "run",
+            return_value=decoded_pixel,
+        ) as run:
+            REAL_MP4_DECODE_PROBE(staged, ffmpeg_verifier)
+        command = run.call_args.args[0]
+        kwargs = run.call_args.kwargs
+        assert command[0].lower().endswith("ffmpeg.exe")
+        assert "-xerror" in command
+        assert command[command.index("-frames:v") + 1] == "1"
+        assert command[command.index("-vf") + 1] == "scale=1:1"
+        assert command[command.index("-pix_fmt") + 1] == "rgb24"
+        assert command[-2:] == ["rawvideo", "pipe:1"]
+        assert kwargs["stdin"] is mp4_verify_target.subprocess.DEVNULL
+        assert kwargs["timeout"] == target.MP4_DECODE_PROBE_TIMEOUT_SECONDS
+
+        rejected(
+            ffmpeg_verifier,
+            SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+        )
+        rejected(
+            ffmpeg_verifier,
+            SimpleNamespace(returncode=0, stdout=b"\x00" * 4, stderr=b""),
+        )
+        rejected(
+            ffmpeg_verifier,
+            SimpleNamespace(returncode=0, stdout=b"\x00" * 3, stderr=b"decode"),
+        )
+        rejected(
+            ffmpeg_verifier,
+            side_effect=OSError("simulated executable failure"),
+        )
+
+    empty_candidates = lambda: iter(())
+    with mock.patch.object(
+        mp4_verify_target,
+        "_static_ffmpeg_verifier_candidates",
+        side_effect=empty_candidates,
+    ), mock.patch.object(
+        mp4_verify_target,
+        "_imageio_ffmpeg_verifier_candidates",
+        side_effect=empty_candidates,
+    ), mock.patch.object(
+        mp4_verify_target,
+        "_system_verifier_candidates",
+        side_effect=empty_candidates,
+    ):
         try:
-            target._resolve_ffprobe_executable()
+            REAL_MP4_DECODE_VERIFIER_RESOLVER()
         except RuntimeError:
             pass
         else:
-            raise AssertionError("Missing ffprobe did not fail closed")
+            raise AssertionError("Missing MP4 decode verifier did not fail closed")
+
+
+def assert_package_managed_decode_verifier_resolution() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        static_root = root / "static_ffmpeg"
+        static_root.mkdir()
+        static_init = static_root / "__init__.py"
+        static_init.write_text("", encoding="utf-8")
+        if target.os.name == "nt":
+            platform_folder = "win32"
+            ffprobe_name = "ffprobe.exe"
+            ffmpeg_name = "ffmpeg.exe"
+        else:
+            platform_folder = (
+                "darwin" if sys.platform == "darwin" else "linux"
+            )
+            ffprobe_name = "ffprobe"
+            ffmpeg_name = "ffmpeg"
+        static_bin = static_root / "bin" / platform_folder
+        static_bin.mkdir(parents=True)
+        static_probe = static_bin / ffprobe_name
+        static_probe.write_bytes(b"package-owned ffprobe fixture")
+        static_ffmpeg = static_bin / ffmpeg_name
+        static_ffmpeg.write_bytes(b"package-owned ffmpeg fixture")
+        static_module = SimpleNamespace(__file__=str(static_init))
+
+        imageio_root = root / "imageio_ffmpeg"
+        imageio_binary_root = imageio_root / "binaries"
+        imageio_binary_root.mkdir(parents=True)
+        imageio_init = imageio_root / "__init__.py"
+        imageio_init.write_text("", encoding="utf-8")
+        imageio_ffmpeg = imageio_binary_root / (
+            "ffmpeg-win-x86_64-v7.1.exe"
+            if target.os.name == "nt"
+            else "ffmpeg-linux-x86_64-v7.1"
+        )
+        imageio_ffmpeg.write_bytes(b"package-owned imageio ffmpeg fixture")
+        imageio_module = SimpleNamespace(
+            __file__=str(imageio_init),
+            get_ffmpeg_exe=lambda: str(imageio_ffmpeg),
+        )
+
+        def import_package(name: str):
+            if name == "static_ffmpeg":
+                return static_module
+            if name == "imageio_ffmpeg":
+                return imageio_module
+            raise ImportError(name)
+
+        with mock.patch.object(
+            mp4_verify_target.importlib,
+            "import_module",
+            side_effect=import_package,
+        ), mock.patch.object(
+            mp4_verify_target.shutil,
+            "which",
+            return_value=None,
+        ), mock.patch.object(
+            mp4_verify_target,
+            "verify_mp4_decode_verifier_start",
+        ) as launch:
+            verifier = REAL_MP4_DECODE_VERIFIER_RESOLVER()
+        assert verifier == target._MP4DecodeVerifier(
+            "ffprobe",
+            static_probe.resolve(),
+        )
+        launch.assert_called_once_with(verifier)
+
+        static_probe.unlink()
+        static_ffmpeg.unlink()
+        with mock.patch.object(
+            mp4_verify_target.importlib,
+            "import_module",
+            side_effect=import_package,
+        ), mock.patch.object(
+            mp4_verify_target.shutil,
+            "which",
+            return_value=None,
+        ), mock.patch.object(
+            mp4_verify_target,
+            "verify_mp4_decode_verifier_start",
+        ) as launch:
+            verifier = REAL_MP4_DECODE_VERIFIER_RESOLVER()
+        assert verifier == target._MP4DecodeVerifier(
+            "ffmpeg",
+            imageio_ffmpeg.resolve(),
+        )
+        launch.assert_called_once_with(verifier)
+
+        external_override = root / "outside-imageio-ffmpeg.exe"
+        external_override.write_bytes(b"untrusted override fixture")
+        imageio_module.get_ffmpeg_exe = lambda: str(external_override)
+        with mock.patch.object(
+            mp4_verify_target.importlib,
+            "import_module",
+            side_effect=import_package,
+        ), mock.patch.object(
+            mp4_verify_target.shutil,
+            "which",
+            return_value=None,
+        ), mock.patch.object(
+            mp4_verify_target,
+            "verify_mp4_decode_verifier_start",
+        ):
+            verifier = REAL_MP4_DECODE_VERIFIER_RESOLVER()
+        assert verifier.executable == imageio_ffmpeg.resolve()
+
+        launch_ok = SimpleNamespace(returncode=0)
+        with mock.patch.object(
+            mp4_verify_target.subprocess,
+            "run",
+            return_value=launch_ok,
+        ) as run:
+            mp4_verify_target.verify_mp4_decode_verifier_start(verifier)
+        assert run.call_args.args[0] == [str(verifier.executable), "-version"]
+        assert run.call_args.kwargs["stdin"] is mp4_verify_target.subprocess.DEVNULL
+        assert run.call_args.kwargs["stdout"] is mp4_verify_target.subprocess.DEVNULL
+        assert run.call_args.kwargs["stderr"] is mp4_verify_target.subprocess.DEVNULL
+        assert run.call_args.kwargs["check"] is False
+        assert run.call_args.kwargs["timeout"] == (
+            target.MP4_DECODE_VERIFIER_START_TIMEOUT_SECONDS
+        )
+
+        for failed_launch in (
+            SimpleNamespace(returncode=1),
+            mp4_verify_target.subprocess.TimeoutExpired(
+                [str(verifier.executable), "-version"],
+                target.MP4_DECODE_VERIFIER_START_TIMEOUT_SECONDS,
+            ),
+            OSError("simulated launch failure"),
+        ):
+            kwargs = (
+                {"side_effect": failed_launch}
+                if isinstance(failed_launch, BaseException)
+                else {"return_value": failed_launch}
+            )
+            with mock.patch.object(mp4_verify_target.subprocess, "run", **kwargs):
+                try:
+                    mp4_verify_target.verify_mp4_decode_verifier_start(verifier)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("Broken verifier executable was accepted")
 
 
 def assert_atomic_output_and_submission_safety() -> None:
@@ -2486,7 +2706,7 @@ def assert_atomic_output_and_submission_safety() -> None:
         observations: list[Path] = []
         probe_observations: list[Path] = []
 
-        def observed_probe(source) -> None:
+        def observed_probe(source, _verifier=None) -> None:
             source_path = Path(source)
             assert source_path.parent == root
             assert source_path.read_bytes() == VALID_MP4_BYTES
@@ -2554,6 +2774,63 @@ def assert_atomic_output_and_submission_safety() -> None:
             raise AssertionError("Unwritable output reached Broker submission")
     assert bridge.account_calls == 0
     assert bridge.generate_payloads == []
+
+    verifier_bridge = FakeBrokerBridge([])
+    verifier_blocked = BrokerScriptedNode(verifier_bridge)
+    verifier_blocked.set_parameter_value(
+        "prompt", "verifier preflight must precede billing"
+    )
+    with mock.patch.object(
+        target.HMBSeedanceGeneration,
+        "_prepare_video_references_for_run",
+        side_effect=AssertionError("Verifier failure reached temporary media upload"),
+    ), mock.patch.object(
+        target,
+        "_resolve_mp4_decode_verifier",
+        side_effect=RuntimeError("simulated unavailable verifier"),
+    ):
+        try:
+            asyncio.run(verifier_blocked._process_generation_impl())
+        except RuntimeError as exc:
+            assert "unavailable verifier" in str(exc)
+        else:
+            raise AssertionError("Missing verifier reached Broker submission")
+    assert verifier_blocked.destination.resolved is True
+    assert verifier_bridge.account_calls == 0
+    assert verifier_bridge.generate_payloads == []
+
+    reuse_bridge = FakeBrokerBridge(
+        [
+            {
+                "job_id": "broker-job-1",
+                "status": "completed",
+                "output": "https://cdn.example/verifier-reuse.mp4",
+            }
+        ]
+    )
+    reuse_node = BrokerScriptedNode(reuse_bridge)
+    reuse_node.set_parameter_value("prompt", "reuse preflight-selected verifier")
+    selected_verifier = target._MP4DecodeVerifier(
+        "ffprobe", Path("C:/managed-test-tools/ffprobe.exe")
+    )
+    observed_verifiers = []
+
+    def record_selected_verifier(_source, verifier=None) -> None:
+        observed_verifiers.append(verifier)
+
+    with mock.patch.object(
+        target,
+        "_resolve_mp4_decode_verifier",
+        return_value=selected_verifier,
+    ) as resolver, mock.patch.object(
+        target,
+        "_validate_decodable_mp4_file",
+        side_effect=record_selected_verifier,
+    ):
+        asyncio.run(reuse_node._process_generation_impl())
+    resolver.assert_called_once_with()
+    assert observed_verifiers == [selected_verifier]
+    assert len(reuse_bridge.generate_payloads) == 1
 
     async def cancellation_case() -> None:
         started = threading.Event()
@@ -3023,6 +3300,7 @@ assert_broker_direct_transport_resilience_contract()
 assert_broker_account_and_button_contract()
 assert_indexed_output_macro_contract()
 assert_bounded_mp4_decode_probe_contract()
+assert_package_managed_decode_verifier_resolution()
 assert_atomic_output_and_submission_safety()
 assert_local_video_temporary_publication()
 assert_tos_local_video_temporary_publication()

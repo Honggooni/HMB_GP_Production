@@ -71,6 +71,7 @@ jobs:
             "HMB_Bundled_Policy_Boundary_Regression.py",
             "HMB_Data_Only_Prompt_Security_Regression.py",
             "HMB_Agent_Paired_Prompt_Snapshot_Regression.py",
+            "HMB_Seedance_MP4_Verifier_Portability_Regression.py",
             "HMB_FX_Timing_Range_Contract_Regression.py",
             "HMB_Optional_Frame_Range_Contract_Regression.py",
             "HMB_Four_Library_Generator_Neutrality_Regression.py",

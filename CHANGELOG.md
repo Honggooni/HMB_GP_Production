@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.24 - 2026-08-12
+
+- Replace the ambient system-`ffprobe` requirement in Seedance result
+  publication with Griptape's already-installed package-local `static_ffmpeg`
+  verifier and the pinned package-managed `imageio-ffmpeg` fallback. Verification
+  requires no network access, runtime download, or separately installed
+  executable on the system `PATH`.
+- Resolve and validate the portable verifier before any billable Seedance
+  generation request, then perform a bounded real-frame decode of the staged
+  result before its atomic final publication.
+- Add a host-independent Seedance MP4 verifier regression to the public
+  Windows release-audit matrix, while retaining the full Generator regression
+  in the exact Griptape runtime matrix, so the no-system-`ffprobe` path and
+  pre-billable verifier gate remain release-blocking behavior.
+
 ## 0.6.23 - 2026-08-12
 
 - Activate signed Agent policy `2026-08-12.agent-shot-quality.v4.2`, under
