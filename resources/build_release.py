@@ -17,8 +17,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.6.24"
-RELEASE_VERSION = "0.6.24"
+RELEASE_LABEL = "v0.6.25"
+RELEASE_VERSION = "0.6.25"
 ARCHIVE_NAME = "HMB_GP_Production.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 MANIFEST_PATH = DIST / "release-manifest.json"

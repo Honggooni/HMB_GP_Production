@@ -416,38 +416,514 @@ finally:
 # later Picker disconnect with that old value.
 revision_node = prompt.HMBPromptLibrary(name="prompt_source_revision")
 revision_base = prompt._normalize_state(prompt._default_widget_state())
+assert revision_base[prompt.UI_EDIT_REVISION_KEY] == 0
 prompt._set_parameter_value(
     revision_node,
     prompt.WIDGET_PARAMETER_NAME,
     prompt._json_dumps(revision_base),
 )
 revision_node._hmb_picker_connected = True
+revision_picker_payload = {
+    "media_ready": True,
+    "run_id": "first-picker-ready",
+    "selection_id": "selection-one",
+    "active_slot_count": 1,
+    "selected_video_count": 1,
+    "ordered_video_uids": ["video-source-one"],
+    "videos": [
+        {
+            "video_uid": "video-source-one",
+            "source_uid": "video-source-one",
+            "selection_order": 1,
+            "video_slot": 1,
+            "video_path": "C:/synthetic/first-picker-shot.mp4",
+            "reference_capabilities": {
+                "schema": "hmb-video-reference-capabilities",
+                "version": 1,
+                "frame_addressable": True,
+                "exact_emitter_cues": False,
+                "image_source_frame_ranges": True,
+                "marker_instance_identity_fields": [
+                    "maya_uuid",
+                    "full_dag_path",
+                ],
+            },
+            "frame_domain": {
+                "schema": "hmb-video-frame-domain",
+                "version": 1,
+                "timebase": "24/1",
+                "start_frame": 101,
+                "end_frame": 162,
+                "frame_count": 62,
+                "range_addressable": True,
+            },
+            "timing_cues": [],
+        }
+    ],
+}
 prompt._set_parameter_value(
     revision_node,
     prompt.PICKER_INPUT_PARAMETER_NAME,
-    prompt._json_dumps(
-        {
-            "media_ready": True,
-            "video_path": "C:/synthetic/first-picker-shot.mp4",
-            "run_id": "first-picker-ready",
-            "selection_id": "selection-one",
-        }
-    ),
+    prompt._json_dumps(revision_picker_payload),
 )
 revision_connected = revision_node._write_dashboard_state()
 assert revision_connected[prompt.SOURCE_SYNC_REVISION_KEY] == 1
 assert revision_connected["picker"]["enabled"] is True
+assert revision_connected["videos"][0]["reference_capabilities"][
+    "frame_addressable"
+] is True
+
+# Loading a workflow whose dashboard already contains the exact applied source
+# must establish the in-memory fingerprint without fabricating another source
+# revision. A blank hydrated state above may advance once; an already-applied
+# persisted state remains unchanged, and every repeated compile is idempotent.
+hydrated_node = prompt.HMBPromptLibrary(name="prompt_hydrated_source_revision")
+hydrated_state = prompt._apply_picker_payload(
+    prompt._normalize_state(prompt._default_widget_state()),
+    revision_picker_payload,
+    connected=True,
+)
+hydrated_state[prompt.SOURCE_SYNC_REVISION_KEY] = 27
+prompt._set_parameter_value(
+    hydrated_node,
+    prompt.WIDGET_PARAMETER_NAME,
+    prompt._json_dumps(hydrated_state),
+)
+# Real Griptape invokes the widget setter hook synchronously while source input
+# caches may still be later in the hydration stream. That eager compile must
+# retain the persisted connected identity instead of treating the not-yet-read
+# input as an authoritative disconnect.
+hydrated_pending = hydrated_node._sync_prompt_output_now()
+assert hydrated_pending[prompt.SOURCE_SYNC_REVISION_KEY] == 27
+assert hydrated_pending["picker"]["enabled"] is True
+hydrated_node._hmb_picker_connected = True
+prompt._set_parameter_value(
+    hydrated_node,
+    prompt.PICKER_INPUT_PARAMETER_NAME,
+    prompt._json_dumps(revision_picker_payload),
+)
+hydrated_first = hydrated_node._write_dashboard_state()
+assert hydrated_first[prompt.SOURCE_SYNC_REVISION_KEY] == 27
+assert hydrated_node._write_dashboard_state()[prompt.SOURCE_SYNC_REVISION_KEY] == 27
+
+# The real widget persists only dashboard-authored fields. Establishing a
+# fingerprint from that frontend-normalized version may restore source helper
+# metadata, but it is still the exact already-applied Picker generation and
+# must not fabricate revision 28 during the first reconcile.
+hydrated_frontend_node = prompt.HMBPromptLibrary(
+    name="prompt_hydrated_frontend_source_revision"
+)
+hydrated_frontend_state = copy.deepcopy(hydrated_state)
+for image in hydrated_frontend_state["images"]:
+    for field in ("source_type_choices", "owner_choices", "scope_choices"):
+        image.pop(field, None)
+for video in hydrated_frontend_state["videos"]:
+    for field in (
+        "source_type_choices",
+        "control_role_choices",
+        "reference_capabilities",
+        "frame_domain",
+        "timing_cues",
+    ):
+        video.pop(field, None)
+prompt._set_parameter_value(
+    hydrated_frontend_node,
+    prompt.WIDGET_PARAMETER_NAME,
+    prompt._json_dumps(hydrated_frontend_state),
+)
+hydrated_frontend_node._hmb_picker_connected = True
+prompt._set_parameter_value(
+    hydrated_frontend_node,
+    prompt.PICKER_INPUT_PARAMETER_NAME,
+    prompt._json_dumps(revision_picker_payload),
+)
+hydrated_frontend_first = hydrated_frontend_node._write_dashboard_state()
+assert hydrated_frontend_first[prompt.SOURCE_SYNC_REVISION_KEY] == 27
+assert hydrated_frontend_first["videos"][0]["reference_capabilities"][
+    "frame_addressable"
+] is True
+
+# Baseline suppression is limited to that first disconnected in-memory
+# fingerprint. A later semantic payload update remains authoritative even when
+# the Picker intentionally keeps its run/selection addresses stable.
+same_identity_transport_update = copy.deepcopy(revision_picker_payload)
+same_identity_transport_update["videos"][0]["reference_capabilities"][
+    "exact_emitter_cues"
+] = True
+prompt._set_parameter_value(
+    hydrated_frontend_node,
+    prompt.PICKER_INPUT_PARAMETER_NAME,
+    prompt._json_dumps(same_identity_transport_update),
+)
+hydrated_transport_updated = hydrated_frontend_node._write_dashboard_state()
+assert hydrated_transport_updated[prompt.SOURCE_SYNC_REVISION_KEY] == 28
+assert hydrated_transport_updated["videos"][0]["reference_capabilities"][
+    "exact_emitter_cues"
+] is True
+
+# A frontend select transaction intentionally carries only dashboard-authored
+# fields. Python restores Picker-only transport metadata while compiling the
+# prompt, but an unchanged upstream payload is not a new source generation.
+# Keeping the revision stable lets the frontend recognize the canonical echo as
+# equivalent instead of remounting and closing the user's next open dropdown.
+local_select_state = copy.deepcopy(revision_connected)
+for image in local_select_state["images"]:
+    for field in ("source_type_choices", "owner_choices", "scope_choices"):
+        image.pop(field, None)
+for video in local_select_state["videos"]:
+    for field in (
+        "source_type_choices",
+        "control_role_choices",
+        "reference_capabilities",
+        "frame_domain",
+        "timing_cues",
+    ):
+        video.pop(field, None)
+local_select_state["videos"][0]["source_type"] = "Timing / Edit Reference"
+local_select_state["videos"][0]["control_role"] = "Timing Only"
+local_select_state[prompt.UI_EDIT_REVISION_KEY] = 11
+prompt._set_parameter_value(
+    revision_node,
+    prompt.WIDGET_PARAMETER_NAME,
+    prompt._json_dumps(local_select_state),
+)
+revision_reenriched = revision_node._write_dashboard_state()
+assert revision_reenriched[prompt.SOURCE_SYNC_REVISION_KEY] == 1
+assert revision_reenriched[prompt.UI_EDIT_REVISION_KEY] == 11
+assert revision_reenriched["videos"][0]["source_type"] == "Timing / Edit Reference"
+assert revision_reenriched["videos"][0]["control_role"] == "Timing Only"
+assert revision_reenriched["videos"][0]["reference_capabilities"][
+    "frame_addressable"
+] is True
+
+
+def frontend_prompt_projection(state):
+    """Remove Python-only row enrichment exactly as the widget projection does."""
+
+    projected = copy.deepcopy(state)
+    for image in projected["images"]:
+        for field in ("source_type_choices", "owner_choices", "scope_choices"):
+            image.pop(field, None)
+    for video in projected["videos"]:
+        for field in (
+            "source_type_choices",
+            "control_role_choices",
+            "reference_capabilities",
+            "frame_domain",
+            "timing_cues",
+        ):
+            video.pop(field, None)
+    return projected
+
+
+assert frontend_prompt_projection(revision_reenriched) == local_select_state
+
+# A genuinely new Picker payload still advances the revision and remains
+# authoritative even when it arrives immediately after local dropdown edits.
+second_picker_payload = copy.deepcopy(revision_picker_payload)
+second_picker_payload["run_id"] = "second-picker-ready"
+second_picker_payload["selection_id"] = "selection-two"
+second_picker_payload["videos"][0]["video_path"] = (
+    "C:/synthetic/second-picker-shot.mp4"
+)
+prompt._set_parameter_value(
+    revision_node,
+    prompt.WIDGET_PARAMETER_NAME,
+    prompt._json_dumps(revision_reenriched),
+)
+prompt._set_parameter_value(
+    revision_node,
+    prompt.PICKER_INPUT_PARAMETER_NAME,
+    prompt._json_dumps(second_picker_payload),
+)
+revision_updated = revision_node._write_dashboard_state()
+assert revision_updated[prompt.SOURCE_SYNC_REVISION_KEY] == 2
+assert revision_updated[prompt.UI_EDIT_REVISION_KEY] == 11
+assert revision_updated["picker"]["run_id"] == "second-picker-ready"
+
+# Transport-only Picker diagnostics can change without changing the applied
+# Prompt state. Consume that fingerprint once so a later local edit cannot
+# misclassify the already-observed payload as a new upstream generation.
+picker_diagnostic_payload = copy.deepcopy(second_picker_payload)
+picker_diagnostic_payload["catalog_video_count"] = 99
+prompt._set_parameter_value(
+    revision_node,
+    prompt.WIDGET_PARAMETER_NAME,
+    prompt._json_dumps(revision_updated),
+)
+prompt._set_parameter_value(
+    revision_node,
+    prompt.PICKER_INPUT_PARAMETER_NAME,
+    prompt._json_dumps(picker_diagnostic_payload),
+)
+revision_diagnostic = revision_node._write_dashboard_state()
+assert revision_diagnostic[prompt.SOURCE_SYNC_REVISION_KEY] == 2
+assert revision_diagnostic[prompt.UI_EDIT_REVISION_KEY] == 11
+assert revision_node._write_dashboard_state()[prompt.SOURCE_SYNC_REVISION_KEY] == 2
 
 prompt._set_parameter_value(
     revision_node,
     prompt.WIDGET_PARAMETER_NAME,
-    prompt._json_dumps(revision_connected),
+    prompt._json_dumps(revision_diagnostic),
 )
 revision_node._hmb_picker_connected = False
 prompt._set_parameter_value(revision_node, prompt.PICKER_INPUT_PARAMETER_NAME, "")
 revision_disconnected = revision_node._write_dashboard_state()
-assert revision_disconnected[prompt.SOURCE_SYNC_REVISION_KEY] == 2
+assert revision_disconnected[prompt.SOURCE_SYNC_REVISION_KEY] == 3
+assert revision_disconnected[prompt.UI_EDIT_REVISION_KEY] == 11
 assert revision_disconnected["picker"]["enabled"] is False
+
+# Reconnecting the same source is an authoritative connection transition and
+# advances once; repeated compile/write calls remain stable.
+prompt._set_parameter_value(
+    revision_node,
+    prompt.WIDGET_PARAMETER_NAME,
+    prompt._json_dumps(revision_disconnected),
+)
+revision_node._hmb_picker_connected = True
+prompt._set_parameter_value(
+    revision_node,
+    prompt.PICKER_INPUT_PARAMETER_NAME,
+    prompt._json_dumps(picker_diagnostic_payload),
+)
+revision_reconnected = revision_node._write_dashboard_state()
+assert revision_reconnected[prompt.SOURCE_SYNC_REVISION_KEY] == 4
+assert revision_reconnected[prompt.UI_EDIT_REVISION_KEY] == 11
+assert revision_reconnected["picker"]["enabled"] is True
+assert revision_node._write_dashboard_state()[prompt.SOURCE_SYNC_REVISION_KEY] == 4
+
+
+# Image Asset has the same revision contract as Picker: local Target/Sub Type
+# edits do not create an upstream generation, while source selection changes,
+# disconnect, and reconnect each advance exactly once.
+asset_node = prompt.HMBPromptLibrary(name="prompt_asset_source_revision")
+asset_base = prompt._normalize_state(prompt._default_widget_state())
+prompt._set_parameter_value(
+    asset_node,
+    prompt.WIDGET_PARAMETER_NAME,
+    prompt._json_dumps(asset_base),
+)
+first_asset_payload = {
+    "schema": "hmb-image-asset-library-binding",
+    "version": 4,
+    "mode": "image_asset",
+    "project_id": "synthetic-project",
+    "project_uid": "synthetic-project-uid",
+    "selection_id": "asset-selection-one",
+    "ordered_images": [
+        {
+            "selected": True,
+            "order_key": "project:hero-one",
+            "source_uid": "project:hero-one",
+            "image_name": "HeroOne",
+            "selection_order": 1,
+        }
+    ],
+    "verified_assets": [
+        {
+            "verified_asset": True,
+            "binding_mode": "verified_asset",
+            "order_key": "project:hero-one",
+            "source_uid": "project:hero-one",
+            "source_kind": "project",
+            "asset_library_id": "hero-library-one",
+            "asset_id": "HeroOne",
+            "image_name": "HeroOne",
+            "source_type": "Character Appearance",
+            "scope_candidate": "Full body / full appearance",
+            "color_pick_candidates": ["Red"],
+            "selection_order": 1,
+        }
+    ],
+}
+asset_node._hmb_image_asset_connected = True
+prompt._set_parameter_value(
+    asset_node,
+    prompt.IMAGE_ASSET_INPUT_PARAMETER_NAME,
+    prompt._json_dumps(first_asset_payload),
+)
+asset_connected = asset_node._write_dashboard_state()
+assert asset_connected[prompt.SOURCE_SYNC_REVISION_KEY] == 1
+assert asset_connected["images"][0]["asset_source_uid"] == "project:hero-one"
+
+asset_local_edit = frontend_prompt_projection(asset_connected)
+asset_local_edit["images"][0]["owner"] = "Hero One"
+asset_local_edit[prompt.UI_EDIT_REVISION_KEY] = prompt.MAX_SOURCE_SYNC_REVISION
+prompt._set_parameter_value(
+    asset_node,
+    prompt.WIDGET_PARAMETER_NAME,
+    prompt._json_dumps(asset_local_edit),
+)
+asset_local_reenriched = asset_node._write_dashboard_state()
+assert asset_local_reenriched[prompt.SOURCE_SYNC_REVISION_KEY] == 1
+assert asset_local_reenriched[prompt.UI_EDIT_REVISION_KEY] == (
+    prompt.MAX_SOURCE_SYNC_REVISION
+)
+assert asset_local_reenriched["images"][0]["owner"] == "Hero One"
+assert frontend_prompt_projection(asset_local_reenriched) == asset_local_edit
+
+second_asset_payload = copy.deepcopy(first_asset_payload)
+second_asset_payload["selection_id"] = "asset-selection-two"
+for key in ("ordered_images", "verified_assets"):
+    second_asset_payload[key][0]["source_uid"] = "project:hero-two"
+    second_asset_payload[key][0]["order_key"] = "project:hero-two"
+    second_asset_payload[key][0]["image_name"] = "HeroTwo"
+second_asset_payload["verified_assets"][0]["asset_library_id"] = (
+    "hero-library-two"
+)
+second_asset_payload["verified_assets"][0]["asset_id"] = "HeroTwo"
+prompt._set_parameter_value(
+    asset_node,
+    prompt.WIDGET_PARAMETER_NAME,
+    prompt._json_dumps(asset_local_reenriched),
+)
+prompt._set_parameter_value(
+    asset_node,
+    prompt.IMAGE_ASSET_INPUT_PARAMETER_NAME,
+    prompt._json_dumps(second_asset_payload),
+)
+asset_updated = asset_node._write_dashboard_state()
+assert asset_updated[prompt.SOURCE_SYNC_REVISION_KEY] == 2
+assert asset_updated[prompt.UI_EDIT_REVISION_KEY] == prompt.MAX_SOURCE_SYNC_REVISION
+assert asset_updated["images"][0]["asset_source_uid"] == "project:hero-two"
+
+# An allowed diagnostic-only payload change is a no-op generation and is
+# consumed exactly once, matching the Picker rule above.
+asset_diagnostic_payload = copy.deepcopy(second_asset_payload)
+asset_diagnostic_payload["media_resolution"] = {"resolved": 1}
+prompt._set_parameter_value(
+    asset_node,
+    prompt.WIDGET_PARAMETER_NAME,
+    prompt._json_dumps(asset_updated),
+)
+prompt._set_parameter_value(
+    asset_node,
+    prompt.IMAGE_ASSET_INPUT_PARAMETER_NAME,
+    prompt._json_dumps(asset_diagnostic_payload),
+)
+asset_diagnostic = asset_node._write_dashboard_state()
+assert asset_diagnostic[prompt.SOURCE_SYNC_REVISION_KEY] == 2
+assert asset_node._write_dashboard_state()[prompt.SOURCE_SYNC_REVISION_KEY] == 2
+
+prompt._set_parameter_value(
+    asset_node,
+    prompt.WIDGET_PARAMETER_NAME,
+    prompt._json_dumps(asset_diagnostic),
+)
+asset_node._hmb_image_asset_connected = False
+prompt._set_parameter_value(asset_node, prompt.IMAGE_ASSET_INPUT_PARAMETER_NAME, "")
+asset_disconnected = asset_node._write_dashboard_state()
+assert asset_disconnected[prompt.SOURCE_SYNC_REVISION_KEY] == 3
+assert asset_disconnected[prompt.UI_EDIT_REVISION_KEY] == (
+    prompt.MAX_SOURCE_SYNC_REVISION
+)
+assert asset_disconnected["image_asset"]["enabled"] is False
+
+prompt._set_parameter_value(
+    asset_node,
+    prompt.WIDGET_PARAMETER_NAME,
+    prompt._json_dumps(asset_disconnected),
+)
+asset_node._hmb_image_asset_connected = True
+prompt._set_parameter_value(
+    asset_node,
+    prompt.IMAGE_ASSET_INPUT_PARAMETER_NAME,
+    prompt._json_dumps(asset_diagnostic_payload),
+)
+asset_reconnected = asset_node._write_dashboard_state()
+assert asset_reconnected[prompt.SOURCE_SYNC_REVISION_KEY] == 4
+assert asset_reconnected["image_asset"]["enabled"] is True
+assert asset_node._write_dashboard_state()[prompt.SOURCE_SYNC_REVISION_KEY] == 4
+
+revision_bounds = prompt._normalize_state(
+    {
+        **prompt._default_widget_state(),
+        prompt.UI_EDIT_REVISION_KEY: prompt.MAX_SOURCE_SYNC_REVISION + 99,
+    }
+)
+assert revision_bounds[prompt.UI_EDIT_REVISION_KEY] == prompt.MAX_SOURCE_SYNC_REVISION
+revision_bounds = prompt._normalize_state(
+    {
+        **prompt._default_widget_state(),
+        prompt.UI_EDIT_REVISION_KEY: -99,
+    }
+)
+assert revision_bounds[prompt.UI_EDIT_REVISION_KEY] == 0
+
+# The private UI transaction counter is transport-only. It must never alter
+# either the user-readable PROMPT_OUT or the Agent's private machine snapshot.
+ui_revision_zero = prompt._normalize_state(prompt._default_widget_state())
+ui_revision_only = copy.deepcopy(ui_revision_zero)
+ui_revision_only[prompt.UI_EDIT_REVISION_KEY] = 123456
+assert prompt._build_prompt_package(ui_revision_only) == prompt._build_prompt_package(
+    ui_revision_zero
+)
+assert prompt._build_data_only_prompt_package(
+    ui_revision_only
+) == prompt._build_data_only_prompt_package(ui_revision_zero)
+assert prompt._prompt_semantic_fingerprint(
+    ui_revision_only
+) == prompt._prompt_semantic_fingerprint(ui_revision_zero)
+
+
+# A delayed local request cannot roll the dashboard back after a newer edit was
+# accepted. The instance cache covers both the normal node setter and host
+# implementations that assign the Parameter before invoking after_value_set.
+echo_node = prompt.HMBPromptLibrary(name="prompt_widget_echo_order")
+echo_b = prompt._normalize_state(prompt._default_widget_state())
+echo_b[prompt.SOURCE_SYNC_REVISION_KEY] = 9
+echo_b[prompt.UI_EDIT_REVISION_KEY] = 2
+echo_b["text"]["SCENE_CONTEXT"] = "newer B"
+echo_a = copy.deepcopy(echo_b)
+echo_a[prompt.UI_EDIT_REVISION_KEY] = 1
+echo_a["text"]["SCENE_CONTEXT"] = "stale A"
+echo_node.set_parameter_value(
+    prompt.WIDGET_PARAMETER_NAME,
+    prompt._json_dumps(echo_b),
+)
+echo_node.set_parameter_value(
+    prompt.WIDGET_PARAMETER_NAME,
+    prompt._json_dumps(echo_a),
+)
+echo_after_stale_setter = prompt._parse_state(
+    prompt._get_parameter_raw(echo_node, prompt.WIDGET_PARAMETER_NAME)
+)
+assert echo_after_stale_setter[prompt.UI_EDIT_REVISION_KEY] == 2
+assert echo_after_stale_setter["text"]["SCENE_CONTEXT"] == "newer B"
+
+echo_parameter = prompt._get_parameter_obj(echo_node, prompt.WIDGET_PARAMETER_NAME)
+echo_parameter.default_value = prompt._json_dumps(echo_a)
+echo_node.after_value_set(echo_parameter, prompt._json_dumps(echo_a))
+echo_after_stale_hook = prompt._parse_state(
+    prompt._get_parameter_raw(echo_node, prompt.WIDGET_PARAMETER_NAME)
+)
+assert echo_after_stale_hook[prompt.UI_EDIT_REVISION_KEY] == 2
+assert echo_after_stale_hook["text"]["SCENE_CONTEXT"] == "newer B"
+
+# A higher Python-owned source revision is authoritative even when its private
+# UI transaction counter is lower. A workflow hydration is also a new saved
+# baseline and may intentionally start below the prior live instance values.
+echo_authoritative = copy.deepcopy(echo_a)
+echo_authoritative[prompt.SOURCE_SYNC_REVISION_KEY] = 10
+echo_authoritative[prompt.UI_EDIT_REVISION_KEY] = 0
+echo_authoritative["text"]["SCENE_CONTEXT"] = "authoritative source"
+echo_node.set_parameter_value(
+    prompt.WIDGET_PARAMETER_NAME,
+    prompt._json_dumps(echo_authoritative),
+)
+assert echo_node._hmb_last_accepted_widget_revisions == (10, 0)
+echo_hydrated = copy.deepcopy(echo_authoritative)
+echo_hydrated[prompt.SOURCE_SYNC_REVISION_KEY] = 3
+echo_hydrated["text"]["SCENE_CONTEXT"] = "saved hydration"
+echo_node.set_parameter_value(
+    prompt.WIDGET_PARAMETER_NAME,
+    prompt._json_dumps(echo_hydrated),
+    initial_setup=True,
+)
+assert echo_node._hmb_last_accepted_widget_revisions == (3, 0)
+assert prompt._parse_state(
+    prompt._get_parameter_raw(echo_node, prompt.WIDGET_PARAMETER_NAME)
+)["text"]["SCENE_CONTEXT"] == "saved hydration"
 
 
 print("HMB Prompt paired-output coalescing regression passed.")

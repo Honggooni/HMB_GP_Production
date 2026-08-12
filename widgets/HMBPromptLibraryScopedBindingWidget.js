@@ -8,6 +8,7 @@ const MAX_KEEP_OUT_CHARS = 4000;
 const MAX_FRAME_RANGES_PER_BINDING = 100;
 const MAX_MANUAL_FRAME_NUMBER = 9999;
 const MAX_SOURCE_SYNC_REVISION = Number.MAX_SAFE_INTEGER;
+const UI_EDIT_REVISION_KEY = "ui_edit_revision";
 let ACTOR_COLOR_PICK_CHOICES = [];
 let OBJECT_COLOR_PICK_CHOICES = [];
 let COLOR_PICK_CHOICES = [];
@@ -224,19 +225,6 @@ const MANUAL_VIDEO_CONTEXT_IMAGE_FIELDS = Object.freeze([
 ]);
 
 const HMB_UI_KO = {
-  external_sources: "외부 소스",
-  picker: "피커",
-  image_order: "이미지 순서",
-  video_order: "비디오 순서",
-  name_only: "이름만",
-  no_image_source: "지정된 이미지 소스 없음",
-  no_video_source: "지정된 비디오 소스 없음",
-  picker_connected: "피커 연결됨",
-  picker_waiting: "피커 실행 대기",
-  picker_reset: "피커 초기화됨 · 피커를 다시 실행하세요",
-  picker_not_connected: "피커 연결 안 됨",
-  markers: "마커",
-  image_matches: "이미지 일치",
   image_source_binding: "이미지 소스 연결",
   image_text_context: "이미지 텍스트 설명",
   scene_level_notes: "장면 단위 메모",
@@ -253,19 +241,11 @@ const HMB_UI_KO = {
   custom_scope: "사용자 지정 범위 입력",
   custom_video_type: "사용자 지정 비디오 유형 입력",
   custom_video_role: "사용자 지정 비디오 세부 유형 입력",
-  output: "출력",
-  only_real_output: "이 노드의 실제 출력만",
-  connection_guide: "연결 안내",
-  connect_agent: "HMBAgentLibrary 프롬프트 입력에 연결",
-  not_included: "포함되지 않음",
-  no_image_output: "이미지 출력 포트 없음",
-  no_video_output: "비디오 출력 포트 없음",
   blank_target: "— 빈칸 / 대상 없음 —",
   blank_subtype: "— 빈칸 / 세부 유형 없음 —",
   blank_control_role: "— 빈칸 / 제어 역할 선택 —",
   keep_out_placeholder: "최종 출력에서 제외할 더미 FX, 타이밍 가이드 영역, 마커 전용 가이드 영역, 프리뷰 아티팩트, 프록시 이펙트 및 기타 금지 요소",
   video_marker_source: "비디오 마커 소스",
-  no_source_label: "소스 이름 없음",
   resize_group: "위아래로 드래그하여 중앙 그룹 크기 조절",
   resize_keep_out: "위아래로 드래그하여 제외 항목 창 크기 조절",
   move_image_up: "이미지를 위로 이동",
@@ -581,6 +561,7 @@ function defaultState() {
     schema: "prompt-library-state",
     mode: "prompt_only_role_dashboard",
     source_sync_revision: 0,
+    [UI_EDIT_REVISION_KEY]: 0,
     images: [defaultImage(1), defaultImage(2), defaultImage(3), defaultImage(4)],
     videos: [defaultVideo(1)],
     text: Object.fromEntries(TEXT_FIELDS.map(([key]) => [key, ""])),
@@ -635,6 +616,12 @@ function clean(value) {
 }
 
 function normalizeSourceSyncRevision(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.min(MAX_SOURCE_SYNC_REVISION, Math.floor(parsed)));
+}
+
+function normalizeUiEditRevision(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return 0;
   return Math.max(0, Math.min(MAX_SOURCE_SYNC_REVISION, Math.floor(parsed)));
@@ -2068,6 +2055,7 @@ export function normalizeState(input) {
     schema: "prompt-library-state",
     mode: "prompt_only_role_dashboard",
     source_sync_revision: normalizeSourceSyncRevision(input?.source_sync_revision),
+    [UI_EDIT_REVISION_KEY]: normalizeUiEditRevision(input?.[UI_EDIT_REVISION_KEY]),
     theme: "dark-neon",
     image_taxonomy: imageTaxonomy,
     images,
@@ -2091,12 +2079,7 @@ export function normalizeState(input) {
 }
 
 function emit(props, state, container = null) {
-  return hmbPublishPromptStateValue(
-    container,
-    props,
-    JSON.stringify(normalizeState(state)),
-    false,
-  );
+  return hmbEmitLocalPromptState(container, props, state);
 }
 
 export function hmbEmitPromptState(container, props, state) {
@@ -2718,14 +2701,6 @@ function escapeHtml(value) {
     .replace(/'/g, "&#39;");
 }
 
-function basename(label, state) {
-  const value = String(label || "").trim();
-  if (!value) return uiText(state, "no_source_label", "No source label");
-  const split = value.split(/[\\/]/);
-  const base = split[split.length - 1] || value;
-  return base.length > 40 ? `${base.slice(0, 37)}...` : base;
-}
-
 function options(list, value, blankLabel, state) {
   return list.map((item) => {
     const text = item === "" ? blankLabel : optionLabel(item, state);
@@ -3100,12 +3075,88 @@ function hmbPromptStateRevisionFromSerialized(value) {
   }
 }
 
-function hmbPendingPromptSourceRevision(item) {
-  if (!item) return 0;
-  if (item.sourceSyncRevision !== undefined) {
-    return normalizeSourceSyncRevision(item.sourceSyncRevision);
+function hmbRememberPromptRevisionState(container, state, disabled, local = false) {
+  if (!container) return;
+  const uiEditRevision = normalizeUiEditRevision(state?.[UI_EDIT_REVISION_KEY]);
+  const sourceSyncRevision = normalizeSourceSyncRevision(state?.source_sync_revision);
+  container.__hmbPromptCurrentUiEditRevision = uiEditRevision;
+  container.__hmbPromptCurrentSourceSyncRevision = sourceSyncRevision;
+  container.__hmbPromptCurrentDisabled = Boolean(disabled);
+  if (local) {
+    container.__hmbPromptLatestLocalUiEditRevision = Math.max(
+      normalizeUiEditRevision(container.__hmbPromptLatestLocalUiEditRevision),
+      uiEditRevision,
+    );
   }
-  return hmbPromptStateRevisionFromSerialized(item.value);
+}
+
+function hmbNextPromptUiEditRevision(container, state) {
+  const current = normalizeUiEditRevision(state?.[UI_EDIT_REVISION_KEY]);
+  const latestLocal = normalizeUiEditRevision(
+    container?.__hmbPromptLatestLocalUiEditRevision,
+  );
+  return Math.min(MAX_SOURCE_SYNC_REVISION, Math.max(current, latestLocal) + 1);
+}
+
+function hmbPromptRevisionDisposition(container, nextProps, incomingState) {
+  if (!container || !incomingState) return "unknown";
+  const hasCurrentSourceRevision = Object.prototype.hasOwnProperty.call(
+    container,
+    "__hmbPromptCurrentSourceSyncRevision",
+  );
+  const incomingSourceRevision = normalizeSourceSyncRevision(
+    incomingState.source_sync_revision,
+  );
+  const currentSourceRevision = normalizeSourceSyncRevision(
+    container.__hmbPromptCurrentSourceSyncRevision,
+  );
+  if (hasCurrentSourceRevision && incomingSourceRevision > currentSourceRevision) {
+    return "authoritative";
+  }
+  if (hasCurrentSourceRevision && incomingSourceRevision < currentSourceRevision) {
+    return "stale";
+  }
+
+  const hasCurrentUiRevision = Object.prototype.hasOwnProperty.call(
+    container,
+    "__hmbPromptCurrentUiEditRevision",
+  );
+  const hasLatestLocalUiRevision = Object.prototype.hasOwnProperty.call(
+    container,
+    "__hmbPromptLatestLocalUiEditRevision",
+  );
+  if (hasCurrentUiRevision || hasLatestLocalUiRevision) {
+    const latestUiRevision = Math.max(
+      normalizeUiEditRevision(container.__hmbPromptCurrentUiEditRevision),
+      normalizeUiEditRevision(container.__hmbPromptLatestLocalUiEditRevision),
+    );
+    const incomingUiRevision = normalizeUiEditRevision(
+      incomingState[UI_EDIT_REVISION_KEY],
+    );
+    if (incomingUiRevision < latestUiRevision) return "stale";
+    if (incomingUiRevision > latestUiRevision) return "authoritative";
+  }
+
+  // Disabled is host-owned, but an old source/UI payload must never roll back
+  // live selections just because it carries a newer disabled flag. The caller
+  // applies that flag without replacing the serialized state.
+  const hasCurrentDisabled = Object.prototype.hasOwnProperty.call(
+    container,
+    "__hmbPromptCurrentDisabled",
+  );
+  if (
+    hasCurrentDisabled
+    && Boolean(nextProps?.disabled) !== Boolean(container.__hmbPromptCurrentDisabled)
+  ) return "authoritative";
+  return hasCurrentUiRevision || hasLatestLocalUiRevision ? "current" : "unknown";
+}
+
+function hmbPromptStateEchoMatches(item, incoming, disabled) {
+  return Boolean(
+    item
+    && incoming === item.value
+    && Boolean(disabled) === Boolean(item.disabled)
+  );
 }
 
 function hmbPromptDirtySnapshot(container) {
@@ -3261,10 +3312,22 @@ function hmbPublishPromptStateValue(
 }
 
 export function hmbEmitLocalPromptState(container, props, state) {
+  const nextUiEditRevision = hmbNextPromptUiEditRevision(container, state);
+  if (state && typeof state === "object") {
+    state[UI_EDIT_REVISION_KEY] = nextUiEditRevision;
+  }
+  const normalized = normalizeState(state);
+  normalized[UI_EDIT_REVISION_KEY] = nextUiEditRevision;
+  hmbRememberPromptRevisionState(
+    container,
+    normalized,
+    Boolean(props?.disabled),
+    true,
+  );
   return hmbPublishPromptStateValue(
     container,
     props,
-    JSON.stringify(normalizeState(state)),
+    JSON.stringify(normalized),
     true,
   );
 }
@@ -3287,13 +3350,7 @@ export function hmbCommitLocalPromptStructure(container, props, state, remount) 
 
 export function hmbConsumePendingPromptStateEcho(container, nextProps) {
   if (!container || !nextProps) return false;
-  const pending = Array.isArray(container.__hmbPromptPendingLocalValues)
-    ? container.__hmbPromptPendingLocalValues
-    : [];
-  const superseded = Array.isArray(container.__hmbPromptSupersededLocalValues)
-    ? container.__hmbPromptSupersededLocalValues
-    : [];
-  if (!pending.length && !superseded.length) return false;
+  container.__hmbPromptLastConsumedEchoWasStale = false;
   let incoming = "";
   let incomingState = null;
   try {
@@ -3302,72 +3359,44 @@ export function hmbConsumePendingPromptStateEcho(container, nextProps) {
   } catch (_error) {
     return false;
   }
-  const now = Date.now();
-  const liveSuperseded = superseded.filter((item) => hmbPendingPromptEchoIsLive(item, now));
-  const supersededMatchIndex = liveSuperseded.findIndex((item) => (
-    item
-    && incoming === item.value
-    && Boolean(nextProps.disabled) === Boolean(item.disabled)
-  ));
-  if (supersededMatchIndex >= 0) {
-    const matched = liveSuperseded[supersededMatchIndex];
-    const configuredRemaining = Number(matched.remainingEchoes);
-    const remaining = (Number.isFinite(configuredRemaining)
-      ? Math.max(1, Math.trunc(configuredRemaining))
-      : 1) - 1;
-    if (remaining > 0) {
-      liveSuperseded[supersededMatchIndex] = { ...matched, remainingEchoes: remaining };
-    } else {
-      liveSuperseded.splice(supersededMatchIndex, 1);
-    }
-    if (liveSuperseded.length) {
-      container.__hmbPromptSupersededLocalValues = liveSuperseded;
-    } else {
-      delete container.__hmbPromptSupersededLocalValues;
-    }
-    // A newer authoritative Picker/Asset revision has already repainted the
-    // widget. Ignore only the exact delayed echo of the older local revision;
-    // a real disconnect carries a newer revision and remains authoritative.
+
+  // Retained-mode hosts may echo two rapid local edits out of order, and may
+  // do so after the short exact-echo queue has expired. The serialized UI edit
+  // revision is the durable ordering contract: a lower revision at the same
+  // source revision is stale regardless of callback latency. Source revisions
+  // and disabled-state changes remain authoritative and must repaint.
+  const revisionDisposition = hmbPromptRevisionDisposition(
+    container,
+    nextProps,
+    incomingState,
+  );
+  if (revisionDisposition === "stale") {
+    container.__hmbPromptLastConsumedEchoWasStale = true;
     return true;
   }
-  if (liveSuperseded.length) {
-    container.__hmbPromptSupersededLocalValues = liveSuperseded;
-  } else {
-    delete container.__hmbPromptSupersededLocalValues;
+  if (revisionDisposition === "authoritative") {
+    hmbClearPendingPromptStateEchoes(container);
+    return false;
   }
+
+  const pending = Array.isArray(container.__hmbPromptPendingLocalValues)
+    ? container.__hmbPromptPendingLocalValues
+    : [];
   if (!pending.length) return false;
+  const incomingDisabled = Boolean(nextProps.disabled);
+  const now = Date.now();
   const livePending = pending.filter((item) => hmbPendingPromptEchoIsLive(item, now));
   const matchIndex = livePending.findIndex((item) => (
-    item
-    && incoming === item.value
-    && Boolean(nextProps.disabled) === Boolean(item.disabled)
+    hmbPromptStateEchoMatches(item, incoming, incomingDisabled)
   ));
   if (matchIndex < 0) {
-    // A different canonical value or disabled flag is authoritative host
-    // state. Quarantine only local publications whose source revision is older
-    // than the incoming Picker/Asset revision. Ordinary same-revision edits and
-    // explicit newer disconnects must never be swallowed.
-    const incomingSourceRevision = normalizeSourceSyncRevision(
-      incomingState?.source_sync_revision,
-    );
-    const quarantined = [
-      ...liveSuperseded,
-      ...livePending.filter(
-        (item) => hmbPendingPromptSourceRevision(item) < incomingSourceRevision,
-      ),
-    ];
-    if (quarantined.length) {
-      container.__hmbPromptSupersededLocalValues = quarantined.slice(
-        -HMB_PROMPT_LOCAL_ECHO_QUEUE_LIMIT,
-      );
-    }
-    delete container.__hmbPromptPendingLocalValues;
+    hmbClearPendingPromptStateEchoes(container);
     return false;
   }
   try {
-    // A host may publish the same local value more than once. Keep only a
-    // short, counted allowance for that exact canonical state. If a later
-    // queued local value arrives first, older entries are obsolete.
+    // A host may publish the same exact local value more than once. Keep only
+    // a short counted allowance. Older queued values may be discarded here:
+    // their lower serialized UI revisions identify them after any queue expiry.
     const matched = livePending[matchIndex];
     const configuredRemaining = Number(matched.remainingEchoes);
     const remaining = (Number.isFinite(configuredRemaining)
@@ -3976,7 +4005,7 @@ function hmbRefreshImageColorControls(container, state) {
   });
 }
 
-function hmbRefreshSourceSummaries(container, state, refreshPicker = false) {
+function hmbRefreshSourceSummaries(container, state) {
   const images = Array.isArray(state && state.images) ? state.images : [];
   const videos = Array.isArray(state && state.videos) ? state.videos : [];
   const activeImages = images.filter((item) => isActiveImageForState(item, state)).length;
@@ -3985,10 +4014,6 @@ function hmbRefreshSourceSummaries(container, state, refreshPicker = false) {
   const videoCount = container.querySelector?.('[data-group-id="videoSources"] h3 b');
   if (imageCount) imageCount.textContent = `${activeImages} / ${MAX_IMAGES}`;
   if (videoCount) videoCount.textContent = `${activeVideos} / ${MAX_VIDEOS}`;
-  if (refreshPicker) {
-    const pickerToken = container.querySelector?.("[data-picker-token]");
-    if (pickerToken) pickerToken.innerHTML = pickerTokenHtml(state);
-  }
 }
 
 function hmbSyncSourceSelectDom(container, state, row, kind, index, field) {
@@ -4011,7 +4036,7 @@ function hmbSyncSourceSelectDom(container, state, row, kind, index, field) {
     hmbRefreshVideoDependentControls(row, item, index, state);
     if (field === "source_type") hmbRefreshImageColorControls(container, state);
   }
-  hmbRefreshSourceSummaries(container, state, kind === "video" && field === "source_type");
+  hmbRefreshSourceSummaries(container, state);
 }
 
 function renderImageRow(item, index, images, state) {
@@ -4069,42 +4094,12 @@ function textField(key, label, value, placeholder, state) {
   return `<label class="text-field"><span>${escapeHtml(localized[0])}</span>${tag}</label>`;
 }
 
-function sourceTokensHtml(items, kind, state) {
-  const active = (items || []).filter((item) => (
-    kind === "image"
-      ? isActiveImageForState(item, state)
-      : Boolean(item && item.present)
-  ));
-  return active.map((item) => `<div class="token ${kind}"><b>${escapeHtml(item.token)}</b><span>${escapeHtml(basename(item.label, state))}</span></div>`).join("")
-    || `<div class="empty-token">${escapeHtml(uiText(state, kind === "image" ? "no_image_source" : "no_video_source", kind === "image" ? "No image source assigned" : "No video source assigned"))}</div>`;
-}
-
-function pickerTokenHtml(state) {
-  const picker = state && state.picker && typeof state.picker === "object" ? state.picker : {};
-  return picker.enabled
-    ? `<div class="token picker-connected"><b>${escapeHtml(uiText(state, "picker_connected", "PICKER CONNECTED"))}</b><span>${escapeHtml(picker.awaiting_data ? uiText(state, "picker_waiting", "Waiting for picker run") : (basename(picker.scene || picker.video_path, state) || "HMBVideoPickerLibrary"))}</span><span>${Number(picker.markers && picker.markers.length) || 0} ${escapeHtml(uiText(state, "markers", "markers"))} · ${Number(picker.matched_images) || 0} ${escapeHtml(uiText(state, "image_matches", "image matches"))}</span></div>`
-    : `<div class="empty-token">${escapeHtml(uiText(state, "picker_not_connected", "Picker not connected"))}</div>`;
-}
-
-function imageAssetTokenHtml(state) {
-  const asset = state && state.image_asset && typeof state.image_asset === "object"
-    ? state.image_asset
-    : {};
-  return asset.enabled
-    ? `<div class="token image picker-connected"><b>IMAGE ASSET CONNECTED</b><span>${escapeHtml(asset.project_id || basename(asset.project_root, state) || "HMBImageAssetLibrary")}</span><span>${Math.max(0, Number(asset.verified_assets) || 0)} verified assets · ${Math.max(0, Number(asset.imported_images) || 0)} external names · ${asset.order_managed ? "@image order synced" : "waiting for selection"} · Prompt final authority</span></div>`
-    : `<div class="empty-token">Image Asset not connected</div>`;
-}
-
 function render(state) {
   const uiTheme = hmbNormalizeUiTheme(state?.ui?.theme || hmbReadSharedUiTheme());
   const images = state.images || [];
   const videos = state.videos || [];
   const groupBFields = TEXT_FIELDS.filter((x) => x[3] === "image").map(([key, label, ph]) => textField(key, label, state.text[key], ph, state)).join("");
   const groupDFields = TEXT_FIELDS.filter((x) => x[3] === "video").map(([key, label, ph]) => textField(key, label, state.text[key], ph, state)).join("");
-  const imageTokens = sourceTokensHtml(images, "image", state);
-  const videoTokens = sourceTokensHtml(videos, "video", state);
-  const pickerToken = pickerTokenHtml(state);
-  const imageAssetToken = imageAssetTokenHtml(state);
   const hImageSources = groupHeightStyle(state, "imageSources");
   const hImageText = groupHeightStyle(state, "imageText");
   const hVideoSources = groupHeightStyle(state, "videoSources");
@@ -4112,7 +4107,7 @@ function render(state) {
   return `<style>
     .hmb-dashboard-clip{width:100%;height:100%;min-width:0;min-height:0;max-width:none;max-height:none;overflow:hidden;background:#050812;box-sizing:border-box;display:flex;flex-direction:column;flex:1 1 auto}
     .hmb-dashboard{--bg:#0b0f19;--panel:#0f172a;--muted:#94a3b8;--line:rgba(148,163,184,.18);--pink:#ec4899;--orange:#f97316;--cyan:#06b6d4;--green:#22c55e;--purple:#a855f7;--safe-x:16px;width:100%;height:100%;min-width:0;min-height:0;max-width:none;max-height:none;padding-left:var(--safe-x);padding-right:var(--safe-x);overflow:hidden;display:flex;flex-direction:column;flex:1 1 auto;background:radial-gradient(circle at 15% 0%,rgba(14,165,233,.16),transparent 34%),linear-gradient(180deg,#0b1120,#050812);color:#e2e8f0;font-family:"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif;border:1px solid rgba(148,163,184,.2);border-radius:11px;box-shadow:0 0 34px rgba(14,165,233,.12);box-sizing:border-box;resize:none;container-type:inline-size}
-    .hmb-dashboard *{box-sizing:border-box;min-width:0}.topbar{height:40px;flex:0 0 40px;padding:6px 12px 6px 16px;border-bottom:1px solid rgba(148,163,184,.14);background:linear-gradient(90deg,rgba(30,41,59,.92),rgba(15,23,42,.78))}.title{display:flex;align-items:center;gap:8px;overflow:hidden;color:#f8fafc;font-size:15px;font-weight:850;letter-spacing:.01em;white-space:nowrap;text-overflow:ellipsis}.title>span:last-child{overflow:hidden;text-overflow:ellipsis}.title-mark{flex:0 0 27px;width:27px;height:27px;display:grid;place-items:center;border:1px solid rgba(244,114,182,.5);border-radius:7px;background:linear-gradient(145deg,rgba(190,24,93,.28),rgba(88,28,135,.22));color:#f9a8d4;font-size:9px;font-weight:950;letter-spacing:.04em;box-shadow:inset 0 0 0 1px rgba(255,255,255,.035),0 0 10px rgba(168,85,247,.13)}.topbar{display:flex;align-items:center;justify-content:space-between;gap:10px}.language-select{width:auto;min-width:92px;height:28px;border-radius:7px;border:1px solid rgba(148,163,184,.28);background:#090d16;color:#e2e8f0;padding:3px 7px;font-size:11px;outline:none}.language-select:focus{border-color:rgba(34,211,238,.75)}.layout{display:grid;grid-template-columns:minmax(112px,.12fr) minmax(0,1fr) minmax(112px,.12fr);gap:8px;flex:1 1 auto;min-height:0;height:100%;overflow:hidden;padding:8px}.rail,.center{min-height:0;border:1px solid var(--line);border-radius:10px;background:linear-gradient(180deg,rgba(15,23,42,.74),rgba(2,6,23,.72))}.rail{padding:10px 8px;overflow:auto}.rail h3{margin:0 0 12px;font-size:12px;letter-spacing:.07em;color:#67e8f9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.rail.left h3{color:#fb7185}.rail-section{border-top:1px solid rgba(148,163,184,.13);padding-top:10px;margin-top:10px}.rail-title{font-size:10px;font-weight:800;color:#cbd5e1;margin-bottom:7px}.token,.empty-token{min-height:34px;display:flex;flex-direction:column;gap:3px;border:1px solid rgba(148,163,184,.13);background:rgba(15,23,42,.56);border-radius:7px;margin-bottom:7px;padding:7px;font-size:10px}.token b{font-size:11px}.token span{color:#94a3b8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.token.image{border-color:rgba(236,72,153,.3)}.token.video{border-color:rgba(249,115,22,.3)}.token.picker-connected{border-color:rgba(34,197,94,.5);color:#bbf7d0}.empty-token{color:#64748b}.output-guide{min-height:42px;display:flex;flex-direction:column;gap:4px;margin-bottom:7px;padding:8px;border:1px dashed rgba(34,197,94,.42);border-radius:7px;background:rgba(15,23,42,.34);color:#94a3b8;cursor:default;user-select:text}.output-guide b{font-size:9px;letter-spacing:.08em;color:#86efac}.output-guide span{font-size:9px;line-height:1.35;white-space:normal}.output-guide code{padding:1px 3px;border-radius:3px;background:rgba(34,197,94,.1);color:#bbf7d0;font:800 9px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace}.center{padding:8px;overflow:hidden;scrollbar-gutter:auto;display:flex;flex-direction:column;gap:7px;align-content:stretch}.group-card{margin:0;border:1px solid var(--line);border-radius:10px;background:rgba(2,6,23,.54);overflow:hidden;display:flex;flex-direction:column;min-height:0;max-height:none;flex:0 0 auto}.group-card h3{margin:0;padding:8px 12px;font-size:12px;letter-spacing:.04em;border-bottom:1px solid rgba(148,163,184,.14);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 0 auto}.group-card h3 b{font-size:10px;color:#94a3b8;font-weight:600}.group-body{flex:1 1 auto;min-height:0;overflow:hidden}.source-scrollbox{overflow:auto;scrollbar-gutter:stable;overscroll-behavior:contain}.source-scrollbox .source-header{position:sticky;top:0;z-index:5;background:linear-gradient(180deg,rgba(8,13,26,.98),rgba(8,13,26,.94));backdrop-filter:blur(2px)}.source-scrollbox .source-row:last-child{border-bottom:1px solid rgba(148,163,184,.1)}.group-resize-bar{flex:0 0 10px;min-height:10px;border-top:1px solid rgba(148,163,184,.16);background:linear-gradient(90deg,transparent,rgba(148,163,184,.18),transparent);cursor:ns-resize;touch-action:none;user-select:none;position:relative}.group-resize-bar::before{content:"";position:absolute;left:50%;top:3px;width:38px;height:3px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.52)}.group-resize-bar:hover::before{background:#67e8f9}.keep-out-resize-shell{display:flex;flex-direction:column;width:100%;min-height:0}.keep-out-field .source-note-input{height:34px;min-height:34px;max-height:34px;resize:none;border-radius:7px 7px 0 0}.keep-out-resize-bar{height:9px;min-height:9px;border:1px solid rgba(148,163,184,.24);border-top:0;border-radius:0 0 7px 7px;background:linear-gradient(90deg,transparent,rgba(148,163,184,.18),transparent);cursor:ns-resize;touch-action:none;user-select:none;position:relative}.keep-out-resize-bar::before{content:"";position:absolute;left:50%;top:3px;width:28px;height:2px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.52)}.keep-out-resize-bar:hover::before{background:#67e8f9}.image-card{border-color:rgba(236,72,153,.58)}.image-card h3{color:#fb7185}.imgtext{border-color:rgba(168,85,247,.55)}.imgtext h3{color:#c084fc}.video-card{border-color:rgba(249,115,22,.7)}.video-card h3{color:#fb923c}.vtext{border-color:rgba(59,130,246,.55)}.vtext h3{color:#60a5fa}.source-header,.source-row{display:grid;gap:8px;align-items:start}.image-header,.source-row.image{grid-template-columns:2.75rem minmax(0,.78fr) minmax(0,.95fr) minmax(0,.82fr) minmax(0,.82fr) minmax(0,.92fr) 3.6rem}.video-header,.source-row.video{grid-template-columns:2.75rem minmax(0,.84fr) minmax(0,.95fr) minmax(0,.95fr) minmax(0,1.36fr) 3rem}.source-header{min-height:22px;padding:5px 10px;color:#b6c5d2;font-size:10px;font-weight:800;border-bottom:1px solid rgba(148,163,184,.11)}.source-header span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-row{padding:6px 10px;border-bottom:1px solid rgba(148,163,184,.1)}.source-row:last-child{border-bottom:none}.source-num{font-weight:800;color:#f8fafc;font-size:11px;line-height:1.3;overflow:hidden;text-overflow:ellipsis}.source-num b{font-size:9px;color:#94a3b8}.source-label,.source-role,.text-field{min-width:0}.source-label input,.source-label textarea,.source-select,.source-target-input,.text-field textarea,.text-field input{width:100%;min-width:0;border-radius:7px;border:1px solid rgba(148,163,184,.24);background:#090d16;color:#e2e8f0;padding:8px;font-size:11px;outline:none}.source-label input,.source-label textarea,.text-field textarea,.text-field input,.custom-inline-input,.custom-fields-panel input{caret-color:#67e8f9}.source-label input::selection,.source-label textarea::selection,.text-field textarea::selection,.text-field input::selection,.custom-inline-input::selection,.custom-fields-panel input::selection{background:rgba(34,211,238,.34);color:#f8fafc}.source-label input:focus,.source-label textarea:focus,.source-select:focus,.source-target-input:focus,.text-field textarea:focus,.text-field input:focus{border-color:#22d3ee;box-shadow:0 0 0 1px rgba(34,211,238,.38),inset 0 0 0 1px rgba(34,211,238,.08);background:#07111b}.source-label small,.source-role small{display:block;margin-top:5px;color:#94a3b8;font-size:9px;line-height:1.25;overflow:hidden;text-overflow:ellipsis}.source-label textarea{resize:none;min-height:34px;line-height:1.35}.source-note-input{height:34px;min-height:34px;max-height:34px;resize:none}.source-status{display:flex;gap:6px;align-items:center;justify-content:flex-end}.source-actions{display:flex;gap:4px;align-items:center;justify-content:flex-end}.source-actions.image-actions{display:grid;grid-template-columns:24px 24px;grid-template-rows:28px 28px;gap:4px;align-items:center;justify-content:flex-end}.image-order-controls{display:grid;width:24px;height:28px;grid-template-rows:1fr 1fr;gap:2px}.source-actions.image-actions .image-order-controls button{width:24px;height:13px;min-height:0;padding:0;border-radius:5px;font-size:8px;line-height:1}.binding-scope-stack,.color-pick-stack{display:flex;flex-direction:column;gap:4px}.binding-scope-entry,.color-binding-entry{display:flex;flex-direction:column;gap:4px}.color-binding-entry{display:block}.binding-scope-cell select,.color-pick-cell select{height:30px;padding:5px 6px}.video-color-pick-wrap{display:grid;grid-template-columns:2rem minmax(0,1fr);gap:4px;align-items:start}.video-color-pick-wrap .image-video-index{height:30px;padding:0 2px;text-align:center;text-align-last:center;font-weight:800}.video-color-pick-wrap .image-video-index:disabled{opacity:.55;cursor:not-allowed}.binding-video-index{padding:0 2px!important;text-align:center;text-align-last:center;font-weight:800}.custom-inline-input,.custom-fields-panel input{width:100%;border-radius:7px;border:1px solid rgba(34,211,238,.28);background:#07111b;color:#dbeafe;padding:7px;font-size:10px;outline:none}.custom-inline-input:focus,.custom-fields-panel input:focus{border-color:#22d3ee}.custom-fields-panel{grid-column:2 / 7;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:6px 8px;border:1px solid rgba(34,211,238,.22);border-radius:8px;background:rgba(8,47,73,.12)}.custom-fields-panel label{display:flex;flex-direction:column;gap:4px}.custom-fields-panel span{font-size:9px;font-weight:800;color:#67e8f9}.video-custom-panel{grid-column:2 / 6}.source-row.image-add-row,.source-row.video-add-row{border-bottom:1px solid rgba(148,163,184,.1);padding-top:6px;padding-bottom:6px}.source-actions button{flex:0 0 24px;width:24px;height:28px;border-radius:7px;border:1px solid rgba(148,163,184,.22);background:#0b1220;color:#94a3b8;cursor:pointer;font-weight:800;line-height:1}.source-actions button:hover{border-color:#67e8f9;color:#67e8f9}.source-actions button.clear-source:hover{border-color:#fb7185;color:#fb7185}.source-actions button:disabled{opacity:.35;cursor:not-allowed}.clear-source{}.add-note{margin:10px;border:1px dashed rgba(148,163,184,.25);border-radius:8px;padding:9px;text-align:center;color:#94a3b8;font-size:11px}.notes{margin:0 10px 10px;color:#cbd5e1;font-size:10px;line-height:1.45}.text-grid{display:grid;grid-template-columns:1fr;align-items:stretch;align-content:stretch;gap:7px;padding:7px;height:100%;min-height:0}.imgtext .text-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.vtext .text-grid{grid-template-columns:1fr}.imgtext .group-body,.vtext .group-body{overflow:hidden;min-height:0}.text-field{display:flex;flex-direction:column;min-width:0;min-height:0}.text-field span{display:block;font-size:10px;color:#cbd5e1;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.text-field textarea{resize:none;display:block;flex:1 1 auto;height:100%;min-height:0;max-height:none}.warning{margin:10px 0 0;padding:8px;border:1px solid rgba(249,115,22,.35);border-radius:8px;color:#fed7aa;background:rgba(124,45,18,.16);font-size:10px;line-height:1.4}
+    .hmb-dashboard *{box-sizing:border-box;min-width:0}.topbar{height:40px;flex:0 0 40px;padding:6px 12px 6px 16px;border-bottom:1px solid rgba(148,163,184,.14);background:linear-gradient(90deg,rgba(30,41,59,.92),rgba(15,23,42,.78))}.title{display:flex;align-items:center;gap:8px;overflow:hidden;color:#f8fafc;font-size:15px;font-weight:850;letter-spacing:.01em;white-space:nowrap;text-overflow:ellipsis}.title>span:last-child{overflow:hidden;text-overflow:ellipsis}.title-mark{flex:0 0 27px;width:27px;height:27px;display:grid;place-items:center;border:1px solid rgba(244,114,182,.5);border-radius:7px;background:linear-gradient(145deg,rgba(190,24,93,.28),rgba(88,28,135,.22));color:#f9a8d4;font-size:9px;font-weight:950;letter-spacing:.04em;box-shadow:inset 0 0 0 1px rgba(255,255,255,.035),0 0 10px rgba(168,85,247,.13)}.topbar{display:flex;align-items:center;justify-content:space-between;gap:10px}.language-select{width:auto;min-width:92px;height:28px;border-radius:7px;border:1px solid rgba(148,163,184,.28);background:#090d16;color:#e2e8f0;padding:3px 7px;font-size:11px;outline:none}.language-select:focus{border-color:rgba(34,211,238,.75)}.layout{display:grid;grid-template-columns:minmax(0,1fr);gap:0;flex:1 1 auto;min-height:0;height:100%;overflow:hidden;padding:8px}.center{min-height:0;border:1px solid var(--line);border-radius:10px;background:linear-gradient(180deg,rgba(15,23,42,.74),rgba(2,6,23,.72));padding:8px;overflow:hidden;scrollbar-gutter:auto;display:flex;flex-direction:column;gap:7px;align-content:stretch}.group-card{margin:0;border:1px solid var(--line);border-radius:10px;background:rgba(2,6,23,.54);overflow:hidden;display:flex;flex-direction:column;min-height:0;max-height:none;flex:0 0 auto}.group-card h3{margin:0;padding:8px 12px;font-size:12px;letter-spacing:.04em;border-bottom:1px solid rgba(148,163,184,.14);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 0 auto}.group-card h3 b{font-size:10px;color:#94a3b8;font-weight:600}.group-body{flex:1 1 auto;min-height:0;overflow:hidden}.source-scrollbox{overflow:auto;scrollbar-gutter:stable;overscroll-behavior:contain}.source-scrollbox .source-header{position:sticky;top:0;z-index:5;background:linear-gradient(180deg,rgba(8,13,26,.98),rgba(8,13,26,.94));backdrop-filter:blur(2px)}.source-scrollbox .source-row:last-child{border-bottom:1px solid rgba(148,163,184,.1)}.group-resize-bar{flex:0 0 10px;min-height:10px;border-top:1px solid rgba(148,163,184,.16);background:linear-gradient(90deg,transparent,rgba(148,163,184,.18),transparent);cursor:ns-resize;touch-action:none;user-select:none;position:relative}.group-resize-bar::before{content:"";position:absolute;left:50%;top:3px;width:38px;height:3px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.52)}.group-resize-bar:hover::before{background:#67e8f9}.keep-out-resize-shell{display:flex;flex-direction:column;width:100%;min-height:0}.keep-out-field .source-note-input{height:34px;min-height:34px;max-height:34px;resize:none;border-radius:7px 7px 0 0}.keep-out-resize-bar{height:9px;min-height:9px;border:1px solid rgba(148,163,184,.24);border-top:0;border-radius:0 0 7px 7px;background:linear-gradient(90deg,transparent,rgba(148,163,184,.18),transparent);cursor:ns-resize;touch-action:none;user-select:none;position:relative}.keep-out-resize-bar::before{content:"";position:absolute;left:50%;top:3px;width:28px;height:2px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.52)}.keep-out-resize-bar:hover::before{background:#67e8f9}.image-card{border-color:rgba(236,72,153,.58)}.image-card h3{color:#fb7185}.imgtext{border-color:rgba(168,85,247,.55)}.imgtext h3{color:#c084fc}.video-card{border-color:rgba(249,115,22,.7)}.video-card h3{color:#fb923c}.vtext{border-color:rgba(59,130,246,.55)}.vtext h3{color:#60a5fa}.source-header,.source-row{display:grid;gap:8px;align-items:start}.image-header,.source-row.image{grid-template-columns:2.75rem minmax(0,.78fr) minmax(0,.95fr) minmax(0,.82fr) minmax(0,.82fr) minmax(0,.92fr) 3.6rem}.video-header,.source-row.video{grid-template-columns:2.75rem minmax(0,.84fr) minmax(0,.95fr) minmax(0,.95fr) minmax(0,1.36fr) 3rem}.source-header{min-height:22px;padding:5px 10px;color:#b6c5d2;font-size:10px;font-weight:800;border-bottom:1px solid rgba(148,163,184,.11)}.source-header span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-row{padding:6px 10px;border-bottom:1px solid rgba(148,163,184,.1)}.source-row:last-child{border-bottom:none}.source-num{font-weight:800;color:#f8fafc;font-size:11px;line-height:1.3;overflow:hidden;text-overflow:ellipsis}.source-num b{font-size:9px;color:#94a3b8}.source-label,.source-role,.text-field{min-width:0}.source-label input,.source-label textarea,.source-select,.source-target-input,.text-field textarea,.text-field input{width:100%;min-width:0;border-radius:7px;border:1px solid rgba(148,163,184,.24);background:#090d16;color:#e2e8f0;padding:8px;font-size:11px;outline:none}.source-label input,.source-label textarea,.text-field textarea,.text-field input,.custom-inline-input,.custom-fields-panel input{caret-color:#67e8f9}.source-label input::selection,.source-label textarea::selection,.text-field textarea::selection,.text-field input::selection,.custom-inline-input::selection,.custom-fields-panel input::selection{background:rgba(34,211,238,.34);color:#f8fafc}.source-label input:focus,.source-label textarea:focus,.source-select:focus,.source-target-input:focus,.text-field textarea:focus,.text-field input:focus{border-color:#22d3ee;box-shadow:0 0 0 1px rgba(34,211,238,.38),inset 0 0 0 1px rgba(34,211,238,.08);background:#07111b}.source-label small,.source-role small{display:block;margin-top:5px;color:#94a3b8;font-size:9px;line-height:1.25;overflow:hidden;text-overflow:ellipsis}.source-label textarea{resize:none;min-height:34px;line-height:1.35}.source-note-input{height:34px;min-height:34px;max-height:34px;resize:none}.source-status{display:flex;gap:6px;align-items:center;justify-content:flex-end}.source-actions{display:flex;gap:4px;align-items:center;justify-content:flex-end}.source-actions.image-actions{display:grid;grid-template-columns:24px 24px;grid-template-rows:28px 28px;gap:4px;align-items:center;justify-content:flex-end}.image-order-controls{display:grid;width:24px;height:28px;grid-template-rows:1fr 1fr;gap:2px}.source-actions.image-actions .image-order-controls button{width:24px;height:13px;min-height:0;padding:0;border-radius:5px;font-size:8px;line-height:1}.binding-scope-stack,.color-pick-stack{display:flex;flex-direction:column;gap:4px}.binding-scope-entry,.color-binding-entry{display:flex;flex-direction:column;gap:4px}.color-binding-entry{display:block}.binding-scope-cell select,.color-pick-cell select{height:30px;padding:5px 6px}.video-color-pick-wrap{display:grid;grid-template-columns:2rem minmax(0,1fr);gap:4px;align-items:start}.video-color-pick-wrap .image-video-index{height:30px;padding:0 2px;text-align:center;text-align-last:center;font-weight:800}.video-color-pick-wrap .image-video-index:disabled{opacity:.55;cursor:not-allowed}.binding-video-index{padding:0 2px!important;text-align:center;text-align-last:center;font-weight:800}.custom-inline-input,.custom-fields-panel input{width:100%;border-radius:7px;border:1px solid rgba(34,211,238,.28);background:#07111b;color:#dbeafe;padding:7px;font-size:10px;outline:none}.custom-inline-input:focus,.custom-fields-panel input:focus{border-color:#22d3ee}.custom-fields-panel{grid-column:2 / 7;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:6px 8px;border:1px solid rgba(34,211,238,.22);border-radius:8px;background:rgba(8,47,73,.12)}.custom-fields-panel label{display:flex;flex-direction:column;gap:4px}.custom-fields-panel span{font-size:9px;font-weight:800;color:#67e8f9}.video-custom-panel{grid-column:2 / 6}.source-row.image-add-row,.source-row.video-add-row{border-bottom:1px solid rgba(148,163,184,.1);padding-top:6px;padding-bottom:6px}.source-actions button{flex:0 0 24px;width:24px;height:28px;border-radius:7px;border:1px solid rgba(148,163,184,.22);background:#0b1220;color:#94a3b8;cursor:pointer;font-weight:800;line-height:1}.source-actions button:hover{border-color:#67e8f9;color:#67e8f9}.source-actions button.clear-source:hover{border-color:#fb7185;color:#fb7185}.source-actions button:disabled{opacity:.35;cursor:not-allowed}.clear-source{}.add-note{margin:10px;border:1px dashed rgba(148,163,184,.25);border-radius:8px;padding:9px;text-align:center;color:#94a3b8;font-size:11px}.notes{margin:0 10px 10px;color:#cbd5e1;font-size:10px;line-height:1.45}.text-grid{display:grid;grid-template-columns:1fr;align-items:stretch;align-content:stretch;gap:7px;padding:7px;height:100%;min-height:0}.imgtext .text-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.vtext .text-grid{grid-template-columns:1fr}.imgtext .group-body,.vtext .group-body{overflow:hidden;min-height:0}.text-field{display:flex;flex-direction:column;min-width:0;min-height:0}.text-field span{display:block;font-size:10px;color:#cbd5e1;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.text-field textarea{resize:none;display:block;flex:1 1 auto;height:100%;min-height:0;max-height:none}.warning{margin:10px 0 0;padding:8px;border:1px solid rgba(249,115,22,.35);border-radius:8px;color:#fed7aa;background:rgba(124,45,18,.16);font-size:10px;line-height:1.4}
     .video-color-pick-wrap{display:block}.color-binding-entry{display:grid;grid-template-columns:2rem minmax(0,1fr);gap:4px;align-items:start}
     .topbar-controls .language-button{min-width:58px;height:28px;padding:0 11px;border:1px solid rgba(148,163,184,.24);border-radius:8px;background:#090d16;color:#e2e8f0;font-size:11px;font-weight:800;cursor:pointer}.topbar-controls .language-button:hover,.topbar-controls .language-button:focus-visible{border-color:#22d3ee;color:#67e8f9;outline:none;box-shadow:0 0 0 1px rgba(34,211,238,.28)}
     .source-row{transition:opacity 120ms ease,box-shadow 120ms ease,background-color 120ms ease}
@@ -4125,8 +4120,8 @@ function render(state) {
     .source-row.image-row-dragging{opacity:.42}
     .source-row.image-drop-before{box-shadow:inset 0 3px 0 #67e8f9}
     .source-row.image-drop-after{box-shadow:inset 0 -3px 0 #67e8f9}
-    @container (max-width: 1250px){.layout{grid-template-columns:minmax(92px,.1fr) minmax(0,1fr) minmax(92px,.1fr);gap:7px;padding:7px}.rail{padding:8px 6px}.center{padding:7px;gap:6px}.image-header,.source-row.image{grid-template-columns:2.5rem minmax(0,.7fr) minmax(0,.9fr) minmax(0,.75fr) minmax(0,.75fr) minmax(0,.84fr) 3.6rem}.video-header,.source-row.video{grid-template-columns:2.5rem minmax(0,.76fr) minmax(0,.9fr) minmax(0,.9fr) minmax(0,1.25fr) 3rem}.source-label textarea{min-height:34px}.source-note-input{height:34px;min-height:34px;max-height:34px}}
-    @container (max-width: 930px){.hmb-dashboard{--safe-x:12px}.topbar{height:38px;flex-basis:38px;padding:8px 12px}.title{font-size:17px}.layout{grid-template-columns:1fr;gap:8px;padding:8px}.rail{display:none}.source-header{display:none}.source-row.image,.source-row.video{grid-template-columns:2.4rem minmax(0,1fr) minmax(0,1fr);gap:7px}.source-row.image .source-textarea,.source-row.video .source-textarea{grid-column:span 3}.source-status{grid-column:span 3}.custom-fields-panel,.imgtext .text-grid,.vtext .text-grid{grid-template-columns:1fr}.group-card h3{white-space:normal}.notes{display:none}}
+    @container (max-width: 1250px){.layout{grid-template-columns:minmax(0,1fr);gap:0;padding:7px}.center{padding:7px;gap:6px}.image-header,.source-row.image{grid-template-columns:2.5rem minmax(0,.7fr) minmax(0,.9fr) minmax(0,.75fr) minmax(0,.75fr) minmax(0,.84fr) 3.6rem}.video-header,.source-row.video{grid-template-columns:2.5rem minmax(0,.76fr) minmax(0,.9fr) minmax(0,.9fr) minmax(0,1.25fr) 3rem}.source-label textarea{min-height:34px}.source-note-input{height:34px;min-height:34px;max-height:34px}}
+    @container (max-width: 930px){.hmb-dashboard{--safe-x:12px}.topbar{height:38px;flex-basis:38px;padding:8px 12px}.title{font-size:17px}.layout{grid-template-columns:minmax(0,1fr);gap:0;padding:8px}.source-header{display:none}.source-row.image,.source-row.video{grid-template-columns:2.4rem minmax(0,1fr) minmax(0,1fr);gap:7px}.source-row.image .source-textarea,.source-row.video .source-textarea{grid-column:span 3}.source-status{grid-column:span 3}.custom-fields-panel,.imgtext .text-grid,.vtext .text-grid{grid-template-columns:1fr}.group-card h3{white-space:normal}.notes{display:none}}
     @container (max-width: 620px){.hmb-dashboard{--safe-x:6px}.source-row.image,.source-row.video{grid-template-columns:1fr}.source-num,.source-row.image .source-textarea,.source-row.video .source-textarea,.source-status{display:flex;grid-column:1}.custom-fields-panel{display:grid;grid-column:1}.source-actions button{flex-basis:30px}.source-label small,.source-role small,.add-note,.warning{display:block}.group-card h3{font-size:11px}.source-row{padding:7px}.text-grid{padding:7px}}
     @container (max-width: 1250px){.frame-binding-row{grid-template-columns:3.4rem minmax(0,.7fr) minmax(0,.9fr) minmax(0,.75fr) minmax(0,.75fr) minmax(0,.84fr) 3.6rem}.frame-track-shell{grid-template-columns:3rem minmax(0,1fr) 3rem}}
     @container (max-width: 930px){.frame-binding-row{grid-template-columns:3.4rem repeat(5,minmax(0,1fr)) 3.6rem}.frame-track-shell{grid-column:2/5}}
@@ -4166,17 +4161,17 @@ function render(state) {
     .hmb-dashboard[data-theme="T"]{--hmb-bg-top:#091525;--hmb-bg-bottom:#050a12;--hmb-panel-top:#0d1c2d;--hmb-panel-bottom:#07111d;--hmb-head-top:#123a63;--hmb-head-mid:#0e2947;--hmb-head-bottom:#081725;--hmb-line:rgba(96,165,250,.23);--hmb-line-strong:rgba(56,189,248,.48);--hmb-field:#06111f;--hmb-focus:#38bdf8;--hmb-hover:rgba(56,189,248,.07);--hmb-primary-top:#2563eb;--hmb-primary-bottom:#0e7490;--hmb-glow:rgba(37,99,235,.2);--hmb-text:#e6f2ff;--hmb-muted:#8daac4;--hmb-subtle:#617f9c;--hmb-utility:#38bdf8;--hmb-selection:#60a5fa;--hmb-group-image:#7dd3fc;--hmb-group-context:#93c5fd;--hmb-group-video:#60a5fa;--hmb-group-vfx:#38bdf8}
     .hmb-dashboard[data-theme]{background:radial-gradient(circle at 8% -10%,var(--hmb-glow),transparent 34%),radial-gradient(circle at 88% 0%,var(--hmb-glow),transparent 30%),linear-gradient(180deg,var(--hmb-bg-top),var(--hmb-bg-bottom));color:var(--hmb-text);border-color:var(--hmb-line);box-shadow:0 12px 36px rgba(0,0,0,.28),0 0 30px var(--hmb-glow)}
     .hmb-dashboard[data-theme] .topbar{background:radial-gradient(circle at 8% 0%,var(--hmb-glow),transparent 38%),linear-gradient(90deg,var(--hmb-head-top),var(--hmb-head-mid) 42%,var(--hmb-head-bottom));border-bottom-color:var(--hmb-line)}
-    .hmb-dashboard[data-theme] .rail,.hmb-dashboard[data-theme] .center{background:radial-gradient(circle at 50% 0%,var(--hmb-glow),transparent 35%),linear-gradient(180deg,var(--hmb-panel-top),var(--hmb-panel-bottom));border-color:var(--hmb-line);box-shadow:0 9px 24px rgba(0,0,0,.14)}
-    .hmb-dashboard[data-theme] .group-card,.hmb-dashboard[data-theme] .token,.hmb-dashboard[data-theme] .empty-token,.hmb-dashboard[data-theme] .custom-fields-panel{background:linear-gradient(145deg,rgba(255,255,255,.026),rgba(255,255,255,.006)),linear-gradient(180deg,var(--hmb-panel-top),var(--hmb-panel-bottom));border-color:var(--hmb-line)}
+    .hmb-dashboard[data-theme] .center{background:radial-gradient(circle at 50% 0%,var(--hmb-glow),transparent 35%),linear-gradient(180deg,var(--hmb-panel-top),var(--hmb-panel-bottom));border-color:var(--hmb-line);box-shadow:0 9px 24px rgba(0,0,0,.14)}
+    .hmb-dashboard[data-theme] .group-card,.hmb-dashboard[data-theme] .custom-fields-panel{background:linear-gradient(145deg,rgba(255,255,255,.026),rgba(255,255,255,.006)),linear-gradient(180deg,var(--hmb-panel-top),var(--hmb-panel-bottom));border-color:var(--hmb-line)}
     .hmb-dashboard[data-theme] .group-card h3,.hmb-dashboard[data-theme] .source-scrollbox .source-header{background:linear-gradient(180deg,rgba(255,255,255,.025),rgba(255,255,255,.005)),linear-gradient(180deg,var(--hmb-head-mid),var(--hmb-head-bottom));border-bottom-color:var(--hmb-line)}
-    .hmb-dashboard[data-theme] .title,.hmb-dashboard[data-theme] .token b,.hmb-dashboard[data-theme] .group-card h3,.hmb-dashboard[data-theme] .source-num,.hmb-dashboard[data-theme] .text-field span{color:var(--hmb-text)}
-    .hmb-dashboard[data-theme] .rail-title,.hmb-dashboard[data-theme] .token,.hmb-dashboard[data-theme] .token span,.hmb-dashboard[data-theme] .empty-token,.hmb-dashboard[data-theme] .group-card h3 b,.hmb-dashboard[data-theme] .source-header,.hmb-dashboard[data-theme] .source-num b,.hmb-dashboard[data-theme] .source-label small,.hmb-dashboard[data-theme] .source-role small,.hmb-dashboard[data-theme] .notes,.hmb-dashboard[data-theme] .add-note{color:var(--hmb-muted)}
-    .hmb-dashboard[data-theme] .rail h3,.hmb-dashboard[data-theme] .custom-fields-panel span{color:var(--hmb-utility)}.hmb-dashboard[data-theme] .rail.left h3{color:var(--hmb-selection)}.hmb-dashboard[data-theme] .theme-control-label{color:var(--hmb-muted)}
+    .hmb-dashboard[data-theme] .title,.hmb-dashboard[data-theme] .group-card h3,.hmb-dashboard[data-theme] .source-num,.hmb-dashboard[data-theme] .text-field span{color:var(--hmb-text)}
+    .hmb-dashboard[data-theme] .group-card h3 b,.hmb-dashboard[data-theme] .source-header,.hmb-dashboard[data-theme] .source-num b,.hmb-dashboard[data-theme] .source-label small,.hmb-dashboard[data-theme] .source-role small,.hmb-dashboard[data-theme] .notes,.hmb-dashboard[data-theme] .add-note{color:var(--hmb-muted)}
+    .hmb-dashboard[data-theme] .custom-fields-panel span{color:var(--hmb-utility)}.hmb-dashboard[data-theme] .theme-control-label{color:var(--hmb-muted)}
     .hmb-dashboard[data-theme] .language-select,.hmb-dashboard[data-theme] .source-label input,.hmb-dashboard[data-theme] .source-label textarea,.hmb-dashboard[data-theme] .source-select,.hmb-dashboard[data-theme] .source-target-input,.hmb-dashboard[data-theme] .text-field textarea,.hmb-dashboard[data-theme] .text-field input,.hmb-dashboard[data-theme] .custom-inline-input,.hmb-dashboard[data-theme] .custom-fields-panel input,.hmb-dashboard[data-theme] .source-actions button{background:linear-gradient(180deg,rgba(255,255,255,.025),rgba(255,255,255,.004)),var(--hmb-field);border-color:rgba(148,163,184,.2);color:var(--hmb-text)}
     .hmb-dashboard[data-theme] .source-label input::placeholder,.hmb-dashboard[data-theme] .source-label textarea::placeholder,.hmb-dashboard[data-theme] .text-field textarea::placeholder,.hmb-dashboard[data-theme] .text-field input::placeholder,.hmb-dashboard[data-theme] .custom-inline-input::placeholder,.hmb-dashboard[data-theme] .custom-fields-panel input::placeholder{color:rgba(255,255,255,.50)}
     .hmb-dashboard[data-theme] .source-label input:focus,.hmb-dashboard[data-theme] .source-label textarea:focus,.hmb-dashboard[data-theme] .source-select:focus,.hmb-dashboard[data-theme] .source-target-input:focus,.hmb-dashboard[data-theme] .text-field textarea:focus,.hmb-dashboard[data-theme] .text-field input:focus,.hmb-dashboard[data-theme] .custom-inline-input:focus,.hmb-dashboard[data-theme] .custom-fields-panel input:focus,.hmb-dashboard[data-theme] .language-select:focus{border-color:var(--hmb-focus);box-shadow:0 0 0 1px var(--hmb-focus),0 0 18px var(--hmb-glow);background:var(--hmb-field)}
     .hmb-dashboard[data-theme] .language-button{background:linear-gradient(180deg,rgba(255,255,255,.025),rgba(255,255,255,.004)),var(--hmb-field);border-color:rgba(148,163,184,.2);color:var(--hmb-text)}.hmb-dashboard[data-theme] .language-button:hover,.hmb-dashboard[data-theme] .language-button:focus-visible{border-color:var(--hmb-focus);color:var(--hmb-utility);box-shadow:0 0 0 1px var(--hmb-focus),0 0 18px var(--hmb-glow)}
-    .hmb-dashboard[data-theme] .source-row,.hmb-dashboard[data-theme] .source-scrollbox .source-row:last-child,.hmb-dashboard[data-theme] .rail-section{border-color:rgba(255,255,255,.08)}
+    .hmb-dashboard[data-theme] .source-row,.hmb-dashboard[data-theme] .source-scrollbox .source-row:last-child{border-color:rgba(255,255,255,.08)}
     .hmb-dashboard[data-theme] .source-row:hover{background:var(--hmb-hover)}
     .hmb-dashboard[data-theme] .group-resize-bar{border-top-color:var(--hmb-line);background:linear-gradient(90deg,transparent,rgba(255,255,255,.16),transparent)}
     .hmb-dashboard[data-theme] .group-resize-bar::before{background:rgba(255,255,255,.44)}
@@ -4188,7 +4183,6 @@ function render(state) {
     .hmb-dashboard[data-theme] .imgtext{border-color:var(--hmb-line-strong)}.hmb-dashboard[data-theme] .imgtext h3{color:var(--hmb-group-context)}
     .hmb-dashboard[data-theme] .video-card{border-color:var(--hmb-line-strong)}.hmb-dashboard[data-theme] .video-card h3{color:var(--hmb-group-video)}
     .hmb-dashboard[data-theme] .vtext{border-color:var(--hmb-line-strong)}.hmb-dashboard[data-theme] .vtext h3{color:var(--hmb-group-vfx)}
-    .hmb-dashboard[data-theme] .token.image,.hmb-dashboard[data-theme] .token.video,.hmb-dashboard[data-theme] .token.picker-connected{border-color:var(--hmb-line);color:var(--hmb-text)}.hmb-dashboard[data-theme] .output-guide{border-color:var(--hmb-line);color:var(--hmb-muted)}.hmb-dashboard[data-theme] .output-guide b,.hmb-dashboard[data-theme] .output-guide code{color:var(--hmb-text)}
     .hmb-dashboard[data-theme] .source-actions button:hover{border-color:var(--hmb-focus);color:var(--hmb-text);box-shadow:0 0 12px var(--hmb-glow)}
     .hmb-dashboard[data-theme] .source-actions button.clear-source:hover{border-color:var(--hmb-selection);color:var(--hmb-text)}
     .hmb-dashboard[data-theme] .warning{color:#fcd34d;background:rgba(120,53,15,.1);border-color:rgba(251,191,36,.22)}
@@ -4202,14 +4196,12 @@ function render(state) {
   </style><div class="hmb-dashboard-clip nodrag"><div class="hmb-dashboard ${state.disabled ? "disabled" : ""}" data-theme="${uiTheme}">
     <div class="topbar"><div class="title"><span class="title-mark" aria-hidden="true">PL</span><span>HMB_GP_Production</span></div><div class="topbar-controls"><div class="theme-control" aria-label="Color Selection"><span class="theme-control-label">Color Selection</span><div class="theme-control-buttons"><button type="button" class="theme-control-button ${uiTheme === "P" ? "active" : ""}" data-theme-choice="P" aria-pressed="${uiTheme === "P" ? "true" : "false"}">P</button><button type="button" class="theme-control-button ${uiTheme === "T" ? "active" : ""}" data-theme-choice="T" aria-pressed="${uiTheme === "T" ? "true" : "false"}">T</button></div></div><button type="button" class="language-button" data-language-toggle aria-label="Language">${uiLanguage(state) === "ko" ? "한국어" : "EN"}</button></div></div>
     <div class="layout">
-      <aside class="rail left"><h3>${escapeHtml(uiText(state, "external_sources", "EXTERNAL SOURCES"))}</h3><div class="rail-title">IMAGE ASSET</div><div data-image-asset-token>${imageAssetToken}</div><div class="rail-title">${escapeHtml(uiText(state, "picker", "VIDEO PICKER"))}</div><div data-picker-token>${pickerToken}</div><div class="rail-section"><div class="rail-title">${escapeHtml(uiText(state, "image_order", "IMAGE ORDER"))}<br/>${escapeHtml(uiText(state, "name_only", "name only"))}</div><div data-source-token-list="image">${imageTokens}</div></div><div class="rail-section"><div class="rail-title">${escapeHtml(uiText(state, "video_order", "VIDEO ORDER"))}<br/>${escapeHtml(uiText(state, "name_only", "name only"))}</div><div data-source-token-list="video">${videoTokens}</div></div></aside>
       <main class="center">
         <section class="group-card image-card" data-group-id="imageSources" ${hImageSources}><h3>${escapeHtml(uiText(state, "image_source_binding", "IMAGE SOURCE BINDING"))} <b>${state.status.active_images} / ${state.status.max_images}</b></h3><div class="group-body source-scrollbox" data-scroll-id="imageSources"><div class="source-header image-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "target", "TARGET"))}</span><span>${escapeHtml(uiText(state, "video_color_pick", "VIDEO / COLOR PICK"))}</span><span></span></div>${images.map((item, idx) => renderImageRow(item, idx, images, state)).join("")}${renderImageAddRow(images, state)}</div><div class="group-resize-bar nodrag" data-resize-group="imageSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card imgtext" data-group-id="imageText" ${hImageText}><h3>${escapeHtml(uiText(state, "image_text_context", "IMAGE TEXT CONTEXT"))} <b>${escapeHtml(uiText(state, "scene_level_notes", "scene-level notes"))}</b></h3><div class="group-body"><div class="text-grid">${groupBFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="imageText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card video-card" data-group-id="videoSources" ${hVideoSources}><h3>${escapeHtml(uiText(state, "video_source_binding", "VIDEO SOURCE BINDING"))} <b>${state.status.active_videos} / ${state.status.max_videos}</b></h3><div class="group-body source-scrollbox" data-scroll-id="videoSources"><div class="source-header video-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "keep_out", "KEEP OUT"))}</span><span></span></div>${videos.map((item, idx) => renderVideoRow(item, idx, images, state)).join("")}${renderVideoAddRow(videos, state)}</div><div class="group-resize-bar nodrag" data-resize-group="videoSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card vtext" data-group-id="videoText" ${hVideoText}><h3>${escapeHtml(uiText(state, "video_vfx", "VIDEO VFX"))}</h3><div class="group-body"><div class="text-grid">${groupDFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="videoText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
       </main>
-      <aside class="rail right"><h3>${escapeHtml(uiText(state, "output", "OUTPUT"))}</h3><div class="rail-title">${escapeHtml(uiText(state, "only_real_output", "ONLY REAL OUTPUT"))}${uiLanguage(state) === "en" ? "<br/>from this node" : ""}</div><div class="output-guide" role="note" aria-label="PROMPT_OUT connection guide"><b>${escapeHtml(uiText(state, "connection_guide", "CONNECTION GUIDE"))}</b><span><code>PROMPT_OUT</code> · ${escapeHtml(uiText(state, "connect_agent", "Connect to HMBAgentLibrary prompt input"))}</span></div><div class="rail-section"><div class="rail-title">${escapeHtml(uiText(state, "not_included", "NOT INCLUDED"))}</div><div class="empty-token">${escapeHtml(uiText(state, "no_image_output", "No IMAGE output ports"))}</div><div class="empty-token">${escapeHtml(uiText(state, "no_video_output", "No VIDEO output ports"))}</div></div></aside>
     </div>
   </div></div>`;
 }
@@ -5044,6 +5036,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
   container.setAttribute?.("data-hmb-node-delete-protected", "true");
   let state = hmbMergeStoredGroupHeights(container, parseValue(props.value));
   state.disabled = Boolean(props.disabled);
+  hmbRememberPromptRevisionState(container, state, state.disabled, false);
   state.ui = state.ui && typeof state.ui === "object" ? state.ui : defaultUi();
   // Mounting or receiving engine props must never redefine the workflow-wide
   // palette. Adopt the already selected shared theme without publishing an
@@ -5639,8 +5632,16 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
   remount();
   const applyProps = (nextProps = {}) => {
     if (hmbConsumePendingPromptStateEcho(container, nextProps || {})) {
-      props = nextProps || {};
-      state.disabled = Boolean(props.disabled);
+      // Do not replace the live callbacks/state with an older retained-mode
+      // payload. Exact current echoes may refresh host callbacks, while stale
+      // lower-revision echoes are acknowledgements only.
+      if (!container.__hmbPromptLastConsumedEchoWasStale) {
+        props = nextProps || {};
+      } else {
+        props = { ...props, disabled: Boolean(nextProps?.disabled) };
+      }
+      state.disabled = Boolean(nextProps?.disabled);
+      hmbRememberPromptRevisionState(container, state, state.disabled, false);
       container.querySelector?.(".hmb-dashboard")?.classList?.toggle("disabled", state.disabled);
       return;
     }
@@ -5679,6 +5680,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
       return;
     }
     state = nextState;
+    hmbRememberPromptRevisionState(container, state, state.disabled, false);
     remount();
     if (dirtyText.length) hmbScheduleImmediateStateCommit(container, props, state);
   };
@@ -5710,6 +5712,13 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
     if (container.__hmbPromptLibraryApplyProps === applyProps) {
       delete container.__hmbPromptLibraryApplyProps;
     }
+    try {
+      delete container.__hmbPromptCurrentUiEditRevision;
+      delete container.__hmbPromptLatestLocalUiEditRevision;
+      delete container.__hmbPromptCurrentSourceSyncRevision;
+      delete container.__hmbPromptCurrentDisabled;
+      delete container.__hmbPromptLastConsumedEchoWasStale;
+    } catch (_e) {}
     container.removeAttribute?.("data-hmb-node-delete-protected");
     container.innerHTML = "";
   };

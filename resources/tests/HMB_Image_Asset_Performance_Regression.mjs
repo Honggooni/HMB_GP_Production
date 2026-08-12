@@ -151,6 +151,161 @@ assert.equal(publishedCanonical, feedbackState, "A canonical local state must no
 assert.equal(assetWidget.hmbImageAssetAuthorityStamp(publishedCanonical), canonicalStamp);
 assert.equal(assetWidget.hmbConsumeImageAssetStateEcho(exactEchoContainer, { value: exactEchoValue }), true);
 assert.equal(assetWidget.hmbConsumeImageAssetStateEcho(exactEchoContainer, { value: exactEchoValue }), false);
+
+// Card selection and view/type controls can publish faster than retained-mode
+// props arrive. Serialized UI revisions make B -> late A deterministic even
+// after the short exact-echo timer has discarded all payload history.
+const rapidCardBase = {
+  scan_revision: 7,
+  asset_view_mode: "image",
+  assets: [{
+    asset_library_id: "rapid-card",
+    source_uid: "project:rapid-card",
+    source_kind: "project",
+    registered: true,
+    asset_id: "RapidCard",
+    image_name: "Rapid Card Source",
+    extension: ".png",
+    source_type: "Character Appearance",
+    selected: false,
+  }],
+};
+const rapidCardSelected = {
+  ...rapidCardBase,
+  asset_view_mode: "detail",
+  assets: [{ ...rapidCardBase.assets[0], selected: true, selection_order: 1 }],
+};
+const rapidContainer = {};
+const rapidValues = [];
+for (const rapidState of [rapidCardBase, rapidCardSelected]) {
+  assetWidget.hmbPublishImageAssetState(
+    rapidContainer,
+    { onChange(value) { rapidValues.push(value); } },
+    assetWidget.hmbNormalizeImageAssetState(rapidState),
+    null,
+    { suppressMatchingEcho: true },
+  );
+}
+const [rapidAValue, rapidBValue] = rapidValues;
+const rapidAState = JSON.parse(rapidAValue);
+const rapidBState = JSON.parse(rapidBValue);
+assert.equal(rapidAState.ui_edit_revision + 1, rapidBState.ui_edit_revision);
+assert.equal(rapidAState.assets[0].selected, false);
+assert.equal(rapidBState.assets[0].selected, true);
+assert.equal(rapidBState.asset_view_mode, "detail");
+assert.equal(
+  assetWidget.hmbConsumeImageAssetStateEcho(rapidContainer, { value: rapidBValue }),
+  true,
+  "The newer card/type state B must consume its exact host acknowledgement.",
+);
+assert.equal(
+  assetWidget.hmbConsumeImageAssetStateEcho(rapidContainer, { value: rapidAValue }),
+  true,
+  "Late card/type state A must not roll back or remount the selected card.",
+);
+assert.equal(rapidContainer.__hmbImageAssetLastConsumedEchoWasStale, true);
+
+const nativeSetTimeout = globalThis.setTimeout;
+const nativeClearTimeout = globalThis.clearTimeout;
+const revisionTimers = new Map();
+let revisionTimerId = 0;
+globalThis.setTimeout = (callback, delay) => {
+  const id = ++revisionTimerId;
+  revisionTimers.set(id, { callback, delay });
+  return id;
+};
+globalThis.clearTimeout = (id) => revisionTimers.delete(id);
+try {
+  const delayedContainer = {};
+  const delayedValues = [];
+  for (const rapidState of [rapidCardBase, rapidCardSelected]) {
+    assetWidget.hmbPublishImageAssetState(
+      delayedContainer,
+      { onChange(value) { delayedValues.push(value); } },
+      assetWidget.hmbNormalizeImageAssetState(rapidState),
+      null,
+      { suppressMatchingEcho: true },
+    );
+  }
+  const echoCleanup = [...revisionTimers.values()].find((timer) => timer.delay === 1500);
+  assert.ok(echoCleanup, "ImageAsset exact-echo history must remain time bounded.");
+  echoCleanup.callback();
+  assert.equal(delayedContainer.__hmbImageAssetPendingStateEchoes, undefined);
+  assert.equal(
+    assetWidget.hmbConsumeImageAssetStateEcho(
+      delayedContainer,
+      { value: delayedValues[0] },
+    ),
+    true,
+    "A lower UI revision must remain stale beyond the 1500ms echo TTL.",
+  );
+
+  const currentState = JSON.parse(delayedValues[1]);
+  const higherScan = assetWidget.hmbNormalizeImageAssetState({
+    ...currentState,
+    scan_revision: 8,
+    ui_edit_revision: 0,
+  });
+  assert.equal(
+    assetWidget.hmbConsumeImageAssetStateEcho(
+      delayedContainer,
+      { value: JSON.stringify(higherScan) },
+    ),
+    false,
+    "A higher catalog scan revision must remain authoritative.",
+  );
+} finally {
+  globalThis.setTimeout = nativeSetTimeout;
+  globalThis.clearTimeout = nativeClearTimeout;
+}
+
+const lowerScanContainer = {};
+assetWidget.hmbPublishImageAssetState(
+  lowerScanContainer,
+  { onChange() {} },
+  assetWidget.hmbNormalizeImageAssetState({ ...rapidCardSelected, scan_revision: 9 }),
+  null,
+  { suppressMatchingEcho: true },
+);
+const lowerScanHigherUi = assetWidget.hmbNormalizeImageAssetState({
+  ...rapidCardBase,
+  scan_revision: 8,
+  ui_edit_revision: 999,
+});
+assert.equal(
+  assetWidget.hmbConsumeImageAssetStateEcho(
+    lowerScanContainer,
+    { value: JSON.stringify(lowerScanHigherUi) },
+  ),
+  true,
+  "A lower scan revision must be stale even when it carries a higher UI revision.",
+);
+clearTimeout(lowerScanContainer.__hmbImageAssetStateEchoTimer);
+
+const higherUiContainer = {};
+const higherUiValues = [];
+assetWidget.hmbPublishImageAssetState(
+  higherUiContainer,
+  { onChange(value) { higherUiValues.push(value); } },
+  assetWidget.hmbNormalizeImageAssetState(rapidCardBase),
+  null,
+  { suppressMatchingEcho: true },
+);
+const higherUiBase = JSON.parse(higherUiValues[0]);
+const higherUiState = assetWidget.hmbNormalizeImageAssetState({
+  ...higherUiBase,
+  asset_view_mode: "detail",
+  ui_edit_revision: higherUiBase.ui_edit_revision + 1,
+});
+assert.equal(
+  assetWidget.hmbConsumeImageAssetStateEcho(
+    higherUiContainer,
+    { value: JSON.stringify(higherUiState) },
+  ),
+  false,
+  "A higher UI edit revision at the current scan must remain authoritative.",
+);
+
 const manifestPollEcho = assetWidget.hmbImageAssetAutoSyncPayload(
   feedbackState,
   "manifest-poll-regression",
@@ -443,7 +598,18 @@ const makeAutoSyncContainer = () => ({
 {
   let rootWrites = 0;
   let markup = "";
+  const languageToggleListeners = new Map();
+  const languageToggle = {
+    isConnected: true,
+    addEventListener(type, handler) { languageToggleListeners.set(type, handler); },
+    removeEventListener(type, handler) {
+      if (languageToggleListeners.get(type) === handler) languageToggleListeners.delete(type);
+    },
+  };
   const container = makeAutoSyncContainer();
+  container.querySelector = (selector) => (
+    selector === "[data-language-toggle]" ? languageToggle : null
+  );
   Object.defineProperty(container, "innerHTML", {
     configurable: true,
     get() { return markup; },
@@ -506,6 +672,57 @@ const makeAutoSyncContainer = () => ({
     writesAfterMount + 1,
     "A real canonical manifest change must still remount exactly once.",
   );
+
+  const rapidMountedValues = [];
+  const mountedA = assetWidget.hmbNormalizeImageAssetState({
+    ...changedCanonical,
+    asset_view_mode: "image",
+  });
+  const mountedB = assetWidget.hmbNormalizeImageAssetState({
+    ...changedCanonical,
+    asset_view_mode: "detail",
+    assets: changedCanonical.assets.map((asset, index) => ({
+      ...asset,
+      selected: index === 0,
+      selection_order: index === 0 ? 1 : 0,
+    })),
+  });
+  assetWidget.hmbPublishImageAssetState(
+    container,
+    { onChange(value) { rapidMountedValues.push(value); } },
+    mountedA,
+    null,
+    { suppressMatchingEcho: true },
+  );
+  assetWidget.hmbPublishImageAssetState(
+    container,
+    { onChange(value) { rapidMountedValues.push(value); } },
+    mountedB,
+    null,
+    { suppressMatchingEcho: true },
+  );
+  const writesBeforeRapidEchoes = rootWrites;
+  let newerCallbackCalls = 0;
+  let staleCallbackCalls = 0;
+  controller.update({
+    value: rapidMountedValues[1],
+    onChange() { newerCallbackCalls += 1; },
+  });
+  controller.update({
+    value: rapidMountedValues[0],
+    onChange() { staleCallbackCalls += 1; },
+  });
+  assert.equal(
+    rootWrites,
+    writesBeforeRapidEchoes,
+    "Mounted B then delayed A props must preserve the current card DOM without another remount.",
+  );
+  assert.equal(container.querySelector("[data-language-toggle]"), languageToggle);
+  assert.equal(languageToggle.isConnected, true, "A delayed echo must retain the mounted control identity.");
+  assert.equal(container.__hmbImageAssetLastConsumedEchoWasStale, true);
+  languageToggleListeners.get("click")?.({ preventDefault() {}, stopPropagation() {} });
+  assert.equal(newerCallbackCalls, 1, "The next card action must use B's newest host callback.");
+  assert.equal(staleCallbackCalls, 0, "A delayed A echo must not restore its obsolete callback.");
   controller.cleanup();
 }
 const exerciseAutoSyncFailure = async (failureKind) => {
@@ -839,6 +1056,16 @@ assert.match(
   assetSource,
   /function emit\(props, state, container = null, onFailure = null, options = \{\}\) \{\s*return hmbPublishImageAssetState\(container, props, state, onFailure, options\);/,
   "Every generic Image state emit must pass through the owner-guarded transport retry boundary.",
+);
+assert.match(
+  assetSource,
+  /if \(hmbConsumeImageAssetStateEcho\(container, nextProps\)\) \{[\s\S]*?__hmbImageAssetLastConsumedEchoWasStale[\s\S]*?return;[\s\S]*?if \(container\.__hmbImageAssetSelectionCommitPending\)/,
+  "Revision-stale props must be consumed before selection-delta authority is merged.",
+);
+assert.match(
+  assetSource,
+  /const cleanup = \(\) => \{[\s\S]*?delete container\.__hmbImageAssetCurrentScanRevision;[\s\S]*?delete container\.__hmbImageAssetCurrentUiEditRevision;[\s\S]*?delete container\.__hmbImageAssetLatestLocalUiEditRevision;/,
+  "Cleanup must discard ImageAsset revision baselines before workflow hydration.",
 );
 assert.match(
   assetSource,

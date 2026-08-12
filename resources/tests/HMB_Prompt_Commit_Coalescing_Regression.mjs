@@ -391,15 +391,10 @@ assert.match(
   "Prompt cleanup must invalidate the async publication created by its final dirty-state flush.",
 );
 
-assert.match(
-  source,
-  /class="output-guide" role="note" aria-label="PROMPT_OUT connection guide"><b>[\s\S]*?<code>PROMPT_OUT<\/code>/,
-  "The dashboard reference must explicitly identify itself as a connection guide.",
-);
 assert.doesNotMatch(
   source,
-  /class="token prompt-out"/,
-  "Decorative PROMPT_OUT guidance must not reuse real source/output token styling.",
+  /class="output-guide"|<aside class="rail (?:left|right)"/,
+  "Removed dashboard guide rails must not leave decorative PROMPT_OUT UI behind.",
 );
 
 const originalWindow = globalThis.window;

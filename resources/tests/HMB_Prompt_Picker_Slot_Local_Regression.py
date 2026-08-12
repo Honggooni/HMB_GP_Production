@@ -105,6 +105,71 @@ assert len(applied["picker"]["markers"]) == 1
 assert len(applied["picker"]["frame_metadata"]) == 3
 
 
+# Reapplying the exact Picker generation happens after every local dropdown
+# commit. Once auto Depth/Motion values have been assigned, a different current
+# Main/Sub Type is a user override and must survive that same-generation pass.
+overridden = copy.deepcopy(applied)
+overridden["videos"][1]["source_type"] = "Motion Reference"
+overridden["videos"][1]["control_role"] = "Local Motion Detail Only"
+overridden["videos"][2]["source_type"] = "Timing / Edit Reference"
+overridden["videos"][2]["control_role"] = "Timing Only"
+same_generation = prompt._apply_picker_payload(
+    overridden,
+    payload_a,
+    connected=True,
+)
+assert same_generation["videos"][1]["source_type"] == "Motion Reference"
+assert same_generation["videos"][1]["control_role"] == "Local Motion Detail Only"
+assert same_generation["videos"][2]["source_type"] == "Timing / Edit Reference"
+assert same_generation["videos"][2]["control_role"] == "Timing Only"
+assert same_generation["videos"][1]["picker_auto_depth"]["pair_run_id"] == (
+    "slot-local-bundle-a"
+)
+assert same_generation["videos"][2]["picker_auto_motion_guide"][
+    "bundle_run_id"
+] == "slot-local-bundle-a"
+
+# Provenance release never rolls a user override back to the value that existed
+# before automation; only fields still equal to their auto assignment restore.
+released_override = copy.deepcopy(same_generation)
+assert prompt._release_picker_generated_depth(released_override["videos"][1])
+assert prompt._release_picker_generated_motion_guide(released_override["videos"][2])
+assert released_override["videos"][1]["source_type"] == "Motion Reference"
+assert released_override["videos"][1]["control_role"] == "Local Motion Detail Only"
+assert released_override["videos"][2]["source_type"] == "Timing / Edit Reference"
+assert released_override["videos"][2]["control_role"] == "Timing Only"
+assert released_override["videos"][1]["picker_auto_depth"] == {}
+assert released_override["videos"][2]["picker_auto_motion_guide"] == {}
+
+# A new pair/bundle is authoritative and may assign its validated automatic
+# Depth/Motion roles again.
+payload_override_next = picker_payload(
+    "slot-local-override-run-b",
+    "slot-local-override-bundle-b",
+)
+new_generation = prompt._apply_picker_payload(
+    same_generation,
+    payload_override_next,
+    connected=True,
+)
+assert new_generation["videos"][1]["source_type"] == "Depth / Spatial Reference"
+assert new_generation["videos"][1]["control_role"] == (
+    "Spatial Alignment Verification Only"
+)
+assert new_generation["videos"][2]["source_type"] == (
+    "Motion Guide / Retargeting Reference"
+)
+assert new_generation["videos"][2]["control_role"] == (
+    "Derived Motion Decoding Only"
+)
+assert new_generation["videos"][1]["picker_auto_depth"]["pair_run_id"] == (
+    "slot-local-override-bundle-b"
+)
+assert new_generation["videos"][2]["picker_auto_motion_guide"][
+    "bundle_run_id"
+] == "slot-local-override-bundle-b"
+
+
 # Ignoring @video1 is a slot-local user choice. Reapplying the still-connected
 # Picker payload must not clear or disable @video2/@video3 and their provenance.
 ignored = copy.deepcopy(applied)

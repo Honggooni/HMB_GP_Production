@@ -235,20 +235,27 @@ assert.match(selectedAssetRule, /border-color:var\(--asset-selection\)/, "Select
 assert.match(selectedAssetRule, /box-shadow:inset 0 0 0 \.3px/, "Selected assets must add the requested 0.3px neon line without changing geometry.");
 assert.doesNotMatch(selectedAssetRule, /border-width:/, "Selection must not resize the card border and shift its contents.");
 assert.match(assetSource, /\.asset-thumb\{[^}]*grid-template-rows:2fr 1fr;/, "The thumbnail preview must grow downward while the format footer shrinks.");
-assert.match(assetSource, /class="asset-title-copy"[\s\S]*?class="asset-id-line"[\s\S]*?imageAssetText\(state, "asset_id"\)/, "Asset ID must remain visible as localized compact secondary text directly below Image Name.");
+assert.match(assetSource, /class="asset-title-copy"[\s\S]*?class="asset-state"[\s\S]*?class="asset-id-line"[\s\S]*?imageAssetText\(state, "asset_id"\)/, "Detail content must retain Project state and localized Asset ID.");
+assert.doesNotMatch(assetSource.match(/function renderAssetCard\([\s\S]*?\n\}/)?.[0] || "", /<b title="\$\{escapeHtml\(imageAssetText\(state, "image_name"\)\)/, "The source name moved to the thumbnail footer must not be duplicated in the detail title.");
 assert.doesNotMatch(assetSource, /<div class="asset-fields">/, "Asset cards must not spend half of their content width on a separate Asset ID field.");
 assert.match(assetSource, /\.hmb-image-assets \.asset-card\{[^}]*min-height:167px;[^}]*padding:10px/, "Asset cards must grow by the requested rounded 10 percent.");
 assert.match(assetSource, /\.hmb-image-assets \.asset-thumb\{[^}]*width:123px;[^}]*height:145px/, "Asset thumbnails must grow by the requested rounded 10 percent.");
 assert.match(assetSource, /\.hmb-image-assets\[data-asset-view="image"\] \.asset-grid\{[^}]*repeat\(auto-fill,145px\)/, "Image-only must use the 10%-larger fixed thumbnail grid.");
 assert.match(assetSource, /\.hmb-image-assets\[data-asset-view="image"\] \.asset-card\{[^}]*width:145px;[^}]*grid-template-columns:123px;[^}]*gap:0/, "Image-only cards must fit the enlarged thumbnail exactly without a trailing detail bar.");
-assert.match(assetSource, /\.hmb-image-assets\[data-asset-view="image"\] \.asset-content\{display:none\}/, "Image-only cards must hide only the detail column.");
+assert.match(assetSource, /\.hmb-image-assets\[data-asset-view="image"\] \.asset-content,\.hmb-image-assets\[data-asset-view="image"\] \.asset-extension-badge\{display:none\}/, "Image-only cards must hide the detail column and its extension badge.");
 assert.match(assetSource, /\.hmb-image-assets\[data-asset-view="detail"\] \.asset-grid\{[^}]*repeat\(auto-fill,286px\)/, "Detailed cards must retain their compact fixed track after the requested 10% enlargement.");
 assert.match(assetSource, /\.hmb-image-assets\[data-asset-view="detail"\] \.asset-card\{[^}]*width:286px;[^}]*grid-template-columns:123px minmax\(0,1fr\)/, "Detailed cards must keep the enlarged image plus a compact metadata column.");
 assert.match(assetSource, /\.hmb-image-assets\[data-asset-view="detail"\] \.asset-content\{display:flex\}/, "Detailed view must restore the red-box metadata region.");
-assert.doesNotMatch(assetSource, /data-asset-view="image"[\s\S]{0,500}asset-thumb-footer\{display:none/, "Image-only mode must retain the Add/format thumbnail footer.");
+assert.doesNotMatch(assetSource, /data-asset-view="image"[\s\S]{0,500}asset-thumb-footer\{display:none/, "Image-only mode must retain the source-name/Add thumbnail footer.");
 assert.doesNotMatch(assetSource, /@media\(max-width:920px\)\{[^}]*\.asset-grid\{grid-template-columns:1fr\}/, "Responsive layout must not restore the stretched green trailing area.");
 assert.match(assetSource, /data-registration-field="asset_id"/, "The Add passport must retain editable Asset ID because Picker and Prompt bind against it.");
-assert.match(assetSource, /asset\.registered[\s\S]*?class="asset-format"[\s\S]*?data-asset-add[\s\S]*?imageAssetText\(state, "add"\)/, "Registered cards show their format while unregistered cards show localized Add.");
+assert.match(assetSource, /function assetCardThumbnailImageMarkup\(asset\)[\s\S]*?class="asset-thumb-placeholder"[\s\S]*?class="asset-thumb-media">\$\{assetCardThumbnailImageMarkup\(asset\)\}\$\{add\}<\/div>[\s\S]*?class="asset-thumb-footer"><span class="asset-source-name"/, "Every asset card must use an image-or-neutral-placeholder media area and show only the source name in its footer.");
+assert.doesNotMatch(assetSource.match(/function assetThumbnailHtml\(asset, state\)[\s\S]*?\n\}/)?.[0] || "", /thumbnailImageMarkup\(asset\)/, "Asset-card fallback media must never expose extension text.");
+assert.match(assetSource, /const add = asset\.registered[\s\S]*?data-asset-add[\s\S]*?imageAssetText\(state, "add"\)/, "Unregistered thumbnail media must retain localized Add.");
+assert.doesNotMatch(assetSource, /class="asset-format"/, "Thumbnail footers must no longer spend their label on the file extension.");
+assert.match(assetSource, /class="asset-title"[\s\S]*?class="asset-extension-badge"/, "Detail content must place the extension badge at the title's top-right edge.");
+assert.match(assetSource, /\.asset-extension-badge\{[^}]*color:var\(--accent\);[^}]*font-family:inherit;[^}]*font-size:7px;[^}]*font-weight:900/, "The detail extension badge must use the project accent and inherited project font.");
+assert.match(assetSource, /data-asset-view="image"\] \.asset-content,\.hmb-image-assets\[data-asset-view="image"\] \.asset-extension-badge\{display:none\}/, "Image-only view must explicitly hide the detail-only extension badge.");
 assert.match(assetSource, /role="dialog" aria-modal="true"[\s\S]*?imageAssetText\(state, "asset_passport"\)[\s\S]*?data-registration-main[\s\S]*?data-registration-sub/, "Add must open a localized passport registration dialog with Main and Sub Type selectors.");
 assert.match(assetSource, /function registrationFolderField\(state, draft, externalImport\)[\s\S]*?if \(!externalImport\) return "";[\s\S]*?<select data-registration-folder>/, "Only external imports should render the destination Asset Folder selector.");
 const registrationFolderOptionsSource = assetSource.match(/function registrationFolderOptions\(state, draft\) \{[\s\S]*?\n\}/)?.[0] || "";
@@ -1081,7 +1088,11 @@ assert.match(
   /export function hmbCommitLocalPromptStructure[\s\S]*?committedState = remount\(\) \|\| state[\s\S]*?hmbEmitLocalPromptState\(container, props, committedState\);/,
   "Prompt structural source edits must repaint before publishing without waiting for a Picker props event.",
 );
-assert.match(promptSource, /if \(currentValue === nextValue && !disabledChanged\) \{[\s\S]*?return;[\s\S]*?\}[\s\S]*?state = nextState;\s*remount\(\);/);
+assert.match(
+  promptSource,
+  /if \(currentValue === nextValue && !disabledChanged\) \{[\s\S]*?return;[\s\S]*?\}[\s\S]*?state = nextState;[\s\S]*?hmbRememberPromptRevisionState\(container, state, state\.disabled, false\);\s*remount\(\);/,
+  "Only a genuinely authoritative newer state may update the revision baseline and remount PromptLibrary.",
+);
 assert.match(promptSource, /hmbCapturePromptControlFocus\(container\)[\s\S]*?hmbRestorePromptControlFocus\(container\)/, "Prompt structural refreshes must preserve non-text control focus.");
 assert.match(promptSource, /container\.__hmbPromptLibraryApplyProps/, "Prompt must reuse one mounted controller across host refreshes.");
 assert.match(promptSource, /data-image-drag-handle draggable=/);

@@ -487,6 +487,362 @@ assert.equal(
   "The identical local echo allowance must stop after its bounded count.",
 );
 
+// Native selects close when their DOM is remounted. Every local edit therefore
+// carries a serialized monotonic UI revision: after rapid A -> B, a B-first
+// host acknowledgement and an arbitrarily late A must both avoid a remount.
+function freshLocalState(value) {
+  return prompt.normalizeState({
+    ...JSON.parse(JSON.stringify(value)),
+    ui_edit_revision: 0,
+  });
+}
+
+function emitLocalStates(states, container = {}) {
+  const emitted = [];
+  const props = {
+    disabled: false,
+    onChange(value) { emitted.push(value); },
+  };
+  for (const item of states) {
+    prompt.hmbEmitLocalPromptState(container, props, freshLocalState(item));
+  }
+  return { container, emitted, props };
+}
+
+function assertRapidLocalEchoOrder(olderState, newerState, label) {
+  const { container, emitted } = emitLocalStates([olderState, newerState]);
+  const [olderValue, newerValue] = emitted;
+  const olderSerialized = JSON.parse(olderValue);
+  const newerSerialized = JSON.parse(newerValue);
+  assert.equal(
+    newerSerialized.ui_edit_revision,
+    olderSerialized.ui_edit_revision + 1,
+    `${label}: each real selection commit must increment ui_edit_revision.`,
+  );
+  assert.equal(
+    prompt.hmbConsumePendingPromptStateEcho(
+      container,
+      { value: newerValue, disabled: false },
+    ),
+    true,
+    `${label}: newer local echo must be consumed.`,
+  );
+  assert.ok(container.__hmbPromptPendingLocalValues.length <= 12);
+  assert.equal(
+    prompt.hmbConsumePendingPromptStateEcho(
+      container,
+      { value: olderValue, disabled: false },
+    ),
+    true,
+    `${label}: late A must not remount and close the next dropdown.`,
+  );
+  assert.equal(container.__hmbPromptLastConsumedEchoWasStale, true);
+  assert.equal(container.__hmbPromptSupersededLocalValues, undefined);
+  clearTimeout(container.__hmbPromptPendingLocalTimer);
+  return { olderValue, newerValue, olderSerialized, newerSerialized };
+}
+
+const sameFieldMainA = prompt.normalizeState({
+  images: [{
+    slot: 1,
+    label: "Hero",
+    present: true,
+    source_type: "Character Appearance",
+    binding_scopes: [""],
+    owner: "",
+  }],
+});
+const sameFieldMainB = prompt.normalizeState({
+  images: [{
+    slot: 1,
+    label: "Hero",
+    present: true,
+    source_type: "Environment / Background",
+    binding_scopes: [""],
+    owner: "",
+  }],
+});
+assertRapidLocalEchoOrder(
+  sameFieldMainA,
+  sameFieldMainB,
+  "same Main Type field rapid change",
+);
+
+const mainThenSubtype = prompt.normalizeState({
+  images: [{
+    slot: 1,
+    label: "Hero",
+    present: true,
+    source_type: "Character Appearance",
+    binding_scopes: ["Full body / full appearance"],
+    owner: "",
+  }],
+});
+const subtypeThenTarget = prompt.normalizeState({
+  images: [{
+    slot: 1,
+    label: "Hero",
+    present: true,
+    source_type: "Character Appearance",
+    binding_scopes: ["Full body / full appearance"],
+    owner: "Hero",
+  }],
+});
+assertRapidLocalEchoOrder(
+  sameFieldMainA,
+  mainThenSubtype,
+  "Main Type -> Sub Type rapid change",
+);
+assertRapidLocalEchoOrder(
+  mainThenSubtype,
+  subtypeThenTarget,
+  "Sub Type -> Target rapid change",
+);
+
+const targetThenVideoBinding = prompt.normalizeState({
+  images: [{
+    slot: 1,
+    label: "Hero",
+    present: true,
+    source_type: "Character Appearance",
+    binding_scopes: ["Full body / full appearance"],
+    owner: "Hero",
+    binding_video_slots: [1],
+    color_picks: [""],
+  }],
+  videos: [{
+    slot: 1,
+    label: "Shot",
+    present: true,
+    source_type: "Maya Preview / Playblast",
+  }],
+});
+const videoBindingThenColorPick = prompt.normalizeState({
+  ...targetThenVideoBinding,
+  images: [{
+    ...targetThenVideoBinding.images[0],
+    color_picks: ["Red"],
+  }],
+});
+const bindingRapid = assertRapidLocalEchoOrder(
+  targetThenVideoBinding,
+  videoBindingThenColorPick,
+  "Image Video Binding -> Color Pick rapid change",
+);
+assert.deepEqual(bindingRapid.newerSerialized.images[0].binding_video_slots, [1]);
+assert.deepEqual(bindingRapid.newerSerialized.images[0].color_picks, ["Red"]);
+
+const customMainType = prompt.normalizeState({
+  images: [{
+    slot: 1,
+    label: "Custom Hero",
+    present: true,
+    source_type: "Custom",
+    custom_source_type: "",
+    binding_scopes: ["Custom scope"],
+    binding_custom_scopes: [""],
+    owner: "Custom Hero",
+  }],
+});
+const customDetails = prompt.normalizeState({
+  ...customMainType,
+  images: [{
+    ...customMainType.images[0],
+    custom_source_type: "Creature Sheet",
+    binding_custom_scopes: ["Face / head"],
+  }],
+});
+const customRapid = assertRapidLocalEchoOrder(
+  customMainType,
+  customDetails,
+  "Custom Main Type -> Custom Sub Type/Scope rapid change",
+);
+assert.equal(customRapid.newerSerialized.images[0].custom_source_type, "Creature Sheet");
+assert.deepEqual(customRapid.newerSerialized.images[0].binding_custom_scopes, ["Face / head"]);
+
+const videoMainType = prompt.normalizeState({
+  videos: [{
+    slot: 1,
+    label: "Shot",
+    present: true,
+    source_type: "Maya Preview / Playblast",
+    control_role: "",
+  }],
+});
+const videoControlRole = prompt.normalizeState({
+  videos: [{
+    slot: 1,
+    label: "Shot",
+    present: true,
+    source_type: "Maya Preview / Playblast",
+    control_role: "Primary Unified Shot Control",
+  }],
+});
+const videoRapid = assertRapidLocalEchoOrder(
+  videoMainType,
+  videoControlRole,
+  "Video Main Type -> Control Role rapid change",
+);
+assert.equal(videoRapid.olderSerialized.videos[0].source_type, "Maya Preview / Playblast");
+assert.equal(videoRapid.newerSerialized.videos[0].control_role, "Primary Unified Shot Control");
+
+const boundedRapidContainer = {};
+const boundedRapidValues = [];
+for (let index = 0; index < 18; index += 1) {
+  prompt.hmbEmitLocalPromptState(
+    boundedRapidContainer,
+    { disabled: false, onChange(value) { boundedRapidValues.push(value); } },
+    prompt.normalizeState({ text: { SCENE_CONTEXT: `Bounded rapid state ${index}` } }),
+  );
+}
+assert.ok(boundedRapidContainer.__hmbPromptPendingLocalValues.length <= 12);
+const boundedNewest = boundedRapidContainer.__hmbPromptPendingLocalValues.at(-1).value;
+assert.equal(
+  prompt.hmbConsumePendingPromptStateEcho(
+    boundedRapidContainer,
+    { value: boundedNewest, disabled: false },
+  ),
+  true,
+);
+assert.ok(boundedRapidContainer.__hmbPromptPendingLocalValues.length <= 12);
+assert.equal(boundedRapidContainer.__hmbPromptSupersededLocalValues, undefined);
+assert.equal(JSON.parse(boundedRapidValues.at(-1)).ui_edit_revision, 18);
+clearTimeout(boundedRapidContainer.__hmbPromptPendingLocalTimer);
+
+// A may expire while B remains live. Its lower UI revision is sufficient to
+// identify it before or after B's exact acknowledgement.
+const expiredPair = emitLocalStates([sameFieldMainA, sameFieldMainB]);
+expiredPair.container.__hmbPromptPendingLocalValues[0].expiresAt = Date.now() - 1;
+assert.equal(
+  prompt.hmbConsumePendingPromptStateEcho(
+    expiredPair.container,
+    { value: expiredPair.emitted[0], disabled: false },
+  ),
+  true,
+  "Expired A must still be recognized while a newer local B publication is live.",
+);
+assert.equal(
+  prompt.hmbConsumePendingPromptStateEcho(
+    expiredPair.container,
+    { value: expiredPair.emitted[1], disabled: false },
+  ),
+  true,
+  "B must still be consumable after an expired A arrives first.",
+);
+clearTimeout(expiredPair.container.__hmbPromptPendingLocalTimer);
+
+const expiredAlone = emitLocalStates([sameFieldMainA]);
+expiredAlone.container.__hmbPromptPendingLocalValues[0].expiresAt = Date.now() - 1;
+assert.equal(
+  prompt.hmbConsumePendingPromptStateEcho(
+    expiredAlone.container,
+    { value: expiredAlone.emitted[0], disabled: false },
+  ),
+  false,
+  "Expired A without a newer live local publication must remain authoritative.",
+);
+
+// Simulate the 750ms queue cleanup without waiting. Revision memory must outlive
+// the timer so A at t=900ms is still stale while an unacknowledged B is live.
+const nativeSetTimeout = globalThis.setTimeout;
+const nativeClearTimeout = globalThis.clearTimeout;
+const fakeTimers = new Map();
+let fakeTimerId = 0;
+globalThis.setTimeout = (callback, delay) => {
+  const id = ++fakeTimerId;
+  fakeTimers.set(id, { callback, delay });
+  return id;
+};
+globalThis.clearTimeout = (id) => fakeTimers.delete(id);
+try {
+  const delayedPair = emitLocalStates([sameFieldMainA, sameFieldMainB]);
+  const cleanupTimer = [...fakeTimers.values()].find((timer) => timer.delay === 750);
+  assert.ok(cleanupTimer, "Local echo cleanup timer must remain bounded to 750ms.");
+  cleanupTimer.callback();
+  assert.equal(delayedPair.container.__hmbPromptPendingLocalValues, undefined);
+  assert.equal(
+    prompt.hmbConsumePendingPromptStateEcho(
+      delayedPair.container,
+      { value: delayedPair.emitted[0], disabled: false },
+    ),
+    true,
+    "A at t=900ms must remain stale after all timer-backed echo history is gone.",
+  );
+} finally {
+  globalThis.setTimeout = nativeSetTimeout;
+  globalThis.clearTimeout = nativeClearTimeout;
+}
+
+const authoritativePair = emitLocalStates([sameFieldMainA, sameFieldMainB]);
+const currentRapidState = JSON.parse(authoritativePair.emitted[1]);
+const unrelatedRapidState = prompt.normalizeState({
+  ...currentRapidState,
+  images: [{ ...currentRapidState.images[0], owner: "External Hero" }],
+});
+assert.equal(
+  prompt.hmbConsumePendingPromptStateEcho(
+    authoritativePair.container,
+    { value: JSON.stringify(unrelatedRapidState), disabled: false },
+  ),
+  false,
+  "An unrelated state at the current UI revision must remain authoritative.",
+);
+
+const newerSourcePair = emitLocalStates([sameFieldMainA, sameFieldMainB]);
+const newerSourceRevisionState = prompt.normalizeState({
+  ...JSON.parse(newerSourcePair.emitted[0]),
+  source_sync_revision: 1,
+});
+assert.equal(
+  prompt.hmbConsumePendingPromptStateEcho(
+    newerSourcePair.container,
+    { value: JSON.stringify(newerSourceRevisionState), disabled: false },
+  ),
+  false,
+  "A newer Picker/Asset source revision must remain authoritative.",
+);
+
+const olderSourceContainer = {};
+const sourceTwoState = prompt.normalizeState({
+  ...sameFieldMainB,
+  source_sync_revision: 2,
+});
+prompt.hmbEmitLocalPromptState(
+  olderSourceContainer,
+  { disabled: false, onChange() {} },
+  sourceTwoState,
+);
+const staleSourceState = prompt.normalizeState({
+  ...sameFieldMainA,
+  source_sync_revision: 1,
+  ui_edit_revision: 999,
+});
+assert.equal(
+  prompt.hmbConsumePendingPromptStateEcho(
+    olderSourceContainer,
+    { value: JSON.stringify(staleSourceState), disabled: true },
+  ),
+  true,
+  "An older source revision must not roll back selects even when disabled changes.",
+);
+assert.equal(olderSourceContainer.__hmbPromptLastConsumedEchoWasStale, true);
+clearTimeout(olderSourceContainer.__hmbPromptPendingLocalTimer);
+
+const higherUiPair = emitLocalStates([sameFieldMainA, sameFieldMainB]);
+const higherUiState = prompt.normalizeState({
+  ...JSON.parse(higherUiPair.emitted[1]),
+  ui_edit_revision: JSON.parse(higherUiPair.emitted[1]).ui_edit_revision + 1,
+  images: [{ ...JSON.parse(higherUiPair.emitted[1]).images[0], owner: "New Host State" }],
+});
+assert.equal(
+  prompt.hmbConsumePendingPromptStateEcho(
+    higherUiPair.container,
+    { value: JSON.stringify(higherUiState), disabled: false },
+  ),
+  false,
+  "A higher UI revision must remain authoritative.",
+);
+
 const disabledMismatchContainer = {
   __hmbPromptPendingLocalValues: [{
     value: canonicalEchoValue,
@@ -593,7 +949,7 @@ assert.equal(
   false,
   "The first populated PICKER_IN payload must reach applyProps and activate Video Source Binding immediately.",
 );
-assert.equal(firstPickerConnectContainer.__hmbPromptSupersededLocalValues.length, 1);
+assert.equal(firstPickerConnectContainer.__hmbPromptSupersededLocalValues, undefined);
 const afterAuthoritativeDisconnect = prompt.normalizeState({
   ...beforePickerConnect,
   source_sync_revision: 2,
@@ -608,6 +964,9 @@ assert.equal(
   false,
   "A newer source revision must allow a real Picker disconnect immediately.",
 );
+firstPickerConnectContainer.__hmbPromptCurrentSourceSyncRevision = 2;
+firstPickerConnectContainer.__hmbPromptCurrentUiEditRevision = 0;
+firstPickerConnectContainer.__hmbPromptCurrentDisabled = false;
 assert.equal(
   prompt.hmbConsumePendingPromptStateEcho(
     firstPickerConnectContainer,
@@ -648,5 +1007,39 @@ assert.match(promptSource, /function hmbRefreshImageColorControls/);
 assert.match(promptSource, /function hmbRefreshVideoDependentControls/);
 assert.match(promptSource, /function hmbRefreshSourceSummaries/);
 assert.match(promptSource, /class="custom-inline-input \$\{scope === "Custom scope" \? "" : "is-hidden"\}"/);
+const applyPropsSource = promptSource.slice(
+  promptSource.indexOf("const applyProps = (nextProps = {}) =>"),
+  promptSource.indexOf("container.__hmbPromptLibraryApplyProps = applyProps"),
+);
+assert.match(
+  applyPropsSource,
+  /if \(hmbConsumePendingPromptStateEcho[\s\S]*?__hmbPromptLastConsumedEchoWasStale[\s\S]*?return;/,
+  "A lower-revision host echo must return before the authoritative remount path.",
+);
+assert.equal(
+  (applyPropsSource.match(/\bremount\(\);/g) || []).length,
+  1,
+  "applyProps must retain exactly one remount, exclusively for authoritative state.",
+);
+assert.match(
+  promptSource,
+  /const cleanup = \(\) => \{[\s\S]*?delete container\.__hmbPromptCurrentUiEditRevision;[\s\S]*?delete container\.__hmbPromptLatestLocalUiEditRevision;[\s\S]*?delete container\.__hmbPromptCurrentSourceSyncRevision;[\s\S]*?delete container\.__hmbPromptCurrentDisabled;/,
+  "Widget cleanup must discard revision baselines before a later workflow remount.",
+);
+assert.doesNotMatch(promptSource, /<aside class="rail (?:left|right)"/);
+assert.doesNotMatch(promptSource, /output-guide/);
+assert.doesNotMatch(promptSource, /data-source-token-list/);
+assert.doesNotMatch(promptSource, /data-picker-token/);
+assert.doesNotMatch(promptSource, /data-image-asset-token/);
+assert.doesNotMatch(promptSource, /function (?:sourceTokensHtml|pickerTokenHtml|imageAssetTokenHtml)/);
+assert.match(
+  promptSource,
+  /\.layout\{display:grid;grid-template-columns:minmax\(0,1fr\);gap:0;/,
+  "The editor layout must use one full-width center column after both rails are removed.",
+);
+assert.match(promptSource, /<main class="center">/);
+for (const groupId of ["imageSources", "imageText", "videoSources", "videoText"]) {
+  assert.match(promptSource, new RegExp(`data-group-id="${groupId}"`));
+}
 
 console.log("HMB Prompt frame-track widget interaction regression: PASS");

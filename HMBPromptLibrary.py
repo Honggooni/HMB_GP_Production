@@ -135,6 +135,7 @@ WIDGET_LIBRARY_NAME = "HMB_GP_Production"
 STATE_SCHEMA = "prompt-library-state"
 MODE_NAME = "prompt_only_role_dashboard"
 SOURCE_SYNC_REVISION_KEY = "source_sync_revision"
+UI_EDIT_REVISION_KEY = "ui_edit_revision"
 MANUAL_VIDEO_CONTEXT_KEY = "manual_video_context"
 MAX_SOURCE_SYNC_REVISION = (1 << 53) - 1
 UI_RESIZE_MODE = "stacked_outer_1000"
@@ -494,6 +495,29 @@ def _merge_unique_notes(*values: Any) -> str:
 
 def _json_dumps(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
+def _connected_source_fingerprint(payload: Any, connected: bool) -> str:
+    """Identify one authoritative Picker/Image input generation.
+
+    Prompt widget edits round-trip through the frontend without the Picker-only
+    transport fields stored on video rows.  Reapplying an unchanged connected
+    payload restores those fields, but that enrichment is not a new upstream
+    generation and must not advance ``source_sync_revision``.  The connection
+    bit is part of the identity so a real disconnect remains authoritative.
+    """
+
+    source = payload if connected and isinstance(payload, dict) else {}
+    try:
+        canonical = json.dumps(
+            {"connected": bool(connected), "payload": source},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except Exception:
+        canonical = repr((bool(connected), source))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 _UNSTRUCTURED_INPUT_KEY = "__hmb_unstructured_input__"
@@ -1240,6 +1264,7 @@ def _default_widget_state() -> Dict[str, Any]:
         "schema": STATE_SCHEMA,
         "mode": MODE_NAME,
         SOURCE_SYNC_REVISION_KEY: 0,
+        UI_EDIT_REVISION_KEY: 0,
         "image_taxonomy": _image_taxonomy_payload(),
         "images": [_default_image_item(slot) for slot in range(1, 5)],
         "videos": [_default_video_item(1)],
@@ -3044,6 +3069,14 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
         0,
         min(MAX_SOURCE_SYNC_REVISION, source_sync_revision),
     )
+    try:
+        ui_edit_revision = int(state.get(UI_EDIT_REVISION_KEY) or 0)
+    except Exception:
+        ui_edit_revision = 0
+    ui_edit_revision = max(
+        0,
+        min(MAX_SOURCE_SYNC_REVISION, ui_edit_revision),
+    )
     source_intent_fallbacks = _normalize_source_intent_fallbacks(
         state.get(_SOURCE_INTENT_FALLBACKS_KEY)
     )
@@ -3216,6 +3249,7 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "schema": STATE_SCHEMA,
         "mode": MODE_NAME,
         SOURCE_SYNC_REVISION_KEY: source_sync_revision,
+        UI_EDIT_REVISION_KEY: ui_edit_revision,
         "theme": "dark-neon",
         "image_taxonomy": _image_taxonomy_payload(),
         "images": images,
@@ -4545,6 +4579,91 @@ def _picker_payload_id(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _source_identity_already_applied(
+    state: Dict[str, Any],
+    source_name: str,
+    payload: Dict[str, Any],
+    connected: bool,
+) -> bool:
+    """Return whether a persisted dashboard already represents one input.
+
+    Source fingerprints intentionally live only for the lifetime of a node.
+    Consequently, a restored workflow first observes both inputs as the
+    disconnected fingerprint even when its serialized dashboard already
+    contains the exact Picker/Image selection.  Frontend serialization also
+    omits transport-only helper fields, so reapplying that same source can make
+    the normalized JSON differ without representing a new upstream selection.
+
+    This check is used only while establishing a disconnected in-memory
+    fingerprint baseline.  Once a connected fingerprint has been observed,
+    the full payload fingerprint remains authoritative, including metadata
+    changes that retain the same run/selection identifiers.
+    """
+
+    if source_name == PICKER_INPUT_PARAMETER_NAME:
+        applied = state.get("picker")
+        if not isinstance(applied, dict):
+            return False
+        if bool(applied.get("enabled")) != bool(connected):
+            return False
+        if not connected:
+            return True
+        if not payload:
+            return True
+        if _clean_string(applied.get("run_id")) != _picker_payload_id(payload):
+            return False
+        if _clean_string(applied.get("selection_id")) != _clean_string(
+            payload.get("selection_id")
+        ):
+            return False
+
+        raw_videos = (
+            payload.get("videos")
+            if isinstance(payload.get("videos"), list)
+            else []
+        )
+        canonical_videos, uid_managed = _canonical_uid_picker_video_rows(
+            raw_videos
+        )
+        if uid_managed:
+            expected_uids = [
+                _picker_video_uid(item)
+                for item in canonical_videos
+                if isinstance(item, dict)
+                and item.get("selected") is not False
+                and _picker_video_uid(item)
+            ][:MAX_VIDEOS]
+            if list(applied.get("ordered_video_uids") or []) != expected_uids:
+                return False
+        return True
+
+    if source_name == IMAGE_ASSET_INPUT_PARAMETER_NAME:
+        applied = state.get("image_asset")
+        if not isinstance(applied, dict):
+            return False
+        if bool(applied.get("enabled")) != bool(connected):
+            return False
+        if not connected:
+            return True
+        if not payload:
+            return True
+        if _clean_string(applied.get("selection_id")) != (
+            _image_asset_selection_id(payload)
+        ):
+            return False
+        if _clean_string(applied.get("project_uid")) != _clean_string(
+            payload.get("project_uid")
+        ):
+            return False
+        if _clean_string(applied.get("project_id")) != _clean_string(
+            payload.get("project_id")
+        ):
+            return False
+        return True
+
+    return False
+
+
 def _picker_video_uid(item: Any) -> str:
     if not isinstance(item, dict):
         return ""
@@ -5325,6 +5444,11 @@ def _assign_picker_generated_motion_guide(
     previous_auto = _normalize_picker_auto_motion_guide(
         item.get("picker_auto_motion_guide")
     )
+    normalized_bundle_run_id = _clean_string(bundle_run_id)
+    same_generation = bool(
+        normalized_bundle_run_id
+        and previous_auto.get("bundle_run_id") == normalized_bundle_run_id
+    )
     previous_fields = previous_auto.get("fields", {})
     next_fields: Dict[str, Dict[str, Any]] = {}
     for field, raw_assigned in assigned_values.items():
@@ -5333,13 +5457,28 @@ def _assign_picker_generated_motion_guide(
         current = _picker_auto_depth_field_value(field, item.get(field))
         assigned = _picker_auto_depth_field_value(field, raw_assigned)
         previous_entry = previous_fields.get(field)
-        if (
-            isinstance(previous_entry, dict)
-            and current
-            == _picker_auto_depth_field_value(
+        previous_assigned = (
+            _picker_auto_depth_field_value(
                 field,
                 previous_entry.get("assigned"),
             )
+            if isinstance(previous_entry, dict)
+            else None
+        )
+        if (
+            same_generation
+            and isinstance(previous_entry, dict)
+            and current != previous_assigned
+        ):
+            # The same Picker generation has already assigned this field. A
+            # different current value is a later Prompt edit, not stale source
+            # data. Keep the override and retain the old automation fingerprint
+            # so disconnect/invalid provenance will not roll it back.
+            next_fields[field] = dict(previous_entry)
+            continue
+        if (
+            isinstance(previous_entry, dict)
+            and current == previous_assigned
         ):
             previous = _picker_auto_depth_field_value(
                 field,
@@ -5353,7 +5492,7 @@ def _assign_picker_generated_motion_guide(
             "previous": previous,
         }
     item["picker_auto_motion_guide"] = {
-        "bundle_run_id": _clean_string(bundle_run_id),
+        "bundle_run_id": normalized_bundle_run_id,
         "fields": next_fields,
     }
 
@@ -5424,6 +5563,11 @@ def _assign_picker_generated_depth(
     previous_auto = _normalize_picker_auto_depth(
         item.get("picker_auto_depth")
     )
+    normalized_pair_run_id = _clean_string(pair_run_id)
+    same_generation = bool(
+        normalized_pair_run_id
+        and previous_auto.get("pair_run_id") == normalized_pair_run_id
+    )
     previous_fields = previous_auto.get("fields", {})
     next_fields: Dict[str, Dict[str, Any]] = {}
     for field, raw_assigned in assigned_values.items():
@@ -5432,13 +5576,26 @@ def _assign_picker_generated_depth(
         current = _picker_auto_depth_field_value(field, item.get(field))
         assigned = _picker_auto_depth_field_value(field, raw_assigned)
         previous_entry = previous_fields.get(field)
-        if (
-            isinstance(previous_entry, dict)
-            and current
-            == _picker_auto_depth_field_value(
+        previous_assigned = (
+            _picker_auto_depth_field_value(
                 field,
                 previous_entry.get("assigned"),
             )
+            if isinstance(previous_entry, dict)
+            else None
+        )
+        if (
+            same_generation
+            and isinstance(previous_entry, dict)
+            and current != previous_assigned
+        ):
+            # Preserve a Prompt-authored override while the exact generated
+            # Depth source is merely being re-applied during a local UI commit.
+            next_fields[field] = dict(previous_entry)
+            continue
+        if (
+            isinstance(previous_entry, dict)
+            and current == previous_assigned
         ):
             previous = _picker_auto_depth_field_value(
                 field,
@@ -5452,7 +5609,7 @@ def _assign_picker_generated_depth(
             "previous": previous,
         }
     item["picker_auto_depth"] = {
-        "pair_run_id": _clean_string(pair_run_id),
+        "pair_run_id": normalized_pair_run_id,
         "fields": next_fields,
     }
 
@@ -8095,6 +8252,14 @@ class HMBPromptLibrary(DataNode):
     """
 
     def __init__(self, **kwargs: Any):
+        # The host may deliver widget value callbacks after a later UI edit has
+        # already been accepted.  Keep a per-node canonical baseline so an old
+        # callback cannot replace the newer dashboard before deferred prompt
+        # synchronization gets a chance to read it.
+        self._hmb_last_accepted_widget_state: str | None = None
+        self._hmb_last_accepted_widget_revisions = (0, 0)
+        self._hmb_widget_write_in_progress = False
+        self._hmb_restoring_widget_state = False
         super().__init__(**kwargs)
         self.category = "HMB_GP_Production"
         self.description = (
@@ -8114,6 +8279,12 @@ class HMBPromptLibrary(DataNode):
         self._hmb_prompt_snapshot_generation = 0
         self._hmb_prompt_notification_generation = 0
         self._hmb_pending_prompt_notification = None
+        self._hmb_source_input_fingerprints = {
+            PICKER_INPUT_PARAMETER_NAME: _connected_source_fingerprint({}, False),
+            IMAGE_ASSET_INPUT_PARAMETER_NAME: _connected_source_fingerprint(
+                {}, False
+            ),
+        }
         try:
             self.ui_options = {"width": 1800, "height": PROMPT_START_HEIGHT, "default_width": 1800, "default_height": PROMPT_START_HEIGHT, "preferred_width": 1800, "preferred_height": PROMPT_START_HEIGHT, "initial_width": 1800, "initial_height": PROMPT_START_HEIGHT, "node_size": {"width": 1800, "height": PROMPT_START_HEIGHT}, "default_size": {"width": 1800, "height": PROMPT_START_HEIGHT}, "initial_size": {"width": 1800, "height": PROMPT_START_HEIGHT}, "min_width": 760, "min_height": PROMPT_MIN_HEIGHT, "resizable": True}
             self.width = 1800
@@ -8126,6 +8297,9 @@ class HMBPromptLibrary(DataNode):
         self._ensure_prompt_output()
         add_group(self, "A_HMB_PROMPT_LIBRARY_DASHBOARD", "HMB_GP_Production", collapsed=False)
         _add_widget_state_parameter(self)
+        self._accept_widget_state_baseline(
+            _get_parameter_raw(self, WIDGET_PARAMETER_NAME)
+        )
         self._ensure_prompt_output()
         try:
             self._sync_prompt_output_from_state()
@@ -8274,16 +8448,50 @@ class HMBPromptLibrary(DataNode):
         """Reconcile real source caches after initial Prompt hydration writes."""
 
         parent_setter = getattr(super(), "set_parameter_value")
-        if ParameterMode is None:
-            parent_setter(param_name, value)
-        else:
-            parent_setter(
-                param_name,
-                value,
-                initial_setup=initial_setup,
-                emit_change=emit_change,
-                skip_before_value_set=skip_before_value_set,
-            )
+        is_widget_write = param_name == WIDGET_PARAMETER_NAME
+        guarded_widget_write = bool(
+            is_widget_write
+            and not initial_setup
+            and not getattr(self, "_hmb_ui_syncing", False)
+            and not getattr(self, "_hmb_restoring_widget_state", False)
+        )
+        if guarded_widget_write and self._widget_state_write_is_stale(value):
+            # A stale request can arrive either before or after the host has
+            # assigned its raw parameter value. Restore the accepted canonical
+            # baseline in both cases and never compile the older selection.
+            self._restore_accepted_widget_state()
+            return
+
+        previous_widget_state = getattr(
+            self, "_hmb_last_accepted_widget_state", None
+        )
+        previous_widget_revisions = getattr(
+            self, "_hmb_last_accepted_widget_revisions", (0, 0)
+        )
+        if is_widget_write:
+            self._accept_widget_state_baseline(value)
+            self._hmb_widget_write_in_progress = True
+        try:
+            if ParameterMode is None:
+                parent_setter(param_name, value)
+            else:
+                parent_setter(
+                    param_name,
+                    value,
+                    initial_setup=initial_setup,
+                    emit_change=emit_change,
+                    skip_before_value_set=skip_before_value_set,
+                )
+        except Exception:
+            if is_widget_write:
+                self._hmb_last_accepted_widget_state = previous_widget_state
+                self._hmb_last_accepted_widget_revisions = (
+                    previous_widget_revisions
+                )
+            raise
+        finally:
+            if is_widget_write:
+                self._hmb_widget_write_in_progress = False
         if (
             not initial_setup
             or param_name
@@ -8315,17 +8523,134 @@ class HMBPromptLibrary(DataNode):
             state = _default_widget_state()
         return state
 
+    @staticmethod
+    def _widget_revision_pair(value: Any) -> tuple[int, int] | None:
+        state = value if isinstance(value, dict) else _parse_state(value)
+        if not isinstance(state, dict) or not state:
+            return None
+
+        def bounded_revision(key: str) -> int:
+            try:
+                revision = int(state.get(key) or 0)
+            except Exception:
+                revision = 0
+            return max(0, min(MAX_SOURCE_SYNC_REVISION, revision))
+
+        return (
+            bounded_revision(SOURCE_SYNC_REVISION_KEY),
+            bounded_revision(UI_EDIT_REVISION_KEY),
+        )
+
+    def _accept_widget_state_baseline(self, value: Any) -> None:
+        state = value if isinstance(value, dict) else _parse_state(value)
+        if not isinstance(state, dict) or not state:
+            return
+        normalized = _normalize_state(state)
+        self._hmb_last_accepted_widget_state = _json_dumps(normalized)
+        self._hmb_last_accepted_widget_revisions = (
+            int(normalized.get(SOURCE_SYNC_REVISION_KEY) or 0),
+            int(normalized.get(UI_EDIT_REVISION_KEY) or 0),
+        )
+        self._seed_source_fingerprint_baseline_from_state(normalized)
+
+    def _seed_source_fingerprint_baseline_from_state(
+        self,
+        state: Dict[str, Any],
+    ) -> None:
+        """Seed restored source identities before host setter hooks can sync.
+
+        The real Griptape setter invokes ``after_value_set`` synchronously.
+        During workflow hydration, HMB_UI_STATE is commonly assigned before the
+        corresponding connected input cache.  Record only a private identity
+        sentinel here; once that raw source arrives, `_write_dashboard_state`
+        verifies it against the persisted run/selection and consumes it without
+        creating a false source revision.
+        """
+
+        fingerprints = getattr(self, "_hmb_source_input_fingerprints", None)
+        if not isinstance(fingerprints, dict):
+            return
+        disconnected_fingerprint = _connected_source_fingerprint({}, False)
+        picker = state.get("picker")
+        if (
+            isinstance(picker, dict)
+            and bool(picker.get("enabled"))
+            and fingerprints.get(PICKER_INPUT_PARAMETER_NAME)
+            == disconnected_fingerprint
+        ):
+            fingerprints[PICKER_INPUT_PARAMETER_NAME] = (
+                "persisted-picker:"
+                + _clean_string(picker.get("run_id"))
+                + ":"
+                + _clean_string(picker.get("selection_id"))
+            )
+        image_asset = state.get("image_asset")
+        if (
+            isinstance(image_asset, dict)
+            and bool(image_asset.get("enabled"))
+            and fingerprints.get(IMAGE_ASSET_INPUT_PARAMETER_NAME)
+            == disconnected_fingerprint
+        ):
+            fingerprints[IMAGE_ASSET_INPUT_PARAMETER_NAME] = (
+                "persisted-image-asset:"
+                + _clean_string(image_asset.get("selection_id"))
+                + ":"
+                + _clean_string(image_asset.get("project_uid"))
+                + ":"
+                + _clean_string(image_asset.get("project_id"))
+            )
+
+    def _widget_state_write_is_stale(self, value: Any) -> bool:
+        incoming = self._widget_revision_pair(value)
+        if incoming is None or self._hmb_last_accepted_widget_state is None:
+            return False
+        accepted_source, accepted_ui = self._hmb_last_accepted_widget_revisions
+        incoming_source, incoming_ui = incoming
+        if incoming_source < accepted_source:
+            return True
+        return incoming_source == accepted_source and incoming_ui < accepted_ui
+
+    def _restore_accepted_widget_state(self) -> None:
+        cached = self._hmb_last_accepted_widget_state
+        if cached is None:
+            return
+        parent_setter = getattr(super(), "set_parameter_value", None)
+        if not callable(parent_setter):
+            return
+        try:
+            self._hmb_restoring_widget_state = True
+            if ParameterMode is None:
+                parent_setter(WIDGET_PARAMETER_NAME, cached)
+            else:
+                parent_setter(
+                    WIDGET_PARAMETER_NAME,
+                    cached,
+                    initial_setup=False,
+                    emit_change=False,
+                    skip_before_value_set=True,
+                )
+        finally:
+            self._hmb_restoring_widget_state = False
+
     def _write_dashboard_state(self) -> Dict[str, Any]:
         if getattr(self, "_hmb_ui_syncing", False):
             return self._current_state()
         try:
             self._hmb_ui_syncing = True
-            self._reconcile_connected_source_inputs_from_graph()
+            graph_sources_authoritative = (
+                self._reconcile_connected_source_inputs_from_graph()
+            )
             raw_widget_value = _get_parameter_raw(self, WIDGET_PARAMETER_NAME)
             current_state = self._current_state()
             state = _normalize_state(current_state)
             source_sync_revision = int(state.get(SOURCE_SYNC_REVISION_KEY) or 0)
-            state_before_source_sync = _json_dumps(state)
+            source_state_before_sync = state
+            state_before_source_sync = _json_dumps(source_state_before_sync)
+            previous_source_fingerprints = getattr(
+                self,
+                "_hmb_source_input_fingerprints",
+                {},
+            )
             image_asset_payload = _parse_image_asset_payload(
                 _get_parameter_raw(self, IMAGE_ASSET_INPUT_PARAMETER_NAME)
             )
@@ -8333,15 +8658,102 @@ class HMBPromptLibrary(DataNode):
                 getattr(self, "_hmb_image_asset_connected", False)
                 or image_asset_payload
             )
-            state = _apply_image_asset_payload(
-                state,
-                image_asset_payload,
-                connected=image_asset_connected,
+            pending_image_asset_hydration = bool(
+                not graph_sources_authoritative
+                and not image_asset_connected
+                and not image_asset_payload
+                and str(
+                    previous_source_fingerprints.get(
+                        IMAGE_ASSET_INPUT_PARAMETER_NAME,
+                        "",
+                    )
+                ).startswith("persisted-image-asset:")
             )
+            if not pending_image_asset_hydration:
+                state = _apply_image_asset_payload(
+                    state,
+                    image_asset_payload,
+                    connected=image_asset_connected,
+                )
             picker_payload = _parse_picker_payload(_get_parameter_raw(self, PICKER_INPUT_PARAMETER_NAME))
             picker_connected = bool(getattr(self, "_hmb_picker_connected", False) or picker_payload)
-            state = _apply_picker_payload(state, picker_payload, connected=picker_connected)
-            if _json_dumps(state) != state_before_source_sync:
+            pending_picker_hydration = bool(
+                not graph_sources_authoritative
+                and not picker_connected
+                and not picker_payload
+                and str(
+                    previous_source_fingerprints.get(
+                        PICKER_INPUT_PARAMETER_NAME,
+                        "",
+                    )
+                ).startswith("persisted-picker:")
+            )
+            source_input_fingerprints = {
+                IMAGE_ASSET_INPUT_PARAMETER_NAME: (
+                    previous_source_fingerprints.get(
+                        IMAGE_ASSET_INPUT_PARAMETER_NAME,
+                        _connected_source_fingerprint({}, False),
+                    )
+                    if pending_image_asset_hydration
+                    else _connected_source_fingerprint(
+                        image_asset_payload,
+                        image_asset_connected,
+                    )
+                ),
+                PICKER_INPUT_PARAMETER_NAME: (
+                    previous_source_fingerprints.get(
+                        PICKER_INPUT_PARAMETER_NAME,
+                        _connected_source_fingerprint({}, False),
+                    )
+                    if pending_picker_hydration
+                    else _connected_source_fingerprint(
+                        picker_payload,
+                        picker_connected,
+                    )
+                ),
+            }
+            source_payloads = {
+                IMAGE_ASSET_INPUT_PARAMETER_NAME: image_asset_payload,
+                PICKER_INPUT_PARAMETER_NAME: picker_payload,
+            }
+            source_connections = {
+                IMAGE_ASSET_INPUT_PARAMETER_NAME: image_asset_connected,
+                PICKER_INPUT_PARAMETER_NAME: picker_connected,
+            }
+            upstream_source_changed = False
+            for name, fingerprint in source_input_fingerprints.items():
+                previous_fingerprint = previous_source_fingerprints.get(name)
+                if previous_fingerprint == fingerprint:
+                    continue
+                disconnected_fingerprint = _connected_source_fingerprint(
+                    {}, False
+                )
+                establishes_hydrated_baseline = bool(
+                    (
+                        previous_fingerprint == disconnected_fingerprint
+                        or str(previous_fingerprint or "").startswith(
+                            "persisted-"
+                        )
+                    )
+                    and _source_identity_already_applied(
+                        source_state_before_sync,
+                        name,
+                        source_payloads[name],
+                        source_connections[name],
+                    )
+                )
+                if not establishes_hydrated_baseline:
+                    upstream_source_changed = True
+            if not pending_picker_hydration:
+                state = _apply_picker_payload(
+                    state,
+                    picker_payload,
+                    connected=picker_connected,
+                )
+            source_application_changed_state = (
+                _json_dumps(state) != state_before_source_sync
+            )
+            if upstream_source_changed and source_application_changed_state:
                 state[SOURCE_SYNC_REVISION_KEY] = min(
                     MAX_SOURCE_SYNC_REVISION,
                     source_sync_revision + 1,
@@ -8354,6 +8766,7 @@ class HMBPromptLibrary(DataNode):
             # parameter only when either operation actually changed its value.
             if state != current_state or not isinstance(raw_widget_value, str):
                 _set_parameter_value(self, WIDGET_PARAMETER_NAME, _json_dumps(state))
+            self._hmb_source_input_fingerprints = source_input_fingerprints
             return state
         finally:
             self._hmb_ui_syncing = False
@@ -8553,6 +8966,21 @@ class HMBPromptLibrary(DataNode):
                 _diagnostic_exception("Parent after_value_set failed", exc)
             try:
                 name = getattr(parameter, "name", "") or ""
+                if (
+                    name == WIDGET_PARAMETER_NAME
+                    and not getattr(self, "_hmb_ui_syncing", False)
+                    and not getattr(self, "_hmb_restoring_widget_state", False)
+                    and not getattr(self, "_hmb_widget_write_in_progress", False)
+                ):
+                    # Some host paths assign the Parameter first and invoke only
+                    # this hook, bypassing this class's set_parameter_value
+                    # override. Compare against the instance baseline before
+                    # any prompt compile can consume that raw rollback.
+                    if self._widget_state_write_is_stale(value):
+                        self._restore_accepted_widget_state()
+                        self._schedule_prompt_sync()
+                        return result
+                    self._accept_widget_state_baseline(value)
                 if name == PICKER_INPUT_PARAMETER_NAME and _clean_string(value):
                     self._hmb_picker_connected = True
                 if name == IMAGE_ASSET_INPUT_PARAMETER_NAME and _clean_string(value):

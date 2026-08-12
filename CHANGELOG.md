@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.25 - 2026-08-12
+
+- Remove the HMBPromptLibrary left external-source and right output rails and
+  expand the production binding workspace across the released width without
+  changing Prompt source, binding, or output behavior.
+- Keep rapid Main Type, Sub Type, Target, video-role, and related cascading
+  selections stable by rejecting out-of-order retained-widget echoes with
+  monotonic UI and connected-source revisions.
+- Move HMBImageAssetLibrary file-format labels into the detail corner, place
+  the source name in the thumbnail footer, and retain source-name visibility
+  in image-only mode while preserving registration controls.
+- Apply the same revision-ordered state synchronization to Image Asset edits
+  so fast consecutive actions cannot be rolled back by a delayed host echo,
+  with release-audit regressions for both libraries.
+
 ## 0.6.24 - 2026-08-12
 
 - Replace the ambient system-`ffprobe` requirement in Seedance result

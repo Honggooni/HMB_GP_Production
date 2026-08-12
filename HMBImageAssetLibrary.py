@@ -117,6 +117,8 @@ MEDIA_OUTPUT_DISPLAY_NAME = "Video Generation Out"
 STATE_SCHEMA = "hmb-image-asset-library-state"
 OUTPUT_SCHEMA = "hmb-image-asset-library-binding"
 STATE_VERSION = 4
+UI_EDIT_REVISION_KEY = "ui_edit_revision"
+MAX_UI_EDIT_REVISION = (1 << 53) - 1
 OUTPUT_VERSION = 4
 IMAGE_BINDING_CAPABILITY_SCHEMA = "hmb-image-source-binding-capabilities"
 IMAGE_BINDING_CAPABILITY_VERSION = 1
@@ -2028,6 +2030,7 @@ def _default_state() -> Dict[str, Any]:
         "search": "",
         "language": "en",
         "asset_view_mode": "image",
+        UI_EDIT_REVISION_KEY: 0,
         "scan_revision": 0,
         "refresh_revision": 0,
         "asset_registration_request": {},
@@ -2114,6 +2117,14 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
         refresh_revision = max(0, int(source.get("refresh_revision") or 0))
     except Exception:
         refresh_revision = 0
+    try:
+        ui_edit_revision = int(source.get(UI_EDIT_REVISION_KEY) or 0)
+    except Exception:
+        ui_edit_revision = 0
+    ui_edit_revision = max(
+        0,
+        min(MAX_UI_EDIT_REVISION, ui_edit_revision),
+    )
     warnings = source.get("warnings")
     if not isinstance(warnings, list):
         warnings = []
@@ -2145,6 +2156,7 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
                 if _clean(source.get("asset_view_mode")).casefold() == "detail"
                 else "image"
             ),
+            UI_EDIT_REVISION_KEY: ui_edit_revision,
             "scan_revision": scan_revision,
             "refresh_revision": refresh_revision,
             "asset_registration_request": _normalize_asset_registration_request(
@@ -4100,6 +4112,12 @@ class HMBImageAssetLibrary(DataNode):
     """
 
     def __init__(self, **kwargs: Any):
+        # Widget callbacks can be delivered after a later click has already
+        # committed. Keep the latest canonical local transaction so an older
+        # callback cannot roll back selection/filter/dropdown state.
+        self._hmb_last_accepted_widget_state: str | None = None
+        self._hmb_last_accepted_widget_revisions = (0, 0)
+        self._hmb_restoring_widget_state = False
         serialized_metadata = kwargs.get("metadata")
         restored_size = (
             dict(serialized_metadata.get("size") or {})
@@ -4176,6 +4194,9 @@ class HMBImageAssetLibrary(DataNode):
         self._hmb_output_notification_generation = 0
         self._hmb_pending_output_notifications: Dict[str, tuple[int, Any]] = {}
         self._ensure_parameters()
+        self._accept_widget_state_baseline(
+            _get_parameter_raw(self, WIDGET_STATE_PARAMETER)
+        )
         root_value = _project_root_text(
             _get_parameter_raw(self, PROJECT_ROOT_PARAMETER)
         )
@@ -4188,10 +4209,110 @@ class HMBImageAssetLibrary(DataNode):
         _add_project_root(self)
         _add_widget_state(self)
 
+    def set_parameter_value(
+        self,
+        param_name: str,
+        value: Any,
+        *,
+        initial_setup: bool = False,
+        emit_change: bool = True,
+        skip_before_value_set: bool = False,
+    ) -> None:
+        """Adopt serialized hydration as a fresh instance-local baseline."""
+
+        parent_setter = getattr(super(), "set_parameter_value")
+        if initial_setup and param_name == WIDGET_STATE_PARAMETER:
+            self._accept_widget_state_baseline(value)
+        if (
+            ParameterMode is None
+            and param_name == WIDGET_STATE_PARAMETER
+            and not initial_setup
+        ):
+            parameter = _get_parameter_obj(self, WIDGET_STATE_PARAMETER)
+            final_value = (
+                value
+                if skip_before_value_set
+                else self.before_value_set(parameter, value)
+            )
+            parent_setter(param_name, final_value)
+            self.after_value_set(parameter, final_value)
+            return
+        if ParameterMode is None:
+            parent_setter(param_name, value)
+            return
+        parent_setter(
+            param_name,
+            value,
+            initial_setup=initial_setup,
+            emit_change=emit_change,
+            skip_before_value_set=skip_before_value_set,
+        )
+
     def _current_state(self) -> Dict[str, Any]:
         return _normalize_state(
             _get_parameter_raw(self, WIDGET_STATE_PARAMETER)
         )
+
+    @staticmethod
+    def _widget_revision_pair(value: Any) -> tuple[int, int] | None:
+        raw = _parse_mapping(value)
+        if not raw:
+            return None
+        scan_revision = _non_negative_int(raw.get("scan_revision"))
+        try:
+            ui_revision = int(raw.get(UI_EDIT_REVISION_KEY) or 0)
+        except Exception:
+            ui_revision = 0
+        return (
+            scan_revision,
+            max(0, min(MAX_UI_EDIT_REVISION, ui_revision)),
+        )
+
+    def _accept_widget_state_baseline(self, value: Any) -> None:
+        raw = _parse_mapping(value)
+        if not raw:
+            return
+        normalized = _normalize_state(raw)
+        self._hmb_last_accepted_widget_state = _json_text(normalized)
+        self._hmb_last_accepted_widget_revisions = (
+            _non_negative_int(normalized.get("scan_revision")),
+            _non_negative_int(normalized.get(UI_EDIT_REVISION_KEY)),
+        )
+
+    def _widget_state_is_stale(self, value: Any) -> bool:
+        incoming = self._widget_revision_pair(value)
+        if (
+            incoming is None
+            or self._hmb_last_accepted_widget_state is None
+        ):
+            return False
+        accepted_scan, accepted_ui = self._hmb_last_accepted_widget_revisions
+        incoming_scan, incoming_ui = incoming
+        if incoming_scan != accepted_scan:
+            return incoming_scan < accepted_scan
+        return incoming_ui < accepted_ui
+
+    def _restore_accepted_widget_state(self) -> None:
+        cached = self._hmb_last_accepted_widget_state
+        if cached is None:
+            return
+        parent_setter = getattr(super(), "set_parameter_value", None)
+        if not callable(parent_setter):
+            return
+        try:
+            self._hmb_restoring_widget_state = True
+            if ParameterMode is None:
+                parent_setter(WIDGET_STATE_PARAMETER, cached)
+            else:
+                parent_setter(
+                    WIDGET_STATE_PARAMETER,
+                    cached,
+                    initial_setup=False,
+                    emit_change=False,
+                    skip_before_value_set=True,
+                )
+        finally:
+            self._hmb_restoring_widget_state = False
 
     def _replace_import_media(self, media_by_uid: Dict[str, Any] | None) -> None:
         """Install one authoritative import snapshot and retire stale resolutions."""
@@ -4338,6 +4459,7 @@ class HMBImageAssetLibrary(DataNode):
         state["asset_registration_request"] = {}
         state["disconnect_import_uid"] = ""
         normalized = _normalize_state(state)
+        self._accept_widget_state_baseline(normalized)
         catalog_root = _project_root_text(normalized.get("catalog_root"))
         current_root = _project_root_text(
             _get_parameter_raw(self, PROJECT_ROOT_PARAMETER)
@@ -4653,7 +4775,11 @@ class HMBImageAssetLibrary(DataNode):
             self._hmb_manifest_poll_received = False
             self._hmb_manifest_poll_pending = False
             if not poll_nonce:
-                return _json_text(_normalize_state(raw_state))
+                if self._widget_state_is_stale(raw_state):
+                    return self._hmb_last_accepted_widget_state
+                normalized = _normalize_state(raw_state)
+                self._accept_widget_state_baseline(normalized)
+                return _json_text(normalized)
 
             current_raw = dict(
                 _parse_mapping(
@@ -4734,6 +4860,18 @@ class HMBImageAssetLibrary(DataNode):
         elif name == IMAGE_IMPORT_PARAMETER:
             self._apply_import_value(value)
         elif name == WIDGET_STATE_PARAMETER:
+            if (
+                not self._hmb_state_syncing
+                and not self._hmb_restoring_widget_state
+                and self._widget_state_is_stale(value)
+            ):
+                # A host may assign the raw Parameter and call this hook with
+                # skip_before_value_set=True. Restore the accepted B snapshot
+                # before any output or filesystem side effect can observe A.
+                self._restore_accepted_widget_state()
+                return result
+            if not self._hmb_state_syncing and not self._hmb_restoring_widget_state:
+                self._accept_widget_state_baseline(value)
             self._apply_widget_state(value)
         return result
 

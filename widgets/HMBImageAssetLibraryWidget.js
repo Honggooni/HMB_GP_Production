@@ -50,6 +50,8 @@ export function hmbScopeWidgetStyleMarkup(markup, rootSelector) {
   return String(markup || "").replace(/<style>([\s\S]*?)<\/style>/g, (_match, css) => `<style>${hmbScopeWidgetCss(css, rootSelector)}</style>`);
 }
 const MAX_SELECTED_IMAGES = 50;
+const MAX_IMAGE_ASSET_REVISION = Number.MAX_SAFE_INTEGER;
+const IMAGE_ASSET_UI_EDIT_REVISION_KEY = "ui_edit_revision";
 const ROOT_FOLDER_KEY = "$root";
 const IMAGE_ASSET_STATE_VERSION = 4;
 const IMAGE_ASSET_AUTO_SYNC_MS = 10000;
@@ -493,6 +495,13 @@ function normalizeState(value) {
     search: clean(input.search).slice(0, 256),
     language: clean(input.language).toLowerCase() === "ko" ? "ko" : "en",
     asset_view_mode: clean(input.asset_view_mode).toLowerCase() === "detail" ? "detail" : "image",
+    [IMAGE_ASSET_UI_EDIT_REVISION_KEY]: Math.max(
+      0,
+      Math.min(
+        MAX_IMAGE_ASSET_REVISION,
+        Math.floor(Number(input?.[IMAGE_ASSET_UI_EDIT_REVISION_KEY]) || 0),
+      ),
+    ),
     scan_revision: Math.max(0, Number.parseInt(input.scan_revision || 0, 10) || 0),
     refresh_revision: Math.max(0, Number.parseInt(input.refresh_revision || 0, 10) || 0),
     asset_registration_request: normalizeRegistrationRequest(input.asset_registration_request),
@@ -633,6 +642,76 @@ export function hmbMoveSelectedAsset(state, sourceKey, targetKey) {
   return true;
 }
 
+function hmbNormalizeImageAssetRevision(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.min(MAX_IMAGE_ASSET_REVISION, Math.floor(parsed)));
+}
+
+function hmbRememberImageAssetRevisionState(container, state, local = false) {
+  if (!container || !state) return;
+  const scanRevision = hmbNormalizeImageAssetRevision(state.scan_revision);
+  const uiEditRevision = hmbNormalizeImageAssetRevision(
+    state[IMAGE_ASSET_UI_EDIT_REVISION_KEY],
+  );
+  container.__hmbImageAssetCurrentScanRevision = scanRevision;
+  container.__hmbImageAssetCurrentUiEditRevision = uiEditRevision;
+  if (local) {
+    container.__hmbImageAssetLatestLocalUiEditRevision = Math.max(
+      hmbNormalizeImageAssetRevision(
+        container.__hmbImageAssetLatestLocalUiEditRevision,
+      ),
+      uiEditRevision,
+    );
+  }
+}
+
+function hmbNextImageAssetUiEditRevision(container, state) {
+  return Math.min(
+    MAX_IMAGE_ASSET_REVISION,
+    Math.max(
+      hmbNormalizeImageAssetRevision(state?.[IMAGE_ASSET_UI_EDIT_REVISION_KEY]),
+      hmbNormalizeImageAssetRevision(
+        container?.__hmbImageAssetLatestLocalUiEditRevision,
+      ),
+    ) + 1,
+  );
+}
+
+function hmbImageAssetRevisionDisposition(container, incomingState) {
+  if (!container || !incomingState) return "unknown";
+  const hasCurrentScan = Object.prototype.hasOwnProperty.call(
+    container,
+    "__hmbImageAssetCurrentScanRevision",
+  );
+  const incomingScan = hmbNormalizeImageAssetRevision(incomingState.scan_revision);
+  const currentScan = hmbNormalizeImageAssetRevision(
+    container.__hmbImageAssetCurrentScanRevision,
+  );
+  if (hasCurrentScan && incomingScan > currentScan) return "authoritative";
+  if (hasCurrentScan && incomingScan < currentScan) return "stale";
+
+  const hasCurrentUi = Object.prototype.hasOwnProperty.call(
+    container,
+    "__hmbImageAssetCurrentUiEditRevision",
+  );
+  const hasLatestLocalUi = Object.prototype.hasOwnProperty.call(
+    container,
+    "__hmbImageAssetLatestLocalUiEditRevision",
+  );
+  if (!hasCurrentUi && !hasLatestLocalUi) return "unknown";
+  const latestUi = Math.max(
+    hmbNormalizeImageAssetRevision(container.__hmbImageAssetCurrentUiEditRevision),
+    hmbNormalizeImageAssetRevision(container.__hmbImageAssetLatestLocalUiEditRevision),
+  );
+  const incomingUi = hmbNormalizeImageAssetRevision(
+    incomingState[IMAGE_ASSET_UI_EDIT_REVISION_KEY],
+  );
+  if (incomingUi < latestUi) return "stale";
+  if (incomingUi > latestUi) return "authoritative";
+  return "current";
+}
+
 function hmbForgetImageAssetStateEcho(container, publicationToken = null) {
   if (!container) return false;
   const prior = Array.isArray(container.__hmbImageAssetPendingStateEchoes)
@@ -671,9 +750,27 @@ function hmbRememberImageAssetStateEcho(container, value, publicationToken) {
 }
 
 export function hmbConsumeImageAssetStateEcho(container, nextProps = {}) {
-  const incoming = nextProps?.value;
+  if (!container) return false;
+  container.__hmbImageAssetLastConsumedEchoWasStale = false;
+  let incomingState = null;
+  let incoming = "";
+  try {
+    incomingState = normalizeState(nextProps?.value);
+    incoming = JSON.stringify(incomingState);
+  } catch (_error) {
+    return false;
+  }
+  const disposition = hmbImageAssetRevisionDisposition(container, incomingState);
+  if (disposition === "stale") {
+    container.__hmbImageAssetLastConsumedEchoWasStale = true;
+    return true;
+  }
+  if (disposition === "authoritative") {
+    hmbForgetImageAssetStateEcho(container);
+    return false;
+  }
   const pending = container?.__hmbImageAssetPendingStateEchoes;
-  if (typeof incoming !== "string" || !Array.isArray(pending) || !pending.length) {
+  if (!Array.isArray(pending) || !pending.length) {
     return false;
   }
   const match = pending.find((item) => item?.value === incoming);
@@ -691,6 +788,9 @@ export function hmbPublishImageAssetState(
 ) {
   hmbClearImageAssetTransportRetry(container);
   const normalized = isCanonicalImageAssetState(state) ? state : normalizeState(state);
+  const nextUiEditRevision = hmbNextImageAssetUiEditRevision(container, normalized);
+  normalized[IMAGE_ASSET_UI_EDIT_REVISION_KEY] = nextUiEditRevision;
+  hmbRememberImageAssetRevisionState(container, normalized, true);
   const value = JSON.stringify(normalized);
   const publicationToken = ++imageAssetPublicationSequence;
   if (container) container.__hmbImageAssetPublicationOwner = publicationToken;
@@ -1151,6 +1251,13 @@ function thumbnailImageMarkup(asset) {
     : `<span>${fallback}</span>`;
 }
 
+function assetCardThumbnailImageMarkup(asset) {
+  const source = imageSource(asset);
+  return source
+    ? `<img src="${escapeHtml(source)}" alt="" draggable="false"/>`
+    : `<span class="asset-thumb-placeholder" aria-hidden="true"></span>`;
+}
+
 function thumbnailHtml(asset, className = "asset-thumb") {
   const source = imageSource(asset);
   return `<div class="${className} ${source ? "" : "fallback"}">${thumbnailImageMarkup(asset)}</div>`;
@@ -1158,16 +1265,14 @@ function thumbnailHtml(asset, className = "asset-thumb") {
 
 function assetThumbnailHtml(asset, state) {
   const source = imageSource(asset);
-  const format = escapeHtml(
-    (asset.extension || ".img").replace(".", "").toUpperCase() || "IMG",
-  );
-  const footer = asset.registered
-    ? `<span class="asset-format" title="${escapeHtml(imageAssetText(state, "registered_project_asset"))}">${format}</span>`
+  const sourceName = clean(asset.image_name) || clean(asset.asset_id) || "Image";
+  const add = asset.registered
+    ? ""
     : `<button type="button" class="asset-add" data-asset-add aria-label="${escapeHtml(imageAssetText(state, "add_image_asset"))}">${escapeHtml(imageAssetText(state, "add"))}</button>`;
   return `
     <div class="asset-thumb ${source ? "" : "fallback"}">
-      <div class="asset-thumb-media">${thumbnailImageMarkup(asset)}</div>
-      <div class="asset-thumb-footer">${footer}</div>
+      <div class="asset-thumb-media">${assetCardThumbnailImageMarkup(asset)}${add}</div>
+      <div class="asset-thumb-footer"><span class="asset-source-name" title="${escapeHtml(sourceName)}">${escapeHtml(sourceName)}</span></div>
     </div>
   `;
 }
@@ -1189,6 +1294,7 @@ function renderAssetCard(asset, selectedCount, search, state) {
     ? unclassified
     : clean(asset.source_type) || unclassified;
   const subUnassigned = imageAssetText(state, "sub_unassigned");
+  const extension = (asset.extension || ".img").replace(".", "").toUpperCase() || "IMG";
   return `
     <article class="asset-card ${asset.selected ? "selected" : ""} ${selectionBlocked ? "selection-blocked" : ""} ${selectable ? "" : "unregistered"}"
       data-asset-key="${escapeHtml(asset.asset_library_id)}"
@@ -1203,9 +1309,9 @@ function renderAssetCard(asset, selectedCount, search, state) {
         <div class="asset-title">
           <div class="asset-title-copy">
             <span class="asset-state">${escapeHtml(imageAssetText(state, asset.registered ? "project_state" : "unregistered_state"))}</span>
-            <b title="${escapeHtml(imageAssetText(state, "image_name"))}: ${escapeHtml(asset.image_name)}">${escapeHtml(asset.image_name)}</b>
             <small class="asset-id-line" title="${escapeHtml(imageAssetText(state, "asset_id"))}: ${escapeHtml(asset.asset_id)}"><em>${escapeHtml(imageAssetText(state, "asset_id"))}</em><span>${escapeHtml(asset.asset_id)}</span></small>
           </div>
+          <span class="asset-extension-badge" title="${escapeHtml(extension)}">${escapeHtml(extension)}</span>
         </div>
         <div class="asset-meta">
           <b title="${escapeHtml(imageAssetText(state, "main_type"))}: ${escapeHtml(sourceTypeLabel)}">${escapeHtml(sourceTypeLabel)}</b>
@@ -1657,10 +1763,10 @@ function render(state, registrationDraft = null) {
       .hmb-image-assets[data-theme="T"]{--accent:#38bdf8;--pink:#60a5fa;--asset-selection:#38bdf8;--line:rgba(96,165,250,.22);--selection-rgb:56,189,248;--selection-deep-rgb:3,105,161;--selection-secondary-rgb:37,99,235;--selection-text:#bae6fd;--selection-soft:#7dd3fc;--selection-strong:#e0f2fe;--selection-panel:rgba(8,26,48,.94);--selection-card:rgba(12,48,78,.62);--header-tint:rgba(15,72,126,.46);background:radial-gradient(circle at 8% -10%,rgba(37,99,235,.2),transparent 34%),linear-gradient(180deg,#091525,#050a12)}
       .hmb-image-assets *{box-sizing:border-box;min-width:0}.top{display:flex;align-items:center;gap:12px;padding:8px 13px;border-bottom:1px solid var(--line);background:linear-gradient(90deg,rgba(72,35,101,.44),rgba(14,23,38,.9) 44%)}.mark{flex:0 0 35px;width:35px;height:35px;display:grid;place-items:center;border:1px solid rgba(34,211,238,.7);border-radius:8px;background:rgba(8,145,178,.12);color:var(--accent);font-size:11px;font-weight:950}.heading{display:flex;flex:0 1 auto;flex-direction:column;gap:2px;overflow:hidden}.heading b{overflow:hidden;font-size:15px;letter-spacing:.01em;white-space:nowrap;text-overflow:ellipsis}.heading span{max-width:360px;color:var(--muted);font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.project-switch{margin-left:auto;display:grid;grid-template-columns:auto auto minmax(150px,260px);align-items:center;gap:7px;min-width:0}.project-actions{display:flex;align-items:center;gap:5px}.project-action{width:31px;height:31px;display:grid;place-items:center;padding:0;border:1px solid rgba(96,165,250,.5);border-radius:7px;background:linear-gradient(180deg,rgba(37,99,235,.3),rgba(15,23,42,.9));color:#93c5fd;font-size:12px;font-weight:950;cursor:pointer}.project-action:hover{border-color:var(--accent);color:#fff;box-shadow:0 0 10px rgba(34,211,238,.2)}.project-action svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.project-switch label{min-width:max-content;color:#aebed0;font-size:8px;font-weight:900;letter-spacing:.08em;white-space:nowrap;word-break:keep-all}.project-switch select{width:100%;height:31px;border:1px solid rgba(148,163,184,.28);border-radius:7px;background:#080d17;color:#edf5ff;padding:0 8px;font-size:10px;outline:none}.project-switch select:focus{border-color:var(--accent)}.status{display:flex;flex:0 1 auto;flex-direction:column;align-items:flex-end;gap:2px;font-size:8px;color:var(--muted)}.status strong{max-width:260px;color:${state.error ? "#fda4af" : "#86efac"};white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       .workspace{display:grid;grid-template-columns:minmax(230px,252px) minmax(0,1fr);gap:8px;min-height:0;padding:8px}.panel{min-height:0;border:1px solid var(--line);border-radius:9px;background:rgba(8,13,23,.76);overflow:hidden}.tree-panel{display:flex;flex-direction:column}.panel-title{height:35px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 10px;border-bottom:1px solid var(--line);background:rgba(19,27,42,.78);color:#bed0e3;font-size:9px;font-weight:900;letter-spacing:.07em}.panel-title>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;word-break:keep-all}.panel-title b{flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--accent);font-size:8px}.tree{padding:6px;overflow:auto;scrollbar-gutter:stable}.tree-row{width:100%;min-height:30px;display:grid;grid-template-columns:13px minmax(0,1fr) auto;align-items:center;gap:5px;margin:0 0 3px;padding:5px 8px 5px calc(8px + var(--tree-depth,0) * 14px);border:1px solid transparent;border-radius:6px;background:transparent;color:#96a9bd;font-size:8px;text-align:left;cursor:pointer;transition:border-color 120ms ease,background-color 120ms ease,color 120ms ease}.tree-row i{color:#61778c;font-style:normal}.tree-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tree-row b{color:#587087}.tree-row:hover{border-color:rgba(34,211,238,.3);color:#def9ff}.tree-row.active{border-color:rgba(34,211,238,.52);background:linear-gradient(90deg,rgba(8,145,178,.2),rgba(8,145,178,.04));color:#e7fcff}.tree-row.root{min-height:35px;color:#fff;font-size:10px;font-weight:850}
-      .assets-panel{display:flex;flex-direction:column}.toolbar{height:44px;display:flex;align-items:center;gap:8px;padding:7px 9px;border-bottom:1px solid var(--line)}.toolbar input{flex:1;height:30px;border:1px solid rgba(148,163,184,.25);border-radius:7px;background:#070c15;color:#edf5ff;padding:0 9px;font-size:9px;outline:none}.toolbar input:focus{border-color:var(--accent)}.filter-chip{max-width:260px;padding:5px 8px;border:1px solid rgba(244,114,182,.3);border-radius:99px;background:rgba(131,24,67,.1);color:#f8c6df;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-scroll{flex:1;min-height:0;overflow:auto;scrollbar-gutter:stable;padding:9px}.asset-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px}.asset-card{display:grid;grid-template-columns:112px minmax(0,1fr);gap:10px;min-height:152px;padding:9px;border:1px solid rgba(148,163,184,.16);border-radius:9px;background:linear-gradient(145deg,rgba(19,27,42,.86),rgba(9,14,24,.82));cursor:pointer;outline:none;transition:border-color 120ms ease,box-shadow 120ms ease,background-color 120ms ease,opacity 120ms ease}.asset-card:hover{border-color:rgba(34,211,238,.34)}.asset-card:focus-visible{box-shadow:0 0 0 2px rgba(34,211,238,.45)}.asset-card.selected{border-color:var(--asset-selection);box-shadow:inset 0 0 0 .3px rgba(244,114,182,.45),0 0 15px rgba(244,114,182,.34),0 0 4px rgba(217,70,239,.55)}.asset-card.selection-blocked{opacity:.58}.asset-card.unregistered{cursor:default}.asset-card.unregistered .asset-state{color:#f3a8ce}.asset-thumb{position:relative;width:112px;height:132px;display:grid;grid-template-rows:2fr 1fr;overflow:hidden;border:1px solid rgba(148,163,184,.2);border-radius:7px;background:#050910;color:#648198;font-size:9px;font-weight:900}.asset-thumb-media{position:relative;display:grid;place-items:center;min-height:0;overflow:hidden;border-bottom:1px solid rgba(148,163,184,.18)}.asset-thumb-media img{width:100%;height:100%;object-fit:cover}.asset-thumb-media>span{display:none}.asset-thumb.fallback .asset-thumb-media img{display:none}.asset-thumb.fallback .asset-thumb-media>span{display:block}.asset-thumb-footer{display:grid;place-items:center;min-height:0;background:linear-gradient(180deg,#080d16,#050810)}.asset-format{display:block;color:#8198ad;font-size:8px;letter-spacing:.08em}.asset-add{min-width:56px;height:25px;padding:0 13px;border:1px solid rgba(244,114,182,.7);border-radius:99px;background:rgba(131,24,67,.26);color:#ffd5eb;font-size:9px;font-weight:950;letter-spacing:.04em;cursor:pointer;box-shadow:0 0 10px rgba(244,114,182,.16)}.asset-add:hover{border-color:#f9a8d4;background:rgba(190,24,93,.32);box-shadow:0 0 13px rgba(244,114,182,.3)}.asset-content{display:flex;flex-direction:column;gap:8px}.asset-title{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.asset-title-copy{display:flex;flex:1;flex-direction:column;gap:2px;min-width:0}.asset-state{color:var(--accent);font-size:7px;font-weight:900}.asset-title-copy>b{font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-id-line{display:flex;align-items:center;gap:5px;min-width:0;color:#9bacc0;font-size:7px;font-weight:500}.asset-id-line em{flex:0 0 auto;color:#6e859c;font-size:6px;font-style:normal;font-weight:900;letter-spacing:.05em}.asset-id-line span{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-meta{display:flex;flex-direction:column;gap:3px;color:#71879c;font-size:7px}.asset-meta b,.asset-meta span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-meta b{color:#bcd0e2}.empty{grid-column:1/-1;padding:30px;border:1px dashed rgba(148,163,184,.2);border-radius:8px;color:#667e94;font-size:9px;text-align:center}.warnings{max-height:64px;overflow:auto;padding:6px 9px;border-top:1px solid rgba(251,191,36,.2);background:rgba(120,53,15,.1);color:#fcd34d;font-size:7px}
+      .assets-panel{display:flex;flex-direction:column}.toolbar{height:44px;display:flex;align-items:center;gap:8px;padding:7px 9px;border-bottom:1px solid var(--line)}.toolbar input{flex:1;height:30px;border:1px solid rgba(148,163,184,.25);border-radius:7px;background:#070c15;color:#edf5ff;padding:0 9px;font-size:9px;outline:none}.toolbar input:focus{border-color:var(--accent)}.filter-chip{max-width:260px;padding:5px 8px;border:1px solid rgba(244,114,182,.3);border-radius:99px;background:rgba(131,24,67,.1);color:#f8c6df;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-scroll{flex:1;min-height:0;overflow:auto;scrollbar-gutter:stable;padding:9px}.asset-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px}.asset-card{display:grid;grid-template-columns:112px minmax(0,1fr);gap:10px;min-height:152px;padding:9px;border:1px solid rgba(148,163,184,.16);border-radius:9px;background:linear-gradient(145deg,rgba(19,27,42,.86),rgba(9,14,24,.82));cursor:pointer;outline:none;transition:border-color 120ms ease,box-shadow 120ms ease,background-color 120ms ease,opacity 120ms ease}.asset-card:hover{border-color:rgba(34,211,238,.34)}.asset-card:focus-visible{box-shadow:0 0 0 2px rgba(34,211,238,.45)}.asset-card.selected{border-color:var(--asset-selection);box-shadow:inset 0 0 0 .3px rgba(244,114,182,.45),0 0 15px rgba(244,114,182,.34),0 0 4px rgba(217,70,239,.55)}.asset-card.selection-blocked{opacity:.58}.asset-card.unregistered{cursor:default}.asset-card.unregistered .asset-state{color:#f3a8ce}.asset-thumb{position:relative;width:112px;height:132px;display:grid;grid-template-rows:2fr 1fr;overflow:hidden;border:1px solid rgba(148,163,184,.2);border-radius:7px;background:#050910;color:#648198;font-size:9px;font-weight:900}.asset-thumb-media{position:relative;display:grid;place-items:center;min-height:0;overflow:hidden;border-bottom:1px solid rgba(148,163,184,.18)}.asset-thumb-media img{width:100%;height:100%;object-fit:cover}.asset-thumb-media>span{display:none}.asset-thumb.fallback .asset-thumb-media img{display:none}.asset-thumb.fallback .asset-thumb-media>span{display:block}.asset-thumb-footer{display:flex;align-items:center;justify-content:center;gap:6px;min-height:0;padding:4px 6px;background:linear-gradient(180deg,#080d16,#050810)}.asset-source-name{min-width:0;flex:1;color:#a8bdd0;font-size:8px;font-weight:800;line-height:1.25;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-extension-badge{flex:0 0 auto;max-width:48px;padding:3px 5px;border:1px solid rgba(34,211,238,.4);border-radius:5px;background:rgba(8,145,178,.1);color:var(--accent);font-family:inherit;font-size:7px;font-weight:900;line-height:1;letter-spacing:.07em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-thumb-media .asset-add{position:absolute;right:5px;bottom:5px;z-index:2}.asset-add{min-width:56px;height:25px;padding:0 13px;border:1px solid rgba(244,114,182,.7);border-radius:99px;background:rgba(131,24,67,.26);color:#ffd5eb;font-size:9px;font-weight:950;letter-spacing:.04em;cursor:pointer;box-shadow:0 0 10px rgba(244,114,182,.16)}.asset-add:hover{border-color:#f9a8d4;background:rgba(190,24,93,.32);box-shadow:0 0 13px rgba(244,114,182,.3)}.asset-content{display:flex;flex-direction:column;gap:8px}.asset-title{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.asset-title-copy{display:flex;flex:1;flex-direction:column;gap:2px;min-width:0}.asset-state{color:var(--accent);font-size:7px;font-weight:900}.asset-id-line{display:flex;align-items:center;gap:5px;min-width:0;color:#9bacc0;font-size:7px;font-weight:500}.asset-id-line em{flex:0 0 auto;color:#6e859c;font-size:6px;font-style:normal;font-weight:900;letter-spacing:.05em}.asset-id-line span{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-meta{display:flex;flex-direction:column;gap:3px;color:#71879c;font-size:7px}.asset-meta b,.asset-meta span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-meta b{color:#bcd0e2}.empty{grid-column:1/-1;padding:30px;border:1px dashed rgba(148,163,184,.2);border-radius:8px;color:#667e94;font-size:9px;text-align:center}.warnings{max-height:64px;overflow:auto;padding:6px 9px;border-top:1px solid rgba(251,191,36,.2);background:rgba(120,53,15,.1);color:#fcd34d;font-size:7px}
       .toolbar-status{flex:0 0 190px;width:190px;min-width:190px;height:30px;display:flex;align-items:center;justify-content:flex-end;overflow:hidden;color:var(--muted);font-size:8px}.toolbar-status strong{display:block;width:100%;color:${state.error ? "#fda4af" : "#86efac"};font-variant-numeric:tabular-nums;letter-spacing:-.02em;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.toolbar .filter-chip{flex:0 0 120px;width:120px;max-width:120px;text-align:center}
       .asset-view-toggle{flex:0 0 31px;width:31px;height:30px;display:grid;place-items:center;padding:0;border:1px solid rgba(96,165,250,.46);border-radius:7px;background:linear-gradient(180deg,rgba(37,99,235,.2),rgba(15,23,42,.88));color:#7dd3fc;cursor:pointer}.asset-view-toggle:hover,.asset-view-toggle:focus-visible,.asset-view-toggle[aria-pressed="true"]{border-color:var(--accent);background:linear-gradient(180deg,rgba(37,99,235,.38),rgba(15,23,42,.94));color:#e0f2fe;outline:none;box-shadow:0 0 10px rgba(34,211,238,.2)}.asset-view-toggle svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
-      .hmb-image-assets .asset-card{min-height:167px;padding:10px}.hmb-image-assets .asset-thumb{width:123px;height:145px}.hmb-image-assets .asset-add{min-width:62px;height:28px;padding:0 14px;font-size:10px}.hmb-image-assets .asset-format{font-size:9px}.hmb-image-assets[data-asset-view="image"] .asset-grid{grid-template-columns:repeat(auto-fill,145px);align-content:start;justify-content:start;gap:9px}.hmb-image-assets[data-asset-view="image"] .asset-card{width:145px;grid-template-columns:123px;gap:0}.hmb-image-assets[data-asset-view="image"] .asset-content{display:none}.hmb-image-assets[data-asset-view="detail"] .asset-grid{grid-template-columns:repeat(auto-fill,286px);align-content:start;justify-content:start;gap:9px}.hmb-image-assets[data-asset-view="detail"] .asset-card{width:286px;grid-template-columns:123px minmax(0,1fr);gap:11px}.hmb-image-assets[data-asset-view="detail"] .asset-content{display:flex}
+      .hmb-image-assets .asset-card{min-height:167px;padding:10px}.hmb-image-assets .asset-thumb{width:123px;height:145px}.hmb-image-assets .asset-add{min-width:52px;height:28px;padding:0 10px;font-size:10px}.hmb-image-assets .asset-source-name{font-size:9px}.hmb-image-assets[data-asset-view="image"] .asset-grid{grid-template-columns:repeat(auto-fill,145px);align-content:start;justify-content:start;gap:9px}.hmb-image-assets[data-asset-view="image"] .asset-card{width:145px;grid-template-columns:123px;gap:0}.hmb-image-assets[data-asset-view="image"] .asset-content,.hmb-image-assets[data-asset-view="image"] .asset-extension-badge{display:none}.hmb-image-assets[data-asset-view="detail"] .asset-grid{grid-template-columns:repeat(auto-fill,286px);align-content:start;justify-content:start;gap:9px}.hmb-image-assets[data-asset-view="detail"] .asset-card{width:286px;grid-template-columns:123px minmax(0,1fr);gap:11px}.hmb-image-assets[data-asset-view="detail"] .asset-content{display:flex}
       .tray{margin:0 8px 8px;border:1px solid rgba(244,114,182,.34);border-radius:10px;background:linear-gradient(180deg,rgba(30,14,30,.9),rgba(8,11,19,.96));overflow:hidden}.tray-head{height:34px;display:flex;align-items:center;gap:9px;padding:0 10px;border-bottom:1px solid rgba(244,114,182,.2)}.tray-head b{font-size:9px;letter-spacing:.07em;color:#f9c2df}.tray-head span{color:#8ea3b8;font-size:7px}.tray-head em{margin-left:auto;color:var(--asset-selection);font-size:7px;font-style:normal}.tray-scroll{height:132px;display:flex;align-items:stretch;gap:8px;overflow-x:auto;overflow-y:hidden;padding:7px}.selected-card{position:relative;flex:0 0 244.5px;display:grid;grid-template-rows:25px minmax(0,1fr);padding:6px;border:1px solid rgba(244,114,182,.25);border-radius:8px;background:linear-gradient(145deg,rgba(61,23,49,.6),rgba(12,17,28,.94));cursor:grab}.selected-card.dragging{opacity:.35}.selected-card.drop-target{border-color:var(--accent);box-shadow:0 0 0 1px rgba(34,211,238,.28)}.selected-card.missing{border-color:rgba(248,113,113,.5)}.selected-card-top{display:flex;align-items:center;gap:7px}.slot{min-width:30px;height:21px;display:grid;place-items:center;border:1px solid rgba(96,165,250,.68);border-radius:5px;background:rgba(37,99,235,.24);color:#93c5fd;font-size:10px;font-weight:950}.drag-handle{color:#7f7184;font-size:10px}.selected-actions{display:flex;gap:3px;margin-left:auto}.selected-actions button{width:23px;height:21px;border:1px solid rgba(148,163,184,.2);border-radius:5px;background:#0a101b;color:#b9cad9;cursor:pointer}.selected-actions button:hover{border-color:var(--accent);color:#fff}.selected-actions button:disabled{opacity:.25;cursor:default}.selected-card-body{display:grid;grid-template-columns:102px minmax(0,1fr);align-items:center;gap:9px}.selected-thumb{position:relative;width:102px;height:82px;display:grid;place-items:center;overflow:hidden;border:1px solid rgba(244,114,182,.25);border-radius:6px;background:#060912;color:#725a70;font-size:7px;font-weight:900}.selected-thumb img{width:100%;height:100%;object-fit:cover}.selected-thumb span{display:none}.selected-thumb.fallback span{display:block}.selected-copy{display:flex;flex-direction:column;gap:4px}.selected-copy b,.selected-copy span,.selected-copy small{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.selected-copy b{font-size:10px}.selected-copy span{color:#a7b7c8;font-size:8px}.selected-copy em{color:#f3a8ce;font-size:7px;font-style:normal;font-weight:900}.selected-copy small{color:#667e94;font-size:7px}.tray-empty{min-width:100%;display:grid;place-items:center;border:1px dashed rgba(244,114,182,.18);border-radius:7px;color:#765d70;font-size:9px}
       .selected-card{flex-basis:120px;width:120px;height:118px;grid-template-rows:23px minmax(0,1fr)}.selected-card-top{gap:4px}.slot{flex:0 0 28px;width:28px;min-width:28px;height:21px;font-size:9px;font-variant-numeric:tabular-nums}.selected-actions{display:grid;grid-template-columns:repeat(3,22px);gap:2px;margin-left:auto}.selected-actions button{width:22px;height:21px;padding:0;display:grid;place-items:center}.selected-card-body{display:grid;grid-template-columns:1fr;place-items:center;gap:0;min-height:0}.selected-thumb{width:106px;height:81px}.selected-copy{display:none}
       .asset-registration-backdrop{position:absolute;inset:0;z-index:80;display:grid;place-items:center;padding:18px;background:rgba(1,4,10,.78);backdrop-filter:blur(5px)}.asset-passport{width:min(390px,100%);max-height:calc(100% - 12px);display:flex;flex-direction:column;overflow:auto;border:1px solid rgba(244,114,182,.62);border-radius:18px 18px 28px 28px;background:radial-gradient(circle at 50% -8%,rgba(190,24,93,.24),transparent 30%),linear-gradient(180deg,#171020,#090d17 45%,#060912);box-shadow:0 24px 70px rgba(0,0,0,.62),0 0 28px rgba(244,114,182,.2)}.passport-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 10px;border-bottom:1px solid rgba(244,114,182,.2)}.passport-head small{display:block;color:#d8a2be;font-size:7px;font-weight:900;letter-spacing:.18em}.passport-head h2{margin:3px 0 0;color:#fff1f8;font-size:15px;letter-spacing:.08em}.passport-head button{width:28px;height:28px;border:1px solid rgba(244,114,182,.25);border-radius:50%;background:#0b0d16;color:#e7b9d1;font-size:18px;line-height:1;cursor:pointer}.passport-photo{position:relative;width:128px;aspect-ratio:3/4;display:grid;place-items:center;align-self:center;margin:14px 0 8px;overflow:hidden;border:1px solid rgba(244,114,182,.38);border-radius:8px;background:#050910;color:#84677a;font-size:10px;font-weight:900;box-shadow:0 0 18px rgba(244,114,182,.12)}.passport-photo img{width:100%;height:100%;object-fit:cover}.passport-photo>span{display:none}.passport-photo.fallback img{display:none}.passport-photo.fallback>span{display:block}.passport-file{display:flex;flex-direction:column;gap:3px;padding:0 18px 12px;text-align:center}.passport-file b,.passport-file span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.passport-file b{color:#d7e2ef;font-size:8px}.passport-file span{color:#73899d;font-size:7px}.passport-fields{display:grid;grid-template-columns:1fr 1fr;gap:9px;padding:12px 16px;border-top:1px dashed rgba(244,114,182,.24)}.passport-fields label{display:flex;flex-direction:column;gap:4px}.passport-fields label:nth-last-child(1){grid-column:1/-1}.passport-fields label span{color:#bb8fa8;font-size:7px;font-weight:900;letter-spacing:.06em}.passport-fields input,.passport-fields select{width:100%;height:32px;border:1px solid rgba(148,163,184,.27);border-radius:7px;background:#060b13;color:#eef5ff;padding:0 8px;font-size:9px;outline:none}.passport-fields input:focus,.passport-fields select:focus{border-color:var(--asset-selection);box-shadow:0 0 0 1px rgba(244,114,182,.18)}.passport-fields select:disabled{opacity:.42}.passport-actions{display:flex;justify-content:flex-end;gap:7px;padding:11px 16px 15px}.passport-actions button{height:31px;padding:0 13px;border:1px solid rgba(148,163,184,.24);border-radius:7px;background:#0a101a;color:#bac9d8;font-size:8px;font-weight:900;cursor:pointer}.passport-actions .passport-register{border-color:rgba(244,114,182,.62);background:linear-gradient(180deg,rgba(190,24,93,.55),rgba(88,28,135,.42));color:#ffe4f2;box-shadow:0 0 12px rgba(244,114,182,.18)}.passport-actions button:disabled{opacity:.32;cursor:default;box-shadow:none}
@@ -2418,6 +2524,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
   container.setAttribute?.("data-hmb-node-delete-protected", "true");
   props = hmbUpdateImageAssetPropsReference({}, props);
   let state = normalizeState(props?.value);
+  hmbRememberImageAssetRevisionState(container, state, false);
   let listeners = [];
   let autoSyncTimer = null;
   let autoSyncPendingUntil = 0;
@@ -2453,6 +2560,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     container.__hmbImageAssetDragging = false;
     clearListeners();
     state = normalizeState(nextState);
+    hmbRememberImageAssetRevisionState(container, state, false);
     if (typeof container.__hmbImageAssetSearchDraft === "string") {
       state.search = container.__hmbImageAssetSearchDraft.slice(0, 256);
     }
@@ -2487,6 +2595,11 @@ export default function HMBImageAssetLibraryWidget(container, props) {
       return;
     }
     if (hmbConsumeImageAssetStateEcho(container, nextProps)) {
+      // A delayed local echo is older than both the visible state and the
+      // callback set delivered with its newer sibling.  Ignore it wholesale;
+      // otherwise the next user action can publish through an obsolete host
+      // callback even though the card DOM correctly stayed on the newer state.
+      if (container.__hmbImageAssetLastConsumedEchoWasStale) return;
       props = hmbUpdateImageAssetPropsReference(props, nextProps);
       return;
     }
@@ -2674,6 +2787,10 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     delete container.__hmbImageAssetSelectionBasePropValue;
     delete container.__hmbImageAssetPendingAuthoritativeProps;
     delete container.__hmbImageAssetAutoSyncError;
+    delete container.__hmbImageAssetCurrentScanRevision;
+    delete container.__hmbImageAssetCurrentUiEditRevision;
+    delete container.__hmbImageAssetLatestLocalUiEditRevision;
+    delete container.__hmbImageAssetLastConsumedEchoWasStale;
     if (Number(container.__hmbImageAssetMountToken) === mountToken) {
       delete container.__hmbImageAssetMountToken;
     }
