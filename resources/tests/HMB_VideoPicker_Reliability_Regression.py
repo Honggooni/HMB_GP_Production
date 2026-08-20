@@ -666,7 +666,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.6.36"
+assert manifest["metadata"]["library_version"] == "0.6.37"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
@@ -704,7 +704,7 @@ picker_manifest = next(item for item in manifest["nodes"] if item["class_name"] 
 prompt_manifest = next(item for item in manifest["nodes"] if item["class_name"] == "HMBPromptLibrary")
 assert picker_manifest["metadata"]["width"] == 1400
 assert prompt_manifest["metadata"]["width"] == 1800
-assert picker_manifest["metadata"]["height"] == 1200
+assert picker_manifest["metadata"]["height"] == 360
 assert prompt_manifest["metadata"]["height"] == 1193
 for prompt_height_key in (
     "height", "default_height", "initial_height", "min_height",
@@ -717,8 +717,8 @@ for prompt_height_key in (
 assert prompt.PROMPT_NATIVE_ASSET_INPUT_ROW_HEIGHT == 42
 assert prompt.PROMPT_START_HEIGHT == prompt.PROMPT_MIN_HEIGHT == 1193
 assert picker_manifest["metadata"]["ui_options"]["initial_width"] == 1400
-assert picker_manifest["metadata"]["ui_options"]["initial_height"] == 1200
-assert picker_manifest["metadata"]["ui_options"]["min_height"] == 1151
+assert picker_manifest["metadata"]["ui_options"]["initial_height"] == 360
+assert picker_manifest["metadata"]["ui_options"]["min_height"] == 360
 agent_manifest = next(item for item in manifest["nodes"] if item["class_name"] == "HMBAgentLibrary")
 for native_size_key in (
     "width", "height", "default_width", "default_height",
@@ -823,7 +823,9 @@ assert "_stage_video_slot_native_size" not in picker_source
 assert "PICKER_VIDEO_OUTPUT_ROW_DELTA" not in picker_source
 assert "def _retire_legacy_video_slot_outputs(" in picker_source
 assert "Legacy node deletion race ignored" not in picker_source
-assert "initial_size_setter(width=PICKER_START_WIDTH, height=PICKER_START_HEIGHT)" in picker_source
+assert 'prepared_kwargs["metadata"] = prepared_metadata' in picker_source
+assert "super().__init__(**prepared_kwargs)" in picker_source
+assert "initial_size_setter(width=PICKER_START_WIDTH, height=PICKER_START_HEIGHT)" not in picker_source
 assert "_add_picker_command_bridge(self)" in picker_source
 assert "if name == WIDGET_COMMAND_PARAMETER:" in picker_source
 assert "if action in {\"cancel_pending\", \"stop_read\", \"cancel_operation\"}:" in picker_source
@@ -1065,15 +1067,22 @@ assert prompt_port_node.parameter_output_values["PROMPT_OUT"] == "prompt-contrac
 state_parameter = picker._get_parameter_obj(node, picker.WIDGET_STATE_PARAMETER)
 command_parameter = picker._get_parameter_obj(node, picker.WIDGET_COMMAND_PARAMETER)
 assert picker.PICKER_START_WIDTH == 1400
-assert picker.PICKER_WIDGET_START_HEIGHT == picker.PICKER_START_HEIGHT == 1200
-assert picker.PICKER_NATIVE_SIZE_VERSION == 3
+assert picker.PICKER_START_HEIGHT == 1200
+assert picker.PICKER_WIDGET_START_HEIGHT == picker.PICKER_WIDGET_COMPACT_MOUNT_HEIGHT == 158
+assert picker.PICKER_COMPACT_NATIVE_HEIGHT == 360
+assert picker.PICKER_NATIVE_SIZE_VERSION == 4
 assert node.metadata["size"] == {
+    "width": picker.PICKER_START_WIDTH,
+    "height": picker.PICKER_COMPACT_NATIVE_HEIGHT,
+}
+assert node.metadata[picker.PICKER_EXPANDED_SIZE_METADATA_KEY] == {
     "width": picker.PICKER_START_WIDTH,
     "height": picker.PICKER_START_HEIGHT,
 }
 assert node.metadata["hmb_picker_native_size_version"] == picker.PICKER_NATIVE_SIZE_VERSION
 assert state_parameter.ui_options["height"] == picker.PICKER_WIDGET_START_HEIGHT
-assert state_parameter.ui_options["min_height"] == picker.PICKER_WIDGET_MIN_HEIGHT == 1151
+assert state_parameter.ui_options["min_height"] == picker.PICKER_WIDGET_COMPACT_MOUNT_HEIGHT
+assert state_parameter.ui_options["node_size"] == node.metadata["size"]
 assert state_parameter.type == "dict"
 assert state_parameter.input_types == ["dict"]
 assert command_parameter.type == "dict"

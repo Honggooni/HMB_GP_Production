@@ -130,28 +130,28 @@ assert.doesNotMatch(
 );
 assert.match(
   toggleSource,
-  /container\.__hmbVideoPickerExpanded = false;\s*cleanup\(\);[\s\S]*?HMBVideoPickerLibraryWidget\(container, liveProps\)/,
+  /hmbRememberVideoPickerViewMode\(container, false\);\s*cleanup\(\);[\s\S]*?HMBVideoPickerLibraryWidget\(container, liveProps\)/,
   "Expanded to compact releases listeners and morphs the retained root.",
 );
 assert.match(
   toggleSource,
-  /container\.__hmbVideoPickerExpanded = true;[\s\S]*?cleanup\(\);\s*HMBVideoPickerLibraryWidget\(container, liveProps\)/,
+  /hmbRememberVideoPickerViewMode\(container, true\);[\s\S]*?cleanup\(\);\s*HMBVideoPickerLibraryWidget\(container, liveProps\)/,
   "Compact to expanded releases compact sizing before morphing the retained root.",
 );
 assert.equal(
-  (toggleSource.match(/hmbRequestVideoPickerNodeInternalsUpdate\(container, liveProps\)/g) || []).length,
-  2,
-  "Each direction sends one settled node-internals update instead of intermediate updates that can pan the canvas.",
+  (toggleSource.match(/hmbRequestVideoPickerNodeInternalsUpdate\(/g) || []).length,
+  0,
+  "A transition must never publish node internals synchronously against intermediate bounds.",
+);
+assert.equal(
+  (toggleSource.match(/hmbScheduleVideoPickerNodeInternalsUpdate\(container, liveProps/g) || []).length,
+  1,
+  "Both directions share one finally-block scheduler that samples only final stable bounds.",
 );
 assert.match(
   toggleSource,
-  /HMBVideoPickerLibraryWidget\(container, liveProps\);\s*hmbSyncVideoPickerHostMeasurement\(container, liveProps\.value, false\);\s*hmbRequestVideoPickerNodeInternalsUpdate/,
-  "Compact commits live DOM, measurement, then node internals.",
-);
-assert.match(
-  toggleSource,
-  /hmbApplyPickerHostSizing\(container, hmbPickerInnerRequiredHeight\(container\)\);[\s\S]*?hmbSyncVideoPickerHostMeasurement\(container, liveProps\.value, true\);\s*hmbRequestVideoPickerNodeInternalsUpdate/,
-  "Expanded commits final geometry before measurement and node internals.",
+  /finally\s*\{\s*delete container\.__hmbVideoPickerViewTransition;\s*hmbScheduleVideoPickerNodeInternalsUpdate\(container, liveProps,[\s\S]*?force:\s*true/,
+  "The final node-local internals publish is queued only after transition ownership is released.",
 );
 assert.doesNotMatch(
   source.slice(

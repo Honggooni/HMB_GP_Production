@@ -146,8 +146,9 @@ assert.equal(expandedShell.style.minHeight, "1200px");
 assert.equal(expandedShell.style.maxHeight, "1200px");
 expandedController.cleanup();
 
-// The visible compact widget owns only its inner authored frame. React Flow's
-// outer height is released and recalculated through updateNodeInternals.
+// The visible compact widget owns only its inner authored frame. Stable native
+// outer geometry must remain unchanged; releasing 1200px here lets the host
+// briefly fit the whole workspace against the 158px authored row.
 const liveShell = fakeShell(1200);
 liveShell.ownerDocument = document;
 const host = {
@@ -191,9 +192,29 @@ assert.equal(clip.style.height, "158px");
 assert.equal(clip.style.minHeight, "158px");
 assert.equal(clip.style.maxHeight, "158px");
 assert.equal(dashboard.style.height, "158px");
-assert.equal(liveShell.style.height, undefined);
-assert.equal(liveShell.style.minHeight, undefined);
-assert.equal(liveShell.style.maxHeight, undefined);
+assert.equal(liveShell.style.height, "1200px");
+assert.equal(liveShell.style.minHeight, "1200px");
+assert.equal(liveShell.style.maxHeight, "1200px");
 assert.equal(container.dataset.hmbVideoPickerCompactContentHeight, "158");
+
+// v0.6.37's native compact shell is 360px (title, ports and three parameter
+// rows included). The authored 158px widget must not mistake it for legacy
+// compact geometry or overwrite any part of the native contract.
+const nativeCompactShell = fakeShell(360);
+nativeCompactShell.ownerDocument = document;
+const nativeHost = { parentElement: nativeCompactShell, style: fakeStyle(), dataset: {}, classList: fakeClassList() };
+const nativeContainer = {
+  ...container,
+  parentElement: nativeHost,
+  dataset: {},
+  closest(selector) { return selector === ".react-flow__node" ? nativeCompactShell : null; },
+};
+assert.equal(
+  picker.hmbApplyVideoPickerCompactHostSizing(nativeContainer, { picker_shots: [] }),
+  158,
+);
+assert.equal(nativeCompactShell.style.height, "360px");
+assert.equal(nativeCompactShell.style.minHeight, "360px");
+assert.equal(nativeCompactShell.style.maxHeight, "360px");
 
 console.log("HMB VideoPicker compact cold-mount regression checks passed.");

@@ -4,7 +4,7 @@
   "metadata": {
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.6.36",
+    "library_version": "0.6.37",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
       "archive_source_count": 30,
@@ -316,28 +316,28 @@
         "description": "Captures Maya snapshots and playblast variants.\nOrders videos for prompts or generators.",
         "display_name": "HMBVideoPickerLibrary",
         "width": 1400,
-        "height": 1200,
+        "height": 360,
         "default_width": 1400,
-        "default_height": 1200,
+        "default_height": 360,
         "preferred_width": 1400,
-        "preferred_height": 1200,
+        "preferred_height": 360,
         "initial_width": 1400,
-        "initial_height": 1200,
+        "initial_height": 360,
         "min_width": 760,
-        "min_height": 1151,
+        "min_height": 360,
         "resizable": true,
         "ui_options": {
           "width": 1400,
-          "height": 1200,
+          "height": 360,
           "default_width": 1400,
-          "default_height": 1200,
+          "default_height": 360,
           "min_width": 760,
-          "min_height": 1151,
+          "min_height": 360,
           "resizable": true,
           "preferred_width": 1400,
-          "preferred_height": 1200,
+          "preferred_height": 360,
           "initial_width": 1400,
-          "initial_height": 1200
+          "initial_height": 360
         }
       }
     }

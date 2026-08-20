@@ -35,12 +35,16 @@ picker._resolve_readable_video_reference = lambda reference: Path(str(reference)
 # serialized property value from the saved workflow.
 picker_node = picker.HMBVideoPickerLibrary(name="picker_state_restore")
 assert picker_node.width == 1400
-assert picker_node.height == 1200
-assert picker_node.metadata["size"] == {"width": 1400, "height": 1200}
-assert picker_node.metadata["hmb_picker_native_size_version"] == 3
+assert picker_node.height == picker.PICKER_COMPACT_NATIVE_HEIGHT == 360
+assert picker_node.metadata["size"] == {"width": 1400, "height": 360}
+assert picker_node.metadata[picker.PICKER_EXPANDED_SIZE_METADATA_KEY] == {
+    "width": 1400,
+    "height": 1200,
+}
+assert picker_node.metadata["hmb_picker_native_size_version"] == 4
 
-# Updating the library's new-node default must not migrate a serialized manual
-# resize from an existing workflow.
+# v4 separates the active compact shell from a serialized manual expanded
+# resize, preserving the latter under its dedicated metadata key.
 saved_picker_metadata = {
     "size": {"width": 1234, "height": 1188},
     "hmb_picker_native_size_version": 2,
@@ -49,8 +53,12 @@ resized_picker_node = picker.HMBVideoPickerLibrary(
     name="picker_manual_size_restore",
     metadata=copy.deepcopy(saved_picker_metadata),
 )
-assert resized_picker_node.metadata["size"] == saved_picker_metadata["size"]
-assert resized_picker_node.metadata["hmb_picker_native_size_version"] == 3
+assert resized_picker_node.metadata["size"] == {"width": 1400, "height": 360}
+assert (
+    resized_picker_node.metadata[picker.PICKER_EXPANDED_SIZE_METADATA_KEY]
+    == saved_picker_metadata["size"]
+)
+assert resized_picker_node.metadata["hmb_picker_native_size_version"] == 4
 saved_picker_state = copy.deepcopy(picker_node._picker_state())
 saved_picker_state.update({
     "runtime_instance_id": "saved-workflow-runtime",

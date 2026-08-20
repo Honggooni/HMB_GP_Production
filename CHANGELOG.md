@@ -1,5 +1,11 @@
 # Changelog
 
+## `v0.6.37` — 2026-08-20
+
+- Fixed the VideoPicker workspace-viewport hotfix path so cold load, reload,
+  and compact/expanded geometry reconciliation no longer zoom, reframe, or
+  shrink the surrounding React Flow workspace while the Picker settles.
+
 ## `v0.6.36` — 2026-08-20
 
 - Approved the audited public GitHub team-distribution channel. The release

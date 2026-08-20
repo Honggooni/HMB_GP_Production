@@ -76,6 +76,13 @@ export const HMB_PICKER_PAINT_FIRST_FALLBACK_MS = 120;
 const HMB_PICKER_GUARDED_COMMAND_OPTIONS = Object.freeze({ ["reserveVisibility"]: true });
 const hmbVideoPickerNativeResizeLocks = new WeakMap();
 const hmbVideoPickerHostMeasurements = new WeakMap();
+// View mode belongs to the React Flow node, not to one transient parameter-row
+// container. Griptape can replace that container during adaptive measurement
+// and workspace reload; retaining the mode by stable node id prevents every
+// replacement from falling back to compact and changing the graph bounds.
+const hmbVideoPickerViewModeRegistry = new Map();
+const hmbVideoPickerViewModeFallbackRegistry = new WeakMap();
+const hmbVideoPickerNodeInternalsSchedulers = new WeakMap();
 let hmbVideoPickerPaintFirstSequence = 0;
 
 // Jewel Night is the single Shot-routing palette shared by ImageAsset,
@@ -3601,6 +3608,45 @@ function findReactFlowNode(container) {
   return hmbFindVideoPickerReactFlowNode(container);
 }
 
+export function hmbVideoPickerNodeIdentity(container) {
+  const shell = findReactFlowNode(container) || videoPickerNodeRoot(container);
+  if (!shell) return null;
+  const id = clean(
+    shell.getAttribute?.("data-id")
+    || shell.getAttribute?.("data-node-id")
+    || shell.getAttribute?.("data-nodeid"),
+  );
+  // runtime_instance_id is intentionally excluded: it changes on reload and
+  // would make the session registry lose the node's chosen view mode.
+  return id ? `id:${id}` : shell;
+}
+
+export function hmbVideoPickerStoredViewMode(container) {
+  const identity = hmbVideoPickerNodeIdentity(container);
+  if (!identity) return null;
+  if (typeof identity === "string") {
+    return hmbVideoPickerViewModeRegistry.has(identity)
+      ? hmbVideoPickerViewModeRegistry.get(identity) === true
+      : null;
+  }
+  return hmbVideoPickerViewModeFallbackRegistry.has(identity)
+    ? hmbVideoPickerViewModeFallbackRegistry.get(identity) === true
+    : null;
+}
+
+export function hmbRememberVideoPickerViewMode(container, expanded) {
+  const resolved = expanded === true;
+  const identity = hmbVideoPickerNodeIdentity(container);
+  if (identity) {
+    if (typeof identity === "string") hmbVideoPickerViewModeRegistry.set(identity, resolved);
+    else hmbVideoPickerViewModeFallbackRegistry.set(identity, resolved);
+  }
+  if (container) container.__hmbVideoPickerExpanded = resolved;
+  const shell = findReactFlowNode(container);
+  if (shell) shell.__hmbVideoPickerMeasurementExpanded = resolved;
+  return resolved;
+}
+
 function hmbPickerNodeIsSelected(root) {
   if (!root) return false;
   if (root.classList?.contains("selected")) return true;
@@ -4688,6 +4734,154 @@ export function hmbRequestVideoPickerNodeInternalsUpdate(container, props = null
   }
 }
 
+function hmbVideoPickerInlineGeometrySignature(shell) {
+  if (!shell?.style) return "";
+  return HMB_VIDEO_PICKER_GEOMETRY_PROPERTIES.map((property) => {
+    const camelProperty = property.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
+    return clean(
+      shell.style.getPropertyValue?.(property)
+      || shell.style[camelProperty]
+      || "",
+    );
+  }).join("|");
+}
+
+export function hmbVideoPickerNodeInternalsSignature(
+  container,
+  stateValue = undefined,
+  expandedOverride = null,
+) {
+  const shell = findReactFlowNode(container);
+  if (!shell) return "";
+  const expanded = typeof expandedOverride === "boolean"
+    ? expandedOverride
+    : container?.__hmbVideoPickerExpanded === true;
+  const state = stateValue === undefined
+    ? normalize(container?.__hmbAuthoritativePickerState || {})
+    : normalize(stateValue);
+  const contentHeight = expanded
+    ? Math.max(HMB_PICKER_CONTENT_FALLBACK_HEIGHT, hmbPickerInnerRequiredHeight(container))
+    : hmbVideoPickerCompactMeasurementHeightFromNormalizedState(state);
+  return [
+    expanded ? "expanded" : "compact",
+    contentHeight,
+    hmbVideoPickerInlineGeometrySignature(shell),
+  ].join("::");
+}
+
+function hmbVideoPickerAnimationFrameApi(container) {
+  const ownerView = container?.ownerDocument?.defaultView
+    || (typeof window !== "undefined" ? window : null);
+  const request = ownerView?.requestAnimationFrame
+    || (typeof requestAnimationFrame === "function" ? requestAnimationFrame : null);
+  const cancel = ownerView?.cancelAnimationFrame
+    || (typeof cancelAnimationFrame === "function" ? cancelAnimationFrame : null);
+  return {
+    request: typeof request === "function"
+      ? request.bind(ownerView || globalThis)
+      : (callback) => setTimeout(callback, 0),
+    cancel: typeof cancel === "function"
+      ? cancel.bind(ownerView || globalThis)
+      : (handle) => clearTimeout(handle),
+  };
+}
+
+export function hmbCancelVideoPickerNodeInternalsUpdate(container) {
+  const shell = findReactFlowNode(container);
+  const record = shell ? hmbVideoPickerNodeInternalsSchedulers.get(shell) : null;
+  if (!record) return false;
+  if (record.firstFrame) {
+    try { record.cancel(record.firstFrame); } catch (_error) {}
+  }
+  if (record.secondFrame) {
+    try { record.cancel(record.secondFrame); } catch (_error) {}
+  }
+  record.firstFrame = 0;
+  record.secondFrame = 0;
+  record.latest = null;
+  record.force = false;
+  container?.removeAttribute?.("data-hmb-video-picker-node-internals-pending");
+  return true;
+}
+
+// Every geometry producer (cold mount, mode transition, ResizeObserver and
+// regional props update) enters this one settled queue. The queue samples the
+// final node-local signature after two frames and publishes at most once for a
+// stable bound. It never calls a viewport, fitView, zoom or transform API.
+export function hmbScheduleVideoPickerNodeInternalsUpdate(
+  container,
+  props = null,
+  options = {},
+) {
+  const shell = findReactFlowNode(container);
+  if (!shell || container?.__hmbVideoPickerDeleted === true) return false;
+  if (container.__hmbVideoPickerViewTransition === true && options?.afterTransition !== true) {
+    return false;
+  }
+  let record = hmbVideoPickerNodeInternalsSchedulers.get(shell);
+  if (!record) {
+    const frameApi = hmbVideoPickerAnimationFrameApi(container);
+    record = {
+      request: frameApi.request,
+      cancel: frameApi.cancel,
+      firstFrame: 0,
+      secondFrame: 0,
+      latest: null,
+      lastSignature: "",
+      lastContainer: null,
+      force: false,
+    };
+    hmbVideoPickerNodeInternalsSchedulers.set(shell, record);
+  }
+  const stateValue = options?.stateValue === undefined
+    ? hmbPickerStateFromProps(props || {})
+    : options.stateValue;
+  const expanded = typeof options?.expanded === "boolean"
+    ? options.expanded
+    : container.__hmbVideoPickerExpanded === true;
+  record.latest = { container, props: props || {}, stateValue, expanded };
+  record.force = record.force || options?.force === true || record.lastContainer !== container;
+  container.setAttribute?.("data-hmb-video-picker-node-internals-pending", "true");
+  if (record.firstFrame || record.secondFrame) return true;
+
+  const flush = () => {
+    record.secondFrame = 0;
+    const latest = record.latest;
+    record.latest = null;
+    if (!latest?.container || latest.container.__hmbVideoPickerDeleted === true) {
+      record.force = false;
+      return;
+    }
+    if (latest.container.__hmbVideoPickerViewTransition === true) {
+      record.force = false;
+      latest.container.removeAttribute?.("data-hmb-video-picker-node-internals-pending");
+      return;
+    }
+    const signature = hmbVideoPickerNodeInternalsSignature(
+      latest.container,
+      latest.stateValue,
+      latest.expanded,
+    );
+    const shouldPublish = !!signature && (
+      record.force
+      || record.lastContainer !== latest.container
+      || record.lastSignature !== signature
+    );
+    record.force = false;
+    latest.container.removeAttribute?.("data-hmb-video-picker-node-internals-pending");
+    if (!shouldPublish) return;
+    if (hmbRequestVideoPickerNodeInternalsUpdate(latest.container, latest.props)) {
+      record.lastSignature = signature;
+      record.lastContainer = latest.container;
+    }
+  };
+  record.firstFrame = record.request(() => {
+    record.firstFrame = 0;
+    record.secondFrame = record.request(flush);
+  });
+  return true;
+}
+
 export function hmbDetachVideoPickerDom(container) {
   if (!container) return [];
   const nodes = Array.from(container.childNodes || container.children || []);
@@ -4716,19 +4910,29 @@ export function hmbRestoreVideoPickerDom(container, nodes) {
 export function hmbReleaseVideoPickerCompactOuterGeometry(container, options = {}) {
   const shell = findReactFlowNode(container);
   if (!shell?.style) return false;
-  const legacyOnly = options?.legacyOnly === true;
+  void options;
   const legacyMarker = Number(shell.dataset?.hmbVideoPickerCompactHeight || 0);
-  const inlineHeight = Number.parseFloat(
-    shell.style.getPropertyValue?.("height") || shell.style.height || "",
-  );
+  const inlineDimensions = ["height", "min-height", "max-height"].map((property) => {
+    const camelProperty = property.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
+    return Number.parseFloat(
+      shell.style.getPropertyValue?.(property) || shell.style[camelProperty] || "",
+    );
+  });
   // Use the authored inline dimension rather than a transient offsetHeight.
   // During React's first layout pass a valid 1200px expanded node can briefly
   // report a small rendered height; that must not be mistaken for v0.6.36's
-  // serialized 158px compact shell.
-  const invalidCompactHeight = Number.isFinite(inlineHeight)
-    && inlineHeight > 0
-    && inlineHeight < HMB_MIN_NODE_HEIGHT;
-  if (legacyOnly && !(legacyMarker > 0) && !invalidCompactHeight) return false;
+  // serialized 158px compact shell. Future native compact geometry (360px)
+  // is valid and must likewise remain untouched; only the explicit migration
+  // marker or the exact legacy bootstrap range is repairable here.
+  const invalidLegacyBootstrap = inlineDimensions.some((value) => (
+    Number.isFinite(value)
+    && value > 0
+    && value <= HMB_VIDEO_PICKER_COMPACT_BOOTSTRAP_HEIGHT + 2
+  ));
+  const markedLegacyDimension = legacyMarker > 0 && inlineDimensions.some((value) => (
+    Number.isFinite(value) && Math.abs(value - legacyMarker) <= 2
+  ));
+  if (!markedLegacyDimension && !invalidLegacyBootstrap) return false;
   let changed = false;
   for (const property of ["height", "min-height", "max-height"]) {
     const camelProperty = property.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
@@ -4746,7 +4950,7 @@ export function hmbReleaseVideoPickerCompactOuterGeometry(container, options = {
     delete shell.dataset.hmbVideoPickerCompactHeight;
     changed = true;
   }
-  if (shell.dataset) shell.dataset.hmbVideoPickerCompactOuterReleased = "1";
+  if (changed && shell.dataset) shell.dataset.hmbVideoPickerCompactOuterReleased = "1";
   return changed;
 }
 
@@ -4810,7 +5014,10 @@ export function hmbApplyVideoPickerCompactHostSizing(container, stateValue = und
     hmbSetPickerStyleIfChanged(element, "max-height", measuredPixels);
   }
   container.dataset && (container.dataset.hmbVideoPickerCompactContentHeight = String(measured));
-  hmbReleaseVideoPickerCompactOuterGeometry(container);
+  // Repair only a v0.6.36 158px shell. Stable native node geometry (current
+  // expanded 1200px or the native compact contract) remains authoritative and
+  // is never released by the live compact widget.
+  hmbReleaseVideoPickerCompactOuterGeometry(container, { legacyOnly: true });
   return measured;
 }
 
@@ -4847,7 +5054,10 @@ export function hmbInstallVideoPickerCompactHostSizing(
       ) return;
       hmbApplyVideoPickerCompactHostSizing(container, latestStateValue);
       container.removeAttribute?.("data-hmb-video-picker-compact-sizing-pending");
-      hmbRequestVideoPickerNodeInternalsUpdate(container, props || {});
+      hmbScheduleVideoPickerNodeInternalsUpdate(container, props || {}, {
+        stateValue: latestStateValue,
+        expanded: false,
+      });
     });
   };
   container.__hmbScheduleVideoPickerCompactHostSizing = schedule;
@@ -4873,11 +5083,14 @@ function hmbApplyPickerInitialNodeSizeOnce(container) {
     const rect = shell.getBoundingClientRect ? shell.getBoundingClientRect() : null;
     const currentWidth = rect && rect.width ? rect.width : 0;
     const currentHeight = rect && rect.height ? rect.height : 0;
-    // Python/manifest metadata owns the 1400x1200 new-node default. This is
-    // only a zero-layout fallback: a smaller non-zero shell may be a restored
-    // user resize and must not be enlarged during a widget remount.
+    // Python/manifest metadata owns the 1400x1200 expanded default. A valid
+    // saved expanded resize is always >= HMB_MIN_NODE_HEIGHT; a non-zero shell
+    // below that floor is the native compact 360px geometry and must become the
+    // full default synchronously before the host can fit intermediate bounds.
     const needsWidth = !currentWidth || currentWidth <= 1;
-    const needsHeight = !currentHeight || currentHeight <= 1;
+    const needsHeight = !currentHeight
+      || currentHeight <= 1
+      || currentHeight < HMB_MIN_NODE_HEIGHT;
     if (needsWidth) shell.style.width = `${HMB_DEFAULT_NODE_WIDTH}px`;
     if (needsHeight) shell.style.height = `${HMB_DEFAULT_NODE_HEIGHT}px`;
     shell.style.minWidth = `${HMB_MIN_NODE_WIDTH}px`;
@@ -6909,9 +7122,9 @@ export function hmbRenderPickerMarkup(container, markup) {
 
 export function hmbVideoPickerIsHostMeasurementClone(container) {
   if (!container) return false;
-  let current = hmbPickerComposedParent(container);
+  let current = container;
   for (let index = 0; current && index < 48; index += 1) {
-    if (hmbPickerIsOuterCanvasOrNode(current)) break;
+    if (current !== container && hmbPickerIsOuterCanvasOrNode(current)) break;
     const classList = current.classList;
     const exactHostMeasurementWrapper = !!(
       classList?.contains?.("absolute")
@@ -6919,11 +7132,47 @@ export function hmbVideoPickerIsHostMeasurementClone(container) {
       && classList?.contains?.("right-0")
       && classList?.contains?.("pointer-events-none")
     );
-    let hidden = false;
+    const explicitMeasurementMarker = [
+      "data-hmb-host-measurement",
+      "data-host-measurement",
+      "data-measurement",
+      "data-measurement-copy",
+      "data-measurement-clone",
+      "data-hidden-measurement",
+    ].some((name) => {
+      try {
+        if (!current.hasAttribute?.(name)) return false;
+        const value = String(current.getAttribute?.(name) || "").trim().toLowerCase();
+        return !["false", "0", "off", "no"].includes(value);
+      } catch (_error) {
+        return false;
+      }
+    });
+    let hidden = current.hidden === true || current.hasAttribute?.("hidden") === true;
     try {
-      hidden = String(current.style?.visibility || "").toLowerCase() === "hidden";
+      const ariaHidden = String(current.getAttribute?.("aria-hidden") || "").trim().toLowerCase();
+      const inlineVisibility = String(current.style?.visibility || "").trim().toLowerCase();
+      const inlineDisplay = String(current.style?.display || "").trim().toLowerCase();
+      hidden = hidden
+        || ariaHidden === "true"
+        || ["hidden", "collapse"].includes(inlineVisibility)
+        || inlineDisplay === "none";
     } catch (_error) {}
-    if (exactHostMeasurementWrapper && hidden) return true;
+    if (!hidden) {
+      try {
+        const ownerView = current.ownerDocument?.defaultView
+          || (typeof window !== "undefined" ? window : null);
+        const computed = ownerView?.getComputedStyle?.(current);
+        const computedVisibility = String(computed?.visibility || "").trim().toLowerCase();
+        const computedDisplay = String(computed?.display || "").trim().toLowerCase();
+        hidden = ["hidden", "collapse"].includes(computedVisibility) || computedDisplay === "none";
+      } catch (_error) {}
+    }
+    // A host measurement marker is authoritative. Generic hidden state alone
+    // is not: a legitimate live node can be temporarily hidden in an inactive
+    // tab/offscreen branch. Require the known inert measurement wrapper when
+    // visibility/hidden/aria-hidden is the only evidence.
+    if (explicitMeasurementMarker || (exactHostMeasurementWrapper && hidden)) return true;
     current = hmbPickerComposedParent(current);
   }
   return false;
@@ -7090,9 +7339,12 @@ export function hmbMountVideoPickerHostMeasurement(container, props = {}, option
   const applyMeasurement = (nextProps = latestProps, forcedExpanded = null) => {
     if (nextProps && typeof nextProps === "object") latestProps = nextProps;
     if (!placeholder?.style) return HMB_VIDEO_PICKER_COMPACT_BOOTSTRAP_HEIGHT;
+    const registeredViewMode = hmbVideoPickerStoredViewMode(container);
     const expanded = typeof forcedExpanded === "boolean"
       ? forcedExpanded
-      : shell?.__hmbVideoPickerMeasurementExpanded === true;
+      : typeof shell?.__hmbVideoPickerMeasurementExpanded === "boolean"
+        ? shell.__hmbVideoPickerMeasurementExpanded === true
+        : registeredViewMode === true;
     const measurementHeight = expanded
       ? HMB_VIDEO_PICKER_EXPANDED_MEASUREMENT_HEIGHT
       : hmbVideoPickerCompactMeasurementHeight(hmbPickerStateFromProps(latestProps));
@@ -7204,11 +7456,21 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   // node.
   container.__hmbVideoPickerDeleted = false;
   if (typeof container.__hmbVideoPickerExpanded !== "boolean") {
-    container.__hmbVideoPickerExpanded = false;
+    const storedViewMode = hmbVideoPickerStoredViewMode(container);
+    hmbRememberVideoPickerViewMode(container, storedViewMode === true);
+  } else {
+    hmbRememberVideoPickerViewMode(container, container.__hmbVideoPickerExpanded === true);
   }
   const pickerExpanded = container.__hmbVideoPickerExpanded === true;
   if (!container.__hmbVideoPickerCompactHostGeometry) {
     container.__hmbVideoPickerCompactHostGeometry = hmbCaptureVideoPickerCompactHostGeometry(container);
+  }
+  if (!container.__hmbVideoPickerCompactOuterGeometry) {
+    const shell = findReactFlowNode(container);
+    const shellHeight = hmbPickerNodeShellHeight(shell);
+    if (!pickerExpanded || (shellHeight > 0 && shellHeight < HMB_MIN_NODE_HEIGHT)) {
+      container.__hmbVideoPickerCompactOuterGeometry = hmbCaptureVideoPickerExpandedGeometry(container);
+    }
   }
   // v0.6.36 keeps one live root across compact/full transitions. Drop any
   // detached-DOM cache left by an older controller; normal keyed morphing now
@@ -7216,7 +7478,13 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   delete container.__hmbVideoPickerExpandedCache;
   delete container.__hmbVideoPickerRestoringExpandedDom;
   if (!pickerExpanded && !container.__hmbVideoPickerExpandedGeometry) {
-    container.__hmbVideoPickerExpandedGeometry = hmbCaptureVideoPickerExpandedGeometry(container);
+    const shell = findReactFlowNode(container);
+    // Never remember native compact 360px as an expanded snapshot. Doing so
+    // would restore 360 after the expanded factory has synchronously reached
+    // 1200 and expose a 360→1200 bounds oscillation on the following frame.
+    if (hmbPickerNodeShellHeight(shell) >= HMB_MIN_NODE_HEIGHT) {
+      container.__hmbVideoPickerExpandedGeometry = hmbCaptureVideoPickerExpandedGeometry(container);
+    }
   }
   const retainedViewportVideo = container.querySelector?.("#picker-video") || null;
   const retainedViewportSource = clean(retainedViewportVideo?.getAttribute?.("src"));
@@ -7227,22 +7495,14 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
         && container.__hmbVideoPickerViewTransition !== true
       );
       if (recoverCompactUnmount) {
-        hmbRestoreVideoPickerExpandedGeometry(
-          container,
-          container.__hmbVideoPickerExpandedGeometry,
-          { shellOnly: true },
-        );
+        // Compact never overwrites valid outer shell geometry, so unmounting
+        // must not restore a 1200px snapshot and publish an intermediate bound.
         hmbSetVideoPickerNativeResizeLocked(container, false);
-        hmbRequestVideoPickerNodeInternalsUpdate(container);
-        container.__hmbVideoPickerCleanupProxyRecovering = true;
       }
       const currentCleanup = container.__hmbVideoPickerCleanup;
-      try {
-        if (typeof currentCleanup === "function") currentCleanup();
-      } finally {
-        delete container.__hmbVideoPickerCleanupProxyRecovering;
-      }
+      if (typeof currentCleanup === "function") currentCleanup();
       container.__hmbVideoPickerDeleted = true;
+      hmbCancelVideoPickerNodeInternalsUpdate(container);
       hmbClearPendingPickerStateEcho(container);
       delete container.__hmbPendingPickerState;
       delete container.__hmbAuthoritativePickerState;
@@ -7288,6 +7548,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       delete container.__hmbVideoPickerExpandedGeometry;
       delete container.__hmbVideoPickerExpandedViewState;
       delete container.__hmbVideoPickerCompactHostGeometry;
+      delete container.__hmbVideoPickerCompactOuterGeometry;
       delete container.__hmbVideoPickerRestoringExpandedDom;
       hmbSetVideoPickerNativeResizeLocked(container, false);
       delete container.__hmbVideoPickerFixedTop;
@@ -7428,18 +7689,10 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       resizeObserver = null;
     }
     container.removeAttribute?.("data-hmb-video-picker-compact-sizing-pending");
-    if (
-      !pickerExpanded
-      && container.__hmbVideoPickerViewTransition !== true
-      && container.__hmbVideoPickerCleanupProxyRecovering !== true
-    ) {
-      hmbRestoreVideoPickerExpandedGeometry(
-        container,
-        container.__hmbVideoPickerExpandedGeometry,
-        { shellOnly: true },
-      );
+    if (!pickerExpanded && container.__hmbVideoPickerViewTransition !== true) {
+      // The native shell is stable across compact cleanup/remount. Restoring
+      // an expanded snapshot here creates the 1200↔158 allocator oscillation.
       hmbSetVideoPickerNativeResizeLocked(container, false);
-      hmbRequestVideoPickerNodeInternalsUpdate(container);
     }
     container.removeAttribute?.("data-hmb-node-delete-protected");
     if (container.__hmbVideoPickerCleanup === cleanup) delete container.__hmbVideoPickerCleanup;
@@ -7820,9 +8073,8 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     hmbApplyVideoPickerCompactHostSizing(container, state);
     hmbInstallVideoPickerCompactHostSizing(container, activeCleanup, props || {}, state);
   }
-  if (container.__hmbVideoPickerViewTransition !== true) {
-    hmbRequestVideoPickerNodeInternalsUpdate(container, props || {});
-  }
+  // Node internals publish is deferred to the single settled scheduler below;
+  // never expose the pre-fit mount frame to the host allocator.
   const replacementViewportVideo = container.querySelector("#picker-video");
   if (
     retainedViewportVideo
@@ -8235,6 +8487,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
         value: currentWidgetState(),
       };
       container.__hmbVideoPickerViewTransition = true;
+      hmbCancelVideoPickerNodeInternalsUpdate(container);
       try {
         if (!targetExpanded) {
           const geometry = hmbCaptureVideoPickerExpandedGeometry(container)
@@ -8245,21 +8498,29 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
           for (const videoElement of container.querySelectorAll?.("video") || []) videoElement.pause?.();
           // Keep the authored root/header mounted. Cleanup releases listeners;
           // the next factory call morphs only the mode-specific descendants.
-          container.__hmbVideoPickerExpanded = false;
+          hmbRememberVideoPickerViewMode(container, false);
           cleanup();
+          hmbRestoreVideoPickerExpandedGeometry(
+            container,
+            container.__hmbVideoPickerCompactOuterGeometry,
+            { shellOnly: true },
+          );
           hmbRestoreVideoPickerCompactHostGeometry(container.__hmbVideoPickerCompactHostGeometry);
           HMBVideoPickerLibraryWidget(container, liveProps);
           hmbSyncVideoPickerHostMeasurement(container, liveProps.value, false);
-          hmbRequestVideoPickerNodeInternalsUpdate(container, liveProps);
           return;
         }
 
         const geometry = container.__hmbVideoPickerExpandedGeometry || null;
         const expandedViewState = container.__hmbVideoPickerExpandedViewState || null;
+        // Capture the host's final compact bound immediately before expansion;
+        // the reverse transition restores exactly this native/adaptive bound,
+        // never the authored 158px row height.
+        container.__hmbVideoPickerCompactOuterGeometry = hmbCaptureVideoPickerExpandedGeometry(container);
         // Switch ownership before stopping compact sizing so every queued RAF is
         // a no-op. The root itself remains mounted and no React Flow position or
         // viewport transform is read or written.
-        container.__hmbVideoPickerExpanded = true;
+        hmbRememberVideoPickerViewMode(container, true);
         hmbRestoreVideoPickerExpandedGeometry(container, geometry, { shellOnly: true });
         cleanup();
         HMBVideoPickerLibraryWidget(container, liveProps);
@@ -8273,10 +8534,15 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
         // that order. Intermediate allocator notifications can otherwise pan
         // the canvas on one host and remove the visible row on another.
         hmbSyncVideoPickerHostMeasurement(container, liveProps.value, true);
-        hmbRequestVideoPickerNodeInternalsUpdate(container, liveProps);
         hmbRestorePickerViewState(container, expandedViewState);
       } finally {
         delete container.__hmbVideoPickerViewTransition;
+        hmbScheduleVideoPickerNodeInternalsUpdate(container, liveProps, {
+          stateValue: liveProps.value,
+          expanded: targetExpanded,
+          force: true,
+          afterTransition: true,
+        });
         clearPickerViewTransitionFeedback();
       }
     });
@@ -8469,6 +8735,12 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       // vice versa), then coalesce the host-internals notification next frame.
       hmbApplyVideoPickerCompactHostSizing(container, nextState);
       container.__hmbScheduleVideoPickerCompactHostSizing?.(nextState);
+      hmbScheduleVideoPickerNodeInternalsUpdate(container, props || {}, {
+        stateValue: nextState,
+        expanded: false,
+      });
+    } else {
+      schedulePickerFit(false);
     }
     return nextState;
   };
@@ -8681,7 +8953,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     // remount the same view from the newest authoritative props.  Expanded
     // recovery deliberately discards a stale transition cache; the fixed top
     // is adopted into the fresh full dashboard by the normal factory path.
-    container.__hmbVideoPickerExpanded = pickerExpanded;
+    hmbRememberVideoPickerViewMode(container, pickerExpanded);
     delete container.__hmbVideoPickerRestoringExpandedDom;
     if (pickerExpanded) delete container.__hmbVideoPickerExpandedCache;
     container.__hmbVideoPickerRootRecoveryCount = Number(
@@ -8776,7 +9048,12 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     } else {
       hmbApplyVideoPickerCompactHostSizing(container, visibleState);
       container.__hmbScheduleVideoPickerCompactHostSizing?.(visibleState);
+      hmbScheduleVideoPickerNodeInternalsUpdate(container, nextProps || props || {}, {
+        stateValue: visibleState,
+        expanded: false,
+      });
     }
+    if (pickerExpanded) schedulePickerFit(false);
     container.__hmbPickerRegionalUpdateCount = Number(container.__hmbPickerRegionalUpdateCount || 0) + 1;
     return true;
   };
@@ -10292,9 +10569,13 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
         return;
       }
       if (!pickerExpanded) {
-        hmbApplyVideoPickerCompactHostSizing(container, currentWidgetState());
+        const fittedState = currentWidgetState();
+        hmbApplyVideoPickerCompactHostSizing(container, fittedState);
         container.removeAttribute?.("data-hmb-video-picker-compact-sizing-pending");
-        hmbRequestVideoPickerNodeInternalsUpdate(container, props || {});
+        hmbScheduleVideoPickerNodeInternalsUpdate(container, props || {}, {
+          stateValue: fittedState,
+          expanded: false,
+        });
         return;
       }
       const liveShell = shellForResizeSync || findReactFlowNode(container);
@@ -10316,6 +10597,10 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       } finally {
         resizeApplying = false;
       }
+      hmbScheduleVideoPickerNodeInternalsUpdate(container, props || {}, {
+        stateValue: currentWidgetState(),
+        expanded: true,
+      });
     };
     resizeFrame = raf(() => {
       if (settle) resizeFrame = raf(apply);
@@ -10329,6 +10614,10 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       container,
       shellForResizeSync,
     );
+    hmbScheduleVideoPickerNodeInternalsUpdate(container, props || {}, {
+      stateValue: currentWidgetState(),
+      expanded: true,
+    });
   } else {
     delete container.__hmbPickerFitSignature;
   }

@@ -216,14 +216,22 @@ PLAYBLAST_RESOLUTIONS = (
     (1920, 1080),
 )
 PICKER_START_WIDTH = 1400
+# Expanded mode keeps the established production canvas.  It is no longer the
+# native cold-mount size: exposing 1200px while the widget is still mounting in
+# compact mode makes React Flow re-fit the entire workspace before the 158px
+# compact row can be measured.
 PICKER_START_HEIGHT = 1200
-PICKER_NATIVE_SIZE_VERSION = 3
-# Version 3 repairs only the invalid outer-node heights written by the retired
-# compact-mode sizing path. Widths that still satisfy the native resize floor
-# are user-owned and remain unchanged during that one-time migration.
+PICKER_NATIVE_SIZE_VERSION = 4
+PICKER_EXPANDED_SIZE_METADATA_KEY = "hmb_picker_expanded_size"
 PICKER_WIDGET_MIN_WIDTH = 760
-# Keep the established resize floor separate from the new-node start height.
-# Existing workflows may legitimately contain a manually resized 1151px node.
+# The compact outer node must be tall enough for Griptape's title, Flow rows,
+# and one 158px Picker parameter row before the JavaScript controller mounts.
+# Unlike the old 158px outer size, this remains visible to the host allocator.
+PICKER_COMPACT_NATIVE_HEIGHT = 360
+PICKER_COMPACT_NATIVE_MIN_HEIGHT = PICKER_COMPACT_NATIVE_HEIGHT
+# Keep the established expanded resize floor separate from the compact native
+# bootstrap. Existing workflows may legitimately contain a manually resized
+# 1151px expanded node; v4 stores that geometry independently.
 PICKER_WIDGET_MIN_HEIGHT = 1151
 # Griptape Nodes 0.122 measures custom-widget rows before their JavaScript
 # factory is mounted.  Advertising the expanded dashboard height (1200px) for
@@ -234,9 +242,8 @@ PICKER_WIDGET_MIN_HEIGHT = 1151
 # replaces it with the exact state-derived compact height after mounting and
 # restores ``PICKER_WIDGET_MIN_HEIGHT`` itself when its full view opens.
 PICKER_WIDGET_COMPACT_MOUNT_HEIGHT = 158
-# Use the same new-node outer sizing contract as HMBImageAssetLibrary. The
-# native node and full-width custom dashboard begin from one shared frame.
-PICKER_WIDGET_START_HEIGHT = PICKER_START_HEIGHT
+# This is the authored parameter-row height, not the React Flow outer height.
+PICKER_WIDGET_START_HEIGHT = PICKER_WIDGET_COMPACT_MOUNT_HEIGHT
 READ_OVERALL_TIMEOUT_SECONDS = 900
 READ_STALL_TIMEOUT_SECONDS = 180
 PLAYBLAST_OVERALL_TIMEOUT_SECONDS = 7200
@@ -9280,9 +9287,9 @@ def _configure_picker_widget_parameter(parameter: Any) -> None:
             "default_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
             "initial_width": PICKER_START_WIDTH,
             "initial_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
-            "node_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
-            "default_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
-            "initial_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
+            "node_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
+            "default_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
+            "initial_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
             # The HMB widget owns compact/expanded mode through its internal
             # double-click controller.  Griptape's host-level expandable row
             # allocator must stay disabled; otherwise a cold mount can move
@@ -9349,9 +9356,9 @@ def _add_picker_widget(node: Any) -> None:
             "default_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
             "initial_width": PICKER_START_WIDTH,
             "initial_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
-            "node_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
-            "default_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
-            "initial_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
+            "node_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
+            "default_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
+            "initial_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
             # Compact/expanded mode is owned by the custom widget.  Keeping
             # host adaptive expansion disabled guarantees that the state row
             # remains mounted during cold load, reload, and mode transitions.
@@ -11520,123 +11527,147 @@ def _copy_video_to_griptape_project(
     return _video_artifact_value(macro_path, metadata), macro_path
 
 
-def _restored_picker_native_size(
-    serialized_metadata: Any,
-) -> tuple[Dict[str, Any], bool]:
-    """Return the saved native size after the versioned compact-height repair.
+def _normalized_picker_native_dimension(value: Any) -> Optional[Any]:
+    """Return one finite positive JSON dimension without accepting booleans."""
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(numeric) or numeric <= 0:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    return int(numeric) if numeric.is_integer() else numeric
 
-    Compact mode formerly copied its small widget height into React Flow's
-    outer-node ``metadata.size``. Griptape then restored a node too short to
-    mount any of the three Picker rows. Only pre-v3 positive heights below the
-    supported resize floor are invalid. A valid user width is retained, while
-    an invalid/missing width falls back to the production start width.
+
+def _normalized_picker_native_size(
+    value: Any,
+    *,
+    minimum_height: int,
+) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    width = _normalized_picker_native_dimension(value.get("width"))
+    height = _normalized_picker_native_dimension(value.get("height"))
+    if width is None or height is None:
+        return {}
+    if float(width) < PICKER_WIDGET_MIN_WIDTH or float(height) < minimum_height:
+        return {}
+    return {"width": width, "height": height}
+
+
+def _restored_picker_native_geometry(
+    serialized_metadata: Any,
+) -> tuple[Dict[str, Any], Dict[str, Any], bool]:
+    """Split cold compact geometry from the saved expanded user geometry.
+
+    v3 used one ``metadata.size`` field for two incompatible owners: Python
+    advertised 1400x1200 while the compact widget measured a 158px row.  That
+    transient 1200 -> 158 disagreement made React Flow auto-fit the workspace
+    and could collapse all three Picker parameters before the live controller
+    mounted.  v4 always hydrates the native node at one stable 1400x360 compact
+    size.  Any valid expanded size is retained independently and can only be
+    applied by an explicit full-view transition.
     """
-    if not isinstance(serialized_metadata, dict):
-        return {}, False
-    raw_size = serialized_metadata.get("size")
-    if not isinstance(raw_size, dict):
-        return {}, False
-    restored_size = dict(raw_size)
+    metadata = serialized_metadata if isinstance(serialized_metadata, dict) else {}
+    raw_size = metadata.get("size")
+    saved_expanded_size = _normalized_picker_native_size(
+        metadata.get(PICKER_EXPANDED_SIZE_METADATA_KEY),
+        minimum_height=PICKER_WIDGET_MIN_HEIGHT,
+    )
+    raw_expanded_size = _normalized_picker_native_size(
+        raw_size,
+        minimum_height=PICKER_WIDGET_MIN_HEIGHT,
+    )
+    # A workflow saved while the full dashboard was visible has the latest
+    # user resize in metadata.size. It takes precedence over the prior v4
+    # expanded snapshot; compact or corrupt raw sizes never erase that snapshot.
+    expanded_size = raw_expanded_size or saved_expanded_size or {
+        "width": PICKER_START_WIDTH,
+        "height": PICKER_START_HEIGHT,
+    }
+    compact_size = {
+        "width": PICKER_START_WIDTH,
+        "height": PICKER_COMPACT_NATIVE_HEIGHT,
+    }
     try:
         native_size_version = max(
             0,
-            int(float(serialized_metadata.get("hmb_picker_native_size_version") or 0)),
+            int(float(metadata.get("hmb_picker_native_size_version") or 0)),
         )
     except (TypeError, ValueError, OverflowError):
         native_size_version = 0
-    try:
-        saved_width = float(restored_size.get("width") or 0)
-        saved_height = float(restored_size.get("height") or 0)
-    except (TypeError, ValueError, OverflowError):
-        return restored_size, False
-    should_repair = (
-        native_size_version < PICKER_NATIVE_SIZE_VERSION
-        and math.isfinite(saved_height)
-        and 0 < saved_height < PICKER_WIDGET_MIN_HEIGHT
+    current_compact_size = _normalized_picker_native_size(
+        raw_size,
+        minimum_height=PICKER_COMPACT_NATIVE_MIN_HEIGHT,
     )
-    if not should_repair:
-        return restored_size, False
-    safe_width = (
-        restored_size.get("width")
-        if math.isfinite(saved_width) and saved_width >= PICKER_WIDGET_MIN_WIDTH
-        else PICKER_START_WIDTH
+    canonical = (
+        native_size_version == PICKER_NATIVE_SIZE_VERSION
+        and current_compact_size == compact_size
+        and saved_expanded_size == expanded_size
     )
-    return {
-        "width": safe_width,
-        "height": PICKER_START_HEIGHT,
-    }, True
+    return compact_size, expanded_size, not canonical
+
+
+def _restored_picker_native_size(
+    serialized_metadata: Any,
+) -> tuple[Dict[str, Any], bool]:
+    """Compatibility wrapper returning the v4 cold-mount compact geometry."""
+    compact_size, _expanded_size, migrated = _restored_picker_native_geometry(
+        serialized_metadata
+    )
+    return compact_size, migrated
 
 
 class HMBVideoPickerLibrary(DataNode):
     def __init__(self, **kwargs: Any):
         serialized_metadata = kwargs.get("metadata")
-        restored_size, restored_size_migrated = _restored_picker_native_size(
+        compact_size, expanded_size, _size_migrated = _restored_picker_native_geometry(
             serialized_metadata
         )
-        super().__init__(**kwargs)
-        if restored_size:
-            current_metadata = dict(getattr(self, "metadata", {}) or {})
-            current_metadata["size"] = restored_size
-            if restored_size_migrated:
-                current_metadata["hmb_picker_native_size_version"] = (
-                    PICKER_NATIVE_SIZE_VERSION
-                )
-            self.metadata = current_metadata
+        # Prepare v4 metadata before DataNode/React Flow sees it. Passing the
+        # serialized 1200px expanded size through ``super`` even briefly is the
+        # load-time race this migration removes.
+        prepared_metadata = (
+            dict(serialized_metadata) if isinstance(serialized_metadata, dict) else {}
+        )
+        prepared_metadata["size"] = dict(compact_size)
+        prepared_metadata[PICKER_EXPANDED_SIZE_METADATA_KEY] = dict(expanded_size)
+        prepared_metadata["hmb_picker_native_size_version"] = PICKER_NATIVE_SIZE_VERSION
+        prepared_kwargs = dict(kwargs)
+        prepared_kwargs["metadata"] = prepared_metadata
+        super().__init__(**prepared_kwargs)
+        current_metadata = dict(getattr(self, "metadata", {}) or {})
+        current_metadata.update(prepared_metadata)
+        self.metadata = current_metadata
         self.category = "HMB_GP_Production"
         self.description = (
             "Maya cut reader, Color Pick assignment editor, append-only video "
             "asset history, and Color/Depth/Motion playblast generator."
         )
-        # Griptape reads native React Flow dimensions from metadata["size"].
-        # This fills a missing size and repairs only the legacy compact-height
-        # corruption above. Valid restored/user-resized nodes keep their saved
-        # dimensions while new nodes start at the production frame.
-        saved_size: Dict[str, Any] = {}
-        has_saved_size = False
-        try:
-            metadata = dict(getattr(self, "metadata", {}) or {})
-            saved_size_value = metadata.get("size")
-            try:
-                has_saved_size = (
-                    isinstance(saved_size_value, dict)
-                    and float(saved_size_value.get("width") or 0) > 0
-                    and float(saved_size_value.get("height") or 0) > 0
-                )
-            except (TypeError, ValueError):
-                has_saved_size = False
-            if has_saved_size:
-                saved_size = saved_size_value
-            initial_size_setter = getattr(self, "set_initial_node_size", None)
-            if not has_saved_size and callable(initial_size_setter):
-                initial_size_setter(width=PICKER_START_WIDTH, height=PICKER_START_HEIGHT)
-            elif not has_saved_size:
-                metadata.setdefault("size", {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT})
-                self.metadata = metadata
-            metadata = getattr(self, "metadata", None)
-            if isinstance(metadata, dict):
-                # Mark the current contract after the one-time compact-height
-                # repair. Valid user-resized nodes retain their exact size.
-                metadata["hmb_picker_native_size_version"] = PICKER_NATIVE_SIZE_VERSION
-        except Exception as exc:
-            _diagnostic_exception("Native picker initial size registration failed", exc)
+        # Node ui_options describe only the cold/reload compact shell. Expanded
+        # geometry remains in metadata and is applied solely by the widget's
+        # explicit full-view controller.
         self.ui_options = {
             "width": PICKER_START_WIDTH,
-            "height": PICKER_START_HEIGHT,
+            "height": PICKER_COMPACT_NATIVE_HEIGHT,
             "default_width": PICKER_START_WIDTH,
-            "default_height": PICKER_START_HEIGHT,
+            "default_height": PICKER_COMPACT_NATIVE_HEIGHT,
             "preferred_width": PICKER_START_WIDTH,
-            "preferred_height": PICKER_START_HEIGHT,
+            "preferred_height": PICKER_COMPACT_NATIVE_HEIGHT,
             "initial_width": PICKER_START_WIDTH,
-            "initial_height": PICKER_START_HEIGHT,
-            "node_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
-            "default_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
-            "initial_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
+            "initial_height": PICKER_COMPACT_NATIVE_HEIGHT,
+            "node_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
+            "default_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
+            "initial_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
             "min_width": PICKER_WIDGET_MIN_WIDTH,
-            "min_height": PICKER_WIDGET_MIN_HEIGHT,
+            "min_height": PICKER_COMPACT_NATIVE_MIN_HEIGHT,
             "resizable": True,
         }
-        self.width = saved_size.get("width") if has_saved_size else PICKER_START_WIDTH
-        self.height = saved_size.get("height") if has_saved_size else PICKER_START_HEIGHT
+        self.width = compact_size["width"]
+        self.height = compact_size["height"]
         self._hmb_video_output: Any = None
         self._hmb_node_deleted = False
         self._hmb_lifecycle_generation = 1
