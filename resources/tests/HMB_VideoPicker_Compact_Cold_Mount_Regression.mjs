@@ -118,9 +118,9 @@ globalThis.window = {
   },
 };
 
-// Cold mount regression: even a legacy 158px outer shell is host-owned. Python
-// v4 migration repairs serialized metadata before React mounts; JavaScript must
-// never rewrite the live React Flow shell itself.
+// Cold mount regression: the hidden measurement controller runs before the
+// visible widget. It must repair the old 158px outer triple or Griptape moves
+// MAYA_SCENE / HMB_PICKER_COMMAND / HMB_PICKER_STATE into "Collapsed (3)".
 const staleShell = fakeShell(158);
 staleShell.ownerDocument = document;
 staleShell.dataset.hmbVideoPickerCompactHeight = "158";
@@ -128,10 +128,10 @@ const hiddenContainer = measurementContainer(staleShell, document);
 const measurementController = picker.hmbMountVideoPickerHostMeasurement(hiddenContainer, {
   value: { picker_shots: [] },
 });
-assert.equal(staleShell.style.height, "158px");
-assert.equal(staleShell.style.minHeight, "158px");
-assert.equal(staleShell.style.maxHeight, "158px");
-assert.equal(staleShell.dataset.hmbVideoPickerCompactHeight, "158");
+assert.equal(staleShell.style.height, undefined);
+assert.equal(staleShell.style.minHeight, undefined);
+assert.equal(staleShell.style.maxHeight, undefined);
+assert.equal(staleShell.dataset.hmbVideoPickerCompactHeight, undefined);
 measurementController.cleanup();
 
 // A measurement clone must not release a valid expanded/user geometry.

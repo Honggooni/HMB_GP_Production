@@ -214,7 +214,7 @@ const pickerContainer = fakeElement(innerHost, "picker-container");
 
 picker.hmbNormalizePickerHostAncestors(pickerContainer);
 for (const host of [innerHost, outerHost]) {
-  assert.equal(host.style.minWidth, undefined, "Picker must not touch host wrapper geometry.");
+  assert.equal(host.style.minWidth, "0");
   assert.equal(host.style.width, undefined, "Picker must not overwrite Griptape-owned wrapper width.");
   assert.equal(host.style.height, undefined, "Picker must not overwrite Griptape-owned wrapper height.");
   assert.equal(host.style.flex, undefined, "Picker must not overwrite Griptape-owned wrapper flex allocation.");
@@ -342,15 +342,13 @@ startContainer.querySelector = (selector) => {
   return null;
 };
 startContainer.getBoundingClientRect = () => ({ top: 260, bottom: 1220, height: 960 });
-const widgetRequiredHeight = picker.hmbStretchPickerAdaptiveStack(startContainer, null, startShell);
 assert.equal(
-  widgetRequiredHeight,
+  picker.hmbStretchPickerAdaptiveStack(startContainer, null, startShell),
   1071,
   "Picker uses one exact Prompt-style dashboard frame without reserving the removed 34px footer.",
 );
-assert.equal(startContainer.style.minHeight, "1071px");
-for (const host of [startInnerHost, startOuterHost]) {
-  assert.equal(host.style.minHeight, undefined, "Picker sizing must stop at its own widget container.");
+for (const host of [startContainer, startInnerHost, startOuterHost]) {
+  assert.equal(host.style.minHeight, "1071px");
 }
 assert.equal(startClip.style.height, "1071px");
 assert.equal(startClip.style.minHeight, "1071px");
@@ -364,8 +362,9 @@ assert.equal(
   "Sizing the Prompt-style inner frame must not overwrite the outer node during host propagation.",
 );
 
-// Outer shell size is host-owned. Identical widget content must therefore
-// produce the same internal frame regardless of the current canvas node size.
+// With no visible native row above the Picker, the established 1200px shell
+// must be fully occupied by the dashboard instead of leaving the former
+// 960px-content / 240px-dead-strip split.
 const fullStartShell = fakeElement(null, "react-flow__node");
 fullStartShell.offsetHeight = 1200;
 fullStartShell.getBoundingClientRect = () => ({ top: 0, bottom: 1200, height: 1200 });
@@ -379,13 +378,14 @@ fullStartContainer.querySelector = (selector) => {
   if (selector === ".hmbvp") return fullStartPicker;
   return null;
 };
-assert.equal(picker.hmbStretchPickerAdaptiveStack(fullStartContainer, null, fullStartShell), widgetRequiredHeight);
-assert.equal(fullStartContainer.style.minHeight, `${widgetRequiredHeight}px`);
-assert.equal(fullStartClip.style.height, `${widgetRequiredHeight}px`);
-assert.equal(fullStartPicker.style.height, `${widgetRequiredHeight}px`);
+assert.equal(picker.hmbStretchPickerAdaptiveStack(fullStartContainer, null, fullStartShell), 1200);
+assert.equal(fullStartContainer.style.minHeight, "1200px");
+assert.equal(fullStartClip.style.height, "1200px");
+assert.equal(fullStartPicker.style.height, "1200px");
 assert.equal(fullStartShell.style.height, undefined, "Inner fill must not rewrite the 1200px outer size.");
 
-// A different serialized shell size likewise cannot affect the widget frame.
+// A serialized manual resize at the established 1151px floor remains exact;
+// filling available space must not behave like a start-size migration.
 const savedResizeShell = fakeElement(null, "react-flow__node");
 savedResizeShell.offsetHeight = 1151;
 savedResizeShell.getBoundingClientRect = () => ({ top: 0, bottom: 1151, height: 1151 });
@@ -399,10 +399,10 @@ savedResizeContainer.querySelector = (selector) => {
   if (selector === ".hmbvp") return savedResizePicker;
   return null;
 };
-assert.equal(picker.hmbStretchPickerAdaptiveStack(savedResizeContainer, null, savedResizeShell), widgetRequiredHeight);
-assert.equal(savedResizeContainer.style.minHeight, `${widgetRequiredHeight}px`);
-assert.equal(savedResizeClip.style.height, `${widgetRequiredHeight}px`);
-assert.equal(savedResizePicker.style.height, `${widgetRequiredHeight}px`);
+assert.equal(picker.hmbStretchPickerAdaptiveStack(savedResizeContainer, null, savedResizeShell), 1151);
+assert.equal(savedResizeContainer.style.minHeight, "1151px");
+assert.equal(savedResizeClip.style.height, "1151px");
+assert.equal(savedResizePicker.style.height, "1151px");
 assert.equal(savedResizeShell.style.height, undefined, "Saved 1151px outer height must remain user-owned.");
 
 const commandBridge = await importWidget("../../widgets/HMBVideoPickerCommandBridgeWidget_v032.js");
@@ -430,9 +430,9 @@ const commandParameterRow = fakeElement(commandLayoutRow, "parameter-row", {
 });
 const commandHost = fakeElement(commandParameterRow, "widget-host");
 const commandContainer = fakeElement(commandHost, "command-container");
-assert.equal(commandBridge.hmbCollapseCommandBridgeLayoutRow(commandContainer), 0);
-assert.equal(commandLayoutRow.style.height, "40px");
-assert.equal(collapsedPickerShell.__hmbPickerCommandRowReclaim, undefined);
+assert.equal(commandBridge.hmbCollapseCommandBridgeLayoutRow(commandContainer), 40);
+assert.equal(commandLayoutRow.style.height, "0px");
+assert.equal(collapsedPickerShell.__hmbPickerCommandRowReclaim, 40);
 
 const stateLayoutRow = fakeElement(adaptiveStack, "adaptive-row");
 stateLayoutRow.getBoundingClientRect = () => ({ top: 180, height: 760 });
@@ -451,21 +451,23 @@ const stateParameterRow = fakeElement(stateLayoutRow, "parameter-row", {
 const stateHost = fakeElement(stateParameterRow, "widget-host");
 const stateContainer = fakeElement(stateHost, "picker-container");
 const trailingSpacer = fakeElement(adaptiveStack, "grow", { "aria-hidden": "true" });
-assert.equal(picker.hmbApplyPickerCommandRowReclaim(stateContainer), 0);
-assert.equal(stateLayoutRow.style.height, "700px");
-assert.equal(stateLayoutRow.style.position, "absolute");
-assert.equal(stateLayoutRow.style.top, "160px");
-assert.equal(stateLayoutRow.style.left, "0px");
-assert.equal(stateLayoutRow.style.right, "0px");
-assert.equal(stateLayoutRow.style.bottom, "0px");
-assert.equal(stateLayoutRow.style.width, "auto");
-assert.equal(stateLayoutRow.style.margin, "0px");
+assert.equal(picker.hmbApplyPickerCommandRowReclaim(stateContainer), 1);
+assert.equal(stateLayoutRow.style.height, undefined);
+assert.equal(stateLayoutRow.style.maxHeight, undefined);
+assert.equal(stateLayoutRow.style.flex, undefined);
+assert.equal(stateLayoutRow.style.position, undefined);
+assert.equal(stateLayoutRow.style.top, undefined);
+assert.equal(stateLayoutRow.style.left, undefined);
+assert.equal(stateLayoutRow.style.right, undefined);
+assert.equal(stateLayoutRow.style.bottom, undefined);
+assert.equal(stateLayoutRow.style.width, undefined);
+assert.equal(stateLayoutRow.style.margin, undefined);
 assert.equal(stateParameterRow.style.height, undefined);
 assert.equal(adaptiveStack.style.height, undefined);
 assert.equal(contentRegion.style.height, undefined);
 assert.equal(nodeBody.style.height, undefined);
-assert.equal(trailingSpacer.style.height, undefined);
-assert.equal(trailingSpacer.style.flex, undefined);
+assert.equal(trailingSpacer.style.height, "0px");
+assert.equal(trailingSpacer.style.flex, "0 0 0px");
 const stableRequiredHeight = picker.hmbStretchPickerAdaptiveStack(
   stateContainer,
   stateLayoutRow,
@@ -475,14 +477,23 @@ assert.ok(
   stableRequiredHeight >= 960,
   "Stable sizing preserves the v0.2.0 natural content floor.",
 );
-assert.equal(stateContainer.style.minHeight, `${stableRequiredHeight}px`);
-for (const host of [stateHost, stateParameterRow, adaptiveStack, contentRegion, nodeBody]) {
-  assert.equal(host.style.minHeight, undefined, "Picker must not resize host-owned ancestors.");
+for (const host of [
+  stateContainer,
+  stateHost,
+  stateParameterRow,
+  stateLayoutRow,
+  adaptiveStack,
+  contentRegion,
+  nodeBody,
+]) {
+  assert.equal(host.style.minHeight, `${stableRequiredHeight}px`);
+  assert.equal(host.style.height, undefined, "Natural-height sizing must not force a fixed wrapper height.");
+  assert.equal(host.style.flex, undefined, "Natural-height sizing must not force a fixed wrapper flex basis.");
 }
 assert.equal(
   picker.hmbApplyPickerCommandRowReclaim(stateContainer),
-  0,
-  "Command-row reclaim remains a strict no-op.",
+  1,
+  "Repeated command-row collapse remains idempotent.",
 );
 
 const mayaLayoutRow = fakeElement(adaptiveStack, "adaptive-row");
@@ -503,12 +514,12 @@ collapsedPickerShell.querySelectorAll = (selector) => (
 );
 assert.equal(
   picker.hmbCollapseNativeMayaLayoutRows(stateContainer),
-  0,
-  "Python hides MAYA_SCENE; the browser widget must not collapse host rows.",
+  1,
+  "The complete hidden native MAYA_SCENE layout branch must be collapsed.",
 );
-assert.equal(mayaLayoutRow.style.height, undefined);
-assert.equal(mayaLayoutRow.style.flex, undefined);
-assert.equal(mayaLayoutRow.style.margin, undefined);
+assert.equal(mayaLayoutRow.style.height, "0px");
+assert.equal(mayaLayoutRow.style.flex, "0 0 0px");
+assert.equal(mayaLayoutRow.style.margin, "0");
 
 const prompt = await importWidget("../../widgets/HMBPromptLibraryScopedBindingWidget.js");
 const assetOnlyPromptState = prompt.normalizeState({

@@ -58,18 +58,15 @@ for (const relativePath of [
   const module = await loadWidget(relativePath);
   const guard = module.hmbGuardSelectedNodeKeyboardDelete;
   assert.equal(typeof guard, "function", `${relativePath} must export its delete guard`);
-  const pickerOwnsNoCanvasKeyboard = relativePath.endsWith("HMBVideoPickerLibraryWidget_v032.js");
 
   for (const key of ["Backspace", "Delete"]) {
     const sample = keyboardEvent(key);
-    assert.equal(
-      guard({ parentElement: nodeRoot(true) }, sample.event),
-      !pickerOwnsNoCanvasKeyboard,
-      `${relativePath}: ${key}`,
-    );
-    assert.deepEqual(sample.calls, pickerOwnsNoCanvasKeyboard
-      ? { preventDefault: 0, stopPropagation: 0, stopImmediatePropagation: 0 }
-      : { preventDefault: 1, stopPropagation: 1, stopImmediatePropagation: 1 });
+    assert.equal(guard({ parentElement: nodeRoot(true) }, sample.event), true, `${relativePath}: ${key}`);
+    assert.deepEqual(sample.calls, {
+      preventDefault: 1,
+      stopPropagation: 1,
+      stopImmediatePropagation: 1,
+    });
   }
 
   const unselected = keyboardEvent("Delete");

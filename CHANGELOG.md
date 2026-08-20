@@ -1,13 +1,5 @@
 # Changelog
 
-## `v0.6.38` — 2026-08-20
-
-- Removed VideoPicker's remaining React Flow and workspace-canvas coupling.
-  The widget no longer rewrites outer-node or adaptive-row geometry, requests
-  node-internals updates, intercepts canvas gestures, or stores command state
-  on React Flow DOM. Compact/expanded layout is now contained inside the
-  authored widget, and commands use a runtime-ID registry.
-
 ## `v0.6.37` — 2026-08-20
 
 - Fixed the VideoPicker workspace-viewport hotfix path so cold load, reload,
