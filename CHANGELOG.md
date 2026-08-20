@@ -1,5 +1,10 @@
 # Changelog
 
+## `v0.6.40` — 2026-08-20
+
+- Reissued the exact v0.6.37 production code and behavior under the v0.6.40
+  release identity. No functional changes from v0.6.37 are included.
+
 ## `v0.6.37` — 2026-08-20
 
 - Fixed the VideoPicker workspace-viewport hotfix path so cold load, reload,
