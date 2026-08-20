@@ -32,7 +32,9 @@ jobs:
             $_ -match '(^|/)\.env($|\.)' -or
             $_ -match '(^|/)(credentials|secrets)[^/]*\.json$' -or
             $_ -match '(^|/)(id_rsa|id_ed25519)[^/]*$' -or
-            $_ -match '\.(dat|jwk|key|p12|pem|pfx|secret|token|zip)$'
+            $_ -match '\.(dat|jwk|key|p12|pfx|secret|token|zip)$' -or
+            ($_ -match '\.pem$' -and
+              $_ -ne 'resources/tls/hmb_agent_broker_ca.pem')
           })
           if ($forbidden.Count -ne 0) {
             throw "Forbidden private/generated tracked paths: $($forbidden -join ', ')"
