@@ -14,7 +14,7 @@ from _hmb_private_policy_fixture import read_private_policy_fixture_if_available
 
 ROOT = Path(__file__).resolve().parents[2]
 PRODUCTION_CONTRACT_SHA256 = (
-    "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
+    "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
 )
 
 
@@ -47,31 +47,43 @@ if private_encoded is not None:
         PRODUCTION_CONTRACT_SHA256
     )
 
-shared_clauses = (
-    "SYNTHETIC STABLE CONTRACT CLAUSE ALPHA.",
-    "SYNTHETIC STABLE CONTRACT CLAUSE BETA.",
+shared_clauses = tuple(
+    f"{marker} SYNTHETIC STABLE CONTRACT CLAUSE {index}."
+    for index, marker in enumerate(common._AGENT_POLICY_SHARED_MARKERS, start=1)
 )
 synthetic_contract_sha256 = self_hash("\n\n".join(shared_clauses))
 synthetic_policy = "\n\n".join(
     (
         "Behavior 1",
         "1. PROJECT_SYNTHETIC_ONE\n\nSynthetic project rule one.\n\n"
-        + shared_clauses[0],
-        "2. PROJECT_SYNTHETIC_TWO\n\nSynthetic project rule two.\n\n"
+        + shared_clauses[0]
+        + "\n\n"
         + shared_clauses[1],
-        "3. PROJECT_SYNTHETIC_THREE\n\nSynthetic project rule three.",
-        "4. PROJECT_SYNTHETIC_FOUR\n\nSynthetic project rule four.",
+        "2. PROJECT_SYNTHETIC_TWO\n\nSynthetic project rule two.\n\n"
+        + shared_clauses[2]
+        + "\n\n"
+        + shared_clauses[3],
+        "3. PROJECT_SYNTHETIC_THREE\n\nSynthetic project rule three.\n\n"
+        + shared_clauses[4],
+        "4. PROJECT_SYNTHETIC_FOUR\n\nSynthetic project rule four.\n\n"
+        + shared_clauses[5],
     )
 )
 synthetic_binding = "\n\n".join(
     (
         "Behavior 2",
         "1. SHOT_SYNTHETIC_ONE\n\nSynthetic shot rule one.\n\n"
-        + shared_clauses[0],
-        "2. SHOT_SYNTHETIC_TWO\n\nSynthetic shot rule two.\n\n"
+        + shared_clauses[0]
+        + "\n\n"
         + shared_clauses[1],
-        "3. SHOT_SYNTHETIC_THREE\n\nSynthetic shot rule three.",
-        "4. SHOT_SYNTHETIC_FOUR\n\nSynthetic shot rule four.",
+        "2. SHOT_SYNTHETIC_TWO\n\nSynthetic shot rule two.\n\n"
+        + shared_clauses[2]
+        + "\n\n"
+        + shared_clauses[3],
+        "3. SHOT_SYNTHETIC_THREE\n\nSynthetic shot rule three.\n\n"
+        + shared_clauses[4],
+        "4. SHOT_SYNTHETIC_FOUR\n\nSynthetic shot rule four.\n\n"
+        + shared_clauses[5],
     )
 )
 baseline_payload = {
@@ -83,7 +95,7 @@ baseline_payload = {
     "final_policy_version": "2026-08-11.synthetic-policy.v4.1",
     "final_motion_look_policy_clauses": list(shared_clauses),
     "final_motion_look_policy_sha256": synthetic_contract_sha256,
-    "video_appearance_isolation_clauses": [shared_clauses[1]],
+    "video_appearance_isolation_clauses": list(shared_clauses[2:4]),
 }
 
 
@@ -170,20 +182,39 @@ try:
         synthetic_contract_sha256
     )
 
-    # No process cache: the next execution sees the next atomically replaced
-    # server envelope and reports that envelope's actual audit identity.
+    # The Broker may atomically publish either trusted revision to a newly
+    # launched process.  Verify each candidate at the transport boundary; an
+    # already bootstrapped process deliberately remains on its one snapshot.
     reads = iter((revision_a, revision_b))
-    real_envelope_reader = common._read_agent_policy_envelope
-    common._read_agent_policy_envelope = lambda: next(reads)
+    real_envelope_reader = common._fetch_agent_policy_envelope
+    common._fetch_agent_policy_envelope = lambda: next(reads)
     try:
-        loaded_a = common._load_agent_rule_payload()
-        loaded_b = common._load_agent_rule_payload()
+        loaded_a = common._fetch_verified_agent_rule_payload()
+        loaded_b = common._fetch_verified_agent_rule_payload()
     finally:
-        common._read_agent_policy_envelope = real_envelope_reader
+        common._fetch_agent_policy_envelope = real_envelope_reader
     assert loaded_a["final_policy_version"].endswith(".v4.1.1")
     assert loaded_b["final_policy_version"].endswith(".v7.2")
     assert loaded_a["envelope_sha256"] == hashlib.sha256(revision_a).hexdigest()
     assert loaded_b["envelope_sha256"] == hashlib.sha256(revision_b).hexdigest()
+
+    # One authenticated bootstrap owns an immutable process snapshot. Reads are
+    # defensive copies and never reach the Broker a second time.
+    common._agent_process_session.bootstrap_once(
+        True,
+        lambda: True,
+        lambda: dict(loaded_a),
+    )
+    common._fetch_agent_policy_envelope = lambda: (_ for _ in ()).throw(
+        AssertionError("READY session performed another Broker fetch")
+    )
+    try:
+        session_a = common._load_agent_rule_payload()
+        session_b = common._load_agent_rule_payload()
+    finally:
+        common._fetch_agent_policy_envelope = real_envelope_reader
+    assert session_a == session_b == loaded_a
+    assert session_a is not session_b
 
     # One Agent execution consumes documents and audit identity from one
     # already-verified payload snapshot, never from multiple server reads.

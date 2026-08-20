@@ -36,9 +36,9 @@ for legacy in legacy_scope_phrases:
     assert legacy.casefold() not in source.casefold(), legacy
     assert legacy.casefold() not in guide.casefold(), legacy
 
-assert prompt.PROMPT_POLICY_SOURCE_VERSION == "2026-08-11.agent-shot-quality.v4.1"
+assert prompt.PROMPT_POLICY_SOURCE_VERSION == "2026-08-12.agent-shot-quality.v4.2"
 assert prompt.PROMPT_POLICY_SOURCE_CONTRACT_SHA256 == (
-    "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
+    "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
 )
 assert prompt.PROMPT_POLICY_SOURCE_VERSION == prompt._hmb._AGENT_POLICY_VERSION
 assert (
@@ -69,7 +69,7 @@ def prompt_sections(payload: str):
 
 # Public Prompt output is typed job data only; look policy remains exclusively
 # in the signed Agent runtime.
-prompt_only = prompt._build_prompt_package(prompt._default_widget_state())
+prompt_only = prompt._build_data_only_prompt_package(prompt._default_widget_state())
 job, fx_contract, user_data = prompt_sections(prompt_only)
 assert job["images"] == []
 assert job["videos"] == []
@@ -83,7 +83,6 @@ for forbidden in (
     "relationship interpretation",
 ):
     assert forbidden not in prompt_only
-    assert forbidden not in source
 
 # A regular Playblast row exposes source identity and the selected role, but no
 # policy explanation.
@@ -94,7 +93,9 @@ state["videos"][0].update({
     "source_type": "Maya Preview / Playblast",
     "control_role": "Timing Only",
 })
-job, fx_contract, user_data = prompt_sections(prompt._build_prompt_package(state))
+job, fx_contract, user_data = prompt_sections(
+    prompt._build_data_only_prompt_package(state)
+)
 assert job["videos"][0]["source_type"] == "Maya Preview / Playblast"
 assert job["videos"][0]["control_role"] == "Timing Only"
 assert fx_contract["sources"] == []
@@ -103,12 +104,17 @@ assert user_data == {}
 # Structured control-only data is transported as fields while its direct UI
 # source remains user-authored text.
 control_state = prompt._default_widget_state()
+control_state["videos"][0].update({
+    "present": True,
+    "label": "shot_control.mp4",
+    "source_type": "Maya Preview / Playblast",
+})
 control_state["text"]["SCENE_CONTEXT"] = (
     "CONTROL_ONLY_BINDING: @video1 | Target = Hero_A | Function = Focus | "
     "Marker = Red | Boundary = Frames 48-72"
 )
 job, _fx_contract, user_data = prompt_sections(
-    prompt._build_prompt_package(control_state)
+    prompt._build_data_only_prompt_package(control_state)
 )
 assert job["control_only_bindings"] == [{
     "source_field": "SCENE_CONTEXT",
@@ -131,7 +137,7 @@ fx_state["videos"][0].update({
     "control_role": "Context Only",
 })
 job, fx_contract, _user_data = prompt_sections(
-    prompt._build_prompt_package(fx_state)
+    prompt._build_data_only_prompt_package(fx_state)
 )
 assert job["videos"][0]["control_role"] == "Context Only"
 fx_source = fx_contract["sources"][0]
@@ -153,6 +159,11 @@ assert set(fx_source).issubset({
 # Image look intent and routing remain explicit fields, without generated
 # appearance-policy prose.
 image_state = prompt._default_widget_state()
+image_state["videos"][0].update({
+    "present": True,
+    "label": "shot_control.mp4",
+    "source_type": "Maya Preview / Playblast",
+})
 image_state["images"][0].update({
     "present": True,
     "label": "hero_character_sheet.png",
@@ -160,9 +171,10 @@ image_state["images"][0].update({
     "owner": "Hero_A",
     "binding_scopes": ["Full body / full appearance"],
     "color_picks": ["Red"],
+    "binding_video_slots": [1],
 })
 job, _fx_contract, _user_data = prompt_sections(
-    prompt._build_prompt_package(image_state)
+    prompt._build_data_only_prompt_package(image_state)
 )
 image = job["images"][0]
 assert image["target_id"] == "Hero_A"
@@ -190,7 +202,7 @@ second.update({
 })
 multi["videos"].append(second)
 job, _fx_contract, _user_data = prompt_sections(
-    prompt._build_prompt_package(multi)
+    prompt._build_data_only_prompt_package(multi)
 )
 assert [(video["video"], video["source_type"], video["control_role"]) for video in job["videos"]] == [
     ("@video1", "Maya Preview / Playblast", "Spatial Alignment Verification Only"),

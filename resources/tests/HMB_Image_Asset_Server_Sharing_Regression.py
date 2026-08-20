@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import time
 from types import ModuleType, SimpleNamespace
 
 
@@ -163,6 +164,20 @@ with tempfile.TemporaryDirectory(prefix="hmb_asset_share_", dir=TEMP_ROOT) as te
     no_op_node._sync_output = lambda _state: (_ for _ in ()).throw(
         AssertionError("An unchanged manifest probe must not rebuild outputs.")
     )
+    published_states = []
+    live_state = {"value": refreshed}
+
+    def publish_without_output_rebuild(value):
+        normalized = asset_library._normalize_state(value)
+        live_state["value"] = normalized
+        published_states.append(normalized)
+        return normalized
+
+    no_op_node._publish_state = publish_without_output_rebuild
+    no_op_node._current_state = lambda: live_state["value"]
+    no_op_node._replace_import_media = lambda _media: None
+    no_op_node._scan_owner_is_current = lambda: True
+    no_op_node._hmb_import_revision = 0
     no_op_payload = dict(refreshed)
     no_op_payload["__hmb_manifest_poll_nonce"] = "poll-no-change"
     no_op_canonical = no_op_node.before_value_set(
@@ -170,9 +185,40 @@ with tempfile.TemporaryDirectory(prefix="hmb_asset_share_", dir=TEMP_ROOT) as te
         json.dumps(no_op_payload),
     )
     assert no_op_node._hmb_manifest_poll_received is True
-    assert no_op_node._hmb_manifest_poll_pending is False
-    no_op_result = no_op_node._apply_widget_state(no_op_canonical)
+    assert no_op_node._hmb_manifest_poll_pending is True
+
+    # The value-set hook performs no filesystem I/O.  The retained-mode apply
+    # schedules one worker probe, and an unchanged signature must avoid a full
+    # project scan as well as the output rebuild guarded above.
+    no_op_scan_count = [0]
+    original_scan = asset_library._scan_project_assets
+
+    def no_op_counted_scan(project_root_value):
+        no_op_scan_count[0] += 1
+        return original_scan(project_root_value)
+
+    asset_library._scan_project_assets = no_op_counted_scan
+    try:
+        scheduled = no_op_node._apply_widget_state(no_op_canonical)
+        assert scheduled["scan_busy"] is True
+        worker = no_op_node._hmb_scan_thread
+        assert worker is not None
+        worker.join(timeout=10.0)
+        assert worker.is_alive() is False
+        deadline = time.monotonic() + 2.0
+        while (
+            no_op_node._hmb_scan_pending_result is None
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert no_op_node._consume_pending_catalog_scan_result() is True
+    finally:
+        asset_library._scan_project_assets = original_scan
+    assert no_op_scan_count[0] == 0
+    no_op_result = live_state["value"]
+    assert no_op_result["scan_busy"] is False
     assert no_op_result["manifest_signature"] == refreshed["manifest_signature"]
+    assert len(published_states) == 2
 
     captured_thumbnail_bytes = []
 

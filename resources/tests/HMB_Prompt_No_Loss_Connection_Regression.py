@@ -31,29 +31,50 @@ def fallback_texts(state):
     ]
 
 
-# Structured connectors do not have verified user-authored text provenance.
-# Malformed/non-object values therefore cannot enter USER DESCRIPTION.
+# Non-HMB prose and non-object JSON remain losslessly quarantined as local
+# connector fallback state.  They never enter the private USER DESCRIPTION
+# contract, which is sourced only from the Prompt widget's authored text fields.
 raw_asset = "Use the brass key as the hero's emotional anchor"
 parsed_asset = prompt._parse_image_asset_payload(raw_asset)
-assert parsed_asset == {}
+assert parsed_asset == {
+    "__hmb_unstructured_input__": [{
+        "source": "IMAGE_ASSET_IN",
+        "reason": "readable non-JSON connected input",
+        "text": raw_asset,
+    }],
+}
 asset_state = prompt._apply_image_asset_payload(
     prompt._default_widget_state(),
     parsed_asset,
     connected=True,
 )
-assert raw_asset not in fallback_texts(asset_state)
+assert raw_asset in fallback_texts(asset_state)
 assert asset_state["image_asset"]["enabled"] is True
+assert prompt_json_section(
+    prompt._build_data_only_prompt_package(asset_state),
+    "USER DESCRIPTION DATA (JSON):",
+) == {}
 
 raw_picker = '["slow orbit", {"mood":"hesitant"}]'
 parsed_picker = prompt._parse_picker_payload(raw_picker)
-assert parsed_picker == {}
+assert parsed_picker == {
+    "__hmb_unstructured_input__": [{
+        "source": "PICKER_IN",
+        "reason": "readable non-object connected input",
+        "text": raw_picker,
+    }],
+}
 picker_state = prompt._apply_picker_payload(
     prompt._default_widget_state(),
     parsed_picker,
     connected=True,
 )
-assert "slow orbit" not in "\n".join(fallback_texts(picker_state))
+assert raw_picker in fallback_texts(picker_state)
 assert picker_state["picker"]["enabled"] is True
+assert prompt_json_section(
+    prompt._build_data_only_prompt_package(picker_state),
+    "USER DESCRIPTION DATA (JSON):",
+) == {}
 
 
 # Foreign contracts are preserved and cannot erase existing connected state.
@@ -81,9 +102,9 @@ foreign_picker = {
 foreign_result = prompt._apply_picker_payload(existing, foreign_picker, connected=True)
 assert foreign_result["videos"][0]["label"] == "manual_color"
 assert foreign_result["picker"]["run_id"] == "keep-run"
-assert "Use every reflection" not in "\n".join(fallback_texts(foreign_result))
+assert "Use every reflection" in "\n".join(fallback_texts(foreign_result))
 foreign_user = prompt_json_section(
-    prompt._build_prompt_package(foreign_result),
+    prompt._build_data_only_prompt_package(foreign_result),
     "USER DESCRIPTION DATA (JSON):",
 )
 assert foreign_user == {}
@@ -143,7 +164,7 @@ assert not any(
     for item in short_result["images"]
 )
 assert short_result["images"][0]["asset_source_uid"] == "uid-a"
-assert "a handwritten third image idea" not in fallback_texts(short_result)
+assert "a handwritten third image idea" in fallback_texts(short_result)
 
 
 # Unknown upstream scope/Color candidates stay readable and available.
@@ -179,8 +200,12 @@ custom_row = custom_result["images"][0]
 assert custom_row["asset_scope_candidate"] == "Invented cinematic scope"
 assert custom_row["asset_color_pick_candidates"] == ["Red", "Infrared dream marker"]
 fallback_blob = "\n".join(fallback_texts(custom_result))
-assert "Invented cinematic scope" not in fallback_blob
-assert "Infrared dream marker" not in fallback_blob
+assert "Invented cinematic scope" in fallback_blob
+assert "Infrared dream marker" in fallback_blob
+assert prompt_json_section(
+    prompt._build_data_only_prompt_package(custom_result),
+    "USER DESCRIPTION DATA (JSON):",
+) == {}
 
 
 # Picker refresh may replace only its auto marker, never the user's frame range.
@@ -243,8 +268,8 @@ unknown_result = prompt._apply_picker_payload(unknown_state, unknown_payload, co
 assert unknown_result["images"][0]["color_picks"] == ["Infrared dream marker"]
 
 
-# Dormant addresses and every Target are expressly available now; Prop does not
-# hardcode @video1 when the user bound a different source.
+# Dormant relationship and video addresses remain round-trippable widget state,
+# but the Agent contract publishes only currently active source addresses.
 goal_state = prompt._default_widget_state()
 goal_state["images"] = [{
     **prompt._default_image_item(1),
@@ -258,22 +283,23 @@ goal_state["images"] = [{
     "binding_video_slots": [3],
 }]
 goal_state["text"]["SCENE_CONTEXT"] = "Resolve @video5 as a dream-memory rhythm"
-goal_prompt = prompt._build_prompt_package(goal_state)
+goal_prompt = prompt._build_data_only_prompt_package(goal_state)
 goal_job = prompt_json_section(goal_prompt, "HMB JOB DATA (JSON):")
 goal_image = goal_job["images"][0]
 assert goal_image["target_id"] == "Hero hand"
-assert goal_image["relationship_targets"] == ["Door lock", "Memory echo"]
-assert goal_image["bindings"] == [{
-    "video": "@video3",
-    "marker_color": "Custom brass marker",
-    "target_scope": "Handheld prop",
-}]
+assert goal_image["relationship_targets"] == []
+assert goal_image["bindings"] == []
+assert goal_state["images"][0]["legacy_relationship_targets"] == [
+    "Door lock",
+    "Memory echo",
+]
+assert goal_state["images"][0]["binding_video_slots"] == [3]
 goal_user = prompt_json_section(goal_prompt, "USER DESCRIPTION DATA (JSON):")
 assert goal_user == {"SCENE_CONTEXT": "Resolve @video5 as a dream-memory rhythm"}
 
 malformed_text_state = prompt._default_widget_state()
 malformed_text_state["text"]["PRESERVED_TEXT"] = "free readable words\n[Future Tag] exact future phrase"
-malformed_prompt = prompt._build_prompt_package(malformed_text_state)
+malformed_prompt = prompt._build_data_only_prompt_package(malformed_text_state)
 assert prompt_json_section(
     malformed_prompt,
     "USER DESCRIPTION DATA (JSON):",

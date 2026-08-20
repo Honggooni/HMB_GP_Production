@@ -208,9 +208,10 @@ for occupied_mask in range(16):
 assert allocator_case_count == 64
 
 
-# Generated records append with new stable identities. Existing typed/manual
-# rows survive, and only the first ten selected records are exposed in the
-# transient Prompt/Generator order.
+# Generated records append with new stable identities. A same-UID staged Mask
+# is finalized once (not duplicated), existing manual rows survive, and only
+# the first ten selected records are exposed in transient Prompt/Generator
+# order.
 append_source = picker._parse_state({
     **state_with(*[manual_video(slot) for slot in AUXILIARY_SLOTS]),
     "original_enabled": False,
@@ -228,7 +229,7 @@ appended = picker._pack_selected_generation_videos(
     },
 )
 assert append_source == append_before
-assert len(appended["videos"]) == len(append_before["videos"]) + 3
+assert len(appended["videos"]) == len(append_before["videos"]) + 2
 assert [item.get("generation_role") for item in appended["videos"][-3:]] == [
     "mask", "depth", "motion_guide",
 ]
@@ -465,9 +466,11 @@ typed_reorder = picker._parse_state({
     "videos": [primary_video(), depth_video(2), motion_video(3)],
 })
 typed_reorder_source = copy.deepcopy(typed_reorder)
-typed_reorder_source["videos"][0]["selection_order"] = 3
-typed_reorder_source["videos"][1]["selection_order"] = 1
-typed_reorder_source["videos"][2]["selection_order"] = 2
+typed_reorder_source["picker_shots"][0]["selected_video_uids"] = [
+    "typed-depth-typed-auxiliary-slot-regression-bundle-2",
+    "typed-motion-typed-auxiliary-slot-regression-bundle-3",
+    "typed-mask-typed-auxiliary-slot-regression-bundle",
+]
 typed_reordered = picker._parse_state(typed_reorder_source)
 typed_payload, _typed_media = picker._build_synchronized_video_outputs(
     typed_reordered
@@ -736,7 +739,9 @@ assert any(
     "mismatched generated Depth provenance" in error
     for error in unverified_depth["picker"].get("contract_errors", [])
 )
-unverified_depth_prompt = prompt._build_prompt_package(unverified_depth)
+unverified_depth_prompt = prompt._build_data_only_prompt_package(
+    unverified_depth
+)
 unverified_lines = unverified_depth_prompt.splitlines()
 assert len(unverified_lines) == 7
 unverified_job = json.loads(

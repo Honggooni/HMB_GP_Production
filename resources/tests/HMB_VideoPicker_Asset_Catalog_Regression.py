@@ -106,25 +106,20 @@ assert not any(
 )
 
 
-# Catalog capacity and generator selection capacity are deliberately separate.
-# All twelve records survive normalization, while only the first ten ordered
-# records may be active in the Prompt/Generator snapshot.
+# One Shot owns at most ten catalog records and at most ten selected outputs.
+# Legacy overflow is rejected instead of becoming unowned global history.
 source = picker._default_widget_state()
 source["videos"] = [
     catalog_video(f"video-{index:02d}", index)
     for index in range(1, 13)
 ]
 normalized = picker._parse_state(source)
-assert len(normalized["videos"]) == 12
-assert len({item["video_uid"] for item in normalized["videos"]}) == 12
+assert len(normalized["videos"]) == 10
+assert len({item["video_uid"] for item in normalized["videos"]}) == 10
 assert all(item["source_uid"] == item["video_uid"] for item in normalized["videos"])
 selected = [item for item in normalized["videos"] if item["selected"]]
 assert len(selected) == 10
 assert [item["selection_order"] for item in selected] == list(range(1, 11))
-assert all(
-    not item["selected"] and item["selection_order"] == 0
-    for item in normalized["videos"][10:]
-)
 
 payload, media_values = picker._build_synchronized_video_outputs(normalized)
 expected_uids = [f"video-{index:02d}" for index in range(1, 11)]
@@ -145,9 +140,15 @@ assert payload["selection_id"]
 # Reordering changes only the transient @video position. Stable identities,
 # catalog membership, and the synchronized metadata/media snapshot stay paired.
 reordered_source = deepcopy(normalized)
-for item in reordered_source["videos"]:
-    if item["selected"]:
-        item["selection_order"] = 11 - int(item["selection_order"])
+active_workspace_uuid = reordered_source["active_picker_shot_uuid"]
+active_workspace = next(
+    row
+    for row in reordered_source["picker_shots"]
+    if row["workspace_uuid"] == active_workspace_uuid
+)
+active_workspace["selected_video_uids"] = list(
+    reversed(active_workspace["selected_video_uids"])
+)
 reordered = picker._parse_state(reordered_source)
 reordered_payload, reordered_media = picker._build_synchronized_video_outputs(
     reordered
@@ -332,8 +333,9 @@ for command_name in (
     "delete_video_asset",
 ):
     assert command_name in picker_source
-chooser_source = inspect.getsource(picker._choose_video_asset_file)
+chooser_source = inspect.getsource(picker._choose_video_asset_files)
 assert "*.mp4" in chooser_source
+assert "Multiselect=$true" in chooser_source
 
 tmp_parent = ROOT / ".tmp"
 tmp_parent.mkdir(parents=True, exist_ok=True)
@@ -350,6 +352,8 @@ with tempfile.TemporaryDirectory(
         b"\x00\x00\x00\x08moov"
     )
     source_mp4.write_bytes(source_bytes)
+    second_source_mp4 = Path(temporary) / "second_reference.mp4"
+    second_source_mp4.write_bytes(source_bytes)
     assert picker._is_structurally_valid_mp4(source_mp4)
 
     prior_test_selection = os.environ.get("HMB_VIDEO_ASSET_TEST_SELECTION")
@@ -392,6 +396,13 @@ with tempfile.TemporaryDirectory(
             source_mp4,
             label="User Reference Take 2",
         )
+        # Re-selecting the same source in one Shot reuses its existing card.
+        assert len(imported_twice["videos"]) == len(imported_once["videos"])
+        imported_twice = node._import_video_asset(
+            imported_twice,
+            second_source_mp4,
+            label="Second User Reference",
+        )
     finally:
         picker._copy_video_to_griptape_project = original_project_copy
     imported_records = [
@@ -403,14 +414,18 @@ with tempfile.TemporaryDirectory(
     assert len({item["video_uid"] for item in imported_records}) == 2
     assert [item["label"] for item in imported_records] == [
         "User Reference",
-        "User Reference Take 2",
+        "Second User Reference",
     ]
     expected_source_path = str(source_mp4.resolve()).replace("\\", "/")
-    assert all(
-        item["video_path"] == expected_source_path
-        and item["import_source_path"] == expected_source_path
-        for item in imported_records
-    )
+    second_expected_source_path = str(second_source_mp4.resolve()).replace("\\", "/")
+    assert [item["video_path"] for item in imported_records] == [
+        expected_source_path,
+        second_expected_source_path,
+    ]
+    assert [item["import_source_path"] for item in imported_records] == [
+        expected_source_path,
+        second_expected_source_path,
+    ]
     assert len(project_copies) == 2
     assert [Path(item["project_video_path"]).resolve() for item in imported_records] == [
         path.resolve() for path in project_copies

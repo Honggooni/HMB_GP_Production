@@ -60,6 +60,7 @@ jobs:
             "HMB_Image_Asset_Resolved_Selection_Regression.py",
             "HMB_Prompt_No_Loss_Connection_Regression.py",
             "HMB_Image_Asset_Registration_Regression.py",
+            "HMB_Image_Asset_Background_Mutation_Regression.py",
             "HMB_Image_Asset_Server_Sharing_Regression.py",
             "HMB_Image_Asset_Process_Lock_Regression.py",
             "HMB_Cutout_Transparency_Regression.py",
@@ -70,8 +71,21 @@ jobs:
             "HMB_Motion_Guide_Regression.py",
             "HMB_Picker_State_Compaction_Regression.py",
             "HMB_VideoPicker_Media_Availability_Regression.py",
+            "HMB_VideoPicker_Native_Size_Migration_Regression.py",
             "HMB_VideoPicker_High_Quality_Original_Regression.py",
-            "HMB_Typed_Auxiliary_Video_Slots_Regression.py"
+            "HMB_VideoPicker_Maya_Shot_Authoring_Regression.py",
+            "HMB_Typed_Auxiliary_Video_Slots_Regression.py",
+            "HMB_Agent_Authenticated_Broker_Regression.py",
+            "HMB_Agent_Cloud_Nonstreaming_Regression.py",
+            "HMB_Agent_Runtime_Prompt_UI_Isolation_Regression.py",
+            "HMB_Agent_Shot_Binding_Regression.py",
+            "HMB_Seedance_Direct_Shot_Source_Regression.py",
+            "HMB_Five_Library_Shot_Routing_Regression.py",
+            "HMB_Shot_Routing_Pass_Cache_Regression.py",
+            "HMB_VideoPicker_Asset_Catalog_Regression.py",
+            "HMB_VideoPicker_No_Loss_State_Regression.py",
+            "HMB_VideoPicker_Publisher_Replacement_Regression.py",
+            "HMB_VideoPicker_Snapshot_History_Regression.py"
           )
           foreach ($test in $tests) {
             python (Join-Path "resources/tests" $test)
@@ -96,3 +110,6 @@ jobs:
           # policy review document. This check builds only an in-memory ZIP.
           python -m py_compile resources/build_developer_release.py
           python resources/build_developer_release.py --check
+          $artifact = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_DEV_0.6.36.zip"
+          python resources/build_developer_release.py --output $artifact
+          python resources/build_developer_release.py --check-output --output $artifact

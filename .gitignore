@@ -26,6 +26,7 @@ policies/
 .env
 .env.*
 *.pem
+!resources/tls/hmb_agent_broker_ca.pem
 *.key
 *.p12
 *.pfx

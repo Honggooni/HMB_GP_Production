@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 
 
@@ -22,6 +23,29 @@ def load(filename: str, alias: str):
     sys.modules[alias] = module
     spec.loader.exec_module(module)
     return module
+
+
+def apply_widget_state_and_wait(node, state):
+    """Exercise the non-blocking scan path, then consume its exact result."""
+
+    result = node._apply_widget_state(state)
+    if not result.get("scan_busy"):
+        return result
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        thread = getattr(node, "_hmb_scan_thread", None)
+        if thread is not None:
+            thread.join(timeout=0.1)
+        if node._consume_pending_catalog_scan_result():
+            final = node._current_state()
+            assert final.get("scan_busy") is False
+            return final
+        if not getattr(node, "_hmb_scan_pending_key", ""):
+            final = node._current_state()
+            assert final.get("scan_busy") is False
+            return final
+        time.sleep(0.01)
+    raise AssertionError("Background image-asset scan did not complete in 10 seconds.")
 
 
 asset_library = load(
@@ -585,7 +609,9 @@ try:
         for item in selected_hero["image_asset"]["dormant_manual_rows"]
         if item["owner"]
     } == {"manual owner-only target"}
-    selected_prompt = prompt_library._build_prompt_package(selected_hero)
+    # PROMPT_OUT is now the concise operator-facing source map.  Assert the
+    # exact structured contract through the private Agent-paired envelope.
+    selected_prompt = prompt_library._build_data_only_prompt_package(selected_hero)
     selected_lines = selected_prompt.splitlines()
     assert len(selected_lines) == 7
     selected_job = json.loads(
@@ -764,23 +790,28 @@ try:
         node,
         asset_library.OUTPUT_PARAMETER,
     )
-    assert asset_output_parameter.ui_options.get("display_name") == "ASSET_OUT"
+    # Cable-free Shot routing keeps legacy metadata/media ports callable while
+    # removing their visible handles from the node chrome.
+    assert asset_output_parameter.ui_options.get("display_name") == ""
     assert asset_output_parameter.ui_options.get("hide_property") is True
-    assert asset_output_parameter.ui_options.get("is_full_width") is False
+    assert asset_output_parameter.ui_options.get("hide") is True
+    assert asset_output_parameter.ui_options.get("hide_handles") is True
+    assert asset_output_parameter.ui_options.get("is_full_width") is True
     media_parameter = asset_library._get_parameter_obj(
         node,
         asset_library.MEDIA_OUTPUT_PARAMETER
     )
     assert media_parameter.output_type == "list[str]"
-    assert (
-        media_parameter.ui_options.get("display_name")
-        == "Video Generation Out"
-    )
+    assert media_parameter.ui_options.get("display_name") == ""
     assert media_parameter.ui_options.get("hide_property") is True
+    assert media_parameter.ui_options.get("hide") is True
+    assert media_parameter.ui_options.get("hide_handles") is True
     image_asset_input = prompt_library._image_asset_input_kwargs()
     assert image_asset_input["name"] == "IMAGE_ASSET_IN"
-    assert image_asset_input["ui_options"]["display_name"] == "ASSET_IN"
+    assert image_asset_input["ui_options"]["display_name"] == ""
     assert image_asset_input["ui_options"]["hide_property"] is True
+    assert image_asset_input["ui_options"]["hide"] is True
+    assert image_asset_input["ui_options"]["hide_handles"] is True
     asset_output_parameter.hide_property = False
     asset_output_parameter.ui_options["display_name"] = "IMAGE_ASSET_OUT"
     asset_output_parameter.ui_options["hide_property"] = False
@@ -789,13 +820,14 @@ try:
     media_parameter.ui_options["hide_property"] = False
     node._ensure_parameters()
     assert asset_output_parameter.hide_property is True
-    assert asset_output_parameter.ui_options["display_name"] == "ASSET_OUT"
+    assert asset_output_parameter.ui_options["display_name"] == ""
     assert asset_output_parameter.ui_options["hide_property"] is True
+    assert asset_output_parameter.ui_options["hide"] is True
+    assert asset_output_parameter.ui_options["hide_handles"] is True
     assert media_parameter.hide_property is True
-    assert (
-        media_parameter.ui_options["display_name"]
-        == "Video Generation Out"
-    )
+    assert media_parameter.ui_options["display_name"] == ""
+    assert media_parameter.ui_options["hide"] is True
+    assert media_parameter.ui_options["hide_handles"] is True
     prompt_node = prompt_library.HMBPromptLibrary(
         name="prompt_asset_port_contract",
     )
@@ -808,11 +840,10 @@ try:
     prompt_asset_input_parameter.ui_options["hide_property"] = False
     prompt_node._ensure_prompt_output()
     assert prompt_asset_input_parameter.hide_property is True
-    assert (
-        prompt_asset_input_parameter.ui_options["display_name"]
-        == "ASSET_IN"
-    )
+    assert prompt_asset_input_parameter.ui_options["display_name"] == ""
     assert prompt_asset_input_parameter.ui_options["hide_property"] is True
+    assert prompt_asset_input_parameter.ui_options["hide"] is True
+    assert prompt_asset_input_parameter.ui_options["hide_handles"] is True
     if asset_library.ParameterList is not None:
         import_parameter = asset_library._get_parameter_obj(
             node,
@@ -918,7 +949,7 @@ try:
         for path in sw12.rglob("*")
         if path.is_dir()
     )
-    selected_state = node._apply_widget_state(selected_state)
+    selected_state = apply_widget_state_and_wait(node, selected_state)
     assert selected_state["project_id"] == "sw12"
     assert selected_state["language"] == "ko"
     assert selected_state["asset_view_mode"] == "detail"
@@ -931,7 +962,7 @@ try:
     added_after_load.write_bytes(PNG_1X1)
     refresh_state = deepcopy(selected_state)
     refresh_state["refresh_revision"] += 1
-    refreshed = node._apply_widget_state(refresh_state)
+    refreshed = apply_widget_state_and_wait(node, refresh_state)
     assert refreshed["asset_view_mode"] == "detail"
     assert "Added_After_Load" in {
         item["image_name"] for item in refreshed["assets"]
@@ -953,7 +984,7 @@ try:
     workflow_only_state = deepcopy(restored)
     workflow_only_state["project_root"] = str(ka8).replace("\\", "/")
     workflow_only_state["project_uid"] = ""
-    workflow_only_state = node._apply_widget_state(workflow_only_state)
+    workflow_only_state = apply_widget_state_and_wait(node, workflow_only_state)
     assert workflow_only_state["project_id"] == "ka8"
     assert workflow_only_state["asset_view_mode"] == "detail"
     node.after_deserialize()
@@ -961,7 +992,7 @@ try:
     assert not (catalog_root / "HMBImageAssetLibrary.project-set.json").exists()
     invalid_state = deepcopy(valid_state)
     invalid_state["catalog_root"] = str(catalog_root / "missing-root")
-    rejected = node._apply_widget_state(invalid_state)
+    rejected = apply_widget_state_and_wait(node, invalid_state)
     assert Path(rejected["catalog_root"]).resolve() == catalog_root.resolve()
     assert "does not exist" in rejected["error"]
 finally:

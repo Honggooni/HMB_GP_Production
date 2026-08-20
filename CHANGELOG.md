@@ -1,5 +1,62 @@
 # Changelog
 
+## `v0.6.36` — 2026-08-20
+
+- Restored the HMBPromptLibrary Range toggle as a direct full-button control,
+  preventing Griptape canvas label forwarding or a late OFF echo from
+  immediately reverting a user-selected ON state; manual Range drafts remain
+  editable and durable without weakening execution-time media validation.
+- Removed the fixed ZIP timestamp policy. Every packaged member now receives
+  the actual local build time, while uniform member times and content hashes
+  remain validated by the release builder and `--check-output`.
+- Resolved Seedance Shot media before the public empty-input preflight so
+  prompt-only, image-only, video-only, and combined jobs retain exact Shot
+  binding without a false `Provide a prompt or supported media input` failure.
+- Moved Agent policy retrieval, Seedance media preparation, and ImageAsset
+  registration work away from UI-critical sections while preserving signed
+  policy validation, durable media verification, cancellation, and rollback.
+- Made VideoPicker selection, ordering, and compact/expanded transitions paint
+  first, then publish coalesced state and geometry updates in the background.
+- Reduced repeated Shot-routing graph reads through per-pass connection caches
+  while retaining fail-closed UUID matching and ambiguity checks.
+
+## `v0.6.35` — 2026-08-20
+
+- Fixed Seedance StartFlow preflight so exact hidden ImageAsset/VideoPicker
+  Shot media is resolved before the public empty-input check, while execution
+  still revalidates Agent text, Shot UUID, and media hashes before Broker use.
+- Moved Seedance media preparation and ImageAsset registration/root scanning
+  off the UI/event loop, added bounded progress phases, and kept durable
+  verification, rollback, cancellation, and fail-closed submission semantics.
+- Made VideoPicker mode changes, selection, and drag ordering paint first and
+  publish on a coalesced later frame; reduced repeated normalization, compact
+  sizing passes, and eager ImageAsset thumbnail decoding.
+- Kept the authenticated Agent policy fetch outside the shared session lock,
+  exposed policy/preparation/run progress without policy data, and cached each
+  Shot-routing target's incoming connections for one reconciliation pass.
+- Unified ImageAsset and VideoPicker card ordering around Shot-local drag and
+  drop, removed the ImageAsset left/right ordering controls, and kept compact,
+  expanded, persisted, and downstream media order consistent.
+- Reworked VideoPicker compact/expanded view ownership so host measurement,
+  node geometry, and widget lifecycle cannot remove or collapse the live UI.
+- Hardened five-library Shot binding across reload, publisher replacement,
+  deletion, duplicate claims, and Agent-to-Seedance provenance validation.
+- Added an atomic release closure manifest and SHA-256 inventory so partial or
+  mixed-version installs can be detected before the library is activated.
+- Cleaned generated project caches and superseded release artifacts from the
+  developer workspace while retaining recovery backups and Maya prototypes.
+
+## `v0.6.34` — 2026-08-20
+
+- Restored Seedance `Only` prompt generation and made ImageAsset and
+  VideoPicker Shot media independently optional. The selector now exposes
+  `Only` plus each available numbered Shot, displays the active number, accepts
+  image-only, video-only, combined, and prompt-only jobs, and keeps duplicate
+  same-kind sources fail-closed.
+- Added a private standalone VideoPicker Shot catalog so one Picker can provide
+  video-conditioned Seedance input without requiring an ImageAsset node. When
+  ImageAsset exists, its UUID catalog remains authoritative.
+
 ## `v0.6.01` (technical version `0.6.1`) — Unreleased
 
 > This is a preparation target only. It does not mark a signed, packaged,

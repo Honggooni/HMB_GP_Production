@@ -108,6 +108,67 @@ for (const element of [assetGestureContainer, assetGestureRoot]) {
   assert.equal(element.handler("wheel"), undefined);
 }
 
+const assetScrollContainer = fakeElement();
+const assetScrollViewport = fakeElement(assetScrollContainer, "asset-scroll");
+assetScrollViewport.scrollTop = 100;
+assetScrollViewport.scrollLeft = 20;
+assetScrollViewport.clientHeight = 480;
+assetScrollContainer.querySelector = (selector) => (
+  selector === "[data-asset-scroll]" ? assetScrollViewport : null
+);
+const assetScrollListenerOptions = new Map();
+assetWidget.hmbInstallImageAssetScrollGestures(
+  assetScrollContainer,
+  (target, type, handler, options) => {
+    if (target === assetScrollViewport) assetScrollListenerOptions.set(type, options);
+    target.addEventListener(type, handler, options);
+  },
+);
+assert.equal(assetScrollViewport.classList.contains("nowheel"), true);
+assert.equal(assetScrollContainer.__hmbImageAssetViewportPanning, undefined);
+assert.equal(assetScrollContainer.__hmbImageAssetCancelViewportPan, undefined);
+assert.equal(assetScrollContainer.handler("wheel"), undefined, "Canvas zoom remains available outside the asset viewport.");
+let localStops = 0;
+let localPrevents = 0;
+const localEvent = (overrides = {}) => ({
+  preventDefault() { localPrevents += 1; },
+  stopPropagation() { localStops += 1; },
+  ...overrides,
+});
+assetScrollViewport.handler("wheel")(localEvent({ deltaY: 120, deltaX: 0, deltaMode: 0 }));
+assert.equal(assetScrollViewport.scrollTop, 220, "Wheel pixels scroll only the red asset viewport.");
+assetScrollViewport.handler("wheel")(localEvent({ deltaY: -2, deltaX: 0, deltaMode: 1 }));
+assert.equal(assetScrollViewport.scrollTop, 140, "Line-mode wheels receive a stable local scroll step.");
+assert.equal(localStops, 2);
+assert.equal(localPrevents, 2);
+assert.equal(assetScrollListenerOptions.get("wheel")?.passive, false);
+for (const eventName of [
+  "pointerdown",
+  "pointermove",
+  "pointerup",
+  "pointercancel",
+  "lostpointercapture",
+  "pointerleave",
+  "mousedown",
+  "mousemove",
+  "mouseup",
+  "auxclick",
+]) {
+  assert.equal(
+    assetScrollViewport.handler(eventName),
+    undefined,
+    `Asset viewport must pass ${eventName} through to Griptape canvas panning.`,
+  );
+}
+assert.equal(windowHandlers.has("pointermove:[object Object]"), false);
+assert.equal(windowHandlers.has("pointerup:[object Object]"), false);
+assert.equal(windowHandlers.has("pointercancel:[object Object]"), false);
+assert.equal(windowHandlers.has("mousemove:[object Object]"), false);
+assert.equal(windowHandlers.has("mouseup:[object Object]"), false);
+assert.equal(windowHandlers.has("blur:true"), false);
+assert.equal(assetScrollViewport.scrollLeft, 20);
+assert.equal(assetScrollViewport.scrollTop, 140);
+
 const agentGestureContainer = fakeElement();
 const agentGestureRoot = fakeElement(agentGestureContainer, "hmb-agent-dashboard");
 agentGestureContainer.innerHTML = '<div class="hmb-agent-dashboard nopan nowheel"></div>';
@@ -179,6 +240,8 @@ const pickerGuardClip = fakeElement(pickerGuardContainer, "hmbvp-clip");
 const pickerGuardDashboard = fakeElement(pickerGuardClip, "hmbvp");
 const pickerGuardControl = fakeElement(pickerGuardDashboard, "picker-control");
 const pickerBroadPanel = fakeElement(pickerGuardDashboard, "right-stack");
+pickerGuardDashboard.closest = () => null;
+pickerGuardControl.closest = () => pickerGuardControl;
 for (const element of [pickerGuardContainer, pickerGuardClip, pickerGuardDashboard]) {
   element.classList.add("nodrag", "nopan", "nowheel");
 }
@@ -189,8 +252,8 @@ pickerGuardContainer.querySelector = (selector) => {
   return null;
 };
 pickerGuardContainer.querySelectorAll = (selector) => {
-  if (selector === "button") return [pickerGuardControl];
   if (selector === ".right-stack") return [pickerBroadPanel];
+  if (String(selector).includes("button")) return [pickerGuardControl];
   return [];
 };
 const pickerGuardCleanup = [];
@@ -211,18 +274,27 @@ for (const className of ["nodrag", "nopan", "nowheel"]) {
 assert.equal(
   typeof pickerGuardContainer.handler("pointerdown"),
   "function",
-  "Picker interior pointerdown must stay local so only the native title bar selects the node.",
+  "Picker uses one delegated pointerdown handler instead of one handler per control.",
 );
 let pickerRootStops = 0;
 pickerGuardContainer.handler("pointerdown")({
+  type: "pointerdown",
+  target: pickerGuardDashboard,
   stopPropagation() { pickerRootStops += 1; },
 });
-assert.equal(pickerRootStops, 1);
+assert.equal(pickerRootStops, 0, "Picker panel backgrounds keep canvas pan/select gestures responsive.");
 assert.equal(
-  pickerGuardContainer.handler("click"),
-  undefined,
-  "Picker background clicks are not swallowed by the widget root.",
+  typeof pickerGuardContainer.handler("click"),
+  "function",
+  "Picker uses one delegated click handler instead of one handler per control.",
 );
+let pickerBackgroundStops = 0;
+pickerGuardContainer.handler("click")({
+  type: "click",
+  target: { closest() { return null; } },
+  stopPropagation() { pickerBackgroundStops += 1; },
+});
+assert.equal(pickerBackgroundStops, 0, "Picker background clicks still reach the canvas.");
 assert.equal(pickerGuardContainer.handler("wheel"), undefined);
 assert.equal(pickerBroadPanel.classList.contains("nopan"), false);
 assert.equal(pickerBroadPanel.classList.contains("nowheel"), false);
@@ -238,10 +310,14 @@ for (const className of ["nodrag", "nopan", "nowheel"]) {
   );
 }
 let pickerInteriorStops = 0;
-pickerGuardControl.handler("pointerdown")({
+pickerGuardContainer.handler("pointerdown")({
+  type: "pointerdown",
+  target: pickerGuardControl,
   stopPropagation() { pickerInteriorStops += 1; },
 });
-pickerGuardControl.handler("click")({
+pickerGuardContainer.handler("click")({
+  type: "click",
+  target: pickerGuardControl,
   stopPropagation() { pickerInteriorStops += 1; },
 });
 assert.equal(
@@ -249,7 +325,8 @@ assert.equal(
   2,
   "Picker controls remain local while their surrounding panel backgrounds pan the canvas.",
 );
-assert.equal(pickerGuardCleanup.length, 2, "Picker controls and title-bar-only selection guard are registered for cleanup.");
+assert.equal(pickerGuardControl.handler("click"), undefined, "Controls do not own per-element listeners.");
+assert.equal(pickerGuardCleanup.length, 1, "One cleanup owns the delegated interaction and delete guards.");
 
 const startShell = fakeElement(null, "react-flow__node");
 startShell.offsetHeight = 1200;
@@ -284,6 +361,49 @@ assert.equal(
   undefined,
   "Sizing the Prompt-style inner frame must not overwrite the outer node during host propagation.",
 );
+
+// With no visible native row above the Picker, the established 1200px shell
+// must be fully occupied by the dashboard instead of leaving the former
+// 960px-content / 240px-dead-strip split.
+const fullStartShell = fakeElement(null, "react-flow__node");
+fullStartShell.offsetHeight = 1200;
+fullStartShell.getBoundingClientRect = () => ({ top: 0, bottom: 1200, height: 1200 });
+const fullStartHost = fakeElement(fullStartShell, "widget-host");
+const fullStartContainer = fakeElement(fullStartHost, "picker-container");
+const fullStartClip = fakeElement(fullStartContainer, "hmbvp-clip");
+const fullStartPicker = fakeElement(fullStartClip, "hmbvp");
+fullStartContainer.getBoundingClientRect = () => ({ top: 0, bottom: 1200, height: 1200 });
+fullStartContainer.querySelector = (selector) => {
+  if (selector === ".hmbvp-clip") return fullStartClip;
+  if (selector === ".hmbvp") return fullStartPicker;
+  return null;
+};
+assert.equal(picker.hmbStretchPickerAdaptiveStack(fullStartContainer, null, fullStartShell), 1200);
+assert.equal(fullStartContainer.style.minHeight, "1200px");
+assert.equal(fullStartClip.style.height, "1200px");
+assert.equal(fullStartPicker.style.height, "1200px");
+assert.equal(fullStartShell.style.height, undefined, "Inner fill must not rewrite the 1200px outer size.");
+
+// A serialized manual resize at the established 1151px floor remains exact;
+// filling available space must not behave like a start-size migration.
+const savedResizeShell = fakeElement(null, "react-flow__node");
+savedResizeShell.offsetHeight = 1151;
+savedResizeShell.getBoundingClientRect = () => ({ top: 0, bottom: 1151, height: 1151 });
+const savedResizeHost = fakeElement(savedResizeShell, "widget-host");
+const savedResizeContainer = fakeElement(savedResizeHost, "picker-container");
+const savedResizeClip = fakeElement(savedResizeContainer, "hmbvp-clip");
+const savedResizePicker = fakeElement(savedResizeClip, "hmbvp");
+savedResizeContainer.getBoundingClientRect = () => ({ top: 0, bottom: 1151, height: 1151 });
+savedResizeContainer.querySelector = (selector) => {
+  if (selector === ".hmbvp-clip") return savedResizeClip;
+  if (selector === ".hmbvp") return savedResizePicker;
+  return null;
+};
+assert.equal(picker.hmbStretchPickerAdaptiveStack(savedResizeContainer, null, savedResizeShell), 1151);
+assert.equal(savedResizeContainer.style.minHeight, "1151px");
+assert.equal(savedResizeClip.style.height, "1151px");
+assert.equal(savedResizePicker.style.height, "1151px");
+assert.equal(savedResizeShell.style.height, undefined, "Saved 1151px outer height must remain user-owned.");
 
 const commandBridge = await importWidget("../../widgets/HMBVideoPickerCommandBridgeWidget_v032.js");
 const collapsedPickerShell = fakeElement(null, "react-flow__node");
@@ -736,9 +856,16 @@ assert.equal(stopped, 3, "Mouse-down does not select the whole library node.");
 globalThis.document.activeElement = textInput;
 assert.equal(
   prompt.hmbShouldDeferPromptTextCommit(promptContainer),
-  true,
-  "A focused text bar defers host remounts so continuous typing and IME composition stay intact.",
+  false,
+  "Focus alone must not suppress the trailing Prompt state publish.",
 );
+promptContainer.__hmbPromptLibraryCompositionActive = true;
+assert.equal(
+  prompt.hmbShouldDeferPromptTextCommit(promptContainer),
+  true,
+  "Only an active IME composition defers the trailing Prompt state publish.",
+);
+promptContainer.__hmbPromptLibraryCompositionActive = false;
 const promptDeleteCapture = windowHandlers.get("keydown:true");
 assert.equal(typeof promptDeleteCapture, "function", "Selected Prompt nodes need a capture-phase delete guard.");
 let captureStopped = 0;

@@ -4,370 +4,273 @@ import hashlib
 import importlib.util
 import json
 import os
-import re
+import ssl
 import sys
-import tempfile
+from email.message import Message
 from pathlib import Path
-from types import MethodType
 
 
 ROOT = Path(__file__).resolve().parents[2]
-POLICY_ENV = "HMB_AGENT_POLICY_PATH"
-EXPECTED_SERVER = "FIN-RCOMP7.funnyflux.local"
-EXPECTED_SHARE = "HMB_AgentPolicy$"
-EXPECTED_UNC = rf"\\{EXPECTED_SERVER}\{EXPECTED_SHARE}\hmb_agent_core.dat"
-EXPECTED_VERSION = "2026-08-11.agent-shot-quality.v4.1"
-EXPECTED_ENVELOPE_SHA256 = (
-    "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
-)
-EXPECTED_PROJECT_SHA256 = (
-    "8bbf296eefd5fa7baf3aa43a66735fa6ce004e95859e09f7b48accb7b7beebc3"
-)
-EXPECTED_BINDING_SHA256 = (
-    "6a362ed04eba75caabcbe81944b0e2dd56a67120bc0dde1518e82aa80d9764d0"
-)
+EXPECTED_URL = "https://192.168.203.245:8443/api/v1/agent-core/dat"
+EXPECTED_HOST = "192.168.203.245"
+EXPECTED_PORT = 8443
+EXPECTED_PATH = "/api/v1/agent-core/dat"
+EXPECTED_VERSION = "2026-08-12.agent-shot-quality.v4.2"
 EXPECTED_CONTRACT_SHA256 = (
-    "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
+    "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
 )
 LOAD_FAILURE = "HMB_GP_Agent_Library internal rule payload could not be loaded."
-PRIVATE_SIGNED_POLICY_FIXTURE = (
-    ROOT
-    / "resources"
-    / "policy"
-    / "HMB_GP_Production_Rule"
-    / "artifact"
-    / "hmb_agent_core.dat"
-)
 
 
-def load(name: str):
-    path = ROOT / f"{name}.py"
+def load(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
 
-common = load("_hmb_common")
-agent = load("HMBAgentLibrary")
+common = load("_hmb_server_policy_boundary_common", ROOT / "_hmb_common.py")
+agent = load("_hmb_server_policy_boundary_agent", ROOT / "HMBAgentLibrary.py")
+manifest = json.loads(
+    (ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8")
+)
 
-assert not hasattr(common, "AGENT_RULE_DATA_PATH_ENV")
-assert common._AGENT_POLICY_SERVER_NAME == EXPECTED_SERVER
-assert common._AGENT_POLICY_SERVER_SHARE == EXPECTED_SHARE
-assert common._AGENT_POLICY_SERVER_UNC == EXPECTED_UNC
+assert common._AGENT_POLICY_BROKER_URL == EXPECTED_URL
+assert common._AGENT_POLICY_BROKER_HOST == EXPECTED_HOST
+assert common._AGENT_POLICY_BROKER_PORT == EXPECTED_PORT
+assert common._AGENT_POLICY_BROKER_PATH == EXPECTED_PATH
 assert common._AGENT_POLICY_VERSION == EXPECTED_VERSION
 assert common._AGENT_POLICY_CONTRACT_SHA256 == EXPECTED_CONTRACT_SHA256
-assert not hasattr(common, "_AGENT_POLICY_ENVELOPE_SHA256")
-assert not hasattr(common, "_AGENT_POLICY_PROJECT_SHA256")
-assert not hasattr(common, "_AGENT_POLICY_BINDING_SHA256")
+assert common._AGENT_POLICY_ENVELOPE_SCHEMA == "hmb-agent-policy-envelope-v3"
+assert common._AGENT_POLICY_SCHEMA == "hmb-agent-policy-v3"
+assert not hasattr(common, "AGENT_RULE_DATA_PATH_ENV")
+assert not hasattr(common, "_AGENT_POLICY_SERVER_UNC")
+assert not hasattr(common, "_resolve_agent_rule_data_path")
+
+delivery = manifest["metadata"]["agent_policy_delivery"]
+assert delivery["mode"] == "authenticated_broker_session"
+assert delivery["broker_endpoint"] == EXPECTED_URL
+assert delivery["public_ca_path"] == "resources/tls/hmb_agent_broker_ca.pem"
+assert delivery["bootstrap_marker"] == "HMB_AGENT_POLICY_PROCESS_BOOTSTRAP=1"
+assert delivery["verification"] == (
+    "pinned_tls_dpapi_bearer_rsa3072_sha256_v3_contract_once_per_process"
+)
+
+# The sole packaged PEM is a public Broker trust anchor and its DER identity is
+# pinned independently.  It is not a policy artifact or a client credential.
+ca_path = ROOT / delivery["public_ca_path"]
+ca_text = ca_path.read_text(encoding="ascii")
+ca_der = ssl.PEM_cert_to_DER_cert(ca_text)
+assert hashlib.sha256(ca_der).hexdigest() == (
+    common._AGENT_POLICY_BROKER_CA_DER_SHA256
+)
 
 
-original_env = os.environ.get(POLICY_ENV)
+class FakeSocket:
+    def __init__(self, peer_der: bytes) -> None:
+        self.peer_der = peer_der
+
+    def getpeercert(self, *, binary_form: bool = False):
+        assert binary_form is True
+        return self.peer_der
+
+
+class FakeResponse:
+    def __init__(self, body: bytes) -> None:
+        self.status = 200
+        self.body = body
+        self.closed = False
+        self.headers = Message()
+        for name, value in (
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Disposition", 'attachment; filename="hmb_agent_core.dat"'),
+            ("Cache-Control", "private, no-store, no-transform"),
+            ("Content-Length", str(len(body))),
+            ("Accept-Ranges", "none"),
+            ("X-Content-Type-Options", "nosniff"),
+            ("X-Request-Id", "0123456789abcdef01234567"),
+            ("Vary", "Authorization"),
+        ):
+            self.headers.add_header(name, value)
+
+    def read(self, limit: int = -1) -> bytes:
+        assert limit == common._AGENT_POLICY_MAX_ENVELOPE_BYTES + 1
+        return self.body
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeConnection:
+    instances: list["FakeConnection"] = []
+    peer_der = ca_der
+    body = b"authenticated-broker-envelope"
+
+    def __init__(self, host: str, port: int, *, timeout: float, context) -> None:
+        self.constructor = (host, port, timeout, context)
+        self.sock = FakeSocket(self.peer_der)
+        self.response = FakeResponse(self.body)
+        self.request: tuple[str, str, bool, bool] | None = None
+        self.headers: list[tuple[str, str]] = []
+        self._buffer: list[bytes] = []
+        self.closed = False
+        self.__class__.instances.append(self)
+
+    def connect(self) -> None:
+        return None
+
+    def putrequest(
+        self,
+        method: str,
+        path: str,
+        *,
+        skip_host: bool,
+        skip_accept_encoding: bool,
+    ) -> None:
+        self.request = (method, path, skip_host, skip_accept_encoding)
+
+    def putheader(self, name: str, value: str) -> None:
+        self.headers.append((name, value))
+
+    def endheaders(self) -> None:
+        return None
+
+    def getresponse(self) -> FakeResponse:
+        return self.response
+
+    def close(self) -> None:
+        self.closed = True
+
+
+# Exercise the exact authenticated GET without touching the network.  TLS peer
+# pinning, a bounded DPAPI-derived bearer value, and strict response headers are
+# all mandatory before any DAT bytes cross the transport boundary.
+real_https_connection = common.http.client.HTTPSConnection
+real_tls_context = common._agent_policy_tls_context
+real_token_loader = common._load_agent_policy_bearer_token
+fake_context = object()
+token_buffer = bytearray(b"broker-session-token")
+common.http.client.HTTPSConnection = FakeConnection
+common._agent_policy_tls_context = lambda: fake_context
+common._load_agent_policy_bearer_token = lambda: token_buffer
 try:
-    # Machine/process environment cannot redirect the loader to a local path,
-    # administrative share, IP-based UNC, retired host, or device namespace.
-    for hostile_path in (
-        "",
-        r"D:\agent\hmb_agent_core.dat",
-        r"Z:\hmb_agent_core.dat",
-        r"\\FIN-RCOMP7\D$\agent\hmb_agent_core.dat",
-        r"\\FIN-RCOMP1\HMB_AgentPolicy$\hmb_agent_core.dat",
-        r"\\192.168.203.245\HMB_AgentPolicy$\hmb_agent_core.dat",
-        r"\\?\UNC\FIN-RCOMP7\HMB_AgentPolicy$\hmb_agent_core.dat",
-        r"\\.\UNC\FIN-RCOMP7\HMB_AgentPolicy$\hmb_agent_core.dat",
-        EXPECTED_UNC + ":alternate",
-        EXPECTED_UNC + " ",
-        " " + EXPECTED_UNC,
-        EXPECTED_UNC + "\\extra",
-    ):
-        os.environ[POLICY_ENV] = hostile_path
-        assert str(common._resolve_agent_rule_data_path()) == EXPECTED_UNC
-    os.environ.pop(POLICY_ENV, None)
-    assert str(common._resolve_agent_rule_data_path()) == EXPECTED_UNC
-
-    original_path_open = Path.open
-    synthetic_bytes = b'{"public_server_reader_fixture":true}'
-    signed_bytes = synthetic_bytes
-
-    # The public checkout has no policy artifact. Exercise bounded, fresh reads
-    # with inert changing bytes; trust is decided after each read by signature,
-    # schema, self-hashes, 4+4 shape, and the stable contract rather than a
-    # package-pinned whole-file digest.
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        synthetic_fixture = Path(temporary_directory) / "reader-fixture.bin"
-        synthetic_fixture.write_bytes(synthetic_bytes)
-        server_open_calls: list[str] = []
-
-        def synthetic_fixture_open(path: Path, *args, **kwargs):
-            server_open_calls.append(str(path))
-            assert str(path).casefold() == EXPECTED_UNC.casefold()
-            return original_path_open(synthetic_fixture, *args, **kwargs)
-
-        Path.open = synthetic_fixture_open
-        try:
-            assert common._read_agent_policy_envelope() == synthetic_bytes
-            with original_path_open(synthetic_fixture, "wb") as stream:
-                stream.write(synthetic_bytes + b"\n")
-            assert common._read_agent_policy_envelope() == synthetic_bytes + b"\n"
-        finally:
-            Path.open = original_path_open
-
-        # No process-global payload cache: every protected execution takes a
-        # fresh server snapshot.
-        assert server_open_calls == [EXPECTED_UNC, EXPECTED_UNC]
-
-    # Internal workspaces additionally verify the real v4.1 RSA signature and
-    # signed 4+4 document self-hashes. Fixture absence is normal in public CI.
-    private_fixture_enabled = os.environ.get(
-        "HMB_TEST_SKIP_PRIVATE_POLICY_FIXTURE",
-        "",
-    ).strip().casefold() not in {"1", "true", "yes", "on"}
-    if private_fixture_enabled and PRIVATE_SIGNED_POLICY_FIXTURE.is_file():
-        signed_bytes = PRIVATE_SIGNED_POLICY_FIXTURE.read_bytes()
-        assert hashlib.sha256(signed_bytes).hexdigest() == EXPECTED_ENVELOPE_SHA256
-        signature_open_calls: list[str] = []
-
-        def signed_fixture_open(path: Path, *args, **kwargs):
-            signature_open_calls.append(str(path))
-            assert str(path).casefold() == EXPECTED_UNC.casefold()
-            return original_path_open(PRIVATE_SIGNED_POLICY_FIXTURE, *args, **kwargs)
-
-        Path.open = signed_fixture_open
-        try:
-            payload = common._load_agent_rule_payload()
-        finally:
-            Path.open = original_path_open
-        assert signature_open_calls == [EXPECTED_UNC]
-        assert payload["final_policy_version"] == EXPECTED_VERSION
-        assert payload["final_motion_look_policy_sha256"] == EXPECTED_CONTRACT_SHA256
-        assert payload["envelope_sha256"] == EXPECTED_ENVELOPE_SHA256
-        assert hashlib.sha256(str(payload["policy"]).encode("utf-8")).hexdigest() == (
-            EXPECTED_PROJECT_SHA256
-        )
-        assert hashlib.sha256(str(payload["binding"]).encode("utf-8")).hexdigest() == (
-            EXPECTED_BINDING_SHA256
-        )
-
-    def assert_open_failure(error: BaseException) -> None:
-        def failing_open(_path: Path, *_args, **_kwargs):
-            raise error
-
-        Path.open = failing_open
-        try:
-            common._load_agent_rule_payload()
-        except RuntimeError as exc:
-            assert str(exc) == LOAD_FAILURE
-        else:
-            raise AssertionError(f"server read failure was accepted: {error!r}")
-        finally:
-            Path.open = original_path_open
-
-    for simulated_error in (
-        FileNotFoundError("simulated missing dedicated share"),
-        PermissionError("simulated reader ACL denial"),
-        OSError(53, "simulated network path not found"),
-        OSError(64, "simulated network name deleted"),
-        OSError(121, "simulated network timeout"),
-        OSError(1231, "simulated network location unavailable"),
-    ):
-        assert_open_failure(simulated_error)
-
-    def assert_file_bytes_rejected(label: str, data: bytes) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            fixture = Path(temporary_directory) / "fixture.bin"
-            fixture.write_bytes(data)
-
-            def fixture_open(_path: Path, *args, **kwargs):
-                return original_path_open(fixture, *args, **kwargs)
-
-            Path.open = fixture_open
-            try:
-                common._load_agent_rule_payload()
-            except RuntimeError as exc:
-                assert str(exc) == LOAD_FAILURE
-            else:
-                raise AssertionError(f"{label} server policy was accepted")
-            finally:
-                Path.open = original_path_open
-
-    assert_file_bytes_rejected("empty", b"")
-    assert_file_bytes_rejected(
-        "oversized",
-        b"x" * (common._AGENT_POLICY_MAX_ENVELOPE_BYTES + 1),
-    )
-    tampered = bytearray(signed_bytes)
-    tampered[len(tampered) // 2] ^= 1
-    assert_file_bytes_rejected("tampered signed envelope", bytes(tampered))
-
-    # Simulate a namespace/content race by returning a different file identity
-    # for the post-read fstat. The loader must reject before decode/injection.
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        first_file = Path(temporary_directory) / "first.bin"
-        second_file = Path(temporary_directory) / "second.bin"
-        first_file.write_bytes(signed_bytes)
-        second_file.write_bytes(signed_bytes)
-
-        class RacingStream:
-            def __init__(self) -> None:
-                self._first = original_path_open(first_file, "rb")
-                self._second = original_path_open(second_file, "rb")
-                self._fileno_calls = 0
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                self._first.close()
-                self._second.close()
-
-            def fileno(self) -> int:
-                self._fileno_calls += 1
-                return (
-                    self._first.fileno()
-                    if self._fileno_calls == 1
-                    else self._second.fileno()
-                )
-
-            def read(self, size: int = -1) -> bytes:
-                return self._first.read(size)
-
-        Path.open = lambda _path, *_args, **_kwargs: RacingStream()
-        try:
-            common._load_agent_rule_payload()
-        except RuntimeError as exc:
-            assert str(exc) == LOAD_FAILURE
-        else:
-            raise AssertionError("server policy identity race was accepted")
-        finally:
-            Path.open = original_path_open
-
-    canonical_empty_prompt = "\n".join(
-        (
-            "HMB_GP_Production",
-            agent._PUBLIC_JOB_CONTRACT_HEADER,
-            json.dumps(
-                {
-                    "schema": agent._PUBLIC_JOB_CONTRACT_SCHEMA,
-                    "version": agent._PUBLIC_JOB_CONTRACT_VERSION,
-                    "images": [],
-                    "videos": [],
-                    "control_only_bindings": [],
-                    "frame_ranges": [],
-                    "connections": {"image_asset": False, "picker": False},
-                },
-                separators=(",", ":"),
-            ),
-            agent._FX_TIMING_CONTRACT_HEADER,
-            json.dumps(
-                {
-                    "schema": agent._FX_TIMING_CONTRACT_SCHEMA,
-                    "version": agent._FX_TIMING_CONTRACT_VERSION,
-                    "valid": True,
-                    "errors": [],
-                    "sources": [],
-                },
-                separators=(",", ":"),
-            ),
-            agent._USER_DESCRIPTION_DATA_HEADER,
-            "{}",
-        )
-    )
-
-    def exercise_route(*, canonical: bool, server_failure: bool) -> tuple[str, int, dict]:
-        node = object.__new__(agent.HMBAgentLibrary)
-        node._hmb_rules_active = False
-        node._hmb_policy = ""
-        node._hmb_binding = ""
-        node._hmb_policy_rules = []
-        node._hmb_binding_rules = []
-        node._hmb_ruleset_names = ("", "")
-        node._hmb_native_calls_this_process = 0
-        node.parameter_output_values = {"agent": {"stale": True}, "output": "stale"}
-        native_calls: list[bool] = []
-
-        def get_parameter_value(_self, name: str):
-            assert name == "prompt"
-            return canonical_empty_prompt
-
-        def native_once(_self):
-            native_calls.append(True)
-            if False:
-                yield None
-            return "native-complete"
-
-        node.get_parameter_value = MethodType(get_parameter_value, node)
-        node._run_native_agent_once = MethodType(native_once, node)
-        node._has_canonical_hmb_prompt_connection = MethodType(
-            lambda _self: canonical,
-            node,
-        )
-
-        original_identity_reader = agent._prompt_policy_source_identity
-        original_envelope_reader = agent._hmb._read_agent_policy_envelope
-        agent._prompt_policy_source_identity = lambda _source_path=None: (
-            EXPECTED_VERSION,
-            EXPECTED_CONTRACT_SHA256,
-        )
-        if server_failure:
-            agent._hmb._read_agent_policy_envelope = lambda: (_ for _ in ()).throw(
-                OSError(53, "private server detail")
-            )
-        else:
-            agent._hmb._read_agent_policy_envelope = lambda: (_ for _ in ()).throw(
-                AssertionError("plain Agent read the HMB server policy")
-            )
-        try:
-            iterator = node.process()
-            while True:
-                next(iterator)
-        except RuntimeError as exc:
-            return str(exc), len(native_calls), dict(node.parameter_output_values)
-        except StopIteration as stop:
-            return str(stop.value), len(native_calls), dict(node.parameter_output_values)
-        finally:
-            agent._prompt_policy_source_identity = original_identity_reader
-            agent._hmb._read_agent_policy_envelope = original_envelope_reader
-
-    public_error, native_calls, public_outputs = exercise_route(
-        canonical=True,
-        server_failure=True,
-    )
-    assert public_error == agent._HMB_POLICY_UNAVAILABLE_MESSAGE
-    assert native_calls == 0
-    assert public_outputs == {
-        "agent": {},
-        "output": agent._HMB_POLICY_UNAVAILABLE_MESSAGE,
-    }
-
-    native_result, native_calls, _native_outputs = exercise_route(
-        canonical=False,
-        server_failure=False,
-    )
-    assert native_result == "native-complete"
-    assert native_calls == 1
+    assert common._fetch_agent_policy_envelope() == FakeConnection.body
 finally:
-    if original_env is None:
-        os.environ.pop(POLICY_ENV, None)
-    else:
-        os.environ[POLICY_ENV] = original_env
+    common.http.client.HTTPSConnection = real_https_connection
+    common._agent_policy_tls_context = real_tls_context
+    common._load_agent_policy_bearer_token = real_token_loader
 
+connection = FakeConnection.instances[-1]
+assert connection.constructor == (
+    EXPECTED_HOST,
+    EXPECTED_PORT,
+    common._AGENT_POLICY_REQUEST_TIMEOUT_SECONDS,
+    fake_context,
+)
+assert connection.request == ("GET", EXPECTED_PATH, True, True)
+assert dict(connection.headers) == {
+    "Host": "192.168.203.245:8443",
+    "Accept": "application/octet-stream",
+    "Accept-Encoding": "identity",
+    "Authorization": "Bearer broker-session-token",
+    "Cache-Control": "no-store",
+}
+assert connection.response.closed is True
+assert connection.closed is True
+assert token_buffer == bytearray(len(token_buffer))
+
+# A certificate at the correct address with the wrong DER identity is rejected
+# before the bearer-token loader is called.
+class WrongPeerConnection(FakeConnection):
+    peer_der = b"wrong-peer-certificate"
+
+
+common.http.client.HTTPSConnection = WrongPeerConnection
+common._agent_policy_tls_context = lambda: fake_context
+common._load_agent_policy_bearer_token = lambda: (_ for _ in ()).throw(
+    AssertionError("bearer token loaded before TLS peer pin validation")
+)
+try:
+    try:
+        common._fetch_agent_policy_envelope()
+    except RuntimeError as exc:
+        assert "certificate pin mismatch" in str(exc)
+    else:
+        raise AssertionError("wrong Broker peer certificate was accepted")
+finally:
+    common.http.client.HTTPSConnection = real_https_connection
+    common._agent_policy_tls_context = real_tls_context
+    common._load_agent_policy_bearer_token = real_token_loader
+
+# The compatibility reader has exactly one transport implementation.  It does
+# not resolve environment paths, UNC shares, or a bundled/local DAT.
+transport_calls: list[bool] = []
+real_fetch = common._fetch_agent_policy_envelope
+common._fetch_agent_policy_envelope = lambda: (
+    transport_calls.append(True) or b"fresh-envelope"
+)
+try:
+    assert common._read_agent_policy_envelope() == b"fresh-envelope"
+    assert common._read_agent_policy_envelope() == b"fresh-envelope"
+finally:
+    common._fetch_agent_policy_envelope = real_fetch
+assert transport_calls == [True, True]
+
+# Agent executions are read-only consumers of one authenticated process
+# snapshot.  An uninitialized session fails closed and never lazily fetches.
+try:
+    common._load_agent_rule_payload()
+except RuntimeError as exc:
+    assert str(exc) == LOAD_FAILURE
+else:
+    raise AssertionError("uninitialized policy session was accepted")
+
+verified_snapshot = {
+    "policy": "verified project rules",
+    "binding": "verified shot rules",
+    "final_policy_version": EXPECTED_VERSION,
+    "final_motion_look_policy_sha256": EXPECTED_CONTRACT_SHA256,
+}
+bootstrap_fetches: list[bool] = []
+real_provenance = common._agent_policy_process_provenance_valid
+real_verified_loader = common._fetch_verified_agent_rule_payload
+common._agent_policy_process_provenance_valid = lambda: True
+common._fetch_verified_agent_rule_payload = lambda: (
+    bootstrap_fetches.append(True) or dict(verified_snapshot)
+)
+os.environ[common._AGENT_POLICY_BOOTSTRAP_MARKER] = "1"
+try:
+    common._bootstrap_agent_policy_session()
+    common._bootstrap_agent_policy_session()
+finally:
+    common._agent_policy_process_provenance_valid = real_provenance
+    common._fetch_verified_agent_rule_payload = real_verified_loader
+assert common._agent_policy_session_state() == "READY"
+first = common._load_agent_rule_payload()
+second = common._load_agent_rule_payload()
+assert first == second == verified_snapshot
+assert first is not second
+assert bootstrap_fetches == [True]
 
 common_source = (ROOT / "_hmb_common.py").read_text(encoding="utf-8")
 agent_source = (ROOT / "HMBAgentLibrary.py").read_text(encoding="utf-8")
-assert "_BUNDLED_AGENT_POLICY_FILE" not in common_source
-assert r"\\FIN-RCOMP7\D$\agent" not in common_source
-assert "192.168.203.245" not in common_source
-assert EXPECTED_SERVER in common_source
-assert POLICY_ENV not in common_source
-assert re.search(r"(?m)^AGENT_RULE_DATA_PATH\s*=", common_source) is None
-assert "lru_cache" not in common_source
-assert "_AGENT_POLICY_ENVELOPE_SHA256" not in common_source
-assert "_AGENT_POLICY_PROJECT_SHA256" not in common_source
-assert "_AGENT_POLICY_BINDING_SHA256" not in common_source
+for retired_marker in (
+    "_BUNDLED_AGENT_POLICY_FILE",
+    "_AGENT_POLICY_SERVER_UNC",
+    "_resolve_agent_rule_data_path",
+    "HMB_AGENT_POLICY_PATH",
+    r"\\FIN-RCOMP7\D$\agent",
+    "lru_cache",
+):
+    assert retired_marker not in common_source
+assert "_bootstrap_agent_policy_session()" in agent_source
 assert "[HMB SERVER POLICY REQUIRED]" in agent._HMB_POLICY_UNAVAILABLE_MESSAGE
 assert "HMB LOCAL POLICY REQUIRED" not in agent_source
-assert "_BUNDLED_AGENT_POLICY_FILE" not in agent_source
 assert "resources/agent/hmb_agent_core.dat" not in agent_source
 
-print("HMB dedicated server Agent policy boundary regression: PASS")
+print(
+    "HMB authenticated Broker Agent policy boundary regression: PASS "
+    "(public CA pin / DPAPI bearer / strict HTTPS / one process snapshot)"
+)

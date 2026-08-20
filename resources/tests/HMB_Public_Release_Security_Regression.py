@@ -6,16 +6,17 @@ import json
 import os
 import re
 import zipfile
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[2]
-POLICY_VERSION = "2026-08-11.agent-shot-quality.v4.1"
+POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
 POLICY_CONTRACT_SHA256 = (
-    "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
+    "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
 )
-RELEASE_LABEL = "v0.6.01"
-RELEASE_VERSION = "0.6.1"
+RELEASE_LABEL = "v0.6.36"
+RELEASE_VERSION = "0.6.36"
 EXPECTED_SOURCE_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
@@ -30,17 +31,23 @@ EXPECTED_SOURCE_FILES = (
     "HMBPromptLibrary.py",
     "HMBSeedanceGeneration.py",
     "HMBVideoPickerLibrary.py",
+    "_hmb_agent_session.py",
+    "_hmb_shot_routing.py",
+    "_hmb_mp4_verify.py",
+    "HMB_Agent_Griptape.bat",
     "_hmb_common.py",
     "_hmb_screen_space.py",
     "widgets/HMBAgentLibraryWidget.js",
     "widgets/HMBImageAssetLibraryWidget.js",
     "widgets/HMBPromptLibraryScopedBindingWidget.js",
+    "widgets/HMBSeedanceGenerationWidget.js",
     "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
     "widgets/HMBVideoPickerLibraryWidget_v032.js",
     "resources/maya/HMB_Maya_Background_Preview.py",
     "resources/maya/HMB_Maya_Binding_Setup.py",
     "resources/maya/HMBVideoPicker_Maya_Guide.txt",
     "resources/picker/HMB_Marker_Catalog.json",
+    "resources/tls/hmb_agent_broker_ca.pem",
 )
 EXPECTED_SECRET_NAMES = {
     "GT_CLOUD_API_KEY",
@@ -133,10 +140,10 @@ builder = load_module(
 )
 
 assert tuple(builder.SOURCE_FILES) == EXPECTED_SOURCE_FILES
-assert len(EXPECTED_SOURCE_FILES) == 24
+assert len(EXPECTED_SOURCE_FILES) == 30
 assert builder.RELEASE_LABEL == RELEASE_LABEL
 assert builder.RELEASE_VERSION == RELEASE_VERSION
-assert builder.ARCHIVE_NAME == "HMB_GP_Production_DEV_0.6.1.zip"
+assert builder.ARCHIVE_NAME == "HMB_GP_Production_DEV_0.6.36.zip"
 assert builder.POLICY_VERSION == POLICY_VERSION
 assert builder.POLICY_CONTRACT_SHA256 == POLICY_CONTRACT_SHA256
 assert builder.POLICY_DELIVERY == "server-only"
@@ -157,10 +164,7 @@ assert next(
     item for item in sbom["packages"]
     if item["SPDXID"] == "SPDXRef-HMB-GP-Production"
 )["versionInfo"] == RELEASE_VERSION
-assert (
-    f"## `{RELEASE_LABEL}` (technical version `{RELEASE_VERSION}`) — Unreleased"
-    in changelog
-)
+assert f"## `{RELEASE_LABEL}` — 2026-08-20" in changelog
 
 release_version, records = builder.validate_sources()
 record_paths = tuple(str(record["path"]) for record in records)
@@ -171,13 +175,25 @@ assert release_version == RELEASE_VERSION
 record_by_path = {str(record["path"]): record for record in records}
 assert set(record_by_path) == set(EXPECTED_SOURCE_FILES)
 
-first_archive = builder.make_archive(records)
-second_archive = builder.make_archive(records)
+release_records = builder.make_release_records(release_version, records)
+builder.validate_release_inventory(release_version, release_records)
+release_record_by_path = {
+    str(record["path"]): record for record in release_records
+}
+assert set(release_record_by_path) == {
+    *EXPECTED_SOURCE_FILES,
+    builder.RELEASE_MANIFEST_PATH,
+    builder.SHA256SUMS_PATH,
+}
+archive_date_time = builder.current_zip_date_time()
+first_archive = builder.make_archive(release_records, archive_date_time)
+second_archive = builder.make_archive(release_records, archive_date_time)
 assert first_archive == second_archive
-builder.validate_archive(first_archive, records)
+builder.validate_archive(first_archive, release_records, archive_date_time)
+assert abs((datetime.now() - datetime(*archive_date_time)).total_seconds()) < 5
 assert builder.module_string_constant(
     ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_CANDIDATE_VERSION"
-) == "2026-08-11.agent-shot-quality.v4.1"
+) == "2026-08-12.agent-shot-quality.v4.2"
 assert builder.module_string_constant(
     ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_CANDIDATE_CONTRACT_SHA256"
 ) == POLICY_CONTRACT_SHA256
@@ -200,12 +216,13 @@ configured_secret_values = tuple(
 
 with zipfile.ZipFile(io.BytesIO(first_archive), "r") as archive:
     infos = archive.infolist()
-    assert len(infos) == len(EXPECTED_SOURCE_FILES)
+    assert len(infos) == len(release_records)
     assert archive.testzip() is None
     expected_names = [
-        f"{builder.ARCHIVE_ROOT}/{relative}" for relative in EXPECTED_SOURCE_FILES
+        f"{builder.ARCHIVE_ROOT}/{record['path']}" for record in release_records
     ]
     assert [info.filename for info in infos] == expected_names
+    assert {info.date_time for info in infos} == {archive_date_time}
     assert not any(
         PurePosixPath(info.filename).suffix.casefold() == ".dat" for info in infos
     )
@@ -214,7 +231,13 @@ with zipfile.ZipFile(io.BytesIO(first_archive), "r") as archive:
         member = PurePosixPath(info.filename)
         lowered = info.filename.casefold()
         relative = member.relative_to(builder.ARCHIVE_ROOT).as_posix()
-        assert member.suffix.casefold() not in FORBIDDEN_SUFFIXES
+        # The authenticated Broker contract intentionally ships one pinned
+        # public CA certificate.  Private keys and every other PEM remain
+        # forbidden, including PEM files at look-alike paths.
+        if relative == builder.PUBLIC_CA_MEMBER.as_posix():
+            assert member.suffix.casefold() == ".pem"
+        else:
+            assert member.suffix.casefold() not in FORBIDDEN_SUFFIXES
         assert "/resources/agent/" not in f"/{lowered}"
         assert "/resources/policy/" not in f"/{lowered}"
         assert "/policies/" not in f"/{lowered}"
@@ -224,7 +247,7 @@ with zipfile.ZipFile(io.BytesIO(first_archive), "r") as archive:
         )
         assert not re.search(r"(^|/)(?:id_rsa|id_ed25519)[^/]*$", lowered)
         content = archive.read(info)
-        assert content == record_by_path[relative]["data"]
+        assert content == release_record_by_path[relative]["data"]
         assert PRIVATE_KEY_HEADER.search(content) is None
         assert not any(pattern.search(content) for pattern in COMMON_TOKEN_PATTERNS)
         assert not any(secret in content for secret in configured_secret_values)
@@ -242,7 +265,8 @@ builder.validate_no_policy_artifacts_in_zip(
 assert_forbidden_archive(zip_bytes({"package/hmb_agent_core.dat": b"sealed"}))
 try:
     builder.make_archive(
-        [{"path": "resources/agent/hmb_agent_core.dat", "data": b"sealed"}]
+        [{"path": "resources/agent/hmb_agent_core.dat", "data": b"sealed"}],
+        archive_date_time,
     )
 except RuntimeError:
     pass

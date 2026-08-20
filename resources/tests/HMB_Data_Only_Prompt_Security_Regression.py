@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 import sys
 
@@ -62,7 +63,7 @@ timing.update(
 )
 state["videos"] = [fx, timing]
 
-compiled = prompt_library._build_prompt_package(state)
+compiled = prompt_library._build_data_only_prompt_package(state)
 lines = [line for line in compiled.splitlines() if line.strip()]
 assert len(lines) == 7
 assert lines[0] == "HMB_GP_Production"
@@ -148,7 +149,9 @@ for forbidden_policy_phrase in (
 assert json.loads(lines[6])["SCENE_CONTEXT"] == "User-authored scene note."
 
 empty_contract = agent._assert_fx_timing_source_contract(
-    prompt_library._build_prompt_package(prompt_library._default_widget_state())
+    prompt_library._build_data_only_prompt_package(
+        prompt_library._default_widget_state()
+    )
 )
 assert empty_contract["sources"] == []
 agent._assert_fx_candidate_matches_signed_runtime(empty_contract)
@@ -188,10 +191,14 @@ assert agent._valid_exact_emitter(cue["emitter"]) is True
 
 secret = (
     "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima "
-    "mike november oscar papa"
+    "mike november oscar papa quebec romeo sierra tango uniform victor whiskey "
+    "xray yankee zulu alpha bravo charlie delta echo foxtrot golf hotel india"
 )
+assert len(secret) >= agent._SANITIZER_SECRET_WINDOW_CHARS
 for exposed in (secret, json.dumps(secret), json.dumps(json.dumps(secret))):
-    assert agent._contains_public_output_state_leak(exposed, secret, secret)
+    # Text-only raw policy disclosure is owned by the rolling-window detector;
+    # the state-leak detector remains reserved for structured Agent wrappers.
+    assert agent._contains_raw_policy_material(exposed, secret, secret)
 
 # Structured-connector catch-all text and technical JSON never enter USER DATA.
 connector_state = prompt_library._default_widget_state()
@@ -207,7 +214,7 @@ connector_state["source_intent_fallbacks"] = [
         "text": '{"decoded_frame_count":62,"maya_start_frame":101}',
     },
 ]
-connector_output = prompt_library._build_prompt_package(connector_state)
+connector_output = prompt_library._build_data_only_prompt_package(connector_state)
 assert "MALICIOUS CONNECTOR DESCRIPTION" not in connector_output
 assert "decoded_frame_count" not in connector_output
 assert json.loads(connector_output.splitlines()[6]) == {}
@@ -246,7 +253,7 @@ range_image.update(
 )
 range_state["videos"] = [range_video]
 range_state["images"] = [range_image]
-range_output = prompt_library._build_prompt_package(range_state)
+range_output = prompt_library._build_data_only_prompt_package(range_state)
 range_job = agent._assert_public_job_data_contract(range_output)
 range_fx = agent._assert_fx_timing_source_contract(range_output)
 range_record = range_job["frame_ranges"][0]
@@ -261,18 +268,20 @@ assert range_record["unresolved_segments"] == [
 ]
 assert range_fx["valid"] is False
 assert range_fx["sources"][0]["range_on"] is True
-assert range_fx["sources"][0]["range_segments"] == [
-    {
-        "segment_id": "image1-video1-1",
-        "image": "@image1",
-        "video": "@video1",
-        "marker_color": "Red",
-        "target_id": "JettMini",
-        "target_scope": "",
-        "start_frame": 10,
-        "end_frame": 20,
-    }
-]
+range_segments = range_fx["sources"][0]["range_segments"]
+assert len(range_segments) == 1
+segment = dict(range_segments[0])
+segment_id = segment.pop("segment_id")
+assert re.fullmatch(r"image1-video1-[0-9a-f]{16}-1", segment_id)
+assert segment == {
+    "image": "@image1",
+    "video": "@video1",
+    "marker_color": "Red",
+    "target_id": "JettMini",
+    "target_scope": "",
+    "start_frame": 10,
+    "end_frame": 20,
+}
 
 print(
     "HMB data-only Prompt and protected Agent output regression: PASS "

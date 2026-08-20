@@ -37,7 +37,7 @@ picker_node = picker.HMBVideoPickerLibrary(name="picker_state_restore")
 assert picker_node.width == 1400
 assert picker_node.height == 1200
 assert picker_node.metadata["size"] == {"width": 1400, "height": 1200}
-assert picker_node.metadata["hmb_picker_native_size_version"] == 2
+assert picker_node.metadata["hmb_picker_native_size_version"] == 3
 
 # Updating the library's new-node default must not migrate a serialized manual
 # resize from an existing workflow.
@@ -50,7 +50,7 @@ resized_picker_node = picker.HMBVideoPickerLibrary(
     metadata=copy.deepcopy(saved_picker_metadata),
 )
 assert resized_picker_node.metadata["size"] == saved_picker_metadata["size"]
-assert resized_picker_node.metadata["hmb_picker_native_size_version"] == 2
+assert resized_picker_node.metadata["hmb_picker_native_size_version"] == 3
 saved_picker_state = copy.deepcopy(picker_node._picker_state())
 saved_picker_state.update({
     "runtime_instance_id": "saved-workflow-runtime",

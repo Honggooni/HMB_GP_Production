@@ -307,7 +307,10 @@ assert picker._operation_input_digest(
 ) == mask_digest
 operation_probe = object.__new__(picker.HMBVideoPickerLibrary)
 packed_context = operation_probe._create_operation_context(
-    "run_video", digest_scene, packed, 1,
+    # Context creation starts *before* the four generated outputs are appended.
+    # Refeeding the already-packed eight-item terminal state would correctly
+    # reserve another four outputs and exceed the Shot's ten-asset capacity.
+    "run_video", digest_scene, four_choice_state, 1,
 )
 assert packed_context.mask_authoring_slot == 1
 no_output_state = picker._default_widget_state()
@@ -663,7 +666,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.6.1"
+assert manifest["metadata"]["library_version"] == "0.6.36"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
@@ -671,10 +674,12 @@ assert registered_widgets == {
     "HMBAgentLibraryWidget",
     "HMBImageAssetLibraryWidget",
     "HMBPromptLibraryScopedBindingWidget",
+    "HMBSeedanceGenerationWidget",
     "HMBVideoPickerCommandBridgeWidget",
     "HMBVideoPickerLibraryWidget",
 }
 assert (ROOT / "widgets/HMBVideoPickerCommandBridgeWidget_v032.js").is_file()
+assert (ROOT / "widgets/HMBSeedanceGenerationWidget.js").is_file()
 obsolete_picker_widgets = (
     "HMBVideoPickerLibraryWidget.js",
     "HMBVideoPickerLibraryWidget_v028.js",
@@ -1061,7 +1066,7 @@ state_parameter = picker._get_parameter_obj(node, picker.WIDGET_STATE_PARAMETER)
 command_parameter = picker._get_parameter_obj(node, picker.WIDGET_COMMAND_PARAMETER)
 assert picker.PICKER_START_WIDTH == 1400
 assert picker.PICKER_WIDGET_START_HEIGHT == picker.PICKER_START_HEIGHT == 1200
-assert picker.PICKER_NATIVE_SIZE_VERSION == 2
+assert picker.PICKER_NATIVE_SIZE_VERSION == 3
 assert node.metadata["size"] == {
     "width": picker.PICKER_START_WIDTH,
     "height": picker.PICKER_START_HEIGHT,
@@ -1076,7 +1081,7 @@ assert command_parameter.input_types == ["dict"]
 assert command_parameter.ui_options["expandable"] is False
 assert command_parameter.ui_options["hide_label"] is True
 assert command_parameter.ui_options["hide_handles"] is True
-assert state_parameter.ui_options["expandable"] is True
+assert state_parameter.ui_options["expandable"] is False
 assert picker._playblast_resolution({}) == (1280, 720)
 assert picker._playblast_resolution({"output_width": 1920, "output_height": 1080}) == (1920, 1080)
 assert picker._playblast_resolution({"output_width": 1600, "output_height": 900}) == (1280, 720)
