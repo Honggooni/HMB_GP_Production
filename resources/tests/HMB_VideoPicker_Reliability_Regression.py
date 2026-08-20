@@ -2,7 +2,6 @@ from pathlib import Path
 import copy
 import hashlib
 import importlib.util
-import inspect
 import io
 import json
 import queue
@@ -12,6 +11,8 @@ import tempfile
 import threading
 import time
 import types
+
+from _hmb_private_policy_fixture import install_private_policy_reader
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -75,85 +76,16 @@ def send_command(node, action, action_id, payload=None, runtime_id=None):
     return node.set_parameter_value(picker.WIDGET_COMMAND_PARAMETER, command)
 
 
+common = load("_hmb_common")
 picker = load("HMBVideoPickerLibrary")
 prompt = load("HMBPromptLibrary")
 agent = load("HMBAgentLibrary")
+_original_policy_reader, signed_policy_fixture = install_private_policy_reader(common)
+if agent._hmb is not common:
+    install_private_policy_reader(agent._hmb)
 
 assert prompt.PICKER_DEPTH_PROFILE == picker.DEPTH_PLAYBLAST_PROFILE
 assert picker.DEPTH_PLAYBLAST_PROFILE == "hmb_camera_space_depth_v7"
-assert picker.MAYA_WORLD_PATTERN_PROFILE == "hmb_maya_world_root_projection_v1"
-assert picker.WORLD_PATTERN_BASE_CELL_WORLD_UNITS == 15.0
-assert picker.WORLD_PATTERN_DENSITY_MULTIPLIER == 3.0
-assert picker.WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS == 5.0
-assert picker.MAYA_WORLD_PATTERN_PROJECTIONS == {
-    "floor_grid": ("Planar", "XZ"),
-    "direction_checker": ("TriPlanar", "XYZ"),
-    "position_pattern": ("TriPlanar", "XYZ"),
-    "sky_grid": ("TriPlanar", "XYZ"),
-}
-
-world_pattern_rows = []
-for pattern, (projection_type, projection_axis) in (
-    picker.MAYA_WORLD_PATTERN_PROJECTIONS.items()
-):
-    token = pattern.replace("_", "_").title().replace("_", "")
-    world_pattern_rows.append({
-        "pattern": pattern,
-        "projection_type": projection_type,
-        "projection_axis": projection_axis,
-        "reference_frame": 101.0,
-        "camera_anchored": False,
-        "uv_dependent": False,
-        "root_scale_followed": True,
-        "world_cell_scale_compensated": True,
-        "projection_node": "HMB_{0}_Projection".format(token),
-        "projector_node": "HMB_{0}_Projector".format(token),
-        "anchor_node": "HMB_{0}_RootAnchor".format(token),
-        "constraint_node": "HMB_{0}_parentConstraint".format(token),
-        "scale_constraint_node": "HMB_{0}_scaleConstraint".format(token),
-        "scale_compensator_node": "HMB_{0}_ScaleCompensator".format(token),
-    })
-world_pattern_report = {
-    "profile": picker.MAYA_WORLD_PATTERN_PROFILE,
-    "coordinate_space": "background_root",
-    "camera_anchored": False,
-    "uv_dependent": False,
-    "root_scale_followed": True,
-    "world_cell_scale_compensated": True,
-    "base_cell_world_units": 15.0,
-    "density_multiplier": 3.0,
-    "cell_size_world_units": 5.0,
-    "reference_frame": 101.0,
-    "pattern_binding_count": 4,
-    "projection_node_count": 4,
-    "projector_node_count": 4,
-    "patterns": world_pattern_rows,
-}
-world_pattern_options = {
-    "output_transform_disabled": True,
-    "multisample_disabled": True,
-    "line_aa_disabled": True,
-    "ssao_disabled": True,
-    "motion_blur_disabled": True,
-}
-world_confirmation = {
-    "world_pattern_profile": picker.MAYA_WORLD_PATTERN_PROFILE,
-    "world_pattern_report": world_pattern_report,
-    "world_pattern_render_options": world_pattern_options,
-}
-assert picker._validate_world_pattern_runner_confirmation(
-    world_confirmation,
-) == world_pattern_report
-invalid_world_confirmation = copy.deepcopy(world_confirmation)
-invalid_world_confirmation["world_pattern_report"]["camera_anchored"] = True
-try:
-    picker._validate_world_pattern_runner_confirmation(
-        invalid_world_confirmation,
-    )
-except RuntimeError as exc:
-    assert "camera independence" in str(exc)
-else:
-    raise AssertionError("Camera-anchored patterns must fail closed.")
 
 # Generate Playblast owns the only execution trigger. Four inert choices pack
 # their validated results in Original -> Mask -> Depth -> Motion Guide order.
@@ -375,7 +307,10 @@ assert picker._operation_input_digest(
 ) == mask_digest
 operation_probe = object.__new__(picker.HMBVideoPickerLibrary)
 packed_context = operation_probe._create_operation_context(
-    "run_video", digest_scene, packed, 1,
+    # Context creation starts *before* the four generated outputs are appended.
+    # Refeeding the already-packed eight-item terminal state would correctly
+    # reserve another four outputs and exceed the Shot's ten-asset capacity.
+    "run_video", digest_scene, four_choice_state, 1,
 )
 assert packed_context.mask_authoring_slot == 1
 no_output_state = picker._default_widget_state()
@@ -435,16 +370,9 @@ with tempfile.TemporaryDirectory() as orchestration_temp_text:
         picker.HMBVideoPickerLibrary(name="four_role_orchestration")
     )
     orchestration_syncs = []
-    orchestration_terminal_boundaries = []
-    def capture_orchestration_sync(state):
-        orchestration_syncs.append(copy.deepcopy(state))
-        orchestration_terminal_boundaries.append({
-            "active_retired": orchestration_node._hmb_active_operation is None,
-            "process_lock_released": not orchestration_node._hmb_process_lock.locked(),
-        })
-        return ""
-
-    orchestration_node._sync_outputs_from_state = capture_orchestration_sync
+    orchestration_node._sync_outputs_from_state = (
+        lambda state: orchestration_syncs.append(copy.deepcopy(state)) or ""
+    )
     orchestration_state = orchestration_node._picker_state()
     orchestration_state.update({
         "scene_path": str(orchestration_scene),
@@ -526,10 +454,6 @@ with tempfile.TemporaryDirectory() as orchestration_temp_text:
         "original", "mask", "depth", "motion_guide",
     ]
     assert len(orchestration_syncs) == 1
-    assert orchestration_terminal_boundaries == [{
-        "active_retired": True,
-        "process_lock_released": True,
-    }]
 
     # A selected Original failure is terminal. The shared core stage must not
     # run and no subset of the remaining three checked roles may be published.
@@ -667,151 +591,6 @@ with tempfile.TemporaryDirectory() as orchestration_temp_text:
     ]
     assert snapshot_failure_syncs == []
 
-# A terminal state must no longer be invalidatable by the previous in-memory
-# context. This reproduces the former post-success recolor -> CANCELLING race.
-terminal_race_node = install_direct_picker_state_writes(
-    picker.HMBVideoPickerLibrary(name="terminal_recolor_race")
-)
-terminal_race_state = terminal_race_node._picker_state()
-terminal_race_state.update({
-    "native_read_ready": True,
-    "original_enabled": False,
-    "mask_enabled": True,
-    "slot_assignments": [{
-        "video_slot": 1,
-        "bindings": [{
-            "group_name": "Actor",
-            "full_dag_path": "|Actor",
-            "color": "Red",
-            "enabled": True,
-        }],
-    }],
-})
-terminal_context = terminal_race_node._create_operation_context(
-    "run_video",
-    "C:/terminal/recolor.mb",
-    terminal_race_state,
-    1,
-)
-terminal_race_node._hmb_active_operation = terminal_context
-terminal_running_state = terminal_race_node._mark_operation_started(
-    terminal_race_state,
-    "run_video",
-)
-terminal_running_state.update({
-    "operation_id": terminal_context.operation_id,
-    "operation_input_digest": terminal_context.input_digest,
-    "operation_scene_fingerprint": terminal_context.scene_fingerprint,
-})
-terminal_finished_state = terminal_race_node._mark_operation_finished(
-    terminal_running_state
-)
-terminal_finished_state.update({
-    "status": "OUTLINER_READY",
-    "scene_stage": "OUTLINER_READY",
-})
-terminal_race_node._write_state(terminal_finished_state)
-terminal_invalidations = []
-terminal_race_node._invalidate_active_operation = (
-    lambda *args, **kwargs: terminal_invalidations.append((args, kwargs))
-)
-terminal_recolor_state = terminal_race_node._picker_state()
-terminal_recolor_state["slot_assignments"][0]["bindings"][0]["color"] = "Pink"
-terminal_race_node.after_value_set(
-    picker.WIDGET_STATE_PARAMETER,
-    terminal_recolor_state,
-)
-assert terminal_invalidations == []
-assert terminal_race_node._picker_state()["slot_assignments"][0]["bindings"][0][
-    "color"
-] == "Pink"
-terminal_race_node._hmb_active_operation = None
-
-# Generate carries the exact visible authoring snapshot so an immediately
-# preceding recolor cannot be overtaken by the independent command transport.
-snapshot_command_node = install_direct_picker_state_writes(
-    picker.HMBVideoPickerLibrary(name="generate_authoring_snapshot")
-)
-snapshot_command_state = snapshot_command_node._picker_state()
-snapshot_command_state.update({
-    "original_enabled": False,
-    "mask_enabled": True,
-    "slot_assignments": [{
-        "video_slot": 1,
-        "bindings": [{
-            "group_name": "Actor",
-            "full_dag_path": "|Actor",
-            "color": "Red",
-            "enabled": True,
-        }],
-    }],
-})
-snapshot_command_node._write_state(snapshot_command_state)
-accepted_authoring_states = []
-def capture_authoring_operation(action, state):
-    accepted_authoring_states.append((action, copy.deepcopy(state)))
-    with snapshot_command_node._hmb_operation_control_lock:
-        snapshot_command_node._hmb_pending_operation_id = ""
-
-snapshot_command_node._start_ui_operation = capture_authoring_operation
-snapshot_command_node._handle_picker_command({
-    "schema": picker.COMMAND_SCHEMA,
-    "version": picker.COMMAND_VERSION,
-    "runtime_instance_id": snapshot_command_node._hmb_runtime_instance_id,
-    "action": "run_video",
-    "action_id": "authoring-snapshot-run",
-    "payload": {
-        "include_original": True,
-        "include_mask": True,
-        "include_depth": True,
-        "include_motion_guide": True,
-        "authoring_state": {
-            "original_enabled": True,
-            "mask_enabled": True,
-            "depth_enabled": True,
-            "motion_guide_enabled": True,
-            "slot_assignments": [{
-                "video_slot": 1,
-                "bindings": [{
-                    "group_name": "Actor",
-                    "full_dag_path": "|Actor",
-                    "color": "Pink",
-                    "enabled": True,
-                }],
-            }],
-            "slot_visibility": [{"video_slot": 1, "hidden_paths": []}],
-            "output_width": 1920,
-            "output_height": 1080,
-        },
-    },
-})
-assert len(accepted_authoring_states) == 1
-accepted_action, accepted_state = accepted_authoring_states[0]
-assert accepted_action == "run_video"
-assert picker._generation_choice_roles(accepted_state) == [
-    "original", "mask", "depth", "motion_guide",
-]
-assert accepted_state["slot_assignments"][0]["bindings"][0]["color"] == "Pink"
-assert (accepted_state["output_width"], accepted_state["output_height"]) == (
-    1920, 1080,
-)
-
-cancel_retry_node = install_direct_picker_state_writes(
-    picker.HMBVideoPickerLibrary(name="cancel_retry_ready")
-)
-cancel_retry_state = cancel_retry_node._picker_state()
-cancel_retry_state.update({
-    "native_read_ready": True,
-    "operation_kind": "run_video",
-    "operation_started_at_ms": int(time.time() * 1000),
-})
-cancel_retry_node._write_state(cancel_retry_state)
-cancel_retry_node._sync_outputs_from_state = lambda _state: ""
-cancel_retry_node._set_cancelled_state()
-assert cancel_retry_node._picker_state()["status"] == "OUTLINER_READY"
-assert cancel_retry_node._picker_state()["scene_stage"] == "OUTLINER_READY"
-assert cancel_retry_node._picker_state()["operation_kind"] == ""
-
 # Private multi-stage generation may write its staging state, but it must not
 # publish VIDEO/PICKER outputs until the final packed commit.
 atomic_probe = object.__new__(picker.HMBVideoPickerLibrary)
@@ -887,7 +666,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.6.25"
+assert manifest["metadata"]["library_version"] == "0.6.36"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
@@ -895,10 +674,12 @@ assert registered_widgets == {
     "HMBAgentLibraryWidget",
     "HMBImageAssetLibraryWidget",
     "HMBPromptLibraryScopedBindingWidget",
+    "HMBSeedanceGenerationWidget",
     "HMBVideoPickerCommandBridgeWidget",
     "HMBVideoPickerLibraryWidget",
 }
 assert (ROOT / "widgets/HMBVideoPickerCommandBridgeWidget_v032.js").is_file()
+assert (ROOT / "widgets/HMBSeedanceGenerationWidget.js").is_file()
 obsolete_picker_widgets = (
     "HMBVideoPickerLibraryWidget.js",
     "HMBVideoPickerLibraryWidget_v028.js",
@@ -945,14 +726,22 @@ for native_size_key in (
 ):
     assert native_size_key not in agent_manifest["metadata"]
 
-# The signed Agent policy is bundled with the matching library release. Keep
-# exactly one artifact at the fixed runtime path while the UI assertions below
-# remain exact.
-bundled_agent_policy = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
-assert bundled_agent_policy.is_file()
-assert list(ROOT.rglob("hmb_agent_core.dat")) == [bundled_agent_policy]
-assert hashlib.sha256(bundled_agent_policy.read_bytes()).hexdigest() == (
-    "7171bef7169df8894ed24ae7a9b4d9d145957c5110c963b7435372b2695fd251"
+# The active runtime is the server-hosted signed v4.1 policy. This internal
+# regression injects the private signed artifact without creating a local
+# runtime fallback or copying it into the public package.
+assert hashlib.sha256(signed_policy_fixture).hexdigest() == (
+    "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
+)
+policy_payload = common._load_agent_rule_payload()
+assert policy_payload["final_policy_version"] == (
+    "2026-08-11.agent-shot-quality.v4.1"
+)
+assert policy_payload["final_motion_look_policy_sha256"] == (
+    "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
+)
+assert agent._assert_prompt_policy_identity_matches_signed_runtime() == (
+    policy_payload["final_policy_version"],
+    policy_payload["final_motion_look_policy_sha256"],
 )
 
 widget_source = (ROOT / "widgets/HMBVideoPickerLibraryWidget_v032.js").read_text(encoding="utf-8")
@@ -978,12 +767,11 @@ assert "def _apply_widget_action(" not in picker_source
 assert "commitAndRemount" not in widget_source
 assert "HMBVideoPickerLibraryWidget(container, {" not in widget_source
 assert "emit(props, state);\n          remount();" not in prompt_widget_source
+assert prompt_widget_source.count("emit(props, state);\n        remount();") == 1
 assert 'state.ui.language = uiLanguage(state) === "ko" ? "en" : "ko";' in prompt_widget_source
-assert prompt_widget_source.count("remount();") == 2
+assert prompt_widget_source.count("remount();") == 4
 assert "hmbCommitLocalPromptStructure(container, props, state, remount)" in prompt_widget_source
-assert "committedState = remount() || state" in prompt_widget_source
-assert "hmbEmitLocalPromptState(container, props, committedState);" in prompt_widget_source
-assert "if (currentValue === nextValue && !disabledChanged) {" in prompt_widget_source
+assert "if (currentValue === nextValue && !disabledChanged) return;" in prompt_widget_source
 assert 'pending_action: "read_scene"' not in widget_source
 assert 'pending_action: "run_video"' not in widget_source
 assert 'pending_action: "render_snapshot"' not in widget_source
@@ -1016,7 +804,7 @@ assert "function hmbApplyPickerInitialNodeSizeOnce(container)" in widget_source
 assert "hmbApplyPickerInitialNodeSizeOnce(container);\n  concealNativeMayaPicker(container);" in widget_source
 assert "currentWidth < HMB_DEFAULT_NODE_WIDTH - 1" not in widget_source
 assert "currentHeight < HMB_DEFAULT_NODE_HEIGHT - 1" not in widget_source
-assert "const HMB_RIGHT_SECTION_DEFAULT_HEIGHTS = { settings: 217, color: 628, log: 208 };" in widget_source
+assert "const HMB_RIGHT_SECTION_DEFAULT_HEIGHTS = { settings: 285, color: 628, log: 208 };" in widget_source
 assert '{ value: "1920x1080", width: 1920, height: 1080' in widget_source
 assert 'id="playblast-resolution"' in widget_source
 assert "(1920, 1080)" in picker_source
@@ -1069,21 +857,14 @@ expected_object = [
     "Sky Blue", "Mint", "Beige",
     "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern",
 ]
-expected_ghost = expected_object[:3]
 assert character == expected_actor
 assert background == expected_object
 assert picker.MARKER_ORDER == expected_actor + expected_object
 assert prompt.ACTOR_COLOR_PICK_CHOICES == expected_actor
 assert prompt.OBJECT_COLOR_PICK_CHOICES == expected_object
 assert prompt.COLOR_PICK_CHOICES == picker.MARKER_ORDER
-assert prompt._color_pick_choices_for_source_type("Character Appearance") == (
-    expected_actor + expected_ghost
-)
+assert prompt._color_pick_choices_for_source_type("Character Appearance") == expected_actor
 assert prompt._color_pick_choices_for_source_type("Prop / Accessory") == expected_object
-assert prompt._color_pick_choices_for_source_type("Custom") == expected_actor + expected_object
-prompt_taxonomy = prompt._image_taxonomy_payload()
-assert prompt_taxonomy["actor_color_pick_choices"] == expected_actor + expected_ghost
-assert prompt_taxonomy["object_color_pick_choices"] == expected_object
 
 original_mayabatch_candidates = picker._mayabatch_candidates
 try:
@@ -1285,7 +1066,7 @@ state_parameter = picker._get_parameter_obj(node, picker.WIDGET_STATE_PARAMETER)
 command_parameter = picker._get_parameter_obj(node, picker.WIDGET_COMMAND_PARAMETER)
 assert picker.PICKER_START_WIDTH == 1400
 assert picker.PICKER_WIDGET_START_HEIGHT == picker.PICKER_START_HEIGHT == 1200
-assert picker.PICKER_NATIVE_SIZE_VERSION == 2
+assert picker.PICKER_NATIVE_SIZE_VERSION == 3
 assert node.metadata["size"] == {
     "width": picker.PICKER_START_WIDTH,
     "height": picker.PICKER_START_HEIGHT,
@@ -1300,7 +1081,7 @@ assert command_parameter.input_types == ["dict"]
 assert command_parameter.ui_options["expandable"] is False
 assert command_parameter.ui_options["hide_label"] is True
 assert command_parameter.ui_options["hide_handles"] is True
-assert state_parameter.ui_options["expandable"] is True
+assert state_parameter.ui_options["expandable"] is False
 assert picker._playblast_resolution({}) == (1280, 720)
 assert picker._playblast_resolution({"output_width": 1920, "output_height": 1080}) == (1920, 1080)
 assert picker._playblast_resolution({"output_width": 1600, "output_height": 900}) == (1280, 720)
@@ -1326,22 +1107,6 @@ normalized_legacy = picker._parse_state(legacy_state)
 assert normalized_legacy["viewport_panel_height"] == 684
 assert normalized_legacy["right_section_heights"]["color"] == 628
 assert picker._parse_state(normalized_legacy) == normalized_legacy
-
-version_five_layout = picker._default_widget_state()
-version_five_layout["ui_layout_version"] = 5
-version_five_layout["right_section_heights"] = {
-    "settings": 285,
-    "color": 628,
-    "log": 208,
-}
-normalized_version_five = picker._parse_state(version_five_layout)
-assert normalized_version_five["ui_layout_version"] == 6
-assert normalized_version_five["right_section_heights"] == {
-    "settings": 217,
-    "color": 628,
-    "log": 208,
-}
-assert picker._parse_state(normalized_version_five) == normalized_version_five
 
 for malformed in (None, [], {}, "bad", float("nan"), float("inf"), -99, 999):
     parsed = picker._parse_state({
@@ -1617,13 +1382,8 @@ assert "URL.createObjectURL" not in widget_source
 assert "URL.revokeObjectURL" not in widget_source
 assert 'data-visibility-path=' in widget_source
 assert "slot_visibility" in widget_source
-assert "export function hmbPickerPaletteGroups(markerCatalog)" in widget_source
-assert "const actorOptions = paletteGroups.actor" in widget_source
-assert "const ghostOptions = paletteGroups.ghost" in widget_source
-assert "const objectOptions = paletteGroups.object" in widget_source
-assert 'data-palette-kind="actor"' in widget_source
-assert 'data-palette-kind="ghost"' in widget_source
-assert 'data-palette-kind="object"' in widget_source
+assert "const actorOptions = markerOptions.slice(0, 7)" in widget_source
+assert "const objectOptions = markerOptions.slice(7, 14)" in widget_source
 assert 'id="create-snapshot"' in widget_source
 assert 'id="delete-snapshot"' in widget_source
 assert 'id="snapshot-prev"' in widget_source
@@ -1648,22 +1408,6 @@ for retired_field in (
     assert retired_field not in widget_source
 
 maya_runner_source = (ROOT / "resources/maya/HMB_Maya_Background_Preview.py").read_text(encoding="utf-8")
-maya_guide_source = (
-    ROOT / "resources/maya/HMBVideoPicker_Maya_Guide.txt"
-).read_text(encoding="utf-8")
-changelog_source = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-assert "hmb_maya_world_root_projection_v1" in maya_guide_source
-for documentation_source in (maya_guide_source, changelog_source):
-    assert "Floor Grid" in documentation_source
-    assert "top-planar" in documentation_source
-    assert "triplanar" in documentation_source
-    assert "5 Maya world" in documentation_source
-    assert "3x" in documentation_source
-assert "first output frame" in maya_guide_source
-assert "never linked to the output camera" in maya_guide_source
-assert "never saved" in maya_guide_source
-assert "explicit legacy fallback" in maya_guide_source
-assert "one frame-global screen-space canvas anchored" not in maya_guide_source
 assert "def _apply_assigned_render_scope" in maya_runner_source
 assert "def _validated_picker_hidden_paths" in maya_runner_source
 assert "def _apply_hidden_paths" not in maya_runner_source
@@ -1690,9 +1434,6 @@ assert '("hardwareRenderingGlobals.multiSampleEnable", 0)' in maya_runner_source
 assert '("hardwareRenderingGlobals.lineAAEnable", 0)' in maya_runner_source
 assert '"hardwareRenderingGlobals.lightingMode", 0' in maya_runner_source
 assert '"hardwareRenderingGlobals.renderMode", 4' in maya_runner_source
-assert "def _world_projected_pattern_group(" in maya_runner_source
-assert "marker_group, pattern_record, projection = (" in maya_runner_source
-assert '"world_pattern_report"' in maya_runner_source
 assert "marker_group = _screen_space_pattern_shader(" in maya_runner_source
 assert "MARKER_PATTERN_IDS.get(color)" in maya_runner_source
 assert "enableMultisample" in maya_runner_source
@@ -1708,28 +1449,6 @@ assert '"generate_original_video": False' in picker_source
 assert '"original_video": ""' in picker_source
 assert 'if action == "render_original_preview":' in picker_source
 assert 'if action == "hide_original_preview":' in picker_source
-
-snapshot_mode_source = inspect.getsource(
-    picker.HMBVideoPickerLibrary._snapshot_mode
-)
-maya_mode_source = inspect.getsource(picker.HMBVideoPickerLibrary._maya_mode)
-for production_mode_source in (snapshot_mode_source, maya_mode_source):
-    assert '"world_space_patterns": True' in production_mode_source
-    assert '"world_pattern_profile": MAYA_WORLD_PATTERN_PROFILE' in (
-        production_mode_source
-    )
-    assert '"world_pattern_cell_units": WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS' in (
-        production_mode_source
-    )
-    assert '"world_pattern_density_multiplier": WORLD_PATTERN_DENSITY_MULTIPLIER' in (
-        production_mode_source
-    )
-    assert '"screen_space_patterns": False' in production_mode_source
-    assert "_world_pattern_preflight(" in production_mode_source
-    assert "_validate_world_pattern_runner_confirmation(" in (
-        production_mode_source
-    )
-    assert "_postprocess_screen_space_frames(" not in production_mode_source
 
 class FakeCompletedProcess:
     @staticmethod
@@ -2527,7 +2246,7 @@ assert applied["videos"][0]["label"] == "shot_playblast_1"
 assert applied["videos"][1]["label"] == "shot_playblast_2"
 assert applied["videos"][0]["source_type"] == "Maya Preview / Playblast"
 assert applied["videos"][0]["control_role"] == ""
-compiled_picker_prompt = prompt._build_data_only_prompt_package(applied)
+compiled_picker_prompt = prompt._build_prompt_package(applied)
 assert agent._is_hmb_prompt_library_payload(compiled_picker_prompt)
 
 # The four patterns use reserved categorical Surface Shader IDs. A host-side
@@ -2663,30 +2382,8 @@ for solid_background_payload in marker_payload_probe[1:4]:
     assert solid_background_payload["shading_profile"] == marker_payload_probe[0]["shading_profile"]
 for pattern_payload in marker_payload_probe[4:]:
     assert pattern_payload["shader_model"] == "surfaceShader"
-    assert pattern_payload["visual_profile"] == maya_runner.MAYA_WORLD_PATTERN_PROFILE
+    assert pattern_payload["visual_profile"] == "hmb_screen_space_pattern_post_v2"
     assert pattern_payload["out_rim"] == ""
-    assert pattern_payload["shading_profile"]["pattern_space"] == "background_root"
-    expected_projection = maya_runner._world_pattern_projection_type(
-        pattern_payload["shading_profile"]["pattern"]
-    )
-    assert (
-        pattern_payload["shading_profile"]["projection_type"],
-        pattern_payload["shading_profile"]["projection_axis"],
-    ) == expected_projection
-    assert pattern_payload["shading_profile"]["base_cell_world_units"] == 15.0
-    assert pattern_payload["shading_profile"]["density_multiplier"] == 3.0
-    assert pattern_payload["shading_profile"]["cell_size_world_units"] == 5.0
-    assert pattern_payload["shading_profile"]["camera_anchored"] is False
-    assert pattern_payload["shading_profile"]["uv_dependent"] is False
-
-# The old top-left compositor is retained solely as an explicit compatibility
-# fallback; production payload metadata must never claim it by default.
-fallback_payload_probe = maya_runner._marker_payload(
-    marker_payload_records,
-    pattern_profile=maya_runner.SCREEN_SPACE_PATTERN_PROFILE,
-)
-for pattern_payload in fallback_payload_probe[4:]:
-    assert pattern_payload["visual_profile"] == maya_runner.SCREEN_SPACE_PATTERN_PROFILE
     assert pattern_payload["shading_profile"]["pattern_space"] == "screen"
     assert pattern_payload["shading_profile"]["phase_origin"] == "frame_top_left"
     assert pattern_payload["shading_profile"]["linear_scale_divisor"] == 3

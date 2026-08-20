@@ -66,10 +66,7 @@ assert len(agent._split_behavior_rules(binding_file, 4)) == 4
 
 prompt_state = prompt._default_widget_state()
 prompt_state["text"]["SCENE_CONTEXT"] = "어두운 창고"
-readable_payload = prompt._build_prompt_package(prompt_state)
-assert "TARGET GENERATOR:" in readable_payload
-assert "USER DESCRIPTION DATA (JSON):" not in readable_payload
-hmb_payload = prompt._build_data_only_prompt_package(prompt_state)
+hmb_payload = prompt._build_prompt_package(prompt_state)
 assert agent._is_hmb_prompt_library_payload(hmb_payload)
 payload_lines = hmb_payload.splitlines()
 assert len(payload_lines) == 7

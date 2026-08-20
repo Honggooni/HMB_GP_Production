@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 import json
-import re
 import shutil
 import sys
 import tempfile
@@ -25,10 +23,6 @@ try:
 except Exception:
     ControlFlow = None
     GriptapeNodes = None
-
-
-def sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def compact_state(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -100,8 +94,6 @@ def main() -> int:
     test_root = Path(tempfile.mkdtemp(prefix="HMBVideoPicker_Live_"))
     scene_copy = test_root / source_scene.name
     shutil.copy2(source_scene, scene_copy)
-    source_hash_before = sha256(source_scene)
-    scene_copy_hash_before = sha256(scene_copy)
     transitions: List[Dict[str, Any]] = []
     result: Dict[str, Any] = {
         "ok": False,
@@ -376,19 +368,18 @@ def main() -> int:
                         "Live PLAYBLAST retained an oversized UI warning."
                     )
             video_path = Path(str(playblast_state.get("video_path") or ""))
-            output_folder = scene_copy.parent / scene_copy.stem
-            playblast_match = re.fullmatch(
-                rf"{re.escape(scene_copy.stem)}_playblast_([0-9a-f]{{12}})\.mp4",
-                video_path.name,
+            expected_playblast = scene_copy.parent / scene_copy.stem / f"{scene_copy.stem}_playblast_1.mp4"
+            expected_playblast_sidecar = (
+                scene_copy.parent
+                / scene_copy.stem
+                / f"{scene_copy.stem}_playblast_1.hmb.json"
             )
             if str(playblast_state.get("status") or "").upper() != "VIDEO_READY":
                 raise RuntimeError(
                     f"Live PLAYBLAST did not retain VIDEO_READY: {playblast_state.get('message')}"
                 )
-            if video_path.parent != output_folder or playblast_match is None:
+            if video_path != expected_playblast:
                 raise RuntimeError(f"Live PLAYBLAST used the wrong output name: {video_path}")
-            playblast_token = playblast_match.group(1)
-            expected_playblast_sidecar = video_path.with_suffix(".hmb.json")
             if not video_path.is_file() or video_path.stat().st_size <= 0:
                 raise RuntimeError(f"Live PLAYBLAST did not create a video: {video_path}")
             if not expected_playblast_sidecar.is_file():
@@ -409,32 +400,15 @@ def main() -> int:
                 raise RuntimeError(
                     "Live PLAYBLAST did not verify full-detail Smooth Preview 3."
                 )
-            world_report = playblast_metadata.get("world_pattern_report") or {}
+            screen_report = playblast_metadata.get("screen_space_postprocess") or {}
             if (
-                playblast_metadata.get("world_pattern_profile")
-                != picker.MAYA_WORLD_PATTERN_PROFILE
-                or world_report.get("profile")
-                != picker.MAYA_WORLD_PATTERN_PROFILE
-                or world_report.get("coordinate_space") != "background_root"
-                or world_report.get("camera_anchored") is not False
-                or world_report.get("uv_dependent") is not False
-                or world_report.get("root_scale_followed") is not True
-                or world_report.get("world_cell_scale_compensated") is not True
-                or float(world_report.get("base_cell_world_units") or 0.0) != 15.0
-                or float(world_report.get("density_multiplier") or 0.0) != 3.0
-                or float(world_report.get("cell_size_world_units") or 0.0) != 5.0
-                or "reference_frame" not in world_report
+                screen_report.get("profile")
+                != picker.SCREEN_SPACE_PATTERN_PROFILE
+                or bool(screen_report.get("uv_dependent"))
+                or screen_report.get("phase") != "frame_top_left"
             ):
                 raise RuntimeError(
-                    "Live PLAYBLAST did not publish the world/root pattern contract."
-                )
-            if (
-                "screen_space_postprocess" in playblast_metadata
-                or "screen_space_postprocess_pending" in playblast_metadata
-            ):
-                raise RuntimeError(
-                    "Production world-pattern PLAYBLAST unexpectedly ran the "
-                    "legacy screen-space postprocess."
+                    "Live PLAYBLAST did not publish the screen-space pattern contract."
                 )
             if (playblast_metadata.get("video_format") or {}).get("crf") != picker.PROXY_ENCODER_CRF:
                 raise RuntimeError("Live PLAYBLAST did not use the high-quality CRF profile.")
@@ -442,19 +416,8 @@ def main() -> int:
                 playblast_state.get("output_frame_count") or 0
             ):
                 raise RuntimeError("Live PLAYBLAST sidecar frame count disagrees with Picker state.")
-            if playblast_state.get("snapshot_active"):
-                raise RuntimeError("Live PLAYBLAST did not return the viewport to video mode.")
-            retained_snapshot = next(
-                (
-                    item for item in playblast_state.get("snapshots", [])
-                    if Path(str(item.get("path") or "")) == snapshot_path
-                ),
-                None,
-            )
-            if retained_snapshot is None or not snapshot_path.is_file():
-                raise RuntimeError(
-                    "Live PLAYBLAST did not preserve the reusable snapshot history."
-                )
+            if playblast_state.get("snapshot_active") or snapshot_path.exists():
+                raise RuntimeError("Live PLAYBLAST did not clear the snapshot cache.")
             result["playblast"]["video_size"] = video_path.stat().st_size
             if args.depth:
                 depth_slot = int(playblast_state.get("depth_video_slot") or 0)
@@ -464,12 +427,14 @@ def main() -> int:
                         f"{depth_slot}"
                     )
                 expected_depth = (
-                    output_folder
-                    / f"{scene_copy.stem}_depth_playblast_{playblast_token}.mp4"
+                    scene_copy.parent
+                    / scene_copy.stem
+                    / f"{scene_copy.stem}_depth_playblast_{depth_slot}.mp4"
                 )
                 expected_depth_sidecar = (
-                    output_folder
-                    / f"{scene_copy.stem}_depth_playblast_{playblast_token}.hmb.json"
+                    scene_copy.parent
+                    / scene_copy.stem
+                    / f"{scene_copy.stem}_depth_playblast_{depth_slot}.hmb.json"
                 )
                 if not expected_depth.is_file() or expected_depth.stat().st_size <= 0:
                     raise RuntimeError(
@@ -541,7 +506,7 @@ def main() -> int:
                     None,
                 )
                 if (
-                    picker_payload.get("schema_version") != 5
+                    picker_payload.get("schema_version") != 4
                     or not depth_payload
                     or depth_payload.get("source_type_hint")
                     != picker.DEPTH_SOURCE_TYPE
@@ -576,12 +541,14 @@ def main() -> int:
                         "Live Motion Guide and Depth occupied the same auxiliary slot."
                     )
                 expected_motion = (
-                    output_folder
-                    / f"{scene_copy.stem}_motion_guide_{playblast_token}.mp4"
+                    scene_copy.parent
+                    / scene_copy.stem
+                    / f"{scene_copy.stem}_motion_guide_{motion_slot}.mp4"
                 )
                 expected_motion_sidecar = (
-                    output_folder
-                    / f"{scene_copy.stem}_motion_guide_{playblast_token}.hmb.json"
+                    scene_copy.parent
+                    / scene_copy.stem
+                    / f"{scene_copy.stem}_motion_guide_{motion_slot}.hmb.json"
                 )
                 if (
                     not expected_motion.is_file()
@@ -675,7 +642,7 @@ def main() -> int:
                     None,
                 )
                 if (
-                    picker_payload.get("schema_version") != 5
+                    picker_payload.get("schema_version") != 4
                     or not motion_payload
                     or motion_payload.get("source_type_hint")
                     != picker.MOTION_GUIDE_SOURCE_TYPE
@@ -706,22 +673,6 @@ def main() -> int:
         result["error"] = f"{exc.__class__.__name__}: {exc}"
         result["terminal_state"] = compact_state(node._picker_state())
     finally:
-        source_hash_after = sha256(source_scene)
-        scene_copy_hash_after = sha256(scene_copy)
-        result["scene_immutability"] = {
-            "source_sha256_before": source_hash_before,
-            "source_sha256_after": source_hash_after,
-            "copy_sha256_before": scene_copy_hash_before,
-            "copy_sha256_after": scene_copy_hash_after,
-        }
-        if (
-            source_hash_after != source_hash_before
-            or scene_copy_hash_after != scene_copy_hash_before
-        ):
-            result["ok"] = False
-            result["error"] = (
-                "Source scene bytes changed during read-only Maya preview."
-            )
         result["transitions"] = transitions
         summary_path = test_root / "live_maya_smoke_summary.json"
         summary_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

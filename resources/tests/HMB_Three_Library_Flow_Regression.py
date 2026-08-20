@@ -134,7 +134,7 @@ for video in prompt_state["videos"][1:]:
     video["control_role"] = "Context Only"
 prompt_state["videos"][1]["source_type"] = "Motion Guide / Retargeting Reference"
 prompt_state["videos"][1]["control_role"] = "Derived Motion Decoding Only"
-compiled_prompt = prompt._build_data_only_prompt_package(prompt_state)
+compiled_prompt = prompt._build_prompt_package(prompt_state)
 compiled_job = prompt_json_section(compiled_prompt, "HMB JOB DATA (JSON):")
 assert compiled_job["images"][0]["label"] == "Hero"
 assert compiled_job["images"][0]["bindings"][0] == {

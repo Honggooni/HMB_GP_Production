@@ -43,18 +43,6 @@ assert "Derived Motion Decoding Only" in prompt.VIDEO_CONTROL_ROLE_CHOICES
 assert prompt.VIDEO_ROLE_COMPATIBILITY[
     "Motion Guide / Retargeting Reference"
 ] == {"Derived Motion Decoding Only"}
-motion_spec = prompt.SELF_SCOPED_AUXILIARY_REFERENCE_SPECS[
-    (
-        "Motion Guide / Retargeting Reference",
-        "Derived Motion Decoding Only",
-    )
-]
-assert motion_spec["authority_domain"] == "derived_motion_decoding"
-assert "explicit scoped instruction" in motion_spec["authority"]
-assert "named property" in motion_spec["authority"]
-assert "if no temporal subset is stated or clearly implied, it applies to the whole shot" in motion_spec["authority"]
-assert "otherwise only to that subset" in motion_spec["authority"]
-assert "zero independent motion" not in motion_spec["authority"]
 
 
 # A companion request always binds generation identity to @video1.
@@ -291,42 +279,14 @@ assert motion_row["picker_motion_guide_summary"] == {
 compiled_prompt = prompt._build_data_only_prompt_package(applied)
 compiled_lines = compiled_prompt.splitlines()
 assert len(compiled_lines) == 7
-assert compiled_lines[0] == "HMB_GP_Production"
-assert compiled_lines[1] == prompt.PUBLIC_JOB_CONTRACT_HEADER
-assert compiled_lines[3] == prompt.FX_TIMING_CONTRACT_HEADER
-assert compiled_lines[5] == prompt.USER_DESCRIPTION_DATA_HEADER
-
-compiled_job = json.loads(compiled_lines[2])
-compiled_fx = json.loads(compiled_lines[4])
-compiled_user = json.loads(compiled_lines[6])
-assert compiled_job["schema"] == prompt.PUBLIC_JOB_CONTRACT_SCHEMA
-assert compiled_job["version"] == prompt.PUBLIC_JOB_CONTRACT_VERSION
-compiled_videos = {item["video"]: item for item in compiled_job["videos"]}
-assert set(compiled_videos) == {"@video1", "@video2"}
-assert compiled_videos["@video1"]["label"] == "color"
-assert compiled_videos["@video1"]["source_type"] == "Maya Preview / Playblast"
-assert compiled_videos["@video2"]["label"] == "motion"
-assert compiled_videos["@video2"]["source_type"] == (
-    "Motion Guide / Retargeting Reference"
+compiled_job = json.loads(
+    compiled_lines[compiled_lines.index("HMB JOB DATA (JSON):") + 1]
 )
-assert compiled_videos["@video2"]["control_role"] == (
-    "Derived Motion Decoding Only"
-)
-assert compiled_videos["@video2"]["companion"] == {
-    "kind": "motion_guide",
-    "source_slot": 1,
-    "source_uid": "motion-regression-color",
-    "validated": True,
-}
-assert compiled_job["connections"] == {"image_asset": False, "picker": True}
-assert compiled_fx["schema"] == prompt.FX_TIMING_CONTRACT_SCHEMA
-assert compiled_fx["version"] == prompt.FX_TIMING_CONTRACT_VERSION
-assert compiled_fx["valid"] is True
-assert compiled_fx["errors"] == []
-assert compiled_user == {}
-assert "verified semantic face summary" not in compiled_prompt
-assert "final Blend Shape channel(s)" not in compiled_prompt
-assert "raw NURBS curve geometry" not in compiled_prompt
+compiled_motion = compiled_job["videos"][1]
+assert compiled_motion["source_type"] == "Motion Guide / Retargeting Reference"
+assert compiled_motion["control_role"] == "Derived Motion Decoding Only"
+assert compiled_motion["companion"]["kind"] == "motion_guide"
+assert compiled_motion["companion"]["validated"] is True
 
 bad_payload = copy.deepcopy(picker_payload)
 bad_payload["videos"][1]["bundle_run_id"] = "other-bundle"

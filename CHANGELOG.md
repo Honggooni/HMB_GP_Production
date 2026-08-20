@@ -1,455 +1,112 @@
 # Changelog
 
-## 0.6.25 - 2026-08-12
+## `v0.6.36` — 2026-08-20
 
-- Remove the HMBPromptLibrary left external-source and right output rails and
-  expand the production binding workspace across the released width without
-  changing Prompt source, binding, or output behavior.
-- Keep rapid Main Type, Sub Type, Target, video-role, and related cascading
-  selections stable by rejecting out-of-order retained-widget echoes with
-  monotonic UI and connected-source revisions.
-- Move HMBImageAssetLibrary file-format labels into the detail corner, place
-  the source name in the thumbnail footer, and retain source-name visibility
-  in image-only mode while preserving registration controls.
-- Apply the same revision-ordered state synchronization to Image Asset edits
-  so fast consecutive actions cannot be rolled back by a delayed host echo,
-  with release-audit regressions for both libraries.
+- Approved the audited public GitHub team-distribution channel. The release
+  contains only the public Broker CA and default service address; credentials,
+  private keys, signed policy bodies, and team media remain excluded.
+- Made HMBPromptLibrary Range a Prompt-owned per-image intent, independent of
+  VideoPicker JSON, video order, Color Pick, probed duration, and capability
+  flags. ON/OFF, signed 32-bit endpoints, and selected segments now survive
+  Picker refresh, empty selection, reorder, disconnect, and reconnect; only a
+  complete valid intent with a real video is projected to the Agent v1 media
+  contract, so incomplete/no-video editing never blocks ordinary generation.
+- Removed the fixed ZIP timestamp policy. Every packaged member now receives
+  the actual local build time, while uniform member times and content hashes
+  remain validated by the release builder and `--check-output`.
+- Resolved Seedance Shot media before the public empty-input preflight so
+  prompt-only, image-only, video-only, and combined jobs retain exact Shot
+  binding without a false `Provide a prompt or supported media input` failure.
+- Moved Agent policy retrieval, Seedance media preparation, and ImageAsset
+  registration work away from UI-critical sections while preserving signed
+  policy validation, durable media verification, cancellation, and rollback.
+- Made VideoPicker selection, ordering, and compact/expanded transitions paint
+  first, then publish coalesced state and geometry updates in the background.
+- Reduced repeated Shot-routing graph reads through per-pass connection caches
+  while retaining fail-closed UUID matching and ambiguity checks.
 
-## 0.6.24 - 2026-08-12
+## `v0.6.35` — 2026-08-20
 
-- Replace the ambient system-`ffprobe` requirement in Seedance result
-  publication with Griptape's already-installed package-local `static_ffmpeg`
-  verifier and the pinned package-managed `imageio-ffmpeg` fallback. Verification
-  requires no network access, runtime download, or separately installed
-  executable on the system `PATH`.
-- Resolve and validate the portable verifier before any billable Seedance
-  generation request, then perform a bounded real-frame decode of the staged
-  result before its atomic final publication.
-- Add a host-independent Seedance MP4 verifier regression to the public
-  Windows release-audit matrix, while retaining the full Generator regression
-  in the exact Griptape runtime matrix, so the no-system-`ffprobe` path and
-  pre-billable verifier gate remain release-blocking behavior.
+- Fixed Seedance StartFlow preflight so exact hidden ImageAsset/VideoPicker
+  Shot media is resolved before the public empty-input check, while execution
+  still revalidates Agent text, Shot UUID, and media hashes before Broker use.
+- Moved Seedance media preparation and ImageAsset registration/root scanning
+  off the UI/event loop, added bounded progress phases, and kept durable
+  verification, rollback, cancellation, and fail-closed submission semantics.
+- Made VideoPicker mode changes, selection, and drag ordering paint first and
+  publish on a coalesced later frame; reduced repeated normalization, compact
+  sizing passes, and eager ImageAsset thumbnail decoding.
+- Kept the authenticated Agent policy fetch outside the shared session lock,
+  exposed policy/preparation/run progress without policy data, and cached each
+  Shot-routing target's incoming connections for one reconciliation pass.
+- Unified ImageAsset and VideoPicker card ordering around Shot-local drag and
+  drop, removed the ImageAsset left/right ordering controls, and kept compact,
+  expanded, persisted, and downstream media order consistent.
+- Reworked VideoPicker compact/expanded view ownership so host measurement,
+  node geometry, and widget lifecycle cannot remove or collapse the live UI.
+- Hardened five-library Shot binding across reload, publisher replacement,
+  deletion, duplicate claims, and Agent-to-Seedance provenance validation.
+- Added an atomic release closure manifest and SHA-256 inventory so partial or
+  mixed-version installs can be detected before the library is activated.
+- Cleaned generated project caches and superseded release artifacts from the
+  developer workspace while retaining recovery backups and Maya prototypes.
 
-## 0.6.23 - 2026-08-12
+## `v0.6.34` — 2026-08-20
 
-- Activate signed Agent policy `2026-08-12.agent-shot-quality.v4.2`, under
-  which shot-specific policy application, summary, paraphrase, translation,
-  and inference over Prompt-selected facts are expected generator output and
-  are not private-policy disclosure.
-- Preserve every generator-required detail with no total output length,
-  source-name, token, character, paragraph, or conciseness cap and no automatic
-  truncation or omission of normal production wording.
-- Keep verbatim raw or reconstructable policy-artifact dumps, system
-  instructions, and private Agent objects, memory, validation state, and logs
-  fail-closed, without blocking policy-derived production instructions.
-- Retain the user-readable sectioned `PROMPT_OUT` and consume only its
-  atomically paired, same-generation private machine snapshot; never
-  reverse-parse visible prose into structured facts.
+- Restored Seedance `Only` prompt generation and made ImageAsset and
+  VideoPicker Shot media independently optional. The selector now exposes
+  `Only` plus each available numbered Shot, displays the active number, accepts
+  image-only, video-only, combined, and prompt-only jobs, and keeps duplicate
+  same-kind sources fail-closed.
+- Added a private standalone VideoPicker Shot catalog so one Picker can provide
+  video-conditioned Seedance input without requiring an ImageAsset node. When
+  ImageAsset exists, its UUID catalog remains authoritative.
 
-## 0.6.22 - 2026-08-12
+## `v0.6.01` (technical version `0.6.1`) — Unreleased
 
-- Recover the paired Prompt snapshot when Griptape `initial_setup` hydrates
-  persisted state without invoking the Prompt lifecycle hook, leaving the
-  constructor-time cache stale.
-- Keep `PROMPT_OUT` as the user-readable sectioned document and normalize only
-  terminal LF transport differences during exact visible-prompt matching.
-- Rebuild the visible document and private Agent snapshot atomically from the
-  same current source state when recovery is safe, while preserving fail-closed
-  pairing for genuine state mismatches.
-- Add safe stage-code logging for source-contract failures without exposing
-  private prompt content, structured payloads, or internal exception details.
-- Propagate late Video Picker output through the real retained-mode graph so
-  `PICKER_OUT -> PICKER_IN -> PROMPT_OUT -> Agent` updates immediately, while
-  discarding superseded re-entrant publications instead of restoring stale
-  values.
-- Restore the complete pre-connection manual video state when Picker is
-  disconnected, including video rows, image bindings, Frame Range state,
-  text references, and textarea sizing, while retaining edits made during the
-  connection and dormant Picker settings for a later reconnect.
-- Lock both add and delete controls for video rows while Picker owns their
-  order, and avoid rebuilding unchanged Main Type/Sub Type option DOM so
-  selection changes no longer flicker.
+> This is a preparation target only. It does not mark a signed, packaged,
+> committed, pushed, or otherwise completed `v0.6.01` release. The current
+> worktree alignment is temporary and must be cleanly re-applied onto the
+> `origin/main` `0.5.74` baseline before release preparation continues.
 
-## 0.6.21 - 2026-08-12
-
-- Keep Frame Range optional for `FX Reference` and `Timing / Edit Reference`:
-  Range OFF or unset uses the full source, a valid Range ON selection takes
-  temporal priority, and an invalid Range ON selection leaves only that image
-  binding unresolved instead of blocking the Agent run.
-- Clarify the protected Agent error so an absent role, emitter cue, or Frame
-  Range is not described as a required input.
-- Lock the Video Source `+` button while `PICKER_IN` is connected, matching the
-  existing Image Asset connection lock, and restore it immediately on Picker
-  disconnect.
-
-## 0.6.20 - 2026-08-12
-
-- Preserve the complete `0.5.74` user-facing feature and UI contract while
-  distributing exactly one signed Agent runtime artifact with the Library at
-  `resources/agent/hmb_agent_core.dat`.
-- Keep `hmb_agent_core.dat` as a signed, compressed integrity artifact. Each
-  installed artifact is freshly verified for Agent execution; missing or
-  unsigned edits, schema or contract drift, and malformed Behavior 1/2
-  structures fail closed.
-- Restore the concise, user-readable Target Generator, Image Source, Image
-  Role, Replacement Binding, and Video Source view on `PROMPT_OUT`, while the
-  directly connected Agent consumes an atomically paired, private, closed
-  JOB/FX/USER machine envelope from the same Prompt state. USER DESCRIPTION
-  contains only the five fields directly authored in the Prompt UI; connected
-  transport metadata and policy prose remain excluded from the machine input.
-- Apply the reviewed v4.1 FX Reference, Timing/Edit, exact emitter point, and
-  Range ON contract internally without changing existing controls, ports,
-  defaults, layouts, or saved-state behavior.
-- Activate Video Source Binding immediately on the first populated `PICKER_IN`
-  update by preventing a delayed pre-connection widget echo from restoring the
-  older empty state. Keep the Frame Range row at one stable vertical position
-  for one or multiple Color Picks, expanding it only when a visible Custom
-  Scope input actually requires the extra row height.
-- Keep the four shared libraries generator-neutral and register only the final
-  `HMBSeedanceGeneration` module/class name.
-- Harden non-billable output preflight, cancellation handling, atomic MP4
-  publication, and bounded `ftyp`/`moov`/`mdat` validation without changing the
-  existing Generator UI or normal job flow.
-- Exclude every additional `.dat` and every English/Korean policy document from
-  GitHub release packages, including nested archives; Korean review files
-  remain local-only.
-
-## 0.5.74 - 2026-08-11
-
-- Reduced `HMBPromptLibrary.PROMPT_OUT` to the five user-verifiable Target Generator, Image Source, Image Role, Replacement Binding, and Video Source sections. Internal interpretation, authority, alignment, and multi-video policy prose is no longer serialized; the signed Agent v4 policy remains unchanged and runtime-only.
-- Removed the complete `USER DESCRIPTION DATA (JSON)` block and connected-source diagnostic fallback payloads from public Prompt output, preventing local paths, scene identifiers, render reports, and transport diagnostics from entering Agent conversation input.
-- Corrected terminal Seedance failure reporting so an unconfirmed provider submission is not described as a render that may still continue, while preserving the existing task ID and fail-closed no-resubmit contract.
-
-## 0.5.73 - 2026-08-11
-
-- Corrected the v0.5.72 middle-button interpretation: the ImageAsset viewport no longer captures or scrolls its own grid during a middle-button drag.
-- Kept wheel rotation as local image-list scrolling while passing middle-button pointer and mouse gestures through to Griptape's native whole-canvas pan, including at high canvas zoom.
-- Preserved left-click image selection, the v0.5.71 manifest-poll flicker fix, and non-middle interaction isolation inside the red asset viewport.
-
-## 0.5.72 - 2026-08-11
-
-- Restored hold-to-drag middle-button panning inside the ImageAsset viewport by isolating React Flow's compatibility `mousedown` before it can claim the gesture.
-- Kept an active local pan across pointer-capture loss and legacy embedded-WebView mouse streams, with bounded window-level cleanup on release, cancel, blur, or widget teardown.
-- Preserved the v0.5.71 flicker fix, local wheel scrolling, image selection behavior, and canvas zoom/pan outside the red asset viewport.
-
-## 0.5.71 - 2026-08-11
-
-- Prevented the Image Asset Library's lightweight 10-12 second manifest poll
-  echo from being normalized as an empty catalog and remounting the full asset
-  grid. Unchanged polls now preserve cards, loaded thumbnails, selection,
-  focus, and scroll position; real manifest changes still remount once.
-- Added vertical wheel scrolling and middle-button drag panning only inside the
-  main asset viewport. Griptape canvas zoom remains unchanged everywhere
-  outside that viewport, and left-click selection plus tray ordering are
-  preserved.
-- Added deterministic regressions for raw string/object poll echoes, canonical
-  authority updates, callback replacement, pointer capture failure and cleanup,
-  local wheel isolation, and middle-button movement.
-
-## 0.5.70 - 2026-08-11
-
-- Activated signed Agent policy `2026-08-11.agent-shot-quality.v4` with its
-  matching runtime, Prompt, release-builder, CI, documentation, and regression
-  identities. The bundled policy remains the only production policy source.
-- Added pre-generation policy boundaries for Actor 7, Ghost 3, Pattern 4,
-  scale authority, character-color continuity, children's TV readability, and
-  temporal identity stability. The policy explicitly does not claim generated
-  video inspection, defect grading, approval, rejection, or regeneration.
-- Added a signed-payload semantic regression to the release workflow and the
-  bounded 26-file CI validation archive. It verifies v4 meaning without
-  exposing a private signing key or introducing an external policy path.
-
-## 0.5.33 - 2026-08-11
-
-- Restored the established team rollout contract: approved changes reach the
-  public GitHub `main` branch, and team members apply them with Griptape's
-  Git-backed Library Update button.
-- Bumped the library version so existing Git installations can discover this
-  update, and documented that the registered Library must retain `.git`, its
-  GitHub `origin`, and the `main` tracking branch.
-- Retired ZIP replacement, copied-folder, network-drive, and SMB rollout as
-  installation paths. Generated archives remain bounded CI validation outputs,
-  are not installation packages, and must not replace a registered Git Library.
-
-## 0.5.32 - 2026-08-10
-
-- Removed the retired client-side Seedance usage ledger, its local retry queue,
-  and every runtime dependency on the temporary Composite Team source share.
-  Authenticated FN AI Broker generation is now the sole production usage,
-  quota, and accounting boundary.
-- Kept the signed Agent policy inside the installable library and retained its
-  bounded signature, version, contract, and payload-integrity validation. No
-  policy share or policy-path environment configuration is required.
-- Added source and release gates that reject the retired share marker, legacy
-  usage-ledger symbols, and stale copies in a team package.
-
-## 0.5.31 - 2026-08-10
-
-- Send FN AI Broker requests directly, without inheriting system or environment
-  proxies, while leaving all non-Broker internet traffic unchanged.
-- Retry bounded device-authorization start transport failures and recover
-  transient token-polling failures on the same device request without opening
-  duplicate browser windows or creating duplicate render jobs.
-- Preserve valid per-user DPAPI tokens across transport failures and add
-  credential-safe diagnostics for Broker connection failures.
-
-## 0.5.30 - 2026-08-10
-
-- Display FN AI Broker `queued` and `running` refresh results as neutral
-  in-progress status instead of a false warning, while preserving warnings for
-  actual terminal failures and connection errors.
-
-## 0.5.29 - 2026-08-09
-
-- Established GitHub and GitHub Releases as the permanent public team
-  distribution channel. Repository visibility is no longer treated as a
-  security boundary; release audits continue to reject credentials, tokens,
-  private signing keys, and non-public media.
-- Removed Image Asset selection cadence stalls by updating only the clicked
-  card, retaining keyed tray nodes and decoded thumbnails, and moving canonical
-  state publication after the immediate visual response.
-- Replaced full-catalog background manifest polling with a lightweight identity
-  probe and reused bounded verified project/import resolutions across ordinary
-  selection changes. Explicit execution still performs fresh validation.
-
-## 0.5.28 - 2026-08-09
-
-- Advanced the manifest, Python package, README, SBOM, and release-security
-  contract to `0.5.28` so Griptape Nodes update discovery no longer treats the
-  validated world-projection/team release as the already installed `0.5.27`.
-- Republished the exact validated four-library runtime and Video Picker render
-  behavior without changing node types, saved state, ports, Broker payloads,
-  Maya output roles, or signed Agent policy identity.
-
-## 0.5.27 - 2026-08-08
-
-- Split the Video Picker color palette into Actor 7, shared Ghost 3, and
-  Object-pattern 4 rows. Existing marker names, repeat behavior, saved
-  bindings, and solid-color Lambert rendering remain unchanged.
-- Replaced the four Object patterns' frame-locked screen-space compositor with
-  temporary UV-independent Maya projection graphs. Floor Grid uses top-planar
-  XZ projection while Direction Checker, Sky Grid, and Position Pattern use
-  triplanar XYZ projection; all four follow the selected background root and
-  retain camera perspective without modifying or saving authored UVs.
-- Fixed the projected pattern density at 3x the 15-unit baseline (5 Maya world
-  units per cell), with first-output-frame anchoring, root scale compensation,
-  cutout-alpha preservation, and fail-closed runner metadata validation.
-- Exposed the shared Ghost 3 colors to Prompt and Image Asset character
-  sources while keeping object/background choices at Ghost 3 plus Pattern 4
-  and preserving the unique 14-choice Custom order.
-- Compacted Video Picker FPS, format, and Maya information into one settings
-  row and reassigned the recovered 68 px to the initial Current Cut Videos
-  area, with a one-time saved-layout migration.
-- Added one-dialog ordered MP4 multi-selection on Windows and one atomic batch
-  import, preserving the 10-active-video limit while retaining overflow files
-  in the catalog.
-- Made Generate carry the exact visible camera, Color Pick, visibility, output
-  role, and resolution snapshot; terminal cleanup now completes before the
-  ready state is published, so immediate recoloring and consecutive renders
-  cannot strand the picker in a stale busy state.
-- Added strict Redshift proxy-placeholder Depth verification for drawable proxy
-  meshes that accept the expected whole-object shading group but do not expose
-  an `MFnMesh`, while keeping ordinary mesh and per-face checks fail-closed.
-- Renamed the public node file to `HMBSeedanceGeneration.py` and the Griptape
-  palette label to `HMB Seedance Generation` so future Broker render options are
-  not tied to one model version. The legacy serialized node type remains as an
-  override-free compatibility wrapper, preserving existing saved workflows.
-- Made Image Asset, Video Picker, and Prompt selections paint locally before
-  their authoritative host round trip, while preserving the existing state
-  schemas, parameter names, saved-workflow format, and Agent connection flow.
-- Removed large-grid listener/remount hot paths, cached immutable widget CSS
-  and manifest parses with bounded lifetimes, and coalesced repeated Prompt
-  output/resize work to eliminate click stalls and visible flicker.
-- Published the Image pair, `PICKER_OUT`, and `PROMPT_OUT` explicitly so every
-  connected Prompt/Agent consumer receives one coherent current snapshot;
-  generation settings and render behavior remain unchanged.
-- Added concurrency and no-loss regressions for stale host echoes, IME editing,
-  video source switching, command submission guards, output propagation, and
-  the complete four-library composition contract.
-- Replaced the Seedance node's CGTeamwork token exchange with the Broker's
-  one-time browser authorization and Windows DPAPI-protected permanent token.
-- Added one stable client request ID and matching idempotency header per render,
-  allowing lost responses to recover the same server task without duplicate
-  submission or billing.
-- Aligned Refresh and terminal-expiry handling with the durable Broker job API;
-  Refresh checks only the existing job and never creates a replacement render.
-- Added server-contract regressions for device authorization, idempotent retry,
-  provisional job aliases, and expired retained results.
-
-## 0.5.26 - 2026-08-08
-
-- Changed only the new Full Seedance 2.0 node default from 4K to the existing
-  `1080p` (1K) option. Explicitly saved 4K selections remain supported, and
-  the selected value is passed unchanged through Broker validation to
-  Volcengine.
-- Removed Griptape `process() returned unexpected type: dict` warnings from the
-  Image Asset, Video Picker, and Prompt data nodes while preserving their real
-  output-parameter payloads.
-- Prevented Refresh from overwriting an active Seedance render status while the
-  Broker submission is still waiting for its task ID.
-
-- Fixed FN AI Broker HTTP 400 failures caused by embedded reference media.
-  Seedance generation requests now share a tested 64 MiB client/server limit;
-  ordinary API endpoints retain their 2 MiB limit.
-- Aligned media-only Full/Fast/Mini generation, smart duration `-1`, and
-  first/last-frame validation across HMB, the Broker schema, and the Volcengine
-  payload adapter.
-- Added credential-safe HTTP 400/413 classification. Response bodies, provider
-  keys, and tokens are never copied into node state or logs.
-- Added a real HTTP regression with a Base64 reference payload larger than
-  2 MiB, while keeping the billable Volcengine call stubbed.
-
-## 0.5.25 - 2026-08-07
-
-- Expanded the FN AI Broker generation contract to the exact Volcengine
-  Seedance 2.0 Full, Fast, and Mini endpoint IDs; arbitrary catalog models and
-  non-Volcengine providers remain rejected locally.
-- Made Full Seedance 2.0 the default at 4K. Full exposes
-  4K/1080p/720p/480p, while Fast and Mini default to 720p and expose only
-  720p/480p. Switching models immediately updates and safely coerces the
-  resolution selector.
-- Kept the collapsed AI Broker panel limited to connection and account state.
-  No provider key, masked key characters, registration/update control, usage,
-  quota, or credit field is stored or displayed by the node.
-- Fixed the client/server request contract so HMB's auxiliary pixel-resolution
-  compatibility field is ignored by schema validation while the selected
-  Seedance quality remains authoritative, preventing the pre-provider HTTP 400.
-
-## 0.5.24 - 2026-08-07
-
-- Aligned HMB's Fast-model Broker request with the server's confirmed successful
-  generation contract by including the required pixel `resolution` plus the
-  explicit `web_search=false` and `content_filter=true` defaults. Portrait
-  ratios use `720x1280`; all other supported ratios use `1280x720`.
-- Fixed the remaining immediate HTTP 400 seen only from HMB clients. Admin
-  access logs showed the HMB requests being rejected in roughly 30-40 ms,
-  before provider execution or usage recording, while the server-native Fast
-  request containing these common fields succeeded.
-- Added bounded, allowlisted HTTP 400 classification. Broker response bodies are
-  never copied to node state or logs; users receive only a fixed safe category
-  for settings, reference media, or model validation.
-
-## 0.5.23 - 2026-08-07
-
-- Matched the Seedance node to the replacement FN AI Broker's verified runtime
-  contract. The server currently exposes catalog metadata for Full, Fast, and
-  Mini, but only `doubao-seedance-2-0-fast-260128` has the asynchronous video
-  generation adapter and a confirmed successful production request.
-- Made `Seedance 2.0 Fast` the node default and the only selectable Broker
-  model, with its verified 480p/720p resolution choices. Saved workflows that
-  still contain Full or Mini now fail locally with an actionable model message
-  instead of reaching the server and returning an opaque HTTP 400.
-- Added regression coverage for the Fast-only Broker boundary while preserving
-  legacy internal payload helpers. No provider key, Broker token, usage, quota,
-  or key-registration UI/state was added or exposed.
-
-## 0.5.22 - 2026-08-07
-
-- Changed the default FN AI Broker origin from
-  `http://192.168.204.242:8080` to `http://192.168.203.245:8080` after
-  confirming the replacement server health, CGTeamwork public-key endpoint,
-  and all three Volcengine Seedance 2.0 model definitions.
-- Preserved `HMB_AI_BROKER_URL` as the explicit installation override and kept
-  the existing strict origin validation and credential boundary unchanged.
-
-## 0.5.21 - 2026-08-07
-
-- Aligned HMB Seedance requests with each FN AI Broker model schema. The full
-  and mini models no longer receive Fast-only or unsupported `input_mode`,
-  last-frame, expiry, or priority fields, eliminating the HTTP 400 response on
-  otherwise valid default requests.
-- Added pre-submission validation for model-specific prompt, First/Last Frame,
-  Last Frame return, custom expiry, and priority support. Unsupported choices
-  now fail locally with a safe explanation before any billable request.
-- Added regressions that verify the exact full-model payload, preserve the Fast
-  frame contract, and prevent invalid model-field combinations from reaching
-  FN AI Broker.
-
-## 0.5.20 - 2026-08-07
-
-- Allowed the current production CGTeamwork origin
-  `cgteamwork.funnyflux.kr:443` alongside the legacy internal origin when
-  starting FN AI Broker approval, while retaining an exact normalized
-  allowlist and rejecting user-info, path, query, fragment, and lookalike-host
-  inputs.
-- Added regression coverage for both approved CGTeamwork origins and unsafe
-  origin variants so `Connect / Refresh` can create the `comp` approval request
-  without weakening the credential boundary.
-
-## 0.5.19 - 2026-08-07
-
-- Routed HMB Seedance 2.0 generation, task refresh, resume, and trusted result
-  downloads through the authenticated FN AI Broker at the configured server
-  origin. Provider API keys remain server-side and are never placed in node
-  parameters, outputs, logs, or serialized state.
-- Added a collapsed `AI Broker` group directly below Status with connection
-  state, account, and one nonblocking `Connect / Refresh` action. Key values,
-  key-registration controls, usage, quota, and reset information are absent;
-  Broker renders also perform no usage collection or local usage recording.
-- Made Picker Depth use Maya-authored visibility plus the Picker eye state
-  independently of Color Assignment, and made Mask recoloring replace stale
-  duplicate bindings by Maya UUID or exact DAG path.
-- Added Broker credential-boundary, async-button, generation/resume/refresh,
-  Picker visibility, Depth, and Mask recolor regressions.
-
-## 0.5.18 - 2026-08-06
-
-- Removed the redundant visible `ASSET · Asset ID` helper line beneath Image
-  Name in HMBPromptLibrary while preserving Asset ID data, binding authority,
-  tooltip diagnostics, and compiled `PROMPT_OUT` behavior.
-- Reclaimed the helper line's unused vertical space so frame-range controls no
-  longer shift downward merely because an image carries an Asset ID.
-- Kept the HMBImageAssetLibrary Add passport and its in-progress text intact
-  across asynchronous host/catalog updates. The latest deferred state is
-  applied once the dialog is cancelled or submitted instead of remounting its
-  live input controls while the user is typing.
-
-## 0.5.17 - 2026-08-06
-
-- Reduced the public `TARGET GENERATOR` preamble to target identification only.
-  Detailed production integration defaults are no longer duplicated in the
-  compiled user-visible Prompt and remain exclusively enforced by the bundled,
-  signed v3 Agent policy.
-- Added regressions that reject future policy-detail exposure in public Prompt
-  text while confirming the signed local policy remains the runtime authority.
-
-## 0.5.16 - 2026-08-06
-
-- Replaced the Agent policy with signed policy
-  `2026-08-06.animation-look-continuity.v3`, contract SHA-256
-  `ab5b63a42717293cc097d51bf3048b5309c0ff52644bd0121b3045f6eeadae93`,
-  and envelope SHA-256
-  `6152355dd51d68da33d4df197e6ac52f2c13b37d9644aa50efd9ba8c2cf13619`.
-- Removed external and network-share policy resolution. The Agent now reads and
-  verifies only the `resources/agent/hmb_agent_core.dat` installed beside the
-  library, with no policy-path environment variable or fallback order.
-- Deferred the required team-project `{_index}` output macro until Griptape's
-  collision-safe write stage, preventing Seedance generation and Refresh from
-  failing before the engine assigns the output index. Other missing macro
-  variables and destination errors still fail before task submission.
-- Reduced the production ZIP to exactly 25 allowlisted runtime files. The signed
-  `.dat` is included; `CHANGELOG.md`, `resources/build_release.py`, policy
-  administration scripts, private keys, credentials, tokens, and every other
-  `.dat` are excluded. The release audit verifies the exact policy hash and
-  source security boundary; release preparation also verifies two identical
-  reproducible builds and the complete archive security regression.
-
-## 0.5.15 - 2026-08-06
-
-- Bundled the exact signed Agent policy
-  `2026-08-01.goal-final-authority.v2` as the first local policy precursor. Its
-  temporary network-precedence experiment was later retired; current releases
-  resolve only the signed policy installed inside the library.
-- Pinned the bundled envelope to SHA-256
-  `94533d84ab914971026f624634c2553a0c7abba298f6dd76242d996ee5c9137f`
-  and retained the v2 contract SHA-256
-  `a17809e4103628c1b0ab0b96081f6325faf9d16703a5fac57ef7d1eaa7d043bf`.
-  Release creation now verifies the RSA signature, policy identity, internal
-  field digests, and runtime fallback path before packaging.
-- Expanded the complete production ZIP to exactly 26 files: the prior 25-file
-  allowlist plus one `resources/agent/hmb_agent_core.dat`. CI and archive
-  regressions reject every other `.dat`, private key, credential, token, or
-  secret file. No private signing key or API credential is included.
+- Activated the offline-signed `2026-08-11.agent-shot-quality.v4.1` policy and
+  its reviewed typed FX/Timing/Range contract. The verified artifact is server-managed at
+  `D:\agent`; the prior signed v4 artifact is retained in the server backup.
+- Replaced Prompt-to-Agent policy prose with a closed, data-only JOB/FX/USER
+  JSON envelope. `USER DESCRIPTION DATA` now contains only the five fields
+  authored directly in the Prompt UI; Picker/Image transport metadata, paths,
+  identifiers, dimensions, diagnostics, and unknown connected fields are not
+  promoted to user intent.
+- Added strict Prompt/Agent schema parity, independent valid/invalid Range
+  segment handling, exact Target/marker/local-point emitter validation, and
+  fail-closed policy-fragment filtering for visible, nested, and JSON-wrapped
+  Agent output.
+- Reduced the public FX/Timing envelope to v3 raw facts: selected Main Type and
+  role, Target/marker range segments, exact cues, and typed validation codes.
+  Policy-dependent interpretation is now derived only after the signed Agent
+  runtime has loaded and is never serialized into `PROMPT_OUT`.
+- Moved the Agent policy loader to the fixed server-only
+  `\\FIN-RCOMP7.funnyflux.local\HMB_AgentPolicy$\hmb_agent_core.dat` boundary,
+  pinned the complete v4.1 envelope and inner digests, and removed every local,
+  package, environment-variable, administrative-share, and retired-host fallback.
+- Isolated canonical Agent inputs, native scheduler callbacks, stream chunks,
+  logs, and final publication until output sanitization; added a regression
+  against the installed Standard Agent constructor and callable-yield contract.
+- Kept the four source/Prompt/Agent libraries generator-neutral and changed the
+  release gate to require the active v4.1 identity while rejecting every `.dat`
+  or policy document from client packages, including nested archives.
+- Renamed the public generator module and class to
+  `HMBSeedanceGeneration.py` / `HMBSeedanceGeneration`, and updated library
+  registration, package exports, release allowlists, and generator integration
+  tests to the same canonical identity.
+- The retired class identifier is intentionally not exported as an alias.
+  Saved workflows created before this rename must replace that generator node
+  once and reconnect its existing ports; current repository workflows contain
+  no serialized instance of the retired identifier.
+- Hardened generator completion by probing the destination before a billable
+  submission, publishing verified MP4 data atomically, retaining a successful
+  primary video when optional sidecar metadata fails, and requiring bounded
+  `ftyp`, non-empty `moov`, and non-empty `mdat` boxes.
 
 ## 0.5.14 - 2026-08-05
 
@@ -487,9 +144,9 @@
 
 ## 0.5.12 - 2026-08-05
 
-- Introduced a temporary external Agent-policy distribution experiment. It was
-  fully superseded by the signed bundled-policy contract and is not a runtime,
-  installation, or release dependency in the current library.
+- Introduced the external Agent-policy distribution path that is now enforced
+  as the signed server-only contract. Policy artifacts are not installation or
+  release-package members of the client library.
 - Kept only public signature-verification material in the client; no private
   signing key, decryption key, or API key was added to release artifacts.
 
@@ -509,7 +166,7 @@
 ## 0.5.10 - 2026-08-05
 
 - Changed only the initial value of `Generate Audio` on a newly added
-  `HMB Seedance 2.0 Video Generation` node from `True` to `False`.
+  `HMB Seedance Generation` node from `True` to `False`.
 - The toggle remains user-selectable, and an explicitly saved `True` or `False`
   value on an existing workflow is not overridden. All other generation,
   media, upload, polling, output, and usage-accounting behavior is unchanged.
@@ -576,8 +233,8 @@
 
 ## 0.5.5 - 2026-08-05
 
-- Added `4k` to the resolution selector of the existing HMB Seedance 2.0
-  generator without changing its node identity, saved-workflow ports, or
+- Added `4k` to the resolution selector of the existing HMB Seedance Generation
+  node without changing its saved-workflow ports or
   default `720p` value.
 - Enabled `resolution: "4k"` only for the full
   `doubao-seedance-2-0-260128` model. Fast and Mini remain fail-closed at
@@ -615,8 +272,8 @@
 
 ## 0.5.2 - 2026-08-04
 
-- Fixed local MP4 references in the existing `HMB Seedance 2.0 Video
-  Generation` node without adding or replacing a generator. Local videos are
+- Fixed local MP4 references in the existing `HMB Seedance Generation` node
+  without adding or replacing a generator. Local videos are
   lazily uploaded to Griptape Cloud only when needed, submitted to Volcengine as
   signed HTTPS references, and removed after success, failure, timeout, or local
   cancellation.
@@ -640,7 +297,7 @@
 
 ## 0.5.0 - 2026-08-04
 
-- Upgraded the existing HMB Seedance generator node in place from a
+- Upgraded the existing `HMBSeedanceGeneration` node in place from a
   Standard/BytePlus wrapper to the official Volcengine Ark asynchronous task
   API. The file, class, display name, and established HMB input/output names are
   retained, so no second generator node is introduced.
@@ -661,7 +318,7 @@
 - Uses the Volcengine CN fail-closed resolution ceiling of 1080p rather than the
   separate BytePlus 4K capability. The `priority` field is emitted only for the
   full model and is omitted for Fast/Mini under the strict Ark schema.
-- Registered `ARK_API_KEY` in Griptape Secrets and added `httpx==0.28.1` as a
+- The retired direct-provider credential experiment added `httpx==0.28.1` as a
   pinned direct dependency. Secret-bearing fields are redacted from diagnostics
   and output.
 
@@ -818,8 +475,8 @@
 
 ## 0.4.14 - 2026-08-03
 
-- Added the predecessor HMB video generator as a thin extension of the
-  registered Standard Library video-generation node. The node replaces only the
+- Added the original HMB Seedance generation node as a thin extension of the
+  registered Standard Library video-generation node. It replaces only the
   editor-facing `reference_images` `ParameterList` with one compatible ordered
   `list[...]` input, allowing `HMBImageAssetLibrary` Video Generation Out to
   connect with a single wire.

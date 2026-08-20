@@ -15,7 +15,7 @@ GENERATOR_NEUTRAL_LIBRARIES = (
 # generator. Provider/model vocabulary belongs only in its generator module.
 FORBIDDEN_GENERATOR_SPECIFIC_TOKENS = (
     "seedance",
-    "시댄스",
+    "\uc2dc\ub304\uc2a4",
     "doubao",
     "dreamina",
     "byteplus",

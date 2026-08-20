@@ -3,10 +3,20 @@ function clean(value) {
   return String(value == null ? "" : value).trim();
 }
 
+function composedParent(node) {
+  if (!node) return null;
+  if (node.parentElement) return node.parentElement;
+  try {
+    const root = node.getRootNode?.();
+    if (root?.host) return root.host;
+  } catch (_error) {}
+  return null;
+}
+
 function findReactFlowNode(container) {
-  let current = container?.parentElement || null;
+  let current = composedParent(container);
   let fallback = null;
-  for (let depth = 0; current && depth < 16; depth += 1, current = current.parentElement) {
+  for (let depth = 0; current && depth < 48; depth += 1, current = composedParent(current)) {
     const className = String(current.className || "").toLowerCase();
     const testId = String(current.getAttribute?.("data-testid") || "").toLowerCase();
     if (className.includes("react-flow__node") || testId === "node") return current;
@@ -18,6 +28,27 @@ function findReactFlowNode(container) {
     if (className.includes("react-flow__pane") || className.includes("react-flow__viewport")) break;
   }
   return fallback || container?.parentElement || container || null;
+}
+
+export function hmbVideoPickerCommandBridgeIsHostMeasurementClone(container) {
+  let current = composedParent(container);
+  for (let depth = 0; current && depth < 48; depth += 1, current = composedParent(current)) {
+    const classList = current.classList;
+    const exactMeasurementWrapper = !!(
+      classList?.contains?.("absolute")
+      && classList?.contains?.("left-0")
+      && classList?.contains?.("right-0")
+      && classList?.contains?.("pointer-events-none")
+    );
+    let hidden = false;
+    try {
+      hidden = String(current.style?.visibility || "").toLowerCase() === "hidden";
+    } catch (_error) {}
+    if (exactMeasurementWrapper && hidden) return true;
+    const className = String(current.className || "").toLowerCase();
+    if (className.includes("react-flow__node")) break;
+  }
+  return false;
 }
 
 function branchContainsVideoOutputs(branch) {
@@ -64,6 +95,13 @@ function commandBridgeLayoutRow(container) {
     }
   }
   if (!parameterRow?.style) return null;
+  // Editor 0.122 mounts a visibility:hidden measurement copy of the complete
+  // adaptive parameter stack.  Climbing from that copy to a branch that does
+  // not contain the first (visible) STATE match can select the measurement
+  // wrapper itself and collapse its height to zero.  That makes contentRef
+  // report stackHeight=0 and the host auto-hides MAYA, COMMAND and STATE.
+  // Inside the measurement copy, collapse only this exact command row.
+  if (hmbVideoPickerCommandBridgeIsHostMeasurementClone(container)) return parameterRow;
   const shell = findReactFlowNode(container);
   let stateRow = null;
   try {

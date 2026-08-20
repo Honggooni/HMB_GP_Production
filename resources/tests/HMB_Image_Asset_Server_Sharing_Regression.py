@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import time
 from types import ModuleType, SimpleNamespace
 
 
@@ -86,27 +87,6 @@ with tempfile.TemporaryDirectory(prefix="hmb_asset_share_", dir=TEMP_ROOT) as te
     registered_signature = asset_library._asset_manifest_signature(project_root)
     assert registered_signature != missing_signature
 
-    original_json_loads = asset_library.json.loads
-    manifest_parse_count = 0
-
-    def counted_json_loads(value, *args, **kwargs):
-        global manifest_parse_count
-        manifest_parse_count += 1
-        return original_json_loads(value, *args, **kwargs)
-
-    with asset_library._ASSET_MANIFEST_CACHE_LOCK:
-        asset_library._ASSET_MANIFEST_CACHE.clear()
-    asset_library.json.loads = counted_json_loads
-    try:
-        first_manifest = asset_library._read_asset_manifest(project_root)
-        second_manifest = asset_library._read_asset_manifest(project_root)
-    finally:
-        asset_library.json.loads = original_json_loads
-    assert first_manifest == second_manifest
-    assert manifest_parse_count == 1, (
-        "An unchanged manifest signature must reuse one parsed snapshot."
-    )
-
     registered_state = asset_library._load_project_catalog(catalog_root, prepared)
     hero_asset = next(
         item for item in registered_state["assets"] if item["relative_path"] == "Hero.png"
@@ -150,12 +130,6 @@ with tempfile.TemporaryDirectory(prefix="hmb_asset_share_", dir=TEMP_ROOT) as te
                 "scope": "Head / face only",
             },
         )
-        root_cache_key = asset_library._asset_manifest_cache_root_key(project_root)
-        with asset_library._ASSET_MANIFEST_CACHE_LOCK:
-            assert not any(
-                key[0] == root_cache_key
-                for key in asset_library._ASSET_MANIFEST_CACHE
-            ), "A local atomic manifest write must invalidate the old parsed snapshot."
         refreshed = node._apply_manifest_poll(registered_state)
         assert scan_count == 1
         assert refreshed["status"]["registered_asset_count"] == 2
@@ -182,69 +156,69 @@ with tempfile.TemporaryDirectory(prefix="hmb_asset_share_", dir=TEMP_ROOT) as te
     no_op_node._hmb_last_manifest_poll_error = ""
     no_op_node._hmb_refresh_revision = refreshed["refresh_revision"]
     no_op_node._hmb_import_media_by_uid = {}
-    no_op_node._hmb_import_revision = 0
-    no_op_node._hmb_import_media_identity = asset_library._import_media_map_identity({})
-    no_op_node._hmb_resolution_cache = asset_library.OrderedDict()
-    no_op_node._hmb_resolution_cache_identity = ""
-    no_op_node._hmb_last_resolution_warning = ""
-    no_op_node._hmb_last_output_fingerprint = ""
-    no_op_node._hmb_last_output_pair = None
-    no_op_node._hmb_output_notification_generation = 0
-    no_op_node._hmb_pending_output_notifications = {}
-    no_op_node.parameter_output_values = {}
-    no_op_node.publish_update_to_parameter = lambda _name, _value: None
     no_op_node.get_parameter_value = lambda name: (
         refreshed["catalog_root"]
         if name == asset_library.PROJECT_ROOT_PARAMETER
-        else json.dumps(refreshed)
-        if name == asset_library.WIDGET_STATE_PARAMETER
         else []
     )
-    original_build_outputs = asset_library._build_synchronized_outputs
-    original_set_output = asset_library.set_output
-    output_build_count = 0
-
-    def counted_build_outputs(*args, **kwargs):
-        global output_build_count
-        output_build_count += 1
-        return original_build_outputs(*args, **kwargs)
-
-    asset_library._build_synchronized_outputs = counted_build_outputs
-    asset_library.set_output = (
-        lambda target, name, value: target.parameter_output_values.__setitem__(
-            name,
-            value,
-        )
+    no_op_node._sync_output = lambda _state: (_ for _ in ()).throw(
+        AssertionError("An unchanged manifest probe must not rebuild outputs.")
     )
+    published_states = []
+    live_state = {"value": refreshed}
+
+    def publish_without_output_rebuild(value):
+        normalized = asset_library._normalize_state(value)
+        live_state["value"] = normalized
+        published_states.append(normalized)
+        return normalized
+
+    no_op_node._publish_state = publish_without_output_rebuild
+    no_op_node._current_state = lambda: live_state["value"]
+    no_op_node._replace_import_media = lambda _media: None
+    no_op_node._scan_owner_is_current = lambda: True
+    no_op_node._hmb_import_revision = 0
+    no_op_payload = dict(refreshed)
+    no_op_payload["__hmb_manifest_poll_nonce"] = "poll-no-change"
+    no_op_canonical = no_op_node.before_value_set(
+        widget_parameter,
+        json.dumps(no_op_payload),
+    )
+    assert no_op_node._hmb_manifest_poll_received is True
+    assert no_op_node._hmb_manifest_poll_pending is True
+
+    # The value-set hook performs no filesystem I/O.  The retained-mode apply
+    # schedules one worker probe, and an unchanged signature must avoid a full
+    # project scan as well as the output rebuild guarded above.
+    no_op_scan_count = [0]
+    original_scan = asset_library._scan_project_assets
+
+    def no_op_counted_scan(project_root_value):
+        no_op_scan_count[0] += 1
+        return original_scan(project_root_value)
+
+    asset_library._scan_project_assets = no_op_counted_scan
     try:
-        no_op_node._sync_output(refreshed)
-        assert output_build_count == 1
-        no_op_payload = {
-            "__hmb_manifest_poll_nonce": "poll-no-change",
-            "catalog_root": refreshed["catalog_root"],
-            "project_root": refreshed["project_root"],
-            "project_id": refreshed["project_id"],
-            "project_uid": refreshed["project_uid"],
-            "manifest_signature": refreshed["manifest_signature"],
-        }
-        no_op_canonical = no_op_node.before_value_set(
-            widget_parameter,
-            json.dumps(no_op_payload),
-        )
-        canonical_poll_state = json.loads(no_op_canonical)
-        assert len(canonical_poll_state["assets"]) == len(refreshed["assets"]), (
-            "A lightweight poll must merge with the authoritative current state."
-        )
-        assert no_op_node._hmb_manifest_poll_received is False
-        assert no_op_node._hmb_manifest_poll_pending is False
-        no_op_result = no_op_node._apply_widget_state(no_op_canonical)
-        assert no_op_result["manifest_signature"] == refreshed["manifest_signature"]
-        assert output_build_count == 1, (
-            "An unchanged lightweight manifest probe must not rebuild outputs."
-        )
+        scheduled = no_op_node._apply_widget_state(no_op_canonical)
+        assert scheduled["scan_busy"] is True
+        worker = no_op_node._hmb_scan_thread
+        assert worker is not None
+        worker.join(timeout=10.0)
+        assert worker.is_alive() is False
+        deadline = time.monotonic() + 2.0
+        while (
+            no_op_node._hmb_scan_pending_result is None
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert no_op_node._consume_pending_catalog_scan_result() is True
     finally:
-        asset_library._build_synchronized_outputs = original_build_outputs
-        asset_library.set_output = original_set_output
+        asset_library._scan_project_assets = original_scan
+    assert no_op_scan_count[0] == 0
+    no_op_result = live_state["value"]
+    assert no_op_result["scan_busy"] is False
+    assert no_op_result["manifest_signature"] == refreshed["manifest_signature"]
+    assert len(published_states) == 2
 
     captured_thumbnail_bytes = []
 

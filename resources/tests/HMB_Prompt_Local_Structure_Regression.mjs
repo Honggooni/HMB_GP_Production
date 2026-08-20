@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 
 const widgetPath = new URL("../../widgets/HMBPromptLibraryScopedBindingWidget.js", import.meta.url);
@@ -202,11 +203,6 @@ const manualContextImageFields = [
   "picker_auto_video",
   "picker_auto_color",
   "picker_auto_source",
-  "frame_range_enabled",
-  "frame_range_color_index",
-  "frame_range_bindings",
-  "frame_range_binding",
-  "frame_range_selected_index",
 ];
 const contextImage = {
   identity: "x".repeat(300),
@@ -320,19 +316,18 @@ assert.deepEqual(
 );
 assert.equal(manualContext.before.text.PROJECT_STYLE_LOOK.length, 6000);
 assert.equal(manualContext.before.text.VIDEO_VFX.length, 20000);
-assert.equal(manualContext.before.images.length, 50, "The remap cache must remain image-count bounded.");
+assert.equal(manualContext.before.images.length, 50, "The remap cache must retain the legacy image-count bound.");
 assert.equal(manualContext.before.images[0].identity.length, 256);
 assert.equal(manualContext.before.images[0].index, 49);
 assert.deepEqual(Object.keys(manualContext.before.images[0].fields), manualContextImageFields);
-assert.ok(
-  Object.keys(manualContext.before.images[0].fields.frame_range_bindings).length <= 3,
-  "Only one bounded binding per Color Pick may survive in the cache.",
+assert.equal(
+  Object.prototype.hasOwnProperty.call(
+    manualContext.before.images[0].fields,
+    "frame_range_intent",
+  ),
+  false,
+  "Picker reconnect snapshots never own or replay Prompt frame-range intent.",
 );
-assert.deepEqual(
-  manualContext.before.images[0].fields.frame_range_bindings["@video2::Red"].ranges,
-  [{ start: 0, end: 9999 }],
-);
-assert.equal(manualContext.before.images[0].fields.frame_range_selected_index, 99);
 assert.deepEqual(manualContext.before.textarea_heights, { "video:1:keep_out": 120 });
 assert.deepEqual(
   widget.normalizeState(JSON.parse(JSON.stringify(manualContextState))).picker.manual_video_context,
@@ -399,12 +394,12 @@ assert.equal(JSON.parse(emitted).images.length, 1, "Deletion must repaint and pe
 
 assert.match(
   source,
-  /export function hmbCommitLocalPromptStructure[\s\S]*?hmbCaptureUiBeforeStateEmit\(container, state\);[\s\S]*?remount\(\)[\s\S]*?hmbEmitLocalPromptState\(container, props, committedState\)/,
+  /export function hmbCommitLocalPromptStructure[\s\S]*?hmbCaptureUiBeforeStateEmit\(container, state\);[\s\S]*?rollbackValue[\s\S]*?remount\(\)[\s\S]*?hmbEmitLocalPromptState\(container, props, committedState,[\s\S]*?remount\(rollbackState\)/,
   "Structural commits must capture geometry, repaint locally, then persist through the host.",
 );
 assert.match(
   source,
-  /const remount = \(\) => \{[\s\S]*?hmbCapturePromptControlFocus\(container\);[\s\S]*?hmbRestoreSourceScroll\(container\);[\s\S]*?hmbRestorePromptControlFocus\(container\);/,
+  /const remount = \(nextState = null\) => \{[\s\S]*?hmbCapturePromptControlFocus\(container\);[\s\S]*?hmbRestoreSourceScroll\(container\);[\s\S]*?hmbRestorePromptControlFocus\(container\);/,
   "Immediate structural remounts must preserve source scrolling and keyboard focus.",
 );
 assert.match(
@@ -457,6 +452,196 @@ const noLossRoundTrip = widget.normalizeState({
 assert.equal(noLossRoundTrip.images[0].color_picks[0], "Infrared dream marker");
 assert.ok(noLossRoundTrip.images[0].frame_range_bindings["@video5::Infrared dream marker"]);
 assert.equal(noLossRoundTrip.source_intent_fallbacks[0].text, "Use the impossible reflection rhythm");
+
+const parseDiagnosticKeys = [
+  "kind",
+  "source",
+  "reason",
+  "error_code",
+  "byte_length",
+  "sha256",
+  "error_offset",
+];
+const slash = String.fromCharCode(92);
+function malformedHmb(sourceName, generation, padding = 32) {
+  const picker = sourceName === "PICKER_IN";
+  const schema = picker
+    ? "hmb-prompt-library-picker-binding"
+    : "hmb-image-asset-library-binding";
+  const mode = picker ? "maya" : "image_asset";
+  const pathKey = picker ? "video_path" : "project_root";
+  return `{"generation":"${generation}","schema":"${schema}","mode":"${mode}","${pathKey}":"C:${slash}Users${slash}team${slash}source","padding":"${"x".repeat(padding)}"}`;
+}
+function expectedParseDiagnostic(sourceName, text, errorOffset) {
+  return {
+    kind: "parse_diagnostic",
+    source: sourceName,
+    reason: "invalid JSON connected input",
+    error_code: "invalid_json",
+    byte_length: Buffer.byteLength(text, "utf8"),
+    sha256: createHash("sha256").update(text, "utf8").digest("hex"),
+    error_offset: errorOffset,
+  };
+}
+
+// Legacy wingtest-style malformed HMB bodies are machine transport failures,
+// not user prose. Frontend normalization must produce exactly the same compact
+// diagnostic schema as Python without retaining any raw path/body.
+const legacyPickerOne = malformedHmb("PICKER_IN", "one", 10_000);
+const legacyPickerLatest = malformedHmb("PICKER_IN", "two", 9_000);
+const legacyImage = malformedHmb("IMAGE_ASSET_IN", "one", 8_000);
+const exactHumanWhitespace = `  사용자가 직접 작성한 의도\n${"장면 설명 🧭 ".repeat(20_000)}END  `;
+const compactMixed = widget.normalizeState({
+  source_intent_fallbacks: [
+    { source: "CONNECTED_SOURCE", reason: "future schema", text: exactHumanWhitespace },
+    { source: "PICKER_IN", reason: "readable non-JSON connected input", text: legacyPickerOne },
+    { source: "IMAGE_ASSET_IN", reason: "readable non-JSON connected input", text: legacyImage },
+    { source: "PICKER_IN", reason: "readable non-JSON connected input", text: legacyPickerLatest },
+  ],
+});
+assert.equal(compactMixed.source_intent_fallbacks.length, 3);
+assert.deepEqual(compactMixed.source_intent_fallbacks[0], {
+  source: "CONNECTED_SOURCE",
+  reason: "future schema",
+  text: exactHumanWhitespace,
+});
+assert.equal(
+  compactMixed.source_intent_fallbacks[0].text,
+  exactHumanWhitespace,
+  "Ordinary user text has no character/byte budget and must retain boundary whitespace.",
+);
+assert.ok(Buffer.byteLength(exactHumanWhitespace, "utf8") > 200_000);
+assert.deepEqual(
+  compactMixed.source_intent_fallbacks[1],
+  expectedParseDiagnostic("PICKER_IN", legacyPickerLatest, 95),
+  "The first same-source diagnostic position must contain the latest failure.",
+);
+assert.deepEqual(
+  compactMixed.source_intent_fallbacks[2],
+  expectedParseDiagnostic("IMAGE_ASSET_IN", legacyImage, 102),
+);
+for (const diagnostic of compactMixed.source_intent_fallbacks.slice(1)) {
+  assert.deepEqual(Object.keys(diagnostic), parseDiagnosticKeys);
+  assert.equal(Object.hasOwn(diagnostic, "text"), false);
+}
+const compactMixedJson = JSON.stringify(compactMixed);
+assert.equal(compactMixedJson.includes(legacyPickerOne), false);
+assert.equal(compactMixedJson.includes(legacyPickerLatest), false);
+assert.equal(compactMixedJson.includes(legacyImage), false);
+assert.equal(compactMixedJson.includes(`C:${slash}Users`), false);
+assert.deepEqual(
+  widget.normalizeState(JSON.parse(compactMixedJson)).source_intent_fallbacks,
+  compactMixed.source_intent_fallbacks,
+  "Compact mixed fallback normalization must be idempotent.",
+);
+
+// Transitional tagged records carrying raw text are compacted even when their
+// older fields are incomplete. Already compact backend records are canonicalized.
+const taggedRaw = malformedHmb("PICKER_IN", "tagged", 4_000);
+const taggedAndCanonical = widget.normalizeState({
+  source_intent_fallbacks: [
+    { kind: "parse_diagnostic", source: "PICKER_IN", reason: "old", text: taggedRaw },
+    {
+      kind: "parse_diagnostic",
+      source: "IMAGE_ASSET_IN",
+      reason: "ignored old label",
+      error_code: "invalid_json",
+      byte_length: "12",
+      sha256: "A".repeat(64),
+      error_offset: -20,
+    },
+  ],
+});
+assert.deepEqual(
+  taggedAndCanonical.source_intent_fallbacks[0],
+  expectedParseDiagnostic("PICKER_IN", taggedRaw, 98),
+);
+assert.deepEqual(taggedAndCanonical.source_intent_fallbacks[1], {
+  kind: "parse_diagnostic",
+  source: "IMAGE_ASSET_IN",
+  reason: "invalid JSON connected input",
+  error_code: "invalid_json",
+  byte_length: 12,
+  sha256: "a".repeat(64),
+  error_offset: -1,
+});
+assert.equal(JSON.stringify(taggedAndCanonical).includes(taggedRaw), false);
+
+const taggedHuman = "  user-authored text carrying a future diagnostic tag  ";
+const taggedHumanState = widget.normalizeState({
+  source_intent_fallbacks: [{
+    kind: "parse_diagnostic",
+    source: "PICKER_IN",
+    reason: "future user extension",
+    text: taggedHuman,
+  }],
+});
+assert.deepEqual(taggedHumanState.source_intent_fallbacks, [{
+  source: "PICKER_IN",
+  reason: "future user extension",
+  text: taggedHuman,
+}]);
+
+// A legacy reason alone is not machine provenance. Both exact source-specific
+// schema and mode signatures must occur inside the bounded prefix.
+const signatureAttacks = [
+  `  {"mode":"maya","note":"C:${slash}x"}  `,
+  `{"schema":"hmb-prompt-library-picker-binding","note":"C:${slash}x"}`,
+  `{"schema":"hmb-image-asset-library-binding","mode":"image_asset","note":"C:${slash}x"}`,
+  `{"note":"${"z".repeat(4_200)}","schema":"hmb-prompt-library-picker-binding","mode":"maya","path":"C:${slash}x"}`,
+  `{"note":"{${slash}"schema${slash}":${slash}"hmb-prompt-library-picker-binding${slash}",${slash}"mode${slash}":${slash}"maya${slash}"}","path":"C:${slash}x"}`,
+];
+const preservedAttacks = widget.normalizeState({
+  source_intent_fallbacks: signatureAttacks.map((text) => ({
+    source: "PICKER_IN",
+    reason: "readable non-JSON connected input",
+    text,
+  })),
+}).source_intent_fallbacks;
+assert.deepEqual(
+  preservedAttacks.map((entry) => entry.text),
+  signatureAttacks,
+  "Schema-only, mode-only, wrong-source, and beyond-prefix prose must remain exact.",
+);
+assert.ok(preservedAttacks.every((entry) => entry.kind !== "parse_diagnostic"));
+
+// Fallback compaction participates in rapid local echo serialization without
+// changing the monotonic revision/stale-echo behavior that keeps selects open.
+const fallbackRapidContainer = {};
+const fallbackRapidValues = [];
+const fallbackRapidProps = {
+  disabled: false,
+  onChange(value) { fallbackRapidValues.push(value); },
+};
+for (const sourceType of ["Character Appearance", "Environment / Background"]) {
+  widget.hmbEmitLocalPromptState(
+    fallbackRapidContainer,
+    fallbackRapidProps,
+    widget.normalizeState({
+      source_intent_fallbacks: compactMixed.source_intent_fallbacks,
+      images: [{ present: true, label: "Hero", source_type: sourceType }],
+    }),
+  );
+}
+const [fallbackOlder, fallbackNewer] = fallbackRapidValues;
+const fallbackOlderState = JSON.parse(fallbackOlder);
+const fallbackNewerState = JSON.parse(fallbackNewer);
+assert.equal(fallbackNewerState.ui_edit_revision, fallbackOlderState.ui_edit_revision + 1);
+assert.deepEqual(
+  fallbackNewerState.source_intent_fallbacks,
+  fallbackOlderState.source_intent_fallbacks,
+);
+assert.equal(JSON.stringify(fallbackNewerState).includes(legacyPickerLatest), false);
+assert.equal(widget.hmbConsumePendingPromptStateEcho(
+  fallbackRapidContainer,
+  { value: fallbackNewer, disabled: false },
+), true);
+assert.equal(widget.hmbConsumePendingPromptStateEcho(
+  fallbackRapidContainer,
+  { value: fallbackOlder, disabled: false },
+), true);
+assert.equal(fallbackRapidContainer.__hmbPromptLastConsumedEchoWasStale, true);
+clearTimeout(fallbackRapidContainer.__hmbPromptPendingLocalTimer);
 
 const pickerUidEcho = widget.normalizeState(JSON.parse(JSON.stringify(widget.normalizeState({
   videos: [

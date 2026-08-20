@@ -25,9 +25,8 @@ if mayabatch is None or ffmpeg is None:
     raise SystemExit(0)
 
 mayapy = Path(mayabatch).with_name("mayapy.exe")
-builder = ROOT / ".tmp" / "build_motion_guide_smoke_scene.py"
-if not mayapy.is_file() or not builder.is_file():
-    print("HMB live Motion Guide smoke: SKIP (fixture builder is unavailable)")
+if not mayapy.is_file():
+    print("HMB live Motion Guide smoke: SKIP (mayapy is unavailable)")
     raise SystemExit(0)
 
 run_folder = (
@@ -38,6 +37,7 @@ run_folder = (
 )
 run_folder.mkdir(parents=True, exist_ok=False)
 scene_path = run_folder / "HMB_Motion_Guide_Smoke.ma"
+builder = ROOT / ".tmp" / "build_motion_guide_smoke_scene.py"
 build_log = run_folder / "build.log"
 with build_log.open("w", encoding="utf-8", errors="replace") as handle:
     built = subprocess.run(

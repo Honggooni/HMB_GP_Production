@@ -106,16 +106,7 @@ try:
     )
     assert hero["source_type"] == "Character Appearance"
     assert hero["scope_candidate"] == "Full body / full appearance"
-    expected_actor_color_candidates = (
-        common.image_color_pick_choices_for_source_type("Character Appearance")
-    )
-    assert expected_actor_color_candidates == (
-        common.ACTOR_COLOR_PICK_CHOICES + common.GHOST_COLOR_PICK_CHOICES
-    )
-    assert not set(expected_actor_color_candidates).intersection(
-        common.PATTERN_COLOR_PICK_CHOICES
-    )
-    assert hero["color_pick_candidates"] == expected_actor_color_candidates
+    assert hero["color_pick_candidates"] == common.ACTOR_COLOR_PICK_CHOICES
     assert hero["registered"] is True
     assert background["source_type"] == "Environment / Background"
     assert background["scope_candidate"] == "Main background"
@@ -190,12 +181,7 @@ try:
     assert default_bound_row["asset_default_target"] == "Hero Beauty"
     assert default_bound_row["binding_scopes"] == ["Full body / full appearance"]
     assert default_bound_row["scope"] == "Full body / full appearance"
-    default_bound_readable = prompt_library._build_prompt_package(default_bound_state)
-    assert "IMAGE SOURCE:" in default_bound_readable
-    assert "HMB JOB DATA (JSON):" not in default_bound_readable
-    default_bound_prompt = prompt_library._build_data_only_prompt_package(
-        default_bound_state
-    )
+    default_bound_prompt = prompt_library._build_prompt_package(default_bound_state)
     default_bound_job = prompt_json_section(
         default_bound_prompt,
         "HMB JOB DATA (JSON):",
@@ -267,7 +253,7 @@ try:
     assert prompt_row["scope"] == "Full body / full appearance"
     assert prompt_row["color_picks"] == ["Blue"]
     assert prompt_row["asset_scope_candidate"] == "Full body / full appearance"
-    assert prompt_row["asset_color_pick_candidates"] == expected_actor_color_candidates
+    assert prompt_row["asset_color_pick_candidates"] == common.ACTOR_COLOR_PICK_CHOICES
 
     # Video Picker markers bind against the exact Asset ID even when Image Name
     # differs; legacy rows still fall back to Image Name.
@@ -281,7 +267,7 @@ try:
         {"asset_id": "Hero Beauty"},
         set(),
     )
-    compiled_prompt = prompt_library._build_data_only_prompt_package(prompt_state)
+    compiled_prompt = prompt_library._build_prompt_package(prompt_state)
     compiled_job = prompt_json_section(compiled_prompt, "HMB JOB DATA (JSON):")
     compiled_image = compiled_job["images"][0]
     assert compiled_image["image"] == "@image1"
@@ -301,8 +287,8 @@ try:
     assert policy
     assert len(policy_identity["contract_sha256"]) == 64
     assert policy.encode("utf-8") not in sealed_policy
-    assert common._BUNDLED_AGENT_POLICY_FILE == (
-        ROOT / "resources" / "agent" / "hmb_agent_core.dat"
+    assert common._AGENT_POLICY_SERVER_UNC == (
+        r"\\FIN-RCOMP7.funnyflux.local\HMB_AgentPolicy$\hmb_agent_core.dat"
     )
 finally:
     shutil.rmtree(project_root, ignore_errors=True)

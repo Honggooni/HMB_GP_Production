@@ -26,27 +26,35 @@ const snapshotState = {
       video_uid: "video-b",
       frame: 20,
       created_at_ms: 20,
-      data_uri: "data:image/png;base64,QkJCQg==",
+      path: "C:/shot/snapshot-b.png",
+      url: "file:///C:/shot/snapshot-b.png",
+      sha256: "b".repeat(64),
     },
     {
       snapshot_uid: "snapshot-a",
       video_uid: "video-a",
       frame: 10,
       created_at_ms: 10,
-      data_uri: "data:image/png;base64,QUFBQQ==",
+      path: "C:/shot/snapshot-a.png",
+      url: "file:///C:/shot/snapshot-a.png",
+      sha256: "a".repeat(64),
     },
     {
       snapshot_id: "legacy-stable-id",
       video_uid: "video-c",
       frame: 30,
       created_at_ms: 30,
-      data_uri: "data:image/jpeg;base64,Q0NDQw==",
+      path: "C:/shot/snapshot-c.jpg",
+      url: "file:///C:/shot/snapshot-c.jpg",
+      sha256: "c".repeat(64),
     },
     {
       video_uid: "video-d",
       frame: 40,
       created_at_ms: 40,
       path: "C:/shot/snapshot-d.png",
+      url: "file:///C:/shot/snapshot-d.png",
+      sha256: "d".repeat(64),
       data_uri: "data:image/png;base64,RERERA==",
     },
     {
@@ -118,7 +126,12 @@ assert.match(
 );
 assert.match(
   selectedSnapshotSource,
-  /snapshotForViewport = viewportMode === "snapshot"[\s\S]*?selectedSnapshot\?\.data_uri/,
+  /snapshotForViewport = viewportMode === "snapshot"[\s\S]*?hmbSnapshotMediaUrl\(selectedSnapshot\)/,
+);
+assert.doesNotMatch(
+  JSON.stringify(firstHistory),
+  /data:image\//,
+  "Durable Snapshot history must not retain base64 image payloads.",
 );
 assert.doesNotMatch(
   selectedSnapshotSource,
@@ -128,6 +141,53 @@ assert.doesNotMatch(
 
 assert.match(widgetSource, /id="picker-snapshot-image"/);
 assert.match(widgetSource, /id="picker-video"/);
+
+const viewportMarkupStart = widgetSource.indexOf('class="panel viewport-panel"');
+const snapshotToolbarStart = widgetSource.indexOf('class="snapshot-toolbar"', viewportMarkupStart);
+const generateToolbarStart = widgetSource.indexOf('class="generate-playblast-toolbar"', viewportMarkupStart);
+const playblastToolbarStart = widgetSource.indexOf('class="playblast-settings-toolbar"', viewportMarkupStart);
+const viewportTitleStart = widgetSource.indexOf('class="panel-title viewport-title"', viewportMarkupStart);
+const viewportStageStart = widgetSource.indexOf('class="viewport-stage"', viewportMarkupStart);
+const rightStackStart = widgetSource.indexOf('class="right-stack"', viewportMarkupStart);
+const rightStackEnd = widgetSource.indexOf("</aside>", rightStackStart);
+assert.ok(viewportMarkupStart >= 0 && snapshotToolbarStart > viewportMarkupStart);
+assert.ok(
+  snapshotToolbarStart < generateToolbarStart
+    && generateToolbarStart < playblastToolbarStart
+    && playblastToolbarStart < viewportTitleStart
+    && viewportTitleStart < viewportStageStart,
+  "Center-column controls must render Snapshot/CAM, Generate, Settings, then Viewport.",
+);
+assert.match(
+  widgetSource,
+  /\.playblast-settings-toolbar\{[^}]*min-height:88px;flex:0 0 88px;[^}]*display:block;[^}]*padding:7px 10px;/,
+  "The Settings area must expand downward into the former Viewport-header position.",
+);
+assert.match(
+  widgetSource,
+  /\.playblast-settings-toolbar \.settings-grid-inline\{[^}]*grid-template-columns:repeat\(2,minmax\(0,1fr\)\);grid-template-rows:29px 29px;/,
+  "Resolution and Frame Range must receive equal halves of the upper Settings row.",
+);
+assert.match(
+  widgetSource,
+  /\.settings-grid-inline \.settings-compact-row\{grid-column:1\/-1;grid-row:2;grid-template-columns:repeat\(3,minmax\(0,1fr\)\);/,
+  "FPS, Format, and Maya must receive equal thirds of the lower Settings row.",
+);
+const playblastToolbarMarkup = widgetSource.slice(playblastToolbarStart, viewportTitleStart);
+assert.equal((playblastToolbarMarkup.match(/class="settings-primary-item"/g) || []).length, 2);
+assert.doesNotMatch(playblastToolbarMarkup, /playblast-settings-heading|tr\.playblastSettings|PLAYBLAST SETTINGS/);
+assert.equal((widgetSource.match(/id="run-video"/g) || []).length, 1);
+assert.match(
+  widgetSource.slice(generateToolbarStart, playblastToolbarStart),
+  /role="group"[^>]*aria-label="\$\{escapeHtml\(tr\.generate\)\}"[\s\S]*?id="run-video"[^>]*aria-label="\$\{escapeHtml\(tr\.generate\)\}"/,
+  "The separated Generate row must retain an accessible name and the existing run-video control identity.",
+);
+assert.match(widgetSource.slice(rightStackStart, rightStackEnd), /video-assets-section/);
+assert.doesNotMatch(widgetSource.slice(rightStackStart, rightStackEnd), /playblast-settings-section/);
+assert.match(widgetSource, /const HMB_DEFAULT_NODE_WIDTH = 1400/);
+assert.match(widgetSource, /const HMB_DEFAULT_NODE_HEIGHT = 1200/);
+assert.match(widgetSource, /data-resize-section="color"/);
+assert.match(widgetSource, /data-resize-panel="viewport"/);
 assert.match(
   widgetSource,
   /const viewportModeLabel = snapshotForViewport \? \(tr\.snapshot \|\| "Snapshot"\) : \(tr\.preview \|\| "Video"\)/,
@@ -182,23 +242,24 @@ const mainTransportEnd = widgetSource.indexOf(
   mainTransportStart,
 );
 const mainTransportSource = widgetSource.slice(mainTransportStart, mainTransportEnd);
-assert.match(mainTransportSource, /if \(!viewportVideo\)/);
-assert.match(mainTransportSource, /container\.__hmbAutoplayVideoUid = livePreviewUid/);
-assert.match(mainTransportSource, /commit\(\{ \.\.\.liveState, viewport_mode: "video" \}\)/);
-assert.match(mainTransportSource, /viewportVideo\.pause\(\)/);
-assert.match(mainTransportSource, /viewportVideo\.play\?\.\(\)/);
+assert.match(mainTransportSource, /const liveState = currentWidgetState\(\)/);
+assert.match(mainTransportSource, /viewport_mode: "video", snapshot_active: false/);
+assert.match(mainTransportSource, /hmbPatchVideoPickerPreviewDom\(container, nextState/);
+assert.match(mainTransportSource, /mediaController\.refresh\(nextState\)/);
+assert.match(mainTransportSource, /mediaController\.togglePlayback\(\)/);
+assert.match(mainTransportSource, /commit\(nextState, \{ suppressMatchingEcho: true \}\)/);
 assert.match(
   widgetSource,
-  /playToggleButton\.textContent = playing \? "Ⅱ" : "▶"/,
+  /playToggle\.textContent = playing \? "Ⅱ" : "▶"/,
   "The single central transport must switch between play and pause glyphs.",
 );
 
 const cardPlaybackStart = widgetSource.indexOf(
-  'container.querySelectorAll("[data-play-video-uid]")',
+  "const playInPreview = (event, button) =>",
   widgetSource.indexOf('on(container.querySelector("#import-video-asset"), "change"'),
 );
 const cardPlaybackEnd = widgetSource.indexOf(
-  'container.querySelectorAll("[data-toggle-video-uid]")',
+  "const toggleVideoSelection = (event, selectionSurface) =>",
   cardPlaybackStart,
 );
 const cardPlaybackSource = widgetSource.slice(cardPlaybackStart, cardPlaybackEnd);
@@ -206,7 +267,7 @@ assert.match(cardPlaybackSource, /container\.__hmbAutoplayVideoUid = uid/);
 assert.match(cardPlaybackSource, /container\.__hmbForceVideoPreviewUid = uid/);
 assert.match(
   cardPlaybackSource,
-  /commit\(\{ \.\.\.hmbPreviewVideoAsset\(liveState, uid\), viewport_mode: "video" \}\)/,
+  /hmbPreviewVideoAsset\(liveState, uid\)[\s\S]*?hmbPatchVideoPickerPreviewDom\(container, nextState, tr, \{[\s\S]*?autoplay: true,[\s\S]*?Video-card playback[\s\S]*?commit\(nextState, \{ suppressMatchingEcho: true \}\)/,
 );
 
 const createSnapshotStart = widgetSource.indexOf(

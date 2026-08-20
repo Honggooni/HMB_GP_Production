@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
-import importlib.util
 import io
 import json
 import os
@@ -11,28 +10,26 @@ import re
 import tempfile
 import tomllib
 import zipfile
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.6.25"
-RELEASE_VERSION = "0.6.25"
-ARCHIVE_NAME = "HMB_GP_Production.zip"
+RELEASE_LABEL = "v0.6.36"
+RELEASE_VERSION = "0.6.36"
+ARCHIVE_NAME = f"HMB_GP_Production_DEV_{RELEASE_VERSION}.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
-MANIFEST_PATH = DIST / "release-manifest.json"
-CHECKSUMS_PATH = DIST / "SHA256SUMS"
 ARCHIVE_ROOT = "HMB_GP_Production"
 POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
 POLICY_CONTRACT_SHA256 = (
     "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
 )
-POLICY_RELATIVE = "resources/agent/hmb_agent_core.dat"
-POLICY_SHA256 = "7171bef7169df8894ed24ae7a9b4d9d145957c5110c963b7435372b2695fd251"
-POLICY_SIGNING_KEY_ID = "hmb-policy-release-2026-08-r2"
-POLICY_DELIVERY = "bundled"
-REPRODUCIBLE_ZIP_DATE_TIME = (2020, 1, 1, 0, 0, 0)
+POLICY_DELIVERY = "server-only"
+SHOT_ROUTING_PROTOCOL_VERSION = "2026-08-20.shot-routing.v1"
+RELEASE_MANIFEST_PATH = "release-manifest.json"
+SHA256SUMS_PATH = "SHA256SUMS"
 REPRODUCIBLE_ZIP_MODE = 0o100644
 MAX_NESTED_ARCHIVE_DEPTH = 3
 MAX_NESTED_ARCHIVE_BYTES = 64 * 1024 * 1024
@@ -53,19 +50,23 @@ SOURCE_FILES = (
     "HMBPromptLibrary.py",
     "HMBSeedanceGeneration.py",
     "HMBVideoPickerLibrary.py",
-    "_hmb_common.py",
+    "_hmb_agent_session.py",
+    "_hmb_shot_routing.py",
     "_hmb_mp4_verify.py",
+    "HMB_Agent_Griptape.bat",
+    "_hmb_common.py",
     "_hmb_screen_space.py",
     "widgets/HMBAgentLibraryWidget.js",
     "widgets/HMBImageAssetLibraryWidget.js",
     "widgets/HMBPromptLibraryScopedBindingWidget.js",
+    "widgets/HMBSeedanceGenerationWidget.js",
     "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
     "widgets/HMBVideoPickerLibraryWidget_v032.js",
     "resources/maya/HMB_Maya_Background_Preview.py",
     "resources/maya/HMB_Maya_Binding_Setup.py",
     "resources/maya/HMBVideoPicker_Maya_Guide.txt",
     "resources/picker/HMB_Marker_Catalog.json",
-    POLICY_RELATIVE,
+    "resources/tls/hmb_agent_broker_ca.pem",
 )
 EXPECTED_SECRET_NAMES = {
     "GT_CLOUD_API_KEY",
@@ -75,6 +76,7 @@ EXPECTED_SECRET_NAMES = {
     "TOS_BUCKET_NAME",
 }
 FORBIDDEN_SUFFIXES = {
+    ".dat",
     ".env",
     ".jwk",
     ".key",
@@ -85,6 +87,9 @@ FORBIDDEN_SUFFIXES = {
     ".token",
 }
 FORBIDDEN_RELEASE_CONTENT_MARKERS = (
+    b"_BUNDLED_AGENT_POLICY_FILE",
+    b"resources/agent/hmb_agent_core.dat",
+    b"resources\\agent\\hmb_agent_core.dat",
     b"resources/policy/HMB_GP_Production_Rule",
 )
 # A policy source must be rejected by filename even when an adversarial nested
@@ -93,6 +98,12 @@ FORBIDDEN_RELEASE_CONTENT_MARKERS = (
 POLICY_DOCUMENT_NAME = re.compile(r"(?i)polic(?:y|ies)")
 PRIVATE_KEY_HEADER = re.compile(
     rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
+)
+PUBLIC_CA_MEMBER = PurePosixPath("resources/tls/hmb_agent_broker_ca.pem")
+PUBLIC_CERTIFICATE = re.compile(
+    rb"\A-----BEGIN CERTIFICATE-----\r?\n"
+    rb"[A-Za-z0-9+/=\r\n]+"
+    rb"-----END CERTIFICATE-----\r?\n?\Z"
 )
 COMMON_TOKEN_PATTERNS = (
     re.compile(rb"AKIA[0-9A-Z]{16}"),
@@ -124,33 +135,21 @@ def module_string_constant(path: Path, name: str) -> str:
     return matches[0]
 
 
-def _is_bundled_policy_member(member: PurePosixPath) -> bool:
-    return tuple(part.casefold() for part in member.parts[-3:]) == (
-        "resources",
-        "agent",
-        "hmb_agent_core.dat",
-    )
-
-
-def assert_release_member_allowed(
-    member: PurePosixPath,
-    *,
-    allow_bundled_policy: bool = False,
-) -> None:
+def assert_release_member_allowed(member: PurePosixPath) -> None:
     """Reject policy artifacts and review documents from every release layer."""
 
     relative = member.as_posix()
     lowered_parts = tuple(part.casefold() for part in member.parts)
     lowered_pairs = set(zip(lowered_parts, lowered_parts[1:]))
     if member.is_absolute() or ".." in member.parts or "\\" in relative:
-        raise RuntimeError(f"Unsafe release path: {relative}")
-    bundled_policy = allow_bundled_policy and _is_bundled_policy_member(member)
-    if member.suffix.casefold() == ".dat" and not bundled_policy:
-        raise RuntimeError(f"Forbidden release member: {relative}")
-    if member.suffix.casefold() in FORBIDDEN_SUFFIXES:
-        raise RuntimeError(f"Forbidden release member: {relative}")
+        raise RuntimeError(f"Unsafe developer release path: {relative}")
+    is_public_ca = tuple(part.casefold() for part in member.parts[-3:]) == tuple(
+        part.casefold() for part in PUBLIC_CA_MEMBER.parts
+    )
+    if member.suffix.casefold() in FORBIDDEN_SUFFIXES and not is_public_ca:
+        raise RuntimeError(f"Forbidden developer release member: {relative}")
     if (
-        (("resources", "agent") in lowered_pairs and not bundled_policy)
+        ("resources", "agent") in lowered_pairs
         or ("resources", "policy") in lowered_pairs
         or "policy" in lowered_parts
         or "policies" in lowered_parts
@@ -164,7 +163,6 @@ def validate_no_policy_artifacts_in_zip(
     *,
     label: str = "release archive",
     depth: int = 0,
-    allow_bundled_policy: bool = False,
 ) -> None:
     """Recursively reject .dat and policy documents, including nested ZIPs."""
 
@@ -181,10 +179,7 @@ def validate_no_policy_artifacts_in_zip(
                 raise RuntimeError(f"{label} member boundary mismatch.")
             for info in infos:
                 member = PurePosixPath(info.filename)
-                assert_release_member_allowed(
-                    member,
-                    allow_bundled_policy=allow_bundled_policy and depth == 0,
-                )
+                assert_release_member_allowed(member)
                 if info.is_dir():
                     continue
                 if info.file_size > MAX_NESTED_ARCHIVE_BYTES:
@@ -197,7 +192,6 @@ def validate_no_policy_artifacts_in_zip(
                     archive.read(info),
                     label=f"{label}::{info.filename}",
                     depth=depth + 1,
-                    allow_bundled_policy=False,
                 )
             if archive.testzip() is not None:
                 raise RuntimeError(f"{label} member boundary mismatch.")
@@ -246,7 +240,11 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
     ) != POLICY_VERSION or module_string_constant(
         ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_SOURCE_CONTRACT_SHA256"
     ) != POLICY_CONTRACT_SHA256:
-        raise RuntimeError("Prompt compiler and bundled policy identities differ.")
+        raise RuntimeError("Prompt compiler and required server policy identities differ.")
+    if module_string_constant(
+        ROOT / "_hmb_shot_routing.py", "SHOT_ROUTING_PROTOCOL_VERSION"
+    ) != SHOT_ROUTING_PROTOCOL_VERSION:
+        raise RuntimeError("Shot-routing protocol and release bundle identities differ.")
     registered_secrets = library_manifest["settings"][0]["contents"][
         "secrets_to_register"
     ]
@@ -255,14 +253,30 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
     ):
         raise RuntimeError("Library secret registration boundary mismatch.")
 
+    declared_widget_paths = {
+        str(item.get("path") or "").strip()
+        for item in library_manifest.get("widgets", [])
+        if isinstance(item, dict)
+    }
+    if "" in declared_widget_paths or not declared_widget_paths:
+        raise RuntimeError("Library widget declarations are missing or invalid.")
+    omitted_widgets = declared_widget_paths - set(SOURCE_FILES)
+    if omitted_widgets:
+        raise RuntimeError(
+            "Developer release omits declared widgets: "
+            + ", ".join(sorted(omitted_widgets))
+        )
+
     records: list[dict[str, Any]] = []
     for relative in SOURCE_FILES:
         member = PurePosixPath(relative)
-        assert_release_member_allowed(member, allow_bundled_policy=True)
+        assert_release_member_allowed(member)
         path = ROOT / Path(relative)
         if not path.is_file() or path.is_symlink():
-            raise RuntimeError(f"Missing or linked release member: {relative}")
+            raise RuntimeError(f"Missing or linked developer release member: {relative}")
         data = path.read_bytes()
+        if member == PUBLIC_CA_MEMBER and PUBLIC_CERTIFICATE.fullmatch(data) is None:
+            raise RuntimeError("Agent Broker public CA bundle is invalid.")
         if PRIVATE_KEY_HEADER.search(data) is not None:
             raise RuntimeError(f"Private signing key material remains in {relative}")
         if any(pattern.search(data) for pattern in COMMON_TOKEN_PATTERNS):
@@ -274,7 +288,7 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
         if member.suffix.casefold() == ".zip":
             validate_no_policy_artifacts_in_zip(
                 data,
-                label=f"release source::{relative}",
+                label=f"developer source::{relative}",
             )
         records.append(
             {
@@ -284,29 +298,127 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
                 "sha256": digest(data),
             }
         )
-    policy = (ROOT / POLICY_RELATIVE).read_bytes()
-    if digest(policy) != POLICY_SHA256:
-        raise RuntimeError("Bundled policy envelope SHA-256 mismatch.")
-    spec = importlib.util.spec_from_file_location(
-        "_hmb_release_policy_verifier",
-        ROOT / "_hmb_common.py",
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError("Bundled policy verifier could not be loaded.")
-    verifier = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(verifier)
-    payload = verifier._decode_signed_agent_policy_envelope(policy)
-    verifier._validate_agent_policy_payload(payload)
-    if (
-        payload.get("final_policy_version") != POLICY_VERSION
-        or payload.get("final_motion_look_policy_sha256")
-        != POLICY_CONTRACT_SHA256
-    ):
-        raise RuntimeError("Bundled policy identity mismatch.")
     return release_version, records
 
 
-def make_archive(records: list[dict[str, Any]]) -> bytes:
+def make_release_records(
+    release_version: str,
+    source_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Append a deterministic install-closure manifest and checksum inventory."""
+
+    source_inventory = [
+        {
+            "bytes": int(record["bytes"]),
+            "path": str(record["path"]),
+            "sha256": str(record["sha256"]),
+        }
+        for record in source_records
+    ]
+    manifest = {
+        "bundle_id": f"hmb-gp-production/{release_version}",
+        "file_count": len(source_inventory),
+        "files": source_inventory,
+        "library": "HMB_GP_Production",
+        "release_label": RELEASE_LABEL,
+        "release_version": release_version,
+        "schema": "hmb-release-closure",
+        "shot_routing_protocol": SHOT_ROUTING_PROTOCOL_VERSION,
+        "version": 1,
+    }
+    manifest_data = (
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    manifest_record = {
+        "bytes": len(manifest_data),
+        "data": manifest_data,
+        "path": RELEASE_MANIFEST_PATH,
+        "sha256": digest(manifest_data),
+    }
+    checksummed_records = [*source_records, manifest_record]
+    checksum_data = (
+        "".join(
+            f'{record["sha256"]}  {record["path"]}\n'
+            for record in checksummed_records
+        )
+    ).encode("utf-8")
+    checksum_record = {
+        "bytes": len(checksum_data),
+        "data": checksum_data,
+        "path": SHA256SUMS_PATH,
+        "sha256": digest(checksum_data),
+    }
+    return [*checksummed_records, checksum_record]
+
+
+def validate_release_inventory(
+    release_version: str,
+    records: list[dict[str, Any]],
+) -> None:
+    by_path = {str(record["path"]): record for record in records}
+    if set((RELEASE_MANIFEST_PATH, SHA256SUMS_PATH)) - set(by_path):
+        raise RuntimeError("Developer release closure inventory is missing.")
+    manifest = json.loads(by_path[RELEASE_MANIFEST_PATH]["data"].decode("utf-8"))
+    source_paths = [str(path) for path in SOURCE_FILES]
+    manifest_paths = [str(item.get("path") or "") for item in manifest.get("files", [])]
+    if (
+        manifest.get("schema") != "hmb-release-closure"
+        or manifest.get("version") != 1
+        or manifest.get("release_version") != release_version
+        or manifest.get("shot_routing_protocol") != SHOT_ROUTING_PROTOCOL_VERSION
+        or manifest_paths != source_paths
+    ):
+        raise RuntimeError("Developer release closure manifest is inconsistent.")
+    for item in manifest["files"]:
+        record = by_path.get(str(item["path"]))
+        if (
+            not record
+            or int(item.get("bytes", -1)) != int(record["bytes"])
+            or str(item.get("sha256") or "") != str(record["sha256"])
+        ):
+            raise RuntimeError(f'Developer release manifest mismatch: {item["path"]}')
+    checksum_lines = by_path[SHA256SUMS_PATH]["data"].decode("utf-8").splitlines()
+    expected_lines = [
+        f'{record["sha256"]}  {record["path"]}'
+        for record in records
+        if str(record["path"]) != SHA256SUMS_PATH
+    ]
+    if checksum_lines != expected_lines:
+        raise RuntimeError("Developer release checksum inventory is inconsistent.")
+
+
+def current_zip_date_time() -> tuple[int, int, int, int, int, int]:
+    """Return the actual local build time at ZIP's two-second resolution."""
+
+    now = datetime.now()
+    return (
+        now.year,
+        now.month,
+        now.day,
+        now.hour,
+        now.minute,
+        now.second - (now.second % 2),
+    )
+
+
+def format_zip_date_time(value: tuple[int, int, int, int, int, int]) -> str:
+    return datetime(*value).isoformat(sep=" ")
+
+
+def archive_zip_date_time(encoded: bytes) -> tuple[int, int, int, int, int, int]:
+    with zipfile.ZipFile(io.BytesIO(encoded), "r") as archive:
+        infos = archive.infolist()
+        if not infos:
+            raise RuntimeError("Developer archive has no timestamped members.")
+        return infos[0].date_time
+
+
+def make_archive(
+    records: list[dict[str, Any]],
+    archive_date_time: tuple[int, int, int, int, int, int] | None = None,
+) -> bytes:
+    if archive_date_time is None:
+        archive_date_time = current_zip_date_time()
     output = io.BytesIO()
     with zipfile.ZipFile(
         output,
@@ -318,10 +430,10 @@ def make_archive(records: list[dict[str, Any]]) -> bytes:
         for record in records:
             relative = str(record["path"])
             member = PurePosixPath(relative)
-            assert_release_member_allowed(member, allow_bundled_policy=True)
+            assert_release_member_allowed(member)
             data = record["data"]
             if not isinstance(data, bytes):
-                raise RuntimeError(f"Release data must be bytes: {relative}")
+                raise RuntimeError(f"Developer release data must be bytes: {relative}")
             if any(marker in data for marker in FORBIDDEN_RELEASE_CONTENT_MARKERS):
                 raise RuntimeError(
                     f"Package-local or private policy reference remains in {relative}"
@@ -329,11 +441,11 @@ def make_archive(records: list[dict[str, Any]]) -> bytes:
             if member.suffix.casefold() == ".zip":
                 validate_no_policy_artifacts_in_zip(
                     data,
-                    label=f"release record::{relative}",
+                    label=f"developer record::{relative}",
                 )
             info = zipfile.ZipInfo(
                 f"{ARCHIVE_ROOT}/{relative}",
-                REPRODUCIBLE_ZIP_DATE_TIME,
+                archive_date_time,
             )
             info.compress_type = zipfile.ZIP_DEFLATED
             info.create_system = 3
@@ -347,35 +459,39 @@ def make_archive(records: list[dict[str, Any]]) -> bytes:
     return output.getvalue()
 
 
-def validate_archive(encoded: bytes, records: list[dict[str, Any]]) -> None:
-    validate_no_policy_artifacts_in_zip(
-        encoded,
-        label="release archive",
-        allow_bundled_policy=True,
-    )
+def validate_archive(
+    encoded: bytes,
+    records: list[dict[str, Any]],
+    archive_date_time: tuple[int, int, int, int, int, int] | None = None,
+) -> None:
+    validate_no_policy_artifacts_in_zip(encoded, label="developer archive")
     expected = {str(item["path"]): item for item in records}
     with zipfile.ZipFile(io.BytesIO(encoded), "r") as archive:
         infos = archive.infolist()
         if len(infos) != len(expected) or archive.testzip() is not None:
-            raise RuntimeError("Release archive member boundary mismatch.")
+            raise RuntimeError("Developer archive member boundary mismatch.")
+        if archive_date_time is None:
+            if not infos:
+                raise RuntimeError("Developer archive has no timestamped members.")
+            archive_date_time = infos[0].date_time
         seen: set[str] = set()
         for info in infos:
             member = PurePosixPath(info.filename)
             if not member.parts or member.parts[0] != ARCHIVE_ROOT:
-                raise RuntimeError(f"Release archive root mismatch: {info.filename}")
+                raise RuntimeError(f"Developer archive root mismatch: {info.filename}")
             relative = PurePosixPath(*member.parts[1:]).as_posix()
             if relative not in expected or relative in seen:
-                raise RuntimeError(f"Unexpected release archive member: {relative}")
-            if info.date_time != REPRODUCIBLE_ZIP_DATE_TIME:
-                raise RuntimeError(f"Release archive timestamp mismatch: {relative}")
+                raise RuntimeError(f"Unexpected developer archive member: {relative}")
+            if info.date_time != archive_date_time:
+                raise RuntimeError(f"Developer archive timestamp mismatch: {relative}")
             if (info.external_attr >> 16) != REPRODUCIBLE_ZIP_MODE:
-                raise RuntimeError(f"Release archive mode mismatch: {relative}")
+                raise RuntimeError(f"Developer archive mode mismatch: {relative}")
             content = archive.read(info)
             if content != expected[relative]["data"]:
-                raise RuntimeError(f"Release archive source mismatch: {relative}")
+                raise RuntimeError(f"Developer archive source mismatch: {relative}")
             seen.add(relative)
         if seen != set(expected):
-            raise RuntimeError("Release archive omitted an allowlisted member.")
+            raise RuntimeError("Developer archive omitted an allowlisted member.")
 
 
 def assert_release_policy_candidate_is_active() -> None:
@@ -397,128 +513,111 @@ def assert_release_policy_candidate_is_active() -> None:
         or candidate_status != "active"
     ):
         raise RuntimeError(
-            "Release is blocked: the reviewed policy candidate is not "
-            "the active signed bundled policy."
+            "Developer release is blocked: the reviewed policy candidate is not "
+            "the active signed server policy."
         )
-
-
-def atomic_write(path: Path, data: bytes) -> None:
-    """Publish one completed release file without exposing a partial write."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="wb",
-        prefix=path.name + ".",
-        suffix=".tmp",
-        dir=path.parent,
-        delete=False,
-    ) as stream:
-        temporary = Path(stream.name)
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    try:
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
 
 
 def build(output_path: Path = ARCHIVE_PATH) -> dict[str, Any]:
     assert_release_policy_candidate_is_active()
-    release_version, records = validate_sources()
-    first = make_archive(records)
-    second = make_archive(records)
+    release_version, source_records = validate_sources()
+    records = make_release_records(release_version, source_records)
+    validate_release_inventory(release_version, records)
+    archive_date_time = current_zip_date_time()
+    first = make_archive(records, archive_date_time)
+    second = make_archive(records, archive_date_time)
     if first != second:
-        raise RuntimeError("Release archive is not reproducible.")
-    validate_archive(first, records)
+        raise RuntimeError("Developer archive is not reproducible.")
+    validate_archive(first, records, archive_date_time)
 
     output = output_path.resolve()
-    manifest_path = output.parent / MANIFEST_PATH.name
-    checksums_path = output.parent / CHECKSUMS_PATH.name
-    public_records = [
-        {key: value for key, value in record.items() if key != "data"}
-        for record in records
-    ]
-    manifest = {
-        "agent_policy": {
-            "bundled": True,
-            "bundled_path": POLICY_RELATIVE,
-            "contract_sha256": POLICY_CONTRACT_SHA256,
-            "delivery": POLICY_DELIVERY,
-            "envelope_sha256": POLICY_SHA256,
-            "policy_version": POLICY_VERSION,
-            "runtime_filename": "hmb_agent_core.dat",
-            "signing_key_id": POLICY_SIGNING_KEY_ID,
-            "trusted_signature_required": True,
-        },
-        "archives": [
-            {
-                "bytes": len(first),
-                "name": output.name,
-                "sha256": digest(first),
-            }
-        ],
-        "contract_sha256": POLICY_CONTRACT_SHA256,
-        "policy_delivery": POLICY_DELIVERY,
-        "policy_version": POLICY_VERSION,
-        "release_label": RELEASE_LABEL,
-        "release_version": release_version,
-        "reproducible_zip": {
-            "compression": "deflate-9",
-            "member_mode": "100644",
-            "member_timestamp": "2020-01-01T00:00:00Z",
-        },
-        "schema": "hmb-release-manifest-v2",
-        "source_files": public_records,
-    }
-    manifest_bytes = (
-        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
-    checksums_bytes = (
-        f"{digest(first)}  {output.name}\n"
-        f"{digest(manifest_bytes)}  {manifest_path.name}\n"
-    ).encode("ascii")
-    atomic_write(output, first)
-    atomic_write(manifest_path, manifest_bytes)
-    atomic_write(checksums_path, checksums_bytes)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        prefix=output.name + ".",
+        suffix=".tmp",
+        dir=output.parent,
+        delete=False,
+    ) as stream:
+        temporary = Path(stream.name)
+        stream.write(first)
+        stream.flush()
+        os.fsync(stream.fileno())
+    try:
+        os.replace(temporary, output)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
     return {
         "archive": str(output),
+        "archive_built_at_local": format_zip_date_time(archive_date_time),
         "archive_sha256": digest(first),
-        "checksums": str(checksums_path),
         "file_count": len(records),
-        "manifest": str(manifest_path),
         "policy_contract_sha256": POLICY_CONTRACT_SHA256,
         "policy_delivery": POLICY_DELIVERY,
         "policy_version": POLICY_VERSION,
         "release_label": RELEASE_LABEL,
         "release_version": release_version,
+        "shot_routing_protocol": SHOT_ROUTING_PROTOCOL_VERSION,
     }
 
 
 def check() -> dict[str, Any]:
     assert_release_policy_candidate_is_active()
-    release_version, records = validate_sources()
-    first = make_archive(records)
-    second = make_archive(records)
+    release_version, source_records = validate_sources()
+    records = make_release_records(release_version, source_records)
+    validate_release_inventory(release_version, records)
+    archive_date_time = current_zip_date_time()
+    first = make_archive(records, archive_date_time)
+    second = make_archive(records, archive_date_time)
     if first != second:
-        raise RuntimeError("Release archive is not reproducible.")
-    validate_archive(first, records)
+        raise RuntimeError("Developer archive is not reproducible.")
+    validate_archive(first, records, archive_date_time)
     return {
         "file_count": len(records),
+        "archive_built_at_local": format_zip_date_time(archive_date_time),
         "policy_contract_sha256": POLICY_CONTRACT_SHA256,
         "policy_delivery": POLICY_DELIVERY,
         "policy_version": POLICY_VERSION,
         "release_label": RELEASE_LABEL,
         "release_version": release_version,
+        "shot_routing_protocol": SHOT_ROUTING_PROTOCOL_VERSION,
+        "validated": True,
+    }
+
+
+def check_output(output_path: Path = ARCHIVE_PATH) -> dict[str, Any]:
+    """Verify existing timestamped artifact contents against current sources."""
+
+    assert_release_policy_candidate_is_active()
+    release_version, source_records = validate_sources()
+    records = make_release_records(release_version, source_records)
+    validate_release_inventory(release_version, records)
+    output = output_path.resolve()
+    if not output.is_file():
+        raise RuntimeError(f"Developer release artifact is missing: {output}")
+    actual = output.read_bytes()
+    archive_date_time = archive_zip_date_time(actual)
+    validate_archive(actual, records, archive_date_time)
+    expected = make_archive(records, archive_date_time)
+    if actual != expected:
+        raise RuntimeError("Developer release artifact is stale or source-mismatched.")
+    return {
+        "archive": str(output),
+        "archive_built_at_local": format_zip_date_time(archive_date_time),
+        "archive_sha256": digest(actual),
+        "file_count": len(records),
+        "release_label": RELEASE_LABEL,
+        "release_version": release_version,
+        "shot_routing_protocol": SHOT_ROUTING_PROTOCOL_VERSION,
         "validated": True,
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build the deterministic HMB release ZIP with one signed policy artifact."
+        description="Build a verified developer ZIP that uses server-only policy delivery."
     )
     parser.add_argument(
         "--check",
@@ -526,13 +625,26 @@ def main() -> None:
         help="Validate sources and the in-memory ZIP without writing an artifact.",
     )
     parser.add_argument(
+        "--check-output",
+        action="store_true",
+        help="Verify that --output has current source contents and a uniform build time.",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=ARCHIVE_PATH,
-        help="Release ZIP destination.",
+        help="Developer ZIP destination. The production release files are never modified.",
     )
     args = parser.parse_args()
-    result = check() if args.check else build(args.output)
+    if args.check and args.check_output:
+        parser.error("--check and --check-output are mutually exclusive")
+    result = (
+        check_output(args.output)
+        if args.check_output
+        else check()
+        if args.check
+        else build(args.output)
+    )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
 
 

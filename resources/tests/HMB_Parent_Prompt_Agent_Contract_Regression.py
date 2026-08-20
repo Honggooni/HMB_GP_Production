@@ -385,9 +385,7 @@ def exercise_agent_route(
     )
 
 
-compiled_prompt_copy = prompt._build_data_only_prompt_package(
-    prompt._default_widget_state()
-)
+compiled_prompt_copy = prompt._build_prompt_package(prompt._default_widget_state())
 native_route = (False, False, 0, 0, 0, False, 0, 1)
 hmb_route = (True, True, 2, 4, 4, True, 1, 1)
 
@@ -488,18 +486,13 @@ four_prompt_modes = {
     "prompt+asset+picker": (prompt_asset_picker, (1, 1)),
 }
 compiled_modes: dict[str, str] = {}
-visible_modes: dict[str, str] = {}
 for mode_name, (state, expected_counts) in four_prompt_modes.items():
     status = state["status"]
     assert (
         int(status["active_images"]),
         int(status["active_videos"]),
     ) == expected_counts, mode_name
-    visible = prompt._build_prompt_package(state)
-    assert visible.startswith("HMB_GP_Production\n\nTARGET GENERATOR:\n")
-    assert "HMB JOB DATA (JSON):" not in visible
-    visible_modes[mode_name] = visible
-    compiled = prompt._build_data_only_prompt_package(state)
+    compiled = prompt._build_prompt_package(state)
     assert len([line for line in compiled.splitlines() if line.strip()]) == 7
     prompt_json_section(compiled, "HMB JOB DATA (JSON):")
     fx_facts = prompt_json_section(compiled, "FX/TIMING SOURCE DATA (JSON):")
@@ -532,7 +525,6 @@ assert [(item["video"], item["label"]) for item in combined_job["videos"]] == [
     ("@video1", "main"),
 ]
 assert len(set(compiled_modes.values())) == 4
-assert len(set(visible_modes.values())) == 4
 
 
 # Both semantic input ports use the engine's official `any` wildcard. The
@@ -594,17 +586,17 @@ prompt_node.after_incoming_connection(
 foreign_state = prompt._parse_state(
     prompt._get_parameter_raw(prompt_node, prompt.WIDGET_PARAMETER_NAME)
 )
+assert "source_intent_fallbacks" not in foreign_state
+foreign_blob = json.dumps(foreign_state, ensure_ascii=False, sort_keys=True)
 foreign_compiled = prompt_node.parameter_output_values["PROMPT_OUT"]
-foreign_machine = prompt_node._hmb_agent_prompt_snapshot(
-    foreign_compiled
-)["machine_prompt"]
 for preserved_token in (
     "KEEP_FOREIGN_ASSET_INTENT",
     "KEEP_FOREIGN_PICKER_INTENT",
 ):
+    assert preserved_token not in foreign_blob
     assert preserved_token not in foreign_compiled
 assert prompt_json_section(
-    foreign_machine,
+    foreign_compiled,
     "USER DESCRIPTION DATA (JSON):",
 ) == {}
 assert foreign_state["status"]["active_images"] == 0

@@ -35,6 +35,7 @@ for (const helper of [
   "hmbToggleVideoAssetSelection",
   "hmbMoveSelectedVideoAsset",
   "hmbApplySelectedVideoAssetOrderToDom",
+  "hmbApplyPickerShotFeedback",
   "hmbInstallVideoAssetDragReorder",
   "hmbPreviewVideoAsset",
   "hmbDeleteVideoAsset",
@@ -47,8 +48,8 @@ for (const helper of [
 }
 
 
-// The catalog may grow past ten. Only the ordered generator selection is
-// capped, and deselection never deletes the underlying card.
+// The catalog may grow without limit. A local Shot owns an ordered strip of up
+// to ten videos and never deletes an underlying catalog card.
 let state = {
   videos: Array.from({ length: 12 }, (_value, index) => (
     video(`video-${String(index + 1).padStart(2, "0")}`)
@@ -64,34 +65,30 @@ for (let index = 0; index < 10; index += 1) {
 }
 assert.deepEqual(
   widget.hmbSelectedVideoAssets(state).map((item) => item.video_uid),
-  Array.from(
-    { length: 10 },
-    (_value, index) => `video-${String(index + 1).padStart(2, "0")}`,
-  ),
+  Array.from({ length: 10 }, (_value, index) => `video-${String(index + 1).padStart(2, "0")}`),
 );
 assert.deepEqual(
   widget.hmbSelectedVideoAssets(state).map((item) => item.selection_order),
   Array.from({ length: 10 }, (_value, index) => index + 1),
 );
 
-const blockedAtTen = widget.hmbToggleVideoAssetSelection(state, "video-11");
-assert.equal(blockedAtTen.videos.length, 12, "Selection capacity must not trim the catalog.");
+const fullAtTen = widget.hmbToggleVideoAssetSelection(state, "video-11");
+assert.equal(fullAtTen.videos.length, 12, "A full Shot must not trim the catalog.");
 assert.deepEqual(
-  widget.hmbSelectedVideoAssets(blockedAtTen).map((item) => item.video_uid),
+  widget.hmbSelectedVideoAssets(fullAtTen).map((item) => item.video_uid),
   widget.hmbSelectedVideoAssets(state).map((item) => item.video_uid),
-  "Selecting an eleventh video is rejected without changing the ten selected UIDs.",
+  "An eleventh card is blocked until one of the ten Shot slots is released.",
 );
 assert.equal(
-  blockedAtTen.videos.find((item) => item.video_uid === "video-11").selected,
+  fullAtTen.videos.find((item) => item.video_uid === "video-11").selected,
   false,
 );
 
 state = widget.hmbToggleVideoAssetSelection(state, "video-04");
-assert.equal(state.videos.length, 12, "Deselecting keeps the video in current-cut history.");
-assert.equal(widget.hmbSelectedVideoAssets(state).length, 9);
+assert.equal(state.videos.length, 12, "Deselecting keeps every video in the catalog.");
+assert.equal(widget.hmbSelectedVideoAssets(state).some((item) => item.video_uid === "video-04"), false);
 state = widget.hmbToggleVideoAssetSelection(state, "video-11");
-assert.equal(widget.hmbSelectedVideoAssets(state).length, 10);
-assert.equal(widget.hmbSelectedVideoAssets(state).at(-1).video_uid, "video-11");
+assert.deepEqual(widget.hmbSelectedVideoAssets(state).map((item) => item.video_uid).slice(-1), ["video-11"]);
 
 const catalogUidsBeforeMove = state.videos.map((item) => item.video_uid);
 state = widget.hmbMoveSelectedVideoAsset(state, "video-11", 0);
@@ -99,7 +96,7 @@ assert.equal(widget.hmbSelectedVideoAssets(state)[0].video_uid, "video-11");
 assert.deepEqual(
   widget.hmbSelectedVideoAssets(state).map((item) => item.selection_order),
   Array.from({ length: 10 }, (_value, index) => index + 1),
-  "Drag/arrow reordering compacts display order without changing stable UID identity.",
+  "The ten-card Shot strip keeps contiguous generator order.",
 );
 assert.deepEqual(
   state.videos.map((item) => item.video_uid),
@@ -133,7 +130,7 @@ class FakeVideoCard {
       ["data-video-uid", uid],
       ["data-selected-video-uid", uid],
       ["data-selected-video-order", String(order)],
-      ["draggable", "true"],
+      ["draggable", "false"],
     ]);
     this.classList = new FakeClassList("video-asset-card", "selected");
     this.badge = { textContent: `@video${order}` };
@@ -166,6 +163,7 @@ class FakeVideoCard {
 class FakeVideoGrid {
   constructor(cards) {
     this.children = [...cards];
+    this.moves = 0;
   }
 
   querySelectorAll(selector) {
@@ -173,8 +171,18 @@ class FakeVideoGrid {
   }
 
   appendChild(card) {
+    this.moves += 1;
     this.children = this.children.filter((item) => item !== card);
     this.children.push(card);
+    return card;
+  }
+
+  insertBefore(card, before) {
+    this.moves += 1;
+    this.children = this.children.filter((item) => item !== card);
+    const index = before ? this.children.indexOf(before) : -1;
+    if (index < 0) this.children.push(card);
+    else this.children.splice(index, 0, card);
     return card;
   }
 }
@@ -227,6 +235,100 @@ class FakeDragContainer {
   }
 }
 
+// Shot switching must repaint selector, Jewel Night accent, and ordered video
+// cards in one optimistic transaction; the same helper is used for rollback.
+{
+  const cards = [new FakeVideoCard("shot-a", 1), new FakeVideoCard("shot-b", 2)];
+  const container = new FakeDragContainer(cards);
+  const paletteAttributes = new Map();
+  const paletteStyles = new Map();
+  const paletteRoot = {
+    style: { setProperty(name, value) { paletteStyles.set(name, value); } },
+    setAttribute(name, value) { paletteAttributes.set(name, String(value)); },
+  };
+  const shotOneUuid = "11111111-1111-4111-8111-111111111111";
+  const shotTwoUuid = "22222222-2222-4222-8222-222222222222";
+  const channelUuid = "33333333-3333-4333-8333-333333333333";
+  const publisherUuid = "44444444-4444-4444-8444-444444444444";
+  const workspaceOneUuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const workspaceTwoUuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const selector = {
+    value: shotOneUuid,
+    options: [{ value: shotOneUuid }, { value: shotTwoUuid }],
+  };
+  const count = { textContent: "" };
+  const originalQuerySelector = container.querySelector.bind(container);
+  container.querySelector = (query) => {
+    if (query === ".hmbvp") return paletteRoot;
+    if (query === "#shot-selector") return selector;
+    if (query === ".video-selected-count") return count;
+    return originalQuerySelector(query);
+  };
+  const switchedShot = {
+    videos: [
+      { ...video("shot-a"), selected: false, selection_order: 0 },
+      { ...video("shot-b"), selected: true, selection_order: 1 },
+    ],
+    shot_publisher_instance_uuid: publisherUuid,
+    channel_uuid: channelUuid,
+    shot_number: 2,
+    shot_uuid: shotTwoUuid,
+    shot_name: "Shot 2",
+    shot_selections: [
+      { shot_uuid: shotOneUuid, number: 1, name: "Shot 1", revision: 1, selected_video_uids: ["shot-a"] },
+      { shot_uuid: shotTwoUuid, number: 2, name: "Shot 2", revision: 1, selected_video_uids: ["shot-b"] },
+    ],
+    picker_shots: [
+      {
+        workspace_uuid: workspaceOneUuid, number: 1, name: "Shot 1", bound_shot_uuid: shotOneUuid,
+        video_asset_uids: ["shot-a", "shot-c"], selected_video_uids: ["shot-a"], preview_video_uid: "shot-a",
+      },
+      {
+        workspace_uuid: workspaceTwoUuid, number: 2, name: "Shot 2", bound_shot_uuid: shotTwoUuid,
+        video_asset_uids: ["shot-b"], selected_video_uids: ["shot-b"], preview_video_uid: "shot-b",
+      },
+    ],
+    active_picker_shot_uuid: workspaceTwoUuid,
+  };
+  assert.deepEqual(widget.hmbApplyPickerShotFeedback(container, switchedShot), ["shot-b"]);
+  assert.equal(selector.value, shotTwoUuid);
+  assert.equal(paletteAttributes.get("data-shot-number"), "2");
+  assert.equal(paletteStyles.get("--hmb-accent"), "#3B82F6");
+  assert.deepEqual(
+    container.grid.children.map((card) => card.getAttribute("data-video-uid")),
+    ["shot-b", "shot-a"],
+  );
+  assert.equal(
+    container.grid.moves,
+    1,
+    "Shot switching must move only the out-of-place card, not append every catalog card.",
+  );
+  assert.equal(count.textContent, "1/10");
+
+  const rollbackShot = {
+    videos: [
+      { ...video("shot-a"), selected: true, selection_order: 1 },
+      { ...video("shot-b"), selected: false, selection_order: 0 },
+    ],
+    shot_publisher_instance_uuid: publisherUuid,
+    channel_uuid: channelUuid,
+    shot_number: 1,
+    shot_uuid: shotOneUuid,
+    shot_name: "Shot 1",
+    shot_selections: switchedShot.shot_selections,
+    picker_shots: switchedShot.picker_shots,
+    active_picker_shot_uuid: workspaceOneUuid,
+  };
+  widget.hmbApplyPickerShotFeedback(container, rollbackShot);
+  assert.equal(selector.value, shotOneUuid);
+  assert.equal(paletteAttributes.get("data-shot-number"), "1");
+  assert.equal(paletteStyles.get("--hmb-accent"), "#F472B6");
+  assert.deepEqual(
+    container.grid.children.map((card) => card.getAttribute("data-video-uid")),
+    ["shot-a", "shot-b"],
+  );
+}
+
 
 function fakeDragEvent(target, dataTransfer) {
   return {
@@ -255,7 +357,7 @@ function fourVideoDragState() {
 }
 
 
-function exerciseDelegatedDrag({ withDrop, remountBeforeFinish = false }) {
+function exerciseDelegatedDrag() {
   let liveState = fourVideoDragState();
   const cards = Array.from({ length: 4 }, (_value, index) => new FakeVideoCard(`drag-${index + 1}`, index + 1));
   const container = new FakeDragContainer(cards);
@@ -277,40 +379,26 @@ function exerciseDelegatedDrag({ withDrop, remountBeforeFinish = false }) {
   };
   container.dispatch("dragstart", fakeDragEvent(cards[3], dataTransfer));
   container.dispatch("dragover", fakeDragEvent(cards[0], dataTransfer));
-  if (remountBeforeFinish) {
-    cleanup();
-    assert.equal(
-      container.__hmbVideoDragSession?.targetUid,
-      "drag-1",
-      "A host widget remount must retain the in-flight source and last valid target.",
-    );
-    cleanup = install();
-  }
-  if (withDrop) container.dispatch("drop", fakeDragEvent(cards[0], dataTransfer));
+  container.dispatch("drop", fakeDragEvent(cards[0], dataTransfer));
   container.dispatch("dragend", fakeDragEvent(cards[3], dataTransfer));
 
-  assert.equal(commits.length, 1, "A native drop plus dragend must commit exactly once.");
-  assert.equal(commits[0].reason, withDrop ? "drop" : "dragend");
+  assert.equal(commits.length, 0, "One-representative cards never expose reorder drag.");
+  assert.equal(container.__hmbVideoDragSession, undefined);
   assert.deepEqual(
     widget.hmbSelectedVideoAssets(liveState).map((item) => item.video_uid),
-    ["drag-4", "drag-1", "drag-2", "drag-3"],
-    "Moving selected video 4 onto video 1 must persist the exact 4,1,2,3 generator order.",
+    ["drag-1", "drag-2", "drag-3", "drag-4"],
+    "A rejected native drag cannot mutate even a legacy multi-selection fixture.",
   );
   assert.deepEqual(
     container.grid.children.map((card) => card.getAttribute("data-video-uid")),
-    ["drag-4", "drag-1", "drag-2", "drag-3"],
-    "The optimistic keyed card DOM must show the committed order immediately.",
-  );
-  assert.deepEqual(
-    container.grid.children.map((card) => card.badge.textContent),
-    ["@video1", "@video2", "@video3", "@video4"],
+    ["drag-1", "drag-2", "drag-3", "drag-4"],
+    "Rejected drag leaves keyed card DOM identity/order untouched.",
   );
   cleanup();
 }
 
 
-exerciseDelegatedDrag({ withDrop: true, remountBeforeFinish: true });
-exerciseDelegatedDrag({ withDrop: false, remountBeforeFinish: true });
+exerciseDelegatedDrag();
 
 // Leaving the selected-card area clears the last candidate. A later dragend
 // must not accidentally apply an old hover position.
@@ -349,8 +437,8 @@ assert.deepEqual(
 );
 assert.deepEqual(
   widget.hmbSelectedVideoAssets(deleted).map((item) => item.selection_order),
-  Array.from({ length: 9 }, (_value, index) => index + 1),
-  "Visible @video order compacts after deletion while stable catalog IDs remain intact.",
+  [1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "The remaining Shot videos are compacted into stable numeric order after deletion.",
 );
 
 const previewed = widget.hmbPreviewVideoAsset(state, "video-07");
@@ -423,7 +511,7 @@ assert.ok(
 );
 assert.match(importVideoInput, /type="file"/);
 assert.match(importVideoInput, /hidden/);
-assert.match(importVideoInput, /\bmultiple\b/);
+assert.match(importVideoInput, /\bmultiple\b/, "One active Shot may load up to its remaining ten-card capacity in one dialog.");
 assert.match(importVideoInput, /accept="[^"]*video\/mp4/);
 assert.doesNotMatch(widgetSource, /files\?\.\[0\]/);
 assert.match(widgetSource, /Array\.from\(event\.target\?\.files \|\| \[\]\)/);
@@ -431,12 +519,9 @@ assert.match(widgetSource, /dispatchCommand\("import_video_assets", \{[\s\S]*?so
 const selectedVideoCardTags = widgetSource.match(
   /<[^>]*data-selected-video-uid=[^>]*>/g,
 ) || [];
-assert.ok(
-  selectedVideoCardTags.some((tag) => (
-    /draggable="true"/.test(tag) || /draggable=\\"true\\"/.test(tag)
-  )),
-  "Selected cards must be draggable in their visible left-to-right/top-to-bottom order.",
-);
+assert.ok(selectedVideoCardTags.length > 0);
+assert.match(widgetSource, /draggable="\$\{locked \|\| !reorderEnabled \? "false" : "true"\}/);
+assert.match(widgetSource, /selected\.length > 1/);
 assert.match(widgetSource, /data-delete-video-uid=/);
 const thumbnailVideoTags = widgetSource.match(
   /<video\b[^>]*class="video-asset-thumb-media"[^>]*>/g,
@@ -465,7 +550,7 @@ assert.ok(
   "Each catalog card needs its own delete action without renumbering stable UIDs.",
 );
 
-const cardTemplateStart = widgetSource.indexOf("function videoAssetCardsHtml(");
+const cardTemplateStart = widgetSource.indexOf("function hmbVideoAssetCardHtml(");
 const cardTemplateEnd = widgetSource.indexOf(
   "export function hmbInstallPickerInteractionIsolation(",
   cardTemplateStart,
@@ -498,16 +583,16 @@ assert.doesNotMatch(
 );
 
 const mainPreviewPlaybackStart = widgetSource.indexOf(
-  'container.querySelectorAll("[data-play-video-uid]")',
+  "const playInPreview = (event, button) =>",
   widgetSource.indexOf('on(container.querySelector("#import-video-asset"), "change"'),
 );
 const mainPreviewPlaybackEnd = widgetSource.indexOf(
-  'container.querySelectorAll("[data-toggle-video-uid]")',
+  "const toggleVideoSelection = (event, selectionSurface) =>",
   mainPreviewPlaybackStart,
 );
 assert.ok(
   mainPreviewPlaybackStart >= 0 && mainPreviewPlaybackEnd > mainPreviewPlaybackStart,
-  "The centered play controls must be wired before the lower selection surfaces.",
+  "The delegated centered-play callback must be defined before the lower selection callback.",
 );
 const mainPreviewPlaybackHandler = widgetSource.slice(
   mainPreviewPlaybackStart,
@@ -518,14 +603,24 @@ assert.match(mainPreviewPlaybackHandler, /container\.__hmbAutoplayVideoUid = uid
 assert.match(mainPreviewPlaybackHandler, /container\.__hmbForceVideoPreviewUid = uid/);
 assert.match(
   mainPreviewPlaybackHandler,
-  /commit\(\{ \.\.\.hmbPreviewVideoAsset\(liveState, uid\), viewport_mode: "video" \}\)/,
-  "A card play click must switch the shared viewport into video mode.",
+  /const nextState = livePreviewUid === uid[\s\S]*?hmbPreviewVideoAsset\(liveState, uid\)[\s\S]*?hmbPatchVideoPickerPreviewDom\(container, nextState, tr, \{[\s\S]*?autoplay: true,[\s\S]*?Video-card playback[\s\S]*?\}\)/,
+  "A card play click must patch the shared viewport into video mode before publication.",
 );
-assert.match(mainPreviewPlaybackHandler, /previewPlayer\.play\?\.\(\)/);
+assert.match(widgetSource, /options\.autoplay === true[\s\S]*?video\.play\?\.\(\)/);
 assert.doesNotMatch(
   mainPreviewPlaybackHandler,
   /video-asset-thumb-media|\bmedia\.play|\bmedia\.pause|\botherMedia\b/,
   "A catalog thumbnail must never be decoded as the playing media element.",
+);
+assert.match(
+  widgetSource.slice(mainPreviewPlaybackStart),
+  /hmbInstallVideoAssetRootDelegation\(\s*container,\s*\{ play: playInPreview, select: toggleVideoSelection, remove: deleteVideoAsset \}/s,
+  "Play, select, and delete must share one root-delegated card controller.",
+);
+assert.doesNotMatch(
+  widgetSource.slice(mainPreviewPlaybackStart),
+  /querySelectorAll\("\[data-(?:play|toggle|delete)-video-uid\]"\)\.forEach/,
+  "Video catalog rows must not install per-card event listeners.",
 );
 assert.doesNotMatch(widgetSource, /syncInlineVideoIndicator|toggleInlineVideo/);
 assert.doesNotMatch(
@@ -540,21 +635,23 @@ assert.match(
 );
 
 const selectionHandlerStart = widgetSource.indexOf(
-  'container.querySelectorAll("[data-toggle-video-uid]")',
+  "const toggleVideoSelection = (event, selectionSurface) =>",
   mainPreviewPlaybackEnd,
 );
 const selectionHandlerEnd = widgetSource.indexOf(
-  'container.querySelectorAll("[data-delete-video-uid]")',
+  "const deleteVideoAsset = (event, button) =>",
   selectionHandlerStart,
 );
 assert.ok(selectionHandlerStart >= 0 && selectionHandlerEnd > selectionHandlerStart);
 const selectionHandler = widgetSource.slice(selectionHandlerStart, selectionHandlerEnd);
-assert.match(selectionHandler, /selectionSurface\.getAttribute\("aria-disabled"\) === "true"/);
+assert.match(selectionHandler, /selectionSurface\?\.getAttribute\?\.\("aria-disabled"\) === "true"/);
 assert.match(selectionHandler, /container\.__hmbSuppressVideoSelectionClick/);
-assert.match(selectionHandler, /on\(selectionSurface, "click", toggleSelection\)/);
-assert.match(selectionHandler, /on\(selectionSurface, "keydown"/);
-assert.match(selectionHandler, /\["Enter", " "\]\.includes\(event\.key\)/);
 assert.match(selectionHandler, /hmbToggleVideoAssetSelection\(liveState, uid\)/);
+assert.match(
+  widgetSource,
+  /const delegatedKeydown = \(event\) => \{[\s\S]*?\["Enter", " "\]\.includes\(event\?\.key\)[\s\S]*?handlers\.select\?\.\(event, select\)/,
+  "The root keyboard delegate must preserve Enter/Space selection accessibility.",
+);
 assert.match(
   widgetSource,
   /\.video-asset-delete\{top:7px;right:7px;bottom:auto;/,

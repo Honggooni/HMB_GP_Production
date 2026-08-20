@@ -362,6 +362,49 @@ assert.equal(
   "Sizing the Prompt-style inner frame must not overwrite the outer node during host propagation.",
 );
 
+// With no visible native row above the Picker, the established 1200px shell
+// must be fully occupied by the dashboard instead of leaving the former
+// 960px-content / 240px-dead-strip split.
+const fullStartShell = fakeElement(null, "react-flow__node");
+fullStartShell.offsetHeight = 1200;
+fullStartShell.getBoundingClientRect = () => ({ top: 0, bottom: 1200, height: 1200 });
+const fullStartHost = fakeElement(fullStartShell, "widget-host");
+const fullStartContainer = fakeElement(fullStartHost, "picker-container");
+const fullStartClip = fakeElement(fullStartContainer, "hmbvp-clip");
+const fullStartPicker = fakeElement(fullStartClip, "hmbvp");
+fullStartContainer.getBoundingClientRect = () => ({ top: 0, bottom: 1200, height: 1200 });
+fullStartContainer.querySelector = (selector) => {
+  if (selector === ".hmbvp-clip") return fullStartClip;
+  if (selector === ".hmbvp") return fullStartPicker;
+  return null;
+};
+assert.equal(picker.hmbStretchPickerAdaptiveStack(fullStartContainer, null, fullStartShell), 1200);
+assert.equal(fullStartContainer.style.minHeight, "1200px");
+assert.equal(fullStartClip.style.height, "1200px");
+assert.equal(fullStartPicker.style.height, "1200px");
+assert.equal(fullStartShell.style.height, undefined, "Inner fill must not rewrite the 1200px outer size.");
+
+// A serialized manual resize at the established 1151px floor remains exact;
+// filling available space must not behave like a start-size migration.
+const savedResizeShell = fakeElement(null, "react-flow__node");
+savedResizeShell.offsetHeight = 1151;
+savedResizeShell.getBoundingClientRect = () => ({ top: 0, bottom: 1151, height: 1151 });
+const savedResizeHost = fakeElement(savedResizeShell, "widget-host");
+const savedResizeContainer = fakeElement(savedResizeHost, "picker-container");
+const savedResizeClip = fakeElement(savedResizeContainer, "hmbvp-clip");
+const savedResizePicker = fakeElement(savedResizeClip, "hmbvp");
+savedResizeContainer.getBoundingClientRect = () => ({ top: 0, bottom: 1151, height: 1151 });
+savedResizeContainer.querySelector = (selector) => {
+  if (selector === ".hmbvp-clip") return savedResizeClip;
+  if (selector === ".hmbvp") return savedResizePicker;
+  return null;
+};
+assert.equal(picker.hmbStretchPickerAdaptiveStack(savedResizeContainer, null, savedResizeShell), 1151);
+assert.equal(savedResizeContainer.style.minHeight, "1151px");
+assert.equal(savedResizeClip.style.height, "1151px");
+assert.equal(savedResizePicker.style.height, "1151px");
+assert.equal(savedResizeShell.style.height, undefined, "Saved 1151px outer height must remain user-owned.");
+
 const commandBridge = await importWidget("../../widgets/HMBVideoPickerCommandBridgeWidget_v032.js");
 const collapsedPickerShell = fakeElement(null, "react-flow__node");
 collapsedPickerShell.offsetWidth = 1400;

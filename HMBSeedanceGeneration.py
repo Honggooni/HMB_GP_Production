@@ -4,6 +4,8 @@ import asyncio
 import base64
 import binascii
 import ctypes
+import hashlib
+import hmac
 import importlib
 import ipaddress
 import json
@@ -58,6 +60,11 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import write_si
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.traits.options import Options
 
+try:
+    from griptape_nodes.traits.widget import Widget
+except Exception:  # Older Griptape Nodes builds keep the legacy selector alive.
+    Widget = None  # type: ignore[assignment]
+
 _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
@@ -70,6 +77,10 @@ from _hmb_mp4_verify import (
     MP4_DECODE_VERIFIER_START_TIMEOUT_SECONDS,
     resolve_mp4_decode_verifier as _resolve_mp4_decode_verifier,
     validate_decodable_mp4_file as _validate_decodable_mp4_file,
+)
+import _hmb_shot_routing as _shot_routing
+from _hmb_common import (
+    _broker_load_bearer_token_readonly,
 )
 
 logger = logging.getLogger("griptape_nodes")
@@ -146,47 +157,59 @@ INPUT_MODE_MULTIMODAL_REFERENCES = "Multimodal References"
 
 MODEL_NAME_SEEDANCE_2_0 = "Seedance 2.0"
 MODEL_NAME_SEEDANCE_2_0_FAST = "Seedance 2.0 Fast"
-MODEL_NAME_SEEDANCE_2_0_MINI = "Seedance 2.0 Mini"
 
 SEEDANCE_2_0_MODEL_ID = "doubao-seedance-2-0-260128"
 SEEDANCE_2_0_FAST_MODEL_ID = "doubao-seedance-2-0-fast-260128"
-SEEDANCE_2_0_MINI_MODEL_ID = "doubao-seedance-2-0-mini-260615"
 
-# The FN AI Broker Volcengine adapter accepts the full, Fast, and Mini Seedance
-# 2.0 endpoints. Keep this allowlist explicit so an arbitrary catalog entry can
-# never be submitted merely because it contains "seedance" in its name.
+# The FN AI Broker Volcengine adapter accepts only the two active Seedance 2.0
+# endpoints. Keep this allowlist explicit so a retired or arbitrary catalog
+# entry can never be submitted merely because its name contains "seedance".
 BROKER_SUPPORTED_MODEL_IDS = frozenset(
     {
         SEEDANCE_2_0_MODEL_ID,
         SEEDANCE_2_0_FAST_MODEL_ID,
-        SEEDANCE_2_0_MINI_MODEL_ID,
     }
 )
 
-# Old display and BytePlus model values remain accepted so saved workflows migrate
-# without silently submitting an obsolete provider model id.
+# Mini is retired by the Broker. These exact historical serialized values are
+# recognized solely to migrate an old workflow once to the active full-model
+# default. They are never members of an active allowlist or request schema.
+RETIRED_SEEDANCE_MODEL_VALUES = frozenset(
+    {
+        "Seedance 2.0 Mini",
+        "dreamina-seedance-2-0-mini-260615",
+        "doubao-seedance-2-0-mini-260615",
+    }
+)
+
+# Old active display and BytePlus values remain accepted so saved workflows
+# migrate without silently submitting an obsolete provider model id. Retired
+# Mini values canonicalize to the current safe default before validation.
 MODEL_ID_ALIASES = {
     MODEL_NAME_SEEDANCE_2_0: SEEDANCE_2_0_MODEL_ID,
     MODEL_NAME_SEEDANCE_2_0_FAST: SEEDANCE_2_0_FAST_MODEL_ID,
-    MODEL_NAME_SEEDANCE_2_0_MINI: SEEDANCE_2_0_MINI_MODEL_ID,
     "dreamina-seedance-2-0-260128": SEEDANCE_2_0_MODEL_ID,
     "dreamina-seedance-2-0-fast-260128": SEEDANCE_2_0_FAST_MODEL_ID,
-    "dreamina-seedance-2-0-mini-260615": SEEDANCE_2_0_MINI_MODEL_ID,
     SEEDANCE_2_0_MODEL_ID: SEEDANCE_2_0_MODEL_ID,
     SEEDANCE_2_0_FAST_MODEL_ID: SEEDANCE_2_0_FAST_MODEL_ID,
-    SEEDANCE_2_0_MINI_MODEL_ID: SEEDANCE_2_0_MINI_MODEL_ID,
+    **{
+        retired: SEEDANCE_2_0_MODEL_ID
+        for retired in RETIRED_SEEDANCE_MODEL_VALUES
+    },
+}
+MODEL_DISPLAY_NAME_BY_ID = {
+    SEEDANCE_2_0_MODEL_ID: MODEL_NAME_SEEDANCE_2_0,
+    SEEDANCE_2_0_FAST_MODEL_ID: MODEL_NAME_SEEDANCE_2_0_FAST,
 }
 
 MODEL_RESOLUTIONS = {
     SEEDANCE_2_0_MODEL_ID: ("4k", "1080p", "720p", "480p"),
     SEEDANCE_2_0_FAST_MODEL_ID: ("720p", "480p"),
-    SEEDANCE_2_0_MINI_MODEL_ID: ("720p", "480p"),
 }
 
 MODEL_DEFAULT_RESOLUTIONS = {
     SEEDANCE_2_0_MODEL_ID: "1080p",
     SEEDANCE_2_0_FAST_MODEL_ID: "720p",
-    SEEDANCE_2_0_MINI_MODEL_ID: "720p",
 }
 
 RATIOS = ("adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16")
@@ -206,6 +229,18 @@ BROKER_FAILURE_STATUSES = {"failed", "error", "rejected"}
 BROKER_CANCELLED_STATUSES = {"cancelled", "canceled"}
 BROKER_EXPIRED_STATUSES = {"expired"}
 
+# Local preparation states are intentionally distinct from server task states.
+# They provide immediate feedback while disk/network preparation runs off the
+# event loop and are converted to ``failed`` if execution stops before POST.
+LOCAL_PRE_SUBMISSION_STATUSES = frozenset(
+    {
+        "resolving_inputs",
+        "preparing_output",
+        "connecting_broker",
+        "preparing_media",
+    }
+)
+
 MAX_REFERENCE_IMAGES = 9
 MAX_VIDEO_REFERENCES = 3
 MAX_REFERENCE_AUDIO = 3
@@ -217,6 +252,146 @@ MAX_ATOMIC_OUTPUT_CANDIDATES = 10_000
 AMBIGUOUS_UPLOAD_CLEANUP_DELAY_SECONDS = 30 * 60
 
 VIDEO_REFERENCES_PARAMETER = "VIDEO_REFERENCES"
+SHOT_PROMPT_INPUT_PARAMETER = "SHOT_PROMPT_IN"
+SHOT_IMAGE_INPUT_PARAMETER = "SHOT_IMAGE_IN"
+SHOT_VIDEO_INPUT_PARAMETER = "SHOT_VIDEO_IN"
+SHOT_ASSET_INPUT_PARAMETER = "SHOT_ASSET_IN"
+SHOT_PICKER_INPUT_PARAMETER = "SHOT_PICKER_IN"
+SHOT_LOCAL_PROMPT_PARAMETER = "HMB_LOCAL_PROMPT_FALLBACK"
+SHOT_LOCAL_PROMPT_CAPTURED_PARAMETER = "HMB_LOCAL_PROMPT_CAPTURED"
+SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER = "HMB_REMOTE_PROMPT_OVERLAY"
+SHOT_AUTOCLAIM_ENABLED_PARAMETER = "HMB_SHOT_AUTOCLAIM_ENABLED"
+SHOT_SELECTOR_PARAMETER = "shot_selector"
+SEEDANCE_SHOT_WIDGET_PARAMETER = "HMB_SEEDANCE_SHOT_UI"
+SEEDANCE_SHOT_WIDGET_NAME = "HMBSeedanceGenerationWidget"
+SEEDANCE_SHOT_WIDGET_LIBRARY_NAME = "HMB_GP_Production"
+SEEDANCE_SHOT_WIDGET_HEIGHT = 64
+SHOT_CHANNEL_UUID_PARAMETER = "shot_channel_uuid"
+SHOT_UUID_PARAMETER = "shot_uuid"
+SHOT_NUMBER_PARAMETER = "shot_number"
+SHOT_NAME_PARAMETER = "shot_name"
+SHOT_ROUTING_MAX_SHOTS = 5
+SHOT_CONNECTION_PENDING_LABEL = "Shot connection pending"
+# Compatibility export for tests and saved integrations that imported the old
+# constant name.  It remains a diagnostic label; the visible independent mode
+# is the ordinary prompt-only ``Only`` choice.
+SHOT_REMOTE_WAITING_LABEL = SHOT_CONNECTION_PENDING_LABEL
+SHOT_ONLY_LABEL = "Only"
+AGENT_REMOTE_PROMPT_PUBLICATION_SCHEMA = "hmb-agent-remote-prompt-publication"
+AGENT_REMOTE_PROMPT_PUBLICATION_VERSION = 1
+MAX_REMOTE_PROMPT_CHARACTERS = 2_000_000
+SHOT_UNAVAILABLE_LABEL = SHOT_ONLY_LABEL
+
+
+def _seedance_uuid_text(value: Any) -> str:
+    text = str(value or "").strip().casefold()
+    return text if re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        text,
+    ) else ""
+
+
+def _seedance_widget_catalog(value: Any) -> dict[str, Any]:
+    """Normalize the bounded backend catalog exposed to the custom widget."""
+
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "version", "publisher_instance_uuid", "channel_uuid",
+        "generation", "metadata_sha256", "shots",
+    }:
+        return {}
+    publisher = _seedance_uuid_text(value.get("publisher_instance_uuid"))
+    channel = _seedance_uuid_text(value.get("channel_uuid"))
+    generation = value.get("generation")
+    metadata_sha256 = str(value.get("metadata_sha256") or "").strip().casefold()
+    if (
+        value.get("schema") != "hmb-shot-routing-catalog"
+        or value.get("version") != 1
+        or not publisher
+        or not channel
+        or not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 1
+        or re.fullmatch(r"[0-9a-f]{64}", metadata_sha256) is None
+        or not isinstance(value.get("shots"), list)
+        or not 1 <= len(value["shots"]) <= SHOT_ROUTING_MAX_SHOTS
+    ):
+        return {}
+    shots: list[dict[str, Any]] = []
+    shot_ids: set[str] = set()
+    numbers: set[int] = set()
+    for raw in value["shots"]:
+        if not isinstance(raw, dict) or set(raw) != {
+            "shot_uuid", "number", "name", "revision",
+        }:
+            return {}
+        shot_uuid = _seedance_uuid_text(raw.get("shot_uuid"))
+        number = raw.get("number")
+        revision = raw.get("revision")
+        name = " ".join(str(raw.get("name") or "").split())
+        if (
+            not shot_uuid
+            or shot_uuid in shot_ids
+            or not isinstance(number, int)
+            or isinstance(number, bool)
+            or not 1 <= number <= SHOT_ROUTING_MAX_SHOTS
+            or number in numbers
+            or not isinstance(raw.get("name"), str)
+            or raw.get("name") != name
+            or not name
+            or len(name) > 128
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or revision < 0
+        ):
+            return {}
+        shot_ids.add(shot_uuid)
+        numbers.add(number)
+        shots.append({
+            "shot_uuid": shot_uuid,
+            "number": number,
+            "name": name,
+            "revision": revision,
+        })
+    shots.sort(key=lambda item: (item["number"], item["shot_uuid"]))
+    return {
+        "schema": "hmb-shot-routing-catalog",
+        "version": 1,
+        "publisher_instance_uuid": publisher,
+        "channel_uuid": channel,
+        "generation": generation,
+        "metadata_sha256": metadata_sha256,
+        "shots": shots,
+    }
+
+
+def _seedance_widget_value(
+    shot: Any = None,
+    shot_catalog: Any = None,
+) -> dict[str, Any]:
+    """Build the sole backend-authoritative Seedance Shot UI value."""
+
+    catalog = _seedance_widget_catalog(shot_catalog)
+    raw_shot = shot if isinstance(shot, dict) else {}
+    requested_channel = _seedance_uuid_text(raw_shot.get("channel_uuid"))
+    requested_uuid = _seedance_uuid_text(raw_shot.get("shot_uuid"))
+    selected = None
+    if catalog and requested_channel == catalog["channel_uuid"] and requested_uuid:
+        selected = next(
+            (item for item in catalog["shots"] if item["shot_uuid"] == requested_uuid),
+            None,
+        )
+    shot_value = {
+        "channel_uuid": catalog["channel_uuid"] if selected else "",
+        "shot_uuid": selected["shot_uuid"] if selected else "",
+        "number": selected["number"] if selected else 1,
+        "name": selected["name"] if selected else SHOT_ONLY_LABEL,
+    }
+    return {
+        "schema": "hmb-seedance-shot-ui",
+        "schema_version": 1,
+        "shot_catalog": catalog,
+        "shot": shot_value,
+    }
 
 IMAGE_MIME_BY_SUFFIX = {
     ".jpg": "image/jpeg",
@@ -304,7 +479,7 @@ class _BrokerNoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def _broker_build_opener() -> Any:
-    """Build a Broker-only opener that never inherits machine proxy settings."""
+    """Build the existing Broker opener without inheriting machine proxies."""
     return urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
         _BrokerNoRedirectHandler(),
@@ -436,19 +611,12 @@ def _broker_clear_token() -> None:
 
 
 def _broker_load_token() -> str:
-    path = _broker_token_path()
-    if not path.is_file():
-        raise _BrokerAuthenticationError("FN AI Broker login is required.")
     try:
-        token = _broker_dpapi(path.read_bytes(), protect=False).decode("utf-8")
-    except (OSError, UnicodeError) as exc:
+        return _broker_load_bearer_token_readonly()
+    except RuntimeError as exc:
         raise _BrokerAuthenticationError(
-            "The saved FN AI Broker login is unavailable. Connect again."
+            str(exc) or "The saved FN AI Broker login is unavailable. Connect again."
         ) from exc
-    token = token.strip()
-    if not token:
-        raise _BrokerAuthenticationError("FN AI Broker login is required.")
-    return token
 
 
 def _broker_read_json(response: Any, *, max_bytes: int) -> Any:
@@ -480,6 +648,14 @@ def _broker_same_origin(url: str, origin_url: str) -> bool:
         return False
 
 
+def _broker_require_exact_response_url(response: Any, expected_url: str) -> None:
+    getter = getattr(response, "geturl", None)
+    if not callable(getter) or str(getter()) != expected_url:
+        raise _BrokerProtocolError(
+            "FN AI Broker response origin or path was invalid."
+        )
+
+
 def _broker_device_login(*, opener: Any | None = None) -> dict[str, Any]:
     """Authorize this Windows account once and persist the resulting Broker token."""
     server_url = _broker_validated_server_url()
@@ -502,9 +678,14 @@ def _broker_device_login(*, opener: Any | None = None) -> dict[str, Any]:
         )
         try:
             with request_opener.open(start_request, timeout=10) as response:
+                _broker_require_exact_response_url(response, start_request.full_url)
                 start_result = _broker_read_json(
                     response, max_bytes=2 * 1024 * 1024
                 )
+                if int(getattr(response, "status", 0) or 0) != 201:
+                    raise _BrokerProtocolError(
+                        "FN AI Broker device authorization response was invalid."
+                    )
             break
         except urllib.error.HTTPError as exc:
             raise _BrokerAuthenticationError(
@@ -576,6 +757,7 @@ def _broker_device_login(*, opener: Any | None = None) -> dict[str, Any]:
                 token_request,
                 timeout=min(10.0, remaining),
             ) as response:
+                _broker_require_exact_response_url(response, token_request.full_url)
                 token_result = _broker_read_json(
                     response, max_bytes=2 * 1024 * 1024
                 )
@@ -693,8 +875,6 @@ class _HMBAIBrokerBridge:
         | _REFERENCE_MODE_FIELDS
         | frozenset({"priority"}),
         SEEDANCE_2_0_FAST_MODEL_ID: _COMMON_SEEDANCE_FIELDS
-        | _REFERENCE_MODE_FIELDS,
-        SEEDANCE_2_0_MINI_MODEL_ID: _COMMON_SEEDANCE_FIELDS
         | _REFERENCE_MODE_FIELDS,
     }
     def __init__(self, *, opener: Any | None = None) -> None:
@@ -838,6 +1018,7 @@ class _HMBAIBrokerBridge:
         )
         try:
             with self._opener.open(request, timeout=timeout) as response:
+                _broker_require_exact_response_url(response, request.full_url)
                 result = _broker_read_json(
                     response, max_bytes=AI_BROKER_MAX_JSON_BYTES
                 )
@@ -975,7 +1156,8 @@ class _HMBAIBrokerBridge:
         )
 
     def is_trusted_broker_url(self, url: str) -> bool:
-        candidate = urlparse(str(url or ""))
+        raw_url = str(url or "")
+        candidate = urlparse(raw_url)
         broker = urlparse(self.server_url)
 
         def origin(parsed: Any) -> tuple[str, str, int]:
@@ -983,7 +1165,18 @@ class _HMBAIBrokerBridge:
             return parsed.scheme.lower(), (parsed.hostname or "").lower(), port
 
         try:
-            return origin(candidate) == origin(broker)
+            return (
+                re.fullmatch(
+                    r"/api/assets/[A-Za-z0-9_-]{43}", candidate.path
+                )
+                is not None
+                and "%" not in raw_url
+                and origin(candidate) == origin(broker)
+                and candidate.username is None
+                and candidate.password is None
+                and candidate.query == ""
+                and candidate.fragment == ""
+            )
         except ValueError:
             return False
 
@@ -1002,6 +1195,7 @@ class _HMBAIBrokerBridge:
         )
         try:
             with self._opener.open(request, timeout=300) as response:
+                _broker_require_exact_response_url(response, request.full_url)
                 raw = response.read(max_bytes + 1)
         except urllib.error.HTTPError as exc:
             raise _BrokerError(
@@ -1061,6 +1255,244 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._generation_refresh_lock = threading.Lock()
         self._generation_refresh_running = False
         self._generation_run_active = threading.Event()
+        self._hmb_node_deleted = False
+        self._hmb_delete_parent_called = False
+        self._hmb_model_migration_active = False
+        self._hmb_retired_model_migration_pending = False
+        self._hmb_shot_syncing = False
+        self._hmb_shared_routing_in_progress = False
+        self._hmb_shot_catalog_snapshot: dict[str, Any] | None = None
+        self._hmb_shot_catalog_generation = 0
+        self._hmb_shot_selector_map: dict[str, dict[str, Any]] = {}
+        self._hmb_shot_route_status: dict[str, Any] = {}
+        self._hmb_remote_prompt_syncing = False
+        self._hmb_prompt_initial_setup_active = False
+        self._hmb_remote_prompt_authority: dict[str, Any] = {}
+        self._hmb_autoclaim_in_progress = False
+
+        self.add_parameter(
+            ParameterString(
+                name=SHOT_SELECTOR_PARAMETER,
+                default_value=SHOT_ONLY_LABEL,
+                tooltip="Legacy Shot selector state retained for saved-workflow compatibility.",
+                allowed_modes={ParameterMode.PROPERTY},
+                serializable=False,
+                hide=True,
+                hide_property=True,
+                hide_label=True,
+                traits={Options(choices=[SHOT_ONLY_LABEL])},
+                ui_options={
+                    "display_name": "",
+                    "simple_dropdown": [SHOT_ONLY_LABEL],
+                    "hide": True,
+                    "hide_property": True,
+                    "hide_label": True,
+                    "hide_handles": True,
+                    "height": 1,
+                    "min_height": 0,
+                    "max_height": 1,
+                    "is_full_width": True,
+                },
+            )
+        )
+        for shot_parameter in (
+            ParameterString(
+                name=SHOT_CHANNEL_UUID_PARAMETER,
+                default_value="",
+                allowed_modes={ParameterMode.PROPERTY},
+                hide=True,
+                hide_property=True,
+                hide_label=True,
+                ui_options={
+                    "display_name": "", "compact": True, "height": 1,
+                    "min_height": 0, "max_height": 1, "is_full_width": True,
+                    "hide": True, "hide_property": True, "hide_label": True,
+                    "hide_handles": True,
+                },
+            ),
+            ParameterString(
+                name=SHOT_UUID_PARAMETER,
+                default_value="",
+                allowed_modes={ParameterMode.PROPERTY},
+                hide=True,
+                hide_property=True,
+                hide_label=True,
+                ui_options={
+                    "display_name": "", "compact": True, "height": 1,
+                    "min_height": 0, "max_height": 1, "is_full_width": True,
+                    "hide": True, "hide_property": True, "hide_label": True,
+                    "hide_handles": True,
+                },
+            ),
+            ParameterInt(
+                name=SHOT_NUMBER_PARAMETER,
+                default_value=0,
+                allowed_modes={ParameterMode.PROPERTY},
+                hide=True,
+                hide_property=True,
+                hide_label=True,
+                ui_options={
+                    "display_name": "", "compact": True, "height": 1,
+                    "min_height": 0, "max_height": 1, "is_full_width": True,
+                    "hide": True, "hide_property": True, "hide_label": True,
+                    "hide_handles": True,
+                },
+            ),
+            ParameterString(
+                name=SHOT_NAME_PARAMETER,
+                default_value="",
+                allowed_modes={ParameterMode.PROPERTY},
+                hide=True,
+                hide_property=True,
+                hide_label=True,
+                ui_options={
+                    "display_name": "", "compact": True, "height": 1,
+                    "min_height": 0, "max_height": 1, "is_full_width": True,
+                    "hide": True, "hide_property": True, "hide_label": True,
+                    "hide_handles": True,
+                },
+            ),
+        ):
+            self.add_parameter(shot_parameter)
+
+        self.add_parameter(
+            ParameterString(
+                name=SHOT_PROMPT_INPUT_PARAMETER,
+                default_value="",
+                tooltip="Hidden exact Agent final-text dependency for the selected Shot.",
+                allowed_modes={ParameterMode.INPUT},
+                hide=True,
+                hide_label=True,
+                hide_property=True,
+                ui_options={
+                    "display_name": "",
+                    "hide": True,
+                    "hide_property": True,
+                    "hide_label": True,
+                    "hide_handles": True,
+                    "height": 1,
+                    "min_height": 0,
+                    "max_height": 1,
+                    "is_full_width": True,
+                },
+            )
+        )
+        for name, tooltip in (
+            (
+                SHOT_ASSET_INPUT_PARAMETER,
+                "Hidden exact ImageAsset Shot source dependency. Media is read from the source's private atomic snapshot.",
+            ),
+            (
+                SHOT_PICKER_INPUT_PARAMETER,
+                "Hidden exact VideoPicker Shot source dependency. Media is read from the source's private atomic snapshot.",
+            ),
+        ):
+            self.add_parameter(
+                Parameter(
+                    name=name,
+                    type="str",
+                    input_types=["any"],
+                    default_value="",
+                    tooltip=tooltip,
+                    allowed_modes={ParameterMode.INPUT},
+                    hide=True,
+                    hide_property=True,
+                    ui_options={
+                        "display_name": "",
+                        "hide": True,
+                        "hide_property": True,
+                        "hide_label": True,
+                        "hide_handles": True,
+                        "height": 1,
+                        "min_height": 0,
+                        "max_height": 1,
+                        "is_full_width": True,
+                    },
+                )
+            )
+        for name, tooltip in (
+            (
+                SHOT_IMAGE_INPUT_PARAMETER,
+                "Hidden ordered Prompt image dependency for the selected Shot.",
+            ),
+            (
+                SHOT_VIDEO_INPUT_PARAMETER,
+                "Hidden ordered Prompt video dependency for the selected Shot.",
+            ),
+        ):
+            self.add_parameter(
+                Parameter(
+                    name=name,
+                    type="list[str]",
+                    input_types=["list[str]"],
+                    default_value=[],
+                    tooltip=tooltip,
+                    allowed_modes={ParameterMode.INPUT},
+                    hide=True,
+                    hide_property=True,
+                    ui_options={
+                        "display_name": "",
+                        "hide": True,
+                        "hide_property": True,
+                        "hide_label": True,
+                        "hide_handles": True,
+                        "height": 1,
+                        "min_height": 0,
+                        "max_height": 1,
+                        "is_full_width": True,
+                    },
+                )
+            )
+
+        shot_widget_kwargs: dict[str, Any] = {
+            "name": SEEDANCE_SHOT_WIDGET_PARAMETER,
+            "type": "dict",
+            "input_types": ["dict"],
+            "default_value": _seedance_widget_value(),
+            "tooltip": "Select one backend-verified production Shot.",
+            "allowed_modes": {ParameterMode.PROPERTY},
+            "serializable": False,
+            "ui_options": {
+                "display_name": "HMBSeedanceGeneration",
+                "is_full_width": True,
+                "height": SEEDANCE_SHOT_WIDGET_HEIGHT,
+                "min_height": SEEDANCE_SHOT_WIDGET_HEIGHT,
+                "max_height": SEEDANCE_SHOT_WIDGET_HEIGHT,
+                "widget_height": SEEDANCE_SHOT_WIDGET_HEIGHT,
+                "default_height": SEEDANCE_SHOT_WIDGET_HEIGHT,
+                "preferred_height": SEEDANCE_SHOT_WIDGET_HEIGHT,
+                "initial_height": SEEDANCE_SHOT_WIDGET_HEIGHT,
+                "expandable": False,
+                "resizable": False,
+                "compact": True,
+            },
+        }
+        try:
+            if Widget is not None:
+                shot_widget_parameter = Parameter(
+                    **{
+                        **shot_widget_kwargs,
+                        "traits": {
+                            Widget(
+                                name=SEEDANCE_SHOT_WIDGET_NAME,
+                                library=SEEDANCE_SHOT_WIDGET_LIBRARY_NAME,
+                            )
+                        },
+                    }
+                )
+            else:
+                shot_widget_parameter = Parameter(**shot_widget_kwargs)
+        except Exception:
+            shot_widget_parameter = Parameter(**shot_widget_kwargs)
+            if Widget is not None:
+                with suppress(Exception):
+                    shot_widget_parameter.add_trait(
+                        Widget(
+                            name=SEEDANCE_SHOT_WIDGET_NAME,
+                            library=SEEDANCE_SHOT_WIDGET_LIBRARY_NAME,
+                        )
+                    )
+        self.add_parameter(shot_widget_parameter)
 
         self.add_parameter(
             ParameterString(
@@ -1068,7 +1500,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 default_value=MODEL_NAME_SEEDANCE_2_0,
                 tooltip=(
                     "Volcengine Seedance 2.0 model. The full model defaults to "
-                    "1080p (1K); Fast and Mini support up to 720p."
+                    "1080p (1K); Fast supports up to 720p."
                 ),
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
                 traits={
@@ -1076,7 +1508,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         choices=[
                             MODEL_NAME_SEEDANCE_2_0,
                             MODEL_NAME_SEEDANCE_2_0_FAST,
-                            MODEL_NAME_SEEDANCE_2_0_MINI,
                         ]
                     )
                 },
@@ -1088,10 +1519,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 name="input_mode",
                 default_value=INPUT_MODE_MULTIMODAL_REFERENCES,
                 tooltip=(
-                    "Text Only, First/Last Frame, or Multimodal References. "
-                    "The HMB default remains Multimodal References."
+                    "Choose how the selected Seedance model receives source media. "
+                    "A routed HMB Shot still uses its exact same-Shot references."
                 ),
-                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+                allowed_modes={ParameterMode.PROPERTY},
                 traits={
                     Options(
                         choices=[
@@ -1101,20 +1532,83 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         ]
                     )
                 },
-                ui_options={"display_name": "Input Mode"},
+                ui_options={
+                    "display_name": "Input Mode",
+                    "simple_dropdown": [
+                        INPUT_MODE_TEXT_ONLY,
+                        INPUT_MODE_FIRST_LAST_FRAME,
+                        INPUT_MODE_MULTIMODAL_REFERENCES,
+                    ],
+                },
             )
         )
         self.add_parameter(
             ParameterString(
                 name="prompt",
                 default_value="",
-                tooltip="Text prompt for the selected Seedance model.",
+                tooltip=(
+                    "Text prompt for the selected Seedance model. Enter it directly or "
+                    "manually connect an HMBAgentLibrary output. Shot media is resolved "
+                    "independently from ImageAsset and VideoPicker."
+                ),
                 multiline=True,
                 placeholder_text="Describe the desired video...",
+                allowed_modes={ParameterMode.PROPERTY, ParameterMode.INPUT},
                 allow_output=False,
                 ui_options={"display_name": "Prompt"},
             )
         )
+        remote_prompt_hidden_ui = {
+            "display_name": "",
+            "hide": True,
+            "hide_property": True,
+            "hide_label": True,
+            "hide_handles": True,
+            "height": 1,
+            "min_height": 0,
+            "max_height": 1,
+            "is_full_width": True,
+        }
+        for remote_prompt_parameter in (
+            ParameterString(
+                name=SHOT_LOCAL_PROMPT_PARAMETER,
+                default_value="",
+                allowed_modes={ParameterMode.PROPERTY},
+                hide=True,
+                hide_property=True,
+                hide_label=True,
+                multiline=True,
+                ui_options=dict(remote_prompt_hidden_ui),
+            ),
+            ParameterBool(
+                name=SHOT_LOCAL_PROMPT_CAPTURED_PARAMETER,
+                default_value=False,
+                allowed_modes={ParameterMode.PROPERTY},
+                hide=True,
+                hide_property=True,
+                hide_label=True,
+                ui_options=dict(remote_prompt_hidden_ui),
+            ),
+            ParameterBool(
+                name=SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER,
+                default_value=False,
+                allowed_modes={ParameterMode.PROPERTY},
+                hide=True,
+                hide_property=True,
+                hide_label=True,
+                ui_options=dict(remote_prompt_hidden_ui),
+            ),
+            ParameterBool(
+                name=SHOT_AUTOCLAIM_ENABLED_PARAMETER,
+                default_value=True,
+                allowed_modes={ParameterMode.PROPERTY},
+                hide=True,
+                hide_property=True,
+                hide_label=True,
+                ui_options=dict(remote_prompt_hidden_ui),
+            ),
+        ):
+            self.add_parameter(remote_prompt_parameter)
         self.add_parameter(
             ParameterImage(
                 name="first_frame",
@@ -1122,7 +1616,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 tooltip="First-frame image for First/Last Frame mode.",
                 allowed_modes={ParameterMode.INPUT},
                 hide_property=True,
-                ui_options={"display_name": "First Frame"},
+                ui_options={
+                    "display_name": "First Frame",
+                    "hide_property": True,
+                },
             )
         )
         self.add_parameter(
@@ -1132,7 +1629,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 tooltip="Optional last-frame image for First/Last Frame mode.",
                 allowed_modes={ParameterMode.INPUT},
                 hide_property=True,
-                ui_options={"display_name": "Last Frame"},
+                ui_options={
+                    "display_name": "Last Frame",
+                    "hide_property": True,
+                },
             )
         )
         self.add_parameter(
@@ -1152,10 +1652,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "with one wire; list order becomes Seedance image order."
                 ),
                 allowed_modes={ParameterMode.INPUT},
+                hide=True,
                 hide_property=True,
                 ui_options={
-                    "display_name": "Reference Images",
+                    "display_name": "",
+                    "hide": True,
                     "hide_property": True,
+                    "hide_label": True,
+                    "hide_handles": True,
                 },
             )
         )
@@ -1217,12 +1721,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "one wire; Picker selection order becomes Seedance order."
                 ),
                 allowed_modes={ParameterMode.INPUT},
-                hide=False,
+                hide=True,
                 hide_property=True,
                 ui_options={
-                    "display_name": "Reference Videos",
-                    "hide": False,
+                    "display_name": "",
+                    "hide": True,
                     "hide_property": True,
+                    "hide_label": True,
+                    "hide_handles": True,
                 },
             )
         )
@@ -1241,10 +1747,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "encoded as data URIs; audio requires an image or video reference."
                 ),
                 allowed_modes={ParameterMode.INPUT},
+                hide=True,
                 ui_options={
-                    "display_name": "Reference Audio",
-                    "expander": True,
+                    "display_name": "",
+                    "hide": True,
                     "hide_property": True,
+                    "hide_label": True,
+                    "hide_handles": True,
                 },
                 max_items=MAX_REFERENCE_AUDIO,
             )
@@ -1255,7 +1764,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 name="resolution",
                 default_value=MODEL_DEFAULT_RESOLUTIONS[SEEDANCE_2_0_MODEL_ID],
                 tooltip=(
-                    "Full Seedance 2.0 defaults to 1080p (1K). Fast and Mini support "
+                    "Full Seedance 2.0 defaults to 1080p (1K). Fast supports "
                     "480p and 720p."
                 ),
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
@@ -1527,16 +2036,1036 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
         self.add_node_element(broker_group)
         self._update_parameter_visibility()
+        _shot_routing.schedule_post_registration_reconcile(self)
+
+    @staticmethod
+    def _shot_uuid(value: Any) -> str:
+        text = str(value or "").strip().casefold()
+        return text if re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            text,
+        ) else ""
+
+    @staticmethod
+    def _canonical_sha256(value: Any) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    @classmethod
+    def _validate_shot_catalog_snapshot(cls, value: Any) -> dict[str, Any]:
+        required = {
+            "schema", "version", "publisher_instance_uuid", "channel_uuid",
+            "generation", "metadata_sha256", "shots",
+        }
+        if not isinstance(value, dict) or set(value) != required:
+            raise RuntimeError("HMB Shot catalog has unknown or missing fields.")
+        if value.get("schema") != "hmb-shot-routing-catalog" or value.get("version") != 1:
+            raise RuntimeError("HMB Shot catalog schema is invalid.")
+        publisher = cls._shot_uuid(value.get("publisher_instance_uuid"))
+        channel = cls._shot_uuid(value.get("channel_uuid"))
+        generation = value.get("generation")
+        if (
+            not publisher or not channel
+            or not isinstance(generation, int) or isinstance(generation, bool)
+            or generation <= 0
+        ):
+            raise RuntimeError("HMB Shot catalog publisher identity is invalid.")
+        raw_shots = value.get("shots")
+        if (
+            not isinstance(raw_shots, list)
+            or not 1 <= len(raw_shots) <= SHOT_ROUTING_MAX_SHOTS
+        ):
+            raise RuntimeError("HMB Shot catalog collections are invalid.")
+        shots: list[dict[str, Any]] = []
+        shot_ids: set[str] = set()
+        numbers: set[int] = set()
+        for raw in raw_shots:
+            if not isinstance(raw, dict) or set(raw) != {
+                "shot_uuid", "number", "name", "revision",
+            }:
+                raise RuntimeError("HMB Shot catalog record is invalid.")
+            shot_uuid = cls._shot_uuid(raw.get("shot_uuid"))
+            number = raw.get("number")
+            revision = raw.get("revision")
+            name = str(raw.get("name") or "").strip()
+            if (
+                not shot_uuid or shot_uuid in shot_ids or not name
+                or not isinstance(raw.get("name"), str)
+                or raw.get("name") != name
+                or len(name) > 128
+                or not isinstance(number, int) or isinstance(number, bool)
+                or not 1 <= number <= SHOT_ROUTING_MAX_SHOTS or number in numbers
+                or not isinstance(revision, int) or isinstance(revision, bool) or revision < 0
+            ):
+                raise RuntimeError("HMB Shot catalog identity/revision is invalid.")
+            shot_ids.add(shot_uuid)
+            numbers.add(number)
+            shots.append({
+                "shot_uuid": shot_uuid,
+                "number": number,
+                "name": name,
+                "revision": revision,
+            })
+        metadata_document = {
+            "channel_uuid": channel,
+            "generation": generation,
+            "shots": shots,
+        }
+        metadata_hash = str(value.get("metadata_sha256") or "").strip().casefold()
+        if metadata_hash != cls._canonical_sha256(metadata_document):
+            raise RuntimeError("HMB Shot catalog metadata hash does not match.")
+        return {
+            **deepcopy(value),
+            "publisher_instance_uuid": publisher,
+            "channel_uuid": channel,
+            "shots": shots,
+            "metadata_sha256": metadata_hash,
+        }
+
+    def _set_shot_value(self, name: str, value: Any) -> None:
+        if self.get_parameter_value(name) == value:
+            return
+        try:
+            self.set_parameter_value(name, value, emit_change=False)
+        except TypeError:
+            self.set_parameter_value(name, value)
+
+    def _set_remote_prompt_control_value(self, name: str, value: Any) -> None:
+        """Persist one hidden authority value without exposing a graph handle."""
+
+        if self.get_parameter_value(name) == value:
+            return
+        try:
+            self.set_parameter_value(name, value, emit_change=False)
+        except TypeError:
+            self.set_parameter_value(name, value)
+
+    def _local_prompt_baseline(self) -> str:
+        captured = self.get_parameter_value(SHOT_LOCAL_PROMPT_CAPTURED_PARAMETER)
+        if captured is True:
+            return str(self.get_parameter_value(SHOT_LOCAL_PROMPT_PARAMETER) or "")
+        current = str(self.get_parameter_value("prompt") or "")
+        self._set_remote_prompt_control_value(SHOT_LOCAL_PROMPT_PARAMETER, current)
+        self._set_remote_prompt_control_value(
+            SHOT_LOCAL_PROMPT_CAPTURED_PARAMETER,
+            True,
+        )
+        return current
+
+    def _remember_direct_prompt(self, value: Any) -> None:
+        text = str(getattr(value, "value", value) or "")
+        self._set_remote_prompt_control_value(SHOT_LOCAL_PROMPT_PARAMETER, text)
+        self._set_remote_prompt_control_value(
+            SHOT_LOCAL_PROMPT_CAPTURED_PARAMETER,
+            True,
+        )
+
+    def _set_visible_prompt_from_remote(self, value: str) -> None:
+        if self.get_parameter_value("prompt") == value:
+            return
+        self._hmb_remote_prompt_syncing = True
+        try:
+            try:
+                self.set_parameter_value("prompt", value, emit_change=True)
+            except TypeError:
+                self.set_parameter_value("prompt", value)
+        finally:
+            self._hmb_remote_prompt_syncing = False
+
+    def _clear_remote_prompt_authority(
+        self,
+        reason: str = "remote_unavailable",
+        *,
+        restore: bool = True,
+    ) -> None:
+        """Drop remote ownership and restore the last direct Seedance prompt."""
+
+        del reason  # A bounded reason belongs in routing status, never prompt text.
+        marked = self.get_parameter_value(SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER) is True
+        had_authority = bool(self._hmb_remote_prompt_authority) or marked
+        self._hmb_remote_prompt_authority = {}
+        if (
+            restore
+            and had_authority
+            and not bool(getattr(self, "_hmb_node_deleted", False))
+        ):
+            self._set_visible_prompt_from_remote(self._local_prompt_baseline())
+        self._set_remote_prompt_control_value(
+            SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER,
+            False,
+        )
+
+    @staticmethod
+    def _validate_remote_prompt_publication(value: Any) -> dict[str, Any]:
+        required = {
+            "schema",
+            "version",
+            "source_token",
+            "publication_revision",
+            "channel_uuid",
+            "shot_uuid",
+            "shot_number",
+            "shot_name",
+            "prompt_generation",
+            "visible_prompt_sha256",
+            "image_media_sha256",
+            "video_media_sha256",
+            "final_text_sha256",
+            "final_text",
+        }
+        if not isinstance(value, dict) or set(value) != required:
+            raise RuntimeError("Seedance remote Agent prompt publication is malformed.")
+        if (
+            value.get("schema") != AGENT_REMOTE_PROMPT_PUBLICATION_SCHEMA
+            or value.get("version") != AGENT_REMOTE_PROMPT_PUBLICATION_VERSION
+            or re.fullmatch(r"[0-9a-f]{32}", str(value.get("source_token") or ""))
+            is None
+            or not isinstance(value.get("publication_revision"), int)
+            or isinstance(value.get("publication_revision"), bool)
+            or int(value["publication_revision"]) <= 0
+            or not isinstance(value.get("prompt_generation"), int)
+            or isinstance(value.get("prompt_generation"), bool)
+            or int(value["prompt_generation"]) <= 0
+            or not isinstance(value.get("shot_number"), int)
+            or isinstance(value.get("shot_number"), bool)
+            or not 1 <= int(value["shot_number"]) <= SHOT_ROUTING_MAX_SHOTS
+            or not isinstance(value.get("shot_name"), str)
+            or not value["shot_name"]
+            or value["shot_name"] != value["shot_name"].strip()[:128]
+            or not HMBSeedanceGeneration._shot_uuid(value.get("channel_uuid"))
+            or not HMBSeedanceGeneration._shot_uuid(value.get("shot_uuid"))
+            or not isinstance(value.get("final_text"), str)
+            or not value["final_text"]
+            or len(value["final_text"]) > MAX_REMOTE_PROMPT_CHARACTERS
+        ):
+            raise RuntimeError("Seedance remote Agent prompt publication is invalid.")
+        for key in (
+            "visible_prompt_sha256",
+            "image_media_sha256",
+            "video_media_sha256",
+            "final_text_sha256",
+        ):
+            if re.fullmatch(r"[0-9a-f]{64}", str(value.get(key) or "")) is None:
+                raise RuntimeError("Seedance remote Agent prompt hash is invalid.")
+        expected_hash = hashlib.sha256(value["final_text"].encode("utf-8")).hexdigest()
+        if not hmac.compare_digest(str(value["final_text_sha256"]), expected_hash):
+            raise RuntimeError("Seedance remote Agent prompt hash does not match.")
+        return deepcopy(value)
+
+    def _apply_remote_prompt_publication(self, value: Any) -> dict[str, Any]:
+        publication = self._validate_remote_prompt_publication(value)
+        subscription = self._hmb_shot_channel_subscription()
+        if (
+            not subscription["enabled"]
+            or publication["channel_uuid"] != subscription["channel_uuid"]
+            or publication["shot_uuid"] != subscription["shot_uuid"]
+            or publication["shot_number"] != subscription["shot_number"]
+            or publication["shot_name"] != subscription["shot_name"]
+        ):
+            raise RuntimeError("Seedance remote Agent prompt belongs to another Shot.")
+        previous = self._hmb_remote_prompt_authority
+        if (
+            isinstance(previous, dict)
+            and previous.get("source_token") == publication["source_token"]
+        ):
+            previous_revision = int(previous.get("publication_revision") or 0)
+            if publication["publication_revision"] < previous_revision:
+                raise RuntimeError("Seedance rejected a stale Agent prompt publication.")
+            if (
+                publication["publication_revision"] == previous_revision
+                and publication["final_text_sha256"]
+                != previous.get("final_text_sha256")
+            ):
+                raise RuntimeError("Seedance rejected a conflicting Agent publication.")
+        self._local_prompt_baseline()
+        self._hmb_remote_prompt_authority = publication
+        self._set_remote_prompt_control_value(
+            SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER,
+            True,
+        )
+        self._set_visible_prompt_from_remote(publication["final_text"])
+        return deepcopy(publication)
+
+    def _refresh_remote_prompt_authority(
+        self,
+        *,
+        strict: bool = False,
+        source_node: Any | None = None,
+    ) -> dict[str, Any]:
+        subscription = self._hmb_shot_channel_subscription()
+        if not subscription["enabled"]:
+            self._clear_remote_prompt_authority("remote_waiting")
+            return {}
+        try:
+            source = source_node or self._exact_incoming_source(
+                SHOT_PROMPT_INPUT_PARAMETER,
+                "output",
+            )
+            source_subscription_getter = getattr(
+                source,
+                "_hmb_shot_channel_subscription",
+                None,
+            )
+            publication_getter = getattr(
+                source,
+                "_hmb_remote_prompt_publication_for_generator",
+                None,
+            )
+            if not callable(source_subscription_getter) or not callable(
+                publication_getter
+            ):
+                raise RuntimeError("Seedance remote Agent authority is unavailable.")
+            source_subscription = source_subscription_getter()
+            if (
+                not isinstance(source_subscription, dict)
+                or source_subscription.get("participant_kind") != "agent"
+                or not source_subscription.get("enabled")
+                or source_subscription.get("channel_uuid")
+                != subscription["channel_uuid"]
+                or source_subscription.get("shot_uuid") != subscription["shot_uuid"]
+                or source_subscription.get("shot_number")
+                != subscription["shot_number"]
+                or source_subscription.get("shot_name") != subscription["shot_name"]
+            ):
+                raise RuntimeError("Seedance remote Agent Shot identity is invalid.")
+            publication = publication_getter()
+            if not publication:
+                raise RuntimeError("Seedance remote Agent FINAL TEXT is unavailable.")
+            return self._apply_remote_prompt_publication(publication)
+        except Exception as exc:
+            self._clear_remote_prompt_authority("remote_invalid")
+            if strict:
+                if isinstance(exc, RuntimeError):
+                    raise
+                raise RuntimeError("Seedance remote Agent authority is unavailable.") from exc
+            return {}
+
+    def _hmb_unique_complete_prompt_agent_pair(
+        self,
+    ) -> tuple[Any, dict[str, Any]] | None:
+        """Find exactly one hydrated Prompt+Agent Shot pair in this flow."""
+
+        try:
+            same_flow = getattr(_shot_routing, "_same_flow_nodes")
+            _flow_name, nodes = same_flow(self)
+        except Exception:
+            return None
+        prompts: dict[tuple[str, str], list[tuple[Any, dict[str, Any]]]] = {}
+        agents: dict[tuple[str, str], list[tuple[Any, dict[str, Any]]]] = {}
+        for candidate in nodes:
+            if candidate is self or bool(getattr(candidate, "_hmb_node_deleted", False)):
+                continue
+            getter = getattr(candidate, "_hmb_shot_channel_subscription", None)
+            if not callable(getter):
+                continue
+            try:
+                subscription = getter()
+            except Exception:
+                continue
+            if not isinstance(subscription, dict) or not subscription.get("enabled"):
+                continue
+            kind = str(subscription.get("participant_kind") or "")
+            key = (
+                str(subscription.get("channel_uuid") or ""),
+                str(subscription.get("shot_uuid") or ""),
+            )
+            if not all(key):
+                continue
+            status = getattr(candidate, "_hmb_shot_route_status", None)
+            if (
+                not isinstance(status, dict)
+                or not status.get("ok")
+                or str(status.get("code") or "") != "ready"
+            ):
+                continue
+            if kind == "prompt":
+                prompts.setdefault(key, []).append((candidate, subscription))
+            elif kind == "agent":
+                agents.setdefault(key, []).append((candidate, subscription))
+        claimed_by_other_generators = self._hmb_other_seedance_shot_claims()
+        complete: list[tuple[Any, dict[str, Any]]] = []
+        for key in sorted(set(prompts) | set(agents)):
+            if key in claimed_by_other_generators:
+                continue
+            prompt_matches = prompts.get(key, [])
+            agent_matches = agents.get(key, [])
+            if len(prompt_matches) == 1 and len(agent_matches) == 1:
+                complete.append(agent_matches[0])
+        return complete[0] if len(complete) == 1 else None
+
+    def _hmb_consider_agent_shot_autoclaim(self, trigger_agent: Any = None) -> bool:
+        """Compatibility callback for older Agent builds.
+
+        Agent is no longer routing authority for Seedance. ImageAsset catalog
+        delivery and the exact VideoPicker source determine Shot availability.
+        """
+
+        del trigger_agent
+        return False
+
+    def _set_seedance_shot_choices(self, labels: list[str]) -> None:
+        # Prompt-only generation is always available.  Remote Shot choices are
+        # appended only when at least one exact same-flow media publisher is
+        # available; no placeholder can accidentally become an executable Shot.
+        choices = [SHOT_ONLY_LABEL, *list(labels)]
+        parameter = self.get_parameter_by_name(SHOT_SELECTOR_PARAMETER)
+        if parameter is None:
+            return
+        for child in getattr(parameter, "_children", ()):
+            if isinstance(child, Options):
+                with suppress(Exception):
+                    child.choices = choices
+        parameter.ui_options = {
+            **dict(getattr(parameter, "ui_options", {}) or {}),
+            "simple_dropdown": choices,
+        }
+
+    def _hmb_other_seedance_shot_claims(
+        self,
+        channel_uuid: str = "",
+    ) -> set[tuple[str, str]]:
+        """Return exact Shot claims owned by other Seedance nodes in this flow."""
+
+        claims: set[tuple[str, str]] = set()
+        try:
+            same_flow = getattr(_shot_routing, "_same_flow_nodes")
+            _flow_name, nodes = same_flow(self)
+        except Exception:
+            return claims
+        for candidate in nodes:
+            if candidate is self or bool(getattr(candidate, "_hmb_node_deleted", False)):
+                continue
+            getter = getattr(candidate, "_hmb_shot_channel_subscription", None)
+            if not callable(getter):
+                continue
+            try:
+                subscription = getter()
+            except Exception:
+                continue
+            if (
+                isinstance(subscription, dict)
+                and subscription.get("participant_kind") == "seedance"
+                and subscription.get("enabled")
+                and subscription.get("channel_uuid")
+                and subscription.get("shot_uuid")
+                and (
+                    not channel_uuid
+                    or subscription.get("channel_uuid") == channel_uuid
+                )
+            ):
+                claims.add(
+                    (
+                        str(subscription["channel_uuid"]),
+                        str(subscription["shot_uuid"]),
+                    )
+                )
+        return claims
+
+    def _hmb_available_seedance_shot_catalog(
+        self,
+        snapshot: Any,
+    ) -> dict[str, Any]:
+        """Expose Shots backed by one or both exact same-flow media sources."""
+
+        if not isinstance(snapshot, dict) or not isinstance(snapshot.get("shots"), list):
+            return {}
+        channel_uuid = str(snapshot.get("channel_uuid") or "")
+        source_counts = {"image_asset": 0, "video_picker": 0}
+        try:
+            same_flow = getattr(_shot_routing, "_same_flow_nodes")
+            _flow_name, nodes = same_flow(self)
+        except Exception:
+            nodes = []
+        for candidate in nodes:
+            if bool(getattr(candidate, "_hmb_node_deleted", False)):
+                continue
+            getter = getattr(candidate, "_hmb_shot_channel_subscription", None)
+            if not callable(getter):
+                continue
+            try:
+                subscription = getter()
+            except Exception:
+                continue
+            if (
+                not isinstance(subscription, dict)
+                or not subscription.get("enabled")
+                or subscription.get("channel_uuid") != channel_uuid
+            ):
+                continue
+            participant_kind = str(
+                subscription.get("participant_kind") or ""
+            )
+            if participant_kind in source_counts:
+                source_counts[participant_kind] += 1
+        if (
+            any(count > 1 for count in source_counts.values())
+            or not any(count == 1 for count in source_counts.values())
+        ):
+            return {}
+        claimed = {
+            shot_uuid
+            for claim_channel, shot_uuid in self._hmb_other_seedance_shot_claims(
+                channel_uuid
+            )
+            if claim_channel == channel_uuid
+        }
+        current = self._shot_identity()
+        current_uuid = (
+            current["shot_uuid"]
+            if current["channel_uuid"] == channel_uuid
+            else ""
+        )
+        shots = [
+            deepcopy(item)
+            for item in snapshot["shots"]
+            if isinstance(item, dict)
+            and (
+                str(item.get("shot_uuid") or "") not in claimed
+                or str(item.get("shot_uuid") or "") == current_uuid
+            )
+        ]
+        return {**deepcopy(snapshot), "shots": shots} if shots else {}
+
+    def _sync_seedance_shot_widget(self) -> None:
+        parameter = self.get_parameter_by_name(SEEDANCE_SHOT_WIDGET_PARAMETER)
+        if parameter is None:
+            return
+        identity = self._shot_identity()
+        available_catalog = self._hmb_available_seedance_shot_catalog(
+            self._hmb_shot_catalog_snapshot
+        )
+        next_value = _seedance_widget_value(
+            {
+                "channel_uuid": identity["channel_uuid"],
+                "shot_uuid": identity["shot_uuid"],
+            },
+            available_catalog,
+        )
+        try:
+            current = self.get_parameter_value(SEEDANCE_SHOT_WIDGET_PARAMETER)
+        except Exception:
+            current = getattr(parameter, "default_value", None)
+        parameter.default_value = deepcopy(next_value)
+        if current == next_value:
+            return
+        self._hmb_shot_syncing = True
+        try:
+            self._set_shot_value(SEEDANCE_SHOT_WIDGET_PARAMETER, next_value)
+        finally:
+            self._hmb_shot_syncing = False
+
+    def _apply_seedance_shot_selection(
+        self,
+        requested_shot_uuid: Any,
+        *,
+        fallback_to_available: bool = True,
+    ) -> None:
+        previous_identity = self._shot_identity()
+        requested = self._shot_uuid(requested_shot_uuid)
+        snapshot = self._hmb_shot_catalog_snapshot
+        available_snapshot = self._hmb_available_seedance_shot_catalog(snapshot)
+        available_shots = (
+            available_snapshot.get("shots", [])
+            if isinstance(available_snapshot, dict)
+            else []
+        )
+        selected = None
+        if requested and isinstance(snapshot, dict):
+            selected = next(
+                (
+                    item for item in available_shots
+                    if isinstance(item, dict) and item.get("shot_uuid") == requested
+                ),
+                None,
+            )
+        if selected is None and fallback_to_available and isinstance(snapshot, dict):
+            current_uuid = previous_identity.get("shot_uuid")
+            selected = next(
+                (
+                    item for item in available_shots
+                    if isinstance(item, dict)
+                    and item.get("shot_uuid") == current_uuid
+                ),
+                None,
+            )
+        if selected is None and fallback_to_available and isinstance(snapshot, dict):
+            selected = next(
+                (
+                    item for item in available_shots
+                    if isinstance(item, dict) and item.get("shot_uuid")
+                ),
+                None,
+            )
+        self._hmb_shot_syncing = True
+        try:
+            if isinstance(selected, dict) and isinstance(snapshot, dict):
+                label = next(
+                    (
+                        label for label, item in self._hmb_shot_selector_map.items()
+                        if item.get("shot_uuid") == selected["shot_uuid"]
+                    ),
+                    SHOT_ONLY_LABEL,
+                )
+                self._set_shot_value(SHOT_CHANNEL_UUID_PARAMETER, snapshot["channel_uuid"])
+                self._set_shot_value(SHOT_UUID_PARAMETER, selected["shot_uuid"])
+                self._set_shot_value(SHOT_NUMBER_PARAMETER, selected["number"])
+                self._set_shot_value(SHOT_NAME_PARAMETER, selected["name"])
+                self._set_shot_value(SHOT_SELECTOR_PARAMETER, label)
+            else:
+                self._set_shot_value(SHOT_CHANNEL_UUID_PARAMETER, "")
+                self._set_shot_value(SHOT_UUID_PARAMETER, "")
+                self._set_shot_value(SHOT_NUMBER_PARAMETER, 0)
+                self._set_shot_value(SHOT_NAME_PARAMETER, "")
+                self._set_shot_value(SHOT_SELECTOR_PARAMETER, SHOT_ONLY_LABEL)
+        finally:
+            self._hmb_shot_syncing = False
+        current_identity = self._shot_identity()
+        if (
+            previous_identity["channel_uuid"],
+            previous_identity["shot_uuid"],
+        ) != (
+            current_identity["channel_uuid"],
+            current_identity["shot_uuid"],
+        ):
+            self._clear_remote_prompt_authority("shot_selection_changed")
+        self._sync_seedance_shot_widget()
+
+    def _shot_identity(self) -> dict[str, Any]:
+        channel = self._shot_uuid(self.get_parameter_value(SHOT_CHANNEL_UUID_PARAMETER))
+        shot_uuid = self._shot_uuid(self.get_parameter_value(SHOT_UUID_PARAMETER))
+        bound = bool(channel and shot_uuid)
+        try:
+            number = int(self.get_parameter_value(SHOT_NUMBER_PARAMETER) or 1)
+        except (TypeError, ValueError, OverflowError):
+            number = 1
+        number = max(1, min(SHOT_ROUTING_MAX_SHOTS, number))
+        name = (
+            str(
+                self.get_parameter_value(SHOT_NAME_PARAMETER) or f"Shot {number}"
+            ).strip()[:128]
+            or f"Shot {number}"
+        ) if bound else SHOT_ONLY_LABEL
+        return {
+            "channel_uuid": channel if bound else "",
+            "shot_uuid": shot_uuid if bound else "",
+            "shot_number": number if bound else 1,
+            "shot_name": name if bound else SHOT_ONLY_LABEL,
+        }
+
+    def _hmb_shot_channel_subscription(self) -> dict[str, Any]:
+        identity = self._shot_identity()
+        return {
+            "schema": "hmb-shot-channel-subscription",
+            "version": 1,
+            "participant_kind": "seedance",
+            "enabled": bool(identity["channel_uuid"] and identity["shot_uuid"]),
+            **identity,
+        }
+
+    def _hmb_shot_routing_status(self, value: Any) -> None:
+        if isinstance(value, dict):
+            self._hmb_shot_route_status = deepcopy(value)
+            # Migrate any saved Agent overlay once. The visible prompt is now
+            # always direct input (authored text or a manual graph connection).
+            if self.get_parameter_value(SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER) is True:
+                self._clear_remote_prompt_authority("manual_prompt_authority")
+
+    def _hmb_reconcile_shot_routing(self, routing_snapshot: Any) -> None:
+        snapshot = self._validate_shot_catalog_snapshot(routing_snapshot)
+        identity = self._shot_identity()
+        if identity["channel_uuid"] and identity["channel_uuid"] != snapshot["channel_uuid"]:
+            raise RuntimeError("Seedance Shot channel does not match the ImageAsset publisher.")
+        previous = self._hmb_shot_catalog_snapshot
+        if isinstance(previous, dict) and previous.get("channel_uuid") == snapshot["channel_uuid"]:
+            previous_generation = int(previous.get("generation") or 0)
+            if snapshot["generation"] < previous_generation:
+                raise RuntimeError("Seedance Shot catalog generation moved backwards.")
+            if snapshot["generation"] == previous_generation and (
+                snapshot["metadata_sha256"] != previous.get("metadata_sha256")
+            ):
+                raise RuntimeError("Seedance Shot catalog changed without a new generation.")
+        selected = next(
+            (item for item in snapshot["shots"] if item["shot_uuid"] == identity["shot_uuid"]),
+            None,
+        )
+        self._hmb_shot_catalog_snapshot = snapshot
+        self._hmb_shot_catalog_generation = snapshot["generation"]
+        available_snapshot = self._hmb_available_seedance_shot_catalog(snapshot)
+        available_shots = (
+            available_snapshot.get("shots", [])
+            if isinstance(available_snapshot, dict)
+            else []
+        )
+        if isinstance(selected, dict) and selected not in available_shots:
+            selected = None
+        labels: list[str] = []
+        selector_map: dict[str, dict[str, Any]] = {}
+        for item in available_shots:
+            label = f"{item['number']:02d} · {item['name']}"
+            labels.append(label)
+            selector_map[label] = item
+        self._set_seedance_shot_choices(labels)
+        self._hmb_shot_selector_map = selector_map
+        # A fresh node auto-adopts Shot 1.  Once the user explicitly chooses
+        # Only, later catalog refreshes must preserve that independent mode.
+        # Existing UUIDs retain authority across rename/renumber.  A deleted
+        # UUID must never silently become another Shot merely because that Shot
+        # inherited its display number; only a fresh, still-auto-claiming node
+        # may adopt the first available UUID.
+        fallback_to_available = bool(
+            not identity.get("shot_uuid")
+            and self.get_parameter_value(SHOT_AUTOCLAIM_ENABLED_PARAMETER)
+        )
+        self._apply_seedance_shot_selection(
+            selected["shot_uuid"] if isinstance(selected, dict) else "",
+            fallback_to_available=fallback_to_available,
+        )
+        self._hmb_shot_route_status = {
+            "schema": "hmb-shot-routing-status",
+            "version": 1,
+            "ok": True,
+            "code": (
+                "catalog_ready"
+                if self._hmb_shot_channel_subscription()["enabled"]
+                else "remote_waiting"
+            ),
+            "details": "",
+        }
+
+    def _hmb_reconcile_replacement_shot_routing(
+        self,
+        routing_snapshot: Any,
+    ) -> None:
+        """Adopt one router-proven replacement for an orphaned Image channel.
+
+        The ordinary catalog callback deliberately rejects channel changes.
+        The central reconciler calls this narrower entry point only after it has
+        proven that the saved channel is absent, exactly one new Image publisher
+        is active, and all old managed edges have been removed.
+        """
+
+        snapshot = self._validate_shot_catalog_snapshot(routing_snapshot)
+        identity = self._shot_identity()
+        if (
+            not identity["channel_uuid"]
+            or identity["channel_uuid"] == snapshot["channel_uuid"]
+        ):
+            self._hmb_reconcile_shot_routing(snapshot)
+            return
+        # Validation happens before mutation. Once the central reconciler has
+        # established orphan replacement, discard only remote authority and the
+        # obsolete quartet, then let the strict callback adopt the new first Shot.
+        self._hmb_clear_shot_routing_catalog("channel_replaced")
+        self._hmb_reconcile_shot_routing(snapshot)
+
+    def _hmb_clear_shot_routing_catalog(
+        self,
+        reason: str = "publisher_unavailable",
+    ) -> dict[str, Any]:
+        """Clear remote authority without touching standalone generation inputs."""
+
+        self._clear_remote_prompt_authority(reason)
+        self._hmb_shot_catalog_snapshot = None
+        self._hmb_shot_catalog_generation = 0
+        self._hmb_shot_selector_map = {}
+        self._set_seedance_shot_choices([])
+        self._apply_seedance_shot_selection("", fallback_to_available=False)
+        self._hmb_shot_route_status = {
+            "schema": "hmb-shot-routing-status",
+            "version": 1,
+            "ok": False,
+            "code": "remote_waiting",
+            "details": str(reason or "publisher_unavailable").strip()[:128],
+        }
+        return self._hmb_shot_channel_subscription()
+
+    def _hmb_reject_duplicate_shot_selection(
+        self,
+        reason: str = "duplicate_seedance_shot",
+    ) -> dict[str, Any]:
+        """Fail a duplicate claim closed by returning this generator to Only."""
+
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            return self._hmb_shot_channel_subscription()
+        self._set_remote_prompt_control_value(
+            SHOT_AUTOCLAIM_ENABLED_PARAMETER,
+            False,
+        )
+        self._clear_remote_prompt_authority(reason)
+        self._apply_seedance_shot_selection(
+            "",
+            fallback_to_available=False,
+        )
+        self._hmb_shot_route_status = {
+            "schema": "hmb-shot-routing-status",
+            "version": 1,
+            "ok": False,
+            "code": str(reason or "duplicate_seedance_shot").strip()[:128],
+            "details": "Duplicate Shot ownership was rejected; Only mode is active.",
+        }
+        return self._hmb_shot_channel_subscription()
+
+    def _reconcile_shared_shot_routing(self, *, strict: bool = False) -> dict[str, Any]:
+        if self._hmb_shared_routing_in_progress:
+            return {"ok": True, "code": "reentrant", "changed": 0}
+        initial_enabled = bool(self._hmb_shot_channel_subscription()["enabled"])
+        self._hmb_shared_routing_in_progress = True
+        try:
+            result = _shot_routing.reconcile_shot_routing(self)
+            if not initial_enabled and self._hmb_shot_channel_subscription()["enabled"]:
+                result = _shot_routing.reconcile_shot_routing(self)
+        finally:
+            self._hmb_shared_routing_in_progress = False
+        if strict and self._hmb_shot_channel_subscription()["enabled"]:
+            if not isinstance(result, dict):
+                raise RuntimeError("Seedance Shot routing result is invalid.")
+            prefix = str(getattr(self, "name", "") or "") + ":"
+            failures = result.get("failures")
+            own_failures = [
+                str(item)
+                for item in (failures if isinstance(failures, (list, tuple)) else ())
+                if str(item).startswith(prefix)
+            ]
+            if own_failures:
+                raise RuntimeError("Seedance Shot routing is incomplete or ambiguous.")
+            status = self._hmb_shot_route_status
+            if isinstance(status, dict) and status and not bool(status.get("ok", True)):
+                raise RuntimeError("Seedance Shot routing is incomplete or ambiguous.")
+        return result if isinstance(result, dict) else {
+            "ok": False,
+            "code": "invalid_result",
+            "changed": 0,
+        }
+
+    def _hmb_post_registration_shot_discovery(self) -> None:
+        """Adopt an already-hydrated Shot/Agent chain after node registration.
+
+        Registration order is not guaranteed by the host.  A newly dragged or
+        recreated Seedance node therefore performs one authoritative same-flow
+        discovery pass instead of waiting for another ImageAsset/Prompt/Agent
+        edit event before discovering its exact hidden Shot connections.
+        """
+
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            return
+        self._reconcile_shared_shot_routing()
+
+    def set_parameter_value(
+        self,
+        param_name: str,
+        value: Any,
+        *,
+        initial_setup: bool = False,
+        emit_change: bool = True,
+        skip_before_value_set: bool = False,
+    ) -> None:
+        """Intercept retired/unknown model values before Options coercion.
+
+        Griptape's Options converter replaces an out-of-list saved value with
+        the first choice before node callbacks run. Inspecting the raw value at
+        this boundary is therefore required both to migrate retired Mini
+        workflows and to prevent an unknown model from silently becoming Full.
+        """
+
+        if param_name == "model_id":
+            raw_model = str(value or "").strip()
+            if raw_model in RETIRED_SEEDANCE_MODEL_VALUES:
+                self._hmb_retired_model_migration_pending = True
+                value = MODEL_NAME_SEEDANCE_2_0
+            elif raw_model not in MODEL_ID_ALIASES:
+                raise ValueError(
+                    f"Unsupported Volcengine Seedance model: {raw_model!r}."
+                )
+            else:
+                value = MODEL_DISPLAY_NAME_BY_ID[MODEL_ID_ALIASES[raw_model]]
+        parent = super().set_parameter_value
+        prompt_initial_setup = param_name == "prompt" and initial_setup
+        if prompt_initial_setup:
+            self._hmb_prompt_initial_setup_active = True
+        try:
+            parent(
+                param_name,
+                value,
+                initial_setup=initial_setup,
+                emit_change=emit_change,
+                skip_before_value_set=skip_before_value_set,
+            )
+        finally:
+            if prompt_initial_setup:
+                self._hmb_prompt_initial_setup_active = False
+        if (
+            param_name == "model_id"
+            and initial_setup
+            and self._hmb_retired_model_migration_pending
+            and self.get_parameter_by_name("resolution") is not None
+        ):
+            resolution_parameter = self.get_parameter_by_name("resolution")
+            resolution_parameter.ui_options = {
+                **resolution_parameter.ui_options,
+                "simple_dropdown": list(MODEL_RESOLUTIONS[SEEDANCE_2_0_MODEL_ID]),
+            }
+            parent(
+                "resolution",
+                MODEL_DEFAULT_RESOLUTIONS[SEEDANCE_2_0_MODEL_ID],
+                initial_setup=True,
+                emit_change=False,
+                skip_before_value_set=False,
+            )
+            self._hmb_retired_model_migration_pending = False
+        if initial_setup and param_name in {
+            SHOT_CHANNEL_UUID_PARAMETER,
+            SHOT_UUID_PARAMETER,
+            SHOT_NUMBER_PARAMETER,
+            SHOT_NAME_PARAMETER,
+        }:
+            self._schedule_post_hydration_shot_reconcile()
+
+    def _schedule_post_hydration_shot_reconcile(self) -> bool:
+        """Supersede constructor work after one authoritative Shot value loads."""
+
+        scheduler = getattr(
+            _shot_routing,
+            "schedule_post_hydration_reconcile",
+            None,
+        )
+        return bool(callable(scheduler) and scheduler(self))
+
+    def before_value_set(self, parameter: Parameter, value: Any) -> Any:
+        """Reject browser-supplied catalogs and canonicalize widget Shot requests."""
+
+        normalized = value
+        if parameter.name == "model_id":
+            model_value = str(value or "").strip()
+            if model_value in RETIRED_SEEDANCE_MODEL_VALUES:
+                # Persist the migration as the active display value. Future
+                # loads no longer need the compatibility path, while unknown
+                # values remain untouched so validation can fail closed.
+                self._hmb_retired_model_migration_pending = True
+                # The retired Mini resolution happened to overlap with Full,
+                # so membership validation alone cannot distinguish a stale
+                # 480p/720p value from an intentional Full selection. The
+                # after-value callback completes the atomic pair after the
+                # canonical model value itself has been stored.
+                normalized = MODEL_NAME_SEEDANCE_2_0
+        elif parameter.name == SEEDANCE_SHOT_WIDGET_PARAMETER:
+            requested_shot = value.get("shot") if isinstance(value, dict) else None
+            normalized = _seedance_widget_value(
+                requested_shot,
+                self._hmb_available_seedance_shot_catalog(
+                    self._hmb_shot_catalog_snapshot
+                ),
+            )
+        parent = getattr(super(), "before_value_set", None)
+        if callable(parent):
+            parent_value = parent(parameter, normalized)
+            if parent_value is not None:
+                normalized = parent_value
+        return normalized
 
     def after_value_set(self, parameter: Parameter, value: Any) -> None:
         """Mirror Standard Seedance media visibility for the selected mode."""
+        if (
+            parameter.name == "prompt"
+            and not self._hmb_remote_prompt_syncing
+            and not self._hmb_prompt_initial_setup_active
+        ):
+            self._remember_direct_prompt(value)
+        if parameter.name == "model_id" and self._hmb_retired_model_migration_pending:
+            resolution_parameter = self.get_parameter_by_name("resolution")
+            if resolution_parameter is not None:
+                resolution_parameter.ui_options = {
+                    **resolution_parameter.ui_options,
+                    "simple_dropdown": list(MODEL_RESOLUTIONS[SEEDANCE_2_0_MODEL_ID]),
+                }
+            self.set_parameter_value(
+                "resolution",
+                MODEL_DEFAULT_RESOLUTIONS[SEEDANCE_2_0_MODEL_ID],
+            )
+            self._hmb_retired_model_migration_pending = False
         if parameter.name in {
             "model_id",
             "input_mode",
             "local_video_upload_service",
         }:
             self._update_parameter_visibility()
+        if not self._hmb_shot_syncing and parameter.name == SEEDANCE_SHOT_WIDGET_PARAMETER:
+            if not self._hmb_autoclaim_in_progress:
+                self._set_remote_prompt_control_value(
+                    SHOT_AUTOCLAIM_ENABLED_PARAMETER,
+                    False,
+                )
+            requested = (
+                value.get("shot", {}).get("shot_uuid")
+                if isinstance(value, dict) and isinstance(value.get("shot"), dict)
+                else ""
+            )
+            self._apply_seedance_shot_selection(
+                requested,
+                fallback_to_available=bool(requested),
+            )
+            self._reconcile_shared_shot_routing()
+        elif not self._hmb_shot_syncing and parameter.name == SHOT_SELECTOR_PARAMETER:
+            if not self._hmb_autoclaim_in_progress:
+                self._set_remote_prompt_control_value(
+                    SHOT_AUTOCLAIM_ENABLED_PARAMETER,
+                    False,
+                )
+            selected = self._hmb_shot_selector_map.get(str(value or ""))
+            self._apply_seedance_shot_selection(
+                selected.get("shot_uuid") if isinstance(selected, dict) else "",
+                fallback_to_available=isinstance(selected, dict),
+            )
+            self._reconcile_shared_shot_routing()
+        elif not self._hmb_shot_syncing and parameter.name in {
+            SHOT_CHANNEL_UUID_PARAMETER,
+            SHOT_UUID_PARAMETER,
+            SHOT_NUMBER_PARAMETER,
+            SHOT_NAME_PARAMETER,
+        }:
+            self._reconcile_shared_shot_routing()
         return super().after_value_set(parameter, value)
+
+    def _restore_seedance_shot_route(self) -> None:
+        """Re-arm routing only after serialized prompt/Shot state is hydrated."""
+
+        if self.get_parameter_value(SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER) is True:
+            self._clear_remote_prompt_authority("manual_prompt_authority")
+        elif self.get_parameter_value(SHOT_LOCAL_PROMPT_CAPTURED_PARAMETER) is not True:
+            self._remember_direct_prompt(self.get_parameter_value("prompt"))
+            self._set_remote_prompt_control_value(
+                SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER,
+                False,
+            )
+        with suppress(Exception):
+            _shot_routing.schedule_post_hydration_reconcile(self)
+        with suppress(Exception):
+            self._reconcile_shared_shot_routing()
+        with suppress(Exception):
+            self._sync_seedance_shot_widget()
+
+    def after_deserialize(self, *args: Any, **kwargs: Any) -> Any:
+        parent = getattr(super(), "after_deserialize", None)
+        result = parent(*args, **kwargs) if callable(parent) else None
+        self._restore_seedance_shot_route()
+        return result
+
+    def after_load(self, *args: Any, **kwargs: Any) -> Any:
+        parent = getattr(super(), "after_load", None)
+        result = parent(*args, **kwargs) if callable(parent) else None
+        self._restore_seedance_shot_route()
+        return result
+
+    def on_loaded(self, *args: Any, **kwargs: Any) -> Any:
+        parent = getattr(super(), "on_loaded", None)
+        result = parent(*args, **kwargs) if callable(parent) else None
+        self._restore_seedance_shot_route()
+        return result
 
     def _create_broker_bridge(self) -> _HMBAIBrokerBridge:
         return _HMBAIBrokerBridge()
@@ -1572,13 +3101,43 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             account="",
         )
 
-    def _apply_broker_snapshot(self, snapshot: _BrokerAccountSnapshot) -> None:
+    def _runtime_node_is_live(self, *, require_registered: bool = False) -> bool:
+        """Verify that this exact runtime object still owns its node name."""
+
+        if getattr(self, "_hmb_node_deleted", False):
+            return False
+        node_name = str(getattr(self, "name", "") or "").strip()
+        if not node_name:
+            return not require_registered
+        try:
+            registered = GriptapeNodes.NodeManager().get_node_by_name(node_name)
+        except Exception:
+            # Constructor-time synchronous configuration is valid before the
+            # retained-mode graph owns the node. Background callbacks must
+            # never use that exception as permission to publish.
+            return not require_registered
+        return registered is self
+
+    def _apply_broker_snapshot(
+        self,
+        snapshot: _BrokerAccountSnapshot,
+        *,
+        require_registered: bool = False,
+    ) -> None:
+        if not self._runtime_node_is_live(require_registered=require_registered):
+            with self._broker_action_lock:
+                self._broker_action_running = False
+            return
         values = {
             "broker_connection_status": self._broker_connection_label(snapshot.state),
             "broker_account": snapshot.account if snapshot.connected and snapshot.account else "—",
         }
         try:
             for name, value in values.items():
+                if not self._runtime_node_is_live(
+                    require_registered=require_registered
+                ):
+                    return
                 self.set_parameter_value(name, value, emit_change=False)
                 publisher = getattr(self, "publish_update_to_parameter", None)
                 if callable(publisher):
@@ -1591,23 +3150,34 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             except Exception:
                 pass
             emitter = getattr(self, "emit_parameter_changes", None)
-            if callable(emitter):
+            if callable(emitter) and self._runtime_node_is_live(
+                require_registered=require_registered
+            ):
                 try:
                     emitter()
                 except Exception:
                     pass
 
     def _schedule_broker_snapshot(self, snapshot: _BrokerAccountSnapshot) -> None:
+        if not self._runtime_node_is_live(require_registered=True):
+            with self._broker_action_lock:
+                self._broker_action_running = False
+            return
+        def apply_if_live() -> None:
+            self._apply_broker_snapshot(snapshot, require_registered=True)
+
         try:
             event_loop = getattr(GriptapeNodes.EventManager(), "event_loop", None)
             if event_loop is not None and event_loop.is_running():
-                event_loop.call_soon_threadsafe(self._apply_broker_snapshot, snapshot)
+                event_loop.call_soon_threadsafe(apply_if_live)
                 return
         except Exception:
             pass
-        self._apply_broker_snapshot(snapshot)
+        apply_if_live()
 
     def _on_broker_connect_clicked(self, _button: Any, _details: Any) -> None:
+        if not self._runtime_node_is_live(require_registered=True):
+            return
         with self._broker_action_lock:
             if self._broker_action_running:
                 return
@@ -1637,7 +3207,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             ).start()
         except Exception:
             self._apply_broker_snapshot(
-                self._broker_error_snapshot(_BrokerUnavailableError("unavailable"))
+                self._broker_error_snapshot(_BrokerUnavailableError("unavailable")),
+                require_registered=True,
             )
 
     async def _ensure_broker_connected(self) -> _HMBAIBrokerBridge:
@@ -1664,34 +3235,24 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     def _update_parameter_visibility(self) -> None:
         self._synchronize_model_resolution()
-        input_mode = self.get_parameter_value("input_mode") or INPUT_MODE_MULTIMODAL_REFERENCES
-        if input_mode == INPUT_MODE_MULTIMODAL_REFERENCES:
-            self.hide_parameter_by_name("first_frame")
-            self.hide_parameter_by_name("last_frame")
-            self.show_parameter_by_name("reference_images")
-            self.show_parameter_by_name(VIDEO_REFERENCES_PARAMETER)
-            self.show_parameter_by_name("reference_audio")
-            self.hide_parameter_by_name(
-                ["reference_video_1", "reference_video_2", "reference_video_3"]
-            )
-        elif input_mode == INPUT_MODE_FIRST_LAST_FRAME:
-            self.show_parameter_by_name("first_frame")
-            self.show_parameter_by_name("last_frame")
-            self.hide_parameter_by_name("reference_images")
-            self.hide_parameter_by_name(VIDEO_REFERENCES_PARAMETER)
-            self.hide_parameter_by_name("reference_audio")
-            self.hide_parameter_by_name(
-                ["reference_video_1", "reference_video_2", "reference_video_3"]
-            )
-        else:
-            self.hide_parameter_by_name("first_frame")
-            self.hide_parameter_by_name("last_frame")
-            self.hide_parameter_by_name("reference_images")
-            self.hide_parameter_by_name(VIDEO_REFERENCES_PARAMETER)
-            self.hide_parameter_by_name("reference_audio")
-            self.hide_parameter_by_name(
-                ["reference_video_1", "reference_video_2", "reference_video_3"]
-            )
+        # First/Last Frame is the one public mode that owns explicit image
+        # inputs. Text Only and Multimodal References keep those two rows
+        # absent; remote same-Shot Prompt media remains on the hidden managed
+        # inputs and does not change this authoring-mode UI contract.
+        self.hide_parameter_by_name(
+            [
+                "first_frame",
+                "last_frame",
+                "reference_images",
+                VIDEO_REFERENCES_PARAMETER,
+                "reference_audio",
+                "reference_video_1",
+                "reference_video_2",
+                "reference_video_3",
+            ]
+        )
+        if self.get_parameter_value("input_mode") == INPUT_MODE_FIRST_LAST_FRAME:
+            self.show_parameter_by_name(["first_frame", "last_frame"])
         if (
             self.get_parameter_value("local_video_upload_service")
             == LOCAL_VIDEO_UPLOAD_TOS
@@ -1706,7 +3267,21 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     def _synchronize_model_resolution(self) -> str:
         """Apply the selected Volcengine model's exact resolution contract."""
         raw_model = self.get_parameter_value("model_id") or MODEL_NAME_SEEDANCE_2_0
-        model_id = MODEL_ID_ALIASES.get(str(raw_model), str(raw_model))
+        raw_model_text = str(raw_model).strip()
+        model_id = MODEL_ID_ALIASES.get(raw_model_text, raw_model_text)
+        migrated_retired_model = bool(
+            self._hmb_retired_model_migration_pending
+            or raw_model_text in RETIRED_SEEDANCE_MODEL_VALUES
+        )
+        if (
+            raw_model_text in RETIRED_SEEDANCE_MODEL_VALUES
+            and not self._hmb_model_migration_active
+        ):
+            self._hmb_model_migration_active = True
+            try:
+                self.set_parameter_value("model_id", MODEL_NAME_SEEDANCE_2_0)
+            finally:
+                self._hmb_model_migration_active = False
         supported = MODEL_RESOLUTIONS.get(model_id)
         if supported is None:
             return model_id
@@ -1721,10 +3296,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 }
 
         current = str(self.get_parameter_value("resolution") or "")
-        if current not in supported:
+        if migrated_retired_model or current not in supported:
             self.set_parameter_value(
                 "resolution", MODEL_DEFAULT_RESOLUTIONS[model_id]
             )
+        if migrated_retired_model:
+            self._hmb_retired_model_migration_pending = False
         return model_id
 
     @staticmethod
@@ -1747,6 +3324,26 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return bool(value)
         return True
 
+    def _has_incoming_parameter_connection(self, name: str) -> bool:
+        """Return True when the current node has any incoming connection on *name*."""
+
+        try:
+            from griptape_nodes.retained_mode.retained_mode import RetainedMode  # type: ignore
+
+            result = RetainedMode.get_connections_for_parameter(
+                str(name),
+                str(self.name),
+            )
+        except Exception:
+            return False
+        incoming = getattr(result, "incoming_connections", None)
+        if not isinstance(incoming, (list, tuple)):
+            return False
+        return any(
+            str(getattr(item, "target_parameter_name", "") or "") == str(name)
+            for item in incoming
+        )
+
     def _get_list_input(self, name: str) -> list[Any]:
         """Read the current list value, then an older serialized top-level value."""
         current = [
@@ -1754,6 +3351,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             for value in self._as_list(self.get_parameter_value(name))
             if self._has_reference_value(value)
         ]
+        if self._has_incoming_parameter_connection(name):
+            return current
         if current:
             return current
         # Griptape's ParameterList getter (still used by reference_audio) reads
@@ -1765,6 +3364,570 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             for value in self._as_list(self.parameter_values.get(name))
             if self._has_reference_value(value)
         ]
+
+    def _exact_incoming_source(
+        self,
+        target_parameter_name: str,
+        expected_source_parameter_name: str,
+        *,
+        required: bool = True,
+    ) -> Any:
+        try:
+            from griptape_nodes.retained_mode.retained_mode import RetainedMode  # type: ignore
+
+            result = RetainedMode.get_connections_for_parameter(
+                target_parameter_name,
+                str(self.name),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Seedance could not inspect {target_parameter_name} Shot routing."
+            ) from exc
+        incoming = getattr(result, "incoming_connections", None)
+        if not isinstance(incoming, (list, tuple)):
+            raise RuntimeError(
+                f"Seedance {target_parameter_name} Shot routing result is malformed."
+            )
+        matches = [
+            item for item in incoming
+            if str(getattr(item, "target_parameter_name", "") or "")
+            == target_parameter_name
+        ]
+        if not matches and not required:
+            return None
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"Seedance {target_parameter_name} requires exactly one upstream Shot source."
+            )
+        connection = matches[0]
+        if str(getattr(connection, "source_parameter_name", "") or "") != expected_source_parameter_name:
+            raise RuntimeError(
+                f"Seedance {target_parameter_name} is connected to the wrong source port."
+            )
+        source_node_name = str(getattr(connection, "source_node_name", "") or "").strip()
+        if not source_node_name:
+            raise RuntimeError(
+                f"Seedance {target_parameter_name} source identity is missing."
+            )
+        source_node = GriptapeNodes.NodeManager().get_node_by_name(source_node_name)
+        if source_node is None:
+            raise RuntimeError(
+                f"Seedance {target_parameter_name} source node is unavailable."
+            )
+        return source_node
+
+    def _manual_agent_prompt_source(self) -> Any | None:
+        """Return a manually connected HMBAgent output, otherwise no authority.
+
+        Ordinary text/property inputs and other prompt-producing nodes remain
+        valid Seedance inputs.  An object that exposes the HMB Agent snapshot
+        API opts into strict exact-Shot parity and must use its public
+        ``output`` port.
+        """
+
+        try:
+            from griptape_nodes.retained_mode.retained_mode import RetainedMode  # type: ignore
+
+            result = RetainedMode.get_connections_for_parameter(
+                "prompt",
+                str(self.name),
+            )
+        except Exception as exc:
+            raise RuntimeError("Seedance could not inspect its prompt connection.") from exc
+        incoming = getattr(result, "incoming_connections", None)
+        if not isinstance(incoming, (list, tuple)):
+            raise RuntimeError("Seedance prompt connection result is malformed.")
+        matches = [
+            item
+            for item in incoming
+            if str(getattr(item, "target_parameter_name", "") or "") == "prompt"
+        ]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise RuntimeError("Seedance prompt connection is ambiguous.")
+        connection = matches[0]
+        source_name = str(getattr(connection, "source_node_name", "") or "").strip()
+        if not source_name:
+            raise RuntimeError("Seedance prompt source identity is missing.")
+        source_node = GriptapeNodes.NodeManager().get_node_by_name(source_name)
+        if source_node is None:
+            raise RuntimeError("Seedance prompt source node is unavailable.")
+        subscription_getter = getattr(
+            source_node,
+            "_hmb_shot_channel_subscription",
+            None,
+        )
+        try:
+            source_subscription = (
+                subscription_getter() if callable(subscription_getter) else None
+            )
+        except Exception:
+            source_subscription = None
+        if (
+            not isinstance(source_subscription, dict)
+            or source_subscription.get("participant_kind") != "agent"
+        ):
+            return None
+        snapshot_getter = getattr(source_node, "_hmb_generator_shot_snapshot", None)
+        if not callable(snapshot_getter):
+            return None
+        if str(getattr(connection, "source_parameter_name", "") or "") != "output":
+            raise RuntimeError("Seedance HMBAgent prompt must use the Agent output port.")
+        return source_node
+
+    @classmethod
+    def _media_list_sha256(cls, values: list[str]) -> str:
+        return cls._canonical_sha256({"media": values})
+
+    @staticmethod
+    def _validate_agent_shot_snapshot(value: Any) -> dict[str, Any]:
+        required = {
+            "schema", "version", "channel_uuid", "shot_uuid", "shot_number",
+            "shot_name", "prompt_generation", "visible_prompt_sha256",
+            "image_media_sha256", "video_media_sha256", "final_text_sha256",
+        }
+        if not isinstance(value, dict) or set(value) != required:
+            raise RuntimeError("Seedance Agent Shot snapshot is malformed.")
+        if value.get("schema") != "hmb-agent-generator-shot-snapshot" or value.get("version") != 1:
+            raise RuntimeError("Seedance Agent Shot snapshot schema is invalid.")
+        channel = HMBSeedanceGeneration._shot_uuid(value.get("channel_uuid"))
+        shot_uuid = HMBSeedanceGeneration._shot_uuid(value.get("shot_uuid"))
+        shot_number = value.get("shot_number")
+        prompt_generation = value.get("prompt_generation")
+        shot_name = value.get("shot_name")
+        if (
+            not channel or not shot_uuid
+            or not isinstance(shot_number, int) or isinstance(shot_number, bool)
+            or not 1 <= shot_number <= SHOT_ROUTING_MAX_SHOTS
+            or not isinstance(shot_name, str) or not shot_name
+            or shot_name != shot_name.strip()[:128]
+            or not isinstance(prompt_generation, int) or isinstance(prompt_generation, bool)
+            or prompt_generation <= 0
+        ):
+            raise RuntimeError("Seedance Agent Shot identity/revision is invalid.")
+        for key in (
+            "visible_prompt_sha256", "image_media_sha256", "video_media_sha256",
+            "final_text_sha256",
+        ):
+            if re.fullmatch(r"[0-9a-f]{64}", str(value.get(key) or "")) is None:
+                raise RuntimeError("Seedance Agent Shot snapshot hash is invalid.")
+        return deepcopy(value)
+
+    @staticmethod
+    def _validate_prompt_shot_snapshot(value: Any) -> dict[str, Any]:
+        required = {
+            "schema", "version", "channel_uuid", "shot_uuid", "shot_number",
+            "shot_name", "prompt_generation", "visible_prompt_sha256",
+            "image_media_sha256", "video_media_sha256", "image_media",
+            "video_media",
+        }
+        if not isinstance(value, dict) or set(value) != required:
+            raise RuntimeError("Seedance Prompt Shot snapshot is malformed.")
+        if value.get("schema") != "hmb-prompt-generator-shot-snapshot" or value.get("version") != 1:
+            raise RuntimeError("Seedance Prompt Shot snapshot schema is invalid.")
+        channel = HMBSeedanceGeneration._shot_uuid(value.get("channel_uuid"))
+        shot_uuid = HMBSeedanceGeneration._shot_uuid(value.get("shot_uuid"))
+        shot_number = value.get("shot_number")
+        prompt_generation = value.get("prompt_generation")
+        shot_name = value.get("shot_name")
+        if (
+            not channel or not shot_uuid
+            or not isinstance(shot_number, int) or isinstance(shot_number, bool)
+            or not 1 <= shot_number <= SHOT_ROUTING_MAX_SHOTS
+            or not isinstance(shot_name, str) or not shot_name
+            or shot_name != shot_name.strip()[:128]
+            or not isinstance(prompt_generation, int) or isinstance(prompt_generation, bool)
+            or prompt_generation <= 0
+        ):
+            raise RuntimeError("Seedance Prompt Shot identity/revision is invalid.")
+        for key in (
+            "visible_prompt_sha256", "image_media_sha256", "video_media_sha256",
+        ):
+            if re.fullmatch(r"[0-9a-f]{64}", str(value.get(key) or "")) is None:
+                raise RuntimeError("Seedance Prompt Shot snapshot hash is invalid.")
+        if (
+            not isinstance(value.get("image_media"), list)
+            or not isinstance(value.get("video_media"), list)
+            or len(value["image_media"]) > MAX_REFERENCE_IMAGES
+            or len(value["video_media"]) > 10
+            or any(
+                not isinstance(item, str) or not item
+                for item in value["image_media"] + value["video_media"]
+            )
+        ):
+            raise RuntimeError("Seedance Prompt Shot media snapshot is invalid.")
+        return deepcopy(value)
+
+    @classmethod
+    def _validate_direct_media_snapshot(
+        cls,
+        value: Any,
+        *,
+        source_kind: str,
+        expected_channel_uuid: str,
+    ) -> dict[str, Any]:
+        """Validate one atomic ImageAsset or VideoPicker source publication."""
+
+        if source_kind == "image_asset":
+            schema = "hmb-shot-routing-snapshot"
+            records_key = "ordered_assets"
+            shot_fields = {
+                "shot_uuid", "number", "name", "revision", "selected_source_uids",
+            }
+        elif source_kind == "video_picker":
+            schema = "hmb-picker-shot-routing-snapshot"
+            records_key = "ordered_videos"
+            shot_fields = {
+                "shot_uuid", "number", "name", "revision", "selected_source_uids",
+                "picker_payload",
+            }
+        else:
+            raise RuntimeError("Seedance direct Shot source kind is invalid.")
+        required = {
+            "schema", "version", "publisher_instance_uuid", "channel_uuid",
+            "generation", "metadata_sha256", "media_sha256", "shots",
+            records_key, "media_by_source_uid",
+        }
+        if not isinstance(value, dict) or set(value) != required:
+            raise RuntimeError(
+                f"Seedance {source_kind} Shot snapshot has unknown or missing fields."
+            )
+        channel = cls._shot_uuid(value.get("channel_uuid"))
+        expected_channel = cls._shot_uuid(expected_channel_uuid)
+        publisher = str(value.get("publisher_instance_uuid") or "").strip()
+        generation = value.get("generation")
+        if (
+            value.get("schema") != schema
+            or value.get("version") != 1
+            or not publisher
+            or len(publisher) > 128
+            or not channel
+            or channel != expected_channel
+            or not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or not 0 <= generation <= 10**12
+        ):
+            raise RuntimeError(f"Seedance {source_kind} Shot snapshot identity is invalid.")
+
+        raw_shots = value.get("shots")
+        if not isinstance(raw_shots, list) or not 1 <= len(raw_shots) <= SHOT_ROUTING_MAX_SHOTS:
+            raise RuntimeError(f"Seedance {source_kind} Shot list is invalid.")
+        shots: list[dict[str, Any]] = []
+        shot_ids: set[str] = set()
+        shot_numbers: set[int] = set()
+        for raw in raw_shots:
+            if not isinstance(raw, dict) or set(raw) != shot_fields:
+                raise RuntimeError(f"Seedance {source_kind} Shot record is malformed.")
+            shot_uuid = cls._shot_uuid(raw.get("shot_uuid"))
+            number = raw.get("number")
+            name = str(raw.get("name") or "").strip()
+            revision = raw.get("revision")
+            selected = raw.get("selected_source_uids")
+            if (
+                not shot_uuid
+                or shot_uuid in shot_ids
+                or not isinstance(number, int)
+                or isinstance(number, bool)
+                or not 1 <= number <= SHOT_ROUTING_MAX_SHOTS
+                or number in shot_numbers
+                or not name
+                or len(name) > 128
+                or not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or not 0 <= revision <= 10**12
+                or not isinstance(selected, list)
+            ):
+                raise RuntimeError(f"Seedance {source_kind} Shot identity is invalid.")
+            selected_uids = [str(item or "").strip() for item in selected]
+            if (
+                any(not item or len(item) > 1024 for item in selected_uids)
+                or len(set(selected_uids)) != len(selected_uids)
+            ):
+                raise RuntimeError(f"Seedance {source_kind} Shot addresses are invalid.")
+            normalized = {
+                "shot_uuid": shot_uuid,
+                "number": number,
+                "name": name,
+                "revision": revision,
+                "selected_source_uids": selected_uids,
+            }
+            if source_kind == "video_picker":
+                if not isinstance(raw.get("picker_payload"), dict):
+                    raise RuntimeError("Seedance VideoPicker payload is invalid.")
+                normalized["picker_payload"] = deepcopy(raw["picker_payload"])
+            shots.append(normalized)
+            shot_ids.add(shot_uuid)
+            shot_numbers.add(number)
+
+        raw_records = value.get(records_key)
+        raw_media = value.get("media_by_source_uid")
+        if not isinstance(raw_records, list) or not isinstance(raw_media, dict):
+            raise RuntimeError(f"Seedance {source_kind} source arrays are invalid.")
+        records: list[dict[str, Any]] = []
+        ordered_uids: list[str] = []
+        for raw in raw_records:
+            if not isinstance(raw, dict) or set(raw) != {"source_uid", "metadata"}:
+                raise RuntimeError(f"Seedance {source_kind} source record is malformed.")
+            source_uid = str(raw.get("source_uid") or "").strip()
+            metadata = raw.get("metadata")
+            if (
+                not source_uid
+                or len(source_uid) > 1024
+                or source_uid in ordered_uids
+                or not isinstance(metadata, dict)
+            ):
+                raise RuntimeError(f"Seedance {source_kind} source address is invalid.")
+            ordered_uids.append(source_uid)
+            records.append({"source_uid": source_uid, "metadata": deepcopy(metadata)})
+        if set(raw_media) != set(ordered_uids):
+            raise RuntimeError(f"Seedance {source_kind} metadata/media addresses differ.")
+        media: dict[str, str] = {}
+        for source_uid in ordered_uids:
+            media_value = raw_media.get(source_uid)
+            if not isinstance(media_value, str) or not media_value:
+                raise RuntimeError(f"Seedance {source_kind} media value is unavailable.")
+            media[source_uid] = media_value
+        known_uids = set(ordered_uids)
+        if any(
+            uid not in known_uids
+            for shot in shots
+            for uid in shot["selected_source_uids"]
+        ):
+            raise RuntimeError(f"Seedance {source_kind} Shot addresses unpublished media.")
+        metadata_document = {
+            "channel_uuid": channel,
+            "generation": generation,
+            "shots": shots,
+            records_key: records,
+        }
+        descriptors = [
+            {
+                "source_uid": uid,
+                "media_value_sha256": hashlib.sha256(media[uid].encode("utf-8")).hexdigest(),
+            }
+            for uid in ordered_uids
+        ]
+        if str(value.get("metadata_sha256") or "").strip().casefold() != cls._canonical_sha256(metadata_document):
+            raise RuntimeError(f"Seedance {source_kind} metadata hash does not match.")
+        if str(value.get("media_sha256") or "").strip().casefold() != cls._canonical_sha256({"media_descriptors": descriptors}):
+            raise RuntimeError(f"Seedance {source_kind} media hash does not match.")
+        return {
+            "schema": schema,
+            "version": 1,
+            "publisher_instance_uuid": publisher,
+            "channel_uuid": channel,
+            "generation": generation,
+            "metadata_sha256": str(value["metadata_sha256"]).strip().casefold(),
+            "media_sha256": str(value["media_sha256"]).strip().casefold(),
+            "shots": shots,
+            records_key: records,
+            "media_by_source_uid": media,
+        }
+
+    @staticmethod
+    def _direct_source_subscription(source_node: Any, expected_kind: str) -> dict[str, Any]:
+        getter = getattr(source_node, "_hmb_shot_channel_subscription", None)
+        try:
+            subscription = getter() if callable(getter) else None
+        except Exception as exc:
+            raise RuntimeError("Seedance direct Shot source identity is unavailable.") from exc
+        if (
+            not isinstance(subscription, dict)
+            or subscription.get("participant_kind") != expected_kind
+            or not subscription.get("enabled")
+        ):
+            raise RuntimeError(f"Seedance {expected_kind} source identity is invalid.")
+        return subscription
+
+    def _resolve_exact_shot_generation_inputs(
+        self,
+        params: dict[str, Any],
+        *,
+        verify_agent_prompt: bool = True,
+    ) -> dict[str, Any]:
+        # A newly added or deserialized Seedance node may still have a blank
+        # durable quartet. Reconcile the same-flow catalog before deciding
+        # whether remote execution can proceed; a missing catalog fails closed.
+        self._reconcile_shared_shot_routing(strict=True)
+        subscription = self._hmb_shot_channel_subscription()
+        if not subscription["enabled"]:
+            self._clear_remote_prompt_authority("remote_waiting")
+            resolved = dict(params)
+            resolved["prompt"] = str(params.get("prompt") or "")
+            resolved["reference_images"] = []
+            resolved["video_references"] = []
+            resolved["video_reference_slots"] = []
+            resolved["input_mode"] = INPUT_MODE_TEXT_ONLY
+            return resolved
+
+        image_node = self._exact_incoming_source(
+            SHOT_ASSET_INPUT_PARAMETER,
+            "SHOT_ASSET_OUT",
+            required=False,
+        )
+        picker_node = self._exact_incoming_source(
+            SHOT_PICKER_INPUT_PARAMETER,
+            "SHOT_PICKER_OUT",
+            required=False,
+        )
+        if image_node is None and picker_node is None:
+            raise RuntimeError("Seedance selected Shot has no direct media source.")
+        if image_node is not None and image_node is picker_node:
+            raise RuntimeError("Seedance ImageAsset and VideoPicker sources must be distinct.")
+        expected_identity = (
+            int(subscription["shot_number"]),
+            str(subscription["shot_name"]),
+        )
+        images: list[str] = []
+        videos: list[str] = []
+        for source_node, source_kind in (
+            (image_node, "image_asset"),
+            (picker_node, "video_picker"),
+        ):
+            if source_node is None:
+                continue
+            source_subscription = self._direct_source_subscription(
+                source_node,
+                source_kind,
+            )
+            if source_subscription.get("channel_uuid") != subscription["channel_uuid"]:
+                raise RuntimeError(
+                    "Seedance direct sources do not match the selected Shot channel."
+                )
+            snapshot_api = getattr(source_node, "_hmb_shot_routing_snapshot", None)
+            if not callable(snapshot_api):
+                raise RuntimeError(
+                    "Seedance direct source does not expose the atomic Shot snapshot API."
+                )
+            try:
+                raw_snapshot = snapshot_api(subscription["channel_uuid"])
+            except TypeError:
+                raw_snapshot = snapshot_api()
+            source_snapshot = self._validate_direct_media_snapshot(
+                raw_snapshot,
+                source_kind=source_kind,
+                expected_channel_uuid=subscription["channel_uuid"],
+            )
+            source_shot = next(
+                (
+                    item for item in source_snapshot["shots"]
+                    if item["shot_uuid"] == subscription["shot_uuid"]
+                ),
+                None,
+            )
+            if not isinstance(source_shot, dict):
+                raise RuntimeError("Seedance selected Shot is missing from a direct source.")
+            if (
+                int(source_shot["number"]),
+                str(source_shot["name"]),
+            ) != expected_identity:
+                raise RuntimeError(
+                    "Seedance selected Shot identity does not match its direct sources."
+                )
+            selected_media = [
+                source_snapshot["media_by_source_uid"][uid]
+                for uid in source_shot["selected_source_uids"]
+            ]
+            if source_kind == "image_asset":
+                images = selected_media
+            else:
+                videos = selected_media
+        if len(images) > MAX_REFERENCE_IMAGES:
+            raise ValueError(
+                f"Selected Shot contains {len(images)} images; Seedance accepts at most "
+                f"{MAX_REFERENCE_IMAGES}. No request was submitted."
+            )
+        if len(videos) > MAX_VIDEO_REFERENCES:
+            raise ValueError(
+                f"Selected Shot contains {len(videos)} videos; Seedance accepts at most "
+                f"{MAX_VIDEO_REFERENCES}. No request was submitted."
+            )
+
+        # The public prompt input remains manual.  When its exact source is an
+        # HMBAgent, however, text alone is not provenance: require the Agent's
+        # immutable generator snapshot to match this Seedance Shot and the two
+        # direct media publications byte-for-byte.  Ordinary manual text and
+        # non-HMB prompt sources remain independent.
+        # StartFlow validates the whole graph before an upstream prompt node has
+        # executed.  At that point its connected output can legitimately still
+        # be blank, so preflight resolves the immutable media snapshot without
+        # attempting to authenticate a not-yet-produced Agent result.  The real
+        # process path always leaves ``verify_agent_prompt`` enabled and proves
+        # the final text + exact Shot media hashes before any billable request.
+        prompt_source = (
+            self._manual_agent_prompt_source()
+            if verify_agent_prompt
+            else None
+        )
+        if prompt_source is not None:
+            source_subscription = self._direct_source_subscription(
+                prompt_source,
+                "agent",
+            )
+            if any(
+                source_subscription.get(key) != subscription.get(key)
+                for key in (
+                    "channel_uuid",
+                    "shot_uuid",
+                    "shot_number",
+                    "shot_name",
+                )
+            ):
+                raise RuntimeError(
+                    "Seedance Agent prompt belongs to another Shot."
+                )
+            snapshot_getter = getattr(
+                prompt_source,
+                "_hmb_generator_shot_snapshot",
+                None,
+            )
+            if not callable(snapshot_getter):
+                raise RuntimeError("Seedance Agent Shot snapshot is unavailable.")
+            agent_snapshot = self._validate_agent_shot_snapshot(
+                snapshot_getter(params.get("prompt"))
+            )
+            prompt_text = str(params.get("prompt") or "")
+            if not hmac.compare_digest(
+                agent_snapshot["final_text_sha256"],
+                hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+            ):
+                raise RuntimeError(
+                    "Seedance Agent final text does not match its Shot snapshot."
+                )
+            if any(
+                agent_snapshot.get(key) != subscription.get(key)
+                for key in (
+                    "channel_uuid",
+                    "shot_uuid",
+                    "shot_number",
+                    "shot_name",
+                )
+            ):
+                raise RuntimeError(
+                    "Seedance Agent and selected Shot generations do not match."
+                )
+            if (
+                agent_snapshot["image_media_sha256"]
+                != self._media_list_sha256(images)
+                or agent_snapshot["video_media_sha256"]
+                != self._media_list_sha256(videos)
+            ):
+                raise RuntimeError(
+                    "Seedance Agent and direct Shot media generations do not match."
+                )
+
+        resolved = dict(params)
+        resolved["prompt"] = str(params.get("prompt") or "")
+        resolved["reference_images"] = list(images)
+        resolved["video_references"] = list(videos)
+        resolved["video_reference_slots"] = []
+        resolved["input_mode"] = (
+            INPUT_MODE_MULTIMODAL_REFERENCES
+            if (images or videos)
+            else INPUT_MODE_TEXT_ONLY
+        )
+        return resolved
 
     def _get_parameters(self) -> dict[str, Any]:
         model_id = self._synchronize_model_resolution()
@@ -1981,21 +4144,48 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if model_id != SEEDANCE_2_0_MODEL_ID and priority != 0:
             raise ValueError(
                 "priority is supported only by the full Seedance 2.0 model. "
-                "Use priority 0 for Fast or Mini."
+                "Use priority 0 for Fast."
             )
 
     @staticmethod
     def _validate_broker_model(model_id: Any) -> None:
         if model_id not in BROKER_SUPPORTED_MODEL_IDS:
             raise ValueError(
-                "FN AI Broker supports the Volcengine Seedance 2.0, Fast, and "
-                "Mini model IDs only."
+                "FN AI Broker supports only the active Volcengine Seedance 2.0 "
+                "and Seedance 2.0 Fast model IDs."
             )
+
+    def _get_parameters_for_start_validation(self) -> dict[str, Any]:
+        """Resolve safe graph inputs without requiring an upstream result yet."""
+
+        params = self._get_parameters()
+        if params.get("resume_generation_id"):
+            return params
+        # Hidden ImageAsset/VideoPicker Shot wires are authoritative but are not
+        # represented in the public parameter lists. Resolve them during
+        # StartFlow validation as well as execution so a valid media-backed Shot
+        # is not rejected as an empty node.
+        params = self._resolve_exact_shot_generation_inputs(
+            params,
+            verify_agent_prompt=False,
+        )
+        # The graph validator runs before connected Prompt/Agent nodes. A
+        # temporary sentinel validates only the connection shape; it never
+        # enters runtime state or a Broker payload. Execution reads the actual
+        # output and performs the full Agent snapshot proof, then fails closed
+        # if the produced text is empty or stale.
+        if (
+            not str(params.get("prompt") or "").strip()
+            and self._has_incoming_parameter_connection("prompt")
+        ):
+            params = dict(params)
+            params["prompt"] = "HMB connected prompt pending execution"
+        return params
 
     def validate_before_node_run(self) -> list[Exception] | None:
         exceptions = super().validate_before_node_run() or []
         try:
-            params = self._get_parameters()
+            params = self._get_parameters_for_start_validation()
             self._validate_parameters(params)
             if not params.get("resume_generation_id"):
                 self._validate_broker_model(params.get("model_id"))
@@ -2683,6 +4873,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         generation_id: str,
         status: str,
     ) -> None:
+        if getattr(self, "_hmb_node_deleted", False):
+            return
         self.parameter_output_values["generation_id"] = generation_id
         self.parameter_output_values["generation_status"] = status
         provider_response = {
@@ -2909,6 +5101,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
 
     def _set_safe_defaults(self) -> None:
+        if getattr(self, "_hmb_node_deleted", False):
+            return
         self.parameter_output_values["generation_id"] = ""
         self.parameter_output_values["generation_status"] = ""
         self.parameter_output_values["provider_response"] = None
@@ -2932,6 +5126,28 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     async def _sleep(self, seconds: float) -> None:
         await asyncio.sleep(seconds)
+
+    async def _run_blocking_generation_stage(
+        self,
+        operation: Any,
+        *args: Any,
+    ) -> Any:
+        """Run blocking preparation without freezing the host event loop.
+
+        ``asyncio.to_thread`` work keeps running when its awaiter is cancelled.
+        Shield it and wait for completion before propagating cancellation so a
+        late upload cannot append temporary objects after cleanup has already
+        run. This preserves the existing no-leak/no-duplicate submission
+        contract while allowing the canvas and controls to keep painting.
+        """
+
+        task = asyncio.create_task(asyncio.to_thread(operation, *args))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                await task
+            raise
 
     @staticmethod
     def _output_destination_policy(destination: Any) -> ExistingFilePolicy:
@@ -3274,23 +5490,32 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         destination: Any,
         verifier: _MP4DecodeVerifier | None = None,
     ) -> None:
+        if not self._runtime_node_is_live(require_registered=True):
+            return
         video_download_url = self._extract_video_url(final_task)
         if not video_download_url:
             raise RuntimeError(
                 "FN AI Broker task succeeded but the video URL was missing."
             )
         video_bytes = await self._download_broker_video(video_download_url)
+        if not self._runtime_node_is_live(require_registered=True):
+            return
         saved = await self._atomic_publish_completed_mp4(
             destination,
             video_bytes,
             verifier,
         )
+        if not self._runtime_node_is_live(require_registered=True):
+            return
         artifact = VideoUrlArtifact(value=saved.location, name=saved.name)
+        last_frame_url = self._extract_last_frame_url(final_task)
+        if not self._runtime_node_is_live(require_registered=True):
+            return
         self.parameter_output_values["video_url"] = artifact
         self.parameter_output_values["VIDEO_OUT"] = artifact
-        self.parameter_output_values["last_frame_url"] = (
-            self._extract_last_frame_url(final_task)
-        )
+        self.parameter_output_values["last_frame_url"] = last_frame_url
+        if not self._runtime_node_is_live(require_registered=True):
+            return
         self._set_status_results(
             was_successful=True,
             result_details=(
@@ -3301,6 +5526,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     async def _refresh_async(self) -> None:
         """Refresh one Broker job without ever creating a replacement task."""
+        if not self._runtime_node_is_live(require_registered=True):
+            return
         generation_id = ""
         try:
             generation_id = str(
@@ -3320,6 +5547,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 )
                 return
             bridge = await self._ensure_broker_connected()
+            if not self._runtime_node_is_live(require_registered=True):
+                return
             generation_id = self._validate_task_id(generation_id)
             try:
                 response = await asyncio.to_thread(
@@ -3327,6 +5556,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     generation_id,
                     timeout=60,
                 )
+                if not self._runtime_node_is_live(require_registered=True):
+                    return
             except _BrokerError as exc:
                 retry_payload = self._last_broker_payload
                 retry_same_request = (
@@ -3349,6 +5580,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         dict(retry_payload),
                         timeout=60,
                     )
+                    if not self._runtime_node_is_live(require_registered=True):
+                        return
                 except _BrokerError:
                     self.parameter_output_values["generation_status"] = (
                         "submission_unknown"
@@ -3358,6 +5591,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 response,
                 fallback_job_id=generation_id,
             )
+            if not self._runtime_node_is_live(require_registered=True):
+                return
             status = str(task["status"])
             self._set_broker_task_outputs(
                 task,
@@ -3386,6 +5621,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 )
             )
         except Exception as exc:
+            if not self._runtime_node_is_live(require_registered=True):
+                return
             safe_detail = (
                 str(exc) if isinstance(exc, _BrokerError) else type(exc).__name__
             )
@@ -3427,6 +5664,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
 
     def _on_refresh_clicked(self, _button: Any, _details: Any) -> None:
+        if not self._runtime_node_is_live(require_registered=True):
+            return
         with self._generation_refresh_lock:
             if self._generation_refresh_running:
                 return
@@ -3466,8 +5705,36 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             _finished()
             raise
 
+    def after_node_deleted(self, *args: Any, **kwargs: Any) -> Any:
+        """Invalidate every delayed Broker/UI callback without blocking delete."""
+
+        if not bool(getattr(self, "_hmb_node_deleted", False)):
+            self._hmb_node_deleted = True
+            self._generation_run_active.clear()
+            with self._broker_action_lock:
+                self._broker_action_running = False
+            with self._generation_refresh_lock:
+                self._generation_refresh_running = False
+            for task in tuple(self._detached_submission_tasks):
+                with suppress(Exception):
+                    task.cancel()
+            self._detached_submission_tasks.clear()
+            # Release this exact (channel_uuid, shot_uuid) claim while the host
+            # still exposes the deleted object as a same-flow anchor.  The
+            # shared helper excludes `_hmb_node_deleted`, so surviving Seedance
+            # selectors immediately regain the Shot without another user edit.
+            with suppress(Exception):
+                _shot_routing.schedule_post_deletion_reconcile(self)
+        if bool(getattr(self, "_hmb_delete_parent_called", False)):
+            return None
+        self._hmb_delete_parent_called = True
+        parent = getattr(super(), "after_node_deleted", None)
+        return parent(*args, **kwargs) if callable(parent) else None
+
     async def _process_generation(self) -> None:
-        self._cleanup_temporary_video_uploads()
+        await self._run_blocking_generation_stage(
+            self._cleanup_temporary_video_uploads
+        )
         self._submission_outcome_unknown = False
         try:
             await self._process_generation_impl()
@@ -3475,26 +5742,39 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if self._submission_outcome_unknown:
                 self._defer_temporary_video_upload_cleanup()
             else:
-                self._cleanup_temporary_video_uploads()
+                await self._run_blocking_generation_stage(
+                    self._cleanup_temporary_video_uploads
+                )
 
     async def _process_generation_impl(self) -> None:
         """Submit and poll Seedance exclusively through the FN AI Broker."""
+        if not self._runtime_node_is_live(require_registered=True):
+            return
         self._set_safe_defaults()
+        self.parameter_output_values["generation_status"] = "resolving_inputs"
         params = self._get_parameters()
+        if not params["resume_generation_id"]:
+            # Resolve and validate the selected ImageAsset/VideoPicker Shot
+            # before destination preparation, authentication, uploads, or a
+            # billable Broker create-task request. Prompt text remains manual.
+            params = self._resolve_exact_shot_generation_inputs(params)
         self._validate_parameters(params)
         resume_generation_id = params["resume_generation_id"]
         decode_verifier: _MP4DecodeVerifier | None = None
 
         # Resolve the save target before the billable Broker POST.
+        self.parameter_output_values["generation_status"] = "preparing_output"
         destination = self._output_file.build_file()
         self._preflight_output_destination(destination)
         if not resume_generation_id:
             # A new render can incur usage. Prove that this installation can
             # decode-verify the completed MP4 before contacting/authenticating
             # with the Broker or preparing any temporary reference uploads.
-            decode_verifier = await asyncio.to_thread(
+            decode_verifier = await self._run_blocking_generation_stage(
                 _resolve_mp4_decode_verifier
             )
+            if not self._runtime_node_is_live(require_registered=True):
+                return
             logger.info(
                 "%s using MP4 decode verifier %s (%s)",
                 self.name,
@@ -3502,7 +5782,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 decode_verifier.backend,
             )
         # The Broker generation request is the sole usage/quota/accounting authority.
+        self.parameter_output_values["generation_status"] = "connecting_broker"
         bridge = await self._ensure_broker_connected()
+        if not self._runtime_node_is_live(require_registered=True):
+            return
 
         started = self._monotonic()
         timeout = params["generation_timeout_seconds"]
@@ -3512,6 +5795,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
         if resume_generation_id:
             generation_id = self._validate_task_id(resume_generation_id)
+            if not self._runtime_node_is_live(require_registered=True):
+                return
             self._set_broker_task_outputs(
                 {"id": generation_id, "status": "resuming"},
                 generation_id=generation_id,
@@ -3519,11 +5804,24 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
             logger.info("%s resuming FN AI Broker task %s", self.name, generation_id)
         else:
-            params = self._prepare_video_references_for_run(params)
-            payload = self._build_broker_payload(params)
+            if not self._runtime_node_is_live(require_registered=True):
+                return
+            self.parameter_output_values["generation_status"] = "preparing_media"
+            params = await self._run_blocking_generation_stage(
+                self._prepare_video_references_for_run,
+                params,
+            )
+            if not self._runtime_node_is_live(require_registered=True):
+                return
+            payload = await self._run_blocking_generation_stage(
+                self._build_broker_payload,
+                params,
+            )
             client_request_id = "hmb-" + uuid4().hex
             payload["client_request_id"] = client_request_id
             self._last_broker_payload = dict(payload)
+            if not self._runtime_node_is_live(require_registered=True):
+                return
             self._set_broker_task_outputs(
                 {"id": client_request_id, "status": "submitting"},
                 generation_id=client_request_id,
@@ -3536,7 +5834,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     timeout=min(float(timeout), 1200.0),
                 )
             except _BrokerError as exc:
+                if not self._runtime_node_is_live(require_registered=True):
+                    return
                 if exc.submission_outcome_unknown:
+                    if not self._runtime_node_is_live(require_registered=True):
+                        return
                     self._submission_outcome_unknown = True
                     self.parameter_output_values["generation_status"] = (
                         "submission_unknown"
@@ -3547,10 +5849,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         "status": "submission_unknown",
                     }
                 raise
+            if not self._runtime_node_is_live(require_registered=True):
+                return
             task = self._normalize_broker_task(response)
             generation_id = str(task["id"])
             status = str(task["status"])
             self._submission_outcome_unknown = False
+            if not self._runtime_node_is_live(require_registered=True):
+                return
             self._set_broker_task_outputs(
                 task,
                 generation_id=generation_id,
@@ -3569,6 +5875,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     self._broker_terminal_failure_message(task, generation_id)
                 )
             if submission_cancelled:
+                if not self._runtime_node_is_live(require_registered=True):
+                    return
                 self.parameter_output_values["generation_status"] = "cancelled_locally"
                 raise asyncio.CancelledError(
                     "Local cancellation arrived during submission. The FN AI Broker "
@@ -3577,7 +5885,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 )
 
         while final_task is None:
+            if not self._runtime_node_is_live(require_registered=True):
+                return
             if self.is_cancellation_requested:
+                if not self._runtime_node_is_live(require_registered=True):
+                    return
                 self.parameter_output_values["generation_status"] = "cancelled_locally"
                 raise asyncio.CancelledError(
                     "Local Broker polling stopped, but the server render continues. "
@@ -3585,6 +5897,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 )
             now = self._monotonic()
             if now >= deadline:
+                if not self._runtime_node_is_live(require_registered=True):
+                    return
                 self.parameter_output_values["generation_status"] = "timed_out"
                 raise TimeoutError(
                     f"FN AI Broker task {generation_id} did not finish within "
@@ -3597,6 +5911,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 generation_id,
                 timeout=min(60.0, max(1.0, deadline - now)),
             )
+            if not self._runtime_node_is_live(require_registered=True):
+                return
             task = self._normalize_broker_task(
                 response,
                 fallback_job_id=generation_id,
@@ -3604,6 +5920,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if str(task["id"]) != generation_id:
                 raise _BrokerError("FN AI Broker returned a different task ID.")
             status = str(task["status"])
+            if not self._runtime_node_is_live(require_registered=True):
+                return
             self._set_broker_task_outputs(
                 task,
                 generation_id=generation_id,
@@ -3625,7 +5943,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             remaining = deadline - self._monotonic()
             if remaining > 0:
                 await self._sleep(min(poll_interval, remaining))
+                if not self._runtime_node_is_live(require_registered=True):
+                    return
 
+        if not self._runtime_node_is_live(require_registered=True):
+            return
         await self._save_completed_task(
             final_task,
             generation_id,
@@ -3635,6 +5957,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
 
     async def aprocess(self) -> None:
+        if not self._runtime_node_is_live(require_registered=True):
+            return
         self._generation_run_active.set()
         try:
             await self._aprocess_impl()
@@ -3642,10 +5966,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self._generation_run_active.clear()
 
     async def _aprocess_impl(self) -> None:
+        if not self._runtime_node_is_live(require_registered=True):
+            return
         self._clear_execution_status()
         try:
             await self._process_generation()
         except asyncio.CancelledError:
+            if not self._runtime_node_is_live(require_registered=True):
+                return
             generation_id = str(
                 self.parameter_output_values.get("generation_id") or ""
             ).strip()
@@ -3669,6 +5997,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
             raise
         except Exception as exc:
+            if not self._runtime_node_is_live(require_registered=True):
+                return
             safe_message = self._safe_exception_message(exc)
             generation_id = str(
                 self.parameter_output_values.get("generation_id") or ""
@@ -3699,6 +6029,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 isinstance(exc, _BrokerError) and exc.submission_outcome_unknown
             )
             if submission_unknown:
+                if not self._runtime_node_is_live(require_registered=True):
+                    return
                 self.parameter_output_values["generation_status"] = (
                     "submission_unknown"
                 )
@@ -3709,8 +6041,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "\nTemporary local video uploads are being retained for up to "
                     "30 minutes so an accepted remote task can still fetch them."
                 )
-            elif not self.parameter_output_values.get("generation_status"):
+            elif (
+                not self.parameter_output_values.get("generation_status")
+                or generation_status in LOCAL_PRE_SUBMISSION_STATUSES
+            ):
+                if not self._runtime_node_is_live(require_registered=True):
+                    return
                 self.parameter_output_values["generation_status"] = "failed"
+            if not self._runtime_node_is_live(require_registered=True):
+                return
             self._set_status_results(
                 was_successful=False,
                 result_details=f"FAILURE: {safe_message}",

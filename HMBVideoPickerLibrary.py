@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from fractions import Fraction
 from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import quote, unquote, urlparse
@@ -30,12 +30,12 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 import _hmb_screen_space as _screen_space
+import _hmb_shot_routing as _shot_routing
 
 
 def _load_hmb_common():
     module_path = _THIS_DIR / "_hmb_common.py"
-    module_key = f"{module_path.resolve()}:{module_path.stat().st_mtime_ns}"
-    module_name = "_hmb_gp_production_common_" + hashlib.sha1(module_key.encode("utf-8")).hexdigest()[:12]
+    module_name = "_hmb_gp_production_common"
     existing = sys.modules.get(module_name)
     if existing is not None and Path(getattr(existing, "__file__", "")).resolve() == module_path.resolve():
         return existing
@@ -85,6 +85,19 @@ WIDGET_COMMAND_PARAMETER = "HMB_PICKER_COMMAND"
 COMMAND_WIDGET_NAME = "HMBVideoPickerCommandBridgeWidget"
 COMMAND_SCHEMA = "hmb-picker-command"
 COMMAND_VERSION = 1
+PICKER_WORKSPACE_SENSITIVE_ACTIONS = frozenset({
+    "read_scene",
+    "run_video",
+    "render_snapshot",
+    "delete_snapshot",
+    "render_original_preview",
+    "hide_original_preview",
+    "browse_maya_scene",
+    "browse_video_asset",
+    "import_video_asset",
+    "import_video_assets",
+    "import_video",
+})
 OUTPUT_FPS = 24.0
 OUTPUT_WIDTH = 1280
 OUTPUT_HEIGHT = 720
@@ -165,6 +178,9 @@ ORIGINAL_MEDIA_KIND = "maya_original_playblast"
 MASK_MEDIA_KIND = "maya_color_assignment_mask"
 PRIMARY_COLOR_VIDEO_SLOT = 1
 MAX_SELECTED_VIDEOS = 10
+# Selection/output order remains bounded to ten within the active Shot. Durable
+# catalog ownership is partitioned separately across five 10-asset Shot rows.
+MAX_REPRESENTATIVE_VIDEOS = MAX_SELECTED_VIDEOS
 MAX_VIDEO_IMPORT_BATCH = 100
 MAX_SNAPSHOT_HISTORY = 10
 # ``MAX_VIDEO_SLOTS`` remains as a compatibility name for the Maya staging and
@@ -177,6 +193,15 @@ MAX_VIDEO_SLOTS = MAX_SELECTED_VIDEOS
 # become output ports, and cannot limit or reorder the catalog selection.
 AUXILIARY_VIDEO_SLOTS = (2, 3, 4, 5)
 VIDEO_OUTPUT_PARAMETER = "VIDEO_OUT"
+SHOT_PICKER_OUTPUT_PARAMETER = "SHOT_PICKER_OUT"
+SHOT_ROUTING_SNAPSHOT_SCHEMA = "hmb-picker-shot-routing-snapshot"
+SHOT_ROUTING_SNAPSHOT_VERSION = 1
+SHOT_ROUTING_MAX_SHOTS = 5
+MAX_VIDEO_ASSETS_PER_PICKER_SHOT = 10
+MAX_PICKER_VIDEO_ASSETS = (
+    SHOT_ROUTING_MAX_SHOTS * MAX_VIDEO_ASSETS_PER_PICKER_SHOT
+)
+PICKER_DEFAULT_WORKSPACE_UUID = "00000000-0000-4000-8000-000000000001"
 VIDEO_REFERENCE_CAPABILITY_SCHEMA = "hmb-video-reference-capabilities"
 VIDEO_REFERENCE_CAPABILITY_VERSION = 1
 VIDEO_FRAME_DOMAIN_SCHEMA = "hmb-video-frame-domain"
@@ -192,10 +217,23 @@ PLAYBLAST_RESOLUTIONS = (
 )
 PICKER_START_WIDTH = 1400
 PICKER_START_HEIGHT = 1200
-PICKER_NATIVE_SIZE_VERSION = 2
+PICKER_NATIVE_SIZE_VERSION = 3
+# Version 3 repairs only the invalid outer-node heights written by the retired
+# compact-mode sizing path. Widths that still satisfy the native resize floor
+# are user-owned and remain unchanged during that one-time migration.
+PICKER_WIDGET_MIN_WIDTH = 760
 # Keep the established resize floor separate from the new-node start height.
 # Existing workflows may legitimately contain a manually resized 1151px node.
 PICKER_WIDGET_MIN_HEIGHT = 1151
+# Griptape Nodes 0.122 measures custom-widget rows before their JavaScript
+# factory is mounted.  Advertising the expanded dashboard height (1200px) for
+# a compact-first widget makes the adaptive row allocator hide the widget (and
+# the two adjacent visible rows) behind its ``Collapsed (...)`` footer, so the
+# factory never gets a chance to size the node. This positive bootstrap fits
+# the fixed header plus the standalone Picker's one empty Shot row. The widget
+# replaces it with the exact state-derived compact height after mounting and
+# restores ``PICKER_WIDGET_MIN_HEIGHT`` itself when its full view opens.
+PICKER_WIDGET_COMPACT_MOUNT_HEIGHT = 158
 # Use the same new-node outer sizing contract as HMBImageAssetLibrary. The
 # native node and full-width custom dashboard begin from one shared frame.
 PICKER_WIDGET_START_HEIGHT = PICKER_START_HEIGHT
@@ -438,41 +476,6 @@ def _validate_full_smooth_confirmation(
             f"these optional quality checks were unavailable: {', '.join(errors)}."
         )
     return report
-
-
-def _validate_screen_space_runner_confirmation(
-    result: Dict[str, Any],
-    sidecar: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    sidecar_payload = sidecar if isinstance(sidecar, dict) else {}
-    profile = _clean(
-        result.get("screen_space_pattern_profile")
-        or sidecar_payload.get("screen_space_pattern_profile")
-    )
-    options_value = (
-        result.get("screen_space_render_options")
-        if isinstance(result.get("screen_space_render_options"), dict)
-        else sidecar_payload.get("screen_space_render_options")
-    )
-    options = dict(options_value) if isinstance(options_value, dict) else {}
-    errors = []
-    if profile != SCREEN_SPACE_PATTERN_PROFILE:
-        errors.append("pattern profile")
-    for field in (
-        "output_transform_disabled",
-        "multisample_disabled",
-        "line_aa_disabled",
-        "ssao_disabled",
-        "motion_blur_disabled",
-    ):
-        if options.get(field) is not True:
-            errors.append(field)
-    if errors:
-        raise RuntimeError(
-            "Maya did not confirm deterministic categorical screen-space IDs "
-            f"({', '.join(errors)})."
-        )
-    return options
 
 
 def _validate_world_pattern_runner_confirmation(
@@ -3592,6 +3595,8 @@ def _configure_compact_output(
     name: str,
     output_type: str,
     display_name: str,
+    *,
+    hidden: bool = False,
 ) -> None:
     """Keep a data output connectable while hiding its read-only value editor."""
     if parameter is None:
@@ -3603,6 +3608,8 @@ def _configure_compact_output(
         ("hide_property", True),
         ("settable", False),
     ]
+    if hidden:
+        attributes.append(("hide", True))
     mode = _mode_set("OUTPUT")
     if mode is not None:
         attributes.append(("allowed_modes", mode))
@@ -3619,16 +3626,30 @@ def _configure_compact_output(
             _diagnostic_exception(f"Output {name} attribute configuration failed for {attribute}", exc)
     try:
         options = dict(getattr(parameter, "ui_options", {}) or {})
-        options.update({
-            "display_name": display_name,
-            "compact": True,
-            "height": 24,
-            "is_full_width": False,
-            "hide_property": True,
-        })
-        options.pop("hide", None)
-        options.pop("hide_handles", None)
-        options.pop("hide_label", None)
+        if hidden:
+            options.update({
+                "display_name": "",
+                "compact": True,
+                "height": 1,
+                "min_height": 0,
+                "max_height": 1,
+                "is_full_width": True,
+                "hide": True,
+                "hide_property": True,
+                "hide_label": True,
+                "hide_handles": True,
+            })
+        else:
+            options.update({
+                "display_name": display_name,
+                "compact": True,
+                "height": 24,
+                "is_full_width": False,
+                "hide_property": True,
+            })
+            options.pop("hide", None)
+            options.pop("hide_handles", None)
+            options.pop("hide_label", None)
         setattr(parameter, "ui_options", options)
     except Exception as exc:
         _diagnostic_exception(f"Output {name} UI option configuration failed", exc)
@@ -3642,6 +3663,7 @@ def _add_output(
     tooltip: str,
     *,
     display_name: str | None = None,
+    hidden: bool = False,
 ) -> None:
     clean_display_name = str(display_name or name)
     if parameter_exists(node, name):
@@ -3650,6 +3672,7 @@ def _add_output(
             name,
             output_type,
             clean_display_name,
+            hidden=hidden,
         )
         return
     base: Dict[str, Any] = {
@@ -3662,11 +3685,16 @@ def _add_output(
         "hide_property": True,
         "tooltip": tooltip,
         "ui_options": {
-            "display_name": clean_display_name,
+            "display_name": "" if hidden else clean_display_name,
             "compact": True,
-            "height": 24,
-            "is_full_width": False,
+            "height": 1 if hidden else 24,
+            "min_height": 0 if hidden else 24,
+            "max_height": 1 if hidden else 24,
+            "is_full_width": bool(hidden),
+            "hide": bool(hidden),
             "hide_property": True,
+            "hide_label": bool(hidden),
+            "hide_handles": bool(hidden),
         },
     }
     mode = _mode_set("OUTPUT")
@@ -3689,11 +3717,16 @@ def _add_output(
         "hide_property": True,
         "tooltip": tooltip,
         "ui_options": {
-            "display_name": clean_display_name,
+            "display_name": "" if hidden else clean_display_name,
             "compact": True,
-            "height": 24,
-            "is_full_width": False,
+            "height": 1 if hidden else 24,
+            "min_height": 0 if hidden else 24,
+            "max_height": 1 if hidden else 24,
+            "is_full_width": bool(hidden),
+            "hide": bool(hidden),
             "hide_property": True,
+            "hide_label": bool(hidden),
+            "hide_handles": bool(hidden),
         },
     }
     attempts.append(legacy)
@@ -3706,6 +3739,7 @@ def _add_output(
         name,
         output_type,
         clean_display_name,
+        hidden=hidden,
     )
 
 
@@ -3719,6 +3753,7 @@ def _add_picker_output(node: Any) -> None:
         "",
         "Maya HMB binding report for HMBPromptLibrary PICKER_IN.",
         display_name="PICKER OUT",
+        hidden=True,
     )
 
 
@@ -3734,7 +3769,45 @@ def _add_video_output(node: Any) -> None:
             "selected videos in PICKER_OUT and transient @video1 through @video10."
         ),
         display_name="VIDEO OUT",
+        hidden=True,
     )
+
+
+def _add_shot_picker_output(node: Any) -> None:
+    """Register the hidden compact dependency used by automatic Shot routing."""
+    _add_output(
+        node,
+        SHOT_PICKER_OUTPUT_PARAMETER,
+        "dict",
+        {},
+        "Compact Shot catalog dependency. Media is resolved through the private atomic snapshot API.",
+        display_name="SHOT PICKER OUT",
+        hidden=True,
+    )
+    parameter = _get_parameter_obj(node, SHOT_PICKER_OUTPUT_PARAMETER)
+    if parameter is not None:
+        for attribute in ("hide", "hide_property"):
+            try:
+                setattr(parameter, attribute, True)
+            except Exception:
+                pass
+        options = getattr(parameter, "ui_options", None)
+        if isinstance(options, dict):
+            options.update({
+                "display_name": "",
+                "height": 1,
+                "min_height": 0,
+                "max_height": 1,
+                "is_full_width": True,
+                "hide": True,
+                "hide_property": True,
+                "hide_label": True,
+                "hide_handles": True,
+            })
+            try:
+                parameter.ui_options = options
+            except Exception:
+                pass
 
 
 def _add_maya_scene_picker(node: Any) -> None:
@@ -3860,6 +3933,7 @@ def _reorder_video_picker_parameters(node: Any, active_count: int = 0) -> None:
     preferred = [
         "PICKER_OUT",
         VIDEO_OUTPUT_PARAMETER,
+        SHOT_PICKER_OUTPUT_PARAMETER,
         "MAYA_SCENE",
         WIDGET_COMMAND_PARAMETER,
         WIDGET_STATE_PARAMETER,
@@ -3900,10 +3974,13 @@ def _reorder_video_picker_parameters(node: Any, active_count: int = 0) -> None:
 
 
 def _default_widget_state() -> Dict[str, Any]:
+    picker_workspace_uuid = PICKER_DEFAULT_WORKSPACE_UUID
     return {
         "schema": "maya-video-picker-state",
         "state_revision": 0,
         "state_writer": "",
+        "writer_runtime_instance_id": "",
+        "writer_lifecycle_generation": 0,
         "state_published_at_ms": 0,
         "frontend_seen_revision": 0,
         "scene_stage": "EMPTY",
@@ -3934,6 +4011,8 @@ def _default_widget_state() -> Dict[str, Any]:
         "snapshot_video_slot": 0,
         "snapshot_data_uri": "",
         "snapshot_path": "",
+        "snapshot_url": "",
+        "snapshot_sha256": "",
         "active_snapshot_uid": "",
         "viewport_mode": "video",
         "snapshot_request_video_uid": "",
@@ -3991,7 +4070,7 @@ def _default_widget_state() -> Dict[str, Any]:
         "selected_video_slot": 1,
         "active_slot_count": 1,
         "selected_video_count": 0,
-        "max_selected_videos": MAX_SELECTED_VIDEOS,
+        "max_selected_videos": MAX_REPRESENTATIVE_VIDEOS,
         "selection_id": "",
         "preview_video_uid": "",
         "selected_video_uid": "",
@@ -4023,12 +4102,46 @@ def _default_widget_state() -> Dict[str, Any]:
         "outliner_expanded": [],
         "cameras": [],
         "selected_camera": "",
-        "language": "en",
+        "language": "ko",
         "outliner_search": "",
         "videos": [],
         "slot_assignments": [{"video_slot": 1, "bindings": []}],
         "slot_visibility": [{"video_slot": 1, "hidden_paths": []}],
         "slot_recovery_fallbacks": [],
+        "shot_publisher_instance_uuid": "",
+        "channel_uuid": "",
+        "shot_uuid": "",
+        "shot_number": 0,
+        "shot_name": "",
+        "shot_selections": [],
+        # Last validated ImageAsset catalog authority. These fields survive
+        # reload/publisher loss so the first callback in a new runtime cannot
+        # replay an older catalog or authorize destructive Shot removal.
+        "accepted_shot_catalog_publisher_instance_uuid": "",
+        "accepted_shot_catalog_channel_uuid": "",
+        "accepted_shot_catalog_generation": 0,
+        "accepted_shot_catalog_metadata_sha256": "",
+        # ImageAsset owns Shot existence.  A standalone/new Picker starts with
+        # exactly one local 01 workspace; a validated ImageAsset catalog later
+        # expands this list to its actual 1..5 Shot count.
+        "picker_shots": [{
+            "workspace_uuid": picker_workspace_uuid,
+            "number": 1,
+            "name": "Shot 1",
+            "custom_name": False,
+            "revision": 0,
+            "bound_shot_uuid": "",
+            "video_asset_uids": [],
+            "selected_video_uids": [],
+            "preview_video_uid": "",
+            "scene_draft_path": "",
+            "current_frame": 0.0,
+            "viewport_mode": "video",
+            "active_snapshot_uid": "",
+            "selected_video_slot": 1,
+        }],
+        "active_picker_shot_uuid": picker_workspace_uuid,
+        "picker_legacy_membership_fallbacks": {},
     }
 
 
@@ -4036,8 +4149,1009 @@ def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _sha256_canonical(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _clean(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _uuid_text(value: Any) -> str:
+    try:
+        return str(uuid.UUID(_clean(value)))
+    except (ValueError, TypeError, AttributeError):
+        return ""
+
+
+def _normalize_shot_selection_fields(state: Dict[str, Any]) -> None:
+    """Normalize only durable subscriber identity and per-shot video membership."""
+    state["shot_publisher_instance_uuid"] = _uuid_text(
+        state.get("shot_publisher_instance_uuid")
+    )
+    state["channel_uuid"] = _uuid_text(state.get("channel_uuid"))
+    state["shot_uuid"] = _uuid_text(state.get("shot_uuid"))
+    try:
+        shot_number = int(state.get("shot_number") or 0)
+    except (TypeError, ValueError, OverflowError):
+        shot_number = 0
+    state["shot_number"] = shot_number if 1 <= shot_number <= SHOT_ROUTING_MAX_SHOTS else 0
+    state["shot_name"] = _clean(state.get("shot_name"))[:128]
+
+    rows: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    raw_rows = state.get("shot_selections")
+    for raw in raw_rows[:SHOT_ROUTING_MAX_SHOTS] if isinstance(raw_rows, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        shot_uuid = _uuid_text(raw.get("shot_uuid"))
+        if not shot_uuid or shot_uuid in seen:
+            continue
+        seen.add(shot_uuid)
+        try:
+            number = int(raw.get("number") or len(rows) + 1)
+        except (TypeError, ValueError, OverflowError):
+            number = len(rows) + 1
+        number = max(1, min(SHOT_ROUTING_MAX_SHOTS, number))
+        try:
+            revision = max(0, int(raw.get("revision") or 0))
+        except (TypeError, ValueError, OverflowError):
+            revision = 0
+        selected_uids: List[str] = []
+        for value in (
+            raw.get("selected_video_uids")
+            if isinstance(raw.get("selected_video_uids"), list)
+            else []
+        ):
+            uid = _clean(value)
+            if uid and uid not in selected_uids:
+                selected_uids.append(uid)
+            if len(selected_uids) >= MAX_SELECTED_VIDEOS:
+                break
+        rows.append(
+            {
+                "shot_uuid": shot_uuid,
+                "number": number,
+                "name": _clean(raw.get("name"))[:128] or f"Shot {number}",
+                "revision": revision,
+                "selected_video_uids": selected_uids,
+            }
+        )
+    if state["shot_uuid"] and state["shot_uuid"] not in seen:
+        number = state["shot_number"] or min(len(rows) + 1, SHOT_ROUTING_MAX_SHOTS)
+        rows.append(
+            {
+                "shot_uuid": state["shot_uuid"],
+                "number": number,
+                "name": state["shot_name"] or f"Shot {number}",
+                "revision": 0,
+                "selected_video_uids": [],
+            }
+        )
+        rows = rows[:SHOT_ROUTING_MAX_SHOTS]
+    # A compact catalog is an option source, not an activation signal.  A
+    # blank durable Shot identity is the independent ``Only`` mode and must
+    # stay blank until the user explicitly chooses one of the advertised
+    # rows.
+    if not state["shot_uuid"]:
+        state["shot_number"] = 0
+        state["shot_name"] = ""
+    state["shot_selections"] = rows
+
+
+def _normalize_shot_catalog_watermark_fields(state: Dict[str, Any]) -> None:
+    """Normalize the durable last-accepted ImageAsset catalog watermark."""
+
+    publisher = _uuid_text(
+        state.get("accepted_shot_catalog_publisher_instance_uuid")
+    )
+    channel = _uuid_text(state.get("accepted_shot_catalog_channel_uuid"))
+    try:
+        generation = max(
+            0,
+            int(state.get("accepted_shot_catalog_generation") or 0),
+        )
+    except (TypeError, ValueError, OverflowError):
+        generation = 0
+    metadata_sha256 = _clean(
+        state.get("accepted_shot_catalog_metadata_sha256")
+    ).casefold()
+    if not re.fullmatch(r"[0-9a-f]{64}", metadata_sha256):
+        metadata_sha256 = ""
+    if not (publisher and channel and generation > 0 and metadata_sha256):
+        publisher = ""
+        channel = ""
+        generation = 0
+        metadata_sha256 = ""
+    state.update({
+        "accepted_shot_catalog_publisher_instance_uuid": publisher,
+        "accepted_shot_catalog_channel_uuid": channel,
+        "accepted_shot_catalog_generation": generation,
+        "accepted_shot_catalog_metadata_sha256": metadata_sha256,
+    })
+
+
+def _shot_catalog_deletion_watermark_matches(
+    state: Dict[str, Any],
+    remote_rows: Sequence[Dict[str, Any]],
+) -> bool:
+    """Return whether rows exactly match the durable validated catalog."""
+
+    publisher = _uuid_text(state.get("shot_publisher_instance_uuid"))
+    channel = _uuid_text(state.get("channel_uuid"))
+    watermark_publisher = _uuid_text(
+        state.get("accepted_shot_catalog_publisher_instance_uuid")
+    )
+    watermark_channel = _uuid_text(
+        state.get("accepted_shot_catalog_channel_uuid")
+    )
+    try:
+        generation = int(
+            state.get("accepted_shot_catalog_generation") or 0
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+    metadata_sha256 = _clean(
+        state.get("accepted_shot_catalog_metadata_sha256")
+    ).casefold()
+    if not (
+        publisher
+        and channel
+        and publisher == watermark_publisher
+        and channel == watermark_channel
+        and generation > 0
+        and re.fullmatch(r"[0-9a-f]{64}", metadata_sha256)
+        and remote_rows
+    ):
+        return False
+    shots = [
+        {
+            "shot_uuid": _uuid_text(row.get("shot_uuid")),
+            "number": int(row.get("number") or 0),
+            "name": _clean(row.get("name"))[:128],
+            "revision": max(0, int(row.get("revision") or 0)),
+        }
+        for row in remote_rows
+    ]
+    return metadata_sha256 == _sha256_canonical({
+        "channel_uuid": channel,
+        "generation": generation,
+        "shots": shots,
+    })
+
+
+def _picker_selected_video_uids(state: Dict[str, Any]) -> List[str]:
+    selected = [
+        item
+        for item in state.get("videos", [])
+        if isinstance(item, dict) and bool(item.get("selected"))
+    ]
+    selected.sort(key=lambda item: _positive_int(item.get("selection_order")))
+    result: List[str] = []
+    for item in selected:
+        uid = _clean(item.get("video_uid") or item.get("source_uid"))
+        if uid and uid not in result:
+            result.append(uid)
+        if len(result) >= MAX_SELECTED_VIDEOS:
+            break
+    return result
+
+
+def _picker_representative_video_uids(
+    values: Any,
+    preview_video_uid: Any = "",
+    known_video_uids: Optional[set[str]] = None,
+) -> List[str]:
+    """Return the bounded durable Shot order; preview remains a separate cursor."""
+
+    candidates: List[str] = []
+    for raw_uid in values if isinstance(values, (list, tuple)) else []:
+        uid = _clean(raw_uid)
+        if (
+            uid
+            and (known_video_uids is None or uid in known_video_uids)
+            and uid not in candidates
+        ):
+            candidates.append(uid)
+        if len(candidates) >= MAX_REPRESENTATIVE_VIDEOS:
+            break
+    return candidates
+
+
+def _picker_workspace_uuid_for_number(number: int) -> str:
+    """Return one stable local identity for a legacy positional workspace."""
+    normalized_number = max(1, min(SHOT_ROUTING_MAX_SHOTS, int(number or 1)))
+    if normalized_number == 1:
+        return PICKER_DEFAULT_WORKSPACE_UUID
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"hmb-video-picker-workspace:{normalized_number}",
+    ))
+
+
+def _picker_workspace_uuid_for_bound_shot(shot_uuid: Any) -> str:
+    """Return a stable workspace identity for a newly discovered Image Shot."""
+
+    normalized = _uuid_text(shot_uuid)
+    if not normalized:
+        return ""
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"hmb-video-picker-image-shot:{normalized}",
+    ))
+
+
+def _new_picker_workspace_row(
+    number: int,
+    *,
+    bound_shot_uuid: str = "",
+    video_asset_uids: Optional[Sequence[str]] = None,
+    selected_video_uids: Optional[Sequence[str]] = None,
+    preview_video_uid: str = "",
+    state: Optional[Dict[str, Any]] = None,
+    workspace_uuid: str = "",
+) -> Dict[str, Any]:
+    source = state if isinstance(state, dict) else {}
+    try:
+        normalized_number = max(
+            1,
+            min(SHOT_ROUTING_MAX_SHOTS, int(number or 1)),
+        )
+    except Exception:
+        normalized_number = 1
+    try:
+        current_frame = float(source.get("current_frame") or 0.0)
+        if not math.isfinite(current_frame):
+            current_frame = 0.0
+    except Exception:
+        current_frame = 0.0
+    try:
+        selected_video_slot = max(
+            1,
+            int(source.get("selected_video_slot") or 1),
+        )
+    except Exception:
+        selected_video_slot = 1
+    representative_uids = _picker_representative_video_uids(
+        list(selected_video_uids or []),
+        preview_video_uid,
+    )
+    asset_uids = _picker_representative_video_uids(
+        list(video_asset_uids or selected_video_uids or []),
+    )
+    representative_uids = [
+        uid for uid in representative_uids if uid in set(asset_uids)
+    ]
+    requested_preview_uid = _clean(preview_video_uid)
+    representative_uid = (
+        requested_preview_uid
+        if requested_preview_uid in representative_uids
+        else (representative_uids[0] if representative_uids else "")
+    )
+    return {
+        "workspace_uuid": (
+            _uuid_text(workspace_uuid)
+            or _picker_workspace_uuid_for_number(normalized_number)
+        ),
+        "number": normalized_number,
+        "name": f"Shot {normalized_number}",
+        "custom_name": False,
+        "revision": 0,
+        "bound_shot_uuid": _uuid_text(bound_shot_uuid),
+        "video_asset_uids": asset_uids,
+        "selected_video_uids": representative_uids,
+        "preview_video_uid": representative_uid,
+        "scene_draft_path": _maya_scene_path_text(source.get("scene_draft_path")),
+        "current_frame": current_frame,
+        "viewport_mode": (
+            "snapshot"
+            if _clean(source.get("viewport_mode")).lower() == "snapshot"
+            else "video"
+        ),
+        "active_snapshot_uid": _clean(source.get("active_snapshot_uid")),
+        "selected_video_slot": selected_video_slot,
+    }
+
+
+def _normalize_picker_workspace_fields(
+    state: Dict[str, Any],
+    raw_picker_shots: Any,
+    *,
+    picker_shots_present: bool,
+) -> None:
+    """Normalize ImageAsset-sized, independently owned video workspaces.
+
+    ``video_asset_uids`` is the durable ownership list for a row and
+    ``selected_video_uids`` is only its ordered output subset. Legacy one-page
+    states migrate to Shot 1 only. A validated ImageAsset catalog owns visible
+    Shot existence; rows are matched by ``bound_shot_uuid`` so renumbering never
+    moves media to another Shot. Merely losing a publisher is not an
+    authoritative deletion, so last-known non-empty/bound rows remain durable.
+    """
+
+    catalog = [
+        dict(item)
+        for item in state.get("videos", [])
+        if isinstance(item, dict)
+        and _clean(item.get("video_uid") or item.get("source_uid"))
+    ]
+    remote_rows = [
+        row
+        for row in state.get("shot_selections", [])
+        if isinstance(row, dict) and _uuid_text(row.get("shot_uuid"))
+    ]
+    catalog_present = bool(
+        state.get("shot_publisher_instance_uuid")
+        and state.get("channel_uuid")
+        and remote_rows
+    )
+    # The remote rows may shape a fresh/unbound view, but only a catalog whose
+    # exact generation+metadata hash matches the durable accepted watermark may
+    # delete an existing bound workspace or any media it owns.
+    catalog_authoritative = bool(
+        catalog_present
+        and _shot_catalog_deletion_watermark_matches(state, remote_rows)
+    )
+    remote_rows.sort(key=lambda row: int(row.get("number") or 0))
+    remote_by_uuid = {
+        _uuid_text(row.get("shot_uuid")): row for row in remote_rows
+    }
+    source_rows = (
+        raw_picker_shots
+        if picker_shots_present and isinstance(raw_picker_shots, list)
+        else []
+    )
+    valid_source_rows = [
+        raw for raw in source_rows[:SHOT_ROUTING_MAX_SHOTS]
+        if isinstance(raw, dict)
+    ]
+    legacy_one_page = not picker_shots_present or (
+        len(valid_source_rows) == 1
+        and not _uuid_text(valid_source_rows[0].get("bound_shot_uuid"))
+    )
+
+    target_rows: List[tuple[int, Optional[Dict[str, Any]], Dict[str, Any]]] = []
+    retained_source_ids: set[int] = set()
+    preserve_bound_shape = bool(
+        catalog_present
+        and not catalog_authoritative
+        and any(
+            _uuid_text(raw.get("bound_shot_uuid"))
+            for raw in valid_source_rows
+        )
+    )
+    if preserve_bound_shape:
+        # A stale/unwatermarked five-row callback must not consume the row cap
+        # before a last-known bound owner can be retained. Preserve the entire
+        # existing shape until reconciliation has accepted and persisted the
+        # callback watermark; otherwise an omitted row's media can be orphaned
+        # and silently reassigned to a different Shot.
+        for index, raw in enumerate(valid_source_rows, start=1):
+            try:
+                raw_number = max(
+                    1,
+                    min(
+                        SHOT_ROUTING_MAX_SHOTS,
+                        int(raw.get("number") or index),
+                    ),
+                )
+            except Exception:
+                raw_number = index
+            retained_source_ids.add(id(raw))
+            target_rows.append((
+                raw_number,
+                {
+                    "shot_uuid": _uuid_text(raw.get("bound_shot_uuid")),
+                    "name": _clean(raw.get("name"))[:128],
+                },
+                raw,
+            ))
+    elif catalog_present:
+        bound_sources = {
+            _uuid_text(raw.get("bound_shot_uuid")): raw
+            for raw in valid_source_rows
+            if _uuid_text(raw.get("bound_shot_uuid"))
+        }
+        unbound_by_number: Dict[int, Dict[str, Any]] = {}
+        for raw in valid_source_rows:
+            if _uuid_text(raw.get("bound_shot_uuid")):
+                continue
+            try:
+                raw_number = int(raw.get("number") or 0)
+            except Exception:
+                raw_number = 0
+            if 1 <= raw_number <= SHOT_ROUTING_MAX_SHOTS:
+                unbound_by_number.setdefault(raw_number, raw)
+        for index, remote in enumerate(remote_rows[:SHOT_ROUTING_MAX_SHOTS], start=1):
+            remote_uuid = _uuid_text(remote.get("shot_uuid"))
+            try:
+                remote_number = max(
+                    1,
+                    min(SHOT_ROUTING_MAX_SHOTS, int(remote.get("number") or index)),
+                )
+            except Exception:
+                remote_number = index
+            raw = bound_sources.get(remote_uuid)
+            if raw is None:
+                raw = unbound_by_number.get(remote_number, {})
+            if raw:
+                retained_source_ids.add(id(raw))
+            target_rows.append((remote_number, remote, raw or {}))
+        if not catalog_authoritative:
+            # A catalog without a matching durable watermark is not deletion
+            # authority (for example the first stale callback after reload).
+            # It may add/update visible options, but every last-known bound row
+            # remains until a validated newer watermark is committed.
+            for raw in valid_source_rows:
+                if (
+                    id(raw) in retained_source_ids
+                    or len(target_rows) >= SHOT_ROUTING_MAX_SHOTS
+                ):
+                    continue
+                try:
+                    raw_number = max(
+                        1,
+                        min(
+                            SHOT_ROUTING_MAX_SHOTS,
+                            int(raw.get("number") or len(target_rows) + 1),
+                        ),
+                    )
+                except Exception:
+                    raw_number = min(
+                        SHOT_ROUTING_MAX_SHOTS,
+                        len(target_rows) + 1,
+                    )
+                retained_source_ids.add(id(raw))
+                target_rows.append((raw_number, None, raw))
+    else:
+        # A never-configured Picker is exactly 01. Preserve additional rows only
+        # when they contain authored media or a last-known ImageAsset identity;
+        # publisher absence alone must not destroy durable Picker history.
+        last_meaningful_index = 0
+        for index, raw in enumerate(valid_source_rows, start=1):
+            meaningful = bool(
+                _uuid_text(raw.get("bound_shot_uuid"))
+                or raw.get("video_asset_uids")
+                or raw.get("selected_video_uids")
+                or _clean(raw.get("preview_video_uid"))
+            )
+            if meaningful:
+                last_meaningful_index = index
+        retained_count = max(1, last_meaningful_index)
+        retained_sources = valid_source_rows[:retained_count]
+        if not retained_sources:
+            retained_sources = [{}]
+        for index, raw in enumerate(retained_sources, start=1):
+            if raw:
+                retained_source_ids.add(id(raw))
+            target_rows.append((index, None, raw))
+
+    # A valid newer ImageAsset catalog is the sole authority allowed to delete
+    # a Shot. Remove only the media owned by a bound row that disappeared from
+    # that catalog; do not reallocate it as an orphan to another Shot.
+    removed_workspace_uuids: set[str] = set()
+    removed_video_uids: set[str] = set()
+    retained_claims: set[str] = set()
+    for raw in valid_source_rows:
+        if id(raw) in retained_source_ids:
+            retained_claims.update(
+                _clean(uid)
+                for uid in (
+                    raw.get("video_asset_uids")
+                    if isinstance(raw.get("video_asset_uids"), list)
+                    else []
+                )
+                if _clean(uid)
+            )
+            continue
+        bound_uuid = _uuid_text(raw.get("bound_shot_uuid"))
+        if not catalog_authoritative or not bound_uuid or bound_uuid in remote_by_uuid:
+            continue
+        workspace_uuid = _uuid_text(raw.get("workspace_uuid"))
+        if workspace_uuid:
+            removed_workspace_uuids.add(workspace_uuid)
+        removed_video_uids.update(
+            _clean(uid)
+            for uid in (
+                raw.get("video_asset_uids")
+                if isinstance(raw.get("video_asset_uids"), list)
+                else []
+            )
+            if _clean(uid)
+        )
+    removed_video_uids.difference_update(retained_claims)
+    if removed_workspace_uuids or removed_video_uids:
+        catalog = [
+            item for item in catalog
+            if _clean(item.get("video_uid") or item.get("source_uid"))
+            not in removed_video_uids
+            and _uuid_text(item.get("picker_shot_uuid"))
+            not in removed_workspace_uuids
+        ]
+        state["videos"] = catalog
+
+    catalog_uids = [
+        _clean(item.get("video_uid") or item.get("source_uid"))
+        for item in catalog
+    ]
+    known_video_uids = set(catalog_uids)
+    global_selected = _picker_selected_video_uids(state)
+    global_preview = _clean(
+        state.get("preview_video_uid") or state.get("selected_video_uid")
+    )
+    snapshot_uids = {
+        _clean(item.get("snapshot_uid"))
+        for item in state.get("snapshots", [])
+        if isinstance(item, dict) and _clean(item.get("snapshot_uid"))
+    }
+
+    rows: List[Dict[str, Any]] = []
+    source_by_workspace: Dict[str, Dict[str, Any]] = {}
+    seen_workspace_uuids: set[str] = set()
+    for number, remote, raw in target_rows:
+        raw_name = _clean(raw.get("name"))[:128]
+        custom_name = (
+            bool(raw.get("custom_name"))
+            if "custom_name" in raw
+            else bool(raw.get("name_is_custom"))
+            if "name_is_custom" in raw
+            else bool(raw_name and raw_name != f"Shot {number}")
+        )
+        workspace_uuid = _uuid_text(raw.get("workspace_uuid"))
+        if not workspace_uuid or workspace_uuid in seen_workspace_uuids:
+            workspace_uuid = (
+                _picker_workspace_uuid_for_bound_shot(
+                    remote.get("shot_uuid") if remote else ""
+                )
+                or _picker_workspace_uuid_for_number(number)
+            )
+            if workspace_uuid in seen_workspace_uuids:
+                workspace_uuid = str(uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"hmb-video-picker-workspace:{number}:{len(rows)}:duplicate",
+                ))
+        seen_workspace_uuids.add(workspace_uuid)
+
+        bound_shot_uuid = _uuid_text(
+            remote.get("shot_uuid") if remote else raw.get("bound_shot_uuid")
+        )
+        remote_name = _clean(remote.get("name"))[:128] if remote else ""
+
+        active_snapshot_uid = _clean(raw.get("active_snapshot_uid"))
+        if active_snapshot_uid not in snapshot_uids:
+            active_snapshot_uid = ""
+        try:
+            current_frame = float(raw.get("current_frame") or 0.0)
+            if not math.isfinite(current_frame):
+                current_frame = 0.0
+        except Exception:
+            current_frame = 0.0
+        try:
+            revision = max(0, int(raw.get("revision") or 0))
+        except Exception:
+            revision = 0
+        try:
+            selected_video_slot = max(1, int(raw.get("selected_video_slot") or 1))
+        except Exception:
+            selected_video_slot = 1
+        row = {
+            "workspace_uuid": workspace_uuid,
+            "number": number,
+            "name": (
+                raw_name if custom_name and raw_name
+                else remote_name or f"Shot {number}"
+            ),
+            "custom_name": custom_name,
+            "revision": revision,
+            "bound_shot_uuid": bound_shot_uuid,
+            "video_asset_uids": [],
+            "selected_video_uids": [],
+            "preview_video_uid": "",
+            "scene_draft_path": _maya_scene_path_text(raw.get("scene_draft_path")),
+            "current_frame": current_frame,
+            "viewport_mode": (
+                "snapshot"
+                if _clean(raw.get("viewport_mode")).lower() == "snapshot"
+                and active_snapshot_uid
+                else "video"
+            ),
+            "active_snapshot_uid": active_snapshot_uid,
+            "selected_video_slot": selected_video_slot,
+        }
+        rows.append(row)
+        source_by_workspace[workspace_uuid] = raw
+
+    requested_active_uuid = (
+        _uuid_text(state.get("active_picker_shot_uuid"))
+        if picker_shots_present else ""
+    )
+    if legacy_one_page:
+        # The pre-workspace Picker was one page, regardless of the transient
+        # remote selector that happened to be active when it was saved. Keep
+        # that page and its media together as the deterministic 01 migration.
+        active_row = rows[0]
+    else:
+        active_row = next(
+            (row for row in rows if row["workspace_uuid"] == requested_active_uuid),
+            next(
+                (
+                    row for row in rows
+                    if row["bound_shot_uuid"] == _uuid_text(state.get("shot_uuid"))
+                ),
+                rows[0],
+            ),
+        )
+    state["active_picker_shot_uuid"] = active_row["workspace_uuid"]
+
+    owned_uids: set[str] = set()
+    if legacy_one_page:
+        # A legacy catalog represented one page, not five. Never silently
+        # spread its overflow into additional user-visible Shots.
+        rows[0]["video_asset_uids"] = catalog_uids[
+            :MAX_VIDEO_ASSETS_PER_PICKER_SHOT
+        ]
+        owned_uids.update(rows[0]["video_asset_uids"])
+    else:
+        # Explicit ownership is authoritative. Numeric row order deterministically
+        # resolves corrupt duplicate claims.
+        for row in rows:
+            raw = source_by_workspace.get(row["workspace_uuid"], {})
+            if "video_asset_uids" not in raw:
+                continue
+            assets = _picker_representative_video_uids(
+                raw.get("video_asset_uids"),
+                "",
+                known_video_uids,
+            )
+            for uid in assets:
+                if uid not in owned_uids:
+                    row["video_asset_uids"].append(uid)
+                    owned_uids.add(uid)
+
+        # Selected-only experimental rows predate ownership. Their membership
+        # claims are migrated before any shared-catalog orphan is allocated.
+        for row in rows:
+            raw = source_by_workspace.get(row["workspace_uuid"], {})
+            if "video_asset_uids" in raw:
+                continue
+            selected_claims = _picker_representative_video_uids(
+                raw.get("selected_video_uids"),
+                raw.get("preview_video_uid"),
+                known_video_uids,
+            )
+            for uid in selected_claims:
+                if (
+                    uid not in owned_uids
+                    and len(row["video_asset_uids"])
+                    < MAX_VIDEO_ASSETS_PER_PICKER_SHOT
+                ):
+                    row["video_asset_uids"].append(uid)
+                    owned_uids.add(uid)
+
+        # Per-record owner tags are a recovery mirror, not the primary model.
+        # Honor them only for still-unclaimed records and currently retained
+        # ImageAsset/local rows.
+        row_by_workspace = {
+            row["workspace_uuid"]: row for row in rows
+        }
+        for item in catalog:
+            uid = _clean(item.get("video_uid") or item.get("source_uid"))
+            tagged_row = row_by_workspace.get(
+                _uuid_text(item.get("picker_shot_uuid"))
+            )
+            if (
+                uid in owned_uids
+                or tagged_row is None
+                or len(tagged_row["video_asset_uids"])
+                >= MAX_VIDEO_ASSETS_PER_PICKER_SHOT
+            ):
+                continue
+            tagged_row["video_asset_uids"].append(uid)
+            owned_uids.add(uid)
+
+        allocation_rows = [active_row] + [
+            row for row in rows if row is not active_row
+        ]
+        for uid in catalog_uids:
+            if uid in owned_uids or len(owned_uids) >= MAX_PICKER_VIDEO_ASSETS:
+                continue
+            target_row = next(
+                (
+                    row
+                    for row in allocation_rows
+                    if len(row["video_asset_uids"])
+                    < MAX_VIDEO_ASSETS_PER_PICKER_SHOT
+                ),
+                None,
+            )
+            if target_row is None:
+                break
+            target_row["video_asset_uids"].append(uid)
+            owned_uids.add(uid)
+
+    # A selected UID is always a subset of ownership. Legacy selection is
+    # retained on Shot 1; newer rows retain their own independent subset/order.
+    for row in rows:
+        raw = source_by_workspace.get(row["workspace_uuid"], {})
+        asset_set = set(row["video_asset_uids"])
+        if legacy_one_page and row["number"] == 1:
+            raw_selected = raw.get("selected_video_uids")
+            requested_selected = (
+                raw_selected
+                if isinstance(raw_selected, (list, tuple)) and raw_selected
+                else global_selected
+            )
+            requested_preview = (
+                raw.get("preview_video_uid") or global_preview
+            )
+        elif legacy_one_page:
+            requested_selected = []
+            requested_preview = ""
+        else:
+            requested_selected = raw.get("selected_video_uids", [])
+            requested_preview = raw.get("preview_video_uid")
+            # States assembled by older Python integrations may carry the
+            # current global selection beside newly introduced empty ownership
+            # rows. Once their orphan records are assigned to the active Shot,
+            # retain that active subset instead of silently deselecting it.
+            if row is active_row and not requested_selected:
+                projected_global_selection = [
+                    uid for uid in global_selected if uid in asset_set
+                ]
+                if projected_global_selection:
+                    requested_selected = projected_global_selection
+        selected = _picker_representative_video_uids(
+            requested_selected,
+            requested_preview,
+            asset_set,
+        )
+        row["selected_video_uids"] = selected
+        preview_uid = _clean(requested_preview)
+        if row is active_row and global_preview in asset_set:
+            preview_uid = global_preview
+        if preview_uid not in asset_set:
+            preview_uid = selected[0] if selected else (
+                row["video_asset_uids"][0] if row["video_asset_uids"] else ""
+            )
+        row["preview_video_uid"] = preview_uid
+        row["selected_video_slot"] = max(
+            1,
+            min(max(1, len(selected)), int(row.get("selected_video_slot") or 1)),
+        )
+
+    # Keep the active row's non-media viewport projection compatible with the
+    # existing widget transport while ownership/selection remains row-local.
+    active_snapshot_uid = _clean(state.get("active_snapshot_uid"))
+    if active_snapshot_uid not in snapshot_uids:
+        active_snapshot_uid = ""
+    try:
+        active_current_frame = float(state.get("current_frame") or 0.0)
+        if not math.isfinite(active_current_frame):
+            active_current_frame = 0.0
+    except Exception:
+        active_current_frame = 0.0
+    active_row.update({
+        "scene_draft_path": _maya_scene_path_text(state.get("scene_draft_path")),
+        "current_frame": active_current_frame,
+        "viewport_mode": (
+            "snapshot"
+            if _clean(state.get("viewport_mode")).lower() == "snapshot"
+            and active_snapshot_uid
+            else "video"
+        ),
+        "active_snapshot_uid": active_snapshot_uid,
+    })
+
+    retained_catalog: List[Dict[str, Any]] = []
+    owner_by_uid = {
+        uid: row["workspace_uuid"]
+        for row in rows
+        for uid in row["video_asset_uids"]
+    }
+    for item in catalog:
+        uid = _clean(item.get("video_uid") or item.get("source_uid"))
+        owner_uuid = owner_by_uid.get(uid)
+        if not owner_uuid:
+            continue
+        item["picker_shot_uuid"] = owner_uuid
+        retained_catalog.append(item)
+    omitted_count = len(catalog) - len(retained_catalog)
+    if omitted_count:
+        scope = (
+            "legacy Shot 1"
+            if legacy_one_page
+            else f"{len(rows)} Picker Shot(s)"
+        )
+        warning = (
+            f"Video ownership overflow: retained {len(retained_catalog)} of "
+            f"{len(catalog)} assets in {scope}; omitted {omitted_count} beyond "
+            f"the {MAX_VIDEO_ASSETS_PER_PICKER_SHOT}-per-Shot capacity."
+        )
+        warnings = _normalize_ui_warnings(state.get("warnings"))
+        if warning not in warnings:
+            warnings.append(warning)
+        state["warnings"] = warnings[-20:]
+    state["videos"] = retained_catalog
+
+    # Once a remote Shot has a fixed local owner, legacy remote membership must
+    # not be resurrected if that publisher later disappears.
+    legacy_membership_fallbacks = (
+        dict(state.get("picker_legacy_membership_fallbacks"))
+        if isinstance(state.get("picker_legacy_membership_fallbacks"), dict)
+        else {}
+    )
+    for row in rows:
+        legacy_membership_fallbacks.pop(row["bound_shot_uuid"], None)
+    state["picker_legacy_membership_fallbacks"] = legacy_membership_fallbacks
+
+    remote_row = remote_by_uuid.get(active_row["bound_shot_uuid"])
+    if remote_row is None:
+        state["shot_uuid"] = ""
+        state["shot_number"] = 0
+        state["shot_name"] = ""
+    else:
+        state["shot_uuid"] = _uuid_text(remote_row.get("shot_uuid"))
+        state["shot_number"] = int(remote_row.get("number") or 0)
+        state["shot_name"] = _clean(remote_row.get("name"))[:128]
+
+    active_selected_uids = list(active_row["selected_video_uids"])
+    active_order_by_uid = {
+        uid: index + 1 for index, uid in enumerate(active_selected_uids)
+    }
+    catalog_by_uid: Dict[str, Dict[str, Any]] = {}
+    for item in state["videos"]:
+        uid = _clean(item.get("video_uid") or item.get("source_uid"))
+        catalog_by_uid[uid] = item
+        selection_order = active_order_by_uid.get(uid, 0)
+        item["selected"] = bool(selection_order)
+        item["selection_order"] = selection_order
+        item["video_slot"] = selection_order
+        if isinstance(item.get("frame_metadata"), dict):
+            item["frame_metadata"]["video_slot"] = (
+                f"@video{selection_order}" if selection_order else ""
+            )
+
+    active_preview_uid = _clean(active_row.get("preview_video_uid"))
+    if active_preview_uid not in set(active_row["video_asset_uids"]):
+        active_preview_uid = (
+            active_selected_uids[0] if active_selected_uids
+            else active_row["video_asset_uids"][0]
+            if active_row["video_asset_uids"] else ""
+        )
+    active_row["preview_video_uid"] = active_preview_uid
+    active_slot = active_order_by_uid.get(active_preview_uid)
+    if not active_slot:
+        active_slot = max(
+            1,
+            min(
+                max(1, len(active_selected_uids)),
+                int(active_row.get("selected_video_slot") or 1),
+            ),
+        )
+    active_row["selected_video_slot"] = active_slot
+    state["preview_video_uid"] = active_preview_uid
+    state["selected_video_uid"] = active_preview_uid
+    state["selected_video_slot"] = active_slot
+    state["selected_video_count"] = len(active_selected_uids)
+    state["max_selected_videos"] = MAX_SELECTED_VIDEOS
+    state["active_slot_count"] = max(1, len(active_selected_uids))
+    preview_item = catalog_by_uid.get(active_preview_uid, {})
+    state["selected_video_path"] = _clean(
+        preview_item.get("project_video_path")
+        or preview_item.get("video_path")
+        or preview_item.get("video_url")
+    )
+    selection_identity = [
+        {
+            "video_uid": uid,
+            "selection_order": order,
+            "media": _clean(
+                catalog_by_uid.get(uid, {}).get("project_video_path")
+                or catalog_by_uid.get(uid, {}).get("video_path")
+                or catalog_by_uid.get(uid, {}).get("video_url")
+            ),
+        }
+        for uid, order in active_order_by_uid.items()
+    ]
+    state["selection_id"] = hashlib.sha256(
+        json.dumps(
+            selection_identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    state["picker_shots"] = rows
+
+
+def _activate_picker_workspace_projection(
+    state: Dict[str, Any],
+    workspace_uuid: Any,
+) -> Optional[Dict[str, Any]]:
+    """Project one validated local workspace onto legacy global controls.
+
+    Command transport and widget state transport are independent. A command
+    can therefore reach Python before the state echo from a rapid local Shot
+    switch. The command's captured workspace UUID is authoritative for that
+    one action, while an invalid/missing row returns ``None`` without mutation.
+    """
+
+    normalized = _parse_state(state)
+    requested_uuid = _uuid_text(workspace_uuid)
+    if not requested_uuid:
+        return None
+    target = next(
+        (
+            row
+            for row in normalized.get("picker_shots", [])
+            if isinstance(row, dict)
+            and _uuid_text(row.get("workspace_uuid")) == requested_uuid
+        ),
+        None,
+    )
+    if target is None:
+        return None
+
+    selected_order = {
+        _clean(uid): index
+        for index, uid in enumerate(
+            target.get("selected_video_uids", []),
+            start=1,
+        )
+        if _clean(uid)
+    }
+    projected = dict(normalized)
+    projected["videos"] = []
+    for raw in normalized.get("videos", []):
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        uid = _clean(item.get("video_uid") or item.get("source_uid"))
+        order = selected_order.get(uid, 0)
+        item["selected"] = bool(order)
+        item["selection_order"] = order
+        item["video_slot"] = order
+        projected["videos"].append(item)
+    projected.update({
+        "active_picker_shot_uuid": requested_uuid,
+        "preview_video_uid": _clean(target.get("preview_video_uid")),
+        "selected_video_uid": _clean(target.get("preview_video_uid")),
+        "scene_draft_path": _maya_scene_path_text(target.get("scene_draft_path")),
+        "current_frame": float(target.get("current_frame") or 0.0),
+        "viewport_mode": (
+            "snapshot"
+            if _clean(target.get("viewport_mode")).lower() == "snapshot"
+            else "video"
+        ),
+        "active_snapshot_uid": _clean(target.get("active_snapshot_uid")),
+        "selected_video_slot": max(1, int(target.get("selected_video_slot") or 1)),
+    })
+    bound_shot_uuid = _uuid_text(target.get("bound_shot_uuid"))
+    bound_remote = next(
+        (
+            row
+            for row in normalized.get("shot_selections", [])
+            if isinstance(row, dict)
+            and _uuid_text(row.get("shot_uuid")) == bound_shot_uuid
+        ),
+        None,
+    )
+    if bound_remote is None:
+        projected.update({"shot_uuid": "", "shot_number": 0, "shot_name": ""})
+    else:
+        projected.update({
+            "shot_uuid": bound_shot_uuid,
+            "shot_number": int(bound_remote.get("number") or 0),
+            "shot_name": _clean(bound_remote.get("name"))[:128],
+        })
+    return _parse_state(projected)
 
 
 def _readable_video_slot(value: Any) -> int:
@@ -4724,6 +5838,111 @@ def _scene_path_text(value: Any) -> str:
     return text
 
 
+def _maya_scene_path_text(value: Any) -> str:
+    """Return exactly one lexical absolute Maya scene path.
+
+    This boundary is intentionally filesystem-independent: a saved workflow
+    may point at a portable/non-mounted scene and READ owns the later existence
+    check.  It nevertheless rejects native-control aggregate text, multiple
+    selections/roots, relative paths, and log/status suffixes before any such
+    value can become retained node state.
+    """
+
+    def one_candidate(candidate: Any) -> str:
+        if candidate is None:
+            return ""
+        if isinstance(candidate, dict):
+            resolved = []
+            for key in (
+                "path", "file_path", "filepath", "value", "uri", "url",
+                "filename",
+            ):
+                if key not in candidate:
+                    continue
+                item = one_candidate(candidate.get(key))
+                if item and item not in resolved:
+                    resolved.append(item)
+            return resolved[0] if len(resolved) == 1 else ""
+        if isinstance(candidate, (list, tuple, set)):
+            resolved = [one_candidate(item) for item in candidate]
+            resolved = [item for item in resolved if item]
+            return resolved[0] if len(resolved) == 1 else ""
+        if not isinstance(candidate, (str, bytes, Path)):
+            resolved = []
+            for attribute in (
+                "path", "file_path", "filepath", "value", "uri", "url",
+                "filename",
+            ):
+                try:
+                    item = one_candidate(getattr(candidate, attribute, None))
+                except Exception:
+                    item = ""
+                if item and item not in resolved:
+                    resolved.append(item)
+            return resolved[0] if len(resolved) == 1 else ""
+        if isinstance(candidate, bytes):
+            candidate = _decode_maya_text(candidate)
+        text_value = str(candidate or "").strip().strip('"').strip("'")
+        if text_value[:1] in {"[", "{"}:
+            try:
+                decoded = json.loads(text_value)
+            except Exception:
+                return text_value
+            return one_candidate(decoded)
+        return text_value
+
+    text = one_candidate(value)
+    if not text or len(text) > 4096:
+        return ""
+    if any(ord(character) < 32 for character in text):
+        return ""
+    if any(character in text for character in '<>"|?*'):
+        return ""
+    if re.search(r"\[\d{1,2}:\d{2}(?::\d{2})?\]", text):
+        return ""
+    if re.search(
+        r"(?i)\.(?:py|js|log|txt)\s*(?:\[[^\]]+\]\s*)?"
+        r"(?:SUCCESS|ERROR|WARNING|INFO)\b",
+        text,
+    ):
+        return ""
+    if re.search(r"(?i)\s(?:SUCCESS|ERROR|WARNING|INFO)(?:\s|$)", text):
+        return ""
+
+    lexical = text.replace("\\", "/")
+    drive_roots = re.findall(r"(?i)(?<![A-Za-z0-9_])[A-Z]:/", lexical)
+    whitespace_roots = re.findall(r"\s/(?!/)", lexical)
+    is_drive = bool(re.fullmatch(r"(?is)[A-Z]:/(?!/).+", lexical))
+    is_unc = lexical.startswith("//") and not lexical.startswith("///")
+    is_posix = lexical.startswith("/") and not lexical.startswith("//")
+
+    if is_drive:
+        if len(drive_roots) != 1 or whitespace_roots:
+            return ""
+        if ":" in lexical[2:]:
+            return ""
+        components = lexical[3:].split("/")
+    elif is_unc:
+        if drive_roots or "//" in lexical[2:] or whitespace_roots:
+            return ""
+        components = lexical[2:].split("/")
+        # server, share, and at least one path component are required.
+        if len(components) < 3:
+            return ""
+    elif is_posix:
+        if drive_roots or whitespace_roots:
+            return ""
+        components = lexical[1:].split("/")
+    else:
+        return ""
+
+    if not components or any(not component for component in components):
+        return ""
+    if Path(components[-1]).suffix.casefold() not in {".ma", ".mb"}:
+        return ""
+    return text
+
+
 _UI_WARNING_MESSAGE_LIMIT = 480
 _UI_ACTIVITY_MESSAGE_LIMIT = 1600
 
@@ -5031,6 +6250,119 @@ def _compact_video_payload_for_state(value: Any) -> Dict[str, Any]:
     return payload
 
 
+# Shot routing publishes media only through ``media_by_source_uid``.  Its
+# sibling metadata is semantic-only, so runtime/project paths must not cross
+# this private snapshot boundary when new Picker fields are added later.
+_SHOT_VIDEO_METADATA_FIELDS = frozenset({
+    "video_uid", "source_uid", "label", "generation_role", "media_kind",
+    "video_role", "source_type_hint", "control_role_hint", "camera",
+    "run_id", "pair_run_id", "bundle_run_id", "created_at_ms",
+    "catalog_order", "source_fps", "output_fps", "fps", "start_frame",
+    "end_frame", "frame_count", "source_frame_count", "output_frame_count",
+    "decoded_frame_count", "source_duration_seconds", "output_duration_seconds",
+    "duration_seconds", "timebase", "width", "height", "output_width",
+    "output_height", "resolution", "available_color_picks", "markers",
+    "frame_metadata", "frame_domain", "timing_cues", "reference_capabilities",
+    "companion_video_uid", "source_video_uid", "companion_of_video_uid",
+    "companion_of_video_slot", "source_video_slot", "depth_profile",
+    "motion_guide_profile", "depth_range_report", "motion_guide_report",
+})
+_SHOT_VIDEO_METADATA_MEDIA_KEYS = frozenset({
+    "path", "asset_path", "video_path", "project_video_path", "video_url",
+    "media", "media_value", "data", "data_uri", "base64", "blob", "bytes",
+    "binary", "url", "reference_file", "maya_executable", "relative_path",
+})
+_SHOT_VIDEO_METADATA_PRIVATE_KEY_TOKENS = (
+    "sidecar",
+    "thumbnail",
+    "thumb",
+    "cache",
+)
+_SHOT_VIDEO_METADATA_IDENTITY_PATH_KEYS = frozenset({
+    # Maya DAG identities are not filesystem/media paths.
+    "full_dag_path",
+})
+_SHOT_VIDEO_METADATA_OMIT = object()
+
+
+def _is_maya_full_dag_path(value: Any) -> bool:
+    """Accept a Maya full DAG identity, never a filesystem/media path."""
+
+    if not isinstance(value, str) or value != value.strip():
+        return False
+    if not value.startswith("|") or len(value) > 4096:
+        return False
+    if "/" in value or "\\" in value:
+        return False
+    parts = value[1:].split("|")
+    return bool(parts) and all(
+        part and not any(ord(character) < 32 for character in part)
+        for part in parts
+    )
+
+
+def _looks_like_private_media_string(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    lowered = text.casefold()
+    return bool(
+        lowered.startswith(("data:", "file:", "http://", "https://"))
+        or re.match(r"^[a-z][a-z0-9+.-]*://", text, re.IGNORECASE)
+        or re.match(r"^[a-z]:[\\/]", text, re.IGNORECASE)
+        or text.startswith(("\\\\", "//", "/", "~/", "~\\"))
+    )
+
+
+def _semantic_shot_video_metadata_value(value: Any, key: str = "") -> Any:
+    """Return a semantic copy, omitting local/project/private media fields."""
+
+    normalized_key = _clean(key).casefold()
+    if normalized_key == "full_dag_path":
+        return value if _is_maya_full_dag_path(value) else _SHOT_VIDEO_METADATA_OMIT
+    if normalized_key:
+        path_like = (
+            normalized_key.endswith("_path")
+            or normalized_key.endswith("_url")
+            or normalized_key.endswith("_folder")
+            or normalized_key.endswith("_directory")
+            or normalized_key.endswith("_file")
+        )
+        if (
+            normalized_key in _SHOT_VIDEO_METADATA_MEDIA_KEYS
+            or "base64" in normalized_key
+            or any(
+                token in normalized_key
+                for token in _SHOT_VIDEO_METADATA_PRIVATE_KEY_TOKENS
+            )
+            or (
+                path_like
+                and normalized_key not in _SHOT_VIDEO_METADATA_IDENTITY_PATH_KEYS
+            )
+        ):
+            return _SHOT_VIDEO_METADATA_OMIT
+    if isinstance(value, dict):
+        result: Dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            field = _clean(raw_key)
+            if not field:
+                continue
+            semantic = _semantic_shot_video_metadata_value(raw_value, field)
+            if semantic is not _SHOT_VIDEO_METADATA_OMIT:
+                result[field] = semantic
+        return result
+    if isinstance(value, (list, tuple)):
+        result_list: List[Any] = []
+        for item in value:
+            semantic = _semantic_shot_video_metadata_value(item)
+            if semantic is not _SHOT_VIDEO_METADATA_OMIT:
+                result_list.append(semantic)
+        return result_list
+    if _looks_like_private_media_string(value):
+        return _SHOT_VIDEO_METADATA_OMIT
+    return copy.deepcopy(value)
+
+
 def _compact_slot_recovery_fallback(value: Any) -> Dict[str, Any]:
     item = dict(value) if isinstance(value, dict) else {}
     if isinstance(item.get("payload"), dict):
@@ -5042,7 +6374,7 @@ def _compact_auxiliary_failure_warning(
     label: Any,
     detail: Any,
     *,
-    language: str = "en",
+    language: str = "ko",
 ) -> str:
     """Summarize an optional artifact failure without publishing path dumps."""
     label_text = _clean(label)
@@ -5388,6 +6720,89 @@ def _normalize_slot_assignments(
     ]
 
 
+def _outliner_selection_after_read(
+    outliner_nodes: Any,
+    slot_assignments: Any,
+    selected_video_slot: Any,
+    previous_path: Any = "",
+    previous_uuid: Any = "",
+) -> Dict[str, str]:
+    """Choose a usable Color Pick target immediately after a Maya READ.
+
+    Maya UUID is preferred when a re-read changes a DAG path. A new scene has
+    no previous target, so its first root (or first readable node) becomes the
+    explicit selection instead of leaving every Color Pick button disabled.
+    The displayed color is restored only from the currently edited video slot.
+    """
+    nodes = (
+        [dict(item) for item in outliner_nodes if isinstance(item, dict)]
+        if isinstance(outliner_nodes, list)
+        else []
+    )
+    readable_nodes = [item for item in nodes if _clean(item.get("full_path"))]
+    if not readable_nodes:
+        return {"path": "", "name": "", "uuid": "", "color": ""}
+
+    requested_uuid = _clean(previous_uuid)
+    requested_path = _clean(previous_path)
+    selected = None
+    if requested_uuid:
+        selected = next(
+            (
+                item for item in readable_nodes
+                if _clean(item.get("maya_uuid")).casefold() == requested_uuid.casefold()
+            ),
+            None,
+        )
+    if selected is None and requested_path:
+        selected = next(
+            (item for item in readable_nodes if _clean(item.get("full_path")) == requested_path),
+            None,
+        )
+    if selected is None:
+        selected = next(
+            (item for item in readable_nodes if not _clean(item.get("parent_path"))),
+            readable_nodes[0],
+        )
+
+    selected_path = _clean(selected.get("full_path"))
+    selected_uuid = _clean(selected.get("maya_uuid"))
+    selected_name = (
+        _clean(selected.get("name") or selected.get("display_name"))
+        or selected_path.rsplit("|", 1)[-1]
+        or selected_path
+    )
+    try:
+        active_slot = max(1, min(MAX_VIDEO_SLOTS, int(selected_video_slot or 1)))
+    except (TypeError, ValueError):
+        active_slot = 1
+    selected_color = ""
+    for slot_item in slot_assignments if isinstance(slot_assignments, list) else []:
+        if not isinstance(slot_item, dict) or int(slot_item.get("video_slot") or 0) != active_slot:
+            continue
+        bindings = slot_item.get("bindings") if isinstance(slot_item.get("bindings"), list) else []
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                continue
+            binding_uuid = _clean(binding.get("maya_uuid"))
+            binding_path = _clean(binding.get("full_dag_path") or binding.get("subject_root"))
+            same_target = bool(
+                (selected_uuid and binding_uuid and selected_uuid.casefold() == binding_uuid.casefold())
+                or (selected_path and binding_path and selected_path == binding_path)
+            )
+            if same_target:
+                color = _clean(binding.get("color"))
+                selected_color = color if color in MARKER_ORDER else ""
+                break
+        break
+    return {
+        "path": selected_path,
+        "name": selected_name,
+        "uuid": selected_uuid,
+        "color": selected_color,
+    }
+
+
 def _slot_assignment_bindings(state: Dict[str, Any], slot: int) -> List[Dict[str, Any]]:
     for item in state.get("slot_assignments", []):
         if isinstance(item, dict) and int(item.get("video_slot") or 0) == slot:
@@ -5402,12 +6817,13 @@ def _normalize_video_items(
     fallbacks: Optional[List[Dict[str, Any]]] = None,
     reserved_slots: Optional[set[int]] = None,
 ) -> List[Dict[str, Any]]:
-    """Normalize an unlimited video catalog and its bounded selection.
+    """Normalize incoming catalog records before 5x10 ownership compaction.
 
     ``video_slot`` is no longer catalog identity.  It is rebuilt from
     ``selection_order`` for the at-most-ten selected records.  Legacy states
     without selection fields are migrated by their prior slot order, while
-    every record receives a stable ``video_uid`` that survives later reorder.
+    every retained record receives a stable ``video_uid`` that survives later
+    reorder. ``_normalize_picker_workspace_fields`` then enforces 50 total.
     """
     if not isinstance(value, list):
         return []
@@ -5604,37 +7020,308 @@ def _normalize_video_items(
     return records
 
 
-def _append_video_asset(state: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
-    """Append one immutable catalog record and auto-select it when capacity allows."""
+def _assert_picker_workspace_capacity(
+    state: Dict[str, Any],
+    picker_shot_uuid: Any = "",
+    required_assets: int = 1,
+) -> tuple[Dict[str, Any], str]:
+    """Return normalized state and a captured row after strict capacity checks."""
     normalized = _parse_state(state)
+    requested_workspace_uuid = _uuid_text(picker_shot_uuid) or _uuid_text(
+        normalized.get("active_picker_shot_uuid")
+    )
+    target_row = next(
+        (
+            row
+            for row in normalized.get("picker_shots", [])
+            if isinstance(row, dict)
+            and _uuid_text(row.get("workspace_uuid")) == requested_workspace_uuid
+        ),
+        None,
+    )
+    if target_row is None:
+        raise ValueError("The captured Picker Shot no longer exists.")
+    try:
+        required = max(0, int(required_assets or 0))
+    except Exception:
+        required = 0
+    owned_count = len(
+        _picker_representative_video_uids(target_row.get("video_asset_uids"))
+    )
+    if owned_count + required > MAX_VIDEO_ASSETS_PER_PICKER_SHOT:
+        raise RuntimeError(
+            f"Shot {int(target_row.get('number') or 1)} already owns "
+            f"{owned_count} video asset(s); at most "
+            f"{MAX_VIDEO_ASSETS_PER_PICKER_SHOT} are allowed."
+        )
+    catalog_count = len(
+        [item for item in normalized.get("videos", []) if isinstance(item, dict)]
+    )
+    picker_row_count = max(
+        1,
+        min(
+            SHOT_ROUTING_MAX_SHOTS,
+            len([
+                row for row in normalized.get("picker_shots", [])
+                if isinstance(row, dict)
+            ]),
+        ),
+    )
+    active_catalog_capacity = min(
+        MAX_PICKER_VIDEO_ASSETS,
+        picker_row_count * MAX_VIDEO_ASSETS_PER_PICKER_SHOT,
+    )
+    if catalog_count + required > active_catalog_capacity:
+        raise RuntimeError(
+            f"The {picker_row_count} active Picker Shot(s) already own "
+            f"{catalog_count} video asset(s); the current catalog capacity is "
+            f"{active_catalog_capacity}."
+        )
+    return normalized, requested_workspace_uuid
+
+
+def _video_import_source_key(value: Any) -> str:
+    """Return a stable same-file key for user-imported MP4 provenance."""
+
+    text = _clean(value)
+    if not text:
+        return ""
+    try:
+        text = str(Path(text).expanduser().resolve(strict=False))
+    except Exception:
+        pass
+    return os.path.normcase(os.path.normpath(text)).replace("\\", "/")
+
+
+def _picker_workspace_imported_asset(
+    state: Dict[str, Any],
+    picker_shot_uuid: Any,
+    source_path: Any,
+) -> Optional[Dict[str, Any]]:
+    """Find the same imported source only inside its captured Picker Shot."""
+
+    normalized = _parse_state(state)
+    workspace_uuid = _uuid_text(picker_shot_uuid) or _uuid_text(
+        normalized.get("active_picker_shot_uuid")
+    )
+    source_key = _video_import_source_key(source_path)
+    if not workspace_uuid or not source_key:
+        return None
+    row = next(
+        (
+            item
+            for item in normalized.get("picker_shots", [])
+            if isinstance(item, dict)
+            and _uuid_text(item.get("workspace_uuid")) == workspace_uuid
+        ),
+        None,
+    )
+    if not isinstance(row, dict):
+        return None
+    owned_uids = {
+        _clean(value)
+        for value in row.get("video_asset_uids", [])
+        if _clean(value)
+    }
+    for item in normalized.get("videos", []):
+        if not isinstance(item, dict):
+            continue
+        uid = _clean(item.get("video_uid") or item.get("source_uid"))
+        if uid not in owned_uids:
+            continue
+        if _video_import_source_key(item.get("import_source_path")) == source_key:
+            return dict(item)
+    return None
+
+
+def _reuse_picker_imported_asset(
+    state: Dict[str, Any],
+    picker_shot_uuid: Any,
+    record: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Reuse/reselect an existing imported card instead of duplicating it."""
+
+    normalized = _parse_state(state)
+    workspace_uuid = _uuid_text(picker_shot_uuid) or _uuid_text(
+        normalized.get("active_picker_shot_uuid")
+    )
+    uid = _clean(record.get("video_uid") or record.get("source_uid"))
+    rows = [
+        dict(item)
+        for item in normalized.get("picker_shots", [])
+        if isinstance(item, dict)
+    ]
+    target = next(
+        (
+            row
+            for row in rows
+            if _uuid_text(row.get("workspace_uuid")) == workspace_uuid
+        ),
+        None,
+    )
+    if not isinstance(target, dict) or not uid:
+        return normalized
+    owned = _picker_representative_video_uids(
+        target.get("video_asset_uids"), "", {
+            _clean(item.get("video_uid") or item.get("source_uid"))
+            for item in normalized.get("videos", [])
+            if isinstance(item, dict)
+        }
+    )
+    selected = _picker_representative_video_uids(
+        target.get("selected_video_uids"),
+        target.get("preview_video_uid"),
+        set(owned),
+    )
+    changed = False
+    if uid in owned and uid not in selected and len(selected) < MAX_VIDEO_SLOTS:
+        selected.append(uid)
+        changed = True
+    if uid in owned and _clean(target.get("preview_video_uid")) != uid:
+        target["preview_video_uid"] = uid
+        target["selected_video_slot"] = max(1, selected.index(uid) + 1) if uid in selected else 1
+        changed = True
+    if changed:
+        target["selected_video_uids"] = selected
+        target["revision"] = max(0, int(target.get("revision") or 0)) + 1
+    result = dict(normalized)
+    result["picker_shots"] = rows
+    return _parse_state(result)
+
+
+def _append_video_asset(
+    state: Dict[str, Any],
+    item: Dict[str, Any],
+    *,
+    picker_shot_uuid: Any = "",
+) -> Dict[str, Any]:
+    """Append and auto-select one asset in its captured local workspace."""
+    try:
+        normalized, requested_workspace_uuid = _assert_picker_workspace_capacity(
+            state,
+            picker_shot_uuid,
+            1,
+        )
+    except RuntimeError as exc:
+        # Direct compatibility callers historically received a state result.
+        # Reject overflow as an idempotent no-op while import/generation paths
+        # call the strict capacity helper before creating any external asset.
+        normalized = _parse_state(state)
+        warning = _clean(exc) or "Picker Shot video capacity was reached."
+        warnings = _normalize_ui_warnings(normalized.get("warnings"))
+        if warning not in warnings:
+            warnings.append(warning)
+        normalized["warnings"] = warnings[-20:]
+        return normalized
     catalog = [
         dict(raw) for raw in normalized.get("videos", []) if isinstance(raw, dict)
     ]
+    picker_rows = [
+        dict(raw)
+        for raw in normalized.get("picker_shots", [])
+        if isinstance(raw, dict)
+    ]
+    target_row = next(
+        row
+        for row in picker_rows
+        if _uuid_text(row.get("workspace_uuid")) == requested_workspace_uuid
+    )
     record = _compact_video_payload_for_state(item)
     existing_uids = {
-        _clean(raw.get("video_uid")) for raw in catalog if _clean(raw.get("video_uid"))
+        _clean(raw.get("video_uid") or raw.get("source_uid"))
+        for raw in catalog
+        if _clean(raw.get("video_uid") or raw.get("source_uid"))
     }
     uid = _clean(record.get("video_uid") or record.get("source_uid"))
     if not uid or uid in existing_uids:
         uid = f"video-{uuid.uuid4().hex}"
-    record["video_uid"] = uid
-    record["source_uid"] = uid
-    record["catalog_order"] = len(catalog) + 1
-    selected_count = len(
-        [raw for raw in catalog if isinstance(raw, dict) and bool(raw.get("selected"))]
+    record.update({
+        "video_uid": uid,
+        "source_uid": uid,
+        "picker_shot_uuid": requested_workspace_uuid,
+        "catalog_order": len(catalog) + 1,
+        "selected": False,
+        "selection_order": 0,
+        "video_slot": 0,
+    })
+    owned_uids = _picker_representative_video_uids(
+        target_row.get("video_asset_uids"),
+        "",
+        existing_uids,
     )
-    if selected_count < MAX_SELECTED_VIDEOS:
-        record["selected"] = True
-        record["selection_order"] = selected_count + 1
-        record["video_slot"] = selected_count + 1
-    else:
-        record["selected"] = False
-        record["selection_order"] = 0
-        record["video_slot"] = 0
+    selected_uids = _picker_representative_video_uids(
+        target_row.get("selected_video_uids"),
+        target_row.get("preview_video_uid"),
+        set(owned_uids),
+    )
+    owned_uids.append(uid)
+    selected_uids.append(uid)
+    target_row.update({
+        "video_asset_uids": owned_uids,
+        "selected_video_uids": selected_uids,
+        "preview_video_uid": uid,
+        "selected_video_slot": len(selected_uids),
+        "revision": max(0, int(target_row.get("revision") or 0)) + 1,
+    })
     catalog.append(record)
     result = dict(normalized)
     result["videos"] = catalog
+    result["picker_shots"] = picker_rows
     return _parse_state(result)
+
+
+def _remove_video_asset_uids(
+    state: Dict[str, Any],
+    video_uids: Sequence[Any],
+) -> Dict[str, Any]:
+    """Remove catalog records and every durable workspace reference to them."""
+
+    normalized = _parse_state(state)
+    removed = {
+        _clean(value) for value in video_uids if _clean(value)
+    }
+    if not removed:
+        return normalized
+    normalized["videos"] = [
+        dict(item)
+        for item in normalized.get("videos", [])
+        if isinstance(item, dict)
+        and _clean(item.get("video_uid") or item.get("source_uid"))
+        not in removed
+    ]
+    cleaned_rows: List[Dict[str, Any]] = []
+    for raw_row in normalized.get("picker_shots", []):
+        if not isinstance(raw_row, dict):
+            continue
+        row = dict(raw_row)
+        changed = False
+        for membership_key in ("video_asset_uids", "selected_video_uids"):
+            membership = [
+                _clean(uid)
+                for uid in row.get(membership_key, [])
+                if _clean(uid) and _clean(uid) not in removed
+            ]
+            if membership != row.get(membership_key, []):
+                changed = True
+            row[membership_key] = membership
+        if _clean(row.get("preview_video_uid")) in removed:
+            row["preview_video_uid"] = (
+                row["selected_video_uids"][0]
+                if row["selected_video_uids"]
+                else row["video_asset_uids"][0]
+                if row["video_asset_uids"]
+                else ""
+            )
+            changed = True
+        if changed:
+            row["revision"] = max(0, int(row.get("revision") or 0)) + 1
+        cleaned_rows.append(row)
+    normalized["picker_shots"] = cleaned_rows
+    if _clean(normalized.get("preview_video_uid")) in removed:
+        normalized["preview_video_uid"] = ""
+    if _clean(normalized.get("selected_video_uid")) in removed:
+        normalized["selected_video_uid"] = ""
+    return _parse_state(normalized)
 
 
 def _is_generated_depth_video_item(value: Any) -> bool:
@@ -5695,17 +7382,6 @@ def _is_generated_motion_guide_video_item(value: Any) -> bool:
         == "maya_motion_guide_companion"
         and _clean(value.get("motion_guide_profile"))
         in MOTION_GUIDE_COMPATIBLE_PROFILES
-    )
-
-
-def _is_generated_original_video_item(value: Any) -> bool:
-    return bool(
-        isinstance(value, dict)
-        and (
-            _clean(value.get("generation_role")) == "original"
-            or _clean(value.get("media_kind")) == ORIGINAL_MEDIA_KIND
-            or _clean(value.get("video_role")) == "maya_original_playblast"
-        )
     )
 
 
@@ -5831,24 +7507,113 @@ def _append_selected_generation_videos(
     manual_source_state: Optional[Dict[str, Any]] = None,
     *,
     selected_roles: Optional[Sequence[str]] = None,
+    picker_shot_uuid: Any = "",
 ) -> Dict[str, Any]:
     """Compatibility entry point that now appends generation assets.
 
-    No prior catalog record is replaced or packed. New records are selected at
-    the end while capacity remains and otherwise stay available, unselected, in
-    the shot history.
+    No prior catalog record is replaced or packed. The complete validated
+    bundle is capacity-checked before the first record is appended, so a
+    generation can never leave an unowned partial overflow record.
     """
-    result_source = dict(state)
+    # The inner Maya pass temporarily publishes validated Mask/Depth/Motion
+    # rows so they can be inspected. Remove only those exact provisional UIDs
+    # from the newest state before appending the finalized operation delta.
+    # Replacing ``videos`` from the pre-generation snapshot would discard any
+    # import, deletion, or selection committed while Maya was running.
+    provisional_uids = [
+        _clean(source.get("video_uid") or source.get("source_uid"))
+        for source in generated_by_role.values()
+        if isinstance(source, dict)
+        and _clean(source.get("video_uid") or source.get("source_uid"))
+    ]
     if isinstance(manual_source_state, dict):
-        # The inner Maya pass temporarily publishes its just-rendered rows so
-        # they can be validated and collected. Start the final catalog from the
-        # pre-generation membership while retaining all newer operation/log
-        # fields from ``state``; each validated row is appended exactly once.
-        preserved_catalog = _parse_state(manual_source_state).get("videos", [])
-        result_source["videos"] = [
-            dict(item) for item in preserved_catalog if isinstance(item, dict)
-        ]
-    result = _parse_state(result_source)
+        parsed_staging = _parse_state(state)
+        for role, source in generated_by_role.items():
+            if not isinstance(source, dict) or _clean(
+                source.get("video_uid") or source.get("source_uid")
+            ):
+                continue
+            source_paths = {
+                _clean(source.get(field))
+                for field in ("video_path", "project_video_path", "video_url")
+                if _clean(source.get(field))
+            }
+            for item in parsed_staging.get("videos", []):
+                if not isinstance(item, dict):
+                    continue
+                item_paths = {
+                    _clean(item.get(field))
+                    for field in (
+                        "video_path",
+                        "project_video_path",
+                        "video_url",
+                    )
+                    if _clean(item.get(field))
+                }
+                uid = _clean(item.get("video_uid") or item.get("source_uid"))
+                role_matches = (
+                    _clean(item.get("generation_role")) == _clean(role)
+                    or (
+                        role == "mask"
+                        and _is_generated_mask_video_item(
+                            item,
+                            parsed_staging,
+                        )
+                    )
+                    or (role == "depth" and _is_generated_depth_video_item(item))
+                    or (
+                        role == "motion_guide"
+                        and _is_generated_motion_guide_video_item(item)
+                    )
+                )
+                if (
+                    uid
+                    and role_matches
+                    and source_paths
+                    and source_paths.intersection(item_paths)
+                ):
+                    provisional_uids.append(uid)
+    result = _remove_video_asset_uids(state, provisional_uids)
+    if isinstance(manual_source_state, dict):
+        # Compatibility callers may still provide a legacy pre-generation page
+        # after a staging state replaced it. Merge only missing records here.
+        # The live Generate worker no longer passes this snapshot, so a user
+        # deletion made during generation can never be resurrected by it.
+        manual = _parse_state(manual_source_state)
+        existing_uids = {
+            _clean(item.get("video_uid") or item.get("source_uid"))
+            for item in result.get("videos", [])
+            if isinstance(item, dict)
+        }
+        owner_by_uid = {
+            _clean(uid): _uuid_text(row.get("workspace_uuid"))
+            for row in manual.get("picker_shots", [])
+            if isinstance(row, dict)
+            for uid in row.get("video_asset_uids", [])
+            if _clean(uid)
+        }
+        for manual_item in manual.get("videos", []):
+            if not isinstance(manual_item, dict):
+                continue
+            manual_uid = _clean(
+                manual_item.get("video_uid") or manual_item.get("source_uid")
+            )
+            if not manual_uid or manual_uid in existing_uids:
+                continue
+            target_uuid = owner_by_uid.get(manual_uid) or _uuid_text(
+                result.get("active_picker_shot_uuid")
+            )
+            result = _append_video_asset(
+                result,
+                manual_item,
+                picker_shot_uuid=target_uuid,
+            )
+            existing_uids.add(manual_uid)
+    captured_picker_shot_uuid = _uuid_text(picker_shot_uuid) or _uuid_text(
+        manual_source_state.get("active_picker_shot_uuid")
+        if isinstance(manual_source_state, dict)
+        else state.get("active_picker_shot_uuid")
+    )
     warnings = [
         _clean(item) for item in state.get("warnings", []) if _clean(item)
     ]
@@ -5863,6 +7628,21 @@ def _append_selected_generation_videos(
         for role in ("original", "mask", "depth", "motion_guide")
         if role in requested_role_set
     )
+    appendable_roles = [
+        role
+        for role in ordered_roles
+        if isinstance(generated_by_role.get(role), dict)
+        and any(
+            _clean(generated_by_role[role].get(field))
+            for field in ("video_path", "project_video_path", "video_url")
+        )
+    ]
+    if appendable_roles:
+        result, captured_picker_shot_uuid = _assert_picker_workspace_capacity(
+            result,
+            captured_picker_shot_uuid,
+            len(appendable_roles),
+        )
     mask_uid = ""
     for role in ordered_roles:
         source = generated_by_role.get(role)
@@ -5902,7 +7682,11 @@ def _append_selected_generation_videos(
         elif role in {"depth", "motion_guide"}:
             item["companion_video_uid"] = mask_uid
             item["source_video_uid"] = mask_uid
-        result = _append_video_asset(result, item)
+        result = _append_video_asset(
+            result,
+            item,
+            picker_shot_uuid=captured_picker_shot_uuid,
+        )
         appended = result.get("videos", [])[-1] if result.get("videos") else {}
         if role == "mask" and isinstance(appended, dict):
             mask_uid = _clean(appended.get("video_uid"))
@@ -5959,6 +7743,48 @@ def _snapshot_created_at_ms(value: Any) -> int:
         return 0
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _snapshot_content_sha256(raw: Dict[str, Any]) -> str:
+    supplied = _clean(raw.get("sha256") or raw.get("content_sha256")).lower()
+    if re.fullmatch(r"[0-9a-f]{64}", supplied):
+        return supplied
+    legacy_data_uri = _clean(raw.get("data_uri") or raw.get("snapshot_data_uri"))
+    if legacy_data_uri.startswith("data:image/") and "," in legacy_data_uri:
+        try:
+            payload = base64.b64decode(legacy_data_uri.split(",", 1)[1], validate=True)
+            return hashlib.sha256(payload).hexdigest()
+        except Exception:
+            return hashlib.sha256(legacy_data_uri.encode("utf-8")).hexdigest()
+    path_text = _clean(raw.get("path") or raw.get("snapshot_path"))
+    if path_text:
+        try:
+            path = Path(path_text)
+            if path.is_file():
+                return _sha256_file(path)
+        except Exception:
+            pass
+    return hashlib.sha256(path_text.encode("utf-8")).hexdigest() if path_text else ""
+
+
+def _snapshot_media_url(raw: Dict[str, Any], path_text: str) -> str:
+    supplied = _clean(raw.get("url") or raw.get("media_url") or raw.get("snapshot_url"))
+    if supplied and not supplied.startswith("data:"):
+        return supplied
+    if not path_text:
+        return ""
+    try:
+        return _external_media_url(Path(path_text))
+    except Exception:
+        return Path(path_text).as_posix()
+
+
 def _snapshot_catalog_uid_by_slot(videos: Any) -> Dict[int, str]:
     """Best-effort migration map for legacy slot-only snapshot records."""
     candidates: Dict[int, List[str]] = {}
@@ -5981,7 +7807,6 @@ def _snapshot_catalog_uid_by_slot(videos: Any) -> Dict[int, str]:
 
 
 def _snapshot_record_signature(item: Dict[str, Any]) -> str:
-    data_uri = _clean(item.get("data_uri") or item.get("snapshot_data_uri"))
     payload = {
         "video_uid": _clean(item.get("video_uid")),
         "render_video_slot": _normalized_video_slot(
@@ -5991,7 +7816,7 @@ def _snapshot_record_signature(item: Dict[str, Any]) -> str:
         "frame": float(item.get("frame") or item.get("snapshot_frame") or 0.0),
         "path": _clean(item.get("path") or item.get("snapshot_path")),
         "created_at_ms": _snapshot_created_at_ms(item.get("created_at_ms")),
-        "data_sha256": hashlib.sha256(data_uri.encode("utf-8")).hexdigest(),
+        "sha256": _snapshot_content_sha256(item),
     }
     return hashlib.sha256(
         json.dumps(
@@ -6009,8 +7834,20 @@ def _normalized_snapshot_record(
 ) -> Optional[Dict[str, Any]]:
     if not isinstance(raw, dict):
         return None
-    data_uri = _clean(raw.get("data_uri") or raw.get("snapshot_data_uri"))
-    if not data_uri.startswith("data:image/"):
+    path_text = _clean(raw.get("path") or raw.get("snapshot_path"))
+    media_url = _snapshot_media_url(raw, path_text)
+    legacy_data_uri = _clean(raw.get("data_uri") or raw.get("snapshot_data_uri"))
+    content_sha256 = _snapshot_content_sha256(raw)
+    # Old workflows embedded Snapshot PNGs directly in widget state.  Modern
+    # state intentionally drops the heavyweight inline bytes, but the history
+    # record (frame, content hash and stable UID) must survive migration even
+    # when no external cache path was recorded.
+    if (
+        not path_text
+        and not media_url
+        and not legacy_data_uri.startswith("data:image/")
+        and not re.fullmatch(r"[0-9a-f]{64}", content_sha256)
+    ):
         return None
     render_slot = _normalized_video_slot(
         raw.get("render_video_slot") or raw.get("video_slot"),
@@ -6038,8 +7875,9 @@ def _normalized_snapshot_record(
         # selection order as the snapshot's identity.
         "video_slot": render_slot,
         "frame": frame,
-        "data_uri": data_uri,
-        "path": _clean(raw.get("path") or raw.get("snapshot_path")),
+        "path": path_text,
+        "url": media_url,
+        "sha256": content_sha256,
         "created_at_ms": _snapshot_created_at_ms(raw.get("created_at_ms")),
     }
     if not record["snapshot_uid"]:
@@ -6093,8 +7931,10 @@ def _apply_active_snapshot_projection(
                 active.get("render_video_slot") or active.get("video_slot"),
                 PRIMARY_COLOR_VIDEO_SLOT,
             ),
-            "snapshot_data_uri": _clean(active.get("data_uri")),
+            "snapshot_data_uri": "",
             "snapshot_path": _clean(active.get("path")),
+            "snapshot_url": _clean(active.get("url")),
+            "snapshot_sha256": _clean(active.get("sha256")),
         })
     else:
         state.update({
@@ -6102,6 +7942,8 @@ def _apply_active_snapshot_projection(
             "snapshot_video_slot": 0,
             "snapshot_data_uri": "",
             "snapshot_path": "",
+            "snapshot_url": "",
+            "snapshot_sha256": "",
         })
     return state
 
@@ -6158,7 +8000,11 @@ def _normalize_snapshot_history(
         # Modern scalar fields are a projection of this exact record. Never
         # reinterpret that lossy projection as another history entry.
         compatibility_record = history_by_uid[compatibility_uid]
-    elif bool(state.get("snapshot_active")) and compatibility_data_uri.startswith("data:image/"):
+    elif bool(state.get("snapshot_active")) and (
+        compatibility_data_uri.startswith("data:image/")
+        or _clean(state.get("snapshot_path"))
+        or _clean(state.get("snapshot_url"))
+    ):
         compatibility_candidate = _normalized_snapshot_record({
             "snapshot_uid": _clean(state.get("active_snapshot_uid")),
             "video_uid": _clean(state.get("snapshot_video_uid")),
@@ -6167,6 +8013,8 @@ def _normalize_snapshot_history(
             "frame": state.get("snapshot_frame"),
             "data_uri": compatibility_data_uri,
             "path": state.get("snapshot_path"),
+            "url": state.get("snapshot_url"),
+            "sha256": state.get("snapshot_sha256"),
             "created_at_ms": state.get("snapshot_created_at_ms"),
         }, catalog_uid_by_slot)
         if compatibility_candidate is not None:
@@ -6274,6 +8122,8 @@ def _parse_state(value: Any) -> Dict[str, Any]:
     state = _default_widget_state()
     if isinstance(source, dict):
         state.update(source)
+    _normalize_shot_selection_fields(state)
+    _normalize_shot_catalog_watermark_fields(state)
     recovery_diagnostics: List[str] = []
     recovery_fallbacks = [
         _compact_slot_recovery_fallback(item)
@@ -6290,15 +8140,43 @@ def _parse_state(value: Any) -> Dict[str, Any]:
     state["marker_catalog_version"] = int(MARKER_CATALOG["version"])
     state["output_width"], state["output_height"] = _playblast_resolution(state)
     for key in (
-        "state_revision", "state_published_at_ms", "frontend_seen_revision",
+        "state_revision", "writer_lifecycle_generation",
+        "state_published_at_ms", "frontend_seen_revision",
     ):
         try:
             state[key] = max(0, int(float(state.get(key) or 0)))
         except Exception:
             state[key] = 0
     state["state_writer"] = _clean(state.get("state_writer"))
-    for key in ("scene_stage", "scene_draft_path", "scene_request_path"):
-        state[key] = _clean(state.get(key))
+    state["writer_runtime_instance_id"] = _clean(
+        state.get("writer_runtime_instance_id")
+    )
+    state["scene_stage"] = _clean(state.get("scene_stage"))
+    raw_scene_fields = {
+        key: state.get(key)
+        for key in ("scene_path", "scene_draft_path", "scene_request_path")
+    }
+    strict_scene_fields = {
+        key: _maya_scene_path_text(raw_value)
+        for key, raw_value in raw_scene_fields.items()
+    }
+    invalid_scene_value = any(
+        bool(_scene_path_text(raw_value)) and not strict_scene_fields[key]
+        for key, raw_value in raw_scene_fields.items()
+    )
+    if invalid_scene_value:
+        state.update({
+            "scene_path": "",
+            "scene_draft_path": "",
+            "scene_request_path": "",
+            "native_read_ready": False,
+            "scene_stage": "EMPTY",
+            "scene_request_status": "IDLE",
+            "status": "READY",
+            "message": "Select a Maya .mb or .ma scene.",
+        })
+    else:
+        state.update(strict_scene_fields)
     try:
         active_slot_count = int(float(state.get("active_slot_count") or 1))
     except Exception:
@@ -6345,13 +8223,16 @@ def _parse_state(value: Any) -> Dict[str, Any]:
         state["right_split_ratio"] = max(0.22, min(0.72, float(state.get("right_split_ratio") or 0.42)))
     except Exception:
         state["right_split_ratio"] = 0.42
-    for key, minimum in (("node_width", 760), ("node_height", PICKER_WIDGET_MIN_HEIGHT)):
+    for key, minimum in (
+        ("node_width", PICKER_WIDGET_MIN_WIDTH),
+        ("node_height", PICKER_WIDGET_MIN_HEIGHT),
+    ):
         try:
             value = int(round(float(state.get(key) or 0)))
         except Exception:
             value = 0
         state[key] = max(minimum, min(6000, value)) if value > 0 else 0
-    for key, minimum in (("outliner_panel_height", 480), ("viewport_panel_height", 520)):
+    for key, minimum in (("outliner_panel_height", 480), ("viewport_panel_height", 636)):
         try:
             value = int(round(float(state.get(key) or 0)))
         except Exception:
@@ -6389,7 +8270,7 @@ def _parse_state(value: Any) -> Dict[str, Any]:
         except Exception:
             legacy_viewport_height = 0
         if legacy_viewport_height > 0:
-            state["viewport_panel_height"] = max(520, min(6000, legacy_viewport_height - legacy_log - 8))
+            state["viewport_panel_height"] = max(636, min(6000, legacy_viewport_height - legacy_log - 8))
     else:
         raw_right_section_heights = (
             state.get("right_section_heights")
@@ -6453,6 +8334,34 @@ def _parse_state(value: Any) -> Dict[str, Any]:
         recovery_fallbacks,
         reserved_video_control_slots,
     )
+    # Normalize the active Shot's ordered selection before computing derived
+    # slot/count/hash fields.  Up to ten selected videos remain durable.
+    preselected_uids = _picker_selected_video_uids(state)
+    prerepresentative = _picker_representative_video_uids(
+        preselected_uids,
+        state.get("preview_video_uid") or state.get("selected_video_uid"),
+        {
+            _clean(item.get("video_uid") or item.get("source_uid"))
+            for item in state["videos"]
+            if isinstance(item, dict)
+        },
+    )
+    selected_order_by_uid = {
+        uid: index + 1 for index, uid in enumerate(prerepresentative)
+    }
+    for item in state["videos"]:
+        if not isinstance(item, dict):
+            continue
+        uid = _clean(item.get("video_uid") or item.get("source_uid"))
+        selection_order = selected_order_by_uid.get(uid, 0)
+        selected = bool(selection_order)
+        item["selected"] = selected
+        item["selection_order"] = selection_order
+        item["video_slot"] = selection_order
+        if isinstance(item.get("frame_metadata"), dict):
+            item["frame_metadata"]["video_slot"] = (
+                f"@video{selection_order}" if selected else ""
+            )
     selected_video_count = len(
         [
             item
@@ -6461,10 +8370,10 @@ def _parse_state(value: Any) -> Dict[str, Any]:
         ]
     )
     state["selected_video_count"] = min(
-        MAX_SELECTED_VIDEOS,
+        MAX_REPRESENTATIVE_VIDEOS,
         selected_video_count,
     )
-    state["max_selected_videos"] = MAX_SELECTED_VIDEOS
+    state["max_selected_videos"] = MAX_REPRESENTATIVE_VIDEOS
     selection_identity = [
         {
             "video_uid": _clean(item.get("video_uid")),
@@ -6512,7 +8421,7 @@ def _parse_state(value: Any) -> Dict[str, Any]:
                 for item in state["videos"]
                 if isinstance(item, dict) and bool(item.get("selected"))
             ),
-            next(iter(catalog_by_uid), ""),
+            "",
         )
     preview_item = catalog_by_uid.get(requested_preview_uid, {})
     preview_order = _positive_int(preview_item.get("selection_order"))
@@ -6636,7 +8545,7 @@ def _parse_state(value: Any) -> Dict[str, Any]:
             state[key] = float(state.get(key) or 0.0)
         except Exception:
             state[key] = 0.0
-    state["language"] = "ko" if _clean(state.get("language")).lower() == "ko" else "en"
+    state["language"] = "en" if _clean(state.get("language")).lower() == "en" else "ko"
     state["outliner_search"] = _clean(state.get("outliner_search"))
     outliner_nodes = state.get("outliner_nodes") if isinstance(state.get("outliner_nodes"), list) else []
     cameras = state.get("cameras") if isinstance(state.get("cameras"), list) else []
@@ -6673,6 +8582,11 @@ def _parse_state(value: Any) -> Dict[str, Any]:
         state["last_operation_seconds"] = max(0.0, float(state.get("last_operation_seconds") or 0.0))
     except Exception:
         state["last_operation_seconds"] = 0.0
+    _normalize_picker_workspace_fields(
+        state,
+        source.get("picker_shots") if isinstance(source, dict) else None,
+        picker_shots_present=isinstance(source, dict) and "picker_shots" in source,
+    )
     return state
 
 
@@ -7022,7 +8936,7 @@ def _build_synchronized_video_outputs(
         "media_ready": bool(videos_payload),
         "active_slot_count": len(videos_payload),
         "selected_video_count": len(videos_payload),
-        "max_selected_videos": MAX_SELECTED_VIDEOS,
+        "max_selected_videos": MAX_REPRESENTATIVE_VIDEOS,
         "selection_id": selection_id,
         "ordered_video_uids": [
             _clean(item.get("video_uid")) for item in videos_payload
@@ -7126,12 +9040,26 @@ def _recover_orphaned_runtime_state(value: Any) -> tuple[Dict[str, Any], bool]:
         state["operation_started_at_ms"] = 0
         state["operation_finished_at_ms"] = int(time.time() * 1000)
         state["last_operation_seconds"] = 0.0
-        scene_text = _scene_path_text(
-            state.get("scene_draft_path")
-            or state.get("scene_request_path")
-            or state.get("scene_path")
+        scene_text = next(
+            (
+                candidate
+                for candidate in (
+                    _maya_scene_path_text(state.get("scene_draft_path")),
+                    _maya_scene_path_text(state.get("scene_request_path")),
+                    _maya_scene_path_text(state.get("scene_path")),
+                )
+                if candidate
+            ),
+            "",
         )
-        valid_scene = Path(scene_text).suffix.lower() in {".ma", ".mb"} if scene_text else False
+        if not scene_text:
+            state.update({
+                "scene_path": "",
+                "scene_draft_path": "",
+                "scene_request_path": "",
+                "native_read_ready": False,
+            })
+        valid_scene = bool(scene_text)
         if state.get("native_read_ready"):
             ready_stage = "VIDEO_READY" if state.get("videos") else "OUTLINER_READY"
             state["status"] = ready_stage
@@ -7341,23 +9269,26 @@ def _configure_picker_widget_parameter(parameter: Any) -> None:
         options.update({
             "display_name": "HMBVideoPickerLibrary",
             "is_full_width": True,
-            "height": PICKER_WIDGET_START_HEIGHT,
-            "min_height": PICKER_WIDGET_MIN_HEIGHT,
-            "widget_height": PICKER_WIDGET_START_HEIGHT,
+            "height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
+            "min_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
+            "widget_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
             "width": PICKER_START_WIDTH,
-            "min_width": 760,
+            "min_width": PICKER_WIDGET_MIN_WIDTH,
             "preferred_width": PICKER_START_WIDTH,
-            "preferred_height": PICKER_WIDGET_START_HEIGHT,
+            "preferred_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
             "default_width": PICKER_START_WIDTH,
-            "default_height": PICKER_WIDGET_START_HEIGHT,
+            "default_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
             "initial_width": PICKER_START_WIDTH,
-            "initial_height": PICKER_WIDGET_START_HEIGHT,
+            "initial_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
             "node_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
             "default_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
             "initial_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
-            # Persisted workflows can retain an older false value. Make the
-            # dashboard the single row that consumes all remaining node space.
-            "expandable": True,
+            # The HMB widget owns compact/expanded mode through its internal
+            # double-click controller.  Griptape's host-level expandable row
+            # allocator must stay disabled; otherwise a cold mount can move
+            # this state row (and its two companion rows) into Collapsed (3)
+            # before the widget has a chance to render or recover its height.
+            "expandable": False,
             "resizable": True,
             "compact": False,
         })
@@ -7407,21 +9338,24 @@ def _add_picker_widget(node: Any) -> None:
         "ui_options": {
             "display_name": "HMBVideoPickerLibrary",
             "is_full_width": True,
-            "height": PICKER_WIDGET_START_HEIGHT,
-            "min_height": PICKER_WIDGET_MIN_HEIGHT,
-            "widget_height": PICKER_WIDGET_START_HEIGHT,
+            "height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
+            "min_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
+            "widget_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
             "width": PICKER_START_WIDTH,
-            "min_width": 760,
+            "min_width": PICKER_WIDGET_MIN_WIDTH,
             "preferred_width": PICKER_START_WIDTH,
-            "preferred_height": PICKER_WIDGET_START_HEIGHT,
+            "preferred_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
             "default_width": PICKER_START_WIDTH,
-            "default_height": PICKER_WIDGET_START_HEIGHT,
+            "default_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
             "initial_width": PICKER_START_WIDTH,
-            "initial_height": PICKER_WIDGET_START_HEIGHT,
+            "initial_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
             "node_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
             "default_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
             "initial_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
-            "expandable": True,
+            # Compact/expanded mode is owned by the custom widget.  Keeping
+            # host adaptive expansion disabled guarantees that the state row
+            # remains mounted during cold load, reload, and mode transitions.
+            "expandable": False,
             "resizable": True,
             "compact": False,
         },
@@ -7518,7 +9452,12 @@ def _end_state_sync(node: Any) -> None:
     local.depth = max(0, int(getattr(local, "depth", 0) or 0) - 1)
 
 
-def _request_parameter_value(node: Any, name: str, value: Any, data_type: str) -> bool:
+def _request_parameter_value(
+    node: Any,
+    name: str,
+    value: Any,
+    data_type: str,
+) -> bool:
     """Publish a value through Griptape's retained-mode request bus when available."""
     try:
         from griptape_nodes.retained_mode.events.parameter_events import (  # type: ignore
@@ -8165,49 +10104,39 @@ def _choose_video_asset_files(initial_value: Any = "") -> List[str]:
         return [str(_norm_path(test_selection))]
     initial_path = _norm_path(initial_value) if _clean(initial_value) else None
     initial_dir = initial_path.parent if initial_path and initial_path.suffix else initial_path
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-
-        root = tk.Tk()
-        root.withdraw()
-        try:
-            root.attributes("-topmost", True)
-        except Exception as exc:
-            _diagnostic_exception("Native video dialog topmost configuration failed", exc)
-        try:
-            selected = filedialog.askopenfilenames(
-                parent=root,
-                title="Import MP4 Videos",
-                initialdir=(
-                    str(initial_dir)
-                    if initial_dir and initial_dir.is_dir()
-                    else None
-                ),
-                filetypes=[("MP4 Video", "*.mp4")],
-            )
-        finally:
-            root.destroy()
-    except Exception as tkinter_exc:
-        if os.name != "nt":
-            raise RuntimeError(
-                f"The native MP4 browser could not be opened: {tkinter_exc}"
-            ) from tkinter_exc
+    if os.name == "nt":
+        # The Picker command runs on a worker. Tk may silently hang when it is
+        # created from that thread, so Windows uses an independent STA WinForms
+        # dialog. Wrap the actual foreground Griptape HWND as IWin32Window: an
+        # invisible topmost owner can leave the common dialog behind Electron
+        # or on another monitor even though the command was delivered.
         initial_directory = (
             str(initial_dir) if initial_dir and initial_dir.is_dir() else ""
         )
         escaped_initial = initial_directory.replace("'", "''")
         script = (
             "Add-Type -AssemblyName System.Windows.Forms; "
+            "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; using System.Windows.Forms; public sealed class HmbPickerOwner : IWin32Window { public HmbPickerOwner(IntPtr handle) { Handle = handle; } public IntPtr Handle { get; private set; } } public static class HmbPickerNative { [DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow(); }'; "
+            "$foreground=[HmbPickerNative]::GetForegroundWindow(); "
+            "$owner=if($foreground -ne [IntPtr]::Zero){[HmbPickerOwner]::new($foreground)}else{$null}; "
             "$d=New-Object System.Windows.Forms.OpenFileDialog; "
             "$d.Title='Import MP4 Videos'; "
             "$d.Filter='MP4 Video (*.mp4)|*.mp4'; "
-            "$d.Multiselect=$true; "
+            "$d.Multiselect=$true; $d.CheckFileExists=$true; $d.RestoreDirectory=$true; "
             f"$d.InitialDirectory='{escaped_initial}'; "
-            "if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){$d.FileNames | ForEach-Object {[Console]::Out.WriteLine($_)}}"
+            "$result=if($owner){$d.ShowDialog($owner)}else{$d.ShowDialog()}; "
+            "if($result -eq [System.Windows.Forms.DialogResult]::OK){$d.FileNames | ForEach-Object {[Console]::Out.WriteLine($_)}}; "
+            "$d.Dispose()"
         )
         completed = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-STA", "-Command", script],
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-STA",
+                "-Command",
+                script,
+            ],
             capture_output=True,
             text=True,
             timeout=600,
@@ -8223,6 +10152,37 @@ def _choose_video_asset_files(initial_value: Any = "") -> List[str]:
             raise RuntimeError(
                 _clean(completed.stderr)
                 or "The Windows MP4 file dialog failed."
+            )
+    else:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                root.attributes("-topmost", True)
+            except Exception as exc:
+                _diagnostic_exception(
+                    "Native video dialog topmost configuration failed",
+                    exc,
+                )
+            try:
+                selected = filedialog.askopenfilenames(
+                    parent=root,
+                    title="Import MP4 Videos",
+                    initialdir=(
+                        str(initial_dir)
+                        if initial_dir and initial_dir.is_dir()
+                        else None
+                    ),
+                    filetypes=[("MP4 Video", "*.mp4")],
+                )
+            finally:
+                root.destroy()
+        except Exception as tkinter_exc:
+            raise RuntimeError(
+                f"The native MP4 browser could not be opened: {tkinter_exc}"
             ) from tkinter_exc
     if isinstance(selected, (str, Path)):
         selected = [selected] if _clean(selected) else []
@@ -8368,7 +10328,7 @@ def _filesystem_activity_snapshot(paths: Sequence[Path]) -> tuple[str, int, int]
 
 def _scene_fingerprint(value: Any) -> str:
     """Fingerprint a scene without reading Maya file contents."""
-    text = _scene_path_text(value)
+    text = _maya_scene_path_text(value)
     if not text:
         return ""
     try:
@@ -9124,6 +11084,9 @@ def _operation_input_digest(kind: str, scene_text: Any, state: Dict[str, Any], s
         })
         if kind_text == "run_video":
             payload.update({
+                "active_picker_shot_uuid": _uuid_text(
+                    normalized.get("active_picker_shot_uuid")
+                ),
                 "original_enabled": bool(normalized.get("original_enabled")),
                 "mask_enabled": bool(normalized.get("mask_enabled")),
                 "depth_enabled": depth_enabled,
@@ -9202,6 +11165,7 @@ class _OperationContext:
     depth_video_slot: int
     motion_guide_video_slot: int
     selected_roles: tuple[str, ...]
+    picker_shot_uuid: str
     accepted_state_revision: int
 
 
@@ -9260,11 +11224,6 @@ def _build_ffmpeg_encode_command(
         "-movflags", "+faststart",
         str(output_path),
     ]
-
-
-def _data_uri(path: Path) -> str:
-    mime = "image/jpeg" if path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
-    return "data:{0};base64,{1}".format(mime, base64.b64encode(path.read_bytes()).decode("ascii"))
 
 
 def _video_artifact_value(value: str, meta: Optional[Dict[str, Any]] = None) -> Any:
@@ -9561,19 +11520,67 @@ def _copy_video_to_griptape_project(
     return _video_artifact_value(macro_path, metadata), macro_path
 
 
+def _restored_picker_native_size(
+    serialized_metadata: Any,
+) -> tuple[Dict[str, Any], bool]:
+    """Return the saved native size after the versioned compact-height repair.
+
+    Compact mode formerly copied its small widget height into React Flow's
+    outer-node ``metadata.size``. Griptape then restored a node too short to
+    mount any of the three Picker rows. Only pre-v3 positive heights below the
+    supported resize floor are invalid. A valid user width is retained, while
+    an invalid/missing width falls back to the production start width.
+    """
+    if not isinstance(serialized_metadata, dict):
+        return {}, False
+    raw_size = serialized_metadata.get("size")
+    if not isinstance(raw_size, dict):
+        return {}, False
+    restored_size = dict(raw_size)
+    try:
+        native_size_version = max(
+            0,
+            int(float(serialized_metadata.get("hmb_picker_native_size_version") or 0)),
+        )
+    except (TypeError, ValueError, OverflowError):
+        native_size_version = 0
+    try:
+        saved_width = float(restored_size.get("width") or 0)
+        saved_height = float(restored_size.get("height") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return restored_size, False
+    should_repair = (
+        native_size_version < PICKER_NATIVE_SIZE_VERSION
+        and math.isfinite(saved_height)
+        and 0 < saved_height < PICKER_WIDGET_MIN_HEIGHT
+    )
+    if not should_repair:
+        return restored_size, False
+    safe_width = (
+        restored_size.get("width")
+        if math.isfinite(saved_width) and saved_width >= PICKER_WIDGET_MIN_WIDTH
+        else PICKER_START_WIDTH
+    )
+    return {
+        "width": safe_width,
+        "height": PICKER_START_HEIGHT,
+    }, True
+
+
 class HMBVideoPickerLibrary(DataNode):
     def __init__(self, **kwargs: Any):
         serialized_metadata = kwargs.get("metadata")
-        restored_size = (
-            dict(serialized_metadata.get("size") or {})
-            if isinstance(serialized_metadata, dict)
-            and isinstance(serialized_metadata.get("size"), dict)
-            else {}
+        restored_size, restored_size_migrated = _restored_picker_native_size(
+            serialized_metadata
         )
         super().__init__(**kwargs)
         if restored_size:
             current_metadata = dict(getattr(self, "metadata", {}) or {})
             current_metadata["size"] = restored_size
+            if restored_size_migrated:
+                current_metadata["hmb_picker_native_size_version"] = (
+                    PICKER_NATIVE_SIZE_VERSION
+                )
             self.metadata = current_metadata
         self.category = "HMB_GP_Production"
         self.description = (
@@ -9581,8 +11588,9 @@ class HMBVideoPickerLibrary(DataNode):
             "asset history, and Color/Depth/Motion playblast generator."
         )
         # Griptape reads native React Flow dimensions from metadata["size"].
-        # This fills only a missing size, so restored/user-resized nodes keep
-        # their saved dimensions while new nodes start at the production frame.
+        # This fills a missing size and repairs only the legacy compact-height
+        # corruption above. Valid restored/user-resized nodes keep their saved
+        # dimensions while new nodes start at the production frame.
         saved_size: Dict[str, Any] = {}
         has_saved_size = False
         try:
@@ -9606,10 +11614,9 @@ class HMBVideoPickerLibrary(DataNode):
                 self.metadata = metadata
             metadata = getattr(self, "metadata", None)
             if isinstance(metadata, dict):
-                # Version the default-size contract without migrating an
-                # already serialized size. User-resized nodes must never be
-                # reset when the library is updated.
-                metadata.setdefault("hmb_picker_native_size_version", PICKER_NATIVE_SIZE_VERSION)
+                # Mark the current contract after the one-time compact-height
+                # repair. Valid user-resized nodes retain their exact size.
+                metadata["hmb_picker_native_size_version"] = PICKER_NATIVE_SIZE_VERSION
         except Exception as exc:
             _diagnostic_exception("Native picker initial size registration failed", exc)
         self.ui_options = {
@@ -9624,13 +11631,17 @@ class HMBVideoPickerLibrary(DataNode):
             "node_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
             "default_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
             "initial_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
-            "min_width": 760,
+            "min_width": PICKER_WIDGET_MIN_WIDTH,
             "min_height": PICKER_WIDGET_MIN_HEIGHT,
             "resizable": True,
         }
         self.width = saved_size.get("width") if has_saved_size else PICKER_START_WIDTH
         self.height = saved_size.get("height") if has_saved_size else PICKER_START_HEIGHT
         self._hmb_video_output: Any = None
+        self._hmb_node_deleted = False
+        self._hmb_lifecycle_generation = 1
+        self._hmb_delete_parent_called = False
+        self._hmb_deletion_reconcile_called = False
         self._hmb_process_lock = threading.Lock()
         self._hmb_active_process: Optional[subprocess.Popen[Any]] = None
         self._hmb_worker_thread: Optional[threading.Thread] = None
@@ -9642,24 +11653,83 @@ class HMBVideoPickerLibrary(DataNode):
         self._hmb_state_sync_local = threading.local()
         self._hmb_state_write_lock = threading.RLock()
         self._hmb_command_lock = threading.RLock()
+        # Serializes catalog authority changes and MP4 import commits. File
+        # browsers may run concurrently, but no stale whole-state import may
+        # overwrite another import or resurrect an ImageAsset-deleted Shot.
+        self._hmb_catalog_commit_lock = threading.RLock()
+        self._hmb_shot_snapshot_lock = threading.RLock()
         self._hmb_latest_widget_state: Optional[Dict[str, Any]] = None
         self._hmb_authoritative_state: Optional[Dict[str, Any]] = None
         self._hmb_state_revision = 0
         self._hmb_runtime_instance_id = f"{id(self):x}-{time.time_ns():x}"
+        self._hmb_serialized_maya_scene_path = ""
+        self._hmb_picker_publisher_uuid = str(uuid.uuid4())
         self._hmb_processed_action_ids: set[str] = set()
         self._hmb_active_operation: Optional[_OperationContext] = None
         self._hmb_pending_scene_selection: Optional[tuple[str, str]] = None
+        self._hmb_last_public_output_fingerprint = ""
+        self._hmb_last_shot_output_fingerprint = ""
+        self._hmb_shot_catalog_snapshot: Optional[Dict[str, Any]] = None
+        self._hmb_shot_catalog_refresh_count = 0
+        self._hmb_shot_snapshot_identity = ""
+        self._hmb_shot_snapshot_generation = 0
+        self._hmb_standalone_catalog_identity = ""
+        self._hmb_standalone_catalog_generation = 0
+        self._hmb_shot_route_status: Dict[str, Any] = {}
+        self._hmb_shared_routing_in_progress = False
 
         _add_picker_output(self)
         _add_video_output(self)
+        _add_shot_picker_output(self)
         _retire_legacy_video_slot_outputs(self)
         _add_maya_scene_picker(self)
         _add_picker_command_bridge(self)
         _add_picker_widget(self)
+        self._initialize_fresh_instance_state()
         _reorder_video_picker_parameters(self, 1)
         set_output(self, "PICKER_OUT", "")
         set_output(self, VIDEO_OUTPUT_PARAMETER, [])
+        set_output(self, SHOT_PICKER_OUTPUT_PARAMETER, {})
         self._seed_python_runtime_state()
+        _shot_routing.schedule_post_registration_reconcile(self)
+
+    def _initialize_fresh_instance_state(self) -> None:
+        """Seal a newly constructed node to instance-local empty defaults.
+
+        Griptape restores a workflow only *after* constructing the node, via
+        ``set_parameter_value(..., initial_setup=True)`` and the deserialize
+        hooks below.  Constructor-time parameter values therefore never carry
+        saved-workflow authority.  Replacing them here prevents a retained
+        native FileSystemPicker/widget bridge (or a reused parameter template)
+        from donating the previous node's Maya path to a newly added node.
+
+        This is intentionally a direct initial-value store: no value-set hook,
+        native browser, Maya validation, or output publication may run while a
+        fresh node is still being registered.  Explicit serialized hydration,
+        Browse, and READ all happen later and remain authoritative.
+        """
+
+        fresh_values = {
+            "MAYA_SCENE": "",
+            WIDGET_STATE_PARAMETER: _default_widget_state(),
+            WIDGET_COMMAND_PARAMETER: _default_picker_command(
+                self._hmb_runtime_instance_id
+            ),
+        }
+        for name, value in fresh_values.items():
+            self._store_initial_parameter_value(name, value)
+
+    def _store_initial_parameter_value(self, name: str, value: Any) -> None:
+        """Store one construction/deserialize value without lifecycle echoes."""
+
+        stored_value = copy.deepcopy(value)
+        parameter_values = getattr(self, "parameter_values", None)
+        if isinstance(parameter_values, dict):
+            parameter_values[name] = stored_value
+            return
+        parameter = _get_parameter_obj(self, name)
+        if parameter is not None:
+            setattr(parameter, "default_value", stored_value)
 
     def _seed_python_runtime_state(self) -> None:
         """Publish a boot handshake before the widget mounts.
@@ -9770,6 +11840,7 @@ class HMBVideoPickerLibrary(DataNode):
     def _ensure_parameters(self) -> None:
         _add_picker_output(self)
         _add_video_output(self)
+        _add_shot_picker_output(self)
         _retire_legacy_video_slot_outputs(self)
         _add_maya_scene_picker(self)
         _add_picker_command_bridge(self)
@@ -9791,6 +11862,26 @@ class HMBVideoPickerLibrary(DataNode):
         )
         return raw_state
 
+    @contextmanager
+    def _hmb_catalog_state_commit(self):
+        """Serialize catalog RMW transactions in one invariant lock order."""
+
+        catalog_lock = getattr(self, "_hmb_catalog_commit_lock", None)
+        state_lock = getattr(self, "_hmb_state_write_lock", None)
+        if catalog_lock is None:
+            if state_lock is None:
+                yield
+                return
+            with state_lock:
+                yield
+                return
+        with catalog_lock:
+            if state_lock is None:
+                yield
+                return
+            with state_lock:
+                yield
+
     def _write_state(self, state: Dict[str, Any]) -> None:
         """Publish one serialized state snapshot.
 
@@ -9798,7 +11889,14 @@ class HMBVideoPickerLibrary(DataNode):
         orchestrator publishes a distinct external widget update. A direct setter
         remains only as the local-validation fallback.
         """
+        if getattr(self, "_hmb_node_deleted", False):
+            return
         with self._hmb_state_write_lock:
+            if getattr(self, "_hmb_node_deleted", False):
+                return
+            owner_generation = int(
+                getattr(self, "_hmb_lifecycle_generation", 0) or 0
+            )
             normalized = _parse_state(state)
             logged_messages = {
                 _clean(entry.get("message"))
@@ -9829,6 +11927,10 @@ class HMBVideoPickerLibrary(DataNode):
             )
             normalized["state_revision"] = current_revision + 1
             normalized["state_writer"] = "python"
+            normalized["writer_runtime_instance_id"] = (
+                self._hmb_runtime_instance_id
+            )
+            normalized["writer_lifecycle_generation"] = owner_generation
             normalized["state_published_at_ms"] = int(time.time() * 1000)
             _begin_state_sync(self)
             try:
@@ -9841,6 +11943,12 @@ class HMBVideoPickerLibrary(DataNode):
                     _set_parameter_value(self, WIDGET_STATE_PARAMETER, normalized)
             finally:
                 _end_state_sync(self)
+            if (
+                getattr(self, "_hmb_node_deleted", False)
+                or owner_generation
+                != int(getattr(self, "_hmb_lifecycle_generation", 0) or 0)
+            ):
+                return
             self._hmb_state_revision = normalized["state_revision"]
             self._hmb_authoritative_state = dict(normalized)
             self._hmb_latest_widget_state = dict(normalized)
@@ -9848,7 +11956,23 @@ class HMBVideoPickerLibrary(DataNode):
     @staticmethod
     def _merge_widget_state(authoritative: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
         merged = dict(_parse_state(authoritative))
+        # Preserve the raw UUID-scoped UI delta before normalization. A stale
+        # browser echo may carry an incomplete catalog/ownership list; parsing
+        # that echo first would discard an otherwise valid selection before it
+        # can be filtered against the authoritative workspace membership.
+        raw_incoming = dict(incoming) if isinstance(incoming, dict) else {}
+        raw_incoming_rows = (
+            list(raw_incoming.get("picker_shots") or [])
+            if isinstance(raw_incoming.get("picker_shots"), list)
+            else []
+        )
+        raw_incoming_active_uuid = _uuid_text(
+            raw_incoming.get("active_picker_shot_uuid")
+        )
         incoming = _parse_state(incoming)
+        authoritative_revision = int(merged.get("state_revision") or 0)
+        incoming_revision = int(incoming.get("state_revision") or 0)
+        stale_picker_echo = incoming_revision < authoritative_revision
         widget_owned_fields = {
             "lower_panel_ratio", "main_split_ratio", "right_split_ratio", "node_width", "node_height",
             "outliner_panel_height", "viewport_panel_height", "right_section_heights",
@@ -9858,9 +11982,6 @@ class HMBVideoPickerLibrary(DataNode):
             "slot_assignments", "slot_visibility", "snapshot_frame", "snapshot_video_slot",
             "activity_log_text", "activity_log_text_user_edited", "activity_log_cleared",
             "scene_draft_path", "scene_request_path",
-            "selected_video_slot", "active_slot_count", "videos",
-            "preview_video_uid", "selected_video_uid", "selected_video_path",
-            "video_library_version",
             "output_width", "output_height",
             "original_enabled", "mask_enabled",
             "depth_enabled", "motion_guide_enabled",
@@ -9869,6 +11990,82 @@ class HMBVideoPickerLibrary(DataNode):
         for key in widget_owned_fields:
             if key in incoming:
                 merged[key] = incoming[key]
+        if not stale_picker_echo:
+            # Catalog rows and media are Python/ImageAsset authority even when
+            # a browser echo has the same revision. Apply only workspace-UUID
+            # scoped UI deltas; never accept row creation/removal, ownership,
+            # binding, route metadata, or a replacement video catalog.
+            incoming_rows_by_uuid = {
+                _uuid_text(row.get("workspace_uuid")): row
+                for row in raw_incoming_rows
+                if isinstance(row, dict)
+                and _uuid_text(row.get("workspace_uuid"))
+            }
+            merged_rows: List[Dict[str, Any]] = []
+            for raw_row in merged.get("picker_shots", []):
+                if not isinstance(raw_row, dict):
+                    continue
+                row = dict(raw_row)
+                workspace_uuid = _uuid_text(row.get("workspace_uuid"))
+                incoming_row = incoming_rows_by_uuid.get(workspace_uuid)
+                if isinstance(incoming_row, dict):
+                    owned_uids = _picker_representative_video_uids(
+                        row.get("video_asset_uids")
+                    )
+                    owned_set = set(owned_uids)
+                    selected_uids = _picker_representative_video_uids(
+                        incoming_row.get("selected_video_uids"),
+                        "",
+                        owned_set,
+                    )
+                    preview_uid = _clean(
+                        incoming_row.get("preview_video_uid")
+                    )
+                    if preview_uid not in owned_set:
+                        preview_uid = (
+                            selected_uids[0]
+                            if selected_uids
+                            else _clean(row.get("preview_video_uid"))
+                        )
+                    row.update({
+                        "name": _clean(incoming_row.get("name"))[:128]
+                        or _clean(row.get("name"))[:128],
+                        "custom_name": bool(
+                            incoming_row.get("custom_name")
+                        ),
+                        "selected_video_uids": selected_uids,
+                        "preview_video_uid": preview_uid,
+                        "scene_draft_path": _maya_scene_path_text(
+                            incoming_row.get("scene_draft_path")
+                        ),
+                        "current_frame": incoming_row.get(
+                            "current_frame",
+                            row.get("current_frame", 0.0),
+                        ),
+                        "viewport_mode": incoming_row.get(
+                            "viewport_mode",
+                            row.get("viewport_mode", "video"),
+                        ),
+                        "active_snapshot_uid": _clean(
+                            incoming_row.get("active_snapshot_uid")
+                        ),
+                        "selected_video_slot": incoming_row.get(
+                            "selected_video_slot",
+                            row.get("selected_video_slot", 1),
+                        ),
+                        "revision": max(
+                            int(row.get("revision") or 0),
+                            int(incoming_row.get("revision") or 0),
+                        ),
+                    })
+                merged_rows.append(row)
+            merged["picker_shots"] = merged_rows
+            requested_active_uuid = raw_incoming_active_uuid
+            if requested_active_uuid in {
+                _uuid_text(row.get("workspace_uuid"))
+                for row in merged_rows
+            }:
+                merged["active_picker_shot_uuid"] = requested_active_uuid
         # Snapshot media/history is backend authoritative. A current widget may
         # move only the active pointer/view mode, and an older browser echo may
         # not roll either pointer back after Python has published new history.
@@ -10100,6 +12297,877 @@ class HMBVideoPickerLibrary(DataNode):
     def _build_picker_payload(self, state: Dict[str, Any]) -> Dict[str, Any]:
         return _build_synchronized_video_outputs(state)[0]
 
+    @staticmethod
+    def _validate_image_shot_catalog_snapshot(
+        value: Any,
+        *,
+        expected_channel_uuid: str = "",
+    ) -> Dict[str, Any]:
+        required = {
+            "schema", "version", "publisher_instance_uuid", "channel_uuid",
+            "generation", "metadata_sha256", "shots",
+        }
+        if not isinstance(value, dict) or set(value) != required:
+            raise ValueError("ImageAsset Shot catalog has unknown or missing fields.")
+        if value.get("schema") != "hmb-shot-routing-catalog" or value.get("version") != 1:
+            raise ValueError("ImageAsset Shot catalog schema is invalid.")
+        publisher = _uuid_text(value.get("publisher_instance_uuid"))
+        channel = _uuid_text(value.get("channel_uuid"))
+        expected = _uuid_text(expected_channel_uuid)
+        if not publisher or not channel or (expected and channel != expected):
+            raise ValueError("ImageAsset Shot catalog publisher/channel mismatch.")
+        generation = value.get("generation")
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
+            raise ValueError("ImageAsset Shot catalog generation is invalid.")
+        raw_shots = value.get("shots")
+        if (
+            not isinstance(raw_shots, list)
+            or not 1 <= len(raw_shots) <= SHOT_ROUTING_MAX_SHOTS
+        ):
+            raise ValueError("ImageAsset Shot catalog collections are invalid.")
+        shots: List[Dict[str, Any]] = []
+        shot_ids: set[str] = set()
+        shot_numbers: set[int] = set()
+        for raw in raw_shots:
+            if not isinstance(raw, dict) or set(raw) != {
+                "shot_uuid", "number", "name", "revision",
+            }:
+                raise ValueError("ImageAsset Shot record is invalid.")
+            shot_uuid = _uuid_text(raw.get("shot_uuid"))
+            number = raw.get("number")
+            revision = raw.get("revision")
+            name = _clean(raw.get("name"))[:128]
+            if (
+                not shot_uuid or shot_uuid in shot_ids or not name
+                or not isinstance(raw.get("name"), str)
+                or raw.get("name") != name
+                or len(name) > 128
+                or not isinstance(number, int) or isinstance(number, bool)
+                or number in shot_numbers or not 1 <= number <= SHOT_ROUTING_MAX_SHOTS
+                or not isinstance(revision, int) or isinstance(revision, bool) or revision < 0
+            ):
+                raise ValueError("ImageAsset Shot identity/revision is invalid.")
+            shot_ids.add(shot_uuid)
+            shot_numbers.add(number)
+            shots.append({
+                "shot_uuid": shot_uuid,
+                "number": number,
+                "name": name,
+                "revision": revision,
+            })
+        metadata_document = {
+            "channel_uuid": channel,
+            "generation": generation,
+            "shots": shots,
+        }
+        metadata_hash = _clean(value.get("metadata_sha256")).casefold()
+        if metadata_hash != _sha256_canonical(metadata_document):
+            raise ValueError("ImageAsset Shot metadata hash does not match.")
+        return {
+            **copy.deepcopy(value),
+            "publisher_instance_uuid": publisher,
+            "channel_uuid": channel,
+            "shots": shots,
+            "metadata_sha256": metadata_hash,
+        }
+
+    def _hmb_shot_channel_subscription(self) -> Dict[str, Any]:
+        state = self._picker_state()
+        channel_uuid = _uuid_text(state.get("channel_uuid"))
+        shot_uuid = _uuid_text(state.get("shot_uuid"))
+        if not channel_uuid:
+            # A standalone Picker still owns one bounded local Shot catalog for
+            # downstream video-conditioned generation. ImageAsset remains the
+            # authority whenever it exists; its catalog replaces this private
+            # fallback without changing the Picker's durable video ownership.
+            catalog = self._hmb_standalone_shot_routing_catalog()
+            rows = [
+                item for item in state.get("picker_shots", [])
+                if isinstance(item, dict) and _uuid_text(item.get("workspace_uuid"))
+            ]
+            active_workspace = _uuid_text(state.get("active_picker_shot_uuid"))
+            active = next(
+                (
+                    item for item in rows
+                    if _uuid_text(item.get("workspace_uuid")) == active_workspace
+                ),
+                rows[0] if rows else {},
+            )
+            fallback_shot_uuid = _uuid_text(active.get("workspace_uuid"))
+            fallback_number = max(
+                1,
+                min(SHOT_ROUTING_MAX_SHOTS, int(active.get("number") or 1)),
+            )
+            fallback_name = _clean(active.get("name"))[:128] or f"Shot {fallback_number}"
+            return {
+                "schema": "hmb-shot-channel-subscription",
+                "version": 1,
+                "participant_kind": "video_picker",
+                "enabled": bool(catalog and fallback_shot_uuid),
+                "channel_uuid": _uuid_text(catalog.get("channel_uuid")),
+                "shot_uuid": fallback_shot_uuid,
+                "shot_number": fallback_number,
+                "shot_name": fallback_name,
+            }
+        # VideoPicker is a flow-level Shot publisher.  Once it has accepted the
+        # ImageAsset channel it can publish the complete per-Shot snapshot even
+        # while its local workspace selector displays ``Only``.  Requiring an
+        # active workspace UUID here detached PICKER_OUT from every Prompt until
+        # the user made an otherwise unnecessary UI selection.  The central
+        # router deliberately exempts ImageAsset/VideoPicker from the per-Shot
+        # UUID requirement for this reason.
+        enabled = bool(channel_uuid)
+        selected = bool(channel_uuid and shot_uuid)
+        return {
+            "schema": "hmb-shot-channel-subscription",
+            "version": 1,
+            "participant_kind": "video_picker",
+            "enabled": enabled,
+            # Retain the accepted channel while Only is selected so the
+            # backend-supplied options remain visible.  ``enabled`` is the
+            # sole remote-routing gate and additionally requires Shot UUID.
+            "channel_uuid": channel_uuid,
+            "shot_uuid": shot_uuid if selected else "",
+            "shot_number": int(state.get("shot_number") or 1) if selected else 1,
+            "shot_name": (_clean(state.get("shot_name")) or "Shot 1") if selected else "Only",
+        }
+
+    def _hmb_standalone_shot_routing_catalog(self) -> Dict[str, Any]:
+        """Publish a media-free local catalog when no ImageAsset exists.
+
+        This fallback is intentionally private to optional downstream media
+        routing. Prompt and Agent keep ImageAsset as their Shot authority.
+        """
+
+        lock = getattr(self, "_hmb_shot_snapshot_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._hmb_shot_snapshot_lock = lock
+        with lock:
+            return self._hmb_standalone_shot_routing_catalog_locked(
+                self._picker_state()
+            )
+
+    def _hmb_standalone_shot_routing_catalog_locked(
+        self,
+        state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if _uuid_text(state.get("channel_uuid")):
+            return {}
+        publisher = _uuid_text(getattr(self, "_hmb_picker_publisher_uuid", ""))
+        if not publisher:
+            publisher = str(uuid.uuid4())
+            self._hmb_picker_publisher_uuid = publisher
+        shots: List[Dict[str, Any]] = []
+        numbers: set[int] = set()
+        for row in state.get("picker_shots", []):
+            if not isinstance(row, dict):
+                continue
+            shot_uuid = _uuid_text(row.get("workspace_uuid"))
+            try:
+                number = int(row.get("number") or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if (
+                not shot_uuid
+                or not 1 <= number <= SHOT_ROUTING_MAX_SHOTS
+                or number in numbers
+            ):
+                continue
+            name = _clean(row.get("name"))[:128] or f"Shot {number}"
+            try:
+                revision = max(0, int(row.get("revision") or 0))
+            except (TypeError, ValueError, OverflowError):
+                revision = 0
+            numbers.add(number)
+            shots.append({
+                "shot_uuid": shot_uuid,
+                "number": number,
+                "name": name,
+                "revision": revision,
+            })
+        shots.sort(key=lambda item: (item["number"], item["shot_uuid"]))
+        if not shots:
+            return {}
+        identity = _sha256_canonical({
+            "channel_uuid": publisher,
+            "shots": shots,
+        })
+        previous_identity = str(
+            getattr(self, "_hmb_standalone_catalog_identity", "") or ""
+        )
+        generation = max(
+            1,
+            int(getattr(self, "_hmb_standalone_catalog_generation", 0) or 0),
+        )
+        if previous_identity and previous_identity != identity:
+            generation += 1
+        self._hmb_standalone_catalog_identity = identity
+        self._hmb_standalone_catalog_generation = generation
+        metadata_document = {
+            "channel_uuid": publisher,
+            "generation": generation,
+            "shots": shots,
+        }
+        return {
+            "schema": "hmb-shot-routing-catalog",
+            "version": 1,
+            "publisher_instance_uuid": publisher,
+            "channel_uuid": publisher,
+            "generation": generation,
+            "metadata_sha256": _sha256_canonical(metadata_document),
+            "shots": shots,
+        }
+
+    def _hmb_shot_routing_status(self, value: Any) -> None:
+        if isinstance(value, dict):
+            self._hmb_shot_route_status = copy.deepcopy(value)
+
+    def _hmb_reconcile_shot_routing(
+        self,
+        routing_snapshot: Any = None,
+    ) -> Dict[str, Any]:
+        """Atomically accept one ImageAsset catalog and commit its delta."""
+
+        with self._hmb_catalog_state_commit():
+            return self._hmb_reconcile_shot_routing_commit(routing_snapshot)
+
+    def _hmb_reconcile_replacement_shot_routing(
+        self,
+        routing_snapshot: Any = None,
+    ) -> Dict[str, Any]:
+        """Adopt the sole replacement ImageAsset after its predecessor left.
+
+        The shared router calls this narrow path only when the Picker's saved
+        channel has no live ImageAsset owner and the flow contains exactly one
+        replacement publisher.  Clearing the stale quartet first prevents an
+        old publisher UUID from permanently rejecting the new catalog.
+        """
+
+        snapshot = self._validate_image_shot_catalog_snapshot(routing_snapshot)
+        with self._hmb_catalog_state_commit():
+            current = self._picker_state()
+            current_channel = (
+                _uuid_text(current.get("channel_uuid"))
+                or _uuid_text(
+                    current.get("accepted_shot_catalog_channel_uuid")
+                )
+            )
+            current_publisher = _uuid_text(
+                current.get("shot_publisher_instance_uuid")
+            ) or _uuid_text(
+                current.get("accepted_shot_catalog_publisher_instance_uuid")
+            )
+            replacing = bool(
+                current_channel
+                and (
+                    current_channel != snapshot["channel_uuid"]
+                    or (
+                        current_publisher
+                        and current_publisher
+                        != snapshot["publisher_instance_uuid"]
+                    )
+                )
+            )
+            if not replacing:
+                return self._hmb_reconcile_shot_routing_commit(snapshot)
+
+            # This callback is reached only after the central router proves that
+            # the previous publisher is absent and exactly one authoritative
+            # replacement exists.  That explicit lifecycle event is the sole
+            # place where display order may bridge newly generated Shot UUIDs.
+            # Ordinary catalog updates remain UUID-only.
+            old_rows = [
+                copy.deepcopy(row)
+                for row in current.get("picker_shots", [])
+                if isinstance(row, dict)
+                and _uuid_text(row.get("workspace_uuid"))
+                and _uuid_text(row.get("bound_shot_uuid"))
+            ]
+            old_rows.sort(
+                key=lambda row: (
+                    int(row.get("number") or 0),
+                    _uuid_text(row.get("workspace_uuid")),
+                )
+            )
+            new_shots = sorted(
+                (dict(item) for item in snapshot["shots"]),
+                key=lambda item: (int(item["number"]), item["shot_uuid"]),
+            )
+            old_numbers = [int(row.get("number") or 0) for row in old_rows]
+            new_numbers = [int(item["number"]) for item in new_shots]
+            unambiguous = bool(
+                old_rows
+                and len(old_rows) == len(new_shots)
+                and old_numbers == new_numbers
+                and len({_uuid_text(row.get("workspace_uuid")) for row in old_rows})
+                == len(old_rows)
+                and len({_uuid_text(row.get("bound_shot_uuid")) for row in old_rows})
+                == len(old_rows)
+            )
+            if not unambiguous:
+                # Preserve every authored workspace/media record as an orphan;
+                # never delete it or guess a different target when the old/new
+                # shapes cannot be paired exactly.  Clearing only the remote
+                # quartet makes the ambiguity visible and retry-safe.
+                self._hmb_clear_shot_routing_catalog_commit(
+                    "replacement_shape_ambiguous_media_preserved"
+                )
+                self._hmb_shot_route_status = {
+                    "schema": "hmb-shot-routing-status",
+                    "version": 1,
+                    "ok": False,
+                    "code": "replacement_ambiguous",
+                    "details": (
+                        "ImageAsset replacement Shot shape differs; Picker media "
+                        "was preserved without automatic rebinding."
+                    ),
+                }
+                raise ValueError(
+                    "ImageAsset replacement Shot shape is ambiguous; Picker media was preserved."
+                )
+
+            active_workspace_uuid = _uuid_text(
+                current.get("active_picker_shot_uuid")
+            )
+            migrated_rows: List[Dict[str, Any]] = []
+            shot_selections: List[Dict[str, Any]] = []
+            selected_catalog_row: Optional[Dict[str, Any]] = None
+            for old_row, new_shot in zip(old_rows, new_shots):
+                migrated = copy.deepcopy(old_row)
+                migrated["bound_shot_uuid"] = new_shot["shot_uuid"]
+                migrated["number"] = new_shot["number"]
+                if not bool(migrated.get("custom_name")):
+                    migrated["name"] = new_shot["name"]
+                migrated_rows.append(migrated)
+                shot_selections.append({
+                    "shot_uuid": new_shot["shot_uuid"],
+                    "number": new_shot["number"],
+                    "name": new_shot["name"],
+                    "revision": max(0, int(new_shot.get("revision") or 0)),
+                    "selected_video_uids": list(
+                        migrated.get("selected_video_uids") or []
+                    )[:MAX_SELECTED_VIDEOS],
+                })
+                if _uuid_text(migrated.get("workspace_uuid")) == active_workspace_uuid:
+                    selected_catalog_row = new_shot
+            if selected_catalog_row is None:
+                selected_catalog_row = new_shots[0]
+                active_workspace_uuid = _uuid_text(
+                    migrated_rows[0].get("workspace_uuid")
+                )
+
+            migrated_state = copy.deepcopy(current)
+            migrated_state.update({
+                "picker_shots": migrated_rows,
+                "active_picker_shot_uuid": active_workspace_uuid,
+                "shot_publisher_instance_uuid": snapshot[
+                    "publisher_instance_uuid"
+                ],
+                "channel_uuid": snapshot["channel_uuid"],
+                "shot_uuid": selected_catalog_row["shot_uuid"],
+                "shot_number": selected_catalog_row["number"],
+                "shot_name": selected_catalog_row["name"],
+                "shot_selections": shot_selections,
+                "accepted_shot_catalog_publisher_instance_uuid": snapshot[
+                    "publisher_instance_uuid"
+                ],
+                "accepted_shot_catalog_channel_uuid": snapshot["channel_uuid"],
+                "accepted_shot_catalog_generation": snapshot["generation"],
+                "accepted_shot_catalog_metadata_sha256": snapshot[
+                    "metadata_sha256"
+                ],
+            })
+            normalized = self._apply_selected_view_fields(
+                _parse_state(migrated_state)
+            )
+            self._hmb_shot_catalog_snapshot = copy.deepcopy(snapshot)
+            self._hmb_shot_catalog_refresh_count = max(
+                0,
+                int(getattr(self, "_hmb_shot_catalog_refresh_count", 0) or 0),
+            ) + 1
+            self._hmb_shot_route_status = {
+                "schema": "hmb-shot-routing-status",
+                "version": 1,
+                "ok": True,
+                "code": "ready",
+                "details": "ImageAsset replacement adopted; Picker workspaces preserved.",
+            }
+            if normalized != current:
+                self._write_state(normalized)
+                self._sync_outputs_from_state(normalized)
+            return self._hmb_shot_channel_subscription()
+
+    def _hmb_reconcile_shot_routing_commit(
+        self,
+        routing_snapshot: Any = None,
+    ) -> Dict[str, Any]:
+        current = self._picker_state()
+        expected_channel = _uuid_text(current.get("channel_uuid"))
+        expected_publisher = _uuid_text(
+            current.get("shot_publisher_instance_uuid")
+        )
+        snapshot = self._validate_image_shot_catalog_snapshot(
+            routing_snapshot,
+            expected_channel_uuid=expected_channel,
+        )
+        if (
+            expected_publisher
+            and snapshot["publisher_instance_uuid"] != expected_publisher
+        ):
+            raise ValueError("ImageAsset Shot catalog publisher does not match.")
+        watermark_scope_matches = bool(
+            _uuid_text(
+                current.get("accepted_shot_catalog_publisher_instance_uuid")
+            ) == snapshot["publisher_instance_uuid"]
+            and _uuid_text(current.get("accepted_shot_catalog_channel_uuid"))
+            == snapshot["channel_uuid"]
+        )
+        if watermark_scope_matches:
+            accepted_generation = int(
+                current.get("accepted_shot_catalog_generation") or 0
+            )
+            accepted_hash = _clean(
+                current.get("accepted_shot_catalog_metadata_sha256")
+            ).casefold()
+            if snapshot["generation"] < accepted_generation:
+                raise ValueError(
+                    "ImageAsset Shot catalog generation moved backwards."
+                )
+            if (
+                snapshot["generation"] == accepted_generation
+                and accepted_hash
+                and snapshot["metadata_sha256"] != accepted_hash
+            ):
+                raise ValueError(
+                    "ImageAsset Shot catalog changed without a generation revision."
+                )
+        previous = getattr(self, "_hmb_shot_catalog_snapshot", None)
+        if (
+            isinstance(previous, dict)
+            and previous.get("publisher_instance_uuid")
+            == snapshot["publisher_instance_uuid"]
+            and previous.get("channel_uuid") == snapshot["channel_uuid"]
+        ):
+            previous_generation = int(previous.get("generation") or 0)
+            if snapshot["generation"] < previous_generation:
+                raise ValueError("ImageAsset Shot catalog generation moved backwards.")
+            if snapshot["generation"] == previous_generation and (
+                snapshot["metadata_sha256"] != previous.get("metadata_sha256")
+            ):
+                raise ValueError("ImageAsset Shot catalog changed without a generation revision.")
+
+        rows_by_uuid = {
+            _uuid_text(row.get("shot_uuid")): dict(row)
+            for row in current.get("shot_selections", [])
+            if isinstance(row, dict) and _uuid_text(row.get("shot_uuid"))
+        }
+        selected_shot_uuid = _uuid_text(current.get("shot_uuid"))
+        catalog_ids = {item["shot_uuid"] for item in snapshot["shots"]}
+        if selected_shot_uuid and selected_shot_uuid not in catalog_ids:
+            # A validated newer ImageAsset catalog is authoritative deletion.
+            # Normalization below removes that bound workspace and its owned
+            # media, then falls back to the first remaining ImageAsset Shot.
+            selected_shot_uuid = ""
+
+        normalized_rows: List[Dict[str, Any]] = []
+        for catalog_shot in snapshot["shots"]:
+            row = rows_by_uuid.get(catalog_shot["shot_uuid"], {})
+            membership = list(row.get("selected_video_uids") or [])
+            normalized_rows.append({
+                "shot_uuid": catalog_shot["shot_uuid"],
+                "number": catalog_shot["number"],
+                "name": catalog_shot["name"],
+                "revision": max(0, int(catalog_shot.get("revision") or 0)),
+                "selected_video_uids": membership[:MAX_SELECTED_VIDEOS],
+            })
+        selected_row = next(
+            (item for item in normalized_rows if item["shot_uuid"] == selected_shot_uuid),
+            None,
+        )
+        current.update({
+            "shot_publisher_instance_uuid": snapshot["publisher_instance_uuid"],
+            "channel_uuid": snapshot["channel_uuid"],
+            "shot_uuid": selected_row["shot_uuid"] if selected_row else "",
+            "shot_number": selected_row["number"] if selected_row else 0,
+            "shot_name": selected_row["name"] if selected_row else "",
+            "shot_selections": normalized_rows,
+            "accepted_shot_catalog_publisher_instance_uuid": snapshot[
+                "publisher_instance_uuid"
+            ],
+            "accepted_shot_catalog_channel_uuid": snapshot["channel_uuid"],
+            "accepted_shot_catalog_generation": snapshot["generation"],
+            "accepted_shot_catalog_metadata_sha256": snapshot[
+                "metadata_sha256"
+            ],
+        })
+        normalized = self._apply_selected_view_fields(_parse_state(current))
+        self._hmb_shot_catalog_snapshot = copy.deepcopy(snapshot)
+        self._hmb_shot_catalog_refresh_count = max(
+            0,
+            int(getattr(self, "_hmb_shot_catalog_refresh_count", 0) or 0),
+        ) + 1
+        self._hmb_shot_route_status = {
+            "schema": "hmb-shot-routing-status",
+            "version": 1,
+            "ok": True,
+            "code": "ready",
+            "details": "",
+        }
+        if normalized != self._picker_state():
+            self._write_state(normalized)
+            self._sync_outputs_from_state(normalized)
+        return self._hmb_shot_channel_subscription()
+
+    def _hmb_clear_shot_routing_catalog(
+        self,
+        reason: str = "publisher_unavailable",
+    ) -> Dict[str, Any]:
+        with self._hmb_catalog_state_commit():
+            return self._hmb_clear_shot_routing_catalog_commit(reason)
+
+    def _hmb_clear_shot_routing_catalog_commit(
+        self,
+        reason: str = "publisher_unavailable",
+    ) -> Dict[str, Any]:
+        """Return to independent Only mode without clearing authored media."""
+
+        current = self._picker_state()
+        cleared = dict(current)
+        cleared.update({
+            "shot_publisher_instance_uuid": "",
+            "channel_uuid": "",
+            "shot_uuid": "",
+            "shot_number": 0,
+            "shot_name": "",
+            "shot_selections": [],
+        })
+        normalized = self._apply_selected_view_fields(_parse_state(cleared))
+        self._hmb_shot_catalog_snapshot = None
+        self._hmb_shot_catalog_refresh_count = 0
+        self._hmb_shot_route_status = {
+            "schema": "hmb-shot-routing-status",
+            "version": 1,
+            "ok": True,
+            "code": "only",
+            "details": _clean(reason)[:128],
+        }
+        if normalized != current:
+            self._write_state(normalized)
+            self._sync_outputs_from_state(normalized)
+        return self._hmb_shot_channel_subscription()
+
+    def _reconcile_shared_shot_routing(self) -> Dict[str, Any]:
+        if self._hmb_shared_routing_in_progress:
+            return {"ok": True, "code": "reentrant", "changed": 0}
+        initially_enabled = bool(self._hmb_shot_channel_subscription()["enabled"])
+        refresh_before = max(
+            0,
+            int(getattr(self, "_hmb_shot_catalog_refresh_count", 0) or 0),
+        )
+        self._hmb_shared_routing_in_progress = True
+        try:
+            result = _shot_routing.reconcile_shot_routing(self)
+            if not initially_enabled and self._hmb_shot_channel_subscription()["enabled"]:
+                result = _shot_routing.reconcile_shot_routing(self)
+            result_code = _clean(result.get("code")) if isinstance(result, dict) else ""
+            refresh_after = max(
+                0,
+                int(getattr(self, "_hmb_shot_catalog_refresh_count", 0) or 0),
+            )
+            # Keep the last selected quartet visible when its ImageAsset
+            # publisher is temporarily absent, but never let the previous
+            # runtime catalog remain executable authority. Constructor and
+            # nested callback passes cannot discover a flow, so only a real
+            # completed reconciliation may invalidate the last-good cache.
+            if (
+                self._hmb_shot_channel_subscription()["enabled"]
+                and result_code not in {"", "not_registered", "reentrant"}
+                and refresh_after == refresh_before
+            ):
+                self._hmb_shot_route_status = {
+                    "schema": "hmb-shot-routing-status",
+                    "version": 1,
+                    "ok": False,
+                    "code": "image_catalog_unavailable",
+                    "details": "The selected Shot channel has no unique ImageAsset publisher.",
+                }
+            return result
+        finally:
+            self._hmb_shared_routing_in_progress = False
+
+    def _hmb_post_registration_shot_discovery(self) -> None:
+        """Adopt the live ImageAsset catalog when this Picker is newly added."""
+
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            return
+        self._reconcile_shared_shot_routing()
+
+    @staticmethod
+    def _shot_video_metadata(item: Dict[str, Any]) -> Dict[str, Any]:
+        compact = _compact_video_payload_for_state(item)
+        metadata: Dict[str, Any] = {}
+        for field in _SHOT_VIDEO_METADATA_FIELDS:
+            if field not in compact:
+                continue
+            semantic = _semantic_shot_video_metadata_value(
+                compact.get(field),
+                field,
+            )
+            if semantic is not _SHOT_VIDEO_METADATA_OMIT:
+                metadata[field] = semantic
+        source_uid = _clean(item.get("video_uid") or item.get("source_uid"))
+        metadata["source_uid"] = source_uid
+        metadata["video_uid"] = source_uid
+        return metadata
+
+    def _hmb_allocate_shot_snapshot_generation(self, identity: str) -> int:
+        """Return one monotonic generation for a serialized snapshot identity."""
+
+        lock = getattr(self, "_hmb_shot_snapshot_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._hmb_shot_snapshot_lock = lock
+        with lock:
+            previous_identity = getattr(
+                self,
+                "_hmb_shot_snapshot_identity",
+                "",
+            )
+            generation = max(
+                1,
+                int(
+                    getattr(
+                        self,
+                        "_hmb_shot_snapshot_generation",
+                        0,
+                    )
+                    or 0
+                ),
+            )
+            if identity != previous_identity:
+                generation += int(bool(previous_identity))
+            self._hmb_shot_snapshot_identity = identity
+            self._hmb_shot_snapshot_generation = generation
+            return generation
+
+    def _hmb_shot_routing_snapshot(
+        self,
+        expected_channel_uuid: str = "",
+    ) -> Dict[str, Any]:
+        lock = getattr(self, "_hmb_shot_snapshot_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._hmb_shot_snapshot_lock = lock
+        with lock:
+            return self._hmb_shot_routing_snapshot_locked(
+                expected_channel_uuid
+            )
+
+    def _hmb_shot_routing_snapshot_locked(
+        self,
+        expected_channel_uuid: str = "",
+    ) -> Dict[str, Any]:
+        state = self._picker_state()
+        channel = _uuid_text(state.get("channel_uuid"))
+        standalone = not bool(channel)
+        if standalone:
+            catalog = self._hmb_standalone_shot_routing_catalog_locked(state)
+            channel = _uuid_text(catalog.get("channel_uuid"))
+        else:
+            catalog = getattr(self, "_hmb_shot_catalog_snapshot", None)
+        expected = _uuid_text(expected_channel_uuid)
+        if not channel or (expected and expected != channel):
+            raise ValueError("VideoPicker Shot channel is unavailable or does not match.")
+        accepted_publisher = _uuid_text(
+            state.get("shot_publisher_instance_uuid")
+        )
+        if not standalone and (
+            not isinstance(catalog, dict)
+            or catalog.get("channel_uuid") != channel
+            or not accepted_publisher
+            or catalog.get("publisher_instance_uuid") != accepted_publisher
+        ):
+            raise ValueError("VideoPicker has no validated ImageAsset Shot catalog.")
+        status = getattr(self, "_hmb_shot_route_status", {})
+        if (
+            not standalone
+            and isinstance(status, dict)
+            and status
+            and not bool(status.get("ok", True))
+        ):
+            raise ValueError("VideoPicker automatic Shot route is incomplete.")
+
+        source_items: Dict[str, Dict[str, Any]] = {}
+        source_media_by_uid: Dict[str, str] = {}
+        for raw in state.get("videos", []):
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            uid = _clean(item.get("video_uid") or item.get("source_uid"))
+            media = _select_synchronized_video_media(item, enforce_media_availability=True)
+            if not uid or not media or uid in source_items:
+                continue
+            source_items[uid] = item
+            source_media_by_uid[uid] = media
+        local_rows_by_bound: Dict[str, Dict[str, Any]] = {}
+        for row in state.get("picker_shots", []):
+            if not isinstance(row, dict):
+                continue
+            bound_shot_uuid = _uuid_text(
+                row.get("workspace_uuid")
+                if standalone
+                else row.get("bound_shot_uuid")
+            )
+            if not bound_shot_uuid:
+                continue
+            if bound_shot_uuid in local_rows_by_bound:
+                raise ValueError("Duplicate local VideoPicker Shot binding is invalid.")
+            local_rows_by_bound[bound_shot_uuid] = row
+        legacy_membership_fallbacks = (
+            state.get("picker_legacy_membership_fallbacks")
+            if isinstance(state.get("picker_legacy_membership_fallbacks"), dict)
+            else {}
+        )
+        shots: List[Dict[str, Any]] = []
+        for catalog_shot in catalog["shots"]:
+            # A bound local workspace is exact authority.  The dedicated
+            # one-way overflow map is only a lossless migration fallback for
+            # an unbound remote row (Only + five historical remote buckets do
+            # not fit into the strict five-local-workspace cap).
+            row = local_rows_by_bound.get(catalog_shot["shot_uuid"])
+            if row is None:
+                row = legacy_membership_fallbacks.get(catalog_shot["shot_uuid"])
+            # Preserve the exact durable intent before consulting media
+            # availability. Filtering through ``source_items`` first turns a
+            # deleted/moved selected file into an indistinguishable empty Shot.
+            selected_uids = _picker_representative_video_uids(
+                row.get("selected_video_uids", []) if isinstance(row, dict) else [],
+                row.get("preview_video_uid", "") if isinstance(row, dict) else "",
+            )
+            unavailable_uids = [
+                uid for uid in selected_uids if uid not in source_items
+            ]
+            if unavailable_uids:
+                raise ValueError(
+                    "A selected Shot video is unavailable: "
+                    + ", ".join(unavailable_uids)
+                )
+            selected_order = {uid: index for index, uid in enumerate(selected_uids, start=1)}
+            shot_state = dict(state)
+            shot_state["shot_uuid"] = catalog_shot["shot_uuid"]
+            shot_state["shot_number"] = catalog_shot["number"]
+            shot_state["shot_name"] = catalog_shot["name"]
+            if isinstance(row, dict) and _uuid_text(row.get("workspace_uuid")):
+                # Output normalization is intentionally active-Shot-local.
+                # Project the bound local owner before building this remote
+                # Shot snapshot instead of relying on transient global flags.
+                shot_state["active_picker_shot_uuid"] = _uuid_text(
+                    row.get("workspace_uuid")
+                )
+            shot_state["videos"] = []
+            for raw in state.get("videos", []):
+                if not isinstance(raw, dict):
+                    continue
+                item = dict(raw)
+                uid = _clean(item.get("video_uid") or item.get("source_uid"))
+                order = selected_order.get(uid, 0)
+                item["selected"] = bool(order)
+                item["selection_order"] = order
+                item["video_slot"] = order
+                shot_state["videos"].append(item)
+            picker_payload, shot_media = _build_synchronized_video_outputs(
+                shot_state,
+                enforce_media_availability=True,
+            )
+            if shot_media != [source_media_by_uid[uid] for uid in selected_uids]:
+                raise ValueError("VideoPicker Shot media order changed during snapshot.")
+            shots.append({
+                "shot_uuid": catalog_shot["shot_uuid"],
+                "number": catalog_shot["number"],
+                "name": catalog_shot["name"],
+                "revision": max(0, int(row.get("revision") or 0)) if row else 0,
+                "selected_source_uids": selected_uids,
+                "picker_payload": picker_payload,
+            })
+        # The routing snapshot is a generation dependency, not the Picker's
+        # reusable catalog. Publish only representatives referenced by Shots;
+        # unselected history remains local and cannot inflate remote payloads.
+        ordered_source_uids: List[str] = []
+        for shot in shots:
+            for uid in shot.get("selected_source_uids", []):
+                if uid and uid not in ordered_source_uids:
+                    ordered_source_uids.append(uid)
+        ordered_videos = [
+            {"source_uid": uid, "metadata": self._shot_video_metadata(source_items[uid])}
+            for uid in ordered_source_uids
+        ]
+        media_by_source_uid = {
+            uid: source_media_by_uid[uid]
+            for uid in ordered_source_uids
+        }
+        semantic_identity = {
+            "channel_uuid": channel,
+            "shots": shots,
+            "ordered_videos": ordered_videos,
+        }
+        media_descriptors = [
+            {
+                "source_uid": item["source_uid"],
+                "media_value_sha256": hashlib.sha256(
+                    media_by_source_uid[item["source_uid"]].encode("utf-8")
+                ).hexdigest(),
+            }
+            for item in ordered_videos
+        ]
+        identity = _sha256_canonical({
+            "semantic": semantic_identity,
+            "media_descriptors": media_descriptors,
+        })
+        generation = self._hmb_allocate_shot_snapshot_generation(identity)
+        metadata_document = {
+            "channel_uuid": channel,
+            "generation": generation,
+            "shots": shots,
+            "ordered_videos": ordered_videos,
+        }
+        return {
+            "schema": SHOT_ROUTING_SNAPSHOT_SCHEMA,
+            "version": SHOT_ROUTING_SNAPSHOT_VERSION,
+            "publisher_instance_uuid": self._hmb_picker_publisher_uuid,
+            "channel_uuid": channel,
+            "generation": generation,
+            "metadata_sha256": _sha256_canonical(metadata_document),
+            "media_sha256": _sha256_canonical({"media_descriptors": media_descriptors}),
+            "shots": shots,
+            "ordered_videos": ordered_videos,
+            "media_by_source_uid": media_by_source_uid,
+        }
+
+    def _shot_picker_dependency_envelope(self) -> Dict[str, Any]:
+        try:
+            snapshot = self._hmb_shot_routing_snapshot()
+        except Exception:
+            state = self._picker_state()
+            return {
+                "schema": "hmb-picker-shot-routing-catalog",
+                "version": 1,
+                "channel_uuid": _uuid_text(state.get("channel_uuid")),
+                "generation": 0,
+                "metadata_sha256": "",
+                "media_sha256": "",
+                "shot_count": len(state.get("shot_selections", [])),
+            }
+        return {
+            "schema": "hmb-picker-shot-routing-catalog",
+            "version": 1,
+            "channel_uuid": snapshot["channel_uuid"],
+            "generation": snapshot["generation"],
+            "metadata_sha256": snapshot["metadata_sha256"],
+            "media_sha256": snapshot["media_sha256"],
+            "shot_count": len(snapshot["shots"]),
+        }
+
     def _sync_outputs_from_state(
         self,
         state: Dict[str, Any],
@@ -10107,59 +13175,107 @@ class HMBVideoPickerLibrary(DataNode):
         enforce_media_availability: bool = True,
         propagate_connections: bool | None = None,
     ) -> str:
-        payload, media_values = _build_synchronized_video_outputs(
-            state,
-            enforce_media_availability=enforce_media_availability,
-        )
-        text = _json_text(payload)
-        synchronized_outputs = (
-            (VIDEO_OUTPUT_PARAMETER, media_values),
-            ("PICKER_OUT", text),
-        )
-        # A synchronous connection callback may read either sibling output.
-        # Stage both caches first so every observer sees one coherent snapshot,
-        # then notify each port independently because the host has no atomic
-        # multi-parameter publication API.
-        for name, value in synchronized_outputs:
-            set_output(self, name, value)
-        notification_errors: List[tuple[str, Exception]] = []
-        for name, value in synchronized_outputs:
-            try:
-                _notify_parameter_update(self, name, value)
-            except Exception as error:
-                notification_errors.append((name, error))
-        should_propagate_connections = (
-            not _is_output_side_effect_callback(self)
-            if propagate_connections is None
-            else bool(propagate_connections)
-        )
-        if should_propagate_connections:
-            for name, value in synchronized_outputs:
-                try:
-                    _propagate_parameter_update_to_connections(
-                        self,
-                        name,
-                        value,
+        if getattr(self, "_hmb_node_deleted", False):
+            return ""
+        # Serialize sibling output staging/notification. Lifecycle invalidation
+        # never waits for this lock; generation checks make deletion win.
+        with self._hmb_state_write_lock:
+            if getattr(self, "_hmb_node_deleted", False):
+                return ""
+            owner_generation = int(
+                getattr(self, "_hmb_lifecycle_generation", 0) or 0
+            )
+
+            def still_owned() -> bool:
+                return (
+                    not bool(getattr(self, "_hmb_node_deleted", False))
+                    and owner_generation
+                    == int(
+                        getattr(self, "_hmb_lifecycle_generation", 0) or 0
                     )
+                )
+
+            payload, media_values = _build_synchronized_video_outputs(
+                state,
+                enforce_media_availability=enforce_media_availability,
+            )
+            if not still_owned():
+                return ""
+            text = _json_text(payload)
+            public_fingerprint = _sha256_canonical({
+                "picker": payload,
+                "videos": media_values,
+            })
+            synchronized_outputs: tuple[tuple[str, Any], ...] = ()
+            public_changed = public_fingerprint != getattr(self, "_hmb_last_public_output_fingerprint", "")
+            if public_changed:
+                synchronized_outputs = (
+                    (VIDEO_OUTPUT_PARAMETER, media_values),
+                    ("PICKER_OUT", text),
+                )
+            shot_envelope = self._shot_picker_dependency_envelope()
+            if not still_owned():
+                return ""
+            shot_fingerprint = _sha256_canonical(shot_envelope)
+            shot_changed = shot_fingerprint != getattr(self, "_hmb_last_shot_output_fingerprint", "")
+            if shot_changed:
+                synchronized_outputs += ((SHOT_PICKER_OUTPUT_PARAMETER, shot_envelope),)
+            # A synchronous connection callback may read either sibling output.
+            # Stage both caches first so every observer sees one coherent snapshot,
+            # then notify each port independently because the host has no atomic
+            # multi-parameter publication API.
+            for name, value in synchronized_outputs:
+                if not still_owned():
+                    return ""
+                set_output(self, name, value)
+            notification_errors: List[tuple[str, Exception]] = []
+            for name, value in synchronized_outputs:
+                if not still_owned():
+                    return ""
+                try:
+                    _notify_parameter_update(self, name, value)
                 except Exception as error:
-                    notification_errors.append((f"{name} graph", error))
-        _retire_legacy_video_slot_outputs(self)
-        _reorder_video_picker_parameters(self)
-        if notification_errors:
-            failed_ports = ", ".join(
-                f"{name} ({type(error).__name__})"
-                for name, error in notification_errors
+                    notification_errors.append((name, error))
+            should_propagate_connections = (
+                not _is_output_side_effect_callback(self)
+                if propagate_connections is None
+                else bool(propagate_connections)
             )
-            raise RuntimeError(
-                "Synchronized picker output notification failed after both "
-                f"output caches were staged: {failed_ports}."
-            ) from notification_errors[0][1]
-        if payload.get("media_blocked"):
-            raise RuntimeError(
-                _clean(payload.get("blocking_error"))
-                or "Selected reference video is unavailable."
-            )
-        return text
+            if should_propagate_connections:
+                for name, value in synchronized_outputs:
+                    if not still_owned():
+                        return ""
+                    try:
+                        _propagate_parameter_update_to_connections(
+                            self,
+                            name,
+                            value,
+                        )
+                    except Exception as error:
+                        notification_errors.append((f"{name} graph", error))
+            if not still_owned():
+                return ""
+            _retire_legacy_video_slot_outputs(self)
+            _reorder_video_picker_parameters(self)
+            if notification_errors:
+                failed_ports = ", ".join(
+                    f"{name} ({type(error).__name__})"
+                    for name, error in notification_errors
+                )
+                raise RuntimeError(
+                    "Synchronized picker output notification failed after both "
+                    f"output caches were staged: {failed_ports}."
+                ) from notification_errors[0][1]
+            if public_changed:
+                self._hmb_last_public_output_fingerprint = public_fingerprint
+            if shot_changed:
+                self._hmb_last_shot_output_fingerprint = shot_fingerprint
+            if payload.get("media_blocked"):
+                raise RuntimeError(
+                    _clean(payload.get("blocking_error"))
+                    or "Selected reference video is unavailable."
+                )
+            return text
 
     @staticmethod
     def _operation_elapsed_seconds(state: Dict[str, Any]) -> float:
@@ -10196,11 +13312,24 @@ class HMBVideoPickerLibrary(DataNode):
         return state
 
     def _current_scene_text(self, fallback: Any = "") -> str:
-        return (
-            _scene_path_text(_raw_parameter_value(self, "MAYA_SCENE"))
-            or _scene_path_text(fallback)
-            or _scene_path_text(self._picker_state().get("scene_request_path"))
-            or _scene_path_text(self._picker_state().get("scene_path"))
+        return next(
+            (
+                candidate
+                for candidate in (
+                    _maya_scene_path_text(
+                        _raw_parameter_value(self, "MAYA_SCENE")
+                    ),
+                    _maya_scene_path_text(fallback),
+                    _maya_scene_path_text(
+                        self._picker_state().get("scene_request_path")
+                    ),
+                    _maya_scene_path_text(
+                        self._picker_state().get("scene_path")
+                    ),
+                )
+                if candidate
+            ),
+            "",
         )
 
     def _create_operation_context(
@@ -10210,7 +13339,10 @@ class HMBVideoPickerLibrary(DataNode):
         state: Dict[str, Any],
         video_slot: Optional[int] = None,
     ) -> _OperationContext:
-        normalized_scene = str(_norm_path(scene_text)).replace("\\", "/")
+        strict_scene_text = _maya_scene_path_text(scene_text)
+        if not strict_scene_text:
+            raise ValueError("A single absolute Maya .mb or .ma scene is required.")
+        normalized_scene = str(_norm_path(strict_scene_text)).replace("\\", "/")
         kind_text = _clean(kind)
         slot = max(
             1,
@@ -10224,6 +13356,7 @@ class HMBVideoPickerLibrary(DataNode):
         selected_roles: tuple[str, ...] = ()
         snapshot_video_uid = ""
         mask_authoring_slot = _mask_authoring_slot(state)
+        picker_shot_uuid = _uuid_text(state.get("active_picker_shot_uuid"))
         if kind_text == "run_video":
             selected_roles = tuple(_generation_choice_roles(state))
             if not selected_roles:
@@ -10231,6 +13364,13 @@ class HMBVideoPickerLibrary(DataNode):
                     "Generate Playblast requires at least one checked output: "
                     "Original, Mask, Depth, or Motion Guide."
                 )
+            _normalized_capacity_state, picker_shot_uuid = (
+                _assert_picker_workspace_capacity(
+                    state,
+                    picker_shot_uuid,
+                    len(selected_roles),
+                )
+            )
             slot = PRIMARY_COLOR_VIDEO_SLOT
             depth_enabled = bool(state.get("depth_enabled"))
             motion_guide_enabled = bool(state.get("motion_guide_enabled"))
@@ -10265,6 +13405,7 @@ class HMBVideoPickerLibrary(DataNode):
             depth_video_slot=depth_video_slot,
             motion_guide_video_slot=motion_guide_video_slot,
             selected_roles=selected_roles,
+            picker_shot_uuid=picker_shot_uuid,
             accepted_state_revision=int(state.get("state_revision") or 0),
         )
 
@@ -10463,9 +13604,211 @@ class HMBVideoPickerLibrary(DataNode):
         self._write_state(state)
         self._sync_outputs_from_state(state)
 
+    def _commit_generate_terminal_state(
+        self,
+        terminal_state: Dict[str, Any],
+        context: _OperationContext,
+        generation_records: Sequence[Dict[str, Any]],
+        provisional_video_uids: Sequence[Any],
+    ) -> Dict[str, Any]:
+        """Rebase one completed Generate delta onto the newest catalog."""
+
+        with self._hmb_catalog_state_commit():
+            latest = self._picker_state()
+            if (
+                self._hmb_active_operation is not context
+                or _clean(latest.get("operation_id")) != context.operation_id
+                or bool(latest.get("operation_invalidated"))
+                or self._hmb_cancel_requested.is_set()
+            ):
+                raise _StaleOperationError(
+                    "Generate terminal ownership changed before publication."
+                )
+
+            latest_rows = {
+                _uuid_text(row.get("workspace_uuid")): dict(row)
+                for row in latest.get("picker_shots", [])
+                if isinstance(row, dict)
+                and _uuid_text(row.get("workspace_uuid"))
+            }
+            latest_videos = [
+                dict(item)
+                for item in latest.get("videos", [])
+                if isinstance(item, dict)
+            ]
+            provisional_role_by_uid = {
+                _clean(item.get("video_uid") or item.get("source_uid")):
+                _clean(item.get("generation_role"))
+                for item in latest_videos
+                if _clean(item.get("video_uid") or item.get("source_uid"))
+                in {
+                    _clean(value)
+                    for value in provisional_video_uids
+                    if _clean(value)
+                }
+            }
+            cleaned_latest = _remove_video_asset_uids(
+                latest,
+                provisional_video_uids,
+            )
+
+            # Retain terminal Maya/backend fields and the newest harmless
+            # widget edits, then explicitly restore newest catalog authority.
+            rebased = self._merge_widget_state(terminal_state, cleaned_latest)
+            catalog_fields = (
+                "videos",
+                "picker_shots",
+                "active_picker_shot_uuid",
+                "preview_video_uid",
+                "selected_video_uid",
+                "selected_video_path",
+                "selected_video_slot",
+                "active_slot_count",
+                "video_library_version",
+                "shot_publisher_instance_uuid",
+                "channel_uuid",
+                "shot_uuid",
+                "shot_number",
+                "shot_name",
+                "shot_selections",
+                "accepted_shot_catalog_publisher_instance_uuid",
+                "accepted_shot_catalog_channel_uuid",
+                "accepted_shot_catalog_generation",
+                "accepted_shot_catalog_metadata_sha256",
+                "picker_legacy_membership_fallbacks",
+            )
+            for field in catalog_fields:
+                rebased[field] = copy.deepcopy(cleaned_latest.get(field))
+
+            rebased, captured_workspace_uuid = _assert_picker_workspace_capacity(
+                rebased,
+                context.picker_shot_uuid,
+                len(generation_records),
+            )
+            actual_uid_by_role: Dict[str, str] = {}
+            for raw_record in generation_records:
+                record = dict(raw_record)
+                role = _clean(record.get("generation_role"))
+                if role in {"depth", "motion_guide"} and actual_uid_by_role.get(
+                    "mask"
+                ):
+                    record["companion_video_uid"] = actual_uid_by_role["mask"]
+                    record["source_video_uid"] = actual_uid_by_role["mask"]
+                rebased = _append_video_asset(
+                    rebased,
+                    record,
+                    picker_shot_uuid=captured_workspace_uuid,
+                )
+                appended = (
+                    rebased.get("videos", [])[-1]
+                    if rebased.get("videos")
+                    else {}
+                )
+                actual_uid = _clean(
+                    appended.get("video_uid") or appended.get("source_uid")
+                )
+                if role and actual_uid:
+                    actual_uid_by_role[role] = actual_uid
+
+            # Preserve the latest user selection. Provisional generated cards
+            # that were selected are replaced by their finalized counterpart;
+            # deselected/new records remain merely available in the history.
+            final_rows: List[Dict[str, Any]] = []
+            for raw_row in rebased.get("picker_shots", []):
+                if not isinstance(raw_row, dict):
+                    continue
+                row = dict(raw_row)
+                workspace_uuid = _uuid_text(row.get("workspace_uuid"))
+                latest_row = latest_rows.get(workspace_uuid, {})
+                owned_uids = _picker_representative_video_uids(
+                    row.get("video_asset_uids")
+                )
+                owned_set = set(owned_uids)
+
+                def finalized_uid(value: Any) -> str:
+                    uid = _clean(value)
+                    role = provisional_role_by_uid.get(uid)
+                    return actual_uid_by_role.get(role, uid)
+
+                selected_uids: List[str] = []
+                for value in latest_row.get("selected_video_uids", []):
+                    uid = finalized_uid(value)
+                    if uid in owned_set and uid not in selected_uids:
+                        selected_uids.append(uid)
+                    if len(selected_uids) >= MAX_SELECTED_VIDEOS:
+                        break
+                preview_uid = finalized_uid(
+                    latest_row.get("preview_video_uid")
+                )
+                if preview_uid not in owned_set:
+                    preview_uid = (
+                        selected_uids[0]
+                        if selected_uids
+                        else owned_uids[0]
+                        if owned_uids
+                        else ""
+                    )
+                row["selected_video_uids"] = selected_uids
+                row["preview_video_uid"] = preview_uid
+                row["selected_video_slot"] = max(
+                    1,
+                    min(
+                        len(selected_uids) or 1,
+                        int(latest_row.get("selected_video_slot") or 1),
+                    ),
+                )
+                final_rows.append(row)
+            rebased["picker_shots"] = final_rows
+            active_workspace_uuid = _uuid_text(
+                rebased.get("active_picker_shot_uuid")
+            )
+            active_final_row = next(
+                (
+                    row
+                    for row in final_rows
+                    if _uuid_text(row.get("workspace_uuid"))
+                    == active_workspace_uuid
+                ),
+                final_rows[0] if final_rows else None,
+            )
+            if active_final_row is not None:
+                # Workspace rows are the selection/preview authority. Project
+                # the finalized active cursor before parsing; otherwise the
+                # stale pre-generation global preview can overwrite this row
+                # during workspace normalization.
+                active_preview_uid = _clean(
+                    active_final_row.get("preview_video_uid")
+                )
+                active_selected_uids = _picker_representative_video_uids(
+                    active_final_row.get("selected_video_uids")
+                )
+                rebased["active_picker_shot_uuid"] = _uuid_text(
+                    active_final_row.get("workspace_uuid")
+                )
+                rebased["preview_video_uid"] = active_preview_uid
+                rebased["selected_video_uid"] = active_preview_uid
+                rebased["selected_video_slot"] = (
+                    active_selected_uids.index(active_preview_uid) + 1
+                    if active_preview_uid in active_selected_uids
+                    else max(
+                        1,
+                        int(active_final_row.get("selected_video_slot") or 1),
+                    )
+                )
+            rebased = self._apply_selected_view_fields(_parse_state(rebased))
+            self._write_state(rebased)
+            return rebased
+
     def _start_ui_operation(self, action: str, incoming: Dict[str, Any]) -> None:
         """Run one accepted operation inside the worker started by after_value_set."""
+        action_id = _clean(
+            incoming.get("backend_ack_action_id")
+            or incoming.get("pending_action_id")
+        )
         if not self._hmb_process_lock.acquire(blocking=False):
+            with self._hmb_operation_control_lock:
+                if self._hmb_pending_operation_id == action_id:
+                    self._hmb_pending_operation_id = ""
             state = self._picker_state()
             state["pending_action"] = ""
             state["message"] = (
@@ -10476,10 +13819,7 @@ class HMBVideoPickerLibrary(DataNode):
             _append_activity_log(state, "WARNING", state["message"])
             self._write_state(state)
             return
-        action_id = _clean(incoming.get("backend_ack_action_id") or incoming.get("pending_action_id"))
         with self._hmb_operation_control_lock:
-            if self._hmb_pending_operation_id == action_id:
-                self._hmb_pending_operation_id = ""
             cancelled_before_start = self._hmb_cancel_requested.is_set()
         if cancelled_before_start:
             state = _parse_state(incoming)
@@ -10517,14 +13857,24 @@ class HMBVideoPickerLibrary(DataNode):
             self._write_state(state)
             self._sync_outputs_from_state(state)
             with self._hmb_operation_control_lock:
+                if self._hmb_pending_operation_id == action_id:
+                    self._hmb_pending_operation_id = ""
                 if self._hmb_worker_thread is threading.current_thread():
                     self._hmb_worker_thread = None
             self._hmb_process_lock.release()
             return
         incoming["pending_action"] = ""
-        scene_text = (
-            _scene_path_text(incoming.get("scene_request_path") or incoming.get("scene_path"))
-            or self._current_scene_text()
+        scene_text = next(
+            (
+                candidate
+                for candidate in (
+                    _maya_scene_path_text(incoming.get("scene_request_path")),
+                    _maya_scene_path_text(incoming.get("scene_path")),
+                    self._current_scene_text(),
+                )
+                if candidate
+            ),
+            "",
         )
         try:
             scene_path = _norm_path(scene_text)
@@ -10546,6 +13896,11 @@ class HMBVideoPickerLibrary(DataNode):
                 failed_preflight_state["operation_kind"] = action
                 failed_preflight_state["operation_started_at_ms"] = int(time.time() * 1000)
                 self._write_state(failed_preflight_state)
+            with self._hmb_operation_control_lock:
+                if self._hmb_pending_operation_id == action_id:
+                    self._hmb_pending_operation_id = ""
+                if self._hmb_worker_thread is threading.current_thread():
+                    self._hmb_worker_thread = None
             self._hmb_process_lock.release()
             raise
         self._hmb_active_operation = context
@@ -10639,6 +13994,9 @@ class HMBVideoPickerLibrary(DataNode):
         worker_name = threading.current_thread().name
         _append_activity_log(incoming, "INFO", f"Background worker thread started: {worker_name}.")
         terminal_success_state: Optional[Dict[str, Any]] = None
+        terminal_generation_records: List[Dict[str, Any]] = []
+        terminal_provisional_uids: List[str] = []
+        terminal_publication_error: Optional[Exception] = None
         pending_selection_to_schedule: Optional[tuple[str, str]] = None
         try:
             self._write_state(incoming)
@@ -10664,7 +14022,6 @@ class HMBVideoPickerLibrary(DataNode):
                     "depth_enabled": "depth" in context.selected_roles,
                     "motion_guide_enabled": "motion_guide" in context.selected_roles,
                 }
-                pre_generation_state = copy.deepcopy(self._picker_state())
                 generated_by_role: Dict[str, Dict[str, Any]] = {}
                 original_cache_state: Dict[str, Any] = {}
                 generation_warnings: List[str] = []
@@ -10804,27 +14161,48 @@ class HMBVideoPickerLibrary(DataNode):
                     if warning not in final_base_warnings:
                         final_base_warnings.append(warning)
                 final_base_state["warnings"] = final_base_warnings[-20:]
+                terminal_provisional_uids = [
+                    _clean(source.get("video_uid") or source.get("source_uid"))
+                    for source in generated_by_role.values()
+                    if isinstance(source, dict)
+                    and _clean(
+                        source.get("video_uid") or source.get("source_uid")
+                    )
+                ]
+                generation_base_state = _remove_video_asset_uids(
+                    final_base_state,
+                    terminal_provisional_uids,
+                )
+                generation_base_uids = {
+                    _clean(item.get("video_uid") or item.get("source_uid"))
+                    for item in generation_base_state.get("videos", [])
+                    if isinstance(item, dict)
+                    and _clean(
+                        item.get("video_uid") or item.get("source_uid")
+                    )
+                }
                 final_state = _append_selected_generation_videos(
                     final_base_state,
                     generated_by_role,
-                    manual_source_state=pre_generation_state,
                     selected_roles=context.selected_roles,
+                    picker_shot_uuid=context.picker_shot_uuid,
                 )
                 # Appended Generate results use the catalog viewer. The legacy
                 # preview flag would otherwise force Original over the selected
                 # Mask/Depth/Motion history card.
                 final_state["original_preview_enabled"] = False
-                prior_uids = {
-                    _clean(item.get("video_uid"))
-                    for item in _parse_state(pre_generation_state).get("videos", [])
-                    if isinstance(item, dict) and _clean(item.get("video_uid"))
-                }
                 new_generation_items = [
                     item
                     for item in final_state.get("videos", [])
                     if isinstance(item, dict)
-                    and _clean(item.get("video_uid")) not in prior_uids
+                    and _clean(
+                        item.get("video_uid") or item.get("source_uid")
+                    ) not in generation_base_uids
                     and _clean(item.get("generation_role"))
+                    in set(context.selected_roles)
+                ]
+                terminal_generation_records = [
+                    copy.deepcopy(item) for item in new_generation_items
                 ]
                 actual_roles = [
                     _clean(item.get("generation_role"))
@@ -10882,27 +14260,57 @@ class HMBVideoPickerLibrary(DataNode):
                 _terminate_process(active)
             self._clear_active_process(active)
             self._cleanup_transient_paths()
+            terminal_commit_context = None
+            terminal_committed_state: Optional[Dict[str, Any]] = None
+            if terminal_success_state is not None:
+                terminal_commit_context = self._hmb_catalog_state_commit()
+                terminal_commit_context.__enter__()
+                try:
+                    terminal_committed_state = self._commit_generate_terminal_state(
+                        terminal_success_state,
+                        context,
+                        terminal_generation_records,
+                        terminal_provisional_uids,
+                    )
+                except Exception as exc:
+                    terminal_publication_error = (
+                        exc
+                        if isinstance(exc, Exception)
+                        else RuntimeError(str(exc))
+                    )
             if self._hmb_active_operation and self._hmb_active_operation.operation_id == context.operation_id:
                 self._hmb_active_operation = None
             with self._hmb_operation_control_lock:
-                if self._hmb_pending_operation_id == action_id:
-                    self._hmb_pending_operation_id = ""
                 if self._hmb_worker_thread is threading.current_thread():
                     self._hmb_worker_thread = None
             if self._hmb_process_lock.locked():
                 self._hmb_process_lock.release()
+            try:
+                if terminal_committed_state is not None:
+                    self._sync_outputs_from_state(terminal_committed_state)
+            except Exception as exc:
+                if terminal_publication_error is None:
+                    terminal_publication_error = (
+                        exc
+                        if isinstance(exc, Exception)
+                        else RuntimeError(str(exc))
+                    )
+            finally:
+                # Keep the operation reservation and catalog commit through
+                # terminal publication, but never leak either if an output
+                # callback rejects the newly committed state.
+                with self._hmb_operation_control_lock:
+                    if self._hmb_pending_operation_id == action_id:
+                        self._hmb_pending_operation_id = ""
+                if terminal_commit_context is not None:
+                    terminal_commit_context.__exit__(None, None, None)
             pending_selection = self._hmb_pending_scene_selection
             self._hmb_pending_scene_selection = None
             if pending_selection:
                 pending_selection_to_schedule = pending_selection
         try:
-            if terminal_success_state is not None:
-                self._write_state(terminal_success_state)
-                self._sync_outputs_from_state(terminal_success_state)
-        except Exception as exc:
-            # Preserve the former terminal-publication error path while keeping
-            # operation teardown ahead of the visible ready state.
-            self._set_failed_state(exc)
+            if terminal_publication_error is not None:
+                self._set_failed_state(terminal_publication_error)
         finally:
             # A Maya scene selected during generation must start after the old
             # operation's terminal state is published, otherwise that terminal
@@ -10922,6 +14330,9 @@ class HMBVideoPickerLibrary(DataNode):
         context: Optional[_OperationContext] = None,
         publish_public: bool = True,
     ) -> None:
+        strict_scene_text = _maya_scene_path_text(scene_text)
+        if not strict_scene_text:
+            raise ValueError("A single absolute Maya .mb or .ma scene is required.")
         state = self._picker_state()
         depth_enabled = bool(state.get("depth_enabled"))
         motion_guide_enabled = bool(state.get("motion_guide_enabled"))
@@ -10964,7 +14375,7 @@ class HMBVideoPickerLibrary(DataNode):
             "mode": "maya",
             "status": "RUNNING",
             "message": message,
-            "scene_path": _clean(scene_text),
+            "scene_path": strict_scene_text,
             "warnings": [],
             "selected_video_slot": video_slot,
             "depth_video_slot": depth_video_slot,
@@ -10999,12 +14410,18 @@ class HMBVideoPickerLibrary(DataNode):
         scene_text: Any,
         base_state: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Prepare one authoritative full Maya read for the selected scene."""
+        """Prepare Maya authoring state without clearing the Picker library.
+
+        A Maya scene is an interchangeable authoring input.  Video catalog,
+        per-Shot ownership/selection and preview identity are durable Picker
+        state and therefore survive selecting a different scene. Scene-derived
+        Outliner/camera/assignment/Snapshot state is still reset below.
+        """
         state = _parse_state(base_state if isinstance(base_state, dict) else self._picker_state())
         previous_state = dict(state)
         active_slot_count = max(1, min(MAX_VIDEO_SLOTS, int(state.get("active_slot_count") or 1)))
         selected_video_slot = max(1, min(active_slot_count, int(state.get("selected_video_slot") or 1)))
-        scene_text = _scene_path_text(scene_text)
+        scene_text = _maya_scene_path_text(scene_text)
         same_scene_request = bool(
             scene_text
             and _scene_path_key(previous_state.get("scene_path") or previous_state.get("scene_request_path"))
@@ -11046,6 +14463,8 @@ class HMBVideoPickerLibrary(DataNode):
             "snapshot_video_slot": 0,
             "snapshot_data_uri": "",
             "snapshot_path": "",
+            "snapshot_url": "",
+            "snapshot_sha256": "",
             "active_snapshot_uid": "",
             "viewport_mode": "video",
             "snapshot_request_video_uid": "",
@@ -11054,7 +14473,6 @@ class HMBVideoPickerLibrary(DataNode):
             "warnings": [],
             "pending_action": "",
             "workspace_view": "outliner",
-            "videos": [],
             "slot_assignments": [
                 {"video_slot": slot, "bindings": []}
                 for slot in range(1, active_slot_count + 1)
@@ -11074,6 +14492,7 @@ class HMBVideoPickerLibrary(DataNode):
                 "video_path", "video_url", "original_video_path", "original_video_url",
                 "snapshot_active", "snapshot_frame",
                 "snapshot_video_slot", "snapshot_data_uri", "snapshot_path",
+                "snapshot_url", "snapshot_sha256",
                 "active_snapshot_uid", "viewport_mode", "snapshots",
                 "markers", "workspace_view", "videos", "slot_assignments",
                 "outliner_search",
@@ -11087,7 +14506,7 @@ class HMBVideoPickerLibrary(DataNode):
                 "status": "READY",
                 "message": "Select a Maya .mb or .ma scene.",
             })
-            return state
+            return _parse_state(state)
         try:
             scene_path = _norm_path(scene_text)
             if scene_path.suffix.lower() not in {".mb", ".ma"}:
@@ -11142,7 +14561,9 @@ class HMBVideoPickerLibrary(DataNode):
 
     def _schedule_scene_selection(self, scene_text: Any, source: str) -> None:
         """Validate the native picker selection and publish READ-ready state."""
-        resolved_text = _scene_path_text(scene_text)
+        resolved_text = _maya_scene_path_text(scene_text)
+        if _scene_path_text(scene_text) and not resolved_text:
+            self._store_initial_parameter_value("MAYA_SCENE", "")
         base = self._picker_state()
         busy_status = _clean(base.get("status")).upper() in {
             "READ_PENDING", "READING_SCENE", "RUN_PENDING", "RUNNING", "GENERATING_VIDEO",
@@ -11178,6 +14599,16 @@ class HMBVideoPickerLibrary(DataNode):
         self._sync_outputs_from_state(prepared)
 
     def _register_active_process(self, process: subprocess.Popen[Any], kind: str) -> None:
+        if getattr(self, "_hmb_node_deleted", False):
+            with suppress(Exception):
+                process.kill()
+            threading.Thread(
+                target=_terminate_process,
+                args=(process,),
+                name="HMBVideoPicker-deleted-process-cleanup",
+                daemon=True,
+            ).start()
+            raise RuntimeError("VideoPicker node was deleted before process registration.")
         self._hmb_active_process = process
         state = self._picker_state()
         state["active_process_pid"] = max(0, int(getattr(process, "pid", 0) or 0))
@@ -11258,7 +14689,9 @@ class HMBVideoPickerLibrary(DataNode):
         try:
             target_text = _clean(state.get("last_log_path") or state.get("log_folder"))
             if not target_text:
-                scene_text = _scene_path_text(_raw_parameter_value(self, "MAYA_SCENE"))
+                scene_text = _maya_scene_path_text(
+                    _raw_parameter_value(self, "MAYA_SCENE")
+                )
                 if scene_text:
                     target_text = str(_norm_path(scene_text).parent / "HMBVideoPicker")
             if not target_text:
@@ -11286,8 +14719,19 @@ class HMBVideoPickerLibrary(DataNode):
         """
         name = _parameter_name(parameter)
         final_value = value
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            # A request already dispatched before deletion may arrive after a
+            # same-name replacement exists. Never let the retired instance
+            # normalize or adopt that transaction as live state.
+            return _raw_parameter_value(self, name)
         try:
-            if name == WIDGET_STATE_PARAMETER:
+            if name == "MAYA_SCENE":
+                # Native FileSystemPicker DOM/control aggregates are untrusted
+                # input. Normalize before Griptape stores the property so an
+                # invalid path can never survive in parameter_values even for
+                # the ordinary (non-initial_setup) setter lifecycle.
+                final_value = _maya_scene_path_text(value)
+            elif name == WIDGET_STATE_PARAMETER:
                 final_value = _parse_state(value)
             elif name == WIDGET_COMMAND_PARAMETER:
                 final_value = _parse_picker_command(value)
@@ -11303,10 +14747,29 @@ class HMBVideoPickerLibrary(DataNode):
         except Exception as parent_exc:
             _diagnostic_exception("parent before_value_set failed", parent_exc)
 
+        if name == "MAYA_SCENE":
+            return _maya_scene_path_text(final_value)
         if name == WIDGET_STATE_PARAMETER:
             incoming = _parse_state(final_value)
             writer = _clean(incoming.get("state_writer")).lower()
             incoming_runtime_id = _clean(incoming.get("runtime_instance_id"))
+            writer_runtime_id = _clean(
+                incoming.get("writer_runtime_instance_id")
+            )
+            # A Python worker request is an ordinary live publication, never a
+            # workflow hydration. If it arrives after same-name replacement,
+            # its writer token names the retired instance: preserve this new
+            # node's authoritative value instead of adopting stale state.
+            if (
+                writer == "python"
+                and writer_runtime_id
+                and writer_runtime_id != self._hmb_runtime_instance_id
+                and not _is_state_syncing(self)
+            ):
+                return _parse_state(
+                    getattr(self, "_hmb_authoritative_state", None)
+                    or _raw_parameter_value(self, WIDGET_STATE_PARAMETER)
+                )
             restored_serialized_state = (
                 incoming_runtime_id != self._hmb_runtime_instance_id
                 and not _is_state_syncing(self)
@@ -11328,7 +14791,7 @@ class HMBVideoPickerLibrary(DataNode):
                 # side-effect free.
                 self._hmb_restored_state_pending_revision = int(incoming["state_revision"])
             elif writer != "python" and not _is_state_syncing(self):
-                with self._hmb_state_write_lock:
+                with self._hmb_catalog_state_commit():
                     authoritative = _parse_state(
                         getattr(self, "_hmb_authoritative_state", None) or {}
                     )
@@ -11394,11 +14857,30 @@ class HMBVideoPickerLibrary(DataNode):
 
         if (
             initial_setup
+            and param_name == "MAYA_SCENE"
+            and hasattr(self, "_hmb_runtime_instance_id")
+        ):
+            # Only the host's explicit serialized-value lifecycle can grant a
+            # pre-existing native picker value authority in this new runtime.
+            # Ordinary constructor/native-template values are cleared above;
+            # normal Browse/value-set callbacks use the live state path instead.
+            self._hmb_serialized_maya_scene_path = _maya_scene_path_text(value)
+        if (
+            initial_setup
             and param_name == WIDGET_STATE_PARAMETER
             and hasattr(self, "_hmb_runtime_instance_id")
         ):
             self._restore_dynamic_state(adopt_serialized=True)
+            self._schedule_post_hydration_shot_reconcile()
         return result
+
+    def _schedule_post_hydration_shot_reconcile(self) -> bool:
+        """Re-run same-flow discovery after serialized state becomes authoritative."""
+
+        scheduler = getattr(
+            _shot_routing, "schedule_post_hydration_reconcile", None
+        )
+        return bool(callable(scheduler) and scheduler(self))
 
     def _schedule_action_worker(
         self,
@@ -11409,6 +14891,8 @@ class HMBVideoPickerLibrary(DataNode):
         """Start one worker after the current retained-mode request has completed."""
 
         def launch() -> None:
+            if getattr(self, "_hmb_node_deleted", False):
+                return
             thread = threading.Thread(
                 target=target,
                 name=f"HMBVideoPicker-{action}",
@@ -11440,14 +14924,62 @@ class HMBVideoPickerLibrary(DataNode):
             _diagnostic_exception("event-loop action scheduling unavailable", exc)
         launch()
 
+    def after_node_deleted(self, *args: Any, **kwargs: Any) -> Any:
+        """Invalidate queued work and terminate external tools without joining."""
+
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            if bool(getattr(self, "_hmb_delete_parent_called", False)):
+                return None
+        else:
+            # Invalidate immediately. Waiting for a worker-owned state lock can
+            # deadlock when that worker is blocked on the retained-mode request
+            # currently dispatching this deletion callback.
+            self._hmb_node_deleted = True
+            self._hmb_lifecycle_generation = (
+                int(getattr(self, "_hmb_lifecycle_generation", 0) or 0) + 1
+            )
+        self._hmb_cancel_requested.set()
+        with self._hmb_operation_control_lock:
+            self._hmb_pending_operation_id = ""
+            self._hmb_active_operation = None
+            self._hmb_pending_scene_selection = None
+        process = self._hmb_active_process
+        self._hmb_active_process = None
+        if process is not None and process.poll() is None:
+            # Kill immediately, then let the existing tree-cleanup routine run
+            # off-thread.  The host delete lifecycle must never wait/join.
+            with suppress(Exception):
+                process.kill()
+            with suppress(Exception):
+                threading.Thread(
+                    target=_terminate_process,
+                    args=(process,),
+                    name="HMBVideoPicker-delete-process-cleanup",
+                    daemon=True,
+                ).start()
+        if not bool(getattr(self, "_hmb_deletion_reconcile_called", False)):
+            self._hmb_deletion_reconcile_called = True
+            try:
+                _shot_routing.schedule_post_deletion_reconcile(self)
+            except Exception as exc:
+                _diagnostic_exception(
+                    "Post-deletion Shot routing schedule failed", exc
+                )
+        if bool(getattr(self, "_hmb_delete_parent_called", False)):
+            return None
+        self._hmb_delete_parent_called = True
+        parent = getattr(super(), "after_node_deleted", None)
+        return parent(*args, **kwargs) if callable(parent) else None
+
     def _import_video_asset(
         self,
         state: Dict[str, Any],
         source_path: Any,
         *,
         label: Any = "",
+        picker_shot_uuid: Any = "",
     ) -> Dict[str, Any]:
-        """Import one MP4 as a new non-overwriting shot-history record."""
+        """Import one MP4 once per Shot, reusing an existing source card."""
         source = _norm_path(source_path)
         if source.suffix.lower() != ".mp4":
             raise ValueError(f"Only MP4 video assets can be imported: {source}")
@@ -11456,8 +14988,49 @@ class HMBVideoPickerLibrary(DataNode):
         if not _is_structurally_valid_mp4(source):
             raise ValueError(f"Imported MP4 is not structurally readable: {source}")
 
-        scene_text = _scene_path_text(
-            state.get("scene_path") or state.get("scene_request_path")
+        state, captured_picker_shot_uuid = _assert_picker_workspace_capacity(
+            state,
+            picker_shot_uuid,
+            0,
+        )
+        existing_import = _picker_workspace_imported_asset(
+            state,
+            captured_picker_shot_uuid,
+            source,
+        )
+        if existing_import is not None:
+            result = _reuse_picker_imported_asset(
+                state,
+                captured_picker_shot_uuid,
+                existing_import,
+            )
+            result.update({
+                "status": "VIDEO_READY",
+                "scene_stage": "VIDEO_READY",
+                "workspace_view": "playblast",
+                "message": (
+                    "This MP4 is already loaded in the active Shot; "
+                    "the existing card was reused."
+                ),
+            })
+            _append_activity_log(result, "INFO", result["message"])
+            return _parse_state(result)
+        state, captured_picker_shot_uuid = _assert_picker_workspace_capacity(
+            state,
+            captured_picker_shot_uuid,
+            1,
+        )
+
+        scene_text = next(
+            (
+                candidate
+                for candidate in (
+                    _maya_scene_path_text(state.get("scene_path")),
+                    _maya_scene_path_text(state.get("scene_request_path")),
+                )
+                if candidate
+            ),
+            "",
         )
         local_video = source
         project_video_path = ""
@@ -11553,7 +15126,11 @@ class HMBVideoPickerLibrary(DataNode):
             "import_source_path": str(source.resolve()).replace("\\", "/"),
             "imported_at_ms": int(time.time() * 1000),
         }
-        result = _append_video_asset(state, item)
+        result = _append_video_asset(
+            state,
+            item,
+            picker_shot_uuid=captured_picker_shot_uuid,
+        )
         appended = result.get("videos", [])[-1] if result.get("videos") else {}
         result.update({
             "status": "VIDEO_READY",
@@ -11576,6 +15153,214 @@ class HMBVideoPickerLibrary(DataNode):
             result["warnings"] = warnings[-20:]
             _append_activity_log(result, "WARNING", import_warning)
         return _parse_state(result)
+
+    def _commit_video_import_sources(
+        self,
+        sources: Sequence[Dict[str, str]],
+        *,
+        captured_picker_shot_uuid: Any,
+        action_id: str,
+    ) -> Dict[str, Any]:
+        """Serialize one import delta against the newest committed catalog.
+
+        File dialogs may finish in any order. The commit mutex also covers
+        ImageAsset reconcile/clear, so the latest state is read only after all
+        earlier imports or authoritative Shot deletion have committed. This
+        prevents last-writer-wins loss and makes a deleted captured workspace a
+        hard failure instead of resurrecting its stale snapshot.
+        """
+
+        # Expensive validation/copying is intentionally outside catalog/state
+        # locks. Only the final durable delta commit is serialized.
+        staging_state, captured_workspace_uuid = _assert_picker_workspace_capacity(
+            self._picker_state(),
+            captured_picker_shot_uuid,
+            0,
+        )
+        baseline_warning_set = {
+            _clean(value)
+            for value in staging_state.get("warnings", [])
+            if _clean(value)
+        }
+        imported_records: List[Dict[str, Any]] = []
+        import_failures: List[str] = []
+        duplicate_sources: List[Dict[str, str]] = []
+        for source in sources:
+            source_path = source["source_path"]
+            try:
+                if _picker_workspace_imported_asset(
+                    staging_state,
+                    captured_workspace_uuid,
+                    source_path,
+                ) is not None:
+                    duplicate_sources.append(dict(source))
+                    continue
+                before_uids = {
+                    _clean(item.get("video_uid") or item.get("source_uid"))
+                    for item in staging_state.get("videos", [])
+                    if isinstance(item, dict)
+                }
+                staged_result = self._import_video_asset(
+                    staging_state,
+                    source_path,
+                    label=source.get("label"),
+                    picker_shot_uuid=captured_workspace_uuid,
+                )
+                appended = [
+                    dict(item)
+                    for item in staged_result.get("videos", [])
+                    if isinstance(item, dict)
+                    and _clean(
+                        item.get("video_uid") or item.get("source_uid")
+                    ) not in before_uids
+                ]
+                if not appended:
+                    raise RuntimeError(
+                        "Imported MP4 produced no durable video asset."
+                    )
+                imported_records.append(appended[-1])
+                staging_state = staged_result
+            except Exception as exc:
+                source_label = _clean(source.get("label")) or Path(
+                    source_path
+                ).name
+                import_failures.append(
+                    f"{source_label or 'MP4'}: "
+                    f"{_clean(exc) or exc.__class__.__name__}"
+                )
+        if not imported_records and not duplicate_sources:
+            raise RuntimeError(
+                "No selected MP4 could be imported. "
+                + " | ".join(import_failures[:5])
+            )
+
+        # Re-read immediately before the durable write. Merge only the imported
+        # records into that newest state and revalidate the captured workspace.
+        with self._hmb_catalog_state_commit():
+            state, captured_workspace_uuid = _assert_picker_workspace_capacity(
+                self._picker_state(),
+                captured_workspace_uuid,
+                0,
+            )
+            pending_records: List[Dict[str, Any]] = []
+            for imported_record in imported_records:
+                import_source_path = imported_record.get("import_source_path")
+                existing = _picker_workspace_imported_asset(
+                    state,
+                    captured_workspace_uuid,
+                    import_source_path,
+                )
+                if existing is not None:
+                    state = _reuse_picker_imported_asset(
+                        state,
+                        captured_workspace_uuid,
+                        existing,
+                    )
+                    duplicate_sources.append({
+                        "source_path": _clean(import_source_path),
+                        "label": _clean(imported_record.get("label")),
+                    })
+                    continue
+                pending_records.append(imported_record)
+            state, captured_workspace_uuid = _assert_picker_workspace_capacity(
+                state,
+                captured_workspace_uuid,
+                len(pending_records),
+            )
+            for duplicate_source in duplicate_sources:
+                existing = _picker_workspace_imported_asset(
+                    state,
+                    captured_workspace_uuid,
+                    duplicate_source.get("source_path"),
+                )
+                if existing is not None:
+                    state = _reuse_picker_imported_asset(
+                        state,
+                        captured_workspace_uuid,
+                        existing,
+                    )
+            for imported_record in pending_records:
+                state = _append_video_asset(
+                    state,
+                    imported_record,
+                    picker_shot_uuid=captured_workspace_uuid,
+                )
+            state["backend_ack_action_id"] = action_id
+            state["pending_action"] = ""
+            state["pending_action_id"] = ""
+            state["status"] = "VIDEO_READY"
+            state["scene_stage"] = "VIDEO_READY"
+            state["workspace_view"] = "playblast"
+            imported_count = len(pending_records)
+            duplicate_count = len(duplicate_sources)
+            if imported_count:
+                state["message"] = (
+                    f"Imported {imported_count} MP4 file(s) into the cut history."
+                )
+                _append_activity_log(state, "SUCCESS", state["message"])
+            else:
+                state["message"] = (
+                    f"Skipped {duplicate_count} duplicate MP4 file(s); "
+                    "the existing Shot card was reused."
+                )
+                _append_activity_log(state, "INFO", state["message"])
+            if duplicate_count and imported_count:
+                _append_activity_log(
+                    state,
+                    "INFO",
+                    f"Skipped {duplicate_count} duplicate MP4 file(s) already loaded in this Shot.",
+                )
+            new_import_warnings = [
+                _clean(value)
+                for value in staging_state.get("warnings", [])
+                if _clean(value) and _clean(value) not in baseline_warning_set
+            ]
+            if new_import_warnings:
+                warnings = [
+                    _clean(item)
+                    for item in state.get("warnings", [])
+                    if _clean(item)
+                ]
+                for warning in new_import_warnings:
+                    if warning not in warnings:
+                        warnings.append(warning)
+                        _append_activity_log(state, "WARNING", warning)
+                state["warnings"] = warnings[-20:]
+            if import_failures:
+                warning = (
+                    f"Skipped {len(import_failures)} MP4 file(s): "
+                    + " | ".join(import_failures[:5])
+                )
+                warnings = [
+                    _clean(item)
+                    for item in state.get("warnings", [])
+                    if _clean(item)
+                ]
+                if warning not in warnings:
+                    warnings.append(warning)
+                state["warnings"] = warnings[-20:]
+                _append_activity_log(state, "WARNING", warning)
+            self._write_state(state)
+            self._sync_outputs_from_state(state)
+            return state
+
+    def _acknowledge_video_import_failure(
+        self,
+        action_id: str,
+        error: Any,
+    ) -> Dict[str, Any]:
+        """Finish a failed file action without destabilizing durable media."""
+
+        detail = _clean(error) or error.__class__.__name__
+        with self._hmb_catalog_state_commit():
+            state = self._picker_state()
+            state["backend_ack_action_id"] = action_id
+            state["pending_action"] = ""
+            state["pending_action_id"] = ""
+            state["message"] = f"MP4 import did not change the library: {detail}"
+            _append_activity_log(state, "WARNING", state["message"])
+            self._write_state(state)
+        return state
 
     def _handle_picker_command(self, command: Dict[str, Any]) -> None:
         command = _parse_picker_command(command)
@@ -11602,15 +15387,74 @@ class HMBVideoPickerLibrary(DataNode):
                         list(self._hmb_processed_action_ids)[-128:]
                     )
         if duplicate_action:
-            state = self._picker_state()
-            state["backend_ack_action_id"] = action_id
-            self._write_state(state)
+            duplicate_state = self._picker_state()
+            duplicate_state["backend_ack_action_id"] = action_id
+            self._write_state(duplicate_state)
             return
-
         state = self._picker_state()
+        workspace_projection_applied = False
+        workspace_uuid_supplied = any(
+            key in payload for key in ("picker_shot_uuid", "workspace_uuid")
+        )
+        if action in PICKER_WORKSPACE_SENSITIVE_ACTIONS and workspace_uuid_supplied:
+            requested_workspace_uuid = payload.get(
+                "picker_shot_uuid",
+                payload.get("workspace_uuid"),
+            )
+            projected_state = _activate_picker_workspace_projection(
+                state,
+                requested_workspace_uuid,
+            )
+            if projected_state is None:
+                # A LOAD/Browse command may arrive just after ImageAsset
+                # authoritatively deleted its captured Shot. Acknowledge the
+                # stale command so the button guard unlocks immediately; never
+                # leave the UI waiting for its transport timeout.
+                state["backend_ack_action_id"] = action_id
+                state["pending_action"] = ""
+                state["pending_action_id"] = ""
+                state["message"] = (
+                    "The captured Picker Shot no longer exists. "
+                    "The file action was cancelled without changing media."
+                )
+                _append_activity_log(state, "WARNING", state["message"])
+                self._write_state(state)
+                _diagnostic(
+                    f"ignored command {action_id}: local Picker Shot workspace "
+                    f"{_clean(requested_workspace_uuid) or '<blank>'} is unavailable"
+                )
+                return
+            state = projected_state
+            workspace_projection_applied = True
+            workspace_scene_draft = _maya_scene_path_text(
+                state.get("scene_draft_path")
+            )
+            if workspace_scene_draft and action in {
+                "read_scene",
+                "run_video",
+                "render_snapshot",
+                "delete_snapshot",
+                "render_original_preview",
+                "browse_maya_scene",
+            }:
+                state["scene_request_path"] = workspace_scene_draft
+
         state["backend_ack_action_id"] = action_id
         state["pending_action"] = ""
         state["pending_action_id"] = ""
+        if action == "browse_maya_scene" or (
+            workspace_projection_applied
+            and action in {
+                "browse_video_asset",
+                "import_video_asset",
+                "import_video_assets",
+                "import_video",
+            }
+        ):
+            # Publish the acknowledgement before an OS browser or file import
+            # can yield. Maya browse is valid without a workspace UUID, while
+            # video imports additionally persist their captured projection.
+            self._write_state(state)
         if action == "run_video" and isinstance(
             payload.get("authoring_state"),
             dict,
@@ -11644,11 +15488,50 @@ class HMBVideoPickerLibrary(DataNode):
         if action in operation_actions:
             state["scene_stage"] = "PYTHON_COMMAND_RECEIVED"
 
-        scene_path = _scene_path_text(payload.get("scene_path"))
+        scene_path = _maya_scene_path_text(payload.get("scene_path"))
+        raw_scene_path_supplied = any(
+            key in payload and payload.get(key) not in (None, "")
+            for key in ("scene_path", "scene_request_path", "scene_draft_path")
+        )
+        if not scene_path:
+            scene_path = next(
+                (
+                    candidate
+                    for candidate in (
+                        _maya_scene_path_text(payload.get("scene_request_path")),
+                        _maya_scene_path_text(payload.get("scene_draft_path")),
+                    )
+                    if candidate
+                ),
+                "",
+            )
         if scene_path:
             state["scene_draft_path"] = scene_path
             state["scene_request_path"] = scene_path
             state["scene_path"] = scene_path
+            self._store_initial_parameter_value("MAYA_SCENE", scene_path)
+        elif raw_scene_path_supplied:
+            # A command carrying malformed scene text is an explicit invalid
+            # selection, never permission to fall back to a previous scene.
+            state.update({
+                "scene_path": "",
+                "scene_draft_path": "",
+                "scene_request_path": "",
+                "native_read_ready": False,
+                "scene_stage": "EMPTY",
+                "scene_request_status": "IDLE",
+                "status": "READY",
+                "message": "Select a Maya .mb or .ma scene.",
+            })
+            self._store_initial_parameter_value("MAYA_SCENE", "")
+            _append_activity_log(
+                state,
+                "WARNING",
+                "Rejected a malformed or non-absolute Maya scene path.",
+            )
+            self._write_state(state)
+            self._sync_outputs_from_state(state)
+            return
         try:
             selected_slot = int(float(payload.get("selected_video_slot") or state.get("selected_video_slot") or 1))
         except Exception:
@@ -11841,6 +15724,11 @@ class HMBVideoPickerLibrary(DataNode):
             "import_video_assets",
             "import_video",
         }:
+            captured_picker_shot_uuid = _uuid_text(
+                payload.get("picker_shot_uuid")
+                or payload.get("workspace_uuid")
+                or state.get("active_picker_shot_uuid")
+            )
             sources: List[Dict[str, str]] = []
             if action == "browse_video_asset":
                 initial_path = _clean(
@@ -11885,53 +15773,22 @@ class HMBVideoPickerLibrary(DataNode):
                         ),
                     }]
             if not sources:
-                state["message"] = "MP4 import was cancelled."
-                self._write_state(state)
+                with self._hmb_catalog_state_commit():
+                    state = self._picker_state()
+                    state["backend_ack_action_id"] = action_id
+                    state["pending_action"] = ""
+                    state["pending_action_id"] = ""
+                    state["message"] = "MP4 import was cancelled."
+                    self._write_state(state)
                 return
-            imported_count = 0
-            import_failures: List[str] = []
-            for source in sources:
-                source_path = source["source_path"]
-                try:
-                    state = self._import_video_asset(
-                        state,
-                        source_path,
-                        label=source.get("label"),
-                    )
-                    imported_count += 1
-                except Exception as exc:
-                    source_label = _clean(source.get("label")) or Path(
-                        source_path
-                    ).name
-                    import_failures.append(
-                        f"{source_label or 'MP4'}: "
-                        f"{_clean(exc) or exc.__class__.__name__}"
-                    )
-            if imported_count <= 0:
-                raise RuntimeError(
-                    "No selected MP4 could be imported. "
-                    + " | ".join(import_failures[:5])
+            try:
+                self._commit_video_import_sources(
+                    sources,
+                    captured_picker_shot_uuid=captured_picker_shot_uuid,
+                    action_id=action_id,
                 )
-            state["message"] = (
-                f"Imported {imported_count} MP4 file(s) into the cut history."
-            )
-            _append_activity_log(state, "SUCCESS", state["message"])
-            if import_failures:
-                warning = (
-                    f"Skipped {len(import_failures)} MP4 file(s): "
-                    + " | ".join(import_failures[:5])
-                )
-                warnings = [
-                    _clean(item)
-                    for item in state.get("warnings", [])
-                    if _clean(item)
-                ]
-                if warning not in warnings:
-                    warnings.append(warning)
-                state["warnings"] = warnings[-20:]
-                _append_activity_log(state, "WARNING", warning)
-            self._write_state(state)
-            self._sync_outputs_from_state(state)
+            except Exception as exc:
+                self._acknowledge_video_import_failure(action_id, exc)
             return
         if action in {"delete_video_asset", "remove_video_asset", "delete_video"}:
             video_uid = _clean(
@@ -11939,61 +15796,50 @@ class HMBVideoPickerLibrary(DataNode):
             )
             if not video_uid:
                 raise ValueError("Deleting a video asset requires video_uid.")
-            # The UI disables catalog mutation while a Maya/FFmpeg operation is
-            # reserved or running. Keep the backend equally defensive for a
-            # delayed/stale command: changing a generated companion record can
-            # alter an operation digest, so reject the metadata mutation without
-            # setting the shared cancel flag or terminating the active process.
-            with self._hmb_operation_control_lock:
-                operation_active = bool(
-                    self._hmb_pending_operation_id
-                    or self._hmb_active_operation is not None
-                    or self._hmb_process_lock.locked()
-                )
-            if operation_active:
-                # The operation may have been reserved after this command first
-                # read state. Refresh before acknowledging so a stale metadata
-                # snapshot cannot overwrite the worker's real busy lifecycle.
+            with self._hmb_catalog_state_commit():
                 state = self._picker_state()
                 state["backend_ack_action_id"] = action_id
                 state["pending_action"] = ""
                 state["pending_action_id"] = ""
-                state["message"] = (
-                    "Video removal was ignored while a Picker operation is running. "
-                    "Wait for it to finish, then remove the history asset."
-                )
-                _append_activity_log(state, "WARNING", state["message"])
+                # The UI disables catalog mutation while a Maya/FFmpeg
+                # operation is reserved or running. Recheck only after the
+                # latest state is captured inside the shared catalog commit.
+                with self._hmb_operation_control_lock:
+                    operation_active = bool(
+                        self._hmb_pending_operation_id
+                        or self._hmb_active_operation is not None
+                        or self._hmb_process_lock.locked()
+                    )
+                if operation_active:
+                    state["message"] = (
+                        "Video removal was ignored while a Picker operation is "
+                        "running. Wait for it to finish, then remove the "
+                        "history asset."
+                    )
+                    _append_activity_log(state, "WARNING", state["message"])
+                elif not any(
+                    isinstance(item, dict)
+                    and _clean(
+                        item.get("video_uid") or item.get("source_uid")
+                    ) == video_uid
+                    for item in state.get("videos", [])
+                ):
+                    # Repeated/stale delete is an idempotent acknowledgement.
+                    state["message"] = (
+                        "Video asset was already absent from the cut history; "
+                        "no media file was changed."
+                    )
+                    _append_activity_log(state, "INFO", state["message"])
+                else:
+                    # Metadata-only deletion; external MP4 files remain
+                    # recoverable and can be imported again.
+                    state = _remove_video_asset_uids(state, [video_uid])
+                    state["backend_ack_action_id"] = action_id
+                    state["pending_action"] = ""
+                    state["pending_action_id"] = ""
+                    state["message"] = "Video asset removed from the cut history."
+                    _append_activity_log(state, "INFO", state["message"])
                 self._write_state(state)
-                return
-            retained = [
-                dict(item)
-                for item in state.get("videos", [])
-                if isinstance(item, dict)
-                and _clean(item.get("video_uid") or item.get("source_uid"))
-                != video_uid
-            ]
-            if len(retained) == len(
-                [item for item in state.get("videos", []) if isinstance(item, dict)]
-            ):
-                # Treat a repeated/stale delete as an idempotent acknowledgement.
-                # A fast double click or delayed browser echo must not route an
-                # otherwise harmless catalog command through the node-wide
-                # FAILED-state handler.
-                state["message"] = (
-                    "Video asset was already absent from the cut history; "
-                    "no media file was changed."
-                )
-                _append_activity_log(state, "INFO", state["message"])
-                self._write_state(state)
-                return
-            # Catalog deletion is metadata-only. Generated/imported MP4 files
-            # remain on disk and can be re-imported; no destructive action is
-            # implied by removing a card from this Picker.
-            state["videos"] = retained
-            state = _parse_state(state)
-            state["message"] = "Video asset removed from the cut history."
-            _append_activity_log(state, "INFO", state["message"])
-            self._write_state(state)
             self._sync_outputs_from_state(state)
             return
         if action == "browse_maya_scene":
@@ -12031,6 +15877,7 @@ class HMBVideoPickerLibrary(DataNode):
     ) -> None:
         """Process state and one-shot commands only after the current transaction."""
         output_side_effect_callback_started = False
+        catalog_state_context = None
         try:
             if _is_state_syncing(self):
                 return
@@ -12040,9 +15887,11 @@ class HMBVideoPickerLibrary(DataNode):
             _diagnostic(f"after_value_set entered: {name or '<unknown>'}")
 
             if name == "MAYA_SCENE":
-                scene_text = _scene_path_text(value)
+                scene_text = _maya_scene_path_text(value)
                 if value is None:
-                    scene_text = _scene_path_text(_raw_parameter_value(self, "MAYA_SCENE"))
+                    scene_text = _maya_scene_path_text(
+                        _raw_parameter_value(self, "MAYA_SCENE")
+                    )
                 scene_key = _scene_path_key(scene_text)
                 current = self._picker_state()
                 current_key = _scene_path_key(current.get("scene_request_path") or current.get("scene_path"))
@@ -12071,6 +15920,9 @@ class HMBVideoPickerLibrary(DataNode):
 
             if name != WIDGET_STATE_PARAMETER:
                 return
+
+            catalog_state_context = self._hmb_catalog_state_commit()
+            catalog_state_context.__enter__()
 
             incoming = _parse_state(value)
             incoming["pending_action"] = ""
@@ -12124,7 +15976,34 @@ class HMBVideoPickerLibrary(DataNode):
                 "active_slot_count": int(merged.get("active_slot_count") or 1),
                 "videos": merged.get("videos") or [],
             })
+            previous_route_signature = _json_text({
+                "shot_publisher_instance_uuid": previous_state.get("shot_publisher_instance_uuid"),
+                "channel_uuid": previous_state.get("channel_uuid"),
+                "shot_uuid": previous_state.get("shot_uuid"),
+                "shot_number": previous_state.get("shot_number"),
+                "shot_name": previous_state.get("shot_name"),
+                "shot_selections": previous_state.get("shot_selections") or [],
+                "picker_shots": previous_state.get("picker_shots") or [],
+                "active_picker_shot_uuid": previous_state.get("active_picker_shot_uuid"),
+                "picker_legacy_membership_fallbacks": previous_state.get("picker_legacy_membership_fallbacks") or {},
+            })
+            merged_route_signature = _json_text({
+                "shot_publisher_instance_uuid": merged.get("shot_publisher_instance_uuid"),
+                "channel_uuid": merged.get("channel_uuid"),
+                "shot_uuid": merged.get("shot_uuid"),
+                "shot_number": merged.get("shot_number"),
+                "shot_name": merged.get("shot_name"),
+                "shot_selections": merged.get("shot_selections") or [],
+                "picker_shots": merged.get("picker_shots") or [],
+                "active_picker_shot_uuid": merged.get("active_picker_shot_uuid"),
+                "picker_legacy_membership_fallbacks": merged.get("picker_legacy_membership_fallbacks") or {},
+            })
+            if merged_route_signature != previous_route_signature:
+                self._reconcile_shared_shot_routing()
+                merged = self._picker_state()
             if merged_output_signature != previous_output_signature:
+                self._sync_outputs_from_state(dict(merged))
+            elif merged_route_signature != previous_route_signature:
                 self._sync_outputs_from_state(dict(merged))
         except Exception as exc:
             _diagnostic_exception("after_value_set failed", exc)
@@ -12133,6 +16012,8 @@ class HMBVideoPickerLibrary(DataNode):
             except Exception as nested:
                 _diagnostic_exception("failed to publish after_value_set error", nested)
         finally:
+            if catalog_state_context is not None:
+                catalog_state_context.__exit__(None, None, None)
             if output_side_effect_callback_started:
                 _end_output_side_effect_callback(self)
             try:
@@ -12229,6 +16110,58 @@ class HMBVideoPickerLibrary(DataNode):
         try:
             if adopt_serialized:
                 raw_state = _parse_state(_raw_parameter_value(self, WIDGET_STATE_PARAMETER))
+                serialized_state_paths = {
+                    field: _maya_scene_path_text(raw_state.get(field))
+                    for field in (
+                        "scene_draft_path",
+                        "scene_request_path",
+                        "scene_path",
+                    )
+                }
+                # Drop malformed aggregate control/log text at the backend
+                # boundary even when it arrived inside serialized widget state.
+                # Keep each valid saved field intact because a saved draft may
+                # legitimately differ from the last completed READ scene.
+                raw_state.update(serialized_state_paths)
+                state_scene_path = next(
+                    (
+                        serialized_state_paths[field]
+                        for field in (
+                            "scene_draft_path",
+                            "scene_request_path",
+                            "scene_path",
+                        )
+                        if serialized_state_paths[field]
+                    ),
+                    "",
+                )
+                serialized_parameter_path = _maya_scene_path_text(
+                    getattr(self, "_hmb_serialized_maya_scene_path", "")
+                )
+                restored_scene_path = state_scene_path or serialized_parameter_path
+                if restored_scene_path:
+                    # A saved widget snapshot is authoritative when present.
+                    # Older workflows that serialized only MAYA_SCENE receive
+                    # the same non-executing LOAD-ready draft on migration.
+                    if not state_scene_path:
+                        raw_state.update({
+                            "scene_draft_path": restored_scene_path,
+                            "scene_request_path": restored_scene_path,
+                            "scene_stage": "LOAD_READY",
+                            "scene_request_status": "COMPLETE",
+                            "status": "READY",
+                            "message": (
+                                "Restored the saved Maya scene selection. "
+                                "Press READ to load it."
+                            ),
+                        })
+                    self._store_initial_parameter_value(
+                        "MAYA_SCENE", restored_scene_path
+                    )
+                else:
+                    # Never consult or retain an unproven native/global bridge
+                    # value while adopting a path-free serialized workflow.
+                    self._store_initial_parameter_value("MAYA_SCENE", "")
                 previous_runtime_id = _clean(raw_state.get("runtime_instance_id"))
                 raw_state, recovered = _recover_orphaned_runtime_state(raw_state)
                 needs_publication = recovered or previous_runtime_id != self._hmb_runtime_instance_id
@@ -12259,6 +16192,7 @@ class HMBVideoPickerLibrary(DataNode):
         except Exception as exc:
             _diagnostic_exception("Parent after_deserialize hook failed", exc)
         self._restore_dynamic_state(adopt_serialized=True)
+        self._schedule_post_hydration_shot_reconcile()
         return result
 
     def after_load(self, *args: Any, **kwargs: Any) -> Any:
@@ -12268,6 +16202,7 @@ class HMBVideoPickerLibrary(DataNode):
         except Exception as exc:
             _diagnostic_exception("Parent after_load hook failed", exc)
         self._restore_dynamic_state(adopt_serialized=True)
+        self._schedule_post_hydration_shot_reconcile()
         return result
 
     def on_loaded(self, *args: Any, **kwargs: Any) -> Any:
@@ -12277,6 +16212,7 @@ class HMBVideoPickerLibrary(DataNode):
         except Exception as exc:
             _diagnostic_exception("Parent on_loaded hook failed", exc)
         self._restore_dynamic_state(adopt_serialized=True)
+        self._schedule_post_hydration_shot_reconcile()
         return result
 
     def _register_cleanup_file(self, path: Path) -> None:
@@ -12322,6 +16258,7 @@ class HMBVideoPickerLibrary(DataNode):
         video_slot: int,
         *,
         publish_public: bool = True,
+        picker_shot_uuid: Any = "",
     ) -> str:
         run_id = str(time.time_ns())
         markers = _normalize_markers(state.get("markers"), video_slot)
@@ -12372,7 +16309,11 @@ class HMBVideoPickerLibrary(DataNode):
             "control_role_hint": "Object and Character Region Guidance",
             "label": "Mask",
         }
-        state = _append_video_asset(state, new_video)
+        state = _append_video_asset(
+            state,
+            new_video,
+            picker_shot_uuid=picker_shot_uuid,
+        )
         videos = [
             item for item in state.get("videos", []) if isinstance(item, dict)
         ]
@@ -12609,9 +16550,10 @@ class HMBVideoPickerLibrary(DataNode):
         self._assert_operation_current(context, "READ preflight")
         if self._hmb_cancel_requested.is_set():
             raise RuntimeError("Maya Outliner READ cancelled by user.")
-        if not _clean(scene_text):
+        strict_scene_text = _maya_scene_path_text(scene_text)
+        if not strict_scene_text:
             raise ValueError("MAYA_SCENE is required before READ.")
-        scene_path = _norm_path(scene_text)
+        scene_path = _norm_path(strict_scene_text)
         if not scene_path.is_file():
             raise FileNotFoundError(f"Maya scene not found: {scene_path}")
         if scene_path.suffix.lower() not in {".ma", ".mb"}:
@@ -12906,6 +16848,13 @@ class HMBVideoPickerLibrary(DataNode):
                 if (full_path and full_path in valid_paths) or (maya_uuid and maya_uuid in valid_uuids):
                     bindings.append(dict(binding))
             preserved_assignments.append({"video_slot": int(slot_item.get("video_slot") or 1), "bindings": bindings})
+        outliner_selection = _outliner_selection_after_read(
+            outliner_nodes,
+            preserved_assignments,
+            selected_video_slot,
+            previous_state.get("selected_outliner_path"),
+            previous_state.get("selected_outliner_uuid"),
+        )
         state = {
             **previous_state,
             "mode": "maya",
@@ -12942,10 +16891,10 @@ class HMBVideoPickerLibrary(DataNode):
             "source_duration_seconds": source_duration,
             "outliner_nodes": outliner_nodes,
             "outliner_expanded": root_paths,
-            "selected_outliner_path": "",
-            "selected_outliner_name": "",
-            "selected_outliner_uuid": "",
-            "selected_color": "",
+            "selected_outliner_path": outliner_selection["path"],
+            "selected_outliner_name": outliner_selection["name"],
+            "selected_outliner_uuid": outliner_selection["uuid"],
+            "selected_color": outliner_selection["color"],
             "workspace_view": "outliner",
             "active_slot_count": active_slot_count,
             "selected_video_slot": selected_video_slot,
@@ -12962,6 +16911,8 @@ class HMBVideoPickerLibrary(DataNode):
             "snapshot_video_slot": 0,
             "snapshot_data_uri": "",
             "snapshot_path": "",
+            "snapshot_url": "",
+            "snapshot_sha256": "",
             "markers": [],
             "warnings": read_warnings,
             "pending_action": "",
@@ -13166,7 +17117,12 @@ class HMBVideoPickerLibrary(DataNode):
         publish_public: bool = True,
     ) -> Dict[str, Any]:
         self._assert_operation_current(context, "ORIGINAL PREVIEW preflight")
-        scene_path = _norm_path(scene_text)
+        strict_scene_text = _maya_scene_path_text(scene_text)
+        if not strict_scene_text:
+            raise ValueError(
+                "A single absolute Maya .mb or .ma scene is required before Original Preview."
+            )
+        scene_path = _norm_path(strict_scene_text)
         if not scene_path.is_file() or scene_path.suffix.lower() not in {".ma", ".mb"}:
             raise FileNotFoundError(f"Select an existing Maya .mb or .ma scene before Original Preview: {scene_path}")
         if not MAYA_RUNNER.is_file():
@@ -13180,7 +17136,9 @@ class HMBVideoPickerLibrary(DataNode):
             if isinstance(state.get("native_metadata"), dict)
             else {}
         )
-        native_scene_text = _scene_path_text(native_metadata.get("scene_path"))
+        native_scene_text = _maya_scene_path_text(
+            native_metadata.get("scene_path")
+        )
         if (
             native_scene_text
             and _scene_path_key(native_scene_text) != _scene_path_key(scene_path)
@@ -13812,9 +17770,17 @@ class HMBVideoPickerLibrary(DataNode):
             return
 
         state = self._merge_widget_state(self._picker_state(), incoming)
-        scene_text = (
-            _scene_path_text(state.get("scene_request_path") or state.get("scene_path"))
-            or self._current_scene_text()
+        scene_text = next(
+            (
+                candidate
+                for candidate in (
+                    _maya_scene_path_text(state.get("scene_request_path")),
+                    _maya_scene_path_text(state.get("scene_path")),
+                    self._current_scene_text(),
+                )
+                if candidate
+            ),
+            "",
         )
         history = [
             dict(item)
@@ -13910,7 +17876,12 @@ class HMBVideoPickerLibrary(DataNode):
     ) -> Dict[str, Any]:
         self._assert_operation_current(context, "SNAPSHOT preflight")
         video_slot = PRIMARY_COLOR_VIDEO_SLOT
-        scene_path = _norm_path(scene_text)
+        strict_scene_text = _maya_scene_path_text(scene_text)
+        if not strict_scene_text:
+            raise ValueError(
+                "A single absolute Maya .mb or .ma scene is required before SNAPSHOT."
+            )
+        scene_path = _norm_path(strict_scene_text)
         if not scene_path.is_file() or scene_path.suffix.lower() not in {".ma", ".mb"}:
             raise FileNotFoundError(f"Select an existing Maya .mb or .ma scene before SNAPSHOT: {scene_path}")
         if not MAYA_RUNNER.is_file():
@@ -14082,8 +18053,9 @@ class HMBVideoPickerLibrary(DataNode):
             "render_video_slot": PRIMARY_COLOR_VIDEO_SLOT,
             "video_slot": video_slot,
             "frame": frame,
-            "data_uri": _data_uri(cache_path),
             "path": str(cache_path).replace("\\", "/"),
+            "url": _external_media_url(cache_path),
+            "sha256": _sha256_file(cache_path),
             "created_at_ms": created_at_ms,
             },
             scene_path=scene_path,
@@ -14209,9 +18181,10 @@ class HMBVideoPickerLibrary(DataNode):
             raise RuntimeError("The frozen Depth slot plan no longer matches the request.")
         if motion_guide_enabled != bool(motion_guide_video_slot):
             raise RuntimeError("The frozen Motion Guide slot plan no longer matches the request.")
-        if not _clean(scene_text):
+        strict_scene_text = _maya_scene_path_text(scene_text)
+        if not strict_scene_text:
             raise ValueError("MAYA_SCENE is required.")
-        scene_path = _norm_path(scene_text)
+        scene_path = _norm_path(strict_scene_text)
         if not scene_path.is_file():
             raise FileNotFoundError(f"Maya scene not found: {scene_path}")
         if scene_path.suffix.lower() not in {".ma", ".mb"}:
@@ -14564,7 +18537,7 @@ class HMBVideoPickerLibrary(DataNode):
             warning = _compact_auxiliary_failure_warning(
                 label,
                 detail,
-                language=_clean(state.get("language")) or "en",
+                language=_clean(state.get("language")) or "ko",
             )
             if warning not in auxiliary_failure_warnings:
                 auxiliary_failure_warnings.append(warning)
@@ -15342,6 +19315,8 @@ class HMBVideoPickerLibrary(DataNode):
                     "snapshot_video_slot": 0,
                     "snapshot_data_uri": "",
                     "snapshot_path": "",
+                    "snapshot_url": "",
+                    "snapshot_sha256": "",
                     "viewport_mode": "video",
                     "snapshot_request_video_uid": "",
                     "workspace_view": "playblast",
@@ -15404,7 +19379,9 @@ class HMBVideoPickerLibrary(DataNode):
                         "companion_video_uid": mask_uid,
                         "source_video_uid": mask_uid,
                         "label": "Depth",
-                    })
+                    }, picker_shot_uuid=(
+                        context.picker_shot_uuid if context is not None else ""
+                    ))
                     state["message"] = (
                         "Mask and Depth were validated for video-history append with "
                         f"{len(markers)} Group Name + Color Pick bindings."
@@ -15485,7 +19462,9 @@ class HMBVideoPickerLibrary(DataNode):
                         "companion_video_uid": mask_uid,
                         "source_video_uid": mask_uid,
                         "label": "Motion Guide",
-                    })
+                    }, picker_shot_uuid=(
+                        context.picker_shot_uuid if context is not None else ""
+                    ))
                     if depth_succeeded:
                         state["message"] = (
                             "Mask, Depth, and Motion Guide were validated for "
@@ -15554,6 +19533,9 @@ class HMBVideoPickerLibrary(DataNode):
                     state,
                     video_slot,
                     publish_public=publish_public,
+                    picker_shot_uuid=(
+                        context.picker_shot_uuid if context is not None else ""
+                    ),
                 )
             except Exception as publish_exc:
                 rollback_errors: List[str] = []
@@ -15638,6 +19620,7 @@ class HMBVideoPickerLibrary(DataNode):
         side-effect-free synchronization step just like HMBPromptLibrary.process().
         """
         self._ensure_parameters()
+        self._reconcile_shared_shot_routing()
         state = self._apply_selected_view_fields(self._picker_state())
         # The workflow executor propagates process outputs through the graph.
         # Explicit late-worker forwarding here would deliver every value twice.

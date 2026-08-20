@@ -15,20 +15,18 @@ backups/
 dist/
 *.zip
 
-# Track exactly one signed runtime artifact. Canonical English sources and
-# Korean review documents remain outside Git and release packages.
-resources/agent/*
-!resources/agent/hmb_agent_core.dat
+# Agent policy artifacts are server-managed and never enter this repository or
+# an installable package. Policy source/review material also remains separate.
+resources/agent/
 resources/policy/
 policies/
-*.dat
 **/hmb_agent_core.dat
-!resources/agent/hmb_agent_core.dat
 
 # Credentials and machine-local configuration
 .env
 .env.*
 *.pem
+!resources/tls/hmb_agent_broker_ca.pem
 *.key
 *.p12
 *.pfx

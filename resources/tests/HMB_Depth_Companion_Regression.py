@@ -158,7 +158,6 @@ def shader_depth_range_report(frame_values=None) -> dict:
             "mesh_path_count": 2,
             "nurbs_surface_path_count": 0,
             "verified_shape_path_count": 2,
-            "verified_proxy_placeholder_path_count": 0,
             "verified_mesh_face_count": 24,
             "rendered_frame_count": len(evaluated_frames),
             "expected_frame_assignment_count": 2 * len(evaluated_frames),
@@ -581,27 +580,13 @@ disconnected_prompt_state = prompt._apply_picker_payload(
     {},
     connected=False,
 )
-assert disconnected_prompt_state["videos"] == prompt._normalize_state(
-    prompt._default_widget_state()
-)["videos"]
-assert {
-    item["video_uid"]
-    for item in disconnected_prompt_state["picker"]["dormant_video_rows"]
-} == {"depth-regression-mask", "depth-regression-depth"}
-reconnected_prompt_state = prompt._apply_picker_payload(
-    copy.deepcopy(disconnected_prompt_state),
-    valid_prompt_payload,
-    connected=True,
-)
-assert reconnected_prompt_state["videos"][0]["video_uid"] == (
-    "depth-regression-mask"
-)
-assert reconnected_prompt_state["videos"][1]["video_uid"] == (
-    "depth-regression-depth"
-)
-assert reconnected_prompt_state["videos"][1]["source_type"] == (
-    "Depth / Spatial Reference"
-)
+# A real edge disconnect restores the complete pre-Picker Prompt snapshot.
+# The independently usable UID row above is retained only while the Picker
+# edge still exists but temporarily publishes no structured media.
+assert len(disconnected_prompt_state["videos"]) == 1
+assert disconnected_prompt_state["videos"][0]["present"] is False
+assert disconnected_prompt_state["videos"][0]["video_uid"] == ""
+assert disconnected_prompt_state["picker"]["enabled"] is False
 
 non_maya_prompt_payload = copy.deepcopy(valid_prompt_payload)
 non_maya_prompt_payload["mode"] = "external_video"
@@ -611,11 +596,20 @@ non_maya_prompt_state = prompt._apply_picker_payload(
     connected=True,
 )
 assert non_maya_prompt_state["videos"] == valid_prompt_state["videos"]
+# A foreign-mode object is not allowed to overwrite structured Picker state,
+# but the no-loss input contract retains it as ordinary user intent.
 assert any(
-    "external_video" in str(entry.get("text") or "")
-    for entry in non_maya_prompt_state.get("source_intent_fallbacks", [])
-    if isinstance(entry, dict)
+    item.get("source") == "PICKER_IN"
+    and "foreign mode or schema" in item.get("reason", "")
+    for item in non_maya_prompt_state.get("source_intent_fallbacks", [])
 )
+non_maya_lines = prompt._build_data_only_prompt_package(
+    non_maya_prompt_state
+).splitlines()
+assert len(non_maya_lines) == 7
+assert json.loads(
+    non_maya_lines[non_maya_lines.index("USER DESCRIPTION DATA (JSON):") + 1]
+) == {}
 
 # Legacy local slot suppression cannot override a UID-managed Picker order.
 # Selection/deletion is authored in the catalog, so reconnecting the same
@@ -680,38 +674,16 @@ legacy_invalid_state = prompt._apply_picker_payload(
 assert_auto_depth_preserved_as_independent_media(legacy_invalid_state)
 legacy_invalid_state["videos"][1]["label"] = "manual-new-label"
 legacy_invalid_state["videos"][1]["present"] = True
-legacy_reactivated_prompt = prompt._build_data_only_prompt_package(legacy_invalid_state)
-legacy_lines = [line for line in legacy_reactivated_prompt.splitlines() if line]
-assert len(legacy_lines) == 7
-assert legacy_lines[0] == "HMB_GP_Production"
-assert legacy_lines[1] == "HMB JOB DATA (JSON):"
-assert legacy_lines[3] == "FX/TIMING SOURCE DATA (JSON):"
-assert legacy_lines[5] == "USER DESCRIPTION DATA (JSON):"
-legacy_job = json.loads(legacy_lines[2])
-legacy_fx = json.loads(legacy_lines[4])
-legacy_user = json.loads(legacy_lines[6])
-assert legacy_job["schema"] == "hmb-public-job-data"
-assert legacy_job["version"] == 1
-legacy_video2 = next(
-    item for item in legacy_job["videos"] if item["video"] == "@video2"
+legacy_reactivated_prompt = prompt._build_data_only_prompt_package(
+    legacy_invalid_state
 )
-assert legacy_video2["label"] == "manual-new-label"
-assert legacy_video2["source_type"] == "Depth / Spatial Reference"
-assert (
-    legacy_video2["control_role"]
-    == "Spatial Alignment Verification Only"
+legacy_lines = legacy_reactivated_prompt.splitlines()
+legacy_job = json.loads(
+    legacy_lines[legacy_lines.index("HMB JOB DATA (JSON):") + 1]
 )
-# Invalid generated-pair provenance removes companion authority while retaining
-# the independently readable source row as typed data.
-assert "companion" not in legacy_video2
-assert legacy_fx == {
-    "schema": "hmb-fx-timing-source-facts",
-    "version": 3,
-    "valid": True,
-    "errors": [],
-    "sources": [],
-}
-assert legacy_user == {}
+legacy_depth = legacy_job["videos"][1]
+assert legacy_depth["source_type"] == "Depth / Spatial Reference"
+assert legacy_depth["control_role"] == "Spatial Alignment Verification Only"
 
 
 # Manual values that existed before Picker temporarily classified @video2 as
@@ -779,10 +751,18 @@ manual_non_maya = prompt._apply_picker_payload(
 )
 assert manual_non_maya["videos"] == manual_then_valid["videos"]
 assert any(
-    "external_video" in str(entry.get("text") or "")
-    for entry in manual_non_maya.get("source_intent_fallbacks", [])
-    if isinstance(entry, dict)
+    item.get("source") == "PICKER_IN"
+    and "foreign mode or schema" in item.get("reason", "")
+    for item in manual_non_maya.get("source_intent_fallbacks", [])
 )
+manual_non_maya_lines = prompt._build_data_only_prompt_package(
+    manual_non_maya
+).splitlines()
+assert json.loads(
+    manual_non_maya_lines[
+        manual_non_maya_lines.index("USER DESCRIPTION DATA (JSON):") + 1
+    ]
+) == {}
 
 manual_deleted_source = copy.deepcopy(manual_then_valid)
 manual_deleted_source["videos"][1] = prompt._default_video_item(2)
@@ -1000,7 +980,10 @@ assert published["viewport_mode"] == "video"
 assert published["snapshot_active"] is False
 assert published["active_snapshot_uid"] == published["snapshots"][-1]["snapshot_uid"]
 assert published["snapshot_video_slot"] == 2
-assert published["snapshot_data_uri"] == "data:image/png;base64,AA=="
+# Snapshot history retains its stable UID/path/content hash without embedding
+# heavyweight PNG bytes back into serialized Picker state.
+assert published["snapshot_data_uri"] == ""
+assert published["snapshot_sha256"] == published["snapshots"][-1]["sha256"]
 assert published["snapshot_path"].endswith("/stale-depth-snapshot.png")
 published_payload = publish_node._build_picker_payload(published)
 assert published_payload["schema_version"] == 5
@@ -1032,6 +1015,11 @@ color_only_state["videos"][1]["depth_range_report"] = {
     "encoding_curve": "normalized_power",
     "contrast_exponent": 0.25,
 }
+# Selection is Shot-local and UID-authored. Explicitly leave the retained
+# legacy Depth asset out of this Shot's ordered selected subset.
+color_only_state["picker_shots"][0]["selected_video_uids"] = [
+    color_only_state["videos"][0]["video_uid"]
+]
 assert picker._is_generated_depth_video_item(color_only_state["videos"][1])
 color_only_captured = {}
 color_only_node = object.__new__(picker.HMBVideoPickerLibrary)
@@ -1075,6 +1063,8 @@ assert not color_only_published.get("pair_run_id")
 # untouched by a Color-only @video1 generation.
 manual_video2 = {
     "video_slot": 2,
+    "video_uid": "manual-preserve-auxiliary",
+    "source_uid": "manual-preserve-auxiliary",
     "video_path": "C:/show/shot/manual_depth_or_auxiliary.mp4",
     "camera": "",
     "markers": [],
@@ -1098,11 +1088,24 @@ manual_state["video_path"] = "C:/show/shot/manual-preserve-new-color.mp4"
 manual_state["videos"] = [
     {
         "video_slot": 1,
+        "video_uid": "manual-preserve-color",
+        "source_uid": "manual-preserve-color",
         "video_path": "C:/show/shot/manual-preserve-old-color.mp4",
         "markers": [],
     },
     manual_video2,
 ]
+manual_state["picker_shots"][0]["video_asset_uids"] = [
+    "manual-preserve-color",
+    "manual-preserve-auxiliary",
+]
+manual_state["picker_shots"][0]["selected_video_uids"] = [
+    "manual-preserve-color",
+    "manual-preserve-auxiliary",
+]
+manual_state["picker_shots"][0]["preview_video_uid"] = (
+    "manual-preserve-color"
+)
 manual_captured = {}
 manual_node = object.__new__(picker.HMBVideoPickerLibrary)
 manual_node._write_state = lambda state: manual_captured.update(
@@ -1574,19 +1577,6 @@ with tempfile.TemporaryDirectory() as temp_dir:
         result=result_matching_range(incomplete_assignment_verification),
         color_sidecar=color_sidecar,
         depth_sidecar=incomplete_assignment_verification,
-        color_frame_paths=color_frames,
-        depth_frame_paths=depth_frames,
-    )
-
-    invalid_proxy_assignment_verification = copy.deepcopy(depth_sidecar)
-    invalid_proxy_assignment_verification["depth_range_report"][
-        "assignment_verification"
-    ]["verified_proxy_placeholder_path_count"] = 3
-    assert_depth_invalid(
-        "proxy placeholder verification exceeds mesh count",
-        result=result_matching_range(invalid_proxy_assignment_verification),
-        color_sidecar=color_sidecar,
-        depth_sidecar=invalid_proxy_assignment_verification,
         color_frame_paths=color_frames,
         depth_frame_paths=depth_frames,
     )

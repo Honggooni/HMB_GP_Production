@@ -239,6 +239,14 @@ frameImage.frame_range_bindings = {
   },
 };
 frameImage.frame_range_binding = null;
+frameImage.frame_range_intent = {
+  version: 1,
+  enabled: true,
+  start_frame: 1,
+  end_frame: 24,
+  ranges: [{ start: 5, end: 12 }],
+  selected_index: 0,
+};
 const frameState = {
   ...normalized,
   images: [frameImage],
@@ -265,10 +273,10 @@ const frameState = {
   },
 };
 const frameStatus = prompt.frameRangeUiStatus(frameState, frameImage);
-assert.equal(frameStatus.colorIndex, 1);
-assert.equal(frameStatus.slot, 3);
-assert.equal(frameStatus.key, "@video3::Green");
-assert.equal(frameStatus.binding.video_slot, "@video3");
+assert.equal(frameStatus.colorIndex, undefined);
+assert.equal(frameStatus.slot, undefined);
+assert.equal(frameStatus.key, undefined);
+assert.equal(frameStatus.binding, undefined);
 assert.deepEqual(frameStatus.ranges, [{ start: 5, end: 12 }]);
 assert.equal(frameStatus.canEnable, true);
 

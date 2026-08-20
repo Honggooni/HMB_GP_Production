@@ -14,9 +14,9 @@ from _hmb_private_policy_fixture import install_private_policy_reader
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.6.25"
-EXPECTED_POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
-EXPECTED_CONTRACT_SHA256 = "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
+EXPECTED_RELEASE_VERSION = "0.6.36"
+EXPECTED_POLICY_VERSION = "2026-08-11.agent-shot-quality.v4.1"
+EXPECTED_CONTRACT_SHA256 = "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
 BASE_MASTER_SEEDS = (
     20260729,
     0x484D42,
@@ -88,9 +88,7 @@ agent_compositions = tuple(item for item in compositions if "A" in item)
 assert len(agent_compositions) == 8
 
 plain_prompt = "Independent native Agent request."
-empty_hmb = prompt_lib._build_data_only_prompt_package(
-    prompt_lib._default_widget_state()
-)
+empty_hmb = prompt_lib._build_prompt_package(prompt_lib._default_widget_state())
 for composition in agent_compositions:
     candidate = empty_hmb if "P" in composition else plain_prompt
     assert agent_lib._is_hmb_prompt_library_payload(candidate) is ("P" in composition)
@@ -218,7 +216,7 @@ for seed in MASTER_SEEDS:
             source_presence_counts[key] += int(enabled)
         canonical = prompt_lib._normalize_state(copy.deepcopy(state))
         before_build = json.dumps(canonical, ensure_ascii=False, sort_keys=True)
-        compiled = prompt_lib._build_data_only_prompt_package(canonical)
+        compiled = prompt_lib._build_prompt_package(canonical)
         after_build = json.dumps(canonical, ensure_ascii=False, sort_keys=True)
         assert before_build == after_build, (seed, case_index, "builder mutated state")
         assert policy not in compiled
@@ -237,7 +235,7 @@ for seed in MASTER_SEEDS:
         )
         paired = copy.deepcopy(canonical)
         paired["text"]["PROJECT_STYLE_LOOK"] = alternate
-        paired_compiled = prompt_lib._build_data_only_prompt_package(paired)
+        paired_compiled = prompt_lib._build_prompt_package(paired)
         assert policy not in paired_compiled
         assert binding not in paired_compiled
         assert prompt_description_json(paired_compiled)["PROJECT_STYLE_LOOK"] == alternate
@@ -256,10 +254,7 @@ for seed in MASTER_SEEDS:
                 )
             )
             recursive_round_trips += 1
-        assert (
-            prompt_lib._build_data_only_prompt_package(recursively_normalized)
-            == compiled
-        )
+        assert prompt_lib._build_prompt_package(recursively_normalized) == compiled
         randomized_cases += 1
 
 # Repeated decode/verify/load cycles cannot duplicate or weaken the contract.

@@ -22,4 +22,3 @@ LICENSE text eol=lf
 *.webp binary
 *.zip binary
 *.mp4 binary
-resources/agent/hmb_agent_core.dat binary

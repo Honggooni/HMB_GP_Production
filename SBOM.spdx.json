@@ -2,33 +2,25 @@
   "SPDXID": "SPDXRef-DOCUMENT",
   "spdxVersion": "SPDX-2.3",
   "dataLicense": "CC0-1.0",
-  "name": "HMB_GP_Production-0.6.25",
-  "documentNamespace": "https://hmb.local/spdx/HMB_GP_Production/0.6.25",
+  "name": "HMB_GP_Production-0.6.36",
+  "documentNamespace": "https://hmb.local/spdx/HMB_GP_Production/0.6.36",
   "creationInfo": {
-    "created": "2026-08-11T00:00:00Z",
-    "creators": ["Organization: HMB Pipeline", "Tool: Codex release audit"]
+    "created": "2026-08-05T00:00:00Z",
+    "creators": [
+      "Organization: HMB Pipeline",
+      "Tool: Codex release audit"
+    ]
   },
   "packages": [
     {
       "SPDXID": "SPDXRef-HMB-GP-Production",
       "name": "hmb-gp-production",
-      "versionInfo": "0.6.25",
+      "versionInfo": "0.6.36",
       "downloadLocation": "NOASSERTION",
       "filesAnalyzed": false,
       "licenseConcluded": "LicenseRef-HMB-Internal-1.0",
       "licenseDeclared": "LicenseRef-HMB-Internal-1.0",
-      "packageComment": "The distribution includes exactly one signed runtime artifact at resources/agent/hmb_agent_core.dat. Canonical English policy sources and Korean review documents are excluded.",
       "copyrightText": "Copyright (c) 2026 HMB Pipeline"
-    },
-    {
-      "SPDXID": "SPDXRef-cryptography",
-      "name": "cryptography",
-      "versionInfo": "50.0.0",
-      "downloadLocation": "https://pypi.org/project/cryptography/50.0.0/",
-      "filesAnalyzed": false,
-      "licenseConcluded": "Apache-2.0 OR BSD-3-Clause",
-      "licenseDeclared": "Apache-2.0 OR BSD-3-Clause",
-      "copyrightText": "NOASSERTION"
     },
     {
       "SPDXID": "SPDXRef-Pillow",
@@ -72,12 +64,31 @@
     }
   ],
   "relationships": [
-    {"spdxElementId": "SPDXRef-DOCUMENT", "relationshipType": "DESCRIBES", "relatedSpdxElement": "SPDXRef-HMB-GP-Production"},
-    {"spdxElementId": "SPDXRef-HMB-GP-Production", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-cryptography"},
-    {"spdxElementId": "SPDXRef-HMB-GP-Production", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-Pillow"},
-    {"spdxElementId": "SPDXRef-HMB-GP-Production", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-imageio-ffmpeg"},
-    {"spdxElementId": "SPDXRef-HMB-GP-Production", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-httpx"},
-    {"spdxElementId": "SPDXRef-HMB-GP-Production", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": "SPDXRef-volcengine-tos"}
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-HMB-GP-Production"
+    },
+    {
+      "spdxElementId": "SPDXRef-HMB-GP-Production",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Pillow"
+    },
+    {
+      "spdxElementId": "SPDXRef-HMB-GP-Production",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-imageio-ffmpeg"
+    },
+    {
+      "spdxElementId": "SPDXRef-HMB-GP-Production",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-httpx"
+    },
+    {
+      "spdxElementId": "SPDXRef-HMB-GP-Production",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-volcengine-tos"
+    }
   ],
   "hasExtractedLicensingInfos": [
     {

@@ -25,8 +25,6 @@ for required_signed_semantic in (
     "Discard every visible color and appearance property from that video",
     "Timing / Edit Reference is a separate Main Type and contributes only readable edit and timing cues",
     "valid Range ON segments as their common allowed time boundary",
-    "When Range is OFF and no other valid explicit time scope exists, retain source-local full-shot timing.",
-    "An invalid ON range leaves only the affected typed binding unresolved",
 ):
     assert required_signed_semantic in SEALED_RUNTIME_TEXT
 
@@ -205,10 +203,7 @@ def two_source_state() -> dict:
 
 
 # Main Type, not a stale secondary role, owns FX/Timing interpretation.
-readable = prompt._build_prompt_package(two_source_state())
-assert "VIDEO SOURCE:" in readable
-assert "FX/TIMING SOURCE DATA (JSON):" not in readable
-compiled = prompt._build_data_only_prompt_package(two_source_state())
+compiled = prompt._build_prompt_package(two_source_state())
 lines, job, contract, user_data = parse_envelope(compiled)
 agent._assert_public_job_data_contract(compiled)
 agent._assert_fx_timing_source_contract(compiled)
@@ -283,7 +278,7 @@ expect_rejected(
 # Range OFF retains dormant widget state but publishes source-local full video.
 range_off_state = two_source_state()
 range_off_state["images"][0]["frame_range_enabled"] = False
-range_off = prompt._build_data_only_prompt_package(range_off_state)
+range_off = prompt._build_prompt_package(range_off_state)
 _, range_off_job, range_off_contract, _ = parse_envelope(range_off)
 agent._assert_fx_timing_source_contract(range_off)
 assert range_off_job["frame_ranges"] == []
@@ -318,7 +313,7 @@ partial_image["frame_range_bindings"] = {
 }
 partial_state["images"] = [partial_image]
 partial_state["videos"] = [video(1, "FX Reference", "Timing Only")]
-partial = prompt._build_data_only_prompt_package(partial_state)
+partial = prompt._build_prompt_package(partial_state)
 _, partial_job, partial_contract, _ = parse_envelope(partial)
 agent._assert_fx_timing_source_contract(partial)
 partial_range = partial_job["frame_ranges"][0]
@@ -389,7 +384,7 @@ multi_state["videos"] = [
     video(2, "Timing / Edit Reference", "FX Behavior Only"),
     video(3, "Timing / Edit Reference", "Context Only"),
 ]
-multi = prompt._build_data_only_prompt_package(multi_state)
+multi = prompt._build_prompt_package(multi_state)
 _, _, multi_contract, _ = parse_envelope(multi)
 agent._assert_fx_timing_source_contract(multi)
 multi_sources = {

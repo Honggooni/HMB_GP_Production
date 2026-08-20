@@ -8,15 +8,21 @@ import types
 from itertools import combinations
 from pathlib import Path
 
-from _hmb_private_policy_fixture import install_private_policy_reader
-
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.6.25"
-EXPECTED_POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
-EXPECTED_CONTRACT_SHA256 = "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
-EXPECTED_SERVER_POLICY_SHA256 = "7171bef7169df8894ed24ae7a9b4d9d145957c5110c963b7435372b2695fd251"
+EXPECTED_RELEASE_VERSION = "0.6.36"
+EXPECTED_POLICY_VERSION = "2026-08-11.agent-shot-quality.v4.1"
+EXPECTED_CONTRACT_SHA256 = "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
+EXPECTED_SERVER_POLICY_SHA256 = "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
 EXPECTED_SIGNING_KEY_ID = "hmb-policy-release-2026-08-r2"
+PRIVATE_SIGNED_POLICY_FIXTURE = (
+    ROOT
+    / "resources"
+    / "policy"
+    / "HMB_GP_Production_Rule"
+    / "artifact"
+    / "hmb_agent_core.dat"
+)
 
 
 def load(name: str):
@@ -31,8 +37,11 @@ def load(name: str):
 agent = load("HMBAgentLibrary")
 prompt = load("HMBPromptLibrary")
 
-original_policy_reader, sealed = install_private_policy_reader(agent._hmb)
+assert PRIVATE_SIGNED_POLICY_FIXTURE.is_file()
+sealed = PRIVATE_SIGNED_POLICY_FIXTURE.read_bytes()
 assert hashlib.sha256(sealed).hexdigest() == EXPECTED_SERVER_POLICY_SHA256
+original_policy_reader = agent._hmb._read_agent_policy_envelope
+agent._hmb._read_agent_policy_envelope = lambda: sealed
 
 assert agent._prompt_policy_source_identity() == (
     prompt.PROMPT_POLICY_SOURCE_VERSION,
@@ -138,9 +147,7 @@ for required_field in (
 # opts into the structured 4+4 Behaviors. Plain text, copied HMB text, and direct
 # Image/Video payloads remain stock native Agent requests.
 plain_prompt = "Independent designer request using the currently available inputs."
-empty_hmb_prompt = prompt._build_data_only_prompt_package(
-    prompt._default_widget_state()
-)
+empty_hmb_prompt = prompt._build_prompt_package(prompt._default_widget_state())
 assert not agent._is_hmb_prompt_library_payload(plain_prompt)
 assert agent._is_hmb_prompt_library_payload(empty_hmb_prompt)
 assert policy not in empty_hmb_prompt
@@ -345,9 +352,9 @@ mixed_state["videos"][0].update({
 })
 payload_variants = (
     empty_hmb_prompt,
-    prompt._build_data_only_prompt_package(image_state),
-    prompt._build_data_only_prompt_package(video_state),
-    prompt._build_data_only_prompt_package(mixed_state),
+    prompt._build_prompt_package(image_state),
+    prompt._build_prompt_package(video_state),
+    prompt._build_prompt_package(mixed_state),
 )
 for variant in payload_variants:
     assert agent._is_hmb_prompt_library_payload(variant)
@@ -429,11 +436,7 @@ assert "pkgutil.walk_packages" not in common_source
 assert "Path.home() / \"Documents\" / \"GriptapeNodes\"" not in common_source
 assert "_AGENT_POLICY_RSA_MODULUS_B64" in common_source
 assert "_verify_agent_policy_signature" in common_source
-assert "_BUNDLED_AGENT_POLICY_FILE" in common_source
-assert 'ROOT / "resources" / "agent" / "hmb_agent_core.dat"' in common_source
-assert "_resolve_agent_rule_data_path" not in common_source
-assert "FIN-RCOMP7.funnyflux.local" not in common_source
-assert "HMB_AgentPolicy$" not in common_source
+assert "_BUNDLED_AGENT_POLICY_FILE" not in common_source
 assert r"\\FIN-RCOMP7\D$\agent" not in common_source
 
 agent._hmb._read_agent_policy_envelope = original_policy_reader

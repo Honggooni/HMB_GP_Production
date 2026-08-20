@@ -10,7 +10,7 @@ import math
 import re
 import sys
 import threading
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
@@ -19,8 +19,7 @@ if str(_THIS_DIR) not in sys.path:
 
 def _load_hmb_common():
     module_path = _THIS_DIR / "_hmb_common.py"
-    module_key = f"{module_path.resolve()}:{module_path.stat().st_mtime_ns}"
-    module_name = "_hmb_gp_production_common_" + hashlib.sha1(module_key.encode("utf-8")).hexdigest()[:12]
+    module_name = "_hmb_gp_production_common"
     existing = sys.modules.get(module_name)
     if existing is not None and Path(getattr(existing, "__file__", "")).resolve() == module_path.resolve():
         return existing
@@ -64,7 +63,11 @@ except Exception:
     Widget = None  # type: ignore
 
 
+# Legacy/manual Prompt authoring retains its established fifty-image capacity.
+# Remote Shot routing is a narrower projection: each Shot publishes at most
+# thirty ordered image addresses. Generator-specific limits remain downstream.
 MAX_IMAGES = 50
+MAX_SHOT_IMAGES = 30
 MAX_VIDEOS = 10
 PROMPT_POLICY_SOURCE_VERSION = "2026-08-12.agent-shot-quality.v4.2"
 PROMPT_POLICY_SOURCE_CONTRACT_SHA256 = (
@@ -90,7 +93,9 @@ MAX_VIDEO_VFX_CHARS = 20000
 MAX_KEEP_OUT_CHARS = 4000
 MAX_PROMPT_CHARS = 55000
 MAX_FRAME_RANGES_PER_BINDING = 100
-MAX_MANUAL_FRAME_NUMBER = 9999
+MIN_MANUAL_FRAME_NUMBER = -(2**31)
+MAX_MANUAL_FRAME_NUMBER = (2**31) - 1
+VIDEO_WIDE_RANGE_MARKER = "Video-wide"
 VIDEO_REFERENCE_CAPABILITIES_SCHEMA = "hmb-video-reference-capabilities"
 VIDEO_REFERENCE_CAPABILITIES_VERSION = 1
 VIDEO_FRAME_DOMAIN_SCHEMA = "hmb-video-frame-domain"
@@ -130,6 +135,19 @@ WIDGET_PARAMETER_NAME = "HMB_UI_STATE"
 PICKER_INPUT_PARAMETER_NAME = "PICKER_IN"
 IMAGE_ASSET_INPUT_PARAMETER_NAME = "IMAGE_ASSET_IN"
 IMAGE_ASSET_INPUT_DISPLAY_NAME = "ASSET_IN"
+SHOT_ASSET_INPUT_PARAMETER_NAME = "SHOT_ASSET_IN"
+SHOT_IMAGE_OUTPUT_PARAMETER_NAME = "SHOT_IMAGE_OUT"
+SHOT_PICKER_INPUT_PARAMETER_NAME = "SHOT_PICKER_IN"
+SHOT_VIDEO_OUTPUT_PARAMETER_NAME = "SHOT_VIDEO_OUT"
+SHOT_ROUTING_SNAPSHOT_SCHEMA = "hmb-shot-routing-snapshot"
+SHOT_ROUTING_SNAPSHOT_VERSION = 1
+SHOT_ROUTING_CATALOG_SCHEMA = "hmb-shot-routing-catalog"
+SHOT_ROUTING_CATALOG_VERSION = 1
+PICKER_SHOT_ROUTING_SNAPSHOT_SCHEMA = "hmb-picker-shot-routing-snapshot"
+PICKER_SHOT_ROUTING_SNAPSHOT_VERSION = 1
+SHOT_SELECTION_SCHEMA = "hmb-shot-selection"
+SHOT_SELECTION_VERSION = 1
+MAX_SHOTS = 5
 WIDGET_NAME = "HMBPromptLibraryScopedBindingWidget"
 WIDGET_LIBRARY_NAME = "HMB_GP_Production"
 STATE_SCHEMA = "prompt-library-state"
@@ -139,24 +157,30 @@ UI_EDIT_REVISION_KEY = "ui_edit_revision"
 MANUAL_VIDEO_CONTEXT_KEY = "manual_video_context"
 MAX_SOURCE_SYNC_REVISION = (1 << 53) - 1
 UI_RESIZE_MODE = "stacked_outer_1000"
+UI_HEADER_LAYOUT_VERSION = 2
+LEGACY_IMAGE_SOURCES_DEFAULT_HEIGHT = 542
 GROUP_START_HEIGHTS = {
-    "imageSources": 500,
+    # Match VideoPicker's 68px header without changing the established
+    # 1800x1193 outer size. Only the fresh/default image editor absorbs the
+    # 10px delta; persisted user group heights remain authoritative.
+    "imageSources": 514,
     "imageText": 200,
     "videoSources": 200,
     "videoText": 150,
 }
-GROUP_MIN_HEIGHTS = GROUP_START_HEIGHTS
+GROUP_MIN_HEIGHTS = {
+    # Keep the established 1193px minimum while reserving VideoPicker chrome.
+    "imageSources": 514,
+    "imageText": 200,
+    "videoSources": 200,
+    "videoText": 150,
+}
 GROUP_START_TOTAL_HEIGHT = sum(GROUP_START_HEIGHTS.values())
-PROMPT_DASHBOARD_FIXED_HEIGHT = 101
-# IMAGE_ASSET_IN adds one native connector row above the custom dashboard.
-# Reserve the measured native-row height so the existing dashboard area is not
-# clipped at the bottom when a Prompt node is first created.
-PROMPT_NATIVE_ASSET_INPUT_ROW_HEIGHT = 42
-PROMPT_START_HEIGHT = (
-    GROUP_START_TOTAL_HEIGHT
-    + PROMPT_DASHBOARD_FIXED_HEIGHT
-    + PROMPT_NATIVE_ASSET_INPUT_ROW_HEIGHT
-)
+PROMPT_DASHBOARD_FIXED_HEIGHT = 129
+# Native compatibility/dependency ports are retained on the graph but rendered
+# as hidden rows. The custom dashboard therefore owns the full node.
+PROMPT_NATIVE_ASSET_INPUT_ROW_HEIGHT = 0
+PROMPT_START_HEIGHT = GROUP_START_TOTAL_HEIGHT + PROMPT_DASHBOARD_FIXED_HEIGHT
 PROMPT_MIN_HEIGHT = PROMPT_START_HEIGHT
 GROUP_MAX_HEIGHT = 6000
 KEEP_OUT_TEXTAREA_MIN_HEIGHT = 34
@@ -200,7 +224,7 @@ VIDEO_CONTROL_ROLE_CHOICES = [
 
 VIDEO_ROLE_COMPATIBILITY = {
     "Maya Preview / Playblast": {
-        "Primary Unified Shot Control", "Local Motion Detail Only", "Secondary Motion Only",
+        "Local Motion Detail Only", "Secondary Motion Only",
         "Spatial Alignment Verification Only", "Timing Only", "Mask / Guide Only", "Context Only",
     },
     "Unified Shot-Control Video": {"Primary Unified Shot Control"},
@@ -270,65 +294,6 @@ TEXT_FIELD_NAMES = [
 ]
 TEXT_FIELD_DEFAULTS = {name: "" for name in TEXT_FIELD_NAMES}
 
-
-PRESERVED_TEXT_TYPES = {
-    "Proper Noun",
-    "Dialogue",
-    "Lip-sync Speech",
-    "Lyrics",
-    "Chant",
-    "On-screen Text",
-}
-_PRESERVED_TEXT_LINE_RE = re.compile(r"^\s*\[([^]\r\n]+)\]\s*(.+?)\s*$")
-
-def _parse_preserved_text(value: Any) -> tuple[List[Dict[str, str]], List[str]]:
-    entries: List[Dict[str, str]] = []
-    errors: List[str] = []
-    seen: set[tuple[str, str]] = set()
-    for line_number, raw_line in enumerate(str(value or "").splitlines(), 1):
-        line = raw_line.strip()
-        if not line:
-            continue
-        match = _PRESERVED_TEXT_LINE_RE.match(line)
-        if not match:
-            errors.append(f"PRESERVED_TEXT line {line_number} must use [Type] exact text.")
-            continue
-        item_type = match.group(1).strip()
-        literal = match.group(2).strip()
-        if item_type not in PRESERVED_TEXT_TYPES:
-            errors.append(f"PRESERVED_TEXT line {line_number} uses unsupported type: {item_type}.")
-            continue
-        if not literal:
-            errors.append(f"PRESERVED_TEXT line {line_number} has no exact text.")
-            continue
-        key=(item_type,literal)
-        if key in seen:
-            continue
-        seen.add(key)
-        entries.append({"type": item_type, "value": literal})
-    return entries, errors
-
-
-def _unverified_preserved_text_lines(value: Any) -> List[str]:
-    """Keep malformed exact-text rows as ordinary descriptive user intent.
-
-    A malformed or unknown tag cannot receive exact-literal authority, but that
-    technical limitation must never erase the words the user supplied.
-    """
-    out: List[str] = []
-    for raw_line in str(value or "").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        match = _PRESERVED_TEXT_LINE_RE.match(line)
-        if not match:
-            out.append(line)
-            continue
-        item_type = match.group(1).strip()
-        literal = match.group(2).strip()
-        if item_type not in PRESERVED_TEXT_TYPES or not literal:
-            out.append(line)
-    return list(dict.fromkeys(out))
 
 VIDEO_ROLE_ALIASES = {
     "Strongest Unified Shot-Control": "Primary Unified Shot Control",
@@ -522,6 +487,24 @@ def _connected_source_fingerprint(payload: Any, connected: bool) -> str:
 
 _UNSTRUCTURED_INPUT_KEY = "__hmb_unstructured_input__"
 _SOURCE_INTENT_FALLBACKS_KEY = "source_intent_fallbacks"
+_SOURCE_PARSE_DIAGNOSTIC_KIND = "parse_diagnostic"
+_SOURCE_PARSE_DIAGNOSTIC_REASON = "invalid JSON connected input"
+_SOURCE_PARSE_DIAGNOSTIC_ERROR_CODE = "invalid_json"
+_LEGACY_SOURCE_PARSE_FAILURE_REASON = "readable non-JSON connected input"
+_HMB_CONNECTED_SIGNATURE_PREFIX_CHARS = 4096
+_HMB_CONNECTED_SIGNATURES = {
+    PICKER_INPUT_PARAMETER_NAME: {
+        "schema": frozenset({"hmb-prompt-library-picker-binding"}),
+        "mode": frozenset({"maya"}),
+    },
+    IMAGE_ASSET_INPUT_PARAMETER_NAME: {
+        "schema": frozenset({"hmb-image-asset-library-binding"}),
+        "mode": frozenset({"image_asset"}),
+    },
+}
+_JSON_STRING_FIELD_PATTERN = re.compile(
+    r'(?:\A|[,{])\s*"(?P<key>schema|mode)"\s*:\s*"(?P<value>[^"\\]*)"'
+)
 _IMAGE_ASSET_PAYLOAD_KEYS = frozenset({
     "schema",
     "version",
@@ -562,10 +545,14 @@ _IMAGE_ASSET_ROW_KEYS = frozenset({
     "asset_library_id",
     "asset_key",
     "asset_id",
+    "asset_project_uid",
     "image_name",
     "label",
     "path",
     "asset_path",
+    "relative_path",
+    "width",
+    "height",
     "project_uid",
     "source_type",
     "custom_source_type",
@@ -575,6 +562,8 @@ _IMAGE_ASSET_ROW_KEYS = frozenset({
     "color_pick_candidates",
     "selection_order",
     "slot",
+    "identity",
+    "binding_capabilities",
 })
 _PICKER_PAYLOAD_KEYS = frozenset({
     "schema",
@@ -715,9 +704,113 @@ def _readable_original(value: Any) -> str:
             return ""
 
 
+def _machine_port_hmb_signature(source: Any, value: Any) -> bool:
+    """Recognize an HMB machine payload without parsing or retaining its body."""
+
+    source_name = _clean_string(source)
+    allowed = _HMB_CONNECTED_SIGNATURES.get(source_name)
+    text = value if isinstance(value, str) else ""
+    prefix = text[:_HMB_CONNECTED_SIGNATURE_PREFIX_CHARS]
+    if not allowed or not prefix.startswith("{"):
+        return False
+    matched: set[str] = set()
+    for match in _JSON_STRING_FIELD_PATTERN.finditer(prefix):
+        key = match.group("key")
+        if match.group("value") in allowed.get(key, frozenset()):
+            matched.add(key)
+    return matched == set(allowed)
+
+
+def _known_hmb_connected_payload(source: Any, payload: Any) -> bool:
+    source_name = _clean_string(source)
+    allowed = _HMB_CONNECTED_SIGNATURES.get(source_name)
+    if not allowed or not isinstance(payload, dict):
+        return False
+    return all(
+        _clean_string(payload.get(key)) in values
+        for key, values in allowed.items()
+    )
+
+
+def _json_error_offset(value: str) -> int:
+    try:
+        json.loads(value)
+    except json.JSONDecodeError as exc:
+        return max(-1, int(exc.pos))
+    except Exception:
+        return -1
+    return -1
+
+
+def _source_parse_diagnostic(
+    source: Any,
+    value: Any,
+    *,
+    error_offset: Any = None,
+    require_hmb_signature: bool = True,
+) -> Dict[str, Any] | None:
+    text = value if isinstance(value, str) else _readable_original(value)
+    source_name = _clean_string(source)
+    if (
+        not text
+        or source_name not in _HMB_CONNECTED_SIGNATURES
+        or (
+            require_hmb_signature
+            and not _machine_port_hmb_signature(source_name, text)
+        )
+    ):
+        return None
+    try:
+        offset = int(error_offset)
+    except Exception:
+        offset = _json_error_offset(text)
+    raw = text.encode("utf-8")
+    return {
+        "kind": _SOURCE_PARSE_DIAGNOSTIC_KIND,
+        "source": source_name,
+        "reason": _SOURCE_PARSE_DIAGNOSTIC_REASON,
+        "error_code": _SOURCE_PARSE_DIAGNOSTIC_ERROR_CODE,
+        "byte_length": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "error_offset": max(-1, offset),
+    }
+
+
+def _normalize_source_parse_diagnostic(value: Any) -> Dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    source = _clean_string(value.get("source"))
+    if (
+        value.get("kind") != _SOURCE_PARSE_DIAGNOSTIC_KIND
+        or source not in _HMB_CONNECTED_SIGNATURES
+        or _clean_string(value.get("error_code"))
+        != _SOURCE_PARSE_DIAGNOSTIC_ERROR_CODE
+    ):
+        return None
+    try:
+        byte_length = max(0, int(value.get("byte_length")))
+        error_offset = max(-1, int(value.get("error_offset")))
+    except Exception:
+        return None
+    sha256 = _clean_string(value.get("sha256")).lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        return None
+    return {
+        "kind": _SOURCE_PARSE_DIAGNOSTIC_KIND,
+        "source": source,
+        "reason": _SOURCE_PARSE_DIAGNOSTIC_REASON,
+        "error_code": _SOURCE_PARSE_DIAGNOSTIC_ERROR_CODE,
+        "byte_length": byte_length,
+        "sha256": sha256,
+        "error_offset": error_offset,
+    }
+
+
 def _source_intent_entry(source: Any, reason: Any, value: Any) -> Dict[str, str] | None:
-    text = _readable_original(value)
-    if not text:
+    # Connected operator prose is ordinary user data, not a transport budget.
+    # Preserve string bytes exactly; use trimming only to reject blank values.
+    text = value if isinstance(value, str) else _readable_original(value)
+    if not text or not text.strip():
         return None
     return {
         "source": _clean_string(source) or "CONNECTED_SOURCE",
@@ -726,12 +819,56 @@ def _source_intent_entry(source: Any, reason: Any, value: Any) -> Dict[str, str]
     }
 
 
-def _normalize_source_intent_fallbacks(value: Any) -> List[Dict[str, str]]:
+def _normalize_source_intent_fallbacks(value: Any) -> List[Dict[str, Any]]:
     raw_entries = value if isinstance(value, (list, tuple)) else [value]
-    out: List[Dict[str, str]] = []
+    out: List[Dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
+    diagnostic_positions: Dict[str, int] = {}
     for raw in raw_entries:
         if isinstance(raw, dict):
+            diagnostic = _normalize_source_parse_diagnostic(raw)
+            if (
+                diagnostic is None
+                and raw.get("kind") == _SOURCE_PARSE_DIAGNOSTIC_KIND
+            ):
+                diagnostic = _source_parse_diagnostic(
+                    raw.get("source"),
+                    raw.get("text"),
+                    error_offset=raw.get("error_offset"),
+                )
+                if diagnostic is None:
+                    entry = _source_intent_entry(
+                        raw.get("source"),
+                        raw.get("reason"),
+                        raw.get("text"),
+                    )
+                    if entry is not None:
+                        signature = (
+                            entry["source"],
+                            entry["reason"],
+                            entry["text"],
+                        )
+                        if signature not in seen:
+                            seen.add(signature)
+                            out.append(entry)
+                    continue
+            if diagnostic is None and (
+                _clean_string(raw.get("reason"))
+                == _LEGACY_SOURCE_PARSE_FAILURE_REASON
+            ):
+                diagnostic = _source_parse_diagnostic(
+                    raw.get("source"),
+                    raw.get("text"),
+                )
+            if diagnostic is not None:
+                source = diagnostic["source"]
+                position = diagnostic_positions.get(source)
+                if position is None:
+                    diagnostic_positions[source] = len(out)
+                    out.append(diagnostic)
+                else:
+                    out[position] = diagnostic
+                continue
             entry = _source_intent_entry(
                 raw.get("source"),
                 raw.get("reason"),
@@ -749,6 +886,20 @@ def _normalize_source_intent_fallbacks(value: Any) -> List[Dict[str, str]]:
     return out
 
 
+def _prune_source_parse_diagnostic(state: Dict[str, Any], source: Any) -> None:
+    source_name = _clean_string(source)
+    state[_SOURCE_INTENT_FALLBACKS_KEY] = [
+        entry
+        for entry in _normalize_source_intent_fallbacks(
+            state.get(_SOURCE_INTENT_FALLBACKS_KEY)
+        )
+        if not (
+            entry.get("kind") == _SOURCE_PARSE_DIAGNOSTIC_KIND
+            and entry.get("source") == source_name
+        )
+    ]
+
+
 def _append_source_intent(
     state: Dict[str, Any],
     source: Any,
@@ -762,6 +913,22 @@ def _append_source_intent(
     if entry is not None:
         entries = _normalize_source_intent_fallbacks([*entries, entry])
     state[_SOURCE_INTENT_FALLBACKS_KEY] = entries
+
+
+def _append_source_parse_diagnostic(
+    state: Dict[str, Any], diagnostic: Any
+) -> None:
+    entry = _normalize_source_parse_diagnostic(diagnostic)
+    if entry is None:
+        return
+    state[_SOURCE_INTENT_FALLBACKS_KEY] = _normalize_source_intent_fallbacks(
+        [
+            *_normalize_source_intent_fallbacks(
+                state.get(_SOURCE_INTENT_FALLBACKS_KEY)
+            ),
+            entry,
+        ]
+    )
 
 
 def _append_unconsumed_connected_fields(
@@ -815,7 +982,7 @@ def _append_unconsumed_connected_rows(
             )
 
 
-def _unstructured_payload_entries(payload: Any) -> List[Dict[str, str]]:
+def _unstructured_payload_entries(payload: Any) -> List[Dict[str, Any]]:
     if not isinstance(payload, dict):
         return []
     return _normalize_source_intent_fallbacks(payload.get(_UNSTRUCTURED_INPUT_KEY))
@@ -1206,6 +1373,19 @@ def _default_image_item(slot: int) -> Dict[str, Any]:
         "picker_auto_color": "",
         "picker_auto_video": 0,
         "picker_auto_source": "",
+        # Prompt-owned, per-image Range draft.  It deliberately contains no
+        # Picker/video/color address: source synchronization may change those
+        # transport details without changing the user's temporal instruction.
+        "frame_range_intent": {
+            "version": 1,
+            "enabled": False,
+            "start_frame": None,
+            "end_frame": None,
+            "ranges": [],
+            "selected_index": -1,
+        },
+        # Legacy compatibility fields.  They are migration/projection surfaces
+        # only; ``frame_range_intent`` above is the sole persisted authority.
         "frame_range_enabled": False,
         "frame_range_color_index": 0,
         "frame_range_bindings": {},
@@ -1266,6 +1446,15 @@ def _default_widget_state() -> Dict[str, Any]:
         SOURCE_SYNC_REVISION_KEY: 0,
         UI_EDIT_REVISION_KEY: 0,
         "image_taxonomy": _image_taxonomy_payload(),
+        # This is the only durable Prompt-side shot selection.  The upstream
+        # catalog and its media stay on the graph-connected Image Asset node.
+        "shot": {
+            "shot_uuid": "",
+            "channel_uuid": "",
+            "name": "Only",
+            "number": 1,
+            "selected_source_uids": [],
+        },
         "images": [_default_image_item(slot) for slot in range(1, 5)],
         "videos": [_default_video_item(1)],
         "text": dict(TEXT_FIELD_DEFAULTS),
@@ -1274,8 +1463,8 @@ def _default_widget_state() -> Dict[str, Any]:
             "group_heights": {},
             "textarea_heights": {},
             "resize_mode": UI_RESIZE_MODE,
-            "language": "en",
-            "theme": "P",
+            "header_layout_version": UI_HEADER_LAYOUT_VERSION,
+            "language": "ko",
         },
         "picker": {
             "enabled": False,
@@ -1295,6 +1484,8 @@ def _default_widget_state() -> Dict[str, Any]:
             "markers": [],
             "frame_metadata": [],
             "matched_images": 0,
+            "shot_catalog": [],
+            "shot_routing": {},
         },
         "image_asset": {
             "enabled": False,
@@ -1314,6 +1505,12 @@ def _default_widget_state() -> Dict[str, Any]:
             # deselect/reselect restores Target, Role, Color Pick, and Range.
             "dormant_manual_rows": [],
             "dormant_asset_rows": [],
+            # Read-only transport projection used to render the five remote
+            # shot choices. It is rebuilt from the connected source snapshot;
+            # no media is serialized into HMB_UI_STATE.
+            "shot_catalog": [],
+            "shot_catalog_routing": {},
+            "shot_routing": {},
         },
         "status": {
             "active_images": 0,
@@ -1424,10 +1621,9 @@ def _normalize_frame_ranges(value: Any) -> List[Dict[str, int]]:
     for raw in raw_ranges[:MAX_FRAME_RANGES_PER_BINDING]:
         if not isinstance(raw, dict):
             continue
-        try:
-            start = int(round(float(raw.get("start"))))
-            end = int(round(float(raw.get("end"))))
-        except Exception:
+        start = _optional_frame_number(raw.get("start"))
+        end = _optional_frame_number(raw.get("end"))
+        if start is None or end is None:
             continue
         ranges.append({"start": start, "end": end})
     ranges.sort(key=lambda item: (item["start"], item["end"]))
@@ -1440,7 +1636,13 @@ def _normalize_frame_ranges(value: Any) -> List[Dict[str, int]]:
         if (
             merged
             and merged[-1]["start"] <= merged[-1]["end"]
-            and current["start"] <= merged[-1]["end"] + 1
+            and (
+                current["start"] <= merged[-1]["end"]
+                or (
+                    merged[-1]["end"] < MAX_MANUAL_FRAME_NUMBER
+                    and current["start"] == merged[-1]["end"] + 1
+                )
+            )
         ):
             merged[-1]["end"] = max(merged[-1]["end"], current["end"])
         else:
@@ -1449,10 +1651,20 @@ def _normalize_frame_ranges(value: Any) -> List[Dict[str, int]]:
 
 
 def _optional_frame_number(value: Any) -> int | None:
-    if value in (None, ""):
+    if value in (None, "") or isinstance(value, bool):
         return None
     try:
-        return max(0, min(MAX_MANUAL_FRAME_NUMBER, int(round(float(value)))))
+        number = float(value)
+        if not math.isfinite(number):
+            return None
+        if not MIN_MANUAL_FRAME_NUMBER <= number <= MAX_MANUAL_FRAME_NUMBER:
+            return None
+        # Match JavaScript Math.round used by the widget (ties move toward
+        # positive infinity) instead of Python's bankers-rounding semantics.
+        rounded = math.floor(number + 0.5)
+        if not MIN_MANUAL_FRAME_NUMBER <= rounded <= MAX_MANUAL_FRAME_NUMBER:
+            return None
+        return rounded
     except Exception:
         return None
 
@@ -1520,6 +1732,135 @@ def _normalize_frame_range_bindings(value: Any, legacy_binding: Any = None) -> D
     return out
 
 
+_PICKER_FRAME_RANGE_ORIGINS = frozenset({
+    "picker",
+    "picker_auto",
+    "picker-authored",
+})
+
+
+def _default_frame_range_intent() -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "enabled": False,
+        "start_frame": None,
+        "end_frame": None,
+        "ranges": [],
+        "selected_index": -1,
+    }
+
+
+def _normalize_frame_range_intent(value: Any) -> Dict[str, Any]:
+    """Normalize the Prompt-owned temporal draft without source context."""
+
+    if not isinstance(value, dict):
+        return _default_frame_range_intent()
+    ranges = _normalize_frame_ranges(value.get("ranges"))
+    enabled = value.get("enabled") is True
+    try:
+        raw_selected_index = value.get("selected_index")
+        if isinstance(raw_selected_index, bool):
+            raise ValueError("boolean selected_index")
+        selected_index = int(raw_selected_index)
+    except Exception:
+        selected_index = -1
+    if not ranges or selected_index < 0 or selected_index >= len(ranges):
+        selected_index = -1
+    return {
+        "version": 1,
+        "enabled": enabled,
+        "start_frame": _optional_frame_number(value.get("start_frame")),
+        "end_frame": _optional_frame_number(value.get("end_frame")),
+        "ranges": ranges,
+        "selected_index": selected_index,
+    }
+
+
+def _manual_legacy_frame_binding(value: Any) -> Dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    origin = _clean_string(value.get("origin")).casefold()
+    if origin in _PICKER_FRAME_RANGE_ORIGINS:
+        return None
+    return dict(value)
+
+
+def _legacy_frame_range_binding_for_migration(
+    item: Dict[str, Any],
+) -> Dict[str, Any] | None:
+    """Select one legacy manual draft deterministically for one-time migration."""
+
+    current = _manual_legacy_frame_binding(item.get("frame_range_binding"))
+    if current is not None:
+        return current
+
+    bindings = _normalize_frame_range_bindings(item.get("frame_range_bindings"))
+    picks = _normalize_color_picks(item.get("color_picks"))
+    try:
+        color_index = int(item.get("frame_range_color_index") or 0)
+    except Exception:
+        color_index = 0
+    color_index = max(0, min(len(picks) - 1, color_index))
+    slots = _normalize_binding_video_slots(
+        item.get("binding_video_slots"),
+        item.get("marker_video") or 1,
+        len(picks),
+        MAX_VIDEOS,
+    )
+    current_key = _frame_binding_key(
+        slots[color_index],
+        picks[color_index] if picks else "",
+    )
+    current = _manual_legacy_frame_binding(bindings.get(current_key))
+    if current is not None:
+        return current
+    for key in sorted(bindings):
+        candidate = _manual_legacy_frame_binding(bindings.get(key))
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _migrate_legacy_frame_range_intent(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Import legacy manual intent once; Picker-authored drafts stay source data."""
+
+    binding = _legacy_frame_range_binding_for_migration(item)
+    ranges = _normalize_frame_ranges(binding.get("ranges")) if binding else []
+    start = _optional_frame_number(binding.get("start_frame")) if binding else None
+    end = _optional_frame_number(binding.get("end_frame")) if binding else None
+    if ranges:
+        if start is None:
+            start = min(frame_range["start"] for frame_range in ranges)
+        if end is None:
+            end = max(frame_range["end"] for frame_range in ranges)
+    try:
+        raw_selected_index = item.get("frame_range_selected_index")
+        if isinstance(raw_selected_index, bool):
+            raise ValueError("boolean frame_range_selected_index")
+        selected_index = int(raw_selected_index)
+    except Exception:
+        selected_index = -1
+    return _normalize_frame_range_intent({
+        "version": 1,
+        "enabled": bool(
+            item.get("frame_range_enabled")
+            or (binding and binding.get("enabled") is True)
+        ),
+        "start_frame": start,
+        "end_frame": end,
+        "ranges": ranges,
+        "selected_index": selected_index,
+    })
+
+
+def _canonical_frame_range_intent(item: Dict[str, Any]) -> Dict[str, Any]:
+    # Presence is the migration sentinel.  Even an empty/disabled canonical
+    # object wins forever, preventing old Picker records from being re-imported.
+    if "frame_range_intent" in item:
+        return _normalize_frame_range_intent(item.get("frame_range_intent"))
+    return _migrate_legacy_frame_range_intent(item)
+
+
 def _release_picker_auto_frame_binding(
     item: Dict[str, Any], video_slot: Any, color_pick: Any
 ) -> bool:
@@ -1543,9 +1884,6 @@ def _release_picker_auto_frame_binding(
         )
         if current_key == key:
             item["frame_range_binding"] = None
-    if not bindings:
-        item["frame_range_enabled"] = False
-        item["frame_range_selected_index"] = -1
     return True
 
 
@@ -1647,6 +1985,7 @@ def _normalize_frame_metadata(value: Any) -> List[Dict[str, Any]]:
 
 
 def _current_frame_range_binding(item: Dict[str, Any]) -> Dict[str, Any] | None:
+    intent = _canonical_frame_range_intent(item)
     picks = _normalize_color_picks(item.get("color_picks"))
     try:
         selected_index = int(item.get("frame_range_color_index") or 0)
@@ -1659,8 +1998,6 @@ def _current_frame_range_binding(item: Dict[str, Any]) -> Dict[str, Any] | None:
             selected_index,
         )
     color = _clean_string(picks[selected_index] if picks else "")
-    if not color:
-        return None
     video_slots = _normalize_binding_video_slots(
         item.get("binding_video_slots"),
         item.get("marker_video") or 1,
@@ -1668,54 +2005,53 @@ def _current_frame_range_binding(item: Dict[str, Any]) -> Dict[str, Any] | None:
         MAX_VIDEOS,
     )
     slot = video_slots[selected_index]
-    bindings = _normalize_frame_range_bindings(
-        item.get("frame_range_bindings"),
-        item.get("frame_range_binding"),
+    if not (
+        intent["enabled"]
+        or intent["start_frame"] is not None
+        or intent["end_frame"] is not None
+        or intent["ranges"]
+    ):
+        return None
+    return {
+        "video_slot": f"@video{slot}",
+        "color_pick": color,
+        "origin": "manual",
+        "start_frame": intent["start_frame"],
+        "end_frame": intent["end_frame"],
+        "ranges": copy.deepcopy(intent["ranges"]),
+        "enabled": intent["enabled"],
+    }
+
+
+def _video_wide_frame_range_allowed(
+    state: Dict[str, Any], video_slot: Any, color_pick: Any
+) -> bool:
+    """A blank user marker always means the whole addressed real video."""
+
+    return not bool(_clean_string(color_pick))
+
+
+def _public_frame_range_marker(
+    state: Dict[str, Any], video_slot: Any, color_pick: Any
+) -> str:
+    color = _clean_string(color_pick)
+    if color:
+        return color
+    return (
+        VIDEO_WIDE_RANGE_MARKER
+        if _video_wide_frame_range_allowed(state, video_slot, color)
+        else ""
     )
-    binding = bindings.get(_frame_binding_key(slot, color))
-    if binding is not None:
-        return dict(binding)
-    if bool(item.get("frame_range_enabled")):
-        return {
-            "video_slot": f"@video{slot}",
-            "color_pick": color,
-            "origin": "manual",
-            "start_frame": None,
-            "end_frame": None,
-            "ranges": [],
-        }
-    return None
 
 
 def _active_frame_range_bindings(item: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Return current Range ON plus explicitly enabled additional bindings."""
+    """Return the single Prompt-owned draft projected onto its current address."""
 
-    if not bool(item.get("frame_range_enabled")):
+    intent = _canonical_frame_range_intent(item)
+    if not intent["enabled"]:
         return []
     current = _current_frame_range_binding(item)
-    bindings = _normalize_frame_range_bindings(
-        item.get("frame_range_bindings"),
-        item.get("frame_range_binding"),
-    )
-    out: List[Dict[str, Any]] = []
-    seen: set[str] = set()
-    if isinstance(current, dict):
-        key = _frame_binding_key(
-            current.get("video_slot"), current.get("color_pick")
-        )
-        seen.add(key)
-        out.append(dict(current))
-    for binding in bindings.values():
-        if not isinstance(binding, dict) or binding.get("enabled") is not True:
-            continue
-        key = _frame_binding_key(
-            binding.get("video_slot"), binding.get("color_pick")
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(dict(binding))
-    return out
+    return [dict(current)] if isinstance(current, dict) else []
 
 
 
@@ -1768,14 +2104,6 @@ def _migrate_target_authority(item: Dict[str, Any], scopes: List[str]) -> str:
     return owner
 
 
-def _relationship_scopes(item: Dict[str, Any]) -> List[str]:
-    return [
-        entry.get("scope_choice", "")
-        for entry in _image_binding_entries(item)
-        if entry.get("scope_choice") in {"Handheld prop", "Attached accessory", "Interactive scene prop"}
-    ]
-
-
 def _effective_image_source_type(item: Dict[str, Any]) -> str:
     source_type = _clean_string(item.get("source_type"))
     if source_type == "Role Required / Select Source Type":
@@ -1783,23 +2111,6 @@ def _effective_image_source_type(item: Dict[str, Any]) -> str:
     if source_type == "Custom":
         return _clean_string(item.get("custom_source_type")) or "Unspecified custom image role"
     return source_type or "Unspecified image role"
-
-
-def _effective_video_source_type(item: Dict[str, Any]) -> str:
-    source_type = _clean_string(item.get("source_type"))
-    if source_type == "Role Required / Select Video Type":
-        source_type = ""
-    if source_type == "Custom":
-        return _clean_string(item.get("custom_source_type")) or "Unspecified custom video type"
-    return source_type or "Unspecified video type"
-
-
-def _effective_video_role(item: Dict[str, Any]) -> str:
-    role = _clean_string(item.get("control_role"))
-    if role == "Custom Role":
-        return _clean_string(item.get("custom_control_role")) or "Unspecified custom video role"
-    return role
-
 
 
 def _effective_target(item: Dict[str, Any], default: str) -> str:
@@ -1855,6 +2166,7 @@ def _verified_registered_subtype(item: Dict[str, Any]) -> str:
 
 
 def _normalize_image_binding_fields(item: Dict[str, Any], video_count: int = MAX_VIDEOS) -> Dict[str, Any]:
+    frame_range_intent = _canonical_frame_range_intent(item)
     picks = _normalize_color_picks(item.get("color_picks"))
     raw_scopes = item.get("binding_scopes")
     if raw_scopes is None:
@@ -1928,7 +2240,8 @@ def _normalize_image_binding_fields(item: Dict[str, Any], video_count: int = MAX
     item["binding_video_slots"] = legacy_video_slots[:count]
     item["marker_video"] = item["binding_video_slots"][0]
     item["scope"] = item["binding_scopes"][0] if item["binding_scopes"] else ""
-    item["frame_range_enabled"] = bool(item.get("frame_range_enabled"))
+    item["frame_range_intent"] = frame_range_intent
+    item["frame_range_enabled"] = frame_range_intent["enabled"]
     try:
         frame_color_index = int(item.get("frame_range_color_index") or 0)
     except Exception:
@@ -1943,24 +2256,19 @@ def _normalize_image_binding_fields(item: Dict[str, Any], video_count: int = MAX
             ),
             item["frame_range_color_index"],
         )
-    # Range intent is canonical user state, not connection state.  Keep every
-    # dormant/manual binding when Range is off or its video/color address is not
-    # currently available; execution validation may describe the missing
-    # context, but normalization must never erase the user's work.
-    item["frame_range_bindings"] = _normalize_frame_range_bindings(
-        item.get("frame_range_bindings"),
-        item.get("frame_range_binding"),
-    )
-    try:
-        selected_range_index = int(item.get("frame_range_selected_index"))
-    except Exception:
-        selected_range_index = -1
-    item["frame_range_selected_index"] = (
-        max(-1, selected_range_index)
-        if item["frame_range_enabled"]
-        else -1
-    )
-    item["frame_range_binding"] = _current_frame_range_binding(item)
+    # Rebuild the old address map as a one-way compatibility projection. This
+    # prevents stale Picker/color addresses from accumulating or becoming a
+    # second authority after one-time migration.
+    item["frame_range_bindings"] = {}
+    item["frame_range_selected_index"] = frame_range_intent["selected_index"]
+    projected_binding = _current_frame_range_binding(item)
+    item["frame_range_binding"] = projected_binding
+    if isinstance(projected_binding, dict):
+        key = _frame_binding_key(
+            projected_binding.get("video_slot"),
+            projected_binding.get("color_pick"),
+        )
+        item["frame_range_bindings"][key] = copy.deepcopy(projected_binding)
     return item
 
 def _image_binding_entries(item: Dict[str, Any], video_count: int = MAX_VIDEOS) -> List[Dict[str, Any]]:
@@ -2029,18 +2337,6 @@ def _enforce_color_pick_uniqueness_by_video(images: List[Dict[str, Any]], video_
     return images
 
 
-def _reset_image_video_binding_to_primary(item: Dict[str, Any], video_count: int = MAX_VIDEOS) -> Dict[str, Any]:
-    _normalize_image_binding_fields(item, video_count)
-    item["marker_video"] = 1
-    item["binding_video_slots"] = [1 for _ in item.get("color_picks", [""])]
-    item["color_picks"] = ["" for _ in item.get("color_picks", [""])] or [""]
-    item["picker_auto_color"] = ""
-    item["picker_auto_video"] = 0
-    item["picker_auto_source"] = ""
-    _normalize_image_binding_fields(item, video_count)
-    return item
-
-
 def _reset_images_bound_to_inactive_videos(
     images: List[Dict[str, Any]], videos: List[Dict[str, Any]]
 ) -> tuple[List[Dict[str, Any]], bool]:
@@ -2054,13 +2350,23 @@ def _reset_images_bound_to_inactive_videos(
         _normalize_image_binding_fields(item, MAX_VIDEOS)
     return images, False
 
-def _color_pick_text(item: Dict[str, Any], include_video: bool = True) -> str:
+def _color_pick_text(
+    item: Dict[str, Any],
+    include_video: bool = True,
+    active_video_slots: set[int] | None = None,
+) -> str:
     parts: List[str] = []
     for entry in _image_binding_entries(item):
+        marker_video = int(entry.get("marker_video") or 1)
+        if (
+            active_video_slots is not None
+            and marker_video not in active_video_slots
+        ):
+            continue
         color = entry["color"]
         if not color:
             continue
-        marker = f"@video{entry['marker_video']} / {color}" if include_video else color
+        marker = f"@video{marker_video} / {color}" if include_video else color
         scope = entry["scope"]
         parts.append(f"{scope} = {marker}" if scope else marker)
     return "; ".join(parts)
@@ -2132,43 +2438,6 @@ def _parse_control_only_bindings(descriptive_fields: Dict[str, Any] | None) -> t
     return entries, errors
 
 
-def _strip_control_only_binding_lines(value: Any) -> str:
-    preserved: List[str] = []
-    for line in str(value or "").splitlines():
-        match = _CONTROL_ONLY_BINDING_PREFIX_RE.match(line)
-        if not match:
-            preserved.append(line)
-            continue
-        payload = match.group(1).strip()
-        video_match = re.search(r"@video(10|[1-9])\b", payload, re.IGNORECASE)
-        has_structured_fields = all(
-            _control_binding_value(payload, key)
-            for key in ("Target", "Function", "Boundary")
-        )
-        # Only a fully structured line is extracted into CONTROL-ONLY BINDING.
-        # Malformed lines stay verbatim as ordinary user intent. A formatting
-        # convention never becomes a prerequisite or warning by itself.
-        if not video_match or not has_structured_fields:
-            preserved.append(line)
-    return "\n".join(preserved).strip()
-
-
-def _control_bindings_for_video(entries: List[Dict[str, Any]], video_slot: int) -> List[Dict[str, Any]]:
-    return [entry for entry in entries if int(entry.get("video") or 0) == int(video_slot)]
-
-
-def _format_control_only_binding(entry: Dict[str, Any]) -> str:
-    marker = f" / Marker = {entry['marker']}" if _clean_string(entry.get("marker")) else ""
-    return (
-        f"@video{int(entry['video'])} / Target = {entry['target']} / Function = {entry['function']}"
-        f"{marker} / Control Boundary = {entry['boundary']} / Default interpretation = control cue; "
-        "an explicit scoped instruction may use a named visible or supplied property only for its "
-        "named Target and declared Control Boundary; if no separate temporal subset is stated or "
-        "clearly implied, it applies to the whole shot, otherwise only to that subset; it does not expand into "
-        "unrelated identity, material, lighting, motion, camera, or final-look attributes"
-    )
-
-
 def _normalize_text(state: Dict[str, Any]) -> Dict[str, str]:
     text = state.get("text") if isinstance(state.get("text"), dict) else {}
     out = {name: _clean_string(text.get(name, "")) for name in TEXT_FIELD_NAMES}
@@ -2199,10 +2468,37 @@ def _normalize_ui(state: Dict[str, Any]) -> Dict[str, Any]:
     ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
     compatible = _clean_string(ui.get("resize_mode")) == UI_RESIZE_MODE
     source_heights = ui.get("group_heights") if compatible and isinstance(ui.get("group_heights"), dict) else {}
+    try:
+        header_layout_version = max(0, int(float(ui.get("header_layout_version") or 0)))
+    except Exception:
+        header_layout_version = 0
+    try:
+        legacy_image_height = int(round(float(source_heights.get("imageSources"))))
+    except Exception:
+        legacy_image_height = -1
+    legacy_companion_defaults = True
+    for key in ("imageText", "videoSources", "videoText"):
+        if key not in source_heights:
+            continue
+        try:
+            if int(round(float(source_heights.get(key)))) != GROUP_START_HEIGHTS[key]:
+                legacy_companion_defaults = False
+        except Exception:
+            legacy_companion_defaults = False
+    legacy_default_layout = bool(
+        compatible
+        and header_layout_version < UI_HEADER_LAYOUT_VERSION
+        and legacy_image_height == LEGACY_IMAGE_SOURCES_DEFAULT_HEIGHT
+        and legacy_companion_defaults
+    )
     group_heights: Dict[str, int] = {}
     for key, min_height in GROUP_MIN_HEIGHTS.items():
         try:
-            value = int(round(float(source_heights.get(key))))
+            value = (
+                GROUP_START_HEIGHTS["imageSources"]
+                if key == "imageSources" and legacy_default_layout
+                else int(round(float(source_heights.get(key))))
+            )
         except Exception:
             continue
         if min_height <= value <= GROUP_MAX_HEIGHT:
@@ -2222,15 +2518,13 @@ def _normalize_ui(state: Dict[str, Any]) -> Dict[str, Any]:
             textarea_heights[normalized_key] = value
 
     language = _clean_string(ui.get("language")).lower()
-    if language not in ("en", "ko"):
-        language = "en"
-    theme = "T" if _clean_string(ui.get("theme")).upper() == "T" else "P"
+    language = "en" if language == "en" else "ko"
     return {
         "group_heights": group_heights,
         "textarea_heights": textarea_heights,
         "resize_mode": UI_RESIZE_MODE,
+        "header_layout_version": UI_HEADER_LAYOUT_VERSION,
         "language": language,
-        "theme": theme,
     }
 
 
@@ -2309,6 +2603,11 @@ def _migrate_old_image_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
     except Exception:
         out["picker_auto_video"] = 0
     out["picker_auto_source"] = _clean_string(item.get("picker_auto_source"))
+    out["frame_range_intent"] = (
+        _normalize_frame_range_intent(item.get("frame_range_intent"))
+        if "frame_range_intent" in item
+        else _migrate_legacy_frame_range_intent(item)
+    )
     out["frame_range_enabled"] = bool(item.get("frame_range_enabled"))
     try:
         out["frame_range_color_index"] = int(item.get("frame_range_color_index") or 0)
@@ -2480,7 +2779,7 @@ def _migrate_old_video_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
     if old_role and not item.get("source_type"):
         if old_role == "Maya Preview / Strongest Unified Shot-Control Source":
             out["source_type"] = "Maya Preview / Playblast"
-            out["control_role"] = "Primary Unified Shot Control"
+            out["control_role"] = ""
         elif old_role == "Motion / Timing Reference":
             out["source_type"] = "Motion Reference"
             out["control_role"] = "Local Motion Detail Only"
@@ -2513,6 +2812,15 @@ def _migrate_old_video_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
             for value in (unknown_control_role, existing_custom_role)
             if value
         ))
+    # Keep the factual Maya preview type but remove the stale combined
+    # authority. Primary is valid only when the user explicitly selects the
+    # distinct Unified Shot-Control Video main type.
+    if (
+        out.get("source_type") == "Maya Preview / Playblast"
+        and out.get("control_role") == "Primary Unified Shot Control"
+    ):
+        out["control_role"] = ""
+        out["custom_control_role"] = ""
     return out
 
 
@@ -2535,7 +2843,6 @@ def _has_image_meaning(item: Dict[str, Any]) -> bool:
         or any(_clean_string(value) for value in item.get("binding_custom_scopes", []))
         or any(_clean_string(value) for value in item.get("color_picks", []))
         or _clean_string(item.get("preview_marker"))
-        or item.get("frame_range_enabled")
     )
 
 
@@ -2663,30 +2970,6 @@ def _normalize_dormant_image_rows(
     return out
 
 
-def _image_target_choices_for_row(item: Dict[str, Any], images: List[Dict[str, Any]]) -> List[str]:
-    dynamic_targets = [
-        _clean_string(row.get("label"))
-        for row in images
-        if _is_active_image(row) and _clean_string(row.get("label"))
-    ]
-    source_type = _clean_string(item.get("source_type"))
-    choices = ["", *dynamic_targets]
-    if source_type == "Ignore / Unused":
-        choices = ["", "None"]
-    elif source_type in {"Environment / Background", "Sky / Exterior Background", "Set / Structure", "Foreground / Ground"}:
-        choices = ["", *dynamic_targets, "Scene / Environment"]
-    elif source_type == "Scale / Composition Reference":
-        choices = ["", *dynamic_targets, "Camera / Composition"]
-    elif source_type in {"Color / Look Reference", "Color + Look + Lighting Mood Reference", "Lighting / Atmosphere Reference"}:
-        choices = ["", *dynamic_targets, "Global Look"]
-    elif source_type == "Custom":
-        choices = ["", *dynamic_targets, "Scene / Environment", "Camera / Composition", "Global Look"]
-    current_target = _clean_string(item.get("owner"))
-    if current_target:
-        choices.append(current_target)
-    return list(dict.fromkeys(choices))
-
-
 def _is_active_video(item: Dict[str, Any]) -> bool:
     return _has_video_meaning(item) and item.get("source_type") != "Ignore / Unused"
 
@@ -2761,11 +3044,6 @@ _MANUAL_VIDEO_CONTEXT_IMAGE_FIELDS = (
     "picker_auto_video",
     "picker_auto_color",
     "picker_auto_source",
-    "frame_range_enabled",
-    "frame_range_color_index",
-    "frame_range_bindings",
-    "frame_range_binding",
-    "frame_range_selected_index",
 )
 
 
@@ -3060,6 +3338,955 @@ def _restore_manual_video_context(
             _replace_mapping_entry(state_heights, original_heights, key)
 
 
+def _normalize_shot_selection(value: Any) -> Dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    shot_uuid = _clean_string(source.get("shot_uuid"))[:128]
+    channel_uuid = _clean_string(source.get("channel_uuid"))[:128]
+    bound = bool(shot_uuid and channel_uuid)
+    try:
+        number = int(source.get("number") or 1) if bound else 1
+    except Exception:
+        number = 1
+    number = max(1, min(MAX_SHOTS, number))
+    selected_source_uids: List[str] = []
+    seen: set[str] = set()
+    raw_uids = source.get("selected_source_uids") if bound else []
+    if isinstance(raw_uids, (list, tuple)):
+        for raw_uid in raw_uids:
+            uid = _clean_string(raw_uid)[:MAX_IDENTIFIER_CHARS]
+            if not uid or uid in seen:
+                continue
+            seen.add(uid)
+            selected_source_uids.append(uid)
+            if len(selected_source_uids) >= MAX_SHOT_IMAGES:
+                break
+    name = (
+        _clean_string(source.get("name"))[:128] or f"Shot {number}"
+        if bound
+        else "Only"
+    )
+    return {
+        "shot_uuid": shot_uuid if bound else "",
+        "channel_uuid": channel_uuid if bound else "",
+        "name": name,
+        "number": number,
+        "selected_source_uids": selected_source_uids,
+    }
+
+
+def _normalize_shot_catalog(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: List[Dict[str, Any]] = []
+    seen_uuids: set[str] = set()
+    seen_numbers: set[int] = set()
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        shot = _normalize_shot_selection(raw)
+        shot_uuid = shot["shot_uuid"]
+        number = shot["number"]
+        if not shot_uuid or shot_uuid in seen_uuids or number in seen_numbers:
+            continue
+        seen_uuids.add(shot_uuid)
+        seen_numbers.add(number)
+        result.append(shot)
+        if len(result) >= MAX_SHOTS:
+            break
+    return sorted(result, key=lambda item: (int(item["number"]), item["shot_uuid"]))
+
+
+def _normalize_shot_routing(value: Any) -> Dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    try:
+        generation = int(source.get("generation") or 0)
+    except Exception:
+        generation = 0
+    generation = max(0, min(MAX_SOURCE_SYNC_REVISION, generation))
+    try:
+        media_count = max(0, int(source.get("media_count") or 0))
+    except Exception:
+        media_count = 0
+    result = {
+        "publisher_instance_uuid": _clean_string(
+            source.get("publisher_instance_uuid")
+        ),
+        "channel_uuid": _clean_string(source.get("channel_uuid")),
+        "generation": generation,
+        "metadata_sha256": _clean_string(source.get("metadata_sha256")),
+        "media_sha256": _clean_string(source.get("media_sha256")),
+        "media_count": media_count,
+        "media_order_sha256": _clean_string(
+            source.get("media_order_sha256")
+        ),
+    }
+    return result if any(result.values()) else {}
+
+
+def _normalize_shot_catalog_routing(value: Any) -> Dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    try:
+        generation = int(source.get("generation") or 0)
+    except Exception:
+        generation = 0
+    generation = max(0, min(MAX_SOURCE_SYNC_REVISION, generation))
+    result = {
+        "publisher_instance_uuid": _clean_string(
+            source.get("publisher_instance_uuid")
+        )[:128],
+        "channel_uuid": _clean_string(source.get("channel_uuid"))[:128],
+        "generation": generation,
+        "metadata_sha256": _clean_string(source.get("metadata_sha256")),
+    }
+    return result if any(result.values()) else {}
+
+
+class _ShotRoutingContractError(RuntimeError):
+    """The graph-connected shot publisher failed its closed snapshot contract."""
+
+
+_SHOT_METADATA_PRIVATE_MEDIA_KEYS = frozenset({
+    "path",
+    "asset_path",
+    "video_path",
+    "project_video_path",
+    "video_url",
+    "media",
+    "media_value",
+    "data",
+    "data_uri",
+    "base64",
+    "blob",
+    "bytes",
+    "binary",
+    "url",
+    "relative_path",
+})
+_SHOT_METADATA_PRIVATE_KEY_TOKENS = (
+    "sidecar",
+    "thumbnail",
+    "thumb",
+    "cache",
+)
+_SHOT_METADATA_IDENTITY_PATH_KEYS = frozenset({
+    # Maya DAG identities are semantic scene addresses, not local media paths.
+    "full_dag_path",
+})
+
+
+def _is_maya_full_dag_path(value: Any) -> bool:
+    """Recognize a Maya DAG identity without accepting disguised file paths."""
+
+    if not isinstance(value, str) or value != value.strip():
+        return False
+    if not value.startswith("|") or len(value) > 4096:
+        return False
+    if "/" in value or "\\" in value:
+        return False
+    parts = value[1:].split("|")
+    return bool(parts) and all(
+        part and not any(ord(character) < 32 for character in part)
+        for part in parts
+    )
+
+
+def _looks_like_private_media_string(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    lowered = text.casefold()
+    return bool(
+        lowered.startswith(("data:", "file:", "http://", "https://"))
+        or re.match(r"^[a-z][a-z0-9+.-]*://", text, re.IGNORECASE)
+        or re.match(r"^[a-z]:[\\/]", text, re.IGNORECASE)
+        or text.startswith(("\\\\", "//", "/", "~/", "~\\"))
+    )
+
+
+def _metadata_contains_private_media(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized_key = _clean_string(key).casefold()
+            if (
+                normalized_key in _SHOT_METADATA_PRIVATE_MEDIA_KEYS
+                or "base64" in normalized_key
+                or any(
+                    token in normalized_key
+                    for token in _SHOT_METADATA_PRIVATE_KEY_TOKENS
+                )
+                or (
+                    normalized_key not in _SHOT_METADATA_IDENTITY_PATH_KEYS
+                    and (
+                        normalized_key.endswith("_path")
+                        or normalized_key.endswith("_url")
+                        or normalized_key.endswith("_file")
+                        or normalized_key.endswith("_folder")
+                        or normalized_key.endswith("_directory")
+                    )
+                )
+                or (
+                    normalized_key == "full_dag_path"
+                    and not _is_maya_full_dag_path(item)
+                )
+            ):
+                return True
+            if _metadata_contains_private_media(item):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(_metadata_contains_private_media(item) for item in value)
+    return _looks_like_private_media_string(value)
+
+
+def _canonical_sha256(value: Any) -> str:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except Exception as exc:
+        raise _ShotRoutingContractError(
+            "Shot routing snapshot contains non-serializable metadata."
+        ) from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_shot_routing_catalog(
+    value: Any,
+    *,
+    expected_channel_uuid: str = "",
+) -> Dict[str, Any]:
+    """Validate compact selector identity without accepting any media facts."""
+
+    if not isinstance(value, dict) or set(value) != {
+        "schema",
+        "version",
+        "publisher_instance_uuid",
+        "channel_uuid",
+        "generation",
+        "metadata_sha256",
+        "shots",
+    }:
+        raise _ShotRoutingContractError("Shot routing catalog is malformed.")
+    if (
+        value.get("schema") != SHOT_ROUTING_CATALOG_SCHEMA
+        or value.get("version") != SHOT_ROUTING_CATALOG_VERSION
+    ):
+        raise _ShotRoutingContractError("Shot routing catalog schema is invalid.")
+    publisher = _clean_string(value.get("publisher_instance_uuid"))
+    channel = _clean_string(value.get("channel_uuid"))
+    generation = value.get("generation")
+    if (
+        not publisher
+        or len(publisher) > 128
+        or not channel
+        or len(channel) > 128
+        or (expected_channel_uuid and channel != _clean_string(expected_channel_uuid))
+        or not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or not 0 <= generation <= MAX_SOURCE_SYNC_REVISION
+    ):
+        raise _ShotRoutingContractError(
+            "Shot routing catalog publisher/channel/generation is invalid."
+        )
+    raw_shots = value.get("shots")
+    if not isinstance(raw_shots, list) or not 1 <= len(raw_shots) <= MAX_SHOTS:
+        raise _ShotRoutingContractError(
+            "Shot routing catalog must contain one to five shots."
+        )
+    shots: List[Dict[str, Any]] = []
+    shot_uuids: set[str] = set()
+    shot_numbers: set[int] = set()
+    for raw in raw_shots:
+        if not isinstance(raw, dict) or set(raw) != {
+            "shot_uuid", "number", "name", "revision"
+        }:
+            raise _ShotRoutingContractError(
+                "A shot routing catalog record is invalid."
+            )
+        shot_uuid = _clean_string(raw.get("shot_uuid"))
+        name = _clean_string(raw.get("name"))
+        number = raw.get("number")
+        revision = raw.get("revision")
+        if (
+            not shot_uuid
+            or len(shot_uuid) > 128
+            or shot_uuid in shot_uuids
+            or not name
+            or len(name) > 128
+            or not isinstance(number, int)
+            or isinstance(number, bool)
+            or not 1 <= number <= MAX_SHOTS
+            or number in shot_numbers
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or not 0 <= revision <= MAX_SOURCE_SYNC_REVISION
+        ):
+            raise _ShotRoutingContractError(
+                "A shot routing catalog value is invalid or duplicated."
+            )
+        shot_uuids.add(shot_uuid)
+        shot_numbers.add(number)
+        shots.append({
+            "shot_uuid": shot_uuid,
+            "number": number,
+            "name": name,
+            "revision": revision,
+        })
+    contract = {
+        "channel_uuid": channel,
+        "generation": generation,
+        "shots": shots,
+    }
+    metadata_sha256 = _clean_string(value.get("metadata_sha256"))
+    if metadata_sha256 != _canonical_sha256(contract):
+        raise _ShotRoutingContractError("Shot routing catalog hash is invalid.")
+    return {
+        "schema": SHOT_ROUTING_CATALOG_SCHEMA,
+        "version": SHOT_ROUTING_CATALOG_VERSION,
+        "publisher_instance_uuid": publisher,
+        **contract,
+        "metadata_sha256": metadata_sha256,
+    }
+
+
+def _validate_shot_routing_snapshot(
+    value: Any,
+    *,
+    expected_channel_uuid: str = "",
+    max_selected_sources: int = MAX_SHOT_IMAGES,
+) -> Dict[str, Any]:
+    """Validate one exact metadata/media generation from an upstream node.
+
+    The two hashes deliberately cover both halves of the source publication.
+    Prompt never joins a target-side JSON cache with media from another source
+    generation; an address, order, duplicate publisher, or hash mismatch fails
+    before PROMPT_OUT or either shot-media output can be published.
+    """
+
+    if not isinstance(value, dict):
+        raise _ShotRoutingContractError("Shot routing snapshot is unavailable.")
+    required = {
+        "schema",
+        "version",
+        "publisher_instance_uuid",
+        "channel_uuid",
+        "generation",
+        "metadata_sha256",
+        "media_sha256",
+        "shots",
+        "ordered_assets",
+        "media_by_source_uid",
+    }
+    if set(value) != required:
+        raise _ShotRoutingContractError(
+            "Shot routing snapshot has an unknown or missing field."
+        )
+    if (
+        value.get("schema") != SHOT_ROUTING_SNAPSHOT_SCHEMA
+        or value.get("version") != SHOT_ROUTING_SNAPSHOT_VERSION
+    ):
+        raise _ShotRoutingContractError("Shot routing snapshot schema is invalid.")
+    publisher_instance_uuid = _clean_string(
+        value.get("publisher_instance_uuid")
+    )
+    channel_uuid = _clean_string(value.get("channel_uuid"))
+    if (
+        not publisher_instance_uuid
+        or not channel_uuid
+        or len(publisher_instance_uuid) > 128
+        or len(channel_uuid) > 128
+    ):
+        raise _ShotRoutingContractError(
+            "Shot routing publisher or channel identity is missing."
+        )
+    expected_channel_uuid = _clean_string(expected_channel_uuid)
+    if expected_channel_uuid and channel_uuid != expected_channel_uuid:
+        raise _ShotRoutingContractError(
+            "Shot routing channel does not match the Prompt subscription."
+        )
+    generation = value.get("generation")
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 0
+        or generation > MAX_SOURCE_SYNC_REVISION
+    ):
+        raise _ShotRoutingContractError("Shot routing generation is invalid.")
+
+    raw_shots = value.get("shots")
+    if not isinstance(raw_shots, list) or not 1 <= len(raw_shots) <= MAX_SHOTS:
+        raise _ShotRoutingContractError("Shot routing must contain one to five shots.")
+    shots: List[Dict[str, Any]] = []
+    shot_uuids: set[str] = set()
+    shot_numbers: set[int] = set()
+    for raw_shot in raw_shots:
+        if not isinstance(raw_shot, dict) or set(raw_shot) != {
+            "shot_uuid",
+            "number",
+            "name",
+            "revision",
+            "selected_source_uids",
+        }:
+            raise _ShotRoutingContractError("A shot routing record is invalid.")
+        shot_uuid = _clean_string(raw_shot.get("shot_uuid"))
+        name = _clean_string(raw_shot.get("name"))
+        number = raw_shot.get("number")
+        revision = raw_shot.get("revision")
+        raw_uids = raw_shot.get("selected_source_uids")
+        if (
+            not shot_uuid
+            or len(shot_uuid) > 128
+            or not name
+            or len(name) > 128
+            or not isinstance(number, int)
+            or isinstance(number, bool)
+            or not 1 <= number <= MAX_SHOTS
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or revision < 0
+            or revision > MAX_SOURCE_SYNC_REVISION
+            or not isinstance(raw_uids, list)
+            or len(raw_uids) > max_selected_sources
+        ):
+            raise _ShotRoutingContractError("A shot routing value is invalid.")
+        uids = [_clean_string(uid) for uid in raw_uids]
+        if (
+            any(not uid or len(uid) > MAX_IDENTIFIER_CHARS for uid in uids)
+            or len(set(uids)) != len(uids)
+        ):
+            raise _ShotRoutingContractError(
+                "A shot contains an empty or duplicate source address."
+            )
+        if shot_uuid in shot_uuids or number in shot_numbers:
+            raise _ShotRoutingContractError("Shot identity is duplicated.")
+        shot_uuids.add(shot_uuid)
+        shot_numbers.add(number)
+        shots.append(
+            {
+                "shot_uuid": shot_uuid,
+                "number": number,
+                "name": name,
+                "revision": revision,
+                "selected_source_uids": uids,
+            }
+        )
+
+    raw_assets = value.get("ordered_assets")
+    raw_media = value.get("media_by_source_uid")
+    if not isinstance(raw_assets, list) or not isinstance(raw_media, dict):
+        raise _ShotRoutingContractError("Shot routing source arrays are invalid.")
+    ordered_assets: List[Dict[str, Any]] = []
+    ordered_uids: List[str] = []
+    for raw_asset in raw_assets:
+        if not isinstance(raw_asset, dict) or set(raw_asset) != {
+            "source_uid",
+            "metadata",
+        }:
+            raise _ShotRoutingContractError("A routed source record is invalid.")
+        source_uid = _clean_string(raw_asset.get("source_uid"))
+        metadata = raw_asset.get("metadata")
+        if (
+            not source_uid
+            or len(source_uid) > MAX_IDENTIFIER_CHARS
+            or source_uid in ordered_uids
+            or not isinstance(metadata, dict)
+            or _metadata_contains_private_media(metadata)
+        ):
+            raise _ShotRoutingContractError(
+                "A routed source address is empty/duplicated or exposes media."
+            )
+        ordered_uids.append(source_uid)
+        ordered_assets.append(
+            {"source_uid": source_uid, "metadata": copy.deepcopy(metadata)}
+        )
+    if set(raw_media) != set(ordered_uids):
+        raise _ShotRoutingContractError(
+            "Shot routing metadata and media addresses do not match."
+        )
+    media_by_source_uid: Dict[str, str] = {}
+    for source_uid in ordered_uids:
+        media = raw_media.get(source_uid)
+        if not isinstance(media, str) or not media:
+            raise _ShotRoutingContractError("A routed source has no media value.")
+        media_by_source_uid[source_uid] = media
+    known = set(ordered_uids)
+    if any(uid not in known for shot in shots for uid in shot["selected_source_uids"]):
+        raise _ShotRoutingContractError(
+            "A shot addresses media outside the published source generation."
+        )
+
+    metadata_contract = {
+        "channel_uuid": channel_uuid,
+        "generation": generation,
+        "shots": shots,
+        "ordered_assets": ordered_assets,
+    }
+    if _clean_string(value.get("metadata_sha256")) != _canonical_sha256(
+        metadata_contract
+    ):
+        raise _ShotRoutingContractError("Shot metadata hash does not match.")
+    media_descriptors = [
+        {
+            "source_uid": uid,
+            "media_value_sha256": hashlib.sha256(
+                media_by_source_uid[uid].encode("utf-8")
+            ).hexdigest(),
+        }
+        for uid in ordered_uids
+    ]
+    if _clean_string(value.get("media_sha256")) != _canonical_sha256(
+        {"media_descriptors": media_descriptors}
+    ):
+        raise _ShotRoutingContractError("Shot media hash does not match.")
+    return {
+        "schema": SHOT_ROUTING_SNAPSHOT_SCHEMA,
+        "version": SHOT_ROUTING_SNAPSHOT_VERSION,
+        "publisher_instance_uuid": publisher_instance_uuid,
+        "channel_uuid": channel_uuid,
+        "generation": generation,
+        "metadata_sha256": _clean_string(value.get("metadata_sha256")),
+        "media_sha256": _clean_string(value.get("media_sha256")),
+        "shots": shots,
+        "ordered_assets": ordered_assets,
+        "media_by_source_uid": media_by_source_uid,
+    }
+
+
+def _validate_picker_shot_routing_snapshot(
+    value: Any,
+    *,
+    expected_channel_uuid: str,
+) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise _ShotRoutingContractError("Picker shot routing snapshot is unavailable.")
+    required = {
+        "schema",
+        "version",
+        "publisher_instance_uuid",
+        "channel_uuid",
+        "generation",
+        "metadata_sha256",
+        "media_sha256",
+        "shots",
+        "ordered_videos",
+        "media_by_source_uid",
+    }
+    if set(value) != required:
+        raise _ShotRoutingContractError(
+            "Picker shot routing snapshot has an unknown or missing field."
+        )
+    if (
+        value.get("schema") != PICKER_SHOT_ROUTING_SNAPSHOT_SCHEMA
+        or value.get("version") != PICKER_SHOT_ROUTING_SNAPSHOT_VERSION
+    ):
+        raise _ShotRoutingContractError(
+            "Picker shot routing snapshot schema is invalid."
+        )
+    publisher = _clean_string(value.get("publisher_instance_uuid"))
+    channel = _clean_string(value.get("channel_uuid"))
+    if (
+        not publisher
+        or len(publisher) > 128
+        or not channel
+        or len(channel) > 128
+        or channel != _clean_string(expected_channel_uuid)
+    ):
+        raise _ShotRoutingContractError(
+            "Picker routing publisher/channel does not match Prompt."
+        )
+    generation = value.get("generation")
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or not 0 <= generation <= MAX_SOURCE_SYNC_REVISION
+    ):
+        raise _ShotRoutingContractError("Picker routing generation is invalid.")
+    raw_shots = value.get("shots")
+    if not isinstance(raw_shots, list) or not 1 <= len(raw_shots) <= MAX_SHOTS:
+        raise _ShotRoutingContractError(
+            "Picker routing must contain one to five shots."
+        )
+    shots: List[Dict[str, Any]] = []
+    shot_ids: set[str] = set()
+    shot_numbers: set[int] = set()
+    for raw in raw_shots:
+        if not isinstance(raw, dict) or set(raw) != {
+            "shot_uuid",
+            "number",
+            "name",
+            "revision",
+            "selected_source_uids",
+            "picker_payload",
+        }:
+            raise _ShotRoutingContractError("A Picker shot record is invalid.")
+        shot_uuid = _clean_string(raw.get("shot_uuid"))
+        name = _clean_string(raw.get("name"))
+        number = raw.get("number")
+        revision = raw.get("revision")
+        selected = raw.get("selected_source_uids")
+        picker_payload = raw.get("picker_payload")
+        if (
+            not shot_uuid
+            or len(shot_uuid) > 128
+            or not name
+            or len(name) > 128
+            or not isinstance(number, int)
+            or isinstance(number, bool)
+            or not 1 <= number <= MAX_SHOTS
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or not 0 <= revision <= MAX_SOURCE_SYNC_REVISION
+            or not isinstance(selected, list)
+            or len(selected) > MAX_VIDEOS
+            or not isinstance(picker_payload, dict)
+        ):
+            raise _ShotRoutingContractError("A Picker shot value is invalid.")
+        uids = [_clean_string(uid) for uid in selected]
+        if (
+            any(not uid or len(uid) > MAX_IDENTIFIER_CHARS for uid in uids)
+            or len(set(uids)) != len(uids)
+            or shot_uuid in shot_ids
+            or number in shot_numbers
+        ):
+            raise _ShotRoutingContractError(
+                "Picker shot identity or source address is duplicated."
+            )
+        shot_ids.add(shot_uuid)
+        shot_numbers.add(number)
+        shots.append(
+            {
+                "shot_uuid": shot_uuid,
+                "number": number,
+                "name": name,
+                "revision": revision,
+                "selected_source_uids": uids,
+                "picker_payload": copy.deepcopy(picker_payload),
+            }
+        )
+    raw_videos = value.get("ordered_videos")
+    raw_media = value.get("media_by_source_uid")
+    if not isinstance(raw_videos, list) or not isinstance(raw_media, dict):
+        raise _ShotRoutingContractError("Picker routing source arrays are invalid.")
+    videos: List[Dict[str, Any]] = []
+    ordered_uids: List[str] = []
+    for raw in raw_videos:
+        if not isinstance(raw, dict) or set(raw) != {"source_uid", "metadata"}:
+            raise _ShotRoutingContractError("A routed video record is invalid.")
+        uid = _clean_string(raw.get("source_uid"))
+        metadata = raw.get("metadata")
+        if (
+            not uid
+            or len(uid) > MAX_IDENTIFIER_CHARS
+            or uid in ordered_uids
+            or not isinstance(metadata, dict)
+            or _metadata_contains_private_media(metadata)
+        ):
+            raise _ShotRoutingContractError(
+                "A routed video address is empty/duplicated or exposes media."
+            )
+        ordered_uids.append(uid)
+        videos.append({"source_uid": uid, "metadata": copy.deepcopy(metadata)})
+    if set(raw_media) != set(ordered_uids):
+        raise _ShotRoutingContractError(
+            "Picker routing metadata and media addresses do not match."
+        )
+    media: Dict[str, str] = {}
+    for uid in ordered_uids:
+        value_at_uid = raw_media.get(uid)
+        if not isinstance(value_at_uid, str) or not value_at_uid:
+            raise _ShotRoutingContractError("A routed video has no media value.")
+        media[uid] = value_at_uid
+    known = set(ordered_uids)
+    if any(uid not in known for shot in shots for uid in shot["selected_source_uids"]):
+        raise _ShotRoutingContractError(
+            "A Picker shot addresses unpublished video media."
+        )
+    if _clean_string(value.get("metadata_sha256")) != _canonical_sha256(
+        {
+            "channel_uuid": channel,
+            "generation": generation,
+            "shots": shots,
+            "ordered_videos": videos,
+        }
+    ):
+        raise _ShotRoutingContractError("Picker routing metadata hash does not match.")
+    descriptors = [
+        {
+            "source_uid": uid,
+            "media_value_sha256": hashlib.sha256(
+                media[uid].encode("utf-8")
+            ).hexdigest(),
+        }
+        for uid in ordered_uids
+    ]
+    if _clean_string(value.get("media_sha256")) != _canonical_sha256(
+        {"media_descriptors": descriptors}
+    ):
+        raise _ShotRoutingContractError("Picker routing media hash does not match.")
+    return {
+        "schema": PICKER_SHOT_ROUTING_SNAPSHOT_SCHEMA,
+        "version": PICKER_SHOT_ROUTING_SNAPSHOT_VERSION,
+        "publisher_instance_uuid": publisher,
+        "channel_uuid": channel,
+        "generation": generation,
+        "metadata_sha256": _clean_string(value.get("metadata_sha256")),
+        "media_sha256": _clean_string(value.get("media_sha256")),
+        "shots": shots,
+        "ordered_videos": videos,
+        "media_by_source_uid": media,
+    }
+
+
+def _select_routed_shot(
+    snapshot: Dict[str, Any],
+    current_shot: Any,
+) -> Dict[str, Any]:
+    current = _normalize_shot_selection(current_shot)
+    shots = snapshot["shots"]
+    selected: Dict[str, Any] | None = None
+    if current["shot_uuid"]:
+        selected = next(
+            (
+                shot
+                for shot in shots
+                if shot["shot_uuid"] == current["shot_uuid"]
+            ),
+            None,
+        )
+        if selected is None:
+            raise _ShotRoutingContractError(
+                "The selected shot is not present in the connected channel."
+            )
+    else:
+        selected = next(
+            (
+                shot
+                for shot in shots
+                if int(shot["number"]) == int(current["number"])
+            ),
+            shots[0],
+        )
+    return {
+        "shot_uuid": selected["shot_uuid"],
+        "channel_uuid": snapshot["channel_uuid"],
+        "name": selected["name"],
+        "number": selected["number"],
+        "selected_source_uids": list(selected["selected_source_uids"]),
+    }
+
+
+def _shot_catalog_from_snapshot(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "shot_uuid": shot["shot_uuid"],
+            "channel_uuid": snapshot["channel_uuid"],
+            "name": shot["name"],
+            "number": shot["number"],
+            "selected_source_uids": list(shot["selected_source_uids"]),
+        }
+        for shot in snapshot["shots"]
+    ]
+
+
+def _compact_catalog_from_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    shots = [
+        {
+            "shot_uuid": shot["shot_uuid"],
+            "number": shot["number"],
+            "name": shot["name"],
+            "revision": shot["revision"],
+        }
+        for shot in snapshot["shots"]
+    ]
+    contract = {
+        "channel_uuid": snapshot["channel_uuid"],
+        "generation": snapshot["generation"],
+        "shots": shots,
+    }
+    return {
+        "schema": SHOT_ROUTING_CATALOG_SCHEMA,
+        "version": SHOT_ROUTING_CATALOG_VERSION,
+        "publisher_instance_uuid": snapshot["publisher_instance_uuid"],
+        **contract,
+        "metadata_sha256": _canonical_sha256(contract),
+    }
+
+
+def _catalog_routing_projection(catalog: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "publisher_instance_uuid": catalog["publisher_instance_uuid"],
+        "channel_uuid": catalog["channel_uuid"],
+        "generation": catalog["generation"],
+        "metadata_sha256": catalog["metadata_sha256"],
+    }
+
+
+def _assert_monotonic_shot_catalog(
+    previous: Any,
+    catalog: Dict[str, Any],
+) -> None:
+    current = _normalize_shot_catalog_routing(previous)
+    if not current:
+        return
+    if current["channel_uuid"] and current["channel_uuid"] != catalog["channel_uuid"]:
+        raise _ShotRoutingContractError(
+            "ImageAsset shot catalog channel changed unexpectedly."
+        )
+    if (
+        current["publisher_instance_uuid"]
+        and current["publisher_instance_uuid"] != catalog["publisher_instance_uuid"]
+    ):
+        raise _ShotRoutingContractError(
+            "ImageAsset shot catalog duplicate/replaced publisher was rejected."
+        )
+    previous_generation = int(current["generation"])
+    generation = int(catalog["generation"])
+    if generation < previous_generation:
+        raise _ShotRoutingContractError("ImageAsset shot catalog generation is stale.")
+    if (
+        generation == previous_generation
+        and previous_generation
+        and current.get("metadata_sha256")
+        and current["metadata_sha256"] != catalog["metadata_sha256"]
+    ):
+        raise _ShotRoutingContractError(
+            "ImageAsset shot catalog reused one generation with different data."
+        )
+
+
+def _routing_projection(
+    snapshot: Dict[str, Any],
+    selected_source_uids: List[str],
+) -> Dict[str, Any]:
+    return {
+        "publisher_instance_uuid": snapshot["publisher_instance_uuid"],
+        "channel_uuid": snapshot["channel_uuid"],
+        "generation": snapshot["generation"],
+        "metadata_sha256": snapshot["metadata_sha256"],
+        "media_sha256": snapshot["media_sha256"],
+        "media_count": len(selected_source_uids),
+        "media_order_sha256": _canonical_sha256(
+            {"selected_source_uids": selected_source_uids}
+        ),
+    }
+
+
+def _assert_monotonic_shot_route(
+    previous: Any,
+    snapshot: Dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    current = _normalize_shot_routing(previous)
+    if not current:
+        return
+    publisher = snapshot["publisher_instance_uuid"]
+    channel = snapshot["channel_uuid"]
+    if current["channel_uuid"] and current["channel_uuid"] != channel:
+        raise _ShotRoutingContractError(f"{label} channel changed unexpectedly.")
+    if (
+        current["publisher_instance_uuid"]
+        and current["publisher_instance_uuid"] != publisher
+    ):
+        raise _ShotRoutingContractError(
+            f"{label} duplicate/replaced publisher was rejected."
+        )
+    previous_generation = int(current["generation"])
+    generation = int(snapshot["generation"])
+    if generation < previous_generation:
+        raise _ShotRoutingContractError(f"{label} generation is stale.")
+    if generation == previous_generation and previous_generation:
+        for key in ("metadata_sha256", "media_sha256"):
+            previous_hash = current.get(key)
+            if previous_hash and previous_hash != snapshot[key]:
+                raise _ShotRoutingContractError(
+                    f"{label} reused one generation with different data."
+                )
+
+
+def _shot_image_payload_from_snapshot(
+    snapshot: Dict[str, Any],
+    shot: Dict[str, Any],
+) -> tuple[Dict[str, Any], List[str]]:
+    by_uid = {
+        item["source_uid"]: item for item in snapshot["ordered_assets"]
+    }
+    ordered_images: List[Dict[str, Any]] = []
+    verified_assets: List[Dict[str, Any]] = []
+    imported_images: List[Dict[str, Any]] = []
+    media: List[str] = []
+    for selection_order, source_uid in enumerate(
+        shot["selected_source_uids"], start=1
+    ):
+        source = by_uid[source_uid]
+        metadata = copy.deepcopy(source["metadata"])
+        metadata["source_uid"] = source_uid
+        metadata["order_key"] = source_uid
+        metadata["selection_order"] = selection_order
+        ordered_images.append(copy.deepcopy(metadata))
+        if (
+            metadata.get("verified_asset") is True
+            and _clean_string(metadata.get("source_kind")).casefold()
+            == "project"
+        ):
+            verified_assets.append(copy.deepcopy(metadata))
+        else:
+            imported_images.append(copy.deepcopy(metadata))
+        media.append(snapshot["media_by_source_uid"][source_uid])
+    first_metadata = (
+        ordered_images[0] if ordered_images else {}
+    )
+    payload = {
+        "schema": "hmb-image-asset-library-binding",
+        "version": 2,
+        "mode": "image_asset",
+        "project_id": _clean_string(first_metadata.get("project_id")),
+        "project_uid": _clean_string(
+            first_metadata.get("project_uid")
+            or first_metadata.get("asset_project_uid")
+        ),
+        "project_root": "",
+        "selection_id": _canonical_sha256(
+            {
+                "channel_uuid": snapshot["channel_uuid"],
+                "generation": snapshot["generation"],
+                "shot_uuid": shot["shot_uuid"],
+                "selected_source_uids": shot["selected_source_uids"],
+            }
+        ),
+        "ordered_images": ordered_images,
+        "verified_assets": verified_assets,
+        "selected_assets": verified_assets,
+        "imported_images": imported_images,
+    }
+    return payload, media
+
+
+def _shot_selection_contract(state: Dict[str, Any]) -> Dict[str, Any]:
+    shot = _normalize_shot_selection(state.get("shot"))
+    image_asset = (
+        state.get("image_asset")
+        if isinstance(state.get("image_asset"), dict)
+        else {}
+    )
+    picker = state.get("picker") if isinstance(state.get("picker"), dict) else {}
+    result: Dict[str, Any] = {
+        "schema": SHOT_SELECTION_SCHEMA,
+        "version": SHOT_SELECTION_VERSION,
+        **shot,
+    }
+    image_routing = _normalize_shot_routing(image_asset.get("shot_routing"))
+    video_routing = _normalize_shot_routing(picker.get("shot_routing"))
+    if image_routing:
+        result["image_routing"] = image_routing
+    if video_routing:
+        result["video_routing"] = video_routing
+    return result
+
+
 def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
     try:
         source_sync_revision = int(state.get(SOURCE_SYNC_REVISION_KEY) or 0)
@@ -3186,6 +4413,12 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "frame_metadata": picker_frame_metadata,
         "contract_errors": picker_contract_errors,
         "matched_images": matched_images,
+        "shot_catalog": _normalize_shot_catalog(
+            picker_source.get("shot_catalog")
+        ),
+        "shot_routing": _normalize_shot_routing(
+            picker_source.get("shot_routing")
+        ),
     }
     image_asset_source = (
         state.get("image_asset")
@@ -3243,6 +4476,15 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
             image_asset_source.get("dormant_asset_rows"),
             asset_rows=True,
         ),
+        "shot_catalog": _normalize_shot_catalog(
+            image_asset_source.get("shot_catalog")
+        ),
+        "shot_catalog_routing": _normalize_shot_catalog_routing(
+            image_asset_source.get("shot_catalog_routing")
+        ),
+        "shot_routing": _normalize_shot_routing(
+            image_asset_source.get("shot_routing")
+        ),
     }
 
     return {
@@ -3250,8 +4492,8 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "mode": MODE_NAME,
         SOURCE_SYNC_REVISION_KEY: source_sync_revision,
         UI_EDIT_REVISION_KEY: ui_edit_revision,
-        "theme": "dark-neon",
         "image_taxonomy": _image_taxonomy_payload(),
+        "shot": _normalize_shot_selection(state.get("shot")),
         "images": images,
         "videos": videos,
         "text": _normalize_text(state),
@@ -3268,6 +4510,55 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
             "max_videos": MAX_VIDEOS,
         },
     }
+
+
+_FRAME_RANGE_UI_FIELDS = (
+    "frame_range_intent",
+)
+
+
+def _merge_prompt_revision_axes(
+    source_state: Dict[str, Any],
+    ui_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Merge a newer source snapshot with newer user-authored Range intent.
+
+    ``source_sync_revision`` and ``ui_edit_revision`` are independent writer
+    clocks.  A Picker/Asset snapshot may therefore be newer on the source axis
+    while an in-flight Prompt edit is newer on the UI axis.  Treating that
+    crossed pair lexicographically used to accept the whole source snapshot and
+    roll Range ON back to OFF.  Keep the higher-source state as the structural
+    base, then carry only Range-authored fields from the higher-UI state for
+    image identities that still exist in that source generation.
+    """
+
+    source = _normalize_state(copy.deepcopy(source_state))
+    ui = _normalize_state(copy.deepcopy(ui_state))
+    ui_images: Dict[str, Dict[str, Any]] = {}
+    for index, item in enumerate(ui.get("images", [])):
+        if not isinstance(item, dict):
+            continue
+        identity = _manual_video_context_image_identity(item, index)
+        ui_images.setdefault(identity, item)
+
+    for index, item in enumerate(source.get("images", [])):
+        if not isinstance(item, dict):
+            continue
+        ui_item = ui_images.get(_manual_video_context_image_identity(item, index))
+        if not isinstance(ui_item, dict):
+            continue
+        for field in _FRAME_RANGE_UI_FIELDS:
+            item[field] = copy.deepcopy(ui_item.get(field))
+
+    source[SOURCE_SYNC_REVISION_KEY] = max(
+        int(source.get(SOURCE_SYNC_REVISION_KEY) or 0),
+        int(ui.get(SOURCE_SYNC_REVISION_KEY) or 0),
+    )
+    source[UI_EDIT_REVISION_KEY] = max(
+        int(source.get(UI_EDIT_REVISION_KEY) or 0),
+        int(ui.get(UI_EDIT_REVISION_KEY) or 0),
+    )
+    return _normalize_state(source)
 
 
 def _subject_number(owner: str) -> int | None:
@@ -3385,10 +4676,25 @@ def _clean_replacement_marker(marker: Any, image_seq: int) -> str:
     return re.sub(r"\s+", " ", marker_text).strip(" /\t")
 
 
-def _image_replacement_line(item: Dict[str, Any], seq: int) -> str | None:
+def _image_replacement_line(
+    item: Dict[str, Any],
+    seq: int,
+    active_video_slots: set[int] | None = None,
+) -> str | None:
     """Render only explicit marker bindings; blank marker addresses stay omitted."""
 
     explicit_marker = _clean_replacement_marker(item.get("preview_marker"), seq)
+    explicit_video_match = re.search(
+        r"@video(10|[1-9])\b",
+        explicit_marker,
+        re.IGNORECASE,
+    )
+    if (
+        explicit_video_match is not None
+        and active_video_slots is not None
+        and int(explicit_video_match.group(1)) not in active_video_slots
+    ):
+        explicit_marker = ""
     source_type = _public_single_line(item.get("source_type"))
     owner = _public_single_line(_effective_target(item, f"image {seq}"))
 
@@ -3466,12 +4772,18 @@ def _image_replacement_line(item: Dict[str, Any], seq: int) -> str | None:
         ))
         lines.append(format_line(explicit_marker, first_scope))
     for entry in _image_binding_entries(item):
+        marker_video = int(entry.get("marker_video") or 1)
+        if (
+            active_video_slots is not None
+            and marker_video not in active_video_slots
+        ):
+            continue
         color = _public_single_line(entry["color"])
         scope = _public_single_line(entry["scope"])
         if not color:
             continue
         marker = (
-            f"Color Pick marker: @video{entry['marker_video']} / {color}"
+            f"Color Pick marker: @video{marker_video} / {color}"
         )
         line = format_line(marker, scope)
         if line not in lines:
@@ -3493,11 +4805,17 @@ def _picker_input_kwargs() -> Dict[str, Any]:
         "allow_property": False,
         "hide_property": True,
         "ui_options": {
-            "display_name": "PICKER_IN",
+            "display_name": "",
             "compact": True,
-            "height": 24,
-            "is_full_width": False,
+            "height": 1,
+            "min_height": 0,
+            "max_height": 1,
+            "expandable": False,
+            "is_full_width": True,
             "hide_property": True,
+            "hide_label": True,
+            "hide": True,
+            "hide_handles": True,
         },
     }
     if ParameterMode is not None:
@@ -3525,11 +4843,17 @@ def _image_asset_input_kwargs() -> Dict[str, Any]:
         "allow_property": False,
         "hide_property": True,
         "ui_options": {
-            "display_name": IMAGE_ASSET_INPUT_DISPLAY_NAME,
+            "display_name": "",
             "compact": True,
-            "height": 24,
-            "is_full_width": False,
+            "height": 1,
+            "min_height": 0,
+            "max_height": 1,
+            "expandable": False,
+            "is_full_width": True,
             "hide_property": True,
+            "hide_label": True,
+            "hide": True,
+            "hide_handles": True,
         },
     }
     if ParameterMode is not None:
@@ -3546,6 +4870,7 @@ def _repair_source_input_parameter(
     if parameter is None:
         return
     try:
+        parameter.hide = True
         parameter.hide_property = True
     except Exception as exc:
         _diagnostic_exception(
@@ -3566,8 +4891,6 @@ def _repair_source_input_parameter(
         if not isinstance(current_ui, dict):
             current_ui = {}
         current_ui.update(kwargs["ui_options"])
-        current_ui.pop("hide", None)
-        current_ui.pop("hide_handles", None)
         parameter.ui_options = current_ui
     except Exception as exc:
         _diagnostic_exception(f"{parameter_name} UI repair failed", exc)
@@ -3609,18 +4932,131 @@ def _add_image_asset_input(node: Any) -> None:
         _repair_image_asset_input_parameter(node)
 
 
+def _shot_asset_input_kwargs() -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "name": SHOT_ASSET_INPUT_PARAMETER_NAME,
+        "tooltip": (
+            "Hidden compact dependency for the active shot's ImageAsset "
+            "snapshot. The raw string is never used as routing authority."
+        ),
+        "default_value": "",
+        "type": "str",
+        "input_types": ["any"],
+        "allow_input": True,
+        "allow_output": False,
+        "allow_property": False,
+        "hide_property": True,
+        "ui_options": {
+            "display_name": "",
+            "compact": True,
+            "height": 1,
+            "min_height": 0,
+            "max_height": 1,
+            "expandable": False,
+            "is_full_width": True,
+            "hide_property": True,
+            "hide_label": True,
+            "hide": True,
+            "hide_handles": True,
+        },
+    }
+    if ParameterMode is not None:
+        kwargs["allowed_modes"] = {ParameterMode.INPUT}
+    return kwargs
+
+
+def _add_shot_asset_input(node: Any) -> None:
+    kwargs = _shot_asset_input_kwargs()
+    if parameter_exists(node, SHOT_ASSET_INPUT_PARAMETER_NAME):
+        _repair_source_input_parameter(
+            node, SHOT_ASSET_INPUT_PARAMETER_NAME, kwargs
+        )
+        return
+    try:
+        _safe_add_parameter(node, **kwargs)
+    finally:
+        _repair_source_input_parameter(
+            node, SHOT_ASSET_INPUT_PARAMETER_NAME, kwargs
+        )
+
+
+def _shot_picker_input_kwargs() -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "name": SHOT_PICKER_INPUT_PARAMETER_NAME,
+        "tooltip": (
+            "Hidden exact-source dependency for the active shot's VideoPicker "
+            "snapshot. The raw string is never used as routing authority."
+        ),
+        "default_value": "",
+        "type": "str",
+        "input_types": ["any"],
+        "allow_input": True,
+        "allow_output": False,
+        "allow_property": False,
+        "hide_property": True,
+        "ui_options": {
+            "display_name": "",
+            "compact": True,
+            "height": 1,
+            "min_height": 0,
+            "max_height": 1,
+            "expandable": False,
+            "is_full_width": True,
+            "hide_property": True,
+            "hide_label": True,
+            "hide": True,
+            "hide_handles": True,
+        },
+    }
+    if ParameterMode is not None:
+        kwargs["allowed_modes"] = {ParameterMode.INPUT}
+    return kwargs
+
+
+def _add_shot_picker_input(node: Any) -> None:
+    kwargs = _shot_picker_input_kwargs()
+    if parameter_exists(node, SHOT_PICKER_INPUT_PARAMETER_NAME):
+        _repair_source_input_parameter(
+            node, SHOT_PICKER_INPUT_PARAMETER_NAME, kwargs
+        )
+        return
+    try:
+        _safe_add_parameter(node, **kwargs)
+    finally:
+        _repair_source_input_parameter(
+            node, SHOT_PICKER_INPUT_PARAMETER_NAME, kwargs
+        )
+
+
 def _parse_connected_payload(value: Any, source_name: str) -> Dict[str, Any]:
     if isinstance(value, dict):
         return value
-    text = value.strip() if isinstance(value, str) else _readable_original(value)
-    if not text:
+    text = value if isinstance(value, str) else _readable_original(value)
+    if not text or not text.strip():
         return {}
     try:
         payload = json.loads(text)
-    except Exception:
+    except json.JSONDecodeError as exc:
+        diagnostic = _source_parse_diagnostic(
+            source_name,
+            text,
+            error_offset=exc.pos,
+        )
+        if diagnostic is not None:
+            return {_UNSTRUCTURED_INPUT_KEY: [diagnostic]}
         entry = _source_intent_entry(
             source_name,
-            "readable non-JSON connected input",
+            _LEGACY_SOURCE_PARSE_FAILURE_REASON,
+            value,
+        )
+        return {_UNSTRUCTURED_INPUT_KEY: [entry] if entry else []}
+    except Exception:
+        diagnostic = _source_parse_diagnostic(source_name, text)
+        if diagnostic is not None:
+            return {_UNSTRUCTURED_INPUT_KEY: [diagnostic]}
+        entry = _source_intent_entry(
+            source_name,
+            _LEGACY_SOURCE_PARSE_FAILURE_REASON,
             value,
         )
         return {_UNSTRUCTURED_INPUT_KEY: [entry] if entry else []}
@@ -3629,7 +5065,7 @@ def _parse_connected_payload(value: Any, source_name: str) -> Dict[str, Any]:
     entry = _source_intent_entry(
         source_name,
         "readable non-object connected input",
-        payload,
+        text,
     )
     return {_UNSTRUCTURED_INPUT_KEY: [entry] if entry else []}
 
@@ -3803,12 +5239,15 @@ def _merge_unstructured_payload_intent(
 ) -> bool:
     entries = _unstructured_payload_entries(payload)
     for entry in entries:
-        _append_source_intent(
-            state,
-            entry.get("source"),
-            entry.get("reason"),
-            entry.get("text"),
-        )
+        if entry.get("kind") == _SOURCE_PARSE_DIAGNOSTIC_KIND:
+            _append_source_parse_diagnostic(state, entry)
+        else:
+            _append_source_intent(
+                state,
+                entry.get("source"),
+                entry.get("reason"),
+                entry.get("text"),
+            )
     return bool(entries)
 
 
@@ -4565,6 +6004,11 @@ def _apply_image_asset_payload(
         "dormant_manual_rows": manual_cache,
         "dormant_asset_rows": asset_cache,
     }
+    if _known_hmb_connected_payload(IMAGE_ASSET_INPUT_PARAMETER_NAME, payload):
+        _prune_source_parse_diagnostic(
+            normalized,
+            IMAGE_ASSET_INPUT_PARAMETER_NAME,
+        )
     return _normalize_state(normalized)
 
 
@@ -4842,9 +6286,6 @@ def _remap_video_slots_in_image(item: Dict[str, Any], slot_map: Dict[int, int]) 
         remapped_bindings[_frame_binding_key(next_slot, color)] = next_binding
     item["frame_range_bindings"] = remapped_bindings
     item["frame_range_binding"] = None
-    if not remapped_bindings:
-        item["frame_range_enabled"] = False
-        item["frame_range_selected_index"] = -1
 
 
 def _remap_video_source_references_in_state(
@@ -6119,6 +7560,11 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             "contract_errors": list(dict.fromkeys(rejected_video_contract_errors)),
             "matched_images": 0,
         }
+        if _known_hmb_connected_payload(PICKER_INPUT_PARAMETER_NAME, payload):
+            _prune_source_parse_diagnostic(
+                normalized,
+                PICKER_INPUT_PARAMETER_NAME,
+            )
         return _normalize_state(normalized)
     if not picker_has_media:
         if has_readable_unstructured_video_rows:
@@ -6809,6 +8255,16 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             in ("", "Role Required / Select Video Type")
         ):
             video_item["source_type"] = "Maya Preview / Playblast"
+        # Connected Picker media may adopt a pre-existing manual row.  Preserve
+        # its label, Keep Out, and all other authoring, but remove the one
+        # taxonomy pair that would claim two incompatible authority domains.
+        if (
+            video_item.get("source_type") == "Maya Preview / Playblast"
+            and video_item.get("control_role")
+            == "Primary Unified Shot Control"
+        ):
+            video_item["control_role"] = ""
+            video_item["custom_control_role"] = ""
         video_item["manual"] = True
     normalized["videos"] = videos
 
@@ -6986,6 +8442,11 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
         "contract_errors": list(dict.fromkeys(picker_contract_errors)),
         "matched_images": matched_images,
     }
+    if _known_hmb_connected_payload(PICKER_INPUT_PARAMETER_NAME, payload):
+        _prune_source_parse_diagnostic(
+            normalized,
+            PICKER_INPUT_PARAMETER_NAME,
+        )
     return _normalize_state(normalized)
 
 def _prompt_output_kwargs() -> Dict[str, Any]:
@@ -7002,11 +8463,17 @@ def _prompt_output_kwargs() -> Dict[str, Any]:
         "settable": False,
         "hide_property": True,
         "ui_options": {
-            "display_name": "PROMPT OUT",
+            "display_name": "",
             "compact": True,
-            "height": 24,
-            "is_full_width": False,
+            "height": 1,
+            "min_height": 0,
+            "max_height": 1,
+            "expandable": False,
+            "is_full_width": True,
             "hide_property": True,
+            "hide_label": True,
+            "hide": True,
+            "hide_handles": True,
         },
     }
     mode = _mode_output()
@@ -7035,10 +8502,6 @@ def _repair_prompt_output_parameter(node: Any) -> None:
         if not isinstance(current_ui, dict):
             current_ui = {}
         current_ui.update(kwargs["ui_options"])
-        current_ui.pop("port_only", None)
-        current_ui.pop("hide", None)
-        current_ui.pop("hide_handles", None)
-        current_ui.pop("hide_label", None)
         parameter.ui_options = current_ui
     except Exception as exc:
         _diagnostic_exception("PROMPT_OUT UI option repair failed", exc)
@@ -7053,6 +8516,82 @@ def _add_prompt_output(node: Any) -> None:
         _safe_add_parameter(node, **kwargs)
     finally:
         _repair_prompt_output_parameter(node)
+
+
+def _shot_media_output_kwargs(name: str) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "name": name,
+        "tooltip": (
+            "Hidden ordered media output for the exact active Prompt shot. "
+            "Its order is generation-paired with PROMPT_OUT."
+        ),
+        "default_value": [],
+        "type": "list[str]",
+        "output_type": "list[str]",
+        "input_types": [],
+        "allow_input": False,
+        "allow_output": True,
+        "allow_property": False,
+        "settable": False,
+        "hide_property": True,
+        "ui_options": {
+            "display_name": "",
+            "compact": True,
+            "height": 1,
+            "min_height": 0,
+            "max_height": 1,
+            "expandable": False,
+            "is_full_width": True,
+            "hide_property": True,
+            "hide_label": True,
+            "hide": True,
+            "hide_handles": True,
+        },
+    }
+    mode = _mode_output()
+    if mode is not None:
+        kwargs["allowed_modes"] = mode
+    return kwargs
+
+
+def _repair_shot_media_output(node: Any, name: str) -> None:
+    parameter = _get_parameter_obj(node, name)
+    if parameter is None:
+        return
+    kwargs = _shot_media_output_kwargs(name)
+    for key, value in kwargs.items():
+        if key == "ui_options":
+            continue
+        if kwargs.get("allowed_modes") is not None and key in {
+            "allow_input",
+            "allow_output",
+            "allow_property",
+        }:
+            continue
+        try:
+            setattr(parameter, key, value)
+        except Exception as exc:
+            _diagnostic_exception(f"{name} attribute repair failed", exc)
+    try:
+        current_ui = dict(
+            getattr(parameter, "ui_options", None)
+            or getattr(parameter, "_ui_options", None)
+            or {}
+        )
+        current_ui.update(kwargs["ui_options"])
+        parameter.ui_options = current_ui
+    except Exception as exc:
+        _diagnostic_exception(f"{name} UI repair failed", exc)
+
+
+def _add_shot_media_output(node: Any, name: str) -> None:
+    if parameter_exists(node, name):
+        _repair_shot_media_output(node, name)
+        return
+    try:
+        _safe_add_parameter(node, **_shot_media_output_kwargs(name))
+    finally:
+        _repair_shot_media_output(node, name)
 
 
 def _add_widget_state_parameter(node: Any) -> None:
@@ -7125,7 +8664,8 @@ def _frame_range_binding_validation(
     binding_override: Dict[str, Any] | None = None,
 ) -> tuple[Dict[str, Any] | None, Dict[str, Any] | None, List[str]]:
     errors: List[str] = []
-    if not bool(item.get("frame_range_enabled")):
+    intent = _canonical_frame_range_intent(item)
+    if not intent["enabled"]:
         return None, None, errors
 
     binding = (
@@ -7135,7 +8675,7 @@ def _frame_range_binding_validation(
     )
     if not binding:
         errors.append(
-            "Optional frame-range instruction ignored: select a Video and Color Pick to define it."
+            "Optional frame-range instruction ignored: no active video address is available."
         )
         return None, None, errors
 
@@ -7143,63 +8683,42 @@ def _frame_range_binding_validation(
     color = _clean_string(binding.get("color_pick"))
     if active_video_slots is not None and slot not in active_video_slots:
         errors.append(f"@video{slot} does not exist as an active video source.")
-    if not color:
-        errors.append("Color Pick is not selected.")
 
-    picker = state.get("picker") if isinstance(state.get("picker"), dict) else {}
-    picker_ready = bool(
-        picker.get("enabled")
-        and not picker.get("awaiting_data")
-    )
-    picker_metadata = next(
-        (
-            entry
-            for entry in _normalize_frame_metadata(picker.get("frame_metadata"))
-            if _video_slot_number(entry.get("video_slot"), MAX_VIDEOS) == slot
-        ),
-        None,
-    ) if picker_ready else None
+    # The user's canonical domain is the sole temporal authority. Picker probe
+    # metadata, marker catalogs, capabilities, duration, and reconnect state
+    # cannot narrow, retarget, or invalidate this draft.
+    manual_start = intent["start_frame"]
+    manual_end = intent["end_frame"]
+    ranges = copy.deepcopy(intent["ranges"])
+    if manual_start is None:
+        errors.append(
+            "Optional frame-range instruction ignored: manual START frame is not supplied."
+        )
+    if manual_end is None:
+        errors.append(
+            "Optional frame-range instruction ignored: manual END frame is not supplied."
+        )
+    if manual_start is not None and manual_end is not None and manual_start > manual_end:
+        errors.append(
+            f"Manual frame domain {manual_start}-{manual_end} has START after END."
+        )
+    if manual_start is None or manual_end is None or manual_start > manual_end:
+        return binding, None, errors
+    metadata = {
+        "video_slot": f"@video{slot}",
+        "fps": 0.0,
+        "start_frame": manual_start,
+        "end_frame": manual_end,
+        "frame_count": manual_end - manual_start + 1,
+        "duration_seconds": 0.0,
+        "timebase": "",
+        "available_color_picks": [color] if color else [],
+        "origin": "manual",
+        "conflict": False,
+        "valid": True,
+        "warnings": [],
+    }
 
-    if picker_metadata is not None:
-        metadata = picker_metadata
-        if bool(metadata.get("conflict")) or not bool(metadata.get("valid")):
-            errors.append(f"Frame metadata for @video{slot} is conflicting or incomplete.")
-        available_colors = metadata.get("available_color_picks")
-        if isinstance(available_colors, list) and color not in available_colors:
-            errors.append(f"{color} is not available in @video{slot} Picker metadata.")
-    else:
-        manual_start = _optional_frame_number(binding.get("start_frame"))
-        manual_end = _optional_frame_number(binding.get("end_frame"))
-        if manual_start is None:
-            errors.append(
-                "Optional frame-range instruction ignored: manual START frame is not supplied."
-            )
-        if manual_end is None:
-            errors.append(
-                "Optional frame-range instruction ignored: manual END frame is not supplied."
-            )
-        if manual_start is not None and manual_end is not None and manual_start > manual_end:
-            errors.append(
-                f"Manual frame domain {manual_start}-{manual_end} has START after END."
-            )
-        if manual_start is None or manual_end is None or manual_start > manual_end:
-            return binding, None, errors
-        metadata = {
-            "video_slot": f"@video{slot}",
-            "fps": 0.0,
-            "start_frame": manual_start,
-            "end_frame": manual_end,
-            "frame_count": manual_end - manual_start + 1,
-            "duration_seconds": 0.0,
-            "timebase": "",
-            "available_color_picks": [color] if color else [],
-            "origin": "manual",
-            "conflict": False,
-            "valid": True,
-            "warnings": [],
-        }
-
-    ranges = _normalize_frame_ranges(binding.get("ranges"))
     if not ranges:
         errors.append(
             "Optional frame-range instruction ignored: no range is selected; full-shot source use remains available."
@@ -7214,7 +8733,7 @@ def _frame_range_binding_validation(
             errors.append(f"Invalid frame range {start}–{end}.")
         elif start < minimum or end > maximum:
             errors.append(
-                f"Frame range {start}–{end} is outside @video{slot} Frames {minimum}–{maximum}."
+                f"Frame range {start}–{end} is outside the user domain {minimum}–{maximum}."
             )
         else:
             valid_ranges.append({"start": start, "end": end})
@@ -7222,6 +8741,9 @@ def _frame_range_binding_validation(
         **binding,
         "video_slot": f"@video{slot}",
         "color_pick": color,
+        "origin": "manual",
+        "start_frame": manual_start,
+        "end_frame": manual_end,
         "ranges": valid_ranges,
     }
     return binding, metadata, errors
@@ -7246,14 +8768,11 @@ def _valid_frame_range_bindings(
                 active_binding,
             )
             error_codes = set(_frame_range_error_codes(errors))
-            segment_only_errors = {
-                "segment_order_invalid", "segment_out_of_domain"
-            }
             if (
                 binding is not None
                 and metadata is not None
                 and bool(binding.get("ranges"))
-                and error_codes.issubset(segment_only_errors)
+                and not error_codes
             ):
                 out.append((item, binding, metadata))
     return out
@@ -7353,7 +8872,10 @@ def _fx_timing_range_segments(
         if _video_slot_number(binding.get("video_slot"), MAX_VIDEOS) != video_slot:
             continue
         image_slot = int(item.get("slot") or 1)
-        marker_color = _clean_string(binding.get("color_pick"))
+        marker_color = (
+            _clean_string(binding.get("color_pick"))
+            or VIDEO_WIDE_RANGE_MARKER
+        )
         image_source_uid = _clean_string(
             item.get("asset_source_uid") or item.get("source_uid")
         )
@@ -7364,8 +8886,10 @@ def _fx_timing_range_segments(
                 entry
                 for entry in _image_binding_entries(item)
                 if int(entry.get("marker_video") or 0) == video_slot
-                and _clean_string(entry.get("color")).casefold()
-                == marker_color.casefold()
+                and (
+                    _clean_string(entry.get("color"))
+                    or VIDEO_WIDE_RANGE_MARKER
+                ).casefold() == marker_color.casefold()
             ),
             {},
         )
@@ -7429,9 +8953,6 @@ def _build_fx_timing_source_contract(
     """
 
     sources: List[Dict[str, Any]] = []
-    active_video_slots = {
-        int(item.get("slot") or 1) for item in active_videos
-    }
     for item in active_videos:
         source_type = _clean_string(item.get("source_type"))
         if source_type not in {"FX Reference", "Timing / Edit Reference"}:
@@ -7445,28 +8966,8 @@ def _build_fx_timing_source_contract(
         role_selected = bool(selected_role)
         validation_codes: List[str] = []
 
-        relevant_range_enabled = False
-        range_errors_for_source: List[str] = []
-        for image in active_images:
-            for binding in _active_frame_range_bindings(image):
-                if _video_slot_number(binding.get("video_slot"), MAX_VIDEOS) != slot:
-                    continue
-                relevant_range_enabled = True
-                _binding, _metadata, range_errors = _frame_range_binding_validation(
-                    state,
-                    image,
-                    active_video_slots,
-                    binding,
-                )
-                range_errors_for_source.extend(
-                    f"{token} image-range binding: {error}" for error in range_errors
-                )
-
         segments = _fx_timing_range_segments(valid_frame_bindings, slot)
-        if relevant_range_enabled and not segments:
-            range_errors_for_source.append(
-                f"{token} Range ON has no valid image-source segment"
-            )
+        relevant_range_enabled = bool(segments)
 
         capabilities = (
             item.get("reference_capabilities")
@@ -7476,18 +8977,9 @@ def _build_fx_timing_source_contract(
         transport_errors = _video_reference_transport_errors(item)
         if transport_errors:
             validation_codes.append("transport")
-        if capabilities:
-            if segments and capabilities.get("frame_addressable") is not True:
-                range_errors_for_source.append(
-                    f"{token} is not frame-addressable for Range ON"
-                )
-            if (
-                segments
-                and capabilities.get("image_source_frame_ranges") is not True
-            ):
-                range_errors_for_source.append(
-                    f"{token} does not support image-source frame ranges"
-                )
+        # Manual Range is Prompt-owned and its user domain is independent of
+        # Picker transport capability flags.  Capabilities remain public source
+        # facts, but cannot veto a valid manual frame_range_intent projection.
 
         raw_timing_cues = _normalize_video_timing_cues(item.get("timing_cues"))
         manual_timing_cues = _control_binding_timing_cues(
@@ -7519,8 +9011,6 @@ def _build_fx_timing_source_contract(
         ):
             validation_codes.append("emitter_cue")
 
-        if range_errors_for_source:
-            validation_codes.append("range")
         validation_codes = list(dict.fromkeys(validation_codes))
 
         source: Dict[str, Any] = {
@@ -7639,18 +9129,42 @@ def _public_job_data_contract(
 ) -> Dict[str, Any]:
     """Build source, role, target, and range addresses without policy prose."""
 
+    active_video_slots = {
+        int(item.get("slot") or 1) for item in active_videos
+    }
     images: List[Dict[str, Any]] = []
     for item in active_images:
         slot = int(item.get("slot") or 1)
+        video_wide_range_slots = {
+            _video_slot_number(binding.get("video_slot"), MAX_VIDEOS)
+            for binding in _active_frame_range_bindings(item)
+            if _video_wide_frame_range_allowed(
+                state,
+                binding.get("video_slot"),
+                binding.get("color_pick"),
+            )
+        }
         bindings = [
             {
                 "video": f"@video{int(entry.get('marker_video') or 1)}",
-                "marker_color": _clean_string(entry.get("color")),
+                "marker_color": (
+                    _clean_string(entry.get("color"))
+                    or (
+                        VIDEO_WIDE_RANGE_MARKER
+                        if int(entry.get("marker_video") or 1)
+                        in video_wide_range_slots
+                        else ""
+                    )
+                ),
                 "target_scope": _clean_string(entry.get("scope")),
             }
             for entry in _image_binding_entries(item)
-            if _clean_string(entry.get("color"))
-            or _clean_string(entry.get("scope"))
+            if int(entry.get("marker_video") or 1) in active_video_slots
+            and (
+                _clean_string(entry.get("color"))
+                or _clean_string(entry.get("scope"))
+                or int(entry.get("marker_video") or 1) in video_wide_range_slots
+            )
         ]
         images.append({
             "image": f"@image{slot}",
@@ -7717,7 +9231,6 @@ def _public_job_data_contract(
             })
         videos.append(record)
 
-    active_video_slots = {int(item.get("slot") or 1) for item in active_videos}
     frame_ranges: List[Dict[str, Any]] = []
     for item in active_images:
         image_token = f"@image{int(item.get('slot') or 1)}"
@@ -7730,18 +9243,23 @@ def _public_job_data_contract(
             )
             selected = binding if isinstance(binding, dict) else active_binding
             slot = _video_slot_number(selected.get("video_slot"), MAX_VIDEOS)
+            if slot not in active_video_slots:
+                continue
             valid_ranges = _normalize_frame_ranges(selected.get("ranges"))
             submitted_ranges = _normalize_frame_ranges(active_binding.get("ranges"))
             error_codes = _frame_range_error_codes(errors)
-            segment_error_codes = {
-                "segment_order_invalid", "segment_out_of_domain"
-            }
             usable = bool(
                 binding is not None
                 and metadata is not None
                 and valid_ranges
-                and set(error_codes).issubset(segment_error_codes)
+                and not error_codes
             )
+            # Incomplete/invalid intent is a dormant editing draft.  Keeping it
+            # out of the signed public v1 contract guarantees ordinary image,
+            # video, and prompt generation remains available while the user is
+            # still typing or has temporarily selected an invalid segment.
+            if not usable:
+                continue
             domain: Dict[str, Any] = {}
             if isinstance(metadata, dict):
                 domain = _nonempty_identity({
@@ -7792,7 +9310,11 @@ def _public_job_data_contract(
             frame_ranges.append({
                 "image": image_token,
                 "video": f"@video{slot}",
-                "marker_color": _clean_string(selected.get("color_pick")),
+                "marker_color": _public_frame_range_marker(
+                    state,
+                    slot,
+                    selected.get("color_pick"),
+                ),
                 "enabled": True,
                 "origin": _clean_string(selected.get("origin")) or "manual",
                 "domain": domain,
@@ -7821,6 +9343,7 @@ def _public_job_data_contract(
             "boundary": _clean_string(entry.get("boundary")),
         }
         for entry in control_only_bindings
+        if int(entry.get("video") or 1) in active_video_slots
     ]
     return {
         "schema": PUBLIC_JOB_CONTRACT_SCHEMA,
@@ -7916,6 +9439,9 @@ def _build_user_readable_prompt_package(state: Dict[str, Any]) -> str:
     state = _normalize_state(state)
     active_images = _active_image_rows_for_state(state["images"], state)
     active_videos = [item for item in state["videos"] if _is_active_video(item)]
+    active_video_slots = {
+        int(item.get("slot") or 1) for item in active_videos
+    }
     lines: List[str] = ["HMB_GP_Production", ""]
 
     lines.extend([
@@ -7938,7 +9464,12 @@ def _build_user_readable_prompt_package(state: Dict[str, Any]) -> str:
                 strip_extension=False,
             )
             asset_suffix = f" / Asset ID: {asset_id}" if asset_id else ""
-            color_text = _public_single_line(_color_pick_text(item))
+            color_text = _public_single_line(
+                _color_pick_text(
+                    item,
+                    active_video_slots=active_video_slots,
+                )
+            )
             color_suffix = f" / Color Pick: {color_text}" if color_text else ""
             lines.append(f"@image{seq} = {label}{asset_suffix}{color_suffix}")
         lines.append(
@@ -7961,7 +9492,11 @@ def _build_user_readable_prompt_package(state: Dict[str, Any]) -> str:
         replacement_lines: List[str] = []
         for item in active_images:
             seq = int(item.get("slot") or 1)
-            replacement = _image_replacement_line(item, seq)
+            replacement = _image_replacement_line(
+                item,
+                seq,
+                active_video_slots=active_video_slots,
+            )
             if not replacement:
                 continue
             for replacement_line in replacement.splitlines():
@@ -8013,9 +9548,51 @@ def _prompt_semantic_fingerprint(
     machine = machine_prompt
     if machine is None:
         machine = _build_data_only_prompt_package(state)
+    # Shot identity and upstream media hashes are private pairing facts. They
+    # must advance the Prompt generation even when the concise document and
+    # machine job JSON happen to remain textually identical (for example, a
+    # source file was replaced in place without changing its label).
+    shot_pairing = _canonical_sha256(_shot_selection_contract(state))
     return hashlib.sha256(
-        (str(visible) + "\0" + str(machine)).encode("utf-8")
+        (str(visible) + "\0" + str(machine) + "\0" + shot_pairing).encode(
+            "utf-8"
+        )
     ).hexdigest()
+
+
+def _media_list_sha256(values: List[str]) -> str:
+    if not isinstance(values, list) or any(
+        not isinstance(value, str) for value in values
+    ):
+        raise _ShotRoutingContractError("Shot media output is not list[str].")
+    return _canonical_sha256({"media": values})
+
+
+def _agent_shot_context(
+    state: Dict[str, Any],
+    *,
+    prompt_generation: int,
+    visible_prompt: str,
+    image_media: List[str],
+    video_media: List[str],
+) -> Dict[str, Any]:
+    shot = _normalize_shot_selection(state.get("shot"))
+    if not shot["channel_uuid"] or not shot["shot_uuid"]:
+        raise _ShotRoutingContractError("Active Prompt shot identity is unavailable.")
+    return {
+        "schema": "hmb-agent-shot-context",
+        "version": 1,
+        "channel_uuid": shot["channel_uuid"],
+        "shot_uuid": shot["shot_uuid"],
+        "shot_number": shot["number"],
+        "shot_name": shot["name"],
+        "prompt_generation": int(prompt_generation),
+        "visible_prompt_sha256": hashlib.sha256(
+            visible_prompt.rstrip("\r\n").encode("utf-8")
+        ).hexdigest(),
+        "image_media_sha256": _media_list_sha256(image_media),
+        "video_media_sha256": _media_list_sha256(video_media),
+    }
 
 
 def _prompt_output_side_effect_local(node: Any) -> Any:
@@ -8047,15 +9624,20 @@ def _propagate_prompt_output_to_connections(
     value: Any,
     *,
     owner_pending: Any = None,
+    output_name: str = "PROMPT_OUT",
+    pending_attribute: str = "_hmb_pending_prompt_notification",
 ) -> None:
-    """Forward a late PROMPT_OUT publication through retained-mode edges."""
+    """Forward one late Prompt output through retained-mode edges."""
 
     def still_owned() -> bool:
-        return (
-            owner_pending is None
-            or getattr(node, "_hmb_pending_prompt_notification", None)
-            is owner_pending
-        )
+        if bool(getattr(node, "_hmb_node_deleted", False)):
+            return False
+        if owner_pending is None:
+            return True
+        current = getattr(node, pending_attribute, None)
+        if isinstance(current, dict):
+            return current.get(output_name) is owner_pending
+        return current is owner_pending
 
     try:
         from griptape_nodes.retained_mode.events.connection_events import (  # type: ignore
@@ -8098,10 +9680,10 @@ def _propagate_prompt_output_to_connections(
             getattr(connections_result, "result_details", "")
         )
         raise RuntimeError(
-            details or "Griptape could not inspect outgoing PROMPT_OUT connections."
+            details or f"Griptape could not inspect outgoing {output_name} connections."
         )
 
-    source_parameter = _get_parameter_obj(node, "PROMPT_OUT")
+    source_parameter = _get_parameter_obj(node, output_name)
     data_type = _clean_string(
         getattr(source_parameter, "output_type", "")
     ) or _clean_string(getattr(source_parameter, "type", ""))
@@ -8110,7 +9692,7 @@ def _propagate_prompt_output_to_connections(
             return
         if _clean_string(
             getattr(connection, "source_parameter_name", "")
-        ) != "PROMPT_OUT":
+        ) != output_name:
             continue
         target_node_name = _clean_string(
             getattr(connection, "target_node_name", "")
@@ -8135,7 +9717,7 @@ def _propagate_prompt_output_to_connections(
                 value=value,
                 data_type=data_type or None,
                 incoming_connection_source_node_name=node_name,
-                incoming_connection_source_parameter_name="PROMPT_OUT",
+                incoming_connection_source_parameter_name=output_name,
             )
         )
         if not still_owned():
@@ -8145,10 +9727,67 @@ def _propagate_prompt_output_to_connections(
             raise RuntimeError(
                 details
                 or (
-                    f"Griptape rejected {node_name}.PROMPT_OUT propagation to "
+                    f"Griptape rejected {node_name}.{output_name} propagation to "
                     f"{target_node_name}.{target_parameter_name}."
                 )
             )
+
+
+def _notify_prompt_shot_media_outputs(
+    node: Any,
+    synchronized_outputs: Sequence[tuple[str, List[str]]],
+) -> None:
+    """Publish changed Shot media after both caches are atomically staged."""
+
+    if bool(getattr(node, "_hmb_node_deleted", False)) or not synchronized_outputs:
+        return
+    generation = int(
+        getattr(node, "_hmb_shot_media_notification_generation", 0) or 0
+    ) + 1
+    node._hmb_shot_media_notification_generation = generation
+    node._hmb_pending_shot_media_notifications = {
+        name: (generation, list(value))
+        for name, value in synchronized_outputs
+    }
+    publisher = getattr(node, "publish_update_to_parameter", None)
+    pending = getattr(node, "_hmb_pending_shot_media_notifications", {})
+    if not isinstance(pending, dict):
+        return
+    for name, pending_item in list(pending.items()):
+        if bool(getattr(node, "_hmb_node_deleted", False)):
+            return
+        current = getattr(node, "_hmb_pending_shot_media_notifications", {})
+        if not isinstance(current, dict) or current.get(name) is not pending_item:
+            continue
+        owner_generation, value = pending_item
+        try:
+            if callable(publisher):
+                publisher(name, value)
+            if bool(getattr(node, "_hmb_node_deleted", False)):
+                return
+            current = getattr(node, "_hmb_pending_shot_media_notifications", {})
+            if (
+                not isinstance(current, dict)
+                or current.get(name) is not pending_item
+                or pending_item[0] != owner_generation
+            ):
+                continue
+            if not _is_prompt_output_side_effect_callback(node):
+                _propagate_prompt_output_to_connections(
+                    node,
+                    value,
+                    owner_pending=pending_item,
+                    output_name=name,
+                    pending_attribute="_hmb_pending_shot_media_notifications",
+                )
+        except Exception:
+            current = getattr(node, "_hmb_pending_shot_media_notifications", {})
+            if isinstance(current, dict) and current.get(name) is pending_item:
+                raise
+            continue
+        current = getattr(node, "_hmb_pending_shot_media_notifications", {})
+        if isinstance(current, dict) and current.get(name) is pending_item:
+            current.pop(name, None)
 
 
 def _stage_and_notify_prompt_output(
@@ -8159,6 +9798,8 @@ def _stage_and_notify_prompt_output(
     replace_pending: bool = True,
 ) -> None:
     """Stage PROMPT_OUT before notifying an already-connected downstream node."""
+    if bool(getattr(node, "_hmb_node_deleted", False)):
+        return
     if stage_output:
         set_output(node, "PROMPT_OUT", value)
     if replace_pending:
@@ -8183,6 +9824,8 @@ def _stage_and_notify_prompt_output(
     try:
         if callable(publisher):
             publisher("PROMPT_OUT", pending_value)
+        if bool(getattr(node, "_hmb_node_deleted", False)):
+            return
         current_pending = getattr(
             node,
             "_hmb_pending_prompt_notification",
@@ -8252,6 +9895,9 @@ class HMBPromptLibrary(DataNode):
     """
 
     def __init__(self, **kwargs: Any):
+        self._hmb_node_deleted = False
+        self._hmb_delete_parent_called = False
+        self._hmb_deletion_reconcile_called = False
         # The host may deliver widget value callbacks after a later UI edit has
         # already been accepted.  Keep a per-node canonical baseline so an old
         # callback cannot replace the newer dashboard before deferred prompt
@@ -8260,6 +9906,22 @@ class HMBPromptLibrary(DataNode):
         self._hmb_last_accepted_widget_revisions = (0, 0)
         self._hmb_widget_write_in_progress = False
         self._hmb_restoring_widget_state = False
+        # Publisher instance UUIDs and routing generations are intentionally
+        # process-local. A saved Flow therefore contains valid media ownership
+        # together with watermarks that cannot match the newly constructed
+        # ImageAsset/VideoPicker instances. Arm one narrowly scoped rebase when
+        # the host hydrates such a saved dashboard. The first successful exact
+        # graph-source projection consumes it; all later live updates continue
+        # to use strict monotonic validation.
+        self._hmb_routing_hydration_rebase_pending = False
+        self._hmb_routing_hydration_epoch_started = False
+        # A newly dragged Prompt should immediately adopt the ImageAsset's
+        # active Shot and exact Picker snapshot. Serialized workflows disable
+        # this one-shot path as soon as their initial widget state arrives, so
+        # an intentionally saved Only selection remains Only after reload.
+        self._hmb_initial_shot_autoclaim_pending = True
+        self._hmb_initial_shot_preferred_uuid = ""
+        self._hmb_initial_shot_exact_refresh_pending = False
         super().__init__(**kwargs)
         self.category = "HMB_GP_Production"
         self.description = (
@@ -8270,6 +9932,15 @@ class HMBPromptLibrary(DataNode):
         self._hmb_ui_syncing = False
         self._hmb_picker_connected = False
         self._hmb_image_asset_connected = False
+        self._hmb_connected_source_nodes: Dict[str, Any] = {}
+        self._hmb_current_shot_images: List[str] = []
+        self._hmb_current_shot_videos: List[str] = []
+        self._hmb_last_shot_context: Dict[str, Any] = {}
+        self._hmb_last_agent_context_pair: Dict[str, Any] = {}
+        self._hmb_agent_pair_local = threading.local()
+        self._hmb_shot_route_status: Dict[str, Any] = {}
+        self._hmb_shared_routing_in_progress = False
+        self._hmb_compact_route_syncing = False
         self._hmb_sync_lock = threading.RLock()
         self._hmb_output_side_effect_local = threading.local()
         self._hmb_sync_generation = 0
@@ -8279,6 +9950,10 @@ class HMBPromptLibrary(DataNode):
         self._hmb_prompt_snapshot_generation = 0
         self._hmb_prompt_notification_generation = 0
         self._hmb_pending_prompt_notification = None
+        self._hmb_shot_media_notification_generation = 0
+        self._hmb_pending_shot_media_notifications: Dict[
+            str, tuple[int, List[str]]
+        ] = {}
         self._hmb_source_input_fingerprints = {
             PICKER_INPUT_PARAMETER_NAME: _connected_source_fingerprint({}, False),
             IMAGE_ASSET_INPUT_PARAMETER_NAME: _connected_source_fingerprint(
@@ -8294,6 +9969,8 @@ class HMBPromptLibrary(DataNode):
 
         _add_image_asset_input(self)
         _add_picker_input(self)
+        _add_shot_asset_input(self)
+        _add_shot_picker_input(self)
         self._ensure_prompt_output()
         add_group(self, "A_HMB_PROMPT_LIBRARY_DASHBOARD", "HMB_GP_Production", collapsed=False)
         _add_widget_state_parameter(self)
@@ -8305,6 +9982,47 @@ class HMBPromptLibrary(DataNode):
             self._sync_prompt_output_from_state()
         except Exception as exc:
             _diagnostic_exception("Initial PROMPT_OUT synchronization failed", exc)
+        try:
+            from _hmb_shot_routing import schedule_post_registration_reconcile
+
+            schedule_post_registration_reconcile(self)
+        except Exception as exc:
+            _diagnostic_exception("Initial Shot routing schedule failed", exc)
+
+    @staticmethod
+    def _state_has_persisted_shot_routing(value: Any) -> bool:
+        state = value if isinstance(value, dict) else _parse_state(value)
+        if not isinstance(state, dict) or not state:
+            return False
+        image_asset = state.get("image_asset")
+        picker = state.get("picker")
+        return bool(
+            isinstance(image_asset, dict)
+            and (
+                _normalize_shot_catalog_routing(
+                    image_asset.get("shot_catalog_routing")
+                )
+                or _normalize_shot_routing(image_asset.get("shot_routing"))
+            )
+            or isinstance(picker, dict)
+            and _normalize_shot_routing(picker.get("shot_routing"))
+        )
+
+    def _arm_routing_hydration_rebase(self, value: Any) -> None:
+        if bool(getattr(self, "_hmb_routing_hydration_epoch_started", False)):
+            return
+        if not self._state_has_persisted_shot_routing(value):
+            return
+        self._hmb_routing_hydration_epoch_started = True
+        self._hmb_routing_hydration_rebase_pending = True
+
+    def _routing_watermark_for_validation(self, value: Any) -> Any:
+        if bool(getattr(self, "_hmb_routing_hydration_rebase_pending", False)):
+            return {}
+        return value
+
+    def _consume_routing_hydration_rebase(self) -> None:
+        self._hmb_routing_hydration_rebase_pending = False
 
     def _ensure_prompt_output(self) -> None:
         try:
@@ -8316,9 +10034,25 @@ class HMBPromptLibrary(DataNode):
         except Exception as exc:
             _diagnostic_exception("PICKER_IN parameter setup failed", exc)
         try:
+            _add_shot_asset_input(self)
+        except Exception as exc:
+            _diagnostic_exception("SHOT_ASSET_IN parameter setup failed", exc)
+        try:
+            _add_shot_picker_input(self)
+        except Exception as exc:
+            _diagnostic_exception("SHOT_PICKER_IN parameter setup failed", exc)
+        try:
             _add_prompt_output(self)
         except Exception as exc:
             _diagnostic_exception("PROMPT_OUT parameter setup failed", exc)
+        for name in (
+            SHOT_IMAGE_OUTPUT_PARAMETER_NAME,
+            SHOT_VIDEO_OUTPUT_PARAMETER_NAME,
+        ):
+            try:
+                _add_shot_media_output(self, name)
+            except Exception as exc:
+                _diagnostic_exception(f"{name} parameter setup failed", exc)
 
     def _reconcile_connected_source_inputs_from_graph(self) -> bool:
         """Refresh source inputs from their actual connected output caches.
@@ -8372,17 +10106,38 @@ class HMBPromptLibrary(DataNode):
         source_targets = {
             PICKER_INPUT_PARAMETER_NAME,
             IMAGE_ASSET_INPUT_PARAMETER_NAME,
+            SHOT_ASSET_INPUT_PARAMETER_NAME,
+            SHOT_PICKER_INPUT_PARAMETER_NAME,
         }
+        incoming_groups: Dict[str, List[Any]] = {
+            name: [] for name in source_targets
+        }
+        for connection in result.incoming_connections:
+            target_name = _clean_string(
+                getattr(connection, "target_parameter_name", "")
+            )
+            if target_name in incoming_groups:
+                incoming_groups[target_name].append(connection)
+        duplicated = [
+            name for name, connections in incoming_groups.items()
+            if len(connections) > 1
+        ]
+        if duplicated:
+            raise _ShotRoutingContractError(
+                "Duplicate shot/source publisher connection: "
+                + ", ".join(sorted(duplicated))
+            )
         incoming_by_target = {
-            _clean_string(getattr(connection, "target_parameter_name", "")): connection
-            for connection in result.incoming_connections
-            if _clean_string(getattr(connection, "target_parameter_name", ""))
-            in source_targets
+            name: connections[0]
+            for name, connections in incoming_groups.items()
+            if connections
         }
         self._hmb_picker_connected = PICKER_INPUT_PARAMETER_NAME in incoming_by_target
         self._hmb_image_asset_connected = (
             IMAGE_ASSET_INPUT_PARAMETER_NAME in incoming_by_target
+            or SHOT_ASSET_INPUT_PARAMETER_NAME in incoming_by_target
         )
+        self._hmb_connected_source_nodes = {}
         sentinel = object()
         parent_setter = getattr(super(), "set_parameter_value", None)
         if not callable(parent_setter):
@@ -8411,6 +10166,7 @@ class HMBPromptLibrary(DataNode):
                 )
             except Exception:
                 continue
+            self._hmb_connected_source_nodes[target_name] = source_node
             value: Any = sentinel
             output_values = getattr(source_node, "parameter_output_values", {})
             if source_parameter_name in output_values:
@@ -8436,6 +10192,798 @@ class HMBPromptLibrary(DataNode):
                 parent_setter(target_name, value, initial_setup=True)
         return True
 
+    def _apply_exact_shot_routes(
+        self,
+        state: Dict[str, Any],
+        *,
+        image_source_node: Any = None,
+        picker_source_node: Any = None,
+    ) -> tuple[Dict[str, Any], List[str], List[str], bool, bool]:
+        """Project one graph-owned shot generation onto Prompt state/media."""
+
+        normalized = _normalize_state(state)
+        sources = getattr(self, "_hmb_connected_source_nodes", {})
+        legacy_image_source_selected = False
+        if image_source_node is None and isinstance(sources, dict):
+            compact_image_source = sources.get(SHOT_ASSET_INPUT_PARAMETER_NAME)
+            legacy_image_source = sources.get(IMAGE_ASSET_INPUT_PARAMETER_NAME)
+            if (
+                compact_image_source is not None
+                and legacy_image_source is not None
+                and compact_image_source is not legacy_image_source
+            ):
+                raise _ShotRoutingContractError(
+                    "Duplicate ImageAsset shot publishers are connected."
+                )
+            # New automatic routing uses only the compact dependency. A saved
+            # legacy IMAGE_ASSET_IN edge remains a supported exact-source
+            # fallback, but its serialized rich payload is never preferred.
+            image_source_node = compact_image_source or legacy_image_source
+            legacy_image_source_selected = bool(
+                compact_image_source is None and legacy_image_source is not None
+            )
+        if picker_source_node is None and isinstance(sources, dict):
+            picker_source_node = sources.get(SHOT_PICKER_INPUT_PARAMETER_NAME)
+
+        current_shot = _normalize_shot_selection(normalized.get("shot"))
+        # IMAGE_ASSET_IN predates Shot routing and intentionally accepts any
+        # third-party source.  Keep that legacy wildcard contract while Shot
+        # mode is disabled; only a compact SHOT_ASSET_IN edge or an explicitly
+        # persisted Shot identity may require the private exact-snapshot API.
+        if legacy_image_source_selected and not (
+            current_shot["channel_uuid"] and current_shot["shot_uuid"]
+        ):
+            image_source_node = None
+        expected_channel = current_shot["channel_uuid"]
+        image_media: List[str] = []
+        video_media: List[str] = []
+        image_exact = False
+        picker_exact = False
+
+        image_api = getattr(
+            image_source_node, "_hmb_shot_routing_snapshot", None
+        )
+        if image_source_node is not None and not callable(image_api):
+            raise _ShotRoutingContractError(
+                "Connected ImageAsset publisher has no exact Shot snapshot API."
+            )
+        if callable(image_api):
+            image_exact = True
+            raw_snapshot = image_api(expected_channel_uuid=expected_channel)
+            image_snapshot = _validate_shot_routing_snapshot(
+                raw_snapshot,
+                expected_channel_uuid=expected_channel,
+                max_selected_sources=MAX_SHOT_IMAGES,
+            )
+            _assert_monotonic_shot_route(
+                self._routing_watermark_for_validation(
+                    normalized.get("image_asset", {}).get("shot_routing")
+                    if isinstance(normalized.get("image_asset"), dict)
+                    else {}
+                ),
+                image_snapshot,
+                label="ImageAsset shot routing",
+            )
+            compact_catalog = _compact_catalog_from_snapshot(image_snapshot)
+            selected_uuid_exists = any(
+                item["shot_uuid"] == current_shot["shot_uuid"]
+                for item in image_snapshot["shots"]
+            )
+            if not (
+                current_shot["channel_uuid"]
+                and current_shot["shot_uuid"]
+                and selected_uuid_exists
+            ):
+                # A verified publisher supplies choices, not an activation.
+                # Restore the independent rows and keep Only selected until the
+                # user explicitly chooses one of those backend-owned UUIDs.
+                normalized = _apply_image_asset_payload(
+                    normalized, {}, connected=False
+                )
+                normalized["shot"] = _normalize_shot_selection({})
+                image_asset = (
+                    normalized.get("image_asset")
+                    if isinstance(normalized.get("image_asset"), dict)
+                    else {}
+                )
+                image_asset["shot_catalog"] = (
+                    self._hmb_available_prompt_shot_catalog(
+                        _shot_catalog_from_snapshot(image_snapshot),
+                        current_shot,
+                    )
+                )
+                image_asset["shot_catalog_routing"] = (
+                    _catalog_routing_projection(compact_catalog)
+                )
+                image_asset["shot_routing"] = {}
+                normalized["image_asset"] = image_asset
+                current_shot = _normalize_shot_selection({})
+                expected_channel = ""
+            else:
+                selected_shot = _select_routed_shot(
+                    image_snapshot, current_shot
+                )
+                payload, image_media = _shot_image_payload_from_snapshot(
+                    image_snapshot, selected_shot
+                )
+                normalized["shot"] = selected_shot
+                normalized = _apply_image_asset_payload(
+                    normalized, payload, connected=True
+                )
+                projected_image_uids = [
+                    _clean_string(
+                        item.get("asset_source_uid") or item.get("source_uid")
+                    )
+                    for item in normalized.get("images", [])
+                    if isinstance(item, dict)
+                    and bool(item.get("asset_managed"))
+                ]
+                if projected_image_uids != selected_shot["selected_source_uids"]:
+                    raise _ShotRoutingContractError(
+                        "Prompt image rows do not match the active Shot media order."
+                    )
+                normalized["shot"] = selected_shot
+                image_asset = (
+                    normalized.get("image_asset")
+                    if isinstance(normalized.get("image_asset"), dict)
+                    else {}
+                )
+                image_asset["shot_catalog"] = (
+                    self._hmb_available_prompt_shot_catalog(
+                        _shot_catalog_from_snapshot(image_snapshot),
+                        current_shot,
+                    )
+                )
+                image_asset["shot_catalog_routing"] = (
+                    _catalog_routing_projection(compact_catalog)
+                )
+                image_asset["shot_routing"] = _routing_projection(
+                    image_snapshot, selected_shot["selected_source_uids"]
+                )
+                normalized["image_asset"] = image_asset
+                current_shot = selected_shot
+                expected_channel = selected_shot["channel_uuid"]
+
+        picker_api = getattr(
+            picker_source_node, "_hmb_shot_routing_snapshot", None
+        )
+        if picker_source_node is not None and not callable(picker_api):
+            raise _ShotRoutingContractError(
+                "Connected VideoPicker publisher has no exact Shot snapshot API."
+            )
+        picker_subscription_api = getattr(
+            picker_source_node, "_hmb_shot_channel_subscription", None
+        )
+        if callable(picker_api) and callable(picker_subscription_api):
+            picker_subscription = picker_subscription_api()
+            if (
+                isinstance(picker_subscription, dict)
+                and picker_subscription.get("participant_kind") == "video_picker"
+                and not bool(picker_subscription.get("enabled"))
+            ):
+                # VideoPicker's independent Only mode is valid even while this
+                # Prompt uses an ImageAsset Shot. A managed edge can survive
+                # for one retained-mode callback during hydration/deletion;
+                # do not ask that disabled Picker for remote Shot authority.
+                picker_exact = True
+                normalized = _apply_picker_payload(
+                    normalized, {}, connected=False
+                )
+                picker_api = None
+        if callable(picker_api):
+            if not expected_channel or not current_shot["shot_uuid"]:
+                # Picker may remain connected while Prompt runs independently.
+                # It is another remote choice consumer and must not force Shot 1.
+                picker_exact = True
+                normalized = _apply_picker_payload(
+                    normalized, {}, connected=False
+                )
+                normalized["shot"] = _normalize_shot_selection({})
+                normalized = _normalize_state(normalized)
+                return (
+                    normalized,
+                    image_media,
+                    video_media,
+                    image_exact,
+                    picker_exact,
+                )
+            picker_exact = True
+            picker_snapshot = _validate_picker_shot_routing_snapshot(
+                picker_api(expected_channel_uuid=expected_channel),
+                expected_channel_uuid=expected_channel,
+            )
+            _assert_monotonic_shot_route(
+                self._routing_watermark_for_validation(
+                    normalized.get("picker", {}).get("shot_routing")
+                    if isinstance(normalized.get("picker"), dict)
+                    else {}
+                ),
+                picker_snapshot,
+                label="VideoPicker shot routing",
+            )
+            picker_shot = next(
+                (
+                    item
+                    for item in picker_snapshot["shots"]
+                    if item["shot_uuid"] == current_shot["shot_uuid"]
+                ),
+                None,
+            )
+            if picker_shot is None:
+                raise _ShotRoutingContractError(
+                    "Picker routing does not contain the active Prompt shot."
+                )
+            if (
+                int(picker_shot["number"]) != int(current_shot["number"])
+                or picker_shot["name"] != current_shot["name"]
+            ):
+                raise _ShotRoutingContractError(
+                    "Picker and ImageAsset shot metadata do not match."
+                )
+            normalized = _apply_picker_payload(
+                normalized,
+                copy.deepcopy(picker_shot["picker_payload"]),
+                connected=True,
+            )
+            projected_video_uids = [
+                _clean_string(uid)
+                for uid in (
+                    normalized.get("picker", {}).get("ordered_video_uids", [])
+                    if isinstance(normalized.get("picker"), dict)
+                    else []
+                )
+            ]
+            if projected_video_uids != picker_shot["selected_source_uids"]:
+                raise _ShotRoutingContractError(
+                    "Prompt video rows do not match the active Shot media order."
+                )
+            normalized["shot"] = current_shot
+            picker_state = (
+                normalized.get("picker")
+                if isinstance(normalized.get("picker"), dict)
+                else {}
+            )
+            picker_state["shot_catalog"] = _shot_catalog_from_snapshot(
+                picker_snapshot
+            )
+            picker_state["shot_routing"] = _routing_projection(
+                picker_snapshot, picker_shot["selected_source_uids"]
+            )
+            normalized["picker"] = picker_state
+            video_media = [
+                picker_snapshot["media_by_source_uid"][uid]
+                for uid in picker_shot["selected_source_uids"]
+            ]
+
+        normalized = _normalize_state(normalized)
+        return (
+            normalized,
+            image_media,
+            video_media,
+            image_exact,
+            picker_exact,
+        )
+
+    def _hmb_shot_channel_subscription(self) -> Dict[str, Any]:
+        """Return the durable selector identity used by the edge helper."""
+
+        shot = _normalize_shot_selection(self._current_state().get("shot"))
+        return {
+            "schema": "hmb-shot-channel-subscription",
+            "version": 1,
+            "participant_kind": "prompt",
+            "enabled": bool(shot["channel_uuid"] and shot["shot_uuid"]),
+            "channel_uuid": shot["channel_uuid"],
+            "shot_uuid": shot["shot_uuid"],
+            "shot_number": shot["number"],
+            "shot_name": shot["name"],
+        }
+
+    def _hmb_available_prompt_shot_catalog(
+        self,
+        catalog: Any,
+        current_shot: Any = None,
+    ) -> List[Dict[str, Any]]:
+        """Hide Shot UUIDs already assigned to another Prompt in this flow."""
+
+        normalized_catalog = _normalize_shot_catalog(catalog)
+        if not normalized_catalog:
+            return []
+        current = _normalize_shot_selection(
+            current_shot
+            if isinstance(current_shot, dict)
+            else self._current_state().get("shot")
+        )
+        channel_uuid = _clean_string(
+            normalized_catalog[0].get("channel_uuid")
+        )
+        claimed: set[str] = set()
+        try:
+            from _hmb_shot_routing import _same_flow_nodes
+
+            _flow_name, nodes = _same_flow_nodes(self)
+        except Exception:
+            nodes = []
+        for candidate in nodes:
+            if candidate is self or bool(getattr(candidate, "_hmb_node_deleted", False)):
+                continue
+            getter = getattr(candidate, "_hmb_shot_channel_subscription", None)
+            if not callable(getter):
+                continue
+            try:
+                subscription = getter()
+            except Exception:
+                continue
+            if (
+                isinstance(subscription, dict)
+                and subscription.get("participant_kind") == "prompt"
+                and subscription.get("enabled")
+                and subscription.get("channel_uuid") == channel_uuid
+                and subscription.get("shot_uuid")
+            ):
+                claimed.add(_clean_string(subscription["shot_uuid"]))
+        current_uuid = (
+            current["shot_uuid"]
+            if current["channel_uuid"] == channel_uuid
+            else ""
+        )
+        return [
+            copy.deepcopy(item)
+            for item in normalized_catalog
+            if item["shot_uuid"] not in claimed
+            or item["shot_uuid"] == current_uuid
+        ]
+
+    def _hmb_filter_prompt_widget_write(self, value: Any) -> Any:
+        """Reject stale/browser attempts to claim another Prompt's Shot."""
+
+        incoming = value if isinstance(value, dict) else _parse_state(value)
+        if not isinstance(incoming, dict) or not incoming:
+            return value
+        state = _normalize_state(copy.deepcopy(incoming))
+        current = _normalize_shot_selection(self._current_state().get("shot"))
+        image_asset = (
+            state.get("image_asset")
+            if isinstance(state.get("image_asset"), dict)
+            else {}
+        )
+        source_catalog = _normalize_shot_catalog(
+            image_asset.get("shot_catalog")
+        )
+        if not source_catalog:
+            return value
+        available_catalog = self._hmb_available_prompt_shot_catalog(
+            source_catalog,
+            current,
+        )
+        available_uuids = {
+            item["shot_uuid"] for item in available_catalog
+        }
+        requested = _normalize_shot_selection(state.get("shot"))
+        if requested["shot_uuid"] and requested["shot_uuid"] not in available_uuids:
+            state["shot"] = (
+                current
+                if current["shot_uuid"] in available_uuids
+                else _normalize_shot_selection({})
+            )
+        image_asset["shot_catalog"] = available_catalog
+        state["image_asset"] = image_asset
+        picker = (
+            state.get("picker")
+            if isinstance(state.get("picker"), dict)
+            else {}
+        )
+        picker["shot_catalog"] = [
+            item
+            for item in _normalize_shot_catalog(picker.get("shot_catalog"))
+            if item["shot_uuid"] in available_uuids
+        ]
+        state["picker"] = picker
+        return _json_dumps(_normalize_state(state))
+
+    def _hmb_post_registration_shot_discovery(self) -> None:
+        """Discover already-running Shot publishers for a newly dragged node."""
+
+        if not bool(getattr(self, "_hmb_initial_shot_autoclaim_pending", False)):
+            return
+        self._reconcile_shared_shot_edges()
+
+    def _hmb_prepare_initial_shot_selection(self, shot_uuid: Any = "") -> None:
+        """Capture ImageAsset's active UUID before accepting its first catalog."""
+
+        if not bool(getattr(self, "_hmb_initial_shot_autoclaim_pending", False)):
+            return
+        current = _normalize_shot_selection(self._current_state().get("shot"))
+        if current["channel_uuid"] or current["shot_uuid"]:
+            self._hmb_initial_shot_autoclaim_pending = False
+            return
+        self._hmb_initial_shot_preferred_uuid = _clean_string(shot_uuid)
+
+    def _hmb_finalize_initial_shot_discovery(self) -> None:
+        """Read exact ImageAsset/VideoPicker outputs after managed edges exist."""
+
+        if not bool(
+            getattr(self, "_hmb_initial_shot_exact_refresh_pending", False)
+        ):
+            return
+        self._hmb_initial_shot_exact_refresh_pending = False
+        try:
+            self._hmb_reconcile_shot_routing()
+        except Exception:
+            self._hmb_initial_shot_exact_refresh_pending = True
+            raise
+
+    def _hmb_reject_duplicate_shot_selection(
+        self, reason: str = "duplicate_prompt_shot"
+    ) -> Dict[str, Any]:
+        """Return only this Prompt selector to Only after a 1:1 collision.
+
+        Remote catalog choices and all manual Prompt rows remain durable.  The
+        graph coordinator performs the subsequent edge reconciliation, so this
+        narrow callback deliberately does not compile or publish PROMPT_OUT.
+        """
+
+        with self._hmb_sync_lock:
+            current = self._current_state()
+            current_image_asset = (
+                current.get("image_asset")
+                if isinstance(current.get("image_asset"), dict)
+                else {}
+            )
+            current_picker = (
+                current.get("picker")
+                if isinstance(current.get("picker"), dict)
+                else {}
+            )
+            image_catalog = self._hmb_available_prompt_shot_catalog(
+                current_image_asset.get("shot_catalog", []),
+                {},
+            )
+            image_catalog_routing = copy.deepcopy(
+                current_image_asset.get("shot_catalog_routing", {})
+            )
+            available_uuids = {
+                item["shot_uuid"] for item in image_catalog
+            }
+            picker_catalog = [
+                item
+                for item in _normalize_shot_catalog(
+                    current_picker.get("shot_catalog", [])
+                )
+                if item["shot_uuid"] in available_uuids
+            ]
+            # Release exact upstream authority through the standard no-loss
+            # disconnect paths. Selected remote rows may remain as ordinary
+            # native content, while dormant manual rows are restored exactly.
+            state = _apply_image_asset_payload(
+                copy.deepcopy(current), {}, connected=False
+            )
+            state = _apply_picker_payload(state, {}, connected=False)
+            state["shot"] = _normalize_shot_selection({})
+            image_asset = (
+                state.get("image_asset")
+                if isinstance(state.get("image_asset"), dict)
+                else {}
+            )
+            image_asset["shot_catalog"] = image_catalog
+            image_asset["shot_catalog_routing"] = image_catalog_routing
+            image_asset["shot_routing"] = {}
+            state["image_asset"] = image_asset
+            picker = (
+                state.get("picker")
+                if isinstance(state.get("picker"), dict)
+                else {}
+            )
+            picker["shot_catalog"] = picker_catalog
+            picker["shot_routing"] = {}
+            state["picker"] = picker
+            normalized = _normalize_state(state)
+            self._hmb_current_shot_images = []
+            self._hmb_current_shot_videos = []
+            self._hmb_last_shot_context = {}
+            self._hmb_last_agent_context_pair = {}
+            self._hmb_shot_route_status = {
+                "ok": False,
+                "code": _clean_string(reason)[:128] or "duplicate_prompt_shot",
+            }
+            if normalized != current:
+                self._hmb_compact_route_syncing = True
+                try:
+                    _set_parameter_value(
+                        self, WIDGET_PARAMETER_NAME, _json_dumps(normalized)
+                    )
+                finally:
+                    self._hmb_compact_route_syncing = False
+            return self._hmb_shot_channel_subscription()
+
+    def _hmb_clear_shot_routing_catalog(
+        self, reason: str = "publisher_unavailable"
+    ) -> Dict[str, Any]:
+        """Drop remote Shot authority without deleting independent content.
+
+        The graph helper calls this when the ImageAsset publisher disappears or
+        becomes ambiguous.  Restore dormant manual rows and immediately publish
+        the resulting local-only Prompt/media generation so downstream nodes can
+        never retain the removed publisher's Shot outputs.
+        """
+
+        with self._hmb_sync_lock:
+            current = self._current_state()
+            state = _apply_image_asset_payload(current, {}, connected=False)
+            state = _apply_picker_payload(state, {}, connected=False)
+            state["shot"] = _normalize_shot_selection({})
+            image_asset = (
+                state.get("image_asset")
+                if isinstance(state.get("image_asset"), dict)
+                else {}
+            )
+            image_asset["shot_catalog"] = []
+            image_asset["shot_catalog_routing"] = {}
+            image_asset["shot_routing"] = {}
+            state["image_asset"] = image_asset
+            picker = (
+                state.get("picker")
+                if isinstance(state.get("picker"), dict)
+                else {}
+            )
+            picker["shot_catalog"] = []
+            picker["shot_routing"] = {}
+            state["picker"] = picker
+            normalized = _normalize_state(state)
+            if normalized != current:
+                try:
+                    previous_source_revision = max(
+                        0,
+                        int(current.get(SOURCE_SYNC_REVISION_KEY) or 0),
+                    )
+                except Exception:
+                    previous_source_revision = 0
+                normalized[SOURCE_SYNC_REVISION_KEY] = min(
+                    MAX_SOURCE_SYNC_REVISION,
+                    previous_source_revision + 1,
+                )
+                normalized = _normalize_state(normalized)
+            self._hmb_current_shot_images = []
+            self._hmb_current_shot_videos = []
+            self._hmb_last_shot_context = {}
+            self._hmb_last_agent_context_pair = {}
+            self._hmb_shot_route_status = {
+                "ok": False,
+                "code": _clean_string(reason)[:128] or "publisher_unavailable",
+            }
+            if normalized != current:
+                self._hmb_compact_route_syncing = True
+                try:
+                    _set_parameter_value(
+                        self, WIDGET_PARAMETER_NAME, _json_dumps(normalized)
+                    )
+                finally:
+                    self._hmb_compact_route_syncing = False
+            # The widget setter above is deliberately non-recursive. Compile
+            # the restored local/Only state explicitly and publish both media
+            # caches before PROMPT_OUT as one paired Prompt generation. Empty
+            # video ownership remains the valid [] no-video contract.
+            self._sync_prompt_output_from_state(publish_shot_media=True)
+            return self._hmb_shot_channel_subscription()
+
+    def _hmb_reconcile_shot_routing(
+        self,
+        routing_snapshot: Any = None,
+        image_source_node: Any = None,
+        picker_source_node: Any = None,
+    ) -> Dict[str, Any]:
+        """Helper hook for atomic auto-edge setup/reconciliation."""
+
+        with self._hmb_sync_lock:
+            if routing_snapshot is not None:
+                state = self._current_state()
+                current = _normalize_shot_selection(state.get("shot"))
+                catalog = _validate_shot_routing_catalog(
+                    routing_snapshot,
+                    expected_channel_uuid=current["channel_uuid"],
+                )
+                image_asset = (
+                    state.get("image_asset")
+                    if isinstance(state.get("image_asset"), dict)
+                    else {}
+                )
+                _assert_monotonic_shot_catalog(
+                    self._routing_watermark_for_validation(
+                        image_asset.get("shot_catalog_routing")
+                    ),
+                    catalog,
+                )
+                previous_catalog = _normalize_shot_catalog(
+                    image_asset.get("shot_catalog")
+                )
+                selected_by_uuid = {
+                    item["shot_uuid"]: list(item["selected_source_uids"])
+                    for item in previous_catalog
+                }
+                if current["shot_uuid"]:
+                    selected_by_uuid[current["shot_uuid"]] = list(
+                        current["selected_source_uids"]
+                    )
+                full_compact_shots = [
+                    {
+                        "shot_uuid": item["shot_uuid"],
+                        "channel_uuid": catalog["channel_uuid"],
+                        "name": item["name"],
+                        "number": item["number"],
+                        # A compact callback may preserve a selection that was
+                        # already proven by a full exact-source compile, but it
+                        # can never introduce a source address itself.
+                        "selected_source_uids": selected_by_uuid.get(
+                            item["shot_uuid"], []
+                        ),
+                    }
+                    for item in catalog["shots"]
+                ]
+                compact_shots = self._hmb_available_prompt_shot_catalog(
+                    full_compact_shots,
+                    current,
+                )
+                selected = next(
+                    (
+                        item for item in compact_shots
+                        if item["shot_uuid"] == current["shot_uuid"]
+                    ),
+                    None,
+                )
+                initial_autoclaim = bool(
+                    selected is None
+                    and not current["channel_uuid"]
+                    and not current["shot_uuid"]
+                    and getattr(
+                        self,
+                        "_hmb_initial_shot_autoclaim_pending",
+                        False,
+                    )
+                    and compact_shots
+                )
+                if initial_autoclaim:
+                    preferred_uuid = _clean_string(
+                        getattr(
+                            self,
+                            "_hmb_initial_shot_preferred_uuid",
+                            "",
+                        )
+                    )
+                    selected = next(
+                        (
+                            item for item in compact_shots
+                            if item["shot_uuid"] == preferred_uuid
+                        ),
+                        compact_shots[0],
+                    )
+                if selected is None:
+                    # Blank recipients remain independently usable. The same
+                    # fallback also handles deletion of the active UUID; the
+                    # renumbered catalog stays available for a new explicit pick.
+                    state["shot"] = _normalize_shot_selection({})
+                else:
+                    state["shot"] = selected
+                if initial_autoclaim:
+                    self._hmb_initial_shot_autoclaim_pending = False
+                    self._hmb_initial_shot_preferred_uuid = ""
+                    self._hmb_initial_shot_exact_refresh_pending = True
+                image_asset["shot_catalog"] = compact_shots
+                image_asset["shot_catalog_routing"] = (
+                    _catalog_routing_projection(catalog)
+                )
+                state["image_asset"] = image_asset
+                normalized = _normalize_state(state)
+                persisted = self._current_state()
+                if normalized != persisted:
+                    # A compact Shot catalog is backend source authority, not a
+                    # local dashboard edit.  Without advancing the source
+                    # revision, a retained-mode props echo can be rejected by
+                    # the widget whenever a more recent local UI revision is
+                    # present, leaving add/rename/delete options visibly stale.
+                    # Keep the UI revision untouched and advance only the
+                    # source watermark once for this accepted catalog
+                    # generation.
+                    try:
+                        previous_source_revision = max(
+                            0,
+                            int(
+                                persisted.get(SOURCE_SYNC_REVISION_KEY)
+                                or 0
+                            ),
+                        )
+                    except Exception:
+                        previous_source_revision = 0
+                    normalized[SOURCE_SYNC_REVISION_KEY] = min(
+                        MAX_SOURCE_SYNC_REVISION,
+                        previous_source_revision + 1,
+                    )
+                    normalized = _normalize_state(normalized)
+                    # One compact callback is only a change signal/catalog
+                    # refresh. Resolve the exact connected source snapshot and
+                    # publish PROMPT_OUT/Shot media in this same transaction;
+                    # otherwise a live ImageAsset membership/name edit can
+                    # leave already connected Prompt outputs stale until the
+                    # user touches or runs the Prompt node again.
+                    self._hmb_compact_route_syncing = True
+                    try:
+                        _set_parameter_value(
+                            self,
+                            WIDGET_PARAMETER_NAME,
+                            _json_dumps(normalized),
+                        )
+                    finally:
+                        self._hmb_compact_route_syncing = False
+                    # Active UUID deletion is also an authoritative change.
+                    # Compile it immediately so the Prompt returns to Only and
+                    # publishes empty Shot media instead of retaining the
+                    # deleted Shot until the next unrelated edit. A Prompt that
+                    # was already in Only receives choices only; asking it for
+                    # exact source data before managed edges exist would erase
+                    # the just-accepted catalog. The exact picker empty-
+                    # selection path remains valid and produces
+                    # SHOT_VIDEO_OUT=[] without an error.
+                    if (
+                        not initial_autoclaim
+                        and (selected is not None or current["shot_uuid"])
+                    ):
+                        self._sync_prompt_output_from_state(
+                            publish_shot_media=True,
+                        )
+                return self._hmb_shot_channel_subscription()
+            if image_source_node is None and picker_source_node is None:
+                self._reconcile_connected_source_inputs_from_graph()
+            state, images, videos, _image_exact, _picker_exact = (
+                self._apply_exact_shot_routes(
+                    self._current_state(),
+                    image_source_node=image_source_node,
+                    picker_source_node=picker_source_node,
+                )
+            )
+            self._hmb_current_shot_images = list(images)
+            self._hmb_current_shot_videos = list(videos)
+            _set_parameter_value(self, WIDGET_PARAMETER_NAME, _json_dumps(state))
+            if _image_exact or _picker_exact:
+                self._consume_routing_hydration_rebase()
+            self._sync_prompt_output_from_state(publish_shot_media=True)
+            return self._hmb_shot_channel_subscription()
+
+    def _hmb_shot_routing_status(self, value: Any) -> None:
+        if isinstance(value, dict):
+            self._hmb_shot_route_status = copy.deepcopy(value)
+
+    def _reconcile_shared_shot_edges(self) -> None:
+        if bool(getattr(self, "_hmb_node_deleted", False)) or self._hmb_shared_routing_in_progress:
+            return
+        try:
+            from _hmb_shot_routing import reconcile_shot_routing
+        except Exception:
+            return
+        try:
+            self._hmb_shared_routing_in_progress = True
+            result = reconcile_shot_routing(self)
+        finally:
+            self._hmb_shared_routing_in_progress = False
+        if not isinstance(result, dict) or bool(result.get("ok", True)):
+            return
+        node_prefix = _clean_string(getattr(self, "name", "")) + ":"
+        failures = result.get("failures")
+        own_failures = [
+            _clean_string(item)
+            for item in (failures if isinstance(failures, (list, tuple)) else [])
+            if _clean_string(item).startswith(node_prefix)
+        ]
+        if own_failures:
+            raise _ShotRoutingContractError("; ".join(own_failures))
+
+    def _schedule_post_hydration_shot_reconcile(self) -> bool:
+        """Re-run same-flow routing after the serialized selector is restored."""
+
+        try:
+            from _hmb_shot_routing import schedule_post_hydration_reconcile
+        except Exception:
+            return False
+        return bool(schedule_post_hydration_reconcile(self))
+
     def set_parameter_value(
         self,
         param_name: str,
@@ -8447,20 +10995,37 @@ class HMBPromptLibrary(DataNode):
     ) -> None:
         """Reconcile real source caches after initial Prompt hydration writes."""
 
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            return
+
         parent_setter = getattr(super(), "set_parameter_value")
         is_widget_write = param_name == WIDGET_PARAMETER_NAME
+        if is_widget_write and initial_setup:
+            self._hmb_initial_shot_autoclaim_pending = False
+            self._hmb_initial_shot_preferred_uuid = ""
+            self._hmb_initial_shot_exact_refresh_pending = False
+            self._arm_routing_hydration_rebase(value)
         guarded_widget_write = bool(
             is_widget_write
             and not initial_setup
             and not getattr(self, "_hmb_ui_syncing", False)
             and not getattr(self, "_hmb_restoring_widget_state", False)
         )
+        reconcile_revision_axes = bool(
+            is_widget_write
+            and not initial_setup
+            and not getattr(self, "_hmb_restoring_widget_state", False)
+        )
+        if reconcile_revision_axes:
+            value = self._merge_widget_revision_axes(value)
         if guarded_widget_write and self._widget_state_write_is_stale(value):
             # A stale request can arrive either before or after the host has
             # assigned its raw parameter value. Restore the accepted canonical
             # baseline in both cases and never compile the older selection.
             self._restore_accepted_widget_state()
             return
+        if guarded_widget_write:
+            value = self._hmb_filter_prompt_widget_write(value)
 
         previous_widget_state = getattr(
             self, "_hmb_last_accepted_widget_state", None
@@ -8499,6 +11064,8 @@ class HMBPromptLibrary(DataNode):
                 WIDGET_PARAMETER_NAME,
                 PICKER_INPUT_PARAMETER_NAME,
                 IMAGE_ASSET_INPUT_PARAMETER_NAME,
+                SHOT_ASSET_INPUT_PARAMETER_NAME,
+                SHOT_PICKER_INPUT_PARAMETER_NAME,
             }
             or getattr(self, "_hmb_hydration_reconciling", False)
             or not hasattr(self, "_hmb_sync_lock")
@@ -8515,6 +11082,7 @@ class HMBPromptLibrary(DataNode):
             )
         finally:
             self._hmb_hydration_reconciling = False
+            self._schedule_post_hydration_shot_reconcile()
 
     def _current_state(self) -> Dict[str, Any]:
         self._ensure_prompt_output()
@@ -8540,6 +11108,36 @@ class HMBPromptLibrary(DataNode):
             bounded_revision(SOURCE_SYNC_REVISION_KEY),
             bounded_revision(UI_EDIT_REVISION_KEY),
         )
+
+    def _merge_widget_revision_axes(self, value: Any) -> Any:
+        """Resolve crossed source/UI clocks without dropping either writer."""
+
+        incoming = value if isinstance(value, dict) else _parse_state(value)
+        accepted = _parse_state(
+            getattr(self, "_hmb_last_accepted_widget_state", None)
+        )
+        incoming_pair = self._widget_revision_pair(incoming)
+        accepted_pair = self._widget_revision_pair(accepted)
+        if incoming_pair is None or accepted_pair is None:
+            return value
+        incoming_source, incoming_ui = incoming_pair
+        accepted_source, accepted_ui = accepted_pair
+        source_is_newer = incoming_source > accepted_source
+        ui_is_newer = incoming_ui > accepted_ui
+        crossed = (source_is_newer and incoming_ui < accepted_ui) or (
+            ui_is_newer and incoming_source < accepted_source
+        )
+        source_advanced_without_ui = bool(
+            source_is_newer and incoming_ui <= accepted_ui
+        )
+        if not (crossed or source_advanced_without_ui):
+            return value
+        source_state = incoming if source_is_newer else accepted
+        ui_state = incoming if ui_is_newer else accepted
+        if source_advanced_without_ui:
+            ui_state = accepted
+        merged = _merge_prompt_revision_axes(source_state, ui_state)
+        return merged if isinstance(value, dict) else _json_dumps(merged)
 
     def _accept_widget_state_baseline(self, value: Any) -> None:
         state = value if isinstance(value, dict) else _parse_state(value)
@@ -8606,9 +11204,11 @@ class HMBPromptLibrary(DataNode):
             return False
         accepted_source, accepted_ui = self._hmb_last_accepted_widget_revisions
         incoming_source, incoming_ui = incoming
-        if incoming_source < accepted_source:
-            return True
-        return incoming_source == accepted_source and incoming_ui < accepted_ui
+        return bool(
+            incoming_source <= accepted_source
+            and incoming_ui <= accepted_ui
+            and (incoming_source, incoming_ui) != (accepted_source, accepted_ui)
+        )
 
     def _restore_accepted_widget_state(self) -> None:
         cached = self._hmb_last_accepted_widget_state
@@ -8651,6 +11251,15 @@ class HMBPromptLibrary(DataNode):
                 "_hmb_source_input_fingerprints",
                 {},
             )
+            (
+                state,
+                shot_images,
+                shot_videos,
+                image_exact,
+                picker_exact,
+            ) = self._apply_exact_shot_routes(state)
+            self._hmb_current_shot_images = list(shot_images)
+            self._hmb_current_shot_videos = list(shot_videos)
             image_asset_payload = _parse_image_asset_payload(
                 _get_parameter_raw(self, IMAGE_ASSET_INPUT_PARAMETER_NAME)
             )
@@ -8669,7 +11278,7 @@ class HMBPromptLibrary(DataNode):
                     )
                 ).startswith("persisted-image-asset:")
             )
-            if not pending_image_asset_hydration:
+            if not pending_image_asset_hydration and not image_exact:
                 state = _apply_image_asset_payload(
                     state,
                     image_asset_payload,
@@ -8688,6 +11297,18 @@ class HMBPromptLibrary(DataNode):
                     )
                 ).startswith("persisted-picker:")
             )
+            image_fingerprint_payload = (
+                {"shot_routing": state["image_asset"].get("shot_routing", {})}
+                if image_exact
+                else image_asset_payload
+            )
+            picker_fingerprint_payload = (
+                {"shot_routing": state["picker"].get("shot_routing", {})}
+                if picker_exact
+                else picker_payload
+            )
+            image_fingerprint_connected = image_exact or image_asset_connected
+            picker_fingerprint_connected = picker_exact or picker_connected
             source_input_fingerprints = {
                 IMAGE_ASSET_INPUT_PARAMETER_NAME: (
                     previous_source_fingerprints.get(
@@ -8696,8 +11317,8 @@ class HMBPromptLibrary(DataNode):
                     )
                     if pending_image_asset_hydration
                     else _connected_source_fingerprint(
-                        image_asset_payload,
-                        image_asset_connected,
+                        image_fingerprint_payload,
+                        image_fingerprint_connected,
                     )
                 ),
                 PICKER_INPUT_PARAMETER_NAME: (
@@ -8707,18 +11328,18 @@ class HMBPromptLibrary(DataNode):
                     )
                     if pending_picker_hydration
                     else _connected_source_fingerprint(
-                        picker_payload,
-                        picker_connected,
+                        picker_fingerprint_payload,
+                        picker_fingerprint_connected,
                     )
                 ),
             }
             source_payloads = {
-                IMAGE_ASSET_INPUT_PARAMETER_NAME: image_asset_payload,
-                PICKER_INPUT_PARAMETER_NAME: picker_payload,
+                IMAGE_ASSET_INPUT_PARAMETER_NAME: image_fingerprint_payload,
+                PICKER_INPUT_PARAMETER_NAME: picker_fingerprint_payload,
             }
             source_connections = {
-                IMAGE_ASSET_INPUT_PARAMETER_NAME: image_asset_connected,
-                PICKER_INPUT_PARAMETER_NAME: picker_connected,
+                IMAGE_ASSET_INPUT_PARAMETER_NAME: image_fingerprint_connected,
+                PICKER_INPUT_PARAMETER_NAME: picker_fingerprint_connected,
             }
             upstream_source_changed = False
             for name, fingerprint in source_input_fingerprints.items():
@@ -8744,7 +11365,7 @@ class HMBPromptLibrary(DataNode):
                 )
                 if not establishes_hydrated_baseline:
                     upstream_source_changed = True
-            if not pending_picker_hydration:
+            if not pending_picker_hydration and not picker_exact:
                 state = _apply_picker_payload(
                     state,
                     picker_payload,
@@ -8766,32 +11387,67 @@ class HMBPromptLibrary(DataNode):
             # parameter only when either operation actually changed its value.
             if state != current_state or not isinstance(raw_widget_value, str):
                 _set_parameter_value(self, WIDGET_PARAMETER_NAME, _json_dumps(state))
+            if image_exact or picker_exact:
+                self._consume_routing_hydration_rebase()
             self._hmb_source_input_fingerprints = source_input_fingerprints
             return state
         finally:
             self._hmb_ui_syncing = False
 
-    def _sync_prompt_output_from_state(self) -> Dict[str, Any]:
+    def _sync_prompt_output_from_state(
+        self,
+        *,
+        publish_shot_media: bool = False,
+    ) -> Dict[str, Any]:
         """Commit the latest widget state and refresh PROMPT_OUT immediately.
 
         The paid Agent may be run directly after editing the dashboard.  PROMPT_OUT
         must therefore never depend on a separate HMBPromptLibrary run or on the
         editor losing focus first.
         """
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            return {}
         state, prompt, machine_prompt, fingerprint = (
             self._compile_current_prompt_pair()
         )
         output_values = getattr(self, "parameter_output_values", {})
         output_getter = getattr(output_values, "get", None)
         current_output = output_getter("PROMPT_OUT") if callable(output_getter) else None
+        shot_images = list(getattr(self, "_hmb_current_shot_images", []))
+        shot_videos = list(getattr(self, "_hmb_current_shot_videos", []))
+        current_images = (
+            output_getter(SHOT_IMAGE_OUTPUT_PARAMETER_NAME)
+            if callable(output_getter)
+            else None
+        )
+        current_videos = (
+            output_getter(SHOT_VIDEO_OUTPUT_PARAMETER_NAME)
+            if callable(output_getter)
+            else None
+        )
         cached_output = getattr(self, "_hmb_last_prompt_output", None)
         cached_machine = getattr(self, "_hmb_last_machine_prompt_output", None)
+        changed_shot_outputs: List[tuple[str, List[str]]] = []
+        if current_images != shot_images:
+            changed_shot_outputs.append(
+                (SHOT_IMAGE_OUTPUT_PARAMETER_NAME, list(shot_images))
+            )
+        if current_videos != shot_videos:
+            changed_shot_outputs.append(
+                (SHOT_VIDEO_OUTPUT_PARAMETER_NAME, list(shot_videos))
+            )
         if (
             fingerprint
             == getattr(self, "_hmb_last_prompt_semantic_fingerprint", "")
             and cached_output is not None
             and cached_machine is not None
         ):
+            if current_images != shot_images:
+                set_output(self, SHOT_IMAGE_OUTPUT_PARAMETER_NAME, shot_images)
+            if current_videos != shot_videos:
+                set_output(self, SHOT_VIDEO_OUTPUT_PARAMETER_NAME, shot_videos)
+            if publish_shot_media:
+                _notify_prompt_shot_media_outputs(self, changed_shot_outputs)
             if current_output != cached_output:
                 _stage_and_notify_prompt_output(self, cached_output)
             elif getattr(self, "_hmb_pending_prompt_notification", None):
@@ -8812,6 +11468,23 @@ class HMBPromptLibrary(DataNode):
         self._hmb_last_prompt_semantic_fingerprint = fingerprint
         self._hmb_last_prompt_output = prompt
         self._hmb_last_machine_prompt_output = machine_prompt
+        self._hmb_last_shot_images = list(shot_images)
+        self._hmb_last_shot_videos = list(shot_videos)
+        try:
+            self._hmb_last_shot_context = _agent_shot_context(
+                state,
+                prompt_generation=self._hmb_prompt_snapshot_generation,
+                visible_prompt=prompt,
+                image_media=shot_images,
+                video_media=shot_videos,
+            )
+        except _ShotRoutingContractError:
+            self._hmb_last_shot_context = {}
+        # Stage both ordered media halves before PROMPT_OUT wakes an Agent.
+        set_output(self, SHOT_IMAGE_OUTPUT_PARAMETER_NAME, shot_images)
+        set_output(self, SHOT_VIDEO_OUTPUT_PARAMETER_NAME, shot_videos)
+        if publish_shot_media:
+            _notify_prompt_shot_media_outputs(self, changed_shot_outputs)
         if current_output != prompt:
             _stage_and_notify_prompt_output(self, prompt)
         else:
@@ -8836,6 +11509,7 @@ class HMBPromptLibrary(DataNode):
         publishing a second output during Agent resolution.
         """
 
+        self._reconcile_shared_shot_edges()
         state = self._write_dashboard_state()
         prompt = _build_prompt_package(state)
         machine_prompt = _build_data_only_prompt_package(state)
@@ -8900,6 +11574,23 @@ class HMBPromptLibrary(DataNode):
                 machine,
                 fingerprint,
             )
+            try:
+                paired_shot_context = _agent_shot_context(
+                    _state,
+                    prompt_generation=generation,
+                    visible_prompt=incoming_text,
+                    image_media=list(self._hmb_current_shot_images),
+                    video_media=list(self._hmb_current_shot_videos),
+                )
+            except _ShotRoutingContractError:
+                paired_shot_context = {}
+            self._hmb_last_agent_context_pair = {
+                "visible_prompt": incoming_text.rstrip("\r\n"),
+                "context": copy.deepcopy(paired_shot_context),
+            }
+            self._hmb_agent_pair_local.pair = copy.deepcopy(
+                self._hmb_last_agent_context_pair
+            )
             return {
                 "schema": "hmb-prompt-paired-snapshot",
                 "version": 1,
@@ -8913,9 +11604,102 @@ class HMBPromptLibrary(DataNode):
                 "machine_prompt": machine,
             }
 
+    def _hmb_agent_shot_context(
+        self, expected_visible_prompt: Any
+    ) -> Dict[str, Any]:
+        """Return the shot/media hashes paired with one exact visible prompt."""
+
+        incoming = getattr(
+            expected_visible_prompt, "value", expected_visible_prompt
+        )
+        incoming_text = str(incoming or "")
+        with self._hmb_sync_lock:
+            paired = getattr(self._hmb_agent_pair_local, "pair", None)
+            if (
+                isinstance(paired, dict)
+                and paired.get("visible_prompt") == incoming_text.rstrip("\r\n")
+                and isinstance(paired.get("context"), dict)
+            ):
+                context = copy.deepcopy(paired["context"])
+                self._hmb_last_agent_context_pair = {}
+                self._hmb_agent_pair_local.pair = None
+                return context
+            state, visible, machine, fingerprint = (
+                self._compile_current_prompt_pair()
+            )
+            if incoming_text.rstrip("\r\n") != visible.rstrip("\r\n"):
+                raise RuntimeError("HMB Prompt shot context is unavailable.")
+            generation = self._cache_prompt_pair(
+                visible, machine, fingerprint
+            )
+            try:
+                context = _agent_shot_context(
+                    state,
+                    prompt_generation=generation,
+                    visible_prompt=incoming_text,
+                    image_media=list(self._hmb_current_shot_images),
+                    video_media=list(self._hmb_current_shot_videos),
+                )
+            except _ShotRoutingContractError:
+                if self._hmb_shot_channel_subscription().get("enabled"):
+                    raise
+                context = {}
+            self._hmb_last_shot_context = copy.deepcopy(context)
+            self._hmb_last_shot_images = list(self._hmb_current_shot_images)
+            self._hmb_last_shot_videos = list(self._hmb_current_shot_videos)
+            self._hmb_last_agent_context_pair = {
+                "visible_prompt": incoming_text.rstrip("\r\n"),
+                "context": copy.deepcopy(context),
+            }
+            self._hmb_agent_pair_local.pair = None
+            return context
+
+    def _hmb_generator_shot_snapshot(
+        self,
+        expected_images: Any,
+        expected_videos: Any,
+    ) -> Dict[str, Any]:
+        """Validate both hidden media edges against one current Prompt pair."""
+
+        raw_images = getattr(expected_images, "value", expected_images)
+        raw_videos = getattr(expected_videos, "value", expected_videos)
+        if not isinstance(raw_images, list) or not isinstance(raw_videos, list):
+            raise RuntimeError("HMB Prompt shot media inputs are invalid.")
+        if any(not isinstance(value, str) for value in raw_images + raw_videos):
+            raise RuntimeError("HMB Prompt shot media inputs are invalid.")
+        with self._hmb_sync_lock:
+            state, visible, machine, fingerprint = (
+                self._compile_current_prompt_pair()
+            )
+            current_images = list(self._hmb_current_shot_images)
+            current_videos = list(self._hmb_current_shot_videos)
+            if raw_images != current_images or raw_videos != current_videos:
+                raise RuntimeError(
+                    "HMB Prompt shot media generation does not match."
+                )
+            generation = self._cache_prompt_pair(
+                visible, machine, fingerprint
+            )
+            context = _agent_shot_context(
+                state,
+                prompt_generation=generation,
+                visible_prompt=visible,
+                image_media=current_images,
+                video_media=current_videos,
+            )
+            return {
+                **context,
+                "schema": "hmb-prompt-generator-shot-snapshot",
+                "version": 1,
+                "image_media": current_images,
+                "video_media": current_videos,
+            }
+
     def _sync_prompt_output_now(self) -> Dict[str, Any]:
         """Invalidate queued callbacks and commit one authoritative snapshot."""
         with self._hmb_sync_lock:
+            if bool(getattr(self, "_hmb_node_deleted", False)):
+                return {}
             self._hmb_sync_generation += 1
             return self._sync_prompt_output_from_state()
 
@@ -8928,13 +11712,18 @@ class HMBPromptLibrary(DataNode):
         guarded synchronous commit instead.
         """
         with self._hmb_sync_lock:
+            if bool(getattr(self, "_hmb_node_deleted", False)):
+                return
             self._hmb_sync_generation += 1
             generation = self._hmb_sync_generation
 
         def run_sync() -> None:
             try:
                 with self._hmb_sync_lock:
-                    if generation != self._hmb_sync_generation:
+                    if (
+                        bool(getattr(self, "_hmb_node_deleted", False))
+                        or generation != self._hmb_sync_generation
+                    ):
                         return
                     self._sync_prompt_output_from_state()
             except Exception as exc:
@@ -8976,6 +11765,12 @@ class HMBPromptLibrary(DataNode):
                     # this hook, bypassing this class's set_parameter_value
                     # override. Compare against the instance baseline before
                     # any prompt compile can consume that raw rollback.
+                    merged_value = self._merge_widget_revision_axes(value)
+                    if merged_value != value:
+                        self._accept_widget_state_baseline(merged_value)
+                        self._restore_accepted_widget_state()
+                        self._schedule_prompt_sync()
+                        return result
                     if self._widget_state_write_is_stale(value):
                         self._restore_accepted_widget_state()
                         self._schedule_prompt_sync()
@@ -8989,7 +11784,11 @@ class HMBPromptLibrary(DataNode):
                     WIDGET_PARAMETER_NAME,
                     PICKER_INPUT_PARAMETER_NAME,
                     IMAGE_ASSET_INPUT_PARAMETER_NAME,
-                } and not getattr(self, "_hmb_ui_syncing", False):
+                    SHOT_ASSET_INPUT_PARAMETER_NAME,
+                    SHOT_PICKER_INPUT_PARAMETER_NAME,
+                } and not getattr(self, "_hmb_ui_syncing", False) and not getattr(
+                    self, "_hmb_compact_route_syncing", False
+                ):
                     self._schedule_prompt_sync()
             except Exception as exc:
                 _diagnostic_exception("after_value_set scheduling failed", exc)
@@ -9003,16 +11802,24 @@ class HMBPromptLibrary(DataNode):
         source_parameter: Any,
         target_parameter: Any,
     ) -> Any:
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            return None
         try:
             target_name = getattr(target_parameter, "name", "")
             if target_name in {
                 PICKER_INPUT_PARAMETER_NAME,
                 IMAGE_ASSET_INPUT_PARAMETER_NAME,
+                SHOT_ASSET_INPUT_PARAMETER_NAME,
+                SHOT_PICKER_INPUT_PARAMETER_NAME,
             }:
                 if target_name == PICKER_INPUT_PARAMETER_NAME:
                     self._hmb_picker_connected = True
-                else:
+                elif target_name in {
+                    IMAGE_ASSET_INPUT_PARAMETER_NAME,
+                    SHOT_ASSET_INPUT_PARAMETER_NAME,
+                }:
                     self._hmb_image_asset_connected = True
+                self._hmb_connected_source_nodes[target_name] = source_node
                 source_name = getattr(source_parameter, "name", "")
                 sentinel = object()
                 value: Any = sentinel
@@ -9045,16 +11852,24 @@ class HMBPromptLibrary(DataNode):
         source_parameter: Any,
         target_parameter: Any,
     ) -> Any:
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            return None
         try:
             target_name = getattr(target_parameter, "name", "")
             if target_name in {
                 PICKER_INPUT_PARAMETER_NAME,
                 IMAGE_ASSET_INPUT_PARAMETER_NAME,
+                SHOT_ASSET_INPUT_PARAMETER_NAME,
+                SHOT_PICKER_INPUT_PARAMETER_NAME,
             }:
                 if target_name == PICKER_INPUT_PARAMETER_NAME:
                     self._hmb_picker_connected = False
-                else:
+                elif target_name in {
+                    IMAGE_ASSET_INPUT_PARAMETER_NAME,
+                    SHOT_ASSET_INPUT_PARAMETER_NAME,
+                }:
                     self._hmb_image_asset_connected = False
+                self._hmb_connected_source_nodes.pop(target_name, None)
                 try:
                     _set_parameter_value(self, target_name, "")
                 except Exception as exc:
@@ -9067,6 +11882,62 @@ class HMBPromptLibrary(DataNode):
         except Exception as exc:
             _diagnostic_exception("Parent incoming connection removal hook failed", exc)
             return None
+
+    def after_node_deleted(self, *args: Any, **kwargs: Any) -> Any:
+        """Invalidate every deferred Prompt write before the host tears us down."""
+
+        def invalidate() -> None:
+            self._hmb_node_deleted = True
+            self._hmb_sync_generation = (
+                int(getattr(self, "_hmb_sync_generation", 0) or 0) + 1
+            )
+            self._hmb_prompt_notification_generation = (
+                int(
+                    getattr(
+                        self, "_hmb_prompt_notification_generation", 0
+                    )
+                    or 0
+                )
+                + 1
+            )
+            self._hmb_pending_prompt_notification = None
+            self._hmb_shot_media_notification_generation = (
+                int(
+                    getattr(
+                        self,
+                        "_hmb_shot_media_notification_generation",
+                        0,
+                    )
+                    or 0
+                )
+                + 1
+            )
+            self._hmb_pending_shot_media_notifications = {}
+
+        first_delete = not bool(getattr(self, "_hmb_node_deleted", False))
+        if first_delete:
+            # Do not wait for _hmb_sync_lock here. A worker can hold it while a
+            # retained-mode request waits for this very deletion callback,
+            # creating a host freeze. Flag/generation invalidation is immediate;
+            # every deferred commit re-checks ownership before publication.
+            invalidate()
+        if first_delete and not bool(
+            getattr(self, "_hmb_deletion_reconcile_called", False)
+        ):
+            self._hmb_deletion_reconcile_called = True
+            try:
+                from _hmb_shot_routing import schedule_post_deletion_reconcile
+
+                schedule_post_deletion_reconcile(self)
+            except Exception as exc:
+                _diagnostic_exception(
+                    "Post-deletion Shot routing schedule failed", exc
+                )
+        if bool(getattr(self, "_hmb_delete_parent_called", False)):
+            return None
+        self._hmb_delete_parent_called = True
+        parent = getattr(super(), "after_node_deleted", None)
+        return parent(*args, **kwargs) if callable(parent) else None
 
     def _restore_picker_connection_state(self) -> None:
         try:
@@ -9088,8 +11959,15 @@ class HMBPromptLibrary(DataNode):
             result = super().after_deserialize(*args, **kwargs)
         except Exception as exc:
             _diagnostic_exception("Parent after_deserialize hook failed", exc)
+        self._hmb_initial_shot_autoclaim_pending = False
+        self._hmb_initial_shot_preferred_uuid = ""
+        self._hmb_initial_shot_exact_refresh_pending = False
+        self._arm_routing_hydration_rebase(
+            _get_parameter_raw(self, WIDGET_PARAMETER_NAME)
+        )
         self._ensure_prompt_output()
         self._restore_picker_connection_state()
+        self._schedule_post_hydration_shot_reconcile()
         return result
 
     def after_load(self, *args: Any, **kwargs: Any) -> Any:
@@ -9098,8 +11976,15 @@ class HMBPromptLibrary(DataNode):
             result = super().after_load(*args, **kwargs)
         except Exception as exc:
             _diagnostic_exception("Parent after_load hook failed", exc)
+        self._hmb_initial_shot_autoclaim_pending = False
+        self._hmb_initial_shot_preferred_uuid = ""
+        self._hmb_initial_shot_exact_refresh_pending = False
+        self._arm_routing_hydration_rebase(
+            _get_parameter_raw(self, WIDGET_PARAMETER_NAME)
+        )
         self._ensure_prompt_output()
         self._restore_picker_connection_state()
+        self._schedule_post_hydration_shot_reconcile()
         return result
 
     def on_loaded(self, *args: Any, **kwargs: Any) -> Any:
@@ -9108,11 +11993,20 @@ class HMBPromptLibrary(DataNode):
             result = super().on_loaded(*args, **kwargs)
         except Exception as exc:
             _diagnostic_exception("Parent on_loaded hook failed", exc)
+        self._hmb_initial_shot_autoclaim_pending = False
+        self._hmb_initial_shot_preferred_uuid = ""
+        self._hmb_initial_shot_exact_refresh_pending = False
+        self._arm_routing_hydration_rebase(
+            _get_parameter_raw(self, WIDGET_PARAMETER_NAME)
+        )
         self._ensure_prompt_output()
         self._restore_picker_connection_state()
+        self._schedule_post_hydration_shot_reconcile()
         return result
 
     def process(self) -> None:
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            return None
         self._ensure_prompt_output()
         # The workflow executor owns normal process-output propagation.
         _begin_prompt_output_side_effect_callback(self)

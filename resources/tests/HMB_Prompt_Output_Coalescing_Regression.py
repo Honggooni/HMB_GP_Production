@@ -54,9 +54,11 @@ assert agent._AGENT_PROMPT_INPUT_PARAMETER == "prompt"
 assert output_kwargs["allow_input"] is False
 assert output_kwargs["allow_output"] is True
 assert output_kwargs["allow_property"] is False
-assert output_kwargs["ui_options"]["display_name"] == "PROMPT OUT"
+assert output_kwargs["ui_options"]["display_name"] == ""
 assert output_kwargs["ui_options"]["compact"] is True
-assert output_kwargs["ui_options"]["height"] == 24
+assert output_kwargs["ui_options"]["height"] == 1
+assert output_kwargs["ui_options"]["hide"] is True
+assert output_kwargs["ui_options"]["hide_handles"] is True
 
 
 node = prompt.HMBPromptLibrary(name="prompt_output_coalescing")
@@ -167,7 +169,10 @@ try:
     assert "User-authored scene description." in text_machine
     assert node._hmb_prompt_snapshot_generation == 2
     assert node.parameter_output_values["PROMPT_OUT"] == base_visible
-    assert set_calls == []
+    assert [name for name, _value in set_calls] == [
+        prompt.SHOT_IMAGE_OUTPUT_PARAMETER_NAME,
+        prompt.SHOT_VIDEO_OUTPUT_PARAMETER_NAME,
+    ]
     assert len(notify_calls) == 1
     assert notify_calls[-1][:2] == ("PROMPT_OUT", base_visible)
     assert notify_calls[-1][2]["machine_prompt"] == text_machine
@@ -185,7 +190,7 @@ try:
     assert node._hmb_prompt_snapshot_generation == 2
     assert node._hmb_last_prompt_output == text_visible
     assert node._hmb_last_machine_prompt_output == text_machine
-    assert set_calls == []
+    assert len(set_calls) == 2
     assert len(notify_calls) == 1
 
     # A visible semantic mutation updates both cache members before synchronous
@@ -204,7 +209,12 @@ try:
     node._write_dashboard_state = lambda: copy.deepcopy(semantic_state)
     node._sync_prompt_output_from_state()
     assert node._hmb_prompt_snapshot_generation == 3
-    assert len(set_calls) == 1
+    assert [name for name, _value in set_calls[-3:]] == [
+        prompt.SHOT_IMAGE_OUTPUT_PARAMETER_NAME,
+        prompt.SHOT_VIDEO_OUTPUT_PARAMETER_NAME,
+        "PROMPT_OUT",
+    ]
+    assert len(set_calls) == 5
     assert len(notify_calls) == 2
     assert set_calls[-1] == notify_calls[-1][:2]
     semantic_visible = node._hmb_last_prompt_output
@@ -220,7 +230,7 @@ try:
     node._write_dashboard_state = lambda: copy.deepcopy(semantic_ui_only)
     node._sync_prompt_output_from_state()
     assert node._hmb_prompt_snapshot_generation == 3
-    assert len(set_calls) == 1
+    assert len(set_calls) == 5
     assert len(notify_calls) == 2
     assert_paired_snapshot(node, semantic_visible, semantic_machine, 3)
 
@@ -232,7 +242,7 @@ try:
     assert set_calls[-1] == ("PROMPT_OUT", semantic_visible)
     assert notify_calls[-1][:2] == ("PROMPT_OUT", semantic_visible)
     assert notify_calls[-1][2]["machine_prompt"] == semantic_machine
-    assert len(set_calls) == 2
+    assert len(set_calls) == 6
     assert len(notify_calls) == 3
 
     # A transport failure occurs only after both snapshot members and the
@@ -874,6 +884,30 @@ echo_b = prompt._normalize_state(prompt._default_widget_state())
 echo_b[prompt.SOURCE_SYNC_REVISION_KEY] = 9
 echo_b[prompt.UI_EDIT_REVISION_KEY] = 2
 echo_b["text"]["SCENE_CONTEXT"] = "newer B"
+echo_b["images"][0].update({
+    "frame_range_intent": {
+        "version": 1,
+        "enabled": True,
+        "start_frame": 101,
+        "end_frame": 162,
+        "ranges": [{"start": 101, "end": 110}],
+        "selected_index": 0,
+    },
+    "frame_range_enabled": True,
+    "frame_range_color_index": 0,
+    "frame_range_bindings": {
+        "@video1::": {
+            "video_slot": "@video1",
+            "color_pick": "",
+            "enabled": True,
+            "origin": "manual",
+            "ranges": [{"start": 101, "end": 110}],
+            "start_frame": 101,
+            "end_frame": 162,
+        }
+    },
+    "frame_range_selected_index": 0,
+})
 echo_a = copy.deepcopy(echo_b)
 echo_a[prompt.UI_EDIT_REVISION_KEY] = 1
 echo_a["text"]["SCENE_CONTEXT"] = "stale A"
@@ -900,18 +934,68 @@ echo_after_stale_hook = prompt._parse_state(
 assert echo_after_stale_hook[prompt.UI_EDIT_REVISION_KEY] == 2
 assert echo_after_stale_hook["text"]["SCENE_CONTEXT"] == "newer B"
 
-# A higher Python-owned source revision is authoritative even when its private
-# UI transaction counter is lower. A workflow hydration is also a new saved
-# baseline and may intentionally start below the prior live instance values.
+# Source and UI revisions are independent axes. A newer Picker generation must
+# update source-owned fields without rolling a newer user Range ON transaction
+# back to the older OFF state carried by that delayed source snapshot.
 echo_authoritative = copy.deepcopy(echo_a)
 echo_authoritative[prompt.SOURCE_SYNC_REVISION_KEY] = 10
 echo_authoritative[prompt.UI_EDIT_REVISION_KEY] = 0
 echo_authoritative["text"]["SCENE_CONTEXT"] = "authoritative source"
+echo_authoritative["images"][0]["frame_range_intent"] = {
+    "version": 1,
+    "enabled": False,
+    "start_frame": None,
+    "end_frame": None,
+    "ranges": [],
+    "selected_index": -1,
+}
+echo_authoritative["images"][0]["frame_range_enabled"] = False
+echo_authoritative["images"][0]["frame_range_bindings"] = {}
+echo_authoritative["images"][0]["frame_range_binding"] = None
+echo_authoritative["images"][0]["frame_range_selected_index"] = -1
+echo_authoritative["picker"]["enabled"] = True
+echo_authoritative["picker"]["run_id"] = "source-generation-10"
 echo_node.set_parameter_value(
     prompt.WIDGET_PARAMETER_NAME,
     prompt._json_dumps(echo_authoritative),
 )
-assert echo_node._hmb_last_accepted_widget_revisions == (10, 0)
+echo_after_crossed_source = prompt._parse_state(
+    prompt._get_parameter_raw(echo_node, prompt.WIDGET_PARAMETER_NAME)
+)
+assert echo_node._hmb_last_accepted_widget_revisions == (10, 2)
+assert echo_after_crossed_source["picker"]["run_id"] == "source-generation-10"
+assert echo_after_crossed_source["text"]["SCENE_CONTEXT"] == "authoritative source"
+assert echo_after_crossed_source["images"][0]["frame_range_enabled"] is True
+assert echo_after_crossed_source["images"][0]["frame_range_intent"][
+    "ranges"
+] == [{"start": 101, "end": 110}]
+
+# The inverse crossed pair is also a merge: a UI Range edit authored from an
+# older source snapshot keeps the already accepted Picker generation.
+echo_newer_ui = copy.deepcopy(echo_authoritative)
+echo_newer_ui[prompt.SOURCE_SYNC_REVISION_KEY] = 9
+echo_newer_ui[prompt.UI_EDIT_REVISION_KEY] = 3
+echo_newer_ui["picker"]["run_id"] = "stale-source-generation"
+echo_newer_ui["images"][0].update(copy.deepcopy(echo_b["images"][0]))
+echo_newer_ui["images"][0]["frame_range_intent"]["ranges"] = [
+    {"start": 120, "end": 130}
+]
+echo_node.set_parameter_value(
+    prompt.WIDGET_PARAMETER_NAME,
+    prompt._json_dumps(echo_newer_ui),
+)
+echo_after_crossed_ui = prompt._parse_state(
+    prompt._get_parameter_raw(echo_node, prompt.WIDGET_PARAMETER_NAME)
+)
+assert echo_node._hmb_last_accepted_widget_revisions == (10, 3)
+assert echo_after_crossed_ui["picker"]["run_id"] == "source-generation-10"
+assert echo_after_crossed_ui["images"][0]["frame_range_enabled"] is True
+assert echo_after_crossed_ui["images"][0]["frame_range_intent"][
+    "ranges"
+] == [{"start": 120, "end": 130}]
+
+# Workflow hydration is a new saved baseline and may intentionally start below
+# both live clocks.
 echo_hydrated = copy.deepcopy(echo_authoritative)
 echo_hydrated[prompt.SOURCE_SYNC_REVISION_KEY] = 3
 echo_hydrated["text"]["SCENE_CONTEXT"] = "saved hydration"

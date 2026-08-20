@@ -34,75 +34,80 @@ jobs:
         shell: pwsh
         run: |
           $tracked = @(git ls-files)
-          $bundledPolicy = "resources/agent/hmb_agent_core.dat"
-          $bundledPolicySha256 = "7171bef7169df8894ed24ae7a9b4d9d145957c5110c963b7435372b2695fd251"
           $forbidden = @($tracked | Where-Object {
-            $_ -ne $bundledPolicy -and (
             $_ -match '(^|/)(\.tmp|\.venv|backups|dist|GriptapeNodes|resources/agent|resources/policy|policies?)/' -or
-            $_ -match '\.dat$' -or
+            $_ -match '(^|/)hmb_agent_core\.dat$' -or
             $_ -match '(policy|policies).*(?:_ko(?:\.|$)|korean)' -or
-            $_ -match 'HMB_Agent_Policies.*\.txt$' -or
             $_ -match '(^|/)\.env($|\.)' -or
             $_ -match '(^|/)(credentials|secrets)[^/]*\.json$' -or
             $_ -match '(^|/)(id_rsa|id_ed25519)[^/]*$' -or
-            $_ -match '\.(dat|jwk|key|p12|pem|pfx|secret|token|zip)$'
-            )
+            $_ -match '\.(dat|jwk|key|p12|pfx|secret|token|zip)$' -or
+            ($_ -match '\.pem$' -and
+              $_ -ne 'resources/tls/hmb_agent_broker_ca.pem')
           })
           if ($forbidden.Count -ne 0) {
             throw "Forbidden private/generated tracked paths: $($forbidden -join ', ')"
           }
-          if ($tracked -notcontains $bundledPolicy) {
-            throw "The exact signed bundled Agent policy is not tracked."
-          }
-          $actualPolicySha256 = (Get-FileHash $bundledPolicy -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualPolicySha256 -ne $bundledPolicySha256) {
-            throw "Bundled Agent policy SHA-256 mismatch."
-          }
-      - name: Install pinned runtime dependencies
-        run: python -m pip install "cryptography==50.0.0" "Pillow==12.3.0" "imageio-ffmpeg==0.6.0" "httpx==0.28.1" "tos==2.9.2"
+      - name: Install pinned direct dependencies
+        run: python -m pip install "Pillow==12.3.0" "imageio-ffmpeg==0.6.0" "httpx==0.28.1" "tos==2.9.2"
       - name: Python release regressions
         shell: pwsh
         env:
           HMB_IMAGE_PROJECTS_ROOT: ${{ github.workspace }}
         run: |
-          # Live-host regressions run only on internal hosts configured with
-          # Griptape Nodes; the bundled-policy package boundary is verified below.
+          # Live-host policy-content regressions run only on protected internal
+          # hosts. Public CI verifies the server-only loader and package boundary.
           $tests = @(
-            "HMB_Bundled_Policy_Boundary_Regression.py",
+            "HMB_Look_Attribute_Scope_Regression.py",
             "HMB_Data_Only_Prompt_Security_Regression.py",
             "HMB_Agent_Paired_Prompt_Snapshot_Regression.py",
-            "HMB_Seedance_MP4_Verifier_Portability_Regression.py",
             "HMB_FX_Timing_Range_Contract_Regression.py",
+            "HMB_Frame_Range_Regression.py",
             "HMB_Optional_Frame_Range_Contract_Regression.py",
+            "HMB_Prompt_Free_Frame_Range_Contract_Regression.py",
             "HMB_Four_Library_Generator_Neutrality_Regression.py",
+            "HMB_Real_Standard_Agent_Boundary_Regression.py",
+            "HMB_Server_Policy_Boundary_Regression.py",
+            "HMB_Signed_Policy_Hot_Update_Regression.py",
+            "HMB_Public_Release_Security_Regression.py",
             "HMB_State_Normalization_Property_Regression.py",
             "HMB_Image_Asset_Import_Order_Regression.py",
             "HMB_Image_Asset_Resolved_Selection_Regression.py",
-            "HMB_Hybrid_Composition_Regression.py",
-            "HMB_Independent_Binding_Video_Slots_Regression.py",
             "HMB_Prompt_No_Loss_Connection_Regression.py",
-            "HMB_Prompt_Public_Prompt_Boundary_Regression.py",
-            "HMB_Prompt_UID_Companion_Alignment_Regression.py",
             "HMB_Image_Asset_Registration_Regression.py",
+            "HMB_Image_Asset_Background_Mutation_Regression.py",
             "HMB_Image_Asset_Server_Sharing_Regression.py",
             "HMB_Image_Asset_Process_Lock_Regression.py",
             "HMB_Image_Asset_State_Echo_Regression.py",
-            "HMB_Prompt_Output_Coalescing_Regression.py",
-            "HMB_Prompt_Picker_Disconnect_Restore_Regression.py",
-            "HMB_Picker_Prompt_Agent_Live_Host_Regression.py",
             "HMB_Cutout_Transparency_Regression.py",
             "HMB_Depth_Companion_Regression.py",
             "HMB_Depth_Visual_Contract_Regression.py",
             "HMB_Maya_Runner_Performance_Regression.py",
-            "HMB_Screen_Space_Pattern_Regression.py",
             "HMB_Mouth_Card_Inner_Patch_Regression.py",
             "HMB_Motion_Guide_Regression.py",
+            "HMB_Prompt_Output_Coalescing_Regression.py",
+            "HMB_Prompt_Picker_Disconnect_Restore_Regression.py",
+            "HMB_Prompt_Public_Prompt_Boundary_Regression.py",
+            "HMB_Picker_Prompt_Agent_Live_Host_Regression.py",
             "HMB_Picker_State_Compaction_Regression.py",
             "HMB_VideoPicker_Media_Availability_Regression.py",
-            "HMB_VideoPicker_Live_Output_Regression.py",
+            "HMB_VideoPicker_Native_Size_Migration_Regression.py",
             "HMB_VideoPicker_High_Quality_Original_Regression.py",
-            "HMB_VideoPicker_Reliability_Regression.py",
-            "HMB_Typed_Auxiliary_Video_Slots_Regression.py"
+            "HMB_VideoPicker_Maya_Shot_Authoring_Regression.py",
+            "HMB_Typed_Auxiliary_Video_Slots_Regression.py",
+            "HMB_Agent_Authenticated_Broker_Regression.py",
+            "HMB_Agent_Cloud_Nonstreaming_Regression.py",
+            "HMB_Agent_Runtime_Prompt_UI_Isolation_Regression.py",
+            "HMB_Agent_Shot_Binding_Regression.py",
+            "HMB_Seedance_MP4_Verifier_Portability_Regression.py",
+            "HMB_Seedance_Direct_Shot_Source_Regression.py",
+            "HMB_Five_Library_Shot_Routing_Regression.py",
+            "HMB_Shot_Routing_Pass_Cache_Regression.py",
+            "HMB_VideoPicker_Asset_Catalog_Regression.py",
+            "HMB_VideoPicker_Live_Output_Regression.py",
+            "HMB_VideoPicker_No_Loss_State_Regression.py",
+            "HMB_VideoPicker_Publisher_Replacement_Regression.py",
+            "HMB_VideoPicker_Snapshot_History_Regression.py"
           )
           foreach ($test in $tests) {
             python (Join-Path "resources/tests" $test)
@@ -115,20 +120,18 @@ jobs:
             node $_.FullName
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-      - name: Bundled-policy release security regression
+      - name: Server policy administration static regression
+        shell: powershell
+        run: >-
+          powershell -NoProfile -ExecutionPolicy Bypass -File
+          resources/tests/HMB_Agent_Policy_Admin_Scripts_Static_Regression.ps1
+      - name: Release builder static syntax audit
         shell: pwsh
         run: |
-          python resources/build_release.py --check
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python resources/build_release.py
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $first = (Get-FileHash dist/HMB_GP_Production.zip -Algorithm SHA256).Hash
-          $firstManifest = (Get-FileHash dist/release-manifest.json -Algorithm SHA256).Hash
-          python resources/build_release.py
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $second = (Get-FileHash dist/HMB_GP_Production.zip -Algorithm SHA256).Hash
-          $secondManifest = (Get-FileHash dist/release-manifest.json -Algorithm SHA256).Hash
-          if ($first -ne $second) { throw "Release ZIP is not reproducible." }
-          if ($firstManifest -ne $secondManifest) { throw "Release manifest is not reproducible." }
-          python resources/tests/HMB_Public_Release_Security_Regression.py
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Public CI never receives or materializes a signed policy artifact or
+          # policy review document. This check builds only an in-memory ZIP.
+          python -m py_compile resources/build_developer_release.py
+          python resources/build_developer_release.py --check
+          $artifact = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_DEV_0.6.36.zip"
+          python resources/build_developer_release.py --output $artifact
+          python resources/build_developer_release.py --check-output --output $artifact

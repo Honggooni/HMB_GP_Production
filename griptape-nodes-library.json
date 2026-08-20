@@ -4,8 +4,17 @@
   "metadata": {
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.6.25",
+    "library_version": "0.6.36",
     "engine_version": "0.93.0",
+    "agent_policy_delivery": {
+      "archive_source_count": 30,
+      "mode": "authenticated_broker_session",
+      "bootstrap_marker": "HMB_AGENT_POLICY_PROCESS_BOOTSTRAP=1",
+      "broker_endpoint": "https://192.168.203.245:8443/api/v1/agent-core/dat",
+      "launcher_path": "HMB_Agent_Griptape.bat",
+      "public_ca_path": "resources/tls/hmb_agent_broker_ca.pem",
+      "verification": "pinned_tls_dpapi_bearer_rsa3072_sha256_v3_contract_once_per_process"
+    },
     "tags": [
       "Griptape",
       "HMB",
@@ -16,6 +25,11 @@
       "CustomWidget",
       "PromptOut",
       "PromptOnlyDashboard",
+      "CableFreeShotRouting",
+      "FiveNamedShots",
+      "ThirtyImagesPerShot",
+      "CompactShotCatalog",
+      "ExactShotMediaPairing",
       "RoleBinding",
       "ManualImageSlots",
       "HMBImageAssetLibrary",
@@ -44,6 +58,10 @@
       "AppendOnlyVideoHistory",
       "StableVideoUIDs",
       "Max10VideoSelection",
+      "FiveVideoShotWorkspaces",
+      "TenVideoAssetsPerShot",
+      "FiftyVideoAssetCapacity",
+      "LightweightFiveByTenVideoCatalog",
       "RowMajorVideoOrder",
       "SingleVideoListOutput",
       "MP4VideoImport",
@@ -94,7 +112,10 @@
       "GoalFirstShotComposition",
       "ControlOnlyBindings",
       "NonBlockingSourceNormalization",
-      "SignedBundledPolicy",
+      "SignedBrokerPolicy",
+      "ProcessSessionAgentPolicy",
+      "PinnedTLSAgentPolicy",
+      "DesktopBootstrapAgentPolicy",
       "CompactPublicPrompt",
       "FinalTextBoundary",
       "AgentStateChainOnly",
@@ -140,7 +161,7 @@
         "imageio-ffmpeg==0.6.0",
         "Pillow==12.3.0",
         "httpx==0.28.1",
-        "cryptography==50.0.0"
+        "tos==2.9.2"
       ]
     },
     "declarations": [
@@ -185,7 +206,7 @@
       "file_path": "HMBAgentLibrary.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "Native Griptape Agent that remains a stock Standard Library Agent for every request not directly connected from the exact registered HMBPromptLibrary PROMPT_OUT port. That canonical edge validates the user-readable PROMPT_OUT against its atomically paired same-generation private machine snapshot and injects four project rules plus four shot rules at runtime; visible prose is never reverse-parsed. Prompt-only, Prompt-plus-Asset, Prompt-plus-Picker, and Prompt-plus-both remain equally valid. FINAL generator output may apply, summarize, paraphrase, translate, or infer the signed rules over Prompt-selected facts and include every generator-required detail and source name without an output-length or conciseness cap. Only verbatim raw or reconstructable policy-artifact dumps, system instructions, and private Agent objects, memory, validation state, and logs remain blocked. Missing or invalid signed policy fails closed before any native Agent or model call; valid runs retain the downstream model, tools, memory, schema, and native execution path.",
+        "description": "Runs Griptape Agent with authenticated Broker policy.\nOnly mode works; invalid policy blocks execution.",
         "display_name": "HMBAgentLibrary"
       }
     },
@@ -194,7 +215,7 @@
       "file_path": "HMBImageAssetLibrary.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "Project image asset library using the canonical _hmb_common.py optional Main Type and Sub Type taxonomy. The compact Project Set and reload controls discover direct-child project folders. Scanned images remain unregistered until the Add passport writes a validated project manifest entry with Image Name and Asset ID; Main Type and Sub Type are optional metadata. Optional IMAGE_IMPORT_IN media remains ordinary external media and can be used immediately; Add requires an existing child Asset Folder and copies the image directly there without creating an Asset ID directory. The ordered selection tray keeps ASSET_OUT metadata and Video Generation Out media aligned without imposing a Prompt or other-library prerequisite.",
+        "description": "Browses project images and groups them by Shot.\nOutputs ordered assets for prompts or generators.",
         "display_name": "HMBImageAssetLibrary",
         "width": 1400,
         "height": 1200,
@@ -227,7 +248,7 @@
       "file_path": "HMBSeedanceGeneration.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "HMB Seedance Generation submits the selected supported model to the authenticated FN AI Broker, refreshes or resumes known Broker jobs without creating replacements, downloads same-origin results with Broker authorization, and never forwards that authorization to external result URLs. Provider API keys remain server-side. The client performs no secondary usage recording; the Broker is the sole usage, quota, and accounting authority. A collapsed AI Broker group below Status shows only connection state, account, and one nonblocking Connect / Refresh action; it exposes no key characters, key-registration control, quota, or reset data. The public media surface accepts up to 9 ordered reference images, up to 3 ordered Picker video references, and up to 3 audio items. Local media publication and output preflight remain bounded and occur before billable submission; successful results publish one local preview and the sole VIDEO_OUT connector.",
+        "description": "Generates Seedance video through FN AI Broker.\nUses optional media and returns one verified MP4.",
         "display_name": "HMB Seedance Generation",
         "icon": "Sparkles",
         "group": "create",
@@ -261,7 +282,7 @@
       "file_path": "HMBPromptLibrary.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "Canonical goal-first prompt parent with four equal modes: independent Prompt only, Prompt plus Image Asset, Prompt plus Video Picker, and Prompt plus both. While IMAGE_ASSET_IN is connected, only selected Asset-managed rows own active @imageN slots and strictly follow upstream add, remove, and reorder operations so Prompt order stays aligned with Video Generation Out; the Prompt image + button is locked until disconnect because new visible rows must be selected upstream. Native/manual rows remain dormant and return after disconnect; deselected managed settings resume only by exact source_uid. Verified assets bind registered Main Type and Sub Type while Target keeps a Main-Type-aware editable default; unverified or unknown connected values remain local dashboard state and are not serialized into PROMPT_OUT. PICKER_IN synchronizes recognized metadata without creating a required companion or library combination. PROMPT_OUT contains only the user-verifiable Target Generator, Image Source, Image Role, Replacement Binding, and Video Source sections, remains available in every mode, and is the only HMB automation gateway recognized by HMBAgentLibrary.",
+        "description": "Builds prompts from manual text and media settings.\nWorks alone or with optional Asset and Picker.",
         "display_name": "HMBPromptLibrary",
         "width": 1800,
         "height": 1193,
@@ -292,7 +313,7 @@
       "file_path": "HMBVideoPickerLibrary.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "Maya HMB playblast picker and current-cut video catalog. READ loads Outliner, camera, and timeline metadata without rendering video. Original, Mask (legacy Color Assignment), Depth, and Motion Guide checkboxes are inert selections; only Generate Playblast executes work, and every successful checked result is appended as a new immutable catalog asset instead of replacing a numbered slot. Imported MP4 files join the same history. Video cards use static thumbnails: the centered play button routes playback to the main Preview and toggles play/pause there, while the entire lower information area selects or deselects the card. Selected cards use a thicker, brighter neon outline; delete remains at the upper-right. Dragging selected cards changes their @video1..@videoN order, and metadata-only deletion never leaves the Picker stuck in a busy state. Snapshot and Video share the main viewport: stable Snapshot history is navigated by the left/right controls, the center control alone plays or pauses Video with ▶/Ⅱ, and the redundant local Open action is removed in favor of current-cut Load. Up to ten selected assets publish synchronized Prompt metadata through PICKER_OUT and the same ordered media paths through one VIDEO_OUT list[str] generator connection. Mask remains limited to Maya-authored visible geometry with enabled Color Assignment and Picker eye state; repeated recoloring replaces stale duplicate bindings by Maya UUID or exact DAG path. Depth always derives its surface scope from Maya-authored visibility plus the Picker eye state, independently of Color Assignment. Motion Guide retains the visibility-driven fallback when no Color Assignment exists. Depth v7 and the shared viewport path preserve authored cutout alpha while applying camera-space grayscale or Smooth Preview. Motion Guide v5 adds bounded render-scope eye/eyelid semantic-mesh evidence to Sidecar-v2 final Blend Shape values, controller-value provenance, front-visible surface landmarks, and cached selective visibility checks. Full-detail and Smooth Preview preparation is best-effort, while exact frame-map, raster, H.264, and BT.709 validation remains mandatory.",
+        "description": "Captures Maya snapshots and playblast variants.\nOrders videos for prompts or generators.",
         "display_name": "HMBVideoPickerLibrary",
         "width": 1400,
         "height": 1200,
@@ -325,7 +346,7 @@
     {
       "name": "HMBAgentLibraryWidget",
       "path": "widgets/HMBAgentLibraryWidget.js",
-      "description": "Compact HMBAgentLibrary header that identifies FINAL TEXT as the display/generator output and Agent State as chain-only while leaving native Agent controls unchanged."
+      "description": "Compact HMBAgentLibrary header with an explicit standalone Only mode and a backend-verified selector containing only same-flow Prompt-owned Shots; native Agent controls and output behavior remain unchanged."
     },
     {
       "name": "HMBImageAssetLibraryWidget",
@@ -338,6 +359,11 @@
       "description": "Goal-first Prompt dashboard where verified Asset Sub Type remains registered and Target stays editable from a Main-Type default. The image + button is locked only while IMAGE_ASSET_IN is connected and automatically returns after disconnect; video, Picker, Color Pick, VIDEO VFX, and Keep Out data remain optional without downstream prerequisites."
     },
     {
+      "name": "HMBSeedanceGenerationWidget",
+      "path": "widgets/HMBSeedanceGenerationWidget.js",
+      "description": "Compact HMB Seedance Generation header placed directly above Model. Only supports prompt-only generation; each numbered Shot resolves the available ImageAsset source, VideoPicker source, or both through exact hidden same-flow dependencies without requiring an Agent."
+    },
+    {
       "name": "HMBVideoPickerCommandBridgeWidget",
       "path": "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
       "description": "Hidden minimal JSON command transport for HMBVideoPickerLibrary; execution commands remain separate from persistent dashboard state."
@@ -345,7 +371,7 @@
     {
       "name": "HMBVideoPickerLibraryWidget",
       "path": "widgets/HMBVideoPickerLibraryWidget_v032.js",
-      "description": "Maya playblast viewport and current-cut asset catalog with static card thumbnails. Each centered card button plays or pauses that asset only in the main Preview; the entire lower information area selects or deselects it. Selected cards have a thicker, brighter neon outline, deletion stays at the upper-right, and dragging selected cards changes the @video1..@videoN order. Metadata-only deletion cannot leave the Picker stuck in a busy state. Snapshot and Video share the viewport: stable Snapshot history uses left/right navigation, the center control alone toggles Video ▶/Ⅱ, and current-cut Load replaces the retired local Open action. Original/Mask/Depth/Motion Guide remain inert selections until the explicit Generate trigger; PICKER_OUT and one ordered VIDEO_OUT list are the only public Picker outputs."
+      "description": "Maya playblast viewport with ImageAsset-synchronized one-to-five Shot video workspaces. Each Shot owns at most ten imported or generated assets; the expanded view shows only the active Shot, and only that Shot's ordered selected subset drives PICKER_OUT and VIDEO_OUT. The compact loader renders actual owned cards only, reuses one on-demand player, and sizes itself to visible rows. Maya scene changes preserve durable video history and stable video UIDs."
     }
   ]
 }

@@ -34,10 +34,10 @@ assert.equal(deleted.selected_video_uid, "preview-b");
 assert.equal(deleted.selected_video_path, "C:/shot/catalog/preview-b.mp4");
 
 const deleteHandlerStart = widgetSource.indexOf(
-  'container.querySelectorAll("[data-delete-video-uid]")',
+  "const deleteVideoAsset = (event, button) =>",
 );
 const deleteHandlerEnd = widgetSource.indexOf(
-  "activeCleanup.push(hmbInstallVideoAssetDragReorder",
+  "hmbInstallVideoAssetRootDelegation(",
   deleteHandlerStart,
 );
 assert.ok(deleteHandlerStart >= 0 && deleteHandlerEnd > deleteHandlerStart);
@@ -67,7 +67,36 @@ assert.doesNotMatch(
   "Delete cleanup must never treat a static catalog thumbnail as a playing media element.",
 );
 
+let deletedPublications = 0;
+const deletedContainer = { __hmbVideoPickerDeleted: true };
+const deletedDelivery = widgetModule.hmbDeliverPickerStateIfMounted(
+  deletedContainer,
+  () => { deletedPublications += 1; },
+  { state_revision: 1 },
+);
+assert.equal(deletedDelivery.delivered, false);
+assert.equal(deletedPublications, 0);
+const cleanupStart = widgetSource.indexOf("container.__hmbVideoPickerCleanupProxy = () => {");
+const cleanupEnd = widgetSource.indexOf("const previousCleanup", cleanupStart);
+assert.ok(cleanupStart >= 0 && cleanupEnd > cleanupStart);
+const cleanupSource = widgetSource.slice(cleanupStart, cleanupEnd);
+for (const requiredCleanup of [
+  "container.__hmbVideoPickerDeleted = true",
+  "hmbClearPendingPickerStateEcho(container)",
+  "delete container.__hmbPendingPickerState",
+  "delete container.__hmbAuthoritativePickerState",
+  "delete container.__hmbMayaSceneDraftPath",
+  "delete container.__hmbMayaSceneDraftRuntimeInstanceId",
+  "delete container.__hmbNativePickerDeadlineMs",
+  "delete container.__hmbNativePickerPreviousPath",
+  "delete container.__hmbReadAckTimer",
+  "delete container.__hmbOriginalAckTimer",
+]) {
+  assert.match(cleanupSource, new RegExp(requiredCleanup.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+}
+assert.match(widgetSource, /if \(container\.__hmbVideoPickerDeleted === true\) \{[\s\S]*?delivered: false/);
+
 console.log(
   "HMB VideoPicker delete lifecycle UI regression: PASS "
-  + "(active preview pause/flag cleanup and deterministic next preview)",
+  + "(active preview cleanup, delete-session timer/cache teardown, zero late publication)",
 );

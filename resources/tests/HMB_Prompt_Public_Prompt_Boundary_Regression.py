@@ -204,7 +204,9 @@ video = job["videos"][0]
 assert video["video"] == "@video1"
 assert video["label"] == "C:\\private\\video\\public_boundary_playblast.mp4"
 assert video["source_type"] == "Maya Preview / Playblast"
-assert video["control_role"] == "Primary Unified Shot Control"
+# A plain Maya Playblast is reference media, not automatic unified authority.
+# The user must select a compatible explicit role when that authority is wanted.
+assert video["control_role"] == ""
 assert video["identity"] == {
     "video_uid": "internal-video-uid",
     # Normalization makes the selected video UID the canonical source UID.

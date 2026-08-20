@@ -132,7 +132,10 @@ assert.match(main, /availability\.operationBusy \|\| container\.__hmbPickerOpera
 assert.match(main, /hmbSetPickerVisibilityBusy\(container, true\)/);
 assert.match(main, /hmbApplyPickerCameraSelectionToDom\(container, next\);\s*commit\(next\);/);
 assert.match(main, /hmbApplyPickerResolutionToDom\(container, selected\.width, selected\.height\);\s*commit\(next\);/);
-assert.match(main, /hmbApplySelectedVideoAssetOrderToDom\(container, nextState, tr, locked\);[\s\S]*?commit\(appendActivityLog/);
+assert.match(
+  main,
+  /hmbApplySelectedVideoAssetOrderToDom\(container, nextState, tr, pickerLocalInteractionLocked\(nextState\)\);[\s\S]*?const loggedState = appendActivityLog[\s\S]*?schedulePickerStatePublicationAfterPaint\(/,
+);
 assert.match(main, /const snapshotUpdated = hmbApplySnapshotNavigationFeedback/);
 assert.match(main, /commit\(next, \{ suppressMatchingEcho: snapshotUpdated \}\)/);
 assert.match(widgetSource, /current\.__hmbPendingPickerVideoSource = desiredSource/);

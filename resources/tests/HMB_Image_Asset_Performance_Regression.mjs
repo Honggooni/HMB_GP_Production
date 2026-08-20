@@ -124,14 +124,14 @@ assert.equal(
   "A click must outline its card locally before the host round trip.",
 );
 assert.equal(feedbackAttributes.get("aria-pressed"), "true");
-assert.equal(trayCount.textContent, "1/50");
+assert.equal(trayCount.textContent, "1/30");
 assert.equal(
   tray.children[0]?.getAttribute?.("data-selected-key"),
   "asset-feedback",
   "A click must populate the selected tray locally.",
 );
 assert.equal(tray.scrollLeft, 19, "Local tray replacement must retain scroll position.");
-assert.match(status.textContent, /1\/50 SEL/);
+assert.match(status.textContent, /1\/50 (?:SEL|선택)/);
 assert.deepEqual(
   feedbackState,
   assetWidget.hmbNormalizeImageAssetState(feedbackState),
@@ -306,42 +306,20 @@ assert.equal(
   "A higher UI edit revision at the current scan must remain authoritative.",
 );
 
-const manifestPollEcho = assetWidget.hmbImageAssetAutoSyncPayload(
-  feedbackState,
-  "manifest-poll-regression",
-);
-assert.equal(
-  assetWidget.hmbIsImageAssetManifestPollEcho(manifestPollEcho),
-  true,
-  "The exact lightweight manifest envelope must be recognized before normalization.",
-);
-assert.equal(
-  assetWidget.hmbIsImageAssetManifestPollEcho(JSON.parse(manifestPollEcho)),
-  true,
-  "Hosts that decode JSON before echoing must receive the same transport-only guard.",
-);
-assert.equal(
-  assetWidget.hmbIsImageAssetManifestPollEcho(JSON.stringify({
-    ...JSON.parse(manifestPollEcho),
-    assets: [],
-  })),
-  false,
-  "A canonical state carrying asset data must never be consumed as a lightweight echo.",
-);
 const oldCallback = () => "old";
 const newCallback = () => "new";
 const retainedProps = { value: exactEchoValue, onChange: oldCallback };
 assert.equal(
   assetWidget.hmbUpdateImageAssetPropsReference(
     retainedProps,
-    { value: manifestPollEcho, onChange: newCallback },
+    { value: "newer-authoritative-value", onChange: newCallback },
     true,
   ),
   retainedProps,
   "No-remount prop updates must retain the object captured by installed event handlers.",
 );
-assert.equal(retainedProps.value, exactEchoValue, "A poll echo must not replace canonical props.value.");
-assert.equal(retainedProps.onChange, newCallback, "A poll echo must refresh the callback used by card events.");
+assert.equal(retainedProps.value, exactEchoValue, "A no-remount update must retain canonical props.value.");
+assert.equal(retainedProps.onChange, newCallback, "A no-remount update must refresh the callback used by card events.");
 assert.equal(
   assetWidget.hmbUpdateImageAssetPropsReference(retainedProps, { value: exactEchoValue }),
   retainedProps,
@@ -635,21 +613,11 @@ const makeAutoSyncContainer = () => ({
   });
   const controller = assetWidget.default(container, { value: authoritative, onChange() {} });
   const writesAfterMount = rootWrites;
-  const pollValue = assetWidget.hmbImageAssetAutoSyncPayload(
-    authoritative,
-    "manifest-poll-raw-host-echo",
-  );
-  controller.update({ value: pollValue, onChange() {} });
-  assert.equal(
-    rootWrites,
-    writesAfterMount,
-    "A raw optimistic manifest-poll echo must not empty and remount the asset grid.",
-  );
   controller.update({ value: JSON.stringify(authoritative), onChange() {} });
   assert.equal(
     rootWrites,
     writesAfterMount,
-    "The unchanged canonical response after a poll must also preserve DOM/image identity.",
+    "An unchanged canonical host echo must preserve DOM/image identity.",
   );
   const changedCanonical = assetWidget.hmbNormalizeImageAssetState({
     ...authoritative,
@@ -669,9 +637,11 @@ const makeAutoSyncContainer = () => ({
   controller.update({ value: JSON.stringify(changedCanonical), onChange() {} });
   assert.equal(
     rootWrites,
-    writesAfterMount + 1,
-    "A real canonical manifest change must still remount exactly once.",
+    writesAfterMount,
+    "A real canonical manifest change must patch without replacing the widget root.",
   );
+  assert.equal(container.__hmbImageAssetLatestState.manifest_signature, "manifest-changed");
+  assert.equal(container.__hmbImageAssetLatestState.assets.length, 2);
 
   const rapidMountedValues = [];
   const mountedA = assetWidget.hmbNormalizeImageAssetState({
@@ -725,63 +695,34 @@ const makeAutoSyncContainer = () => ({
   assert.equal(staleCallbackCalls, 0, "A delayed A echo must not restore its obsolete callback.");
   controller.cleanup();
 }
-const exerciseAutoSyncFailure = async (failureKind) => {
+const verifyNoBackgroundAutoSyncPolling = () => {
   const timers = new Map();
   let timerSequence = 0;
-  let fakeNow = 100_000;
   const savedSetTimeout = globalThis.setTimeout;
   const savedClearTimeout = globalThis.clearTimeout;
-  const savedDateNow = Date.now;
   globalThis.setTimeout = (callback, delay = 0) => {
     const id = ++timerSequence;
     timers.set(id, { callback, delay: Number(delay) || 0 });
     return id;
   };
   globalThis.clearTimeout = (id) => timers.delete(id);
-  Date.now = () => fakeNow;
-  const runNextTimer = () => {
-    const entry = timers.entries().next().value;
-    assert.ok(entry, "Auto-sync must leave a next timer installed.");
-    const [id, timer] = entry;
-    timers.delete(id);
-    fakeNow += timer.delay;
-    timer.callback();
-    return timer.delay;
-  };
   const container = makeAutoSyncContainer();
   let calls = 0;
   let mounted;
   try {
     mounted = assetWidget.default(container, {
       value: { project_root: "C:/project", catalog_root: "C:/project" },
-      onChange() {
-        calls += 1;
-        if (calls !== 1) return undefined;
-        if (failureKind === "throw") throw new Error("auto-sync throw");
-        return Promise.reject(new Error("auto-sync reject"));
-      },
+      onChange() { calls += 1; },
     });
-    runNextTimer();
-    if (failureKind === "reject") await Promise.resolve();
-    assert.equal(calls, 1);
-    assert.equal(timers.size, 1, `${failureKind} must keep exactly one retry scheduled.`);
-    assert.equal(
-      [...timers.values()][0].delay,
-      1000,
-      `${failureKind} must replace the default interval with bounded backoff.`,
-    );
-    runNextTimer();
-    assert.equal(calls, 2, `${failureKind} recovery poll must execute after backoff.`);
-    assert.equal(timers.size, 1, "A successful recovery must restore periodic polling.");
+    assert.equal(calls, 0, "Mounting must not publish an unsolicited catalog poll.");
+    assert.equal(timers.size, 0, "The widget must not leave background auto-sync timers running.");
   } finally {
     try { mounted?.cleanup?.(); } catch (_error) {}
     globalThis.setTimeout = savedSetTimeout;
     globalThis.clearTimeout = savedClearTimeout;
-    Date.now = savedDateNow;
   }
 };
-await exerciseAutoSyncFailure("throw");
-await exerciseAutoSyncFailure("reject");
+verifyNoBackgroundAutoSyncPolling();
 
 const selectableAsset = (id, selected = false, order = 0, extra = {}) => ({
   asset_library_id: id,
@@ -1004,28 +945,18 @@ assert.doesNotMatch(
 );
 assert.match(
   installEventsSource,
-  /const selectedTray = container\.querySelector\("\.tray-scroll"\)[\s\S]*?on\(selectedTray, "dragstart"[\s\S]*?on\(selectedTray, "drop"[\s\S]*?on\(selectedTray, "click"/,
-  "Delegated move/remove/drag handlers must survive tray-only replacement.",
+  /const selectedTray = container\.querySelector\("\[data-shot-tray\]"\);[\s\S]*?hmbInstallImageAssetShotDragReorder\(container, \{[\s\S]*?listen: \(eventName, handler\) => on\(container, eventName, handler, true\),[\s\S]*?on\(selectedTray, "click"/,
+  "Stable-container drag delegation and active-tray removal must survive tray patching.",
 );
 assert.match(
   installEventsSource,
   /on\(container, "error"[\s\S]*?image\.closest/,
   "One capture listener must handle dynamically replaced thumbnail errors.",
 );
-assert.match(
+assert.doesNotMatch(
   assetSource,
-  /now >= autoSyncPendingUntil[\s\S]*?autoSyncPendingUntil = now \+ IMAGE_ASSET_AUTO_SYNC_PENDING_MS/,
-  "Rapid auto-sync wakeups must not stack host round trips.",
-);
-assert.match(
-  assetSource,
-  /if \(!value\.slice\(0, 256\)\.includes\('"__hmb_manifest_poll_nonce"'\)\) return false;[\s\S]*?JSON\.parse\(value\)/,
-  "Canonical catalog props must bypass the poll guard without another full JSON parse.",
-);
-assert.match(
-  assetSource,
-  /&& !container\.__hmbImageAssetSelectionCommitPending/,
-  "Auto-sync must yield while a local selection commit is pending.",
+  /hmbImageAssetAutoSyncPayload|hmbIsImageAssetManifestPollEcho|__hmb_manifest_poll_nonce|IMAGE_ASSET_AUTO_SYNC|function runAutoSync|scheduleAutoSync/,
+  "ImageAsset must not retain the retired background manifest polling path.",
 );
 assert.match(
   assetSource,
@@ -1039,18 +970,13 @@ assert.match(
 );
 assert.match(
   assetSource,
-  /const cleanup = \(\) => \{[\s\S]*?hmbInvalidateImageAssetPublication\(container\);[\s\S]*?hmbFlushImageAssetSelectionCommit\(container\)[\s\S]*?hmbInvalidateImageAssetPublication\(container\);[\s\S]*?disposed = true/,
-  "Cleanup must flush a visible local selection, then invalidate the flush publication before releasing the mount.",
+  /const cleanup = \(\) => \{[\s\S]*?hmbInvalidateImageAssetPublication\(container\);[\s\S]*?hmbCancelImageAssetSelectionCommit\(container\);[\s\S]*?hmbForgetImageAssetStateEcho\(container\);/,
+  "Cleanup must cancel pending selection and echo work without publishing a disposed widget.",
 );
 assert.match(
   toggleSource,
-  /rollbackState = pending\.state[\s\S]*?if \(rollbackState\) \{\s*remount\(rollbackState\);[\s\S]*?hmbRestoreImageAssetSelectionSnapshot\(state, baseSelection\)/,
+  /rollbackState = pending\.state[\s\S]*?if \(rollbackState\) \{\s*state = remount\(rollbackState\);[\s\S]*?hmbRestoreImageAssetSelectionSnapshot\(state, baseSelection\)/,
   "A latest selection transport failure must restore pending authority or the compact base selection snapshot.",
-);
-assert.match(
-  assetSource,
-  /function runAutoSync\(\) \{[\s\S]*?try \{[\s\S]*?props\.onChange[\s\S]*?Promise\.resolve\(result\)\.then[\s\S]*?\} finally \{[\s\S]*?scheduleAutoSync\(nextDelay\);/,
-  "Auto-sync throw/reject paths must always leave the next poll scheduled.",
 );
 assert.match(
   assetSource,
@@ -1067,15 +993,4 @@ assert.match(
   /const cleanup = \(\) => \{[\s\S]*?delete container\.__hmbImageAssetCurrentScanRevision;[\s\S]*?delete container\.__hmbImageAssetCurrentUiEditRevision;[\s\S]*?delete container\.__hmbImageAssetLatestLocalUiEditRevision;/,
   "Cleanup must discard ImageAsset revision baselines before workflow hydration.",
 );
-assert.match(
-  assetSource,
-  /Promise\.resolve\(result\)\.then\(\s*\(\) => settle\(\),\s*\(error\) => settle\(error\)/,
-  "An asynchronous auto-sync rejection must be handled by the owned request settlement path.",
-);
-assert.match(
-  assetSource,
-  /const settle = \(error = null\) => \{[\s\S]*?if \(error\) \{[\s\S]*?scheduleAutoSync\(1000\);/,
-  "A failed owned auto-sync request must replace the default poll with a bounded retry.",
-);
-
 console.log("HMB ImageAsset immediate feedback + no-remount performance regression: PASS");

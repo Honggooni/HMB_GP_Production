@@ -16,9 +16,7 @@ except Exception:
     HMBPromptLibrary = None  # type: ignore
 
 try:
-    from .HMBSeedanceGeneration import (
-        HMBSeedanceGeneration,
-    )
+    from .HMBSeedanceGeneration import HMBSeedanceGeneration
 except Exception:
     HMBSeedanceGeneration = None  # type: ignore
 

@@ -16,6 +16,13 @@ prompt = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(prompt)
 
 
+def prompt_json_section(payload: str, header: str):
+    lines = payload.splitlines()
+    assert lines[0] == "HMB_GP_Production"
+    assert len(lines) == 7
+    return json.loads(lines[lines.index(header) + 1])
+
+
 def fallback_texts(state):
     return [
         str(entry.get("text") or "")
@@ -24,10 +31,18 @@ def fallback_texts(state):
     ]
 
 
-# Readable malformed/non-object connected values are ordinary intent, never {}.
+# Non-HMB prose and non-object JSON remain losslessly quarantined as local
+# connector fallback state.  They never enter the private USER DESCRIPTION
+# contract, which is sourced only from the Prompt widget's authored text fields.
 raw_asset = "Use the brass key as the hero's emotional anchor"
 parsed_asset = prompt._parse_image_asset_payload(raw_asset)
-assert parsed_asset
+assert parsed_asset == {
+    "__hmb_unstructured_input__": [{
+        "source": "IMAGE_ASSET_IN",
+        "reason": "readable non-JSON connected input",
+        "text": raw_asset,
+    }],
+}
 asset_state = prompt._apply_image_asset_payload(
     prompt._default_widget_state(),
     parsed_asset,
@@ -35,17 +50,31 @@ asset_state = prompt._apply_image_asset_payload(
 )
 assert raw_asset in fallback_texts(asset_state)
 assert asset_state["image_asset"]["enabled"] is True
+assert prompt_json_section(
+    prompt._build_data_only_prompt_package(asset_state),
+    "USER DESCRIPTION DATA (JSON):",
+) == {}
 
 raw_picker = '["slow orbit", {"mood":"hesitant"}]'
 parsed_picker = prompt._parse_picker_payload(raw_picker)
-assert parsed_picker
+assert parsed_picker == {
+    "__hmb_unstructured_input__": [{
+        "source": "PICKER_IN",
+        "reason": "readable non-object connected input",
+        "text": raw_picker,
+    }],
+}
 picker_state = prompt._apply_picker_payload(
     prompt._default_widget_state(),
     parsed_picker,
     connected=True,
 )
-assert "slow orbit" in "\n".join(fallback_texts(picker_state))
+assert raw_picker in fallback_texts(picker_state)
 assert picker_state["picker"]["enabled"] is True
+assert prompt_json_section(
+    prompt._build_data_only_prompt_package(picker_state),
+    "USER DESCRIPTION DATA (JSON):",
+) == {}
 
 
 # Foreign contracts are preserved and cannot erase existing connected state.
@@ -74,6 +103,11 @@ foreign_result = prompt._apply_picker_payload(existing, foreign_picker, connecte
 assert foreign_result["videos"][0]["label"] == "manual_color"
 assert foreign_result["picker"]["run_id"] == "keep-run"
 assert "Use every reflection" in "\n".join(fallback_texts(foreign_result))
+foreign_user = prompt_json_section(
+    prompt._build_data_only_prompt_package(foreign_result),
+    "USER DESCRIPTION DATA (JSON):",
+)
+assert foreign_user == {}
 
 
 # A shorter connected Asset selection removes only the deselected upstream-owned
@@ -168,6 +202,10 @@ assert custom_row["asset_color_pick_candidates"] == ["Red", "Infrared dream mark
 fallback_blob = "\n".join(fallback_texts(custom_result))
 assert "Invented cinematic scope" in fallback_blob
 assert "Infrared dream marker" in fallback_blob
+assert prompt_json_section(
+    prompt._build_data_only_prompt_package(custom_result),
+    "USER DESCRIPTION DATA (JSON):",
+) == {}
 
 
 # Picker refresh may replace only its auto marker, never the user's frame range.
@@ -184,6 +222,14 @@ range_image = {
     "picker_auto_color": "Red",
     "picker_auto_video": 1,
     "picker_auto_source": "old-picker",
+    "frame_range_intent": {
+        "version": 1,
+        "enabled": True,
+        "start_frame": 101,
+        "end_frame": 140,
+        "ranges": [{"start": 110, "end": 120}],
+        "selected_index": 0,
+    },
     "frame_range_enabled": True,
     "frame_range_bindings": {
         "@video1::Red": {
@@ -212,7 +258,71 @@ assert range_result["images"][0]["frame_range_bindings"]["@video1::Red"]["ranges
 auto_range_state = copy.deepcopy(range_state)
 auto_range_state["images"][0]["frame_range_bindings"]["@video1::Red"]["origin"] = "picker_auto"
 auto_range_result = prompt._apply_picker_payload(auto_range_state, picker_payload, connected=True)
-assert "@video1::Red" not in auto_range_result["images"][0]["frame_range_bindings"]
+assert auto_range_result["images"][0]["frame_range_enabled"] is True
+assert auto_range_result["images"][0]["frame_range_intent"] == {
+    "version": 1,
+    "enabled": True,
+    "start_frame": 101,
+    "end_frame": 140,
+    "ranges": [{"start": 110, "end": 120}],
+    "selected_index": 0,
+}
+
+
+# An attached VideoPicker may legitimately publish an authoritative empty
+# selection. It may retire an unsafe @video address, but that source refresh is
+# not allowed to undo the user's independent Range ON choice.
+empty_picker_state = copy.deepcopy(range_state)
+empty_picker_state["images"][0]["color_picks"] = [""]
+empty_picker_state["images"][0]["frame_range_bindings"] = {
+    "@video1::": {
+        "video_slot": "@video1",
+        "color_pick": "",
+        "enabled": True,
+        "origin": "manual",
+        "start_frame": 101,
+        "end_frame": 140,
+        "ranges": [{"start": 110, "end": 120}],
+    },
+}
+empty_picker_state["images"][0]["frame_range_binding"] = copy.deepcopy(
+    empty_picker_state["images"][0]["frame_range_bindings"]["@video1::"]
+)
+empty_picker_payload = {
+    "schema": "hmb-prompt-library-picker-binding",
+    "mode": "maya",
+    "media_ready": False,
+    "selection_id": "empty-selection",
+    "selected_video_count": 0,
+    "videos": [],
+    "markers": [],
+}
+empty_picker_result = prompt._apply_picker_payload(
+    empty_picker_state,
+    empty_picker_payload,
+    connected=True,
+)
+assert empty_picker_result["picker"]["enabled"] is True
+assert empty_picker_result["picker"]["selected_video_count"] == 0
+assert empty_picker_result["images"][0]["frame_range_enabled"] is True
+assert empty_picker_result["images"][0]["frame_range_selected_index"] == 0
+assert empty_picker_result["images"][0]["frame_range_intent"] == {
+    "version": 1,
+    "enabled": True,
+    "start_frame": 101,
+    "end_frame": 140,
+    "ranges": [{"start": 110, "end": 120}],
+    "selected_index": 0,
+}
+empty_picker_repeat = prompt._apply_picker_payload(
+    empty_picker_result,
+    empty_picker_payload,
+    connected=True,
+)
+assert empty_picker_repeat["images"][0]["frame_range_enabled"] is True
+assert empty_picker_repeat["images"][0]["frame_range_intent"] == empty_picker_result[
+    "images"
+][0]["frame_range_intent"]
 
 
 # Unknown Picker markers remain usable rather than being normalized to blank.
@@ -230,9 +340,8 @@ unknown_result = prompt._apply_picker_payload(unknown_state, unknown_payload, co
 assert unknown_result["images"][0]["color_picks"] == ["Infrared dream marker"]
 
 
-# Dormant relationship Targets remain local state. The typed public job keeps
-# the active Prop target and selected source binding, while the direct Prompt
-# UI text remains in the five-field USER DESCRIPTION object.
+# Dormant relationship and video addresses remain round-trippable widget state,
+# but the Agent contract publishes only currently active source addresses.
 goal_state = prompt._default_widget_state()
 goal_state["images"] = [{
     **prompt._default_image_item(1),
@@ -247,39 +356,28 @@ goal_state["images"] = [{
 }]
 goal_state["text"]["SCENE_CONTEXT"] = "Resolve @video5 as a dream-memory rhythm"
 goal_prompt = prompt._build_data_only_prompt_package(goal_state)
+goal_job = prompt_json_section(goal_prompt, "HMB JOB DATA (JSON):")
+goal_image = goal_job["images"][0]
+assert goal_image["target_id"] == "Hero hand"
+assert goal_image["relationship_targets"] == []
+assert goal_image["bindings"] == []
 assert goal_state["images"][0]["legacy_relationship_targets"] == [
     "Door lock",
     "Memory echo",
 ]
-goal_lines = goal_prompt.splitlines()
-assert len(goal_lines) == 7
-goal_job = json.loads(goal_lines[2])
-goal_user = json.loads(goal_lines[6])
-goal_image = goal_job["images"][0]
-assert goal_image["source_type"] == "Prop / Accessory"
-assert goal_image["target_id"] == "Hero hand"
-assert goal_image["bindings"] == [{
-    "video": "@video3",
-    "marker_color": "Custom brass marker",
-    "target_scope": "Handheld prop",
-}]
-assert goal_image["relationship_targets"] == []
-assert "Door lock" not in goal_prompt
-assert "Memory echo" not in goal_prompt
-assert "follow @video1" not in goal_prompt
-assert goal_user == {
-    "SCENE_CONTEXT": "Resolve @video5 as a dream-memory rhythm",
-}
+assert goal_state["images"][0]["binding_video_slots"] == [3]
+goal_user = prompt_json_section(goal_prompt, "USER DESCRIPTION DATA (JSON):")
+assert goal_user == {"SCENE_CONTEXT": "Resolve @video5 as a dream-memory rhythm"}
 
 malformed_text_state = prompt._default_widget_state()
 malformed_text_state["text"]["PRESERVED_TEXT"] = "free readable words\n[Future Tag] exact future phrase"
 malformed_prompt = prompt._build_data_only_prompt_package(malformed_text_state)
-assert "PRESERVED_TEXT_DESCRIPTIVE_FALLBACK" not in malformed_prompt
-malformed_user = json.loads(malformed_prompt.splitlines()[6])
-assert malformed_user == {
+assert prompt_json_section(
+    malformed_prompt,
+    "USER DESCRIPTION DATA (JSON):",
+) == {
     "PRESERVED_TEXT": "free readable words\n[Future Tag] exact future phrase",
 }
-assert "SOURCE DATA WARNINGS" not in malformed_prompt
 
 source = (ROOT / "HMBPromptLibrary.py").read_text(encoding="utf-8")
 for forbidden in (
@@ -291,4 +389,4 @@ for forbidden in (
 ):
     assert forbidden not in source
 
-print("HMB Prompt connection no-loss and goal-first regression: PASS")
+print("HMB Prompt connection data-boundary regression: PASS")

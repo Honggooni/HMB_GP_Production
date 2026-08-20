@@ -37,7 +37,7 @@ picker_node = picker.HMBVideoPickerLibrary(name="picker_state_restore")
 assert picker_node.width == 1400
 assert picker_node.height == 1200
 assert picker_node.metadata["size"] == {"width": 1400, "height": 1200}
-assert picker_node.metadata["hmb_picker_native_size_version"] == 2
+assert picker_node.metadata["hmb_picker_native_size_version"] == 3
 
 # Updating the library's new-node default must not migrate a serialized manual
 # resize from an existing workflow.
@@ -50,7 +50,7 @@ resized_picker_node = picker.HMBVideoPickerLibrary(
     metadata=copy.deepcopy(saved_picker_metadata),
 )
 assert resized_picker_node.metadata["size"] == saved_picker_metadata["size"]
-assert resized_picker_node.metadata["hmb_picker_native_size_version"] == 2
+assert resized_picker_node.metadata["hmb_picker_native_size_version"] == 3
 saved_picker_state = copy.deepcopy(picker_node._picker_state())
 saved_picker_state.update({
     "runtime_instance_id": "saved-workflow-runtime",
@@ -370,8 +370,8 @@ assert reset_picker_state["node_width"] == 0
 assert reset_picker_state["node_height"] == 0
 assert reset_picker_state["outliner_panel_height"] == 0
 assert reset_picker_state["viewport_panel_height"] == 0
-assert reset_picker_state["right_section_heights"] == {"settings": 217, "color": 628, "log": 208}
-assert reset_picker_state["ui_layout_version"] == 6
+assert reset_picker_state["right_section_heights"] == {"settings": 285, "color": 628, "log": 208}
+assert reset_picker_state["ui_layout_version"] == 5
 assert reset_picker_state["ui_theme"] == "P"
 
 legacy_picker_state = picker._default_widget_state()
@@ -379,29 +379,9 @@ legacy_picker_state.pop("ui_layout_version", None)
 legacy_picker_state["viewport_panel_height"] = 900
 legacy_picker_state["right_section_heights"] = {"settings": 190, "color": 412, "log": 208}
 migrated_picker_state = picker._parse_state(legacy_picker_state)
-assert migrated_picker_state["ui_layout_version"] == 6
+assert migrated_picker_state["ui_layout_version"] == 5
 assert migrated_picker_state["viewport_panel_height"] == 684
 assert migrated_picker_state["right_section_heights"]["color"] == 628
-
-version_five_picker_state = picker._default_widget_state()
-version_five_picker_state["ui_layout_version"] = 5
-version_five_picker_state["right_section_heights"] = {
-    "settings": 285,
-    "color": 628,
-    "log": 208,
-}
-migrated_version_five = picker._parse_state(version_five_picker_state)
-assert migrated_version_five["ui_layout_version"] == 6
-assert migrated_version_five["right_section_heights"] == {
-    "settings": 217,
-    "color": 628,
-    "log": 208,
-}
-assert picker._parse_state(migrated_version_five)["right_section_heights"] == {
-    "settings": 217,
-    "color": 628,
-    "log": 208,
-}
 
 reset_prompt = prompt.HMBPromptLibrary(name="prompt_reset_default")
 reset_prompt_state = reset_prompt._current_state()

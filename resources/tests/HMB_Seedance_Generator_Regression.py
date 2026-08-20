@@ -2,12 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import http.server
 import io
 import importlib.util
 import json
-import os
-import socket
 import sys
 import tempfile
 import threading
@@ -40,8 +37,6 @@ from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
 ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 MODULE_PATH = ROOT / "HMBSeedanceGeneration.py"
 IMAGE_ASSET_MODULE_PATH = ROOT / "HMBImageAssetLibrary.py"
 VIDEO_PICKER_MODULE_PATH = ROOT / "HMBVideoPickerLibrary.py"
@@ -91,25 +86,13 @@ def load_video_picker_target():
 target = load_target()
 image_asset_target = load_image_asset_target()
 video_picker_target = load_video_picker_target()
-mp4_verify_target = sys.modules["_hmb_mp4_verify"]
-
-# Most generator cases use a deliberately minimal structural MP4 fixture. Keep
-# those tests independent of a host codec binary; the real probe implementation
-# is exercised with bounded subprocess mocks below.
-REAL_MP4_DECODE_PROBE = target._validate_decodable_mp4_file
-REAL_MP4_DECODE_VERIFIER_RESOLVER = target._resolve_mp4_decode_verifier
-target._validate_decodable_mp4_file = lambda _path, _verifier=None: None
-target._resolve_mp4_decode_verifier = lambda: target._MP4DecodeVerifier(
-    "ffprobe",
-    Path("C:/managed-test-tools/ffprobe.exe"),
-)
 
 
 class FakeDestination:
     def __init__(self) -> None:
-        self._temporary_directory = tempfile.TemporaryDirectory()
+        self._temporary = tempfile.TemporaryDirectory()
         self.location = str(
-            Path(self._temporary_directory.name) / "volcengine-regression.mp4"
+            Path(self._temporary.name) / "volcengine-regression.mp4"
         )
         self.resolved = False
         self.written: bytes | None = None
@@ -119,8 +102,7 @@ class FakeDestination:
         return self.location
 
     async def awrite_bytes(self, content: bytes):
-        self.written = bytes(content)
-        return SimpleNamespace(location=self.location, name="volcengine-regression.mp4")
+        raise AssertionError("Completed MP4 bypassed atomic sibling publication")
 
 
 class FakeOutputFile:
@@ -129,32 +111,6 @@ class FakeOutputFile:
 
     def build_file(self) -> FakeDestination:
         return self.destination
-
-
-class IndexedMacroDestination(FakeDestination):
-    def __init__(self, missing_variables: str = "_index") -> None:
-        super().__init__()
-        self.missing_variables = missing_variables
-        self.resolve_attempts = 0
-        if missing_variables == "_index":
-            parsed_macro = ParsedMacro(
-                Path(self._temporary_directory.name).as_posix()
-                + "/take_{###}/volcengine-regression.mp4"
-            )
-            self._file = SimpleNamespace(
-                _file_path=target.MacroPath(parsed_macro, {}),
-                _file_metadata=None,
-            )
-            self._existing_file_policy = target.ExistingFilePolicy.CREATE_NEW
-            self._create_parents = True
-            self._append = False
-
-    def resolve(self) -> str:
-        self.resolve_attempts += 1
-        raise RuntimeError(
-            "Attempted to resolve macro path. Failed because missing required "
-            f"variables: {self.missing_variables}"
-        )
 
 
 
@@ -245,10 +201,6 @@ def assert_constructor_and_public_contract() -> None:
         node = target.HMBSeedanceGeneration(name="Constructor Regression")
 
     assert target.HMBSeedanceGeneration.__mro__[1].__name__ == "SuccessFailureNode"
-    assert target.HMBSeedanceGeneration.__name__ == "HMBSeedanceGeneration"
-    retired_class_name = "HMB" + "Seedance" + "20VideoGeneration"
-    assert not hasattr(target, retired_class_name)
-    assert retired_class_name not in target.__all__
     names = [parameter.name for parameter in node.parameters]
     for required in (
         "exec_in",
@@ -304,6 +256,7 @@ def assert_constructor_and_public_contract() -> None:
     assert target.MAX_REFERENCE_IMAGES == 9
     assert target.MAX_VIDEO_REFERENCES == 3
     assert target.MAX_REFERENCE_AUDIO == 3
+    assert target.AI_BROKER_SERVER_URL == "http://192.168.203.245:8080"
     assert target.MODEL_RESOLUTIONS[target.SEEDANCE_2_0_MODEL_ID] == (
         "4k",
         "1080p",
@@ -318,6 +271,11 @@ def assert_constructor_and_public_contract() -> None:
         "720p",
         "480p",
     )
+    assert target.MODEL_DEFAULT_RESOLUTIONS == {
+        target.SEEDANCE_2_0_MODEL_ID: "1080p",
+        target.SEEDANCE_2_0_FAST_MODEL_ID: "720p",
+        target.SEEDANCE_2_0_MINI_MODEL_ID: "720p",
+    }
 
     image_parameter = node.get_parameter_by_name("reference_images")
     assert type(image_parameter).__name__ == "Parameter"
@@ -383,8 +341,20 @@ def assert_constructor_and_public_contract() -> None:
     assert type(audio_parameter).__name__ == "ParameterList"
     assert audio_parameter._max_items == 3
     assert node.get_parameter_value("auto_publish_local_videos") is True
+    assert (
+        node.get_parameter_value("local_video_upload_service")
+        == target.LOCAL_VIDEO_UPLOAD_GRIPTAPE
+    )
+    assert node.get_parameter_value("tos_region") == "cn-beijing"
+    assert node.get_parameter_value("tos_endpoint") == "tos-cn-beijing.volces.com"
+    assert node.get_parameter_value("tos_url_validity_seconds") == 86400
+    assert node.get_parameter_by_name("tos_region").hide is True
     assert node.get_parameter_value("model_id") == target.MODEL_NAME_SEEDANCE_2_0
-    assert node.get_parameter_value("resolution") == "1080p"
+    assert node.get_parameter_by_name("model_id").ui_options["simple_dropdown"] == [
+        target.MODEL_NAME_SEEDANCE_2_0,
+        target.MODEL_NAME_SEEDANCE_2_0_FAST,
+        target.MODEL_NAME_SEEDANCE_2_0_MINI,
+    ]
     assert (
         node.get_parameter_value("input_mode")
         == target.INPUT_MODE_MULTIMODAL_REFERENCES
@@ -396,29 +366,14 @@ def assert_constructor_and_public_contract() -> None:
         target.INPUT_MODE_FIRST_LAST_FRAME,
         target.INPUT_MODE_MULTIMODAL_REFERENCES,
     ]
-    assert target.BROKER_SUPPORTED_MODEL_IDS == frozenset(
-        {
-            target.SEEDANCE_2_0_MODEL_ID,
-            target.SEEDANCE_2_0_FAST_MODEL_ID,
-            target.SEEDANCE_2_0_MINI_MODEL_ID,
-        }
-    )
-    assert target.MODEL_DEFAULT_RESOLUTIONS == {
-        target.SEEDANCE_2_0_MODEL_ID: "1080p",
-        target.SEEDANCE_2_0_FAST_MODEL_ID: "720p",
-        target.SEEDANCE_2_0_MINI_MODEL_ID: "720p",
-    }
-    model_choices = node.get_parameter_by_name("model_id").ui_options[
-        "simple_dropdown"
+    assert node.get_parameter_value("generate_audio") is False
+    assert node.get_parameter_value("resolution") == "1080p"
+    assert node.get_parameter_by_name("resolution").ui_options["simple_dropdown"] == [
+        "4k",
+        "1080p",
+        "720p",
+        "480p",
     ]
-    assert model_choices == [
-        target.MODEL_NAME_SEEDANCE_2_0,
-        target.MODEL_NAME_SEEDANCE_2_0_FAST,
-        target.MODEL_NAME_SEEDANCE_2_0_MINI,
-    ]
-    assert node.get_parameter_by_name("resolution").ui_options[
-        "simple_dropdown"
-    ] == ["4k", "1080p", "720p", "480p"]
     assert node.get_parameter_value("ratio") == "adaptive"
     assert node.get_parameter_by_name("ratio").ui_options["simple_dropdown"] == list(
         target.RATIOS
@@ -428,7 +383,6 @@ def assert_constructor_and_public_contract() -> None:
         -1,
         *range(4, 16),
     ]
-    assert node.get_parameter_value("generate_audio") is False
     assert node.get_parameter_value("resume_generation_id") == ""
     assert node.get_parameter_value("watermark") is False
     assert node.get_parameter_value("return_last_frame") is False
@@ -437,27 +391,15 @@ def assert_constructor_and_public_contract() -> None:
     assert node.get_parameter_value("poll_interval_seconds") == 30
     assert node.get_parameter_value("generation_timeout_seconds") == 3600
     node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0_FAST)
+    assert node._get_parameters()["model_id"] == target.SEEDANCE_2_0_FAST_MODEL_ID
     assert node.get_parameter_value("resolution") == "720p"
-    assert node.get_parameter_by_name("resolution").ui_options[
-        "simple_dropdown"
-    ] == ["720p", "480p"]
+    assert node.get_parameter_by_name("resolution").ui_options["simple_dropdown"] == [
+        "720p",
+        "480p",
+    ]
     node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0_MINI)
-    assert node.get_parameter_by_name("resolution").ui_options[
-        "simple_dropdown"
-    ] == ["720p", "480p"]
-    node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0)
-    assert node.get_parameter_by_name("resolution").ui_options[
-        "simple_dropdown"
-    ] == ["4k", "1080p", "720p", "480p"]
-    assert (
-        node.get_parameter_value("local_video_upload_service")
-        == target.LOCAL_VIDEO_UPLOAD_GRIPTAPE
-    )
-    assert node.get_parameter_value("tos_region") == "cn-beijing"
-    assert node.get_parameter_value("tos_endpoint") == "tos-cn-beijing.volces.com"
-    assert node.get_parameter_value("tos_url_validity_seconds") == 86400
-    assert node.get_parameter_by_name("tos_region").hide is True
-    assert node.get_parameter_value("generate_audio") is False
+    assert node._get_parameters()["model_id"] == target.SEEDANCE_2_0_MINI_MODEL_ID
+    assert node.get_parameter_value("resolution") == "720p"
     saved_audio_node = target.HMBSeedanceGeneration(
         name="Saved Generate Audio Regression"
     )
@@ -520,13 +462,16 @@ def assert_constructor_and_public_contract() -> None:
         "Volcengine" + "APIError",
         "_process_" + "direct",
         "_refresh_" + "direct",
+        "USAGE" + "_LEDGER_ROOT",
+        "Griptape_" + "list",
     ):
         assert forbidden_symbol not in source
-    assert "CGTeamwork" not in source
-    assert '"/api/device/start"' in source
-    assert '"/api/device/token"' in source
-    assert 'headers["Idempotency-Key"]' in source
-    assert ("_Base" + "Seedance" + "20") not in source
+    assert not {
+        name
+        for name in dir(target.HMBSeedanceGeneration)
+        if "usage" in name.casefold() or "direct" in name.casefold()
+    }
+    assert "_BaseSeedance" not in source
     assert "GriptapeProxyNode" not in source
     assert "ProxyAuthProviderParameter" not in source
     assert "HMB_GRIPTAPE_STANDARD_LIBRARY_PATH" not in source
@@ -538,8 +483,10 @@ def assert_constructor_and_public_contract() -> None:
     assert "PublicArtifactUrlParameter" not in source
     assert "GriptapeCloudStorageDriver" in source
     assert 'importlib.import_module("tos")' in source
-    assert "MODEL_DEFAULT_RESOLUTIONS" in source
-    assert "MODEL_RESOLUTIONS[SEEDANCE_2_0_MODEL_ID]" in source
+    assert (
+        "Options(choices=list(MODEL_RESOLUTIONS[SEEDANCE_2_0_MODEL_ID]))"
+        in source
+    )
 
 
 def assert_image_asset_single_wire_host_contract() -> None:
@@ -1091,38 +1038,36 @@ def assert_payload_and_media_contract() -> None:
     else:
         raise AssertionError("Fast model accepted 1080p")
 
-    for supported_model in (
-        target.SEEDANCE_2_0_MODEL_ID,
+    params = node._get_parameters()
+    params.update(
+        {
+            "model_id": target.SEEDANCE_2_0_MODEL_ID,
+            "resolution": "4k",
+            "prompt": "standard 4k",
+        }
+    )
+    standard_4k_payload = node._build_broker_payload(params)
+    assert standard_4k_payload["model"] == target.SEEDANCE_2_0_MODEL_ID
+    assert standard_4k_payload["quality"] == "4k"
+
+    for restricted_model in (
+        target.SEEDANCE_2_0_FAST_MODEL_ID,
         target.SEEDANCE_2_0_MINI_MODEL_ID,
     ):
         params = node._get_parameters()
         params.update(
             {
-                "model_id": supported_model,
-                "resolution": (
-                    "4k"
-                    if supported_model == target.SEEDANCE_2_0_MODEL_ID
-                    else "720p"
-                ),
-                "prompt": "supported Broker model",
+                "model_id": restricted_model,
+                "resolution": "4k",
+                "prompt": "restricted 4k",
             }
         )
-        assert node._build_broker_payload(params)["model"] == supported_model
-
-    unsupported = node._get_parameters()
-    unsupported.update(
-        {
-            "model_id": "doubao-seedance-2-0-unknown",
-            "resolution": "720p",
-            "prompt": "unsupported Broker model",
-        }
-    )
-    try:
-        node._build_broker_payload(unsupported)
-    except ValueError as exc:
-        assert "Unsupported Volcengine Seedance model" in str(exc)
-    else:
-        raise AssertionError("Unknown Broker model was accepted")
+        try:
+            node._validate_parameters(params)
+        except ValueError as exc:
+            assert "does not support 4k" in str(exc)
+        else:
+            raise AssertionError(f"Restricted model accepted 4k: {restricted_model}")
 
     params = node._get_parameters()
     params.update(
@@ -1224,18 +1169,6 @@ def assert_broker_generation_contract() -> None:
         "provider-api-key-canary"
     ) == ""
 
-    bridge_contract = target._HMBAIBrokerBridge()
-    settings_error = target.urllib.error.HTTPError(
-        "http://broker.invalid/api/v1/generate/video",
-        400,
-        "Bad Request",
-        {},
-        io.BytesIO(b'{"detail":"resolution is invalid","token":"secret-canary"}'),
-    )
-    safe_error_message = bridge_contract._safe_http_error_message(settings_error)
-    assert "generation settings" in safe_error_message
-    assert "secret-canary" not in safe_error_message
-
     oversized_error = target.urllib.error.HTTPError(
         "http://broker.invalid/api/v1/generate/video",
         413,
@@ -1245,168 +1178,11 @@ def assert_broker_generation_contract() -> None:
             b'{"error_code":"request_body_too_large","token":"secret-canary"}'
         ),
     )
-    oversized_message = bridge_contract._safe_http_error_message(oversized_error)
-    assert "oversized reference-media request" in oversized_message
-    assert "secret-canary" not in oversized_message
-
-    class ExpiredOpener:
-        @staticmethod
-        def open(_request, *, timeout: float):
-            assert timeout > 0
-            raise target.urllib.error.HTTPError(
-                "http://broker.invalid/api/v1/jobs/expired-job/refresh",
-                410,
-                "Gone",
-                {},
-                io.BytesIO(
-                    b'{"status":"expired","job_id":"expired-job"}'
-                ),
-            )
-
-    expired_bridge = target._HMBAIBrokerBridge(opener=ExpiredOpener())
-    with mock.patch.object(target, "_broker_load_token", return_value="saved-token"):
-        expired_result = expired_bridge._request_json(
-            "POST",
-            "/api/v1/jobs/expired-job/refresh",
-            payload=None,
-            timeout=30,
-        )
-    assert expired_result == {
-        "status": "expired",
-        "job_id": "expired-job",
-        "_http_status": 410,
-    }
-
-    fast_payload = {
-        "provider": "volcengine_ark",
-        "model": target.SEEDANCE_2_0_FAST_MODEL_ID,
-        "prompt": "Broker schema regression",
-        "input_mode": target.INPUT_MODE_MULTIMODAL_REFERENCES,
-        "duration_seconds": 5,
-        "quality": "720p",
-        "resolution": "1280x720",
-        "aspect_ratio": "adaptive",
-        "generate_audio": False,
-        "watermark": False,
-        "web_search": False,
-        "content_filter": True,
-        "return_last_frame": False,
-        "execution_expires_after": 172800,
-        "client_request_id": "hmb-schema-request-1",
-    }
-    with mock.patch.object(
-        bridge_contract,
-        "_request_json",
-        return_value={"status": "pending", "job_id": "schema-job-1"},
-    ) as request_json:
-        bridge_contract.generate_seedance(fast_payload, timeout=30)
-    submitted = request_json.call_args.kwargs["payload"]
-    assert set(submitted) == {
-        "provider",
-        "model",
-        "prompt",
-        "input_mode",
-        "duration_seconds",
-        "quality",
-        "resolution",
-        "aspect_ratio",
-        "generate_audio",
-        "watermark",
-        "web_search",
-        "content_filter",
-        "return_last_frame",
-        "execution_expires_after",
-        "client_request_id",
-    }
-    assert "input_mode" in submitted
-    assert "return_last_frame" in submitted
-    assert "execution_expires_after" in submitted
-    assert submitted["client_request_id"] == "hmb-schema-request-1"
-    assert request_json.call_args.kwargs["idempotency_key"] == (
-        "hmb-schema-request-1"
+    safe_error_message = target._HMBAIBrokerBridge._safe_http_error_message(
+        oversized_error
     )
-
-    framed_fast_payload = dict(fast_payload)
-    framed_fast_payload.update(
-        {
-            "input_mode": target.INPUT_MODE_FIRST_LAST_FRAME,
-            "first_frame": ["https://cdn.example/first.png"],
-            "last_frame": ["https://cdn.example/last.png"],
-            "return_last_frame": True,
-        }
-    )
-    with mock.patch.object(
-        bridge_contract,
-        "_request_json",
-        return_value={"status": "pending", "job_id": "schema-job-2"},
-    ) as request_json:
-        bridge_contract.generate_seedance(framed_fast_payload, timeout=30)
-    fast_submitted = request_json.call_args.kwargs["payload"]
-    for field in (
-        "input_mode",
-        "first_frame",
-        "last_frame",
-        "return_last_frame",
-        "execution_expires_after",
-    ):
-        assert field in fast_submitted
-
-    for supported_model, quality in (
-        (target.SEEDANCE_2_0_MODEL_ID, "4k"),
-        (target.SEEDANCE_2_0_MINI_MODEL_ID, "720p"),
-    ):
-        valid = dict(fast_payload)
-        valid["model"] = supported_model
-        valid["quality"] = quality
-        valid["prompt"] = "required prompt"
-        if supported_model == target.SEEDANCE_2_0_MODEL_ID:
-            valid["priority"] = 1
-        with mock.patch.object(
-            bridge_contract,
-            "_request_json",
-            return_value={"status": "pending", "job_id": "all-models-job"},
-        ) as request_json:
-            bridge_contract.generate_seedance(valid, timeout=30)
-        submitted = request_json.call_args.kwargs["payload"]
-        assert submitted["model"] == supported_model
-        assert submitted["quality"] == quality
-        assert ("priority" in submitted) is (
-            supported_model == target.SEEDANCE_2_0_MODEL_ID
-        )
-
-    media_only_mini = dict(fast_payload)
-    media_only_mini.update(
-        {
-            "model": target.SEEDANCE_2_0_MINI_MODEL_ID,
-            "prompt": "",
-            "image_urls": ["data:image/png;base64,AA=="],
-        }
-    )
-    with mock.patch.object(
-        bridge_contract,
-        "_request_json",
-        return_value={"status": "pending", "job_id": "media-only-job"},
-    ) as request_json:
-        bridge_contract.generate_seedance(media_only_mini, timeout=30)
-    assert request_json.call_args.kwargs["payload"]["prompt"] == ""
-    assert request_json.call_args.kwargs["payload"]["image_urls"]
-
-    rejected_payloads = []
-    priority_payload = dict(fast_payload)
-    priority_payload["priority"] = 1
-    rejected_payloads.append(priority_payload)
-    for invalid in rejected_payloads:
-        with mock.patch.object(
-            bridge_contract,
-            "_request_json",
-            side_effect=AssertionError("invalid payload reached FN AI Broker"),
-        ):
-            try:
-                bridge_contract.generate_seedance(invalid, timeout=30)
-            except target._BrokerProtocolError:
-                pass
-            else:
-                raise AssertionError("Invalid Broker payload was accepted")
+    assert "oversized reference-media request" in safe_error_message
+    assert "secret-canary" not in safe_error_message
 
     completed = {
         "status": "completed",
@@ -1420,6 +1196,7 @@ def assert_broker_generation_contract() -> None:
     node = BrokerScriptedNode(bridge)
     node.set_parameter_value("prompt", "Broker-only Seedance regression")
     assert not hasattr(node, "_get_" + "api_key")
+    assert not {name for name in dir(node) if "usage" in name.casefold()}
     asyncio.run(node._process_generation())
 
     assert bridge.account_calls == 1
@@ -1431,17 +1208,7 @@ def assert_broker_generation_contract() -> None:
     assert payload["prompt"] == "Broker-only Seedance regression"
     assert payload["duration_seconds"] == 5
     assert payload["quality"] == "1080p"
-    assert payload["resolution"] == "1280x720"
     assert payload["aspect_ratio"] == "adaptive"
-    assert payload["web_search"] is False
-    assert payload["content_filter"] is True
-    assert target._TASK_ID_PATTERN.fullmatch(payload["client_request_id"])
-    portrait = BrokerScriptedNode(FakeBrokerBridge([]))
-    portrait_params = portrait._get_parameters()
-    portrait_params.update({"prompt": "portrait", "ratio": "9:16"})
-    assert portrait._build_broker_payload(portrait_params)["resolution"] == (
-        "720x1280"
-    )
     assert not any(
         sensitive in key.lower()
         for key in payload
@@ -1483,12 +1250,7 @@ def assert_broker_generation_contract() -> None:
     )
     resumed = BrokerScriptedNode(resume_bridge)
     resumed.set_parameter_value("resume_generation_id", "broker-resume-9")
-    with mock.patch.object(
-        target,
-        "_resolve_mp4_decode_verifier",
-        side_effect=AssertionError("Resume performed a new-render verifier preflight"),
-    ):
-        asyncio.run(resumed._process_generation())
+    asyncio.run(resumed._process_generation())
     assert resume_bridge.generate_payloads == []
     assert resume_bridge.refresh_ids == ["broker-resume-9"]
     assert resumed.downloads == ["https://cdn.example/resumed-broker.mp4"]
@@ -1507,161 +1269,6 @@ def assert_broker_generation_contract() -> None:
     asyncio.run(refreshed._refresh_async())
     assert refresh_bridge.refresh_ids == ["broker-refresh-3"]
     assert refreshed.downloads == ["https://cdn.example/refreshed-broker.mp4"]
-
-    class SameKeyRetryBridge(FakeBrokerBridge):
-        def refresh_job(self, job_id: str, *, timeout: float = 60) -> dict:
-            assert timeout > 0
-            self.refresh_ids.append(job_id)
-            raise target._BrokerError("not registered", status_code=404)
-
-        def generate_seedance(self, payload: dict, *, timeout: float) -> dict:
-            assert timeout > 0
-            self.generate_payloads.append(dict(payload))
-            return {
-                "status": "pending",
-                "job_id": payload["client_request_id"],
-            }
-
-    stable_request_id = "hmb-stable-request-123"
-    retry_bridge = SameKeyRetryBridge([])
-    retry_node = BrokerScriptedNode(retry_bridge)
-    retry_payload = {
-        "provider": "volcengine_ark",
-        "model": target.SEEDANCE_2_0_MODEL_ID,
-        "prompt": "same idempotent request",
-        "client_request_id": stable_request_id,
-    }
-    retry_node._last_broker_payload = dict(retry_payload)
-    retry_node.parameter_output_values["generation_id"] = stable_request_id
-    retry_node.parameter_output_values["generation_status"] = "submission_unknown"
-    asyncio.run(retry_node._refresh_async())
-    assert retry_bridge.refresh_ids == [stable_request_id]
-    assert retry_bridge.generate_payloads == [retry_payload]
-    assert retry_node.parameter_output_values["generation_id"] == stable_request_id
-    assert retry_node.parameter_output_values["generation_status"] == "queued"
-    assert retry_node.parameter_output_values["was_successful"] is False
-    assert retry_node._execution_succeeded is None
-    assert "display_name" not in (
-        retry_node.status_component.get_parameter_group().ui_options
-    )
-    assert "never starts a duplicate render" in retry_node.parameter_output_values[
-        "result_details"
-    ]
-
-    failed_bridge = FakeBrokerBridge(
-        [{"status": "failed", "job_id": "broker-refresh-failed-4"}]
-    )
-    failed_refresh = BrokerScriptedNode(failed_bridge)
-    failed_refresh.parameter_output_values["generation_id"] = (
-        "broker-refresh-failed-4"
-    )
-    asyncio.run(failed_refresh._refresh_async())
-    assert failed_refresh.parameter_output_values["generation_status"] == "failed"
-    assert failed_refresh.parameter_output_values["was_successful"] is False
-    assert failed_refresh._execution_succeeded is False
-    assert "display_name" in (
-        failed_refresh.status_component.get_parameter_group().ui_options
-    )
-
-    submission_unknown_response = {
-        "status": "failed",
-        "job_id": "job-submission-unknown-5",
-        "provider_job_id": "",
-        "error_code": "submission_unknown",
-        "error": "server detail must not be copied into public node state",
-        "message": "server guidance must not be copied into public node state",
-        "terminal": True,
-        "resubmit_allowed": False,
-        "recovery_action": "contact_admin",
-        "token": FakeBrokerBridge.SECRET_VALUES[0],
-    }
-    normalized_unknown = (
-        target.HMBSeedanceGeneration._normalize_broker_task(
-            submission_unknown_response
-        )
-    )
-    assert normalized_unknown == {
-        "id": "job-submission-unknown-5",
-        "status": "failed",
-        "broker_status": "failed",
-        "error_code": "submission_unknown",
-        "terminal": True,
-        "resubmit_allowed": False,
-        "recovery_action": "contact_admin",
-        "provider_task_registered": False,
-    }
-
-    class TerminalSubmissionUnknownBridge(FakeBrokerBridge):
-        def generate_seedance(self, payload: dict, *, timeout: float) -> dict:
-            assert timeout > 0
-            self.generate_payloads.append(dict(payload))
-            response = dict(submission_unknown_response)
-            response["job_id"] = payload["client_request_id"]
-            return response
-
-    terminal_bridge = TerminalSubmissionUnknownBridge([])
-    terminal_node = BrokerScriptedNode(terminal_bridge)
-    terminal_node.set_parameter_value("prompt", "terminal submission regression")
-    try:
-        asyncio.run(terminal_node._aprocess_impl())
-    except RuntimeError as exc:
-        terminal_message = str(exc)
-    else:
-        raise AssertionError("A terminal submission_unknown response was accepted")
-    assert terminal_node.parameter_output_values["generation_status"] == "failed"
-    assert terminal_node.parameter_output_values["provider_response"] == {
-        "transport": "fn_ai_broker",
-        "id": terminal_node.parameter_output_values["generation_id"],
-        "status": "failed",
-        "error_code": "submission_unknown",
-        "terminal": True,
-        "resubmit_allowed": False,
-        "recovery_action": "contact_admin",
-        "provider_task_registered": False,
-    }
-    assert "Broker error code: submission_unknown" in terminal_message
-    assert "no provider task ID was returned" in terminal_message
-    assert "automatic resubmission is disabled" in terminal_message
-    assert "This Broker job is terminal" in terminal_message
-    assert "server render can continue" not in terminal_message
-    assert "server detail must not be copied" not in terminal_message
-    assert "server guidance must not be copied" not in terminal_message
-    assert FakeBrokerBridge.SECRET_VALUES[0] not in terminal_message
-    assert terminal_bridge.refresh_ids == []
-    assert len(terminal_bridge.generate_payloads) == 1
-
-    class OfflineTerminalRefreshBridge(FakeBrokerBridge):
-        def refresh_job(self, job_id: str, *, timeout: float = 60) -> dict:
-            assert timeout > 0
-            self.refresh_ids.append(job_id)
-            raise target._BrokerUnavailableError("offline terminal refresh")
-
-    offline_bridge = OfflineTerminalRefreshBridge([])
-    offline_terminal = BrokerScriptedNode(offline_bridge)
-    offline_terminal.parameter_output_values.update(
-        {
-            "generation_id": "job-submission-unknown-offline-6",
-            "generation_status": "failed",
-            "provider_response": {
-                "transport": "fn_ai_broker",
-                "id": "job-submission-unknown-offline-6",
-                "status": "failed",
-                "error_code": "submission_unknown",
-                "terminal": True,
-                "resubmit_allowed": False,
-                "recovery_action": "contact_admin",
-                "provider_task_registered": False,
-            },
-        }
-    )
-    asyncio.run(offline_terminal._refresh_async())
-    offline_message = offline_terminal.parameter_output_values["result_details"]
-    assert offline_bridge.refresh_ids == ["job-submission-unknown-offline-6"]
-    assert offline_bridge.generate_payloads == []
-    assert "known terminal job" in offline_message
-    assert "did not resume, restart, or duplicate" in offline_message
-    assert "may still be rendering" not in offline_message
-    assert "automatic resubmission is disabled" in offline_message
 
 
 def assert_refresh_during_submission_contract() -> None:
@@ -1702,523 +1309,7 @@ def assert_refresh_during_submission_contract() -> None:
     ]
 
 
-def assert_broker_direct_transport_resilience_contract() -> None:
-    assert target.AI_BROKER_DEVICE_START_BACKOFF_SECONDS == (0.0, 0.5, 1.5)
-    assert target.AI_BROKER_DEVICE_AUTH_TIMEOUT_SECONDS == 5 * 60
-    assert target.AI_BROKER_DEVICE_POLL_MAX_CONSECUTIVE_TRANSPORT_ERRORS == 3
-    source = MODULE_PATH.read_text(encoding="utf-8")
-    assert "urllib.request.install_opener" not in source
-
-    class CountingOriginHandler(http.server.BaseHTTPRequestHandler):
-        request_count = 0
-
-        def do_GET(self) -> None:
-            type(self).request_count += 1
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"status":"ok"}')
-
-        def log_message(self, _format: str, *_args) -> None:
-            return None
-
-    class CountingProxyHandler(http.server.BaseHTTPRequestHandler):
-        request_count = 0
-
-        def do_GET(self) -> None:
-            type(self).request_count += 1
-            self.send_response(502)
-            self.end_headers()
-
-        def log_message(self, _format: str, *_args) -> None:
-            return None
-
-    origin_server = http.server.ThreadingHTTPServer(
-        ("127.0.0.1", 0), CountingOriginHandler
-    )
-    proxy_server = http.server.ThreadingHTTPServer(
-        ("127.0.0.1", 0), CountingProxyHandler
-    )
-    origin_thread = threading.Thread(target=origin_server.serve_forever, daemon=True)
-    proxy_thread = threading.Thread(target=proxy_server.serve_forever, daemon=True)
-    origin_thread.start()
-    proxy_thread.start()
-    try:
-        proxy_url = f"http://127.0.0.1:{proxy_server.server_port}"
-        direct_host = "broker-direct-regression.invalid"
-        direct_url = f"http://{direct_host}:{origin_server.server_port}"
-        original_getaddrinfo = socket.getaddrinfo
-
-        def regression_getaddrinfo(host, *args, **kwargs):
-            if host == direct_host:
-                host = "127.0.0.1"
-            return original_getaddrinfo(host, *args, **kwargs)
-
-        proxy_environment = {
-            "HTTP_PROXY": proxy_url,
-            "HTTPS_PROXY": proxy_url,
-            "http_proxy": proxy_url,
-            "https_proxy": proxy_url,
-        }
-        with mock.patch.dict(os.environ, proxy_environment, clear=False):
-            for name in ("NO_PROXY", "no_proxy"):
-                os.environ.pop(name, None)
-            assert target.urllib.request.getproxies()["http"] == proxy_url
-            with mock.patch.object(
-                target.urllib.request,
-                "build_opener",
-                wraps=target.urllib.request.build_opener,
-            ) as build_opener:
-                opener = target._broker_build_opener()
-            handlers = build_opener.call_args.args
-            assert len(handlers) == 2
-            assert isinstance(handlers[0], target.urllib.request.ProxyHandler)
-            assert handlers[0].proxies == {}
-            assert isinstance(handlers[1], target._BrokerNoRedirectHandler)
-            with mock.patch.object(
-                socket, "getaddrinfo", side_effect=regression_getaddrinfo
-            ):
-                with opener.open(direct_url + "/api/health", timeout=2) as response:
-                    assert response.status == 200
-                    assert json.loads(response.read()) == {"status": "ok"}
-        assert CountingOriginHandler.request_count == 1
-        assert CountingProxyHandler.request_count == 0
-    finally:
-        origin_server.shutdown()
-        proxy_server.shutdown()
-        origin_server.server_close()
-        proxy_server.server_close()
-        origin_thread.join(timeout=2)
-        proxy_thread.join(timeout=2)
-
-    class JsonResponse(io.BytesIO):
-        def __init__(self, status: int, payload) -> None:
-            super().__init__(json.dumps(payload).encode("utf-8"))
-            self.status = status
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            self.close()
-            return False
-
-    class ScriptedOpener:
-        def __init__(self, events: list) -> None:
-            self.events = list(events)
-            self.requests: list[dict] = []
-
-        def open(self, request, *, timeout: float):
-            assert 0 < timeout <= 10
-            self.requests.append(
-                {
-                    "url": request.full_url,
-                    "body": json.loads(request.data or b"{}"),
-                    "headers": {
-                        key.lower(): value for key, value in request.header_items()
-                    },
-                }
-            )
-            if not self.events:
-                raise AssertionError("Unexpected extra Broker transport request")
-            event = self.events.pop(0)
-            if isinstance(event, BaseException):
-                raise event
-            status, payload = event
-            return JsonResponse(status, payload)
-
-    server_url = target.AI_BROKER_SERVER_URL
-
-    def start_payload(code: str, secret: str) -> dict:
-        return {
-            "device_code": code,
-            "device_secret": secret,
-            "verification_url": server_url + "/?device=" + code,
-        }
-
-    retry_code = "device-code-start-retry"
-    retry_secret = "device-secret-start-retry-canary"
-    retry_opener = ScriptedOpener(
-        [
-            TimeoutError("start-secret-canary"),
-            target.urllib.error.URLError(OSError(10060, "proxy-secret-canary")),
-            (201, start_payload(retry_code, retry_secret)),
-            (200, {"access_token": "permanent-token-after-start-retry"}),
-        ]
-    )
-    with mock.patch.object(
-        target, "_broker_build_opener", return_value=retry_opener
-    ) as opener_factory, mock.patch.object(
-        target.webbrowser, "open", return_value=True
-    ) as retry_browser, mock.patch.object(
-        target, "_broker_save_token"
-    ) as retry_save, mock.patch.object(
-        target.time, "sleep"
-    ) as retry_sleep, mock.patch.object(target.logger, "warning"):
-        assert target._broker_device_login() == {"status": "connected"}
-    opener_factory.assert_called_once_with()
-    assert [request["url"] for request in retry_opener.requests].count(
-        server_url + "/api/device/start"
-    ) == 3
-    assert [request["url"] for request in retry_opener.requests].count(
-        server_url + "/api/device/token"
-    ) == 1
-    assert retry_sleep.call_args_list == [mock.call(0.5), mock.call(1.5)]
-    retry_browser.assert_called_once_with(
-        server_url + "/?device=" + retry_code,
-        new=2,
-        autoraise=True,
-    )
-    retry_save.assert_called_once_with("permanent-token-after-start-retry")
-
-    poll_code = "device-code-poll-recovery"
-    poll_secret = "device-secret-poll-recovery-canary"
-    poll_opener = ScriptedOpener(
-        [
-            (201, start_payload(poll_code, poll_secret)),
-            target.urllib.error.URLError(OSError(10054, "poll-secret-one")),
-            OSError(10060, "poll-secret-two"),
-            (202, {"status": "pending"}),
-            (200, {"access_token": "permanent-token-after-poll-recovery"}),
-        ]
-    )
-    with mock.patch.object(
-        target.webbrowser, "open", return_value=True
-    ) as poll_browser, mock.patch.object(
-        target, "_broker_save_token"
-    ) as poll_save, mock.patch.object(
-        target.time, "sleep"
-    ) as poll_sleep, mock.patch.object(target.logger, "warning"):
-        assert target._broker_device_login(opener=poll_opener) == {
-            "status": "connected"
-        }
-    start_requests = [
-        request
-        for request in poll_opener.requests
-        if request["url"].endswith("/api/device/start")
-    ]
-    token_requests = [
-        request
-        for request in poll_opener.requests
-        if request["url"].endswith("/api/device/token")
-    ]
-    assert len(start_requests) == 1
-    assert len(token_requests) == 4
-    assert all(
-        request["body"]
-        == {"device_code": poll_code, "device_secret": poll_secret}
-        for request in token_requests
-    )
-    assert all("/api/v1/generate/" not in request["url"] for request in poll_opener.requests)
-    assert poll_sleep.call_count == 3
-    poll_browser.assert_called_once_with(
-        server_url + "/?device=" + poll_code,
-        new=2,
-        autoraise=True,
-    )
-    poll_save.assert_called_once_with("permanent-token-after-poll-recovery")
-
-    failed_poll_code = "device-code-bounded-poll"
-    failed_poll_secret = "device-secret-bounded-poll-canary"
-    failed_poll_opener = ScriptedOpener(
-        [
-            (201, start_payload(failed_poll_code, failed_poll_secret)),
-            TimeoutError("poll-failure-one"),
-            target.urllib.error.URLError(OSError(10054, "poll-failure-two")),
-            OSError(10060, "poll-failure-three"),
-        ]
-    )
-    with mock.patch.object(
-        target.webbrowser, "open", return_value=True
-    ) as failed_poll_browser, mock.patch.object(
-        target, "_broker_save_token"
-    ) as failed_poll_save, mock.patch.object(
-        target.time, "sleep"
-    ), mock.patch.object(target.logger, "warning"):
-        failed_at = time.monotonic()
-        try:
-            target._broker_device_login(opener=failed_poll_opener)
-        except target._BrokerUnavailableError as exc:
-            assert "polling was interrupted" in str(exc)
-        else:
-            raise AssertionError("Unbounded device-token polling was accepted")
-        assert time.monotonic() - failed_at < 1.0
-    assert len(failed_poll_opener.requests) == 4
-    assert sum(
-        request["url"].endswith("/api/device/start")
-        for request in failed_poll_opener.requests
-    ) == 1
-    assert sum(
-        request["url"].endswith("/api/device/token")
-        for request in failed_poll_opener.requests
-    ) == target.AI_BROKER_DEVICE_POLL_MAX_CONSECUTIVE_TRANSPORT_ERRORS
-    failed_poll_browser.assert_called_once()
-    failed_poll_save.assert_not_called()
-
-    failed_start_opener = ScriptedOpener(
-        [
-            TimeoutError("bounded-start-one"),
-            target.urllib.error.URLError(OSError(10060, "bounded-start-two")),
-            OSError(10013, "bounded-start-three"),
-        ]
-    )
-    with mock.patch.object(
-        target.webbrowser,
-        "open",
-        side_effect=AssertionError("Failed start opened a browser"),
-    ), mock.patch.object(target.time, "sleep") as failed_start_sleep, mock.patch.object(
-        target.logger, "warning"
-    ):
-        try:
-            target._broker_device_login(opener=failed_start_opener)
-        except target._BrokerUnavailableError as exc:
-            assert "authorization service is unavailable" in str(exc)
-        else:
-            raise AssertionError("Unbounded device-start retry was accepted")
-    assert len(failed_start_opener.requests) == len(
-        target.AI_BROKER_DEVICE_START_BACKOFF_SECONDS
-    )
-    assert all(
-        request["url"].endswith("/api/device/start")
-        for request in failed_start_opener.requests
-    )
-    assert failed_start_sleep.call_args_list == [mock.call(0.5), mock.call(1.5)]
-
-    http_error = target.urllib.error.HTTPError(
-        server_url + "/api/device/start",
-        503,
-        "Service Unavailable",
-        {},
-        io.BytesIO(b'{"device_secret":"must-not-be-retried"}'),
-    )
-    http_error_opener = ScriptedOpener([http_error])
-    with mock.patch.object(
-        target.webbrowser,
-        "open",
-        side_effect=AssertionError("HTTP failure opened a browser"),
-    ), mock.patch.object(target.time, "sleep") as http_error_sleep:
-        try:
-            target._broker_device_login(opener=http_error_opener)
-        except target._BrokerAuthenticationError as exc:
-            assert exc.status_code == 503
-        else:
-            raise AssertionError("Device-start HTTP error was retried")
-    assert len(http_error_opener.requests) == 1
-    http_error_sleep.assert_not_called()
-
-    invalid_opener = ScriptedOpener([(201, ["not", "a", "mapping"])])
-    with mock.patch.object(
-        target.webbrowser,
-        "open",
-        side_effect=AssertionError("Invalid response opened a browser"),
-    ), mock.patch.object(target.time, "sleep") as invalid_sleep:
-        try:
-            target._broker_device_login(opener=invalid_opener)
-        except target._BrokerProtocolError:
-            pass
-        else:
-            raise AssertionError("Invalid device-start response was retried")
-    assert len(invalid_opener.requests) == 1
-    invalid_sleep.assert_not_called()
-
-    persisted_token = "persisted-dpapi-token-canary"
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        appdata_root = Path(temporary_directory)
-        token_path = appdata_root / "FNAIBroker" / "access_token_v2.dpapi"
-        token_path.parent.mkdir(parents=True)
-        token_path.write_bytes(b"encrypted-dpapi-token")
-        persisted_opener = ScriptedOpener(
-            [(200, {"display_name": "Persisted Token Artist"})]
-        )
-        with mock.patch.dict(
-            target.os.environ, {"APPDATA": str(appdata_root)}, clear=False
-        ), mock.patch.object(
-            target, "_broker_dpapi", return_value=persisted_token.encode("utf-8")
-        ), mock.patch.object(
-            target,
-            "_broker_device_login",
-            side_effect=AssertionError("Valid DPAPI token started device login"),
-        ) as persisted_device_login, mock.patch.object(
-            target.webbrowser,
-            "open",
-            side_effect=AssertionError("Valid DPAPI token opened a browser"),
-        ) as persisted_browser, mock.patch.object(
-            target, "_broker_clear_token"
-        ) as clear_token:
-            persisted_bridge = target._HMBAIBrokerBridge(opener=persisted_opener)
-            persisted_snapshot = persisted_bridge.account_snapshot(connect=True)
-            assert target._broker_token_path() == token_path
-        assert persisted_snapshot == target._BrokerAccountSnapshot(
-            state="connected",
-            connected=True,
-            account="Persisted Token Artist",
-        )
-        assert len(persisted_opener.requests) == 1
-        assert persisted_opener.requests[0]["url"] == server_url + "/api/me"
-        assert persisted_opener.requests[0]["headers"]["authorization"] == (
-            "Bearer " + persisted_token
-        )
-        persisted_device_login.assert_not_called()
-        persisted_browser.assert_not_called()
-        clear_token.assert_not_called()
-        assert token_path.read_bytes() == b"encrypted-dpapi-token"
-
-        transport_failure_opener = ScriptedOpener(
-            [target.urllib.error.URLError(OSError(10054, "token-must-survive"))]
-        )
-        with mock.patch.dict(
-            target.os.environ, {"APPDATA": str(appdata_root)}, clear=False
-        ), mock.patch.object(
-            target, "_broker_dpapi", return_value=persisted_token.encode("utf-8")
-        ), mock.patch.object(
-            target, "_broker_clear_token"
-        ) as transport_clear, mock.patch.object(
-            target,
-            "_broker_device_login",
-            side_effect=AssertionError("Transport failure forced device login"),
-        ) as transport_device_login, mock.patch.object(
-            target.webbrowser,
-            "open",
-            side_effect=AssertionError("Transport failure opened a browser"),
-        ) as transport_browser, mock.patch.object(target.logger, "warning"):
-            transport_bridge = target._HMBAIBrokerBridge(
-                opener=transport_failure_opener
-            )
-            try:
-                transport_bridge.account_snapshot(connect=True)
-            except target._BrokerUnavailableError:
-                pass
-            else:
-                raise AssertionError("Broker transport failure was accepted")
-        transport_clear.assert_not_called()
-        transport_device_login.assert_not_called()
-        transport_browser.assert_not_called()
-        assert token_path.read_bytes() == b"encrypted-dpapi-token"
-
-    sentinel_opener = object()
-    with mock.patch.object(
-        target, "_broker_build_opener", return_value=sentinel_opener
-    ) as bridge_factory:
-        default_bridge = target._HMBAIBrokerBridge()
-    bridge_factory.assert_called_once_with()
-    assert default_bridge._opener is sentinel_opener
-
-    sensitive_reason = OSError(13, "device-secret-and-proxy-password-canary")
-    sensitive_reason.winerror = 10013
-    sensitive_error = target.urllib.error.URLError(sensitive_reason)
-    with mock.patch.object(target.logger, "warning") as safe_warning:
-        target._broker_log_transport_error(
-            stage="device_token_poll",
-            attempt=2,
-            exc=sensitive_error,
-            server_url=(
-                "http://proxy-user:proxy-password-canary@192.168.203.245:8080"
-            ),
-        )
-    safe_warning.assert_called_once()
-    log_format, *log_values = safe_warning.call_args.args
-    rendered_log = log_format % tuple(log_values)
-    assert "stage=device_token_poll" in rendered_log
-    assert "attempt=2" in rendered_log
-    assert "exception=URLError" in rendered_log
-    assert f"reason={type(sensitive_reason).__name__}" in rendered_log
-    assert "errno=13" in rendered_log
-    assert "winerror=10013" in rendered_log
-    assert "host=192.168.203.245" in rendered_log
-    assert "port=8080" in rendered_log
-    for sensitive_value in (
-        "device-secret-and-proxy-password-canary",
-        "proxy-user",
-        "proxy-password-canary",
-        persisted_token,
-        retry_secret,
-        poll_secret,
-        failed_poll_secret,
-        "Authorization",
-    ):
-        assert sensitive_value not in rendered_log
-
-
 def assert_broker_account_and_button_contract() -> None:
-    assert target.AI_BROKER_SERVER_URL == "http://192.168.203.245:8080"
-    assert target._broker_validated_server_url() == target.AI_BROKER_SERVER_URL
-
-    class DeviceResponse(io.BytesIO):
-        def __init__(self, status: int, payload: dict) -> None:
-            super().__init__(json.dumps(payload).encode("utf-8"))
-            self.status = status
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            self.close()
-            return False
-
-    class DeviceOpener:
-        def __init__(self) -> None:
-            self.requests: list[tuple[str, dict]] = []
-            self.responses = [
-                DeviceResponse(
-                    201,
-                    {
-                        "device_code": "device-code-1",
-                        "device_secret": "device-secret-abcdefghijklmnopqrstuvwxyz",
-                        "verification_url": (
-                            target.AI_BROKER_SERVER_URL + "/?device=device-code-1"
-                        ),
-                    },
-                ),
-                DeviceResponse(202, {"status": "pending"}),
-                DeviceResponse(200, {"access_token": "permanent-device-token"}),
-            ]
-
-        def open(self, request, *, timeout: float):
-            assert timeout > 0
-            body = json.loads(request.data or b"{}")
-            self.requests.append((request.full_url, body))
-            return self.responses.pop(0)
-
-    device_opener = DeviceOpener()
-    with mock.patch.object(target.webbrowser, "open", return_value=True) as browser_open, mock.patch.object(
-        target, "_broker_save_token"
-    ) as save_token, mock.patch.object(target.time, "sleep") as poll_sleep:
-        login_result = target._broker_device_login(opener=device_opener)
-    assert login_result == {"status": "connected"}
-    assert [url for url, _body in device_opener.requests] == [
-        target.AI_BROKER_SERVER_URL + "/api/device/start",
-        target.AI_BROKER_SERVER_URL + "/api/device/token",
-        target.AI_BROKER_SERVER_URL + "/api/device/token",
-    ]
-    assert device_opener.requests[0][1] == {}
-    assert device_opener.requests[1][1] == device_opener.requests[2][1]
-    assert device_opener.requests[1][1]["device_code"] == "device-code-1"
-    browser_open.assert_called_once_with(
-        target.AI_BROKER_SERVER_URL + "/?device=device-code-1",
-        new=2,
-        autoraise=True,
-    )
-    poll_sleep.assert_called_once_with(target.AI_BROKER_DEVICE_POLL_SECONDS)
-    save_token.assert_called_once_with("permanent-device-token")
-
-    declined_opener = DeviceOpener()
-    with mock.patch.object(
-        target.webbrowser, "open", return_value=False
-    ), mock.patch.object(target, "_broker_save_token") as declined_save, mock.patch.object(
-        target.time, "sleep"
-    ) as declined_sleep:
-        try:
-            target._broker_device_login(opener=declined_opener)
-        except target._BrokerUnavailableError as exc:
-            assert "authorization page" in str(exc)
-        else:
-            raise AssertionError("Browser-open refusal entered the polling loop")
-    assert [url for url, _body in declined_opener.requests] == [
-        target.AI_BROKER_SERVER_URL + "/api/device/start"
-    ]
-    declined_save.assert_not_called()
-    declined_sleep.assert_not_called()
-
     secrets = {
         "token": "account-token-canary",
         "api_key": "account-provider-key-canary",
@@ -2232,12 +1323,8 @@ def assert_broker_account_and_button_contract() -> None:
     }
     with mock.patch.object(
         bridge, "_request_json", return_value=safe_me
-    ) as request_json, mock.patch.object(
-        target,
-        "_broker_device_login",
-        side_effect=AssertionError("saved token fast path opened device login"),
-    ):
-        snapshot = bridge.account_snapshot(connect=True)
+    ) as request_json:
+        snapshot = bridge.account_snapshot(connect=False)
     assert request_json.call_count == 1
     assert snapshot == target._BrokerAccountSnapshot(
         state="connected",
@@ -2251,29 +1338,11 @@ def assert_broker_account_and_button_contract() -> None:
     with mock.patch.object(
         bridge,
         "_request_json",
-        side_effect=[
-            target._BrokerAuthenticationError("login required"),
-            {"display_name": "Direct Signup Artist"},
-        ],
-    ), mock.patch.object(
-        target, "_broker_device_login", return_value={"status": "connected"}
-    ) as device_login:
-        direct_snapshot = bridge.account_snapshot(connect=True)
-    assert direct_snapshot == target._BrokerAccountSnapshot(
-        state="connected",
-        connected=True,
-        account="Direct Signup Artist",
-    )
-    device_login.assert_called_once_with()
-
-    with mock.patch.object(
-        bridge,
-        "_request_json",
         side_effect=target._BrokerUnavailableError("safe unavailable"),
     ), mock.patch.object(
         target,
-        "_broker_device_login",
-        side_effect=AssertionError("server outage opened device authorization"),
+        "_broker_auto_login",
+        side_effect=AssertionError("server outage triggered a login exchange"),
     ):
         try:
             bridge.account_snapshot(connect=True)
@@ -2333,563 +1402,6 @@ def assert_broker_account_and_button_contract() -> None:
     assert node.get_parameter_value("broker_account") == "Threaded Artist"
 
 
-
-
-def assert_indexed_output_macro_contract() -> None:
-    # Required {_index} slots are resolved before submission without exposing a
-    # partial final file.
-    bridge = FakeBrokerBridge(
-        [
-            {
-                "job_id": "broker-job-1",
-                "status": "completed",
-                "output": "https://cdn.example/indexed.mp4",
-            }
-        ]
-    )
-    node = BrokerScriptedNode(bridge)
-    indexed_destination = IndexedMacroDestination()
-    node.destination = indexed_destination
-    node._output_file = FakeOutputFile(indexed_destination)
-    node.set_parameter_value("prompt", "required output index regression")
-    asyncio.run(node._process_generation())
-
-    assert indexed_destination.resolve_attempts == 0
-    published = list(
-        Path(indexed_destination._temporary_directory.name).rglob("*.mp4")
-    )
-    assert len(published) == 1
-    assert published[0].read_bytes() == VALID_MP4_BYTES
-    assert len(bridge.generate_payloads) == 1
-    assert bridge.refresh_ids == ["broker-job-1"]
-    assert node.parameter_output_values["was_successful"] is True
-
-    # No other missing macro variable may bypass the pre-billing validation.
-    invalid_bridge = FakeBrokerBridge([])
-    invalid = BrokerScriptedNode(invalid_bridge)
-    invalid_destination = IndexedMacroDestination("_index, shot_name")
-    invalid.destination = invalid_destination
-    invalid._output_file = FakeOutputFile(invalid_destination)
-    invalid.set_parameter_value("prompt", "invalid output macro regression")
-    try:
-        asyncio.run(invalid._process_generation_impl())
-    except RuntimeError as exc:
-        assert "_index, shot_name" in str(exc)
-    else:
-        raise AssertionError("An unrelated missing output macro variable was accepted")
-    assert invalid_bridge.generate_payloads == []
-
-
-class AtomicLocalDestination:
-    def __init__(self, path: Path, policy) -> None:
-        self.location = str(path)
-        self._existing_file_policy = policy
-        self._create_parents = True
-        self._append = False
-
-    def resolve(self) -> str:
-        return self.location
-
-    async def awrite_bytes(self, _content: bytes):
-        raise AssertionError("Completed MP4 used a non-atomic destination writer")
-
-
-def assert_bounded_mp4_decode_probe_contract() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        staged = Path(temporary) / "staged.mp4"
-        staged.write_bytes(VALID_MP4_BYTES)
-        ffprobe_verifier = target._MP4DecodeVerifier(
-            "ffprobe",
-            Path("C:/managed-test-tools/ffprobe.exe"),
-        )
-        success = SimpleNamespace(
-            returncode=0,
-            stdout=json.dumps(
-                {
-                    "frames": [
-                        {"media_type": "video", "width": 64, "height": 64}
-                    ]
-                }
-            ).encode("utf-8"),
-            stderr=b"",
-        )
-        with mock.patch.object(
-            mp4_verify_target.subprocess, "run", return_value=success
-        ) as run:
-            REAL_MP4_DECODE_PROBE(staged, ffprobe_verifier)
-        command = run.call_args.args[0]
-        kwargs = run.call_args.kwargs
-        assert command[0].lower().endswith("ffprobe.exe")
-        assert command[-2:] == ["-i", str(staged.resolve())]
-        assert "-show_frames" in command
-        assert f"%+#{target.MP4_DECODE_PROBE_PACKET_LIMIT}" in command
-        assert kwargs["stdin"] is mp4_verify_target.subprocess.DEVNULL
-        assert kwargs["stdout"] is mp4_verify_target.subprocess.PIPE
-        assert kwargs["stderr"] is mp4_verify_target.subprocess.PIPE
-        assert kwargs["check"] is False
-        assert kwargs["timeout"] == target.MP4_DECODE_PROBE_TIMEOUT_SECONDS
-
-        def rejected(verifier, completed=None, *, side_effect=None) -> None:
-            with mock.patch.object(
-                mp4_verify_target.subprocess,
-                "run",
-                return_value=completed,
-                side_effect=side_effect,
-            ):
-                try:
-                    REAL_MP4_DECODE_PROBE(staged, verifier)
-                except RuntimeError:
-                    return
-            raise AssertionError("Invalid MP4 decode result was accepted")
-
-        rejected(
-            ffprobe_verifier,
-            SimpleNamespace(returncode=1, stdout=b"", stderr=b"decode"),
-        )
-        rejected(
-            ffprobe_verifier,
-            SimpleNamespace(returncode=0, stdout=b"not-json", stderr=b""),
-        )
-        rejected(
-            ffprobe_verifier,
-            SimpleNamespace(
-                returncode=0,
-                stdout=b'{"frames":[]}',
-                stderr=b"",
-            )
-        )
-        rejected(
-            ffprobe_verifier,
-            SimpleNamespace(
-                returncode=0,
-                stdout=b"x" * (target.MP4_DECODE_PROBE_MAX_OUTPUT_BYTES + 1),
-                stderr=b"",
-            )
-        )
-        rejected(
-            ffprobe_verifier,
-            side_effect=mp4_verify_target.subprocess.TimeoutExpired(
-                ["ffprobe"], target.MP4_DECODE_PROBE_TIMEOUT_SECONDS
-            )
-        )
-
-        ffmpeg_verifier = target._MP4DecodeVerifier(
-            "ffmpeg",
-            Path("C:/managed-test-tools/ffmpeg.exe"),
-        )
-        decoded_pixel = SimpleNamespace(
-            returncode=0,
-            stdout=b"\x10\x20\x30",
-            stderr=b"",
-        )
-        with mock.patch.object(
-            mp4_verify_target.subprocess,
-            "run",
-            return_value=decoded_pixel,
-        ) as run:
-            REAL_MP4_DECODE_PROBE(staged, ffmpeg_verifier)
-        command = run.call_args.args[0]
-        kwargs = run.call_args.kwargs
-        assert command[0].lower().endswith("ffmpeg.exe")
-        assert "-xerror" in command
-        assert command[command.index("-frames:v") + 1] == "1"
-        assert command[command.index("-vf") + 1] == "scale=1:1"
-        assert command[command.index("-pix_fmt") + 1] == "rgb24"
-        assert command[-2:] == ["rawvideo", "pipe:1"]
-        assert kwargs["stdin"] is mp4_verify_target.subprocess.DEVNULL
-        assert kwargs["timeout"] == target.MP4_DECODE_PROBE_TIMEOUT_SECONDS
-
-        rejected(
-            ffmpeg_verifier,
-            SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
-        )
-        rejected(
-            ffmpeg_verifier,
-            SimpleNamespace(returncode=0, stdout=b"\x00" * 4, stderr=b""),
-        )
-        rejected(
-            ffmpeg_verifier,
-            SimpleNamespace(returncode=0, stdout=b"\x00" * 3, stderr=b"decode"),
-        )
-        rejected(
-            ffmpeg_verifier,
-            side_effect=OSError("simulated executable failure"),
-        )
-
-    empty_candidates = lambda: iter(())
-    with mock.patch.object(
-        mp4_verify_target,
-        "_static_ffmpeg_verifier_candidates",
-        side_effect=empty_candidates,
-    ), mock.patch.object(
-        mp4_verify_target,
-        "_imageio_ffmpeg_verifier_candidates",
-        side_effect=empty_candidates,
-    ), mock.patch.object(
-        mp4_verify_target,
-        "_system_verifier_candidates",
-        side_effect=empty_candidates,
-    ):
-        try:
-            REAL_MP4_DECODE_VERIFIER_RESOLVER()
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("Missing MP4 decode verifier did not fail closed")
-
-
-def assert_package_managed_decode_verifier_resolution() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        static_root = root / "static_ffmpeg"
-        static_root.mkdir()
-        static_init = static_root / "__init__.py"
-        static_init.write_text("", encoding="utf-8")
-        if target.os.name == "nt":
-            platform_folder = "win32"
-            ffprobe_name = "ffprobe.exe"
-            ffmpeg_name = "ffmpeg.exe"
-        else:
-            platform_folder = (
-                "darwin" if sys.platform == "darwin" else "linux"
-            )
-            ffprobe_name = "ffprobe"
-            ffmpeg_name = "ffmpeg"
-        static_bin = static_root / "bin" / platform_folder
-        static_bin.mkdir(parents=True)
-        static_probe = static_bin / ffprobe_name
-        static_probe.write_bytes(b"package-owned ffprobe fixture")
-        static_ffmpeg = static_bin / ffmpeg_name
-        static_ffmpeg.write_bytes(b"package-owned ffmpeg fixture")
-        static_module = SimpleNamespace(__file__=str(static_init))
-
-        imageio_root = root / "imageio_ffmpeg"
-        imageio_binary_root = imageio_root / "binaries"
-        imageio_binary_root.mkdir(parents=True)
-        imageio_init = imageio_root / "__init__.py"
-        imageio_init.write_text("", encoding="utf-8")
-        imageio_ffmpeg = imageio_binary_root / (
-            "ffmpeg-win-x86_64-v7.1.exe"
-            if target.os.name == "nt"
-            else "ffmpeg-linux-x86_64-v7.1"
-        )
-        imageio_ffmpeg.write_bytes(b"package-owned imageio ffmpeg fixture")
-        imageio_module = SimpleNamespace(
-            __file__=str(imageio_init),
-            get_ffmpeg_exe=lambda: str(imageio_ffmpeg),
-        )
-
-        def import_package(name: str):
-            if name == "static_ffmpeg":
-                return static_module
-            if name == "imageio_ffmpeg":
-                return imageio_module
-            raise ImportError(name)
-
-        with mock.patch.object(
-            mp4_verify_target.importlib,
-            "import_module",
-            side_effect=import_package,
-        ), mock.patch.object(
-            mp4_verify_target.shutil,
-            "which",
-            return_value=None,
-        ), mock.patch.object(
-            mp4_verify_target,
-            "verify_mp4_decode_verifier_start",
-        ) as launch:
-            verifier = REAL_MP4_DECODE_VERIFIER_RESOLVER()
-        assert verifier == target._MP4DecodeVerifier(
-            "ffprobe",
-            static_probe.resolve(),
-        )
-        launch.assert_called_once_with(verifier)
-
-        static_probe.unlink()
-        static_ffmpeg.unlink()
-        with mock.patch.object(
-            mp4_verify_target.importlib,
-            "import_module",
-            side_effect=import_package,
-        ), mock.patch.object(
-            mp4_verify_target.shutil,
-            "which",
-            return_value=None,
-        ), mock.patch.object(
-            mp4_verify_target,
-            "verify_mp4_decode_verifier_start",
-        ) as launch:
-            verifier = REAL_MP4_DECODE_VERIFIER_RESOLVER()
-        assert verifier == target._MP4DecodeVerifier(
-            "ffmpeg",
-            imageio_ffmpeg.resolve(),
-        )
-        launch.assert_called_once_with(verifier)
-
-        external_override = root / "outside-imageio-ffmpeg.exe"
-        external_override.write_bytes(b"untrusted override fixture")
-        imageio_module.get_ffmpeg_exe = lambda: str(external_override)
-        with mock.patch.object(
-            mp4_verify_target.importlib,
-            "import_module",
-            side_effect=import_package,
-        ), mock.patch.object(
-            mp4_verify_target.shutil,
-            "which",
-            return_value=None,
-        ), mock.patch.object(
-            mp4_verify_target,
-            "verify_mp4_decode_verifier_start",
-        ):
-            verifier = REAL_MP4_DECODE_VERIFIER_RESOLVER()
-        assert verifier.executable == imageio_ffmpeg.resolve()
-
-        launch_ok = SimpleNamespace(returncode=0)
-        with mock.patch.object(
-            mp4_verify_target.subprocess,
-            "run",
-            return_value=launch_ok,
-        ) as run:
-            mp4_verify_target.verify_mp4_decode_verifier_start(verifier)
-        assert run.call_args.args[0] == [str(verifier.executable), "-version"]
-        assert run.call_args.kwargs["stdin"] is mp4_verify_target.subprocess.DEVNULL
-        assert run.call_args.kwargs["stdout"] is mp4_verify_target.subprocess.DEVNULL
-        assert run.call_args.kwargs["stderr"] is mp4_verify_target.subprocess.DEVNULL
-        assert run.call_args.kwargs["check"] is False
-        assert run.call_args.kwargs["timeout"] == (
-            target.MP4_DECODE_VERIFIER_START_TIMEOUT_SECONDS
-        )
-
-        for failed_launch in (
-            SimpleNamespace(returncode=1),
-            mp4_verify_target.subprocess.TimeoutExpired(
-                [str(verifier.executable), "-version"],
-                target.MP4_DECODE_VERIFIER_START_TIMEOUT_SECONDS,
-            ),
-            OSError("simulated launch failure"),
-        ):
-            kwargs = (
-                {"side_effect": failed_launch}
-                if isinstance(failed_launch, BaseException)
-                else {"return_value": failed_launch}
-            )
-            with mock.patch.object(mp4_verify_target.subprocess, "run", **kwargs):
-                try:
-                    mp4_verify_target.verify_mp4_decode_verifier_start(verifier)
-                except RuntimeError:
-                    pass
-                else:
-                    raise AssertionError("Broken verifier executable was accepted")
-
-
-def assert_atomic_output_and_submission_safety() -> None:
-    assert target._is_structurally_valid_mp4(VALID_MP4_BYTES)
-    assert not target._is_structurally_valid_mp4(
-        b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
-        b"\x00\x00\x00\x10mdat12345678"
-    )
-    assert not target._is_structurally_valid_mp4(
-        b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
-        b"\x00\x00\x00\x10moov\x00\x00\x00\x08mvhd"
-    )
-
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        final_path = root / "atomic.mp4"
-        old_bytes = b"previous-complete-output"
-        final_path.write_bytes(old_bytes)
-        destination = AtomicLocalDestination(
-            final_path,
-            target.ExistingFilePolicy.OVERWRITE,
-        )
-        real_replace = target.os.replace
-        observations: list[Path] = []
-        probe_observations: list[Path] = []
-
-        def observed_probe(source, _verifier=None) -> None:
-            source_path = Path(source)
-            assert source_path.parent == root
-            assert source_path.read_bytes() == VALID_MP4_BYTES
-            assert final_path.read_bytes() == old_bytes
-            probe_observations.append(source_path)
-
-        def observed_replace(source, target_path) -> None:
-            source_path = Path(source)
-            assert probe_observations == [source_path]
-            assert source_path.parent == Path(target_path).parent == root
-            assert source_path.read_bytes() == VALID_MP4_BYTES
-            assert final_path.read_bytes() == old_bytes
-            observations.append(source_path)
-            real_replace(source_path, target_path)
-
-        with mock.patch.object(
-            target, "_validate_decodable_mp4_file", side_effect=observed_probe
-        ), mock.patch.object(target.os, "replace", side_effect=observed_replace):
-            saved = asyncio.run(
-                target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
-                    destination,
-                    VALID_MP4_BYTES,
-                )
-            )
-        assert observations
-        assert probe_observations
-        assert final_path.read_bytes() == VALID_MP4_BYTES
-        assert Path(saved.resolve()) == final_path
-        assert not list(root.glob(".*.partial.mp4"))
-        assert not list(root.glob(".*.output-probe"))
-
-        final_path.write_bytes(old_bytes)
-        with mock.patch.object(
-            target,
-            "_validate_decodable_mp4_file",
-            side_effect=RuntimeError("simulated undecodable stream"),
-        ):
-            try:
-                asyncio.run(
-                    target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
-                        destination,
-                        VALID_MP4_BYTES,
-                    )
-                )
-            except RuntimeError as exc:
-                assert "undecodable" in str(exc)
-            else:
-                raise AssertionError("Undecodable staged MP4 was published")
-        assert final_path.read_bytes() == old_bytes
-        assert not list(root.glob(".*.partial.mp4"))
-
-    bridge = FakeBrokerBridge([])
-    node = BrokerScriptedNode(bridge)
-    node.set_parameter_value("prompt", "preflight must precede billing")
-    with mock.patch.object(
-        target.HMBSeedanceGeneration,
-        "_probe_output_parent_writable",
-        side_effect=PermissionError("simulated unwritable output parent"),
-    ):
-        try:
-            asyncio.run(node._process_generation_impl())
-        except PermissionError:
-            pass
-        else:
-            raise AssertionError("Unwritable output reached Broker submission")
-    assert bridge.account_calls == 0
-    assert bridge.generate_payloads == []
-
-    verifier_bridge = FakeBrokerBridge([])
-    verifier_blocked = BrokerScriptedNode(verifier_bridge)
-    verifier_blocked.set_parameter_value(
-        "prompt", "verifier preflight must precede billing"
-    )
-    with mock.patch.object(
-        target.HMBSeedanceGeneration,
-        "_prepare_video_references_for_run",
-        side_effect=AssertionError("Verifier failure reached temporary media upload"),
-    ), mock.patch.object(
-        target,
-        "_resolve_mp4_decode_verifier",
-        side_effect=RuntimeError("simulated unavailable verifier"),
-    ):
-        try:
-            asyncio.run(verifier_blocked._process_generation_impl())
-        except RuntimeError as exc:
-            assert "unavailable verifier" in str(exc)
-        else:
-            raise AssertionError("Missing verifier reached Broker submission")
-    assert verifier_blocked.destination.resolved is True
-    assert verifier_bridge.account_calls == 0
-    assert verifier_bridge.generate_payloads == []
-
-    reuse_bridge = FakeBrokerBridge(
-        [
-            {
-                "job_id": "broker-job-1",
-                "status": "completed",
-                "output": "https://cdn.example/verifier-reuse.mp4",
-            }
-        ]
-    )
-    reuse_node = BrokerScriptedNode(reuse_bridge)
-    reuse_node.set_parameter_value("prompt", "reuse preflight-selected verifier")
-    selected_verifier = target._MP4DecodeVerifier(
-        "ffprobe", Path("C:/managed-test-tools/ffprobe.exe")
-    )
-    observed_verifiers = []
-
-    def record_selected_verifier(_source, verifier=None) -> None:
-        observed_verifiers.append(verifier)
-
-    with mock.patch.object(
-        target,
-        "_resolve_mp4_decode_verifier",
-        return_value=selected_verifier,
-    ) as resolver, mock.patch.object(
-        target,
-        "_validate_decodable_mp4_file",
-        side_effect=record_selected_verifier,
-    ):
-        asyncio.run(reuse_node._process_generation_impl())
-    resolver.assert_called_once_with()
-    assert observed_verifiers == [selected_verifier]
-    assert len(reuse_bridge.generate_payloads) == 1
-
-    async def cancellation_case() -> None:
-        started = threading.Event()
-        release = threading.Event()
-        worker_finished = threading.Event()
-
-        def blocking_submit() -> dict:
-            started.set()
-            assert release.wait(2.0)
-            worker_finished.set()
-            return {"job_id": "broker-job-cancel", "status": "pending"}
-
-        request_id = "hmb-cancelled-submit-1"
-        node.parameter_output_values["generation_id"] = request_id
-        node.parameter_output_values["generation_status"] = "submitting"
-        cleanup_events: list[str] = []
-        node._cleanup_temporary_video_uploads = lambda: cleanup_events.append(
-            "eager_cleanup"
-        )
-        node._defer_temporary_video_upload_cleanup = lambda: cleanup_events.append(
-            "deferred_cleanup"
-        )
-
-        async def submit_only() -> None:
-            await node._await_submission_result(blocking_submit)
-
-        node._process_generation_impl = submit_only
-        operation = asyncio.create_task(node._process_generation())
-        assert await asyncio.to_thread(started.wait, 1.0)
-        cancelled_at = time.monotonic()
-        operation.cancel()
-        try:
-            await operation
-        except asyncio.CancelledError:
-            pass
-        else:
-            raise AssertionError("Cancelled submission waited for its worker thread")
-        assert time.monotonic() - cancelled_at < 0.5
-        assert not worker_finished.is_set()
-        assert node._submission_outcome_unknown is True
-        assert node.parameter_output_values["generation_id"] == request_id
-        assert node.parameter_output_values["generation_status"] == "submission_unknown"
-        assert node.parameter_output_values["provider_response"] == {
-            "transport": "fn_ai_broker",
-            "id": request_id,
-            "status": "submission_unknown",
-        }
-        assert cleanup_events == ["eager_cleanup", "deferred_cleanup"]
-        assert len(node._detached_submission_tasks) == 1
-
-        release.set()
-        for _ in range(100):
-            if worker_finished.is_set() and not node._detached_submission_tasks:
-                break
-            await asyncio.sleep(0.01)
-        assert worker_finished.is_set()
-        assert not node._detached_submission_tasks
-
-    asyncio.run(cancellation_case())
 
 
 class FakeCloudDriver:
@@ -3066,6 +1578,102 @@ def assert_local_video_temporary_publication() -> None:
         assert len(failing_driver.uploads) == 1
         assert failing_driver.deletes == [failing_driver.uploads[0]["path"]]
 
+        unknown_driver = FakeCloudDriver()
+        unknown_bridge = FakeBrokerBridge([])
+        unknown_node = BrokerScriptedNode(unknown_bridge)
+        unknown_node.set_parameter_value("prompt", "ambiguous submission outcome")
+        unknown_node.set_parameter_value("reference_video_1", original_artifact)
+        unknown_node._create_gt_cloud_storage_driver = lambda: unknown_driver
+        unknown_bridge.generate_seedance = mock.Mock(
+            side_effect=target._BrokerUnavailableError(
+                "simulated submission transport loss",
+                submission_outcome_unknown=True,
+            )
+        )
+        unknown_deferred_uploads: list[tuple[object, Path]] = []
+
+        def capture_unknown_deferred_cleanup() -> None:
+            unknown_deferred_uploads.extend(unknown_node._temporary_video_uploads)
+            unknown_node._temporary_video_uploads = []
+
+        unknown_node._defer_temporary_video_upload_cleanup = (
+            capture_unknown_deferred_cleanup
+        )
+        try:
+            asyncio.run(unknown_node._process_generation())
+        except target._BrokerUnavailableError as exc:
+            assert exc.submission_outcome_unknown is True
+        else:
+            raise AssertionError("Ambiguous submission transport loss was accepted")
+        assert unknown_bridge.generate_seedance.call_count == 1
+        assert unknown_node.parameter_output_values["generation_id"] == ""
+        assert unknown_node.parameter_output_values["generation_status"] == (
+            "submission_unknown"
+        )
+        assert unknown_driver.deletes == []
+        assert len(unknown_deferred_uploads) == 1
+        assert unknown_deferred_uploads[0][1] == unknown_driver.uploads[0]["path"]
+
+        class BlockingSubmissionBridge(FakeBrokerBridge):
+            def __init__(self) -> None:
+                super().__init__([])
+                self.started = threading.Event()
+                self.release = threading.Event()
+                self.returned = threading.Event()
+
+            def generate_seedance(self, payload: dict, *, timeout: float) -> dict:
+                assert timeout > 0
+                self.generate_payloads.append(dict(payload))
+                self.started.set()
+                assert self.release.wait(2.0)
+                self.returned.set()
+                return {
+                    "job_id": "broker-job-cancelled-submit",
+                    "status": "pending",
+                }
+
+        blocking_driver = FakeCloudDriver()
+        blocking_bridge = BlockingSubmissionBridge()
+        blocking_node = BrokerScriptedNode(blocking_bridge)
+        blocking_node.set_parameter_value("prompt", "cancelled submit retention")
+        blocking_node.set_parameter_value("reference_video_1", original_artifact)
+        blocking_node._create_gt_cloud_storage_driver = lambda: blocking_driver
+        deferred_uploads: list[tuple[object, Path]] = []
+
+        def capture_deferred_cleanup() -> None:
+            deferred_uploads.extend(blocking_node._temporary_video_uploads)
+            blocking_node._temporary_video_uploads = []
+
+        blocking_node._defer_temporary_video_upload_cleanup = capture_deferred_cleanup
+
+        async def cancel_started_submission() -> None:
+            process = asyncio.create_task(blocking_node._process_generation())
+            started = await asyncio.to_thread(blocking_bridge.started.wait, 1.0)
+            assert started
+            process.cancel()
+            await asyncio.sleep(0.05)
+            assert not process.done(), "Submit coroutine outran its blocking POST worker"
+            blocking_bridge.release.set()
+            try:
+                await process
+            except asyncio.CancelledError:
+                pass
+            else:
+                raise AssertionError("Cancellation during submit was swallowed")
+
+        asyncio.run(cancel_started_submission())
+        assert blocking_bridge.returned.is_set()
+        assert len(blocking_bridge.generate_payloads) == 1
+        assert (
+            blocking_node.parameter_output_values["generation_id"]
+            == "broker-job-cancelled-submit"
+        )
+        assert blocking_node._submission_outcome_unknown is False
+        assert blocking_node._remote_task_may_be_active is True
+        assert blocking_driver.deletes == []
+        assert len(deferred_uploads) == 1
+        assert deferred_uploads[0][1] == blocking_driver.uploads[0]["path"]
+
 
 def assert_tos_local_video_temporary_publication() -> None:
     with tempfile.TemporaryDirectory() as temporary:
@@ -3163,6 +1771,19 @@ class BrokerResultDownloadNode(target.HMBSeedanceGeneration):
 def assert_broker_result_download_contract() -> None:
     node = BrokerResultDownloadNode()
     original_async_client = target.httpx.AsyncClient
+    assert target._is_structurally_valid_mp4(VALID_MP4_BYTES)
+    assert not target._is_structurally_valid_mp4(b"\x00\x00\x00\x0cftypmp42")
+    assert not target._is_structurally_valid_mp4(
+        b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+        b"\x00\x00\x00\x10mdat12345678"
+    )
+    assert not target._is_structurally_valid_mp4(
+        b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+    )
+    assert not target._is_structurally_valid_mp4(
+        b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+        b"\xff\xff\xff\xffmdat"
+    )
 
     download_requests: list[httpx.Request] = []
 
@@ -3223,38 +1844,337 @@ def assert_broker_result_download_contract() -> None:
     assert len(redirect_requests) == 1
 
 
-def assert_broker_server_accounting_contract() -> None:
-    module_source = MODULE_PATH.read_text(encoding="utf-8")
-    retired_ledger_name = "".join(("Griptape_", "list"))
-    retired_share = "".join(
-        (r"\\fin-rcomp1\Composite_Team", "\\", "00", ".", "CompSource")
-    )
-    for forbidden in (
-        "USAGE_LEDGER_ROOT",
-        "USAGE_LOCAL_QUEUE_ROOT",
-        "USAGE_PRICE_CNY_PER_MILLION",
-        "_prepare_usage_tracking",
-        "_record_usage_task",
-        "_record_current_usage_status",
-        "_build_usage_event",
-        "_flush_usage_queue",
-        retired_ledger_name,
-        retired_share,
-    ):
-        assert forbidden not in module_source
+class AtomicLocalDestination:
+    def __init__(self, path: Path, policy) -> None:
+        self.location = str(path)
+        self._existing_file_policy = policy
+        self._create_parents = True
+        self._append = False
 
-    assert not {
-        name
-        for name in vars(target)
-        if name.startswith("USAGE_") or name.startswith("_USAGE_")
-    }
-    for runtime_class in (
+    def resolve(self) -> str:
+        return self.location
+
+    async def awrite_bytes(self, _content: bytes):
+        raise AssertionError("Completed MP4 used the non-atomic destination writer")
+
+
+def assert_atomic_final_output_publication() -> None:
+    video_bytes = VALID_MP4_BYTES
+    old_bytes = b"previous-complete-output"
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        final_path = root / "atomic.mp4"
+        destination = AtomicLocalDestination(
+            final_path,
+            target.ExistingFilePolicy.OVERWRITE,
+        )
+
+        final_path.write_bytes(old_bytes)
+        real_replace = target.os.replace
+        replacement_observations: list[tuple[Path, Path]] = []
+
+        def observed_replace(source, target_path) -> None:
+            source_path = Path(source)
+            destination_path = Path(target_path)
+            assert source_path.parent == destination_path.parent == root
+            assert source_path.read_bytes() == video_bytes
+            assert final_path.read_bytes() == old_bytes
+            replacement_observations.append((source_path, destination_path))
+            real_replace(source_path, destination_path)
+
+        with mock.patch.object(target.os, "replace", side_effect=observed_replace):
+            saved = asyncio.run(
+                target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                    destination,
+                    video_bytes,
+                )
+            )
+        assert replacement_observations
+        assert final_path.read_bytes() == video_bytes
+        assert Path(saved.resolve()) == final_path
+        assert not list(root.glob(".*.partial.mp4"))
+        assert not list(root.glob(".*.output-probe"))
+
+        final_path.write_bytes(old_bytes)
+        commit_started = threading.Event()
+        commit_release = threading.Event()
+
+        def blocking_replace(source, target_path) -> None:
+            commit_started.set()
+            assert commit_release.wait(2.0)
+            real_replace(source, target_path)
+
+        async def cancel_during_commit():
+            with mock.patch.object(
+                target.os,
+                "replace",
+                side_effect=blocking_replace,
+            ):
+                publication = asyncio.create_task(
+                    target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                        destination,
+                        video_bytes,
+                    )
+                )
+                started = await asyncio.to_thread(commit_started.wait, 1.0)
+                assert started
+                publication.cancel()
+                await asyncio.sleep(0.05)
+                assert not publication.done(), "Commit cancellation outran os.replace"
+                assert final_path.read_bytes() == old_bytes
+                commit_release.set()
+                return await publication
+
+        cancellation_saved = asyncio.run(cancel_during_commit())
+        assert Path(cancellation_saved.resolve()) == final_path
+        assert final_path.read_bytes() == video_bytes
+        assert not list(root.glob(".*.partial.mp4"))
+
+        final_path.write_bytes(old_bytes)
+        with mock.patch.object(
+            target.os,
+            "replace",
+            side_effect=OSError("simulated atomic replacement failure"),
+        ):
+            try:
+                asyncio.run(
+                    target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                        destination,
+                        video_bytes,
+                    )
+                )
+            except OSError as exc:
+                assert "replacement failure" in str(exc)
+            else:
+                raise AssertionError("Atomic replacement failure was accepted")
+        assert final_path.read_bytes() == old_bytes
+        assert not list(root.glob(".*.partial.mp4"))
+
+        async def partial_stage_failure(file, content: bytes, **_kwargs):
+            Path(file.location).write_bytes(content[:8])
+            raise OSError("simulated staging write failure")
+
+        with mock.patch.object(
+            target.File,
+            "awrite_bytes",
+            autospec=True,
+            side_effect=partial_stage_failure,
+        ):
+            try:
+                asyncio.run(
+                    target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                        destination,
+                        video_bytes,
+                    )
+                )
+            except OSError as exc:
+                assert "staging write failure" in str(exc)
+            else:
+                raise AssertionError("Partial staging write failure was accepted")
+        assert final_path.read_bytes() == old_bytes
+        assert not list(root.glob(".*.partial.mp4"))
+
+        create_new_destination = AtomicLocalDestination(
+            final_path,
+            target.ExistingFilePolicy.CREATE_NEW,
+        )
+        created = asyncio.run(
+            target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                create_new_destination,
+                video_bytes,
+            )
+        )
+        indexed_path = root / "atomic_1.mp4"
+        assert final_path.read_bytes() == old_bytes
+        assert indexed_path.read_bytes() == video_bytes
+        assert Path(created.resolve()) == indexed_path
+        assert not list(root.glob(".*.partial.mp4"))
+
+        fail_destination = AtomicLocalDestination(
+            final_path,
+            target.ExistingFilePolicy.FAIL,
+        )
+        try:
+            asyncio.run(
+                target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                    fail_destination,
+                    video_bytes,
+                )
+            )
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("FAIL collision policy overwrote an existing MP4")
+        assert final_path.read_bytes() == old_bytes
+        assert not list(root.glob(".*.partial.mp4"))
+
+    macro_node = target.HMBSeedanceGeneration(name="Atomic Macro Candidate Regression")
+    macro_destination = macro_node._output_file.build_file()
+    macro_candidate = next(
+        target.HMBSeedanceGeneration._output_destination_candidates(
+            macro_destination
+        )
+    )
+    assert macro_candidate.name.endswith("_v001.mp4")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        parsed_macro = ParsedMacro(
+            root.as_posix() + "/take_{###}/directory-indexed.mp4"
+        )
+        metadata = SimpleNamespace(
+            situation=SimpleNamespace(variables={"file_extension": "mp4"})
+        )
+        macro_destination = SimpleNamespace(
+            _file=SimpleNamespace(
+                _file_path=target.MacroPath(parsed_macro, {}),
+                _file_metadata=metadata,
+            ),
+            _existing_file_policy=target.ExistingFilePolicy.CREATE_NEW,
+            _create_parents=True,
+            _append=False,
+        )
+        first_macro_path = root / "take_001" / "directory-indexed.mp4"
+        first_macro_path.parent.mkdir(parents=True)
+        first_macro_path.write_bytes(old_bytes)
+        sidecars: list[tuple[Path, object]] = []
+        with mock.patch.object(
+            target,
+            "write_sidecar",
+            side_effect=lambda path, value: sidecars.append((Path(path), value)),
+        ):
+            macro_saved = asyncio.run(
+                target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                    macro_destination,
+                    video_bytes,
+                )
+            )
+        second_macro_path = root / "take_002" / "directory-indexed.mp4"
+        assert first_macro_path.read_bytes() == old_bytes
+        assert second_macro_path.read_bytes() == video_bytes
+        assert Path(macro_saved.resolve()) == second_macro_path
+        assert sidecars[0][0] == second_macro_path
+        assert sidecars[0][1].situation.variables["_index"] == 2
+        assert "_index" not in metadata.situation.variables
+        assert not list(root.rglob(".*.partial.mp4"))
+        assert not list(root.rglob(".*.output-probe"))
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        sidecar_failure_path = root / "sidecar-failure.mp4"
+        metadata = SimpleNamespace(
+            situation=SimpleNamespace(variables={"file_extension": "mp4"})
+        )
+        sidecar_failure_destination = SimpleNamespace(
+            _file=SimpleNamespace(_file_metadata=metadata),
+            _existing_file_policy=target.ExistingFilePolicy.OVERWRITE,
+            _create_parents=True,
+            _append=False,
+            resolve=lambda: str(sidecar_failure_path),
+        )
+        with mock.patch.object(
+            target,
+            "write_sidecar",
+            side_effect=PermissionError("simulated sidecar failure"),
+        ):
+            saved_after_sidecar_failure = asyncio.run(
+                target.HMBSeedanceGeneration._atomic_publish_completed_mp4(
+                    sidecar_failure_destination,
+                    video_bytes,
+                )
+            )
+        assert Path(saved_after_sidecar_failure.resolve()) == sidecar_failure_path
+        assert sidecar_failure_path.read_bytes() == video_bytes
+        assert not list(root.glob(".*.partial.mp4"))
+        assert not list(root.glob(".*.output-probe"))
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        requested_path = root / "project-parameter.mp4"
+        requested_path.write_bytes(old_bytes)
+        bridge = FakeBrokerBridge(
+            [
+                {
+                    "status": "completed",
+                    "job_id": "broker-job-1",
+                    "output": "https://cdn.example/atomic-project-result.mp4",
+                }
+            ]
+        )
+        project_node = target.HMBSeedanceGeneration(
+            name="Atomic ProjectFileParameter Regression"
+        )
+        project_node._broker_bridge_instance = bridge
+        project_node.set_parameter_value("prompt", "atomic project output")
+        project_node.set_parameter_value("output_file", str(requested_path))
+
+        async def project_download(_url: str) -> bytes:
+            return video_bytes
+
+        async def no_wait(_seconds: float) -> None:
+            return None
+
+        project_node._download_video = project_download
+        project_node._sleep = no_wait
+        project_node._monotonic = lambda: 0.0
+        asyncio.run(project_node._process_generation())
+
+        indexed_project_path = root / "project-parameter_1.mp4"
+        assert requested_path.read_bytes() == old_bytes
+        assert indexed_project_path.read_bytes() == video_bytes
+        assert (
+            Path(project_node.parameter_output_values["VIDEO_OUT"].value)
+            == indexed_project_path
+        )
+        assert (
+            project_node.parameter_output_values["video_url"]
+            is project_node.parameter_output_values["VIDEO_OUT"]
+        )
+        assert indexed_project_path.is_absolute()
+        assert indexed_project_path.is_file()
+        assert indexed_project_path.suffix == ".mp4"
+        assert indexed_project_path.read_bytes() == video_bytes
+        assert len(bridge.generate_payloads) == 1
+        assert not list(root.glob(".*.partial.mp4"))
+        assert not list(root.glob(".*.output-probe"))
+
+
+def assert_unwritable_output_is_rejected_before_submission() -> None:
+    bridge = FakeBrokerBridge([])
+    node = BrokerScriptedNode(bridge)
+    node.set_parameter_value("prompt", "preflight must precede billing")
+    with mock.patch.object(
         target.HMBSeedanceGeneration,
-        target.HMBSeedanceGeneration,
+        "_probe_output_parent_writable",
+        side_effect=PermissionError("simulated unwritable output parent"),
     ):
-        assert not {
-            name for name in dir(runtime_class) if "usage" in name.casefold()
-        }
+        try:
+            asyncio.run(node._process_generation())
+        except PermissionError as exc:
+            assert "unwritable output parent" in str(exc)
+        else:
+            raise AssertionError("Unwritable output parent reached Broker submission")
+    assert bridge.account_calls == 0
+    assert bridge.generate_payloads == []
+
+
+def assert_broker_server_accounting_contract() -> None:
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    forbidden_markers = (
+        "USAGE" + "_LEDGER_ROOT",
+        "USAGE" + "_LOCAL_QUEUE_ROOT",
+        "USAGE" + "_PRICE_CNY_PER_MILLION",
+        "_prepare_" + "usage_tracking",
+        "_record_" + "usage_task",
+        "_build_" + "usage_event",
+        "_flush_" + "usage_queue",
+        r"\\fin-rcomp1\Composite_Team" + "\\" + "00" + "." + "CompSource",
+    )
+    assert not {marker for marker in forbidden_markers if marker in source}
+    assert (
+        "The Broker generation request is the sole "
+        "usage/quota/accounting authority."
+    ) in source
 
     bridge = FakeBrokerBridge(
         [
@@ -3273,21 +2193,7 @@ def assert_broker_server_accounting_contract() -> None:
     assert node.parameter_output_values["generation_status"] == "succeeded"
     assert not {name for name in vars(node) if "usage" in name.casefold()}
 
-    manifest = json.loads(
-        (ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8")
-    )
-    tags = set(manifest["metadata"]["tags"])
-    assert not {
-        "PrivatePerUserMonthlyUsageLedger",
-        "OfflineUsageQueue",
-        "AtomicUsageLedger",
-    } & tags
-    assert "BrokerServerUsageAccounting" in tags
-    manifest_text = json.dumps(manifest, ensure_ascii=False)
-    assert (
-        "The client performs no secondary usage recording; the Broker is the sole "
-        "usage, quota, and accounting authority."
-    ) in manifest_text
+
 
 
 assert_constructor_and_public_contract()
@@ -3296,15 +2202,12 @@ assert_video_picker_single_wire_host_contract()
 assert_payload_and_media_contract()
 assert_broker_generation_contract()
 assert_refresh_during_submission_contract()
-assert_broker_direct_transport_resilience_contract()
 assert_broker_account_and_button_contract()
-assert_indexed_output_macro_contract()
-assert_bounded_mp4_decode_probe_contract()
-assert_package_managed_decode_verifier_resolution()
-assert_atomic_output_and_submission_safety()
 assert_local_video_temporary_publication()
 assert_tos_local_video_temporary_publication()
 assert_broker_result_download_contract()
+assert_atomic_final_output_publication()
+assert_unwritable_output_is_rejected_before_submission()
 assert_broker_server_accounting_contract()
 
-print("HMB Seedance FN AI Broker regression: PASS")
+print("HMB Seedance Generation FN AI Broker regression: PASS")

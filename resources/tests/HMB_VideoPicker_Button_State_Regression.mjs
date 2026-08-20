@@ -25,8 +25,8 @@ function asset(uid, order, role = "mask", selected = true) {
   };
 }
 
-// The asset catalog is unlimited, while only ten stable UIDs can be selected
-// for the transient Prompt/Generator order.
+// The asset catalog is unlimited while each active local Shot keeps at most
+// ten ordered UIDs.
 const catalogState = {
   mask_authoring_slot: 1,
   selected_video_uid: "asset-01",
@@ -77,8 +77,8 @@ const authoringBefore = {
 };
 const reordered = widgetModule.hmbMoveSelectedVideoAsset(catalogState, "asset-03", 0);
 assert.deepEqual(
-  widgetModule.hmbSelectedVideoAssets(reordered).map((item) => item.video_uid).slice(0, 3),
-  ["asset-03", "asset-01", "asset-02"],
+  widgetModule.hmbSelectedVideoAssets(reordered).map((item) => item.video_uid),
+  ["asset-03", "asset-01", "asset-02", "asset-04", "asset-05", "asset-06", "asset-07", "asset-08", "asset-09", "asset-10"],
 );
 const reorderedDepth = reordered.videos.find((item) => item.video_uid === "asset-02");
 const reorderedMotion = reordered.videos.find((item) => item.video_uid === "asset-03");
@@ -88,16 +88,15 @@ assert.equal(reordered.mask_authoring_slot, 1);
 assert.deepEqual(reordered.slot_assignments, authoringBefore.assignments);
 assert.deepEqual(reordered.slot_visibility, authoringBefore.visibility);
 
-// Full selection rejects an eleventh card. Deselecting one makes exactly one
-// position available and preserves every unrelated stable UID.
+// A full ten-video Shot rejects an eleventh card. Clicking a selected card
+// releases one slot, after which a new catalog card appends at order ten.
 const fullToggle = widgetModule.hmbToggleVideoAssetSelection(catalogState, "asset-11");
-assert.equal(widgetModule.hmbSelectedVideoAssets(fullToggle).length, 10);
-assert.equal(fullToggle.videos.find((item) => item.video_uid === "asset-11").selected, false);
-const nineSelected = widgetModule.hmbToggleVideoAssetSelection(catalogState, "asset-04");
-assert.equal(widgetModule.hmbSelectedVideoAssets(nineSelected).length, 9);
-const refilled = widgetModule.hmbToggleVideoAssetSelection(nineSelected, "asset-11");
-assert.equal(widgetModule.hmbSelectedVideoAssets(refilled).length, 10);
-assert.equal(widgetModule.hmbSelectedVideoAssets(refilled).at(-1).video_uid, "asset-11");
+assert.deepEqual(widgetModule.hmbSelectedVideoAssets(fullToggle).map((item) => item.video_uid), catalogState.videos.slice(0, 10).map((item) => item.video_uid));
+assert.equal(fullToggle.videos.length, 12);
+const cleared = widgetModule.hmbToggleVideoAssetSelection(catalogState, "asset-04");
+assert.equal(widgetModule.hmbSelectedVideoAssets(cleared).length, 9);
+const refilled = widgetModule.hmbToggleVideoAssetSelection(cleared, "asset-11");
+assert.deepEqual(widgetModule.hmbSelectedVideoAssets(refilled).map((item) => item.video_uid).slice(-1), ["asset-11"]);
 
 // Preview may target an unselected asset without changing generator order.
 const previewed = widgetModule.hmbPreviewVideoAsset(catalogState, "asset-12");
@@ -105,7 +104,7 @@ assert.equal(previewed.preview_video_uid, "asset-12");
 assert.equal(previewed.selected_video_path, "C:/shots/catalog/asset-12.mp4");
 assert.deepEqual(
   widgetModule.hmbSelectedVideoAssets(previewed).map((item) => item.video_uid),
-  widgetModule.hmbSelectedVideoAssets(catalogState).map((item) => item.video_uid),
+  catalogState.videos.slice(0, 10).map((item) => item.video_uid),
 );
 
 // Delete removes only that metadata record. Remaining selected UIDs keep their
@@ -176,6 +175,25 @@ assert.equal(result.originalPreviewToggleEnabled, true);
 
 result = buttons({
   ...readComplete,
+  operation_kind: "run_video",
+  active_process_pid: 0,
+  operation_started_at_ms: 2000,
+  operation_finished_at_ms: 2000,
+}, selectedPath);
+assert.equal(result.operationBusy, false, "A stale completed operation_kind must not disable LOAD or Shot controls forever.");
+assert.equal(result.playblastEnabled, true);
+
+result = buttons({
+  ...readComplete,
+  operation_kind: "run_video",
+  active_process_pid: 0,
+  operation_started_at_ms: 2001,
+  operation_finished_at_ms: 2000,
+}, selectedPath);
+assert.equal(result.operationBusy, true, "An operation with an unfinished lifecycle remains locked even before a PID echo.");
+
+result = buttons({
+  ...readComplete,
   original_enabled: false,
   mask_enabled: false,
   depth_enabled: false,
@@ -198,7 +216,9 @@ result = buttons({
   ...readComplete,
   snapshot_active: true,
   snapshot_video_slot: 1,
-  snapshot_data_uri: "data:image/png;base64,AA==",
+  snapshot_path: "C:/shots/.hmb_picker/snapshot-active.png",
+  snapshot_url: "file:///C:/shots/.hmb_picker/snapshot-active.png",
+  snapshot_sha256: "a".repeat(64),
 }, selectedPath);
 assert.equal(result.snapshotDeleteEnabled, true);
 

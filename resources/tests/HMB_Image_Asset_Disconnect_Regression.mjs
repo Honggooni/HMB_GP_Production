@@ -24,14 +24,10 @@ const selectedHandler = source.match(
 )?.[0] || "";
 assert.match(
   selectedHandler,
-  /assetsByLibraryId\.get\(key\)[\s\S]*?externalImport[\s\S]*?state\.disconnect_import_uid = asset\.source_uid;[\s\S]*?state = emit\(props, state, container\);[\s\S]*?return;/,
-  "An external X must request a graph disconnect and keep selection until acknowledgement.",
+  /const asset = assetsBySourceUid\.get\(key\)[\s\S]*?commitShotMutation\([\s\S]*?hmbToggleImageAssetShotAsset\(state, shotUuid, key, asset\)[\s\S]*?paintActiveShotSelection/,
+  "A Shot tray X must remove only that Shot membership without disconnecting the shared source.",
 );
-assert.match(
-  source,
-  /disconnectPending \? 'disabled aria-busy="true"'/,
-  "The external X must expose a pending state while the backend checks the edge.",
-);
+assert.doesNotMatch(selectedHandler, /disconnect_import_uid|_disconnect_import_connection/);
 assert.match(
   source,
   /Disconnect this external image from IMAGE_IMPORT_IN\. Multi-image or ambiguous links must be removed at the input port\./,

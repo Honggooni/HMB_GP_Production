@@ -293,7 +293,7 @@ try:
                     )
                     edges.add("V->P")
                 assert_user_state_survives(state, f"{label}:connected")
-                compiled = prompt._build_data_only_prompt_package(state)
+                compiled = prompt._build_prompt_package(state)
                 assert_data_only_prompt(compiled, label)
                 assert bool(state["image_asset"]["enabled"]) is ("I" in composition), label
                 assert bool(state["picker"]["enabled"]) is ("V" in composition), label
@@ -312,10 +312,7 @@ try:
                         connected=True,
                     )
                     assert_user_state_survives(reverse, f"{label}:reverse")
-                    assert_data_only_prompt(
-                        prompt._build_data_only_prompt_package(reverse),
-                        f"{label}:reverse",
-                    )
+                    assert_data_only_prompt(prompt._build_prompt_package(reverse), f"{label}:reverse")
 
             agent_calls = 0
             if "A" in composition:

@@ -360,7 +360,7 @@ topology_target = SimpleNamespace(name="paired_agent")
 edge = SimpleNamespace(
     source_node_name=topology_source.name,
     source_parameter_name="PROMPT_OUT",
-    target_parameter_name="prompt",
+    target_parameter_name=agent._AGENT_SHOT_PROMPT_INPUT_PARAMETER,
 )
 assert agent._is_direct_hmb_prompt_library_connection(
     topology_target,

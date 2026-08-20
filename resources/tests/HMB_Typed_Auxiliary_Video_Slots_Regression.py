@@ -208,9 +208,10 @@ for occupied_mask in range(16):
 assert allocator_case_count == 64
 
 
-# Generated records append with new stable identities. Existing typed/manual
-# rows survive, and only the first ten selected records are exposed in the
-# transient Prompt/Generator order.
+# Generated records append with new stable identities. A same-UID staged Mask
+# is finalized once (not duplicated), existing manual rows survive, and only
+# the first ten selected records are exposed in transient Prompt/Generator
+# order.
 append_source = picker._parse_state({
     **state_with(*[manual_video(slot) for slot in AUXILIARY_SLOTS]),
     "original_enabled": False,
@@ -228,7 +229,7 @@ appended = picker._pack_selected_generation_videos(
     },
 )
 assert append_source == append_before
-assert len(appended["videos"]) == len(append_before["videos"]) + 3
+assert len(appended["videos"]) == len(append_before["videos"]) + 2
 assert [item.get("generation_role") for item in appended["videos"][-3:]] == [
     "mask", "depth", "motion_guide",
 ]
@@ -465,9 +466,11 @@ typed_reorder = picker._parse_state({
     "videos": [primary_video(), depth_video(2), motion_video(3)],
 })
 typed_reorder_source = copy.deepcopy(typed_reorder)
-typed_reorder_source["videos"][0]["selection_order"] = 3
-typed_reorder_source["videos"][1]["selection_order"] = 1
-typed_reorder_source["videos"][2]["selection_order"] = 2
+typed_reorder_source["picker_shots"][0]["selected_video_uids"] = [
+    "typed-depth-typed-auxiliary-slot-regression-bundle-2",
+    "typed-motion-typed-auxiliary-slot-regression-bundle-3",
+    "typed-mask-typed-auxiliary-slot-regression-bundle",
+]
 typed_reordered = picker._parse_state(typed_reorder_source)
 typed_payload, _typed_media = picker._build_synchronized_video_outputs(
     typed_reordered
@@ -736,46 +739,17 @@ assert any(
     "mismatched generated Depth provenance" in error
     for error in unverified_depth["picker"].get("contract_errors", [])
 )
-unverified_depth_prompt = prompt._build_data_only_prompt_package(unverified_depth)
-assert "SOURCE DATA WARNINGS:" not in unverified_depth_prompt
-assert "mismatched generated Depth provenance" not in unverified_depth_prompt
-unverified_depth_lines = unverified_depth_prompt.splitlines()
-assert len(unverified_depth_lines) == 7
-assert unverified_depth_lines[0] == "HMB_GP_Production"
-assert unverified_depth_lines[1] == prompt.PUBLIC_JOB_CONTRACT_HEADER
-assert unverified_depth_lines[3] == prompt.FX_TIMING_CONTRACT_HEADER
-assert unverified_depth_lines[5] == prompt.USER_DESCRIPTION_DATA_HEADER
-
-unverified_depth_job = json.loads(unverified_depth_lines[2])
-unverified_depth_fx = json.loads(unverified_depth_lines[4])
-unverified_depth_user = json.loads(unverified_depth_lines[6])
-assert unverified_depth_job["schema"] == prompt.PUBLIC_JOB_CONTRACT_SCHEMA
-assert unverified_depth_job["version"] == prompt.PUBLIC_JOB_CONTRACT_VERSION
-unverified_depth_videos = {
-    item["video"]: item for item in unverified_depth_job["videos"]
-}
-assert set(unverified_depth_videos) == {"@video1", "@video2"}
-assert unverified_depth_videos["@video2"]["label"] == "depth_2"
-assert unverified_depth_videos["@video2"]["source_type"] == (
-    "Depth / Spatial Reference"
+unverified_depth_prompt = prompt._build_data_only_prompt_package(
+    unverified_depth
 )
-assert unverified_depth_videos["@video2"]["control_role"] == (
-    "Spatial Alignment Verification Only"
+unverified_lines = unverified_depth_prompt.splitlines()
+assert len(unverified_lines) == 7
+unverified_job = json.loads(
+    unverified_lines[unverified_lines.index("HMB JOB DATA (JSON):") + 1]
 )
-assert unverified_depth_videos["@video2"]["identity"]["video_uid"] == (
-    "typed-depth-wrong-bundle-2"
-)
-assert "companion" not in unverified_depth_videos["@video2"]
-assert unverified_depth_job["connections"] == {
-    "image_asset": False,
-    "picker": True,
-}
-assert unverified_depth_fx["schema"] == prompt.FX_TIMING_CONTRACT_SCHEMA
-assert unverified_depth_fx["version"] == prompt.FX_TIMING_CONTRACT_VERSION
-assert unverified_depth_fx["valid"] is True
-assert unverified_depth_fx["errors"] == []
-assert unverified_depth_user == {}
-assert "Final prompt generation is blocked" not in unverified_depth_prompt
+assert unverified_job["videos"][1]["video"] == "@video2"
+assert unverified_job["videos"][1]["source_type"] == picker.DEPTH_SOURCE_TYPE
+assert "companion" not in unverified_job["videos"][1]
 
 
 # Applying a valid generated typed source is additive: user-authored Color Pick,
@@ -788,6 +762,14 @@ binding_state["images"][0].update({
     "color_picks": ["Red"],
     "binding_video_slots": [2],
     "marker_video": 2,
+    "frame_range_intent": {
+        "version": 1,
+        "enabled": True,
+        "start_frame": 101,
+        "end_frame": 112,
+        "ranges": [{"start": 103, "end": 108}],
+        "selected_index": 0,
+    },
     "frame_range_enabled": True,
     "frame_range_color_index": 0,
     "frame_range_bindings": {
@@ -815,6 +797,14 @@ bound_image = bound_depth["images"][0]
 assert bound_image["color_picks"][0] == "Red"
 assert bound_image["binding_video_slots"][0] == 2
 assert "@video2::Red" in bound_image["frame_range_bindings"]
+assert bound_image["frame_range_intent"] == {
+    "version": 1,
+    "enabled": True,
+    "start_frame": 101,
+    "end_frame": 112,
+    "ranges": [{"start": 103, "end": 108}],
+    "selected_index": 0,
+}
 
 
 # Prompt consumes whichever valid Picker media exists. Color-only and
@@ -832,7 +822,7 @@ for companions in ([], [depth_video(4)]):
         },
         connected=True,
     )
-    compiled = prompt._build_data_only_prompt_package(applied)
+    compiled = prompt._build_prompt_package(applied)
     assert motion_required_text not in compiled
     assert "Final prompt generation is blocked" not in compiled
 
@@ -846,7 +836,7 @@ motion_ready = prompt._apply_picker_payload(
     },
     connected=True,
 )
-assert motion_required_text not in prompt._build_data_only_prompt_package(motion_ready)
+assert motion_required_text not in prompt._build_prompt_package(motion_ready)
 
 
 print(

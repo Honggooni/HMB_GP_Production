@@ -156,6 +156,14 @@ assert agent._is_hmb_prompt_library_payload(compiled)
 # binding_video_slots[1] (@video3), not to the compatibility marker_video value.
 range_state = copy.deepcopy(normalized)
 range_image = range_state["images"][0]
+range_image["frame_range_intent"] = {
+    "version": 1,
+    "enabled": True,
+    "start_frame": 1,
+    "end_frame": 24,
+    "ranges": [{"start": 5, "end": 12}],
+    "selected_index": 0,
+}
 range_image["frame_range_enabled"] = True
 range_image["frame_range_color_index"] = 1
 range_image["frame_range_bindings"] = {
@@ -225,8 +233,7 @@ assert prompt_json_section(
         "start_frame": 1,
         "end_frame": 24,
         "frame_count": 24,
-        "timebase": "24/1",
-        "fps": 24.0,
+        "fps": 0.0,
     },
     "segments": [{"start_frame": 5, "end_frame": 12}],
     "unresolved_segments": [],
@@ -239,6 +246,14 @@ assert prompt_json_section(
 # The @video1 binding, shared scope, and optional frame instruction remain intact
 # so the independent @video3 source can return later.
 inactive_state = copy.deepcopy(normalized)
+inactive_state["images"][0]["frame_range_intent"] = {
+    "version": 1,
+    "enabled": True,
+    "start_frame": 1,
+    "end_frame": 24,
+    "ranges": [{"start": 5, "end": 12}],
+    "selected_index": 0,
+}
 inactive_state["images"][0]["frame_range_enabled"] = True
 inactive_state["images"][0]["frame_range_color_index"] = 1
 inactive_state["images"][0]["frame_range_bindings"] = {

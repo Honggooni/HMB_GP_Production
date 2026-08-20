@@ -53,8 +53,7 @@ assert agent._assert_prompt_policy_identity_matches_signed_runtime() == (
     prompt.PROMPT_POLICY_SOURCE_VERSION,
     prompt.PROMPT_POLICY_SOURCE_CONTRACT_SHA256,
 )
-assert "[HMB BUNDLED SIGNED POLICY REQUIRED]" in agent_source
-assert "[HMB SERVER POLICY REQUIRED]" not in agent_source
+assert "[HMB SERVER POLICY REQUIRED]" in agent_source
 assert "사용자 로컬에 동봉된 hmb_agent_core.dat" not in agent_source
 assert "_assert_prompt_policy_identity_matches_signed_runtime()" in agent_source
 
@@ -85,12 +84,6 @@ for forbidden in (
 ):
     assert forbidden not in prompt_only
 
-for forbidden in (
-    "PRODUCTION INTEGRATION DEFAULTS:",
-    "relationship interpretation",
-):
-    assert forbidden not in source
-
 # A regular Playblast row exposes source identity and the selected role, but no
 # policy explanation.
 state = prompt._default_widget_state()
@@ -111,6 +104,11 @@ assert user_data == {}
 # Structured control-only data is transported as fields while its direct UI
 # source remains user-authored text.
 control_state = prompt._default_widget_state()
+control_state["videos"][0].update({
+    "present": True,
+    "label": "shot_control.mp4",
+    "source_type": "Maya Preview / Playblast",
+})
 control_state["text"]["SCENE_CONTEXT"] = (
     "CONTROL_ONLY_BINDING: @video1 | Target = Hero_A | Function = Focus | "
     "Marker = Red | Boundary = Frames 48-72"
@@ -161,6 +159,11 @@ assert set(fx_source).issubset({
 # Image look intent and routing remain explicit fields, without generated
 # appearance-policy prose.
 image_state = prompt._default_widget_state()
+image_state["videos"][0].update({
+    "present": True,
+    "label": "shot_control.mp4",
+    "source_type": "Maya Preview / Playblast",
+})
 image_state["images"][0].update({
     "present": True,
     "label": "hero_character_sheet.png",
@@ -168,6 +171,7 @@ image_state["images"][0].update({
     "owner": "Hero_A",
     "binding_scopes": ["Full body / full appearance"],
     "color_picks": ["Red"],
+    "binding_video_slots": [1],
 })
 job, _fx_contract, _user_data = prompt_sections(
     prompt._build_data_only_prompt_package(image_state)

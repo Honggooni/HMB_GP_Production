@@ -150,15 +150,49 @@ def assert_no_runtime_fetch_and_prebilling_order() -> None:
         encoding="utf-8"
     )
     method = generator_source.index("async def _process_generation_impl")
-    new_run_guard = generator_source.index("if not resume_generation_id", method)
+    new_run_guard = generator_source.index(
+        'if not params["resume_generation_id"]:', method
+    )
+    shot_resolution = generator_source.index(
+        "params = self._resolve_exact_shot_generation_inputs(params)",
+        new_run_guard,
+    )
+    validation = generator_source.index(
+        "self._validate_parameters(params)", shot_resolution
+    )
+    destination = generator_source.index(
+        "destination = self._output_file.build_file()", validation
+    )
+    verifier_guard = generator_source.index(
+        "if not resume_generation_id:", destination
+    )
     verifier = generator_source.index(
-        "decode_verifier = await asyncio.to_thread", new_run_guard
+        "decode_verifier = await self._run_blocking_generation_stage(",
+        verifier_guard,
+    )
+    verifier_resolver = generator_source.index(
+        "_resolve_mp4_decode_verifier", verifier
     )
     broker = generator_source.index(
-        "bridge = await self._ensure_broker_connected()", verifier
+        "bridge = await self._ensure_broker_connected()", verifier_resolver
+    )
+    media_preparation = generator_source.index(
+        "self._prepare_video_references_for_run", broker
     )
     billable = generator_source.index("bridge.generate_seedance", broker)
-    assert method < new_run_guard < verifier < broker < billable
+    assert (
+        method
+        < new_run_guard
+        < shot_resolution
+        < validation
+        < destination
+        < verifier_guard
+        < verifier
+        < verifier_resolver
+        < broker
+        < media_preparation
+        < billable
+    )
 
 
 assert_griptape_package_candidate_is_off_path()

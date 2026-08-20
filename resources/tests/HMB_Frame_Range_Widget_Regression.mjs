@@ -1,19 +1,66 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 
-
 async function importSource(path) {
   const source = fs.readFileSync(path, "utf8");
   return import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
 }
 
-
 const promptPath = new URL("../../widgets/HMBPromptLibraryScopedBindingWidget.js", import.meta.url);
-const pickerPath = new URL("../../widgets/HMBVideoPickerLibraryWidget_v032.js", import.meta.url);
 const promptSource = fs.readFileSync(promptPath, "utf8");
 const prompt = await importSource(promptPath);
-const picker = await importSource(pickerPath);
+const INT32_MIN = -2147483648;
+const INT32_MAX = 2147483647;
+const defaultIntent = () => ({
+  version: 1,
+  enabled: false,
+  start_frame: null,
+  end_frame: null,
+  ranges: [],
+  selected_index: -1,
+});
+const activeIntent = () => ({
+  version: 1,
+  enabled: true,
+  start_frame: -12000,
+  end_frame: 24000,
+  ranges: [
+    { start: -12000, end: -11000 },
+    { start: 12001, end: 24000 },
+  ],
+  selected_index: 1,
+});
+const baseImage = (overrides = {}) => ({
+  slot: 1,
+  label: "Hero",
+  present: true,
+  asset_id: "hero",
+  asset_source_uid: "project:hero",
+  source_type: "Character Appearance",
+  owner: "Hero",
+  scope: "Full body / full appearance",
+  binding_scopes: ["Full body / full appearance"],
+  binding_custom_scopes: [""],
+  binding_video_slots: [1],
+  marker_video: 1,
+  color_picks: [""],
+  frame_range_intent: defaultIntent(),
+  frame_range_enabled: false,
+  frame_range_color_index: 0,
+  frame_range_bindings: {},
+  frame_range_binding: null,
+  frame_range_selected_index: -1,
+  ...overrides,
+});
+const baseState = (image, overrides = {}) => prompt.normalizeState({
+  ui: { language: "en" },
+  images: [image],
+  videos: [],
+  picker: { enabled: false, awaiting_data: false, frame_metadata: [] },
+  ...overrides,
+});
 
+// Full signed INT32 normalization, including raw-bound rejection and MAX-safe merge.
 assert.deepEqual(
   prompt.normalizeFrameRanges([
     { start: 97, end: 120 },
@@ -21,1025 +68,366 @@ assert.deepEqual(
     { start: 121, end: 144 },
     { start: 40, end: 60 },
   ]),
-  [
-    { start: 1, end: 60 },
-    { start: 97, end: 144 },
-  ],
+  [{ start: 1, end: 60 }, { start: 97, end: 144 }],
 );
+assert.deepEqual(
+  prompt.normalizeFrameRanges([
+    { start: INT32_MIN, end: INT32_MIN },
+    { start: INT32_MIN + 1, end: -1 },
+    { start: INT32_MAX - 1, end: INT32_MAX },
+    { start: INT32_MAX, end: INT32_MAX },
+    { start: INT32_MIN - 1, end: 0 },
+    { start: 0, end: INT32_MAX + 0.4 },
+    { start: true, end: 1 },
+  ]),
+  [{ start: INT32_MIN, end: -1 }, { start: INT32_MAX - 1, end: INT32_MAX }],
+);
+assert.deepEqual(
+  prompt.normalizeFrameRanges([{ start: -1.5, end: 1.5 }]),
+  [{ start: -1, end: 2 }],
+  "Frontend rounding matches backend JavaScript-style signed rounding.",
+);
+assert.equal(prompt.frameDomainInputValue(INT32_MIN), "-2147483648");
+assert.equal(prompt.frameDomainInputValue(-12), "-012");
+assert.equal(prompt.frameDomainInputValue(12000), "12000");
+assert.equal(prompt.frameDomainInputValue(INT32_MAX + 1), "");
+assert.equal(prompt.frameDomainInputValue(false), "");
 
-const image = {
-  slot: 1,
-  label: "Hero",
-  present: true,
-  source_type: "Character Appearance",
-  owner: "Hero",
-  scope: "Full body / full appearance",
-  binding_scopes: ["Full body / full appearance"],
-  binding_custom_scopes: [""],
-  binding_video_slots: [3],
-  marker_video: 3,
-  color_picks: ["Green"],
+// One-way migration imports manual legacy data only.
+const legacyManual = baseImage({
   frame_range_enabled: true,
-  frame_range_color_index: 0,
-  frame_range_bindings: {},
-  frame_range_selected_index: -1,
-};
-const state = {
-  images: [image],
-  videos: [
-    { slot: 1, label: "primary", present: true, source_type: "Maya Preview / Playblast" },
-    { slot: 2, label: "aux2", present: true, source_type: "Motion Reference" },
-    { slot: 3, label: "aux3", present: true, source_type: "Motion Reference" },
-  ],
-  picker: {
-    enabled: true,
-    awaiting_data: false,
-    suppressed: false,
-    frame_metadata: [
-      {
-        video_slot: "@video3",
-        fps: 24,
-        start_frame: 1,
-        end_frame: 144,
-        frame_count: 144,
-        duration_seconds: 6,
-        timebase: "24/1",
-        available_color_picks: ["Green", "Blue"],
-        conflict: false,
-        valid: true,
-        warnings: [],
-      },
-    ],
-  },
-};
-
-prompt.storeCurrentFrameRanges(image, [
-  { start: 97, end: 144 },
-  { start: 1, end: 48 },
-], 0);
-assert.deepEqual(image.frame_range_bindings["@video3::Green"].ranges, [
-  { start: 1, end: 48 },
-  { start: 97, end: 144 },
-]);
-assert.equal(prompt.frameRangeUiStatus(state, image).canEnable, true);
-assert.equal(prompt.frameRangeUiStatus(state, image).status, "2 RANGES");
-
-const manualImage = {
-  ...image,
-  color_picks: ["Green"],
-  frame_range_bindings: {
-    "@video3::Green": {
-      video_slot: "@video3",
-      color_pick: "Green",
-      origin: "manual",
-      start_frame: 1001,
-      end_frame: 1120,
-      ranges: [{ start: 1010, end: 1020 }],
-    },
-  },
-  frame_range_binding: null,
   frame_range_selected_index: 0,
-};
-const manualState = {
-  ...state,
-  images: [manualImage],
-  picker: {
-    ...state.picker,
-    enabled: false,
-    awaiting_data: false,
-    suppressed: false,
-    // Stale metadata must not lock a manually operated Range control.
-    frame_metadata: state.picker.frame_metadata,
-  },
-};
-const manualStatus = prompt.frameRangeUiStatus(manualState, manualImage);
-assert.equal(manualStatus.canEnable, true, "Manual Range can be enabled without Picker.");
-assert.equal(manualStatus.domainReadonly, false);
-assert.equal(manualStatus.domainComplete, true);
-assert.equal(manualStatus.metadata.origin, "manual");
-assert.deepEqual(
-  [manualStatus.domainStart, manualStatus.domainEnd],
-  [1001, 1120],
-);
-assert.deepEqual(manualStatus.ranges, [{ start: 1010, end: 1020 }]);
-assert.equal(prompt.frameDomainInputValue(0), "0000");
-const zeroDomainImage = {
-  ...manualImage,
-  frame_range_bindings: {},
-  frame_range_binding: null,
-};
-prompt.storeCurrentFrameDomain(zeroDomainImage, "0000", 0);
-assert.deepEqual(
-  [
-    zeroDomainImage.frame_range_bindings["@video3::Green"].start_frame,
-    zeroDomainImage.frame_range_bindings["@video3::Green"].end_frame,
-  ],
-  [0, 0],
-  "Frame 0000 remains a valid persisted manual domain instead of becoming null.",
-);
-const zeroDomainStatus = prompt.frameRangeUiStatus(manualState, zeroDomainImage);
-assert.deepEqual([zeroDomainStatus.domainStart, zeroDomainStatus.domainEnd], [0, 0]);
-assert.equal(zeroDomainStatus.domainComplete, true);
-
-const legacyEndpointImage = {
-  ...manualImage,
   frame_range_binding: {
-    video_slot: "@video3",
+    video_slot: "@video7",
     color_pick: "Green",
     origin: "manual",
-    manual_start_frame: 1001,
-    manual_end_frame: 1120,
-    ranges: [],
+    start_frame: -20,
+    end_frame: 12000,
+    ranges: [{ start: 10, end: 20 }],
   },
-  frame_range_bindings: {
-    "@video3::Green": {
-      video_slot: "@video3",
-      color_pick: "Green",
-      origin: "manual",
-      ranges: [{ start: 1010, end: 1020 }],
-    },
+});
+delete legacyManual.frame_range_intent;
+assert.deepEqual(baseState(legacyManual).images[0].frame_range_intent, {
+  version: 1,
+  enabled: true,
+  start_frame: -20,
+  end_frame: 12000,
+  ranges: [{ start: 10, end: 20 }],
+  selected_index: 0,
+});
+
+const pickerOnlyLegacy = baseImage({
+  frame_range_enabled: true,
+  frame_range_selected_index: 0,
+  frame_range_binding: {
+    origin: "picker_auto",
+    start_frame: 1,
+    end_frame: 144,
+    ranges: [{ start: 1, end: 48 }],
+  },
+});
+delete pickerOnlyLegacy.frame_range_intent;
+assert.deepEqual(
+  baseState(pickerOnlyLegacy).images[0].frame_range_intent,
+  { ...defaultIntent(), enabled: true },
+  "Picker-authored endpoints/ranges are never imported into Prompt intent.",
+);
+
+const canonicalWins = baseImage({
+  frame_range_intent: defaultIntent(),
+  frame_range_enabled: true,
+  frame_range_selected_index: 0,
+  frame_range_binding: {
+    origin: "manual",
+    start_frame: 1,
+    end_frame: 144,
+    ranges: [{ start: 1, end: 48 }],
+  },
+});
+assert.deepEqual(
+  baseState(canonicalWins).images[0].frame_range_intent,
+  defaultIntent(),
+  "Canonical field presence is the permanent migration sentinel.",
+);
+
+// No video, Picker, Color Pick, or metadata is required to author a Range.
+const noVideoState = baseState(baseImage());
+const noVideoImage = noVideoState.images[0];
+const legacyBeforeEdit = JSON.stringify({
+  enabled: noVideoImage.frame_range_enabled,
+  colorIndex: noVideoImage.frame_range_color_index,
+  bindings: noVideoImage.frame_range_bindings,
+  binding: noVideoImage.frame_range_binding,
+  selected: noVideoImage.frame_range_selected_index,
+});
+assert.equal(prompt.setFrameRangeEnabled(noVideoImage, true), true);
+prompt.storeCurrentFrameDomain(noVideoImage, -12000, 24000);
+prompt.storeCurrentFrameRanges(noVideoImage, [
+  { start: 12001, end: 24000 },
+  { start: -12000, end: -11000 },
+], 1);
+assert.deepEqual(noVideoImage.frame_range_intent, activeIntent());
+assert.equal(
+  JSON.stringify({
+    enabled: noVideoImage.frame_range_enabled,
+    colorIndex: noVideoImage.frame_range_color_index,
+    bindings: noVideoImage.frame_range_bindings,
+    binding: noVideoImage.frame_range_binding,
+    selected: noVideoImage.frame_range_selected_index,
+  }),
+  legacyBeforeEdit,
+  "Range UI does not project changes into video/color-addressed legacy fields.",
+);
+let status = prompt.frameRangeUiStatus(noVideoState, noVideoImage);
+assert.equal(status.canEnable, true);
+assert.equal(status.reason, "");
+assert.equal(status.domainReadonly, false);
+assert.equal(status.domainComplete, true);
+assert.equal(status.metadata.origin, "manual");
+assert.deepEqual([status.domainStart, status.domainEnd], [-12000, 24000]);
+assert.deepEqual(status.ranges, activeIntent().ranges);
+
+const beforeOff = structuredClone(noVideoImage.frame_range_intent);
+assert.equal(prompt.setFrameRangeEnabled(noVideoImage, false), false);
+assert.deepEqual(noVideoImage.frame_range_intent, { ...beforeOff, enabled: false });
+assert.equal(noVideoImage.frame_range_intent.selected_index, 1);
+assert.equal(prompt.setFrameRangeEnabled(noVideoImage, true), true);
+assert.deepEqual(noVideoImage.frame_range_intent, beforeOff);
+
+prompt.storeCurrentFrameDomain(noVideoImage, INT32_MAX + 1, INT32_MIN - 1);
+assert.deepEqual(
+  [noVideoImage.frame_range_intent.start_frame, noVideoImage.frame_range_intent.end_frame],
+  [null, null],
+  "Out-of-domain manual input is rejected rather than clamped.",
+);
+prompt.storeCurrentFrameDomain(noVideoImage, INT32_MIN, INT32_MAX);
+
+// Source slot/color/Picker changes are orthogonal to canonical intent.
+const intentBeforeSourceChanges = structuredClone(noVideoImage.frame_range_intent);
+noVideoImage.color_picks = ["Blue", "Green"];
+noVideoImage.binding_video_slots = [10, 2];
+noVideoImage.marker_video = 10;
+noVideoImage.picker_auto_color = "Blue";
+noVideoImage.picker_auto_video = 10;
+noVideoImage.frame_range_color_index = 1;
+noVideoImage.frame_range_enabled = false;
+noVideoImage.frame_range_selected_index = -1;
+noVideoImage.frame_range_bindings = {
+  "@video10::Blue": {
+    origin: "picker_auto",
+    start_frame: 1,
+    end_frame: 12,
+    ranges: [{ start: 1, end: 12 }],
   },
 };
-const legacyEndpointStatus = prompt.frameRangeUiStatus(manualState, legacyEndpointImage);
-assert.deepEqual(
-  [legacyEndpointStatus.domainStart, legacyEndpointStatus.domainEnd],
-  [1001, 1120],
-  "Legacy endpoint aliases survive a canonical range-map entry that omits the domain.",
-);
-assert.deepEqual(legacyEndpointStatus.ranges, [{ start: 1010, end: 1020 }]);
+const afterSlotAndColorChange = prompt.normalizeState(noVideoState);
+assert.deepEqual(afterSlotAndColorChange.images[0].frame_range_intent, intentBeforeSourceChanges);
 
-prompt.storeCurrentFrameDomain(manualImage, 12, null);
-let partialManualStatus = prompt.frameRangeUiStatus(manualState, manualImage);
-assert.equal(partialManualStatus.canEnable, true);
-assert.equal(partialManualStatus.domainComplete, false);
-assert.equal(partialManualStatus.status, "SET START / END · OPTIONAL");
-const koreanPartialStatus = prompt.frameRangeUiStatus(
-  { ...manualState, ui: { ...(manualState.ui || {}), language: "ko" } },
-  manualImage,
-);
-assert.equal(koreanPartialStatus.status, "시작 / 끝 입력 (선택 사항)");
-assert.equal(
-  manualImage.frame_range_bindings["@video3::Green"].start_frame,
-  12,
-);
-assert.equal(
-  manualImage.frame_range_bindings["@video3::Green"].end_frame,
-  null,
-);
-prompt.storeCurrentFrameDomain(manualImage, 12, 34);
-partialManualStatus = prompt.frameRangeUiStatus(manualState, manualImage);
-assert.equal(partialManualStatus.domainComplete, true);
+const pickerMutationStatus = prompt.frameRangeUiStatus({
+  ...afterSlotAndColorChange,
+  videos: [{ slot: 10, present: true, video_uid: "changed-video" }],
+  picker: {
+    enabled: true,
+    awaiting_data: false,
+    frame_metadata: [{
+      video_slot: "@video10",
+      start_frame: 1,
+      end_frame: 12,
+      frame_count: 12,
+      fps: 24,
+      available_color_picks: ["Blue"],
+      valid: true,
+    }],
+  },
+}, afterSlotAndColorChange.images[0]);
 assert.deepEqual(
-  [partialManualStatus.domainStart, partialManualStatus.domainEnd],
-  [12, 34],
+  {
+    intent: pickerMutationStatus.intent,
+    domainStart: pickerMutationStatus.domainStart,
+    domainEnd: pickerMutationStatus.domainEnd,
+    ranges: pickerMutationStatus.ranges,
+    reason: pickerMutationStatus.reason,
+  },
+  {
+    intent: intentBeforeSourceChanges,
+    domainStart: INT32_MIN,
+    domainEnd: INT32_MAX,
+    ranges: intentBeforeSourceChanges.ranges,
+    reason: "",
+  },
+  "Picker JSON/metadata cannot veto, fill, cap, or replace manual intent.",
 );
 
-const pickerPriorityImage = {
-  ...manualImage,
-  frame_range_bindings: {
-    "@video3::Green": {
-      video_slot: "@video3",
-      color_pick: "Green",
-      origin: "manual",
-      start_frame: 1001,
-      end_frame: 1120,
-      ranges: [{ start: 10, end: 20 }],
-    },
+// A props update that arrives inside the input debounce window overlays the
+// focused endpoint draft onto the authoritative source state.
+const dirtyContainer = {};
+const dirtyRow = {
+  getAttribute(name) {
+    return name === "data-kind" ? "image" : name === "data-index" ? "0" : "";
   },
 };
-const pickerPriorityStatus = prompt.frameRangeUiStatus(
-  { ...state, images: [pickerPriorityImage] },
-  pickerPriorityImage,
+const dirtyStartInput = {
+  value: "-34567",
+  matches(selector) { return selector.includes('input[type="text"]'); },
+  getAttribute(name) {
+    if (name === "data-frame-domain-number") return "start";
+    return "";
+  },
+  closest(selector) { return selector === ".source-row" ? dirtyRow : null; },
+};
+assert.equal(
+  prompt.hmbRememberPromptDirtyTextControl(dirtyContainer, dirtyStartInput, noVideoState),
+  true,
 );
-assert.equal(pickerPriorityStatus.domainReadonly, true);
-assert.equal(pickerPriorityStatus.metadata.origin, "");
-assert.deepEqual(
-  [pickerPriorityStatus.domainStart, pickerPriorityStatus.domainEnd],
-  [1, 144],
-  "Picker metadata is the authoritative locked frame domain when available.",
+const dirtyMerged = prompt.hmbMergePromptDirtyTextState(
+  baseState(baseImage({ frame_range_intent: defaultIntent() })),
+  dirtyContainer.__hmbPromptLibraryDirtyText,
 );
+assert.equal(dirtyMerged.images[0].frame_range_intent.start_frame, -34567);
+assert.equal(dirtyMerged.images[0].frame_range_intent.enabled, false);
 
-image.color_picks = ["Blue"];
-prompt.storeCurrentFrameRanges(image, [{ start: 30, end: 40 }], 0);
-assert.deepEqual(image.frame_range_bindings["@video3::Blue"].ranges, [{ start: 30, end: 40 }]);
-assert.deepEqual(image.frame_range_bindings["@video3::Green"].ranges, [
-  { start: 1, end: 48 },
-  { start: 97, end: 144 },
+// Keyboard editing works across signed bounds without scanning 4B frames.
+assert.deepEqual(
+  prompt.hmbApplyFrameRangeKeyboard([], -1, "Enter", {}, INT32_MIN, INT32_MAX),
+  {
+    handled: true,
+    changed: true,
+    ranges: [{ start: INT32_MIN, end: INT32_MIN }],
+    selectedIndex: 0,
+  },
+);
+const addGap = prompt.hmbApplyFrameRangeKeyboard(
+  [{ start: INT32_MIN, end: 0 }], 0, "Enter", { altKey: true }, INT32_MIN, INT32_MAX,
+);
+assert.equal(addGap.changed, true);
+assert.deepEqual(addGap.ranges, [
+  { start: INT32_MIN, end: 0 },
+  { start: 2, end: 2 },
 ]);
+const fullDomainAdd = prompt.hmbApplyFrameRangeKeyboard(
+  [{ start: INT32_MIN, end: INT32_MAX }], 0, "Enter", { altKey: true }, INT32_MIN, INT32_MAX,
+);
+assert.equal(fullDomainAdd.changed, false);
+assert.deepEqual(fullDomainAdd.ranges, [{ start: INT32_MIN, end: INT32_MAX }]);
 
-const resetImage = JSON.parse(JSON.stringify(manualImage));
-resetImage.frame_range_bindings["@video2::Blue"] = {
-  video_slot: "@video2",
-  color_pick: "Blue",
-  origin: "manual",
-  start_frame: 1,
-  end_frame: 10,
-  ranges: [{ start: 2, end: 4 }],
+// Higher-source same/lower-UI echoes retain local intent by stable identity.
+const currentState = baseState(baseImage({ frame_range_intent: activeIntent() }), {
+  source_sync_revision: 5,
+  ui_edit_revision: 9,
+});
+const incomingStaleIntent = prompt.normalizeState({
+  ...structuredClone(currentState),
+  source_sync_revision: 6,
+  ui_edit_revision: 9,
+  images: currentState.images.map((item, index) => index === 0 ? {
+    ...structuredClone(item),
+    label: "Source refreshed Hero",
+    frame_range_intent: defaultIntent(),
+  } : structuredClone(item)),
+});
+const mergeContainer = {
+  __hmbPromptCurrentSourceSyncRevision: 5,
+  __hmbPromptCurrentUiEditRevision: 9,
+  __hmbPromptLatestLocalUiEditRevision: 9,
+  __hmbPromptCurrentDisabled: false,
 };
-assert.equal(prompt.setFrameRangeEnabled(resetImage, false), false);
+assert.equal(
+  prompt.hmbConsumePendingPromptStateEcho(
+    mergeContainer,
+    { value: JSON.stringify(incomingStaleIntent), disabled: false },
+    currentState,
+  ),
+  false,
+);
+const mergedNewSource = prompt.hmbTakePromptRevisionMerge(mergeContainer);
+assert.equal(mergedNewSource.source_sync_revision, 6);
+assert.equal(mergedNewSource.images[0].label, "Source refreshed Hero");
+assert.deepEqual(mergedNewSource.images[0].frame_range_intent, activeIntent());
+
+const lowerUiIncoming = prompt.normalizeState({
+  ...structuredClone(incomingStaleIntent),
+  source_sync_revision: 7,
+  ui_edit_revision: 8,
+});
+mergeContainer.__hmbPromptCurrentSourceSyncRevision = 6;
+assert.equal(
+  prompt.hmbConsumePendingPromptStateEcho(
+    mergeContainer,
+    { value: JSON.stringify(lowerUiIncoming), disabled: false },
+    mergedNewSource,
+  ),
+  false,
+);
 assert.deepEqual(
-  resetImage.frame_range_bindings["@video2::Blue"].ranges,
-  [{ start: 2, end: 4 }],
-  "Range OFF preserves dormant manual bindings.",
-);
-assert.deepEqual(
-  resetImage.frame_range_bindings["@video3::Green"].ranges,
-  [{ start: 1010, end: 1020 }],
-);
-assert.equal(resetImage.frame_range_selected_index, -1);
-assert.equal(prompt.setFrameRangeEnabled(resetImage, true), true);
-assert.deepEqual(
-  resetImage.frame_range_bindings["@video3::Green"],
-  {
-    video_slot: "@video3",
-    color_pick: "Green",
-    enabled: true,
-    origin: "manual",
-    ranges: [{ start: 1010, end: 1020 }],
-    start_frame: 12,
-    end_frame: 34,
-  },
-  "Range ON resumes the preserved manual domain and marks that address active.",
+  prompt.hmbTakePromptRevisionMerge(mergeContainer).images[0].frame_range_intent,
+  activeIntent(),
 );
 
-const dormantImage = {
-  ...image,
-  color_picks: [""],
-  binding_video_slots: [5],
-  frame_range_enabled: false,
-  frame_range_bindings: {},
-  frame_range_binding: null,
-};
-assert.equal(prompt.setFrameRangeEnabled(dormantImage, true), true);
-prompt.storeCurrentFrameDomain(dormantImage, 1001, 1050);
-assert.deepEqual(
-  dormantImage.frame_range_bindings["@video5::"],
-  {
-    video_slot: "@video5",
-    color_pick: "",
-    enabled: true,
-    origin: "manual",
-    ranges: [],
-    start_frame: 1001,
-    end_frame: 1050,
-  },
-  "No video connection or Color Pick is required to author dormant Range intent.",
-);
-assert.equal(prompt.frameRangeUiStatus({ images: [dormantImage], videos: [], picker: {} }, dormantImage).canEnable, true);
+const directUi = prompt.normalizeState({
+  ui_edit_revision: 11,
+  source_sync_revision: 7,
+  images: [
+    baseImage({ slot: 1, asset_id: "a", asset_source_uid: "project:a", frame_range_intent: { ...activeIntent(), start_frame: -9 } }),
+    baseImage({ slot: 2, asset_id: "b", asset_source_uid: "project:b", frame_range_intent: { ...activeIntent(), start_frame: -8 } }),
+  ],
+});
+const directSource = prompt.normalizeState({
+  ui_edit_revision: 10,
+  source_sync_revision: 8,
+  images: [
+    baseImage({ slot: 1, label: "B refreshed", asset_id: "b", asset_source_uid: "project:b", frame_range_intent: defaultIntent() }),
+    baseImage({ slot: 2, label: "A refreshed", asset_id: "a", asset_source_uid: "project:a", frame_range_intent: defaultIntent() }),
+  ],
+});
+const directMerged = prompt.hmbMergePromptRevisionAxes(directSource, directUi);
+assert.equal(directMerged.images[0].asset_source_uid, "project:b");
+assert.equal(directMerged.images[0].frame_range_intent.start_frame, -8);
+assert.equal(directMerged.images[1].asset_source_uid, "project:a");
+assert.equal(directMerged.images[1].frame_range_intent.start_frame, -9);
 
-assert.equal(picker.formatFrameTimecode(67, 1, 24), "00:00:02:18");
-assert.equal(picker.formatFrameTimecode(101, 101, 24), "00:00:00:00");
+// Canonical no-video state survives widget publication.
+const publications = [];
+prompt.hmbEmitLocalPromptState(
+  {},
+  { disabled: false, onChange(value) { publications.push(JSON.parse(value)); } },
+  noVideoState,
+);
+assert.equal(publications.length, 1);
+assert.deepEqual(publications[0].images[0].frame_range_intent, noVideoImage.frame_range_intent);
 
-assert.match(promptSource, /data-frame-range-toggle/);
-assert.match(promptSource, /data-frame-track/);
-assert.match(promptSource, /data-frame-range-handle="start"/);
-assert.match(promptSource, /data-frame-range-handle="end"/);
-assert.match(promptSource, /movedPixels < 6/);
-assert.match(promptSource, /document\.addEventListener\("pointermove", moveHandler, true\)/);
-assert.match(promptSource, /document\.addEventListener\("pointerup", upHandler, true\)/);
-assert.match(promptSource, /storeCurrentFrameRanges\(item, normalized/);
-assert.match(
-  promptSource,
-  /\.source-row\.image>\.frame-binding-row\{grid-column:1\/5;grid-row:1;align-self:start;margin-top:38px\}/,
-  "Wide IMAGE SOURCE BINDING rows reuse the blank area beneath NAME through SUB TYPE.",
-);
-assert.match(promptSource, /\.frame-binding-row\{grid-column:1\/-1;display:grid;grid-template-columns:3\.55rem minmax\(0,1fr\)/);
-assert.match(promptSource, /padStart\(4, "0"\)/);
-const frameInteractionSource = promptSource.slice(
-  promptSource.indexOf("function hmbInstallFrameRangeInteractions"),
-  promptSource.indexOf("function renderColorPickControls"),
-);
-assert.match(
-  frameInteractionSource,
-  /querySelectorAll\(\s*"\[data-frame-range-toggle\], \[data-frame-domain-number\]"/,
-  "Only the compact Range toggle and full-domain inputs receive direct change handlers.",
-);
-assert.doesNotMatch(frameInteractionSource, /data-frame-range-number|frame-range-delete/);
-assert.match(frameInteractionSource, /querySelectorAll\("\[data-frame-track\]"\)/);
-assert.doesNotMatch(
-  frameInteractionSource,
-  /container\.addEventListener\("(?:change|click|keydown|pointerdown)"/,
-  "Range controls must keep their direct handlers after the image-card gesture guard is released.",
-);
-
-const imageRowSource = promptSource.slice(
-  promptSource.indexOf("function renderImageRow"),
-  promptSource.indexOf("function renderVideoRow"),
-);
-assert.match(imageRowSource, /String\(item\.slot\)\.padStart\(2, "0"\)/);
-assert.doesNotMatch(
-  imageRowSource,
-  /item\.token|<br\/><b>/,
-  "Image order displays only 01, 02, 03 without the internal @image token.",
-);
-
+// DOM/source contract: signed fields, low-latency input, focus protection,
+// canonical-only revision overlay, and no Color Pick deletion coupling.
 const frameRowSource = promptSource.slice(
   promptSource.indexOf("function renderFrameRangeRow"),
   promptSource.indexOf("export function storeCurrentFrameRanges"),
 );
-assert.match(frameRowSource, /<b>Range<\/b><em>\$\{enabled \? "ON" : "OFF"\}<\/em>/);
-assert.doesNotMatch(frameRowSource, /USE FRAME RANGE|프레임 범위 사용/);
-assert.doesNotMatch(
-  frameRowSource,
-  /frame-range-editor|data-frame-range-number|frame-range-delete|frame-binding-context/,
-  "The redundant selected-range IN/OUT editor and @video/color context label stay removed.",
+assert.match(frameRowSource, /data-frame-domain-number="start"[^>]*pattern="-\?\[0-9\]\+"/);
+assert.match(frameRowSource, /data-frame-domain-number="end"[^>]*pattern="-\?\[0-9\]\+"/);
+assert.doesNotMatch(frameRowSource, /maxlength=/);
+assert.doesNotMatch(frameRowSource, /readonly/);
+const interactionSource = promptSource.slice(
+  promptSource.indexOf("function hmbInstallFrameRangeInteractions"),
+  promptSource.indexOf("function renderColorPickControls"),
 );
-assert.match(
-  frameRowSource,
-  /data-frame-domain-number="start" type="text" inputmode="numeric" pattern="\[0-9\]\{1,4\}" maxlength="4"/,
-);
-assert.match(
-  frameRowSource,
-  /data-frame-domain-number="end" type="text" inputmode="numeric" pattern="\[0-9\]\{1,4\}" maxlength="4"/,
-);
-const domainStartMarkup = frameRowSource.indexOf('data-frame-domain-number="start"');
-const trackMarkup = frameRowSource.indexOf("data-frame-track");
-const domainEndMarkup = frameRowSource.indexOf('data-frame-domain-number="end"');
-assert.ok(
-  domainStartMarkup >= 0 && domainStartMarkup < trackMarkup && trackMarkup < domainEndMarkup,
-  "Four-digit START and END inputs must occupy the left and right ends of the highlighted Range track.",
-);
-assert.match(frameRowSource, /const domainReadonly = frameStatus\.domainReadonly \? "readonly" : "";/);
-const subtypeSource = promptSource.slice(
-  promptSource.indexOf("function renderSubtypeControls"),
-  promptSource.indexOf("function frameRangeBarsHtml"),
-);
-assert.match(subtypeSource, /<div class="binding-scope-entry">[\s\S]*?\$\{customInput\}<\/div>/);
-assert.doesNotMatch(subtypeSource, /binding_scopes\.map/);
-assert.doesNotMatch(promptSource, /function renderCustomScopeControls/);
-const singlePickAssetRow = {
-  asset_id: "registered-character",
-  binding_scopes: ["Full body / full appearance"],
-  color_picks: ["Red"],
-};
-const twoPickAssetRow = {
-  ...singlePickAssetRow,
-  color_picks: ["Red", "Yellow"],
-};
-assert.equal(
-  prompt.hmbImageRowHasExpandedLeftFields(singlePickAssetRow),
-  false,
-  "One Color Pick must not push Range down for a registered asset with no visible expanded field.",
-);
-assert.equal(
-  prompt.hmbImageRowHasExpandedLeftFields(twoPickAssetRow),
-  false,
-  "Adding a second Color Pick must not change Range geometry.",
-);
-assert.equal(
-  prompt.hmbImageRowHasExpandedLeftFields({
-    ...singlePickAssetRow,
-    binding_scopes: ["Custom scope"],
-  }),
-  true,
-  "Only the visible Custom Sub Type input should expand the left-side content.",
-);
-assert.match(
-  promptSource,
-  /const expandedLeftFields = hmbImageRowHasExpandedLeftFields\(item\);/,
-  "Initial render and live refresh must share one Range-layout predicate.",
-);
-const liveSubtypeRefreshSource = promptSource.slice(
-  promptSource.indexOf("function hmbRefreshImageSubtypeControls"),
-  promptSource.indexOf("function hmbRefreshImageCustomPanel"),
-);
-assert.match(liveSubtypeRefreshSource, /hmbImageRowHasExpandedLeftFields\(item\)/);
-assert.doesNotMatch(
-  liveSubtypeRefreshSource,
-  /asset_id/,
-  "A hidden Asset ID must never select the 72px expanded Range offset during live Picker refresh.",
-);
-assert.match(
-  promptSource,
-  /\.source-row\.image\.image-expanded-left-fields>\.frame-binding-row\{margin-top:72px\}/,
-  "Range must move below the visible Custom Sub Type input instead of overlapping it.",
-);
-assert.doesNotMatch(
-  imageRowSource,
-  /<small>[\s\S]*?Asset ID:[\s\S]*?<\/small>/,
-  "Prompt Image rows must not render the redundant Asset ID helper line.",
-);
-
-const previewSource = promptSource.slice(
-  promptSource.indexOf("export function updateFrameTrackPreview"),
+assert.match(interactionSource, /bind\(element, "input", inputHandler\)/);
+assert.match(interactionSource, /status\.intent\.enabled/);
+assert.doesNotMatch(interactionSource, /item\.frame_range_enabled|item\.frame_range_selected_index/);
+const syncDomSource = promptSource.slice(
   promptSource.indexOf("function hmbSyncFrameRangeRowDom"),
+  promptSource.indexOf("const HMB_PROMPT_LOCAL_ECHO_TTL_MS"),
 );
-assert.doesNotMatch(previewSource, /track\.innerHTML/);
-assert.match(previewSource, /bar\.style\.left/);
-assert.match(previewSource, /existing\.slice\(normalized\.length\)/);
-assert.match(promptSource, /hmbConsumePendingFrameRangeEcho/);
-assert.match(promptSource, /__hmbPromptPendingLocalValues/);
+assert.match(syncDomSource, /input\.ownerDocument\?\.activeElement !== input/);
+const revisionFieldSource = promptSource.slice(
+  promptSource.indexOf("const HMB_FRAME_RANGE_UI_FIELDS"),
+  promptSource.indexOf("function hmbPromptFrameRangeIdentity"),
+);
+assert.match(revisionFieldSource, /"frame_range_intent"/);
+assert.doesNotMatch(revisionFieldSource, /frame_range_enabled|frame_range_bindings|frame_range_color_index/);
+const removeColorSource = promptSource.slice(
+  promptSource.indexOf('container.querySelectorAll(".remove-color-pick")'),
+  promptSource.indexOf('container.querySelectorAll(".add-image")'),
+);
+assert.doesNotMatch(removeColorSource, /frame_range_bindings|frame_range_binding|frame_range_intent/);
+assert.match(promptSource, /shouldRepublishRevisionMerge/);
 
-const canonicalEchoValue = JSON.stringify(prompt.normalizeState(manualState));
-const echoContainer = {
-  __hmbPromptPendingLocalValues: [{
-    value: canonicalEchoValue,
-    disabled: false,
-  }],
-};
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    echoContainer,
-    { value: canonicalEchoValue, disabled: false },
-  ),
-  true,
-);
-assert.equal(echoContainer.__hmbPromptPendingLocalValues, undefined);
-
-const repeatedEchoContainer = {
-  __hmbPromptPendingLocalValues: [{
-    value: canonicalEchoValue,
-    disabled: false,
-    expiresAt: Date.now() + 5000,
-    remainingEchoes: 3,
-  }],
-};
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    repeatedEchoContainer,
-    { value: canonicalEchoValue, disabled: false },
-  ),
-  true,
-);
-assert.equal(repeatedEchoContainer.__hmbPromptPendingLocalValues[0].remainingEchoes, 2);
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    repeatedEchoContainer,
-    { value: canonicalEchoValue, disabled: false },
-  ),
-  true,
-);
-assert.equal(repeatedEchoContainer.__hmbPromptPendingLocalValues[0].remainingEchoes, 1);
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    repeatedEchoContainer,
-    { value: canonicalEchoValue, disabled: false },
-  ),
-  true,
-);
-assert.equal(repeatedEchoContainer.__hmbPromptPendingLocalValues, undefined);
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    repeatedEchoContainer,
-    { value: canonicalEchoValue, disabled: false },
-  ),
-  false,
-  "The identical local echo allowance must stop after its bounded count.",
-);
-
-// Native selects close when their DOM is remounted. Every local edit therefore
-// carries a serialized monotonic UI revision: after rapid A -> B, a B-first
-// host acknowledgement and an arbitrarily late A must both avoid a remount.
-function freshLocalState(value) {
-  return prompt.normalizeState({
-    ...JSON.parse(JSON.stringify(value)),
-    ui_edit_revision: 0,
-  });
-}
-
-function emitLocalStates(states, container = {}) {
-  const emitted = [];
-  const props = {
-    disabled: false,
-    onChange(value) { emitted.push(value); },
-  };
-  for (const item of states) {
-    prompt.hmbEmitLocalPromptState(container, props, freshLocalState(item));
-  }
-  return { container, emitted, props };
-}
-
-function assertRapidLocalEchoOrder(olderState, newerState, label) {
-  const { container, emitted } = emitLocalStates([olderState, newerState]);
-  const [olderValue, newerValue] = emitted;
-  const olderSerialized = JSON.parse(olderValue);
-  const newerSerialized = JSON.parse(newerValue);
-  assert.equal(
-    newerSerialized.ui_edit_revision,
-    olderSerialized.ui_edit_revision + 1,
-    `${label}: each real selection commit must increment ui_edit_revision.`,
-  );
-  assert.equal(
-    prompt.hmbConsumePendingPromptStateEcho(
-      container,
-      { value: newerValue, disabled: false },
-    ),
-    true,
-    `${label}: newer local echo must be consumed.`,
-  );
-  assert.ok(container.__hmbPromptPendingLocalValues.length <= 12);
-  assert.equal(
-    prompt.hmbConsumePendingPromptStateEcho(
-      container,
-      { value: olderValue, disabled: false },
-    ),
-    true,
-    `${label}: late A must not remount and close the next dropdown.`,
-  );
-  assert.equal(container.__hmbPromptLastConsumedEchoWasStale, true);
-  assert.equal(container.__hmbPromptSupersededLocalValues, undefined);
-  clearTimeout(container.__hmbPromptPendingLocalTimer);
-  return { olderValue, newerValue, olderSerialized, newerSerialized };
-}
-
-const sameFieldMainA = prompt.normalizeState({
-  images: [{
-    slot: 1,
-    label: "Hero",
-    present: true,
-    source_type: "Character Appearance",
-    binding_scopes: [""],
-    owner: "",
-  }],
-});
-const sameFieldMainB = prompt.normalizeState({
-  images: [{
-    slot: 1,
-    label: "Hero",
-    present: true,
-    source_type: "Environment / Background",
-    binding_scopes: [""],
-    owner: "",
-  }],
-});
-assertRapidLocalEchoOrder(
-  sameFieldMainA,
-  sameFieldMainB,
-  "same Main Type field rapid change",
-);
-
-const mainThenSubtype = prompt.normalizeState({
-  images: [{
-    slot: 1,
-    label: "Hero",
-    present: true,
-    source_type: "Character Appearance",
-    binding_scopes: ["Full body / full appearance"],
-    owner: "",
-  }],
-});
-const subtypeThenTarget = prompt.normalizeState({
-  images: [{
-    slot: 1,
-    label: "Hero",
-    present: true,
-    source_type: "Character Appearance",
-    binding_scopes: ["Full body / full appearance"],
-    owner: "Hero",
-  }],
-});
-assertRapidLocalEchoOrder(
-  sameFieldMainA,
-  mainThenSubtype,
-  "Main Type -> Sub Type rapid change",
-);
-assertRapidLocalEchoOrder(
-  mainThenSubtype,
-  subtypeThenTarget,
-  "Sub Type -> Target rapid change",
-);
-
-const targetThenVideoBinding = prompt.normalizeState({
-  images: [{
-    slot: 1,
-    label: "Hero",
-    present: true,
-    source_type: "Character Appearance",
-    binding_scopes: ["Full body / full appearance"],
-    owner: "Hero",
-    binding_video_slots: [1],
-    color_picks: [""],
-  }],
-  videos: [{
-    slot: 1,
-    label: "Shot",
-    present: true,
-    source_type: "Maya Preview / Playblast",
-  }],
-});
-const videoBindingThenColorPick = prompt.normalizeState({
-  ...targetThenVideoBinding,
-  images: [{
-    ...targetThenVideoBinding.images[0],
-    color_picks: ["Red"],
-  }],
-});
-const bindingRapid = assertRapidLocalEchoOrder(
-  targetThenVideoBinding,
-  videoBindingThenColorPick,
-  "Image Video Binding -> Color Pick rapid change",
-);
-assert.deepEqual(bindingRapid.newerSerialized.images[0].binding_video_slots, [1]);
-assert.deepEqual(bindingRapid.newerSerialized.images[0].color_picks, ["Red"]);
-
-const customMainType = prompt.normalizeState({
-  images: [{
-    slot: 1,
-    label: "Custom Hero",
-    present: true,
-    source_type: "Custom",
-    custom_source_type: "",
-    binding_scopes: ["Custom scope"],
-    binding_custom_scopes: [""],
-    owner: "Custom Hero",
-  }],
-});
-const customDetails = prompt.normalizeState({
-  ...customMainType,
-  images: [{
-    ...customMainType.images[0],
-    custom_source_type: "Creature Sheet",
-    binding_custom_scopes: ["Face / head"],
-  }],
-});
-const customRapid = assertRapidLocalEchoOrder(
-  customMainType,
-  customDetails,
-  "Custom Main Type -> Custom Sub Type/Scope rapid change",
-);
-assert.equal(customRapid.newerSerialized.images[0].custom_source_type, "Creature Sheet");
-assert.deepEqual(customRapid.newerSerialized.images[0].binding_custom_scopes, ["Face / head"]);
-
-const videoMainType = prompt.normalizeState({
-  videos: [{
-    slot: 1,
-    label: "Shot",
-    present: true,
-    source_type: "Maya Preview / Playblast",
-    control_role: "",
-  }],
-});
-const videoControlRole = prompt.normalizeState({
-  videos: [{
-    slot: 1,
-    label: "Shot",
-    present: true,
-    source_type: "Maya Preview / Playblast",
-    control_role: "Primary Unified Shot Control",
-  }],
-});
-const videoRapid = assertRapidLocalEchoOrder(
-  videoMainType,
-  videoControlRole,
-  "Video Main Type -> Control Role rapid change",
-);
-assert.equal(videoRapid.olderSerialized.videos[0].source_type, "Maya Preview / Playblast");
-assert.equal(videoRapid.newerSerialized.videos[0].control_role, "Primary Unified Shot Control");
-
-const boundedRapidContainer = {};
-const boundedRapidValues = [];
-for (let index = 0; index < 18; index += 1) {
-  prompt.hmbEmitLocalPromptState(
-    boundedRapidContainer,
-    { disabled: false, onChange(value) { boundedRapidValues.push(value); } },
-    prompt.normalizeState({ text: { SCENE_CONTEXT: `Bounded rapid state ${index}` } }),
-  );
-}
-assert.ok(boundedRapidContainer.__hmbPromptPendingLocalValues.length <= 12);
-const boundedNewest = boundedRapidContainer.__hmbPromptPendingLocalValues.at(-1).value;
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    boundedRapidContainer,
-    { value: boundedNewest, disabled: false },
-  ),
-  true,
-);
-assert.ok(boundedRapidContainer.__hmbPromptPendingLocalValues.length <= 12);
-assert.equal(boundedRapidContainer.__hmbPromptSupersededLocalValues, undefined);
-assert.equal(JSON.parse(boundedRapidValues.at(-1)).ui_edit_revision, 18);
-clearTimeout(boundedRapidContainer.__hmbPromptPendingLocalTimer);
-
-// A may expire while B remains live. Its lower UI revision is sufficient to
-// identify it before or after B's exact acknowledgement.
-const expiredPair = emitLocalStates([sameFieldMainA, sameFieldMainB]);
-expiredPair.container.__hmbPromptPendingLocalValues[0].expiresAt = Date.now() - 1;
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    expiredPair.container,
-    { value: expiredPair.emitted[0], disabled: false },
-  ),
-  true,
-  "Expired A must still be recognized while a newer local B publication is live.",
-);
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    expiredPair.container,
-    { value: expiredPair.emitted[1], disabled: false },
-  ),
-  true,
-  "B must still be consumable after an expired A arrives first.",
-);
-clearTimeout(expiredPair.container.__hmbPromptPendingLocalTimer);
-
-const expiredAlone = emitLocalStates([sameFieldMainA]);
-expiredAlone.container.__hmbPromptPendingLocalValues[0].expiresAt = Date.now() - 1;
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    expiredAlone.container,
-    { value: expiredAlone.emitted[0], disabled: false },
-  ),
-  false,
-  "Expired A without a newer live local publication must remain authoritative.",
-);
-
-// Simulate the 750ms queue cleanup without waiting. Revision memory must outlive
-// the timer so A at t=900ms is still stale while an unacknowledged B is live.
-const nativeSetTimeout = globalThis.setTimeout;
-const nativeClearTimeout = globalThis.clearTimeout;
-const fakeTimers = new Map();
-let fakeTimerId = 0;
-globalThis.setTimeout = (callback, delay) => {
-  const id = ++fakeTimerId;
-  fakeTimers.set(id, { callback, delay });
-  return id;
-};
-globalThis.clearTimeout = (id) => fakeTimers.delete(id);
-try {
-  const delayedPair = emitLocalStates([sameFieldMainA, sameFieldMainB]);
-  const cleanupTimer = [...fakeTimers.values()].find((timer) => timer.delay === 750);
-  assert.ok(cleanupTimer, "Local echo cleanup timer must remain bounded to 750ms.");
-  cleanupTimer.callback();
-  assert.equal(delayedPair.container.__hmbPromptPendingLocalValues, undefined);
-  assert.equal(
-    prompt.hmbConsumePendingPromptStateEcho(
-      delayedPair.container,
-      { value: delayedPair.emitted[0], disabled: false },
-    ),
-    true,
-    "A at t=900ms must remain stale after all timer-backed echo history is gone.",
-  );
-} finally {
-  globalThis.setTimeout = nativeSetTimeout;
-  globalThis.clearTimeout = nativeClearTimeout;
-}
-
-const authoritativePair = emitLocalStates([sameFieldMainA, sameFieldMainB]);
-const currentRapidState = JSON.parse(authoritativePair.emitted[1]);
-const unrelatedRapidState = prompt.normalizeState({
-  ...currentRapidState,
-  images: [{ ...currentRapidState.images[0], owner: "External Hero" }],
-});
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    authoritativePair.container,
-    { value: JSON.stringify(unrelatedRapidState), disabled: false },
-  ),
-  false,
-  "An unrelated state at the current UI revision must remain authoritative.",
-);
-
-const newerSourcePair = emitLocalStates([sameFieldMainA, sameFieldMainB]);
-const newerSourceRevisionState = prompt.normalizeState({
-  ...JSON.parse(newerSourcePair.emitted[0]),
-  source_sync_revision: 1,
-});
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    newerSourcePair.container,
-    { value: JSON.stringify(newerSourceRevisionState), disabled: false },
-  ),
-  false,
-  "A newer Picker/Asset source revision must remain authoritative.",
-);
-
-const olderSourceContainer = {};
-const sourceTwoState = prompt.normalizeState({
-  ...sameFieldMainB,
-  source_sync_revision: 2,
-});
-prompt.hmbEmitLocalPromptState(
-  olderSourceContainer,
-  { disabled: false, onChange() {} },
-  sourceTwoState,
-);
-const staleSourceState = prompt.normalizeState({
-  ...sameFieldMainA,
-  source_sync_revision: 1,
-  ui_edit_revision: 999,
-});
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    olderSourceContainer,
-    { value: JSON.stringify(staleSourceState), disabled: true },
-  ),
-  true,
-  "An older source revision must not roll back selects even when disabled changes.",
-);
-assert.equal(olderSourceContainer.__hmbPromptLastConsumedEchoWasStale, true);
-clearTimeout(olderSourceContainer.__hmbPromptPendingLocalTimer);
-
-const higherUiPair = emitLocalStates([sameFieldMainA, sameFieldMainB]);
-const higherUiState = prompt.normalizeState({
-  ...JSON.parse(higherUiPair.emitted[1]),
-  ui_edit_revision: JSON.parse(higherUiPair.emitted[1]).ui_edit_revision + 1,
-  images: [{ ...JSON.parse(higherUiPair.emitted[1]).images[0], owner: "New Host State" }],
-});
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    higherUiPair.container,
-    { value: JSON.stringify(higherUiState), disabled: false },
-  ),
-  false,
-  "A higher UI revision must remain authoritative.",
-);
-
-const disabledMismatchContainer = {
-  __hmbPromptPendingLocalValues: [{
-    value: canonicalEchoValue,
-    disabled: true,
-    expiresAt: Date.now() + 5000,
-    remainingEchoes: 3,
-  }],
-};
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    disabledMismatchContainer,
-    { value: canonicalEchoValue, disabled: false },
-  ),
-  false,
-  "An external disabled-state change must not be mistaken for a local selection echo.",
-);
-assert.equal(
-  disabledMismatchContainer.__hmbPromptPendingLocalValues,
-  undefined,
-  "A disabled-state mismatch must invalidate the local echo window.",
-);
-
-const externalState = JSON.parse(JSON.stringify(manualState));
-externalState.images[0].label = "Externally renamed";
-const externalValue = JSON.stringify(prompt.normalizeState(externalState));
-const externalUpdateContainer = {
-  __hmbPromptPendingLocalValues: [{
-    value: canonicalEchoValue,
-    disabled: false,
-    expiresAt: Date.now() + 5000,
-    remainingEchoes: 3,
-  }],
-};
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    externalUpdateContainer,
-    { value: externalValue, disabled: false },
-  ),
-  false,
-  "A genuinely different external state must reach the normal remount path.",
-);
-assert.equal(externalUpdateContainer.__hmbPromptPendingLocalValues, undefined);
-assert.equal(
-  externalUpdateContainer.__hmbPromptSupersededLocalValues,
-  undefined,
-  "A same-revision ordinary external edit must not create a source-echo quarantine.",
-);
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    externalUpdateContainer,
-    { value: canonicalEchoValue, disabled: false },
-  ),
-  false,
-  "A legitimate same-revision external revert must remain authoritative.",
-);
-
-const beforePickerConnect = prompt.normalizeState({
-  source_sync_revision: 0,
-  images: [{
-    label: "Jett",
-    source_type: "Character Appearance",
-    color_picks: ["Red"],
-    binding_video_slots: [1],
-  }],
-  videos: [{ label: "", source_type: "Role Required / Select Video Type" }],
-  picker: { enabled: false },
-});
-const afterPickerConnect = prompt.normalizeState({
-  ...beforePickerConnect,
-  source_sync_revision: 1,
-  videos: [
-    { label: "shot-color", source_type: "Maya Preview / Playblast", present: true },
-    { label: "shot-mask", source_type: "Mask / Control Reference", present: true },
-    { label: "shot-depth", source_type: "Depth / Spatial Reference", present: true },
-  ],
-  picker: {
-    enabled: true,
-    run_id: "picker-first-ready",
-    selected_video_count: 3,
-    ordered_video_uids: ["color", "mask", "depth"],
-    order_managed: true,
-  },
-});
-const beforePickerValue = JSON.stringify(beforePickerConnect);
-const afterPickerValue = JSON.stringify(afterPickerConnect);
-const firstPickerConnectContainer = {
-  __hmbPromptPendingLocalValues: [{
-    value: beforePickerValue,
-    disabled: false,
-    expiresAt: Date.now() + 5000,
-    remainingEchoes: 3,
-  }],
-};
-assert.equal(prompt.hmbImagePickerEnabled(beforePickerConnect), false);
-assert.equal(prompt.hmbImagePickerEnabled(afterPickerConnect), true);
-assert.equal(prompt.hmbPromptVideoRowsLocked(beforePickerConnect), false);
-assert.equal(prompt.hmbPromptVideoRowsLocked(afterPickerConnect), true);
-assert.equal(prompt.hmbCanAddPromptVideoRow(afterPickerConnect), false);
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    firstPickerConnectContainer,
-    { value: afterPickerValue, disabled: false },
-  ),
-  false,
-  "The first populated PICKER_IN payload must reach applyProps and activate Video Source Binding immediately.",
-);
-assert.equal(firstPickerConnectContainer.__hmbPromptSupersededLocalValues, undefined);
-const afterAuthoritativeDisconnect = prompt.normalizeState({
-  ...beforePickerConnect,
-  source_sync_revision: 2,
-});
-assert.equal(prompt.hmbPromptVideoRowsLocked(afterAuthoritativeDisconnect), false);
-assert.equal(prompt.hmbCanAddPromptVideoRow(afterAuthoritativeDisconnect), true);
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    firstPickerConnectContainer,
-    { value: JSON.stringify(afterAuthoritativeDisconnect), disabled: false },
-  ),
-  false,
-  "A newer source revision must allow a real Picker disconnect immediately.",
-);
-firstPickerConnectContainer.__hmbPromptCurrentSourceSyncRevision = 2;
-firstPickerConnectContainer.__hmbPromptCurrentUiEditRevision = 0;
-firstPickerConnectContainer.__hmbPromptCurrentDisabled = false;
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    firstPickerConnectContainer,
-    { value: beforePickerValue, disabled: false },
-  ),
-  true,
-  "A late pre-connection echo must not deactivate the newly populated video rows.",
-);
-
-const expiredEchoContainer = {
-  __hmbPromptPendingLocalValues: [{
-    value: canonicalEchoValue,
-    disabled: false,
-    expiresAt: Date.now() - 1,
-    remainingEchoes: 3,
-  }],
-};
-assert.equal(
-  prompt.hmbConsumePendingPromptStateEcho(
-    expiredEchoContainer,
-    { value: canonicalEchoValue, disabled: false },
-  ),
-  false,
-  "An identical value outside the short echo window is an authoritative host update.",
-);
-assert.equal(expiredEchoContainer.__hmbPromptPendingLocalValues, undefined);
-
-const sourceSelectHandler = promptSource.slice(
-  promptSource.indexOf('container.querySelectorAll(".source-select")'),
-  promptSource.indexOf('container.querySelectorAll(".move-image-up, .move-image-down")'),
-);
-assert.match(sourceSelectHandler, /hmbSyncSourceSelectDom\(container, state, row, kind, index, field\)/);
-assert.match(sourceSelectHandler, /hmbEmitLocalPromptState\(container, props, state\)/);
-assert.doesNotMatch(sourceSelectHandler, /\bemit\(props, state\)/);
-assert.match(promptSource, /HMB_PROMPT_LOCAL_ECHO_TTL_MS = 750/);
-assert.match(promptSource, /HMB_PROMPT_LOCAL_ECHO_MAX_CONSUMES = 3/);
-assert.match(promptSource, /function hmbRefreshImageColorControls/);
-assert.match(promptSource, /function hmbRefreshVideoDependentControls/);
-assert.match(promptSource, /function hmbRefreshSourceSummaries/);
-assert.match(promptSource, /class="custom-inline-input \$\{scope === "Custom scope" \? "" : "is-hidden"\}"/);
-const applyPropsSource = promptSource.slice(
-  promptSource.indexOf("const applyProps = (nextProps = {}) =>"),
-  promptSource.indexOf("container.__hmbPromptLibraryApplyProps = applyProps"),
-);
-assert.match(
-  applyPropsSource,
-  /if \(hmbConsumePendingPromptStateEcho[\s\S]*?__hmbPromptLastConsumedEchoWasStale[\s\S]*?return;/,
-  "A lower-revision host echo must return before the authoritative remount path.",
-);
-assert.equal(
-  (applyPropsSource.match(/\bremount\(\);/g) || []).length,
-  1,
-  "applyProps must retain exactly one remount, exclusively for authoritative state.",
-);
-assert.match(
-  promptSource,
-  /const cleanup = \(\) => \{[\s\S]*?delete container\.__hmbPromptCurrentUiEditRevision;[\s\S]*?delete container\.__hmbPromptLatestLocalUiEditRevision;[\s\S]*?delete container\.__hmbPromptCurrentSourceSyncRevision;[\s\S]*?delete container\.__hmbPromptCurrentDisabled;/,
-  "Widget cleanup must discard revision baselines before a later workflow remount.",
-);
-assert.doesNotMatch(promptSource, /<aside class="rail (?:left|right)"/);
-assert.doesNotMatch(promptSource, /output-guide/);
-assert.doesNotMatch(promptSource, /data-source-token-list/);
-assert.doesNotMatch(promptSource, /data-picker-token/);
-assert.doesNotMatch(promptSource, /data-image-asset-token/);
-assert.doesNotMatch(promptSource, /function (?:sourceTokensHtml|pickerTokenHtml|imageAssetTokenHtml)/);
-assert.match(
-  promptSource,
-  /\.layout\{display:grid;grid-template-columns:minmax\(0,1fr\);gap:0;/,
-  "The editor layout must use one full-width center column after both rails are removed.",
-);
-assert.match(promptSource, /<main class="center">/);
-for (const groupId of ["imageSources", "imageText", "videoSources", "videoText"]) {
-  assert.match(promptSource, new RegExp(`data-group-id="${groupId}"`));
-}
-
-console.log("HMB Prompt frame-track widget interaction regression: PASS");
+console.log("HMB Prompt independent frame-range intent regression: PASS");

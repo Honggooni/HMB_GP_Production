@@ -151,9 +151,6 @@ assert without_picker["picker"]["enabled"] is False
 
 
 def assert_prompt_is_additive(state, label: str) -> str:
-    readable = prompt._build_prompt_package(state)
-    assert "TARGET GENERATOR:" in readable, label
-    assert "HMB JOB DATA (JSON):" not in readable, label
     compiled = prompt._build_data_only_prompt_package(state)
     job, fx_contract, user_data = prompt_sections(compiled)
     assert job["schema"] == "hmb-public-job-data", label
@@ -391,6 +388,14 @@ incomplete_range_state = prompt._default_widget_state()
 incomplete_range_state["images"][0].update({
     "present": True,
     "label": "Range-independent idea",
+    "frame_range_intent": {
+        "version": 1,
+        "enabled": True,
+        "start_frame": None,
+        "end_frame": None,
+        "ranges": [],
+        "selected_index": -1,
+    },
     "frame_range_enabled": True,
 })
 incomplete_range_state["videos"][0].update({

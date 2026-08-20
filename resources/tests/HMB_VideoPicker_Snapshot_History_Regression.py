@@ -78,8 +78,8 @@ assert history_state["snapshot_active"] is True
 assert history_state["snapshot_frame"] == 109.0
 
 
-# Navigation changes only the pointer/projection. Every record and its image
-# payload survives both Snapshot navigation and a temporary Video-mode switch.
+# Navigation changes only the pointer/projection. Every record and its content
+# hash survives while heavyweight legacy inline PNG bytes stay excluded.
 navigation = deepcopy(history_state)
 navigation["active_snapshot_uid"] = "snapshot-a"
 navigation["viewport_mode"] = "snapshot"

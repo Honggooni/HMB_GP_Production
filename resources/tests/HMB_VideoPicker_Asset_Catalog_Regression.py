@@ -106,25 +106,20 @@ assert not any(
 )
 
 
-# Catalog capacity and generator selection capacity are deliberately separate.
-# All twelve records survive normalization, while only the first ten ordered
-# records may be active in the Prompt/Generator snapshot.
+# One Shot owns at most ten catalog records and at most ten selected outputs.
+# Legacy overflow is rejected instead of becoming unowned global history.
 source = picker._default_widget_state()
 source["videos"] = [
     catalog_video(f"video-{index:02d}", index)
     for index in range(1, 13)
 ]
 normalized = picker._parse_state(source)
-assert len(normalized["videos"]) == 12
-assert len({item["video_uid"] for item in normalized["videos"]}) == 12
+assert len(normalized["videos"]) == 10
+assert len({item["video_uid"] for item in normalized["videos"]}) == 10
 assert all(item["source_uid"] == item["video_uid"] for item in normalized["videos"])
 selected = [item for item in normalized["videos"] if item["selected"]]
 assert len(selected) == 10
 assert [item["selection_order"] for item in selected] == list(range(1, 11))
-assert all(
-    not item["selected"] and item["selection_order"] == 0
-    for item in normalized["videos"][10:]
-)
 
 payload, media_values = picker._build_synchronized_video_outputs(normalized)
 expected_uids = [f"video-{index:02d}" for index in range(1, 11)]
@@ -145,9 +140,15 @@ assert payload["selection_id"]
 # Reordering changes only the transient @video position. Stable identities,
 # catalog membership, and the synchronized metadata/media snapshot stay paired.
 reordered_source = deepcopy(normalized)
-for item in reordered_source["videos"]:
-    if item["selected"]:
-        item["selection_order"] = 11 - int(item["selection_order"])
+active_workspace_uuid = reordered_source["active_picker_shot_uuid"]
+active_workspace = next(
+    row
+    for row in reordered_source["picker_shots"]
+    if row["workspace_uuid"] == active_workspace_uuid
+)
+active_workspace["selected_video_uids"] = list(
+    reversed(active_workspace["selected_video_uids"])
+)
 reordered = picker._parse_state(reordered_source)
 reordered_payload, reordered_media = picker._build_synchronized_video_outputs(
     reordered
@@ -324,20 +325,17 @@ assert len({item["video_uid"] for item in appended_again["videos"]}) == 3
 # it preserves the user's source as provenance while still publishing a browser-
 # playable copy into the active Griptape project for every history record.
 assert callable(picker._choose_video_asset_file)
-assert callable(picker._choose_video_asset_files)
 assert callable(getattr(picker.HMBVideoPickerLibrary, "_import_video_asset", None))
 picker_source = MODULE_PATH.read_text(encoding="utf-8")
 for command_name in (
     "browse_video_asset",
     "import_video_asset",
-    "import_video_assets",
     "delete_video_asset",
 ):
     assert command_name in picker_source
 chooser_source = inspect.getsource(picker._choose_video_asset_files)
 assert "*.mp4" in chooser_source
-assert "askopenfilenames" in chooser_source
-assert "$d.Multiselect=$true" in chooser_source
+assert "Multiselect=$true" in chooser_source
 
 tmp_parent = ROOT / ".tmp"
 tmp_parent.mkdir(parents=True, exist_ok=True)
@@ -354,10 +352,8 @@ with tempfile.TemporaryDirectory(
         b"\x00\x00\x00\x08moov"
     )
     source_mp4.write_bytes(source_bytes)
-    source_mp4_b = Path(temporary) / "user_reference_b.mp4"
-    source_mp4_c = Path(temporary) / "user_reference_c.mp4"
-    source_mp4_b.write_bytes(source_bytes)
-    source_mp4_c.write_bytes(source_bytes)
+    second_source_mp4 = Path(temporary) / "second_reference.mp4"
+    second_source_mp4.write_bytes(source_bytes)
     assert picker._is_structurally_valid_mp4(source_mp4)
 
     prior_test_selection = os.environ.get("HMB_VIDEO_ASSET_TEST_SELECTION")
@@ -369,23 +365,6 @@ with tempfile.TemporaryDirectory(
             os.environ.pop("HMB_VIDEO_ASSET_TEST_SELECTION", None)
         else:
             os.environ["HMB_VIDEO_ASSET_TEST_SELECTION"] = prior_test_selection
-
-    prior_test_selections = os.environ.get("HMB_VIDEO_ASSET_TEST_SELECTIONS")
-    os.environ["HMB_VIDEO_ASSET_TEST_SELECTIONS"] = json.dumps([
-        str(source_mp4_b),
-        str(source_mp4_c),
-    ])
-    try:
-        assert [
-            Path(path).resolve()
-            for path in picker._choose_video_asset_files()
-        ] == [source_mp4_b.resolve(), source_mp4_c.resolve()]
-        assert Path(picker._choose_video_asset_file()).resolve() == source_mp4_b.resolve()
-    finally:
-        if prior_test_selections is None:
-            os.environ.pop("HMB_VIDEO_ASSET_TEST_SELECTIONS", None)
-        else:
-            os.environ["HMB_VIDEO_ASSET_TEST_SELECTIONS"] = prior_test_selections
 
     project_copies = []
 
@@ -417,6 +396,13 @@ with tempfile.TemporaryDirectory(
             source_mp4,
             label="User Reference Take 2",
         )
+        # Re-selecting the same source in one Shot reuses its existing card.
+        assert len(imported_twice["videos"]) == len(imported_once["videos"])
+        imported_twice = node._import_video_asset(
+            imported_twice,
+            second_source_mp4,
+            label="Second User Reference",
+        )
     finally:
         picker._copy_video_to_griptape_project = original_project_copy
     imported_records = [
@@ -428,14 +414,18 @@ with tempfile.TemporaryDirectory(
     assert len({item["video_uid"] for item in imported_records}) == 2
     assert [item["label"] for item in imported_records] == [
         "User Reference",
-        "User Reference Take 2",
+        "Second User Reference",
     ]
     expected_source_path = str(source_mp4.resolve()).replace("\\", "/")
-    assert all(
-        item["video_path"] == expected_source_path
-        and item["import_source_path"] == expected_source_path
-        for item in imported_records
-    )
+    second_expected_source_path = str(second_source_mp4.resolve()).replace("\\", "/")
+    assert [item["video_path"] for item in imported_records] == [
+        expected_source_path,
+        second_expected_source_path,
+    ]
+    assert [item["import_source_path"] for item in imported_records] == [
+        expected_source_path,
+        second_expected_source_path,
+    ]
     assert len(project_copies) == 2
     assert [Path(item["project_video_path"]).resolve() for item in imported_records] == [
         path.resolve() for path in project_copies
@@ -450,46 +440,11 @@ with tempfile.TemporaryDirectory(
     # publication plumbing. Removing one history card must leave the source MP4
     # and every other UID untouched.
     command_state = {"value": deepcopy(imported_twice)}
-    command_writes = []
-    command_syncs = []
     node._picker_state = lambda: deepcopy(command_state["value"])
-    def capture_command_write(value):
-        command_writes.append(deepcopy(value))
-        command_state["value"] = deepcopy(value)
-
-    node._write_state = capture_command_write
-    node._sync_outputs_from_state = lambda value: command_syncs.append(
-        deepcopy(value)
-    ) or ""
-    picker._copy_video_to_griptape_project = copy_to_test_project
-    try:
-        node._handle_picker_command({
-            "schema": picker.COMMAND_SCHEMA,
-            "version": picker.COMMAND_VERSION,
-            "runtime_instance_id": node._hmb_runtime_instance_id,
-            "action": "import_video_assets",
-            "action_id": "import-three-in-one-command",
-            "payload": {
-                "sources": [
-                    {"source_path": str(source_mp4_b), "label": "Batch B"},
-                    {"source_path": str(source_mp4_c), "label": "Batch C"},
-                    {"source_path": str(source_mp4), "label": "Batch A Again"},
-                ],
-            },
-        })
-    finally:
-        picker._copy_video_to_griptape_project = original_project_copy
-    assert len(command_writes) == 1
-    assert len(command_syncs) == 1
-    assert [item["label"] for item in command_state["value"]["videos"][-3:]] == [
-        "Batch B", "Batch C", "Batch A Again",
-    ]
-    assert len({
-        item["video_uid"] for item in command_state["value"]["videos"][-3:]
-    }) == 3
-
-    command_writes.clear()
-    command_syncs.clear()
+    node._write_state = lambda value: command_state.__setitem__(
+        "value", deepcopy(value)
+    )
+    node._sync_outputs_from_state = lambda _value: ""
     deleted_uid = imported_records[0]["video_uid"]
     retained_uid = imported_records[1]["video_uid"]
     node._handle_picker_command({

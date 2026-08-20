@@ -221,25 +221,23 @@ def assert_host_connection_reorder_and_payload() -> None:
         # Four selected videos must fail before any billable POST, and no item may
         # be silently discarded to fit Seedance's three-video provider limit.
         destination.set_parameter_value("prompt", "four-video preflight rejection")
-        broker_calls: list[tuple[Any, ...]] = []
+        request_calls: list[tuple[Any, ...]] = []
 
-        async def forbidden_broker_connection(
-            *args: Any, **kwargs: Any
-        ) -> dict[str, Any]:
-            broker_calls.append((*args, kwargs))
-            raise AssertionError("Broker connection occurred before preflight rejection")
+        async def forbidden_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            request_calls.append((*args, kwargs))
+            raise AssertionError("Provider request occurred before preflight rejection")
 
-        destination._ensure_broker_connected = forbidden_broker_connection
+        destination._request_json = forbidden_request
         try:
             asyncio.run(destination._process_generation_impl())
         except ValueError as exc:
             assert "at most 3 reference videos" in str(exc)
         else:
             raise AssertionError("Four connected Picker videos were accepted")
-        assert broker_calls == []
+        assert request_calls == []
 
         # Deselecting only the fourth-position item leaves the requested 4->1
-        # order intact. The resulting three URLs become Broker media in that order.
+        # order intact. The resulting three URLs become Ark content in that order.
         ordered_three = submit_picker_order(source, (4, 1, 2))
         assert destination.get_parameter_value(
             seedance.VIDEO_REFERENCES_PARAMETER

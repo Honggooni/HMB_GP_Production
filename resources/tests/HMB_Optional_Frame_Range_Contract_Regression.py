@@ -60,6 +60,18 @@ def bound_image(*, range_enabled: bool, valid_range: bool) -> dict:
         "color_picks": ["Red"],
         "binding_video_slots": [1],
         "binding_scopes": ["Full body / full appearance"],
+        "frame_range_intent": {
+            "version": 1,
+            "enabled": range_enabled,
+            "start_frame": 1 if valid_range else 101,
+            "end_frame": 48 if valid_range else 40,
+            "ranges": [
+                {"start": 12, "end": 24}
+                if valid_range
+                else {"start": 30, "end": 20}
+            ],
+            "selected_index": 0,
+        },
         "frame_range_enabled": range_enabled,
         "frame_range_color_index": 0,
         "frame_range_bindings": {
@@ -162,46 +174,28 @@ assert on_runtime["allowed_segments"] == on_contract["sources"][0][
 ]
 
 
-# An incomplete/invalid Range ON selection is isolated to that binding. It is
-# retained as unresolved typed state, while Agent contract validation and the
-# rest of generation continue instead of raising SOURCE CONTRACT INVALID.
+# An incomplete/invalid Range ON selection stays in canonical Prompt state but
+# is omitted from public Agent v1. The source therefore remains full-video and
+# generation cannot be blocked by an optional unfinished edit.
 invalid_on = prompt._default_widget_state()
 invalid_on["images"] = [bound_image(range_enabled=True, valid_range=False)]
 invalid_on["videos"] = [video(1, "FX Reference")]
 invalid_machine, invalid_job, invalid_contract = parse_machine(invalid_on)
-invalid_record = invalid_job["frame_ranges"][0]
-assert invalid_record["valid"] is False
-assert invalid_record["segments"] == []
-assert invalid_record["unresolved_segments"] == [{
-    "start_frame": 30,
-    "end_frame": 20,
-    "error_code": "segment_order_invalid",
-}]
-assert set(invalid_record["error_codes"]) == {
-    "domain_order_invalid",
-    "segment_order_invalid",
+normalized_invalid = prompt._normalize_state(copy.deepcopy(invalid_on))
+assert normalized_invalid["images"][0]["frame_range_intent"] == {
+    "version": 1,
+    "enabled": True,
+    "start_frame": 101,
+    "end_frame": 40,
+    "ranges": [{"start": 30, "end": 20}],
+    "selected_index": 0,
 }
-assert invalid_contract["valid"] is False
-assert invalid_contract["errors"] == [{"video": "@video1", "code": "range"}]
-assert invalid_contract["sources"][0]["range_on"] is True
+assert invalid_job["frame_ranges"] == []
+assert invalid_contract["valid"] is True
+assert invalid_contract["errors"] == []
+assert invalid_contract["sources"][0]["range_on"] is False
 assert invalid_contract["sources"][0]["range_segments"] == []
-assert runtime(invalid_contract)["sources"][0]["range_mode"] == "unresolved"
-
-
-# The unresolved allowance is closed, not permissive: deleting the declared
-# invalid-domain code makes the same record inconsistent and must still fail.
-tampered_lines = [line for line in invalid_machine.splitlines() if line.strip()]
-tampered_job = json.loads(tampered_lines[2])
-tampered_job["frame_ranges"][0]["error_codes"].remove(
-    "domain_order_invalid"
-)
-tampered_lines[2] = json.dumps(tampered_job, separators=(",", ":"))
-try:
-    agent._assert_public_job_data_contract("\n".join(tampered_lines))
-except RuntimeError:
-    pass
-else:
-    raise AssertionError("undeclared invalid Range domain was accepted")
+assert runtime(invalid_contract)["sources"][0]["range_mode"] == "full_video"
 
 
 # A bad optional Range attached to a non-FX video also cannot disable an
@@ -213,7 +207,7 @@ isolated["videos"] = [
     video(2, "FX Reference"),
 ]
 _, isolated_job, isolated_contract = parse_machine(isolated)
-assert isolated_job["frame_ranges"][0]["valid"] is False
+assert isolated_job["frame_ranges"] == []
 assert [source["video"] for source in isolated_contract["sources"]] == [
     "@video2"
 ]
@@ -223,5 +217,5 @@ assert runtime(isolated_contract)["sources"][0]["range_mode"] == "full_video"
 
 print(
     "HMB optional Frame Range contract regression: PASS "
-    "(empty / off / unset / valid ON priority / invalid ON isolation)"
+    "(empty / off / unset / valid ON priority / invalid ON non-blocking omission)"
 )

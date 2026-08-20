@@ -197,11 +197,39 @@ assert.equal(
 picker.hmbClearPendingPickerStateEcho(container);
 
 const updateSource = widgetSource.slice(
-  widgetSource.lastIndexOf("return {"),
-  widgetSource.indexOf("\n  };", widgetSource.lastIndexOf("return {")) + 5,
+  widgetSource.lastIndexOf("container.__hmbVideoPickerControllerUpdate = (nextProps) =>"),
+  widgetSource.indexOf(
+    "return container.__hmbVideoPickerControllerProxy",
+    widgetSource.lastIndexOf("container.__hmbVideoPickerControllerUpdate = (nextProps) =>"),
+  ),
 );
 assert.match(updateSource, /hmbConsumePendingPickerStateEcho\(container, nextProps \|\| \{\}\)/);
-assert.match(updateSource, /hmbClearPendingPickerStateEcho\(container\);[\s\S]*HMBVideoPickerLibraryWidget/);
+assert.match(updateSource, /hmbClearPendingPickerStateEcho\(container\);[\s\S]*patchMountedPicker\(nextProps \|\| \{\}\)/);
+
+// Model the retained update boundary: an exact Shot echo returns before any
+// regional DOM patch, while a functional backend mismatch crosses that boundary once.
+let modeledPatchCount = 0;
+const modeledUpdate = (target, nextProps) => {
+  if (picker.hmbConsumePendingPickerStateEcho(target, nextProps)) return "echo";
+  modeledPatchCount += 1;
+  return "patch";
+};
+container = pendingContainer(false);
+assert.equal(
+  modeledUpdate(container, { value: structuredClone(emittedState), disabled: false }),
+  "echo",
+);
+assert.equal(modeledPatchCount, 0, "An exact retained echo must cause zero regional patches.");
+container = pendingContainer(false);
+assert.equal(
+  modeledUpdate(container, {
+    value: { ...emittedState, status: "READING_SCENE", state_revision: 18 },
+    disabled: false,
+  }),
+  "patch",
+);
+assert.equal(modeledPatchCount, 1, "A functional authoritative mismatch must reach one regional patch.");
+picker.hmbClearPendingPickerStateEcho(container);
 
 assert.doesNotMatch(
   widgetSource,
@@ -314,9 +342,10 @@ assert.match(
   /depthPlayblastToggle\.checked = !!next\?\.depth_enabled/,
   "Immediate UI synchronization must retain the live Depth checkbox value.",
 );
+const depthToggleHandlerStart = widgetSource.indexOf('on(container.querySelector("#depth-playblast-toggle")');
 const depthToggleHandler = widgetSource.slice(
-  widgetSource.indexOf('on(container.querySelector("#depth-playblast-toggle")'),
-  widgetSource.indexOf('on(container.querySelector("#stop-read")'),
+  depthToggleHandlerStart,
+  widgetSource.indexOf('on(container.querySelector("#motion-guide-toggle")', depthToggleHandlerStart),
 );
 assert.match(depthToggleHandler, /depth_enabled:\s*depthEnabled/);
 assert.match(
@@ -408,13 +437,13 @@ assert.doesNotMatch(
 assert.match(forcedVideoPathSource, /\|\| cardVideoPath/);
 
 const catalogPreviewHandlerStart = widgetSource.indexOf(
-  'container.querySelectorAll("[data-play-video-uid]")',
+  "const playInPreview = (event, button) =>",
   widgetSource.indexOf('on(container.querySelector("#import-video-asset"), "change"'),
 );
 const catalogPreviewHandler = widgetSource.slice(
   catalogPreviewHandlerStart,
   widgetSource.indexOf(
-    'container.querySelectorAll("[data-toggle-video-uid]")',
+    "const toggleVideoSelection = (event, selectionSurface) =>",
     catalogPreviewHandlerStart,
   ),
 );
@@ -422,12 +451,12 @@ assert.match(catalogPreviewHandler, /container\.__hmbAutoplayVideoUid = uid/);
 assert.match(catalogPreviewHandler, /container\.__hmbForceVideoPreviewUid = uid/);
 assert.match(
   catalogPreviewHandler,
-  /commit\(\{ \.\.\.hmbPreviewVideoAsset\(liveState, uid\), viewport_mode: "video" \}\)/,
+  /hmbPatchVideoPickerPreviewDom\(container, nextState, tr, \{[\s\S]*?autoplay: true,[\s\S]*?Video-card playback[\s\S]*?\}\)/,
 );
-assert.doesNotMatch(
+assert.match(
   catalogPreviewHandler,
   /suppressMatchingEcho:\s*true/,
-  "Changing the main preview UID needs the normal structural morph before autoplay.",
+  "The exact preview region is updated before the optimistic host echo is suppressed.",
 );
 const autoplaySource = widgetSource.slice(
   widgetSource.indexOf('Object.prototype.hasOwnProperty.call(container, "__hmbAutoplayVideoUid")'),

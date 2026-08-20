@@ -105,8 +105,12 @@ assert.deepEqual(paletteGroups.object, [
   "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern",
 ]);
 
+assert.match(
+  videoSource,
+  /container\.__hmbVideoPickerControllerProxy\s*=\s*\{[\s\S]*?cleanup\(\)[\s\S]*?update\(nextProps\)[\s\S]*?return container\.__hmbVideoPickerControllerProxy/,
+  "VideoPicker must keep one stable cleanup/update controller across compact/full remounts.",
+);
 for (const [name, source] of [
-  ["VideoPicker", videoSource],
   ["VideoPickerCommandBridge", commandSource],
   ["PromptLibrary", promptSource],
   ["AgentLibrary", agentSource],
@@ -125,33 +129,59 @@ assert.match(
   "VideoPicker delegates control isolation once while keeping panel backgrounds available to the canvas.",
 );
 for (const [name, source] of [
+  ["VideoPicker", videoSource],
   ["PromptLibrary", promptSource],
   ["AgentLibrary", agentSource],
   ["ImageAssetLibrary", assetSource],
 ]) {
-  assert.match(source, /hmb_gp_production_ui_theme/, `${name} must use the shared HMB theme key.`);
-  assert.match(source, /hmb-gp-production-theme-change/, `${name} must follow the shared HMB theme event.`);
+  assert.doesNotMatch(source, /hmb_gp_production_ui_theme/, `${name} must not revive the retired P/T theme storage.`);
+  assert.doesNotMatch(source, /hmb-gp-production-theme-change/, `${name} must not observe the retired P/T theme event.`);
   assert.match(
     source,
     /"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif/,
     `${name} must use the unified HMB Latin/Korean font stack.`,
   );
-  assert.match(source, /#(?:0b1020|090c16)/, `${name} P must use the ImageAsset deep-navy surface family.`);
-  assert.match(source, /#f472b6/, `${name} P must retain the shared pink selection accent.`);
-  assert.match(source, /#091525/, `${name} T must retain the shared blue surface family.`);
-  assert.match(source, /#38bdf8/, `${name} T must retain the shared cyan-blue accent.`);
+  assert.match(source, /#(?:0b1020|090c16)/i, `${name} must retain the single deep-navy base design.`);
+  for (const accent of ["F472B6", "3B82F6", "10B981", "8B5CF6", "EAB308"]) {
+    assert.match(source, new RegExp(`#${accent}`, "i"), `${name} must expose Jewel Night ${accent}.`);
+  }
 }
-assert.match(
-  assetSource,
-  /function normalizeTheme\(value\)\s*\{\s*return clean\(value\)\.toUpperCase\(\) === "T" \? "T" : "P";/,
-  "ImageAssetLibrary must use the same P/T theme identifiers as PromptLibrary.",
-);
 assert.match(promptSource, /class="title-mark" aria-hidden="true">PL<\/span>/, "Prompt must use the rounded PL monogram.");
 assert.match(
   promptSource,
-  /const HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT = 42;[\s\S]*?HMB_START_LAYOUT_CHROME_HEIGHT \+[\s\S]*?HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT;/,
-  "Prompt startup height must reserve one native ASSET_IN row without reducing its dashboard area.",
+  /imageSources: 514,[\s\S]*?const HMB_START_LAYOUT_CHROME_HEIGHT = 129;[\s\S]*?const HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT = 0;[\s\S]*?HMB_START_LAYOUT_CHROME_HEIGHT \+[\s\S]*?HMB_NATIVE_ASSET_INPUT_ROW_HEIGHT;/,
+  "Prompt must preserve the established 1193px startup size while reserving the current header and Shot selector chrome.",
 );
+assert.match(promptSource, /\.topbar\{height:58px;flex:0 0 58px;padding:8px 13px/);
+assert.match(promptSource, /\.title-mark\{flex:0 0 35px;width:35px;height:35px/);
+assert.doesNotMatch(
+  promptSource,
+  /\.topbar\{height:38px;flex-basis:38px/,
+  "Responsive Prompt layouts must retain the unified 58px header instead of restoring the compact legacy bar.",
+);
+assert.match(
+  promptSource,
+  /const HMB_HEADER_LAYOUT_VERSION = 2;[\s\S]*?legacyDefaultLayout[\s\S]*?HMB_LEGACY_IMAGE_SOURCES_DEFAULT_HEIGHT[\s\S]*?HMB_GROUP_START_HEIGHTS\.imageSources/,
+  "A saved legacy default 542px Image Sources layout must migrate once to 514px without shrinking intentional custom layouts.",
+);
+const promptDefaultGeometry = promptModule.normalizeState({});
+assert.equal(promptDefaultGeometry.ui.header_layout_version, 2);
+assert.deepEqual(promptDefaultGeometry.ui.group_heights, {});
+const promptLegacyDefaultGeometry = promptModule.normalizeState({
+  ui: {
+    resize_mode: "stacked_outer_1000",
+    group_heights: { imageSources: 542, imageText: 200, videoSources: 200, videoText: 150 },
+  },
+});
+assert.equal(promptLegacyDefaultGeometry.ui.group_heights.imageSources, 514);
+assert.equal(promptLegacyDefaultGeometry.ui.header_layout_version, 2);
+const promptLegacyCustomGeometry = promptModule.normalizeState({
+  ui: {
+    resize_mode: "stacked_outer_1000",
+    group_heights: { imageSources: 560, imageText: 200, videoSources: 200, videoText: 150 },
+  },
+});
+assert.equal(promptLegacyCustomGeometry.ui.group_heights.imageSources, 560);
 assert.match(
   promptSource,
   /export function hmbImagePickerEnabled\(state\)[\s\S]*?return videos\.some\(isActiveVideo\);/,
@@ -167,8 +197,8 @@ assert.match(
   /if \(kind === "video"\) hmbRefreshImageColorControls\(container, state\);/,
   "Editing any video slot must refresh picker disabled state immediately even when the local state echo skips remounting.",
 );
-assert.match(promptSource, /\.theme-control-button\{[^}]*width:28px;[^}]*height:28px;/, "P/T must remain compact icon tiles.");
-assert.match(promptSource, /data-theme-choice="P"[^>]*>P<\/button><button[^>]*data-theme-choice="T"[^>]*>T<\/button>/, "Prompt must remain the sole P/T selector.");
+assert.doesNotMatch(promptSource, /theme-control-button|data-theme-choice/, "The retired Prompt P/T selector must not return.");
+assert.match(promptSource, /HMB_JEWEL_NIGHT_SHOT_PALETTE/, "Prompt must use the single Jewel Night Shot palette.");
 assert.match(promptSource, /class="language-button" data-language-toggle[^>]*>\$\{uiLanguage\(state\) === "ko" \? "한국어" : "EN"\}<\/button>/, "Prompt language control must match the VideoPicker Korean/EN button.");
 assert.match(promptSource, /data-language-toggle[\s\S]*?state\.ui\.language = uiLanguage\(state\) === "ko" \? "en" : "ko";[\s\S]*?remount\(\);/, "Prompt language changes must repaint immediately.");
 assert.doesNotMatch(promptSource, /<select class="language-select"/, "The old Prompt language dropdown must not return.");
@@ -202,10 +232,10 @@ assert.match(assetSource, /data-project-set[^>]*>S<\/button>/, "The Project Set 
 assert.match(assetSource, /data-project-set[\s\S]*?openNativeProjectRootPicker\(container\)/, "Project Set must still open the native project-root picker.");
 assert.doesNotMatch(assetSource, /project_set_request/, "Project Set root selection must not trigger default-folder creation.");
 assert.match(assetSource, /data-project-reload[^>]*aria-label="\$\{escapeHtml\(imageAssetText\(state, "reload_projects"\)\)\}"/, "Project reload must use a localized accessible icon button.");
-assert.match(assetSource, /<select data-project-select>[\s\S]*?<button type="button" class="language-button" data-language-toggle/, "The ImageAsset Korean/EN toggle must sit directly after the project selector.");
+assert.match(assetSource, /<select data-project-select(?:\s[^>]*)?>[\s\S]*?<button type="button" class="language-button" data-language-toggle/, "The ImageAsset Korean/EN toggle must sit directly after the project selector even while asynchronous loading disables the selector.");
 assert.match(assetSource, /data-language-toggle[\s\S]*?state\.language = imageAssetLanguage\(state\) === "ko" \? "en" : "ko";/, "ImageAsset language must toggle between Korean and English.");
 assert.match(assetSource, /data-project-reload[\s\S]*?state\.refresh_revision = Math\.max\(0, Number\(state\.refresh_revision\) \|\| 0\) \+ 1/, "The reload icon must emit a monotonic rescan request.");
-assert.match(assetSource, /grid-template-rows:58px minmax\(0,1fr\) 174px/, "Removing the red bar must also remove its empty 38px layout row.");
+assert.match(assetSource, /grid-template-rows:58px minmax\(0,1fr\)/, "The Shot accordion must stay inside the single rendered content row without reviving the removed output row.");
 assert.doesNotMatch(assetSource, /<div class="status">/, "The selection status must not consume header space.");
 assert.match(assetSource, /<div class="toolbar">[\s\S]*?data-asset-view-toggle[\s\S]*?<input data-search[\s\S]*?<div class="toolbar-status"[\s\S]*?<span class="filter-chip">/, "The Windows-style view toggle must lead the search/status/project-root toolbar.");
 assert.match(assetSource, /\.toolbar-status\{[^}]*flex:0 0 190px;[^}]*width:190px;[^}]*min-width:190px;[^}]*height:30px;/, "The bilingual selection status must retain a fixed 190px footprint.");
@@ -226,7 +256,7 @@ assert.match(assetSource, /key: "\$imports"[\s\S]*?sourceView: "user"[\s\S]*?imp
 assert.match(assetSource, /state\.selected_source_view === "user"[\s\S]*?asset\.source_kind === "user"/, "Selecting Import In must render external source cards in the main grid.");
 assert.match(assetSource, /SELECTED IMAGES \/ GENERATOR ORDER/, "ImageAssetLibrary must expose the ordered selection tray.");
 assert.match(assetSource, /data-selected-key/, "ImageAssetLibrary must expose stable draggable selection identities.");
-assert.match(assetSource, /event\.dataTransfer\.setData\("text\/plain", key\)/, "ImageAssetLibrary drag ordering must transport the stable asset key.");
+assert.match(assetSource, /event\.dataTransfer\.setData\?\.\("text\/plain", sourceUid\)/, "ImageAssetLibrary drag ordering must transport the stable Shot-local asset UID.");
 assert.match(assetSource, /selection_order = index \+ 1/, "ImageAssetLibrary drag ordering must renumber @image slots.");
 assert.match(assetSource, /MAX_SELECTED_IMAGES = 50/, "ImageAssetLibrary must enforce the 50-image selection limit.");
 const selectedAssetRule = assetSource.match(/\.asset-card\.selected\{([^}]*)\}/)?.[1] || "";
@@ -299,13 +329,13 @@ assert.match(
   "Registered Sub Type must share the automatic-field visual treatment.",
 );
 assert.match(assetSource, /if \(!hmbImageAssetCanSelect\(asset\)\) return;/, "Unregistered project cards must not enter generator selection.");
-assert.match(assetSource, /applyAssetSearchFilter\(container, state\.search\)/, "Search must filter locally without remounting on every character.");
+assert.match(assetSource, /IMAGE_ASSET_SEARCH_DEBOUNCE_MS[\s\S]*?hmbReconcileImageAssetCatalog\(container, state\)/, "Search must debounce and reconcile a bounded catalog window without remounting on every character.");
 assert.match(assetSource, /class="hmb-image-assets nodrag"/, "Asset interior gestures must not drag the node.");
 assert.doesNotMatch(assetSource, /class="hmb-image-assets nodrag nowheel"/, "Asset must not broadly disable Griptape wheel zoom.");
 assert.doesNotMatch(assetSource, /on\(container, "wheel",|addEventListener\?\.\("wheel",/, "Asset must pass wheel input from its entire surface to Griptape zoom.");
 assert.match(assetSource, /export function hmbPrepareImageAssetCanvasGestures\(container\)/, "Asset must expose Prompt-style persistent-host wheel cleanup.");
 assert.match(assetSource, /canvasPanRoots\.forEach\(\(element\) => \{\s*element\.classList\?\.remove\("nopan", "nowheel"\);\s*element\.classList\?\.add\("nodrag"\);/, "Asset remounts must clear stale pan/wheel blockers from both host and dashboard.");
-assert.match(assetSource, /container\.innerHTML = hmbScopeWidgetStyleMarkup\(render\([\s\S]*?container\.__hmbImageAssetRegistrationDraft \|\| null,[\s\S]*?\), "\.hmb-image-assets"\);[\s\S]*?hmbPrepareImageAssetCanvasGestures\(container\);/, "Every Asset remount must render scoped local registration state, apply modal isolation when needed, and restore canvas wheel behavior.");
+assert.match(assetSource, /const markup = hmbScopeWidgetStyleMarkup\(render\([\s\S]*?container\.__hmbImageAssetRegistrationDraft \|\| null,[\s\S]*?\), "\.hmb-image-assets"\);[\s\S]*?hmbPatchImageAssetMarkup\(container, markup\);[\s\S]*?hmbPrepareImageAssetCanvasGestures\(container\);/, "Every Asset structural update must retain-patch scoped local registration state, apply modal isolation when needed, and restore canvas wheel behavior.");
 assert.match(assetSource, /container\.__hmbImageAssetApplyProps/, "Asset must reuse one mounted controller across host refreshes.");
 assert.match(assetSource, /if \(currentValue === nextValue\) return;/, "An identical Asset state update must not rebuild the dashboard.");
 assert.match(
@@ -314,11 +344,8 @@ assert.match(
   "Host props must not remount the Asset registration dialog while its text fields are being edited.",
 );
 assert.match(assetSource, /detachReusableImageAssets\(container\)[\s\S]*?restoreReusableImageAssets\(container, reusableImages\)/, "Asset remounts must reuse loaded thumbnail elements.");
-assert.match(assetSource, /IMAGE_ASSET_AUTO_SYNC_MS = 10000/, "Asset must probe the shared manifest every ten seconds.");
-assert.match(assetSource, /__hmb_manifest_poll_nonce/, "Asset auto-sync probes must use a transient backend nonce.");
-assert.match(assetSource, /IMAGE_ASSET_AUTO_SYNC_PENDING_MS = 5000/, "Rapid wake events must share one bounded in-flight Asset manifest probe.");
-assert.match(assetSource, /now >= autoSyncPendingUntil[\s\S]*?autoSyncPendingUntil = now \+ IMAGE_ASSET_AUTO_SYNC_PENDING_MS/, "Asset auto-sync must not stack host round trips while a recent probe is pending.");
-assert.match(assetSource, /clearAutoSyncTimer\(\)[\s\S]*?removeEventListener/, "Asset cleanup must stop its sync timer and global listeners.");
+assert.match(assetSource, /on\(window, "hmb-shot-routing-discover-v1", publishShotRouting\)/, "Asset must answer late Shot-routing discovery without polling the manifest.");
+assert.match(assetSource, /dispatchEvent\(new EventConstructor\("hmb-shot-routing-catalog-v1"/, "Asset must publish its current Shot catalog to newly mounted consumers.");
 assert.match(assetSource, /\.asset-scroll\{[^}]*scrollbar-gutter:stable/, "Asset scrollbars must reserve stable layout space.");
 assert.match(assetSource, /class="asset-scroll nodrag nopan nowheel" data-asset-scroll/, "Only the red Asset viewport must suppress wheel zoom and non-middle local pan.");
 assert.match(assetSource, /hmbInstallImageAssetScrollGestures\(container, on\)/, "Every Asset remount must restore local wheel scrolling.");
@@ -344,22 +371,33 @@ assert.match(
 );
 assert.match(
   assetSource,
-  /on\(card, "click", \(event\) => \{[\s\S]*?toggle\(\);\s*\}\);/,
-  "Passing middle-button gestures through must not remove left-click image selection.",
+  /on\(container, "click", \(event\) => \{[\s\S]*?event\.target\?\.closest\?\.\("\[data-asset-key\]"\)[\s\S]*?toggleDelegatedAsset\(card, asset\);\s*\}\);/,
+  "Passing middle-button gestures through must retain left-click image selection through one delegated root handler.",
+);
+assert.match(
+  assetSource,
+  /on\(container, "keydown", \(event\) => \{[\s\S]*?\["Enter", " "\]\.includes\(event\.key\)[\s\S]*?toggleDelegatedAsset\(card, asset\);\s*\}\);/,
+  "Virtualized image cards must retain keyboard selection through root delegation.",
+);
+assert.match(
+  assetSource,
+  /event\.__hmbImageAssetCardHandled = true;[\s\S]*?if \(event\.__hmbImageAssetCardHandled\) return;/,
+  "Retained cards may keep their local listeners only while the handled-event guard prevents a duplicate delegated toggle.",
 );
 assert.doesNotMatch(assetSource, /data-asset-selected|type="checkbox" data-asset-selected/, "Asset selection must use the card outline, not per-card checkboxes.");
 assert.doesNotMatch(assetSource, /candidate-list|writing-mode/, "Removed color chips and rotated slot text must not return.");
 assert.match(assetSource, /String\(index \+ 1\)\.padStart\(2, "0"\)/, "Selected cards must use horizontal 01/02 numbering.");
 assert.doesNotMatch(assetSource, /IMAGE_IMPORT_IN →[\s\S]*?Video Generation Out → Generator/, "The removed header flow-help text must not return.");
 const selectedCardMarkup = assetSource.match(/function renderSelectedCard\([\s\S]*?\n\}\n\nexport function hmbApplyImageAssetSelectionFeedback/)?.[0] || "";
-assert.match(selectedCardMarkup, /class="slot"[\s\S]*?data-move="-1"[\s\S]*?data-move="1"[\s\S]*?data-remove-selected[\s\S]*?selected-thumb/, "Compact selected cards must keep number, left, right, delete, and image controls inside one box.");
+assert.match(selectedCardMarkup, /class="slot"[\s\S]*?data-remove-selected[\s\S]*?selected-thumb/, "Compact selected cards must keep number, delete, and image controls inside one draggable box.");
+assert.doesNotMatch(selectedCardMarkup, /data-move=|move_left|move_right|>‹<|>›</, "The retired one-step arrow controls must not remain in selected-card markup.");
 assert.doesNotMatch(selectedCardMarkup, /drag-handle|selected-copy/, "Compact selected cards must not render drag hints or metadata text.");
-assert.match(selectedCardMarkup, /externalImport[\s\S]*?disconnectPending[\s\S]*?remove_external_selection/, "External selected-card X must describe its guarded graph disconnect.");
-assert.match(assetSource, /state\.disconnect_import_uid = asset\.source_uid;[\s\S]*?state = emit\(props, state, container\);[\s\S]*?return;/, "External selected-card X must submit the source UID without optimistically deselecting the card.");
-assert.match(assetSource, /Disconnect this external image from IMAGE_IMPORT_IN\. Multi-image or ambiguous links must be removed at the input port\./, "The external X tooltip must explain the exact safe-disconnect boundary.");
+assert.match(assetSource, /hmbToggleImageAssetShotAsset\(state, shotUuid, key, asset\),\s*paintActiveShotSelection/, "Selected-card X must remove only this Shot membership, preserve the shared source, and patch the mounted tray without rebuilding the catalog.");
+assert.match(assetSource, /const commitShotMutation = \(mutate, paint = null\) => \{[\s\S]*?baseRouting[\s\S]*?baseSelection[\s\S]*?baseLatestLocalUiEditRevision[\s\S]*?cloneImageAssetShotRouting\(baseRouting\)[\s\S]*?hmbRestoreImageAssetSelectionSnapshot[\s\S]*?__hmbImageAssetLatestLocalUiEditRevision = baseLatestLocalUiEditRevision[\s\S]*?suppressMatchingEcho: true/, "Every Shot structure action must suppress its exact echo and restore the prior Shot/membership/revision authority if the newest publication fails.");
 assert.match(assetSource, /이 외부 이미지를 IMAGE_IMPORT_IN에서 연결 해제합니다\./, "The external X connection explanation must be available in Korean too.");
 assert.match(assetSource, /\.selected-card\{flex-basis:120px;width:120px;height:118px;grid-template-rows:23px minmax\(0,1fr\)\}/, "Selected cards must match the confirmed 120x118 blue-box footprint.");
-assert.match(assetSource, /\.selected-actions\{[^}]*grid-template-columns:repeat\(3,22px\);[^}]*margin-left:auto/, "All three selected-card action icons must fit inside the compact header.");
+assert.match(assetSource, /\.selected-actions\{[^}]*display:flex;[^}]*margin-left:auto/, "The selected-card delete control must remain aligned inside the compact header after arrows are removed.");
+assert.doesNotMatch(assetSource, /grid-template-columns:repeat\(3,22px\)|move_left:|move_right:/, "Arrow-only CSS and translations must be removed with the controls.");
 assert.doesNotMatch(assetSource, /@media\(max-width:920px\)[\s\S]*?\.selected-card\{flex-basis:225px\}/, "Responsive layout must not restore the old wide selected card.");
 
 assert.equal(
@@ -429,8 +467,6 @@ const makeFeedbackSelectedCard = (asset) => {
   });
   const controls = {
     ".slot": { textContent: "" },
-    '[data-move="-1"]': control(),
-    '[data-move="1"]': control(),
     "[data-remove-selected]": control(),
   };
   return {
@@ -478,6 +514,7 @@ const feedbackContainer = {
   },
 };
 const feedbackState = assetModule.hmbNormalizeImageAssetState({
+  language: "en",
   assets: [{
     asset_library_id: "asset-feedback",
     source_uid: "project:asset-feedback",
@@ -494,7 +531,7 @@ assetModule.hmbApplyImageAssetSelectionFeedback(feedbackContainer, feedbackState
 });
 assert.equal(feedbackClasses.has("selected"), true, "Local feedback must outline the clicked card immediately.");
 assert.equal(feedbackAttributes.get("aria-pressed"), "true");
-assert.equal(feedbackTrayCount.textContent, "1/50");
+assert.equal(feedbackTrayCount.textContent, "1/30");
 assert.equal(feedbackTray.children[0]?.getAttribute?.("data-selected-key"), "asset-feedback", "Local feedback must populate the selected tray before the host round trip.");
 assert.equal(feedbackTray.scrollLeft, 17, "Local tray feedback must preserve its horizontal position.");
 assert.match(feedbackStatus.textContent, /1\/50 SEL/);
@@ -505,8 +542,8 @@ assert.deepEqual(
 );
 const assetInstallEventsSource = assetSource.match(/function installEvents\([\s\S]*?\n\}\n\nexport default function HMBImageAssetLibraryWidget/)?.[0] || "";
 assert.match(assetInstallEventsSource, /const assetsByLibraryId = new Map\(/, "Asset event installation must index cards in one linear pass.");
-assert.doesNotMatch(assetInstallEventsSource, /state\.assets\.find\(/, "Per-card event installation must not rescan the full asset array.");
-const assetToggleSource = assetInstallEventsSource.match(/const toggle = \(\) => \{[\s\S]*?\n    \};/)?.[0] || "";
+assert.doesNotMatch(assetInstallEventsSource, /state\.assets\.find\(/, "Delegated card events must not rescan the full asset array.");
+const assetToggleSource = assetInstallEventsSource.match(/const toggleDelegatedAsset = \(card, asset\) => \{[\s\S]*?\n  \};/)?.[0] || "";
 const assetOrdinaryToggleSource = assetToggleSource.slice(
   0,
   assetToggleSource.indexOf("hmbScheduleImageAssetSelectionCommit(container"),
@@ -523,8 +560,8 @@ assert.doesNotMatch(
 );
 assert.match(
   assetInstallEventsSource,
-  /const selectedTray = container\.querySelector\("\.tray-scroll"\)[\s\S]*?on\(selectedTray, "dragstart"[\s\S]*?on\(selectedTray, "drop"[\s\S]*?on\(selectedTray, "click"/,
-  "Delegated tray controls and drag events must survive selection-only tray replacement.",
+  /hmbInstallImageAssetShotDragReorder\(container, \{[\s\S]*?listen: \(eventName, handler\) => on\(container, eventName, handler, true\)[\s\S]*?on\(selectedTray, "click"/,
+  "Capture-phase root drag delegation must survive selected-card morphs while the delete control remains tray-local.",
 );
 assert.match(
   assetSource,
@@ -533,8 +570,8 @@ assert.match(
 );
 assert.match(
   assetSource,
-  /&& !container\.__hmbImageAssetSelectionCommitPending/,
-  "Manifest auto-sync must yield while an immediate local selection commit is pending.",
+  /if \(!container\.__hmbImageAssetSelectionCommitPending\) \{[\s\S]*?__hmbImageAssetSelectionBase/,
+  "The first immediate local selection must capture one rollback base while later clicks coalesce into the same commit.",
 );
 const unverifiedAssetProbe = assetModule.hmbNormalizeImageAssetState({
   assets: [{
@@ -680,81 +717,46 @@ assert.equal(
   "",
   "The widget must never turn a local or mapped-drive path into file://.",
 );
-const autoSyncPayloadProbe = JSON.parse(assetModule.hmbImageAssetAutoSyncPayload({
-  project_root: "//SERVER/Share/ProjectA",
-  project_id: "ProjectA",
-  project_uid: "hmbp2:test",
-  manifest_signature: "signature-a",
-}, "poll-1"));
-assert.equal(autoSyncPayloadProbe.__hmb_manifest_poll_nonce, "poll-1");
-assert.equal(autoSyncPayloadProbe.manifest_signature, "signature-a");
-assert.deepEqual(
-  Object.keys(autoSyncPayloadProbe).sort(),
-  [
-    "__hmb_manifest_poll_nonce",
-    "catalog_root",
-    "manifest_signature",
-    "project_id",
-    "project_root",
-    "project_uid",
-  ].sort(),
-  "Asset auto-sync must send only identity fields, never the full catalog.",
-);
-assert.equal(autoSyncPayloadProbe.assets, undefined);
 assert.match(promptSource, /asset_verified:\s*false/, "Prompt rows must default to unverified.");
 assert.match(promptSource, /item\.asset_verified/, "Prompt metadata locking must require verified provenance.");
 assert.match(promptSource, /Name and Prompt fields remain editable/, "External imported Prompt rows must remain editable.");
-assert.doesNotMatch(
-  promptSource,
-  /hmbPublishSharedUiTheme\(state\.ui\s*&&\s*state\.ui\.theme\)/,
-  "Prompt mount and engine-prop updates must never overwrite the shared workflow theme.",
-);
-assert.match(
-  promptSource,
-  /\[data-theme-choice\][\s\S]*?const handler = \(\) => \{[\s\S]*?hmbPublishSharedUiTheme\(theme\)/,
-  "Only an explicit Prompt P/T selector action may publish the shared workflow theme.",
-);
-assert.equal(
-  (promptSource.match(/hmbPublishSharedUiTheme\(/g) || []).length,
-  2,
-  "Shared theme publication must be limited to its function definition and the explicit P/T click handler.",
-);
-for (const [name, source, reader] of [
-  ["VideoPicker", videoSource, "hmbReadSharedUiTheme"],
-  ["PromptLibrary", promptSource, "hmbReadSharedUiTheme"],
-  ["AgentLibrary", agentSource, "hmbReadSharedUiTheme"],
-  ["ImageAssetLibrary", assetSource, "readTheme"],
+for (const [name, source] of [
+  ["VideoPicker", videoSource],
+  ["PromptLibrary", promptSource],
+  ["AgentLibrary", agentSource],
+  ["ImageAssetLibrary", assetSource],
 ]) {
-  assert.match(
+  assert.doesNotMatch(
     source,
-    new RegExp(`function ${reader}\\(fallback = "P"\\)`),
-    `${name} must mount independently with P while honoring an existing shared selection.`,
+    /hmbPublishSharedUiTheme|hmbReadSharedUiTheme|sharedThemeHandler|__hmbGpProductionUiTheme/,
+    `${name} must not retain the retired cross-widget P/T theme transport.`,
   );
 }
-assert.match(
-  videoSource,
-  /state\.ui_theme = hmbReadSharedUiTheme\(state\.ui_theme\)/,
-  "A new VideoPicker must adopt the shared theme locally without publishing it.",
-);
-const videoThemeReceiver = videoSource.match(/const sharedThemeHandler = \(event\) => \{([\s\S]*?)\n  \};/)?.[1] || "";
-assert.ok(videoThemeReceiver, "VideoPicker must retain a shared-theme paint receiver.");
-assert.doesNotMatch(videoThemeReceiver, /\bcommit\(|props\.onChange|dispatchEvent/, "VideoPicker theme reception must be paint-only.");
-const promptThemeReceiver = promptSource.match(/const sharedThemeHandler = \(event\) => \{([\s\S]*?)\n    \};/)?.[1] || "";
-assert.ok(promptThemeReceiver, "PromptLibrary must retain a shared-theme paint receiver.");
-assert.doesNotMatch(promptThemeReceiver, /\bemit\(|hmbPublishSharedUiTheme|dispatchEvent/, "Prompt theme reception must be paint-only.");
-assert.match(
-  assetSource,
-  /window\.__hmbGpProductionUiTheme[\s\S]*?sessionStorage\?\.getItem\(HMB_UI_THEME_STORAGE_KEY\)/,
-  "ImageAsset must use the same in-memory then session-storage theme precedence as the other libraries.",
-);
+assert.match(videoSource, /state\.ui_theme = "P";/, "VideoPicker must normalize to the single P base design.");
+assert.match(videoSource, /const uiTheme = "P";/, "VideoPicker rendering must ignore stale T storage.");
 assert.doesNotMatch(
   agentSource,
   /PROJECT_IDENTITY_SOURCE_AUTHORITY_AND_LANGUAGE|SHOT_ACTIVATION_IDENTIFIERS_IMAGE_AND_MARKER_BINDING/,
   "Agent widget source must not contain internal policy identifiers.",
 );
 assert.match(agentSource, /<b>HMBAgentLibrary<\/b>/, "Agent must use the HMBAgentLibrary title.");
-assert.match(agentSource, /DISPLAY → FINAL TEXT/, "Agent header must identify the public text output.");
-assert.match(agentSource, /AGENT STATE · CHAIN/, "Agent header must mark native state as chain-only.");
+assert.doesNotMatch(agentSource, /DISPLAY → FINAL TEXT/, "Agent header must omit the retired subtitle.");
+assert.match(agentSource, /class="agent-shot-select nodrag"/, "Agent header must expose the shared Shot selector.");
+assert.match(
+  agentSource,
+  /const catalog = hmbAgentCatalog\(state\.shot_catalog\)/,
+  "Agent must receive its bounded Shot catalog through backend-authoritative widget props.",
+);
+assert.doesNotMatch(
+  agentSource,
+  /addEventListener\([^\n]*hmb-shot-routing-catalog-v1|__hmbAgentShotCatalogs|shotCatalogHandler/,
+  "Agent must never display or commit a process-global Shot catalog, including a cloned Flow with identical UUIDs.",
+);
+assert.match(
+  agentSource,
+  /window\.dispatchEvent\(new CustomEvent\("hmb-shot-routing-discover-v1"\)\)/,
+  "Agent may request a notification replay while leaving the response to backend same-flow reconciliation.",
+);
 assert.doesNotMatch(
   agentSource,
   /class="agent-flow"|class="agent-statusbar"/,
@@ -782,7 +784,7 @@ assert.match(
 );
 assert.match(
   agentSource,
-  /container\.innerHTML = hmbScopeWidgetStyleMarkup\([\s\S]*?renderAgentDashboard\(hmbReadSharedUiTheme\(\)\),[\s\S]*?"\.hmb-agent-dashboard",[\s\S]*?\);\s*hmbPrepareAgentCanvasGestures\(container\);/,
+  /container\.innerHTML = hmbScopeWidgetStyleMarkup\([\s\S]*?renderAgentDashboard\(hmbAgentState\(props\), container\),[\s\S]*?"\.hmb-agent-dashboard",[\s\S]*?\);\s*hmbPrepareAgentCanvasGestures\(container\);/,
   "The first Agent mount must apply the native canvas gesture contract.",
 );
 assert.equal(
@@ -790,7 +792,7 @@ assert.equal(
   1,
   "Agent updates must retain the existing static dashboard DOM.",
 );
-assert.match(agentSource, /hmbRefreshAgentDashboard\(container\)/, "Agent updates must refresh theme and gestures in place.");
+assert.match(agentSource, /hmbRefreshAgentDashboard\(container, props\)/, "Agent updates must refresh Shot color, selector, and gestures in place.");
 assert.doesNotMatch(
   agentSource,
   /class="[^"]*\b(?:nopan|nowheel)\b[^"]*"/,
@@ -802,11 +804,12 @@ assert.doesNotMatch(
   /(?:^|[;{])\s*cursor\s*:|pointer-events\s*:/m,
   "Agent must inherit Griptape's native grab/grabbing cursor and pointer hit testing.",
 );
-assert.doesNotMatch(
+assert.match(
   agentSource,
-  /<(?:button|input|select|textarea)\b/i,
-  "Agent's custom widget remains a background-only title header with no controls to isolate.",
+  /<select class="agent-shot-select nodrag"/i,
+  "Agent's only custom control must be the shared Shot selector.",
 );
+assert.doesNotMatch(agentSource, /<(?:button|input|textarea)\b/i);
 
 for (const [name, source] of [
   ["PromptLibrary", promptSource],
@@ -864,7 +867,16 @@ assert.match(
 
 // Each custom widget updates only its own parameter. The visible picker commits
 // HMB_PICKER_STATE; the hidden bridge commits only HMB_PICKER_COMMAND.
-assert.match(videoSource, /props\.onChange\(JSON\.parse\(JSON\.stringify\(normalized\)\)\)/);
+assert.match(
+  videoSource,
+  /hmbDeliverPickerStateIfMounted\(\s*container,\s*props\.onChange,\s*JSON\.parse\(JSON\.stringify\(normalized\)\),?\s*\)/s,
+  "Picker state publication must be gated by the mounted-widget lifecycle before invoking onChange.",
+);
+assert.match(
+  videoSource,
+  /export function hmbDeliverPickerStateIfMounted\(container, onChange, value\)[\s\S]*?container\.__hmbVideoPickerDeleted === true[\s\S]*?onChange\(value\)/,
+  "A deleted Picker must refuse late widget publications while a mounted Picker still delivers them.",
+);
 assert.match(videoSource, /shell\?\.__hmbPickerCommandBridge/);
 assert.match(commandSource, /return props\.onChange\(command\)/);
 assert.match(commandSource, /shell\.__hmbPickerCommandBridge = \{ token, dispatch \}/);
@@ -880,8 +892,8 @@ assert.match(
 );
 assert.match(
   videoSource,
-  /update\(nextProps\)\s*\{\s*if \(hmbConsumePendingPickerStateEcho\(container, nextProps \|\| \{\}\)\)\s*\{\s*props = nextProps \|\| \{\};\s*return;/s,
-  "An exact safe local echo must return before cleanup, DOM morphing, and resize reinstallation.",
+  /container\.__hmbVideoPickerControllerUpdate\s*=\s*\(nextProps\)\s*=>\s*\{[\s\S]*?if \(hmbConsumePendingPickerStateEcho\(container, nextProps \|\| \{\}\)\) \{[\s\S]*?patchMountedPicker\(nextProps \|\| \{\}\);\s*return;/s,
+  "An exact local echo must use the retained regional patch path before any full cleanup or controller reinstallation.",
 );
 
 const localPickerEcho = {
@@ -991,36 +1003,44 @@ assert.doesNotMatch(
   "Resolution changes need the normal morph to refresh the resolution summary, message, and activity log.",
 );
 const pickerSelectionHandler = videoSource.slice(
-  videoSource.indexOf('container.querySelectorAll("[data-toggle-video-uid]")'),
-  videoSource.indexOf('container.querySelectorAll("[data-delete-video-uid]")'),
+  videoSource.indexOf("const toggleVideoSelection ="),
+  videoSource.indexOf("const deleteVideoAsset ="),
 );
-assert.doesNotMatch(
+assert.match(
+  pickerSelectionHandler,
+  /hmbApplySelectedVideoAssetOrderToDom\(container, nextState/,
+  "UID selection must update outline/order fields locally without rebuilding every media row.",
+);
+assert.match(
   pickerSelectionHandler,
   /suppressMatchingEcho:\s*true/,
-  "UID selection changes need the normal morph to refresh card order, viewport, and dependent controls.",
+  "The exact retained-mode selection echo must be quarantined after local row feedback.",
 );
-assert.match(pickerSelectionHandler, /selectionSurface\.getAttribute\("aria-disabled"\) === "true"/);
+assert.match(pickerSelectionHandler, /selectionSurface\?\.getAttribute\?\.\("aria-disabled"\) === "true"/);
 assert.match(pickerSelectionHandler, /container\.__hmbSuppressVideoSelectionClick/);
-assert.match(pickerSelectionHandler, /on\(selectionSurface, "click", toggleSelection\)/);
-assert.match(pickerSelectionHandler, /on\(selectionSurface, "keydown"/);
-assert.match(pickerSelectionHandler, /\["Enter", " "\]\.includes\(event\.key\)/);
-const pickerPlaybackHandlerStart = videoSource.indexOf(
-  'container.querySelectorAll("[data-play-video-uid]")',
-  videoSource.indexOf('on(container.querySelector("#import-video-asset"), "change"'),
+const pickerDelegationHandler = videoSource.slice(
+  videoSource.indexOf("export function hmbInstallVideoAssetRootDelegation"),
+  videoSource.indexOf("export function hmbSetVideoPickerCanvasMotion"),
 );
+assert.match(pickerDelegationHandler, /container\.addEventListener\("click", delegatedClick\)/);
+assert.match(pickerDelegationHandler, /container\.addEventListener\("keydown", delegatedKeydown\)/);
+assert.match(pickerDelegationHandler, /\["Enter", " "\]\.includes\(event\?\.key\)/);
+assert.doesNotMatch(
+  videoSource,
+  /querySelectorAll\("\[data-(?:play|toggle|delete)-video-uid\]"\)\.forEach\([\s\S]{0,900}?on\([^,]+,\s*"(?:click|keydown)"/,
+  "Video cards must not regain per-row click/keyboard listeners after root delegation.",
+);
+const pickerPlaybackHandlerStart = videoSource.indexOf("const playInPreview =");
 const pickerPlaybackHandler = videoSource.slice(
   pickerPlaybackHandlerStart,
-  videoSource.indexOf(
-    'container.querySelectorAll("[data-toggle-video-uid]")',
-    pickerPlaybackHandlerStart,
-  ),
+  videoSource.indexOf("const toggleVideoSelection =", pickerPlaybackHandlerStart),
 );
 assert.match(pickerPlaybackHandler, /container\.querySelector\("#picker-video"\)/);
 assert.match(pickerPlaybackHandler, /container\.__hmbAutoplayVideoUid = uid/);
 assert.match(pickerPlaybackHandler, /container\.__hmbForceVideoPreviewUid = uid/);
 assert.match(
   pickerPlaybackHandler,
-  /commit\(\{ \.\.\.hmbPreviewVideoAsset\(liveState, uid\), viewport_mode: "video" \}\)/,
+  /const nextState = livePreviewUid === uid[\s\S]*hmbPreviewVideoAsset\(liveState, uid\)[\s\S]*hmbPatchVideoPickerPreviewDom\(container, nextState[\s\S]*mediaController\.refresh\(nextState\)[\s\S]*commit\(nextState, \{ suppressMatchingEcho: true \}\)/,
 );
 assert.doesNotMatch(
   pickerPlaybackHandler,
@@ -1085,13 +1105,13 @@ assert.equal(
 );
 assert.match(
   promptSource,
-  /export function hmbCommitLocalPromptStructure[\s\S]*?committedState = remount\(\) \|\| state[\s\S]*?hmbEmitLocalPromptState\(container, props, committedState\);/,
+  /export function hmbCommitLocalPromptStructure[\s\S]*?rollbackValue[\s\S]*?committedState = remount\(\) \|\| state[\s\S]*?hmbEmitLocalPromptState\(container, props, committedState,[\s\S]*?remount\(rollbackState\)/,
   "Prompt structural source edits must repaint before publishing without waiting for a Picker props event.",
 );
 assert.match(
   promptSource,
-  /if \(currentValue === nextValue && !disabledChanged\) \{[\s\S]*?return;[\s\S]*?\}[\s\S]*?state = nextState;[\s\S]*?hmbRememberPromptRevisionState\(container, state, state\.disabled, false\);\s*remount\(\);/,
-  "Only a genuinely authoritative newer state may update the revision baseline and remount PromptLibrary.",
+  /if \(currentValue === nextValue && !disabledChanged\) \{[\s\S]*?return;[\s\S]*?\}[\s\S]*?state = nextState;[\s\S]*?hmbRememberPromptRevisionState\(container, state, state\.disabled, false\);[\s\S]*?if \(shotRegionOnly\) \{[\s\S]*?hmbApplyPromptShotFeedback\(container, state\);[\s\S]*?\} else \{\s*remount\(\);/,
+  "A newer state must patch only the Shot selector when possible and reserve full Prompt remounting for other authoritative changes.",
 );
 assert.match(promptSource, /hmbCapturePromptControlFocus\(container\)[\s\S]*?hmbRestorePromptControlFocus\(container\)/, "Prompt structural refreshes must preserve non-text control focus.");
 assert.match(promptSource, /container\.__hmbPromptLibraryApplyProps/, "Prompt must reuse one mounted controller across host refreshes.");
@@ -1201,7 +1221,15 @@ const pickerMoveContract = videoSource.slice(
   videoSource.indexOf("export function hmbPreviewVideoAsset"),
 );
 assert.match(pickerMoveContract, /ordered\.splice\(currentIndex, 1\)/);
-assert.match(pickerMoveContract, /hmbApplyVideoAssetSelection\(state, ordered, targetUid\)/);
+assert.match(
+  pickerMoveContract,
+  /const retainedPreviewUid = clean\(state\?\.preview_video_uid \|\| state\?\.selected_video_uid\)/,
+  "Reordering keeps the current preview/playback target independent of @video order.",
+);
+assert.match(
+  pickerMoveContract,
+  /hmbApplyVideoAssetSelection\(state, ordered, retainedPreviewUid\)/,
+);
 const pickerDragContract = videoSource.slice(
   videoSource.indexOf("export function hmbInstallVideoAssetDragReorder"),
   videoSource.indexOf("export function hmbPreviewVideoAsset"),
@@ -1263,6 +1291,34 @@ assert.match(videoSource, /\.snapshot-toolbar \.output-camera-label\{white-space
 assert.match(
   videoSource,
   /\.snapshot-toolbar \.camera-fixed,\.snapshot-toolbar \.camera-dropdown\{[\s\S]*?min-height:29px;max-height:29px/,
+);
+assert.match(
+  videoSource,
+  /\.generate-playblast-toolbar\{[^}]*min-height:42px;flex:0 0 42px;[^}]*display:flex;[^}]*border-bottom:/,
+  "Generate Playblast must occupy one dedicated 42px row immediately below Snapshot/CAM.",
+);
+assert.match(
+  videoSource,
+  /\.playblast-settings-toolbar\{[^}]*min-height:88px;flex:0 0 88px;[^}]*display:block;[^}]*padding:7px 10px;/,
+  "Playblast Settings must expand to two 29px rows and move the Viewport header down by 44px.",
+);
+assert.match(
+  videoSource,
+  /\.playblast-settings-toolbar \.settings-grid-inline\{[^}]*width:100%;height:66px;[^}]*grid-template-columns:repeat\(2,minmax\(0,1fr\)\);grid-template-rows:29px 29px/,
+  "Resolution and Frame Range must each occupy exactly one half of the upper Settings row.",
+);
+assert.match(
+  videoSource,
+  /\.settings-grid-inline \.settings-compact-row\{grid-column:1\/-1;grid-row:2;grid-template-columns:repeat\(3,minmax\(0,1fr\)\);/,
+  "FPS, Format, and Maya metadata must each occupy exactly one third of the lower Settings row.",
+);
+assert.equal((videoSource.match(/class="settings-primary-item"/g) || []).length, 2);
+assert.doesNotMatch(videoSource, /playblast-settings-heading|tr\.playblastSettings|PLAYBLAST SETTINGS/);
+assert.doesNotMatch(videoSource, /settings-action-inline/);
+assert.match(
+  videoSource,
+  /const fixed = \[[\s\S]*?\["\.snapshot-toolbar", 42\],[\s\S]*?\["\.generate-playblast-toolbar", 42\],[\s\S]*?\["\.playblast-settings-toolbar", 88\]/,
+  "Viewport sizing must account for the exact reordered 42 + 42 + 88px header budget.",
 );
 assert.match(
   videoSource,
@@ -1382,10 +1438,19 @@ assert.match(videoSource, /\.panel\{[\s\S]*?border-radius:10px/);
 assert.match(videoSource, /\.side-section\{[\s\S]*?border-radius:10px/);
 assert.doesNotMatch(videoSource, /class="statusbar"|\.statusbar\{|class="warnings"|\.warnings\{/,
   "Picker notifications must live only in Activity Log; no footer status bar or warning overlay may return.");
-assert.doesNotMatch(videoSource, /const available = hmbPickerAvailableHeightToShell\(container, shell\);/);
-assert.match(videoSource, /const required = minimumRequired;/);
-assert.match(videoSource, /clip\.style\.height = `\$\{required\}px`/);
-assert.match(videoSource, /picker\.style\.height = `\$\{required\}px`/);
+assert.match(
+  videoSource,
+  /const availableShellHeight = shell[\s\S]*?hmbPickerAvailableHeightToShell\(container, shell\)/,
+  "The Picker frame must consume the current shell's actually available height after hidden rows collapse.",
+);
+assert.match(videoSource, /const required = Math\.max\(minimumRequired, availableShellHeight\);/);
+assert.doesNotMatch(
+  videoSource,
+  /const required = Math\.max\(minimumRequired, HMB_DEFAULT_NODE_HEIGHT\)/,
+  "Available-space fill must not force a saved 1151px user resize back to the 1200px start size.",
+);
+assert.match(videoSource, /hmbSetPickerStyleIfChanged\(clip, "height", `\$\{required\}px`\)/);
+assert.match(videoSource, /hmbSetPickerStyleIfChanged\(picker, "height", `\$\{required\}px`\)/);
 assert.match(videoSource, /hmbPickerLocalHostAncestors\(container\)\.forEach\(applyMinimum\)/);
 assert.doesNotMatch(videoSource, /layoutRow\.style\.setProperty\("flex", "1 1 0%", "important"\)/);
 assert.doesNotMatch(videoSource, /element\.style\.setProperty\("flex", `0 0 \$\{height\}px`, "important"\)/);
@@ -1451,9 +1516,30 @@ assert.match(
 );
 assert.doesNotMatch(videoSource, /data-resize-section="log"/);
 assert.match(videoSource, /data-resize-section="color"/);
-assert.match(videoSource, /data-resize-section="settings"/);
+assert.doesNotMatch(
+  videoSource,
+  /data-resize-section="settings"/,
+  "Playblast Settings now belongs to the viewport header and must not reserve a separate right-column panel.",
+);
+assert.ok(
+  videoSource.indexOf('<div class="snapshot-toolbar">')
+    < videoSource.indexOf('<div class="generate-playblast-toolbar"')
+    && videoSource.indexOf('<div class="generate-playblast-toolbar"')
+      < videoSource.indexOf('<div class="playblast-settings-toolbar">')
+    && videoSource.indexOf('<div class="playblast-settings-toolbar">')
+      < videoSource.indexOf('<div class="panel-title viewport-title">')
+    && videoSource.indexOf('<div class="panel-title viewport-title">')
+      < videoSource.indexOf('<div class="viewport-stage">'),
+  "The center column must render Snapshot/CAM, Generate, Settings, then Viewport while Current Cut Videos owns the right column.",
+);
+assert.equal((videoSource.match(/id="run-video"/g) || []).length, 1);
+assert.match(
+  videoSource,
+  /class="generate-playblast-toolbar" role="group" aria-label="\$\{escapeHtml\(tr\.generate\)\}"[\s\S]*?id="run-video" aria-label="\$\{escapeHtml\(tr\.generate\)\}"/,
+  "Moving Generate must preserve the existing control ID and add explicit accessible naming.",
+);
 assert.doesNotMatch(videoSource, /HMB_RIGHT_SECTION_HEIGHTS_KEY|hmbWriteRightSectionHeights/);
-assert.match(promptSource, /state\.ui\.theme\s*=\s*theme/);
+assert.doesNotMatch(promptSource, /state\.ui\.theme\s*=\s*theme|data-theme-choice/);
 assert.equal((videoSource.match(/data-section-key="log"/g) || []).length, 1);
 assert.ok(
   videoSource.indexOf('<div class="center-stack">') < videoSource.indexOf('data-section-key="log"')

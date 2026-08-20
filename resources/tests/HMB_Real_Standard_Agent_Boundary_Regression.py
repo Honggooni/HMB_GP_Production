@@ -19,16 +19,21 @@ STANDARD_ROOT = Path(
     os.environ.get("HMB_GRIPTAPE_STANDARD_LIBRARY_PATH", DEFAULT_STANDARD_ROOT)
 )
 
-if not (STANDARD_ROOT / "griptape_nodes_library" / "agents" / "agent.py").is_file():
-    print("HMB_REAL_STANDARD_AGENT_BOUNDARY=SKIP (standard library unavailable)")
-    raise SystemExit(0)
-
 os.environ["HMB_GRIPTAPE_STANDARD_LIBRARY_PATH"] = str(STANDARD_ROOT)
 sys.path.insert(0, str(ROOT))
 
 import HMBAgentLibrary as module  # noqa: E402
 import HMBPromptLibrary as prompt_module  # noqa: E402
 from _hmb_private_policy_fixture import install_private_policy_reader  # noqa: E402
+
+
+# A source checkout can exist without the Standard Library's import-time
+# dependencies being available to this regression interpreter.  Exercise the
+# real boundary only when production resolved the actual Standard Agent class;
+# the stub boundary remains covered by the other Agent regressions.
+if module._BuiltinAgent is None:
+    print("HMB_REAL_STANDARD_AGENT_BOUNDARY=SKIP (standard Agent not importable)")
+    raise SystemExit(0)
 
 
 node = module.HMBAgentLibrary(name="hmb_real_standard_boundary")
