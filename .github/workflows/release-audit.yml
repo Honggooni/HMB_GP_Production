@@ -132,6 +132,6 @@ jobs:
           # policy review document. This check builds only an in-memory ZIP.
           python -m py_compile resources/build_developer_release.py
           python resources/build_developer_release.py --check
-          $artifact = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_DEV_0.6.37.zip"
+          $artifact = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_DEV_0.6.38.zip"
           python resources/build_developer_release.py --output $artifact
           python resources/build_developer_release.py --check-output --output $artifact

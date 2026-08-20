@@ -145,21 +145,21 @@ assert.equal(
 );
 assert.equal(
   (toggleSource.match(/hmbScheduleVideoPickerNodeInternalsUpdate\(container, liveProps/g) || []).length,
-  1,
-  "Both directions share one finally-block scheduler that samples only final stable bounds.",
+  0,
+  "Mode transitions never request React Flow node-internals updates.",
 );
-assert.match(
+assert.doesNotMatch(
   toggleSource,
-  /finally\s*\{\s*delete container\.__hmbVideoPickerViewTransition;\s*hmbScheduleVideoPickerNodeInternalsUpdate\(container, liveProps,[\s\S]*?force:\s*true/,
-  "The final node-local internals publish is queued only after transition ownership is released.",
+  /hmbScheduleVideoPickerNodeInternalsUpdate|hmbRequestVideoPickerNodeInternalsUpdate|updateNodeInternals/,
+  "The transition is strictly widget-local and cannot publish canvas geometry.",
 );
 assert.doesNotMatch(
   source.slice(
     source.indexOf("const HMB_VIDEO_PICKER_GEOMETRY_PROPERTIES"),
-    source.indexOf("const HMB_VIDEO_PICKER_RESIZE_LOCK_ATTRIBUTE"),
+    source.indexOf("export function hmbDetachVideoPickerDom"),
   ),
-  /transform|translate|left|top/,
-  "View restoration may resize the node but must never move its canvas position or viewport transform.",
+  /(?:^|[;{]\s*)(?:shell|nodeRoot)\.style|setViewport|fitView|fitBounds|zoomTo|panBy|setCenter/,
+  "View restoration is widget-local and must never move the canvas or mutate an outer node.",
 );
 
 console.log("HMB VideoPicker view-transition lifecycle regression: PASS");

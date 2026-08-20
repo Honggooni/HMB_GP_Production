@@ -3824,7 +3824,39 @@ def _add_maya_scene_picker(node: Any) -> None:
     Griptape Nodes builds those fields can coexist with allowed_modes but produce a
     property that renders correctly while its value-change lifecycle is not forwarded.
     """
+    def configure_hidden_scene_parameter(parameter: Any) -> None:
+        if parameter is None:
+            return
+        # The custom Picker has its own path field and sends browse/read through
+        # HMB_PICKER_COMMAND. Keeping a second native row visible previously
+        # forced the JavaScript widget to collapse Griptape layout ancestors,
+        # which could resize the entire React Flow canvas on some team PCs.
+        for attribute in ("hide", "hide_property"):
+            try:
+                setattr(parameter, attribute, True)
+            except Exception:
+                pass
+        try:
+            options = dict(getattr(parameter, "ui_options", {}) or {})
+            options.update({
+                "display_name": "",
+                "height": 1,
+                "min_height": 0,
+                "max_height": 1,
+                "is_full_width": True,
+                "hide": True,
+                "hide_property": True,
+                "hide_label": True,
+                "hide_handles": True,
+                "expandable": False,
+                "resizable": False,
+            })
+            parameter.ui_options = options
+        except Exception:
+            pass
+
     if parameter_exists(node, "MAYA_SCENE"):
+        configure_hidden_scene_parameter(_get_parameter_obj(node, "MAYA_SCENE"))
         return
     tooltip = (
         "Select one Maya .mb or .ma scene. READ loads cameras, exact frame range, "
@@ -3881,6 +3913,7 @@ def _add_maya_scene_picker(node: Any) -> None:
             kwargs["traits"] = {trait}
         parameter = Parameter(**kwargs)
     node.add_parameter(parameter)
+    configure_hidden_scene_parameter(parameter)
 
 
 def _remove_parameter(node: Any, name: str) -> None:

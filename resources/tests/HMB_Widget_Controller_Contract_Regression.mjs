@@ -877,9 +877,10 @@ assert.match(
   /export function hmbDeliverPickerStateIfMounted\(container, onChange, value\)[\s\S]*?container\.__hmbVideoPickerDeleted === true[\s\S]*?onChange\(value\)/,
   "A deleted Picker must refuse late widget publications while a mounted Picker still delivers them.",
 );
-assert.match(videoSource, /shell\?\.__hmbPickerCommandBridge/);
+assert.match(videoSource, /__hmbVideoPickerCommandBridgeRegistryV1/);
 assert.match(commandSource, /return props\.onChange\(command\)/);
-assert.match(commandSource, /shell\.__hmbPickerCommandBridge = \{ token, dispatch \}/);
+assert.match(commandSource, /registry\?\.set\(runtimeInstanceId, \{ token, dispatch \}\)/);
+assert.doesNotMatch(commandSource, /__hmbPickerCommandBridge|react-flow|shell\.style|nodeRoot\.style/);
 assert.doesNotMatch(videoSource, /pending_action:\s*"(?:read_scene|run_video|render_snapshot|stop_read)"/);
 assert.doesNotMatch(videoSource, /commitAndRemount/);
 assert.doesNotMatch(videoSource, /HMBVideoPickerLibraryWidget\(container,\s*\{/);
@@ -1389,46 +1390,28 @@ for (const source of [videoSource, promptSource]) {
 }
 assert.match(videoSource, /class="hmbvp-clip nodrag"/);
 assert.match(promptSource, /class="hmb-dashboard-clip nodrag"/);
-assert.match(videoSource, /hmbApplyPickerInitialNodeSizeOnce\(container\);\s*concealNativeMayaPicker\(container\);/);
-assert.match(videoSource, /shell\.style\.width = `\$\{HMB_DEFAULT_NODE_WIDTH\}px`/);
-assert.match(videoSource, /shell\.style\.height = `\$\{HMB_DEFAULT_NODE_HEIGHT\}px`/);
-assert.doesNotMatch(videoSource, /shell\.style\.width = `\$\{targetWidth\}px`/);
+assert.match(
+  videoSource,
+  /function hmbApplyPickerInitialNodeSizeOnce\(container\) \{\s*void container;\s*\}/,
+  "The retained bootstrap helper must be a no-op and cannot resize the outer node.",
+);
 assert.match(
   videoSource,
   /export function hmbAlignPickerOuterBottom\(container, preferredShell = null, allowShrink = true\)/,
-  "Picker must expose the settled-layout outer-bottom alignment helper.",
+  "The compatibility surface remains available while outer alignment is disabled.",
 );
 assert.match(
   videoSource,
-  /pickerRect\.bottom \|\| 0\) - Number\(shellRect\.bottom \|\| 0\)/,
-  "Outer-bottom alignment must use the rendered visual endpoint and React Flow bottom edges.",
+  /export function hmbAlignPickerOuterBottom[\s\S]*?return null;/,
+  "Outer-bottom alignment must be a no-op.",
 );
-assert.match(
-  videoSource,
-  /const pickerRect = picker\.getBoundingClientRect\?\.\(\);/,
-  "Picker outer alignment must use the dashboard's actual bottom edge.",
-);
-assert.match(videoSource, /shell\.style\.height = `\$\{targetHeight\}px`/);
-assert.match(videoSource, /shell\.style\.minHeight = `\$\{targetHeight\}px`/);
-assert.match(
-  videoSource,
-  /if \(shell\?\.style\) shell\.style\.minHeight = `\$\{HMB_MIN_NODE_HEIGHT\}px`/,
-  "Native node resizing must release the automatic slot-height floor.",
-);
-assert.match(videoSource, /let resizeApplying = false;/);
-assert.match(videoSource, /let pointerInteractionActive = false;/);
-assert.match(videoSource, /let nativeNodeResizeActive = false;/);
+assert.doesNotMatch(videoSource, /resizeApplying|pointerInteractionActive|nativeNodeResizeActive/);
 assert.doesNotMatch(commandSource, /HMB_PICKER_BOOTSTRAP_(?:WIDTH|HEIGHT)|hmbEnsurePickerBootstrapNode/);
 assert.doesNotMatch(commandSource, /window\.setTimeout/);
 assert.match(commandSource, /hmbCollapseCommandBridgeLayoutRow\(container\)/);
 assert.match(videoSource, /hmbApplyPickerCommandRowReclaim\(container\)/);
-assert.match(
-  videoSource,
-  /!hmbPickerBranchContainsVideoOutputs\(parameterBranch\.parentElement\)/,
-  "MAYA_SCENE row concealment must never collapse an ancestor that owns VIDEO output handles.",
-);
-assert.match(commandSource, /branchContainsVideoOutputs/);
-assert.match(videoSource, /VIDEO_OUT/);
+assert.doesNotMatch(videoSource, /hmbPickerBranchContainsVideoOutputs|hmbPickerLocalHostAncestors|findReactFlowNode/);
+assert.doesNotMatch(commandSource, /branchContainsVideoOutputs|findReactFlowNode/);
 
 assert.match(videoSource, /const HMB_PICKER_CONTENT_FALLBACK_HEIGHT = 960;/);
 assert.match(videoSource, /\.hmbvp-clip\{width:100%;height:100%;/);
@@ -1438,51 +1421,30 @@ assert.match(videoSource, /\.panel\{[\s\S]*?border-radius:10px/);
 assert.match(videoSource, /\.side-section\{[\s\S]*?border-radius:10px/);
 assert.doesNotMatch(videoSource, /class="statusbar"|\.statusbar\{|class="warnings"|\.warnings\{/,
   "Picker notifications must live only in Activity Log; no footer status bar or warning overlay may return.");
-assert.match(
-  videoSource,
-  /const availableShellHeight = shell[\s\S]*?hmbPickerAvailableHeightToShell\(container, shell\)/,
-  "The Picker frame must consume the current shell's actually available height after hidden rows collapse.",
-);
-assert.match(videoSource, /const required = Math\.max\(minimumRequired, availableShellHeight\);/);
-assert.doesNotMatch(
-  videoSource,
-  /const required = Math\.max\(minimumRequired, HMB_DEFAULT_NODE_HEIGHT\)/,
-  "Available-space fill must not force a saved 1151px user resize back to the 1200px start size.",
-);
 assert.match(videoSource, /hmbSetPickerStyleIfChanged\(clip, "height", `\$\{required\}px`\)/);
 assert.match(videoSource, /hmbSetPickerStyleIfChanged\(picker, "height", `\$\{required\}px`\)/);
-assert.match(videoSource, /hmbPickerLocalHostAncestors\(container\)\.forEach\(applyMinimum\)/);
 assert.doesNotMatch(videoSource, /layoutRow\.style\.setProperty\("flex", "1 1 0%", "important"\)/);
 assert.doesNotMatch(videoSource, /element\.style\.setProperty\("flex", `0 0 \$\{height\}px`, "important"\)/);
-assert.match(videoSource, /resizeObserver = new ResizeObserverClass\(\(\) => schedulePickerFit\(false\)\)/);
-assert.match(videoSource, /resizeObserver\.observe\(container\)/);
-assert.match(videoSource, /resizeObserver\.observe\(rightStackForResizeSync\)/);
-assert.match(videoSource, /resizeObserver\.observe\(centerStackForResizeSync\)/);
-assert.doesNotMatch(videoSource, /resizeObserver\.observe\(shell/);
-assert.match(videoSource, /hmbCollapseNativeMayaLayoutRows\(container, hosts\)/);
+assert.doesNotMatch(videoSource, /new ResizeObserverClass|updateNodeInternals|request-node-internals|react-flow/);
+assert.doesNotMatch(commandSource, /updateNodeInternals|request-node-internals|react-flow/);
+assert.match(videoSource, /export function hmbCollapseNativeMayaLayoutRows[\s\S]*?return 0;/);
 assert.doesNotMatch(videoSource, /transition-property:height,flex-basis/);
 assert.doesNotMatch(
   videoSource,
   /layoutRow\.style\.setProperty\("position", "absolute", "important"\)/,
 );
-assert.match(videoSource, /trailingSpacer\.style\.setProperty\("flex", "0 0 0px", "important"\)/);
+assert.doesNotMatch(videoSource, /trailingSpacer\.style\.setProperty/);
 assert.doesNotMatch(videoSource, /hmbPickerReclaimAppliedHeight|hmbPickerReclaimBaseHeight/);
 assert.doesNotMatch(
   videoSource,
-  /hmbAdjustPickerNodeHeightForVideoSlots|shell\.style\.setProperty\("height"/,
-  "Slot changes must not write React Flow height from the frontend.",
-);
-assert.match(videoSource, /hmbEnsurePickerNodeFits\(container, shellForResizeSync \|\| findReactFlowNode\(container\)\);/);
-assert.doesNotMatch(
-  videoSource,
-  /hmbEnsurePickerNodeFits\(container, shellForResizeSync \|\| findReactFlowNode\(container\)\);[\s\S]{0,260}?hmbAlignPickerOuterBottom\(/,
-  "Settled fitting must keep Prompt's fixed inner frame instead of bottom-edge chasing.",
+  /hmbAdjustPickerNodeHeightForVideoSlots|shell\.style|nodeRoot\.style/,
+  "VideoPicker must never write React Flow or outer-node geometry.",
 );
 assert.match(videoSource, /function hmbApplyPickerDominoResizeFrame\(container, startNodeHeight, startRequiredHeight\)/);
 assert.equal(
   (videoSource.match(/hmbApplyPickerDominoResizeFrame\(container, startNodeHeight, startRequiredHeight\)/g) || []).length,
-  3,
-  "Both Picker resize handles must use the shared Prompt-style domino frame.",
+  1,
+  "The compatibility domino helper remains defined but no outer resize handle invokes it.",
 );
 assert.doesNotMatch(videoSource, /outerBottomAlignTimer/);
 assert.match(videoSource, /const HMB_PICKER_MAX_SELECTED_VIDEOS = 10;/);
@@ -1492,15 +1454,9 @@ assert.doesNotMatch(videoSource, /hmb-picker-native-row-in/);
 assert.doesNotMatch(videoSource, /transition:height 180ms/);
 assert.match(videoSource, /hmbRenderPickerMarkup\([\s\S]*?container,[\s\S]*?hmbScopeWidgetStyleMarkup\(pickerMarkup, "\.hmbvp"\),[\s\S]*?\)/);
 assert.doesNotMatch(videoSource, /container\.innerHTML = `\s*<style>/);
-assert.match(
-  videoSource,
-  /hmbPickerLocalHostAncestors\(container\)\.forEach\(applyMinimum\)/,
-  "Stable v0.2.0 sizing propagates only the minimum content height.",
-);
 assert.match(videoSource, /container\.style\.maxWidth = "none"/);
 assert.match(videoSource, /container\.style\.overflow = "visible"/);
 assert.doesNotMatch(videoSource, /container\.style\.height = "100%"/);
-assert.match(videoSource, /concealNativeMayaPicker\(container\);\s*hmbEnsurePickerNodeFits/s);
 assert.doesNotMatch(videoSource, /initialFitTimers|\[80,\s*250,\s*750\]/);
 assert.match(agentSource, /compactAgentWidgetHost\(container\)/);
 assert.match(agentSource, /setProperty\("height",\s*"64px",\s*"important"\)/);
@@ -1509,10 +1465,10 @@ assert.doesNotMatch(videoSource, /data-resize-panel="outliner"/);
 assert.match(videoSource, /data-resize-panel="viewport"/);
 assert.match(videoSource, /right_section_heights:\s*heights/);
 assert.doesNotMatch(videoSource, /node_height:\s*latestNodeHeight/);
-assert.match(
+assert.doesNotMatch(
   videoSource,
   /function hmbApplyPickerDominoResizeFrame\(container, startNodeHeight, startRequiredHeight\)[\s\S]*?hmbApplyPickerOuterNodeHeight/,
-  "Only explicit Prompt-style panel resizing should drive outer-node height.",
+  "Panel resizing must remain inside VideoPicker and never drive outer-node height.",
 );
 assert.doesNotMatch(videoSource, /data-resize-section="log"/);
 assert.match(videoSource, /data-resize-section="color"/);

@@ -294,15 +294,15 @@ try {
   assert.equal(picker.hmbVideoPickerIsHostMeasurementClone(liveContainer), false);
   assert.equal(
     picker.hmbSyncVideoPickerHostMeasurement(liveContainer, populatedThreeShotState, true),
-    1,
-    "Expanded mode updates the sibling measurement controller on the same node.",
+    0,
+    "The live widget never reaches through the React Flow node to a sibling measurement controller.",
   );
-  assert.equal(box.style.height, "1151px");
+  assert.equal(box.style.height, "436px");
   assert.equal(shell.style.height, "1200px", "Expanded measurement cannot reposition or resize the shell.");
   assert.equal(
     picker.hmbSyncVideoPickerHostMeasurement(liveContainer, populatedThreeShotState, false),
-    1,
-    "Returning to compact mode reuses the dynamic compact measurement.",
+    0,
+    "Mode changes remain local to the visible widget.",
   );
   assert.equal(box.style.height, "436px");
   assert.equal(shell.style.height, "1200px");
