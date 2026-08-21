@@ -186,6 +186,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $repository = $env:GITHUB_REPOSITORY
           $archive = Join-Path $PWD "release/HMB_GP_Production_v0.6.42_Runtime.zip"
           $checksum = "$archive.sha256"
           if (-not (Test-Path -LiteralPath $archive) -or -not (Test-Path -LiteralPath $checksum)) {
@@ -202,17 +203,19 @@ jobs:
 
           Close Griptape completely before running the included installer.
           '@ | Set-Content -LiteralPath $notesPath -Encoding utf8
-          gh release view $env:GITHUB_REF_NAME *> $null
+          gh release view $env:GITHUB_REF_NAME --repo $repository *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:GITHUB_REF_NAME $archive $checksum --clobber
+            gh release upload $env:GITHUB_REF_NAME $archive $checksum --clobber --repo $repository
             gh release edit $env:GITHUB_REF_NAME `
               --title "HMB GP Production $env:GITHUB_REF_NAME" `
               --notes-file $notesPath `
-              --latest
+              --latest `
+              --repo $repository
           } else {
             gh release create $env:GITHUB_REF_NAME $archive $checksum `
               --verify-tag `
               --title "HMB GP Production $env:GITHUB_REF_NAME" `
               --notes-file $notesPath `
-              --latest
+              --latest `
+              --repo $repository
           }
