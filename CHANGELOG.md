@@ -1,5 +1,37 @@
 # Changelog
 
+## `v0.6.45` — 2026-08-21
+
+- Restored the native model-specific Seedance selector contract. Seedance
+  2.0/2.0 Fast expose `Input Mode` with `Text Only`, `First/Last Frame`, and
+  `Multimodal References`; Seedance 2.5 exposes `Task` with `Reference to
+  Video`, `Video Editing`, and `Video Extension`. The paired hidden value stays
+  synchronized so saved workflows and model switching preserve their intent.
+- Added stock-style manual Reference Images, Reference Videos, and Reference
+  Audio lists for `Only`. Numbered `Shot` mode preserves those authored values
+  without using or deleting them, resolves only the exact same-Shot ImageAsset
+  and VideoPicker publications, and forces the effective task to
+  `Reference to Video` without changing the authored Only task.
+- Added Seedance 2.5 verified MP4/MOV local output and optional verified local
+  PNG last-frame output. The output container must match its extension, prior
+  successful media remains available until atomic replacement succeeds, and
+  signed Broker result URLs are not persisted in node output or logs.
+- Added an authenticated Broker capability gate for task-declared 2.5
+  Reference-to-Video, Editing, Extension, MOV, and returned-last-frame
+  requests. R2V now declares `omni_reference_task_type=reference`, matching the
+  stock 2.5 proxy; missing or mismatched capability contracts fail closed
+  before reference upload or billable submission, while the 2.0/2.0 Fast
+  multimodal request schema remains intact.
+- Added native MOV-preview fallback text and promoted the full Seedance
+  generator plus Picker-to-Seedance integration regressions into the public
+  Windows release gate.
+- Restored native image/video/audio colours on Seedance's manual reference
+  rows, renamed the verified video connector label to `video_url`, and restored
+  the native last-frame image preview when `Return Last Frame` is enabled.
+- Deferred the preview overlay's `기존 작업 결과 확인` command until after the
+  current UI value-set transaction, preventing the recovery action from
+  re-entering and stalling Griptape while preserving same-task retrieval only.
+
 ## `v0.6.43` — 2026-08-21
 
 - Added HMB Seedance Generation 2.5 with the official BytePlus saved-model

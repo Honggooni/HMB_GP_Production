@@ -112,6 +112,8 @@ export function hmbSeedancePreviewPresentation(value, options = {}) {
   const generation = hmbSeedanceGenerationPreview(value);
   const playableVideo = options.playableVideo === true;
   const visibleVideo = options.visibleVideo === true;
+  const previewError = options.previewError === true;
+  const mediaFormat = text(options.mediaFormat, 16).toLowerCase();
   const elapsed = elapsedLabel(generation.elapsed_seconds);
   const base = {
     visible: true,
@@ -168,15 +170,24 @@ export function hmbSeedancePreviewPresentation(value, options = {}) {
         tone: "error",
       };
     case "succeeded":
-      return playableVideo
-        ? { ...base, visible: false, action: "none" }
-        : {
-            ...base,
-            title: "완료 영상을 준비 중…",
-            detail: base.detail || "영상이 재생 가능해지는 즉시 표시합니다.",
-            busy: true,
-            action: "none",
-          };
+      if (playableVideo) return { ...base, visible: false, action: "none" };
+      if (previewError && mediaFormat === "mov") {
+        return {
+          ...base,
+          title: "MOV 저장 완료 · 내장 미리보기 불가",
+          detail: "파일은 정상 저장되었습니다. 외부 플레이어에서 MOV 파일을 여세요.",
+          busy: false,
+          tone: "warning",
+          action: "none",
+        };
+      }
+      return {
+        ...base,
+        title: "완료 영상을 준비 중…",
+        detail: base.detail || "영상이 재생 가능해지는 즉시 표시합니다.",
+        busy: true,
+        action: "none",
+      };
     default:
       return { ...base, visible: false, action: "none" };
   }
@@ -482,6 +493,12 @@ function videoIdentity(video) {
   );
 }
 
+function videoMediaFormat(identity) {
+  const path = text(identity, 2048).toLowerCase().split(/[?#]/, 1)[0];
+  const extension = path.match(/\.([a-z0-9]{2,8})$/)?.[1] || "";
+  return extension === "mov" || extension === "mp4" ? extension : "";
+}
+
 function setElementText(element, value) {
   const next = String(value || "");
   if (element && element.textContent !== next) element.textContent = next;
@@ -544,6 +561,7 @@ function removePreviewVideoListeners(container) {
   binding.video?.removeEventListener?.("canplay", binding.onCanPlay);
   binding.video?.removeEventListener?.("loadeddata", binding.onCanPlay);
   binding.video?.removeEventListener?.("emptied", binding.onEmptied);
+  binding.video?.removeEventListener?.("error", binding.onError);
   delete container.__hmbSeedancePreviewVideoBinding;
 }
 
@@ -573,13 +591,16 @@ function bindPreviewVideo(container, video) {
     video,
     identity,
     canPlay: Number(video.readyState) >= 3,
+    previewError: Boolean(video.error),
     awaitingRevision: null,
     confirmedRevision: null,
     onCanPlay: null,
     onEmptied: null,
+    onError: null,
   };
   binding.onCanPlay = () => {
     binding.canPlay = true;
+    binding.previewError = false;
     if (binding.awaitingRevision !== null) {
       binding.confirmedRevision = binding.awaitingRevision;
     }
@@ -587,11 +608,18 @@ function bindPreviewVideo(container, video) {
   };
   binding.onEmptied = () => {
     binding.canPlay = false;
+    binding.previewError = false;
+    schedulePreviewSync(container);
+  };
+  binding.onError = () => {
+    binding.canPlay = false;
+    binding.previewError = true;
     schedulePreviewSync(container);
   };
   video.addEventListener?.("canplay", binding.onCanPlay);
   video.addEventListener?.("loadeddata", binding.onCanPlay);
   video.addEventListener?.("emptied", binding.onEmptied);
+  video.addEventListener?.("error", binding.onError);
   container.__hmbSeedancePreviewVideoBinding = binding;
 }
 
@@ -678,15 +706,19 @@ export function hmbSeedanceRequestExistingResult(container) {
     || typeof props.onChange !== "function"
     || previewActionPending(container, generation)
   ) return false;
-  container.__hmbSeedancePreviewActionPending = {
+  const pendingRequest = {
     job_id: generation.job_id,
     phase: generation.phase,
     media_revision: generation.media_revision,
   };
+  container.__hmbSeedancePreviewActionPending = pendingRequest;
   delete container.__hmbSeedancePreviewActionError;
   clearTimeout(container.__hmbSeedancePreviewActionTimeout);
+  clearTimeout(container.__hmbSeedancePreviewActionDispatchTimeout);
+  delete container.__hmbSeedancePreviewActionDispatchTimeout;
   if (typeof setTimeout === "function") {
     container.__hmbSeedancePreviewActionTimeout = setTimeout(() => {
+      if (container.__hmbSeedancePreviewActionPending !== pendingRequest) return;
       delete container.__hmbSeedancePreviewActionPending;
       delete container.__hmbSeedancePreviewActionTimeout;
       schedulePreviewSync(container);
@@ -694,11 +726,11 @@ export function hmbSeedanceRequestExistingResult(container) {
     container.__hmbSeedancePreviewActionTimeout?.unref?.();
   }
   schedulePreviewSync(container);
-  const request = { ...state, request: { action: "refresh_existing" } };
-  let result;
-  try {
-    result = props.onChange(request);
-  } catch (error) {
+  const rejectRequest = (error) => {
+    if (
+      container.__hmbSeedancePreviewDisposed
+      || container.__hmbSeedancePreviewActionPending !== pendingRequest
+    ) return;
     clearTimeout(container.__hmbSeedancePreviewActionTimeout);
     delete container.__hmbSeedancePreviewActionTimeout;
     delete container.__hmbSeedancePreviewActionPending;
@@ -707,19 +739,40 @@ export function hmbSeedanceRequestExistingResult(container) {
       240,
     );
     schedulePreviewSync(container);
-    return false;
-  }
-  if (result && typeof result.then === "function") {
-    Promise.resolve(result).catch((error) => {
-      clearTimeout(container.__hmbSeedancePreviewActionTimeout);
-      delete container.__hmbSeedancePreviewActionTimeout;
-      delete container.__hmbSeedancePreviewActionPending;
-      container.__hmbSeedancePreviewActionError = text(
-        error?.message || error || "Existing task refresh failed",
-        240,
-      );
-      schedulePreviewSync(container);
-    });
+  };
+  const dispatch = () => {
+    delete container.__hmbSeedancePreviewActionDispatchTimeout;
+    if (container.__hmbSeedancePreviewDisposed) return;
+    const liveProps = container.__hmbSeedanceLatestProps || {};
+    const liveGeneration = hmbSeedanceShotState(liveProps).generation;
+    if (
+      container.__hmbSeedancePreviewActionPending !== pendingRequest
+      || !previewActionPending(container, liveGeneration)
+    ) return;
+    if (typeof liveProps.onChange !== "function") {
+      rejectRequest("Existing task refresh is unavailable");
+      return;
+    }
+    let result;
+    try {
+      // This parameter also stores durable Shot state. Send only the one-shot
+      // command shape that Python explicitly recognizes, never a browser copy
+      // of the authoritative catalog or Broker task identity.
+      result = liveProps.onChange({ request: { action: "refresh_existing" } });
+    } catch (error) {
+      rejectRequest(error);
+      return;
+    }
+    if (result && typeof result.then === "function") {
+      Promise.resolve(result).catch(rejectRequest);
+    }
+  };
+  if (typeof setTimeout === "function") {
+    // Yield the click/value-set stack so the pending UI can paint and Python's
+    // retained-mode transaction cannot be re-entered by this button handler.
+    container.__hmbSeedancePreviewActionDispatchTimeout = setTimeout(dispatch, 0);
+  } else {
+    Promise.resolve().then(dispatch);
   }
   return true;
 }
@@ -765,6 +818,8 @@ export function hmbSeedanceSyncPreviewOverlay(container, state, onRetrieve = nul
   const presentation = hmbSeedancePreviewPresentation(generation, {
     visibleVideo,
     playableVideo,
+    previewError: binding?.previewError === true,
+    mediaFormat: videoMediaFormat(identity),
   });
   let overlay = region.querySelector?.(".hmb-seedance-preview-overlay");
   if (!presentation.visible) {
@@ -828,6 +883,10 @@ export function hmbSeedanceCleanupPreviewOverlay(container) {
   delete container.__hmbSeedancePreviewObserver;
   clearTimeout(container.__hmbSeedancePreviewActionTimeout);
   delete container.__hmbSeedancePreviewActionTimeout;
+  clearTimeout(container.__hmbSeedancePreviewActionDispatchTimeout);
+  delete container.__hmbSeedancePreviewActionDispatchTimeout;
+  delete container.__hmbSeedancePreviewActionPending;
+  delete container.__hmbSeedancePreviewActionError;
   removePreviewVideoListeners(container);
   const region = container.__hmbSeedancePreviewRegion;
   region?.querySelector?.(".hmb-seedance-preview-overlay")?.remove?.();

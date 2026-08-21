@@ -1,6 +1,6 @@
 # HMB GP Production
 
-Current technical release: `v0.6.43`.
+Current technical release: `v0.6.45`.
 
 HMBAgentLibrary keeps Korean authoring input intact inside the private Prompt
 contract, but its final video-generator instruction is English-only. Prompt
@@ -9,16 +9,32 @@ unchanged valid VideoPicker catalog remains ready instead of becoming a false
 missing-source failure.
 
 HMBSeedanceGeneration supports Seedance 2.0, 2.0 Fast, and 2.5 through the
-authenticated FN AI Broker. Seedance 2.5 defaults to 720p, offers optional
-1080p 10-bit HEVC, accepts explicit 4-30 second duration, and supports up to
-30 image, 10 video, and 10 audio references, including audio-only input. The
-HMB 2.5 production profile intentionally omits 480p and smart duration. The
+authenticated FN AI Broker. Seedance 2.0/2.0 Fast expose the stock `Input Mode`
+choices `Text Only`, `First/Last Frame`, and `Multimodal References`. Seedance
+2.5 instead exposes the stock `Task` choices, including `Reference to Video`,
+`Video Editing`, and `Video Extension`. In `Only`, those operations use the
+node's manually authored image, video, audio, and frame references. In a
+numbered `Shot`, manual media is preserved but ignored and generation resolves
+only the exact same-Shot ImageAsset and VideoPicker publications as 2.0
+multimodal reference or 2.5 `Reference to Video`, according to the model.
+
+Seedance 2.5 defaults to 720p, offers optional 1080p 10-bit HEVC, accepts
+explicit 4-30 second duration, and supports up to 30 image, 10 video, and 10
+audio references, including audio-only input where the selected task permits
+it. The HMB 2.5 production profile intentionally omits 480p and smart duration.
+It can save verified MP4 or MOV output and, when requested, a separately
+verified local PNG last frame; signed result URLs are never persisted. The
 existing Seedance 2.0 limits and saved three-port video compatibility contract
-remain unchanged. The Broker must authorize the exact 2.5 model server-side.
-The native video preview now reports submission, render, retrieval, download,
-verification, cancellation, timeout, and failure states. A completed prior
-video remains visible while a new task runs, and the recovery action checks the
-existing authoritative task without submitting a duplicate generation.
+remain unchanged. Task-declared 2.5 Reference-to-Video, Editing, Extension,
+MOV, and last-frame requests require an exact authenticated Broker capability
+contract and fail closed before media upload or billable submission when that
+contract is unavailable.
+
+The native video preview reports submission, render, retrieval, download,
+verification, cancellation, timeout, failure, and unsupported local MOV
+preview states. A completed prior video remains visible while a new task runs,
+and the recovery action checks the existing authoritative task without
+submitting a duplicate generation.
 
 HMBVideoPickerLibrary opens in expanded authoring mode on its first mount. Its
 expanded UI is isolated from the React Flow canvas; switching to the compact
@@ -60,7 +76,7 @@ running the installer: those overlay methods retain obsolete development
 files. The installed `resources` tree contains only Maya runtime support, the
 Picker catalog, and the pinned public Broker CA.
 
-All files inside the v0.6.43 ZIP use the actual local package-build time. The
+All files inside the v0.6.45 ZIP use the actual local package-build time. The
 builder records one uniform ZIP-compatible timestamp (two-second resolution),
 so Windows Explorer shows the real build hour and minute instead of a fixed
 midnight value. Verify an installation with `metadata.library_version`,

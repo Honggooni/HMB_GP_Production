@@ -89,6 +89,23 @@ assert.equal(
   false,
   "The completed overlay may disappear only after the video is actually playable.",
 );
+const unsupportedMovPreview = widget.hmbSeedancePreviewPresentation(
+  generation("succeeded"),
+  {
+    playableVideo: false,
+    visibleVideo: true,
+    previewError: true,
+    mediaFormat: "mov",
+  },
+);
+assert.equal(unsupportedMovPreview.visible, true);
+assert.equal(unsupportedMovPreview.busy, false);
+assert.equal(unsupportedMovPreview.tone, "warning");
+assert.equal(unsupportedMovPreview.title, "MOV 저장 완료 · 내장 미리보기 불가");
+assert.equal(
+  unsupportedMovPreview.detail,
+  "파일은 정상 저장되었습니다. 외부 플레이어에서 MOV 파일을 여세요.",
+);
 
 for (const phase of ["cancelled_locally", "timed_out", "submission_unknown"]) {
   const presentation = widget.hmbSeedancePreviewPresentation(generation(phase, {
@@ -380,7 +397,71 @@ assert.equal(
 );
 widget.hmbSeedanceCleanupPreviewOverlay(sameSourceFixture.container);
 
+// ParameterVideo is type-compatible with MOV, but the embedded Chromium codec
+// set may reject a real provider MOV/10-bit HEVC stream on some team PCs. The
+// saved result must not look like an endless render in that case, and no local
+// or signed URL may be copied into visible overlay text.
+const movFallbackFixture = previewFixture();
+const movFallbackVideo = element("video");
+movFallbackVideo.src = (
+  "http://127.0.0.1:8124/external/seedance-result.mov"
+  + "?token=must-not-enter-overlay"
+);
+movFallbackVideo.currentSrc = movFallbackVideo.src;
+movFallbackVideo.readyState = 0;
+movFallbackFixture.region.append(movFallbackVideo);
+const movCompleted = generation("succeeded", {
+  has_existing_video: true,
+  media_revision: 8,
+});
+movFallbackFixture.container.__hmbSeedanceLatestProps = {
+  value: {
+    schema: "hmb-seedance-shot-ui",
+    schema_version: 2,
+    shot_catalog: {},
+    shot: {},
+    generation: movCompleted,
+  },
+};
+widget.hmbSeedanceSyncPreviewOverlay(movFallbackFixture.container, {
+  generation: movCompleted,
+});
+assert.ok(movFallbackFixture.region.querySelector(".hmb-seedance-preview-overlay"));
+movFallbackVideo.error = { code: 4 };
+movFallbackVideo.fire("error");
+await Promise.resolve();
+await Promise.resolve();
+const movFallbackOverlay = movFallbackFixture.region.querySelector(
+  ".hmb-seedance-preview-overlay",
+);
+assert.ok(movFallbackOverlay, "A native MOV codec error must retain an actionable overlay.");
+assert.equal(movFallbackOverlay.dataset.tone, "warning");
+assert.equal(movFallbackOverlay.dataset.busy, "false");
+assert.equal(
+  movFallbackOverlay.querySelector(".hmb-seedance-preview-overlay__title").textContent,
+  "MOV 저장 완료 · 내장 미리보기 불가",
+);
+const movFallbackVisibleText = [
+  movFallbackOverlay.querySelector(".hmb-seedance-preview-overlay__title").textContent,
+  movFallbackOverlay.querySelector(".hmb-seedance-preview-overlay__detail").textContent,
+].join(" ");
+assert.doesNotMatch(movFallbackVisibleText, /127\.0\.0\.1|token=|seedance-result/i);
+
+// A late codec installation/source replacement can still make the same MOV
+// playable. Its own canplay event should then clear the fallback normally.
+movFallbackVideo.error = null;
+movFallbackVideo.readyState = 3;
+movFallbackVideo.fire("canplay");
+await Promise.resolve();
+await Promise.resolve();
+assert.equal(
+  movFallbackFixture.region.querySelector(".hmb-seedance-preview-overlay"),
+  null,
+);
+widget.hmbSeedanceCleanupPreviewOverlay(movFallbackFixture.container);
+
 const refreshRequests = [];
+let insideRefreshClickStack = true;
 const refreshGeneration = generation("cancelled_locally", {
   action: "refresh_existing",
   has_existing_video: true,
@@ -394,7 +475,14 @@ fixture.container.__hmbSeedanceLatestProps = {
     shot: {},
     generation: refreshGeneration,
   },
-  onChange(request) { refreshRequests.push(request); },
+  onChange(request) {
+    assert.equal(
+      insideRefreshClickStack,
+      false,
+      "Refresh publication must be deferred beyond the button click stack.",
+    );
+    refreshRequests.push(request);
+  },
 };
 widget.hmbSeedanceSyncPreviewOverlay(fixture.container, {
   generation: refreshGeneration,
@@ -404,7 +492,22 @@ const refreshButton = overlay.querySelector("[data-hmb-seedance-preview-action]"
 assert.equal(refreshButton.style.getPropertyValue("display"), "");
 refreshButton.fire("click");
 refreshButton.fire("click");
+assert.equal(
+  refreshRequests.length,
+  0,
+  "The click handler must return before entering Griptape's value-set transaction.",
+);
+insideRefreshClickStack = false;
+await Promise.resolve();
+assert.equal(refreshButton.disabled, true);
+assert.equal(refreshButton.textContent, "기존 작업 확인 중…");
+await new Promise((resolve) => setTimeout(resolve, 0));
 assert.equal(refreshRequests.length, 1, "One UI pulse must produce at most one backend refresh request.");
+assert.deepEqual(
+  refreshRequests[0],
+  { request: { action: "refresh_existing" } },
+  "The transient action must not republish the durable Shot/catalog state.",
+);
 assert.deepEqual(refreshRequests[0].request, { action: "refresh_existing" });
 assert.equal(
   Object.keys(refreshRequests[0].request).includes("job_id"),

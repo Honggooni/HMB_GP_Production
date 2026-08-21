@@ -76,6 +76,7 @@ def _install_clean_ci_griptape_stubs() -> None:
 
     if griptape_missing:
         artifacts = package("griptape.artifacts")
+        artifacts.ImageUrlArtifact = StubValue
         artifacts.VideoUrlArtifact = StubValue
         module(
             "griptape.artifacts.video_url_artifact",
@@ -153,6 +154,18 @@ import HMBVideoPickerLibrary as picker_target
 
 CHANNEL = "11111111-1111-4111-8111-111111111111"
 SHOT = "22222222-2222-4222-8222-222222222222"
+TASK_TEXT_ONLY = "Text Only"
+TASK_FIRST_LAST_FRAME = "First/Last Frame"
+TASK_REFERENCE_TO_VIDEO = "Reference to Video"
+TASK_VIDEO_EDITING = "Video Editing"
+TASK_VIDEO_EXTENSION = "Video Extension"
+TASK_STORAGE_CHOICES = (
+    TASK_TEXT_ONLY,
+    TASK_FIRST_LAST_FRAME,
+    TASK_REFERENCE_TO_VIDEO,
+    TASK_VIDEO_EDITING,
+    TASK_VIDEO_EXTENSION,
+)
 
 
 def canonical(value: Any) -> str:
@@ -304,10 +317,29 @@ node = generator(image, picker)
 
 # No Agent or Prompt node participates. Prompt text remains exactly the public
 # direct/manual input, while media order comes from the two exact Shot sources.
-resolved = node._resolve_exact_shot_generation_inputs({"prompt": "manual Agent text"})
+resolved = node._resolve_exact_shot_generation_inputs(
+    {
+        "prompt": "manual Agent text",
+        "model_id": target.SEEDANCE_2_5_MODEL_ID,
+        "task": TASK_VIDEO_EDITING,
+        "duration": -1,
+        "first_frame": "manual-first-frame-must-not-leak",
+        "last_frame": "manual-last-frame-must-not-leak",
+        "reference_images": ["manual-image-must-not-leak"],
+        "video_references": ["manual-video-must-not-leak"],
+        "video_reference_slots": ["manual-slot-must-not-leak"],
+        "reference_audio": ["manual-audio-must-not-leak"],
+    }
+)
 assert resolved["prompt"] == "manual Agent text"
+assert resolved["task"] == TASK_REFERENCE_TO_VIDEO
+assert resolved["duration"] == 5
+assert resolved["first_frame"] is None
+assert resolved["last_frame"] is None
 assert resolved["reference_images"] == ["@image2", "@image1"]
 assert resolved["video_references"] == ["@video1"]
+assert resolved["video_reference_slots"] == []
+assert resolved["reference_audio"] == []
 assert resolved["input_mode"] == target.INPUT_MODE_MULTIMODAL_REFERENCES
 
 
@@ -315,6 +347,7 @@ def valid_params(*, prompt: str = "") -> dict[str, Any]:
     return {
         "resume_generation_id": "",
         "model_id": target.SEEDANCE_2_0_MODEL_ID,
+        "task": TASK_TEXT_ONLY,
         "input_mode": target.INPUT_MODE_TEXT_ONLY,
         "prompt": prompt,
         "first_frame": None,
@@ -368,6 +401,32 @@ assert target.DURATION_STORAGE_CHOICES == (-1, *range(4, 31))
 assert SEEDANCE_2_5_MODEL_ID in target.BROKER_SUPPORTED_MODEL_IDS
 assert SEEDANCE_2_5_BYTEPLUS_ALIAS not in target.BROKER_SUPPORTED_MODEL_IDS
 assert SEEDANCE_2_5_MODEL_ID in target._HMBAIBrokerBridge._MODEL_GENERATION_FIELDS
+assert target.TASK_PARAMETER == "task"
+assert target.TASK_TEXT_ONLY == TASK_TEXT_ONLY
+assert target.TASK_FIRST_LAST_FRAME == TASK_FIRST_LAST_FRAME
+assert target.TASK_REFERENCE_TO_VIDEO == TASK_REFERENCE_TO_VIDEO
+assert target.TASK_VIDEO_EDITING == TASK_VIDEO_EDITING
+assert target.TASK_VIDEO_EXTENSION == TASK_VIDEO_EXTENSION
+assert target.TASK_STORAGE_CHOICES == TASK_STORAGE_CHOICES
+assert target.MODEL_TASK_CHOICES == {
+    target.SEEDANCE_2_0_MODEL_ID: TASK_STORAGE_CHOICES[:3],
+    target.SEEDANCE_2_0_FAST_MODEL_ID: TASK_STORAGE_CHOICES[:3],
+    target.SEEDANCE_2_5_MODEL_ID: TASK_STORAGE_CHOICES,
+}
+assert "task" in target._HMBAIBrokerBridge._ALLOWED_GENERATION_FIELDS
+assert "omni_reference_task_type" in target._HMBAIBrokerBridge._MODEL_GENERATION_FIELDS[
+    target.SEEDANCE_2_5_MODEL_ID
+]
+assert "task" not in target._HMBAIBrokerBridge._MODEL_GENERATION_FIELDS[
+    target.SEEDANCE_2_5_MODEL_ID
+]
+for broker_model_id in (
+    target.SEEDANCE_2_0_MODEL_ID,
+    target.SEEDANCE_2_0_FAST_MODEL_ID,
+):
+    assert "task" not in target._HMBAIBrokerBridge._MODEL_GENERATION_FIELDS[
+        broker_model_id
+    ]
 for retired_model in target.RETIRED_SEEDANCE_MODEL_VALUES:
     assert target.MODEL_ID_ALIASES[retired_model] == target.SEEDANCE_2_0_MODEL_ID
 
@@ -386,6 +445,7 @@ def hydration_probe() -> tuple[
         "model_id": target.MODEL_NAME_SEEDANCE_2_0,
         "resolution": "4k",
         "duration": 5,
+        "task": TASK_REFERENCE_TO_VIDEO,
     }
     parameters = {
         "model_id": types.SimpleNamespace(
@@ -402,6 +462,9 @@ def hydration_probe() -> tuple[
         ),
         "duration": types.SimpleNamespace(
             ui_options={"simple_dropdown": [-1, *range(4, 16)]}
+        ),
+        "task": types.SimpleNamespace(
+            ui_options={"simple_dropdown": list(TASK_STORAGE_CHOICES)}
         ),
     }
     probe = object.__new__(target.HMBSeedanceGeneration)
@@ -561,6 +624,64 @@ try:
             *range(4, 16),
         ]
 
+    # Task and model values are independent serialized/connected inputs, so
+    # neither replay order may lose a 2.5-only task before the model arrives.
+    # The visible dropdown is narrowed only after both values are available.
+    for task_hydration_order in (
+        (
+            ("model_id", SEEDANCE_2_5_BYTEPLUS_ALIAS),
+            ("task", TASK_VIDEO_EDITING),
+        ),
+        (
+            ("task", TASK_VIDEO_EDITING),
+            ("model_id", SEEDANCE_2_5_BYTEPLUS_ALIAS),
+        ),
+    ):
+        task_probe, task_state, task_parameters = hydration_probe()
+        for parameter_name, saved_value in task_hydration_order:
+            task_probe.set_parameter_value(
+                parameter_name,
+                saved_value,
+                initial_setup=True,
+            )
+        task_probe._synchronize_model_resolution()
+        assert task_state["model_id"] == target.MODEL_NAME_SEEDANCE_2_5
+        assert task_state["task"] == TASK_VIDEO_EDITING
+        assert task_parameters["task"].ui_options["simple_dropdown"] == list(
+            TASK_STORAGE_CHOICES
+        )
+
+    # A stale 2.5-only task cannot survive hydration under either 2.0 model.
+    # Fall back to Reference to Video, which preserves the former Multimodal
+    # References meaning and is valid for both legacy models.
+    for legacy_model_name in (
+        target.MODEL_NAME_SEEDANCE_2_0,
+        target.MODEL_NAME_SEEDANCE_2_0_FAST,
+    ):
+        for task_hydration_order in (
+            (
+                ("model_id", legacy_model_name),
+                ("task", TASK_VIDEO_EXTENSION),
+            ),
+            (
+                ("task", TASK_VIDEO_EXTENSION),
+                ("model_id", legacy_model_name),
+            ),
+        ):
+            task_probe, task_state, task_parameters = hydration_probe()
+            for parameter_name, saved_value in task_hydration_order:
+                task_probe.set_parameter_value(
+                    parameter_name,
+                    saved_value,
+                    initial_setup=True,
+                )
+            task_probe._synchronize_model_resolution()
+            assert task_state["model_id"] == legacy_model_name
+            assert task_state["task"] == TASK_REFERENCE_TO_VIDEO
+            assert task_parameters["task"].ui_options["simple_dropdown"] == list(
+                TASK_STORAGE_CHOICES[:3]
+            )
+
     # A live model switch carries an explicit non-default quality forward, but
     # replaces the previous model's untouched default and invalid duration.
     switch_probe, switch_state, switch_parameters = hydration_probe()
@@ -615,6 +736,7 @@ seedance_2_5_audio_only = valid_params(prompt="2.5 audio-only reference")
 seedance_2_5_audio_only.update(
     {
         "model_id": SEEDANCE_2_5_MODEL_ID,
+        "task": TASK_REFERENCE_TO_VIDEO,
         "input_mode": target.INPUT_MODE_MULTIMODAL_REFERENCES,
         "duration": 30,
         "reference_audio": [
@@ -626,19 +748,127 @@ seedance_2_5_audio_only.update(
 validation_probe = object.__new__(target.HMBSeedanceGeneration)
 validation_probe._validate_parameters(seedance_2_5_audio_only)
 
-# Audio-only must survive the same resolver used by StartFlow and execution,
-# both with an active Shot subscription and without any Shot routing.
-seedance_2_5_audio_routed = generator(None, None)._resolve_exact_shot_generation_inputs(
-    seedance_2_5_audio_only,
-    verify_agent_prompt=False,
+
+def task_params(model_id: str, task_name: str) -> dict[str, Any]:
+    if task_name == TASK_VIDEO_EDITING:
+        prompt = f"edit the source video for {model_id}"
+    elif task_name == TASK_VIDEO_EXTENSION:
+        prompt = f"extend the source video for {model_id}"
+    else:
+        prompt = f"{model_id} {task_name}"
+    params = valid_params(prompt=prompt)
+    params["model_id"] = model_id
+    params["resolution"] = target.MODEL_DEFAULT_RESOLUTIONS[model_id]
+    params["task"] = task_name
+    if task_name == TASK_TEXT_ONLY:
+        params["input_mode"] = target.INPUT_MODE_TEXT_ONLY
+    elif task_name == TASK_FIRST_LAST_FRAME:
+        params["input_mode"] = target.INPUT_MODE_FIRST_LAST_FRAME
+        params["first_frame"] = "https://media.example/task-first.png"
+    else:
+        params["input_mode"] = target.INPUT_MODE_MULTIMODAL_REFERENCES
+        if task_name == TASK_REFERENCE_TO_VIDEO:
+            params["reference_images"] = [
+                "https://media.example/task-reference.png"
+            ]
+        else:
+            params["video_references"] = [
+                "https://media.example/task-source.mp4"
+            ]
+            if task_name in {TASK_VIDEO_EDITING, TASK_VIDEO_EXTENSION}:
+                params["duration"] = -1
+    return params
+
+
+# Only mode exposes exactly three tasks on both 2.0 models and all five tasks
+# on 2.5. Validation, not dropdown coercion, remains the final fail-closed
+# boundary for a stale or programmatically supplied unsupported task.
+for model_id, allowed_tasks in (
+    (target.SEEDANCE_2_0_MODEL_ID, TASK_STORAGE_CHOICES[:3]),
+    (target.SEEDANCE_2_0_FAST_MODEL_ID, TASK_STORAGE_CHOICES[:3]),
+    (SEEDANCE_2_5_MODEL_ID, TASK_STORAGE_CHOICES),
+):
+    assert target.MODEL_TASK_CHOICES[model_id] == allowed_tasks
+    for task_name in allowed_tasks:
+        allowed_params = task_params(model_id, task_name)
+        validation_probe._validate_parameters(allowed_params)
+        assert validation_probe._build_broker_payload(allowed_params)["task"] == (
+            task_name
+        )
+
+# Stock 2.0 Multimodal References remains a valid prompt-only selection, while
+# 2.5 Reference-to-Video is a declared provider subtask and needs a reference.
+seedance_2_0_empty_multimodal = task_params(
+    target.SEEDANCE_2_0_MODEL_ID,
+    TASK_REFERENCE_TO_VIDEO,
 )
-assert seedance_2_5_audio_routed["input_mode"] == (
+seedance_2_0_empty_multimodal["reference_images"] = []
+seedance_2_0_empty_multimodal["video_references"] = []
+seedance_2_0_empty_multimodal["reference_audio"] = []
+validation_probe._validate_parameters(seedance_2_0_empty_multimodal)
+empty_multimodal_payload = validation_probe._build_broker_payload(
+    seedance_2_0_empty_multimodal
+)
+assert empty_multimodal_payload["input_mode"] == (
     target.INPUT_MODE_MULTIMODAL_REFERENCES
 )
-assert seedance_2_5_audio_routed["reference_audio"] == (
-    seedance_2_5_audio_only["reference_audio"]
+assert "image_urls" not in empty_multimodal_payload
+assert "video_urls" not in empty_multimodal_payload
+assert "audio_urls" not in empty_multimodal_payload
+
+seedance_2_5_empty_reference = task_params(
+    SEEDANCE_2_5_MODEL_ID,
+    TASK_REFERENCE_TO_VIDEO,
 )
-validation_probe._validate_parameters(seedance_2_5_audio_routed)
+seedance_2_5_empty_reference["reference_images"] = []
+try:
+    validation_probe._validate_parameters(seedance_2_5_empty_reference)
+except ValueError as exc:
+    assert "Reference to Video requires" in str(exc)
+else:
+    raise AssertionError("Seedance 2.5 accepted empty Reference-to-Video input.")
+
+for model_id in (
+    target.SEEDANCE_2_0_MODEL_ID,
+    target.SEEDANCE_2_0_FAST_MODEL_ID,
+):
+    for unsupported_task in (TASK_VIDEO_EDITING, TASK_VIDEO_EXTENSION):
+        try:
+            validation_probe._validate_parameters(
+                task_params(model_id, unsupported_task)
+            )
+        except ValueError as exc:
+            assert "task" in str(exc).casefold()
+        else:
+            raise AssertionError(
+                f"{model_id} accepted unsupported Only task {unsupported_task!r}."
+            )
+
+unknown_task = task_params(SEEDANCE_2_5_MODEL_ID, TASK_REFERENCE_TO_VIDEO)
+unknown_task["task"] = "Browser Supplied Unknown Task"
+try:
+    validation_probe._validate_parameters(unknown_task)
+except ValueError as exc:
+    assert "task" in str(exc).casefold()
+else:
+    raise AssertionError("Seedance accepted an unknown Task value.")
+
+# Manual audio is an Only-mode input. An active Shot with no exact ImageAsset or
+# VideoPicker source must fail instead of silently treating hidden audio as Shot
+# authority.
+try:
+    generator(None, None)._resolve_exact_shot_generation_inputs(
+        seedance_2_5_audio_only,
+        verify_agent_prompt=False,
+    )
+except RuntimeError as exc:
+    assert "direct media source" in str(exc)
+else:
+    raise AssertionError("Shot mode accepted hidden Only-mode reference audio.")
+
+# Audio-only remains valid in 2.5 Only mode and reaches the ordinary reference
+# payload without any Shot identity.
+seedance_2_5_audio_routed = deepcopy(seedance_2_5_audio_only)
 audio_only_payload = validation_probe._build_broker_payload(
     seedance_2_5_audio_routed
 )
@@ -688,6 +918,7 @@ seedance_2_5_nonadaptive_frames = valid_params(prompt="2.5 frame contract")
 seedance_2_5_nonadaptive_frames.update(
     {
         "model_id": SEEDANCE_2_5_MODEL_ID,
+        "task": TASK_FIRST_LAST_FRAME,
         "input_mode": target.INPUT_MODE_FIRST_LAST_FRAME,
         "first_frame": "https://media.example/first.png",
         "ratio": "16:9",
@@ -747,6 +978,7 @@ for field, values in (
     ),
 ):
     invalid = valid_params(prompt="2.0 reference bound")
+    invalid["task"] = TASK_REFERENCE_TO_VIDEO
     invalid["input_mode"] = target.INPUT_MODE_MULTIMODAL_REFERENCES
     invalid[field] = values
     if field == "reference_audio":
@@ -805,11 +1037,16 @@ validation_probe._validate_parameters(seedance_2_5_direct)
 # The billable payload and the bridge both use only HMB's canonical China-route
 # ID.  Priority remains absent until the Broker explicitly grants it to
 # 2.5; an arbitrary similarly named model must still fail closed.
-seedance_2_5_payload_params = valid_params(prompt="canonical 2.5 Broker payload")
+seedance_2_5_payload_params = valid_params(
+    prompt="edit the source in the canonical 2.5 Broker payload"
+)
 seedance_2_5_payload_params.update(
     {
         "model_id": SEEDANCE_2_5_MODEL_ID,
-        "duration": 30,
+        "task": TASK_VIDEO_EDITING,
+        "input_mode": target.INPUT_MODE_MULTIMODAL_REFERENCES,
+        "video_references": ["https://media.example/edit-source.mp4"],
+        "duration": -1,
         "resolution": target.MODEL_DEFAULT_RESOLUTIONS[SEEDANCE_2_5_MODEL_ID],
     }
 )
@@ -817,7 +1054,8 @@ seedance_2_5_payload = validation_probe._build_broker_payload(
     seedance_2_5_payload_params
 )
 assert seedance_2_5_payload["model"] == SEEDANCE_2_5_MODEL_ID
-assert seedance_2_5_payload["duration_seconds"] == 30
+assert seedance_2_5_payload["task"] == TASK_VIDEO_EDITING
+assert seedance_2_5_payload["duration_seconds"] == -1
 assert seedance_2_5_payload["quality"] == "720p"
 assert "priority" not in seedance_2_5_payload
 
@@ -837,6 +1075,20 @@ def capture_bridge_request(
     submission: bool = False,
     idempotency_key: str = "",
 ) -> dict[str, Any]:
+    if method == "GET":
+        assert path == target.BROKER_SEEDANCE_CAPABILITIES_PATH
+        assert payload is None
+        return {
+            "schema": target.BROKER_SEEDANCE_CAPABILITIES_SCHEMA,
+            "version": target.BROKER_SEEDANCE_CAPABILITIES_VERSION,
+            "models": {
+                SEEDANCE_2_5_MODEL_ID: {
+                    "tasks": list(target.TASK_BROKER_SLUGS.values()),
+                    "output_formats": ["mp4", "mov"],
+                    "return_last_frame": True,
+                }
+            },
+        }
     bridge_calls.append(
         {
             "method": method,
@@ -862,7 +1114,22 @@ assert bridge_calls[0]["path"] == "/api/v1/generate/video"
 assert bridge_calls[0]["submission"] is True
 assert bridge_calls[0]["payload"]["provider"] == "volcengine_ark"
 assert bridge_calls[0]["payload"]["model"] == SEEDANCE_2_5_MODEL_ID
+assert "task" not in bridge_calls[0]["payload"]
+assert bridge_calls[0]["payload"]["omni_reference_task_type"] == "edit"
 assert "priority" not in bridge_calls[0]["payload"]
+
+reference_bridge_payload = validation_probe._build_broker_payload(
+    task_params(SEEDANCE_2_5_MODEL_ID, TASK_REFERENCE_TO_VIDEO)
+)
+assert seedance_2_5_bridge.generate_seedance(
+    reference_bridge_payload,
+    timeout=17.0,
+) == {"id": "seedance-2-5-contract-probe"}
+assert len(bridge_calls) == 2
+assert bridge_calls[1]["payload"]["omni_reference_task_type"] == "reference"
+assert bridge_calls[1]["payload"]["output_format"] == "mp4"
+assert bridge_calls[1]["payload"]["return_last_frame"] is False
+assert "task" not in bridge_calls[1]["payload"]
 
 for forbidden_payload in (
     {**seedance_2_5_payload, "priority": 1},
@@ -1079,32 +1346,73 @@ empty_result = generator(image, empty_picker)._resolve_exact_shot_generation_inp
 assert empty_result["video_references"] == []
 assert empty_result["reference_images"] == ["@image2", "@image1"]
 
-# Only is a genuine prompt-only mode and clears every stale media field before
-# request validation or upload preparation.
-only = object.__new__(target.HMBSeedanceGeneration)
-only._reconcile_shared_shot_routing = lambda strict=False: {  # type: ignore[method-assign]
-    "ok": True,
-    "code": "only",
+# Only owns its manual media. The same authored dict can move through
+# Only -> Shot -> Only without mutation: Shot uses only exact source snapshots
+# and fixes its effective Task to Reference to Video, while returning to Only
+# restores the authored Task and every manual reference in its original order.
+transition = generator(image, picker)
+transition_mode = {"shot": False}
+
+
+def transition_subscription() -> dict[str, Any]:
+    if transition_mode["shot"]:
+        return {
+            "enabled": True,
+            "channel_uuid": CHANNEL,
+            "shot_uuid": SHOT,
+            "shot_number": 2,
+            "shot_name": "Second Shot",
+        }
+    return {
+        "enabled": False,
+        "channel_uuid": "",
+        "shot_uuid": "",
+        "shot_number": 1,
+        "shot_name": "Only",
+    }
+
+
+transition._hmb_shot_channel_subscription = transition_subscription  # type: ignore[method-assign]
+transition._clear_remote_prompt_authority = lambda _reason: None  # type: ignore[method-assign]
+authored_only = {
+    "prompt": "manual edit survives mode changes",
+    "task": TASK_VIDEO_EDITING,
+    "input_mode": target.INPUT_MODE_TEXT_ONLY,
+    "first_frame": None,
+    "last_frame": None,
+    "reference_images": ["manual-image-2", "manual-image-1"],
+    "video_references": ["manual-video-2", "manual-video-1"],
+    "video_reference_slots": ["manual-legacy-video"],
+    "reference_audio": ["manual-audio-2", "manual-audio-1"],
 }
-only._hmb_shot_channel_subscription = lambda: {  # type: ignore[method-assign]
-    "enabled": False,
-    "channel_uuid": "",
-    "shot_uuid": "",
-    "shot_number": 1,
-    "shot_name": "Only",
-}
-only._clear_remote_prompt_authority = lambda _reason: None  # type: ignore[method-assign]
-only_result = only._resolve_exact_shot_generation_inputs({
-    "prompt": "prompt only",
-    "reference_images": ["stale-image"],
-    "video_references": ["stale-video"],
-    "video_reference_slots": ["stale-slot"],
-})
-assert only_result["prompt"] == "prompt only"
-assert only_result["reference_images"] == []
-assert only_result["video_references"] == []
-assert only_result["video_reference_slots"] == []
-assert only_result["input_mode"] == target.INPUT_MODE_TEXT_ONLY
+authored_snapshot = deepcopy(authored_only)
+
+only_before = transition._resolve_exact_shot_generation_inputs(authored_only)
+assert only_before["prompt"] == authored_only["prompt"]
+assert only_before["task"] == TASK_VIDEO_EDITING
+assert only_before["reference_images"] == authored_only["reference_images"]
+assert only_before["video_references"] == authored_only["video_references"]
+assert only_before["video_reference_slots"] == authored_only["video_reference_slots"]
+assert only_before["reference_audio"] == authored_only["reference_audio"]
+assert only_before["input_mode"] == target.INPUT_MODE_MULTIMODAL_REFERENCES
+assert authored_only == authored_snapshot
+
+transition_mode["shot"] = True
+shot_middle = transition._resolve_exact_shot_generation_inputs(authored_only)
+assert shot_middle["task"] == TASK_REFERENCE_TO_VIDEO
+assert shot_middle["first_frame"] is None
+assert shot_middle["last_frame"] is None
+assert shot_middle["reference_images"] == ["@image2", "@image1"]
+assert shot_middle["video_references"] == ["@video1"]
+assert shot_middle["video_reference_slots"] == []
+assert shot_middle["reference_audio"] == []
+assert shot_middle["input_mode"] == target.INPUT_MODE_MULTIMODAL_REFERENCES
+assert authored_only == authored_snapshot
+
+transition_mode["shot"] = False
+only_after = transition._resolve_exact_shot_generation_inputs(authored_only)
+assert only_after == only_before
+assert authored_only == authored_snapshot
 
 # Exact UUID/name/number matching is fail-closed.
 bad_picker_snapshot = snapshot(

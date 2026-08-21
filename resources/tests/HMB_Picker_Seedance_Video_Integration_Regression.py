@@ -135,6 +135,7 @@ def assert_single_video_output_surface(destination: Any) -> None:
     assert preview.allowed_modes == {seedance.ParameterMode.PROPERTY}
     assert connector.allowed_modes == {seedance.ParameterMode.OUTPUT}
     assert connector.output_type == "VideoUrlArtifact"
+    assert connector.ui_options["display_name"] == "video_url"
 
     video_artifact_outputs = [
         parameter.name
@@ -151,18 +152,20 @@ def assert_single_video_input_surface(source: Any, destination: Any) -> None:
         seedance.VIDEO_REFERENCES_PARAMETER
     )
     assert source_output.output_type == "list[str]"
-    assert destination_input.type == "list[str]"
+    assert type(destination_input).__name__ == "ParameterList"
+    assert destination_input.type == "list[VideoUrlArtifact]"
     assert source_output.output_type in destination_input.input_types
     assert destination_input.allowed_modes == {seedance.ParameterMode.INPUT}
-    assert destination_input.hide is True
+    assert destination_input.hide is False
     assert destination_input.hide_property is True
-    assert destination_input.ui_options["display_name"] == ""
-    assert destination_input.ui_options["hide_handles"] is True
+    assert destination_input.ui_options["display_name"] == "Reference Videos"
+    assert destination_input.ui_options.get("hide_handles", False) is False
+    assert destination_input.ui_options.get("hide_label", False) is False
     assert seedance.LEGACY_VIDEO_REFERENCE_SLOTS == 3
     assert seedance.MAX_VIDEO_REFERENCES == 10
 
-    # Scalar ports remain hidden only for saved-workflow migration. The user has
-    # one visible list connector, so a Picker selection never needs re-wiring.
+    # Scalar ports remain hidden only for saved-workflow migration. Only mode
+    # exposes one list connector, so a Picker selection never needs re-wiring.
     for index in range(1, seedance.LEGACY_VIDEO_REFERENCE_SLOTS + 1):
         legacy = destination.get_parameter_by_name(f"reference_video_{index}")
         assert legacy.hide is True

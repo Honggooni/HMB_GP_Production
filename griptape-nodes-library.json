@@ -4,7 +4,7 @@
   "metadata": {
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.6.43",
+    "library_version": "0.6.45",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
       "archive_source_count": 29,
@@ -246,7 +246,7 @@
       "file_path": "HMBSeedanceGeneration.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "Generates Seedance video through FN AI Broker.\nUses optional media and returns one verified MP4.",
+        "description": "Generates Seedance video through FN AI Broker.\nSeedance 2.0/2.0 Fast expose the stock Input Mode with 3 choices; Seedance 2.5 exposes Task with 5 choices. Only uses preserved manual references; Shot resolves exact same-Shot ImageAsset/VideoPicker references. Seedance 2.5 supports verified local MP4/MOV plus an optional verified local PNG last frame, with advanced requests failing closed unless the authenticated Broker capability contract matches.",
         "display_name": "HMB Seedance Generation",
         "icon": "Sparkles",
         "group": "create",
@@ -262,6 +262,13 @@
           "model-specific-reference-capacity",
           "video-reference-capacity-10",
           "seedance-2-5",
+          "task-selector",
+          "seedance-2-0-three-tasks",
+          "seedance-2-5-five-tasks",
+          "only-manual-references",
+          "exact-shot-references",
+          "video-editing",
+          "video-extension",
           "audio-default-off",
           "volcengine-ark",
           "fn-ai-broker",
@@ -273,7 +280,9 @@
           "single-video-preview",
           "broker-task-refresh",
           "ambiguous-submission-safety",
-          "local-mp4-output"
+          "local-mp4-mov-output",
+          "local-png-last-frame",
+          "broker-capability-fail-closed"
         ]
       }
     },
@@ -361,7 +370,7 @@
     {
       "name": "HMBSeedanceGenerationWidget",
       "path": "widgets/HMBSeedanceGenerationWidget.js",
-      "description": "Compact HMB Seedance Generation header placed directly above Model. Only supports prompt-only generation; each numbered Shot resolves the available ImageAsset source, VideoPicker source, or both through exact hidden same-flow dependencies without requiring an Agent."
+      "description": "Compact HMB Seedance Generation header placed directly above Model. Only preserves and exposes task-specific manual image, video, audio, and frame references; each numbered Shot temporarily forces Reference to Video and resolves only exact same-Shot ImageAsset and VideoPicker publications without deleting the authored Only values."
     },
     {
       "name": "HMBVideoPickerCommandBridgeWidget",
