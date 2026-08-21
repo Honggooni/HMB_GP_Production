@@ -194,6 +194,9 @@ assert.equal(stableRoleSelect.writes, 1);
 assert.equal(stableRoleSelect.value, "FX Behavior Only");
 
 const manualContextImageFields = [
+  "image_main_type",
+  "image_sub_type",
+  "custom_source_type",
   "color_picks",
   "binding_scopes",
   "binding_custom_scopes",
@@ -209,6 +212,9 @@ const contextImage = {
   index: 999,
   unknown_record_field: "drop",
   fields: {
+    image_main_type: "Character",
+    image_sub_type: "Full Appearance",
+    custom_source_type: "",
     color_picks: ["Red", "Green", "Blue", "drop"],
     binding_scopes: ["Full body / full appearance", "ignored", "ignored"],
     binding_custom_scopes: ["", "ignored", "ignored"],
@@ -433,14 +439,16 @@ const noLossRoundTrip = widget.normalizeState({
   images: [{
     present: true,
     label: "Custom marker image",
+    image_main_type: "Custom / Context",
+    image_sub_type: "Custom",
     source_type: "Custom",
     custom_source_type: "User idea",
-    color_picks: ["Infrared dream marker"],
+    color_picks: ["Red"],
     frame_range_enabled: true,
     frame_range_bindings: {
-      "@video5::Infrared dream marker": {
+      "@video5::Red": {
         video_slot: "@video5",
-        color_pick: "Infrared dream marker",
+        color_pick: "Red",
         origin: "manual",
         start_frame: 101,
         end_frame: 140,
@@ -449,8 +457,8 @@ const noLossRoundTrip = widget.normalizeState({
     },
   }],
 });
-assert.equal(noLossRoundTrip.images[0].color_picks[0], "Infrared dream marker");
-assert.ok(noLossRoundTrip.images[0].frame_range_bindings["@video5::Infrared dream marker"]);
+assert.equal(noLossRoundTrip.images[0].color_picks[0], "Red");
+assert.ok(noLossRoundTrip.images[0].frame_range_bindings["@video5::Red"]);
 assert.equal(noLossRoundTrip.source_intent_fallbacks[0].text, "Use the impossible reflection rhythm");
 
 const parseDiagnosticKeys = [
@@ -780,7 +788,8 @@ assert.equal(Object.hasOwn(slotLocalEmission.picker, "suppressed_run_id"), false
 assert.equal(widget.hmbReleasePickerVideoSlotSuppression(slotLocalPickerState, 2), true);
 assert.deepEqual(slotLocalPickerState.picker.slot_suppressions, {});
 assert.doesNotMatch(source, /suppressCurrentPickerPayload/);
-assert.match(source, /select\.value === "Ignore \/ Unused"[\s\S]{0,180}?hmbSuppressPickerVideoSlot/);
+assert.doesNotMatch(source, /select\.value === "Ignore \/ Unused"/);
+assert.ok(!widget.primaryVideoTypeChoices().includes("Ignore / Unused"), "Ignore is not a visible taxonomy field.");
 assert.match(source, /const removedSlot = Number\([\s\S]{0,180}?hmbSuppressPickerVideoSlot\(state, removedSlot\)/);
 
 console.log("HMB Prompt local structure regression checks passed.");

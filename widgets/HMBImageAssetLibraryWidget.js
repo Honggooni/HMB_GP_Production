@@ -120,6 +120,7 @@ const IMAGE_ASSET_UI_TEXT = {
     disconnecting_external_import: "Disconnecting external image…",
     add: "Add",
     add_image_asset: "Add image asset",
+    edit_image_asset: "Edit image classification",
     registered_project_asset: "Registered project asset",
     metadata_pending: "Raster metadata pending",
     register_before_select: "Register this image with Add before selecting it.",
@@ -137,11 +138,11 @@ const IMAGE_ASSET_UI_TEXT = {
     asset_passport: "ASSET PASSPORT",
     close_registration: "Close asset registration",
     final_image_name: "FINAL IMAGE NAME",
-    main_type_label: "MAIN TYPE (OPTIONAL)",
-    select_main_type: "Select Main Type (optional)",
-    custom_main_type: "CUSTOM MAIN TYPE (OPTIONAL)",
-    sub_type_label: "SUB TYPE (OPTIONAL)",
-    select_sub_type: "Select Sub Type (optional)",
+    main_type_label: "MAIN TYPE (REQUIRED)",
+    select_main_type: "Select Main Type",
+    custom_main_type: "CUSTOM MAIN TYPE",
+    sub_type_label: "SUB TYPE (REQUIRED)",
+    select_sub_type: "Select Sub Type",
     cancel: "Cancel",
     register_asset: "Register Asset",
     import_in: "IMAGE IMPORT IN",
@@ -186,6 +187,7 @@ const IMAGE_ASSET_UI_TEXT = {
     disconnecting_external_import: "외부 이미지 연결 해제 중…",
     add: "추가",
     add_image_asset: "이미지 에셋 추가",
+    edit_image_asset: "이미지 분류 수정",
     registered_project_asset: "등록된 프로젝트 에셋",
     metadata_pending: "래스터 메타데이터 확인 중",
     register_before_select: "선택하기 전에 추가 버튼으로 이 이미지를 등록하세요.",
@@ -196,18 +198,18 @@ const IMAGE_ASSET_UI_TEXT = {
     image_name: "이미지 이름",
     asset_id: "에셋 ID",
     main_type: "메인 유형",
-    unclassified: "미분류 (선택 사항)",
+    unclassified: "미분류",
     sub_type: "하위 유형",
     sub_unassigned: "하위 유형 후보가 지정되지 않음",
     hmb_project_asset: "HMB 프로젝트 에셋",
     asset_passport: "에셋 등록 정보",
     close_registration: "에셋 등록 창 닫기",
     final_image_name: "최종 이미지 이름",
-    main_type_label: "메인 유형 (선택)",
-    select_main_type: "메인 유형 선택 (선택 사항)",
-    custom_main_type: "사용자 정의 메인 유형 (선택)",
-    sub_type_label: "하위 유형 (선택)",
-    select_sub_type: "하위 유형 선택 (선택 사항)",
+    main_type_label: "메인 유형 (필수)",
+    select_main_type: "메인 유형 선택",
+    custom_main_type: "사용자 정의 메인 유형",
+    sub_type_label: "하위 유형 (필수)",
+    select_sub_type: "하위 유형 선택",
     cancel: "취소",
     register_asset: "에셋 등록",
     import_in: "이미지 가져오기",
@@ -234,6 +236,46 @@ function imageAssetLanguage(state) {
 function imageAssetText(state, key) {
   const language = imageAssetLanguage(state);
   return IMAGE_ASSET_UI_TEXT[language]?.[key] || IMAGE_ASSET_UI_TEXT.en[key] || key;
+}
+
+const IMAGE_TAXONOMY_KO = Object.freeze({
+  Character: "캐릭터",
+  "Character Prop": "캐릭터 프랍",
+  "Environment / Background": "환경 / 배경",
+  "Background Prop": "배경 프랍",
+  "Look Reference": "룩 레퍼런스",
+  "Custom / Context": "사용자 정의 / 컨텍스트",
+  "Full Appearance": "전체 외형",
+  "Head / Face": "머리 / 얼굴",
+  "Eyes / Expression": "눈 / 표정",
+  "Body Part": "신체 부위",
+  "Hair / Fur": "머리카락 / 털",
+  "Costume Detail": "의상 디테일",
+  "Full Costume": "전체 의상",
+  "Handheld Prop": "손에 드는 프랍",
+  "Attached Accessory": "부착 액세서리",
+  "Character Interactive Prop": "캐릭터 상호작용 프랍",
+  "Main Background": "메인 배경",
+  "Sky / Exterior": "하늘 / 외부",
+  "Ground / Floor": "지면 / 바닥",
+  Foreground: "전경",
+  "Independent Scene Prop": "독립 장면 프랍",
+  "Interactive Scene Prop": "상호작용 장면 프랍",
+  "Set / Structure": "세트 / 구조물",
+  "Color Mood": "색감 무드",
+  "Lighting / Atmosphere": "조명 / 분위기",
+  "Render Look": "렌더 룩",
+  "Color / Look / Lighting": "색감 / 룩 / 조명",
+  Scale: "스케일",
+  Composition: "구도",
+  "Scale / Composition": "스케일 / 구도",
+  Context: "컨텍스트",
+  Custom: "사용자 정의",
+});
+
+function imageAssetTaxonomyLabel(state, value) {
+  const text = clean(value);
+  return imageAssetLanguage(state) === "ko" ? (IMAGE_TAXONOMY_KO[text] || text) : text;
 }
 
 function imageAssetStatusCount(value) {
@@ -373,9 +415,9 @@ function normalizeAsset(raw) {
     extension: clean(raw.extension).toLowerCase(),
     width: Math.max(0, Number.parseInt(raw.width || 0, 10) || 0),
     height: Math.max(0, Number.parseInt(raw.height || 0, 10) || 0),
-    source_type: UNCLASSIFIED_SOURCE_TYPES.has(clean(raw.source_type))
-      ? "Custom"
-      : clean(raw.source_type) || "Custom",
+    image_main_type: clean(raw.image_main_type) || "Select Image Main Type",
+    image_sub_type: clean(raw.image_sub_type),
+    source_type: clean(raw.source_type) || "Role Required / Select Source Type",
     custom_source_type: clean(raw.custom_source_type),
     scope_candidate: clean(raw.scope_candidate || raw.scope || raw.sub_type),
     color_pick_candidates: uniqueStrings(raw.color_pick_candidates),
@@ -412,6 +454,8 @@ function normalizeRegistrationRequest(raw) {
     target_folder: targetFolder,
     image_name: clean(raw.image_name).slice(0, 256),
     asset_id: clean(raw.asset_id).slice(0, 256),
+    image_main_type: clean(raw.image_main_type).slice(0, 256),
+    image_sub_type: clean(raw.image_sub_type).slice(0, 256),
     source_type: clean(raw.source_type).slice(0, 256),
     custom_source_type: clean(raw.custom_source_type).slice(0, 256),
     scope_candidate: clean(raw.scope_candidate || raw.scope).slice(0, 256),
@@ -594,6 +638,12 @@ function normalizeState(value) {
     ? input.taxonomy
     : {};
   const taxonomy = {
+    image_main_type_choices: uniqueStrings(taxonomyInput.image_main_type_choices),
+    image_sub_type_choices:
+      taxonomyInput.image_sub_type_choices
+      && typeof taxonomyInput.image_sub_type_choices === "object"
+        ? taxonomyInput.image_sub_type_choices
+        : {},
     source_type_choices: uniqueStrings(taxonomyInput.source_type_choices),
     scope_choices: uniqueStrings(taxonomyInput.scope_choices),
     scope_choices_by_source_type:
@@ -1510,8 +1560,8 @@ function assetSearchText(asset) {
     asset.asset_id,
     asset.image_name,
     asset.relative_path,
-    asset.source_type,
-    asset.scope_candidate,
+    asset.image_main_type,
+    asset.image_sub_type,
   ].map((value) => clean(value).toLowerCase()).join("\n");
 }
 
@@ -1831,9 +1881,11 @@ function thumbnailHtml(asset, className = "asset-thumb") {
 function assetThumbnailHtml(asset, state) {
   const source = imageSource(asset);
   const sourceName = clean(asset.image_name) || clean(asset.asset_id) || "Image";
-  const add = asset.registered
-    ? ""
-    : `<button type="button" class="asset-add" data-asset-add aria-label="${escapeHtml(imageAssetText(state, "add_image_asset"))}">${escapeHtml(imageAssetText(state, "add"))}</button>`;
+  const actionLabel = imageAssetText(
+    state,
+    asset.registered ? "edit_image_asset" : "add_image_asset",
+  );
+  const add = `<button type="button" class="asset-add" data-asset-add aria-label="${escapeHtml(actionLabel)}">${escapeHtml(asset.registered ? "✎" : imageAssetText(state, "add"))}</button>`;
   return `
     <div class="asset-thumb ${source ? "" : "fallback"}">
       <div class="asset-thumb-media">${assetCardThumbnailImageMarkup(asset)}${add}</div>
@@ -1855,10 +1907,9 @@ function renderAssetCard(asset, selectedCount, search, state, shot = activeImage
       ? imageAssetText(state, "image_limit")
       : imageAssetText(state, "click_select");
   const unclassified = imageAssetText(state, "unclassified");
-  const sourceTypeLabel = UNCLASSIFIED_SOURCE_TYPES.has(clean(asset.source_type))
-    || (clean(asset.source_type) === "Custom" && !clean(asset.custom_source_type))
+  const sourceTypeLabel = clean(asset.image_main_type) === "Select Image Main Type"
     ? unclassified
-    : clean(asset.source_type) || unclassified;
+    : imageAssetTaxonomyLabel(state, asset.image_main_type) || unclassified;
   const subUnassigned = imageAssetText(state, "sub_unassigned");
   const extension = (asset.extension || ".img").replace(".", "").toUpperCase() || "IMG";
   return `
@@ -1881,7 +1932,7 @@ function renderAssetCard(asset, selectedCount, search, state, shot = activeImage
         </div>
         <div class="asset-meta">
           <b title="${escapeHtml(imageAssetText(state, "main_type"))}: ${escapeHtml(sourceTypeLabel)}">${escapeHtml(sourceTypeLabel)}</b>
-          <span title="${escapeHtml(imageAssetText(state, "sub_type"))}: ${escapeHtml(asset.scope_candidate || subUnassigned)}">${escapeHtml(asset.scope_candidate || subUnassigned)}</span>
+          <span title="${escapeHtml(imageAssetText(state, "sub_type"))}: ${escapeHtml(imageAssetTaxonomyLabel(state, asset.image_sub_type) || subUnassigned)}">${escapeHtml(imageAssetTaxonomyLabel(state, asset.image_sub_type) || subUnassigned)}</span>
           <span class="asset-location" title="${escapeHtml(`${dimensions} · ${asset.relative_path || asset.media_ref_kind}`)}">${escapeHtml(dimensions)} · ${escapeHtml(asset.relative_path || asset.media_ref_kind)}</span>
         </div>
       </div>
@@ -2568,26 +2619,21 @@ function displayWindowsPath(value) {
 }
 
 function registrationMainTypes(taxonomy) {
-  const excluded = new Set([
-    "Role Required / Select Source Type",
-    "Select Source Type",
-    "Ignore / Unused",
-  ]);
-  return uniqueStrings(taxonomy?.source_type_choices).filter((value) => !excluded.has(value));
+  return uniqueStrings(taxonomy?.image_main_type_choices).filter(
+    (value) => value !== "Select Image Main Type",
+  );
 }
 
 export function hmbImageAssetRegistrationSubTypes(taxonomy, sourceType) {
-  const mapped = taxonomy?.scope_choices_by_source_type?.[clean(sourceType)];
-  return uniqueStrings(Array.isArray(mapped) ? mapped : taxonomy?.scope_choices).filter(Boolean);
+  const mapped = taxonomy?.image_sub_type_choices?.[clean(sourceType)];
+  return uniqueStrings(Array.isArray(mapped) ? mapped : []).filter(Boolean);
 }
 
 export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}) {
   if (!asset || typeof asset !== "object") return null;
   const mainTypes = registrationMainTypes(taxonomy);
-  const sourceType = clean(asset.source_type) === "Custom" && !clean(asset.custom_source_type)
-    ? ""
-    : mainTypes.includes(clean(asset.source_type))
-    ? clean(asset.source_type)
+  const sourceType = mainTypes.includes(clean(asset.image_main_type))
+    ? clean(asset.image_main_type)
     : "";
   const subTypes = hmbImageAssetRegistrationSubTypes(taxonomy, sourceType);
   const sourceKind = clean(asset.source_kind).toLowerCase() === "user" ? "user" : "project";
@@ -2604,19 +2650,19 @@ export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}) {
     target_folder_confirmed: sourceKind === "project",
     image_name: clean(asset.image_name).slice(0, 256),
     asset_id: clean(asset.asset_id).slice(0, 256),
-    source_type: sourceType,
-    custom_source_type: clean(asset.custom_source_type).slice(0, 256),
-    scope_candidate: subTypes.includes(clean(asset.scope_candidate))
-      ? clean(asset.scope_candidate)
+    image_main_type: sourceType,
+    image_sub_type: subTypes.includes(clean(asset.image_sub_type))
+      ? clean(asset.image_sub_type)
       : "",
+    custom_source_type: clean(asset.custom_source_type).slice(0, 256),
   };
 }
 
-function registrationOptions(values, selected, placeholder) {
+function registrationOptions(state, values, selected, placeholder) {
   return [
     `<option value="">${escapeHtml(placeholder)}</option>`,
     ...values.map((value) => (
-      `<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""}>${escapeHtml(value)}</option>`
+      `<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""}>${escapeHtml(imageAssetTaxonomyLabel(state, value))}</option>`
     )),
   ].join("");
 }
@@ -2625,6 +2671,12 @@ function registrationDraftIsComplete(draft) {
   return Boolean(
     clean(draft?.image_name)
     && clean(draft?.asset_id)
+    && clean(draft?.image_main_type)
+    && clean(draft?.image_sub_type)
+    && (
+      !(draft?.image_main_type === "Custom / Context" && draft?.image_sub_type === "Custom")
+      || clean(draft?.custom_source_type)
+    )
     && (
       draft?.source_kind !== "user"
       || (
@@ -2669,12 +2721,11 @@ function renderRegistrationDialog(state, draft) {
   const externalImport = asset?.source_kind === "user" && Number(asset?.import_index || 0) > 0;
   if (
     !asset
-    || asset.registered
     || (asset.source_kind !== "project" && !externalImport)
   ) return "";
   const mainTypes = registrationMainTypes(state.taxonomy);
-  const subTypes = hmbImageAssetRegistrationSubTypes(state.taxonomy, draft.source_type);
-  const customMainType = draft.source_type === "Custom"
+  const subTypes = hmbImageAssetRegistrationSubTypes(state.taxonomy, draft.image_main_type);
+  const customMainType = draft.image_main_type === "Custom / Context" && draft.image_sub_type === "Custom"
     ? `<label><span>${escapeHtml(imageAssetText(state, "custom_main_type"))}</span><input data-registration-field="custom_source_type" maxlength="256" value="${escapeHtml(draft.custom_source_type)}"/></label>`
     : "";
   return `
@@ -2690,9 +2741,9 @@ function renderRegistrationDialog(state, draft) {
           ${registrationFolderField(state, draft, externalImport)}
           <label><span>${escapeHtml(imageAssetText(state, "final_image_name"))}</span><input data-registration-field="image_name" maxlength="256" value="${escapeHtml(draft.image_name)}"/></label>
           <label><span>${escapeHtml(imageAssetText(state, "asset_id"))}</span><input data-registration-field="asset_id" maxlength="256" value="${escapeHtml(draft.asset_id)}"/></label>
-          <label><span>${escapeHtml(imageAssetText(state, "main_type_label"))}</span><select data-registration-main>${registrationOptions(mainTypes, draft.source_type, imageAssetText(state, "select_main_type"))}</select></label>
+          <label><span>${escapeHtml(imageAssetText(state, "main_type_label"))}</span><select data-registration-main>${registrationOptions(state, mainTypes, draft.image_main_type, imageAssetText(state, "select_main_type"))}</select></label>
           ${customMainType}
-          <label><span>${escapeHtml(imageAssetText(state, "sub_type_label"))}</span><select data-registration-sub ${draft.source_type ? "" : "disabled"}>${registrationOptions(subTypes, draft.scope_candidate, imageAssetText(state, "select_sub_type"))}</select></label>
+          <label><span>${escapeHtml(imageAssetText(state, "sub_type_label"))}</span><select data-registration-sub ${draft.image_main_type ? "" : "disabled"}>${registrationOptions(state, subTypes, draft.image_sub_type, imageAssetText(state, "select_sub_type"))}</select></label>
         </div>
         <footer class="passport-actions">
           <button type="button" data-registration-cancel>${escapeHtml(imageAssetText(state, "cancel"))}</button>
@@ -4003,7 +4054,7 @@ function installEvents(container, state, props, remount, listeners) {
       event.preventDefault();
       event.stopPropagation();
       const externalImport = asset.source_kind === "user" && Number(asset.import_index || 0) > 0;
-      if (asset.registered || (asset.source_kind !== "project" && !externalImport)) return;
+      if (asset.source_kind !== "project" && !externalImport) return;
       container.__hmbImageAssetRegistrationReturnFocus = {
         descriptor: imageAssetFocusDescriptor(container),
         assetKey: asset.asset_library_id,
@@ -4203,7 +4254,7 @@ function installEvents(container, state, props, remount, listeners) {
       event.preventDefault();
       event.stopPropagation();
       const externalImport = asset.source_kind === "user" && Number(asset.import_index || 0) > 0;
-      if (asset.registered || (asset.source_kind !== "project" && !externalImport)) return;
+      if (asset.source_kind !== "project" && !externalImport) return;
       container.__hmbImageAssetRegistrationReturnFocus = {
         descriptor: imageAssetFocusDescriptor(container),
         assetKey: asset.asset_library_id,
@@ -4292,18 +4343,19 @@ function installEvents(container, state, props, remount, listeners) {
   on(registrationMain, "change", () => {
     const draft = container.__hmbImageAssetRegistrationDraft;
     if (!draft) return;
-    draft.source_type = clean(registrationMain.value);
-    if (draft.source_type !== "Custom") draft.custom_source_type = "";
-    const choices = hmbImageAssetRegistrationSubTypes(state.taxonomy, draft.source_type);
-    if (!choices.includes(draft.scope_candidate)) draft.scope_candidate = "";
+    draft.image_main_type = clean(registrationMain.value);
+    draft.custom_source_type = "";
+    const choices = hmbImageAssetRegistrationSubTypes(state.taxonomy, draft.image_main_type);
+    if (!choices.includes(draft.image_sub_type)) draft.image_sub_type = "";
     remount(state);
   });
   const registrationSub = container.querySelector("[data-registration-sub]");
   on(registrationSub, "change", () => {
     const draft = container.__hmbImageAssetRegistrationDraft;
     if (!draft) return;
-    draft.scope_candidate = clean(registrationSub.value);
-    updateRegistrationSubmit();
+    draft.image_sub_type = clean(registrationSub.value);
+    if (draft.image_sub_type !== "Custom") draft.custom_source_type = "";
+    remount(state);
   });
   on(container.querySelector("[data-registration-submit]"), "click", (event) => {
     event.preventDefault();
@@ -4322,9 +4374,9 @@ function installEvents(container, state, props, remount, listeners) {
       target_folder: clean(draft.target_folder),
       image_name: clean(draft.image_name),
       asset_id: clean(draft.asset_id),
-      source_type: clean(draft.source_type),
+      image_main_type: clean(draft.image_main_type),
+      image_sub_type: clean(draft.image_sub_type),
       custom_source_type: clean(draft.custom_source_type),
-      scope_candidate: clean(draft.scope_candidate),
     };
     state.asset_registration_result = {};
     const returnFocus = container.__hmbImageAssetRegistrationReturnFocus;

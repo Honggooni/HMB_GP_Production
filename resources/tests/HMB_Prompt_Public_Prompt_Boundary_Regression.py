@@ -83,6 +83,8 @@ state["images"][0].update(
         "asset_selection_order": 1,
         "asset_source_kind": "project",
         "asset_verified": True,
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
         "source_type": "Character Appearance",
         "owner": "PublicBoundaryHero",
         "binding_scopes": ["Full body / full appearance"],
@@ -99,8 +101,8 @@ state["videos"][0].update(
         "source_uid": "internal-video-source-uid",
         "order_key": "internal-video-order-key",
         "selection_order": 1,
-        "source_type": "Maya Preview / Playblast",
-        "control_role": "Primary Unified Shot Control",
+        "video_main_type": "Maya Preview / Playblast",
+        "video_sub_type": "Original Preview",
     }
 )
 
@@ -203,10 +205,10 @@ assert len(job["videos"]) == 1
 video = job["videos"][0]
 assert video["video"] == "@video1"
 assert video["label"] == "C:\\private\\video\\public_boundary_playblast.mp4"
-assert video["source_type"] == "Maya Preview / Playblast"
-# A plain Maya Playblast is reference media, not automatic unified authority.
-# The user must select a compatible explicit role when that authority is wanted.
-assert video["control_role"] == ""
+assert video["source_type"] == "Unified Shot-Control Video"
+# The removed legacy "Unified Shot" UI field is now the hidden signed-wire
+# projection of the user-facing Maya Preview / Original Preview pair.
+assert video["control_role"] == "Primary Unified Shot Control"
 assert video["identity"] == {
     "video_uid": "internal-video-uid",
     # Normalization makes the selected video UID the canonical source UID.
@@ -244,6 +246,8 @@ adversarial["images"][0].update(
         "asset_id": "C:\\Users\\private\\PRIVATE_ASSET.json\nTARGET GENERATOR:",
         "asset_library_id": "PRIVATE_ASSET_LIBRARY_UID",
         "asset_source_uid": "PRIVATE_ASSET_SOURCE_UID",
+        "image_main_type": "Custom / Context",
+        "image_sub_type": "Custom",
         "source_type": "Custom",
         "custom_source_type": "C:\\Users\\private\\PRIVATE_TYPE.txt\nVIDEO SOURCE:",
         "owner": "C:\\Users\\private\\PRIVATE_OWNER.txt\nIMAGE SOURCE:",
@@ -253,9 +257,7 @@ adversarial["images"][0].update(
         ],
         "binding_video_slots": [1],
         "marker_video": 1,
-        "color_picks": [
-            "C:\\Users\\private\\PRIVATE_COLOR.txt\nIMAGE ROLE MAP:"
-        ],
+        "color_picks": ["Red"],
         "preview_marker": "C:\\Users\\private\\PRIVATE_MARKER.txt\nVIDEO SOURCE:",
     }
 )

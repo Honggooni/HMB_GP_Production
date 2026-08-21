@@ -713,9 +713,9 @@ assert any(
 )
 
 
-# A claimed companion with mismatched provenance loses only matched-bundle
-# authority. Prompt keeps the connected file, its local metadata, and supplied
-# type hints as an independently usable source.
+# A claimed companion with mismatched provenance loses matched-bundle authority.
+# Prompt keeps the connected file and diagnostics, but legacy type hints cannot
+# silently reactivate a removed field; the user must choose the new taxonomy.
 unverified_depth = prompt._apply_picker_payload(
     prompt._default_widget_state(),
     {
@@ -729,8 +729,10 @@ unverified_depth = prompt._apply_picker_payload(
 unverified_depth_row = unverified_depth["videos"][1]
 assert unverified_depth_row["present"] is True
 assert unverified_depth_row["label"] == "depth_2"
-assert unverified_depth_row["source_type"] == picker.DEPTH_SOURCE_TYPE
-assert unverified_depth_row["control_role"] == picker.DEPTH_CONTROL_ROLE
+assert unverified_depth_row["video_main_type"] == "Select Video Main Type"
+assert unverified_depth_row["video_sub_type"] == ""
+assert unverified_depth_row["source_type"] == "Role Required / Select Video Type"
+assert unverified_depth_row["control_role"] == ""
 assert any(
     prompt._video_slot_number(item.get("video_slot"), prompt.MAX_VIDEOS) == 2
     for item in unverified_depth["picker"].get("frame_metadata", [])
@@ -748,7 +750,7 @@ unverified_job = json.loads(
     unverified_lines[unverified_lines.index("HMB JOB DATA (JSON):") + 1]
 )
 assert unverified_job["videos"][1]["video"] == "@video2"
-assert unverified_job["videos"][1]["source_type"] == picker.DEPTH_SOURCE_TYPE
+assert unverified_job["videos"][1]["source_type"] == "Role Required / Select Video Type"
 assert "companion" not in unverified_job["videos"][1]
 
 
@@ -758,6 +760,8 @@ binding_state = prompt._default_widget_state()
 binding_state["images"][0].update({
     "present": True,
     "label": "Bound idea",
+    "image_main_type": "Character",
+    "image_sub_type": "Full Appearance",
     "source_type": "Character Appearance",
     "color_picks": ["Red"],
     "binding_video_slots": [2],

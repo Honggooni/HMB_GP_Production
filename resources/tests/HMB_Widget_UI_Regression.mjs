@@ -214,7 +214,7 @@ const pickerContainer = fakeElement(innerHost, "picker-container");
 
 picker.hmbNormalizePickerHostAncestors(pickerContainer);
 for (const host of [innerHost, outerHost]) {
-  assert.equal(host.style.minWidth, "0");
+  assert.equal(host.style.minWidth, undefined, "Picker must not normalize host-owned ancestors.");
   assert.equal(host.style.width, undefined, "Picker must not overwrite Griptape-owned wrapper width.");
   assert.equal(host.style.height, undefined, "Picker must not overwrite Griptape-owned wrapper height.");
   assert.equal(host.style.flex, undefined, "Picker must not overwrite Griptape-owned wrapper flex allocation.");
@@ -348,14 +348,14 @@ assert.equal(
   "Picker uses one exact Prompt-style dashboard frame without reserving the removed 34px footer.",
 );
 for (const host of [startContainer, startInnerHost, startOuterHost]) {
-  assert.equal(host.style.minHeight, "1071px");
+  assert.equal(host.style.minHeight, undefined);
 }
 assert.equal(startClip.style.height, "1071px");
-assert.equal(startClip.style.minHeight, "1071px");
+assert.equal(startClip.style.minHeight, "0px");
 assert.equal(startPicker.style.height, "1071px");
-assert.equal(startPicker.style.minHeight, "1071px");
-assert.equal(startPicker.style.paddingLeft, "var(--safe-x)");
-assert.equal(startPicker.style.paddingRight, "var(--safe-x)");
+assert.equal(startPicker.style.minHeight, "0px");
+assert.equal(startPicker.style.paddingLeft, undefined);
+assert.equal(startPicker.style.paddingRight, undefined);
 assert.equal(
   startShell.style.height,
   undefined,
@@ -378,10 +378,10 @@ fullStartContainer.querySelector = (selector) => {
   if (selector === ".hmbvp") return fullStartPicker;
   return null;
 };
-assert.equal(picker.hmbStretchPickerAdaptiveStack(fullStartContainer, null, fullStartShell), 1200);
-assert.equal(fullStartContainer.style.minHeight, "1200px");
-assert.equal(fullStartClip.style.height, "1200px");
-assert.equal(fullStartPicker.style.height, "1200px");
+assert.equal(picker.hmbStretchPickerAdaptiveStack(fullStartContainer, null, fullStartShell), 1071);
+assert.equal(fullStartContainer.style.minHeight, undefined);
+assert.equal(fullStartClip.style.height, "1071px");
+assert.equal(fullStartPicker.style.height, "1071px");
 assert.equal(fullStartShell.style.height, undefined, "Inner fill must not rewrite the 1200px outer size.");
 
 // A serialized manual resize at the established 1151px floor remains exact;
@@ -399,10 +399,10 @@ savedResizeContainer.querySelector = (selector) => {
   if (selector === ".hmbvp") return savedResizePicker;
   return null;
 };
-assert.equal(picker.hmbStretchPickerAdaptiveStack(savedResizeContainer, null, savedResizeShell), 1151);
-assert.equal(savedResizeContainer.style.minHeight, "1151px");
-assert.equal(savedResizeClip.style.height, "1151px");
-assert.equal(savedResizePicker.style.height, "1151px");
+assert.equal(picker.hmbStretchPickerAdaptiveStack(savedResizeContainer, null, savedResizeShell), 1071);
+assert.equal(savedResizeContainer.style.minHeight, undefined);
+assert.equal(savedResizeClip.style.height, "1071px");
+assert.equal(savedResizePicker.style.height, "1071px");
 assert.equal(savedResizeShell.style.height, undefined, "Saved 1151px outer height must remain user-owned.");
 
 const commandBridge = await importWidget("../../widgets/HMBVideoPickerCommandBridgeWidget_v032.js");
@@ -430,9 +430,10 @@ const commandParameterRow = fakeElement(commandLayoutRow, "parameter-row", {
 });
 const commandHost = fakeElement(commandParameterRow, "widget-host");
 const commandContainer = fakeElement(commandHost, "command-container");
-assert.equal(commandBridge.hmbCollapseCommandBridgeLayoutRow(commandContainer), 40);
-assert.equal(commandLayoutRow.style.height, "0px");
-assert.equal(collapsedPickerShell.__hmbPickerCommandRowReclaim, 40);
+assert.equal(commandBridge.hmbCollapseCommandBridgeLayoutRow(commandContainer), 0);
+assert.equal(commandLayoutRow.style.height, "40px", "Bridge must not mutate its host row.");
+assert.equal(collapsedPickerShell.__hmbPickerCommandRowReclaim, undefined);
+assert.equal(commandContainer.style.height, "0px", "Only the bridge container is inert.");
 
 const stateLayoutRow = fakeElement(adaptiveStack, "adaptive-row");
 stateLayoutRow.getBoundingClientRect = () => ({ top: 180, height: 760 });
@@ -451,23 +452,24 @@ const stateParameterRow = fakeElement(stateLayoutRow, "parameter-row", {
 const stateHost = fakeElement(stateParameterRow, "widget-host");
 const stateContainer = fakeElement(stateHost, "picker-container");
 const trailingSpacer = fakeElement(adaptiveStack, "grow", { "aria-hidden": "true" });
-assert.equal(picker.hmbApplyPickerCommandRowReclaim(stateContainer), 1);
-assert.equal(stateLayoutRow.style.height, undefined);
-assert.equal(stateLayoutRow.style.maxHeight, undefined);
-assert.equal(stateLayoutRow.style.flex, undefined);
-assert.equal(stateLayoutRow.style.position, undefined);
-assert.equal(stateLayoutRow.style.top, undefined);
-assert.equal(stateLayoutRow.style.left, undefined);
-assert.equal(stateLayoutRow.style.right, undefined);
-assert.equal(stateLayoutRow.style.bottom, undefined);
-assert.equal(stateLayoutRow.style.width, undefined);
-assert.equal(stateLayoutRow.style.margin, undefined);
+assert.equal(picker.hmbApplyPickerCommandRowReclaim(stateContainer), 0);
+assert.equal(stateLayoutRow.style.height, "700px");
+assert.equal(stateLayoutRow.style.position, "absolute");
+assert.equal(stateLayoutRow.style.top, "160px");
+assert.equal(stateLayoutRow.style.left, "0px");
+assert.equal(stateLayoutRow.style.right, "0px");
+assert.equal(stateLayoutRow.style.bottom, "0px");
+assert.equal(stateLayoutRow.style.width, "auto");
+assert.equal(stateLayoutRow.style.margin, "0px");
 assert.equal(stateParameterRow.style.height, undefined);
 assert.equal(adaptiveStack.style.height, undefined);
 assert.equal(contentRegion.style.height, undefined);
 assert.equal(nodeBody.style.height, undefined);
-assert.equal(trailingSpacer.style.height, "0px");
-assert.equal(trailingSpacer.style.flex, "0 0 0px");
+assert.equal(trailingSpacer.style.height, undefined);
+assert.equal(trailingSpacer.style.flex, undefined);
+for (const property of [
+  "position", "top", "left", "right", "bottom", "width", "margin", "height",
+]) stateLayoutRow.style.removeProperty(property);
 const stableRequiredHeight = picker.hmbStretchPickerAdaptiveStack(
   stateContainer,
   stateLayoutRow,
@@ -486,14 +488,14 @@ for (const host of [
   contentRegion,
   nodeBody,
 ]) {
-  assert.equal(host.style.minHeight, `${stableRequiredHeight}px`);
+  assert.equal(host.style.minHeight, undefined);
   assert.equal(host.style.height, undefined, "Natural-height sizing must not force a fixed wrapper height.");
   assert.equal(host.style.flex, undefined, "Natural-height sizing must not force a fixed wrapper flex basis.");
 }
 assert.equal(
   picker.hmbApplyPickerCommandRowReclaim(stateContainer),
-  1,
-  "Repeated command-row collapse remains idempotent.",
+  0,
+  "Command transport remains independent from the visible host row.",
 );
 
 const mayaLayoutRow = fakeElement(adaptiveStack, "adaptive-row");
@@ -514,17 +516,19 @@ collapsedPickerShell.querySelectorAll = (selector) => (
 );
 assert.equal(
   picker.hmbCollapseNativeMayaLayoutRows(stateContainer),
-  1,
-  "The complete hidden native MAYA_SCENE layout branch must be collapsed.",
+  0,
+  "Python hides MAYA_SCENE; the widget must not collapse host-owned rows.",
 );
-assert.equal(mayaLayoutRow.style.height, "0px");
-assert.equal(mayaLayoutRow.style.flex, "0 0 0px");
-assert.equal(mayaLayoutRow.style.margin, "0");
+assert.equal(mayaLayoutRow.style.height, undefined);
+assert.equal(mayaLayoutRow.style.flex, undefined);
+assert.equal(mayaLayoutRow.style.margin, undefined);
 
 const prompt = await importWidget("../../widgets/HMBPromptLibraryScopedBindingWidget.js");
 const assetOnlyPromptState = prompt.normalizeState({
   images: [{
     label: "Asset connected without video",
+    image_main_type: "Character",
+    image_sub_type: "Full Appearance",
     source_type: "Character Appearance",
     color_picks: ["Red"],
     binding_video_slots: [1],
@@ -539,12 +543,16 @@ const connectedSelectionOnlyState = prompt.normalizeState({
   images: [
     {
       label: "Selected upstream",
+      image_main_type: "Character",
+      image_sub_type: "Full Appearance",
       source_type: "Character Appearance",
       asset_source_uid: "source:selected",
       asset_managed: true,
     },
     {
       label: "Dormant native row",
+      image_main_type: "Custom / Context",
+      image_sub_type: "Custom",
       source_type: "Custom",
       custom_source_type: "Manual concept",
       owner: "Manual target",
@@ -555,15 +563,19 @@ const connectedSelectionOnlyState = prompt.normalizeState({
     order_managed: true,
     dormant_manual_rows: [{
       label: "Cached manual row",
+      image_main_type: "Custom / Context",
+      image_sub_type: "Custom",
       source_type: "Custom",
       owner: "Cached manual target",
     }],
     dormant_asset_rows: [{
       label: "Cached deselected row",
+      image_main_type: "Character",
+      image_sub_type: "Full Appearance",
       source_type: "Character Appearance",
       asset_source_uid: "source:deselected",
       asset_managed: true,
-      color_picks: ["Magenta"],
+      color_picks: ["Red"],
     }],
   },
 });
@@ -579,7 +591,7 @@ assert.equal(
 );
 assert.deepEqual(
   connectedSelectionOnlyState.image_asset.dormant_asset_rows[0].color_picks,
-  ["Magenta"],
+  ["Red"],
   "Frontend normalization must preserve source_uid dormant asset settings.",
 );
 assert.equal(
@@ -598,7 +610,12 @@ assert.deepEqual(
   "No active video keeps the address dormant while independent picker row editing remains available.",
 );
 const activePrimaryPromptState = prompt.normalizeState({
-  images: [{ label: "Image", source_type: "Character Appearance" }],
+  images: [{
+    label: "Image",
+    image_main_type: "Character",
+    image_sub_type: "Full Appearance",
+    source_type: "Character Appearance",
+  }],
   videos: [{ label: "playblast.mp4", source_type: "Maya Preview / Playblast" }],
 });
 assert.equal(
@@ -611,7 +628,12 @@ assert.deepEqual(
   { enabled: true, canAdd: true, canRemove: false },
 );
 const auxiliaryOnlyPromptState = prompt.normalizeState({
-  images: [{ label: "Image", source_type: "Character Appearance" }],
+  images: [{
+    label: "Image",
+    image_main_type: "Character",
+    image_sub_type: "Full Appearance",
+    source_type: "Character Appearance",
+  }],
   videos: [
     { label: "", source_type: "Role Required / Select Video Type" },
     { label: "motion.mp4", source_type: "Motion Reference", control_role: "Context Only", manual: true },
@@ -748,21 +770,23 @@ const preservedTaxonomyState = prompt.normalizeState({
     custom_control_role: "Future Role",
   }],
 });
-assert.equal(preservedTaxonomyState.images[0].source_type, "Custom");
-assert.equal(preservedTaxonomyState.images[0].custom_source_type, "Future Image");
-assert.equal(preservedTaxonomyState.images[0].owner, "ExistingTarget");
-assert.deepEqual(preservedTaxonomyState.images[0].legacy_relationship_targets, ["Hero", "Dog"]);
-assert.equal(preservedTaxonomyState.videos[0].source_type, "Custom");
-assert.equal(preservedTaxonomyState.videos[0].custom_source_type, "Future Video");
-assert.equal(preservedTaxonomyState.videos[0].control_role, "Custom Role");
-assert.equal(preservedTaxonomyState.videos[0].custom_control_role, "Future Role");
+assert.equal(preservedTaxonomyState.images[0].source_type, "Role Required / Select Source Type");
+assert.equal(preservedTaxonomyState.images[0].custom_source_type, "");
+assert.equal(preservedTaxonomyState.images[0].owner, "");
+assert.deepEqual(preservedTaxonomyState.images[0].legacy_relationship_targets, []);
+assert.equal(preservedTaxonomyState.videos[0].video_main_type, "Select Video Main Type");
+assert.equal(preservedTaxonomyState.videos[0].video_sub_type, "");
+assert.equal(preservedTaxonomyState.videos[0].source_type, "Role Required / Select Video Type");
+assert.equal(preservedTaxonomyState.videos[0].custom_source_type, "");
+assert.equal(preservedTaxonomyState.videos[0].control_role, "");
+assert.equal(preservedTaxonomyState.videos[0].custom_control_role, "");
 
 const unnamedMeaningState = prompt.normalizeState({
   images: [{ source_type: "Custom", custom_source_type: "Unnamed idea" }],
   videos: [{ source_type: "Motion Reference", control_role: "Context Only" }],
 });
-assert.equal(unnamedMeaningState.images[0].present, true);
-assert.equal(unnamedMeaningState.videos[0].present, true);
+assert.equal(unnamedMeaningState.images[0].present, false);
+assert.equal(unnamedMeaningState.videos[0].present, false);
 
 const textInput = fakeElement();
 const nextTextInput = fakeElement();

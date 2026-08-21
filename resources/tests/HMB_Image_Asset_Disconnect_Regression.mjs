@@ -38,9 +38,9 @@ assert.match(
 );
 assert.match(
   source,
-  /UNCLASSIFIED_SOURCE_TYPES\.has\(clean\(asset\.source_type\)\)[\s\S]*?\? unclassified/,
-  "The compatibility sentinel must render as an optional unclassified label.",
+  /clean\(asset\.image_main_type\) === "Select Image Main Type"[\s\S]*?\? unclassified/,
+  "The released v2 taxonomy sentinel must render as an unclassified label.",
 );
-assert.match(source, /unclassified: "미분류 \(선택 사항\)"/);
+assert.match(source, /unclassified: "미분류"/);
 
 console.log("HMB ImageAsset guarded external disconnect widget regression: PASS");

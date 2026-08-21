@@ -19,10 +19,10 @@ const newWidgetOptions = pythonSource.match(
 );
 assert.ok(visibleWidgetOptions, "Existing Picker state rows must expose an explicit UI contract.");
 assert.ok(newWidgetOptions, "New Picker state rows must expose an explicit UI contract.");
-assert.match(visibleWidgetOptions[1], /"expandable": False/);
-assert.match(newWidgetOptions[1], /"expandable": False/);
-assert.doesNotMatch(visibleWidgetOptions[1], /"expandable": True/);
-assert.doesNotMatch(newWidgetOptions[1], /"expandable": True/);
+assert.match(visibleWidgetOptions[1], /"expandable": True/);
+assert.match(newWidgetOptions[1], /"expandable": True/);
+assert.doesNotMatch(visibleWidgetOptions[1], /"expandable": False/);
+assert.doesNotMatch(newWidgetOptions[1], /"expandable": False/);
 
 function fakeStyle(initial = {}) {
   const style = { ...initial };
@@ -119,8 +119,7 @@ globalThis.window = {
 };
 
 // Cold mount regression: the hidden measurement controller runs before the
-// visible widget. It must repair the old 158px outer triple or Griptape moves
-// MAYA_SCENE / HMB_PICKER_COMMAND / HMB_PICKER_STATE into "Collapsed (3)".
+// visible widget but must never repair or mutate the outer React Flow node.
 const staleShell = fakeShell(158);
 staleShell.ownerDocument = document;
 staleShell.dataset.hmbVideoPickerCompactHeight = "158";
@@ -128,10 +127,10 @@ const hiddenContainer = measurementContainer(staleShell, document);
 const measurementController = picker.hmbMountVideoPickerHostMeasurement(hiddenContainer, {
   value: { picker_shots: [] },
 });
-assert.equal(staleShell.style.height, undefined);
-assert.equal(staleShell.style.minHeight, undefined);
-assert.equal(staleShell.style.maxHeight, undefined);
-assert.equal(staleShell.dataset.hmbVideoPickerCompactHeight, undefined);
+assert.equal(staleShell.style.height, "158px");
+assert.equal(staleShell.style.minHeight, "158px");
+assert.equal(staleShell.style.maxHeight, "158px");
+assert.equal(staleShell.dataset.hmbVideoPickerCompactHeight, "158");
 measurementController.cleanup();
 
 // A measurement clone must not release a valid expanded/user geometry.
@@ -148,7 +147,7 @@ expandedController.cleanup();
 
 // The visible compact widget owns only its inner authored frame. Stable native
 // outer geometry must remain unchanged; releasing 1200px here lets the host
-// briefly fit the whole workspace against the 158px authored row.
+// briefly fit the whole workspace against the 252px authored row.
 const liveShell = fakeShell(1200);
 liveShell.ownerDocument = document;
 const host = {
@@ -186,35 +185,33 @@ const dashboard = {
 
 assert.equal(
   picker.hmbApplyVideoPickerCompactHostSizing(container, { picker_shots: [] }),
-  158,
+  252,
 );
-assert.equal(clip.style.height, "158px");
-assert.equal(clip.style.minHeight, "158px");
-assert.equal(clip.style.maxHeight, "158px");
-assert.equal(dashboard.style.height, "158px");
+assert.equal(clip.style.height, "252px");
+assert.equal(clip.style.minHeight, "252px");
+assert.equal(clip.style.maxHeight, "252px");
+assert.equal(dashboard.style.height, "252px");
 assert.equal(liveShell.style.height, "1200px");
 assert.equal(liveShell.style.minHeight, "1200px");
 assert.equal(liveShell.style.maxHeight, "1200px");
-assert.equal(container.dataset.hmbVideoPickerCompactContentHeight, "158");
+assert.equal(container.dataset.hmbVideoPickerCompactContentHeight, "252");
 
-// v0.6.37's native compact shell is 360px (title, ports and three parameter
-// rows included). The authored 158px widget must not mistake it for legacy
-// compact geometry or overwrite any part of the native contract.
-const nativeCompactShell = fakeShell(360);
-nativeCompactShell.ownerDocument = document;
-const nativeHost = { parentElement: nativeCompactShell, style: fakeStyle(), dataset: {}, classList: fakeClassList() };
+// A host-owned outer geometry is not changed by inner content sizing alone.
+const arbitraryHostShell = fakeShell(480);
+arbitraryHostShell.ownerDocument = document;
+const nativeHost = { parentElement: arbitraryHostShell, style: fakeStyle(), dataset: {}, classList: fakeClassList() };
 const nativeContainer = {
   ...container,
   parentElement: nativeHost,
   dataset: {},
-  closest(selector) { return selector === ".react-flow__node" ? nativeCompactShell : null; },
+  closest(selector) { return selector === ".react-flow__node" ? arbitraryHostShell : null; },
 };
 assert.equal(
   picker.hmbApplyVideoPickerCompactHostSizing(nativeContainer, { picker_shots: [] }),
-  158,
+  252,
 );
-assert.equal(nativeCompactShell.style.height, "360px");
-assert.equal(nativeCompactShell.style.minHeight, "360px");
-assert.equal(nativeCompactShell.style.maxHeight, "360px");
+assert.equal(arbitraryHostShell.style.height, "480px");
+assert.equal(arbitraryHostShell.style.minHeight, "480px");
+assert.equal(arbitraryHostShell.style.maxHeight, "480px");
 
 console.log("HMB VideoPicker compact cold-mount regression checks passed.");

@@ -9,7 +9,7 @@ from _hmb_private_policy_fixture import install_private_policy_reader
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.6.40"
+EXPECTED_RELEASE_VERSION = "0.6.42"
 EXPECTED_VERSION = "2026-08-11.agent-shot-quality.v4.1"
 EXPECTED_CONTRACT_SHA256 = "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
 

@@ -167,7 +167,8 @@ assert short_result["images"][0]["asset_source_uid"] == "uid-a"
 assert "a handwritten third image idea" in fallback_texts(short_result)
 
 
-# Unknown upstream scope/Color candidates stay readable and available.
+# Valid v2 custom taxonomy remains readable; retired free-form legacy scope and
+# Color candidates are not migrated.
 custom_asset_payload = {
     "schema": "hmb-image-asset-library-binding",
     "mode": "image_asset",
@@ -186,8 +187,9 @@ custom_asset_payload = {
         "binding_mode": "verified_asset",
         "asset_id": "CustomAsset",
         "asset_library_id": "lib-custom",
-        "source_type": "Character Appearance",
-        "scope_candidate": "Invented cinematic scope",
+        "image_main_type": "Custom / Context",
+        "image_sub_type": "Custom",
+        "custom_source_type": "Invented cinematic scope",
         "color_pick_candidates": ["Red", "Infrared dream marker"],
     }],
 }
@@ -197,11 +199,11 @@ custom_result = prompt._apply_image_asset_payload(
     connected=True,
 )
 custom_row = custom_result["images"][0]
-assert custom_row["asset_scope_candidate"] == "Invented cinematic scope"
-assert custom_row["asset_color_pick_candidates"] == ["Red", "Infrared dream marker"]
-fallback_blob = "\n".join(fallback_texts(custom_result))
-assert "Invented cinematic scope" in fallback_blob
-assert "Infrared dream marker" in fallback_blob
+assert custom_row["image_main_type"] == "Custom / Context"
+assert custom_row["image_sub_type"] == "Custom"
+assert custom_row["asset_scope_candidate"] == "Custom scope"
+assert custom_row["asset_color_pick_candidates"] == ["Red"]
+assert custom_row["custom_source_type"] == "Invented cinematic scope"
 assert prompt_json_section(
     prompt._build_data_only_prompt_package(custom_result),
     "USER DESCRIPTION DATA (JSON):",
@@ -215,6 +217,8 @@ range_image = {
     "present": True,
     "label": "Hero",
     "asset_id": "Hero",
+    "image_main_type": "Character",
+    "image_sub_type": "Full Appearance",
     "source_type": "Character Appearance",
     "binding_scopes": ["Full body / full appearance"],
     "color_picks": ["Red"],
@@ -325,7 +329,7 @@ assert empty_picker_repeat["images"][0]["frame_range_intent"] == empty_picker_re
 ][0]["frame_range_intent"]
 
 
-# Unknown Picker markers remain usable rather than being normalized to blank.
+# Unknown Picker markers cannot become taxonomy authority.
 unknown_payload = copy.deepcopy(picker_payload)
 unknown_payload["markers"][0]["color"] = "Infrared dream marker"
 unknown_state = prompt._default_widget_state()
@@ -334,10 +338,12 @@ unknown_state["images"] = [{
     "present": True,
     "label": "Hero",
     "asset_id": "Hero",
+    "image_main_type": "Character",
+    "image_sub_type": "Full Appearance",
     "source_type": "Character Appearance",
 }]
 unknown_result = prompt._apply_picker_payload(unknown_state, unknown_payload, connected=True)
-assert unknown_result["images"][0]["color_picks"] == ["Infrared dream marker"]
+assert unknown_result["images"][0]["color_picks"] == [""]
 
 
 # Dormant relationship and video addresses remain round-trippable widget state,
@@ -347,11 +353,13 @@ goal_state["images"] = [{
     **prompt._default_image_item(1),
     "present": True,
     "label": "Key",
+    "image_main_type": "Character Prop",
+    "image_sub_type": "Handheld Prop",
     "source_type": "Prop / Accessory",
     "owner": "Hero hand",
     "legacy_relationship_targets": ["Door lock", "Memory echo"],
     "binding_scopes": ["Handheld prop"],
-    "color_picks": ["Custom brass marker"],
+    "color_picks": ["Red"],
     "binding_video_slots": [3],
 }]
 goal_state["text"]["SCENE_CONTEXT"] = "Resolve @video5 as a dream-memory rhythm"
@@ -378,6 +386,57 @@ assert prompt_json_section(
 ) == {
     "PRESERVED_TEXT": "free readable words\n[Future Tag] exact future phrase",
 }
+
+
+# During saved-workflow hydration the Prompt can mount before VideoPicker has
+# restored its accepted catalog.  This is a transient widget ordering state,
+# not a reason to erase saved media or show an error.  Strict execution keeps
+# the exact same failure closed after hydration finishes.
+hydration_channel = "11111111-1111-4111-8111-111111111111"
+hydration_shot = "22222222-2222-4222-8222-222222222222"
+hydration_state = prompt._default_widget_state()
+hydration_state["shot"] = {
+    "channel_uuid": hydration_channel,
+    "shot_uuid": hydration_shot,
+    "shot_number": 1,
+    "shot_name": "Shot 1",
+}
+
+
+class PendingPicker:
+    @staticmethod
+    def _hmb_shot_channel_subscription():
+        return {
+            "participant_kind": "video_picker",
+            "enabled": True,
+            "channel_uuid": hydration_channel,
+        }
+
+    @staticmethod
+    def _hmb_shot_routing_snapshot(*, expected_channel_uuid=""):
+        assert expected_channel_uuid == hydration_channel
+        raise ValueError("VideoPicker automatic Shot route is incomplete.")
+
+
+hydration_node = prompt.HMBPromptLibrary(name="prompt_picker_hydration")
+hydration_node._hmb_routing_hydration_rebase_pending = False
+hydrated = hydration_node._apply_exact_shot_routes(
+    hydration_state,
+    picker_source_node=PendingPicker(),
+    allow_picker_hydration_pending=True,
+)
+assert hydrated[4] is False
+assert hydration_node._hmb_picker_route_hydration_pending is True
+try:
+    hydration_node._apply_exact_shot_routes(
+        hydration_state,
+        picker_source_node=PendingPicker(),
+        allow_picker_hydration_pending=False,
+    )
+except ValueError as exc:
+    assert str(exc) == "VideoPicker automatic Shot route is incomplete."
+else:
+    raise AssertionError("strict Picker execution accepted an incomplete route")
 
 source = (ROOT / "HMBPromptLibrary.py").read_text(encoding="utf-8")
 for forbidden in (

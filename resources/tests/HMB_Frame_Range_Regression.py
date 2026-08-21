@@ -229,6 +229,8 @@ legacy_state["images"][0].update(
     {
         "present": True,
         "label": "Hero",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
         "source_type": "Character Appearance",
         "owner": "Hero",
         "binding_scopes": ["Full body / full appearance"],
@@ -279,6 +281,8 @@ prompt_state["images"][0].update(
     {
         "present": True,
         "label": "Hero",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
         "source_type": "Character Appearance",
         "owner": "Hero",
         "binding_scopes": ["Full body / full appearance"],

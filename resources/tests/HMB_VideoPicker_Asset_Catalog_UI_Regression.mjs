@@ -614,7 +614,7 @@ assert.doesNotMatch(
 );
 assert.match(
   widgetSource.slice(mainPreviewPlaybackStart),
-  /hmbInstallVideoAssetRootDelegation\(\s*container,\s*\{ play: playInPreview, select: toggleVideoSelection, remove: deleteVideoAsset \}/s,
+  /hmbInstallVideoAssetRootDelegation\(\s*container,\s*\{[\s\S]*?enabled:\s*\(\) => container\.__hmbVideoPickerExpanded === true,[\s\S]*?play:\s*playInPreview,[\s\S]*?select:\s*toggleVideoSelection,[\s\S]*?remove:\s*deleteVideoAsset,[\s\S]*?\}/s,
   "Play, select, and delete must share one root-delegated card controller.",
 );
 assert.doesNotMatch(
@@ -717,7 +717,7 @@ assert.match(
 );
 assert.match(
   dragInstaller,
-  /hmbMoveSelectedVideoAsset\(liveState, sourceUid, targetIndex\)/,
+  /hmbMoveSelectedVideoAssetInWorkspace\([\s\S]*?liveState,[\s\S]*?session\.workspaceUuid,[\s\S]*?sourceUid,[\s\S]*?targetIndex/,
 );
 assert.match(
   dragInstaller,

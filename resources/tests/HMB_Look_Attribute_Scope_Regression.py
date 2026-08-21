@@ -90,14 +90,14 @@ state = prompt._default_widget_state()
 state["videos"][0].update({
     "present": True,
     "label": "animator_color_playblast.mp4",
-    "source_type": "Maya Preview / Playblast",
-    "control_role": "Timing Only",
+    "video_main_type": "Maya Preview / Playblast",
+    "video_sub_type": "Mask",
 })
 job, fx_contract, user_data = prompt_sections(
     prompt._build_data_only_prompt_package(state)
 )
 assert job["videos"][0]["source_type"] == "Maya Preview / Playblast"
-assert job["videos"][0]["control_role"] == "Timing Only"
+assert job["videos"][0]["control_role"] == "Mask / Guide Only"
 assert fx_contract["sources"] == []
 assert user_data == {}
 
@@ -107,7 +107,8 @@ control_state = prompt._default_widget_state()
 control_state["videos"][0].update({
     "present": True,
     "label": "shot_control.mp4",
-    "source_type": "Maya Preview / Playblast",
+    "video_main_type": "Maya Preview / Playblast",
+    "video_sub_type": "Original Preview",
 })
 control_state["text"]["SCENE_CONTEXT"] = (
     "CONTROL_ONLY_BINDING: @video1 | Target = Hero_A | Function = Focus | "
@@ -133,16 +134,16 @@ fx_state = prompt._default_widget_state()
 fx_state["videos"][0].update({
     "present": True,
     "label": "fx_reference.mp4",
-    "source_type": "FX Reference",
-    "control_role": "Context Only",
+    "video_main_type": "FX / Simulation Reference",
+    "video_sub_type": "Explosion",
 })
 job, fx_contract, _user_data = prompt_sections(
     prompt._build_data_only_prompt_package(fx_state)
 )
-assert job["videos"][0]["control_role"] == "Context Only"
+assert job["videos"][0]["control_role"] == "FX Behavior Only"
 fx_source = fx_contract["sources"][0]
 assert fx_source["source_type"] == "FX Reference"
-assert fx_source["selected_role"] == "Context Only"
+assert fx_source["selected_role"] == "FX Behavior Only"
 assert set(fx_source).issubset({
     "video",
     "video_uid",
@@ -162,11 +163,14 @@ image_state = prompt._default_widget_state()
 image_state["videos"][0].update({
     "present": True,
     "label": "shot_control.mp4",
-    "source_type": "Maya Preview / Playblast",
+    "video_main_type": "Maya Preview / Playblast",
+    "video_sub_type": "Original Preview",
 })
 image_state["images"][0].update({
     "present": True,
     "label": "hero_character_sheet.png",
+    "image_main_type": "Character",
+    "image_sub_type": "Full Appearance",
     "source_type": "Character Appearance",
     "owner": "Hero_A",
     "binding_scopes": ["Full body / full appearance"],
@@ -190,22 +194,22 @@ multi = prompt._default_widget_state()
 multi["videos"][0].update({
     "present": True,
     "label": "animator_color_playblast.mp4",
-    "source_type": "Maya Preview / Playblast",
-    "control_role": "Spatial Alignment Verification Only",
+    "video_main_type": "Scene / Look Reference",
+    "video_sub_type": "Camera / Layout",
 })
 second = prompt._default_video_item(2)
 second.update({
     "present": True,
     "label": "lighting_reference.mp4",
-    "source_type": "Lighting / Look Reference",
-    "control_role": "Lighting / Look Only",
+    "video_main_type": "Scene / Look Reference",
+    "video_sub_type": "Lighting / Look",
 })
 multi["videos"].append(second)
 job, _fx_contract, _user_data = prompt_sections(
     prompt._build_data_only_prompt_package(multi)
 )
 assert [(video["video"], video["source_type"], video["control_role"]) for video in job["videos"]] == [
-    ("@video1", "Maya Preview / Playblast", "Spatial Alignment Verification Only"),
+    ("@video1", "Camera / Layout Reference", "Spatial Alignment Verification Only"),
     ("@video2", "Lighting / Look Reference", "Lighting / Look Only"),
 ]
 

@@ -17,9 +17,9 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.6.40"
-RELEASE_VERSION = "0.6.40"
-ARCHIVE_NAME = f"HMB_GP_Production_DEV_{RELEASE_VERSION}.zip"
+RELEASE_LABEL = "v0.6.42"
+RELEASE_VERSION = "0.6.42"
+ARCHIVE_NAME = f"HMB_GP_Production_v{RELEASE_VERSION}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
 POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
@@ -54,6 +54,7 @@ SOURCE_FILES = (
     "_hmb_shot_routing.py",
     "_hmb_mp4_verify.py",
     "HMB_Agent_Griptape.bat",
+    "Install_HMB_GP_Production.ps1",
     "_hmb_common.py",
     "_hmb_screen_space.py",
     "widgets/HMBAgentLibraryWidget.js",
@@ -142,12 +143,12 @@ def assert_release_member_allowed(member: PurePosixPath) -> None:
     lowered_parts = tuple(part.casefold() for part in member.parts)
     lowered_pairs = set(zip(lowered_parts, lowered_parts[1:]))
     if member.is_absolute() or ".." in member.parts or "\\" in relative:
-        raise RuntimeError(f"Unsafe developer release path: {relative}")
+        raise RuntimeError(f"Unsafe runtime release path: {relative}")
     is_public_ca = tuple(part.casefold() for part in member.parts[-3:]) == tuple(
         part.casefold() for part in PUBLIC_CA_MEMBER.parts
     )
     if member.suffix.casefold() in FORBIDDEN_SUFFIXES and not is_public_ca:
-        raise RuntimeError(f"Forbidden developer release member: {relative}")
+        raise RuntimeError(f"Forbidden runtime release member: {relative}")
     if (
         ("resources", "agent") in lowered_pairs
         or ("resources", "policy") in lowered_pairs
@@ -263,7 +264,7 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
     omitted_widgets = declared_widget_paths - set(SOURCE_FILES)
     if omitted_widgets:
         raise RuntimeError(
-            "Developer release omits declared widgets: "
+            "Runtime release omits declared widgets: "
             + ", ".join(sorted(omitted_widgets))
         )
 
@@ -273,7 +274,7 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
         assert_release_member_allowed(member)
         path = ROOT / Path(relative)
         if not path.is_file() or path.is_symlink():
-            raise RuntimeError(f"Missing or linked developer release member: {relative}")
+            raise RuntimeError(f"Missing or linked runtime release member: {relative}")
         data = path.read_bytes()
         if member == PUBLIC_CA_MEMBER and PUBLIC_CERTIFICATE.fullmatch(data) is None:
             raise RuntimeError("Agent Broker public CA bundle is invalid.")
@@ -288,7 +289,7 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
         if member.suffix.casefold() == ".zip":
             validate_no_policy_artifacts_in_zip(
                 data,
-                label=f"developer source::{relative}",
+                label=f"runtime source::{relative}",
             )
         records.append(
             {
@@ -357,7 +358,7 @@ def validate_release_inventory(
 ) -> None:
     by_path = {str(record["path"]): record for record in records}
     if set((RELEASE_MANIFEST_PATH, SHA256SUMS_PATH)) - set(by_path):
-        raise RuntimeError("Developer release closure inventory is missing.")
+        raise RuntimeError("Runtime release closure inventory is missing.")
     manifest = json.loads(by_path[RELEASE_MANIFEST_PATH]["data"].decode("utf-8"))
     source_paths = [str(path) for path in SOURCE_FILES]
     manifest_paths = [str(item.get("path") or "") for item in manifest.get("files", [])]
@@ -368,7 +369,7 @@ def validate_release_inventory(
         or manifest.get("shot_routing_protocol") != SHOT_ROUTING_PROTOCOL_VERSION
         or manifest_paths != source_paths
     ):
-        raise RuntimeError("Developer release closure manifest is inconsistent.")
+        raise RuntimeError("Runtime release closure manifest is inconsistent.")
     for item in manifest["files"]:
         record = by_path.get(str(item["path"]))
         if (
@@ -376,7 +377,7 @@ def validate_release_inventory(
             or int(item.get("bytes", -1)) != int(record["bytes"])
             or str(item.get("sha256") or "") != str(record["sha256"])
         ):
-            raise RuntimeError(f'Developer release manifest mismatch: {item["path"]}')
+            raise RuntimeError(f'Runtime release manifest mismatch: {item["path"]}')
     checksum_lines = by_path[SHA256SUMS_PATH]["data"].decode("utf-8").splitlines()
     expected_lines = [
         f'{record["sha256"]}  {record["path"]}'
@@ -384,7 +385,7 @@ def validate_release_inventory(
         if str(record["path"]) != SHA256SUMS_PATH
     ]
     if checksum_lines != expected_lines:
-        raise RuntimeError("Developer release checksum inventory is inconsistent.")
+        raise RuntimeError("Runtime release checksum inventory is inconsistent.")
 
 
 def current_zip_date_time() -> tuple[int, int, int, int, int, int]:
@@ -409,7 +410,7 @@ def archive_zip_date_time(encoded: bytes) -> tuple[int, int, int, int, int, int]
     with zipfile.ZipFile(io.BytesIO(encoded), "r") as archive:
         infos = archive.infolist()
         if not infos:
-            raise RuntimeError("Developer archive has no timestamped members.")
+            raise RuntimeError("Runtime archive has no timestamped members.")
         return infos[0].date_time
 
 
@@ -433,7 +434,7 @@ def make_archive(
             assert_release_member_allowed(member)
             data = record["data"]
             if not isinstance(data, bytes):
-                raise RuntimeError(f"Developer release data must be bytes: {relative}")
+                raise RuntimeError(f"Runtime release data must be bytes: {relative}")
             if any(marker in data for marker in FORBIDDEN_RELEASE_CONTENT_MARKERS):
                 raise RuntimeError(
                     f"Package-local or private policy reference remains in {relative}"
@@ -441,7 +442,7 @@ def make_archive(
             if member.suffix.casefold() == ".zip":
                 validate_no_policy_artifacts_in_zip(
                     data,
-                    label=f"developer record::{relative}",
+                    label=f"runtime record::{relative}",
                 )
             info = zipfile.ZipInfo(
                 f"{ARCHIVE_ROOT}/{relative}",
@@ -464,34 +465,34 @@ def validate_archive(
     records: list[dict[str, Any]],
     archive_date_time: tuple[int, int, int, int, int, int] | None = None,
 ) -> None:
-    validate_no_policy_artifacts_in_zip(encoded, label="developer archive")
+    validate_no_policy_artifacts_in_zip(encoded, label="runtime archive")
     expected = {str(item["path"]): item for item in records}
     with zipfile.ZipFile(io.BytesIO(encoded), "r") as archive:
         infos = archive.infolist()
         if len(infos) != len(expected) or archive.testzip() is not None:
-            raise RuntimeError("Developer archive member boundary mismatch.")
+            raise RuntimeError("Runtime archive member boundary mismatch.")
         if archive_date_time is None:
             if not infos:
-                raise RuntimeError("Developer archive has no timestamped members.")
+                raise RuntimeError("Runtime archive has no timestamped members.")
             archive_date_time = infos[0].date_time
         seen: set[str] = set()
         for info in infos:
             member = PurePosixPath(info.filename)
             if not member.parts or member.parts[0] != ARCHIVE_ROOT:
-                raise RuntimeError(f"Developer archive root mismatch: {info.filename}")
+                raise RuntimeError(f"Runtime archive root mismatch: {info.filename}")
             relative = PurePosixPath(*member.parts[1:]).as_posix()
             if relative not in expected or relative in seen:
-                raise RuntimeError(f"Unexpected developer archive member: {relative}")
+                raise RuntimeError(f"Unexpected runtime archive member: {relative}")
             if info.date_time != archive_date_time:
-                raise RuntimeError(f"Developer archive timestamp mismatch: {relative}")
+                raise RuntimeError(f"Runtime archive timestamp mismatch: {relative}")
             if (info.external_attr >> 16) != REPRODUCIBLE_ZIP_MODE:
-                raise RuntimeError(f"Developer archive mode mismatch: {relative}")
+                raise RuntimeError(f"Runtime archive mode mismatch: {relative}")
             content = archive.read(info)
             if content != expected[relative]["data"]:
-                raise RuntimeError(f"Developer archive source mismatch: {relative}")
+                raise RuntimeError(f"Runtime archive source mismatch: {relative}")
             seen.add(relative)
         if seen != set(expected):
-            raise RuntimeError("Developer archive omitted an allowlisted member.")
+            raise RuntimeError("Runtime archive omitted an allowlisted member.")
 
 
 def assert_release_policy_candidate_is_active() -> None:
@@ -513,7 +514,7 @@ def assert_release_policy_candidate_is_active() -> None:
         or candidate_status != "active"
     ):
         raise RuntimeError(
-            "Developer release is blocked: the reviewed policy candidate is not "
+            "Runtime release is blocked: the reviewed policy candidate is not "
             "the active signed server policy."
         )
 
@@ -527,7 +528,7 @@ def build(output_path: Path = ARCHIVE_PATH) -> dict[str, Any]:
     first = make_archive(records, archive_date_time)
     second = make_archive(records, archive_date_time)
     if first != second:
-        raise RuntimeError("Developer archive is not reproducible.")
+        raise RuntimeError("Runtime archive is not reproducible.")
     validate_archive(first, records, archive_date_time)
 
     output = output_path.resolve()
@@ -572,7 +573,7 @@ def check() -> dict[str, Any]:
     first = make_archive(records, archive_date_time)
     second = make_archive(records, archive_date_time)
     if first != second:
-        raise RuntimeError("Developer archive is not reproducible.")
+        raise RuntimeError("Runtime archive is not reproducible.")
     validate_archive(first, records, archive_date_time)
     return {
         "file_count": len(records),
@@ -596,13 +597,13 @@ def check_output(output_path: Path = ARCHIVE_PATH) -> dict[str, Any]:
     validate_release_inventory(release_version, records)
     output = output_path.resolve()
     if not output.is_file():
-        raise RuntimeError(f"Developer release artifact is missing: {output}")
+        raise RuntimeError(f"Runtime release artifact is missing: {output}")
     actual = output.read_bytes()
     archive_date_time = archive_zip_date_time(actual)
     validate_archive(actual, records, archive_date_time)
     expected = make_archive(records, archive_date_time)
     if actual != expected:
-        raise RuntimeError("Developer release artifact is stale or source-mismatched.")
+        raise RuntimeError("Runtime release artifact is stale or source-mismatched.")
     return {
         "archive": str(output),
         "archive_built_at_local": format_zip_date_time(archive_date_time),
@@ -617,7 +618,7 @@ def check_output(output_path: Path = ARCHIVE_PATH) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build a verified developer ZIP that uses server-only policy delivery."
+        description="Build a verified runtime-only ZIP that uses server-only policy delivery."
     )
     parser.add_argument(
         "--check",
@@ -633,7 +634,7 @@ def main() -> None:
         "--output",
         type=Path,
         default=ARCHIVE_PATH,
-        help="Developer ZIP destination. The production release files are never modified.",
+        help="Runtime ZIP destination. The production release files are never modified.",
     )
     args = parser.parse_args()
     if args.check and args.check_output:

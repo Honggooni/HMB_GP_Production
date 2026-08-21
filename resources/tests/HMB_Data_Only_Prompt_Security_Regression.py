@@ -47,9 +47,8 @@ fx.update(
     {
         "present": True,
         "label": "fx.mp4",
-        "source_type": "FX Reference",
-        # Main Type is canonical: a stale narrower role cannot reduce FX behavior.
-        "control_role": "Context Only",
+        "video_main_type": "FX / Simulation Reference",
+        "video_sub_type": "Explosion",
     }
 )
 timing = prompt_library._default_video_item(2)
@@ -57,8 +56,8 @@ timing.update(
     {
         "present": True,
         "label": "timing.mp4",
-        "source_type": "Timing / Edit Reference",
-        "control_role": "FX Behavior Only",
+        "video_main_type": "Maya Preview / Playblast",
+        "video_sub_type": "Timing / Edit",
     }
 )
 state["videos"] = [fx, timing]
@@ -89,8 +88,8 @@ fx_contract = agent._assert_fx_timing_source_contract(compiled)
 agent._assert_fx_candidate_matches_signed_runtime(fx_contract)
 assert "asset_path" not in job["images"][0]["identity"]
 assert [video["control_role"] for video in job["videos"]] == [
-    "Context Only",
     "FX Behavior Only",
+    "Timing Only",
 ]
 allowed_source_fact_keys = {
     "video",
@@ -109,7 +108,7 @@ assert all(
     for source in fx_contract["sources"]
 )
 for source, expected_role in zip(
-    fx_contract["sources"], ("Context Only", "FX Behavior Only")
+    fx_contract["sources"], ("FX Behavior Only", "Timing Only")
 ):
     assert source["selected_role"] == expected_role
 
@@ -225,7 +224,12 @@ assert json.loads(connector_output.splitlines()[6]) == {}
 range_state = prompt_library._default_widget_state()
 range_video = prompt_library._default_video_item(1)
 range_video.update(
-    {"present": True, "label": "fx", "source_type": "FX Reference"}
+    {
+        "present": True,
+        "label": "fx",
+        "video_main_type": "FX / Simulation Reference",
+        "video_sub_type": "Explosion",
+    }
 )
 range_image = prompt_library._default_image_item(1)
 range_image.update(

@@ -24,6 +24,8 @@ const state = {
       name: "IMAGE_01",
       present: true,
       label: "Hero",
+      image_main_type: "Character",
+      image_sub_type: "Full Appearance",
       source_type: "Character Appearance",
       owner: "Hero",
       scope: "Full body / full appearance",
@@ -110,6 +112,9 @@ const customScopeState = prompt.normalizeState({
   ...state,
   images: [{
     ...state.images[0],
+    image_main_type: "Custom / Context",
+    image_sub_type: "Custom",
+    custom_source_type: "Hero silhouette",
     scope: "Custom scope",
     binding_scopes: ["Custom scope", "Head / face only"],
     binding_custom_scopes: ["Hero silhouette", "Face detail"],
@@ -304,8 +309,8 @@ assert.ok(subtypeRenderStart >= 0 && subtypeRenderEnd > subtypeRenderStart);
 const subtypeRenderSource = promptSource.slice(subtypeRenderStart, subtypeRenderEnd);
 assert.match(
   subtypeRenderSource,
-  /data-field="binding_scopes" data-binding-index="0"/,
-  "Each image row must render exactly one image-level Sub Type selector.",
+  /data-field="image_sub_type"/,
+  "Each image row must render exactly one v2 image-level Sub Type selector.",
 );
 assert.doesNotMatch(
   subtypeRenderSource,

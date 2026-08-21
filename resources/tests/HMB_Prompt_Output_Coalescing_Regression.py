@@ -85,6 +85,23 @@ node._hmb_prompt_snapshot_generation = 1
 node.parameter_output_values["PROMPT_OUT"] = base_visible
 assert_paired_snapshot(node, base_visible, base_machine, 1)
 
+
+def install_dashboard_state(state):
+    """Mirror the real writer: persist state before compiling/publishing it."""
+
+    encoded = prompt._json_dumps(state)
+    parameter_values = getattr(node, "parameter_values", None)
+    if isinstance(parameter_values, dict):
+        parameter_values[prompt.WIDGET_PARAMETER_NAME] = encoded
+    else:
+        parameter = prompt._get_parameter_obj(
+            node, prompt.WIDGET_PARAMETER_NAME
+        )
+        if parameter is None:
+            raise AssertionError("Prompt widget state parameter is missing")
+        parameter.default_value = encoded
+    node._write_dashboard_state = lambda: copy.deepcopy(state)
+
 try:
     node._hmb_agent_prompt_snapshot(base_visible + "stale")
 except RuntimeError as error:
@@ -144,7 +161,7 @@ try:
     ui_only_state["ui"]["theme"] = "T"
     ui_only_state["ui"]["language"] = "en"
     ui_only_state["ui"]["group_heights"]["imageSources"] = 777
-    node._write_dashboard_state = lambda: copy.deepcopy(ui_only_state)
+    install_dashboard_state(ui_only_state)
     node._sync_prompt_output_from_state()
     assert node._hmb_prompt_snapshot_generation == 1
     assert node._hmb_last_prompt_output == base_visible
@@ -160,7 +177,7 @@ try:
     # connected Agent wakes and retrieves the newer private snapshot.
     text_state = copy.deepcopy(base_state)
     text_state["text"]["SCENE_CONTEXT"] = "User-authored scene description."
-    node._write_dashboard_state = lambda: copy.deepcopy(text_state)
+    install_dashboard_state(text_state)
     node._sync_prompt_output_from_state()
     text_visible = node._hmb_last_prompt_output
     text_machine = node._hmb_last_machine_prompt_output
@@ -185,7 +202,7 @@ try:
     local_only_state["source_intent_fallbacks"] = [
         {"source": "PICKER_IN", "reason": "diagnostic", "text": "local only"}
     ]
-    node._write_dashboard_state = lambda: copy.deepcopy(local_only_state)
+    install_dashboard_state(local_only_state)
     node._sync_prompt_output_from_state()
     assert node._hmb_prompt_snapshot_generation == 2
     assert node._hmb_last_prompt_output == text_visible
@@ -206,7 +223,7 @@ try:
             "owner": "CoalescingHero",
         }
     )
-    node._write_dashboard_state = lambda: copy.deepcopy(semantic_state)
+    install_dashboard_state(semantic_state)
     node._sync_prompt_output_from_state()
     assert node._hmb_prompt_snapshot_generation == 3
     assert [name for name, _value in set_calls[-3:]] == [
@@ -227,7 +244,7 @@ try:
     semantic_ui_only = copy.deepcopy(semantic_state)
     semantic_ui_only["ui"]["theme"] = "T"
     semantic_ui_only["ui"]["group_heights"]["imageSources"] = 888
-    node._write_dashboard_state = lambda: copy.deepcopy(semantic_ui_only)
+    install_dashboard_state(semantic_ui_only)
     node._sync_prompt_output_from_state()
     assert node._hmb_prompt_snapshot_generation == 3
     assert len(set_calls) == 5
@@ -263,7 +280,7 @@ try:
 
     failure_state = copy.deepcopy(semantic_ui_only)
     failure_state["images"][0]["label"] = "NotificationFailureHero"
-    node._write_dashboard_state = lambda: copy.deepcopy(failure_state)
+    install_dashboard_state(failure_state)
     node.publish_update_to_parameter = failing_notify
     try:
         node._sync_prompt_output_from_state()
@@ -529,6 +546,8 @@ for image in hydrated_frontend_state["images"]:
         image.pop(field, None)
 for video in hydrated_frontend_state["videos"]:
     for field in (
+        "video_main_type_choices",
+        "video_sub_type_choices",
         "source_type_choices",
         "control_role_choices",
         "reference_capabilities",
@@ -582,6 +601,8 @@ for image in local_select_state["images"]:
         image.pop(field, None)
 for video in local_select_state["videos"]:
     for field in (
+        "video_main_type_choices",
+        "video_sub_type_choices",
         "source_type_choices",
         "control_role_choices",
         "reference_capabilities",
@@ -589,6 +610,8 @@ for video in local_select_state["videos"]:
         "timing_cues",
     ):
         video.pop(field, None)
+local_select_state["videos"][0]["video_main_type"] = "Maya Preview / Playblast"
+local_select_state["videos"][0]["video_sub_type"] = "Timing / Edit"
 local_select_state["videos"][0]["source_type"] = "Timing / Edit Reference"
 local_select_state["videos"][0]["control_role"] = "Timing Only"
 local_select_state[prompt.UI_EDIT_REVISION_KEY] = 11
@@ -600,6 +623,8 @@ prompt._set_parameter_value(
 revision_reenriched = revision_node._write_dashboard_state()
 assert revision_reenriched[prompt.SOURCE_SYNC_REVISION_KEY] == 1
 assert revision_reenriched[prompt.UI_EDIT_REVISION_KEY] == 11
+assert revision_reenriched["videos"][0]["video_main_type"] == "Maya Preview / Playblast"
+assert revision_reenriched["videos"][0]["video_sub_type"] == "Timing / Edit"
 assert revision_reenriched["videos"][0]["source_type"] == "Timing / Edit Reference"
 assert revision_reenriched["videos"][0]["control_role"] == "Timing Only"
 assert revision_reenriched["videos"][0]["reference_capabilities"][
@@ -616,6 +641,8 @@ def frontend_prompt_projection(state):
             image.pop(field, None)
     for video in projected["videos"]:
         for field in (
+            "video_main_type_choices",
+            "video_sub_type_choices",
             "source_type_choices",
             "control_role_choices",
             "reference_capabilities",
@@ -739,6 +766,8 @@ first_asset_payload = {
             "asset_library_id": "hero-library-one",
             "asset_id": "HeroOne",
             "image_name": "HeroOne",
+            "image_main_type": "Character",
+            "image_sub_type": "Full Appearance",
             "source_type": "Character Appearance",
             "scope_candidate": "Full body / full appearance",
             "color_pick_candidates": ["Red"],
@@ -935,8 +964,8 @@ assert echo_after_stale_hook[prompt.UI_EDIT_REVISION_KEY] == 2
 assert echo_after_stale_hook["text"]["SCENE_CONTEXT"] == "newer B"
 
 # Source and UI revisions are independent axes. A newer Picker generation must
-# update source-owned fields without rolling a newer user Range ON transaction
-# back to the older OFF state carried by that delayed source snapshot.
+# update source-owned fields without rolling newer Prompt prose or a user Range
+# ON transaction back to the older values carried by that delayed snapshot.
 echo_authoritative = copy.deepcopy(echo_a)
 echo_authoritative[prompt.SOURCE_SYNC_REVISION_KEY] = 10
 echo_authoritative[prompt.UI_EDIT_REVISION_KEY] = 0
@@ -964,7 +993,7 @@ echo_after_crossed_source = prompt._parse_state(
 )
 assert echo_node._hmb_last_accepted_widget_revisions == (10, 2)
 assert echo_after_crossed_source["picker"]["run_id"] == "source-generation-10"
-assert echo_after_crossed_source["text"]["SCENE_CONTEXT"] == "authoritative source"
+assert echo_after_crossed_source["text"]["SCENE_CONTEXT"] == "newer B"
 assert echo_after_crossed_source["images"][0]["frame_range_enabled"] is True
 assert echo_after_crossed_source["images"][0]["frame_range_intent"][
     "ranges"
@@ -1008,6 +1037,83 @@ assert echo_node._hmb_last_accepted_widget_revisions == (3, 0)
 assert prompt._parse_state(
     prompt._get_parameter_raw(echo_node, prompt.WIDGET_PARAMETER_NAME)
 )["text"]["SCENE_CONTEXT"] == "saved hydration"
+
+
+# The host can replay Prompt's saved Shot before VideoPicker has accepted the
+# restored ImageAsset channel. Initial hydration preserves the durable loader
+# projection and defers exact validation; the same mismatch outside hydration
+# remains fail-closed.
+pending_channel = "10000000-0000-4000-8000-000000000001"
+pending_shot = "20000000-0000-4000-8000-000000000001"
+stale_picker_channel = "30000000-0000-4000-8000-000000000001"
+pending_state = prompt._apply_picker_payload(
+    prompt._default_widget_state(),
+    revision_picker_payload,
+    connected=True,
+)
+pending_state["shot"] = prompt._normalize_shot_selection({
+    "channel_uuid": pending_channel,
+    "shot_uuid": pending_shot,
+    "name": "Shot 1",
+    "number": 1,
+    "selected_source_uids": [],
+})
+pending_state = prompt._normalize_state(pending_state)
+
+
+class HydratingPicker:
+    def __init__(self):
+        self.snapshot_calls = 0
+
+    def _hmb_shot_channel_subscription(self):
+        return {
+            "participant_kind": "video_picker",
+            "enabled": True,
+            "channel_uuid": stale_picker_channel,
+            "shot_uuid": pending_shot,
+        }
+
+    def _hmb_shot_routing_snapshot(self, expected_channel_uuid=""):
+        self.snapshot_calls += 1
+        raise ValueError(
+            "VideoPicker Shot channel is unavailable or does not match."
+        )
+
+
+pending_picker = HydratingPicker()
+pending_node = prompt.HMBPromptLibrary(name="prompt_picker_route_pending")
+pending_node._hmb_routing_hydration_rebase_pending = True
+(
+    pending_projected,
+    _pending_images,
+    _pending_videos,
+    _pending_image_exact,
+    pending_picker_exact,
+) = pending_node._apply_exact_shot_routes(
+    pending_state,
+    picker_source_node=pending_picker,
+    allow_picker_hydration_pending=True,
+)
+assert pending_picker.snapshot_calls == 0
+assert pending_picker_exact is False
+assert pending_node._hmb_picker_route_hydration_pending is True
+assert pending_projected["picker"]["enabled"] is True
+assert pending_projected["picker"]["ordered_video_uids"] == pending_state[
+    "picker"
+]["ordered_video_uids"]
+
+try:
+    pending_node._apply_exact_shot_routes(
+        pending_state,
+        picker_source_node=pending_picker,
+    )
+except ValueError as error:
+    assert "channel is unavailable" in str(error)
+else:
+    raise AssertionError(
+        "A live VideoPicker Shot channel mismatch was incorrectly deferred."
+    )
+assert pending_picker.snapshot_calls == 1
 
 
 print("HMB Prompt paired-output coalescing regression passed.")

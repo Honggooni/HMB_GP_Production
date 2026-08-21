@@ -1,9 +1,70 @@
 # Changelog
 
+## `v0.6.42` — 2026-08-21
+
+- Removed VideoPicker compact mode's non-functional lower black band by
+  reclaiming only the exact HMB state row's Editor-owned trailing spacer. The
+  fix never mutates the workspace, viewport, canvas, or unrelated nodes.
+- Kept compact sizing deterministic for Shot 1 through Shot 5: every added Shot
+  grows the node by one complete 180px loader row plus its 6px gap.
+- Added a fail-closed allocator fallback for changed Editor DOM signatures. An
+  unrecognized host keeps the full 32px safety reserve instead of clipping the
+  compact cards, and expanded mode restores all temporarily reclaimed styles.
+- Fixed workflow hydration so Griptape's `initial_setup=True` replay can restore
+  imported VideoPicker media instead of being rejected as a retired runtime
+  publication. Shot ownership, order, selection, preview, and saved file paths
+  now survive reload and subsequent ImageAsset Shot catalog updates.
+- Added real saved-workflow and recursive Shot 1-through-5 round-trip gates,
+  including delayed/equal widget echoes, every supported load-hook order, and
+  Prompt's read-only consumption of the restored Picker catalog.
+- Coalesced Prompt selection and frame-range drag publications, blocked
+  equal-clock divergent echoes, and merged source/UI revision axes by stable
+  image identity so rapid interaction no longer flickers or rolls back.
+- Promoted the manifest-verified team runtime ZIP and SHA256 to a tagged GitHub
+  Release only after the complete Windows release audit succeeds.
+
+## `v0.6.41` — 2026-08-21
+
+- Replaced VideoPicker's automatic top-layer dialog with an inline,
+  ImageAsset-style hybrid view. The fixed internal header now switches between
+  retained expanded content and a compact Shot loader without remounting the
+  widget or changing the canvas viewport.
+- Restored content-derived compact heights (158px empty, 252px for one
+  populated Shot, capped at 360px with scrolling) and an expanded-first native
+  1400x1200 cold mount, removing the clipped header and black-tail layout.
+- Fixed HMBAgentLibrary's protected output contract to require generator-ready
+  English instructions even when HMBPromptLibrary authoring text is Korean.
+  Korean final instructions are stopped before reaching a video generator.
+- Removed Prompt/Agent execution-time Shot graph re-entry from paired Prompt
+  and media snapshot reads, preventing video hydration callbacks from blocking
+  the next node while Prompt's synchronization lock is held.
+- Preserved an accepted VideoPicker Shot catalog across unchanged router cache
+  passes. Real publisher deletion, duplicate sources, stale generations, and
+  catalog conflicts remain fail-closed under the central Shot router.
+
 ## `v0.6.40` — 2026-08-20
 
-- Reissued the exact v0.6.37 production code and behavior under the v0.6.40
-  release identity. No functional changes from v0.6.37 are included.
+- Restored serialized VideoPicker media catalogs, Shot membership, selection,
+  and fresh local media URLs across `initial_setup`, deserialize, load, and
+  loaded hooks. The visible state row explicitly clears stale host hide flags,
+  preventing saved cards from being trapped behind `Collapsed (3)`.
+- VideoPicker now opens its expanded authoring surface on the first mount. The
+  expanded surface uses a browser top-layer dialog while the host parameter row
+  remains a fixed compact measurement, so neither initial load nor view changes
+  resize, re-fit, pan, or split the React Flow workspace.
+- Increased the visible compact state row to 360px inside a stable 480px native
+  node shell and kept the hidden Maya/command transports out of adaptive row
+  allocation.
+- Replaced mixed Git-checkout/ZIP-overlay installation with a manifest-verified
+  exact runtime replacement. Updates move the prior install to a recoverable
+  `%LOCALAPPDATA%` rollback location, preserve `.venv`, and leave no source
+  tests, administration tools, stale Maya fixtures, caches, obsolete files, or
+  backup directory below the active Griptape libraries folder.
+- Removed `resources/build_developer_release.py`. Runtime packaging now lives
+  only in the development-only `tools` area and is never shipped as a library
+  resource.
+- Prevented Python bytecode creation in the supported HMB launcher and Maya
+  runner so immutable runtime resources do not accumulate `__pycache__` data.
 
 ## `v0.6.37` — 2026-08-20
 

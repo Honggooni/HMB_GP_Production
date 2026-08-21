@@ -57,6 +57,8 @@ def image_row(
             "label": "RangeHero",
             "asset_id": "range-hero",
             "asset_source_uid": "range-hero-source",
+            "image_main_type": "Character",
+            "image_sub_type": "Full Appearance",
             "source_type": "Character Appearance",
             "owner": "RangeHero",
             "binding_scopes": ["Full body / full appearance"],
@@ -76,6 +78,12 @@ def video_row(
     source_type: str = "Maya Preview / Playblast",
 ) -> dict[str, Any]:
     row = prompt._default_video_item(slot)
+    taxonomy = {
+        "Maya Preview / Playblast": ("Maya Preview / Playblast", "Mask"),
+        "FX Reference": ("FX / Simulation Reference", "Explosion"),
+        "Timing / Edit Reference": ("Maya Preview / Playblast", "Timing / Edit"),
+    }
+    main_type, sub_type = taxonomy[source_type]
     row.update(
         {
             "present": True,
@@ -84,7 +92,8 @@ def video_row(
             "source_uid": f"range-video-{slot}",
             "selection_order": slot,
             "order_key": f"range-video-{slot}",
-            "source_type": source_type,
+            "video_main_type": main_type,
+            "video_sub_type": sub_type,
         }
     )
     return row
@@ -374,10 +383,10 @@ for picker_state in picker_oracles:
     )
 
 color_conflict = copy.deepcopy(manual_video)
-color_conflict["images"][0]["color_picks"] = ["UserMagenta"]
+color_conflict["images"][0]["color_picks"] = ["Pink"]
 color_conflict["picker"] = picker_oracles[2]
 _, color_job, _ = machine_sections(color_conflict)
-assert color_job["frame_ranges"][0]["marker_color"] == "UserMagenta"
+assert color_job["frame_ranges"][0]["marker_color"] == "Pink"
 assert color_job["frame_ranges"][0]["valid"] is True
 assert color_job["frame_ranges"][0]["error_codes"] == []
 
@@ -385,7 +394,8 @@ assert color_job["frame_ranges"][0]["error_codes"] == []
 # FX sources also treat Picker capabilities as non-authoritative for manual
 # Prompt Range. The Agent receives the user's exact allowed segments.
 fx_state = copy.deepcopy(manual_video)
-fx_state["videos"][0]["source_type"] = "FX Reference"
+fx_state["videos"][0]["video_main_type"] = "FX / Simulation Reference"
+fx_state["videos"][0]["video_sub_type"] = "Explosion"
 fx_state["videos"][0]["reference_capabilities"] = {
     "schema": "hmb-video-reference-capabilities",
     "version": 1,

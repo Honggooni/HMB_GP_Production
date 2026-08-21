@@ -436,9 +436,11 @@ def assert_auto_depth_preserved_as_independent_media(state: dict) -> None:
     item = state["videos"][1]
     assert item["label"] == "depth_contract_depth_playblast_2"
     assert item["present"] is True
-    assert item["source_type"] == "Depth / Spatial Reference"
+    assert item["video_main_type"] == "Select Video Main Type"
+    assert item["video_sub_type"] == ""
+    assert item["source_type"] == "Role Required / Select Video Type"
     assert item["custom_source_type"] == ""
-    assert item["control_role"] == "Spatial Alignment Verification Only"
+    assert item["control_role"] == ""
     assert item["custom_control_role"] == ""
     assert item["picker_auto_label"] == "depth_contract_depth_playblast_2"
     assert item["picker_auto_depth"] == {}
@@ -497,6 +499,8 @@ valid_prompt_state = prompt._apply_picker_payload(
 )
 valid_prompt_depth = valid_prompt_state["videos"][1]
 assert valid_prompt_depth["present"] is True
+assert valid_prompt_depth["video_main_type"] == "Maya Preview / Playblast"
+assert valid_prompt_depth["video_sub_type"] == "Depth"
 assert valid_prompt_depth["source_type"] == "Depth / Spatial Reference"
 assert (
     valid_prompt_depth["control_role"]
@@ -656,12 +660,14 @@ assert any(
 )
 
 
-# Saved states from the release immediately before provenance support can
-# contain the exact Picker auto fingerprint without picker_auto_depth.  An
-# invalid claimed Depth payload must drop generated-bundle confidence without
-# deleting or declassifying the readable media row.
+# Saved states from the release immediately before provenance support may keep
+# readable media, but their legacy role fields are deliberately not migrated.
 legacy_auto_state = copy.deepcopy(valid_prompt_state)
 legacy_auto_state["videos"][1].pop("picker_auto_depth", None)
+legacy_auto_state["videos"][1].pop("video_main_type", None)
+legacy_auto_state["videos"][1].pop("video_sub_type", None)
+legacy_auto_state["videos"][1].pop("picker_auto_video_main_type", None)
+legacy_auto_state["videos"][1].pop("picker_auto_video_sub_type", None)
 legacy_invalid_state = prompt._apply_picker_payload(
     legacy_auto_state,
     prompt_payload_with_pairs(
@@ -682,8 +688,8 @@ legacy_job = json.loads(
     legacy_lines[legacy_lines.index("HMB JOB DATA (JSON):") + 1]
 )
 legacy_depth = legacy_job["videos"][1]
-assert legacy_depth["source_type"] == "Depth / Spatial Reference"
-assert legacy_depth["control_role"] == "Spatial Alignment Verification Only"
+assert legacy_depth["source_type"] == "Role Required / Select Video Type"
+assert legacy_depth["control_role"] == ""
 
 
 # Manual values that existed before Picker temporarily classified @video2 as
@@ -695,9 +701,9 @@ manual_prompt_base["videos"] = [
         **prompt._default_video_item(2),
         "label": "manual-auxiliary",
         "present": True,
-        "source_type": "Custom",
+        "video_main_type": "Custom / Context",
+        "video_sub_type": "Custom",
         "custom_source_type": "Manual source type",
-        "control_role": "Custom Role",
         "custom_control_role": "Manual control role",
         "manual": True,
     },
@@ -811,9 +817,9 @@ manual_override_depth = manual_override_state["videos"][1]
 manual_override_depth.update({
     "label": "user-edited-depth",
     "present": True,
-    "source_type": "Motion Reference",
+    "video_main_type": "Motion Reference",
+    "video_sub_type": "Local Motion",
     "custom_source_type": "User source note",
-    "control_role": "Local Motion Detail Only",
     "custom_control_role": "User role note",
 })
 manual_override_result = prompt._apply_picker_payload(

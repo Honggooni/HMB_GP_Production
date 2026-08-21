@@ -79,6 +79,7 @@ jobs:
             "HMB_Image_Asset_Server_Sharing_Regression.py",
             "HMB_Image_Asset_Process_Lock_Regression.py",
             "HMB_Image_Asset_State_Echo_Regression.py",
+            "HMB_Image_Taxonomy_Regression.py",
             "HMB_Cutout_Transparency_Regression.py",
             "HMB_Depth_Companion_Regression.py",
             "HMB_Depth_Visual_Contract_Regression.py",
@@ -86,17 +87,26 @@ jobs:
             "HMB_Mouth_Card_Inner_Patch_Regression.py",
             "HMB_Motion_Guide_Regression.py",
             "HMB_Prompt_Output_Coalescing_Regression.py",
+            "HMB_Prompt_Revision_Axis_Regression.py",
             "HMB_Prompt_Picker_Disconnect_Restore_Regression.py",
             "HMB_Prompt_Public_Prompt_Boundary_Regression.py",
             "HMB_Picker_Prompt_Agent_Live_Host_Regression.py",
             "HMB_Picker_State_Compaction_Regression.py",
             "HMB_VideoPicker_Media_Availability_Regression.py",
             "HMB_VideoPicker_Native_Size_Migration_Regression.py",
+            "HMB_VideoPicker_Python_Geometry_Hydration_Regression.py",
             "HMB_VideoPicker_High_Quality_Original_Regression.py",
             "HMB_VideoPicker_Maya_Shot_Authoring_Regression.py",
+            "HMB_VideoPicker_Save_Reload_Regression.py",
+            "HMB_VideoPicker_Real_Saved_Workflow_Replay_Regression.py",
+            "HMB_VideoPicker_Five_Shot_Recursive_Save_Reload_Regression.py",
+            "HMB_VideoPicker_Five_Shot_Recursive_RoundTrip_Regression.py",
+            "HMB_Runtime_Resource_Cleanliness_Regression.py",
             "HMB_Typed_Auxiliary_Video_Slots_Regression.py",
+            "HMB_Video_Taxonomy_Regression.py",
             "HMB_Agent_Authenticated_Broker_Regression.py",
             "HMB_Agent_Cloud_Nonstreaming_Regression.py",
+            "HMB_Agent_English_Video_Progression_Regression.py",
             "HMB_Agent_Runtime_Prompt_UI_Isolation_Regression.py",
             "HMB_Agent_Shot_Binding_Regression.py",
             "HMB_Seedance_MP4_Verifier_Portability_Regression.py",
@@ -125,13 +135,84 @@ jobs:
         run: >-
           powershell -NoProfile -ExecutionPolicy Bypass -File
           resources/tests/HMB_Agent_Policy_Admin_Scripts_Static_Regression.ps1
-      - name: Release builder static syntax audit
+      - name: Runtime package static syntax audit
         shell: pwsh
         run: |
           # Public CI never receives or materializes a signed policy artifact or
           # policy review document. This check builds only an in-memory ZIP.
-          python -m py_compile resources/build_developer_release.py
-          python resources/build_developer_release.py --check
-          $artifact = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_DEV_0.6.40.zip"
-          python resources/build_developer_release.py --output $artifact
-          python resources/build_developer_release.py --check-output --output $artifact
+          python -m py_compile tools/package_runtime_release.py
+          python tools/package_runtime_release.py --check
+          $artifact = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_v0.6.42_Runtime.zip"
+          python tools/package_runtime_release.py --output $artifact
+          python tools/package_runtime_release.py --check-output --output $artifact
+      - name: Prepare tagged team distribution
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+          if ($env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Release tag $env:GITHUB_REF_NAME does not match package version v$version."
+          }
+          $artifact = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_v${version}_Runtime.zip"
+          $checksum = "{0} *{1}" -f `
+            (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant(), `
+            (Split-Path -Leaf $artifact)
+          Set-Content -LiteralPath "$artifact.sha256" -Value $checksum -Encoding ascii -NoNewline
+      - name: Upload audited tagged team distribution
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: hmb-team-release-${{ github.ref_name }}
+          path: |
+            ${{ runner.temp }}/HMB_GP_Production_v0.6.42_Runtime.zip
+            ${{ runner.temp }}/HMB_GP_Production_v0.6.42_Runtime.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-team-release:
+    needs: windows-release-audit
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download audited team distribution
+        uses: actions/download-artifact@v4
+        with:
+          name: hmb-team-release-${{ github.ref_name }}
+          path: release
+      - name: Publish GitHub team release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $archive = Join-Path $PWD "release/HMB_GP_Production_v0.6.42_Runtime.zip"
+          $checksum = "$archive.sha256"
+          if (-not (Test-Path -LiteralPath $archive) -or -not (Test-Path -LiteralPath $checksum)) {
+            throw "Audited release assets are missing."
+          }
+          $notesPath = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_v0.6.42_release_notes.md"
+          @'
+          ## HMB GP Production v0.6.42
+
+          - Removes the non-functional VideoPicker compact-mode lower black band without changing the workspace or canvas viewport.
+          - Restores imported VideoPicker media, Shot ownership, order, selection, and preview state after workflow save/reload.
+          - Keeps compact Shot growth deterministic and preserves the expanded authoring view.
+          - Includes the manifest-verified runtime installer and exact SHA256 checksum.
+
+          Close Griptape completely before running the included installer.
+          '@ | Set-Content -LiteralPath $notesPath -Encoding utf8
+          gh release view $env:GITHUB_REF_NAME *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:GITHUB_REF_NAME $archive $checksum --clobber
+            gh release edit $env:GITHUB_REF_NAME `
+              --title "HMB GP Production $env:GITHUB_REF_NAME" `
+              --notes-file $notesPath `
+              --latest
+          } else {
+            gh release create $env:GITHUB_REF_NAME $archive $checksum `
+              --verify-tag `
+              --title "HMB GP Production $env:GITHUB_REF_NAME" `
+              --notes-file $notesPath `
+              --latest
+          }

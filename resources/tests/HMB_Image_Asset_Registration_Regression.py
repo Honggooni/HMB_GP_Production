@@ -109,9 +109,9 @@ try:
         "relative_path": candidate["relative_path"],
         "image_name": "Hero Final",
         "asset_id": "HeroRig",
-        "source_type": "Character Appearance",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
         "custom_source_type": "",
-        "scope_candidate": "Full body / full appearance",
     }
     registered_state = asset_library._apply_asset_registration(state, request)
     assert manifest_path.is_file()
@@ -128,6 +128,8 @@ try:
     assert registered_candidate["registered"] is True
     assert registered_candidate["image_name"] == "Hero Final"
     assert registered_candidate["asset_id"] == "HeroRig"
+    assert registered_candidate["image_main_type"] == "Character"
+    assert registered_candidate["image_sub_type"] == "Full Appearance"
     assert registered_candidate["source_type"] == "Character Appearance"
     assert registered_candidate["scope_candidate"] == "Full body / full appearance"
     assert registered_state["asset_registration_request"] == {}
@@ -149,6 +151,8 @@ try:
         "path": candidate_path.relative_to(project_root).as_posix(),
         "asset_id": "HeroRig",
         "image_name": "Hero Final",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
         "source_type": "Character Appearance",
         "custom_source_type": "",
         "scope": "Full body / full appearance",
@@ -194,9 +198,9 @@ try:
         "target_folder": "Environment/Background",
         "image_name": "Imported Forest Final",
         "asset_id": "ImportedForestFinal",
-        "source_type": "Environment / Background",
+        "image_main_type": "Environment / Background",
+        "image_sub_type": "Main Background",
         "custom_source_type": "",
-        "scope_candidate": "Main background",
     }
     manifest_before_root_rejection = manifest_path.read_bytes()
     for rejected_folder in ("", "$root"):
@@ -298,9 +302,9 @@ try:
         "target_folder": "Character Appearance/Full body - full appearance",
         "image_name": "Macro Character",
         "asset_id": "MacroCharacter",
-        "source_type": "Character Appearance",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
         "custom_source_type": "",
-        "scope_candidate": "Full body / full appearance",
     }
     original_resolver = asset_library._resolve_import_file_reference
     asset_library._resolve_import_file_reference = (
@@ -349,9 +353,9 @@ try:
         "target_folder": "Character Appearance/Full body - full appearance",
         "image_name": "Generated Hero Frame",
         "asset_id": "GeneratedHeroFrame",
-        "source_type": "Character Appearance",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
         "custom_source_type": "",
-        "scope_candidate": "Full body / full appearance",
     }
     embedded_registered = asset_library._apply_asset_registration(
         embedded_state,
@@ -370,9 +374,9 @@ try:
         for item in embedded_registered["assets"]
     )
 
-    # Main Type, custom role, and Sub Type are optional creative metadata. An
-    # external image can be copied and registered with technical identity/folder
-    # only; the normalized asset remains usable as unclassified Custom content.
+    # A freshly imported image starts unclassified. The backend can preserve an
+    # explicit unclassified record for compatibility, while the UI requires the
+    # new Main/Sub pair before a user can submit registration.
     optional_role_source = test_root / "optional_role_source.png"
     optional_role_source.write_bytes(PNG_1X1)
     optional_state, optional_media = asset_library._merge_import_input(
@@ -382,7 +386,9 @@ try:
     optional_asset = next(
         item for item in optional_state["assets"] if item["source_kind"] == "user"
     )
-    assert optional_asset["source_type"] == "Custom"
+    assert optional_asset["image_main_type"] == "Select Image Main Type"
+    assert optional_asset["image_sub_type"] == ""
+    assert optional_asset["source_type"] == "Role Required / Select Source Type"
     optional_request = {
         "request_id": "register-without-creative-role",
         "project_uid": optional_state["project_uid"],
@@ -393,9 +399,9 @@ try:
         "target_folder": "Environment/Background",
         "image_name": "Unclassified User Idea",
         "asset_id": "UnclassifiedUserIdea",
-        "source_type": "",
+        "image_main_type": "",
+        "image_sub_type": "",
         "custom_source_type": "",
-        "scope_candidate": "",
     }
     optional_registered = asset_library._apply_asset_registration(
         optional_state,
@@ -415,7 +421,9 @@ try:
         if item["asset_id"] == "UnclassifiedUserIdea"
     )
     assert optional_project_asset["registered"] is True
-    assert optional_project_asset["source_type"] == "Custom"
+    assert optional_project_asset["image_main_type"] == "Select Image Main Type"
+    assert optional_project_asset["image_sub_type"] == ""
+    assert optional_project_asset["source_type"] == "Role Required / Select Source Type"
     assert optional_project_asset["custom_source_type"] == ""
     assert optional_project_asset["scope_candidate"] == ""
 
@@ -440,9 +448,9 @@ try:
         "target_folder": "Environment/Background",
         "image_name": "Rollback Asset",
         "asset_id": "RollbackAsset",
-        "source_type": "Environment / Background",
+        "image_main_type": "Environment / Background",
+        "image_sub_type": "Main Background",
         "custom_source_type": "",
-        "scope_candidate": "Main background",
     }
     original_manifest_writer = asset_library._write_asset_manifest_record
 
@@ -487,9 +495,9 @@ try:
         "target_folder": "Environment/Background",
         "image_name": "Corrupt Image",
         "asset_id": "CorruptImage",
-        "source_type": "Custom",
+        "image_main_type": "Custom / Context",
+        "image_sub_type": "Context",
         "custom_source_type": "",
-        "scope_candidate": "",
     }
     manifest_before_corrupt = manifest_path.read_bytes()
     try:
@@ -513,11 +521,11 @@ try:
     manifest_before_invalid = manifest_path.read_bytes()
     invalid_scope = dict(request)
     invalid_scope["request_id"] = "invalid-scope"
-    invalid_scope["scope_candidate"] = "Main background"
+    invalid_scope["image_sub_type"] = "Main Background"
     try:
         asset_library._apply_asset_registration(registered_state, invalid_scope)
     except ValueError as exc:
-        assert "is not valid" in str(exc)
+        assert "valid Image Main Type and Sub Type pair" in str(exc)
     else:
         raise AssertionError("A Main/Sub Type mismatch must be rejected.")
     assert manifest_path.read_bytes() == manifest_before_invalid

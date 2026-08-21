@@ -565,7 +565,7 @@ assert 'SHOT_ASSET_INPUT_PARAMETER = "SHOT_ASSET_IN"' in seedance_source
 assert 'SHOT_PICKER_INPUT_PARAMETER = "SHOT_PICKER_IN"' in seedance_source
 assert 'resolved["prompt"] = str(params.get("prompt") or "")' in seedance_source
 
-release_builder = (ROOT / "resources/build_developer_release.py").read_text(
+release_builder = (ROOT / "tools/package_runtime_release.py").read_text(
     encoding="utf-8"
 )
 for path in widget_paths.values():

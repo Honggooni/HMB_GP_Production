@@ -87,6 +87,31 @@ container.dispatch("keydown", {
 assert.equal(prevented, true);
 assert.equal(selectionCount, 3);
 
+// The retained hybrid installs both delegates. The inactive expanded delegate
+// is registered first on a compact mount, but it must not consume the event
+// before the compact delegate can perform the one real mutation.
+const hybridContainer = new FakeContainer();
+const hybridCleanup = [];
+let expanded = false;
+let expandedSelections = 0;
+let compactSelections = 0;
+widget.hmbInstallVideoAssetRootDelegation(hybridContainer, {
+  enabled: () => expanded,
+  select: () => { expandedSelections += 1; },
+}, hybridCleanup);
+widget.hmbInstallVideoAssetRootDelegation(hybridContainer, {
+  enabled: () => !expanded,
+  select: () => { compactSelections += 1; },
+}, hybridCleanup);
+hybridContainer.dispatch("click", { target: selectionSurface("BUTTON") });
+assert.equal(expandedSelections, 0);
+assert.equal(compactSelections, 1, "The active compact delegate must receive exactly one click.");
+expanded = true;
+hybridContainer.dispatch("click", { target: selectionSurface("BUTTON") });
+assert.equal(expandedSelections, 1, "The active expanded delegate must receive exactly one click.");
+assert.equal(compactSelections, 1);
+
 cleanupA.forEach((cleanup) => cleanup());
 cleanupB.forEach((cleanup) => cleanup());
+hybridCleanup.forEach((cleanup) => cleanup());
 console.log("HMB VideoPicker selection event once regression: PASS");

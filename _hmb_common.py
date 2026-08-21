@@ -419,6 +419,168 @@ OBJECT_COLOR_PICK_SOURCE_TYPES = {
     "Scale / Composition Reference",
 }
 
+# User-facing image taxonomy.  ``source_type``/``scope`` remain the stable
+# public Agent wire contract; these compact fields are the only authoring
+# authority shown by ImageAsset and Prompt.  Legacy selections are deliberately
+# released instead of inferred or migrated.
+IMAGE_MAIN_TYPE_UNCLASSIFIED = "Select Image Main Type"
+IMAGE_MAIN_TYPE_CHOICES = [
+    IMAGE_MAIN_TYPE_UNCLASSIFIED,
+    "Character",
+    "Character Prop",
+    "Environment / Background",
+    "Background Prop",
+    "Look Reference",
+    "Custom / Context",
+]
+IMAGE_SUB_TYPE_CHOICES = {
+    "Character": [
+        "Full Appearance",
+        "Head / Face",
+        "Eyes / Expression",
+        "Body Part",
+        "Hair / Fur",
+        "Costume Detail",
+        "Full Costume",
+    ],
+    "Character Prop": [
+        "Handheld Prop",
+        "Attached Accessory",
+        "Character Interactive Prop",
+    ],
+    "Environment / Background": [
+        "Main Background",
+        "Sky / Exterior",
+        "Ground / Floor",
+        "Foreground",
+    ],
+    "Background Prop": [
+        "Independent Scene Prop",
+        "Interactive Scene Prop",
+        "Set / Structure",
+    ],
+    "Look Reference": [
+        "Color Mood",
+        "Lighting / Atmosphere",
+        "Render Look",
+        "Color / Look / Lighting",
+        "Scale",
+        "Composition",
+        "Scale / Composition",
+    ],
+    "Custom / Context": [
+        "Context",
+        "Custom",
+    ],
+}
+
+IMAGE_TAXONOMY_WIRE_MAP = {
+    ("Character", "Full Appearance"): (
+        "Character Appearance",
+        "Full body / full appearance",
+    ),
+    ("Character", "Head / Face"): (
+        "Partial Character Detail",
+        "Head / face only",
+    ),
+    ("Character", "Eyes / Expression"): (
+        "Partial Character Detail",
+        "Eye / expression detail",
+    ),
+    ("Character", "Body Part"): (
+        "Partial Character Detail",
+        "Hand / foot / body part detail",
+    ),
+    ("Character", "Hair / Fur"): (
+        "Partial Character Detail",
+        "Hair / fur detail",
+    ),
+    ("Character", "Costume Detail"): (
+        "Costume / Clothing",
+        "Costume detail",
+    ),
+    ("Character", "Full Costume"): (
+        "Costume / Clothing",
+        "Full outfit / complete costume",
+    ),
+    ("Character Prop", "Handheld Prop"): (
+        "Prop / Accessory",
+        "Handheld prop",
+    ),
+    ("Character Prop", "Attached Accessory"): (
+        "Prop / Accessory",
+        "Attached accessory",
+    ),
+    ("Character Prop", "Character Interactive Prop"): (
+        "Prop / Accessory",
+        "Interactive scene prop",
+    ),
+    ("Environment / Background", "Main Background"): (
+        "Environment / Background",
+        "Main background",
+    ),
+    ("Environment / Background", "Sky / Exterior"): (
+        "Sky / Exterior Background",
+        "Sky / exterior area",
+    ),
+    ("Environment / Background", "Ground / Floor"): (
+        "Foreground / Ground",
+        "Ground / floor",
+    ),
+    ("Environment / Background", "Foreground"): (
+        "Foreground / Ground",
+        "Foreground element",
+    ),
+    ("Background Prop", "Independent Scene Prop"): (
+        "Prop / Accessory",
+        "Independent scene prop",
+    ),
+    ("Background Prop", "Interactive Scene Prop"): (
+        "Prop / Accessory",
+        "Interactive scene prop",
+    ),
+    ("Background Prop", "Set / Structure"): (
+        "Set / Structure",
+        "Set geometry / structure only",
+    ),
+    ("Look Reference", "Color Mood"): (
+        "Color / Look Reference",
+        "Color mood only",
+    ),
+    ("Look Reference", "Lighting / Atmosphere"): (
+        "Lighting / Atmosphere Reference",
+        "Lighting mood only",
+    ),
+    ("Look Reference", "Render Look"): (
+        "Color / Look Reference",
+        "Render look only",
+    ),
+    ("Look Reference", "Color / Look / Lighting"): (
+        "Color + Look + Lighting Mood Reference",
+        "All color + look + lighting functions",
+    ),
+    ("Look Reference", "Scale"): (
+        "Scale / Composition Reference",
+        "Scale only",
+    ),
+    ("Look Reference", "Composition"): (
+        "Scale / Composition Reference",
+        "Composition only",
+    ),
+    ("Look Reference", "Scale / Composition"): (
+        "Scale / Composition Reference",
+        "Scale + composition",
+    ),
+    ("Custom / Context", "Context"): ("Custom", ""),
+    ("Custom / Context", "Custom"): ("Custom", "Custom scope"),
+}
+
+IMAGE_CHARACTER_COLOR_MAIN_TYPES = {"Character", "Character Prop"}
+IMAGE_BACKGROUND_COLOR_MAIN_TYPES = {
+    "Environment / Background",
+    "Background Prop",
+}
+
 
 def image_scope_choices_for_source_type(source_type: Any) -> List[str]:
     """Return a copy of the canonical Sub Type choices for one Main Type."""
@@ -436,6 +598,36 @@ def image_color_pick_choices_for_source_type(source_type: Any) -> List[str]:
         return list(OBJECT_COLOR_PICK_CHOICES)
     if key == "Custom":
         return list(COLOR_PICK_CHOICES)
+    return []
+
+
+def image_sub_type_choices_for_main_type(main_type: Any) -> List[str]:
+    """Return the user-facing Sub Type choices for one image Main Type."""
+    return list(IMAGE_SUB_TYPE_CHOICES.get(str(main_type or "").strip(), []))
+
+
+def image_taxonomy_wire_pair(main_type: Any, sub_type: Any) -> tuple[str, str] | None:
+    """Project one authoring pair onto the unchanged public Agent schema."""
+    return IMAGE_TAXONOMY_WIRE_MAP.get(
+        (str(main_type or "").strip(), str(sub_type or "").strip())
+    )
+
+
+def image_color_pick_choices_for_taxonomy(
+    main_type: Any,
+    sub_type: Any = "",
+) -> List[str]:
+    """Return authoring colors without granting Look Reference marker authority."""
+    main = str(main_type or "").strip()
+    sub = str(sub_type or "").strip()
+    if main in IMAGE_CHARACTER_COLOR_MAIN_TYPES:
+        return list(ACTOR_COLOR_PICK_CHOICES)
+    if main in IMAGE_BACKGROUND_COLOR_MAIN_TYPES:
+        return list(OBJECT_COLOR_PICK_CHOICES)
+    if main == "Custom / Context" and sub == "Custom":
+        return list(COLOR_PICK_CHOICES)
+    # Look Reference and Context intentionally describe the whole scene and
+    # therefore never expose a per-marker Color Pick.
     return []
 
 

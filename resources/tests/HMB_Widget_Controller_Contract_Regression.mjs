@@ -218,12 +218,12 @@ assert.match(agentSource, /class="agent-mark" aria-hidden="true"><span>AG<\/span
 assert.match(assetSource, /data-project-select/, "ImageAssetLibrary must expose project switching.");
 assert.doesNotMatch(assetSource, /Project and Custom \/ User Imports share this order/, "External imports must not be presented as project Custom assets.");
 assert.match(assetSource, /Image \+ available metadata/, "IMAGE_IMPORT_IN must expose readable image content plus optional metadata.");
-assert.match(assetSource, /MAIN TYPE \(OPTIONAL\)/, "Image creative classification must be visibly optional.");
-assert.match(assetSource, /메인 유형 \(선택\)/, "The Korean Image registration label must remain explicitly optional.");
-assert.doesNotMatch(
+assert.match(assetSource, /MAIN TYPE \(REQUIRED\)/, "Image Main Type must be visibly required for registration.");
+assert.match(assetSource, /메인 유형 \(필수\)/, "The Korean Image Main Type label must be visibly required.");
+assert.match(
   assetSource.match(/function registrationDraftIsComplete\(draft\) \{[\s\S]*?\n\}/)?.[0] || "",
-  /source_type|scope_candidate|custom_source_type/,
-  "Creative role and subtype fields must not gate asset registration.",
+  /image_main_type[\s\S]*?image_sub_type/,
+  "The v2 Main/Sub taxonomy must gate new asset registration.",
 );
 assert.match(assetSource, /asset\.source_kind !== "project"/, "The project asset grid must exclude external imports.");
 assert.match(assetSource, /isUserImportFolder\(folderPath\)/, "The project folder tree must hide the reserved import cache.");
@@ -281,7 +281,7 @@ assert.doesNotMatch(assetSource, /@media\(max-width:920px\)\{[^}]*\.asset-grid\{
 assert.match(assetSource, /data-registration-field="asset_id"/, "The Add passport must retain editable Asset ID because Picker and Prompt bind against it.");
 assert.match(assetSource, /function assetCardThumbnailImageMarkup\(asset\)[\s\S]*?class="asset-thumb-placeholder"[\s\S]*?class="asset-thumb-media">\$\{assetCardThumbnailImageMarkup\(asset\)\}\$\{add\}<\/div>[\s\S]*?class="asset-thumb-footer"><span class="asset-source-name"/, "Every asset card must use an image-or-neutral-placeholder media area and show only the source name in its footer.");
 assert.doesNotMatch(assetSource.match(/function assetThumbnailHtml\(asset, state\)[\s\S]*?\n\}/)?.[0] || "", /thumbnailImageMarkup\(asset\)/, "Asset-card fallback media must never expose extension text.");
-assert.match(assetSource, /const add = asset\.registered[\s\S]*?data-asset-add[\s\S]*?imageAssetText\(state, "add"\)/, "Unregistered thumbnail media must retain localized Add.");
+assert.match(assetSource, /const add = `<button[\s\S]*?data-asset-add[\s\S]*?asset\.registered \? "✎" : imageAssetText\(state, "add"\)/, "Registered assets must expose Edit while unregistered media retains localized Add.");
 assert.doesNotMatch(assetSource, /class="asset-format"/, "Thumbnail footers must no longer spend their label on the file extension.");
 assert.match(assetSource, /class="asset-title"[\s\S]*?class="asset-extension-badge"/, "Detail content must place the extension badge at the title's top-right edge.");
 assert.match(assetSource, /\.asset-extension-badge\{[^}]*color:var\(--accent\);[^}]*font-family:inherit;[^}]*font-size:7px;[^}]*font-weight:900/, "The detail extension badge must use the project accent and inherited project font.");
@@ -293,8 +293,9 @@ assert.match(registrationFolderOptionsSource, /state\.folders[\s\S]*?!isUserImpo
 assert.doesNotMatch(registrationFolderOptionsSource, /ROOT_FOLDER_KEY|project_root/, "Add must never offer the already-selected project root as a destination folder.");
 assert.match(assetSource, /source_kind: draft\.source_kind[\s\S]*?source_uid: draft\.source_uid[\s\S]*?target_folder:/, "External registration requests must carry trusted source identity and the selected destination folder.");
 assert.match(assetSource, /asset_registration_request/, "The registration dialog must submit a one-shot backend request.");
-assert.match(promptSource, /function renderSubtypeControls\(item, state, locked = false\)[\s\S]*?data-field="binding_scopes"[\s\S]*?\$\{locked \? "disabled" : ""\}/, "Verified registered Sub Type controls must support a locked state.");
-assert.match(promptSource, /data-field="owner">\$\{targetSelectOptions\(item, images, state\)\}<\/select>/, "Verified Asset Target must remain freely editable.");
+assert.match(promptSource, /function renderSubtypeControls\(item, state, locked = false\)[\s\S]*?data-field="image_sub_type"[\s\S]*?\$\{locked \? "disabled" : ""\}/, "Verified registered v2 Sub Type controls must support a locked state.");
+assert.match(promptSource, /data-field="owner" \$\{sceneWideLookReference \? "disabled data-hmb-base-disabled=/, "Only scene-wide Look Reference must lock its Target to Global Look.");
+assert.doesNotMatch(promptSource, /verifiedAsset[^\n]*\?[^\n]*disabled[^\n]*data-field="owner"/, "Other verified Asset targets must remain freely editable.");
 assert.match(promptSource, /renderSubtypeControls\(item, state, Boolean\(verifiedAsset && verifiedRegisteredSubtype\(item\)\)\)/, "Only verified assets with a registered Sub Type should lock the Prompt subtype control.");
 const promptImageRowSource = promptSource.match(/function renderImageRow\([\s\S]*?\n\}\n\nfunction renderVideoRow/)?.[0] || "";
 assert.doesNotMatch(
@@ -601,17 +602,16 @@ const registrationDraftProbe = assetModule.hmbCreateImageAssetRegistrationDraft(
   relative_path: "Character/Hero.png",
   asset_id: "Hero",
   image_name: "Hero Beauty",
-  source_type: "Character Appearance",
-  scope_candidate: "Full body / full appearance",
+  image_main_type: "Character",
+  image_sub_type: "Full Appearance",
 }, {
-  source_type_choices: ["Role Required / Select Source Type", "Character Appearance", "Custom"],
-  scope_choices: ["", "Custom scope"],
-  scope_choices_by_source_type: {
-    "Character Appearance": ["", "Full body / full appearance", "Head / face only"],
+  image_main_type_choices: ["Select Image Main Type", "Character", "Look Reference"],
+  image_sub_type_choices: {
+    Character: ["Full Appearance", "Head / Face"],
   },
 });
-assert.equal(registrationDraftProbe.source_type, "Character Appearance");
-assert.equal(registrationDraftProbe.scope_candidate, "Full body / full appearance");
+assert.equal(registrationDraftProbe.image_main_type, "Character");
+assert.equal(registrationDraftProbe.image_sub_type, "Full Appearance");
 assert.equal(registrationDraftProbe.source_kind, "project");
 assert.equal(registrationDraftProbe.target_folder, "Character");
 assert.equal(registrationDraftProbe.target_folder_confirmed, true);
@@ -622,12 +622,12 @@ const externalRegistrationDraftProbe = assetModule.hmbCreateImageAssetRegistrati
   import_index: 1,
   asset_id: "External",
   image_name: "External Image",
-  source_type: "Character Appearance",
-  scope_candidate: "Full body / full appearance",
+  image_main_type: "Character",
+  image_sub_type: "Full Appearance",
 }, {
-  source_type_choices: ["Character Appearance", "Custom"],
-  scope_choices_by_source_type: {
-    "Character Appearance": ["Full body / full appearance"],
+  image_main_type_choices: ["Select Image Main Type", "Character"],
+  image_sub_type_choices: {
+    Character: ["Full Appearance"],
   },
 });
 assert.equal(externalRegistrationDraftProbe.source_kind, "user");
@@ -688,21 +688,22 @@ const legacyUnclassifiedProbe = assetModule.hmbNormalizeImageAssetState({
     selected: true,
   }],
 });
-assert.equal(legacyUnclassifiedProbe.assets[0].source_type, "Custom");
+assert.equal(legacyUnclassifiedProbe.assets[0].image_main_type, "Select Image Main Type");
+assert.equal(legacyUnclassifiedProbe.assets[0].source_type, "Role Required / Select Source Type");
 const legacyDraftProbe = assetModule.hmbCreateImageAssetRegistrationDraft(
   legacyUnclassifiedProbe.assets[0],
   {
-    source_type_choices: ["Role Required / Select Source Type", "Character Appearance", "Custom"],
-    scope_choices: ["", "Custom scope"],
+    image_main_type_choices: ["Select Image Main Type", "Character"],
+    image_sub_type_choices: { Character: ["Head / Face"] },
   },
 );
-assert.equal(legacyDraftProbe.source_type, "", "Legacy mandatory-looking roles must normalize to an optional blank choice.");
-assert.equal(legacyDraftProbe.scope_candidate, "");
+assert.equal(legacyDraftProbe.image_main_type, "", "Legacy roles must not migrate into the new taxonomy.");
+assert.equal(legacyDraftProbe.image_sub_type, "");
 assert.deepEqual(
   assetModule.hmbImageAssetRegistrationSubTypes({
-    scope_choices_by_source_type: { "Character Appearance": ["", "Head / face only"] },
-  }, "Character Appearance"),
-  ["Head / face only"],
+    image_sub_type_choices: { Character: ["Full Appearance", "Head / Face"] },
+  }, "Character"),
+  ["Full Appearance", "Head / Face"],
 );
 assert.equal(
   assetModule.hmbImageAssetImageSource({
@@ -877,9 +878,10 @@ assert.match(
   /export function hmbDeliverPickerStateIfMounted\(container, onChange, value\)[\s\S]*?container\.__hmbVideoPickerDeleted === true[\s\S]*?onChange\(value\)/,
   "A deleted Picker must refuse late widget publications while a mounted Picker still delivers them.",
 );
-assert.match(videoSource, /shell\?\.__hmbPickerCommandBridge/);
-assert.match(commandSource, /return props\.onChange\(command\)/);
-assert.match(commandSource, /shell\.__hmbPickerCommandBridge = \{ token, dispatch \}/);
+assert.match(videoSource, /HMB_VIDEO_PICKER_COMMAND_REGISTRY_KEY/);
+assert.match(commandSource, /return latestProps\.onChange\(command\)/);
+assert.match(commandSource, /registry\.set\(runtimeId, \{ token, dispatch \}\)/);
+assert.doesNotMatch(commandSource, /react-flow|parentElement|closest\?|querySelector\?/i);
 assert.doesNotMatch(videoSource, /pending_action:\s*"(?:read_scene|run_video|render_snapshot|stop_read)"/);
 assert.doesNotMatch(videoSource, /commitAndRemount/);
 assert.doesNotMatch(videoSource, /HMBVideoPickerLibraryWidget\(container,\s*\{/);
@@ -1249,7 +1251,11 @@ assert.match(
   pickerDragContract,
   /setTimeout\(\(\) => \{ delete container\.__hmbSuppressVideoSelectionClick; \}, 0\)/,
 );
-assert.match(pickerDragContract, /hmbMoveSelectedVideoAsset\(liveState, sourceUid, targetIndex\)/);
+assert.match(
+  pickerDragContract,
+  /hmbMoveSelectedVideoAssetInWorkspace\([\s\S]*?liveState,[\s\S]*?session\.workspaceUuid,[\s\S]*?sourceUid,[\s\S]*?targetIndex/,
+  "Compact and expanded drag commits must preserve the card's exact Shot owner.",
+);
 assert.match(
   pickerDragContract,
   /session\.targetUid = targetUid[\s\S]*?finalize\("drop"\)[\s\S]*?finalize\("dragend"\)/,
@@ -1389,45 +1395,31 @@ for (const source of [videoSource, promptSource]) {
 }
 assert.match(videoSource, /class="hmbvp-clip nodrag"/);
 assert.match(promptSource, /class="hmb-dashboard-clip nodrag"/);
-assert.match(videoSource, /hmbApplyPickerInitialNodeSizeOnce\(container\);\s*concealNativeMayaPicker\(container\);/);
-assert.match(videoSource, /shell\.style\.width = `\$\{HMB_DEFAULT_NODE_WIDTH\}px`/);
-assert.match(videoSource, /shell\.style\.height = `\$\{HMB_DEFAULT_NODE_HEIGHT\}px`/);
-assert.doesNotMatch(videoSource, /shell\.style\.width = `\$\{targetWidth\}px`/);
+assert.match(videoSource, /hmbRememberVideoPickerViewMode\(container, storedViewMode !== false\)/);
+assert.doesNotMatch(videoSource, /<dialog\b|\.showModal\s*\(/);
+assert.match(videoSource, /const desiredPickerExpanded = container\.__hmbVideoPickerExpanded === true;/);
+assert.match(videoSource, /const pickerExpanded = true;/);
+assert.match(videoSource, /hmbSetVideoPickerHybridView\(container, false, compactPickerMarkup\)/);
+assert.match(videoSource, /hmbSetVideoPickerHybridView\(container, true, compactPickerMarkup\)/);
 assert.match(
   videoSource,
-  /export function hmbAlignPickerOuterBottom\(container, preferredShell = null, allowShrink = true\)/,
-  "Picker must expose the settled-layout outer-bottom alignment helper.",
+  /const expanded = typeof forcedExpanded === "boolean"[\s\S]*?const measurementHeight = expanded/,
 );
-assert.match(
-  videoSource,
-  /pickerRect\.bottom \|\| 0\) - Number\(shellRect\.bottom \|\| 0\)/,
-  "Outer-bottom alignment must use the rendered visual endpoint and React Flow bottom edges.",
-);
-assert.match(
-  videoSource,
-  /const pickerRect = picker\.getBoundingClientRect\?\.\(\);/,
-  "Picker outer alignment must use the dashboard's actual bottom edge.",
-);
-assert.match(videoSource, /shell\.style\.height = `\$\{targetHeight\}px`/);
-assert.match(videoSource, /shell\.style\.minHeight = `\$\{targetHeight\}px`/);
-assert.match(
-  videoSource,
-  /if \(shell\?\.style\) shell\.style\.minHeight = `\$\{HMB_MIN_NODE_HEIGHT\}px`/,
-  "Native node resizing must release the automatic slot-height floor.",
-);
+assert.match(videoSource, /export function hmbRequestVideoPickerNodeInternalsUpdate\([^)]*\) \{\s*return false;/);
+assert.match(videoSource, /export function hmbScheduleVideoPickerNodeInternalsUpdate\([\s\S]*?\) \{\s*container\?\.removeAttribute\?\.\("data-hmb-video-picker-node-internals-pending"\);\s*return false;/);
 assert.match(videoSource, /let resizeApplying = false;/);
 assert.match(videoSource, /let pointerInteractionActive = false;/);
-assert.match(videoSource, /let nativeNodeResizeActive = false;/);
+assert.doesNotMatch(videoSource, /let nativeNodeResizeActive = false;/);
 assert.doesNotMatch(commandSource, /HMB_PICKER_BOOTSTRAP_(?:WIDTH|HEIGHT)|hmbEnsurePickerBootstrapNode/);
 assert.doesNotMatch(commandSource, /window\.setTimeout/);
-assert.match(commandSource, /hmbCollapseCommandBridgeLayoutRow\(container\)/);
+assert.match(commandSource, /export function hmbCollapseCommandBridgeLayoutRow\(container\)/);
 assert.match(videoSource, /hmbApplyPickerCommandRowReclaim\(container\)/);
 assert.match(
   videoSource,
   /!hmbPickerBranchContainsVideoOutputs\(parameterBranch\.parentElement\)/,
   "MAYA_SCENE row concealment must never collapse an ancestor that owns VIDEO output handles.",
 );
-assert.match(commandSource, /branchContainsVideoOutputs/);
+assert.doesNotMatch(commandSource, /branchContainsVideoOutputs/);
 assert.match(videoSource, /VIDEO_OUT/);
 
 assert.match(videoSource, /const HMB_PICKER_CONTENT_FALLBACK_HEIGHT = 960;/);
@@ -1440,18 +1432,8 @@ assert.doesNotMatch(videoSource, /class="statusbar"|\.statusbar\{|class="warning
   "Picker notifications must live only in Activity Log; no footer status bar or warning overlay may return.");
 assert.match(
   videoSource,
-  /const availableShellHeight = shell[\s\S]*?hmbPickerAvailableHeightToShell\(container, shell\)/,
-  "The Picker frame must consume the current shell's actually available height after hidden rows collapse.",
+  /for \(const element of \[[\s\S]*?container\?\.querySelector\?\.\("\.hmbvp-clip"\)[\s\S]*?container\?\.querySelector\?\.\("\.hmbvp"\)[\s\S]*?hmbSetPickerStyleIfChanged\(element, "height", `\$\{localRequired\}px`\)/,
 );
-assert.match(videoSource, /const required = Math\.max\(minimumRequired, availableShellHeight\);/);
-assert.doesNotMatch(
-  videoSource,
-  /const required = Math\.max\(minimumRequired, HMB_DEFAULT_NODE_HEIGHT\)/,
-  "Available-space fill must not force a saved 1151px user resize back to the 1200px start size.",
-);
-assert.match(videoSource, /hmbSetPickerStyleIfChanged\(clip, "height", `\$\{required\}px`\)/);
-assert.match(videoSource, /hmbSetPickerStyleIfChanged\(picker, "height", `\$\{required\}px`\)/);
-assert.match(videoSource, /hmbPickerLocalHostAncestors\(container\)\.forEach\(applyMinimum\)/);
 assert.doesNotMatch(videoSource, /layoutRow\.style\.setProperty\("flex", "1 1 0%", "important"\)/);
 assert.doesNotMatch(videoSource, /element\.style\.setProperty\("flex", `0 0 \$\{height\}px`, "important"\)/);
 assert.match(videoSource, /resizeObserver = new ResizeObserverClass\(\(\) => schedulePickerFit\(false\)\)/);
@@ -1472,17 +1454,10 @@ assert.doesNotMatch(
   /hmbAdjustPickerNodeHeightForVideoSlots|shell\.style\.setProperty\("height"/,
   "Slot changes must not write React Flow height from the frontend.",
 );
-assert.match(videoSource, /hmbEnsurePickerNodeFits\(container, shellForResizeSync \|\| findReactFlowNode\(container\)\);/);
-assert.doesNotMatch(
-  videoSource,
-  /hmbEnsurePickerNodeFits\(container, shellForResizeSync \|\| findReactFlowNode\(container\)\);[\s\S]{0,260}?hmbAlignPickerOuterBottom\(/,
-  "Settled fitting must keep Prompt's fixed inner frame instead of bottom-edge chasing.",
-);
-assert.match(videoSource, /function hmbApplyPickerDominoResizeFrame\(container, startNodeHeight, startRequiredHeight\)/);
 assert.equal(
   (videoSource.match(/hmbApplyPickerDominoResizeFrame\(container, startNodeHeight, startRequiredHeight\)/g) || []).length,
-  3,
-  "Both Picker resize handles must use the shared Prompt-style domino frame.",
+  0,
+  "The retired outer-node domino resize implementation must be removed, not left behind as dead code.",
 );
 assert.doesNotMatch(videoSource, /outerBottomAlignTimer/);
 assert.match(videoSource, /const HMB_PICKER_MAX_SELECTED_VIDEOS = 10;/);
@@ -1492,15 +1467,7 @@ assert.doesNotMatch(videoSource, /hmb-picker-native-row-in/);
 assert.doesNotMatch(videoSource, /transition:height 180ms/);
 assert.match(videoSource, /hmbRenderPickerMarkup\([\s\S]*?container,[\s\S]*?hmbScopeWidgetStyleMarkup\(pickerMarkup, "\.hmbvp"\),[\s\S]*?\)/);
 assert.doesNotMatch(videoSource, /container\.innerHTML = `\s*<style>/);
-assert.match(
-  videoSource,
-  /hmbPickerLocalHostAncestors\(container\)\.forEach\(applyMinimum\)/,
-  "Stable v0.2.0 sizing propagates only the minimum content height.",
-);
-assert.match(videoSource, /container\.style\.maxWidth = "none"/);
-assert.match(videoSource, /container\.style\.overflow = "visible"/);
-assert.doesNotMatch(videoSource, /container\.style\.height = "100%"/);
-assert.match(videoSource, /concealNativeMayaPicker\(container\);\s*hmbEnsurePickerNodeFits/s);
+assert.match(videoSource, /hmbApplyPickerHostSizing\(container, measuredInnerHeight\)/);
 assert.doesNotMatch(videoSource, /initialFitTimers|\[80,\s*250,\s*750\]/);
 assert.match(agentSource, /compactAgentWidgetHost\(container\)/);
 assert.match(agentSource, /setProperty\("height",\s*"64px",\s*"important"\)/);
@@ -1509,10 +1476,10 @@ assert.doesNotMatch(videoSource, /data-resize-panel="outliner"/);
 assert.match(videoSource, /data-resize-panel="viewport"/);
 assert.match(videoSource, /right_section_heights:\s*heights/);
 assert.doesNotMatch(videoSource, /node_height:\s*latestNodeHeight/);
-assert.match(
-  videoSource,
-  /function hmbApplyPickerDominoResizeFrame\(container, startNodeHeight, startRequiredHeight\)[\s\S]*?hmbApplyPickerOuterNodeHeight/,
-  "Only explicit Prompt-style panel resizing should drive outer-node height.",
+assert.equal(
+  (videoSource.match(/hmbApplyPickerHostSizing\(container, hmbPickerInnerRequiredHeight\(container\)\)/g) || []).length >= 2,
+  true,
+  "Both Picker resize handles must resize only widget-owned dialog content.",
 );
 assert.doesNotMatch(videoSource, /data-resize-section="log"/);
 assert.match(videoSource, /data-resize-section="color"/);

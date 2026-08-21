@@ -39,13 +39,17 @@ def runtime(contract: dict) -> dict:
 
 def video(slot: int, source_type: str) -> dict:
     item = prompt._default_video_item(slot)
+    taxonomy = {
+        "Maya Preview / Playblast": ("Maya Preview / Playblast", "Mask"),
+        "FX Reference": ("FX / Simulation Reference", "Explosion"),
+        "Timing / Edit Reference": ("Maya Preview / Playblast", "Timing / Edit"),
+    }
+    main_type, sub_type = taxonomy[source_type]
     item.update({
         "present": True,
         "label": f"source-{slot}.mp4",
-        "source_type": source_type,
-        # A secondary role is intentionally absent. Main Type and readable
-        # media remain usable without optional role metadata.
-        "control_role": "",
+        "video_main_type": main_type,
+        "video_sub_type": sub_type,
     })
     return item
 
@@ -55,6 +59,8 @@ def bound_image(*, range_enabled: bool, valid_range: bool) -> dict:
     item.update({
         "present": True,
         "label": "approved-character.png",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
         "source_type": "Character Appearance",
         "owner": "Hero",
         "color_picks": ["Red"],
@@ -119,7 +125,7 @@ for main_type in ("FX Reference", "Timing / Edit Reference"):
     _, job, contract = parse_machine(no_range)
     assert job["frame_ranges"] == []
     assert contract["valid"] is True and contract["errors"] == []
-    assert contract["sources"][0]["role_selected"] is False
+    assert contract["sources"][0]["role_selected"] is True
     assert contract["sources"][0]["emitter_binding_declared"] is False
     assert contract["sources"][0]["range_on"] is False
     assert contract["sources"][0]["range_segments"] == []

@@ -247,8 +247,8 @@ prompt_state["videos"] = [
 prompt_state["videos"][1].update({
     "label": "manual-motion-row",
     "present": True,
-    "source_type": "Custom",
-    "control_role": "Context Only",
+    "video_main_type": "Custom / Context",
+    "video_sub_type": "Context",
 })
 applied = prompt._apply_picker_payload(
     prompt_state,
@@ -297,6 +297,8 @@ released = prompt._apply_picker_payload(
 )
 released_row = released["videos"][1]
 assert released_row["label"] == "manual-motion-row"
+assert released_row["video_main_type"] == "Custom / Context"
+assert released_row["video_sub_type"] == "Context"
 assert released_row["source_type"] == "Custom"
 assert released_row["control_role"] == "Context Only"
 assert released_row["present"] is True

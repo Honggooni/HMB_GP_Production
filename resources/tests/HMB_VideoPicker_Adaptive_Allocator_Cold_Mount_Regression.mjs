@@ -7,6 +7,8 @@ const widgetPath = new URL(
   import.meta.url,
 );
 const source = fs.readFileSync(widgetPath, "utf8");
+const pythonPath = new URL("../../HMBVideoPickerLibrary.py", import.meta.url);
+const pythonSource = fs.readFileSync(pythonPath, "utf8");
 const picker = await import(
   `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`
 );
@@ -223,15 +225,32 @@ const populatedThreeShotState = {
   videos: [{ video_uid: "video-1", video_path: "C:/media/one.mp4", label: "one.mp4" }],
 };
 
-// Editor 0.122 uses a visibility:hidden absolute copy as the custom-row
-// measurement source. If that copy mounts the full live widget, its compact
-// sizing path writes 158px onto the shared React Flow shell. The allocator then
-// has less than its native chrome plus the parameter row and exposes exactly
-// the user-visible `Collapsed (3)` failure.
-function adaptiveAllocatorCollapsedCount(shell, measuredRowHeight) {
-  const shellHeight = parseFloat(shell.style.height || "0") || 0;
-  const nativeChromeAndGaps = 72;
-  return shellHeight >= nativeChromeAndGaps + measuredRowHeight ? 0 : 3;
+function pythonFunctionSource(functionName) {
+  const start = pythonSource.indexOf(`def ${functionName}(`);
+  assert.notEqual(start, -1, `Python function ${functionName} must exist.`);
+  const next = pythonSource.indexOf("\ndef ", start + 1);
+  return pythonSource.slice(start, next === -1 ? pythonSource.length : next);
+}
+
+function expandableContract(functionName) {
+  const body = pythonFunctionSource(functionName);
+  const match = body.match(/"expandable"\s*:\s*(True|False)/);
+  assert.ok(match, `${functionName} must declare its host allocator contract.`);
+  return match[1] === "True";
+}
+
+// Griptape's adaptive allocator starts an unmeasured custom row at 40px. A
+// fill/non-expandable row keeps only that base height and the trailing spacer
+// receives the remainder. An expandable row receives the free stack height on
+// that same first pass, before the visibility:hidden measurement clone settles.
+function adaptiveAllocatorFirstPass(stackHeight, expandable, measuredRowHeight = 0) {
+  const initialRowHeight = measuredRowHeight > 0 ? measuredRowHeight : 40;
+  const bottomReserve = 16;
+  const remaining = Math.max(0, stackHeight - initialRowHeight - bottomReserve);
+  return {
+    rowHeight: initialRowHeight + (expandable ? remaining : 0),
+    trailingSpacerHeight: expandable ? 0 : remaining,
+  };
 }
 
 try {
@@ -266,7 +285,7 @@ try {
   flushFrames();
   const box = measurementContainer.querySelector("[data-hmb-video-picker-measurement-box]");
   assert.ok(box, "Cold mount keeps an inert height box in the host measurement copy.");
-  assert.equal(box.style.height, "158px", "One empty Shot receives its exact compact measurement.");
+  assert.equal(box.style.height, "1151px", "A first mount measures the expanded authoring row.");
   assert.equal(
     measurementContainer.querySelector(".hmbvp"),
     null,
@@ -275,17 +294,39 @@ try {
   assert.equal(shell.style.height, "1200px", "Cold measurement cannot shrink the shared outer node.");
   assert.equal(shell.style.minHeight, "1151px");
   assert.equal(shell.style.maxHeight, "none");
+
+  const repairedStateExpandable = expandableContract("_configure_picker_widget_parameter");
+  const newStateExpandable = expandableContract("_add_picker_widget");
+  const mayaTransportExpandable = expandableContract("_configure_hidden_maya_scene_parameter");
+  const commandTransportExpandable = expandableContract("_configure_picker_command_parameter");
+  assert.equal(repairedStateExpandable, true, "Saved Picker rows are repaired as expandable.");
+  assert.equal(newStateExpandable, true, "New Picker rows are created as expandable.");
+  assert.equal(mayaTransportExpandable, false, "The hidden MAYA transport cannot consume free height.");
+  assert.equal(commandTransportExpandable, false, "The hidden COMMAND transport cannot consume free height.");
+
+  const repairedFirstPass = adaptiveAllocatorFirstPass(1151, repairedStateExpandable);
+  const newFirstPass = adaptiveAllocatorFirstPass(1151, newStateExpandable);
   assert.equal(
-    adaptiveAllocatorCollapsedCount(shell, 158),
-    0,
-    "The cold allocator retains all three authored Picker rows instead of Collapsed (3).",
+    repairedFirstPass.rowHeight,
+    1135,
+    "A restored Picker dashboard receives the free stack height on its initial 40px pass.",
+  );
+  assert.equal(repairedFirstPass.trailingSpacerHeight, 0);
+  assert.deepEqual(newFirstPass, repairedFirstPass);
+
+  const clippedRegression = adaptiveAllocatorFirstPass(1151, false);
+  assert.equal(clippedRegression.rowHeight, 40);
+  assert.equal(
+    clippedRegression.trailingSpacerHeight,
+    1095,
+    "expandable=false reproduces the 40px header plus black trailing-spacer failure.",
   );
 
   measurementController.update({ value: populatedThreeShotState });
   assert.equal(
     box.style.height,
-    "436px",
-    "Reload/update derives height from the current Shot/media structure rather than stale DOM.",
+    "1151px",
+    "An ordinary value update preserves the stored expanded measurement mode.",
   );
   assert.equal(shell.style.height, "1200px", "Reload measurement also leaves outer geometry host-owned.");
 
@@ -295,7 +336,7 @@ try {
   assert.equal(
     picker.hmbSyncVideoPickerHostMeasurement(liveContainer, populatedThreeShotState, true),
     1,
-    "Expanded mode updates the sibling measurement controller on the same node.",
+    "Expanded inline mode keeps the sibling measurement expanded.",
   );
   assert.equal(box.style.height, "1151px");
   assert.equal(shell.style.height, "1200px", "Expanded measurement cannot reposition or resize the shell.");
@@ -304,8 +345,11 @@ try {
     1,
     "Returning to compact mode reuses the dynamic compact measurement.",
   );
-  assert.equal(box.style.height, "436px");
+  const compactThreeShotHeight = picker.hmbVideoPickerCompactMeasurementHeight(populatedThreeShotState);
+  assert.equal(compactThreeShotHeight, 624);
+  assert.equal(box.style.height, `${compactThreeShotHeight}px`);
   assert.equal(shell.style.height, "1200px");
+  picker.hmbRememberVideoPickerViewMode(liveContainer, false);
 
   measurementController.cleanup();
   assert.equal(
@@ -336,7 +380,7 @@ try {
   assert.equal(promotions, 0, "A still-hidden reload copy cannot install live listeners.");
   assert.equal(
     reloadContainer.querySelector("[data-hmb-video-picker-measurement-box]")?.style?.height,
-    "436px",
+    `${compactThreeShotHeight}px`,
   );
 
   // Some Editor builds reuse contentRef instead of invoking the factory again.

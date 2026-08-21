@@ -120,8 +120,13 @@ _PUBLIC_WINDOWS_PATH_PATTERN = re.compile(
     r"(?i)(?<![A-Z0-9_])(?:[A-Z]:[\\/]|\\\\)[^|;]*?(?=\s+/\s+|\s+\|\s+|;|$)"
 )
 IMAGE_SOURCE_TYPE_CHOICES = _hmb.IMAGE_SOURCE_TYPE_CHOICES
+IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED = _hmb.IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED
 IMAGE_SCOPE_CHOICES = _hmb.IMAGE_SCOPE_CHOICES
 IMAGE_SCOPE_CHOICES_BY_SOURCE_TYPE = _hmb.IMAGE_SCOPE_CHOICES_BY_SOURCE_TYPE
+IMAGE_MAIN_TYPE_UNCLASSIFIED = _hmb.IMAGE_MAIN_TYPE_UNCLASSIFIED
+IMAGE_MAIN_TYPE_CHOICES = _hmb.IMAGE_MAIN_TYPE_CHOICES
+IMAGE_SUB_TYPE_CHOICES = _hmb.IMAGE_SUB_TYPE_CHOICES
+IMAGE_TAXONOMY_WIRE_MAP = _hmb.IMAGE_TAXONOMY_WIRE_MAP
 IMAGE_SYSTEM_TARGETS = _hmb.IMAGE_SYSTEM_TARGETS
 IMAGE_OWNER_CHOICES = _hmb.IMAGE_OWNER_CHOICES
 ACTOR_COLOR_PICK_CHOICES = _hmb.ACTOR_COLOR_PICK_CHOICES
@@ -131,6 +136,9 @@ ACTOR_COLOR_PICK_SOURCE_TYPES = _hmb.ACTOR_COLOR_PICK_SOURCE_TYPES
 OBJECT_COLOR_PICK_SOURCE_TYPES = _hmb.OBJECT_COLOR_PICK_SOURCE_TYPES
 image_scope_choices_for_source_type = _hmb.image_scope_choices_for_source_type
 image_color_pick_choices_for_source_type = _hmb.image_color_pick_choices_for_source_type
+image_color_pick_choices_for_taxonomy = _hmb.image_color_pick_choices_for_taxonomy
+image_sub_type_choices_for_main_type = _hmb.image_sub_type_choices_for_main_type
+image_taxonomy_wire_pair = _hmb.image_taxonomy_wire_pair
 WIDGET_PARAMETER_NAME = "HMB_UI_STATE"
 PICKER_INPUT_PARAMETER_NAME = "PICKER_IN"
 IMAGE_ASSET_INPUT_PARAMETER_NAME = "IMAGE_ASSET_IN"
@@ -221,6 +229,119 @@ VIDEO_CONTROL_ROLE_CHOICES = [
     "Context Only",
     "Custom Role",
 ]
+
+# User-facing video taxonomy.  The signed Agent contract continues to receive
+# the stable ``source_type``/``control_role`` wire pair below; these compact
+# main/sub values are Prompt authoring state only.  That separation lets the UI
+# remove duplicate categories without changing the protected public v1 schema.
+# Legacy UI selections are intentionally released instead of migrated.
+VIDEO_MAIN_TYPE_CHOICES = [
+    "Select Video Main Type",
+    "Maya Preview / Playblast",
+    "Motion Reference",
+    "Scene / Look Reference",
+    "FX / Simulation Reference",
+    "Custom / Context",
+]
+VIDEO_SUB_TYPE_CHOICES = {
+    "Maya Preview / Playblast": [
+        "Original Preview",
+        "Mask",
+        "Depth",
+        "Motion Guide",
+        "Timing / Edit",
+    ],
+    "Motion Reference": [
+        "Local Motion",
+        "Secondary Motion",
+        "Retargeting Guide",
+    ],
+    "Scene / Look Reference": [
+        "Camera / Layout",
+        "Depth / Spatial",
+        "Lighting / Look",
+        "Composition",
+    ],
+    "FX / Simulation Reference": [
+        "Explosion",
+        "Dust",
+        "Particle",
+    ],
+    "Custom / Context": [
+        "Context",
+        "Custom",
+    ],
+}
+VIDEO_TAXONOMY_WIRE_MAP = {
+    ("Maya Preview / Playblast", "Original Preview"): (
+        "Unified Shot-Control Video",
+        "Primary Unified Shot Control",
+    ),
+    ("Maya Preview / Playblast", "Mask"): (
+        "Maya Preview / Playblast",
+        "Mask / Guide Only",
+    ),
+    ("Maya Preview / Playblast", "Depth"): (
+        "Depth / Spatial Reference",
+        "Spatial Alignment Verification Only",
+    ),
+    ("Maya Preview / Playblast", "Motion Guide"): (
+        "Motion Guide / Retargeting Reference",
+        "Derived Motion Decoding Only",
+    ),
+    ("Maya Preview / Playblast", "Timing / Edit"): (
+        "Timing / Edit Reference",
+        "Timing Only",
+    ),
+    ("Motion Reference", "Local Motion"): (
+        "Motion Reference",
+        "Local Motion Detail Only",
+    ),
+    ("Motion Reference", "Secondary Motion"): (
+        "Motion Reference",
+        "Secondary Motion Only",
+    ),
+    ("Motion Reference", "Retargeting Guide"): (
+        "Motion Guide / Retargeting Reference",
+        "Derived Motion Decoding Only",
+    ),
+    ("Scene / Look Reference", "Camera / Layout"): (
+        "Camera / Layout Reference",
+        "Spatial Alignment Verification Only",
+    ),
+    ("Scene / Look Reference", "Depth / Spatial"): (
+        "Depth / Spatial Reference",
+        "Spatial Alignment Verification Only",
+    ),
+    ("Scene / Look Reference", "Lighting / Look"): (
+        "Lighting / Look Reference",
+        "Lighting / Look Only",
+    ),
+    ("Scene / Look Reference", "Composition"): (
+        "Camera / Layout Reference",
+        "Local Composition Check Only",
+    ),
+    ("FX / Simulation Reference", "Explosion"): (
+        "FX Reference",
+        "FX Behavior Only",
+    ),
+    ("FX / Simulation Reference", "Dust"): (
+        "FX Reference",
+        "FX Behavior Only",
+    ),
+    ("FX / Simulation Reference", "Particle"): (
+        "FX Reference",
+        "FX Behavior Only",
+    ),
+    ("Custom / Context", "Context"): (
+        "Custom",
+        "Context Only",
+    ),
+    ("Custom / Context", "Custom"): (
+        "Custom",
+        "Custom Role",
+    ),
+}
 
 VIDEO_ROLE_COMPATIBILITY = {
     "Maya Preview / Playblast": {
@@ -313,6 +434,32 @@ PRIMARY_VIDEO_SOURCE_TYPES = {
 def _canonical_video_role(value: Any) -> str:
     role = _clean_string(value) if "_clean_string" in globals() else str(value or "").strip()
     return VIDEO_ROLE_ALIASES.get(role, role)
+
+
+def _normalize_video_taxonomy(item: Dict[str, Any]) -> tuple[str, str]:
+    """Normalize new UI values; legacy selections are intentionally released."""
+
+    main_type = _clean_string(item.get("video_main_type"))
+    sub_type = _clean_string(item.get("video_sub_type"))
+    allowed_sub_types = VIDEO_SUB_TYPE_CHOICES.get(main_type, [])
+    if (
+        main_type not in VIDEO_MAIN_TYPE_CHOICES
+        or main_type == "Select Video Main Type"
+        or sub_type not in allowed_sub_types
+    ):
+        main_type = "Select Video Main Type"
+        sub_type = ""
+    item["video_main_type"] = main_type
+    item["video_sub_type"] = sub_type
+    wire_pair = VIDEO_TAXONOMY_WIRE_MAP.get((main_type, sub_type))
+    if wire_pair is None:
+        item["source_type"] = "Role Required / Select Video Type"
+        item["control_role"] = ""
+        item["custom_source_type"] = ""
+        item["custom_control_role"] = ""
+    else:
+        item["source_type"], item["control_role"] = wire_pair
+    return main_type, sub_type
 
 
 def _mode_output():
@@ -445,6 +592,88 @@ def _color_pick_choices_for_source_type(source_type: Any) -> List[str]:
     return image_color_pick_choices_for_source_type(source_type)
 
 
+def _normalize_image_taxonomy(item: Dict[str, Any]) -> tuple[str, str]:
+    """Normalize image authoring fields and rebuild the legacy Agent wire pair.
+
+    Existing ``source_type``/``scope`` values are never used as migration
+    input.  This is deliberate: the v2 taxonomy starts unselected and users
+    explicitly choose the new compact classification.
+    """
+
+    main_type = _clean_string(item.get("image_main_type"))
+    sub_type = _clean_string(item.get("image_sub_type"))
+    allowed_sub_types = image_sub_type_choices_for_main_type(main_type)
+    if (
+        main_type not in IMAGE_MAIN_TYPE_CHOICES
+        or main_type == IMAGE_MAIN_TYPE_UNCLASSIFIED
+        or sub_type not in allowed_sub_types
+    ):
+        main_type = IMAGE_MAIN_TYPE_UNCLASSIFIED
+        sub_type = ""
+    item["image_main_type"] = main_type
+    item["image_sub_type"] = sub_type
+
+    wire_pair = image_taxonomy_wire_pair(main_type, sub_type)
+    if wire_pair is None:
+        item["source_type"] = IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED
+        item["scope"] = ""
+        item["binding_scopes"] = [""]
+        item["binding_custom_scopes"] = [""]
+        item["color_picks"] = [""]
+        item["owner"] = ""
+        item["interaction_targets"] = [""]
+        item["interaction_custom_targets"] = [""]
+        item["legacy_relationship_targets"] = []
+        item["custom_source_type"] = ""
+        item["picker_auto_color"] = ""
+        item["picker_auto_video"] = 0
+        item["picker_auto_source"] = ""
+        return main_type, sub_type
+
+    source_type, scope = wire_pair
+    item["source_type"] = source_type
+    item["scope"] = scope
+    if not (main_type == "Custom / Context" and sub_type == "Custom"):
+        item["custom_source_type"] = ""
+
+    # Look Reference is scene-wide by contract.  It cannot inherit a former
+    # character/prop target when the user changes classification.
+    if main_type == "Look Reference":
+        item["owner"] = "Global Look"
+        item["interaction_targets"] = [""]
+        item["interaction_custom_targets"] = [""]
+        item["legacy_relationship_targets"] = []
+
+    allowed_colors = image_color_pick_choices_for_taxonomy(main_type, sub_type)
+    raw_colors = item.get("color_picks")
+    colors = raw_colors if isinstance(raw_colors, (list, tuple)) else []
+    filtered = [
+        _clean_string(value)
+        for value in colors
+        if _clean_string(value) in allowed_colors
+    ][:MAX_COLOR_PICKS]
+    item["color_picks"] = filtered or [""]
+    count = len(item["color_picks"])
+    item["binding_scopes"] = [scope] * count
+    item["binding_custom_scopes"] = [
+        _clean_string(item.get("custom_source_type"))
+        if scope == "Custom scope"
+        else ""
+    ] * count
+    if not allowed_colors:
+        item["color_picks"] = [""]
+        item["binding_scopes"] = [scope]
+        item["binding_custom_scopes"] = [
+            _clean_string(item.get("custom_source_type"))
+            if scope == "Custom scope"
+            else ""
+        ]
+        item["picker_auto_color"] = ""
+        item["picker_auto_video"] = 0
+        item["picker_auto_source"] = ""
+    return main_type, sub_type
+
+
 def _merge_unique_notes(*values: Any) -> str:
     parts: List[str] = []
     for value in values:
@@ -554,6 +783,8 @@ _IMAGE_ASSET_ROW_KEYS = frozenset({
     "width",
     "height",
     "project_uid",
+    "image_main_type",
+    "image_sub_type",
     "source_type",
     "custom_source_type",
     "scope_candidate",
@@ -1322,6 +1553,10 @@ def _slot_name(prefix: str, index: int) -> str:
 
 def _image_taxonomy_payload() -> Dict[str, Any]:
     return {
+        "image_main_type_choices": list(IMAGE_MAIN_TYPE_CHOICES),
+        "image_sub_type_choices": {
+            key: list(values) for key, values in IMAGE_SUB_TYPE_CHOICES.items()
+        },
         "source_type_choices": list(IMAGE_SOURCE_TYPE_CHOICES),
         "scope_choices": list(IMAGE_SCOPE_CHOICES),
         "scope_choices_by_source_type": {
@@ -1352,6 +1587,8 @@ def _default_image_item(slot: int) -> Dict[str, Any]:
         "asset_source_uid": "",
         "asset_project_uid": "",
         "asset_selection_order": 0,
+        "asset_image_main_type_candidate": "",
+        "asset_image_sub_type_candidate": "",
         "asset_source_type_candidate": "",
         "asset_scope_candidate": "",
         "asset_color_pick_candidates": [],
@@ -1359,6 +1596,8 @@ def _default_image_item(slot: int) -> Dict[str, Any]:
         "asset_managed": False,
         "asset_verified": False,
         "asset_source_kind": "",
+        "image_main_type": IMAGE_MAIN_TYPE_UNCLASSIFIED,
+        "image_sub_type": "",
         "source_type": "Role Required / Select Source Type",
         "custom_source_type": "",
         "owner": "",
@@ -1392,6 +1631,8 @@ def _default_image_item(slot: int) -> Dict[str, Any]:
         "frame_range_binding": None,
         "frame_range_selected_index": -1,
         "manual": True,
+        "image_main_type_choices": IMAGE_MAIN_TYPE_CHOICES,
+        "image_sub_type_choices": IMAGE_SUB_TYPE_CHOICES,
         "source_type_choices": IMAGE_SOURCE_TYPE_CHOICES,
         "owner_choices": IMAGE_OWNER_CHOICES,
         "scope_choices": IMAGE_SCOPE_CHOICES,
@@ -1413,12 +1654,16 @@ def _default_video_item(slot: int) -> Dict[str, Any]:
         "picker_managed": False,
         "present": False,
         "label": "",
+        "video_main_type": "Select Video Main Type",
+        "video_sub_type": "",
         "source_type": "Role Required / Select Video Type",
         "custom_source_type": "",
         "control_role": "",
         "custom_control_role": "",
         "keep_out": "",
         "picker_auto_label": "",
+        "picker_auto_video_main_type": "",
+        "picker_auto_video_sub_type": "",
         "picker_auto_depth": {},
         "picker_auto_motion_guide": {},
         "picker_motion_guide_summary": {},
@@ -1434,6 +1679,8 @@ def _default_video_item(slot: int) -> Dict[str, Any]:
         "picker_companion_source_uid": "",
         "picker_companion_validated": False,
         "manual": slot == 1,
+        "video_main_type_choices": VIDEO_MAIN_TYPE_CHOICES,
+        "video_sub_type_choices": VIDEO_SUB_TYPE_CHOICES,
         "source_type_choices": VIDEO_SOURCE_TYPE_CHOICES,
         "control_role_choices": VIDEO_CONTROL_ROLE_CHOICES,
     }
@@ -2157,15 +2404,20 @@ def _verified_registered_subtype(item: Dict[str, Any]) -> str:
         or _clean_string(item.get("asset_source_kind")).casefold() != "project"
     ):
         return ""
-    subtype = _clean_string(item.get("asset_scope_candidate"))
-    if subtype and subtype in image_scope_choices_for_source_type(
-        item.get("source_type")
+    main_type = _clean_string(item.get("asset_image_main_type_candidate"))
+    subtype = _clean_string(item.get("asset_image_sub_type_candidate"))
+    if (
+        main_type == _clean_string(item.get("image_main_type"))
+        and subtype == _clean_string(item.get("image_sub_type"))
+        and subtype in image_sub_type_choices_for_main_type(main_type)
     ):
-        return subtype
+        wire_pair = image_taxonomy_wire_pair(main_type, subtype)
+        return wire_pair[1] if wire_pair else ""
     return ""
 
 
 def _normalize_image_binding_fields(item: Dict[str, Any], video_count: int = MAX_VIDEOS) -> Dict[str, Any]:
+    _normalize_image_taxonomy(item)
     frame_range_intent = _canonical_frame_range_intent(item)
     picks = _normalize_color_picks(item.get("color_picks"))
     raw_scopes = item.get("binding_scopes")
@@ -2273,6 +2525,8 @@ def _normalize_image_binding_fields(item: Dict[str, Any], video_count: int = MAX
 
 def _image_binding_entries(item: Dict[str, Any], video_count: int = MAX_VIDEOS) -> List[Dict[str, Any]]:
     normalized = _normalize_image_binding_fields(dict(item), video_count)
+    if _clean_string(normalized.get("image_main_type")) == "Look Reference":
+        return []
     entries: List[Dict[str, Any]] = []
     scopes = normalized.get("binding_scopes", [""])
     custom_scopes = normalized.get("binding_custom_scopes", [""])
@@ -2546,6 +2800,12 @@ def _migrate_old_image_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
         )
     except Exception:
         out["asset_selection_order"] = 0
+    out["asset_image_main_type_candidate"] = _clean_string(
+        item.get("asset_image_main_type_candidate")
+    )
+    out["asset_image_sub_type_candidate"] = _clean_string(
+        item.get("asset_image_sub_type_candidate")
+    )
     out["asset_source_type_candidate"] = _clean_string(
         item.get("asset_source_type_candidate")
     )
@@ -2567,6 +2827,8 @@ def _migrate_old_image_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
         item.get("asset_verified")
         and asset_source_kind == "project"
     )
+    out["image_main_type"] = _clean_string(item.get("image_main_type"))
+    out["image_sub_type"] = _clean_string(item.get("image_sub_type"))
     out["source_type"] = _clean_string(item.get("source_type")) or out["source_type"]
     out["custom_source_type"] = _clean_string(item.get("custom_source_type") or item.get("custom_main_type"))
     out["scope"] = _clean_string(item.get("scope"))
@@ -2686,6 +2948,8 @@ def _migrate_old_video_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
     out["picker_managed"] = bool(item.get("picker_managed") or video_uid)
     out["label"] = _clean_string(item.get("label") or item.get("name_override") or item.get("description"))
     out["present"] = bool(item.get("present")) or bool(out["label"])
+    out["video_main_type"] = _clean_string(item.get("video_main_type"))
+    out["video_sub_type"] = _clean_string(item.get("video_sub_type"))
     out["source_type"] = _clean_string(item.get("source_type")) or out["source_type"]
     out["custom_source_type"] = _clean_string(item.get("custom_source_type") or item.get("custom_video_type"))
     out["control_role"] = _canonical_video_role(item.get("control_role"))
@@ -2700,6 +2964,12 @@ def _migrate_old_video_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
         item.get("description"),
     )
     out["picker_auto_label"] = _clean_string(item.get("picker_auto_label"))
+    out["picker_auto_video_main_type"] = _clean_string(
+        item.get("picker_auto_video_main_type")
+    )
+    out["picker_auto_video_sub_type"] = _clean_string(
+        item.get("picker_auto_video_sub_type")
+    )
     out["picker_auto_depth"] = _normalize_picker_auto_depth(
         item.get("picker_auto_depth")
     )
@@ -2812,15 +3082,7 @@ def _migrate_old_video_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
             for value in (unknown_control_role, existing_custom_role)
             if value
         ))
-    # Keep the factual Maya preview type but remove the stale combined
-    # authority. Primary is valid only when the user explicitly selects the
-    # distinct Unified Shot-Control Video main type.
-    if (
-        out.get("source_type") == "Maya Preview / Playblast"
-        and out.get("control_role") == "Primary Unified Shot Control"
-    ):
-        out["control_role"] = ""
-        out["custom_control_role"] = ""
+    _normalize_video_taxonomy(out)
     return out
 
 
@@ -3035,6 +3297,9 @@ def _normalize_dormant_video_rows(
 
 
 _MANUAL_VIDEO_CONTEXT_IMAGE_FIELDS = (
+    "image_main_type",
+    "image_sub_type",
+    "custom_source_type",
     "color_picks",
     "binding_scopes",
     "binding_custom_scopes",
@@ -4512,24 +4777,108 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-_FRAME_RANGE_UI_FIELDS = (
+_PROMPT_IMAGE_UI_FIELDS = (
+    # Prompt-owned controls. Picker/ImageAsset synchronization may replace the
+    # row's transport envelope, but it must not replace these user decisions.
+    "owner",
+    "color_picks",
+    "binding_scopes",
+    "binding_custom_scopes",
+    "binding_video_slots",
+    "marker_video",
+    "preview_marker",
     "frame_range_intent",
 )
+
+_PROMPT_EDITABLE_IMAGE_UI_FIELDS = (
+    # Verified project assets lock these fields in the widget. Native and user-
+    # imported rows keep taxonomy as Prompt-owned authoring controls.
+    "image_main_type",
+    "image_sub_type",
+    "custom_source_type",
+)
+
+_PROMPT_MANUAL_IMAGE_UI_FIELDS = (
+    "label",
+)
+
+_PROMPT_VIDEO_UI_FIELDS = (
+    "custom_source_type",
+    "custom_control_role",
+    "keep_out",
+)
+
+
+def _prompt_revision_image_identity(item: Dict[str, Any], index: int) -> str:
+    """Return one persisted identity shared by source and UI generations."""
+
+    source_uid = _clean_string(
+        item.get("asset_source_uid") or item.get("source_uid")
+    )
+    if source_uid:
+        return f"uid:{source_uid}"
+    library_id = _clean_string(item.get("asset_library_id"))
+    asset_id = _clean_string(item.get("asset_id"))
+    if library_id or asset_id:
+        return f"asset:{library_id}:{asset_id}"
+    asset_path = _clean_string(item.get("asset_path"))
+    if asset_path:
+        return f"path:{asset_path}"
+    return f"slot:{index + 1}"
+
+
+def _prompt_revision_video_identity(item: Dict[str, Any], index: int) -> str:
+    video_uid = _clean_string(item.get("video_uid") or item.get("source_uid"))
+    return f"uid:{video_uid}" if video_uid else f"slot:{index + 1}"
+
+
+def _verified_project_image(item: Dict[str, Any]) -> bool:
+    return bool(
+        item.get("asset_managed")
+        and item.get("asset_verified")
+        and _clean_string(item.get("asset_source_kind")).casefold() == "project"
+    )
+
+
+def _source_managed_image(item: Dict[str, Any]) -> bool:
+    return bool(
+        item.get("asset_managed")
+        or _clean_string(item.get("asset_source_uid"))
+        or _clean_string(item.get("asset_library_id"))
+        or _clean_string(item.get("asset_id"))
+        or _clean_string(item.get("asset_path"))
+    )
+
+
+def _source_managed_video(item: Dict[str, Any]) -> bool:
+    return bool(
+        item.get("picker_managed")
+        or _clean_string(item.get("video_uid") or item.get("source_uid"))
+    )
+
+
+def _copy_prompt_ui_fields(
+    target: Dict[str, Any],
+    source: Dict[str, Any],
+    fields: Sequence[str],
+) -> None:
+    for field in fields:
+        target[field] = copy.deepcopy(source.get(field))
 
 
 def _merge_prompt_revision_axes(
     source_state: Dict[str, Any],
     ui_state: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Merge a newer source snapshot with newer user-authored Range intent.
+    """Merge a newer source snapshot with newer Prompt-authored UI intent.
 
     ``source_sync_revision`` and ``ui_edit_revision`` are independent writer
     clocks.  A Picker/Asset snapshot may therefore be newer on the source axis
     while an in-flight Prompt edit is newer on the UI axis.  Treating that
     crossed pair lexicographically used to accept the whole source snapshot and
     roll Range ON back to OFF.  Keep the higher-source state as the structural
-    base, then carry only Range-authored fields from the higher-UI state for
-    image identities that still exist in that source generation.
+    base, then carry Prompt-owned controls from the higher-UI state for stable
+    image/video identities that still exist in that source generation.
     """
 
     source = _normalize_state(copy.deepcopy(source_state))
@@ -4538,17 +4887,73 @@ def _merge_prompt_revision_axes(
     for index, item in enumerate(ui.get("images", [])):
         if not isinstance(item, dict):
             continue
-        identity = _manual_video_context_image_identity(item, index)
+        identity = _prompt_revision_image_identity(item, index)
         ui_images.setdefault(identity, item)
 
     for index, item in enumerate(source.get("images", [])):
         if not isinstance(item, dict):
             continue
-        ui_item = ui_images.get(_manual_video_context_image_identity(item, index))
+        ui_item = ui_images.get(_prompt_revision_image_identity(item, index))
         if not isinstance(ui_item, dict):
             continue
-        for field in _FRAME_RANGE_UI_FIELDS:
-            item[field] = copy.deepcopy(ui_item.get(field))
+        _copy_prompt_ui_fields(item, ui_item, _PROMPT_IMAGE_UI_FIELDS)
+        if not _verified_project_image(item):
+            _copy_prompt_ui_fields(
+                item,
+                ui_item,
+                _PROMPT_EDITABLE_IMAGE_UI_FIELDS,
+            )
+        if not _source_managed_image(item):
+            _copy_prompt_ui_fields(
+                item,
+                ui_item,
+                _PROMPT_MANUAL_IMAGE_UI_FIELDS,
+            )
+
+    ui_videos: Dict[str, Dict[str, Any]] = {}
+    for index, item in enumerate(ui.get("videos", [])):
+        if not isinstance(item, dict):
+            continue
+        identity = _prompt_revision_video_identity(item, index)
+        ui_videos.setdefault(identity, item)
+
+    for index, item in enumerate(source.get("videos", [])):
+        if not isinstance(item, dict):
+            continue
+        ui_item = ui_videos.get(_prompt_revision_video_identity(item, index))
+        if not isinstance(ui_item, dict):
+            continue
+        _copy_prompt_ui_fields(item, ui_item, _PROMPT_VIDEO_UI_FIELDS)
+        if not _source_managed_video(item):
+            item["label"] = copy.deepcopy(ui_item.get("label"))
+        ui_auto_taxonomy = (
+            _clean_string(ui_item.get("picker_auto_video_main_type")),
+            _clean_string(ui_item.get("picker_auto_video_sub_type")),
+        )
+        ui_taxonomy = (
+            _clean_string(ui_item.get("video_main_type")),
+            _clean_string(ui_item.get("video_sub_type")),
+        )
+        if not all(ui_auto_taxonomy) or ui_taxonomy != ui_auto_taxonomy:
+            item["video_main_type"] = copy.deepcopy(
+                ui_item.get("video_main_type")
+            )
+            item["video_sub_type"] = copy.deepcopy(
+                ui_item.get("video_sub_type")
+            )
+
+    # Connected source inputs do not author Prompt prose. A crossed source/UI
+    # callback therefore keeps the latest accepted text generation.
+    source["text"] = copy.deepcopy(ui.get("text"))
+
+    source_picker = (
+        source.get("picker") if isinstance(source.get("picker"), dict) else {}
+    )
+    ui_picker = ui.get("picker") if isinstance(ui.get("picker"), dict) else {}
+    source_picker["slot_suppressions"] = copy.deepcopy(
+        ui_picker.get("slot_suppressions")
+    )
+    source["picker"] = source_picker
 
     source[SOURCE_SYNC_REVISION_KEY] = max(
         int(source.get(SOURCE_SYNC_REVISION_KEY) or 0),
@@ -5662,48 +6067,43 @@ def _apply_image_asset_payload(
         seen_source_uids.add(source_uid)
         if library_id:
             seen_library_ids.add(library_id)
-        source_type = (
-            _clean_string(metadata.get("source_type"))
-            if project_verified
-            else "Role Required / Select Source Type"
-        )
-        custom_source_type = (
-            _clean_string(metadata.get("custom_source_type"))
-            if project_verified
-            else ""
-        )
-        if project_verified and source_type and source_type not in IMAGE_SOURCE_TYPE_CHOICES:
-            custom_source_type = " | ".join(dict.fromkeys(
-                value for value in (source_type, custom_source_type) if value
-            ))
-            source_type = "Custom"
-        elif not project_verified or not source_type:
-            source_type = "Role Required / Select Source Type"
-        scope_candidate = _clean_string(
-            metadata.get("scope_candidate")
-            or metadata.get("scope")
-            or metadata.get("sub_type")
-        )
-        allowed_scopes = image_scope_choices_for_source_type(source_type)
-        if scope_candidate and scope_candidate not in allowed_scopes:
-            _append_source_intent(
-                normalized,
-                IMAGE_ASSET_INPUT_PARAMETER_NAME,
-                f"custom scope candidate for {image_name}",
-                scope_candidate,
-            )
+        taxonomy_item: Dict[str, Any] = {
+            "image_main_type": (
+                _clean_string(metadata.get("image_main_type"))
+                if project_verified
+                else ""
+            ),
+            "image_sub_type": (
+                _clean_string(metadata.get("image_sub_type"))
+                if project_verified
+                else ""
+            ),
+            "custom_source_type": (
+                _clean_string(metadata.get("custom_source_type"))
+                if project_verified
+                else ""
+            ),
+        }
+        _normalize_image_taxonomy(taxonomy_item)
+        image_main_type = taxonomy_item["image_main_type"]
+        image_sub_type = taxonomy_item["image_sub_type"]
+        source_type = taxonomy_item["source_type"]
+        scope_candidate = taxonomy_item["scope"]
+        custom_source_type = taxonomy_item.get("custom_source_type", "")
         raw_colors = metadata.get("color_pick_candidates")
         if not isinstance(raw_colors, (list, tuple)):
-            raw_colors = (
-                image_color_pick_choices_for_source_type(source_type)
-                if project_verified
-                else []
-            )
-        allowed_colors = image_color_pick_choices_for_source_type(source_type)
+            raw_colors = image_color_pick_choices_for_taxonomy(
+                image_main_type,
+                image_sub_type,
+            ) if project_verified else []
+        allowed_colors = image_color_pick_choices_for_taxonomy(
+            image_main_type,
+            image_sub_type,
+        )
         color_candidates = [
             _clean_string(value)
             for value in raw_colors
-            if _clean_string(value)
+            if _clean_string(value) in allowed_colors
         ]
         for custom_color in color_candidates:
             if custom_color not in allowed_colors:
@@ -5726,6 +6126,8 @@ def _apply_image_asset_payload(
                 "asset_id": asset_id,
                 "image_name": image_name,
                 "asset_path": asset_path,
+                "image_main_type": image_main_type,
+                "image_sub_type": image_sub_type,
                 "source_type": source_type,
                 "custom_source_type": custom_source_type,
                 "scope_candidate": scope_candidate,
@@ -5934,9 +6336,13 @@ def _apply_image_asset_payload(
             item["asset_path"] = asset["asset_path"]
             item["asset_library_id"] = asset["asset_library_id"]
             item["asset_project_uid"] = asset["asset_project_uid"]
+            item["asset_image_main_type_candidate"] = asset["image_main_type"]
+            item["asset_image_sub_type_candidate"] = asset["image_sub_type"]
             item["asset_source_type_candidate"] = asset["source_type"]
             item["asset_scope_candidate"] = asset["scope_candidate"]
             item["asset_color_pick_candidates"] = asset["color_pick_candidates"]
+            item["image_main_type"] = asset["image_main_type"]
+            item["image_sub_type"] = asset["image_sub_type"]
             item["source_type"] = asset["source_type"]
             item["custom_source_type"] = asset["custom_source_type"]
             default_target = _default_image_target_for_main_type(
@@ -6507,6 +6913,8 @@ def _prepare_uid_managed_video_rows(
 _PICKER_AUTO_DEPTH_FIELDS = (
     "label",
     "present",
+    "video_main_type",
+    "video_sub_type",
     "source_type",
     "custom_source_type",
     "control_role",
@@ -8083,6 +8491,28 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
                     video_item["label"] = ""
                     video_item["picker_auto_label"] = ""
                     video_item["present"] = False
+                    auto_main_type = _clean_string(
+                        video_item.get("picker_auto_video_main_type")
+                    )
+                    auto_sub_type = _clean_string(
+                        video_item.get("picker_auto_video_sub_type")
+                    )
+                    if (
+                        auto_main_type
+                        and auto_sub_type
+                        and _clean_string(video_item.get("video_main_type"))
+                        == auto_main_type
+                        and _clean_string(video_item.get("video_sub_type"))
+                        == auto_sub_type
+                    ):
+                        video_item["video_main_type"] = "Select Video Main Type"
+                        video_item["video_sub_type"] = ""
+                        video_item["source_type"] = (
+                            "Role Required / Select Video Type"
+                        )
+                        video_item["control_role"] = ""
+                    video_item["picker_auto_video_main_type"] = ""
+                    video_item["picker_auto_video_sub_type"] = ""
                     if (
                         video_item.get("source_type") == "Maya Preview / Playblast"
                         and not _clean_string(video_item.get("control_role"))
@@ -8144,6 +8574,16 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
         previous_auto_label = _clean_string(video_item.get("picker_auto_label"))
         generated_depth = slot in generated_depth_slots
         generated_motion_guide = slot in generated_motion_guide_slots
+        raw_generation_role = _clean_string(
+            raw_video.get("generation_role")
+        ).casefold()
+        raw_media_kind = _clean_string(raw_video.get("media_kind")).casefold()
+        raw_video_role = _clean_string(raw_video.get("video_role")).casefold()
+        generated_mask = bool(
+            raw_generation_role == "mask"
+            or raw_media_kind == "maya_color_assignment_mask"
+            or raw_video_role == "maya_color_assignment_mask"
+        )
         declared_depth = slot in claimed_depth_slots
         declared_motion_guide = slot in claimed_motion_guide_slots
         if declared_depth or declared_motion_guide:
@@ -8168,6 +8608,8 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             video_item["picker_companion_validated"] = False
         if generated_depth:
             assigned_depth_values: Dict[str, Any] = {
+                "video_main_type": "Maya Preview / Playblast",
+                "video_sub_type": "Depth",
                 "source_type": "Depth / Spatial Reference",
                 "custom_source_type": "",
                 "control_role": "Spatial Alignment Verification Only",
@@ -8187,6 +8629,8 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             )
         elif generated_motion_guide:
             assigned_motion_values: Dict[str, Any] = {
+                "video_main_type": "Maya Preview / Playblast",
+                "video_sub_type": "Motion Guide",
                 "source_type": "Motion Guide / Retargeting Reference",
                 "custom_source_type": "",
                 "control_role": "Derived Motion Decoding Only",
@@ -8208,25 +8652,9 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
                 _picker_motion_guide_summary(raw_video)
             )
         elif declared_depth or declared_motion_guide:
-            declared_type = _clean_string(raw_video.get("source_type_hint")) or (
-                "Depth / Spatial Reference"
-                if declared_depth
-                else "Motion Guide / Retargeting Reference"
-            )
-            declared_role = _canonical_video_role(
-                raw_video.get("control_role_hint")
-            ) or (
-                "Spatial Alignment Verification Only"
-                if declared_depth
-                else "Derived Motion Decoding Only"
-            )
-            if video_item.get("source_type") in (
-                "",
-                "Role Required / Select Video Type",
-            ):
-                video_item["source_type"] = declared_type
-            if not _clean_string(video_item.get("control_role")):
-                video_item["control_role"] = declared_role
+            # A claimed but unverified companion may contribute its label and
+            # diagnostic provenance, but it cannot resurrect a released legacy
+            # Main/Sub selection or author an Agent wire role.
             if slot_path and (
                 not current_label
                 or current_label == previous_auto_label
@@ -8238,16 +8666,44 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
                 video_item["label"] = _video_file_stem(slot_path)
                 video_item["picker_auto_label"] = video_item["label"]
                 video_item["present"] = True
-        elif slot_path and (
-            not current_label
-            or current_label == previous_auto_label
-            or current_label == previous_video_path
-            or current_label == _video_file_stem(previous_video_path)
-            or current_label == _clean_string(previous_picker.get(f"video{slot}_path"))
-        ):
-            video_item["label"] = _video_file_stem(slot_path)
-            video_item["picker_auto_label"] = video_item["label"]
-            video_item["present"] = True
+        elif slot_path:
+            if (
+                not current_label
+                or current_label == previous_auto_label
+                or current_label == previous_video_path
+                or current_label == _video_file_stem(previous_video_path)
+                or current_label
+                == _clean_string(previous_picker.get(f"video{slot}_path"))
+            ):
+                video_item["label"] = _video_file_stem(slot_path)
+                video_item["picker_auto_label"] = video_item["label"]
+                video_item["present"] = True
+            previous_auto_main = _clean_string(
+                video_item.get("picker_auto_video_main_type")
+            )
+            previous_auto_sub = _clean_string(
+                video_item.get("picker_auto_video_sub_type")
+            )
+            current_main = _clean_string(video_item.get("video_main_type"))
+            current_sub = _clean_string(video_item.get("video_sub_type"))
+            taxonomy_is_picker_owned = bool(
+                current_main in {"", "Select Video Main Type"}
+                or (
+                    previous_auto_main
+                    and previous_auto_sub
+                    and current_main == previous_auto_main
+                    and current_sub == previous_auto_sub
+                )
+            )
+            if taxonomy_is_picker_owned:
+                auto_sub_type = "Mask" if generated_mask else "Original Preview"
+                video_item["video_main_type"] = "Maya Preview / Playblast"
+                video_item["video_sub_type"] = auto_sub_type
+                video_item["picker_auto_video_main_type"] = (
+                    "Maya Preview / Playblast"
+                )
+                video_item["picker_auto_video_sub_type"] = auto_sub_type
+                _normalize_video_taxonomy(video_item)
         if (
             not generated_depth
             and not generated_motion_guide
@@ -9915,6 +10371,12 @@ class HMBPromptLibrary(DataNode):
         # to use strict monotonic validation.
         self._hmb_routing_hydration_rebase_pending = False
         self._hmb_routing_hydration_epoch_started = False
+        # A saved Prompt can hydrate before its connected VideoPicker has
+        # accepted the restored ImageAsset channel. That short window is not a
+        # routing contract failure: preserve the saved loader projection and
+        # let the identity-bound post-hydration reconcile retry it. Normal UI
+        # updates and process execution never enable this allowance.
+        self._hmb_picker_route_hydration_pending = False
         # A newly dragged Prompt should immediately adopt the ImageAsset's
         # active Shot and exact Picker snapshot. Serialized workflows disable
         # this one-shot path as soon as their initial widget state arrives, so
@@ -10198,9 +10660,11 @@ class HMBPromptLibrary(DataNode):
         *,
         image_source_node: Any = None,
         picker_source_node: Any = None,
+        allow_picker_hydration_pending: bool = False,
     ) -> tuple[Dict[str, Any], List[str], List[str], bool, bool]:
         """Project one graph-owned shot generation onto Prompt state/media."""
 
+        self._hmb_picker_route_hydration_pending = False
         normalized = _normalize_state(state)
         sources = getattr(self, "_hmb_connected_source_nodes", {})
         legacy_image_source_selected = False
@@ -10361,6 +10825,21 @@ class HMBPromptLibrary(DataNode):
                 and picker_subscription.get("participant_kind") == "video_picker"
                 and not bool(picker_subscription.get("enabled"))
             ):
+                if (
+                    allow_picker_hydration_pending
+                    and bool(expected_channel and current_shot["shot_uuid"])
+                ):
+                    # The durable per-Shot loader state belongs to Picker and
+                    # must not be cleared merely because its channel/catalog is
+                    # later in the host's deserialize stream.
+                    self._hmb_picker_route_hydration_pending = True
+                    return (
+                        normalized,
+                        image_media,
+                        video_media,
+                        image_exact,
+                        False,
+                    )
                 # VideoPicker's independent Only mode is valid even while this
                 # Prompt uses an ImageAsset Shot. A managed edge can survive
                 # for one retained-mode callback during hydration/deletion;
@@ -10370,6 +10849,25 @@ class HMBPromptLibrary(DataNode):
                     normalized, {}, connected=False
                 )
                 picker_api = None
+            elif (
+                allow_picker_hydration_pending
+                and isinstance(picker_subscription, dict)
+                and picker_subscription.get("participant_kind")
+                == "video_picker"
+                and bool(expected_channel and current_shot["shot_uuid"])
+                and _clean_string(
+                    picker_subscription.get("channel_uuid")
+                )
+                != expected_channel
+            ):
+                self._hmb_picker_route_hydration_pending = True
+                return (
+                    normalized,
+                    image_media,
+                    video_media,
+                    image_exact,
+                    False,
+                )
         if callable(picker_api):
             if not expected_channel or not current_shot["shot_uuid"]:
                 # Picker may remain connected while Prompt runs independently.
@@ -10388,8 +10886,31 @@ class HMBPromptLibrary(DataNode):
                     picker_exact,
                 )
             picker_exact = True
+            try:
+                raw_picker_snapshot = picker_api(
+                    expected_channel_uuid=expected_channel
+                )
+            except ValueError as exc:
+                transient_messages = {
+                    "VideoPicker Shot channel is unavailable or does not match.",
+                    "VideoPicker has no validated ImageAsset Shot catalog.",
+                    "VideoPicker automatic Shot route is incomplete.",
+                }
+                if (
+                    allow_picker_hydration_pending
+                    and str(exc) in transient_messages
+                ):
+                    self._hmb_picker_route_hydration_pending = True
+                    return (
+                        normalized,
+                        image_media,
+                        video_media,
+                        image_exact,
+                        False,
+                    )
+                raise
             picker_snapshot = _validate_picker_shot_routing_snapshot(
-                picker_api(expected_channel_uuid=expected_channel),
+                raw_picker_snapshot,
                 expected_channel_uuid=expected_channel,
             )
             _assert_monotonic_shot_route(
@@ -11005,6 +11526,15 @@ class HMBPromptLibrary(DataNode):
             self._hmb_initial_shot_preferred_uuid = ""
             self._hmb_initial_shot_exact_refresh_pending = False
             self._arm_routing_hydration_rebase(value)
+            # Constructor-time caches describe the default dashboard, not the
+            # state the host is about to hydrate. Invalidate the pair here so a
+            # same-looking visible document can never reuse an older private
+            # USER DESCRIPTION/video envelope.
+            if hasattr(self, "_hmb_sync_lock"):
+                self._hmb_last_prompt_semantic_fingerprint = ""
+                self._hmb_last_prompt_output = None
+                self._hmb_last_machine_prompt_output = None
+                self._hmb_last_shot_context = {}
         guarded_widget_write = bool(
             is_widget_write
             and not initial_setup
@@ -11074,7 +11604,9 @@ class HMBPromptLibrary(DataNode):
         try:
             self._hmb_hydration_reconciling = True
             if self._reconcile_connected_source_inputs_from_graph():
-                self._sync_prompt_output_now()
+                self._sync_prompt_output_now(
+                    allow_picker_hydration_pending=True
+                )
         except Exception as exc:
             _diagnostic_exception(
                 "Initial connected source hydration reconciliation failed",
@@ -11204,10 +11736,25 @@ class HMBPromptLibrary(DataNode):
             return False
         accepted_source, accepted_ui = self._hmb_last_accepted_widget_revisions
         incoming_source, incoming_ui = incoming
+        if (incoming_source, incoming_ui) == (accepted_source, accepted_ui):
+            # Equal clocks are acknowledgements, never a second writer turn.
+            # Accept the exact canonical echo, but reject any semantic
+            # divergence: retained-mode hosts can replay an older local payload
+            # after a newer edit while carrying the same revision pair.
+            incoming_state = (
+                value if isinstance(value, dict) else _parse_state(value)
+            )
+            accepted_state = _parse_state(self._hmb_last_accepted_widget_state)
+            if not isinstance(incoming_state, dict) or not incoming_state:
+                return True
+            if not isinstance(accepted_state, dict) or not accepted_state:
+                return False
+            return _normalize_state(incoming_state) != _normalize_state(
+                accepted_state
+            )
         return bool(
             incoming_source <= accepted_source
             and incoming_ui <= accepted_ui
-            and (incoming_source, incoming_ui) != (accepted_source, accepted_ui)
         )
 
     def _restore_accepted_widget_state(self) -> None:
@@ -11232,7 +11779,11 @@ class HMBPromptLibrary(DataNode):
         finally:
             self._hmb_restoring_widget_state = False
 
-    def _write_dashboard_state(self) -> Dict[str, Any]:
+    def _write_dashboard_state(
+        self,
+        *,
+        allow_picker_hydration_pending: bool = False,
+    ) -> Dict[str, Any]:
         if getattr(self, "_hmb_ui_syncing", False):
             return self._current_state()
         try:
@@ -11257,7 +11808,15 @@ class HMBPromptLibrary(DataNode):
                 shot_videos,
                 image_exact,
                 picker_exact,
-            ) = self._apply_exact_shot_routes(state)
+            ) = self._apply_exact_shot_routes(
+                state,
+                allow_picker_hydration_pending=(
+                    allow_picker_hydration_pending
+                ),
+            )
+            picker_route_hydration_pending = bool(
+                getattr(self, "_hmb_picker_route_hydration_pending", False)
+            )
             self._hmb_current_shot_images = list(shot_images)
             self._hmb_current_shot_videos = list(shot_videos)
             image_asset_payload = _parse_image_asset_payload(
@@ -11287,15 +11846,18 @@ class HMBPromptLibrary(DataNode):
             picker_payload = _parse_picker_payload(_get_parameter_raw(self, PICKER_INPUT_PARAMETER_NAME))
             picker_connected = bool(getattr(self, "_hmb_picker_connected", False) or picker_payload)
             pending_picker_hydration = bool(
-                not graph_sources_authoritative
-                and not picker_connected
-                and not picker_payload
-                and str(
-                    previous_source_fingerprints.get(
-                        PICKER_INPUT_PARAMETER_NAME,
-                        "",
-                    )
-                ).startswith("persisted-picker:")
+                picker_route_hydration_pending
+                or (
+                    not graph_sources_authoritative
+                    and not picker_connected
+                    and not picker_payload
+                    and str(
+                        previous_source_fingerprints.get(
+                            PICKER_INPUT_PARAMETER_NAME,
+                            "",
+                        )
+                    ).startswith("persisted-picker:")
+                )
             )
             image_fingerprint_payload = (
                 {"shot_routing": state["image_asset"].get("shot_routing", {})}
@@ -11387,7 +11949,10 @@ class HMBPromptLibrary(DataNode):
             # parameter only when either operation actually changed its value.
             if state != current_state or not isinstance(raw_widget_value, str):
                 _set_parameter_value(self, WIDGET_PARAMETER_NAME, _json_dumps(state))
-            if image_exact or picker_exact:
+            if (
+                (image_exact or picker_exact)
+                and not picker_route_hydration_pending
+            ):
                 self._consume_routing_hydration_rebase()
             self._hmb_source_input_fingerprints = source_input_fingerprints
             return state
@@ -11398,6 +11963,7 @@ class HMBPromptLibrary(DataNode):
         self,
         *,
         publish_shot_media: bool = False,
+        allow_picker_hydration_pending: bool = False,
     ) -> Dict[str, Any]:
         """Commit the latest widget state and refresh PROMPT_OUT immediately.
 
@@ -11407,9 +11973,16 @@ class HMBPromptLibrary(DataNode):
         """
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return {}
-        state, prompt, machine_prompt, fingerprint = (
-            self._compile_current_prompt_pair()
-        )
+        if allow_picker_hydration_pending:
+            state, prompt, machine_prompt, fingerprint = (
+                self._compile_current_prompt_pair(
+                    allow_picker_hydration_pending=True
+                )
+            )
+        else:
+            state, prompt, machine_prompt, fingerprint = (
+                self._compile_current_prompt_pair()
+            )
         output_values = getattr(self, "parameter_output_values", {})
         output_getter = getattr(output_values, "get", None)
         current_output = output_getter("PROMPT_OUT") if callable(output_getter) else None
@@ -11500,17 +12073,30 @@ class HMBPromptLibrary(DataNode):
 
     def _compile_current_prompt_pair(
         self,
+        *,
+        refresh_sources: bool = True,
+        allow_picker_hydration_pending: bool = False,
     ) -> tuple[Dict[str, Any], str, str, str]:
         """Compile both Prompt representations from one current-state snapshot.
 
         Griptape hydrates persisted parameter values after constructing a node.
-        This pure publication-free compiler lets the Agent recover the private
-        pair from those hydrated values without parsing the human document or
-        publishing a second output during Agent resolution.
+        Agent and generator snapshot readers call this with
+        ``refresh_sources=False`` so compiling an already-published generation
+        cannot mutate the host graph or re-enter VideoPicker routing while the
+        Prompt synchronization lock is held. Normal Prompt publication keeps
+        the source refresh enabled and remains the sole route-refresh owner.
         """
 
-        self._reconcile_shared_shot_edges()
-        state = self._write_dashboard_state()
+        if refresh_sources:
+            self._reconcile_shared_shot_edges()
+            if allow_picker_hydration_pending:
+                state = self._write_dashboard_state(
+                    allow_picker_hydration_pending=True
+                )
+            else:
+                state = self._write_dashboard_state()
+        else:
+            state = _normalize_state(self._current_state())
         prompt = _build_prompt_package(state)
         machine_prompt = _build_data_only_prompt_package(state)
         fingerprint = _prompt_semantic_fingerprint(
@@ -11552,38 +12138,80 @@ class HMBPromptLibrary(DataNode):
         incoming = getattr(expected_visible, "value", expected_visible)
         incoming_text = str(incoming or "")
         with self._hmb_sync_lock:
+            (
+                current_state,
+                current_visible,
+                current_machine,
+                current_fingerprint,
+            ) = self._compile_current_prompt_pair(refresh_sources=False)
+            cached_visible = getattr(self, "_hmb_last_prompt_output", None)
+            cached_machine = getattr(
+                self, "_hmb_last_machine_prompt_output", None
+            )
+            use_cached_pair = bool(
+                isinstance(cached_visible, str)
+                and cached_visible.rstrip("\r\n")
+                == incoming_text.rstrip("\r\n")
+                and isinstance(cached_machine, str)
+                and cached_machine
+                and cached_visible == current_visible
+                and cached_machine == current_machine
+                and getattr(
+                    self, "_hmb_last_prompt_semantic_fingerprint", ""
+                )
+                == current_fingerprint
+            )
             # Parameter hydration bypasses after_value_set and the host does not
             # call this library's deserialize/load hooks. Recompile on every
             # Agent snapshot request so a constructor-time default cache can
             # never be paired with later hydrated state. This also catches a
             # machine-only state change whose concise visible text is unchanged.
-            (
-                _state,
-                visible,
-                machine,
-                fingerprint,
-            ) = self._compile_current_prompt_pair()
+            # A valid cached pair is already authoritative and must not be
+            # rebuilt from a host parameter that may still be echoing the
+            # previous generation. Every initial hydration explicitly
+            # invalidates this cache in ``set_parameter_value`` above.
+            if use_cached_pair:
+                _state = current_state
+                visible = cached_visible
+                machine = cached_machine
+                fingerprint = getattr(
+                    self, "_hmb_last_prompt_semantic_fingerprint", ""
+                )
+            else:
+                _state = current_state
+                visible = current_visible
+                machine = current_machine
+                fingerprint = current_fingerprint
             # Griptape's execution hydration removes terminal line separators
             # from a string output. Treat that transport-only normalization as
             # equivalent while keeping every document character before it
             # exact; embedded line breaks and section text remain protected.
             if incoming_text.rstrip("\r\n") != visible.rstrip("\r\n"):
                 raise RuntimeError("HMB Prompt paired snapshot is unavailable.")
-            generation = self._cache_prompt_pair(
-                visible,
-                machine,
-                fingerprint,
-            )
-            try:
-                paired_shot_context = _agent_shot_context(
-                    _state,
-                    prompt_generation=generation,
-                    visible_prompt=incoming_text,
-                    image_media=list(self._hmb_current_shot_images),
-                    video_media=list(self._hmb_current_shot_videos),
+            if use_cached_pair:
+                generation = max(
+                    1,
+                    int(getattr(self, "_hmb_prompt_snapshot_generation", 0) or 0),
                 )
-            except _ShotRoutingContractError:
-                paired_shot_context = {}
+                paired_shot_context = copy.deepcopy(
+                    getattr(self, "_hmb_last_shot_context", {})
+                )
+            else:
+                generation = self._cache_prompt_pair(
+                    visible,
+                    machine,
+                    fingerprint,
+                )
+                try:
+                    paired_shot_context = _agent_shot_context(
+                        _state,
+                        prompt_generation=generation,
+                        visible_prompt=incoming_text,
+                        image_media=list(self._hmb_current_shot_images),
+                        video_media=list(self._hmb_current_shot_videos),
+                    )
+                except _ShotRoutingContractError:
+                    paired_shot_context = {}
             self._hmb_last_agent_context_pair = {
                 "visible_prompt": incoming_text.rstrip("\r\n"),
                 "context": copy.deepcopy(paired_shot_context),
@@ -11625,7 +12253,7 @@ class HMBPromptLibrary(DataNode):
                 self._hmb_agent_pair_local.pair = None
                 return context
             state, visible, machine, fingerprint = (
-                self._compile_current_prompt_pair()
+                self._compile_current_prompt_pair(refresh_sources=False)
             )
             if incoming_text.rstrip("\r\n") != visible.rstrip("\r\n"):
                 raise RuntimeError("HMB Prompt shot context is unavailable.")
@@ -11669,7 +12297,7 @@ class HMBPromptLibrary(DataNode):
             raise RuntimeError("HMB Prompt shot media inputs are invalid.")
         with self._hmb_sync_lock:
             state, visible, machine, fingerprint = (
-                self._compile_current_prompt_pair()
+                self._compile_current_prompt_pair(refresh_sources=False)
             )
             current_images = list(self._hmb_current_shot_images)
             current_videos = list(self._hmb_current_shot_videos)
@@ -11695,12 +12323,20 @@ class HMBPromptLibrary(DataNode):
                 "video_media": current_videos,
             }
 
-    def _sync_prompt_output_now(self) -> Dict[str, Any]:
+    def _sync_prompt_output_now(
+        self,
+        *,
+        allow_picker_hydration_pending: bool = False,
+    ) -> Dict[str, Any]:
         """Invalidate queued callbacks and commit one authoritative snapshot."""
         with self._hmb_sync_lock:
             if bool(getattr(self, "_hmb_node_deleted", False)):
                 return {}
             self._hmb_sync_generation += 1
+            if allow_picker_hydration_pending:
+                return self._sync_prompt_output_from_state(
+                    allow_picker_hydration_pending=True
+                )
             return self._sync_prompt_output_from_state()
 
     def _schedule_prompt_sync(self) -> None:
@@ -11949,7 +12585,9 @@ class HMBPromptLibrary(DataNode):
             payload = _parse_picker_payload(_get_parameter_raw(self, PICKER_INPUT_PARAMETER_NAME))
             if payload:
                 self._hmb_picker_connected = True
-            self._sync_prompt_output_now()
+            self._sync_prompt_output_now(
+                allow_picker_hydration_pending=True
+            )
         except Exception as exc:
             _diagnostic_exception("Picker connection state restore failed", exc)
 

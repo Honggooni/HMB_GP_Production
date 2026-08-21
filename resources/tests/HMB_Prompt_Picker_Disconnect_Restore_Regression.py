@@ -145,6 +145,8 @@ marker_base["images"][0].update(
         "label": "hero.png",
         "asset_id": "hero",
         "asset_source_uid": "hero-source",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
         "color_picks": [""],
         "binding_video_slots": [1],
     }
@@ -342,6 +344,8 @@ legacy_base["images"][0].update(
         "present": True,
         "asset_id": "legacy-asset",
         "asset_source_uid": "legacy-source",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
         "color_picks": [""],
     }
 )

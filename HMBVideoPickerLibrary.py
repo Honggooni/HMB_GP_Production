@@ -82,6 +82,7 @@ WIDGET_NAME = "HMBVideoPickerLibraryWidget"
 WIDGET_LIBRARY_NAME = "HMB_GP_Production"
 WIDGET_STATE_PARAMETER = "HMB_PICKER_STATE"
 WIDGET_COMMAND_PARAMETER = "HMB_PICKER_COMMAND"
+WIDGET_STATE_EMBEDDED_COMMAND_FIELD = "__hmb_picker_command__"
 COMMAND_WIDGET_NAME = "HMBVideoPickerCommandBridgeWidget"
 COMMAND_SCHEMA = "hmb-picker-command"
 COMMAND_VERSION = 1
@@ -216,34 +217,34 @@ PLAYBLAST_RESOLUTIONS = (
     (1920, 1080),
 )
 PICKER_START_WIDTH = 1400
-# Expanded mode keeps the established production canvas.  It is no longer the
-# native cold-mount size: exposing 1200px while the widget is still mounting in
-# compact mode makes React Flow re-fit the entire workspace before the 158px
-# compact row can be measured.
+# Expanded mode keeps the established production canvas and is the native
+# cold-mount size. Compact mode is entered only by the user's header
+# double-click, after the live node and its saved expanded geometry exist.
 PICKER_START_HEIGHT = 1200
-PICKER_NATIVE_SIZE_VERSION = 4
+PICKER_NATIVE_SIZE_VERSION = 6
 PICKER_EXPANDED_SIZE_METADATA_KEY = "hmb_picker_expanded_size"
 PICKER_WIDGET_MIN_WIDTH = 760
-# The compact outer node must be tall enough for Griptape's title, Flow rows,
-# and one 158px Picker parameter row before the JavaScript controller mounts.
-# Unlike the old 158px outer size, this remains visible to the host allocator.
+# The compact outer node minimum covers Griptape's title/Flow chrome plus the
+# populated one-Shot Loader row. JavaScript grows the exact node beyond this
+# floor for every additional Shot; it never caps the list with an inner scroll.
 PICKER_COMPACT_NATIVE_HEIGHT = 360
 PICKER_COMPACT_NATIVE_MIN_HEIGHT = PICKER_COMPACT_NATIVE_HEIGHT
 # Keep the established expanded resize floor separate from the compact native
 # bootstrap. Existing workflows may legitimately contain a manually resized
-# 1151px expanded node; v4 stores that geometry independently.
+# 1151px expanded node; v6 stores that geometry independently.
 PICKER_WIDGET_MIN_HEIGHT = 1151
-# Griptape Nodes 0.122 measures custom-widget rows before their JavaScript
-# factory is mounted.  Advertising the expanded dashboard height (1200px) for
-# a compact-first widget makes the adaptive row allocator hide the widget (and
-# the two adjacent visible rows) behind its ``Collapsed (...)`` footer, so the
-# factory never gets a chance to size the node. This positive bootstrap fits
-# the fixed header plus the standalone Picker's one empty Shot row. The widget
-# replaces it with the exact state-derived compact height after mounting and
-# restores ``PICKER_WIDGET_MIN_HEIGHT`` itself when its full view opens.
-PICKER_WIDGET_COMPACT_MOUNT_HEIGHT = 158
+# The library now starts in the expanded ImageAsset-style hybrid view.  The
+# authored row therefore advertises the expanded dashboard height from the
+# first host layout pass.  Compact mode is entered only by an explicit header
+# double-click and is sized locally by the widget after the workflow has
+# finished loading; this avoids the former 480 -> 1200 cold-mount reflow.
+# Compact Loader rows reserve the full, populated one-Shot card height even
+# before media arrives. Additional Shots grow the widget deterministically in
+# the browser (180px row + 6px gap each) instead of switching between an empty
+# and populated height or introducing an internal scroll cap.
+PICKER_WIDGET_COMPACT_MOUNT_HEIGHT = 252
 # This is the authored parameter-row height, not the React Flow outer height.
-PICKER_WIDGET_START_HEIGHT = PICKER_WIDGET_COMPACT_MOUNT_HEIGHT
+PICKER_WIDGET_START_HEIGHT = PICKER_WIDGET_MIN_HEIGHT
 READ_OVERALL_TIMEOUT_SECONDS = 900
 READ_STALL_TIMEOUT_SECONDS = 180
 PLAYBLAST_OVERALL_TIMEOUT_SECONDS = 7200
@@ -3825,6 +3826,9 @@ def _add_maya_scene_picker(node: Any) -> None:
     property that renders correctly while its value-change lifecycle is not forwarded.
     """
     if parameter_exists(node, "MAYA_SCENE"):
+        _configure_hidden_maya_scene_parameter(
+            _get_parameter_obj(node, "MAYA_SCENE")
+        )
         return
     tooltip = (
         "Select one Maya .mb or .ma scene. READ loads cameras, exact frame range, "
@@ -3881,6 +3885,46 @@ def _add_maya_scene_picker(node: Any) -> None:
             kwargs["traits"] = {trait}
         parameter = Parameter(**kwargs)
     node.add_parameter(parameter)
+    _configure_hidden_maya_scene_parameter(parameter)
+
+
+def _configure_hidden_maya_scene_parameter(parameter: Any) -> None:
+    """Keep the durable Maya path without consuming an adaptive host row.
+
+    The expanded Picker dashboard owns Browse/READ.  Rendering the native
+    FileSystemPicker as a second visible row lets Griptape hide MAYA, COMMAND,
+    and STATE together before the saved dashboard can mount.
+    """
+
+    if parameter is None:
+        return
+    for attribute, setting in (
+        ("hide", True),
+        ("hide_property", True),
+        ("serializable", True),
+    ):
+        try:
+            setattr(parameter, attribute, setting)
+        except Exception:
+            pass
+    try:
+        options = dict(getattr(parameter, "ui_options", {}) or {})
+        options.update({
+            "display_name": "",
+            "height": 0,
+            "min_height": 0,
+            "max_height": 0,
+            "hide": True,
+            "hide_property": True,
+            "hide_label": True,
+            "hide_handles": True,
+            "is_full_width": True,
+            "expandable": False,
+            "resizable": False,
+        })
+        parameter.ui_options = options
+    except Exception as exc:
+        _diagnostic_exception("Maya scene transport row configuration failed", exc)
 
 
 def _remove_parameter(node: Any, name: str) -> None:
@@ -4146,6 +4190,26 @@ def _default_widget_state() -> Dict[str, Any]:
             "viewport_mode": "video",
             "active_snapshot_uid": "",
             "selected_video_slot": 1,
+            "authoring_context": {
+                "version": 1,
+                "scene_stage": "EMPTY",
+                "scene_draft_path": "",
+                "scene_request_path": "",
+                "scene_path": "",
+                "native_read_ready": False,
+                "native_metadata": {},
+                "selected_camera": "",
+                "cameras": [],
+                "selected_outliner_path": "",
+                "selected_outliner_name": "",
+                "selected_outliner_uuid": "",
+                "selected_color": "",
+                "outliner_nodes": [],
+                "outliner_expanded": [],
+                "outliner_search": "",
+                "slot_assignments": [{"video_slot": 1, "bindings": []}],
+                "slot_visibility": [{"video_slot": 1, "hidden_paths": []}],
+            },
         }],
         "active_picker_shot_uuid": picker_workspace_uuid,
         "picker_legacy_membership_fallbacks": {},
@@ -4395,6 +4459,144 @@ def _picker_workspace_uuid_for_bound_shot(shot_uuid: Any) -> str:
     ))
 
 
+PICKER_AUTHORING_CONTEXT_VERSION = 1
+_PICKER_AUTHORING_CONTEXT_FIELDS = (
+    "scene_stage", "scene_draft_path", "scene_request_path", "scene_path",
+    "scene_request_id", "scene_request_source", "scene_request_status",
+    "native_read_ready", "native_read_mode", "native_source_version",
+    "native_metadata", "camera", "selected_camera", "cameras",
+    "source_fps", "output_fps", "output_width", "output_height",
+    "source_frame_count", "output_frame_count", "decoded_frame_count",
+    "source_duration_seconds", "output_duration_seconds", "frame_metadata",
+    "start_frame", "end_frame", "current_frame", "has_maya_frame_range",
+    "workspace_view", "selected_outliner_path", "selected_outliner_name",
+    "selected_outliner_uuid", "selected_color", "outliner_nodes",
+    "outliner_expanded", "outliner_search", "slot_assignments",
+    "slot_visibility", "markers", "original_video_path",
+    "original_video_url", "original_metadata", "original_preview_enabled",
+    "status", "message",
+)
+
+
+def _empty_picker_authoring_context() -> Dict[str, Any]:
+    return {
+        "version": PICKER_AUTHORING_CONTEXT_VERSION,
+        "scene_stage": "EMPTY",
+        "scene_draft_path": "",
+        "scene_request_path": "",
+        "scene_path": "",
+        "scene_request_id": "",
+        "scene_request_source": "",
+        "scene_request_status": "",
+        "native_read_ready": False,
+        "native_read_mode": "",
+        "native_source_version": "",
+        "native_metadata": {},
+        "camera": "",
+        "selected_camera": "",
+        "cameras": [],
+        "source_fps": 0.0,
+        "output_fps": OUTPUT_FPS,
+        "output_width": OUTPUT_WIDTH,
+        "output_height": OUTPUT_HEIGHT,
+        "source_frame_count": 0,
+        "output_frame_count": 0,
+        "decoded_frame_count": 0,
+        "source_duration_seconds": 0.0,
+        "output_duration_seconds": 0.0,
+        "frame_metadata": {},
+        "start_frame": 0.0,
+        "end_frame": 0.0,
+        "current_frame": 0.0,
+        "has_maya_frame_range": False,
+        "workspace_view": "outliner",
+        "selected_outliner_path": "",
+        "selected_outliner_name": "",
+        "selected_outliner_uuid": "",
+        "selected_color": "",
+        "outliner_nodes": [],
+        "outliner_expanded": [],
+        "outliner_search": "",
+        "slot_assignments": [{"video_slot": 1, "bindings": []}],
+        "slot_visibility": [{"video_slot": 1, "hidden_paths": []}],
+        "markers": [],
+        "original_video_path": "",
+        "original_video_url": "",
+        "original_metadata": {},
+        "original_preview_enabled": False,
+        "status": "READY",
+        "message": "Browse to a Maya scene, then press READ.",
+    }
+
+
+def _normalize_picker_authoring_context(value: Any) -> Dict[str, Any]:
+    defaults = _empty_picker_authoring_context()
+    source = value if isinstance(value, dict) else {}
+    context = copy.deepcopy(defaults)
+    for key in _PICKER_AUTHORING_CONTEXT_FIELDS:
+        if key in source:
+            context[key] = copy.deepcopy(source[key])
+    context["version"] = PICKER_AUTHORING_CONTEXT_VERSION
+    for key in (
+        "scene_stage", "scene_request_id", "scene_request_source",
+        "scene_request_status", "native_read_mode", "native_source_version",
+        "camera", "selected_camera", "workspace_view",
+        "selected_outliner_path", "selected_outliner_name",
+        "selected_outliner_uuid", "selected_color", "outliner_search",
+        "original_video_path", "original_video_url", "status", "message",
+    ):
+        context[key] = _clean(context.get(key))
+    for key in ("scene_draft_path", "scene_request_path", "scene_path"):
+        context[key] = _maya_scene_path_text(context.get(key))
+    for key in ("native_read_ready", "has_maya_frame_range", "original_preview_enabled"):
+        context[key] = bool(context.get(key))
+    for key in (
+        "source_fps", "output_fps", "output_width", "output_height",
+        "source_frame_count", "output_frame_count", "decoded_frame_count",
+        "source_duration_seconds", "output_duration_seconds", "start_frame",
+        "end_frame", "current_frame",
+    ):
+        try:
+            numeric = float(context.get(key) or 0.0)
+            context[key] = numeric if math.isfinite(numeric) else defaults[key]
+        except Exception:
+            context[key] = defaults[key]
+    for key in ("native_metadata", "frame_metadata", "original_metadata"):
+        context[key] = (
+            copy.deepcopy(context.get(key))
+            if isinstance(context.get(key), dict)
+            else {}
+        )
+    for key in (
+        "cameras", "outliner_nodes", "outliner_expanded", "slot_assignments",
+        "slot_visibility", "markers",
+    ):
+        context[key] = (
+            copy.deepcopy(context.get(key))
+            if isinstance(context.get(key), list)
+            else []
+        )
+    return context
+
+
+def _picker_authoring_context_from_state(state: Any) -> Dict[str, Any]:
+    source = state if isinstance(state, dict) else {}
+    context = _empty_picker_authoring_context()
+    for key in _PICKER_AUTHORING_CONTEXT_FIELDS:
+        if key in source:
+            context[key] = copy.deepcopy(source[key])
+    return _normalize_picker_authoring_context(context)
+
+
+def _apply_picker_authoring_context(
+    state: Dict[str, Any],
+    value: Any,
+) -> None:
+    context = _normalize_picker_authoring_context(value)
+    for key in _PICKER_AUTHORING_CONTEXT_FIELDS:
+        state[key] = copy.deepcopy(context[key])
+
+
 def _new_picker_workspace_row(
     number: int,
     *,
@@ -4464,6 +4666,7 @@ def _new_picker_workspace_row(
         ),
         "active_snapshot_uid": _clean(source.get("active_snapshot_uid")),
         "selected_video_slot": selected_video_slot,
+        "authoring_context": _picker_authoring_context_from_state(source),
     }
 
 
@@ -4771,6 +4974,9 @@ def _normalize_picker_workspace_fields(
             ),
             "active_snapshot_uid": active_snapshot_uid,
             "selected_video_slot": selected_video_slot,
+            "authoring_context": _normalize_picker_authoring_context(
+                raw.get("authoring_context")
+            ),
         }
         rows.append(row)
         source_by_workspace[workspace_uuid] = raw
@@ -4954,6 +5160,7 @@ def _normalize_picker_workspace_fields(
             else "video"
         ),
         "active_snapshot_uid": active_snapshot_uid,
+        "authoring_context": _picker_authoring_context_from_state(state),
     })
 
     retained_catalog: List[Dict[str, Any]] = []
@@ -5076,6 +5283,30 @@ def _normalize_picker_workspace_fields(
         ).encode("utf-8")
     ).hexdigest()
     state["picker_shots"] = rows
+    # ``picker_shots`` is the durable media owner. Keep the compact routing
+    # rows synchronized from that authority on every save/reload. Older saved
+    # files could contain full Shot membership here while ``shot_selections``
+    # remained empty, causing Prompt hydration to observe an empty Picker even
+    # though every video card was still serialized.
+    workspaces_by_bound_uuid = {
+        _uuid_text(row.get("bound_shot_uuid")): row
+        for row in rows
+        if _uuid_text(row.get("bound_shot_uuid"))
+    }
+    synchronized_shot_selections: List[Dict[str, Any]] = []
+    for raw_selection in state.get("shot_selections", []):
+        if not isinstance(raw_selection, dict):
+            continue
+        selection = dict(raw_selection)
+        workspace = workspaces_by_bound_uuid.get(
+            _uuid_text(selection.get("shot_uuid"))
+        )
+        if workspace is not None:
+            selection["selected_video_uids"] = list(
+                workspace.get("selected_video_uids") or []
+            )[:MAX_SELECTED_VIDEOS]
+        synchronized_shot_selections.append(selection)
+    state["shot_selections"] = synchronized_shot_selections
 
 
 def _activate_picker_workspace_projection(
@@ -5140,6 +5371,10 @@ def _activate_picker_workspace_projection(
         "active_snapshot_uid": _clean(target.get("active_snapshot_uid")),
         "selected_video_slot": max(1, int(target.get("selected_video_slot") or 1)),
     })
+    _apply_picker_authoring_context(
+        projected,
+        target.get("authoring_context"),
+    )
     bound_shot_uuid = _uuid_text(target.get("bound_shot_uuid"))
     bound_remote = next(
         (
@@ -9133,6 +9368,11 @@ def _configure_picker_command_parameter(parameter: Any) -> None:
         ("type", "dict"),
         ("input_types", ["dict"]),
         ("settable", True),
+        ("hide", True),
+        ("hide_property", True),
+        # SaveWorkflow serializes parameter_values. Keep the full Shot/media
+        # catalog durable instead of treating this widget value as ephemeral.
+        ("serializable", True),
     ]
     mode = _mode_set("PROPERTY")
     if mode is not None:
@@ -9144,22 +9384,6 @@ def _configure_picker_command_parameter(parameter: Any) -> None:
             setattr(parameter, attribute, value)
         except Exception as exc:
             _diagnostic_exception(f"Command parameter attribute {attribute} setup failed", exc)
-    if Widget is not None:
-        has_widget = False
-        try:
-            finder = getattr(parameter, "find_elements_by_type", None)
-            if callable(finder):
-                has_widget = any(
-                    _clean(getattr(item, "name", "")) == COMMAND_WIDGET_NAME
-                    for item in finder(Widget, find_recursively=True)
-                )
-        except Exception as exc:
-            _diagnostic_exception("Command bridge widget inspection failed", exc)
-        if not has_widget:
-            try:
-                parameter.add_trait(Widget(name=COMMAND_WIDGET_NAME, library=WIDGET_LIBRARY_NAME))
-            except Exception as exc:
-                _diagnostic_exception("Command bridge widget registration failed", exc)
     try:
         setattr(parameter, "default_value", _parse_picker_command(getattr(parameter, "default_value", None)))
     except Exception as exc:
@@ -9169,9 +9393,9 @@ def _configure_picker_command_parameter(parameter: Any) -> None:
         options.update({
             "display_name": "",
             "is_full_width": True,
-            "height": 1,
+            "height": 0,
             "min_height": 0,
-            "max_height": 1,
+            "max_height": 0,
             # Griptape classifies every custom widget as an expandable row
             # unless this flag is explicitly false. This invisible command
             # bridge must remain mounted, but must never share the node's free
@@ -9181,6 +9405,8 @@ def _configure_picker_command_parameter(parameter: Any) -> None:
             "resizable": False,
             "hide_label": True,
             "hide_handles": True,
+            "hide": True,
+            "hide_property": True,
         })
         setattr(parameter, "ui_options", options)
     except Exception as exc:
@@ -9200,9 +9426,9 @@ def _add_picker_command_bridge(node: Any) -> None:
         "ui_options": {
             "display_name": "",
             "is_full_width": True,
-            "height": 1,
+            "height": 0,
             "min_height": 0,
-            "max_height": 1,
+            "max_height": 0,
             "expandable": False,
             "compact": True,
             "resizable": False,
@@ -9215,18 +9441,7 @@ def _add_picker_command_bridge(node: Any) -> None:
         kwargs["allowed_modes"] = mode
     else:
         kwargs.update({"allow_input": False, "allow_output": False, "allow_property": True})
-    try:
-        if Widget is not None:
-            parameter = Parameter(**{**kwargs, "traits": {Widget(name=COMMAND_WIDGET_NAME, library=WIDGET_LIBRARY_NAME)}})
-        else:
-            parameter = Parameter(**kwargs)
-    except Exception:
-        parameter = Parameter(**kwargs)
-        if Widget is not None:
-            try:
-                parameter.add_trait(Widget(name=COMMAND_WIDGET_NAME, library=WIDGET_LIBRARY_NAME))
-            except Exception as exc:
-                _diagnostic_exception("Command bridge fallback widget registration failed", exc)
+    parameter = Parameter(**kwargs)
     node.add_parameter(parameter)
     _configure_picker_command_parameter(parameter)
 
@@ -9238,6 +9453,12 @@ def _configure_picker_widget_parameter(parameter: Any) -> None:
         ("type", "dict"),
         ("input_types", ["dict"]),
         ("settable", True),
+        # Explicitly clear a stale host allocator latch. Older Picker builds
+        # could leave this serializable state row hidden as Collapsed (3),
+        # preventing the saved media catalog from ever reaching the widget.
+        ("hide", False),
+        ("hide_property", False),
+        ("serializable", True),
     ]
     mode = _mode_set("PROPERTY")
     if mode is not None:
@@ -9276,28 +9497,32 @@ def _configure_picker_widget_parameter(parameter: Any) -> None:
         options.update({
             "display_name": "HMBVideoPickerLibrary",
             "is_full_width": True,
-            "height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
+            "height": PICKER_WIDGET_START_HEIGHT,
             "min_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
-            "widget_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
+            "widget_height": PICKER_WIDGET_START_HEIGHT,
             "width": PICKER_START_WIDTH,
             "min_width": PICKER_WIDGET_MIN_WIDTH,
             "preferred_width": PICKER_START_WIDTH,
-            "preferred_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
+            "preferred_height": PICKER_WIDGET_START_HEIGHT,
             "default_width": PICKER_START_WIDTH,
-            "default_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
+            "default_height": PICKER_WIDGET_START_HEIGHT,
             "initial_width": PICKER_START_WIDTH,
-            "initial_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
-            "node_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
-            "default_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
-            "initial_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
-            # The HMB widget owns compact/expanded mode through its internal
-            # double-click controller.  Griptape's host-level expandable row
-            # allocator must stay disabled; otherwise a cold mount can move
-            # this state row (and its two companion rows) into Collapsed (3)
-            # before the widget has a chance to render or recover its height.
-            "expandable": False,
+            "initial_height": PICKER_WIDGET_START_HEIGHT,
+            "node_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
+            "default_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
+            "initial_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
+            # This is the only visible Picker row. Griptape initially measures
+            # custom rows at 40px; an expandable row receives the remaining
+            # stack height immediately while its hidden measurement copy
+            # settles. A non-expandable row stays at 40px and clips the full
+            # dashboard below its header, leaving the rest of the node as the
+            # host's black trailing spacer. Hidden MAYA/COMMAND transports stay
+            # non-expandable and therefore cannot compete for this free height.
+            "expandable": True,
             "resizable": True,
             "compact": False,
+            "hide": False,
+            "hide_property": False,
         })
         setattr(parameter, "ui_options", options)
     except Exception as exc:
@@ -9341,30 +9566,34 @@ def _add_picker_widget(node: Any) -> None:
         "default_value": _default_widget_state(),
         "type": "dict",
         "input_types": ["dict"],
+        "serializable": True,
         "tooltip": "Maya Outliner reader, per-video Color Pick assignment editor, and temporary-shader Playblast generator.",
         "ui_options": {
             "display_name": "HMBVideoPickerLibrary",
             "is_full_width": True,
-            "height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
+            "height": PICKER_WIDGET_START_HEIGHT,
             "min_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
-            "widget_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
+            "widget_height": PICKER_WIDGET_START_HEIGHT,
             "width": PICKER_START_WIDTH,
             "min_width": PICKER_WIDGET_MIN_WIDTH,
             "preferred_width": PICKER_START_WIDTH,
-            "preferred_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
+            "preferred_height": PICKER_WIDGET_START_HEIGHT,
             "default_width": PICKER_START_WIDTH,
-            "default_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
+            "default_height": PICKER_WIDGET_START_HEIGHT,
             "initial_width": PICKER_START_WIDTH,
-            "initial_height": PICKER_WIDGET_COMPACT_MOUNT_HEIGHT,
-            "node_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
-            "default_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
-            "initial_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
-            # Compact/expanded mode is owned by the custom widget.  Keeping
-            # host adaptive expansion disabled guarantees that the state row
-            # remains mounted during cold load, reload, and mode transitions.
-            "expandable": False,
+            "initial_height": PICKER_WIDGET_START_HEIGHT,
+            "node_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
+            "default_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
+            "initial_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
+            # The visible state row must participate in the host's expandable
+            # allocation from the first 40px measurement pass. Compact/full
+            # switching remains widget-owned; hidden transport rows remain
+            # non-expandable so only this dashboard receives spare height.
+            "expandable": True,
             "resizable": True,
             "compact": False,
+            "hide": False,
+            "hide_property": False,
         },
     }
     mode = _mode_set("PROPERTY")
@@ -9800,6 +10029,75 @@ def _external_media_url(path: Path) -> str:
         return str(resolved).replace("\\", "/")
 
 
+def _refresh_saved_video_media_urls(
+    value: Any,
+) -> tuple[Dict[str, Any], bool]:
+    """Rebind saved video cards to this engine's static-media server.
+
+    Workflow files persist durable project/absolute paths. ``video_url`` is
+    process-local because Griptape chooses a static-server origin per launch.
+    Missing files remain assigned to their Shot and are reported rather than
+    being silently removed from the user's saved ordering and selection.
+    """
+
+    state = _parse_state(value)
+    videos = [
+        dict(item)
+        for item in state.get("videos", [])
+        if isinstance(item, dict)
+    ]
+    warnings = _normalize_ui_warnings(state.get("warnings"))
+    changed = False
+    restored_count = 0
+
+    for item in videos:
+        references: List[str] = []
+        for field in (
+            "project_video_path",
+            "video_path",
+            "import_source_path",
+        ):
+            reference = _clean(item.get(field))
+            if reference and reference not in references:
+                references.append(reference)
+        resolved = next(
+            (
+                candidate
+                for candidate in (
+                    _resolve_readable_video_reference(reference)
+                    for reference in references
+                )
+                if candidate is not None
+            ),
+            None,
+        )
+        if resolved is not None:
+            restored_count += 1
+            refreshed_url = _external_media_url(resolved)
+            if refreshed_url and refreshed_url != _clean(item.get("video_url")):
+                item["video_url"] = refreshed_url
+                changed = True
+            continue
+
+        if references:
+            label = _selected_video_label(item)
+            warning = (
+                f"Saved video is unavailable: {label}. The Shot assignment "
+                "and card were preserved; restore the file and reload."
+            )
+            if warning not in warnings:
+                warnings.append(warning)
+                changed = True
+
+    previous_count = int(state.get("saved_video_restore_count") or 0)
+    if previous_count != restored_count:
+        changed = True
+    state["videos"] = videos
+    state["warnings"] = warnings[-20:]
+    state["saved_video_restore_count"] = restored_count
+    return _parse_state(state), changed
+
+
 def _decode_maya_text(value: bytes) -> str:
     raw = bytes(value or b"").rstrip(b"\0")
     for encoding in ("utf-8", "cp949", "latin-1"):
@@ -9976,6 +10274,7 @@ def _maya_subprocess_environment(job_path: Path) -> Dict[str, str]:
         runner_path.read_bytes()
     ).hexdigest()
     env["PYTHONUTF8"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["MAYA_DISABLE_CIP"] = "1"
     env["MAYA_DISABLE_CER"] = "1"
     env["MAYA_DISABLE_ADP"] = "1"
@@ -9996,7 +10295,7 @@ def _maya_subprocess_environment(job_path: Path) -> Dict[str, str]:
 def _maya_runner_command() -> str:
     """Load the verified runner by absolute path, never by ambient sys.path."""
     code = (
-        "import hashlib,importlib.util,os;"
+        "import hashlib,importlib.util,os,sys;sys.dont_write_bytecode=True;"
         "p=os.path.abspath(os.environ['HMB_VIDEO_PICKER_RUNNER']);"
         "e=os.environ['HMB_VIDEO_PICKER_RUNNER_SHA256'].lower();"
         "a=hashlib.sha256(__import__('pathlib').Path(p).read_bytes()).hexdigest().lower();"
@@ -10057,6 +10356,7 @@ def _choose_maya_scene_file(initial_value: Any = "") -> str:
         initial_directory = str(initial_dir) if initial_dir and initial_dir.is_dir() else ""
         escaped_initial = initial_directory.replace("'", "''")
         script = (
+            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
             "Add-Type -AssemblyName System.Windows.Forms; "
             "$d=New-Object System.Windows.Forms.OpenFileDialog; "
             "$d.Title='Open Maya Scene'; "
@@ -10069,14 +10369,17 @@ def _choose_maya_scene_file(initial_value: Any = "") -> str:
             completed = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-STA", "-Command", script],
                 capture_output=True,
-                text=True,
+                text=False,
                 timeout=600,
                 creationflags=_creation_flags(),
                 check=False,
             )
-            selected = _clean(completed.stdout)
+            selected = _decode_maya_text(bytes(completed.stdout or b""))
             if completed.returncode != 0:
-                raise RuntimeError(_clean(completed.stderr) or "PowerShell file dialog failed.")
+                raise RuntimeError(
+                    _decode_maya_text(bytes(completed.stderr or b""))
+                    or "PowerShell file dialog failed."
+                )
         except Exception as powershell_exc:
             raise RuntimeError(
                 "The native Maya scene browser could not be opened with Tk or Windows Forms: "
@@ -10122,6 +10425,7 @@ def _choose_video_asset_files(initial_value: Any = "") -> List[str]:
         )
         escaped_initial = initial_directory.replace("'", "''")
         script = (
+            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
             "Add-Type -AssemblyName System.Windows.Forms; "
             "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; using System.Windows.Forms; public sealed class HmbPickerOwner : IWin32Window { public HmbPickerOwner(IntPtr handle) { Handle = handle; } public IntPtr Handle { get; private set; } } public static class HmbPickerNative { [DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow(); }'; "
             "$foreground=[HmbPickerNative]::GetForegroundWindow(); "
@@ -10145,19 +10449,20 @@ def _choose_video_asset_files(initial_value: Any = "") -> List[str]:
                 script,
             ],
             capture_output=True,
-            text=True,
+            text=False,
             timeout=600,
             creationflags=_creation_flags(),
             check=False,
         )
+        stdout_text = _decode_maya_text(bytes(completed.stdout or b""))
         selected = [
             line.strip()
-            for line in str(completed.stdout or "").splitlines()
+            for line in stdout_text.splitlines()
             if line.strip()
         ]
         if completed.returncode != 0:
             raise RuntimeError(
-                _clean(completed.stderr)
+                _decode_maya_text(bytes(completed.stderr or b""))
                 or "The Windows MP4 file dialog failed."
             )
     else:
@@ -11561,15 +11866,14 @@ def _normalized_picker_native_size(
 def _restored_picker_native_geometry(
     serialized_metadata: Any,
 ) -> tuple[Dict[str, Any], Dict[str, Any], bool]:
-    """Split cold compact geometry from the saved expanded user geometry.
+    """Restore one stable expanded cold-mount geometry for the hybrid widget.
 
-    v3 used one ``metadata.size`` field for two incompatible owners: Python
-    advertised 1400x1200 while the compact widget measured a 158px row.  That
-    transient 1200 -> 158 disagreement made React Flow auto-fit the workspace
-    and could collapse all three Picker parameters before the live controller
-    mounted.  v4 always hydrates the native node at one stable 1400x360 compact
-    size.  Any valid expanded size is retained independently and can only be
-    applied by an explicit full-view transition.
+    The v4/v5 modal implementation hydrated a compact outer node and then
+    opened the authoring UI in a browser ``dialog``.  Besides being unlike the
+    ImageAsset hybrid, that split produced a clipped compact row after the
+    dialog was closed.  v6 starts with the expanded geometry that the inline
+    widget actually renders.  Compact geometry is an explicit, session-local
+    header toggle and never becomes the next workflow's cold-mount authority.
     """
     metadata = serialized_metadata if isinstance(serialized_metadata, dict) else {}
     raw_size = metadata.get("size")
@@ -11588,10 +11892,7 @@ def _restored_picker_native_geometry(
         "width": PICKER_START_WIDTH,
         "height": PICKER_START_HEIGHT,
     }
-    compact_size = {
-        "width": PICKER_START_WIDTH,
-        "height": PICKER_COMPACT_NATIVE_HEIGHT,
-    }
+    initial_size = dict(expanded_size)
     try:
         native_size_version = max(
             0,
@@ -11599,41 +11900,51 @@ def _restored_picker_native_geometry(
         )
     except (TypeError, ValueError, OverflowError):
         native_size_version = 0
-    current_compact_size = _normalized_picker_native_size(
+    current_native_size = _normalized_picker_native_size(
         raw_size,
-        minimum_height=PICKER_COMPACT_NATIVE_MIN_HEIGHT,
+        minimum_height=PICKER_WIDGET_MIN_HEIGHT,
     )
     canonical = (
         native_size_version == PICKER_NATIVE_SIZE_VERSION
-        and current_compact_size == compact_size
+        and current_native_size == initial_size
         and saved_expanded_size == expanded_size
     )
-    return compact_size, expanded_size, not canonical
+    return initial_size, expanded_size, not canonical
 
 
 def _restored_picker_native_size(
     serialized_metadata: Any,
 ) -> tuple[Dict[str, Any], bool]:
-    """Compatibility wrapper returning the v4 cold-mount compact geometry."""
-    compact_size, _expanded_size, migrated = _restored_picker_native_geometry(
+    """Compatibility wrapper returning the v6 expanded cold-mount geometry."""
+    initial_size, _expanded_size, migrated = _restored_picker_native_geometry(
         serialized_metadata
     )
-    return compact_size, migrated
+    return initial_size, migrated
 
 
 class HMBVideoPickerLibrary(DataNode):
+    """One UI facade over two deliberately separated responsibilities.
+
+    ``picker_shots`` plus the global ``videos`` catalog form the durable,
+    per-Shot loader. Maya READ/Outliner/Color Pick data lives in each row's
+    ``authoring_context`` and may only append a validated artifact to the
+    workspace UUID captured when the operation starts. Switching scenes or
+    Shots may reset/restore Maya authoring state; it must never replace or
+    delete the loader catalog owned by another Shot.
+    """
+
     def __init__(self, **kwargs: Any):
         serialized_metadata = kwargs.get("metadata")
-        compact_size, expanded_size, _size_migrated = _restored_picker_native_geometry(
+        initial_size, expanded_size, _size_migrated = _restored_picker_native_geometry(
             serialized_metadata
         )
-        # Prepare v4 metadata before DataNode/React Flow sees it. Passing the
-        # serialized 1200px expanded size through ``super`` even briefly is the
-        # load-time race this migration removes.
+        # Prepare v6 metadata before DataNode/React Flow sees it.  The first
+        # widget paint is expanded, so the host and widget now agree on the
+        # same 1200px geometry from the initial graph layout onward.
         prepared_metadata = (
             dict(serialized_metadata) if isinstance(serialized_metadata, dict) else {}
         )
-        prepared_metadata["size"] = dict(compact_size)
+        prepared_metadata["size"] = dict(initial_size)
         prepared_metadata[PICKER_EXPANDED_SIZE_METADATA_KEY] = dict(expanded_size)
         prepared_metadata["hmb_picker_native_size_version"] = PICKER_NATIVE_SIZE_VERSION
         prepared_kwargs = dict(kwargs)
@@ -11644,30 +11955,30 @@ class HMBVideoPickerLibrary(DataNode):
         self.metadata = current_metadata
         self.category = "HMB_GP_Production"
         self.description = (
-            "Maya cut reader, Color Pick assignment editor, append-only video "
-            "asset history, and Color/Depth/Motion playblast generator."
+            "Per-Shot video loader with durable order/selection, plus a Maya "
+            "Picker that appends validated Color/Depth/Motion playblasts to "
+            "the captured Shot without replacing its loader history."
         )
-        # Node ui_options describe only the cold/reload compact shell. Expanded
-        # geometry remains in metadata and is applied solely by the widget's
-        # explicit full-view controller.
+        # Node ui_options describe the initial expanded hybrid surface.
+        # Compact mode is an explicit session-local header toggle.
         self.ui_options = {
             "width": PICKER_START_WIDTH,
-            "height": PICKER_COMPACT_NATIVE_HEIGHT,
+            "height": PICKER_START_HEIGHT,
             "default_width": PICKER_START_WIDTH,
-            "default_height": PICKER_COMPACT_NATIVE_HEIGHT,
+            "default_height": PICKER_START_HEIGHT,
             "preferred_width": PICKER_START_WIDTH,
-            "preferred_height": PICKER_COMPACT_NATIVE_HEIGHT,
+            "preferred_height": PICKER_START_HEIGHT,
             "initial_width": PICKER_START_WIDTH,
-            "initial_height": PICKER_COMPACT_NATIVE_HEIGHT,
-            "node_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
-            "default_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
-            "initial_size": {"width": PICKER_START_WIDTH, "height": PICKER_COMPACT_NATIVE_HEIGHT},
+            "initial_height": PICKER_START_HEIGHT,
+            "node_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
+            "default_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
+            "initial_size": {"width": PICKER_START_WIDTH, "height": PICKER_START_HEIGHT},
             "min_width": PICKER_WIDGET_MIN_WIDTH,
             "min_height": PICKER_COMPACT_NATIVE_MIN_HEIGHT,
             "resizable": True,
         }
-        self.width = compact_size["width"]
-        self.height = compact_size["height"]
+        self.width = initial_size["width"]
+        self.height = initial_size["height"]
         self._hmb_video_output: Any = None
         self._hmb_node_deleted = False
         self._hmb_lifecycle_generation = 1
@@ -11684,6 +11995,7 @@ class HMBVideoPickerLibrary(DataNode):
         self._hmb_state_sync_local = threading.local()
         self._hmb_state_write_lock = threading.RLock()
         self._hmb_command_lock = threading.RLock()
+        self._hmb_embedded_command_queue: List[Dict[str, Any]] = []
         # Serializes catalog authority changes and MP4 import commits. File
         # browsers may run concurrently, but no stale whole-state import may
         # overwrite another import or resurrect an ImageAsset-deleted Shot.
@@ -11963,6 +12275,24 @@ class HMBVideoPickerLibrary(DataNode):
             )
             normalized["writer_lifecycle_generation"] = owner_generation
             normalized["state_published_at_ms"] = int(time.time() * 1000)
+            # SaveWorkflow reads ``node.parameter_values`` directly. Stage the
+            # completed import/reorder snapshot there before broadcasting it to
+            # the retained UI, so an immediate Ctrl+S cannot serialize the
+            # previous video catalog while the browser notification is pending.
+            parameter_values = getattr(self, "parameter_values", None)
+            had_serialized_value = (
+                isinstance(parameter_values, dict)
+                and WIDGET_STATE_PARAMETER in parameter_values
+            )
+            previous_serialized_value = (
+                copy.deepcopy(parameter_values.get(WIDGET_STATE_PARAMETER))
+                if isinstance(parameter_values, dict)
+                else None
+            )
+            self._store_initial_parameter_value(
+                WIDGET_STATE_PARAMETER,
+                normalized,
+            )
             _begin_state_sync(self)
             try:
                 if not _request_parameter_value(
@@ -11972,6 +12302,15 @@ class HMBVideoPickerLibrary(DataNode):
                     "dict",
                 ):
                     _set_parameter_value(self, WIDGET_STATE_PARAMETER, normalized)
+            except Exception:
+                if isinstance(parameter_values, dict):
+                    if had_serialized_value:
+                        parameter_values[WIDGET_STATE_PARAMETER] = (
+                            previous_serialized_value
+                        )
+                    else:
+                        parameter_values.pop(WIDGET_STATE_PARAMETER, None)
+                raise
             finally:
                 _end_state_sync(self)
             if (
@@ -12004,24 +12343,32 @@ class HMBVideoPickerLibrary(DataNode):
         authoritative_revision = int(merged.get("state_revision") or 0)
         incoming_revision = int(incoming.get("state_revision") or 0)
         stale_picker_echo = incoming_revision < authoritative_revision
-        widget_owned_fields = {
+        widget_layout_fields = {
             "lower_panel_ratio", "main_split_ratio", "right_split_ratio", "node_width", "node_height",
             "outliner_panel_height", "viewport_panel_height", "right_section_heights",
             "ui_layout_version", "ui_theme",
+            "activity_log_text", "activity_log_text_user_edited", "activity_log_cleared",
+        }
+        widget_authoring_fields = {
             "workspace_view", "selected_outliner_path", "selected_outliner_name", "selected_outliner_uuid",
             "selected_color", "outliner_expanded", "outliner_search", "selected_camera",
             "slot_assignments", "slot_visibility", "snapshot_frame", "snapshot_video_slot",
-            "activity_log_text", "activity_log_text_user_edited", "activity_log_cleared",
             "scene_draft_path", "scene_request_path",
             "output_width", "output_height",
             "original_enabled", "mask_enabled",
             "depth_enabled", "motion_guide_enabled",
             "depth_video_slot", "motion_guide_video_slot",
         }
-        for key in widget_owned_fields:
+        for key in widget_layout_fields:
             if key in incoming:
                 merged[key] = incoming[key]
         if not stale_picker_echo:
+            # A READ result is backend authority. Delayed browser props from
+            # before READ must never erase its Outliner, selected Maya object,
+            # or color bindings. Current UI edits still merge normally.
+            for key in widget_authoring_fields:
+                if key in incoming:
+                    merged[key] = incoming[key]
             # Catalog rows and media are Python/ImageAsset authority even when
             # a browser echo has the same revision. Apply only workspace-UUID
             # scoped UI deltas; never accept row creation/removal, ownership,
@@ -12039,7 +12386,29 @@ class HMBVideoPickerLibrary(DataNode):
                 row = dict(raw_row)
                 workspace_uuid = _uuid_text(row.get("workspace_uuid"))
                 incoming_row = incoming_rows_by_uuid.get(workspace_uuid)
-                if isinstance(incoming_row, dict):
+                try:
+                    row_revision = max(0, int(row.get("revision") or 0))
+                except (TypeError, ValueError, OverflowError):
+                    row_revision = 0
+                try:
+                    incoming_row_revision = max(
+                        0,
+                        int(incoming_row.get("revision") or 0),
+                    ) if isinstance(incoming_row, dict) else -1
+                except (TypeError, ValueError, OverflowError):
+                    incoming_row_revision = -1
+                # Global state_revision identifies the last Python snapshot,
+                # not the ordering of rapid per-Shot UI edits made from that
+                # snapshot.  Every real workspace mutation increments its row
+                # revision in the widget.  Require that monotonic token here so
+                # a delayed same-global-revision echo cannot restore an older
+                # selection/order/preview after a newer Shot edit was already
+                # committed. Equal row revisions are an acknowledgement only;
+                # the Python-owned selection/order/preview remains authoritative.
+                if (
+                    isinstance(incoming_row, dict)
+                    and incoming_row_revision > row_revision
+                ):
                     owned_uids = _picker_representative_video_uids(
                         row.get("video_asset_uids")
                     )
@@ -12084,9 +12453,14 @@ class HMBVideoPickerLibrary(DataNode):
                             "selected_video_slot",
                             row.get("selected_video_slot", 1),
                         ),
+                        "authoring_context": _normalize_picker_authoring_context(
+                            incoming_row.get("authoring_context")
+                            if "authoring_context" in incoming_row
+                            else row.get("authoring_context")
+                        ),
                         "revision": max(
-                            int(row.get("revision") or 0),
-                            int(incoming_row.get("revision") or 0),
+                            row_revision,
+                            incoming_row_revision,
                         ),
                     })
                 merged_rows.append(row)
@@ -12793,6 +13167,12 @@ class HMBVideoPickerLibrary(DataNode):
             for row in current.get("shot_selections", [])
             if isinstance(row, dict) and _uuid_text(row.get("shot_uuid"))
         }
+        workspaces_by_bound_uuid = {
+            _uuid_text(row.get("bound_shot_uuid")): dict(row)
+            for row in current.get("picker_shots", [])
+            if isinstance(row, dict)
+            and _uuid_text(row.get("bound_shot_uuid"))
+        }
         selected_shot_uuid = _uuid_text(current.get("shot_uuid"))
         catalog_ids = {item["shot_uuid"] for item in snapshot["shots"]}
         if selected_shot_uuid and selected_shot_uuid not in catalog_ids:
@@ -12804,7 +13184,14 @@ class HMBVideoPickerLibrary(DataNode):
         normalized_rows: List[Dict[str, Any]] = []
         for catalog_shot in snapshot["shots"]:
             row = rows_by_uuid.get(catalog_shot["shot_uuid"], {})
-            membership = list(row.get("selected_video_uids") or [])
+            workspace = workspaces_by_bound_uuid.get(
+                catalog_shot["shot_uuid"], {}
+            )
+            membership = list(
+                workspace.get("selected_video_uids")
+                or row.get("selected_video_uids")
+                or []
+            )
             normalized_rows.append({
                 "shot_uuid": catalog_shot["shot_uuid"],
                 "number": catalog_shot["number"],
@@ -12892,37 +13279,19 @@ class HMBVideoPickerLibrary(DataNode):
         if self._hmb_shared_routing_in_progress:
             return {"ok": True, "code": "reentrant", "changed": 0}
         initially_enabled = bool(self._hmb_shot_channel_subscription()["enabled"])
-        refresh_before = max(
-            0,
-            int(getattr(self, "_hmb_shot_catalog_refresh_count", 0) or 0),
-        )
         self._hmb_shared_routing_in_progress = True
         try:
             result = _shot_routing.reconcile_shot_routing(self)
             if not initially_enabled and self._hmb_shot_channel_subscription()["enabled"]:
                 result = _shot_routing.reconcile_shot_routing(self)
-            result_code = _clean(result.get("code")) if isinstance(result, dict) else ""
-            refresh_after = max(
-                0,
-                int(getattr(self, "_hmb_shot_catalog_refresh_count", 0) or 0),
-            )
-            # Keep the last selected quartet visible when its ImageAsset
-            # publisher is temporarily absent, but never let the previous
-            # runtime catalog remain executable authority. Constructor and
-            # nested callback passes cannot discover a flow, so only a real
-            # completed reconciliation may invalidate the last-good cache.
-            if (
-                self._hmb_shot_channel_subscription()["enabled"]
-                and result_code not in {"", "not_registered", "reentrant"}
-                and refresh_after == refresh_before
-            ):
-                self._hmb_shot_route_status = {
-                    "schema": "hmb-shot-routing-status",
-                    "version": 1,
-                    "ok": False,
-                    "code": "image_catalog_unavailable",
-                    "details": "The selected Shot channel has no unique ImageAsset publisher.",
-                }
+            # An unchanged valid catalog does not invoke the recipient callback
+            # on every retained-mode pass. Treating that normal cache hit as a
+            # missing publisher changed a ready Picker into a false failure and
+            # made Prompt/Agent video snapshots stop at the next stage. The
+            # central router already owns every real invalidation: it clears an
+            # orphaned catalog, rejects stale/conflicting generations, and
+            # publishes a precise failure status. Preserve the last accepted
+            # ready status when this pass simply has nothing new to commit.
             return result
         finally:
             self._hmb_shared_routing_in_progress = False
@@ -14749,6 +15118,22 @@ class HMBVideoPickerLibrary(DataNode):
         replace backend-owned Maya results.
         """
         name = _parameter_name(parameter)
+        if (
+            name == WIDGET_STATE_PARAMETER
+            and isinstance(value, dict)
+            and isinstance(value.get(WIDGET_STATE_EMBEDDED_COMMAND_FIELD), dict)
+        ):
+            command = _parse_picker_command(
+                value.get(WIDGET_STATE_EMBEDDED_COMMAND_FIELD)
+            )
+            if (
+                _clean(command.get("runtime_instance_id"))
+                == self._hmb_runtime_instance_id
+                and _clean(command.get("action"))
+                and _clean(command.get("action_id"))
+            ):
+                with self._hmb_command_lock:
+                    self._hmb_embedded_command_queue.append(command)
         final_value = value
         if bool(getattr(self, "_hmb_node_deleted", False)):
             # A request already dispatched before deletion may arrive after a
@@ -14783,45 +15168,15 @@ class HMBVideoPickerLibrary(DataNode):
         if name == WIDGET_STATE_PARAMETER:
             incoming = _parse_state(final_value)
             writer = _clean(incoming.get("state_writer")).lower()
-            incoming_runtime_id = _clean(incoming.get("runtime_instance_id"))
-            writer_runtime_id = _clean(
-                incoming.get("writer_runtime_instance_id")
-            )
-            # A Python worker request is an ordinary live publication, never a
-            # workflow hydration. If it arrives after same-name replacement,
-            # its writer token names the retired instance: preserve this new
-            # node's authoritative value instead of adopting stale state.
-            if (
-                writer == "python"
-                and writer_runtime_id
-                and writer_runtime_id != self._hmb_runtime_instance_id
-                and not _is_state_syncing(self)
-            ):
-                return _parse_state(
-                    getattr(self, "_hmb_authoritative_state", None)
-                    or _raw_parameter_value(self, WIDGET_STATE_PARAMETER)
-                )
-            restored_serialized_state = (
-                incoming_runtime_id != self._hmb_runtime_instance_id
-                and not _is_state_syncing(self)
-            )
-            if restored_serialized_state:
-                incoming, _recovered = _recover_orphaned_runtime_state(incoming)
-                incoming["python_core_loaded"] = True
-                incoming["python_core_path"] = str(Path(__file__).resolve()).replace("\\", "/")
-                incoming["runtime_instance_id"] = self._hmb_runtime_instance_id
-                incoming["state_revision"] = max(
-                    int(getattr(self, "_hmb_state_revision", 0) or 0),
-                    int(incoming.get("state_revision") or 0),
-                ) + 1
-                incoming["state_writer"] = "python"
-                incoming["state_published_at_ms"] = int(time.time() * 1000)
-                # Mark the complete serialized snapshot for after_value_set().
-                # Griptape stores the value between the two hooks; adoption belongs
-                # in the latter so a standalone validation call to this hook remains
-                # side-effect free.
-                self._hmb_restored_state_pending_revision = int(incoming["state_revision"])
-            elif writer != "python" and not _is_state_syncing(self):
+            # Do not decide whether a foreign Python runtime is a saved
+            # workflow or a late worker publication here. Griptape invokes
+            # this hook *before* ``set_parameter_value`` even for
+            # ``initial_setup=True`` workflow replay, but the hook receives no
+            # initial-setup flag. Treating every previous-runtime writer as a
+            # retired worker therefore replaced a valid serialized media
+            # catalog with the constructor's empty default. The setter below
+            # has the real lifecycle flag and performs that discrimination.
+            if writer != "python" and not _is_state_syncing(self):
                 with self._hmb_catalog_state_commit():
                     authoritative = _parse_state(
                         getattr(self, "_hmb_authoritative_state", None) or {}
@@ -14864,6 +15219,30 @@ class HMBVideoPickerLibrary(DataNode):
         existing before/store/after path.
         """
         parent_setter = super().set_parameter_value
+        if (
+            not initial_setup
+            and param_name == WIDGET_STATE_PARAMETER
+            and hasattr(self, "_hmb_runtime_instance_id")
+            and not _is_state_syncing(self)
+        ):
+            candidate = _parse_state(value)
+            writer_runtime_id = _clean(
+                candidate.get("writer_runtime_instance_id")
+            )
+            if (
+                _clean(candidate.get("state_writer")).lower() == "python"
+                and writer_runtime_id
+                and writer_runtime_id != self._hmb_runtime_instance_id
+            ):
+                # Normal live publications from a deleted/replaced Picker must
+                # not be allowed to overwrite the replacement. Unlike
+                # before_value_set(), this method receives ``initial_setup``
+                # and can reject only the live stale-worker case without
+                # rejecting a legitimate saved-workflow snapshot.
+                value = _parse_state(
+                    getattr(self, "_hmb_authoritative_state", None)
+                    or _raw_parameter_value(self, WIDGET_STATE_PARAMETER)
+                )
         lifecycle_values = {
             "initial_setup": initial_setup,
             "emit_change": emit_change,
@@ -15952,6 +16331,30 @@ class HMBVideoPickerLibrary(DataNode):
             if name != WIDGET_STATE_PARAMETER:
                 return
 
+            embedded_command: Optional[Dict[str, Any]] = None
+            with self._hmb_command_lock:
+                if self._hmb_embedded_command_queue:
+                    embedded_command = self._hmb_embedded_command_queue.pop(0)
+            if embedded_command is not None:
+                action = _clean(embedded_command.get("action")) or "command"
+                action_id = _clean(embedded_command.get("action_id"))
+
+                def handle_embedded_command() -> None:
+                    try:
+                        self._handle_picker_command(embedded_command)
+                    except Exception as action_exc:
+                        _diagnostic_exception(
+                            "embedded picker command worker failed", action_exc
+                        )
+                        self._set_failed_state(action_exc)
+
+                self._schedule_action_worker(
+                    action,
+                    action_id,
+                    handle_embedded_command,
+                )
+                return
+
             catalog_state_context = self._hmb_catalog_state_commit()
             catalog_state_context.__enter__()
 
@@ -16141,6 +16544,9 @@ class HMBVideoPickerLibrary(DataNode):
         try:
             if adopt_serialized:
                 raw_state = _parse_state(_raw_parameter_value(self, WIDGET_STATE_PARAMETER))
+                raw_state, media_urls_refreshed = _refresh_saved_video_media_urls(
+                    raw_state
+                )
                 serialized_state_paths = {
                     field: _maya_scene_path_text(raw_state.get(field))
                     for field in (
@@ -16195,7 +16601,11 @@ class HMBVideoPickerLibrary(DataNode):
                     self._store_initial_parameter_value("MAYA_SCENE", "")
                 previous_runtime_id = _clean(raw_state.get("runtime_instance_id"))
                 raw_state, recovered = _recover_orphaned_runtime_state(raw_state)
-                needs_publication = recovered or previous_runtime_id != self._hmb_runtime_instance_id
+                needs_publication = (
+                    recovered
+                    or media_urls_refreshed
+                    or previous_runtime_id != self._hmb_runtime_instance_id
+                )
                 if needs_publication:
                     raw_state["python_core_loaded"] = True
                     raw_state["python_core_path"] = str(Path(__file__).resolve()).replace("\\", "/")
@@ -16219,7 +16629,9 @@ class HMBVideoPickerLibrary(DataNode):
     def after_deserialize(self, *args: Any, **kwargs: Any) -> Any:
         result = None
         try:
-            result = super().after_deserialize(*args, **kwargs)
+            parent_hook = getattr(super(), "after_deserialize", None)
+            if callable(parent_hook):
+                result = parent_hook(*args, **kwargs)
         except Exception as exc:
             _diagnostic_exception("Parent after_deserialize hook failed", exc)
         self._restore_dynamic_state(adopt_serialized=True)
@@ -16229,7 +16641,9 @@ class HMBVideoPickerLibrary(DataNode):
     def after_load(self, *args: Any, **kwargs: Any) -> Any:
         result = None
         try:
-            result = super().after_load(*args, **kwargs)
+            parent_hook = getattr(super(), "after_load", None)
+            if callable(parent_hook):
+                result = parent_hook(*args, **kwargs)
         except Exception as exc:
             _diagnostic_exception("Parent after_load hook failed", exc)
         self._restore_dynamic_state(adopt_serialized=True)
@@ -16239,7 +16653,9 @@ class HMBVideoPickerLibrary(DataNode):
     def on_loaded(self, *args: Any, **kwargs: Any) -> Any:
         result = None
         try:
-            result = super().on_loaded(*args, **kwargs)
+            parent_hook = getattr(super(), "on_loaded", None)
+            if callable(parent_hook):
+                result = parent_hook(*args, **kwargs)
         except Exception as exc:
             _diagnostic_exception("Parent on_loaded hook failed", exc)
         self._restore_dynamic_state(adopt_serialized=True)

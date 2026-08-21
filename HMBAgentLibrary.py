@@ -102,6 +102,18 @@ _PUBLIC_JOB_CONTRACT_SCHEMA = "hmb-public-job-data"
 _PUBLIC_JOB_CONTRACT_VERSION = 1
 _USER_DESCRIPTION_DATA_HEADER = "USER DESCRIPTION DATA (JSON):"
 _RUNTIME_FX_SCOPE_HEADER = "HMB VERIFIED FX/TIMING RUNTIME SCOPE (JSON):"
+_ENGLISH_GENERATOR_OUTPUT_CONTRACT_HEADER = (
+    "HMB GENERATOR OUTPUT CONTRACT (ENGLISH ONLY):"
+)
+_ENGLISH_GENERATOR_OUTPUT_CONTRACT = (
+    "Write the final video-generator instruction entirely in English. "
+    "Translate every user-authored descriptive sentence into clear natural "
+    "production English. Do not emit Korean prose, explanations, headings, "
+    "or commands. Keep machine addresses such as @image1 and @video1 exact, "
+    "but describe their visual and motion instructions in English. Return "
+    "only the generator-ready instruction, without commentary about this "
+    "language requirement."
+)
 _PAIRED_PROMPT_SNAPSHOT_SCHEMA = "hmb-prompt-paired-snapshot"
 _PAIRED_PROMPT_SNAPSHOT_VERSION = 1
 _PAIRED_PROMPT_SNAPSHOT_KEYS = frozenset({
@@ -208,6 +220,10 @@ _PUBLIC_OUTPUT_BLOCKED = (
 )
 _HMB_EXECUTION_FAILED_MESSAGE = (
     "[HMB EXECUTION FAILED] The protected execution ended without a publishable result."
+)
+_HMB_ENGLISH_OUTPUT_REQUIRED_MESSAGE = (
+    "[HMB ENGLISH OUTPUT REQUIRED] The Agent returned non-English generator "
+    "instructions, so publication was stopped before the video generator."
 )
 _HMB_REQUIRED_MARKERS = (
     _PUBLIC_JOB_CONTRACT_HEADER,
@@ -2125,7 +2141,7 @@ def _derive_fx_timing_runtime_scope(
 def _compose_hmb_runtime_prompt(
     prompt_value: Any, runtime_scope: Dict[str, Any]
 ) -> str:
-    """Append private derived range facts without changing ``PROMPT_OUT``."""
+    """Append private runtime facts and the fixed English output contract."""
 
     value = getattr(prompt_value, "value", prompt_value)
     public_prompt = str(value or "").rstrip()
@@ -2135,14 +2151,29 @@ def _compose_hmb_runtime_prompt(
         sort_keys=True,
         separators=(",", ":"),
     )
-    if not public_prompt or len(public_prompt) + len(encoded_scope) > 6_000_000:
+    appended_size = (
+        len(encoded_scope)
+        + len(_ENGLISH_GENERATOR_OUTPUT_CONTRACT_HEADER)
+        + len(_ENGLISH_GENERATOR_OUTPUT_CONTRACT)
+    )
+    if not public_prompt or len(public_prompt) + appended_size > 6_000_000:
         raise RuntimeError("HMB runtime prompt size is invalid.")
     return "\n".join((
         public_prompt,
         _RUNTIME_FX_SCOPE_HEADER,
         encoded_scope,
+        _ENGLISH_GENERATOR_OUTPUT_CONTRACT_HEADER,
+        _ENGLISH_GENERATOR_OUTPUT_CONTRACT,
         "",
     ))
+
+
+def _contains_korean_script(value: Any) -> bool:
+    """Return whether a final generator instruction contains Korean script."""
+
+    if not isinstance(value, str) or not value:
+        return False
+    return bool(re.search(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3]", value))
 
 
 def _is_private_hmb_runtime_prompt(value: Any) -> bool:
@@ -4961,14 +4992,17 @@ class HMBAgentLibrary(_BaseAgent):
 
         return _is_direct_hmb_prompt_library_connection(self)
 
-    def _secure_hmb_outputs(self) -> None:
+    def _secure_hmb_outputs(self) -> bool:
+        """Sanitize public outputs and report an English-language violation."""
+
         if bool(getattr(self, "_hmb_node_deleted", False)):
-            return
+            return False
         outputs = getattr(self, "parameter_output_values", None)
         if not isinstance(outputs, dict):
-            return
+            return False
 
         blocked = _PUBLIC_OUTPUT_BLOCKED
+        english_output_failed = False
         try:
             for key, current in list(outputs.items()):
                 if key == "agent" and isinstance(current, dict):
@@ -4980,24 +5014,34 @@ class HMBAgentLibrary(_BaseAgent):
                     _strip_runtime_scope_from_agent_wrapper(current)
                 if key == "output":
                     sanitized = current
-                    # Shot-tailored policy results, paraphrases, and common
-                    # production language are valid FINAL TEXT. Block only
-                    # strong raw-policy evidence (a normalized contiguous
-                    # 160-character window, including reversible encodings) or
-                    # an actual runtime/Agent-state structure. Length itself is
-                    # never a limit and accepted text is never rewritten.
-                    leak_detected = _contains_public_output_state_leak(
-                        sanitized,
-                        self._hmb_policy,
-                        self._hmb_binding,
-                    )
-                    leak_detected = leak_detected or (
-                        _contains_raw_policy_material(
+                    english_output_failed = _contains_korean_script(sanitized)
+                    if english_output_failed:
+                        # Never forward Korean instructions to a downstream
+                        # video generator. Translation is the model's job under
+                        # the private contract above; the sanitizer does not
+                        # guess at or rewrite production meaning.
+                        sanitized = _HMB_ENGLISH_OUTPUT_REQUIRED_MESSAGE
+                        leak_detected = False
+                    else:
+                        # Shot-tailored policy results, paraphrases, and common
+                        # production language are valid FINAL TEXT. Block only
+                        # strong raw-policy evidence (a normalized contiguous
+                        # 160-character window, including reversible encodings)
+                        # or an actual runtime/Agent-state structure. Length
+                        # itself is never a limit and accepted text is never
+                        # rewritten.
+                        leak_detected = _contains_public_output_state_leak(
                             sanitized,
                             self._hmb_policy,
                             self._hmb_binding,
                         )
-                    )
+                        leak_detected = leak_detected or (
+                            _contains_raw_policy_material(
+                                sanitized,
+                                self._hmb_policy,
+                                self._hmb_binding,
+                            )
+                        )
                 else:
                     sanitized = _replace_leaked_strings(
                         current,
@@ -5024,6 +5068,7 @@ class HMBAgentLibrary(_BaseAgent):
                 # Only now may the native result cross the public parameter
                 # callback boundary; streaming writes were privately buffered.
                 self._set_visible_output(visible_output)
+            return english_output_failed
         except Exception:
             # A broken detector cannot establish that FINAL TEXT is free of a
             # raw policy dump. Fail closed without exposing partial state.
@@ -5035,6 +5080,7 @@ class HMBAgentLibrary(_BaseAgent):
                 print("[HMB_PRODUCTION][WARN] Agent output sanitizer failed closed.")
             except Exception:
                 pass
+            return False
 
     def process(self):
         """Execute the native Agent exactly once.
@@ -5200,6 +5246,7 @@ class HMBAgentLibrary(_BaseAgent):
 
         result = None
         native_failed = False
+        english_output_failed = False
         try:
             result = yield from self._run_native_agent_once()
         except Exception:
@@ -5214,11 +5261,12 @@ class HMBAgentLibrary(_BaseAgent):
             try:
                 if not self._hmb_lifecycle_is_live(lifecycle_generation):
                     return None
-                self._secure_hmb_outputs()
+                english_output_failed = self._secure_hmb_outputs()
                 outputs = getattr(self, "parameter_output_values", None)
                 final_text = outputs.get("output") if isinstance(outputs, dict) else ""
                 if (
                     not native_failed
+                    and not english_output_failed
                     and self._hmb_shot_context
                     and isinstance(final_text, str)
                     and final_text
@@ -5270,6 +5318,13 @@ class HMBAgentLibrary(_BaseAgent):
             self._refresh_agent_shot_route()
         except Exception:
             pass
+        if english_output_failed:
+            self._publish_hmb_execution_block(
+                _HMB_ENGLISH_OUTPUT_REQUIRED_MESSAGE
+            )
+            raise RuntimeError(
+                _HMB_ENGLISH_OUTPUT_REQUIRED_MESSAGE
+            ) from None
         if native_failed:
             self._publish_hmb_execution_block(_HMB_EXECUTION_FAILED_MESSAGE)
             raise RuntimeError(_HMB_EXECUTION_FAILED_MESSAGE) from None

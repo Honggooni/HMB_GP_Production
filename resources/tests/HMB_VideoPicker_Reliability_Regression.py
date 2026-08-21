@@ -666,7 +666,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.6.40"
+assert manifest["metadata"]["library_version"] == "0.6.42"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
@@ -704,7 +704,7 @@ picker_manifest = next(item for item in manifest["nodes"] if item["class_name"] 
 prompt_manifest = next(item for item in manifest["nodes"] if item["class_name"] == "HMBPromptLibrary")
 assert picker_manifest["metadata"]["width"] == 1400
 assert prompt_manifest["metadata"]["width"] == 1800
-assert picker_manifest["metadata"]["height"] == 360
+assert picker_manifest["metadata"]["height"] == 1200
 assert prompt_manifest["metadata"]["height"] == 1193
 for prompt_height_key in (
     "height", "default_height", "initial_height", "min_height",
@@ -714,10 +714,10 @@ for prompt_height_key in (
     "height", "default_height", "preferred_height", "initial_height", "min_height",
 ):
     assert prompt_manifest["metadata"]["ui_options"][prompt_height_key] == 1193
-assert prompt.PROMPT_NATIVE_ASSET_INPUT_ROW_HEIGHT == 42
+assert prompt.PROMPT_NATIVE_ASSET_INPUT_ROW_HEIGHT == 0
 assert prompt.PROMPT_START_HEIGHT == prompt.PROMPT_MIN_HEIGHT == 1193
 assert picker_manifest["metadata"]["ui_options"]["initial_width"] == 1400
-assert picker_manifest["metadata"]["ui_options"]["initial_height"] == 360
+assert picker_manifest["metadata"]["ui_options"]["initial_height"] == 1200
 assert picker_manifest["metadata"]["ui_options"]["min_height"] == 360
 agent_manifest = next(item for item in manifest["nodes"] if item["class_name"] == "HMBAgentLibrary")
 for native_size_key in (
@@ -760,8 +760,8 @@ assert picker.LEGACY_DEPTH_PLAYBLAST_PROFILES == frozenset({
 })
 assert "hmb_camera_space_depth_v7" not in widget_source
 assert "HMB_PICKER_COMMAND" in widget_source
-assert "__hmbPickerCommandBridge" in widget_source
-assert "return props.onChange(command)" in command_widget_source
+assert "HMB_VIDEO_PICKER_COMMAND_REGISTRY_KEY" in widget_source
+assert "return latestProps.onChange(command)" in command_widget_source
 assert "props.onChange(JSON.parse(JSON.stringify(normalized)))" in widget_source
 assert "def _apply_widget_action(" not in picker_source
 assert "commitAndRemount" not in widget_source
@@ -795,7 +795,9 @@ assert 'id="activity-log-view" class="activity-log-view" role="log" aria-live="p
 assert '.activity-log-row[data-level="ERROR"]{color:#fb7185}' in widget_source
 assert 'container.style.overflow = "visible"' in widget_source
 assert "hmbEnsurePickerBootstrapNode" not in command_widget_source
-assert "hmbCollapseCommandBridgeLayoutRow(container)" in command_widget_source
+assert "export function hmbCollapseCommandBridgeLayoutRow(container)" in command_widget_source
+assert "parentElement" not in command_widget_source
+assert "react-flow" not in command_widget_source.casefold()
 assert "hmbApplyPickerCommandRowReclaim(container)" in widget_source
 assert "const HMB_DEFAULT_NODE_WIDTH = 1400;" in widget_source
 assert "const HMB_DEFAULT_NODE_HEIGHT = 1200;" in widget_source
@@ -975,8 +977,17 @@ initial_restore_candidate = initial_restore_node.before_value_set(
     initial_state_parameter,
     initial_restore_state,
 )
-assert initial_restore_candidate["runtime_instance_id"] == initial_restore_node._hmb_runtime_instance_id
-assert initial_restore_node._hmb_restored_state_pending_revision > 17
+# NodeManager calls before_value_set without exposing its initial_setup flag.
+# The hook must preserve the previous-runtime serialized snapshot verbatim;
+# the setter below owns the real saved-workflow versus stale-worker decision.
+assert initial_restore_candidate["runtime_instance_id"] == (
+    "serialized-previous-runtime"
+)
+assert getattr(
+    initial_restore_node,
+    "_hmb_restored_state_pending_revision",
+    -1,
+) == -1
 initial_restore_node.set_parameter_value(
     picker.WIDGET_STATE_PARAMETER,
     initial_restore_candidate,
@@ -1068,12 +1079,13 @@ state_parameter = picker._get_parameter_obj(node, picker.WIDGET_STATE_PARAMETER)
 command_parameter = picker._get_parameter_obj(node, picker.WIDGET_COMMAND_PARAMETER)
 assert picker.PICKER_START_WIDTH == 1400
 assert picker.PICKER_START_HEIGHT == 1200
-assert picker.PICKER_WIDGET_START_HEIGHT == picker.PICKER_WIDGET_COMPACT_MOUNT_HEIGHT == 158
+assert picker.PICKER_WIDGET_START_HEIGHT == picker.PICKER_WIDGET_MIN_HEIGHT == 1151
+assert picker.PICKER_WIDGET_COMPACT_MOUNT_HEIGHT == 252
 assert picker.PICKER_COMPACT_NATIVE_HEIGHT == 360
-assert picker.PICKER_NATIVE_SIZE_VERSION == 4
+assert picker.PICKER_NATIVE_SIZE_VERSION == 6
 assert node.metadata["size"] == {
     "width": picker.PICKER_START_WIDTH,
-    "height": picker.PICKER_COMPACT_NATIVE_HEIGHT,
+    "height": picker.PICKER_START_HEIGHT,
 }
 assert node.metadata[picker.PICKER_EXPANDED_SIZE_METADATA_KEY] == {
     "width": picker.PICKER_START_WIDTH,
@@ -1090,7 +1102,7 @@ assert command_parameter.input_types == ["dict"]
 assert command_parameter.ui_options["expandable"] is False
 assert command_parameter.ui_options["hide_label"] is True
 assert command_parameter.ui_options["hide_handles"] is True
-assert state_parameter.ui_options["expandable"] is False
+assert state_parameter.ui_options["expandable"] is True
 assert picker._playblast_resolution({}) == (1280, 720)
 assert picker._playblast_resolution({"output_width": 1920, "output_height": 1080}) == (1920, 1080)
 assert picker._playblast_resolution({"output_width": 1600, "output_height": 900}) == (1280, 720)

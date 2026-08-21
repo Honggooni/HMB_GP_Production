@@ -8,6 +8,9 @@ if not errorlevel 1 (
 )
 
 set "HMB_AGENT_POLICY_PROCESS_BOOTSTRAP=1"
+rem Runtime libraries are immutable. Keep Python bytecode caches out of the
+rem installed HMB package on every supported team launch.
+set "PYTHONDONTWRITEBYTECODE=1"
 set "HMB_GRIPTAPE_EXE=%LOCALAPPDATA%\ai.griptape.nodes.desktop\current\griptape-nodes-desktop.exe"
 if not exist "%HMB_GRIPTAPE_EXE%" (
     echo [HMB Agent] Griptape Desktop is not installed at the supported location.

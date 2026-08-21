@@ -64,6 +64,9 @@ parameter_exists = getattr(
 )
 
 IMAGE_SOURCE_TYPE_CHOICES = _hmb.IMAGE_SOURCE_TYPE_CHOICES
+IMAGE_MAIN_TYPE_UNCLASSIFIED = _hmb.IMAGE_MAIN_TYPE_UNCLASSIFIED
+IMAGE_MAIN_TYPE_CHOICES = _hmb.IMAGE_MAIN_TYPE_CHOICES
+IMAGE_SUB_TYPE_CHOICES = _hmb.IMAGE_SUB_TYPE_CHOICES
 IMAGE_SOURCE_TYPE_UNCLASSIFIED = getattr(
     _hmb,
     "IMAGE_SOURCE_TYPE_UNCLASSIFIED",
@@ -83,6 +86,9 @@ image_scope_choices_for_source_type = _hmb.image_scope_choices_for_source_type
 image_color_pick_choices_for_source_type = (
     _hmb.image_color_pick_choices_for_source_type
 )
+image_color_pick_choices_for_taxonomy = _hmb.image_color_pick_choices_for_taxonomy
+image_sub_type_choices_for_main_type = _hmb.image_sub_type_choices_for_main_type
+image_taxonomy_wire_pair = _hmb.image_taxonomy_wire_pair
 
 try:
     from griptape_nodes.traits.file_system_picker import FileSystemPicker  # type: ignore
@@ -364,6 +370,10 @@ def _set_parameter_value(node: Any, name: str, value: Any) -> None:
 
 def _taxonomy_payload() -> Dict[str, Any]:
     return {
+        "image_main_type_choices": list(IMAGE_MAIN_TYPE_CHOICES),
+        "image_sub_type_choices": {
+            key: list(values) for key, values in IMAGE_SUB_TYPE_CHOICES.items()
+        },
         "source_type_choices": list(IMAGE_SOURCE_TYPE_CHOICES),
         "scope_choices": list(IMAGE_SCOPE_CHOICES),
         "scope_choices_by_source_type": {
@@ -372,6 +382,53 @@ def _taxonomy_payload() -> Dict[str, Any]:
         },
         "actor_color_pick_choices": list(ACTOR_COLOR_PICK_CHOICES),
         "object_color_pick_choices": list(OBJECT_COLOR_PICK_CHOICES),
+    }
+
+
+def _normalize_image_taxonomy_fields(raw: Any) -> Dict[str, Any]:
+    """Normalize v2 authoring fields without reading legacy classifications."""
+    source = raw if isinstance(raw, dict) else {}
+    main_type = _clean(source.get("image_main_type"))
+    sub_type = _clean(source.get("image_sub_type"))
+    if (
+        main_type not in IMAGE_MAIN_TYPE_CHOICES
+        or main_type == IMAGE_MAIN_TYPE_UNCLASSIFIED
+        or sub_type not in image_sub_type_choices_for_main_type(main_type)
+    ):
+        return {
+            "image_main_type": IMAGE_MAIN_TYPE_UNCLASSIFIED,
+            "image_sub_type": "",
+            "source_type": IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED,
+            "scope_candidate": "",
+            "custom_source_type": "",
+            "color_pick_candidates": [],
+        }
+    wire_pair = image_taxonomy_wire_pair(main_type, sub_type)
+    if wire_pair is None:
+        return {
+            "image_main_type": IMAGE_MAIN_TYPE_UNCLASSIFIED,
+            "image_sub_type": "",
+            "source_type": IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED,
+            "scope_candidate": "",
+            "custom_source_type": "",
+            "color_pick_candidates": [],
+        }
+    source_type, scope_candidate = wire_pair
+    custom_source_type = (
+        _clean(source.get("custom_source_type"))
+        if main_type == "Custom / Context" and sub_type == "Custom"
+        else ""
+    )
+    return {
+        "image_main_type": main_type,
+        "image_sub_type": sub_type,
+        "source_type": source_type,
+        "scope_candidate": scope_candidate,
+        "custom_source_type": custom_source_type,
+        "color_pick_candidates": image_color_pick_choices_for_taxonomy(
+            main_type,
+            sub_type,
+        ),
     }
 
 
@@ -1082,10 +1139,11 @@ def _import_record(
         "extension": extension,
         "width": width,
         "height": height,
-        # Creative classification is optional.  External media starts as an
-        # unclassified Custom source instead of carrying the legacy
-        # "Role Required" sentinel into output payloads.
-        "source_type": "Custom",
+        # New imports are intentionally unclassified.  Legacy taxonomy values
+        # are never inferred from their folder or copied from a previous schema.
+        "image_main_type": IMAGE_MAIN_TYPE_UNCLASSIFIED,
+        "image_sub_type": "",
+        "source_type": IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED,
         "custom_source_type": "",
         "scope_candidate": "",
         "color_pick_candidates": [],
@@ -1324,20 +1382,20 @@ def _verified_project_relative_path(
         return ""
     if not isinstance(manifest_record, dict):
         return ""
+    manifest_taxonomy = _normalize_image_taxonomy_fields(manifest_record)
     authoritative_fields = (
         ("asset_id", _clean(manifest_record.get("asset_id"))),
         (
             "image_name",
             _clean(manifest_record.get("image_name") or manifest_record.get("name")),
         ),
-        ("source_type", _clean(manifest_record.get("source_type"))),
-        ("custom_source_type", _clean(manifest_record.get("custom_source_type"))),
+        ("image_main_type", manifest_taxonomy["image_main_type"]),
+        ("image_sub_type", manifest_taxonomy["image_sub_type"]),
+        ("source_type", manifest_taxonomy["source_type"]),
+        ("custom_source_type", manifest_taxonomy["custom_source_type"]),
         (
             "scope_candidate",
-            _clean(
-                manifest_record.get("scope")
-                or manifest_record.get("scope_candidate")
-            ),
+            manifest_taxonomy["scope_candidate"],
         ),
     )
     if any(
@@ -1783,47 +1841,15 @@ def _scan_project_assets(project_root: Any) -> Dict[str, Any]:
     for path in paths:
         relative = path.relative_to(root)
         relative_text = relative.as_posix()
-        inferred = _infer_asset_taxonomy(relative)
         override = manifest_overrides.get(relative_text.casefold())
         registered = override is not None
         override_values = override or {}
-        source_type = (
-            _clean(override_values.get("source_type")) or inferred["source_type"]
-        )
-        if source_type in {
-            IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED,
-            IMAGE_SOURCE_TYPE_UNCLASSIFIED,
-        }:
-            source_type = "Custom"
-        if source_type not in IMAGE_SOURCE_TYPE_CHOICES:
-            warnings.append(
-                f"{relative_text}: unknown Main Type {source_type!r}; classified as Custom."
-            )
-            source_type = "Custom"
-        custom_source_type = (
-            _clean(override_values.get("custom_source_type"))
-            if "custom_source_type" in override_values
-            else inferred["custom_source_type"]
-        )
-        scope_candidate = (
-            _clean(
-                override_values.get("scope")
-                if "scope" in override_values
-                else override_values.get("scope_candidate")
-            )
-            if "scope" in override_values or "scope_candidate" in override_values
-            else inferred["scope_candidate"]
-        )
-        if (
-            scope_candidate
-            and scope_candidate
-            not in image_scope_choices_for_source_type(source_type)
-        ):
-            warnings.append(
-                f"{relative_text}: Sub Type candidate {scope_candidate!r} is not "
-                f"valid for {source_type!r}; candidate cleared."
-            )
-            scope_candidate = ""
+        taxonomy = _normalize_image_taxonomy_fields(override_values)
+        image_main_type = taxonomy["image_main_type"]
+        image_sub_type = taxonomy["image_sub_type"]
+        source_type = taxonomy["source_type"]
+        custom_source_type = taxonomy["custom_source_type"]
+        scope_candidate = taxonomy["scope_candidate"]
 
         default_asset_id = path.stem
         if stem_counts.get(path.stem.casefold(), 0) > 1:
@@ -1838,7 +1864,7 @@ def _scan_project_assets(project_root: Any) -> Dict[str, Any]:
         library_id = _asset_library_id(project_id, relative_text)
         width, height = _asset_dimensions(path)
         thumbnail_url = _asset_thumbnail_url(path, library_id)
-        color_candidates = image_color_pick_choices_for_source_type(source_type)
+        color_candidates = taxonomy["color_pick_candidates"]
         is_user_import = _is_user_import_relative_path(relative_text)
         assets.append(
             {
@@ -1855,6 +1881,8 @@ def _scan_project_assets(project_root: Any) -> Dict[str, Any]:
                 "extension": path.suffix.casefold(),
                 "width": width,
                 "height": height,
+                "image_main_type": image_main_type,
+                "image_sub_type": image_sub_type,
                 "source_type": source_type,
                 "custom_source_type": custom_source_type,
                 "scope_candidate": scope_candidate,
@@ -1906,23 +1934,12 @@ def _normalize_asset(raw: Any) -> Dict[str, Any] | None:
     source_uid = _clean(raw.get("source_uid")) or (
         f"project:{library_id}" if source_kind == "project" else library_id
     )
-    source_type = _clean(raw.get("source_type"))
-    if source_type in {
-        IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED,
-        IMAGE_SOURCE_TYPE_UNCLASSIFIED,
-    }:
-        source_type = "Custom"
-    if source_type not in IMAGE_SOURCE_TYPE_CHOICES:
-        source_type = "Custom"
-    scope_candidate = _clean(
-        raw.get("scope_candidate") or raw.get("scope") or raw.get("sub_type")
-    )
-    if (
-        scope_candidate
-        and scope_candidate not in image_scope_choices_for_source_type(source_type)
-    ):
-        scope_candidate = ""
-    allowed_colors = image_color_pick_choices_for_source_type(source_type)
+    taxonomy = _normalize_image_taxonomy_fields(raw)
+    image_main_type = taxonomy["image_main_type"]
+    image_sub_type = taxonomy["image_sub_type"]
+    source_type = taxonomy["source_type"]
+    scope_candidate = taxonomy["scope_candidate"]
+    allowed_colors = taxonomy["color_pick_candidates"]
     raw_colors = raw.get("color_pick_candidates")
     if not isinstance(raw_colors, (list, tuple)):
         raw_colors = allowed_colors
@@ -1951,8 +1968,10 @@ def _normalize_asset(raw: Any) -> Dict[str, Any] | None:
         "extension": _clean(raw.get("extension")).casefold(),
         "width": width,
         "height": height,
+        "image_main_type": image_main_type,
+        "image_sub_type": image_sub_type,
         "source_type": source_type,
-        "custom_source_type": _clean(raw.get("custom_source_type")),
+        "custom_source_type": taxonomy["custom_source_type"],
         "scope_candidate": scope_candidate,
         "color_pick_candidates": list(dict.fromkeys(colors)),
         "registered": registered,
@@ -2145,6 +2164,8 @@ def _normalize_asset_registration_request(value: Any) -> Dict[str, str]:
         "target_folder": target_folder,
         "image_name": _clean(value.get("image_name"))[:256],
         "asset_id": _clean(value.get("asset_id"))[:256],
+        "image_main_type": _clean(value.get("image_main_type"))[:256],
+        "image_sub_type": _clean(value.get("image_sub_type"))[:256],
         "source_type": _clean(value.get("source_type"))[:256],
         "custom_source_type": _clean(value.get("custom_source_type"))[:256],
         "scope_candidate": _clean(
@@ -2431,18 +2452,15 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
     if not isinstance(raw_expanded, list) and project_root:
         expanded_folders = ["$root"]
     selected_main_type = _clean(source.get("selected_main_type"))
-    if selected_main_type in {
-        IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED,
-        IMAGE_SOURCE_TYPE_UNCLASSIFIED,
-    }:
+    if selected_main_type == IMAGE_MAIN_TYPE_UNCLASSIFIED:
         selected_main_type = ""
-    if selected_main_type not in IMAGE_SOURCE_TYPE_CHOICES:
+    if selected_main_type not in IMAGE_MAIN_TYPE_CHOICES:
         selected_main_type = ""
     selected_sub_type = _clean(source.get("selected_sub_type"))
     if (
         selected_sub_type
         and selected_sub_type
-        not in image_scope_choices_for_source_type(selected_main_type)
+        not in image_sub_type_choices_for_main_type(selected_main_type)
     ):
         selected_sub_type = ""
     selected_source_view = _clean(source.get("selected_source_view")).casefold()
@@ -2612,6 +2630,8 @@ _ASYNC_SCAN_USER_ASSET_FIELDS = (
     "asset_id",
     "image_name",
     "registered",
+    "image_main_type",
+    "image_sub_type",
     "source_type",
     "custom_source_type",
     "scope_candidate",
@@ -2914,54 +2934,33 @@ def _registration_record(
 ) -> Dict[str, Any]:
     image_name = _registration_identifier(request.get("image_name"), "Image Name")
     asset_id = _registration_identifier(request.get("asset_id"), "Asset ID")
-    requested_source_type = _clean(request.get("source_type"))
-    source_type = requested_source_type
-    if source_type in {
-        "",
-        IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED,
-        IMAGE_SOURCE_TYPE_UNCLASSIFIED,
-    }:
-        source_type = "Custom"
-    custom_source_type = _clean(request.get("custom_source_type"))
-    if source_type not in _selectable_source_types():
-        # Preserve an unknown future/user role as ordinary Custom metadata.  A
-        # role is creative context, not a registration prerequisite.
-        custom_source_type = custom_source_type or requested_source_type
-        source_type = "Custom"
-    if source_type == "Custom":
-        if len(custom_source_type) > 256:
-            raise ValueError("Custom Main Type exceeds 256 characters.")
-        if any(
-            ord(character) < 32 or ord(character) == 127
-            for character in custom_source_type
-        ):
-            raise ValueError("Custom Main Type contains unsupported control characters.")
-    else:
-        custom_source_type = ""
-    scope_candidate = _clean(request.get("scope_candidate"))
-    if len(scope_candidate) > 256:
-        raise ValueError("Sub Type exceeds 256 characters.")
+    requested_main_type = _clean(request.get("image_main_type"))
+    requested_sub_type = _clean(request.get("image_sub_type"))
+    taxonomy = _normalize_image_taxonomy_fields({
+        "image_main_type": requested_main_type,
+        "image_sub_type": requested_sub_type,
+        "custom_source_type": request.get("custom_source_type"),
+    })
+    if requested_main_type and taxonomy["image_main_type"] == IMAGE_MAIN_TYPE_UNCLASSIFIED:
+        raise ValueError("Select a valid Image Main Type and Sub Type pair.")
+    custom_source_type = taxonomy["custom_source_type"]
+    if len(custom_source_type) > 256:
+        raise ValueError("Custom Main Type exceeds 256 characters.")
     if any(
         ord(character) < 32 or ord(character) == 127
-        for character in scope_candidate
+        for character in custom_source_type
     ):
-        raise ValueError("Sub Type contains unsupported control characters.")
-    if (
-        scope_candidate
-        and scope_candidate not in image_scope_choices_for_source_type(source_type)
-    ):
-        raise ValueError(
-            f"Sub Type {scope_candidate!r} is not valid for Main Type "
-            f"{source_type!r}."
-        )
+        raise ValueError("Custom Main Type contains unsupported control characters.")
     relative_text = _clean(scanned_asset.get("relative_path")).replace("\\", "/")
     return {
         "path": relative_text,
         "asset_id": asset_id,
         "image_name": image_name,
-        "source_type": source_type,
+        "image_main_type": taxonomy["image_main_type"],
+        "image_sub_type": taxonomy["image_sub_type"],
+        "source_type": taxonomy["source_type"],
         "custom_source_type": custom_source_type,
-        "scope": scope_candidate,
+        "scope": taxonomy["scope_candidate"],
     }
 
 
@@ -3653,6 +3652,8 @@ _PROJECT_RESOLUTION_KEY_FIELDS = (
     "path",
     "relative_path",
     "extension",
+    "image_main_type",
+    "image_sub_type",
     "source_type",
     "custom_source_type",
     "scope_candidate",
@@ -3990,6 +3991,8 @@ def _selection_id(
                     "asset_id": asset["asset_id"],
                     "image_name": asset["image_name"],
                     "relative_path": relative_path,
+                    "image_main_type": asset["image_main_type"],
+                    "image_sub_type": asset["image_sub_type"],
                     "source_type": asset["source_type"],
                     "scope_candidate": asset["scope_candidate"],
                     "selection_order": selection_order,
@@ -4057,6 +4060,8 @@ def _build_output_payload(
                 "relative_path": relative_path,
                 "width": asset["width"],
                 "height": asset["height"],
+                "image_main_type": asset["image_main_type"],
+                "image_sub_type": asset["image_sub_type"],
                 "source_type": asset["source_type"],
                 "custom_source_type": asset["custom_source_type"],
                 "scope_candidate": asset["scope_candidate"],
@@ -4111,6 +4116,8 @@ def _build_output_payload(
             "version": IMAGE_AUTHORITY_SCOPE_VERSION,
             "verified_metadata_fields": [
                 "project_uid",
+                "image_main_type",
+                "image_sub_type",
                 "source_type",
                 "asset_id",
                 "image_name",
@@ -4180,6 +4187,8 @@ def _shot_asset_metadata(
         "label": _clean(asset.get("image_name")),
         "width": _non_negative_int(asset.get("width")),
         "height": _non_negative_int(asset.get("height")),
+        "image_main_type": _clean(asset.get("image_main_type")),
+        "image_sub_type": _clean(asset.get("image_sub_type")),
         "source_type": _clean(asset.get("source_type")),
         "custom_source_type": _clean(asset.get("custom_source_type")),
         "scope_candidate": _clean(asset.get("scope_candidate")),
@@ -4378,6 +4387,8 @@ _OUTPUT_FINGERPRINT_ASSET_FIELDS = (
     "relative_path",
     "width",
     "height",
+    "image_main_type",
+    "image_sub_type",
     "source_type",
     "custom_source_type",
     "scope_candidate",

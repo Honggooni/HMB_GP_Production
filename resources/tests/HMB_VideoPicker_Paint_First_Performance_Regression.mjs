@@ -133,8 +133,13 @@ assert.ok(
 );
 assert.ok(
   toggleSource.indexOf("hmbScheduleVideoPickerPaintFirstTask")
-    < toggleSource.indexOf("HMBVideoPickerLibraryWidget(container, liveProps)"),
-  "The full dashboard morph must run behind the paint boundary.",
+    < toggleSource.indexOf("hmbSetVideoPickerHybridView(container, false"),
+  "The retained-subtree view change must run behind the paint boundary.",
+);
+assert.doesNotMatch(
+  toggleSource,
+  /HMBVideoPickerLibraryWidget\(container, liveProps\)|\bcleanup\(\)/,
+  "A paint-first view change must not remount or clean up the live controller.",
 );
 
 const sizingStart = source.indexOf("export function hmbInstallVideoPickerCompactHostSizing(");

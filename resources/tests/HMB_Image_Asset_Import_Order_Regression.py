@@ -109,6 +109,8 @@ def payload_row(name: str, order: int) -> dict:
         "asset_id": f"Asset_{name}",
         "image_name": name,
         "path": f"C:/Project/sw12/Custom/{name}.png",
+        "image_main_type": "Custom / Context",
+        "image_sub_type": "Custom",
         "source_type": "Custom",
         "custom_source_type": f"Type_{name}",
         "scope_candidate": "Custom scope",
@@ -174,6 +176,8 @@ try:
                         "path": "Custom/Project_A.png",
                         "asset_id": "Project_A",
                         "image_name": "Project_A",
+                        "image_main_type": "Custom / Context",
+                        "image_sub_type": "Custom",
                         "source_type": "Custom",
                         "custom_source_type": "Regression fixture",
                         "scope": "Custom scope",
@@ -240,7 +244,9 @@ try:
     assert imported["asset_project_uid"] == ""
     assert imported["relative_path"] == ""
     assert imported["path"] == ""
-    assert imported["source_type"] == "Custom"
+    assert imported["image_main_type"] == "Select Image Main Type"
+    assert imported["image_sub_type"] == ""
+    assert imported["source_type"] == "Role Required / Select Source Type"
     assert imported["custom_source_type"] == ""
     assert imported["scope_candidate"] == ""
     assert imported["color_pick_candidates"] == []
@@ -324,7 +330,8 @@ try:
     # External rows behave like native Prompt rows for identity/taxonomy
     # editing while their physical generator order remains upstream-managed.
     imported_row["label"] = "Editable external name"
-    imported_row["source_type"] = "Prop / Accessory"
+    imported_row["image_main_type"] = "Character Prop"
+    imported_row["image_sub_type"] = "Handheld Prop"
     reapplied_mixed = prompt_library._apply_image_asset_payload(
         mixed_prompt,
         output,
@@ -336,6 +343,8 @@ try:
         if item["asset_source_kind"] == "user"
     )
     assert reapplied_import["label"] == "Editable external name"
+    assert reapplied_import["image_main_type"] == "Character Prop"
+    assert reapplied_import["image_sub_type"] == "Handheld Prop"
     assert reapplied_import["source_type"] == "Prop / Accessory"
     assert reapplied_import["asset_id"] == ""
     assert prompt_library._picker_match_candidates(
@@ -367,7 +376,10 @@ try:
     assert forged_row["source_type"] == "Role Required / Select Source Type"
     assert forged_row["custom_source_type"] == ""
 
+    # Retired/unknown legacy classification values never migrate into v2.
     future_type_payload = payload(["FutureType"])
+    future_type_payload["ordered_images"][0].pop("image_main_type", None)
+    future_type_payload["ordered_images"][0].pop("image_sub_type", None)
     future_type_payload["ordered_images"][0]["source_type"] = "Future Asset Type"
     future_type_payload["ordered_images"][0]["custom_source_type"] = "Future Asset Type"
     future_type_prompt = prompt_library._apply_image_asset_payload(
@@ -376,8 +388,10 @@ try:
         connected=True,
     )
     future_type_row = future_type_prompt["images"][0]
-    assert future_type_row["source_type"] == "Custom"
-    assert future_type_row["custom_source_type"] == "Future Asset Type"
+    assert future_type_row["image_main_type"] == "Select Image Main Type"
+    assert future_type_row["image_sub_type"] == ""
+    assert future_type_row["source_type"] == "Role Required / Select Source Type"
+    assert future_type_row["custom_source_type"] == ""
 
     cleared_import_state = asset_library._remove_live_imports(imported_state)
     assert not any(
@@ -584,6 +598,8 @@ try:
             "present": True,
             "label": "Hero",
             "owner": "manual named target",
+            "image_main_type": "Character",
+            "image_sub_type": "Full Appearance",
             "source_type": "Character Appearance",
         }
     )
@@ -592,6 +608,8 @@ try:
         {
             "present": True,
             "owner": "manual owner-only target",
+            "image_main_type": "Custom / Context",
+            "image_sub_type": "Custom",
             "source_type": "Custom",
             "custom_source_type": "Unnamed manual concept",
         }
@@ -637,6 +655,8 @@ try:
             "manual": True,
             "label": "FORGED_MANUAL",
             "owner": "forced click target",
+            "image_main_type": "Custom / Context",
+            "image_sub_type": "Custom",
             "source_type": "Custom",
             "custom_source_type": "Forced stale UI row",
         }
@@ -691,6 +711,8 @@ try:
         "label": "Hero",
         "asset_id": "Manual_Hero_ID",
         "owner": "manual ID target",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
         "source_type": "Character Appearance",
     }]
     id_collision = prompt_library._apply_image_asset_payload(

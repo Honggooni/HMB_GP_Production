@@ -13,9 +13,17 @@ const MAX_MANUAL_FRAME_NUMBER = 2147483647;
 const FRAME_RANGE_INTENT_VERSION = 1;
 const MAX_SOURCE_SYNC_REVISION = Number.MAX_SAFE_INTEGER;
 const UI_EDIT_REVISION_KEY = "ui_edit_revision";
-let ACTOR_COLOR_PICK_CHOICES = [];
-let OBJECT_COLOR_PICK_CHOICES = [];
-let COLOR_PICK_CHOICES = [];
+let ACTOR_COLOR_PICK_CHOICES = [
+  "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink",
+];
+let OBJECT_COLOR_PICK_CHOICES = [
+  "Sky Blue", "Mint", "Beige",
+  "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern",
+];
+let COLOR_PICK_CHOICES = [
+  ...ACTOR_COLOR_PICK_CHOICES,
+  ...OBJECT_COLOR_PICK_CHOICES,
+];
 let ACTOR_COLOR_PICK_SOURCE_TYPES = new Set();
 let OBJECT_COLOR_PICK_SOURCE_TYPES = new Set();
 const HMB_DEFAULT_NODE_WIDTH = 1800;
@@ -116,6 +124,64 @@ export function hmbScopeWidgetStyleMarkup(markup, rootSelector) {
 let IMAGE_SOURCE_TYPES = [];
 let IMAGE_SCOPES = [];
 let IMAGE_SCOPES_BY_SOURCE_TYPE = {};
+let IMAGE_MAIN_TYPES = [
+  "Select Image Main Type",
+  "Character",
+  "Character Prop",
+  "Environment / Background",
+  "Background Prop",
+  "Look Reference",
+  "Custom / Context",
+];
+let IMAGE_SUB_TYPES = {
+  Character: [
+    "Full Appearance", "Head / Face", "Eyes / Expression", "Body Part",
+    "Hair / Fur", "Costume Detail", "Full Costume",
+  ],
+  "Character Prop": [
+    "Handheld Prop", "Attached Accessory", "Character Interactive Prop",
+  ],
+  "Environment / Background": [
+    "Main Background", "Sky / Exterior", "Ground / Floor", "Foreground",
+  ],
+  "Background Prop": [
+    "Independent Scene Prop", "Interactive Scene Prop", "Set / Structure",
+  ],
+  "Look Reference": [
+    "Color Mood", "Lighting / Atmosphere", "Render Look",
+    "Color / Look / Lighting", "Scale", "Composition", "Scale / Composition",
+  ],
+  "Custom / Context": ["Context", "Custom"],
+};
+
+const IMAGE_TAXONOMY_WIRE_MAP = Object.freeze({
+  "Character\u0000Full Appearance": ["Character Appearance", "Full body / full appearance"],
+  "Character\u0000Head / Face": ["Partial Character Detail", "Head / face only"],
+  "Character\u0000Eyes / Expression": ["Partial Character Detail", "Eye / expression detail"],
+  "Character\u0000Body Part": ["Partial Character Detail", "Hand / foot / body part detail"],
+  "Character\u0000Hair / Fur": ["Partial Character Detail", "Hair / fur detail"],
+  "Character\u0000Costume Detail": ["Costume / Clothing", "Costume detail"],
+  "Character\u0000Full Costume": ["Costume / Clothing", "Full outfit / complete costume"],
+  "Character Prop\u0000Handheld Prop": ["Prop / Accessory", "Handheld prop"],
+  "Character Prop\u0000Attached Accessory": ["Prop / Accessory", "Attached accessory"],
+  "Character Prop\u0000Character Interactive Prop": ["Prop / Accessory", "Interactive scene prop"],
+  "Environment / Background\u0000Main Background": ["Environment / Background", "Main background"],
+  "Environment / Background\u0000Sky / Exterior": ["Sky / Exterior Background", "Sky / exterior area"],
+  "Environment / Background\u0000Ground / Floor": ["Foreground / Ground", "Ground / floor"],
+  "Environment / Background\u0000Foreground": ["Foreground / Ground", "Foreground element"],
+  "Background Prop\u0000Independent Scene Prop": ["Prop / Accessory", "Independent scene prop"],
+  "Background Prop\u0000Interactive Scene Prop": ["Prop / Accessory", "Interactive scene prop"],
+  "Background Prop\u0000Set / Structure": ["Set / Structure", "Set geometry / structure only"],
+  "Look Reference\u0000Color Mood": ["Color / Look Reference", "Color mood only"],
+  "Look Reference\u0000Lighting / Atmosphere": ["Lighting / Atmosphere Reference", "Lighting mood only"],
+  "Look Reference\u0000Render Look": ["Color / Look Reference", "Render look only"],
+  "Look Reference\u0000Color / Look / Lighting": ["Color + Look + Lighting Mood Reference", "All color + look + lighting functions"],
+  "Look Reference\u0000Scale": ["Scale / Composition Reference", "Scale only"],
+  "Look Reference\u0000Composition": ["Scale / Composition Reference", "Composition only"],
+  "Look Reference\u0000Scale / Composition": ["Scale / Composition Reference", "Scale + composition"],
+  "Custom / Context\u0000Context": ["Custom", ""],
+  "Custom / Context\u0000Custom": ["Custom", "Custom scope"],
+});
 
 const VIDEO_SOURCE_TYPES = [
   "Role Required / Select Video Type",
@@ -165,6 +231,47 @@ const VIDEO_ROLE_COMPATIBILITY = {
   "Custom": ["Custom Role", "Context Only"],
 };
 
+// Compact authoring taxonomy.  These values are saved by Prompt only; the
+// established source_type/control_role pair remains the signed Agent wire
+// contract and is populated through VIDEO_TAXONOMY_WIRE_MAP. Legacy UI
+// selections are intentionally released instead of migrated.
+const VIDEO_MAIN_TYPES = [
+  "Select Video Main Type",
+  "Maya Preview / Playblast",
+  "Motion Reference",
+  "Scene / Look Reference",
+  "FX / Simulation Reference",
+  "Custom / Context",
+];
+
+const VIDEO_SUB_TYPES = Object.freeze({
+  "Maya Preview / Playblast": ["Original Preview", "Mask", "Depth", "Motion Guide", "Timing / Edit"],
+  "Motion Reference": ["Local Motion", "Secondary Motion", "Retargeting Guide"],
+  "Scene / Look Reference": ["Camera / Layout", "Depth / Spatial", "Lighting / Look", "Composition"],
+  "FX / Simulation Reference": ["Explosion", "Dust", "Particle"],
+  "Custom / Context": ["Context", "Custom"],
+});
+
+const VIDEO_TAXONOMY_WIRE_MAP = Object.freeze({
+  "Maya Preview / Playblast\u0000Original Preview": ["Unified Shot-Control Video", "Primary Unified Shot Control"],
+  "Maya Preview / Playblast\u0000Mask": ["Maya Preview / Playblast", "Mask / Guide Only"],
+  "Maya Preview / Playblast\u0000Depth": ["Depth / Spatial Reference", "Spatial Alignment Verification Only"],
+  "Maya Preview / Playblast\u0000Motion Guide": ["Motion Guide / Retargeting Reference", "Derived Motion Decoding Only"],
+  "Maya Preview / Playblast\u0000Timing / Edit": ["Timing / Edit Reference", "Timing Only"],
+  "Motion Reference\u0000Local Motion": ["Motion Reference", "Local Motion Detail Only"],
+  "Motion Reference\u0000Secondary Motion": ["Motion Reference", "Secondary Motion Only"],
+  "Motion Reference\u0000Retargeting Guide": ["Motion Guide / Retargeting Reference", "Derived Motion Decoding Only"],
+  "Scene / Look Reference\u0000Camera / Layout": ["Camera / Layout Reference", "Spatial Alignment Verification Only"],
+  "Scene / Look Reference\u0000Depth / Spatial": ["Depth / Spatial Reference", "Spatial Alignment Verification Only"],
+  "Scene / Look Reference\u0000Lighting / Look": ["Lighting / Look Reference", "Lighting / Look Only"],
+  "Scene / Look Reference\u0000Composition": ["Camera / Layout Reference", "Local Composition Check Only"],
+  "FX / Simulation Reference\u0000Explosion": ["FX Reference", "FX Behavior Only"],
+  "FX / Simulation Reference\u0000Dust": ["FX Reference", "FX Behavior Only"],
+  "FX / Simulation Reference\u0000Particle": ["FX Reference", "FX Behavior Only"],
+  "Custom / Context\u0000Context": ["Custom", "Context Only"],
+  "Custom / Context\u0000Custom": ["Custom", "Custom Role"],
+});
+
 const TEXT_FIELDS = [
   ["PROJECT_STYLE_LOOK", "PROJECT STYLE / LOOK CONTEXT ONLY", "approved project look, render quality, style continuity, production-level visual target", "image"],
   ["SCENE_CONTEXT", "SCENE CONTEXT ONLY", "place, time, atmosphere, story situation, relationship, narrative context", "image"],
@@ -178,6 +285,9 @@ const MANUAL_VIDEO_CONTEXT_TEXT_FIELDS = Object.freeze(
   TEXT_FIELDS.map(([key]) => key).filter((key) => key !== "PRESERVED_TEXT"),
 );
 const MANUAL_VIDEO_CONTEXT_IMAGE_FIELDS = Object.freeze([
+  "image_main_type",
+  "image_sub_type",
+  "custom_source_type",
   "color_picks",
   "binding_scopes",
   "binding_custom_scopes",
@@ -223,6 +333,7 @@ const HMB_UI_KO = {
   add_video_row: "비디오 소스 행 추가",
   add_color_pick: "컬러 픽 추가",
   remove_color_pick: "컬러 픽 삭제",
+  no_color_pick: "장면 전체 적용 · 컬러 픽 없음",
   use_frame_range: "Range",
   frame_range_disabled: "연결 없이도 Range를 편집할 수 있으며 소스 연결 시 자동으로 활성화됩니다.",
   frame_in: "인",
@@ -231,6 +342,34 @@ const HMB_UI_KO = {
 };
 
 const HMB_OPTION_KO = {
+  "Select Image Main Type": "이미지 메인 타입 선택",
+  "Character": "캐릭터",
+  "Character Prop": "캐릭터 프랍",
+  "Background Prop": "배경 프랍",
+  "Look Reference": "룩 레퍼런스",
+  "Full Appearance": "전체 외형",
+  "Head / Face": "머리 / 얼굴",
+  "Eyes / Expression": "눈 / 표정",
+  "Body Part": "신체 부위",
+  "Hair / Fur": "머리카락 / 털",
+  "Costume Detail": "의상 세부",
+  "Full Costume": "전체 의상",
+  "Handheld Prop": "손에 드는 프랍",
+  "Attached Accessory": "부착 액세서리",
+  "Character Interactive Prop": "캐릭터 상호작용 프랍",
+  "Main Background": "메인 배경",
+  "Sky / Exterior": "하늘 / 외부",
+  "Ground / Floor": "지면 / 바닥",
+  "Foreground": "전경",
+  "Independent Scene Prop": "독립 장면 프랍",
+  "Interactive Scene Prop": "상호작용 장면 프랍",
+  "Set / Structure": "세트 / 구조물",
+  "Color Mood": "색감 분위기",
+  "Lighting / Atmosphere": "조명 / 분위기",
+  "Render Look": "렌더 룩",
+  "Color / Look / Lighting": "색감 / 룩 / 조명",
+  "Scale": "크기",
+  "Scale / Composition": "크기 / 구도",
   "Role Required / Select Source Type": "소스 유형 선택 (선택 사항)",
   "Ignore / Unused": "무시 / 사용 안 함",
   "Character Appearance": "캐릭터 외형",
@@ -300,6 +439,27 @@ const HMB_OPTION_KO = {
   "Mask / Guide Only": "마스크 / 가이드만",
   "Context Only": "맥락 참조만",
   "Custom Role": "사용자 지정 역할",
+  "Select Video Main Type": "비디오 메인 타입 선택",
+  "Scene / Look Reference": "장면 / 룩 레퍼런스",
+  "FX / Simulation Reference": "FX / 시뮬레이션 레퍼런스",
+  "Custom / Context": "사용자 지정 / 참고",
+  "Original Preview": "원본 프리뷰",
+  "Mask": "마스크",
+  "Depth": "뎁스",
+  "Motion Guide": "모션 가이드",
+  "Timing / Edit": "타이밍 / 편집",
+  "Local Motion": "로컬 모션",
+  "Secondary Motion": "보조 모션",
+  "Retargeting Guide": "리타게팅 가이드",
+  "Camera / Layout": "카메라 / 레이아웃",
+  "Depth / Spatial": "뎁스 / 공간",
+  "Lighting / Look": "라이팅 / 룩",
+  "Composition": "구도",
+  "Explosion": "폭발",
+  "Dust": "먼지",
+  "Particle": "파티클",
+  "Context": "참고 전용",
+  "Custom": "사용자 지정",
   "Red": "빨강",
   "Yellow": "노랑",
   "Green": "초록",
@@ -363,6 +523,8 @@ function defaultImage(slot) {
     asset_source_uid: "",
     asset_project_uid: "",
     asset_selection_order: 0,
+    asset_image_main_type_candidate: "",
+    asset_image_sub_type_candidate: "",
     asset_source_type_candidate: "",
     asset_scope_candidate: "",
     asset_color_pick_candidates: [],
@@ -370,6 +532,8 @@ function defaultImage(slot) {
     asset_managed: false,
     asset_verified: false,
     asset_source_kind: "",
+    image_main_type: "Select Image Main Type",
+    image_sub_type: "",
     source_type: "Role Required / Select Source Type",
     custom_source_type: "",
     owner: "",
@@ -468,9 +632,11 @@ function hmbPromptManualSourceFingerprint(item, kind, coarse = false) {
   if (coarse) {
     const keys = kind === "image" ? [
       "label", "present", "asset_id", "asset_path", "asset_library_id",
+      "image_main_type", "image_sub_type",
       "source_type", "custom_source_type", "scope", "owner", "manual",
     ] : [
-      "label", "present", "video_uid", "source_uid", "source_type",
+      "label", "present", "video_uid", "source_uid", "video_main_type",
+      "video_sub_type", "source_type",
       "custom_source_type", "control_role", "custom_control_role", "manual",
     ];
     return JSON.stringify(keys.map((key) => hmbPromptStableSerializable(item[key])));
@@ -546,6 +712,8 @@ export function hmbReconcilePromptSourceIdentities(previousState, nextState) {
 const PICKER_AUTO_DEPTH_FIELDS = Object.freeze([
   "label",
   "present",
+  "video_main_type",
+  "video_sub_type",
   "source_type",
   "custom_source_type",
   "control_role",
@@ -644,12 +812,16 @@ function defaultVideo(slot) {
     picker_managed: false,
     present: false,
     label: "",
+    video_main_type: "Select Video Main Type",
+    video_sub_type: "",
     source_type: "Role Required / Select Video Type",
     custom_source_type: "",
     control_role: "",
     custom_control_role: "",
     keep_out: "",
     picker_auto_label: "",
+    picker_auto_video_main_type: "",
+    picker_auto_video_sub_type: "",
     picker_auto_depth: {},
     picker_auto_motion_guide: {},
     picker_motion_guide_summary: {},
@@ -1110,6 +1282,19 @@ function applyImageTaxonomy(input) {
   const sourceTypes = uniqueStrings(
     taxonomy.source_type_choices || firstImage.source_type_choices,
   );
+  const mainTypes = uniqueStrings(
+    taxonomy.image_main_type_choices || firstImage.image_main_type_choices,
+  );
+  if (mainTypes.length) IMAGE_MAIN_TYPES = mainTypes;
+  const rawSubTypes = taxonomy.image_sub_type_choices || firstImage.image_sub_type_choices;
+  if (rawSubTypes && typeof rawSubTypes === "object" && !Array.isArray(rawSubTypes)) {
+    const mapped = {};
+    Object.entries(rawSubTypes).forEach(([key, values]) => {
+      const choices = uniqueStrings(values);
+      if (choices.length) mapped[String(key)] = choices;
+    });
+    if (Object.keys(mapped).length) IMAGE_SUB_TYPES = mapped;
+  }
   const scopes = uniqueStrings(taxonomy.scope_choices || firstImage.scope_choices);
   if (sourceTypes.length) IMAGE_SOURCE_TYPES = sourceTypes;
   if (scopes.length) IMAGE_SCOPES = scopes;
@@ -1138,6 +1323,10 @@ function applyImageTaxonomy(input) {
   ])];
 
   return {
+    image_main_type_choices: [...IMAGE_MAIN_TYPES],
+    image_sub_type_choices: Object.fromEntries(
+      Object.entries(IMAGE_SUB_TYPES).map(([key, values]) => [key, [...values]]),
+    ),
     source_type_choices: [...IMAGE_SOURCE_TYPES],
     scope_choices: [...IMAGE_SCOPES],
     scope_choices_by_source_type: Object.fromEntries(
@@ -1158,6 +1347,85 @@ export function colorPickChoicesForSourceType(sourceType) {
   return [];
 }
 
+export function colorPickChoicesForImageTaxonomy(mainType, subType = "") {
+  const main = clean(mainType);
+  const sub = clean(subType);
+  if (["Character", "Character Prop"].includes(main)) {
+    return [...ACTOR_COLOR_PICK_CHOICES];
+  }
+  if (["Environment / Background", "Background Prop"].includes(main)) {
+    return [...OBJECT_COLOR_PICK_CHOICES];
+  }
+  if (main === "Custom / Context" && sub === "Custom") {
+    return [...COLOR_PICK_CHOICES];
+  }
+  return [];
+}
+
+export function normalizeImageTaxonomy(item) {
+  if (!item || typeof item !== "object") return ["Select Image Main Type", ""];
+  let mainType = clean(item.image_main_type);
+  let subType = clean(item.image_sub_type);
+  const subTypes = Array.isArray(IMAGE_SUB_TYPES[mainType]) ? IMAGE_SUB_TYPES[mainType] : [];
+  if (
+    !IMAGE_MAIN_TYPES.includes(mainType)
+    || mainType === "Select Image Main Type"
+    || !subTypes.includes(subType)
+  ) {
+    mainType = "Select Image Main Type";
+    subType = "";
+  }
+  item.image_main_type = mainType;
+  item.image_sub_type = subType;
+  const wirePair = IMAGE_TAXONOMY_WIRE_MAP[`${mainType}\u0000${subType}`] || null;
+  if (!wirePair) {
+    item.source_type = "Role Required / Select Source Type";
+    item.scope = "";
+    item.binding_scopes = [""];
+    item.binding_custom_scopes = [""];
+    item.color_picks = [""];
+    item.owner = "";
+    item.interaction_targets = [""];
+    item.interaction_custom_targets = [""];
+    item.legacy_relationship_targets = [];
+    item.custom_source_type = "";
+    item.picker_auto_color = "";
+    item.picker_auto_video = 0;
+    item.picker_auto_source = "";
+    return [mainType, subType];
+  }
+  const [sourceType, scope] = wirePair;
+  item.source_type = sourceType;
+  item.scope = scope;
+  if (!(mainType === "Custom / Context" && subType === "Custom")) {
+    item.custom_source_type = "";
+  }
+  if (mainType === "Look Reference") {
+    item.owner = "Global Look";
+    item.interaction_targets = [""];
+    item.interaction_custom_targets = [""];
+    item.legacy_relationship_targets = [];
+  }
+  const allowedColors = colorPickChoicesForImageTaxonomy(mainType, subType);
+  const colors = Array.isArray(item.color_picks) ? item.color_picks : [];
+  item.color_picks = colors.map(clean).filter((value) => allowedColors.includes(value)).slice(0, MAX_COLOR_PICKS);
+  if (!item.color_picks.length) item.color_picks = [""];
+  const count = item.color_picks.length;
+  item.binding_scopes = Array.from({ length: count }, () => scope);
+  item.binding_custom_scopes = Array.from({ length: count }, () => (
+    scope === "Custom scope" ? clean(item.custom_source_type) : ""
+  ));
+  if (!allowedColors.length) {
+    item.color_picks = [""];
+    item.binding_scopes = [scope];
+    item.binding_custom_scopes = [scope === "Custom scope" ? clean(item.custom_source_type) : ""];
+    item.picker_auto_color = "";
+    item.picker_auto_video = 0;
+    item.picker_auto_source = "";
+  }
+  return [mainType, subType];
+}
+
 const VIDEO_ROLE_ALIASES = {
   "Strongest Unified Shot-Control": "Primary Unified Shot Control",
   "Motion Only": "Local Motion Detail Only",
@@ -1170,25 +1438,44 @@ function canonicalVideoRole(value) {
   return VIDEO_ROLE_ALIASES[role] || role;
 }
 
-export function applyVideoRoleDefaultForSourceType(item) {
-  if (!item || typeof item !== "object") return "";
-  const currentRole = canonicalVideoRole(item.control_role);
-  const sourceType = clean(item.source_type);
-  const defaultRole = sourceType === "FX Reference"
-    ? "FX Behavior Only"
-    : sourceType === "Timing / Edit Reference"
-      ? "Timing Only"
-      : "";
-  if (!defaultRole) {
-    item.control_role = currentRole;
-    return currentRole;
-  }
-  item.control_role = defaultRole;
-  return defaultRole;
+function videoTaxonomyWirePair(mainType, subType) {
+  return VIDEO_TAXONOMY_WIRE_MAP[`${clean(mainType)}\u0000${clean(subType)}`] || null;
 }
 
-function primaryVideoTypeChoices(_current) {
-  return [...VIDEO_SOURCE_TYPES];
+export function normalizeVideoTaxonomy(item) {
+  if (!item || typeof item !== "object") return ["Select Video Main Type", ""];
+  let mainType = clean(item.video_main_type);
+  let subType = clean(item.video_sub_type);
+  const subTypes = Array.isArray(VIDEO_SUB_TYPES[mainType]) ? VIDEO_SUB_TYPES[mainType] : [];
+  if (!VIDEO_MAIN_TYPES.includes(mainType) || mainType === "Select Video Main Type" || !subTypes.includes(subType)) {
+    mainType = "Select Video Main Type";
+    subType = "";
+  }
+  item.video_main_type = mainType;
+  item.video_sub_type = subType;
+  const wirePair = videoTaxonomyWirePair(mainType, subType);
+  if (!wirePair) {
+    item.source_type = "Role Required / Select Video Type";
+    item.control_role = "";
+    item.custom_source_type = "";
+    item.custom_control_role = "";
+  } else {
+    [item.source_type, item.control_role] = wirePair;
+  }
+  return [mainType, subType];
+}
+
+export function applyVideoRoleDefaultForSourceType(item) {
+  if (!item || typeof item !== "object") return "";
+  const mainType = clean(item.video_main_type);
+  const subTypes = Array.isArray(VIDEO_SUB_TYPES[mainType]) ? VIDEO_SUB_TYPES[mainType] : [];
+  item.video_sub_type = subTypes[0] || "";
+  normalizeVideoTaxonomy(item);
+  return item.video_sub_type;
+}
+
+export function primaryVideoTypeChoices(_current) {
+  return [...VIDEO_MAIN_TYPES];
 }
 
 function mergeUniqueNotes(...values) {
@@ -1622,6 +1909,7 @@ function migrateTargetAuthority(item, scopes) {
 
 function normalizeImageBindingFields(item, videoCount = MAX_VIDEOS) {
   if (!item || typeof item !== "object") return item;
+  normalizeImageTaxonomy(item);
   const picks = normalizeColorPicks(item.color_picks);
   const rawScopes = item.binding_scopes != null ? item.binding_scopes : (item.sub_types != null ? item.sub_types : item.subtypes);
   let scopes = normalizeBindingScopes(rawScopes, item.scope, picks.length);
@@ -1721,10 +2009,14 @@ export function hmbImagePickerEnabled(state) {
 export function hmbImagePickerActionAvailability(state, item) {
   const enabled = hmbImagePickerEnabled(state);
   const pickCount = normalizeColorPicks(item && item.color_picks).length;
+  const hasColorAuthority = colorPickChoicesForImageTaxonomy(
+    item?.image_main_type,
+    item?.image_sub_type,
+  ).length > 0;
   return {
     enabled,
-    canAdd: pickCount < MAX_COLOR_PICKS,
-    canRemove: pickCount > 1,
+    canAdd: hasColorAuthority && pickCount < MAX_COLOR_PICKS,
+    canRemove: hasColorAuthority && pickCount > 1,
   };
 }
 
@@ -1837,6 +2129,8 @@ function migrateImage(item, slot) {
     0,
     Math.floor(Number(item.asset_selection_order || item.selection_order) || 0),
   );
+  out.asset_image_main_type_candidate = clean(item.asset_image_main_type_candidate);
+  out.asset_image_sub_type_candidate = clean(item.asset_image_sub_type_candidate);
   out.asset_source_type_candidate = clean(item.asset_source_type_candidate);
   out.asset_scope_candidate = clean(item.asset_scope_candidate);
   out.asset_color_pick_candidates = Array.isArray(item.asset_color_pick_candidates)
@@ -1848,6 +2142,8 @@ function migrateImage(item, slot) {
     ? clean(item.asset_source_kind).toLowerCase()
     : "";
   out.asset_verified = Boolean(item.asset_verified && out.asset_source_kind === "project");
+  out.image_main_type = clean(item.image_main_type);
+  out.image_sub_type = clean(item.image_sub_type);
   out.source_type = clean(item.source_type) || out.source_type;
   out.custom_source_type = clean(item.custom_source_type || item.custom_main_type);
   out.scope = clean(item.scope);
@@ -1936,6 +2232,8 @@ function migrateVideo(item, slot) {
   out.picker_managed = Boolean(item.picker_managed || out.video_uid);
   out.label = clean(item.label || item.name_override || item.description);
   out.present = Boolean(item.present) || Boolean(out.label);
+  out.video_main_type = clean(item.video_main_type);
+  out.video_sub_type = clean(item.video_sub_type);
   out.source_type = clean(item.source_type) || out.source_type;
   out.custom_source_type = clean(item.custom_source_type || item.custom_video_type);
   out.control_role = canonicalVideoRole(item.control_role);
@@ -1950,6 +2248,8 @@ function migrateVideo(item, slot) {
     item.description,
   );
   out.picker_auto_label = clean(item.picker_auto_label);
+  out.picker_auto_video_main_type = clean(item.picker_auto_video_main_type);
+  out.picker_auto_video_sub_type = clean(item.picker_auto_video_sub_type);
   out.picker_auto_depth = normalizePickerAutoDepth(item.picker_auto_depth);
   out.picker_auto_motion_guide = normalizePickerAutoMotionGuide(
     item.picker_auto_motion_guide,
@@ -2020,15 +2320,7 @@ function migrateVideo(item, slot) {
     out.control_role = "Custom Role";
     out.custom_control_role = uniqueList([unknownControlRole, out.custom_control_role].filter(Boolean)).join(" | ");
   }
-  // Keep the factual Maya preview type but remove the stale combined
-  // authority. Primary is valid only for an explicit Unified type.
-  if (
-    out.source_type === "Maya Preview / Playblast"
-    && out.control_role === "Primary Unified Shot Control"
-  ) {
-    out.control_role = "";
-    out.custom_control_role = "";
-  }
+  normalizeVideoTaxonomy(out);
   return hmbPromptCarrySourceIdentity(item, out, "video");
 }
 
@@ -2328,6 +2620,9 @@ function normalizeManualVideoContextImageFields(value, index) {
     source.frame_range_binding,
   );
   const normalizedItem = migrateImage({
+    image_main_type: boundedClean(source.image_main_type),
+    image_sub_type: boundedClean(source.image_sub_type),
+    custom_source_type: boundedClean(source.custom_source_type),
     color_picks: colorPicks,
     binding_scopes: bindingScopes,
     binding_custom_scopes: bindingCustomScopes,
@@ -2358,6 +2653,9 @@ function normalizeManualVideoContextImageFields(value, index) {
     normalizeManualVideoContextFrameBindings({}, normalizedItem.frame_range_binding),
   )[0] || null;
   const fields = {
+    image_main_type: boundedClean(normalizedItem.image_main_type),
+    image_sub_type: boundedClean(normalizedItem.image_sub_type),
+    custom_source_type: boundedClean(normalizedItem.custom_source_type),
     color_picks: normalizedItem.color_picks.map((item) => boundedClean(item)).slice(0, MAX_COLOR_PICKS),
     binding_scopes: normalizedItem.binding_scopes.map((item) => boundedClean(item)).slice(0, MAX_COLOR_PICKS),
     binding_custom_scopes: normalizedItem.binding_custom_scopes.map((item) => boundedClean(item)).slice(0, MAX_COLOR_PICKS),
@@ -2828,6 +3126,80 @@ export function hmbFlushImmediateStateCommit(container, props, state) {
   if (!hmbClearImmediateStateCommit(container)) return false;
   hmbCaptureUiBeforeStateEmit(container, state);
   hmbEmitLocalPromptState(container, props, state);
+  return true;
+}
+
+// Select and Range controls already own their live DOM value. Publishing in
+// the same browser task blocks that first paint and lets every rapid change
+// create another retained-mode echo. Keep only the newest state and publish it
+// after two paint opportunities; a subsequent direct publication cancels this
+// batch and carries the same in-memory state immediately.
+export function hmbClearPromptInteractionCommit(container) {
+  if (!container) return false;
+  const job = container.__hmbPromptLibraryInteractionCommit;
+  if (!job) return false;
+  job.cancelled = true;
+  try { delete container.__hmbPromptLibraryInteractionCommit; } catch (_error) {
+    container.__hmbPromptLibraryInteractionCommit = null;
+  }
+  return true;
+}
+
+export function hmbSchedulePromptInteractionCommit(container, props, state) {
+  if (!container) {
+    hmbEmitLocalPromptState(container, props, state);
+    return true;
+  }
+  hmbClearImmediateStateCommit(container);
+  hmbInvalidatePromptPublication(container);
+  // Make the optimistic selection visible to revision arbitration before the
+  // deferred transport runs. An equal-clock delayed echo can then be rejected
+  // without repainting the control back to its previous value.
+  try {
+    container.__hmbPromptLatestLocalStateValue = JSON.stringify(normalizeState(state));
+  } catch (_error) {}
+  const pending = container.__hmbPromptLibraryInteractionCommit;
+  if (pending && !pending.cancelled) {
+    pending.props = props;
+    pending.state = state;
+    return false;
+  }
+  const job = {
+    cancelled: false,
+    props,
+    state,
+    phase: 0,
+  };
+  container.__hmbPromptLibraryInteractionCommit = job;
+  const publish = () => {
+    if (
+      job.cancelled
+      || container.__hmbPromptLibraryInteractionCommit !== job
+    ) return;
+    delete container.__hmbPromptLibraryInteractionCommit;
+    hmbCaptureUiBeforeStateEmit(container, job.state);
+    hmbEmitLocalPromptState(container, job.props, job.state);
+  };
+  const afterFirstPaint = () => {
+    if (
+      job.cancelled
+      || container.__hmbPromptLibraryInteractionCommit !== job
+    ) return;
+    job.phase = 1;
+    hmbPromptLifecycleFrame(container, publish);
+  };
+  hmbPromptLifecycleFrame(container, afterFirstPaint);
+  return true;
+}
+
+export function hmbFlushPromptInteractionCommit(container) {
+  if (!container) return false;
+  const job = container.__hmbPromptLibraryInteractionCommit;
+  if (!job || job.cancelled) return false;
+  delete container.__hmbPromptLibraryInteractionCommit;
+  job.cancelled = true;
+  hmbCaptureUiBeforeStateEmit(container, job.state);
+  hmbEmitLocalPromptState(container, job.props, job.state);
   return true;
 }
 
@@ -3492,7 +3864,10 @@ function colorPickChoices(images, rowIndex, pickIndex, videoCount) {
       if (!used.includes(entry.color)) used.push(entry.color);
     });
   });
-  const allowed = colorPickChoicesForSourceType(row.source_type);
+  const allowed = colorPickChoicesForImageTaxonomy(
+    row.image_main_type,
+    row.image_sub_type,
+  );
   const choices = [
     "",
     ...(current && !allowed.includes(current) ? [current] : []),
@@ -3518,18 +3893,27 @@ function verifiedRegisteredSubtype(item) {
     !item?.asset_verified
     || clean(item?.asset_source_kind).toLowerCase() !== "project"
   ) return "";
-  const subtype = clean(item.asset_scope_candidate);
-  const choices = Array.isArray(IMAGE_SCOPES_BY_SOURCE_TYPE[clean(item.source_type)])
-    ? IMAGE_SCOPES_BY_SOURCE_TYPE[clean(item.source_type)]
-    : IMAGE_SCOPES;
-  return subtype && choices.includes(subtype) ? subtype : "";
+  const mainType = clean(item.asset_image_main_type_candidate);
+  const subtype = clean(item.asset_image_sub_type_candidate);
+  const choices = Array.isArray(IMAGE_SUB_TYPES[mainType])
+    ? IMAGE_SUB_TYPES[mainType]
+    : [];
+  const wirePair = IMAGE_TAXONOMY_WIRE_MAP[`${mainType}\u0000${subtype}`] || null;
+  return mainType === clean(item.image_main_type)
+    && subtype === clean(item.image_sub_type)
+    && choices.includes(subtype)
+    && wirePair
+    ? clean(wirePair[1])
+    : "";
 }
 
 function renderSubtypeControls(item, state, locked = false) {
   normalizeImageBindingFields(item, videoSlotCount(state));
-  const scope = clean(item.binding_scopes[0]);
-  const customInput = `<input class="custom-inline-input ${scope === "Custom scope" ? "" : "is-hidden"}" data-custom-array="binding_custom_scopes" data-custom-index="0" maxlength="${MAX_IDENTIFIER_CHARS}" value="${escapeHtml(item.binding_custom_scopes[0] || "")}" placeholder="${escapeHtml(uiText(state, "custom_scope", "Custom scope input"))}" aria-hidden="${scope === "Custom scope" ? "false" : "true"}" ${locked ? "disabled" : ""}/>`;
-  return `<div class="binding-scope-stack"><div class="binding-scope-entry"><select class="source-select binding-scope-select" data-field="binding_scopes" data-binding-index="0" ${locked ? "disabled" : ""}>${options(imageScopeChoicesForRow(item, scope), scope, uiText(state, "blank_subtype", "— blank / no subtype —"), state)}</select>${customInput}</div></div>`;
+  const subType = clean(item.image_sub_type);
+  const choices = Array.isArray(IMAGE_SUB_TYPES[clean(item.image_main_type)])
+    ? IMAGE_SUB_TYPES[clean(item.image_main_type)]
+    : [];
+  return `<div class="binding-scope-stack"><div class="binding-scope-entry"><select class="source-select binding-scope-select" data-field="image_sub_type" ${locked ? "disabled" : ""}>${options(["", ...choices], subType, uiText(state, "blank_subtype", "— blank / no subtype —"), state)}</select></div></div>`;
 }
 
 function frameRangeBarsHtml(ranges, metadata, selectedIndex) {
@@ -3638,14 +4022,35 @@ export function setFrameRangeEnabled(item, enabled) {
   return item.frame_range_intent.enabled;
 }
 
-function frameFromPointer(event, track, minimum, maximum) {
-  const rect = track.getBoundingClientRect();
+function frameFromPointer(event, track, minimum, maximum, rectOverride = null) {
+  const rect = rectOverride || track.getBoundingClientRect();
   const width = Math.max(1, Number(rect.width || 1));
   const min = normalizeFrameDomainEndpoint(minimum);
   const max = normalizeFrameDomainEndpoint(maximum);
   if (min === null || max === null || max < min) return 0;
   const ratio = Math.max(0, Math.min(1, (Number(event.clientX || 0) - Number(rect.left || 0)) / width));
   return Math.max(min, Math.min(max, min + Math.round(ratio * (max - min))));
+}
+
+function hmbSetPromptDomAttribute(element, name, value) {
+  if (!element) return false;
+  const next = String(value == null ? "" : value);
+  let current = null;
+  try { current = element.getAttribute?.(name); } catch (_error) {}
+  if (current == null && name in element) {
+    try { current = String(element[name] == null ? "" : element[name]); } catch (_error) {}
+  }
+  if (String(current == null ? "" : current) === next) return false;
+  try { element.setAttribute?.(name, next); } catch (_error) {}
+  return true;
+}
+
+function hmbSetPromptText(element, value) {
+  if (!element) return false;
+  const next = String(value == null ? "" : value);
+  if (String(element.textContent == null ? "" : element.textContent) === next) return false;
+  element.textContent = next;
+  return true;
 }
 
 export function updateFrameTrackPreview(track, ranges, metadata, selectedIndex, statusText) {
@@ -3674,28 +4079,87 @@ export function updateFrameTrackPreview(track, ranges, metadata, selectedIndex, 
       else track.appendChild(bar);
     }
     if (!bar) return;
-    bar.className = `frame-range-bar ${index === selectedIndex ? "selected" : ""}`.trim();
-    bar.setAttribute("data-frame-range-index", String(index));
-    bar.setAttribute("title", `${range.start}–${range.end}`);
+    const className = `frame-range-bar ${index === selectedIndex ? "selected" : ""}`.trim();
+    if (String(bar.className || "") !== className) bar.className = className;
+    hmbSetPromptDomAttribute(bar, "data-frame-range-index", index);
+    hmbSetPromptDomAttribute(bar, "title", `${range.start}–${range.end}`);
     const left = total ? ((range.start - metadata.start_frame) / total) * 100 : 0;
     const width = total ? ((range.end - range.start + 1) / total) * 100 : 0;
-    bar.style.left = `${Math.max(0, left)}%`;
-    bar.style.width = `${Math.max(0, width)}%`;
+    const nextLeft = `${Math.max(0, left)}%`;
+    const nextWidth = `${Math.max(0, width)}%`;
+    if (bar.style && bar.style.left !== nextLeft) bar.style.left = nextLeft;
+    if (bar.style && bar.style.width !== nextWidth) bar.style.width = nextWidth;
     const label = bar.querySelector?.("b");
-    if (label) label.textContent = `${range.start}–${range.end}`;
+    hmbSetPromptText(label, `${range.start}–${range.end}`);
   });
   existing.slice(normalized.length).forEach((bar) => bar.remove?.());
-  if (status) status.textContent = String(statusText || "");
+  hmbSetPromptText(status, statusText || "");
   if (validMetadata) {
     const selected = normalized[selectedIndex] || null;
-    track.setAttribute?.("aria-valuemin", String(metadata.start_frame));
-    track.setAttribute?.("aria-valuemax", String(metadata.end_frame));
-    track.setAttribute?.("aria-valuenow", String(selected ? selected.start : metadata.start_frame));
-    track.setAttribute?.(
+    hmbSetPromptDomAttribute(track, "aria-valuemin", metadata.start_frame);
+    hmbSetPromptDomAttribute(track, "aria-valuemax", metadata.end_frame);
+    hmbSetPromptDomAttribute(track, "aria-valuenow", selected ? selected.start : metadata.start_frame);
+    hmbSetPromptDomAttribute(
+      track,
       "aria-valuetext",
       hmbFrameRangeAriaValueText(normalized, selectedIndex),
     );
   }
+}
+
+export function hmbClearScheduledFrameTrackPreview(container) {
+  if (!container) return false;
+  const job = container.__hmbFrameRangePreviewJob;
+  if (!job) return false;
+  job.cancelled = true;
+  try { delete container.__hmbFrameRangePreviewJob; } catch (_error) {
+    container.__hmbFrameRangePreviewJob = null;
+  }
+  return true;
+}
+
+// Pointer events can greatly outnumber display frames. Calculate the newest
+// range synchronously, but patch bars at most once per animation frame.
+export function hmbScheduleFrameTrackPreview(
+  container,
+  track,
+  ranges,
+  metadata,
+  selectedIndex,
+  statusText,
+) {
+  if (!container || !track) return false;
+  const snapshot = normalizeFrameRanges(ranges).map((range) => ({ ...range }));
+  const current = container.__hmbFrameRangePreviewJob;
+  if (current && !current.cancelled) {
+    current.track = track;
+    current.ranges = snapshot;
+    current.metadata = metadata ? { ...metadata } : null;
+    current.selectedIndex = Number(selectedIndex);
+    current.statusText = String(statusText || "");
+    return false;
+  }
+  const job = {
+    cancelled: false,
+    track,
+    ranges: snapshot,
+    metadata: metadata ? { ...metadata } : null,
+    selectedIndex: Number(selectedIndex),
+    statusText: String(statusText || ""),
+  };
+  container.__hmbFrameRangePreviewJob = job;
+  hmbPromptLifecycleFrame(container, () => {
+    if (job.cancelled || container.__hmbFrameRangePreviewJob !== job) return;
+    delete container.__hmbFrameRangePreviewJob;
+    updateFrameTrackPreview(
+      job.track,
+      job.ranges,
+      job.metadata,
+      job.selectedIndex,
+      job.statusText,
+    );
+  });
+  return true;
 }
 
 function hmbSyncFrameRangeRowDom(row, item, state) {
@@ -3726,13 +4190,13 @@ function hmbSyncFrameRangeRowDom(row, item, state) {
   row.classList?.toggle("invalid", visibleError);
   const toggle = row.querySelector?.("[data-frame-range-toggle]");
   if (toggle) {
-    toggle.checked = enabled;
-    toggle.disabled = false;
-    toggle.setAttribute?.("data-hmb-base-disabled", "0");
-    toggle.closest?.(".frame-range-toggle-wrap")?.setAttribute("title", tooltip);
+    if (Boolean(toggle.checked) !== enabled) toggle.checked = enabled;
+    if (toggle.disabled) toggle.disabled = false;
+    hmbSetPromptDomAttribute(toggle, "data-hmb-base-disabled", "0");
+    hmbSetPromptDomAttribute(toggle.closest?.(".frame-range-toggle-wrap"), "title", tooltip);
   }
   const toggleState = row.querySelector?.(".frame-range-toggle-ui em");
-  if (toggleState) toggleState.textContent = enabled ? "ON" : "OFF";
+  hmbSetPromptText(toggleState, enabled ? "ON" : "OFF");
 
   [
     ["start", frameStatus.domainStart],
@@ -3742,20 +4206,21 @@ function hmbSyncFrameRangeRowDom(row, item, state) {
     if (!input) return;
     input.classList?.toggle("is-hidden", !enabled);
     if (input.ownerDocument?.activeElement !== input) {
-      input.value = frameDomainInputValue(value);
+      const nextValue = frameDomainInputValue(value);
+      if (String(input.value || "") !== nextValue) input.value = nextValue;
     }
-    input.readOnly = false;
-    input.removeAttribute("readonly");
+    if (input.readOnly) input.readOnly = false;
+    if (input.hasAttribute?.("readonly")) input.removeAttribute("readonly");
   });
 
   const shell = row.querySelector?.(".frame-track-shell");
-  if (shell) shell.setAttribute("title", tooltip);
+  hmbSetPromptDomAttribute(shell, "title", tooltip);
   const track = row.querySelector?.("[data-frame-track]");
   if (track) {
     track.classList?.toggle("editable", trackEditable);
-    track.setAttribute("data-frame-min", String(minimum));
-    track.setAttribute("data-frame-max", String(maximum));
-    track.setAttribute("tabindex", trackEditable ? "0" : "-1");
+    hmbSetPromptDomAttribute(track, "data-frame-min", minimum);
+    hmbSetPromptDomAttribute(track, "data-frame-max", maximum);
+    hmbSetPromptDomAttribute(track, "tabindex", trackEditable ? "0" : "-1");
     updateFrameTrackPreview(track, frameStatus.ranges, metadata, selectedIndex, frameStatus.status);
   }
   return frameStatus;
@@ -3859,17 +4324,84 @@ function hmbNextPromptUiEditRevision(container, state) {
   return Math.min(MAX_SOURCE_SYNC_REVISION, Math.max(current, latestLocal) + 1);
 }
 
-const HMB_FRAME_RANGE_UI_FIELDS = Object.freeze([
+const HMB_PROMPT_IMAGE_UI_FIELDS = Object.freeze([
+  "owner",
+  "color_picks",
+  "binding_scopes",
+  "binding_custom_scopes",
+  "binding_video_slots",
+  "marker_video",
+  "preview_marker",
   "frame_range_intent",
 ]);
 
+const HMB_PROMPT_MANUAL_IMAGE_UI_FIELDS = Object.freeze([
+  "image_main_type",
+  "image_sub_type",
+  "custom_source_type",
+]);
+
+const HMB_PROMPT_VIDEO_UI_FIELDS = Object.freeze([
+  "keep_out",
+]);
+
+// Retain the canonical Range contract name for release-audit consumers while
+// the UI axis now also protects the neighboring Prompt-owned selections.
+const HMB_FRAME_RANGE_UI_FIELDS = Object.freeze(["frame_range_intent"]);
+
 function hmbPromptFrameRangeIdentity(item, index) {
-  return hmbPromptSourceIdentity(item, "image") || `image-slot:${index + 1}`;
+  const sourceUid = clean(item?.asset_source_uid || item?.source_uid);
+  if (sourceUid) return `image-uid:${sourceUid}`;
+  const libraryId = clean(item?.asset_library_id);
+  const assetId = clean(item?.asset_id);
+  if (libraryId || assetId) return `image-asset:${libraryId}:${assetId}`;
+  const assetPath = clean(item?.asset_path);
+  if (assetPath) return `image-path:${assetPath}`;
+  return `image-slot:${Math.max(1, Number(item?.slot) || index + 1)}`;
+}
+
+function hmbPromptVideoRevisionIdentity(item, index) {
+  const sourceUid = clean(item?.video_uid || item?.source_uid);
+  if (sourceUid) return `video-uid:${sourceUid}`;
+  return `video-slot:${Math.max(1, Number(item?.slot) || index + 1)}`;
 }
 
 function hmbPromptCloneRangeField(value) {
   if (value === undefined) return undefined;
   try { return JSON.parse(JSON.stringify(value)); } catch (_error) { return value; }
+}
+
+function hmbPromptCopyUiFields(target, source, fields) {
+  if (!target || !source) return;
+  fields.forEach((field) => {
+    if (!Object.prototype.hasOwnProperty.call(source, field)) return;
+    target[field] = hmbPromptCloneRangeField(source[field]);
+  });
+}
+
+function hmbPromptImageHasAuthority(item) {
+  return Boolean(
+    item?.asset_managed
+    || clean(item?.asset_source_uid)
+    || clean(item?.asset_library_id)
+    || clean(item?.asset_id)
+    || clean(item?.asset_path)
+  );
+}
+
+function hmbPromptImageTaxonomyIsVerified(item) {
+  return Boolean(
+    item?.asset_verified
+    && clean(item?.asset_source_kind).toLowerCase() === "project"
+  );
+}
+
+function hmbPromptVideoHasAuthority(item) {
+  return Boolean(
+    item?.picker_managed
+    || clean(item?.video_uid)
+    || clean(item?.source_uid)
+  );
 }
 
 export function hmbMergePromptRevisionAxes(sourceState, uiState) {
@@ -3884,10 +4416,55 @@ export function hmbMergePromptRevisionAxes(sourceState, uiState) {
   source.images.forEach((item, index) => {
     const uiItem = uiImages.get(hmbPromptFrameRangeIdentity(item, index));
     if (!uiItem) return;
-    HMB_FRAME_RANGE_UI_FIELDS.forEach((field) => {
-      item[field] = hmbPromptCloneRangeField(uiItem[field]);
-    });
+    hmbPromptCopyUiFields(item, uiItem, HMB_PROMPT_IMAGE_UI_FIELDS);
+    if (!hmbPromptImageHasAuthority(item)) {
+      item.label = hmbPromptCloneRangeField(uiItem.label);
+    }
+    if (!hmbPromptImageTaxonomyIsVerified(item)) {
+      hmbPromptCopyUiFields(item, uiItem, HMB_PROMPT_MANUAL_IMAGE_UI_FIELDS);
+    }
   });
+  const uiVideos = new Map();
+  ui.videos.forEach((item, index) => {
+    const identity = hmbPromptVideoRevisionIdentity(item, index);
+    if (!uiVideos.has(identity)) uiVideos.set(identity, item);
+  });
+  source.videos.forEach((item, index) => {
+    const identity = hmbPromptVideoRevisionIdentity(item, index);
+    const uiItem = uiVideos.get(identity);
+    if (!uiItem) return;
+    hmbPromptCopyUiFields(item, uiItem, HMB_PROMPT_VIDEO_UI_FIELDS);
+    if (!hmbPromptVideoHasAuthority(item)) {
+      item.label = hmbPromptCloneRangeField(uiItem.label);
+    }
+    const uiMainType = clean(uiItem.video_main_type);
+    const uiAutoMainType = clean(uiItem.picker_auto_video_main_type);
+    if (uiMainType !== uiAutoMainType) {
+      hmbPromptCopyUiFields(item, uiItem, ["video_main_type", "custom_source_type"]);
+    }
+    const uiSubType = clean(uiItem.video_sub_type);
+    const uiAutoSubType = clean(uiItem.picker_auto_video_sub_type);
+    if (uiSubType !== uiAutoSubType) {
+      hmbPromptCopyUiFields(item, uiItem, ["video_sub_type", "custom_control_role"]);
+    }
+  });
+  source.text = hmbPromptCloneRangeField(ui.text) || source.text;
+  source.ui = hmbPromptCloneRangeField(ui.ui) || source.ui;
+  source.source_intent_fallbacks = hmbPromptCloneRangeField(
+    ui.source_intent_fallbacks,
+  ) || source.source_intent_fallbacks;
+  source.picker = source.picker && typeof source.picker === "object" ? source.picker : {};
+  source.picker.slot_suppressions = hmbPromptCloneRangeField(
+    ui?.picker?.slot_suppressions,
+  ) || {};
+  const selectedShotUuid = clean(ui?.shot?.shot_uuid);
+  if (!selectedShotUuid) {
+    source.shot = normalizeShotSelection({});
+  } else {
+    const selectedShot = hmbPromptVerifiedShotCatalog(source)
+      .find((shot) => clean(shot.shot_uuid) === selectedShotUuid);
+    if (selectedShot) source.shot = normalizeShotSelection(selectedShot);
+  }
   source.source_sync_revision = Math.max(
     normalizeSourceSyncRevision(source.source_sync_revision),
     normalizeSourceSyncRevision(ui.source_sync_revision),
@@ -3944,6 +4521,24 @@ function hmbPromptRevisionDisposition(container, nextProps, incomingState) {
   if (uiDirection > 0) return "authoritative";
   if (uiDirection < 0) return "stale";
 
+  // Revision equality is an acknowledgement contract, not permission to
+  // replace a newer optimistic control value. A semantically different
+  // payload at the same two clocks is necessarily a delayed/stale echo.
+  if (hasCurrentSourceRevision && hasUiRevision) {
+    let currentValue = "";
+    try {
+      currentValue = JSON.stringify(normalizeState(parseValue(
+        container.__hmbPromptLatestLocalStateValue
+          || container.__hmbPromptLastPaintedValue,
+      )));
+    } catch (_error) {}
+    if (currentValue) {
+      let incomingValue = "";
+      try { incomingValue = JSON.stringify(normalizeState(incomingState)); } catch (_error) {}
+      if (incomingValue && currentValue !== incomingValue) return "stale";
+    }
+  }
+
   // Disabled is host-owned, but an old source/UI payload must never roll back
   // live selections just because it carries a newer disabled flag. The caller
   // applies that flag without replacing the serialized state.
@@ -3954,7 +4549,7 @@ function hmbPromptRevisionDisposition(container, nextProps, incomingState) {
   if (
     hasCurrentDisabled
     && Boolean(nextProps?.disabled) !== Boolean(container.__hmbPromptCurrentDisabled)
-  ) return "authoritative";
+  ) return "disabled-only";
   return hasUiRevision ? "current" : "unknown";
 }
 
@@ -4135,6 +4730,10 @@ function hmbPublishPromptStateValue(
 }
 
 export function hmbEmitLocalPromptState(container, props, state, onFinalFailure = null) {
+  // A direct publication supersedes any paint-first interaction batch. The
+  // live state object already includes those edits, so a second delayed echo
+  // would only add latency and a possible stale repaint.
+  hmbClearPromptInteractionCommit(container);
   const revisionBaseline = {
     currentUiEditRevision: container?.__hmbPromptCurrentUiEditRevision,
     latestLocalUiEditRevision: container?.__hmbPromptLatestLocalUiEditRevision,
@@ -4287,6 +4886,7 @@ export function hmbConsumePendingPromptStateEcho(container, nextProps, currentSt
     nextProps,
     incomingState,
   );
+  if (revisionDisposition === "disabled-only") return true;
   if (revisionDisposition === "stale") {
     container.__hmbPromptLastConsumedEchoWasStale = true;
     return true;
@@ -4495,9 +5095,8 @@ function hmbInstallFrameRangeInteractions(container, state, props, listeners) {
   const commitFrameState = (row, item) => {
     hmbClearImmediateStateCommit(container);
     hmbSyncFrameRangeRowDom(row, item, state);
-    hmbCaptureUiBeforeStateEmit(container, state);
-    hmbEmitLocalPromptState(container, props, state);
     hmbRestoreSourceScroll(container);
+    hmbSchedulePromptInteractionCommit(container, props, state);
   };
   const itemForElement = (element) => {
     const row = element && element.closest ? element.closest("[data-frame-binding-row]") : null;
@@ -4599,7 +5198,11 @@ function hmbInstallFrameRangeInteractions(container, state, props, listeners) {
       : bar
         ? "move"
         : "create";
-    const anchorFrame = frameFromPointer(event, track, minimum, maximum);
+    // The track does not move during its gesture. Cache this layout read so a
+    // burst of pointermove events cannot alternate layout reads and style
+    // writes on the whole Prompt dashboard.
+    const trackRect = track.getBoundingClientRect();
+    const anchorFrame = frameFromPointer(event, track, minimum, maximum, trackRect);
     const anchorClientX = Number(event.clientX || 0);
     let previewRanges = originalRanges.map((range) => ({ ...range }));
     let previewSelected = rangeIndex;
@@ -4608,7 +5211,7 @@ function hmbInstallFrameRangeInteractions(container, state, props, listeners) {
     const moveHandler = (moveEvent) => {
       moveEvent.preventDefault();
       movedPixels = Math.max(movedPixels, Math.abs(Number(moveEvent.clientX || 0) - anchorClientX));
-      const frame = frameFromPointer(moveEvent, track, minimum, maximum);
+      const frame = frameFromPointer(moveEvent, track, minimum, maximum, trackRect);
       previewRanges = originalRanges.map((range) => ({ ...range }));
       if (mode === "create") {
         previewRanges.push({ start: Math.min(anchorFrame, frame), end: Math.max(anchorFrame, frame) });
@@ -4626,10 +5229,18 @@ function hmbInstallFrameRangeInteractions(container, state, props, listeners) {
           previewRanges[rangeIndex].end = Math.min(maximum, Math.max(original.start, frame));
         }
       }
-      updateFrameTrackPreview(track, previewRanges, metadata, previewSelected, `${previewRanges[previewSelected]?.start || anchorFrame}–${previewRanges[previewSelected]?.end || frame}`);
+      hmbScheduleFrameTrackPreview(
+        container,
+        track,
+        previewRanges,
+        metadata,
+        previewSelected,
+        `${previewRanges[previewSelected]?.start || anchorFrame}–${previewRanges[previewSelected]?.end || frame}`,
+      );
     };
 
     const removeDocumentListeners = () => {
+      hmbClearScheduledFrameTrackPreview(container);
       document.removeEventListener("pointermove", moveHandler, true);
       document.removeEventListener("pointerup", upHandler, true);
       document.removeEventListener("pointercancel", cancelHandler, true);
@@ -4697,6 +5308,9 @@ function hmbInstallFrameRangeInteractions(container, state, props, listeners) {
 function renderColorPickControls(item, rowIndex, images, state) {
   const count = MAX_VIDEOS;
   normalizeImageBindingFields(item, count);
+  if (!colorPickChoicesForImageTaxonomy(item.image_main_type, item.image_sub_type).length) {
+    return `<div class="video-color-pick-wrap no-color-pick"><span>${escapeHtml(uiText(state, "no_color_pick", "Scene-wide · no Color Pick"))}</span></div>`;
+  }
   const title = escapeHtml(uiText(state, "video_marker_source", "video marker source"));
   return `<div class="video-color-pick-wrap"><div class="color-pick-stack">${item.color_picks.map((pick, pickIndex) => `<div class="color-binding-entry"><select class="source-select image-video-index binding-video-index" data-field="binding_video_slots" data-binding-index="${pickIndex}" title="${title}" aria-label="${title}">${videoNumberOptions(state, item.binding_video_slots[pickIndex])}</select><select class="source-select color-pick-select" data-field="color_picks" data-color-index="${pickIndex}" aria-label="${escapeHtml(uiText(state, "video_color_pick", "Video / Color Pick"))}">${colorPickOptions(images, rowIndex, pickIndex, count, state)}</select></div>`).join("")}</div></div>`;
 }
@@ -4941,6 +5555,8 @@ function refreshImageTargetControls(container, state) {
         uiText(state, "blank_target", "— blank / no target —"),
         state,
       );
+      select.disabled = clean(item.image_main_type) === "Look Reference";
+      select.setAttribute?.("data-hmb-base-disabled", select.disabled ? "1" : "0");
     });
   } catch (_e) {}
 }
@@ -4958,42 +5574,32 @@ function imageScopeChoicesForRow(item, currentValue) {
 
 function reconcileImageBindingAfterTypeChange(item, images) {
   if (!item) return;
-  // A Main Type edit changes interpretation, never authored data. Preserve
-  // Target, Sub Type, Color Pick, and dormant slot addresses verbatim.
+  const choices = Array.isArray(IMAGE_SUB_TYPES[clean(item.image_main_type)])
+    ? IMAGE_SUB_TYPES[clean(item.image_main_type)]
+    : [];
+  item.image_sub_type = choices[0] || "";
+  normalizeImageTaxonomy(item);
   normalizeImageBindingFields(item, MAX_VIDEOS);
   item.scope = item.binding_scopes[0] || "";
 }
 
 function renderImageCustomPanel(item, state) {
-  const visible = item.source_type === "Custom";
+  const visible = item.image_main_type === "Custom / Context" && item.image_sub_type === "Custom";
   return `<div class="custom-fields-panel image-custom-panel ${visible ? "" : "is-hidden"}" aria-hidden="${visible ? "false" : "true"}"><label><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><input class="custom-field-input" data-field="custom_source_type" maxlength="${MAX_IDENTIFIER_CHARS}" value="${escapeHtml(item.custom_source_type || "")}" placeholder="${escapeHtml(uiText(state, "custom_main_type", "Custom main type input"))}"/></label></div>`;
 }
 
 function compatibleVideoSourceTypeChoices(item, primaryVideo) {
-  return primaryVideoTypeChoices(item && item.source_type);
+  return primaryVideoTypeChoices(item && item.video_main_type);
 }
 
 export function compatibleVideoRoleChoices(item, _primaryVideo = false) {
-  const sourceType = clean(item?.source_type);
-  const compatible = VIDEO_ROLE_COMPATIBILITY[sourceType];
-  if (!Array.isArray(compatible)) return [...VIDEO_CONTROL_ROLES];
-  const choices = ["", ...compatible];
-  const current = canonicalVideoRole(item?.control_role);
-  const prohibitedPair = Boolean(
-    sourceType === "Maya Preview / Playblast"
-    && current === "Primary Unified Shot Control"
-  );
-  // A saved manual value remains visible until the user changes it.  New
-  // choices are constrained by the authoritative main-type compatibility map.
-  if (current && !choices.includes(current) && !prohibitedPair) {
-    choices.push(current);
-  }
-  return uniqueList(choices);
+  const mainType = clean(item?.video_main_type);
+  return [...(VIDEO_SUB_TYPES[mainType] || [])];
 }
 
 function renderVideoCustomPanel(item, state) {
-  const sourceVisible = item.source_type === "Custom";
-  const roleVisible = item.control_role === "Custom Role";
+  const sourceVisible = item.video_main_type === "Custom / Context";
+  const roleVisible = item.video_sub_type === "Custom";
   return `<div class="custom-fields-panel video-custom-panel ${sourceVisible || roleVisible ? "" : "is-hidden"}" aria-hidden="${sourceVisible || roleVisible ? "false" : "true"}"><label class="video-custom-source ${sourceVisible ? "" : "is-hidden"}"><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><input class="custom-field-input" data-field="custom_source_type" maxlength="${MAX_IDENTIFIER_CHARS}" value="${escapeHtml(item.custom_source_type || "")}" placeholder="${escapeHtml(uiText(state, "custom_video_type", "Custom video type input"))}"/></label><label class="video-custom-role ${roleVisible ? "" : "is-hidden"}"><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><input class="custom-field-input" data-field="custom_control_role" maxlength="${MAX_IDENTIFIER_CHARS}" value="${escapeHtml(item.custom_control_role || "")}" placeholder="${escapeHtml(uiText(state, "custom_video_role", "Custom video role input"))}"/></label></div>`;
 }
 
@@ -5004,7 +5610,8 @@ function hmbSetVisible(element, visible) {
 }
 
 export function hmbImageRowHasExpandedLeftFields(item) {
-  return clean(item?.binding_scopes?.[0]) === "Custom scope";
+  return clean(item?.image_main_type) === "Custom / Context"
+    && clean(item?.image_sub_type) === "Custom";
 }
 
 function hmbRefreshImageSubtypeControls(row, item, state) {
@@ -5014,28 +5621,22 @@ function hmbRefreshImageSubtypeControls(row, item, state) {
     "image-expanded-left-fields",
     hmbImageRowHasExpandedLeftFields(item),
   );
-  row.querySelectorAll?.('select[data-field="binding_scopes"]').forEach((select) => {
-    const bindingIndex = Number(select.getAttribute("data-binding-index") || 0);
-    const scope = clean(item.binding_scopes[bindingIndex]);
+  row.querySelectorAll?.('select[data-field="image_sub_type"]').forEach((select) => {
+    const subType = clean(item.image_sub_type);
     hmbSyncSelectOptions(
       select,
-      imageScopeChoicesForRow(item, scope),
-      scope,
+      ["", ...(IMAGE_SUB_TYPES[clean(item.image_main_type)] || [])],
+      subType,
       uiText(state, "blank_subtype", "— blank / no subtype —"),
       state,
     );
-    const input = select.closest?.(".binding-scope-entry")?.querySelector?.(".custom-inline-input");
-    if (input) {
-      input.value = clean(item.binding_custom_scopes[bindingIndex]);
-      hmbSetVisible(input, scope === "Custom scope");
-    }
   });
 }
 
 function hmbRefreshImageCustomPanel(row, item) {
   if (!row || !item) return;
   const panel = row.querySelector?.(".image-custom-panel");
-  const visible = item.source_type === "Custom";
+  const visible = item.image_main_type === "Custom / Context" && item.image_sub_type === "Custom";
   hmbSetVisible(panel, visible);
   const input = panel?.querySelector?.('[data-field="custom_source_type"]');
   if (input) input.value = clean(item.custom_source_type);
@@ -5044,22 +5645,22 @@ function hmbRefreshImageCustomPanel(row, item) {
 function hmbRefreshVideoDependentControls(row, item, index, state) {
   if (!row || !item) return;
   const primaryVideo = index === 0;
-  const typeSelect = row.querySelector?.('select[data-field="source_type"]');
-  if (typeSelect) typeSelect.value = clean(item.source_type);
-  const roleSelect = row.querySelector?.('select[data-field="control_role"]');
+  const typeSelect = row.querySelector?.('select[data-field="video_main_type"]');
+  if (typeSelect) typeSelect.value = clean(item.video_main_type);
+  const roleSelect = row.querySelector?.('select[data-field="video_sub_type"]');
   if (roleSelect) {
     const blankRole = uiText(state, "blank_control_role", "— optional / choose role —");
     hmbSyncSelectOptions(
       roleSelect,
       compatibleVideoRoleChoices(item, primaryVideo),
-      item.control_role,
+      item.video_sub_type,
       blankRole,
       state,
     );
   }
   const panel = row.querySelector?.(".video-custom-panel");
-  const sourceVisible = item.source_type === "Custom";
-  const roleVisible = item.control_role === "Custom Role";
+  const sourceVisible = item.video_main_type === "Custom / Context";
+  const roleVisible = item.video_sub_type === "Custom";
   hmbSetVisible(panel, sourceVisible || roleVisible);
   hmbSetVisible(panel?.querySelector?.(".video-custom-source"), sourceVisible);
   hmbSetVisible(panel?.querySelector?.(".video-custom-role"), roleVisible);
@@ -5140,29 +5741,34 @@ function hmbSyncSourceSelectDom(container, state, row, kind, index, field) {
   const item = target && target[index];
   if (!row || !item) return;
   if (kind === "image") {
-    const sourceType = row.querySelector?.('select[data-field="source_type"]');
-    if (sourceType) sourceType.value = clean(item.source_type);
-    if (field === "source_type" || field === "owner") {
+    const sourceType = row.querySelector?.('select[data-field="image_main_type"]');
+    if (sourceType) sourceType.value = clean(item.image_main_type);
+    if (field === "image_main_type" || field === "image_sub_type" || field === "owner") {
       refreshImageTargetControls(container, state);
     }
-    if (field === "source_type" || field === "color_picks" || field === "binding_video_slots") {
+    if (field === "image_main_type" || field === "image_sub_type" || field === "color_picks" || field === "binding_video_slots") {
       hmbRefreshImageColorControls(container, state);
-    } else if (field === "binding_scopes") {
+    }
+    if (field === "image_main_type" || field === "image_sub_type") {
       hmbRefreshImageSubtypeControls(row, item, state);
+      hmbRefreshImageCustomPanel(row, item);
       hmbSyncSourceRowActivation(row);
     }
   } else {
     hmbRefreshVideoDependentControls(row, item, index, state);
-    if (field === "source_type") hmbRefreshImageColorControls(container, state);
+    if (field === "video_main_type" || field === "video_sub_type") {
+      hmbRefreshImageColorControls(container, state);
+    }
   }
   hmbRefreshSourceSummaries(container, state);
 }
 
 function renderImageRow(item, index, images, state) {
   normalizeImageBindingFields(item, videoSlotCount(state));
-  const sourceTypeChoices = IMAGE_SOURCE_TYPES.length
-    ? IMAGE_SOURCE_TYPES
-    : uniqueList([item.source_type]);
+  const sceneWideLookReference = clean(item.image_main_type) === "Look Reference";
+  const sourceTypeChoices = IMAGE_MAIN_TYPES.length
+    ? IMAGE_MAIN_TYPES
+    : uniqueList([item.image_main_type]);
   const orderManaged = Boolean(state?.image_asset?.enabled && state?.image_asset?.order_managed);
   const rowManaged = Boolean(orderManaged && item.asset_managed);
   const verifiedAsset = Boolean(
@@ -5180,9 +5786,9 @@ function renderImageRow(item, index, images, state) {
   return `<div class="source-row image ${item.present ? "active" : "next"} ${rowManaged ? "asset-order-managed" : ""} ${verifiedAsset ? "asset-authority-managed" : ""} ${expandedLeftFields ? "image-expanded-left-fields" : ""}" data-kind="image" data-index="${index}" data-source-key="${escapeHtml(hmbPromptSourceIdentity(item, "image"))}">
     <div class="source-num image-index-cell image-drag-handle nodrag" data-image-drag-handle draggable="${dragEnabled ? "true" : "false"}" role="button" tabindex="${dragEnabled ? "0" : "-1"}" aria-label="${escapeHtml(dragEnabled ? uiText(state, "drag_image_row", "Drag or use arrow keys to reorder image source") : (orderManaged ? "Order is controlled by HMBImageAssetLibrary" : ""))}" title="${escapeHtml(dragEnabled ? uiText(state, "drag_image_row", "Drag to reorder image source") : (orderManaged ? "Order is controlled by HMBImageAssetLibrary" : ""))}">${String(item.slot).padStart(2, "0")}</div>
     <div class="source-label image-name-cell"><input class="source-label-input" data-field="label" maxlength="${MAX_IDENTIFIER_CHARS}" value="${escapeHtml(item.label)}" placeholder="${escapeHtml(uiText(state, "name", "Name"))}" title="${escapeHtml(identityTitle)}" ${verifiedAsset ? "readonly" : ""}/></div>
-    <div class="source-role image-main-type-cell"><select class="source-select" data-field="source_type" ${verifiedAsset ? "disabled" : ""}>${options(sourceTypeChoices, item.source_type, "", state)}</select></div>
+    <div class="source-role image-main-type-cell"><select class="source-select" data-field="image_main_type" ${verifiedAsset ? "disabled" : ""}>${options(sourceTypeChoices, item.image_main_type, "", state)}</select></div>
     <div class="source-role binding-scope-cell">${renderSubtypeControls(item, state, Boolean(verifiedAsset && verifiedRegisteredSubtype(item)))}</div>
-    <div class="source-role image-target-cell"><select class="source-select source-target-select" data-field="owner">${targetSelectOptions(item, images, state)}</select></div>
+    <div class="source-role image-target-cell"><select class="source-select source-target-select" data-field="owner" ${sceneWideLookReference ? "disabled data-hmb-base-disabled=\"1\"" : "data-hmb-base-disabled=\"0\""}>${targetSelectOptions(item, images, state)}</select></div>
     <div class="source-role color-pick-cell">${renderColorPickControls(item, index, images, state)}</div>
     <div class="source-status image-actions-cell">${renderImageActions(item, state, index, images.length)}</div>
     ${renderFrameRangeRow(item, index, state)}
@@ -5198,8 +5804,8 @@ function renderVideoRow(item, index, images, state) {
   return `<div class="source-row video ${item.present ? "active" : "next"}" data-kind="video" data-index="${index}" data-source-key="${escapeHtml(hmbPromptSourceIdentity(item, "video"))}">
     <div class="source-num">${String(item.slot).padStart(2, "0")}<br/><b>${escapeHtml(item.token)}</b></div>
     <div class="source-label"><input class="source-label-input" data-field="label" maxlength="${MAX_IDENTIFIER_CHARS}" value="${escapeHtml(item.label)}" placeholder="${escapeHtml(uiText(state, "name", "Name"))}"/></div>
-    <div class="source-role"><select class="source-select" data-field="source_type">${options(compatibleVideoSourceTypeChoices(item, primaryVideo), item.source_type, "", state)}</select></div>
-    <div class="source-role"><select class="source-select" data-field="control_role">${options(roleChoices, item.control_role, blankRole, state)}</select></div>
+    <div class="source-role"><select class="source-select" data-field="video_main_type">${options(compatibleVideoSourceTypeChoices(item, primaryVideo), item.video_main_type, "", state)}</select></div>
+    <div class="source-role"><select class="source-select" data-field="video_sub_type">${options(roleChoices, item.video_sub_type, blankRole, state)}</select></div>
     <div class="source-label source-textarea keep-out-field"><div class="keep-out-resize-shell"><textarea class="source-label-input source-note-input" data-field="keep_out" maxlength="${MAX_KEEP_OUT_CHARS}" ${hmbTextareaAttrs(state, keepOutKey)} placeholder="${escapeHtml(uiText(state, "keep_out_placeholder", "Keep Out: dummy FX, timing-guide regions, marker-only guide areas, preview artifacts, proxy effects, and anything not allowed in final output"))}">${escapeHtml(item.keep_out)}</textarea><div class="keep-out-resize-bar nodrag" data-resize-textarea="${escapeHtml(keepOutKey)}" title="${escapeHtml(uiText(state, "resize_keep_out", "Drag down/up to resize this Keep Out field"))}"></div></div></div>
     <div class="source-status">${renderVideoActions(state)}</div>
     ${renderVideoCustomPanel(item, state)}
@@ -5424,7 +6030,7 @@ function render(state) {
     .hmb-dashboard *{box-sizing:border-box;min-width:0}.topbar{height:58px;flex:0 0 58px;padding:8px 13px;border-bottom:1px solid rgba(148,163,184,.14);background:linear-gradient(90deg,rgba(30,41,59,.92),rgba(15,23,42,.78))}.title{flex:1 1 auto;display:flex;align-items:center;gap:12px;overflow:hidden;color:#f8fafc;font-size:15px;font-weight:850;letter-spacing:.01em;white-space:nowrap;text-overflow:ellipsis}.title>span:last-child{overflow:hidden;text-overflow:ellipsis}.title-mark{flex:0 0 35px;width:35px;height:35px;display:grid;place-items:center;border:1px solid rgba(244,114,182,.5);border-radius:8px;background:linear-gradient(145deg,rgba(190,24,93,.28),rgba(88,28,135,.22));color:#f9a8d4;font-size:10px;font-weight:950;letter-spacing:.04em;box-shadow:inset 0 0 0 1px rgba(255,255,255,.035),0 0 10px rgba(168,85,247,.13)}.topbar{display:flex;align-items:center;gap:12px}.prompt-publish-status{flex:0 1 230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--hmb-status-error);font-size:9px;font-weight:800;text-align:right}.prompt-publish-status:empty{display:none}.language-select{width:auto;min-width:92px;height:28px;border-radius:7px;border:1px solid rgba(148,163,184,.28);background:#090d16;color:#e2e8f0;padding:3px 7px;font-size:11px;outline:none}.language-select:focus{border-color:rgba(34,211,238,.75)}.layout{display:grid;grid-template-columns:minmax(0,1fr);gap:0;flex:1 1 auto;min-height:0;height:100%;overflow:hidden;padding:8px}.center{min-height:0;border:1px solid var(--line);border-radius:10px;background:linear-gradient(180deg,rgba(15,23,42,.74),rgba(2,6,23,.72));padding:8px;overflow:hidden;scrollbar-gutter:auto;display:flex;flex-direction:column;gap:7px;align-content:stretch}.group-card{margin:0;border:1px solid var(--line);border-radius:10px;background:rgba(2,6,23,.54);overflow:hidden;display:flex;flex-direction:column;min-height:0;max-height:none;flex:0 0 auto}.group-card h3{margin:0;padding:8px 12px;font-size:12px;letter-spacing:.04em;border-bottom:1px solid rgba(148,163,184,.14);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 0 auto}.group-card h3 b{font-size:10px;color:#94a3b8;font-weight:600}.group-body{flex:1 1 auto;min-height:0;overflow:hidden}.source-scrollbox{overflow:auto;scrollbar-gutter:stable;overscroll-behavior:contain}.source-scrollbox .source-header{position:sticky;top:0;z-index:5;background:linear-gradient(180deg,rgba(8,13,26,.98),rgba(8,13,26,.94));backdrop-filter:blur(2px)}.source-scrollbox .source-row:last-child{border-bottom:1px solid rgba(148,163,184,.1)}.group-resize-bar{flex:0 0 10px;min-height:10px;border-top:1px solid rgba(148,163,184,.16);background:linear-gradient(90deg,transparent,rgba(148,163,184,.18),transparent);cursor:ns-resize;touch-action:none;user-select:none;position:relative}.group-resize-bar::before{content:"";position:absolute;left:50%;top:3px;width:38px;height:3px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.52)}.group-resize-bar:hover::before{background:#67e8f9}.keep-out-resize-shell{display:flex;flex-direction:column;width:100%;min-height:0}.keep-out-field .source-note-input{height:34px;min-height:34px;max-height:34px;resize:none;border-radius:7px 7px 0 0}.keep-out-resize-bar{height:9px;min-height:9px;border:1px solid rgba(148,163,184,.24);border-top:0;border-radius:0 0 7px 7px;background:linear-gradient(90deg,transparent,rgba(148,163,184,.18),transparent);cursor:ns-resize;touch-action:none;user-select:none;position:relative}.keep-out-resize-bar::before{content:"";position:absolute;left:50%;top:3px;width:28px;height:2px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.52)}.keep-out-resize-bar:hover::before{background:#67e8f9}.image-card{border-color:rgba(236,72,153,.58)}.image-card h3{color:#fb7185}.imgtext{border-color:rgba(168,85,247,.55)}.imgtext h3{color:#c084fc}.video-card{border-color:rgba(249,115,22,.7)}.video-card h3{color:#fb923c}.vtext{border-color:rgba(59,130,246,.55)}.vtext h3{color:#60a5fa}.source-header,.source-row{display:grid;gap:8px;align-items:start}.image-header,.source-row.image{grid-template-columns:2.75rem minmax(0,.78fr) minmax(0,.95fr) minmax(0,.82fr) minmax(0,.82fr) minmax(0,.92fr) 3.6rem}.video-header,.source-row.video{grid-template-columns:2.75rem minmax(0,.84fr) minmax(0,.95fr) minmax(0,.95fr) minmax(0,1.36fr) 3rem}.source-header{min-height:22px;padding:5px 10px;color:#b6c5d2;font-size:10px;font-weight:800;border-bottom:1px solid rgba(148,163,184,.11)}.source-header span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-row{padding:6px 10px;border-bottom:1px solid rgba(148,163,184,.1)}.source-row:last-child{border-bottom:none}.source-num{font-weight:800;color:#f8fafc;font-size:11px;line-height:1.3;overflow:hidden;text-overflow:ellipsis}.source-num b{font-size:9px;color:#94a3b8}.source-label,.source-role,.text-field{min-width:0}.source-label input,.source-label textarea,.source-select,.source-target-input,.text-field textarea,.text-field input{width:100%;min-width:0;border-radius:7px;border:1px solid rgba(148,163,184,.24);background:#090d16;color:#e2e8f0;padding:8px;font-size:11px;outline:none}.source-label input,.source-label textarea,.text-field textarea,.text-field input,.custom-inline-input,.custom-fields-panel input{caret-color:#67e8f9}.source-label input::selection,.source-label textarea::selection,.text-field textarea::selection,.text-field input::selection,.custom-inline-input::selection,.custom-fields-panel input::selection{background:rgba(34,211,238,.34);color:#f8fafc}.source-label input:focus,.source-label textarea:focus,.source-select:focus,.source-target-input:focus,.text-field textarea:focus,.text-field input:focus{border-color:#22d3ee;box-shadow:0 0 0 1px rgba(34,211,238,.38),inset 0 0 0 1px rgba(34,211,238,.08);background:#07111b}.source-label small,.source-role small{display:block;margin-top:5px;color:#94a3b8;font-size:9px;line-height:1.25;overflow:hidden;text-overflow:ellipsis}.source-label textarea{resize:none;min-height:34px;line-height:1.35}.source-note-input{height:34px;min-height:34px;max-height:34px;resize:none}.source-status{display:flex;gap:6px;align-items:center;justify-content:flex-end}.source-actions{display:flex;gap:4px;align-items:center;justify-content:flex-end}.source-actions.image-actions{display:grid;grid-template-columns:24px 24px;grid-template-rows:28px 28px;gap:4px;align-items:center;justify-content:flex-end}.image-order-controls{display:grid;width:24px;height:28px;grid-template-rows:1fr 1fr;gap:2px}.source-actions.image-actions .image-order-controls button{width:24px;height:13px;min-height:0;padding:0;border-radius:5px;font-size:8px;line-height:1}.binding-scope-stack,.color-pick-stack{display:flex;flex-direction:column;gap:4px}.binding-scope-entry,.color-binding-entry{display:flex;flex-direction:column;gap:4px}.color-binding-entry{display:block}.binding-scope-cell select,.color-pick-cell select{height:30px;padding:5px 6px}.video-color-pick-wrap{display:grid;grid-template-columns:2rem minmax(0,1fr);gap:4px;align-items:start}.video-color-pick-wrap .image-video-index{height:30px;padding:0 2px;text-align:center;text-align-last:center;font-weight:800}.video-color-pick-wrap .image-video-index:disabled{opacity:.55;cursor:not-allowed}.binding-video-index{padding:0 2px!important;text-align:center;text-align-last:center;font-weight:800}.custom-inline-input,.custom-fields-panel input{width:100%;border-radius:7px;border:1px solid rgba(34,211,238,.28);background:#07111b;color:#dbeafe;padding:7px;font-size:10px;outline:none}.custom-inline-input:focus,.custom-fields-panel input:focus{border-color:#22d3ee}.custom-fields-panel{grid-column:2 / 7;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:6px 8px;border:1px solid rgba(34,211,238,.22);border-radius:8px;background:rgba(8,47,73,.12)}.custom-fields-panel label{display:flex;flex-direction:column;gap:4px}.custom-fields-panel span{font-size:9px;font-weight:800;color:#67e8f9}.video-custom-panel{grid-column:2 / 6}.source-row.image-add-row,.source-row.video-add-row{border-bottom:1px solid rgba(148,163,184,.1);padding-top:6px;padding-bottom:6px}.source-actions button{flex:0 0 24px;width:24px;height:28px;border-radius:7px;border:1px solid rgba(148,163,184,.22);background:#0b1220;color:#94a3b8;cursor:pointer;font-weight:800;line-height:1}.source-actions button:hover{border-color:#67e8f9;color:#67e8f9}.source-actions button.clear-source:hover{border-color:#fb7185;color:#fb7185}.source-actions button:disabled{opacity:.35;cursor:not-allowed}.clear-source{}.add-note{margin:10px;border:1px dashed rgba(148,163,184,.25);border-radius:8px;padding:9px;text-align:center;color:#94a3b8;font-size:11px}.notes{margin:0 10px 10px;color:#cbd5e1;font-size:10px;line-height:1.45}.text-grid{display:grid;grid-template-columns:1fr;align-items:stretch;align-content:stretch;gap:7px;padding:7px;height:100%;min-height:0}.imgtext .text-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.vtext .text-grid{grid-template-columns:1fr}.imgtext .group-body,.vtext .group-body{overflow:hidden;min-height:0}.text-field{display:flex;flex-direction:column;min-width:0;min-height:0}.text-field span{display:block;font-size:10px;color:#cbd5e1;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.text-field textarea{resize:none;display:block;flex:1 1 auto;height:100%;min-height:0;max-height:none}.warning{margin:10px 0 0;padding:8px;border:1px solid rgba(249,115,22,.35);border-radius:8px;color:#fed7aa;background:rgba(124,45,18,.16);font-size:10px;line-height:1.4}
     .video-color-pick-wrap{display:block}.color-binding-entry{display:grid;grid-template-columns:2rem minmax(0,1fr);gap:4px;align-items:start}
     .topbar-controls .language-button{min-width:58px;height:28px;padding:0 11px;border:1px solid rgba(148,163,184,.24);border-radius:8px;background:#090d16;color:#e2e8f0;font-size:11px;font-weight:800;cursor:pointer}.topbar-controls .language-button:hover,.topbar-controls .language-button:focus-visible{border-color:var(--hmb-shot-accent);color:var(--hmb-shot-soft);outline:none;box-shadow:0 0 0 1px var(--hmb-shot-accent),0 0 12px var(--hmb-shot-glow)}.shot-selector-shell{flex:0 1 290px;width:290px;max-width:290px;height:30px;display:flex;align-items:center;gap:6px;padding:3px 7px;border:1px solid var(--hmb-shot-line);border-radius:8px;background:linear-gradient(180deg,rgba(var(--hmb-shot-rgb),.24),rgba(15,23,42,.88));box-shadow:0 0 12px var(--hmb-shot-glow)}.shot-selector-shell>span,.shot-selector-shell>i{flex:0 0 auto;color:var(--hmb-shot-soft);font-size:8px;font-style:normal;font-weight:900;letter-spacing:.08em}.shot-selector-shell>i{color:var(--hmb-shot-accent)}.shot-selector{flex:1 1 auto;width:100%;height:22px;padding:0 7px;border:0;border-radius:5px;background:#07101f;color:#dbeafe;font-size:10px;font-weight:800;outline:none}.shot-selector:focus-visible{box-shadow:0 0 0 1px var(--hmb-shot-accent),0 0 10px var(--hmb-shot-glow)}.shot-selector:disabled{opacity:.72}
-    .source-row{transition:opacity 120ms ease,box-shadow 120ms ease,background-color 120ms ease}
+    .source-row{transition:none}
     .frame-binding-row{grid-column:1/-1;display:grid;grid-template-columns:3.55rem minmax(0,.78fr) minmax(0,.95fr) minmax(0,.82fr) minmax(0,.82fr) minmax(0,.92fr) 3.6rem;gap:8px;align-items:center;min-height:36px;margin-top:-2px}.frame-range-toggle-wrap{grid-column:1;position:relative;display:flex;align-items:center;min-width:0;color:#cbd5e1;font-size:8px;font-weight:800;line-height:1;cursor:pointer}.frame-range-toggle{position:absolute;inset:0;inline-size:100%;block-size:100%;margin:0;opacity:0;pointer-events:auto;cursor:pointer;z-index:2}.frame-range-toggle-ui{width:100%;min-width:52px;height:24px;display:inline-flex;align-items:center;justify-content:space-between;gap:3px;padding:0 5px;border:1px solid rgba(148,163,184,.28);border-radius:7px;background:#090d16;color:#94a3b8;white-space:nowrap;overflow:hidden}.frame-range-toggle:hover+.frame-range-toggle-ui,.frame-range-toggle:focus-visible+.frame-range-toggle-ui{border-color:rgba(34,211,238,.62);color:#cbd5e1;box-shadow:0 0 0 1px rgba(34,211,238,.2)}.frame-range-toggle-ui b,.frame-range-toggle-ui em{font-size:7px;font-style:normal;font-weight:900;letter-spacing:.02em}.frame-range-toggle-ui em{min-width:17px;text-align:center;color:#64748b}.frame-range-toggle:checked+.frame-range-toggle-ui{border-color:rgba(34,211,238,.52);background:rgba(8,145,178,.18);color:#e0f2fe}.frame-range-toggle:checked+.frame-range-toggle-ui em{color:#67e8f9}.frame-range-toggle:disabled+.frame-range-toggle-ui{opacity:.42;cursor:not-allowed}.frame-track-shell{grid-column:2/5;display:grid;grid-template-columns:3.25rem minmax(0,1fr) 3.25rem;align-items:center;gap:5px;min-width:0}.frame-track-stage{position:relative;min-width:0}.frame-domain-number{width:100%;height:26px;border:1px solid rgba(148,163,184,.28);border-radius:7px;background:#090d16;color:#e2e8f0;padding:2px 4px;font-size:9px;font-weight:800;font-variant-numeric:tabular-nums;text-align:center;outline:none}.frame-domain-number:focus{border-color:#22d3ee;box-shadow:0 0 0 1px rgba(34,211,238,.3)}.frame-domain-number[readonly]{border-color:rgba(34,211,238,.25);background:rgba(8,47,73,.18);color:#bae6fd;cursor:default}.frame-domain-number.is-hidden{visibility:hidden;pointer-events:none}.frame-track{position:relative;height:26px;border:1px solid rgba(148,163,184,.26);border-radius:7px;background:#070d17;overflow:hidden;touch-action:none;user-select:none}.frame-track.editable{cursor:crosshair;border-color:rgba(34,211,238,.42)}.frame-track:focus{outline:1px solid #22d3ee;outline-offset:1px}.frame-track-grid{position:absolute;inset:0;background:repeating-linear-gradient(90deg,transparent 0,transparent calc(10% - 1px),rgba(148,163,184,.09) calc(10% - 1px),rgba(148,163,184,.09) 10%)}.frame-track>em{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#718096;font-size:8px;font-style:normal;font-weight:800;letter-spacing:.05em;pointer-events:none}.frame-binding-row.enabled .frame-track>em{justify-content:flex-end;padding-right:7px;color:#fbbf24}.frame-binding-row.invalid .frame-track{border-color:rgba(248,113,113,.65)}.frame-binding-row.invalid .frame-track>em{color:#fca5a5}.frame-range-bar{position:absolute;z-index:2;top:3px;height:18px;min-width:2px;border:1px solid #22d3ee;border-radius:5px;background:linear-gradient(180deg,rgba(34,211,238,.78),rgba(8,145,178,.72));cursor:grab;overflow:visible}.frame-range-bar.selected{border-color:#f8fafc;box-shadow:0 0 0 1px rgba(34,211,238,.85),0 0 8px rgba(34,211,238,.5)}.frame-range-bar>b{display:block;padding:1px 8px;color:#fff;font-size:8px;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}.frame-range-handle{position:absolute;z-index:3;top:-1px;bottom:-1px;width:7px;background:rgba(255,255,255,.45);cursor:ew-resize}.frame-range-handle.left{left:-1px;border-radius:5px 0 0 5px}.frame-range-handle.right{right:-1px;border-radius:0 5px 5px 0}.frame-binding-row.disabled .frame-track{opacity:.72}.frame-binding-row.disabled .frame-range-bar{filter:saturate(.35)}.frame-custom-scope{grid-column:5;display:flex;flex-direction:column;gap:4px;min-width:0}.frame-custom-scope:empty{min-height:1px}.frame-binding-context{grid-column:6;display:flex;align-items:center;gap:5px;min-width:0;color:#94a3b8;font-size:8px;white-space:nowrap;overflow:hidden}.frame-binding-context b,.frame-binding-context span{overflow:hidden;text-overflow:ellipsis}.frame-binding-context.error{color:#fca5a5}.frame-range-editor{position:absolute;z-index:30;left:50%;top:30px;transform:translateX(-50%);display:flex;align-items:center;gap:5px;padding:5px;border:1px solid rgba(34,211,238,.52);border-radius:7px;background:#07111b;box-shadow:0 8px 18px rgba(0,0,0,.55)}.frame-range-editor label{display:flex;align-items:center;gap:3px;color:#cbd5e1;font-size:8px;font-weight:800}.frame-range-number{width:58px;height:24px;border:1px solid rgba(148,163,184,.28);border-radius:5px;background:#090d16;color:#fff;padding:2px 4px;font-size:9px}.frame-range-delete{width:24px;height:24px;border:1px solid rgba(248,113,113,.45);border-radius:5px;background:#3f1720;color:#fecaca;cursor:pointer}
     .image-drag-handle{padding:5px 4px;border:1px solid transparent;border-radius:7px;cursor:grab;user-select:none;-webkit-user-select:none;touch-action:none}
     .image-drag-handle:hover{border-color:rgba(103,232,249,.5);background:rgba(34,211,238,.08)}
@@ -6912,33 +7518,29 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
             enforceColorPickUniquenessByVideo(state.images, videoSlotCount(state));
           } else {
             target[index][field] = select.value;
-            if (kind === "image" && field === "source_type") {
-              if (select.value !== "Custom") target[index].custom_source_type = "";
+            if (kind === "image" && field === "image_main_type") {
+              target[index].custom_source_type = "";
               reconcileImageBindingAfterTypeChange(target[index], target);
             }
-            if (kind === "video" && field === "source_type") {
+            if (kind === "image" && field === "image_sub_type") {
               if (select.value !== "Custom") target[index].custom_source_type = "";
-              applyVideoRoleDefaultForSourceType(target[index]);
-              if (
-                select.value === "Maya Preview / Playblast"
-                && target[index].control_role === "Primary Unified Shot Control"
-              ) {
-                target[index].control_role = "";
-                target[index].custom_control_role = "";
-              }
-              if (select.value === "Ignore / Unused") {
-                hmbSuppressPickerVideoSlot(state, target[index].slot || index + 1);
-              } else {
-                hmbReleasePickerVideoSlotSuppression(state, target[index].slot || index + 1);
-              }
+              normalizeImageTaxonomy(target[index]);
+              normalizeImageBindingFields(target[index], videoSlotCount(state));
             }
-            if (kind === "video" && field === "control_role" && select.value !== "Custom Role") target[index].custom_control_role = "";
+            if (kind === "video" && field === "video_main_type") {
+              if (select.value !== "Custom / Context") target[index].custom_source_type = "";
+              applyVideoRoleDefaultForSourceType(target[index]);
+              hmbReleasePickerVideoSlotSuppression(state, target[index].slot || index + 1);
+            }
+            if (kind === "video" && field === "video_sub_type") {
+              if (select.value !== "Custom") target[index].custom_control_role = "";
+              normalizeVideoTaxonomy(target[index]);
+            }
           }
           if (kind === "image") syncCurrentFrameRangeBinding(target[index]);
           hmbSyncSourceSelectDom(container, state, row, kind, index, field);
-          hmbCaptureUiBeforeStateEmit(container, state);
-          hmbEmitLocalPromptState(container, props, state);
           hmbRestoreSourceScroll(container);
+          hmbSchedulePromptInteractionCommit(container, props, state);
         }
       };
       select.addEventListener("change", handler);
@@ -7330,6 +7932,21 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
       return;
     }
     state = nextState;
+    const pendingInteraction = container.__hmbPromptLibraryInteractionCommit;
+    if (pendingInteraction && !pendingInteraction.cancelled) {
+      if (revisionMergedState) {
+        // A newer source catalog crossed the paint-first local edit. Publish
+        // the already-merged object, never the pre-merge snapshot.
+        pendingInteraction.state = state;
+        pendingInteraction.props = props;
+      } else {
+        // A genuinely newer UI authority supersedes the queued local draft.
+        hmbClearPromptInteractionCommit(container);
+      }
+    }
+    try {
+      container.__hmbPromptLatestLocalStateValue = JSON.stringify(state);
+    } catch (_error) {}
     hmbRememberPromptRevisionState(container, state, state.disabled, false);
     if (shotRegionOnly) {
       hmbApplyPromptShotFeedback(container, state);
@@ -7354,6 +7971,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
     // from cleanup can synchronously re-enter a disposed widget and is the
     // delete/reload freeze that this cancellation path prevents.
     try { hmbClearImmediateStateCommit(container); } catch (_e) {}
+    try { hmbClearPromptInteractionCommit(container); } catch (_e) {}
     hmbInvalidatePromptPublication(container);
     try { hmbClearPendingPromptStateEchoes(container); } catch (_e) {}
     try { hmbClearPromptDirtyText(container); } catch (_e) {}
@@ -7366,6 +7984,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
       container.__hmbPromptHostResizeTimer = null;
     } catch (_e) {}
     try { container.__hmbFrameRangeDragCleanup?.(); } catch (_e) {}
+    try { hmbClearScheduledFrameTrackPreview(container); } catch (_e) {}
     try { stopFluidSync && stopFluidSync(); } catch (_e) {}
     for (const [el, event, handler, options] of listeners.splice(0)) {
       try { el.removeEventListener(event, handler, options); } catch (_e) {}
@@ -7392,6 +8011,8 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
       delete container.__hmbPromptLatestLocalStateValue;
       delete container.__hmbPromptPendingRevisionMerge;
       delete container.__hmbPromptLastConsumedEchoWasStale;
+      delete container.__hmbPromptLibraryInteractionCommit;
+      delete container.__hmbFrameRangePreviewJob;
     } catch (_e) {}
     container.removeAttribute?.("data-hmb-node-delete-protected");
     container.innerHTML = "";
