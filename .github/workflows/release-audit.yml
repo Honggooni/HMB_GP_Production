@@ -111,8 +111,6 @@ jobs:
             "HMB_Agent_Shot_Binding_Regression.py",
             "HMB_Seedance_MP4_Verifier_Portability_Regression.py",
             "HMB_Seedance_Direct_Shot_Source_Regression.py",
-            "HMB_Seedance_Generator_Regression.py",
-            "HMB_Picker_Seedance_Video_Integration_Regression.py",
             "HMB_Five_Library_Shot_Routing_Regression.py",
             "HMB_Shot_Routing_Pass_Cache_Regression.py",
             "HMB_VideoPicker_Asset_Catalog_Regression.py",

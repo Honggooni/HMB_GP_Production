@@ -22,9 +22,9 @@
   stock 2.5 proxy; missing or mismatched capability contracts fail closed
   before reference upload or billable submission, while the 2.0/2.0 Fast
   multimodal request schema remains intact.
-- Added native MOV-preview fallback text and promoted the full Seedance
-  generator plus Picker-to-Seedance integration regressions into the public
-  Windows release gate.
+- Added native MOV-preview fallback text, expanded the actual-host Seedance
+  generator and Picker-to-Seedance integration regressions, and kept the
+  self-contained Direct Shot/MP4/widget contracts in the public Windows gate.
 - Restored native image/video/audio colours on Seedance's manual reference
   rows, renamed the verified video connector label to `video_url`, and restored
   the native last-frame image preview when `Return Last Frame` is enabled.
