@@ -142,7 +142,7 @@ jobs:
           # policy review document. This check builds only an in-memory ZIP.
           python -m py_compile tools/package_runtime_release.py
           python tools/package_runtime_release.py --check
-          $artifact = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_v0.6.42_Runtime.zip"
+          $artifact = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_v0.6.43_Runtime.zip"
           python tools/package_runtime_release.py --output $artifact
           python tools/package_runtime_release.py --check-output --output $artifact
       - name: Prepare tagged team distribution
@@ -164,8 +164,8 @@ jobs:
         with:
           name: hmb-team-release-${{ github.ref_name }}
           path: |
-            ${{ runner.temp }}/HMB_GP_Production_v0.6.42_Runtime.zip
-            ${{ runner.temp }}/HMB_GP_Production_v0.6.42_Runtime.zip.sha256
+            ${{ runner.temp }}/HMB_GP_Production_v0.6.43_Runtime.zip
+            ${{ runner.temp }}/HMB_GP_Production_v0.6.43_Runtime.zip.sha256
           if-no-files-found: error
           retention-days: 30
 
@@ -187,18 +187,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $repository = $env:GITHUB_REPOSITORY
-          $archive = Join-Path $PWD "release/HMB_GP_Production_v0.6.42_Runtime.zip"
+          $archive = Join-Path $PWD "release/HMB_GP_Production_v0.6.43_Runtime.zip"
           $checksum = "$archive.sha256"
           if (-not (Test-Path -LiteralPath $archive) -or -not (Test-Path -LiteralPath $checksum)) {
             throw "Audited release assets are missing."
           }
-          $notesPath = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_v0.6.42_release_notes.md"
+          $notesPath = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_v0.6.43_release_notes.md"
           @'
-          ## HMB GP Production v0.6.42
+          ## HMB GP Production v0.6.43
 
-          - Removes the non-functional VideoPicker compact-mode lower black band without changing the workspace or canvas viewport.
-          - Restores imported VideoPicker media, Shot ownership, order, selection, and preview state after workflow save/reload.
-          - Keeps compact Shot growth deterministic and preserves the expanded authoring view.
+          - Adds HMB Seedance Generation 2.5 with 720p default and optional 1080p 10-bit HEVC output.
+          - Adds native Seedance task-state overlays while preserving a prior successful preview during new work.
+          - Removes the obsolete HMB-specific Desktop launcher; start Griptape normally after installation.
           - Includes the manifest-verified runtime installer and exact SHA256 checksum.
 
           Close Griptape completely before running the included installer.

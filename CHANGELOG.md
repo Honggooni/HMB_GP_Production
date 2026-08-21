@@ -1,5 +1,26 @@
 # Changelog
 
+## `v0.6.43` — 2026-08-21
+
+- Added HMB Seedance Generation 2.5 with the official BytePlus saved-model
+  alias, an HMB canonical Broker route, 720p default and optional 1080p HEVC,
+  explicit 4-30 second duration, and model-specific limits of 30 image, 10
+  video, and 10 audio references including audio-only input.
+- Kept the HMB 2.5 production profile quality-focused: 480p and smart duration
+  are not exposed, while 720p remains the default.
+- Preserved the existing Seedance 2.0/2.0 Fast limits and exactly three legacy
+  scalar video ports. Unknown model IDs, unsupported fields, and unapproved
+  2.5 priority values remain fail-closed before Broker submission.
+- Added native Seedance preview status overlays for submission, rendering,
+  retrieval, download, verification, local cancellation, timeout, and failure.
+  A prior successful video remains visible during a new render; recovery checks
+  the authoritative existing job only and never creates a replacement task.
+- Removed the obsolete HMB-specific Desktop launcher and its compatibility
+  marker from the runtime closure. Agent policy bootstrap now relies on the
+  exact packaged Griptape process provenance, and Griptape starts normally.
+- Removed the legacy Maya binding setup helper from team runtime packages. It
+  remains development-only; the production Maya runner never imports it.
+
 ## `v0.6.42` — 2026-08-21
 
 - Removed VideoPicker compact mode's non-functional lower black band by

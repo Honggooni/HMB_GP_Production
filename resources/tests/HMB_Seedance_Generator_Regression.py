@@ -47,6 +47,13 @@ VALID_MP4_BYTES = (
 )
 
 
+def accept_structural_regression_mp4(path: Path, _verifier=None) -> None:
+    """Keep generator tests focused on publication; decode QA has its own suite."""
+    content = Path(path).read_bytes()
+    assert content == VALID_MP4_BYTES
+    assert target._is_structurally_valid_mp4(content)
+
+
 def load_target():
     spec = importlib.util.spec_from_file_location(
         "hmb_seedance_volcengine_regression_target", MODULE_PATH
@@ -161,7 +168,15 @@ class FakeBrokerBridge:
         return False
 
 
-class BrokerScriptedNode(target.HMBSeedanceGeneration):
+class RuntimeRegisteredSeedance(target.HMBSeedanceGeneration):
+    """Exercise live-node paths without weakening production liveness guards."""
+
+    def _runtime_node_is_live(self, *, require_registered: bool = False) -> bool:
+        del require_registered
+        return True
+
+
+class BrokerScriptedNode(RuntimeRegisteredSeedance):
     def __init__(self, bridge: FakeBrokerBridge) -> None:
         super().__init__(name="HMB Seedance Broker Scripted Regression")
         self.bridge = bridge
@@ -172,6 +187,18 @@ class BrokerScriptedNode(target.HMBSeedanceGeneration):
 
     def _create_broker_bridge(self):
         return self.bridge
+
+    def _resolve_exact_shot_generation_inputs(
+        self,
+        params: dict,
+        *,
+        verify_agent_prompt: bool = True,
+    ) -> dict:
+        # These cases isolate Broker/upload mechanics. Direct Shot provenance is
+        # covered by the dedicated routing regression and must not erase the
+        # synthetic references used here.
+        del verify_agent_prompt
+        return dict(params)
 
     async def _download_video(self, url: str) -> bytes:
         self.downloads.append(url)
@@ -253,9 +280,15 @@ def assert_constructor_and_public_contract() -> None:
     assert names.index("reference_video_2") < names.index("reference_video_3")
     assert names.index("reference_video_3") < names.index("VIDEO_REFERENCES")
     assert names.index("VIDEO_REFERENCES") < names.index("reference_audio")
-    assert target.MAX_REFERENCE_IMAGES == 9
-    assert target.MAX_VIDEO_REFERENCES == 3
-    assert target.MAX_REFERENCE_AUDIO == 3
+    assert target.MAX_REFERENCE_IMAGES == 30
+    assert target.MAX_VIDEO_REFERENCES == 10
+    assert target.MAX_REFERENCE_AUDIO == 10
+    assert target.LEGACY_VIDEO_REFERENCE_SLOTS == 3
+    assert target.MODEL_REFERENCE_LIMITS == {
+        target.SEEDANCE_2_0_MODEL_ID: (9, 3, 3),
+        target.SEEDANCE_2_0_FAST_MODEL_ID: (9, 3, 3),
+        target.SEEDANCE_2_5_MODEL_ID: (30, 10, 10),
+    }
     assert target.AI_BROKER_SERVER_URL == "http://192.168.203.245:8080"
     assert target.MODEL_RESOLUTIONS[target.SEEDANCE_2_0_MODEL_ID] == (
         "4k",
@@ -267,14 +300,19 @@ def assert_constructor_and_public_contract() -> None:
         "720p",
         "480p",
     )
-    assert target.MODEL_RESOLUTIONS[target.SEEDANCE_2_0_MINI_MODEL_ID] == (
+    assert target.MODEL_RESOLUTIONS[target.SEEDANCE_2_5_MODEL_ID] == (
         "720p",
-        "480p",
+        "1080p",
     )
     assert target.MODEL_DEFAULT_RESOLUTIONS == {
         target.SEEDANCE_2_0_MODEL_ID: "1080p",
         target.SEEDANCE_2_0_FAST_MODEL_ID: "720p",
-        target.SEEDANCE_2_0_MINI_MODEL_ID: "720p",
+        target.SEEDANCE_2_5_MODEL_ID: "720p",
+    }
+    assert target.MODEL_DURATION_CHOICES == {
+        target.SEEDANCE_2_0_MODEL_ID: (-1, *range(4, 16)),
+        target.SEEDANCE_2_0_FAST_MODEL_ID: (-1, *range(4, 16)),
+        target.SEEDANCE_2_5_MODEL_ID: (*range(4, 31),),
     }
 
     image_parameter = node.get_parameter_by_name("reference_images")
@@ -287,9 +325,11 @@ def assert_constructor_and_public_contract() -> None:
         "list[ImageArtifact]",
         "list[BytePlusImageAssetReference]",
     ]
-    assert image_parameter.ui_options["display_name"] == "Reference Images"
+    assert image_parameter.ui_options["display_name"] == ""
     assert "expander" not in image_parameter.ui_options
     assert image_parameter.hide_property is True
+    assert image_parameter.hide is True
+    assert image_parameter.ui_options["hide_handles"] is True
     assert image_parameter.allowed_modes == {target.ParameterMode.INPUT}
 
     # The Asset Library source and Seedance target advertise an exact list[str]
@@ -302,7 +342,7 @@ def assert_constructor_and_public_contract() -> None:
     assert asset_media_output.output_type == "list[str]"
     assert asset_media_output.output_type in image_parameter.input_types
 
-    for index in range(1, 4):
+    for index in range(1, target.LEGACY_VIDEO_REFERENCE_SLOTS + 1):
         parameter = node.get_parameter_by_name(f"reference_video_{index}")
         assert parameter.type == "VideoUrlArtifact"
         assert parameter.input_types == [
@@ -316,8 +356,9 @@ def assert_constructor_and_public_contract() -> None:
 
     video_list_parameter = node.get_parameter_by_name("VIDEO_REFERENCES")
     assert video_list_parameter.type == "list[str]"
-    assert video_list_parameter.hide is False
-    assert video_list_parameter.ui_options["display_name"] == "Reference Videos"
+    assert video_list_parameter.hide is True
+    assert video_list_parameter.ui_options["display_name"] == ""
+    assert video_list_parameter.ui_options["hide_handles"] is True
     assert video_list_parameter.allowed_modes == {target.ParameterMode.INPUT}
     assert video_list_parameter.hide_property is True
     assert video_list_parameter.input_types == [
@@ -339,7 +380,7 @@ def assert_constructor_and_public_contract() -> None:
 
     audio_parameter = node.get_parameter_by_name("reference_audio")
     assert type(audio_parameter).__name__ == "ParameterList"
-    assert audio_parameter._max_items == 3
+    assert audio_parameter._max_items == target.MAX_REFERENCE_AUDIO
     assert node.get_parameter_value("auto_publish_local_videos") is True
     assert (
         node.get_parameter_value("local_video_upload_service")
@@ -353,7 +394,7 @@ def assert_constructor_and_public_contract() -> None:
     assert node.get_parameter_by_name("model_id").ui_options["simple_dropdown"] == [
         target.MODEL_NAME_SEEDANCE_2_0,
         target.MODEL_NAME_SEEDANCE_2_0_FAST,
-        target.MODEL_NAME_SEEDANCE_2_0_MINI,
+        target.MODEL_NAME_SEEDANCE_2_5,
     ]
     assert (
         node.get_parameter_value("input_mode")
@@ -397,9 +438,16 @@ def assert_constructor_and_public_contract() -> None:
         "720p",
         "480p",
     ]
-    node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0_MINI)
-    assert node._get_parameters()["model_id"] == target.SEEDANCE_2_0_MINI_MODEL_ID
+    node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_5)
+    assert node._get_parameters()["model_id"] == target.SEEDANCE_2_5_MODEL_ID
     assert node.get_parameter_value("resolution") == "720p"
+    assert node.get_parameter_by_name("resolution").ui_options["simple_dropdown"] == [
+        "720p",
+        "1080p",
+    ]
+    assert node.get_parameter_by_name("duration").ui_options["simple_dropdown"] == [
+        *range(4, 31),
+    ]
     saved_audio_node = target.HMBSeedanceGeneration(
         name="Saved Generate Audio Regression"
     )
@@ -427,6 +475,14 @@ def assert_constructor_and_public_contract() -> None:
     refresh_parameter = node.get_parameter_by_name("generation_refresh")
     assert type(refresh_parameter).__name__ == "ParameterButton"
     assert refresh_parameter.label == "Refresh / Retrieve Result"
+    shot_widget_parameter = node.get_parameter_by_name(
+        target.SEEDANCE_SHOT_WIDGET_PARAMETER
+    )
+    assert shot_widget_parameter is not None
+    assert shot_widget_parameter.serializable is False
+    assert node.get_parameter_value(target.SEEDANCE_SHOT_WIDGET_PARAMETER)[
+        "generation"
+    ]["schema"] == target.GENERATION_PREVIEW_SCHEMA
 
     root_children = list(node.root_ui_element.children)
     root_names = [element.name for element in root_children]
@@ -469,7 +525,7 @@ def assert_constructor_and_public_contract() -> None:
     assert not {
         name
         for name in dir(target.HMBSeedanceGeneration)
-        if "usage" in name.casefold() or "direct" in name.casefold()
+        if "usage" in name.casefold()
     }
     assert "_BaseSeedance" not in source
     assert "GriptapeProxyNode" not in source
@@ -1052,7 +1108,7 @@ def assert_payload_and_media_contract() -> None:
 
     for restricted_model in (
         target.SEEDANCE_2_0_FAST_MODEL_ID,
-        target.SEEDANCE_2_0_MINI_MODEL_ID,
+        target.SEEDANCE_2_5_MODEL_ID,
     ):
         params = node._get_parameters()
         params.update(
@@ -1148,6 +1204,111 @@ def assert_payload_and_media_contract() -> None:
         raise AssertionError("Last Frame without First Frame was accepted")
 
 
+def assert_seedance_25_model_contract() -> None:
+    node = target.HMBSeedanceGeneration(name="Seedance 2.5 Contract Regression")
+    node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_5)
+
+    assert node._get_parameters()["model_id"] == target.SEEDANCE_2_5_MODEL_ID
+    assert node.get_parameter_value("resolution") == "720p"
+    assert node.get_parameter_by_name("resolution").ui_options["simple_dropdown"] == [
+        "720p",
+        "1080p",
+    ]
+    assert node.get_parameter_by_name("duration").ui_options["simple_dropdown"] == [
+        *range(4, 31),
+    ]
+
+    params = node._get_parameters()
+    params.update(
+        {
+            "model_id": target.SEEDANCE_2_5_MODEL_ID,
+            "input_mode": target.INPUT_MODE_MULTIMODAL_REFERENCES,
+            "prompt": "Seedance 2.5 model-specific capacity",
+            "resolution": "720p",
+            "ratio": "adaptive",
+            "duration": 30,
+            "priority": 0,
+            "reference_images": [
+                f"https://cdn.example/seedance-25-image-{index}.png"
+                for index in range(30)
+            ],
+            "video_references": [
+                f"https://cdn.example/seedance-25-video-{index}.mp4"
+                for index in range(10)
+            ],
+            "video_reference_slots": [],
+            "reference_audio": [
+                f"https://cdn.example/seedance-25-audio-{index}.mp3"
+                for index in range(10)
+            ],
+        }
+    )
+    node._validate_parameters(params)
+    payload = node._build_broker_payload(params)
+    assert payload["model"] == target.SEEDANCE_2_5_MODEL_ID
+    assert payload["quality"] == "720p"
+    assert payload["duration_seconds"] == 30
+    assert len(payload["image_urls"]) == 30
+    assert len(payload["video_urls"]) == 10
+    assert len(payload["audio_urls"]) == 10
+    assert "priority" not in payload
+
+    for supported_duration in (4, 30):
+        boundary = dict(params)
+        boundary["duration"] = supported_duration
+        node._validate_parameters(boundary)
+    for unsupported_duration in (-1, 3, 31):
+        invalid = dict(params)
+        invalid["duration"] = unsupported_duration
+        try:
+            node._validate_parameters(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"Seedance 2.5 accepted unsupported duration: {unsupported_duration}"
+            )
+
+    high_definition = dict(params)
+    high_definition["resolution"] = "1080p"
+    node._validate_parameters(high_definition)
+    unsupported_resolution = dict(params)
+    unsupported_resolution["resolution"] = "480p"
+    try:
+        node._validate_parameters(unsupported_resolution)
+    except ValueError as exc:
+        assert "does not support 480p" in str(exc)
+    else:
+        raise AssertionError("Seedance 2.5 accepted 480p")
+
+    overflow_cases = (
+        (
+            "reference_images",
+            [f"https://cdn.example/overflow-{index}.png" for index in range(31)],
+            "at most 30 reference images",
+        ),
+        (
+            "video_references",
+            [f"https://cdn.example/overflow-{index}.mp4" for index in range(11)],
+            "at most 10 reference videos",
+        ),
+        (
+            "reference_audio",
+            [f"https://cdn.example/overflow-{index}.mp3" for index in range(11)],
+            "at most 10 reference audio",
+        ),
+    )
+    for field_name, overflow_values, expected_message in overflow_cases:
+        invalid = dict(params)
+        invalid[field_name] = overflow_values
+        try:
+            node._validate_parameters(invalid)
+        except ValueError as exc:
+            assert expected_message in str(exc)
+        else:
+            raise AssertionError(f"Seedance 2.5 accepted overflow: {field_name}")
+
+
 def assert_broker_generation_contract() -> None:
     status_cases = {
         "pending": "queued",
@@ -1183,6 +1344,15 @@ def assert_broker_generation_contract() -> None:
     )
     assert "oversized reference-media request" in safe_error_message
     assert "secret-canary" not in safe_error_message
+
+    detached_bridge = FakeBrokerBridge([])
+    detached = target.HMBSeedanceGeneration(name="Detached Broker Guard Regression")
+    detached._broker_bridge_instance = detached_bridge
+    detached.set_parameter_value("prompt", "must remain detached")
+    asyncio.run(detached._process_generation())
+    assert detached_bridge.account_calls == 0
+    assert detached_bridge.generate_payloads == []
+    assert detached_bridge.refresh_ids == []
 
     completed = {
         "status": "completed",
@@ -1271,6 +1441,308 @@ def assert_broker_generation_contract() -> None:
     assert refreshed.downloads == ["https://cdn.example/refreshed-broker.mp4"]
 
 
+def assert_generation_preview_status_contract() -> None:
+    """Keep preview status informative without granting the browser task authority."""
+
+    private_path = "C:/private/artist/seedance-result.mp4"
+    public_preview = target._seedance_generation_preview_value(
+        {
+            "phase": "running",
+            "job_id": "authoritative-preview-job-1",
+            "started_at_ms": 1_782_000_000_000,
+            "elapsed_seconds": 151,
+            "action": "refresh_existing",
+            "has_existing_video": True,
+            "media_revision": 7,
+            "local_path": private_path,
+            "video_url": "https://signed.example/private-result.mp4?token=secret",
+            "provider_response": {"token": "provider-secret"},
+        }
+    )
+    assert set(public_preview) == {
+        "schema",
+        "version",
+        "phase",
+        "job_id",
+        "started_at_ms",
+        "elapsed_seconds",
+        "guidance",
+        "action",
+        "has_existing_video",
+        "media_revision",
+    }
+    assert public_preview == {
+        "schema": target.GENERATION_PREVIEW_SCHEMA,
+        "version": target.GENERATION_PREVIEW_VERSION,
+        "phase": "running",
+        "job_id": "authoritative-preview-job-1",
+        "started_at_ms": 1_782_000_000_000,
+        "elapsed_seconds": 151,
+        "guidance": target.GENERATION_PREVIEW_GUIDANCE["running"],
+        "action": "refresh_existing",
+        "has_existing_video": True,
+        "media_revision": 7,
+    }
+    serialized_preview = json.dumps(public_preview, ensure_ascii=False)
+    assert private_path not in serialized_preview
+    assert "signed.example" not in serialized_preview
+    assert "provider-secret" not in serialized_preview
+    assert target._seedance_generation_preview_value(
+        {
+            "phase": "running",
+            "job_id": "../../browser-chosen-job",
+            "action": "refresh_existing",
+        }
+    )["action"] == "none"
+
+    # Exercise a real generation through queued/running/download/verify/success.
+    # The prior successful artifact must remain the ParameterVideo value until
+    # the replacement file has been atomically published.
+    completed = {
+        "status": "completed",
+        "job_id": "broker-job-1",
+        "output": "https://cdn.example/preview-status-result.mp4",
+    }
+    bridge = FakeBrokerBridge(
+        [
+            {"status": "running", "job_id": "broker-job-1"},
+            completed,
+        ]
+    )
+    node = BrokerScriptedNode(bridge)
+    previous_video = target.VideoUrlArtifact(private_path)
+    node.parameter_output_values["video_url"] = previous_video
+    node.parameter_output_values["VIDEO_OUT"] = previous_video
+    node.parameter_output_values["last_frame_url"] = "retained-last-frame"
+    node.set_parameter_value("prompt", "Preview status lifecycle regression")
+    observed: list[tuple[str, object, dict]] = []
+    publish = node._publish_generation_preview
+
+    def observe_preview(phase: str, **kwargs) -> None:
+        publish(phase, **kwargs)
+        observed.append(
+            (
+                node._hmb_generation_preview_state["phase"],
+                node.parameter_output_values.get("video_url"),
+                dict(node._hmb_generation_preview_state),
+            )
+        )
+
+    node._publish_generation_preview = observe_preview
+    asyncio.run(node._process_generation())
+    observed_phases = [phase for phase, _video, _state in observed]
+    required_phases = [
+        "preparing",
+        "submitting",
+        "queued",
+        "running",
+        "downloading",
+        "verifying",
+        "succeeded",
+    ]
+    phase_cursor = 0
+    for phase in observed_phases:
+        if phase_cursor < len(required_phases) and phase == required_phases[phase_cursor]:
+            phase_cursor += 1
+    assert phase_cursor == len(required_phases), observed_phases
+    for phase, current_video, state in observed:
+        if phase != "succeeded":
+            assert current_video is previous_video, phase
+        assert private_path not in json.dumps(state, ensure_ascii=False)
+    assert bridge.generate_payloads and len(bridge.generate_payloads) == 1
+    assert bridge.refresh_ids == ["broker-job-1", "broker-job-1"]
+    assert node.downloads == ["https://cdn.example/preview-status-result.mp4"]
+    assert node.parameter_output_values["video_url"] is not previous_video
+    assert node._hmb_generation_preview_state["phase"] == "succeeded"
+    assert node._hmb_generation_preview_state["media_revision"] == 1
+    assert private_path not in json.dumps(
+        node.get_parameter_value(target.SEEDANCE_SHOT_WIDGET_PARAMETER),
+        ensure_ascii=False,
+    )
+
+    # A widget action is a pulse only. Even if a compromised browser supplies
+    # a different Shot, catalog, or generation object, backend identity and the
+    # existing authoritative task ID stay unchanged. This path performs one
+    # same-ID status lookup and zero create-task calls.
+    action_bridge = FakeBrokerBridge(
+        [{"status": "running", "job_id": "authoritative-action-job-7"}]
+    )
+    action_node = BrokerScriptedNode(action_bridge)
+    channel_uuid = "11111111-1111-4111-8111-111111111111"
+    shot_uuid = "22222222-2222-4222-8222-222222222222"
+    publisher_uuid = "33333333-3333-4333-8333-333333333333"
+    shots = [
+        {
+            "shot_uuid": shot_uuid,
+            "number": 2,
+            "name": "Action Shot",
+            "revision": 4,
+        }
+    ]
+    metadata = {
+        "channel_uuid": channel_uuid,
+        "generation": 9,
+        "shots": shots,
+    }
+    catalog = {
+        "schema": "hmb-shot-routing-catalog",
+        "version": 1,
+        "publisher_instance_uuid": publisher_uuid,
+        **metadata,
+        "metadata_sha256": target.HMBSeedanceGeneration._canonical_sha256(metadata),
+    }
+    action_node._hmb_shot_catalog_snapshot = catalog
+    action_node._hmb_shot_catalog_generation = 9
+    action_node._hmb_shot_selector_map = {"02 · Action Shot": shots[0]}
+    action_node._hmb_shot_syncing = True
+    try:
+        action_node.set_parameter_value(target.SHOT_CHANNEL_UUID_PARAMETER, channel_uuid)
+        action_node.set_parameter_value(target.SHOT_UUID_PARAMETER, shot_uuid)
+        action_node.set_parameter_value(target.SHOT_NUMBER_PARAMETER, 2)
+        action_node.set_parameter_value(target.SHOT_NAME_PARAMETER, "Action Shot")
+        action_node.set_parameter_value(target.SHOT_SELECTOR_PARAMETER, "02 · Action Shot")
+        action_node.set_parameter_value(target.SHOT_AUTOCLAIM_ENABLED_PARAMETER, True)
+    finally:
+        action_node._hmb_shot_syncing = False
+    authoritative_id = "authoritative-action-job-7"
+    action_node.parameter_output_values["generation_id"] = authoritative_id
+    action_node.parameter_output_values["generation_status"] = "cancelled_locally"
+    action_node._hmb_generation_preview_state = (
+        target._seedance_generation_preview_value(
+            {
+                "phase": "cancelled_locally",
+                "job_id": authoritative_id,
+                "action": "refresh_existing",
+            }
+        )
+    )
+    # Model the already-rendered widget value that the backend, not this new
+    # browser pulse, previously published. Action-only normalization must use
+    # this catalog even if live graph discovery is momentarily unavailable.
+    action_node.parameter_values[target.SEEDANCE_SHOT_WIDGET_PARAMETER] = (
+        target._seedance_widget_value(
+            {"channel_uuid": channel_uuid, "shot_uuid": shot_uuid},
+            catalog,
+            action_node._hmb_generation_preview_state,
+        )
+    )
+    identity_before = action_node._shot_identity()
+    catalog_before = json.dumps(
+        action_node._hmb_shot_catalog_snapshot,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    autoclaim_before = action_node.get_parameter_value(
+        target.SHOT_AUTOCLAIM_ENABLED_PARAMETER
+    )
+    widget_parameter = action_node.get_parameter_by_name(
+        target.SEEDANCE_SHOT_WIDGET_PARAMETER
+    )
+    assert widget_parameter is not None
+    browser_value = {
+        "request": {"action": "refresh_existing"},
+        "shot": {
+            "channel_uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "shot_uuid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        },
+        "shot_catalog": {"browser": "must-not-be-authority"},
+        "generation": {
+            "phase": "succeeded",
+            "job_id": "browser-supplied-job-must-be-ignored",
+            "media_revision": 999,
+        },
+    }
+    refresh_invocations: list[tuple[object, object]] = []
+
+    def run_authoritative_refresh(button, details) -> None:
+        refresh_invocations.append((button, details))
+        asyncio.run(action_node._refresh_async())
+
+    with mock.patch.object(
+        action_node,
+        "_hmb_available_seedance_shot_catalog",
+        return_value=catalog,
+    ), mock.patch.object(
+        action_node,
+        "_apply_seedance_shot_selection",
+        side_effect=AssertionError("Action pulse changed Shot selection"),
+    ), mock.patch.object(
+        action_node,
+        "_reconcile_shared_shot_routing",
+        side_effect=AssertionError("Action pulse reconciled Shot routing"),
+    ), mock.patch.object(
+        action_node,
+        "_on_refresh_clicked",
+        side_effect=run_authoritative_refresh,
+    ):
+        normalized = action_node.before_value_set(widget_parameter, browser_value)
+        assert normalized["shot"] == {
+            "channel_uuid": channel_uuid,
+            "shot_uuid": shot_uuid,
+            "number": 2,
+            "name": "Action Shot",
+        }
+        assert normalized["generation"]["job_id"] == authoritative_id
+        assert "browser-supplied-job" not in json.dumps(normalized)
+        # This assignment models the host commit between before/after hooks.
+        # The nonserializable value may update at runtime, but no browser-owned
+        # generation identity can become the value that the backend publishes.
+        action_node.parameter_values[target.SEEDANCE_SHOT_WIDGET_PARAMETER] = normalized
+        action_node.after_value_set(widget_parameter, normalized)
+
+    assert refresh_invocations == [(None, None)]
+    assert action_bridge.generate_payloads == []
+    assert action_bridge.refresh_ids == [authoritative_id]
+    assert action_node._hmb_generation_preview_state["phase"] == "running"
+    assert action_node._hmb_generation_preview_state["job_id"] == authoritative_id
+    assert action_node._hmb_generation_preview_state["action"] == "refresh_existing"
+    stored_runtime_widget = action_node.get_parameter_value(
+        target.SEEDANCE_SHOT_WIDGET_PARAMETER
+    )
+    assert stored_runtime_widget["generation"]["job_id"] == authoritative_id
+    assert "browser-supplied-job" not in json.dumps(stored_runtime_widget)
+    assert widget_parameter.serializable is False
+    assert action_node._shot_identity() == identity_before
+    assert json.dumps(
+        action_node._hmb_shot_catalog_snapshot,
+        ensure_ascii=False,
+        sort_keys=True,
+    ) == catalog_before
+    assert action_node.get_parameter_value(
+        target.SHOT_AUTOCLAIM_ENABLED_PARAMETER
+    ) is autoclaim_before
+
+    # Timeout recovery has the same retrieval-only guarantee and begins with
+    # an explicit retrieving state before reporting the current server state.
+    timeout_bridge = FakeBrokerBridge(
+        [{"status": "running", "job_id": "authoritative-timeout-job-8"}]
+    )
+    timeout_node = BrokerScriptedNode(timeout_bridge)
+    timeout_id = "authoritative-timeout-job-8"
+    timeout_node.parameter_output_values["generation_id"] = timeout_id
+    timeout_node._hmb_generation_preview_state = target._seedance_generation_preview_value(
+        {
+            "phase": "timed_out",
+            "job_id": timeout_id,
+            "action": "refresh_existing",
+        }
+    )
+    timeout_phases: list[str] = []
+    timeout_publish = timeout_node._publish_generation_preview
+
+    def observe_timeout_preview(phase: str, **kwargs) -> None:
+        timeout_publish(phase, **kwargs)
+        timeout_phases.append(timeout_node._hmb_generation_preview_state["phase"])
+
+    timeout_node._publish_generation_preview = observe_timeout_preview
+    asyncio.run(timeout_node._refresh_async())
+    assert timeout_bridge.generate_payloads == []
+    assert timeout_bridge.refresh_ids == [timeout_id]
+    assert timeout_phases[0] == "retrieving"
+    assert timeout_phases[-1] == "running"
+    assert timeout_node._hmb_generation_preview_state["action"] == "refresh_existing"
+
+
 def assert_refresh_during_submission_contract() -> None:
     bridge = FakeBrokerBridge([])
     node = BrokerScriptedNode(bridge)
@@ -1341,7 +1813,7 @@ def assert_broker_account_and_button_contract() -> None:
         side_effect=target._BrokerUnavailableError("safe unavailable"),
     ), mock.patch.object(
         target,
-        "_broker_auto_login",
+        "_broker_device_login",
         side_effect=AssertionError("server outage triggered a login exchange"),
     ):
         try:
@@ -1351,13 +1823,19 @@ def assert_broker_account_and_button_contract() -> None:
         else:
             raise AssertionError("Broker outage was treated as a logged-out session")
 
-    assert bridge.is_trusted_broker_url(target.AI_BROKER_SERVER_URL + "/result.mp4")
+    trusted_asset_path = "/api/assets/" + ("a" * 43)
+    assert bridge.is_trusted_broker_url(
+        target.AI_BROKER_SERVER_URL + trusted_asset_path
+    )
+    assert not bridge.is_trusted_broker_url(
+        target.AI_BROKER_SERVER_URL + "/result.mp4"
+    )
     assert not bridge.is_trusted_broker_url(
         target.AI_BROKER_SERVER_URL + ".evil.example/result.mp4"
     )
     assert target.HMBSeedanceGeneration._broker_result_url(
-        "/downloads/result.mp4"
-    ) == (target.AI_BROKER_SERVER_URL + "/downloads/result.mp4")
+        trusted_asset_path
+    ) == (target.AI_BROKER_SERVER_URL + trusted_asset_path)
 
     class BlockingBridge:
         def __init__(self) -> None:
@@ -1379,7 +1857,13 @@ def assert_broker_account_and_button_contract() -> None:
             )
 
     blocking_bridge = BlockingBridge()
-    node = target.HMBSeedanceGeneration(name="Broker Button Regression")
+    detached = target.HMBSeedanceGeneration(name="Detached Broker Button Guard")
+    detached._broker_bridge_instance = blocking_bridge
+    detached._on_broker_connect_clicked(None, None)
+    assert blocking_bridge.calls == 0
+    assert detached._broker_action_running is False
+
+    node = RuntimeRegisteredSeedance(name="Broker Button Regression")
     node._broker_bridge_instance = blocking_bridge
     no_engine_loop = SimpleNamespace(event_loop=None, put_event=lambda _event: None)
     with mock.patch.object(
@@ -1606,7 +2090,12 @@ def assert_local_video_temporary_publication() -> None:
         else:
             raise AssertionError("Ambiguous submission transport loss was accepted")
         assert unknown_bridge.generate_seedance.call_count == 1
-        assert unknown_node.parameter_output_values["generation_id"] == ""
+        unknown_generation_id = unknown_node.parameter_output_values["generation_id"]
+        assert isinstance(unknown_generation_id, str)
+        assert unknown_generation_id.startswith("hmb-")
+        assert len(unknown_generation_id) == 36
+        submitted_payload = unknown_bridge.generate_seedance.call_args.args[0]
+        assert submitted_payload["client_request_id"] == unknown_generation_id
         assert unknown_node.parameter_output_values["generation_status"] == (
             "submission_unknown"
         )
@@ -1651,25 +2140,29 @@ def assert_local_video_temporary_publication() -> None:
             started = await asyncio.to_thread(blocking_bridge.started.wait, 1.0)
             assert started
             process.cancel()
-            await asyncio.sleep(0.05)
-            assert not process.done(), "Submit coroutine outran its blocking POST worker"
-            blocking_bridge.release.set()
             try:
                 await process
             except asyncio.CancelledError:
                 pass
             else:
                 raise AssertionError("Cancellation during submit was swallowed")
+            assert process.done()
+            assert blocking_node._submission_outcome_unknown is True
+            assert blocking_node.parameter_output_values["generation_status"] == (
+                "submission_unknown"
+            )
+            blocking_bridge.release.set()
+            returned = await asyncio.to_thread(blocking_bridge.returned.wait, 1.0)
+            assert returned
 
         asyncio.run(cancel_started_submission())
         assert blocking_bridge.returned.is_set()
         assert len(blocking_bridge.generate_payloads) == 1
-        assert (
-            blocking_node.parameter_output_values["generation_id"]
-            == "broker-job-cancelled-submit"
-        )
-        assert blocking_node._submission_outcome_unknown is False
-        assert blocking_node._remote_task_may_be_active is True
+        cancelled_generation_id = blocking_node.parameter_output_values[
+            "generation_id"
+        ]
+        assert cancelled_generation_id.startswith("hmb-")
+        assert blocking_node._submission_outcome_unknown is True
         assert blocking_driver.deletes == []
         assert len(deferred_uploads) == 1
         assert deferred_uploads[0][1] == blocking_driver.uploads[0]["path"]
@@ -2101,7 +2594,7 @@ def assert_atomic_final_output_publication() -> None:
                 }
             ]
         )
-        project_node = target.HMBSeedanceGeneration(
+        project_node = RuntimeRegisteredSeedance(
             name="Atomic ProjectFileParameter Regression"
         )
         project_node._broker_bridge_instance = bridge
@@ -2200,14 +2693,21 @@ assert_constructor_and_public_contract()
 assert_image_asset_single_wire_host_contract()
 assert_video_picker_single_wire_host_contract()
 assert_payload_and_media_contract()
-assert_broker_generation_contract()
-assert_refresh_during_submission_contract()
-assert_broker_account_and_button_contract()
-assert_local_video_temporary_publication()
-assert_tos_local_video_temporary_publication()
-assert_broker_result_download_contract()
-assert_atomic_final_output_publication()
-assert_unwritable_output_is_rejected_before_submission()
-assert_broker_server_accounting_contract()
+assert_seedance_25_model_contract()
+with mock.patch.object(
+    target,
+    "_validate_decodable_mp4_file",
+    side_effect=accept_structural_regression_mp4,
+):
+    assert_broker_generation_contract()
+    assert_generation_preview_status_contract()
+    assert_refresh_during_submission_contract()
+    assert_broker_account_and_button_contract()
+    assert_local_video_temporary_publication()
+    assert_tos_local_video_temporary_publication()
+    assert_broker_result_download_contract()
+    assert_atomic_final_output_publication()
+    assert_unwritable_output_is_rejected_before_submission()
+    assert_broker_server_accounting_contract()
 
 print("HMB Seedance Generation FN AI Broker regression: PASS")

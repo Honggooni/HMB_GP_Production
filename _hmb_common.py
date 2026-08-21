@@ -68,7 +68,6 @@ except Exception:  # Local validation fallback only.
 
 
 ROOT = Path(__file__).resolve().parent
-_AGENT_POLICY_BOOTSTRAP_MARKER = "HMB_AGENT_POLICY_PROCESS_BOOTSTRAP"
 _AGENT_POLICY_BROKER_URL = "https://192.168.203.245:8443/api/v1/agent-core/dat"
 _AGENT_POLICY_BROKER_HOST = "192.168.203.245"
 _AGENT_POLICY_BROKER_PORT = 8443
@@ -100,8 +99,6 @@ _AGENT_POLICY_DIAGNOSTIC_STAGES = frozenset(
         "bootstrap_state_failed",
         "bootstrap_state_closed",
         "bootstrap_state_unknown",
-        "bootstrap_marker_present",
-        "bootstrap_marker_absent",
         "provenance_accepted",
         "provenance_platform_rejected",
         "provenance_layout_rejected",
@@ -1657,11 +1654,9 @@ def _load_agent_rule_payload() -> Dict[str, Any]:
 def _bootstrap_agent_policy_session() -> None:
     """Initialize once inside the exact packaged Griptape engine process.
 
-    The BAT marker remains accepted for compatibility, but Electron launchers
-    may rebuild the engine environment and omit inherited custom variables.
-    Exact executable, command-line and parent-process provenance is therefore
-    the durable authority; an arbitrary Python child still cannot initialize
-    the session or reach transport.
+    Exact executable, command-line and parent-process provenance is the sole
+    bootstrap authority. An arbitrary Python child cannot initialize the
+    session or reach transport.
     """
 
     _agent_policy_log_stage("bootstrap_enter")
@@ -1672,22 +1667,12 @@ def _bootstrap_agent_policy_session() -> None:
         else "bootstrap_state_unknown"
     )
     try:
-        # Consume the compatibility marker and claim EMPTY -> LOADING inside
-        # one process-cell transaction.  The authenticated Broker GET and
-        # signature verification then run *outside* the shared condition so
-        # status/READY readers do not freeze behind a 15-second network wait.
-        def authorize_bootstrap() -> bool:
-            marker = os.environ.pop(_AGENT_POLICY_BOOTSTRAP_MARKER, None)
-            _agent_policy_log_stage(
-                "bootstrap_marker_present" if marker == "1" else "bootstrap_marker_absent"
-            )
-            packaged_process = _agent_policy_process_provenance_valid()
-            # The marker remains a compatibility signal, never an authority
-            # that can bypass exact packaged-process provenance.
-            return bool((marker == "1" or packaged_process) and packaged_process)
-
+        # Claim EMPTY -> LOADING using exact packaged-process provenance. The
+        # authenticated Broker GET and signature verification then run outside
+        # the shared condition so status/READY readers do not freeze behind a
+        # 15-second network wait.
         _agent_process_session.bootstrap_once_authorized(
-            authorize_bootstrap,
+            _agent_policy_process_provenance_valid,
             _fetch_verified_agent_rule_payload,
         )
         _agent_policy_log_stage("session_ready")

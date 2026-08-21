@@ -17,8 +17,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.6.42"
-RELEASE_VERSION = "0.6.42"
+RELEASE_LABEL = "v0.6.43"
+RELEASE_VERSION = "0.6.43"
 ARCHIVE_NAME = f"HMB_GP_Production_v{RELEASE_VERSION}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -53,7 +53,6 @@ SOURCE_FILES = (
     "_hmb_agent_session.py",
     "_hmb_shot_routing.py",
     "_hmb_mp4_verify.py",
-    "HMB_Agent_Griptape.bat",
     "Install_HMB_GP_Production.ps1",
     "_hmb_common.py",
     "_hmb_screen_space.py",
@@ -64,7 +63,6 @@ SOURCE_FILES = (
     "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
     "widgets/HMBVideoPickerLibraryWidget_v032.js",
     "resources/maya/HMB_Maya_Background_Preview.py",
-    "resources/maya/HMB_Maya_Binding_Setup.py",
     "resources/maya/HMBVideoPicker_Maya_Guide.txt",
     "resources/picker/HMB_Marker_Catalog.json",
     "resources/tls/hmb_agent_broker_ca.pem",

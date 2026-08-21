@@ -341,6 +341,565 @@ def valid_params(*, prompt: str = "") -> dict[str, Any]:
     }
 
 
+# Seedance 2.5 is a separate active Broker contract.  Persisted BytePlus model
+# values canonicalize to the China-route Doubao ID, while the provider alias is
+# never submitted directly to the Broker.  Existing retired Mini workflows keep
+# their one-way migration to full 2.0; adding 2.5 must not silently retarget them.
+SEEDANCE_2_5_MODEL_ID = "doubao-seedance-2-5-260628"
+SEEDANCE_2_5_BYTEPLUS_ALIAS = "dreamina-seedance-2-5-260628"
+assert target.MODEL_NAME_SEEDANCE_2_5 == "Seedance 2.5"
+assert target.SEEDANCE_2_5_MODEL_ID == SEEDANCE_2_5_MODEL_ID
+assert target.MODEL_ID_ALIASES[target.MODEL_NAME_SEEDANCE_2_5] == (
+    SEEDANCE_2_5_MODEL_ID
+)
+assert target.MODEL_ID_ALIASES[SEEDANCE_2_5_BYTEPLUS_ALIAS] == (
+    SEEDANCE_2_5_MODEL_ID
+)
+assert target.MODEL_ID_ALIASES[SEEDANCE_2_5_MODEL_ID] == SEEDANCE_2_5_MODEL_ID
+assert target.MODEL_DISPLAY_NAME_BY_ID[SEEDANCE_2_5_MODEL_ID] == (
+    target.MODEL_NAME_SEEDANCE_2_5
+)
+assert target.MODEL_RESOLUTIONS[SEEDANCE_2_5_MODEL_ID] == (
+    "720p",
+    "1080p",
+)
+assert target.MODEL_DEFAULT_RESOLUTIONS[SEEDANCE_2_5_MODEL_ID] == "720p"
+assert target.DURATION_STORAGE_CHOICES == (-1, *range(4, 31))
+assert SEEDANCE_2_5_MODEL_ID in target.BROKER_SUPPORTED_MODEL_IDS
+assert SEEDANCE_2_5_BYTEPLUS_ALIAS not in target.BROKER_SUPPORTED_MODEL_IDS
+assert SEEDANCE_2_5_MODEL_ID in target._HMBAIBrokerBridge._MODEL_GENERATION_FIELDS
+for retired_model in target.RETIRED_SEEDANCE_MODEL_VALUES:
+    assert target.MODEL_ID_ALIASES[retired_model] == target.SEEDANCE_2_0_MODEL_ID
+
+
+# Exercise serialized hydration through the real HMB override while replacing
+# only SuccessFailureNode.set_parameter_value with Griptape's relevant Options
+# behavior: a value outside ``simple_dropdown`` is coerced to its first choice.
+# Both host replay orders must preserve a saved 2.5 duration of 30 seconds, and
+# the post-load pass must narrow an incompatible 2.0 workflow back to 4..15.
+def hydration_probe() -> tuple[
+    target.HMBSeedanceGeneration,
+    dict[str, Any],
+    dict[str, types.SimpleNamespace],
+]:
+    state: dict[str, Any] = {
+        "model_id": target.MODEL_NAME_SEEDANCE_2_0,
+        "resolution": "4k",
+        "duration": 5,
+    }
+    parameters = {
+        "model_id": types.SimpleNamespace(
+            ui_options={
+                "simple_dropdown": [
+                    target.MODEL_NAME_SEEDANCE_2_0,
+                    target.MODEL_NAME_SEEDANCE_2_0_FAST,
+                    target.MODEL_NAME_SEEDANCE_2_5,
+                ]
+            }
+        ),
+        "resolution": types.SimpleNamespace(
+            ui_options={"simple_dropdown": ["4k", "1080p", "720p", "480p"]}
+        ),
+        "duration": types.SimpleNamespace(
+            ui_options={"simple_dropdown": [-1, *range(4, 16)]}
+        ),
+    }
+    probe = object.__new__(target.HMBSeedanceGeneration)
+    probe._hmb_hydration_values = state
+    probe._hmb_retired_model_migration_pending = False
+    probe._hmb_model_migration_active = False
+    probe._hmb_node_deleted = False
+    probe.get_parameter_value = (  # type: ignore[method-assign]
+        lambda name: state.get(name)
+    )
+    probe.get_parameter_by_name = (  # type: ignore[method-assign]
+        lambda name: parameters.get(name)
+    )
+    probe._clear_remote_prompt_authority = lambda _reason: None  # type: ignore[method-assign]
+    probe._remember_direct_prompt = lambda _value: None  # type: ignore[method-assign]
+    probe._set_remote_prompt_control_value = (  # type: ignore[method-assign]
+        lambda _name, _value: None
+    )
+    probe._reconcile_shared_shot_routing = (  # type: ignore[method-assign]
+        lambda strict=False: {"ok": True, "strict": strict}
+    )
+    probe._sync_seedance_shot_widget = lambda: None  # type: ignore[method-assign]
+    return probe, state, parameters
+
+
+seedance_base = target.SuccessFailureNode
+base_had_set_parameter_value = hasattr(seedance_base, "set_parameter_value")
+base_set_parameter_value = getattr(seedance_base, "set_parameter_value", None)
+
+
+def options_coercing_base_set(
+    self: target.HMBSeedanceGeneration,
+    param_name: str,
+    value: Any,
+    **_kwargs: Any,
+) -> None:
+    parameter = self.get_parameter_by_name(param_name)
+    choices = (
+        list(parameter.ui_options.get("simple_dropdown") or [])
+        if parameter is not None
+        else []
+    )
+    stored = value if not choices or value in choices else choices[0]
+    self._hmb_hydration_values[param_name] = stored
+
+
+original_post_hydration_schedule = (
+    target._shot_routing.schedule_post_hydration_reconcile
+)
+setattr(seedance_base, "set_parameter_value", options_coercing_base_set)
+target._shot_routing.schedule_post_hydration_reconcile = lambda _node: False
+try:
+    duration_2_5_choices = [*range(4, 31)]
+    for hydration_order in (
+        (("model_id", SEEDANCE_2_5_BYTEPLUS_ALIAS), ("duration", 30)),
+        (("duration", 30), ("model_id", SEEDANCE_2_5_BYTEPLUS_ALIAS)),
+    ):
+        saved_model_probe, saved_model_state, saved_parameters = hydration_probe()
+        for parameter_name, saved_value in hydration_order:
+            saved_model_probe.set_parameter_value(
+                parameter_name,
+                saved_value,
+                initial_setup=True,
+            )
+        assert saved_model_state["model_id"] == target.MODEL_NAME_SEEDANCE_2_5
+        assert saved_model_state["duration"] == 30
+        assert saved_model_probe._synchronize_model_resolution() == (
+            SEEDANCE_2_5_MODEL_ID
+        )
+        assert saved_model_state["model_id"] == target.MODEL_NAME_SEEDANCE_2_5
+        assert saved_model_state["resolution"] == "720p"
+        assert saved_model_state["duration"] == 30
+        assert saved_parameters["duration"].ui_options["simple_dropdown"] == (
+            duration_2_5_choices
+        )
+
+    # A newly selected/restored 2.5 model inherits 720p when no serialized
+    # resolution was supplied. An explicitly serialized 1080p selection must
+    # still survive when it arrives before the model field.
+    default_resolution_probe, default_resolution_state, _ = hydration_probe()
+    default_resolution_state["resolution"] = "1080p"
+    default_resolution_probe.set_parameter_value(
+        "model_id",
+        SEEDANCE_2_5_BYTEPLUS_ALIAS,
+        initial_setup=True,
+    )
+    assert default_resolution_state["resolution"] == "720p"
+
+    explicit_resolution_probe, explicit_resolution_state, _ = hydration_probe()
+    explicit_resolution_state["resolution"] = "720p"
+    explicit_resolution_probe.set_parameter_value(
+        "resolution",
+        "1080p",
+        initial_setup=True,
+    )
+    explicit_resolution_probe.set_parameter_value(
+        "model_id",
+        SEEDANCE_2_5_BYTEPLUS_ALIAS,
+        initial_setup=True,
+    )
+    assert explicit_resolution_state["resolution"] == "1080p"
+
+    # Connected inputs use ordinary setters and their delivery order is host-
+    # dependent. The Options converter must not coerce a valid 2.5 duration
+    # before the paired model value arrives.
+    for runtime_order in (
+        (("model_id", SEEDANCE_2_5_BYTEPLUS_ALIAS), ("duration", 30)),
+        (("duration", 30), ("model_id", SEEDANCE_2_5_BYTEPLUS_ALIAS)),
+    ):
+        runtime_probe, runtime_state, runtime_parameters = hydration_probe()
+        for parameter_name, runtime_value in runtime_order:
+            runtime_probe.set_parameter_value(
+                parameter_name,
+                runtime_value,
+                initial_setup=False,
+            )
+            if parameter_name == "model_id":
+                # The clean-CI base stub does not dispatch after_value_set;
+                # mirror the real model callback's dependent-control sync.
+                runtime_probe._synchronize_model_resolution()
+        assert runtime_state["model_id"] == target.MODEL_NAME_SEEDANCE_2_5
+        assert runtime_state["duration"] == 30
+        assert runtime_parameters["duration"].ui_options["simple_dropdown"] == (
+            duration_2_5_choices
+        )
+
+    saved_2_0_probe, saved_2_0_state, saved_2_0_parameters = hydration_probe()
+    saved_2_0_probe.set_parameter_value(
+        "model_id",
+        target.MODEL_NAME_SEEDANCE_2_0,
+        initial_setup=True,
+    )
+    saved_2_0_probe.set_parameter_value("duration", 30, initial_setup=True)
+    assert saved_2_0_state["model_id"] == target.MODEL_NAME_SEEDANCE_2_0
+    assert saved_2_0_state["duration"] == 5
+    assert saved_2_0_parameters["duration"].ui_options["simple_dropdown"] == [
+        -1,
+        *range(4, 16),
+    ]
+
+    # The 2.5 converter expansion must never retire 2.0's smart duration.
+    for smart_order in (
+        (("model_id", target.MODEL_NAME_SEEDANCE_2_0), ("duration", -1)),
+        (("duration", -1), ("model_id", target.MODEL_NAME_SEEDANCE_2_0)),
+    ):
+        smart_probe, smart_state, smart_parameters = hydration_probe()
+        for parameter_name, smart_value in smart_order:
+            smart_probe.set_parameter_value(
+                parameter_name,
+                smart_value,
+                initial_setup=True,
+            )
+        assert smart_state["model_id"] == target.MODEL_NAME_SEEDANCE_2_0
+        assert smart_state["duration"] == -1
+        assert smart_parameters["duration"].ui_options["simple_dropdown"] == [
+            -1,
+            *range(4, 16),
+        ]
+
+    # A live model switch carries an explicit non-default quality forward, but
+    # replaces the previous model's untouched default and invalid duration.
+    switch_probe, switch_state, switch_parameters = hydration_probe()
+    switch_state.update(
+        {
+            "model_id": target.MODEL_NAME_SEEDANCE_2_5,
+            "resolution": "1080p",
+            "duration": 30,
+        }
+    )
+    switch_probe._hmb_model_switch_previous_id = target.SEEDANCE_2_0_MODEL_ID
+    assert switch_probe._synchronize_model_resolution() == SEEDANCE_2_5_MODEL_ID
+    assert switch_state["resolution"] == "720p"
+    assert switch_state["duration"] == 30
+    switch_state["model_id"] = target.MODEL_NAME_SEEDANCE_2_0
+    switch_probe._hmb_model_switch_previous_id = SEEDANCE_2_5_MODEL_ID
+    assert switch_probe._synchronize_model_resolution() == (
+        target.SEEDANCE_2_0_MODEL_ID
+    )
+    assert switch_state["resolution"] == "1080p"
+    assert switch_state["duration"] == 5
+    assert switch_parameters["duration"].ui_options["simple_dropdown"] == [
+        -1,
+        *range(4, 16),
+    ]
+finally:
+    target._shot_routing.schedule_post_hydration_reconcile = (
+        original_post_hydration_schedule
+    )
+    if base_had_set_parameter_value:
+        setattr(seedance_base, "set_parameter_value", base_set_parameter_value)
+    else:
+        delattr(seedance_base, "set_parameter_value")
+
+
+def assert_invalid_seedance_params(
+    params: dict[str, Any],
+    *,
+    description: str,
+) -> None:
+    probe = object.__new__(target.HMBSeedanceGeneration)
+    try:
+        probe._validate_parameters(params)
+    except ValueError:
+        return
+    raise AssertionError(f"Seedance accepted invalid {description} parameters.")
+
+
+# Model-specific limits must expand only 2.5.  Full/Fast 2.0 retain their
+# existing 4..15 second and 9-image/3-video/3-audio bounds.
+seedance_2_5_audio_only = valid_params(prompt="2.5 audio-only reference")
+seedance_2_5_audio_only.update(
+    {
+        "model_id": SEEDANCE_2_5_MODEL_ID,
+        "input_mode": target.INPUT_MODE_MULTIMODAL_REFERENCES,
+        "duration": 30,
+        "reference_audio": [
+            f"https://media.example/audio-{index:02d}.wav"
+            for index in range(1, 11)
+        ],
+    }
+)
+validation_probe = object.__new__(target.HMBSeedanceGeneration)
+validation_probe._validate_parameters(seedance_2_5_audio_only)
+
+# Audio-only must survive the same resolver used by StartFlow and execution,
+# both with an active Shot subscription and without any Shot routing.
+seedance_2_5_audio_routed = generator(None, None)._resolve_exact_shot_generation_inputs(
+    seedance_2_5_audio_only,
+    verify_agent_prompt=False,
+)
+assert seedance_2_5_audio_routed["input_mode"] == (
+    target.INPUT_MODE_MULTIMODAL_REFERENCES
+)
+assert seedance_2_5_audio_routed["reference_audio"] == (
+    seedance_2_5_audio_only["reference_audio"]
+)
+validation_probe._validate_parameters(seedance_2_5_audio_routed)
+audio_only_payload = validation_probe._build_broker_payload(
+    seedance_2_5_audio_routed
+)
+assert audio_only_payload["audio_urls"] == seedance_2_5_audio_only[
+    "reference_audio"
+]
+
+seedance_2_5_unrouted_probe = generator(None, None)
+seedance_2_5_unrouted_probe._hmb_shot_channel_subscription = lambda: {  # type: ignore[method-assign]
+    "enabled": False,
+}
+seedance_2_5_unrouted_probe._clear_remote_prompt_authority = (  # type: ignore[method-assign]
+    lambda _reason: None
+)
+seedance_2_5_audio_unrouted = (
+    seedance_2_5_unrouted_probe._resolve_exact_shot_generation_inputs(
+        seedance_2_5_audio_only,
+        verify_agent_prompt=False,
+    )
+)
+assert seedance_2_5_audio_unrouted["input_mode"] == (
+    target.INPUT_MODE_MULTIMODAL_REFERENCES
+)
+assert seedance_2_5_audio_unrouted["reference_audio"] == (
+    seedance_2_5_audio_only["reference_audio"]
+)
+validation_probe._validate_parameters(seedance_2_5_audio_unrouted)
+
+seedance_2_5_smart_duration = deepcopy(seedance_2_5_audio_only)
+seedance_2_5_smart_duration["duration"] = -1
+try:
+    validation_probe._validate_parameters(seedance_2_5_smart_duration)
+except ValueError:
+    pass
+else:
+    raise AssertionError("Seedance 2.5 must reject smart duration (-1).")
+
+for invalid_duration in (3, 31):
+    invalid = deepcopy(seedance_2_5_audio_only)
+    invalid["duration"] = invalid_duration
+    assert_invalid_seedance_params(
+        invalid,
+        description=f"2.5 duration {invalid_duration}",
+    )
+
+seedance_2_5_nonadaptive_frames = valid_params(prompt="2.5 frame contract")
+seedance_2_5_nonadaptive_frames.update(
+    {
+        "model_id": SEEDANCE_2_5_MODEL_ID,
+        "input_mode": target.INPUT_MODE_FIRST_LAST_FRAME,
+        "first_frame": "https://media.example/first.png",
+        "ratio": "16:9",
+    }
+)
+assert_invalid_seedance_params(
+    seedance_2_5_nonadaptive_frames,
+    description="2.5 non-adaptive First/Last Frame",
+)
+
+seedance_2_5_priority = deepcopy(seedance_2_5_audio_only)
+seedance_2_5_priority["priority"] = 1
+assert_invalid_seedance_params(
+    seedance_2_5_priority,
+    description="2.5 task priority",
+)
+
+for field, values in (
+    (
+        "reference_images",
+        [f"https://media.example/image-{index:02d}.png" for index in range(31)],
+    ),
+    (
+        "video_references",
+        [f"https://media.example/video-{index:02d}.mp4" for index in range(11)],
+    ),
+    (
+        "reference_audio",
+        [f"https://media.example/audio-{index:02d}.wav" for index in range(11)],
+    ),
+):
+    invalid = deepcopy(seedance_2_5_audio_only)
+    invalid[field] = values
+    assert_invalid_seedance_params(
+        invalid,
+        description=f"2.5 {field} overflow",
+    )
+
+seedance_2_0_duration_overflow = valid_params(prompt="2.0 duration bound")
+seedance_2_0_duration_overflow["duration"] = 16
+assert_invalid_seedance_params(
+    seedance_2_0_duration_overflow,
+    description="2.0 duration 16",
+)
+for field, values in (
+    (
+        "reference_images",
+        [f"https://media.example/legacy-image-{index:02d}.png" for index in range(10)],
+    ),
+    (
+        "video_references",
+        [f"https://media.example/legacy-video-{index:02d}.mp4" for index in range(4)],
+    ),
+    (
+        "reference_audio",
+        [f"https://media.example/legacy-audio-{index:02d}.wav" for index in range(4)],
+    ),
+):
+    invalid = valid_params(prompt="2.0 reference bound")
+    invalid["input_mode"] = target.INPUT_MODE_MULTIMODAL_REFERENCES
+    invalid[field] = values
+    if field == "reference_audio":
+        invalid["reference_images"] = ["https://media.example/anchor.png"]
+    assert_invalid_seedance_params(
+        invalid,
+        description=f"2.0 {field} overflow",
+    )
+
+
+# Direct Shot routing remains model-agnostic: 2.5 receives the exact ordered
+# Loader media and does not weaken Shot ownership/provenance while using its
+# larger documented reference limits.
+seedance_2_5_image_media = {
+    f"image-{index:02d}": f"@image{index}"
+    for index in range(1, 31)
+}
+seedance_2_5_video_media = {
+    f"video-{index:02d}": f"@video{index}"
+    for index in range(1, 11)
+}
+seedance_2_5_image_order = list(reversed(seedance_2_5_image_media))
+seedance_2_5_video_order = list(reversed(seedance_2_5_video_media))
+seedance_2_5_image_source = Source(
+    "image_asset",
+    snapshot(
+        kind="image_asset",
+        selected=seedance_2_5_image_order,
+        media=seedance_2_5_image_media,
+    ),
+)
+seedance_2_5_video_source = Source(
+    "video_picker",
+    snapshot(
+        kind="video_picker",
+        selected=seedance_2_5_video_order,
+        media=seedance_2_5_video_media,
+    ),
+)
+seedance_2_5_direct_params = valid_params(prompt="exact 2.5 Shot references")
+seedance_2_5_direct_params["model_id"] = SEEDANCE_2_5_MODEL_ID
+seedance_2_5_direct = generator(
+    seedance_2_5_image_source,
+    seedance_2_5_video_source,
+)._resolve_exact_shot_generation_inputs(seedance_2_5_direct_params)
+assert seedance_2_5_direct["model_id"] == SEEDANCE_2_5_MODEL_ID
+assert seedance_2_5_direct["reference_images"] == [
+    seedance_2_5_image_media[uid] for uid in seedance_2_5_image_order
+]
+assert seedance_2_5_direct["video_references"] == [
+    seedance_2_5_video_media[uid] for uid in seedance_2_5_video_order
+]
+validation_probe._validate_parameters(seedance_2_5_direct)
+
+
+# The billable payload and the bridge both use only HMB's canonical China-route
+# ID.  Priority remains absent until the Broker explicitly grants it to
+# 2.5; an arbitrary similarly named model must still fail closed.
+seedance_2_5_payload_params = valid_params(prompt="canonical 2.5 Broker payload")
+seedance_2_5_payload_params.update(
+    {
+        "model_id": SEEDANCE_2_5_MODEL_ID,
+        "duration": 30,
+        "resolution": target.MODEL_DEFAULT_RESOLUTIONS[SEEDANCE_2_5_MODEL_ID],
+    }
+)
+seedance_2_5_payload = validation_probe._build_broker_payload(
+    seedance_2_5_payload_params
+)
+assert seedance_2_5_payload["model"] == SEEDANCE_2_5_MODEL_ID
+assert seedance_2_5_payload["duration_seconds"] == 30
+assert seedance_2_5_payload["quality"] == "720p"
+assert "priority" not in seedance_2_5_payload
+
+# Exercise the final client-side bridge boundary, not just its field map.  The
+# bridge must remove a zero-valued legacy priority, preserve the canonical
+# model/provider, and fail before network I/O for forbidden values or fields.
+bridge_calls: list[dict[str, Any]] = []
+seedance_2_5_bridge = target._HMBAIBrokerBridge(opener=object())
+
+
+def capture_bridge_request(
+    method: str,
+    path: str,
+    *,
+    payload: dict[str, Any] | None,
+    timeout: float,
+    submission: bool = False,
+    idempotency_key: str = "",
+) -> dict[str, Any]:
+    bridge_calls.append(
+        {
+            "method": method,
+            "path": path,
+            "payload": deepcopy(payload),
+            "timeout": timeout,
+            "submission": submission,
+            "idempotency_key": idempotency_key,
+        }
+    )
+    return {"id": "seedance-2-5-contract-probe"}
+
+
+seedance_2_5_bridge._request_json = capture_bridge_request  # type: ignore[method-assign]
+bridge_probe_payload = {**seedance_2_5_payload, "priority": 0}
+assert seedance_2_5_bridge.generate_seedance(
+    bridge_probe_payload,
+    timeout=17.0,
+) == {"id": "seedance-2-5-contract-probe"}
+assert len(bridge_calls) == 1
+assert bridge_calls[0]["method"] == "POST"
+assert bridge_calls[0]["path"] == "/api/v1/generate/video"
+assert bridge_calls[0]["submission"] is True
+assert bridge_calls[0]["payload"]["provider"] == "volcengine_ark"
+assert bridge_calls[0]["payload"]["model"] == SEEDANCE_2_5_MODEL_ID
+assert "priority" not in bridge_calls[0]["payload"]
+
+for forbidden_payload in (
+    {**seedance_2_5_payload, "priority": 1},
+    {**seedance_2_5_payload, "unapproved_field": True},
+):
+    calls_before = len(bridge_calls)
+    try:
+        seedance_2_5_bridge.generate_seedance(forbidden_payload, timeout=17.0)
+    except target._BrokerProtocolError:
+        pass
+    else:
+        raise AssertionError("Seedance 2.5 bridge accepted a forbidden payload.")
+    assert len(bridge_calls) == calls_before
+
+# The expanded 2.5 list capacity must not create new serialized scalar ports.
+# Saved workflows retain exactly reference_video_1..3; larger ordered input is
+# carried only by VIDEO_REFERENCES.
+assert target.LEGACY_VIDEO_REFERENCE_SLOTS == 3
+seedance_source = (ROOT / "HMBSeedanceGeneration.py").read_text(encoding="utf-8")
+assert "for index in range(1, LEGACY_VIDEO_REFERENCE_SLOTS + 1):" in seedance_source
+assert 'name=f"reference_video_{index}"' in seedance_source
+assert "reference_video_4" not in seedance_source
+for unsupported_model in (
+    SEEDANCE_2_5_BYTEPLUS_ALIAS,
+    "doubao-seedance-2-5-latest",
+    "Seedance 2.5 beta",
+):
+    try:
+        target.HMBSeedanceGeneration._validate_broker_model(unsupported_model)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(
+            f"Broker accepted non-canonical Seedance model {unsupported_model!r}."
+        )
+
+
 # StartFlow used to validate only the empty public parameter lists and reject a
 # valid hidden Shot before process() could resolve its ImageAsset/VideoPicker
 # snapshot. Preflight must resolve that snapshot without weakening runtime Agent

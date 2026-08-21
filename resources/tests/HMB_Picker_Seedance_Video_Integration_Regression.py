@@ -63,25 +63,18 @@ def video_url(number: int) -> str:
     return f"https://example.test/hmb-picker-video-{number}.mp4"
 
 
-def submit_picker_order(
-    source: Any,
-    ordered_numbers: tuple[int, ...],
-) -> list[str]:
-    """Submit the exact complete widget snapshot used by a card reorder."""
-    current = copy.deepcopy(source._picker_state())
-    order_by_number = {
-        number: selection_order
-        for selection_order, number in enumerate(ordered_numbers, start=1)
-    }
-    current["videos"] = [
+def seed_picker_catalog(source: Any) -> None:
+    """Publish media through Python authority before the widget selects it."""
+    state = copy.deepcopy(source._picker_state())
+    state["videos"] = [
         {
             "video_uid": f"video-{number}",
             "source_uid": f"video-{number}",
             "catalog_order": number,
             "video_url": video_url(number),
-            "selected": number in order_by_number,
-            "selection_order": order_by_number.get(number, 0),
-            "video_slot": order_by_number.get(number, 0),
+            "selected": False,
+            "selection_order": 0,
+            "video_slot": 0,
             "source_fps": 24.0,
             "source_frame_count": 24,
             "decoded_frame_count": 24,
@@ -89,6 +82,32 @@ def submit_picker_order(
         }
         for number in range(1, 5)
     ]
+    source._write_state(picker._parse_state(state))
+    committed = source._picker_state()
+    source._sync_outputs_from_state(
+        committed,
+        enforce_media_availability=False,
+    )
+    assert source.parameter_output_values[picker.VIDEO_OUTPUT_PARAMETER] == []
+
+
+def submit_picker_order(
+    source: Any,
+    ordered_numbers: tuple[int, ...],
+) -> list[str]:
+    """Submit only the active Shot's widget-owned selection/order delta."""
+    current = copy.deepcopy(source._picker_state())
+    active_workspace_uuid = current["active_picker_shot_uuid"]
+    active_workspace = next(
+        row
+        for row in current["picker_shots"]
+        if row["workspace_uuid"] == active_workspace_uuid
+    )
+    ordered_uids = [f"video-{number}" for number in ordered_numbers]
+    assert set(ordered_uids).issubset(active_workspace["video_asset_uids"])
+    active_workspace["selected_video_uids"] = ordered_uids
+    active_workspace["preview_video_uid"] = ordered_uids[0] if ordered_uids else ""
+    active_workspace["revision"] = int(active_workspace.get("revision") or 0) + 1
     current["state_writer"] = "widget"
     current["runtime_instance_id"] = source._hmb_runtime_instance_id
     current["state_revision"] = int(current.get("state_revision") or 0) + 1
@@ -135,18 +154,22 @@ def assert_single_video_input_surface(source: Any, destination: Any) -> None:
     assert destination_input.type == "list[str]"
     assert source_output.output_type in destination_input.input_types
     assert destination_input.allowed_modes == {seedance.ParameterMode.INPUT}
-    assert destination_input.hide is False
+    assert destination_input.hide is True
     assert destination_input.hide_property is True
-    assert destination_input.ui_options["display_name"] == "Reference Videos"
+    assert destination_input.ui_options["display_name"] == ""
+    assert destination_input.ui_options["hide_handles"] is True
+    assert seedance.LEGACY_VIDEO_REFERENCE_SLOTS == 3
+    assert seedance.MAX_VIDEO_REFERENCES == 10
 
     # Scalar ports remain hidden only for saved-workflow migration. The user has
     # one visible list connector, so a Picker selection never needs re-wiring.
-    for index in range(1, seedance.MAX_VIDEO_REFERENCES + 1):
+    for index in range(1, seedance.LEGACY_VIDEO_REFERENCE_SLOTS + 1):
         legacy = destination.get_parameter_by_name(f"reference_video_{index}")
         assert legacy.hide is True
         assert legacy.ui_options["display_name"] == (
             f"Legacy Reference Video {index}"
         )
+    assert destination.get_parameter_by_name("reference_video_4") is None
 
 
 def assert_host_connection_reorder_and_payload() -> None:
@@ -178,6 +201,7 @@ def assert_host_connection_reorder_and_payload() -> None:
 
         assert_single_video_input_surface(source, destination)
         assert_single_video_output_surface(destination)
+        seed_picker_catalog(source)
 
         initial = submit_picker_order(source, (1, 2, 3, 4))
         connected = GriptapeNodes.handle_request(
@@ -231,7 +255,8 @@ def assert_host_connection_reorder_and_payload() -> None:
         try:
             asyncio.run(destination._process_generation_impl())
         except ValueError as exc:
-            assert "at most 3 reference videos" in str(exc)
+            assert "Seedance 2.0 accepts at most 3" in str(exc)
+            assert "No request was submitted" in str(exc)
         else:
             raise AssertionError("Four connected Picker videos were accepted")
         assert request_calls == []

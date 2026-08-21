@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import os
 import ssl
 import sys
 from email.message import Message
@@ -53,7 +52,9 @@ delivery = manifest["metadata"]["agent_policy_delivery"]
 assert delivery["mode"] == "authenticated_broker_session"
 assert delivery["broker_endpoint"] == EXPECTED_URL
 assert delivery["public_ca_path"] == "resources/tls/hmb_agent_broker_ca.pem"
-assert delivery["bootstrap_marker"] == "HMB_AGENT_POLICY_PROCESS_BOOTSTRAP=1"
+assert "bootstrap_marker" not in delivery
+assert "launcher_path" not in delivery
+assert not hasattr(common, "_AGENT_POLICY_BOOTSTRAP_MARKER")
 assert delivery["verification"] == (
     "pinned_tls_dpapi_bearer_rsa3072_sha256_v3_contract_once_per_process"
 )
@@ -240,7 +241,6 @@ common._agent_policy_process_provenance_valid = lambda: True
 common._fetch_verified_agent_rule_payload = lambda: (
     bootstrap_fetches.append(True) or dict(verified_snapshot)
 )
-os.environ[common._AGENT_POLICY_BOOTSTRAP_MARKER] = "1"
 try:
     common._bootstrap_agent_policy_session()
     common._bootstrap_agent_policy_session()

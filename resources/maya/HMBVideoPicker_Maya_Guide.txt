@@ -116,7 +116,3 @@ Any selected video may be connected and used in the way that best serves the use
 PICKER_OUT schema v5 publishes only the selected catalog records in visible row-major drag order, with stable `video_uid`/`source_uid`, dense transient `selection_order` and `video_slot`, resolved video paths, typed auxiliary provenance, Asset ID, Color Pick, Maya DAG root, Maya UUID, camera, and compact intrinsic generated-guide metadata. The catalog itself may retain more than ten assets, but the synchronized PICKER_OUT and VIDEO_OUT snapshot contains at most ten. When an Asset ID matches an active Image Name, HMBPromptLibrary can associate them automatically; a missing match remains valid and simply contributes no automatic image association.
 
 HMBPromptLibrary alone owns Main Type, Target, Image Sub Type, Video Sub Type, Keep Out, VIDEO VFX, and descriptive control data. HMBAgentLibrary receives the compiled HMBPromptLibrary output, injects the four project rules plus four shot rules for an HMB payload, executes the native Agent once, and removes hidden policy data from visible output.
-
-Test scene
-
-Run Create_HMBVideoPicker_Test_8Objects.bat on a Windows computer with Maya installed. The utility creates a new disposable HMBVideoPicker_Test_8Objects.mb for testing; it does not modify a production scene.

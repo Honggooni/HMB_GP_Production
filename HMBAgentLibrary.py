@@ -80,7 +80,7 @@ _AGENT_STATE_DISPLAY_NAME = "AGENT STATE · CHAIN ONLY"
 _HMB_POLICY_UNAVAILABLE_MESSAGE = (
     "[HMB SERVER POLICY REQUIRED] Agent policy session is unavailable. "
     "Close Griptape completely, verify the existing FN AI Broker login and "
-    "server connection, then restart Griptape with HMB_Agent_Griptape.bat."
+    "server connection, then restart the official Griptape Desktop application."
 )
 _HMB_POLICY_IDENTITY_MISMATCH_MESSAGE = (
     "[HMB POLICY CONTRACT MISMATCH] HMBPromptLibrary와 서버의 서명된 "

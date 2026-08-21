@@ -1,12 +1,24 @@
 # HMB GP Production
 
-Current technical release: `v0.6.42`.
+Current technical release: `v0.6.43`.
 
 HMBAgentLibrary keeps Korean authoring input intact inside the private Prompt
 contract, but its final video-generator instruction is English-only. Prompt
 video snapshots are compiled without re-entering Shot graph mutation, and an
 unchanged valid VideoPicker catalog remains ready instead of becoming a false
 missing-source failure.
+
+HMBSeedanceGeneration supports Seedance 2.0, 2.0 Fast, and 2.5 through the
+authenticated FN AI Broker. Seedance 2.5 defaults to 720p, offers optional
+1080p 10-bit HEVC, accepts explicit 4-30 second duration, and supports up to
+30 image, 10 video, and 10 audio references, including audio-only input. The
+HMB 2.5 production profile intentionally omits 480p and smart duration. The
+existing Seedance 2.0 limits and saved three-port video compatibility contract
+remain unchanged. The Broker must authorize the exact 2.5 model server-side.
+The native video preview now reports submission, render, retrieval, download,
+verification, cancellation, timeout, and failure states. A completed prior
+video remains visible while a new task runs, and the recovery action checks the
+existing authoritative task without submitting a duplicate generation.
 
 HMBVideoPickerLibrary opens in expanded authoring mode on its first mount. Its
 expanded UI is isolated from the React Flow canvas; switching to the compact
@@ -33,6 +45,10 @@ the Griptape library directory, close Griptape completely, and run:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\HMB_GP_Production\Install_HMB_GP_Production.ps1
 ```
 
+After installation, start Griptape normally from the supported Desktop app.
+The runtime package no longer ships a separate HMB launcher; Agent policy
+bootstrap is authorized by the exact packaged Griptape process provenance.
+
 The installer verifies every manifest hash and replaces the target with the
 exact runtime closure. It never creates a backup folder under
 `Documents\GriptapeNodes\libraries`; the previous install is moved to a
@@ -44,7 +60,7 @@ running the installer: those overlay methods retain obsolete development
 files. The installed `resources` tree contains only Maya runtime support, the
 Picker catalog, and the pinned public Broker CA.
 
-All files inside the v0.6.42 ZIP use the actual local package-build time. The
+All files inside the v0.6.43 ZIP use the actual local package-build time. The
 builder records one uniform ZIP-compatible timestamp (two-second resolution),
 so Windows Explorer shows the real build hour and minute instead of a fixed
 midnight value. Verify an installation with `metadata.library_version`,

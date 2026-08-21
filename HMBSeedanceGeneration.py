@@ -157,17 +157,22 @@ INPUT_MODE_MULTIMODAL_REFERENCES = "Multimodal References"
 
 MODEL_NAME_SEEDANCE_2_0 = "Seedance 2.0"
 MODEL_NAME_SEEDANCE_2_0_FAST = "Seedance 2.0 Fast"
+MODEL_NAME_SEEDANCE_2_5 = "Seedance 2.5"
 
 SEEDANCE_2_0_MODEL_ID = "doubao-seedance-2-0-260128"
 SEEDANCE_2_0_FAST_MODEL_ID = "doubao-seedance-2-0-fast-260128"
+SEEDANCE_2_5_MODEL_ID = "doubao-seedance-2-5-260628"
 
-# The FN AI Broker Volcengine adapter accepts only the two active Seedance 2.0
-# endpoints. Keep this allowlist explicit so a retired or arbitrary catalog
-# entry can never be submitted merely because its name contains "seedance".
+# Keep the exact HMB client-approved Volcengine IDs explicit so an arbitrary
+# catalog entry can never be submitted merely because its name contains
+# "seedance".  The corresponding BytePlus ``dreamina-*`` IDs below are saved-
+# workflow aliases only; HMB's China-region route submits ``doubao-*`` IDs and
+# the Broker independently authorizes every model server-side.
 BROKER_SUPPORTED_MODEL_IDS = frozenset(
     {
         SEEDANCE_2_0_MODEL_ID,
         SEEDANCE_2_0_FAST_MODEL_ID,
+        SEEDANCE_2_5_MODEL_ID,
     }
 )
 
@@ -188,10 +193,13 @@ RETIRED_SEEDANCE_MODEL_VALUES = frozenset(
 MODEL_ID_ALIASES = {
     MODEL_NAME_SEEDANCE_2_0: SEEDANCE_2_0_MODEL_ID,
     MODEL_NAME_SEEDANCE_2_0_FAST: SEEDANCE_2_0_FAST_MODEL_ID,
+    MODEL_NAME_SEEDANCE_2_5: SEEDANCE_2_5_MODEL_ID,
     "dreamina-seedance-2-0-260128": SEEDANCE_2_0_MODEL_ID,
     "dreamina-seedance-2-0-fast-260128": SEEDANCE_2_0_FAST_MODEL_ID,
+    "dreamina-seedance-2-5-260628": SEEDANCE_2_5_MODEL_ID,
     SEEDANCE_2_0_MODEL_ID: SEEDANCE_2_0_MODEL_ID,
     SEEDANCE_2_0_FAST_MODEL_ID: SEEDANCE_2_0_FAST_MODEL_ID,
+    SEEDANCE_2_5_MODEL_ID: SEEDANCE_2_5_MODEL_ID,
     **{
         retired: SEEDANCE_2_0_MODEL_ID
         for retired in RETIRED_SEEDANCE_MODEL_VALUES
@@ -200,16 +208,40 @@ MODEL_ID_ALIASES = {
 MODEL_DISPLAY_NAME_BY_ID = {
     SEEDANCE_2_0_MODEL_ID: MODEL_NAME_SEEDANCE_2_0,
     SEEDANCE_2_0_FAST_MODEL_ID: MODEL_NAME_SEEDANCE_2_0_FAST,
+    SEEDANCE_2_5_MODEL_ID: MODEL_NAME_SEEDANCE_2_5,
 }
 
 MODEL_RESOLUTIONS = {
     SEEDANCE_2_0_MODEL_ID: ("4k", "1080p", "720p", "480p"),
     SEEDANCE_2_0_FAST_MODEL_ID: ("720p", "480p"),
+    # Seedance 2.5 production contract: 720p default and optional 1080p
+    # (10-bit HEVC).  480p is intentionally not exposed.
+    SEEDANCE_2_5_MODEL_ID: ("720p", "1080p"),
 }
 
 MODEL_DEFAULT_RESOLUTIONS = {
     SEEDANCE_2_0_MODEL_ID: "1080p",
     SEEDANCE_2_0_FAST_MODEL_ID: "720p",
+    SEEDANCE_2_5_MODEL_ID: "720p",
+}
+
+MODEL_DURATION_CHOICES = {
+    SEEDANCE_2_0_MODEL_ID: (-1, *range(4, 16)),
+    SEEDANCE_2_0_FAST_MODEL_ID: (-1, *range(4, 16)),
+    # The 2.5 Broker contract is literal 4–30 seconds; smart-duration (-1)
+    # is not sent for this model.
+    SEEDANCE_2_5_MODEL_ID: (*range(4, 31),),
+}
+
+# The converter-facing set is the union of every active model. It is wider
+# than any one visible dropdown so host delivery order cannot coerce a saved
+# 2.0 smart duration or a 2.5 long duration before model_id is known.
+DURATION_STORAGE_CHOICES = (-1, *range(4, 31))
+
+MODEL_REFERENCE_LIMITS = {
+    SEEDANCE_2_0_MODEL_ID: (9, 3, 3),
+    SEEDANCE_2_0_FAST_MODEL_ID: (9, 3, 3),
+    SEEDANCE_2_5_MODEL_ID: (30, 10, 10),
 }
 
 RATIOS = ("adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16")
@@ -241,9 +273,12 @@ LOCAL_PRE_SUBMISSION_STATUSES = frozenset(
     }
 )
 
-MAX_REFERENCE_IMAGES = 9
-MAX_VIDEO_REFERENCES = 3
-MAX_REFERENCE_AUDIO = 3
+# Absolute library bounds match Seedance 2.5.  Older models keep their lower
+# limits in ``MODEL_REFERENCE_LIMITS`` and fail before any Broker submission.
+MAX_REFERENCE_IMAGES = 30
+MAX_VIDEO_REFERENCES = 10
+MAX_REFERENCE_AUDIO = 10
+LEGACY_VIDEO_REFERENCE_SLOTS = 3
 MAX_IMAGE_BYTES = 30 * 1024 * 1024
 MAX_AUDIO_BYTES = 15 * 1024 * 1024
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
@@ -281,6 +316,113 @@ AGENT_REMOTE_PROMPT_PUBLICATION_SCHEMA = "hmb-agent-remote-prompt-publication"
 AGENT_REMOTE_PROMPT_PUBLICATION_VERSION = 1
 MAX_REMOTE_PROMPT_CHARACTERS = 2_000_000
 SHOT_UNAVAILABLE_LABEL = SHOT_ONLY_LABEL
+
+GENERATION_PREVIEW_SCHEMA = "hmb-seedance-generation-preview"
+GENERATION_PREVIEW_VERSION = 1
+GENERATION_PREVIEW_PHASES = frozenset(
+    {
+        "idle",
+        "preparing",
+        "submitting",
+        "queued",
+        "running",
+        "retrieving",
+        "downloading",
+        "verifying",
+        "cancelled_locally",
+        "timed_out",
+        "submission_unknown",
+        "failed",
+        "succeeded",
+    }
+)
+GENERATION_PREVIEW_REFRESH_PHASES = frozenset(
+    {
+        "queued",
+        "running",
+        "cancelled_locally",
+        "timed_out",
+        "submission_unknown",
+        "failed",
+    }
+)
+GENERATION_PREVIEW_GUIDANCE = {
+    "idle": "",
+    "preparing": "입력과 출력 위치를 확인하고 있습니다.",
+    "submitting": "새 작업을 서버에 제출하고 있습니다.",
+    "queued": "서버 렌더 대기열에서 순서를 기다리고 있습니다.",
+    "running": "서버에서 영상을 생성하고 있습니다.",
+    "retrieving": "새 작업을 만들지 않고 기존 작업 결과만 확인하고 있습니다.",
+    "downloading": "완료된 영상을 내려받고 있습니다.",
+    "verifying": "영상 파일을 검증하고 안전하게 저장하고 있습니다.",
+    "cancelled_locally": (
+        "서버 렌더는 계속될 수 있습니다. 기존 작업 결과만 확인합니다."
+    ),
+    "timed_out": (
+        "자동 조회 시간이 끝났습니다. 기존 작업 결과만 다시 확인합니다."
+    ),
+    "submission_unknown": (
+        "제출 응답을 확인하지 못했습니다. 새 작업을 만들지 않고 기존 요청만 확인합니다."
+    ),
+    "failed": "작업 상태 또는 결과 수신을 확인해야 합니다.",
+    "succeeded": "",
+}
+
+
+def _seedance_generation_preview_value(value: Any = None) -> dict[str, Any]:
+    """Return the bounded, browser-safe runtime preview contract.
+
+    This value deliberately contains no media path, signed URL, provider body,
+    or browser-supplied identifier.  The custom widget receives only enough
+    state to explain an empty preview and request a same-job refresh.
+    """
+
+    source = value if isinstance(value, dict) else {}
+    phase = str(source.get("phase") or "idle").strip().lower()
+    if phase not in GENERATION_PREVIEW_PHASES:
+        phase = "idle"
+
+    job_id = str(source.get("job_id") or "").strip()
+    if not job_id or _TASK_ID_PATTERN.fullmatch(job_id) is None:
+        job_id = ""
+
+    def bounded_nonnegative_integer(raw: Any, maximum: int) -> int:
+        if not isinstance(raw, int) or isinstance(raw, bool):
+            return 0
+        return min(maximum, max(0, raw))
+
+    started_at_ms = bounded_nonnegative_integer(
+        source.get("started_at_ms"),
+        9_999_999_999_999,
+    )
+    elapsed_seconds = bounded_nonnegative_integer(
+        source.get("elapsed_seconds"),
+        7 * 24 * 60 * 60,
+    )
+    media_revision = bounded_nonnegative_integer(
+        source.get("media_revision"),
+        2_147_483_647,
+    )
+    requested_action = str(source.get("action") or "none").strip().lower()
+    action = (
+        "refresh_existing"
+        if requested_action == "refresh_existing"
+        and job_id
+        and phase in GENERATION_PREVIEW_REFRESH_PHASES
+        else "none"
+    )
+    return {
+        "schema": GENERATION_PREVIEW_SCHEMA,
+        "version": GENERATION_PREVIEW_VERSION,
+        "phase": phase,
+        "job_id": job_id,
+        "started_at_ms": started_at_ms,
+        "elapsed_seconds": elapsed_seconds,
+        "guidance": GENERATION_PREVIEW_GUIDANCE[phase],
+        "action": action,
+        "has_existing_video": source.get("has_existing_video") is True,
+        "media_revision": media_revision,
+    }
 
 
 def _seedance_uuid_text(value: Any) -> str:
@@ -367,8 +509,9 @@ def _seedance_widget_catalog(value: Any) -> dict[str, Any]:
 def _seedance_widget_value(
     shot: Any = None,
     shot_catalog: Any = None,
+    generation: Any = None,
 ) -> dict[str, Any]:
-    """Build the sole backend-authoritative Seedance Shot UI value."""
+    """Build the sole backend-authoritative Seedance custom-widget value."""
 
     catalog = _seedance_widget_catalog(shot_catalog)
     raw_shot = shot if isinstance(shot, dict) else {}
@@ -388,9 +531,10 @@ def _seedance_widget_value(
     }
     return {
         "schema": "hmb-seedance-shot-ui",
-        "schema_version": 1,
+        "schema_version": 2,
         "shot_catalog": catalog,
         "shot": shot_value,
+        "generation": _seedance_generation_preview_value(generation),
     }
 
 IMAGE_MIME_BY_SUFFIX = {
@@ -876,6 +1020,8 @@ class _HMBAIBrokerBridge:
         | frozenset({"priority"}),
         SEEDANCE_2_0_FAST_MODEL_ID: _COMMON_SEEDANCE_FIELDS
         | _REFERENCE_MODE_FIELDS,
+        SEEDANCE_2_5_MODEL_ID: _COMMON_SEEDANCE_FIELDS
+        | _REFERENCE_MODE_FIELDS,
     }
     def __init__(self, *, opener: Any | None = None) -> None:
         self._opener = opener if opener is not None else _broker_build_opener()
@@ -1249,16 +1395,25 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._submission_outcome_unknown = False
         self._detached_submission_tasks: set[asyncio.Task[Any]] = set()
         self._broker_bridge_instance: _HMBAIBrokerBridge | None = None
-        self._last_broker_payload: dict[str, Any] | None = None
         self._broker_action_lock = threading.Lock()
         self._broker_action_running = False
         self._generation_refresh_lock = threading.Lock()
         self._generation_refresh_running = False
         self._generation_run_active = threading.Event()
+        self._hmb_generation_preview_state = _seedance_generation_preview_value()
+        self._hmb_generation_started_monotonic: float | None = None
+        self._hmb_generation_started_at_ms = 0
+        self._hmb_generation_media_revision = 0
+        self._hmb_last_success_video: VideoUrlArtifact | None = None
+        self._hmb_last_success_last_frame_url = ""
+        self._hmb_pending_generation_action = False
+        self._hmb_generation_action_only_update = False
         self._hmb_node_deleted = False
         self._hmb_delete_parent_called = False
         self._hmb_model_migration_active = False
         self._hmb_retired_model_migration_pending = False
+        self._hmb_model_initial_setup_seen = False
+        self._hmb_resolution_initial_setup_seen = False
         self._hmb_shot_syncing = False
         self._hmb_shared_routing_in_progress = False
         self._hmb_shot_catalog_snapshot: dict[str, Any] | None = None
@@ -1448,7 +1603,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "name": SEEDANCE_SHOT_WIDGET_PARAMETER,
             "type": "dict",
             "input_types": ["dict"],
-            "default_value": _seedance_widget_value(),
+            "default_value": _seedance_widget_value(
+                generation=self._hmb_generation_preview_state
+            ),
             "tooltip": "Select one backend-verified production Shot.",
             "allowed_modes": {ParameterMode.PROPERTY},
             "serializable": False,
@@ -1499,8 +1656,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 name="model_id",
                 default_value=MODEL_NAME_SEEDANCE_2_0,
                 tooltip=(
-                    "Volcengine Seedance 2.0 model. The full model defaults to "
-                    "1080p (1K); Fast supports up to 720p."
+                    "Select Seedance 2.0, 2.0 Fast, or 2.5. Seedance 2.5 "
+                    "supports 4-30 second generations and optional 1080p HEVC; "
+                    "the existing 2.0 contracts remain unchanged."
                 ),
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
                 traits={
@@ -1508,6 +1666,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         choices=[
                             MODEL_NAME_SEEDANCE_2_0,
                             MODEL_NAME_SEEDANCE_2_0_FAST,
+                            MODEL_NAME_SEEDANCE_2_5,
                         ]
                     )
                 },
@@ -1648,8 +1807,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 default_value=[],
                 tooltip=(
                     "Ordered reference-image list from HMBImageAssetLibrary "
-                    "Video Generation Out (0-9). Connect the entire selection "
-                    "with one wire; list order becomes Seedance image order."
+                    "Video Generation Out. Connect the entire selection with one "
+                    "wire; list order becomes Seedance image order. Seedance 2.5 "
+                    "accepts up to 30 images; 2.0 models retain their lower limit."
                 ),
                 allowed_modes={ParameterMode.INPUT},
                 hide=True,
@@ -1667,7 +1827,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # Keep the former three scalar ports registered but hidden so workflows
         # saved with those exact parameter names continue to resolve. New HMB
         # workflows use the ordered VIDEO_REFERENCES list below.
-        for index in range(1, MAX_VIDEO_REFERENCES + 1):
+        for index in range(1, LEGACY_VIDEO_REFERENCE_SLOTS + 1):
             video_parameter = Parameter(
                 name=f"reference_video_{index}",
                 type="VideoUrlArtifact",
@@ -1717,8 +1877,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 default_value=[],
                 tooltip=(
                     "Ordered reference-video list from HMBVideoPickerLibrary "
-                    "VIDEO OUT (0-3). Connect the complete selected list with "
-                    "one wire; Picker selection order becomes Seedance order."
+                    "VIDEO OUT. Connect the complete selected list with one wire; "
+                    "Picker selection order becomes Seedance order. Seedance 2.5 "
+                    "accepts up to 10 videos; 2.0 models retain their lower limit."
                 ),
                 allowed_modes={ParameterMode.INPUT},
                 hide=True,
@@ -1743,8 +1904,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 ],
                 default_value=[],
                 tooltip=(
-                    "Optional reference audio (0-3). Local MP3/WAV files are "
-                    "encoded as data URIs; audio requires an image or video reference."
+                    "Optional ordered reference audio. Seedance 2.5 accepts up to "
+                    "10 files and permits audio-only reference input; 2.0 models "
+                    "retain the 3-file limit and require image or video context."
                 ),
                 allowed_modes={ParameterMode.INPUT},
                 hide=True,
@@ -1764,8 +1926,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 name="resolution",
                 default_value=MODEL_DEFAULT_RESOLUTIONS[SEEDANCE_2_0_MODEL_ID],
                 tooltip=(
-                    "Full Seedance 2.0 defaults to 1080p (1K). Fast supports "
-                    "480p and 720p."
+                    "Seedance 2.0 defaults to 1080p. Seedance 2.5 and Fast "
+                    "default to 720p; 2.5 also offers 1080p 10-bit HEVC."
                 ),
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
                 traits={Options(choices=list(MODEL_RESOLUTIONS[SEEDANCE_2_0_MODEL_ID]))},
@@ -1780,9 +1942,25 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             ParameterInt(
                 name="duration",
                 default_value=5,
-                tooltip="Duration: 4-15 seconds, or -1 for smart duration.",
+                tooltip=(
+                    "Duration: Seedance 2.0 supports 4-15 seconds or -1 smart "
+                    "duration; Seedance 2.5 uses an explicit 4-30 seconds."
+                ),
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
-                traits={Options(choices=[-1, *range(4, 16)])},
+                # The static converter must accept the union so saved 2.0
+                # smart duration and 2.5 long duration both survive hydration
+                # regardless of parameter order.
+                # The visible dropdown is narrowed per model below.
+                traits={
+                    Options(
+                        choices=list(DURATION_STORAGE_CHOICES)
+                    )
+                },
+                ui_options={
+                    "simple_dropdown": list(
+                        MODEL_DURATION_CHOICES[SEEDANCE_2_0_MODEL_ID]
+                    )
+                },
             )
             ParameterBool(
                 name="generate_audio",
@@ -2128,11 +2306,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "metadata_sha256": metadata_hash,
         }
 
-    def _set_shot_value(self, name: str, value: Any) -> None:
+    def _set_shot_value(
+        self,
+        name: str,
+        value: Any,
+        *,
+        emit_change: bool = False,
+    ) -> None:
         if self.get_parameter_value(name) == value:
             return
         try:
-            self.set_parameter_value(name, value, emit_change=False)
+            self.set_parameter_value(name, value, emit_change=emit_change)
         except TypeError:
             self.set_parameter_value(name, value)
 
@@ -2532,7 +2716,129 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         ]
         return {**deepcopy(snapshot), "shots": shots} if shots else {}
 
-    def _sync_seedance_shot_widget(self) -> None:
+    @staticmethod
+    def _generation_artifact_is_present(value: Any) -> bool:
+        if value is None:
+            return False
+        location = getattr(value, "value", value)
+        return bool(str(location or "").strip())
+
+    def _capture_last_success_video(self) -> VideoUrlArtifact | None:
+        """Keep the last complete preview visible while another task runs."""
+
+        current = self.parameter_output_values.get("video_url")
+        if self._generation_artifact_is_present(current):
+            self._hmb_last_success_video = current
+            self._hmb_last_success_last_frame_url = str(
+                self.parameter_output_values.get("last_frame_url") or ""
+            )
+        return self._hmb_last_success_video
+
+    def _begin_generation_preview(self) -> None:
+        self._capture_last_success_video()
+        self._hmb_generation_started_monotonic = self._monotonic()
+        self._hmb_generation_started_at_ms = int(time.time() * 1000)
+        self._publish_generation_preview(
+            "preparing",
+            generation_id="",
+            action="none",
+        )
+
+    @staticmethod
+    def _generation_preview_phase_for_status(status: Any) -> str:
+        normalized = str(status or "").strip().lower().replace("-", "_")
+        if normalized in LOCAL_PRE_SUBMISSION_STATUSES or normalized in {
+            "connecting_broker",
+            "preparing_media",
+        }:
+            return "preparing"
+        if normalized == "submitting":
+            return "submitting"
+        if normalized in {"queued", "resuming"}:
+            return "queued"
+        if normalized == "running":
+            return "running"
+        if normalized == "retrieving":
+            return "retrieving"
+        if normalized == "succeeded":
+            # A completed remote job is not a usable preview until its MP4 has
+            # been downloaded, decode-verified, and atomically published.
+            return "downloading"
+        if normalized == "cancelled_locally":
+            return "cancelled_locally"
+        if normalized == "timed_out":
+            return "timed_out"
+        if normalized == "submission_unknown":
+            return "submission_unknown"
+        if normalized in TERMINAL_FAILURE_STATUSES or normalized in {
+            "failed",
+            "result_failed",
+        }:
+            return "failed"
+        return "idle"
+
+    def _publish_generation_preview(
+        self,
+        phase: str,
+        *,
+        generation_id: str | None = None,
+        action: str = "none",
+    ) -> None:
+        """Publish one authoritative, bounded state to the custom widget."""
+
+        if getattr(self, "_hmb_node_deleted", False):
+            return
+        job_id = (
+            str(generation_id).strip()
+            if generation_id is not None
+            else str(self.parameter_output_values.get("generation_id") or "").strip()
+        )
+        started_monotonic = self._hmb_generation_started_monotonic
+        elapsed_seconds = 0
+        if started_monotonic is not None:
+            elapsed_seconds = max(
+                0,
+                int(self._monotonic() - started_monotonic),
+            )
+        state = _seedance_generation_preview_value(
+            {
+                "phase": phase,
+                "job_id": job_id,
+                "started_at_ms": self._hmb_generation_started_at_ms,
+                "elapsed_seconds": elapsed_seconds,
+                "action": action,
+                "has_existing_video": self._generation_artifact_is_present(
+                    self._capture_last_success_video()
+                ),
+                "media_revision": self._hmb_generation_media_revision,
+            }
+        )
+        self._hmb_generation_preview_state = state
+        self._sync_seedance_shot_widget(emit_change=True)
+
+    def _request_existing_generation_refresh(self) -> None:
+        """Accept one browser pulse without accepting any browser task ID."""
+
+        preview = _seedance_generation_preview_value(
+            self._hmb_generation_preview_state
+        )
+        authoritative_id = str(
+            self.parameter_output_values.get("generation_id") or ""
+        ).strip()
+        if (
+            preview["action"] != "refresh_existing"
+            or not authoritative_id
+            or preview["job_id"] != authoritative_id
+            or self._generation_run_active.is_set()
+        ):
+            return
+        try:
+            self._validate_task_id(authoritative_id)
+        except _BrokerProtocolError:
+            return
+        self._on_refresh_clicked(None, None)
+
+    def _sync_seedance_shot_widget(self, *, emit_change: bool = False) -> None:
         parameter = self.get_parameter_by_name(SEEDANCE_SHOT_WIDGET_PARAMETER)
         if parameter is None:
             return
@@ -2546,6 +2852,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "shot_uuid": identity["shot_uuid"],
             },
             available_catalog,
+            self._hmb_generation_preview_state,
         )
         try:
             current = self.get_parameter_value(SEEDANCE_SHOT_WIDGET_PARAMETER)
@@ -2556,7 +2863,19 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return
         self._hmb_shot_syncing = True
         try:
-            self._set_shot_value(SEEDANCE_SHOT_WIDGET_PARAMETER, next_value)
+            self._set_shot_value(
+                SEEDANCE_SHOT_WIDGET_PARAMETER,
+                next_value,
+                emit_change=emit_change,
+            )
+            if emit_change:
+                # Runtime progress uses the same paired lifecycle/value update
+                # contract as Griptape's execution status component.  The
+                # custom widget therefore receives the new value immediately
+                # without waiting for node completion.
+                publisher = getattr(self, "publish_update_to_parameter", None)
+                if callable(publisher):
+                    publisher(SEEDANCE_SHOT_WIDGET_PARAMETER, next_value)
         finally:
             self._hmb_shot_syncing = False
 
@@ -2873,7 +3192,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         workflows and to prevent an unknown model from silently becoming Full.
         """
 
+        previous_model_id = ""
         if param_name == "model_id":
+            previous_model_raw = str(
+                self.get_parameter_value("model_id") or MODEL_NAME_SEEDANCE_2_0
+            ).strip()
+            previous_model_id = MODEL_ID_ALIASES.get(
+                previous_model_raw,
+                previous_model_raw,
+            )
             raw_model = str(value or "").strip()
             if raw_model in RETIRED_SEEDANCE_MODEL_VALUES:
                 self._hmb_retired_model_migration_pending = True
@@ -2884,10 +3211,27 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 )
             else:
                 value = MODEL_DISPLAY_NAME_BY_ID[MODEL_ID_ALIASES[raw_model]]
+        elif param_name == "duration":
+            # Griptape's Options converter reads ``simple_dropdown`` as the
+            # accepted value set. Use the 2.5 superset while storing the raw
+            # value so duration=16..30 survives serialized hydration and a
+            # connected duration value that arrives before its paired model.
+            # Runtime delivery narrows the UI immediately; duration-first
+            # hydration narrows when its serialized model value arrives.
+            duration_parameter = self.get_parameter_by_name("duration")
+            if duration_parameter is not None:
+                duration_parameter.ui_options = {
+                    **duration_parameter.ui_options,
+                    "simple_dropdown": list(
+                        DURATION_STORAGE_CHOICES
+                    ),
+                }
         parent = super().set_parameter_value
         prompt_initial_setup = param_name == "prompt" and initial_setup
         if prompt_initial_setup:
             self._hmb_prompt_initial_setup_active = True
+        if param_name == "model_id" and not initial_setup:
+            self._hmb_model_switch_previous_id = previous_model_id
         try:
             parent(
                 param_name,
@@ -2899,25 +3243,48 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         finally:
             if prompt_initial_setup:
                 self._hmb_prompt_initial_setup_active = False
+            if param_name == "model_id" and not initial_setup:
+                with suppress(AttributeError):
+                    del self._hmb_model_switch_previous_id
+        if param_name == "resolution" and initial_setup:
+            self._hmb_resolution_initial_setup_seen = True
+        if param_name == "duration" and not initial_setup:
+            duration_parameter = self.get_parameter_by_name("duration")
+            raw_model = str(
+                self.get_parameter_value("model_id") or MODEL_NAME_SEEDANCE_2_0
+            ).strip()
+            current_model_id = MODEL_ID_ALIASES.get(raw_model, raw_model)
+            current_choices = MODEL_DURATION_CHOICES.get(current_model_id)
+            if duration_parameter is not None and current_choices is not None:
+                duration_parameter.ui_options = {
+                    **duration_parameter.ui_options,
+                    "simple_dropdown": list(current_choices),
+                }
         if (
             param_name == "model_id"
             and initial_setup
-            and self._hmb_retired_model_migration_pending
             and self.get_parameter_by_name("resolution") is not None
         ):
-            resolution_parameter = self.get_parameter_by_name("resolution")
-            resolution_parameter.ui_options = {
-                **resolution_parameter.ui_options,
-                "simple_dropdown": list(MODEL_RESOLUTIONS[SEEDANCE_2_0_MODEL_ID]),
-            }
-            parent(
-                "resolution",
-                MODEL_DEFAULT_RESOLUTIONS[SEEDANCE_2_0_MODEL_ID],
-                initial_setup=True,
-                emit_change=False,
-                skip_before_value_set=False,
+            # ``initial_setup`` deliberately bypasses the ordinary after-value
+            # callback, so synchronize the dependent controls explicitly.
+            self._hmb_model_initial_setup_seen = True
+            inherited_constructor_default = not bool(
+                getattr(self, "_hmb_resolution_initial_setup_seen", False)
             )
-            self._hmb_retired_model_migration_pending = False
+            if inherited_constructor_default:
+                self._hmb_model_switch_previous_id = previous_model_id
+            try:
+                self._synchronize_model_resolution()
+            finally:
+                if inherited_constructor_default:
+                    with suppress(AttributeError):
+                        del self._hmb_model_switch_previous_id
+        elif param_name == "duration" and initial_setup:
+            if bool(getattr(self, "_hmb_model_initial_setup_seen", False)):
+                # Model-first hydration can finalize immediately. Duration-
+                # first hydration remains in the permissive union until its
+                # serialized model arrives and performs this same sync.
+                self._synchronize_model_resolution()
         if initial_setup and param_name in {
             SHOT_CHANNEL_UUID_PARAMETER,
             SHOT_UUID_PARAMETER,
@@ -2954,12 +3321,62 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 # canonical model value itself has been stored.
                 normalized = MODEL_NAME_SEEDANCE_2_0
         elif parameter.name == SEEDANCE_SHOT_WIDGET_PARAMETER:
-            requested_shot = value.get("shot") if isinstance(value, dict) else None
+            request = value.get("request") if isinstance(value, dict) else None
+            action_only = bool(
+                isinstance(request, dict)
+                and set(request) == {"action"}
+                and request.get("action") == "refresh_existing"
+            )
+            if action_only:
+                self._hmb_generation_action_only_update = True
+                preview = _seedance_generation_preview_value(
+                    self._hmb_generation_preview_state
+                )
+                authoritative_id = str(
+                    self.parameter_output_values.get("generation_id") or ""
+                ).strip()
+                self._hmb_pending_generation_action = bool(
+                    preview["action"] == "refresh_existing"
+                    and authoritative_id
+                    and preview["job_id"] == authoritative_id
+                )
+                identity = self._shot_identity()
+                requested_shot = {
+                    "channel_uuid": identity["channel_uuid"],
+                    "shot_uuid": identity["shot_uuid"],
+                }
+                current_widget = self.get_parameter_value(
+                    SEEDANCE_SHOT_WIDGET_PARAMETER
+                )
+                stored_catalog = (
+                    current_widget.get("shot_catalog")
+                    if isinstance(current_widget, dict)
+                    else None
+                )
+                normalized_stored_catalog = _seedance_widget_catalog(stored_catalog)
+                stored_has_current_shot = bool(
+                    normalized_stored_catalog
+                    and any(
+                        item.get("shot_uuid") == identity["shot_uuid"]
+                        for item in normalized_stored_catalog["shots"]
+                    )
+                )
+                authoritative_catalog = (
+                    normalized_stored_catalog
+                    if stored_has_current_shot
+                    else self._hmb_available_seedance_shot_catalog(
+                        self._hmb_shot_catalog_snapshot
+                    )
+                )
+            else:
+                requested_shot = value.get("shot") if isinstance(value, dict) else None
+                authoritative_catalog = self._hmb_available_seedance_shot_catalog(
+                    self._hmb_shot_catalog_snapshot
+                )
             normalized = _seedance_widget_value(
                 requested_shot,
-                self._hmb_available_seedance_shot_catalog(
-                    self._hmb_shot_catalog_snapshot
-                ),
+                authoritative_catalog,
+                self._hmb_generation_preview_state,
             )
         parent = getattr(super(), "before_value_set", None)
         if callable(parent):
@@ -2994,7 +3411,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "local_video_upload_service",
         }:
             self._update_parameter_visibility()
-        if not self._hmb_shot_syncing and parameter.name == SEEDANCE_SHOT_WIDGET_PARAMETER:
+        if (
+            not self._hmb_shot_syncing
+            and not self._hmb_generation_action_only_update
+            and parameter.name == SEEDANCE_SHOT_WIDGET_PARAMETER
+        ):
             if not self._hmb_autoclaim_in_progress:
                 self._set_remote_prompt_control_value(
                     SHOT_AUTOCLAIM_ENABLED_PARAMETER,
@@ -3029,11 +3450,23 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             SHOT_NAME_PARAMETER,
         }:
             self._reconcile_shared_shot_routing()
-        return super().after_value_set(parameter, value)
+        result = super().after_value_set(parameter, value)
+        if parameter.name == SEEDANCE_SHOT_WIDGET_PARAMETER:
+            action_requested = self._hmb_pending_generation_action
+            self._hmb_pending_generation_action = False
+            self._hmb_generation_action_only_update = False
+            if action_requested:
+                self._request_existing_generation_refresh()
+        return result
 
     def _restore_seedance_shot_route(self) -> None:
         """Re-arm routing only after serialized prompt/Shot state is hydrated."""
 
+        # Complete model-dependent dropdown narrowing after every serialized
+        # field has replayed. This makes model-first and duration-first loading
+        # equivalent and repairs invalid cross-model values deterministically.
+        with suppress(Exception):
+            self._synchronize_model_resolution()
         if self.get_parameter_value(SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER) is True:
             self._clear_remote_prompt_authority("manual_prompt_authority")
         elif self.get_parameter_value(SHOT_LOCAL_PROMPT_CAPTURED_PARAMETER) is not True:
@@ -3265,7 +3698,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
 
     def _synchronize_model_resolution(self) -> str:
-        """Apply the selected Volcengine model's exact resolution contract."""
+        """Apply the selected Volcengine model's generation contract."""
         raw_model = self.get_parameter_value("model_id") or MODEL_NAME_SEEDANCE_2_0
         raw_model_text = str(raw_model).strip()
         model_id = MODEL_ID_ALIASES.get(raw_model_text, raw_model_text)
@@ -3296,10 +3729,42 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 }
 
         current = str(self.get_parameter_value("resolution") or "")
-        if migrated_retired_model or current not in supported:
+        previous_model_id = str(
+            getattr(self, "_hmb_model_switch_previous_id", "") or ""
+        )
+        inherited_previous_default = bool(
+            previous_model_id
+            and previous_model_id != model_id
+            and current == MODEL_DEFAULT_RESOLUTIONS.get(previous_model_id)
+        )
+        if (
+            migrated_retired_model
+            or current not in supported
+            or inherited_previous_default
+        ):
             self.set_parameter_value(
                 "resolution", MODEL_DEFAULT_RESOLUTIONS[model_id]
             )
+
+        duration_choices = MODEL_DURATION_CHOICES[model_id]
+        duration_parameter = self.get_parameter_by_name("duration")
+        if duration_parameter is not None:
+            visible_duration_choices = list(duration_choices)
+            if (
+                duration_parameter.ui_options.get("simple_dropdown")
+                != visible_duration_choices
+            ):
+                duration_parameter.ui_options = {
+                    **duration_parameter.ui_options,
+                    "simple_dropdown": visible_duration_choices,
+                }
+            current_duration = self.get_parameter_value("duration")
+            if (
+                not isinstance(current_duration, int)
+                or isinstance(current_duration, bool)
+                or current_duration not in duration_choices
+            ):
+                self.set_parameter_value("duration", 5)
         if migrated_retired_model:
             self._hmb_retired_model_migration_pending = False
         return model_id
@@ -3758,7 +4223,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             resolved["reference_images"] = []
             resolved["video_references"] = []
             resolved["video_reference_slots"] = []
-            resolved["input_mode"] = INPUT_MODE_TEXT_ONLY
+            resolved["input_mode"] = (
+                INPUT_MODE_MULTIMODAL_REFERENCES
+                if params.get("reference_audio")
+                else INPUT_MODE_TEXT_ONLY
+            )
             return resolved
 
         image_node = self._exact_incoming_source(
@@ -3771,7 +4240,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "SHOT_PICKER_OUT",
             required=False,
         )
-        if image_node is None and picker_node is None:
+        model_id = str(params.get("model_id") or "")
+        audio_references = list(params.get("reference_audio") or [])
+        audio_only_allowed = bool(
+            model_id == SEEDANCE_2_5_MODEL_ID and audio_references
+        )
+        if image_node is None and picker_node is None and not audio_only_allowed:
             raise RuntimeError("Seedance selected Shot has no direct media source.")
         if image_node is not None and image_node is picker_node:
             raise RuntimeError("Seedance ImageAsset and VideoPicker sources must be distinct.")
@@ -3833,15 +4307,20 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 images = selected_media
             else:
                 videos = selected_media
-        if len(images) > MAX_REFERENCE_IMAGES:
+        image_limit, video_limit, _audio_limit = MODEL_REFERENCE_LIMITS.get(
+            model_id,
+            MODEL_REFERENCE_LIMITS[SEEDANCE_2_0_MODEL_ID],
+        )
+        model_name = MODEL_DISPLAY_NAME_BY_ID.get(model_id, "Seedance")
+        if len(images) > image_limit:
             raise ValueError(
-                f"Selected Shot contains {len(images)} images; Seedance accepts at most "
-                f"{MAX_REFERENCE_IMAGES}. No request was submitted."
+                f"Selected Shot contains {len(images)} images; {model_name} accepts "
+                f"at most {image_limit}. No request was submitted."
             )
-        if len(videos) > MAX_VIDEO_REFERENCES:
+        if len(videos) > video_limit:
             raise ValueError(
-                f"Selected Shot contains {len(videos)} videos; Seedance accepts at most "
-                f"{MAX_VIDEO_REFERENCES}. No request was submitted."
+                f"Selected Shot contains {len(videos)} videos; {model_name} accepts "
+                f"at most {video_limit}. No request was submitted."
             )
 
         # The public prompt input remains manual.  When its exact source is an
@@ -3924,7 +4403,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         resolved["video_reference_slots"] = []
         resolved["input_mode"] = (
             INPUT_MODE_MULTIMODAL_REFERENCES
-            if (images or videos)
+            if (images or videos or audio_references)
             else INPUT_MODE_TEXT_ONLY
         )
         return resolved
@@ -3933,7 +4412,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         model_id = self._synchronize_model_resolution()
         legacy_video_slots = [
             self.get_parameter_value(f"reference_video_{index}")
-            for index in range(1, MAX_VIDEO_REFERENCES + 1)
+            for index in range(1, LEGACY_VIDEO_REFERENCE_SLOTS + 1)
         ]
         ordered_video_references = self._get_list_input(VIDEO_REFERENCES_PARAMETER)
         if ordered_video_references:
@@ -4043,6 +4522,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         model_id = params["model_id"]
         if model_id not in MODEL_RESOLUTIONS:
             raise ValueError(f"Unsupported Volcengine Seedance model: {model_id!r}.")
+        model_name = MODEL_DISPLAY_NAME_BY_ID[model_id]
 
         resolution = params["resolution"]
         supported_resolutions = MODEL_RESOLUTIONS[model_id]
@@ -4059,20 +4539,26 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         duration = params["duration"]
         if not isinstance(duration, int) or isinstance(duration, bool):
             raise ValueError("Duration must be an integer.")
-        if duration != -1 and not 4 <= duration <= 15:
-            raise ValueError("Duration must be -1 or an integer from 4 through 15.")
+        duration_choices = MODEL_DURATION_CHOICES[model_id]
+        if duration not in duration_choices:
+            maximum_duration = max(duration_choices)
+            raise ValueError(
+                f"{model_name} duration must be -1 or an integer from 4 through "
+                f"{maximum_duration}."
+            )
 
         images = params["reference_images"]
         videos = params["video_references"]
         audio = params["reference_audio"]
-        if len(images) > MAX_REFERENCE_IMAGES:
+        image_limit, video_limit, audio_limit = MODEL_REFERENCE_LIMITS[model_id]
+        if len(images) > image_limit:
             raise ValueError(
-                f"Seedance 2.0 accepts at most {MAX_REFERENCE_IMAGES} reference images; "
+                f"{model_name} accepts at most {image_limit} reference images; "
                 f"received {len(images)}."
             )
-        if len(videos) > MAX_VIDEO_REFERENCES:
+        if len(videos) > video_limit:
             raise ValueError(
-                f"Seedance 2.0 accepts at most {MAX_VIDEO_REFERENCES} reference videos; "
+                f"{model_name} accepts at most {video_limit} reference videos; "
                 f"received {len(videos)}. No references were discarded."
             )
         video_slots = params.get("video_reference_slots") or []
@@ -4090,9 +4576,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 raise ValueError(
                     "reference_video_3 requires reference_video_2 to be connected first."
                 )
-        if len(audio) > MAX_REFERENCE_AUDIO:
+        if len(audio) > audio_limit:
             raise ValueError(
-                f"Seedance 2.0 accepts at most {MAX_REFERENCE_AUDIO} reference audio files; "
+                f"{model_name} accepts at most {audio_limit} reference audio files; "
                 f"received {len(audio)}."
             )
 
@@ -4109,6 +4595,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 raise ValueError(
                     "First/Last Frame mode does not accept multimodal reference lists."
                 )
+            if model_id == SEEDANCE_2_5_MODEL_ID and params["ratio"] != "adaptive":
+                raise ValueError(
+                    "Seedance 2.5 First/Last Frame mode requires adaptive ratio."
+                )
             if params["last_frame"] and not params["first_frame"]:
                 raise ValueError("Last Frame requires First Frame to be connected first.")
             if not has_frames and not params["prompt"].strip():
@@ -4120,7 +4610,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 raise ValueError(
                     "Multimodal References mode does not accept first_frame/last_frame."
                 )
-            if audio and not (images or videos):
+            if (
+                model_id != SEEDANCE_2_5_MODEL_ID
+                and audio
+                and not (images or videos)
+            ):
                 raise ValueError(
                     "Reference audio requires at least one reference image or video."
                 )
@@ -4144,15 +4638,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if model_id != SEEDANCE_2_0_MODEL_ID and priority != 0:
             raise ValueError(
                 "priority is supported only by the full Seedance 2.0 model. "
-                "Use priority 0 for Fast."
+                "Use priority 0 for Fast or Seedance 2.5."
             )
 
     @staticmethod
     def _validate_broker_model(model_id: Any) -> None:
         if model_id not in BROKER_SUPPORTED_MODEL_IDS:
             raise ValueError(
-                "FN AI Broker supports only the active Volcengine Seedance 2.0 "
-                "and Seedance 2.0 Fast model IDs."
+                "FN AI Broker supports only the active Volcengine Seedance 2.0, "
+                "Seedance 2.0 Fast, and Seedance 2.5 model IDs."
             )
 
     def _get_parameters_for_start_validation(self) -> dict[str, Any]:
@@ -4872,6 +5366,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         *,
         generation_id: str,
         status: str,
+        preview_action: str = "none",
     ) -> None:
         if getattr(self, "_hmb_node_deleted", False):
             return
@@ -4892,6 +5387,27 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if name in task:
                 provider_response[name] = task[name]
         self.parameter_output_values["provider_response"] = provider_response
+        self._publish_generation_preview(
+            self._generation_preview_phase_for_status(status),
+            generation_id=generation_id,
+            action=preview_action,
+        )
+
+    def _set_generation_status(
+        self,
+        status: str,
+        *,
+        generation_id: str | None = None,
+        preview_action: str = "none",
+    ) -> None:
+        if getattr(self, "_hmb_node_deleted", False):
+            return
+        self.parameter_output_values["generation_status"] = status
+        self._publish_generation_preview(
+            self._generation_preview_phase_for_status(status),
+            generation_id=generation_id,
+            action=preview_action,
+        )
 
     async def _download_broker_video(self, url: str) -> bytes:
         bridge = self._get_broker_bridge()
@@ -5103,12 +5619,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     def _set_safe_defaults(self) -> None:
         if getattr(self, "_hmb_node_deleted", False):
             return
+        previous_video = self._capture_last_success_video()
         self.parameter_output_values["generation_id"] = ""
         self.parameter_output_values["generation_status"] = ""
         self.parameter_output_values["provider_response"] = None
-        self.parameter_output_values["video_url"] = None
-        self.parameter_output_values["VIDEO_OUT"] = None
-        self.parameter_output_values["last_frame_url"] = ""
+        self.parameter_output_values["video_url"] = previous_video
+        self.parameter_output_values["VIDEO_OUT"] = previous_video
+        self.parameter_output_values["last_frame_url"] = (
+            self._hmb_last_success_last_frame_url if previous_video is not None else ""
+        )
 
     @staticmethod
     def _validate_task_id(value: Any) -> str:
@@ -5353,6 +5872,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     {"id": generation_id, "status": "submission_unknown"},
                     generation_id=generation_id,
                     status="submission_unknown",
+                    preview_action="refresh_existing",
                 )
             self._detached_submission_tasks.add(operation)
 
@@ -5497,9 +6017,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise RuntimeError(
                 "FN AI Broker task succeeded but the video URL was missing."
             )
+        self._publish_generation_preview(
+            "downloading",
+            generation_id=generation_id,
+        )
         video_bytes = await self._download_broker_video(video_download_url)
         if not self._runtime_node_is_live(require_registered=True):
             return
+        self._publish_generation_preview(
+            "verifying",
+            generation_id=generation_id,
+        )
         saved = await self._atomic_publish_completed_mp4(
             destination,
             video_bytes,
@@ -5514,6 +6042,16 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self.parameter_output_values["video_url"] = artifact
         self.parameter_output_values["VIDEO_OUT"] = artifact
         self.parameter_output_values["last_frame_url"] = last_frame_url
+        self._hmb_last_success_video = artifact
+        self._hmb_last_success_last_frame_url = last_frame_url
+        self._hmb_generation_media_revision = min(
+            2_147_483_647,
+            self._hmb_generation_media_revision + 1,
+        )
+        self._publish_generation_preview(
+            "succeeded",
+            generation_id=generation_id,
+        )
         if not self._runtime_node_is_live(require_registered=True):
             return
         self._set_status_results(
@@ -5527,6 +6065,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     async def _refresh_async(self) -> None:
         """Refresh one Broker job without ever creating a replacement task."""
         if not self._runtime_node_is_live(require_registered=True):
+            return
+        # A running generation already owns automatic polling.  Mixing a
+        # manual refresh into it can race output publication even though both
+        # operations target the same server job.
+        if self._generation_run_active.is_set():
             return
         generation_id = ""
         try:
@@ -5546,47 +6089,28 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     ),
                 )
                 return
+            if self._hmb_generation_started_monotonic is None:
+                self._hmb_generation_started_monotonic = self._monotonic()
+                self._hmb_generation_started_at_ms = int(time.time() * 1000)
+            generation_id = self._validate_task_id(generation_id)
+            self._publish_generation_preview(
+                "retrieving",
+                generation_id=generation_id,
+                action="none",
+            )
             bridge = await self._ensure_broker_connected()
             if not self._runtime_node_is_live(require_registered=True):
                 return
-            generation_id = self._validate_task_id(generation_id)
-            try:
-                response = await asyncio.to_thread(
-                    bridge.refresh_job,
-                    generation_id,
-                    timeout=60,
-                )
-                if not self._runtime_node_is_live(require_registered=True):
-                    return
-            except _BrokerError as exc:
-                retry_payload = self._last_broker_payload
-                retry_same_request = (
-                    exc.status_code == 404
-                    and self.parameter_output_values.get("generation_status")
-                    == "submission_unknown"
-                    and isinstance(retry_payload, dict)
-                    and retry_payload.get("client_request_id") == generation_id
-                )
-                if not retry_same_request:
-                    raise
-                self._set_broker_task_outputs(
-                    {"id": generation_id, "status": "retrying_same_request"},
-                    generation_id=generation_id,
-                    status="retrying_same_request",
-                )
-                try:
-                    response = await asyncio.to_thread(
-                        bridge.generate_seedance,
-                        dict(retry_payload),
-                        timeout=60,
-                    )
-                    if not self._runtime_node_is_live(require_registered=True):
-                        return
-                except _BrokerError:
-                    self.parameter_output_values["generation_status"] = (
-                        "submission_unknown"
-                    )
-                    raise
+            # Refresh retrieves status for this authoritative job only.  In
+            # particular, an uncertain submission never replays
+            # generate_seedance (the create-task request) here.
+            response = await asyncio.to_thread(
+                bridge.refresh_job,
+                generation_id,
+                timeout=60,
+            )
+            if not self._runtime_node_is_live(require_registered=True):
+                return
             task = self._normalize_broker_task(
                 response,
                 fallback_job_id=generation_id,
@@ -5598,6 +6122,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 task,
                 generation_id=generation_id,
                 status=status,
+                preview_action=(
+                    "refresh_existing"
+                    if status in {"queued", "running"}
+                    else "none"
+                ),
             )
             if status == "succeeded":
                 destination = self._output_file.build_file()
@@ -5650,6 +6179,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "restart, or duplicate this known terminal job. Details: "
                     + safe_detail
                 )
+                preview_action = "none"
             else:
                 detail = (
                     "The Broker connection is currently unavailable, but the existing "
@@ -5658,6 +6188,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "Details: "
                     + safe_detail
                 )
+                preview_action = "refresh_existing" if generation_id else "none"
+            self._publish_generation_preview(
+                "failed",
+                generation_id=generation_id,
+                action=preview_action,
+            )
             self._set_status_results(
                 was_successful=False,
                 result_details=detail,
@@ -5665,6 +6201,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     def _on_refresh_clicked(self, _button: Any, _details: Any) -> None:
         if not self._runtime_node_is_live(require_registered=True):
+            return
+        if self._generation_run_active.is_set():
             return
         with self._generation_refresh_lock:
             if self._generation_refresh_running:
@@ -5751,7 +6289,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if not self._runtime_node_is_live(require_registered=True):
             return
         self._set_safe_defaults()
-        self.parameter_output_values["generation_status"] = "resolving_inputs"
+        self._begin_generation_preview()
+        self._set_generation_status("resolving_inputs", generation_id="")
         params = self._get_parameters()
         if not params["resume_generation_id"]:
             # Resolve and validate the selected ImageAsset/VideoPicker Shot
@@ -5763,7 +6302,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         decode_verifier: _MP4DecodeVerifier | None = None
 
         # Resolve the save target before the billable Broker POST.
-        self.parameter_output_values["generation_status"] = "preparing_output"
+        self._set_generation_status("preparing_output", generation_id="")
         destination = self._output_file.build_file()
         self._preflight_output_destination(destination)
         if not resume_generation_id:
@@ -5782,7 +6321,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 decode_verifier.backend,
             )
         # The Broker generation request is the sole usage/quota/accounting authority.
-        self.parameter_output_values["generation_status"] = "connecting_broker"
+        self._set_generation_status("connecting_broker", generation_id="")
         bridge = await self._ensure_broker_connected()
         if not self._runtime_node_is_live(require_registered=True):
             return
@@ -5806,7 +6345,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         else:
             if not self._runtime_node_is_live(require_registered=True):
                 return
-            self.parameter_output_values["generation_status"] = "preparing_media"
+            self._set_generation_status("preparing_media", generation_id="")
             params = await self._run_blocking_generation_stage(
                 self._prepare_video_references_for_run,
                 params,
@@ -5819,7 +6358,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
             client_request_id = "hmb-" + uuid4().hex
             payload["client_request_id"] = client_request_id
-            self._last_broker_payload = dict(payload)
             if not self._runtime_node_is_live(require_registered=True):
                 return
             self._set_broker_task_outputs(
@@ -5840,8 +6378,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     if not self._runtime_node_is_live(require_registered=True):
                         return
                     self._submission_outcome_unknown = True
-                    self.parameter_output_values["generation_status"] = (
-                        "submission_unknown"
+                    self._set_generation_status(
+                        "submission_unknown",
+                        generation_id=client_request_id,
+                        preview_action="refresh_existing",
                     )
                     self.parameter_output_values["provider_response"] = {
                         "transport": "fn_ai_broker",
@@ -5877,7 +6417,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if submission_cancelled:
                 if not self._runtime_node_is_live(require_registered=True):
                     return
-                self.parameter_output_values["generation_status"] = "cancelled_locally"
+                self._set_generation_status(
+                    "cancelled_locally",
+                    generation_id=generation_id,
+                    preview_action="refresh_existing",
+                )
                 raise asyncio.CancelledError(
                     "Local cancellation arrived during submission. The FN AI Broker "
                     f"task ID was recovered as {generation_id}; use Refresh / Retrieve "
@@ -5890,7 +6434,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if self.is_cancellation_requested:
                 if not self._runtime_node_is_live(require_registered=True):
                     return
-                self.parameter_output_values["generation_status"] = "cancelled_locally"
+                self._set_generation_status(
+                    "cancelled_locally",
+                    generation_id=generation_id,
+                    preview_action="refresh_existing",
+                )
                 raise asyncio.CancelledError(
                     "Local Broker polling stopped, but the server render continues. "
                     "Use Refresh / Retrieve Result for this same task."
@@ -5899,7 +6447,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if now >= deadline:
                 if not self._runtime_node_is_live(require_registered=True):
                     return
-                self.parameter_output_values["generation_status"] = "timed_out"
+                self._set_generation_status(
+                    "timed_out",
+                    generation_id=generation_id,
+                    preview_action="refresh_existing",
+                )
                 raise TimeoutError(
                     f"FN AI Broker task {generation_id} did not finish within "
                     f"{timeout} seconds. The server render continues; use Refresh / "
@@ -5977,6 +6529,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             generation_id = str(
                 self.parameter_output_values.get("generation_id") or ""
             ).strip()
+            current_status = str(
+                self.parameter_output_values.get("generation_status") or ""
+            ).strip().lower()
+            if generation_id and current_status != "submission_unknown":
+                self._set_generation_status(
+                    "cancelled_locally",
+                    generation_id=generation_id,
+                    preview_action="refresh_existing",
+                )
+            elif not generation_id:
+                self._publish_generation_preview("failed", generation_id="")
             resume_guidance = (
                 f" Use Refresh / Retrieve Result for the same task {generation_id}; "
                 "it never starts a replacement render."
@@ -6031,13 +6594,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if submission_unknown:
                 if not self._runtime_node_is_live(require_registered=True):
                     return
-                self.parameter_output_values["generation_status"] = (
-                    "submission_unknown"
+                self._set_generation_status(
+                    "submission_unknown",
+                    generation_id=generation_id,
+                    preview_action="refresh_existing",
                 )
                 safe_message += (
-                    "\nRefresh / Retrieve Result will use the same client request ID. "
-                    "If the server never received the first POST, it repeats the exact "
-                    "request with that same idempotency key, never a new key."
+                    "\nRefresh / Retrieve Result checks the same client request ID "
+                    "only. It never repeats the create-task request or creates a new "
+                    "idempotency key."
                     "\nTemporary local video uploads are being retained for up to "
                     "30 minutes so an accepted remote task can still fetch them."
                 )
@@ -6047,7 +6612,20 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             ):
                 if not self._runtime_node_is_live(require_registered=True):
                     return
-                self.parameter_output_values["generation_status"] = "failed"
+                self._set_generation_status(
+                    "failed",
+                    generation_id=generation_id,
+                )
+            else:
+                self._publish_generation_preview(
+                    "failed",
+                    generation_id=generation_id,
+                    action=(
+                        "refresh_existing"
+                        if generation_id and not terminal
+                        else "none"
+                    ),
+                )
             if not self._runtime_node_is_live(require_registered=True):
                 return
             self._set_status_results(
@@ -6065,8 +6643,17 @@ __all__ = [
     "HMBSeedanceGeneration",
     "LOCAL_VIDEO_UPLOAD_GRIPTAPE",
     "LOCAL_VIDEO_UPLOAD_TOS",
+    "MODEL_NAME_SEEDANCE_2_5",
+    "SEEDANCE_2_5_MODEL_ID",
+    "MODEL_DURATION_CHOICES",
+    "DURATION_STORAGE_CHOICES",
+    "MODEL_REFERENCE_LIMITS",
     "MAX_REFERENCE_IMAGES",
     "MAX_VIDEO_REFERENCES",
     "MAX_REFERENCE_AUDIO",
+    "LEGACY_VIDEO_REFERENCE_SLOTS",
     "VIDEO_REFERENCES_PARAMETER",
+    "GENERATION_PREVIEW_SCHEMA",
+    "GENERATION_PREVIEW_VERSION",
+    "GENERATION_PREVIEW_PHASES",
 ]

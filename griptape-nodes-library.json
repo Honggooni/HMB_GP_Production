@@ -4,14 +4,12 @@
   "metadata": {
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.6.42",
+    "library_version": "0.6.43",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
-      "archive_source_count": 31,
+      "archive_source_count": 29,
       "mode": "authenticated_broker_session",
-      "bootstrap_marker": "HMB_AGENT_POLICY_PROCESS_BOOTSTRAP=1",
       "broker_endpoint": "https://192.168.203.245:8443/api/v1/agent-core/dat",
-      "launcher_path": "HMB_Agent_Griptape.bat",
       "public_ca_path": "resources/tls/hmb_agent_broker_ca.pem",
       "verification": "pinned_tls_dpapi_bearer_rsa3072_sha256_v3_contract_once_per_process"
     },
@@ -261,7 +259,9 @@
           "HMB",
           "ordered-image-list",
           "single-wire-video-input",
-          "video-reference-capacity-3",
+          "model-specific-reference-capacity",
+          "video-reference-capacity-10",
+          "seedance-2-5",
           "audio-default-off",
           "volcengine-ark",
           "fn-ai-broker",

@@ -15,8 +15,8 @@ POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
 POLICY_CONTRACT_SHA256 = (
     "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
 )
-RELEASE_LABEL = "v0.6.42"
-RELEASE_VERSION = "0.6.42"
+RELEASE_LABEL = "v0.6.43"
+RELEASE_VERSION = "0.6.43"
 EXPECTED_SOURCE_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
@@ -34,7 +34,6 @@ EXPECTED_SOURCE_FILES = (
     "_hmb_agent_session.py",
     "_hmb_shot_routing.py",
     "_hmb_mp4_verify.py",
-    "HMB_Agent_Griptape.bat",
     "Install_HMB_GP_Production.ps1",
     "_hmb_common.py",
     "_hmb_screen_space.py",
@@ -45,7 +44,6 @@ EXPECTED_SOURCE_FILES = (
     "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
     "widgets/HMBVideoPickerLibraryWidget_v032.js",
     "resources/maya/HMB_Maya_Background_Preview.py",
-    "resources/maya/HMB_Maya_Binding_Setup.py",
     "resources/maya/HMBVideoPicker_Maya_Guide.txt",
     "resources/picker/HMB_Marker_Catalog.json",
     "resources/tls/hmb_agent_broker_ca.pem",
@@ -141,10 +139,10 @@ builder = load_module(
 )
 
 assert tuple(builder.SOURCE_FILES) == EXPECTED_SOURCE_FILES
-assert len(EXPECTED_SOURCE_FILES) == 31
+assert len(EXPECTED_SOURCE_FILES) == 29
 assert builder.RELEASE_LABEL == RELEASE_LABEL
 assert builder.RELEASE_VERSION == RELEASE_VERSION
-assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.6.42_Runtime.zip"
+assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.6.43_Runtime.zip"
 assert builder.POLICY_VERSION == POLICY_VERSION
 assert builder.POLICY_CONTRACT_SHA256 == POLICY_CONTRACT_SHA256
 assert builder.POLICY_DELIVERY == "server-only"
@@ -159,6 +157,10 @@ changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 registered_secrets = manifest["settings"][0]["contents"]["secrets_to_register"]
 assert set(registered_secrets) == EXPECTED_SECRET_NAMES
 assert all(value == "" for value in registered_secrets.values())
+delivery = manifest["metadata"]["agent_policy_delivery"]
+assert delivery["archive_source_count"] == len(EXPECTED_SOURCE_FILES)
+assert "launcher_path" not in delivery
+assert "bootstrap_marker" not in delivery
 assert sbom["name"] == f"HMB_GP_Production-{RELEASE_VERSION}"
 assert sbom["documentNamespace"].endswith(f"/{RELEASE_VERSION}")
 assert next(
