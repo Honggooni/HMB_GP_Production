@@ -1148,7 +1148,7 @@ assert.match(videoSource, /const action = processPid > 0 \? "stop_read" : "cance
 assert.match(videoSource, /Pending operation cancelled before an external process PID existed\./);
 
 assert.match(videoSource, /const HMB_DEFAULT_NODE_WIDTH = 1400;/, "Picker must start at the requested 1400px width.");
-assert.match(videoSource, /const HMB_DEFAULT_NODE_HEIGHT = 1200;/, "Picker must start at the requested 1200px height.");
+assert.match(videoSource, /const HMB_DEFAULT_NODE_HEIGHT = 1200;/, "Picker must retain the 1200px expanded default height.");
 assert.match(videoSource, /const HMB_MIN_NODE_HEIGHT = 1151;/, "Picker must preserve the established manual-resize floor.");
 assert.doesNotMatch(videoSource, /class="step-nav"|\.step-nav\{|\.step\.active\{|1&nbsp;/);
 assert.match(videoSource, /\.app-header\{height:68px;display:flex;align-items:center;justify-content:space-between/);
@@ -1395,7 +1395,8 @@ for (const source of [videoSource, promptSource]) {
 }
 assert.match(videoSource, /class="hmbvp-clip nodrag"/);
 assert.match(promptSource, /class="hmb-dashboard-clip nodrag"/);
-assert.match(videoSource, /hmbRememberVideoPickerViewMode\(container, storedViewMode !== false\)/);
+assert.match(videoSource, /hmbRememberVideoPickerViewMode\(container, storedViewMode === true\)/);
+assert.match(videoSource, /export function hmbBindVideoPickerRuntimeIdentity\(/);
 assert.doesNotMatch(videoSource, /<dialog\b|\.showModal\s*\(/);
 assert.match(videoSource, /const desiredPickerExpanded = container\.__hmbVideoPickerExpanded === true;/);
 assert.match(videoSource, /const pickerExpanded = true;/);
@@ -1409,7 +1410,11 @@ assert.match(videoSource, /export function hmbRequestVideoPickerNodeInternalsUpd
 assert.match(videoSource, /export function hmbScheduleVideoPickerNodeInternalsUpdate\([\s\S]*?\) \{\s*container\?\.removeAttribute\?\.\("data-hmb-video-picker-node-internals-pending"\);\s*return false;/);
 assert.match(videoSource, /let resizeApplying = false;/);
 assert.match(videoSource, /let pointerInteractionActive = false;/);
-assert.doesNotMatch(videoSource, /let nativeNodeResizeActive = false;/);
+assert.match(
+  videoSource,
+  /let nativeNodeResizeActive = false;/,
+  "Native expanded resize completion must persist the exact expanded_node_size.",
+);
 assert.doesNotMatch(commandSource, /HMB_PICKER_BOOTSTRAP_(?:WIDTH|HEIGHT)|hmbEnsurePickerBootstrapNode/);
 assert.doesNotMatch(commandSource, /window\.setTimeout/);
 assert.match(commandSource, /export function hmbCollapseCommandBridgeLayoutRow\(container\)/);
@@ -1423,6 +1428,11 @@ assert.doesNotMatch(commandSource, /branchContainsVideoOutputs/);
 assert.match(videoSource, /VIDEO_OUT/);
 
 assert.match(videoSource, /const HMB_PICKER_CONTENT_FALLBACK_HEIGHT = 960;/);
+assert.match(
+  videoSource,
+  /const exactShell = hmbVideoPickerExactReactFlowNode\(container\);[\s\S]*?const availableHeight = exactShell[\s\S]*?Math\.ceil\(hmbPickerAvailableHeightToShell\(container, exactShell\)\)[\s\S]*?const localRequired = Math\.max\([\s\S]*?naturalRequired,[\s\S]*?availableHeight/,
+  "Expanded Picker-owned clip/root must fill the exact shell before its exact state row is propagated.",
+);
 assert.match(videoSource, /\.hmbvp-clip\{width:100%;height:100%;/);
 assert.match(videoSource, /\.hmbvp\{--safe-x:16px;position:relative;width:100%;height:100%;/);
 assert.match(videoSource, /border-radius:11px/);
@@ -1434,13 +1444,63 @@ assert.match(
   videoSource,
   /for \(const element of \[[\s\S]*?container\?\.querySelector\?\.\("\.hmbvp-clip"\)[\s\S]*?container\?\.querySelector\?\.\("\.hmbvp"\)[\s\S]*?hmbSetPickerStyleIfChanged\(element, "height", `\$\{localRequired\}px`\)/,
 );
-assert.doesNotMatch(videoSource, /layoutRow\.style\.setProperty\("flex", "1 1 0%", "important"\)/);
+assert.match(videoSource, /export function hmbApplyVideoPickerExpandedHostHeightPropagation\(/);
+assert.match(videoSource, /export function hmbRestoreVideoPickerExpandedHostHeightPropagation\(/);
+assert.match(videoSource, /export function hmbInstallVideoPickerExpandedHostReconciliation\(/);
+const exactStateRowTargetSource = videoSource.slice(
+  videoSource.indexOf("function hmbVideoPickerExactStateRowTargets"),
+  videoSource.indexOf("function hmbVideoPickerCompactTailTargets"),
+);
+assert.match(
+  exactStateRowTargetSource,
+  /HMB_PICKER_STATE/,
+  "Expanded propagation must fail closed unless the exact Editor state-row signature is present.",
+);
+assert.match(exactStateRowTargetSource, /\["flex-shrink-0", "overflow-hidden"\]/);
+assert.match(exactStateRowTargetSource, /\["min-h-0", "grow", "shrink-0", "basis-0"\]/);
+assert.match(exactStateRowTargetSource, /\["absolute", "left-0", "right-0", "pointer-events-none"\]/);
+assert.match(
+  videoSource,
+  /function hmbVideoPickerExpandedHostAppliedValues\(rowHeight, containerHeight = rowHeight\)[\s\S]*?row:[\s\S]*?flex: `0 0 \$\{rowPixels\}`[\s\S]*?spacer:[\s\S]*?flex: "0 0 0px"[\s\S]*?container:[\s\S]*?height: containerPixels[\s\S]*?flex: `0 0 \$\{containerPixels\}`[\s\S]*?"box-sizing": "border-box"/,
+  "Only the exact state row, spacer, and widget container may join expanded height propagation.",
+);
+assert.match(
+  videoSource,
+  /function hmbApplyPickerHostSizing\([\s\S]*?hmbApplyVideoPickerExpandedHostHeightPropagation\(\s*container,\s*localRequired,\s*exactShell/,
+  "Every expanded sizing pass must propagate through the exact state row.",
+);
+assert.match(
+  videoSource,
+  /function hmbPickerFitMeasurementSignature\([\s\S]*?const hostTargets = hmbVideoPickerExactStateRowTargets\(container\)[\s\S]*?dimension\(hostTargets\?\.layoutRow, "height"\)[\s\S]*?dimension\(hostTargets\?\.trailingSpacer, "height"\)[\s\S]*?hostStyleSignature/,
+  "Fit deduplication must include live state-row/spacer geometry and inline ownership values.",
+);
+assert.match(
+  videoSource,
+  /hostStyleSignature\(\s*container,\s*HMB_VIDEO_PICKER_EXPANDED_HOST_CONTAINER_PROPERTIES/,
+  "Fit deduplication must detect a late inline overwrite on the exact widget container.",
+);
+assert.match(
+  videoSource,
+  /const cleanup = \(\) => \{[\s\S]*?hmbRestoreVideoPickerExpandedHostHeightPropagation\(container\)[\s\S]*?hmbRestoreVideoPickerCompactTailReclaim\(container\)/,
+  "Factory cleanup must restore the exact state row before releasing the widget.",
+);
+assert.match(
+  videoSource,
+  /hmbInstallVideoPickerExpandedHostReconciliation\(\s*container,\s*\(\) => \{\s*applyPickerFitNow\(true\);[\s\S]*?activeCleanup,\s*\)/,
+  "The factory must retain one bounded settled post-mount reconciliation.",
+);
 assert.doesNotMatch(videoSource, /element\.style\.setProperty\("flex", `0 0 \$\{height\}px`, "important"\)/);
 assert.match(videoSource, /resizeObserver = new ResizeObserverClass\(\(\) => schedulePickerFit\(false\)\)/);
-assert.match(videoSource, /resizeObserver\.observe\(container\)/);
 assert.match(videoSource, /resizeObserver\.observe\(rightStackForResizeSync\)/);
 assert.match(videoSource, /resizeObserver\.observe\(centerStackForResizeSync\)/);
-assert.doesNotMatch(videoSource, /resizeObserver\.observe\(shell/);
+assert.doesNotMatch(
+  videoSource,
+  /resizeObserver\.observe\((?:container|shellForResizeSync|hostTargetsForResizeSync\.(?:layoutRow|trailingSpacer))\)/,
+  "Automatic fit may observe Picker-owned inner stacks only; host geometry must not feed React updates back into HMB.",
+);
+assert.match(videoSource, /export function hmbApplyVideoPickerExpandedGeometryFloor/);
+assert.match(videoSource, /const HMB_EXPANDED_NODE_MIN_WIDTH = HMB_DEFAULT_NODE_WIDTH;/);
+assert.match(videoSource, /const HMB_EXPANDED_NODE_MIN_HEIGHT = HMB_DEFAULT_NODE_HEIGHT;/);
 assert.match(videoSource, /hmbCollapseNativeMayaLayoutRows\(container, hosts\)/);
 assert.doesNotMatch(videoSource, /transition-property:height,flex-basis/);
 assert.doesNotMatch(
@@ -1449,11 +1509,8 @@ assert.doesNotMatch(
 );
 assert.match(videoSource, /trailingSpacer\.style\.setProperty\("flex", "0 0 0px", "important"\)/);
 assert.doesNotMatch(videoSource, /hmbPickerReclaimAppliedHeight|hmbPickerReclaimBaseHeight/);
-assert.doesNotMatch(
-  videoSource,
-  /hmbAdjustPickerNodeHeightForVideoSlots|shell\.style\.setProperty\("height"/,
-  "Slot changes must not write React Flow height from the frontend.",
-);
+assert.doesNotMatch(videoSource, /hmbAdjustPickerNodeHeightForVideoSlots/,
+  "Slot changes must not write React Flow height from the frontend.");
 assert.equal(
   (videoSource.match(/hmbApplyPickerDominoResizeFrame\(container, startNodeHeight, startRequiredHeight\)/g) || []).length,
   0,
@@ -1468,18 +1525,28 @@ assert.doesNotMatch(videoSource, /transition:height 180ms/);
 assert.match(videoSource, /hmbRenderPickerMarkup\([\s\S]*?container,[\s\S]*?hmbScopeWidgetStyleMarkup\(pickerMarkup, "\.hmbvp"\),[\s\S]*?\)/);
 assert.doesNotMatch(videoSource, /container\.innerHTML = `\s*<style>/);
 assert.match(videoSource, /hmbApplyPickerHostSizing\(container, measuredInnerHeight\)/);
+assert.match(
+  videoSource,
+  /const renderedDelta = hmbVideoPickerExpandedRenderedResizeDelta\([\s\S]*?const synchronizedAvailableHeight = Math\.max\([\s\S]*?session\.availableHeight \|\| 0\) \+ renderedDelta/,
+  "Native outer resize must apply the rendered shell delta to the Picker-owned root.",
+);
+assert.match(
+  videoSource,
+  /const scheduleNativeNodeResizeRepair = \(finalize = false\) => \{[\s\S]*?if \(shouldFinalize\) \{[\s\S]*?expanded_node_size:\s*\{[\s\S]*?width: shellSize\.width,[\s\S]*?height: shellSize\.height/,
+  "Native outer-resize completion must persist the repaired rendered shell geometry.",
+);
+assert.match(videoSource, /scheduleNativeNodeResizeRepair\(true\)/);
 assert.doesNotMatch(videoSource, /initialFitTimers|\[80,\s*250,\s*750\]/);
 assert.match(agentSource, /compactAgentWidgetHost\(container\)/);
 assert.match(agentSource, /setProperty\("height",\s*"64px",\s*"important"\)/);
 
-assert.doesNotMatch(videoSource, /data-resize-panel="outliner"/);
-assert.match(videoSource, /data-resize-panel="viewport"/);
+assert.doesNotMatch(videoSource, /data-resize-panel|panel-resize-handle/);
 assert.match(videoSource, /right_section_heights:\s*heights/);
 assert.doesNotMatch(videoSource, /node_height:\s*latestNodeHeight/);
 assert.equal(
   (videoSource.match(/hmbApplyPickerHostSizing\(container, hmbPickerInnerRequiredHeight\(container\)\)/g) || []).length >= 2,
   true,
-  "Both Picker resize handles must resize only widget-owned dialog content.",
+  "Expanded mount and retained right-section resizing must size widget content and its exact state row together.",
 );
 assert.doesNotMatch(videoSource, /data-resize-section="log"/);
 assert.match(videoSource, /data-resize-section="color"/);
@@ -1513,7 +1580,11 @@ assert.ok(
     && videoSource.indexOf('data-section-key="log"') < videoSource.indexOf('<aside class="right-stack">'),
   "Activity Log must be below the video preview in the center column.",
 );
-assert.match(videoSource, /\.center-stack>\.activity-section\{flex:1 1 0;min-height:150px\}/);
+assert.match(
+  videoSource,
+  /\.center-stack>\.viewport-panel\{height:auto;min-height:\$\{HMB_PICKER_VIEWPORT_PANEL_MIN_HEIGHT\}px;flex:1 1 0\}\.center-stack>\.activity-section\{height:\$\{HMB_RIGHT_SECTION_DEFAULT_HEIGHTS\.log\}px;flex:0 0 \$\{HMB_RIGHT_SECTION_DEFAULT_HEIGHTS\.log\}px;min-height:\$\{HMB_RIGHT_SECTION_DEFAULT_HEIGHTS\.log\}px;max-height:\$\{HMB_RIGHT_SECTION_DEFAULT_HEIGHTS\.log\}px\}/,
+  "Viewport alone absorbs expanded outer-height deltas; Activity Log stays fixed at 208px.",
+);
 assert.doesNotMatch(videoSource, /const statusHeight = hmbPickerCssHeight|class="statusbar"|\.status-message|\.status-meta/,
   "Removing the footer must also remove its reserved height and message/meta render path.");
 assert.match(videoSource, /id="activity-log-view" class="activity-log-view" role="log" aria-live="polite"/,
@@ -1549,9 +1620,11 @@ assert.match(videoSource, /data-palette-kind="ghost" data-palette-scope="actor-b
 assert.doesNotMatch(videoSource, /id="apply-color"|class="selected-target"|\.apply-button/);
 assert.match(
   videoSource,
-  /container\.querySelectorAll\("\[data-color\]"\)[\s\S]*?if \(liveSelectedNode\) applyColor\(color\)/,
-  "A palette click must continue to assign its color immediately after removing the redundant Target/APPLY row.",
+  /container\.querySelectorAll\("\[data-color\]"\)[\s\S]*?const color = clean\(button\.getAttribute\("data-color"\)\);[\s\S]*?applyColor\(color\)/,
+  "A palette click must immediately assign its color through the healed Outliner target after removing the redundant Target/APPLY row.",
 );
+assert.match(videoSource, /export function hmbEnsurePickerOutlinerSelection/);
+assert.match(videoSource, /const liveState = hmbEnsurePickerOutlinerSelection\(currentWidgetState\(\)\)/);
 assert.doesNotMatch(videoSource, /assignmentHtml\(|id="clear-colors"|No color assignments/);
 assert.doesNotMatch(videoSource, /id="node-(?:width|height)-handle"/);
 

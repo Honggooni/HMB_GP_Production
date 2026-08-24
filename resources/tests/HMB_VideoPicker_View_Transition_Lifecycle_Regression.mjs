@@ -200,7 +200,13 @@ assert.equal(
   0,
   "Neither transition may schedule React Flow internals updates.",
 );
-assert.match(source, /hmbRememberVideoPickerViewMode\(container, storedViewMode !== false\)/);
+assert.match(source, /hmbRememberVideoPickerViewMode\(container, storedViewMode === true\)/);
+assert.match(source, /hmbBindVideoPickerRuntimeIdentity\(container, nextRuntimeId\)/);
+assert.match(
+  source,
+  /if \(runtimeBinding\.hydrationReset\) \{[\s\S]*?HMBVideoPickerLibraryWidget\(container, nextProps \|\| \{\}\)/,
+  "A hot A→B runtime replacement must remount once under the new compact identity.",
+);
 assert.match(source, /const desiredPickerExpanded = container\.__hmbVideoPickerExpanded === true;/);
 assert.match(source, /const pickerExpanded = true;/);
 assert.doesNotMatch(source, /const pickerMarkup = pickerExpanded\s*\?/);
@@ -225,14 +231,14 @@ assert.doesNotMatch(source, /<dialog\b|showModal\(|data-hmb-picker-expanded-surf
 assert.match(source, /export function hmbSetVideoPickerHybridView\(/);
 assert.match(source, /__hmbVideoPickerExpandedFragment/);
 assert.match(source, /data-picker-compact-summary/);
-assert.match(source, /const HMB_VIDEO_PICKER_HYBRID_GEOMETRY_PROPERTIES = Object\.freeze\(\[\s*"height",\s*"min-height",\s*"max-height",?\s*\]\)/);
+assert.match(source, /const HMB_VIDEO_PICKER_HYBRID_GEOMETRY_PROPERTIES = Object\.freeze\(\[\s*"width",\s*"min-width",\s*"max-width",\s*"height",\s*"min-height",\s*"max-height",?\s*\]\)/);
 assert.doesNotMatch(
   source.slice(
     source.indexOf("const HMB_VIDEO_PICKER_HYBRID_GEOMETRY_PROPERTIES"),
     source.indexOf("export function hmbRestoreVideoPickerExpandedGeometry"),
   ),
-  /setProperty\?\.\(\s*["'](?:width|overflow|transform|translate|left|top)["']|fitView|zoom|updateNodeInternals|react-flow__viewport/i,
-  "Hybrid geometry may mutate only the exact React Flow node's three vertical size properties.",
+  /setProperty\?\.\(\s*["'](?:overflow|transform|translate|left|top)["']|fitView|zoom|updateNodeInternals|react-flow__viewport/i,
+  "Hybrid geometry may mutate only the exact React Flow node's width/height size properties.",
 );
 assert.doesNotMatch(
   source.slice(

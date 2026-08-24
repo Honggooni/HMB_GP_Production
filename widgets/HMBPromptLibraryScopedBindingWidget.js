@@ -273,12 +273,43 @@ const VIDEO_TAXONOMY_WIRE_MAP = Object.freeze({
 });
 
 const TEXT_FIELDS = [
-  ["PROJECT_STYLE_LOOK", "PROJECT STYLE / LOOK CONTEXT ONLY", "approved project look, render quality, style continuity, production-level visual target", "image"],
-  ["SCENE_CONTEXT", "SCENE CONTEXT ONLY", "place, time, atmosphere, story situation, relationship, narrative context", "image"],
-  ["EMOTION_INTENT", "EMOTION / INTENT", "emotion, performance intent, mood, relationship, tension, tone, narrative purpose", "image"],
-  ["VIDEO_VFX", "VIDEO VFX", "shot-specific VFX generation notes, FX timing, FX placement, visibility states, occlusion behavior, and fallback-only instructions", "video"],
-  ["PRESERVED_TEXT", "EXACT TEXT / PROPER NOUNS", "one item per line: [Proper Noun], [Dialogue], [Lip-sync Speech], [Lyrics], [Chant], or [On-screen Text] followed by the exact original text", "image"],
+  ["PROJECT_STYLE_LOOK", "PROJECT / SEQUENCE VISUAL DIRECTION", "project-wide render language, quality bar, style and look continuity only; do not redefine subject identity or shot facts here", "image"],
+  ["SCENE_CONTEXT", "SHOT SCENE / NARRATIVE FACTS", "place, time, weather, event, relationships, and what is physically or narratively happening; put look, performance, camera, and effects in their own fields", "image"],
+  ["EMOTION_INTENT", "TARGETED PERFORMANCE / EMOTION", "name the target, then describe emotion, performance tone, tension, relationship subtext, and narrative intent; this does not activate lip-sync, camera, or VFX", "image"],
+  ["VIDEO_VFX", "VIDEO ACTION / LIP-SYNC / VFX", "operational shot direction: named target or emitter, source media/audio, time range, action or lip-sync timing, FX path, onset/peak/falloff, occlusion, shadow, reflection, and environment response; keep the exact transcript in Exact Literals", "video"],
+  ["PRESERVED_TEXT", "EXACT LITERALS (TEXT ONLY)", "one exact item per line: [Proper Noun], [Dialogue], [Lip-sync Transcript], [Lyrics], [Chant], or [On-screen Text]. This preserves spelling and punctuation; it does not activate a media operation. Existing [Lip-sync Speech] entries remain compatible and unchanged", "image"],
 ];
+
+const LOOK_REFERENCE_AUTHORITY_HINTS = Object.freeze({
+  "Color Mood": Object.freeze({
+    en: "Global palette and color relationships only; no light direction, exposure, identity, or material authority.",
+    ko: "전역 팔레트와 색 관계만 적용합니다. 광원 방향·노출·정체성·재질 권한은 없습니다.",
+  }),
+  "Render Look": Object.freeze({
+    en: "Global rendering language, shading character, detail and finish only; it does not set light direction or exposure.",
+    ko: "전역 렌더 언어·셰이딩 특성·디테일·마감만 적용합니다. 광원 방향과 노출은 정하지 않습니다.",
+  }),
+  "Color / Look / Lighting": Object.freeze({
+    en: "Global palette, render language, lighting, exposure, white balance, atmosphere and grade apply to every visible character, prop, sky and environment while intrinsic identity is preserved.",
+    ko: "전역 팔레트·렌더 언어·라이팅·노출·화이트밸런스·대기·그레이드를 모든 캐릭터·프랍·하늘·환경에 함께 적용하되 고유 정체성은 유지합니다.",
+  }),
+  "Lighting / Atmosphere": Object.freeze({
+    en: "Global light direction and quality, exposure, white balance and atmosphere only; subject identity and intrinsic design stay unchanged.",
+    ko: "전역 광원 방향·광질·노출·화이트밸런스·대기만 적용하며 대상 정체성과 고유 디자인은 유지합니다.",
+  }),
+  Scale: Object.freeze({
+    en: "Scale authority only; this is Camera / Composition, not Global Look.",
+    ko: "스케일만 제어합니다. 전역 룩이 아니라 카메라·구도 권한입니다.",
+  }),
+  Composition: Object.freeze({
+    en: "Composition authority only; this is Camera / Composition, not Global Look.",
+    ko: "구도만 제어합니다. 전역 룩이 아니라 카메라·구도 권한입니다.",
+  }),
+  "Scale / Composition": Object.freeze({
+    en: "Scale and composition only; no color, material, lighting, identity or motion authority.",
+    ko: "스케일과 구도만 제어하며 색·재질·라이팅·정체성·모션 권한은 없습니다.",
+  }),
+});
 
 const MANUAL_VIDEO_CONTEXT_VERSION = 1;
 const MANUAL_VIDEO_CONTEXT_TEXT_FIELDS = Object.freeze(
@@ -301,10 +332,10 @@ const MANUAL_VIDEO_CONTEXT_IMAGE_FIELDS = Object.freeze([
 
 const HMB_UI_KO = {
   image_source_binding: "이미지 소스 연결",
-  image_text_context: "이미지 텍스트 설명",
+  image_text_context: "장면 지시 · 정확 문자열",
   scene_level_notes: "장면 단위 메모",
   video_source_binding: "비디오 소스 연결",
-  video_vfx: "비디오 VFX",
+  video_vfx: "영상 작업 · 립싱크 · VFX",
   name: "이름",
   main_type: "주요 유형",
   target: "대상",
@@ -477,11 +508,11 @@ const HMB_OPTION_KO = {
 };
 
 const HMB_TEXT_KO = {
-  PROJECT_STYLE_LOOK: ["프로젝트 스타일 / 룩 설명만", "승인된 프로젝트 룩, 렌더 품질, 스타일 연속성, 프로덕션 수준의 시각 목표"],
-  SCENE_CONTEXT: ["장면 설명만", "장소, 시간, 분위기, 이야기 상황, 관계, 서사적 맥락"],
-  EMOTION_INTENT: ["감정 / 의도", "감정, 연기 의도, 분위기, 관계, 긴장감, 톤, 서사 목적"],
-  VIDEO_VFX: ["비디오 VFX", "샷별 VFX 생성 메모, FX 타이밍, 위치, 가시성, 가림 동작 및 소스 누락 시 대체 지시"],
-  PRESERVED_TEXT: ["원문 유지 항목", "한 줄에 하나씩 입력: [Proper Noun], [Dialogue], [Lip-sync Speech], [Lyrics], [Chant], [On-screen Text] 뒤에 원문을 정확히 입력"],
+  PROJECT_STYLE_LOOK: ["프로젝트 / 시퀀스 시각 방향", "프로젝트 공통 렌더 언어, 품질 기준, 스타일과 룩 연속성만 입력합니다. 대상 정체성이나 개별 장면 사실을 여기서 재정의하지 마세요."],
+  SCENE_CONTEXT: ["샷 장면 / 서사 사실", "장소, 시간대, 날씨, 사건, 관계와 실제로 무엇이 일어나는지 입력합니다. 룩·연기·카메라·효과는 각 전용 항목에 입력하세요."],
+  EMOTION_INTENT: ["대상 연기 / 감정", "대상을 명시한 뒤 감정, 연기 톤, 긴장, 관계의 서브텍스트와 서사 의도를 입력합니다. 립싱크·카메라·VFX를 자동 실행하지 않습니다."],
+  VIDEO_VFX: ["영상 작업 / 립싱크 / VFX", "대상·에미터, 입력 영상·오디오, 시간 범위, 동작·립싱크 타이밍, FX 경로, 시작·정점·감쇠, 가림·그림자·반사·환경 반응을 입력합니다. 정확한 발화문은 ‘정확 문자열’에 입력하세요."],
+  PRESERVED_TEXT: ["정확히 보존할 문자열 (텍스트 전용)", "한 줄에 하나씩 [Proper Noun], [Dialogue], [Lip-sync Transcript], [Lyrics], [Chant], [On-screen Text] 뒤에 정확한 원문을 입력합니다. 철자와 문장부호만 보존하며 미디어 작업을 자동 실행하지 않습니다. 기존 [Lip-sync Speech]도 변경 없이 호환됩니다."],
 };
 
 function uiLanguage(state) {
@@ -1401,7 +1432,9 @@ export function normalizeImageTaxonomy(item) {
     item.custom_source_type = "";
   }
   if (mainType === "Look Reference") {
-    item.owner = "Global Look";
+    item.owner = ["Scale", "Composition", "Scale / Composition"].includes(subType)
+      ? "Camera / Composition"
+      : "Global Look";
     item.interaction_targets = [""];
     item.interaction_custom_targets = [""];
     item.legacy_relationship_targets = [];
@@ -1424,6 +1457,13 @@ export function normalizeImageTaxonomy(item) {
     item.picker_auto_source = "";
   }
   return [mainType, subType];
+}
+
+export function hmbImageSubtypeAuthorityHint(item, state) {
+  if (clean(item?.image_main_type) !== "Look Reference") return "";
+  const hint = LOOK_REFERENCE_AUTHORITY_HINTS[clean(item?.image_sub_type)];
+  if (!hint) return "";
+  return uiLanguage(state) === "ko" ? hint.ko : hint.en;
 }
 
 const VIDEO_ROLE_ALIASES = {
@@ -3913,7 +3953,8 @@ function renderSubtypeControls(item, state, locked = false) {
   const choices = Array.isArray(IMAGE_SUB_TYPES[clean(item.image_main_type)])
     ? IMAGE_SUB_TYPES[clean(item.image_main_type)]
     : [];
-  return `<div class="binding-scope-stack"><div class="binding-scope-entry"><select class="source-select binding-scope-select" data-field="image_sub_type" ${locked ? "disabled" : ""}>${options(["", ...choices], subType, uiText(state, "blank_subtype", "— blank / no subtype —"), state)}</select></div></div>`;
+  const authorityHint = hmbImageSubtypeAuthorityHint(item, state);
+  return `<div class="binding-scope-stack"><div class="binding-scope-entry"><select class="source-select binding-scope-select" data-field="image_sub_type" title="${escapeHtml(authorityHint)}" ${locked ? "disabled" : ""}>${options(["", ...choices], subType, uiText(state, "blank_subtype", "— blank / no subtype —"), state)}</select></div></div>`;
 }
 
 function frameRangeBarsHtml(ranges, metadata, selectedIndex) {
@@ -4450,9 +4491,8 @@ export function hmbMergePromptRevisionAxes(sourceState, uiState) {
   });
   source.text = hmbPromptCloneRangeField(ui.text) || source.text;
   source.ui = hmbPromptCloneRangeField(ui.ui) || source.ui;
-  source.source_intent_fallbacks = hmbPromptCloneRangeField(
-    ui.source_intent_fallbacks,
-  ) || source.source_intent_fallbacks;
+  // Connected-source parsing owns these diagnostics. Keep the newest source
+  // generation instead of replacing it with an older dashboard snapshot.
   source.picker = source.picker && typeof source.picker === "object" ? source.picker : {};
   source.picker.slot_suppressions = hmbPromptCloneRangeField(
     ui?.picker?.slot_suppressions,
@@ -5630,6 +5670,7 @@ function hmbRefreshImageSubtypeControls(row, item, state) {
       uiText(state, "blank_subtype", "— blank / no subtype —"),
       state,
     );
+    select.title = hmbImageSubtypeAuthorityHint(item, state);
   });
 }
 
@@ -6127,9 +6168,9 @@ function render(state) {
     <div class="layout">
       <main class="center">
         <section class="group-card image-card" data-group-id="imageSources" ${hImageSources}><h3>${escapeHtml(uiText(state, "image_source_binding", "IMAGE SOURCE BINDING"))} <b>${state.status.active_images} / ${state.status.max_images}</b></h3><div class="group-body source-scrollbox" data-scroll-id="imageSources"><div class="source-header image-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "target", "TARGET"))}</span><span>${escapeHtml(uiText(state, "video_color_pick", "VIDEO / COLOR PICK"))}</span><span></span></div>${images.map((item, idx) => renderImageRow(item, idx, images, state)).join("")}${renderImageAddRow(images, state)}</div><div class="group-resize-bar nodrag" data-resize-group="imageSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
-        <section class="group-card imgtext" data-group-id="imageText" ${hImageText}><h3>${escapeHtml(uiText(state, "image_text_context", "IMAGE TEXT CONTEXT"))} <b>${escapeHtml(uiText(state, "scene_level_notes", "scene-level notes"))}</b></h3><div class="group-body"><div class="text-grid">${groupBFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="imageText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
+        <section class="group-card imgtext" data-group-id="imageText" ${hImageText}><h3>${escapeHtml(uiText(state, "image_text_context", "SHOT TEXT DIRECTION / EXACT LITERALS"))} <b>${escapeHtml(uiText(state, "scene_level_notes", "scene-level notes"))}</b></h3><div class="group-body"><div class="text-grid">${groupBFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="imageText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card video-card" data-group-id="videoSources" ${hVideoSources}><h3>${escapeHtml(uiText(state, "video_source_binding", "VIDEO SOURCE BINDING"))} <b>${state.status.active_videos} / ${state.status.max_videos}</b></h3><div class="group-body source-scrollbox" data-scroll-id="videoSources"><div class="source-header video-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "keep_out", "KEEP OUT"))}</span><span></span></div>${videos.map((item, idx) => renderVideoRow(item, idx, images, state)).join("")}${renderVideoAddRow(videos, state)}</div><div class="group-resize-bar nodrag" data-resize-group="videoSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
-        <section class="group-card vtext" data-group-id="videoText" ${hVideoText}><h3>${escapeHtml(uiText(state, "video_vfx", "VIDEO VFX"))}</h3><div class="group-body"><div class="text-grid">${groupDFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="videoText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
+        <section class="group-card vtext" data-group-id="videoText" ${hVideoText}><h3>${escapeHtml(uiText(state, "video_vfx", "VIDEO ACTION / LIP-SYNC / VFX"))}</h3><div class="group-body"><div class="text-grid">${groupDFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="videoText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
       </main>
     </div>
   </div></div>`;

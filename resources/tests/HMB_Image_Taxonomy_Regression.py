@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
@@ -21,6 +23,21 @@ common = load("_hmb_image_taxonomy_common", "_hmb_common.py")
 prompt = load("_hmb_image_taxonomy_prompt", "HMBPromptLibrary.py")
 image_asset = load("_hmb_image_taxonomy_asset", "HMBImageAssetLibrary.py")
 agent = load("_hmb_image_taxonomy_agent", "HMBAgentLibrary.py")
+
+
+def expect_rejected(callback) -> None:
+    try:
+        callback()
+    except RuntimeError:
+        return
+    raise AssertionError("invalid image taxonomy authority was accepted")
+
+
+def replace_job(package: str, job: dict) -> str:
+    lines = package.splitlines()
+    assert lines[1] == prompt.PUBLIC_JOB_CONTRACT_HEADER
+    lines[2] = json.dumps(job, ensure_ascii=False, separators=(",", ":"))
+    return "\n".join(lines)
 
 assert prompt.IMAGE_MAIN_TYPE_CHOICES == [
     "Select Image Main Type",
@@ -58,11 +75,18 @@ assert released["color_picks"] == [""]
 assert released["label"] == "legacy.png"
 assert released["asset_id"] == "legacy"
 
+exact_taxonomy_records: set[tuple[str, str, str, str, str]] = set()
+visible_documents: set[str] = set()
+semantic_fingerprints: set[str] = set()
+packages_by_taxonomy: dict[tuple[str, str], tuple[str, dict]] = {}
+
 for (main_type, sub_type), wire_pair in prompt.IMAGE_TAXONOMY_WIRE_MAP.items():
     item = prompt._default_image_item(1)
     item.update({
         "present": True,
-        "label": f"{main_type}-{sub_type}.png",
+        # Keep every non-taxonomy input identical so uniqueness cannot be
+        # accidentally supplied by a changing file name.
+        "label": "shared-taxonomy-reference.png",
         "image_main_type": main_type,
         "image_sub_type": sub_type,
     })
@@ -72,7 +96,68 @@ for (main_type, sub_type), wire_pair in prompt.IMAGE_TAXONOMY_WIRE_MAP.items():
     state["images"] = [normalized]
     package = prompt._build_data_only_prompt_package(state)
     validated = agent._assert_public_job_data_contract(package)
-    assert validated["images"][0]["source_type"] == wire_pair[0]
+    record = validated["images"][0]
+    assert record["image_main_type"] == main_type
+    assert record["image_sub_type"] == sub_type
+    assert (record["source_type"], record["source_scope"]) == wire_pair
+    exact_taxonomy_records.add((
+        record["image_main_type"],
+        record["image_sub_type"],
+        record["source_type"],
+        record["source_scope"],
+        record["target_id"],
+    ))
+    visible_documents.add(prompt._build_prompt_package(state))
+    semantic_fingerprints.add(prompt._prompt_semantic_fingerprint(state))
+    packages_by_taxonomy[(main_type, sub_type)] = (package, validated)
+
+assert len(exact_taxonomy_records) == len(prompt.IMAGE_TAXONOMY_WIRE_MAP) == 26
+assert len(visible_documents) == 26
+assert len(semantic_fingerprints) == 26
+
+# The two authoring choices formerly collapsed to an identical no-video job.
+color_mood_package, color_mood_job = packages_by_taxonomy[
+    ("Look Reference", "Color Mood")
+]
+render_look_package, render_look_job = packages_by_taxonomy[
+    ("Look Reference", "Render Look")
+]
+assert color_mood_package != render_look_package
+assert color_mood_job["images"][0]["source_scope"] == "Color mood only"
+assert render_look_job["images"][0]["source_scope"] == "Render look only"
+
+# Agent fail-closes exact taxonomy and scene/camera-level Look ownership.
+full_look_package, full_look_job = packages_by_taxonomy[
+    ("Look Reference", "Color / Look / Lighting")
+]
+full_look_record = full_look_job["images"][0]
+assert full_look_record["target_id"] == "Global Look"
+assert full_look_record["bindings"] == []
+assert full_look_record["relationship_targets"] == []
+
+wrong_scope_job = copy.deepcopy(full_look_job)
+wrong_scope_job["images"][0]["source_scope"] = "Rendering look only"
+expect_rejected(
+    lambda: agent._assert_public_job_data_contract(
+        replace_job(full_look_package, wrong_scope_job)
+    )
+)
+
+wrong_target_job = copy.deepcopy(full_look_job)
+wrong_target_job["images"][0]["target_id"] = "Hero_A"
+expect_rejected(
+    lambda: agent._assert_public_job_data_contract(
+        replace_job(full_look_package, wrong_target_job)
+    )
+)
+
+wrong_relationship_job = copy.deepcopy(full_look_job)
+wrong_relationship_job["images"][0]["relationship_targets"] = ["Hero_A"]
+expect_rejected(
+    lambda: agent._assert_public_job_data_contract(
+        replace_job(full_look_package, wrong_relationship_job)
+    )
+)
 
 character_prop = prompt._default_image_item(1)
 character_prop.update({
@@ -108,6 +193,59 @@ assert look["interaction_targets"] == [""]
 assert prompt._image_binding_entries(look) == []
 assert common.image_color_pick_choices_for_taxonomy("Look Reference", "Render Look") == []
 
+for camera_subtype in ("Scale", "Composition", "Scale / Composition"):
+    camera_look = prompt._default_image_item(1)
+    camera_look.update({
+        "present": True,
+        "label": "camera-reference.png",
+        "image_main_type": "Look Reference",
+        "image_sub_type": camera_subtype,
+        "owner": "Former Global Look",
+    })
+    prompt._normalize_image_binding_fields(camera_look)
+    assert camera_look["owner"] == "Camera / Composition"
+
+# Five-image, no-control-video production example. Image 5 owns the shared
+# scene lighting/look while the first four sources retain intrinsic identity.
+example_state = prompt._default_widget_state()
+example_state["images"] = []
+for slot, label, main_type, sub_type, owner in (
+    (1, "Character_A.png", "Character", "Full Appearance", "Character_A"),
+    (2, "Character_B.png", "Character", "Full Appearance", "Character_B"),
+    (3, "Main_Background.png", "Environment / Background", "Main Background", "Main Background"),
+    (4, "Sky.png", "Environment / Background", "Sky / Exterior", "Sky"),
+    (5, "Master_Look.png", "Look Reference", "Color / Look / Lighting", ""),
+):
+    example_item = prompt._default_image_item(slot)
+    example_item.update({
+        "present": True,
+        "label": label,
+        "image_main_type": main_type,
+        "image_sub_type": sub_type,
+        "owner": owner,
+    })
+    example_state["images"].append(
+        prompt._normalize_image_binding_fields(example_item)
+    )
+
+example_visible = prompt._build_prompt_package(example_state)
+example_job = agent._assert_public_job_data_contract(
+    prompt._build_data_only_prompt_package(example_state)
+)
+assert len(example_job["images"]) == 5
+assert example_job["images"][4]["image_main_type"] == "Look Reference"
+assert example_job["images"][4]["image_sub_type"] == "Color / Look / Lighting"
+assert example_job["images"][4]["source_scope"] == (
+    "All color + look + lighting functions"
+)
+assert example_job["images"][4]["target_id"] == "Global Look"
+assert "across every visible character, prop, sky, and environment source" in (
+    example_visible
+)
+assert "preserving intrinsic identity, color, pattern, and material" in (
+    example_visible
+)
+
 # Server records use only the new authoring fields. Legacy record values are
 # never treated as migration input.
 server_legacy = image_asset._normalize_image_taxonomy_fields({
@@ -129,5 +267,5 @@ assert server_look["color_pick_candidates"] == []
 
 print(
     "HMB image taxonomy regression: PASS "
-    "(legacy release, 26 Agent projections, Look Reference has no Color Pick)"
+    "(26 exact Agent projections, fail-closed Look authority, five-image relight)"
 )

@@ -119,6 +119,46 @@ def finish_worker(node, live) -> dict:
     raise AssertionError("Background mutation did not finish in five seconds.")
 
 
+# Constructor/registration callbacks must never perform the first catalog walk
+# or lazily construct Griptape's Engine merely to find an event loop.
+constructor_source = inspect.getsource(asset_library.HMBImageAssetLibrary.__init__)
+scan_scheduler_source = inspect.getsource(
+    asset_library.HMBImageAssetLibrary._schedule_catalog_scan
+)
+assert "self._load_catalog(" not in constructor_source
+assert "has_current_engine()" in scan_scheduler_source
+assert scan_scheduler_source.index("has_current_engine()") < scan_scheduler_source.index(
+    "GriptapeNodes.EventManager()"
+)
+
+
+# Exact post-registration starts one generation from a detached normalized
+# snapshot. It must retain the currently visible asset order until that worker
+# publishes, and a duplicate callback must not schedule another scan.
+initial_base, _ = registration_state()
+initial_node, initial_live, _ = fake_node(initial_base)
+initial_node._hmb_initial_catalog_scan_pending = True
+initial_node._hmb_initial_catalog_root = "C:/fallback"
+initial_node._ensure_scan_runtime_state()
+initial_calls = []
+
+
+def capture_initial_scan(request_key, candidate, scan, **kwargs):
+    initial_calls.append((request_key, deepcopy(candidate), scan, kwargs))
+    return candidate
+
+
+initial_node._schedule_catalog_scan = capture_initial_scan
+initial_visible_before = deepcopy(initial_live["state"])
+initial_node._hmb_post_registration_shot_discovery()
+initial_node._hmb_post_registration_shot_discovery()
+assert len(initial_calls) == 1
+assert initial_calls[0][0] == "initial:c:/catalog"
+assert initial_calls[0][1]["assets"] == initial_visible_before["assets"]
+assert initial_live["state"] == initial_visible_before
+assert initial_node._hmb_initial_catalog_scan_pending is False
+
+
 # A pending acknowledgement is a UI-only publication.  It must not resolve
 # media, read manifests through output synchronization, or reconcile the graph.
 pending_publish_node = object.__new__(asset_library.HMBImageAssetLibrary)

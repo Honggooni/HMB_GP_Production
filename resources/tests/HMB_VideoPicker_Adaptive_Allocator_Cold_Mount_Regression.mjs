@@ -268,9 +268,9 @@ try {
   globalThis.cancelAnimationFrame = cancelFrame;
 
   const shell = fakeElement("react-flow__node", documentStub);
-  shell.style.height = "1200px";
-  shell.style.minHeight = "1151px";
-  shell.style.maxHeight = "none";
+  shell.style.height = "360px";
+  shell.style.minHeight = "360px";
+  shell.style.maxHeight = "360px";
 
   const measurementLayer = attach(shell, fakeElement(
     "absolute left-0 right-0 pointer-events-none",
@@ -285,15 +285,15 @@ try {
   flushFrames();
   const box = measurementContainer.querySelector("[data-hmb-video-picker-measurement-box]");
   assert.ok(box, "Cold mount keeps an inert height box in the host measurement copy.");
-  assert.equal(box.style.height, "1151px", "A first mount measures the expanded authoring row.");
+  assert.equal(box.style.height, "252px", "A first mount measures the compact one-Shot Loader row.");
   assert.equal(
     measurementContainer.querySelector(".hmbvp"),
     null,
     "The hidden measurement copy must never mount the live Picker dashboard.",
   );
-  assert.equal(shell.style.height, "1200px", "Cold measurement cannot shrink the shared outer node.");
-  assert.equal(shell.style.minHeight, "1151px");
-  assert.equal(shell.style.maxHeight, "none");
+  assert.equal(shell.style.height, "360px", "Cold measurement cannot resize the shared outer node.");
+  assert.equal(shell.style.minHeight, "360px");
+  assert.equal(shell.style.maxHeight, "360px");
 
   const repairedStateExpandable = expandableContract("_configure_picker_widget_parameter");
   const newStateExpandable = expandableContract("_add_picker_widget");
@@ -304,31 +304,31 @@ try {
   assert.equal(mayaTransportExpandable, false, "The hidden MAYA transport cannot consume free height.");
   assert.equal(commandTransportExpandable, false, "The hidden COMMAND transport cannot consume free height.");
 
-  const repairedFirstPass = adaptiveAllocatorFirstPass(1151, repairedStateExpandable);
-  const newFirstPass = adaptiveAllocatorFirstPass(1151, newStateExpandable);
+  const repairedFirstPass = adaptiveAllocatorFirstPass(252, repairedStateExpandable);
+  const newFirstPass = adaptiveAllocatorFirstPass(252, newStateExpandable);
   assert.equal(
     repairedFirstPass.rowHeight,
-    1135,
-    "A restored Picker dashboard receives the free stack height on its initial 40px pass.",
+    236,
+    "A restored compact Picker receives the free row height on its initial 40px pass.",
   );
   assert.equal(repairedFirstPass.trailingSpacerHeight, 0);
   assert.deepEqual(newFirstPass, repairedFirstPass);
 
-  const clippedRegression = adaptiveAllocatorFirstPass(1151, false);
+  const clippedRegression = adaptiveAllocatorFirstPass(252, false);
   assert.equal(clippedRegression.rowHeight, 40);
   assert.equal(
     clippedRegression.trailingSpacerHeight,
-    1095,
-    "expandable=false reproduces the 40px header plus black trailing-spacer failure.",
+    196,
+    "expandable=false reproduces the 40px row plus compact trailing-spacer failure.",
   );
 
   measurementController.update({ value: populatedThreeShotState });
   assert.equal(
     box.style.height,
-    "1151px",
-    "An ordinary value update preserves the stored expanded measurement mode.",
+    "624px",
+    "A compact value update grows the measurement exactly with its Shot count.",
   );
-  assert.equal(shell.style.height, "1200px", "Reload measurement also leaves outer geometry host-owned.");
+  assert.equal(shell.style.height, "360px", "Reload measurement also leaves outer geometry host-owned.");
 
   const liveLayer = attach(shell, fakeElement("relative", documentStub));
   const liveContainer = attach(liveLayer, fakeElement("raw-widget live", documentStub));
@@ -338,8 +338,12 @@ try {
     1,
     "Expanded inline mode keeps the sibling measurement expanded.",
   );
-  assert.equal(box.style.height, "1151px");
-  assert.equal(shell.style.height, "1200px", "Expanded measurement cannot reposition or resize the shell.");
+  assert.equal(
+    box.style.height,
+    "1200px",
+    "Expanded measurement must reserve the fixed 1400x1200 authoring floor.",
+  );
+  assert.equal(shell.style.height, "360px", "Expanded measurement cannot reposition or resize the shell.");
   assert.equal(
     picker.hmbSyncVideoPickerHostMeasurement(liveContainer, populatedThreeShotState, false),
     1,
@@ -348,7 +352,7 @@ try {
   const compactThreeShotHeight = picker.hmbVideoPickerCompactMeasurementHeight(populatedThreeShotState);
   assert.equal(compactThreeShotHeight, 624);
   assert.equal(box.style.height, `${compactThreeShotHeight}px`);
-  assert.equal(shell.style.height, "1200px");
+  assert.equal(shell.style.height, "360px");
   picker.hmbRememberVideoPickerViewMode(liveContainer, false);
 
   measurementController.cleanup();
@@ -391,7 +395,7 @@ try {
   flushFrames();
   assert.equal(promotions, 1, "A reused contentRef promotes to the live Picker exactly once.");
   assert.equal(promotedValue, populatedThreeShotState);
-  assert.equal(shell.style.height, "1200px");
+  assert.equal(shell.style.height, "360px");
   reloadController.cleanup();
 } finally {
   for (const [name, value] of Object.entries(savedGlobals)) {

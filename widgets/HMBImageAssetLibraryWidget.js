@@ -2658,6 +2658,112 @@ export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}) {
   };
 }
 
+export function hmbInstallImageAssetRegistrationBackdropDismissal(
+  backdrop,
+  closeRegistration,
+  addListener = null,
+) {
+  if (!backdrop?.addEventListener || typeof closeRegistration !== "function") return () => {};
+  const ownedListeners = [];
+  const listen = typeof addListener === "function"
+    ? addListener
+    : (target, type, handler, options) => {
+      target.addEventListener(type, handler, options);
+      ownedListeners.push([target, type, handler, options]);
+    };
+  const dragThresholdSquared = 36;
+  let gesture = null;
+  const eventCoordinate = (event, key) => {
+    const value = Number(event?.[key]);
+    return Number.isFinite(value) ? value : null;
+  };
+  const gestureMatches = (event) => {
+    if (!gesture) return false;
+    if (gesture.family !== "pointer") return !String(event?.type || "").startsWith("pointer");
+    return (
+      String(event?.type || "").startsWith("pointer")
+      && (gesture.pointerId == null || event?.pointerId == null || event.pointerId === gesture.pointerId)
+    );
+  };
+  const updateGestureMovement = (event) => {
+    if (!gestureMatches(event) || gesture.moved) return;
+    const x = eventCoordinate(event, "clientX");
+    const y = eventCoordinate(event, "clientY");
+    if (x == null || y == null || gesture.startX == null || gesture.startY == null) return;
+    const deltaX = x - gesture.startX;
+    const deltaY = y - gesture.startY;
+    if ((deltaX * deltaX) + (deltaY * deltaY) > dragThresholdSquared) gesture.moved = true;
+  };
+  const beginGesture = (event) => {
+    const family = String(event?.type || "").startsWith("pointer") ? "pointer" : "mouse";
+    // Ignore the compatibility mousedown that follows a PointerEvent. The
+    // PointerEvent carries the stable pointerId needed to keep multitouch and
+    // mixed-device sequences from completing one another.
+    if (family === "mouse" && gesture?.family === "pointer") return;
+    const button = Number(event?.button ?? 0);
+    if (button !== 0 || event?.isPrimary === false) {
+      gesture = null;
+      return;
+    }
+    gesture = {
+      family,
+      pointerId: family === "pointer" && event?.pointerId != null ? event.pointerId : null,
+      startedOnBackdrop: event?.target === backdrop,
+      endedOnBackdrop: false,
+      ended: false,
+      moved: false,
+      startX: eventCoordinate(event, "clientX"),
+      startY: eventCoordinate(event, "clientY"),
+    };
+  };
+  const endGesture = (event) => {
+    if (!gestureMatches(event)) return;
+    updateGestureMovement(event);
+    gesture.endedOnBackdrop = event?.target === backdrop;
+    gesture.ended = true;
+  };
+  const cancelGesture = () => {
+    gesture = null;
+  };
+  const cancelMatchingGesture = (event) => {
+    if (gestureMatches(event)) cancelGesture();
+  };
+  const activateBackdrop = (event) => {
+    const shouldClose = (
+      event?.target === backdrop
+      && gesture?.startedOnBackdrop
+      && gesture?.endedOnBackdrop
+      && gesture?.ended
+      && !gesture?.moved
+    );
+    cancelGesture();
+    if (shouldClose) closeRegistration();
+  };
+  // A browser may target `click` at the nearest common ancestor when text
+  // selection starts in an input and the pointer is released on the backdrop.
+  // Both ends must therefore be the real backdrop surface. Capture phase keeps
+  // this record reliable even when a form control stops its own pointer event.
+  for (const type of ["pointerdown", "mousedown"]) {
+    listen(backdrop, type, beginGesture, true);
+  }
+  for (const type of ["pointermove", "mousemove"]) {
+    listen(backdrop, type, updateGestureMovement, true);
+  }
+  for (const type of ["pointerup", "mouseup"]) {
+    listen(backdrop, type, endGesture, true);
+  }
+  listen(backdrop, "pointercancel", cancelMatchingGesture, true);
+  listen(backdrop, "lostpointercapture", cancelMatchingGesture, true);
+  listen(backdrop, "click", activateBackdrop);
+  return () => {
+    ownedListeners.forEach(([target, type, handler, options]) => {
+      target.removeEventListener?.(type, handler, options);
+    });
+    ownedListeners.length = 0;
+    cancelGesture();
+  };
+}
+
 function registrationOptions(state, values, selected, placeholder) {
   return [
     `<option value="">${escapeHtml(placeholder)}</option>`,
@@ -4311,9 +4417,11 @@ function installEvents(container, state, props, remount, listeners) {
     });
   });
   const registrationBackdrop = container.querySelector("[data-registration-backdrop]");
-  on(registrationBackdrop, "click", (event) => {
-    if (event.target === registrationBackdrop) closeRegistration();
-  });
+  hmbInstallImageAssetRegistrationBackdropDismissal(
+    registrationBackdrop,
+    closeRegistration,
+    on,
+  );
   const updateRegistrationSubmit = () => {
     const submit = container.querySelector("[data-registration-submit]");
     if (submit) {

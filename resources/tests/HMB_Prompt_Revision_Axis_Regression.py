@@ -40,6 +40,38 @@ def range_intent(start: int, end: int):
 ui = prompt._default_widget_state()
 ui[prompt.SOURCE_SYNC_REVISION_KEY] = 20
 ui[prompt.UI_EDIT_REVISION_KEY] = 7
+ui["image_asset"]["shot_catalog_routing"] = {
+    "publisher_instance_uuid": "publisher-alpha",
+    "channel_uuid": "channel-alpha",
+    "generation": 20,
+    "metadata_sha256": "a" * 64,
+}
+ui["image_asset"]["shot_catalog"] = [
+    {
+        "shot_uuid": "shot-alpha",
+        "channel_uuid": "channel-alpha",
+        "name": "Shot 1",
+        "number": 1,
+        "selected_source_uids": ["image-alpha"],
+    },
+    {
+        "shot_uuid": "shot-beta",
+        "channel_uuid": "channel-alpha",
+        "name": "Shot 2",
+        "number": 2,
+        "selected_source_uids": ["image-beta"],
+    },
+]
+ui["shot"] = copy.deepcopy(ui["image_asset"]["shot_catalog"][1])
+ui["ui"]["language"] = "en"
+ui["ui"]["textarea_heights"] = {"video:1:keep_out": 333}
+ui["source_intent_fallbacks"] = [
+    {
+        "source": "PICKER_IN",
+        "reason": "older source callback",
+        "text": "do not restore this stale connected intent",
+    }
+]
 ui["images"][0].update(
     {
         "asset_source_uid": "image-alpha",
@@ -84,6 +116,16 @@ source = copy.deepcopy(ui)
 source[prompt.SOURCE_SYNC_REVISION_KEY] = 21
 source["picker"]["run_id"] = "source-generation-21"
 source["text"]["SCENE_CONTEXT"] = "stale source context"
+source["shot"] = copy.deepcopy(source["image_asset"]["shot_catalog"][0])
+source["ui"]["language"] = "ko"
+source["ui"]["textarea_heights"] = {"video:1:keep_out": 100}
+source["source_intent_fallbacks"] = [
+    {
+        "source": "PICKER_IN",
+        "reason": "newest source callback",
+        "text": "retain this newest connected intent",
+    }
+]
 source["images"] = list(reversed(source["images"]))
 for item in source["images"]:
     if item.get("asset_source_uid"):
@@ -118,6 +160,11 @@ assert merged[prompt.SOURCE_SYNC_REVISION_KEY] == 21
 assert merged[prompt.UI_EDIT_REVISION_KEY] == 7
 assert merged["picker"]["run_id"] == "source-generation-21"
 assert merged["text"]["SCENE_CONTEXT"] == "latest UI context"
+assert merged["shot"]["shot_uuid"] == "shot-beta"
+assert merged["shot"]["selected_source_uids"] == ["image-beta"]
+assert merged["ui"]["language"] == "en"
+assert merged["ui"]["textarea_heights"]["video:1:keep_out"] == 333
+assert merged["source_intent_fallbacks"] == source["source_intent_fallbacks"]
 by_image_uid = {item["asset_source_uid"]: item for item in merged["images"]}
 assert by_image_uid["image-alpha"]["label"] == "Source image-alpha"
 assert by_image_uid["image-alpha"]["image_main_type"] == "Character"
@@ -131,6 +178,13 @@ assert merged["videos"][0]["video_main_type"] == "FX / Simulation Reference"
 assert merged["videos"][0]["video_sub_type"] == "Explosion"
 assert merged["videos"][0]["keep_out"] == "Ignore proxy sparks."
 assert merged["videos"][0]["label"] == "Source Video"
+
+# Only is a real Prompt-owned selection too. A simultaneous source callback
+# must not resurrect the previously selected Shot.
+only_ui = copy.deepcopy(ui)
+only_ui["shot"] = prompt._normalize_shot_selection({})
+only_merged = prompt._merge_prompt_revision_axes(source, only_ui)
+assert only_merged["shot"] == prompt._normalize_shot_selection({})
 
 manual_ui = prompt._default_widget_state()
 manual_ui[prompt.SOURCE_SYNC_REVISION_KEY] = 2

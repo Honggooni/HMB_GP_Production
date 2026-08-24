@@ -104,7 +104,7 @@ FX_TIMING_CONTRACT_SCHEMA = "hmb-fx-timing-source-facts"
 FX_TIMING_CONTRACT_VERSION = 3
 FX_TIMING_CONTRACT_HEADER = "FX/TIMING SOURCE DATA (JSON):"
 PUBLIC_JOB_CONTRACT_SCHEMA = "hmb-public-job-data"
-PUBLIC_JOB_CONTRACT_VERSION = 1
+PUBLIC_JOB_CONTRACT_VERSION = 2
 PUBLIC_JOB_CONTRACT_HEADER = "HMB JOB DATA (JSON):"
 USER_DESCRIPTION_DATA_HEADER = "USER DESCRIPTION DATA (JSON):"
 MAX_PUBLIC_PROMPT_FIELD_CHARS = 512
@@ -147,6 +147,7 @@ SHOT_ASSET_INPUT_PARAMETER_NAME = "SHOT_ASSET_IN"
 SHOT_IMAGE_OUTPUT_PARAMETER_NAME = "SHOT_IMAGE_OUT"
 SHOT_PICKER_INPUT_PARAMETER_NAME = "SHOT_PICKER_IN"
 SHOT_VIDEO_OUTPUT_PARAMETER_NAME = "SHOT_VIDEO_OUT"
+SHOT_PICKER_LEGACY_JSON_MAX_BYTES = 1024 * 1024
 SHOT_ROUTING_SNAPSHOT_SCHEMA = "hmb-shot-routing-snapshot"
 SHOT_ROUTING_SNAPSHOT_VERSION = 1
 SHOT_ROUTING_CATALOG_SCHEMA = "hmb-shot-routing-catalog"
@@ -233,7 +234,7 @@ VIDEO_CONTROL_ROLE_CHOICES = [
 # User-facing video taxonomy.  The signed Agent contract continues to receive
 # the stable ``source_type``/``control_role`` wire pair below; these compact
 # main/sub values are Prompt authoring state only.  That separation lets the UI
-# remove duplicate categories without changing the protected public v1 schema.
+# remove duplicate categories without changing the protected public schema.
 # Legacy UI selections are intentionally released instead of migrated.
 VIDEO_MAIN_TYPE_CHOICES = [
     "Select Video Main Type",
@@ -636,10 +637,16 @@ def _normalize_image_taxonomy(item: Dict[str, Any]) -> tuple[str, str]:
     if not (main_type == "Custom / Context" and sub_type == "Custom"):
         item["custom_source_type"] = ""
 
-    # Look Reference is scene-wide by contract.  It cannot inherit a former
-    # character/prop target when the user changes classification.
+    # Appearance Look references are scene-wide by contract. Scale and
+    # composition references share the compact Look Reference authoring group,
+    # but belong to the camera/composition domain instead of Global Look.
+    # Neither kind may inherit a former character/prop target.
     if main_type == "Look Reference":
-        item["owner"] = "Global Look"
+        item["owner"] = (
+            "Camera / Composition"
+            if sub_type in {"Scale", "Composition", "Scale / Composition"}
+            else "Global Look"
+        )
         item["interaction_targets"] = [""]
         item["interaction_custom_targets"] = [""]
         item["legacy_relationship_targets"] = []
@@ -4866,6 +4873,50 @@ def _copy_prompt_ui_fields(
         target[field] = copy.deepcopy(source.get(field))
 
 
+def _verified_prompt_shot_catalog(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return only the backend-proven catalog exposed to the Shot selector.
+
+    The browser uses the same proof before it carries a newer local Shot choice
+    across a simultaneous source refresh. Keeping that rule on both sides
+    prevents the Python revision merge from either rolling the selection back
+    or accepting an unverified process-global UI catalog.
+    """
+
+    image_asset = (
+        state.get("image_asset")
+        if isinstance(state.get("image_asset"), dict)
+        else {}
+    )
+    routing = _normalize_shot_catalog_routing(
+        image_asset.get("shot_catalog_routing")
+    )
+    if (
+        not routing.get("publisher_instance_uuid")
+        or not routing.get("channel_uuid")
+        or int(routing.get("generation") or 0) < 1
+        or re.fullmatch(
+            r"[0-9a-fA-F]{64}",
+            _clean_string(routing.get("metadata_sha256")),
+        )
+        is None
+    ):
+        return []
+    catalog = [
+        item
+        for item in _normalize_shot_catalog(image_asset.get("shot_catalog"))
+        if item["channel_uuid"] == routing["channel_uuid"]
+    ]
+    if not catalog:
+        return []
+    previous_number = 0
+    for item in catalog:
+        number = int(item.get("number") or 0)
+        if number < 1 or number > MAX_SHOTS or number <= previous_number:
+            return []
+        previous_number = number
+    return catalog
+
+
 def _merge_prompt_revision_axes(
     source_state: Dict[str, Any],
     ui_state: Dict[str, Any],
@@ -4945,6 +4996,15 @@ def _merge_prompt_revision_axes(
     # Connected source inputs do not author Prompt prose. A crossed source/UI
     # callback therefore keeps the latest accepted text generation.
     source["text"] = copy.deepcopy(ui.get("text"))
+    # These fields are also authored only by the Prompt dashboard. In
+    # particular, carrying the selected Shot from the newer UI axis prevents a
+    # fast Shot 1 -> Shot 2 choice from being repainted by an overlapping Shot
+    # 1 source callback. The selected row is re-read from the source-proven
+    # catalog so UI data can never mint or alter Shot authority.
+    source["ui"] = copy.deepcopy(ui.get("ui"))
+    # Source-intent fallbacks are generated while parsing the newest connected
+    # ImageAsset/Picker payload. They are source-owned diagnostics, not Prompt
+    # dashboard edits, so an older UI snapshot must never replace them.
 
     source_picker = (
         source.get("picker") if isinstance(source.get("picker"), dict) else {}
@@ -4954,6 +5014,21 @@ def _merge_prompt_revision_axes(
         ui_picker.get("slot_suppressions")
     )
     source["picker"] = source_picker
+
+    ui_shot = _normalize_shot_selection(ui.get("shot"))
+    if not ui_shot["shot_uuid"]:
+        source["shot"] = _normalize_shot_selection({})
+    else:
+        selected = next(
+            (
+                item
+                for item in _verified_prompt_shot_catalog(source)
+                if item["shot_uuid"] == ui_shot["shot_uuid"]
+            ),
+            None,
+        )
+        if selected is not None:
+            source["shot"] = _normalize_shot_selection(selected)
 
     source[SOURCE_SYNC_REVISION_KEY] = max(
         int(source.get(SOURCE_SYNC_REVISION_KEY) or 0),
@@ -5011,10 +5086,18 @@ def _image_role_line(item: Dict[str, Any], seq: int) -> str:
     source_type_choice = _public_single_line(item.get("source_type"))
     source_type = _public_single_line(_effective_image_source_type(item))
     owner = _public_single_line(_effective_target(item, f"image {seq}"))
+    main_type = _public_single_line(item.get("image_main_type"))
+    sub_type = _public_single_line(item.get("image_sub_type"))
     scopes = [
         _public_single_line(scope)
         for scope in (_non_empty_binding_scopes(item) or [""])
     ]
+    # Look Reference intentionally has no video/Color-Pick binding entries, so
+    # its image-level Sub Type scope must be read directly. Without this
+    # fallback Color Mood and Render Look (and the three scale/composition
+    # variants) collapse to identical user-readable role lines.
+    if not any(scopes):
+        scopes = [_public_single_line(item.get("scope"))]
 
     def line_for(scope: str) -> str:
         suffix = _detail_suffix(scope)
@@ -5048,13 +5131,39 @@ def _image_role_line(item: Dict[str, Any], seq: int) -> str:
         if source_type_choice == "Foreground / Ground":
             return f"{owner} / Foreground / ground source = {token}{suffix}"
         if source_type_choice == "Color / Look Reference":
-            return f"{owner} / Color / look reference = {token}{suffix}"
+            authority = (
+                "scene-wide palette and color relationships only; it does not "
+                "own light direction, exposure, or subject identity"
+                if scope == "Color mood only"
+                else "scene-wide rendering language, shading character, detail, "
+                "and finish only; it does not own light direction, exposure, or "
+                "subject identity"
+            )
+            return (
+                f"{owner} / Color / look reference = {token}{suffix} / "
+                f"Authority = {authority}"
+            )
         if source_type_choice == "Color + Look + Lighting Mood Reference":
-            return f"{owner} / Color / look / lighting reference = {token}{suffix}"
+            return (
+                f"{owner} / Color / look / lighting reference = {token}{suffix} / "
+                "Authority = scene-wide shared palette, render language, lighting, "
+                "exposure, white balance, atmosphere, and grade across every visible "
+                "character, prop, sky, and environment source; relight them together "
+                "while preserving intrinsic identity, color, pattern, and material"
+            )
         if source_type_choice == "Lighting / Atmosphere Reference":
-            return f"{owner} / Lighting / atmosphere source = {token}{suffix}"
+            return (
+                f"{owner} / Lighting / atmosphere source = {token}{suffix} / "
+                "Authority = scene-wide shared light direction, quality, exposure, "
+                "white balance, atmosphere, and integration only; it does not replace "
+                "subject identity or intrinsic design"
+            )
         if source_type_choice == "Scale / Composition Reference":
-            return f"{owner} / Scale / composition reference = {token}{suffix}"
+            return (
+                f"{owner} / Scale / composition reference = {token}{suffix} / "
+                "Authority = only the named scale and/or composition domain; no color, "
+                "material, lighting, identity, or motion authority"
+            )
         if source_type_choice == "Custom":
             return f"{owner} / {source_type} = {token}{suffix}"
         return f"{owner} / Unspecified image role = {token}{suffix}"
@@ -5062,6 +5171,8 @@ def _image_role_line(item: Dict[str, Any], seq: int) -> str:
     lines: List[str] = []
     for scope in scopes:
         line = line_for(scope)
+        if main_type and sub_type:
+            line = f"{line} / Classification = {main_type} > {sub_type}"
         if line not in lines:
             lines.append(line)
     return "\n".join(lines)
@@ -5274,6 +5385,11 @@ def _repair_source_input_parameter(
     parameter = _get_parameter_obj(node, parameter_name)
     if parameter is None:
         return
+    shot_picker_value = (
+        _get_parameter_raw(node, parameter_name)
+        if parameter_name == SHOT_PICKER_INPUT_PARAMETER_NAME
+        else None
+    )
     try:
         parameter.hide = True
         parameter.hide_property = True
@@ -5285,6 +5401,28 @@ def _repair_source_input_parameter(
     try:
         parameter.type = kwargs["type"]
         parameter.input_types = list(kwargs["input_types"])
+        if parameter_name == SHOT_PICKER_INPUT_PARAMETER_NAME and hasattr(
+            parameter, "accept_any"
+        ):
+            parameter.accept_any = False
+        if parameter_name == SHOT_PICKER_INPUT_PARAMETER_NAME:
+            migrated_value = _migrate_shot_picker_input_value(
+                shot_picker_value
+            )
+            parameter_values = getattr(node, "parameter_values", None)
+            if (
+                isinstance(parameter_values, dict)
+                and parameter_name in parameter_values
+            ):
+                parameter.default_value = copy.deepcopy(
+                    kwargs["default_value"]
+                )
+                parameter_values[parameter_name] = migrated_value
+            else:
+                # The local-validation/legacy fallback stores the effective
+                # value directly on Parameter.default_value. Preserve that
+                # value while migrating only this formerly-string port.
+                parameter.default_value = migrated_value
     except Exception as exc:
         _diagnostic_exception(f"{parameter_name} input-type repair failed", exc)
     try:
@@ -5390,11 +5528,12 @@ def _shot_picker_input_kwargs() -> Dict[str, Any]:
         "name": SHOT_PICKER_INPUT_PARAMETER_NAME,
         "tooltip": (
             "Hidden exact-source dependency for the active shot's VideoPicker "
-            "snapshot. The raw string is never used as routing authority."
+            "snapshot. Legacy serialized JSON is migrated to a dict, but the "
+            "connected source node remains the only routing authority."
         ),
-        "default_value": "",
-        "type": "str",
-        "input_types": ["any"],
+        "default_value": {},
+        "type": "dict",
+        "input_types": ["dict"],
         "allow_input": True,
         "allow_output": False,
         "allow_property": False,
@@ -5416,6 +5555,64 @@ def _shot_picker_input_kwargs() -> Dict[str, Any]:
     if ParameterMode is not None:
         kwargs["allowed_modes"] = {ParameterMode.INPUT}
     return kwargs
+
+
+def _migrate_shot_picker_input_value(value: Any) -> Dict[str, Any]:
+    """Normalize the pre-v0.6.46 string transport to the typed dict contract.
+
+    This hidden value is only a connection transport cache. Downstream routing
+    still resolves the exact registered VideoPicker and reads its private atomic
+    snapshot. Bounding the one-time parse prevents an old workflow value from
+    becoming an unbounded JSON migration.
+    """
+
+    if isinstance(value, dict):
+        return copy.deepcopy(value)
+    if not isinstance(value, str):
+        return {}
+    text = value.strip()
+    if not text:
+        return {}
+    if (
+        len(text) > SHOT_PICKER_LEGACY_JSON_MAX_BYTES
+        or len(text.encode("utf-8", errors="ignore"))
+        > SHOT_PICKER_LEGACY_JSON_MAX_BYTES
+    ):
+        _diagnostic("SHOT_PICKER_IN legacy JSON exceeded the migration limit")
+        return {}
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return {}
+    return copy.deepcopy(parsed) if isinstance(parsed, dict) else {}
+
+
+def _source_transport_values_equal(
+    parameter_name: str,
+    current_value: Any,
+    next_value: Any,
+) -> bool:
+    """Compare graph transport caches without publishing an unchanged value.
+
+    ``SHOT_PICKER_IN`` changed from serialized JSON to a typed dict in v0.6.46,
+    so its legacy and current representations are semantically equivalent.
+    Other source ports retain their exact string/``any`` contract; the readable
+    fallback only covers host wrappers that expose the same underlying value.
+    """
+
+    if parameter_name == SHOT_PICKER_INPUT_PARAMETER_NAME:
+        # Semantic equality is not enough for the one-time v0.6.46 migration:
+        # a legacy JSON string must still be written once as the typed dict
+        # contract, then every identical graph reconciliation becomes a no-op.
+        return isinstance(current_value, dict) and current_value == (
+            _migrate_shot_picker_input_value(next_value)
+        )
+    try:
+        if current_value == next_value:
+            return True
+    except Exception:
+        pass
+    return _readable_original(current_value) == _readable_original(next_value)
 
 
 def _add_shot_picker_input(node: Any) -> None:
@@ -9625,7 +9822,13 @@ def _public_job_data_contract(
         images.append({
             "image": f"@image{slot}",
             "label": _clean_string(item.get("label")),
+            # Preserve the exact user-facing taxonomy. ``source_type`` remains
+            # the stable Agent wire role, but it is not one-to-one: 26 valid
+            # Main/Sub pairs previously collapsed to 13 no-video records.
+            "image_main_type": _clean_string(item.get("image_main_type")),
+            "image_sub_type": _clean_string(item.get("image_sub_type")),
             "source_type": _clean_string(item.get("source_type")),
+            "source_scope": _clean_string(item.get("scope")),
             "custom_source_type": _clean_string(item.get("custom_source_type")),
             "target_id": _clean_string(item.get("owner")),
             # Legacy relationship targets are retained in widget state for
@@ -9711,7 +9914,7 @@ def _public_job_data_contract(
                 and not error_codes
             )
             # Incomplete/invalid intent is a dormant editing draft.  Keeping it
-            # out of the signed public v1 contract guarantees ordinary image,
+            # out of the signed public contract guarantees ordinary image,
             # video, and prompt generation remains available while the user is
             # still typing or has temporarily selected an invalid segment.
             if not usable:
@@ -10609,10 +10812,19 @@ class HMBPromptLibrary(DataNode):
         # retaining one after its edge is absent can make ``or payload`` below
         # resurrect a disconnected Picker/ImageAsset during hydration.
         for target_name in source_targets - incoming_by_target.keys():
+            empty_value: Any = (
+                {} if target_name == SHOT_PICKER_INPUT_PARAMETER_NAME else ""
+            )
+            if _source_transport_values_equal(
+                target_name,
+                _get_parameter_raw(self, target_name),
+                empty_value,
+            ):
+                continue
             if ParameterMode is None:
-                parent_setter(target_name, "")
+                parent_setter(target_name, empty_value)
             else:
-                parent_setter(target_name, "", initial_setup=True)
+                parent_setter(target_name, empty_value, initial_setup=True)
         for target_name, connection in incoming_by_target.items():
             source_node_name = _clean_string(
                 getattr(connection, "source_node_name", "")
@@ -10645,6 +10857,12 @@ class HMBPromptLibrary(DataNode):
                     except Exception:
                         value = sentinel
             if value is sentinel:
+                continue
+            if _source_transport_values_equal(
+                target_name,
+                _get_parameter_raw(self, target_name),
+                value,
+            ):
                 continue
             if ParameterMode is None:
                 parent_setter(target_name, value)
@@ -11518,6 +11736,9 @@ class HMBPromptLibrary(DataNode):
 
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return
+
+        if param_name == SHOT_PICKER_INPUT_PARAMETER_NAME:
+            value = _migrate_shot_picker_input_value(value)
 
         parent_setter = getattr(super(), "set_parameter_value")
         is_widget_write = param_name == WIDGET_PARAMETER_NAME
@@ -12507,7 +12728,11 @@ class HMBPromptLibrary(DataNode):
                     self._hmb_image_asset_connected = False
                 self._hmb_connected_source_nodes.pop(target_name, None)
                 try:
-                    _set_parameter_value(self, target_name, "")
+                    _set_parameter_value(
+                        self,
+                        target_name,
+                        {} if target_name == SHOT_PICKER_INPUT_PARAMETER_NAME else "",
+                    )
                 except Exception as exc:
                     _diagnostic_exception("Source input clear failed", exc)
                 self._sync_prompt_output_now()

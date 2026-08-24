@@ -15,8 +15,8 @@ POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
 POLICY_CONTRACT_SHA256 = (
     "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
 )
-RELEASE_LABEL = "v0.6.45"
-RELEASE_VERSION = "0.6.45"
+RELEASE_LABEL = "v0.6.47"
+RELEASE_VERSION = "0.6.47"
 EXPECTED_SOURCE_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
@@ -142,7 +142,7 @@ assert tuple(builder.SOURCE_FILES) == EXPECTED_SOURCE_FILES
 assert len(EXPECTED_SOURCE_FILES) == 29
 assert builder.RELEASE_LABEL == RELEASE_LABEL
 assert builder.RELEASE_VERSION == RELEASE_VERSION
-assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.6.45_Runtime.zip"
+assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.6.47_Runtime.zip"
 assert builder.POLICY_VERSION == POLICY_VERSION
 assert builder.POLICY_CONTRACT_SHA256 == POLICY_CONTRACT_SHA256
 assert builder.POLICY_DELIVERY == "server-only"
@@ -154,6 +154,7 @@ manifest = json.loads(
 )
 sbom = json.loads((ROOT / "SBOM.spdx.json").read_text(encoding="utf-8"))
 changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+security_policy = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
 registered_secrets = manifest["settings"][0]["contents"]["secrets_to_register"]
 assert set(registered_secrets) == EXPECTED_SECRET_NAMES
 assert all(value == "" for value in registered_secrets.values())
@@ -167,7 +168,25 @@ assert next(
     item for item in sbom["packages"]
     if item["SPDXID"] == "SPDXRef-HMB-GP-Production"
 )["versionInfo"] == RELEASE_VERSION
-assert f"## `{RELEASE_LABEL}` — 2026-08-21" in changelog
+assert f"## `{RELEASE_LABEL}` — 2026-08-25" in changelog
+assert "http://192.168.203.245:8080" in security_policy
+assert "Seedance 생성 Broker 내부망 예외" in security_policy
+assert "Agent 정책 Broker" in security_policy
+assert "서명 정책 조회나 정책 본문 전달에는 적용되지 않습니다" in security_policy
+assert "임의의 외부 HTTP 주소" in security_policy
+workflow_text = (ROOT / ".github" / "workflows" / "release-audit.yml").read_text(
+    encoding="utf-8"
+)
+assert RELEASE_LABEL not in workflow_text
+assert re.search(r"HMB_GP_Production_v\d+\.\d+\.\d+", workflow_text) is None
+assert re.search(r"HMB GP Production v\d+\.\d+\.\d+", workflow_text) is None
+assert "id: release_metadata" in workflow_text
+assert "tomllib.load(open('pyproject.toml','rb'))" in workflow_text
+assert "Unsafe or unsupported package version" in workflow_text
+assert "steps.release_metadata.outputs.archive_name" in workflow_text
+assert "needs.windows-release-audit.outputs.package_version" in workflow_text
+assert "Even patch version v$version is local-test-only" in workflow_text
+assert "Team releases require an odd patch version" in workflow_text
 
 release_version, records = builder.validate_sources()
 record_paths = tuple(str(record["path"]) for record in records)

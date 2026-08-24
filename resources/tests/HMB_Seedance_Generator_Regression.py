@@ -100,6 +100,10 @@ def load_video_picker_target():
 
 
 target = load_target()
+# The dedicated five-Shot concurrency regression validates the production
+# 1.05-second create cadence. Keep this broad generator suite deterministic and
+# fast while it exercises cancellation after a Broker POST has actually begun.
+target.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.0
 image_asset_target = load_image_asset_target()
 video_picker_target = load_video_picker_target()
 
@@ -182,6 +186,18 @@ class RuntimeRegisteredSeedance(target.HMBSeedanceGeneration):
 
     def _runtime_node_is_live(self, *, require_registered: bool = False) -> bool:
         del require_registered
+        return True
+
+    async def _force_save_generation_recovery_checkpoint(
+        self,
+        *,
+        required: bool,
+        reason: str,
+    ) -> bool:
+        # Synthetic nodes in this suite deliberately run without a retained
+        # workflow. The dedicated crash/reopen suite verifies the fail-closed
+        # save boundary; these cases isolate Broker/media behavior.
+        del required, reason
         return True
 
 
@@ -603,6 +619,10 @@ def assert_constructor_and_public_contract() -> None:
     refresh_parameter = node.get_parameter_by_name("generation_refresh")
     assert type(refresh_parameter).__name__ == "ParameterButton"
     assert refresh_parameter.label == "Refresh / Retrieve Result"
+    assert refresh_parameter.state == "hidden"
+    assert refresh_parameter.hide is True
+    assert refresh_parameter.hide_property is True
+    assert refresh_parameter.serializable is False
     shot_widget_parameter = node.get_parameter_by_name(
         target.SEEDANCE_SHOT_WIDGET_PARAMETER
     )
@@ -614,8 +634,22 @@ def assert_constructor_and_public_contract() -> None:
 
     root_children = list(node.root_ui_element.children)
     root_names = [element.name for element in root_children]
-    assert root_names[-2:] == ["Status", "AI Broker"]
-    broker_group = root_children[-1]
+    assert root_names[-3:] == [
+        "Status",
+        "AI Broker",
+        target.SEEDANCE_RECOVERY_PARAMETER,
+    ]
+    assert [
+        element.name
+        for element in root_children
+        if not bool(getattr(element, "hide", False))
+    ][-2:] == ["Status", "AI Broker"]
+    recovery_parameter = root_children[-1]
+    assert recovery_parameter.settable is False
+    assert recovery_parameter.serializable is True
+    assert recovery_parameter.hide is True
+    assert recovery_parameter.hide_property is True
+    broker_group = root_children[-2]
     assert type(broker_group).__name__ == "ParameterGroup"
     assert broker_group.ui_options == {"collapsed": True}
     assert [child.name for child in broker_group.children] == [
@@ -1417,6 +1451,9 @@ def assert_payload_and_media_contract() -> None:
 
         assert payload["model"] == "doubao-seedance-2-0-260128"
         assert payload["quality"] == "1080p"
+        # The 2.0 Broker adapter retains its established pixel-shaped
+        # compatibility field; the 2.5 enum contract is asserted below.
+        assert payload["resolution"] == "1280x720"
         assert payload["aspect_ratio"] == "16:9"
         assert payload["duration_seconds"] == 8
         assert payload["generate_audio"] is True
@@ -1824,6 +1861,7 @@ def assert_seedance_25_model_contract() -> None:
     payload = node._build_broker_payload(params)
     assert payload["model"] == target.SEEDANCE_2_5_MODEL_ID
     assert payload["quality"] == "720p"
+    assert payload["resolution"] == "720p"
     assert payload["duration_seconds"] == 30
     assert len(payload["image_urls"]) == 30
     assert len(payload["video_urls"]) == 10
@@ -1848,7 +1886,12 @@ def assert_seedance_25_model_contract() -> None:
 
     high_definition = dict(params)
     high_definition["resolution"] = "1080p"
+    high_definition["ratio"] = "9:16"
     node._validate_parameters(high_definition)
+    high_definition_payload = node._build_broker_payload(high_definition)
+    assert high_definition_payload["quality"] == "1080p"
+    assert high_definition_payload["resolution"] == "1080p"
+    assert high_definition_payload["aspect_ratio"] == "9:16"
     unsupported_resolution = dict(params)
     unsupported_resolution["resolution"] = "480p"
     try:
@@ -1998,6 +2041,12 @@ def assert_broker_generation_contract() -> None:
     )
     resumed = BrokerScriptedNode(resume_bridge)
     resumed.set_parameter_value("resume_generation_id", "broker-resume-9")
+    # Resume/retrieve performs no upload. Broken/stale TOS authoring controls
+    # must not make an already-submitted Broker result unrecoverable.
+    resumed.set_parameter_value(
+        "local_video_upload_service", target.LOCAL_VIDEO_UPLOAD_TOS
+    )
+    resumed.set_parameter_value("tos_url_validity_seconds", 0)
     asyncio.run(resumed._process_generation())
     assert resume_bridge.generate_payloads == []
     assert resume_bridge.refresh_ids == ["broker-resume-9"]
@@ -2017,6 +2066,58 @@ def assert_broker_generation_contract() -> None:
     asyncio.run(refreshed._refresh_async())
     assert refresh_bridge.refresh_ids == ["broker-refresh-3"]
     assert refreshed.downloads == ["https://cdn.example/refreshed-broker.mp4"]
+
+    # A response error while polling an already-authoritative task is not a
+    # create rejection. It must retain the task and its safe retrieve action,
+    # even when the HTTP status happens to match a create-side rejection.
+    polling_error = target._BrokerError(
+        "FN AI Broker request failed with HTTP 429.",
+        status_code=429,
+    )
+    assert polling_error.definitive_submission_rejection is False
+    polling_error_bridge = FakeBrokerBridge([])
+    polling_error_bridge.refresh_job = mock.Mock(side_effect=polling_error)
+    polling_error_node = BrokerScriptedNode(polling_error_bridge)
+    polling_error_node.set_parameter_value(
+        "resume_generation_id",
+        "broker-authoritative-429",
+    )
+    polling_status_results: list[dict] = []
+    polling_error_node._clear_execution_status = lambda: None
+    polling_error_node._set_status_results = (
+        lambda **kwargs: polling_status_results.append(dict(kwargs))
+    )
+
+    def raise_polling_failure(exc: BaseException) -> None:
+        raise exc
+
+    polling_error_node._handle_failure_exception = raise_polling_failure
+    try:
+        asyncio.run(polling_error_node._aprocess_impl())
+    except RuntimeError as exc:
+        polling_message = str(exc)
+        assert "HTTP 429" in polling_message
+        assert "Existing task ID: broker-authoritative-429" in polling_message
+        assert "no new render was started" not in polling_message
+    else:
+        raise AssertionError("Authoritative task polling error was accepted")
+    assert polling_error.definitive_submission_rejection is False
+    assert polling_error_node.parameter_output_values["generation_id"] == (
+        "broker-authoritative-429"
+    )
+    assert polling_error_node.parameter_output_values["provider_response"] == {
+        "transport": "fn_ai_broker",
+        "id": "broker-authoritative-429",
+        "status": "resuming",
+    }
+    polling_error_preview = polling_error_node._hmb_generation_preview_state
+    assert polling_error_preview["phase"] == "failed"
+    assert polling_error_preview["job_id"] == "broker-authoritative-429"
+    assert polling_error_preview["action"] == "refresh_existing"
+    assert polling_status_results[-1]["was_successful"] is False
+    assert "no new render was started" not in polling_status_results[-1][
+        "result_details"
+    ]
 
 
 def assert_generation_preview_status_contract() -> None:
@@ -2742,18 +2843,67 @@ def assert_local_video_temporary_publication() -> None:
             target.TASK_PARAMETER,
             target.TASK_REFERENCE_TO_VIDEO,
         )
+        failing_node.set_parameter_value("prompt", "definitive Broker rejection")
         failing_node.set_parameter_value("reference_video_1", original_artifact)
         failing_node._create_gt_cloud_storage_driver = lambda: failing_driver
+        previous_video = target.VideoUrlArtifact(
+            "https://local.example/previous-success.mp4"
+        )
+        previous_last_frame = target.ImageUrlArtifact(
+            "https://local.example/previous-last-frame.png"
+        )
+        failing_node.parameter_output_values["video_url"] = previous_video
+        failing_node.parameter_output_values["VIDEO_OUT"] = previous_video
+        failing_node.parameter_output_values["last_frame_url"] = previous_last_frame
 
         failing_bridge.generate_seedance = mock.Mock(
-            side_effect=target._BrokerError("simulated create failure")
+            side_effect=target._BrokerError(
+                "FN AI Broker request failed with HTTP 429.",
+                status_code=429,
+            )
         )
+        failure_status_results: list[dict] = []
+        failing_node._clear_execution_status = lambda: None
+        failing_node._set_status_results = (
+            lambda **kwargs: failure_status_results.append(dict(kwargs))
+        )
+
+        def raise_reported_failure(exc: BaseException) -> None:
+            raise exc
+
+        failing_node._handle_failure_exception = raise_reported_failure
         try:
-            asyncio.run(failing_node._process_generation())
+            asyncio.run(failing_node._aprocess_impl())
         except RuntimeError as exc:
-            assert "simulated create failure" in str(exc)
+            failure_message = str(exc)
+            assert "HTTP 429" in failure_message
+            assert "no new render was started" in failure_message
+            assert "Existing task ID" not in failure_message
+            assert "server render can continue" not in failure_message
+            assert "Refresh / Retrieve Result" not in failure_message
         else:
-            raise AssertionError("Simulated create failure was accepted")
+            raise AssertionError("Definitive Broker rejection was accepted")
+        assert failing_bridge.generate_seedance.call_count == 1
+        provisional_payload = failing_bridge.generate_seedance.call_args.args[0]
+        assert provisional_payload["client_request_id"].startswith("hmb-")
+        assert failing_node.parameter_output_values["generation_id"] == ""
+        assert failing_node.parameter_output_values["generation_status"] == "failed"
+        assert failing_node.parameter_output_values["provider_response"] is None
+        assert failing_node.parameter_output_values["video_url"] is previous_video
+        assert failing_node.parameter_output_values["VIDEO_OUT"] is previous_video
+        assert (
+            failing_node.parameter_output_values["last_frame_url"]
+            is previous_last_frame
+        )
+        rejection_preview = failing_node._hmb_generation_preview_state
+        assert rejection_preview["phase"] == "failed"
+        assert rejection_preview["job_id"] == ""
+        assert rejection_preview["action"] == "none"
+        assert rejection_preview["has_existing_video"] is True
+        assert failure_status_results[-1]["was_successful"] is False
+        assert "no new render was started" in failure_status_results[-1][
+            "result_details"
+        ]
         assert len(failing_driver.uploads) == 1
         assert failing_driver.deletes == [failing_driver.uploads[0]["path"]]
 
@@ -2798,6 +2948,15 @@ def assert_local_video_temporary_publication() -> None:
         assert unknown_node.parameter_output_values["generation_status"] == (
             "submission_unknown"
         )
+        assert unknown_node.parameter_output_values["provider_response"] == {
+            "transport": "fn_ai_broker",
+            "id": unknown_generation_id,
+            "status": "submission_unknown",
+        }
+        unknown_preview = unknown_node._hmb_generation_preview_state
+        assert unknown_preview["phase"] == "submission_unknown"
+        assert unknown_preview["job_id"] == unknown_generation_id
+        assert unknown_preview["action"] == "refresh_existing"
         assert unknown_driver.deletes == []
         assert len(unknown_deferred_uploads) == 1
         assert unknown_deferred_uploads[0][1] == unknown_driver.uploads[0]["path"]
@@ -3019,6 +3178,9 @@ def assert_broker_result_download_contract() -> None:
     assert downloaded[4:8] == b"ftyp"
     assert len(download_requests) == 1
     assert "authorization" not in download_requests[0].headers
+    assert download_requests[0].url.host == "93.184.216.34"
+    assert download_requests[0].headers["host"] == "cdn.example"
+    assert download_requests[0].extensions["sni_hostname"] == "cdn.example"
 
     mov_requests: list[httpx.Request] = []
 
@@ -3047,12 +3209,72 @@ def assert_broker_result_download_contract() -> None:
     assert downloaded_mov == VALID_MOV_BYTES
     assert len(mov_requests) == 1
     assert "authorization" not in mov_requests[0].headers
+    assert mov_requests[0].url.host == "93.184.216.34"
+    assert mov_requests[0].headers["host"] == "cdn.example"
+    assert mov_requests[0].extensions["sni_hostname"] == "cdn.example"
+
+    # The connection target must remain the address returned by the validated
+    # DNS lookup. A second attacker-controlled lookup would return loopback.
+    rebind_requests: list[httpx.Request] = []
+    dns_calls = 0
+
+    def rebinding_dns(*_args, **_kwargs):
+        nonlocal dns_calls
+        dns_calls += 1
+        if dns_calls == 1:
+            return public_dns
+        return [
+            (
+                target.socket.AF_INET,
+                target.socket.SOCK_STREAM,
+                target.socket.IPPROTO_TCP,
+                "",
+                ("127.0.0.1", 443),
+            )
+        ]
+
+    async def rebind_handler(request: httpx.Request) -> httpx.Response:
+        rebind_requests.append(request)
+        return httpx.Response(
+            200,
+            content=VALID_MP4_BYTES,
+            headers={"content-type": "video/mp4"},
+        )
+
+    rebind_transport = httpx.MockTransport(rebind_handler)
+
+    def rebind_client_factory(*args, **kwargs):
+        kwargs["transport"] = rebind_transport
+        return original_async_client(*args, **kwargs)
+
+    with mock.patch.object(
+        target.httpx, "AsyncClient", side_effect=rebind_client_factory
+    ), mock.patch.object(target.socket, "getaddrinfo", side_effect=rebinding_dns):
+        rebound_safe = asyncio.run(
+            node._download_video("https://rebind.example/result.mp4")
+        )
+    assert rebound_safe == VALID_MP4_BYTES
+    assert dns_calls == 1
+    assert len(rebind_requests) == 1
+    assert rebind_requests[0].url.host == "93.184.216.34"
+    assert rebind_requests[0].headers["host"] == "rebind.example"
+    assert rebind_requests[0].extensions["sni_hostname"] == "rebind.example"
+
+    try:
+        asyncio.run(node._download_video("http://cdn.example/insecure.mp4"))
+    except ValueError as exc:
+        assert "must use HTTPS" in str(exc)
+    else:
+        raise AssertionError("External HTTP result URL was accepted")
 
     redirect_requests: list[httpx.Request] = []
 
     async def redirect_handler(request: httpx.Request) -> httpx.Response:
         redirect_requests.append(request)
-        return httpx.Response(302, headers={"location": "http://127.0.0.1/private.mp4"})
+        return httpx.Response(
+            302,
+            headers={"location": "https://127.0.0.1/private.mp4"},
+        )
 
     redirect_transport = httpx.MockTransport(redirect_handler)
 
@@ -3070,6 +3292,34 @@ def assert_broker_result_download_contract() -> None:
         else:
             raise AssertionError("Private-network download redirect was followed")
     assert len(redirect_requests) == 1
+
+    class TrustedBrokerResultBridge:
+        def __init__(self) -> None:
+            self.downloads: list[tuple[str, int, str]] = []
+
+        @staticmethod
+        def is_trusted_broker_url(url: str) -> bool:
+            return url == target.AI_BROKER_SERVER_URL + "/api/assets/trusted-result"
+
+        def download_trusted_result(
+            self,
+            url: str,
+            *,
+            max_bytes: int,
+            media_type: str,
+        ) -> bytes:
+            self.downloads.append((url, max_bytes, media_type))
+            return VALID_MP4_BYTES
+
+    trusted_bridge = TrustedBrokerResultBridge()
+    trusted_node = BrokerResultDownloadNode()
+    trusted_node._get_broker_bridge = lambda: trusted_bridge
+    trusted_url = target.AI_BROKER_SERVER_URL + "/api/assets/trusted-result"
+    trusted_bytes = asyncio.run(trusted_node._download_broker_video(trusted_url))
+    assert trusted_bytes == VALID_MP4_BYTES
+    assert trusted_bridge.downloads == [
+        (trusted_url, target.MAX_DOWNLOAD_BYTES, "video")
+    ]
 
 
 class AtomicLocalDestination:

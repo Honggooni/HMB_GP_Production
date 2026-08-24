@@ -1,6 +1,17 @@
 const HMB_SHOT_ONLY_KEY = "__hmb_shot_only__";
 const HMB_SEEDANCE_PREVIEW_SCHEMA = "hmb-seedance-generation-preview";
 const HMB_SEEDANCE_PREVIEW_VERSION = 1;
+const HMB_SEEDANCE_COMMAND_SCHEMA = "hmb-seedance-refresh-command";
+const HMB_SEEDANCE_COMMAND_VERSION = 1;
+const HMB_SEEDANCE_COMMAND_REGISTRY_KEY = "__HMB_SEEDANCE_REFRESH_BRIDGES_V1__";
+export const HMB_SEEDANCE_PREVIEW_ACTION_WATCHDOG_MS = 10_000;
+
+const HMB_SEEDANCE_REFRESH_DELIVERY_TIMEOUT = (
+  "요청 전달을 확인하지 못했습니다. 잠시 후 다시 시도하세요."
+);
+const HMB_SEEDANCE_REFRESH_TRANSPORT_UNAVAILABLE = (
+  "기존 작업 확인 기능을 사용할 수 없습니다. 노드를 다시 연 뒤 재시도하세요."
+);
 
 const PREVIEW_PHASE_ALIASES = Object.freeze({
   "": "idle",
@@ -451,6 +462,110 @@ function hmbSeedanceNodeRoot(container) {
   return null;
 }
 
+function hmbSeedanceCommandRegistry() {
+  const root = typeof globalThis !== "undefined" ? globalThis : null;
+  if (!root) return null;
+  if (!(root[HMB_SEEDANCE_COMMAND_REGISTRY_KEY] instanceof WeakMap)) {
+    root[HMB_SEEDANCE_COMMAND_REGISTRY_KEY] = new WeakMap();
+  }
+  return root[HMB_SEEDANCE_COMMAND_REGISTRY_KEY];
+}
+
+function hmbSeedanceCommandValue(props) {
+  const candidate = props?.value ?? props?.parameterValue ?? props?.defaultValue;
+  return candidate && typeof candidate === "object" && !Array.isArray(candidate)
+    ? candidate : {};
+}
+
+function hmbSeedanceCommandProps(props) {
+  const value = hmbSeedanceCommandValue(props);
+  return value.schema === HMB_SEEDANCE_COMMAND_SCHEMA
+    && Number(value.version) === HMB_SEEDANCE_COMMAND_VERSION;
+}
+
+function hmbSeedanceCommandContainer(container) {
+  let current = container || null;
+  for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+    if (
+      current.getAttribute?.("data-parameter-name")
+      === "HMB_SEEDANCE_REFRESH_COMMAND"
+    ) return true;
+  }
+  return false;
+}
+
+function hmbSeedanceMakeCommandContainerInert(container) {
+  if (!container?.style) return;
+  container.setAttribute?.("aria-hidden", "true");
+  for (const [name, value] of [
+    ["height", "0px"], ["min-height", "0px"], ["max-height", "0px"],
+    ["margin", "0"], ["padding", "0"], ["border", "0"],
+    ["overflow", "hidden"], ["opacity", "0"], ["pointer-events", "none"],
+  ]) container.style.setProperty?.(name, value, "important");
+}
+
+function hmbSeedanceCommandBridgeWidget(container, props) {
+  if (!container) return { cleanup() {}, update() {} };
+  container.__hmbSeedanceCommandBridgeCleanup?.();
+  hmbSeedanceMakeCommandContainerInert(container);
+  let latestProps = props || {};
+  let registeredRoot = null;
+  const token = `hmb-seedance-command-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const registry = hmbSeedanceCommandRegistry();
+  const register = () => {
+    if (registeredRoot && registry?.get(registeredRoot)?.token === token) {
+      registry.delete(registeredRoot);
+    }
+    registeredRoot = hmbSeedanceNodeRoot(container);
+    if (!registeredRoot || !registry) return;
+    registry.set(registeredRoot, {
+      token,
+      dispatch(rawCommand) {
+        if (typeof latestProps?.onChange !== "function") {
+          throw new Error("Seedance refresh command transport is unavailable.");
+        }
+        const source = rawCommand && typeof rawCommand === "object" ? rawCommand : {};
+        const action = text(source.action, 48).toLowerCase();
+        const actionId = text(source.action_id, 128);
+        if (action !== "refresh_existing" || !actionId) {
+          throw new Error("Seedance refresh command is invalid.");
+        }
+        return latestProps.onChange({
+          schema: HMB_SEEDANCE_COMMAND_SCHEMA,
+          version: HMB_SEEDANCE_COMMAND_VERSION,
+          action,
+          action_id: actionId,
+          issued_at_ms: Math.max(0, Math.floor(Number(source.issued_at_ms || Date.now()))),
+        });
+      },
+    });
+  };
+  register();
+  const cleanup = () => {
+    if (registeredRoot && registry?.get(registeredRoot)?.token === token) {
+      registry.delete(registeredRoot);
+    }
+    registeredRoot = null;
+    if (container.__hmbSeedanceCommandBridgeCleanup === cleanup) {
+      delete container.__hmbSeedanceCommandBridgeCleanup;
+    }
+  };
+  container.__hmbSeedanceCommandBridgeCleanup = cleanup;
+  return {
+    cleanup,
+    update(nextProps) {
+      latestProps = nextProps || {};
+      hmbSeedanceMakeCommandContainerInert(container);
+      register();
+    },
+  };
+}
+
+function hmbSeedanceRefreshCommandBridge(container) {
+  const root = hmbSeedanceNodeRoot(container);
+  return root ? hmbSeedanceCommandRegistry()?.get(root) || null : null;
+}
+
 function classTokens(element) {
   return String(element?.className || "").split(/\s+/).filter(Boolean);
 }
@@ -696,83 +811,126 @@ function previewActionPending(container, generation) {
 }
 
 export function hmbSeedanceRequestExistingResult(container) {
-  const props = container?.__hmbSeedanceLatestProps || {};
-  const state = hmbSeedanceShotState(props);
+  const state = hmbSeedanceShotState(container?.__hmbSeedanceLatestProps || {});
   const generation = state.generation;
   if (
     !container
     || generation.action !== "refresh_existing"
     || !generation.job_id
-    || typeof props.onChange !== "function"
     || previewActionPending(container, generation)
   ) return false;
+  if (!hmbSeedanceRefreshCommandBridge(container)) {
+    container.__hmbSeedancePreviewActionError = HMB_SEEDANCE_REFRESH_TRANSPORT_UNAVAILABLE;
+    schedulePreviewSync(container);
+    return false;
+  }
   const pendingRequest = {
     job_id: generation.job_id,
     phase: generation.phase,
     media_revision: generation.media_revision,
+    action_id: `refresh-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`,
   };
   container.__hmbSeedancePreviewActionPending = pendingRequest;
   delete container.__hmbSeedancePreviewActionError;
   clearTimeout(container.__hmbSeedancePreviewActionTimeout);
   clearTimeout(container.__hmbSeedancePreviewActionDispatchTimeout);
   delete container.__hmbSeedancePreviewActionDispatchTimeout;
-  if (typeof setTimeout === "function") {
-    container.__hmbSeedancePreviewActionTimeout = setTimeout(() => {
-      if (container.__hmbSeedancePreviewActionPending !== pendingRequest) return;
-      delete container.__hmbSeedancePreviewActionPending;
-      delete container.__hmbSeedancePreviewActionTimeout;
-      schedulePreviewSync(container);
-    }, 90_000);
-    container.__hmbSeedancePreviewActionTimeout?.unref?.();
+  if (
+    container.__hmbSeedancePreviewActionDispatchFrame !== undefined
+    && typeof cancelAnimationFrame === "function"
+  ) {
+    cancelAnimationFrame(container.__hmbSeedancePreviewActionDispatchFrame);
   }
-  schedulePreviewSync(container);
-  const rejectRequest = (error) => {
+  delete container.__hmbSeedancePreviewActionDispatchFrame;
+  const releaseRequest = (message) => {
     if (
       container.__hmbSeedancePreviewDisposed
       || container.__hmbSeedancePreviewActionPending !== pendingRequest
-    ) return;
+    ) return false;
     clearTimeout(container.__hmbSeedancePreviewActionTimeout);
     delete container.__hmbSeedancePreviewActionTimeout;
+    clearTimeout(container.__hmbSeedancePreviewActionDispatchTimeout);
+    delete container.__hmbSeedancePreviewActionDispatchTimeout;
+    if (
+      container.__hmbSeedancePreviewActionDispatchFrame !== undefined
+      && typeof cancelAnimationFrame === "function"
+    ) {
+      cancelAnimationFrame(container.__hmbSeedancePreviewActionDispatchFrame);
+    }
+    delete container.__hmbSeedancePreviewActionDispatchFrame;
     delete container.__hmbSeedancePreviewActionPending;
     container.__hmbSeedancePreviewActionError = text(
-      error?.message || error || "Existing task refresh failed",
+      message || HMB_SEEDANCE_REFRESH_DELIVERY_TIMEOUT,
       240,
     );
     schedulePreviewSync(container);
+    return true;
   };
+  if (typeof setTimeout === "function") {
+    container.__hmbSeedancePreviewActionTimeout = setTimeout(() => {
+      releaseRequest(HMB_SEEDANCE_REFRESH_DELIVERY_TIMEOUT);
+    }, HMB_SEEDANCE_PREVIEW_ACTION_WATCHDOG_MS);
+    container.__hmbSeedancePreviewActionTimeout?.unref?.();
+  }
+  schedulePreviewSync(container);
+  const rejectRequest = (message) => releaseRequest(
+    message || HMB_SEEDANCE_REFRESH_DELIVERY_TIMEOUT,
+  );
   const dispatch = () => {
     delete container.__hmbSeedancePreviewActionDispatchTimeout;
     if (container.__hmbSeedancePreviewDisposed) return;
-    const liveProps = container.__hmbSeedanceLatestProps || {};
-    const liveGeneration = hmbSeedanceShotState(liveProps).generation;
+    const liveGeneration = hmbSeedanceShotState(
+      container.__hmbSeedanceLatestProps || {},
+    ).generation;
     if (
       container.__hmbSeedancePreviewActionPending !== pendingRequest
       || !previewActionPending(container, liveGeneration)
     ) return;
-    if (typeof liveProps.onChange !== "function") {
-      rejectRequest("Existing task refresh is unavailable");
+    const bridge = hmbSeedanceRefreshCommandBridge(container);
+    if (!bridge || typeof bridge.dispatch !== "function") {
+      rejectRequest(HMB_SEEDANCE_REFRESH_TRANSPORT_UNAVAILABLE);
       return;
     }
     let result;
     try {
-      // This parameter also stores durable Shot state. Send only the one-shot
-      // command shape that Python explicitly recognizes, never a browser copy
-      // of the authoritative catalog or Broker task identity.
-      result = liveProps.onChange({ request: { action: "refresh_existing" } });
+      // The dedicated zero-height command parameter carries only this
+      // one-shot action. It is independent of the durable Shot/catalog value,
+      // carries no browser task ID, and never enters React's native button.
+      result = bridge.dispatch({
+        action: "refresh_existing",
+        action_id: pendingRequest.action_id,
+        issued_at_ms: Date.now(),
+      });
     } catch (error) {
-      rejectRequest(error);
+      rejectRequest(error?.message || error);
       return;
     }
     if (result && typeof result.then === "function") {
-      Promise.resolve(result).catch(rejectRequest);
+      Promise.resolve(result).catch((error) => {
+        rejectRequest(error?.message || error);
+      });
     }
   };
-  if (typeof setTimeout === "function") {
-    // Yield the click/value-set stack so the pending UI can paint and Python's
-    // retained-mode transaction cannot be re-entered by this button handler.
-    container.__hmbSeedancePreviewActionDispatchTimeout = setTimeout(dispatch, 0);
+  const dispatchAfterPaint = () => {
+    delete container.__hmbSeedancePreviewActionDispatchFrame;
+    if (container.__hmbSeedancePreviewDisposed) return;
+    if (typeof setTimeout === "function") {
+      // The frame commits the visible busy state; the timer then leaves that
+      // paint task before entering Griptape's retained-mode value transaction.
+      container.__hmbSeedancePreviewActionDispatchTimeout = setTimeout(dispatch, 0);
+    } else {
+      Promise.resolve().then(dispatch);
+    }
+  };
+  if (typeof requestAnimationFrame === "function") {
+    // setTimeout(0) alone is not a paint guarantee in Electron. When a retained-
+    // mode host callback is slow, dispatching it before the next frame makes the
+    // whole node appear frozen even though the request is asynchronous.
+    container.__hmbSeedancePreviewActionDispatchFrame = requestAnimationFrame(
+      dispatchAfterPaint,
+    );
   } else {
-    Promise.resolve().then(dispatch);
+    dispatchAfterPaint();
   }
   return true;
 }
@@ -828,9 +986,12 @@ export function hmbSeedanceSyncPreviewOverlay(container, state, onRetrieve = nul
   }
   if (!overlay) overlay = createPreviewOverlay(region);
   if (!overlay) return false;
+  const pending = previewActionPending(container, generation);
+  const visiblyBusy = presentation.busy || pending;
   overlay.dataset.phase = presentation.phase;
   overlay.dataset.mode = presentation.mode;
-  overlay.dataset.busy = presentation.busy ? "true" : "false";
+  overlay.dataset.busy = visiblyBusy ? "true" : "false";
+  overlay.setAttribute?.("aria-busy", visiblyBusy ? "true" : "false");
   overlay.dataset.tone = presentation.tone;
   const shotNumber = hmbSeedancePaletteShotNumber(state);
   const theme = SHOT_THEME[shotNumber];
@@ -840,10 +1001,16 @@ export function hmbSeedanceSyncPreviewOverlay(container, state, onRetrieve = nul
   const detail = overlay.querySelector?.(".hmb-seedance-preview-overlay__detail");
   const elapsed = overlay.querySelector?.(".hmb-seedance-preview-overlay__elapsed");
   const action = overlay.querySelector?.("[data-hmb-seedance-preview-action]");
-  const pending = previewActionPending(container, generation);
   const actionError = text(container.__hmbSeedancePreviewActionError, 240);
-  setElementText(title, presentation.title);
-  setElementText(detail, actionError || presentation.detail);
+  setElementText(
+    title,
+    pending ? "기존 작업 결과 확인 중…" : presentation.title,
+  );
+  setElementText(
+    detail,
+    actionError
+      || (pending ? "새 작업을 만들지 않고 기존 작업만 확인합니다." : presentation.detail),
+  );
   setElementText(elapsed, presentation.elapsed ? `경과 시간 ${presentation.elapsed}` : "");
   if (elapsed?.style) elapsed.style.display = presentation.elapsed ? "" : "none";
   if (action) {
@@ -851,6 +1018,7 @@ export function hmbSeedanceSyncPreviewOverlay(container, state, onRetrieve = nul
       action.style.display = presentation.action === "refresh_existing" ? "" : "none";
     }
     action.disabled = pending;
+    action.setAttribute?.("aria-busy", pending ? "true" : "false");
     setElementText(action, pending ? "기존 작업 확인 중…" : "기존 작업 결과 확인");
     if (!action.__hmbSeedancePreviewActionBound) {
       action.__hmbSeedancePreviewActionBound = true;
@@ -865,14 +1033,69 @@ export function hmbSeedanceSyncPreviewOverlay(container, state, onRetrieve = nul
   return true;
 }
 
+function hmbSeedancePreviewAncestorKind(element) {
+  let current = element || null;
+  for (let depth = 0; current && depth < 20; depth += 1, current = current.parentElement) {
+    if (current.classList?.contains?.("hmb-seedance-preview-overlay")) return "overlay";
+    if (
+      String(current.tagName || "").toUpperCase() === "VIDEO"
+      || current.hasAttribute?.("data-vp-video-area") === true
+      || current.getAttribute?.("data-parameter-name") === "video_url"
+      || classTokens(current).includes("video_url")
+    ) return "preview";
+    const className = String(current.className || "").toLowerCase();
+    if (className.includes("react-flow__node")) break;
+  }
+  return "";
+}
+
+function hmbSeedanceNodeContainsPreviewSurface(node) {
+  if (!node || typeof node !== "object") return false;
+  if (hmbSeedancePreviewAncestorKind(node) === "preview") return true;
+  return Boolean(
+    node.querySelector?.('[data-parameter-name="video_url"]')
+    || node.querySelector?.('[data-vp-video-area]')
+    || node.querySelector?.("video")
+    || node.querySelector?.(".video_url"),
+  );
+}
+
+export function hmbSeedancePreviewMutationIsRelevant(record) {
+  if (!record || typeof record !== "object") return false;
+  const targetKind = hmbSeedancePreviewAncestorKind(record.target);
+  if (targetKind === "overlay") return false;
+  if (record.type === "attributes") return targetKind === "preview";
+  const changedNodes = [
+    ...Array.from(record.addedNodes || []),
+    ...Array.from(record.removedNodes || []),
+  ];
+  // A childList record targets the preview region when this widget mounts or
+  // removes its own overlay.  Inspect the changed nodes before accepting that
+  // target so self-authored status DOM never schedules another rescan.
+  if (!changedNodes.length) return targetKind === "preview";
+  return changedNodes.some((node) => (
+    hmbSeedancePreviewAncestorKind(node) !== "overlay"
+    && hmbSeedanceNodeContainsPreviewSurface(node)
+  ));
+}
+
 function installPreviewObserver(container) {
   if (!container || container.__hmbSeedancePreviewObserver || typeof MutationObserver !== "function") {
     return;
   }
   const nodeRoot = hmbSeedanceNodeRoot(container);
   if (!nodeRoot) return;
-  const observer = new MutationObserver(() => schedulePreviewSync(container));
-  observer.observe(nodeRoot, { childList: true, subtree: true });
+  const observer = new MutationObserver((records) => {
+    if (records.some((record) => hmbSeedancePreviewMutationIsRelevant(record))) {
+      schedulePreviewSync(container);
+    }
+  });
+  observer.observe(nodeRoot, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["src", "data-raw-video-value"],
+  });
   container.__hmbSeedancePreviewObserver = observer;
 }
 
@@ -885,6 +1108,13 @@ export function hmbSeedanceCleanupPreviewOverlay(container) {
   delete container.__hmbSeedancePreviewActionTimeout;
   clearTimeout(container.__hmbSeedancePreviewActionDispatchTimeout);
   delete container.__hmbSeedancePreviewActionDispatchTimeout;
+  if (
+    container.__hmbSeedancePreviewActionDispatchFrame !== undefined
+    && typeof cancelAnimationFrame === "function"
+  ) {
+    cancelAnimationFrame(container.__hmbSeedancePreviewActionDispatchFrame);
+  }
+  delete container.__hmbSeedancePreviewActionDispatchFrame;
   delete container.__hmbSeedancePreviewActionPending;
   delete container.__hmbSeedancePreviewActionError;
   removePreviewVideoListeners(container);
@@ -956,6 +1186,9 @@ function refresh(container, props) {
 
 export default function HMBSeedanceGenerationWidget(container, props) {
   if (!container) return { cleanup() {}, update() {} };
+  if (hmbSeedanceCommandProps(props) || hmbSeedanceCommandContainer(container)) {
+    return hmbSeedanceCommandBridgeWidget(container, props);
+  }
   delete container.__hmbSeedancePreviewDisposed;
   const latest = props || container.__hmbSeedanceLatestProps || {};
   container.__hmbSeedanceLatestProps = latest;

@@ -44,7 +44,13 @@ class PublishProbe:
         self.published.append((name, value))
         self.cache_snapshots.append(copy.deepcopy(self.parameter_output_values))
 
-    def _shot_picker_dependency_envelope(self) -> dict[str, object]:
+    def _shot_picker_dependency_envelope(
+        self,
+        *,
+        state_snapshot: object = None,
+        probe_cache: object = None,
+    ) -> dict[str, object]:
+        del state_snapshot, probe_cache
         return copy.deepcopy(self.shot_envelope)
 
 

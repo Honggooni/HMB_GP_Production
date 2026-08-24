@@ -51,6 +51,8 @@ assert "Move-Item -LiteralPath $target -Destination $rollback" in installer
 assert "Move-Item -LiteralPath $preservedVenv" in installer
 assert "LocalApplicationData" in installer
 assert "Rollback data must be stored outside the Griptape libraries folder" in installer
+assert "MyInvocation.MyCommand.Path" in installer
+assert "Could not resolve the extracted HMB package directory" in installer
 assert "Remove-Item" not in installer
 assert "backup" not in installer.casefold()
 

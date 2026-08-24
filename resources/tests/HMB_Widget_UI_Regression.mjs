@@ -329,6 +329,7 @@ assert.equal(pickerGuardControl.handler("click"), undefined, "Controls do not ow
 assert.equal(pickerGuardCleanup.length, 1, "One cleanup owns the delegated interaction and delete guards.");
 
 const startShell = fakeElement(null, "react-flow__node");
+startShell.classList.add("react-flow__node");
 startShell.offsetHeight = 1200;
 startShell.getBoundingClientRect = () => ({ top: 20, bottom: 1220, height: 1200 });
 const startOuterHost = fakeElement(startShell, "parameter-host");
@@ -366,6 +367,7 @@ assert.equal(
 // must be fully occupied by the dashboard instead of leaving the former
 // 960px-content / 240px-dead-strip split.
 const fullStartShell = fakeElement(null, "react-flow__node");
+fullStartShell.classList.add("react-flow__node");
 fullStartShell.offsetHeight = 1200;
 fullStartShell.getBoundingClientRect = () => ({ top: 0, bottom: 1200, height: 1200 });
 const fullStartHost = fakeElement(fullStartShell, "widget-host");
@@ -378,15 +380,16 @@ fullStartContainer.querySelector = (selector) => {
   if (selector === ".hmbvp") return fullStartPicker;
   return null;
 };
-assert.equal(picker.hmbStretchPickerAdaptiveStack(fullStartContainer, null, fullStartShell), 1071);
+assert.equal(picker.hmbStretchPickerAdaptiveStack(fullStartContainer, null, fullStartShell), 1200);
 assert.equal(fullStartContainer.style.minHeight, undefined);
-assert.equal(fullStartClip.style.height, "1071px");
-assert.equal(fullStartPicker.style.height, "1071px");
+assert.equal(fullStartClip.style.height, "1200px");
+assert.equal(fullStartPicker.style.height, "1200px");
 assert.equal(fullStartShell.style.height, undefined, "Inner fill must not rewrite the 1200px outer size.");
 
 // A serialized manual resize at the established 1151px floor remains exact;
 // filling available space must not behave like a start-size migration.
 const savedResizeShell = fakeElement(null, "react-flow__node");
+savedResizeShell.classList.add("react-flow__node");
 savedResizeShell.offsetHeight = 1151;
 savedResizeShell.getBoundingClientRect = () => ({ top: 0, bottom: 1151, height: 1151 });
 const savedResizeHost = fakeElement(savedResizeShell, "widget-host");
@@ -399,10 +402,10 @@ savedResizeContainer.querySelector = (selector) => {
   if (selector === ".hmbvp") return savedResizePicker;
   return null;
 };
-assert.equal(picker.hmbStretchPickerAdaptiveStack(savedResizeContainer, null, savedResizeShell), 1071);
+assert.equal(picker.hmbStretchPickerAdaptiveStack(savedResizeContainer, null, savedResizeShell), 1151);
 assert.equal(savedResizeContainer.style.minHeight, undefined);
-assert.equal(savedResizeClip.style.height, "1071px");
-assert.equal(savedResizePicker.style.height, "1071px");
+assert.equal(savedResizeClip.style.height, "1151px");
+assert.equal(savedResizePicker.style.height, "1151px");
 assert.equal(savedResizeShell.style.height, undefined, "Saved 1151px outer height must remain user-owned.");
 
 const commandBridge = await importWidget("../../widgets/HMBVideoPickerCommandBridgeWidget_v032.js");
@@ -479,19 +482,32 @@ assert.ok(
   stableRequiredHeight >= 960,
   "Stable sizing preserves the v0.2.0 natural content floor.",
 );
+assert.equal(
+  typeof picker.hmbApplyVideoPickerExpandedHostHeightPropagation,
+  "function",
+  "Expanded sizing may override only an exactly recognized HMB_PICKER_STATE allocator row.",
+);
+assert.equal(
+  typeof picker.hmbRestoreVideoPickerExpandedHostHeightPropagation,
+  "function",
+  "Compact transition and cleanup must restore the exact allocator row.",
+);
 for (const host of [
-  stateContainer,
   stateHost,
   stateParameterRow,
-  stateLayoutRow,
   adaptiveStack,
   contentRegion,
   nodeBody,
 ]) {
   assert.equal(host.style.minHeight, undefined);
-  assert.equal(host.style.height, undefined, "Natural-height sizing must not force a fixed wrapper height.");
-  assert.equal(host.style.flex, undefined, "Natural-height sizing must not force a fixed wrapper flex basis.");
+  assert.equal(host.style.height, undefined, "Expanded propagation must not mutate broad host wrappers.");
+  assert.equal(host.style.flex, undefined, "Expanded propagation must not mutate broad host flex allocation.");
 }
+assert.equal(
+  stateLayoutRow.style.height,
+  undefined,
+  "A generic row without the exact Editor signature must fail closed; the exact-row fixture is tested separately.",
+);
 assert.equal(
   picker.hmbApplyPickerCommandRowReclaim(stateContainer),
   0,

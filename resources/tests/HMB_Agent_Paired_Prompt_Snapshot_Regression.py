@@ -46,7 +46,7 @@ machine_prompt = "\n".join(
         json.dumps(
             {
                 "schema": "hmb-public-job-data",
-                "version": 1,
+                "version": agent._PUBLIC_JOB_CONTRACT_VERSION,
                 "images": [],
                 "videos": [],
                 "control_only_bindings": [],

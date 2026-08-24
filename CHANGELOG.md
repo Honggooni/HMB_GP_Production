@@ -1,5 +1,91 @@
 # Changelog
 
+## `v0.6.47` — 2026-08-25
+
+- Promoted the validated `v0.6.46` local-test line from the team-distributed
+  `v0.6.45` baseline.
+- Version policy: odd patch versions are team releases; even patch versions are
+  local test builds and are not distributed directly.
+- Preserved fast Prompt Shot/UI edits across crossed source and UI revisions,
+  while retaining the newest source-owned connection diagnostics. Added
+  actual-host coverage for connected edits across Picker refresh and disconnect.
+- Moved ImageAsset's first catalog scan out of the node-registration UI callback,
+  keeping the saved snapshot immediately available while the worker refreshes.
+- Removed the process-wide Shot-routing callback bottleneck with independent
+  per-flow gates, fresh queued same-flow passes, and transaction-scoped Picker
+  media probes. Added early aggregate Seedance media-size rejection, chunked
+  image/audio encoding, and bounded streaming for supported cloud video uploads.
+- Standardized hidden VideoPicker publications and Prompt/Seedance consumers on
+  a strict `dict` port contract. Bounded legacy JSON strings migrate during
+  workflow hydration; malformed or oversized legacy values fail closed to `{}`.
+- Split the documented Broker transport policy: Agent policy delivery remains
+  strict pinned HTTPS, while the exact Seedance generation endpoint may use
+  HTTP only inside the access-controlled, non-routed HMB production LAN.
+- Restored VideoPicker's compact-first cold and workflow-reload mount at
+  1400x360, with an exact 252px one-Shot Loader row and deterministic 186px
+  growth for each additional Shot. Compact mode keeps native resize controls
+  locked; an explicit expand restores the authoring surface without changing
+  the React Flow canvas, workspace viewport, or saved Shot media.
+- Removed the expanded Picker's residual lower black area by filling only the
+  Picker-owned clip/root to the exact live node space. Host parameter stacks,
+  sibling nodes, canvas transforms, zoom, and pan remain untouched.
+- Healed missing or stale Maya Outliner selections after READ by stable UUID,
+  DAG path, then first root, so Color Pick controls always bind to a real
+  Outliner target instead of remaining disabled or storing a color-only echo.
+- Made one VideoPicker publication use the same immutable Shot state and media
+  probe results for `VIDEO_OUT`, `PICKER_OUT`, and `SHOT_PICKER_OUT`; five-Shot
+  save/reload now verifies exact UID order and media hashes without revision
+  mixing. Windows UNC previews also retain their server authority through the
+  Griptape external-file route, including Original Preview after reload.
+- Unified Seedance 2.5 quality and resolution payloads: `720p` publishes
+  `quality=720p`/`resolution=720p`, while `1080p` publishes
+  `quality=1080p`/`resolution=1080p`; aspect ratio remains independent and the
+  established Seedance 2.0 Broker compatibility shape is unchanged.
+- Made ImageAsset and VideoPicker singleton lifecycle reset-safe: Griptape's
+  same-flow `<name>_temp` replacement inherits durable Shot images and Loader
+  video membership, order, selection, and preview while runtime/error/Maya
+  authoring state is renewed; ordinary delete/recreate releases every stale
+  admission lease. Expanded Picker authoring now has a strict 1400x1200 floor;
+  the manual viewport/activity divider is removed, Activity Log stays fixed at
+  208px, and the viewport automatically fills every valid outer-node resize.
+- Kept the ImageAsset registration dialog open when a name selection drag ends
+  outside the dialog. The backdrop now closes only for a primary-button click
+  that both starts and ends on the backdrop itself; Cancel, Close, and Escape
+  retain their existing behavior.
+- Fixed five simultaneous Prompt→Agent→Seedance Shot chains losing one Agent's
+  source identity during retained UI/route interleaving. Each Agent now holds
+  only its strictly verified execution Shot until its final phase is restored;
+  Only mode remains independent and stale Shot snapshots never become routing
+  authority.
+- Enabled Shot 1–5 Seedance branches to prepare and poll concurrently while
+  pacing only billable Broker POST starts by the server's one-second account
+  interval. Managed video and returned-last-frame defaults are Shot-suffixed,
+  preventing five parallel completions from overwriting one another; explicit
+  user output paths remain unchanged.
+- Made the runtime installer recover its extracted source directory from the
+  invoked script path when a non-interactive Windows PowerShell launcher binds
+  an empty `PSScriptRoot`, preserving the documented no-argument install flow.
+- Made `기존 작업 결과 확인` paint its busy state before entering Griptape's
+  retained value transaction. Existing-job lookup stays on the shared engine
+  loop, offloads only blocking Broker I/O, rejects duplicate clicks and active
+  renders, and never creates a replacement provider task.
+- Removed the VideoPicker/React Flow geometry feedback that could raise
+  minified React error #185. Expanded layout performs one settled mount repair
+  and then reacts only to Picker-owned inner geometry or explicit view/resize
+  boundaries; it no longer persistently observes and rewrites the host shell,
+  allocator row, or trailing spacer on every React render.
+- Persisted active Seedance task identity at submission time so a workflow can
+  be reopened after an application interruption and retrieve the same Broker
+  task. Recovery remains non-billable, handles definitive HTTP 429 rejection
+  separately from an accepted task, and exposes a bounded non-reentrant result
+  action only when an authoritative task is recoverable.
+- Preserved exact ImageAsset Main/Sub classification through Prompt and Agent
+  public-job contract v2. Prompt and Agent independently recompute the canonical
+  source type and scope, reject mismatches, and keep Global Look references as
+  scene-wide lighting/look authority unless a narrower explicit override is
+  authored. Renewed field guidance separates literal dialogue/lip-sync text
+  from visual action without adding a validation badge or QA display.
+
 ## `v0.6.45` — 2026-08-21
 
 - Restored the native model-specific Seedance selector contract. Seedance

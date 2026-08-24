@@ -14,9 +14,9 @@ from _hmb_private_policy_fixture import install_private_policy_reader
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.6.45"
-EXPECTED_POLICY_VERSION = "2026-08-11.agent-shot-quality.v4.1"
-EXPECTED_CONTRACT_SHA256 = "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
+EXPECTED_RELEASE_VERSION = "0.6.47"
+EXPECTED_POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
+EXPECTED_CONTRACT_SHA256 = "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
 BASE_MASTER_SEEDS = (
     20260729,
     0x484D42,
@@ -51,7 +51,11 @@ _original_policy_reader, sealed = install_private_policy_reader(common)
 
 
 def prompt_description_json(compiled: str) -> dict:
-    tail = compiled.split("USER DESCRIPTION DATA (JSON):", 1)[1].lstrip()
+    # Adversarial user text may contain the public section label itself. Parse
+    # the final line-anchored machine section, never the first substring.
+    marker = "\nUSER DESCRIPTION DATA (JSON):\n"
+    assert marker in compiled
+    tail = compiled.rsplit(marker, 1)[1].lstrip()
     return json.loads(tail.splitlines()[0])
 
 
@@ -217,12 +221,16 @@ for seed in MASTER_SEEDS:
         canonical = prompt_lib._normalize_state(copy.deepcopy(state))
         before_build = json.dumps(canonical, ensure_ascii=False, sort_keys=True)
         compiled = prompt_lib._build_prompt_package(canonical)
+        machine_compiled = prompt_lib._build_data_only_prompt_package(canonical)
         after_build = json.dumps(canonical, ensure_ascii=False, sort_keys=True)
         assert before_build == after_build, (seed, case_index, "builder mutated state")
         assert policy not in compiled
         assert binding not in compiled
+        assert policy not in machine_compiled
+        assert binding not in machine_compiled
         assert agent_lib._is_hmb_prompt_library_payload(compiled)
-        assert prompt_description_json(compiled)["PROJECT_STYLE_LOOK"] == (
+        assert "USER DESCRIPTION DATA (JSON):" not in compiled
+        assert prompt_description_json(machine_compiled)["PROJECT_STYLE_LOOK"] == (
             canonical["text"]["PROJECT_STYLE_LOOK"]
         )
 
@@ -236,9 +244,10 @@ for seed in MASTER_SEEDS:
         paired = copy.deepcopy(canonical)
         paired["text"]["PROJECT_STYLE_LOOK"] = alternate
         paired_compiled = prompt_lib._build_prompt_package(paired)
+        paired_machine_compiled = prompt_lib._build_data_only_prompt_package(paired)
         assert policy not in paired_compiled
         assert binding not in paired_compiled
-        assert prompt_description_json(paired_compiled)["PROJECT_STYLE_LOOK"] == alternate
+        assert prompt_description_json(paired_machine_compiled)["PROJECT_STYLE_LOOK"] == alternate
         paired_look_checks += 1
 
         depth = rng.choice(RECURSION_DEPTHS)
@@ -255,6 +264,10 @@ for seed in MASTER_SEEDS:
             )
             recursive_round_trips += 1
         assert prompt_lib._build_prompt_package(recursively_normalized) == compiled
+        assert (
+            prompt_lib._build_data_only_prompt_package(recursively_normalized)
+            == machine_compiled
+        )
         randomized_cases += 1
 
 # Repeated decode/verify/load cycles cannot duplicate or weaken the contract.

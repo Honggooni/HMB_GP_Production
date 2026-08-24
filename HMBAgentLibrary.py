@@ -99,7 +99,7 @@ _FX_TIMING_CONTRACT_SCHEMA = "hmb-fx-timing-source-facts"
 _FX_TIMING_CONTRACT_VERSION = 3
 _PUBLIC_JOB_CONTRACT_HEADER = "HMB JOB DATA (JSON):"
 _PUBLIC_JOB_CONTRACT_SCHEMA = "hmb-public-job-data"
-_PUBLIC_JOB_CONTRACT_VERSION = 1
+_PUBLIC_JOB_CONTRACT_VERSION = 2
 _USER_DESCRIPTION_DATA_HEADER = "USER DESCRIPTION DATA (JSON):"
 _RUNTIME_FX_SCOPE_HEADER = "HMB VERIFIED FX/TIMING RUNTIME SCOPE (JSON):"
 _ENGLISH_GENERATOR_OUTPUT_CONTRACT_HEADER = (
@@ -148,7 +148,11 @@ _MAX_FX_TIMING_CONTRACT_CHARS = (
 # The remaining two JSON records are independently bounded.  User text has
 # four 6,000-character fields plus one 20,000-character field; JSON escaping
 # can double that data, and 4 KiB covers the fixed seven-record envelope.
-_MAX_USER_DESCRIPTION_JSON_CHARS = ((4 * 6_000) + 20_000) * 2
+_MAX_USER_DESCRIPTION_FIELD_CHARS = 6_000
+_MAX_USER_VIDEO_VFX_CHARS = 20_000
+_MAX_USER_DESCRIPTION_JSON_CHARS = (
+    (4 * _MAX_USER_DESCRIPTION_FIELD_CHARS) + _MAX_USER_VIDEO_VFX_CHARS
+) * 2
 _MAX_HMB_PROMPT_ENVELOPE_CHARS = 4_096
 _MAX_HMB_PROMPT_CHARS = (
     _MAX_PUBLIC_JOB_CONTRACT_CHARS
@@ -1212,23 +1216,70 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
     image_binding_video_tokens: List[str] = []
     for image in images:
         if not isinstance(image, dict) or set(image) != {
-            "image", "label", "source_type", "custom_source_type", "target_id",
+            "image", "label", "image_main_type", "image_sub_type",
+            "source_type", "source_scope", "custom_source_type", "target_id",
             "relationship_targets", "bindings", "identity",
         }:
             raise RuntimeError("HMB image source record is invalid.")
         token = image.get("image")
         strings = (
-            image.get("label"), image.get("source_type"),
+            image.get("label"), image.get("image_main_type"),
+            image.get("image_sub_type"), image.get("source_type"),
+            image.get("source_scope"),
             image.get("custom_source_type"), image.get("target_id"),
+        )
+        image_main_type = str(image.get("image_main_type") or "").strip()
+        image_sub_type = str(image.get("image_sub_type") or "").strip()
+        source_type = str(image.get("source_type") or "").strip()
+        source_scope = str(image.get("source_scope") or "").strip()
+        taxonomy_wire_pair = _hmb.image_taxonomy_wire_pair(
+            image_main_type, image_sub_type
+        )
+        unclassified_main_type = str(
+            getattr(_hmb, "IMAGE_MAIN_TYPE_UNCLASSIFIED", "Select Image Main Type")
+        )
+        unclassified_source_type = str(
+            getattr(
+                _hmb,
+                "IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED",
+                "Role Required / Select Source Type",
+            )
+        )
+        taxonomy_valid = (
+            image_main_type == unclassified_main_type
+            and not image_sub_type
+            and source_type == unclassified_source_type
+            and not source_scope
+        ) or (
+            taxonomy_wire_pair is not None
+            and (source_type, source_scope) == tuple(taxonomy_wire_pair)
         )
         relationships = image.get("relationship_targets")
         bindings = image.get("bindings")
+        taxonomy_authority_valid = True
+        if image_main_type == "Look Reference":
+            expected_target = (
+                "Camera / Composition"
+                if image_sub_type in {"Scale", "Composition", "Scale / Composition"}
+                else "Global Look"
+            )
+            # Look inputs are scene/camera-level authority by taxonomy, never a
+            # character/prop target and never a color-marker/video binding.
+            taxonomy_authority_valid = (
+                str(image.get("target_id") or "").strip() == expected_target
+                and isinstance(relationships, list)
+                and not relationships
+                and isinstance(bindings, list)
+                and not bindings
+            )
         if (
             not isinstance(token, str)
             or not re.fullmatch(r"@image(?:[1-9]|[1-4][0-9]|50)", token)
             or token in seen_images
             or any(not isinstance(value, str) for value in strings)
             or image.get("source_type") not in _PUBLIC_IMAGE_SOURCE_TYPES
+            or not taxonomy_valid
+            or not taxonomy_authority_valid
             or not isinstance(relationships, list)
             or any(not isinstance(value, str) or not value for value in relationships)
             or len(relationships) != len(set(relationships))
@@ -1481,7 +1532,12 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
     if not set(user_data).issubset(allowed_user_fields):
         raise RuntimeError("HMB user description field is invalid.")
     for key, value in user_data.items():
-        if not isinstance(value, str):
+        max_chars = (
+            _MAX_USER_VIDEO_VFX_CHARS
+            if key == "VIDEO_VFX"
+            else _MAX_USER_DESCRIPTION_FIELD_CHARS
+        )
+        if not isinstance(value, str) or len(value) > max_chars:
             raise RuntimeError("HMB user description value is invalid.")
     return job
 
@@ -3223,6 +3279,10 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_shot_context: dict[str, Any] = {}
         self._hmb_shot_catalog_snapshot: dict[str, Any] = {}
         self._hmb_last_generator_snapshot: dict[str, Any] = {}
+        # Instance-local execution authority.  Display widget writes and
+        # same-flow route callbacks may interleave while several Agents run,
+        # but they must not change the exact Shot being consumed by this run.
+        self._hmb_execution_shot_binding: dict[str, Any] = {}
         self._hmb_remote_prompt_publication: dict[str, Any] = {}
         self._hmb_remote_prompt_revision = 0
         self._hmb_remote_prompt_source_token = secrets.token_hex(16)
@@ -3354,7 +3414,10 @@ class HMBAgentLibrary(_BaseAgent):
         if not channel_uuid or not shot_uuid:
             return {}
         try:
-            shot_number = int(value.get("shot_number"))
+            raw_shot_number = value.get("shot_number")
+            if isinstance(raw_shot_number, bool):
+                return {}
+            shot_number = int(raw_shot_number)
             generation = int(value.get("prompt_generation"))
         except (TypeError, ValueError, OverflowError):
             return {}
@@ -3373,6 +3436,84 @@ class HMBAgentLibrary(_BaseAgent):
             "video_media_sha256": str(hashes[2]),
         }
 
+    @staticmethod
+    def _normalize_execution_shot_binding(value: Any) -> dict[str, Any]:
+        """Return one strict, instance-owned Agent subscription or no binding."""
+
+        required = {
+            "schema",
+            "version",
+            "participant_kind",
+            "enabled",
+            "channel_uuid",
+            "shot_uuid",
+            "shot_number",
+            "shot_name",
+        }
+        if (
+            not isinstance(value, dict)
+            or set(value) != required
+            or value.get("schema") != "hmb-shot-channel-subscription"
+            or value.get("version") != 1
+            or value.get("participant_kind") != "agent"
+            or value.get("enabled") is not True
+        ):
+            return {}
+        channel_uuid = str(value.get("channel_uuid") or "").strip()[:128]
+        shot_uuid = str(value.get("shot_uuid") or "").strip()[:128]
+        if not channel_uuid or not shot_uuid:
+            return {}
+        try:
+            shot_number = int(value.get("shot_number"))
+        except (TypeError, ValueError, OverflowError):
+            return {}
+        if not 1 <= shot_number <= 5:
+            return {}
+        shot_name = " ".join(
+            str(value.get("shot_name") or f"Shot {shot_number}").split()
+        )[:128] or f"Shot {shot_number}"
+        return {
+            "schema": "hmb-shot-channel-subscription",
+            "version": 1,
+            "participant_kind": "agent",
+            "enabled": True,
+            "channel_uuid": channel_uuid,
+            "shot_uuid": shot_uuid,
+            "shot_number": shot_number,
+            "shot_name": shot_name,
+        }
+
+    def _capture_execution_shot_binding(
+        self,
+        verified_subscription: Any = None,
+    ) -> dict[str, Any]:
+        """Freeze the strict Shot selected when protected execution starts."""
+
+        self._hmb_execution_shot_binding = {}
+        binding = self._normalize_execution_shot_binding(
+            self._hmb_shot_channel_subscription()
+            if verified_subscription is None
+            else verified_subscription
+        )
+        if not binding:
+            raise RuntimeError("HMB Agent execution Shot identity is unavailable.")
+        self._hmb_execution_shot_binding = dict(binding)
+        return dict(binding)
+
+    def _clear_execution_shot_binding(self) -> None:
+        self._hmb_execution_shot_binding = {}
+
+    def _adopt_verified_execution_shot_binding(
+        self,
+        verified_subscription: Any,
+    ) -> dict[str, Any]:
+        """Adopt a verified Shot, while preserving canonical HMB Prompt Only."""
+
+        if verified_subscription == {}:
+            self._clear_execution_shot_binding()
+            return {}
+        return self._capture_execution_shot_binding(verified_subscription)
+
     def _hmb_shot_channel_subscription(self) -> dict[str, Any]:
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return {
@@ -3385,6 +3526,11 @@ class HMBAgentLibrary(_BaseAgent):
                 "shot_number": 1,
                 "shot_name": "Only",
             }
+        execution_binding = self._normalize_execution_shot_binding(
+            getattr(self, "_hmb_execution_shot_binding", {})
+        )
+        if execution_binding:
+            return execution_binding
         context = getattr(self, "_hmb_shot_context", {})
         if not isinstance(context, dict):
             context = {}
@@ -3465,6 +3611,7 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_shot_catalog_snapshot = {}
         self._hmb_shot_context = {}
         self._hmb_last_generator_snapshot = {}
+        self._clear_execution_shot_binding()
         self._hmb_remote_prompt_publication = {}
         self._hmb_shot_route_status = {
             "ok": False,
@@ -3602,6 +3749,7 @@ class HMBAgentLibrary(_BaseAgent):
             return self._hmb_shot_channel_subscription()
         self._hmb_shot_context = {}
         self._hmb_last_generator_snapshot = {}
+        self._clear_execution_shot_binding()
         self._hmb_remote_prompt_publication = {}
         self._hmb_initial_shot_autoclaim_pending = False
         self._hmb_initial_shot_preferred_uuid = ""
@@ -4060,8 +4208,8 @@ class HMBAgentLibrary(_BaseAgent):
             "changed": 0,
         }
 
-    def _assert_exact_prompt_shot_route(self) -> None:
-        """Require one ready Prompt whose durable Shot identity equals this Agent."""
+    def _assert_exact_prompt_shot_route(self) -> dict[str, Any]:
+        """Return the Agent identity only after its exact Prompt route is verified."""
 
         subscription = self._hmb_shot_channel_subscription()
         source_node = getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
@@ -4081,7 +4229,7 @@ class HMBAgentLibrary(_BaseAgent):
             # allowed only while this Agent is also in independent Only mode.
             if subscription.get("enabled"):
                 raise RuntimeError("HMB Prompt Shot identity is unavailable.")
-            return
+            return {}
         if source_subscription.get("participant_kind") != "prompt":
             raise RuntimeError("HMB Prompt Shot identity is invalid.")
         source_enabled = bool(source_subscription.get("enabled"))
@@ -4089,7 +4237,12 @@ class HMBAgentLibrary(_BaseAgent):
         if source_enabled != agent_enabled:
             raise RuntimeError("HMB Prompt and Agent Shot identities do not match.")
         if not agent_enabled:
-            return
+            return {}
+        verified_subscription = HMBAgentLibrary._normalize_execution_shot_binding(
+            subscription
+        )
+        if not verified_subscription:
+            raise RuntimeError("HMB Agent Shot identity is invalid.")
         status = getattr(self, "_hmb_shot_route_status", None)
         if (
             not isinstance(status, dict)
@@ -4114,6 +4267,7 @@ class HMBAgentLibrary(_BaseAgent):
         )
         if not str(getattr(routed_prompt, "value", routed_prompt) or ""):
             raise RuntimeError("HMB Prompt Shot value is unavailable.")
+        return verified_subscription
 
     def _native_parameter_value(self, name: str, default: Any = "") -> Any:
         """Read a native value without the protected-runtime prompt override."""
@@ -4272,6 +4426,19 @@ class HMBAgentLibrary(_BaseAgent):
             requested_shot = (
                 value.get("shot") if isinstance(value, dict) else None
             )
+            execution_binding = self._normalize_execution_shot_binding(
+                getattr(self, "_hmb_execution_shot_binding", {})
+            )
+            if execution_binding:
+                # The selector is disabled during execution, but retained-mode
+                # echoes and route callbacks can still write its display dict.
+                # Preserve the exact per-node binding captured at process start.
+                requested_shot = {
+                    "channel_uuid": execution_binding["channel_uuid"],
+                    "shot_uuid": execution_binding["shot_uuid"],
+                    "number": execution_binding["shot_number"],
+                    "name": execution_binding["shot_name"],
+                }
             requested_uuid = str(
                 requested_shot.get("shot_uuid")
                 if isinstance(requested_shot, dict)
@@ -4346,6 +4513,34 @@ class HMBAgentLibrary(_BaseAgent):
                 parameter.default_value = normalized
             except Exception:
                 pass
+            execution_binding = self._normalize_execution_shot_binding(
+                getattr(self, "_hmb_execution_shot_binding", {})
+            )
+            selected = normalized.get("shot", {})
+            previous = getattr(self, "_hmb_last_generator_snapshot", {})
+            if not isinstance(previous, dict) or not previous:
+                previous = getattr(self, "_hmb_shot_context", {})
+            if (
+                not execution_binding
+                and isinstance(previous, dict)
+                and previous.get("channel_uuid")
+                and any(
+                    previous.get(key) != selected.get(selected_key)
+                    for key, selected_key in (
+                        ("channel_uuid", "channel_uuid"),
+                        ("shot_uuid", "shot_uuid"),
+                        ("shot_number", "number"),
+                        ("shot_name", "name"),
+                    )
+                )
+            ):
+                # A real Only/Shot change is authority-changing, unlike an
+                # execution-phase display echo. Invalidate the old result now,
+                # before the central router mutates managed edges.
+                self._hmb_shot_context = {}
+                self._hmb_last_generator_snapshot = {}
+                self._hmb_invalidate_remote_prompt_publication()
+                setattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
             if (
                 not getattr(self, "_hmb_shot_clear_syncing", False)
                 and not getattr(self, "_hmb_execution_phase_syncing", False)
@@ -4616,6 +4811,7 @@ class HMBAgentLibrary(_BaseAgent):
             self._hmb_shot_catalog_snapshot = {}
             self._hmb_shot_context = {}
             self._hmb_last_generator_snapshot = {}
+            self._clear_execution_shot_binding()
             self._hmb_invalidate_remote_prompt_publication()
             self._hmb_shot_route_status = {
                 "ok": False,
@@ -4766,6 +4962,7 @@ class HMBAgentLibrary(_BaseAgent):
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return
         self._set_agent_execution_phase("")
+        self._clear_execution_shot_binding()
         self._clear_hmb_runtime_policy()
         self._hmb_last_generator_snapshot = {}
         self._hmb_invalidate_remote_prompt_publication()
@@ -4809,8 +5006,19 @@ class HMBAgentLibrary(_BaseAgent):
             except Exception:
                 current = getattr(parameter, "default_value", None)
             current = current if isinstance(current, dict) else {}
+            execution_binding = self._normalize_execution_shot_binding(
+                getattr(self, "_hmb_execution_shot_binding", {})
+            )
+            shot = current.get("shot")
+            if execution_binding:
+                shot = {
+                    "channel_uuid": execution_binding["channel_uuid"],
+                    "shot_uuid": execution_binding["shot_uuid"],
+                    "number": execution_binding["shot_number"],
+                    "name": execution_binding["shot_name"],
+                }
             next_ui = _agent_widget_value(
-                current.get("shot"),
+                shot,
                 current.get("shot_catalog"),
                 normalized_phase,
             )
@@ -5102,6 +5310,7 @@ class HMBAgentLibrary(_BaseAgent):
         )
         self._hmb_native_calls_this_process = 0
         self._hmb_last_generator_snapshot = {}
+        self._clear_execution_shot_binding()
         # The selector is cable-free in the editor, but the router establishes
         # the same-flow hidden Prompt edge before topology validation so the
         # native scheduler still observes the real dependency.
@@ -5128,7 +5337,8 @@ class HMBAgentLibrary(_BaseAgent):
         if not self._hmb_lifecycle_is_live(lifecycle_generation):
             return None
         try:
-            self._assert_exact_prompt_shot_route()
+            verified_subscription = self._assert_exact_prompt_shot_route()
+            self._adopt_verified_execution_shot_binding(verified_subscription)
         except Exception:
             self._publish_hmb_execution_block(_HMB_TOPOLOGY_UNAVAILABLE_MESSAGE)
             raise RuntimeError(_HMB_TOPOLOGY_UNAVAILABLE_MESSAGE) from None
@@ -5153,6 +5363,7 @@ class HMBAgentLibrary(_BaseAgent):
 
         if not self._hmb_lifecycle_is_live(lifecycle_generation):
             self._set_agent_execution_phase("")
+            self._clear_execution_shot_binding()
             return None
         self._set_agent_execution_phase("preparing")
         try:
@@ -5170,6 +5381,7 @@ class HMBAgentLibrary(_BaseAgent):
         if not self._hmb_lifecycle_is_live(lifecycle_generation):
             self._clear_hmb_runtime_policy()
             self._set_agent_execution_phase("")
+            self._clear_execution_shot_binding()
             return None
         source_contract_stage = "paired_snapshot"
         try:
@@ -5314,6 +5526,7 @@ class HMBAgentLibrary(_BaseAgent):
             finally:
                 self._clear_hmb_runtime_policy()
                 self._set_agent_execution_phase("")
+                self._clear_execution_shot_binding()
         try:
             self._refresh_agent_shot_route()
         except Exception:

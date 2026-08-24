@@ -51,10 +51,25 @@ def install_engine_hooks(node):
 
     node._write_state = local_write_state
 
-    def engine_set(name, value):
+    def engine_set(
+        name,
+        value,
+        *,
+        initial_setup=False,
+        emit_change=True,
+        skip_before_value_set=False,
+    ):
+        if initial_setup:
+            return raw_set(
+                name,
+                value,
+                initial_setup=True,
+                emit_change=emit_change,
+                skip_before_value_set=skip_before_value_set,
+            )
         parameter = picker._get_parameter_obj(node, name)
         assert parameter is not None, name
-        final_value = node.before_value_set(parameter, value)
+        final_value = value if skip_before_value_set else node.before_value_set(parameter, value)
         raw_set(name, final_value)
         node.after_value_set(parameter, final_value)
         return final_value
@@ -666,7 +681,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.6.45"
+assert manifest["metadata"]["library_version"] == "0.6.47"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
@@ -704,7 +719,7 @@ picker_manifest = next(item for item in manifest["nodes"] if item["class_name"] 
 prompt_manifest = next(item for item in manifest["nodes"] if item["class_name"] == "HMBPromptLibrary")
 assert picker_manifest["metadata"]["width"] == 1400
 assert prompt_manifest["metadata"]["width"] == 1800
-assert picker_manifest["metadata"]["height"] == 1200
+assert picker_manifest["metadata"]["height"] == 360
 assert prompt_manifest["metadata"]["height"] == 1193
 for prompt_height_key in (
     "height", "default_height", "initial_height", "min_height",
@@ -717,7 +732,7 @@ for prompt_height_key in (
 assert prompt.PROMPT_NATIVE_ASSET_INPUT_ROW_HEIGHT == 0
 assert prompt.PROMPT_START_HEIGHT == prompt.PROMPT_MIN_HEIGHT == 1193
 assert picker_manifest["metadata"]["ui_options"]["initial_width"] == 1400
-assert picker_manifest["metadata"]["ui_options"]["initial_height"] == 1200
+assert picker_manifest["metadata"]["ui_options"]["initial_height"] == 360
 assert picker_manifest["metadata"]["ui_options"]["min_height"] == 360
 agent_manifest = next(item for item in manifest["nodes"] if item["class_name"] == "HMBAgentLibrary")
 for native_size_key in (
@@ -726,18 +741,18 @@ for native_size_key in (
 ):
     assert native_size_key not in agent_manifest["metadata"]
 
-# The active runtime is the server-hosted signed v4.1 policy. This internal
+# The active runtime is the server-hosted signed v4.2 policy. This internal
 # regression injects the private signed artifact without creating a local
 # runtime fallback or copying it into the public package.
 assert hashlib.sha256(signed_policy_fixture).hexdigest() == (
-    "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
+    "6debb90960499ff6fe163a8a5a6db42a0da028f7a7606f993175edbd5712e65e"
 )
 policy_payload = common._load_agent_rule_payload()
 assert policy_payload["final_policy_version"] == (
-    "2026-08-11.agent-shot-quality.v4.1"
+    "2026-08-12.agent-shot-quality.v4.2"
 )
 assert policy_payload["final_motion_look_policy_sha256"] == (
-    "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
+    "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
 )
 assert agent._assert_prompt_policy_identity_matches_signed_runtime() == (
     policy_payload["final_policy_version"],
@@ -762,16 +777,18 @@ assert "hmb_camera_space_depth_v7" not in widget_source
 assert "HMB_PICKER_COMMAND" in widget_source
 assert "HMB_VIDEO_PICKER_COMMAND_REGISTRY_KEY" in widget_source
 assert "return latestProps.onChange(command)" in command_widget_source
-assert "props.onChange(JSON.parse(JSON.stringify(normalized)))" in widget_source
+assert "hmbDeliverPickerStateIfMounted(" in widget_source
+assert "JSON.parse(JSON.stringify(normalized))" in widget_source
 assert "def _apply_widget_action(" not in picker_source
 assert "commitAndRemount" not in widget_source
 assert "HMBVideoPickerLibraryWidget(container, {" not in widget_source
 assert "emit(props, state);\n          remount();" not in prompt_widget_source
-assert prompt_widget_source.count("emit(props, state);\n        remount();") == 1
+assert "emit(props, state, container);\n        remount();" not in prompt_widget_source
 assert 'state.ui.language = uiLanguage(state) === "ko" ? "en" : "ko";' in prompt_widget_source
-assert prompt_widget_source.count("remount();") == 4
+assert prompt_widget_source.count("remount();") == 2
 assert "hmbCommitLocalPromptStructure(container, props, state, remount)" in prompt_widget_source
-assert "if (currentValue === nextValue && !disabledChanged) return;" in prompt_widget_source
+assert "if (currentValue === nextValue && !disabledChanged) {" in prompt_widget_source
+assert "if (dirtyText.length || shouldRepublishRevisionMerge) {" in prompt_widget_source
 assert 'pending_action: "read_scene"' not in widget_source
 assert 'pending_action: "run_video"' not in widget_source
 assert 'pending_action: "render_snapshot"' not in widget_source
@@ -793,7 +810,14 @@ assert 'class="warnings"' not in widget_source
 assert ".warnings{" not in widget_source
 assert 'id="activity-log-view" class="activity-log-view" role="log" aria-live="polite"' in widget_source
 assert '.activity-log-row[data-level="ERROR"]{color:#fb7185}' in widget_source
-assert 'container.style.overflow = "visible"' in widget_source
+# v0.6.46 leaves broad host/adaptive ancestors untouched. Compact and expanded
+# modes may size only the exact recognized HMB_PICKER_STATE row and its spacer,
+# restoring their snapshots on transition; broad overflow overrides stay banned.
+assert 'container.style.overflow = "visible"' not in widget_source
+assert "export function hmbApplyVideoPickerCompactTailReclaim(" in widget_source
+assert "export function hmbRestoreVideoPickerCompactTailReclaim(container)" in widget_source
+assert 'container.closest?.(\'[data-parameter-name="HMB_PICKER_STATE"]\')' in widget_source
+assert 'clean(element.getAttribute?.("aria-hidden")).toLowerCase() === "true"' in widget_source
 assert "hmbEnsurePickerBootstrapNode" not in command_widget_source
 assert "export function hmbCollapseCommandBridgeLayoutRow(container)" in command_widget_source
 assert "parentElement" not in command_widget_source
@@ -806,7 +830,7 @@ assert "function hmbApplyPickerInitialNodeSizeOnce(container)" in widget_source
 assert "hmbApplyPickerInitialNodeSizeOnce(container);\n  concealNativeMayaPicker(container);" in widget_source
 assert "currentWidth < HMB_DEFAULT_NODE_WIDTH - 1" not in widget_source
 assert "currentHeight < HMB_DEFAULT_NODE_HEIGHT - 1" not in widget_source
-assert "const HMB_RIGHT_SECTION_DEFAULT_HEIGHTS = { settings: 285, color: 628, log: 208 };" in widget_source
+assert "const HMB_RIGHT_SECTION_DEFAULT_HEIGHTS = { settings: 217, color: 628, log: 208 };" in widget_source
 assert '{ value: "1920x1080", width: 1920, height: 1080' in widget_source
 assert 'id="playblast-resolution"' in widget_source
 assert "(1920, 1080)" in picker_source
@@ -816,7 +840,7 @@ assert "hmbAdjustPickerNodeHeightForVideoSlots" not in widget_source
 assert 'hmbScopeWidgetStyleMarkup(pickerMarkup, ".hmbvp")' in widget_source
 assert "hmbPreparePickerSlotTransition(" not in widget_source
 assert 'data-video-asset-uid="${escapeHtml(uid)}"' in widget_source
-assert 'data-selected-video-order="${order}"' in widget_source
+assert 'data-selected-video-order="${Number(order || 0)}"' in widget_source
 assert 'draggable="true"' in widget_source
 assert 'data-hmb-picker-slot-transition="true"' not in widget_source
 assert "hmb-picker-native-row-in" not in widget_source
@@ -857,8 +881,9 @@ assert catalog["version"] == 4
 character = [item["name"] for item in catalog["character"]]
 background = [item["name"] for item in catalog["background"]]
 expected_actor = ["Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink"]
+expected_ghost = ["Sky Blue", "Mint", "Beige"]
 expected_object = [
-    "Sky Blue", "Mint", "Beige",
+    *expected_ghost,
     "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern",
 ]
 assert character == expected_actor
@@ -867,7 +892,9 @@ assert picker.MARKER_ORDER == expected_actor + expected_object
 assert prompt.ACTOR_COLOR_PICK_CHOICES == expected_actor
 assert prompt.OBJECT_COLOR_PICK_CHOICES == expected_object
 assert prompt.COLOR_PICK_CHOICES == picker.MARKER_ORDER
-assert prompt._color_pick_choices_for_source_type("Character Appearance") == expected_actor
+assert prompt._color_pick_choices_for_source_type("Character Appearance") == (
+    expected_actor + expected_ghost
+)
 assert prompt._color_pick_choices_for_source_type("Prop / Accessory") == expected_object
 
 original_mayabatch_candidates = picker._mayabatch_candidates
@@ -948,11 +975,15 @@ video_parameter = picker._get_parameter_obj(node, "VIDEO_OUT")
 assert video_parameter is not None
 assert video_parameter.output_type == "list[str]"
 assert video_parameter.default_value == []
-assert video_parameter.ui_options["display_name"] == "VIDEO OUT"
+assert video_parameter.ui_options["display_name"] == ""
+assert video_parameter.ui_options["hide"] is True
+assert video_parameter.ui_options["height"] == 1
 
 # Generated workflows hydrate HMB_PICKER_STATE with initial_setup=True. The
 # saved UID/catalog selection must restore one synchronized media list.
-initial_restore_node = picker.HMBVideoPickerLibrary(name="initial_three_slot_restore")
+initial_restore_node = install_engine_hooks(
+    picker.HMBVideoPickerLibrary(name="initial_three_slot_restore")
+)
 initial_restore_state = initial_restore_node._picker_state()
 initial_restore_state.update({
     "runtime_instance_id": "serialized-previous-runtime",
@@ -1031,9 +1062,11 @@ else:
     assert picker_output_parameter.allow_input is False
 assert picker_output_parameter.input_types in ([], ["str"])
 assert picker_output_parameter.hide_property is True
-assert picker_output_parameter.ui_options["display_name"] == "PICKER OUT"
+assert picker_output_parameter.ui_options["display_name"] == ""
 assert picker_output_parameter.ui_options["hide_property"] is True
-assert picker_output_parameter.ui_options["is_full_width"] is False
+assert picker_output_parameter.ui_options["is_full_width"] is True
+assert picker_output_parameter.ui_options["hide"] is True
+assert picker_output_parameter.ui_options["hide_handles"] is True
 picker.set_output(node, "PICKER_OUT", "picker-contract-preserved")
 picker_output_parameter.hide_property = False
 picker_output_parameter.ui_options.update({
@@ -1043,9 +1076,9 @@ picker_output_parameter.ui_options.update({
 })
 node._ensure_parameters()
 assert picker_output_parameter.hide_property is True
-assert picker_output_parameter.ui_options["display_name"] == "PICKER OUT"
+assert picker_output_parameter.ui_options["display_name"] == ""
 assert picker_output_parameter.ui_options["hide_property"] is True
-assert "hide_handles" not in picker_output_parameter.ui_options
+assert picker_output_parameter.ui_options["hide_handles"] is True
 assert node.parameter_output_values["PICKER_OUT"] == "picker-contract-preserved"
 prompt_port_node = prompt.HMBPromptLibrary(name="prompt_output_port_contract")
 prompt_output_parameter = prompt._get_parameter_obj(prompt_port_node, "PROMPT_OUT")
@@ -1059,9 +1092,11 @@ else:
     assert prompt_output_parameter.allow_input is False
 assert prompt_output_parameter.input_types in ([], ["str"])
 assert prompt_output_parameter.hide_property is True
-assert prompt_output_parameter.ui_options["display_name"] == "PROMPT OUT"
+assert prompt_output_parameter.ui_options["display_name"] == ""
 assert prompt_output_parameter.ui_options["hide_property"] is True
-assert prompt_output_parameter.ui_options["is_full_width"] is False
+assert prompt_output_parameter.ui_options["is_full_width"] is True
+assert prompt_output_parameter.ui_options["hide"] is True
+assert prompt_output_parameter.ui_options["hide_handles"] is True
 prompt.set_output(prompt_port_node, "PROMPT_OUT", "prompt-contract-preserved")
 prompt_output_parameter.hide_property = False
 prompt_output_parameter.ui_options.update({
@@ -1071,21 +1106,22 @@ prompt_output_parameter.ui_options.update({
 })
 prompt_port_node._ensure_prompt_output()
 assert prompt_output_parameter.hide_property is True
-assert prompt_output_parameter.ui_options["display_name"] == "PROMPT OUT"
+assert prompt_output_parameter.ui_options["display_name"] == ""
 assert prompt_output_parameter.ui_options["hide_property"] is True
-assert "hide_handles" not in prompt_output_parameter.ui_options
+assert prompt_output_parameter.ui_options["hide_handles"] is True
 assert prompt_port_node.parameter_output_values["PROMPT_OUT"] == "prompt-contract-preserved"
 state_parameter = picker._get_parameter_obj(node, picker.WIDGET_STATE_PARAMETER)
 command_parameter = picker._get_parameter_obj(node, picker.WIDGET_COMMAND_PARAMETER)
 assert picker.PICKER_START_WIDTH == 1400
 assert picker.PICKER_START_HEIGHT == 1200
-assert picker.PICKER_WIDGET_START_HEIGHT == picker.PICKER_WIDGET_MIN_HEIGHT == 1151
+assert picker.PICKER_WIDGET_START_HEIGHT == picker.PICKER_WIDGET_COMPACT_MOUNT_HEIGHT == 252
+assert picker.PICKER_WIDGET_MIN_HEIGHT == 1151
 assert picker.PICKER_WIDGET_COMPACT_MOUNT_HEIGHT == 252
 assert picker.PICKER_COMPACT_NATIVE_HEIGHT == 360
-assert picker.PICKER_NATIVE_SIZE_VERSION == 6
+assert picker.PICKER_NATIVE_SIZE_VERSION == 7
 assert node.metadata["size"] == {
     "width": picker.PICKER_START_WIDTH,
-    "height": picker.PICKER_START_HEIGHT,
+    "height": picker.PICKER_COMPACT_NATIVE_HEIGHT,
 }
 assert node.metadata[picker.PICKER_EXPANDED_SIZE_METADATA_KEY] == {
     "width": picker.PICKER_START_WIDTH,
@@ -1393,8 +1429,10 @@ assert 'id="browse-maya-scene"' in widget_source
 assert 'id="load-maya-scene"' not in widget_source
 assert widget_source.count('id="read-scene"') == 1
 assert "openNativeMayaPicker(container)" in widget_source
-assert "window.setInterval(checkSelectionResult, 200)" in widget_source
-assert "container.__hmbNativePickerDeadlineMs = Date.now() + 120000" in widget_source
+assert "window.setInterval(checkSelectionResult, 200)" not in widget_source
+assert "const HMB_PICKER_BROWSE_POLL_DELAYS_MS" in widget_source
+assert "+ HMB_PICKER_BROWSE_POLL_DELAYS_MS.reduce((total, delay) => total + delay, 0)" in widget_source
+assert "hmbNativeMayaBrowseSessionOwnedBy(container, ownerActionId)" in widget_source
 assert 'id="open-video"' not in widget_source
 assert 'id="open-video-file"' not in widget_source
 assert "__hmbOpenedVideoUrl" not in widget_source
@@ -1403,8 +1441,9 @@ assert "URL.createObjectURL" not in widget_source
 assert "URL.revokeObjectURL" not in widget_source
 assert 'data-visibility-path=' in widget_source
 assert "slot_visibility" in widget_source
-assert "const actorOptions = markerOptions.slice(0, 7)" in widget_source
-assert "const objectOptions = markerOptions.slice(7, 14)" in widget_source
+assert "const actorOptions = paletteGroups.actor;" in widget_source
+assert "const ghostOptions = paletteGroups.ghost;" in widget_source
+assert "const objectOptions = paletteGroups.object;" in widget_source
 assert 'id="create-snapshot"' in widget_source
 assert 'id="delete-snapshot"' in widget_source
 assert 'id="snapshot-prev"' in widget_source
@@ -1413,8 +1452,9 @@ assert 'id="snapshot-next"' in widget_source
 assert 'id="video-prev-frame"' not in widget_source
 assert 'id="video-next-frame"' not in widget_source
 assert 'id="video-seek"' in widget_source
-assert "viewportVideo.loop = true" in widget_source
-assert "MutationObserver" not in widget_source
+assert "viewportVideo.loop = true" not in widget_source
+assert "media.loop = false;" in widget_source
+assert widget_source.count("ownerDocument?.defaultView?.MutationObserver") == 3
 assert "READ_PREVIEW_WIDTH" not in picker_source
 assert "READ_PREVIEW_HEIGHT" not in picker_source
 assert 'f"{scene_path.stem}_Orignal.mp4"' in picker_source
@@ -2240,19 +2280,22 @@ prompt_state = prompt._default_widget_state()
 prompt_state["images"][0].update(
     present=True,
     label="Hero",
-    source_type="Character Appearance",
+    image_main_type="Character",
+    image_sub_type="Full Appearance",
 )
 prompt_state["images"].append(prompt._default_image_item(2))
 prompt_state["images"][1].update(
     present=True,
     label="Ground",
-    source_type="Foreground / Ground",
+    image_main_type="Environment / Background",
+    image_sub_type="Ground / Floor",
 )
 prompt_state["images"].append(prompt._default_image_item(3))
 prompt_state["images"][2].update(
     present=True,
     label="Trees",
-    source_type="Environment / Background",
+    image_main_type="Environment / Background",
+    image_sub_type="Main Background",
 )
 applied = prompt._apply_picker_payload(prompt_state, payload, connected=True)
 assert applied["images"][0]["color_picks"] == ["Red"]
@@ -2265,8 +2308,10 @@ assert [item["asset_id"] for item in applied["picker"]["markers"] if item["color
 ]
 assert applied["videos"][0]["label"] == "shot_playblast_1"
 assert applied["videos"][1]["label"] == "shot_playblast_2"
-assert applied["videos"][0]["source_type"] == "Maya Preview / Playblast"
-assert applied["videos"][0]["control_role"] == ""
+assert applied["videos"][0]["video_main_type"] == "Maya Preview / Playblast"
+assert applied["videos"][0]["video_sub_type"] == "Original Preview"
+assert applied["videos"][0]["source_type"] == "Unified Shot-Control Video"
+assert applied["videos"][0]["control_role"] == "Primary Unified Shot Control"
 compiled_picker_prompt = prompt._build_prompt_package(applied)
 assert agent._is_hmb_prompt_library_payload(compiled_picker_prompt)
 

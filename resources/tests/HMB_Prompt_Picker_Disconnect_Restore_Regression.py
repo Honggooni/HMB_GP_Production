@@ -191,6 +191,31 @@ assert user_marker_disconnected["images"][0]["color_picks"] == ["Blue"]
 assert user_marker_disconnected["images"][0]["picker_auto_color"] == ""
 assert user_marker_disconnected["images"][0]["picker_auto_video"] == 0
 
+# A later connected source generation advances only the automatic baseline.
+# Prompt-authored text and a valid user Color Pick remain different from that
+# baseline and therefore survive both the refresh and the true disconnect.
+refreshed_user_edit = copy.deepcopy(marker_live)
+refreshed_user_edit["text"]["VIDEO_VFX"] = "user connected VFX edit"
+refreshed_user_edit["images"][0]["color_picks"] = ["Green"]
+refreshed_user_edit = prompt._apply_picker_payload(
+    refreshed_user_edit,
+    uid_payload(("marker-video",), marker_asset_id="hero"),
+    connected=True,
+)
+assert refreshed_user_edit["text"]["VIDEO_VFX"] == "user connected VFX edit"
+assert refreshed_user_edit["images"][0]["color_picks"] == ["Green"]
+refreshed_user_disconnect = prompt._apply_picker_payload(
+    refreshed_user_edit,
+    {},
+    connected=False,
+)
+assert refreshed_user_disconnect["text"]["VIDEO_VFX"] == (
+    "user connected VFX edit"
+)
+assert refreshed_user_disconnect["images"][0]["color_picks"] == ["Green"]
+assert refreshed_user_disconnect["images"][0]["picker_auto_color"] == ""
+assert refreshed_user_disconnect["images"][0]["picker_auto_video"] == 0
+
 
 # selected=0 produces only a transient visible placeholder. It never joins the
 # immutable manual cache, including a TEMP edit that cannot occur through the

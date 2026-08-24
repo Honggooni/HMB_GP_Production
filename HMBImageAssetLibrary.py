@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
+import asyncio
 import base64
+import copy
 import hashlib
 import importlib.util
 from io import BytesIO
@@ -126,6 +128,11 @@ MEDIA_OUTPUT_DISPLAY_NAME = "Video Generation Out"
 STATE_SCHEMA = "hmb-image-asset-library-state"
 OUTPUT_SCHEMA = "hmb-image-asset-library-binding"
 STATE_VERSION = 4
+RESET_HANDOFF_SCHEMA = "hmb-image-asset-reset-handoff"
+RESET_HANDOFF_VERSION = 1
+RESET_HANDOFF_IDENTITY_CONTRACT = (
+    "preserve-channel-shot-new-publisher-runtime-v1"
+)
 UI_EDIT_REVISION_KEY = "ui_edit_revision"
 MAX_UI_EDIT_REVISION = (1 << 53) - 1
 OUTPUT_VERSION = 4
@@ -2560,6 +2567,104 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
         }
     )
     return state
+
+
+_IMAGE_ASSET_RESET_DURABLE_FIELDS = (
+    "catalog_root",
+    "projects",
+    "project_root",
+    "project_id",
+    "project_uid",
+    "manifest_signature",
+    "folders",
+    "assets",
+)
+
+
+def _reset_image_asset_state_preserving_shot_media(value: Any) -> Dict[str, Any]:
+    """Reset transient UI/work state while retaining the Shot image library.
+
+    Griptape implements Reset Node by constructing a temporary replacement and
+    retiring the old object.  The replacement must start with no scan, request,
+    registration, error, filter, or layout draft, but the selected asset rows
+    and their per-Shot membership are workflow data rather than authoring
+    scratch state.  Preserve those fields as one normalized snapshot so order,
+    selection and active Shot cannot drift during the replacement transaction.
+    """
+
+    source = _normalize_state(value)
+    reset = _default_state()
+    for field in _IMAGE_ASSET_RESET_DURABLE_FIELDS:
+        reset[field] = copy.deepcopy(source.get(field))
+    ordered_selected_source_uids = [
+        _clean(asset.get("source_uid"))
+        for asset in sorted(
+            (
+                asset
+                for asset in source.get("assets", [])
+                if isinstance(asset, dict) and bool(asset.get("selected"))
+            ),
+            key=lambda asset: _non_negative_int(
+                asset.get("selection_order")
+            ),
+        )
+        if _clean(asset.get("source_uid"))
+    ]
+    source_routing = source.get("shot_routing")
+    source_routing = source_routing if isinstance(source_routing, dict) else {}
+    source_shots = [
+        item
+        for item in source_routing.get("shots", [])
+        if isinstance(item, dict)
+    ][:MAX_SHOTS]
+    source_active_uuid = _uuid_text(source_routing.get("active_shot_uuid"))
+    replacement_shots: List[Dict[str, Any]] = []
+    for index, shot in enumerate(source_shots, start=1):
+        replacement_shots.append(
+            {
+                # Channel and Shot UUIDs are durable workflow addresses used
+                # by downstream Shot participants. Reset changes the publisher
+                # runtime, not the content address of an existing Shot.
+                "shot_uuid": _uuid_text(shot.get("shot_uuid")),
+                "number": index,
+                "name": _clean(shot.get("name"))[:128] or f"Shot {index}",
+                "name_is_custom": bool(shot.get("name_is_custom")),
+                "revision": _non_negative_int(shot.get("revision")) + 1,
+                "selected_source_uids": copy.deepcopy(
+                    shot.get("selected_source_uids")
+                    if isinstance(shot.get("selected_source_uids"), list)
+                    else []
+                ),
+                # Media hashes are derived again by the new publisher runtime;
+                # no previous process cache is authority after Reset.
+                "media_count": 0,
+                "metadata_sha256": "",
+                "media_sha256": "",
+            }
+        )
+    replacement_routing = {
+        "publisher_instance_uuid": _new_uuid_text(),
+        "channel_uuid": _uuid_text(source_routing.get("channel_uuid")),
+        "generation": 1,
+        "active_shot_uuid": source_active_uuid,
+        "expanded": False,
+        "shots": replacement_shots,
+    }
+    reset["shot_routing"] = _normalize_shot_routing(
+        replacement_routing,
+        ordered_selected_source_uids,
+    )
+    # Monotonic revisions reject any browser echo queued for the retired
+    # object without treating Reset itself as a filesystem refresh request.
+    reset["scan_revision"] = _non_negative_int(source.get("scan_revision")) + 1
+    reset["refresh_revision"] = _non_negative_int(
+        source.get("refresh_revision")
+    )
+    reset[UI_EDIT_REVISION_KEY] = min(
+        MAX_UI_EDIT_REVISION,
+        _non_negative_int(source.get(UI_EDIT_REVISION_KEY)) + 1,
+    )
+    return _normalize_state(reset)
 
 
 def _merge_scan_with_state(
@@ -5194,6 +5299,8 @@ class HMBImageAssetLibrary(DataNode):
         self._hmb_scan_thread: threading.Thread | None = None
         self._hmb_scan_pending_result: tuple[int, str, str, Dict[str, Any]] | None = None
         self._hmb_node_deleted = False
+        self._hmb_initial_catalog_scan_pending = True
+        self._hmb_initial_catalog_root = str(DEFAULT_PROJECTS_ROOT)
         # Constructor/default catalog scans are not serialized workflow
         # authority. The host initial_setup lifecycle or an explicit user
         # action adopts the aggregate before any whole-flow reconciliation.
@@ -5263,7 +5370,11 @@ class HMBImageAssetLibrary(DataNode):
         root_value = _project_root_text(
             _get_parameter_raw(self, PROJECT_ROOT_PARAMETER)
         )
-        self._load_catalog(root_value or str(DEFAULT_PROJECTS_ROOT))
+        # The constructor is a retained-mode/UI callback and may run while the
+        # default catalog points at an unavailable UNC share.  Keep the
+        # parameter's already-normalized snapshot paintable immediately; exact
+        # registration below owns the first filesystem discovery generation.
+        self._hmb_initial_catalog_root = root_value or str(DEFAULT_PROJECTS_ROOT)
         scheduler = getattr(
             _hmb_shot_routing, "schedule_post_registration_reconcile", None
         )
@@ -5334,6 +5445,52 @@ class HMBImageAssetLibrary(DataNode):
             _hmb_shot_routing, "schedule_post_hydration_reconcile", None
         )
         return bool(callable(scheduler) and scheduler(self))
+
+    def _hmb_post_registration_shot_discovery(self) -> None:
+        """Start the first catalog scan only after exact host registration.
+
+        Constructor state is the immutable last-known snapshot.  Registration
+        may race workflow hydration or an explicit root edit, so any newer scan
+        generation remains authoritative and suppresses this default request.
+        """
+
+        self._ensure_scan_runtime_state()
+        with self._hmb_scan_lock:
+            if not bool(getattr(self, "_hmb_initial_catalog_scan_pending", False)):
+                return
+            self._hmb_initial_catalog_scan_pending = False
+            if self._hmb_scan_pending_key or bool(
+                getattr(self, "_hmb_node_deleted", False)
+            ):
+                return
+
+        snapshot = self._current_state()
+        requested_root = (
+            _project_root_text(snapshot.get("catalog_root"))
+            or _project_root_text(
+                _get_parameter_raw(self, PROJECT_ROOT_PARAMETER)
+            )
+            or _project_root_text(
+                getattr(self, "_hmb_initial_catalog_root", "")
+            )
+            or str(DEFAULT_PROJECTS_ROOT)
+        ).replace("\\", "/")
+        candidate = dict(snapshot)
+        candidate["catalog_root"] = requested_root
+        candidate["error"] = ""
+        captured_import_value = _get_parameter_raw(
+            self,
+            IMAGE_IMPORT_PARAMETER,
+        )
+        self._schedule_catalog_scan(
+            f"initial:{requested_root.casefold()}",
+            candidate,
+            lambda: self._merge_captured_imports_into_scan(
+                _load_project_catalog(requested_root, snapshot),
+                captured_import_value,
+            ),
+            failure_state=snapshot,
+        )
 
     def _current_state(self) -> Dict[str, Any]:
         return _normalize_state(
@@ -5546,6 +5703,106 @@ class HMBImageAssetLibrary(DataNode):
             "shot_number": active["number"],
             "shot_name": active["name"],
         }
+
+    def _hmb_export_reset_handoff(self) -> Dict[str, Any]:
+        """Export only durable image/Shot state for an in-flow node reset."""
+
+        self._ensure_scan_runtime_state()
+        with self._hmb_scan_lock:
+            state = _normalize_state(self._current_state())
+            import_value = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
+            import_media = dict(
+                getattr(self, "_hmb_import_media_by_uid", {}) or {}
+            )
+        try:
+            import_value = copy.deepcopy(import_value)
+        except Exception:
+            # Artifact/media wrappers may deliberately be non-copyable. The
+            # handoff is synchronous and in-process, so retaining that exact
+            # immutable host value is safer than dropping the imported image.
+            pass
+        return {
+            "schema": RESET_HANDOFF_SCHEMA,
+            "version": RESET_HANDOFF_VERSION,
+            "identity_contract": RESET_HANDOFF_IDENTITY_CONTRACT,
+            "participant_kind": "image_asset",
+            "state": state,
+            "project_root": _project_root_text(state.get("catalog_root")),
+            "import_value": import_value,
+            "import_media_by_uid": import_media,
+        }
+
+    def _hmb_adopt_reset_handoff(self, value: Any) -> bool:
+        """Adopt a predecessor's Shot images without restoring its UI/error state."""
+
+        payload = value if isinstance(value, dict) else {}
+        if (
+            payload.get("schema") != RESET_HANDOFF_SCHEMA
+            or payload.get("version") != RESET_HANDOFF_VERSION
+            or payload.get("identity_contract")
+            != RESET_HANDOFF_IDENTITY_CONTRACT
+            or _clean(payload.get("participant_kind")) != "image_asset"
+            or bool(getattr(self, "_hmb_node_deleted", False))
+        ):
+            return False
+        state = _reset_image_asset_state_preserving_shot_media(
+            payload.get("state")
+        )
+        project_root = (
+            _project_root_text(payload.get("project_root"))
+            or _project_root_text(state.get("catalog_root"))
+            or str(DEFAULT_PROJECTS_ROOT)
+        )
+        import_value = payload.get("import_value")
+        import_media = payload.get("import_media_by_uid")
+        if not isinstance(import_media, dict):
+            return False
+
+        self._ensure_scan_runtime_state()
+        with self._hmb_scan_lock:
+            self._hmb_scan_generation += 1
+            self._hmb_scan_pending_key = ""
+            self._hmb_scan_pending_result = None
+            self._hmb_scan_thread = None
+            self._hmb_initial_catalog_scan_pending = False
+        self._replace_import_media(dict(import_media))
+        self._hmb_last_applied_import_identity = (
+            _canonical_import_input_identity(import_value)
+        )
+
+        # Store reconstructed connection aggregates through the ordinary host
+        # lifecycle, but keep their callbacks inert until the one coherent
+        # durable snapshot is published below.
+        self._hmb_root_syncing = True
+        self._hmb_state_syncing = True
+        try:
+            self.set_parameter_value(
+                PROJECT_ROOT_PARAMETER,
+                project_root,
+                initial_setup=True,
+                emit_change=False,
+                skip_before_value_set=True,
+            )
+            self.set_parameter_value(
+                IMAGE_IMPORT_PARAMETER,
+                import_value,
+                initial_setup=True,
+                emit_change=False,
+                skip_before_value_set=True,
+            )
+        finally:
+            self._hmb_state_syncing = False
+            self._hmb_root_syncing = False
+
+        state["catalog_root"] = project_root.replace("\\", "/")
+        self._hmb_hydration_adopted = False
+        adopted = self._publish_state(state)
+        self._hmb_hydration_adopted = True
+        self._hmb_initial_catalog_root = project_root
+        return bool(
+            adopted.get("assets") == state.get("assets")
+            and adopted.get("shot_routing") == state.get("shot_routing")
+        )
 
     def _reconcile_hmb_shot_routing(
         self,
@@ -5836,8 +6093,14 @@ class HMBImageAssetLibrary(DataNode):
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return False
         try:
+            from griptape_nodes.retained_mode.engine import has_current_engine  # type: ignore
             from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes  # type: ignore
 
+            # Unit/legacy hosts may expose the package without an active Engine.
+            # Identity cannot be stale before registration exists, and probing
+            # GriptapeNodes here would synchronously construct the whole Engine.
+            if not has_current_engine():
+                return True
             node_name = _clean(getattr(self, "name", ""))
             if node_name:
                 registered = GriptapeNodes.NodeManager().get_node_by_name(node_name)
@@ -5908,15 +6171,34 @@ class HMBImageAssetLibrary(DataNode):
         busy["error"] = ""
         busy = self._publish_state(busy)
         node_ref = weakref.ref(self)
+        # Never instantiate/resolve Griptape's Engine from this UI callback.
+        # In actual-host tests a cold EventManager lookup can take seconds.  A
+        # running callback loop is sufficient for thread-safe publication; a
+        # synchronous/legacy host uses the existing retained-mode consumption
+        # fallback instead.
         event_loop = None
         try:
-            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes  # type: ignore
-
-            event_loop = GriptapeNodes.EventManager().event_loop
-        except ImportError:
+            event_loop = asyncio.get_running_loop()
+        except RuntimeError:
             event_loop = None
         except Exception as exc:
             _diagnostic_exception("Background project scan event-loop lookup", exc)
+        if event_loop is None:
+            try:
+                from griptape_nodes.retained_mode.engine import has_current_engine  # type: ignore
+                from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes  # type: ignore
+
+                # This guard is the important boundary: never let a catalog UI
+                # callback lazily construct an Engine just to locate its loop.
+                if has_current_engine():
+                    event_loop = GriptapeNodes.EventManager().event_loop
+            except ImportError:
+                event_loop = None
+            except Exception as exc:
+                _diagnostic_exception(
+                    "Active background project scan event-loop lookup",
+                    exc,
+                )
 
         def apply_result(
             result: Dict[str, Any],
@@ -6032,7 +6314,7 @@ class HMBImageAssetLibrary(DataNode):
                 if (
                     generation != owner._hmb_scan_generation
                     or key != owner._hmb_scan_pending_key
-                    or not owner._scan_owner_is_current()
+                    or bool(getattr(owner, "_hmb_node_deleted", False))
                 ):
                     return
                 thread = threading.Thread(
@@ -6043,14 +6325,10 @@ class HMBImageAssetLibrary(DataNode):
                 owner._hmb_scan_thread = thread
             thread.start()
 
-        try:
-            if event_loop is not None and event_loop.is_running():
-                event_loop.call_soon_threadsafe(launch)
-            else:
-                launch()
-        except Exception as exc:
-            _diagnostic_exception("Background project scan scheduling fallback", exc)
-            launch()
+        # Starting a daemon thread is bounded and does not require any retained-
+        # mode manager.  Only the completed result is marshalled back to the
+        # captured UI loop.
+        launch()
         return busy
 
     def _consume_pending_catalog_scan_result(self) -> bool:
@@ -6120,6 +6398,7 @@ class HMBImageAssetLibrary(DataNode):
     def _schedule_catalog_root_change(self, root_value: Any) -> Dict[str, Any]:
         """Acknowledge a picker edit immediately and discover it off-thread."""
 
+        self._hmb_initial_catalog_scan_pending = False
         requested_root = (
             _project_root_text(root_value) or str(DEFAULT_PROJECTS_ROOT)
         ).replace("\\", "/")
@@ -6651,6 +6930,7 @@ class HMBImageAssetLibrary(DataNode):
         self._hmb_last_applied_import_identity = None
         self._ensure_parameters()
         self._ensure_scan_runtime_state()
+        self._hmb_initial_catalog_scan_pending = False
         saved_state = self._current_state()
         saved_root = _project_root_text(saved_state.get("catalog_root"))
         parameter_root = _project_root_text(
@@ -6688,10 +6968,38 @@ class HMBImageAssetLibrary(DataNode):
     def after_node_deleted(self, *args: Any, **kwargs: Any) -> Any:
         """Reconcile surviving Shot participants exactly once on deletion."""
 
+        prepare = getattr(
+            _hmb_shot_routing,
+            "prepare_node_deletion",
+            None,
+        )
+        if callable(prepare) and not bool(
+            getattr(self, "_hmb_node_deleted", False)
+        ):
+            try:
+                prepare(self)
+            except Exception as exc:
+                _diagnostic_exception(
+                    "ImageAsset reset handoff preparation failed",
+                    exc,
+                )
         self._ensure_scan_runtime_state()
         first_delete = not bool(getattr(self, "_hmb_node_deleted", False))
         if first_delete:
             self._hmb_node_deleted = True
+            release = getattr(
+                _hmb_shot_routing,
+                "release_node_lifecycle",
+                None,
+            )
+            if callable(release):
+                try:
+                    release(self)
+                except Exception as exc:
+                    _diagnostic_exception(
+                        "ImageAsset lifecycle release failed",
+                        exc,
+                    )
             with self._hmb_scan_lock:
                 self._hmb_scan_generation += 1
                 self._hmb_scan_pending_key = ""

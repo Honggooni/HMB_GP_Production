@@ -44,6 +44,46 @@ with tempfile.TemporaryDirectory() as temporary:
     assert resolved_absolute is not None
     assert resolved_absolute.resolve() == local_video.resolve()
 
+    # One state publication builds both public and per-Shot projections. Share
+    # the readability result for that exact revision, but never retain it into
+    # the next publication where an external deletion must be observable.
+    uncached_probe = picker._probe_readable_video_reference
+    probe_calls: list[str] = []
+
+    def counted_probe(value):
+        probe_calls.append(str(value))
+        return uncached_probe(value)
+
+    picker._probe_readable_video_reference = counted_probe
+    try:
+        cached_state = {
+            "videos": [
+                selected_item(
+                    "cached-local",
+                    1,
+                    video_path=str(local_video),
+                )
+            ]
+        }
+        revision_cache = {}
+        for _projection in range(2):
+            _payload, cached_media = picker._build_synchronized_video_outputs(
+                cached_state,
+                enforce_media_availability=True,
+                probe_cache=revision_cache,
+            )
+            assert cached_media == [str(local_video)]
+        assert probe_calls == [str(local_video)]
+
+        picker._build_synchronized_video_outputs(
+            cached_state,
+            enforce_media_availability=True,
+            probe_cache={},
+        )
+        assert probe_calls == [str(local_video), str(local_video)]
+    finally:
+        picker._probe_readable_video_reference = uncached_probe
+
     # A valid project macro remains the emitted authority, not its expanded
     # machine-specific path.
     project_macro = "inputs/videos/verified-project.mp4"

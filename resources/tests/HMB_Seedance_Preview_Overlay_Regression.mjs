@@ -24,6 +24,12 @@ const generation = (phase, overrides = {}) => ({
 
 assert.equal(typeof widget.hmbSeedanceGenerationPreview, "function");
 assert.equal(typeof widget.hmbSeedancePreviewPresentation, "function");
+assert.equal(typeof widget.hmbSeedancePreviewMutationIsRelevant, "function");
+assert.equal(
+  widget.HMB_SEEDANCE_PREVIEW_ACTION_WATCHDOG_MS,
+  10_000,
+  "The overlay transport watchdog must release an unacknowledged request after ten seconds.",
+);
 
 assert.deepEqual(widget.hmbSeedanceGenerationPreview({ schema: "foreign", version: 99 }), {
   schema: "hmb-seedance-generation-preview",
@@ -117,6 +123,21 @@ for (const phase of ["cancelled_locally", "timed_out", "submission_unknown"]) {
 
 assert.match(widgetSource, /\[data-parameter-name=['"]video_url['"]\]/);
 assert.match(widgetSource, /\[data-vp-video-area\]/);
+assert.equal(
+  (widgetSource.match(/generation_refresh/g) || []).length,
+  0,
+  "Preview retrieval must never find or click React's native ParameterButton.",
+);
+assert.equal(
+  (widgetSource.match(/return\s+latestProps\.onChange\s*\(\s*\{/g) || []).length,
+  1,
+  "The hidden command bridge must own exactly one action-only onChange call site.",
+);
+assert.doesNotMatch(
+  widgetSource,
+  /refreshButton\.disabled\s*=/,
+  "The overlay must never mutate React-owned native ParameterButton state.",
+);
 assert.doesNotMatch(
   widgetSource,
   /\b(?:fetch|XMLHttpRequest|WebSocket)\s*\(/,
@@ -240,6 +261,7 @@ class FakeElement {
     };
     for (const listener of [...(this.listeners.get(type) || [])]) listener(event);
   }
+  click() { this.fire("click"); }
   load() {
     this.loadCount += 1;
     this.readyState = 0;
@@ -269,11 +291,119 @@ function previewFixture() {
   const region = element("div", "relative bg-black overflow-hidden", {
     "data-vp-video-area": "true",
   });
+  const commandParameter = element("div", "HMB_SEEDANCE_REFRESH_COMMAND", {
+    "data-parameter-name": "HMB_SEEDANCE_REFRESH_COMMAND",
+  });
+  const commandContainer = element("div", "seedance-command-widget");
   widgetParent.append(container);
   parameter.append(region);
-  nodeRoot.append(widgetParent, parameter);
-  return { nodeRoot, container, parameter, region };
+  commandParameter.append(commandContainer);
+  nodeRoot.append(widgetParent, parameter, commandParameter);
+  return {
+    nodeRoot,
+    container,
+    parameter,
+    region,
+    commandContainer,
+  };
 }
+
+function installCommandBridge(current, onChange) {
+  return widget.default(current.commandContainer, {
+    value: {
+      schema: "hmb-seedance-refresh-command",
+      version: 1,
+      action: "none",
+      action_id: "",
+      issued_at_ms: 0,
+    },
+    onChange,
+  });
+}
+
+function assertRefreshCommand(value) {
+  assert.equal(value?.schema, "hmb-seedance-refresh-command");
+  assert.equal(value?.version, 1);
+  assert.equal(value?.action, "refresh_existing");
+  assert.match(String(value?.action_id || ""), /^refresh-/);
+  assert.ok(Number.isSafeInteger(value?.issued_at_ms) && value.issued_at_ms > 0);
+  assert.equal("job_id" in value, false, "The browser must not nominate a Broker task ID.");
+  assert.deepEqual(
+    Object.keys(value).sort(),
+    ["action", "action_id", "issued_at_ms", "schema", "version"],
+    "The command transport must not echo Shot/catalog/generation state.",
+  );
+}
+
+const mutationFixture = previewFixture();
+const nodeResizer = element("div", "react-flow__node-resizer");
+assert.equal(
+  widget.hmbSeedancePreviewMutationIsRelevant({
+    type: "childList",
+    target: mutationFixture.nodeRoot,
+    addedNodes: [nodeResizer],
+    removedNodes: [],
+  }),
+  false,
+  "React Flow resizer mutations must not trigger a preview rescan.",
+);
+assert.equal(
+  widget.hmbSeedancePreviewMutationIsRelevant({
+    type: "attributes",
+    attributeName: "class",
+    target: mutationFixture.nodeRoot,
+    addedNodes: [],
+    removedNodes: [],
+  }),
+  false,
+  "Whole-node selection/class mutations must not trigger a preview rescan.",
+);
+const mutationOverlay = element("div", "hmb-seedance-preview-overlay");
+mutationFixture.region.append(mutationOverlay);
+assert.equal(
+  widget.hmbSeedancePreviewMutationIsRelevant({
+    type: "childList",
+    target: mutationFixture.region,
+    addedNodes: [mutationOverlay],
+    removedNodes: [],
+  }),
+  false,
+  "Mounting the overlay inside the preview region must not rescan itself.",
+);
+assert.equal(
+  widget.hmbSeedancePreviewMutationIsRelevant({
+    type: "childList",
+    target: mutationOverlay,
+    addedNodes: [element("span")],
+    removedNodes: [],
+  }),
+  false,
+  "The overlay's own DOM writes must not recursively schedule itself.",
+);
+assert.equal(
+  widget.hmbSeedancePreviewMutationIsRelevant({
+    type: "attributes",
+    attributeName: "data-raw-video-value",
+    target: mutationFixture.parameter,
+    addedNodes: [],
+    removedNodes: [],
+  }),
+  true,
+  "A video_url parameter mutation must resynchronize the preview.",
+);
+const mutationVideo = element("video");
+mutationFixture.region.append(mutationVideo);
+assert.equal(
+  widget.hmbSeedancePreviewMutationIsRelevant({
+    type: "attributes",
+    attributeName: "src",
+    target: mutationVideo,
+    addedNodes: [],
+    removedNodes: [],
+  }),
+  true,
+  "A native video source mutation must resynchronize the preview.",
+);
 
 const fixture = previewFixture();
 assert.equal(widget.hmbSeedanceFindPreviewRegion(fixture.container), fixture.region);
@@ -467,6 +597,14 @@ const refreshGeneration = generation("cancelled_locally", {
   has_existing_video: true,
   media_revision: 1,
 });
+const fixtureCommandBridge = installCommandBridge(fixture, (value) => {
+  assert.equal(
+    insideRefreshClickStack,
+    false,
+    "The action-only refresh dispatch must be deferred beyond the overlay click stack.",
+  );
+  refreshRequests.push(value);
+});
 fixture.container.__hmbSeedanceLatestProps = {
   value: {
     schema: "hmb-seedance-shot-ui",
@@ -475,13 +613,8 @@ fixture.container.__hmbSeedanceLatestProps = {
     shot: {},
     generation: refreshGeneration,
   },
-  onChange(request) {
-    assert.equal(
-      insideRefreshClickStack,
-      false,
-      "Refresh publication must be deferred beyond the button click stack.",
-    );
-    refreshRequests.push(request);
+  onChange() {
+    assert.fail("Refresh must not republish the durable Shot/catalog parameter.");
   },
 };
 widget.hmbSeedanceSyncPreviewOverlay(fixture.container, {
@@ -501,21 +634,25 @@ insideRefreshClickStack = false;
 await Promise.resolve();
 assert.equal(refreshButton.disabled, true);
 assert.equal(refreshButton.textContent, "기존 작업 확인 중…");
+assert.equal(overlay.getAttribute("aria-busy"), "true");
+assert.equal(
+  overlay.querySelector(".hmb-seedance-preview-overlay__title").textContent,
+  "기존 작업 결과 확인 중…",
+  "The pending state must be visible before Griptape receives the action.",
+);
 await new Promise((resolve) => setTimeout(resolve, 0));
 assert.equal(refreshRequests.length, 1, "One UI pulse must produce at most one backend refresh request.");
-assert.deepEqual(
-  refreshRequests[0],
-  { request: { action: "refresh_existing" } },
-  "The transient action must not republish the durable Shot/catalog state.",
-);
-assert.deepEqual(refreshRequests[0].request, { action: "refresh_existing" });
+assertRefreshCommand(refreshRequests[0]);
+refreshButton.fire("click");
+await new Promise((resolve) => setTimeout(resolve, 0));
 assert.equal(
-  Object.keys(refreshRequests[0].request).includes("job_id"),
-  false,
-  "The browser action itself must never nominate a task ID.",
+  refreshRequests.length,
+  1,
+  "An unresolved backend publication must keep duplicate clicks idempotent.",
 );
 
 assert.equal(widget.hmbSeedanceCleanupPreviewOverlay(fixture.container), true);
+fixtureCommandBridge.cleanup();
 assert.equal(fixture.region.querySelector(".hmb-seedance-preview-overlay"), null);
 assert.equal(fixture.region.getAttribute("data-hmb-seedance-preview-positioned"), "");
 await Promise.resolve();
@@ -525,6 +662,244 @@ assert.equal(
   null,
   "Cleanup must invalidate already queued synchronization work instead of reattaching an overlay.",
 );
+
+// Electron exposes requestAnimationFrame. The backend action must wait until a
+// full frame has committed the busy state, then leave that frame through a
+// timer. The no-rAF fallback was exercised by the fixture above.
+const rafFixture = previewFixture();
+const rafRequests = [];
+const rafCallbacks = new Map();
+let nextRafId = 1;
+const previousRequestAnimationFrame = globalThis.requestAnimationFrame;
+const previousCancelAnimationFrame = globalThis.cancelAnimationFrame;
+globalThis.requestAnimationFrame = (callback) => {
+  const id = nextRafId;
+  nextRafId += 1;
+  rafCallbacks.set(id, callback);
+  return id;
+};
+globalThis.cancelAnimationFrame = (id) => rafCallbacks.delete(id);
+try {
+  const rafCommandBridge = installCommandBridge(
+    rafFixture,
+    (value) => rafRequests.push(value),
+  );
+  rafFixture.container.__hmbSeedanceLatestProps = {
+    value: {
+      schema: "hmb-seedance-shot-ui",
+      schema_version: 2,
+      shot_catalog: {},
+      shot: {},
+      generation: refreshGeneration,
+    },
+    onChange() { assert.fail("Refresh must not update durable Shot state."); },
+  };
+  widget.hmbSeedanceSyncPreviewOverlay(rafFixture.container, {
+    generation: refreshGeneration,
+  });
+  const rafOverlay = rafFixture.region.querySelector(".hmb-seedance-preview-overlay");
+  const rafButton = rafOverlay.querySelector("[data-hmb-seedance-preview-action]");
+  rafButton.fire("click");
+  await Promise.resolve();
+  assert.equal(rafOverlay.getAttribute("aria-busy"), "true");
+  assert.equal(rafRequests.length, 0);
+  assert.equal(rafCallbacks.size, 1);
+  const [[rafId, rafCallback]] = [...rafCallbacks.entries()];
+  rafCallbacks.delete(rafId);
+  rafCallback(16.7);
+  assert.equal(
+    rafRequests.length,
+    0,
+    "The backend action cannot run inside the frame that paints its busy state.",
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(rafRequests.length, 1);
+  assertRefreshCommand(rafRequests[0]);
+  assert.equal(widget.hmbSeedanceCleanupPreviewOverlay(rafFixture.container), true);
+  rafCommandBridge.cleanup();
+
+  const cancelledRafFixture = previewFixture();
+  const cancelledRafRequests = [];
+  const cancelledRafCommandBridge = installCommandBridge(
+    cancelledRafFixture,
+    (value) => cancelledRafRequests.push(value),
+  );
+  cancelledRafFixture.container.__hmbSeedanceLatestProps = {
+    value: {
+      schema: "hmb-seedance-shot-ui",
+      schema_version: 2,
+      shot_catalog: {},
+      shot: {},
+      generation: refreshGeneration,
+    },
+    onChange() { assert.fail("Refresh must not update durable Shot state."); },
+  };
+  widget.hmbSeedanceSyncPreviewOverlay(cancelledRafFixture.container, {
+    generation: refreshGeneration,
+  });
+  cancelledRafFixture.region
+    .querySelector("[data-hmb-seedance-preview-action]")
+    .fire("click");
+  await Promise.resolve();
+  assert.equal(rafCallbacks.size, 1);
+  assert.equal(
+    widget.hmbSeedanceCleanupPreviewOverlay(cancelledRafFixture.container),
+    true,
+  );
+  assert.equal(rafCallbacks.size, 0, "Cleanup must cancel a queued paint-frame action.");
+  cancelledRafCommandBridge.cleanup();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(cancelledRafRequests.length, 0);
+} finally {
+  if (previousRequestAnimationFrame === undefined) delete globalThis.requestAnimationFrame;
+  else globalThis.requestAnimationFrame = previousRequestAnimationFrame;
+  if (previousCancelAnimationFrame === undefined) delete globalThis.cancelAnimationFrame;
+  else globalThis.cancelAnimationFrame = previousCancelAnimationFrame;
+}
+
+// Five independent generator nodes may request retrieval together. Each node
+// must publish one small action envelope, even when its overlay is double-
+// clicked, instead of echoing the full Shot/catalog state over WebSocket.
+const parallelRefreshFixtures = Array.from({ length: 5 }, () => previewFixture());
+const parallelRefreshRequests = [];
+const parallelRefreshCommandBridges = [];
+for (const [index, current] of parallelRefreshFixtures.entries()) {
+  parallelRefreshCommandBridges.push(installCommandBridge(
+    current,
+    (value) => parallelRefreshRequests.push({ index, value }),
+  ));
+  current.container.__hmbSeedanceLatestProps = {
+    value: {
+      schema: "hmb-seedance-shot-ui",
+      schema_version: 2,
+      shot_catalog: {},
+      shot: {},
+      generation: refreshGeneration,
+    },
+    onChange() { assert.fail("Refresh must not update durable Shot state."); },
+  };
+  widget.hmbSeedanceSyncPreviewOverlay(current.container, {
+    generation: refreshGeneration,
+  });
+  const button = current.region.querySelector("[data-hmb-seedance-preview-action]");
+  button.fire("click");
+  button.fire("click");
+}
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.equal(
+  parallelRefreshRequests.length,
+  5,
+  "Five nodes must produce exactly five refresh publications, not click or mutation storms.",
+);
+assert.deepEqual(
+  parallelRefreshRequests.map(({ index }) => index),
+  [0, 1, 2, 3, 4],
+);
+for (const { value } of parallelRefreshRequests) {
+  assertRefreshCommand(value);
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(value), "utf8") <= 256,
+    "A refresh publication must remain a bounded action-only WebSocket payload.",
+  );
+}
+assert.equal(
+  new Set(parallelRefreshRequests.map(({ value }) => value.action_id)).size,
+  5,
+  "Concurrent nodes must retain distinct idempotency identities.",
+);
+for (const [index, current] of parallelRefreshFixtures.entries()) {
+  widget.hmbSeedanceCleanupPreviewOverlay(current.container);
+  parallelRefreshCommandBridges[index].cleanup();
+}
+
+// An action-only onChange may never receive a host acknowledgement. The
+// watchdog must release the overlay and the exact same button instance must be
+// safe to retry; no React-owned native ParameterButton is involved.
+const timeoutFixture = previewFixture();
+const timeoutRequests = [];
+const timeoutCommandBridge = installCommandBridge(timeoutFixture, (value) => {
+  timeoutRequests.push(value);
+  return new Promise(() => {});
+});
+const originalSetTimeout = globalThis.setTimeout;
+const originalClearTimeout = globalThis.clearTimeout;
+const fakeTimers = new Map();
+let nextTimerId = 1;
+globalThis.setTimeout = (callback, delay = 0) => {
+  const id = nextTimerId;
+  nextTimerId += 1;
+  fakeTimers.set(id, { callback, delay: Number(delay) });
+  return id;
+};
+globalThis.clearTimeout = (id) => fakeTimers.delete(id);
+try {
+  timeoutFixture.container.__hmbSeedanceLatestProps = {
+    value: {
+      schema: "hmb-seedance-shot-ui",
+      schema_version: 2,
+      shot_catalog: {},
+      shot: {},
+      generation: refreshGeneration,
+    },
+    onChange() { assert.fail("Refresh must not update durable Shot state."); },
+  };
+  widget.hmbSeedanceSyncPreviewOverlay(timeoutFixture.container, {
+    generation: refreshGeneration,
+  });
+  const timeoutOverlay = timeoutFixture.region.querySelector(
+    ".hmb-seedance-preview-overlay",
+  );
+  const timeoutButton = timeoutOverlay.querySelector(
+    "[data-hmb-seedance-preview-action]",
+  );
+  timeoutButton.fire("click");
+  await Promise.resolve();
+
+  const dispatchTimer = [...fakeTimers.entries()].find(([, timer]) => timer.delay === 0);
+  assert.ok(dispatchTimer, "The action-only dispatch must remain outside the overlay click stack.");
+  fakeTimers.delete(dispatchTimer[0]);
+  dispatchTimer[1].callback();
+  assert.equal(timeoutRequests.length, 1);
+  assertRefreshCommand(timeoutRequests[0]);
+  const firstTimeoutActionId = timeoutRequests[0].action_id;
+
+  const watchdogTimer = [...fakeTimers.entries()].find(
+    ([, timer]) => timer.delay === widget.HMB_SEEDANCE_PREVIEW_ACTION_WATCHDOG_MS,
+  );
+  assert.ok(watchdogTimer, "A ten-second delivery watchdog must be armed.");
+  fakeTimers.delete(watchdogTimer[0]);
+  watchdogTimer[1].callback();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(timeoutFixture.container.__hmbSeedancePreviewActionPending, undefined);
+  assert.equal(timeoutOverlay.getAttribute("aria-busy"), "false");
+  assert.equal(timeoutButton.disabled, false, "The overlay must release its own busy lock.");
+  assert.equal(
+    timeoutOverlay.querySelector(".hmb-seedance-preview-overlay__detail").textContent,
+    "요청 전달을 확인하지 못했습니다. 잠시 후 다시 시도하세요.",
+  );
+
+  timeoutButton.fire("click");
+  await Promise.resolve();
+  const retryDispatchTimer = [...fakeTimers.entries()].find(([, timer]) => timer.delay === 0);
+  assert.ok(retryDispatchTimer, "The same overlay button must be retryable after timeout.");
+  fakeTimers.delete(retryDispatchTimer[0]);
+  retryDispatchTimer[1].callback();
+  assert.equal(timeoutRequests.length, 2);
+  assertRefreshCommand(timeoutRequests[1]);
+  assert.notEqual(
+    timeoutRequests[1].action_id,
+    firstTimeoutActionId,
+    "A retry must receive a fresh idempotency identity.",
+  );
+} finally {
+  widget.hmbSeedanceCleanupPreviewOverlay(timeoutFixture.container);
+  timeoutCommandBridge.cleanup();
+  fakeTimers.clear();
+  globalThis.setTimeout = originalSetTimeout;
+  globalThis.clearTimeout = originalClearTimeout;
+}
 
 console.log(
   "HMB Seedance native preview status-overlay regression: PASS "

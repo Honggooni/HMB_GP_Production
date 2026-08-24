@@ -12,6 +12,9 @@ jobs:
   windows-release-audit:
     runs-on: windows-latest
     timeout-minutes: 30
+    outputs:
+      package_version: ${{ steps.release_metadata.outputs.version }}
+      archive_name: ${{ steps.release_metadata.outputs.archive_name }}
     steps:
       - uses: actions/checkout@v4
       - name: Require the public team distribution channel
@@ -30,6 +33,23 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: Resolve validated release metadata
+        id: release_metadata
+        shell: pwsh
+        run: |
+          $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not read the package version from pyproject.toml."
+          }
+          $version = "$version".Trim()
+          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Unsafe or unsupported package version: $version"
+          }
+          $archiveName = "HMB_GP_Production_v${version}_Runtime.zip"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "version=$version"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "archive_name=$archiveName"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_PACKAGE_VERSION=$version"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_RUNTIME_ARCHIVE=$archiveName"
       - name: Reject private or generated tracked content
         shell: pwsh
         run: |
@@ -86,7 +106,9 @@ jobs:
             "HMB_Maya_Runner_Performance_Regression.py",
             "HMB_Mouth_Card_Inner_Patch_Regression.py",
             "HMB_Motion_Guide_Regression.py",
+            "HMB_Prompt_Field_Authority_Regression.py",
             "HMB_Prompt_Output_Coalescing_Regression.py",
+            "HMB_Prompt_Source_Reconcile_NoOp_Regression.py",
             "HMB_Prompt_Revision_Axis_Regression.py",
             "HMB_Prompt_Picker_Disconnect_Restore_Regression.py",
             "HMB_Prompt_Public_Prompt_Boundary_Regression.py",
@@ -110,13 +132,25 @@ jobs:
             "HMB_Agent_Runtime_Prompt_UI_Isolation_Regression.py",
             "HMB_Agent_Shot_Binding_Regression.py",
             "HMB_Seedance_MP4_Verifier_Portability_Regression.py",
+            "HMB_Seedance_Crash_Reopen_Recovery_Regression.py",
             "HMB_Seedance_Direct_Shot_Source_Regression.py",
+            "HMB_Seedance_Five_Node_Full_Lifecycle_Concurrency_Regression.py",
+            "HMB_Seedance_Five_Shot_Submission_Concurrency_Regression.py",
+            "HMB_Seedance_Media_Preflight_Regression.py",
+            "HMB_Seedance_Refresh_Command_Regression.py",
+            "HMB_Seedance_Retrieve_UI_Nonblocking_Regression.py",
             "HMB_Five_Library_Shot_Routing_Regression.py",
+            "HMB_Shot_Picker_Dict_Port_Migration_Regression.py",
+            "HMB_Shot_Routing_Flow_Isolation_Regression.py",
             "HMB_Shot_Routing_Pass_Cache_Regression.py",
+            "HMB_Singleton_Reset_Lifecycle_Regression.py",
+            "HMB_Singleton_Reset_Media_Preservation_Regression.py",
             "HMB_VideoPicker_Asset_Catalog_Regression.py",
+            "HMB_VideoPicker_Five_Shot_Output_Cohesion_Regression.py",
             "HMB_VideoPicker_Live_Output_Regression.py",
             "HMB_VideoPicker_No_Loss_State_Regression.py",
             "HMB_VideoPicker_Publisher_Replacement_Regression.py",
+            "HMB_VideoPicker_Server_Media_Reload_Regression.py",
             "HMB_VideoPicker_Snapshot_History_Regression.py"
           )
           foreach ($test in $tests) {
@@ -142,16 +176,20 @@ jobs:
           # policy review document. This check builds only an in-memory ZIP.
           python -m py_compile tools/package_runtime_release.py
           python tools/package_runtime_release.py --check
-          $artifact = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_v0.6.45_Runtime.zip"
+          $artifact = Join-Path $env:RUNNER_TEMP $env:HMB_RUNTIME_ARCHIVE
           python tools/package_runtime_release.py --output $artifact
           python tools/package_runtime_release.py --check-output --output $artifact
       - name: Prepare tagged team distribution
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
-          $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+          $version = $env:HMB_PACKAGE_VERSION
           if ($env:GITHUB_REF_NAME -ne "v$version") {
             throw "Release tag $env:GITHUB_REF_NAME does not match package version v$version."
+          }
+          $versionParts = $version.Split('.')
+          if ($versionParts.Count -ne 3 -or ([int]$versionParts[2] % 2) -eq 0) {
+            throw "Even patch version v$version is local-test-only. Team releases require an odd patch version."
           }
           $artifact = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_v${version}_Runtime.zip"
           $checksum = "{0} *{1}" -f `
@@ -164,8 +202,8 @@ jobs:
         with:
           name: hmb-team-release-${{ github.ref_name }}
           path: |
-            ${{ runner.temp }}/HMB_GP_Production_v0.6.45_Runtime.zip
-            ${{ runner.temp }}/HMB_GP_Production_v0.6.45_Runtime.zip.sha256
+            ${{ runner.temp }}/${{ steps.release_metadata.outputs.archive_name }}
+            ${{ runner.temp }}/${{ steps.release_metadata.outputs.archive_name }}.sha256
           if-no-files-found: error
           retention-days: 30
 
@@ -185,26 +223,37 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          HMB_PACKAGE_VERSION: ${{ needs.windows-release-audit.outputs.package_version }}
+          HMB_RUNTIME_ARCHIVE: ${{ needs.windows-release-audit.outputs.archive_name }}
         run: |
           $repository = $env:GITHUB_REPOSITORY
-          $archive = Join-Path $PWD "release/HMB_GP_Production_v0.6.45_Runtime.zip"
+          $version = "$env:HMB_PACKAGE_VERSION".Trim()
+          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Unsafe or unsupported package version: $version"
+          }
+          $expectedArchiveName = "HMB_GP_Production_v${version}_Runtime.zip"
+          if ($env:HMB_RUNTIME_ARCHIVE -ne $expectedArchiveName) {
+            throw "Audited release metadata is inconsistent."
+          }
+          $archive = Join-Path $PWD "release/$expectedArchiveName"
           $checksum = "$archive.sha256"
           if (-not (Test-Path -LiteralPath $archive) -or -not (Test-Path -LiteralPath $checksum)) {
             throw "Audited release assets are missing."
           }
-          $notesPath = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_v0.6.45_release_notes.md"
-          @'
-          ## HMB GP Production v0.6.45
-
-          - Keeps the stock 3-choice Input Mode for Seedance 2.0/2.0 Fast and adds a 5-choice Task selector for Seedance 2.5.
-          - Keeps manual references in Only and resolves only exact same-Shot ImageAsset/VideoPicker media in Shot.
-          - Adds verified local MP4/MOV and optional local PNG last-frame output for Seedance 2.5.
-          - Fails closed before upload or billing when an advanced 2.5 request lacks the exact Broker capability contract.
-          - Removes the obsolete HMB-specific Desktop launcher; start Griptape normally after installation.
-          - Includes the manifest-verified runtime installer and exact SHA256 checksum.
-
-          Close Griptape completely before running the included installer.
-          '@ | Set-Content -LiteralPath $notesPath -Encoding utf8
+          $notesPath = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_v${version}_release_notes.md"
+          @(
+            "## HMB GP Production v$version",
+            "",
+            "- Runs independent Shot 1-5 Prompt, Agent, and Seedance branches concurrently while pacing only billable Broker starts.",
+            "- Restores the same persisted Seedance task after an application interruption without submitting a duplicate render.",
+            "- Preserves ImageAsset and VideoPicker Shot media across reset replacement and exact saved-workflow reload.",
+            "- Uses a strict typed Shot contract and exact Main/Sub image taxonomy through Prompt-to-Agent public-job contract v2.",
+            "- Keeps VideoPicker compact-first with stable React Flow geometry and no lower black tail or update-depth feedback loop.",
+            "- Enforces pinned HTTPS for Agent policy delivery and the documented production-LAN-only HTTP Seedance exception.",
+            "- Includes the manifest-verified runtime installer and exact SHA256 checksum.",
+            "",
+            "Close Griptape completely before running the included installer."
+          ) | Set-Content -LiteralPath $notesPath -Encoding utf8
           gh release view $env:GITHUB_REF_NAME --repo $repository *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $env:GITHUB_REF_NAME $archive $checksum --clobber --repo $repository

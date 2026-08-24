@@ -10,9 +10,10 @@ parameters.  Media and prompt payloads never enter a process-global registry.
 """
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 import logging
 import threading
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 import weakref
 
 
@@ -39,7 +40,8 @@ SINGLETON_KINDS = frozenset({KIND_IMAGE_ASSET, KIND_VIDEO_PICKER})
 
 _LOGGER = logging.getLogger("griptape_nodes")
 _ROUTING_LOCK = threading.RLock()
-_ACTIVE_FLOWS: set[str] = set()
+_CONNECTION_MUTATION_LOCK = threading.Lock()
+_ROUTING_FLOW_GATES: dict[str, "_RoutingFlowGate"] = {}
 _ROUTING_PASS_LOCAL = threading.local()
 _POST_REGISTRATION_MAX_ATTEMPTS = 6
 _POST_REGISTRATION_RETRY_DELAYS_SECONDS = (0.025, 0.100, 0.250, 0.500, 1.000)
@@ -82,6 +84,23 @@ class _PendingReconcile:
     fingerprint: tuple[str, bool, str, str] | None
 
 
+class _RoutingFlowGate:
+    """One short-lived same-flow serialization gate.
+
+    Different flows own different locks and therefore remain independent. A
+    nested call from the thread already reconciling this flow is rejected, but
+    another thread waits for the active pass and then performs a fresh pass so
+    its newer state change cannot be lost.
+    """
+
+    __slots__ = ("lock", "owner_thread_id", "participants")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.owner_thread_id: int | None = None
+        self.participants = 0
+
+
 _POST_REGISTRATION_PENDING: weakref.WeakKeyDictionary[Any, _PendingReconcile] = (
     weakref.WeakKeyDictionary()
 )
@@ -97,7 +116,57 @@ _SINGLETON_ADMISSIONS: weakref.WeakKeyDictionary[Any, tuple[str, str]] = (
 _SINGLETON_REGISTRATION_ORDERS: weakref.WeakKeyDictionary[Any, int] = (
     weakref.WeakKeyDictionary()
 )
+_SINGLETON_RESET_HANDOFFS: weakref.WeakKeyDictionary[
+    Any, weakref.ReferenceType[Any]
+] = weakref.WeakKeyDictionary()
 _SINGLETON_REGISTRATION_GENERATION = 0
+
+
+@contextmanager
+def _claim_routing_flow(flow_name: str) -> Iterator[bool]:
+    """Serialize only this flow while keeping the global registry lock short.
+
+    The old reconciler held ``_ROUTING_LOCK`` while it called node callbacks and
+    mutated retained-mode edges.  A slow callback in one canvas consequently
+    stalled routing in every other canvas, and a callback waiting on another
+    flow could form a cross-flow lock cycle. The process-wide lock now protects
+    only the flow-gate registry. Same-thread nested re-entry remains fail-fast;
+    a concurrent caller for the same flow waits and then runs its own fresh pass
+    instead of silently dropping the newer state change.
+    """
+
+    thread_id = threading.get_ident()
+    nested_reentry = False
+    with _ROUTING_LOCK:
+        gate = _ROUTING_FLOW_GATES.get(flow_name)
+        if gate is None:
+            gate = _RoutingFlowGate()
+            _ROUTING_FLOW_GATES[flow_name] = gate
+        if gate.owner_thread_id == thread_id:
+            nested_reentry = True
+        else:
+            gate.participants += 1
+
+    if nested_reentry:
+        yield False
+        return
+
+    gate.lock.acquire()
+    with _ROUTING_LOCK:
+        gate.owner_thread_id = thread_id
+    try:
+        yield True
+    finally:
+        with _ROUTING_LOCK:
+            gate.owner_thread_id = None
+            gate.participants -= 1
+        gate.lock.release()
+        with _ROUTING_LOCK:
+            if (
+                gate.participants == 0
+                and _ROUTING_FLOW_GATES.get(flow_name) is gate
+            ):
+                _ROUTING_FLOW_GATES.pop(flow_name, None)
 
 
 class _ReconcileResult(dict[str, Any]):
@@ -225,8 +294,23 @@ def _singleton_owner(node: Any, nodes: Iterable[Any]) -> Any | None:
         subscription = _subscription_for(candidate)
         if subscription is not None and subscription.kind == current.kind:
             candidates.append(candidate)
+    with _ROUTING_LOCK:
+        registration_orders = {
+            id(candidate): _SINGLETON_REGISTRATION_ORDERS.get(candidate)
+            for candidate in candidates
+        }
+        admissions = {
+            id(candidate): _SINGLETON_ADMISSIONS.get(candidate, ("", ""))
+            for candidate in candidates
+        }
+        authoritative_ids = {
+            id(candidate)
+            for candidate in candidates
+            if candidate in _AUTHORITATIVE_FINGERPRINTS
+        }
+
     def registration_rank(candidate: Any) -> tuple[int, str]:
-        order = _SINGLETON_REGISTRATION_ORDERS.get(candidate)
+        order = registration_orders.get(id(candidate))
         return (
             int(order) if isinstance(order, int) else 2**63 - 1,
             _clean(getattr(candidate, "name", ""), 512).casefold(),
@@ -235,12 +319,12 @@ def _singleton_owner(node: Any, nodes: Iterable[Any]) -> Any | None:
     admitted = [
         candidate
         for candidate in candidates
-        if _SINGLETON_ADMISSIONS.get(candidate, ("", ""))[1] == current.kind
+        if admissions.get(id(candidate), ("", ""))[1] == current.kind
     ]
     if admitted:
         return min(admitted, key=registration_rank)
     authoritative = [
-        candidate for candidate in candidates if candidate in _AUTHORITATIVE_FINGERPRINTS
+        candidate for candidate in candidates if id(candidate) in authoritative_ids
     ]
     if authoritative:
         return min(authoritative, key=registration_rank)
@@ -249,7 +333,137 @@ def _singleton_owner(node: Any, nodes: Iterable[Any]) -> Any | None:
     return None
 
 
-def _enforce_singleton_admission(node: Any) -> bool:
+def _try_stage_singleton_reset_handoff(
+    node: Any,
+    owner: Any,
+) -> bool:
+    """Copy durable singleton content during Griptape's reset replacement.
+
+    Griptape 0.95 resets a node by constructing ``<old-name>_temp`` first,
+    deleting the old object, and finally renaming the replacement.  The old
+    and new objects therefore overlap briefly even though the workflow still
+    owns one logical singleton.  Transfer only through the nodes' explicit
+    export/adopt hooks; routing itself never stores media or prompt payloads.
+    """
+
+    node_name = _clean(getattr(node, "name", ""), 512)
+    if not node_name.endswith("_temp"):
+        return False
+    owner_name = node_name[: -len("_temp")]
+    if not owner_name:
+        return False
+    if (
+        owner is None
+        or owner is node
+        or bool(getattr(owner, "_hmb_node_deleted", False))
+        or _clean(getattr(owner, "name", ""), 512) != owner_name
+    ):
+        return False
+    # Exact same-flow identity is mandatory. Names are process-global in the
+    # current host, but relying on that implementation detail could copy one
+    # workflow's durable media into another workflow's manually named temp
+    # node. Both objects must already be retained in the same flow.
+    owner_flow_name, owner_flow_nodes = _same_flow_nodes(owner)
+    node_flow_name, node_flow_nodes = _same_flow_nodes(node)
+    if (
+        not owner_flow_name
+        or owner_flow_name != node_flow_name
+        or owner not in owner_flow_nodes
+        or node not in node_flow_nodes
+    ):
+        return False
+    node_subscription = _subscription_for(node)
+    owner_subscription = _subscription_for(owner)
+    if (
+        node_subscription is None
+        or owner_subscription is None
+        or node_subscription.kind not in SINGLETON_KINDS
+        or node_subscription.kind != owner_subscription.kind
+    ):
+        return False
+    with _ROUTING_LOCK:
+        previous_owner = _SINGLETON_RESET_HANDOFFS.get(node)
+        if previous_owner is not None and previous_owner() is owner:
+            return True
+    exporter = getattr(owner, "_hmb_export_reset_handoff", None)
+    adopter = getattr(node, "_hmb_adopt_reset_handoff", None)
+    if not callable(exporter) or not callable(adopter):
+        return False
+    try:
+        payload = exporter()
+        if not isinstance(payload, dict):
+            return False
+        adopted = adopter(payload)
+        if adopted is False:
+            return False
+    except Exception as exc:
+        _LOGGER.warning(
+            "Unable to preserve singleton reset state from %s to %s: %s",
+            owner_name,
+            node_name,
+            exc,
+        )
+        return False
+    with _ROUTING_LOCK:
+        _SINGLETON_RESET_HANDOFFS[node] = weakref.ref(owner)
+    return True
+
+
+def prepare_node_deletion(node: Any) -> bool:
+    """Preserve a same-flow reset replacement before marking ``node`` deleted."""
+
+    flow_name, nodes = _same_flow_nodes(node)
+    owner_subscription = _subscription_for(node)
+    owner_name = _clean(getattr(node, "name", ""), 512)
+    if (
+        not flow_name
+        or owner_subscription is None
+        or owner_subscription.kind not in SINGLETON_KINDS
+        or not owner_name
+    ):
+        return False
+    replacement_name = f"{owner_name}_temp"
+    replacement = next(
+        (
+            candidate
+            for candidate in nodes
+            if candidate is not node
+            and not bool(getattr(candidate, "_hmb_node_deleted", False))
+            and _clean(getattr(candidate, "name", ""), 512) == replacement_name
+            and (
+                (candidate_subscription := _subscription_for(candidate))
+                is not None
+            )
+            and candidate_subscription.kind == owner_subscription.kind
+        ),
+        None,
+    )
+    return bool(
+        replacement is not None
+        and _try_stage_singleton_reset_handoff(replacement, node)
+    )
+
+
+def release_node_lifecycle(node: Any) -> None:
+    """Release every identity-bound routing lease for one deleted object."""
+
+    with _ROUTING_LOCK:
+        _POST_REGISTRATION_PENDING.pop(node, None)
+        _POST_RECONCILE_GENERATIONS.pop(node, None)
+        _AUTHORITATIVE_FINGERPRINTS.pop(node, None)
+        _SINGLETON_ADMISSIONS.pop(node, None)
+        _SINGLETON_REGISTRATION_ORDERS.pop(node, None)
+        _SINGLETON_RESET_HANDOFFS.pop(node, None)
+        for replacement, owner_ref in list(_SINGLETON_RESET_HANDOFFS.items()):
+            if owner_ref() is node:
+                _SINGLETON_RESET_HANDOFFS.pop(replacement, None)
+
+
+def _enforce_singleton_admission(
+    node: Any,
+    *,
+    defer_reset_staging: bool = False,
+) -> bool | None:
     """Reject a newly registered duplicate flow authority immediately.
 
     Engine 0.93 has no per-flow library-palette availability callback, so a
@@ -271,8 +485,23 @@ def _enforce_singleton_admission(node: Any) -> bool:
     ]
     if node not in candidates:
         candidates.append(node)
+    with _ROUTING_LOCK:
+        registration_orders = {
+            id(candidate): _SINGLETON_REGISTRATION_ORDERS.get(candidate)
+            for candidate in candidates
+        }
+        admissions = {
+            id(candidate): _SINGLETON_ADMISSIONS.get(candidate)
+            for candidate in candidates
+        }
+        authoritative_ids = {
+            id(candidate)
+            for candidate in candidates
+            if candidate in _AUTHORITATIVE_FINGERPRINTS
+        }
+
     def registration_rank(candidate: Any) -> tuple[int, str]:
-        order = _SINGLETON_REGISTRATION_ORDERS.get(candidate)
+        order = registration_orders.get(id(candidate))
         return (
             int(order) if isinstance(order, int) else 2**63 - 1,
             _clean(getattr(candidate, "name", ""), 512).casefold(),
@@ -280,12 +509,12 @@ def _enforce_singleton_admission(node: Any) -> bool:
     admitted = [
         candidate
         for candidate in candidates
-        if _SINGLETON_ADMISSIONS.get(candidate) == (flow_name, current.kind)
+        if admissions.get(id(candidate)) == (flow_name, current.kind)
     ]
     authoritative = [
         candidate
         for candidate in candidates
-        if candidate in _AUTHORITATIVE_FINGERPRINTS
+        if id(candidate) in authoritative_ids
     ]
     owner_pool = admitted or authoritative or candidates
     owner = min(owner_pool, key=registration_rank) if owner_pool else None
@@ -293,10 +522,21 @@ def _enforce_singleton_admission(node: Any) -> bool:
         # Construction-time registration order is recorded before hydration
         # can replace the pending callback.  It is therefore stable even when
         # React Flow inserts a newer drag at the front of its node mapping.
-        _SINGLETON_ADMISSIONS[node] = (flow_name, current.kind)
+        with _ROUTING_LOCK:
+            _SINGLETON_ADMISSIONS[node] = (flow_name, current.kind)
         return True
     node_name = _clean(getattr(node, "name", ""), 512)
     owner_name = _clean(getattr(owner, "name", ""), 512)
+    if (
+        defer_reset_staging
+        and owner is not None
+        and node_name == f"{owner_name}_temp"
+    ):
+        # A reset replacement is not an ordinary palette duplicate. Preserve
+        # its durable state while both identities exist, then let the bounded
+        # registration callback retry after the host deletes/renames them.
+        _try_stage_singleton_reset_handoff(node, owner)
+        return None
     if not node_name:
         return False
     _notify_status(
@@ -328,7 +568,8 @@ def _enforce_singleton_admission(node: Any) -> bool:
 def _mark_authoritative(node: Any) -> tuple[str, bool, str, str] | None:
     fingerprint = _subscription_fingerprint(node)
     if fingerprint is not None:
-        _AUTHORITATIVE_FINGERPRINTS[node] = fingerprint
+        with _ROUTING_LOCK:
+            _AUTHORITATIVE_FINGERPRINTS[node] = fingerprint
     return fingerprint
 
 
@@ -422,15 +663,19 @@ def _schedule_post_reconcile(node: Any, *, phase: str) -> bool:
         with _ROUTING_LOCK:
             if _POST_REGISTRATION_PENDING.get(current) is not pending:
                 return
-        if (
-            getattr(current, "_hmb_node_deleted", False)
-            or _clean(getattr(current, "name", ""), 512) != node_name
-        ):
+        if getattr(current, "_hmb_node_deleted", False):
+            clear_pending(current)
+            return
+        # Reset replaces ``name_temp`` and then renames that same exact object
+        # to ``name``. Resolve registration by current identity/name instead of
+        # rejecting the legitimate rename against the constructor-time label.
+        current_name = _clean(getattr(current, "name", ""), 512)
+        if not current_name:
             clear_pending(current)
             return
         try:
             manager = GriptapeNodes.NodeManager()
-            registered = manager.get_node_by_name(node_name)
+            registered = manager.get_node_by_name(current_name)
         except Exception:
             manager = None
             registered = None
@@ -451,10 +696,21 @@ def _schedule_post_reconcile(node: Any, *, phase: str) -> bool:
         # enforced for both phases once exact manager identity is proven. The
         # oldest registered ImageAsset/VideoPicker remains authoritative and a
         # rejected duplicate is retried until the host confirms its deletion.
-        admitted = _enforce_singleton_admission(current)
+        admitted = _enforce_singleton_admission(
+            current,
+            defer_reset_staging=(
+                attempt + 1 < _POST_REGISTRATION_MAX_ATTEMPTS
+            ),
+        )
+        if admitted is None:
+            queue_delayed_attempt(attempt + 1)
+            return
         if not admitted or bool(getattr(current, "_hmb_node_deleted", False)):
             try:
-                still_registered = manager.get_node_by_name(node_name) is current
+                current_name = _clean(getattr(current, "name", ""), 512)
+                still_registered = bool(current_name) and (
+                    manager.get_node_by_name(current_name) is current
+                )
             except Exception:
                 still_registered = False
             if still_registered and attempt + 1 < _POST_REGISTRATION_MAX_ATTEMPTS:
@@ -483,6 +739,20 @@ def _schedule_post_reconcile(node: Any, *, phase: str) -> bool:
         if _subscription_fingerprint(current) != pending.fingerprint:
             clear_pending(current)
             return
+        # A hydrated generation supersedes the constructor registration
+        # callback. Give nodes with non-routing durable UI state one exact,
+        # registered, next-turn restore seam before routing reconciliation.
+        # The callback must remain local-only; it may not perform network I/O.
+        hydration_restore = getattr(
+            current,
+            "_hmb_post_hydration_state_restore",
+            None,
+        )
+        if callable(hydration_restore):
+            try:
+                hydration_restore()
+            except Exception:
+                pass
         try:
             result = reconcile_shot_routing(current)
         except Exception:
@@ -500,12 +770,16 @@ def _schedule_post_reconcile(node: Any, *, phase: str) -> bool:
             return
         if (
             getattr(current, "_hmb_node_deleted", False)
-            or _clean(getattr(current, "name", ""), 512) != node_name
         ):
             clear_pending(current)
             return
         try:
-            if manager is None or manager.get_node_by_name(node_name) is not current:
+            current_name = _clean(getattr(current, "name", ""), 512)
+            if (
+                manager is None
+                or not current_name
+                or manager.get_node_by_name(current_name) is not current
+            ):
                 clear_pending(current)
                 return
         except Exception:
@@ -624,15 +898,19 @@ def _delete_connection(connection: Any, target: Any) -> bool:
         )
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes  # type: ignore
 
-        result = GriptapeNodes.handle_request(
-            DeleteConnectionRequest(
-                source_node_name=str(connection.source_node_name),
-                source_parameter_name=str(connection.source_parameter_name),
-                target_node_name=str(target.name),
-                target_parameter_name=str(connection.target_parameter_name),
-                failure_log_level=logging.DEBUG,
+        # Griptape 0.95 stores retained connections in one process-global
+        # collection. Keep only the actual mutation serialized; discovery and
+        # node callbacks remain independent per flow.
+        with _CONNECTION_MUTATION_LOCK:
+            result = GriptapeNodes.handle_request(
+                DeleteConnectionRequest(
+                    source_node_name=str(connection.source_node_name),
+                    source_parameter_name=str(connection.source_parameter_name),
+                    target_node_name=str(target.name),
+                    target_parameter_name=str(connection.target_parameter_name),
+                    failure_log_level=logging.DEBUG,
+                )
             )
-        )
         succeeded = bool(getattr(result, "succeeded", lambda: False)())
         if succeeded:
             cache = getattr(_ROUTING_PASS_LOCAL, "incoming_by_node", None)
@@ -665,15 +943,16 @@ def _create_connection(edge: ShotEdge) -> bool:
         )
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes  # type: ignore
 
-        result = GriptapeNodes.handle_request(
-            CreateConnectionRequest(
-                source_node_name=str(edge.source.name),
-                source_parameter_name=edge.source_parameter,
-                target_node_name=str(edge.target.name),
-                target_parameter_name=edge.target_parameter,
-                failure_log_level=logging.DEBUG,
+        with _CONNECTION_MUTATION_LOCK:
+            result = GriptapeNodes.handle_request(
+                CreateConnectionRequest(
+                    source_node_name=str(edge.source.name),
+                    source_parameter_name=edge.source_parameter,
+                    target_node_name=str(edge.target.name),
+                    target_parameter_name=edge.target_parameter,
+                    failure_log_level=logging.DEBUG,
+                )
             )
-        )
         succeeded = bool(getattr(result, "succeeded", lambda: False)())
         if succeeded:
             cache = getattr(_ROUTING_PASS_LOCAL, "incoming_by_node", None)
@@ -907,7 +1186,8 @@ def _subscription_is_authoritative(subscription: ShotSubscription) -> bool:
         subscription.channel_uuid,
         subscription.shot_uuid,
     )
-    return _AUTHORITATIVE_FINGERPRINTS.get(subscription.node) == fingerprint
+    with _ROUTING_LOCK:
+        return _AUTHORITATIVE_FINGERPRINTS.get(subscription.node) == fingerprint
 
 
 def _subscription_requires_authority(subscription: ShotSubscription) -> bool:
@@ -944,10 +1224,19 @@ def reconcile_shot_routing(
     if not bool(getattr(node, "_hmb_node_deleted", False)):
         _mark_authoritative(node)
 
-    with _ROUTING_LOCK:
-        if flow_name in _ACTIVE_FLOWS:
+    with _claim_routing_flow(flow_name) as claimed:
+        if not claimed:
             return {"ok": True, "code": "reentrant", "changed": 0}
-        _ACTIVE_FLOWS.add(flow_name)
+        # A second thread may have waited for a pass that began before its
+        # state mutation. Re-read the retained flow only after it owns the
+        # same-flow gate so that its pass observes the newest nodes and values.
+        current_flow_name, nodes = _same_flow_nodes(node)
+        if not current_flow_name:
+            return {"ok": True, "code": "not_registered", "changed": 0}
+        if current_flow_name != flow_name:
+            # Never mutate a newly moved flow while holding the old flow's
+            # gate. Host move/registration hooks will reconcile the new owner.
+            return {"ok": True, "code": "flow_changed", "changed": 0}
         previous_incoming_cache = getattr(
             _ROUTING_PASS_LOCAL, "incoming_by_node", None
         )
@@ -2017,7 +2306,6 @@ def reconcile_shot_routing(
                 covered_node_ids=(id(value) for value in nodes),
             )
         finally:
-            _ACTIVE_FLOWS.discard(flow_name)
             if previous_incoming_cache is None:
                 try:
                     delattr(_ROUTING_PASS_LOCAL, "incoming_by_node")
@@ -2038,6 +2326,8 @@ __all__ = [
     "SHOT_ROUTING_PROTOCOL_VERSION",
     "SUBSCRIPTION_SCHEMA",
     "SUBSCRIPTION_VERSION",
+    "prepare_node_deletion",
+    "release_node_lifecycle",
     "reconcile_shot_routing",
     "schedule_post_deletion_reconcile",
     "schedule_post_hydration_reconcile",

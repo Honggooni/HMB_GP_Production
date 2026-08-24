@@ -172,7 +172,7 @@ assert set(job) == {
     "connections",
 }
 assert job["schema"] == "hmb-public-job-data"
-assert job["version"] == 1
+assert job["version"] == prompt.PUBLIC_JOB_CONTRACT_VERSION == 2
 assert job["control_only_bindings"] == []
 assert job["frame_ranges"] == []
 assert job["connections"] == {"image_asset": False, "picker": False}
@@ -181,7 +181,10 @@ assert len(job["images"]) == 1
 image = job["images"][0]
 assert image["image"] == "@image1"
 assert image["label"] == "C:\\private\\source\\PublicBoundaryHero.png"
+assert image["image_main_type"] == "Character"
+assert image["image_sub_type"] == "Full Appearance"
 assert image["source_type"] == "Character Appearance"
+assert image["source_scope"] == "Full body / full appearance"
 assert image["target_id"] == "PublicBoundaryHero"
 assert image["identity"] == {
     "asset_id": "PublicBoundaryHeroAsset",

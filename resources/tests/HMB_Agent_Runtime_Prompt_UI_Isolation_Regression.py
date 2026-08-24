@@ -46,9 +46,9 @@ visible = "HMB_GP_Production\n\nIMAGE SOURCE:\n@image1 = Jett_02\n"
 machine = "\n".join((
     "HMB_GP_Production",
     agent._PUBLIC_JOB_CONTRACT_HEADER,
-    '{"schema":"hmb-public-job-data","version":1}',
+    '{"schema":"hmb-public-job-data","version":2,"images":[],"videos":[],"control_only_bindings":[],"frame_ranges":[],"connections":{"image_asset":false,"picker":false}}',
     agent._FX_TIMING_CONTRACT_HEADER,
-    '{"schema":"hmb-fx-timing-source-facts","version":3}',
+    '{"schema":"hmb-fx-timing-source-facts","version":3,"valid":true,"errors":[],"sources":[]}',
     agent._USER_DESCRIPTION_DATA_HEADER,
     "{}",
     agent._RUNTIME_FX_SCOPE_HEADER,

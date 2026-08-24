@@ -187,7 +187,7 @@ assert.doesNotMatch(widgetSource.slice(rightStackStart, rightStackEnd), /playbla
 assert.match(widgetSource, /const HMB_DEFAULT_NODE_WIDTH = 1400/);
 assert.match(widgetSource, /const HMB_DEFAULT_NODE_HEIGHT = 1200/);
 assert.match(widgetSource, /data-resize-section="color"/);
-assert.match(widgetSource, /data-resize-panel="viewport"/);
+assert.doesNotMatch(widgetSource, /data-resize-panel|panel-resize-handle/);
 assert.match(
   widgetSource,
   /const viewportModeLabel = snapshotForViewport \? \(tr\.snapshot \|\| "Snapshot"\) : \(tr\.preview \|\| "Video"\)/,

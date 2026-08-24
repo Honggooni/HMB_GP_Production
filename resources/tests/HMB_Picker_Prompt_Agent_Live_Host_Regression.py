@@ -307,6 +307,8 @@ manual["images"][0].update(
         "label": "asset-a.png",
         "asset_id": "asset-a",
         "asset_source_uid": "asset-a-source",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
         "binding_video_slots": [1],
         "color_picks": [""],
     }
@@ -316,6 +318,12 @@ manual["ui"]["textarea_heights"] = {
     "video:1:keep_out": 111,
     "video:2:keep_out": 222,
 }
+# Browser-authored writes always advance the independent UI clock. Model that
+# contract here so the equal-clock stale-echo guard does not (correctly) reject
+# this setup as an unversioned replay.
+manual[prompt_library.UI_EDIT_REVISION_KEY] = (
+    int(manual.get(prompt_library.UI_EDIT_REVISION_KEY) or 0) + 1
+)
 set_value(
     target,
     prompt_library.WIDGET_PARAMETER_NAME,
@@ -323,6 +331,8 @@ set_value(
     "str",
 )
 manual_baseline = target._current_state()
+assert manual_baseline["text"]["VIDEO_VFX"] == manual["text"]["VIDEO_VFX"]
+assert manual_baseline["images"][0]["asset_source_uid"] == "asset-a-source"
 baseline_surface = manual_surface(manual_baseline)
 
 connect(source, "PICKER_OUT", target, prompt_library.PICKER_INPUT_PARAMETER_NAME)
@@ -376,12 +386,31 @@ reconnected = target._current_state()
 assert reconnected["picker"]["ordered_video_uids"] == ["video-b", "video-a"]
 reconnected["text"]["VIDEO_VFX"] = "user edit while Picker remains connected"
 reconnected["images"][0]["color_picks"] = ["Green"]
+reconnected[prompt_library.UI_EDIT_REVISION_KEY] = (
+    int(reconnected.get(prompt_library.UI_EDIT_REVISION_KEY) or 0) + 1
+)
 set_value(
     target,
     prompt_library.WIDGET_PARAMETER_NAME,
     prompt_library._json_dumps(reconnected),
     "str",
 )
+stored_connected_edit = target._current_state()
+assert stored_connected_edit["text"]["VIDEO_VFX"] == (
+    reconnected["text"]["VIDEO_VFX"]
+)
+assert stored_connected_edit["images"][0]["color_picks"] == ["Green"]
+# Advance the connected Picker generation once more. The three-way baseline
+# must advance only Picker-owned remaps and retain these later user edits.
+source._sync_outputs_from_state(
+    picker_state(source, ("video-a", "video-b")),
+    enforce_media_availability=False,
+)
+refreshed_connected_edit = target._current_state()
+assert refreshed_connected_edit["text"]["VIDEO_VFX"] == (
+    reconnected["text"]["VIDEO_VFX"]
+)
+assert refreshed_connected_edit["images"][0]["color_picks"] == ["Green"]
 disconnect(source, "PICKER_OUT", target, prompt_library.PICKER_INPUT_PARAMETER_NAME)
 edited_disconnect = target._current_state()
 assert edited_disconnect["videos"] == manual_baseline["videos"]

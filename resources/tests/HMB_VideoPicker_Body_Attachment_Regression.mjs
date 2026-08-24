@@ -436,7 +436,7 @@ try {
   const second = makePickerInstance("picker-node-2", "runtime-shared");
   const firstMeasurement = picker.hmbMountVideoPickerHostMeasurement(
     first.measurementContainer,
-    { value: { runtime_instance_id: "runtime-measurement-old", picker_shots: [{}] } },
+    { value: { runtime_instance_id: first.runtimeId, picker_shots: [{}] } },
   );
   const secondMeasurement = picker.hmbMountVideoPickerHostMeasurement(
     second.measurementContainer,
@@ -446,6 +446,8 @@ try {
   assert.ok(first.measurementContainer.querySelector("[data-hmb-video-picker-measurement-box]"));
   assert.ok(second.measurementContainer.querySelector("[data-hmb-video-picker-measurement-box]"));
 
+  picker.hmbBindVideoPickerRuntimeIdentity(first.liveContainer, first.runtimeId);
+  picker.hmbBindVideoPickerRuntimeIdentity(second.liveContainer, second.runtimeId);
   picker.hmbRememberVideoPickerViewMode(first.liveContainer, true);
   picker.hmbRememberVideoPickerViewMode(second.liveContainer, true);
   assert.equal(picker.hmbVideoPickerStoredViewMode(first.measurementContainer), true);
@@ -578,6 +580,8 @@ try {
   const workflowB = element("div", "react-flow", { "data-workflow-id": "workflow-b" });
   const collisionA = makePickerInstance("picker-node-shared", "runtime-a", workflowA);
   const collisionB = makePickerInstance("picker-node-shared", "runtime-b", workflowB);
+  picker.hmbBindVideoPickerRuntimeIdentity(collisionA.liveContainer, collisionA.runtimeId);
+  picker.hmbBindVideoPickerRuntimeIdentity(collisionB.liveContainer, collisionB.runtimeId);
   picker.hmbRememberVideoPickerViewMode(collisionA.liveContainer, false);
   picker.hmbRememberVideoPickerViewMode(collisionB.liveContainer, true);
   assert.equal(picker.hmbVideoPickerStoredViewMode(collisionA.liveContainer), false);
@@ -597,7 +601,11 @@ try {
     null,
     "Same node id in another workflow cannot inherit expanded geometry.",
   );
-  const collisionARemount = makePickerInstance("picker-node-shared", "runtime-a-new", workflowA);
+  const collisionARemount = makePickerInstance("picker-node-shared", "runtime-a", workflowA);
+  picker.hmbBindVideoPickerRuntimeIdentity(
+    collisionARemount.liveContainer,
+    collisionARemount.runtimeId,
+  );
   assert.equal(
     picker.hmbVideoPickerStoredViewMode(collisionARemount.liveContainer),
     false,

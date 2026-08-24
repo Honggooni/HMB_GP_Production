@@ -309,8 +309,8 @@ check(
   `Python expanded initial relationship: expected row/outer 1151/1200, received ${pythonExpandedRowHeight}/${pythonExpandedOuterHeight}`,
 );
 check(
-  /^PICKER_WIDGET_START_HEIGHT\s*=\s*PICKER_WIDGET_MIN_HEIGHT$/m.test(pythonSource),
-  "Python parameter-row initial/default height must remain the expanded 1151px contract",
+  /^PICKER_WIDGET_START_HEIGHT\s*=\s*PICKER_WIDGET_COMPACT_MOUNT_HEIGHT$/m.test(pythonSource),
+  "Python parameter-row initial/default height must match the compact 252px contract",
 );
 
 const manifest = JSON.parse(fs.readFileSync(
@@ -321,12 +321,12 @@ const manifestPicker = manifest.nodes?.find?.((entry) => entry?.class_name === "
 check(!!manifestPicker, "manifest must register HMBVideoPickerLibrary metadata");
 for (const key of ["height", "default_height", "preferred_height", "initial_height"]) {
   check(
-    manifestPicker?.[key] === pythonExpandedOuterHeight,
-    `manifest outer ${key}: expected expanded ${pythonExpandedOuterHeight}px, received ${manifestPicker?.[key]}`,
+    manifestPicker?.[key] === pythonOuterHeight,
+    `manifest outer ${key}: expected compact ${pythonOuterHeight}px, received ${manifestPicker?.[key]}`,
   );
   check(
-    manifestPicker?.ui_options?.[key] === pythonExpandedOuterHeight,
-    `manifest ui_options.${key}: expected expanded ${pythonExpandedOuterHeight}px, received ${manifestPicker?.ui_options?.[key]}`,
+    manifestPicker?.ui_options?.[key] === pythonOuterHeight,
+    `manifest ui_options.${key}: expected compact ${pythonOuterHeight}px, received ${manifestPicker?.ui_options?.[key]}`,
   );
 }
 check(

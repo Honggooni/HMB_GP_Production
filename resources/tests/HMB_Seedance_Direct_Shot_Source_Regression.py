@@ -15,8 +15,21 @@ from typing import Any
 def _install_clean_ci_griptape_stubs() -> None:
     """Provide only the import surface this host-independent regression needs."""
 
-    griptape_missing = importlib.util.find_spec("griptape") is None
-    griptape_nodes_missing = importlib.util.find_spec("griptape_nodes") is None
+    def surface_missing(name: str) -> bool:
+        try:
+            return importlib.util.find_spec(name) is None
+        except (AttributeError, ImportError, ModuleNotFoundError, ValueError):
+            return True
+
+    griptape_missing = surface_missing("griptape.artifacts.video_url_artifact")
+    griptape_nodes_missing = any(
+        surface_missing(name)
+        for name in (
+            "griptape_nodes.files.project_file",
+            "griptape_nodes.exe_types.param_components.project_file_parameter",
+            "griptape_nodes.retained_mode.griptape_nodes",
+        )
+    )
     if not griptape_missing and not griptape_nodes_missing:
         return
 
@@ -71,6 +84,24 @@ def _install_clean_ci_griptape_stubs() -> None:
         FAIL = object()
         OVERWRITE = object()
 
+    class StubProjectFileDestination(StubValue):
+        @classmethod
+        def from_situation(
+            cls,
+            filename: str,
+            situation: str,
+            **extra_vars: str | int,
+        ) -> "StubProjectFileDestination":
+            return cls(
+                filename,
+                filename=filename,
+                situation=situation,
+                extra_vars=dict(extra_vars),
+            )
+
+        def resolve(self) -> str:
+            return str(getattr(self, "filename", ""))
+
     class StubGriptapeNodes:
         pass
 
@@ -123,6 +154,10 @@ def _install_clean_ci_griptape_stubs() -> None:
         "griptape_nodes.files.file",
         File=StubValue,
         FileLoadError=StubFileLoadError,
+    )
+    module(
+        "griptape_nodes.files.project_file",
+        ProjectFileDestination=StubProjectFileDestination,
     )
     module(
         "griptape_nodes.retained_mode.events.os_events",
@@ -1057,6 +1092,7 @@ assert seedance_2_5_payload["model"] == SEEDANCE_2_5_MODEL_ID
 assert seedance_2_5_payload["task"] == TASK_VIDEO_EDITING
 assert seedance_2_5_payload["duration_seconds"] == -1
 assert seedance_2_5_payload["quality"] == "720p"
+assert seedance_2_5_payload["resolution"] == "720p"
 assert "priority" not in seedance_2_5_payload
 
 # Exercise the final client-side bridge boundary, not just its field map.  The

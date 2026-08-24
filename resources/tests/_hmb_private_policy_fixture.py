@@ -39,7 +39,14 @@ def read_private_policy_fixture_if_available() -> bytes | None:
 
 
 def install_private_policy_reader(common: Any) -> tuple[Callable[[], bytes], bytes]:
-    """Inject the private signed fixture into one isolated regression process."""
+    """Install the private signed fixture into one isolated regression process.
+
+    Production Agent execution reads only the process-scoped READY session; it
+    no longer decodes a policy on demand.  Internal regressions therefore prove
+    the real signature/contract first and seed that same one-shot session.  The
+    legacy reader override is retained only for tests that directly exercise
+    the envelope decoder, never as a runtime fallback.
+    """
 
     encoded = read_private_policy_fixture_if_available()
     if encoded is None:
@@ -48,4 +55,28 @@ def install_private_policy_reader(common: Any) -> tuple[Callable[[], bytes], byt
         )
     original = common._read_agent_policy_envelope
     common._read_agent_policy_envelope = lambda: encoded
+    validated = common._validate_agent_policy_payload(
+        common._decode_signed_agent_policy_envelope(encoded)
+    )
+    validated["envelope_sha256"] = hashlib.sha256(encoded).hexdigest()
+    session = common._agent_process_session
+    state = str(session._status_for_regression()[0]).casefold()
+    if state == "empty":
+        session.bootstrap_once_authorized(lambda: True, lambda: validated)
+    elif state == "ready":
+        current = session.read_ready()
+        expected_identity = (
+            validated.get("final_policy_version"),
+            validated.get("final_motion_look_policy_sha256"),
+        )
+        current_identity = (
+            current.get("final_policy_version"),
+            current.get("final_motion_look_policy_sha256"),
+        )
+        if current_identity != expected_identity:
+            raise RuntimeError("Private Agent policy regression session identity mismatch.")
+    else:
+        raise RuntimeError(
+            f"Private Agent policy regression session is not reusable: {state}."
+        )
     return original, encoded

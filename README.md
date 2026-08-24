@@ -1,12 +1,22 @@
 # HMB GP Production
 
-Current technical release: `v0.6.45`.
+Current team release: `v0.6.47`.
+
+Odd patch versions are team releases. Even patch versions are local test builds
+and are not published or distributed until promoted to the next odd version.
 
 HMBAgentLibrary keeps Korean authoring input intact inside the private Prompt
 contract, but its final video-generator instruction is English-only. Prompt
 video snapshots are compiled without re-entering Shot graph mutation, and an
 unchanged valid VideoPicker catalog remains ready instead of becoming a false
 missing-source failure.
+
+The hidden VideoPicker Shot publication and its Prompt/Seedance inputs use one
+strict `dict` contract. Workflows saved by older builds with bounded JSON text
+are migrated during hydration; malformed or oversized legacy values are cleared
+without being interpreted as media. Prompt keeps accepted user edits across
+simultaneous Picker refresh/disconnect, and ImageAsset performs its first
+catalog scan outside the node-registration UI callback.
 
 HMBSeedanceGeneration supports Seedance 2.0, 2.0 Fast, and 2.5 through the
 authenticated FN AI Broker. Seedance 2.0/2.0 Fast expose the stock `Input Mode`
@@ -36,12 +46,25 @@ preview states. A completed prior video remains visible while a new task runs,
 and the recovery action checks the existing authoritative task without
 submitting a duplicate generation.
 
-HMBVideoPickerLibrary opens in expanded authoring mode on its first mount. Its
-expanded UI is isolated from the React Flow canvas; switching to the compact
-Shot-sized card view does not resize or reframe the surrounding workspace.
-Each added Shot grows by one complete fixed loader row, with no empty lower
-band. Saved video cards and their exact Shot-local order are restored on
-workflow reload.
+Shot 1 through Shot 5 may each own an independent Prompt -> Agent -> Seedance
+branch and all five Seedance nodes can submit and poll concurrently. Griptape's
+workflow execution mode must be `parallel` with `max_nodes_in_parallel` set to
+at least `5`; this is a local host setting, while any lower Broker/provider
+account quota can still queue accepted jobs on the server. To satisfy the
+Broker's same-account ingress rule, only the five billable POST starts are
+spaced by 1.20 seconds; accepted renders are not serialized.
+
+HMBVideoPickerLibrary opens and reloads in its compact 1400x360 Loader view.
+The one-Shot state row is 252px and native node resizing is locked while this
+compact view is active; each added Shot grows the node by one complete 180px
+loader row plus its 6px gap. An explicit header toggle opens the expanded
+authoring surface without resizing or reframing the React Flow workspace, and
+the Picker-owned body fills the live node instead of leaving a lower black
+band. Saved video cards and their exact Shot-local order are restored even
+though the view itself starts compact. Shot routing serializes only participants
+in the same flow; independent canvases no longer wait behind another flow's
+callbacks, and a queued same-flow update reruns against a fresh retained-node
+snapshot.
 
 Team members should download the tagged runtime ZIP and matching `.sha256`
 from [GitHub Releases](https://github.com/Honggooni/HMB_GP_Production/releases/latest),
@@ -76,7 +99,7 @@ running the installer: those overlay methods retain obsolete development
 files. The installed `resources` tree contains only Maya runtime support, the
 Picker catalog, and the pinned public Broker CA.
 
-All files inside the v0.6.45 ZIP use the actual local package-build time. The
+All files inside a runtime ZIP use the actual local package-build time. The
 builder records one uniform ZIP-compatible timestamp (two-second resolution),
 so Windows Explorer shows the real build hour and minute instead of a fixed
 midnight value. Verify an installation with `metadata.library_version`,

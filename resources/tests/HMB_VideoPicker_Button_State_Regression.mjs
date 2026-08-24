@@ -173,6 +173,78 @@ assert.equal(result.playblastEnabled, true);
 assert.equal(result.snapshotEnabled, true);
 assert.equal(result.originalPreviewToggleEnabled, true);
 
+// A completed Maya READ is itself sufficient to enable Color Pick authoring.
+// If a delayed widget echo drops the explicit selection fields, the UI heals
+// them from a stable UUID/path or the first root instead of leaving every
+// palette button disabled.
+const readWithoutSelection = {
+  ...readComplete,
+  selected_outliner_path: "",
+  selected_outliner_name: "",
+  selected_outliner_uuid: "",
+  selected_color: "",
+  outliner_nodes: [
+    {
+      name: "Actor_MESH",
+      full_path: "|Actor_GRP|Actor_MESH",
+      parent_path: "|Actor_GRP",
+      maya_uuid: "actor-mesh-uuid",
+    },
+    {
+      name: "Actor_GRP",
+      full_path: "|Actor_GRP",
+      parent_path: "",
+      maya_uuid: "actor-root-uuid",
+    },
+  ],
+  slot_assignments: [{ video_slot: 1, bindings: [] }],
+};
+const healedReadSelection = widgetModule.hmbEnsurePickerOutlinerSelection(readWithoutSelection);
+assert.equal(healedReadSelection.selected_outliner_path, "|Actor_GRP");
+assert.equal(healedReadSelection.selected_outliner_uuid, "actor-root-uuid");
+
+const renamedReadSelection = widgetModule.hmbEnsurePickerOutlinerSelection({
+  ...readWithoutSelection,
+  selected_outliner_path: "|OldActor_GRP",
+  selected_outliner_uuid: "actor-root-uuid",
+  outliner_nodes: [{
+    name: "Hero_GRP",
+    full_path: "|Hero_GRP",
+    parent_path: "",
+    maya_uuid: "actor-root-uuid",
+  }],
+  slot_assignments: [{
+    video_slot: 1,
+    bindings: [{
+      full_dag_path: "|OldActor_GRP",
+      maya_uuid: "actor-root-uuid",
+      color: "Green",
+    }],
+  }],
+});
+assert.equal(renamedReadSelection.selected_outliner_path, "|Hero_GRP");
+assert.equal(renamedReadSelection.selected_color, "Green");
+
+const paletteButtons = ["Red", "Green"].map((color) => {
+  const classes = new Set();
+  return {
+    disabled: true,
+    getAttribute(name) { return name === "data-color" ? color : ""; },
+    classList: {
+      add(name) { classes.add(name); },
+      remove(name) { classes.delete(name); },
+      contains(name) { return classes.has(name); },
+    },
+  };
+});
+const paletteContainer = {
+  querySelectorAll(selector) { return selector === "[data-color]" ? paletteButtons : []; },
+};
+widgetModule.hmbApplyPickerPaletteSelectionToDom(paletteContainer, readWithoutSelection, false);
+assert.equal(paletteButtons.every((button) => button.disabled === false), true);
+widgetModule.hmbApplyPickerPaletteSelectionToDom(paletteContainer, { outliner_nodes: [] }, false);
+assert.equal(paletteButtons.every((button) => button.disabled === true), true);
+
 result = buttons({
   ...readComplete,
   operation_kind: "run_video",

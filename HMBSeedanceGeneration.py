@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import importlib
 import ipaddress
+import io
 import json
 import logging
 import mimetypes
@@ -21,6 +22,7 @@ import time
 import urllib.error
 import urllib.request
 import webbrowser
+import weakref
 from collections.abc import Iterator
 from contextlib import suppress
 from copy import deepcopy
@@ -43,6 +45,17 @@ from griptape_nodes.exe_types.core_types import (
     ParameterList,
     ParameterMode,
 )
+
+try:
+    from griptape_nodes.exe_types.core_types import NodeMessageResult
+except ImportError:  # Compatibility for older hosts and lightweight test stubs.
+    @dataclass
+    class NodeMessageResult:  # type: ignore[no-redef]
+        success: bool
+        details: str
+        response: Any = None
+        altered_workflow_state: bool = True
+
 from griptape_nodes.exe_types.node_types import SuccessFailureNode
 from griptape_nodes.exe_types.param_components.project_file_parameter import (
     ProjectFileParameter,
@@ -55,6 +68,7 @@ from griptape_nodes.exe_types.param_types.parameter_int import ParameterInt
 from griptape_nodes.exe_types.param_types.parameter_string import ParameterString
 from griptape_nodes.exe_types.param_types.parameter_video import ParameterVideo
 from griptape_nodes.files.file import File, FileLoadError
+from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
 from griptape_nodes.retained_mode.events.project_events import MacroPath
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import write_sidecar
@@ -99,6 +113,17 @@ AI_BROKER_DEVICE_AUTH_TIMEOUT_SECONDS = 5 * 60
 AI_BROKER_DEVICE_POLL_SECONDS = 2.0
 AI_BROKER_DEVICE_START_BACKOFF_SECONDS = (0.0, 0.5, 1.5)
 AI_BROKER_DEVICE_POLL_MAX_CONSECUTIVE_TRANSPORT_ERRORS = 3
+# Five Shot generators prepare and later poll independently.  Only their
+# billable Broker POST starts are paced because the production Broker rejects
+# same-account creates that arrive less than one second apart.  The lock is
+# released before network I/O, so accepted remote renders continue together.
+AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 1.20
+_BROKER_SUBMISSION_CADENCE_LOCK = threading.Lock()
+_BROKER_SUBMISSION_LAST_STARTED = 0.0
+_WORKFLOW_CHECKPOINT_LOCKS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Lock
+] = weakref.WeakKeyDictionary()
+_WORKFLOW_CHECKPOINT_LOCKS_GUARD = threading.Lock()
 
 LOCAL_VIDEO_UPLOAD_GRIPTAPE = "Griptape Cloud (Existing)"
 LOCAL_VIDEO_UPLOAD_TOS = "Volcengine TOS"
@@ -229,6 +254,14 @@ INPUT_MODE_MULTIMODAL_REFERENCES = "Multimodal References"
 OUTPUT_FORMAT_CHOICES = ("mp4", "mov")
 DEFAULT_OUTPUT_FORMAT = "mp4"
 LAST_FRAME_FILENAME = "seedance_2_5_last_frame.png"
+_AUTO_VIDEO_OUTPUT_NAME_PATTERN = re.compile(
+    r"^volcengine_seedance_video(?:_shot_0[1-5])?\.(?:mp4|mov)$",
+    re.IGNORECASE,
+)
+_AUTO_LAST_FRAME_NAME_PATTERN = re.compile(
+    r"^seedance_2_5_last_frame(?:_shot_0[1-5])?\.png$",
+    re.IGNORECASE,
+)
 
 # ``Task`` is the authored Seedance operation. ``input_mode`` remains a hidden
 # compatibility field for workflows saved before Task existed and is derived
@@ -418,6 +451,8 @@ MAX_AUDIO_BYTES = 15 * 1024 * 1024
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024
 MAX_LAST_FRAME_BYTES = 64 * 1024 * 1024
+MEDIA_BASE64_READ_CHUNK_BYTES = 3 * 256 * 1024
+CLOUD_UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 MAX_ATOMIC_OUTPUT_CANDIDATES = 10_000
 AMBIGUOUS_UPLOAD_CLEANUP_DELAY_SECONDS = 30 * 60
 
@@ -427,6 +462,7 @@ SHOT_IMAGE_INPUT_PARAMETER = "SHOT_IMAGE_IN"
 SHOT_VIDEO_INPUT_PARAMETER = "SHOT_VIDEO_IN"
 SHOT_ASSET_INPUT_PARAMETER = "SHOT_ASSET_IN"
 SHOT_PICKER_INPUT_PARAMETER = "SHOT_PICKER_IN"
+SHOT_PICKER_LEGACY_JSON_MAX_BYTES = 1024 * 1024
 SHOT_LOCAL_PROMPT_PARAMETER = "HMB_LOCAL_PROMPT_FALLBACK"
 SHOT_LOCAL_PROMPT_CAPTURED_PARAMETER = "HMB_LOCAL_PROMPT_CAPTURED"
 SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER = "HMB_REMOTE_PROMPT_OVERLAY"
@@ -436,6 +472,27 @@ SEEDANCE_SHOT_WIDGET_PARAMETER = "HMB_SEEDANCE_SHOT_UI"
 SEEDANCE_SHOT_WIDGET_NAME = "HMBSeedanceGenerationWidget"
 SEEDANCE_SHOT_WIDGET_LIBRARY_NAME = "HMB_GP_Production"
 SEEDANCE_SHOT_WIDGET_HEIGHT = 64
+SEEDANCE_REFRESH_COMMAND_PARAMETER = "HMB_SEEDANCE_REFRESH_COMMAND"
+SEEDANCE_REFRESH_COMMAND_SCHEMA = "hmb-seedance-refresh-command"
+SEEDANCE_REFRESH_COMMAND_VERSION = 1
+SEEDANCE_RECOVERY_PARAMETER = "HMB_SEEDANCE_RECOVERY"
+SEEDANCE_RECOVERY_SCHEMA = "hmb-seedance-generation-recovery"
+SEEDANCE_RECOVERY_VERSION = 1
+SEEDANCE_RECOVERY_STAGES = frozenset(
+    {
+        "",
+        "pre_submit",
+        "accepted",
+        "resume",
+        "submission_unknown",
+        "cancelled_locally",
+        "timed_out",
+        "terminal",
+        "remote_succeeded",
+        "local_succeeded",
+        "refresh",
+    }
+)
 SHOT_CHANNEL_UUID_PARAMETER = "shot_channel_uuid"
 SHOT_UUID_PARAMETER = "shot_uuid"
 SHOT_NUMBER_PARAMETER = "shot_number"
@@ -558,6 +615,121 @@ def _seedance_generation_preview_value(value: Any = None) -> dict[str, Any]:
         "has_existing_video": source.get("has_existing_video") is True,
         "media_revision": media_revision,
     }
+
+
+def _seedance_refresh_command_value(value: Any = None) -> dict[str, Any]:
+    """Normalize the one-shot browser command without accepting a task ID."""
+
+    source = value if isinstance(value, dict) else {}
+    action = str(source.get("action") or "").strip().lower()
+    action_id = str(source.get("action_id") or "").strip()
+    if (
+        source.get("schema") != SEEDANCE_REFRESH_COMMAND_SCHEMA
+        or source.get("version") != SEEDANCE_REFRESH_COMMAND_VERSION
+        or action != "refresh_existing"
+        or not action_id
+        or len(action_id) > 128
+        or _TASK_ID_PATTERN.fullmatch(action_id) is None
+    ):
+        action = ""
+        action_id = ""
+    issued_at_ms = source.get("issued_at_ms")
+    if not isinstance(issued_at_ms, int) or isinstance(issued_at_ms, bool):
+        issued_at_ms = 0
+    issued_at_ms = min(9_999_999_999_999, max(0, issued_at_ms))
+    return {
+        "schema": SEEDANCE_REFRESH_COMMAND_SCHEMA,
+        "version": SEEDANCE_REFRESH_COMMAND_VERSION,
+        "action": action,
+        "action_id": action_id,
+        "issued_at_ms": issued_at_ms,
+    }
+
+
+def _seedance_recovery_value(value: Any = None) -> dict[str, Any]:
+    """Normalize the durable, non-sensitive same-task recovery checkpoint."""
+
+    source = value if isinstance(value, dict) else {}
+    task_id = str(source.get("task_id") or "").strip()
+    if not task_id or _TASK_ID_PATTERN.fullmatch(task_id) is None:
+        task_id = ""
+    identity = str(source.get("task_identity") or "").strip().lower()
+    if identity not in {"client_request", "broker_task"} or not task_id:
+        identity = ""
+    status = str(source.get("status") or "").strip().lower().replace("-", "_")
+    allowed_statuses = (
+        BROKER_ACTIVE_STATUSES
+        | BROKER_SUCCESS_STATUSES
+        | BROKER_FAILURE_STATUSES
+        | BROKER_CANCELLED_STATUSES
+        | BROKER_EXPIRED_STATUSES
+        | LOCAL_PRE_SUBMISSION_STATUSES
+        | {
+            "",
+            "submitting",
+            "resuming",
+            "retrieving",
+            "downloading",
+            "verifying",
+            "cancelled_locally",
+            "timed_out",
+            "submission_unknown",
+            "succeeded",
+            "failed",
+        }
+    )
+    if status not in allowed_statuses or not task_id:
+        status = ""
+    stage = str(source.get("stage") or "").strip().lower()
+    if stage not in SEEDANCE_RECOVERY_STAGES or not task_id:
+        stage = ""
+    model_id = str(source.get("model_id") or "").strip()
+    if model_id not in MODEL_DISPLAY_NAME_BY_ID:
+        model_id = ""
+    output_format = str(source.get("output_format") or "").strip().lower()
+    if output_format not in OUTPUT_FORMAT_CHOICES:
+        output_format = ""
+    output_file = str(source.get("output_file") or "").strip()
+    if (
+        len(output_file) > 4096
+        or output_file.lower().startswith(("http://", "https://", "data:"))
+    ):
+        output_file = ""
+
+    def bounded_integer(raw: Any, maximum: int) -> int:
+        if not isinstance(raw, int) or isinstance(raw, bool):
+            return 0
+        return min(maximum, max(0, raw))
+
+    return {
+        "schema": SEEDANCE_RECOVERY_SCHEMA,
+        "version": SEEDANCE_RECOVERY_VERSION,
+        "revision": bounded_integer(source.get("revision"), 2_147_483_647),
+        "stage": stage,
+        "task_id": task_id,
+        "task_identity": identity,
+        "status": status,
+        "terminal": source.get("terminal") is True,
+        "updated_at_ms": bounded_integer(
+            source.get("updated_at_ms"), 9_999_999_999_999
+        ),
+        "model_id": model_id,
+        "output_format": output_format,
+        "return_last_frame": source.get("return_last_frame") is True,
+        "output_file": output_file,
+    }
+
+
+def _workflow_checkpoint_lock() -> asyncio.Lock:
+    """Return one save coordinator per event loop without binding stale loops."""
+
+    loop = asyncio.get_running_loop()
+    with _WORKFLOW_CHECKPOINT_LOCKS_GUARD:
+        lock = _WORKFLOW_CHECKPOINT_LOCKS.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            _WORKFLOW_CHECKPOINT_LOCKS[loop] = lock
+        return lock
 
 
 def _seedance_uuid_text(value: Any) -> str:
@@ -724,6 +896,10 @@ class _BrokerError(RuntimeError):
         super().__init__(message)
         self.status_code = status_code
         self.submission_outcome_unknown = submission_outcome_unknown
+        # Only the create-call catch may promote this to True. Keeping it out of
+        # the constructor prevents errors from accepted task polling/retrieval
+        # paths from inheriting create-rejection semantics.
+        self.definitive_submission_rejection = False
 
 
 class _BrokerUnavailableError(_BrokerError):
@@ -736,6 +912,10 @@ class _BrokerAuthenticationError(_BrokerError):
 
 class _BrokerProtocolError(_BrokerError):
     pass
+
+
+class _SubmissionCancelledBeforeStart(RuntimeError):
+    """Internal marker: local cancellation won before the billable POST."""
 
 
 @dataclass(frozen=True)
@@ -763,6 +943,22 @@ def _broker_build_opener() -> Any:
         urllib.request.ProxyHandler({}),
         _BrokerNoRedirectHandler(),
     )
+
+
+def _broker_wait_for_submission_slot() -> None:
+    """Reserve the next local Broker-create start without serializing renders."""
+
+    global _BROKER_SUBMISSION_LAST_STARTED
+    with _BROKER_SUBMISSION_CADENCE_LOCK:
+        now = time.monotonic()
+        remaining = (
+            _BROKER_SUBMISSION_LAST_STARTED
+            + AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS
+            - now
+        )
+        if remaining > 0:
+            time.sleep(remaining)
+        _BROKER_SUBMISSION_LAST_STARTED = time.monotonic()
 
 
 def _broker_log_transport_error(
@@ -1743,6 +1939,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._generation_refresh_running = False
         self._generation_run_active = threading.Event()
         self._hmb_generation_preview_state = _seedance_generation_preview_value()
+        self._hmb_generation_recovery_restore_fingerprint: (
+            tuple[Any, ...] | None
+        ) = None
+        self._hmb_last_saved_recovery_revision = 0
         self._hmb_generation_started_monotonic: float | None = None
         self._hmb_generation_started_at_ms = 0
         self._hmb_generation_media_revision = 0
@@ -1753,6 +1953,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._hmb_output_contract_syncing = False
         self._hmb_pending_generation_action = False
         self._hmb_generation_action_only_update = False
+        self._hmb_pending_generation_command_id = ""
+        self._hmb_processed_generation_command_ids: set[str] = set()
         self._hmb_node_deleted = False
         self._hmb_delete_parent_called = False
         self._hmb_model_migration_active = False
@@ -1882,39 +2084,53 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 },
             )
         )
-        for name, tooltip in (
-            (
-                SHOT_ASSET_INPUT_PARAMETER,
-                "Hidden exact ImageAsset Shot source dependency. Media is read from the source's private atomic snapshot.",
-            ),
-            (
-                SHOT_PICKER_INPUT_PARAMETER,
-                "Hidden exact VideoPicker Shot source dependency. Media is read from the source's private atomic snapshot.",
-            ),
-        ):
-            self.add_parameter(
-                Parameter(
-                    name=name,
-                    type="str",
-                    input_types=["any"],
-                    default_value="",
-                    tooltip=tooltip,
-                    allowed_modes={ParameterMode.INPUT},
-                    hide=True,
-                    hide_property=True,
-                    ui_options={
-                        "display_name": "",
-                        "hide": True,
-                        "hide_property": True,
-                        "hide_label": True,
-                        "hide_handles": True,
-                        "height": 1,
-                        "min_height": 0,
-                        "max_height": 1,
-                        "is_full_width": True,
-                    },
-                )
+        hidden_shot_input_ui = {
+            "display_name": "",
+            "hide": True,
+            "hide_property": True,
+            "hide_label": True,
+            "hide_handles": True,
+            "height": 1,
+            "min_height": 0,
+            "max_height": 1,
+            "is_full_width": True,
+        }
+        self.add_parameter(
+            Parameter(
+                name=SHOT_ASSET_INPUT_PARAMETER,
+                type="str",
+                input_types=["str"],
+                default_value="",
+                tooltip=(
+                    "Hidden exact ImageAsset Shot source dependency. Media is "
+                    "read from the source's private atomic snapshot."
+                ),
+                allowed_modes={ParameterMode.INPUT},
+                hide=True,
+                hide_label=True,
+                hide_property=True,
+                ui_options=dict(hidden_shot_input_ui),
             )
+        )
+        self.add_parameter(
+            ParameterDict(
+                name=SHOT_PICKER_INPUT_PARAMETER,
+                type="dict",
+                input_types=["dict"],
+                accept_any=False,
+                default_value={},
+                tooltip=(
+                    "Hidden exact VideoPicker Shot source dependency. Legacy "
+                    "serialized JSON is migrated to a dict; media is read from "
+                    "the source's private atomic snapshot."
+                ),
+                allowed_modes={ParameterMode.INPUT},
+                hide=True,
+                hide_label=True,
+                hide_property=True,
+                ui_options=dict(hidden_shot_input_ui),
+            )
+        )
         for name, tooltip in (
             (
                 SHOT_IMAGE_INPUT_PARAMETER,
@@ -2000,6 +2216,60 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         )
                     )
         self.add_parameter(shot_widget_parameter)
+
+        # A separate, zero-height custom-widget parameter carries one-shot
+        # refresh commands. Reusing HMB_SEEDANCE_SHOT_UI would make Griptape
+        # reconcile the durable Shot/catalog value; programmatically clicking
+        # the native ParameterButton can leave React waiting forever when its
+        # SendNodeMessage response is lost. This bridge contains no task ID.
+        refresh_command_kwargs: dict[str, Any] = {
+            "name": SEEDANCE_REFRESH_COMMAND_PARAMETER,
+            "type": "dict",
+            "input_types": ["dict"],
+            "default_value": _seedance_refresh_command_value(),
+            "tooltip": "Ephemeral minimal command transport for existing-task retrieval.",
+            "allowed_modes": {ParameterMode.PROPERTY},
+            "serializable": False,
+            "ui_options": {
+                "display_name": "",
+                "is_full_width": True,
+                "height": 1,
+                "min_height": 0,
+                "max_height": 1,
+                "widget_height": 1,
+                "expandable": False,
+                "resizable": False,
+                "compact": True,
+                "hide_label": True,
+                "hide_handles": True,
+            },
+        }
+        try:
+            if Widget is not None:
+                refresh_command_parameter = Parameter(
+                    **{
+                        **refresh_command_kwargs,
+                        "traits": {
+                            Widget(
+                                name=SEEDANCE_SHOT_WIDGET_NAME,
+                                library=SEEDANCE_SHOT_WIDGET_LIBRARY_NAME,
+                            )
+                        },
+                    }
+                )
+            else:
+                refresh_command_parameter = Parameter(**refresh_command_kwargs)
+        except Exception:
+            refresh_command_parameter = Parameter(**refresh_command_kwargs)
+            if Widget is not None:
+                with suppress(Exception):
+                    refresh_command_parameter.add_trait(
+                        Widget(
+                            name=SEEDANCE_SHOT_WIDGET_NAME,
+                            library=SEEDANCE_SHOT_WIDGET_LIBRARY_NAME,
+                        )
+                    )
+        self.add_parameter(refresh_command_parameter)
 
         self.add_parameter(
             ParameterString(
@@ -2555,8 +2825,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 ),
                 allowed_modes={ParameterMode.OUTPUT},
                 settable=False,
-                hide=True,
-                hide_property=True,
+                hide=False,
+                hide_property=False,
+                ui_options={"display_name": "Task ID"},
             )
         )
         status_group.add_child(
@@ -2580,6 +2851,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "replacement render or creates a second charge."
                 ),
                 on_click=self._on_refresh_clicked,
+                # Retain the parameter/callback for saved-host compatibility,
+                # but do not expose React's native loading button.  The visible
+                # preview action uses the bounded, zero-height command bridge;
+                # a lost native SendNodeMessage response could otherwise leave
+                # the button (and selected node) permanently loading.
+                state="hidden",
+                hide=True,
+                hide_property=True,
+                serializable=False,
             )
         )
         with ParameterGroup(name="AI Broker", collapsed=True) as broker_group:
@@ -2628,6 +2908,41 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 ui_options={"display_name": ""},
             )
         self.add_node_element(broker_group)
+
+        # Unlike the browser preview and one-shot command parameters, this
+        # bounded checkpoint is serialized with the workflow. It contains no
+        # prompt, media, signed URL, provider body, or credential. Its sole
+        # purpose is to recover the same paid Broker task after a hard restart.
+        #
+        # Keep it as the final node parameter. Griptape Nodes 0.95.1 replays
+        # saved parameter commands sequentially; placing this hydration
+        # sentinel after video/status outputs guarantees that the recovery UI
+        # observes the fully restored local artifact before deciding whether a
+        # same-task retrieval button is required.
+        self.add_parameter(
+            ParameterDict(
+                name=SEEDANCE_RECOVERY_PARAMETER,
+                default_value=_seedance_recovery_value(),
+                tooltip="Durable same-task Seedance crash recovery checkpoint.",
+                allowed_modes={ParameterMode.PROPERTY},
+                settable=False,
+                serializable=True,
+                hide=True,
+                hide_property=True,
+                hide_label=True,
+                ui_options={
+                    "display_name": "",
+                    "hide": True,
+                    "hide_property": True,
+                    "hide_label": True,
+                    "hide_handles": True,
+                    "height": 1,
+                    "min_height": 0,
+                    "max_height": 1,
+                    "is_full_width": True,
+                },
+            )
+        )
         self._update_parameter_visibility()
         _shot_routing.schedule_post_registration_reconcile(self)
 
@@ -3131,12 +3446,328 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         ]
         return {**deepcopy(snapshot), "shots": shots} if shots else {}
 
+    def _current_recovery_output_file(self) -> str:
+        raw = self.get_parameter_value("output_file")
+        location = getattr(raw, "location", getattr(raw, "value", raw))
+        text = str(location or "").strip()
+        if (
+            len(text) > 4096
+            or text.lower().startswith(("http://", "https://", "data:"))
+        ):
+            return ""
+        return text
+
+    def _build_recovery_output_destination(
+        self,
+        checkpoint: dict[str, Any],
+    ) -> Any:
+        """Rebuild the submitted task's saved output target, not today's UI value."""
+
+        persisted = _seedance_recovery_value(
+            self.get_parameter_value(SEEDANCE_RECOVERY_PARAMETER)
+        )
+        checkpoint_task_id = str(checkpoint.get("task_id") or "").strip()
+        output_file = str(persisted.get("output_file") or "").strip()
+        if (
+            not checkpoint_task_id
+            or persisted.get("task_id") != checkpoint_task_id
+            or not output_file
+        ):
+            # v0.6.46 and older workflows only have legacy output fields. Their
+            # live ProjectFileParameter may be connected to a destination
+            # provider, so preserve that host contract rather than synthesizing
+            # a new destination from the migration-only recovery view.
+            return self._output_file.build_file()
+        situation = str(
+            getattr(
+                self._output_file,
+                "_situation_name",
+                ProjectFileParameter.DEFAULT_SITUATION,
+            )
+            or ProjectFileParameter.DEFAULT_SITUATION
+        )
+        return ProjectFileDestination.from_situation(
+            output_file,
+            situation,
+            node_name=self.name,
+        )
+
+    def _submission_start_is_authorized(
+        self,
+        *,
+        require_registered: bool,
+    ) -> bool:
+        """Fail closed when Stop/delete wins before the billable POST starts."""
+
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            return False
+        if bool(getattr(self, "is_cancellation_requested", False)):
+            return False
+        return bool(
+            not require_registered
+            or self._runtime_node_is_live(require_registered=True)
+        )
+
+    async def _discard_unsent_generation_checkpoint(self, *, reason: str) -> None:
+        """Clear a provisional identity after proving no create call began."""
+
+        self.parameter_output_values["generation_id"] = ""
+        self.parameter_output_values["generation_status"] = ""
+        self.parameter_output_values["provider_response"] = None
+        self._clear_generation_recovery_checkpoint()
+        if self._runtime_node_is_live(require_registered=True):
+            await self._force_save_generation_recovery_checkpoint(
+                required=False,
+                reason=reason,
+            )
+
+    def _generation_recovery_state(self) -> dict[str, Any]:
+        """Return the durable checkpoint, migrating older serialized outputs."""
+
+        checkpoint = _seedance_recovery_value(
+            self.get_parameter_value(SEEDANCE_RECOVERY_PARAMETER)
+        )
+        if checkpoint["task_id"]:
+            return checkpoint
+
+        generation_id = str(
+            self.parameter_output_values.get("generation_id") or ""
+        ).strip()
+        if not generation_id or _TASK_ID_PATTERN.fullmatch(generation_id) is None:
+            return checkpoint
+        status = str(
+            self.parameter_output_values.get("generation_status") or ""
+        ).strip().lower().replace("-", "_")
+        provider_response = self.parameter_output_values.get("provider_response")
+        raw_model = str(
+            self.get_parameter_value("model_id") or MODEL_NAME_SEEDANCE_2_0
+        ).strip()
+        model_id = MODEL_ID_ALIASES.get(raw_model, "")
+        checkpoint = _seedance_recovery_value(
+            {
+                "revision": 1,
+                "stage": (
+                    "pre_submit"
+                    if status == "submitting"
+                    else "terminal"
+                    if status in TERMINAL_FAILURE_STATUSES
+                    else "accepted"
+                ),
+                "task_id": generation_id,
+                "task_identity": (
+                    "client_request"
+                    if status in {"submitting", "submission_unknown"}
+                    and generation_id.startswith("hmb-")
+                    else "broker_task"
+                ),
+                "status": status,
+                "terminal": bool(
+                    status in TERMINAL_FAILURE_STATUSES
+                    or (
+                        isinstance(provider_response, dict)
+                        and provider_response.get("terminal") is True
+                    )
+                ),
+                "updated_at_ms": int(time.time() * 1000),
+                "model_id": model_id,
+                "output_format": str(
+                    self.get_parameter_value("output_format")
+                    or DEFAULT_OUTPUT_FORMAT
+                ).strip().lower(),
+                "return_last_frame": bool(
+                    self.get_parameter_value("return_last_frame")
+                ),
+                "output_file": self._current_recovery_output_file(),
+            }
+        )
+        return checkpoint
+
+    def _set_generation_recovery_checkpoint(
+        self,
+        *,
+        stage: str,
+        task_id: str,
+        task_identity: str,
+        status: str,
+        params: dict[str, Any] | None = None,
+        terminal: bool = False,
+    ) -> dict[str, Any]:
+        """Update the serializable, bounded checkpoint without emitting UI state."""
+
+        previous = _seedance_recovery_value(
+            self.get_parameter_value(SEEDANCE_RECOVERY_PARAMETER)
+        )
+        source_params = params if isinstance(params, dict) else {}
+        raw_model = str(
+            source_params.get("model_id")
+            or previous.get("model_id")
+            or self.get_parameter_value("model_id")
+            or MODEL_NAME_SEEDANCE_2_0
+        ).strip()
+        model_id = MODEL_ID_ALIASES.get(raw_model, raw_model)
+        raw_format = str(
+            source_params.get("output_format")
+            or previous.get("output_format")
+            or self.get_parameter_value("output_format")
+            or DEFAULT_OUTPUT_FORMAT
+        ).strip().lower()
+        return_last_frame = (
+            bool(source_params.get("return_last_frame"))
+            if "return_last_frame" in source_params
+            else bool(previous.get("return_last_frame"))
+            if previous.get("task_id")
+            else bool(self.get_parameter_value("return_last_frame"))
+        )
+        # Capture the UI destination exactly once, at the durable pre-submit
+        # boundary.  A successful create replaces the client request identity
+        # with the Broker task ID, so task-ID equality cannot identify the same
+        # render across that transition.  Every later stage therefore retains
+        # the submitted destination even if the user edits the visible field.
+        previous_output_file = str(previous.get("output_file") or "")
+        current_output_file = self._current_recovery_output_file()
+        default_output_file = str(
+            getattr(self._output_file, "_default_filename", "") or ""
+        ).strip()
+        output_file = (
+            current_output_file or default_output_file
+            if stage == "pre_submit"
+            else previous_output_file or current_output_file or default_output_file
+        )
+        checkpoint = _seedance_recovery_value(
+            {
+                "revision": min(
+                    2_147_483_647,
+                    int(previous.get("revision") or 0) + 1,
+                ),
+                "stage": stage,
+                "task_id": task_id,
+                "task_identity": task_identity,
+                "status": status,
+                "terminal": terminal,
+                "updated_at_ms": int(time.time() * 1000),
+                "model_id": model_id,
+                "output_format": raw_format,
+                "return_last_frame": return_last_frame,
+                "output_file": output_file,
+            }
+        )
+        self.set_parameter_value(
+            SEEDANCE_RECOVERY_PARAMETER,
+            checkpoint,
+            emit_change=False,
+        )
+        self._hmb_generation_recovery_restore_fingerprint = None
+        return checkpoint
+
+    def _clear_generation_recovery_checkpoint(self) -> None:
+        self.set_parameter_value(
+            SEEDANCE_RECOVERY_PARAMETER,
+            _seedance_recovery_value(),
+            emit_change=False,
+        )
+        self._hmb_generation_recovery_restore_fingerprint = None
+
+    async def _force_save_generation_recovery_checkpoint(
+        self,
+        *,
+        required: bool,
+        reason: str,
+    ) -> bool:
+        """Persist the current workflow, serializing all five nodes in order.
+
+        A pre-submit save is fail-closed: no successful save means no billable
+        POST. Once the Broker has accepted a request, bounded retries are best
+        effort because the earlier client-request checkpoint is already safe.
+        """
+
+        checkpoint = self._generation_recovery_state()
+        if not checkpoint["task_id"] and required:
+            raise RuntimeError(
+                "Seedance recovery checkpoint has no valid task identity. "
+                "No render was submitted."
+            )
+
+        failure: Exception | None = None
+        attempts = 1 if required else 3
+        for attempt in range(1, attempts + 1):
+            try:
+                from griptape_nodes.retained_mode.events.workflow_events import (
+                    SaveWorkflowRequest,
+                    SaveWorkflowResultSuccess,
+                )
+
+                async with _workflow_checkpoint_lock():
+                    context_factory = getattr(GriptapeNodes, "ContextManager", None)
+                    request_handler = getattr(GriptapeNodes, "ahandle_request", None)
+                    if not callable(context_factory) or not callable(request_handler):
+                        raise RuntimeError("The host workflow save API is unavailable.")
+                    context = context_factory()
+                    if not context.has_current_workflow():
+                        raise RuntimeError("There is no active workflow to save.")
+                    current_name = str(context.get_current_workflow_name() or "")
+                    if not current_name:
+                        raise RuntimeError("The active workflow identity is missing.")
+                    first_save = current_name.startswith("unsaved:")
+                    result = await request_handler(
+                        SaveWorkflowRequest(
+                            file_name=None if first_save else current_name,
+                            broadcast_result=first_save,
+                            create_versioned=False,
+                            overwrite_existing=True,
+                        )
+                    )
+                    if not isinstance(result, SaveWorkflowResultSuccess):
+                        raise RuntimeError("The host rejected the workflow save.")
+                self._hmb_last_saved_recovery_revision = int(
+                    checkpoint.get("revision") or 0
+                )
+                return True
+            except Exception as exc:
+                failure = exc
+                if attempt < attempts:
+                    await asyncio.sleep(0.05 * attempt)
+
+        logger.warning(
+            "%s could not persist Seedance recovery checkpoint %s (%s; %s).",
+            self.name,
+            checkpoint["task_id"],
+            reason,
+            type(failure).__name__ if failure is not None else "UnknownError",
+        )
+        if required:
+            raise RuntimeError(
+                "Seedance recovery checkpoint could not be saved. "
+                "No render was submitted. Save the workflow and try again."
+            ) from failure
+        return False
+
     @staticmethod
     def _generation_artifact_is_present(value: Any) -> bool:
         if value is None:
             return False
         location = getattr(value, "value", value)
         return bool(str(location or "").strip())
+
+    @staticmethod
+    def _generation_artifact_is_locally_available(value: Any) -> bool:
+        if value is None:
+            return False
+        location = getattr(value, "value", value)
+        text = str(location or "").strip()
+        if not text:
+            return False
+        parsed = urlparse(text)
+        if parsed.scheme in {"http", "https"}:
+            return True
+        try:
+            resolved = File(text).resolve()
+            resolved_text = str(
+                getattr(resolved, "location", getattr(resolved, "value", resolved))
+                or ""
+            ).strip()
+        except Exception:
+            resolved_text = text
+        return bool(resolved_text and Path(resolved_text).is_file())
 
     def _capture_last_success_video(self) -> VideoUrlArtifact | None:
         """Keep the last complete preview visible while another task runs."""
@@ -3201,6 +3832,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         *,
         generation_id: str | None = None,
         action: str = "none",
+        has_existing_video: bool | None = None,
     ) -> None:
         """Publish one authoritative, bounded state to the custom widget."""
 
@@ -3225,14 +3857,184 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "started_at_ms": self._hmb_generation_started_at_ms,
                 "elapsed_seconds": elapsed_seconds,
                 "action": action,
-                "has_existing_video": self._generation_artifact_is_present(
-                    self._capture_last_success_video()
+                "has_existing_video": (
+                    self._generation_artifact_is_present(
+                        self._capture_last_success_video()
+                    )
+                    if has_existing_video is None
+                    else bool(has_existing_video)
                 ),
                 "media_revision": self._hmb_generation_media_revision,
             }
         )
         self._hmb_generation_preview_state = state
         self._sync_seedance_shot_widget(emit_change=True)
+
+    def _restore_generation_recovery_preview(self) -> None:
+        """Recreate only the same-task UI action after workflow hydration."""
+
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            return
+        checkpoint = self._generation_recovery_state()
+        generation_id = str(checkpoint.get("task_id") or "").strip()
+        current_video = self.parameter_output_values.get(
+            "video_url"
+        ) or self.parameter_output_values.get("VIDEO_OUT")
+        video_present = self._generation_artifact_is_locally_available(
+            current_video
+        )
+        if not generation_id:
+            fingerprint = ("idle", "", video_present)
+            if self._hmb_generation_recovery_restore_fingerprint == fingerprint:
+                return
+            self._hmb_generation_started_monotonic = None
+            self._hmb_generation_started_at_ms = 0
+            self._publish_generation_preview(
+                "idle",
+                generation_id="",
+                action="none",
+                has_existing_video=video_present,
+            )
+            self._hmb_generation_recovery_restore_fingerprint = fingerprint
+            return
+
+        status = str(checkpoint.get("status") or "").strip().lower()
+        provider_response = self.parameter_output_values.get("provider_response")
+        terminal = bool(
+            checkpoint.get("terminal") is True
+            or status in TERMINAL_FAILURE_STATUSES
+            or (
+                isinstance(provider_response, dict)
+                and provider_response.get("terminal") is True
+            )
+        )
+        if status == "submitting":
+            restored_status = "submission_unknown"
+            phase = "submission_unknown"
+            action = "refresh_existing"
+        elif status in {"pending", "queued", "submitted", "resuming"}:
+            restored_status = "queued" if status != "resuming" else "resuming"
+            phase = "queued"
+            action = "refresh_existing"
+        elif status in {"running", "processing", "in_progress"}:
+            restored_status = "running"
+            phase = "running"
+            action = "refresh_existing"
+        elif status in {
+            "retrieving",
+            "downloading",
+            "verifying",
+            "cancelled_locally",
+            "timed_out",
+            "submission_unknown",
+        }:
+            restored_status = status
+            phase = (
+                status
+                if status in GENERATION_PREVIEW_PHASES
+                else "submission_unknown"
+            )
+            # A local crash during retrieval/publication still recovers the
+            # exact server task; no create endpoint is reachable from this UI.
+            if phase in {"retrieving", "downloading", "verifying"}:
+                phase = "submission_unknown"
+            action = "refresh_existing"
+        elif terminal:
+            restored_status = status or "failed"
+            phase = "failed"
+            action = "none"
+        elif status in BROKER_SUCCESS_STATUSES or status == "succeeded":
+            restored_status = "succeeded"
+            phase = "succeeded" if video_present else "failed"
+            action = "none" if video_present else "refresh_existing"
+        else:
+            restored_status = status or "submission_unknown"
+            phase = "failed"
+            action = "refresh_existing"
+
+        fingerprint = (
+            generation_id,
+            restored_status,
+            terminal,
+            video_present,
+            int(checkpoint.get("revision") or 0),
+        )
+        if self._hmb_generation_recovery_restore_fingerprint == fingerprint:
+            return
+        self.parameter_output_values["generation_id"] = generation_id
+        self.parameter_output_values["generation_status"] = restored_status
+        if isinstance(provider_response, dict) and str(
+            provider_response.get("id") or ""
+        ).strip() == generation_id:
+            restored_response = dict(provider_response)
+            restored_response["status"] = restored_status
+            if terminal:
+                restored_response["terminal"] = True
+            self.parameter_output_values["provider_response"] = restored_response
+        else:
+            self.parameter_output_values["provider_response"] = {
+                "transport": "fn_ai_broker",
+                "id": generation_id,
+                "status": restored_status,
+                **({"terminal": True} if terminal else {}),
+            }
+        if video_present:
+            self._hmb_last_success_video = current_video
+        persisted_checkpoint = _seedance_recovery_value(
+            self.get_parameter_value(SEEDANCE_RECOVERY_PARAMETER)
+        )
+        if not persisted_checkpoint["task_id"]:
+            # In-memory migration for v0.6.46 workflows whose serialized output
+            # fields predate the dedicated recovery checkpoint.
+            self.set_parameter_value(
+                SEEDANCE_RECOVERY_PARAMETER,
+                checkpoint,
+                emit_change=False,
+            )
+        self._hmb_generation_started_monotonic = None
+        self._publish_generation_preview(
+            phase,
+            generation_id=generation_id,
+            action=action,
+            has_existing_video=video_present,
+        )
+        self._hmb_generation_recovery_restore_fingerprint = fingerprint
+
+    def _generation_recovery_blocks_new_submission(self) -> bool:
+        checkpoint = self._generation_recovery_state()
+        if not checkpoint["task_id"]:
+            return False
+        status = str(checkpoint.get("status") or "").strip().lower()
+        provider_response = self.parameter_output_values.get("provider_response")
+        terminal = bool(
+            checkpoint.get("terminal") is True
+            or status in TERMINAL_FAILURE_STATUSES
+            or (
+                isinstance(provider_response, dict)
+                and provider_response.get("terminal") is True
+            )
+        )
+        if terminal:
+            return False
+        if status in BROKER_SUCCESS_STATUSES or status == "succeeded":
+            current_video = self.parameter_output_values.get(
+                "video_url"
+            ) or self.parameter_output_values.get("VIDEO_OUT")
+            return not self._generation_artifact_is_locally_available(
+                current_video
+            )
+        return True
+
+    def _assert_new_submission_is_safe(self) -> None:
+        if not self._generation_recovery_blocks_new_submission():
+            return
+        checkpoint = self._generation_recovery_state()
+        self._restore_generation_recovery_preview()
+        raise RuntimeError(
+            "A previously submitted Seedance task still requires confirmation. "
+            f"Task ID: {checkpoint['task_id']}. Use the central Existing Task "
+            "Result button; a replacement render was not submitted."
+        )
 
     def _request_existing_generation_refresh(self) -> None:
         """Accept one browser pulse without accepting any browser task ID."""
@@ -3311,13 +4113,16 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self._set_shot_value(
                 SEEDANCE_SHOT_WIDGET_PARAMETER,
                 next_value,
-                emit_change=emit_change,
+                # Runtime preview publication has one authority path.  Calling
+                # set_parameter_value(..., emit_change=True) and then the
+                # explicit publisher duplicated the same retained-mode update,
+                # which amplified React/WebSocket work during result refresh.
+                emit_change=False,
             )
             if emit_change:
-                # Runtime progress uses the same paired lifecycle/value update
-                # contract as Griptape's execution status component.  The
-                # custom widget therefore receives the new value immediately
-                # without waiting for node completion.
+                # One explicit value event is sufficient for runtime progress;
+                # lifecycle invalidation here would duplicate the same state
+                # and can cascade through every selected React node.
                 publisher = getattr(self, "publish_update_to_parameter", None)
                 if callable(publisher):
                     publisher(SEEDANCE_SHOT_WIDGET_PARAMETER, next_value)
@@ -3398,6 +4203,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             current_identity["shot_uuid"],
         ):
             self._clear_remote_prompt_authority("shot_selection_changed")
+        # Five concurrent Shot generators must never publish into the same
+        # legacy default path. Only HMB-managed defaults are renamed; explicit
+        # output destinations and connected FileOutputSettings remain owned by
+        # the user/workflow.
+        self._sync_shot_output_filenames()
         self._sync_seedance_shot_widget()
 
     def _shot_identity(self) -> dict[str, Any]:
@@ -3618,7 +4428,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return
-        self._reconcile_shared_shot_routing()
+        try:
+            self._reconcile_shared_shot_routing()
+        finally:
+            self._restore_generation_recovery_preview()
+
+    def _hmb_post_hydration_state_restore(self) -> None:
+        """Restore durable preview state after the newest serialized replay."""
+
+        self._restore_generation_recovery_preview()
 
     def set_parameter_value(
         self,
@@ -3636,6 +4454,28 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         this boundary is therefore required both to migrate retired Mini
         workflows and to prevent an unknown model from silently becoming Full.
         """
+
+        if param_name == SEEDANCE_RECOVERY_PARAMETER:
+            value = _seedance_recovery_value(value)
+        elif param_name == SHOT_PICKER_INPUT_PARAMETER:
+            if isinstance(value, dict):
+                value = deepcopy(value)
+            elif isinstance(value, str):
+                text = value.strip()
+                parsed_value: Any = {}
+                if (
+                    text
+                    and len(text) <= SHOT_PICKER_LEGACY_JSON_MAX_BYTES
+                    and len(text.encode("utf-8", errors="ignore"))
+                    <= SHOT_PICKER_LEGACY_JSON_MAX_BYTES
+                ):
+                    with suppress(TypeError, ValueError):
+                        parsed = json.loads(text)
+                        if isinstance(parsed, dict):
+                            parsed_value = deepcopy(parsed)
+                value = parsed_value
+            else:
+                value = {}
 
         previous_model_id = ""
         if param_name == "model_id":
@@ -3786,6 +4626,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self._hmb_return_last_frame_initial_setup_seen = True
         if param_name == "output_format" and not initial_setup:
             self._sync_output_filename(str(value))
+        if param_name in {"output_file", "last_frame_file"}:
+            # Serialized legacy defaults can arrive before or after the hidden
+            # Shot quartet. Re-evaluate both managed names after either value
+            # is hydrated; a user-authored path never matches the managed-name
+            # patterns and is therefore left byte-for-byte intact.
+            self._sync_shot_output_filenames()
         if param_name in {"output_format", "return_last_frame"} and (
             not initial_setup
             or bool(getattr(self, "_hmb_model_initial_setup_seen", False))
@@ -3854,6 +4700,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             SHOT_UUID_PARAMETER,
             SHOT_NUMBER_PARAMETER,
             SHOT_NAME_PARAMETER,
+            SEEDANCE_RECOVERY_PARAMETER,
         }:
             self._schedule_post_hydration_shot_reconcile()
 
@@ -3871,7 +4718,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         """Reject browser-supplied catalogs and canonicalize widget Shot requests."""
 
         normalized = value
-        if parameter.name == "model_id":
+        if parameter.name == SEEDANCE_RECOVERY_PARAMETER:
+            normalized = _seedance_recovery_value(value)
+        elif parameter.name == "model_id":
             model_value = str(value or "").strip()
             if model_value in RETIRED_SEEDANCE_MODEL_VALUES:
                 # Persist the migration as the active display value. Future
@@ -3884,6 +4733,36 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 # after-value callback completes the atomic pair after the
                 # canonical model value itself has been stored.
                 normalized = MODEL_NAME_SEEDANCE_2_0
+        elif parameter.name == SEEDANCE_REFRESH_COMMAND_PARAMETER:
+            normalized = _seedance_refresh_command_value(value)
+            self._hmb_pending_generation_command_id = ""
+            action_id = normalized["action_id"]
+            processed_ids = getattr(
+                self,
+                "_hmb_processed_generation_command_ids",
+                set(),
+            )
+            preview = _seedance_generation_preview_value(
+                self._hmb_generation_preview_state
+            )
+            authoritative_id = str(
+                self.parameter_output_values.get("generation_id") or ""
+            ).strip()
+            if (
+                normalized["action"] == "refresh_existing"
+                and action_id
+                and action_id not in processed_ids
+                and preview["action"] == "refresh_existing"
+                and authoritative_id
+                and preview["job_id"] == authoritative_id
+                and not self._generation_run_active.is_set()
+            ):
+                try:
+                    self._validate_task_id(authoritative_id)
+                except _BrokerProtocolError:
+                    pass
+                else:
+                    self._hmb_pending_generation_command_id = action_id
         elif parameter.name == SEEDANCE_SHOT_WIDGET_PARAMETER:
             request = value.get("request") if isinstance(value, dict) else None
             action_only = bool(
@@ -4047,7 +4926,27 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         }:
             self._reconcile_shared_shot_routing()
         result = super().after_value_set(parameter, value)
-        if parameter.name == SEEDANCE_SHOT_WIDGET_PARAMETER:
+        if parameter.name == SEEDANCE_REFRESH_COMMAND_PARAMETER:
+            action_id = str(
+                getattr(self, "_hmb_pending_generation_command_id", "") or ""
+            ).strip()
+            self._hmb_pending_generation_command_id = ""
+            if action_id:
+                processed_ids = getattr(
+                    self,
+                    "_hmb_processed_generation_command_ids",
+                    None,
+                )
+                if not isinstance(processed_ids, set):
+                    processed_ids = set()
+                    self._hmb_processed_generation_command_ids = processed_ids
+                processed_ids.add(action_id)
+                if len(processed_ids) > 256:
+                    retained = set(tuple(processed_ids)[-127:])
+                    retained.add(action_id)
+                    self._hmb_processed_generation_command_ids = retained
+                self._schedule_existing_generation_refresh()
+        elif parameter.name == SEEDANCE_SHOT_WIDGET_PARAMETER:
             action_requested = self._hmb_pending_generation_action
             self._hmb_pending_generation_action = False
             self._hmb_generation_action_only_update = False
@@ -4097,18 +4996,21 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         parent = getattr(super(), "after_deserialize", None)
         result = parent(*args, **kwargs) if callable(parent) else None
         self._restore_seedance_shot_route()
+        self._restore_generation_recovery_preview()
         return result
 
     def after_load(self, *args: Any, **kwargs: Any) -> Any:
         parent = getattr(super(), "after_load", None)
         result = parent(*args, **kwargs) if callable(parent) else None
         self._restore_seedance_shot_route()
+        self._restore_generation_recovery_preview()
         return result
 
     def on_loaded(self, *args: Any, **kwargs: Any) -> Any:
         parent = getattr(super(), "on_loaded", None)
         result = parent(*args, **kwargs) if callable(parent) else None
         self._restore_seedance_shot_route()
+        self._restore_generation_recovery_preview()
         return result
 
     def _create_broker_bridge(self) -> _HMBAIBrokerBridge:
@@ -4278,8 +5180,39 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         return bridge
 
     @staticmethod
-    def _default_output_filename(output_format: str) -> str:
-        return f"volcengine_seedance_video.{output_format}"
+    def _default_output_filename(
+        output_format: str,
+        shot_number: int = 0,
+    ) -> str:
+        suffix = (
+            f"_shot_{shot_number:02d}"
+            if 1 <= int(shot_number or 0) <= SHOT_ROUTING_MAX_SHOTS
+            else ""
+        )
+        return f"volcengine_seedance_video{suffix}.{output_format}"
+
+    @staticmethod
+    def _default_last_frame_filename(shot_number: int = 0) -> str:
+        suffix = (
+            f"_shot_{shot_number:02d}"
+            if 1 <= int(shot_number or 0) <= SHOT_ROUTING_MAX_SHOTS
+            else ""
+        )
+        return f"seedance_2_5_last_frame{suffix}.png"
+
+    def _bound_output_shot_number(self) -> int:
+        identity = self._shot_identity()
+        return (
+            int(identity["shot_number"])
+            if identity.get("channel_uuid") and identity.get("shot_uuid")
+            else 0
+        )
+
+    @staticmethod
+    def _replace_managed_filename(current_text: str, filename: str) -> str:
+        current_path = Path(current_text)
+        updated = current_path.with_name(filename)
+        return filename if current_text == current_path.name else str(updated)
 
     def _sync_output_filename(self, output_format: str) -> None:
         requested = str(output_format or "").strip().lower()
@@ -4290,22 +5223,52 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return
         current_text = str(current_value)
         current_path = Path(current_text)
-        defaults = {
-            self._default_output_filename(item) for item in OUTPUT_FORMAT_CHOICES
-        }
-        if current_path.name not in defaults:
+        if _AUTO_VIDEO_OUTPUT_NAME_PATTERN.fullmatch(current_path.name) is None:
             return
-        updated_path = current_path.with_suffix("." + requested)
-        updated_value = (
-            updated_path.name
-            if current_text == current_path.name
-            else str(updated_path)
+        updated_value = self._replace_managed_filename(
+            current_text,
+            self._default_output_filename(
+                requested,
+                self._bound_output_shot_number(),
+            ),
         )
         if current_text == updated_value:
             return
         super().set_parameter_value("output_file", updated_value)
         with suppress(Exception):
             self.publish_update_to_parameter("output_file", updated_value)
+
+    def _sync_last_frame_filename(self) -> None:
+        current_value = self.get_parameter_value("last_frame_file")
+        if current_value in (None, ""):
+            return
+        current_text = str(current_value)
+        current_path = Path(current_text)
+        if _AUTO_LAST_FRAME_NAME_PATTERN.fullmatch(current_path.name) is None:
+            return
+        updated_value = self._replace_managed_filename(
+            current_text,
+            self._default_last_frame_filename(
+                self._bound_output_shot_number(),
+            ),
+        )
+        if current_text == updated_value:
+            return
+        super().set_parameter_value("last_frame_file", updated_value)
+        with suppress(Exception):
+            self.publish_update_to_parameter("last_frame_file", updated_value)
+
+    def _sync_shot_output_filenames(
+        self,
+        output_format: str | None = None,
+    ) -> None:
+        requested = str(
+            output_format
+            or self.get_parameter_value("output_format")
+            or DEFAULT_OUTPUT_FORMAT
+        ).strip().lower()
+        self._sync_output_filename(requested)
+        self._sync_last_frame_filename()
 
     def _synchronize_model_output_contract(
         self,
@@ -4330,7 +5293,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     super().set_parameter_value("output_format", output_format)
                 if bool(self.get_parameter_value("return_last_frame")):
                     super().set_parameter_value("return_last_frame", False)
-            self._sync_output_filename(output_format)
+            self._sync_shot_output_filenames(output_format)
         finally:
             self._hmb_output_contract_syncing = False
 
@@ -5327,6 +6290,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "poll_interval_seconds cannot exceed generation_timeout_seconds."
             )
 
+        resume_generation_id = params.get("resume_generation_id", "")
+        if resume_generation_id:
+            # Resuming an existing Broker task performs no reference upload.
+            # Validate only the task ID and polling controls used by this path;
+            # stale or incomplete TOS authoring settings must not make an
+            # already-submitted result unrecoverable.
+            self._validate_task_id(resume_generation_id)
+            return
+
         upload_service = params.get(
             "local_video_upload_service", LOCAL_VIDEO_UPLOAD_GRIPTAPE
         )
@@ -5343,11 +6315,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if not params.get("tos_region"):
                 raise ValueError("TOS Region cannot be blank.")
             self._normalize_tos_endpoint(params.get("tos_endpoint", ""))
-
-        resume_generation_id = params.get("resume_generation_id", "")
-        if resume_generation_id:
-            self._validate_task_id(resume_generation_id)
-            return
 
         model_id = params["model_id"]
         if model_id not in MODEL_RESOLUTIONS:
@@ -5677,6 +6644,146 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         encoded = base64.b64encode(decoded).decode("ascii")
         return f"data:{mime};base64,{encoded}"
 
+    @staticmethod
+    def _encode_local_media_data_uri(path: Path, mime: str) -> str:
+        """Base64-encode a bounded local file without a whole-file raw copy."""
+
+        encoded = io.StringIO()
+        encoded.write(f"data:{mime};base64,")
+        with path.open("rb") as stream:
+            remainder = b""
+            while True:
+                chunk = stream.read(MEDIA_BASE64_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                chunk = remainder + chunk
+                boundary = len(chunk) - (len(chunk) % 3)
+                if boundary:
+                    encoded.write(
+                        base64.b64encode(chunk[:boundary]).decode("ascii")
+                    )
+                remainder = chunk[boundary:]
+            if remainder:
+                encoded.write(base64.b64encode(remainder).decode("ascii"))
+        return encoded.getvalue()
+
+    @classmethod
+    def _projected_prepared_reference_json_bytes(
+        cls,
+        kind: str,
+        value: Any,
+    ) -> int:
+        """Project the exact JSON string size before loading local media bytes."""
+
+        reference = cls._coerce_reference_value(value)
+        text = str(reference).strip()
+        if not text:
+            raise ValueError(f"{kind.capitalize()} reference cannot be empty.")
+
+        if text.startswith("data:"):
+            match = _DATA_URI_PATTERN.fullmatch(text)
+            if match is None:
+                # The normal validator supplies the precise error. This value
+                # can never be submitted, so only a bounded projection is needed.
+                return len(text.encode("utf-8")) + 2
+            mime = match.group("mime").lower()
+            if kind == "audio":
+                mime = cls._normalize_audio_mime(mime)
+            compact_size = len(match.group("data"))
+            compact_size -= match.group("data").count("\r")
+            compact_size -= match.group("data").count("\n")
+            return len(f"data:{mime};base64,".encode("utf-8")) + compact_size + 2
+        if text.startswith(("asset://", "http://", "https://")):
+            return len(
+                json.dumps(text, ensure_ascii=False, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            )
+
+        try:
+            path = Path(File(text).resolve())
+        except FileLoadError as exc:
+            raise ValueError(
+                f"Could not resolve {kind} reference in the active Griptape project: {text}"
+            ) from exc
+        if not path.exists():
+            raise ValueError(
+                f"{kind.capitalize()} reference file does not exist in the active "
+                f"Griptape project: {text} (resolved to {path})"
+            )
+        if not path.is_file():
+            raise ValueError(f"{kind.capitalize()} reference is not a file: {path}")
+        if kind == "video":
+            raise ValueError(
+                "Volcengine Ark does not accept Base64/local video references. "
+                "Upload the MP4 to a public http(s) URL or register a Volcengine "
+                "asset:// reference before running this node."
+            )
+
+        suffix = path.suffix.lower()
+        if kind == "image":
+            mime = IMAGE_MIME_BY_SUFFIX.get(suffix)
+            maximum = MAX_IMAGE_BYTES
+        elif kind == "audio":
+            mime = AUDIO_MIME_BY_SUFFIX.get(suffix)
+            maximum = MAX_AUDIO_BYTES
+        else:
+            raise ValueError(f"Unsupported media kind: {kind!r}.")
+        if mime is None:
+            guessed, _ = mimetypes.guess_type(path.name)
+            raise ValueError(
+                f"Unsupported {kind} file type {suffix or guessed or '<none>'}: {path.name}"
+            )
+        size = path.stat().st_size
+        if size <= 0:
+            raise ValueError(f"{kind.capitalize()} reference is empty: {path}")
+        exceeds_limit = size >= maximum if kind == "image" else size > maximum
+        if exceeds_limit:
+            limit_mb = maximum // (1024 * 1024)
+            raise ValueError(
+                f"{kind.capitalize()} reference must be "
+                f"{'smaller than' if kind == 'image' else 'no larger than'} "
+                f"{limit_mb} MB: {path.name}"
+            )
+        base64_size = 4 * ((size + 2) // 3)
+        return len(f"data:{mime};base64,".encode("ascii")) + base64_size + 2
+
+    @classmethod
+    def _preflight_broker_media_size(
+        cls,
+        payload: dict[str, Any],
+        reference_fields: tuple[tuple[str, str, list[Any]], ...],
+    ) -> None:
+        """Reject an oversized request before any local media is materialized."""
+
+        projected_payload = dict(payload)
+        for field, _kind, values in reference_fields:
+            if values:
+                projected_payload[field] = ["" for _value in values]
+        projected_bytes = len(
+            json.dumps(
+                projected_payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        if projected_bytes > MAX_REQUEST_BYTES:
+            raise ValueError(
+                "FN AI Broker request body exceeds the 64 MB limit. "
+                "Reduce or externally host reference media."
+            )
+        for _field, kind, values in reference_fields:
+            for value in values:
+                # Each placeholder already contributed the two quote bytes.
+                projected_bytes += (
+                    cls._projected_prepared_reference_json_bytes(kind, value) - 2
+                )
+                if projected_bytes > MAX_REQUEST_BYTES:
+                    raise ValueError(
+                        "FN AI Broker request body exceeds the 64 MB limit. "
+                        "Reduce or externally host reference media."
+                    )
+
     @classmethod
     def _prepare_media_reference(cls, kind: str, value: Any) -> str:
         reference = cls._coerce_reference_value(value)
@@ -5746,8 +6853,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 f"{'smaller than' if kind == 'image' else 'no larger than'} "
                 f"{limit_mb} MB: {path.name}"
             )
-        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-        return f"data:{mime};base64,{encoded}"
+        try:
+            return cls._encode_local_media_data_uri(path, mime)
+        except OSError as exc:
+            raise ValueError(
+                f"{kind.capitalize()} reference cannot be read: {path}"
+            ) from exc
 
     @staticmethod
     def _get_optional_secret(name: str) -> str:
@@ -5901,6 +7012,79 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 f"Local reference video cannot be read: {value}"
             ) from exc
 
+    @staticmethod
+    def _iter_local_video_upload_chunks(path: Path) -> Iterator[bytes]:
+        """Yield one local upload as bounded chunks for signed HTTP storage."""
+
+        try:
+            with path.open("rb") as stream:
+                while True:
+                    chunk = stream.read(CLOUD_UPLOAD_READ_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    yield chunk
+        except OSError as exc:
+            raise LocalReferenceVideoError(
+                f"Local reference video cannot be read: {path}"
+            ) from exc
+
+    def _upload_local_video_to_griptape_cloud(
+        self,
+        driver: GriptapeCloudStorageDriver,
+        local_path: Path,
+        remote_path: Path,
+    ) -> str:
+        """Stream through the driver's signed URL, with legacy fallback.
+
+        Griptape Nodes 0.95 exposes signed upload/download methods, while older
+        compatible drivers expose only ``upload_file(bytes)``.  Prefer the
+        streaming contract so a large reference does not require a second
+        whole-file bytes allocation; retain the legacy path for old hosts and
+        test doubles.
+        """
+
+        create_upload = getattr(driver, "create_signed_upload_url", None)
+        create_download = getattr(driver, "create_signed_download_url", None)
+        if not callable(create_upload) or not callable(create_download):
+            _path, content = self._read_local_video_for_upload(str(local_path))
+            return str(
+                driver.upload_file(
+                    path=remote_path,
+                    file_content=content,
+                    timeout=120.0,
+                )
+            )
+
+        upload = create_upload(remote_path)
+        if not isinstance(upload, dict):
+            raise RuntimeError(
+                "Cloud storage returned an invalid signed upload contract."
+            )
+        method = str(upload.get("method") or "PUT").upper()
+        upload_url = str(upload.get("url") or "").strip()
+        if method not in {"PUT", "POST"} or not upload_url.startswith("https://"):
+            raise RuntimeError(
+                "Cloud storage returned an invalid signed HTTPS upload URL."
+            )
+        headers = {
+            str(key): str(value)
+            for key, value in dict(upload.get("headers") or {}).items()
+        }
+        if not any(key.lower() == "content-length" for key in headers):
+            headers["Content-Length"] = str(local_path.stat().st_size)
+        response = httpx.request(
+            method,
+            upload_url,
+            content=self._iter_local_video_upload_chunks(local_path),
+            headers=headers,
+            timeout=120.0,
+        )
+        response.raise_for_status()
+        public_url = str(create_download(remote_path) or "").strip()
+        if not public_url:
+            raise RuntimeError("Cloud storage returned an empty signed download URL.")
+        return public_url
+
     def _upload_local_video_to_tos(
         self,
         local_path: Path,
@@ -5990,7 +7174,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         local_path, params, tos_context
                     )
                 else:
-                    local_path, content = self._read_local_video_for_upload(text)
+                    local_path = self._resolve_local_video_path(text)
                     if driver is None:
                         driver = self._create_gt_cloud_storage_driver()
                     remote_path = (
@@ -5999,10 +7183,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         / local_path.name
                     )
                     self._temporary_video_uploads.append((driver, remote_path))
-                    public_url = driver.upload_file(
-                        path=remote_path,
-                        file_content=content,
-                        timeout=120.0,
+                    public_url = self._upload_local_video_to_griptape_cloud(
+                        driver,
+                        local_path,
+                        remote_path,
                     )
             except LocalReferenceVideoError:
                 # Preserve the actionable local/project-path diagnosis. The
@@ -6078,10 +7262,20 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         """Map the HMB media contract to the FN AI Broker Seedance schema."""
         self._validate_parameters(params)
         self._validate_broker_model(params.get("model_id"))
+        # Seedance 2.5 uses the provider's canonical resolution enum.  Keeping
+        # the legacy 720-pixel dimensions here produced contradictory requests
+        # such as ``quality=1080p`` beside ``resolution=1280x720``.  Aspect
+        # ratio is transported independently, so 2.5 must publish the exact
+        # validated 720p/1080p choice for every orientation.  Preserve the
+        # established pixel-shaped Broker compatibility field for 2.0.
         broker_resolution = (
-            "720x1280"
-            if params["ratio"] in {"9:16", "3:4"}
-            else "1280x720"
+            params["resolution"]
+            if params["model_id"] == SEEDANCE_2_5_MODEL_ID
+            else (
+                "720x1280"
+                if params["ratio"] in {"9:16", "3:4"}
+                else "1280x720"
+            )
         )
         task = str(params.get(TASK_PARAMETER) or TASK_REFERENCE_TO_VIDEO)
         input_mode = TASK_INPUT_MODES[task]
@@ -6110,6 +7304,27 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
         if params["model_id"] == SEEDANCE_2_0_MODEL_ID:
             payload["priority"] = params["priority"]
+        reference_fields: tuple[tuple[str, str, list[Any]], ...] = ()
+        if input_mode == INPUT_MODE_FIRST_LAST_FRAME:
+            reference_fields = (
+                (
+                    "first_frame",
+                    "image",
+                    [params["first_frame"]] if params["first_frame"] else [],
+                ),
+                (
+                    "last_frame",
+                    "image",
+                    [params["last_frame"]] if params["last_frame"] else [],
+                ),
+            )
+        elif input_mode == INPUT_MODE_MULTIMODAL_REFERENCES:
+            reference_fields = (
+                ("image_urls", "image", list(params["reference_images"])),
+                ("video_urls", "video", list(params["video_references"])),
+                ("audio_urls", "audio", list(params["reference_audio"])),
+            )
+        self._preflight_broker_media_size(payload, reference_fields)
         if input_mode == INPUT_MODE_FIRST_LAST_FRAME:
             if params["first_frame"]:
                 payload["first_frame"] = [
@@ -6424,9 +7639,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
 
     @staticmethod
-    def _resolve_host_addresses(hostname: str, port: int) -> set[str]:
+    def _resolve_host_addresses(hostname: str, port: int) -> tuple[str, ...]:
         try:
-            return {str(ipaddress.ip_address(hostname))}
+            return (str(ipaddress.ip_address(hostname)),)
         except ValueError:
             pass
         try:
@@ -6439,20 +7654,25 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise RuntimeError(
                 "Could not resolve the Volcengine video download host."
             ) from exc
-        return {
-            str(record[4][0]).split("%", 1)[0]
-            for record in records
-            if record and record[4]
-        }
+        addresses: list[str] = []
+        for record in records:
+            if not record or not record[4]:
+                continue
+            address = str(record[4][0]).split("%", 1)[0]
+            if address not in addresses:
+                addresses.append(address)
+        return tuple(addresses)
 
-    async def _validate_download_url(self, url: str) -> None:
+    async def _validate_download_url(self, url: str) -> tuple[str, ...]:
         parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise ValueError("Volcengine returned an invalid video download URL.")
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise ValueError(
+                "External result download URL must use HTTPS."
+            )
         if parsed.username is not None or parsed.password is not None:
             raise ValueError("Video download URL must not contain user credentials.")
         try:
-            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            port = parsed.port or 443
         except ValueError as exc:
             raise ValueError("Video download URL contains an invalid port.") from exc
         addresses = await asyncio.to_thread(
@@ -6472,6 +7692,52 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "Video download URL resolved to a private, loopback, link-local, "
                     "or otherwise non-public address."
                 )
+        return addresses
+
+    @staticmethod
+    def _pinned_download_target(
+        url: str,
+        address: str,
+    ) -> tuple[str, str, str]:
+        """Return an IP-pinned URL plus the original HTTP Host and TLS SNI.
+
+        DNS is resolved and classified before this helper is called.  The
+        socket target is then the validated literal address, so HTTPX cannot
+        perform a second attacker-controlled lookup between validation and
+        connection.  The original hostname remains both the Host header and
+        TLS SNI/certificate identity.
+        """
+
+        parsed = urlparse(url)
+        hostname = str(parsed.hostname or "")
+        if not hostname:
+            raise ValueError("External result download URL has no hostname.")
+        try:
+            port = parsed.port or 443
+        except ValueError as exc:
+            raise ValueError("Video download URL contains an invalid port.") from exc
+        normalized_address = str(ipaddress.ip_address(address))
+        ip_authority = (
+            f"[{normalized_address}]"
+            if ":" in normalized_address
+            else normalized_address
+        )
+        if parsed.port is not None:
+            ip_authority = f"{ip_authority}:{port}"
+
+        try:
+            sni_hostname = hostname.encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise ValueError(
+                "External result download URL contains an invalid hostname."
+            ) from exc
+        host_authority = (
+            f"[{sni_hostname}]" if ":" in sni_hostname else sni_hostname
+        )
+        if parsed.port is not None:
+            host_authority = f"{host_authority}:{port}"
+        pinned_url = parsed._replace(netloc=ip_authority).geturl()
+        return pinned_url, host_authority, sni_hostname
 
     async def _download_external_media(
         self,
@@ -6486,17 +7752,26 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         attempts = 0
         redirects = 0
         while attempts < 3:
-            await self._validate_download_url(current_url)
+            validated_addresses = await self._validate_download_url(current_url)
+            pinned_url, host_header, sni_hostname = self._pinned_download_target(
+                current_url,
+                validated_addresses[attempts % len(validated_addresses)],
+            )
             try:
                 # External signed result URLs are downloaded without Broker
                 # authorization; its access token must never leave Broker origin.
+                # Environment proxies are disabled so the validated public IP
+                # remains the actual socket destination.
                 async with httpx.AsyncClient(
-                    timeout=timeout, follow_redirects=False
+                    timeout=timeout,
+                    follow_redirects=False,
+                    trust_env=False,
                 ) as client:
                     async with client.stream(
                         "GET",
-                        current_url,
-                        headers={"Accept": accept},
+                        pinned_url,
+                        headers={"Accept": accept, "Host": host_header},
+                        extensions={"sni_hostname": sni_hostname},
                     ) as response:
                         if response.status_code in {301, 302, 303, 307, 308}:
                             location = response.headers.get("location")
@@ -6883,14 +8158,58 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         *args: Any,
         **kwargs: Any,
     ) -> tuple[Any, bool]:
-        """Return promptly on cancellation while the started POST finishes off-task."""
+        """Pace a create POST, then preserve its cancellation-safe outcome."""
 
-        operation = asyncio.create_task(
-            asyncio.to_thread(function, *args, **kwargs)
-        )
+        # Keep cadence reservation and the actual POST in the same worker so a
+        # delayed OS reschedule cannot compress two creates back together.
+        # A small state lock lets local cancellation win safely while the
+        # worker is still queued behind the cadence gate.
+        start_state_lock = threading.Lock()
+        cancel_before_start = threading.Event()
+        submission_started = False
+
+        def invoke_paced_submission() -> Any:
+            nonlocal submission_started
+            _broker_wait_for_submission_slot()
+            with start_state_lock:
+                if cancel_before_start.is_set() or not self._submission_start_is_authorized(
+                    require_registered=False
+                ):
+                    raise _SubmissionCancelledBeforeStart()
+                submission_started = True
+            return function(*args, **kwargs)
+
+        operation = asyncio.create_task(asyncio.to_thread(invoke_paced_submission))
         try:
             return await asyncio.shield(operation), False
         except asyncio.CancelledError:
+            with start_state_lock:
+                started_remotely = submission_started
+                if not started_remotely:
+                    cancel_before_start.set()
+
+            self._detached_submission_tasks.add(operation)
+
+            def consume_detached_result(completed: asyncio.Task[Any]) -> None:
+                self._detached_submission_tasks.discard(completed)
+                try:
+                    completed.result()
+                except (asyncio.CancelledError, _SubmissionCancelledBeforeStart):
+                    return
+                except Exception as exc:
+                    logger.warning(
+                        "%s detached Broker submission finished after local "
+                        "cancellation with %s; remote state remains unknown.",
+                        self.name,
+                        type(exc).__name__,
+                    )
+
+            operation.add_done_callback(consume_detached_result)
+            if not started_remotely:
+                # No remote request was made, so ordinary cancellation cleanup
+                # remains authoritative and no ambiguous task is reported.
+                raise
+
             # A running Python worker thread cannot be reclaimed safely. Detach it,
             # retain a strong reference until completion, and expose the only safe
             # remote-state claim: this idempotent submission may have been accepted.
@@ -6905,23 +8224,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     status="submission_unknown",
                     preview_action="refresh_existing",
                 )
-            self._detached_submission_tasks.add(operation)
-
-            def consume_detached_result(completed: asyncio.Task[Any]) -> None:
-                self._detached_submission_tasks.discard(completed)
-                try:
-                    completed.result()
-                except asyncio.CancelledError:
-                    return
-                except Exception as exc:
-                    logger.warning(
-                        "%s detached Broker submission finished after local "
-                        "cancellation with %s; remote state remains unknown.",
-                        self.name,
-                        type(exc).__name__,
-                    )
-
-            operation.add_done_callback(consume_detached_result)
             raise
 
     @classmethod
@@ -7261,6 +8563,24 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "succeeded",
             generation_id=generation_id,
         )
+        existing_recovery = self._generation_recovery_state()
+        self._set_generation_recovery_checkpoint(
+            stage="local_succeeded",
+            task_id=generation_id,
+            task_identity=str(
+                existing_recovery.get("task_identity") or "broker_task"
+            ),
+            status="succeeded",
+            params={
+                "model_id": effective_model_id,
+                "output_format": effective_output_format,
+                "return_last_frame": requested_last_frame,
+            },
+        )
+        await self._force_save_generation_recovery_checkpoint(
+            required=False,
+            reason="local_succeeded",
+        )
         if not self._runtime_node_is_live(require_registered=True):
             return
         self._set_status_results(
@@ -7327,6 +8647,23 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if not self._runtime_node_is_live(require_registered=True):
                 return
             status = str(task["status"])
+            refresh_params = self._get_parameters()
+            recovery_contract = self._generation_recovery_state()
+            recovery_destination = (
+                self._build_recovery_output_destination(recovery_contract)
+                if status == "succeeded"
+                else None
+            )
+            if recovery_contract.get("task_id") == generation_id:
+                if recovery_contract.get("model_id"):
+                    refresh_params["model_id"] = recovery_contract["model_id"]
+                if recovery_contract.get("output_format"):
+                    refresh_params["output_format"] = recovery_contract[
+                        "output_format"
+                    ]
+                refresh_params["return_last_frame"] = bool(
+                    recovery_contract.get("return_last_frame")
+                )
             self._set_broker_task_outputs(
                 task,
                 generation_id=generation_id,
@@ -7337,12 +8674,39 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     else "none"
                 ),
             )
+            self._set_generation_recovery_checkpoint(
+                stage=(
+                    "remote_succeeded"
+                    if status == "succeeded"
+                    else "terminal"
+                    if status in TERMINAL_FAILURE_STATUSES
+                    or task.get("terminal") is True
+                    else "refresh"
+                ),
+                task_id=generation_id,
+                task_identity=str(
+                    recovery_contract.get("task_identity") or "broker_task"
+                ),
+                status=status,
+                params=refresh_params,
+                terminal=bool(
+                    status in TERMINAL_FAILURE_STATUSES
+                    or task.get("terminal") is True
+                ),
+            )
+            await self._force_save_generation_recovery_checkpoint(
+                required=False,
+                reason="manual_refresh",
+            )
             if status == "succeeded":
-                refresh_params = self._get_parameters()
                 refresh_output_format = str(
                     refresh_params.get("output_format") or DEFAULT_OUTPUT_FORMAT
                 )
-                destination = self._output_file.build_file()
+                destination = recovery_destination
+                if destination is None:
+                    raise RuntimeError(
+                        "Seedance recovery output destination is unavailable."
+                    )
                 self._preflight_output_destination(
                     destination,
                     refresh_output_format,
@@ -7376,6 +8740,39 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
         except Exception as exc:
             if not self._runtime_node_is_live(require_registered=True):
+                return
+            recovery_checkpoint = self._generation_recovery_state()
+            definitive_missing_client_request = bool(
+                isinstance(exc, _BrokerError)
+                and exc.status_code in {404, 410}
+                and recovery_checkpoint.get("task_identity") == "client_request"
+                and recovery_checkpoint.get("task_id") == generation_id
+            )
+            if definitive_missing_client_request:
+                # The durable pre-submit identity can legitimately exist even
+                # when the process stopped before POST. Only an explicit Broker
+                # not-found/gone response for that provisional identity proves
+                # that no same-task recovery remains and permits a later create.
+                self.parameter_output_values["generation_id"] = ""
+                self.parameter_output_values["provider_response"] = None
+                self._clear_generation_recovery_checkpoint()
+                self._set_generation_status(
+                    "failed",
+                    generation_id="",
+                    preview_action="none",
+                )
+                await self._force_save_generation_recovery_checkpoint(
+                    required=False,
+                    reason="client_request_not_found",
+                )
+                self._set_status_results(
+                    was_successful=False,
+                    result_details=(
+                        "The Broker confirmed that the saved pre-submit request no "
+                        "longer identifies a server task. Recovery was cleared; no "
+                        "replacement render was started automatically."
+                    ),
+                )
                 return
             safe_detail = (
                 str(exc) if isinstance(exc, _BrokerError) else type(exc).__name__
@@ -7424,15 +8821,32 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 result_details=detail,
             )
 
-    def _on_refresh_clicked(self, _button: Any, _details: Any) -> None:
+    def _on_refresh_clicked(
+        self,
+        _button: Any,
+        _details: Any,
+    ) -> NodeMessageResult:
         if not self._runtime_node_is_live(require_registered=True):
-            return
+            return NodeMessageResult(
+                success=False,
+                details="Seedance refresh is unavailable because the node is inactive.",
+                response=_details,
+                altered_workflow_state=False,
+            )
         with self._generation_refresh_lock:
             if (
                 self._generation_refresh_running
                 or self._generation_run_active.is_set()
             ):
-                return
+                return NodeMessageResult(
+                    success=True,
+                    details=(
+                        "Seedance refresh was acknowledged, but this node is already "
+                        "busy; no duplicate request was scheduled."
+                    ),
+                    response=_details,
+                    altered_workflow_state=False,
+                )
             self._generation_refresh_running = True
 
         def _finished(_future: Any = None) -> None:
@@ -7442,15 +8856,27 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         try:
             event_loop = getattr(GriptapeNodes.EventManager(), "event_loop", None)
             if event_loop is not None and event_loop.is_running():
+                # Retained parameter/output state belongs to Griptape's engine
+                # loop. _refresh_async offloads Broker and media blocking work,
+                # so scheduling the coroutine here keeps node mutation ordered
+                # without occupying the loop during network I/O.
                 future = asyncio.run_coroutine_threadsafe(
                     self._refresh_async(), event_loop
                 )
                 future.add_done_callback(_finished)
-                return
+                return NodeMessageResult(
+                    success=True,
+                    details="Existing Seedance task refresh was scheduled.",
+                    response=_details,
+                    altered_workflow_state=False,
+                )
         except Exception:
             pass
 
         def _runner() -> None:
+            # Compatibility hosts without an initialized EventManager loop use
+            # an isolated fallback. Normal desktop execution takes the ordered
+            # engine-loop path above.
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
@@ -7465,9 +8891,25 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 name=f"{self.name}-refresh",
                 daemon=True,
             ).start()
-        except Exception:
+        except Exception as exc:
             _finished()
-            raise
+            logger.warning(
+                "%s could not schedule the existing-task refresh (%s).",
+                self.name,
+                type(exc).__name__,
+            )
+            return NodeMessageResult(
+                success=False,
+                details="Existing Seedance task refresh could not be scheduled.",
+                response=_details,
+                altered_workflow_state=False,
+            )
+        return NodeMessageResult(
+            success=True,
+            details="Existing Seedance task refresh was scheduled.",
+            response=_details,
+            altered_workflow_state=False,
+        )
 
     def after_node_deleted(self, *args: Any, **kwargs: Any) -> Any:
         """Invalidate every delayed Broker/UI callback without blocking delete."""
@@ -7514,6 +8956,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         """Submit and poll Seedance exclusively through the FN AI Broker."""
         if not self._runtime_node_is_live(require_registered=True):
             return
+        requested_resume_id = str(
+            self.get_parameter_value("resume_generation_id") or ""
+        ).strip()
+        if not requested_resume_id:
+            self._assert_new_submission_is_safe()
         self._set_safe_defaults()
         self._begin_generation_preview()
         self._set_generation_status("resolving_inputs", generation_id="")
@@ -7600,6 +9047,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 generation_id=generation_id,
                 status="resuming",
             )
+            self._set_generation_recovery_checkpoint(
+                stage="resume",
+                task_id=generation_id,
+                task_identity="broker_task",
+                status="resuming",
+                params=params,
+            )
+            await self._force_save_generation_recovery_checkpoint(
+                required=False,
+                reason="resume",
+            )
             logger.info("%s resuming FN AI Broker task %s", self.name, generation_id)
         else:
             if not self._runtime_node_is_live(require_registered=True):
@@ -7624,12 +9082,63 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 generation_id=client_request_id,
                 status="submitting",
             )
+            self._set_generation_recovery_checkpoint(
+                stage="pre_submit",
+                task_id=client_request_id,
+                task_identity="client_request",
+                status="submitting",
+                params=params,
+            )
+            # This is the billing boundary. A hard restart is recoverable only
+            # when the idempotent client identity is on disk before the POST.
+            try:
+                await self._force_save_generation_recovery_checkpoint(
+                    required=True,
+                    reason="pre_submit",
+                )
+            except Exception:
+                # No POST was reached. Remove the in-memory provisional ID so
+                # the current session neither claims a remote render exists nor
+                # blocks a corrected retry after the workflow-save problem is
+                # fixed. The failed save cannot have persisted this mutation,
+                # and the previously saved workflow remains untouched on disk.
+                self.parameter_output_values["generation_id"] = ""
+                self.parameter_output_values["provider_response"] = None
+                self._clear_generation_recovery_checkpoint()
+                self._set_generation_status(
+                    "failed",
+                    generation_id="",
+                    preview_action="none",
+                )
+                raise
+            if not self._submission_start_is_authorized(
+                require_registered=True
+            ):
+                await self._discard_unsent_generation_checkpoint(
+                    reason="cancelled_after_pre_submit_save",
+                )
+                raise asyncio.CancelledError(
+                    "Seedance submission was cancelled before the create request started."
+                )
             try:
                 response, submission_cancelled = await self._await_submission_result(
                     bridge.generate_seedance,
                     payload,
                     timeout=min(float(timeout), 1200.0),
                 )
+            except _SubmissionCancelledBeforeStart:
+                await self._discard_unsent_generation_checkpoint(
+                    reason="cancelled_at_submission_gate",
+                )
+                raise asyncio.CancelledError(
+                    "Seedance submission was cancelled before the create request started."
+                ) from None
+            except asyncio.CancelledError:
+                if not self._submission_outcome_unknown:
+                    await self._discard_unsent_generation_checkpoint(
+                        reason="cancelled_before_submission_start",
+                    )
+                raise
             except _BrokerError as exc:
                 if not self._runtime_node_is_live(require_registered=True):
                     return
@@ -7647,6 +9156,38 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         "id": client_request_id,
                         "status": "submission_unknown",
                     }
+                    self._set_generation_recovery_checkpoint(
+                        stage="submission_unknown",
+                        task_id=client_request_id,
+                        task_identity="client_request",
+                        status="submission_unknown",
+                        params=params,
+                    )
+                    await self._force_save_generation_recovery_checkpoint(
+                        required=False,
+                        reason="submission_unknown",
+                    )
+                elif (
+                    exc.status_code is not None
+                    and not exc.submission_outcome_unknown
+                ):
+                    # An HTTP response is a definitive create rejection, not a
+                    # disconnect with an accepted task hiding behind it. The
+                    # hmb-* value is only this client's idempotency key until a
+                    # successful Broker response returns an authoritative job ID.
+                    exc.definitive_submission_rejection = True
+                    self.parameter_output_values["generation_id"] = ""
+                    self.parameter_output_values["provider_response"] = None
+                    self._set_generation_status(
+                        "failed",
+                        generation_id="",
+                        preview_action="none",
+                    )
+                    self._clear_generation_recovery_checkpoint()
+                    await self._force_save_generation_recovery_checkpoint(
+                        required=False,
+                        reason="definitive_submission_rejection",
+                    )
                 raise
             if not self._runtime_node_is_live(require_registered=True):
                 return
@@ -7660,6 +9201,30 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 task,
                 generation_id=generation_id,
                 status=status,
+            )
+            self._set_generation_recovery_checkpoint(
+                stage=(
+                    "remote_succeeded"
+                    if status == "succeeded"
+                    else "terminal"
+                    if status in TERMINAL_FAILURE_STATUSES
+                    or task.get("terminal") is True
+                    else "accepted"
+                ),
+                task_id=generation_id,
+                task_identity="broker_task",
+                status=status,
+                params=params,
+                terminal=bool(
+                    status in TERMINAL_FAILURE_STATUSES
+                    or task.get("terminal") is True
+                ),
+            )
+            # If this best-effort save fails, the required pre-submit save still
+            # retains the same idempotent client request for safe retrieval.
+            await self._force_save_generation_recovery_checkpoint(
+                required=False,
+                reason="broker_accepted",
             )
             logger.info(
                 "%s submitted Seedance model %s through FN AI Broker as task %s",
@@ -7681,6 +9246,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     generation_id=generation_id,
                     preview_action="refresh_existing",
                 )
+                self._set_generation_recovery_checkpoint(
+                    stage="cancelled_locally",
+                    task_id=generation_id,
+                    task_identity="broker_task",
+                    status="cancelled_locally",
+                    params=params,
+                )
+                await self._force_save_generation_recovery_checkpoint(
+                    required=False,
+                    reason="submission_cancelled_locally",
+                )
                 raise asyncio.CancelledError(
                     "Local cancellation arrived during submission. The FN AI Broker "
                     f"task ID was recovered as {generation_id}; use Refresh / Retrieve "
@@ -7698,6 +9274,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     generation_id=generation_id,
                     preview_action="refresh_existing",
                 )
+                self._set_generation_recovery_checkpoint(
+                    stage="cancelled_locally",
+                    task_id=generation_id,
+                    task_identity="broker_task",
+                    status="cancelled_locally",
+                    params=params,
+                )
+                await self._force_save_generation_recovery_checkpoint(
+                    required=False,
+                    reason="poll_cancelled_locally",
+                )
                 raise asyncio.CancelledError(
                     "Local Broker polling stopped, but the server render continues. "
                     "Use Refresh / Retrieve Result for this same task."
@@ -7710,6 +9297,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "timed_out",
                     generation_id=generation_id,
                     preview_action="refresh_existing",
+                )
+                self._set_generation_recovery_checkpoint(
+                    stage="timed_out",
+                    task_id=generation_id,
+                    task_identity="broker_task",
+                    status="timed_out",
+                    params=params,
+                )
+                await self._force_save_generation_recovery_checkpoint(
+                    required=False,
+                    reason="poll_timed_out",
                 )
                 raise TimeoutError(
                     f"FN AI Broker task {generation_id} did not finish within "
@@ -7745,9 +9343,32 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 status,
             )
             if status == "succeeded":
+                self._set_generation_recovery_checkpoint(
+                    stage="remote_succeeded",
+                    task_id=generation_id,
+                    task_identity="broker_task",
+                    status="succeeded",
+                    params=params,
+                )
+                await self._force_save_generation_recovery_checkpoint(
+                    required=False,
+                    reason="remote_succeeded",
+                )
                 final_task = task
                 break
             if status in TERMINAL_FAILURE_STATUSES:
+                self._set_generation_recovery_checkpoint(
+                    stage="terminal",
+                    task_id=generation_id,
+                    task_identity="broker_task",
+                    status=status,
+                    params=params,
+                    terminal=True,
+                )
+                await self._force_save_generation_recovery_checkpoint(
+                    required=False,
+                    reason="broker_terminal",
+                )
                 raise RuntimeError(
                     self._broker_terminal_failure_message(task, generation_id)
                 )
@@ -7845,8 +9466,25 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 isinstance(provider_response, dict)
                 and provider_response.get("terminal") is True
             )
+            submission_unknown = (
+                isinstance(exc, _BrokerError) and exc.submission_outcome_unknown
+            )
+            definitive_submission_rejection = bool(
+                isinstance(exc, _BrokerError)
+                and exc.definitive_submission_rejection
+            )
+            if definitive_submission_rejection:
+                safe_message += (
+                    "\nThe Broker definitively rejected this create request; "
+                    "no new render was started."
+                )
             if generation_id:
-                if terminal:
+                if submission_unknown:
+                    safe_message += (
+                        f"\nClient request ID: {generation_id}. Broker acceptance "
+                        "could not be confirmed, so a remote task may still exist."
+                    )
+                elif terminal:
                     safe_message += (
                         f"\nExisting task ID: {generation_id}. This Broker job is "
                         "terminal. Refresh / Retrieve Result only retrieves the same "
@@ -7859,9 +9497,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         "continue after a disconnect. Use Refresh / Retrieve Result to "
                         "check this same task without creating a duplicate."
                     )
-            submission_unknown = (
-                isinstance(exc, _BrokerError) and exc.submission_outcome_unknown
-            )
             if submission_unknown:
                 if not self._runtime_node_is_live(require_registered=True):
                     return
@@ -7935,4 +9570,7 @@ __all__ = [
     "GENERATION_PREVIEW_SCHEMA",
     "GENERATION_PREVIEW_VERSION",
     "GENERATION_PREVIEW_PHASES",
+    "SEEDANCE_RECOVERY_PARAMETER",
+    "SEEDANCE_RECOVERY_SCHEMA",
+    "SEEDANCE_RECOVERY_VERSION",
 ]

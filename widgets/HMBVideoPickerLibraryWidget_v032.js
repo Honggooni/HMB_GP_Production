@@ -20,6 +20,12 @@ const HMB_DEFAULT_NODE_WIDTH = 1400;
 const HMB_DEFAULT_NODE_HEIGHT = 1200;
 const HMB_MIN_NODE_WIDTH = 760;
 const HMB_MIN_NODE_HEIGHT = 1151;
+// Expanded authoring is a fixed production canvas at its starting size.  The
+// smaller legacy limits above remain useful while compact Loader geometry is
+// hydrated, but the native resizer may only grow an expanded Picker beyond
+// the authored 1400x1200 frame.
+const HMB_EXPANDED_NODE_MIN_WIDTH = HMB_DEFAULT_NODE_WIDTH;
+const HMB_EXPANDED_NODE_MIN_HEIGHT = HMB_DEFAULT_NODE_HEIGHT;
 // ImageAsset parity: compact height follows Shot count only. Every Shot owns a
 // complete 180px loader row before and after media import.
 const HMB_VIDEO_PICKER_COMMAND_REGISTRY_KEY = "__HMB_VIDEO_PICKER_COMMAND_BRIDGES_V1__";
@@ -37,7 +43,7 @@ const HMB_VIDEO_PICKER_COMPACT_CHROME_RESERVE = 108;
 // then reserves another net 8px at the bottom. Unknown Editor DOM signatures
 // cannot be reclaimed safely, so retain the full 32px allocator allowance.
 const HMB_VIDEO_PICKER_COMPACT_ALLOCATOR_SAFE_RESERVE = 32;
-const HMB_VIDEO_PICKER_EXPANDED_MEASUREMENT_HEIGHT = HMB_MIN_NODE_HEIGHT;
+const HMB_VIDEO_PICKER_EXPANDED_MEASUREMENT_HEIGHT = HMB_EXPANDED_NODE_MIN_HEIGHT;
 const HMB_PICKER_CONTENT_FALLBACK_HEIGHT = 960;
 const HMB_PICKER_VIEWPORT_STAGE_MIN_HEIGHT = 360;
 const HMB_PICKER_OUTLINER_BODY_MIN_HEIGHT = 300;
@@ -98,8 +104,11 @@ const hmbVideoPickerExpandedGeometryFallbackRegistry = new WeakMap();
 const hmbVideoPickerRegistryScopeIds = new WeakMap();
 const hmbVideoPickerNodeInternalsSchedulers = new WeakMap();
 const hmbVideoPickerCompactTailReclaims = new WeakMap();
+const hmbVideoPickerExpandedHostHeightPropagations = new WeakMap();
+const hmbVideoPickerFitElementIds = new WeakMap();
 let hmbVideoPickerPaintFirstSequence = 0;
 let hmbVideoPickerRegistryScopeSequence = 0;
+let hmbVideoPickerFitElementSequence = 0;
 
 // Jewel Night is the single Shot-routing palette shared by ImageAsset,
 // Prompt, Agent, and VideoPicker. Shot 1 intentionally preserves the
@@ -252,13 +261,6 @@ function hmbNormalizeRightSectionHeights(value) {
 function hmbSectionHeightStyle(heights, key) {
   const value = Number(heights?.[key] || HMB_RIGHT_SECTION_DEFAULT_HEIGHTS[key] || 0);
   return value > 0 ? `height:${Math.round(value)}px` : "";
-}
-
-function hmbFlexPanelHeightStyle(value, minimum) {
-  const height = Number(value || 0);
-  return height >= minimum
-    ? `height:${Math.round(height)}px;flex:0 0 ${Math.round(height)}px`
-    : "";
 }
 
 const TEXT = {
@@ -2729,6 +2731,10 @@ function defaultState() {
     runtime_instance_id: "",
     node_width: 0,
     node_height: 0,
+    expanded_node_size: {
+      width: HMB_DEFAULT_NODE_WIDTH,
+      height: HMB_DEFAULT_NODE_HEIGHT,
+    },
     outliner_panel_height: 0,
     viewport_panel_height: 0,
     right_section_heights: { ...HMB_RIGHT_SECTION_DEFAULT_HEIGHTS },
@@ -2981,6 +2987,64 @@ function normalizeAssignments(value, activeCount, videos) {
   return Array.from({ length: activeCount }, (_, index) => ({ video_slot: index + 1, bindings: bySlot.get(index + 1) || [] }));
 }
 
+export function hmbPickerSelectedOutlinerNode(stateValue) {
+  const state = stateValue && typeof stateValue === "object" ? stateValue : {};
+  const nodes = Array.isArray(state.outliner_nodes)
+    ? state.outliner_nodes.filter((item) => item && typeof item === "object" && clean(item.full_path))
+    : [];
+  if (!nodes.length) return null;
+  const requestedUuid = clean(state.selected_outliner_uuid).toLowerCase();
+  const requestedPath = clean(state.selected_outliner_path);
+  return (
+    (requestedUuid
+      ? nodes.find((item) => clean(item.maya_uuid).toLowerCase() === requestedUuid)
+      : null)
+    || (requestedPath
+      ? nodes.find((item) => clean(item.full_path) === requestedPath)
+      : null)
+    || nodes.find((item) => !clean(item.parent_path))
+    || nodes[0]
+  );
+}
+
+export function hmbEnsurePickerOutlinerSelection(stateValue) {
+  const state = stateValue && typeof stateValue === "object" ? { ...stateValue } : {};
+  const selected = hmbPickerSelectedOutlinerNode(state);
+  if (!selected) {
+    state.selected_outliner_path = "";
+    state.selected_outliner_name = "";
+    state.selected_outliner_uuid = "";
+    state.selected_color = "";
+    return state;
+  }
+  const selectedPath = clean(selected.full_path);
+  const selectedUuid = clean(selected.maya_uuid);
+  const requestedPath = clean(state.selected_outliner_path);
+  const requestedUuid = clean(state.selected_outliner_uuid);
+  const retainedExactTarget = Boolean(
+    (selectedUuid && requestedUuid && selectedUuid.toLowerCase() === requestedUuid.toLowerCase())
+    || (selectedPath && requestedPath === selectedPath)
+  );
+  const bindings = (Array.isArray(state.slot_assignments) ? state.slot_assignments : [])
+    .find((item) => Number(item?.video_slot || 0) === 1)?.bindings;
+  const assigned = (Array.isArray(bindings) ? bindings : []).find((item) => {
+    const bindingUuid = clean(item?.maya_uuid);
+    const bindingPath = clean(item?.full_dag_path || item?.subject_root);
+    return (
+      (selectedUuid && bindingUuid && selectedUuid.toLowerCase() === bindingUuid.toLowerCase())
+      || (selectedPath && bindingPath === selectedPath)
+    );
+  });
+  state.selected_outliner_path = selectedPath;
+  state.selected_outliner_name = clean(selected.name || selected.display_name)
+    || selectedPath.split("|").filter(Boolean).at(-1)
+    || selectedPath;
+  state.selected_outliner_uuid = selectedUuid;
+  state.selected_color = clean(assigned?.color)
+    || (retainedExactTarget ? clean(state.selected_color) : "");
+  return state;
+}
+
 function normalize(value) {
   let source = {};
   if (value && typeof value === "object") source = value;
@@ -3025,12 +3089,28 @@ function normalize(value) {
   state.output_height = requestedResolution.height;
   state.node_width = Number(state.node_width || 0) > 0 ? clamp(Math.round(Number(state.node_width)), HMB_MIN_NODE_WIDTH, 6000) : 0;
   state.node_height = Number(state.node_height || 0) > 0 ? clamp(Math.round(Number(state.node_height)), HMB_MIN_NODE_HEIGHT, 6000) : 0;
+  const rawExpandedNodeSize = state.expanded_node_size && typeof state.expanded_node_size === "object"
+    ? state.expanded_node_size
+    : {};
+  state.expanded_node_size = {
+    width: clamp(
+      Math.round(Number(rawExpandedNodeSize.width || HMB_DEFAULT_NODE_WIDTH)),
+      HMB_EXPANDED_NODE_MIN_WIDTH,
+      6000,
+    ),
+    height: clamp(
+      Math.round(Number(rawExpandedNodeSize.height || HMB_DEFAULT_NODE_HEIGHT)),
+      HMB_EXPANDED_NODE_MIN_HEIGHT,
+      6000,
+    ),
+  };
   state.outliner_panel_height = Number(state.outliner_panel_height || 0) > 0
     ? clamp(Math.round(Number(state.outliner_panel_height)), HMB_PICKER_OUTLINER_PANEL_MIN_HEIGHT, 6000)
     : 0;
-  state.viewport_panel_height = Number(state.viewport_panel_height || 0) > 0
-    ? clamp(Math.round(Number(state.viewport_panel_height)), HMB_PICKER_VIEWPORT_PANEL_MIN_HEIGHT, 6000)
-    : 0;
+  // v0.6.46 fixed layout: the viewport always owns the center stack's
+  // remaining height. Retain the schema field for old workflows, but normalize
+  // every legacy/manual value to zero so it cannot return as inline geometry.
+  state.viewport_panel_height = 0;
   const sourceLayoutVersion = Math.max(1, Math.floor(Number(source?.ui_layout_version || 1)));
   // v3 repairs outer heights saved by the former Picker height propagation.
   // Internal panel sizes remain untouched; only the stale React Flow height is
@@ -3048,14 +3128,6 @@ function normalize(value) {
       color: legacyColor + legacyLog + 8,
       log: legacyLog,
     });
-    const legacyViewportHeight = Number(source?.viewport_panel_height || 0);
-    if (legacyViewportHeight > 0) {
-      state.viewport_panel_height = clamp(
-        Math.round(legacyViewportHeight - legacyLog - 8),
-        HMB_PICKER_VIEWPORT_PANEL_MIN_HEIGHT,
-        6000,
-      );
-    }
   } else {
     state.right_section_heights = hmbNormalizeRightSectionHeights(state.right_section_heights);
   }
@@ -3233,6 +3305,11 @@ function normalize(value) {
   hmbNormalizePickerShotRows(state);
   hmbNormalizePickerWorkspaceRows(state);
   state.slot_assignments = normalizeAssignments(state.slot_assignments, state.active_slot_count, state.videos);
+  // Python normally publishes one concrete target with OUTLINER_READY. A
+  // delayed/stale widget echo can omit that selection even though the Maya
+  // roots arrived correctly, which leaves every Color Pick disabled. Heal the
+  // UI projection deterministically by UUID/path, then by the first root.
+  Object.assign(state, hmbEnsurePickerOutlinerSelection(state));
   const visibilityBySlot = new Map();
   for (const raw of Array.isArray(state.slot_visibility) ? state.slot_visibility : []) {
     const slot = clamp(Math.floor(Number(raw?.video_slot || 1)), 1, state.active_slot_count);
@@ -3904,26 +3981,65 @@ function hmbVideoPickerRegistryScopeKey(container, shell) {
   return String(scopeId);
 }
 
+export function hmbBindVideoPickerRuntimeIdentity(container, runtimeInstanceId) {
+  if (!container) return { changed: false, hydrationReset: false };
+  const nextRuntimeId = clean(runtimeInstanceId);
+  const previousRuntimeId = clean(container.__hmbVideoPickerRuntimeInstanceId);
+  // A transient host echo without runtime identity is not authority to erase a
+  // live controller's choice. The initial empty value simply stays compact.
+  if (!nextRuntimeId || nextRuntimeId === previousRuntimeId) {
+    if (!previousRuntimeId && !nextRuntimeId) {
+      container.__hmbVideoPickerRuntimeInstanceId = "";
+    }
+    return { changed: false, hydrationReset: false };
+  }
+  const hydrationReset = !!previousRuntimeId && previousRuntimeId !== nextRuntimeId;
+  const migrateUnboundChoice = !previousRuntimeId;
+  const rememberedExpanded = typeof container.__hmbVideoPickerExpanded === "boolean"
+    ? container.__hmbVideoPickerExpanded === true
+    : null;
+  const rememberedGeometry = container.__hmbVideoPickerExpandedGeometry || null;
+
+  container.__hmbVideoPickerRuntimeInstanceId = nextRuntimeId;
+  if (hydrationReset) {
+    // React Flow may reuse the same data-id for a newly hydrated Python node.
+    // That is a new workflow-load boundary: never copy view/geometry from the
+    // previous runtime into its registry identity.
+    delete container.__hmbVideoPickerExpandedGeometry;
+    delete container.__hmbVideoPickerExpandedViewState;
+    hmbRememberVideoPickerViewMode(container, false);
+  } else if (migrateUnboundChoice) {
+    // Some hosts first mount with a blank runtime id and publish the real id in
+    // the next echo. Rebind the user's already-visible choice exactly once.
+    if (typeof rememberedExpanded === "boolean") {
+      hmbRememberVideoPickerViewMode(container, rememberedExpanded);
+    }
+    if (rememberedGeometry?.properties) {
+      hmbRememberVideoPickerExpandedGeometry(container, rememberedGeometry);
+    }
+  }
+  return { changed: true, hydrationReset };
+}
+
 export function hmbVideoPickerNodeIdentity(container) {
   const shell = findReactFlowNode(container) || videoPickerNodeRoot(container);
   if (!shell) return null;
+  const runtimeId = clean(container?.__hmbVideoPickerRuntimeInstanceId);
+  // View and expanded-geometry memory may survive controller remounts inside
+  // one loaded Python node, but a newly hydrated runtime must always cold-mount
+  // compact even when React Flow reuses the same serialized node id.
+  if (!runtimeId) return null;
   const id = clean(
     shell.getAttribute?.("data-id")
     || shell.getAttribute?.("data-node-id")
     || shell.getAttribute?.("data-nodeid"),
   );
-  // runtime_instance_id is intentionally excluded: it changes on reload and
-  // would make the session registry lose the node's chosen view mode. The
-  // stable node id is scoped to its workflow canvas (or ownerDocument fallback)
-  // so two open workflows may safely reuse the same serialized React Flow id.
-  return id ? `scope:${hmbVideoPickerRegistryScopeKey(container, shell)}:id:${id}` : shell;
+  return id
+    ? `scope:${hmbVideoPickerRegistryScopeKey(container, shell)}:id:${id}:runtime:${runtimeId}`
+    : `runtime:${runtimeId}`;
 }
 
 export function hmbVideoPickerStoredViewMode(container) {
-  const shell = findReactFlowNode(container);
-  if (shell && hmbVideoPickerViewModeFallbackRegistry.has(shell)) {
-    return hmbVideoPickerViewModeFallbackRegistry.get(shell) === true;
-  }
   const identity = hmbVideoPickerNodeIdentity(container);
   if (!identity) return null;
   if (typeof identity === "string") {
@@ -3951,10 +4067,6 @@ export function hmbRememberVideoPickerViewMode(container, expanded) {
 }
 
 function hmbVideoPickerExpandedGeometryRegistryEntry(container) {
-  const shell = findReactFlowNode(container);
-  if (shell && hmbVideoPickerExpandedGeometryFallbackRegistry.has(shell)) {
-    return hmbVideoPickerExpandedGeometryFallbackRegistry.get(shell) || null;
-  }
   const identity = hmbVideoPickerNodeIdentity(container);
   if (!identity) return null;
   return typeof identity === "string"
@@ -4030,7 +4142,7 @@ const HMB_PICKER_INTERNAL_HEADER_INTERACTIVE_SELECTOR = [
 const HMB_PICKER_CANVAS_MOTION_INTERACTIVE_SELECTOR = [
   "button", "input", "select", "textarea", "a", "summary", "[role='button']",
   "[contenteditable='true']", "[contenteditable='']", "video", "audio",
-  "[data-resize-panel]", "[data-resize-section]",
+  "[data-resize-section]",
 ].join(",");
 
 function hmbVideoPickerPaintFirstJobs(container, create = false) {
@@ -4572,7 +4684,6 @@ function hmbPickerViewportPanelRequiredHeight(container) {
     [".video-seekbar", 28],
     [".video-controls", 44],
     [".frame-info-strip", 28],
-    [".panel-resize-handle", 10],
   ].reduce((sum, entry) => sum + hmbPickerCssHeight(panel.querySelector?.(entry[0]), entry[1]), 0);
   const borders = hmbPickerComputedNumber(panel, "borderTopWidth", 1) + hmbPickerComputedNumber(panel, "borderBottomWidth", 1);
   const explicitHeight = parseFloat(panel.style?.height || "");
@@ -4602,7 +4713,7 @@ function hmbPickerCenterStackRequiredHeight(container) {
   const viewportHeight = hmbPickerViewportPanelRequiredHeight(container);
   const activity = stack.querySelector?.(".activity-section");
   const activityHeight = activity
-    ? Math.max(150, hmbPickerComputedNumber(activity, "minHeight", 150))
+    ? hmbPickerSectionRequiredHeight(activity, HMB_RIGHT_SECTION_DEFAULT_HEIGHTS.log)
     : 0;
   let gap = 8;
   try {
@@ -4664,11 +4775,22 @@ function hmbSetPickerStyleIfChanged(element, property, value, priority = "") {
 }
 
 function hmbApplyPickerHostSizing(container, requiredInnerHeight = null) {
-  // Expanded mode stays inline. Size only Picker-owned DOM; React Flow,
-  // adaptive parameter rows, and canvas ancestors stay immutable.
-  const localRequired = Math.max(
+  // Expanded mode stays inline. The exact HMB_PICKER_STATE allocator row is
+  // allowed to follow the Picker, but React Flow workspace/canvas ancestors
+  // remain immutable. The React Flow shell is repaired only at an explicit
+  // view transition or native resize boundary; touching it from every fit pass
+  // creates a host-render -> ResizeObserver -> fit feedback loop.
+  const naturalRequired = Math.max(
     HMB_PICKER_CONTENT_FALLBACK_HEIGHT,
     Math.ceil(Number(requiredInnerHeight) || hmbPickerInnerRequiredHeight(container)),
+  );
+  const exactShell = hmbVideoPickerExactReactFlowNode(container);
+  const availableHeight = exactShell
+    ? Math.ceil(hmbPickerAvailableHeightToShell(container, exactShell))
+    : 0;
+  const localRequired = Math.max(
+    naturalRequired,
+    availableHeight,
   );
   for (const element of [
     container?.querySelector?.(".hmbvp-clip"),
@@ -4682,6 +4804,11 @@ function hmbApplyPickerHostSizing(container, requiredInnerHeight = null) {
     hmbSetPickerStyleIfChanged(element, "overflow", "hidden");
     hmbSetPickerStyleIfChanged(element, "box-sizing", "border-box");
   }
+  hmbApplyVideoPickerExpandedHostHeightPropagation(
+    container,
+    localRequired,
+    exactShell,
+  );
   return localRequired;
 }
 
@@ -4709,6 +4836,131 @@ function hmbVideoPickerExactReactFlowNode(container) {
     current = hmbPickerComposedParent(current);
   }
   return null;
+}
+
+function hmbVideoPickerExpandedShellWidth(shell) {
+  if (!shell) return 0;
+  try {
+    const value = Number(shell.offsetWidth || 0);
+    if (Number.isFinite(value) && value > 0) return Math.round(value);
+  } catch (_error) {}
+  try {
+    const rect = shell.getBoundingClientRect?.();
+    const styleWidth = parseFloat(shell.style?.getPropertyValue?.("width") || shell.style?.width || "");
+    const visualWidth = Number(rect?.width || 0);
+    if (Number.isFinite(styleWidth) && styleWidth > 0) return Math.round(styleWidth);
+    if (Number.isFinite(visualWidth) && visualWidth > 0) return Math.round(visualWidth);
+  } catch (_error) {}
+  return 0;
+}
+
+function hmbVideoPickerExpandedInlineDimension(shell, property) {
+  if (!shell?.style) return 0;
+  try {
+    const value = parseFloat(
+      shell.style.getPropertyValue?.(property)
+      || shell.style[property]
+      || "",
+    );
+    return Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+  } catch (_error) {
+    return 0;
+  }
+}
+
+export function hmbVideoPickerExpandedRenderedResizeDelta(startHeight, currentHeight) {
+  const start = Math.max(
+    HMB_EXPANDED_NODE_MIN_HEIGHT,
+    Math.round(Number(startHeight) || HMB_EXPANDED_NODE_MIN_HEIGHT),
+  );
+  const current = Math.max(
+    HMB_EXPANDED_NODE_MIN_HEIGHT,
+    Math.round(Number(currentHeight) || HMB_EXPANDED_NODE_MIN_HEIGHT),
+  );
+  return current - start;
+}
+
+// Apply the expanded-only resize contract directly to the exact React Flow
+// shell.  Compact owns a smaller automatic height, so it never enters here.
+// The min declarations stop a native pointer resize before the authored frame
+// can reflow; normal width/height values remain free to grow above the floor.
+// React Flow can still write an undersized inline width/height while the CSS
+// minimum keeps offsetWidth/offsetHeight visually at 1400x1200.  The host's
+// adaptive rows consume that stale inline size and shrink only the widget,
+// exposing a black tail.  Inspect and repair both rendered and inline geometry.
+export function hmbApplyVideoPickerExpandedGeometryFloor(container, options = {}) {
+  if (!container || (container.__hmbVideoPickerExpanded !== true && options.force !== true)) {
+    return null;
+  }
+  const shell = hmbVideoPickerExactReactFlowNode(container);
+  if (!shell?.style) return null;
+  const measuredWidth = hmbVideoPickerExpandedShellWidth(shell);
+  const measuredHeight = hmbPickerNodeShellHeight(shell);
+  const inlineWidth = hmbVideoPickerExpandedInlineDimension(shell, "width");
+  const inlineHeight = hmbVideoPickerExpandedInlineDimension(shell, "height");
+  const widthClamped = !(measuredWidth >= HMB_EXPANDED_NODE_MIN_WIDTH)
+    || (inlineWidth > 0 && inlineWidth < HMB_EXPANDED_NODE_MIN_WIDTH);
+  const heightClamped = !(measuredHeight >= HMB_EXPANDED_NODE_MIN_HEIGHT)
+    || (inlineHeight > 0 && inlineHeight < HMB_EXPANDED_NODE_MIN_HEIGHT);
+
+  hmbSetPickerStyleIfChanged(
+    shell,
+    "min-width",
+    `${HMB_EXPANDED_NODE_MIN_WIDTH}px`,
+    "important",
+  );
+  hmbSetPickerStyleIfChanged(
+    shell,
+    "min-height",
+    `${HMB_EXPANDED_NODE_MIN_HEIGHT}px`,
+    "important",
+  );
+  if (widthClamped) {
+    hmbSetPickerStyleIfChanged(
+      shell,
+      "width",
+      `${Math.max(HMB_EXPANDED_NODE_MIN_WIDTH, measuredWidth || 0)}px`,
+    );
+  }
+  if (heightClamped) {
+    hmbSetPickerStyleIfChanged(
+      shell,
+      "height",
+      `${Math.max(HMB_EXPANDED_NODE_MIN_HEIGHT, measuredHeight || 0)}px`,
+    );
+  }
+  return {
+    shell,
+    width: Math.max(HMB_EXPANDED_NODE_MIN_WIDTH, measuredWidth || 0),
+    height: Math.max(HMB_EXPANDED_NODE_MIN_HEIGHT, measuredHeight || 0),
+    widthClamped,
+    heightClamped,
+    inlineWidth,
+    inlineHeight,
+  };
+}
+
+export function hmbVideoPickerExpandedShellSize(container) {
+  const shell = hmbVideoPickerExactReactFlowNode(container);
+  if (!shell) return { shell: null, width: 0, height: 0 };
+  return {
+    shell,
+    width: Math.max(HMB_EXPANDED_NODE_MIN_WIDTH, hmbVideoPickerExpandedShellWidth(shell) || 0),
+    height: Math.max(HMB_EXPANDED_NODE_MIN_HEIGHT, hmbPickerNodeShellHeight(shell) || 0),
+  };
+}
+
+export function hmbSetVideoPickerExpandedShellHeight(container, requestedHeight) {
+  const floor = hmbApplyVideoPickerExpandedGeometryFloor(container, { force: true });
+  const shell = floor?.shell || null;
+  if (!shell?.style) return 0;
+  const nextHeight = clamp(
+    Math.round(Number(requestedHeight) || HMB_EXPANDED_NODE_MIN_HEIGHT),
+    HMB_EXPANDED_NODE_MIN_HEIGHT,
+    6000,
+  );
+  shell.style.setProperty?.("height", `${nextHeight}px`);
+  return nextHeight;
 }
 
 // Compact mode is an application-owned loader, not a resizable full
@@ -4810,6 +5062,9 @@ export function hmbAdoptVideoPickerFixedTop(container) {
 }
 
 const HMB_VIDEO_PICKER_HYBRID_GEOMETRY_PROPERTIES = Object.freeze([
+  "width",
+  "min-width",
+  "max-width",
   "height",
   "min-height",
   "max-height",
@@ -4832,7 +5087,10 @@ export function hmbCaptureVideoPickerExpandedGeometry(container) {
   const actualHeight = Math.round(
     Number(shell.offsetHeight) || Number(shell.getBoundingClientRect?.()?.height) || 0,
   );
-  const measuredHeight = Math.max(HMB_MIN_NODE_HEIGHT, actualHeight || HMB_DEFAULT_NODE_HEIGHT);
+  const measuredHeight = Math.max(
+    HMB_EXPANDED_NODE_MIN_HEIGHT,
+    actualHeight || HMB_DEFAULT_NODE_HEIGHT,
+  );
   return {
     shell,
     properties,
@@ -4841,20 +5099,46 @@ export function hmbCaptureVideoPickerExpandedGeometry(container) {
   };
 }
 
-function hmbVideoPickerExpandedGeometryForCompactMount(container) {
+export function hmbVideoPickerExpandedGeometryForCompactMount(container, stateValue = null) {
   const remembered = hmbVideoPickerRememberedExpandedGeometry(container);
   if (remembered) return remembered;
   const captured = hmbCaptureVideoPickerExpandedGeometry(container);
-  if (!captured || captured.actualHeight >= HMB_MIN_NODE_HEIGHT) return captured;
+  if (!captured) return captured;
+  const rawExpandedSize = stateValue?.expanded_node_size
+    && typeof stateValue.expanded_node_size === "object"
+    ? stateValue.expanded_node_size
+    : {};
+  const hasAuthoritativeExpandedSize = Number(rawExpandedSize.width) > 0
+    && Number(rawExpandedSize.width) >= HMB_EXPANDED_NODE_MIN_WIDTH
+    && Number(rawExpandedSize.height) >= HMB_EXPANDED_NODE_MIN_HEIGHT;
+  if (
+    !hasAuthoritativeExpandedSize
+    && captured.actualHeight >= HMB_EXPANDED_NODE_MIN_HEIGHT
+  ) {
+    return captured;
+  }
+  const restoredExpandedWidth = clamp(
+    Math.round(Number(rawExpandedSize.width || HMB_DEFAULT_NODE_WIDTH)),
+    HMB_EXPANDED_NODE_MIN_WIDTH,
+    6000,
+  );
+  const restoredExpandedHeight = clamp(
+    Math.round(Number(rawExpandedSize.height || HMB_DEFAULT_NODE_HEIGHT)),
+    HMB_EXPANDED_NODE_MIN_HEIGHT,
+    6000,
+  );
   return {
     ...captured,
     properties: {
       ...captured.properties,
-      height: { value: `${HMB_DEFAULT_NODE_HEIGHT}px`, priority: "" },
-      "min-height": { value: `${HMB_MIN_NODE_HEIGHT}px`, priority: "" },
+      width: { value: `${restoredExpandedWidth}px`, priority: "" },
+      "min-width": { value: `${HMB_EXPANDED_NODE_MIN_WIDTH}px`, priority: "important" },
+      "max-width": { value: "", priority: "" },
+      height: { value: `${restoredExpandedHeight}px`, priority: "" },
+      "min-height": { value: `${HMB_EXPANDED_NODE_MIN_HEIGHT}px`, priority: "important" },
       "max-height": { value: "", priority: "" },
     },
-    measuredHeight: HMB_DEFAULT_NODE_HEIGHT,
+    measuredHeight: restoredExpandedHeight,
     defaultedFromCompactMount: true,
   };
 }
@@ -4905,10 +5189,11 @@ function hmbVideoPickerCompactTailClassMatch(element, requiredTokens) {
   );
 }
 
-function hmbVideoPickerCompactTailTargets(container) {
-  if (!container || container.__hmbVideoPickerExpanded === true) return null;
-  const root = container.querySelector?.(".hmbvp") || null;
-  if (clean(root?.getAttribute?.("data-picker-view")) !== "compact") return null;
+// Editor 0.123 owns one exact adaptive-row shape around HMB_PICKER_STATE. Keep
+// this recognition deliberately strict: changing an arbitrary flex ancestor
+// can resize the whole workspace, while declining an unknown host is safe.
+function hmbVideoPickerExactStateRowTargets(container) {
+  if (!container) return null;
   const shell = hmbVideoPickerExactReactFlowNode(container);
   if (!shell) return null;
   let parameterRow = null;
@@ -4964,6 +5249,359 @@ function hmbVideoPickerCompactTailTargets(container) {
   return null;
 }
 
+function hmbVideoPickerCompactTailTargets(container) {
+  if (!container || container.__hmbVideoPickerExpanded === true) return null;
+  const root = container.querySelector?.(".hmbvp") || null;
+  if (clean(root?.getAttribute?.("data-picker-view")) !== "compact") return null;
+  return hmbVideoPickerExactStateRowTargets(container);
+}
+
+const HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE = "data-hmb-picker-height-propagation";
+const HMB_VIDEO_PICKER_EXPANDED_HOST_ROW_PROPERTIES = Object.freeze([
+  "height",
+  "min-height",
+  "max-height",
+  "flex",
+  "overflow",
+]);
+const HMB_VIDEO_PICKER_EXPANDED_HOST_SPACER_PROPERTIES = Object.freeze([
+  "height",
+  "min-height",
+  "max-height",
+  "flex",
+  "overflow",
+]);
+const HMB_VIDEO_PICKER_EXPANDED_HOST_CONTAINER_PROPERTIES = Object.freeze([
+  "height",
+  "min-height",
+  "max-height",
+  "flex",
+  "overflow",
+  "box-sizing",
+]);
+
+function hmbVideoPickerHostAttributeSnapshot(element, name) {
+  const rawValue = element?.getAttribute?.(name);
+  return {
+    present: !!element?.hasAttribute?.(name),
+    value: rawValue == null ? "" : String(rawValue),
+  };
+}
+
+function hmbRestoreVideoPickerHostAttribute(element, name, snapshot) {
+  if (!element || !snapshot) return;
+  if (snapshot.present) element.setAttribute?.(name, snapshot.value);
+  else element.removeAttribute?.(name);
+}
+
+function hmbVideoPickerExpandedHostAppliedValues(rowHeight, containerHeight = rowHeight) {
+  const rowPixels = `${rowHeight}px`;
+  const containerPixels = `${containerHeight}px`;
+  return {
+    row: {
+      height: rowPixels,
+      "min-height": rowPixels,
+      "max-height": rowPixels,
+      flex: `0 0 ${rowPixels}`,
+      overflow: "hidden",
+    },
+    spacer: {
+      height: "0px",
+      "min-height": "0px",
+      "max-height": "0px",
+      flex: "0 0 0px",
+      overflow: "hidden",
+    },
+    // Griptape's raw-widget host writes the allocator's current height directly
+    // onto this exact widget container. The cold mount starts at 252px and the
+    // React prop can remain at that stale allocation after this code grows the
+    // outer row, exposing the rest of the node as a black tail. Keep this exact
+    // HMB container in the same reversible transaction as its allocator row.
+    container: {
+      height: containerPixels,
+      "min-height": containerPixels,
+      "max-height": containerPixels,
+      flex: `0 0 ${containerPixels}`,
+      overflow: "hidden",
+      "box-sizing": "border-box",
+    },
+  };
+}
+
+function hmbRefreshVideoPickerExpandedHostSnapshot(record) {
+  if (!record?.appliedValues) return;
+  for (const [element, snapshot, applied] of [
+    [record.container, record.containerSnapshot, record.appliedValues.container],
+    [record.layoutRow, record.rowSnapshot, record.appliedValues.row],
+    [record.trailingSpacer, record.spacerSnapshot, record.appliedValues.spacer],
+  ]) {
+    for (const [property, appliedValue] of Object.entries(applied)) {
+      const current = hmbVideoPickerHybridStyleValue(element, property);
+      if (current.value !== appliedValue || current.priority !== "important") {
+        snapshot[property] = current;
+      }
+    }
+  }
+  const currentRowMarker = hmbVideoPickerHostAttributeSnapshot(
+    record.layoutRow,
+    HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE,
+  );
+  if (!currentRowMarker.present || currentRowMarker.value !== "expanded") {
+    record.rowAttributeSnapshot = currentRowMarker;
+  }
+  const currentSpacerMarker = hmbVideoPickerHostAttributeSnapshot(
+    record.trailingSpacer,
+    HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE,
+  );
+  if (!currentSpacerMarker.present || currentSpacerMarker.value !== "expanded-spacer") {
+    record.spacerAttributeSnapshot = currentSpacerMarker;
+  }
+  const currentContainerMarker = hmbVideoPickerHostAttributeSnapshot(
+    record.container,
+    HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE,
+  );
+  if (!currentContainerMarker.present || currentContainerMarker.value !== "expanded-container") {
+    record.containerAttributeSnapshot = currentContainerMarker;
+  }
+}
+
+function hmbRestoreVideoPickerExpandedHostElement(element, snapshot, appliedValues) {
+  if (!element?.style || !snapshot || !appliedValues) return;
+  for (const [property, appliedValue] of Object.entries(appliedValues)) {
+    const current = hmbVideoPickerHybridStyleValue(element, property);
+    // Preserve a newer host-authored declaration instead of restoring through
+    // it. Only declarations still owned by this propagation transaction revert.
+    if (current.value !== appliedValue || current.priority !== "important") continue;
+    const saved = snapshot[property] || { value: "", priority: "" };
+    if (saved.value) element.style.setProperty?.(property, saved.value, saved.priority || "");
+    else element.style.removeProperty?.(property);
+  }
+}
+
+export function hmbRestoreVideoPickerExpandedHostHeightPropagation(container) {
+  const record = hmbVideoPickerExpandedHostHeightPropagations.get(container) || null;
+  if (!record) return false;
+  hmbRestoreVideoPickerExpandedHostElement(
+    record.container,
+    record.containerSnapshot,
+    record.appliedValues?.container,
+  );
+  hmbRestoreVideoPickerExpandedHostElement(
+    record.layoutRow,
+    record.rowSnapshot,
+    record.appliedValues?.row,
+  );
+  hmbRestoreVideoPickerExpandedHostElement(
+    record.trailingSpacer,
+    record.spacerSnapshot,
+    record.appliedValues?.spacer,
+  );
+  const rowMarker = hmbVideoPickerHostAttributeSnapshot(
+    record.layoutRow,
+    HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE,
+  );
+  if (rowMarker.present && rowMarker.value === "expanded") {
+    hmbRestoreVideoPickerHostAttribute(
+      record.layoutRow,
+      HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE,
+      record.rowAttributeSnapshot,
+    );
+  }
+  const spacerMarker = hmbVideoPickerHostAttributeSnapshot(
+    record.trailingSpacer,
+    HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE,
+  );
+  if (spacerMarker.present && spacerMarker.value === "expanded-spacer") {
+    hmbRestoreVideoPickerHostAttribute(
+      record.trailingSpacer,
+      HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE,
+      record.spacerAttributeSnapshot,
+    );
+  }
+  const containerMarker = hmbVideoPickerHostAttributeSnapshot(
+    record.container,
+    HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE,
+  );
+  if (containerMarker.present && containerMarker.value === "expanded-container") {
+    hmbRestoreVideoPickerHostAttribute(
+      record.container,
+      HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE,
+      record.containerAttributeSnapshot,
+    );
+  }
+  hmbVideoPickerExpandedHostHeightPropagations.delete(container);
+  return true;
+}
+
+export function hmbApplyVideoPickerExpandedHostHeightPropagation(
+  container,
+  requiredInnerHeight = null,
+  preferredShell = null,
+) {
+  const root = container?.querySelector?.(".hmbvp") || null;
+  if (
+    !container
+    || container.__hmbVideoPickerExpanded !== true
+    || clean(root?.getAttribute?.("data-picker-view")) !== "expanded"
+  ) {
+    hmbRestoreVideoPickerExpandedHostHeightPropagation(container);
+    return 0;
+  }
+  const targets = hmbVideoPickerExactStateRowTargets(container);
+  const shell = targets?.shell || null;
+  if (!targets || (preferredShell && preferredShell !== shell)) {
+    hmbRestoreVideoPickerExpandedHostHeightPropagation(container);
+    return 0;
+  }
+
+  // The row begins above the custom widget container in some Editor builds.
+  // Preserve that exact inset while extending both to the same shell bottom.
+  const containerAvailable = hmbPickerAvailableHeightToShell(container, shell);
+  const rowAvailable = hmbPickerAvailableHeightToShell(targets.layoutRow, shell);
+  const rowToContainerInset = Math.max(0, rowAvailable - containerAvailable);
+  const innerHeight = Math.max(
+    1,
+    Math.ceil(Number(requiredInnerHeight) || containerAvailable || hmbPickerInnerRequiredHeight(container)),
+  );
+  const rowHeight = Math.max(
+    1,
+    Math.ceil(rowAvailable || 0),
+    Math.ceil(innerHeight + rowToContainerInset),
+  );
+
+  let record = hmbVideoPickerExpandedHostHeightPropagations.get(container) || null;
+  if (
+    record
+    && (
+      record.layoutRow !== targets.layoutRow
+      || record.trailingSpacer !== targets.trailingSpacer
+      || record.shell !== shell
+    )
+  ) {
+    hmbRestoreVideoPickerExpandedHostHeightPropagation(container);
+    record = null;
+  }
+  if (!record) {
+    record = {
+      ...targets,
+      container,
+      containerSnapshot: hmbVideoPickerCompactTailStyleSnapshot(
+        container,
+        HMB_VIDEO_PICKER_EXPANDED_HOST_CONTAINER_PROPERTIES,
+      ),
+      rowSnapshot: hmbVideoPickerCompactTailStyleSnapshot(
+        targets.layoutRow,
+        HMB_VIDEO_PICKER_EXPANDED_HOST_ROW_PROPERTIES,
+      ),
+      spacerSnapshot: hmbVideoPickerCompactTailStyleSnapshot(
+        targets.trailingSpacer,
+        HMB_VIDEO_PICKER_EXPANDED_HOST_SPACER_PROPERTIES,
+      ),
+      rowAttributeSnapshot: hmbVideoPickerHostAttributeSnapshot(
+        targets.layoutRow,
+        HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE,
+      ),
+      spacerAttributeSnapshot: hmbVideoPickerHostAttributeSnapshot(
+        targets.trailingSpacer,
+        HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE,
+      ),
+      containerAttributeSnapshot: hmbVideoPickerHostAttributeSnapshot(
+        container,
+        HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE,
+      ),
+      appliedValues: null,
+    };
+    hmbVideoPickerExpandedHostHeightPropagations.set(container, record);
+  } else {
+    hmbRefreshVideoPickerExpandedHostSnapshot(record);
+  }
+
+  const appliedValues = hmbVideoPickerExpandedHostAppliedValues(rowHeight, innerHeight);
+  for (const [property, value] of Object.entries(appliedValues.container)) {
+    hmbSetPickerStyleIfChanged(record.container, property, value, "important");
+  }
+  for (const [property, value] of Object.entries(appliedValues.row)) {
+    hmbSetPickerStyleIfChanged(record.layoutRow, property, value, "important");
+  }
+  for (const [property, value] of Object.entries(appliedValues.spacer)) {
+    hmbSetPickerStyleIfChanged(record.trailingSpacer, property, value, "important");
+  }
+  if (record.container.getAttribute?.(HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE) !== "expanded-container") {
+    record.container.setAttribute?.(HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE, "expanded-container");
+  }
+  if (record.layoutRow.getAttribute?.(HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE) !== "expanded") {
+    record.layoutRow.setAttribute?.(HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE, "expanded");
+  }
+  if (record.trailingSpacer.getAttribute?.(HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE) !== "expanded-spacer") {
+    record.trailingSpacer.setAttribute?.(
+      HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE,
+      "expanded-spacer",
+    );
+  }
+  record.appliedValues = appliedValues;
+  record.rowHeight = rowHeight;
+  return rowHeight;
+}
+
+// Keep one settled post-mount reconciliation for Editor builds that finish the
+// adaptive parameter layout after the raw widget controller has mounted. Do
+// not persistently observe React Flow or allocator-owned geometry: React writes
+// those nodes during its own render, and answering every write with another HMB
+// style transaction creates the React #185 update-depth ping-pong. Subsequent
+// legitimate changes enter through widget props, view transitions, or explicit
+// pointer-resize boundaries and schedule their own bounded fit pass.
+export function hmbInstallVideoPickerExpandedHostReconciliation(
+  container,
+  reconcileHostLayout,
+  cleanupList = [],
+) {
+  if (!container || typeof reconcileHostLayout !== "function") return () => {};
+  const ownerView = container.ownerDocument?.defaultView
+    || (typeof window !== "undefined" ? window : null);
+  const requestFrame = typeof ownerView?.requestAnimationFrame === "function"
+    ? ownerView.requestAnimationFrame.bind(ownerView)
+    : (typeof requestAnimationFrame === "function"
+      ? requestAnimationFrame
+      : (callback) => setTimeout(callback, 0));
+  const cancelFrame = typeof ownerView?.cancelAnimationFrame === "function"
+    ? ownerView.cancelAnimationFrame.bind(ownerView)
+    : (typeof cancelAnimationFrame === "function"
+      ? cancelAnimationFrame
+      : (handle) => clearTimeout(handle));
+  let disposed = false;
+  let firstFrame = 0;
+  let secondFrame = 0;
+
+  const cancelPending = () => {
+    if (firstFrame) cancelFrame(firstFrame);
+    if (secondFrame) cancelFrame(secondFrame);
+    firstFrame = 0;
+    secondFrame = 0;
+  };
+  const run = () => {
+    secondFrame = 0;
+    if (
+      disposed
+      || container.__hmbVideoPickerExpanded !== true
+      || hmbVideoPickerIsHostMeasurementClone(container)
+    ) return false;
+    reconcileHostLayout();
+    return true;
+  };
+  firstFrame = requestFrame(() => {
+    firstFrame = 0;
+    if (disposed) return;
+    secondFrame = requestFrame(run);
+  });
+  const cleanup = () => {
+    if (disposed) return;
+    disposed = true;
+    cancelPending();
+  };
+  if (Array.isArray(cleanupList)) cleanupList.push(cleanup);
+  return cleanup;
+}
+
 export function hmbRestoreVideoPickerCompactTailReclaim(container) {
   const record = hmbVideoPickerCompactTailReclaims.get(container) || null;
   if (!record) return false;
@@ -4977,6 +5615,9 @@ export function hmbApplyVideoPickerCompactTailReclaim(
   container,
   compactContentHeight = HMB_VIDEO_PICKER_COMPACT_ONE_SHOT_CONTENT_HEIGHT,
 ) {
+  if (container?.__hmbVideoPickerExpanded !== true) {
+    hmbRestoreVideoPickerExpandedHostHeightPropagation(container);
+  }
   const targets = hmbVideoPickerCompactTailTargets(container);
   if (!targets) {
     hmbRestoreVideoPickerCompactTailReclaim(container);
@@ -5073,8 +5714,16 @@ export function hmbApplyVideoPickerCompactGeometry(
     );
   const compactShellHeight = compactChromeHeight + contentHeight;
   const pixels = `${compactShellHeight}px`;
-  for (const property of HMB_VIDEO_PICKER_HYBRID_GEOMETRY_PROPERTIES) {
-    shell.style.setProperty?.(property, pixels, "important");
+  const compactProperties = {
+    width: `${HMB_DEFAULT_NODE_WIDTH}px`,
+    "min-width": `${HMB_DEFAULT_NODE_WIDTH}px`,
+    "max-width": `${HMB_DEFAULT_NODE_WIDTH}px`,
+    height: pixels,
+    "min-height": pixels,
+    "max-height": pixels,
+  };
+  for (const [property, value] of Object.entries(compactProperties)) {
+    shell.style.setProperty?.(property, value, "important");
   }
   return compactShellHeight;
 }
@@ -5094,9 +5743,10 @@ export function hmbRestoreVideoPickerExpandedGeometry(container, snapshot, optio
   if (!savedHeight && restoredHeight <= 0) {
     shell.style.setProperty?.(
       "height",
-      `${Math.max(HMB_MIN_NODE_HEIGHT, Number(snapshot.measuredHeight) || HMB_DEFAULT_NODE_HEIGHT)}px`,
+      `${Math.max(HMB_EXPANDED_NODE_MIN_HEIGHT, Number(snapshot.measuredHeight) || HMB_DEFAULT_NODE_HEIGHT)}px`,
     );
   }
+  hmbApplyVideoPickerExpandedGeometryFloor(container, { force: true });
   return true;
 }
 
@@ -5232,6 +5882,7 @@ export function hmbSetVideoPickerHybridView(
     && hmbVideoPickerHasMountedBody(container, false)
   ) {
     container.__hmbVideoPickerExpanded = false;
+    hmbRestoreVideoPickerExpandedHostHeightPropagation(container);
     return true;
   }
 
@@ -5263,6 +5914,7 @@ export function hmbSetVideoPickerHybridView(
   root.setAttribute?.("data-picker-view", "compact");
   clip.setAttribute?.("data-picker-view", "compact");
   container.__hmbVideoPickerExpanded = false;
+  hmbRestoreVideoPickerExpandedHostHeightPropagation(container);
   return true;
 }
 
@@ -5378,6 +6030,7 @@ export function hmbApplyVideoPickerCompactHostSizing(container, stateValue = und
     || container.__hmbVideoPickerExpanded === true
     || hmbVideoPickerIsHostMeasurementClone(container)
   ) return 0;
+  hmbRestoreVideoPickerExpandedHostHeightPropagation(container);
   const picker = container.querySelector?.(".hmbvp");
   const clip = container.querySelector?.(".hmbvp-clip");
   if (clean(picker?.getAttribute?.("data-picker-view")) !== "compact") return 0;
@@ -5680,6 +6333,23 @@ function hmbPickerFitMeasurementSignature(container, shell, measuredInnerHeight 
   );
   const rightStack = container?.querySelector?.(".right-stack");
   const centerStack = container?.querySelector?.(".center-stack");
+  const hostTargets = hmbVideoPickerExactStateRowTargets(container);
+  const hostStyleSignature = (element, properties) => properties.map((property) => {
+    const current = hmbVideoPickerHybridStyleValue(element, property);
+    return `${property}=${current.value}!${current.priority}`;
+  }).join(",");
+  const elementIdentity = (element) => {
+    if (!element || (typeof element !== "object" && typeof element !== "function")) return 0;
+    let identity = hmbVideoPickerFitElementIds.get(element) || 0;
+    if (!identity) {
+      identity = ++hmbVideoPickerFitElementSequence;
+      hmbVideoPickerFitElementIds.set(element, identity);
+    }
+    return identity;
+  };
+  const hostMarker = (element) => clean(
+    element?.getAttribute?.(HMB_VIDEO_PICKER_EXPANDED_HOST_ATTRIBUTE),
+  );
   return [
     innerHeight,
     dimension(container, "width"),
@@ -5688,6 +6358,25 @@ function hmbPickerFitMeasurementSignature(container, shell, measuredInnerHeight 
     dimension(centerStack, "height"),
     dimension(shell, "width"),
     hmbPickerNodeShellHeight(shell),
+    dimension(hostTargets?.layoutRow, "height"),
+    dimension(hostTargets?.trailingSpacer, "height"),
+    elementIdentity(hostTargets?.layoutRow),
+    elementIdentity(hostTargets?.trailingSpacer),
+    hostMarker(container),
+    hostMarker(hostTargets?.layoutRow),
+    hostMarker(hostTargets?.trailingSpacer),
+    hostStyleSignature(
+      container,
+      HMB_VIDEO_PICKER_EXPANDED_HOST_CONTAINER_PROPERTIES,
+    ),
+    hostStyleSignature(
+      hostTargets?.layoutRow,
+      HMB_VIDEO_PICKER_EXPANDED_HOST_ROW_PROPERTIES,
+    ),
+    hostStyleSignature(
+      hostTargets?.trailingSpacer,
+      HMB_VIDEO_PICKER_EXPANDED_HOST_SPACER_PROPERTIES,
+    ),
   ].join(":");
 }
 
@@ -6813,7 +7502,6 @@ export function hmbInstallPickerInteractionIsolation(container, cleanupList) {
     "[contenteditable='true']",
     "[data-group-path]",
     "[data-video-uid]",
-    "[data-resize-panel]",
     "[data-resize-section]"
   ];
   const interactionSelector = interactionSelectors.join(",");
@@ -6866,7 +7554,6 @@ function hmbMorphNodeKey(node) {
     "data-color",
     "data-outliner-spacer",
     "data-section-key",
-    "data-resize-panel",
     "data-resize-section",
   ]) {
     const value = clean(node.getAttribute?.(name));
@@ -7005,12 +7692,12 @@ export function hmbRenderPickerOutlinerLocal(container, state, tr, locked = fals
 }
 
 export function hmbApplyPickerPaletteSelectionToDom(container, state, locked = false) {
-  const selectedPath = clean(state?.selected_outliner_path);
+  const selectedNode = hmbPickerSelectedOutlinerNode(state);
   for (const button of container?.querySelectorAll?.("[data-color]") || []) {
     const active = clean(button.getAttribute?.("data-color")) === clean(state?.selected_color);
     if (active) button.classList?.add?.("active");
     else button.classList?.remove?.("active");
-    button.disabled = locked || !selectedPath;
+    button.disabled = locked || !selectedNode;
   }
 }
 
@@ -7685,6 +8372,10 @@ export function hmbSyncVideoPickerHostMeasurement(container, value, expanded = f
 export function hmbMountVideoPickerHostMeasurement(container, props = {}, options = {}) {
   if (!container) return null;
   container.__hmbVideoPickerDeleted = false;
+  hmbBindVideoPickerRuntimeIdentity(
+    container,
+    hmbPickerStateFromProps(props || {}).runtime_instance_id,
+  );
   container.setAttribute?.("data-hmb-video-picker-host-measurement", "true");
   // Measurement copies report widget-local height only. They never repair or
   // mutate the enclosing React Flow node.
@@ -7715,10 +8406,14 @@ export function hmbMountVideoPickerHostMeasurement(container, props = {}, option
   const applyMeasurement = (nextProps = latestProps, forcedExpanded = null) => {
     if (nextProps && typeof nextProps === "object") latestProps = nextProps;
     if (!placeholder?.style) return HMB_VIDEO_PICKER_COMPACT_ONE_SHOT_CONTENT_HEIGHT;
+    const nextRuntimeId = clean(
+      hmbPickerStateFromProps(latestProps).runtime_instance_id,
+    );
+    hmbBindVideoPickerRuntimeIdentity(container, nextRuntimeId);
     const storedViewMode = hmbVideoPickerStoredViewMode(container);
     const expanded = typeof forcedExpanded === "boolean"
       ? forcedExpanded
-      : storedViewMode !== false;
+      : storedViewMode === true;
     const measurementHeight = expanded
       ? HMB_VIDEO_PICKER_EXPANDED_MEASUREMENT_HEIGHT
       : hmbVideoPickerCompactMeasurementHeight(hmbPickerStateFromProps(latestProps));
@@ -7789,6 +8484,7 @@ export function hmbMountVideoPickerHostMeasurement(container, props = {}, option
     if (container.__hmbVideoPickerCleanup === cleanup) delete container.__hmbVideoPickerCleanup;
     if (container.__hmbVideoPickerCleanupProxy === cleanup) delete container.__hmbVideoPickerCleanupProxy;
     delete container.__hmbVideoPickerControllerUpdate;
+    delete container.__hmbVideoPickerRuntimeInstanceId;
     container.removeAttribute?.("data-hmb-video-picker-host-measurement");
   };
   container.__hmbVideoPickerCleanup = cleanup;
@@ -7829,15 +8525,6 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   // cleanup so late promise/timer callbacks cannot publish into a removed
   // node.
   container.__hmbVideoPickerDeleted = false;
-  if (typeof container.__hmbVideoPickerExpanded !== "boolean") {
-    const storedViewMode = hmbVideoPickerStoredViewMode(container);
-    // First mount opens the full authoring surface. An explicit compact choice
-    // remains remembered for later remounts in the same editor session.
-    hmbRememberVideoPickerViewMode(container, storedViewMode !== false);
-  } else {
-    hmbRememberVideoPickerViewMode(container, container.__hmbVideoPickerExpanded === true);
-  }
-  const desiredPickerExpanded = container.__hmbVideoPickerExpanded === true;
   // Every live controller mounts the complete authoring subtree first. A
   // remembered compact view is applied only after all expanded controls own
   // their listeners, so a compact cold/remount can re-expand without a factory
@@ -7908,6 +8595,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       );
       delete container.__hmbPickerWorkspacePublicationGeneration;
       delete container.__hmbVideoPickerExpanded;
+      delete container.__hmbVideoPickerRuntimeInstanceId;
       delete container.__hmbVideoPickerExpandedCache;
       delete container.__hmbVideoPickerExpandedFragment;
       delete container.__hmbVideoPickerCompactFragment;
@@ -7930,6 +8618,17 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   if (typeof previousCleanup === "function") previousCleanup();
   container.setAttribute?.("data-hmb-node-delete-protected", "true");
   const engineState = normalize(props?.value ?? props?.parameterValue ?? props?.defaultValue);
+  hmbBindVideoPickerRuntimeIdentity(container, engineState.runtime_instance_id);
+  if (typeof container.__hmbVideoPickerExpanded !== "boolean") {
+    const storedViewMode = hmbVideoPickerStoredViewMode(container);
+    // A workflow load starts in the compact Loader. An explicit expanded
+    // choice remains remembered across controller remounts for this exact
+    // Python runtime; a new runtime id intentionally has no stored selection.
+    hmbRememberVideoPickerViewMode(container, storedViewMode === true);
+  } else {
+    hmbRememberVideoPickerViewMode(container, container.__hmbVideoPickerExpanded === true);
+  }
+  const desiredPickerExpanded = container.__hmbVideoPickerExpanded === true;
   let pendingState = container.__hmbPendingPickerState && typeof container.__hmbPendingPickerState === "object"
     ? normalize(container.__hmbPendingPickerState)
     : null;
@@ -8048,6 +8747,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   const cleanup = () => {
     if (disposed) return;
     disposed = true;
+    hmbRestoreVideoPickerExpandedHostHeightPropagation(container);
     hmbRestoreVideoPickerCompactTailReclaim(container);
     activeCleanup.forEach((fn) => { try { fn(); } catch (_error) {} });
     activeCleanup = [];
@@ -8263,9 +8963,8 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       .brand{display:flex;align-items:center;gap:10px;min-width:0;flex:1 1 auto;font-size:19px;font-weight:700;color:#f3f6f8;white-space:nowrap;overflow:hidden}.brand>span:last-child{overflow:hidden;text-overflow:ellipsis}.brand-mark{width:30px;height:30px;flex:0 0 30px;border:2px solid #dfe7ed;transform:rotate(30deg);display:grid;place-items:center}.brand-mark:after{content:"H";transform:rotate(-30deg);font-size:13px}.header-actions{display:flex;align-items:center;justify-content:flex-end;flex:0 0 auto;gap:7px}.header-actions button,.header-actions select{height:30px;border:1px solid #33414d;background:#18232d;border-radius:3px;padding:0 10px;cursor:pointer;color:inherit}.shot-selector-wrap{display:flex;align-items:center;gap:6px}.shot-selector-label{font-size:10px;font-weight:800;letter-spacing:.12em;color:#8296a7}.shot-selector{min-width:150px;max-width:260px}.shot-selector-conflict{color:#fda4af;font-size:10px;font-weight:700}.header-actions .read-button{background:#1c3c62;border-color:#2c5b8d}.header-actions .stop-button{background:#4d2328;border-color:#774047}.header-actions .language-button{min-width:58px}.header-actions button:disabled,.header-actions select:disabled{opacity:.4;cursor:not-allowed}
       .scene-load-bar{height:36px;flex:0 0 36px;display:grid;grid-template-columns:auto minmax(120px,1fr) auto auto max-content max-content max-content max-content;align-items:center;gap:6px;padding:3px 10px;background:#111a22;border-bottom:1px solid #293640}.scene-load-label{font-size:10px;font-weight:800;color:#aebbc4}.scene-path-input{height:25px;min-width:0;padding:0 9px;border:1px solid #33424e;border-radius:3px;background:#0d151c;color:#e2e8ed}.scene-path-input:focus{outline:0;border-color:#5797d1}.scene-load-bar button{height:25px;padding:0 10px;border:1px solid #3b4b57;border-radius:3px;background:#1a2833;color:#e1e8ed;cursor:pointer}.scene-load-bar .load-scene-button{background:#285b91;border-color:#346ba4;font-weight:800}.scene-load-bar button:disabled,.scene-path-input:disabled{opacity:.4;cursor:not-allowed}
       .main-grid{display:grid;grid-template-columns:minmax(230px,24%) minmax(420px,1fr) minmax(285px,26%);align-items:stretch;gap:8px;padding:8px;flex:1;min-height:0;overflow:auto;background:#0e161d}
-      .center-stack{min-width:0;min-height:0;display:flex;flex-direction:column;gap:8px;overflow:hidden}.center-stack>.viewport-panel{flex:3 1 0}.center-stack>.activity-section{flex:1 1 0;min-height:150px}
+      .center-stack{min-width:0;min-height:0;display:flex;flex-direction:column;gap:8px;overflow:hidden}.center-stack>.viewport-panel{height:auto;min-height:${HMB_PICKER_VIEWPORT_PANEL_MIN_HEIGHT}px;flex:1 1 0}.center-stack>.activity-section{height:${HMB_RIGHT_SECTION_DEFAULT_HEIGHTS.log}px;flex:0 0 ${HMB_RIGHT_SECTION_DEFAULT_HEIGHTS.log}px;min-height:${HMB_RIGHT_SECTION_DEFAULT_HEIGHTS.log}px;max-height:${HMB_RIGHT_SECTION_DEFAULT_HEIGHTS.log}px}
       .panel{min-width:0;min-height:0;background:#151f27;border:1px solid #2c3740;border-radius:10px;display:flex;flex-direction:column;overflow:hidden}.panel-title{height:34px;display:flex;align-items:center;padding:0 10px;border-bottom:1px solid #2b3740;background:#18232b;font-weight:700;color:#edf2f5}.panel-title.viewport-title{justify-content:center;text-align:center}.panel-title small{margin-left:5px;color:#aeb9c1;font-weight:500}.panel-title .grow{flex:1}
-      .panel-resize-handle{position:relative;flex:0 0 10px;min-height:10px;height:10px;border-top:1px solid #2c3740;cursor:ns-resize;background:linear-gradient(90deg,transparent,rgba(148,163,184,.16),transparent);touch-action:none;user-select:none}.panel-resize-handle:before{content:"";position:absolute;left:50%;top:3px;width:44px;height:3px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.48)}.panel-resize-handle:hover:before{background:#fff}
       .outliner-palette{padding:8px;border-bottom:1px solid #29343d;background:#111a21}.outliner-toolbar{display:flex;gap:6px;padding:8px;border-bottom:1px solid #29343d}.search-input{width:100%;height:29px;background:#101820;border:1px solid #2b3944;color:#dce5eb;padding:0 9px;border-radius:3px}.column-head{height:28px;display:flex;align-items:center;padding:0 8px;border-bottom:1px solid #2b353d;color:#b7c1c9;font-size:11px}.outliner-scroll{flex:1;min-height:0;overflow:auto;padding:3px}.outliner-list{display:flex;flex-direction:column}.outliner-virtual-spacer{width:1px;pointer-events:none}.outliner-row{display:flex;align-items:center;height:29px;min-height:29px;box-sizing:border-box;padding-right:5px;color:#d2d9df;border-radius:2px;cursor:pointer}.outliner-row:hover{background:#1c2a35}.outliner-row.selected{background:#25517e}.outliner-row.output-off{opacity:.48}.tree-toggle{width:19px;height:25px;border:0;background:transparent;padding:0;color:#a8b4bd;cursor:pointer}.tree-toggle.leaf{cursor:default}.eye-toggle{width:25px;height:25px;display:grid;place-items:center;border:0;background:transparent;padding:4px;cursor:pointer}.eye-toggle svg{width:17px;height:17px;fill:none;stroke:#68d26d;stroke-width:1.8}.eye-toggle.on svg circle{fill:#68d26d;stroke:none}.eye-toggle.off svg{stroke:#dd5c60}.node-icon{font-size:9px;color:#bcc6ce;margin-right:5px}.group-name{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ref-tag{font-size:9px;border:1px solid #5c6b76;border-radius:3px;padding:1px 4px;margin-right:5px;color:#adb8c0}.assigned-chip{width:14px;height:14px;border:1px solid rgba(255,255,255,.4);border-radius:2px;margin-right:6px}
       .viewport-panel{background:#131c23}.output-scope-inline{position:relative;z-index:20;min-height:38px;display:flex;align-items:center;justify-content:flex-start;gap:12px;padding:4px 10px;border-bottom:1px solid #2a353e;background:#151f27;white-space:nowrap;overflow:visible}.output-scope-title{font-size:10px;font-weight:800;color:#d7dfe5;flex:0 0 auto;text-align:center}.output-scope-options{display:flex;align-items:center;justify-content:flex-start;gap:14px;min-width:max-content}.output-scope-option{display:flex;align-items:center;gap:5px;font-size:10px;color:#d7dfe5;cursor:pointer}.output-scope-option input{margin:0;accent-color:#4c8fd7}.output-scope-option span{white-space:nowrap}.output-camera-inline{display:flex;align-items:center;gap:7px;margin-left:auto;flex:0 0 auto}.output-camera-label{font-size:10px;font-weight:800;color:#d7dfe5}.camera-fixed,.camera-dropdown{position:relative;min-width:200px}.camera-fixed{height:28px;display:flex;align-items:center;gap:7px;padding:0 9px;background:#111a21;border:1px solid #33414c;border-radius:3px}.camera-fixed b{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.camera-fixed em{font-size:9px;color:#79aee4;font-style:normal}.camera-fixed.disabled{opacity:.5}.camera-dropdown summary{list-style:none;height:29px;display:flex;align-items:center;gap:7px;padding:0 9px;background:#111a21;border:1px solid #33414c;border-radius:3px;cursor:pointer}.camera-dropdown summary::-webkit-details-marker{display:none}.camera-dropdown summary b{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.camera-menu{position:absolute;z-index:60;left:0;right:0;top:32px;max-height:240px;overflow:auto;background:#17232c;border:1px solid #3b4a56;box-shadow:0 8px 18px rgba(0,0,0,.5);padding:4px}.camera-menu button{width:100%;display:flex;justify-content:space-between;align-items:center;border:0;background:transparent;padding:8px;text-align:left;cursor:pointer}.camera-menu button:hover,.camera-menu button.active{background:#24415e}.camera-menu button span{font-size:9px;color:#9dacb6}.viewport-stage{position:relative;flex:1;min-height:0;background:radial-gradient(circle at 50% 44%,#5a5a59 0,#373b3d 36%,#20282d 80%);display:flex;align-items:center;justify-content:center;overflow:hidden}.preview-image{width:100%;height:100%;object-fit:contain;background:#232a2e}.viewport-empty{position:relative;width:82%;height:76%;border:1px solid #3fa578;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#b5c0c8;text-align:center;gap:7px;background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(0,0,0,.08))}.viewport-empty .camera-frame{position:absolute;inset:5% 6%;border:1px solid rgba(65,173,124,.8)}.viewport-empty b,.viewport-empty span{position:relative;z-index:2}.viewport-empty span{max-width:420px;color:#93a0aa}.preview-nav{height:42px;flex:0 0 42px;border-top:1px solid #2b363e;background:#111a21;display:grid;grid-template-columns:38px minmax(0,1fr) 38px;align-items:center;gap:8px;padding:6px 10px}.preview-nav button{height:28px;border:1px solid #303e49;background:#1b2730;border-radius:3px;cursor:pointer;font-weight:800}.preview-nav button:disabled{opacity:.35;cursor:not-allowed}.preview-frame-label{min-width:0;text-align:center;color:#aeb9c1;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       .right-stack{display:flex;flex-direction:column;gap:8px;min-height:0;overflow:hidden;background:transparent}.side-section{position:relative;flex:0 0 auto;min-height:96px;background:#151f27;border:1px solid #2c3740;border-radius:10px;display:flex;flex-direction:column;overflow:hidden}.playblast-settings-section{min-height:150px}.video-assets-section{min-height:240px;flex:1 1 0}.section-head{height:34px;flex:0 0 34px;display:flex;align-items:center;padding:0 10px;border-bottom:1px solid #2c3740;background:#18232b;font-weight:700}.section-head .grow{flex:1}.section-head .section-tools{margin-left:auto;display:flex;align-items:center;gap:5px}.video-selected-count{margin-left:auto;color:#aeb9c1;font-size:10px;font-variant-numeric:tabular-nums}.import-video-button{height:24px;margin-left:8px;padding:0 8px;border:1px solid #35434e;border-radius:6px;background:#111a21;color:#dce5eb;cursor:pointer;font-size:9px}.activity-section{min-height:150px}.activity-section .section-head{justify-content:flex-start}.activity-clear{height:23px;border:1px solid #35434e;background:#111a21;color:#c7d0d7;border-radius:7px;padding:0 8px;cursor:pointer;font-size:9px}.activity-elapsed{min-width:74px;text-align:right;font-size:9px;color:#aeb9c1;font-variant-numeric:tabular-nums}.activity-body{flex:1;min-width:0;min-height:0;overflow:hidden;padding:0;background:#0e161d;contain:layout paint}.activity-log-view{display:block;width:100%;height:100%;min-width:0;min-height:0;max-width:100%;margin:0;padding:6px 8px;overflow-x:auto;overflow-y:auto;scrollbar-gutter:stable both-edges;color:#cbd5dc;background:transparent;font:10px/1.5 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;user-select:text;-webkit-user-select:text;pointer-events:auto}.activity-log-row{display:grid;grid-template-columns:68px 58px max-content;align-items:center;width:max-content;min-width:100%;height:18px;min-height:18px;max-height:18px;overflow:visible;white-space:nowrap;color:#cbd5dc}.activity-log-time{overflow:hidden;color:#7f8e99;font-variant-numeric:tabular-nums}.activity-log-level{overflow:hidden;font-weight:800}.activity-log-message{display:block;min-width:max-content;max-width:none;overflow:visible;text-overflow:clip;white-space:nowrap}.activity-log-row[data-level="ERROR"]{color:#fb7185}.activity-log-row[data-level="ERROR"] .activity-log-time{color:#fb7185}.activity-log-row[data-level="WARNING"]{color:#fbbf24}.activity-log-row[data-level="WARNING"] .activity-log-time{color:#d6a51d}.activity-log-row[data-level="SUCCESS"]{color:#4ade80}.activity-log-row[data-level="SUCCESS"] .activity-log-time{color:#3bbd6b}.activity-log-empty{padding:4px 0;color:#7f8e99;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.section-resize-handle{position:relative;left:auto;right:auto;bottom:auto;flex:0 0 10px;min-height:10px;height:10px;border-top:1px solid #2c3740;cursor:ns-resize;background:linear-gradient(90deg,transparent,rgba(148,163,184,.16),transparent);touch-action:none}.section-resize-handle:before{content:"";position:absolute;left:50%;top:3px;width:44px;height:3px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.48)}.section-resize-handle:hover:before{background:#fff}.section-body{padding:9px}.side-section>.section-body{flex:1;min-height:0;overflow:auto;padding-bottom:9px}.palette-head{display:flex;flex-direction:column;align-items:stretch;gap:7px;min-width:0}.palette-group{display:grid;grid-template-columns:minmax(82px,92px) minmax(0,1fr);align-items:center;gap:6px;min-width:0}.palette-label{height:26px;min-width:0;display:flex;align-items:center;padding:0 7px;background:#26343f;border:1px solid #364652;border-radius:7px;color:#d5dde3;white-space:nowrap;font-size:10px}.palette-grid{display:flex;gap:4px;flex-wrap:wrap;min-width:0}.palette-button{width:20px;height:20px;border:2px solid transparent;border-radius:3px;cursor:pointer;padding:0}.palette-button.active{border-color:#f4f7f9;box-shadow:0 0 0 1px #111}.video-assets-body{flex:1;min-height:0;overflow:auto;padding:8px}.video-asset-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-content:start;gap:8px}.video-assets-empty{grid-column:1/-1;min-height:130px;display:grid;place-items:center;padding:16px;border:1px dashed #35434e;border-radius:8px;color:#8998a3;text-align:center}.video-asset-card{position:relative;overflow:hidden;border:1px solid var(--hmb-line-soft,#344550);border-radius:9px;background:linear-gradient(145deg,rgba(255,255,255,.025),rgba(255,255,255,.006)),var(--hmb-field,#101820);transition:border-color 100ms ease,box-shadow 100ms ease}.video-asset-card[draggable="true"]{cursor:grab}.video-asset-card.dragging{opacity:.5;transform:scale(.985)}.video-asset-card.drop-target{border-color:rgb(var(--selection-rgb));box-shadow:0 0 0 1px rgba(var(--selection-rgb),.35)}.video-asset-card.selected{border-color:rgb(var(--selection-rgb));background:linear-gradient(145deg,rgba(var(--selection-rgb),.12),var(--selection-card));box-shadow:0 0 0 1px rgba(var(--selection-rgb),.16),0 0 18px rgba(var(--selection-rgb),.12)}.video-asset-thumb{position:relative;aspect-ratio:16/9;overflow:hidden;background:#080d14}.video-asset-thumb-media{width:100%;height:100%;object-fit:cover;pointer-events:none}.video-asset-thumb-fallback{position:absolute;inset:0;display:grid;place-items:center;color:#667684;font-size:10px;font-weight:800}.video-asset-role,.selected-video-order{position:absolute;top:7px;padding:3px 6px;border-radius:5px;background:rgba(5,8,18,.82);color:#fff;font-size:9px;font-weight:800}.video-asset-role{left:7px}.selected-video-order{right:7px;color:var(--selection-strong)}.video-asset-play{position:absolute;left:50%;top:50%;width:38px;height:38px;transform:translate(-50%,-50%);display:grid;place-items:center;border:1px solid rgba(255,255,255,.30);border-radius:50%;background:rgba(5,8,18,.76);color:#fff;cursor:pointer}.video-asset-delete{position:absolute;right:7px;bottom:7px;width:26px;height:26px;border:1px solid rgba(251,113,133,.45);border-radius:6px;background:rgba(76,5,25,.80);color:#ffe4e8;cursor:pointer}.video-asset-copy{padding:8px}.video-asset-copy>b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#edf2f5}.video-asset-footer{display:flex;align-items:center;gap:6px;margin-top:6px}.video-asset-footer>span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8f9da7;font-size:9px}.video-asset-footer button,.video-order-actions button{height:25px;padding:0 7px;border:1px solid #35434e;border-radius:6px;background:#111a21;color:#dce5eb;cursor:pointer;font-size:9px}.video-order-actions{display:flex;justify-content:flex-end;gap:4px;margin-top:5px}.video-order-hint{flex:0 0 auto;padding:5px 8px;border-top:1px solid #2c3740;color:#7f8e99;font-size:9px;text-align:center}
@@ -8348,8 +9047,8 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       .hmbvp[data-theme] .video-seekbar input,.hmbvp[data-theme] .output-scope-option input,.hmbvp[data-theme] .original-preview-toggle input,.hmbvp[data-theme] .mask-playblast-toggle input,.hmbvp[data-theme] .depth-playblast-toggle input,.hmbvp[data-theme] .motion-guide-toggle input,.hmbvp[data-theme] .radio-row input,.hmbvp[data-theme] .setting-checks input{accent-color:var(--hmb-accent)}
       .hmbvp[data-theme] .viewport-empty{border-color:var(--hmb-focus);box-shadow:inset 0 0 0 1px rgba(255,255,255,.018),0 0 18px var(--hmb-glow)}
       .hmbvp[data-theme] .viewport-empty .camera-frame{border-color:color-mix(in srgb,var(--hmb-focus) 58%,transparent)}
-      .hmbvp[data-theme] .panel-resize-handle,.hmbvp[data-theme] .section-resize-handle{border-color:var(--hmb-line-soft);background:linear-gradient(90deg,transparent,var(--hmb-line-soft),transparent)}
-      .hmbvp[data-theme] .panel-resize-handle:before,.hmbvp[data-theme] .section-resize-handle:before{background:var(--hmb-muted);opacity:.48}
+      .hmbvp[data-theme] .section-resize-handle{border-color:var(--hmb-line-soft);background:linear-gradient(90deg,transparent,var(--hmb-line-soft),transparent)}
+      .hmbvp[data-theme] .section-resize-handle:before{background:var(--hmb-muted);opacity:.48}
       .hmbvp[data-theme] .video-assets-section>.section-resize-handle{border-top-color:transparent;background:transparent}.hmbvp[data-theme] .video-assets-section>.section-resize-handle:before{display:none}
       .hmbvp .brand{font-size:15px;font-weight:800;letter-spacing:.01em;font-style:normal;line-height:normal}
       .hmbvp .shot-selector{flex:0 1 210px;width:210px;min-width:120px;max-width:210px;height:44px;font-size:13px;font-weight:800;font-style:normal;line-height:normal}
@@ -8388,7 +9087,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
           <div class="outliner-scroll">${outlinerHtml(state, bindings, tr, initialLocked, outlinerRenderOptions)}</div>
         </section>
         <div class="center-stack">
-        <section class="panel viewport-panel" style="${hmbFlexPanelHeightStyle(state.viewport_panel_height, HMB_PICKER_VIEWPORT_PANEL_MIN_HEIGHT)}">
+        <section class="panel viewport-panel">
           <div class="snapshot-toolbar"><button type="button" id="create-snapshot" ${!buttonAvailability.snapshotEnabled ? "disabled" : ""}>${escapeHtml(tr.snapshot || "Snapshot")}</button><button type="button" id="delete-snapshot" ${!snapshotDeleteEnabled ? "disabled" : ""}>${escapeHtml(tr.deleteSnapshot || "Delete Snapshot")}</button><div class="output-camera-inline"><span class="output-camera-label">${escapeHtml(tr.cameraPrefix)} :</span>${cameraControlHtml(state, tr, runningOperation)}</div></div>
           <div class="generate-playblast-toolbar" role="group" aria-label="${escapeHtml(tr.generate)}"><button type="button" class="generate-button" id="run-video" aria-label="${escapeHtml(tr.generate)}" ${!buttonAvailability.playblastEnabled ? "disabled" : ""}>▶&nbsp; ${escapeHtml(tr.generate)}</button></div>
           <div class="playblast-settings-toolbar">
@@ -8403,7 +9102,6 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
           <div class="video-seekbar"><input type="range" id="video-seek" min="${frameStart}" max="${frameEnd}" step="1" value="${Math.round(initialViewportFrame)}" aria-label="Video timeline" ${!selectedVideoUrl || snapshotForViewport || !hasFrameRange ? "disabled" : ""}/></div>
           <div class="video-controls"><button type="button" class="transport-button" id="snapshot-prev" title="${escapeHtml(tr.previousSnapshot || "Previous snapshot")}" aria-label="${escapeHtml(tr.previousSnapshot || "Previous snapshot")}" ${snapshotHistory.length ? "" : "disabled"}>◀</button><button type="button" class="transport-button" id="video-play-toggle" title="${escapeHtml(tr.playVideo || "Play")}" aria-label="${escapeHtml(tr.playVideo || "Play")}" ${selectedVideoUrl ? "" : "disabled"}>▶</button><button type="button" class="transport-button" id="snapshot-next" title="${escapeHtml(tr.nextSnapshot || "Next snapshot")}" aria-label="${escapeHtml(tr.nextSnapshot || "Next snapshot")}" ${snapshotHistory.length ? "" : "disabled"}>▶</button><label class="frame-number-label">${escapeHtml(tr.frameLabel)} <input type="number" id="video-frame-number" min="${frameStart}" max="${frameEnd}" step="1" value="${Math.round(initialViewportFrame)}" aria-label="${escapeHtml(tr.frameLabel)}" ${!hasFrameRange || snapshotForViewport ? "disabled" : ""}/></label></div>
           <div class="frame-info-strip"><span>FRAME <b id="frame-info-frame">${Math.round(initialViewportFrame)} / ${frameEnd}</b></span><span>TIME <b id="frame-info-time">${escapeHtml(initialTimecode)}</b></span><span>FPS <b id="frame-info-fps">${escapeHtml(frameInfoFps || "—")}</b></span><span>RANGE <b id="frame-info-range">${frameStart}–${frameEnd}</b></span></div>
-          <div class="panel-resize-handle nodrag" data-resize-panel="viewport" title="${escapeHtml(tr.resizeSection)}"></div>
         </section>
           <section class="side-section activity-section preview-activity-section" data-section-key="log"><div class="section-head"><span class="grow">${escapeHtml(tr.activityLog)}</span><div class="section-tools"><span class="activity-elapsed" id="activity-elapsed" data-start-ms="${Number(state.operation_started_at_ms || 0)}">${escapeHtml(tr.elapsed)} ${elapsedText}</span><button type="button" class="activity-clear" id="clear-activity-log" ${activityRows.length ? "" : "disabled"}>${escapeHtml(tr.clearLog)}</button></div></div><div class="activity-body" id="activity-log-body"><div id="activity-log-view" class="activity-log-view" role="log" aria-live="polite" aria-label="${escapeHtml(tr.activityLog)}">${activityLogMarkup}</div></div></section>
         </div>
@@ -9340,6 +10038,16 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   const patchMountedPicker = (nextProps = {}) => {
     if (recoverMissingMountedPicker(nextProps || {})) return true;
     const nextState = normalize(nextProps?.value ?? nextProps?.parameterValue ?? nextProps?.defaultValue);
+    const runtimeBinding = hmbBindVideoPickerRuntimeIdentity(
+      container,
+      nextState.runtime_instance_id,
+    );
+    if (runtimeBinding.hydrationReset) {
+      // Rebuild once under the new runtime-scoped compact identity. Keeping the
+      // previous expanded subtree would visually contradict the load boundary.
+      HMBVideoPickerLibraryWidget(container, nextProps || {});
+      return true;
+    }
     const nextTr = TEXT[nextState.language] || TEXT.ko;
     const liveExpanded = container.__hmbVideoPickerExpanded === true;
     props = nextProps || {};
@@ -9681,10 +10389,8 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
 
   const applyColor = (color) => {
     if (!color || pickerLocalInteractionLocked()) return;
-    const liveState = currentWidgetState();
-    const liveSelectedNode = liveState.outliner_nodes.find(
-      (item) => clean(item.full_path) === clean(liveState.selected_outliner_path),
-    ) || null;
+    const liveState = hmbEnsurePickerOutlinerSelection(currentWidgetState());
+    const liveSelectedNode = hmbPickerSelectedOutlinerNode(liveState);
     if (!liveSelectedNode) return;
     const liveSlot = 1;
     const current = selectedBindings(liveState, liveSlot);
@@ -10425,12 +11131,15 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     const liveState = currentWidgetState();
     const node = liveState.outliner_nodes.find((item) => clean(item.full_path) === clean(path));
     if (!node) return;
-    const next = {
+    const next = hmbEnsurePickerOutlinerSelection({
       ...liveState,
       selected_outliner_path: clean(path),
       selected_outliner_name: clean(node.name),
       selected_outliner_uuid: clean(node.maya_uuid),
-    };
+      // normalize() restores the selected target's actual binding color. Clear
+      // the previous row's transient selection so it cannot leak to this row.
+      selected_color: "",
+    });
     const interactionLocked = pickerLocalInteractionLocked(next);
     const outlinerUpdated = hmbRenderPickerOutlinerLocal(container, next, tr, interactionLocked);
     hmbApplyPickerPaletteSelectionToDom(container, next, interactionLocked);
@@ -10594,20 +11303,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   container.querySelectorAll("[data-color]").forEach((button) => {
     on(button, "click", () => {
       const color = clean(button.getAttribute("data-color"));
-      const liveState = currentWidgetState();
-      const liveSelectedNode = liveState.outliner_nodes.find(
-        (item) => clean(item.full_path) === clean(liveState.selected_outliner_path),
-      );
-      if (liveSelectedNode) applyColor(color);
-      else {
-        const next = { ...liveState, selected_color: color };
-        hmbApplyPickerPaletteSelectionToDom(
-          container,
-          next,
-          pickerLocalInteractionLocked(next),
-        );
-        commit(next, { suppressMatchingEcho: true });
-      }
+      applyColor(color);
     });
   });
   on(container.querySelector("#import-video-asset"), "change", (event) => {
@@ -10827,111 +11523,152 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     });
   });
 
-  container.querySelectorAll("[data-resize-panel]").forEach((handle) => {
-    on(handle, "pointerdown", (event) => {
-      if (event.button !== undefined && event.button !== 0) return;
-      event.preventDefault();
-      event.stopPropagation();
-      const key = clean(handle.getAttribute("data-resize-panel"));
-      const panel = handle.closest(".panel");
-      const stateField = "viewport_panel_height";
-      const minimum = HMB_PICKER_VIEWPORT_PANEL_MIN_HEIGHT;
-      if (!panel || key !== "viewport") return;
-      const startY = Number(event.clientY || 0);
-      const panelRect = panel.getBoundingClientRect?.();
-      const offsetHeight = Number(panel.offsetHeight || 0);
-      const rectHeight = Number(panelRect?.height || 0);
-      const startHeight = Math.max(
-        minimum,
-        offsetHeight > 0 ? offsetHeight : (rectHeight > 0 ? rectHeight : minimum),
-      );
-      const renderScale = offsetHeight > 0 && rectHeight > 0 ? rectHeight / offsetHeight : 1;
-      const safeScale = Number.isFinite(renderScale) && renderScale > 0.05 ? renderScale : 1;
-      let latestHeight = startHeight;
-      try { handle.setPointerCapture?.(event.pointerId); } catch (_error) {}
-
-      const move = (moveEvent) => {
-        moveEvent.preventDefault();
-        const screenDelta = Number(moveEvent.clientY || startY) - startY;
-        latestHeight = clamp(
-          Math.round(startHeight + screenDelta / safeScale),
-          minimum,
-          6000,
-        );
-        panel.style.height = `${latestHeight}px`;
-        panel.style.flex = `0 0 ${latestHeight}px`;
-        hmbApplyPickerHostSizing(container, hmbPickerInnerRequiredHeight(container));
-      };
-
-      const end = (endEvent) => {
-        window.removeEventListener("pointermove", move, true);
-        window.removeEventListener("pointerup", end, true);
-        window.removeEventListener("pointercancel", end, true);
-        try { handle.releasePointerCapture?.(endEvent?.pointerId ?? event.pointerId); } catch (_error) {}
-        const liveState = currentWidgetState();
-        commit({
-          ...liveState,
-          [stateField]: latestHeight,
-        }, { suppressMatchingEcho: true });
-        schedulePickerFit();
-      };
-
-      window.addEventListener("pointermove", move, true);
-      window.addEventListener("pointerup", end, true);
-      window.addEventListener("pointercancel", end, true);
-      activeCleanup.push(() => {
-        window.removeEventListener("pointermove", move, true);
-        window.removeEventListener("pointerup", end, true);
-        window.removeEventListener("pointercancel", end, true);
-      });
-    });
-  });
-
   let resizeFrame = 0;
   let resizeApplying = false;
   let pointerInteractionActive = false;
-  const schedulePickerFit = (settle = false) => {
+  let nativeNodeResizeActive = false;
+  let nativeNodeResizeFrame = 0;
+  let nativeNodeResizeFinalize = false;
+  let nativeNodeResizeSession = null;
+  const applyPickerFitNow = (forceHostReconcile = false) => {
+    resizeFrame = 0;
+    if (disposed || resizeApplying || pointerInteractionActive) return false;
+    if (
+      !container.querySelector?.(".hmbvp")
+      || !container.querySelector?.(".hmbvp-clip")
+    ) {
+      container.__hmbVideoPickerMountedRootGuardSchedule?.();
+      return false;
+    }
+    if (container.__hmbVideoPickerExpanded !== true) {
+      const fittedState = currentWidgetState();
+      const compactContentHeight = hmbApplyVideoPickerCompactHostSizing(container, fittedState);
+      hmbApplyVideoPickerCompactGeometry(container, compactContentHeight);
+      container.removeAttribute?.("data-hmb-video-picker-compact-sizing-pending");
+      return true;
+    }
+    // Automatic fit passes own only Picker/recognized allocator geometry. The
+    // React Flow shell is repaired at explicit transition/resize boundaries.
+    const measuredInnerHeight = hmbPickerInnerRequiredHeight(container);
+    const shell = hmbVideoPickerExactReactFlowNode(container);
+    const beforeSignature = hmbPickerFitMeasurementSignature(
+      container,
+      shell,
+      measuredInnerHeight,
+    );
+    if (!forceHostReconcile && beforeSignature === container.__hmbPickerFitSignature) return false;
+    resizeApplying = true;
+    try {
+      concealNativeMayaPicker(container);
+      hmbApplyPickerHostSizing(container, measuredInnerHeight);
+      container.__hmbPickerFitSignature = hmbPickerFitMeasurementSignature(
+        container,
+        shell,
+        measuredInnerHeight,
+      );
+    } finally {
+      resizeApplying = false;
+    }
+    return true;
+  };
+  const schedulePickerFit = (settle = false, forceHostReconcile = false) => {
     if (resizeFrame && typeof cancelAnimationFrame === "function") cancelAnimationFrame(resizeFrame);
     const raf = typeof requestAnimationFrame === "function" ? requestAnimationFrame : (fn) => setTimeout(fn, 0);
-    const apply = () => {
-      resizeFrame = 0;
-      if (disposed || resizeApplying || pointerInteractionActive) return;
-      if (
-        !container.querySelector?.(".hmbvp")
-        || !container.querySelector?.(".hmbvp-clip")
-      ) {
-        container.__hmbVideoPickerMountedRootGuardSchedule?.();
-        return;
-      }
-      if (container.__hmbVideoPickerExpanded !== true) {
-        const fittedState = currentWidgetState();
-        const compactContentHeight = hmbApplyVideoPickerCompactHostSizing(container, fittedState);
-        hmbApplyVideoPickerCompactGeometry(container, compactContentHeight);
-        container.removeAttribute?.("data-hmb-video-picker-compact-sizing-pending");
-        return;
-      }
-      const measuredInnerHeight = hmbPickerInnerRequiredHeight(container);
-      const beforeSignature = String(measuredInnerHeight);
-      if (beforeSignature === container.__hmbPickerFitSignature) return;
-      resizeApplying = true;
-      try {
-        concealNativeMayaPicker(container);
-        hmbApplyPickerHostSizing(container, measuredInnerHeight);
-        container.__hmbPickerFitSignature = beforeSignature;
-      } finally {
-        resizeApplying = false;
-      }
-    };
+    const apply = () => applyPickerFitNow(forceHostReconcile);
     resizeFrame = raf(() => {
       if (settle) resizeFrame = raf(apply);
       else apply();
     });
   };
 
+  const scheduleNativeNodeResizeRepair = (finalize = false) => {
+    nativeNodeResizeFinalize = nativeNodeResizeFinalize || finalize;
+    if (nativeNodeResizeFrame && typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(nativeNodeResizeFrame);
+    }
+    const raf = typeof requestAnimationFrame === "function"
+      ? requestAnimationFrame
+      : (fn) => setTimeout(fn, 0);
+    nativeNodeResizeFrame = raf(() => {
+      nativeNodeResizeFrame = 0;
+      const shouldFinalize = nativeNodeResizeFinalize;
+      nativeNodeResizeFinalize = false;
+      if (
+        disposed
+        || container.__hmbVideoPickerExpanded !== true
+        || (!nativeNodeResizeActive && !shouldFinalize)
+      ) return;
+
+      const floor = hmbApplyVideoPickerExpandedGeometryFloor(container);
+      const shellSize = hmbVideoPickerExpandedShellSize(container);
+      const session = nativeNodeResizeSession || {
+        shell: floor?.shell || shellSize.shell || null,
+        renderedHeight: shellSize.height || HMB_EXPANDED_NODE_MIN_HEIGHT,
+        availableHeight: hmbPickerAvailableHeightToShell(
+          container,
+          floor?.shell || shellSize.shell || null,
+        ),
+      };
+      const renderedDelta = hmbVideoPickerExpandedRenderedResizeDelta(
+        session.renderedHeight,
+        shellSize.height,
+      );
+      // The Picker-owned root follows the exact rendered outer delta. At the
+      // 1200px floor, another inward native drag yields delta 0 even when React
+      // Flow temporarily writes a smaller inline/model height.
+      const synchronizedAvailableHeight = Math.max(
+        1,
+        Math.round(Number(session.availableHeight || 0) + renderedDelta),
+      );
+      const measuredInnerHeight = Math.max(
+        hmbPickerInnerRequiredHeight(container),
+        synchronizedAvailableHeight,
+      );
+      resizeApplying = true;
+      try {
+        concealNativeMayaPicker(container);
+        hmbApplyPickerHostSizing(container, measuredInnerHeight);
+        container.__hmbPickerFitSignature = hmbPickerFitMeasurementSignature(
+          container,
+          floor?.shell || shellSize.shell,
+          measuredInnerHeight,
+        );
+      } finally {
+        resizeApplying = false;
+      }
+
+      if (shouldFinalize) {
+        const liveState = currentWidgetState();
+        const priorSize = liveState.expanded_node_size || {};
+        if (
+          Number(priorSize.width || 0) !== shellSize.width
+          || Number(priorSize.height || 0) !== shellSize.height
+        ) {
+          commit({
+            ...liveState,
+            expanded_node_size: {
+              width: shellSize.width,
+              height: shellSize.height,
+            },
+          }, { suppressMatchingEcho: true });
+        }
+        nativeNodeResizeSession = null;
+        schedulePickerFit(true);
+      }
+    });
+  };
+
   if (pickerExpanded) {
+    // One explicit mount boundary may establish the authored minimum. Never
+    // repeat this from ResizeObserver-driven fit passes.
+    hmbApplyVideoPickerExpandedGeometryFloor(container, { force: true });
     const measuredInnerHeight = hmbPickerInnerRequiredHeight(container);
     hmbApplyPickerHostSizing(container, measuredInnerHeight);
-    container.__hmbPickerFitSignature = String(measuredInnerHeight);
+    container.__hmbPickerFitSignature = hmbPickerFitMeasurementSignature(
+      container,
+      hmbVideoPickerExactReactFlowNode(container),
+      measuredInnerHeight,
+    );
   } else {
     delete container.__hmbPickerFitSignature;
   }
@@ -10939,7 +11676,6 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     const ResizeObserverClass = window?.ResizeObserver;
     if (typeof ResizeObserverClass === "function") {
       resizeObserver = new ResizeObserverClass(() => schedulePickerFit(false));
-      try { resizeObserver.observe(container); } catch (_error) {}
       const rightStackForResizeSync = container.querySelector?.(".right-stack");
       if (rightStackForResizeSync) {
         try { resizeObserver.observe(rightStackForResizeSync); } catch (_error) {}
@@ -10951,30 +11687,75 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     }
   } catch (_error) {}
 
+  hmbInstallVideoPickerExpandedHostReconciliation(
+    container,
+    () => {
+      applyPickerFitNow(true);
+    },
+    activeCleanup,
+  );
+
   const pauseFitDuringPointer = (event) => {
     const target = event?.target;
     let localResizeControl = false;
+    let nativeResizeControl = false;
     try {
-      localResizeControl = !!target?.closest?.("[data-resize-panel],[data-resize-section]");
+      localResizeControl = !!target?.closest?.("[data-resize-section]");
+      const shell = hmbVideoPickerExactReactFlowNode(container);
+      const control = target?.closest?.(
+        ".react-flow__resize-control,.react-flow__node-resizer,[class*='node-resizer']",
+      ) || null;
+      nativeResizeControl = !!control && !!shell?.contains?.(control);
     } catch (_error) {}
     if (target && localResizeControl) pointerInteractionActive = true;
+    else if (target && nativeResizeControl && container.__hmbVideoPickerExpanded === true) {
+      nativeNodeResizeActive = true;
+      const shellSize = hmbVideoPickerExpandedShellSize(container);
+      nativeNodeResizeSession = {
+        shell: shellSize.shell,
+        renderedHeight: shellSize.height || HMB_EXPANDED_NODE_MIN_HEIGHT,
+        availableHeight: hmbPickerAvailableHeightToShell(container, shellSize.shell),
+      };
+      scheduleNativeNodeResizeRepair(false);
+    }
+  };
+  const repairDuringNativePointer = () => {
+    if (nativeNodeResizeActive) scheduleNativeNodeResizeRepair(false);
   };
   const settleAfterPointer = () => {
-    if (!pointerInteractionActive) return;
+    const localWasActive = pointerInteractionActive;
+    const nativeWasActive = nativeNodeResizeActive;
+    if (!localWasActive && !nativeWasActive) return;
     pointerInteractionActive = false;
+    nativeNodeResizeActive = false;
+    if (nativeWasActive && container.__hmbVideoPickerExpanded === true) {
+      // This listener runs in capture phase. Defer the final repair until the
+      // host's pointerup handler has written its last inline dimensions.
+      scheduleNativeNodeResizeRepair(true);
+      return;
+    }
     schedulePickerFit(true);
   };
   window.addEventListener("pointerdown", pauseFitDuringPointer, true);
+  window.addEventListener("pointermove", repairDuringNativePointer, true);
   window.addEventListener("pointerup", settleAfterPointer, true);
   window.addEventListener("pointercancel", settleAfterPointer, true);
   window.addEventListener("mouseup", settleAfterPointer, true);
   activeCleanup.push(() => {
     window.removeEventListener("pointerdown", pauseFitDuringPointer, true);
+    window.removeEventListener("pointermove", repairDuringNativePointer, true);
     window.removeEventListener("pointerup", settleAfterPointer, true);
     window.removeEventListener("pointercancel", settleAfterPointer, true);
     window.removeEventListener("mouseup", settleAfterPointer, true);
+    nativeNodeResizeActive = false;
+    nativeNodeResizeSession = null;
     if (resizeFrame && typeof cancelAnimationFrame === "function") cancelAnimationFrame(resizeFrame);
+    if (nativeNodeResizeFrame && typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(nativeNodeResizeFrame);
+    }
     resizeFrame = 0;
+    nativeNodeResizeFrame = 0;
+    nativeNodeResizeFinalize = false;
   });
   schedulePickerFit(true);
   container.__hmbVideoPickerControllerUpdate = (nextProps) => {
@@ -10997,7 +11778,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   };
   if (!desiredPickerExpanded) {
     container.__hmbVideoPickerExpandedGeometry = container.__hmbVideoPickerExpandedGeometry
-      || hmbVideoPickerExpandedGeometryForCompactMount(container)
+      || hmbVideoPickerExpandedGeometryForCompactMount(container, state)
       || null;
     if (hmbSetVideoPickerHybridView(container, false, compactPickerMarkup)) {
       hmbRememberVideoPickerViewMode(container, false);

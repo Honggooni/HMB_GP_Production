@@ -8,13 +8,15 @@ import types
 from itertools import combinations
 from pathlib import Path
 
+from _hmb_private_policy_fixture import install_private_policy_reader
+
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.6.45"
-EXPECTED_POLICY_VERSION = "2026-08-11.agent-shot-quality.v4.1"
-EXPECTED_CONTRACT_SHA256 = "26243936dddc34679aba57043e9ee583a0421e20c05f69fffd6c1ffe50192ff5"
-EXPECTED_SERVER_POLICY_SHA256 = "0322425a4380a71c0cb2835dc900875ae4dbed1a564a3a3ed898d1d31824eb42"
-EXPECTED_SIGNING_KEY_ID = "hmb-policy-release-2026-08-r2"
+EXPECTED_RELEASE_VERSION = "0.6.47"
+EXPECTED_POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
+EXPECTED_CONTRACT_SHA256 = "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
+EXPECTED_SERVER_POLICY_SHA256 = "6debb90960499ff6fe163a8a5a6db42a0da028f7a7606f993175edbd5712e65e"
+EXPECTED_SIGNING_KEY_ID = "hmb-policy-local-2026-08-r1"
 PRIVATE_SIGNED_POLICY_FIXTURE = (
     ROOT
     / "resources"
@@ -41,7 +43,9 @@ assert PRIVATE_SIGNED_POLICY_FIXTURE.is_file()
 sealed = PRIVATE_SIGNED_POLICY_FIXTURE.read_bytes()
 assert hashlib.sha256(sealed).hexdigest() == EXPECTED_SERVER_POLICY_SHA256
 original_policy_reader = agent._hmb._read_agent_policy_envelope
-agent._hmb._read_agent_policy_envelope = lambda: sealed
+_fixture_reader, installed_sealed = install_private_policy_reader(agent._hmb)
+assert _fixture_reader is original_policy_reader
+assert installed_sealed == sealed
 
 assert agent._prompt_policy_source_identity() == (
     prompt.PROMPT_POLICY_SOURCE_VERSION,
@@ -72,7 +76,7 @@ assert len(binding_rule_list) == 4
 assert all(rule.strip() for rule in policy_rule_list + binding_rule_list)
 assert policy_rule_list != binding_rule_list
 
-# The signed/compressed v4.1 envelope is read from the private test fixture only.
+# The signed/compressed v4.2 envelope is read from the private test fixture only.
 # Runtime and public packages never use this path or carry a local fallback.
 assert policy.encode("utf-8") not in sealed
 assert binding.encode("utf-8") not in sealed
@@ -147,7 +151,11 @@ for required_field in (
 # opts into the structured 4+4 Behaviors. Plain text, copied HMB text, and direct
 # Image/Video payloads remain stock native Agent requests.
 plain_prompt = "Independent designer request using the currently available inputs."
-empty_hmb_prompt = prompt._build_prompt_package(prompt._default_widget_state())
+empty_prompt_state = prompt._default_widget_state()
+empty_hmb_prompt = prompt._build_prompt_package(empty_prompt_state)
+empty_hmb_machine_prompt = prompt._build_data_only_prompt_package(
+    empty_prompt_state
+)
 assert not agent._is_hmb_prompt_library_payload(plain_prompt)
 assert agent._is_hmb_prompt_library_payload(empty_hmb_prompt)
 assert policy not in empty_hmb_prompt
@@ -170,6 +178,7 @@ def exercise_agent_route(
     prompt_value: str,
     *,
     canonical_prompt_connected: bool = False,
+    paired_machine_prompt: str = "",
 ) -> tuple[bool, bool, int, int, int, bool]:
     node = object.__new__(agent.HMBAgentLibrary)
     node._hmb_rules_active = False
@@ -179,6 +188,28 @@ def exercise_agent_route(
     node._hmb_binding_rules = []
     node._hmb_ruleset_names = ("", "")
     node._hmb_native_calls_this_process = 0
+    paired_source = None
+    if canonical_prompt_connected:
+        assert paired_machine_prompt
+
+        class PairedPromptSource:
+            @staticmethod
+            def _hmb_agent_prompt_snapshot(expected_visible):
+                visible = str(expected_visible or "")
+                return {
+                    "schema": agent._PAIRED_PROMPT_SNAPSHOT_SCHEMA,
+                    "version": agent._PAIRED_PROMPT_SNAPSHOT_VERSION,
+                    "generation": 1,
+                    "visible_sha256": hashlib.sha256(
+                        visible.encode("utf-8")
+                    ).hexdigest(),
+                    "machine_sha256": hashlib.sha256(
+                        paired_machine_prompt.encode("utf-8")
+                    ).hexdigest(),
+                    "machine_prompt": paired_machine_prompt,
+                }
+
+        paired_source = PairedPromptSource()
     observations: list[tuple[bool, bool, int, int, int]] = []
     secured: list[bool] = []
 
@@ -206,13 +237,33 @@ def exercise_agent_route(
         secured.append(True)
 
     node.get_parameter_value = types.MethodType(
-        lambda _self, name: prompt_value if name == "prompt" else None,
+        lambda _self, name: (
+            prompt_value
+            if name in {"prompt", agent._AGENT_SHOT_PROMPT_INPUT_PARAMETER}
+            else None
+        ),
         node,
     )
     node._run_native_agent_once = types.MethodType(native_once, node)
     node._secure_hmb_outputs = types.MethodType(secure, node)
+    node._hmb_shot_channel_subscription = types.MethodType(
+        lambda _self: {"enabled": False},
+        node,
+    )
+
+    def canonical_prompt_topology(self):
+        # The production topology verifier clears any retained predecessor and
+        # installs the exact live Prompt instance during this call. Mirror that
+        # paired-source side effect instead of returning a provenance-free bool.
+        setattr(
+            self,
+            agent._VERIFIED_PROMPT_SOURCE_ATTRIBUTE,
+            paired_source if canonical_prompt_connected else None,
+        )
+        return canonical_prompt_connected
+
     node._has_canonical_hmb_prompt_connection = types.MethodType(
-        lambda _self: canonical_prompt_connected,
+        canonical_prompt_topology,
         node,
     )
     iterator = node.process()
@@ -291,6 +342,7 @@ for composition in agent_compositions:
     route = exercise_agent_route(
         empty_hmb_prompt if has_prompt else plain_prompt,
         canonical_prompt_connected=has_prompt,
+        paired_machine_prompt=empty_hmb_machine_prompt if has_prompt else "",
     )
     if has_prompt:
         assert route == (True, True, 2, 4, 4, True), composition
@@ -350,17 +402,20 @@ mixed_state["videos"][0].update({
     "source_type": "Motion Guide / Retargeting Reference",
     "control_role": "Derived Motion Decoding Only",
 })
-payload_variants = (
-    empty_hmb_prompt,
-    prompt._build_prompt_package(image_state),
-    prompt._build_prompt_package(video_state),
-    prompt._build_prompt_package(mixed_state),
+payload_variant_states = (
+    empty_prompt_state,
+    image_state,
+    video_state,
+    mixed_state,
 )
-for variant in payload_variants:
+for variant_state in payload_variant_states:
+    variant = prompt._build_prompt_package(variant_state)
+    machine_variant = prompt._build_data_only_prompt_package(variant_state)
     assert agent._is_hmb_prompt_library_payload(variant)
     assert exercise_agent_route(
         variant,
         canonical_prompt_connected=True,
+        paired_machine_prompt=machine_variant,
     ) == (True, True, 2, 4, 4, True)
 
 # Copied or forged HMB-shaped text is still a native request when the canonical
@@ -415,13 +470,8 @@ tampered_policy_bytes = json.dumps(
     tampered_envelope,
     separators=(",", ":"),
 ).encode("utf-8")
-agent._hmb._read_agent_policy_envelope = lambda: tampered_policy_bytes
-try:
-    assert exercise_agent_block(empty_hmb_prompt) == (
-        agent._HMB_POLICY_UNAVAILABLE_MESSAGE
-    )
-finally:
-    agent._hmb._read_agent_policy_envelope = lambda: sealed
+assert_policy_rejected(tampered_policy_bytes)
+assert agent._hmb.get_internal_policy_identity() == identity
 
 # Runtime source contains no stable ruleset labels or legacy synthesized-policy
 # fallback. Trusted signing, self-hashes, stable contract, and strict 4+4 shape

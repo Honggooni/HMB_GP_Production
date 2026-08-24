@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import copy
 import importlib.util
 import json
@@ -25,44 +26,111 @@ def load(name: str):
 picker = load("HMBVideoPickerLibrary")
 prompt = load("HMBPromptLibrary")
 
+# The bundled BaseNode emits construction lifecycle events through the global
+# retained engine. These are intentionally unregistered serialization fixtures,
+# so replace only that out-of-scope event sink instead of loading the user's
+# config, MCP services, and active Flow.
+try:
+    from griptape_nodes.retained_mode.griptape_nodes import (  # type: ignore
+        GriptapeNodes as _RuntimeGriptapeNodes,
+    )
+except Exception:
+    _RuntimeGriptapeNodes = None
+
+
+class _SilentConstructionEventManager:
+    class _StoppedEventLoop:
+        @staticmethod
+        def is_running():
+            return False
+
+        @staticmethod
+        def is_closed():
+            return False
+
+        @staticmethod
+        def call_soon_threadsafe(_callback, *_args):
+            return None
+
+        @staticmethod
+        def call_later(_delay, _callback, *_args):
+            return None
+
+    event_loop = _StoppedEventLoop()
+
+    @staticmethod
+    def put_event(_event):
+        return None
+
+
+if _RuntimeGriptapeNodes is not None:
+    _original_event_manager_descriptor = _RuntimeGriptapeNodes.__dict__.get(
+        "EventManager"
+    )
+    _RuntimeGriptapeNodes.EventManager = staticmethod(
+        lambda: _SilentConstructionEventManager()
+    )
+    if _original_event_manager_descriptor is not None:
+        atexit.register(
+            setattr,
+            _RuntimeGriptapeNodes,
+            "EventManager",
+            _original_event_manager_descriptor,
+        )
+
 # This regression validates serialization, not filesystem availability. Treat
 # its synthetic Windows references as readable so runtime media preflight does
 # not replace the state-persistence assertion with a missing-file failure.
-picker._resolve_readable_video_reference = lambda reference: Path(str(reference))
+picker._resolve_readable_video_reference = (
+    lambda reference, **_kwargs: Path(str(reference))
+)
+# `_write_state` stages the complete serialized snapshot before asking the
+# retained NodeManager to broadcast it. Model that successful publication for
+# the whole isolated fixture so delayed command callbacks cannot fail merely
+# because these nodes intentionally have no Flow registration.
+picker._request_parameter_value = lambda *_args, **_kwargs: True
 
 
 # Simulate Griptape's load order: construct a fresh node, then assign the
 # serialized property value from the saved workflow.
 picker_node = picker.HMBVideoPickerLibrary(name="picker_state_restore")
 assert picker_node.width == 1400
-assert picker_node.height == picker.PICKER_START_HEIGHT == 1200
-assert picker_node.metadata["size"] == {"width": 1400, "height": 1200}
+assert picker_node.height == picker.PICKER_COMPACT_NATIVE_HEIGHT == 360
+assert picker_node.metadata["size"] == {"width": 1400, "height": 360}
 assert picker_node.metadata[picker.PICKER_EXPANDED_SIZE_METADATA_KEY] == {
     "width": 1400,
     "height": 1200,
 }
-assert picker_node.metadata["hmb_picker_native_size_version"] == 6
+assert picker_node.metadata["hmb_picker_native_size_version"] == 7
 
-# v6 starts inline-expanded and promotes a serialized manual expanded resize
-# directly to the native cold-mount geometry.
+# v7 starts compact and retains a serialized manual resize only for the
+# explicit expanded transition.
 saved_picker_metadata = {
-    "size": {"width": 1234, "height": 1188},
+    # A retained expanded resize must be at or above the fixed 1400x1200
+    # authoring floor. Values below it are legacy/corrupt geometry rather than
+    # a valid manual expansion.
+    "size": {"width": 1680, "height": 1320},
     "hmb_picker_native_size_version": 2,
 }
 resized_picker_node = picker.HMBVideoPickerLibrary(
     name="picker_manual_size_restore",
     metadata=copy.deepcopy(saved_picker_metadata),
 )
-assert resized_picker_node.metadata["size"] == saved_picker_metadata["size"]
+assert resized_picker_node.metadata["size"] == {"width": 1400, "height": 360}
 assert (
     resized_picker_node.metadata[picker.PICKER_EXPANDED_SIZE_METADATA_KEY]
     == saved_picker_metadata["size"]
 )
-assert resized_picker_node.metadata["hmb_picker_native_size_version"] == 6
+assert resized_picker_node.metadata["hmb_picker_native_size_version"] == 7
 saved_picker_state = copy.deepcopy(picker_node._picker_state())
+assert saved_picker_state["expanded_node_size"] == {
+    "width": 1400,
+    "height": 1200,
+}
 saved_picker_state.update({
     "runtime_instance_id": "saved-workflow-runtime",
-    "state_writer": "widget",
+    "state_writer": "python",
+    "writer_runtime_instance_id": "saved-workflow-runtime",
     "state_revision": 41,
     "active_slot_count": 3,
     "selected_video_slot": 2,
@@ -150,8 +218,12 @@ saved_picker_state.update({
 
 picker_parameter = picker._get_parameter_obj(picker_node, picker.WIDGET_STATE_PARAMETER)
 hydrated_picker_state = picker_node.before_value_set(picker_parameter, saved_picker_state)
-picker_node.set_parameter_value(picker.WIDGET_STATE_PARAMETER, hydrated_picker_state)
-picker_node.after_value_set(picker_parameter, hydrated_picker_state)
+picker_node.set_parameter_value(
+    picker.WIDGET_STATE_PARAMETER,
+    hydrated_picker_state,
+    initial_setup=True,
+    skip_before_value_set=True,
+)
 
 restored_picker_state = picker_node._picker_state()
 for key in (
@@ -258,7 +330,6 @@ saved_prompt_state["ui"] = {
     "textarea_heights": {"video:1:keep_out": 188},
     "resize_mode": prompt.UI_RESIZE_MODE,
     "language": "ko",
-    "theme": "T",
 }
 saved_prompt_state = prompt._normalize_state(saved_prompt_state)
 saved_prompt_text = json.dumps(saved_prompt_state, ensure_ascii=False, separators=(",", ":"))
@@ -280,8 +351,12 @@ class _FakeEventLoop:
         return True
 
     @staticmethod
-    def call_soon_threadsafe(callback):
-        scheduled_callbacks.append(callback)
+    def call_soon_threadsafe(callback, *args):
+        scheduled_callbacks.append(lambda: callback(*args))
+
+    @staticmethod
+    def call_later(_delay, callback, *args):
+        scheduled_callbacks.append(lambda: callback(*args))
 
 class _FakeEventManager:
     event_loop = _FakeEventLoop()
@@ -326,6 +401,10 @@ def guarded_prompt_get(name):
 
 prompt_node.set_parameter_value = guarded_prompt_set
 prompt_node.get_parameter_value = guarded_prompt_get
+# This block verifies only Prompt's deferred same-value UI write. Shot routing
+# has its own registered-flow regressions; the isolated Prompt has no
+# NodeManager identity and must not add a second scheduler callback here.
+prompt_node._schedule_post_hydration_shot_reconcile = lambda: False
 try:
     # Model the host's already-committed property value without emitting a
     # second retained-mode lifecycle event from this unregistered test node.
@@ -333,8 +412,12 @@ try:
     prompt_node.after_value_set(prompt_parameter, saved_prompt_text)
     in_after_value_set = False
     assert nested_prompt_writes == []
-    assert len(scheduled_callbacks) == 1
-    scheduled_callbacks.pop()()
+    assert scheduled_callbacks
+    callback_count = 0
+    while scheduled_callbacks:
+        scheduled_callbacks.pop(0)()
+        callback_count += 1
+        assert callback_count <= 4, "deferred Prompt callbacks did not settle"
     assert len(prompt_widget_writes) == 0, (
         "An already-canonical widget edit must not be written back a second time; "
         "that duplicate host echo remounts the Prompt dashboard."
@@ -354,7 +437,6 @@ assert restored_prompt_state["text"]["SCENE_CONTEXT"] == "Night exterior continu
 assert restored_prompt_state["ui"]["group_heights"]["imageSources"] == 710
 assert restored_prompt_state["ui"]["textarea_heights"]["video:1:keep_out"] == 188
 assert restored_prompt_state["ui"]["language"] == "ko"
-assert restored_prompt_state["ui"]["theme"] == "T"
 assert prompt_node.parameter_output_values["PROMPT_OUT"] == prompt._build_prompt_package(restored_prompt_state)
 
 prompt_before_run = copy.deepcopy(restored_prompt_state)
@@ -376,10 +458,14 @@ assert reset_picker_state["videos"] == []
 assert reset_picker_state["workspace_view"] == "outliner"
 assert reset_picker_state["node_width"] == 0
 assert reset_picker_state["node_height"] == 0
+assert reset_picker_state["expanded_node_size"] == {
+    "width": 1400,
+    "height": 1200,
+}
 assert reset_picker_state["outliner_panel_height"] == 0
 assert reset_picker_state["viewport_panel_height"] == 0
-assert reset_picker_state["right_section_heights"] == {"settings": 285, "color": 628, "log": 208}
-assert reset_picker_state["ui_layout_version"] == 5
+assert reset_picker_state["right_section_heights"] == {"settings": 217, "color": 628, "log": 208}
+assert reset_picker_state["ui_layout_version"] == 6
 assert reset_picker_state["ui_theme"] == "P"
 
 legacy_picker_state = picker._default_widget_state()
@@ -387,7 +473,7 @@ legacy_picker_state.pop("ui_layout_version", None)
 legacy_picker_state["viewport_panel_height"] = 900
 legacy_picker_state["right_section_heights"] = {"settings": 190, "color": 412, "log": 208}
 migrated_picker_state = picker._parse_state(legacy_picker_state)
-assert migrated_picker_state["ui_layout_version"] == 5
+assert migrated_picker_state["ui_layout_version"] == 6
 assert migrated_picker_state["viewport_panel_height"] == 684
 assert migrated_picker_state["right_section_heights"]["color"] == 628
 
@@ -398,7 +484,6 @@ assert not any(item.get("label") for item in reset_prompt_state["videos"])
 assert not any(str(value or "").strip() for value in reset_prompt_state["text"].values())
 assert reset_prompt_state["ui"]["group_heights"] == {}
 assert reset_prompt_state["ui"]["textarea_heights"] == {}
-assert reset_prompt_state["ui"]["theme"] == "P"
 
 # The idempotent local-echo guard must not suppress an authoritative external
 # Picker payload. A changed PICKER_IN value still rewrites the dashboard once.
@@ -413,25 +498,35 @@ def track_external_prompt_set(name, value):
 
 external_prompt.set_parameter_value = track_external_prompt_set
 external_prompt._hmb_picker_connected = True
-external_prompt_raw_set(
-    prompt.PICKER_INPUT_PARAMETER_NAME,
-    json.dumps(
-        {
-            "mode": "maya",
-            "run_id": "external-picker-regression",
-            "active_slot_count": 1,
-            "videos": [
-                {
-                    "video_slot": 1,
-                    "video_path": "P:/show/shot/external_picker_regression.mp4",
-                    "camera": "|shotCam",
-                }
-            ],
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ),
+external_picker_value = json.dumps(
+    {
+        "mode": "maya",
+        "run_id": "external-picker-regression",
+        "active_slot_count": 1,
+        "videos": [
+            {
+                "video_slot": 1,
+                "video_path": "P:/show/shot/external_picker_regression.mp4",
+                "camera": "|shotCam",
+            }
+        ],
+    },
+    ensure_ascii=False,
+    separators=(",", ":"),
 )
+# BaseNode stores are host-owned and an unregistered bundled node may reject
+# the synthetic input write. Keep this unit oracle's source read deterministic
+# without weakening the product's exact NodeManager identity requirement.
+external_prompt_raw_get = external_prompt.get_parameter_value
+external_prompt.get_parameter_value = lambda name: (
+    external_picker_value
+    if name == prompt.PICKER_INPUT_PARAMETER_NAME
+    else external_prompt_raw_get(name)
+)
+# The isolated node has no retained graph callback to close the hidden Shot
+# route hydration window. This case tests the public PICKER_IN application
+# itself, so model that completed host lifecycle explicitly.
+external_prompt._hmb_picker_route_hydration_pending = False
 external_state = external_prompt._write_dashboard_state()
 assert len(external_prompt_parameter_writes) == 1
 assert external_state["picker"]["run_id"] == "external-picker-regression"

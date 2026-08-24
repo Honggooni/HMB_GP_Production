@@ -14,6 +14,19 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Windows PowerShell normally supplies $PSScriptRoot while binding script
+# parameters, but some non-interactive launchers expose it only after binding.
+# Recover from the invoked script path so the documented no-argument install
+# command never passes an empty SourceRoot into path validation.
+if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
+    $SourceRoot = [System.IO.Path]::GetDirectoryName(
+        [string]$MyInvocation.MyCommand.Path
+    )
+}
+if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
+    throw 'Could not resolve the extracted HMB package directory.'
+}
+
 function Get-HmbFullPath {
     param([Parameter(Mandatory = $true)][string]$Path)
     return [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
