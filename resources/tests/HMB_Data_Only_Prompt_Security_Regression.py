@@ -196,15 +196,14 @@ long_generator_text = (
     "shadow, reflection, exposure, atmosphere, camera, framing, and occlusion."
 )
 assert len(long_generator_text) > 160
-assert not agent._contains_public_output_state_leak(long_generator_text, "", "")
-for exposed in (
-    state_wrapper,
+assert not agent._contains_public_output_state_leak(long_generator_text)
+assert agent._contains_public_output_state_leak(state_wrapper)
+for serialized in (
     json.dumps(state_wrapper),
     json.dumps(json.dumps(state_wrapper)),
 ):
-    # FINAL TEXT no longer uses a fixed-length policy-text threshold. Structured
-    # Agent/runtime state remains blocked through bounded JSON decoding.
-    assert agent._contains_public_output_state_leak(exposed, "", "")
+    # The lightweight client boundary never interprets serialized text.
+    assert not agent._contains_public_output_state_leak(serialized)
 
 # Structured-connector catch-all text and technical JSON never enter USER DATA.
 connector_state = prompt_library._default_widget_state()
@@ -295,5 +294,5 @@ assert prompt_library._normalize_state(range_state)["images"][0][
 print(
     "HMB data-only Prompt and protected Agent output regression: PASS "
     "(closed schema / no policy prose / path redaction / exact emitter / "
-    "encoded Agent-state isolation)"
+    "direct structured Agent-state isolation)"
 )

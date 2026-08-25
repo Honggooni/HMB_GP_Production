@@ -38,8 +38,8 @@ LONG_POLICY_DERIVED_RESULT = (
     "shadow, reflection, exposure, and atmospheric space without changing their "
     "design. Preserve the requested camera, timing, framing, and occlusion."
 )
-assert len(agent._normalized_leak_text(LONG_POLICY_DERIVED_RESULT)) > 160
-VERBATIM_LONG_CLAUSE = agent._normalized_leak_text(POLICY).split(
+assert len(" ".join(LONG_POLICY_DERIVED_RESULT.casefold().split())) > 160
+VERBATIM_LONG_CLAUSE = " ".join(POLICY.casefold().split()).split(
     "character visual authority", 1
 )[1].strip()
 assert len(VERBATIM_LONG_CLAUSE) > 160
@@ -57,17 +57,18 @@ for removed_name in (
     "_POLICY_COLLISION_REWRITE_CONTRACT_HEADER",
     "_POLICY_COLLISION_REWRITE_CONTRACT",
     "_HMB_OUTPUT_REWRITE_FAILED_MESSAGE",
+    "_AGENT_WRAPPER_KEY_PATTERN",
+    "_SANITIZER_MAX_JSON_CHARS",
+    "_normalized_leak_text",
+    "_secret_heading_signatures",
+    "_string_contains_internal_rule_text",
+    "_value_contains_protected_headings",
+    "_contains_internal_rule_text",
+    "_contains_complete_policy_document",
+    "_replace_leaked_strings",
+    "_strip_internal_rules_from_agent_wrapper",
 ):
     assert not hasattr(agent, removed_name), removed_name
-
-# Private Agent/log ports still scrub exact internal headings.
-assert agent._contains_internal_rule_text(
-    "CHARACTER VISUAL AUTHORITY", POLICY, BINDING
-)
-private_payload = {"logs": "CHARACTER VISUAL AUTHORITY"}
-assert agent._replace_leaked_strings(
-    private_payload, POLICY, BINDING, agent._PUBLIC_OUTPUT_BLOCKED
-)["logs"] == agent._PUBLIC_OUTPUT_BLOCKED
 
 
 class PromptSource:
@@ -204,15 +205,18 @@ try:
 
     complete_document = drive(f"{POLICY}\n{BINDING}")
     assert complete_document["calls"] == 1
-    assert complete_document["output"] == agent._PUBLIC_OUTPUT_BLOCKED
+    assert complete_document["output"] == f"{POLICY}\n{BINDING}"
+    assert complete_document["visible"] == [f"{POLICY}\n{BINDING}"]
 
     state_only = drive(STATE_RESULT)
     assert state_only["calls"] == 1
-    assert state_only["output"] == agent._PUBLIC_OUTPUT_BLOCKED
+    assert state_only["output"] == STATE_RESULT
+    assert state_only["visible"] == [STATE_RESULT]
 
     encoded_state = drive(DOUBLE_JSON_STATE_RESULT)
     assert encoded_state["calls"] == 1
-    assert encoded_state["output"] == agent._PUBLIC_OUTPUT_BLOCKED
+    assert encoded_state["output"] == DOUBLE_JSON_STATE_RESULT
+    assert encoded_state["visible"] == [DOUBLE_JSON_STATE_RESULT]
 finally:
     for name, value in originals.items():
         setattr(agent, name, value)
@@ -226,5 +230,5 @@ assert "call_index == 1" not in native_guard_source
 
 print(
     "HMB Agent final-text state-boundary regression: PASS "
-    "(fixed policy threshold removed, complete documents/state still blocked)"
+    "(all text/JSON inspection removed; direct native structures remain blocked)"
 )

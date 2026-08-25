@@ -1,5 +1,30 @@
 # Changelog
 
+## `v0.6.55` — 2026-08-25
+
+- Promoted the fully validated `v0.6.54` local-test line as the replacement
+  team release for `main` and GitHub Latest Release.
+- Reduced Agent output security to the requested two lightweight boundaries:
+  authenticated server policy/contract verification and direct structured
+  Agent/runtime-state suppression. Client policy-text, JSON-string, reversible
+  encoding, compression, and recursive disclosure inspection remain removed.
+- Restored Agent widget and output-port normalization on every saved-workflow
+  deserialize so stale expandable headers and legacy labels cannot return.
+- Kept replaced/future sanitizer failures fail-closed without leaking their raw
+  exception through the host scheduler.
+
+## `v0.6.54` — 2026-08-25 (local test)
+
+- Started the local-only test line from the team-distributed `v0.6.53` build.
+- Removed client-side policy-text matching, complete-document detection, and
+  reversible encoding/recursive policy disclosure scans now that signed Agent
+  policy content is delivered only by the server.
+- Retained two lightweight boundaries: authenticated server policy contract
+  verification and direct structured Agent/runtime-state suppression at public
+  UI outputs. The client no longer interprets plaintext or JSON strings for
+  security purposes. No `v0.6.54` commit, tag, push, or team distribution is
+  authorized.
+
 ## `v0.6.53` — 2026-08-25
 
 - Promoted the validated `v0.6.52` local-test line from the team-distributed

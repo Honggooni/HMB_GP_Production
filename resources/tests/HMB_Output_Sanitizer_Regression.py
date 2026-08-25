@@ -1,6 +1,4 @@
 from pathlib import Path
-import base64
-import codecs
 import importlib.util
 import json
 import os
@@ -8,8 +6,6 @@ import random
 import sys
 import tempfile
 import types
-import urllib.parse
-import zlib
 
 from _hmb_private_policy_fixture import install_private_policy_reader
 
@@ -184,6 +180,30 @@ module.HMBAgentLibrary._has_canonical_hmb_prompt_connection = (
 def canonical_hmb_agent():
     instance = module.HMBAgentLibrary()
     instance._test_canonical_hmb_prompt = True
+    # This sanitizer-focused host double has no real Prompt node or paired
+    # snapshot. Feed the same validated machine package through the router-owned
+    # hidden input and keep snapshot verification covered by its dedicated
+    # regressions.
+    instance.set_parameter_value(
+        module._AGENT_SHOT_PROMPT_INPUT_PARAMETER,
+        hmb_payload,
+    )
+    instance._refresh_agent_shot_route = types.MethodType(
+        lambda _self, strict=False: {},
+        instance,
+    )
+    instance._refresh_routed_prompt_preview = types.MethodType(
+        lambda _self: None,
+        instance,
+    )
+    instance._assert_exact_prompt_shot_route = types.MethodType(
+        lambda _self: {"enabled": False},
+        instance,
+    )
+    instance._adopt_verified_execution_shot_binding = types.MethodType(
+        lambda _self, _subscription: None,
+        instance,
+    )
     return instance
 
 hmb_payload = "\n".join(
@@ -217,6 +237,9 @@ hmb_payload = "\n".join(
         "{}",
     )
 )
+visible_prompt = "Describe the selected shot in production-ready English."
+
+module._paired_machine_prompt = lambda _node, prompt_value: str(prompt_value or "")
 
 SIGNED_V4_PROMPT_IDENTITY = (
     str(module._hmb._AGENT_POLICY_VERSION),
@@ -233,7 +256,7 @@ module._prompt_policy_source_identity = lambda _source_path=None: (
     "0" * 64,
 )
 identity_mismatch = canonical_hmb_agent()
-identity_mismatch.set_parameter_value("prompt", hmb_payload)
+identity_mismatch.set_parameter_value("prompt", visible_prompt)
 try:
     list(identity_mismatch.process())
 except RuntimeError as exc:
@@ -309,13 +332,7 @@ assert node.get_parameter_by_name("output").ui_options["display_name"] == (
 assert node.get_parameter_by_name("agent").ui_options["display_name"] == (
     "AGENT STATE · CHAIN ONLY"
 )
-sealed_policy, sealed_binding = module._hmb._load_verified_behavior_documents()
-assert not module._contains_internal_rule_text(
-    str(node.get_parameter_value(module._AGENT_WIDGET_PARAMETER)),
-    sealed_policy,
-    sealed_binding,
-)
-node.set_parameter_value("prompt", hmb_payload)
+node.set_parameter_value("prompt", visible_prompt)
 node.set_parameter_value("additional_context", "CALLER CONTEXT")
 node.set_parameter_value("rulesets", ["USER RULE"])
 node.set_parameter_value("tools", ["SIDE EFFECT TOOL"])
@@ -325,7 +342,7 @@ node.set_parameter_value("output_schema", {"description": "CALLER SCHEMA"})
 list(node.process())
 
 assert node.native_calls == 1
-assert node.get_parameter_value("prompt") == hmb_payload
+assert node.get_parameter_value("prompt") == visible_prompt
 assert node.get_parameter_value("additional_context") == "CALLER CONTEXT"
 assert node.get_parameter_value("rulesets") == ["USER RULE"]
 assert node.get_parameter_value("tools") == ["SIDE EFFECT TOOL"]
@@ -361,8 +378,8 @@ assert node._hmb_policy_rules == []
 assert node._hmb_binding_rules == []
 assert node._hmb_ruleset_names == ("", "")
 
-# Native streaming/progress values are never forwarded on the protected path,
-# even when a future Standard Agent yields sealed text before final publication.
+# Native streaming/progress values stay buffered until final publication. The
+# lightweight client no longer inspects policy wording in the completed log.
 intermediate_leak = canonical_hmb_agent()
 
 
@@ -373,11 +390,11 @@ def publish_intermediate_leak():
 
 
 intermediate_leak.intermediate_override = publish_intermediate_leak
-intermediate_leak.set_parameter_value("prompt", hmb_payload)
+intermediate_leak.set_parameter_value("prompt", visible_prompt)
 assert len(drive_scheduler(intermediate_leak.process())) == 1
 assert intermediate_leak.parameter_output_values["output"] == "FINAL ENGLISH OUTPUT"
-assert SEALED_TEST_FRAGMENT not in intermediate_leak.parameter_output_values.get(
-    "logs", ""
+assert intermediate_leak.parameter_output_values.get("logs", "") == (
+    SEALED_TEST_FRAGMENT
 )
 assert intermediate_leak._hmb_policy == ""
 
@@ -424,55 +441,53 @@ for direct_payload in (
 
 leak = canonical_hmb_agent()
 leak.emit_hidden_rule = True
-leak.set_parameter_value("prompt", hmb_payload)
+leak.set_parameter_value("prompt", visible_prompt)
 list(leak.process())
 assert leak.native_calls == 1
 assert leak.parameter_output_values["output"] == f"{SEALED_TEST_FRAGMENT} leaked"
 assert not leak.parameter_output_values["agent"]["rulesets"]
-assert SEALED_TEST_FRAGMENT not in str(leak.parameter_output_values["agent"])
+assert SEALED_TEST_FRAGMENT in str(leak.parameter_output_values["agent"])
 
-# Hidden Behavior text must also be removed from nested Agent wrapper data even
-# when the visible output itself is clean.
-nested = canonical_hmb_agent()
-nested.nested_output_override = f"{SEALED_TEST_FRAGMENT} leaked in wrapper only"
-nested.set_parameter_value("prompt", hmb_payload)
-list(nested.process())
-assert nested.parameter_output_values["output"] == "FINAL ENGLISH OUTPUT"
-assert SEALED_TEST_FRAGMENT not in str(nested.parameter_output_values["agent"])
-assert "[HMB OUTPUT BLOCKED]" in str(nested.parameter_output_values["agent"])
 
-# Public output must never expose a native Agent envelope or its sensitive state
-# keys. Benign JSON remains a valid model final response.
-for leaked_output in (
+# The lightweight public boundary does not parse text, including JSON, Python
+# repr, or a runtime-scope echo. Protected native output publication itself is
+# string-valued; direct state objects are scrubbed on the separate Agent port.
+for serialized_output in (
     '{"agent":{"type":"GriptapeNodesAgent","conversation_memory":{"runs":[]}}}',
     '{"system":"internal prompt","rulesets":[]}',
     "{'conversation_memory': {'runs': []}}",
     '"{\\"agent\\":{\\"type\\":\\"GriptapeNodesAgent\\"}}"',
-    {"agent": {"type": "GriptapeNodesAgent"}},
 ):
     boundary = canonical_hmb_agent()
-    boundary.output_override = leaked_output
-    boundary.set_parameter_value("prompt", hmb_payload)
+    boundary.output_override = serialized_output
+    boundary.set_parameter_value("prompt", visible_prompt)
     list(boundary.process())
-    assert boundary.parameter_output_values["output"] == module._PUBLIC_OUTPUT_BLOCKED
+    assert boundary.parameter_output_values["output"] == serialized_output
+
+structured_boundary = canonical_hmb_agent()
+structured_boundary.output_override = {"agent": {"type": "GriptapeNodesAgent"}}
+structured_boundary.set_parameter_value("prompt", visible_prompt)
+list(structured_boundary.process())
+assert structured_boundary.parameter_output_values["output"] == str(
+    structured_boundary.output_override
+)
 
 benign_json = canonical_hmb_agent()
 benign_json.output_override = '{"shot":"e101s001c001","final_prompt":"keep exact motion"}'
-benign_json.set_parameter_value("prompt", hmb_payload)
+benign_json.set_parameter_value("prompt", visible_prompt)
 list(benign_json.process())
 assert benign_json.parameter_output_values["output"] == benign_json.output_override
 
-# The signed-runtime-derived scope is internal Agent context, not a public
-# result. It must be blocked even though it contains no verbatim policy prose.
+# Runtime-scope text is also no longer inspected at the public string boundary.
 runtime_scope_echo = canonical_hmb_agent()
 runtime_scope_echo.output_override = (
     f"{module._RUNTIME_FX_SCOPE_HEADER}\n"
     '{"shared_windows":[{"window_id":"runtime-shared-1"}]}'
 )
-runtime_scope_echo.set_parameter_value("prompt", hmb_payload)
+runtime_scope_echo.set_parameter_value("prompt", visible_prompt)
 list(runtime_scope_echo.process())
 assert runtime_scope_echo.parameter_output_values["output"] == (
-    module._PUBLIC_OUTPUT_BLOCKED
+    runtime_scope_echo.output_override
 )
 
 runtime_memory = {
@@ -491,109 +506,29 @@ module._strip_runtime_scope_from_agent_wrapper(runtime_memory)
 assert runtime_memory["conversation_memory"]["runs"][0]["input"] == hmb_payload
 assert module._RUNTIME_FX_SCOPE_HEADER not in json.dumps(runtime_memory)
 
-# Deterministic probabilistic cross-check: internal state remains detectable
-# through randomized nesting and one/two JSON encodings, while ordinary
-# generator payloads with similar structural depth remain valid.
+sealed_state = {
+    "rulesets": ["SERVER POLICY"],
+    "system": "PRIVATE SYSTEM STATE",
+    "nested": {"instructions": "PRIVATE INSTRUCTIONS"},
+}
+module._strip_sealed_state_from_agent_wrapper(sealed_state)
+assert sealed_state["rulesets"] == []
+assert sealed_state["system"] == module._PUBLIC_OUTPUT_BLOCKED
+assert sealed_state["nested"]["instructions"] == module._PUBLIC_OUTPUT_BLOCKED
+
+# Deterministic probabilistic cross-check: directly supplied internal structures
+# remain detectable through randomized nesting, while serialized JSON and
+# ordinary generator payloads are not interpreted by this lightweight boundary.
 rng = random.Random(20260730)
-policy_text, binding_text = module._hmb._load_verified_behavior_documents()
 
-# Private wrapper ports still scrub exact internal headings through reversible
-# encodings. FINAL TEXT has no fixed-length policy-text publication threshold.
-for secret_document in (policy_text, binding_text):
-    encoded_variants = (
-        base64.b64encode(secret_document.encode("utf-8")).decode("ascii"),
-        base64.urlsafe_b64encode(secret_document.encode("utf-8")).decode("ascii"),
-        base64.urlsafe_b64encode(secret_document.encode("utf-8"))
-        .decode("ascii")
-        .rstrip("="),
-        secret_document.encode("utf-8").hex(),
-        secret_document.encode("utf-8").hex().upper(),
-        secret_document[::-1],
-    )
-    for encoded_secret in encoded_variants:
-        assert module._contains_internal_rule_text(
-            encoded_secret,
-            policy_text,
-            binding_text,
-        )
-        assert not module._contains_public_output_state_leak(
-            encoded_secret,
-            policy_text,
-            binding_text,
-        )
-        assert not module._contains_complete_policy_document(
-            encoded_secret,
-            policy_text,
-            binding_text,
-        )
-        encoded_wrapper = {"payload": encoded_secret}
-        module._replace_leaked_strings(
-            encoded_wrapper,
-            policy_text,
-            binding_text,
-            module._PUBLIC_OUTPUT_BLOCKED,
-        )
-        assert encoded_wrapper["payload"] == module._PUBLIC_OUTPUT_BLOCKED
-
-# Arbitrary long production prose is no longer classified as a leak by length.
-# Use one runtime-derived line to verify plain and reversible representations.
-runtime_fragment = next(line for line in policy_text.splitlines() if len(line) >= 160)[:160]
-fragment_words = runtime_fragment.split()
-encoded_fragment_variants = (
-    {runtime_fragment: "value hidden in a mapping key"},
-    [
-        " ".join(fragment_words[index : index + 4])
-        for index in range(0, len(fragment_words), 4)
-    ],
-    list(runtime_fragment),
-    [ord(character) for character in runtime_fragment],
-    json.dumps([ord(character) for character in runtime_fragment]),
-    codecs.encode(runtime_fragment, "rot_13"),
-    urllib.parse.quote(runtime_fragment, safe=""),
-    base64.b64encode(zlib.compress(runtime_fragment.encode("utf-8"))).decode(
-        "ascii"
-    ),
-    base64.b85encode(runtime_fragment.encode("utf-8")).decode("ascii"),
-    "\u200b".join(runtime_fragment),
-    base64.b64encode(runtime_fragment.encode("utf-8")).decode("ascii"),
-    runtime_fragment.encode("utf-8").hex(),
-    runtime_fragment[::-1],
-)
-for encoded_fragment in encoded_fragment_variants:
-    assert not module._contains_internal_rule_text(
-        encoded_fragment,
-        policy_text,
-        binding_text,
-    )
-    assert not module._contains_public_output_state_leak(
-        json.dumps({"payload": encoded_fragment}),
-        policy_text,
-        binding_text,
-    )
-    assert not module._contains_complete_policy_document(
-        encoded_fragment,
-        policy_text,
-        binding_text,
-    )
-
-    boundary = canonical_hmb_agent()
-    boundary.parameter_output_values = {
-        "output": encoded_fragment,
-        "agent": {
-            "conversation_memory": {"runs": [{"output": encoded_fragment}]}
-        },
-    }
-    boundary._hmb_policy = policy_text
-    boundary._hmb_binding = binding_text
-    boundary._hmb_policy_rules = module._split_behavior_rules(policy_text, 4)
-    boundary._hmb_binding_rules = module._split_behavior_rules(binding_text, 4)
-    boundary._secure_hmb_outputs()
-    assert boundary.parameter_output_values["output"] == encoded_fragment
 
 state_keys = tuple(sorted(module._PUBLIC_OUTPUT_STATE_KEYS))
 for case_index in range(4096):
     state_key = rng.choice(state_keys)
     leaked_value = {state_key: {"case": case_index, "runs": []}}
+    if state_key in module._GENERIC_AGENT_STATE_KEYS:
+        companion_key = "messages" if state_key != "messages" else "memory"
+        leaked_value[companion_key] = []
     for _ in range(rng.randint(0, 5)):
         leaked_value = rng.choice(
             (
@@ -602,14 +537,11 @@ for case_index in range(4096):
                 [leaked_value, {"case": case_index}],
             )
         )
-    if rng.random() < 0.75:
-        leaked_value = json.dumps(leaked_value, ensure_ascii=False)
-    if rng.random() < 0.35:
-        leaked_value = json.dumps(leaked_value, ensure_ascii=False)
-    assert module._contains_public_output_state_leak(
-        leaked_value,
-        policy_text,
-        binding_text,
+    assert module._contains_public_output_state_leak(leaked_value)
+    serialized_leak = json.dumps(leaked_value, ensure_ascii=False)
+    assert not module._contains_public_output_state_leak(serialized_leak)
+    assert not module._contains_public_output_state_leak(
+        json.dumps(serialized_leak, ensure_ascii=False)
     )
 
     benign_value = {
@@ -626,66 +558,16 @@ for case_index in range(4096):
                 [benign_value, {"case": case_index}],
             )
         )
-    if rng.random() < 0.75:
-        benign_value = json.dumps(benign_value, ensure_ascii=False)
+    assert not module._contains_public_output_state_leak(benign_value)
     assert not module._contains_public_output_state_leak(
-        benign_value,
-        policy_text,
-        binding_text,
+        json.dumps(benign_value, ensure_ascii=False)
     )
 
-# Cyclic and adversarially deep host values are bounded without RecursionError.
-cyclic_benign = {"shot": "e101s001c001"}
-cyclic_benign["self"] = cyclic_benign
-assert not module._mapping_contains_agent_state(cyclic_benign)
-assert not module._contains_internal_rule_text(cyclic_benign, policy_text, binding_text)
-
-cyclic_leak = {"conversation_memory": {"runs": []}}
-cyclic_leak["self"] = cyclic_leak
-assert module._mapping_contains_agent_state(cyclic_leak)
-
-cyclic_wrapper = []
-cyclic_wrapper.append(cyclic_wrapper)
-cyclic_wrapper.append(f"{SEALED_TEST_FRAGMENT} leaked")
-scrubbed_cycle = module._replace_leaked_strings(
-    cyclic_wrapper,
-    policy_text,
-    binding_text,
-    module._PUBLIC_OUTPUT_BLOCKED,
-)
-assert scrubbed_cycle[0] == module._PUBLIC_OUTPUT_BLOCKED
-assert scrubbed_cycle[1] == module._PUBLIC_OUTPUT_BLOCKED
-
-tuple_cycle_list = []
-tuple_cycle = (
-    tuple_cycle_list,
-    f"{SEALED_TEST_FRAGMENT} leaked through tuple cycle",
-)
-tuple_cycle_list.append(tuple_cycle)
-scrubbed_tuple_cycle = module._replace_leaked_strings(
-    tuple_cycle,
-    policy_text,
-    binding_text,
-    module._PUBLIC_OUTPUT_BLOCKED,
-)
-assert SEALED_TEST_FRAGMENT not in str(scrubbed_tuple_cycle)
-
-deep_value = {"leaf": "safe"}
-for _ in range(1_100):
-    deep_value = {"payload": deep_value}
-assert module._mapping_contains_agent_state(deep_value)
-assert module._contains_internal_rule_text(deep_value, policy_text, binding_text)
-module._replace_leaked_strings(
-    deep_value,
-    policy_text,
-    binding_text,
-    module._PUBLIC_OUTPUT_BLOCKED,
-)
 
 # Sanitizer failure is fail-closed, and native exception details are replaced
 # by the fixed public execution diagnostic.
 sanitizer_failure = canonical_hmb_agent()
-sanitizer_failure.set_parameter_value("prompt", hmb_payload)
+sanitizer_failure.set_parameter_value("prompt", visible_prompt)
 sanitizer_failure._secure_hmb_outputs = types.MethodType(
     lambda _self: (_ for _ in ()).throw(RuntimeError("simulated sanitizer failure")),
     sanitizer_failure,
@@ -697,7 +579,7 @@ assert sanitizer_failure._hmb_policy == ""
 
 sanitizer_failure_after_native_error = canonical_hmb_agent()
 sanitizer_failure_after_native_error.raise_after_publish = True
-sanitizer_failure_after_native_error.set_parameter_value("prompt", hmb_payload)
+sanitizer_failure_after_native_error.set_parameter_value("prompt", visible_prompt)
 sanitizer_failure_after_native_error._secure_hmb_outputs = types.MethodType(
     lambda _self: (_ for _ in ()).throw(RuntimeError("simulated sanitizer failure")),
     sanitizer_failure_after_native_error,
@@ -715,7 +597,7 @@ assert sanitizer_failure_after_native_error._hmb_policy == ""
 exceptional = canonical_hmb_agent()
 exceptional.emit_hidden_rule = True
 exceptional.raise_after_publish = True
-exceptional.set_parameter_value("prompt", hmb_payload)
+exceptional.set_parameter_value("prompt", visible_prompt)
 try:
     list(exceptional.process())
 except RuntimeError as exc:
@@ -735,4 +617,4 @@ for obsolete in ("PROJECT", "project", "episode", "shot", "projects_root", "proj
 
 module._prompt_policy_source_identity = actual_prompt_identity_reader
 
-print("HMB native single-execution and hidden-rule protection regression: PASS")
+print("HMB native single-execution and runtime-state protection regression: PASS")
