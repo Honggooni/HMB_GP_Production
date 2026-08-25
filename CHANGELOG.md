@@ -1,5 +1,21 @@
 # Changelog
 
+## `v0.6.51` — 2026-08-25
+
+- Promoted the validated `v0.6.50` local-test line from the team-distributed
+  `v0.6.49` baseline.
+- Version policy: odd patch versions are team releases; even patch versions are
+  local test builds and are not distributed directly.
+- Kept the 160-character protected-policy disclosure boundary intact while
+  separating genuine Agent/runtime-state leaks from generator text that echoed
+  protected wording. A raw-policy-only collision now stays private and receives
+  exactly one scene-specific finalization retry using the same Shot facts.
+- Added a one-shot retry authority, terminal re-sanitization, and explicit
+  fail-closed handling. Agent-state output never retries, a second collision
+  cannot loop, and only the final clean result can publish a Seedance snapshot.
+- Added a public-CI regression for the 159/160 boundary, raw-to-clean recovery,
+  repeated collision, and Agent-state isolation.
+
 ## `v0.6.49` — 2026-08-25
 
 - Promoted the validated `v0.6.48` local-test line from the team-distributed

@@ -128,6 +128,7 @@ jobs:
             "HMB_Video_Taxonomy_Regression.py",
             "HMB_Agent_Authenticated_Broker_Regression.py",
             "HMB_Agent_Cloud_Nonstreaming_Regression.py",
+            "HMB_Agent_Policy_Collision_Retry_Regression.py",
             "HMB_Agent_English_Video_Progression_Regression.py",
             "HMB_Agent_Runtime_Prompt_UI_Isolation_Regression.py",
             "HMB_Agent_Shot_Binding_Regression.py",

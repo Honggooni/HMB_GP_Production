@@ -15,8 +15,8 @@ POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
 POLICY_CONTRACT_SHA256 = (
     "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
 )
-RELEASE_LABEL = "v0.6.49"
-RELEASE_VERSION = "0.6.49"
+RELEASE_LABEL = "v0.6.51"
+RELEASE_VERSION = "0.6.51"
 EXPECTED_SOURCE_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
@@ -142,7 +142,7 @@ assert tuple(builder.SOURCE_FILES) == EXPECTED_SOURCE_FILES
 assert len(EXPECTED_SOURCE_FILES) == 29
 assert builder.RELEASE_LABEL == RELEASE_LABEL
 assert builder.RELEASE_VERSION == RELEASE_VERSION
-assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.6.49_Runtime.zip"
+assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.6.51_Runtime.zip"
 assert builder.POLICY_VERSION == POLICY_VERSION
 assert builder.POLICY_CONTRACT_SHA256 == POLICY_CONTRACT_SHA256
 assert builder.POLICY_DELIVERY == "server-only"

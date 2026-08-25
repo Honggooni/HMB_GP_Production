@@ -1,9 +1,9 @@
 # HMB GP Production
 
-Current team release: `v0.6.49`.
+Current team release: `v0.6.51`.
 
-Odd patch versions are team releases. Even patch versions are local test builds
-and are not published or distributed until promoted to the next odd version.
+Odd patch versions are team releases; even patch versions are local test builds
+and must not be published or distributed until promoted to the next odd version.
 
 HMBAgentLibrary keeps Korean authoring input intact inside the private Prompt
 contract, but its final video-generator instruction is English-only. Prompt
