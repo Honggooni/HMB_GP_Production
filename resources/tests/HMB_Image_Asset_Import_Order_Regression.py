@@ -163,6 +163,33 @@ def look_payload(sub_type: str = "Color Mood") -> dict:
     }
 
 
+def character_payload(image_name: str) -> dict:
+    row = {
+        "selected": True,
+        "source_uid": "source:HeroCharacter",
+        "source_kind": "project",
+        "asset_project_uid": "sw12:test",
+        "asset_library_id": "library:HeroCharacter",
+        "asset_id": "Asset_HeroCharacter",
+        "image_name": image_name,
+        "path": f"C:/Project/sw12/Character/{image_name}.png",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
+        "selection_order": 1,
+    }
+    return {
+        "schema": "hmb-image-asset-library-binding",
+        "version": 2,
+        "mode": "image_asset",
+        "project_id": "sw12",
+        "project_uid": "sw12:test",
+        "project_root": "C:/Project/sw12",
+        "selection_id": f"character-{image_name}",
+        "selected_assets": [row],
+        "ordered_images": [row],
+    }
+
+
 # The temporary production catalog requested for this workstation must expose
 # each direct child folder as one independently selectable project.
 real_catalog_root = Path(r"C:\Project")
@@ -547,14 +574,16 @@ try:
     )
     assert repeated == reordered
 
-    # Registered Look provenance remains global, while the Prompt's effective
-    # Sub Type survives refresh, upstream default changes, and dormant reselect.
+    # Registered Look provenance remains source-owned, while the Prompt's
+    # effective Sub Type and independently authored Target survive refresh,
+    # upstream default changes, and dormant reselect.
     look_state = prompt_library._apply_image_asset_payload(
         prompt_library._default_widget_state(),
         look_payload(),
         connected=True,
     )
     look_state["images"][0]["image_sub_type"] = "Scale"
+    look_state["images"][0]["owner"] = "Jett_11"
     prompt_library._normalize_image_binding_fields(look_state["images"][0])
     refreshed_look = prompt_library._apply_image_asset_payload(
         look_state,
@@ -566,7 +595,7 @@ try:
     assert refreshed_look_row["image_sub_type"] == "Scale"
     assert refreshed_look_row["source_type"] == "Scale / Composition Reference"
     assert refreshed_look_row["scope"] == "Scale only"
-    assert refreshed_look_row["owner"] == "Camera / Composition"
+    assert refreshed_look_row["owner"] == "Jett_11"
 
     changed_registered_look = prompt_library._apply_image_asset_payload(
         refreshed_look,
@@ -577,6 +606,7 @@ try:
         "asset_image_sub_type_candidate"
     ] == "Render Look"
     assert changed_registered_look["images"][0]["image_sub_type"] == "Scale"
+    assert changed_registered_look["images"][0]["owner"] == "Jett_11"
 
     dormant_look = prompt_library._apply_image_asset_payload(
         changed_registered_look,
@@ -593,13 +623,44 @@ try:
         },
         connected=True,
     )
+    cached_look = next(
+        item
+        for item in dormant_look["image_asset"]["dormant_asset_rows"]
+        if item["asset_source_uid"] == "source:MasterLook"
+    )
+    assert cached_look["image_sub_type"] == "Scale"
+    assert cached_look["owner"] == "Jett_11"
     restored_look = prompt_library._apply_image_asset_payload(
         dormant_look,
         look_payload("Render Look"),
         connected=True,
     )
     assert restored_look["images"][0]["image_sub_type"] == "Scale"
-    assert restored_look["images"][0]["owner"] == "Camera / Composition"
+    assert restored_look["images"][0]["owner"] == "Jett_11"
+
+    # Look is the only verified Main Type whose Target is always Prompt-owned.
+    # Other verified defaults still follow an upstream rename until the user
+    # authors a different Target, after which that explicit choice is retained.
+    character_state = prompt_library._apply_image_asset_payload(
+        prompt_library._default_widget_state(),
+        character_payload("Hero Old"),
+        connected=True,
+    )
+    assert character_state["images"][0]["owner"] == "Hero Old"
+    renamed_character = prompt_library._apply_image_asset_payload(
+        character_state,
+        character_payload("Hero New"),
+        connected=True,
+    )
+    assert renamed_character["images"][0]["owner"] == "Hero New"
+    renamed_character["images"][0]["owner"] = "Hero Custom Target"
+    authored_character = prompt_library._apply_image_asset_payload(
+        renamed_character,
+        character_payload("Hero Final"),
+        connected=True,
+    )
+    assert authored_character["images"][0]["owner"] == "Hero Custom Target"
+    assert authored_character["images"][0]["asset_default_target"] == "Hero Final"
 
     # A shorter connected selection removes the deselected managed row. Tokens
     # that pointed to it become tombstones instead of silently rebinding.
@@ -849,6 +910,10 @@ try:
     node = asset_library.HMBImageAssetLibrary(
         name="image_asset_import_contract",
     )
+    # This unit node is intentionally not registered with a retained-mode
+    # NodeManager. An installed host may already own an Engine singleton, so
+    # make the fixture's identity explicit while exercising its async scanner.
+    node._scan_owner_is_current = lambda: True
     for parameter_name in (
         asset_library.IMAGE_IMPORT_PARAMETER,
         asset_library.OUTPUT_PARAMETER,
@@ -952,11 +1017,18 @@ try:
             node,
             asset_library.IMAGE_IMPORT_PARAMETER
         )
-        assert import_parameter.input_types == [
+        expected_import_types = [
             "list[ImageUrlArtifact]",
             "list[ImageArtifact]",
             "list[str]",
         ]
+        # Griptape 0.98 additionally advertises the ParameterList aggregate as
+        # generic ``list``; older/current clean-CI doubles expose only the three
+        # typed aggregates. Both surfaces preserve the same accepted media.
+        assert import_parameter.input_types in (
+            expected_import_types,
+            [*expected_import_types, "list"],
+        )
         assert getattr(import_parameter, "_collapsed", None) is True
         assert getattr(import_parameter, "_max_items", None) == 50
         assert import_parameter.ui_options.get("collapsed") is True

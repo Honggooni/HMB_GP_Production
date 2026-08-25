@@ -519,6 +519,7 @@ const verifiedLookOverrideMerge = widget.hmbMergePromptRevisionAxes(
       asset_image_sub_type_candidate: "Render Look",
       image_main_type: "Look Reference",
       image_sub_type: "Render Look",
+      owner: "Global Look",
     }],
   },
   {
@@ -534,6 +535,7 @@ const verifiedLookOverrideMerge = widget.hmbMergePromptRevisionAxes(
       asset_image_sub_type_candidate: "Color Mood",
       image_main_type: "Look Reference",
       image_sub_type: "Scale",
+      owner: "Jett_11",
     }],
   },
 );
@@ -543,7 +545,7 @@ assert.equal(verifiedLookOverrideRow.image_main_type, "Look Reference");
 assert.equal(verifiedLookOverrideRow.image_sub_type, "Scale");
 assert.equal(verifiedLookOverrideRow.source_type, "Scale / Composition Reference");
 assert.equal(verifiedLookOverrideRow.scope, "Scale only");
-assert.equal(verifiedLookOverrideRow.owner, "Camera / Composition");
+assert.equal(verifiedLookOverrideRow.owner, "Jett_11");
 assert.deepEqual(verifiedLookOverrideRow.color_picks, [""]);
 
 const verifiedLookDefaultMerge = widget.hmbMergePromptRevisionAxes(
@@ -559,6 +561,7 @@ const verifiedLookDefaultMerge = widget.hmbMergePromptRevisionAxes(
       asset_image_sub_type_candidate: "Render Look",
       image_main_type: "Look Reference",
       image_sub_type: "Render Look",
+      owner: "Global Look",
     }],
   },
   {
@@ -573,6 +576,7 @@ const verifiedLookDefaultMerge = widget.hmbMergePromptRevisionAxes(
       asset_image_sub_type_candidate: "Color Mood",
       image_main_type: "Look Reference",
       image_sub_type: "Color Mood",
+      owner: "Jett_08",
     }],
   },
 );
@@ -580,6 +584,11 @@ assert.equal(
   verifiedLookDefaultMerge.images[0].image_sub_type,
   "Render Look",
   "A stale registered default is not a Prompt override and must not defeat a newer Asset registration.",
+);
+assert.equal(
+  verifiedLookDefaultMerge.images[0].owner,
+  "Jett_08",
+  "Prompt Target remains UI-owned even when the stale Look Sub Type is not an override.",
 );
 
 const imageBindingUiMerge = widget.hmbMergePromptRevisionAxes(

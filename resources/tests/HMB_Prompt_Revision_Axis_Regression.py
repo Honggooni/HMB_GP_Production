@@ -194,11 +194,13 @@ look_source["images"][0].update(
         "asset_image_sub_type_candidate": "Render Look",
         "image_main_type": "Look Reference",
         "image_sub_type": "Render Look",
+        "owner": "Global Look",
     }
 )
 look_ui = copy.deepcopy(look_source)
 look_ui["images"][0]["asset_image_sub_type_candidate"] = "Color Mood"
 look_ui["images"][0]["image_sub_type"] = "Scale"
+look_ui["images"][0]["owner"] = "Jett_11"
 look_merged = prompt._merge_prompt_revision_axes(look_source, look_ui)
 look_row = look_merged["images"][0]
 assert look_row["asset_image_sub_type_candidate"] == "Render Look"
@@ -206,7 +208,7 @@ assert look_row["image_main_type"] == "Look Reference"
 assert look_row["image_sub_type"] == "Scale"
 assert look_row["source_type"] == "Scale / Composition Reference"
 assert look_row["scope"] == "Scale only"
-assert look_row["owner"] == "Camera / Composition"
+assert look_row["owner"] == "Jett_11"
 assert look_row["color_picks"] == [""]
 
 # A stale registered default is not an override. A newer global registration
@@ -214,11 +216,13 @@ assert look_row["color_picks"] == [""]
 look_default_ui = copy.deepcopy(look_source)
 look_default_ui["images"][0]["asset_image_sub_type_candidate"] = "Color Mood"
 look_default_ui["images"][0]["image_sub_type"] = "Color Mood"
+look_default_ui["images"][0]["owner"] = "Jett_08"
 look_default_merged = prompt._merge_prompt_revision_axes(
     look_source,
     look_default_ui,
 )
 assert look_default_merged["images"][0]["image_sub_type"] == "Render Look"
+assert look_default_merged["images"][0]["owner"] == "Jett_08"
 
 # Only is a real Prompt-owned selection too. A simultaneous source callback
 # must not resurrect the previously selected Shot.

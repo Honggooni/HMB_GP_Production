@@ -117,10 +117,22 @@ real_node._has_canonical_hmb_prompt_connection = types.MethodType(
     real_node,
 )
 real_node._model_access.raise_if_denied = lambda *args, **kwargs: None
-real_node.set_parameter_value("prompt", canonical_prompt)
-stored_canonical_prompt = getattr(real_node.get_parameter_value("prompt"), "value", None)
+# Production Shot routing executes from the hidden, router-owned Prompt input.
+# Keep the private machine envelope out of the native public Prompt editor and
+# seed only that authoritative input so this fixture matches current topology.
+real_node.set_parameter_value(
+    module._AGENT_SHOT_PROMPT_INPUT_PARAMETER,
+    canonical_prompt,
+)
+stored_canonical_prompt = getattr(
+    real_node.get_parameter_value(module._AGENT_SHOT_PROMPT_INPUT_PARAMETER),
+    "value",
+    None,
+)
 if stored_canonical_prompt is None:
-    stored_canonical_prompt = real_node.get_parameter_value("prompt")
+    stored_canonical_prompt = real_node.get_parameter_value(
+        module._AGENT_SHOT_PROMPT_INPUT_PARAMETER
+    )
 stored_canonical_prompt = str(stored_canonical_prompt)
 real_node.set_parameter_value("additional_context", "CALLER_CONTEXT_MUST_NOT_RUN")
 real_node.set_parameter_value("rulesets", ["CALLER_RULE_MUST_NOT_RUN"])

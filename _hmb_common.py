@@ -621,8 +621,8 @@ def image_color_pick_choices_for_taxonomy(
         return list(OBJECT_COLOR_PICK_CHOICES)
     if main == "Custom / Context" and sub == "Custom":
         return list(COLOR_PICK_CHOICES)
-    # Look Reference and Context intentionally describe the whole scene and
-    # therefore never expose a per-marker Color Pick.
+    # Look Reference and Context use their explicit Target rather than a
+    # per-marker video address, so they never expose a Color Pick here.
     return []
 
 

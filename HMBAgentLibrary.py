@@ -1227,16 +1227,12 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
         bindings = image.get("bindings")
         taxonomy_authority_valid = True
         if image_main_type == "Look Reference":
-            expected_target = (
-                "Camera / Composition"
-                if image_sub_type in {"Scale", "Composition", "Scale / Composition"}
-                else "Global Look"
-            )
-            # Look inputs are scene/camera-level authority by taxonomy, never a
-            # character/prop target and never a color-marker/video binding.
+            # Main/Sub Type limits transferable attributes; Target independently
+            # selects their recipient. A named character, prop, environment, or
+            # composition target is valid, while Look still never gains a
+            # color-marker/video relationship or content/identity authority.
             taxonomy_authority_valid = (
-                str(image.get("target_id") or "").strip() == expected_target
-                and isinstance(relationships, list)
+                isinstance(relationships, list)
                 and not relationships
                 and isinstance(bindings, list)
                 and not bindings

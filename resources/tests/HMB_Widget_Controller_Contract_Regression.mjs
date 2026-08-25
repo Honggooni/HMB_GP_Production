@@ -299,7 +299,37 @@ assert.match(assetSource, /export function hmbImageAssetCanRegister\(asset\)[\s\
 assert.match(assetSource, /if \(!hmbImageAssetCanRegister\(asset\)\) return null;/, "Registered assets must not create a registration draft.");
 assert.match(assetSource, /!asset[\s\S]*?\|\| !hmbImageAssetCanRegister\(asset\)[\s\S]*?\) return "";/, "The registration passport must render only for Add candidates.");
 assert.match(promptSource, /function renderSubtypeControls\(item, state, locked = false\)[\s\S]*?data-field="image_sub_type"[\s\S]*?\$\{locked \? "disabled" : ""\}/, "Verified registered v2 Sub Type controls must support a locked state.");
-assert.match(promptSource, /data-field="owner" \$\{sceneWideLookReference \? "disabled data-hmb-base-disabled=/, "Only scene-wide Look Reference must lock its Target to Global Look.");
+const promptOwnerSelectSource = promptSource.match(
+  /<select class="source-select source-target-select" data-field="owner"[^>]*>/,
+)?.[0] || "";
+assert.match(
+  promptOwnerSelectSource,
+  /data-hmb-base-disabled="0"/,
+  "Look and non-Look Target selectors must start from the same editable base state.",
+);
+assert.doesNotMatch(
+  promptOwnerSelectSource,
+  /\sdisabled(?:\s|=|>)/,
+  "A Look Reference must never render its Target selector disabled.",
+);
+const promptTargetRefreshSource = promptSource.match(
+  /function refreshImageTargetControls\([\s\S]*?\n\}/,
+)?.[0] || "";
+assert.doesNotMatch(
+  promptTargetRefreshSource,
+  /Look Reference|image_main_type/,
+  "Refreshing Target options must not restore a Look-specific lock.",
+);
+assert.match(
+  promptTargetRefreshSource,
+  /select\.disabled\s*=\s*false[\s\S]*?data-hmb-base-disabled",\s*"0"/,
+  "A dependent-control refresh must explicitly retain the editable Target base state.",
+);
+assert.doesNotMatch(
+  promptSource,
+  /no_color_pick:\s*"[^"]*(?:장면 전체 적용|Scene-wide)|Scene-wide · no Color Pick/,
+  "No-Color-Pick guidance must not claim scene-wide Look application.",
+);
 assert.doesNotMatch(promptSource, /verifiedAsset[^\n]*\?[^\n]*disabled[^\n]*data-field="owner"/, "Other verified Asset targets must remain freely editable.");
 assert.match(
   promptSource,
@@ -1177,6 +1207,17 @@ assert.match(
 );
 assert.match(videoSource, /\.scene-path-input\{height:25px;/);
 assert.match(videoSource, /\.scene-load-bar button\{height:25px;/);
+assert.match(
+  videoSource,
+  /\.palette-button\{width:20px;height:20px[\s\S]*?\.palette-pattern-chip\{[^}]*width:20px;height:20px;flex:0 0 20px\}[\s\S]*?\.palette-pattern-visual\{[^}]*transform:scale\(1\.1\)[^}]*pointer-events:none\}/,
+  "Only the four Object pattern visuals must paint 10% larger while the button and flex hitbox remain 20px.",
+);
+assert.match(
+  videoSource,
+  /objectOptions\.map\(\(name\) => `<span class="palette-pattern-chip"><button[\s\S]*?<span class="palette-pattern-visual" aria-hidden="true" style=/,
+  "Each Object option must retain one interactive button and add one non-interactive visual layer.",
+);
+assert.doesNotMatch(videoSource, /\.palette-pattern-chip>\.palette-button\{[^}]*transform:/);
 assert.match(videoSource, /id="depth-playblast-toggle"/);
 assert.match(videoSource, /id="mask-playblast-toggle"/);
 assert.match(videoSource, /id="motion-guide-toggle"/);

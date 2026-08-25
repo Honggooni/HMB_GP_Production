@@ -67,6 +67,11 @@ class GriptapeNodesProbe:
         return ListConnectionsForNodeResultSuccess(cls.incoming_connections)
 
 
+# Construct the unit node before replacing retained-mode modules. An installed
+# host's real DataNode constructor needs its complete GriptapeNodes surface;
+# clean CI uses the lightweight test double installed above.
+node = prompt.HMBPromptLibrary(name="Prompt Source Reconcile Probe")
+
 connection_events = types.ModuleType(
     "griptape_nodes.retained_mode.events.connection_events"
 )
@@ -76,13 +81,13 @@ connection_events.ListConnectionsForNodeResultSuccess = (
 )
 sys.modules[connection_events.__name__] = connection_events
 
-griptape_nodes_module = sys.modules[
+griptape_nodes_module = types.ModuleType(
     "griptape_nodes.retained_mode.griptape_nodes"
-]
+)
 griptape_nodes_module.GriptapeNodes = GriptapeNodesProbe
+sys.modules[griptape_nodes_module.__name__] = griptape_nodes_module
 
 
-node = prompt.HMBPromptLibrary(name="Prompt Source Reconcile Probe")
 source = SimpleNamespace(
     name="Source Probe",
     parameter_output_values={"SOURCE_OUT": "fresh-v1"},

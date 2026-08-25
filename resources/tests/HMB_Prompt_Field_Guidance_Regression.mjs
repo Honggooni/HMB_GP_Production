@@ -23,31 +23,39 @@ assert.equal(Object.hasOwn(forged, "prompt_guidance"), false);
 const globalLook = {
   image_main_type: "Look Reference",
   image_sub_type: "Color / Look / Lighting",
-  owner: "Former Character",
+  owner: "Global Look",
 };
 widget.normalizeImageTaxonomy(globalLook);
 assert.equal(globalLook.owner, "Global Look");
 assert.match(
   widget.hmbImageSubtypeAuthorityHint(globalLook, { ui: { language: "ko" } }),
-  /모든 캐릭터·프랍·하늘·환경/,
+  /선택한 대상에만 적용.*전체 룩/,
 );
 
-for (const subtype of ["Scale", "Composition", "Scale / Composition"]) {
-  const cameraReference = {
+for (const subtype of [
+  "Render Look",
+  "Lighting / Atmosphere",
+  "Scale",
+  "Composition",
+  "Scale / Composition",
+]) {
+  const targetedReference = {
     image_main_type: "Look Reference",
     image_sub_type: subtype,
-    owner: "Former Global Look",
+    owner: "Jett_11",
   };
-  widget.normalizeImageTaxonomy(cameraReference);
-  assert.equal(cameraReference.owner, "Camera / Composition");
-  assert.match(
-    widget.hmbImageSubtypeAuthorityHint(
-      cameraReference,
-      { ui: { language: "en" } },
-    ),
-    /not Global Look|no color/,
+  widget.normalizeImageTaxonomy(targetedReference);
+  assert.equal(targetedReference.owner, "Jett_11");
+  const targetedHint = widget.hmbImageSubtypeAuthorityHint(
+    targetedReference,
+    { ui: { language: "en" } },
   );
+  assert.match(targetedHint, /appl(?:y|ies) only to the selected Target/i);
+  assert.doesNotMatch(targetedHint, /apply to every visible|applies globally/i);
 }
+
+assert.doesNotMatch(source, /장면 전체 적용 · 컬러 픽 없음/);
+assert.doesNotMatch(source, /Scene-wide · no Color Pick/);
 
 const exactLegacyAndCurrent = (
   "[Lip-sync Transcript] 안녕, Jett!\n"

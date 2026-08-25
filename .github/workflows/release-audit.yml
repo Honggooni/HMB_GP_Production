@@ -14,6 +14,7 @@ jobs:
     timeout-minutes: 30
     outputs:
       package_version: ${{ steps.release_metadata.outputs.version }}
+      release_label: ${{ steps.release_metadata.outputs.release_label }}
       archive_name: ${{ steps.release_metadata.outputs.archive_name }}
     steps:
       - uses: actions/checkout@v4
@@ -41,14 +42,28 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Could not read the package version from pyproject.toml."
           }
+          $releaseLabel = python -c "from tools.package_runtime_release import RELEASE_LABEL; print(RELEASE_LABEL)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not read the approved release label from the package builder."
+          }
           $version = "$version".Trim()
-          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+          $releaseLabel = "$releaseLabel".Trim()
+          if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
             throw "Unsafe or unsupported package version: $version"
           }
-          $archiveName = "HMB_GP_Production_v${version}_Runtime.zip"
+          $major = $Matches[1]
+          $minor = $Matches[2]
+          $patch = [int]$Matches[3]
+          $expectedReleaseLabel = "v${major}.${minor}.$($patch.ToString('D2'))"
+          if ($releaseLabel -cne $expectedReleaseLabel) {
+            throw "Release label $releaseLabel does not match technical version $version; expected $expectedReleaseLabel."
+          }
+          $archiveName = "HMB_GP_Production_${releaseLabel}_Runtime.zip"
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "version=$version"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "release_label=$releaseLabel"
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "archive_name=$archiveName"
           Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_PACKAGE_VERSION=$version"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_RELEASE_LABEL=$releaseLabel"
           Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_RUNTIME_ARCHIVE=$archiveName"
       - name: Reject private or generated tracked content
         shell: pwsh
@@ -185,14 +200,15 @@ jobs:
         shell: pwsh
         run: |
           $version = $env:HMB_PACKAGE_VERSION
-          if ($env:GITHUB_REF_NAME -ne "v$version") {
-            throw "Release tag $env:GITHUB_REF_NAME does not match package version v$version."
+          $releaseLabel = $env:HMB_RELEASE_LABEL
+          if ($env:GITHUB_REF_NAME -cne $releaseLabel) {
+            throw "Release tag $env:GITHUB_REF_NAME does not match approved label $releaseLabel."
           }
           $versionParts = $version.Split('.')
           if ($versionParts.Count -ne 3 -or ([int]$versionParts[2] % 2) -eq 0) {
-            throw "Even patch version v$version is local-test-only. Team releases require an odd patch version."
+            throw "Even technical patch version $version is local-test-only. Team releases require an odd technical patch version."
           }
-          $artifact = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_v${version}_Runtime.zip"
+          $artifact = Join-Path $env:RUNNER_TEMP $env:HMB_RUNTIME_ARCHIVE
           $checksum = "{0} *{1}" -f `
             (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant(), `
             (Split-Path -Leaf $artifact)
@@ -225,14 +241,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           HMB_PACKAGE_VERSION: ${{ needs.windows-release-audit.outputs.package_version }}
+          HMB_RELEASE_LABEL: ${{ needs.windows-release-audit.outputs.release_label }}
           HMB_RUNTIME_ARCHIVE: ${{ needs.windows-release-audit.outputs.archive_name }}
         run: |
           $repository = $env:GITHUB_REPOSITORY
           $version = "$env:HMB_PACKAGE_VERSION".Trim()
-          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+          $releaseLabel = "$env:HMB_RELEASE_LABEL".Trim()
+          if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
             throw "Unsafe or unsupported package version: $version"
           }
-          $expectedArchiveName = "HMB_GP_Production_v${version}_Runtime.zip"
+          $major = $Matches[1]
+          $minor = $Matches[2]
+          $patch = [int]$Matches[3]
+          $expectedReleaseLabel = "v${major}.${minor}.$($patch.ToString('D2'))"
+          if ($releaseLabel -cne $expectedReleaseLabel -or $env:GITHUB_REF_NAME -cne $releaseLabel) {
+            throw "Published tag, release label, and technical version are inconsistent."
+          }
+          $expectedArchiveName = "HMB_GP_Production_${releaseLabel}_Runtime.zip"
           if ($env:HMB_RUNTIME_ARCHIVE -ne $expectedArchiveName) {
             throw "Audited release metadata is inconsistent."
           }
@@ -241,16 +266,14 @@ jobs:
           if (-not (Test-Path -LiteralPath $archive) -or -not (Test-Path -LiteralPath $checksum)) {
             throw "Audited release assets are missing."
           }
-          $notesPath = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_v${version}_release_notes.md"
+          $notesPath = Join-Path $env:RUNNER_TEMP "HMB_GP_Production_${releaseLabel}_release_notes.md"
           @(
-            "## HMB GP Production v$version",
+            "## HMB GP Production $releaseLabel",
             "",
-            "- Runs independent Shot 1-5 Prompt, Agent, and Seedance branches concurrently while pacing only billable Broker starts.",
-            "- Restores the same persisted Seedance task after an application interruption without submitting a duplicate render.",
-            "- Preserves ImageAsset and VideoPicker Shot media across reset replacement and exact saved-workflow reload.",
-            "- Uses a strict typed Shot contract and exact Main/Sub image taxonomy through Prompt-to-Agent public-job contract v2.",
-            "- Keeps VideoPicker compact-first with stable React Flow geometry and no lower black tail or update-depth feedback loop.",
-            "- Enforces pinned HTTPS for Agent policy delivery and the documented production-LAN-only HTTP Seedance exception.",
+            "- Keeps each Look Reference Target editable per shot, including named targets, blank, Global Look, and Camera / Composition, without granting identity or scene/background-content authority.",
+            "- Prefers Griptape Cloud HTTPS for local/Base64 images and local videos only when authentication and an accessible bucket are ready; otherwise images retain bounded Base64 and videos retain public HTTPS, asset://, or configured TOS fallbacks.",
+            "- Recomputes VideoPicker Generate availability immediately for Original, Mask, Depth, and Motion Guide output choices while preserving command locks.",
+            "- Enlarges only the Object pattern swatch visual by 10% while preserving its 20px hitbox, palette layout, marker identity, and Maya render behavior.",
             "- Includes the manifest-verified runtime installer and exact SHA256 checksum.",
             "",
             "Close Griptape completely before running the included installer."

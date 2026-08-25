@@ -282,32 +282,32 @@ const TEXT_FIELDS = [
 
 const LOOK_REFERENCE_AUTHORITY_HINTS = Object.freeze({
   "Color Mood": Object.freeze({
-    en: "Global palette and color relationships only; no light direction, exposure, identity, or material authority.",
-    ko: "전역 팔레트와 색 관계만 적용합니다. 광원 방향·노출·정체성·재질 권한은 없습니다.",
+    en: "Palette and color relationships apply only to the selected Target; choose Global Look for scene-wide use. No light direction, exposure, identity, or material authority.",
+    ko: "팔레트와 색 관계를 선택한 대상에만 적용합니다. 장면 전체 적용은 전체 룩을 선택하세요. 광원 방향·노출·정체성·재질 권한은 없습니다.",
   }),
   "Render Look": Object.freeze({
-    en: "Global rendering language, shading character, detail and finish only; it does not set light direction or exposure.",
-    ko: "전역 렌더 언어·셰이딩 특성·디테일·마감만 적용합니다. 광원 방향과 노출은 정하지 않습니다.",
+    en: "Rendering language, shading character, detail and finish apply only to the selected Target; choose Global Look for scene-wide use. It does not set light direction or exposure.",
+    ko: "렌더 언어·셰이딩 특성·디테일·마감을 선택한 대상에만 적용합니다. 장면 전체 적용은 전체 룩을 선택하세요. 광원 방향과 노출은 정하지 않습니다.",
   }),
   "Color / Look / Lighting": Object.freeze({
-    en: "Global palette, render language, lighting, exposure, white balance, atmosphere and grade apply to every visible character, prop, sky and environment while intrinsic identity is preserved.",
-    ko: "전역 팔레트·렌더 언어·라이팅·노출·화이트밸런스·대기·그레이드를 모든 캐릭터·프랍·하늘·환경에 함께 적용하되 고유 정체성은 유지합니다.",
+    en: "Palette, render language, lighting, exposure, white balance, atmosphere and grade apply only to the selected Target; choose Global Look for every visible source. Intrinsic identity is preserved.",
+    ko: "팔레트·렌더 언어·라이팅·노출·화이트밸런스·대기·그레이드를 선택한 대상에만 적용합니다. 모든 소스 적용은 전체 룩을 선택하세요. 고유 정체성은 유지합니다.",
   }),
   "Lighting / Atmosphere": Object.freeze({
-    en: "Global light direction and quality, exposure, white balance and atmosphere only; subject identity and intrinsic design stay unchanged.",
-    ko: "전역 광원 방향·광질·노출·화이트밸런스·대기만 적용하며 대상 정체성과 고유 디자인은 유지합니다.",
+    en: "Light direction and quality, exposure, white balance and atmosphere apply only to the selected Target; choose Global Look for scene-wide use. Identity and intrinsic design stay unchanged.",
+    ko: "광원 방향·광질·노출·화이트밸런스·대기를 선택한 대상에만 적용합니다. 장면 전체 적용은 전체 룩을 선택하세요. 정체성과 고유 디자인은 유지합니다.",
   }),
   Scale: Object.freeze({
-    en: "Scale authority only; this is Camera / Composition, not Global Look.",
-    ko: "스케일만 제어합니다. 전역 룩이 아니라 카메라·구도 권한입니다.",
+    en: "Scale authority applies only to the selected Target; choose Camera / Composition for shot-wide camera scope. No color, lighting, identity, or motion authority.",
+    ko: "스케일 권한을 선택한 대상에만 적용합니다. 샷 전체 카메라 범위는 카메라 / 구도를 선택하세요. 색·라이팅·정체성·모션 권한은 없습니다.",
   }),
   Composition: Object.freeze({
-    en: "Composition authority only; this is Camera / Composition, not Global Look.",
-    ko: "구도만 제어합니다. 전역 룩이 아니라 카메라·구도 권한입니다.",
+    en: "Composition authority applies only to the selected Target; choose Camera / Composition for shot-wide camera scope. No color, lighting, identity, or motion authority.",
+    ko: "구도 권한을 선택한 대상에만 적용합니다. 샷 전체 카메라 범위는 카메라 / 구도를 선택하세요. 색·라이팅·정체성·모션 권한은 없습니다.",
   }),
   "Scale / Composition": Object.freeze({
-    en: "Scale and composition only; no color, material, lighting, identity or motion authority.",
-    ko: "스케일과 구도만 제어하며 색·재질·라이팅·정체성·모션 권한은 없습니다.",
+    en: "Scale and composition apply only to the selected Target; choose Camera / Composition for shot-wide camera scope. No color, material, lighting, identity or motion authority.",
+    ko: "스케일과 구도를 선택한 대상에만 적용합니다. 샷 전체 카메라 범위는 카메라 / 구도를 선택하세요. 색·재질·라이팅·정체성·모션 권한은 없습니다.",
   }),
 });
 
@@ -364,7 +364,7 @@ const HMB_UI_KO = {
   add_video_row: "비디오 소스 행 추가",
   add_color_pick: "컬러 픽 추가",
   remove_color_pick: "컬러 픽 삭제",
-  no_color_pick: "장면 전체 적용 · 컬러 픽 없음",
+  no_color_pick: "컬러 픽 없음",
   use_frame_range: "Range",
   frame_range_disabled: "연결 없이도 Range를 편집할 수 있으며 소스 연결 시 자동으로 활성화됩니다.",
   frame_in: "인",
@@ -1431,9 +1431,6 @@ export function normalizeImageTaxonomy(item) {
     item.custom_source_type = "";
   }
   if (mainType === "Look Reference") {
-    item.owner = ["Scale", "Composition", "Scale / Composition"].includes(subType)
-      ? "Camera / Composition"
-      : "Global Look";
     item.interaction_targets = [""];
     item.interaction_custom_targets = [""];
     item.legacy_relationship_targets = [];
@@ -4508,7 +4505,7 @@ export function hmbMergePromptRevisionAxes(sourceState, uiState) {
     ) {
       // A verified Look keeps its registered Main Type and provenance, while
       // the Prompt owns an effective per-shot Sub Type. Re-normalization below
-      // atomically rebuilds source/scope/Target from that effective choice.
+      // rebuilds source/scope while preserving the Prompt-owned Target.
       item.image_sub_type = hmbPromptCloneRangeField(uiItem.image_sub_type);
     }
   });
@@ -5398,7 +5395,7 @@ function renderColorPickControls(item, rowIndex, images, state) {
   const count = MAX_VIDEOS;
   normalizeImageBindingFields(item, count);
   if (!colorPickChoicesForImageTaxonomy(item.image_main_type, item.image_sub_type).length) {
-    return `<div class="video-color-pick-wrap no-color-pick"><span>${escapeHtml(uiText(state, "no_color_pick", "Scene-wide · no Color Pick"))}</span></div>`;
+    return `<div class="video-color-pick-wrap no-color-pick"><span>${escapeHtml(uiText(state, "no_color_pick", "No Color Pick"))}</span></div>`;
   }
   const title = escapeHtml(uiText(state, "video_marker_source", "video marker source"));
   return `<div class="video-color-pick-wrap"><div class="color-pick-stack">${item.color_picks.map((pick, pickIndex) => `<div class="color-binding-entry"><select class="source-select image-video-index binding-video-index" data-field="binding_video_slots" data-binding-index="${pickIndex}" title="${title}" aria-label="${title}">${videoNumberOptions(state, item.binding_video_slots[pickIndex])}</select><select class="source-select color-pick-select" data-field="color_picks" data-color-index="${pickIndex}" aria-label="${escapeHtml(uiText(state, "video_color_pick", "Video / Color Pick"))}">${colorPickOptions(images, rowIndex, pickIndex, count, state)}</select></div>`).join("")}</div></div>`;
@@ -5644,8 +5641,8 @@ function refreshImageTargetControls(container, state) {
         uiText(state, "blank_target", "— blank / no target —"),
         state,
       );
-      select.disabled = clean(item.image_main_type) === "Look Reference";
-      select.setAttribute?.("data-hmb-base-disabled", select.disabled ? "1" : "0");
+      select.disabled = false;
+      select.setAttribute?.("data-hmb-base-disabled", "0");
     });
   } catch (_e) {}
 }
@@ -5855,7 +5852,7 @@ function hmbSyncSourceSelectDom(container, state, row, kind, index, field) {
 
 function renderImageRow(item, index, images, state) {
   normalizeImageBindingFields(item, videoSlotCount(state));
-  const sceneWideLookReference = clean(item.image_main_type) === "Look Reference";
+  const lookReference = clean(item.image_main_type) === "Look Reference";
   const sourceTypeChoices = IMAGE_MAIN_TYPES.length
     ? IMAGE_MAIN_TYPES
     : uniqueList([item.image_main_type]);
@@ -5873,8 +5870,8 @@ function renderImageRow(item, index, images, state) {
     && verifiedRegisteredSubtype(item)
   );
   const identityTitle = verifiedAsset
-    ? (sceneWideLookReference
-      ? "Image Name, Asset ID, Main Type, and @image order are controlled by HMBImageAssetLibrary; Look Sub Type is an editable per-shot usage choice"
+    ? (lookReference
+      ? "Image Name, Asset ID, Main Type, and @image order are controlled by HMBImageAssetLibrary; Look Sub Type and Target are editable per-shot choices"
       : "Image Name, Asset ID, Main Type, registered Sub Type, and @image order are controlled by HMBImageAssetLibrary; Target remains editable")
     : (rowManaged
       ? "Generator order is controlled by HMBImageAssetLibrary; Name and Prompt fields remain editable"
@@ -5885,7 +5882,7 @@ function renderImageRow(item, index, images, state) {
     <div class="source-label image-name-cell"><input class="source-label-input" data-field="label" maxlength="${MAX_IDENTIFIER_CHARS}" value="${escapeHtml(item.label)}" placeholder="${escapeHtml(uiText(state, "name", "Name"))}" title="${escapeHtml(identityTitle)}" ${verifiedAsset ? "readonly" : ""}/></div>
     <div class="source-role image-main-type-cell"><select class="source-select" data-field="image_main_type" ${verifiedAsset ? "disabled" : ""}>${options(sourceTypeChoices, item.image_main_type, "", state)}</select></div>
     <div class="source-role binding-scope-cell">${renderSubtypeControls(item, state, registeredSubtypeLocked)}</div>
-    <div class="source-role image-target-cell"><select class="source-select source-target-select" data-field="owner" ${sceneWideLookReference ? "disabled data-hmb-base-disabled=\"1\"" : "data-hmb-base-disabled=\"0\""}>${targetSelectOptions(item, images, state)}</select></div>
+    <div class="source-role image-target-cell"><select class="source-select source-target-select" data-field="owner" data-hmb-base-disabled="0">${targetSelectOptions(item, images, state)}</select></div>
     <div class="source-role color-pick-cell">${renderColorPickControls(item, index, images, state)}</div>
     <div class="source-status image-actions-cell">${renderImageActions(item, state, index, images.length)}</div>
     ${renderFrameRangeRow(item, index, state)}

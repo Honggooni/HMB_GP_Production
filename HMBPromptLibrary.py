@@ -637,16 +637,12 @@ def _normalize_image_taxonomy(item: Dict[str, Any]) -> tuple[str, str]:
     if not (main_type == "Custom / Context" and sub_type == "Custom"):
         item["custom_source_type"] = ""
 
-    # Appearance Look references are scene-wide by contract. Scale and
-    # composition references share the compact Look Reference authoring group,
-    # but belong to the camera/composition domain instead of Global Look.
-    # Neither kind may inherit a former character/prop target.
+    # Look Reference Target is Prompt-owned. Main/Sub Type limits which
+    # attributes may transfer, while Target selects the recipient of those
+    # attributes. Never rewrite a named target into a global/camera target
+    # during normalization; that would discard valid per-target authoring on
+    # every state round-trip.
     if main_type == "Look Reference":
-        item["owner"] = (
-            "Camera / Composition"
-            if sub_type in {"Scale", "Composition", "Scale / Composition"}
-            else "Global Look"
-        )
         item["interaction_targets"] = [""]
         item["interaction_custom_targets"] = [""]
         item["legacy_relationship_targets"] = []
@@ -5045,8 +5041,9 @@ def _merge_prompt_revision_axes(
             and _verified_look_reference_subtype_override(ui_item)
         ):
             # Registered Look provenance stays on the source axis. The Prompt
-            # may carry only its effective per-shot Sub Type across a crossed
-            # source/UI revision; normalization rebuilds the full wire pair.
+            # may carry its effective per-shot Sub Type and Prompt-owned Target
+            # across a crossed source/UI revision; normalization rebuilds only
+            # the taxonomy wire pair.
             item["image_sub_type"] = copy.deepcopy(
                 ui_item.get("image_sub_type")
             )
@@ -5176,6 +5173,22 @@ def _target_function_suffix(scope: str) -> str:
     return f" / Target function = {_target_function(scope)}"
 
 
+def _look_target_authority_scope(target: Any) -> str:
+    """Describe Look application scope without inventing global authority."""
+
+    value = _public_single_line(target)
+    if value == "Global Look":
+        return "scene-wide"
+    if value == "Camera / Composition":
+        return "within the shot camera/composition domain"
+    if value:
+        return f"only on the selected target {value}"
+    return (
+        "with Target unspecified and without implicit scene-wide or "
+        "other-target expansion"
+    )
+
+
 def _image_role_line(item: Dict[str, Any], seq: int) -> str:
     """Render one user-readable image role without transport metadata."""
 
@@ -5183,6 +5196,9 @@ def _image_role_line(item: Dict[str, Any], seq: int) -> str:
     source_type_choice = _public_single_line(item.get("source_type"))
     source_type = _public_single_line(_effective_image_source_type(item))
     owner = _public_single_line(_effective_target(item, f"image {seq}"))
+    authored_target = _public_single_line(item.get("owner"))
+    look_owner = authored_target or "Target unspecified"
+    look_target_scope = _look_target_authority_scope(authored_target)
     main_type = _public_single_line(item.get("image_main_type"))
     sub_type = _public_single_line(item.get("image_sub_type"))
     scopes = [
@@ -5229,37 +5245,37 @@ def _image_role_line(item: Dict[str, Any], seq: int) -> str:
             return f"{owner} / Foreground / ground source = {token}{suffix}"
         if source_type_choice == "Color / Look Reference":
             authority = (
-                "scene-wide palette and color relationships only; it does not "
+                f"palette and color relationships {look_target_scope}; it does not "
                 "own light direction, exposure, or subject identity"
                 if scope == "Color mood only"
-                else "scene-wide rendering language, shading character, detail, "
-                "and finish only; it does not own light direction, exposure, or "
-                "subject identity"
+                else f"rendering language, shading character, detail, and finish "
+                f"{look_target_scope}; it does not own light direction, exposure, "
+                "subject identity, or scene/background content"
             )
             return (
-                f"{owner} / Color / look reference = {token}{suffix} / "
+                f"{look_owner} / Color / look reference = {token}{suffix} / "
                 f"Authority = {authority}"
             )
         if source_type_choice == "Color + Look + Lighting Mood Reference":
             return (
-                f"{owner} / Color / look / lighting reference = {token}{suffix} / "
-                "Authority = scene-wide shared palette, render language, lighting, "
-                "exposure, white balance, atmosphere, and grade across every visible "
-                "character, prop, sky, and environment source; relight them together "
-                "while preserving intrinsic identity, color, pattern, and material"
+                f"{look_owner} / Color / look / lighting reference = {token}{suffix} / "
+                "Authority = palette, render language, lighting, exposure, white "
+                f"balance, atmosphere, and grade {look_target_scope}; preserve "
+                "intrinsic identity, color, pattern, and material and do not expand "
+                "to untargeted subjects or scene/background content"
             )
         if source_type_choice == "Lighting / Atmosphere Reference":
             return (
-                f"{owner} / Lighting / atmosphere source = {token}{suffix} / "
-                "Authority = scene-wide shared light direction, quality, exposure, "
-                "white balance, atmosphere, and integration only; it does not replace "
-                "subject identity or intrinsic design"
+                f"{look_owner} / Lighting / atmosphere source = {token}{suffix} / "
+                "Authority = light direction, quality, exposure, white balance, "
+                f"atmosphere, and integration {look_target_scope}; it does not replace "
+                "subject identity, intrinsic design, or scene/background content"
             )
         if source_type_choice == "Scale / Composition Reference":
             return (
-                f"{owner} / Scale / composition reference = {token}{suffix} / "
-                "Authority = only the named scale and/or composition domain; no color, "
-                "material, lighting, identity, or motion authority"
+                f"{look_owner} / Scale / composition reference = {token}{suffix} / "
+                f"Authority = scale and/or composition {look_target_scope}; no color, "
+                "material, lighting, identity, motion, or scene-content authority"
             )
         if source_type_choice == "Custom":
             return f"{owner} / {source_type} = {token}{suffix}"
@@ -5444,7 +5460,7 @@ def _image_asset_input_kwargs() -> Dict[str, Any]:
             "assets provide Main Type, Asset ID, Image Name, a registered Sub Type, "
             "and Color Pick candidates. The registered Sub Type stays bound to the "
             "asset except that Look Reference rows may select an effective per-shot "
-            "Look Sub Type; Target is then derived from that effective taxonomy. "
+            "Look Sub Type; Target remains an independent per-shot selection. "
             "IMAGE_IMPORT_IN sources provide only Image Name and generator order. "
             "Recognized source, role, Color Pick, and replacement fields compile into the public Prompt sections. "
             "Other connected or descriptive values remain local dashboard state and are not serialized into PROMPT_OUT."
@@ -5975,8 +5991,9 @@ def _apply_image_asset_payload(
     assets. External IMAGE_IMPORT_IN rows carry Image Name and generator order
     only and otherwise behave like native Prompt rows. A verified registered Sub
     Type is authoritative except that a Look Reference may keep one effective
-    Prompt Sub Type. Target is rebuilt from that Look choice; other Targets
-    receive a Main-Type default only when not authored and remain editable.
+    Prompt Sub Type. Every Target remains Prompt-owned; a new verified row may
+    receive a Main-Type initial default, but refresh and normalization never
+    replace an authored Target.
     Neither mode writes final Color Pick, video slot, or frame range.
     """
     normalized = _normalize_state(state)
@@ -6658,20 +6675,23 @@ def _apply_image_asset_payload(
                 asset.get("asset_id"),
             )
             current_target = _clean_string(item.get("owner"))
+            look_target_is_prompt_owned = (
+                item.get("image_main_type") == "Look Reference"
+            )
             if (
-                (not current_target and not previous_asset_default_target)
-                or (
-                    previous_asset_default_target
-                    and current_target == previous_asset_default_target
-                )
+                not current_target
+                and not previous_asset_default_target
+            ) or (
+                not look_target_is_prompt_owned
+                and previous_asset_default_target
+                and current_target == previous_asset_default_target
             ):
                 item["owner"] = default_target
             item["asset_default_target"] = default_target
             _normalize_image_binding_fields(item, MAX_VIDEOS)
-            # Look Sub Types span Global Look and Camera / Composition. Keep
-            # the tracked default aligned with the effective wire after the
-            # Prompt-local selection is normalized.
-            if item.get("image_main_type") == "Look Reference":
+            # Track the current suggested default for new rows and diagnostics,
+            # without applying it over the Prompt-owned Target.
+            if look_target_is_prompt_owned:
                 item["asset_default_target"] = _default_image_target_for_main_type(
                     item.get("source_type"),
                     asset.get("image_name"),
@@ -10664,7 +10684,8 @@ class HMBPromptLibrary(DataNode):
     Verified Project Asset data establishes Project, Asset ID, Image Name, Main
     Type, and the registered Image Sub Type. A verified Look Reference keeps
     its Main Type while permitting an effective per-shot Look Sub Type; its
-    Target is derived from that choice. External IMAGE_IMPORT_IN rows establish
+    Target remains an independent per-shot Prompt selection. External
+    IMAGE_IMPORT_IN rows establish
     Image Name and generator order only. Prompt keeps Target, Color Pick, and
     custom user intent editable.
     Picker data synchronizes video-slot lifecycle, generated video paths, and exact Asset ID-to-Image Name appearance-replacement Color Pick bindings.

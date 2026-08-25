@@ -15,8 +15,11 @@ POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
 POLICY_CONTRACT_SHA256 = (
     "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
 )
-RELEASE_LABEL = "v0.6.55"
-RELEASE_VERSION = "0.6.55"
+RELEASE_LABEL = "v0.7.01"
+RELEASE_VERSION = "0.7.1"
+LOCAL_RELEASE_PROHIBITION = (
+    "must not be committed, tagged, pushed, or distributed"
+)
 EXPECTED_SOURCE_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
@@ -133,6 +136,53 @@ def assert_forbidden_archive(encoded: bytes) -> None:
     raise AssertionError("A policy artifact or policy document entered a release ZIP.")
 
 
+def current_changelog_release(markdown: str, release_label: str) -> tuple[bool, str]:
+    match = re.search(
+        rf"^## `{re.escape(release_label)}` — "
+        rf"\d{{4}}-\d{{2}}-\d{{2}}(?P<local> \(local test\))?\n"
+        rf"(?P<body>.*?)(?=^## |\Z)",
+        markdown,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, f"Missing Changelog section for {release_label}."
+    return match.group("local") is not None, match.group("body")
+
+
+def assert_changelog_release_policy(
+    markdown: str,
+    release_label: str,
+    release_version: str,
+) -> None:
+    is_local_release, release_notes = current_changelog_release(
+        markdown,
+        release_label,
+    )
+    release_patch = builder.release_version_parts(release_version)[2]
+    has_distribution_prohibition = (
+        LOCAL_RELEASE_PROHIBITION in release_notes.casefold()
+    )
+    if release_patch % 2:
+        assert not is_local_release
+        assert not has_distribution_prohibition
+    else:
+        assert is_local_release
+        assert has_distribution_prohibition
+
+
+def assert_changelog_release_policy_rejected(
+    markdown: str,
+    release_label: str,
+    release_version: str,
+) -> None:
+    try:
+        assert_changelog_release_policy(markdown, release_label, release_version)
+    except AssertionError:
+        return
+    raise AssertionError(
+        f"Invalid Changelog policy was accepted for {release_label}/{release_version}."
+    )
+
+
 builder = load_module(
     "_hmb_public_release_in_memory_builder",
     ROOT / "tools" / "package_runtime_release.py",
@@ -142,7 +192,31 @@ assert tuple(builder.SOURCE_FILES) == EXPECTED_SOURCE_FILES
 assert len(EXPECTED_SOURCE_FILES) == 29
 assert builder.RELEASE_LABEL == RELEASE_LABEL
 assert builder.RELEASE_VERSION == RELEASE_VERSION
-assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.6.55_Runtime.zip"
+assert builder.release_version_parts(RELEASE_VERSION) == (0, 7, 1)
+assert builder.release_label_for_version(RELEASE_VERSION) == RELEASE_LABEL
+builder.validate_release_identity(RELEASE_LABEL, RELEASE_VERSION)
+for invalid_version in (
+    "0.7.01",
+    "0.07.1",
+    "00.7.1",
+    "0.7.1-alpha",
+    "0.7",
+):
+    try:
+        builder.validate_release_identity(RELEASE_LABEL, invalid_version)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError(f"Invalid technical SemVer was accepted: {invalid_version}")
+for mismatched_label in ("v0.7.1", "v0.7.02", "0.7.01"):
+    try:
+        builder.validate_release_identity(mismatched_label, RELEASE_VERSION)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError(f"Mismatched public release label was accepted: {mismatched_label}")
+assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.7.01_Runtime.zip"
+assert builder.ARCHIVE_NAME == f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 assert builder.POLICY_VERSION == POLICY_VERSION
 assert builder.POLICY_CONTRACT_SHA256 == POLICY_CONTRACT_SHA256
 assert builder.POLICY_DELIVERY == "server-only"
@@ -168,7 +242,44 @@ assert next(
     item for item in sbom["packages"]
     if item["SPDXID"] == "SPDXRef-HMB-GP-Production"
 )["versionInfo"] == RELEASE_VERSION
-assert f"## `{RELEASE_LABEL}` — 2026-08-25" in changelog
+assert_changelog_release_policy(changelog, RELEASE_LABEL, RELEASE_VERSION)
+
+valid_team_changelog = (
+    "## `v9.8.01` — 2026-08-26\n\n"
+    "- Published the approved team release.\n"
+)
+valid_local_changelog = (
+    "## `v9.8.02` — 2026-08-26 (local test)\n\n"
+    f"- This build {LOCAL_RELEASE_PROHIBITION}.\n"
+)
+assert_changelog_release_policy(valid_team_changelog, "v9.8.01", "9.8.1")
+assert_changelog_release_policy(valid_local_changelog, "v9.8.02", "9.8.2")
+assert_changelog_release_policy_rejected(
+    valid_team_changelog.replace(
+        "2026-08-26\n",
+        "2026-08-26 (local test)\n",
+    ),
+    "v9.8.01",
+    "9.8.1",
+)
+assert_changelog_release_policy_rejected(
+    valid_team_changelog.replace(
+        "Published the approved team release.",
+        f"This build {LOCAL_RELEASE_PROHIBITION}.",
+    ),
+    "v9.8.01",
+    "9.8.1",
+)
+assert_changelog_release_policy_rejected(
+    valid_local_changelog.replace(" (local test)", ""),
+    "v9.8.02",
+    "9.8.2",
+)
+assert_changelog_release_policy_rejected(
+    valid_local_changelog.replace(LOCAL_RELEASE_PROHIBITION, "is local-only"),
+    "v9.8.02",
+    "9.8.2",
+)
 assert "http://192.168.203.245:8080" in security_policy
 assert "Seedance 생성 Broker 내부망 예외" in security_policy
 assert "Agent 정책 Broker" in security_policy
@@ -182,11 +293,22 @@ assert re.search(r"HMB_GP_Production_v\d+\.\d+\.\d+", workflow_text) is None
 assert re.search(r"HMB GP Production v\d+\.\d+\.\d+", workflow_text) is None
 assert "id: release_metadata" in workflow_text
 assert "tomllib.load(open('pyproject.toml','rb'))" in workflow_text
+assert "from tools.package_runtime_release import RELEASE_LABEL" in workflow_text
 assert "Unsafe or unsupported package version" in workflow_text
+assert "release_label=$releaseLabel" in workflow_text
+assert "HMB_RELEASE_LABEL=$releaseLabel" in workflow_text
+assert 'HMB_GP_Production_${releaseLabel}_Runtime.zip' in workflow_text
 assert "steps.release_metadata.outputs.archive_name" in workflow_text
 assert "needs.windows-release-audit.outputs.package_version" in workflow_text
-assert "Even patch version v$version is local-test-only" in workflow_text
-assert "Team releases require an odd patch version" in workflow_text
+assert "needs.windows-release-audit.outputs.release_label" in workflow_text
+assert re.search(
+    r"Even(?: technical)? patch version v?\$version is local-test-only",
+    workflow_text,
+)
+assert re.search(
+    r"Team releases require an odd(?: technical)? patch version",
+    workflow_text,
+)
 
 release_version, records = builder.validate_sources()
 record_paths = tuple(str(record["path"]) for record in records)
@@ -202,6 +324,55 @@ builder.validate_release_inventory(release_version, release_records)
 release_record_by_path = {
     str(record["path"]): record for record in release_records
 }
+closure_manifest = json.loads(
+    release_record_by_path[builder.RELEASE_MANIFEST_PATH]["data"].decode("utf-8")
+)
+assert closure_manifest["release_label"] == RELEASE_LABEL
+assert closure_manifest["release_version"] == RELEASE_VERSION
+
+# Keep every other closure field and checksum internally consistent so this
+# mutation is rejected specifically because the public label is not approved.
+tampered_release_records = [dict(record) for record in release_records]
+tampered_manifest_record = next(
+    record
+    for record in tampered_release_records
+    if record["path"] == builder.RELEASE_MANIFEST_PATH
+)
+tampered_manifest = json.loads(tampered_manifest_record["data"].decode("utf-8"))
+tampered_manifest["release_label"] = "v0.7.99"
+tampered_manifest_data = (
+    json.dumps(tampered_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+).encode("utf-8")
+tampered_manifest_record.update(
+    bytes=len(tampered_manifest_data),
+    data=tampered_manifest_data,
+    sha256=builder.digest(tampered_manifest_data),
+)
+tampered_checksum_record = next(
+    record
+    for record in tampered_release_records
+    if record["path"] == builder.SHA256SUMS_PATH
+)
+tampered_checksum_data = (
+    "\n".join(
+        f'{record["sha256"]}  {record["path"]}'
+        for record in tampered_release_records
+        if record["path"] != builder.SHA256SUMS_PATH
+    )
+    + "\n"
+).encode("utf-8")
+tampered_checksum_record.update(
+    bytes=len(tampered_checksum_data),
+    data=tampered_checksum_data,
+    sha256=builder.digest(tampered_checksum_data),
+)
+try:
+    builder.validate_release_inventory(release_version, tampered_release_records)
+except RuntimeError:
+    pass
+else:
+    raise AssertionError("A mismatched release-manifest label was accepted.")
+
 assert set(release_record_by_path) == {
     *EXPECTED_SOURCE_FILES,
     builder.RELEASE_MANIFEST_PATH,

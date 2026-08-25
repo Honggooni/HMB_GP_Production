@@ -17,9 +17,9 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.6.55"
-RELEASE_VERSION = "0.6.55"
-ARCHIVE_NAME = f"HMB_GP_Production_v{RELEASE_VERSION}_Runtime.zip"
+RELEASE_LABEL = "v0.7.01"
+RELEASE_VERSION = "0.7.1"
+ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
 POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
@@ -35,6 +35,9 @@ MAX_NESTED_ARCHIVE_DEPTH = 3
 MAX_NESTED_ARCHIVE_BYTES = 64 * 1024 * 1024
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 128 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 4096
+STRICT_SEMVER_PATTERN = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+)
 
 SOURCE_FILES = (
     "__init__.py",
@@ -114,6 +117,37 @@ COMMON_TOKEN_PATTERNS = (
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def release_version_parts(release_version: str) -> tuple[int, int, int]:
+    """Parse the exact Griptape-compatible technical SemVer triplet."""
+
+    match = STRICT_SEMVER_PATTERN.fullmatch(release_version)
+    if match is None:
+        raise RuntimeError(
+            "Technical release version must be strict major.minor.patch SemVer "
+            "without leading zeroes."
+        )
+    return tuple(int(part) for part in match.groups())
+
+
+def release_label_for_version(release_version: str) -> str:
+    """Return the public label, padding only a one-digit technical patch."""
+
+    major, minor, patch = release_version_parts(release_version)
+    return f"v{major}.{minor}.{patch:02d}"
+
+
+def validate_release_identity(
+    release_label: str = RELEASE_LABEL,
+    release_version: str = RELEASE_VERSION,
+) -> None:
+    expected_label = release_label_for_version(release_version)
+    if release_label != expected_label:
+        raise RuntimeError(
+            "Public release label does not match the approved technical SemVer: "
+            f"expected {expected_label}, got {release_label}."
+        )
 
 
 def module_string_constant(path: Path, name: str) -> str:
@@ -199,6 +233,7 @@ def validate_no_policy_artifacts_in_zip(
 
 
 def validate_sources() -> tuple[str, list[dict[str, Any]]]:
+    validate_release_identity()
     library_manifest = json.loads(
         (ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8")
     )
@@ -363,6 +398,7 @@ def validate_release_inventory(
     if (
         manifest.get("schema") != "hmb-release-closure"
         or manifest.get("version") != 1
+        or manifest.get("release_label") != RELEASE_LABEL
         or manifest.get("release_version") != release_version
         or manifest.get("shot_routing_protocol") != SHOT_ROUTING_PROTOCOL_VERSION
         or manifest_paths != source_paths

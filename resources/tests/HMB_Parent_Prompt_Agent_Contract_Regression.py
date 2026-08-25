@@ -69,7 +69,7 @@ def make_edge(
     *,
     source_node_name: str = "renamed_parent_prompt",
     source_parameter_name: str = "PROMPT_OUT",
-    target_parameter_name: str = "prompt",
+    target_parameter_name: str = agent._AGENT_SHOT_PROMPT_INPUT_PARAMETER,
 ):
     return SimpleNamespace(
         source_node_name=source_node_name,
@@ -92,7 +92,7 @@ def direct_contract_result(
 
     if connection_lookup is None:
         def connection_lookup(parameter_name: str, node_name: str):
-            assert parameter_name == "prompt"
+            assert parameter_name == agent._AGENT_SHOT_PROMPT_INPUT_PARAMETER
             assert node_name == target.name
             return SimpleNamespace(incoming_connections=list(edges))
 
@@ -112,7 +112,8 @@ def direct_contract_result(
 
 
 # The only positive topology is the exact registered class and exact direct
-# PROMPT_OUT -> prompt edge. Runtime node names are intentionally irrelevant.
+# PROMPT_OUT -> router-owned SHOT_PROMPT_IN edge. Runtime node names are
+# intentionally irrelevant.
 canonical_source = make_source(prompt.HMBPromptLibrary)
 canonical_edge = make_edge()
 assert direct_contract_result(
@@ -308,7 +309,11 @@ def exercise_agent_route(
         )
 
     node.get_parameter_value = MethodType(
-        lambda _self, name: prompt_value if name == "prompt" else None,
+        lambda _self, name: (
+            prompt_value
+            if name == agent._AGENT_SHOT_PROMPT_INPUT_PARAMETER
+            else None
+        ),
         node,
     )
     node._has_canonical_hmb_prompt_connection = MethodType(
@@ -385,7 +390,9 @@ def exercise_agent_route(
     )
 
 
-compiled_prompt_copy = prompt._build_prompt_package(prompt._default_widget_state())
+compiled_prompt_copy = prompt._build_data_only_prompt_package(
+    prompt._default_widget_state()
+)
 native_route = (False, False, 0, 0, 0, False, 0, 1)
 hmb_route = (True, True, 2, 4, 4, True, 1, 1)
 
@@ -492,7 +499,7 @@ for mode_name, (state, expected_counts) in four_prompt_modes.items():
         int(status["active_images"]),
         int(status["active_videos"]),
     ) == expected_counts, mode_name
-    compiled = prompt._build_prompt_package(state)
+    compiled = prompt._build_data_only_prompt_package(state)
     assert len([line for line in compiled.splitlines() if line.strip()]) == 7
     prompt_json_section(compiled, "HMB JOB DATA (JSON):")
     fx_facts = prompt_json_section(compiled, "FX/TIMING SOURCE DATA (JSON):")
@@ -528,8 +535,9 @@ assert len(set(compiled_modes.values())) == 4
 
 
 # Both semantic input ports use the engine's official `any` wildcard. The
-# Prompt accepts arbitrary source classes at the host port, but connector data
-# without verified user-authored provenance cannot enter USER DESCRIPTION.
+# Prompt accepts arbitrary source classes at the host port and preserves their
+# text in quarantined no-loss fallback state, but that connector data cannot
+# enter USER DESCRIPTION without verified user-authored provenance.
 if not hasattr(prompt.DataNode, "after_incoming_connection"):
     setattr(
         prompt.DataNode,
@@ -586,14 +594,24 @@ prompt_node.after_incoming_connection(
 foreign_state = prompt._parse_state(
     prompt._get_parameter_raw(prompt_node, prompt.WIDGET_PARAMETER_NAME)
 )
-assert "source_intent_fallbacks" not in foreign_state
+assert {
+    str(item.get("source") or "")
+    for item in foreign_state.get("source_intent_fallbacks", [])
+    if isinstance(item, dict)
+} == {
+    prompt.IMAGE_ASSET_INPUT_PARAMETER_NAME,
+    prompt.PICKER_INPUT_PARAMETER_NAME,
+}
 foreign_blob = json.dumps(foreign_state, ensure_ascii=False, sort_keys=True)
-foreign_compiled = prompt_node.parameter_output_values["PROMPT_OUT"]
+foreign_visible = prompt_node.parameter_output_values["PROMPT_OUT"]
+foreign_compiled = prompt_node._hmb_agent_prompt_snapshot(
+    foreign_visible
+)["machine_prompt"]
 for preserved_token in (
     "KEEP_FOREIGN_ASSET_INTENT",
     "KEEP_FOREIGN_PICKER_INTENT",
 ):
-    assert preserved_token not in foreign_blob
+    assert preserved_token in foreign_blob
     assert preserved_token not in foreign_compiled
 assert prompt_json_section(
     foreign_compiled,
@@ -622,7 +640,7 @@ extended_state = prompt._apply_picker_payload(
     extended_picker,
     connected=True,
 )
-extended_compiled = prompt._build_prompt_package(extended_state)
+extended_compiled = prompt._build_data_only_prompt_package(extended_state)
 assert extended_state["status"]["active_images"] == 1
 assert extended_state["status"]["active_videos"] == 1
 assert "KEEP_ASSET_EXTENSION" not in extended_compiled

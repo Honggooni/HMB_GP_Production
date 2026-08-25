@@ -39,6 +39,10 @@ from griptape.artifacts.video_url_artifact import VideoUrlArtifact
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import (
     GriptapeCloudStorageDriver,
 )
+try:
+    from griptape_nodes.drivers.cloud_credentials import resolve_cloud_credential
+except ImportError:  # Older Griptape hosts expose only GT_CLOUD_API_KEY.
+    resolve_cloud_credential = None  # type: ignore[assignment]
 from griptape_nodes.exe_types.core_types import (
     Parameter,
     ParameterGroup,
@@ -455,6 +459,7 @@ MEDIA_BASE64_READ_CHUNK_BYTES = 3 * 256 * 1024
 CLOUD_UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 MAX_ATOMIC_OUTPUT_CANDIDATES = 10_000
 AMBIGUOUS_UPLOAD_CLEANUP_DELAY_SECONDS = 30 * 60
+_CLOUD_DRIVER_UNSET = object()
 
 VIDEO_REFERENCES_PARAMETER = "VIDEO_REFERENCES"
 SHOT_PROMPT_INPUT_PARAMETER = "SHOT_PROMPT_IN"
@@ -936,6 +941,9 @@ _TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _BROKER_PUBLIC_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _TOS_BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
 _BEARER_PATTERN = re.compile(r"(?i)Bearer\s+[A-Za-z0-9._~+/=-]+")
+_SIGNED_URL_QUERY_PATTERN = re.compile(
+    r"(?i)(?P<base>https?://[^\s'\"<>?#]+)\?[^\s'\"<>#]*"
+)
 _SENSITIVE_FIELD_PATTERN = re.compile(
     r"(?i)(authorization|(?:^|[_-])key(?:$|[_-])|api[_-]?key|provider[_-]?key|"
     r"token|secret|credential|cookie|session|exchange[_-]?code|usage[_-]?code)"
@@ -2761,8 +2769,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 name="auto_publish_local_videos",
                 default_value=True,
                 tooltip=(
-                    "Temporarily publish local reference MP4 files through the "
-                    "selected upload service."
+                    "When Griptape Cloud authentication and a bucket are ready, "
+                    "temporarily publish local image and video references as Cloud "
+                    "HTTPS URLs. Otherwise images keep the Base64 JSON path and "
+                    "videos use an already-supported fallback transport."
                 ),
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
                 ui_options={"display_name": "Auto Publish Local Videos"},
@@ -2771,9 +2781,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 name="local_video_upload_service",
                 default_value=LOCAL_VIDEO_UPLOAD_GRIPTAPE,
                 tooltip=(
-                    "Existing storage remains the default for saved workflows. "
-                    "Choose Volcengine TOS to keep local-video publication inside "
-                    "the Volcengine account."
+                    "Used for local video only when Griptape Cloud is unavailable. "
+                    "Choose Volcengine TOS for the existing signed-HTTPS fallback; "
+                    "public HTTPS and asset:// references always pass through."
                 ),
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
                 traits={Options(choices=list(LOCAL_VIDEO_UPLOAD_SERVICES))},
@@ -7072,20 +7082,60 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return ""
         return str(value or "").strip()
 
-    def _create_gt_cloud_storage_driver(self) -> GriptapeCloudStorageDriver:
-        api_key = self._get_optional_secret(GT_CLOUD_API_KEY_SECRET)
-        if not api_key:
+    @staticmethod
+    def _normalize_gt_cloud_base_url(value: str) -> str:
+        text = str(value or "").strip().rstrip("/")
+        parsed = urlparse(text)
+        if (
+            parsed.scheme.lower() != "https"
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
             raise RuntimeError(
-                "GT_CLOUD_API_KEY is missing. Sign in to Griptape Cloud or add "
-                "the key in Griptape Settings > Secrets."
+                "Griptape Cloud must use a credential-free HTTPS service URL."
             )
-        base_url = os.getenv("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai").strip()
+        return text
+
+    @staticmethod
+    def _resolve_gt_cloud_credential() -> str:
+        secrets_manager = GriptapeNodes.SecretsManager()
+        if callable(resolve_cloud_credential):
+            try:
+                value = resolve_cloud_credential(
+                    secrets_manager,
+                    secret_name=GT_CLOUD_API_KEY_SECRET,
+                )
+            except Exception:
+                value = ""
+        else:
+            try:
+                value = secrets_manager.get_secret(
+                    GT_CLOUD_API_KEY_SECRET,
+                    should_error_on_not_found=False,
+                )
+            except Exception:
+                value = ""
+        return str(value or "").strip()
+
+    def _create_gt_cloud_storage_driver(self) -> GriptapeCloudStorageDriver:
+        cloud_credential = self._resolve_gt_cloud_credential()
+        if not cloud_credential:
+            raise RuntimeError(
+                "Griptape Cloud authentication is unavailable. Sign in to "
+                "Griptape Cloud or add GT_CLOUD_API_KEY in Settings > Secrets."
+            )
+        base_url = self._normalize_gt_cloud_base_url(
+            os.getenv("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
+        )
         bucket_id = self._get_optional_secret(GT_CLOUD_BUCKET_ID_SECRET)
         if bucket_id:
             if not GriptapeCloudStorageDriver.bucket_exists(
                 bucket_id,
                 base_url=base_url,
-                api_key=api_key,
+                api_key=cloud_credential,
                 timeout=30.0,
             ):
                 raise RuntimeError(
@@ -7096,7 +7146,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             bucket_id = str(
                 GriptapeCloudStorageDriver.get_default_bucket_id(
                     base_url=base_url,
-                    api_key=api_key,
+                    api_key=cloud_credential,
                     timeout=30.0,
                 )
                 or ""
@@ -7108,10 +7158,32 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         return GriptapeCloudStorageDriver(
             workspace_directory=GriptapeNodes.ConfigManager().workspace_path,
             bucket_id=bucket_id,
-            api_key=api_key,
+            api_key=cloud_credential,
             base_url=base_url,
             request_timeout=30.0,
         )
+
+    def _try_create_gt_cloud_storage_driver(
+        self,
+    ) -> GriptapeCloudStorageDriver | None:
+        """Return one verified Cloud driver, or select the existing fallbacks.
+
+        Missing authentication, an unavailable default bucket, or an inaccessible
+        configured bucket means Cloud transport is not ready for this run.  The
+        caller keeps images on the bounded Base64 JSON path and videos on their
+        already-supported public URL / asset / explicitly selected TOS path.
+        """
+
+        try:
+            return self._create_gt_cloud_storage_driver()
+        except Exception as exc:
+            logger.info(
+                "%s Griptape Cloud media transport is unavailable; using existing "
+                "media fallbacks (%s).",
+                self.name,
+                type(exc).__name__,
+            )
+            return None
 
     @staticmethod
     def _normalize_tos_endpoint(value: str) -> str:
@@ -7230,6 +7302,132 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 f"Local reference video cannot be read: {path}"
             ) from exc
 
+    @classmethod
+    def _require_cloud_https_url(cls, value: Any, *, label: str) -> str:
+        text = str(value or "").strip()
+        parsed = urlparse(text)
+        if (
+            parsed.scheme.lower() != "https"
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.fragment
+            or cls._is_non_public_http_url(text)
+        ):
+            raise RuntimeError(
+                f"Griptape Cloud returned an invalid public HTTPS {label} URL."
+            )
+        return text
+
+    @classmethod
+    def _read_image_for_cloud_upload(
+        cls,
+        value: Any,
+    ) -> tuple[bytes, str, str]:
+        """Read one bounded image candidate without changing saved parameters."""
+
+        reference = cls._coerce_reference_value(value)
+        text = str(reference).strip()
+        if text.startswith("data:"):
+            normalized = cls._validate_data_uri("image", text)
+            match = _DATA_URI_PATTERN.fullmatch(normalized)
+            if match is None:  # _validate_data_uri already guarantees this.
+                raise ValueError("Image data URI is invalid.")
+            mime = match.group("mime").lower()
+            content = base64.b64decode(match.group("data"), validate=True)
+            suffix = next(
+                (
+                    candidate
+                    for candidate, candidate_mime in IMAGE_MIME_BY_SUFFIX.items()
+                    if candidate_mime == mime
+                ),
+                ".img",
+            )
+            return content, mime, f"reference-image{suffix}"
+
+        try:
+            path = Path(File(text).resolve())
+        except FileLoadError as exc:
+            raise ValueError(
+                "Could not resolve image reference in the active Griptape project: "
+                f"{text}"
+            ) from exc
+        if not path.is_file():
+            raise ValueError(
+                "Image reference file does not exist in the active Griptape "
+                f"project: {text}"
+            )
+        mime = IMAGE_MIME_BY_SUFFIX.get(path.suffix.lower())
+        if mime is None:
+            raise ValueError(f"Unsupported image file type: {path.name}")
+        size = path.stat().st_size
+        if size <= 0:
+            raise ValueError(f"Image reference is empty: {path}")
+        if size >= MAX_IMAGE_BYTES:
+            raise ValueError(
+                f"Image reference must be smaller than "
+                f"{MAX_IMAGE_BYTES // (1024 * 1024)} MB: {path.name}"
+            )
+        try:
+            return path.read_bytes(), mime, path.name
+        except OSError as exc:
+            raise ValueError(f"Image reference cannot be read: {path}") from exc
+
+    def _upload_image_to_griptape_cloud(
+        self,
+        driver: GriptapeCloudStorageDriver,
+        value: Any,
+    ) -> str:
+        content, _mime, filename = self._read_image_for_cloud_upload(value)
+        remote_path = Path("artifact_url_storage") / uuid4().hex / filename
+        self._temporary_video_uploads.append((driver, remote_path))
+
+        create_upload = getattr(driver, "create_signed_upload_url", None)
+        create_download = getattr(driver, "create_signed_download_url", None)
+        if not callable(create_upload) or not callable(create_download):
+            public_url = driver.upload_file(
+                path=remote_path,
+                file_content=content,
+                timeout=120.0,
+            )
+            return self._require_cloud_https_url(
+                public_url,
+                label="download",
+            )
+
+        upload = create_upload(remote_path)
+        if not isinstance(upload, dict):
+            raise RuntimeError(
+                "Griptape Cloud returned an invalid signed upload contract."
+            )
+        method = str(upload.get("method") or "PUT").upper()
+        upload_url = self._require_cloud_https_url(
+            upload.get("url"),
+            label="upload",
+        )
+        if method not in {"PUT", "POST"}:
+            raise RuntimeError("Griptape Cloud returned an invalid upload method.")
+        headers = {
+            str(key): str(header_value)
+            for key, header_value in dict(upload.get("headers") or {}).items()
+            if str(key).lower() != "content-length"
+        }
+        headers["Content-Length"] = str(len(content))
+        response = httpx.request(
+            method,
+            upload_url,
+            content=content,
+            headers=headers,
+            timeout=120.0,
+            follow_redirects=False,
+            trust_env=False,
+        )
+        response.raise_for_status()
+        return self._require_cloud_https_url(
+            create_download(remote_path),
+            label="download",
+        )
+
     def _upload_local_video_to_griptape_cloud(
         self,
         driver: GriptapeCloudStorageDriver,
@@ -7249,12 +7447,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         create_download = getattr(driver, "create_signed_download_url", None)
         if not callable(create_upload) or not callable(create_download):
             _path, content = self._read_local_video_for_upload(str(local_path))
-            return str(
+            return self._require_cloud_https_url(
                 driver.upload_file(
                     path=remote_path,
                     file_content=content,
                     timeout=120.0,
-                )
+                ),
+                label="download",
             )
 
         upload = create_upload(remote_path)
@@ -7263,29 +7462,34 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "Cloud storage returned an invalid signed upload contract."
             )
         method = str(upload.get("method") or "PUT").upper()
-        upload_url = str(upload.get("url") or "").strip()
-        if method not in {"PUT", "POST"} or not upload_url.startswith("https://"):
+        upload_url = self._require_cloud_https_url(
+            upload.get("url"),
+            label="upload",
+        )
+        if method not in {"PUT", "POST"}:
             raise RuntimeError(
-                "Cloud storage returned an invalid signed HTTPS upload URL."
+                "Cloud storage returned an invalid signed upload method."
             )
         headers = {
             str(key): str(value)
             for key, value in dict(upload.get("headers") or {}).items()
+            if str(key).lower() != "content-length"
         }
-        if not any(key.lower() == "content-length" for key in headers):
-            headers["Content-Length"] = str(local_path.stat().st_size)
+        headers["Content-Length"] = str(local_path.stat().st_size)
         response = httpx.request(
             method,
             upload_url,
             content=self._iter_local_video_upload_chunks(local_path),
             headers=headers,
             timeout=120.0,
+            follow_redirects=False,
+            trust_env=False,
         )
         response.raise_for_status()
-        public_url = str(create_download(remote_path) or "").strip()
-        if not public_url:
-            raise RuntimeError("Cloud storage returned an empty signed download URL.")
-        return public_url
+        return self._require_cloud_https_url(
+            create_download(remote_path),
+            label="download",
+        )
 
     def _upload_local_video_to_tos(
         self,
@@ -7333,10 +7537,63 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
         return signed_url
 
+    def _prepare_image_references_for_run(
+        self,
+        params: dict[str, Any],
+        cloud_driver: Any = _CLOUD_DRIVER_UNSET,
+    ) -> tuple[dict[str, Any], Any]:
+        """Prefer Cloud HTTPS for embeddable images, preserving Base64 fallback."""
+
+        values = [
+            params.get("first_frame"),
+            params.get("last_frame"),
+            *(params.get("reference_images") or []),
+        ]
+        candidates: list[Any] = []
+        for value in values:
+            if not self._has_reference_value(value):
+                continue
+            text = str(self._coerce_reference_value(value)).strip()
+            if text.startswith(("http://", "https://", "asset://")):
+                continue
+            candidates.append(value)
+
+        if not candidates:
+            return dict(params), cloud_driver
+        if cloud_driver is _CLOUD_DRIVER_UNSET:
+            cloud_driver = self._try_create_gt_cloud_storage_driver()
+        if cloud_driver is None:
+            # `_build_broker_payload` retains the bounded canonical Base64 JSON
+            # conversion for local/data-URI image references.
+            return dict(params), None
+
+        def prepare(value: Any) -> Any:
+            if not self._has_reference_value(value):
+                return value
+            text = str(self._coerce_reference_value(value)).strip()
+            if text.startswith(("http://", "https://", "asset://")):
+                return value
+            return self._upload_image_to_griptape_cloud(cloud_driver, value)
+
+        updated = dict(params)
+        updated["first_frame"] = prepare(params.get("first_frame"))
+        updated["last_frame"] = prepare(params.get("last_frame"))
+        updated["reference_images"] = [
+            prepare(value) for value in params.get("reference_images") or []
+        ]
+        return updated, cloud_driver
+
     def _prepare_video_references_for_run(
-        self, params: dict[str, Any]
+        self,
+        params: dict[str, Any],
+        cloud_driver: Any = _CLOUD_DRIVER_UNSET,
     ) -> dict[str, Any]:
-        """Publish only local video inputs without changing their selected order."""
+        """Prepare image/video transport without changing selected media order."""
+
+        params, cloud_driver = self._prepare_image_references_for_run(
+            params,
+            cloud_driver,
+        )
         video_slots = params.get("video_reference_slots") or []
         if any(self._has_reference_value(value) for value in video_slots):
             references = [
@@ -7352,7 +7609,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             ]
 
         prepared: list[str] = []
-        driver: GriptapeCloudStorageDriver | None = None
         tos_context: tuple[Any, Any, str] | None = None
         for _parameter_name, value, _scratch_parameter in references:
             reference = self._coerce_reference_value(value)
@@ -7365,30 +7621,38 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 continue
 
             try:
+                local_path = self._resolve_local_video_path(text)
                 upload_service = params.get(
                     "local_video_upload_service", LOCAL_VIDEO_UPLOAD_GRIPTAPE
                 )
-                if upload_service == LOCAL_VIDEO_UPLOAD_TOS:
-                    local_path = self._resolve_local_video_path(text)
+                if cloud_driver is _CLOUD_DRIVER_UNSET:
+                    cloud_driver = self._try_create_gt_cloud_storage_driver()
+                if cloud_driver is not None:
+                    remote_path = (
+                        Path("artifact_url_storage")
+                        / uuid4().hex
+                        / local_path.name
+                    )
+                    self._temporary_video_uploads.append(
+                        (cloud_driver, remote_path)
+                    )
+                    public_url = self._upload_local_video_to_griptape_cloud(
+                        cloud_driver,
+                        local_path,
+                        remote_path,
+                    )
+                elif upload_service == LOCAL_VIDEO_UPLOAD_TOS:
                     if tos_context is None:
                         tos_context = self._create_tos_storage_context(params)
                     public_url = self._upload_local_video_to_tos(
                         local_path, params, tos_context
                     )
                 else:
-                    local_path = self._resolve_local_video_path(text)
-                    if driver is None:
-                        driver = self._create_gt_cloud_storage_driver()
-                    remote_path = (
-                        Path("artifact_url_storage")
-                        / uuid4().hex
-                        / local_path.name
-                    )
-                    self._temporary_video_uploads.append((driver, remote_path))
-                    public_url = self._upload_local_video_to_griptape_cloud(
-                        driver,
-                        local_path,
-                        remote_path,
+                    raise RuntimeError(
+                        "Griptape Cloud authentication or bucket access is not "
+                        "available for this local video. Use a public HTTPS URL, "
+                        "a Volcengine asset:// reference, or select a configured "
+                        "Volcengine TOS transport."
                     )
             except LocalReferenceVideoError:
                 # Preserve the actionable local/project-path diagnosis. The
@@ -7397,7 +7661,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 raise
             except Exception as exc:
                 raise RuntimeError(
-                    "Local reference-video publishing failed through the selected "
+                    "Local reference-video publishing failed through an allowed "
                     "upload service. Check its credentials, bucket, region, and "
                     "endpoint, then retry. Alternatively provide a public https:// "
                     "URL or Volcengine asset:// reference."
@@ -7831,7 +8095,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
         if isinstance(value, str):
             redacted = value.replace(secret, "[REDACTED]") if secret else value
-            return _BEARER_PATTERN.sub("Bearer [REDACTED]", redacted)
+            redacted = _BEARER_PATTERN.sub("Bearer [REDACTED]", redacted)
+            # httpx status errors include the complete request URL. Signed
+            # Cloud/TOS URLs carry credentials in their query string, so retain
+            # only the non-secret origin/path in every public error message.
+            return _SIGNED_URL_QUERY_PATTERN.sub(
+                r"\g<base>?[REDACTED]",
+                redacted,
+            )
         return value
 
     @classmethod

@@ -1,5 +1,36 @@
 # Changelog
 
+## `v0.7.01` — 2026-08-26
+
+- Published the team release with technical SemVer `0.7.1`.
+- Restored Look Reference Target as an independent per-shot Prompt choice.
+  Named image targets, blank, Global Look, and Camera / Composition now survive
+  normalization, Asset refresh, dormant restore, and Agent validation; only an
+  explicit Global Look choice expands look attributes scene-wide. Each source
+  can therefore retain a different Render Look, Lighting, or Camera /
+  Composition target. Main/Sub Type still limits transferable attributes and
+  Look sources retain no marker, identity, or scene/background-content authority.
+- Added one lazy Seedance media-transport decision per new render. A valid
+  Griptape Cloud login/API key plus an accessible explicit or account-default
+  bucket converts local/Base64 image inputs and local videos to signed public
+  HTTPS references. Without that Cloud contract, images retain the existing
+  bounded Base64 JSON path and videos retain public HTTPS, `asset://`, or the
+  explicitly configured Volcengine TOS fallback. Saved media values are not
+  rewritten, temporary Cloud objects keep the established cleanup lifecycle,
+  credential-bearing signed URLs remain redacted from persisted/public state,
+  and official signed-in Griptape license credentials are now recognized.
+- Repaired VideoPicker output-choice feedback after a completed Maya READ.
+  Original, Mask, Depth, and Motion Guide now recompute only the Generate
+  Playblast button immediately from the optimistic checkbox state while command
+  submission locks remain authoritative. The four Object pattern swatches paint
+  10% larger through a non-interactive visual layer without changing their
+  established 20px hitbox, palette layout, marker identity, or Maya render.
+- Expanded Python and JavaScript regressions for per-target Look ownership,
+  persistence and round-trip normalization, Cloud transport fallback and URL
+  redaction, and Depth/Motion Guide interaction stability. Updated the real
+  Standard Agent Host fixture to seed the router-owned `SHOT_PROMPT_IN` source
+  contract used by production execution.
+
 ## `v0.6.55` — 2026-08-25
 
 - Promoted the fully validated `v0.6.54` local-test line as the replacement

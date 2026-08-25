@@ -292,6 +292,11 @@ assert.match(
   /hmbApplyPickerOutputChoicesToDom\([\s\S]*?schedulePickerStatePublicationAfterPaint\([\s\S]*?commitOptions:\s*\{\s*suppressMatchingEcho:\s*true\s*\}/,
   "Output toggles must paint locally, then coalesce one exact-echo-suppressed publication.",
 );
+assert.match(
+  outputChoiceHandler,
+  /const outputAvailability = pickerButtonAvailability\([\s\S]*?next,[\s\S]*?liveDraftPath[\s\S]*?playblastButton\.disabled = pickerLocalInteractionLocked\(next\)[\s\S]*?\|\| !outputAvailability\.playblastEnabled/,
+  "Every output toggle must immediately update only Generate Playblast while preserving the pending-operation lock.",
+);
 assert.doesNotMatch(
   `${outputChoiceHandler}\n${originalToggleHandler}`,
   /dispatchCommand\s*\(/,
@@ -363,6 +368,45 @@ assert.match(
   /schedulePickerStatePublicationAfterPaint\(next,[\s\S]*?commitOptions:\s*\{\s*suppressMatchingEcho:\s*true\s*\}/,
   "Depth changes must be coalesced local state commits whose exact echo performs no full morph.",
 );
+
+const readyOutputChoiceState = {
+  status: "READY",
+  scene_stage: "OUTLINER_READY",
+  scene_path: "C:/shots/shot01.ma",
+  native_read_ready: true,
+  cameras: ["|camera1"],
+  selected_camera: "|camera1",
+  start_frame: 101,
+  end_frame: 160,
+  source_fps: 24,
+  output_fps: 24,
+  output_width: 1280,
+  output_height: 720,
+  original_enabled: false,
+  mask_enabled: false,
+  depth_enabled: false,
+  motion_guide_enabled: false,
+};
+assert.equal(
+  picker.pickerButtonAvailability(readyOutputChoiceState, readyOutputChoiceState.scene_path).playblastEnabled,
+  false,
+  "Generate remains disabled when all four outputs are off.",
+);
+for (const outputField of [
+  "original_enabled",
+  "mask_enabled",
+  "depth_enabled",
+  "motion_guide_enabled",
+]) {
+  assert.equal(
+    picker.pickerButtonAvailability(
+      { ...readyOutputChoiceState, [outputField]: true },
+      readyOutputChoiceState.scene_path,
+    ).playblastEnabled,
+    true,
+    `${outputField} alone must enable Generate immediately after a completed Maya READ.`,
+  );
+}
 
 const snapshotHandler = widgetSource.slice(
   widgetSource.indexOf('on(container.querySelector("#create-snapshot")'),

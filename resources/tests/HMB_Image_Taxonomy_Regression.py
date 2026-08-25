@@ -126,12 +126,14 @@ assert color_mood_package != render_look_package
 assert color_mood_job["images"][0]["source_scope"] == "Color mood only"
 assert render_look_job["images"][0]["source_scope"] == "Render look only"
 
-# Agent fail-closes exact taxonomy and scene/camera-level Look ownership.
+# Agent fail-closes exact taxonomy and Look-only relationship/binding authority,
+# while Target remains an independent Prompt-authored address. Blank, named,
+# global, and camera/composition targets are all valid typed Look targets.
 full_look_package, full_look_job = packages_by_taxonomy[
     ("Look Reference", "Color / Look / Lighting")
 ]
 full_look_record = full_look_job["images"][0]
-assert full_look_record["target_id"] == "Global Look"
+assert full_look_record["target_id"] == ""
 assert full_look_record["bindings"] == []
 assert full_look_record["relationship_targets"] == []
 
@@ -143,19 +145,42 @@ expect_rejected(
     )
 )
 
-wrong_target_job = copy.deepcopy(full_look_job)
-wrong_target_job["images"][0]["target_id"] = "Hero_A"
-expect_rejected(
-    lambda: agent._assert_public_job_data_contract(
-        replace_job(full_look_package, wrong_target_job)
+for authored_target in ("", "Hero_A", "Global Look", "Camera / Composition"):
+    targeted_job = copy.deepcopy(full_look_job)
+    targeted_job["images"][0]["target_id"] = authored_target
+    validated_targeted_job = agent._assert_public_job_data_contract(
+        replace_job(full_look_package, targeted_job)
     )
-)
+    assert validated_targeted_job["images"][0]["target_id"] == authored_target
 
 wrong_relationship_job = copy.deepcopy(full_look_job)
 wrong_relationship_job["images"][0]["relationship_targets"] = ["Hero_A"]
 expect_rejected(
     lambda: agent._assert_public_job_data_contract(
         replace_job(full_look_package, wrong_relationship_job)
+    )
+)
+
+wrong_binding_job = copy.deepcopy(full_look_job)
+wrong_binding_job["images"][0]["bindings"] = [{
+    "video": "@video1",
+    "marker_color": "",
+    "target_scope": "All color + look + lighting functions",
+}]
+wrong_binding_job["videos"] = [{
+    "video": "@video1",
+    "label": "valid-motion-reference.mp4",
+    "source_type": "Motion Reference",
+    "custom_source_type": "",
+    "control_role": "Local Motion Detail Only",
+    "custom_control_role": "",
+    "control_role_explicit": True,
+    "keep_out": "",
+    "identity": {},
+}]
+expect_rejected(
+    lambda: agent._assert_public_job_data_contract(
+        replace_job(full_look_package, wrong_binding_job)
     )
 )
 
@@ -235,22 +260,64 @@ look.update({
 })
 prompt._normalize_image_binding_fields(look)
 assert look["color_picks"] == [""]
-assert look["owner"] == "Global Look"
+assert look["owner"] == "Former Character Target"
 assert look["interaction_targets"] == [""]
 assert prompt._image_binding_entries(look) == []
 assert common.image_color_pick_choices_for_taxonomy("Look Reference", "Render Look") == []
 
-for camera_subtype in ("Scale", "Composition", "Scale / Composition"):
-    camera_look = prompt._default_image_item(1)
-    camera_look.update({
+# A Target survives repeated normalization and Render -> Lighting -> Composition
+# changes. Only the canonical wire source/scope changes with the Sub Type.
+transitioning_look = prompt._default_image_item(1)
+transitioning_look.update({
+    "present": True,
+    "label": "jett-look-reference.png",
+    "image_main_type": "Look Reference",
+    "owner": "Jett_11",
+})
+for look_subtype in ("Render Look", "Lighting / Atmosphere", "Composition"):
+    transitioning_look["image_sub_type"] = look_subtype
+    prompt._normalize_image_binding_fields(transitioning_look)
+    assert transitioning_look["owner"] == "Jett_11"
+    assert (
+        transitioning_look["source_type"],
+        transitioning_look["scope"],
+    ) == prompt.IMAGE_TAXONOMY_WIRE_MAP[("Look Reference", look_subtype)]
+
+# Multiple Look rows may address different subjects with independent look,
+# lighting, scale, and composition decisions in the same public Agent job.
+targeted_look_state = prompt._default_widget_state()
+targeted_look_state["images"] = []
+targeted_look_subtypes = prompt.image_sub_type_choices_for_main_type(
+    "Look Reference"
+)
+expected_target_ids = []
+for index, look_subtype in enumerate(targeted_look_subtypes, start=1):
+    target_id = f"Look_Target_{index}"
+    targeted_item = prompt._default_image_item(index)
+    targeted_item.update({
         "present": True,
-        "label": "camera-reference.png",
+        "label": f"targeted-look-{index}.png",
         "image_main_type": "Look Reference",
-        "image_sub_type": camera_subtype,
-        "owner": "Former Global Look",
+        "image_sub_type": look_subtype,
+        "owner": target_id,
     })
-    prompt._normalize_image_binding_fields(camera_look)
-    assert camera_look["owner"] == "Camera / Composition"
+    targeted_look_state["images"].append(
+        prompt._normalize_image_binding_fields(targeted_item)
+    )
+    expected_target_ids.append(target_id)
+
+targeted_look_visible = prompt._build_prompt_package(targeted_look_state)
+targeted_look_job = agent._assert_public_job_data_contract(
+    prompt._build_data_only_prompt_package(targeted_look_state)
+)
+assert [record["target_id"] for record in targeted_look_job["images"]] == (
+    expected_target_ids
+)
+assert all(record["bindings"] == [] for record in targeted_look_job["images"])
+assert "across every visible" not in targeted_look_visible
+assert "scene-wide" not in targeted_look_visible
+assert "only on the selected target" in targeted_look_visible
+assert "scene/background content" in targeted_look_visible
 
 # Registration candidates are internal provenance. The public job and Agent
 # contract must receive only the effective Prompt Look taxonomy.
@@ -270,6 +337,7 @@ verified_look_override.update(
         "asset_image_sub_type_candidate": "Color Mood",
         "image_main_type": "Look Reference",
         "image_sub_type": "Scale",
+        "owner": "Jett_11",
     }
 )
 prompt._normalize_image_binding_fields(verified_look_override)
@@ -283,7 +351,7 @@ assert verified_look_record["image_main_type"] == "Look Reference"
 assert verified_look_record["image_sub_type"] == "Scale"
 assert verified_look_record["source_type"] == "Scale / Composition Reference"
 assert verified_look_record["source_scope"] == "Scale only"
-assert verified_look_record["target_id"] == "Camera / Composition"
+assert verified_look_record["target_id"] == "Jett_11"
 assert verified_look_record["bindings"] == []
 assert "asset_image_sub_type_candidate" not in verified_look_record
 
@@ -296,7 +364,7 @@ for slot, label, main_type, sub_type, owner in (
     (2, "Character_B.png", "Character", "Full Appearance", "Character_B"),
     (3, "Main_Background.png", "Environment / Background", "Main Background", "Main Background"),
     (4, "Sky.png", "Environment / Background", "Sky / Exterior", "Sky"),
-    (5, "Master_Look.png", "Look Reference", "Color / Look / Lighting", ""),
+    (5, "Master_Look.png", "Look Reference", "Color / Look / Lighting", "Global Look"),
 ):
     example_item = prompt._default_image_item(slot)
     example_item.update({
@@ -321,12 +389,9 @@ assert example_job["images"][4]["source_scope"] == (
     "All color + look + lighting functions"
 )
 assert example_job["images"][4]["target_id"] == "Global Look"
-assert "across every visible character, prop, sky, and environment source" in (
-    example_visible
-)
-assert "preserving intrinsic identity, color, pattern, and material" in (
-    example_visible
-)
+assert "scene-wide" in example_visible
+assert "across every visible" not in example_visible
+assert "preserve intrinsic identity, color, pattern, and material" in example_visible
 
 # Server records use only the new authoring fields. Legacy record values are
 # never treated as migration input.
@@ -349,5 +414,5 @@ assert server_look["color_pick_candidates"] == []
 
 print(
     "HMB image taxonomy regression: PASS "
-    "(26 exact Agent projections, fail-closed Look authority, five-image relight)"
+    "(26 exact Agent projections, editable Look targets, five-image relight)"
 )

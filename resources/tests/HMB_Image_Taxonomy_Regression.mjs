@@ -71,7 +71,7 @@ assert.deepEqual(backgroundProp.color_picks, ["Mint"]);
 const look = {
   image_main_type: "Look Reference",
   image_sub_type: "Render Look",
-  owner: "Former Character Target",
+  owner: "Jett_11",
   interaction_targets: ["Hero"],
   color_picks: ["Red", "Mint"],
 };
@@ -79,9 +79,36 @@ normalizeImageTaxonomy(look);
 assert.equal(look.source_type, "Color / Look Reference");
 assert.equal(look.scope, "Render look only");
 assert.deepEqual(look.color_picks, [""]);
-assert.equal(look.owner, "Global Look");
+assert.equal(look.owner, "Jett_11");
 assert.deepEqual(look.interaction_targets, [""]);
 assert.deepEqual(colorPickChoicesForImageTaxonomy("Look Reference", "Render Look"), []);
+
+// Target is independent from the transferable Look attributes. Repeated
+// Render -> Lighting -> Composition changes rebuild only the wire pair.
+for (const [subType, expectedWire] of [
+  ["Render Look", ["Color / Look Reference", "Render look only"]],
+  ["Lighting / Atmosphere", ["Lighting / Atmosphere Reference", "Lighting mood only"]],
+  ["Composition", ["Scale / Composition Reference", "Composition only"]],
+]) {
+  look.image_sub_type = subType;
+  normalizeImageTaxonomy(look);
+  assert.equal(look.owner, "Jett_11");
+  assert.deepEqual([look.source_type, look.scope], expectedWire);
+}
+
+const lookRoundTrip = normalizeState(JSON.parse(JSON.stringify({
+  image_taxonomy: {
+    image_main_type_choices: mainTypes,
+    image_sub_type_choices: subTypes,
+    actor_color_pick_choices: ["Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink"],
+    object_color_pick_choices: ["Sky Blue", "Mint", "Beige", "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern"],
+  },
+  images: [look],
+})));
+assert.equal(lookRoundTrip.images[0].image_sub_type, "Composition");
+assert.equal(lookRoundTrip.images[0].source_type, "Scale / Composition Reference");
+assert.equal(lookRoundTrip.images[0].scope, "Composition only");
+assert.equal(lookRoundTrip.images[0].owner, "Jett_11");
 assert.ok(!mainTypes.includes("Scene / Look Reference"));
 assert.ok(!mainTypes.includes("Character Appearance"));
 
