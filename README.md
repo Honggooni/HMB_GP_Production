@@ -1,6 +1,6 @@
 # HMB GP Production
 
-Current team release: `v0.6.51`.
+Current team release: `v0.6.53`.
 
 Odd patch versions are team releases; even patch versions are local test builds
 and must not be published or distributed until promoted to the next odd version.

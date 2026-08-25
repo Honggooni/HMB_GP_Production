@@ -188,16 +188,23 @@ assert cue["emitter"] == {
 assert agent._valid_exact_emitter({"marker_color": "Red"}) is False
 assert agent._valid_exact_emitter(cue["emitter"]) is True
 
-secret = (
-    "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima "
-    "mike november oscar papa quebec romeo sierra tango uniform victor whiskey "
-    "xray yankee zulu alpha bravo charlie delta echo foxtrot golf hotel india"
+state_wrapper = {"agent": {"tasks": [], "rulesets": []}}
+long_generator_text = (
+    "Preserve face identity, body proportions, character design, stylization, "
+    "rendering medium, surface and material treatment, intrinsic color, and "
+    "pattern while integrating the subject into the shared environmental light, "
+    "shadow, reflection, exposure, atmosphere, camera, framing, and occlusion."
 )
-assert len(secret) >= agent._SANITIZER_SECRET_WINDOW_CHARS
-for exposed in (secret, json.dumps(secret), json.dumps(json.dumps(secret))):
-    # Text-only raw policy disclosure is owned by the rolling-window detector;
-    # the state-leak detector remains reserved for structured Agent wrappers.
-    assert agent._contains_raw_policy_material(exposed, secret, secret)
+assert len(long_generator_text) > 160
+assert not agent._contains_public_output_state_leak(long_generator_text, "", "")
+for exposed in (
+    state_wrapper,
+    json.dumps(state_wrapper),
+    json.dumps(json.dumps(state_wrapper)),
+):
+    # FINAL TEXT no longer uses a fixed-length policy-text threshold. Structured
+    # Agent/runtime state remains blocked through bounded JSON decoding.
+    assert agent._contains_public_output_state_leak(exposed, "", "")
 
 # Structured-connector catch-all text and technical JSON never enter USER DATA.
 connector_state = prompt_library._default_widget_state()
@@ -287,5 +294,6 @@ assert prompt_library._normalize_state(range_state)["images"][0][
 
 print(
     "HMB data-only Prompt and protected Agent output regression: PASS "
-    "(closed schema / no policy prose / path redaction / exact emitter / encoded leak)"
+    "(closed schema / no policy prose / path redaction / exact emitter / "
+    "encoded Agent-state isolation)"
 )

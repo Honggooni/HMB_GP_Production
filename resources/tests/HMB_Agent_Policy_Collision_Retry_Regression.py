@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from pathlib import Path
 import sys
 from types import MethodType
@@ -12,45 +13,61 @@ sys.path.insert(0, str(ROOT))
 import HMBAgentLibrary as agent  # noqa: E402
 
 
-POLICY = (
-    "The stylized production source remains authoritative for character identity, "
-    "body proportions, character design, rendering medium, surface treatment, "
-    "facial proportions, scene composition, and the intended animation language. "
-    "Motion references provide timing, pose, camera, framing, visibility, and "
-    "occlusion only, without importing realistic anatomy or photographic skin. "
-    "Every character must share the scene lighting and shadow space continuously."
+POLICY = """BEHAVIOR 1
+
+CHARACTER VISUAL AUTHORITY
+
+Appearance-bearing character images own face identity, facial and body
+proportions, character design, stylization, rendering medium, intrinsic
+surface and material treatment, intrinsic color, and pattern. The main
+background remains the sole scene-content authority while the look reference
+transfers only rendering-language attributes.
+"""
+BINDING = """BEHAVIOR 2
+
+SHOT SOURCE BINDING
+
+Preserve every assigned machine address and apply the verified shot sources.
+"""
+LONG_POLICY_DERIVED_RESULT = (
+    "Use @image1 as the appearance authority for face identity, facial and body "
+    "proportions, character design, stylization, rendering medium, intrinsic "
+    "surface and material treatment, intrinsic color, and pattern. Use @image3 "
+    "as the sole scene-content authority and transfer only the rendering language "
+    "from @image4. Integrate the characters into the same environmental lighting, "
+    "shadow, reflection, exposure, and atmospheric space without changing their "
+    "design. Preserve the requested camera, timing, framing, and occlusion."
 )
-BINDING = (
-    "For the current shot, preserve the assigned image identities and transfer only "
-    "the explicitly bound motion, timing, camera, framing, occlusion, lighting, and "
-    "look attributes. Never substitute scene content from a look-only reference."
-)
-NORMALIZED_POLICY = agent._normalized_leak_text(POLICY)
-assert len(NORMALIZED_POLICY) > agent._SANITIZER_SECRET_WINDOW_CHARS
-RAW_159 = NORMALIZED_POLICY[: agent._SANITIZER_SECRET_WINDOW_CHARS - 1]
-RAW_160 = NORMALIZED_POLICY[: agent._SANITIZER_SECRET_WINDOW_CHARS]
-SAFE_RESULT = (
-    "Use @image1 as the stylized character design and stage the subject in the "
-    "assigned scene with coherent animation lighting, grounded contact shadows, "
-    "and the requested camera timing."
-)
+assert len(agent._normalized_leak_text(LONG_POLICY_DERIVED_RESULT)) > 160
+VERBATIM_LONG_CLAUSE = agent._normalized_leak_text(POLICY).split(
+    "character visual authority", 1
+)[1].strip()
+assert len(VERBATIM_LONG_CLAUSE) > 160
 STATE_RESULT = '{"agent":{"tasks":[],"rulesets":[]}}'
+DOUBLE_JSON_STATE_RESULT = json.dumps(json.dumps({
+    "agent": {"tasks": [], "rulesets": []}
+}))
 
 
-assert not agent._contains_raw_policy_material(RAW_159, POLICY, BINDING)
-assert agent._contains_raw_policy_material(RAW_160, POLICY, BINDING)
+for removed_name in (
+    "_SANITIZER_SECRET_WINDOW_CHARS",
+    "_contains_raw_policy_material",
+    "_string_contains_raw_policy_window",
+    "_compose_policy_collision_retry_prompt",
+    "_POLICY_COLLISION_REWRITE_CONTRACT_HEADER",
+    "_POLICY_COLLISION_REWRITE_CONTRACT",
+    "_HMB_OUTPUT_REWRITE_FAILED_MESSAGE",
+):
+    assert not hasattr(agent, removed_name), removed_name
 
-base_runtime_prompt = "CURRENT SHOT FACTS\n@image1 character\n"
-retry_runtime_prompt = agent._compose_policy_collision_retry_prompt(
-    base_runtime_prompt
+# Private Agent/log ports still scrub exact internal headings.
+assert agent._contains_internal_rule_text(
+    "CHARACTER VISUAL AUTHORITY", POLICY, BINDING
 )
-assert retry_runtime_prompt.startswith(base_runtime_prompt.rstrip())
-assert retry_runtime_prompt.count(
-    agent._POLICY_COLLISION_REWRITE_CONTRACT_HEADER
-) == 1
-assert POLICY not in retry_runtime_prompt
-assert BINDING not in retry_runtime_prompt
-assert agent._PUBLIC_OUTPUT_BLOCKED not in retry_runtime_prompt
+private_payload = {"logs": "CHARACTER VISUAL AUTHORITY"}
+assert agent._replace_leaked_strings(
+    private_payload, POLICY, BINDING, agent._PUBLIC_OUTPUT_BLOCKED
+)["logs"] == agent._PUBLIC_OUTPUT_BLOCKED
 
 
 class PromptSource:
@@ -59,7 +76,7 @@ class PromptSource:
         return {}
 
 
-def drive(scripted_outputs: list[str]):
+def drive(scripted_output: str):
     node = object.__new__(agent.HMBAgentLibrary)
     node._hmb_node_deleted = False
     node._hmb_lifecycle_generation = 1
@@ -81,7 +98,6 @@ def drive(scripted_outputs: list[str]):
     node._hmb_native_calls_this_process = 0
     node.parameter_output_values = {"agent": {}, "output": "", "logs": ""}
 
-    prompts: list[str] = []
     visible_writes: list[str] = []
     native_calls = [0]
 
@@ -89,17 +105,15 @@ def drive(scripted_outputs: list[str]):
         self._hmb_verified_prompt_source_node = PromptSource()
 
     def native_once(self):
-        index = native_calls[0]
         native_calls[0] += 1
-        if index >= len(scripted_outputs):
-            raise AssertionError("Unexpected third native Agent attempt.")
-        prompts.append(str(self._hmb_runtime_prompt))
+        if native_calls[0] > 1:
+            raise AssertionError("A policy-text result must not trigger another Agent call.")
         self.parameter_output_values["agent"] = {}
-        self.parameter_output_values["output"] = scripted_outputs[index]
+        self.parameter_output_values["output"] = scripted_output
         self.parameter_output_values["logs"] = "private-attempt-log"
         if False:
             yield None
-        return f"native-result-{index + 1}"
+        return "native-result-1"
 
     def set_visible(self, value: str):
         visible_writes.append(value)
@@ -111,9 +125,7 @@ def drive(scripted_outputs: list[str]):
         set_visible(self, message)
 
     node._refresh_agent_shot_route = MethodType(refresh_route, node)
-    node._has_canonical_hmb_prompt_connection = MethodType(
-        lambda self: True, node
-    )
+    node._has_canonical_hmb_prompt_connection = MethodType(lambda self: True, node)
     node._assert_exact_prompt_shot_route = MethodType(
         lambda self: {"enabled": False}, node
     )
@@ -134,9 +146,7 @@ def drive(scripted_outputs: list[str]):
         lambda self, _name: "VISIBLE SHOT PROMPT", node
     )
     node._hide_hmb_policy_warning = MethodType(lambda self: None, node)
-    node._set_agent_execution_phase = MethodType(
-        lambda self, _phase: None, node
-    )
+    node._set_agent_execution_phase = MethodType(lambda self, _phase: None, node)
     node._run_native_agent_once = MethodType(native_once, node)
     node._set_visible_output = MethodType(set_visible, node)
     node._publish_hmb_execution_block = MethodType(publish_block, node)
@@ -148,22 +158,17 @@ def drive(scripted_outputs: list[str]):
     )
 
     iterator = node.process()
-    error = ""
     result = None
     try:
         next(iterator)
     except StopIteration as stop:
         result = stop.value
-    except RuntimeError as exc:
-        error = str(exc)
 
     return {
         "calls": native_calls[0],
-        "prompts": prompts,
         "visible": visible_writes,
         "output": node.parameter_output_values.get("output"),
         "result": result,
-        "error": error,
         "snapshot": dict(node._hmb_last_generator_snapshot),
     }
 
@@ -187,54 +192,39 @@ try:
     agent._assert_prompt_policy_identity_matches_signed_runtime = lambda: None
     agent._hmb._bootstrap_agent_policy_session = lambda: None
 
-    below_boundary = drive([f"Safe preface. {RAW_159}"])
-    assert below_boundary["calls"] == 1
-    assert below_boundary["output"] == f"Safe preface. {RAW_159}"
+    policy_text = drive(LONG_POLICY_DERIVED_RESULT)
+    assert policy_text["calls"] == 1
+    assert policy_text["output"] == LONG_POLICY_DERIVED_RESULT
+    assert policy_text["visible"] == [LONG_POLICY_DERIVED_RESULT]
 
-    rewritten = drive([RAW_160, SAFE_RESULT])
-    assert rewritten["calls"] == 2
-    assert rewritten["output"] == SAFE_RESULT
-    assert rewritten["visible"] == [SAFE_RESULT]
-    assert rewritten["error"] == ""
-    assert RAW_160 not in rewritten["prompts"][1]
-    assert POLICY not in rewritten["prompts"][1]
-    assert BINDING not in rewritten["prompts"][1]
-    assert rewritten["prompts"][1].count(
-        agent._POLICY_COLLISION_REWRITE_CONTRACT_HEADER
-    ) == 1
+    verbatim_clause = drive(VERBATIM_LONG_CLAUSE)
+    assert verbatim_clause["calls"] == 1
+    assert verbatim_clause["output"] == VERBATIM_LONG_CLAUSE
+    assert verbatim_clause["visible"] == [VERBATIM_LONG_CLAUSE]
 
-    repeated_collision = drive([RAW_160, RAW_160])
-    assert repeated_collision["calls"] == 2
-    assert repeated_collision["output"] == agent._HMB_OUTPUT_REWRITE_FAILED_MESSAGE
-    assert repeated_collision["error"] == agent._HMB_OUTPUT_REWRITE_FAILED_MESSAGE
-    assert RAW_160 not in repeated_collision["visible"]
+    complete_document = drive(f"{POLICY}\n{BINDING}")
+    assert complete_document["calls"] == 1
+    assert complete_document["output"] == agent._PUBLIC_OUTPUT_BLOCKED
 
-    state_only = drive([STATE_RESULT])
+    state_only = drive(STATE_RESULT)
     assert state_only["calls"] == 1
     assert state_only["output"] == agent._PUBLIC_OUTPUT_BLOCKED
 
-    state_after_collision = drive([RAW_160, STATE_RESULT])
-    assert state_after_collision["calls"] == 2
-    assert state_after_collision["output"] == agent._PUBLIC_OUTPUT_BLOCKED
-    assert state_after_collision["error"] == ""
-
-    normal = drive([SAFE_RESULT])
-    assert normal["calls"] == 1
-    assert normal["output"] == SAFE_RESULT
+    encoded_state = drive(DOUBLE_JSON_STATE_RESULT)
+    assert encoded_state["calls"] == 1
+    assert encoded_state["output"] == agent._PUBLIC_OUTPUT_BLOCKED
 finally:
     for name, value in originals.items():
         setattr(agent, name, value)
     agent._hmb._bootstrap_agent_policy_session = original_bootstrap
 
 
-native_guard_source = inspect.getsource(
-    agent.HMBAgentLibrary._run_native_agent_once
-)
-assert "_hmb_policy_rewrite_retry_authorized" in native_guard_source
-assert "_hmb_policy_rewrite_retry_consumed" in native_guard_source
-assert "call_index == 1" in native_guard_source
+native_guard_source = inspect.getsource(agent.HMBAgentLibrary._run_native_agent_once)
+assert "if call_index >= 1" in native_guard_source
+assert "rewrite_retry" not in native_guard_source
+assert "call_index == 1" not in native_guard_source
 
 print(
-    "HMB Agent policy-collision one-retry regression: PASS "
-    "(159/160 boundary, raw->clean, raw->raw, state isolation)"
+    "HMB Agent final-text state-boundary regression: PASS "
+    "(fixed policy threshold removed, complete documents/state still blocked)"
 )

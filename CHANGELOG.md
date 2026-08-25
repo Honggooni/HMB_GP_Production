@@ -1,5 +1,18 @@
 # Changelog
 
+## `v0.6.53` — 2026-08-25
+
+- Promoted the validated `v0.6.52` local-test line from the team-distributed
+  `v0.6.51` baseline.
+- Version policy: odd patch versions are team releases; even patch versions are
+  local test builds and are not distributed directly.
+- Retired the fixed 160-character policy-text publication criterion. FINAL TEXT
+  now accepts policy-required generator wording in one Agent call, while native
+  Agent/runtime-state structures and complete confidential document dumps remain
+  blocked, and private wrapper headings are still scrubbed. Removed the policy-
+  collision retry and its terminal rewrite failure path so valid policy-required
+  instructions cannot be rejected by repeated overlap.
+
 ## `v0.6.51` — 2026-08-25
 
 - Promoted the validated `v0.6.50` local-test line from the team-distributed

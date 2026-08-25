@@ -1,6 +1,6 @@
 [project]
 name = "hmb-gp-production"
-version = "0.6.51"
+version = "0.6.53"
 description = "HMB production libraries with authenticated Broker-managed Seedance generation"
 authors = [{name = "HMB Pipeline"}]
 requires-python = ">=3.12,<3.13"
