@@ -49,6 +49,15 @@ SCREEN_SPACE_PATTERN_CELL_DIVISOR = (
 )
 SCREEN_SPACE_PATTERN_MIN_CELL_PIXELS = 4
 POSITION_PATTERN_REPEATS = SCREEN_SPACE_PATTERN_LINEAR_SCALE_DIVISOR
+MAYA_WORLD_PATTERN_PROFILE = "hmb_maya_world_root_projection_v1"
+WORLD_PATTERN_BASE_CELL_WORLD_UNITS = 15.0
+WORLD_PATTERN_DENSITY_MULTIPLIER = 3.0
+WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS = (
+    WORLD_PATTERN_BASE_CELL_WORLD_UNITS / WORLD_PATTERN_DENSITY_MULTIPLIER
+)
+WORLD_PATTERN_MIN_CELL_WORLD_UNITS = 1.0e-3
+WORLD_PATTERN_MAX_CELL_WORLD_UNITS = 1.0e6
+WORLD_PATTERN_MAX_TEXTURE_REPEAT = 4096.0
 DEPTH_PLAYBLAST_PROFILE = "hmb_camera_space_depth_v7"
 # Production Depth uses the full 0.0..0.9 signal range.  The final 0.1 is
 # deliberately left unused so near-plane/bounds approximation cannot turn a
@@ -4115,6 +4124,381 @@ def _pattern_shader(name, pattern, texture_folder):
     return shading_group
 
 
+def _write_position_pattern_tile(path, size=512):
+    """Write one seamless Position Pattern cell for Maya's 2D repeat node."""
+    path = os.path.abspath(path)
+    folder = os.path.dirname(path)
+    if folder and not os.path.isdir(folder):
+        os.makedirs(folder)
+    raw = bytearray()
+    half = max(1, int(size) // 2)
+    line_width = max(1, int(size) // 128)
+    for y in range(int(size)):
+        raw.append(0)
+        for x in range(int(size)):
+            if abs(x - half) < line_width or abs(y - half) < line_width:
+                rgb = (255, 255, 255)
+            elif x < half and y < half:
+                rgb = (239, 65, 65)
+            elif x >= half and y < half:
+                rgb = (62, 205, 119)
+            elif x < half and y >= half:
+                rgb = (57, 104, 232)
+            else:
+                rgb = (246, 210, 49)
+            raw.extend(bytearray(rgb))
+    signature = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", int(size), int(size), 8, 2, 0, 0, 0)
+    payload = (
+        signature
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+        + _png_chunk(b"IEND", b"")
+    )
+    with open(path, "wb") as handle:
+        handle.write(payload)
+    return path
+
+
+def _world_pattern_projection_type(pattern):
+    if pattern == "floor_grid":
+        return "Planar", "XZ"
+    if pattern in ("direction_checker", "position_pattern", "sky_grid"):
+        return "TriPlanar", "XYZ"
+    raise RuntimeError("Unsupported Maya world pattern: {0}".format(pattern))
+
+
+def _world_pattern_cell_units(job):
+    value = float(
+        (job or {}).get("world_pattern_cell_units")
+        or WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS
+    )
+    if (
+        not math.isfinite(value)
+        or value < WORLD_PATTERN_MIN_CELL_WORLD_UNITS
+        or value > WORLD_PATTERN_MAX_CELL_WORLD_UNITS
+    ):
+        raise RuntimeError(
+            "Maya world pattern cell size is outside the supported range: "
+            "{0}".format(value)
+        )
+    return value
+
+
+def _world_pattern_root_transform(root):
+    if not cmds.objExists(root):
+        raise RuntimeError("Maya world pattern root does not exist: {0}".format(root))
+    node_type = _clean(cmds.nodeType(root))
+    if node_type in ("transform", "joint"):
+        return root
+    parents = cmds.listRelatives(root, parent=True, fullPath=True) or []
+    if not parents:
+        raise RuntimeError(
+            "Maya world pattern root has no transform parent: {0}".format(root)
+        )
+    return parents[0]
+
+
+def _world_pattern_bounds(shapes, cell_units):
+    try:
+        bounds = [
+            float(value)
+            for value in cmds.exactWorldBoundingBox(
+                list(shapes),
+                ignoreInvisible=False,
+            )
+        ]
+    except Exception as exc:
+        raise RuntimeError(
+            "Maya world pattern bounds could not be measured ({0}).".format(exc)
+        )
+    if len(bounds) != 6 or any(
+        (not math.isfinite(value)) or abs(value) > 1.0e12
+        for value in bounds
+    ):
+        raise RuntimeError("Maya world pattern bounds are invalid.")
+    width = max(bounds[3] - bounds[0], cell_units)
+    height = max(bounds[4] - bounds[1], cell_units)
+    depth = max(bounds[5] - bounds[2], cell_units)
+    center = [
+        (bounds[0] + bounds[3]) * 0.5,
+        (bounds[1] + bounds[4]) * 0.5,
+        (bounds[2] + bounds[5]) * 0.5,
+    ]
+    return bounds, center, width, height, depth
+
+
+def _world_pattern_texture(name, pattern, texture_folder):
+    place = cmds.shadingNode(
+        "place2dTexture",
+        asUtility=True,
+        name=name + "_Place2d",
+    )
+    if pattern == "direction_checker":
+        texture = cmds.shadingNode(
+            "checker",
+            asTexture=True,
+            name=name + "_Checker",
+        )
+        cmds.setAttr(texture + ".color1", 1.0, 1.0, 1.0, type="double3")
+        cmds.setAttr(texture + ".color2", 0.0, 0.0, 0.0, type="double3")
+        if cmds.objExists(texture + ".contrast"):
+            cmds.setAttr(texture + ".contrast", 1.0)
+    elif pattern in ("floor_grid", "sky_grid"):
+        texture = cmds.shadingNode(
+            "grid",
+            asTexture=True,
+            name=name + "_Grid",
+        )
+        if pattern == "floor_grid":
+            line_color = (1.0, 0.906, 0.592)
+            filler_color = (0.42, 0.33, 0.20)
+        else:
+            line_color = (0.75, 0.95, 1.0)
+            filler_color = (0.263, 0.608, 0.906)
+        cmds.setAttr(texture + ".lineColor", *line_color, type="double3")
+        cmds.setAttr(texture + ".fillerColor", *filler_color, type="double3")
+        if cmds.objExists(texture + ".uWidth"):
+            cmds.setAttr(texture + ".uWidth", 0.055)
+        if cmds.objExists(texture + ".vWidth"):
+            cmds.setAttr(texture + ".vWidth", 0.055)
+    elif pattern == "position_pattern":
+        texture_path = _write_position_pattern_tile(
+            os.path.join(texture_folder, name + "_position_pattern.png")
+        )
+        try:
+            texture = cmds.shadingNode(
+                "file",
+                asTexture=True,
+                isColorManaged=True,
+                name=name + "_File",
+            )
+        except TypeError:
+            texture = cmds.shadingNode(
+                "file",
+                asTexture=True,
+                name=name + "_File",
+            )
+        cmds.setAttr(texture + ".fileTextureName", texture_path, type="string")
+        try:
+            cmds.setAttr(texture + ".colorSpace", "Raw", type="string")
+        except Exception:
+            pass
+    else:
+        raise RuntimeError("Unsupported Maya world pattern: {0}".format(pattern))
+    _connect_2d_texture(place, texture)
+    return place, texture
+
+
+def _projected_surface_group(name, projection, transparency_source=""):
+    shader = cmds.shadingNode(
+        "surfaceShader",
+        asShader=True,
+        name=name + "_SurfaceShader",
+    )
+    shading_group = cmds.sets(
+        renderable=True,
+        noSurfaceShader=True,
+        empty=True,
+        name=shader + "SG",
+    )
+    cmds.connectAttr(
+        projection + ".outColor",
+        shader + ".outColor",
+        force=True,
+    )
+    if transparency_source:
+        _connect_authored_transparency(
+            transparency_source,
+            shader + ".outTransparency",
+        )
+    elif cmds.objExists(shader + ".outTransparency"):
+        cmds.setAttr(
+            shader + ".outTransparency",
+            0.0,
+            0.0,
+            0.0,
+            type="double3",
+        )
+    cmds.connectAttr(
+        shader + ".outColor",
+        shading_group + ".surfaceShader",
+        force=True,
+    )
+    return shading_group
+
+
+def _world_projected_pattern_group(
+    name,
+    pattern,
+    root,
+    shapes,
+    texture_folder,
+    cell_units,
+):
+    projection_type, projection_axis = _world_pattern_projection_type(pattern)
+    bounds, center, width, height, depth = _world_pattern_bounds(
+        shapes,
+        cell_units,
+    )
+    if projection_type == "Planar":
+        projector_scale = [width, depth, max(height * 2.0, cell_units)]
+        repeat_u = max(width / cell_units, 1.0)
+        repeat_v = max(depth / cell_units, 1.0)
+    else:
+        extent = max(width, height, depth, cell_units)
+        projector_scale = [extent, extent, extent]
+        repeat_u = repeat_v = max(extent / cell_units, 1.0)
+    if max(repeat_u, repeat_v) > WORLD_PATTERN_MAX_TEXTURE_REPEAT:
+        raise RuntimeError(
+            "Maya world pattern repeat exceeds the safe VP2 limit ({0:.3f} > "
+            "{1:.0f}). Check the scene linear unit or background scale.".format(
+                max(repeat_u, repeat_v),
+                WORLD_PATTERN_MAX_TEXTURE_REPEAT,
+            )
+        )
+
+    place2d, texture = _world_pattern_texture(
+        name,
+        pattern,
+        texture_folder,
+    )
+    cmds.setAttr(place2d + ".repeatU", repeat_u)
+    cmds.setAttr(place2d + ".repeatV", repeat_v)
+
+    projection = cmds.shadingNode(
+        "projection",
+        asTexture=True,
+        name=name + "_Projection",
+    )
+    enum_names = (
+        cmds.attributeQuery(
+            "projType",
+            node=projection,
+            listEnum=True,
+        )
+        or [""]
+    )[0].split(":")
+    if projection_type not in enum_names:
+        raise RuntimeError(
+            "Maya projection type is unavailable: {0}".format(projection_type)
+        )
+    cmds.setAttr(projection + ".projType", enum_names.index(projection_type))
+    if cmds.objExists(projection + ".fitType"):
+        cmds.setAttr(projection + ".fitType", 0)
+    if cmds.objExists(projection + ".wrap"):
+        cmds.setAttr(projection + ".wrap", True)
+    cmds.connectAttr(texture + ".outColor", projection + ".image", force=True)
+
+    root_transform = _world_pattern_root_transform(root)
+    anchor = cmds.createNode("transform", name=name + "_RootAnchor")
+    constraint_nodes = cmds.parentConstraint(
+        root_transform,
+        anchor,
+        maintainOffset=False,
+    ) or []
+    if not constraint_nodes:
+        raise RuntimeError(
+            "Maya world projector could not follow background root: {0}".format(
+                root_transform
+            )
+        )
+    scale_constraint_nodes = cmds.scaleConstraint(
+        root_transform,
+        anchor,
+        maintainOffset=False,
+    ) or []
+    if not scale_constraint_nodes:
+        raise RuntimeError(
+            "Maya world projector could not follow background scale: {0}".format(
+                root_transform
+            )
+        )
+    anchor_scale = cmds.getAttr(anchor + ".scale")[0]
+    if any(
+        (not math.isfinite(float(value))) or abs(float(value)) < 1.0e-8
+        for value in anchor_scale
+    ):
+        raise RuntimeError(
+            "Maya world pattern root has a zero or invalid scale: {0}".format(
+                root_transform
+            )
+        )
+    projector = cmds.shadingNode(
+        "place3dTexture",
+        asUtility=True,
+        name=name + "_Projector",
+    )
+    parented = cmds.parent(projector, anchor, relative=True) or []
+    if parented:
+        projector = parented[0]
+    cmds.xform(projector, worldSpace=True, translation=center)
+    if projection_type == "Planar":
+        # Maya's Planar image plane is XY/local-Z. +90 X makes it XZ/top-Y.
+        cmds.setAttr(projector + ".rotateX", 90.0)
+    # Follow root scale for placement/phase while cancelling it from the
+    # projector's world extent. This keeps each cell at 5 Maya world units,
+    # including under animated or non-uniform background-root scale.
+    scale_compensator = cmds.shadingNode(
+        "multiplyDivide",
+        asUtility=True,
+        name=name + "_WorldScaleCompensator",
+    )
+    cmds.setAttr(scale_compensator + ".operation", 2)
+    cmds.setAttr(
+        scale_compensator + ".input1",
+        projector_scale[0],
+        projector_scale[1],
+        projector_scale[2],
+        type="double3",
+    )
+    divisor_axes = (
+        ("scaleX", "scaleZ", "scaleY")
+        if projection_type == "Planar"
+        else ("scaleX", "scaleY", "scaleZ")
+    )
+    for destination_axis, source_axis in zip(("X", "Y", "Z"), divisor_axes):
+        cmds.connectAttr(
+            anchor + "." + source_axis,
+            scale_compensator + ".input2" + destination_axis,
+            force=True,
+        )
+        cmds.connectAttr(
+            scale_compensator + ".output" + destination_axis,
+            projector + ".scale" + destination_axis,
+            force=True,
+        )
+    cmds.connectAttr(
+        projector + ".worldInverseMatrix[0]",
+        projection + ".placementMatrix",
+        force=True,
+    )
+    shading_group = _projected_surface_group(name, projection)
+    return shading_group, {
+        "pattern": pattern,
+        "subject_root": root,
+        "root_transform": root_transform,
+        "projection_type": projection_type,
+        "projection_axis": projection_axis,
+        "cell_size_world_units": cell_units,
+        "baked_repeat_count": [repeat_u, repeat_v],
+        "projector_extent_world_units": projector_scale,
+        "world_bounds": bounds,
+        "texture_node": texture,
+        "texture_node_type": _clean(cmds.nodeType(texture)),
+        "projection_node": projection,
+        "projector_node": projector,
+        "anchor_node": anchor,
+        "constraint_node": constraint_nodes[0],
+        "scale_constraint_node": scale_constraint_nodes[0],
+        "scale_compensator_node": scale_compensator,
+        "root_scale_followed": True,
+        "world_cell_scale_compensated": True,
+        "camera_anchored": False,
+        "uv_dependent": False,
+    }, projection
+
+
 def _assign(shapes, shading_group):
     failures = []
     for shape in shapes:
@@ -4390,11 +4774,86 @@ def _assign_marker_group_preserving_cutouts(
     return warnings, opaque_shapes, verified_cutouts
 
 
+def _assign_world_pattern_preserving_cutouts(
+    shapes,
+    shared_group,
+    marker_name,
+    projection,
+    job,
+    variant_cache,
+):
+    """Assign projected color while preserving authored alpha-card cutouts."""
+    snapshot = _ensure_authored_cutout_snapshot(job, shapes)
+    opaque_shapes = []
+    cutout_by_source = {}
+    for shape in shapes:
+        long_names = _long_names([shape])
+        key = long_names[0] if long_names else shape
+        record = snapshot.get(key) or {"alpha_driven": False}
+        if not record.get("alpha_driven"):
+            opaque_shapes.append(shape)
+            continue
+        source_plug = _clean(record.get("source_plug"))
+        if not source_plug:
+            raise RuntimeError(
+                "Projected-pattern cutout has no authored outTransparency "
+                "source: {0}".format(shape)
+            )
+        cutout_by_source.setdefault(source_plug, []).append(shape)
+
+    warnings = _assign(opaque_shapes, shared_group) if opaque_shapes else []
+    failures = []
+    verified_cutouts = []
+    for source_plug in sorted(cutout_by_source):
+        cache_key = (projection, source_plug)
+        group = variant_cache.get(cache_key)
+        if not group:
+            group = _projected_surface_group(
+                "{0}_Cutout_{1}".format(
+                    marker_name,
+                    _cutout_variant_token(source_plug),
+                ),
+                projection,
+                transparency_source=source_plug,
+            )
+            variant_cache[cache_key] = group
+        source_shapes = sorted(cutout_by_source[source_plug])
+        source_failures = _assign(source_shapes, group)
+        if source_failures:
+            failures.extend(source_failures)
+        else:
+            verified_cutouts.extend(source_shapes)
+    if failures:
+        raise RuntimeError(
+            "Projected-pattern cutout assignment failed: {0}".format(
+                " | ".join(failures[:20])
+                + (
+                    " | and {0} more".format(len(failures) - 20)
+                    if len(failures) > 20
+                    else ""
+                )
+            )
+        )
+    return warnings, opaque_shapes, verified_cutouts
+
+
 def _apply_marker_shaders(bindings, job):
     warnings = []
     errors = []
     outline_mode = _character_outline_mode(job)
     screen_space_patterns = bool((job or {}).get("screen_space_patterns"))
+    world_space_patterns = bool((job or {}).get("world_space_patterns"))
+    if screen_space_patterns and world_space_patterns:
+        raise RuntimeError(
+            "Maya world patterns and legacy screen-space fallback cannot be "
+            "enabled together."
+        )
+    world_cell_units = _world_pattern_cell_units(job)
+    texture_folder = os.path.join(
+        os.path.dirname(os.path.abspath((job or {}).get("result_path") or os.getcwd())),
+        "world_pattern_textures",
+    )
+    world_pattern_records = []
     require_full_smooth_geometry = bool(
         (job or {}).get("require_full_smooth_geometry")
     )
@@ -4457,10 +4916,46 @@ def _apply_marker_shaders(bindings, job):
                 # explicit legacy outline; cutout cards retain alpha only.
                 character_outline_shapes.extend(opaque_shapes)
         elif color in BACKGROUND_MARKERS and pattern:
+            if world_space_patterns:
+                marker_name = "HMB_{0}_{1}".format(
+                    _safe_token(color),
+                    hashlib.sha1(root.encode("utf-8")).hexdigest()[:10],
+                )
+                marker_group, pattern_record, projection = (
+                    _world_projected_pattern_group(
+                        marker_name,
+                        pattern,
+                        root,
+                        shapes,
+                        texture_folder,
+                        world_cell_units,
+                    )
+                )
+                marker_warnings, opaque_shapes, cutout_shapes = (
+                    _assign_world_pattern_preserving_cutouts(
+                        shapes,
+                        marker_group,
+                        marker_name,
+                        projection,
+                        job,
+                        variant_cache,
+                    )
+                )
+                warnings.extend(marker_warnings)
+                verified_cutout_shapes.extend(cutout_shapes)
+                pattern_record.update({
+                    "reference_frame": float(
+                        (job or {}).get("_world_pattern_reference_frame") or 0.0
+                    ),
+                    "opaque_shape_path_count": len(opaque_shapes),
+                    "cutout_verified_shape_path_count": len(cutout_shapes),
+                })
+                world_pattern_records.append(pattern_record)
+                continue
             if not screen_space_patterns:
                 errors.append(
-                    "{0} requires the UV-independent screen-space postprocess "
-                    "profile.".format(color)
+                    "{0} requires the Maya world-projection profile or an "
+                    "explicit legacy screen-space fallback.".format(color)
                 )
                 continue
             id_rgb = MARKER_PATTERN_IDS.get(color)
@@ -4503,6 +4998,34 @@ def _apply_marker_shaders(bindings, job):
     cutout_report = dict((job or {}).get("_authored_cutout_report") or {})
     cutout_report["verified_shape_path_count"] = len(set(verified_cutout_shapes))
     job["_marker_cutout_transparency"] = cutout_report
+    if world_space_patterns:
+        try:
+            scene_linear_unit = _clean(cmds.currentUnit(query=True, linear=True))
+        except Exception:
+            scene_linear_unit = ""
+        job["_world_pattern_report"] = {
+            "profile": MAYA_WORLD_PATTERN_PROFILE,
+            "coordinate_space": "background_root",
+            "camera_anchored": False,
+            "uv_dependent": False,
+            "root_scale_followed": True,
+            "world_cell_scale_compensated": True,
+            "base_cell_world_units": WORLD_PATTERN_BASE_CELL_WORLD_UNITS,
+            "density_multiplier": WORLD_PATTERN_DENSITY_MULTIPLIER,
+            "cell_size_world_units": world_cell_units,
+            "reference_frame": float(
+                (job or {}).get("_world_pattern_reference_frame") or 0.0
+            ),
+            "scene_linear_unit": scene_linear_unit,
+            "pattern_binding_count": len(world_pattern_records),
+            "projection_node_count": len(world_pattern_records),
+            "projector_node_count": len(world_pattern_records),
+            "cutout_verified_shape_path_count": sum(
+                int(record.get("cutout_verified_shape_path_count") or 0)
+                for record in world_pattern_records
+            ),
+            "patterns": world_pattern_records,
+        }
     return warnings
 
 
@@ -13858,7 +14381,11 @@ def _scan_scene(job, result_path, maya_version, scene_path):
     return result
 
 
-def _marker_payload(bindings, character_outline_mode=CHARACTER_OUTLINE_NATIVE):
+def _marker_payload(
+    bindings,
+    character_outline_mode=CHARACTER_OUTLINE_NATIVE,
+    pattern_profile=MAYA_WORLD_PATTERN_PROFILE,
+):
     outline_mode = _character_outline_mode(
         {"character_outline_mode": character_outline_mode}
     )
@@ -13892,16 +14419,34 @@ def _marker_payload(bindings, character_outline_mode=CHARACTER_OUTLINE_NATIVE):
                     "out_rim_antialiasing": "viewport_native",
                 })
         elif pattern:
-            shading_profile = {
-                "profile": SCREEN_SPACE_PATTERN_PROFILE,
-                "pattern": pattern,
-                "pattern_space": "screen",
-                "phase_origin": "frame_top_left",
-                "linear_scale_divisor": SCREEN_SPACE_PATTERN_LINEAR_SCALE_DIVISOR,
-                "uv_dependent": False,
-                "occlusion": "viewport2_depth",
-                "categorical_id_rgb": list(pattern_id_rgb or ()),
-            }
+            if pattern_profile == MAYA_WORLD_PATTERN_PROFILE:
+                projection_type, projection_axis = (
+                    _world_pattern_projection_type(pattern)
+                )
+                shading_profile = {
+                    "profile": MAYA_WORLD_PATTERN_PROFILE,
+                    "pattern": pattern,
+                    "pattern_space": "background_root",
+                    "projection_type": projection_type,
+                    "projection_axis": projection_axis,
+                    "base_cell_world_units": WORLD_PATTERN_BASE_CELL_WORLD_UNITS,
+                    "density_multiplier": WORLD_PATTERN_DENSITY_MULTIPLIER,
+                    "cell_size_world_units": WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS,
+                    "camera_anchored": False,
+                    "uv_dependent": False,
+                    "occlusion": "viewport2_depth",
+                }
+            else:
+                shading_profile = {
+                    "profile": SCREEN_SPACE_PATTERN_PROFILE,
+                    "pattern": pattern,
+                    "pattern_space": "screen",
+                    "phase_origin": "frame_top_left",
+                    "linear_scale_divisor": SCREEN_SPACE_PATTERN_LINEAR_SCALE_DIVISOR,
+                    "uv_dependent": False,
+                    "occlusion": "viewport2_depth",
+                    "categorical_id_rgb": list(pattern_id_rgb or ()),
+                }
         result.append({
             "color": color,
             "asset_id": record["asset_id"],
@@ -13919,7 +14464,7 @@ def _marker_payload(bindings, character_outline_mode=CHARACTER_OUTLINE_NATIVE):
                 else (
                     CHARACTER_VISUAL_PROFILE
                     if uses_lambert
-                    else SCREEN_SPACE_PATTERN_PROFILE
+                    else pattern_profile
                 )
             ),
             "out_rim": "pfxToon_profile" if pfx_profile else "",
@@ -13957,6 +14502,7 @@ def run(job_path):
         apply_marker_shaders = bool(job.get("apply_marker_shaders", True))
         force_high_quality_viewport = bool(job.get("force_high_quality_viewport"))
         screen_space_patterns = bool(job.get("screen_space_patterns"))
+        world_space_patterns = bool(job.get("world_space_patterns"))
         generate_depth_playblast = bool(job.get("generate_depth_playblast"))
         generate_motion_guide = bool(job.get("generate_motion_guide"))
         requested_mouth_patch_policy = _clean(
@@ -13974,9 +14520,14 @@ def run(job_path):
         require_full_smooth_geometry = bool(
             job.get("require_full_smooth_geometry")
         )
-        if screen_space_patterns and not apply_marker_shaders:
+        if screen_space_patterns and world_space_patterns:
             raise RuntimeError(
-                "screen_space_patterns requires temporary marker shaders."
+                "Maya world patterns and legacy screen-space fallback cannot "
+                "be enabled together."
+            )
+        if (screen_space_patterns or world_space_patterns) and not apply_marker_shaders:
+            raise RuntimeError(
+                "Pattern projection requires temporary marker shaders."
             )
         requested_pattern_profile = _clean(
             job.get("screen_space_pattern_profile")
@@ -13991,6 +14542,37 @@ def run(job_path):
                     requested_pattern_profile or "<empty>"
                 )
             )
+        requested_world_pattern_profile = _clean(
+            job.get("world_pattern_profile")
+        )
+        if (
+            world_space_patterns
+            and requested_world_pattern_profile != MAYA_WORLD_PATTERN_PROFILE
+        ):
+            raise RuntimeError(
+                "Unsupported Maya world pattern profile: {0}".format(
+                    requested_world_pattern_profile or "<empty>"
+                )
+            )
+        if world_space_patterns:
+            cell_units = _world_pattern_cell_units(job)
+            density_multiplier = float(
+                job.get("world_pattern_density_multiplier")
+                or WORLD_PATTERN_DENSITY_MULTIPLIER
+            )
+            if (
+                not math.isfinite(density_multiplier)
+                or abs(
+                    density_multiplier - WORLD_PATTERN_DENSITY_MULTIPLIER
+                ) > 1.0e-9
+                or abs(
+                    cell_units - WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS
+                ) > 1.0e-9
+            ):
+                raise RuntimeError(
+                    "Maya world pattern production density must be 3x "
+                    "(15.0 / 3.0 = 5.0 world units)."
+                )
         if generate_depth_playblast:
             requested_depth_profile = _clean(job.get("depth_profile"))
             if (
@@ -14144,10 +14726,19 @@ def run(job_path):
         # Full-smooth preparation only touches the already-scoped concrete Maya
         # shapes and never promotes authored-hidden proxy caches.
         if apply_marker_shaders:
+            if world_space_patterns:
+                job["_world_pattern_reference_frame"] = float(frames[0])
+                cmds.currentTime(frames[0], edit=True, update=True)
             _write_progress(
                 job,
                 "preparing_scene",
-                "Applying temporary marker shaders and categorical screen-space IDs.",
+                (
+                    "Applying temporary marker shaders and Maya root-projected "
+                    "world patterns."
+                    if world_space_patterns
+                    else "Applying temporary marker shaders and categorical "
+                    "screen-space IDs."
+                ),
             )
             warnings.extend(_apply_marker_shaders(bindings, job))
         elif not force_high_quality_viewport:
@@ -14162,7 +14753,9 @@ def run(job_path):
                 preserve_authored_look=(
                     force_high_quality_viewport and not apply_marker_shaders
                 ),
-                screen_space_patterns=screen_space_patterns,
+                screen_space_patterns=(
+                    screen_space_patterns or world_space_patterns
+                ),
             )
         except Exception:
             if quality_restore is not None:
@@ -14457,6 +15050,11 @@ def run(job_path):
             "markers": _marker_payload(
                 bindings,
                 character_outline_mode=character_outline_mode,
+                pattern_profile=(
+                    MAYA_WORLD_PATTERN_PROFILE
+                    if world_space_patterns
+                    else SCREEN_SPACE_PATTERN_PROFILE
+                ),
             ),
             "hidden_paths": hidden_paths,
             "warnings": warnings,
@@ -14477,6 +15075,12 @@ def run(job_path):
             payload["screen_space_pattern_profile"] = SCREEN_SPACE_PATTERN_PROFILE
             payload["screen_space_postprocess_pending"] = True
             payload["screen_space_render_options"] = render_options_report
+        if world_space_patterns:
+            payload["world_pattern_profile"] = MAYA_WORLD_PATTERN_PROFILE
+            payload["world_pattern_report"] = dict(
+                job.get("_world_pattern_report") or {}
+            )
+            payload["world_pattern_render_options"] = render_options_report
         if force_high_quality_viewport:
             payload["viewport_quality_profile"] = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
             payload["viewport_quality_report"] = quality_report
@@ -14624,6 +15228,12 @@ def run(job_path):
         if screen_space_patterns:
             result["screen_space_pattern_profile"] = SCREEN_SPACE_PATTERN_PROFILE
             result["screen_space_render_options"] = render_options_report
+        if world_space_patterns:
+            result["world_pattern_profile"] = MAYA_WORLD_PATTERN_PROFILE
+            result["world_pattern_report"] = dict(
+                job.get("_world_pattern_report") or {}
+            )
+            result["world_pattern_render_options"] = render_options_report
         _write_json(result_path, result)
         _write_progress(
             job,

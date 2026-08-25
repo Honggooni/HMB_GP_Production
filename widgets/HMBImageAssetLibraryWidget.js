@@ -120,14 +120,13 @@ const IMAGE_ASSET_UI_TEXT = {
     disconnecting_external_import: "Disconnecting external image…",
     add: "Add",
     add_image_asset: "Add image asset",
-    edit_image_asset: "Edit image classification",
     registered_project_asset: "Registered project asset",
     metadata_pending: "Raster metadata pending",
     register_before_select: "Register this image with Add before selecting it.",
     image_limit: `The ${MAX_SHOT_IMAGES}-image Shot limit has been reached.`,
     click_select: "Click the card to select or deselect this image.",
     project_state: "PROJECT",
-    unregistered_state: "UNREGISTERED",
+    unregistered_state: "ADD",
     image_name: "Image Name",
     asset_id: "ASSET ID",
     main_type: "Main Type",
@@ -185,16 +184,15 @@ const IMAGE_ASSET_UI_TEXT = {
     keep_one_shot: "Shot은 최소 1개가 필요합니다.",
     remove_external_selection: "이 외부 이미지를 IMAGE_IMPORT_IN에서 연결 해제합니다. 여러 이미지를 함께 전달하거나 연결이 모호하면 입력 포트에서 직접 해제하세요.",
     disconnecting_external_import: "외부 이미지 연결 해제 중…",
-    add: "추가",
+    add: "Add",
     add_image_asset: "이미지 에셋 추가",
-    edit_image_asset: "이미지 분류 수정",
     registered_project_asset: "등록된 프로젝트 에셋",
     metadata_pending: "래스터 메타데이터 확인 중",
     register_before_select: "선택하기 전에 추가 버튼으로 이 이미지를 등록하세요.",
     image_limit: `Shot마다 이미지는 최대 ${MAX_SHOT_IMAGES}개까지 선택할 수 있습니다.`,
     click_select: "카드를 클릭하여 이미지를 선택하거나 선택 해제합니다.",
     project_state: "프로젝트",
-    unregistered_state: "미등록",
+    unregistered_state: "ADD",
     image_name: "이미지 이름",
     asset_id: "에셋 ID",
     main_type: "메인 유형",
@@ -1873,6 +1871,14 @@ function assetCardThumbnailImageMarkup(asset) {
     : `<span class="asset-thumb-placeholder" aria-hidden="true"></span>`;
 }
 
+export function hmbImageAssetCanRegister(asset) {
+  if (!asset || typeof asset !== "object" || asset.registered) return false;
+  const sourceKind = clean(asset.source_kind).toLowerCase();
+  if (!sourceKind || sourceKind === "project") return true;
+  return sourceKind === "user"
+    && Number(asset.import_index || 0) > 0;
+}
+
 function thumbnailHtml(asset, className = "asset-thumb") {
   const source = imageSource(asset);
   return `<div class="${className} ${source ? "" : "fallback"}">${thumbnailImageMarkup(asset)}</div>`;
@@ -1881,11 +1887,9 @@ function thumbnailHtml(asset, className = "asset-thumb") {
 function assetThumbnailHtml(asset, state) {
   const source = imageSource(asset);
   const sourceName = clean(asset.image_name) || clean(asset.asset_id) || "Image";
-  const actionLabel = imageAssetText(
-    state,
-    asset.registered ? "edit_image_asset" : "add_image_asset",
-  );
-  const add = `<button type="button" class="asset-add" data-asset-add aria-label="${escapeHtml(actionLabel)}">${escapeHtml(asset.registered ? "✎" : imageAssetText(state, "add"))}</button>`;
+  const add = hmbImageAssetCanRegister(asset)
+    ? `<button type="button" class="asset-add" data-asset-add aria-label="${escapeHtml(imageAssetText(state, "add_image_asset"))}">${escapeHtml(imageAssetText(state, "add"))}</button>`
+    : "";
   return `
     <div class="asset-thumb ${source ? "" : "fallback"}">
       <div class="asset-thumb-media">${assetCardThumbnailImageMarkup(asset)}${add}</div>
@@ -2630,7 +2634,7 @@ export function hmbImageAssetRegistrationSubTypes(taxonomy, sourceType) {
 }
 
 export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}) {
-  if (!asset || typeof asset !== "object") return null;
+  if (!hmbImageAssetCanRegister(asset)) return null;
   const mainTypes = registrationMainTypes(taxonomy);
   const sourceType = mainTypes.includes(clean(asset.image_main_type))
     ? clean(asset.image_main_type)
@@ -2827,7 +2831,7 @@ function renderRegistrationDialog(state, draft) {
   const externalImport = asset?.source_kind === "user" && Number(asset?.import_index || 0) > 0;
   if (
     !asset
-    || (asset.source_kind !== "project" && !externalImport)
+    || !hmbImageAssetCanRegister(asset)
   ) return "";
   const mainTypes = registrationMainTypes(state.taxonomy);
   const subTypes = hmbImageAssetRegistrationSubTypes(state.taxonomy, draft.image_main_type);
@@ -4159,8 +4163,7 @@ function installEvents(container, state, props, remount, listeners) {
     on(card.querySelector("[data-asset-add]"), "click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      const externalImport = asset.source_kind === "user" && Number(asset.import_index || 0) > 0;
-      if (asset.source_kind !== "project" && !externalImport) return;
+      if (!hmbImageAssetCanRegister(asset)) return;
       container.__hmbImageAssetRegistrationReturnFocus = {
         descriptor: imageAssetFocusDescriptor(container),
         assetKey: asset.asset_library_id,
@@ -4359,8 +4362,7 @@ function installEvents(container, state, props, remount, listeners) {
     if (add) {
       event.preventDefault();
       event.stopPropagation();
-      const externalImport = asset.source_kind === "user" && Number(asset.import_index || 0) > 0;
-      if (asset.source_kind !== "project" && !externalImport) return;
+      if (!hmbImageAssetCanRegister(asset)) return;
       container.__hmbImageAssetRegistrationReturnFocus = {
         descriptor: imageAssetFocusDescriptor(container),
         assetKey: asset.asset_library_id,

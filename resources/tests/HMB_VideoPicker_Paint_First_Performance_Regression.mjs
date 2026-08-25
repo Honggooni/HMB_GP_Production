@@ -102,8 +102,8 @@ try {
   }
 }
 
-const selectionStart = source.indexOf("const toggleVideoSelection = (");
-const selectionEnd = source.indexOf("const deleteVideoAsset = (", selectionStart);
+const selectionStart = source.indexOf("const toggleSharedLoaderVideoSelection = (");
+const selectionEnd = source.indexOf("const commitSharedLoaderVideoDrag = (", selectionStart);
 const selectionSource = source.slice(selectionStart, selectionEnd);
 assert.ok(selectionStart >= 0 && selectionEnd > selectionStart);
 assert.ok(

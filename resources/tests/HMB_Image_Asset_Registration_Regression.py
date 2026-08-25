@@ -518,8 +518,25 @@ try:
         / "corrupt_source.png"
     ).exists()
 
+    validation_path = project_root / "Validation" / "unregistered.png"
+    validation_path.parent.mkdir(parents=True)
+    validation_path.write_bytes(PNG_1X1)
+    validation_relative = validation_path.relative_to(project_root).as_posix()
+    validation_request = dict(request)
+    validation_request.update(
+        {
+            "asset_library_id": asset_library._asset_library_id(
+                registered_state["project_id"],
+                validation_relative,
+            ),
+            "relative_path": validation_relative,
+            "image_name": "Validation Candidate",
+            "asset_id": "ValidationCandidate",
+        }
+    )
+
     manifest_before_invalid = manifest_path.read_bytes()
-    invalid_scope = dict(request)
+    invalid_scope = dict(validation_request)
     invalid_scope["request_id"] = "invalid-scope"
     invalid_scope["image_sub_type"] = "Main Background"
     try:
@@ -530,7 +547,7 @@ try:
         raise AssertionError("A Main/Sub Type mismatch must be rejected.")
     assert manifest_path.read_bytes() == manifest_before_invalid
 
-    duplicate_id = dict(request)
+    duplicate_id = dict(validation_request)
     duplicate_id["request_id"] = "duplicate-id"
     duplicate_id["asset_id"] = "ExistingBackground"
     try:
@@ -551,6 +568,47 @@ try:
     else:
         raise AssertionError("A stale project request must be rejected.")
     assert manifest_path.read_bytes() == manifest_before_invalid
+
+    # Registration is create-only. Even a forged/stale Edit request cannot
+    # change Image Name, Asset ID, Main Type, or Sub Type after Add succeeds.
+    manifest_before_registered_edit = manifest_path.read_bytes()
+    forbidden_registered_edit = dict(request)
+    forbidden_registered_edit.update(
+        {
+            "request_id": "reject-registered-edit",
+            "image_name": "Edited Hero",
+            "asset_id": "EditedHero",
+            "image_main_type": "Look Reference",
+            "image_sub_type": "Color Mood",
+        }
+    )
+    try:
+        asset_library._apply_asset_registration(
+            registered_state,
+            forbidden_registered_edit,
+        )
+    except ValueError as exc:
+        assert "already registered and cannot be edited" in str(exc)
+    else:
+        raise AssertionError("A registered asset must not expose an Edit operation.")
+    assert manifest_path.read_bytes() == manifest_before_registered_edit
+
+    # The writer repeats the same check while holding both manifest locks so a
+    # concurrent Add cannot turn into an accidental update.
+    forged_record = dict(persisted)
+    forged_record.update(
+        {
+            "image_name": "Race Edited Hero",
+            "asset_id": "RaceEditedHero",
+        }
+    )
+    try:
+        asset_library._write_asset_manifest_record(project_root, forged_record)
+    except ValueError as exc:
+        assert "already registered and cannot be edited" in str(exc)
+    else:
+        raise AssertionError("The locked manifest writer must reject existing paths.")
+    assert manifest_path.read_bytes() == manifest_before_registered_edit
 finally:
     shutil.rmtree(test_root, ignore_errors=True)
 

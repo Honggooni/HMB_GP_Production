@@ -44,11 +44,11 @@ assert.ok(deleteHandlerStart >= 0 && deleteHandlerEnd > deleteHandlerStart);
 const deleteHandler = widgetSource.slice(deleteHandlerStart, deleteHandlerEnd);
 assert.match(deleteHandler, /preview_video_uid \|\| liveState\.selected_video_uid/);
 assert.match(deleteHandler, /container\.__hmbForceVideoPreviewUid/);
-assert.match(deleteHandler, /container\.querySelector\("#picker-video"\)\?\.pause\?\.\(\)/);
+assert.match(deleteHandler, /hmbPauseVideoPickerWithDebt\(container\.querySelector\("#picker-video"\)\)/);
 assert.match(deleteHandler, /delete container\.__hmbForceVideoPreviewUid/);
 assert.match(deleteHandler, /delete container\.__hmbAutoplayVideoUid/);
 assert.ok(
-  deleteHandler.indexOf('container.querySelector("#picker-video")?.pause?.()')
+  deleteHandler.indexOf('hmbPauseVideoPickerWithDebt(container.querySelector("#picker-video"))')
     < deleteHandler.indexOf('dispatchCommand("delete_video_asset"'),
   "The active main preview must pause before the asynchronous delete command is sent.",
 );

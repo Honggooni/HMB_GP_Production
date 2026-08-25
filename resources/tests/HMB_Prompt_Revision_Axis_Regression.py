@@ -179,12 +179,89 @@ assert merged["videos"][0]["video_sub_type"] == "Explosion"
 assert merged["videos"][0]["keep_out"] == "Ignore proxy sparks."
 assert merged["videos"][0]["label"] == "Source Video"
 
+# A verified Look keeps source-owned registration provenance, but a valid
+# effective Prompt Sub Type survives the crossed source/UI clocks by UID.
+look_source = prompt._default_widget_state()
+look_source["images"][0].update(
+    {
+        "present": True,
+        "label": "Registered Look",
+        "asset_managed": True,
+        "asset_verified": True,
+        "asset_source_kind": "project",
+        "asset_source_uid": "verified-look-axis",
+        "asset_image_main_type_candidate": "Look Reference",
+        "asset_image_sub_type_candidate": "Render Look",
+        "image_main_type": "Look Reference",
+        "image_sub_type": "Render Look",
+    }
+)
+look_ui = copy.deepcopy(look_source)
+look_ui["images"][0]["asset_image_sub_type_candidate"] = "Color Mood"
+look_ui["images"][0]["image_sub_type"] = "Scale"
+look_merged = prompt._merge_prompt_revision_axes(look_source, look_ui)
+look_row = look_merged["images"][0]
+assert look_row["asset_image_sub_type_candidate"] == "Render Look"
+assert look_row["image_main_type"] == "Look Reference"
+assert look_row["image_sub_type"] == "Scale"
+assert look_row["source_type"] == "Scale / Composition Reference"
+assert look_row["scope"] == "Scale only"
+assert look_row["owner"] == "Camera / Composition"
+assert look_row["color_picks"] == [""]
+
+# A stale registered default is not an override. A newer global registration
+# therefore remains authoritative when the UI had never chosen another Sub.
+look_default_ui = copy.deepcopy(look_source)
+look_default_ui["images"][0]["asset_image_sub_type_candidate"] = "Color Mood"
+look_default_ui["images"][0]["image_sub_type"] = "Color Mood"
+look_default_merged = prompt._merge_prompt_revision_axes(
+    look_source,
+    look_default_ui,
+)
+assert look_default_merged["images"][0]["image_sub_type"] == "Render Look"
+
 # Only is a real Prompt-owned selection too. A simultaneous source callback
 # must not resurrect the previously selected Shot.
 only_ui = copy.deepcopy(ui)
 only_ui["shot"] = prompt._normalize_shot_selection({})
 only_merged = prompt._merge_prompt_revision_axes(source, only_ui)
 assert only_merged["shot"] == prompt._normalize_shot_selection({})
+
+# A Prompt created first has only the default catalog-less Only placeholder.
+# Text entered before ImageAsset arrives remains Prompt-owned, while the first
+# backend-proven Shot must be accepted instead of being overwritten to Only.
+prompt_first_ui = prompt._default_widget_state()
+prompt_first_ui["text"]["SCENE_CONTEXT"] = "typed before ImageAsset"
+prompt_first_ui[prompt.UI_EDIT_REVISION_KEY] = 1
+prompt_first_source = copy.deepcopy(source)
+prompt_first_source["text"]["SCENE_CONTEXT"] = "older source text"
+prompt_first_merged = prompt._merge_prompt_revision_axes(
+    prompt_first_source,
+    prompt_first_ui,
+)
+assert prompt_first_merged["text"]["SCENE_CONTEXT"] == "typed before ImageAsset"
+assert prompt_first_merged["shot"]["shot_uuid"] == "shot-alpha"
+
+# An Only selection from another/older publisher has no authority to suppress
+# the first Shot of a replacement ImageAsset publisher.
+old_publisher_only = copy.deepcopy(only_ui)
+replacement_source = copy.deepcopy(source)
+replacement_source["image_asset"]["shot_catalog_routing"].update({
+    "publisher_instance_uuid": "publisher-replacement",
+    "channel_uuid": "channel-replacement",
+    "generation": 1,
+    "metadata_sha256": "b" * 64,
+})
+for item in replacement_source["image_asset"]["shot_catalog"]:
+    item["channel_uuid"] = "channel-replacement"
+replacement_source["shot"] = copy.deepcopy(
+    replacement_source["image_asset"]["shot_catalog"][0]
+)
+replacement_merged = prompt._merge_prompt_revision_axes(
+    replacement_source,
+    old_publisher_only,
+)
+assert replacement_merged["shot"]["shot_uuid"] == "shot-alpha"
 
 manual_ui = prompt._default_widget_state()
 manual_ui[prompt.SOURCE_SYNC_REVISION_KEY] = 2

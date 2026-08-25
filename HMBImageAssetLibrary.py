@@ -1615,7 +1615,7 @@ def _load_asset_manifest_document(
 
 
 def _write_asset_manifest_record(root: Path, record: Dict[str, Any]) -> Path:
-    """Atomically upsert one validated project-relative asset record."""
+    """Atomically create one record; an existing project-relative path is immutable."""
     lock = _asset_manifest_lock(root)
     with lock:
         with _asset_manifest_process_lock(root):
@@ -1674,10 +1674,10 @@ def _write_asset_manifest_record_locked(
 
     updated_records = list(records)
     if matching_indices:
-        existing = records[matching_indices[0]]
-        updated = dict(existing) if isinstance(existing, dict) else {}
-        updated.update(record)
-        updated_records[matching_indices[0]] = updated
+        raise ValueError(
+            "This image asset is already registered and cannot be edited. "
+            "Only unregistered assets can be added."
+        )
     else:
         updated_records.append(dict(record))
 
@@ -3329,6 +3329,11 @@ def _apply_asset_registration(
         if len(matches) != 1:
             raise ValueError("The image file changed or no longer belongs to this project.")
         scanned_asset = matches[0]
+        if bool(scanned_asset.get("registered")):
+            raise ValueError(
+                "This image asset is already registered and cannot be edited. "
+                "Only unregistered assets can be added."
+            )
         relative_text = _clean(scanned_asset.get("relative_path")).replace("\\", "/")
         if relative_text.casefold() != request.get("relative_path", "").casefold():
             raise ValueError("The image path changed while the registration window was open.")
@@ -4615,8 +4620,9 @@ def _add_output(node: Any) -> None:
         "tooltip": (
             "ASSET_OUT optionally shares selected images and available project, name, "
             "order, and taxonomy metadata with any downstream node. A verified "
-            "registered Sub Type remains bound in HMBPromptLibrary while Target and "
-            "Color Pick remain editable without making Prompt a prerequisite."
+            "registration is immutable in this library. HMBPromptLibrary may still "
+            "select an effective per-shot Look Sub Type where its own taxonomy permits "
+            "it, without making Prompt a prerequisite."
         ),
         "default_value": "",
         "type": "str",
@@ -4840,7 +4846,8 @@ def _add_project_root(node: Any) -> None:
         "Select a projects catalog. Each direct child "
         "folder is one project; a direct project folder is also accepted. Optional "
         "hmb_image_assets.json records may override inferred Asset ID, Image "
-        "Name, Main Type, registered Sub Type, and default selection."
+        "Name, Main Type, registered Sub Type, and default selection. Registered "
+        "records are read-only; only unregistered project media can use Add."
     )
     trait = None
     if FileSystemPicker is not None:
@@ -5300,6 +5307,10 @@ class HMBImageAssetLibrary(DataNode):
         self._hmb_scan_pending_result: tuple[int, str, str, Dict[str, Any]] | None = None
         self._hmb_node_deleted = False
         self._hmb_initial_catalog_scan_pending = True
+        # A newly registered ImageAsset may appear after Prompt. Its first
+        # exact catalog result must advertise once, but a subsequently hydrated
+        # saved workflow must never let this constructor-default scan win.
+        self._hmb_fresh_registration_scan_key = ""
         self._hmb_initial_catalog_root = str(DEFAULT_PROJECTS_ROOT)
         # Constructor/default catalog scans are not serialized workflow
         # authority. The host initial_setup lifecycle or an explicit user
@@ -5401,6 +5412,12 @@ class HMBImageAssetLibrary(DataNode):
         """Adopt serialized hydration as a fresh instance-local baseline."""
 
         parent_setter = getattr(super(), "set_parameter_value")
+        if initial_setup and param_name in {
+            WIDGET_STATE_PARAMETER,
+            PROJECT_ROOT_PARAMETER,
+            IMAGE_IMPORT_PARAMETER,
+        }:
+            self._hmb_fresh_registration_scan_key = ""
         if initial_setup and param_name == WIDGET_STATE_PARAMETER:
             self._accept_widget_state_baseline(value)
         if (
@@ -5482,8 +5499,11 @@ class HMBImageAssetLibrary(DataNode):
             self,
             IMAGE_IMPORT_PARAMETER,
         )
+        request_key = f"initial:{requested_root.casefold()}"
+        with self._hmb_scan_lock:
+            self._hmb_fresh_registration_scan_key = request_key
         self._schedule_catalog_scan(
-            f"initial:{requested_root.casefold()}",
+            request_key,
             candidate,
             lambda: self._merge_captured_imports_into_scan(
                 _load_project_catalog(requested_root, snapshot),
@@ -5824,6 +5844,34 @@ class HMBImageAssetLibrary(DataNode):
         except Exception as exc:
             _diagnostic_exception("Shot routing reconciliation failed", exc)
 
+    def _publish_completed_catalog_scan(
+        self,
+        state: Dict[str, Any],
+        request_key: Any,
+    ) -> Dict[str, Any]:
+        """Publish one worker result and adopt only a fresh registered scan.
+
+        The request has already passed generation, key, deletion, and exact
+        NodeManager identity checks at both call sites.  Clearing the key here
+        makes the late-discovery advertisement exactly once.
+        """
+
+        key = _clean(request_key)[:512]
+        with self._hmb_scan_lock:
+            fresh_registration = bool(
+                key
+                and key
+                == _clean(
+                    getattr(self, "_hmb_fresh_registration_scan_key", "")
+                )[:512]
+                and not bool(getattr(self, "_hmb_node_deleted", False))
+            )
+            if fresh_registration:
+                self._hmb_fresh_registration_scan_key = ""
+        if fresh_registration:
+            self._hmb_hydration_adopted = True
+        return self._publish_state(state)
+
     @staticmethod
     def _widget_revision_pair(value: Any) -> tuple[int, int] | None:
         raw = _parse_mapping(value)
@@ -6152,6 +6200,11 @@ class HMBImageAssetLibrary(DataNode):
                 current = self._current_state()
                 current["scan_busy"] = True
                 return current
+            if (
+                getattr(self, "_hmb_fresh_registration_scan_key", "")
+                and self._hmb_fresh_registration_scan_key != key
+            ):
+                self._hmb_fresh_registration_scan_key = ""
             self._hmb_scan_generation += 1
             generation = self._hmb_scan_generation
             request_id = f"scan-{generation}-{uuid.uuid4().hex[:12]}"
@@ -6230,7 +6283,7 @@ class HMBImageAssetLibrary(DataNode):
                 owner._replace_import_media(media_by_uid)
             result["scan_busy"] = False
             result["scan_request_id"] = request_id
-            owner._publish_state(result)
+            owner._publish_completed_catalog_scan(result, key)
 
         def worker() -> None:
             owner = node_ref()
@@ -6369,7 +6422,7 @@ class HMBImageAssetLibrary(DataNode):
             self._replace_import_media(media_by_uid)
         result["scan_busy"] = False
         result["scan_request_id"] = request_id
-        self._publish_state(result)
+        self._publish_completed_catalog_scan(result, key)
         return True
 
     def _load_catalog(self, root_value: Any) -> Dict[str, Any]:
@@ -6931,6 +6984,7 @@ class HMBImageAssetLibrary(DataNode):
         self._ensure_parameters()
         self._ensure_scan_runtime_state()
         self._hmb_initial_catalog_scan_pending = False
+        self._hmb_fresh_registration_scan_key = ""
         saved_state = self._current_state()
         saved_root = _project_root_text(saved_state.get("catalog_root"))
         parameter_root = _project_root_text(
@@ -6987,6 +7041,7 @@ class HMBImageAssetLibrary(DataNode):
         first_delete = not bool(getattr(self, "_hmb_node_deleted", False))
         if first_delete:
             self._hmb_node_deleted = True
+            self._hmb_fresh_registration_scan_key = ""
             release = getattr(
                 _hmb_shot_routing,
                 "release_node_lifecycle",

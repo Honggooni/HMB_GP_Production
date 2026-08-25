@@ -136,6 +136,33 @@ def payload(order: list[str]) -> dict:
     }
 
 
+def look_payload(sub_type: str = "Color Mood") -> dict:
+    row = {
+        "selected": True,
+        "source_uid": "source:MasterLook",
+        "source_kind": "project",
+        "asset_project_uid": "sw12:test",
+        "asset_library_id": "library:MasterLook",
+        "asset_id": "Asset_MasterLook",
+        "image_name": "Master Look",
+        "path": "C:/Project/sw12/Look/MasterLook.png",
+        "image_main_type": "Look Reference",
+        "image_sub_type": sub_type,
+        "selection_order": 1,
+    }
+    return {
+        "schema": "hmb-image-asset-library-binding",
+        "version": 2,
+        "mode": "image_asset",
+        "project_id": "sw12",
+        "project_uid": "sw12:test",
+        "project_root": "C:/Project/sw12",
+        "selection_id": f"look-{sub_type}",
+        "selected_assets": [row],
+        "ordered_images": [row],
+    }
+
+
 # The temporary production catalog requested for this workstation must expose
 # each direct child folder as one independently selectable project.
 real_catalog_root = Path(r"C:\Project")
@@ -519,6 +546,60 @@ try:
         connected=True,
     )
     assert repeated == reordered
+
+    # Registered Look provenance remains global, while the Prompt's effective
+    # Sub Type survives refresh, upstream default changes, and dormant reselect.
+    look_state = prompt_library._apply_image_asset_payload(
+        prompt_library._default_widget_state(),
+        look_payload(),
+        connected=True,
+    )
+    look_state["images"][0]["image_sub_type"] = "Scale"
+    prompt_library._normalize_image_binding_fields(look_state["images"][0])
+    refreshed_look = prompt_library._apply_image_asset_payload(
+        look_state,
+        look_payload(),
+        connected=True,
+    )
+    refreshed_look_row = refreshed_look["images"][0]
+    assert refreshed_look_row["asset_image_sub_type_candidate"] == "Color Mood"
+    assert refreshed_look_row["image_sub_type"] == "Scale"
+    assert refreshed_look_row["source_type"] == "Scale / Composition Reference"
+    assert refreshed_look_row["scope"] == "Scale only"
+    assert refreshed_look_row["owner"] == "Camera / Composition"
+
+    changed_registered_look = prompt_library._apply_image_asset_payload(
+        refreshed_look,
+        look_payload("Render Look"),
+        connected=True,
+    )
+    assert changed_registered_look["images"][0][
+        "asset_image_sub_type_candidate"
+    ] == "Render Look"
+    assert changed_registered_look["images"][0]["image_sub_type"] == "Scale"
+
+    dormant_look = prompt_library._apply_image_asset_payload(
+        changed_registered_look,
+        {
+            "schema": "hmb-image-asset-library-binding",
+            "version": 2,
+            "mode": "image_asset",
+            "project_id": "sw12",
+            "project_uid": "sw12:test",
+            "project_root": "C:/Project/sw12",
+            "selection_id": "look-empty",
+            "selected_assets": [],
+            "ordered_images": [],
+        },
+        connected=True,
+    )
+    restored_look = prompt_library._apply_image_asset_payload(
+        dormant_look,
+        look_payload("Render Look"),
+        connected=True,
+    )
+    assert restored_look["images"][0]["image_sub_type"] == "Scale"
+    assert restored_look["images"][0]["owner"] == "Camera / Composition"
 
     # A shorter connected selection removes the deselected managed row. Tokens
     # that pointed to it become tombstones instead of silently rebinding.

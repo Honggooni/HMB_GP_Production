@@ -27,7 +27,7 @@ install_private_policy_reader(agent._hmb)
 def prompt_json_section(payload: str, header: str):
     lines = payload.splitlines()
     assert lines[0] == "HMB_GP_Production"
-    assert len(lines) == 7
+    assert header in lines
     return json.loads(lines[lines.index(header) + 1])
 
 # VideoPicker publishes one ordered catalog snapshot to Prompt and the exact
@@ -98,6 +98,8 @@ prompt_state = prompt._default_widget_state()
 prompt_state["images"][0].update({
     "present": True,
     "label": "Hero",
+    "image_main_type": "Character",
+    "image_sub_type": "Full Appearance",
     "source_type": "Character Appearance",
     "owner": "Hero",
     "binding_scopes": ["Full body / full appearance"],
@@ -111,6 +113,8 @@ for slot in range(2, 6):
     prompt_state["images"][slot - 1].update({
         "present": True,
         "label": f"Control{slot}",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
         "source_type": "Character Appearance",
         "owner": f"Control{slot}",
         "binding_scopes": ["Full body / full appearance"],
@@ -134,7 +138,7 @@ for video in prompt_state["videos"][1:]:
     video["control_role"] = "Context Only"
 prompt_state["videos"][1]["source_type"] = "Motion Guide / Retargeting Reference"
 prompt_state["videos"][1]["control_role"] = "Derived Motion Decoding Only"
-compiled_prompt = prompt._build_prompt_package(prompt_state)
+compiled_prompt = prompt._build_data_only_prompt_package(prompt_state)
 compiled_job = prompt_json_section(compiled_prompt, "HMB JOB DATA (JSON):")
 assert compiled_job["images"][0]["label"] == "Hero"
 assert compiled_job["images"][0]["bindings"][0] == {

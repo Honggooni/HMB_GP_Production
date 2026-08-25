@@ -26,7 +26,7 @@ agent = load("HMBAgentLibrary")
 def prompt_json_section(payload: str, header: str):
     lines = payload.splitlines()
     assert lines[0] == "HMB_GP_Production"
-    assert len(lines) == 7
+    assert header in lines
     return json.loads(lines[lines.index(header) + 1])
 
 
@@ -38,6 +38,16 @@ def active_video(slot: int, label: str, source_type: str, control_role: str):
             "label": label,
             "source_type": source_type,
             "control_role": control_role,
+            "video_main_type": (
+                "Maya Preview / Playblast"
+                if source_type == "Maya Preview / Playblast"
+                else "Motion Reference"
+            ),
+            "video_sub_type": (
+                "Original Preview"
+                if source_type == "Maya Preview / Playblast"
+                else "Local Motion"
+            ),
             "manual": True,
         }
     )
@@ -54,6 +64,8 @@ state["images"][0].update(
     {
         "present": True,
         "label": "Hero",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
         "source_type": "Character Appearance",
         "owner": "Hero",
         "binding_scopes": [
@@ -90,6 +102,9 @@ assert prompt._normalize_state(copy.deepcopy(normalized)) == normalized
 custom_scope_image = prompt._default_image_item(1)
 custom_scope_image.update(
     {
+        "image_main_type": "Custom / Context",
+        "image_sub_type": "Custom",
+        "custom_source_type": "Hero custom binding",
         "color_picks": ["Red", "Green"],
         "binding_scopes": ["Custom scope", "Head / face only"],
         "binding_custom_scopes": ["Hero silhouette", "Face detail"],
@@ -99,8 +114,8 @@ custom_scope_image.update(
 prompt._normalize_image_binding_fields(custom_scope_image)
 assert custom_scope_image["binding_scopes"] == ["Custom scope", "Custom scope"]
 assert custom_scope_image["binding_custom_scopes"] == [
-    "Hero silhouette",
-    "Hero silhouette",
+    "Hero custom binding",
+    "Hero custom binding",
 ]
 
 legacy_owner_state = prompt._default_widget_state()
@@ -109,6 +124,8 @@ legacy_owner_state["images"] = [
         "slot": 1,
         "present": True,
         "label": "Hero",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
         "source_type": "Character Appearance",
         "owner": "",
         "color_picks": ["Red", "Green"],
@@ -312,6 +329,8 @@ picker_state["images"][0].update(
     {
         "present": True,
         "label": "Hero",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
         "source_type": "Character Appearance",
         "owner": "Hero",
         "binding_scopes": ["Full body / full appearance"],

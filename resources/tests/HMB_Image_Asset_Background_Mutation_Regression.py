@@ -138,6 +138,7 @@ assert scan_scheduler_source.index("has_current_engine()") < scan_scheduler_sour
 initial_base, _ = registration_state()
 initial_node, initial_live, _ = fake_node(initial_base)
 initial_node._hmb_initial_catalog_scan_pending = True
+initial_node._hmb_hydration_adopted = False
 initial_node._hmb_initial_catalog_root = "C:/fallback"
 initial_node._ensure_scan_runtime_state()
 initial_calls = []
@@ -157,6 +158,22 @@ assert initial_calls[0][0] == "initial:c:/catalog"
 assert initial_calls[0][1]["assets"] == initial_visible_before["assets"]
 assert initial_live["state"] == initial_visible_before
 assert initial_node._hmb_initial_catalog_scan_pending is False
+assert initial_node._hmb_fresh_registration_scan_key == "initial:c:/catalog"
+
+# Only the exact fresh-registration completion adopts constructor state. The
+# adoption key is one-shot, so a duplicate/stale completion cannot advertise.
+initial_node._publish_completed_catalog_scan(
+    initial_visible_before,
+    "initial:c:/catalog",
+)
+assert initial_node._hmb_hydration_adopted is True
+assert initial_node._hmb_fresh_registration_scan_key == ""
+initial_node._hmb_hydration_adopted = False
+initial_node._publish_completed_catalog_scan(
+    initial_visible_before,
+    "initial:c:/catalog",
+)
+assert initial_node._hmb_hydration_adopted is False
 
 
 # A pending acknowledgement is a UI-only publication.  It must not resolve

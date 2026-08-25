@@ -282,6 +282,108 @@ with tempfile.TemporaryDirectory(prefix="hmb-seedance-reopen-") as temporary:
     assert ordered_preview["has_existing_video"] is True
     assert ordered_preview["action"] == "none"
 
+    # Host workflow saves do not reliably serialize video_url/VIDEO_OUT.  The
+    # durable local_succeeded checkpoint itself proves that publication and
+    # verification completed, so the same node must permit one new explicit
+    # render without forcing a duplicate retrieval of the old task.
+    completed_without_outputs_id = "reopen-local-success-no-video-output"
+    completed_without_outputs = target.HMBSeedanceGeneration(
+        name="Seedance Local Success Without Serialized Artifact"
+    )
+    completed_without_outputs.parameter_output_values.update(
+        {
+            "video_url": None,
+            "VIDEO_OUT": None,
+            "provider_response": {
+                "transport": "fn_ai_broker",
+                "id": completed_without_outputs_id,
+                "status": "succeeded",
+            },
+            "generation_id": completed_without_outputs_id,
+            "generation_status": "succeeded",
+        }
+    )
+    completed_without_outputs.set_parameter_value(
+        target.SEEDANCE_RECOVERY_PARAMETER,
+        {
+            "schema": target.SEEDANCE_RECOVERY_SCHEMA,
+            "version": target.SEEDANCE_RECOVERY_VERSION,
+            "revision": 8,
+            "stage": "local_succeeded",
+            "task_id": completed_without_outputs_id,
+            "task_identity": "broker_task",
+            "status": "succeeded",
+            "terminal": False,
+            "updated_at_ms": 2,
+            "model_id": target.SEEDANCE_2_5_MODEL_ID,
+            "output_format": "mp4",
+            "return_last_frame": False,
+            "output_file": str(present_path),
+        },
+        initial_setup=True,
+        emit_change=False,
+    )
+    assert (
+        completed_without_outputs._generation_recovery_blocks_new_submission()
+        is False
+    )
+    completed_without_outputs._assert_new_submission_is_safe()
+    assert (
+        completed_without_outputs.parameter_output_values["generation_id"]
+        == completed_without_outputs_id
+    ), "Completed task identity remains available as non-blocking history."
+
+    # Conversely, remote_succeeded means the paid result has not completed
+    # local publication.  A stale video from an earlier render must never make
+    # that different task look consumed.
+    remote_success_id = "reopen-remote-success-with-stale-video"
+    remote_success = target.HMBSeedanceGeneration(
+        name="Seedance Remote Success With Stale Local Artifact"
+    )
+    stale_artifact = artifact(present_path)
+    remote_success.parameter_output_values.update(
+        {
+            "video_url": stale_artifact,
+            "VIDEO_OUT": stale_artifact,
+            "provider_response": {
+                "transport": "fn_ai_broker",
+                "id": remote_success_id,
+                "status": "succeeded",
+            },
+            "generation_id": remote_success_id,
+            "generation_status": "succeeded",
+        }
+    )
+    remote_success.set_parameter_value(
+        target.SEEDANCE_RECOVERY_PARAMETER,
+        {
+            "schema": target.SEEDANCE_RECOVERY_SCHEMA,
+            "version": target.SEEDANCE_RECOVERY_VERSION,
+            "revision": 9,
+            "stage": "remote_succeeded",
+            "task_id": remote_success_id,
+            "task_identity": "broker_task",
+            "status": "succeeded",
+            "terminal": False,
+            "updated_at_ms": 3,
+            "model_id": target.SEEDANCE_2_5_MODEL_ID,
+            "output_format": "mp4",
+            "return_last_frame": False,
+            "output_file": str(present_path),
+        },
+        initial_setup=True,
+        emit_change=False,
+    )
+    assert remote_success._generation_recovery_blocks_new_submission() is True
+    try:
+        remote_success._assert_new_submission_is_safe()
+    except RuntimeError as exc:
+        assert remote_success_id in str(exc)
+    else:
+        raise AssertionError(
+            "A remote-only success was released by an earlier local video."
+        )
+
     # Saved project outputs may use a Griptape macro. Availability must be
     # tested on File(...).resolve(), not on the literal macro string.
     class MacroResolvingFile:
@@ -374,6 +476,34 @@ else:
     raise AssertionError("An unresolved recovered task allowed a new create.")
 assert terminal_preview["action"] == "none"
 assert _terminal_node._generation_recovery_blocks_new_submission() is False
+
+for unresolved_status in (
+    "submission_unknown",
+    "queued",
+    "running",
+    "cancelled_locally",
+    "timed_out",
+):
+    unresolved_id = f"reopen-guard-{unresolved_status}"
+    unresolved_node, unresolved_preview = reopened_node(
+        job_id=unresolved_id,
+        status=unresolved_status,
+        provider_response={
+            "transport": "fn_ai_broker",
+            "id": unresolved_id,
+            "status": unresolved_status,
+        },
+    )
+    assert unresolved_preview["action"] == "refresh_existing"
+    assert unresolved_node._generation_recovery_blocks_new_submission() is True
+    try:
+        unresolved_node._assert_new_submission_is_safe()
+    except RuntimeError as exc:
+        assert unresolved_id in str(exc)
+    else:
+        raise AssertionError(
+            f"Unresolved {unresolved_status} task allowed a replacement render."
+        )
 
 
 class RecordingBridge:

@@ -635,11 +635,10 @@ assert.match(
 );
 
 const selectionHandlerStart = widgetSource.indexOf(
-  "const toggleVideoSelection = (event, selectionSurface) =>",
-  mainPreviewPlaybackEnd,
+  "const toggleSharedLoaderVideoSelection = (event, selectionSurface) =>",
 );
 const selectionHandlerEnd = widgetSource.indexOf(
-  "const deleteVideoAsset = (event, button) =>",
+  "const commitSharedLoaderVideoDrag = (nextState, details = {}) =>",
   selectionHandlerStart,
 );
 assert.ok(selectionHandlerStart >= 0 && selectionHandlerEnd > selectionHandlerStart);

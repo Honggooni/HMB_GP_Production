@@ -277,13 +277,23 @@ const originalToggleHandler = widgetSource.slice(
   widgetSource.indexOf('on(container.querySelector("#original-preview-toggle")'),
   widgetSource.indexOf('on(container.querySelector("#mask-playblast-toggle")'),
 );
-assert.match(originalToggleHandler, /original_enabled:\s*originalEnabled/);
+assert.match(originalToggleHandler, /"original_enabled"/);
+const outputChoiceHandler = widgetSource.slice(
+  widgetSource.indexOf("const queueOutputChoice ="),
+  widgetSource.indexOf('on(container.querySelector("#original-preview-toggle")'),
+);
 assert.match(
-  originalToggleHandler,
-  /commit\(next,\s*\{\s*suppressMatchingEcho:\s*true\s*\}\)/,
+  outputChoiceHandler,
+  /\[field\]:\s*enabled/,
+  "All four output checkboxes must update the requested state field through one path.",
+);
+assert.match(
+  outputChoiceHandler,
+  /hmbApplyPickerOutputChoicesToDom\([\s\S]*?schedulePickerStatePublicationAfterPaint\([\s\S]*?commitOptions:\s*\{\s*suppressMatchingEcho:\s*true\s*\}/,
+  "Output toggles must paint locally, then coalesce one exact-echo-suppressed publication.",
 );
 assert.doesNotMatch(
-  originalToggleHandler,
+  `${outputChoiceHandler}\n${originalToggleHandler}`,
   /dispatchCommand\s*\(/,
   "Changing Original must never render or dispatch a backend command.",
 );
@@ -294,7 +304,7 @@ assert.doesNotMatch(
 );
 assert.match(
   widgetSource,
-  /originalPreviewToggle\.checked = !!next\?\.original_enabled/,
+  /\["#original-preview-toggle",\s*!!state\?\.original_enabled\]/,
   "Immediate command UI must synchronize the live checkbox property.",
 );
 assert.match(
@@ -314,7 +324,7 @@ const maskToggleHandler = widgetSource.slice(
   widgetSource.indexOf('on(container.querySelector("#mask-playblast-toggle")'),
   widgetSource.indexOf('on(container.querySelector("#depth-playblast-toggle")'),
 );
-assert.match(maskToggleHandler, /mask_enabled:\s*maskEnabled/);
+assert.match(maskToggleHandler, /"mask_enabled"/);
 assert.doesNotMatch(maskToggleHandler, /dispatchCommand\s*\(/);
 
 assert.match(
@@ -339,7 +349,7 @@ assert.match(
 );
 assert.match(
   widgetSource,
-  /depthPlayblastToggle\.checked = !!next\?\.depth_enabled/,
+  /\["#depth-playblast-toggle",\s*!!state\?\.depth_enabled\]/,
   "Immediate UI synchronization must retain the live Depth checkbox value.",
 );
 const depthToggleHandlerStart = widgetSource.indexOf('on(container.querySelector("#depth-playblast-toggle")');
@@ -347,11 +357,11 @@ const depthToggleHandler = widgetSource.slice(
   depthToggleHandlerStart,
   widgetSource.indexOf('on(container.querySelector("#motion-guide-toggle")', depthToggleHandlerStart),
 );
-assert.match(depthToggleHandler, /depth_enabled:\s*depthEnabled/);
+assert.match(depthToggleHandler, /"depth_enabled"/);
 assert.match(
-  depthToggleHandler,
-  /commit\(next,\s*\{\s*suppressMatchingEcho:\s*true\s*\}\)/,
-  "Depth changes are local state commits and must consume their matching echo without a full morph.",
+  outputChoiceHandler,
+  /schedulePickerStatePublicationAfterPaint\(next,[\s\S]*?commitOptions:\s*\{\s*suppressMatchingEcho:\s*true\s*\}/,
+  "Depth changes must be coalesced local state commits whose exact echo performs no full morph.",
 );
 
 const snapshotHandler = widgetSource.slice(
@@ -458,15 +468,35 @@ assert.match(
   /suppressMatchingEcho:\s*true/,
   "The exact preview region is updated before the optimistic host echo is suppressed.",
 );
+const autoplayStart = widgetSource.indexOf('const autoplayVideo = container.querySelector("#picker-video")');
 const autoplaySource = widgetSource.slice(
-  widgetSource.indexOf('Object.prototype.hasOwnProperty.call(container, "__hmbAutoplayVideoUid")'),
+  autoplayStart,
   widgetSource.indexOf(
     "const activityLogView",
-    widgetSource.indexOf('Object.prototype.hasOwnProperty.call(container, "__hmbAutoplayVideoUid")'),
+    autoplayStart,
   ),
 );
 assert.match(autoplaySource, /const autoplayVideo = container\.querySelector\("#picker-video"\)/);
+assert.match(autoplaySource, /Object\.prototype\.hasOwnProperty\.call\(container, "__hmbAutoplayVideoUid"\)/);
 assert.match(autoplaySource, /autoplayVideo\?\.play\?\.\(\)/);
 assert.doesNotMatch(autoplaySource, /video-asset-thumb-media/);
+
+const controllerUpdateSource = widgetSource.slice(
+  widgetSource.indexOf("container.__hmbVideoPickerControllerUpdate ="),
+  widgetSource.indexOf("if (!desiredPickerExpanded)", widgetSource.indexOf("container.__hmbVideoPickerControllerUpdate =")),
+);
+assert.match(
+  controllerUpdateSource,
+  /hmbConsumePendingPickerStateEcho[\s\S]*?acceptMatchingPickerStateEchoWithoutDom/,
+  "An exact optimistic echo must accept transport metadata without reparsing cards or interrupting media.",
+);
+assert.doesNotMatch(
+  controllerUpdateSource.slice(
+    controllerUpdateSource.indexOf("if (hmbConsumePendingPickerStateEcho"),
+    controllerUpdateSource.indexOf("hmbClearPendingPickerStateEcho"),
+  ),
+  /patchMountedPicker\(/,
+  "The exact-echo branch must not run the regional DOM/media patch.",
+);
 
 console.log("HMB VideoPicker exact local echo, forced main-preview autoplay, and no-blink regression: PASS");

@@ -207,6 +207,19 @@ MAX_VIDEO_ASSETS_PER_PICKER_SHOT = 10
 MAX_PICKER_VIDEO_ASSETS = (
     SHOT_ROUTING_MAX_SHOTS * MAX_VIDEO_ASSETS_PER_PICKER_SHOT
 )
+VIDEO_THUMBNAIL_WIDTH = 320
+VIDEO_THUMBNAIL_HEIGHT = 180
+VIDEO_THUMBNAIL_TIMEOUT_SECONDS = 20.0
+# StaticFilesManager URLs belong to one Python/static-server lifetime.  The
+# token is serialized beside each URL so a workflow reopened by a later engine
+# can discard only that process-local URL while retaining all durable media and
+# Shot ownership fields.
+_VIDEO_THUMBNAIL_RUNTIME_ID = uuid.uuid4().hex
+_VIDEO_THUMBNAIL_LOCK = threading.RLock()
+_VIDEO_THUMBNAIL_URLS: Dict[str, str] = {}
+_VIDEO_THUMBNAIL_ATTEMPTED: set[str] = set()
+_VIDEO_THUMBNAIL_FFMPEG: Optional[Path] = None
+_VIDEO_THUMBNAIL_FFMPEG_RESOLVED = False
 PICKER_DEFAULT_WORKSPACE_UUID = "00000000-0000-4000-8000-000000000001"
 VIDEO_REFERENCE_CAPABILITY_SCHEMA = "hmb-video-reference-capabilities"
 VIDEO_REFERENCE_CAPABILITY_VERSION = 1
@@ -4646,9 +4659,12 @@ def _new_picker_workspace_row(
         uid for uid in representative_uids if uid in set(asset_uids)
     ]
     requested_preview_uid = _clean(preview_video_uid)
+    # Output membership and the Loader preview cursor are independent. Keep a
+    # valid owned preview even when that card is not selected as an @video
+    # representative; name-click selection must never stop viewport playback.
     representative_uid = (
         requested_preview_uid
-        if requested_preview_uid in representative_uids
+        if requested_preview_uid in asset_uids
         else (representative_uids[0] if representative_uids else "")
     )
     return {
@@ -7140,6 +7156,13 @@ def _normalize_video_items(
         item["video_path"] = _clean(raw.get("video_path"))
         item["project_video_path"] = _clean(raw.get("project_video_path"))
         item["video_url"] = _clean(raw.get("video_url"))
+        item["thumbnail_url"] = _clean(raw.get("thumbnail_url"))
+        item["thumbnail_runtime_id"] = _clean(
+            raw.get("thumbnail_runtime_id")
+        )
+        item["thumbnail_source_signature"] = _clean(
+            raw.get("thumbnail_source_signature")
+        )
         item["camera"] = _clean(raw.get("camera"))
         item["markers"] = _normalize_markers(raw.get("markers"), marker_slot)
         if isinstance(raw.get("motion_guide_report"), dict):
@@ -7484,6 +7507,24 @@ def _append_video_asset(
     uid = _clean(record.get("video_uid") or record.get("source_uid"))
     if not uid or uid in existing_uids:
         uid = f"video-{uuid.uuid4().hex}"
+    thumbnail_url = (
+        _clean(record.get("thumbnail_url"))
+        if _clean(record.get("thumbnail_runtime_id"))
+        == _VIDEO_THUMBNAIL_RUNTIME_ID
+        else ""
+    )
+    if not thumbnail_url:
+        local_video = _resolved_video_asset_path(record)
+        if local_video is not None:
+            thumbnail_url, thumbnail_signature = _video_asset_thumbnail_url(
+                local_video,
+                uid,
+            )
+            if thumbnail_signature:
+                record["thumbnail_source_signature"] = thumbnail_signature
+    if thumbnail_url:
+        record["thumbnail_url"] = thumbnail_url
+        record["thumbnail_runtime_id"] = _VIDEO_THUMBNAIL_RUNTIME_ID
     record.update({
         "video_uid": uid,
         "source_uid": uid,
@@ -10205,8 +10246,178 @@ def _external_media_url(path: Path) -> str:
         return str(resolved).replace("\\", "/")
 
 
+def _resolved_video_asset_path(value: Any) -> Optional[Path]:
+    """Return the first durable, readable local source for one catalog card."""
+
+    item = value if isinstance(value, dict) else {}
+    probe_cache: Dict[str, Optional[Path]] = {}
+    for field in (
+        "project_video_path",
+        "video_path",
+        "import_source_path",
+    ):
+        reference = _clean(item.get(field))
+        if not reference:
+            continue
+        try:
+            resolved = _resolve_readable_video_reference(
+                reference,
+                probe_cache=probe_cache,
+            )
+        except Exception as exc:
+            _diagnostic_exception("Video thumbnail source probe failed", exc)
+            resolved = None
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def _video_thumbnail_signature(path: Path) -> str:
+    """Return a durable source signature without retaining the local path."""
+
+    try:
+        resolved = path.resolve()
+        details = resolved.stat()
+        signature_text = "|".join((
+            str(resolved).replace("\\", "/").casefold(),
+            str(int(details.st_size)),
+            str(int(details.st_mtime_ns)),
+        ))
+    except Exception:
+        return ""
+    return hashlib.sha256(signature_text.encode("utf-8")).hexdigest()[:24]
+
+
+def _video_thumbnail_ffmpeg() -> Optional[Path]:
+    """Resolve the package-managed FFmpeg binary once per engine process."""
+
+    global _VIDEO_THUMBNAIL_FFMPEG, _VIDEO_THUMBNAIL_FFMPEG_RESOLVED
+    with _VIDEO_THUMBNAIL_LOCK:
+        if not _VIDEO_THUMBNAIL_FFMPEG_RESOLVED:
+            # Reuse the same trusted discovery policy as playblast encoding,
+            # including an application-local binary beside mayabatch.
+            _VIDEO_THUMBNAIL_FFMPEG = _find_ffmpeg(_find_mayabatch())
+            _VIDEO_THUMBNAIL_FFMPEG_RESOLVED = True
+        return _VIDEO_THUMBNAIL_FFMPEG
+
+
+def _video_asset_thumbnail_url(
+    path: Path,
+    video_uid: Any,
+) -> tuple[str, str]:
+    """Decode and publish one cached 320x180 PNG poster for a local video.
+
+    Cache identity follows file path, size, and mtime.  The lock intentionally
+    covers extraction and publication: simultaneous append/recovery workers for
+    the same source therefore invoke FFmpeg and ``save_static_file`` only once.
+    Failures are non-fatal because the video card and playback URL remain the
+    durable authority.
+    """
+
+    try:
+        resolved = path.resolve()
+    except Exception:
+        return "", ""
+    signature = _video_thumbnail_signature(resolved)
+    if not signature:
+        return "", ""
+
+    with _VIDEO_THUMBNAIL_LOCK:
+        cached = _clean(_VIDEO_THUMBNAIL_URLS.get(signature))
+        if cached:
+            return cached, signature
+        if signature in _VIDEO_THUMBNAIL_ATTEMPTED:
+            return "", signature
+        if len(_VIDEO_THUMBNAIL_ATTEMPTED) >= MAX_PICKER_VIDEO_ASSETS * 4:
+            try:
+                _VIDEO_THUMBNAIL_ATTEMPTED.pop()
+            except KeyError:
+                pass
+        _VIDEO_THUMBNAIL_ATTEMPTED.add(signature)
+        try:
+            ffmpeg = _video_thumbnail_ffmpeg()
+        except Exception as exc:
+            _diagnostic_exception("Video thumbnail FFmpeg lookup failed", exc)
+            return "", signature
+        if ffmpeg is None:
+            return "", signature
+        command = [
+            str(ffmpeg),
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(resolved),
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+            "-vf",
+            (
+                f"scale={VIDEO_THUMBNAIL_WIDTH}:{VIDEO_THUMBNAIL_HEIGHT}:"
+                "force_original_aspect_ratio=decrease,"
+                f"pad={VIDEO_THUMBNAIL_WIDTH}:{VIDEO_THUMBNAIL_HEIGHT}:"
+                "(ow-iw)/2:(oh-ih)/2:color=black"
+            ),
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "pipe:1",
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=VIDEO_THUMBNAIL_TIMEOUT_SECONDS,
+                check=False,
+                creationflags=_creation_flags(),
+            )
+            png_bytes = bytes(completed.stdout or b"")
+            if (
+                completed.returncode != 0
+                or not png_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+                or len(png_bytes) > 8 * 1024 * 1024
+            ):
+                return "", signature
+            from griptape_nodes.retained_mode.griptape_nodes import (  # type: ignore
+                GriptapeNodes,
+            )
+
+            safe_uid = re.sub(
+                r"[^0-9A-Za-z_-]+",
+                "_",
+                _clean(video_uid),
+            )[:32] or "video"
+            filename = f"hmb_video_thumb_{safe_uid}_{signature}.png"
+            url = _clean(
+                GriptapeNodes.StaticFilesManager().save_static_file(
+                    png_bytes,
+                    filename,
+                )
+            )
+        except Exception as exc:
+            _diagnostic_exception("Video thumbnail publication failed", exc)
+            url = ""
+        if url:
+            if len(_VIDEO_THUMBNAIL_URLS) >= MAX_PICKER_VIDEO_ASSETS * 2:
+                try:
+                    _VIDEO_THUMBNAIL_URLS.pop(
+                        next(iter(_VIDEO_THUMBNAIL_URLS))
+                    )
+                except (KeyError, StopIteration):
+                    pass
+            _VIDEO_THUMBNAIL_URLS[signature] = url
+        return url, signature
+
+
 def _refresh_saved_video_media_urls(
     value: Any,
+    *,
+    clear_process_thumbnail_urls: bool = True,
 ) -> tuple[Dict[str, Any], bool]:
     """Rebind saved video cards to this engine's static-media server.
 
@@ -10227,6 +10438,19 @@ def _refresh_saved_video_media_urls(
     restored_count = 0
 
     for item in videos:
+        # ``thumbnail_url`` is served by the current process' static manager,
+        # just like ``video_url``.  Clear stale saved URLs synchronously, but do
+        # not decode any frame here; a daemon recovery worker performs that
+        # bounded work after hydration.
+        thumbnail_url = _clean(item.get("thumbnail_url"))
+        thumbnail_runtime_id = _clean(item.get("thumbnail_runtime_id"))
+        if thumbnail_url and (
+            clear_process_thumbnail_urls
+            or thumbnail_runtime_id != _VIDEO_THUMBNAIL_RUNTIME_ID
+        ):
+            item["thumbnail_url"] = ""
+            item["thumbnail_runtime_id"] = ""
+            changed = True
         references: List[str] = []
         for field in (
             "project_video_path",
@@ -12275,6 +12499,10 @@ class HMBVideoPickerLibrary(DataNode):
         # overwrite another import or resurrect an ImageAsset-deleted Shot.
         self._hmb_catalog_commit_lock = threading.RLock()
         self._hmb_shot_snapshot_lock = threading.RLock()
+        self._hmb_thumbnail_worker_lock = threading.Lock()
+        self._hmb_thumbnail_worker: Optional[threading.Thread] = None
+        self._hmb_thumbnail_recovery_generation = 0
+        self._hmb_thumbnail_serialized_adoption_complete = False
         self._hmb_latest_widget_state: Optional[Dict[str, Any]] = None
         self._hmb_authoritative_state: Optional[Dict[str, Any]] = None
         self._hmb_state_revision = 0
@@ -12706,6 +12934,7 @@ class HMBVideoPickerLibrary(DataNode):
                 if isinstance(row, dict)
                 and _uuid_text(row.get("workspace_uuid"))
             }
+            accepted_workspace_delta = False
             merged_rows: List[Dict[str, Any]] = []
             for raw_row in merged.get("picker_shots", []):
                 if not isinstance(raw_row, dict):
@@ -12736,6 +12965,7 @@ class HMBVideoPickerLibrary(DataNode):
                     isinstance(incoming_row, dict)
                     and incoming_row_revision > row_revision
                 ):
+                    accepted_workspace_delta = True
                     owned_uids = _picker_representative_video_uids(
                         row.get("video_asset_uids")
                     )
@@ -12798,6 +13028,85 @@ class HMBVideoPickerLibrary(DataNode):
                 for row in merged_rows
             }:
                 merged["active_picker_shot_uuid"] = requested_active_uuid
+
+            if accepted_workspace_delta:
+                # ``videos[*].selected`` is the legacy global projection of
+                # the active Picker Shot.  A current row edit can legitimately
+                # make its selected list empty while an unselected card keeps
+                # playing in the Loader preview.  Project the accepted row
+                # before the final parse so the legacy catalog flags cannot
+                # resurrect the just-deselected card as a fallback selection.
+                active_workspace_uuid = _uuid_text(
+                    merged.get("active_picker_shot_uuid")
+                )
+                active_workspace = next(
+                    (
+                        row for row in merged_rows
+                        if _uuid_text(row.get("workspace_uuid"))
+                        == active_workspace_uuid
+                    ),
+                    None,
+                )
+                if isinstance(active_workspace, dict):
+                    owned_uids = _picker_representative_video_uids(
+                        active_workspace.get("video_asset_uids")
+                    )
+                    owned_set = set(owned_uids)
+                    selected_uids = _picker_representative_video_uids(
+                        active_workspace.get("selected_video_uids"),
+                        "",
+                        owned_set,
+                    )
+                    selection_order_by_uid = {
+                        uid: index + 1
+                        for index, uid in enumerate(selected_uids)
+                    }
+                    active_workspace["selected_video_uids"] = selected_uids
+                    preview_uid = _clean(
+                        active_workspace.get("preview_video_uid")
+                    )
+                    if preview_uid not in owned_set:
+                        preview_uid = (
+                            selected_uids[0]
+                            if selected_uids
+                            else owned_uids[0]
+                            if owned_uids else ""
+                        )
+                    active_workspace["preview_video_uid"] = preview_uid
+                    for item in merged.get("videos", []):
+                        if not isinstance(item, dict):
+                            continue
+                        uid = _clean(
+                            item.get("video_uid") or item.get("source_uid")
+                        )
+                        order = selection_order_by_uid.get(uid, 0)
+                        item["selected"] = bool(order)
+                        item["selection_order"] = order
+                        item["video_slot"] = order
+                        if isinstance(item.get("frame_metadata"), dict):
+                            item["frame_metadata"]["video_slot"] = (
+                                f"@video{order}" if order else ""
+                            )
+                    merged["preview_video_uid"] = preview_uid
+                    merged["selected_video_uid"] = preview_uid
+                    resolved_preview_slot = (
+                        selection_order_by_uid.get(preview_uid)
+                        or max(
+                            1,
+                            min(
+                                max(1, len(selected_uids)),
+                                _positive_int(
+                                    active_workspace.get(
+                                        "selected_video_slot"
+                                    )
+                                ) or 1,
+                            ),
+                        )
+                    )
+                    active_workspace["selected_video_slot"] = (
+                        resolved_preview_slot
+                    )
+                    merged["selected_video_slot"] = resolved_preview_slot
         # Snapshot media/history is backend authoritative. A current widget may
         # move only the active pointer/view mode, and an older browser echo may
         # not roll either pointer back after Python has published new history.
@@ -15689,6 +15998,15 @@ class HMBVideoPickerLibrary(DataNode):
         setter has stored it, while leaving every normal transaction on the
         existing before/store/after path.
         """
+        if (
+            initial_setup
+            and param_name == WIDGET_STATE_PARAMETER
+            and hasattr(self, "_hmb_runtime_instance_id")
+        ):
+            # A new serialized snapshot (including loading another workflow in
+            # the same engine process) must rebind every process-local poster.
+            self._hmb_thumbnail_serialized_adoption_complete = False
+            self._hmb_thumbnail_recovery_generation = 0
         parent_setter = super().set_parameter_value
         if (
             not initial_setup
@@ -17027,6 +17345,166 @@ class HMBVideoPickerLibrary(DataNode):
         )
         self._write_state(state)
 
+    def _recover_missing_video_thumbnails(
+        self,
+        owner_generation: int,
+    ) -> None:
+        """Backfill restored card posters and publish one UID-scoped merge."""
+
+        published: Dict[str, tuple[str, str]] = {}
+        try:
+            if (
+                getattr(self, "_hmb_node_deleted", False)
+                or owner_generation
+                != int(getattr(self, "_hmb_lifecycle_generation", 0) or 0)
+            ):
+                return
+            snapshot = self._picker_state()
+            for raw_item in snapshot.get("videos", []):
+                if (
+                    getattr(self, "_hmb_node_deleted", False)
+                    or owner_generation
+                    != int(
+                        getattr(self, "_hmb_lifecycle_generation", 0) or 0
+                    )
+                ):
+                    return
+                if not isinstance(raw_item, dict):
+                    continue
+                if (
+                    _clean(raw_item.get("thumbnail_url"))
+                    and _clean(raw_item.get("thumbnail_runtime_id"))
+                    == _VIDEO_THUMBNAIL_RUNTIME_ID
+                ):
+                    continue
+                uid = _clean(
+                    raw_item.get("video_uid") or raw_item.get("source_uid")
+                )
+                if not uid:
+                    continue
+                local_video = _resolved_video_asset_path(raw_item)
+                if local_video is None:
+                    continue
+                url, signature = _video_asset_thumbnail_url(local_video, uid)
+                if url and signature:
+                    published[uid] = (url, signature)
+            if not published:
+                return
+
+            with self._hmb_catalog_state_commit():
+                if (
+                    getattr(self, "_hmb_node_deleted", False)
+                    or owner_generation
+                    != int(
+                        getattr(self, "_hmb_lifecycle_generation", 0) or 0
+                    )
+                ):
+                    return
+                latest = self._picker_state()
+                videos = [
+                    dict(item)
+                    for item in latest.get("videos", [])
+                    if isinstance(item, dict)
+                ]
+                changed = False
+                for item in videos:
+                    uid = _clean(
+                        item.get("video_uid") or item.get("source_uid")
+                    )
+                    result = published.get(uid)
+                    if result is None:
+                        continue
+                    if (
+                        _clean(item.get("thumbnail_url"))
+                        and _clean(item.get("thumbnail_runtime_id"))
+                        == _VIDEO_THUMBNAIL_RUNTIME_ID
+                    ):
+                        continue
+                    local_video = _resolved_video_asset_path(item)
+                    if local_video is None:
+                        continue
+                    url, source_signature = result
+                    if _video_thumbnail_signature(local_video) != source_signature:
+                        # The card's source changed while FFmpeg was decoding;
+                        # never attach the previous source's frame to that UID.
+                        continue
+                    item.update({
+                        "thumbnail_url": url,
+                        "thumbnail_runtime_id": _VIDEO_THUMBNAIL_RUNTIME_ID,
+                        "thumbnail_source_signature": source_signature,
+                    })
+                    changed = True
+                if changed:
+                    latest["videos"] = videos
+                    # _write_state normalizes against the newest catalog and
+                    # increments one global revision. Selection/order and all
+                    # expanded playback fields are left byte-for-byte intact.
+                    self._write_state(latest)
+        except Exception as exc:
+            _diagnostic_exception("Video thumbnail recovery failed", exc)
+        finally:
+            worker_lock = getattr(self, "_hmb_thumbnail_worker_lock", None)
+            if worker_lock is not None:
+                with worker_lock:
+                    if getattr(self, "_hmb_thumbnail_worker", None) is (
+                        threading.current_thread()
+                    ):
+                        self._hmb_thumbnail_worker = None
+
+    def _schedule_missing_video_thumbnail_recovery(self) -> bool:
+        """Start at most one daemon backfill for this node lifecycle."""
+
+        worker_lock = getattr(self, "_hmb_thumbnail_worker_lock", None)
+        if worker_lock is None or getattr(self, "_hmb_node_deleted", False):
+            return False
+        current = getattr(self, "_hmb_authoritative_state", None)
+        if not isinstance(current, dict):
+            return False
+        has_missing_thumbnail = any(
+            isinstance(item, dict)
+            and not (
+                _clean(item.get("thumbnail_url"))
+                and _clean(item.get("thumbnail_runtime_id"))
+                == _VIDEO_THUMBNAIL_RUNTIME_ID
+            )
+            and any(
+                _clean(item.get(field))
+                for field in (
+                    "project_video_path",
+                    "video_path",
+                    "import_source_path",
+                )
+            )
+            for item in current.get("videos", [])
+        )
+        if not has_missing_thumbnail:
+            # Do not consume this lifecycle's one backfill when an early host
+            # hook fires before the serialized media catalog is installed.
+            return False
+        owner_generation = int(
+            getattr(self, "_hmb_lifecycle_generation", 0) or 0
+        )
+        if owner_generation <= 0:
+            return False
+        with worker_lock:
+            existing = getattr(self, "_hmb_thumbnail_worker", None)
+            if existing is not None and existing.is_alive():
+                return False
+            if int(
+                getattr(self, "_hmb_thumbnail_recovery_generation", 0) or 0
+            ) == owner_generation:
+                return False
+            self._hmb_thumbnail_recovery_generation = owner_generation
+            worker = threading.Thread(
+                target=self._recover_missing_video_thumbnails,
+                args=(owner_generation,),
+                name="HMBVideoPicker-thumbnail-recovery",
+                daemon=True,
+            )
+            self._hmb_thumbnail_worker = worker
+            worker.start()
+        return True
+
     def _restore_dynamic_state(self, *, adopt_serialized: bool = False) -> None:
         """Restore only the saved state; never auto-reset it during reconnect."""
         try:
@@ -17036,8 +17514,16 @@ class HMBVideoPickerLibrary(DataNode):
                     WIDGET_STATE_PARAMETER,
                 )
                 raw_state = _parse_state(serialized_state)
+                clear_process_thumbnail_urls = not bool(
+                    getattr(
+                        self,
+                        "_hmb_thumbnail_serialized_adoption_complete",
+                        False,
+                    )
+                )
                 raw_state, media_urls_refreshed = _refresh_saved_video_media_urls(
-                    raw_state
+                    raw_state,
+                    clear_process_thumbnail_urls=clear_process_thumbnail_urls,
                 )
                 expanded_node_size = _reconciled_picker_expanded_state_size(
                     serialized_state,
@@ -17123,11 +17609,17 @@ class HMBVideoPickerLibrary(DataNode):
                 # initial_setup bypasses after_value_set(), so no deferred
                 # restored-state revision may remain after this direct adopt.
                 self._hmb_restored_state_pending_revision = -1
+                self._hmb_thumbnail_serialized_adoption_complete = True
                 if needs_publication:
                     self._write_state(raw_state)
             self._ensure_parameters()
             state = self._apply_selected_view_fields(self._picker_state())
             self._sync_outputs_from_state(state)
+            if adopt_serialized:
+                # Never decode up to 50 restored videos on the retained-mode
+                # hydration path. The daemon performs a single batched state
+                # merge after the saved state is visible and interactive.
+                self._schedule_missing_video_thumbnail_recovery()
         except Exception as exc:
             _diagnostic_exception("Dynamic state restore failed", exc)
 

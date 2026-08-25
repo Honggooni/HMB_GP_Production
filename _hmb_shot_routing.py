@@ -5,8 +5,11 @@ from __future__ import annotations
 The public UI presents this as a cable-free Shot selector.  The retained-mode
 engine still needs real data edges so upstream execution, save/load, and
 invalidation remain deterministic.  This module discovers only nodes in the
-caller's parent flow and creates those dependency edges behind hidden
-parameters.  Media and prompt payloads never enter a process-global registry.
+caller's parent flow and creates those dependency edges behind hidden media
+parameters. The exact Agent.output -> Seedance.prompt edge stays public so the
+host owns normal connected-port state; its visual cable is hidden by the
+Seedance widget. Media and prompt payloads never enter a process-global
+registry.
 """
 
 from dataclasses import dataclass
@@ -1100,7 +1103,11 @@ def _clear_remote_edges(
         )
     elif subscription.kind == KIND_SEEDANCE:
         routes = (
-            # Legacy automatic Agent/Prompt routes are removed during migration.
+            # The public prompt edge is routing-owned only when its source is
+            # an HMB participant's exact ``output`` port. Foreign/manual text
+            # sources remain user-owned and are preserved by _clear_hmb_route.
+            ("prompt", "output"),
+            # Legacy hidden Agent/Prompt routes are removed during migration.
             ("SHOT_PROMPT_IN", "output"),
             ("SHOT_IMAGE_IN", "SHOT_IMAGE_OUT"),
             ("SHOT_VIDEO_IN", "SHOT_VIDEO_OUT"),
@@ -1687,8 +1694,8 @@ def reconcile_shot_routing(
             # callback, so there is no enabled -> disabled snapshot above.
             # Prompt uses dedicated hidden remote inputs; clearing those exact
             # HMB edges is safe and prevents inactive upstream invalidations.
-            # A blank Seedance is remote-waiting, never Only, but its hidden
-            # stale routes are likewise safe to clear.
+            # A disabled Seedance is Only or remote-waiting; its managed public
+            # prompt and hidden media routes are likewise safe to clear.
             # Agent keeps public ``prompt`` exclusively for native Only mode;
             # only its dedicated hidden SHOT_PROMPT_IN route is managed here.
             for recipient in tuple(values):
@@ -1704,6 +1711,20 @@ def reconcile_shot_routing(
                     f"{recipient.node_name}: {detail}"
                     for detail in clear_failures
                 )
+                if recipient.kind == KIND_SEEDANCE:
+                    # Publish the disconnected UI state only after retained
+                    # mode has removed the real edge. Otherwise the widget
+                    # would unhide a still-live cable during Shot -> Only.
+                    _notify_status(
+                        recipient.node,
+                        ok=not clear_failures,
+                        code="only" if not clear_failures else "route_incomplete",
+                        details=(
+                            "Only mode has no managed Agent prompt connection."
+                            if not clear_failures
+                            else "; ".join(clear_failures)
+                        ),
+                    )
 
             # One Prompt owns one Shot in one flow.  Never use node age/name as
             # an ownership guess.  A restored exact Prompt -> Agent edge may
@@ -1838,7 +1859,8 @@ def reconcile_shot_routing(
 
             # Agent ownership is also exactly 1:1 per Shot.  Never choose an
             # Agent merely because it was registered first.  A saved exact
-            # Seedance <- Agent edge is the only admissible tie breaker; it
+            # Seedance.prompt <- Agent.output edge is the only admissible tie
+            # breaker; it
             # preserves that established pair and returns additional claimants
             # to Only.  With no exact edge, every duplicate stays fail-closed.
             agent_groups: dict[tuple[str, str], list[ShotSubscription]] = {}
@@ -1865,7 +1887,7 @@ def reconcile_shot_routing(
                         str(getattr(connection, "source_node_name", ""))
                         for connection in _incoming_connections(seedance.node)
                         if str(getattr(connection, "target_parameter_name", ""))
-                        == "SHOT_PROMPT_IN"
+                        in {"prompt", "SHOT_PROMPT_IN"}
                         and str(getattr(connection, "source_parameter_name", ""))
                         == "output"
                         and str(getattr(connection, "source_node_name", ""))
@@ -2113,8 +2135,11 @@ def reconcile_shot_routing(
                     failures.append(f"{agent.node_name}: {detail}")
                 _notify_status(agent.node, ok=ok, code="ready" if ok else "route_incomplete")
 
-            # Seedance prompt input is intentionally manual. Hidden routing only
-            # supplies exact ImageAsset and VideoPicker sources for its Shot.
+            # Seedance receives the exact Agent final text selected for the
+            # same Shot through its public prompt input.  Keeping a real public
+            # edge lets the host render both ports as connected; the Seedance
+            # widget hides only that exact edge line. ImageAsset and
+            # VideoPicker continue to use their dedicated hidden inputs.
             unresolved_seedance_ids: set[int] = set()
             seedance_groups: dict[
                 tuple[str, str], list[ShotSubscription]
@@ -2198,6 +2223,16 @@ def reconcile_shot_routing(
                 and id(item.node) not in unresolved_seedance_ids
             ]
             for target in seedance_nodes:
+                agent, agent_duplicate = _single(
+                    (
+                        item
+                        for item in routable_values
+                        if id(item.node) not in unresolved_agent_ids
+                    ),
+                    kind=KIND_AGENT,
+                    channel_uuid=target.channel_uuid,
+                    shot_uuid=target.shot_uuid,
+                )
                 image, image_duplicate = _single(
                     routable_values,
                     kind=KIND_IMAGE_ASSET,
@@ -2212,14 +2247,27 @@ def reconcile_shot_routing(
                     image is not None and id(image.node) in catalog_rejected_node_ids
                     or picker is not None and id(picker.node) in catalog_rejected_node_ids
                 )
+                agent_identity_mismatch = bool(
+                    agent is not None
+                    and (
+                        agent.shot_number != target.shot_number
+                        or agent.shot_name != target.shot_name
+                    )
+                )
                 if (
-                    image_duplicate
+                    agent_duplicate
+                    or agent_identity_mismatch
+                    or image_duplicate
                     or picker_duplicate
                     or (image is None and picker is None)
                     or source_rejected
                 ):
                     code = (
-                        "duplicate_shot_source"
+                        "duplicate_agent"
+                        if agent_duplicate
+                        else "shot_identity_mismatch"
+                        if agent_identity_mismatch
+                        else "duplicate_shot_source"
                         if (image_duplicate or picker_duplicate)
                         else "shot_source_unavailable"
                     )
@@ -2227,8 +2275,9 @@ def reconcile_shot_routing(
                     for target_parameter, source_parameter in (
                         ("SHOT_ASSET_IN", "SHOT_ASSET_OUT"),
                         ("SHOT_PICKER_IN", "SHOT_PICKER_OUT"),
-                        # Remove saved automatic Agent/Prompt routes without
-                        # touching the public manual `prompt` parameter.
+                        # Remove only HMB Agent.output prompt routes. A foreign
+                        # or differently-typed manual prompt source is kept.
+                        ("prompt", "output"),
                         ("SHOT_PROMPT_IN", "output"),
                         ("SHOT_IMAGE_IN", "SHOT_IMAGE_OUT"),
                         ("SHOT_VIDEO_IN", "SHOT_VIDEO_OUT"),
@@ -2244,8 +2293,8 @@ def reconcile_shot_routing(
                             failures.append(f"{target.node_name}: {detail}")
                     _notify_status(target.node, ok=False, code=code)
                     continue
-                # Always retire legacy automatic prompt/media connections before
-                # creating the two direct source dependencies.
+                # Always retire legacy hidden prompt/media connections before
+                # creating the public Agent prompt and direct media sources.
                 for target_parameter, source_parameter in (
                     ("SHOT_PROMPT_IN", "output"),
                     ("SHOT_IMAGE_IN", "SHOT_IMAGE_OUT"),
@@ -2259,6 +2308,41 @@ def reconcile_shot_routing(
                     )
                     changed += removed
                     if detail.startswith("unable"):
+                        failures.append(f"{target.node_name}: {detail}")
+                if agent is None:
+                    removed, detail = _clear_hmb_route(
+                        target.node,
+                        "prompt",
+                        by_name,
+                        source_parameter="output",
+                    )
+                    changed += removed
+                    if detail.startswith("unable"):
+                        failures.append(f"{target.node_name}: {detail}")
+                else:
+                    prepare_prompt_route = getattr(
+                        target.node,
+                        "_hmb_prepare_remote_prompt_route",
+                        None,
+                    )
+                    if callable(prepare_prompt_route):
+                        try:
+                            prepare_prompt_route(agent.node)
+                        except Exception:
+                            # Edge visibility metadata is presentation-only;
+                            # retained-mode connection authority remains below.
+                            pass
+                    ok, detail = _ensure_edge(
+                        ShotEdge(
+                            agent.node,
+                            "output",
+                            target.node,
+                            "prompt",
+                        ),
+                        by_name,
+                    )
+                    changed += int(ok and detail == "created")
+                    if not ok:
                         failures.append(f"{target.node_name}: {detail}")
                 for source, source_parameter, target_parameter in (
                     (image, "SHOT_ASSET_OUT", "SHOT_ASSET_IN"),

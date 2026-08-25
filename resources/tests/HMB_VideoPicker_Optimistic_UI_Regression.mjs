@@ -134,12 +134,15 @@ assert.match(main, /hmbApplyPickerCameraSelectionToDom\(container, next\);\s*com
 assert.match(main, /hmbApplyPickerResolutionToDom\(container, selected\.width, selected\.height\);\s*commit\(next\);/);
 assert.match(
   main,
-  /hmbApplySelectedVideoAssetOrderToDom\(container, nextState, tr, pickerLocalInteractionLocked\(nextState\)\);[\s\S]*?const loggedState = appendActivityLog[\s\S]*?schedulePickerStatePublicationAfterPaint\(/,
+  /hmbApplySelectedVideoAssetOrderToDom\(\s*container,\s*nextState,\s*liveTr,\s*pickerLocalInteractionLocked\(nextState\),?\s*\);[\s\S]*?schedulePickerStatePublicationAfterPaint\(/,
 );
 assert.match(main, /const snapshotUpdated = hmbApplySnapshotNavigationFeedback/);
 assert.match(main, /commit\(next, \{ suppressMatchingEcho: snapshotUpdated \}\)/);
 assert.match(widgetSource, /current\.__hmbPendingPickerVideoSource = desiredSource/);
-assert.match(main, /hmbStagePickerViewportVideoSource\([\s\S]*?completeRequestedPreviewSwitch,[\s\S]*?failRequestedPreviewSwitch/);
+assert.match(
+  main,
+  /hmbStagePickerViewportVideoSource\([\s\S]*?\(\) => completeRequestedPreviewSwitch\(requestedUid, requestedUrl, requestToken\),[\s\S]*?\(\) => failRequestedPreviewSwitch\(requestedUid, requestToken\),[\s\S]*?requestToken/,
+);
 assert.match(widgetSource, /HMB_PICKER_VIDEO_PRELOAD_TIMEOUT_MS = 15000/);
 assert.match(widgetSource, /id="picker-preview-load-status"[\s\S]*?role="alert"[\s\S]*?id="retry-picker-preview-load"/);
 assert.match(main, /completeRequestedPreviewSwitch[\s\S]*?hmbClearPickerPreviewLoadFailure\(container\)/);

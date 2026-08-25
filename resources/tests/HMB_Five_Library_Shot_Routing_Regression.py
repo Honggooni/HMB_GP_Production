@@ -95,6 +95,7 @@ class Participant:
         self.preferred_shot_uuid = ""
         self.catalog_count = 0
         self.statuses: list[dict[str, Any]] = []
+        self.prepared_prompt_sources: list[str] = []
         self._hmb_node_deleted = False
 
     def _hmb_shot_channel_subscription(self) -> dict[str, Any]:
@@ -132,6 +133,10 @@ class Participant:
         if isinstance(value, dict):
             self.statuses.append(dict(value))
 
+    def _hmb_prepare_remote_prompt_route(self, source: Any) -> bool:
+        self.prepared_prompt_sources.append(str(source.name))
+        return True
+
 
 image = Participant(
     "ImageAsset",
@@ -152,14 +157,17 @@ created_edges: set[tuple[str, str, str, str]] = set()
 
 
 def ensure_edge(edge: Any, _subscriptions: Any) -> tuple[bool, str]:
-    created_edges.add(
-        (
-            edge.source.name,
-            edge.source_parameter,
-            edge.target.name,
-            edge.target_parameter,
-        )
+    if edge.target_parameter == "prompt":
+        assert edge.target.prepared_prompt_sources[-1] == edge.source.name
+    identity = (
+        edge.source.name,
+        edge.source_parameter,
+        edge.target.name,
+        edge.target_parameter,
     )
+    if identity in created_edges:
+        return True, "existing"
+    created_edges.add(identity)
     return True, "created"
 
 
@@ -183,18 +191,29 @@ assert seedance.catalog_count == 1
 assert prompt.shot_uuid == SHOT
 assert agent.shot_uuid == SHOT
 assert seedance.shot_uuid == SHOT
+assert seedance.prepared_prompt_sources == ["Agent"]
 
 assert created_edges == {
     ("ImageAsset", "SHOT_ASSET_OUT", "Prompt", "SHOT_ASSET_IN"),
     ("VideoPicker", "SHOT_PICKER_OUT", "Prompt", "SHOT_PICKER_IN"),
     ("Prompt", "PROMPT_OUT", "Agent", "SHOT_PROMPT_IN"),
+    ("Agent", "output", "Seedance", "prompt"),
     ("ImageAsset", "SHOT_ASSET_OUT", "Seedance", "SHOT_ASSET_IN"),
     ("VideoPicker", "SHOT_PICKER_OUT", "Seedance", "SHOT_PICKER_IN"),
 }
+saved_edges = set(created_edges)
+reload_result = routing.reconcile_shot_routing(
+    image,
+    _allow_unready_cleanup=True,
+)
+assert reload_result["ok"] is True, reload_result
+assert reload_result["changed"] == 0, reload_result
+assert created_edges == saved_edges
 
 
-# Seedance must route either media source independently. Prompt text stays on
-# the public/manual input and therefore creates no hidden Prompt/Agent edge.
+# Seedance must route either media source independently. Without an exact Agent
+# for the selected Shot, its public prompt stays authored/manual and no managed
+# prompt edge is created.
 image_only_source = Participant(
     "ImageOnly",
     routing.KIND_IMAGE_ASSET,
@@ -395,9 +414,9 @@ assert duplicate_a.statuses[-1]["code"] == "only"
 assert duplicate_b.statuses[-1]["code"] == "only"
 
 
-# Three independent Shot chains must remain exact even though every managed
+# Five independent Shot chains must remain exact even though every managed
 # edge is hidden from the canvas. No node age/name fallback may cross-connect
-# Prompt 1 to Agent/Seedance 2 or 3.
+# Prompt 1 to Agent/Seedance 2 through 5.
 multi_shots = [
     {
         "shot_uuid": f"{number}3333333-3333-4333-8333-333333333333"[:36],
@@ -405,7 +424,7 @@ multi_shots = [
         "name": f"Shot {number}",
         "revision": 1,
     }
-    for number in (1, 2, 3)
+    for number in (1, 2, 3, 4, 5)
 ]
 
 
@@ -478,13 +497,14 @@ multi_result = routing.reconcile_shot_routing(
     _allow_unready_cleanup=True,
 )
 assert multi_result["ok"] is True, multi_result
-assert len(created_edges) == 15, created_edges
+assert len(created_edges) == 30, created_edges
 for shot in multi_shots:
     number = shot["number"]
     exact_edges = {
         ("ImageAssetExact", "SHOT_ASSET_OUT", f"Prompt{number}", "SHOT_ASSET_IN"),
         ("VideoPickerExact", "SHOT_PICKER_OUT", f"Prompt{number}", "SHOT_PICKER_IN"),
         (f"Prompt{number}", "PROMPT_OUT", f"Agent{number}", "SHOT_PROMPT_IN"),
+        (f"Agent{number}", "output", f"Seedance{number}", "prompt"),
         ("ImageAssetExact", "SHOT_ASSET_OUT", f"Seedance{number}", "SHOT_ASSET_IN"),
         ("VideoPickerExact", "SHOT_PICKER_OUT", f"Seedance{number}", "SHOT_PICKER_IN"),
     }
@@ -494,6 +514,70 @@ for source_name, _source_port, target_name, _target_port in created_edges:
     target_number = target_name[-1:] if target_name.startswith(("Prompt", "Agent", "Seedance")) else ""
     if source_number and target_number:
         assert source_number == target_number, (source_name, target_name)
+
+
+# Only/clear transitions remove exactly the managed public Agent.output edge.
+# A foreign prompt source or a different Agent handle remains user-owned.
+cleanup_routing = load_routing()
+cleanup_agent_node = Participant("CleanupAgent", cleanup_routing.KIND_AGENT)
+cleanup_seedance_node = Participant("CleanupSeedance", cleanup_routing.KIND_SEEDANCE)
+cleanup_agent = cleanup_routing.ShotSubscription(
+    cleanup_agent_node,
+    cleanup_agent_node.name,
+    cleanup_routing.KIND_AGENT,
+    True,
+    CHANNEL,
+    SHOT,
+    1,
+    "Opening",
+)
+cleanup_seedance = cleanup_routing.ShotSubscription(
+    cleanup_seedance_node,
+    cleanup_seedance_node.name,
+    cleanup_routing.KIND_SEEDANCE,
+    False,
+    "",
+    "",
+    1,
+    "Only",
+)
+
+
+class Incoming:
+    def __init__(self, source: str, source_parameter: str) -> None:
+        self.source_node_name = source
+        self.source_parameter_name = source_parameter
+        self.target_node_name = cleanup_seedance_node.name
+        self.target_parameter_name = "prompt"
+
+
+managed_prompt_edge = Incoming(cleanup_agent_node.name, "output")
+foreign_prompt_edge = Incoming("ExternalPrompt", "output")
+different_handle_edge = Incoming(cleanup_agent_node.name, "agent")
+incoming_edges = [managed_prompt_edge, foreign_prompt_edge, different_handle_edge]
+deleted_edges: list[Incoming] = []
+cleanup_routing._incoming_connections = lambda _node: list(incoming_edges)
+
+
+def delete_cleanup_edge(connection: Incoming, _target: Any) -> bool:
+    deleted_edges.append(connection)
+    incoming_edges.remove(connection)
+    return True
+
+
+cleanup_routing._delete_connection = delete_cleanup_edge
+removed, cleanup_failures = cleanup_routing._clear_remote_edges(
+    cleanup_seedance,
+    {
+        cleanup_agent.node_name: cleanup_agent,
+        cleanup_seedance.node_name: cleanup_seedance,
+    },
+)
+assert removed == 1
+assert cleanup_failures == []
+assert deleted_edges == [managed_prompt_edge]
+assert foreign_prompt_edge in incoming_edges
+assert different_handle_edge in incoming_edges
 
 
 source_by_kind = {

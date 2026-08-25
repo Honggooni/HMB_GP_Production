@@ -1,6 +1,6 @@
 # HMB GP Production
 
-Current team release: `v0.6.47`.
+Current team release: `v0.6.49`.
 
 Odd patch versions are team releases. Even patch versions are local test builds
 and are not published or distributed until promoted to the next odd version.
@@ -47,7 +47,11 @@ and the recovery action checks the existing authoritative task without
 submitting a duplicate generation.
 
 Shot 1 through Shot 5 may each own an independent Prompt -> Agent -> Seedance
-branch and all five Seedance nodes can submit and poll concurrently. Griptape's
+branch and all five Seedance nodes can submit and poll concurrently. The HMB
+same-Shot router connects each Agent final-text `output` to the matching
+Seedance public `prompt`; both public string ports show their normal connected
+color while only the exact cable is visually hidden. `Only` has no managed
+Agent-to-Seedance prompt connection, so both ports remain unlit. Griptape's
 workflow execution mode must be `parallel` with `max_nodes_in_parallel` set to
 at least `5`; this is a local host setting, while any lower Broker/provider
 account quota can still queue accepted jobs on the server. To satisfy the

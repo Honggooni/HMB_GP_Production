@@ -177,6 +177,53 @@ background_prop.update({
 prompt._normalize_image_binding_fields(background_prop)
 assert background_prop["color_picks"] == ["Mint"]
 
+# Empty marker values are pending UI binding slots, not invalid taxonomy.
+# They must survive until the user fills all three Video / Color selectors.
+pending_three = prompt._default_image_item(1)
+pending_three.update({
+    "image_main_type": "Character",
+    "image_sub_type": "Full Appearance",
+    "color_picks": ["", "", ""],
+    "binding_video_slots": [1, 2, 3],
+})
+prompt._normalize_image_binding_fields(pending_three)
+assert pending_three["color_picks"] == ["", "", ""]
+assert pending_three["binding_video_slots"] == [1, 2, 3]
+
+filled_three = prompt._default_image_item(1)
+filled_three.update({
+    "image_main_type": "Character",
+    "image_sub_type": "Full Appearance",
+    "color_picks": ["Red", "Green", "Blue", "Yellow"],
+    "binding_video_slots": [1, 2, 3, 4],
+})
+prompt._normalize_image_binding_fields(filled_three)
+assert filled_three["color_picks"] == ["Red", "Green", "Blue"]
+assert filled_three["binding_video_slots"] == [1, 2, 3]
+
+# Environment Main/Sub already owns scene authority. Migrate only the former
+# generated target; a genuinely authored named target remains intact.
+legacy_environment_target = prompt._default_image_item(1)
+legacy_environment_target.update({
+    "image_main_type": "Environment / Background",
+    "image_sub_type": "Main Background",
+    "owner": "Scene / Environment",
+})
+prompt._normalize_image_binding_fields(legacy_environment_target)
+assert legacy_environment_target["owner"] == ""
+assert prompt._default_image_target_for_main_type("Environment / Background") == ""
+assert "Scene / Environment" not in common.IMAGE_SYSTEM_TARGETS
+assert "Scene / Environment" not in common.IMAGE_OWNER_CHOICES
+
+named_environment_target = prompt._default_image_item(1)
+named_environment_target.update({
+    "image_main_type": "Environment / Background",
+    "image_sub_type": "Main Background",
+    "owner": "Forest_Set_A",
+})
+prompt._normalize_image_binding_fields(named_environment_target)
+assert named_environment_target["owner"] == "Forest_Set_A"
+
 look = prompt._default_image_item(1)
 look.update({
     "present": True,
@@ -204,6 +251,41 @@ for camera_subtype in ("Scale", "Composition", "Scale / Composition"):
     })
     prompt._normalize_image_binding_fields(camera_look)
     assert camera_look["owner"] == "Camera / Composition"
+
+# Registration candidates are internal provenance. The public job and Agent
+# contract must receive only the effective Prompt Look taxonomy.
+verified_look_override = prompt._default_image_item(1)
+verified_look_override.update(
+    {
+        "present": True,
+        "label": "registered-master-look.png",
+        "asset_managed": True,
+        "asset_verified": True,
+        "asset_source_kind": "project",
+        "asset_source_uid": "verified-look-taxonomy",
+        "asset_project_uid": "project-look-taxonomy",
+        "asset_library_id": "library-look-taxonomy",
+        "asset_id": "MasterLook",
+        "asset_image_main_type_candidate": "Look Reference",
+        "asset_image_sub_type_candidate": "Color Mood",
+        "image_main_type": "Look Reference",
+        "image_sub_type": "Scale",
+    }
+)
+prompt._normalize_image_binding_fields(verified_look_override)
+verified_look_state = prompt._default_widget_state()
+verified_look_state["images"] = [verified_look_override]
+verified_look_job = agent._assert_public_job_data_contract(
+    prompt._build_data_only_prompt_package(verified_look_state)
+)
+verified_look_record = verified_look_job["images"][0]
+assert verified_look_record["image_main_type"] == "Look Reference"
+assert verified_look_record["image_sub_type"] == "Scale"
+assert verified_look_record["source_type"] == "Scale / Composition Reference"
+assert verified_look_record["source_scope"] == "Scale only"
+assert verified_look_record["target_id"] == "Camera / Composition"
+assert verified_look_record["bindings"] == []
+assert "asset_image_sub_type_candidate" not in verified_look_record
 
 # Five-image, no-control-video production example. Image 5 owns the shared
 # scene lighting/look while the first four sources retain intrinsic identity.

@@ -61,6 +61,93 @@ def row_by_number(state: dict[str, object], number: int) -> dict[str, object]:
     )
 
 
+# Loader preview is an owned-card cursor, not a selected-output cursor. This
+# mirrors expanded playback where video-b may keep playing while only video-a
+# is selected (or the selection becomes empty).
+independent_preview_row = picker._new_picker_workspace_row(
+    1,
+    video_asset_uids=["video-a", "video-b"],
+    selected_video_uids=["video-a"],
+    preview_video_uid="video-b",
+)
+assert independent_preview_row["selected_video_uids"] == ["video-a"]
+assert independent_preview_row["preview_video_uid"] == "video-b"
+
+
+# A widget row revision is newer than the Python snapshot: A is deselected
+# while B remains the Loader preview. The final parse must not rebuild A from
+# the authoritative catalog's previous legacy ``selected`` flag.
+MERGE_WORKSPACE_A = "11111111-1111-4111-8111-111111111111"
+MERGE_WORKSPACE_B = "22222222-2222-4222-8222-222222222222"
+merge_authoritative = picker._default_widget_state()
+merge_authoritative.update(
+    {
+        "videos": [
+            {
+                "video_uid": "video-a",
+                "source_uid": "video-a",
+                "video_url": "https://media.example/video-a.mp4",
+                "picker_shot_uuid": MERGE_WORKSPACE_A,
+                "selected": True,
+                "selection_order": 1,
+                "video_slot": 1,
+            },
+            {
+                "video_uid": "video-b",
+                "source_uid": "video-b",
+                "video_url": "https://media.example/video-b.mp4",
+                "picker_shot_uuid": MERGE_WORKSPACE_A,
+                "selected": False,
+                "selection_order": 0,
+                "video_slot": 0,
+            },
+        ],
+        "picker_shots": [
+            picker._new_picker_workspace_row(
+                1,
+                workspace_uuid=MERGE_WORKSPACE_A,
+                video_asset_uids=["video-a", "video-b"],
+                selected_video_uids=["video-a"],
+                preview_video_uid="video-b",
+            ),
+            picker._new_picker_workspace_row(
+                2,
+                workspace_uuid=MERGE_WORKSPACE_B,
+            ),
+        ],
+        "active_picker_shot_uuid": MERGE_WORKSPACE_A,
+        "preview_video_uid": "video-b",
+        "selected_video_uid": "video-b",
+        "state_revision": 10,
+    }
+)
+merge_authoritative = picker._parse_state(merge_authoritative)
+merge_incoming = copy.deepcopy(merge_authoritative)
+merge_incoming["picker_shots"] = [
+    copy.deepcopy(merge_authoritative["picker_shots"][0])
+]
+merge_incoming["picker_shots"][0]["selected_video_uids"] = []
+merge_incoming["picker_shots"][0]["preview_video_uid"] = "video-b"
+merge_incoming["picker_shots"][0]["selected_video_slot"] = "invalid-slot"
+merge_incoming["picker_shots"][0]["revision"] = (
+    int(merge_authoritative["picker_shots"][0].get("revision") or 0) + 1
+)
+merge_result = picker.HMBVideoPickerLibrary._merge_widget_state(
+    merge_authoritative,
+    merge_incoming,
+)
+merge_active_row = next(
+    row
+    for row in merge_result["picker_shots"]
+    if row["workspace_uuid"] == MERGE_WORKSPACE_A
+)
+assert merge_active_row["selected_video_uids"] == []
+assert merge_active_row["preview_video_uid"] == "video-b"
+assert merge_active_row["selected_video_slot"] == 1
+assert merge_result["preview_video_uid"] == "video-b"
+assert not any(item["selected"] for item in merge_result["videos"])
+
+
 catalog = build_catalog()
 state = picker._default_widget_state()
 state.update(

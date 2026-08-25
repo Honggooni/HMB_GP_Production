@@ -411,6 +411,54 @@ assert.deepEqual(crossedClockMerge.images[0].frame_range_intent.ranges, [{ start
 assert.equal(crossedClockMerge.ui_edit_revision, crossedClockLocal.ui_edit_revision);
 assert.equal(crossedClockMerge.source_sync_revision, newerSourceOlderUi.source_sync_revision);
 
+const lateAssetRouting = {
+  publisher_instance_uuid: "publisher-late-asset",
+  channel_uuid: "channel-late-asset",
+  generation: 1,
+  metadata_sha256: "a".repeat(64),
+};
+const lateAssetShot = {
+  shot_uuid: "shot-late-one",
+  channel_uuid: "channel-late-asset",
+  name: "Shot 1",
+  number: 1,
+  selected_source_uids: ["late-image-one"],
+};
+const promptFirstMerge = widget.hmbMergePromptRevisionAxes(
+  {
+    image_asset: {
+      shot_catalog_routing: lateAssetRouting,
+      shot_catalog: [lateAssetShot],
+    },
+    shot: lateAssetShot,
+    text: { SCENE_CONTEXT: "older source text" },
+  },
+  {
+    shot: {},
+    text: { SCENE_CONTEXT: "typed before ImageAsset" },
+  },
+);
+assert.equal(promptFirstMerge.shot.shot_uuid, "shot-late-one");
+assert.equal(promptFirstMerge.text.SCENE_CONTEXT, "typed before ImageAsset");
+
+const explicitOnlyMerge = widget.hmbMergePromptRevisionAxes(
+  {
+    image_asset: {
+      shot_catalog_routing: { ...lateAssetRouting, generation: 2 },
+      shot_catalog: [lateAssetShot],
+    },
+    shot: lateAssetShot,
+  },
+  {
+    image_asset: {
+      shot_catalog_routing: lateAssetRouting,
+      shot_catalog: [lateAssetShot],
+    },
+    shot: {},
+  },
+);
+assert.equal(explicitOnlyMerge.shot.shot_uuid, "");
+
 // Direct ownership matrix: source authority and Prompt UI have independent
 // fields during crossed-clock merges. These assertions prevent a future jank
 // fix from solving rollback by indiscriminately choosing either whole object.
@@ -456,6 +504,83 @@ assert.equal(verifiedImageMerge.images[0].image_main_type, "Environment / Backgr
 assert.equal(verifiedImageMerge.images[0].image_sub_type, "Main Background");
 assert.equal(verifiedImageMerge.images[0].frame_range_intent.enabled, true);
 assert.deepEqual(verifiedImageMerge.images[0].frame_range_intent.ranges, [{ start: 21, end: 35 }]);
+
+const verifiedLookOverrideMerge = widget.hmbMergePromptRevisionAxes(
+  {
+    images: [{
+      slot: 1,
+      present: true,
+      label: "Registered Look",
+      asset_managed: true,
+      asset_verified: true,
+      asset_source_kind: "project",
+      asset_source_uid: "verified-look-image",
+      asset_image_main_type_candidate: "Look Reference",
+      asset_image_sub_type_candidate: "Render Look",
+      image_main_type: "Look Reference",
+      image_sub_type: "Render Look",
+    }],
+  },
+  {
+    images: [{
+      slot: 1,
+      present: true,
+      label: "Registered Look",
+      asset_managed: true,
+      asset_verified: true,
+      asset_source_kind: "project",
+      asset_source_uid: "verified-look-image",
+      asset_image_main_type_candidate: "Look Reference",
+      asset_image_sub_type_candidate: "Color Mood",
+      image_main_type: "Look Reference",
+      image_sub_type: "Scale",
+    }],
+  },
+);
+const verifiedLookOverrideRow = verifiedLookOverrideMerge.images[0];
+assert.equal(verifiedLookOverrideRow.asset_image_sub_type_candidate, "Render Look");
+assert.equal(verifiedLookOverrideRow.image_main_type, "Look Reference");
+assert.equal(verifiedLookOverrideRow.image_sub_type, "Scale");
+assert.equal(verifiedLookOverrideRow.source_type, "Scale / Composition Reference");
+assert.equal(verifiedLookOverrideRow.scope, "Scale only");
+assert.equal(verifiedLookOverrideRow.owner, "Camera / Composition");
+assert.deepEqual(verifiedLookOverrideRow.color_picks, [""]);
+
+const verifiedLookDefaultMerge = widget.hmbMergePromptRevisionAxes(
+  {
+    images: [{
+      slot: 1,
+      present: true,
+      asset_managed: true,
+      asset_verified: true,
+      asset_source_kind: "project",
+      asset_source_uid: "verified-look-default",
+      asset_image_main_type_candidate: "Look Reference",
+      asset_image_sub_type_candidate: "Render Look",
+      image_main_type: "Look Reference",
+      image_sub_type: "Render Look",
+    }],
+  },
+  {
+    images: [{
+      slot: 1,
+      present: true,
+      asset_managed: true,
+      asset_verified: true,
+      asset_source_kind: "project",
+      asset_source_uid: "verified-look-default",
+      asset_image_main_type_candidate: "Look Reference",
+      asset_image_sub_type_candidate: "Color Mood",
+      image_main_type: "Look Reference",
+      image_sub_type: "Color Mood",
+    }],
+  },
+);
+assert.equal(
+  verifiedLookDefaultMerge.images[0].image_sub_type,
+  "Render Look",
+  "A stale registered default is not a Prompt override and must not defeat a newer Asset registration.",
+);
 
 const imageBindingUiMerge = widget.hmbMergePromptRevisionAxes(
   {

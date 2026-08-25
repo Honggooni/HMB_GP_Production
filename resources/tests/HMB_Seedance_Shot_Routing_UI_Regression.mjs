@@ -34,6 +34,7 @@ const only = widget.hmbSeedanceShotState({ value: {
 } });
 assert.equal(only.shot.name, "Only");
 assert.equal(only.shot.shot_uuid, "");
+assert.equal(only.remote_prompt_route.connected, false);
 assert.deepEqual(
   widget.hmbSeedanceShotOptions(only).map((item) => item.name),
   ["Only", "Opening", "Hero"],
@@ -58,6 +59,89 @@ const selected = widget.hmbSeedanceShotState({ value: selectedValue });
 assert.equal(selected.shot.shot_uuid, shot4Uuid);
 assert.equal(selected.shot.number, 4);
 assert.equal(widget.hmbSeedanceShotAccent(selected), "#8B5CF6");
+
+const connectedRoute = {
+  schema: "hmb-seedance-remote-prompt-route",
+  version: 1,
+  connected: true,
+  source_node_name: "HMBAgentLibrary_4",
+  target_node_name: "HMB Seedance Generation_4",
+  source_parameter: "output",
+  target_parameter: "prompt",
+};
+const routed = widget.hmbSeedanceShotState({ value: {
+  ...selectedValue,
+  remote_prompt_route: connectedRoute,
+} });
+assert.equal(routed.remote_prompt_route.connected, true);
+assert.equal(routed.remote_prompt_route.source_node_name, "HMBAgentLibrary_4");
+
+const edge = (id, ariaLabel) => ({
+  getAttribute(name) {
+    if (name === "data-id") return id;
+    if (name === "aria-label") return ariaLabel;
+    return "";
+  },
+});
+const exactEdgeId = (
+  "HMBAgentLibrary_4-output-HMB Seedance Generation_4-prompt-1700000000000"
+);
+assert.equal(
+  widget.hmbSeedanceRemotePromptEdgeMatches(
+    edge(exactEdgeId, "Edge from HMBAgentLibrary_4 to HMB Seedance Generation_4"),
+    connectedRoute,
+  ),
+  true,
+  "Only the exact Agent.output -> Seedance.prompt DOM edge may be hidden.",
+);
+assert.equal(
+  widget.hmbSeedanceRemotePromptEdgeMatches(
+    edge(
+      "HMBAgentLibrary_4-agent-HMB Seedance Generation_4-prompt-1700000000000",
+      "Edge from HMBAgentLibrary_4 to HMB Seedance Generation_4",
+    ),
+    connectedRoute,
+  ),
+  false,
+  "A different Agent handle must remain visible.",
+);
+assert.equal(
+  widget.hmbSeedanceRemotePromptEdgeMatches(
+    edge(exactEdgeId, "Edge from HMBAgentLibrary_4 to Another Generator"),
+    connectedRoute,
+  ),
+  false,
+  "DOM format or endpoint disagreement must fail visible.",
+);
+assert.equal(
+  widget.hmbSeedanceRemotePromptEdgeMatches(edge(exactEdgeId, ""), only),
+  false,
+  "Only mode never hides or lights a prompt edge.",
+);
+const replacementRoute = {
+  ...connectedRoute,
+  source_node_name: "HMBAgentLibrary_4",
+  previous_source_node_name: "HMBAgentLibrary_3",
+};
+assert.equal(
+  widget.hmbSeedanceRemotePromptEdgeMatches(
+    edge(
+      "HMBAgentLibrary_3-output-HMB Seedance Generation_4-prompt-1699999999999",
+      "Edge from HMBAgentLibrary_3 to HMB Seedance Generation_4",
+    ),
+    replacementRoute,
+  ),
+  true,
+  "The old exact cable stays hidden until Shot replacement is committed.",
+);
+assert.equal(
+  widget.hmbSeedanceRemotePromptEdgeMatches(
+    edge(exactEdgeId, "Edge from HMBAgentLibrary_4 to HMB Seedance Generation_4"),
+    replacementRoute,
+  ),
+  true,
+  "The next exact cable is pre-armed before retained mode creates it.",
+);
 
 const serialized = widget.hmbSeedanceShotState({ value: JSON.stringify(selectedValue) });
 assert.equal(serialized.shot.shot_uuid, shot4Uuid, "Serialized dict props must retain Shot identity.");
@@ -97,6 +181,18 @@ assert.match(widgetSource, /height:64px/);
 assert.match(widgetSource, /HMBSeedanceGeneration/);
 assert.doesNotMatch(widgetSource, /addEventListener\([^\n]*hmb-shot-routing-catalog-v1/);
 assert.doesNotMatch(widgetSource, /__hmbShotRoutingCatalogs/);
+assert.match(widgetSource, /data-hmb-seedance-prompt-edge/);
+assert.match(widgetSource, /observe\(layer, \{ childList: true, subtree: true \}\)/);
+assert.doesNotMatch(
+  widgetSource,
+  /observe\(layer, \{[^}]*attributes:\s*true/,
+  "The shared edge observer must not watch its own marker attributes.",
+);
+assert.doesNotMatch(
+  widgetSource,
+  /next\.remote_prompt_route\s*=/,
+  "Optimistic Shot changes must keep the old cable hidden until retained mode mutates it.",
+);
 assert.equal(typeof widget.hmbGuardSelectedNodeKeyboardDelete, "function");
 
 const lifecycleContainer = {};

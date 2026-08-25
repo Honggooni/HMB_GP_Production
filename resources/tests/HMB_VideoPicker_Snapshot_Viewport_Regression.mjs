@@ -106,7 +106,7 @@ const forceVideoStart = widgetSource.indexOf("const forceVideoPreview", viewport
 assert.ok(viewportModeStart >= 0 && forceVideoStart > viewportModeStart);
 const viewportModeSource = widgetSource.slice(viewportModeStart, forceVideoStart);
 assert.match(viewportModeSource, /viewportMode === "snapshot"/);
-assert.match(viewportModeSource, /retainedViewportVideo\?\.pause\?\.\(\)/);
+assert.match(viewportModeSource, /hmbPauseVideoPickerWithDebt\(retainedViewportVideo\)/);
 assert.match(viewportModeSource, /delete container\.__hmbAutoplayVideoUid/);
 assert.match(viewportModeSource, /delete container\.__hmbForceVideoPreviewUid/);
 

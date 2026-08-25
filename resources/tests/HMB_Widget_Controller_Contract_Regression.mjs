@@ -281,7 +281,9 @@ assert.doesNotMatch(assetSource, /@media\(max-width:920px\)\{[^}]*\.asset-grid\{
 assert.match(assetSource, /data-registration-field="asset_id"/, "The Add passport must retain editable Asset ID because Picker and Prompt bind against it.");
 assert.match(assetSource, /function assetCardThumbnailImageMarkup\(asset\)[\s\S]*?class="asset-thumb-placeholder"[\s\S]*?class="asset-thumb-media">\$\{assetCardThumbnailImageMarkup\(asset\)\}\$\{add\}<\/div>[\s\S]*?class="asset-thumb-footer"><span class="asset-source-name"/, "Every asset card must use an image-or-neutral-placeholder media area and show only the source name in its footer.");
 assert.doesNotMatch(assetSource.match(/function assetThumbnailHtml\(asset, state\)[\s\S]*?\n\}/)?.[0] || "", /thumbnailImageMarkup\(asset\)/, "Asset-card fallback media must never expose extension text.");
-assert.match(assetSource, /const add = `<button[\s\S]*?data-asset-add[\s\S]*?asset\.registered \? "✎" : imageAssetText\(state, "add"\)/, "Registered assets must expose Edit while unregistered media retains localized Add.");
+const assetThumbnailSource = assetSource.match(/function assetThumbnailHtml\([\s\S]*?\n\}/)?.[0] || "";
+assert.match(assetThumbnailSource, /const add = hmbImageAssetCanRegister\(asset\)[\s\S]*?data-asset-add[\s\S]*?: ""/, "Only unregistered registerable media may expose Add.");
+assert.doesNotMatch(assetThumbnailSource, /✎|edit_image_asset/, "Registered asset editing must not remain reachable from the thumbnail.");
 assert.doesNotMatch(assetSource, /class="asset-format"/, "Thumbnail footers must no longer spend their label on the file extension.");
 assert.match(assetSource, /class="asset-title"[\s\S]*?class="asset-extension-badge"/, "Detail content must place the extension badge at the title's top-right edge.");
 assert.match(assetSource, /\.asset-extension-badge\{[^}]*color:var\(--accent\);[^}]*font-family:inherit;[^}]*font-size:7px;[^}]*font-weight:900/, "The detail extension badge must use the project accent and inherited project font.");
@@ -293,10 +295,17 @@ assert.match(registrationFolderOptionsSource, /state\.folders[\s\S]*?!isUserImpo
 assert.doesNotMatch(registrationFolderOptionsSource, /ROOT_FOLDER_KEY|project_root/, "Add must never offer the already-selected project root as a destination folder.");
 assert.match(assetSource, /source_kind: draft\.source_kind[\s\S]*?source_uid: draft\.source_uid[\s\S]*?target_folder:/, "External registration requests must carry trusted source identity and the selected destination folder.");
 assert.match(assetSource, /asset_registration_request/, "The registration dialog must submit a one-shot backend request.");
+assert.match(assetSource, /export function hmbImageAssetCanRegister\(asset\)[\s\S]*?asset\.registered[\s\S]*?source_kind[\s\S]*?import_index/, "One central contract must allow Add only for unregistered project media or live external imports.");
+assert.match(assetSource, /if \(!hmbImageAssetCanRegister\(asset\)\) return null;/, "Registered assets must not create a registration draft.");
+assert.match(assetSource, /!asset[\s\S]*?\|\| !hmbImageAssetCanRegister\(asset\)[\s\S]*?\) return "";/, "The registration passport must render only for Add candidates.");
 assert.match(promptSource, /function renderSubtypeControls\(item, state, locked = false\)[\s\S]*?data-field="image_sub_type"[\s\S]*?\$\{locked \? "disabled" : ""\}/, "Verified registered v2 Sub Type controls must support a locked state.");
 assert.match(promptSource, /data-field="owner" \$\{sceneWideLookReference \? "disabled data-hmb-base-disabled=/, "Only scene-wide Look Reference must lock its Target to Global Look.");
 assert.doesNotMatch(promptSource, /verifiedAsset[^\n]*\?[^\n]*disabled[^\n]*data-field="owner"/, "Other verified Asset targets must remain freely editable.");
-assert.match(promptSource, /renderSubtypeControls\(item, state, Boolean\(verifiedAsset && verifiedRegisteredSubtype\(item\)\)\)/, "Only verified assets with a registered Sub Type should lock the Prompt subtype control.");
+assert.match(
+  promptSource,
+  /const registeredSubtypeLocked = Boolean\([\s\S]*?verifiedAsset[\s\S]*?image_main_type\) !== "Look Reference"[\s\S]*?verifiedRegisteredSubtype\(item\)[\s\S]*?renderSubtypeControls\(item, state, registeredSubtypeLocked\)/,
+  "Verified non-Look assets keep their registered Sub Type locked, while verified Look rows expose an effective Prompt Sub Type.",
+);
 const promptImageRowSource = promptSource.match(/function renderImageRow\([\s\S]*?\n\}\n\nfunction renderVideoRow/)?.[0] || "";
 assert.doesNotMatch(
   promptImageRowSource,
@@ -615,6 +624,14 @@ assert.equal(registrationDraftProbe.image_sub_type, "Full Appearance");
 assert.equal(registrationDraftProbe.source_kind, "project");
 assert.equal(registrationDraftProbe.target_folder, "Character");
 assert.equal(registrationDraftProbe.target_folder_confirmed, true);
+assert.equal(
+  assetModule.hmbCreateImageAssetRegistrationDraft({
+    asset_library_id: "registered-project-asset",
+    registered: true,
+  }, {}),
+  null,
+  "Registered assets must not reopen the Add passport.",
+);
 const externalRegistrationDraftProbe = assetModule.hmbCreateImageAssetRegistrationDraft({
   asset_library_id: "import-source",
   source_uid: "import:source",
@@ -682,6 +699,7 @@ const legacyUnclassifiedProbe = assetModule.hmbNormalizeImageAssetState({
     asset_library_id: "legacy-import",
     source_uid: "import:legacy",
     source_kind: "user",
+    import_index: 1,
     asset_id: "Legacy",
     image_name: "Legacy Image",
     source_type: "Role Required / Select Source Type",
@@ -894,8 +912,8 @@ assert.match(
 );
 assert.match(
   videoSource,
-  /container\.__hmbVideoPickerControllerUpdate\s*=\s*\(nextProps\)\s*=>\s*\{[\s\S]*?if \(hmbConsumePendingPickerStateEcho\(container, nextProps \|\| \{\}\)\) \{[\s\S]*?patchMountedPicker\(nextProps \|\| \{\}\);\s*return;/s,
-  "An exact local echo must use the retained regional patch path before any full cleanup or controller reinstallation.",
+  /container\.__hmbVideoPickerControllerUpdate\s*=\s*\(nextProps\)\s*=>\s*\{[\s\S]*?if \(hmbConsumePendingPickerStateEcho\(container, nextProps \|\| \{\}\)\) \{[\s\S]*?acceptMatchingPickerStateEchoWithoutDom\(nextProps \|\| \{\}\);\s*return;/s,
+  "An exact local echo must accept transport metadata without repainting the already-correct Loader DOM.",
 );
 
 const localPickerEcho = {
@@ -1005,12 +1023,12 @@ assert.doesNotMatch(
   "Resolution changes need the normal morph to refresh the resolution summary, message, and activity log.",
 );
 const pickerSelectionHandler = videoSource.slice(
-  videoSource.indexOf("const toggleVideoSelection ="),
-  videoSource.indexOf("const deleteVideoAsset ="),
+  videoSource.indexOf("const toggleSharedLoaderVideoSelection ="),
+  videoSource.indexOf("const commitSharedLoaderVideoDrag ="),
 );
 assert.match(
   pickerSelectionHandler,
-  /hmbApplySelectedVideoAssetOrderToDom\(container, nextState/,
+  /hmbApplySelectedVideoAssetOrderToDom\(\s*container,\s*nextState/,
   "UID selection must update outline/order fields locally without rebuilding every media row.",
 );
 assert.match(
@@ -1620,8 +1638,8 @@ assert.match(videoSource, /data-palette-kind="ghost" data-palette-scope="actor-b
 assert.doesNotMatch(videoSource, /id="apply-color"|class="selected-target"|\.apply-button/);
 assert.match(
   videoSource,
-  /container\.querySelectorAll\("\[data-color\]"\)[\s\S]*?const color = clean\(button\.getAttribute\("data-color"\)\);[\s\S]*?applyColor\(color\)/,
-  "A palette click must immediately assign its color through the healed Outliner target after removing the redundant Target/APPLY row.",
+  /hmbInstallPickerValueControlDelegation\([\s\S]*?container\.querySelector\("\.palette-head"\)[\s\S]*?"\[data-color\]"[\s\S]*?"data-color"[\s\S]*?\(color\) => applyColor\(color\)/,
+  "A delegated palette click must immediately assign its color through the healed Outliner target after removing the redundant Target/APPLY row.",
 );
 assert.match(videoSource, /export function hmbEnsurePickerOutlinerSelection/);
 assert.match(videoSource, /const liveState = hmbEnsurePickerOutlinerSelection\(currentWidgetState\(\)\)/);

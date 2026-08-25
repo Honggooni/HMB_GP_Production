@@ -416,7 +416,6 @@ const HMB_OPTION_KO = {
   "Lighting / Atmosphere Reference": "조명 / 분위기 참조",
   "Scale / Composition Reference": "크기 / 구도 참조",
   "Custom": "사용자 지정",
-  "Scene / Environment": "장면 / 환경",
   "Camera / Composition": "카메라 / 구도",
   "Global Look": "전체 룩",
   "Current shot": "현재 샷",
@@ -1439,9 +1438,19 @@ export function normalizeImageTaxonomy(item) {
     item.interaction_custom_targets = [""];
     item.legacy_relationship_targets = [];
   }
+  // Main/Sub taxonomy already supplies environment authority. Migrate only
+  // the former generated system Target; user-authored named targets survive.
+  if (
+    ["Environment / Background", "Sky / Exterior Background", "Set / Structure", "Foreground / Ground"].includes(sourceType)
+    && clean(item.owner) === "Scene / Environment"
+  ) {
+    item.owner = "";
+  }
   const allowedColors = colorPickChoicesForImageTaxonomy(mainType, subType);
   const colors = Array.isArray(item.color_picks) ? item.color_picks : [];
-  item.color_picks = colors.map(clean).filter((value) => allowedColors.includes(value)).slice(0, MAX_COLOR_PICKS);
+  // Blank entries are real UI slots created by +. Preserve them until the
+  // user selects marker values, while rejecting invalid non-empty markers.
+  item.color_picks = colors.map(clean).filter((value) => !value || allowedColors.includes(value)).slice(0, MAX_COLOR_PICKS);
   if (!item.color_picks.length) item.color_picks = [""];
   const count = item.color_picks.length;
   item.binding_scopes = Array.from({ length: count }, () => scope);
@@ -2227,7 +2236,6 @@ function migrateImage(item, slot) {
       out.scope = "Full body / full appearance";
     } else if (oldRole === "Environment / Background") {
       out.source_type = "Environment / Background";
-      out.owner = "Scene / Environment";
       out.scope = "Main background";
     } else if (oldRole === "Lighting / Atmosphere") {
       out.source_type = "Lighting / Atmosphere Reference";
@@ -4437,11 +4445,41 @@ function hmbPromptImageTaxonomyIsVerified(item) {
   );
 }
 
+function hmbPromptVerifiedLookSubtypeOverride(item) {
+  if (!hmbPromptImageTaxonomyIsVerified(item)) return "";
+  if (
+    clean(item?.asset_image_main_type_candidate) !== "Look Reference"
+    || clean(item?.image_main_type) !== "Look Reference"
+  ) return "";
+  const registeredSubtype = clean(item?.asset_image_sub_type_candidate);
+  const effectiveSubtype = clean(item?.image_sub_type);
+  const choices = Array.isArray(IMAGE_SUB_TYPES["Look Reference"])
+    ? IMAGE_SUB_TYPES["Look Reference"]
+    : [];
+  return effectiveSubtype
+    && effectiveSubtype !== registeredSubtype
+    && choices.includes(effectiveSubtype)
+    ? effectiveSubtype
+    : "";
+}
+
 function hmbPromptVideoHasAuthority(item) {
   return Boolean(
     item?.picker_managed
     || clean(item?.video_uid)
     || clean(item?.source_uid)
+  );
+}
+
+function hmbPromptOnlyIntentMatchesSourceAuthority(uiState, sourceState) {
+  if (!hmbPromptVerifiedShotCatalog(uiState).length) return false;
+  const uiRouting = normalizeShotCatalogRouting(uiState?.image_asset?.shot_catalog_routing);
+  const sourceRouting = normalizeShotCatalogRouting(sourceState?.image_asset?.shot_catalog_routing);
+  return Boolean(
+    uiRouting.publisher_instance_uuid
+    && uiRouting.publisher_instance_uuid === sourceRouting.publisher_instance_uuid
+    && uiRouting.channel_uuid
+    && uiRouting.channel_uuid === sourceRouting.channel_uuid
   );
 }
 
@@ -4463,6 +4501,15 @@ export function hmbMergePromptRevisionAxes(sourceState, uiState) {
     }
     if (!hmbPromptImageTaxonomyIsVerified(item)) {
       hmbPromptCopyUiFields(item, uiItem, HMB_PROMPT_MANUAL_IMAGE_UI_FIELDS);
+    } else if (
+      clean(item.asset_image_main_type_candidate) === "Look Reference"
+      && clean(item.image_main_type) === "Look Reference"
+      && hmbPromptVerifiedLookSubtypeOverride(uiItem)
+    ) {
+      // A verified Look keeps its registered Main Type and provenance, while
+      // the Prompt owns an effective per-shot Sub Type. Re-normalization below
+      // atomically rebuilds source/scope/Target from that effective choice.
+      item.image_sub_type = hmbPromptCloneRangeField(uiItem.image_sub_type);
     }
   });
   const uiVideos = new Map();
@@ -4499,7 +4546,9 @@ export function hmbMergePromptRevisionAxes(sourceState, uiState) {
   ) || {};
   const selectedShotUuid = clean(ui?.shot?.shot_uuid);
   if (!selectedShotUuid) {
-    source.shot = normalizeShotSelection({});
+    if (hmbPromptOnlyIntentMatchesSourceAuthority(ui, source)) {
+      source.shot = normalizeShotSelection({});
+    }
   } else {
     const selectedShot = hmbPromptVerifiedShotCatalog(source)
       .find((shot) => clean(shot.shot_uuid) === selectedShotUuid);
@@ -5558,13 +5607,13 @@ function imageTargetChoicesForRow(item, images) {
   if (sourceType === "Ignore / Unused") {
     choices = ["", "None"];
   } else if (["Environment / Background", "Sky / Exterior Background", "Set / Structure", "Foreground / Ground"].includes(sourceType)) {
-    choices = ["", ...dynamicTargets, "Scene / Environment"];
+    choices = ["", ...dynamicTargets];
   } else if (sourceType === "Scale / Composition Reference") {
     choices = ["", ...dynamicTargets, "Camera / Composition"];
   } else if (["Color / Look Reference", "Color + Look + Lighting Mood Reference", "Lighting / Atmosphere Reference"].includes(sourceType)) {
     choices = ["", ...dynamicTargets, "Global Look"];
   } else if (sourceType === "Custom") {
-    choices = ["", ...dynamicTargets, "Scene / Environment", "Camera / Composition", "Global Look"];
+    choices = ["", ...dynamicTargets, "Camera / Composition", "Global Look"];
   }
   const currentTarget = clean(item && item.owner);
   if (currentTarget) choices.push(currentTarget);
@@ -5818,8 +5867,15 @@ function renderImageRow(item, index, images, state) {
     && clean(item.asset_source_kind).toLowerCase() === "project"
   );
   const dragEnabled = !orderManaged && images.length > 1;
+  const registeredSubtypeLocked = Boolean(
+    verifiedAsset
+    && clean(item.image_main_type) !== "Look Reference"
+    && verifiedRegisteredSubtype(item)
+  );
   const identityTitle = verifiedAsset
-    ? "Image Name, Asset ID, Main Type, registered Sub Type, and @image order are controlled by HMBImageAssetLibrary; Target remains editable"
+    ? (sceneWideLookReference
+      ? "Image Name, Asset ID, Main Type, and @image order are controlled by HMBImageAssetLibrary; Look Sub Type is an editable per-shot usage choice"
+      : "Image Name, Asset ID, Main Type, registered Sub Type, and @image order are controlled by HMBImageAssetLibrary; Target remains editable")
     : (rowManaged
       ? "Generator order is controlled by HMBImageAssetLibrary; Name and Prompt fields remain editable"
       : (item.asset_id ? `Asset ID: ${item.asset_id}` : ""));
@@ -5828,7 +5884,7 @@ function renderImageRow(item, index, images, state) {
     <div class="source-num image-index-cell image-drag-handle nodrag" data-image-drag-handle draggable="${dragEnabled ? "true" : "false"}" role="button" tabindex="${dragEnabled ? "0" : "-1"}" aria-label="${escapeHtml(dragEnabled ? uiText(state, "drag_image_row", "Drag or use arrow keys to reorder image source") : (orderManaged ? "Order is controlled by HMBImageAssetLibrary" : ""))}" title="${escapeHtml(dragEnabled ? uiText(state, "drag_image_row", "Drag to reorder image source") : (orderManaged ? "Order is controlled by HMBImageAssetLibrary" : ""))}">${String(item.slot).padStart(2, "0")}</div>
     <div class="source-label image-name-cell"><input class="source-label-input" data-field="label" maxlength="${MAX_IDENTIFIER_CHARS}" value="${escapeHtml(item.label)}" placeholder="${escapeHtml(uiText(state, "name", "Name"))}" title="${escapeHtml(identityTitle)}" ${verifiedAsset ? "readonly" : ""}/></div>
     <div class="source-role image-main-type-cell"><select class="source-select" data-field="image_main_type" ${verifiedAsset ? "disabled" : ""}>${options(sourceTypeChoices, item.image_main_type, "", state)}</select></div>
-    <div class="source-role binding-scope-cell">${renderSubtypeControls(item, state, Boolean(verifiedAsset && verifiedRegisteredSubtype(item)))}</div>
+    <div class="source-role binding-scope-cell">${renderSubtypeControls(item, state, registeredSubtypeLocked)}</div>
     <div class="source-role image-target-cell"><select class="source-select source-target-select" data-field="owner" ${sceneWideLookReference ? "disabled data-hmb-base-disabled=\"1\"" : "data-hmb-base-disabled=\"0\""}>${targetSelectOptions(item, images, state)}</select></div>
     <div class="source-role color-pick-cell">${renderColorPickControls(item, index, images, state)}</div>
     <div class="source-status image-actions-cell">${renderImageActions(item, state, index, images.length)}</div>

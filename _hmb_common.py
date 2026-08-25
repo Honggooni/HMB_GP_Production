@@ -364,14 +364,12 @@ IMAGE_SCOPE_CHOICES_BY_SOURCE_TYPE = {
 }
 
 IMAGE_SYSTEM_TARGETS = {
-    "Scene / Environment",
     "Camera / Composition",
     "Global Look",
     "None",
 }
 IMAGE_OWNER_CHOICES = [
     "",
-    "Scene / Environment",
     "Camera / Composition",
     "Global Look",
     "None",

@@ -4,6 +4,8 @@ const HMB_SEEDANCE_PREVIEW_VERSION = 1;
 const HMB_SEEDANCE_COMMAND_SCHEMA = "hmb-seedance-refresh-command";
 const HMB_SEEDANCE_COMMAND_VERSION = 1;
 const HMB_SEEDANCE_COMMAND_REGISTRY_KEY = "__HMB_SEEDANCE_REFRESH_BRIDGES_V1__";
+const HMB_SEEDANCE_PROMPT_EDGE_REGISTRY_KEY = "__HMB_SEEDANCE_PROMPT_EDGE_REGISTRY_V1__";
+const HMB_SEEDANCE_PROMPT_EDGE_ATTRIBUTE = "data-hmb-seedance-prompt-edge";
 export const HMB_SEEDANCE_PREVIEW_ACTION_WATCHDOG_MS = 10_000;
 
 const HMB_SEEDANCE_REFRESH_DELIVERY_TIMEOUT = (
@@ -220,6 +222,57 @@ function uuid(value) {
     ? normalized : "";
 }
 
+function hmbSeedanceNodeName(value) {
+  if (typeof value !== "string") return "";
+  const normalized = value.trim();
+  if (
+    !normalized
+    || normalized.length > 512
+    || Array.from(normalized).some((character) => character.charCodeAt(0) < 32)
+  ) return "";
+  return normalized;
+}
+
+export function hmbSeedanceRemotePromptRoute(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value)
+    ? (value.remote_prompt_route && typeof value.remote_prompt_route === "object"
+      ? value.remote_prompt_route : value)
+    : {};
+  const disconnected = {
+    schema: "hmb-seedance-remote-prompt-route",
+    version: 1,
+    connected: false,
+    source_node_name: "",
+    previous_source_node_name: "",
+    target_node_name: "",
+    source_parameter: "output",
+    target_parameter: "prompt",
+  };
+  const sourceNodeName = hmbSeedanceNodeName(source.source_node_name);
+  const rawPreviousSourceNodeName = source.previous_source_node_name ?? "";
+  const previousSourceNodeName = rawPreviousSourceNodeName
+    ? hmbSeedanceNodeName(rawPreviousSourceNodeName) : "";
+  const targetNodeName = hmbSeedanceNodeName(source.target_node_name);
+  if (
+    source.schema !== disconnected.schema
+    || Number(source.version) !== disconnected.version
+    || source.connected !== true
+    || source.source_parameter !== "output"
+    || source.target_parameter !== "prompt"
+    || !sourceNodeName
+    || (rawPreviousSourceNodeName && !previousSourceNodeName)
+    || !targetNodeName
+  ) return disconnected;
+  return {
+    ...disconnected,
+    connected: true,
+    source_node_name: sourceNodeName,
+    previous_source_node_name: previousSourceNodeName === sourceNodeName
+      ? "" : previousSourceNodeName,
+    target_node_name: targetNodeName,
+  };
+}
+
 export function hmbSeedanceShotCatalog(value) {
   const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
   if (JSON.stringify(Object.keys(source).sort()) !== JSON.stringify([
@@ -313,6 +366,7 @@ export function hmbSeedanceShotState(props) {
       name: "Only",
     },
     generation: hmbSeedanceGenerationPreview(source.generation),
+    remote_prompt_route: hmbSeedanceRemotePromptRoute(source),
   };
 }
 
@@ -427,6 +481,7 @@ function render(state) {
       .hmb-seedance-preview-overlay__elapsed{color:#cbd5e1;font-variant-numeric:tabular-nums;font-size:10px;font-weight:750}
       .hmb-seedance-preview-overlay__action{margin-top:5px;padding:7px 11px;border:1px solid rgba(var(--shot-rgb),.7);border-radius:7px;background:rgba(var(--shot-rgb),.2);color:var(--shot-soft);font:inherit;font-size:10px;font-weight:850;cursor:pointer;pointer-events:auto}
       .hmb-seedance-preview-overlay__action:hover{background:rgba(var(--shot-rgb),.34)}.hmb-seedance-preview-overlay__action:disabled{cursor:wait;opacity:.55}
+      .react-flow__edge[${HMB_SEEDANCE_PROMPT_EDGE_ATTRIBUTE}="true"]{display:none!important}
       @keyframes hmb-seedance-preview-spin{to{transform:rotate(360deg)}}
     </style>
     <div class="hmb-seedance-shot nodrag" data-shot-number="${number}">
@@ -460,6 +515,156 @@ function hmbSeedanceNodeRoot(container) {
     if (className.includes("react-flow__pane") || className.includes("react-flow__viewport")) return null;
   }
   return null;
+}
+
+export function hmbSeedanceRemotePromptEdgeMatches(element, value) {
+  const route = hmbSeedanceRemotePromptRoute(value);
+  if (!route.connected || !element?.getAttribute) return false;
+  const edgeId = String(element.getAttribute("data-id") || "");
+  const ariaLabel = String(element.getAttribute("aria-label") || "");
+  return [route.source_node_name, route.previous_source_node_name]
+    .filter(Boolean)
+    .some((sourceNodeName) => {
+      const expectedPrefix = (
+        `${sourceNodeName}-${route.source_parameter}-`
+        + `${route.target_node_name}-${route.target_parameter}-`
+      );
+      return edgeId.startsWith(expectedPrefix)
+        && ariaLabel === `Edge from ${sourceNodeName} to ${route.target_node_name}`;
+    });
+}
+
+function hmbSeedancePromptEdgeRegistry() {
+  const root = typeof globalThis !== "undefined" ? globalThis : null;
+  if (!root) return null;
+  if (!(root[HMB_SEEDANCE_PROMPT_EDGE_REGISTRY_KEY] instanceof WeakMap)) {
+    root[HMB_SEEDANCE_PROMPT_EDGE_REGISTRY_KEY] = new WeakMap();
+  }
+  return root[HMB_SEEDANCE_PROMPT_EDGE_REGISTRY_KEY];
+}
+
+function hmbSeedanceEdgeLayer(container) {
+  const nodeRoot = hmbSeedanceNodeRoot(container);
+  let current = nodeRoot?.parentElement || null;
+  for (let depth = 0; current && depth < 16; depth += 1, current = current.parentElement) {
+    const layer = current.querySelector?.(".react-flow__edges");
+    if (layer) return layer;
+  }
+  return null;
+}
+
+function hmbSeedanceScanPromptEdges(controller) {
+  if (!controller?.layer) return;
+  for (const edge of controller.markedEdges) {
+    edge?.removeAttribute?.(HMB_SEEDANCE_PROMPT_EDGE_ATTRIBUTE);
+  }
+  controller.markedEdges.clear();
+  const routes = Array.from(controller.entries.values()).filter((route) => route.connected);
+  if (!routes.length) return;
+  const edges = controller.layer.querySelectorAll?.(
+    ".react-flow__edge[data-id][aria-label]",
+  ) || [];
+  for (const edge of edges) {
+    if (!routes.some((route) => hmbSeedanceRemotePromptEdgeMatches(edge, route))) continue;
+    edge.setAttribute?.(HMB_SEEDANCE_PROMPT_EDGE_ATTRIBUTE, "true");
+    controller.markedEdges.add(edge);
+  }
+}
+
+function hmbSeedanceSchedulePromptEdgeScan(controller) {
+  if (!controller || controller.scheduled !== null) return;
+  const run = () => {
+    controller.scheduled = null;
+    hmbSeedanceScanPromptEdges(controller);
+  };
+  if (typeof requestAnimationFrame === "function") {
+    controller.scheduled = { type: "frame", id: requestAnimationFrame(run) };
+  } else if (typeof setTimeout === "function") {
+    controller.scheduled = { type: "timeout", id: setTimeout(run, 0) };
+  } else {
+    run();
+  }
+}
+
+function hmbSeedanceCancelPromptEdgeScan(controller) {
+  const scheduled = controller?.scheduled;
+  if (!scheduled) return;
+  if (scheduled.type === "frame" && typeof cancelAnimationFrame === "function") {
+    cancelAnimationFrame(scheduled.id);
+  } else if (scheduled.type === "timeout" && typeof clearTimeout === "function") {
+    clearTimeout(scheduled.id);
+  }
+  controller.scheduled = null;
+}
+
+function hmbSeedanceUnregisterRemotePromptEdge(container) {
+  const layer = container?.__hmbSeedancePromptEdgeLayer;
+  if (!layer) return false;
+  const registry = hmbSeedancePromptEdgeRegistry();
+  const controller = registry?.get(layer);
+  delete container.__hmbSeedancePromptEdgeLayer;
+  if (!controller) return false;
+  controller.entries.delete(container);
+  if (controller.entries.size) {
+    hmbSeedanceSchedulePromptEdgeScan(controller);
+    return true;
+  }
+  controller.observer?.disconnect?.();
+  hmbSeedanceCancelPromptEdgeScan(controller);
+  for (const edge of controller.markedEdges) {
+    edge?.removeAttribute?.(HMB_SEEDANCE_PROMPT_EDGE_ATTRIBUTE);
+  }
+  controller.markedEdges.clear();
+  registry.delete(layer);
+  return true;
+}
+
+function hmbSeedanceSyncRemotePromptEdge(container, state) {
+  const route = hmbSeedanceRemotePromptRoute(state);
+  const layer = route.connected ? hmbSeedanceEdgeLayer(container) : null;
+  if (container?.__hmbSeedancePromptEdgeLayer !== layer) {
+    hmbSeedanceUnregisterRemotePromptEdge(container);
+  }
+  if (!container || !layer || !route.connected) return false;
+  const registry = hmbSeedancePromptEdgeRegistry();
+  if (!registry) return false;
+  let controller = registry.get(layer);
+  if (!controller) {
+    controller = {
+      layer,
+      entries: new Map(),
+      markedEdges: new Set(),
+      observer: null,
+      scheduled: null,
+    };
+    if (typeof MutationObserver === "function") {
+      controller.observer = new MutationObserver(() => {
+        hmbSeedanceSchedulePromptEdgeScan(controller);
+      });
+      // Five generators share this one edge-layer observer. Attribute changes
+      // are deliberately excluded so our own marker never retriggers a scan.
+      controller.observer.observe(layer, { childList: true, subtree: true });
+    }
+    registry.set(layer, controller);
+  }
+  const previousRoute = controller.entries.get(container);
+  const routeUnchanged = Boolean(
+    previousRoute
+    && previousRoute.connected === route.connected
+    && previousRoute.source_node_name === route.source_node_name
+    && previousRoute.previous_source_node_name === route.previous_source_node_name
+    && previousRoute.target_node_name === route.target_node_name
+    && previousRoute.source_parameter === route.source_parameter
+    && previousRoute.target_parameter === route.target_parameter
+  );
+  controller.entries.set(container, route);
+  container.__hmbSeedancePromptEdgeLayer = layer;
+  if (!routeUnchanged) hmbSeedanceScanPromptEdges(controller);
+  return true;
+}
+
+export function hmbSeedanceCleanupRemotePromptEdge(container) {
+  return hmbSeedanceUnregisterRemotePromptEdge(container);
 }
 
 function hmbSeedanceCommandRegistry() {
@@ -1181,6 +1386,7 @@ function refresh(container, props) {
   );
   hmbSeedanceSyncPreviewOverlay(container, state);
   installPreviewObserver(container);
+  hmbSeedanceSyncRemotePromptEdge(container, state);
   return true;
 }
 
@@ -1221,6 +1427,7 @@ export default function HMBSeedanceGenerationWidget(container, props) {
   container.innerHTML = render(initialState);
   hmbSeedanceSyncPreviewOverlay(container, initialState);
   installPreviewObserver(container);
+  hmbSeedanceSyncRemotePromptEdge(container, initialState);
   const select = container.querySelector?.(".hmb-seedance-shot__select");
   const onShotChange = () => {
     const liveProps = container.__hmbSeedanceLatestProps || {};
@@ -1242,6 +1449,8 @@ export default function HMBSeedanceGenerationWidget(container, props) {
       number: selected.number,
       name: selected.name,
     };
+    // Preserve the prior descriptor until retained mode has removed or
+    // replaced the real edge. This prevents a cable flash during transition.
     const owner = hmbSeedanceNextChangeOwner(container);
     const optimisticProps = { ...liveProps, value: next, parameterValue: next, defaultValue: next };
     const accept = () => {
@@ -1275,6 +1484,7 @@ export default function HMBSeedanceGenerationWidget(container, props) {
   container.addEventListener?.("keydown", stopInteriorDelete);
   container.addEventListener?.("pointerdown", stopInteriorSelection);
   const cleanup = () => {
+    hmbSeedanceCleanupRemotePromptEdge(container);
     hmbSeedanceCleanupPreviewOverlay(container);
     if (typeof window !== "undefined" && typeof window.removeEventListener === "function") {
       window.removeEventListener("keydown", guardDelete, true);

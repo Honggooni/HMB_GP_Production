@@ -1477,7 +1477,70 @@ source = (ROOT / "_hmb_shot_routing.py").read_text(encoding="utf-8")
 assert '(image, "SHOT_ASSET_OUT", "SHOT_ASSET_IN")' in source
 assert '(picker, "SHOT_PICKER_OUT", "SHOT_PICKER_IN")' in source
 assert 'or (image is None and picker is None)' in source
+assert '("prompt", "output")' in source
+assert (
+    'agent.node,\n                            "output",\n'
+    '                            target.node,\n                            "prompt",'
+) in source
 assert 'ShotEdge(agent.node, "output", target.node, "SHOT_PROMPT_IN")' not in source
+
+# The UI cable-hiding descriptor is derived only from a real public connection
+# whose Agent subscription matches the same channel, Shot UUID, number, and
+# name. It carries endpoint names, never prompt text.
+route_probe = object.__new__(target.HMBSeedanceGeneration)
+route_probe.name = "HMB Seedance Generation_3"
+route_identity = {
+    "channel_uuid": CHANNEL,
+    "shot_uuid": SHOT,
+    "shot_number": 3,
+    "shot_name": "Shot 3",
+}
+agent_route_identity = dict(route_identity)
+route_probe._shot_identity = lambda: dict(route_identity)  # type: ignore[method-assign]
+
+
+class RouteAgent:
+    name = "HMBAgentLibrary_3"
+
+    @staticmethod
+    def _hmb_shot_channel_subscription() -> dict[str, Any]:
+        return {
+            "participant_kind": "agent",
+            "enabled": True,
+            **agent_route_identity,
+        }
+
+
+route_agent = RouteAgent()
+route_probe._manual_agent_prompt_source = lambda: route_agent  # type: ignore[method-assign]
+route_descriptor = route_probe._current_remote_prompt_route()
+assert route_descriptor["connected"] is True
+assert route_descriptor["source_node_name"] == route_agent.name
+assert route_descriptor["target_node_name"] == route_probe.name
+assert "prompt" not in route_descriptor
+
+agent_route_identity["shot_number"] = 4
+assert route_probe._current_remote_prompt_route()["connected"] is False
+agent_route_identity["shot_number"] = 3
+
+route_probe._hmb_remote_prompt_route = target._seedance_remote_prompt_route_value(
+    {
+        "connected": True,
+        "source_node_name": "HMBAgentLibrary_2",
+        "target_node_name": route_probe.name,
+    }
+)
+route_syncs: list[bool] = []
+route_probe._sync_seedance_shot_widget = (  # type: ignore[method-assign]
+    lambda *, emit_change=False: route_syncs.append(bool(emit_change))
+)
+assert route_probe._hmb_prepare_remote_prompt_route(route_agent) is True
+assert route_probe._hmb_remote_prompt_route["source_node_name"] == route_agent.name
+assert (
+    route_probe._hmb_remote_prompt_route["previous_source_node_name"]
+    == "HMBAgentLibrary_2"
+)
+assert route_syncs == [True]
 
 # A standalone VideoPicker publishes its local Shot 1 through a private,
 # media-free catalog and a matching atomic snapshot.  This is the authority used

@@ -817,6 +817,7 @@ def _seedance_widget_value(
     shot: Any = None,
     shot_catalog: Any = None,
     generation: Any = None,
+    remote_prompt_route: Any = None,
 ) -> dict[str, Any]:
     """Build the sole backend-authoritative Seedance custom-widget value."""
 
@@ -842,6 +843,67 @@ def _seedance_widget_value(
         "shot_catalog": catalog,
         "shot": shot_value,
         "generation": _seedance_generation_preview_value(generation),
+        "remote_prompt_route": _seedance_remote_prompt_route_value(
+            remote_prompt_route
+        ),
+    }
+
+
+def _seedance_remote_prompt_route_value(value: Any = None) -> dict[str, Any]:
+    """Normalize the UI-only descriptor for one managed public prompt edge.
+
+    This descriptor never carries prompt text and never grants execution
+    authority.  The retained-mode connection remains the sole source of truth;
+    the widget uses these bounded endpoint names only to hide that exact edge
+    line while the host keeps both public ports visibly connected.
+    """
+
+    disconnected = {
+        "schema": "hmb-seedance-remote-prompt-route",
+        "version": 1,
+        "connected": False,
+        "source_node_name": "",
+        "previous_source_node_name": "",
+        "target_node_name": "",
+        "source_parameter": "output",
+        "target_parameter": "prompt",
+    }
+    if not isinstance(value, dict) or value.get("connected") is not True:
+        return disconnected
+    source_name = value.get("source_node_name")
+    previous_source_name = value.get("previous_source_node_name", "")
+    target_name = value.get("target_node_name")
+    if (
+        not isinstance(source_name, str)
+        or not isinstance(previous_source_name, str)
+        or not isinstance(target_name, str)
+    ):
+        return disconnected
+    source_name = source_name.strip()
+    previous_source_name = previous_source_name.strip()
+    target_name = target_name.strip()
+    if (
+        not source_name
+        or not target_name
+        or len(source_name) > 512
+        or len(previous_source_name) > 512
+        or len(target_name) > 512
+        or any(
+            ord(character) < 32
+            for character in source_name + previous_source_name + target_name
+        )
+    ):
+        return disconnected
+    return {
+        **disconnected,
+        "connected": True,
+        "source_node_name": source_name,
+        "previous_source_node_name": (
+            previous_source_name
+            if previous_source_name != source_name
+            else ""
+        ),
+        "target_node_name": target_name,
     }
 
 IMAGE_MIME_BY_SUFFIX = {
@@ -1972,6 +2034,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._hmb_shot_catalog_generation = 0
         self._hmb_shot_selector_map: dict[str, dict[str, Any]] = {}
         self._hmb_shot_route_status: dict[str, Any] = {}
+        self._hmb_remote_prompt_route = _seedance_remote_prompt_route_value()
         self._hmb_remote_prompt_syncing = False
         self._hmb_prompt_initial_setup_active = False
         self._hmb_remote_prompt_authority: dict[str, Any] = {}
@@ -4005,6 +4068,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if not checkpoint["task_id"]:
             return False
         status = str(checkpoint.get("status") or "").strip().lower()
+        stage = str(checkpoint.get("stage") or "").strip().lower()
+        task_identity = str(
+            checkpoint.get("task_identity") or ""
+        ).strip().lower()
         provider_response = self.parameter_output_values.get("provider_response")
         terminal = bool(
             checkpoint.get("terminal") is True
@@ -4017,6 +4084,24 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if terminal:
             return False
         if status in BROKER_SUCCESS_STATUSES or status == "succeeded":
+            # ``local_succeeded`` is persisted only after the remote result was
+            # downloaded, decoded, verified, atomically published, and exposed
+            # as this node's output.  Griptape does not reliably serialize the
+            # video artifact outputs, so a reopened node must use this durable
+            # checkpoint as the authoritative consumed-result signal.  Keep the
+            # task ID for audit/recovery history; the next explicit Run replaces
+            # it with the new pre-submit checkpoint.
+            if (
+                task_identity == "broker_task"
+                and stage == "local_succeeded"
+            ):
+                return False
+
+            # A remote success is not yet safe to retire: the visible local
+            # artifact can belong to an earlier render.  Only stage-less legacy
+            # checkpoints retain the pre-v0.6.48 artifact compatibility path.
+            if stage:
+                return True
             current_video = self.parameter_output_values.get(
                 "video_url"
             ) or self.parameter_output_values.get("VIDEO_OUT")
@@ -4100,6 +4185,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             },
             available_catalog,
             self._hmb_generation_preview_state,
+            getattr(self, "_hmb_remote_prompt_route", None),
         )
         try:
             current = self.get_parameter_value(SEEDANCE_SHOT_WIDGET_PARAMETER)
@@ -4203,6 +4289,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             current_identity["shot_uuid"],
         ):
             self._clear_remote_prompt_authority("shot_selection_changed")
+            # Keep the previous exact-edge descriptor until the central router
+            # has actually removed/replaced that public connection. Clearing
+            # it here would reveal the still-live cable for one UI frame.
         # Five concurrent Shot generators must never publish into the same
         # legacy default path. Only HMB-managed defaults are renamed; explicit
         # output destinations and connected FileOutputSettings remain owned by
@@ -4245,10 +4334,122 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     def _hmb_shot_routing_status(self, value: Any) -> None:
         if isinstance(value, dict):
             self._hmb_shot_route_status = deepcopy(value)
+            self._hmb_remote_prompt_route = self._current_remote_prompt_route()
+            self._sync_seedance_shot_widget(emit_change=True)
             # Migrate any saved Agent overlay once. The visible prompt is now
-            # always direct input (authored text or a manual graph connection).
+            # always direct input: authored text in Only or an exact public
+            # Agent.output connection in Shot mode.
             if self.get_parameter_value(SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER) is True:
                 self._clear_remote_prompt_authority("manual_prompt_authority")
+
+    def _hmb_prepare_remote_prompt_route(self, source_node: Any) -> bool:
+        """Pre-arm exact old/new edge hiding before retained-mode mutation.
+
+        The real graph edge remains execution authority. This bounded UI-only
+        descriptor is published first so neither the initial connection nor a
+        Shot A -> B replacement can paint a transient cable.
+        """
+
+        identity = self._shot_identity()
+        subscription_getter = getattr(
+            source_node,
+            "_hmb_shot_channel_subscription",
+            None,
+        )
+        try:
+            subscription = (
+                subscription_getter()
+                if callable(subscription_getter)
+                else None
+            )
+        except Exception:
+            return False
+        if (
+            not identity["channel_uuid"]
+            or not identity["shot_uuid"]
+            or not isinstance(subscription, dict)
+            or subscription.get("participant_kind") != "agent"
+            or subscription.get("enabled") is not True
+            or self._shot_uuid(subscription.get("channel_uuid"))
+            != identity["channel_uuid"]
+            or self._shot_uuid(subscription.get("shot_uuid"))
+            != identity["shot_uuid"]
+            or subscription.get("shot_number") != identity["shot_number"]
+            or subscription.get("shot_name") != identity["shot_name"]
+        ):
+            return False
+        current = _seedance_remote_prompt_route_value(
+            getattr(self, "_hmb_remote_prompt_route", None)
+        )
+        next_source_name = str(getattr(source_node, "name", ""))
+        previous_source_name = (
+            current["source_node_name"]
+            if current["connected"]
+            and current["target_node_name"] == str(getattr(self, "name", "")).strip()
+            else ""
+        )
+        prepared = _seedance_remote_prompt_route_value(
+            {
+                "connected": True,
+                "source_node_name": next_source_name,
+                "previous_source_node_name": previous_source_name,
+                "target_node_name": str(getattr(self, "name", "")),
+            }
+        )
+        if not prepared["connected"]:
+            return False
+        if prepared != current:
+            self._hmb_remote_prompt_route = prepared
+            self._sync_seedance_shot_widget(emit_change=True)
+        return True
+
+    def _current_remote_prompt_route(self) -> dict[str, Any]:
+        """Describe one proven same-Shot public Agent prompt connection."""
+
+        disconnected = _seedance_remote_prompt_route_value()
+        identity = self._shot_identity()
+        if not identity["channel_uuid"] or not identity["shot_uuid"]:
+            return disconnected
+        try:
+            source_node = self._manual_agent_prompt_source()
+        except Exception:
+            # UI decoration is fail-visible. Execution still performs the
+            # strict connection/provenance validation and reports its error.
+            return disconnected
+        if source_node is None:
+            return disconnected
+        subscription_getter = getattr(
+            source_node,
+            "_hmb_shot_channel_subscription",
+            None,
+        )
+        try:
+            subscription = (
+                subscription_getter()
+                if callable(subscription_getter)
+                else None
+            )
+        except Exception:
+            return disconnected
+        if (
+            not isinstance(subscription, dict)
+            or subscription.get("participant_kind") != "agent"
+            or subscription.get("enabled") is not True
+            or self._shot_uuid(subscription.get("channel_uuid"))
+            != identity["channel_uuid"]
+            or self._shot_uuid(subscription.get("shot_uuid"))
+            != identity["shot_uuid"]
+            or subscription.get("shot_number") != identity["shot_number"]
+            or subscription.get("shot_name") != identity["shot_name"]
+        ):
+            return disconnected
+        return _seedance_remote_prompt_route_value(
+            {
+                "connected": True,
+                "source_node_name": str(getattr(source_node, "name", "")),
+                "target_node_name": str(getattr(self, "name", "")),
+            }
+        )
 
     def _hmb_reconcile_shot_routing(self, routing_snapshot: Any) -> None:
         snapshot = self._validate_shot_catalog_snapshot(routing_snapshot)
@@ -4820,6 +5021,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 requested_shot,
                 authoritative_catalog,
                 self._hmb_generation_preview_state,
+                getattr(self, "_hmb_remote_prompt_route", None),
             )
         parent = getattr(super(), "before_value_set", None)
         if callable(parent):

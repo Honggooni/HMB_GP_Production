@@ -1,5 +1,28 @@
 # Changelog
 
+## `v0.6.49` — 2026-08-25
+
+- Promoted the validated `v0.6.48` local-test line from the team-distributed
+  `v0.6.47` baseline.
+- Version policy: odd patch versions are team releases; even patch versions are
+  local test builds and are not distributed directly.
+- Connected each numbered HMBAgent final-text `output` to the matching
+  HMBSeedanceGeneration public `prompt` as a strict same-flow/same-Shot route.
+  The retained edge keeps both string ports naturally lit while the widget
+  hides only that exact cable; `Only` removes the managed connection and leaves
+  both ports unlit. Five-Shot, reload ownership, foreign-input preservation,
+  and shared-observer UI regressions cover the contract.
+- Removed the redundant `Scene / Environment` Target generated for Environment
+  Main/Sub Types while preserving the Target contract for named characters,
+  props, FX/ranges, Global Look, and Camera/Composition. Existing canonical
+  environment defaults migrate to blank; authored named Targets remain intact.
+- Restored all three Video / Color binding controls by retaining the empty
+  structural slots created by `+` through Python and widget normalization.
+- Fixed Prompt-first workflow order: a freshly registered ImageAsset now
+  advertises its first exact catalog once, Prompt text survives crossed source/UI
+  revisions, and default catalog-less `Only` accepts Shot 1. A user-selected
+  `Only` from the same verified publisher remains authoritative.
+
 ## `v0.6.47` — 2026-08-25
 
 - Promoted the validated `v0.6.46` local-test line from the team-distributed

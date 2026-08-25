@@ -651,13 +651,31 @@ def _normalize_image_taxonomy(item: Dict[str, Any]) -> tuple[str, str]:
         item["interaction_custom_targets"] = [""]
         item["legacy_relationship_targets"] = []
 
+    # Main/Sub taxonomy already owns scene/background authority.  Older
+    # workflows also carried the redundant system Target below; remove only
+    # that exact generated value while preserving every authored named target.
+    if (
+        source_type
+        in {
+            "Environment / Background",
+            "Sky / Exterior Background",
+            "Set / Structure",
+            "Foreground / Ground",
+        }
+        and _clean_string(item.get("owner")) == "Scene / Environment"
+    ):
+        item["owner"] = ""
+
     allowed_colors = image_color_pick_choices_for_taxonomy(main_type, sub_type)
     raw_colors = item.get("color_picks")
     colors = raw_colors if isinstance(raw_colors, (list, tuple)) else []
+    # Empty values are structural slots created by the + control.  Keeping
+    # those placeholders is what allows the user to fill bindings 2 and 3;
+    # only invalid non-empty marker values are discarded.
     filtered = [
         _clean_string(value)
         for value in colors
-        if _clean_string(value) in allowed_colors
+        if not _clean_string(value) or _clean_string(value) in allowed_colors
     ][:MAX_COLOR_PICKS]
     item["color_picks"] = filtered or [""]
     count = len(item["color_picks"])
@@ -2380,13 +2398,15 @@ def _default_image_target_for_main_type(
     main_type = _clean_string(source_type)
     if main_type == "Ignore / Unused":
         return "None"
+    # Environment authority is already explicit in Main/Sub Type.  A second
+    # scene-wide Target is redundant and used to render as "Scene / Environment".
     if main_type in {
         "Environment / Background",
         "Sky / Exterior Background",
         "Set / Structure",
         "Foreground / Ground",
     }:
-        return "Scene / Environment"
+        return ""
     if main_type == "Scale / Composition Reference":
         return "Camera / Composition"
     if main_type in {
@@ -2421,6 +2441,32 @@ def _verified_registered_subtype(item: Dict[str, Any]) -> str:
         wire_pair = image_taxonomy_wire_pair(main_type, subtype)
         return wire_pair[1] if wire_pair else ""
     return ""
+
+
+def _verified_look_reference_subtype_override(item: Dict[str, Any]) -> str:
+    """Return a valid Prompt-owned Look Sub Type that differs from registration."""
+
+    if (
+        not bool(item.get("asset_verified"))
+        or _clean_string(item.get("asset_source_kind")).casefold() != "project"
+        or _clean_string(item.get("asset_image_main_type_candidate"))
+        != "Look Reference"
+        or _clean_string(item.get("image_main_type")) != "Look Reference"
+    ):
+        return ""
+    registered_subtype = _clean_string(
+        item.get("asset_image_sub_type_candidate")
+    )
+    effective_subtype = _clean_string(item.get("image_sub_type"))
+    return (
+        effective_subtype
+        if (
+            effective_subtype != registered_subtype
+            and effective_subtype
+            in image_sub_type_choices_for_main_type("Look Reference")
+        )
+        else ""
+    )
 
 
 def _normalize_image_binding_fields(item: Dict[str, Any], video_count: int = MAX_VIDEOS) -> Dict[str, Any]:
@@ -2901,7 +2947,6 @@ def _migrate_old_image_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
             out["scope"] = "Full body / full appearance"
         elif old_role == "Environment / Background":
             out["source_type"] = "Environment / Background"
-            out["owner"] = "Scene / Environment"
             out["scope"] = "Main background"
         elif old_role == "Lighting / Atmosphere":
             out["source_type"] = "Lighting / Atmosphere Reference"
@@ -2920,7 +2965,6 @@ def _migrate_old_image_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
             out["scope"] = "Render look only"
         elif old_role == "Environment + Lighting + Color":
             out["source_type"] = "Environment / Background"
-            out["owner"] = "Scene / Environment"
         elif old_role == "Ignore / Unused":
             out["source_type"] = "Ignore / Unused"
     if out["source_type"] not in IMAGE_SOURCE_TYPE_CHOICES:
@@ -4917,6 +4961,45 @@ def _verified_prompt_shot_catalog(state: Dict[str, Any]) -> List[Dict[str, Any]]
     return catalog
 
 
+def _prompt_only_intent_matches_source_authority(
+    ui_state: Dict[str, Any],
+    source_state: Dict[str, Any],
+) -> bool:
+    """Return whether a blank UI Shot is an explicit Only selection.
+
+    A Prompt created before ImageAsset starts with a catalog-less default Only.
+    That placeholder must accept the first backend-proven Shot.  Once the UI has
+    already seen the same verified publisher/channel, however, blank is a real
+    user choice and must survive later generations from that publisher.
+    """
+
+    if not _verified_prompt_shot_catalog(ui_state):
+        return False
+    ui_image_asset = (
+        ui_state.get("image_asset")
+        if isinstance(ui_state.get("image_asset"), dict)
+        else {}
+    )
+    source_image_asset = (
+        source_state.get("image_asset")
+        if isinstance(source_state.get("image_asset"), dict)
+        else {}
+    )
+    ui_routing = _normalize_shot_catalog_routing(
+        ui_image_asset.get("shot_catalog_routing")
+    )
+    source_routing = _normalize_shot_catalog_routing(
+        source_image_asset.get("shot_catalog_routing")
+    )
+    return bool(
+        ui_routing.get("publisher_instance_uuid")
+        and ui_routing.get("publisher_instance_uuid")
+        == source_routing.get("publisher_instance_uuid")
+        and ui_routing.get("channel_uuid")
+        and ui_routing.get("channel_uuid") == source_routing.get("channel_uuid")
+    )
+
+
 def _merge_prompt_revision_axes(
     source_state: Dict[str, Any],
     ui_state: Dict[str, Any],
@@ -4953,6 +5036,19 @@ def _merge_prompt_revision_axes(
                 item,
                 ui_item,
                 _PROMPT_EDITABLE_IMAGE_UI_FIELDS,
+            )
+        elif (
+            _clean_string(item.get("asset_image_main_type_candidate"))
+            == "Look Reference"
+            and _clean_string(item.get("image_main_type"))
+            == "Look Reference"
+            and _verified_look_reference_subtype_override(ui_item)
+        ):
+            # Registered Look provenance stays on the source axis. The Prompt
+            # may carry only its effective per-shot Sub Type across a crossed
+            # source/UI revision; normalization rebuilds the full wire pair.
+            item["image_sub_type"] = copy.deepcopy(
+                ui_item.get("image_sub_type")
             )
         if not _source_managed_image(item):
             _copy_prompt_ui_fields(
@@ -5017,7 +5113,8 @@ def _merge_prompt_revision_axes(
 
     ui_shot = _normalize_shot_selection(ui.get("shot"))
     if not ui_shot["shot_uuid"]:
-        source["shot"] = _normalize_shot_selection({})
+        if _prompt_only_intent_matches_source_authority(ui, source):
+            source["shot"] = _normalize_shot_selection({})
     else:
         selected = next(
             (
@@ -5346,7 +5443,8 @@ def _image_asset_input_kwargs() -> Dict[str, Any]:
             "Connect HMBImageAssetLibrary ASSET_OUT. Verified Project "
             "assets provide Main Type, Asset ID, Image Name, a registered Sub Type, "
             "and Color Pick candidates. The registered Sub Type stays bound to the "
-            "asset; Target receives a Main-Type default and remains editable. "
+            "asset except that Look Reference rows may select an effective per-shot "
+            "Look Sub Type; Target is then derived from that effective taxonomy. "
             "IMAGE_IMPORT_IN sources provide only Image Name and generator order. "
             "Recognized source, role, Color Pick, and replacement fields compile into the public Prompt sections. "
             "Other connected or descriptive values remain local dashboard state and are not serialized into PROMPT_OUT."
@@ -5876,8 +5974,9 @@ def _apply_image_asset_payload(
     HMBImageAssetLibrary establishes Project metadata only for verified project
     assets. External IMAGE_IMPORT_IN rows carry Image Name and generator order
     only and otherwise behave like native Prompt rows. A verified registered Sub
-    Type is authoritative for its Prompt bindings. Target receives a Main-Type
-    default only when it has not been authored and remains freely editable.
+    Type is authoritative except that a Look Reference may keep one effective
+    Prompt Sub Type. Target is rebuilt from that Look choice; other Targets
+    receive a Main-Type default only when not authored and remain editable.
     Neither mode writes final Color Pick, video slot, or frame range.
     """
     normalized = _normalize_state(state)
@@ -6512,6 +6611,9 @@ def _apply_image_asset_payload(
         previous_asset_default_target = _clean_string(
             item.get("asset_default_target")
         )
+        previous_look_subtype_override = (
+            _verified_look_reference_subtype_override(item)
+        )
         assigned.add(match_index)
         # Remove an older cached snapshot when the visible/resumable row won.
         _pop_dormant_asset_row(
@@ -6539,7 +6641,15 @@ def _apply_image_asset_payload(
             item["asset_scope_candidate"] = asset["scope_candidate"]
             item["asset_color_pick_candidates"] = asset["color_pick_candidates"]
             item["image_main_type"] = asset["image_main_type"]
-            item["image_sub_type"] = asset["image_sub_type"]
+            item["image_sub_type"] = (
+                previous_look_subtype_override
+                if (
+                    asset["image_main_type"] == "Look Reference"
+                    and previous_look_subtype_override
+                    in image_sub_type_choices_for_main_type("Look Reference")
+                )
+                else asset["image_sub_type"]
+            )
             item["source_type"] = asset["source_type"]
             item["custom_source_type"] = asset["custom_source_type"]
             default_target = _default_image_target_for_main_type(
@@ -6558,6 +6668,15 @@ def _apply_image_asset_payload(
                 item["owner"] = default_target
             item["asset_default_target"] = default_target
             _normalize_image_binding_fields(item, MAX_VIDEOS)
+            # Look Sub Types span Global Look and Camera / Composition. Keep
+            # the tracked default aligned with the effective wire after the
+            # Prompt-local selection is normalized.
+            if item.get("image_main_type") == "Look Reference":
+                item["asset_default_target"] = _default_image_target_for_main_type(
+                    item.get("source_type"),
+                    asset.get("image_name"),
+                    asset.get("asset_id"),
+                )
         else:
             # External/imported selection contributes its readable name/order.
             # It never erases an existing Asset ID/path note, candidate, or user
@@ -10543,12 +10662,13 @@ class HMBPromptLibrary(DataNode):
     PROMPT_OUT is available in every mode and is the canonical parent edge for
     HMBAgentLibrary automation.
     Verified Project Asset data establishes Project, Asset ID, Image Name, Main
-    Type, and the registered Image Sub Type. Target starts from a Main-Type
-    default but remains freely editable. External IMAGE_IMPORT_IN rows establish
+    Type, and the registered Image Sub Type. A verified Look Reference keeps
+    its Main Type while permitting an effective per-shot Look Sub Type; its
+    Target is derived from that choice. External IMAGE_IMPORT_IN rows establish
     Image Name and generator order only. Prompt keeps Target, Color Pick, and
     custom user intent editable.
     Picker data synchronizes video-slot lifecycle, generated video paths, and exact Asset ID-to-Image Name appearance-replacement Color Pick bindings.
-    Native image rows may bind one or many supplied Targets, Image Sub Types, video addresses, and appearance markers. Verified Asset rows keep their one registered Sub Type across every local binding while Target remains editable.
+    Native image rows may bind one or many supplied Targets, Image Sub Types, video addresses, and appearance markers. Verified non-Look Asset rows keep their registered Sub Type; verified Look rows keep registered provenance while using one effective Sub Type per shot.
     Every video row is independently usable in any slot. Video Sub Type, Keep Out, image-derived boundaries, and structured CONTROL_ONLY_BINDING lines add meaning when supplied; omitted fields remain optional and never require another source or companion.
     Media remains connected through external loaders.
     """

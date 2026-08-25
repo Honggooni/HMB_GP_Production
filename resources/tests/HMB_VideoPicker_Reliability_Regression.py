@@ -681,7 +681,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.6.47"
+assert manifest["metadata"]["library_version"] == "0.6.49"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
@@ -866,7 +866,15 @@ original_toggle_source = widget_source[
     widget_source.index('on(container.querySelector("#mask-playblast-toggle")')
 ]
 assert "dispatchCommand(" not in original_toggle_source
-assert "original_enabled: originalEnabled" in original_toggle_source
+assert '"original_enabled"' in original_toggle_source
+output_choice_source = widget_source[
+    widget_source.index("const queueOutputChoice ="):
+    widget_source.index('on(container.querySelector("#original-preview-toggle")')
+]
+assert "[field]: enabled" in output_choice_source
+assert "hmbApplyPickerOutputChoicesToDom(" in output_choice_source
+assert "schedulePickerStatePublicationAfterPaint(next" in output_choice_source
+assert "commitOptions: { suppressMatchingEcho: true }" in output_choice_source
 assert "include_original: originalEnabled" in widget_source
 assert "include_mask: maskEnabled" in widget_source
 assert "Select at least one output: Original, Mask, Depth, or Motion Guide." in widget_source
@@ -2448,12 +2456,29 @@ for solid_background_payload in marker_payload_probe[1:4]:
     assert solid_background_payload["shading_profile"] == marker_payload_probe[0]["shading_profile"]
 for pattern_payload in marker_payload_probe[4:]:
     assert pattern_payload["shader_model"] == "surfaceShader"
-    assert pattern_payload["visual_profile"] == "hmb_screen_space_pattern_post_v2"
+    assert pattern_payload["visual_profile"] == "hmb_maya_world_root_projection_v1"
     assert pattern_payload["out_rim"] == ""
+    assert pattern_payload["shading_profile"]["pattern_space"] == "background_root"
+    assert pattern_payload["shading_profile"]["base_cell_world_units"] == 15.0
+    assert pattern_payload["shading_profile"]["density_multiplier"] == 3.0
+    assert pattern_payload["shading_profile"]["cell_size_world_units"] == 5.0
+    assert pattern_payload["shading_profile"]["camera_anchored"] is False
+    assert pattern_payload["shading_profile"]["uv_dependent"] is False
+    assert pattern_payload["shading_profile"]["projection_type"] in {
+        "Planar",
+        "TriPlanar",
+    }
+    assert pattern_payload["shading_profile"]["projection_axis"] in {"XZ", "XYZ"}
+
+legacy_marker_payload_probe = maya_runner._marker_payload(
+    marker_payload_records,
+    pattern_profile=maya_runner.SCREEN_SPACE_PATTERN_PROFILE,
+)
+for pattern_payload in legacy_marker_payload_probe[4:]:
+    assert pattern_payload["visual_profile"] == "hmb_screen_space_pattern_post_v2"
     assert pattern_payload["shading_profile"]["pattern_space"] == "screen"
     assert pattern_payload["shading_profile"]["phase_origin"] == "frame_top_left"
     assert pattern_payload["shading_profile"]["linear_scale_divisor"] == 3
-    assert pattern_payload["shading_profile"]["uv_dependent"] is False
     assert len(pattern_payload["shading_profile"]["categorical_id_rgb"]) == 3
 assert maya_runner._pattern_pixel("direction_checker", 0, 0, 512) == (0, 0, 0)
 assert maya_runner._pattern_pixel("direction_checker", 20, 0, 512) == (0, 0, 0)

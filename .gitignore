@@ -9,6 +9,7 @@ GriptapeNodes/
 .cache/
 .codex/
 .agents/
+.install-staging/
 
 # Local backups and generated release artifacts
 backups/

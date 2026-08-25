@@ -91,6 +91,8 @@ state["images"][0].update(
         "present": True,
         "label": "Hero",
         "asset_id": "Hero",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
         "source_type": "Character Appearance",
         "owner": "Hero",
     }
@@ -105,14 +107,16 @@ assert len(applied["picker"]["markers"]) == 1
 assert len(applied["picker"]["frame_metadata"]) == 3
 
 
-# Ignoring @video1 is a slot-local user choice. Reapplying the still-connected
-# Picker payload must not clear or disable @video2/@video3 and their provenance.
+# Removing @video1 is a slot-local user choice. Reapplying the still-connected
+# Picker payload must honor the same-run tombstone without clearing or disabling
+# @video2/@video3 and their provenance.
 ignored = copy.deepcopy(applied)
-ignored["videos"][0]["source_type"] = "Ignore / Unused"
+ignored["videos"][0] = prompt._default_video_item(1)
+ignored["videos"][0]["manual"] = True
 ignored["picker"]["slot_suppressions"] = {"1": "slot-local-run-a"}
 ignored = prompt._apply_picker_payload(ignored, payload_a, connected=True)
 
-assert ignored["videos"][0]["source_type"] == "Ignore / Unused"
+assert not prompt._is_active_video(ignored["videos"][0])
 assert ignored["videos"][1]["picker_auto_depth"]
 assert ignored["videos"][2]["picker_auto_motion_guide"]
 assert len(ignored["picker"]["markers"]) == 1
@@ -146,8 +150,8 @@ assert len(deleted_depth["picker"]["frame_metadata"]) == 3
 
 
 # A genuinely new Picker run may populate a deleted slot again. Stale
-# same-run tombstones are discarded automatically, while explicit Ignore
-# remains a user-owned role until the user changes it.
+# same-run tombstones are discarded automatically and the new run may restore
+# the previously removed slot.
 payload_b = picker_payload("slot-local-run-b", "slot-local-bundle-b")
 next_run = prompt._apply_picker_payload(
     deleted_depth,
@@ -155,7 +159,7 @@ next_run = prompt._apply_picker_payload(
     connected=True,
 )
 
-assert next_run["videos"][0]["source_type"] == "Ignore / Unused"
+assert prompt._is_active_video(next_run["videos"][0])
 assert next_run["videos"][1]["picker_auto_depth"]
 assert next_run["videos"][2]["picker_auto_motion_guide"]
 assert next_run["picker"]["slot_suppressions"] == {}
