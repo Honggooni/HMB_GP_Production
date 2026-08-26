@@ -108,6 +108,43 @@ assert.deepEqual(
   "Repeated widget normalization must keep the shared image subtype stable.",
 );
 
+// The image-row video number selector exposes only video slots that currently
+// contain source input. MAX_VIDEOS remains a storage limit, not a UI option
+// list, and sparse slot identities must never be compacted.
+assert.deepEqual(
+  prompt.hmbPromptVideoBindingSlotSelection(state, 3),
+  { choices: ["1", "3"], value: "3" },
+  "Sparse active video slots must remain addressable by their real slot numbers.",
+);
+const twoActiveVideos = {
+  ...state,
+  videos: [
+    state.videos[0],
+    {
+      ...state.videos[1],
+      present: true,
+      label: "mask",
+      source_type: "Maya Preview / Playblast",
+      control_role: "Mask / Guide Only",
+    },
+  ],
+};
+assert.deepEqual(
+  prompt.hmbPromptVideoBindingSlotSelection(twoActiveVideos, 1),
+  { choices: ["1", "2"], value: "1" },
+  "Two entered videos must expose only video numbers 1 and 2.",
+);
+assert.deepEqual(
+  prompt.hmbPromptVideoBindingSlotSelection({ ...state, videos: [state.videos[1]] }, 1),
+  { choices: [""], value: "" },
+  "With no entered video, the selector must not invent video numbers 1 through 10.",
+);
+assert.deepEqual(
+  prompt.hmbPromptVideoBindingSlotSelection(state, 2),
+  { choices: ["", "1", "3"], value: "" },
+  "A dormant binding stays stored but must not expose its inactive number as an available choice.",
+);
+
 const customScopeState = prompt.normalizeState({
   ...state,
   images: [{
@@ -133,7 +170,6 @@ const legacyOwnerState = prompt.normalizeState({
     ...state.images[0],
     owner: "",
     binding_scopes: ["Full body / full appearance", "Handheld prop"],
-    interaction_targets: ["Dog"],
   }],
 });
 assert.deepEqual(
@@ -301,6 +337,20 @@ assert.doesNotMatch(
   renderSource,
   /data-field="marker_video"/,
   "The renderer must not fall back to one row-global video selector.",
+);
+assert.match(
+  renderSource,
+  /videoNumberOptions\(state, item\.binding_video_slots\[pickIndex\]\)/,
+  "Initial rendering must build video-number options from current active state.",
+);
+
+const refreshStart = promptSource.indexOf("function hmbRefreshImageColorControls");
+const refreshEnd = promptSource.indexOf("function hmbRefreshSourceSummaries", refreshStart);
+assert.ok(refreshStart >= 0 && refreshEnd > refreshStart);
+assert.match(
+  promptSource.slice(refreshStart, refreshEnd),
+  /hmbPromptVideoBindingSlotSelection\(state, videoSlot\)/,
+  "Retained-mode refresh must use the same active-slot selector contract as initial rendering.",
 );
 
 const subtypeRenderStart = promptSource.indexOf("function renderSubtypeControls");

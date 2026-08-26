@@ -40,6 +40,12 @@ CHARACTER_OUT_RIM_SCREENSPACE_RESAMPLING = 0.0
 CHARACTER_OUT_RIM_LOCAL_OCCLUSION = 2
 FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE = "hmb_full_smooth_geometry_v2"
 ORIGINAL_VIEWPORT_QUALITY_PROFILE = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
+ORIGINAL_MATERIAL_OVERRIDE_PROFILE = (
+    "per_source_material_lambert_texture_preserving_v1"
+)
+ORIGINAL_LAMBERT_ASSIGNMENT_MODE = (
+    "original_per_source_material_lambert_texture_preserving"
+)
 SCREEN_SPACE_PATTERN_PROFILE = "hmb_screen_space_pattern_post_v2"
 SCREEN_SPACE_PATTERN_LINEAR_SCALE_DIVISOR = 3
 SCREEN_SPACE_PATTERN_BASE_CELL_DIVISOR = 8
@@ -2398,7 +2404,7 @@ def _plug_value(plug):
         return []
 
 
-def _material_cutout_evidence(material):
+def _material_cutout_evidence(material, original_lambert_profile=False):
     """Return strict, material-semantic evidence for an authored alpha cutout.
 
     Ordinary Lambert/Phong transparency is not enough: glass and other
@@ -2418,7 +2424,14 @@ def _material_cutout_evidence(material):
     except Exception:
         output_exists = False
 
-    for attribute in ("cutoutOpacity", "opacity"):
+    coverage_attributes = ["cutoutOpacity", "opacity"]
+    if original_lambert_profile:
+        coverage_attributes.extend(
+            attribute
+            for attribute in _ORIGINAL_OPACITY_ATTRIBUTES
+            if attribute not in coverage_attributes
+        )
+    for attribute in coverage_attributes:
         plug = material + "." + attribute
         try:
             exists = bool(cmds.objExists(plug))
@@ -2433,6 +2446,14 @@ def _material_cutout_evidence(material):
         )
         if not sources and not authored_coverage:
             continue
+        if not output_exists and original_lambert_profile:
+            return {
+                "alpha_driven": True,
+                "source_plug": "",
+                "evidence_plug": plug,
+                "evidence_kind": "explicit_{0}".format(attribute),
+                "original_lambert_deferred": True,
+            }
         if not output_exists:
             return {
                 "alpha_driven": True,
@@ -2462,6 +2483,14 @@ def _material_cutout_evidence(material):
         sources = _incoming_source_plugs(plug)
         if not sources or not _upstream_has_spatial_texture(sources):
             continue
+        if not output_exists and original_lambert_profile:
+            return {
+                "alpha_driven": True,
+                "source_plug": "",
+                "evidence_plug": plug,
+                "evidence_kind": "spatial_texture_alpha",
+                "original_lambert_deferred": True,
+            }
         if not output_exists:
             return {
                 "alpha_driven": True,
@@ -2505,7 +2534,7 @@ def _shape_shading_groups(shape):
     return sorted(set(_clean(item) for item in groups if _clean(item)))
 
 
-def _shape_authored_cutout_record(shape):
+def _shape_authored_cutout_record(shape, original_lambert_profile=False):
     """Capture one concrete DAG path before temporary SG replacement."""
     groups = _shape_shading_groups(shape)
     material_records = []
@@ -2522,7 +2551,10 @@ def _shape_authored_cutout_record(shape):
         if not source_plugs:
             continue
         material = source_plugs[0].split(".", 1)[0]
-        evidence = _material_cutout_evidence(material)
+        evidence = _material_cutout_evidence(
+            material,
+            original_lambert_profile=original_lambert_profile,
+        )
         evidence.update({
             "material": material,
             "shading_group": group,
@@ -2556,7 +2588,15 @@ def _shape_authored_cutout_record(shape):
     # Component-level mixtures cannot be reproduced by a single whole-object
     # temporary marker/depth SG.  Fail closed instead of publishing a subtly
     # wrong mask.  A supported cutout has exactly one SG and one alpha output.
-    if len(groups) != 1 or len(alpha_records) != 1 or len(source_plugs) != 1:
+    deferred_original_lambert = bool(
+        len(alpha_records) == 1
+        and alpha_records[0].get("original_lambert_deferred")
+    )
+    if (
+        len(groups) != 1
+        or len(alpha_records) != 1
+        or (len(source_plugs) != 1 and not deferred_original_lambert)
+    ):
         return {
             "shape": shape,
             "alpha_driven": True,
@@ -2570,12 +2610,13 @@ def _shape_authored_cutout_record(shape):
     return {
         "shape": shape,
         "alpha_driven": True,
-        "source_plug": source_plugs[0],
+        "source_plug": source_plugs[0] if source_plugs else "",
         "source_material": selected.get("material") or "",
         "evidence_plug": selected.get("evidence_plug") or "",
         "evidence_kind": selected.get("evidence_kind") or "",
         "shading_group": selected.get("shading_group") or "",
         "shading_groups": groups,
+        "original_lambert_deferred": deferred_original_lambert,
     }
 
 
@@ -2613,7 +2654,12 @@ def _ensure_authored_cutout_snapshot(job, shapes):
         if shape in snapshot:
             continue
         try:
-            snapshot[shape] = _shape_authored_cutout_record(shape)
+            snapshot[shape] = _shape_authored_cutout_record(
+                shape,
+                original_lambert_profile=bool(
+                    job.get("apply_original_lambert_override")
+                ),
+            )
         except Exception as exc:
             snapshot[shape] = {
                 "shape": shape,
@@ -3833,6 +3879,655 @@ def _lambert_shader(name, rgb, fresh=False, transparency_source=""):
             shader + ".transparency",
         )
     return shading_group
+
+
+_ORIGINAL_COLOR_INPUT_ATTRIBUTES = (
+    "base_color",
+    "baseColor",
+    "diffuse_color",
+    "diffuseColor",
+    "color",
+    "albedo",
+    "albedoColor",
+)
+_ORIGINAL_DIRECT_TRANSPARENCY_ATTRIBUTES = (
+    "transparency",
+)
+_ORIGINAL_OPACITY_ATTRIBUTES = (
+    "opacity_color",
+    "opacityColor",
+    "opacity",
+    "cutout_opacity",
+    "cutoutOpacity",
+)
+_ORIGINAL_EMISSION_INPUT_ATTRIBUTES = (
+    "emission_color",
+    "emissionColor",
+    "incandescence",
+)
+_ORIGINAL_NORMAL_INPUT_ATTRIBUTES = (
+    "normalCamera",
+)
+_ORIGINAL_UNSAFE_BUMP_INPUT_ATTRIBUTES = (
+    "bump_input",
+    "bumpInput",
+    "normal",
+)
+
+
+def _original_plug_exists(plug):
+    try:
+        return bool(cmds.objExists(plug))
+    except Exception:
+        return False
+
+
+def _original_node_type(node):
+    try:
+        return _clean(cmds.nodeType(node))
+    except Exception:
+        return ""
+
+
+def _original_source_requires_plugin(source_plug):
+    node_type = _original_node_type(_clean(source_plug).split(".", 1)[0])
+    lowered = node_type.lower()
+    return (
+        not node_type
+        or lowered in ("unknown", "unknowndag", "unknowntransform")
+        or lowered.startswith("redshift")
+        or lowered.startswith("rs")
+        or lowered.startswith("ai")
+    )
+
+
+def _original_upstream_plugin_nodes(source_plug):
+    """Return plug-in-only dependencies hidden behind a Maya-native source."""
+    root = _clean(source_plug).split(".", 1)[0]
+    queue = [root]
+    visited = set()
+    plugin_nodes = set()
+    while queue and len(visited) < 512:
+        node = queue.pop(0)
+        if not node or node in visited:
+            continue
+        visited.add(node)
+        try:
+            upstream = cmds.listConnections(
+                node,
+                source=True,
+                destination=False,
+                plugs=True,
+            ) or []
+        except Exception:
+            upstream = []
+        for candidate in upstream:
+            source_node = _clean(candidate).split(".", 1)[0]
+            if not source_node or source_node in visited:
+                continue
+            if _original_source_requires_plugin(candidate):
+                plugin_nodes.add(source_node)
+            queue.append(source_node)
+    return sorted(plugin_nodes)
+
+
+def _original_supported_source(source_plug):
+    source_plug = _clean(source_plug)
+    if not source_plug or not _original_plug_exists(source_plug):
+        raise RuntimeError(
+            "Original Lambert source plug is missing: {0}".format(
+                source_plug or "<empty>"
+            )
+        )
+    if not _original_source_requires_plugin(source_plug):
+        plugin_nodes = _original_upstream_plugin_nodes(source_plug)
+        if plugin_nodes:
+            raise RuntimeError(
+                "Original Maya-native utility depends on an unavailable "
+                "plug-in node ({0}); the graph cannot be evaluated safely.".format(
+                    ", ".join(plugin_nodes[:8])
+                )
+            )
+        return source_plug
+    raise RuntimeError(
+        "Original texture identity depends on a plug-in-only texture or utility "
+        "node. Connect the Maya file/texture graph directly to the material "
+        "input for renderer-independent Original Playblast."
+    )
+
+
+def _original_attr_record(material, attributes):
+    records = []
+    for attribute in attributes:
+        plug = material + "." + attribute
+        if not _original_plug_exists(plug):
+            continue
+        component_sources = []
+        for suffix in ("R", "G", "B"):
+            component_plug = plug + suffix
+            sources = (
+                _incoming_source_plugs(component_plug)
+                if _original_plug_exists(component_plug)
+                else []
+            )
+            if len(sources) > 1:
+                raise RuntimeError(
+                    "Original material input has ambiguous component sources."
+                )
+            component_sources.append(sources[0] if sources else "")
+        sources = _incoming_source_plugs(plug)
+        if len(sources) > 1 and not any(component_sources):
+            raise RuntimeError(
+                "Original material input has ambiguous compound sources."
+            )
+        records.append({
+            "attribute": attribute,
+            "plug": plug,
+            "source": sources[0] if len(sources) == 1 else "",
+            "component_sources": component_sources,
+            "value": _plug_value(plug),
+        })
+    for record in records:
+        if record["source"] or any(record["component_sources"]):
+            return record
+    for record in records:
+        if record["value"]:
+            return record
+    return {}
+
+
+def _original_record_sources(record):
+    if not isinstance(record, dict):
+        return []
+    return sorted(set(
+        _clean(item)
+        for item in (
+            [record.get("source")]
+            + list(record.get("component_sources") or [])
+        )
+        if _clean(item)
+    ))
+
+
+def _original_assert_existing_lambert_is_native(material):
+    """Ensure an authored Lambert does not hide a renderer-only dependency."""
+    records = (
+        _original_attr_record(material, _ORIGINAL_COLOR_INPUT_ATTRIBUTES),
+        _original_attr_record(
+            material,
+            _ORIGINAL_DIRECT_TRANSPARENCY_ATTRIBUTES,
+        ),
+        _original_attr_record(material, _ORIGINAL_OPACITY_ATTRIBUTES),
+        _original_attr_record(material, _ORIGINAL_EMISSION_INPUT_ATTRIBUTES),
+        _original_attr_record(material, _ORIGINAL_NORMAL_INPUT_ATTRIBUTES),
+    )
+    for record in records:
+        for source_plug in _original_record_sources(record):
+            source_node = source_plug.split(".", 1)[0]
+            if _original_source_requires_plugin(source_plug):
+                raise RuntimeError(
+                    "Existing Lambert {0} depends on plug-in-only node {1}; "
+                    "Original cannot preserve that texture graph without the "
+                    "renderer plug-in.".format(material, source_node)
+                )
+            hidden_plugins = _original_upstream_plugin_nodes(source_plug)
+            if hidden_plugins:
+                raise RuntimeError(
+                    "Existing Lambert {0} has a Maya-native input that still "
+                    "depends on plug-in-only node(s): {1}.".format(
+                        material,
+                        ", ".join(hidden_plugins[:8]),
+                    )
+                )
+
+
+def _original_vector(values, default):
+    components = _numeric_attr_components(values)
+    if not components:
+        return tuple(default)
+    if len(components) == 1:
+        return (components[0], components[0], components[0])
+    return tuple(components[:3])
+
+
+def _original_set_vector(plug, values):
+    vector = _original_vector(values, (0.0, 0.0, 0.0))
+    cmds.setAttr(plug, vector[0], vector[1], vector[2], type="double3")
+
+
+def _original_connect(source_plug, target_plug):
+    cmds.connectAttr(source_plug, target_plug, force=True)
+    try:
+        connected = bool(cmds.isConnected(source_plug, target_plug))
+    except Exception:
+        connected = True
+    if not connected:
+        raise RuntimeError("Original Lambert texture connection was not retained.")
+
+
+def _original_source_is_scalar(source_plug):
+    try:
+        source_type = _clean(cmds.getAttr(source_plug, type=True)).lower()
+    except Exception:
+        source_type = ""
+    if source_type in (
+        "bool",
+        "byte",
+        "char",
+        "short",
+        "long",
+        "float",
+        "double",
+        "doubleangle",
+        "doublelinear",
+        "enum",
+    ):
+        return True
+    attribute = _clean(source_plug).split(".", 1)[-1].lower()
+    return attribute.endswith(("alpha", "outa", "outx", "outy", "outz"))
+
+
+def _original_wire_record(
+    controller,
+    record,
+    target_plug,
+    invert=False,
+    default=(0.0, 0.0, 0.0),
+):
+    if not record:
+        _original_set_vector(target_plug, default)
+        return "default"
+    values = _original_vector(record.get("value"), default)
+    if invert:
+        values = tuple(max(0.0, min(1.0, 1.0 - value)) for value in values)
+    _original_set_vector(target_plug, values)
+    component_sources = list(record.get("component_sources") or [])
+    source_plug = _clean(record.get("source"))
+    if any(component_sources):
+        reverse_node = ""
+        if invert:
+            reverse_node = cmds.createNode(
+                "reverse",
+                name="HMB_Original_OpacityReverse#",
+            )
+            controller.created_nodes.append(reverse_node)
+        for index, source in enumerate(component_sources[:3]):
+            if not source:
+                continue
+            supported = _original_supported_source(source)
+            source_target = (
+                reverse_node + ".input" + "XYZ"[index]
+                if reverse_node
+                else target_plug + "RGB"[index]
+            )
+            _original_connect(supported, source_target)
+            if reverse_node:
+                _original_connect(
+                    reverse_node + ".output" + "XYZ"[index],
+                    target_plug + "RGB"[index],
+                )
+        return "texture"
+    if not source_plug:
+        return "numeric"
+    supported = _original_supported_source(source_plug)
+    scalar = _original_source_is_scalar(supported)
+    if invert:
+        reverse_node = cmds.createNode(
+            "reverse",
+            name="HMB_Original_OpacityReverse#",
+        )
+        controller.created_nodes.append(reverse_node)
+        if scalar:
+            _original_connect(supported, reverse_node + ".inputX")
+            for suffix in "RGB":
+                _original_connect(
+                    reverse_node + ".outputX",
+                    target_plug + suffix,
+                )
+        else:
+            _original_connect(supported, reverse_node + ".input")
+            _original_connect(reverse_node + ".output", target_plug)
+        return "texture"
+    if scalar:
+        for suffix in "RGB":
+            _original_connect(supported, target_plug + suffix)
+    else:
+        _original_connect(supported, target_plug)
+    return "texture"
+
+
+class _OriginalLambertOverrideController(object):
+    """Temporarily replace each authored surface material with its own Lambert.
+
+    Existing shadingEngine memberships are never edited, so object, face and
+    instance assignments remain authored.  Only each SG.surfaceShader source is
+    swapped, then restored and verified before the Original result is published.
+    """
+
+    def __init__(self, job):
+        self.job = job if isinstance(job, dict) else {}
+        self.connections = []
+        self.created_nodes = []
+        self.material_cache = {}
+        self.membership_snapshot = {}
+        self.finished = False
+        self.report = {
+            "profile": ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
+            "requested": True,
+            "status": "ready",
+            "inspected_shading_engine_count": 0,
+            "source_material_count": 0,
+            "temporary_lambert_count": 0,
+            "existing_lambert_count": 0,
+            "texture_connection_count": 0,
+            "numeric_color_count": 0,
+            "transparency_transfer_count": 0,
+            "emission_transfer_count": 0,
+            "normal_transfer_count": 0,
+            "normal_skip_count": 0,
+            "scoped_shape_path_count": 0,
+            "swapped_shading_engine_count": 0,
+            "shading_group_membership_preserved": True,
+            "one_lambert_per_source_material": True,
+            "restore_ok": False,
+            "temporary_nodes_retained_on_restore_failure": False,
+            "default_lighting_verified": False,
+            "textured_render_mode_verified": False,
+        }
+        requested_profile = _clean(
+            self.job.get("original_material_override_profile")
+        )
+        if requested_profile != ORIGINAL_MATERIAL_OVERRIDE_PROFILE:
+            raise RuntimeError(
+                "Unsupported Original material override profile: {0}".format(
+                    requested_profile or "<empty>"
+                )
+            )
+
+    @staticmethod
+    def _group_members(group):
+        try:
+            return sorted(set(
+                _clean(item)
+                for item in (cmds.sets(group, query=True) or [])
+                if _clean(item)
+            ))
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not inspect Original shadingEngine membership: {0}".format(
+                    _clean(exc) or exc.__class__.__name__
+                )
+            )
+
+    def _create_lambert(self, source_material):
+        shader = cmds.shadingNode(
+            "lambert",
+            asShader=True,
+            name="HMB_Original_{0}_Lambert#".format(
+                _safe_token(source_material)
+            ),
+        )
+        self.created_nodes.append(shader)
+        for attribute, value in (
+            ("diffuse", 0.8),
+            ("translucence", 0.0),
+            ("translucenceDepth", 0.0),
+        ):
+            plug = shader + "." + attribute
+            if _original_plug_exists(plug):
+                cmds.setAttr(plug, value)
+        for attribute in ("ambientColor", "incandescence", "transparency"):
+            plug = shader + "." + attribute
+            if _original_plug_exists(plug):
+                _original_set_vector(plug, (0.0, 0.0, 0.0))
+
+        color_attributes = _ORIGINAL_COLOR_INPUT_ATTRIBUTES
+        if _original_node_type(source_material).lower() == "surfaceshader":
+            color_attributes = color_attributes + ("outColor",)
+        color_record = _original_attr_record(
+            source_material,
+            color_attributes,
+        )
+        if not color_record:
+            raise RuntimeError(
+                "Original material has no supported base/diffuse color input; "
+                "its texture identity cannot be preserved with Maya Lambert."
+            )
+        color_mode = _original_wire_record(
+            self,
+            color_record,
+            shader + ".color",
+            default=(0.5, 0.5, 0.5),
+        )
+        if color_mode == "texture":
+            self.report["texture_connection_count"] += 1
+        elif color_mode == "numeric":
+            self.report["numeric_color_count"] += 1
+
+        transparency_record = _original_attr_record(
+            source_material,
+            _ORIGINAL_DIRECT_TRANSPARENCY_ATTRIBUTES,
+        )
+        invert_transparency = False
+        if not transparency_record or not (
+            transparency_record.get("source")
+            or any(transparency_record.get("component_sources") or [])
+            or any(abs(value) > 1.0e-9 for value in _original_vector(
+                transparency_record.get("value"),
+                (0.0, 0.0, 0.0),
+            ))
+        ):
+            opacity_record = _original_attr_record(
+                source_material,
+                _ORIGINAL_OPACITY_ATTRIBUTES,
+            )
+            if opacity_record:
+                transparency_record = opacity_record
+                invert_transparency = True
+        if transparency_record:
+            transparency_mode = _original_wire_record(
+                self,
+                transparency_record,
+                shader + ".transparency",
+                invert=invert_transparency,
+                default=(1.0, 1.0, 1.0) if invert_transparency else (0.0, 0.0, 0.0),
+            )
+            if transparency_mode in ("texture", "numeric"):
+                self.report["transparency_transfer_count"] += 1
+
+        emission_record = _original_attr_record(
+            source_material,
+            _ORIGINAL_EMISSION_INPUT_ATTRIBUTES,
+        )
+        if emission_record:
+            try:
+                emission_mode = _original_wire_record(
+                    self,
+                    emission_record,
+                    shader + ".incandescence",
+                    default=(0.0, 0.0, 0.0),
+                )
+                if emission_mode in ("texture", "numeric"):
+                    self.report["emission_transfer_count"] += 1
+            except Exception:
+                # Emission is an optional appearance aid.  Base texture and
+                # cutout identity remain strict; plug-in-only emission is not.
+                _original_set_vector(
+                    shader + ".incandescence",
+                    (0.0, 0.0, 0.0),
+                )
+
+        normal_record = _original_attr_record(
+            source_material,
+            _ORIGINAL_NORMAL_INPUT_ATTRIBUTES,
+        )
+        normal_sources = []
+        if normal_record and _original_plug_exists(shader + ".normalCamera"):
+            normal_sources = [
+                _clean(item)
+                for item in (
+                    [normal_record.get("source")]
+                    + list(normal_record.get("component_sources") or [])
+                )
+                if _clean(item)
+            ]
+            if normal_sources and not any(
+                _original_source_requires_plugin(item)
+                for item in normal_sources
+            ):
+                try:
+                    normal_mode = _original_wire_record(
+                        self,
+                        normal_record,
+                        shader + ".normalCamera",
+                        default=(0.0, 0.0, 1.0),
+                    )
+                    if normal_mode == "texture":
+                        self.report["normal_transfer_count"] += 1
+                except Exception:
+                    self.report["normal_skip_count"] += 1
+            elif normal_sources:
+                # A raw color texture is not a valid replacement for a
+                # plug-in normal/bump evaluator.  Keep Lambert's default
+                # normal instead of distorting the surface.
+                self.report["normal_skip_count"] += 1
+        if not normal_sources:
+            bump_record = _original_attr_record(
+                source_material,
+                _ORIGINAL_UNSAFE_BUMP_INPUT_ATTRIBUTES,
+            )
+            if bump_record and (
+                bump_record.get("source")
+                or any(bump_record.get("component_sources") or [])
+            ):
+                # Height maps require a bump2d/bump3d evaluator before they can
+                # drive Lambert.normalCamera.  Never wire raw RGB/alpha there.
+                self.report["normal_skip_count"] += 1
+        return shader
+
+    def _scoped_shading_groups(self):
+        shapes = _authored_cutout_scope_shapes(self.job)
+        self.report["scoped_shape_path_count"] = len(shapes)
+        groups = set()
+        for shape in shapes:
+            groups.update(_shape_shading_groups(shape))
+        return sorted(group for group in groups if _clean(group))
+
+    def _remap_cutout_snapshot(self, group, source_material, shader):
+        snapshot = self.job.get("_authored_cutout_snapshot")
+        if not isinstance(snapshot, dict):
+            return
+        for record in snapshot.values():
+            if not isinstance(record, dict) or not record.get("alpha_driven"):
+                continue
+            if _clean(record.get("shading_group")) != group:
+                continue
+            if _clean(record.get("source_material")) != source_material:
+                continue
+            record["source_plug"] = shader + ".outTransparency"
+            record["original_lambert_deferred"] = False
+        self.job["_authored_cutout_report"] = _cutout_snapshot_report(snapshot)
+
+    def _restore(self):
+        connection_failures = []
+        for group, source_plug in reversed(self.connections):
+            try:
+                _original_connect(source_plug, group + ".surfaceShader")
+                if self._group_members(group) != self.membership_snapshot[group]:
+                    raise RuntimeError("shadingEngine membership changed")
+            except Exception as exc:
+                connection_failures.append(
+                    "{0}: {1}".format(
+                        group,
+                        _clean(exc) or exc.__class__.__name__,
+                    )
+                )
+        failures = list(connection_failures)
+        if connection_failures:
+            # Never delete a temporary Lambert that may still be the only
+            # connected surface shader after a failed SG restore.
+            self.report["temporary_nodes_retained_on_restore_failure"] = True
+        else:
+            for node in reversed(self.created_nodes):
+                try:
+                    if cmds.objExists(node):
+                        cmds.delete(node)
+                except Exception as exc:
+                    failures.append(_clean(exc) or exc.__class__.__name__)
+        self.report["restore_ok"] = not bool(failures)
+        self.report["status"] = "restored" if not failures else "restore_failed"
+        if failures:
+            raise RuntimeError(
+                "Original Lambert override could not restore Maya material state: {0}".format(
+                    " | ".join(failures[:10])
+                )
+            )
+
+    def apply(self):
+        try:
+            groups = self._scoped_shading_groups()
+            active_groups = []
+            for group in groups:
+                members = self._group_members(group)
+                if not members:
+                    continue
+                self.membership_snapshot[group] = members
+                active_groups.append(group)
+            self.report["inspected_shading_engine_count"] = len(active_groups)
+            source_materials = set()
+            existing_lamberts = set()
+            for group in active_groups:
+                source_plugs = _incoming_source_plugs(group + ".surfaceShader")
+                if len(source_plugs) != 1:
+                    raise RuntimeError(
+                        "Every assigned shadingEngine must have exactly one "
+                        "surfaceShader source for Original Playblast."
+                    )
+                source_plug = source_plugs[0]
+                source_material = source_plug.split(".", 1)[0]
+                source_materials.add(source_material)
+                if _original_node_type(source_material).lower() == "lambert":
+                    _original_assert_existing_lambert_is_native(
+                        source_material
+                    )
+                    existing_lamberts.add(source_material)
+                    continue
+                shader = self.material_cache.get(source_material)
+                if not shader:
+                    shader = self._create_lambert(source_material)
+                    self.material_cache[source_material] = shader
+                self.connections.append((group, source_plug))
+                _original_connect(shader + ".outColor", group + ".surfaceShader")
+                self._remap_cutout_snapshot(
+                    group,
+                    source_material,
+                    shader,
+                )
+                if self._group_members(group) != self.membership_snapshot[group]:
+                    raise RuntimeError(
+                        "Original Lambert swap changed shadingEngine membership."
+                    )
+            self.report["source_material_count"] = len(source_materials)
+            self.report["existing_lambert_count"] = len(existing_lamberts)
+            self.report["temporary_lambert_count"] = len(self.material_cache)
+            self.report["swapped_shading_engine_count"] = len(self.connections)
+            self.report["status"] = "applied"
+            return dict(self.report)
+        except Exception as original_exc:
+            try:
+                self._restore()
+            except Exception as restore_exc:
+                raise RuntimeError(
+                    "Original Lambert override failed and rollback also failed: "
+                    "{0} | {1}".format(original_exc, restore_exc)
+                )
+            raise
+
+    def finish(self):
+        if not self.finished:
+            self._restore()
+            self.finished = True
+        return dict(self.report)
 
 
 def _character_outline_mode(job):
@@ -8159,6 +8854,7 @@ def _set_viewport_render_options(
     preserve_authored_look=False,
     screen_space_patterns=False,
     depth_mode=False,
+    original_lambert_mode=False,
 ):
     report = {
         "output_transform_disabled": False,
@@ -8168,6 +8864,8 @@ def _set_viewport_render_options(
         "motion_blur_disabled": False,
         "depth_of_field_disabled": False,
         "fog_disabled": False,
+        "default_lighting_verified": False,
+        "textured_render_mode_verified": False,
     }
     if not preserve_authored_look:
         try:
@@ -8202,20 +8900,36 @@ def _set_viewport_render_options(
                             attr
                         )
                     )
-    if marker_mode or depth_mode:
+    if marker_mode or depth_mode or original_lambert_mode:
         # Character markers use Lambert, so the marker playblast must use
         # Maya's Default Lighting with smooth shaded/textured rendering. The
         # camera-depth Surface Shader uses the same textured render mode but is
-        # independent of the lighting result.
+        # independent of the lighting result. Original's compatibility
+        # Lambert also uses Default Lighting so Redshift-only scene lights are
+        # never required to evaluate the Original output.
         for attr, value in (
             ("hardwareRenderingGlobals.lightingMode", 0),
             ("hardwareRenderingGlobals.renderMode", 4),
         ):
             try:
-                if cmds.objExists(attr):
-                    cmds.setAttr(attr, value)
-            except Exception:
-                pass
+                if not cmds.objExists(attr):
+                    raise RuntimeError("attribute is unavailable")
+                cmds.setAttr(attr, value)
+                if int(cmds.getAttr(attr)) != int(value):
+                    raise RuntimeError("attribute did not retain the value")
+                if attr.endswith(".lightingMode"):
+                    report["default_lighting_verified"] = True
+                else:
+                    report["textured_render_mode_verified"] = True
+            except Exception as exc:
+                if original_lambert_mode:
+                    raise RuntimeError(
+                        "Original Maya Lambert compatibility could not enable "
+                        "Default Lighting/textured Viewport 2.0 ({0}: {1}).".format(
+                            attr,
+                            exc,
+                        )
+                    )
     if screen_space_patterns or depth_mode:
         try:
             cmds.colorManagementPrefs(
@@ -14500,11 +15214,42 @@ def run(job_path):
             return _scan_scene(job, result_path, maya_version, scene_path)
 
         apply_marker_shaders = bool(job.get("apply_marker_shaders", True))
+        apply_original_lambert_override = bool(
+            job.get("apply_original_lambert_override")
+        )
         force_high_quality_viewport = bool(job.get("force_high_quality_viewport"))
         screen_space_patterns = bool(job.get("screen_space_patterns"))
         world_space_patterns = bool(job.get("world_space_patterns"))
         generate_depth_playblast = bool(job.get("generate_depth_playblast"))
         generate_motion_guide = bool(job.get("generate_motion_guide"))
+        requested_original_material_profile = _clean(
+            job.get("original_material_override_profile")
+        )
+        if apply_original_lambert_override:
+            if (
+                apply_marker_shaders
+                or not force_high_quality_viewport
+                or generate_depth_playblast
+                or generate_motion_guide
+            ):
+                raise RuntimeError(
+                    "The per-material Lambert override is restricted to the "
+                    "standalone Original Playblast path."
+                )
+            if (
+                requested_original_material_profile
+                != ORIGINAL_MATERIAL_OVERRIDE_PROFILE
+            ):
+                raise RuntimeError(
+                    "Unsupported Original material override profile: {0}".format(
+                        requested_original_material_profile or "<empty>"
+                    )
+                )
+        elif requested_original_material_profile:
+            raise RuntimeError(
+                "An Original material override profile cannot be supplied to "
+                "READ, Mask, Depth, Motion Guide, or Color Playblast."
+            )
         requested_mouth_patch_policy = _clean(
             job.get("mouth_card_inner_patch_policy")
         )
@@ -14756,6 +15501,7 @@ def run(job_path):
                 screen_space_patterns=(
                     screen_space_patterns or world_space_patterns
                 ),
+                original_lambert_mode=apply_original_lambert_override,
             )
         except Exception:
             if quality_restore is not None:
@@ -14858,7 +15604,58 @@ def run(job_path):
         auxiliary_scope_error = ""
         original_mouth_controller = None
         original_mouth_report = {}
+        original_material_controller = None
+        original_material_report = {}
+        if apply_original_lambert_override:
+            _write_progress(
+                job,
+                "preparing_original_lambert_materials",
+                "Mapping each authored surface material to its own temporary Maya Lambert.",
+            )
+            try:
+                original_material_controller = (
+                    _OriginalLambertOverrideController(job)
+                )
+                original_material_controller.apply()
+                original_material_controller.report.update({
+                    "default_lighting_verified": bool(
+                        render_options_report.get("default_lighting_verified")
+                    ),
+                    "textured_render_mode_verified": bool(
+                        render_options_report.get(
+                            "textured_render_mode_verified"
+                        )
+                    ),
+                })
+                original_material_report = dict(
+                    original_material_controller.report
+                )
+                job["_original_material_override_report"] = dict(
+                    original_material_report
+                )
+            except Exception:
+                if quality_restore is not None:
+                    warnings.extend(
+                        _restore_full_smooth_viewport(quality_restore)
+                    )
+                    quality_restore = None
+                raise
         try:
+            if original_material_controller is not None:
+                _write_progress(
+                    job,
+                    "original_lambert_materials_ready",
+                    "Per-source-material Maya Lambert compatibility pass is active.",
+                    temporary_lambert_count=int(
+                        original_material_report.get("temporary_lambert_count") or 0
+                    ),
+                    existing_lambert_count=int(
+                        original_material_report.get("existing_lambert_count") or 0
+                    ),
+                    swapped_shading_engine_count=int(
+                        original_material_report.get("swapped_shading_engine_count") or 0
+                    ),
+                )
             if force_high_quality_viewport and not apply_marker_shaders:
                 original_mouth_controller = _MouthCardInnerPatchController(
                     job,
@@ -15014,10 +15811,23 @@ def run(job_path):
                     warnings.append(warning)
                     _emit_console("WARNING", warning)
         finally:
+            material_restore_error = None
+            if original_material_controller is not None:
+                try:
+                    original_material_report = (
+                        original_material_controller.finish()
+                    )
+                    job["_original_material_override_report"] = dict(
+                        original_material_report
+                    )
+                except Exception as exc:
+                    material_restore_error = exc
             if quality_restore is not None:
                 warnings.extend(
                     _restore_full_smooth_viewport(quality_restore)
                 )
+            if material_restore_error is not None:
+                raise material_restore_error
 
         auxiliary_render_scope_report = dict(
             job.get("_auxiliary_render_scope_report") or {}
@@ -15084,7 +15894,15 @@ def run(job_path):
         if force_high_quality_viewport:
             payload["viewport_quality_profile"] = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
             payload["viewport_quality_report"] = quality_report
-        if force_high_quality_viewport and not apply_marker_shaders:
+        if apply_original_lambert_override:
+            payload["assignment_mode"] = ORIGINAL_LAMBERT_ASSIGNMENT_MODE
+            payload["original_material_override_profile"] = (
+                ORIGINAL_MATERIAL_OVERRIDE_PROFILE
+            )
+            payload["original_material_override_report"] = dict(
+                original_material_report
+            )
+        elif force_high_quality_viewport and not apply_marker_shaders:
             payload["assignment_mode"] = "original_full_detail_no_marker"
         _write_json(sidecar_path, payload)
 
@@ -15225,6 +16043,13 @@ def run(job_path):
         if force_high_quality_viewport:
             result["viewport_quality_profile"] = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
             result["viewport_quality_report"] = quality_report
+        if apply_original_lambert_override:
+            result["original_material_override_profile"] = (
+                ORIGINAL_MATERIAL_OVERRIDE_PROFILE
+            )
+            result["original_material_override_report"] = dict(
+                original_material_report
+            )
         if screen_space_patterns:
             result["screen_space_pattern_profile"] = SCREEN_SPACE_PATTERN_PROFILE
             result["screen_space_render_options"] = render_options_report

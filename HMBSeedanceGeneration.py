@@ -870,6 +870,7 @@ def _seedance_remote_prompt_route_value(value: Any = None) -> dict[str, Any]:
         "source_node_name": "",
         "previous_source_node_name": "",
         "target_node_name": "",
+        "previous_target_node_name": "",
         "source_parameter": "output",
         "target_parameter": "prompt",
     }
@@ -878,24 +879,33 @@ def _seedance_remote_prompt_route_value(value: Any = None) -> dict[str, Any]:
     source_name = value.get("source_node_name")
     previous_source_name = value.get("previous_source_node_name", "")
     target_name = value.get("target_node_name")
+    previous_target_name = value.get("previous_target_node_name", "")
     if (
         not isinstance(source_name, str)
         or not isinstance(previous_source_name, str)
         or not isinstance(target_name, str)
+        or not isinstance(previous_target_name, str)
     ):
         return disconnected
     source_name = source_name.strip()
     previous_source_name = previous_source_name.strip()
     target_name = target_name.strip()
+    previous_target_name = previous_target_name.strip()
     if (
         not source_name
         or not target_name
         or len(source_name) > 512
         or len(previous_source_name) > 512
         or len(target_name) > 512
+        or len(previous_target_name) > 512
         or any(
             ord(character) < 32
-            for character in source_name + previous_source_name + target_name
+            for character in (
+                source_name
+                + previous_source_name
+                + target_name
+                + previous_target_name
+            )
         )
     ):
         return disconnected
@@ -909,7 +919,69 @@ def _seedance_remote_prompt_route_value(value: Any = None) -> dict[str, Any]:
             else ""
         ),
         "target_node_name": target_name,
+        "previous_target_node_name": (
+            previous_target_name
+            if previous_target_name != target_name
+            else ""
+        ),
     }
+
+
+def _merge_seedance_remote_prompt_route_aliases(
+    current: Any,
+    discovered: Any,
+) -> dict[str, Any]:
+    """Retain one reset-era alias for each exact public edge endpoint.
+
+    Griptape resets a node through a temporary replacement name and then
+    renames that same object back to the original name. React Flow may retain
+    temporary endpoint names in the edge ``data-id`` while publishing final
+    names in its aria label. Both proven names for each endpoint therefore
+    describe the same retained edge during this bounded transition; prompt
+    execution authority still comes only from the real connection.
+    """
+
+    current_route = _seedance_remote_prompt_route_value(current)
+    next_route = _seedance_remote_prompt_route_value(discovered)
+    if not next_route["connected"] or not current_route["connected"]:
+        return next_route
+
+    def previous_alias(
+        current_name: str,
+        current_previous_name: str,
+        next_name: str,
+        next_previous_name: str,
+    ) -> str:
+        if next_previous_name and next_previous_name != next_name:
+            return next_previous_name
+        return next(
+            (
+                name
+                for name in (current_name, current_previous_name)
+                if name and name != next_name
+            ),
+            "",
+        )
+
+    previous_source_name = previous_alias(
+        current_route["source_node_name"],
+        current_route["previous_source_node_name"],
+        next_route["source_node_name"],
+        next_route["previous_source_node_name"],
+    )
+    previous_target_name = previous_alias(
+        current_route["target_node_name"],
+        current_route["previous_target_node_name"],
+        next_route["target_node_name"],
+        next_route["previous_target_node_name"],
+    )
+    return _seedance_remote_prompt_route_value(
+        {
+            **next_route,
+            "previous_source_node_name": previous_source_name,
+            "previous_target_node_name": previous_target_name,
+        }
+    )
 
 IMAGE_MIME_BY_SUFFIX = {
     ".jpg": "image/jpeg",
@@ -4344,7 +4416,30 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     def _hmb_shot_routing_status(self, value: Any) -> None:
         if isinstance(value, dict):
             self._hmb_shot_route_status = deepcopy(value)
-            self._hmb_remote_prompt_route = self._current_remote_prompt_route()
+            current_route = _seedance_remote_prompt_route_value(
+                getattr(self, "_hmb_remote_prompt_route", None)
+            )
+            discovered_route = self._current_remote_prompt_route()
+            if discovered_route["connected"]:
+                self._hmb_remote_prompt_route = (
+                    _merge_seedance_remote_prompt_route_aliases(
+                        current_route,
+                        discovered_route,
+                    )
+                )
+            elif (
+                value.get("ok") is True
+                and value.get("code") == "ready"
+                and current_route["connected"]
+                and self._shot_identity()["shot_uuid"]
+            ):
+                # A reset replacement can briefly be undiscoverable between
+                # its temporary and final names. Keep the already-proven,
+                # pre-armed descriptor for that one ready Shot; a real
+                # disconnect/Only transition still clears it below.
+                self._hmb_remote_prompt_route = current_route
+            else:
+                self._hmb_remote_prompt_route = discovered_route
             self._sync_seedance_shot_widget(emit_change=True)
             # Migrate any saved Agent overlay once. The visible prompt is now
             # always direct input: authored text in Only or an exact public
@@ -4392,19 +4487,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             getattr(self, "_hmb_remote_prompt_route", None)
         )
         next_source_name = str(getattr(source_node, "name", ""))
-        previous_source_name = (
-            current["source_node_name"]
-            if current["connected"]
-            and current["target_node_name"] == str(getattr(self, "name", "")).strip()
-            else ""
-        )
-        prepared = _seedance_remote_prompt_route_value(
+        prepared = _merge_seedance_remote_prompt_route_aliases(
+            current,
             {
                 "connected": True,
                 "source_node_name": next_source_name,
-                "previous_source_node_name": previous_source_name,
                 "target_node_name": str(getattr(self, "name", "")),
-            }
+            },
         )
         if not prepared["connected"]:
             return False
@@ -6380,6 +6469,62 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             ):
                 raise RuntimeError(
                     "Seedance Agent and direct Shot media generations do not match."
+                )
+            # Media equality alone cannot prove that the Agent result still
+            # represents the current Prompt. A user can change target, Look,
+            # VFX, or another machine-only field without changing the visible
+            # media lists (and sometimes without changing concise PROMPT_OUT
+            # text). Resolve the exact Prompt instance behind this Agent and
+            # compare its current atomic generation before any billable submit.
+            prompt_node_getter = getattr(
+                prompt_source,
+                "_hmb_generator_prompt_source_node",
+                None,
+            )
+            if not callable(prompt_node_getter):
+                raise RuntimeError(
+                    "Seedance Agent Prompt source snapshot is unavailable."
+                )
+            prompt_node = prompt_node_getter(prompt_text)
+            prompt_snapshot_getter = getattr(
+                prompt_node,
+                "_hmb_generator_shot_snapshot",
+                None,
+            )
+            if not callable(prompt_snapshot_getter):
+                raise RuntimeError(
+                    "Seedance current Prompt Shot snapshot is unavailable."
+                )
+            prompt_snapshot = self._validate_prompt_shot_snapshot(
+                prompt_snapshot_getter(images, videos)
+            )
+            prompt_comparison_fields = (
+                "channel_uuid",
+                "shot_uuid",
+                "shot_number",
+                "shot_name",
+                "prompt_generation",
+                "visible_prompt_sha256",
+                "image_media_sha256",
+                "video_media_sha256",
+            )
+            if any(
+                agent_snapshot.get(key) != prompt_snapshot.get(key)
+                for key in prompt_comparison_fields
+            ):
+                invalidator = getattr(
+                    prompt_source,
+                    "_invalidate_generator_authority_for_prompt_change",
+                    None,
+                )
+                if callable(invalidator):
+                    try:
+                        invalidator()
+                    except Exception:
+                        pass
+                raise RuntimeError(
+                    "Seedance Prompt changed after the Agent result was created. "
+                    "Run HMBAgentLibrary again; no render was submitted."
                 )
 
         resolved = dict(params)

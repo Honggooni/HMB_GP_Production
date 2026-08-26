@@ -245,6 +245,7 @@ export function hmbSeedanceRemotePromptRoute(value) {
     source_node_name: "",
     previous_source_node_name: "",
     target_node_name: "",
+    previous_target_node_name: "",
     source_parameter: "output",
     target_parameter: "prompt",
   };
@@ -253,6 +254,9 @@ export function hmbSeedanceRemotePromptRoute(value) {
   const previousSourceNodeName = rawPreviousSourceNodeName
     ? hmbSeedanceNodeName(rawPreviousSourceNodeName) : "";
   const targetNodeName = hmbSeedanceNodeName(source.target_node_name);
+  const rawPreviousTargetNodeName = source.previous_target_node_name ?? "";
+  const previousTargetNodeName = rawPreviousTargetNodeName
+    ? hmbSeedanceNodeName(rawPreviousTargetNodeName) : "";
   if (
     source.schema !== disconnected.schema
     || Number(source.version) !== disconnected.version
@@ -262,6 +266,7 @@ export function hmbSeedanceRemotePromptRoute(value) {
     || !sourceNodeName
     || (rawPreviousSourceNodeName && !previousSourceNodeName)
     || !targetNodeName
+    || (rawPreviousTargetNodeName && !previousTargetNodeName)
   ) return disconnected;
   return {
     ...disconnected,
@@ -270,6 +275,8 @@ export function hmbSeedanceRemotePromptRoute(value) {
     previous_source_node_name: previousSourceNodeName === sourceNodeName
       ? "" : previousSourceNodeName,
     target_node_name: targetNodeName,
+    previous_target_node_name: previousTargetNodeName === targetNodeName
+      ? "" : previousTargetNodeName,
   };
 }
 
@@ -522,16 +529,26 @@ export function hmbSeedanceRemotePromptEdgeMatches(element, value) {
   if (!route.connected || !element?.getAttribute) return false;
   const edgeId = String(element.getAttribute("data-id") || "");
   const ariaLabel = String(element.getAttribute("aria-label") || "");
-  return [route.source_node_name, route.previous_source_node_name]
-    .filter(Boolean)
-    .some((sourceNodeName) => {
-      const expectedPrefix = (
-        `${sourceNodeName}-${route.source_parameter}-`
-        + `${route.target_node_name}-${route.target_parameter}-`
-      );
-      return edgeId.startsWith(expectedPrefix)
-        && ariaLabel === `Edge from ${sourceNodeName} to ${route.target_node_name}`;
-    });
+  const sourceAliases = [route.source_node_name, route.previous_source_node_name]
+    .filter(Boolean);
+  const targetAliases = [route.target_node_name, route.previous_target_node_name]
+    .filter(Boolean);
+  const idMatches = sourceAliases.some((sourceNodeName) => (
+    targetAliases.some((targetNodeName) => edgeId.startsWith(
+      `${sourceNodeName}-${route.source_parameter}-`
+      + `${targetNodeName}-${route.target_parameter}-`,
+    ))
+  ));
+  const labelMatches = sourceAliases.some((sourceNodeName) => (
+    targetAliases.some((targetNodeName) => (
+      ariaLabel === `Edge from ${sourceNodeName} to ${targetNodeName}`
+    ))
+  ));
+  // During Reset Node, React Flow can retain temporary endpoint names in the
+  // edge id while its aria label already uses final names. The two proven
+  // aliases for each endpoint may therefore match independently, but both
+  // public handles and every accepted endpoint remain exact.
+  return idMatches && labelMatches;
 }
 
 function hmbSeedancePromptEdgeRegistry() {
@@ -641,9 +658,16 @@ function hmbSeedanceSyncRemotePromptEdge(container, state) {
       controller.observer = new MutationObserver(() => {
         hmbSeedanceSchedulePromptEdgeScan(controller);
       });
-      // Five generators share this one edge-layer observer. Attribute changes
-      // are deliberately excluded so our own marker never retriggers a scan.
-      controller.observer.observe(layer, { childList: true, subtree: true });
+      // Five generators share this one edge-layer observer. Reset Node may
+      // rename the retained edge in place, so watch only the two host-owned
+      // endpoint attributes. Our own hiding marker is intentionally outside
+      // this filter and therefore cannot retrigger the observer.
+      controller.observer.observe(layer, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["data-id", "aria-label"],
+      });
     }
     registry.set(layer, controller);
   }
@@ -654,6 +678,7 @@ function hmbSeedanceSyncRemotePromptEdge(container, state) {
     && previousRoute.source_node_name === route.source_node_name
     && previousRoute.previous_source_node_name === route.previous_source_node_name
     && previousRoute.target_node_name === route.target_node_name
+    && previousRoute.previous_target_node_name === route.previous_target_node_name
     && previousRoute.source_parameter === route.source_parameter
     && previousRoute.target_parameter === route.target_parameter
   );

@@ -89,14 +89,17 @@ def seeded_prompt_state() -> dict:
         {
             "present": True,
             "label": "",
-            "source_type": "User invented image role",
+            "image_main_type": "Custom / Context",
+            "image_sub_type": "Custom",
+            "source_type": "Custom",
+            "custom_source_type": "User invented image role",
             "owner": "Whole imagined world",
-            "binding_scopes": ["User invented scope"],
+            "scope": "Custom scope",
+            "binding_scopes": ["Custom scope"],
             "binding_custom_scopes": ["User invented scope"],
             "binding_video_slots": [5],
             "marker_video": 5,
             "color_picks": ["Red"],
-            "legacy_relationship_targets": ["Left hand idea", "Floating idea"],
             "manual": True,
         }
     )
@@ -106,8 +109,12 @@ def seeded_prompt_state() -> dict:
         {
             "present": True,
             "label": "MANUAL_VIDEO2_SENTINEL.mp4",
-            "source_type": "User invented video role",
-            "control_role": "User invented control role",
+            "video_main_type": "Custom / Context",
+            "video_sub_type": "Custom",
+            "source_type": "Custom",
+            "custom_source_type": "User invented video role",
+            "control_role": "Custom Role",
+            "custom_control_role": "User invented control role",
             "keep_out": "Keep dormant @image8 wording exactly.",
             "manual": True,
         }
@@ -116,6 +123,8 @@ def seeded_prompt_state() -> dict:
         {
             "present": True,
             "label": "MANUAL_VIDEO5_SENTINEL.mp4",
+            "video_main_type": "Custom / Context",
+            "video_sub_type": "Custom",
             "source_type": "Custom",
             "custom_source_type": "Any-purpose user evidence",
             "control_role": "Custom Role",
@@ -213,7 +222,11 @@ def exercise_agent_once(
         return "agent-output"
 
     node.get_parameter_value = types.MethodType(
-        lambda _self, name: prompt_value if name == "prompt" else None,
+        lambda _self, name: (
+            prompt_value
+            if name == agent._AGENT_SHOT_PROMPT_INPUT_PARAMETER
+            else None
+        ),
         node,
     )
     node._run_native_agent_once = types.MethodType(native_once, node)
@@ -293,7 +306,7 @@ try:
                     )
                     edges.add("V->P")
                 assert_user_state_survives(state, f"{label}:connected")
-                compiled = prompt._build_prompt_package(state)
+                compiled = prompt._build_data_only_prompt_package(state)
                 assert_data_only_prompt(compiled, label)
                 assert bool(state["image_asset"]["enabled"]) is ("I" in composition), label
                 assert bool(state["picker"]["enabled"]) is ("V" in composition), label
@@ -312,7 +325,10 @@ try:
                         connected=True,
                     )
                     assert_user_state_survives(reverse, f"{label}:reverse")
-                    assert_data_only_prompt(prompt._build_prompt_package(reverse), f"{label}:reverse")
+                    assert_data_only_prompt(
+                        prompt._build_data_only_prompt_package(reverse),
+                        f"{label}:reverse",
+                    )
 
             agent_calls = 0
             if "A" in composition:

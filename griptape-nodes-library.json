@@ -4,10 +4,10 @@
   "metadata": {
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.7.1",
+    "library_version": "0.7.5",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
-      "archive_source_count": 29,
+      "archive_source_count": 25,
       "mode": "authenticated_broker_session",
       "broker_endpoint": "https://192.168.203.245:8443/api/v1/agent-core/dat",
       "public_ca_path": "resources/tls/hmb_agent_broker_ca.pem",

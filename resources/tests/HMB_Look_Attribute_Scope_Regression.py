@@ -22,9 +22,6 @@ prompt = load_module("HMBPromptLibrary")
 agent = load_module("HMBAgentLibrary")
 source = (ROOT / "HMBPromptLibrary.py").read_text(encoding="utf-8")
 agent_source = (ROOT / "HMBAgentLibrary.py").read_text(encoding="utf-8")
-guide = (ROOT / "resources" / "maya" / "HMBVideoPicker_Maya_Guide.txt").read_text(
-    encoding="utf-8-sig"
-)
 legacy_scope_phrases = (
     "explicit user goal may use any visible property",
     "explicit current user goal may use any visible or supplied property",
@@ -34,7 +31,6 @@ legacy_scope_phrases = (
 )
 for legacy in legacy_scope_phrases:
     assert legacy.casefold() not in source.casefold(), legacy
-    assert legacy.casefold() not in guide.casefold(), legacy
 
 assert prompt.PROMPT_POLICY_SOURCE_VERSION == "2026-08-12.agent-shot-quality.v4.2"
 assert prompt.PROMPT_POLICY_SOURCE_CONTRACT_SHA256 == (
@@ -65,6 +61,51 @@ def prompt_sections(payload: str):
     assert lines[3] == "FX/TIMING SOURCE DATA (JSON):"
     assert lines[5] == "USER DESCRIPTION DATA (JSON):"
     return json.loads(lines[2]), json.loads(lines[4]), json.loads(lines[6])
+
+
+def expect_rejected(callback) -> None:
+    try:
+        callback()
+    except RuntimeError:
+        return
+    raise AssertionError("ambiguous Look attribute authority was accepted")
+
+
+def look_claim_package(*claims: tuple[str, str]) -> str:
+    """Build one closed job with two real recipients and typed Look claims."""
+
+    look_state = prompt._default_widget_state()
+    look_state["images"] = []
+    for slot, label, owner, main_type, sub_type in (
+        (1, "hero-sheet.png", "Hero_A", "Character", "Full Appearance"),
+        (
+            2,
+            "forest-sheet.png",
+            "Forest_A",
+            "Environment / Background",
+            "Main Background",
+        ),
+    ):
+        row = prompt._default_image_item(slot)
+        row.update({
+            "present": True,
+            "label": label,
+            "owner": owner,
+            "image_main_type": main_type,
+            "image_sub_type": sub_type,
+        })
+        look_state["images"].append(row)
+    for slot, (sub_type, target) in enumerate(claims, start=3):
+        row = prompt._default_image_item(slot)
+        row.update({
+            "present": True,
+            "label": f"look-{slot}.png",
+            "owner": target,
+            "image_main_type": "Look Reference",
+            "image_sub_type": sub_type,
+        })
+        look_state["images"].append(row)
+    return prompt._build_data_only_prompt_package(look_state)
 
 
 # Public Prompt output is typed job data only; look policy remains exclusively
@@ -134,16 +175,16 @@ fx_state = prompt._default_widget_state()
 fx_state["videos"][0].update({
     "present": True,
     "label": "fx_reference.mp4",
-    "video_main_type": "FX / Simulation Reference",
-    "video_sub_type": "Explosion",
+    "video_main_type": "FX Reference",
+    "video_sub_type": "FX Effect Only",
 })
 job, fx_contract, _user_data = prompt_sections(
     prompt._build_data_only_prompt_package(fx_state)
 )
-assert job["videos"][0]["control_role"] == "FX Behavior Only"
+assert job["videos"][0]["control_role"] == "FX Effect Only"
 fx_source = fx_contract["sources"][0]
 assert fx_source["source_type"] == "FX Reference"
-assert fx_source["selected_role"] == "FX Behavior Only"
+assert fx_source["selected_role"] == "FX Effect Only"
 assert set(fx_source).issubset({
     "video",
     "video_uid",
@@ -188,6 +229,61 @@ assert image["bindings"] == [{
     "marker_color": "Red",
     "target_scope": "Full body / full appearance",
 }]
+
+# Look authority is an attribute-domain contract, not a last-writer-wins list.
+# The same recipient (or Global Look versus any named recipient) may carry
+# disjoint color/lighting/render claims, but overlapping domains fail closed.
+for valid_claims in (
+    (
+        ("Color Mood", "Hero_A"),
+        ("Lighting / Atmosphere", "Global Look"),
+        ("Render Look", "Hero_A"),
+    ),
+    (
+        ("Color Mood", "Hero_A"),
+        ("Color Mood", "Forest_A"),
+    ),
+    (
+        ("Color Mood", "Global Look"),
+        ("Lighting / Atmosphere", "Global Look"),
+    ),
+    (
+        ("Color Mood", "Global Look"),
+        ("Lighting / Atmosphere", "Global Look"),
+        ("Render Look", "Global Look"),
+    ),
+):
+    valid_package = look_claim_package(*valid_claims)
+    valid_job = agent._assert_public_job_data_contract(valid_package)
+    assert [
+        (row["image_sub_type"], row["target_id"])
+        for row in valid_job["images"][2:]
+    ] == list(valid_claims)
+
+for invalid_claims in (
+    (
+        ("Color Mood", "Hero_A"),
+        ("Color Mood", "Hero_A"),
+    ),
+    (
+        ("Color / Look / Lighting", "Global Look"),
+        ("Render Look", "Hero_A"),
+    ),
+    (
+        ("Color Mood", "Global Look"),
+        ("Color Mood", "Hero_A"),
+    ),
+    (
+        ("Color / Look / Lighting", "Global Look"),
+        ("Lighting / Atmosphere", "Global Look"),
+    ),
+):
+    invalid_package = look_claim_package(*invalid_claims)
+    expect_rejected(
+        lambda package=invalid_package: agent._assert_public_job_data_contract(
+            package
+        )
+    )
 
 # Multiple video sources remain independent rows in one closed job schema.
 multi = prompt._default_widget_state()

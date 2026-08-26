@@ -46,7 +46,7 @@ assert "with _agent_process_session._condition" not in common_source
 
 delivery = manifest["metadata"]["agent_policy_delivery"]
 assert delivery == {
-    "archive_source_count": 29,
+    "archive_source_count": 25,
     "mode": "authenticated_broker_session",
     "broker_endpoint": "https://192.168.203.245:8443/api/v1/agent-core/dat",
     "public_ca_path": "resources/tls/hmb_agent_broker_ca.pem",

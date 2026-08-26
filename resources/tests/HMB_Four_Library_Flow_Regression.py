@@ -40,17 +40,16 @@ agent_library = load("HMBAgentLibrary", "hmb_four_flow_agent")
 # Prompt and Image Asset bind the exact same common taxonomy objects. No copied
 # Python literal is allowed to become a second source of truth.
 assert (
-    prompt_library.IMAGE_SOURCE_TYPE_CHOICES
-    is prompt_library._hmb.IMAGE_SOURCE_TYPE_CHOICES
-)
-assert (
     asset_library.IMAGE_SOURCE_TYPE_CHOICES
     is asset_library._hmb.IMAGE_SOURCE_TYPE_CHOICES
 )
 assert asset_library._hmb is prompt_library._hmb
 assert agent_library._hmb is prompt_library._hmb
-assert prompt_library.IMAGE_SOURCE_TYPE_CHOICES == common.IMAGE_SOURCE_TYPE_CHOICES
-assert prompt_library.IMAGE_SCOPE_CHOICES == common.IMAGE_SCOPE_CHOICES
+assert prompt_library._image_taxonomy_payload() == asset_library._taxonomy_payload()
+assert prompt_library._image_taxonomy_payload() == common.image_taxonomy_payload()
+assert common.IMAGE_MAIN_TYPE_COUNT == 6
+assert common.IMAGE_SUB_TYPE_COUNT == 26
+assert common.IMAGE_TAXONOMY_PAIR_COUNT == 26
 
 
 png_1x1 = base64.b64decode(
@@ -209,11 +208,20 @@ try:
         "Environment / Background", "Night City"
     ) == ""
     assert prompt_library._default_image_target_for_main_type(
-        "Scale / Composition Reference", "Wide Shot"
-    ) == "Camera / Composition"
+        "Relative Size Reference", "Wide Shot", "", "ch_Scale"
+    ) == "ch_all"
+    assert prompt_library._default_image_target_for_main_type(
+        "Relative Size Reference", "Wide Shot", "", "bg_Scale"
+    ) == "bg_all"
+    assert prompt_library._default_image_target_for_main_type(
+        "Relative Size Reference",
+        "Wide Shot",
+        "",
+        "ch_Scale / bg_Scale",
+    ) == "ch_all / bg_all"
     assert prompt_library._default_image_target_for_main_type(
         "Lighting / Atmosphere Reference", "Blue Hour"
-    ) == "Global Look"
+    ) == ""
 
     # Prompt may already hold a freely authored Target and Color Pick. Applying
     # Asset Library metadata preserves those fields but replaces the Prompt Sub

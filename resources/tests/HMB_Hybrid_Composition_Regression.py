@@ -166,6 +166,8 @@ manual_primary = prompt._default_widget_state()
 manual_primary["videos"][0].update({
     "present": True,
     "label": "manual-motion-reference.mp4",
+    "video_main_type": "Motion Reference",
+    "video_sub_type": "Local Motion",
     "source_type": "Motion Reference",
     "control_role": "Local Motion Detail Only",
 })
@@ -184,8 +186,10 @@ auxiliary_only["videos"].append(prompt._default_video_item(2))
 auxiliary_only["videos"][1].update({
     "present": True,
     "label": "auxiliary-context.mp4",
+    "video_main_type": "Motion Reference",
+    "video_sub_type": "Secondary Motion",
     "source_type": "Motion Reference",
-    "control_role": "Context Only",
+    "control_role": "Secondary Motion Only",
     "manual": True,
 })
 auxiliary_compiled = assert_prompt_is_additive(auxiliary_only, "P auxiliary-only")
@@ -251,7 +255,8 @@ color_direct_prompt = prompt._build_data_only_prompt_package(prompt_states["VP"]
 color_direct_job, color_direct_fx, color_direct_user = prompt_sections(
     color_direct_prompt
 )
-assert color_direct_job["videos"][0]["source_type"] == "Maya Preview / Playblast"
+assert color_direct_job["videos"][0]["source_type"] == "Unified Shot-Control Video"
+assert color_direct_job["videos"][0]["control_role"] == "Primary Unified Shot Control"
 assert color_direct_fx["sources"] == []
 assert color_direct_user == {}
 
@@ -259,6 +264,8 @@ color_depth_state = prompt._apply_picker_payload(
     prompt._default_widget_state(), picker_depth_payload, connected=True
 )
 color_depth_state["videos"][1].update({
+    "video_main_type": "Maya Preview / Playblast",
+    "video_sub_type": "Depth",
     "source_type": "Depth / Spatial Reference",
     "control_role": "Spatial Alignment Verification Only",
 })
@@ -286,14 +293,18 @@ manual_aux = prompt._default_video_item(2)
 manual_aux.update({
     "present": True,
     "label": "manual-independent-aux.mp4",
+    "video_main_type": "Motion Reference",
+    "video_sub_type": "Secondary Motion",
     "source_type": "Motion Reference",
-    "control_role": "Context Only",
+    "control_role": "Secondary Motion Only",
     "manual": True,
 })
 merge_state["videos"].append(manual_aux)
 merge_state["images"][0].update({
     "present": True,
     "label": "Dormant binding idea",
+    "image_main_type": "Custom / Context",
+    "image_sub_type": "Custom",
     "source_type": "Custom",
     "custom_source_type": "User idea",
     "color_picks": ["Blue"],
@@ -315,11 +326,15 @@ assert merged_picker_state["images"][0]["color_picks"] == ["Blue"]
 unnamed_state = prompt._default_widget_state()
 unnamed_state["images"][0].update({
     "present": False,
+    "image_main_type": "Custom / Context",
+    "image_sub_type": "Custom",
     "source_type": "Custom",
     "custom_source_type": "Unnamed image idea",
 })
 unnamed_state["videos"][0].update({
     "present": False,
+    "video_main_type": "Custom / Context",
+    "video_sub_type": "Context",
     "source_type": "Motion Reference",
     "control_role": "Context Only",
 })
@@ -358,29 +373,31 @@ assert (
     == "Use [deselected image source #2] silhouette"
 )
 
-# Unknown future taxonomy values and legacy relationships survive migration.
-future_image = prompt._migrate_old_image_item({
+# Unknown or retired taxonomy text is released. Current Main/Sub is the only
+# authoring contract and existing assets are intentionally reset on upgrade.
+future_image = prompt._normalize_image_item({
     "source_type": "Future Image",
     "custom_source_type": "Future Image",
     "owner": "ExistingTarget",
     "binding_scopes": ["Handheld prop"],
-    "interaction_targets": ["Hero", "Custom"],
-    "interaction_custom_targets": ["", "Dog"],
 }, 1)
-assert future_image["source_type"] == "Custom"
-assert future_image["custom_source_type"] == "Future Image"
-assert future_image["owner"] == "ExistingTarget"
-assert future_image["legacy_relationship_targets"] == ["Hero", "Dog"]
+assert future_image["image_main_type"] == "Select Image Main Type"
+assert future_image["image_sub_type"] == ""
+assert future_image["source_type"] == "Role Required / Select Source Type"
+assert future_image["custom_source_type"] == ""
+assert future_image["owner"] == ""
 future_video = prompt._migrate_old_video_item({
     "source_type": "Future Video",
     "custom_source_type": "Future Video",
     "control_role": "Future Role",
     "custom_control_role": "Future Role",
 }, 1)
-assert future_video["source_type"] == "Custom"
-assert future_video["custom_source_type"] == "Future Video"
-assert future_video["control_role"] == "Custom Role"
-assert future_video["custom_control_role"] == "Future Role"
+assert future_video["video_main_type"] == "Select Video Main Type"
+assert future_video["video_sub_type"] == ""
+assert future_video["source_type"] == "Role Required / Select Video Type"
+assert future_video["custom_source_type"] == ""
+assert future_video["control_role"] == ""
+assert future_video["custom_control_role"] == ""
 
 # Enabling an incomplete optional Range preserves it as an unresolved typed
 # constraint. Missing optional fields are not technical corruption and add no warning.
@@ -401,8 +418,10 @@ incomplete_range_state["images"][0].update({
 incomplete_range_state["videos"][0].update({
     "present": True,
     "label": "range-source.mp4",
+    "video_main_type": "Motion Reference",
+    "video_sub_type": "Secondary Motion",
     "source_type": "Motion Reference",
-    "control_role": "Context Only",
+    "control_role": "Secondary Motion Only",
 })
 incomplete_range_prompt = assert_prompt_is_additive(
     incomplete_range_state,
@@ -423,8 +442,10 @@ for slot in range(1, prompt.MAX_VIDEOS + 1):
     row.update({
         "present": True,
         "label": f"long-source-{slot}.mp4",
+        "video_main_type": "Motion Reference",
+        "video_sub_type": "Secondary Motion",
         "source_type": "Motion Reference",
-        "control_role": "Context Only",
+        "control_role": "Secondary Motion Only",
         "keep_out": "K" * prompt.MAX_KEEP_OUT_CHARS,
         "manual": True,
     })

@@ -535,17 +535,17 @@ const verifiedLookOverrideMerge = widget.hmbMergePromptRevisionAxes(
       asset_image_sub_type_candidate: "Color Mood",
       image_main_type: "Look Reference",
       image_sub_type: "Scale",
-      owner: "Jett_11",
+      owner: "Camera / Composition",
     }],
   },
 );
 const verifiedLookOverrideRow = verifiedLookOverrideMerge.images[0];
 assert.equal(verifiedLookOverrideRow.asset_image_sub_type_candidate, "Render Look");
 assert.equal(verifiedLookOverrideRow.image_main_type, "Look Reference");
-assert.equal(verifiedLookOverrideRow.image_sub_type, "Scale");
-assert.equal(verifiedLookOverrideRow.source_type, "Scale / Composition Reference");
-assert.equal(verifiedLookOverrideRow.scope, "Scale only");
-assert.equal(verifiedLookOverrideRow.owner, "Jett_11");
+assert.equal(verifiedLookOverrideRow.image_sub_type, "Render Look");
+assert.equal(verifiedLookOverrideRow.source_type, "Color / Look Reference");
+assert.equal(verifiedLookOverrideRow.scope, "Render look only");
+assert.equal(verifiedLookOverrideRow.owner, "");
 assert.deepEqual(verifiedLookOverrideRow.color_picks, [""]);
 
 const verifiedLookDefaultMerge = widget.hmbMergePromptRevisionAxes(
@@ -710,15 +710,15 @@ const manualVideoMerge = widget.hmbMergePromptRevisionAxes(
       present: true,
       manual: true,
       label: "Newest manual video",
-      video_main_type: "FX / Simulation Reference",
-      video_sub_type: "Dust",
+      video_main_type: "FX Reference",
+      video_sub_type: "FX Effect Only",
       keep_out: "Newest manual keep out",
     }],
   },
 );
 assert.equal(manualVideoMerge.videos[0].label, "Newest manual video");
-assert.equal(manualVideoMerge.videos[0].video_main_type, "FX / Simulation Reference");
-assert.equal(manualVideoMerge.videos[0].video_sub_type, "Dust");
+assert.equal(manualVideoMerge.videos[0].video_main_type, "FX Reference");
+assert.equal(manualVideoMerge.videos[0].video_sub_type, "FX Effect Only");
 assert.equal(manualVideoMerge.videos[0].keep_out, "Newest manual keep out");
 
 clearTimeout(rapidEchoContainer.__hmbPromptPendingLocalTimer);

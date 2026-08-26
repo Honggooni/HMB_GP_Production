@@ -20,6 +20,8 @@ RUNNER_PATH = ROOT / "resources/maya/HMB_Maya_Background_Preview.py"
 VIEWPORT_PROFILE_FIELD = "viewport_quality_profile"
 MOUTH_PATCH_POLICY_FIELD = "mouth_card_inner_patch_policy"
 FORCE_JOB_FIELD = "force_high_quality_viewport"
+ORIGINAL_LAMBERT_JOB_FIELD = "apply_original_lambert_override"
+ORIGINAL_MATERIAL_PROFILE_FIELD = "original_material_override_profile"
 
 
 def load_module(name: str, path: Path):
@@ -106,10 +108,14 @@ assert read_job.get("generate_original_video") is False
 assert FORCE_JOB_FIELD not in read_job
 assert original_job["operation"] == "render"
 assert original_job.get("apply_marker_shaders") is False
+assert original_job.get(ORIGINAL_LAMBERT_JOB_FIELD) is True
+assert original_job.get(ORIGINAL_MATERIAL_PROFILE_FIELD) is not None
 assert original_job.get(FORCE_JOB_FIELD) is True
 assert original_job.get("require_full_smooth_geometry") is True
 assert original_job.get(MOUTH_PATCH_POLICY_FIELD) is not None
 assert color_job.get("apply_marker_shaders") is True
+assert ORIGINAL_LAMBERT_JOB_FIELD not in color_job
+assert ORIGINAL_MATERIAL_PROFILE_FIELD not in color_job
 assert color_job.get(FORCE_JOB_FIELD) is True
 assert color_job.get("require_full_smooth_geometry") is True
 assert color_job.get("world_space_patterns") is True
@@ -231,6 +237,9 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
     assert cache_fields[MOUTH_PATCH_POLICY_FIELD] == (
         picker.MOUTH_CARD_INNER_PATCH_POLICY
     )
+    assert cache_fields[ORIGINAL_MATERIAL_PROFILE_FIELD] == (
+        picker.ORIGINAL_MATERIAL_OVERRIDE_PROFILE
+    )
 
     video_path, sidecar_path = picker._original_preview_paths(scene_path)
     video_path.parent.mkdir(parents=True, exist_ok=True)
@@ -245,6 +254,24 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
     current_sidecar = {
         "schema": "hmb-original-playblast",
         **copy.deepcopy(cache_fields),
+        "assignment_mode": picker.ORIGINAL_LAMBERT_ASSIGNMENT_MODE,
+        "original_material_override_report": {
+            "profile": picker.ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
+            "requested": True,
+            "status": "restored",
+            "restore_ok": True,
+            "shading_group_membership_preserved": True,
+            "one_lambert_per_source_material": True,
+            "default_lighting_verified": True,
+            "textured_render_mode_verified": True,
+            "inspected_shading_engine_count": 1,
+            "source_material_count": 1,
+            "temporary_lambert_count": 1,
+            "existing_lambert_count": 0,
+            "texture_connection_count": 1,
+            "numeric_color_count": 0,
+            "swapped_shading_engine_count": 1,
+        },
         "accepted_read_dependency_fingerprint": cache_fields[
             "scene_dependency_fingerprint"
         ],
@@ -267,6 +294,24 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
     current_sidecar = {
         "schema": "hmb-original-playblast",
         **copy.deepcopy(cache_fields),
+        "assignment_mode": picker.ORIGINAL_LAMBERT_ASSIGNMENT_MODE,
+        "original_material_override_report": {
+            "profile": picker.ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
+            "requested": True,
+            "status": "restored",
+            "restore_ok": True,
+            "shading_group_membership_preserved": True,
+            "one_lambert_per_source_material": True,
+            "default_lighting_verified": True,
+            "textured_render_mode_verified": True,
+            "inspected_shading_engine_count": 1,
+            "source_material_count": 1,
+            "temporary_lambert_count": 1,
+            "existing_lambert_count": 0,
+            "texture_connection_count": 1,
+            "numeric_color_count": 0,
+            "swapped_shading_engine_count": 1,
+        },
         "accepted_read_dependency_fingerprint": cache_fields[
             "scene_dependency_fingerprint"
         ],
@@ -278,6 +323,20 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
     legacy_sidecar.pop(VIEWPORT_PROFILE_FIELD)
     sidecar_path.write_text(
         json.dumps(legacy_sidecar, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    assert not picker._original_preview_cache_is_valid(
+        scene_path, state, video_path, sidecar_path
+    )
+
+    missing_material_profile_sidecar = copy.deepcopy(current_sidecar)
+    missing_material_profile_sidecar.pop(ORIGINAL_MATERIAL_PROFILE_FIELD)
+    sidecar_path.write_text(
+        json.dumps(
+            missing_material_profile_sidecar,
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
     assert not picker._original_preview_cache_is_valid(
@@ -488,6 +547,12 @@ maya_module.cmds = fake_cmds
 sys.modules["maya"] = maya_module
 sys.modules["maya.cmds"] = fake_cmds
 runner = load_module("HMB_Maya_Background_Preview_HQ_Regression", RUNNER_PATH)
+assert runner.ORIGINAL_MATERIAL_OVERRIDE_PROFILE == (
+    picker.ORIGINAL_MATERIAL_OVERRIDE_PROFILE
+)
+assert runner.ORIGINAL_LAMBERT_ASSIGNMENT_MODE == (
+    picker.ORIGINAL_LAMBERT_ASSIGNMENT_MODE
+)
 production_switch_proxy_reference = runner._switch_proxy_reference
 
 

@@ -574,16 +574,18 @@ try:
     )
     assert repeated == reordered
 
-    # Registered Look provenance remains source-owned, while the Prompt's
-    # effective Sub Type and independently authored Target survive refresh,
-    # upstream default changes, and dormant reselect.
+    # Registered Look provenance remains source-owned. Retired pre-v2 Sub Type
+    # text is released; refresh restores only the registered current Sub Type.
     look_state = prompt_library._apply_image_asset_payload(
         prompt_library._default_widget_state(),
         look_payload(),
         connected=True,
     )
+    assert look_state["images"][0]["image_sub_type"] == "Color Mood"
+    assert look_state["images"][0]["owner"] == ""
+    assert look_state["images"][0]["asset_default_target"] == ""
     look_state["images"][0]["image_sub_type"] = "Scale"
-    look_state["images"][0]["owner"] = "Jett_11"
+    look_state["images"][0]["owner"] = "Camera / Composition"
     prompt_library._normalize_image_binding_fields(look_state["images"][0])
     refreshed_look = prompt_library._apply_image_asset_payload(
         look_state,
@@ -592,10 +594,10 @@ try:
     )
     refreshed_look_row = refreshed_look["images"][0]
     assert refreshed_look_row["asset_image_sub_type_candidate"] == "Color Mood"
-    assert refreshed_look_row["image_sub_type"] == "Scale"
-    assert refreshed_look_row["source_type"] == "Scale / Composition Reference"
-    assert refreshed_look_row["scope"] == "Scale only"
-    assert refreshed_look_row["owner"] == "Jett_11"
+    assert refreshed_look_row["image_sub_type"] == "Color Mood"
+    assert refreshed_look_row["source_type"] == "Color / Look Reference"
+    assert refreshed_look_row["scope"] == "Color mood only"
+    assert refreshed_look_row["owner"] == ""
 
     changed_registered_look = prompt_library._apply_image_asset_payload(
         refreshed_look,
@@ -605,8 +607,8 @@ try:
     assert changed_registered_look["images"][0][
         "asset_image_sub_type_candidate"
     ] == "Render Look"
-    assert changed_registered_look["images"][0]["image_sub_type"] == "Scale"
-    assert changed_registered_look["images"][0]["owner"] == "Jett_11"
+    assert changed_registered_look["images"][0]["image_sub_type"] == "Render Look"
+    assert changed_registered_look["images"][0]["owner"] == ""
 
     dormant_look = prompt_library._apply_image_asset_payload(
         changed_registered_look,
@@ -628,15 +630,118 @@ try:
         for item in dormant_look["image_asset"]["dormant_asset_rows"]
         if item["asset_source_uid"] == "source:MasterLook"
     )
-    assert cached_look["image_sub_type"] == "Scale"
-    assert cached_look["owner"] == "Jett_11"
+    assert cached_look["image_sub_type"] == "Render Look"
+    assert cached_look["owner"] == ""
     restored_look = prompt_library._apply_image_asset_payload(
         dormant_look,
         look_payload("Render Look"),
         connected=True,
     )
-    assert restored_look["images"][0]["image_sub_type"] == "Scale"
-    assert restored_look["images"][0]["owner"] == "Jett_11"
+    assert restored_look["images"][0]["image_sub_type"] == "Render Look"
+    assert restored_look["images"][0]["owner"] == ""
+
+    # Lighting-bearing Look rows default to Global Look and expose Custom as a
+    # reserved shared-scope mode. The authored instruction must survive source
+    # refresh, deselection into the dormant cache, and exact-UID reconnect.
+    lighting_state = prompt_library._apply_image_asset_payload(
+        prompt_library._default_widget_state(),
+        look_payload("Lighting / Atmosphere"),
+        connected=True,
+    )
+    assert lighting_state["images"][0]["owner"] == "Global Look"
+    lighting_state["images"][0]["owner"] = "Custom"
+    lighting_state["images"][0]["look_custom_instruction"] = (
+        "Use dawn lighting globally, with a readable foreground."
+    )
+    prompt_library._normalize_image_binding_fields(lighting_state["images"][0])
+    refreshed_lighting = prompt_library._apply_image_asset_payload(
+        lighting_state,
+        look_payload("Lighting / Atmosphere"),
+        connected=True,
+    )
+    assert refreshed_lighting["images"][0]["owner"] == "Custom"
+    assert refreshed_lighting["images"][0]["look_custom_instruction"] == (
+        "Use dawn lighting globally, with a readable foreground."
+    )
+    dormant_lighting = prompt_library._apply_image_asset_payload(
+        refreshed_lighting,
+        {
+            "schema": "hmb-image-asset-library-binding",
+            "version": 2,
+            "mode": "image_asset",
+            "project_id": "sw12",
+            "project_uid": "sw12:test",
+            "project_root": "C:/Project/sw12",
+            "selection_id": "look-lighting-empty",
+            "selected_assets": [],
+            "ordered_images": [],
+        },
+        connected=True,
+    )
+    cached_lighting = next(
+        item
+        for item in dormant_lighting["image_asset"]["dormant_asset_rows"]
+        if item["asset_source_uid"] == "source:MasterLook"
+    )
+    assert cached_lighting["owner"] == "Custom"
+    assert cached_lighting["look_custom_instruction"] == (
+        "Use dawn lighting globally, with a readable foreground."
+    )
+    restored_lighting = prompt_library._apply_image_asset_payload(
+        dormant_lighting,
+        look_payload("Lighting / Atmosphere"),
+        connected=True,
+    )
+    assert restored_lighting["images"][0]["owner"] == "Custom"
+    assert restored_lighting["images"][0]["look_custom_instruction"] == (
+        "Use dawn lighting globally, with a readable foreground."
+    )
+
+    # Returning from Scale to a general Look releases the generated scale-only
+    # all target. The blank survives source refresh, dormant cache, and restore;
+    # a verified Look never acquires scene-wide Global Look implicitly.
+    returned_general = deepcopy(restored_look)
+    returned_general["images"][0]["image_sub_type"] = "Color Mood"
+    prompt_library._normalize_image_binding_fields(returned_general["images"][0])
+    assert returned_general["images"][0]["owner"] == ""
+    assert returned_general["images"][0]["asset_default_target"] == ""
+    refreshed_general = prompt_library._apply_image_asset_payload(
+        returned_general,
+        look_payload("Render Look"),
+        connected=True,
+    )
+    assert refreshed_general["images"][0]["image_sub_type"] == "Color Mood"
+    assert refreshed_general["images"][0]["owner"] == ""
+    assert refreshed_general["images"][0]["asset_default_target"] == ""
+    dormant_general = prompt_library._apply_image_asset_payload(
+        refreshed_general,
+        {
+            "schema": "hmb-image-asset-library-binding",
+            "version": 2,
+            "mode": "image_asset",
+            "project_id": "sw12",
+            "project_uid": "sw12:test",
+            "project_root": "C:/Project/sw12",
+            "selection_id": "look-general-empty",
+            "selected_assets": [],
+            "ordered_images": [],
+        },
+        connected=True,
+    )
+    cached_general = next(
+        item
+        for item in dormant_general["image_asset"]["dormant_asset_rows"]
+        if item["asset_source_uid"] == "source:MasterLook"
+    )
+    assert cached_general["image_sub_type"] == "Color Mood"
+    assert cached_general["owner"] == ""
+    restored_general = prompt_library._apply_image_asset_payload(
+        dormant_general,
+        look_payload("Render Look"),
+        connected=True,
+    )
+    assert restored_general["images"][0]["image_sub_type"] == "Color Mood"
+    assert restored_general["images"][0]["owner"] == ""
 
     # Look is the only verified Main Type whose Target is always Prompt-owned.
     # Other verified defaults still follow an upstream rename until the user

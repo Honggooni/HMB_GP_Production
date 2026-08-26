@@ -17,8 +17,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.7.01"
-RELEASE_VERSION = "0.7.1"
+RELEASE_LABEL = "v0.7.05"
+RELEASE_VERSION = "0.7.5"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -39,15 +39,9 @@ STRICT_SEMVER_PATTERN = re.compile(
     r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
 )
 
-SOURCE_FILES = (
+RUNTIME_INSTALL_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
-    "pyproject.toml",
-    "README.md",
-    "SECURITY.md",
-    "LICENSE",
-    "THIRD_PARTY_NOTICES.md",
-    "SBOM.spdx.json",
     "HMBAgentLibrary.py",
     "HMBImageAssetLibrary.py",
     "HMBPromptLibrary.py",
@@ -56,7 +50,6 @@ SOURCE_FILES = (
     "_hmb_agent_session.py",
     "_hmb_shot_routing.py",
     "_hmb_mp4_verify.py",
-    "Install_HMB_GP_Production.ps1",
     "_hmb_common.py",
     "_hmb_screen_space.py",
     "widgets/HMBAgentLibraryWidget.js",
@@ -66,10 +59,20 @@ SOURCE_FILES = (
     "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
     "widgets/HMBVideoPickerLibraryWidget_v032.js",
     "resources/maya/HMB_Maya_Background_Preview.py",
-    "resources/maya/HMBVideoPicker_Maya_Guide.txt",
     "resources/picker/HMB_Marker_Catalog.json",
     "resources/tls/hmb_agent_broker_ca.pem",
 )
+DISTRIBUTION_ONLY_FILES = (
+    "Install_HMB_GP_Production.ps1",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "SBOM.spdx.json",
+)
+SOURCE_FILES = (*RUNTIME_INSTALL_FILES, *DISTRIBUTION_ONLY_FILES)
+if len(RUNTIME_INSTALL_FILES) != 21 or len(DISTRIBUTION_ONLY_FILES) != 4:
+    raise RuntimeError("Runtime/distribution release boundary count mismatch.")
+if set(RUNTIME_INSTALL_FILES) & set(DISTRIBUTION_ONLY_FILES):
+    raise RuntimeError("Runtime and distribution-only release files overlap.")
 EXPECTED_SECRET_NAMES = {
     "GT_CLOUD_API_KEY",
     "GT_CLOUD_BUCKET_ID",
@@ -294,7 +297,7 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
     }
     if "" in declared_widget_paths or not declared_widget_paths:
         raise RuntimeError("Library widget declarations are missing or invalid.")
-    omitted_widgets = declared_widget_paths - set(SOURCE_FILES)
+    omitted_widgets = declared_widget_paths - set(RUNTIME_INSTALL_FILES)
     if omitted_widgets:
         raise RuntimeError(
             "Runtime release omits declared widgets: "
@@ -328,6 +331,7 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
             {
                 "bytes": len(data),
                 "data": data,
+                "install": relative in RUNTIME_INSTALL_FILES,
                 "path": relative,
                 "sha256": digest(data),
             }
@@ -339,11 +343,12 @@ def make_release_records(
     release_version: str,
     source_records: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Append a deterministic install-closure manifest and checksum inventory."""
+    """Append a deterministic release manifest and checksum inventory."""
 
     source_inventory = [
         {
             "bytes": int(record["bytes"]),
+            "install": record["install"],
             "path": str(record["path"]),
             "sha256": str(record["sha256"]),
         }
@@ -351,8 +356,10 @@ def make_release_records(
     ]
     manifest = {
         "bundle_id": f"hmb-gp-production/{release_version}",
+        "distribution_file_count": len(DISTRIBUTION_ONLY_FILES),
         "file_count": len(source_inventory),
         "files": source_inventory,
+        "install_file_count": len(RUNTIME_INSTALL_FILES),
         "library": "HMB_GP_Production",
         "release_label": RELEASE_LABEL,
         "release_version": release_version,
@@ -395,13 +402,20 @@ def validate_release_inventory(
     manifest = json.loads(by_path[RELEASE_MANIFEST_PATH]["data"].decode("utf-8"))
     source_paths = [str(path) for path in SOURCE_FILES]
     manifest_paths = [str(item.get("path") or "") for item in manifest.get("files", [])]
+    manifest_install_flags = [item.get("install") for item in manifest.get("files", [])]
+    expected_install_flags = [path in RUNTIME_INSTALL_FILES for path in SOURCE_FILES]
     if (
         manifest.get("schema") != "hmb-release-closure"
         or manifest.get("version") != 1
         or manifest.get("release_label") != RELEASE_LABEL
         or manifest.get("release_version") != release_version
         or manifest.get("shot_routing_protocol") != SHOT_ROUTING_PROTOCOL_VERSION
+        or manifest.get("file_count") != len(SOURCE_FILES)
+        or manifest.get("install_file_count") != len(RUNTIME_INSTALL_FILES)
+        or manifest.get("distribution_file_count") != len(DISTRIBUTION_ONLY_FILES)
         or manifest_paths != source_paths
+        or manifest_install_flags != expected_install_flags
+        or any(type(flag) is not bool for flag in manifest_install_flags)
     ):
         raise RuntimeError("Runtime release closure manifest is inconsistent.")
     for item in manifest["files"]:
@@ -409,6 +423,7 @@ def validate_release_inventory(
         if (
             not record
             or int(item.get("bytes", -1)) != int(record["bytes"])
+            or item.get("install") is not record.get("install")
             or str(item.get("sha256") or "") != str(record["sha256"])
         ):
             raise RuntimeError(f'Runtime release manifest mismatch: {item["path"]}')
@@ -588,13 +603,16 @@ def build(output_path: Path = ARCHIVE_PATH) -> dict[str, Any]:
         "archive": str(output),
         "archive_built_at_local": format_zip_date_time(archive_date_time),
         "archive_sha256": digest(first),
+        "distribution_file_count": len(DISTRIBUTION_ONLY_FILES),
         "file_count": len(records),
+        "install_file_count": len(RUNTIME_INSTALL_FILES),
         "policy_contract_sha256": POLICY_CONTRACT_SHA256,
         "policy_delivery": POLICY_DELIVERY,
         "policy_version": POLICY_VERSION,
         "release_label": RELEASE_LABEL,
         "release_version": release_version,
         "shot_routing_protocol": SHOT_ROUTING_PROTOCOL_VERSION,
+        "source_file_count": len(SOURCE_FILES),
     }
 
 
@@ -612,12 +630,15 @@ def check() -> dict[str, Any]:
     return {
         "file_count": len(records),
         "archive_built_at_local": format_zip_date_time(archive_date_time),
+        "distribution_file_count": len(DISTRIBUTION_ONLY_FILES),
+        "install_file_count": len(RUNTIME_INSTALL_FILES),
         "policy_contract_sha256": POLICY_CONTRACT_SHA256,
         "policy_delivery": POLICY_DELIVERY,
         "policy_version": POLICY_VERSION,
         "release_label": RELEASE_LABEL,
         "release_version": release_version,
         "shot_routing_protocol": SHOT_ROUTING_PROTOCOL_VERSION,
+        "source_file_count": len(SOURCE_FILES),
         "validated": True,
     }
 
@@ -642,10 +663,13 @@ def check_output(output_path: Path = ARCHIVE_PATH) -> dict[str, Any]:
         "archive": str(output),
         "archive_built_at_local": format_zip_date_time(archive_date_time),
         "archive_sha256": digest(actual),
+        "distribution_file_count": len(DISTRIBUTION_ONLY_FILES),
         "file_count": len(records),
+        "install_file_count": len(RUNTIME_INSTALL_FILES),
         "release_label": RELEASE_LABEL,
         "release_version": release_version,
         "shot_routing_protocol": SHOT_ROUTING_PROTOCOL_VERSION,
+        "source_file_count": len(SOURCE_FILES),
         "validated": True,
     }
 

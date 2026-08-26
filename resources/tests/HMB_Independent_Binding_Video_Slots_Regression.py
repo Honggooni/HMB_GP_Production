@@ -133,7 +133,6 @@ legacy_owner_state["images"] = [
             "Full body / full appearance",
             "Handheld prop",
         ],
-        "interaction_targets": ["Dog"],
     }
 ]
 legacy_owner_image = prompt._normalize_state(legacy_owner_state)["images"][0]

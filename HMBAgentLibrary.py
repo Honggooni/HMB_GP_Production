@@ -95,7 +95,7 @@ _FX_TIMING_CONTRACT_SCHEMA = "hmb-fx-timing-source-facts"
 _FX_TIMING_CONTRACT_VERSION = 3
 _PUBLIC_JOB_CONTRACT_HEADER = "HMB JOB DATA (JSON):"
 _PUBLIC_JOB_CONTRACT_SCHEMA = "hmb-public-job-data"
-_PUBLIC_JOB_CONTRACT_VERSION = 2
+_PUBLIC_JOB_CONTRACT_VERSION = 3
 _USER_DESCRIPTION_DATA_HEADER = "USER DESCRIPTION DATA (JSON):"
 _RUNTIME_FX_SCOPE_HEADER = "HMB VERIFIED FX/TIMING RUNTIME SCOPE (JSON):"
 _ENGLISH_GENERATOR_OUTPUT_CONTRACT_HEADER = (
@@ -109,6 +109,24 @@ _ENGLISH_GENERATOR_OUTPUT_CONTRACT = (
     "but describe their visual and motion instructions in English. Return "
     "only the generator-ready instruction, without commentary about this "
     "language requirement."
+)
+_FINAL_OUTPUT_SEMANTIC_MANIFEST_HEADER = (
+    "HMB FINAL OUTPUT SEMANTIC MANIFEST (JSON):"
+)
+_FINAL_OUTPUT_SEMANTIC_MANIFEST_SCHEMA = "hmb-final-output-semantic-manifest"
+_FINAL_OUTPUT_SEMANTIC_MANIFEST_VERSION = 1
+_FINAL_OUTPUT_SEMANTIC_CONTRACT = (
+    "Preserve every source token and its declared target/authority in the final "
+    "generator instruction. Image references supply only their declared image "
+    "authority. A Look Reference transfers only its declared look attributes "
+    "and must not replace Main Background content. Video references supply only "
+    "their declared motion, timing, camera, spatial, FX, or guide evidence and "
+    "must not supply character appearance, identity, skin, body, costume, or "
+    "photorealism. Translate and preserve every custom_instruction; at the end "
+    "of that source's translated lighting clause append its exact "
+    "custom_instruction_evidence_tag (the client removes this private tag before "
+    "publication). Return natural generator-ready prose; do not reproduce this "
+    "manifest or discuss validation."
 )
 _PAIRED_PROMPT_SNAPSHOT_SCHEMA = "hmb-prompt-paired-snapshot"
 _PAIRED_PROMPT_SNAPSHOT_VERSION = 1
@@ -157,7 +175,7 @@ _MAX_HMB_PROMPT_CHARS = (
     + _MAX_HMB_PROMPT_ENVELOPE_CHARS
 )
 _PUBLIC_IMAGE_SOURCE_TYPES = frozenset(
-    str(value) for value in getattr(_hmb, "IMAGE_SOURCE_TYPE_CHOICES", ())
+    str(value) for value in _hmb.IMAGE_SOURCE_TYPE_CHOICES
 )
 _PUBLIC_VIDEO_SOURCE_TYPES = frozenset({
     "Role Required / Select Video Type",
@@ -183,6 +201,7 @@ _PUBLIC_VIDEO_ROLES = frozenset({
     "Secondary Motion Only",
     "Spatial Alignment Verification Only",
     "Derived Motion Decoding Only",
+    "FX Effect Only",
     "FX Behavior Only",
     "Lighting / Look Only",
     "Local Composition Check Only",
@@ -224,6 +243,10 @@ _HMB_EXECUTION_FAILED_MESSAGE = (
 _HMB_ENGLISH_OUTPUT_REQUIRED_MESSAGE = (
     "[HMB ENGLISH OUTPUT REQUIRED] The Agent returned non-English generator "
     "instructions, so publication was stopped before the video generator."
+)
+_HMB_OUTPUT_SEMANTIC_INCOMPLETE_MESSAGE = (
+    "[HMB OUTPUT SEMANTIC INCOMPLETE] Required source, target, or authority "
+    "meaning was not preserved. No generator prompt was published."
 )
 _HMB_REQUIRED_MARKERS = (
     _PUBLIC_JOB_CONTRACT_HEADER,
@@ -1181,14 +1204,77 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
     ):
         raise RuntimeError("HMB public job collection is invalid.")
 
+    def image_target_address(entry: Dict[str, Any]) -> str:
+        return str(entry.get("target_id") or entry.get("label") or "").strip()
+
+    def image_target_address_key(entry: Dict[str, Any]) -> str:
+        return _hmb.image_target_key(image_target_address(entry))
+
+    renderable_target_rows = [
+        entry
+        for entry in images
+        if isinstance(entry, dict)
+        and str(entry.get("image_main_type") or "").strip()
+        in _hmb.IMAGE_GENERAL_LOOK_NAMED_TARGET_MAIN_TYPES
+    ]
+    renderable_target_addresses = {
+        image_target_address_key(entry)
+        for entry in renderable_target_rows
+        if image_target_address_key(entry)
+    }
+    reserved_renderable_targets = renderable_target_addresses.intersection(
+        _hmb.IMAGE_SYSTEM_TARGET_KEYS
+    )
+    if reserved_renderable_targets:
+        raise RuntimeError("HMB image target address collides with a reserved target.")
+
+    character_scale_targets = {
+        image_target_address_key(entry)
+        for entry in renderable_target_rows
+        if str(entry.get("image_main_type") or "").strip()
+        in {"Character", "Character Prop"}
+        and image_target_address_key(entry)
+    }
+    background_scale_targets = {
+        image_target_address_key(entry)
+        for entry in renderable_target_rows
+        if str(entry.get("image_main_type") or "").strip()
+        in {"Environment / Background", "Background Prop"}
+        and image_target_address_key(entry)
+    }
+    # The same normalized address may not identify both a character-domain and
+    # a background-domain object. Leave duplicate labels usable when no typed
+    # authority addresses them, but never accept that ambiguous address as a
+    # Look or relative-size recipient.
+    ambiguous_renderable_targets = character_scale_targets.intersection(
+        background_scale_targets
+    )
+    character_scale_targets.difference_update(ambiguous_renderable_targets)
+    background_scale_targets.difference_update(ambiguous_renderable_targets)
+    general_look_named_targets = set(renderable_target_addresses).difference(
+        ambiguous_renderable_targets
+    )
+
     seen_images: set[str] = set()
     image_binding_video_tokens: List[str] = []
+    general_look_claims: List[tuple[str, frozenset[str], str]] = []
+    scale_claims: List[
+        tuple[str, frozenset[str], frozenset[str]]
+    ] = []
     for image in images:
-        if not isinstance(image, dict) or set(image) != {
+        required_image_fields = {
             "image", "label", "image_main_type", "image_sub_type",
             "source_type", "source_scope", "custom_source_type", "target_id",
             "relationship_targets", "bindings", "identity",
-        }:
+        }
+        look_scope_fields = {"target_scope_mode", "custom_look_instruction"}
+        if (
+            not isinstance(image, dict)
+            or not required_image_fields.issubset(image)
+            or not set(image).issubset(required_image_fields | look_scope_fields)
+            or bool(look_scope_fields.intersection(image))
+            != look_scope_fields.issubset(image)
+        ):
             raise RuntimeError("HMB image source record is invalid.")
         token = image.get("image")
         strings = (
@@ -1201,18 +1287,26 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
         image_sub_type = str(image.get("image_sub_type") or "").strip()
         source_type = str(image.get("source_type") or "").strip()
         source_scope = str(image.get("source_scope") or "").strip()
+        target_scope_mode = str(image.get("target_scope_mode") or "").strip()
+        custom_look_instruction = str(
+            image.get("custom_look_instruction") or ""
+        ).strip()
+        shared_lighting_sub_type = bool(
+            image_main_type == "Look Reference"
+            and image_sub_type
+            in {"Lighting / Atmosphere", "Color / Look / Lighting"}
+        )
+        look_scope_shape_valid = (
+            look_scope_fields.issubset(image)
+            if shared_lighting_sub_type
+            else not look_scope_fields.intersection(image)
+        )
         taxonomy_wire_pair = _hmb.image_taxonomy_wire_pair(
             image_main_type, image_sub_type
         )
-        unclassified_main_type = str(
-            getattr(_hmb, "IMAGE_MAIN_TYPE_UNCLASSIFIED", "Select Image Main Type")
-        )
+        unclassified_main_type = str(_hmb.IMAGE_MAIN_TYPE_UNCLASSIFIED)
         unclassified_source_type = str(
-            getattr(
-                _hmb,
-                "IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED",
-                "Role Required / Select Source Type",
-            )
+            _hmb.IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED
         )
         taxonomy_valid = (
             image_main_type == unclassified_main_type
@@ -1228,20 +1322,99 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
         taxonomy_authority_valid = True
         if image_main_type == "Look Reference":
             # Main/Sub Type limits transferable attributes; Target independently
-            # selects their recipient. A named character, prop, environment, or
-            # composition target is valid, while Look still never gains a
-            # color-marker/video relationship or content/identity authority.
+            # selects a named renderable recipient or the explicit Global Look
+            # scope. Look never gains camera/composition, color-marker/video,
+            # scene-content, or identity authority.
             taxonomy_authority_valid = (
                 isinstance(relationships, list)
                 and not relationships
                 and isinstance(bindings, list)
                 and not bindings
             )
+            target_id = str(image.get("target_id") or "").strip()
+            target_key = _hmb.image_target_key(target_id)
+            if image_sub_type == "ch_Scale":
+                taxonomy_authority_valid = (
+                    taxonomy_authority_valid
+                    and (
+                        target_key in character_scale_targets
+                        or target_id == "ch_all"
+                    )
+                )
+            elif image_sub_type == "bg_Scale":
+                taxonomy_authority_valid = (
+                    taxonomy_authority_valid
+                    and (
+                        target_key in background_scale_targets
+                        or target_id == "bg_all"
+                    )
+                )
+            elif image_sub_type == "ch_Scale / bg_Scale":
+                taxonomy_authority_valid = (
+                    taxonomy_authority_valid
+                    and (
+                        target_key
+                        in (character_scale_targets | background_scale_targets)
+                        or target_id == "ch_all / bg_all"
+                    )
+                )
+            elif image_sub_type in _hmb.IMAGE_GENERAL_LOOK_REFERENCE_SUB_TYPES:
+                # General Look attributes may address only an actual renderable
+                # image target, or explicitly selected Global Look. Camera /
+                # Composition, scale-wide tokens, Ignore's ``None`` token, Look
+                # sheets, Custom/Context rows, and unresolved names are not
+                # valid recipients.
+                shared_lighting_scope = (
+                    shared_lighting_sub_type
+                    and look_scope_fields.issubset(image)
+                )
+                if shared_lighting_scope:
+                    # Lighting-bearing references deliberately expose no named
+                    # Target dropdown. ``Custom`` carries its target/local or
+                    # scene-wide scope inside the authored instruction and
+                    # never grants scene-content authority.
+                    taxonomy_authority_valid = (
+                        taxonomy_authority_valid
+                        and target_scope_mode in {"global", "custom"}
+                        and target_id
+                        == (
+                            "Global Look"
+                            if target_scope_mode == "global"
+                            else "Custom"
+                        )
+                        and bool(custom_look_instruction)
+                        == (target_scope_mode == "custom")
+                        and len(custom_look_instruction) <= 6_000
+                    )
+                elif look_scope_fields.issubset(image):
+                    taxonomy_authority_valid = (
+                        taxonomy_authority_valid
+                        and not target_scope_mode
+                        and not custom_look_instruction
+                    )
+                else:
+                    taxonomy_authority_valid = (
+                        taxonomy_authority_valid
+                        and (
+                            not target_id
+                            or target_id
+                            in _hmb.IMAGE_GENERAL_LOOK_ALLOWED_SYSTEM_TARGETS
+                            or target_key in general_look_named_targets
+                        )
+                    )
         if (
             not isinstance(token, str)
             or not re.fullmatch(r"@image(?:[1-9]|[1-4][0-9]|50)", token)
             or token in seen_images
             or any(not isinstance(value, str) for value in strings)
+            or not look_scope_shape_valid
+            or (
+                look_scope_fields.issubset(image)
+                and (
+                    not isinstance(image.get("target_scope_mode"), str)
+                    or not isinstance(image.get("custom_look_instruction"), str)
+                )
+            )
             or image.get("source_type") not in _PUBLIC_IMAGE_SOURCE_TYPES
             or not taxonomy_valid
             or not taxonomy_authority_valid
@@ -1261,6 +1434,74 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
         ):
             raise RuntimeError("HMB image source fields are invalid.")
         seen_images.add(token)
+        if (
+            image_main_type == "Look Reference"
+            and image_sub_type in _hmb.IMAGE_GENERAL_LOOK_REFERENCE_SUB_TYPES
+            and str(image.get("target_id") or "").strip()
+        ):
+            look_domains = {
+                "Color Mood": frozenset({"color"}),
+                "Lighting / Atmosphere": frozenset({"lighting"}),
+                "Render Look": frozenset({"render"}),
+                "Color / Look / Lighting": frozenset(
+                    {"color", "lighting", "render"}
+                ),
+            }[image_sub_type]
+            if target_scope_mode == "custom":
+                normalized_custom_scope = " ".join(
+                    custom_look_instruction.split()
+                ).casefold()
+                claim_target = "custom:" + hashlib.sha256(
+                    normalized_custom_scope.encode("utf-8")
+                ).hexdigest()
+                claim_mode = "custom"
+            elif (
+                target_scope_mode == "global"
+                or _hmb.image_target_key(image.get("target_id"))
+                == _hmb.image_target_key("Global Look")
+            ):
+                claim_target = _hmb.image_target_key("Global Look")
+                claim_mode = "global"
+            else:
+                claim_target = _hmb.image_target_key(image.get("target_id"))
+                claim_mode = "named"
+            general_look_claims.append(
+                (claim_target, look_domains, claim_mode)
+            )
+        if (
+            image_main_type == "Look Reference"
+            and image_sub_type in _hmb.IMAGE_SCALE_REFERENCE_SUB_TYPES
+            and str(image.get("target_id") or "").strip()
+        ):
+            scale_target = _hmb.image_target_key(image.get("target_id"))
+            character_all = _hmb.image_target_key("ch_all")
+            background_all = _hmb.image_target_key("bg_all")
+            combined_all = _hmb.image_target_key("ch_all / bg_all")
+            if scale_target == character_all:
+                scale_domains = frozenset({"character"})
+                scale_wide_domains = scale_domains
+            elif scale_target == background_all:
+                scale_domains = frozenset({"background"})
+                scale_wide_domains = scale_domains
+            elif scale_target == combined_all:
+                scale_domains = frozenset({"character", "background"})
+                scale_wide_domains = scale_domains
+            elif scale_target in character_scale_targets:
+                scale_domains = frozenset({"character"})
+                scale_wide_domains = frozenset()
+            elif scale_target in background_scale_targets:
+                scale_domains = frozenset({"background"})
+                scale_wide_domains = frozenset()
+            else:
+                # Taxonomy validation above will reject this address. Keeping
+                # it out of the overlap set avoids inventing a domain for an
+                # already-invalid record.
+                scale_domains = frozenset()
+                scale_wide_domains = frozenset()
+            if scale_domains:
+                scale_claims.append(
+                    (scale_target, scale_domains, scale_wide_domains)
+                )
         for binding in bindings:
             if (
                 not isinstance(binding, dict)
@@ -1274,7 +1515,55 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
                 raise RuntimeError("HMB image binding address is invalid.")
             image_binding_video_tokens.append(str(binding.get("video") or ""))
 
+    for index, (
+        left_target,
+        left_domains,
+        left_mode,
+    ) in enumerate(general_look_claims):
+        for (
+            right_target,
+            right_domains,
+            right_mode,
+        ) in general_look_claims[index + 1:]:
+            scopes_overlap = (
+                left_target == right_target
+                or (
+                    left_mode == "global"
+                    and right_mode != "custom"
+                )
+                or (
+                    right_mode == "global"
+                    and left_mode != "custom"
+                )
+            )
+            if scopes_overlap and left_domains.intersection(right_domains):
+                raise RuntimeError("HMB Look target attribute authority is ambiguous.")
+
+    # A relative-size sheet is measurement authority. Two sheets may describe
+    # disjoint targets/domains, but the same named target or a domain-wide
+    # target plus any member of that domain would supply competing ratios.
+    for index, (
+        left_target,
+        left_domains,
+        left_wide_domains,
+    ) in enumerate(scale_claims):
+        for (
+            right_target,
+            right_domains,
+            right_wide_domains,
+        ) in scale_claims[index + 1:]:
+            targets_overlap = (
+                left_target == right_target
+                or bool(left_wide_domains.intersection(right_domains))
+                or bool(right_wide_domains.intersection(left_domains))
+            )
+            if targets_overlap:
+                raise RuntimeError(
+                    "HMB Relative Size target authority is ambiguous."
+                )
+
     seen_videos: set[str] = set()
+    primary_unified_videos: List[str] = []
     for video in videos:
         required = {
             "video", "label", "source_type", "custom_source_type", "control_role",
@@ -1325,6 +1614,15 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
         ):
             raise RuntimeError("HMB video source fields are invalid.")
         seen_videos.add(token)
+        if video.get("control_role") == "Primary Unified Shot Control":
+            primary_unified_videos.append(str(token))
+
+    if len(primary_unified_videos) > 1:
+        raise RuntimeError(
+            "HMB Shot has multiple Primary Unified Shot Control videos. "
+            "Keep one Original Preview primary and classify the remaining "
+            "videos as Mask, Depth, Motion Guide, or another auxiliary role."
+        )
 
     if any(token not in seen_videos for token in image_binding_video_tokens):
         raise RuntimeError("HMB image binding addresses an inactive video source.")
@@ -1505,6 +1803,390 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
         if not isinstance(value, str) or len(value) > max_chars:
             raise RuntimeError("HMB user description value is invalid.")
     return job
+
+
+def _build_final_output_semantic_manifest(job: Any) -> Dict[str, Any]:
+    """Build a small, policy-free checklist from the validated public job.
+
+    This manifest does not copy server policy prose and is never published. It
+    records only addresses and user-selected authority facts that must survive
+    the Agent's natural-language rewrite before a compatible downstream
+    generator can consume it.
+    """
+
+    if not isinstance(job, dict):
+        return {}
+    images = job.get("images")
+    videos = job.get("videos")
+    if not isinstance(images, list) or not isinstance(videos, list):
+        return {}
+    image_rows: list[Dict[str, Any]] = []
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        token = str(image.get("image") or "").strip()
+        if not token:
+            continue
+        main_type = str(image.get("image_main_type") or "").strip()
+        sub_type = str(image.get("image_sub_type") or "").strip()
+        scope_mode = str(image.get("target_scope_mode") or "").strip()
+        custom_instruction = str(
+            image.get("custom_look_instruction") or ""
+        ).strip()
+        custom_digest = (
+            _prompt_text_sha256(custom_instruction) if custom_instruction else ""
+        )
+        image_rows.append({
+            "token": token,
+            "main_type": main_type,
+            "sub_type": sub_type,
+            "target": str(image.get("target_id") or "").strip(),
+            "scope_mode": scope_mode,
+            "custom_instruction": custom_instruction,
+            "custom_instruction_sha256": custom_digest,
+            "custom_instruction_evidence_tag": (
+                f"[HMB-CUSTOM-LOOK:{custom_digest[:16]}]"
+                if custom_digest
+                else ""
+            ),
+        })
+    video_rows: list[Dict[str, str]] = []
+    for video in videos:
+        if not isinstance(video, dict):
+            continue
+        token = str(video.get("video") or "").strip()
+        if not token:
+            continue
+        video_rows.append({
+            "token": token,
+            "source_type": str(video.get("source_type") or "").strip(),
+            "control_role": str(video.get("control_role") or "").strip(),
+        })
+    main_background_tokens = [
+        row["token"]
+        for row in image_rows
+        if row["main_type"] == "Environment / Background"
+        and row["sub_type"] == "Main Background"
+    ]
+    look_tokens = [
+        row["token"]
+        for row in image_rows
+        if row["main_type"] == "Look Reference"
+    ]
+    return {
+        "schema": _FINAL_OUTPUT_SEMANTIC_MANIFEST_SCHEMA,
+        "version": _FINAL_OUTPUT_SEMANTIC_MANIFEST_VERSION,
+        "images": image_rows,
+        "videos": video_rows,
+        "main_background_tokens": main_background_tokens,
+        "look_tokens": look_tokens,
+        "require_background_look_non_substitution": bool(
+            main_background_tokens and look_tokens
+        ),
+        "require_video_appearance_isolation": bool(video_rows),
+    }
+
+
+def _semantic_text_window(text: str, token: str, radius: int = 900) -> str:
+    paragraphs = re.split(r"\n\s*\n", str(text or ""))
+    matching_paragraphs = [
+        paragraph.casefold()
+        for paragraph in paragraphs
+        if token.casefold() in paragraph.casefold()
+    ]
+    if matching_paragraphs:
+        return "\n\n".join(matching_paragraphs)
+    folded = text.casefold()
+    marker = token.casefold()
+    index = folded.find(marker)
+    if index < 0:
+        return ""
+    return folded[max(0, index - radius): min(len(folded), index + len(marker) + radius)]
+
+
+def _semantic_term_group_present(text: str, terms: tuple[str, ...]) -> bool:
+    return any(term in text for term in terms)
+
+
+def _semantic_custom_instruction_preserved(
+    window: str,
+    instruction: str,
+    evidence_tag: str,
+) -> bool:
+    normalized_instruction = " ".join(instruction.split()).casefold()
+    if not normalized_instruction or not evidence_tag:
+        return False
+    if evidence_tag.casefold() not in window:
+        return False
+    if normalized_instruction in " ".join(window.split()):
+        return True
+    # English custom directions may be naturally rephrased. Require a majority
+    # of their meaningful lexical anchors in addition to the exact evidence tag.
+    # Non-Latin instructions are translated by the Agent; their exact digest tag
+    # plus the independently checked declared Look authority is the only
+    # deterministic client-side proof available without a second AI call.
+    words = re.findall(r"[a-z0-9][a-z0-9_-]{2,}", normalized_instruction)
+    stop_words = {
+        "the", "and", "for", "with", "from", "into", "this", "that", "then",
+        "use", "using", "apply", "make", "keep", "should", "must", "scene",
+    }
+    anchors = list(dict.fromkeys(word for word in words if word not in stop_words))
+    if not anchors:
+        return True
+    required = max(1, min(3, (len(anchors) + 1) // 2))
+    return sum(anchor in window for anchor in anchors) >= required
+
+
+def _strip_semantic_evidence_tags(value: str) -> str:
+    """Remove private custom-scope acknowledgements before publication."""
+
+    return re.sub(
+        r"[ \t]*\[HMB-CUSTOM-LOOK:[0-9a-f]{16}\]",
+        "",
+        str(value or ""),
+        flags=re.IGNORECASE,
+    )
+
+
+def _semantic_token_present(text: str, token: str) -> bool:
+    return bool(
+        token
+        and re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _semantic_literal_present(text: str, value: str) -> bool:
+    normalized = " ".join(str(value or "").split()).casefold()
+    if not normalized:
+        return True
+    return normalized in " ".join(text.split()).casefold()
+
+
+def _has_global_video_appearance_isolation(text: str) -> bool:
+    """Accept one explicit shot-wide video appearance exclusion clause.
+
+    Agent prose does not need to repeat the same exclusion in every ``@videoN``
+    paragraph.  The clause must nevertheless quantify all video references and
+    explicitly deny appearance authority (or reserve appearance for images).
+    """
+
+    patterns = (
+        r"(?:all|every|any)\s+(?:of\s+the\s+)?(?:@video(?:\d+)?|video)s?\s+references?"
+        r".{0,320}\b(?:no|not|never|must\s+not|do\s+not)\b.{0,160}"
+        r"\b(?:appearance|identity|skin|body|costume|clothing|photoreal)\b",
+        r"(?:all|every|any)\s+(?:of\s+the\s+)?(?:@video(?:\d+)?|video)s?\s+references?"
+        r".{0,320}\b(?:appearance|identity|skin|body|costume|clothing|photoreal)\b"
+        r".{0,160}\b(?:only|solely|exclusively)\b.{0,80}\b(?:@image|image)\b",
+        r"\b(?:appearance|identity|skin|body|costume|clothing|photoreal)\b"
+        r".{0,220}\b(?:only|solely|exclusively)\b.{0,80}\b(?:@image|image)\b"
+        r".{0,320}\b(?:all|every|any)\s+(?:of\s+the\s+)?"
+        r"(?:@video(?:\d+)?|video)s?\s+references?",
+    )
+    return any(re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL) for pattern in patterns)
+
+
+def _assert_final_output_semantic_integrity(
+    final_text: Any,
+    manifest: Any,
+) -> None:
+    """Fail closed when the Agent drops source addresses or core authorities.
+
+    The check intentionally uses broad semantic families instead of matching
+    server-policy sentences. It catches silent omission while allowing natural
+    English wording, heading order, and provider-model phrasing to evolve.
+    """
+
+    text = str(getattr(final_text, "value", final_text) or "").strip()
+    if not text:
+        raise RuntimeError("final_text_empty")
+    if not isinstance(manifest, dict) or not manifest:
+        return
+    if (
+        manifest.get("schema") != _FINAL_OUTPUT_SEMANTIC_MANIFEST_SCHEMA
+        or manifest.get("version") != _FINAL_OUTPUT_SEMANTIC_MANIFEST_VERSION
+        or not isinstance(manifest.get("images"), list)
+        or not isinstance(manifest.get("videos"), list)
+    ):
+        raise RuntimeError("semantic_manifest_invalid")
+
+    failures: list[str] = []
+    folded = text.casefold()
+    for image in manifest["images"]:
+        if not isinstance(image, dict):
+            failures.append("image_manifest_invalid")
+            continue
+        token = str(image.get("token") or "")
+        if not _semantic_token_present(text, token):
+            failures.append(f"missing:{token}")
+            continue
+        target = str(image.get("target") or "").strip()
+        scope_mode = str(image.get("scope_mode") or "").strip()
+        if target and target != "Custom" and not _semantic_literal_present(text, target):
+            failures.append(f"target:{token}")
+        window = _semantic_text_window(text, token)
+        main_type = str(image.get("main_type") or "")
+        subtype = str(image.get("sub_type") or "")
+        if main_type != "Look Reference":
+            image_terms = {
+                "Character": (
+                    "appearance", "identity", "design", "proportion", "silhouette",
+                    "material", "stylization", "colour", "color", "pattern",
+                ),
+                "Character Prop": (
+                    "prop", "accessory", "appearance", "identity", "design", "material",
+                ),
+                "Environment / Background": (
+                    "background", "environment", "scene", "location", "terrain",
+                    "ground", "sky", "layout",
+                ),
+                "Background Prop": (
+                    "prop", "object", "set", "structure", "scene", "environment",
+                ),
+                "Custom / Context": ("context", "custom", "reference", "evidence"),
+            }.get(main_type, ("image", "reference", "source"))
+            if not _semantic_term_group_present(window, image_terms):
+                failures.append(f"image_authority:{token}")
+            continue
+
+        if subtype in {"ch_Scale", "bg_Scale", "ch_Scale / bg_Scale"}:
+            look_groups = (("scale", "size", "ratio", "proportion", "relative"),)
+        elif subtype == "Color Mood":
+            look_groups = (("color", "colour", "palette", "grade", "mood"),)
+        elif subtype == "Lighting / Atmosphere":
+            look_groups = ((
+                "light", "illumination", "atmosphere", "exposure", "white balance",
+            ),)
+        elif subtype == "Render Look":
+            look_groups = (("render", "shading", "style", "surface", "finish"),)
+        elif subtype == "Color / Look / Lighting":
+            look_groups = (
+                ("color", "colour", "palette", "grade"),
+                ("light", "illumination", "atmosphere", "exposure", "white balance"),
+                ("render", "shading", "style", "surface", "finish"),
+            )
+        else:
+            look_groups = (("look", "reference", "context"),)
+        if any(
+            not _semantic_term_group_present(window, group)
+            for group in look_groups
+        ):
+            failures.append(f"look_authority:{token}")
+        if scope_mode == "global" and not any(
+            term in window
+            for term in (
+                "global", "scene-wide", "scene wide", "shared scene",
+                "all visible", "environment and", "same scene lighting",
+            )
+        ):
+            failures.append(f"shared_lighting_scope:{token}")
+        if scope_mode == "custom":
+            instruction = str(image.get("custom_instruction") or "").strip()
+            digest = str(image.get("custom_instruction_sha256") or "").strip()
+            evidence_tag = str(
+                image.get("custom_instruction_evidence_tag") or ""
+            ).strip()
+            if (
+                not instruction
+                or not hmac.compare_digest(digest, _prompt_text_sha256(instruction))
+                or not _semantic_custom_instruction_preserved(
+                    window,
+                    instruction,
+                    evidence_tag,
+                )
+            ):
+                failures.append(f"custom_look_instruction:{token}")
+
+    global_video_appearance_isolation = (
+        bool(manifest.get("require_video_appearance_isolation"))
+        and _has_global_video_appearance_isolation(text)
+    )
+    for video in manifest["videos"]:
+        if not isinstance(video, dict):
+            failures.append("video_manifest_invalid")
+            continue
+        token = str(video.get("token") or "")
+        if not _semantic_token_present(text, token):
+            failures.append(f"missing:{token}")
+            continue
+        window = _semantic_text_window(text, token)
+        role = str(video.get("control_role") or "")
+        source_type = str(video.get("source_type") or "")
+        role_groups: tuple[tuple[str, ...], ...]
+        if role == "Primary Unified Shot Control":
+            role_groups = (
+                ("motion", "acting", "performance", "pose", "timing", "trajectory"),
+                ("camera", "framing", "layout", "composition"),
+            )
+        elif role in {"Local Motion Detail Only", "Secondary Motion Only"}:
+            role_groups = (("motion", "pose", "acting", "performance", "timing"),)
+        elif role == "Spatial Alignment Verification Only":
+            role_groups = (("depth", "spatial", "alignment", "position", "occlusion"),)
+        elif role == "Derived Motion Decoding Only":
+            role_groups = (("motion guide", "retarget", "derived motion", "pose", "joint"),)
+        elif role in {"FX Effect Only", "FX Behavior Only"}:
+            role_groups = (("fx", "effect", "particle", "emitter", "simulation"),)
+        elif role == "Timing Only":
+            role_groups = (("timing", "edit", "cut", "pacing", "rhythm"),)
+        elif role == "Lighting / Look Only":
+            role_groups = (("lighting", "light", "look", "exposure", "atmosphere"),)
+        elif role == "Local Composition Check Only":
+            role_groups = (("composition", "framing", "layout", "camera"),)
+        elif role == "Mask / Guide Only":
+            role_groups = (("mask", "guide", "occupancy", "occlusion", "silhouette", "separation"),)
+        elif role == "Context Only":
+            role_groups = (("context", "reference", "evidence"),)
+        elif source_type == "Depth / Spatial Reference":
+            role_groups = (("depth", "spatial", "alignment", "occlusion"),)
+        elif source_type == "Motion Guide / Retargeting Reference":
+            role_groups = (("motion guide", "retarget", "derived motion", "pose"),)
+        elif source_type == "FX Reference":
+            role_groups = (("fx", "effect", "particle", "simulation"),)
+        else:
+            role_groups = (("video", "reference", "source"),)
+        if any(
+            not _semantic_term_group_present(window, group)
+            for group in role_groups
+        ):
+            failures.append(f"video_authority:{token}")
+
+        if (
+            manifest.get("require_video_appearance_isolation")
+            and not global_video_appearance_isolation
+        ):
+            explicit_isolation_patterns = (
+                r"no\s+(?:character\s+)?appearance\s+authority",
+                r"(?:do not|must not|never)\b.{0,180}\b(?:appearance|identity|skin|body|costume|photoreal)",
+                r"(?:appearance|identity|skin|body|costume|photoreal)\b.{0,180}\b(?:only|solely)\s+from\s+@image",
+                r"(?:proxy|control)\s+(?:visualization|shading|colour|color)",
+            )
+            if not any(
+                re.search(pattern, window, flags=re.DOTALL)
+                for pattern in explicit_isolation_patterns
+            ):
+                failures.append(f"video_appearance_isolation:{token}")
+
+    if manifest.get("require_background_look_non_substitution"):
+        negative_terms = ("do not", "must not", "never", "without copying", "no ")
+        substitution_terms = (
+            "copy", "replicate", "transplant", "substitute", "replace", "import",
+        )
+        scene_content_terms = (
+            "background", "location", "terrain", "geometry", "object", "layout",
+            "composition", "vegetation", "scene content",
+        )
+        if not (
+            any(term in folded for term in negative_terms)
+            and any(term in folded for term in substitution_terms)
+            and any(term in folded for term in scene_content_terms)
+        ):
+            failures.append("background_look_non_substitution")
+
+    if failures:
+        raise RuntimeError(",".join(failures[:16]))
 
 
 
@@ -2160,9 +2842,11 @@ def _derive_fx_timing_runtime_scope(
 
 
 def _compose_hmb_runtime_prompt(
-    prompt_value: Any, runtime_scope: Dict[str, Any]
+    prompt_value: Any,
+    runtime_scope: Dict[str, Any],
+    semantic_manifest: Dict[str, Any] | None = None,
 ) -> str:
-    """Append private runtime facts and the fixed English output contract."""
+    """Append private runtime facts and fixed generator-output contracts."""
 
     value = getattr(prompt_value, "value", prompt_value)
     public_prompt = str(value or "").rstrip()
@@ -2172,21 +2856,46 @@ def _compose_hmb_runtime_prompt(
         sort_keys=True,
         separators=(",", ":"),
     )
+    encoded_manifest = ""
+    if semantic_manifest:
+        encoded_manifest = json.dumps(
+            semantic_manifest,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     appended_size = (
         len(encoded_scope)
+        + len(_RUNTIME_FX_SCOPE_HEADER)
+        + len(encoded_manifest)
+        + (
+            len(_FINAL_OUTPUT_SEMANTIC_MANIFEST_HEADER)
+            + len(_FINAL_OUTPUT_SEMANTIC_CONTRACT)
+            if encoded_manifest
+            else 0
+        )
         + len(_ENGLISH_GENERATOR_OUTPUT_CONTRACT_HEADER)
         + len(_ENGLISH_GENERATOR_OUTPUT_CONTRACT)
     )
     if not public_prompt or len(public_prompt) + appended_size > 6_000_000:
         raise RuntimeError("HMB runtime prompt size is invalid.")
-    return "\n".join((
+    sections = [
         public_prompt,
         _RUNTIME_FX_SCOPE_HEADER,
         encoded_scope,
+    ]
+    if encoded_manifest:
+        sections.extend((
+            _FINAL_OUTPUT_SEMANTIC_MANIFEST_HEADER,
+            encoded_manifest,
+            _FINAL_OUTPUT_SEMANTIC_CONTRACT,
+        ))
+    sections.extend((
         _ENGLISH_GENERATOR_OUTPUT_CONTRACT_HEADER,
         _ENGLISH_GENERATOR_OUTPUT_CONTRACT,
         "",
     ))
+    return "\n".join(sections)
 
 
 def _contains_korean_script(value: Any) -> bool:
@@ -2633,6 +3342,7 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_shot_context: dict[str, Any] = {}
         self._hmb_shot_catalog_snapshot: dict[str, Any] = {}
         self._hmb_last_generator_snapshot: dict[str, Any] = {}
+        self._hmb_expected_output_semantics: dict[str, Any] = {}
         # Instance-local execution authority.  Display widget writes and
         # same-flow route callbacks may interleave while several Agents run,
         # but they must not change the exact Shot being consumed by this run.
@@ -3405,6 +4115,67 @@ class HMBAgentLibrary(_BaseAgent):
 
         self._hmb_remote_prompt_publication = {}
 
+    def _invalidate_generator_authority_for_prompt_change(self) -> None:
+        """Drop only derived Agent authority; keep user-visible FINAL TEXT intact."""
+
+        self._hmb_shot_context = {}
+        self._hmb_last_generator_snapshot = {}
+        self._hmb_invalidate_remote_prompt_publication()
+
+    def _invalidate_stale_generator_authority_for_prompt(
+        self,
+        prompt_value: Any,
+        *,
+        source_node: Any | None = None,
+    ) -> bool:
+        """Invalidate a completed Agent result when its paired Prompt advances.
+
+        A concise Prompt document may remain byte-identical while a private
+        field, target, or media generation changes. The cheap visible hash
+        catches ordinary edits immediately; when the routed source instance is
+        available, its exact paired Shot context also catches machine-only and
+        media-only changes before Generator can adopt the old publication.
+        """
+
+        snapshot = getattr(self, "_hmb_last_generator_snapshot", None)
+        publication = getattr(self, "_hmb_remote_prompt_publication", None)
+        if not isinstance(snapshot, dict) or not snapshot:
+            snapshot = publication if isinstance(publication, dict) else {}
+        if not snapshot:
+            return False
+
+        text = str(getattr(prompt_value, "value", prompt_value) or "")
+        visible_sha256 = _prompt_text_sha256(text.rstrip("\r\n"))
+        stale = not hmac.compare_digest(
+            str(snapshot.get("visible_prompt_sha256") or ""),
+            visible_sha256,
+        )
+        if not stale and source_node is not None:
+            context_getter = getattr(source_node, "_hmb_agent_shot_context", None)
+            if not callable(context_getter):
+                stale = True
+            else:
+                try:
+                    current = self._normalize_shot_context(context_getter(prompt_value))
+                except Exception:
+                    current = {}
+                compared = (
+                    "channel_uuid",
+                    "shot_uuid",
+                    "shot_number",
+                    "shot_name",
+                    "prompt_generation",
+                    "visible_prompt_sha256",
+                    "image_media_sha256",
+                    "video_media_sha256",
+                )
+                stale = not current or any(
+                    current.get(key) != snapshot.get(key) for key in compared
+                )
+        if stale:
+            self._invalidate_generator_authority_for_prompt_change()
+        return stale
+
     def _hmb_remote_prompt_publication_for_generator(self) -> dict[str, Any]:
         """Return the current exact-Shot publication, or no authority at all.
 
@@ -3758,6 +4529,10 @@ class HMBAgentLibrary(_BaseAgent):
         if value is sentinel:
             return False
         self.set_parameter_value(_AGENT_SHOT_PROMPT_INPUT_PARAMETER, value)
+        self._invalidate_stale_generator_authority_for_prompt(
+            value,
+            source_node=source_node,
+        )
         self._refresh_routed_prompt_preview()
         return True
 
@@ -3905,6 +4680,14 @@ class HMBAgentLibrary(_BaseAgent):
                 self._refresh_agent_shot_route()
             self._refresh_routed_prompt_preview()
         elif str(getattr(parameter, "name", "") or "") == _AGENT_SHOT_PROMPT_INPUT_PARAMETER:
+            self._invalidate_stale_generator_authority_for_prompt(
+                value,
+                source_node=getattr(
+                    self,
+                    _VERIFIED_PROMPT_SOURCE_ATTRIBUTE,
+                    None,
+                ),
+            )
             self._refresh_routed_prompt_preview()
         return result
 
@@ -4080,6 +4863,7 @@ class HMBAgentLibrary(_BaseAgent):
         if str(getattr(target_parameter, "name", "") or "") == (
             _AGENT_SHOT_PROMPT_INPUT_PARAMETER
         ):
+            self._invalidate_generator_authority_for_prompt_change()
             try:
                 self.set_parameter_value(_AGENT_SHOT_PROMPT_INPUT_PARAMETER, "")
             except Exception:
@@ -4271,6 +5055,7 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_ruleset_names = ("", "")
         self._hmb_policy_identity = {}
         self._hmb_runtime_prompt = ""
+        self._hmb_expected_output_semantics = {}
         self._hmb_native_prompt_read_active = False
         self._hmb_verified_prompt_source_node = None
         self._hmb_publication_buffer = {"output": "", "logs": ""}
@@ -4657,6 +5442,7 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_last_sanitizer_status = "clean"
         self._hmb_suppress_visible_publication = False
         self._hmb_last_generator_snapshot = {}
+        self._hmb_expected_output_semantics = {}
         self._clear_execution_shot_binding()
         # The selector is cable-free in the editor, but the router establishes
         # the same-flow hidden Prompt edge before topology validation so the
@@ -4763,7 +5549,10 @@ class HMBAgentLibrary(_BaseAgent):
             else:
                 self._hmb_shot_context = {}
             source_contract_stage = "public_job"
-            _assert_public_job_data_contract(machine_prompt)
+            public_job = _assert_public_job_data_contract(machine_prompt)
+            self._hmb_expected_output_semantics = (
+                _build_final_output_semantic_manifest(public_job)
+            )
             source_contract_stage = "fx_contract"
             fx_timing_contract = _assert_fx_timing_source_contract(machine_prompt)
             source_contract_stage = "signed_candidate"
@@ -4780,7 +5569,9 @@ class HMBAgentLibrary(_BaseAgent):
             )
             source_contract_stage = "runtime_prompt"
             self._hmb_runtime_prompt = _compose_hmb_runtime_prompt(
-                machine_prompt, runtime_scope
+                machine_prompt,
+                runtime_scope,
+                self._hmb_expected_output_semantics,
             )
         except _HMBPolicyIdentityMismatchError:
             self._publish_hmb_execution_block(
@@ -4806,6 +5597,7 @@ class HMBAgentLibrary(_BaseAgent):
         result = None
         native_failed = False
         english_output_failed = False
+        semantic_output_failed = False
         sanitizer_ran = False
         self._hmb_suppress_visible_publication = True
         try:
@@ -4849,6 +5641,38 @@ class HMBAgentLibrary(_BaseAgent):
                 sanitizer_status = str(
                     getattr(self, "_hmb_last_sanitizer_status", "") or ""
                 )
+                if (
+                    not native_failed
+                    and not english_output_failed
+                    and sanitizer_status == "clean"
+                    and isinstance(final_text, str)
+                    and final_text
+                ):
+                    try:
+                        _assert_final_output_semantic_integrity(
+                            final_text,
+                            self._hmb_expected_output_semantics,
+                        )
+                        final_text = _strip_semantic_evidence_tags(final_text)
+                        if isinstance(outputs, dict):
+                            outputs["output"] = final_text
+                    except RuntimeError as exc:
+                        semantic_output_failed = True
+                        sanitizer_status = "semantic"
+                        self._hmb_last_sanitizer_status = sanitizer_status
+                        final_text = _HMB_OUTPUT_SEMANTIC_INCOMPLETE_MESSAGE
+                        if isinstance(outputs, dict):
+                            outputs["agent"] = {}
+                            outputs["output"] = final_text
+                            if "logs" in outputs:
+                                outputs["logs"] = ""
+                        try:
+                            print(
+                                "[HMB_PRODUCTION][ERROR] "
+                                f"OUTPUT_SEMANTIC_STAGE={exc}"
+                            )
+                        except Exception:
+                            pass
                 self._hmb_suppress_visible_publication = False
                 if isinstance(final_text, str):
                     self._set_visible_output(final_text)
@@ -4915,6 +5739,13 @@ class HMBAgentLibrary(_BaseAgent):
             )
             raise RuntimeError(
                 _HMB_ENGLISH_OUTPUT_REQUIRED_MESSAGE
+            ) from None
+        if semantic_output_failed:
+            self._publish_hmb_execution_block(
+                _HMB_OUTPUT_SEMANTIC_INCOMPLETE_MESSAGE
+            )
+            raise RuntimeError(
+                _HMB_OUTPUT_SEMANTIC_INCOMPLETE_MESSAGE
             ) from None
         if native_failed:
             self._publish_hmb_execution_block(_HMB_EXECUTION_FAILED_MESSAGE)

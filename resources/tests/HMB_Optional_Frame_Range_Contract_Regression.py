@@ -41,7 +41,7 @@ def video(slot: int, source_type: str) -> dict:
     item = prompt._default_video_item(slot)
     taxonomy = {
         "Maya Preview / Playblast": ("Maya Preview / Playblast", "Mask"),
-        "FX Reference": ("FX / Simulation Reference", "Explosion"),
+        "FX Reference": ("FX Reference", "FX Effect Only"),
         "Timing / Edit Reference": ("Maya Preview / Playblast", "Timing / Edit"),
     }
     main_type, sub_type = taxonomy[source_type]

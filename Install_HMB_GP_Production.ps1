@@ -107,14 +107,27 @@ $records = @($manifest.files)
 if ($records.Count -ne [int]$manifest.file_count) {
     throw 'HMB release manifest file_count does not match its file list.'
 }
+if (
+    [int]$manifest.install_file_count -ne 21 -or
+    [int]$manifest.distribution_file_count -ne 4 -or
+    $records.Count -ne 25
+) {
+    throw 'HMB release manifest install/distribution boundary mismatch.'
+}
 
-$allowed = New-Object 'System.Collections.Generic.HashSet[string]' `
+$verifiedMembers = New-Object 'System.Collections.Generic.HashSet[string]' `
+    ([System.StringComparer]::OrdinalIgnoreCase)
+$installMembers = New-Object 'System.Collections.Generic.HashSet[string]' `
     ([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($record in $records) {
     $relative = ([string]$record.path).Replace('/', '\')
     Assert-HmbRelativeMember -Path $relative
-    if (-not $allowed.Add($relative)) {
+    if (-not $verifiedMembers.Add($relative)) {
         throw "Duplicate HMB release member: $relative"
+    }
+    $installProperty = $record.PSObject.Properties['install']
+    if ($null -eq $installProperty -or $installProperty.Value -isnot [bool]) {
+        throw "HMB release member has an invalid install flag: $relative"
     }
     $sourceFile = Join-Path $source $relative
     if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) {
@@ -124,9 +137,30 @@ foreach ($record in $records) {
     if ($actual -ne ([string]$record.sha256).ToUpperInvariant()) {
         throw "HMB release member hash mismatch: $relative"
     }
+    if ($installProperty.Value -and -not $installMembers.Add($relative)) {
+        throw "Duplicate HMB runtime install member: $relative"
+    }
 }
-$null = $allowed.Add('release-manifest.json')
-$null = $allowed.Add('SHA256SUMS')
+
+$installRecords = @($records | Where-Object { $_.install -eq $true })
+$distributionOnlyMembers = @(
+    $records |
+        Where-Object { $_.install -eq $false } |
+        ForEach-Object { ([string]$_.path).Replace('/', '\') }
+)
+$expectedDistributionOnlyMembers = @(
+    'Install_HMB_GP_Production.ps1',
+    'LICENSE',
+    'THIRD_PARTY_NOTICES.md',
+    'SBOM.spdx.json'
+)
+if (
+    $installRecords.Count -ne [int]$manifest.install_file_count -or
+    $distributionOnlyMembers.Count -ne [int]$manifest.distribution_file_count -or
+    @(Compare-Object $expectedDistributionOnlyMembers $distributionOnlyMembers).Count -ne 0
+) {
+    throw 'HMB release manifest distribution-only members are invalid.'
+}
 
 $rollback = $null
 $preservedVenv = $null
@@ -155,18 +189,15 @@ if (Test-Path -LiteralPath $target) {
 
 try {
     New-Item -ItemType Directory -Path $target -Force | Out-Null
-    foreach ($relative in $allowed) {
+    foreach ($relative in $installMembers) {
         $sourceFile = Join-Path $source $relative
-        if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) {
-            continue
-        }
         $destination = Join-Path $target $relative
         New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force |
             Out-Null
         Copy-Item -LiteralPath $sourceFile -Destination $destination -Force
     }
 
-    foreach ($record in $records) {
+    foreach ($record in $installRecords) {
         $relative = ([string]$record.path).Replace('/', '\')
         $installed = Join-Path $target $relative
         $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $installed).Hash
@@ -176,7 +207,7 @@ try {
     }
 
     $resourceMembers = @(
-        $records |
+        $installRecords |
             ForEach-Object { ([string]$_.path).Replace('/', '\') } |
             Where-Object { $_ -like 'resources\*' }
     )
@@ -193,7 +224,7 @@ try {
         Get-ChildItem -LiteralPath $target -Force -Recurse -File |
             ForEach-Object { Get-HmbRelativePath -Root $target -Path $_.FullName }
     )
-    if (@(Compare-Object @($allowed) $installedRuntimeFiles).Count -ne 0) {
+    if (@(Compare-Object @($installMembers) $installedRuntimeFiles).Count -ne 0) {
         throw 'Installed HMB files do not match the exact runtime release closure.'
     }
 
@@ -220,6 +251,6 @@ catch {
 Write-Output 'HMB_RUNTIME_INSTALL_OK'
 Write-Output ("TARGET=$target")
 Write-Output ("VERSION=$($manifest.release_version)")
-Write-Output ("RUNTIME_FILES=$($records.Count)")
+Write-Output ("RUNTIME_FILES=$($installRecords.Count)")
 Write-Output ("RESOURCE_FILES=$($resourceMembers.Count)")
 Write-Output ("ROLLBACK=$rollback")

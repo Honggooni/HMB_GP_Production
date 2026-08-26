@@ -101,13 +101,19 @@ const hmbVideoPickerViewModeRegistry = new Map();
 const hmbVideoPickerViewModeFallbackRegistry = new WeakMap();
 const hmbVideoPickerExpandedGeometryRegistry = new Map();
 const hmbVideoPickerExpandedGeometryFallbackRegistry = new WeakMap();
+// Strong keys intentionally survive a transient controller remount for the
+// same Python runtime. Keep that memory bounded so deleted workflow identities
+// cannot accumulate for the lifetime of the browser process.
+export const HMB_VIDEO_PICKER_STRONG_REGISTRY_LIMIT = 128;
 const hmbVideoPickerRegistryScopeIds = new WeakMap();
+const hmbVideoPickerRegistryNodeShellIds = new WeakMap();
 const hmbVideoPickerNodeInternalsSchedulers = new WeakMap();
 const hmbVideoPickerCompactTailReclaims = new WeakMap();
 const hmbVideoPickerExpandedHostHeightPropagations = new WeakMap();
 const hmbVideoPickerFitElementIds = new WeakMap();
 let hmbVideoPickerPaintFirstSequence = 0;
 let hmbVideoPickerRegistryScopeSequence = 0;
+let hmbVideoPickerRegistryNodeShellSequence = 0;
 let hmbVideoPickerFitElementSequence = 0;
 
 // Jewel Night is the single Shot-routing palette shared by ImageAsset,
@@ -4306,10 +4312,105 @@ function hmbVideoPickerRegistryScopeKey(container, shell) {
   return String(scopeId);
 }
 
+function hmbVideoPickerRegistryNodeShellKey(shell) {
+  if (!shell || (typeof shell !== "object" && typeof shell !== "function")) return "unknown";
+  let shellId = hmbVideoPickerRegistryNodeShellIds.get(shell);
+  if (!shellId) {
+    shellId = ++hmbVideoPickerRegistryNodeShellSequence;
+    hmbVideoPickerRegistryNodeShellIds.set(shell, shellId);
+  }
+  return String(shellId);
+}
+
+function hmbVideoPickerStrongRegistrySet(registry, identity, value) {
+  if (!identity || typeof identity !== "string") return false;
+  if (registry.has(identity)) registry.delete(identity);
+  registry.set(identity, value);
+  while (registry.size > HMB_VIDEO_PICKER_STRONG_REGISTRY_LIMIT) {
+    const oldestIdentity = registry.keys().next().value;
+    if (oldestIdentity == null) break;
+    registry.delete(oldestIdentity);
+  }
+  return true;
+}
+
+function hmbVideoPickerStrongRegistryRead(registry, identity) {
+  if (!identity || typeof identity !== "string" || !registry.has(identity)) {
+    return { found: false, value: null };
+  }
+  const value = registry.get(identity);
+  // Reads refresh recency so an actively remounting node is not evicted by
+  // unrelated workflow churn.
+  registry.delete(identity);
+  registry.set(identity, value);
+  return { found: true, value };
+}
+
+function hmbDeleteVideoPickerStrongRegistryIdentity(identity) {
+  if (!identity || typeof identity !== "string") return false;
+  const removedView = hmbVideoPickerViewModeRegistry.delete(identity);
+  const removedGeometry = hmbVideoPickerExpandedGeometryRegistry.delete(identity);
+  return removedView || removedGeometry;
+}
+
+function hmbMigrateVideoPickerStrongRegistryIdentity(previousIdentity, nextIdentity) {
+  if (
+    !previousIdentity
+    || !nextIdentity
+    || previousIdentity === nextIdentity
+    || typeof previousIdentity !== "string"
+    || typeof nextIdentity !== "string"
+  ) return false;
+  let migrated = false;
+  for (const registry of [
+    hmbVideoPickerViewModeRegistry,
+    hmbVideoPickerExpandedGeometryRegistry,
+  ]) {
+    if (!registry.has(previousIdentity)) continue;
+    const previousValue = registry.get(previousIdentity);
+    registry.delete(previousIdentity);
+    if (!registry.has(nextIdentity)) {
+      hmbVideoPickerStrongRegistrySet(registry, nextIdentity, previousValue);
+    }
+    migrated = true;
+  }
+  return migrated;
+}
+
+function hmbVideoPickerTempFinalNodeIdRename(previousNodeId, nextNodeId) {
+  const previous = clean(previousNodeId);
+  const next = clean(nextNodeId);
+  return previous.endsWith("_temp") && next === previous.slice(0, -5);
+}
+
+function hmbVideoPickerIdentityDescriptor(container) {
+  const shell = findReactFlowNode(container) || videoPickerNodeRoot(container);
+  if (!shell) return null;
+  const runtimeId = clean(container?.__hmbVideoPickerRuntimeInstanceId);
+  if (!runtimeId) return null;
+  const nodeId = clean(
+    shell.getAttribute?.("data-id")
+    || shell.getAttribute?.("data-node-id")
+    || shell.getAttribute?.("data-nodeid"),
+  );
+  const scopeKey = hmbVideoPickerRegistryScopeKey(container, shell);
+  const stableNodeId = nodeId && !nodeId.endsWith("_temp") ? nodeId : "";
+  return {
+    shell,
+    runtimeId,
+    nodeId,
+    scopeKey,
+    identity: stableNodeId
+      ? `scope:${scopeKey}:id:${stableNodeId}:runtime:${runtimeId}`
+      : `scope:${scopeKey}:shell:${hmbVideoPickerRegistryNodeShellKey(shell)}:runtime:${runtimeId}`,
+  };
+}
+
 export function hmbBindVideoPickerRuntimeIdentity(container, runtimeInstanceId) {
   if (!container) return { changed: false, hydrationReset: false };
   const nextRuntimeId = clean(runtimeInstanceId);
   const previousRuntimeId = clean(container.__hmbVideoPickerRuntimeInstanceId);
+  const recordedRuntimeId = clean(container.__hmbVideoPickerRegistryRuntimeId);
   // A transient host echo without runtime identity is not authority to erase a
   // live controller's choice. The initial empty value simply stays compact.
   if (!nextRuntimeId || nextRuntimeId === previousRuntimeId) {
@@ -4318,8 +4419,12 @@ export function hmbBindVideoPickerRuntimeIdentity(container, runtimeInstanceId) 
     }
     return { changed: false, hydrationReset: false };
   }
-  const hydrationReset = !!previousRuntimeId && previousRuntimeId !== nextRuntimeId;
-  const migrateUnboundChoice = !previousRuntimeId;
+  const effectivePreviousRuntimeId = previousRuntimeId || recordedRuntimeId;
+  const hydrationReset = !!effectivePreviousRuntimeId
+    && effectivePreviousRuntimeId !== nextRuntimeId;
+  const migrateUnboundChoice = !effectivePreviousRuntimeId;
+  const previousIdentity = container.__hmbVideoPickerRegistryIdentity
+    || (previousRuntimeId ? hmbVideoPickerNodeIdentity(container) : null);
   const rememberedExpanded = typeof container.__hmbVideoPickerExpanded === "boolean"
     ? container.__hmbVideoPickerExpanded === true
     : null;
@@ -4330,6 +4435,11 @@ export function hmbBindVideoPickerRuntimeIdentity(container, runtimeInstanceId) 
     // React Flow may reuse the same data-id for a newly hydrated Python node.
     // That is a new workflow-load boundary: never copy view/geometry from the
     // previous runtime into its registry identity.
+    hmbDeleteVideoPickerStrongRegistryIdentity(previousIdentity);
+    delete container.__hmbVideoPickerRegistryIdentity;
+    delete container.__hmbVideoPickerRegistryNodeId;
+    delete container.__hmbVideoPickerRegistryScopeKey;
+    delete container.__hmbVideoPickerRegistryRuntimeId;
     delete container.__hmbVideoPickerExpandedGeometry;
     delete container.__hmbVideoPickerExpandedViewState;
     hmbRememberVideoPickerViewMode(container, false);
@@ -4347,30 +4457,40 @@ export function hmbBindVideoPickerRuntimeIdentity(container, runtimeInstanceId) 
 }
 
 export function hmbVideoPickerNodeIdentity(container) {
-  const shell = findReactFlowNode(container) || videoPickerNodeRoot(container);
-  if (!shell) return null;
-  const runtimeId = clean(container?.__hmbVideoPickerRuntimeInstanceId);
   // View and expanded-geometry memory may survive controller remounts inside
   // one loaded Python node, but a newly hydrated runtime must always cold-mount
   // compact even when React Flow reuses the same serialized node id.
-  if (!runtimeId) return null;
-  const id = clean(
-    shell.getAttribute?.("data-id")
-    || shell.getAttribute?.("data-node-id")
-    || shell.getAttribute?.("data-nodeid"),
-  );
-  return id
-    ? `scope:${hmbVideoPickerRegistryScopeKey(container, shell)}:id:${id}:runtime:${runtimeId}`
-    : `runtime:${runtimeId}`;
+  const descriptor = hmbVideoPickerIdentityDescriptor(container);
+  if (!descriptor) return null;
+  const previousIdentity = container.__hmbVideoPickerRegistryIdentity;
+  const previousRuntimeId = clean(container.__hmbVideoPickerRegistryRuntimeId);
+  const previousNodeId = clean(container.__hmbVideoPickerRegistryNodeId);
+  const previousScopeKey = clean(container.__hmbVideoPickerRegistryScopeKey);
+  if (previousIdentity && previousIdentity !== descriptor.identity) {
+    const safeRename = previousRuntimeId === descriptor.runtimeId
+      && previousScopeKey === descriptor.scopeKey
+      && hmbVideoPickerTempFinalNodeIdRename(previousNodeId, descriptor.nodeId);
+    if (safeRename) {
+      hmbMigrateVideoPickerStrongRegistryIdentity(previousIdentity, descriptor.identity);
+    } else if (previousRuntimeId && previousRuntimeId !== descriptor.runtimeId) {
+      // Defensive fallback for a host reset that replaced the runtime while
+      // bypassing the normal binding path.
+      hmbDeleteVideoPickerStrongRegistryIdentity(previousIdentity);
+    }
+  }
+  container.__hmbVideoPickerRegistryIdentity = descriptor.identity;
+  container.__hmbVideoPickerRegistryNodeId = descriptor.nodeId;
+  container.__hmbVideoPickerRegistryScopeKey = descriptor.scopeKey;
+  container.__hmbVideoPickerRegistryRuntimeId = descriptor.runtimeId;
+  return descriptor.identity;
 }
 
 export function hmbVideoPickerStoredViewMode(container) {
   const identity = hmbVideoPickerNodeIdentity(container);
   if (!identity) return null;
   if (typeof identity === "string") {
-    return hmbVideoPickerViewModeRegistry.has(identity)
-      ? hmbVideoPickerViewModeRegistry.get(identity) === true
-      : null;
+    const stored = hmbVideoPickerStrongRegistryRead(hmbVideoPickerViewModeRegistry, identity);
+    return stored.found ? stored.value === true : null;
   }
   return hmbVideoPickerViewModeFallbackRegistry.has(identity)
     ? hmbVideoPickerViewModeFallbackRegistry.get(identity) === true
@@ -4383,7 +4503,9 @@ export function hmbRememberVideoPickerViewMode(container, expanded) {
   if (shell) hmbVideoPickerViewModeFallbackRegistry.set(shell, resolved);
   const identity = hmbVideoPickerNodeIdentity(container);
   if (identity) {
-    if (typeof identity === "string") hmbVideoPickerViewModeRegistry.set(identity, resolved);
+    if (typeof identity === "string") {
+      hmbVideoPickerStrongRegistrySet(hmbVideoPickerViewModeRegistry, identity, resolved);
+    }
     else hmbVideoPickerViewModeFallbackRegistry.set(identity, resolved);
   }
   if (container) container.__hmbVideoPickerExpanded = resolved;
@@ -4394,9 +4516,14 @@ export function hmbRememberVideoPickerViewMode(container, expanded) {
 function hmbVideoPickerExpandedGeometryRegistryEntry(container) {
   const identity = hmbVideoPickerNodeIdentity(container);
   if (!identity) return null;
-  return typeof identity === "string"
-    ? hmbVideoPickerExpandedGeometryRegistry.get(identity) || null
-    : hmbVideoPickerExpandedGeometryFallbackRegistry.get(identity) || null;
+  if (typeof identity === "string") {
+    const stored = hmbVideoPickerStrongRegistryRead(
+      hmbVideoPickerExpandedGeometryRegistry,
+      identity,
+    );
+    return stored.found ? stored.value || null : null;
+  }
+  return hmbVideoPickerExpandedGeometryFallbackRegistry.get(identity) || null;
 }
 
 export function hmbRememberVideoPickerExpandedGeometry(container, snapshot) {
@@ -4414,7 +4541,9 @@ export function hmbRememberVideoPickerExpandedGeometry(container, snapshot) {
   };
   const shell = findReactFlowNode(container);
   if (shell) hmbVideoPickerExpandedGeometryFallbackRegistry.set(shell, stored);
-  if (typeof identity === "string") hmbVideoPickerExpandedGeometryRegistry.set(identity, stored);
+  if (typeof identity === "string") {
+    hmbVideoPickerStrongRegistrySet(hmbVideoPickerExpandedGeometryRegistry, identity, stored);
+  }
   else hmbVideoPickerExpandedGeometryFallbackRegistry.set(identity, stored);
   return stored;
 }

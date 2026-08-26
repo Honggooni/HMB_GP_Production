@@ -104,8 +104,8 @@ ui["videos"][0].update(
         "source_uid": "video-alpha",
         "picker_managed": True,
         "label": "UI Video",
-        "video_main_type": "FX / Simulation Reference",
-        "video_sub_type": "Explosion",
+        "video_main_type": "FX Reference",
+        "video_sub_type": "FX Effect Only",
         "keep_out": "Ignore proxy sparks.",
     }
 )
@@ -174,13 +174,13 @@ assert by_image_uid["image-alpha"]["frame_range_intent"] == range_intent(101, 12
 assert by_image_uid["image-beta"]["image_sub_type"] == "Head / Face"
 assert by_image_uid["image-beta"]["color_picks"] == ["Green"]
 assert by_image_uid["image-beta"]["frame_range_intent"] == range_intent(201, 208)
-assert merged["videos"][0]["video_main_type"] == "FX / Simulation Reference"
-assert merged["videos"][0]["video_sub_type"] == "Explosion"
+assert merged["videos"][0]["video_main_type"] == "FX Reference"
+assert merged["videos"][0]["video_sub_type"] == "FX Effect Only"
 assert merged["videos"][0]["keep_out"] == "Ignore proxy sparks."
 assert merged["videos"][0]["label"] == "Source Video"
 
-# A verified Look keeps source-owned registration provenance, but a valid
-# effective Prompt Sub Type survives the crossed source/UI clocks by UID.
+# A verified Look keeps source-owned registration provenance. Retired pre-v2
+# Prompt text is released instead of being migrated across revision axes.
 look_source = prompt._default_widget_state()
 look_source["images"][0].update(
     {
@@ -200,15 +200,15 @@ look_source["images"][0].update(
 look_ui = copy.deepcopy(look_source)
 look_ui["images"][0]["asset_image_sub_type_candidate"] = "Color Mood"
 look_ui["images"][0]["image_sub_type"] = "Scale"
-look_ui["images"][0]["owner"] = "Jett_11"
+look_ui["images"][0]["owner"] = "Camera / Composition"
 look_merged = prompt._merge_prompt_revision_axes(look_source, look_ui)
 look_row = look_merged["images"][0]
 assert look_row["asset_image_sub_type_candidate"] == "Render Look"
 assert look_row["image_main_type"] == "Look Reference"
-assert look_row["image_sub_type"] == "Scale"
-assert look_row["source_type"] == "Scale / Composition Reference"
-assert look_row["scope"] == "Scale only"
-assert look_row["owner"] == "Jett_11"
+assert look_row["image_sub_type"] == "Render Look"
+assert look_row["source_type"] == "Color / Look Reference"
+assert look_row["scope"] == "Render look only"
+assert look_row["owner"] == ""
 assert look_row["color_picks"] == [""]
 
 # A stale registered default is not an override. A newer global registration

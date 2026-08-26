@@ -21,11 +21,8 @@ let OBJECT_COLOR_PICK_CHOICES = [
   "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern",
 ];
 let COLOR_PICK_CHOICES = [
-  ...ACTOR_COLOR_PICK_CHOICES,
-  ...OBJECT_COLOR_PICK_CHOICES,
+  ...new Set([...ACTOR_COLOR_PICK_CHOICES, ...OBJECT_COLOR_PICK_CHOICES]),
 ];
-let ACTOR_COLOR_PICK_SOURCE_TYPES = new Set();
-let OBJECT_COLOR_PICK_SOURCE_TYPES = new Set();
 const HMB_DEFAULT_NODE_WIDTH = 1800;
 const HMB_MIN_NODE_WIDTH = 760;
 const HMB_HEADER_LAYOUT_VERSION = 2;
@@ -121,9 +118,8 @@ export function hmbScopeWidgetStyleMarkup(markup, rootSelector) {
   ));
 }
 
-let IMAGE_SOURCE_TYPES = [];
-let IMAGE_SCOPES = [];
-let IMAGE_SCOPES_BY_SOURCE_TYPE = {};
+const IMAGE_TAXONOMY_SCHEMA = "hmb-image-taxonomy";
+const IMAGE_TAXONOMY_VERSION = 2;
 let IMAGE_MAIN_TYPES = [
   "Select Image Main Type",
   "Character",
@@ -149,12 +145,13 @@ let IMAGE_SUB_TYPES = {
   ],
   "Look Reference": [
     "Color Mood", "Lighting / Atmosphere", "Render Look",
-    "Color / Look / Lighting", "Scale", "Composition", "Scale / Composition",
+    "Color / Look / Lighting", "ch_Scale", "bg_Scale", "ch_Scale / bg_Scale",
   ],
   "Custom / Context": ["Context", "Custom"],
 };
+let IMAGE_TAXONOMY_LABELS = { en: {}, ko: {} };
 
-const IMAGE_TAXONOMY_WIRE_MAP = Object.freeze({
+let IMAGE_TAXONOMY_WIRE_MAP = Object.freeze({
   "Character\u0000Full Appearance": ["Character Appearance", "Full body / full appearance"],
   "Character\u0000Head / Face": ["Partial Character Detail", "Head / face only"],
   "Character\u0000Eyes / Expression": ["Partial Character Detail", "Eye / expression detail"],
@@ -176,12 +173,55 @@ const IMAGE_TAXONOMY_WIRE_MAP = Object.freeze({
   "Look Reference\u0000Lighting / Atmosphere": ["Lighting / Atmosphere Reference", "Lighting mood only"],
   "Look Reference\u0000Render Look": ["Color / Look Reference", "Render look only"],
   "Look Reference\u0000Color / Look / Lighting": ["Color + Look + Lighting Mood Reference", "All color + look + lighting functions"],
-  "Look Reference\u0000Scale": ["Scale / Composition Reference", "Scale only"],
-  "Look Reference\u0000Composition": ["Scale / Composition Reference", "Composition only"],
-  "Look Reference\u0000Scale / Composition": ["Scale / Composition Reference", "Scale + composition"],
-  "Custom / Context\u0000Context": ["Custom", ""],
+  "Look Reference\u0000ch_Scale": ["Relative Size Reference", "Character Relative Size Only"],
+  "Look Reference\u0000bg_Scale": ["Relative Size Reference", "Background Relative Size / Placement Only"],
+  "Look Reference\u0000ch_Scale / bg_Scale": ["Relative Size Reference", "Character / Background Relative Size / Placement Only"],
+  "Custom / Context\u0000Context": ["Custom", "Context only"],
   "Custom / Context\u0000Custom": ["Custom", "Custom scope"],
 });
+
+const IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS = Object.freeze({
+  ch_Scale: "ch_all",
+  bg_Scale: "bg_all",
+  "ch_Scale / bg_Scale": "ch_all / bg_all",
+});
+const IMAGE_GENERAL_LOOK_REFERENCE_SUB_TYPES = new Set([
+  "Color Mood", "Lighting / Atmosphere", "Render Look", "Color / Look / Lighting",
+]);
+const IMAGE_GLOBAL_SCOPE_LOOK_REFERENCE_SUB_TYPES = new Set([
+  "Lighting / Atmosphere", "Color / Look / Lighting",
+]);
+const IMAGE_GLOBAL_LOOK_TARGET = "Global Look";
+const IMAGE_CUSTOM_LOOK_TARGET = "Custom";
+const IMAGE_GENERAL_LOOK_ALLOWED_SYSTEM_TARGETS = new Set([
+  IMAGE_GLOBAL_LOOK_TARGET,
+]);
+const IMAGE_GLOBAL_SCOPE_LOOK_ALLOWED_TARGETS = new Set([
+  IMAGE_GLOBAL_LOOK_TARGET, IMAGE_CUSTOM_LOOK_TARGET,
+]);
+const IMAGE_GENERAL_LOOK_NAMED_TARGET_MAIN_TYPES = new Set([
+  "Character", "Character Prop", "Environment / Background", "Background Prop",
+]);
+const IMAGE_SYSTEM_TARGETS = new Set([
+  "Camera / Composition", "Global Look", "ch_all", "bg_all", "ch_all / bg_all", "None",
+]);
+const IMAGE_RESERVED_TARGET_ALIASES = new Set([
+  "Scale", "Composition", "Scale / Composition", "Look", "Custom", "self",
+]);
+const imageTargetKey = (value) => clean(value).normalize("NFKC").toLowerCase();
+const IMAGE_SYSTEM_TARGET_KEYS = new Set(
+  [...IMAGE_SYSTEM_TARGETS, ...IMAGE_RESERVED_TARGET_ALIASES].map(imageTargetKey),
+);
+
+function isImageSystemTarget(value) {
+  return IMAGE_SYSTEM_TARGET_KEYS.has(imageTargetKey(value));
+}
+
+function isForbiddenGeneralLookSystemTarget(value) {
+  const target = clean(value);
+  return isImageSystemTarget(target)
+    && !IMAGE_GENERAL_LOOK_ALLOWED_SYSTEM_TARGETS.has(target);
+}
 
 const VIDEO_SOURCE_TYPES = [
   "Role Required / Select Video Type",
@@ -208,7 +248,7 @@ const VIDEO_CONTROL_ROLES = [
   "Secondary Motion Only",
   "Spatial Alignment Verification Only",
   "Derived Motion Decoding Only",
-  "FX Behavior Only",
+  "FX Effect Only",
   "Lighting / Look Only",
   "Local Composition Check Only",
   "Mask / Guide Only",
@@ -223,32 +263,33 @@ const VIDEO_ROLE_COMPATIBILITY = {
   "Camera / Layout Reference": ["Spatial Alignment Verification Only", "Local Composition Check Only", "Context Only"],
   "Depth / Spatial Reference": ["Spatial Alignment Verification Only", "Mask / Guide Only", "Context Only"],
   "Motion Guide / Retargeting Reference": ["Derived Motion Decoding Only"],
-  "FX Reference": ["FX Behavior Only", "Timing Only", "Context Only"],
+  "FX Reference": ["FX Effect Only", "Timing Only", "Context Only"],
   "Timing / Edit Reference": ["Timing Only", "Context Only"],
   "Lighting / Look Reference": ["Lighting / Look Only", "Context Only"],
-  "Simulation Reference": ["Secondary Motion Only", "FX Behavior Only", "Context Only"],
+  "Simulation Reference": ["Secondary Motion Only", "FX Effect Only", "Context Only"],
   "Mask / Control Reference": ["Mask / Guide Only", "Context Only"],
   "Custom": ["Custom Role", "Context Only"],
 };
 
 // Compact authoring taxonomy.  These values are saved by Prompt only; the
 // established source_type/control_role pair remains the signed Agent wire
-// contract and is populated through VIDEO_TAXONOMY_WIRE_MAP. Legacy UI
-// selections are intentionally released instead of migrated.
+// contract and is populated through VIDEO_TAXONOMY_WIRE_MAP. Legacy wire-only
+// selections remain released; former Depth/Motion placements and the old FX
+// effect subcategories normalize to their single authoring entries below.
 const VIDEO_MAIN_TYPES = [
   "Select Video Main Type",
   "Maya Preview / Playblast",
   "Motion Reference",
   "Scene / Look Reference",
-  "FX / Simulation Reference",
+  "FX Reference",
   "Custom / Context",
 ];
 
 const VIDEO_SUB_TYPES = Object.freeze({
   "Maya Preview / Playblast": ["Original Preview", "Mask", "Depth", "Motion Guide", "Timing / Edit"],
-  "Motion Reference": ["Local Motion", "Secondary Motion", "Retargeting Guide"],
-  "Scene / Look Reference": ["Camera / Layout", "Depth / Spatial", "Lighting / Look", "Composition"],
-  "FX / Simulation Reference": ["Explosion", "Dust", "Particle"],
+  "Motion Reference": ["Local Motion", "Secondary Motion"],
+  "Scene / Look Reference": ["Camera / Layout", "Lighting / Look", "Composition"],
+  "FX Reference": ["FX Effect Only"],
   "Custom / Context": ["Context", "Custom"],
 });
 
@@ -260,54 +301,69 @@ const VIDEO_TAXONOMY_WIRE_MAP = Object.freeze({
   "Maya Preview / Playblast\u0000Timing / Edit": ["Timing / Edit Reference", "Timing Only"],
   "Motion Reference\u0000Local Motion": ["Motion Reference", "Local Motion Detail Only"],
   "Motion Reference\u0000Secondary Motion": ["Motion Reference", "Secondary Motion Only"],
-  "Motion Reference\u0000Retargeting Guide": ["Motion Guide / Retargeting Reference", "Derived Motion Decoding Only"],
   "Scene / Look Reference\u0000Camera / Layout": ["Camera / Layout Reference", "Spatial Alignment Verification Only"],
-  "Scene / Look Reference\u0000Depth / Spatial": ["Depth / Spatial Reference", "Spatial Alignment Verification Only"],
   "Scene / Look Reference\u0000Lighting / Look": ["Lighting / Look Reference", "Lighting / Look Only"],
   "Scene / Look Reference\u0000Composition": ["Camera / Layout Reference", "Local Composition Check Only"],
-  "FX / Simulation Reference\u0000Explosion": ["FX Reference", "FX Behavior Only"],
-  "FX / Simulation Reference\u0000Dust": ["FX Reference", "FX Behavior Only"],
-  "FX / Simulation Reference\u0000Particle": ["FX Reference", "FX Behavior Only"],
+  "FX Reference\u0000FX Effect Only": ["FX Reference", "FX Effect Only"],
   "Custom / Context\u0000Context": ["Custom", "Context Only"],
   "Custom / Context\u0000Custom": ["Custom", "Custom Role"],
 });
+
+const VIDEO_TAXONOMY_PLACEMENT_MIGRATIONS = Object.freeze({
+  "Scene / Look Reference\u0000Depth / Spatial": ["Maya Preview / Playblast", "Depth"],
+  "Depth\u0000Depth / Spatial": ["Maya Preview / Playblast", "Depth"],
+  "Motion Reference\u0000Retargeting Guide": ["Maya Preview / Playblast", "Motion Guide"],
+  "Motion Guide\u0000Retargeting Guide": ["Maya Preview / Playblast", "Motion Guide"],
+  "FX / Simulation Reference\u0000Explosion": ["FX Reference", "FX Effect Only"],
+  "FX / Simulation Reference\u0000Dust": ["FX Reference", "FX Effect Only"],
+  "FX / Simulation Reference\u0000Particle": ["FX Reference", "FX Effect Only"],
+  "FX / Simulation Reference\u0000FX Effect Only": ["FX Reference", "FX Effect Only"],
+  "FX Reference\u0000Explosion": ["FX Reference", "FX Effect Only"],
+  "FX Reference\u0000Dust": ["FX Reference", "FX Effect Only"],
+  "FX Reference\u0000Particle": ["FX Reference", "FX Effect Only"],
+});
+
+function migrateVideoTaxonomyPlacement(mainType, subType) {
+  const cleanedPair = [clean(mainType), clean(subType)];
+  return VIDEO_TAXONOMY_PLACEMENT_MIGRATIONS[cleanedPair.join("\u0000")] || cleanedPair;
+}
 
 const TEXT_FIELDS = [
   ["PROJECT_STYLE_LOOK", "PROJECT / SEQUENCE VISUAL DIRECTION", "project-wide render language, quality bar, style and look continuity only; do not redefine subject identity or shot facts here", "image"],
   ["SCENE_CONTEXT", "SHOT SCENE / NARRATIVE FACTS", "place, time, weather, event, relationships, and what is physically or narratively happening; put look, performance, camera, and effects in their own fields", "image"],
   ["EMOTION_INTENT", "TARGETED PERFORMANCE / EMOTION", "name the target, then describe emotion, performance tone, tension, relationship subtext, and narrative intent; this does not activate lip-sync, camera, or VFX", "image"],
-  ["VIDEO_VFX", "VIDEO ACTION / LIP-SYNC / VFX", "operational shot direction: named target or emitter, source media/audio, time range, action or lip-sync timing, FX path, onset/peak/falloff, occlusion, shadow, reflection, and environment response; keep the exact transcript in Exact Literals", "video"],
+  ["VIDEO_VFX", "VIDEO ACTION / LIP-SYNC / VFX", "", "video"],
   ["PRESERVED_TEXT", "EXACT LITERALS (TEXT ONLY)", "one exact item per line: [Proper Noun], [Dialogue], [Lip-sync Transcript], [Lyrics], [Chant], or [On-screen Text]. This preserves spelling and punctuation; it does not activate a media operation. Existing [Lip-sync Speech] entries remain compatible and unchanged", "image"],
 ];
 
 const LOOK_REFERENCE_AUTHORITY_HINTS = Object.freeze({
   "Color Mood": Object.freeze({
-    en: "Palette and color relationships apply only to the selected Target; choose Global Look for scene-wide use. No light direction, exposure, identity, or material authority.",
-    ko: "팔레트와 색 관계를 선택한 대상에만 적용합니다. 장면 전체 적용은 전체 룩을 선택하세요. 광원 방향·노출·정체성·재질 권한은 없습니다.",
+    en: "Environmental palette, grade, color spill and value/saturation response apply only to the selected Target; intrinsic albedo, hue family, markings, pattern and material class stay unchanged. Choose Global Look for scene-wide use. Reference content is never copied.",
+    ko: "환경 팔레트·그레이드·색 번짐·명도/채도 반응만 선택한 대상에 적용하며 고유 색상군·마킹·패턴·재질 종류는 유지합니다. 장면 전체는 전체 룩을 선택하세요. 참조 내용은 절대 복제하지 않습니다.",
   }),
   "Render Look": Object.freeze({
-    en: "Rendering language, shading character, detail and finish apply only to the selected Target; choose Global Look for scene-wide use. It does not set light direction or exposure.",
-    ko: "렌더 언어·셰이딩 특성·디테일·마감을 선택한 대상에만 적용합니다. 장면 전체 적용은 전체 룩을 선택하세요. 광원 방향과 노출은 정하지 않습니다.",
+    en: "Shading response, detail and finish harmonize only within the selected Target's approved stylization, rendering medium and material class. Choose Global Look for scene-wide use; medium/material family stays unchanged and reference content is never copied.",
+    ko: "선택한 대상의 승인된 스타일화·렌더링 매체·재질 종류 안에서 셰이딩 반응·디테일·마감만 조화시킵니다. 장면 전체는 전체 룩을 선택하며 매체·재질 계열 변경이나 참조 내용 복제를 금지합니다.",
   }),
   "Color / Look / Lighting": Object.freeze({
-    en: "Palette, render language, lighting, exposure, white balance, atmosphere and grade apply only to the selected Target; choose Global Look for every visible source. Intrinsic identity is preserved.",
-    ko: "팔레트·렌더 언어·라이팅·노출·화이트밸런스·대기·그레이드를 선택한 대상에만 적용합니다. 모든 소스 적용은 전체 룩을 선택하세요. 고유 정체성은 유지합니다.",
+    en: "Palette, render language, lighting, exposure, white balance, atmosphere and grade use Global Look by default. With Custom, directly name the affected properties and either a named target/local scope or an explicit scene-wide scope; named Targets remain hidden from this dropdown. Reference content is never copied.",
+    ko: "팔레트·룩·라이팅·노출·화이트밸런스·대기는 기본적으로 전체 룩으로 적용합니다. 사용자 지정에서는 영향 속성과 대상 이름/로컬 범위 또는 명시적인 장면 전체 범위를 직접 작성하며, 이 드롭다운에는 개별 대상이 표시되지 않습니다. 참조 내용은 복제하지 않습니다.",
   }),
   "Lighting / Atmosphere": Object.freeze({
-    en: "Light direction and quality, exposure, white balance and atmosphere apply only to the selected Target; choose Global Look for scene-wide use. Identity and intrinsic design stay unchanged.",
-    ko: "광원 방향·광질·노출·화이트밸런스·대기를 선택한 대상에만 적용합니다. 장면 전체 적용은 전체 룩을 선택하세요. 정체성과 고유 디자인은 유지합니다.",
+    en: "Light direction and quality, exposure, white balance and atmosphere use Global Look by default. With Custom, directly name the affected properties and either a named target/local scope or an explicit scene-wide scope; named Targets remain hidden from this dropdown. Identity and content stay unchanged and reference scenery is never copied.",
+    ko: "광원 방향·광질·노출·화이트밸런스·대기는 기본적으로 전체 룩으로 적용합니다. 사용자 지정에서는 영향 속성과 대상 이름/로컬 범위 또는 명시적인 장면 전체 범위를 직접 작성하며, 이 드롭다운에는 개별 대상이 표시되지 않습니다. 정체성과 실제 내용은 유지하고 참조 배경은 복제하지 않습니다.",
   }),
-  Scale: Object.freeze({
-    en: "Scale authority applies only to the selected Target; choose Camera / Composition for shot-wide camera scope. No color, lighting, identity, or motion authority.",
-    ko: "스케일 권한을 선택한 대상에만 적용합니다. 샷 전체 카메라 범위는 카메라 / 구도를 선택하세요. 색·라이팅·정체성·모션 권한은 없습니다.",
+  ch_Scale: Object.freeze({
+    en: "Measurement-only character/Character Prop size against the actual background. Use an individual character target or ch_all. Never copy color, lighting, objects, pixels, or pictorial content from the sheet.",
+    ko: "실제 배경 대비 캐릭터·캐릭터 프랍의 상대 크기만 측정합니다. 개별 대상 또는 ch_all을 사용합니다. 시트의 색·조명·오브젝트·픽셀·그림 내용은 절대 복제하지 않습니다.",
   }),
-  Composition: Object.freeze({
-    en: "Composition authority applies only to the selected Target; choose Camera / Composition for shot-wide camera scope. No color, lighting, identity, or motion authority.",
-    ko: "구도 권한을 선택한 대상에만 적용합니다. 샷 전체 카메라 범위는 카메라 / 구도를 선택하세요. 색·라이팅·정체성·모션 권한은 없습니다.",
+  bg_Scale: Object.freeze({
+    en: "Measurement-only background size and placement against the actual character/Character Prop. Use an individual background target or bg_all. Never copy color, lighting, objects, pixels, or pictorial content from the sheet.",
+    ko: "실제 캐릭터·캐릭터 프랍 대비 배경 크기와 배치만 측정합니다. 개별 대상 또는 bg_all을 사용합니다. 시트의 색·조명·오브젝트·픽셀·그림 내용은 절대 복제하지 않습니다.",
   }),
-  "Scale / Composition": Object.freeze({
-    en: "Scale and composition apply only to the selected Target; choose Camera / Composition for shot-wide camera scope. No color, material, lighting, identity or motion authority.",
-    ko: "스케일과 구도를 선택한 대상에만 적용합니다. 샷 전체 카메라 범위는 카메라 / 구도를 선택하세요. 색·재질·라이팅·정체성·모션 권한은 없습니다.",
+  "ch_Scale / bg_Scale": Object.freeze({
+    en: "Measurement-only character/background relative size and background placement. Use an eligible individual target or ch_all / bg_all. The sheet itself is never renderable content.",
+    ko: "캐릭터와 배경의 상대 크기 및 배경 배치만 측정합니다. 허용된 개별 대상 또는 ch_all / bg_all을 사용합니다. 시트 자체는 절대 렌더 콘텐츠가 아닙니다.",
   }),
 });
 
@@ -319,6 +375,7 @@ const MANUAL_VIDEO_CONTEXT_IMAGE_FIELDS = Object.freeze([
   "image_main_type",
   "image_sub_type",
   "custom_source_type",
+  "look_custom_instruction",
   "color_picks",
   "binding_scopes",
   "binding_custom_scopes",
@@ -335,7 +392,7 @@ const HMB_UI_KO = {
   image_text_context: "장면 지시 · 정확 문자열",
   scene_level_notes: "장면 단위 메모",
   video_source_binding: "비디오 소스 연결",
-  video_vfx: "영상 작업 · 립싱크 · VFX",
+  video_vfx: "VFX",
   name: "이름",
   main_type: "주요 유형",
   target: "대상",
@@ -345,6 +402,7 @@ const HMB_UI_KO = {
   keep_out: "제외 항목",
   custom_main_type: "사용자 지정 주요 유형 입력",
   custom_scope: "사용자 지정 범위 입력",
+  custom_look_instruction: "영향 속성과 적용 범위를 직접 작성: 대상 이름(예: Hero 조명만) 또는 장면 전체를 명시하세요.",
   custom_video_type: "사용자 지정 비디오 유형 입력",
   custom_video_role: "사용자 지정 비디오 세부 유형 입력",
   blank_target: "— 빈칸 / 대상 없음 —",
@@ -399,8 +457,9 @@ const HMB_OPTION_KO = {
   "Lighting / Atmosphere": "조명 / 분위기",
   "Render Look": "렌더 룩",
   "Color / Look / Lighting": "색감 / 룩 / 조명",
-  "Scale": "크기",
-  "Scale / Composition": "크기 / 구도",
+  "ch_Scale": "캐릭터 상대 크기",
+  "bg_Scale": "배경 상대 크기 / 배치",
+  "ch_Scale / bg_Scale": "캐릭터 / 배경 상대 크기 / 배치",
   "Role Required / Select Source Type": "소스 유형 선택 (선택 사항)",
   "Ignore / Unused": "무시 / 사용 안 함",
   "Character Appearance": "캐릭터 외형",
@@ -414,7 +473,7 @@ const HMB_OPTION_KO = {
   "Color / Look Reference": "색감 / 룩 참조",
   "Color + Look + Lighting Mood Reference": "색감 + 룩 + 조명 분위기 참조",
   "Lighting / Atmosphere Reference": "조명 / 분위기 참조",
-  "Scale / Composition Reference": "크기 / 구도 참조",
+  "Relative Size Reference": "상대 크기 참조",
   "Custom": "사용자 지정",
   "Camera / Composition": "카메라 / 구도",
   "Global Look": "전체 룩",
@@ -441,9 +500,9 @@ const HMB_OPTION_KO = {
   "Lighting mood only": "조명 분위기만",
   "Render look only": "렌더 룩만",
   "All color + look + lighting functions": "색감 + 룩 + 조명 전체",
-  "Scale only": "크기만",
-  "Scale + composition": "크기 + 구도",
-  "Composition only": "구도만",
+  "Character Relative Size Only": "캐릭터 상대 크기만",
+  "Background Relative Size / Placement Only": "배경 상대 크기 / 배치만",
+  "Character / Background Relative Size / Placement Only": "캐릭터 / 배경 상대 크기 / 배치만",
   "Custom scope": "사용자 지정 범위",
   "Role Required / Select Video Type": "비디오 유형 선택 (선택 사항)",
   "Maya Preview / Playblast": "Maya 프리뷰 / 플레이블라스트",
@@ -463,7 +522,7 @@ const HMB_OPTION_KO = {
   "Secondary Motion Only": "유기적 모션 세부",
   "Spatial Alignment Verification Only": "공간 정렬 검증만",
   "Derived Motion Decoding Only": "파생 모션 디코딩만",
-  "FX Behavior Only": "FX 동작만",
+  "FX Effect Only": "FX 효과만",
   "Lighting / Look Only": "조명 / 룩만",
   "Local Composition Check Only": "부분 구도 확인만",
   "Mask / Guide Only": "마스크 / 가이드만",
@@ -485,9 +544,6 @@ const HMB_OPTION_KO = {
   "Depth / Spatial": "뎁스 / 공간",
   "Lighting / Look": "라이팅 / 룩",
   "Composition": "구도",
-  "Explosion": "폭발",
-  "Dust": "먼지",
-  "Particle": "파티클",
   "Context": "참고 전용",
   "Custom": "사용자 지정",
   "Red": "빨강",
@@ -510,7 +566,7 @@ const HMB_TEXT_KO = {
   PROJECT_STYLE_LOOK: ["프로젝트 / 시퀀스 시각 방향", "프로젝트 공통 렌더 언어, 품질 기준, 스타일과 룩 연속성만 입력합니다. 대상 정체성이나 개별 장면 사실을 여기서 재정의하지 마세요."],
   SCENE_CONTEXT: ["샷 장면 / 서사 사실", "장소, 시간대, 날씨, 사건, 관계와 실제로 무엇이 일어나는지 입력합니다. 룩·연기·카메라·효과는 각 전용 항목에 입력하세요."],
   EMOTION_INTENT: ["대상 연기 / 감정", "대상을 명시한 뒤 감정, 연기 톤, 긴장, 관계의 서브텍스트와 서사 의도를 입력합니다. 립싱크·카메라·VFX를 자동 실행하지 않습니다."],
-  VIDEO_VFX: ["영상 작업 / 립싱크 / VFX", "대상·에미터, 입력 영상·오디오, 시간 범위, 동작·립싱크 타이밍, FX 경로, 시작·정점·감쇠, 가림·그림자·반사·환경 반응을 입력합니다. 정확한 발화문은 ‘정확 문자열’에 입력하세요."],
+  VIDEO_VFX: ["영상 작업 / 립싱크 / VFX", ""],
   PRESERVED_TEXT: ["정확히 보존할 문자열 (텍스트 전용)", "한 줄에 하나씩 [Proper Noun], [Dialogue], [Lip-sync Transcript], [Lyrics], [Chant], [On-screen Text] 뒤에 정확한 원문을 입력합니다. 철자와 문장부호만 보존하며 미디어 작업을 자동 실행하지 않습니다. 기존 [Lip-sync Speech]도 변경 없이 호환됩니다."],
 };
 
@@ -525,7 +581,10 @@ function uiText(state, key, english) {
 
 function optionLabel(value, state) {
   const text = String(value == null ? "" : value);
-  if (uiLanguage(state) !== "ko") {
+  const language = uiLanguage(state);
+  const taxonomyLabel = clean(IMAGE_TAXONOMY_LABELS?.[language]?.[text]);
+  if (taxonomyLabel) return taxonomyLabel;
+  if (language !== "ko") {
     if (text === "Role Required / Select Source Type") return "Select Source Type (Optional)";
     if (text === "Role Required / Select Video Type") return "Select Video Type (Optional)";
     return text;
@@ -567,7 +626,7 @@ function defaultImage(slot) {
     source_type: "Role Required / Select Source Type",
     custom_source_type: "",
     owner: "",
-    legacy_relationship_targets: [],
+    look_custom_instruction: "",
     scope: "",
     binding_scopes: [""],
     binding_custom_scopes: [""],
@@ -776,6 +835,15 @@ function normalizePickerAutoDepth(value) {
       assigned: pickerAutoDepthFieldValue(field, entry.assigned),
       previous: pickerAutoDepthFieldValue(field, entry.previous),
     };
+  });
+  ["assigned", "previous"].forEach((side) => {
+    if (!fields.video_main_type || !fields.video_sub_type) return;
+    const canonicalPair = migrateVideoTaxonomyPlacement(
+      fields.video_main_type[side],
+      fields.video_sub_type[side],
+    );
+    fields.video_main_type[side] = canonicalPair[0];
+    fields.video_sub_type[side] = canonicalPair[1];
   });
   if (!Object.keys(fields).length) return {};
   return {
@@ -1298,83 +1366,96 @@ function isKnownColorPick(value) {
 }
 
 function applyImageTaxonomy(input) {
-  const taxonomy = input && typeof input.image_taxonomy === "object"
+  const candidateTaxonomy = input && typeof input.image_taxonomy === "object"
     ? input.image_taxonomy
     : {};
-  const firstImage = input && Array.isArray(input.images) && input.images[0]
-    && typeof input.images[0] === "object"
-    ? input.images[0]
-    : {};
+  let taxonomy = (
+    candidateTaxonomy.schema === IMAGE_TAXONOMY_SCHEMA
+    && Number(candidateTaxonomy.version) === IMAGE_TAXONOMY_VERSION
+  ) ? candidateTaxonomy : {};
   const uniqueStrings = (value) => Array.isArray(value)
     ? [...new Set(value.map((item) => String(item == null ? "" : item)).filter((item, index) => item || index === 0))]
     : [];
-
-  const sourceTypes = uniqueStrings(
-    taxonomy.source_type_choices || firstImage.source_type_choices,
-  );
-  const mainTypes = uniqueStrings(
-    taxonomy.image_main_type_choices || firstImage.image_main_type_choices,
-  );
-  if (mainTypes.length) IMAGE_MAIN_TYPES = mainTypes;
-  const rawSubTypes = taxonomy.image_sub_type_choices || firstImage.image_sub_type_choices;
+  const mainTypes = uniqueStrings(taxonomy.image_main_type_choices);
+  const rawSubTypes = taxonomy.image_sub_type_choices;
+  const semanticPairs = Array.isArray(taxonomy.semantic_pairs)
+    ? taxonomy.semantic_pairs
+    : [];
+  const mappedSubTypes = {};
   if (rawSubTypes && typeof rawSubTypes === "object" && !Array.isArray(rawSubTypes)) {
-    const mapped = {};
     Object.entries(rawSubTypes).forEach(([key, values]) => {
-      const choices = uniqueStrings(values);
-      if (choices.length) mapped[String(key)] = choices;
+      const choices = uniqueStrings(values).filter(Boolean);
+      if (choices.length) mappedSubTypes[clean(key)] = choices;
     });
-    if (Object.keys(mapped).length) IMAGE_SUB_TYPES = mapped;
   }
-  const scopes = uniqueStrings(taxonomy.scope_choices || firstImage.scope_choices);
-  if (sourceTypes.length) IMAGE_SOURCE_TYPES = sourceTypes;
-  if (scopes.length) IMAGE_SCOPES = scopes;
-
-  const rawMap = taxonomy.scope_choices_by_source_type;
-  if (rawMap && typeof rawMap === "object" && !Array.isArray(rawMap)) {
-    const mapped = {};
-    Object.entries(rawMap).forEach(([key, values]) => {
-      const choices = uniqueStrings(values);
-      if (choices.length) mapped[String(key)] = choices;
-    });
-    if (Object.keys(mapped).length) IMAGE_SCOPES_BY_SOURCE_TYPE = mapped;
+  const selectableMainCount = Math.max(0, mainTypes.length - 1);
+  const subTypeCount = Object.values(mappedSubTypes)
+    .reduce((total, values) => total + values.length, 0);
+  const pairMap = {};
+  semanticPairs.forEach((pair) => {
+    if (!pair || typeof pair !== "object") return;
+    const mainType = clean(pair.main_type);
+    const subType = clean(pair.sub_type);
+    const sourceType = clean(pair.source_type);
+    const scope = clean(pair.scope);
+    if (!mainType || !subType || !sourceType) return;
+    pairMap[`${mainType}\u0000${subType}`] = [sourceType, scope];
+  });
+  const pairKeys = Object.entries(mappedSubTypes)
+    .flatMap(([mainType, values]) => values.map((subType) => `${mainType}\u0000${subType}`));
+  const contractValid = (
+    mainTypes[0] === "Select Image Main Type"
+    && Number(taxonomy.main_type_count) === selectableMainCount
+    && Number(taxonomy.sub_type_count) === subTypeCount
+    && Number(taxonomy.pair_count) === pairKeys.length
+    && Object.keys(pairMap).length === pairKeys.length
+    && pairKeys.every((key) => Array.isArray(pairMap[key]))
+  );
+  if (!contractValid) taxonomy = {};
+  else {
+    IMAGE_MAIN_TYPES = mainTypes;
+    IMAGE_SUB_TYPES = mappedSubTypes;
+    IMAGE_TAXONOMY_WIRE_MAP = Object.freeze(pairMap);
+    const rawLabels = taxonomy.labels;
+    IMAGE_TAXONOMY_LABELS = rawLabels && typeof rawLabels === "object"
+      ? {
+          en: { ...(rawLabels.en && typeof rawLabels.en === "object" ? rawLabels.en : {}) },
+          ko: { ...(rawLabels.ko && typeof rawLabels.ko === "object" ? rawLabels.ko : {}) },
+        }
+      : { en: {}, ko: {} };
   }
 
+  // Palettes are display data within the same versioned Main/Sub contract.
   const actorColors = uniqueStrings(taxonomy.actor_color_pick_choices);
   const objectColors = uniqueStrings(taxonomy.object_color_pick_choices);
-  const actorTypes = uniqueStrings(taxonomy.actor_color_pick_source_types);
-  const objectTypes = uniqueStrings(taxonomy.object_color_pick_source_types);
   if (actorColors.length) ACTOR_COLOR_PICK_CHOICES = actorColors;
   if (objectColors.length) OBJECT_COLOR_PICK_CHOICES = objectColors;
-  if (actorTypes.length) ACTOR_COLOR_PICK_SOURCE_TYPES = new Set(actorTypes);
-  if (objectTypes.length) OBJECT_COLOR_PICK_SOURCE_TYPES = new Set(objectTypes);
   COLOR_PICK_CHOICES = [...new Set([
     ...ACTOR_COLOR_PICK_CHOICES,
     ...OBJECT_COLOR_PICK_CHOICES,
   ])];
 
   return {
+    schema: IMAGE_TAXONOMY_SCHEMA,
+    version: IMAGE_TAXONOMY_VERSION,
+    main_type_count: Math.max(0, IMAGE_MAIN_TYPES.length - 1),
+    sub_type_count: Object.values(IMAGE_SUB_TYPES).reduce((sum, values) => sum + values.length, 0),
+    pair_count: Object.keys(IMAGE_TAXONOMY_WIRE_MAP).length,
     image_main_type_choices: [...IMAGE_MAIN_TYPES],
     image_sub_type_choices: Object.fromEntries(
       Object.entries(IMAGE_SUB_TYPES).map(([key, values]) => [key, [...values]]),
     ),
-    source_type_choices: [...IMAGE_SOURCE_TYPES],
-    scope_choices: [...IMAGE_SCOPES],
-    scope_choices_by_source_type: Object.fromEntries(
-      Object.entries(IMAGE_SCOPES_BY_SOURCE_TYPE).map(([key, values]) => [key, [...values]]),
-    ),
+    semantic_pairs: Object.entries(IMAGE_TAXONOMY_WIRE_MAP).map(([key, value]) => {
+      const [mainType, subType] = key.split("\u0000");
+      return { main_type: mainType, sub_type: subType, source_type: value[0], scope: value[1] };
+    }),
+    labels: {
+      en: { ...IMAGE_TAXONOMY_LABELS.en },
+      ko: { ...IMAGE_TAXONOMY_LABELS.ko },
+    },
     actor_color_pick_choices: [...ACTOR_COLOR_PICK_CHOICES],
     object_color_pick_choices: [...OBJECT_COLOR_PICK_CHOICES],
-    actor_color_pick_source_types: [...ACTOR_COLOR_PICK_SOURCE_TYPES],
-    object_color_pick_source_types: [...OBJECT_COLOR_PICK_SOURCE_TYPES],
   };
-}
-
-export function colorPickChoicesForSourceType(sourceType) {
-  const value = clean(sourceType);
-  if (ACTOR_COLOR_PICK_SOURCE_TYPES.has(value)) return [...ACTOR_COLOR_PICK_CHOICES];
-  if (OBJECT_COLOR_PICK_SOURCE_TYPES.has(value)) return [...OBJECT_COLOR_PICK_CHOICES];
-  if (value === "Custom") return [...COLOR_PICK_CHOICES];
-  return [];
 }
 
 export function colorPickChoicesForImageTaxonomy(mainType, subType = "") {
@@ -1407,6 +1488,25 @@ export function normalizeImageTaxonomy(item) {
   }
   item.image_main_type = mainType;
   item.image_sub_type = subType;
+  const candidateMainType = clean(item.asset_image_main_type_candidate);
+  const candidateSubType = clean(item.asset_image_sub_type_candidate);
+  if (candidateMainType || candidateSubType) {
+    const candidateWirePair = IMAGE_TAXONOMY_WIRE_MAP[`${candidateMainType}\u0000${candidateSubType}`] || null;
+    if (!candidateWirePair) {
+      item.asset_image_main_type_candidate = "";
+      item.asset_image_sub_type_candidate = "";
+      item.asset_source_type_candidate = "";
+      item.asset_scope_candidate = "";
+      item.asset_color_pick_candidates = [];
+      item.asset_default_target = "";
+      item.asset_verified = false;
+    } else {
+      item.asset_image_main_type_candidate = candidateMainType;
+      item.asset_image_sub_type_candidate = candidateSubType;
+      item.asset_source_type_candidate = candidateWirePair[0];
+      item.asset_scope_candidate = candidateWirePair[1];
+    }
+  }
   const wirePair = IMAGE_TAXONOMY_WIRE_MAP[`${mainType}\u0000${subType}`] || null;
   if (!wirePair) {
     item.source_type = "Role Required / Select Source Type";
@@ -1415,9 +1515,7 @@ export function normalizeImageTaxonomy(item) {
     item.binding_custom_scopes = [""];
     item.color_picks = [""];
     item.owner = "";
-    item.interaction_targets = [""];
-    item.interaction_custom_targets = [""];
-    item.legacy_relationship_targets = [];
+    item.look_custom_instruction = "";
     item.custom_source_type = "";
     item.picker_auto_color = "";
     item.picker_auto_video = 0;
@@ -1427,16 +1525,38 @@ export function normalizeImageTaxonomy(item) {
   const [sourceType, scope] = wirePair;
   item.source_type = sourceType;
   item.scope = scope;
-  if (!(mainType === "Custom / Context" && subType === "Custom")) {
+  if (mainType === "Custom / Context" && subType === "Context") {
+    item.custom_source_type = "Context Reference";
+  } else if (!(mainType === "Custom / Context" && subType === "Custom")) {
     item.custom_source_type = "";
   }
-  if (mainType === "Look Reference") {
-    item.interaction_targets = [""];
-    item.interaction_custom_targets = [""];
-    item.legacy_relationship_targets = [];
+  const scaleDefaultTarget = IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS[subType] || "";
+  if (IMAGE_GLOBAL_SCOPE_LOOK_REFERENCE_SUB_TYPES.has(subType)) {
+    item.owner = imageTargetKey(item.owner) === imageTargetKey(IMAGE_CUSTOM_LOOK_TARGET)
+      ? IMAGE_CUSTOM_LOOK_TARGET
+      : IMAGE_GLOBAL_LOOK_TARGET;
+    item.look_custom_instruction = clean(item.look_custom_instruction).slice(0, MAX_DESCRIPTION_CHARS);
+    item.asset_default_target = IMAGE_GLOBAL_LOOK_TARGET;
+  } else if (IMAGE_GENERAL_LOOK_REFERENCE_SUB_TYPES.has(subType)) {
+    if (isForbiddenGeneralLookSystemTarget(item.owner)) {
+      item.owner = "";
+    } else if (imageTargetKey(item.owner) === imageTargetKey(IMAGE_GLOBAL_LOOK_TARGET)) {
+      item.owner = IMAGE_GLOBAL_LOOK_TARGET;
+    }
+    item.look_custom_instruction = "";
+    item.asset_default_target = "";
+  } else if (scaleDefaultTarget) {
+    const currentTarget = clean(item.owner);
+    if (!currentTarget || (isImageSystemTarget(currentTarget) && currentTarget !== scaleDefaultTarget)) {
+      item.owner = scaleDefaultTarget;
+    }
+    item.asset_default_target = scaleDefaultTarget;
+    item.look_custom_instruction = "";
+  } else {
+    item.look_custom_instruction = "";
   }
-  // Main/Sub taxonomy already supplies environment authority. Migrate only
-  // the former generated system Target; user-authored named targets survive.
+  // Main/Sub taxonomy already supplies environment authority. Remove the
+  // redundant system Target while preserving authored named targets.
   if (
     ["Environment / Background", "Sky / Exterior Background", "Set / Structure", "Foreground / Ground"].includes(sourceType)
     && clean(item.owner) === "Scene / Environment"
@@ -1477,6 +1597,7 @@ const VIDEO_ROLE_ALIASES = {
   "Motion Only": "Local Motion Detail Only",
   "Camera / Layout / Depth Only": "Spatial Alignment Verification Only",
   "Composition Reference Only": "Local Composition Check Only",
+  "FX Behavior Only": "FX Effect Only",
 };
 
 function canonicalVideoRole(value) {
@@ -1490,8 +1611,10 @@ function videoTaxonomyWirePair(mainType, subType) {
 
 export function normalizeVideoTaxonomy(item) {
   if (!item || typeof item !== "object") return ["Select Video Main Type", ""];
-  let mainType = clean(item.video_main_type);
-  let subType = clean(item.video_sub_type);
+  let [mainType, subType] = migrateVideoTaxonomyPlacement(
+    item.video_main_type,
+    item.video_sub_type,
+  );
   const subTypes = Array.isArray(VIDEO_SUB_TYPES[mainType]) ? VIDEO_SUB_TYPES[mainType] : [];
   if (!VIDEO_MAIN_TYPES.includes(mainType) || mainType === "Select Video Main Type" || !subTypes.includes(subType)) {
     mainType = "Select Video Main Type";
@@ -1925,39 +2048,11 @@ export function frameRangeUiStatus(state, item) {
   };
 }
 
-function legacyRelationshipTargets(item) {
-  const preservedValue = item && item.legacy_relationship_targets;
-  const preserved = Array.isArray(preservedValue)
-    ? preservedValue
-    : (typeof preservedValue === "string" && clean(preservedValue) ? [preservedValue] : []);
-  const rawValue = item && (item.interaction_targets || item.interaction_target || item.interactionTarget);
-  const raw = Array.isArray(rawValue) ? rawValue : (typeof rawValue === "string" && clean(rawValue) ? [rawValue] : []);
-  const customValue = item && item.interaction_custom_targets;
-  const customs = Array.isArray(customValue) ? customValue : (typeof customValue === "string" && clean(customValue) ? [customValue] : []);
-  const out = uniqueList(preserved.map(clean).filter(Boolean));
-  raw.forEach((value, index) => {
-    const target = clean(clean(value) === "Custom" ? customs[index] : value);
-    if (target && !out.includes(target)) out.push(target);
-  });
-  return out;
-}
-
-function migrateTargetAuthority(item, scopes) {
-  let owner = clean(item && item.owner);
-  if (owner === "Custom") owner = clean(item && (item.custom_owner || item.custom_target));
-  const relationshipScopes = ["Handheld prop", "Attached accessory", "Interactive scene prop"];
-  if (!owner && (scopes || []).some((scope) => relationshipScopes.includes(clean(scope)))) {
-    const legacyTargets = legacyRelationshipTargets(item);
-    if (legacyTargets.length === 1) owner = legacyTargets[0];
-  }
-  return owner;
-}
-
 function normalizeImageBindingFields(item, videoCount = MAX_VIDEOS) {
   if (!item || typeof item !== "object") return item;
   normalizeImageTaxonomy(item);
   const picks = normalizeColorPicks(item.color_picks);
-  const rawScopes = item.binding_scopes != null ? item.binding_scopes : (item.sub_types != null ? item.sub_types : item.subtypes);
+  const rawScopes = item.binding_scopes;
   let scopes = normalizeBindingScopes(rawScopes, item.scope, picks.length);
   const count = Math.max(1, Math.min(MAX_COLOR_PICKS, Math.max(picks.length, scopes.length)));
   while (picks.length < count) picks.push("");
@@ -2066,8 +2161,14 @@ export function hmbImagePickerActionAvailability(state, item) {
   };
 }
 
-function editableVideoSlotChoices() {
-  return Array.from({ length: MAX_VIDEOS }, (_item, index) => String(index + 1));
+export function hmbPromptVideoBindingSlotSelection(state, current) {
+  const choices = activeVideoSlotChoices(state);
+  const savedValue = String(normalizeMarkerVideo(current, MAX_VIDEOS));
+  const value = choices.includes(savedValue) ? savedValue : "";
+  return {
+    choices: value ? choices : ["", ...choices],
+    value,
+  };
 }
 
 function resetImagesBoundToInactiveVideos(images, videos) {
@@ -2135,33 +2236,7 @@ function enforceColorPickUniquenessByVideo(images, videoCount) {
   return images;
 }
 
-function resetImageVideoBindingToPrimary(item, videoCount = MAX_VIDEOS) {
-  if (!item || typeof item !== "object") return item;
-  // Compatibility hook: a temporarily unavailable video must not erase or
-  // redirect a user-authored binding.
-  normalizeImageBindingFields(item, MAX_VIDEOS);
-  return item;
-}
-
-function resetImageBindingsMatchingVideo(item, shouldReset, videoCount = MAX_VIDEOS) {
-  if (!item || typeof item !== "object") return false;
-  // Compatibility hook retained for older controller call sites. Bindings to
-  // hidden/removed slots remain dormant and can become active again later.
-  normalizeImageBindingFields(item, MAX_VIDEOS);
-  return false;
-}
-
-function resetImagesBoundToVideoSlot(state, removedSlot) {
-  // Preserve dormant user intent when a video is hidden, renamed, ignored, or
-  // removed. UI availability follows active slots; stored addresses do not.
-  (state && Array.isArray(state.images) ? state.images : []).forEach((item) => {
-    if (!item || typeof item !== "object") return;
-    normalizeImageBindingFields(item, MAX_VIDEOS);
-  });
-  enforceColorPickUniquenessByVideo(state && state.images, MAX_VIDEOS);
-}
-
-function migrateImage(item, slot) {
+function normalizeImage(item, slot) {
   const out = defaultImage(slot);
   if (!item || typeof item !== "object") return hmbPromptCarrySourceIdentity(null, out, "image");
   out.label = clean(item.label || item.name_override || item.description);
@@ -2191,21 +2266,16 @@ function migrateImage(item, slot) {
   out.image_main_type = clean(item.image_main_type);
   out.image_sub_type = clean(item.image_sub_type);
   out.source_type = clean(item.source_type) || out.source_type;
-  out.custom_source_type = clean(item.custom_source_type || item.custom_main_type);
+  out.custom_source_type = clean(item.custom_source_type);
+  out.look_custom_instruction = clean(item.look_custom_instruction).slice(0, MAX_DESCRIPTION_CHARS);
   out.scope = clean(item.scope);
   out.color_picks = normalizeColorPicks(item.color_picks || item.colorPick || item.color_pick || item.color || item.preview_color);
   out.binding_custom_scopes = normalizeParallelTextList(item.binding_custom_scopes || item.custom_scopes, out.color_picks.length, MAX_COLOR_PICKS);
   const legacyVideoSlots = normalizeBindingVideoSlots(item.binding_video_slots, item.marker_video || item.color_video || item.video_slot || item.video_number || item.video_pick, out.color_picks.length, MAX_VIDEOS);
   out.binding_video_slots = legacyVideoSlots;
   out.marker_video = legacyVideoSlots[0];
-  const rawBindingScopes = item.binding_scopes != null ? item.binding_scopes : (item.sub_types != null ? item.sub_types : item.subtypes);
-  const migrationScopes = normalizeBindingScopes(rawBindingScopes, out.scope, out.color_picks.length);
-  const migrationPrimaryScope = verifiedRegisteredSubtype(out)
-    || clean(migrationScopes[0])
-    || clean(out.scope)
-    || clean(migrationScopes.find((scope) => Boolean(clean(scope))) || "");
-  out.owner = migrateTargetAuthority(item, [migrationPrimaryScope]);
-  out.legacy_relationship_targets = legacyRelationshipTargets(item);
+  const rawBindingScopes = item.binding_scopes;
+  out.owner = clean(item.owner);
   out.preview_marker = clean(item.preview_marker || item.target_marker || item.replacement_target);
   out.picker_auto_color = clean(item.picker_auto_color);
   out.picker_auto_video = Number(item.picker_auto_video) || 0;
@@ -2224,41 +2294,6 @@ function migrateImage(item, slot) {
   );
   out.manual = item.manual !== false;
 
-  const oldRole = clean(item.role);
-  if (oldRole && !item.source_type) {
-    const m = oldRole.match(/^Subject\s+(\d+)\s+Appearance$/);
-    if (m) {
-      out.source_type = "Character Appearance";
-      out.owner = `Subject ${Number(m[1])}`;
-      out.scope = "Full body / full appearance";
-    } else if (oldRole === "Environment / Background") {
-      out.source_type = "Environment / Background";
-      out.scope = "Main background";
-    } else if (oldRole === "Lighting / Atmosphere") {
-      out.source_type = "Lighting / Atmosphere Reference";
-      out.owner = "Global Look";
-      out.scope = "Lighting mood only";
-    } else if (oldRole === "Scene Scale / Composition") {
-      out.source_type = "Scale / Composition Reference";
-      out.owner = "Camera / Composition";
-      out.scope = "Composition only";
-    } else if (oldRole === "Prop / Set Reference") {
-      out.source_type = "Prop / Accessory";
-      out.scope = "Custom scope";
-    } else if (oldRole === "Color / Look Reference") {
-      out.source_type = "Color / Look Reference";
-      out.owner = "Global Look";
-      out.scope = "Render look only";
-    } else if (oldRole === "Ignore / Unused") {
-      out.source_type = "Ignore / Unused";
-    }
-  }
-  if (IMAGE_SOURCE_TYPES.length && !IMAGE_SOURCE_TYPES.includes(out.source_type)) {
-    const unknownSourceType = out.source_type;
-    out.source_type = "Custom";
-    out.custom_source_type = uniqueList([unknownSourceType, out.custom_source_type].filter(Boolean)).join(" | ");
-  }
-  if (subjectNumberFromOwner(out.owner)) out.owner = `image ${subjectNumberFromOwner(out.owner)}`;
   out.binding_scopes = normalizeBindingScopes(rawBindingScopes, out.scope, out.color_picks.length);
   normalizeImageBindingFields(out, MAX_VIDEOS);
   return hmbPromptCarrySourceIdentity(item, out, "image");
@@ -2293,8 +2328,11 @@ function migrateVideo(item, slot) {
     item.description,
   );
   out.picker_auto_label = clean(item.picker_auto_label);
-  out.picker_auto_video_main_type = clean(item.picker_auto_video_main_type);
-  out.picker_auto_video_sub_type = clean(item.picker_auto_video_sub_type);
+  [out.picker_auto_video_main_type, out.picker_auto_video_sub_type] =
+    migrateVideoTaxonomyPlacement(
+      item.picker_auto_video_main_type,
+      item.picker_auto_video_sub_type,
+    );
   out.picker_auto_depth = normalizePickerAutoDepth(item.picker_auto_depth);
   out.picker_auto_motion_guide = normalizePickerAutoMotionGuide(
     item.picker_auto_motion_guide,
@@ -2388,7 +2426,6 @@ function hasImageMeaning(item) {
     || !["", "Role Required / Select Source Type"].includes(clean(item.source_type))
     || clean(item.custom_source_type)
     || clean(item.owner)
-    || (item.legacy_relationship_targets || []).some((value) => clean(value))
     || (item.binding_scopes || []).some((value) => clean(value))
     || (item.binding_custom_scopes || []).some((value) => clean(value))
     || (item.color_picks || []).some((value) => clean(value))
@@ -2399,7 +2436,7 @@ function hasImageMeaning(item) {
 
 function normalizeRows(rows, kind, maxCount) {
   const source = Array.isArray(rows) ? rows.slice(0, maxCount) : [];
-  const migrated = source.map((item, idx) => kind === "image" ? migrateImage(item, idx + 1) : migrateVideo(item, idx + 1));
+  const migrated = source.map((item, idx) => kind === "image" ? normalizeImage(item, idx + 1) : migrateVideo(item, idx + 1));
   if (!migrated.length) {
     if (kind === "image") migrated.push(defaultImage(1), defaultImage(2), defaultImage(3), defaultImage(4));
     else migrated.push(defaultVideo(1));
@@ -2430,7 +2467,7 @@ function normalizeRows(rows, kind, maxCount) {
   const visibleCount = Math.max(1, Math.min(maxCount, migrated.length));
   const out = [];
   for (let i = 1; i <= visibleCount; i += 1) {
-    const row = migrateImage(migrated[i - 1] || {}, i);
+    const row = normalizeImage(migrated[i - 1] || {}, i);
     row.slot = i;
     row.token = `@image${i}`;
     row.name = `IMAGE_${String(i).padStart(2, "0")}`;
@@ -2483,7 +2520,7 @@ function normalizeDormantImageRows(value, assetRows = false) {
   const limit = assetRows ? MAX_IMAGES * 4 : MAX_IMAGES;
   return value.slice(0, limit).flatMap((raw, index) => {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
-    const row = migrateImage(raw, index + 1);
+    const row = normalizeImage(raw, index + 1);
     row.manual = true;
     if (assetRows) {
       if (!clean(row.asset_source_uid || row.asset_library_id)) return [];
@@ -2664,10 +2701,14 @@ function normalizeManualVideoContextImageFields(value, index) {
     source.frame_range_bindings,
     source.frame_range_binding,
   );
-  const normalizedItem = migrateImage({
+  const normalizedItem = normalizeImage({
     image_main_type: boundedClean(source.image_main_type),
     image_sub_type: boundedClean(source.image_sub_type),
     custom_source_type: boundedClean(source.custom_source_type),
+    look_custom_instruction: boundedClean(
+      source.look_custom_instruction,
+      MAX_DESCRIPTION_CHARS,
+    ),
     color_picks: colorPicks,
     binding_scopes: bindingScopes,
     binding_custom_scopes: bindingCustomScopes,
@@ -2701,6 +2742,10 @@ function normalizeManualVideoContextImageFields(value, index) {
     image_main_type: boundedClean(normalizedItem.image_main_type),
     image_sub_type: boundedClean(normalizedItem.image_sub_type),
     custom_source_type: boundedClean(normalizedItem.custom_source_type),
+    look_custom_instruction: boundedClean(
+      normalizedItem.look_custom_instruction,
+      MAX_DESCRIPTION_CHARS,
+    ),
     color_picks: normalizedItem.color_picks.map((item) => boundedClean(item)).slice(0, MAX_COLOR_PICKS),
     binding_scopes: normalizedItem.binding_scopes.map((item) => boundedClean(item)).slice(0, MAX_COLOR_PICKS),
     binding_custom_scopes: normalizedItem.binding_custom_scopes.map((item) => boundedClean(item)).slice(0, MAX_COLOR_PICKS),
@@ -3011,6 +3056,8 @@ export function normalizeState(input) {
   enforceSingleActiveVideoUnified(videos);
   const imageReset = resetImagesBoundToInactiveVideos(normalizeRows(input && input.images, "image", MAX_IMAGES), videos);
   const images = enforceColorPickUniquenessByVideo(imageReset.images, videos.length);
+  reconcileScaleReferenceTargets(images, input);
+  reconcileGeneralLookReferenceTargets(images, input);
   const imageAssetConnected = Boolean(input?.image_asset?.enabled);
   const activeImageCount = images.filter(
     (item) => isActiveImage(item) && (!imageAssetConnected || Boolean(item?.asset_managed)),
@@ -4372,6 +4419,7 @@ function hmbNextPromptUiEditRevision(container, state) {
 
 const HMB_PROMPT_IMAGE_UI_FIELDS = Object.freeze([
   "owner",
+  "look_custom_instruction",
   "color_picks",
   "binding_scopes",
   "binding_custom_scopes",
@@ -5401,17 +5449,9 @@ function renderColorPickControls(item, rowIndex, images, state) {
   return `<div class="video-color-pick-wrap"><div class="color-pick-stack">${item.color_picks.map((pick, pickIndex) => `<div class="color-binding-entry"><select class="source-select image-video-index binding-video-index" data-field="binding_video_slots" data-binding-index="${pickIndex}" title="${title}" aria-label="${title}">${videoNumberOptions(state, item.binding_video_slots[pickIndex])}</select><select class="source-select color-pick-select" data-field="color_picks" data-color-index="${pickIndex}" aria-label="${escapeHtml(uiText(state, "video_color_pick", "Video / Color Pick"))}">${colorPickOptions(images, rowIndex, pickIndex, count, state)}</select></div>`).join("")}</div></div>`;
 }
 
-function videoNumberChoices(current) {
-  const choices = editableVideoSlotChoices();
-  const savedValue = String(normalizeMarkerVideo(current, MAX_VIDEOS));
-  return uniqueList(choices.includes(savedValue)
-    ? choices
-    : [savedValue, ...choices]);
-}
-
 function videoNumberOptions(state, current) {
-  const savedValue = String(normalizeMarkerVideo(current, MAX_VIDEOS));
-  return options(videoNumberChoices(current), savedValue, "1", state);
+  const selection = hmbPromptVideoBindingSlotSelection(state, current);
+  return options(selection.choices, selection.value, "—", state);
 }
 
 function renderImageActions(item, state, index, imageCount) {
@@ -5578,11 +5618,6 @@ function renderVideoAddRow(videos, state) {
   return `<div class="source-row video video-add-row" data-kind="video-add"><div></div><div></div><div></div><div></div><div></div><div class="source-status"><div class="source-actions"><button class="add-video-source" ${canAdd ? "" : "disabled"} title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}">+</button></div></div></div>`;
 }
 
-function subjectNumberFromOwner(owner) {
-  const match = clean(owner).match(/^Subject\s+(\d+)$/);
-  return match ? Number(match[1]) : null;
-}
-
 function uniqueList(items) {
   const out = [];
   items.forEach((item) => {
@@ -5593,37 +5628,213 @@ function uniqueList(items) {
   return out;
 }
 
-function imageTargetLabel(item, _index) {
-  return clean(item && item.label);
+function uniqueTargetList(items) {
+  const out = [];
+  const seen = new Set();
+  (items || []).forEach((item) => {
+    const value = clean(item);
+    const key = imageTargetKey(value);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(value);
+  });
+  return out;
 }
 
-function imageTargetChoicesForRow(item, images) {
-  const dynamicTargets = (images || []).filter(isActiveImage).map((row, idx) => imageTargetLabel(row, idx)).filter(Boolean);
+function imageTargetLabel(item, _index) {
+  return clean(item && item.owner) || clean(item && item.label);
+}
+
+function targetCandidateRows(images, state) {
+  return (images || []).filter((row) => isActiveImageForState(row, state));
+}
+
+function renderableTargetDomains(images, state = null) {
+  const characterTargets = new Map();
+  const backgroundTargets = new Map();
+  targetCandidateRows(images, state).forEach((row, index) => {
+    const mainType = clean(row?.image_main_type);
+    const address = imageTargetLabel(row, index);
+    if (!address || isImageSystemTarget(address)) return;
+    const key = imageTargetKey(address);
+    if (["Character", "Character Prop"].includes(mainType)) {
+      if (!characterTargets.has(key)) characterTargets.set(key, address);
+    } else if (["Environment / Background", "Background Prop"].includes(mainType)) {
+      if (!backgroundTargets.has(key)) backgroundTargets.set(key, address);
+    }
+  });
+  const ambiguousTargetKeys = new Set(
+    [...characterTargets.keys()].filter((key) => backgroundTargets.has(key)),
+  );
+  ambiguousTargetKeys.forEach((key) => {
+    characterTargets.delete(key);
+    backgroundTargets.delete(key);
+  });
+  return { characterTargets, backgroundTargets, ambiguousTargetKeys };
+}
+
+function scaleReferenceTargetChoices(item, images, state = null) {
+  const subType = clean(item && item.image_sub_type);
+  const scaleDefaultTarget = IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS[subType] || "";
+  if (!scaleDefaultTarget) return null;
+  const { characterTargets, backgroundTargets } = renderableTargetDomains(images, state);
+  const eligibleTargets = subType === "ch_Scale"
+    ? [...characterTargets.values()]
+    : (subType === "bg_Scale"
+      ? [...backgroundTargets.values()]
+      : [...characterTargets.values(), ...backgroundTargets.values()]);
+  return uniqueTargetList([...eligibleTargets, scaleDefaultTarget]);
+}
+
+function reconcileScaleReferenceTargets(images, state = null) {
+  (images || []).forEach((item) => {
+    const choices = scaleReferenceTargetChoices(item, images, state);
+    if (!choices) return;
+    const choiceByKey = new Map(choices.map((choice) => [imageTargetKey(choice), choice]));
+    const canonicalChoice = choiceByKey.get(imageTargetKey(item && item.owner));
+    if (!canonicalChoice) {
+      item.owner = IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS[clean(item.image_sub_type)];
+    } else {
+      item.owner = canonicalChoice;
+    }
+  });
+  return images;
+}
+
+function generalLookNamedTargetChoices(images, state = null) {
+  const { characterTargets, backgroundTargets } = renderableTargetDomains(images, state);
+  return uniqueTargetList([
+    ...characterTargets.values(),
+    ...backgroundTargets.values(),
+  ]);
+}
+
+function isGlobalScopeLookReference(item) {
+  return IMAGE_GLOBAL_SCOPE_LOOK_REFERENCE_SUB_TYPES.has(
+    clean(item && item.image_sub_type),
+  );
+}
+
+function reconcileGeneralLookReferenceTargets(images, state = null) {
+  const { ambiguousTargetKeys } = renderableTargetDomains(images, state);
+  const eligibleTargets = new Map(
+    generalLookNamedTargetChoices(images, state)
+      .map((value) => [imageTargetKey(value), value]),
+  );
+  const activeNonTargets = new Set();
+  targetCandidateRows(images, state).forEach((row) => {
+    if (IMAGE_GENERAL_LOOK_NAMED_TARGET_MAIN_TYPES.has(clean(row?.image_main_type))) return;
+    const sourceAddress = clean(row?.label);
+    if (sourceAddress && !isImageSystemTarget(sourceAddress)) {
+      activeNonTargets.add(imageTargetKey(sourceAddress));
+    }
+  });
+  (images || []).forEach((item) => {
+    const subType = clean(item?.image_sub_type);
+    if (!IMAGE_GENERAL_LOOK_REFERENCE_SUB_TYPES.has(subType)) return;
+    if (IMAGE_GLOBAL_SCOPE_LOOK_REFERENCE_SUB_TYPES.has(subType)) {
+      item.owner = imageTargetKey(item?.owner) === imageTargetKey(IMAGE_CUSTOM_LOOK_TARGET)
+        ? IMAGE_CUSTOM_LOOK_TARGET
+        : IMAGE_GLOBAL_LOOK_TARGET;
+      return;
+    }
+    const currentTarget = clean(item?.owner);
+    if (isForbiddenGeneralLookSystemTarget(currentTarget)) {
+      item.owner = "";
+      return;
+    }
+    const currentTargetKey = imageTargetKey(currentTarget);
+    if (ambiguousTargetKeys.has(currentTargetKey)) {
+      item.owner = "";
+    } else if (eligibleTargets.has(currentTargetKey)) {
+      item.owner = eligibleTargets.get(currentTargetKey);
+    } else if (activeNonTargets.has(currentTargetKey)) {
+      item.owner = "";
+    }
+  });
+  return images;
+}
+
+export function imageTargetChoicesForRow(item, images, state = null) {
+  const dynamicTargets = uniqueTargetList(
+    targetCandidateRows(images, state)
+      .map((row, idx) => imageTargetLabel(row, idx))
+      .filter((value) => Boolean(value) && !isImageSystemTarget(value)),
+  );
+  const generalLookTargets = generalLookNamedTargetChoices(images, state);
   const sourceType = clean(item && item.source_type);
+  const scaleChoices = scaleReferenceTargetChoices(item, images, state);
+  if (scaleChoices) {
+    const scaleChoiceByKey = new Map(
+      scaleChoices.map((choice) => [imageTargetKey(choice), choice]),
+    );
+    const canonicalScaleChoice = scaleChoiceByKey.get(
+      imageTargetKey(item && item.owner),
+    );
+    if (!canonicalScaleChoice) {
+      item.owner = IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS[clean(item.image_sub_type)];
+    } else {
+      item.owner = canonicalScaleChoice;
+    }
+    return scaleChoices;
+  }
+  if (isGlobalScopeLookReference(item)) {
+    item.owner = imageTargetKey(item && item.owner) === imageTargetKey(IMAGE_CUSTOM_LOOK_TARGET)
+      ? IMAGE_CUSTOM_LOOK_TARGET
+      : IMAGE_GLOBAL_LOOK_TARGET;
+    return [...IMAGE_GLOBAL_SCOPE_LOOK_ALLOWED_TARGETS];
+  }
   let choices = ["", ...dynamicTargets];
   if (sourceType === "Ignore / Unused") {
     choices = ["", "None"];
   } else if (["Environment / Background", "Sky / Exterior Background", "Set / Structure", "Foreground / Ground"].includes(sourceType)) {
     choices = ["", ...dynamicTargets];
-  } else if (sourceType === "Scale / Composition Reference") {
-    choices = ["", ...dynamicTargets, "Camera / Composition"];
-  } else if (["Color / Look Reference", "Color + Look + Lighting Mood Reference", "Lighting / Atmosphere Reference"].includes(sourceType)) {
-    choices = ["", ...dynamicTargets, "Global Look"];
+  } else if (
+    IMAGE_GENERAL_LOOK_REFERENCE_SUB_TYPES.has(clean(item && item.image_sub_type))
+    || ["Color / Look Reference", "Color + Look + Lighting Mood Reference", "Lighting / Atmosphere Reference"].includes(sourceType)
+  ) {
+    const { ambiguousTargetKeys } = renderableTargetDomains(images, state);
+    if (
+      isForbiddenGeneralLookSystemTarget(item && item.owner)
+      || ambiguousTargetKeys.has(imageTargetKey(item && item.owner))
+    ) {
+      item.owner = "";
+    }
+    const generalTargetByKey = new Map(
+      generalLookTargets.map((target) => [imageTargetKey(target), target]),
+    );
+    const canonicalGeneralTarget = generalTargetByKey.get(
+      imageTargetKey(item && item.owner),
+    );
+    if (canonicalGeneralTarget) item.owner = canonicalGeneralTarget;
+    choices = [
+      "",
+      ...generalLookTargets,
+      "Global Look",
+    ];
   } else if (sourceType === "Custom") {
     choices = ["", ...dynamicTargets, "Camera / Composition", "Global Look"];
   }
   const currentTarget = clean(item && item.owner);
   if (currentTarget) choices.push(currentTarget);
-  return uniqueList(choices);
+  return uniqueTargetList(choices);
 }
 
 function targetSelectOptions(item, images, state) {
   return options(
-    imageTargetChoicesForRow(item, images),
+    imageTargetChoicesForRow(item, images, state),
     clean(item && item.owner),
     uiText(state, "blank_target", "— blank / no target —"),
     state
   );
+}
+
+function renderImageTargetControls(item, images, state) {
+  const customVisible = (
+    isGlobalScopeLookReference(item)
+    && imageTargetKey(item && item.owner) === imageTargetKey(IMAGE_CUSTOM_LOOK_TARGET)
+  );
+  return `<select class="source-select source-target-select" data-field="owner" data-hmb-base-disabled="0">${targetSelectOptions(item, images, state)}</select><textarea class="source-target-input custom-field-input look-custom-instruction ${customVisible ? "" : "is-hidden"}" data-field="look_custom_instruction" maxlength="${MAX_DESCRIPTION_CHARS}" rows="2" aria-hidden="${customVisible ? "false" : "true"}" placeholder="${escapeHtml(uiText(state, "custom_look_instruction", "Specify affected properties and scope: name a target (for example, Hero lighting only) or state scene-wide."))}">${escapeHtml(item.look_custom_instruction || "")}</textarea>`;
 }
 
 function refreshImageTargetControls(container, state) {
@@ -5636,26 +5847,24 @@ function refreshImageTargetControls(container, state) {
       if (!item || !select) return;
       hmbSyncSelectOptions(
         select,
-        imageTargetChoicesForRow(item, images),
+        imageTargetChoicesForRow(item, images, state),
         clean(item.owner),
         uiText(state, "blank_target", "— blank / no target —"),
         state,
       );
       select.disabled = false;
       select.setAttribute?.("data-hmb-base-disabled", "0");
+      const customInstruction = row.querySelector?.('[data-field="look_custom_instruction"]');
+      if (customInstruction) {
+        const customVisible = (
+          isGlobalScopeLookReference(item)
+          && imageTargetKey(item.owner) === imageTargetKey(IMAGE_CUSTOM_LOOK_TARGET)
+        );
+        hmbSetVisible(customInstruction, customVisible);
+        customInstruction.value = clean(item.look_custom_instruction);
+      }
     });
   } catch (_e) {}
-}
-
-function imageScopeChoicesForRow(item, currentValue) {
-  const sourceType = clean(item && item.source_type);
-  const current = clean(currentValue);
-  let choices = Array.isArray(IMAGE_SCOPES_BY_SOURCE_TYPE[sourceType])
-    ? [...IMAGE_SCOPES_BY_SOURCE_TYPE[sourceType]]
-    : [...IMAGE_SCOPES];
-  if (!choices.length) choices = [""];
-  if (current && !choices.includes(current)) choices.splice(Math.max(1, choices.length - 1), 0, current);
-  return uniqueList(choices);
 }
 
 function reconcileImageBindingAfterTypeChange(item, images) {
@@ -5770,11 +5979,12 @@ function hmbRefreshImageColorControls(container, state) {
     row.querySelectorAll?.('select[data-field="binding_video_slots"]').forEach((select) => {
       const bindingIndex = Number(select.getAttribute("data-binding-index") || 0);
       const videoSlot = item.binding_video_slots[bindingIndex];
+      const selection = hmbPromptVideoBindingSlotSelection(state, videoSlot);
       hmbSyncSelectOptions(
         select,
-        videoNumberChoices(videoSlot),
-        String(normalizeMarkerVideo(videoSlot, MAX_VIDEOS)),
-        "1",
+        selection.choices,
+        selection.value,
+        "—",
         state,
       );
       select.disabled = false;
@@ -5882,7 +6092,7 @@ function renderImageRow(item, index, images, state) {
     <div class="source-label image-name-cell"><input class="source-label-input" data-field="label" maxlength="${MAX_IDENTIFIER_CHARS}" value="${escapeHtml(item.label)}" placeholder="${escapeHtml(uiText(state, "name", "Name"))}" title="${escapeHtml(identityTitle)}" ${verifiedAsset ? "readonly" : ""}/></div>
     <div class="source-role image-main-type-cell"><select class="source-select" data-field="image_main_type" ${verifiedAsset ? "disabled" : ""}>${options(sourceTypeChoices, item.image_main_type, "", state)}</select></div>
     <div class="source-role binding-scope-cell">${renderSubtypeControls(item, state, registeredSubtypeLocked)}</div>
-    <div class="source-role image-target-cell"><select class="source-select source-target-select" data-field="owner" data-hmb-base-disabled="0">${targetSelectOptions(item, images, state)}</select></div>
+    <div class="source-role image-target-cell">${renderImageTargetControls(item, images, state)}</div>
     <div class="source-role color-pick-cell">${renderColorPickControls(item, index, images, state)}</div>
     <div class="source-status image-actions-cell">${renderImageActions(item, state, index, images.length)}</div>
     ${renderFrameRangeRow(item, index, state)}
@@ -6140,7 +6350,7 @@ function render(state) {
     @container (max-width: 1250px){.frame-binding-row{grid-template-columns:3.4rem minmax(0,.7fr) minmax(0,.9fr) minmax(0,.75fr) minmax(0,.75fr) minmax(0,.84fr) 3.6rem}.frame-track-shell{grid-template-columns:3rem minmax(0,1fr) 3rem}}
     @container (max-width: 930px){.frame-binding-row{grid-template-columns:3.4rem repeat(5,minmax(0,1fr)) 3.6rem}.frame-track-shell{grid-column:2/5}}
     @container (max-width: 620px){.frame-binding-row{display:grid!important;grid-template-columns:3.35rem minmax(0,1fr);gap:6px}.frame-range-toggle-wrap{grid-column:1;display:flex!important;justify-content:center}.frame-track-shell{grid-column:2;grid-template-columns:2.65rem minmax(3.5rem,1fr) 2.65rem}.frame-custom-scope,.frame-binding-context,.frame-binding-row>div:last-child{display:none}.frame-range-editor{left:auto;right:0;transform:none}}
-    .custom-inline-input.is-hidden,.custom-fields-panel.is-hidden,.custom-fields-panel label.is-hidden{display:none!important}
+    .custom-inline-input.is-hidden,.look-custom-instruction.is-hidden,.custom-fields-panel.is-hidden,.custom-fields-panel label.is-hidden{display:none!important}.look-custom-instruction{display:block;margin-top:4px;min-height:54px;resize:vertical;line-height:1.35}
     /* Compact Range row: reuse the open area below # / NAME / MAIN TYPE / SUB TYPE. */
     .frame-binding-row{grid-column:1/-1;display:grid;grid-template-columns:3.55rem minmax(0,1fr);gap:8px;align-items:center;min-height:28px;margin-top:0}
     .frame-binding-row .frame-range-toggle-wrap{grid-column:1}
@@ -6223,7 +6433,7 @@ function render(state) {
         <section class="group-card image-card" data-group-id="imageSources" ${hImageSources}><h3>${escapeHtml(uiText(state, "image_source_binding", "IMAGE SOURCE BINDING"))} <b>${state.status.active_images} / ${state.status.max_images}</b></h3><div class="group-body source-scrollbox" data-scroll-id="imageSources"><div class="source-header image-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "target", "TARGET"))}</span><span>${escapeHtml(uiText(state, "video_color_pick", "VIDEO / COLOR PICK"))}</span><span></span></div>${images.map((item, idx) => renderImageRow(item, idx, images, state)).join("")}${renderImageAddRow(images, state)}</div><div class="group-resize-bar nodrag" data-resize-group="imageSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card imgtext" data-group-id="imageText" ${hImageText}><h3>${escapeHtml(uiText(state, "image_text_context", "SHOT TEXT DIRECTION / EXACT LITERALS"))} <b>${escapeHtml(uiText(state, "scene_level_notes", "scene-level notes"))}</b></h3><div class="group-body"><div class="text-grid">${groupBFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="imageText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
         <section class="group-card video-card" data-group-id="videoSources" ${hVideoSources}><h3>${escapeHtml(uiText(state, "video_source_binding", "VIDEO SOURCE BINDING"))} <b>${state.status.active_videos} / ${state.status.max_videos}</b></h3><div class="group-body source-scrollbox" data-scroll-id="videoSources"><div class="source-header video-header"><span>#</span><span>${escapeHtml(uiText(state, "name", "NAME"))}</span><span>${escapeHtml(uiText(state, "main_type", "MAIN TYPE"))}</span><span>${escapeHtml(uiText(state, "sub_type", "SUB TYPE"))}</span><span>${escapeHtml(uiText(state, "keep_out", "KEEP OUT"))}</span><span></span></div>${videos.map((item, idx) => renderVideoRow(item, idx, images, state)).join("")}${renderVideoAddRow(videos, state)}</div><div class="group-resize-bar nodrag" data-resize-group="videoSources" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
-        <section class="group-card vtext" data-group-id="videoText" ${hVideoText}><h3>${escapeHtml(uiText(state, "video_vfx", "VIDEO ACTION / LIP-SYNC / VFX"))}</h3><div class="group-body"><div class="text-grid">${groupDFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="videoText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
+        <section class="group-card vtext" data-group-id="videoText" ${hVideoText}><h3>${escapeHtml(uiText(state, "video_vfx", "VFX"))}</h3><div class="group-body"><div class="text-grid">${groupDFields}</div></div><div class="group-resize-bar nodrag" data-resize-group="videoText" title="${escapeHtml(uiText(state, "resize_group", "Drag down/up to resize this center group"))}"></div></section>
       </main>
     </div>
   </div></div>`;

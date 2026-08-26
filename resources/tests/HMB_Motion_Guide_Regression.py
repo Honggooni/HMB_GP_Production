@@ -256,6 +256,8 @@ applied = prompt._apply_picker_payload(
     connected=True,
 )
 motion_row = applied["videos"][1]
+assert motion_row["video_main_type"] == "Maya Preview / Playblast"
+assert motion_row["video_sub_type"] == "Motion Guide"
 assert motion_row["source_type"] == "Motion Guide / Retargeting Reference"
 assert motion_row["control_role"] == "Derived Motion Decoding Only"
 assert motion_row["present"] is True

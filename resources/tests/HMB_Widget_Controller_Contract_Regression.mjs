@@ -753,6 +753,29 @@ assert.deepEqual(
   }, "Character"),
   ["Full Appearance", "Head / Face"],
 );
+const legacyScaleDraft = assetModule.hmbCreateImageAssetRegistrationDraft({
+  asset_library_id: "legacy-scale-sheet",
+  relative_path: "Look/Scale.png",
+  asset_id: "ScaleSheet",
+  image_name: "Scale Sheet",
+  image_main_type: "Look Reference",
+  image_sub_type: "Scale / Composition",
+}, {
+  image_main_type_choices: ["Select Image Main Type", "Look Reference"],
+  image_sub_type_choices: {
+    "Look Reference": ["ch_Scale", "bg_Scale", "ch_Scale / bg_Scale"],
+  },
+});
+assert.equal(legacyScaleDraft.image_main_type, "Look Reference");
+assert.equal(legacyScaleDraft.image_sub_type, "");
+assert.deepEqual(
+  assetModule.hmbImageAssetRegistrationSubTypes({
+    image_sub_type_choices: {
+      "Look Reference": ["ch_Scale", "bg_Scale", "ch_Scale / bg_Scale"],
+    },
+  }, "Look Reference"),
+  ["ch_Scale", "bg_Scale", "ch_Scale / bg_Scale"],
+);
 assert.equal(
   assetModule.hmbImageAssetImageSource({
     thumbnail_url: "http://localhost:8124/workspace/static_files/thumb.webp",

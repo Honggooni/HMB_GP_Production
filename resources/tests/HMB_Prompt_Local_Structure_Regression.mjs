@@ -182,8 +182,8 @@ assert.equal(stableRoleSelect.value, "Timing Only");
 assert.equal(
   widget.hmbSyncSelectOptions(
     stableRoleSelect,
-    ["", "FX Behavior Only"],
-    "FX Behavior Only",
+    ["", "FX Effect Only"],
+    "FX Effect Only",
     "optional",
     selectState,
   ),
@@ -191,12 +191,13 @@ assert.equal(
   "A genuinely changed taxonomy must rebuild the option list once.",
 );
 assert.equal(stableRoleSelect.writes, 1);
-assert.equal(stableRoleSelect.value, "FX Behavior Only");
+assert.equal(stableRoleSelect.value, "FX Effect Only");
 
 const manualContextImageFields = [
   "image_main_type",
   "image_sub_type",
   "custom_source_type",
+  "look_custom_instruction",
   "color_picks",
   "binding_scopes",
   "binding_custom_scopes",
@@ -355,7 +356,7 @@ assert.deepEqual(
 
 const targetRefreshSource = source.slice(
   source.indexOf("function refreshImageTargetControls"),
-  source.indexOf("function imageScopeChoicesForRow"),
+  source.indexOf("function reconcileImageBindingAfterTypeChange"),
 );
 assert.match(targetRefreshSource, /hmbSyncSelectOptions\(/);
 assert.doesNotMatch(targetRefreshSource, /\.innerHTML\s*=/);

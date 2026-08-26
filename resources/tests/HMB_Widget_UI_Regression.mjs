@@ -768,16 +768,12 @@ const preservedTaxonomyState = prompt.normalizeState({
     scope_choices_by_source_type: { Custom: ["", "Custom scope"] },
     actor_color_pick_choices: ["Red", "Green", "Blue"],
     object_color_pick_choices: ["Red", "Green", "Blue"],
-    actor_color_pick_source_types: [],
-    object_color_pick_source_types: ["Custom"],
   },
   images: [{
     source_type: "Future Image",
     custom_source_type: "Future Image",
     owner: "ExistingTarget",
     binding_scopes: ["Handheld prop"],
-    interaction_targets: ["Hero", "Custom"],
-    interaction_custom_targets: ["", "Dog"],
   }],
   videos: [{
     source_type: "Future Video",
@@ -789,7 +785,6 @@ const preservedTaxonomyState = prompt.normalizeState({
 assert.equal(preservedTaxonomyState.images[0].source_type, "Role Required / Select Source Type");
 assert.equal(preservedTaxonomyState.images[0].custom_source_type, "");
 assert.equal(preservedTaxonomyState.images[0].owner, "");
-assert.deepEqual(preservedTaxonomyState.images[0].legacy_relationship_targets, []);
 assert.equal(preservedTaxonomyState.videos[0].video_main_type, "Select Video Main Type");
 assert.equal(preservedTaxonomyState.videos[0].video_sub_type, "");
 assert.equal(preservedTaxonomyState.videos[0].source_type, "Role Required / Select Video Type");

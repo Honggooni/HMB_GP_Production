@@ -152,6 +152,51 @@ assert.equal(assetWidget.hmbImageAssetAuthorityStamp(publishedCanonical), canoni
 assert.equal(assetWidget.hmbConsumeImageAssetStateEcho(exactEchoContainer, { value: exactEchoValue }), true);
 assert.equal(assetWidget.hmbConsumeImageAssetStateEcho(exactEchoContainer, { value: exactEchoValue }), false);
 
+const presentationState = assetWidget.hmbNormalizeImageAssetState({
+  project_uid: "presentation-project",
+  manifest_signature: "presentation-manifest",
+  scan_revision: 5,
+  ui_edit_revision: 7,
+});
+const presentationContainer = {};
+let presentationEcho = "";
+assetWidget.hmbPublishImageAssetState(
+  presentationContainer,
+  { onChange(value) { presentationEcho = value; } },
+  presentationState,
+  null,
+  { suppressMatchingEcho: true, preserveUiEditRevision: true },
+);
+assert.equal(JSON.parse(presentationEcho).ui_edit_revision, 7);
+assert.equal(presentationContainer.__hmbImageAssetCurrentUiEditRevision, 7);
+assert.equal(
+  assetWidget.hmbConsumeImageAssetStateEcho(presentationContainer, { value: presentationEcho }),
+  true,
+  "A presentation-only request must retain exact-echo suppression without advancing UI authority.",
+);
+const presentationFailureState = assetWidget.hmbNormalizeImageAssetState({
+  ...presentationState,
+  ui_edit_revision: 8,
+});
+const presentationFailureContainer = {};
+let presentationFailureCount = 0;
+const savedPresentationConsoleError = console.error;
+console.error = () => {};
+try {
+  assetWidget.hmbPublishImageAssetState(
+    presentationFailureContainer,
+    { onChange() { throw new Error("presentation transport failure"); } },
+    presentationFailureState,
+    () => { presentationFailureCount += 1; },
+    { preserveUiEditRevision: true },
+  );
+} finally {
+  console.error = savedPresentationConsoleError;
+}
+assert.equal(presentationFailureCount, 1);
+assert.equal(presentationFailureState.ui_edit_revision, 8);
+assert.equal(presentationFailureContainer.__hmbImageAssetCurrentUiEditRevision, 8);
+
 // Card selection and view/type controls can publish faster than retained-mode
 // props arrive. Serialized UI revisions make B -> late A deterministic even
 // after the short exact-echo timer has discarded all payload history.
@@ -731,10 +776,735 @@ const selectableAsset = (id, selected = false, order = 0, extra = {}) => ({
   registered: true,
   asset_id: id,
   image_name: id,
+  relative_path: `Assets/${id}.png`,
   selected,
   selection_order: order,
   ...extra,
 });
+
+// Foreground catalog work is a 60-card page. Selected assets take thumbnail
+// priority even when they live outside that page, and browser-safe media does
+// not enter the hydration queue.
+const thumbnailWindowState = assetWidget.hmbNormalizeImageAssetState({
+  project_uid: "thumbnail-window-project",
+  manifest_signature: "thumbnail-window-manifest",
+  scan_revision: 11,
+  assets: Array.from({ length: 70 }, (_value, index) => selectableAsset(
+    `thumbnail-window-${index}`,
+    index === 65 || index === 69,
+    index === 65 ? 1 : index === 69 ? 2 : 0,
+    index === 2
+      ? { thumbnail_url: "https://static.invalid/already-hydrated.webp" }
+      : index === 3
+        ? { path: "https://static.invalid/browser-safe.png" }
+        : {},
+  )),
+});
+assert.equal(assetWidget.hmbImageAssetCatalogWindow(thumbnailWindowState).rendered.length, 60);
+assert.equal(assetWidget.hmbImageAssetCatalogWindow(thumbnailWindowState, 60, 60).rendered.length, 10);
+const thumbnailWindowIds = assetWidget.hmbImageAssetThumbnailRequestIds(thumbnailWindowState);
+assert.deepEqual(
+  thumbnailWindowIds.slice(0, 2),
+  ["thumbnail-window-65", "thumbnail-window-69"],
+  "Selected assets outside the page must lead the staged-thumbnail batch.",
+);
+assert.equal(thumbnailWindowIds.includes("thumbnail-window-2"), false);
+assert.equal(thumbnailWindowIds.includes("thumbnail-window-3"), false);
+const userAssetEligibilityState = assetWidget.hmbNormalizeImageAssetState({
+  project_uid: "thumbnail-window-project",
+  manifest_signature: "thumbnail-window-manifest",
+  scan_revision: 11,
+  selected_source_view: "user",
+  assets: [
+    selectableAsset("thumbnail-window-persisted-user", true, 1, {
+      source_kind: "user",
+      import_index: 0,
+      relative_path: "User/thumbnail-window-persisted-user.png",
+    }),
+    selectableAsset("thumbnail-window-live-user", true, 2, {
+      source_kind: "user",
+      import_index: 1,
+      relative_path: "User/thumbnail-window-live-user.png",
+    }),
+    selectableAsset("thumbnail-window-unpersisted-user", true, 3, {
+      source_kind: "user",
+      import_index: 0,
+      relative_path: "",
+    }),
+  ],
+});
+assert.deepEqual(
+  assetWidget.hmbImageAssetThumbnailRequestIds(userAssetEligibilityState),
+  ["thumbnail-window-persisted-user"],
+  "Persisted User-folder assets hydrate, while live/unpersisted IMAGE_IMPORT_IN rows do not.",
+);
+assert.equal(new Set(thumbnailWindowIds).size, thumbnailWindowIds.length);
+const thumbnailPlaceholderMarkup = assetWidget.hmbRenderImageAssetGrid(
+  thumbnailWindowState,
+).markup;
+assert.match(thumbnailPlaceholderMarkup, /thumbnail-loading/);
+assert.match(thumbnailPlaceholderMarkup, /asset-thumb-placeholder/);
+
+// A delayed thumbnail worker response may patch thumbnail_url only. Local
+// selection, per-Shot ordering, dimensions, names, and every other semantic
+// field remain owned by the latest UI/catalog state.
+const thumbnailShotUuid = "11111111-1111-4111-8111-111111111111";
+const thumbnailMergeLocal = assetWidget.hmbNormalizeImageAssetState({
+  project_uid: "thumbnail-merge-project",
+  manifest_signature: "thumbnail-merge-manifest",
+  scan_revision: 12,
+  ui_edit_revision: 9,
+  thumbnail_revision: 3,
+  assets: [
+    selectableAsset("thumbnail-merge-a", true, 1, {
+      image_name: "Local A",
+      media_signature: "a".repeat(64),
+      width: 640,
+      height: 360,
+      relative_path: "local/a.png",
+    }),
+    selectableAsset("thumbnail-merge-b", true, 2, {
+      image_name: "Local B",
+      media_signature: "b".repeat(64),
+      width: 800,
+      height: 450,
+      relative_path: "local/b.png",
+    }),
+  ],
+  shot_routing: {
+    schema: "hmb-shot-routing",
+    version: 1,
+    channel_uuid: "22222222-2222-4222-8222-222222222222",
+    active_shot_uuid: thumbnailShotUuid,
+    revision: 7,
+    shots: [{
+      shot_uuid: thumbnailShotUuid,
+      number: 1,
+      name: "Local Shot",
+      name_is_custom: true,
+      revision: 5,
+      selected_source_uids: ["project:thumbnail-merge-b", "project:thumbnail-merge-a"],
+    }],
+  },
+});
+const thumbnailMergeIncoming = assetWidget.hmbNormalizeImageAssetState({
+  ...JSON.parse(JSON.stringify(thumbnailMergeLocal)),
+  ui_edit_revision: 4,
+  thumbnail_revision: 4,
+  thumbnail_busy: false,
+  thumbnail_request: {},
+  thumbnail_result: {
+    request_id: "thumbnail-merge-request",
+    project_uid: "thumbnail-merge-project",
+    manifest_signature: "thumbnail-merge-manifest",
+    scan_revision: 12,
+    completed_asset_library_ids: ["thumbnail-merge-a"],
+    failed_asset_library_ids: [],
+  },
+  assets: thumbnailMergeLocal.assets.map((asset) => ({
+    ...asset,
+    thumbnail_url: `https://static.invalid/${asset.asset_library_id}.webp`,
+    selected: false,
+    selection_order: 0,
+    width: 9999,
+    height: 9999,
+    image_name: `Worker ${asset.asset_library_id}`,
+    relative_path: "worker/changed.png",
+  })),
+  shot_routing: {},
+});
+const thumbnailMerged = assetWidget.hmbMergeImageAssetThumbnailResponse(
+  thumbnailMergeLocal,
+  thumbnailMergeIncoming,
+);
+assert.equal(
+  thumbnailMerged.assets[0].thumbnail_url,
+  "https://static.invalid/thumbnail-merge-a.webp",
+);
+assert.equal(thumbnailMerged.assets[1].thumbnail_url, "");
+assert.deepEqual(
+  thumbnailMerged.assets.map((asset) => ({
+    selected: asset.selected,
+    selection_order: asset.selection_order,
+    width: asset.width,
+    height: asset.height,
+    image_name: asset.image_name,
+    media_signature: asset.media_signature,
+    relative_path: asset.relative_path,
+  })),
+  thumbnailMergeLocal.assets.map((asset) => ({
+    selected: asset.selected,
+    selection_order: asset.selection_order,
+    width: asset.width,
+    height: asset.height,
+    image_name: asset.image_name,
+    media_signature: asset.media_signature,
+    relative_path: asset.relative_path,
+  })),
+  "Thumbnail hydration must not overwrite semantic asset fields or generator order.",
+);
+assert.deepEqual(thumbnailMerged.shot_routing, thumbnailMergeLocal.shot_routing);
+{
+  const staleThumbnailContainer = makeAutoSyncContainer();
+  const staleThumbnailController = assetWidget.default(staleThumbnailContainer, {
+    value: thumbnailMergeLocal,
+  });
+  staleThumbnailController.update({ value: thumbnailMergeIncoming });
+  const applied = staleThumbnailContainer.__hmbImageAssetLatestState;
+  assert.equal(
+    applied.assets[0].thumbnail_url,
+    "https://static.invalid/thumbnail-merge-a.webp",
+    "Mounted applyProps must accept a newer thumbnail revision from a UI-stale response.",
+  );
+  assert.deepEqual(applied.shot_routing, thumbnailMergeLocal.shot_routing);
+  assert.deepEqual(
+    assetWidget.hmbImageAssetSelectionSnapshot(applied),
+    assetWidget.hmbImageAssetSelectionSnapshot(thumbnailMergeLocal),
+  );
+  staleThumbnailController.cleanup();
+}
+const mismatchedThumbnailResponse = assetWidget.hmbMergeImageAssetThumbnailResponse(
+  thumbnailMergeLocal,
+  {
+    ...thumbnailMergeIncoming,
+    thumbnail_revision: 5,
+    thumbnail_result: { ...thumbnailMergeIncoming.thumbnail_result, scan_revision: 10 },
+  },
+);
+assert.equal(mismatchedThumbnailResponse.thumbnail_revision, 3);
+assert.equal(mismatchedThumbnailResponse.assets[0].thumbnail_url, "");
+const mismatchedThumbnailIdentity = assetWidget.hmbMergeImageAssetThumbnailResponse(
+  thumbnailMergeLocal,
+  {
+    ...thumbnailMergeIncoming,
+    thumbnail_revision: 5,
+    assets: thumbnailMergeIncoming.assets.map((asset, index) => ({
+      ...asset,
+      media_signature: index === 0 ? "c".repeat(64) : asset.media_signature,
+    })),
+  },
+);
+assert.equal(
+  mismatchedThumbnailIdentity.assets[0].thumbnail_url,
+  "",
+  "A thumbnail built from another path/size/mtime identity must be discarded.",
+);
+const newerPendingRequest = {
+  request_id: "thumbnail-newer-request",
+  project_uid: thumbnailMergeLocal.project_uid,
+  manifest_signature: thumbnailMergeLocal.manifest_signature,
+  scan_revision: thumbnailMergeLocal.scan_revision,
+  asset_library_ids: ["thumbnail-merge-a"],
+};
+const mismatchedPendingResponse = assetWidget.hmbMergeImageAssetThumbnailResponse(
+  { ...thumbnailMergeLocal, thumbnail_request: newerPendingRequest },
+  { ...thumbnailMergeIncoming, thumbnail_revision: 6 },
+  newerPendingRequest.request_id,
+);
+assert.equal(mismatchedPendingResponse.thumbnail_revision, 3);
+assert.equal(mismatchedPendingResponse.assets[0].thumbnail_url, "");
+assert.equal(
+  mismatchedPendingResponse.thumbnail_request.request_id,
+  newerPendingRequest.request_id,
+  "An older completion must not clear or supersede a newer pending request.",
+);
+
+// Missing thumbnails publish after paint as one deduplicated 64-id batch. A
+// completion schedules the still-missing remainder once; failed IDs stay
+// attempted for that catalog context and cannot create an idle retry loop.
+const stagedThumbnailState = assetWidget.hmbNormalizeImageAssetState({
+  project_uid: "thumbnail-stage-project",
+  manifest_signature: "thumbnail-stage-manifest",
+  scan_revision: 13,
+  assets: Array.from({ length: 110 }, (_value, index) => selectableAsset(
+    `thumbnail-stage-${index}`,
+    index >= 60,
+    index >= 60 ? index - 59 : 0,
+  )),
+});
+const stagedContainer = {
+  __hmbImageAssetLatestState: stagedThumbnailState,
+  __hmbImageAssetRenderLimit: 60,
+  __hmbImageAssetRenderOffset: 0,
+  querySelector() { return null; },
+  querySelectorAll() { return []; },
+};
+const stagedSelectionBefore = assetWidget.hmbImageAssetSelectionSnapshot(
+  stagedThumbnailState,
+);
+const stagedShotRoutingBefore = JSON.parse(JSON.stringify(stagedThumbnailState.shot_routing));
+const stagedFrames = [];
+const stagedTimers = new Map();
+let stagedHandle = 0;
+const stagedPublished = [];
+const stagedSavedAnimationFrame = globalThis.requestAnimationFrame;
+const stagedSavedSetTimeout = globalThis.setTimeout;
+const stagedSavedClearTimeout = globalThis.clearTimeout;
+globalThis.requestAnimationFrame = (callback) => {
+  const id = ++stagedHandle;
+  stagedFrames.push({ id, callback });
+  return id;
+};
+globalThis.setTimeout = (callback, delay = 0) => {
+  const id = ++stagedHandle;
+  stagedTimers.set(id, { callback, delay: Number(delay) || 0 });
+  return id;
+};
+globalThis.clearTimeout = (id) => stagedTimers.delete(id);
+const flushStagedAfterPaint = () => {
+  stagedFrames.splice(0).forEach(({ callback }) => callback());
+  Array.from(stagedTimers.entries())
+    .filter(([, timer]) => timer.delay === 0)
+    .forEach(([id, timer]) => {
+      stagedTimers.delete(id);
+      timer.callback();
+    });
+};
+try {
+  const stagedProps = { onChange(value) { stagedPublished.push(JSON.parse(value)); } };
+  assert.equal(
+    assetWidget.hmbScheduleImageAssetThumbnailRequest(
+      stagedContainer,
+      stagedThumbnailState,
+      stagedProps,
+    ),
+    true,
+  );
+  assert.equal(
+    assetWidget.hmbScheduleImageAssetThumbnailRequest(
+      stagedContainer,
+      stagedThumbnailState,
+      stagedProps,
+    ),
+    true,
+    "Repeated pre-paint scheduling may replace the job but must not duplicate its publish.",
+  );
+  assert.equal(stagedPublished.length, 0);
+  flushStagedAfterPaint();
+  assert.equal(stagedPublished.length, 1);
+  const firstThumbnailRequest = stagedPublished[0].thumbnail_request;
+  assert.equal(stagedPublished[0].thumbnail_busy, true);
+  assert.equal(
+    stagedPublished[0].ui_edit_revision,
+    stagedThumbnailState.ui_edit_revision,
+    "A thumbnail request must not advance semantic UI authority.",
+  );
+  assert.deepEqual(
+    assetWidget.hmbImageAssetSelectionSnapshot(stagedPublished[0]),
+    stagedSelectionBefore,
+    "A presentation request must preserve selection and drag order in its payload.",
+  );
+  assert.deepEqual(
+    stagedPublished[0].shot_routing,
+    stagedShotRoutingBefore,
+    "A presentation request must preserve all Shot routing state in its payload.",
+  );
+  assert.deepEqual(
+    assetWidget.hmbImageAssetSelectionSnapshot(
+      stagedContainer.__hmbImageAssetLatestState,
+    ),
+    stagedSelectionBefore,
+  );
+  assert.deepEqual(
+    stagedContainer.__hmbImageAssetLatestState.shot_routing,
+    stagedShotRoutingBefore,
+  );
+  assert.deepEqual(stagedContainer.__hmbImageAssetLatestState.thumbnail_request, {});
+  assert.equal(stagedContainer.__hmbImageAssetLatestState.thumbnail_busy, true);
+  assert.equal(
+    stagedContainer.__hmbImageAssetThumbnailPendingRequestId,
+    firstThumbnailRequest.request_id,
+    "Successful request intent clears locally while busy/pending persists to completion.",
+  );
+  assert.equal(firstThumbnailRequest.asset_library_ids.length, 64);
+  assert.deepEqual(
+    firstThumbnailRequest.asset_library_ids.slice(0, 3),
+    ["thumbnail-stage-60", "thumbnail-stage-61", "thumbnail-stage-62"],
+  );
+  assert.deepEqual(
+    firstThumbnailRequest.asset_library_ids.slice(50),
+    Array.from({ length: 14 }, (_value, index) => `thumbnail-stage-${index}`),
+  );
+
+  const firstCompleted = new Set(firstThumbnailRequest.asset_library_ids);
+  const firstCompletion = assetWidget.hmbNormalizeImageAssetState({
+    ...stagedPublished[0],
+    thumbnail_request: {},
+    thumbnail_revision: 1,
+    thumbnail_busy: false,
+    thumbnail_result: {
+      request_id: firstThumbnailRequest.request_id,
+      project_uid: firstThumbnailRequest.project_uid,
+      manifest_signature: firstThumbnailRequest.manifest_signature,
+      scan_revision: firstThumbnailRequest.scan_revision,
+      completed_asset_library_ids: firstThumbnailRequest.asset_library_ids,
+      failed_asset_library_ids: [],
+    },
+    assets: stagedPublished[0].assets.map((asset) => ({
+      ...asset,
+      thumbnail_url: firstCompleted.has(asset.asset_library_id)
+        ? `https://static.invalid/${asset.asset_library_id}.webp`
+        : "",
+    })),
+  });
+  stagedContainer.__hmbImageAssetLatestState = firstCompletion;
+  delete stagedContainer.__hmbImageAssetThumbnailPendingRequestId;
+  assert.equal(
+    assetWidget.hmbScheduleImageAssetThumbnailRequest(
+      stagedContainer,
+      firstCompletion,
+      stagedProps,
+    ),
+    true,
+  );
+  flushStagedAfterPaint();
+  assert.equal(stagedPublished.length, 2);
+  const secondThumbnailRequest = stagedPublished[1].thumbnail_request;
+  assert.deepEqual(
+    secondThumbnailRequest.asset_library_ids,
+    Array.from({ length: 46 }, (_value, index) => `thumbnail-stage-${index + 14}`),
+  );
+
+  const failedCompletion = assetWidget.hmbNormalizeImageAssetState({
+    ...stagedPublished[1],
+    thumbnail_request: {},
+    thumbnail_revision: 2,
+    thumbnail_busy: false,
+    thumbnail_result: {
+      request_id: secondThumbnailRequest.request_id,
+      project_uid: secondThumbnailRequest.project_uid,
+      manifest_signature: secondThumbnailRequest.manifest_signature,
+      scan_revision: secondThumbnailRequest.scan_revision,
+      completed_asset_library_ids: [],
+      failed_asset_library_ids: secondThumbnailRequest.asset_library_ids,
+    },
+  });
+  stagedContainer.__hmbImageAssetLatestState = failedCompletion;
+  delete stagedContainer.__hmbImageAssetThumbnailPendingRequestId;
+  assert.equal(
+    assetWidget.hmbScheduleImageAssetThumbnailRequest(
+      stagedContainer,
+      failedCompletion,
+      stagedProps,
+    ),
+    false,
+    "A failed asset is attempted once per scan context instead of looping while idle.",
+  );
+  assert.equal(
+    assetWidget.hmbScheduleImageAssetThumbnailRequest(
+      { __hmbImageAssetLatestState: { ...failedCompletion, scan_busy: true } },
+      { ...failedCompletion, scan_busy: true },
+      stagedProps,
+    ),
+    false,
+  );
+  assert.equal(
+    assetWidget.hmbScheduleImageAssetThumbnailRequest(
+      { __hmbImageAssetLatestState: { ...failedCompletion, thumbnail_busy: true } },
+      { ...failedCompletion, thumbnail_busy: true },
+      stagedProps,
+    ),
+    false,
+  );
+
+  const failedTransportState = assetWidget.hmbNormalizeImageAssetState({
+    project_uid: "thumbnail-transport-project",
+    manifest_signature: "thumbnail-transport-manifest",
+    scan_revision: 2,
+    ui_edit_revision: 6,
+    assets: [selectableAsset("thumbnail-transport-asset")],
+  });
+  const failedTransportContainer = {
+    __hmbImageAssetLatestState: failedTransportState,
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  const failedTransportAssetsBefore = JSON.parse(JSON.stringify(failedTransportState.assets));
+  const failedTransportShotRoutingBefore = JSON.parse(
+    JSON.stringify(failedTransportState.shot_routing),
+  );
+  const savedTransportConsoleError = console.error;
+  console.error = () => {};
+  try {
+    assert.equal(
+      assetWidget.hmbScheduleImageAssetThumbnailRequest(
+        failedTransportContainer,
+        failedTransportState,
+        { onChange() { throw new Error("thumbnail request transport failure"); } },
+      ),
+      true,
+    );
+    flushStagedAfterPaint();
+  } finally {
+    console.error = savedTransportConsoleError;
+  }
+  assert.equal(failedTransportState.ui_edit_revision, 6);
+  assert.equal(failedTransportState.thumbnail_busy, false);
+  assert.deepEqual(failedTransportState.thumbnail_request, {});
+  assert.deepEqual(failedTransportState.assets, failedTransportAssetsBefore);
+  assert.deepEqual(failedTransportState.shot_routing, failedTransportShotRoutingBefore);
+  assert.equal(failedTransportContainer.__hmbImageAssetThumbnailPendingRequestId, undefined);
+  assert.equal(failedTransportContainer.__hmbImageAssetThumbnailRequestedIds.size, 0);
+
+  const staleUrl = "http://localhost:8124/workspace/static_files/stale.webp";
+  const staleUrlState = assetWidget.hmbNormalizeImageAssetState({
+    project_uid: "thumbnail-error-project",
+    manifest_signature: "thumbnail-error-manifest",
+    scan_revision: 4,
+    ui_edit_revision: 10,
+    assets: [selectableAsset("thumbnail-error-asset", false, 0, {
+      thumbnail_url: staleUrl,
+      media_signature: "d".repeat(64),
+      relative_path: "Assets/stale.png",
+    })],
+  });
+  const staleUrlCard = {
+    getAttribute(name) {
+      return name === "data-asset-key" ? "thumbnail-error-asset" : "";
+    },
+  };
+  const staleUrlWrapperClasses = new Set();
+  const staleUrlWrapper = { classList: { add(name) { staleUrlWrapperClasses.add(name); } } };
+  const staleUrlAttributes = new Map([["src", staleUrl]]);
+  const staleUrlImage = {
+    matches(selector) { return selector === "img"; },
+    getAttribute(name) { return staleUrlAttributes.get(name) || ""; },
+    removeAttribute(name) { staleUrlAttributes.delete(name); },
+    closest(selector) {
+      if (selector === "[data-asset-key]") return staleUrlCard;
+      if (selector.includes(".asset-thumb")) return staleUrlWrapper;
+      return null;
+    },
+  };
+  const staleUrlContainer = {
+    __hmbImageAssetLatestState: staleUrlState,
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  const retryPublished = [];
+  const retryProps = { onChange(value) { retryPublished.push(JSON.parse(value)); } };
+  assert.equal(
+    assetWidget.hmbHandleImageAssetThumbnailError(
+      staleUrlContainer,
+      staleUrlState,
+      staleUrlImage,
+      retryProps,
+    ),
+    true,
+  );
+  assert.equal(staleUrlState.assets[0].thumbnail_url, "");
+  flushStagedAfterPaint();
+  assert.equal(retryPublished.length, 1);
+  assert.equal(retryPublished[0].thumbnail_busy, true);
+  assert.equal(retryPublished[0].ui_edit_revision, 10);
+
+  const staleUrlRetryCompletion = assetWidget.hmbNormalizeImageAssetState({
+    ...retryPublished[0],
+    thumbnail_request: {},
+    thumbnail_busy: false,
+    thumbnail_revision: 1,
+    thumbnail_result: {
+      request_id: retryPublished[0].thumbnail_request.request_id,
+      project_uid: "thumbnail-error-project",
+      manifest_signature: "thumbnail-error-manifest",
+      scan_revision: 4,
+      completed_asset_library_ids: ["thumbnail-error-asset"],
+      failed_asset_library_ids: [],
+    },
+    assets: retryPublished[0].assets.map((asset) => ({
+      ...asset,
+      thumbnail_url: staleUrl,
+    })),
+  });
+  staleUrlContainer.__hmbImageAssetLatestState = staleUrlRetryCompletion;
+  delete staleUrlContainer.__hmbImageAssetThumbnailPendingRequestId;
+  staleUrlAttributes.set("src", staleUrl);
+  assert.equal(
+    assetWidget.hmbHandleImageAssetThumbnailError(
+      staleUrlContainer,
+      staleUrlRetryCompletion,
+      staleUrlImage,
+      retryProps,
+    ),
+    true,
+  );
+  flushStagedAfterPaint();
+  assert.equal(
+    retryPublished.length,
+    1,
+    "The same invalid StaticFiles URL may be retried once, never in an idle loop.",
+  );
+  assert.equal(staleUrlRetryCompletion.assets[0].thumbnail_url, "");
+  assert.equal(
+    staleUrlContainer.__hmbImageAssetThumbnailRequestedIds.has("thumbnail-error-asset"),
+    true,
+  );
+
+  const persistedUserStaleUrl = "http://localhost:8124/workspace/static_files/stale-user.webp";
+  const persistedUserStaleState = assetWidget.hmbNormalizeImageAssetState({
+    project_uid: "thumbnail-error-project",
+    manifest_signature: "thumbnail-error-manifest",
+    scan_revision: 4,
+    ui_edit_revision: 10,
+    selected_source_view: "user",
+    assets: [selectableAsset("thumbnail-error-persisted-user", false, 0, {
+      source_kind: "user",
+      import_index: 0,
+      relative_path: "User/stale-user.png",
+      thumbnail_url: persistedUserStaleUrl,
+      media_signature: "f".repeat(64),
+    })],
+  });
+  const persistedUserCard = {
+    getAttribute(name) {
+      return name === "data-asset-key" ? "thumbnail-error-persisted-user" : "";
+    },
+  };
+  const persistedUserImage = {
+    getAttribute(name) { return name === "src" ? persistedUserStaleUrl : ""; },
+    removeAttribute() {},
+    closest(selector) {
+      if (selector === "[data-asset-key]") return persistedUserCard;
+      return null;
+    },
+  };
+  const persistedUserContainer = {
+    __hmbImageAssetLatestState: persistedUserStaleState,
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  assert.equal(
+    assetWidget.hmbHandleImageAssetThumbnailError(
+      persistedUserContainer,
+      persistedUserStaleState,
+      persistedUserImage,
+      retryProps,
+    ),
+    true,
+    "A persisted project User-folder StaticFiles URL must enter bounded recovery.",
+  );
+  assert.equal(persistedUserStaleState.assets[0].thumbnail_url, "");
+  flushStagedAfterPaint();
+  assert.equal(retryPublished.length, 2);
+  assert.deepEqual(
+    retryPublished[1].thumbnail_request.asset_library_ids,
+    ["thumbnail-error-persisted-user"],
+  );
+
+  const liveImportStaleState = assetWidget.hmbNormalizeImageAssetState({
+    project_uid: "thumbnail-error-project",
+    manifest_signature: "thumbnail-error-manifest",
+    scan_revision: 4,
+    assets: [selectableAsset("thumbnail-error-live-user", false, 0, {
+      source_kind: "user",
+      import_index: 1,
+      relative_path: "User/live-user.png",
+      thumbnail_url: staleUrl,
+    })],
+  });
+  const liveImportCard = {
+    getAttribute(name) {
+      return name === "data-asset-key" ? "thumbnail-error-live-user" : "";
+    },
+  };
+  const liveImportImage = {
+    getAttribute(name) { return name === "src" ? staleUrl : ""; },
+    closest(selector) {
+      return selector === "[data-asset-key]" ? liveImportCard : null;
+    },
+  };
+  assert.equal(
+    assetWidget.hmbHandleImageAssetThumbnailError(
+      { __hmbImageAssetLatestState: liveImportStaleState },
+      liveImportStaleState,
+      liveImportImage,
+      retryProps,
+    ),
+    false,
+    "A live IMAGE_IMPORT_IN row must not enter StaticFiles recovery.",
+  );
+  assert.equal(liveImportStaleState.assets[0].thumbnail_url, staleUrl);
+
+  const externalUrlState = assetWidget.hmbNormalizeImageAssetState({
+    project_uid: "thumbnail-error-project",
+    manifest_signature: "thumbnail-error-manifest",
+    scan_revision: 4,
+    assets: [{
+      ...selectableAsset("thumbnail-external-asset"),
+      source_uid: "import:thumbnail-external-asset",
+      source_kind: "user",
+      thumbnail_url: "https://external.invalid/source.png",
+    }],
+  });
+  const externalCard = {
+    getAttribute(name) {
+      return name === "data-asset-key" ? "thumbnail-external-asset" : "";
+    },
+  };
+  const externalImage = {
+    getAttribute(name) {
+      return name === "src" ? "https://external.invalid/source.png" : "";
+    },
+    closest(selector) {
+      return selector === "[data-asset-key]" ? externalCard : null;
+    },
+  };
+  assert.equal(
+    assetWidget.hmbHandleImageAssetThumbnailError(
+      { __hmbImageAssetLatestState: externalUrlState },
+      externalUrlState,
+      externalImage,
+      retryProps,
+    ),
+    false,
+    "External HTTP/data media must never enter the project thumbnail retry path.",
+  );
+  assert.equal(
+    externalUrlState.assets[0].thumbnail_url,
+    "https://external.invalid/source.png",
+  );
+  const dataUrl = "data:image/png;base64,AAAA";
+  const dataUrlState = assetWidget.hmbNormalizeImageAssetState({
+    project_uid: "thumbnail-error-project",
+    manifest_signature: "thumbnail-error-manifest",
+    scan_revision: 4,
+    assets: [selectableAsset("thumbnail-data-asset", false, 0, {
+      thumbnail_url: dataUrl,
+      media_signature: "e".repeat(64),
+    })],
+  });
+  const dataUrlCard = {
+    getAttribute(name) {
+      return name === "data-asset-key" ? "thumbnail-data-asset" : "";
+    },
+  };
+  const dataUrlImage = {
+    getAttribute(name) { return name === "src" ? dataUrl : ""; },
+    closest(selector) {
+      return selector === "[data-asset-key]" ? dataUrlCard : null;
+    },
+  };
+  assert.equal(
+    assetWidget.hmbHandleImageAssetThumbnailError(
+      { __hmbImageAssetLatestState: dataUrlState },
+      dataUrlState,
+      dataUrlImage,
+      retryProps,
+    ),
+    false,
+    "Inline data media must never enter the project thumbnail retry path.",
+  );
+  assert.equal(dataUrlState.assets[0].thumbnail_url, dataUrl);
+  assetWidget.hmbCancelImageAssetThumbnailRequest(persistedUserContainer);
+  assetWidget.hmbCancelImageAssetThumbnailRequest(staleUrlContainer);
+} finally {
+  assetWidget.hmbCancelImageAssetThumbnailRequest(stagedContainer);
+  if (stagedSavedAnimationFrame === undefined) delete globalThis.requestAnimationFrame;
+  else globalThis.requestAnimationFrame = stagedSavedAnimationFrame;
+  globalThis.setTimeout = stagedSavedSetTimeout;
+  globalThis.clearTimeout = stagedSavedClearTimeout;
+}
+
 const mergeBase = assetWidget.hmbNormalizeImageAssetState({
   manifest_signature: "manifest-old",
   assets: [selectableAsset("asset-a", true, 1), selectableAsset("asset-b")],

@@ -62,11 +62,15 @@ const MAX_IMAGE_ASSET_REVISION = Number.MAX_SAFE_INTEGER;
 const IMAGE_ASSET_UI_EDIT_REVISION_KEY = "ui_edit_revision";
 const ROOT_FOLDER_KEY = "$root";
 const IMAGE_ASSET_STATE_VERSION = 4;
+const IMAGE_TAXONOMY_SCHEMA = "hmb-image-taxonomy";
+const IMAGE_TAXONOMY_VERSION = 2;
 const IMAGE_ASSET_SELECTION_COMMIT_FALLBACK_MS = 120;
 const IMAGE_ASSET_ECHO_EXPIRY_MS = 1500;
 // Search covers the complete in-memory catalog, but foreground DOM work stays
 // bounded for projects containing thousands of images.
-const IMAGE_ASSET_RENDER_WINDOW = 240;
+const IMAGE_ASSET_RENDER_WINDOW = 60;
+const IMAGE_ASSET_THUMBNAIL_REQUEST_BATCH = 64;
+const IMAGE_ASSET_THUMBNAIL_ERROR_RETRY_LIMIT = 1;
 const IMAGE_ASSET_SEARCH_DEBOUNCE_MS = 72;
 let imageAssetWidgetMountSequence = 0;
 const imageAssetMountedContainers = new Set();
@@ -77,12 +81,6 @@ let imageAssetPublicationSequence = 0;
 let imageAssetAuthoritySequence = 0;
 const IMAGE_ASSET_TRANSPORT_RETRY_MS = 32;
 const IMAGE_ASSET_AUTHORITY_STAMP = Symbol("hmbImageAssetAuthorityStamp");
-const UNCLASSIFIED_SOURCE_TYPES = new Set([
-  "",
-  "Role Required / Select Source Type",
-  "Select Source Type",
-]);
-
 export function hmbImageAssetShotPalette(value = 1) {
   const number = Number.parseInt(value, 10);
   const index = Number.isInteger(number) && number >= 1 && number <= MAX_IMAGE_ASSET_SHOTS
@@ -141,6 +139,7 @@ const IMAGE_ASSET_UI_TEXT = {
     select_main_type: "Select Main Type",
     custom_main_type: "CUSTOM MAIN TYPE",
     sub_type_label: "SUB TYPE (REQUIRED)",
+    taxonomy_contract: "AGENT MEANING",
     select_sub_type: "Select Sub Type",
     cancel: "Cancel",
     register_asset: "Register Asset",
@@ -207,6 +206,7 @@ const IMAGE_ASSET_UI_TEXT = {
     select_main_type: "메인 유형 선택",
     custom_main_type: "사용자 정의 메인 유형",
     sub_type_label: "하위 유형 (필수)",
+    taxonomy_contract: "에이전트 적용 의미",
     select_sub_type: "하위 유형 선택",
     cancel: "취소",
     register_asset: "에셋 등록",
@@ -236,44 +236,20 @@ function imageAssetText(state, key) {
   return IMAGE_ASSET_UI_TEXT[language]?.[key] || IMAGE_ASSET_UI_TEXT.en[key] || key;
 }
 
-const IMAGE_TAXONOMY_KO = Object.freeze({
-  Character: "캐릭터",
-  "Character Prop": "캐릭터 프랍",
-  "Environment / Background": "환경 / 배경",
-  "Background Prop": "배경 프랍",
-  "Look Reference": "룩 레퍼런스",
-  "Custom / Context": "사용자 정의 / 컨텍스트",
-  "Full Appearance": "전체 외형",
-  "Head / Face": "머리 / 얼굴",
-  "Eyes / Expression": "눈 / 표정",
-  "Body Part": "신체 부위",
-  "Hair / Fur": "머리카락 / 털",
-  "Costume Detail": "의상 디테일",
-  "Full Costume": "전체 의상",
-  "Handheld Prop": "손에 드는 프랍",
-  "Attached Accessory": "부착 액세서리",
-  "Character Interactive Prop": "캐릭터 상호작용 프랍",
-  "Main Background": "메인 배경",
-  "Sky / Exterior": "하늘 / 외부",
-  "Ground / Floor": "지면 / 바닥",
-  Foreground: "전경",
-  "Independent Scene Prop": "독립 장면 프랍",
-  "Interactive Scene Prop": "상호작용 장면 프랍",
-  "Set / Structure": "세트 / 구조물",
-  "Color Mood": "색감 무드",
-  "Lighting / Atmosphere": "조명 / 분위기",
-  "Render Look": "렌더 룩",
-  "Color / Look / Lighting": "색감 / 룩 / 조명",
-  Scale: "스케일",
-  Composition: "구도",
-  "Scale / Composition": "스케일 / 구도",
-  Context: "컨텍스트",
-  Custom: "사용자 정의",
-});
-
 function imageAssetTaxonomyLabel(state, value) {
   const text = clean(value);
-  return imageAssetLanguage(state) === "ko" ? (IMAGE_TAXONOMY_KO[text] || text) : text;
+  const language = imageAssetLanguage(state);
+  return clean(state?.taxonomy?.labels?.[language]?.[text]) || text;
+}
+
+function imageAssetTaxonomyMeaning(state, mainType, subType) {
+  const main = clean(mainType);
+  const sub = clean(subType);
+  const pair = (Array.isArray(state?.taxonomy?.semantic_pairs)
+    ? state.taxonomy.semantic_pairs
+    : []).find((item) => item.main_type === main && item.sub_type === sub);
+  if (!pair) return "";
+  return [clean(pair.source_type), clean(pair.scope)].filter(Boolean).join(" · ");
 }
 
 function imageAssetStatusCount(value) {
@@ -399,6 +375,8 @@ function normalizeAsset(raw) {
   if (!assetLibraryId || !assetId || !imageName) return null;
   const sourceKind = clean(raw.source_kind).toLowerCase() === "project" ? "project" : "user";
   const registered = sourceKind === "project" && Boolean(raw.registered);
+  const imageMainType = clean(raw.image_main_type);
+  const imageSubType = clean(raw.image_sub_type);
   return {
     asset_library_id: assetLibraryId,
     source_uid: clean(raw.source_uid) || assetLibraryId,
@@ -409,15 +387,16 @@ function normalizeAsset(raw) {
     image_name: imageName,
     path: clean(raw.path || raw.asset_path).replaceAll("\\", "/"),
     thumbnail_url: clean(raw.thumbnail_url),
+    media_signature: clean(raw.media_signature).slice(0, 64),
     relative_path: clean(raw.relative_path).replaceAll("\\", "/"),
     extension: clean(raw.extension).toLowerCase(),
     width: Math.max(0, Number.parseInt(raw.width || 0, 10) || 0),
     height: Math.max(0, Number.parseInt(raw.height || 0, 10) || 0),
-    image_main_type: clean(raw.image_main_type) || "Select Image Main Type",
-    image_sub_type: clean(raw.image_sub_type),
+    image_main_type: imageMainType || "Select Image Main Type",
+    image_sub_type: imageSubType,
     source_type: clean(raw.source_type) || "Role Required / Select Source Type",
     custom_source_type: clean(raw.custom_source_type),
-    scope_candidate: clean(raw.scope_candidate || raw.scope || raw.sub_type),
+    scope_candidate: clean(raw.scope_candidate),
     color_pick_candidates: uniqueStrings(raw.color_pick_candidates),
     registered,
     selected: Boolean(raw.selected) && (sourceKind === "user" || registered),
@@ -442,6 +421,8 @@ function normalizeRegistrationRequest(raw) {
     || (sourceKind === "project" && !relativePath)
     || (sourceKind === "user" && !sourceUid)
   ) return {};
+  const imageMainType = clean(raw.image_main_type);
+  const imageSubType = clean(raw.image_sub_type);
   return {
     request_id: requestId,
     project_uid: clean(raw.project_uid).slice(0, 256),
@@ -452,11 +433,9 @@ function normalizeRegistrationRequest(raw) {
     target_folder: targetFolder,
     image_name: clean(raw.image_name).slice(0, 256),
     asset_id: clean(raw.asset_id).slice(0, 256),
-    image_main_type: clean(raw.image_main_type).slice(0, 256),
-    image_sub_type: clean(raw.image_sub_type).slice(0, 256),
-    source_type: clean(raw.source_type).slice(0, 256),
+    image_main_type: imageMainType.slice(0, 256),
+    image_sub_type: imageSubType.slice(0, 256),
     custom_source_type: clean(raw.custom_source_type).slice(0, 256),
-    scope_candidate: clean(raw.scope_candidate || raw.scope).slice(0, 256),
   };
 }
 
@@ -469,6 +448,42 @@ function normalizeRegistrationResult(raw) {
     ok: Boolean(raw.ok),
     asset_library_id: clean(raw.asset_library_id).slice(0, 512),
     message: clean(raw.message).slice(0, 1000),
+  };
+}
+
+function normalizeThumbnailRequest(raw) {
+  if (!raw || typeof raw !== "object") return {};
+  const requestId = clean(raw.request_id).slice(0, 128);
+  const projectUid = clean(raw.project_uid).slice(0, 256);
+  const assetLibraryIds = uniqueStrings(raw.asset_library_ids)
+    .map((value) => value.slice(0, 512))
+    .slice(0, IMAGE_ASSET_THUMBNAIL_REQUEST_BATCH);
+  if (!requestId || !projectUid || !assetLibraryIds.length) return {};
+  return {
+    request_id: requestId,
+    project_uid: projectUid,
+    manifest_signature: clean(raw.manifest_signature).slice(0, 128),
+    scan_revision: hmbNormalizeImageAssetRevision(raw.scan_revision),
+    asset_library_ids: assetLibraryIds,
+  };
+}
+
+function normalizeThumbnailResult(raw) {
+  if (!raw || typeof raw !== "object") return {};
+  const requestId = clean(raw.request_id).slice(0, 128);
+  const projectUid = clean(raw.project_uid).slice(0, 256);
+  if (!requestId || !projectUid) return {};
+  return {
+    request_id: requestId,
+    project_uid: projectUid,
+    manifest_signature: clean(raw.manifest_signature).slice(0, 128),
+    scan_revision: hmbNormalizeImageAssetRevision(raw.scan_revision),
+    completed_asset_library_ids: uniqueStrings(raw.completed_asset_library_ids)
+      .map((value) => value.slice(0, 512))
+      .slice(0, IMAGE_ASSET_THUMBNAIL_REQUEST_BATCH),
+    failed_asset_library_ids: uniqueStrings(raw.failed_asset_library_ids)
+      .map((value) => value.slice(0, 512))
+      .slice(0, IMAGE_ASSET_THUMBNAIL_REQUEST_BATCH),
   };
 }
 
@@ -630,28 +645,71 @@ function isCanonicalImageAssetState(state) {
   return imageAssetAuthorityStamp(state) > 0;
 }
 
+function normalizeImageTaxonomyContract(value) {
+  const raw = value && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : {};
+  if (
+    raw.schema !== IMAGE_TAXONOMY_SCHEMA
+    || Number(raw.version) !== IMAGE_TAXONOMY_VERSION
+  ) return {};
+  const mainTypes = uniqueStrings(raw.image_main_type_choices);
+  const rawSubTypes = (
+    raw.image_sub_type_choices
+    && typeof raw.image_sub_type_choices === "object"
+    && !Array.isArray(raw.image_sub_type_choices)
+  ) ? raw.image_sub_type_choices : {};
+  const subTypes = Object.fromEntries(
+    Object.entries(rawSubTypes)
+      .map(([mainType, values]) => [clean(mainType), uniqueStrings(values)])
+      .filter(([mainType, values]) => mainType && values.length),
+  );
+  const semanticPairs = (Array.isArray(raw.semantic_pairs) ? raw.semantic_pairs : [])
+    .map((pair) => ({
+      main_type: clean(pair?.main_type),
+      sub_type: clean(pair?.sub_type),
+      source_type: clean(pair?.source_type),
+      scope: clean(pair?.scope),
+    }))
+    .filter((pair) => pair.main_type && pair.sub_type && pair.source_type);
+  const pairKeys = Object.entries(subTypes)
+    .flatMap(([mainType, values]) => values.map((subType) => `${mainType}\u0000${subType}`));
+  const semanticKeys = new Set(
+    semanticPairs.map((pair) => `${pair.main_type}\u0000${pair.sub_type}`),
+  );
+  const selectableMainCount = Math.max(0, mainTypes.length - 1);
+  const subTypeCount = Object.values(subTypes)
+    .reduce((sum, values) => sum + values.length, 0);
+  if (
+    mainTypes[0] !== "Select Image Main Type"
+    || Number(raw.main_type_count) !== selectableMainCount
+    || Number(raw.sub_type_count) !== subTypeCount
+    || Number(raw.pair_count) !== pairKeys.length
+    || semanticKeys.size !== pairKeys.length
+    || !pairKeys.every((key) => semanticKeys.has(key))
+  ) return {};
+  const labels = raw.labels && typeof raw.labels === "object" && !Array.isArray(raw.labels)
+    ? {
+        en: { ...(raw.labels.en && typeof raw.labels.en === "object" ? raw.labels.en : {}) },
+        ko: { ...(raw.labels.ko && typeof raw.labels.ko === "object" ? raw.labels.ko : {}) },
+      }
+    : { en: {}, ko: {} };
+  return {
+    schema: IMAGE_TAXONOMY_SCHEMA,
+    version: IMAGE_TAXONOMY_VERSION,
+    main_type_count: selectableMainCount,
+    sub_type_count: subTypeCount,
+    pair_count: pairKeys.length,
+    image_main_type_choices: mainTypes,
+    image_sub_type_choices: subTypes,
+    semantic_pairs: semanticPairs,
+    labels,
+  };
+}
+
 function normalizeState(value) {
   const input = parseValue(value);
-  const taxonomyInput = input.taxonomy && typeof input.taxonomy === "object"
-    ? input.taxonomy
-    : {};
-  const taxonomy = {
-    image_main_type_choices: uniqueStrings(taxonomyInput.image_main_type_choices),
-    image_sub_type_choices:
-      taxonomyInput.image_sub_type_choices
-      && typeof taxonomyInput.image_sub_type_choices === "object"
-        ? taxonomyInput.image_sub_type_choices
-        : {},
-    source_type_choices: uniqueStrings(taxonomyInput.source_type_choices),
-    scope_choices: uniqueStrings(taxonomyInput.scope_choices),
-    scope_choices_by_source_type:
-      taxonomyInput.scope_choices_by_source_type
-      && typeof taxonomyInput.scope_choices_by_source_type === "object"
-        ? taxonomyInput.scope_choices_by_source_type
-        : {},
-    actor_color_pick_choices: uniqueStrings(taxonomyInput.actor_color_pick_choices),
-    object_color_pick_choices: uniqueStrings(taxonomyInput.object_color_pick_choices),
-  };
+  const taxonomy = normalizeImageTaxonomyContract(input.taxonomy);
   const projects = [];
   const seenProjects = new Set();
   (Array.isArray(input.projects) ? input.projects : []).forEach((raw) => {
@@ -666,6 +724,15 @@ function normalizeState(value) {
   (Array.isArray(input.assets) ? input.assets : []).forEach((raw) => {
     const asset = normalizeAsset(raw);
     if (!asset || seenAssets.has(asset.asset_library_id)) return;
+    const allowedSubTypes = taxonomy.image_sub_type_choices?.[asset.image_main_type];
+    if (!Array.isArray(allowedSubTypes) || !allowedSubTypes.includes(asset.image_sub_type)) {
+      asset.image_main_type = "Select Image Main Type";
+      asset.image_sub_type = "";
+      asset.source_type = "Role Required / Select Source Type";
+      asset.scope_candidate = "";
+      asset.custom_source_type = "";
+      asset.color_pick_candidates = [];
+    }
     seenAssets.add(asset.asset_library_id);
     assets.push(asset);
   });
@@ -681,6 +748,8 @@ function normalizeState(value) {
   const selectedSourceView = clean(input.selected_source_view).toLowerCase() === "user"
     ? "user"
     : "project";
+  const selectedMainType = clean(input.selected_main_type);
+  const selectedSubType = clean(input.selected_sub_type);
   return markCanonicalImageAssetState({
     schema: "hmb-image-asset-library-state",
     version: IMAGE_ASSET_STATE_VERSION,
@@ -699,8 +768,8 @@ function normalizeState(value) {
     root_edit_enabled: Boolean(input.root_edit_enabled),
     selected_folder_path: folders.includes(selectedFolderPath) ? selectedFolderPath : "",
     expanded_folders: expandedFolders,
-    selected_main_type: clean(input.selected_main_type),
-    selected_sub_type: clean(input.selected_sub_type),
+    selected_main_type: selectedMainType,
+    selected_sub_type: selectedSubType,
     selected_source_view: selectedSourceView,
     search: clean(input.search).slice(0, 256),
     language: clean(input.language).toLowerCase() === "en" ? "en" : "ko",
@@ -716,6 +785,10 @@ function normalizeState(value) {
     refresh_revision: Math.max(0, Number.parseInt(input.refresh_revision || 0, 10) || 0),
     scan_busy: Boolean(input.scan_busy),
     scan_request_id: clean(input.scan_request_id).slice(0, 128),
+    thumbnail_request: normalizeThumbnailRequest(input.thumbnail_request),
+    thumbnail_result: normalizeThumbnailResult(input.thumbnail_result),
+    thumbnail_revision: hmbNormalizeImageAssetRevision(input.thumbnail_revision),
+    thumbnail_busy: Boolean(input.thumbnail_busy),
     asset_registration_request: normalizeRegistrationRequest(input.asset_registration_request),
     asset_registration_result: normalizeRegistrationResult(input.asset_registration_result),
     disconnect_import_uid: clean(input.disconnect_import_uid).startsWith("import:")
@@ -740,6 +813,65 @@ function normalizeState(value) {
 
 export function hmbNormalizeImageAssetState(value) {
   return normalizeState(value);
+}
+
+function imageAssetThumbnailContextMatches(state, result) {
+  return Boolean(
+    clean(state?.project_uid)
+    && clean(result?.request_id)
+    && clean(result?.project_uid) === clean(state?.project_uid)
+    && clean(result?.manifest_signature) === clean(state?.manifest_signature)
+    && hmbNormalizeImageAssetRevision(result?.scan_revision)
+      === hmbNormalizeImageAssetRevision(state?.scan_revision)
+  );
+}
+
+// A thumbnail completion is allowed to update presentation media only. In
+// particular, delayed hydration must never become an authority for Shot
+// membership, selection order, raster metadata, paths, or taxonomy fields.
+export function hmbMergeImageAssetThumbnailResponse(
+  localValue,
+  incomingValue,
+  expectedRequestId = "",
+) {
+  const local = normalizeState(localValue);
+  const incoming = isCanonicalImageAssetState(incomingValue)
+    ? incomingValue
+    : normalizeState(incomingValue);
+  const result = incoming.thumbnail_result;
+  const pendingRequestId = clean(expectedRequestId)
+    || clean(local.thumbnail_request?.request_id);
+  if (
+    !imageAssetThumbnailContextMatches(local, result)
+    || (pendingRequestId && result.request_id !== pendingRequestId)
+    || incoming.thumbnail_revision <= local.thumbnail_revision
+  ) return local;
+
+  const completed = new Set(result.completed_asset_library_ids || []);
+  const incomingById = new Map(
+    incoming.assets.map((asset) => [clean(asset.asset_library_id), asset]),
+  );
+  local.assets.forEach((asset) => {
+    const key = clean(asset.asset_library_id);
+    if (!completed.has(key)) return;
+    const hydrated = incomingById.get(key);
+    const mediaSignature = clean(asset.media_signature);
+    if (
+      !hydrated
+      || clean(hydrated.source_uid) !== clean(asset.source_uid)
+      || !mediaSignature
+      || clean(hydrated.media_signature) !== mediaSignature
+    ) return;
+    const thumbnailUrl = clean(hydrated.thumbnail_url);
+    if (thumbnailUrl) asset.thumbnail_url = thumbnailUrl;
+  });
+  local.thumbnail_revision = incoming.thumbnail_revision;
+  local.thumbnail_result = result;
+  local.thumbnail_busy = incoming.thumbnail_busy;
+  if (local.thumbnail_request?.request_id === result.request_id) {
+    local.thumbnail_request = {};
+  }
+  return local;
 }
 
 function selectedAssets(state) {
@@ -1299,9 +1431,16 @@ export function hmbPublishImageAssetState(
     currentUiEditRevision: container?.__hmbImageAssetCurrentUiEditRevision,
     latestLocalUiEditRevision: container?.__hmbImageAssetLatestLocalUiEditRevision,
   };
-  const nextUiEditRevision = hmbNextImageAssetUiEditRevision(container, normalized);
+  const preserveUiEditRevision = options?.preserveUiEditRevision === true;
+  const nextUiEditRevision = preserveUiEditRevision
+    ? Math.max(
+        hmbNormalizeImageAssetRevision(normalized[IMAGE_ASSET_UI_EDIT_REVISION_KEY]),
+        hmbNormalizeImageAssetRevision(container?.__hmbImageAssetCurrentUiEditRevision),
+        hmbNormalizeImageAssetRevision(container?.__hmbImageAssetLatestLocalUiEditRevision),
+      )
+    : hmbNextImageAssetUiEditRevision(container, normalized);
   normalized[IMAGE_ASSET_UI_EDIT_REVISION_KEY] = nextUiEditRevision;
-  hmbRememberImageAssetRevisionState(container, normalized, true);
+  hmbRememberImageAssetRevisionState(container, normalized, !preserveUiEditRevision);
   const value = JSON.stringify(normalized);
   const publicationToken = ++imageAssetPublicationSequence;
   if (container) container.__hmbImageAssetPublicationOwner = publicationToken;
@@ -1861,7 +2000,7 @@ function thumbnailImageMarkup(asset) {
   const fallback = escapeHtml((asset.extension || ".img").replace(".", "").toUpperCase() || "IMG");
   return source
     ? `<img src="${escapeHtml(source)}" alt="" draggable="false" loading="lazy" decoding="async" fetchpriority="low"/><span>${fallback}</span>`
-    : `<span>${fallback}</span>`;
+    : `<span class="thumbnail-placeholder" aria-hidden="true"></span>`;
 }
 
 function assetCardThumbnailImageMarkup(asset) {
@@ -1881,7 +2020,7 @@ export function hmbImageAssetCanRegister(asset) {
 
 function thumbnailHtml(asset, className = "asset-thumb") {
   const source = imageSource(asset);
-  return `<div class="${className} ${source ? "" : "fallback"}">${thumbnailImageMarkup(asset)}</div>`;
+  return `<div class="${className} ${source ? "" : "fallback thumbnail-loading"}" data-thumbnail-loading="${source ? "false" : "true"}">${thumbnailImageMarkup(asset)}</div>`;
 }
 
 function assetThumbnailHtml(asset, state) {
@@ -1891,7 +2030,7 @@ function assetThumbnailHtml(asset, state) {
     ? `<button type="button" class="asset-add" data-asset-add aria-label="${escapeHtml(imageAssetText(state, "add_image_asset"))}">${escapeHtml(imageAssetText(state, "add"))}</button>`
     : "";
   return `
-    <div class="asset-thumb ${source ? "" : "fallback"}">
+    <div class="asset-thumb ${source ? "" : "fallback thumbnail-loading"}" data-thumbnail-loading="${source ? "false" : "true"}">
       <div class="asset-thumb-media">${assetCardThumbnailImageMarkup(asset)}${add}</div>
       <div class="asset-thumb-footer"><span class="asset-source-name" title="${escapeHtml(sourceName)}">${escapeHtml(sourceName)}</span></div>
     </div>
@@ -1965,6 +2104,285 @@ export function hmbImageAssetCatalogWindow(
     limit: boundedLimit,
     offset: boundedOffset,
   };
+}
+
+function imageAssetThumbnailContextKey(state) {
+  const projectUid = clean(state?.project_uid);
+  if (!projectUid) return "";
+  return [
+    projectUid,
+    clean(state?.manifest_signature),
+    hmbNormalizeImageAssetRevision(state?.scan_revision),
+  ].join("\n");
+}
+
+function imageAssetThumbnailRequestMatchesState(state, request) {
+  return Boolean(
+    clean(request?.request_id)
+    && clean(request?.project_uid) === clean(state?.project_uid)
+    && clean(request?.manifest_signature) === clean(state?.manifest_signature)
+    && hmbNormalizeImageAssetRevision(request?.scan_revision)
+      === hmbNormalizeImageAssetRevision(state?.scan_revision)
+  );
+}
+
+export function hmbImageAssetThumbnailRequestIds(
+  state,
+  limit = IMAGE_ASSET_RENDER_WINDOW,
+  offset = 0,
+  options = {},
+) {
+  const canonical = isCanonicalImageAssetState(state) ? state : normalizeState(state);
+  const visible = options.includeWindow === false
+    ? []
+    : hmbImageAssetCatalogWindow(canonical, limit, offset).rendered;
+  const candidates = [...selectedAssets(canonical), ...visible];
+  const seen = new Set();
+  return candidates
+    .filter((asset) => {
+      const key = clean(asset?.asset_library_id);
+      // The project catalog can legitimately contain source_kind="user"
+      // assets after they are registered into its User folder. Eligibility is
+      // therefore based on persisted project identity, not source_kind. Live
+      // IMAGE_IMPORT_IN rows have import_index > 0 or no relative_path and
+      // remain browser-owned instead of entering backend hydration.
+      const persistedProjectAsset = Number(asset?.import_index || 0) === 0
+        && Boolean(clean(asset?.relative_path));
+      return key
+        && persistedProjectAsset
+        && !imageSource(asset)
+        && !seen.has(key)
+        && seen.add(key);
+    })
+    .map((asset) => clean(asset.asset_library_id))
+    .slice(0, IMAGE_ASSET_THUMBNAIL_REQUEST_BATCH);
+}
+
+function imageAssetThumbnailRequestTracking(container, state) {
+  const contextKey = imageAssetThumbnailContextKey(state);
+  if (!container || !contextKey) return { contextKey, requested: new Set() };
+  if (container.__hmbImageAssetThumbnailContextKey !== contextKey) {
+    container.__hmbImageAssetThumbnailContextKey = contextKey;
+    container.__hmbImageAssetThumbnailRequestedIds = new Set();
+    container.__hmbImageAssetThumbnailErrorRetries = new Map();
+    delete container.__hmbImageAssetThumbnailPendingRequestId;
+  }
+  if (!(container.__hmbImageAssetThumbnailRequestedIds instanceof Set)) {
+    container.__hmbImageAssetThumbnailRequestedIds = new Set();
+  }
+  if (!(container.__hmbImageAssetThumbnailErrorRetries instanceof Map)) {
+    container.__hmbImageAssetThumbnailErrorRetries = new Map();
+  }
+  return {
+    contextKey,
+    requested: container.__hmbImageAssetThumbnailRequestedIds,
+  };
+}
+
+function hmbAcceptImageAssetThumbnailResult(container, state) {
+  const result = state?.thumbnail_result;
+  if (!container || !imageAssetThumbnailContextMatches(state, result)) return false;
+  if (container.__hmbImageAssetThumbnailPendingRequestId === result.request_id) {
+    delete container.__hmbImageAssetThumbnailPendingRequestId;
+  }
+  if (
+    !state.thumbnail_busy
+    && state.thumbnail_request?.request_id === result.request_id
+  ) state.thumbnail_request = {};
+  return true;
+}
+
+export function hmbCancelImageAssetThumbnailRequest(container) {
+  if (!container) return false;
+  container.__hmbImageAssetThumbnailScheduleToken =
+    (Number(container.__hmbImageAssetThumbnailScheduleToken) || 0) + 1;
+  delete container.__hmbImageAssetThumbnailPendingRequestId;
+  delete container.__hmbImageAssetThumbnailRequestedIds;
+  delete container.__hmbImageAssetThumbnailErrorRetries;
+  delete container.__hmbImageAssetThumbnailContextKey;
+  return true;
+}
+
+function imageAssetThumbnailAssetForElement(container, state, image) {
+  if (!state || !Array.isArray(state.assets) || !image) return null;
+  const keyedOwner = image.closest?.("[data-asset-key]")
+    || image.closest?.("[data-selected-key]");
+  const libraryId = clean(
+    keyedOwner?.getAttribute?.("data-asset-key")
+    || keyedOwner?.getAttribute?.("data-selected-key"),
+  );
+  if (libraryId) {
+    return state.assets.find((asset) => clean(asset.asset_library_id) === libraryId) || null;
+  }
+  const compactOwner = image.closest?.("[data-compact-asset-key]");
+  const sourceUid = clean(compactOwner?.getAttribute?.("data-shot-source-uid"));
+  if (sourceUid) {
+    return state.assets.find((asset) => clean(asset.source_uid) === sourceUid) || null;
+  }
+  if (image.closest?.(".passport-photo")) {
+    const draftId = clean(container?.__hmbImageAssetRegistrationDraft?.asset_library_id);
+    return state.assets.find((asset) => clean(asset.asset_library_id) === draftId) || null;
+  }
+  return null;
+}
+
+function imageAssetThumbnailElementMatchesAsset(image, asset) {
+  const thumbnailUrl = clean(asset?.thumbnail_url);
+  const persistedProjectAsset = Number(asset?.import_index || 0) === 0
+    && Boolean(clean(asset?.relative_path));
+  if (
+    !persistedProjectAsset
+    // Only process-lifetime StaticFilesManager URLs are eligible for this
+    // recovery. Durable external HTTP sources and inline data media remain
+    // browser-owned even when their catalog row is persisted.
+    || !/^https?:\/\/[^/]+\/workspace\/static_files(?:\/|[?#]|$)/i.test(thumbnailUrl)
+  ) return false;
+  const elementUrl = clean(
+    image?.getAttribute?.("src")
+    || image?.getAttribute?.("data-hmb-compact-src"),
+  );
+  return Boolean(elementUrl && elementUrl === thumbnailUrl);
+}
+
+export function hmbHandleImageAssetThumbnailError(container, state, image, props) {
+  const liveState = container?.__hmbImageAssetLatestState || state;
+  const asset = imageAssetThumbnailAssetForElement(container, liveState, image);
+  if (!imageAssetThumbnailElementMatchesAsset(image, asset)) return false;
+  const tracking = imageAssetThumbnailRequestTracking(container, liveState);
+  if (!tracking.contextKey) return false;
+  const key = clean(asset.asset_library_id);
+  const retries = container.__hmbImageAssetThumbnailErrorRetries;
+  const retryCount = Math.max(0, Number(retries.get(key)) || 0);
+  asset.thumbnail_url = "";
+  container.__hmbImageAssetLatestState = liveState;
+  image.closest?.(".asset-thumb,.selected-thumb,.passport-photo,.compact-shot-asset")
+    ?.classList?.add?.("fallback");
+  if (retryCount >= IMAGE_ASSET_THUMBNAIL_ERROR_RETRY_LIMIT) {
+    tracking.requested.add(key);
+    image.removeAttribute?.("src");
+    image.removeAttribute?.("data-hmb-compact-src");
+    return true;
+  }
+  retries.set(key, retryCount + 1);
+  tracking.requested.delete(key);
+  hmbPatchImageAssetThumbnailMedia(container, liveState, [key]);
+  hmbScheduleImageAssetThumbnailRequest(container, liveState, props, {
+    includeWindow: !container.__hmbImageAssetCompact,
+  });
+  return true;
+}
+
+export function hmbRememberLoadedImageAssetThumbnail(container, state, image) {
+  const liveState = container?.__hmbImageAssetLatestState || state;
+  const asset = imageAssetThumbnailAssetForElement(container, liveState, image);
+  if (!imageAssetThumbnailElementMatchesAsset(image, asset)) return false;
+  const tracking = imageAssetThumbnailRequestTracking(container, liveState);
+  if (!tracking.contextKey) return false;
+  container.__hmbImageAssetThumbnailErrorRetries.delete(clean(asset.asset_library_id));
+  return true;
+}
+
+export function hmbScheduleImageAssetThumbnailRequest(
+  container,
+  state,
+  props,
+  options = {},
+) {
+  if (!container || typeof props?.onChange !== "function") return false;
+  const liveState = container.__hmbImageAssetLatestState || state;
+  if (!liveState || liveState.scan_busy || liveState.thumbnail_busy) return false;
+  const tracking = imageAssetThumbnailRequestTracking(container, liveState);
+  if (!tracking.contextKey) return false;
+  if (imageAssetThumbnailRequestMatchesState(liveState, liveState.thumbnail_request)) {
+    return false;
+  }
+  const requestIds = hmbImageAssetThumbnailRequestIds(
+    liveState,
+    options.limit ?? container.__hmbImageAssetRenderLimit ?? IMAGE_ASSET_RENDER_WINDOW,
+    options.offset ?? container.__hmbImageAssetRenderOffset ?? 0,
+    options,
+  ).filter((key) => !tracking.requested.has(key));
+  if (!requestIds.length) return false;
+
+  const token = (Number(container.__hmbImageAssetThumbnailScheduleToken) || 0) + 1;
+  container.__hmbImageAssetThumbnailScheduleToken = token;
+  hmbAfterImageAssetPaint(() => {
+    if (container.__hmbImageAssetThumbnailScheduleToken !== token) return;
+    const current = container.__hmbImageAssetLatestState || liveState;
+    const currentTracking = imageAssetThumbnailRequestTracking(container, current);
+    if (
+      !currentTracking.contextKey
+      || currentTracking.contextKey !== tracking.contextKey
+      || current.scan_busy
+      || current.thumbnail_busy
+      || typeof props?.onChange !== "function"
+      || imageAssetThumbnailRequestMatchesState(current, current.thumbnail_request)
+      || container.__hmbImageAssetThumbnailPendingRequestId
+    ) return;
+    const currentIds = hmbImageAssetThumbnailRequestIds(
+      current,
+      options.limit ?? container.__hmbImageAssetRenderLimit ?? IMAGE_ASSET_RENDER_WINDOW,
+      options.offset ?? container.__hmbImageAssetRenderOffset ?? 0,
+      options,
+    ).filter((key) => !currentTracking.requested.has(key));
+    if (!currentIds.length) return;
+
+    const requestId = `thumbnail-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const presentationBaseline = {
+      thumbnailRequest: current.thumbnail_request,
+      thumbnailResult: current.thumbnail_result,
+      thumbnailBusy: current.thumbnail_busy,
+      pendingRequestId: container.__hmbImageAssetThumbnailPendingRequestId,
+      requestedIds: new Set(currentTracking.requested),
+    };
+    current.thumbnail_request = {
+      request_id: requestId,
+      project_uid: current.project_uid,
+      manifest_signature: current.manifest_signature,
+      scan_revision: current.scan_revision,
+      asset_library_ids: currentIds,
+    };
+    current.thumbnail_result = {};
+    current.thumbnail_busy = true;
+    currentIds.forEach((key) => currentTracking.requested.add(key));
+    container.__hmbImageAssetThumbnailPendingRequestId = requestId;
+    container.__hmbImageAssetLatestState = current;
+    const revisionBaseline = {
+      uiEditRevision: current[IMAGE_ASSET_UI_EDIT_REVISION_KEY],
+      currentScanRevision: container.__hmbImageAssetCurrentScanRevision,
+      currentUiEditRevision: container.__hmbImageAssetCurrentUiEditRevision,
+      latestLocalUiEditRevision: container.__hmbImageAssetLatestLocalUiEditRevision,
+    };
+    emit(props, current, container, () => {
+      current.thumbnail_request = presentationBaseline.thumbnailRequest;
+      current.thumbnail_result = presentationBaseline.thumbnailResult;
+      current.thumbnail_busy = presentationBaseline.thumbnailBusy;
+      currentTracking.requested.clear();
+      presentationBaseline.requestedIds.forEach((key) => currentTracking.requested.add(key));
+      if (presentationBaseline.pendingRequestId) {
+        container.__hmbImageAssetThumbnailPendingRequestId =
+          presentationBaseline.pendingRequestId;
+      } else {
+        delete container.__hmbImageAssetThumbnailPendingRequestId;
+      }
+      current[IMAGE_ASSET_UI_EDIT_REVISION_KEY] = hmbNormalizeImageAssetRevision(
+        revisionBaseline.uiEditRevision,
+      );
+      container.__hmbImageAssetCurrentScanRevision = revisionBaseline.currentScanRevision;
+      container.__hmbImageAssetCurrentUiEditRevision = revisionBaseline.currentUiEditRevision;
+      container.__hmbImageAssetLatestLocalUiEditRevision =
+        revisionBaseline.latestLocalUiEditRevision;
+    }, {
+      suppressMatchingEcho: true,
+      preserveUiEditRevision: true,
+      onSuccess: () => {
+        if (current.thumbnail_request?.request_id === requestId) {
+          current.thumbnail_request = {};
+        }
+      },
+    });
+  });
+  return true;
 }
 
 export function hmbRenderImageAssetGrid(
@@ -2636,8 +3054,10 @@ export function hmbImageAssetRegistrationSubTypes(taxonomy, sourceType) {
 export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}) {
   if (!hmbImageAssetCanRegister(asset)) return null;
   const mainTypes = registrationMainTypes(taxonomy);
-  const sourceType = mainTypes.includes(clean(asset.image_main_type))
-    ? clean(asset.image_main_type)
+  const assetMainType = clean(asset.image_main_type);
+  const assetSubType = clean(asset.image_sub_type);
+  const sourceType = mainTypes.includes(assetMainType)
+    ? assetMainType
     : "";
   const subTypes = hmbImageAssetRegistrationSubTypes(taxonomy, sourceType);
   const sourceKind = clean(asset.source_kind).toLowerCase() === "user" ? "user" : "project";
@@ -2655,8 +3075,8 @@ export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}) {
     image_name: clean(asset.image_name).slice(0, 256),
     asset_id: clean(asset.asset_id).slice(0, 256),
     image_main_type: sourceType,
-    image_sub_type: subTypes.includes(clean(asset.image_sub_type))
-      ? clean(asset.image_sub_type)
+    image_sub_type: subTypes.includes(assetSubType)
+      ? assetSubType
       : "",
     custom_source_type: clean(asset.custom_source_type).slice(0, 256),
   };
@@ -2838,6 +3258,11 @@ function renderRegistrationDialog(state, draft) {
   const customMainType = draft.image_main_type === "Custom / Context" && draft.image_sub_type === "Custom"
     ? `<label><span>${escapeHtml(imageAssetText(state, "custom_main_type"))}</span><input data-registration-field="custom_source_type" maxlength="256" value="${escapeHtml(draft.custom_source_type)}"/></label>`
     : "";
+  const taxonomyMeaning = imageAssetTaxonomyMeaning(
+    state,
+    draft.image_main_type,
+    draft.image_sub_type,
+  );
   return `
     <div class="asset-registration-backdrop" data-registration-backdrop>
       <section class="asset-passport" role="dialog" aria-modal="true" aria-labelledby="asset-registration-title">
@@ -2845,16 +3270,17 @@ function renderRegistrationDialog(state, draft) {
           <div><small>${escapeHtml(imageAssetText(state, "hmb_project_asset"))}</small><h2 id="asset-registration-title">${escapeHtml(imageAssetText(state, "asset_passport"))}</h2></div>
           <button type="button" data-registration-cancel aria-label="${escapeHtml(imageAssetText(state, "close_registration"))}">&times;</button>
         </header>
-        <div class="passport-photo ${imageSource(asset) ? "" : "fallback"}">${thumbnailImageMarkup(asset)}</div>
+        <div class="passport-photo ${imageSource(asset) ? "" : "fallback thumbnail-loading"}" data-thumbnail-loading="${imageSource(asset) ? "false" : "true"}">${thumbnailImageMarkup(asset)}</div>
         <div class="passport-file"><b>${escapeHtml(asset.relative_path || asset.path || asset.media_ref_kind)}</b><span>${asset.width && asset.height ? `${asset.width} × ${asset.height}` : escapeHtml(imageAssetText(state, "metadata_pending"))}</span></div>
         <div class="passport-fields">
           ${registrationFolderField(state, draft, externalImport)}
           <label><span>${escapeHtml(imageAssetText(state, "final_image_name"))}</span><input data-registration-field="image_name" maxlength="256" value="${escapeHtml(draft.image_name)}"/></label>
           <label><span>${escapeHtml(imageAssetText(state, "asset_id"))}</span><input data-registration-field="asset_id" maxlength="256" value="${escapeHtml(draft.asset_id)}"/></label>
           <label><span>${escapeHtml(imageAssetText(state, "main_type_label"))}</span><select data-registration-main>${registrationOptions(state, mainTypes, draft.image_main_type, imageAssetText(state, "select_main_type"))}</select></label>
-          ${customMainType}
-          <label><span>${escapeHtml(imageAssetText(state, "sub_type_label"))}</span><select data-registration-sub ${draft.image_main_type ? "" : "disabled"}>${registrationOptions(state, subTypes, draft.image_sub_type, imageAssetText(state, "select_sub_type"))}</select></label>
-        </div>
+           ${customMainType}
+           <label><span>${escapeHtml(imageAssetText(state, "sub_type_label"))}</span><select data-registration-sub ${draft.image_main_type ? "" : "disabled"}>${registrationOptions(state, subTypes, draft.image_sub_type, imageAssetText(state, "select_sub_type"))}</select></label>
+          <div class="passport-taxonomy-contract" ${taxonomyMeaning ? "" : "hidden"}><small>${escapeHtml(imageAssetText(state, "taxonomy_contract"))}</small><span>${escapeHtml(taxonomyMeaning)}</span></div>
+         </div>
         <footer class="passport-actions">
           <button type="button" data-registration-cancel>${escapeHtml(imageAssetText(state, "cancel"))}</button>
           <button type="button" class="passport-register" data-registration-submit ${registrationDraftIsComplete(draft) ? "" : "disabled"}>${escapeHtml(imageAssetText(state, "register_asset"))}</button>
@@ -2914,7 +3340,7 @@ function renderImageAssetCompactAsset(asset, index, shotUuid) {
   const media = source
     ? `<img data-hmb-compact-src="${escapeHtml(source)}" alt="" draggable="false" loading="lazy" decoding="async" fetchpriority="low"/>`
     : `<span class="compact-shot-placeholder" aria-hidden="true"></span>`;
-  return `<article class="compact-shot-asset" data-compact-asset-key="${escapeHtml(key)}" data-shot-source-uid="${escapeHtml(sourceUid)}" data-shot-uuid="${escapeHtml(shotUuid)}" data-compact-order="${index + 1}" title="${escapeHtml(name)}">
+  return `<article class="compact-shot-asset ${source ? "" : "thumbnail-loading"}" data-thumbnail-loading="${source ? "false" : "true"}" data-compact-asset-key="${escapeHtml(key)}" data-shot-source-uid="${escapeHtml(sourceUid)}" data-shot-uuid="${escapeHtml(shotUuid)}" data-compact-order="${index + 1}" title="${escapeHtml(name)}">
       <div class="compact-shot-thumb">${media}<small>${String(index + 1).padStart(2, "0")}</small></div>
       <b>${escapeHtml(name)}</b>
     </article>`;
@@ -2933,6 +3359,70 @@ export function hmbRenderImageAssetCompactSummary(state) {
   return `<section class="library-compact-summary" data-library-compact-summary hidden aria-label="HMBImageAssetLibrary Shot summary">${rows.map(
     (row) => renderImageAssetCompactShotRow(state, row),
   ).join("")}</section>`;
+}
+
+function hmbPatchImageAssetThumbnailFragment(current, markup) {
+  const ownerDocument = current?.ownerDocument
+    || (typeof document !== "undefined" ? document : null);
+  if (!current || !ownerDocument?.createElement) return false;
+  const template = ownerDocument.createElement("template");
+  template.innerHTML = String(markup || "").trim();
+  const desired = template.content?.firstElementChild;
+  return Boolean(desired && hmbPatchImageAssetElement(current, desired));
+}
+
+export function hmbPatchImageAssetThumbnailMedia(container, state, assetLibraryIds) {
+  if (!container || !state) return 0;
+  const changed = new Set(uniqueStrings(assetLibraryIds));
+  if (!changed.size) return 0;
+  const assetsById = new Map(
+    state.assets.map((asset) => [clean(asset.asset_library_id), asset]),
+  );
+  const assetsBySourceUid = new Map(
+    state.assets.map((asset) => [clean(asset.source_uid), asset]),
+  );
+  let patched = 0;
+  Array.from(container.querySelectorAll?.("[data-asset-key]") || []).forEach((card) => {
+    const asset = assetsById.get(clean(card.getAttribute?.("data-asset-key")));
+    const thumbnail = card.querySelector?.(".asset-thumb");
+    if (!asset || !thumbnail || !changed.has(asset.asset_library_id)) return;
+    if (hmbPatchImageAssetThumbnailFragment(thumbnail, assetThumbnailHtml(asset, state))) {
+      patched += 1;
+    }
+  });
+  Array.from(container.querySelectorAll?.("[data-selected-key]") || []).forEach((card) => {
+    const asset = assetsById.get(clean(card.getAttribute?.("data-selected-key")));
+    const thumbnail = card.querySelector?.(".selected-thumb");
+    if (!asset || !thumbnail || !changed.has(asset.asset_library_id)) return;
+    if (hmbPatchImageAssetThumbnailFragment(
+      thumbnail,
+      thumbnailHtml(asset, "selected-thumb"),
+    )) patched += 1;
+  });
+  Array.from(container.querySelectorAll?.("[data-compact-asset-key]") || []).forEach((card) => {
+    const asset = assetsBySourceUid.get(clean(card.getAttribute?.("data-shot-source-uid")));
+    if (!asset || !changed.has(asset.asset_library_id)) return;
+    const index = Math.max(0, Number(card.getAttribute?.("data-compact-order")) - 1 || 0);
+    const shotUuid = clean(card.getAttribute?.("data-shot-uuid"));
+    if (hmbPatchImageAssetThumbnailFragment(
+      card,
+      renderImageAssetCompactAsset(asset, index, shotUuid),
+    )) patched += 1;
+  });
+  const draftId = clean(container.__hmbImageAssetRegistrationDraft?.asset_library_id);
+  if (draftId && changed.has(draftId)) {
+    const asset = assetsById.get(draftId);
+    const passport = container.querySelector?.(".passport-photo");
+    if (
+      asset
+      && passport
+      && hmbPatchImageAssetThumbnailFragment(
+        passport,
+        `<div class="passport-photo ${imageSource(asset) ? "" : "fallback thumbnail-loading"}" data-thumbnail-loading="${imageSource(asset) ? "false" : "true"}">${thumbnailImageMarkup(asset)}</div>`,
+      )
+    ) patched += 1;
+  }
+  return patched;
 }
 
 function hmbSetImageAssetCompactThumbnailsActive(summary, active) {
@@ -3038,6 +3528,7 @@ function render(
       .workspace{display:grid;grid-template-columns:minmax(230px,252px) minmax(0,1fr);gap:8px;min-height:0;padding:8px}.panel{min-height:0;border:1px solid var(--line);border-radius:9px;background:rgba(8,13,23,.76);overflow:hidden}.tree-panel{display:flex;flex-direction:column}.panel-title{height:35px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 10px;border-bottom:1px solid var(--line);background:rgba(19,27,42,.78);color:#bed0e3;font-size:9px;font-weight:900;letter-spacing:.07em}.panel-title>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;word-break:keep-all}.panel-title b{flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--accent);font-size:8px}.tree{padding:6px;overflow:auto;scrollbar-gutter:stable}.tree-row{width:100%;min-height:30px;display:grid;grid-template-columns:13px minmax(0,1fr) auto;align-items:center;gap:5px;margin:0 0 3px;padding:5px 8px 5px calc(8px + var(--tree-depth,0) * 14px);border:1px solid transparent;border-radius:6px;background:transparent;color:#96a9bd;font-size:8px;text-align:left;cursor:pointer;transition:border-color 120ms ease,background-color 120ms ease,color 120ms ease}.tree-row i{color:#61778c;font-style:normal}.tree-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tree-row b{color:#587087}.tree-row:hover{border-color:rgba(34,211,238,.3);color:#def9ff}.tree-row.active{border-color:rgba(34,211,238,.52);background:linear-gradient(90deg,rgba(8,145,178,.2),rgba(8,145,178,.04));color:#e7fcff}.tree-row.root{min-height:35px;color:#fff;font-size:10px;font-weight:850}
       .assets-panel{display:flex;flex-direction:column}.toolbar{height:44px;display:flex;align-items:center;gap:8px;padding:7px 9px;border-bottom:1px solid var(--line)}.toolbar input{flex:1;height:30px;border:1px solid rgba(148,163,184,.25);border-radius:7px;background:#070c15;color:#edf5ff;padding:0 9px;font-size:9px;outline:none}.toolbar input:focus{border-color:var(--accent)}.filter-chip{max-width:260px;padding:5px 8px;border:1px solid rgba(244,114,182,.3);border-radius:99px;background:rgba(131,24,67,.1);color:#f8c6df;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-scroll{flex:1;min-height:0;overflow:auto;scrollbar-gutter:stable;padding:9px}.asset-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px}.asset-card{display:grid;grid-template-columns:112px minmax(0,1fr);gap:10px;min-height:152px;padding:9px;border:1px solid rgba(148,163,184,.16);border-radius:9px;background:linear-gradient(145deg,rgba(19,27,42,.86),rgba(9,14,24,.82));cursor:pointer;outline:none;content-visibility:auto;contain-intrinsic-size:167px;transition:border-color 120ms ease,box-shadow 120ms ease,background-color 120ms ease,opacity 120ms ease}.asset-card:hover{border-color:rgba(34,211,238,.34)}.asset-card:focus-visible{box-shadow:0 0 0 2px rgba(34,211,238,.45)}.asset-card.selected{border-color:var(--asset-selection);box-shadow:inset 0 0 0 .3px rgba(244,114,182,.45),0 0 15px rgba(244,114,182,.34),0 0 4px rgba(217,70,239,.55)}.asset-card.selection-blocked{opacity:.58}.asset-card.unregistered{cursor:default}.asset-card.unregistered .asset-state{color:#f3a8ce}.asset-thumb{position:relative;width:112px;height:132px;display:grid;grid-template-rows:2fr 1fr;overflow:hidden;border:1px solid rgba(148,163,184,.2);border-radius:7px;background:#050910;color:#648198;font-size:9px;font-weight:900}.asset-thumb-media{position:relative;display:grid;place-items:center;min-height:0;overflow:hidden;border-bottom:1px solid rgba(148,163,184,.18)}.asset-thumb-media img{width:100%;height:100%;object-fit:cover}.asset-thumb-media>span{display:none}.asset-thumb.fallback .asset-thumb-media img{display:none}.asset-thumb.fallback .asset-thumb-media>span{display:block}.asset-thumb-footer{display:flex;align-items:center;justify-content:center;gap:6px;min-height:0;padding:4px 6px;background:linear-gradient(180deg,#080d16,#050810)}.asset-source-name{min-width:0;flex:1;color:#a8bdd0;font-size:8px;font-weight:800;line-height:1.25;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-extension-badge{flex:0 0 auto;max-width:48px;padding:3px 5px;border:1px solid rgba(34,211,238,.4);border-radius:5px;background:rgba(8,145,178,.1);color:var(--accent);font-family:inherit;font-size:7px;font-weight:900;line-height:1;letter-spacing:.07em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-thumb-media .asset-add{position:absolute;right:5px;bottom:5px;z-index:2}.asset-add{min-width:56px;height:25px;padding:0 13px;border:1px solid rgba(244,114,182,.7);border-radius:99px;background:rgba(131,24,67,.26);color:#ffd5eb;font-size:9px;font-weight:950;letter-spacing:.04em;cursor:pointer;box-shadow:0 0 10px rgba(244,114,182,.16)}.asset-add:hover{border-color:#f9a8d4;background:rgba(190,24,93,.32);box-shadow:0 0 13px rgba(244,114,182,.3)}.asset-content{display:flex;flex-direction:column;gap:8px}.asset-title{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.asset-title-copy{display:flex;flex:1;flex-direction:column;gap:2px;min-width:0}.asset-state{color:var(--accent);font-size:7px;font-weight:900}.asset-id-line{display:flex;align-items:center;gap:5px;min-width:0;color:#9bacc0;font-size:7px;font-weight:500}.asset-id-line em{flex:0 0 auto;color:#6e859c;font-size:6px;font-style:normal;font-weight:900;letter-spacing:.05em}.asset-id-line span{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-meta{display:flex;flex-direction:column;gap:3px;color:#71879c;font-size:7px}.asset-meta b,.asset-meta span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-meta b{color:#bcd0e2}.empty{grid-column:1/-1;padding:30px;border:1px dashed rgba(148,163,184,.2);border-radius:8px;color:#667e94;font-size:9px;text-align:center}.warnings{max-height:64px;overflow:auto;padding:6px 9px;border-top:1px solid rgba(251,191,36,.2);background:rgba(120,53,15,.1);color:#fcd34d;font-size:7px}
       .asset-window-nav{grid-column:1/-1;display:flex;justify-content:center;gap:8px}.asset-window-more{min-width:160px;min-height:34px;border:1px solid rgba(34,211,238,.3);border-radius:8px;background:rgba(8,145,178,.1);color:#a5f3fc;font-size:9px;font-weight:850;cursor:pointer}.asset-window-more:hover,.asset-window-more:focus-visible{border-color:var(--accent);outline:none;background:rgba(8,145,178,.18)}
+      @keyframes hmb-image-thumbnail-loading{0%{background-position:120% 0}100%{background-position:-120% 0}}.thumbnail-loading .thumbnail-placeholder,.thumbnail-loading .asset-thumb-placeholder,.thumbnail-loading .compact-shot-placeholder{display:block;width:100%;height:100%;background:linear-gradient(100deg,rgba(31,41,55,.72) 20%,rgba(71,85,105,.72) 42%,rgba(31,41,55,.72) 64%);background-size:220% 100%;animation:hmb-image-thumbnail-loading 1.25s ease-in-out infinite}.thumbnail-loading .thumbnail-placeholder{min-width:100%;min-height:100%}@media (prefers-reduced-motion:reduce){.thumbnail-loading .thumbnail-placeholder,.thumbnail-loading .asset-thumb-placeholder,.thumbnail-loading .compact-shot-placeholder{animation:none;background:rgba(31,41,55,.78)}}
       .shot-panel .shot-rename{width:29px;height:29px;flex:0 0 29px;padding:0;border:1px solid rgba(var(--shot-rgb),.42);border-radius:7px;background:rgba(var(--shot-rgb),.10);color:var(--shot-accent);font-size:13px;cursor:pointer}.shot-panel .shot-rename:hover,.shot-panel .shot-rename:focus-visible{border-color:var(--shot-accent);background:rgba(var(--shot-rgb),.22);outline:none}.shot-name-input{width:min(180px,100%);height:24px;border:1px solid var(--shot-accent);border-radius:5px;background:#060b13;color:#f8fafc;padding:0 6px;font:inherit;outline:none;box-shadow:0 0 0 2px rgba(var(--shot-rgb),.2)}
       .toolbar-status{flex:0 0 190px;width:190px;min-width:190px;height:30px;display:flex;align-items:center;justify-content:flex-end;overflow:hidden;color:var(--muted);font-size:8px}.toolbar-status strong{display:block;width:100%;color:${state.error ? "#fda4af" : "#86efac"};font-variant-numeric:tabular-nums;letter-spacing:-.02em;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.toolbar .filter-chip{flex:0 0 120px;width:120px;max-width:120px;text-align:center}
       .asset-view-toggle{flex:0 0 31px;width:31px;height:30px;display:grid;place-items:center;padding:0;border:1px solid rgba(96,165,250,.46);border-radius:7px;background:linear-gradient(180deg,rgba(37,99,235,.2),rgba(15,23,42,.88));color:#7dd3fc;cursor:pointer}.asset-view-toggle:hover,.asset-view-toggle:focus-visible,.asset-view-toggle[aria-pressed="true"]{border-color:var(--accent);background:linear-gradient(180deg,rgba(37,99,235,.38),rgba(15,23,42,.94));color:#e0f2fe;outline:none;box-shadow:0 0 10px rgba(34,211,238,.2)}.asset-view-toggle svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
@@ -3047,7 +3538,7 @@ function render(
       .shot-routing{margin:0 8px 8px;border:1px solid rgba(34,211,238,.3);border-radius:9px;background:linear-gradient(180deg,rgba(7,28,40,.94),rgba(6,10,18,.98));overflow:hidden}.shot-routing-head{height:38px;display:flex;align-items:center;gap:7px;padding:0 8px}.shot-toggle,.shot-add,.shot-tab,.shot-source button{border:1px solid rgba(34,211,238,.24);border-radius:6px;background:#08131e;color:#a9c6d8;cursor:pointer}.shot-toggle{width:25px;height:25px;padding:0;color:var(--accent)}.shot-routing-head>b{font-size:8px;letter-spacing:.08em;color:var(--accent);white-space:nowrap}.shot-channel{max-width:58px;color:#5f7f94;font-size:7px;font-family:ui-monospace,monospace}.shot-tabs{display:flex;flex:1;align-items:center;gap:5px;min-width:0;overflow-x:auto;padding:2px}.shot-tab{height:27px;display:flex;align-items:center;gap:5px;padding:0 7px;white-space:nowrap}.shot-tab small{color:#5e7e93;font-size:6px}.shot-tab b{max-width:92px;overflow:hidden;text-overflow:ellipsis;font-size:8px}.shot-tab em{color:#6f90a5;font-size:7px;font-style:normal}.shot-tab.active{border-color:var(--accent);background:rgba(8,145,178,.18);color:#e6fbff}.shot-add{height:27px;padding:0 9px;color:#bceef5;font-size:8px;font-weight:900;white-space:nowrap}.shot-add:disabled,.shot-source button:disabled{opacity:.28;cursor:default}.shot-routing-body{min-height:78px;display:grid;grid-template-columns:190px minmax(0,1fr);gap:8px;padding:7px 9px 9px;border-top:1px solid rgba(34,211,238,.14)}.shot-routing-summary{display:flex;flex-direction:column;gap:3px;padding:7px;border:1px solid rgba(34,211,238,.16);border-radius:7px;background:rgba(4,14,24,.65)}.shot-routing-summary b{color:#d9f8ff;font-size:10px}.shot-routing-summary span{color:var(--accent);font-size:8px;font-weight:900}.shot-routing-summary small{color:#708ba0;font-size:7px;line-height:1.35}.shot-sources{display:flex;align-content:flex-start;gap:5px;overflow-x:auto;padding:3px}.shot-source{height:30px;display:flex;flex:0 0 auto;align-items:stretch}.shot-source>button:first-child{max-width:145px;display:flex;align-items:center;gap:5px;padding:0 7px}.shot-source i{color:#5d7d91;font-size:8px;font-style:normal}.shot-source span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:8px}.shot-source.selected>button:first-child{border-color:rgba(244,114,182,.62);background:rgba(131,24,67,.22);color:#ffe0f1}.shot-source.selected i{color:#f9a8d4}.shot-source .shot-source-move{width:22px;margin-left:2px;padding:0;color:#8eb6ca}.shot-routing-empty{align-self:center;color:#607b90;font-size:8px}
       .shot-stack{max-height:360px;margin:0 8px 8px;display:flex;flex-direction:column;gap:5px;overflow:auto;scrollbar-gutter:stable}.shot-panel{flex:0 0 auto;overflow:hidden;border:1px solid rgba(var(--shot-rgb),.34);border-radius:10px;background:linear-gradient(180deg,rgba(var(--shot-rgb),.10),rgba(8,11,19,.96));box-shadow:0 0 16px rgba(var(--shot-rgb),.07)}.shot-panel-head{height:38px;display:flex;align-items:center;gap:6px;padding:4px 7px;border-bottom:1px solid transparent}.shot-panel.active .shot-panel-head{border-bottom-color:rgba(var(--shot-rgb),.20)}.shot-panel-toggle{height:29px;min-width:0;flex:1;display:grid;grid-template-columns:30px minmax(70px,auto) minmax(120px,1fr) auto auto;align-items:center;gap:7px;padding:0 8px;border:1px solid rgba(var(--shot-rgb),.32);border-radius:7px;background:linear-gradient(90deg,rgba(var(--shot-rgb),.16),rgba(8,13,23,.72));color:#d9e6f3;text-align:left;cursor:pointer}.shot-panel-toggle small{color:var(--shot-accent);font-size:8px;font-weight:950}.shot-panel-toggle b{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f8fafc;font-size:10px}.shot-panel-toggle span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(var(--shot-rgb),.92);font-size:8px;font-weight:900;letter-spacing:.06em}.shot-panel-toggle em{color:var(--shot-accent);font-size:8px;font-style:normal;font-weight:900}.shot-panel-toggle i{color:#7f95a8;font-size:7px;font-style:normal;letter-spacing:.08em}.shot-panel.active{border-color:rgba(var(--shot-rgb),.68);box-shadow:0 0 18px rgba(var(--shot-rgb),.14)}.shot-panel.active .shot-panel-toggle{border-color:var(--shot-accent);box-shadow:0 0 10px rgba(var(--shot-rgb),.14)}.shot-panel .shot-delete{width:29px;height:29px;flex:0 0 29px;padding:0;border:1px solid rgba(var(--shot-rgb),.42);border-radius:7px;background:rgba(var(--shot-rgb),.10);color:var(--shot-accent);font-size:16px;line-height:1;cursor:pointer}.shot-panel .shot-delete:hover:not(:disabled),.shot-panel .shot-delete:focus-visible{border-color:var(--shot-accent);background:rgba(var(--shot-rgb),.22);outline:none;box-shadow:0 0 10px rgba(var(--shot-rgb),.18)}.shot-panel .shot-delete:disabled{opacity:.25;cursor:default}.shot-panel .shot-add{height:29px;padding:0 11px;border:1px solid rgba(var(--shot-rgb),.54);border-radius:7px;background:rgba(var(--shot-rgb),.14);color:var(--shot-accent);font-size:8px;font-weight:950;white-space:nowrap;cursor:pointer}.shot-panel .shot-add:disabled{opacity:.3;cursor:default}.shot-panel .tray-scroll{height:132px;display:flex;align-items:stretch;gap:8px;overflow-x:auto;overflow-y:hidden;padding:7px}.shot-panel .selected-card{border-color:rgba(var(--shot-rgb),.30);background:linear-gradient(145deg,rgba(var(--shot-rgb),.15),rgba(12,17,28,.94))}.shot-panel .selected-thumb{border-color:rgba(var(--shot-rgb),.30)}.shot-panel .slot{border-color:rgba(var(--shot-rgb),.70);background:rgba(var(--shot-rgb),.20);color:var(--shot-accent)}.shot-panel .tray-empty{border-color:rgba(var(--shot-rgb),.22);color:rgba(var(--shot-rgb),.72)}.hmb-image-assets .asset-card.selected{border-color:var(--active-shot-accent);box-shadow:inset 0 0 0 .3px rgba(var(--active-shot-rgb),.48),0 0 15px rgba(var(--active-shot-rgb),.34),0 0 4px rgba(var(--active-shot-rgb),.55)}
       .asset-registration-backdrop{position:absolute;inset:0;z-index:80;display:grid;place-items:center;padding:18px;background:rgba(1,4,10,.78);backdrop-filter:blur(5px)}.asset-passport{width:min(390px,100%);max-height:calc(100% - 12px);display:flex;flex-direction:column;overflow:auto;border:1px solid rgba(244,114,182,.62);border-radius:18px 18px 28px 28px;background:radial-gradient(circle at 50% -8%,rgba(190,24,93,.24),transparent 30%),linear-gradient(180deg,#171020,#090d17 45%,#060912);box-shadow:0 24px 70px rgba(0,0,0,.62),0 0 28px rgba(244,114,182,.2)}.passport-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 10px;border-bottom:1px solid rgba(244,114,182,.2)}.passport-head small{display:block;color:#d8a2be;font-size:7px;font-weight:900;letter-spacing:.18em}.passport-head h2{margin:3px 0 0;color:#fff1f8;font-size:15px;letter-spacing:.08em}.passport-head button{width:28px;height:28px;border:1px solid rgba(244,114,182,.25);border-radius:50%;background:#0b0d16;color:#e7b9d1;font-size:18px;line-height:1;cursor:pointer}.passport-photo{position:relative;width:128px;aspect-ratio:3/4;display:grid;place-items:center;align-self:center;margin:14px 0 8px;overflow:hidden;border:1px solid rgba(244,114,182,.38);border-radius:8px;background:#050910;color:#84677a;font-size:10px;font-weight:900;box-shadow:0 0 18px rgba(244,114,182,.12)}.passport-photo img{width:100%;height:100%;object-fit:cover}.passport-photo>span{display:none}.passport-photo.fallback img{display:none}.passport-photo.fallback>span{display:block}.passport-file{display:flex;flex-direction:column;gap:3px;padding:0 18px 12px;text-align:center}.passport-file b,.passport-file span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.passport-file b{color:#d7e2ef;font-size:8px}.passport-file span{color:#73899d;font-size:7px}.passport-fields{display:grid;grid-template-columns:1fr 1fr;gap:9px;padding:12px 16px;border-top:1px dashed rgba(244,114,182,.24)}.passport-fields label{display:flex;flex-direction:column;gap:4px}.passport-fields label:nth-last-child(1){grid-column:1/-1}.passport-fields label span{color:#bb8fa8;font-size:7px;font-weight:900;letter-spacing:.06em}.passport-fields input,.passport-fields select{width:100%;height:32px;border:1px solid rgba(148,163,184,.27);border-radius:7px;background:#060b13;color:#eef5ff;padding:0 8px;font-size:9px;outline:none}.passport-fields input:focus,.passport-fields select:focus{border-color:var(--asset-selection);box-shadow:0 0 0 1px rgba(244,114,182,.18)}.passport-fields select:disabled{opacity:.42}.passport-actions{display:flex;justify-content:flex-end;gap:7px;padding:11px 16px 15px}.passport-actions button{height:31px;padding:0 13px;border:1px solid rgba(148,163,184,.24);border-radius:7px;background:#0a101a;color:#bac9d8;font-size:8px;font-weight:900;cursor:pointer}.passport-actions .passport-register{border-color:rgba(244,114,182,.62);background:linear-gradient(180deg,rgba(190,24,93,.55),rgba(88,28,135,.42));color:#ffe4f2;box-shadow:0 0 12px rgba(244,114,182,.18)}.passport-actions button:disabled{opacity:.32;cursor:default;box-shadow:none}
-      .passport-fields .passport-folder{grid-column:1/-1}
+      .passport-fields .passport-folder{grid-column:1/-1}.passport-taxonomy-contract{grid-column:1/-1;display:flex;flex-direction:column;gap:4px;padding:8px 9px;border:1px solid rgba(148,163,184,.18);border-radius:7px;background:rgba(2,6,14,.58)}.passport-taxonomy-contract[hidden]{display:none}.passport-taxonomy-contract small{color:#bb8fa8;font-size:7px;font-weight:900;letter-spacing:.06em}.passport-taxonomy-contract span{color:#cbd8e6;font-size:8px;line-height:1.45}
       /* Fixed P-base visual language. Shot 1-5 are the only accent authority. */
       .hmb-image-assets[data-theme] .top{background:linear-gradient(90deg,var(--header-tint),rgba(14,23,38,.92) 44%,rgba(6,9,18,.96))}.hmb-image-assets[data-theme] .mark{border-color:rgba(var(--selection-rgb),.54);background:linear-gradient(145deg,rgba(var(--selection-rgb),.16),rgba(8,13,23,.86));color:var(--accent);box-shadow:inset 0 0 0 1px rgba(255,255,255,.025),0 0 14px rgba(var(--selection-rgb),.11)}
       .hmb-image-assets[data-theme] .filter-chip{border-color:rgba(var(--selection-rgb),.3);background:rgba(var(--selection-deep-rgb),.1);color:var(--selection-text)}.hmb-image-assets[data-theme] .asset-card.selected{box-shadow:inset 0 0 0 .3px rgba(var(--selection-rgb),.45),0 0 15px rgba(var(--selection-rgb),.34),0 0 4px rgba(var(--selection-secondary-rgb),.55)}.hmb-image-assets[data-theme] .asset-card.unregistered .asset-state{color:var(--selection-soft)}.hmb-image-assets[data-theme] .asset-add{border-color:rgba(var(--selection-rgb),.7);background:rgba(var(--selection-deep-rgb),.26);color:var(--selection-strong);box-shadow:0 0 10px rgba(var(--selection-rgb),.16)}.hmb-image-assets[data-theme] .asset-add:hover{border-color:var(--selection-soft);background:rgba(var(--selection-deep-rgb),.34);box-shadow:0 0 13px rgba(var(--selection-rgb),.3)}
@@ -3233,13 +3724,130 @@ export function hmbSetImageAssetNativeResizeLocked(container, locked) {
   return true;
 }
 
-function hmbImageAssetNodeIdentity(nodeRoot) {
-  const id = clean(
+function hmbImageAssetNodeId(nodeRoot) {
+  return clean(
     nodeRoot?.getAttribute?.("data-id")
     || nodeRoot?.getAttribute?.("data-node-id")
     || nodeRoot?.getAttribute?.("data-nodeid"),
   );
-  return id ? `id:${id}` : nodeRoot;
+}
+
+function hmbImageAssetNodeIdentity(nodeRoot) {
+  const id = hmbImageAssetNodeId(nodeRoot);
+  // Temporary ids are recyclable host labels, not stable node identities.
+  // Key them by their exact shell until React Flow publishes the final id.
+  return id && !id.endsWith("_temp") ? `id:${id}` : nodeRoot;
+}
+
+function hmbImageAssetTempFinalIdentityRename(previousId, nextId) {
+  return previousId.endsWith("_temp") && nextId === previousId.slice(0, -5);
+}
+
+function hmbImageAssetCompactKeyHasOtherOwner(nodeKey, excludedContainer = null) {
+  if (!nodeKey) return false;
+  return Array.from(imageAssetMountedContainers).some((candidate) => (
+    candidate !== excludedContainer
+    && candidate.__hmbImageAssetCompact === true
+    && candidate.__hmbImageAssetRecordedNodeKey === nodeKey
+  ));
+}
+
+function hmbReleaseImageAssetCompactKey(nodeKey, excludedContainer = null) {
+  if (!nodeKey || hmbImageAssetCompactKeyHasOtherOwner(nodeKey, excludedContainer)) return false;
+  return imageAssetCompactNodeKeys.delete(nodeKey);
+}
+
+// React Flow assigns a temporary data-id before finalizing a newly-created
+// node. Record every identity observed by this mount so teardown never derives
+// cleanup solely from the mutable, final DOM attribute. The exact `_temp` ->
+// final rename is the only identity transition allowed to carry compact state;
+// arbitrary id reuse is treated as a different node.
+export function hmbImageAssetRecordedNodeIdentity(container) {
+  if (!container) return null;
+  const nodeRoot = findNodeRoot(container);
+  const currentId = hmbImageAssetNodeId(nodeRoot);
+  const currentKey = hmbImageAssetNodeIdentity(nodeRoot);
+  if (!currentKey) return null;
+  const hasRecordedKey = Object.prototype.hasOwnProperty.call(
+    container,
+    "__hmbImageAssetRecordedNodeKey",
+  );
+  const previousKey = hasRecordedKey
+    ? container.__hmbImageAssetRecordedNodeKey
+    : null;
+  const previousId = clean(container.__hmbImageAssetRecordedNodeId);
+  if (!hasRecordedKey) {
+    container.__hmbImageAssetRecordedNodeKey = currentKey;
+    container.__hmbImageAssetRecordedNodeId = currentId;
+    container.__hmbImageAssetRecordedNodeRoot = nodeRoot;
+  } else if (previousKey !== currentKey) {
+    const carryCompact = hmbImageAssetTempFinalIdentityRename(previousId, currentId)
+      && (
+        imageAssetCompactNodeKeys.has(previousKey)
+        || container.__hmbImageAssetCompact === true
+      );
+    hmbReleaseImageAssetCompactKey(previousKey, container);
+    if (carryCompact) imageAssetCompactNodeKeys.add(currentKey);
+    container.__hmbImageAssetRecordedNodeKey = currentKey;
+    container.__hmbImageAssetRecordedNodeId = currentId;
+    container.__hmbImageAssetRecordedNodeRoot = nodeRoot;
+  } else {
+    container.__hmbImageAssetRecordedNodeId = currentId;
+    container.__hmbImageAssetRecordedNodeRoot = nodeRoot;
+  }
+  let recordedKeys = container.__hmbImageAssetRecordedNodeKeys;
+  if (!(recordedKeys instanceof Set)) {
+    recordedKeys = new Set();
+    container.__hmbImageAssetRecordedNodeKeys = recordedKeys;
+  }
+  recordedKeys.add(currentKey);
+  return currentKey;
+}
+
+export function hmbAttachImageAssetRegistryContainer(container) {
+  if (!container) return null;
+  imageAssetMountedContainers.add(container);
+  return hmbImageAssetRecordedNodeIdentity(container);
+}
+
+export function hmbRememberImageAssetCompactRegistry(container, compactMode) {
+  const nodeKey = hmbImageAssetRecordedNodeIdentity(container);
+  if (!nodeKey) return false;
+  if (compactMode) imageAssetCompactNodeKeys.add(nodeKey);
+  else imageAssetCompactNodeKeys.delete(nodeKey);
+  return imageAssetCompactNodeKeys.has(nodeKey);
+}
+
+export function hmbImageAssetCompactRegistryHas(container) {
+  const nodeKey = hmbImageAssetRecordedNodeIdentity(container);
+  return !!nodeKey && imageAssetCompactNodeKeys.has(nodeKey);
+}
+
+export function hmbDetachImageAssetRegistryContainer(container) {
+  if (!container) return false;
+  if (!imageAssetMountedContainers.has(container)) {
+    delete container.__hmbImageAssetRecordedNodeKey;
+    delete container.__hmbImageAssetRecordedNodeId;
+    delete container.__hmbImageAssetRecordedNodeRoot;
+    delete container.__hmbImageAssetRecordedNodeKeys;
+    return false;
+  }
+  const nodeRoot = findNodeRoot(container);
+  hmbImageAssetRecordedNodeIdentity(container);
+  const recordedKeys = container.__hmbImageAssetRecordedNodeKeys instanceof Set
+    ? Array.from(container.__hmbImageAssetRecordedNodeKeys)
+    : [container.__hmbImageAssetRecordedNodeKey].filter(Boolean);
+  const wasMounted = imageAssetMountedContainers.delete(container);
+  recordedKeys.forEach((nodeKey) => hmbReleaseImageAssetCompactKey(nodeKey, container));
+  const currentKey = hmbImageAssetNodeIdentity(nodeRoot);
+  if (!currentKey || !imageAssetCompactNodeKeys.has(currentKey)) {
+    nodeRoot?.removeAttribute?.(IMAGE_ASSET_COMPACT_NODE_ATTRIBUTE);
+  }
+  delete container.__hmbImageAssetRecordedNodeKey;
+  delete container.__hmbImageAssetRecordedNodeId;
+  delete container.__hmbImageAssetRecordedNodeRoot;
+  delete container.__hmbImageAssetRecordedNodeKeys;
+  return wasMounted;
 }
 
 function hmbImageAssetStyleValue(element, property) {
@@ -3533,15 +4141,14 @@ export function hmbSetImageAssetLibraryCompact(container, compactMode, options =
 }
 
 function hmbSetImageAssetLibraryCompactGroup(container, compactMode) {
-  const nodeRoot = findNodeRoot(container);
-  const nodeKey = hmbImageAssetNodeIdentity(nodeRoot);
+  const nodeKey = hmbImageAssetRecordedNodeIdentity(container);
   const candidates = [container, ...Array.from(imageAssetMountedContainers).filter(
     (candidate) => (
       candidate !== container
-      && hmbImageAssetNodeIdentity(findNodeRoot(candidate)) === nodeKey
+      && hmbImageAssetRecordedNodeIdentity(candidate) === nodeKey
     ),
   )];
-  if (compactMode) imageAssetCompactNodeKeys.add(nodeKey);
+  hmbRememberImageAssetCompactRegistry(container, compactMode);
   candidates.forEach((candidate) => {
     const candidateRoot = findNodeRoot(candidate);
     if (compactMode) candidateRoot?.setAttribute?.(IMAGE_ASSET_COMPACT_NODE_ATTRIBUTE, "true");
@@ -3555,7 +4162,6 @@ function hmbSetImageAssetLibraryCompactGroup(container, compactMode) {
     }),
   }));
   if (!compactMode) {
-    imageAssetCompactNodeKeys.delete(nodeKey);
     changed.forEach(({ candidate, ok }) => {
       if (ok) candidate.__hmbImageAssetRefreshAfterCompactExpand?.();
     });
@@ -3826,6 +4432,12 @@ function installEvents(container, state, props, remount, listeners) {
       hmbSyncImageAssetCompactEntryState(container, current);
     }
     hmbSetImageAssetLibraryCompactGroup(container, next);
+    hmbScheduleImageAssetThumbnailRequest(
+      container,
+      container.__hmbImageAssetLatestState || state,
+      props,
+      { includeWindow: !next },
+    );
   });
   const assetsByLibraryId = new Map(
     state.assets.map((asset) => [clean(asset.asset_library_id), asset]),
@@ -4108,6 +4720,9 @@ function installEvents(container, state, props, remount, listeners) {
     }
     delete container.__hmbImageAssetSearchTimer;
     hmbReconcileImageAssetCatalog(container, state);
+    hmbScheduleImageAssetThumbnailRequest(container, state, props, {
+      includeWindow: true,
+    });
   };
   on(search, "input", () => {
     state.search = String(search.value || "").slice(0, 256);
@@ -4148,6 +4763,9 @@ function installEvents(container, state, props, remount, listeners) {
         + direction * IMAGE_ASSET_RENDER_WINDOW,
     );
     hmbReconcileImageAssetCatalog(container, state);
+    hmbScheduleImageAssetThumbnailRequest(container, state, props, {
+      includeWindow: true,
+    });
     const nextFocus = container.querySelector?.(
       direction > 0 ? "[data-assets-more]" : "[data-assets-previous]",
     ) || container.querySelector?.(
@@ -4526,6 +5144,21 @@ function installEvents(container, state, props, remount, listeners) {
     const image = event.target;
     if (!image?.matches?.("img")) return;
     image.closest?.(".asset-thumb,.selected-thumb,.passport-photo")?.classList?.add("fallback");
+    hmbHandleImageAssetThumbnailError(
+      container,
+      container.__hmbImageAssetLatestState || state,
+      image,
+      props,
+    );
+  }, true);
+  on(container, "load", (event) => {
+    const image = event.target;
+    if (!image?.matches?.("img")) return;
+    hmbRememberLoadedImageAssetThumbnail(
+      container,
+      container.__hmbImageAssetLatestState || state,
+      image,
+    );
   }, true);
 
   const selectedTray = container.querySelector("[data-shot-tray]");
@@ -4604,7 +5237,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
   if (typeof previousCleanup === "function") previousCleanup();
   const mountToken = ++imageAssetWidgetMountSequence;
   container.__hmbImageAssetMountToken = mountToken;
-  imageAssetMountedContainers.add(container);
+  hmbAttachImageAssetRegistryContainer(container);
   container.setAttribute?.("data-hmb-node-delete-protected", "true");
   props = hmbUpdateImageAssetPropsReference({}, props);
   const rememberNodeInternalsUpdater = (candidate = {}) => {
@@ -4649,6 +5282,9 @@ export default function HMBImageAssetLibraryWidget(container, props) {
       }
       container.__hmbImageAssetLatestState = state;
       hmbPatchCompactImageAssetState(container, state);
+      hmbScheduleImageAssetThumbnailRequest(container, state, props, {
+        includeWindow: false,
+      });
       return state;
     }
     const uiMemory = container.__hmbImageAssetCompactUiMemory
@@ -4693,11 +5329,14 @@ export default function HMBImageAssetLibraryWidget(container, props) {
       !container.__hmbImageAssetCompact
       && (
         currentNodeRoot?.getAttribute?.(IMAGE_ASSET_COMPACT_NODE_ATTRIBUTE) === "true"
-        || imageAssetCompactNodeKeys.has(hmbImageAssetNodeIdentity(currentNodeRoot))
+        || hmbImageAssetCompactRegistryHas(container)
       )
     ) {
       hmbSetImageAssetLibraryCompact(container, true, { geometry: false });
     }
+    hmbScheduleImageAssetThumbnailRequest(container, state, props, {
+      includeWindow: !container.__hmbImageAssetCompact,
+    });
     return state;
   };
 
@@ -4718,7 +5357,30 @@ export default function HMBImageAssetLibraryWidget(container, props) {
       // callback set delivered with its newer sibling.  Ignore it wholesale;
       // otherwise the next user action can publish through an obsolete host
       // callback even though the card DOM correctly stayed on the newer state.
-      if (container.__hmbImageAssetLastConsumedEchoWasStale) return;
+      if (container.__hmbImageAssetLastConsumedEchoWasStale) {
+        const incomingThumbnailState = normalizeState(nextProps?.value);
+        const localThumbnailState = container.__hmbImageAssetLatestState || state;
+        const priorThumbnailRevision = localThumbnailState.thumbnail_revision;
+        const merged = hmbMergeImageAssetThumbnailResponse(
+          localThumbnailState,
+          incomingThumbnailState,
+          container.__hmbImageAssetThumbnailPendingRequestId,
+        );
+        if (merged.thumbnail_revision > priorThumbnailRevision) {
+          state = merged;
+          container.__hmbImageAssetLatestState = state;
+          hmbAcceptImageAssetThumbnailResult(container, state);
+          hmbPatchImageAssetThumbnailMedia(
+            container,
+            state,
+            state.thumbnail_result.completed_asset_library_ids,
+          );
+          hmbScheduleImageAssetThumbnailRequest(container, state, props, {
+            includeWindow: !container.__hmbImageAssetCompact,
+          });
+        }
+        return;
+      }
       props = hmbUpdateImageAssetPropsReference(props, nextProps);
       return;
     }
@@ -4740,6 +5402,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
       }
       hmbInvalidateImageAssetPublication(container);
       const nextState = normalizeState(nextProps?.value);
+      hmbAcceptImageAssetThumbnailResult(container, nextState);
       container.__hmbImageAssetPendingAuthoritativeProps = {
         state: nextState,
       };
@@ -4750,6 +5413,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     if (nextProps?.value === previousPropValue) return;
     hmbInvalidateImageAssetPublication(container);
     const nextState = normalizeState(nextProps?.value);
+    hmbAcceptImageAssetThumbnailResult(container, nextState);
     const currentValue = JSON.stringify(state);
     const nextValue = JSON.stringify(nextState);
     if (currentValue === nextValue) return;
@@ -4765,22 +5429,12 @@ export default function HMBImageAssetLibraryWidget(container, props) {
   container.__hmbImageAssetApplyProps = applyProps;
 
   const cleanup = () => {
-    const compactNodeRoot = findNodeRoot(container);
-    const compactNodeKey = hmbImageAssetNodeIdentity(compactNodeRoot);
     hmbCancelImageAssetCompactGeometrySettle(container);
     if (container.__hmbImageAssetExpandedGeometry) {
       hmbSetImageAssetCompactShellGeometry(container, false);
     }
     hmbSetImageAssetNativeResizeLocked(container, false);
-    imageAssetMountedContainers.delete(container);
-    const sameNodeStillCompact = Array.from(imageAssetMountedContainers).some((candidate) => (
-      candidate.__hmbImageAssetCompact
-      && hmbImageAssetNodeIdentity(findNodeRoot(candidate)) === compactNodeKey
-    ));
-    if (!sameNodeStillCompact) {
-      imageAssetCompactNodeKeys.delete(compactNodeKey);
-      compactNodeRoot?.removeAttribute?.(IMAGE_ASSET_COMPACT_NODE_ATTRIBUTE);
-    }
+    hmbDetachImageAssetRegistryContainer(container);
     hmbInvalidateImageAssetPublication(container);
     // Library removal must be publication-free. A normal structural remount
     // still flushes visible optimistic feedback, but teardown cancels its
@@ -4788,6 +5442,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     // cannot start an onChange against a disposed widget.
     hmbCancelImageAssetSelectionCommit(container);
     hmbForgetImageAssetStateEcho(container);
+    hmbCancelImageAssetThumbnailRequest(container);
     // Invalidate an explicit project action that was queued for the next paint.
     // Its bounded RAF/task may still run, but the token guard makes it inert.
     delete container.__hmbImageAssetSlowActionToken;
@@ -4817,6 +5472,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     delete container.__hmbImageAssetCurrentUiEditRevision;
     delete container.__hmbImageAssetLatestLocalUiEditRevision;
     delete container.__hmbImageAssetLastConsumedEchoWasStale;
+    delete container.__hmbImageAssetThumbnailScheduleToken;
     if (container.__hmbImageAssetSearchTimer != null && typeof clearTimeout === "function") {
       clearTimeout(container.__hmbImageAssetSearchTimer);
     }

@@ -47,8 +47,8 @@ fx.update(
     {
         "present": True,
         "label": "fx.mp4",
-        "video_main_type": "FX / Simulation Reference",
-        "video_sub_type": "Explosion",
+        "video_main_type": "FX Reference",
+        "video_sub_type": "FX Effect Only",
     }
 )
 timing = prompt_library._default_video_item(2)
@@ -88,7 +88,7 @@ fx_contract = agent._assert_fx_timing_source_contract(compiled)
 agent._assert_fx_candidate_matches_signed_runtime(fx_contract)
 assert "asset_path" not in job["images"][0]["identity"]
 assert [video["control_role"] for video in job["videos"]] == [
-    "FX Behavior Only",
+    "FX Effect Only",
     "Timing Only",
 ]
 allowed_source_fact_keys = {
@@ -108,7 +108,7 @@ assert all(
     for source in fx_contract["sources"]
 )
 for source, expected_role in zip(
-    fx_contract["sources"], ("FX Behavior Only", "Timing Only")
+    fx_contract["sources"], ("FX Effect Only", "Timing Only")
 ):
     assert source["selected_role"] == expected_role
 
@@ -233,8 +233,8 @@ range_video.update(
     {
         "present": True,
         "label": "fx",
-        "video_main_type": "FX / Simulation Reference",
-        "video_sub_type": "Explosion",
+        "video_main_type": "FX Reference",
+        "video_sub_type": "FX Effect Only",
     }
 )
 range_image = prompt_library._default_image_item(1)

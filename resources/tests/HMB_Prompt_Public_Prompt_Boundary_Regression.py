@@ -172,7 +172,7 @@ assert set(job) == {
     "connections",
 }
 assert job["schema"] == "hmb-public-job-data"
-assert job["version"] == prompt.PUBLIC_JOB_CONTRACT_VERSION == 2
+assert job["version"] == prompt.PUBLIC_JOB_CONTRACT_VERSION == 3
 assert job["control_only_bindings"] == []
 assert job["frame_ranges"] == []
 assert job["connections"] == {"image_asset": False, "picker": False}

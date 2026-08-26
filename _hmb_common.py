@@ -13,6 +13,7 @@ import re
 import ssl
 import stat
 import sys
+import unicodedata
 import zlib
 from ctypes import wintypes
 from pathlib import Path
@@ -243,6 +244,8 @@ _agent_process_session = _load_agent_process_session_module()
 # a missing creative role is ordinary unclassified metadata, never a gate.
 IMAGE_SOURCE_TYPE_UNCLASSIFIED = "Select Source Type"
 IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED = "Role Required / Select Source Type"
+IMAGE_TAXONOMY_SCHEMA = "hmb-image-taxonomy"
+IMAGE_TAXONOMY_VERSION = 2
 
 IMAGE_SOURCE_TYPE_CHOICES = [
     IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED,
@@ -258,122 +261,48 @@ IMAGE_SOURCE_TYPE_CHOICES = [
     "Color / Look Reference",
     "Color + Look + Lighting Mood Reference",
     "Lighting / Atmosphere Reference",
-    "Scale / Composition Reference",
+    "Relative Size Reference",
     "Custom",
 ]
-
-IMAGE_SCOPE_CHOICES = [
-    "",
-    "Full body / full appearance",
-    "Head / face only",
-    "Eye / expression detail",
-    "Eyes / iris / pupil detail",
-    "Hand / foot / body part detail",
-    "Hair / fur detail",
-    "Costume detail",
-    "Full outfit / complete costume",
-    "Handheld prop",
-    "Attached accessory",
-    "Interactive scene prop",
-    "Independent scene prop",
-    "Main background",
-    "Sky / exterior area",
-    "Set geometry / structure only",
-    "Ground / floor",
-    "Foreground element",
-    "Color mood only",
-    "Lighting mood only",
-    "Render look only",
-    "All color + look + lighting functions",
-    "Scale only",
-    "Composition only",
-    "Scale + composition",
-    "Custom scope",
-]
-
-IMAGE_SCOPE_CHOICES_BY_SOURCE_TYPE = {
-    IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED: [""],
-    IMAGE_SOURCE_TYPE_UNCLASSIFIED: [""],
-    "Ignore / Unused": [""],
-    "Character Appearance": [
-        "",
-        "Full body / full appearance",
-        "Head / face only",
-        "Custom scope",
-    ],
-    "Partial Character Detail": [
-        "",
-        "Head / face only",
-        "Eye / expression detail",
-        "Eyes / iris / pupil detail",
-        "Hand / foot / body part detail",
-        "Hair / fur detail",
-        "Costume detail",
-        "Custom scope",
-    ],
-    "Prop / Accessory": [
-        "",
-        "Handheld prop",
-        "Attached accessory",
-        "Interactive scene prop",
-        "Independent scene prop",
-        "Custom scope",
-    ],
-    "Costume / Clothing": [
-        "",
-        "Costume detail",
-        "Full outfit / complete costume",
-        "Custom scope",
-    ],
-    "Environment / Background": ["", "Main background", "Custom scope"],
-    "Sky / Exterior Background": ["", "Sky / exterior area", "Custom scope"],
-    "Set / Structure": ["", "Set geometry / structure only", "Custom scope"],
-    "Foreground / Ground": [
-        "",
-        "Foreground element",
-        "Ground / floor",
-        "Custom scope",
-    ],
-    "Color / Look Reference": [
-        "",
-        "Color mood only",
-        "Render look only",
-        "Custom scope",
-    ],
-    "Color + Look + Lighting Mood Reference": [
-        "",
-        "All color + look + lighting functions",
-        "Color mood only",
-        "Lighting mood only",
-        "Render look only",
-        "Custom scope",
-    ],
-    "Lighting / Atmosphere Reference": [
-        "",
-        "Lighting mood only",
-        "Custom scope",
-    ],
-    "Scale / Composition Reference": [
-        "",
-        "Scale only",
-        "Composition only",
-        "Scale + composition",
-        "Custom scope",
-    ],
-    "Custom": list(IMAGE_SCOPE_CHOICES),
-}
 
 IMAGE_SYSTEM_TARGETS = {
     "Camera / Composition",
     "Global Look",
+    "ch_all",
+    "bg_all",
+    "ch_all / bg_all",
     "None",
 }
-IMAGE_OWNER_CHOICES = [
-    "",
-    "Camera / Composition",
-    "Global Look",
-    "None",
-]
+IMAGE_RESERVED_TARGET_ALIASES = frozenset({
+    # Retired taxonomy/system words must never become object addresses after
+    # a save/restore or owner/label fallback. They remain private rejection
+    # tokens and are never exposed as current choices.
+    "Scale",
+    "Composition",
+    "Scale / Composition",
+    "Look",
+    "Custom",
+    "self",
+})
+
+
+def image_target_key(value: Any) -> str:
+    """Return the comparison key for one public image Target address."""
+
+    return unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+
+
+IMAGE_SYSTEM_TARGET_KEYS = frozenset(
+    image_target_key(value)
+    for value in (IMAGE_SYSTEM_TARGETS | set(IMAGE_RESERVED_TARGET_ALIASES))
+)
+
+
+def is_image_system_target(value: Any) -> bool:
+    """Match reserved Target addresses without case/width spelling bypasses."""
+
+    return image_target_key(value) in IMAGE_SYSTEM_TARGET_KEYS
+
 
 ACTOR_COLOR_PICK_CHOICES = [
     "Red",
@@ -397,22 +326,6 @@ PATTERN_COLOR_PICK_CHOICES = [
 ]
 OBJECT_COLOR_PICK_CHOICES = GHOST_COLOR_PICK_CHOICES + PATTERN_COLOR_PICK_CHOICES
 COLOR_PICK_CHOICES = ACTOR_COLOR_PICK_CHOICES + OBJECT_COLOR_PICK_CHOICES
-ACTOR_COLOR_PICK_SOURCE_TYPES = {
-    "Character Appearance",
-    "Partial Character Detail",
-    "Costume / Clothing",
-}
-OBJECT_COLOR_PICK_SOURCE_TYPES = {
-    "Prop / Accessory",
-    "Environment / Background",
-    "Sky / Exterior Background",
-    "Set / Structure",
-    "Foreground / Ground",
-    "Color / Look Reference",
-    "Color + Look + Lighting Mood Reference",
-    "Lighting / Atmosphere Reference",
-    "Scale / Composition Reference",
-}
 
 # User-facing image taxonomy.  ``source_type``/``scope`` remain the stable
 # public Agent wire contract; these compact fields are the only authoring
@@ -459,9 +372,9 @@ IMAGE_SUB_TYPE_CHOICES = {
         "Lighting / Atmosphere",
         "Render Look",
         "Color / Look / Lighting",
-        "Scale",
-        "Composition",
-        "Scale / Composition",
+        "ch_Scale",
+        "bg_Scale",
+        "ch_Scale / bg_Scale",
     ],
     "Custom / Context": [
         "Context",
@@ -554,20 +467,59 @@ IMAGE_TAXONOMY_WIRE_MAP = {
         "Color + Look + Lighting Mood Reference",
         "All color + look + lighting functions",
     ),
-    ("Look Reference", "Scale"): (
-        "Scale / Composition Reference",
-        "Scale only",
+    ("Look Reference", "ch_Scale"): (
+        "Relative Size Reference",
+        "Character Relative Size Only",
     ),
-    ("Look Reference", "Composition"): (
-        "Scale / Composition Reference",
-        "Composition only",
+    ("Look Reference", "bg_Scale"): (
+        "Relative Size Reference",
+        "Background Relative Size / Placement Only",
     ),
-    ("Look Reference", "Scale / Composition"): (
-        "Scale / Composition Reference",
-        "Scale + composition",
+    ("Look Reference", "ch_Scale / bg_Scale"): (
+        "Relative Size Reference",
+        "Character / Background Relative Size / Placement Only",
     ),
-    ("Custom / Context", "Context"): ("Custom", ""),
+    ("Custom / Context", "Context"): ("Custom", "Context only"),
     ("Custom / Context", "Custom"): ("Custom", "Custom scope"),
+}
+
+# The same labels are sent to both widgets.  Saved values remain the canonical
+# English keys above; localization is display-only and can never change the
+# Agent wire meaning.
+IMAGE_TAXONOMY_LABELS_KO = {
+    "Select Image Main Type": "이미지 메인 타입 선택",
+    "Character": "캐릭터",
+    "Character Prop": "캐릭터 프랍",
+    "Environment / Background": "환경 / 배경",
+    "Background Prop": "배경 프랍",
+    "Look Reference": "룩 레퍼런스",
+    "Custom / Context": "사용자 지정 / 참고",
+    "Full Appearance": "전체 외형",
+    "Head / Face": "머리 / 얼굴",
+    "Eyes / Expression": "눈 / 표정",
+    "Body Part": "신체 부위",
+    "Hair / Fur": "머리카락 / 털",
+    "Costume Detail": "의상 세부",
+    "Full Costume": "전체 의상",
+    "Handheld Prop": "손에 드는 프랍",
+    "Attached Accessory": "부착 액세서리",
+    "Character Interactive Prop": "캐릭터 상호작용 프랍",
+    "Main Background": "메인 배경",
+    "Sky / Exterior": "하늘 / 외부",
+    "Ground / Floor": "지면 / 바닥",
+    "Foreground": "전경",
+    "Independent Scene Prop": "독립 장면 프랍",
+    "Interactive Scene Prop": "상호작용 장면 프랍",
+    "Set / Structure": "세트 / 구조물",
+    "Color Mood": "색감 분위기",
+    "Lighting / Atmosphere": "조명 / 분위기",
+    "Render Look": "렌더 룩",
+    "Color / Look / Lighting": "색감 / 룩 / 조명",
+    "ch_Scale": "캐릭터 상대 크기",
+    "bg_Scale": "배경 상대 크기 / 배치",
+    "ch_Scale / bg_Scale": "캐릭터 / 배경 상대 크기 / 배치",
+    "Context": "참고 전용",
+    "Custom": "사용자 지정",
 }
 
 IMAGE_CHARACTER_COLOR_MAIN_TYPES = {"Character", "Character Prop"}
@@ -576,24 +528,45 @@ IMAGE_BACKGROUND_COLOR_MAIN_TYPES = {
     "Background Prop",
 }
 
+IMAGE_SCALE_REFERENCE_SUB_TYPES = frozenset({
+    "ch_Scale",
+    "bg_Scale",
+    "ch_Scale / bg_Scale",
+})
+IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS = {
+    "ch_Scale": "ch_all",
+    "bg_Scale": "bg_all",
+    "ch_Scale / bg_Scale": "ch_all / bg_all",
+}
+IMAGE_GENERAL_LOOK_REFERENCE_SUB_TYPES = frozenset({
+    "Color Mood",
+    "Lighting / Atmosphere",
+    "Render Look",
+    "Color / Look / Lighting",
+})
+IMAGE_GLOBAL_SCOPE_LOOK_REFERENCE_SUB_TYPES = frozenset({
+    "Lighting / Atmosphere",
+    "Color / Look / Lighting",
+})
+IMAGE_GLOBAL_LOOK_TARGET = "Global Look"
+IMAGE_CUSTOM_LOOK_TARGET = "Custom"
+IMAGE_GENERAL_LOOK_ALLOWED_SYSTEM_TARGETS = frozenset({
+    IMAGE_GLOBAL_LOOK_TARGET,
+})
+IMAGE_GLOBAL_SCOPE_LOOK_ALLOWED_TARGETS = frozenset({
+    IMAGE_GLOBAL_LOOK_TARGET,
+    IMAGE_CUSTOM_LOOK_TARGET,
+})
+IMAGE_GENERAL_LOOK_NAMED_TARGET_MAIN_TYPES = frozenset({
+    "Character",
+    "Character Prop",
+    "Environment / Background",
+    "Background Prop",
+})
 
-def image_scope_choices_for_source_type(source_type: Any) -> List[str]:
-    """Return a copy of the canonical Sub Type choices for one Main Type."""
-    key = str(source_type or "").strip()
-    choices = IMAGE_SCOPE_CHOICES_BY_SOURCE_TYPE.get(key, IMAGE_SCOPE_CHOICES)
-    return list(choices)
-
-
-def image_color_pick_choices_for_source_type(source_type: Any) -> List[str]:
-    """Return the Video Picker Color Pick candidates allowed by a Main Type."""
-    key = str(source_type or "").strip()
-    if key in ACTOR_COLOR_PICK_SOURCE_TYPES:
-        return list(ACTOR_COLOR_PICK_CHOICES + GHOST_COLOR_PICK_CHOICES)
-    if key in OBJECT_COLOR_PICK_SOURCE_TYPES:
-        return list(OBJECT_COLOR_PICK_CHOICES)
-    if key == "Custom":
-        return list(COLOR_PICK_CHOICES)
-    return []
+IMAGE_MAIN_TYPE_COUNT = len(IMAGE_MAIN_TYPE_CHOICES) - 1
+IMAGE_SUB_TYPE_COUNT = sum(len(values) for values in IMAGE_SUB_TYPE_CHOICES.values())
+IMAGE_TAXONOMY_PAIR_COUNT = len(IMAGE_TAXONOMY_WIRE_MAP)
 
 
 def image_sub_type_choices_for_main_type(main_type: Any) -> List[str]:
@@ -606,6 +579,53 @@ def image_taxonomy_wire_pair(main_type: Any, sub_type: Any) -> tuple[str, str] |
     return IMAGE_TAXONOMY_WIRE_MAP.get(
         (str(main_type or "").strip(), str(sub_type or "").strip())
     )
+
+
+def image_taxonomy_payload() -> Dict[str, Any]:
+    """Return the single versioned image taxonomy used by every HMB widget.
+
+    Main/Sub text, selectable counts and their Agent-wire meanings travel as
+    one immutable contract so Prompt and Image Asset registration cannot drift.
+    """
+
+    semantic_pairs = [
+        {
+            "main_type": main_type,
+            "sub_type": sub_type,
+            "source_type": source_type,
+            "scope": scope,
+        }
+        for (main_type, sub_type), (source_type, scope)
+        in IMAGE_TAXONOMY_WIRE_MAP.items()
+    ]
+    return {
+        "schema": IMAGE_TAXONOMY_SCHEMA,
+        "version": IMAGE_TAXONOMY_VERSION,
+        "main_type_count": IMAGE_MAIN_TYPE_COUNT,
+        "sub_type_count": IMAGE_SUB_TYPE_COUNT,
+        "pair_count": IMAGE_TAXONOMY_PAIR_COUNT,
+        "image_main_type_choices": list(IMAGE_MAIN_TYPE_CHOICES),
+        "image_sub_type_choices": {
+            key: list(values) for key, values in IMAGE_SUB_TYPE_CHOICES.items()
+        },
+        "semantic_pairs": semantic_pairs,
+        "labels": {
+            "en": {
+                value: value
+                for value in (
+                    list(IMAGE_MAIN_TYPE_CHOICES)
+                    + [
+                        sub_type
+                        for values in IMAGE_SUB_TYPE_CHOICES.values()
+                        for sub_type in values
+                    ]
+                )
+            },
+            "ko": dict(IMAGE_TAXONOMY_LABELS_KO),
+        },
+        "actor_color_pick_choices": list(ACTOR_COLOR_PICK_CHOICES),
+        "object_color_pick_choices": list(OBJECT_COLOR_PICK_CHOICES),
+    }
 
 
 def image_color_pick_choices_for_taxonomy(

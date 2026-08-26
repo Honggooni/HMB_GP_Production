@@ -140,7 +140,6 @@ row_b = {
     "source_type": "Custom",
     "custom_source_type": "Memory apparition",
     "owner": "Any user-defined relationship target",
-    "legacy_relationship_targets": ["Second simultaneous target"],
     "binding_scopes": ["Impossible custom scope"],
     "color_picks": ["Ultraviolet user tone"],
     "binding_video_slots": [5],
@@ -346,8 +345,8 @@ unknown_result = prompt._apply_picker_payload(unknown_state, unknown_payload, co
 assert unknown_result["images"][0]["color_picks"] == [""]
 
 
-# Dormant relationship and video addresses remain round-trippable widget state,
-# but the Agent contract publishes only currently active source addresses.
+# Only the current Prompt Target and active video addresses enter the Agent
+# contract; removed multi-target compatibility state is intentionally absent.
 goal_state = prompt._default_widget_state()
 goal_state["images"] = [{
     **prompt._default_image_item(1),
@@ -357,7 +356,6 @@ goal_state["images"] = [{
     "image_sub_type": "Handheld Prop",
     "source_type": "Prop / Accessory",
     "owner": "Hero hand",
-    "legacy_relationship_targets": ["Door lock", "Memory echo"],
     "binding_scopes": ["Handheld prop"],
     "color_picks": ["Red"],
     "binding_video_slots": [3],
@@ -369,10 +367,6 @@ goal_image = goal_job["images"][0]
 assert goal_image["target_id"] == "Hero hand"
 assert goal_image["relationship_targets"] == []
 assert goal_image["bindings"] == []
-assert goal_state["images"][0]["legacy_relationship_targets"] == [
-    "Door lock",
-    "Memory echo",
-]
 assert goal_state["images"][0]["binding_video_slots"] == [3]
 goal_user = prompt_json_section(goal_prompt, "USER DESCRIPTION DATA (JSON):")
 assert goal_user == {"SCENE_CONTEXT": "Resolve @video5 as a dream-memory rhythm"}

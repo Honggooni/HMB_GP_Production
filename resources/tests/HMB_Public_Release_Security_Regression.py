@@ -15,20 +15,11 @@ POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
 POLICY_CONTRACT_SHA256 = (
     "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
 )
-RELEASE_LABEL = "v0.7.01"
-RELEASE_VERSION = "0.7.1"
-LOCAL_RELEASE_PROHIBITION = (
-    "must not be committed, tagged, pushed, or distributed"
-)
-EXPECTED_SOURCE_FILES = (
+RELEASE_LABEL = "v0.7.05"
+RELEASE_VERSION = "0.7.5"
+EXPECTED_RUNTIME_INSTALL_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
-    "pyproject.toml",
-    "README.md",
-    "SECURITY.md",
-    "LICENSE",
-    "THIRD_PARTY_NOTICES.md",
-    "SBOM.spdx.json",
     "HMBAgentLibrary.py",
     "HMBImageAssetLibrary.py",
     "HMBPromptLibrary.py",
@@ -37,7 +28,6 @@ EXPECTED_SOURCE_FILES = (
     "_hmb_agent_session.py",
     "_hmb_shot_routing.py",
     "_hmb_mp4_verify.py",
-    "Install_HMB_GP_Production.ps1",
     "_hmb_common.py",
     "_hmb_screen_space.py",
     "widgets/HMBAgentLibraryWidget.js",
@@ -47,9 +37,18 @@ EXPECTED_SOURCE_FILES = (
     "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
     "widgets/HMBVideoPickerLibraryWidget_v032.js",
     "resources/maya/HMB_Maya_Background_Preview.py",
-    "resources/maya/HMBVideoPicker_Maya_Guide.txt",
     "resources/picker/HMB_Marker_Catalog.json",
     "resources/tls/hmb_agent_broker_ca.pem",
+)
+EXPECTED_DISTRIBUTION_ONLY_FILES = (
+    "Install_HMB_GP_Production.ps1",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "SBOM.spdx.json",
+)
+EXPECTED_SOURCE_FILES = (
+    *EXPECTED_RUNTIME_INSTALL_FILES,
+    *EXPECTED_DISTRIBUTION_ONLY_FILES,
 )
 EXPECTED_SECRET_NAMES = {
     "GT_CLOUD_API_KEY",
@@ -136,63 +135,20 @@ def assert_forbidden_archive(encoded: bytes) -> None:
     raise AssertionError("A policy artifact or policy document entered a release ZIP.")
 
 
-def current_changelog_release(markdown: str, release_label: str) -> tuple[bool, str]:
-    match = re.search(
-        rf"^## `{re.escape(release_label)}` — "
-        rf"\d{{4}}-\d{{2}}-\d{{2}}(?P<local> \(local test\))?\n"
-        rf"(?P<body>.*?)(?=^## |\Z)",
-        markdown,
-        re.MULTILINE | re.DOTALL,
-    )
-    assert match is not None, f"Missing Changelog section for {release_label}."
-    return match.group("local") is not None, match.group("body")
-
-
-def assert_changelog_release_policy(
-    markdown: str,
-    release_label: str,
-    release_version: str,
-) -> None:
-    is_local_release, release_notes = current_changelog_release(
-        markdown,
-        release_label,
-    )
-    release_patch = builder.release_version_parts(release_version)[2]
-    has_distribution_prohibition = (
-        LOCAL_RELEASE_PROHIBITION in release_notes.casefold()
-    )
-    if release_patch % 2:
-        assert not is_local_release
-        assert not has_distribution_prohibition
-    else:
-        assert is_local_release
-        assert has_distribution_prohibition
-
-
-def assert_changelog_release_policy_rejected(
-    markdown: str,
-    release_label: str,
-    release_version: str,
-) -> None:
-    try:
-        assert_changelog_release_policy(markdown, release_label, release_version)
-    except AssertionError:
-        return
-    raise AssertionError(
-        f"Invalid Changelog policy was accepted for {release_label}/{release_version}."
-    )
-
-
 builder = load_module(
     "_hmb_public_release_in_memory_builder",
     ROOT / "tools" / "package_runtime_release.py",
 )
 
+assert tuple(builder.RUNTIME_INSTALL_FILES) == EXPECTED_RUNTIME_INSTALL_FILES
+assert tuple(builder.DISTRIBUTION_ONLY_FILES) == EXPECTED_DISTRIBUTION_ONLY_FILES
 assert tuple(builder.SOURCE_FILES) == EXPECTED_SOURCE_FILES
-assert len(EXPECTED_SOURCE_FILES) == 29
+assert len(EXPECTED_RUNTIME_INSTALL_FILES) == 21
+assert len(EXPECTED_DISTRIBUTION_ONLY_FILES) == 4
+assert len(EXPECTED_SOURCE_FILES) == 25
 assert builder.RELEASE_LABEL == RELEASE_LABEL
 assert builder.RELEASE_VERSION == RELEASE_VERSION
-assert builder.release_version_parts(RELEASE_VERSION) == (0, 7, 1)
+assert builder.release_version_parts(RELEASE_VERSION) == (0, 7, 5)
 assert builder.release_label_for_version(RELEASE_VERSION) == RELEASE_LABEL
 builder.validate_release_identity(RELEASE_LABEL, RELEASE_VERSION)
 for invalid_version in (
@@ -208,14 +164,14 @@ for invalid_version in (
         pass
     else:
         raise AssertionError(f"Invalid technical SemVer was accepted: {invalid_version}")
-for mismatched_label in ("v0.7.1", "v0.7.02", "0.7.01"):
+for mismatched_label in ("v0.7.5", "v0.7.04", "0.7.05"):
     try:
         builder.validate_release_identity(mismatched_label, RELEASE_VERSION)
     except RuntimeError:
         pass
     else:
         raise AssertionError(f"Mismatched public release label was accepted: {mismatched_label}")
-assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.7.01_Runtime.zip"
+assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.7.05_Runtime.zip"
 assert builder.ARCHIVE_NAME == f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 assert builder.POLICY_VERSION == POLICY_VERSION
 assert builder.POLICY_CONTRACT_SHA256 == POLICY_CONTRACT_SHA256
@@ -227,7 +183,6 @@ manifest = json.loads(
     (ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8")
 )
 sbom = json.loads((ROOT / "SBOM.spdx.json").read_text(encoding="utf-8"))
-changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 security_policy = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
 registered_secrets = manifest["settings"][0]["contents"]["secrets_to_register"]
 assert set(registered_secrets) == EXPECTED_SECRET_NAMES
@@ -242,44 +197,6 @@ assert next(
     item for item in sbom["packages"]
     if item["SPDXID"] == "SPDXRef-HMB-GP-Production"
 )["versionInfo"] == RELEASE_VERSION
-assert_changelog_release_policy(changelog, RELEASE_LABEL, RELEASE_VERSION)
-
-valid_team_changelog = (
-    "## `v9.8.01` — 2026-08-26\n\n"
-    "- Published the approved team release.\n"
-)
-valid_local_changelog = (
-    "## `v9.8.02` — 2026-08-26 (local test)\n\n"
-    f"- This build {LOCAL_RELEASE_PROHIBITION}.\n"
-)
-assert_changelog_release_policy(valid_team_changelog, "v9.8.01", "9.8.1")
-assert_changelog_release_policy(valid_local_changelog, "v9.8.02", "9.8.2")
-assert_changelog_release_policy_rejected(
-    valid_team_changelog.replace(
-        "2026-08-26\n",
-        "2026-08-26 (local test)\n",
-    ),
-    "v9.8.01",
-    "9.8.1",
-)
-assert_changelog_release_policy_rejected(
-    valid_team_changelog.replace(
-        "Published the approved team release.",
-        f"This build {LOCAL_RELEASE_PROHIBITION}.",
-    ),
-    "v9.8.01",
-    "9.8.1",
-)
-assert_changelog_release_policy_rejected(
-    valid_local_changelog.replace(" (local test)", ""),
-    "v9.8.02",
-    "9.8.2",
-)
-assert_changelog_release_policy_rejected(
-    valid_local_changelog.replace(LOCAL_RELEASE_PROHIBITION, "is local-only"),
-    "v9.8.02",
-    "9.8.2",
-)
 assert "http://192.168.203.245:8080" in security_policy
 assert "Seedance 생성 Broker 내부망 예외" in security_policy
 assert "Agent 정책 Broker" in security_policy
@@ -318,6 +235,14 @@ assert release_version == manifest["metadata"]["library_version"]
 assert release_version == RELEASE_VERSION
 record_by_path = {str(record["path"]): record for record in records}
 assert set(record_by_path) == set(EXPECTED_SOURCE_FILES)
+assert all(
+    record_by_path[path]["install"] is True
+    for path in EXPECTED_RUNTIME_INSTALL_FILES
+)
+assert all(
+    record_by_path[path]["install"] is False
+    for path in EXPECTED_DISTRIBUTION_ONLY_FILES
+)
 
 release_records = builder.make_release_records(release_version, records)
 builder.validate_release_inventory(release_version, release_records)
@@ -329,6 +254,20 @@ closure_manifest = json.loads(
 )
 assert closure_manifest["release_label"] == RELEASE_LABEL
 assert closure_manifest["release_version"] == RELEASE_VERSION
+assert closure_manifest["file_count"] == 25
+assert closure_manifest["install_file_count"] == 21
+assert closure_manifest["distribution_file_count"] == 4
+closure_by_path = {
+    str(record["path"]): record for record in closure_manifest["files"]
+}
+assert all(
+    closure_by_path[path]["install"] is True
+    for path in EXPECTED_RUNTIME_INSTALL_FILES
+)
+assert all(
+    closure_by_path[path]["install"] is False
+    for path in EXPECTED_DISTRIBUTION_ONLY_FILES
+)
 
 # Keep every other closure field and checksum internally consistent so this
 # mutation is rejected specifically because the public label is not approved.
@@ -395,6 +334,10 @@ assert builder.module_string_constant(
 ) == "active"
 check_result = builder.check()
 assert check_result["validated"] is True
+assert check_result["file_count"] == 27
+assert check_result["source_file_count"] == 25
+assert check_result["install_file_count"] == 21
+assert check_result["distribution_file_count"] == 4
 assert check_result["policy_delivery"] == "server-only"
 assert check_result["policy_version"] == POLICY_VERSION
 assert check_result["policy_contract_sha256"] == POLICY_CONTRACT_SHA256

@@ -153,7 +153,7 @@ def two_source_state() -> dict:
         }
     )
     fx = video(1, "FX Reference", "Context Only")
-    timing = video(2, "Timing / Edit Reference", "FX Behavior Only")
+    timing = video(2, "Timing / Edit Reference", "FX Effect Only")
     timing["reference_capabilities"] = reference_capabilities(
         exact_cues=True
     )
@@ -211,7 +211,7 @@ agent._assert_fx_timing_source_contract(compiled)
 assert user_data == {}
 assert [item["control_role"] for item in job["videos"]] == [
     "Context Only",
-    "FX Behavior Only",
+    "FX Effect Only",
 ]
 fx_source, timing_source = contract["sources"]
 allowed_source_fact_keys = {
@@ -229,7 +229,7 @@ allowed_source_fact_keys = {
 assert set(fx_source).issubset(allowed_source_fact_keys)
 assert set(timing_source).issubset(allowed_source_fact_keys)
 assert fx_source["selected_role"] == "Context Only"
-assert timing_source["selected_role"] == "FX Behavior Only"
+assert timing_source["selected_role"] == "FX Effect Only"
 assert timing_source["timing_cues"][0]["frame"] == 7
 assert timing_source["timing_cues"][0]["local_point"]["space"] == "local"
 assert [cue["frame"] for cue in timing_source["timing_cues"]] == [7, 12]
@@ -381,7 +381,7 @@ multi_image.update(
 multi_state["images"] = [multi_image]
 multi_state["videos"] = [
     video(1, "FX Reference", "Context Only"),
-    video(2, "Timing / Edit Reference", "FX Behavior Only"),
+    video(2, "Timing / Edit Reference", "FX Effect Only"),
     video(3, "Timing / Edit Reference", "Context Only"),
 ]
 multi = prompt._build_prompt_package(multi_state)

@@ -1289,10 +1289,49 @@ async def assert_blocking_stage_is_background_and_cleanup_safe() -> None:
 asyncio.run(assert_blocking_stage_is_background_and_cleanup_safe())
 
 
+class AgentPromptSource:
+    def __init__(self, *, prompt_generation: int = 4) -> None:
+        self.prompt_generation = prompt_generation
+
+    def _hmb_generator_shot_snapshot(
+        self,
+        expected_images: Any,
+        expected_videos: Any,
+    ) -> dict[str, Any]:
+        images = list(expected_images)
+        videos = list(expected_videos)
+        return {
+            "schema": "hmb-prompt-generator-shot-snapshot",
+            "version": 1,
+            "channel_uuid": CHANNEL,
+            "shot_uuid": SHOT,
+            "shot_number": 2,
+            "shot_name": "Second Shot",
+            "prompt_generation": self.prompt_generation,
+            "visible_prompt_sha256": "1" * 64,
+            "image_media_sha256": target.HMBSeedanceGeneration._media_list_sha256(images),
+            "video_media_sha256": target.HMBSeedanceGeneration._media_list_sha256(videos),
+            "image_media": images,
+            "video_media": videos,
+        }
+
+
 class AgentSource:
-    def __init__(self, *, shot_uuid: str = SHOT, image_hash: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        shot_uuid: str = SHOT,
+        image_hash: str = "",
+        prompt_generation: int = 4,
+        current_prompt_generation: int = 4,
+    ) -> None:
         self.shot_uuid = shot_uuid
         self.image_hash = image_hash
+        self.prompt_generation = prompt_generation
+        self.prompt_source = AgentPromptSource(
+            prompt_generation=current_prompt_generation
+        )
+        self.invalidated = False
 
     def _hmb_shot_channel_subscription(self) -> dict[str, Any]:
         return {
@@ -1313,7 +1352,7 @@ class AgentSource:
             "shot_uuid": self.shot_uuid,
             "shot_number": 2,
             "shot_name": "Second Shot",
-            "prompt_generation": 4,
+            "prompt_generation": self.prompt_generation,
             "visible_prompt_sha256": "1" * 64,
             "image_media_sha256": self.image_hash or target.HMBSeedanceGeneration._media_list_sha256(
                 ["@image2", "@image1"]
@@ -1323,6 +1362,13 @@ class AgentSource:
             ),
             "final_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
         }
+
+    def _hmb_generator_prompt_source_node(self, final_text: Any) -> AgentPromptSource:
+        self._hmb_generator_shot_snapshot(final_text)
+        return self.prompt_source
+
+    def _invalidate_generator_authority_for_prompt_change(self) -> None:
+        self.invalidated = True
 
 
 # A manually connected HMBAgent prompt is accepted only when its immutable
@@ -1354,6 +1400,19 @@ except RuntimeError as exc:
     assert "media generations" in str(exc)
 else:
     raise AssertionError("Seedance accepted a stale HMBAgent media generation.")
+
+stale_prompt_source = AgentSource(current_prompt_generation=5)
+try:
+    generator(
+        image,
+        picker,
+        stale_prompt_source,
+    )._resolve_exact_shot_generation_inputs({"prompt": "stale Prompt generation"})
+except RuntimeError as exc:
+    assert "Prompt changed after the Agent result" in str(exc)
+    assert stale_prompt_source.invalidated is True
+else:
+    raise AssertionError("Seedance accepted an Agent result from an older Prompt generation.")
 
 # ImageAsset alone is sufficient for image + prompt generation.
 image_only = generator(image, None)._resolve_exact_shot_generation_inputs(
@@ -1517,7 +1576,16 @@ route_descriptor = route_probe._current_remote_prompt_route()
 assert route_descriptor["connected"] is True
 assert route_descriptor["source_node_name"] == route_agent.name
 assert route_descriptor["target_node_name"] == route_probe.name
+assert route_descriptor["previous_source_node_name"] == ""
+assert route_descriptor["previous_target_node_name"] == ""
 assert "prompt" not in route_descriptor
+
+assert target._seedance_remote_prompt_route_value(
+    {
+        **route_descriptor,
+        "previous_target_node_name": "x" * 513,
+    }
+)["connected"] is False
 
 agent_route_identity["shot_number"] = 4
 assert route_probe._current_remote_prompt_route()["connected"] is False
@@ -1541,6 +1609,83 @@ assert (
     == "HMBAgentLibrary_2"
 )
 assert route_syncs == [True]
+
+# Griptape Reset Node constructs an Agent under a temporary name and then
+# renames the same object back. Preserve both proven names so the React Flow
+# edge id and aria label may transition independently without exposing a cable.
+route_agent.name = "HMBAgentLibrary_3_temp"
+assert route_probe._hmb_prepare_remote_prompt_route(route_agent) is True
+assert route_probe._hmb_remote_prompt_route["source_node_name"] == route_agent.name
+assert (
+    route_probe._hmb_remote_prompt_route["previous_source_node_name"]
+    == "HMBAgentLibrary_3"
+)
+route_probe.get_parameter_value = lambda _name: False  # type: ignore[method-assign]
+route_probe._hmb_shot_routing_status({
+    "schema": "hmb-shot-routing-status",
+    "version": 1,
+    "ok": True,
+    "code": "ready",
+    "details": "",
+})
+assert route_probe._hmb_remote_prompt_route["source_node_name"] == route_agent.name
+assert (
+    route_probe._hmb_remote_prompt_route["previous_source_node_name"]
+    == "HMBAgentLibrary_3"
+)
+route_agent.name = "HMBAgentLibrary_3"
+route_probe._hmb_shot_routing_status({
+    "schema": "hmb-shot-routing-status",
+    "version": 1,
+    "ok": True,
+    "code": "ready",
+    "details": "",
+})
+assert route_probe._hmb_remote_prompt_route["source_node_name"] == route_agent.name
+assert (
+    route_probe._hmb_remote_prompt_route["previous_source_node_name"]
+    == "HMBAgentLibrary_3_temp"
+)
+
+# Resetting the Seedance target uses the same old -> temp -> final rename
+# sequence. Preserve the independently proven target names without weakening
+# the exact public Agent.output -> Seedance.prompt authority contract.
+final_target_name = route_probe.name
+route_probe.name = f"{final_target_name}_temp"
+assert route_probe._hmb_prepare_remote_prompt_route(route_agent) is True
+assert route_probe._hmb_remote_prompt_route["target_node_name"] == route_probe.name
+assert (
+    route_probe._hmb_remote_prompt_route["previous_target_node_name"]
+    == final_target_name
+)
+route_probe.name = final_target_name
+route_probe._hmb_shot_routing_status({
+    "schema": "hmb-shot-routing-status",
+    "version": 1,
+    "ok": True,
+    "code": "ready",
+    "details": "",
+})
+assert route_probe._hmb_remote_prompt_route["target_node_name"] == final_target_name
+assert (
+    route_probe._hmb_remote_prompt_route["previous_target_node_name"]
+    == f"{final_target_name}_temp"
+)
+
+# A momentary lookup gap during the ready reset transition keeps the pre-armed
+# alias descriptor; a failure/Only status remains free to clear it.
+route_probe._manual_agent_prompt_source = (  # type: ignore[method-assign]
+    lambda: (_ for _ in ()).throw(RuntimeError("reset transition"))
+)
+before_lookup_gap = dict(route_probe._hmb_remote_prompt_route)
+route_probe._hmb_shot_routing_status({
+    "schema": "hmb-shot-routing-status",
+    "version": 1,
+    "ok": True,
+    "code": "ready",
+    "details": "",
+})
+assert route_probe._hmb_remote_prompt_route == before_lookup_gap
 
 # A standalone VideoPicker publishes its local Shot 1 through a private,
 # media-free catalog and a matching atomic snapshot.  This is the authority used

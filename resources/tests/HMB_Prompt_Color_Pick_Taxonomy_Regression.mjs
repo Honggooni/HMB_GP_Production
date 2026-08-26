@@ -12,34 +12,25 @@ const state = prompt.normalizeState({
   image_taxonomy: {
     actor_color_pick_choices: [...actor, ...ghost],
     object_color_pick_choices: object,
-    actor_color_pick_source_types: [
-      "Character Appearance",
-      "Partial Character Detail",
-      "Costume / Clothing",
-    ],
-    object_color_pick_source_types: [
-      "Prop / Accessory",
-      "Environment / Background",
-    ],
   },
 });
 
 assert.deepEqual(
-  prompt.colorPickChoicesForSourceType("Character Appearance"),
-  [...actor, ...ghost],
-  "Actor sources must expose the seven Actor colors plus the three Ghost colors.",
+  prompt.colorPickChoicesForImageTaxonomy("Character", "Full Appearance"),
+  actor,
+  "Character Main/Sub must expose the configured actor palette.",
 );
 assert.deepEqual(
-  prompt.colorPickChoicesForSourceType("Environment / Background"),
+  prompt.colorPickChoicesForImageTaxonomy("Environment / Background", "Main Background"),
   object,
-  "Background/Object sources must expose the three Ghost colors plus four patterns.",
+  "Environment Main/Sub must expose the configured object palette.",
 );
 assert.deepEqual(
-  prompt.colorPickChoicesForSourceType("Custom"),
+  prompt.colorPickChoicesForImageTaxonomy("Custom / Context", "Custom"),
   all,
-  "Custom must preserve the existing unique fourteen-choice order.",
+  "Custom Main/Sub must expose the union palette.",
 );
-assert.deepEqual(state.image_taxonomy.actor_color_pick_choices, [...actor, ...ghost]);
+assert.deepEqual(state.image_taxonomy.actor_color_pick_choices, actor);
 assert.deepEqual(state.image_taxonomy.object_color_pick_choices, object);
 assert.equal(state.schema, "prompt-library-state", "The persisted state schema must remain unchanged.");
 

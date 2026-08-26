@@ -29,15 +29,90 @@ widget.normalizeImageTaxonomy(globalLook);
 assert.equal(globalLook.owner, "Global Look");
 assert.match(
   widget.hmbImageSubtypeAuthorityHint(globalLook, { ui: { language: "ko" } }),
-  /선택한 대상에만 적용.*전체 룩/,
+  /기본적으로 전체 룩.*영향 속성과 대상 이름\/로컬 범위.*개별 대상이 표시되지 않습니다.*복제하지 않습니다/,
 );
+
+const freshGeneralLook = {
+  image_main_type: "Look Reference",
+  image_sub_type: "Color Mood",
+  owner: "ch_all",
+  asset_default_target: "Global Look",
+};
+widget.normalizeImageTaxonomy(freshGeneralLook);
+assert.equal(freshGeneralLook.owner, "");
+assert.equal(freshGeneralLook.asset_default_target, "");
+const freshGeneralChoices = widget.imageTargetChoicesForRow(
+  freshGeneralLook,
+  [{ present: true, label: "Jett_11", image_main_type: "Character" }],
+);
+assert.ok(!freshGeneralChoices.includes("Camera / Composition"));
+assert.ok(freshGeneralChoices.includes("Global Look"));
+assert.ok(freshGeneralChoices.includes("Jett_11"));
+for (const scaleOnlyTarget of ["ch_all", "bg_all", "ch_all / bg_all", "None"]) {
+  assert.ok(!freshGeneralChoices.includes(scaleOnlyTarget));
+}
+freshGeneralLook.owner = "Camera / Composition";
+widget.normalizeImageTaxonomy(freshGeneralLook);
+assert.equal(freshGeneralLook.owner, "");
+
+const scopedLookState = widget.normalizeState({
+  images: [
+    {
+      present: true,
+      label: "Jett display",
+      owner: "JettCanonical",
+      image_main_type: "Character",
+      image_sub_type: "Full Appearance",
+    },
+    {
+      present: true,
+      label: "Other Look",
+      owner: "OtherLookCanonical",
+      image_main_type: "Look Reference",
+      image_sub_type: "Color Mood",
+    },
+    {
+      present: true,
+      label: "Shot notes",
+      owner: "NotesCanonical",
+      image_main_type: "Custom / Context",
+      image_sub_type: "Context",
+    },
+    {
+      present: true,
+      label: "Self Look",
+      owner: "Self Look",
+      image_main_type: "Look Reference",
+      image_sub_type: "Color Mood",
+    },
+    {
+      present: true,
+      label: "Reserved display",
+      owner: "None",
+      image_main_type: "Environment / Background",
+      image_sub_type: "Main Background",
+    },
+  ],
+});
+const scopedLook = scopedLookState.images.find((row) => row.label === "Self Look");
+assert.ok(scopedLook);
+assert.equal(scopedLook.owner, "", "A general Look must not target itself.");
+const scopedChoices = widget.imageTargetChoicesForRow(
+  scopedLook,
+  scopedLookState.images,
+  scopedLookState,
+);
+assert.ok(scopedChoices.includes("JettCanonical"));
+assert.ok(!scopedChoices.includes("Jett display"), "Canonical owner must take priority over label.");
+for (const excluded of [
+  "Camera / Composition", "ch_all", "bg_all", "ch_all / bg_all", "None",
+  "Other Look", "OtherLookCanonical", "Shot notes", "NotesCanonical", "Self Look",
+]) {
+  assert.ok(!scopedChoices.includes(excluded), `${excluded} is not a valid general Look Target.`);
+}
 
 for (const subtype of [
   "Render Look",
-  "Lighting / Atmosphere",
-  "Scale",
-  "Composition",
-  "Scale / Composition",
 ]) {
   const targetedReference = {
     image_main_type: "Look Reference",
@@ -50,8 +125,68 @@ for (const subtype of [
     targetedReference,
     { ui: { language: "en" } },
   );
-  assert.match(targetedHint, /appl(?:y|ies) only to the selected Target/i);
+  assert.match(targetedHint, /selected (?:Target|sources)/i);
   assert.doesNotMatch(targetedHint, /apply to every visible|applies globally/i);
+  assert.match(targetedHint, /never copied/i);
+}
+
+for (const subtype of ["Lighting / Atmosphere", "Color / Look / Lighting"]) {
+  const sharedLightingReference = {
+    image_main_type: "Look Reference",
+    image_sub_type: subtype,
+    owner: "Jett_11",
+    look_custom_instruction: "Keep the foreground readable.",
+  };
+  widget.normalizeImageTaxonomy(sharedLightingReference);
+  assert.equal(sharedLightingReference.owner, "Global Look");
+  assert.deepEqual(
+    widget.imageTargetChoicesForRow(sharedLightingReference, scopedLookState.images),
+    ["Global Look", "Custom"],
+  );
+  const sharedHint = widget.hmbImageSubtypeAuthorityHint(
+    sharedLightingReference,
+    { ui: { language: "en" } },
+  );
+  assert.match(sharedHint, /Global Look by default/i);
+  assert.match(sharedHint, /affected properties/i);
+  assert.match(sharedHint, /named target\/local scope/i);
+  assert.match(sharedHint, /scene-wide scope/i);
+  assert.match(sharedHint, /named Targets remain hidden/i);
+  sharedLightingReference.owner = "Custom";
+  const restored = widget.normalizeState(JSON.parse(JSON.stringify({
+    images: [sharedLightingReference],
+  })));
+  assert.equal(restored.images[0].owner, "Custom");
+  assert.equal(restored.images[0].look_custom_instruction, "Keep the foreground readable.");
+}
+
+assert.match(
+  source,
+  /Specify affected properties and scope: name a target .* or state scene-wide\./,
+);
+assert.match(
+  source,
+  /영향 속성과 적용 범위를 직접 작성: 대상 이름\(예: Hero 조명만\) 또는 장면 전체를 명시하세요\./,
+);
+
+for (const [subtype, target, phrase] of [
+  ["ch_Scale", "ch_all", /character\/Character Prop size/i],
+  ["bg_Scale", "bg_all", /background size and placement/i],
+  ["ch_Scale / bg_Scale", "ch_all / bg_all", /character\/background relative size/i],
+]) {
+  const scaleReference = {
+    image_main_type: "Look Reference",
+    image_sub_type: subtype,
+    owner: "Camera / Composition",
+  };
+  widget.normalizeImageTaxonomy(scaleReference);
+  assert.equal(scaleReference.owner, target);
+  const hint = widget.hmbImageSubtypeAuthorityHint(
+    scaleReference,
+    { ui: { language: "en" } },
+  );
+  assert.match(hint, phrase);
+  assert.match(hint, /never (?:copy|renderable)/i);
 }
 
 assert.doesNotMatch(source, /장면 전체 적용 · 컬러 픽 없음/);
@@ -71,6 +206,10 @@ assert.match(source, /\[Lip-sync Transcript\]/);
 assert.match(source, /Existing \[Lip-sync Speech\] entries remain compatible and unchanged/);
 assert.match(source, /it does not activate a media operation/);
 assert.match(source, /VIDEO ACTION \/ LIP-SYNC \/ VFX/);
+assert.match(source, /video_vfx: "VFX"/);
+assert.match(source, /VIDEO_VFX: \["영상 작업 \/ 립싱크 \/ VFX", ""\]/);
+assert.doesNotMatch(source, /operational shot direction: named target or emitter/);
+assert.doesNotMatch(source, /대상·에미터, 입력 영상·오디오/);
 assert.doesNotMatch(source, /HMB_PROMPT_QA_COVERAGE/);
 assert.doesNotMatch(source, /class="qa-badge"/);
 assert.doesNotMatch(source, /qa_coverage_not_provider_attention/);

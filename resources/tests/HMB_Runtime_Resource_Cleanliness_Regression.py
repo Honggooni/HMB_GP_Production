@@ -7,9 +7,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_RESOURCES = {
     "resources/maya/HMB_Maya_Background_Preview.py",
-    "resources/maya/HMBVideoPicker_Maya_Guide.txt",
     "resources/picker/HMB_Marker_Catalog.json",
     "resources/tls/hmb_agent_broker_ca.pem",
+}
+DISTRIBUTION_ONLY_FILES = (
+    "Install_HMB_GP_Production.ps1",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "SBOM.spdx.json",
+)
+EXCLUDED_PACKAGE_FILES = {
+    "README.md",
+    "SECURITY.md",
+    "pyproject.toml",
+    "resources/maya/HMBVideoPicker_Maya_Guide.txt",
 }
 
 
@@ -25,8 +36,17 @@ def load_packager():
 assert not (ROOT / "resources" / "build_developer_release.py").exists()
 packager = load_packager()
 source_files = tuple(packager.SOURCE_FILES)
-assert "Install_HMB_GP_Production.ps1" in source_files
-assert {path for path in source_files if path.startswith("resources/")} == RUNTIME_RESOURCES
+runtime_install_files = tuple(packager.RUNTIME_INSTALL_FILES)
+distribution_only_files = tuple(packager.DISTRIBUTION_ONLY_FILES)
+assert len(runtime_install_files) == 21
+assert distribution_only_files == DISTRIBUTION_ONLY_FILES
+assert source_files == (*runtime_install_files, *distribution_only_files)
+assert len(source_files) == 25
+assert not EXCLUDED_PACKAGE_FILES.intersection(source_files)
+assert not set(runtime_install_files).intersection(distribution_only_files)
+assert {
+    path for path in runtime_install_files if path.startswith("resources/")
+} == RUNTIME_RESOURCES
 assert not any(
     forbidden in path.casefold()
     for path in source_files
@@ -45,6 +65,12 @@ installer = (ROOT / "Install_HMB_GP_Production.ps1").read_text(encoding="utf-8")
 assert "release-manifest.json" in installer
 assert "SHA256SUMS" in installer
 assert "Get-FileHash -Algorithm SHA256" in installer
+assert "$installProperty.Value" in installer
+assert "foreach ($relative in $installMembers)" in installer
+assert "foreach ($record in $installRecords)" in installer
+assert "Compare-Object $expectedDistributionOnlyMembers $distributionOnlyMembers" in installer
+assert "$null = $allowed.Add('release-manifest.json')" not in installer
+assert "$null = $allowed.Add('SHA256SUMS')" not in installer
 assert "Close Griptape completely" in installer
 assert "Get-ChildItem -LiteralPath $target -Force -Recurse -File" in installer
 assert "Move-Item -LiteralPath $target -Destination $rollback" in installer

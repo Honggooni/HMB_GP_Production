@@ -104,7 +104,7 @@ FX_TIMING_CONTRACT_SCHEMA = "hmb-fx-timing-source-facts"
 FX_TIMING_CONTRACT_VERSION = 3
 FX_TIMING_CONTRACT_HEADER = "FX/TIMING SOURCE DATA (JSON):"
 PUBLIC_JOB_CONTRACT_SCHEMA = "hmb-public-job-data"
-PUBLIC_JOB_CONTRACT_VERSION = 2
+PUBLIC_JOB_CONTRACT_VERSION = 3
 PUBLIC_JOB_CONTRACT_HEADER = "HMB JOB DATA (JSON):"
 USER_DESCRIPTION_DATA_HEADER = "USER DESCRIPTION DATA (JSON):"
 MAX_PUBLIC_PROMPT_FIELD_CHARS = 512
@@ -119,26 +119,35 @@ _PUBLIC_PROMPT_SECTION_HEADERS = (
 _PUBLIC_WINDOWS_PATH_PATTERN = re.compile(
     r"(?i)(?<![A-Z0-9_])(?:[A-Z]:[\\/]|\\\\)[^|;]*?(?=\s+/\s+|\s+\|\s+|;|$)"
 )
-IMAGE_SOURCE_TYPE_CHOICES = _hmb.IMAGE_SOURCE_TYPE_CHOICES
 IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED = _hmb.IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED
-IMAGE_SCOPE_CHOICES = _hmb.IMAGE_SCOPE_CHOICES
-IMAGE_SCOPE_CHOICES_BY_SOURCE_TYPE = _hmb.IMAGE_SCOPE_CHOICES_BY_SOURCE_TYPE
 IMAGE_MAIN_TYPE_UNCLASSIFIED = _hmb.IMAGE_MAIN_TYPE_UNCLASSIFIED
 IMAGE_MAIN_TYPE_CHOICES = _hmb.IMAGE_MAIN_TYPE_CHOICES
 IMAGE_SUB_TYPE_CHOICES = _hmb.IMAGE_SUB_TYPE_CHOICES
-IMAGE_TAXONOMY_WIRE_MAP = _hmb.IMAGE_TAXONOMY_WIRE_MAP
-IMAGE_SYSTEM_TARGETS = _hmb.IMAGE_SYSTEM_TARGETS
-IMAGE_OWNER_CHOICES = _hmb.IMAGE_OWNER_CHOICES
-ACTOR_COLOR_PICK_CHOICES = _hmb.ACTOR_COLOR_PICK_CHOICES
-OBJECT_COLOR_PICK_CHOICES = _hmb.OBJECT_COLOR_PICK_CHOICES
-COLOR_PICK_CHOICES = _hmb.COLOR_PICK_CHOICES
-ACTOR_COLOR_PICK_SOURCE_TYPES = _hmb.ACTOR_COLOR_PICK_SOURCE_TYPES
-OBJECT_COLOR_PICK_SOURCE_TYPES = _hmb.OBJECT_COLOR_PICK_SOURCE_TYPES
-image_scope_choices_for_source_type = _hmb.image_scope_choices_for_source_type
-image_color_pick_choices_for_source_type = _hmb.image_color_pick_choices_for_source_type
+IMAGE_SCALE_REFERENCE_SUB_TYPES = _hmb.IMAGE_SCALE_REFERENCE_SUB_TYPES
+IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS = _hmb.IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS
+IMAGE_GENERAL_LOOK_REFERENCE_SUB_TYPES = (
+    _hmb.IMAGE_GENERAL_LOOK_REFERENCE_SUB_TYPES
+)
+IMAGE_GLOBAL_SCOPE_LOOK_REFERENCE_SUB_TYPES = (
+    _hmb.IMAGE_GLOBAL_SCOPE_LOOK_REFERENCE_SUB_TYPES
+)
+IMAGE_GLOBAL_LOOK_TARGET = _hmb.IMAGE_GLOBAL_LOOK_TARGET
+IMAGE_CUSTOM_LOOK_TARGET = _hmb.IMAGE_CUSTOM_LOOK_TARGET
+IMAGE_GENERAL_LOOK_ALLOWED_SYSTEM_TARGETS = (
+    _hmb.IMAGE_GENERAL_LOOK_ALLOWED_SYSTEM_TARGETS
+)
+IMAGE_GLOBAL_SCOPE_LOOK_ALLOWED_TARGETS = (
+    _hmb.IMAGE_GLOBAL_SCOPE_LOOK_ALLOWED_TARGETS
+)
+IMAGE_GENERAL_LOOK_NAMED_TARGET_MAIN_TYPES = (
+    _hmb.IMAGE_GENERAL_LOOK_NAMED_TARGET_MAIN_TYPES
+)
+image_target_key = _hmb.image_target_key
+is_image_system_target = _hmb.is_image_system_target
 image_color_pick_choices_for_taxonomy = _hmb.image_color_pick_choices_for_taxonomy
 image_sub_type_choices_for_main_type = _hmb.image_sub_type_choices_for_main_type
 image_taxonomy_wire_pair = _hmb.image_taxonomy_wire_pair
+image_taxonomy_payload = _hmb.image_taxonomy_payload
 WIDGET_PARAMETER_NAME = "HMB_UI_STATE"
 PICKER_INPUT_PARAMETER_NAME = "PICKER_IN"
 IMAGE_ASSET_INPUT_PARAMETER_NAME = "IMAGE_ASSET_IN"
@@ -223,7 +232,7 @@ VIDEO_CONTROL_ROLE_CHOICES = [
     "Secondary Motion Only",
     "Spatial Alignment Verification Only",
     "Derived Motion Decoding Only",
-    "FX Behavior Only",
+    "FX Effect Only",
     "Lighting / Look Only",
     "Local Composition Check Only",
     "Mask / Guide Only",
@@ -235,13 +244,15 @@ VIDEO_CONTROL_ROLE_CHOICES = [
 # the stable ``source_type``/``control_role`` wire pair below; these compact
 # main/sub values are Prompt authoring state only.  That separation lets the UI
 # remove duplicate categories without changing the protected public schema.
-# Legacy UI selections are intentionally released instead of migrated.
+# Legacy/intermediate Depth/Motion placements and the former FX effect
+# subcategories are migrated below; unrelated legacy selections are still
+# intentionally released.
 VIDEO_MAIN_TYPE_CHOICES = [
     "Select Video Main Type",
     "Maya Preview / Playblast",
     "Motion Reference",
     "Scene / Look Reference",
-    "FX / Simulation Reference",
+    "FX Reference",
     "Custom / Context",
 ]
 VIDEO_SUB_TYPE_CHOICES = {
@@ -255,18 +266,14 @@ VIDEO_SUB_TYPE_CHOICES = {
     "Motion Reference": [
         "Local Motion",
         "Secondary Motion",
-        "Retargeting Guide",
     ],
     "Scene / Look Reference": [
         "Camera / Layout",
-        "Depth / Spatial",
         "Lighting / Look",
         "Composition",
     ],
-    "FX / Simulation Reference": [
-        "Explosion",
-        "Dust",
-        "Particle",
+    "FX Reference": [
+        "FX Effect Only",
     ],
     "Custom / Context": [
         "Context",
@@ -302,16 +309,8 @@ VIDEO_TAXONOMY_WIRE_MAP = {
         "Motion Reference",
         "Secondary Motion Only",
     ),
-    ("Motion Reference", "Retargeting Guide"): (
-        "Motion Guide / Retargeting Reference",
-        "Derived Motion Decoding Only",
-    ),
     ("Scene / Look Reference", "Camera / Layout"): (
         "Camera / Layout Reference",
-        "Spatial Alignment Verification Only",
-    ),
-    ("Scene / Look Reference", "Depth / Spatial"): (
-        "Depth / Spatial Reference",
         "Spatial Alignment Verification Only",
     ),
     ("Scene / Look Reference", "Lighting / Look"): (
@@ -322,17 +321,9 @@ VIDEO_TAXONOMY_WIRE_MAP = {
         "Camera / Layout Reference",
         "Local Composition Check Only",
     ),
-    ("FX / Simulation Reference", "Explosion"): (
+    ("FX Reference", "FX Effect Only"): (
         "FX Reference",
-        "FX Behavior Only",
-    ),
-    ("FX / Simulation Reference", "Dust"): (
-        "FX Reference",
-        "FX Behavior Only",
-    ),
-    ("FX / Simulation Reference", "Particle"): (
-        "FX Reference",
-        "FX Behavior Only",
+        "FX Effect Only",
     ),
     ("Custom / Context", "Context"): (
         "Custom",
@@ -341,6 +332,56 @@ VIDEO_TAXONOMY_WIRE_MAP = {
     ("Custom / Context", "Custom"): (
         "Custom",
         "Custom Role",
+    ),
+}
+
+# Saved compact states used older duplicate homes and one intermediate release
+# briefly introduced standalone homes. Preserve the exact semantic selection
+# while converging both histories on the Maya Preview / Playblast children.
+VIDEO_TAXONOMY_PAIR_MIGRATIONS = {
+    ("Scene / Look Reference", "Depth / Spatial"): (
+        "Maya Preview / Playblast",
+        "Depth",
+    ),
+    ("Motion Reference", "Retargeting Guide"): (
+        "Maya Preview / Playblast",
+        "Motion Guide",
+    ),
+    ("Depth", "Depth / Spatial"): (
+        "Maya Preview / Playblast",
+        "Depth",
+    ),
+    ("Motion Guide", "Retargeting Guide"): (
+        "Maya Preview / Playblast",
+        "Motion Guide",
+    ),
+    ("FX / Simulation Reference", "Explosion"): (
+        "FX Reference",
+        "FX Effect Only",
+    ),
+    ("FX / Simulation Reference", "Dust"): (
+        "FX Reference",
+        "FX Effect Only",
+    ),
+    ("FX / Simulation Reference", "Particle"): (
+        "FX Reference",
+        "FX Effect Only",
+    ),
+    ("FX / Simulation Reference", "FX Effect Only"): (
+        "FX Reference",
+        "FX Effect Only",
+    ),
+    ("FX Reference", "Explosion"): (
+        "FX Reference",
+        "FX Effect Only",
+    ),
+    ("FX Reference", "Dust"): (
+        "FX Reference",
+        "FX Effect Only",
+    ),
+    ("FX Reference", "Particle"): (
+        "FX Reference",
+        "FX Effect Only",
     ),
 }
 
@@ -354,10 +395,10 @@ VIDEO_ROLE_COMPATIBILITY = {
     "Camera / Layout Reference": {"Spatial Alignment Verification Only", "Local Composition Check Only", "Context Only"},
     "Depth / Spatial Reference": {"Spatial Alignment Verification Only", "Mask / Guide Only", "Context Only"},
     "Motion Guide / Retargeting Reference": {"Derived Motion Decoding Only"},
-    "FX Reference": {"FX Behavior Only", "Timing Only", "Context Only"},
+    "FX Reference": {"FX Effect Only", "Timing Only", "Context Only"},
     "Timing / Edit Reference": {"Timing Only", "Context Only"},
     "Lighting / Look Reference": {"Lighting / Look Only", "Context Only"},
-    "Simulation Reference": {"Secondary Motion Only", "FX Behavior Only", "Context Only"},
+    "Simulation Reference": {"Secondary Motion Only", "FX Effect Only", "Context Only"},
     "Mask / Control Reference": {"Mask / Guide Only", "Context Only"},
     "Custom": {"Custom Role", "Context Only"},
 }
@@ -422,6 +463,7 @@ VIDEO_ROLE_ALIASES = {
     "Motion Only": "Local Motion Detail Only",
     "Camera / Layout / Depth Only": "Spatial Alignment Verification Only",
     "Composition Reference Only": "Local Composition Check Only",
+    "FX Behavior Only": "FX Effect Only",
 }
 # Compatibility export retained for saved states and downstream integrations.
 # Prompt no longer assigns special authority to a slot number: every declared
@@ -437,11 +479,20 @@ def _canonical_video_role(value: Any) -> str:
     return VIDEO_ROLE_ALIASES.get(role, role)
 
 
-def _normalize_video_taxonomy(item: Dict[str, Any]) -> tuple[str, str]:
-    """Normalize new UI values; legacy selections are intentionally released."""
+def _migrate_video_taxonomy_pair(main_type: Any, sub_type: Any) -> tuple[str, str]:
+    """Return the canonical compact pair for legacy/intermediate UI homes."""
 
-    main_type = _clean_string(item.get("video_main_type"))
-    sub_type = _clean_string(item.get("video_sub_type"))
+    pair = (_clean_string(main_type), _clean_string(sub_type))
+    return VIDEO_TAXONOMY_PAIR_MIGRATIONS.get(pair, pair)
+
+
+def _normalize_video_taxonomy(item: Dict[str, Any]) -> tuple[str, str]:
+    """Normalize compact UI values and migrate moved selections."""
+
+    main_type, sub_type = _migrate_video_taxonomy_pair(
+        item.get("video_main_type"),
+        item.get("video_sub_type"),
+    )
     allowed_sub_types = VIDEO_SUB_TYPE_CHOICES.get(main_type, [])
     if (
         main_type not in VIDEO_MAIN_TYPE_CHOICES
@@ -589,16 +640,11 @@ def _public_path_basename(value: Any, fallback: str, *, strip_extension: bool) -
     return _public_single_line(filename, MAX_PUBLIC_PROMPT_FIELD_CHARS)
 
 
-def _color_pick_choices_for_source_type(source_type: Any) -> List[str]:
-    return image_color_pick_choices_for_source_type(source_type)
-
-
 def _normalize_image_taxonomy(item: Dict[str, Any]) -> tuple[str, str]:
-    """Normalize image authoring fields and rebuild the legacy Agent wire pair.
+    """Normalize image authoring fields and rebuild the Agent wire pair.
 
     Existing ``source_type``/``scope`` values are never used as migration
-    input.  This is deliberate: the v2 taxonomy starts unselected and users
-    explicitly choose the new compact classification.
+    input. Only the current versioned Main/Sub contract is accepted.
     """
 
     main_type = _clean_string(item.get("image_main_type"))
@@ -614,6 +660,31 @@ def _normalize_image_taxonomy(item: Dict[str, Any]) -> tuple[str, str]:
     item["image_main_type"] = main_type
     item["image_sub_type"] = sub_type
 
+    candidate_main_type = _clean_string(
+        item.get("asset_image_main_type_candidate")
+    )
+    candidate_sub_type = _clean_string(
+        item.get("asset_image_sub_type_candidate")
+    )
+    if candidate_main_type or candidate_sub_type:
+        candidate_wire_pair = image_taxonomy_wire_pair(
+            candidate_main_type,
+            candidate_sub_type,
+        )
+        if candidate_wire_pair is None:
+            item["asset_image_main_type_candidate"] = ""
+            item["asset_image_sub_type_candidate"] = ""
+            item["asset_source_type_candidate"] = ""
+            item["asset_scope_candidate"] = ""
+            item["asset_color_pick_candidates"] = []
+            item["asset_default_target"] = ""
+            item["asset_verified"] = False
+        else:
+            item["asset_image_main_type_candidate"] = candidate_main_type
+            item["asset_image_sub_type_candidate"] = candidate_sub_type
+            item["asset_source_type_candidate"] = candidate_wire_pair[0]
+            item["asset_scope_candidate"] = candidate_wire_pair[1]
+
     wire_pair = image_taxonomy_wire_pair(main_type, sub_type)
     if wire_pair is None:
         item["source_type"] = IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED
@@ -622,9 +693,7 @@ def _normalize_image_taxonomy(item: Dict[str, Any]) -> tuple[str, str]:
         item["binding_custom_scopes"] = [""]
         item["color_picks"] = [""]
         item["owner"] = ""
-        item["interaction_targets"] = [""]
-        item["interaction_custom_targets"] = [""]
-        item["legacy_relationship_targets"] = []
+        item["look_custom_instruction"] = ""
         item["custom_source_type"] = ""
         item["picker_auto_color"] = ""
         item["picker_auto_video"] = 0
@@ -634,22 +703,63 @@ def _normalize_image_taxonomy(item: Dict[str, Any]) -> tuple[str, str]:
     source_type, scope = wire_pair
     item["source_type"] = source_type
     item["scope"] = scope
-    if not (main_type == "Custom / Context" and sub_type == "Custom"):
+    if main_type == "Custom / Context" and sub_type == "Context":
+        item["custom_source_type"] = "Context Reference"
+    elif not (main_type == "Custom / Context" and sub_type == "Custom"):
         item["custom_source_type"] = ""
 
-    # Look Reference Target is Prompt-owned. Main/Sub Type limits which
-    # attributes may transfer, while Target selects the recipient of those
-    # attributes. Never rewrite a named target into a global/camera target
-    # during normalization; that would discard valid per-target authoring on
-    # every state round-trip.
-    if main_type == "Look Reference":
-        item["interaction_targets"] = [""]
-        item["interaction_custom_targets"] = [""]
-        item["legacy_relationship_targets"] = []
+    # Lighting-bearing Look sheets are scene-light authorities. They may use
+    # only the explicit Global Look scope or an authored Custom instruction;
+    # a named image Target must never become an implicit per-subject lighting
+    # override. ``Custom`` is a reserved scope-mode sentinel, not a target ID.
+    if sub_type in IMAGE_GLOBAL_SCOPE_LOOK_REFERENCE_SUB_TYPES:
+        current_target_key = image_target_key(item.get("owner"))
+        if current_target_key == image_target_key(IMAGE_CUSTOM_LOOK_TARGET):
+            item["owner"] = IMAGE_CUSTOM_LOOK_TARGET
+        else:
+            item["owner"] = IMAGE_GLOBAL_LOOK_TARGET
+        item["look_custom_instruction"] = _clean_string(
+            item.get("look_custom_instruction")
+        )[:MAX_DESCRIPTION_CHARS]
+        item["asset_default_target"] = IMAGE_GLOBAL_LOOK_TARGET
 
-    # Main/Sub taxonomy already owns scene/background authority.  Older
-    # workflows also carried the redundant system Target below; remove only
-    # that exact generated value while preserving every authored named target.
+    # Non-lighting general Look targets remain explicitly Prompt-authored.
+    # Scale-only all tokens (and Ignore's ``None`` token) have no authority,
+    # so a subtype transition releases them to blank. Global Look remains
+    # valid only when explicitly selected, while authored named targets survive
+    # normalization. Camera/composition is not a visual-look recipient.
+    elif sub_type in IMAGE_GENERAL_LOOK_REFERENCE_SUB_TYPES:
+        current_target = _clean_string(item.get("owner"))
+        if (
+            is_image_system_target(current_target)
+            and current_target not in IMAGE_GENERAL_LOOK_ALLOWED_SYSTEM_TARGETS
+        ):
+            item["owner"] = ""
+        elif image_target_key(current_target) == image_target_key(
+            IMAGE_GLOBAL_LOOK_TARGET
+        ):
+            item["owner"] = IMAGE_GLOBAL_LOOK_TARGET
+        item["look_custom_instruction"] = ""
+        item["asset_default_target"] = ""
+
+    # Scale sheets are measurement references, never camera/global-look
+    # authority. Blank rows receive the explicit domain-wide target while
+    # authored named targets remain intact.
+    elif sub_type in IMAGE_SCALE_REFERENCE_SUB_TYPES:
+        default_scale_target = IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS[sub_type]
+        current_target = _clean_string(item.get("owner"))
+        if not current_target or (
+            is_image_system_target(current_target)
+            and current_target != default_scale_target
+        ):
+            item["owner"] = default_scale_target
+        item["asset_default_target"] = default_scale_target
+
+    else:
+        item["look_custom_instruction"] = ""
+
+    # Main/Sub taxonomy already owns scene/background authority. Remove the
+    # redundant system Target while preserving every authored named target.
     if (
         source_type
         in {
@@ -693,6 +803,120 @@ def _normalize_image_taxonomy(item: Dict[str, Any]) -> tuple[str, str]:
         item["picker_auto_video"] = 0
         item["picker_auto_source"] = ""
     return main_type, sub_type
+
+
+def _reconcile_scale_reference_targets(
+    images: List[Dict[str, Any]],
+    state: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Keep scale-sheet Target values inside their typed recipient domain."""
+
+    active_images = _active_image_rows_for_state(images, state)
+    character_targets: Dict[str, str] = {}
+    background_targets: Dict[str, str] = {}
+    for row in active_images:
+        address = _clean_string(row.get("owner")) or _clean_string(row.get("label"))
+        if not address or is_image_system_target(address):
+            continue
+        main_type = _clean_string(row.get("image_main_type"))
+        if main_type in {"Character", "Character Prop"}:
+            character_targets.setdefault(image_target_key(address), address)
+        elif main_type in {"Environment / Background", "Background Prop"}:
+            background_targets.setdefault(image_target_key(address), address)
+    # One canonical address cannot identify both a character-domain and a
+    # background-domain recipient. Excluding the collision prevents a Look or
+    # relative-size sheet from silently choosing the wrong physical subject.
+    ambiguous_target_keys = set(character_targets).intersection(background_targets)
+    for target_key in ambiguous_target_keys:
+        character_targets.pop(target_key, None)
+        background_targets.pop(target_key, None)
+    for item in images:
+        sub_type = _clean_string(item.get("image_sub_type"))
+        default_target = IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS.get(sub_type)
+        if not default_target:
+            continue
+        if sub_type == "ch_Scale":
+            allowed_targets = dict(character_targets)
+        elif sub_type == "bg_Scale":
+            allowed_targets = dict(background_targets)
+        else:
+            allowed_targets = {**character_targets, **background_targets}
+        allowed_targets[image_target_key(default_target)] = default_target
+        current_target_key = image_target_key(item.get("owner"))
+        if current_target_key not in allowed_targets:
+            item["owner"] = default_target
+        else:
+            item["owner"] = allowed_targets[current_target_key]
+    return images
+
+
+def _reconcile_general_look_reference_targets(
+    images: List[Dict[str, Any]],
+    state: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Remove active non-renderable recipients without erasing dormant names."""
+
+    active_images = _active_image_rows_for_state(images, state)
+    character_targets: Dict[str, str] = {}
+    background_targets: Dict[str, str] = {}
+    active_non_target_keys: set[str] = set()
+    for row in active_images:
+        main_type = _clean_string(row.get("image_main_type"))
+        if main_type in IMAGE_GENERAL_LOOK_NAMED_TARGET_MAIN_TYPES:
+            address = _clean_string(row.get("owner")) or _clean_string(row.get("label"))
+            if address and not is_image_system_target(address):
+                target_map = (
+                    character_targets
+                    if main_type in {"Character", "Character Prop"}
+                    else background_targets
+                )
+                target_map.setdefault(image_target_key(address), address)
+            continue
+        # A Look/Custom row's owner is its intended recipient, not its own
+        # address. Only its label can invalidate a self/non-renderable Target.
+        source_address = _clean_string(row.get("label"))
+        if source_address and not is_image_system_target(source_address):
+            active_non_target_keys.add(image_target_key(source_address))
+    ambiguous_target_keys = set(character_targets).intersection(background_targets)
+    eligible_targets = {
+        **{
+            key: value
+            for key, value in character_targets.items()
+            if key not in ambiguous_target_keys
+        },
+        **{
+            key: value
+            for key, value in background_targets.items()
+            if key not in ambiguous_target_keys
+        },
+    }
+    for item in images:
+        sub_type = _clean_string(item.get("image_sub_type"))
+        if sub_type not in IMAGE_GENERAL_LOOK_REFERENCE_SUB_TYPES:
+            continue
+        if sub_type in IMAGE_GLOBAL_SCOPE_LOOK_REFERENCE_SUB_TYPES:
+            current_target_key = image_target_key(item.get("owner"))
+            item["owner"] = (
+                IMAGE_CUSTOM_LOOK_TARGET
+                if current_target_key == image_target_key(IMAGE_CUSTOM_LOOK_TARGET)
+                else IMAGE_GLOBAL_LOOK_TARGET
+            )
+            continue
+        current_target = _clean_string(item.get("owner"))
+        if (
+            is_image_system_target(current_target)
+            and current_target not in IMAGE_GENERAL_LOOK_ALLOWED_SYSTEM_TARGETS
+        ):
+            item["owner"] = ""
+            continue
+        current_target_key = image_target_key(current_target)
+        if current_target_key in ambiguous_target_keys:
+            item["owner"] = ""
+        elif current_target_key in eligible_targets:
+            item["owner"] = eligible_targets[current_target_key]
+        elif current_target_key in active_non_target_keys:
+            item["owner"] = ""
+    return images
 
 
 def _merge_unique_notes(*values: Any) -> str:
@@ -1573,26 +1797,7 @@ def _slot_name(prefix: str, index: int) -> str:
 
 
 def _image_taxonomy_payload() -> Dict[str, Any]:
-    return {
-        "image_main_type_choices": list(IMAGE_MAIN_TYPE_CHOICES),
-        "image_sub_type_choices": {
-            key: list(values) for key, values in IMAGE_SUB_TYPE_CHOICES.items()
-        },
-        "source_type_choices": list(IMAGE_SOURCE_TYPE_CHOICES),
-        "scope_choices": list(IMAGE_SCOPE_CHOICES),
-        "scope_choices_by_source_type": {
-            key: list(values)
-            for key, values in IMAGE_SCOPE_CHOICES_BY_SOURCE_TYPE.items()
-        },
-        "actor_color_pick_choices": image_color_pick_choices_for_source_type(
-            "Character Appearance"
-        ),
-        "object_color_pick_choices": image_color_pick_choices_for_source_type(
-            "Prop / Accessory"
-        ),
-        "actor_color_pick_source_types": sorted(ACTOR_COLOR_PICK_SOURCE_TYPES),
-        "object_color_pick_source_types": sorted(OBJECT_COLOR_PICK_SOURCE_TYPES),
-    }
+    return image_taxonomy_payload()
 
 
 def _default_image_item(slot: int) -> Dict[str, Any]:
@@ -1622,7 +1827,9 @@ def _default_image_item(slot: int) -> Dict[str, Any]:
         "source_type": "Role Required / Select Source Type",
         "custom_source_type": "",
         "owner": "",
-        "legacy_relationship_targets": [],
+        # Used only when a lighting-bearing Look subtype selects the reserved
+        # Custom scope mode. It is never interpreted as an image Target ID.
+        "look_custom_instruction": "",
         "scope": "",
         "binding_scopes": [""],
         "binding_custom_scopes": [""],
@@ -1652,11 +1859,6 @@ def _default_image_item(slot: int) -> Dict[str, Any]:
         "frame_range_binding": None,
         "frame_range_selected_index": -1,
         "manual": True,
-        "image_main_type_choices": IMAGE_MAIN_TYPE_CHOICES,
-        "image_sub_type_choices": IMAGE_SUB_TYPE_CHOICES,
-        "source_type_choices": IMAGE_SOURCE_TYPE_CHOICES,
-        "owner_choices": IMAGE_OWNER_CHOICES,
-        "scope_choices": IMAGE_SCOPE_CHOICES,
     }
 
 
@@ -2323,55 +2525,6 @@ def _active_frame_range_bindings(item: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 
-def _legacy_relationship_targets(item: Dict[str, Any]) -> List[str]:
-    """Preserve every readable Target from older multi-target dashboard states."""
-    out: List[str] = []
-    preserved_value = item.get("legacy_relationship_targets")
-    if isinstance(preserved_value, (list, tuple)):
-        preserved = list(preserved_value)
-    elif isinstance(preserved_value, str) and preserved_value.strip():
-        preserved = [preserved_value]
-    else:
-        preserved = []
-    for value in preserved:
-        target = _clean_string(value)
-        if target and target not in out:
-            out.append(target)
-
-    raw_value = item.get("interaction_targets") or item.get("interaction_target") or item.get("interactionTarget")
-    if isinstance(raw_value, (list, tuple)):
-        raw = list(raw_value)
-    elif isinstance(raw_value, str) and raw_value.strip():
-        raw = [raw_value]
-    else:
-        raw = []
-    custom_value = item.get("interaction_custom_targets")
-    if isinstance(custom_value, (list, tuple)):
-        customs = [_clean_string(value) for value in custom_value]
-    elif isinstance(custom_value, str) and custom_value.strip():
-        customs = [_clean_string(custom_value)]
-    else:
-        customs = []
-    for index, value in enumerate(raw):
-        target = _clean_string(customs[index] if _clean_string(value) == "Custom" and index < len(customs) else value)
-        if target and target not in out:
-            out.append(target)
-    return out
-
-
-def _migrate_target_authority(item: Dict[str, Any], scopes: List[str]) -> str:
-    """Migrate one unambiguous legacy Target without merging distinct meanings."""
-    owner = _clean_string(item.get("owner"))
-    if owner == "Custom":
-        owner = _clean_string(item.get("custom_owner") or item.get("custom_target"))
-    relationship_scopes = {"Handheld prop", "Attached accessory", "Interactive scene prop"}
-    if not owner and any(scope in relationship_scopes for scope in scopes):
-        legacy_targets = _legacy_relationship_targets(item)
-        if len(legacy_targets) == 1:
-            owner = legacy_targets[0]
-    return owner
-
-
 def _effective_image_source_type(item: Dict[str, Any]) -> str:
     source_type = _clean_string(item.get("source_type"))
     if source_type == "Role Required / Select Source Type":
@@ -2389,6 +2542,7 @@ def _default_image_target_for_main_type(
     source_type: Any,
     image_name: Any = "",
     asset_id: Any = "",
+    image_sub_type: Any = "",
 ) -> str:
     """Return the editable initial Target implied by a verified Main Type."""
     main_type = _clean_string(source_type)
@@ -2403,14 +2557,25 @@ def _default_image_target_for_main_type(
         "Foreground / Ground",
     }:
         return ""
-    if main_type == "Scale / Composition Reference":
-        return "Camera / Composition"
+    if main_type == "Relative Size Reference":
+        return IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS.get(
+            _clean_string(image_sub_type),
+            "",
+        )
     if main_type in {
         "Color / Look Reference",
         "Color + Look + Lighting Mood Reference",
         "Lighting / Atmosphere Reference",
     }:
-        return "Global Look"
+        if _clean_string(image_sub_type) in (
+            IMAGE_GLOBAL_SCOPE_LOOK_REFERENCE_SUB_TYPES
+        ):
+            return IMAGE_GLOBAL_LOOK_TARGET
+        # Color Mood and Render Look remain opt-in: a newly connected verified
+        # row stays blank until the user chooses Global Look or one renderable
+        # named target. Lighting-bearing Look subtypes returned above always
+        # start at Global Look.
+        return ""
     if main_type in {
         "Character Appearance",
         "Partial Character Detail",
@@ -2470,10 +2635,6 @@ def _normalize_image_binding_fields(item: Dict[str, Any], video_count: int = MAX
     frame_range_intent = _canonical_frame_range_intent(item)
     picks = _normalize_color_picks(item.get("color_picks"))
     raw_scopes = item.get("binding_scopes")
-    if raw_scopes is None:
-        raw_scopes = item.get("sub_types")
-    if raw_scopes is None:
-        raw_scopes = item.get("subtypes")
     scopes = _normalize_binding_scopes(raw_scopes, item.get("scope"), len(picks))
     count = max(1, min(MAX_COLOR_PICKS, max(len(picks), len(scopes))))
     while len(picks) < count:
@@ -2482,8 +2643,8 @@ def _normalize_image_binding_fields(item: Dict[str, Any], video_count: int = MAX
         scopes.append("")
     custom_scopes = _normalize_parallel_text_list(item.get("binding_custom_scopes"), count, MAX_COLOR_PICKS)
     registered_subtype = _verified_registered_subtype(item)
-    # Sub Type is image-level authority. Color/video bindings remain independent,
-    # but legacy per-binding subtype overrides are intentionally collapsed.
+    # Sub Type is image-level authority. Color/video bindings remain independent
+    # and cannot carry hidden per-binding subtype overrides.
     first_authored_scope_index = next(
         (index for index, scope in enumerate(scopes) if _clean_string(scope)),
         -1,
@@ -2557,9 +2718,7 @@ def _normalize_image_binding_fields(item: Dict[str, Any], video_count: int = MAX
             ),
             item["frame_range_color_index"],
         )
-    # Rebuild the old address map as a one-way compatibility projection. This
-    # prevents stale Picker/color addresses from accumulating or becoming a
-    # second authority after one-time migration.
+    # Rebuild the current derived address map from the Prompt-owned range intent.
     item["frame_range_bindings"] = {}
     item["frame_range_selected_index"] = frame_range_intent["selected_index"]
     projected_binding = _current_frame_range_binding(item)
@@ -2831,7 +2990,7 @@ def _normalize_ui(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _migrate_old_image_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
+def _normalize_image_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
     out = _default_image_item(slot)
     out["label"] = _clean_string(item.get("label") or item.get("name_override") or item.get("description"))
     out["present"] = bool(item.get("present")) or bool(out["label"])
@@ -2879,7 +3038,10 @@ def _migrate_old_image_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
     out["image_main_type"] = _clean_string(item.get("image_main_type"))
     out["image_sub_type"] = _clean_string(item.get("image_sub_type"))
     out["source_type"] = _clean_string(item.get("source_type")) or out["source_type"]
-    out["custom_source_type"] = _clean_string(item.get("custom_source_type") or item.get("custom_main_type"))
+    out["custom_source_type"] = _clean_string(item.get("custom_source_type"))
+    out["look_custom_instruction"] = _clean_string(
+        item.get("look_custom_instruction")
+    )[:MAX_DESCRIPTION_CHARS]
     out["scope"] = _clean_string(item.get("scope"))
     out["color_picks"] = _normalize_color_picks(item.get("color_picks") or item.get("colorPick") or item.get("color_pick") or item.get("color") or item.get("preview_color"))
     out["binding_custom_scopes"] = _normalize_parallel_text_list(item.get("binding_custom_scopes") or item.get("custom_scopes"), len(out["color_picks"]), MAX_COLOR_PICKS)
@@ -2887,26 +3049,7 @@ def _migrate_old_image_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
     out["binding_video_slots"] = legacy_video_slots
     out["marker_video"] = legacy_video_slots[0]
     raw_binding_scopes = item.get("binding_scopes")
-    if raw_binding_scopes is None:
-        raw_binding_scopes = item.get("sub_types")
-    if raw_binding_scopes is None:
-        raw_binding_scopes = item.get("subtypes")
-    migration_scopes = _normalize_binding_scopes(raw_binding_scopes, out["scope"], len(out["color_picks"]))
-    migration_primary_scope = (
-        _verified_registered_subtype(out)
-        or (migration_scopes[0] if migration_scopes else "")
-        or out["scope"]
-        or next(
-            (
-                scope
-                for scope in migration_scopes
-                if _clean_string(scope)
-            ),
-            "",
-        )
-    )
-    out["owner"] = _migrate_target_authority(item, [migration_primary_scope])
-    out["legacy_relationship_targets"] = _legacy_relationship_targets(item)
+    out["owner"] = _clean_string(item.get("owner"))
     out["preview_marker"] = _clean_string(item.get("preview_marker") or item.get("target_marker") or item.get("replacement_target"))
     out["picker_auto_color"] = _clean_string(item.get("picker_auto_color"))
     try:
@@ -2934,47 +3077,6 @@ def _migrate_old_image_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
         out["frame_range_selected_index"] = -1
     out["manual"] = bool(item.get("manual", True))
 
-    old_role = _clean_string(item.get("role"))
-    if old_role and not item.get("source_type"):
-        m = re.match(r"^Subject\s+(\d+)\s+Appearance$", old_role)
-        if m:
-            out["source_type"] = "Character Appearance"
-            out["owner"] = f"Subject {int(m.group(1))}"
-            out["scope"] = "Full body / full appearance"
-        elif old_role == "Environment / Background":
-            out["source_type"] = "Environment / Background"
-            out["scope"] = "Main background"
-        elif old_role == "Lighting / Atmosphere":
-            out["source_type"] = "Lighting / Atmosphere Reference"
-            out["owner"] = "Global Look"
-            out["scope"] = "Lighting mood only"
-        elif old_role == "Scene Scale / Composition":
-            out["source_type"] = "Scale / Composition Reference"
-            out["owner"] = "Camera / Composition"
-            out["scope"] = "Composition only"
-        elif old_role == "Prop / Set Reference":
-            out["source_type"] = "Prop / Accessory"
-            out["scope"] = "Custom scope"
-        elif old_role == "Color / Look Reference":
-            out["source_type"] = "Color / Look Reference"
-            out["owner"] = "Global Look"
-            out["scope"] = "Render look only"
-        elif old_role == "Environment + Lighting + Color":
-            out["source_type"] = "Environment / Background"
-        elif old_role == "Ignore / Unused":
-            out["source_type"] = "Ignore / Unused"
-    if out["source_type"] not in IMAGE_SOURCE_TYPE_CHOICES:
-        unknown_source_type = out["source_type"]
-        existing_custom = _clean_string(out.get("custom_source_type"))
-        out["source_type"] = "Custom"
-        out["custom_source_type"] = " | ".join(dict.fromkeys(
-            value
-            for value in (unknown_source_type, existing_custom)
-            if value
-        ))
-    subject_num = _subject_number(out["owner"])
-    if subject_num:
-        out["owner"] = f"image {subject_num}"
     out["binding_scopes"] = _normalize_binding_scopes(raw_binding_scopes, out["scope"], len(out["color_picks"]))
     _normalize_image_binding_fields(out, MAX_VIDEOS)
     return out
@@ -3011,11 +3113,12 @@ def _migrate_old_video_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
         item.get("description"),
     )
     out["picker_auto_label"] = _clean_string(item.get("picker_auto_label"))
-    out["picker_auto_video_main_type"] = _clean_string(
-        item.get("picker_auto_video_main_type")
-    )
-    out["picker_auto_video_sub_type"] = _clean_string(
-        item.get("picker_auto_video_sub_type")
+    (
+        out["picker_auto_video_main_type"],
+        out["picker_auto_video_sub_type"],
+    ) = _migrate_video_taxonomy_pair(
+        item.get("picker_auto_video_main_type"),
+        item.get("picker_auto_video_sub_type"),
     )
     out["picker_auto_depth"] = _normalize_picker_auto_depth(
         item.get("picker_auto_depth")
@@ -3147,7 +3250,6 @@ def _has_image_meaning(item: Dict[str, Any]) -> bool:
         not in ("", "Role Required / Select Source Type")
         or _clean_string(item.get("custom_source_type"))
         or _clean_string(item.get("owner"))
-        or any(_clean_string(value) for value in item.get("legacy_relationship_targets", []))
         or any(_clean_string(value) for value in item.get("binding_scopes", []))
         or any(_clean_string(value) for value in item.get("binding_custom_scopes", []))
         or any(_clean_string(value) for value in item.get("color_picks", []))
@@ -3175,7 +3277,7 @@ def _normalize_items(state: Dict[str, Any], key: str, max_count: int) -> List[Di
         if not isinstance(item, dict):
             migrated.append(_default_image_item(slot) if key == "images" else _default_video_item(slot))
             continue
-        migrated.append(_migrate_old_image_item(item, slot) if key == "images" else _migrate_old_video_item(item, slot))
+        migrated.append(_normalize_image_item(item, slot) if key == "images" else _migrate_old_video_item(item, slot))
     if not migrated:
         if key == "images":
             migrated = [_default_image_item(slot) for slot in range(1, 5)]
@@ -3207,7 +3309,7 @@ def _normalize_items(state: Dict[str, Any], key: str, max_count: int) -> List[Di
     result: List[Dict[str, Any]] = []
     for idx in range(1, visible_count + 1):
         prev = migrated[idx - 1] if idx <= len(migrated) else {}
-        row = _migrate_old_image_item(prev, idx)
+        row = _normalize_image_item(prev, idx)
         row["slot"] = idx
         row["token"] = f"@image{idx}"
         row["name"] = _slot_name("IMAGE", idx)
@@ -3262,7 +3364,7 @@ def _normalize_dormant_image_rows(
     for raw in value[:limit]:
         if not isinstance(raw, dict):
             continue
-        row = _migrate_old_image_item(raw, len(out) + 1)
+        row = _normalize_image_item(raw, len(out) + 1)
         row["manual"] = True
         if asset_rows:
             if not _clean_string(
@@ -3281,6 +3383,35 @@ def _normalize_dormant_image_rows(
 
 def _is_active_video(item: Dict[str, Any]) -> bool:
     return _has_video_meaning(item) and item.get("source_type") != "Ignore / Unused"
+
+
+def _assert_single_primary_unified_video(
+    active_videos: Sequence[Dict[str, Any]],
+) -> None:
+    """Fail closed when more than one video claims shot-wide authority.
+
+    A Primary Unified Shot Control owns camera, framing, layout, timing, and
+    motion together. Prompt must never choose a winner or silently demote a
+    user's Original Preview; the user must keep exactly one Original Preview
+    and explicitly classify companions as Mask, Depth, Motion Guide, or another
+    non-primary role.
+    """
+
+    primary_slots = [
+        int(item.get("slot") or index)
+        for index, item in enumerate(active_videos, start=1)
+        if _clean_string(item.get("control_role"))
+        == "Primary Unified Shot Control"
+    ]
+    if len(primary_slots) <= 1:
+        return
+    addressed = ", ".join(f"@video{slot}" for slot in primary_slots)
+    raise RuntimeError(
+        "[HMB VIDEO AUTHORITY CONFLICT] Multiple Primary Unified Shot Control "
+        f"videos are active: {addressed}. Keep exactly one Original Preview; "
+        "classify the remaining videos explicitly as Mask, Depth, Motion "
+        "Guide, or another non-primary role. No video was auto-reclassified."
+    )
 
 
 def _enforce_single_active_video_unified(videos: List[Dict[str, Any]]) -> None:
@@ -3347,6 +3478,7 @@ _MANUAL_VIDEO_CONTEXT_IMAGE_FIELDS = (
     "image_main_type",
     "image_sub_type",
     "custom_source_type",
+    "look_custom_instruction",
     "color_picks",
     "binding_scopes",
     "binding_custom_scopes",
@@ -3429,7 +3561,7 @@ def _normalize_manual_video_context_snapshot(value: Any) -> Dict[str, Any]:
         except Exception:
             index = fallback_index
         fields_source = raw.get("fields") if isinstance(raw.get("fields"), dict) else {}
-        normalized_item = _migrate_old_image_item(fields_source, index + 1)
+        normalized_item = _normalize_image_item(fields_source, index + 1)
         images.append({
             "identity": _clean_string(raw.get("identity")) or f"slot:{index + 1}",
             "index": index,
@@ -4661,6 +4793,8 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
 
     _enforce_single_active_video_unified(videos)
     images = _normalize_items(state, "images", MAX_IMAGES)
+    images = _reconcile_scale_reference_targets(images, state)
+    images = _reconcile_general_look_reference_targets(images, state)
     images, _ = _reset_images_bound_to_inactive_videos(images, videos)
     images = _enforce_color_pick_uniqueness_by_video(images, len(videos))
     active_images = len(_active_image_rows_for_state(images, state))
@@ -4828,6 +4962,7 @@ _PROMPT_IMAGE_UI_FIELDS = (
     # Prompt-owned controls. Picker/ImageAsset synchronization may replace the
     # row's transport envelope, but it must not replace these user decisions.
     "owner",
+    "look_custom_instruction",
     "color_picks",
     "binding_scopes",
     "binding_custom_scopes",
@@ -5135,15 +5270,8 @@ def _merge_prompt_revision_axes(
     return _normalize_state(source)
 
 
-def _subject_number(owner: str) -> int | None:
-    m = re.match(r"^Subject\s+(\d+)$", owner or "")
-    return int(m.group(1)) if m else None
-
-
 def _target_text(owner: str, default: str) -> str:
     owner = _clean_string(owner)
-    if _subject_number(owner):
-        return f"image {_subject_number(owner)}"
     return owner or default
 
 
@@ -5177,10 +5305,16 @@ def _look_target_authority_scope(target: Any) -> str:
     """Describe Look application scope without inventing global authority."""
 
     value = _public_single_line(target)
-    if value == "Global Look":
+    if value == IMAGE_GLOBAL_LOOK_TARGET:
         return "scene-wide"
-    if value == "Camera / Composition":
-        return "within the shot camera/composition domain"
+    if value == IMAGE_CUSTOM_LOOK_TARGET:
+        return "through the explicit custom Look scope instruction"
+    if value == "ch_all":
+        return "across all Character and Character Prop targets"
+    if value == "bg_all":
+        return "across all Environment / Background and Background Prop targets"
+    if value == "ch_all / bg_all":
+        return "across all character/prop and background domains"
     if value:
         return f"only on the selected target {value}"
     return (
@@ -5195,9 +5329,18 @@ def _image_role_line(item: Dict[str, Any], seq: int) -> str:
     token = f"@image{seq}"
     source_type_choice = _public_single_line(item.get("source_type"))
     source_type = _public_single_line(_effective_image_source_type(item))
-    owner = _public_single_line(_effective_target(item, f"image {seq}"))
+    default_target = _public_single_line(item.get("label")) or f"image {seq}"
+    owner = _public_single_line(_effective_target(item, default_target))
     authored_target = _public_single_line(item.get("owner"))
-    look_owner = authored_target or "Target unspecified"
+    custom_look_instruction = _public_single_line(
+        item.get("look_custom_instruction"),
+        MAX_PUBLIC_PROMPT_LINE_CHARS,
+    )
+    look_owner = (
+        "Custom Look Scope"
+        if authored_target == IMAGE_CUSTOM_LOOK_TARGET
+        else authored_target or "Target unspecified"
+    )
     look_target_scope = _look_target_authority_scope(authored_target)
     main_type = _public_single_line(item.get("image_main_type"))
     sub_type = _public_single_line(item.get("image_sub_type"))
@@ -5207,10 +5350,17 @@ def _image_role_line(item: Dict[str, Any], seq: int) -> str:
     ]
     # Look Reference intentionally has no video/Color-Pick binding entries, so
     # its image-level Sub Type scope must be read directly. Without this
-    # fallback Color Mood and Render Look (and the three scale/composition
+    # fallback Color Mood and Render Look (and the three relative-size
     # variants) collapse to identical user-readable role lines.
     if not any(scopes):
         scopes = [_public_single_line(item.get("scope"))]
+
+    reference_content_exclusion = (
+        "Reference-content exclusion = transfer only the attributes authorized "
+        "by this Sub Type; never copy, insert, reconstruct, or render any depicted "
+        "subject, object, prop, architecture, background, artwork, graphic, or "
+        "text from the reference image"
+    )
 
     def line_for(scope: str) -> str:
         suffix = _detail_suffix(scope)
@@ -5245,37 +5395,97 @@ def _image_role_line(item: Dict[str, Any], seq: int) -> str:
             return f"{owner} / Foreground / ground source = {token}{suffix}"
         if source_type_choice == "Color / Look Reference":
             authority = (
-                f"palette and color relationships {look_target_scope}; it does not "
-                "own light direction, exposure, or subject identity"
+                f"environmental palette relationships, grading, color spill, and "
+                f"value/saturation response {look_target_scope}; preserve intrinsic "
+                "albedo, hue family, markings, pattern, and material class, and do not "
+                "grant light-direction, exposure, or subject-identity authority"
                 if scope == "Color mood only"
-                else f"rendering language, shading character, detail, and finish "
-                f"{look_target_scope}; it does not own light direction, exposure, "
-                "subject identity, or scene/background content"
+                else f"rendering-language harmony, shading response, detail, and finish "
+                f"{look_target_scope} only within each target's approved stylization, "
+                "rendering medium, and material class; never change medium/material "
+                "family, intrinsic identity, or scene/background content"
             )
             return (
                 f"{look_owner} / Color / look reference = {token}{suffix} / "
-                f"Authority = {authority}"
+                f"Authority = {authority} / {reference_content_exclusion}"
             )
         if source_type_choice == "Color + Look + Lighting Mood Reference":
+            custom_scope = authored_target == IMAGE_CUSTOM_LOOK_TARGET
+            custom_scope_suffix = (
+                f" / Custom scope instruction = {custom_look_instruction}"
+                if custom_scope and custom_look_instruction
+                else ""
+            )
+            integration = (
+                "apply only the affected properties and named target or "
+                "scene-wide scope written in the Custom instruction; never "
+                "expand it to an unlisted target or to the whole scene"
+                if custom_scope
+                else "reconcile the actual selected character, prop, and "
+                "background sources into the reference time-of-day and "
+                "illumination state even when their source captures differ"
+            )
             return (
                 f"{look_owner} / Color / look / lighting reference = {token}{suffix} / "
                 "Authority = palette, render language, lighting, exposure, white "
                 f"balance, atmosphere, and grade {look_target_scope}; preserve "
                 "intrinsic identity, color, pattern, and material and do not expand "
-                "to untargeted subjects or scene/background content"
+                f"to untargeted subjects / Integration = {integration} / "
+                f"{reference_content_exclusion}{custom_scope_suffix}"
             )
         if source_type_choice == "Lighting / Atmosphere Reference":
+            custom_scope = authored_target == IMAGE_CUSTOM_LOOK_TARGET
+            custom_scope_suffix = (
+                f" / Custom scope instruction = {custom_look_instruction}"
+                if custom_scope and custom_look_instruction
+                else ""
+            )
+            integration = (
+                "apply only the affected properties and named target or "
+                "scene-wide scope written in the Custom instruction; never "
+                "expand it to an unlisted target or to the whole scene"
+                if custom_scope
+                else "relight the actual selected character, prop, and "
+                "background sources coherently under the reference time-of-day "
+                "while preserving their authored content"
+            )
             return (
                 f"{look_owner} / Lighting / atmosphere source = {token}{suffix} / "
                 "Authority = light direction, quality, exposure, white balance, "
                 f"atmosphere, and integration {look_target_scope}; it does not replace "
-                "subject identity, intrinsic design, or scene/background content"
+                "subject identity, intrinsic color/pattern, material class, or design / "
+                f"Integration = {integration} / "
+                f"{reference_content_exclusion}{custom_scope_suffix}"
             )
-        if source_type_choice == "Scale / Composition Reference":
+        if source_type_choice == "Relative Size Reference":
+            if sub_type == "ch_Scale":
+                scale_authority = (
+                    "measurement-only character/Character Prop size ratio against the "
+                    "actual shot background, with placement read only to establish that "
+                    "relative ratio"
+                )
+            elif sub_type == "bg_Scale":
+                scale_authority = (
+                    "measurement-only background size and placement ratio against the "
+                    "actual shot character/Character Prop"
+                )
+            else:
+                scale_authority = (
+                    "measurement-only character/background relative-size relationship "
+                    "and background placement"
+                )
             return (
-                f"{look_owner} / Scale / composition reference = {token}{suffix} / "
-                f"Authority = scale and/or composition {look_target_scope}; no color, "
-                "material, lighting, identity, motion, or scene-content authority"
+                f"{look_owner} / Relative-size reference sheet = {token}{suffix} / "
+                f"Authority = {scale_authority} {look_target_scope}; no camera, lens, "
+                "framing, color, look, lighting, material, identity, motion, or "
+                "scene-content authority; the reference sheet itself is never "
+                f"renderable content / {reference_content_exclusion}"
+            )
+        if main_type == "Custom / Context" and sub_type == "Context":
+            return (
+                f"{owner} / Context-only reference = {token}{suffix} / "
+                "Authority = supplemental context only; no identity, appearance, "
+                "scene-content, replacement, motion, camera, or look authority"
             )
         if source_type_choice == "Custom":
             return f"{owner} / {source_type} = {token}{suffix}"
@@ -5372,13 +5582,22 @@ def _image_replacement_line(
             "Color / Look Reference",
             "Color + Look + Lighting Mood Reference",
             "Lighting / Atmosphere Reference",
-            "Scale / Composition Reference",
+            "Relative Size Reference",
         }:
             return (
                 f"{source_type} applies to = {marker} / @image{seq}"
                 f"{_detail_suffix(scope)}"
             )
         if source_type == "Custom":
+            if (
+                _public_single_line(item.get("image_main_type"))
+                == "Custom / Context"
+                and _public_single_line(item.get("image_sub_type")) == "Context"
+            ):
+                return (
+                    f"Context-only reference applies to {owner} = {marker} / "
+                    f"@image{seq}{_detail_suffix(scope)}"
+                )
             return (
                 f"{_public_single_line(_effective_image_source_type(item))} "
                 f"applies to {owner} = {marker} / "
@@ -5460,7 +5679,10 @@ def _image_asset_input_kwargs() -> Dict[str, Any]:
             "assets provide Main Type, Asset ID, Image Name, a registered Sub Type, "
             "and Color Pick candidates. The registered Sub Type stays bound to the "
             "asset except that Look Reference rows may select an effective per-shot "
-            "Look Sub Type; Target remains an independent per-shot selection. "
+            "Look Sub Type; Target remains an independent per-shot selection, "
+            "except lighting-bearing Look rows which expose only Global Look "
+            "or a Custom instruction that directly names its affected properties "
+            "and target/local or scene-wide scope. "
             "IMAGE_IMPORT_IN sources provide only Image Name and generator order. "
             "Recognized source, role, Color Pick, and replacement fields compile into the public Prompt sections. "
             "Other connected or descriptive values remain local dashboard state and are not serialized into PROMPT_OUT."
@@ -5991,9 +6213,10 @@ def _apply_image_asset_payload(
     assets. External IMAGE_IMPORT_IN rows carry Image Name and generator order
     only and otherwise behave like native Prompt rows. A verified registered Sub
     Type is authoritative except that a Look Reference may keep one effective
-    Prompt Sub Type. Every Target remains Prompt-owned; a new verified row may
-    receive a Main-Type initial default, but refresh and normalization never
-    replace an authored Target.
+    Prompt Sub Type. Targets remain Prompt-owned; lighting-bearing Look rows
+    are normalized to Global Look or a Custom instruction that directly names
+    its affected properties and target/local or scene-wide scope, while other
+    Look targets preserve their current behavior.
     Neither mode writes final Color Pick, video slot, or frame range.
     """
     normalized = _normalize_state(state)
@@ -6673,6 +6896,7 @@ def _apply_image_asset_payload(
                 item.get("source_type"),
                 asset.get("image_name"),
                 asset.get("asset_id"),
+                item.get("image_sub_type"),
             )
             current_target = _clean_string(item.get("owner"))
             look_target_is_prompt_owned = (
@@ -6696,6 +6920,7 @@ def _apply_image_asset_payload(
                     item.get("source_type"),
                     asset.get("image_name"),
                     asset.get("asset_id"),
+                    item.get("image_sub_type"),
                 )
         else:
             # External/imported selection contributes its readable name/order.
@@ -7271,6 +7496,8 @@ def _picker_auto_depth_field_value(field: str, value: Any) -> Any:
             "yes",
             "on",
         }
+    if field == "control_role":
+        return _canonical_video_role(value)
     return _clean_string(value)
 
 
@@ -7295,6 +7522,16 @@ def _normalize_picker_auto_depth(value: Any) -> Dict[str, Any]:
                 entry.get("previous"),
             ),
         }
+    main_entry = fields.get("video_main_type")
+    sub_entry = fields.get("video_sub_type")
+    if isinstance(main_entry, dict) and isinstance(sub_entry, dict):
+        for state_key in ("assigned", "previous"):
+            migrated_main, migrated_sub = _migrate_video_taxonomy_pair(
+                main_entry.get(state_key),
+                sub_entry.get(state_key),
+            )
+            main_entry[state_key] = migrated_main
+            sub_entry[state_key] = migrated_sub
     if not fields:
         return {}
     return {
@@ -9958,7 +10195,7 @@ def _public_job_data_contract(
                 or int(entry.get("marker_video") or 1) in video_wide_range_slots
             )
         ]
-        images.append({
+        image_record = {
             "image": f"@image{slot}",
             "label": _clean_string(item.get("label")),
             # Preserve the exact user-facing taxonomy. ``source_type`` remains
@@ -9970,9 +10207,6 @@ def _public_job_data_contract(
             "source_scope": _clean_string(item.get("scope")),
             "custom_source_type": _clean_string(item.get("custom_source_type")),
             "target_id": _clean_string(item.get("owner")),
-            # Legacy relationship targets are retained in widget state for
-            # round-trip compatibility, but remain dormant until a dedicated
-            # active binding contract exists.
             "relationship_targets": [],
             "bindings": bindings,
             "identity": _nonempty_identity({
@@ -9986,7 +10220,24 @@ def _public_job_data_contract(
                 "source_kind": _clean_string(item.get("asset_source_kind")),
                 "verified": bool(item.get("asset_verified")),
             }),
-        })
+        }
+        image_sub_type = _clean_string(item.get("image_sub_type"))
+        if image_sub_type in IMAGE_GLOBAL_SCOPE_LOOK_REFERENCE_SUB_TYPES:
+            custom_scope = (
+                image_target_key(item.get("owner"))
+                == image_target_key(IMAGE_CUSTOM_LOOK_TARGET)
+            )
+            image_record["target_scope_mode"] = (
+                "custom" if custom_scope else "global"
+            )
+            image_record["custom_look_instruction"] = (
+                _clean_string(item.get("look_custom_instruction"))[
+                    :MAX_DESCRIPTION_CHARS
+                ]
+                if custom_scope
+                else ""
+            )
+        images.append(image_record)
 
     videos: List[Dict[str, Any]] = []
     for item in active_videos:
@@ -10178,6 +10429,7 @@ def _build_data_only_prompt_package(state: Dict[str, Any]) -> str:
     text = state["text"]
     active_images = _active_image_rows_for_state(state["images"], state)
     active_videos = [item for item in state["videos"] if _is_active_video(item)]
+    _assert_single_primary_unified_video(active_videos)
     control_only_bindings = _parse_control_only_bindings(text)[0]
     valid_frame_bindings = _valid_frame_range_bindings(
         state, active_images, active_videos
@@ -10683,8 +10935,10 @@ class HMBPromptLibrary(DataNode):
     HMBAgentLibrary automation.
     Verified Project Asset data establishes Project, Asset ID, Image Name, Main
     Type, and the registered Image Sub Type. A verified Look Reference keeps
-    its Main Type while permitting an effective per-shot Look Sub Type; its
-    Target remains an independent per-shot Prompt selection. External
+    its Main Type while permitting an effective per-shot Look Sub Type. Color
+    Mood and Render Look keep an independent per-shot Target; lighting-bearing
+    Look rows expose Global Look or a Custom authored target/local or
+    scene-wide scope. External
     IMAGE_IMPORT_IN rows establish
     Image Name and generator order only. Prompt keeps Target, Color Pick, and
     custom user intent editable.

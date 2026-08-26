@@ -681,7 +681,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.7.1"
+assert manifest["metadata"]["library_version"] == "0.7.5"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
@@ -897,13 +897,21 @@ expected_object = [
 assert character == expected_actor
 assert background == expected_object
 assert picker.MARKER_ORDER == expected_actor + expected_object
-assert prompt.ACTOR_COLOR_PICK_CHOICES == expected_actor
-assert prompt.OBJECT_COLOR_PICK_CHOICES == expected_object
-assert prompt.COLOR_PICK_CHOICES == picker.MARKER_ORDER
-assert prompt._color_pick_choices_for_source_type("Character Appearance") == (
-    expected_actor + expected_ghost
-)
-assert prompt._color_pick_choices_for_source_type("Prop / Accessory") == expected_object
+assert prompt._hmb.ACTOR_COLOR_PICK_CHOICES == expected_actor
+assert prompt._hmb.OBJECT_COLOR_PICK_CHOICES == expected_object
+assert prompt._hmb.COLOR_PICK_CHOICES == picker.MARKER_ORDER
+assert prompt.image_color_pick_choices_for_taxonomy(
+    "Character", "Full Appearance"
+) == expected_actor
+assert prompt.image_color_pick_choices_for_taxonomy(
+    "Character Prop", "Handheld Prop"
+) == expected_actor
+assert prompt.image_color_pick_choices_for_taxonomy(
+    "Environment / Background", "Main Background"
+) == expected_object
+assert prompt.image_color_pick_choices_for_taxonomy(
+    "Background Prop", "Independent Scene Prop"
+) == expected_object
 
 original_mayabatch_candidates = picker._mayabatch_candidates
 try:
@@ -1818,7 +1826,27 @@ with tempfile.TemporaryDirectory() as temp_dir:
                              "width": job["width"],
                              "height": job["height"],
                          },
-                         "assignment_mode": "original_full_detail_no_marker",
+                         "assignment_mode": picker.ORIGINAL_LAMBERT_ASSIGNMENT_MODE,
+                         "original_material_override_profile": (
+                             picker.ORIGINAL_MATERIAL_OVERRIDE_PROFILE
+                         ),
+                         "original_material_override_report": {
+                             "profile": picker.ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
+                             "requested": True,
+                             "status": "restored",
+                             "restore_ok": True,
+                             "shading_group_membership_preserved": True,
+                             "one_lambert_per_source_material": True,
+                             "default_lighting_verified": True,
+                             "textured_render_mode_verified": True,
+                             "inspected_shading_engine_count": 2,
+                             "source_material_count": 2,
+                             "temporary_lambert_count": 2,
+                             "existing_lambert_count": 0,
+                             "texture_connection_count": 2,
+                             "numeric_color_count": 0,
+                             "swapped_shading_engine_count": 2,
+                         },
                          "markers": [],
                          "scene_dependency_paths": [str(scene_path)],
                          "script_node_report": {
@@ -1936,6 +1964,11 @@ with tempfile.TemporaryDirectory() as temp_dir:
         assert len(captured_maya_jobs) == 2
         assert captured_maya_jobs[1]["operation"] == "render"
         assert captured_maya_jobs[1]["apply_marker_shaders"] is False
+        assert captured_maya_jobs[1]["apply_original_lambert_override"] is True
+        assert (
+            captured_maya_jobs[1]["original_material_override_profile"]
+            == picker.ORIGINAL_MATERIAL_OVERRIDE_PROFILE
+        )
         assert captured_maya_jobs[1]["force_high_quality_viewport"] is True
         assert (
             captured_maya_jobs[1]["viewport_quality_profile"]
@@ -2334,13 +2367,6 @@ maya_runner = load(
     "HMB_Maya_Background_Preview_regression",
     ROOT / "resources/maya/HMB_Maya_Background_Preview.py",
 )
-maya_binding_setup = load(
-    "HMB_Maya_Binding_Setup_regression",
-    ROOT / "resources/maya/HMB_Maya_Binding_Setup.py",
-)
-assert maya_binding_setup._allows_repeated_color("Sky Blue")
-assert maya_binding_setup._allows_repeated_color("Direction Checker")
-assert not maya_binding_setup._allows_repeated_color("Red")
 reference_parent_map = {
     "|CH|AnimalKidLion:All_G|AnimalKidLion:geo_GRP|AnimalKidLion:Body": "|CH|AnimalKidLion:All_G|AnimalKidLion:geo_GRP",
     "|CH|AnimalKidLion:All_G|AnimalKidLion:geo_GRP": "|CH|AnimalKidLion:All_G",

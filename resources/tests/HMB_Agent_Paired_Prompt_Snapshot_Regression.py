@@ -112,6 +112,10 @@ expect_rejected(lambda: agent._assert_public_job_data_contract(visible_prompt))
 runtime_prompt = agent._compose_hmb_runtime_prompt(machine_prompt, {"sources": []})
 assert runtime_prompt.startswith(machine_prompt.rstrip() + "\n")
 assert visible_prompt not in runtime_prompt
+assert agent._RUNTIME_FX_SCOPE_HEADER in runtime_prompt
+assert agent._ENGLISH_GENERATOR_OUTPUT_CONTRACT_HEADER in runtime_prompt
+assert "IMAGE TAXONOMY COMPATIBILITY" not in runtime_prompt
+assert "Scale / Composition Reference" not in runtime_prompt
 
 
 for changed in (

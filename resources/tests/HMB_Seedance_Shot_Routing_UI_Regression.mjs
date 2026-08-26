@@ -75,6 +75,11 @@ const routed = widget.hmbSeedanceShotState({ value: {
 } });
 assert.equal(routed.remote_prompt_route.connected, true);
 assert.equal(routed.remote_prompt_route.source_node_name, "HMBAgentLibrary_4");
+assert.equal(routed.remote_prompt_route.previous_target_node_name, "");
+assert.equal(widget.hmbSeedanceRemotePromptRoute({
+  ...connectedRoute,
+  previous_target_node_name: "x".repeat(513),
+}).connected, false, "Reset target aliases remain bounded node names.");
 
 const edge = (id, ariaLabel) => ({
   getAttribute(name) {
@@ -142,6 +147,83 @@ assert.equal(
   true,
   "The next exact cable is pre-armed before retained mode creates it.",
 );
+assert.equal(
+  widget.hmbSeedanceRemotePromptEdgeMatches(
+    edge(
+      "HMBAgentLibrary_4_temp-output-HMB Seedance Generation_4-prompt-1700000000001",
+      "Edge from HMBAgentLibrary_4 to HMB Seedance Generation_4",
+    ),
+    {
+      ...replacementRoute,
+      source_node_name: "HMBAgentLibrary_4_temp",
+      previous_source_node_name: "HMBAgentLibrary_4",
+    },
+  ),
+  true,
+  "Reset Node may retain the temporary name in the edge id after its aria label uses the final name.",
+);
+assert.equal(
+  widget.hmbSeedanceRemotePromptEdgeMatches(
+    edge(
+      "ForeignAgent-output-HMB Seedance Generation_4-prompt-1700000000002",
+      "Edge from HMBAgentLibrary_4 to HMB Seedance Generation_4",
+    ),
+    replacementRoute,
+  ),
+  false,
+  "A mixed reset alias must still reject an unproven source endpoint.",
+);
+const fullResetRoute = {
+  ...connectedRoute,
+  source_node_name: "HMBAgentLibrary_4_temp",
+  previous_source_node_name: "HMBAgentLibrary_4",
+  target_node_name: "HMB Seedance Generation_4_temp",
+  previous_target_node_name: "HMB Seedance Generation_4",
+};
+assert.equal(
+  widget.hmbSeedanceRemotePromptEdgeMatches(
+    edge(
+      "HMBAgentLibrary_4_temp-output-HMB Seedance Generation_4_temp-prompt-1700000000003",
+      "Edge from HMBAgentLibrary_4 to HMB Seedance Generation_4",
+    ),
+    fullResetRoute,
+  ),
+  true,
+  "Source and target Reset aliases may transition independently between edge id and aria label.",
+);
+assert.equal(
+  widget.hmbSeedanceRemotePromptEdgeMatches(
+    edge(
+      "HMBAgentLibrary_4-output-HMB Seedance Generation_4_temp-prompt-1700000000004",
+      "Edge from HMBAgentLibrary_4_temp to HMB Seedance Generation_4",
+    ),
+    fullResetRoute,
+  ),
+  true,
+  "Every proven source/target alias combination remains hidden during Reset.",
+);
+assert.equal(
+  widget.hmbSeedanceRemotePromptEdgeMatches(
+    edge(
+      "HMBAgentLibrary_4_temp-output-Foreign Generator-prompt-1700000000005",
+      "Edge from HMBAgentLibrary_4 to HMB Seedance Generation_4",
+    ),
+    fullResetRoute,
+  ),
+  false,
+  "An unproven target endpoint in the edge id must remain visible.",
+);
+assert.equal(
+  widget.hmbSeedanceRemotePromptEdgeMatches(
+    edge(
+      "HMBAgentLibrary_4_temp-output-HMB Seedance Generation_4_temp-prompt-1700000000006",
+      "Edge from HMBAgentLibrary_4 to Foreign Generator",
+    ),
+    fullResetRoute,
+  ),
+  false,
+  "An unproven target endpoint in the aria label must remain visible.",
+);
 
 const serialized = widget.hmbSeedanceShotState({ value: JSON.stringify(selectedValue) });
 assert.equal(serialized.shot.shot_uuid, shot4Uuid, "Serialized dict props must retain Shot identity.");
@@ -182,11 +264,15 @@ assert.match(widgetSource, /HMBSeedanceGeneration/);
 assert.doesNotMatch(widgetSource, /addEventListener\([^\n]*hmb-shot-routing-catalog-v1/);
 assert.doesNotMatch(widgetSource, /__hmbShotRoutingCatalogs/);
 assert.match(widgetSource, /data-hmb-seedance-prompt-edge/);
-assert.match(widgetSource, /observe\(layer, \{ childList: true, subtree: true \}\)/);
+assert.match(
+  widgetSource,
+  /attributes:\s*true,[\s\S]*attributeFilter:\s*\["data-id", "aria-label"\]/,
+  "Reset Node endpoint renames must trigger an exact edge rescan.",
+);
 assert.doesNotMatch(
   widgetSource,
-  /observe\(layer, \{[^}]*attributes:\s*true/,
-  "The shared edge observer must not watch its own marker attributes.",
+  /attributeFilter:\s*\[[^\]]*data-hmb-seedance-prompt-edge/,
+  "The observer must not watch its own hiding marker.",
 );
 assert.doesNotMatch(
   widgetSource,

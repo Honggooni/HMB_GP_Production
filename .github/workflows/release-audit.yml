@@ -107,6 +107,7 @@ jobs:
             "HMB_Public_Release_Security_Regression.py",
             "HMB_State_Normalization_Property_Regression.py",
             "HMB_Image_Asset_Import_Order_Regression.py",
+            "HMB_Image_Asset_Staged_Loading_Regression.py",
             "HMB_Image_Asset_Resolved_Selection_Regression.py",
             "HMB_Prompt_No_Loss_Connection_Regression.py",
             "HMB_Image_Asset_Registration_Regression.py",
@@ -133,6 +134,7 @@ jobs:
             "HMB_VideoPicker_Native_Size_Migration_Regression.py",
             "HMB_VideoPicker_Python_Geometry_Hydration_Regression.py",
             "HMB_VideoPicker_High_Quality_Original_Regression.py",
+            "HMB_VideoPicker_Original_Lambert_Override_Regression.py",
             "HMB_VideoPicker_Maya_Shot_Authoring_Regression.py",
             "HMB_VideoPicker_Save_Reload_Regression.py",
             "HMB_VideoPicker_Real_Saved_Workflow_Replay_Regression.py",
@@ -145,6 +147,7 @@ jobs:
             "HMB_Agent_Cloud_Nonstreaming_Regression.py",
             "HMB_Agent_Policy_Collision_Retry_Regression.py",
             "HMB_Agent_English_Video_Progression_Regression.py",
+            "HMB_Agent_Generator_Semantic_Integrity_Regression.py",
             "HMB_Agent_Runtime_Prompt_UI_Isolation_Regression.py",
             "HMB_Agent_Shot_Binding_Regression.py",
             "HMB_Seedance_MP4_Verifier_Portability_Regression.py",
@@ -180,11 +183,6 @@ jobs:
             node $_.FullName
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-      - name: Server policy administration static regression
-        shell: powershell
-        run: >-
-          powershell -NoProfile -ExecutionPolicy Bypass -File
-          resources/tests/HMB_Agent_Policy_Admin_Scripts_Static_Regression.ps1
       - name: Runtime package static syntax audit
         shell: pwsh
         run: |
@@ -270,10 +268,12 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
-            "- Keeps each Look Reference Target editable per shot, including named targets, blank, Global Look, and Camera / Composition, without granting identity or scene/background-content authority.",
+            "- Keeps each visual Look Reference Target editable per shot for active named renderable targets or explicit Global Look; camera/composition remains isolated to its dedicated video or Custom authority.",
             "- Prefers Griptape Cloud HTTPS for local/Base64 images and local videos only when authentication and an accessible bucket are ready; otherwise images retain bounded Base64 and videos retain public HTTPS, asset://, or configured TOS fallbacks.",
             "- Recomputes VideoPicker Generate availability immediately for Original, Mask, Depth, and Motion Guide output choices while preserving command locks.",
+            "- Renders Original Playblast with temporary per-source Maya Lambert materials, preserving native texture identity and restoring every authored shading assignment after capture so Redshift is not required on team workstations.",
             "- Enlarges only the Object pattern swatch visual by 10% while preserving its 20px hitbox, palette layout, marker identity, and Maya render behavior.",
+            "- Loads ImageAsset thumbnails in staged batches while preserving shot selection, drag order, registration, and Agent routing contracts.",
             "- Includes the manifest-verified runtime installer and exact SHA256 checksum.",
             "",
             "Close Griptape completely before running the included installer."

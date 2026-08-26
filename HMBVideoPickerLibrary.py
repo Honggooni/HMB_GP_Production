@@ -114,6 +114,12 @@ PROXY_H264_PROFILE = "high"
 PROXY_H264_LEVEL = "4.2"
 FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE = "hmb_full_smooth_geometry_v2"
 ORIGINAL_VIEWPORT_QUALITY_PROFILE = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
+ORIGINAL_MATERIAL_OVERRIDE_PROFILE = (
+    "per_source_material_lambert_texture_preserving_v1"
+)
+ORIGINAL_LAMBERT_ASSIGNMENT_MODE = (
+    "original_per_source_material_lambert_texture_preserving"
+)
 MOUTH_CARD_INNER_PATCH_POLICY = "temporary_mouth_alpha_inner_patch_v1"
 SCREEN_SPACE_PATTERN_PROFILE = "hmb_screen_space_pattern_post_v2"
 SCREEN_SPACE_PATTERN_LINEAR_SCALE_DIVISOR = 3
@@ -11612,6 +11618,7 @@ def _original_preview_cache_fields(scene_path: Path, state: Dict[str, Any]) -> D
         "resolution": {"width": output_width, "height": output_height},
         "encoding_profile": PROXY_ENCODING_PROFILE,
         "viewport_quality_profile": ORIGINAL_VIEWPORT_QUALITY_PROFILE,
+        "original_material_override_profile": ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
         "mouth_card_inner_patch_policy": MOUTH_CARD_INNER_PATCH_POLICY,
         "dependency_manifest_version": ORIGINAL_DEPENDENCY_MANIFEST_VERSION,
         "scene_dependency_complete": bool(dependency_summary["complete"]),
@@ -11620,6 +11627,57 @@ def _original_preview_cache_fields(scene_path: Path, state: Dict[str, Any]) -> D
         "scene_dependency_file_count": int(dependency_summary["file_count"]),
         "scene_dependency_missing_count": int(dependency_summary["missing_count"]),
     }
+
+
+def _original_material_report_is_valid(report: Any) -> bool:
+    source = report if isinstance(report, dict) else {}
+    count_keys = (
+        "inspected_shading_engine_count",
+        "source_material_count",
+        "temporary_lambert_count",
+        "existing_lambert_count",
+        "texture_connection_count",
+        "numeric_color_count",
+        "swapped_shading_engine_count",
+    )
+    if any(
+        isinstance(source.get(key), bool)
+        or not isinstance(source.get(key), int)
+        for key in count_keys
+    ):
+        return False
+    try:
+        counts = {
+            key: int(source[key])
+            for key in count_keys
+        }
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        _clean(source.get("profile"))
+        == ORIGINAL_MATERIAL_OVERRIDE_PROFILE
+        and source.get("requested") is True
+        and _clean(source.get("status")) == "restored"
+        and source.get("restore_ok") is True
+        and source.get("shading_group_membership_preserved") is True
+        and source.get("one_lambert_per_source_material") is True
+        and source.get("default_lighting_verified") is True
+        and source.get("textured_render_mode_verified") is True
+        and not bool(
+            source.get("temporary_nodes_retained_on_restore_failure")
+        )
+        and min(counts.values()) >= 0
+        and counts["inspected_shading_engine_count"]
+        >= counts["swapped_shading_engine_count"]
+        and counts["source_material_count"]
+        == counts["temporary_lambert_count"]
+        + counts["existing_lambert_count"]
+        and counts["temporary_lambert_count"]
+        <= counts["swapped_shading_engine_count"]
+        and counts["texture_connection_count"]
+        + counts["numeric_color_count"]
+        == counts["temporary_lambert_count"]
+    )
 
 
 def _original_preview_cache_is_valid(
@@ -11652,6 +11710,23 @@ def _original_preview_cache_is_valid(
         if _clean(metadata.get("encoding_profile")) != expected["encoding_profile"]:
             return False
         if _clean(metadata.get("viewport_quality_profile")) != expected["viewport_quality_profile"]:
+            return False
+        if (
+            _clean(metadata.get("original_material_override_profile"))
+            != expected["original_material_override_profile"]
+        ):
+            return False
+        if (
+            _clean(metadata.get("assignment_mode"))
+            != ORIGINAL_LAMBERT_ASSIGNMENT_MODE
+        ):
+            return False
+        material_report = (
+            dict(metadata.get("original_material_override_report"))
+            if isinstance(metadata.get("original_material_override_report"), dict)
+            else {}
+        )
+        if not _original_material_report_is_valid(material_report):
             return False
         if (
             _clean(metadata.get("mouth_card_inner_patch_policy"))
@@ -11720,6 +11795,14 @@ def _original_view_metadata(metadata: Any) -> Dict[str, Any]:
         "viewport_quality_profile": _clean(
             source.get("viewport_quality_profile")
         ),
+        "original_material_override_profile": _clean(
+            source.get("original_material_override_profile")
+        ),
+        "original_material_override_report": (
+            dict(source.get("original_material_override_report"))
+            if isinstance(source.get("original_material_override_report"), dict)
+            else {}
+        ),
     }
 
 
@@ -11754,6 +11837,9 @@ def _operation_input_digest(kind: str, scene_text: Any, state: Dict[str, Any], s
             "height": original_fields["resolution"]["height"],
             "encoding_profile": original_fields["encoding_profile"],
             "viewport_quality_profile": original_fields["viewport_quality_profile"],
+            "original_material_override_profile": original_fields[
+                "original_material_override_profile"
+            ],
             "mouth_card_inner_patch_policy": original_fields[
                 "mouth_card_inner_patch_policy"
             ],
@@ -18691,6 +18777,10 @@ class HMBVideoPickerLibrary(DataNode):
             "end_frame": end_frame,
             "fps": source_fps,
             "apply_marker_shaders": False,
+            "apply_original_lambert_override": True,
+            "original_material_override_profile": (
+                ORIGINAL_MATERIAL_OVERRIDE_PROFILE
+            ),
             "force_high_quality_viewport": True,
             "viewport_quality_profile": ORIGINAL_VIEWPORT_QUALITY_PROFILE,
             "mouth_card_inner_patch_policy": MOUTH_CARD_INNER_PATCH_POLICY,
@@ -18731,7 +18821,8 @@ class HMBVideoPickerLibrary(DataNode):
             (
                 f"Original preview Maya render started with camera {camera}, frames "
                 f"{start_frame:g}-{end_frame:g}, {source_fps:g} FPS, and forced "
-                f"full-detail viewport profile {ORIGINAL_VIEWPORT_QUALITY_PROFILE}."
+                f"full-detail viewport profile {ORIGINAL_VIEWPORT_QUALITY_PROFILE} "
+                "with a per-source-material Maya Lambert compatibility pass."
             ),
         )
         self._write_state(state)
@@ -18841,8 +18932,25 @@ class HMBVideoPickerLibrary(DataNode):
             validation_errors.append("width")
         if int(runner_resolution.get("height") or 0) != output_height:
             validation_errors.append("height")
-        if _clean(runner_sidecar.get("assignment_mode")) != "original_full_detail_no_marker":
+        if (
+            _clean(runner_sidecar.get("assignment_mode"))
+            != ORIGINAL_LAMBERT_ASSIGNMENT_MODE
+        ):
             validation_errors.append("assignment mode")
+        if (
+            _clean(runner_sidecar.get("original_material_override_profile"))
+            != ORIGINAL_MATERIAL_OVERRIDE_PROFILE
+        ):
+            validation_errors.append("Original Lambert material profile")
+        runner_material_report = (
+            dict(runner_sidecar.get("original_material_override_report"))
+            if isinstance(
+                runner_sidecar.get("original_material_override_report"), dict
+            )
+            else {}
+        )
+        if not _original_material_report_is_valid(runner_material_report):
+            validation_errors.append("Original Lambert restoration report")
         if list(runner_sidecar.get("markers") or []):
             validation_errors.append("marker isolation")
         if not runner_dependency_paths:
@@ -18939,6 +19047,8 @@ class HMBVideoPickerLibrary(DataNode):
             "frame_count": frame_count,
             "source_duration_seconds": frame_count / source_fps,
             "marker_shaders": False,
+            "assignment_mode": ORIGINAL_LAMBERT_ASSIGNMENT_MODE,
+            "original_material_override_report": runner_material_report,
             "render_method": _clean(runner_sidecar.get("render_method")) or "Viewport 2.0 OGS",
             "viewport_quality_report": viewport_quality_report,
             "duration_policy": "exact_source_timing",

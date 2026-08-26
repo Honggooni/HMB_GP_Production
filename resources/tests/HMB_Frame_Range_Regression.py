@@ -126,6 +126,11 @@ picker_state.update(
             {
                 "video_slot": 3,
                 "video_path": "C:/shots/frame_range_playblast_3.mp4",
+                # This companion supplies the marker/frame-range mask only;
+                # it must not claim a second shot-wide Original authority.
+                "generation_role": "mask",
+                "media_kind": "maya_color_assignment_mask",
+                "video_role": "maya_color_assignment_mask",
                 "camera": "|shotCam",
                 "source_fps": 24,
                 "output_fps": 24,

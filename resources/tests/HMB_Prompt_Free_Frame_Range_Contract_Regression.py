@@ -80,7 +80,7 @@ def video_row(
     row = prompt._default_video_item(slot)
     taxonomy = {
         "Maya Preview / Playblast": ("Maya Preview / Playblast", "Mask"),
-        "FX Reference": ("FX / Simulation Reference", "Explosion"),
+        "FX Reference": ("FX Reference", "FX Effect Only"),
         "Timing / Edit Reference": ("Maya Preview / Playblast", "Timing / Edit"),
     }
     main_type, sub_type = taxonomy[source_type]
@@ -134,6 +134,17 @@ def picker_payload(
                 "selection_order": slot,
                 "video_slot": slot,
                 "video_path": f"https://example.test/{uid}.mp4",
+                **(
+                    {
+                        # Additional lifecycle sources are mask companions,
+                        # never duplicate shot-wide Original authorities.
+                        "generation_role": "mask",
+                        "media_kind": "maya_color_assignment_mask",
+                        "video_role": "maya_color_assignment_mask",
+                    }
+                    if slot > 1
+                    else {}
+                ),
                 "reference_capabilities": {
                     "schema": "hmb-video-reference-capabilities",
                     "version": 1,
@@ -394,8 +405,8 @@ assert color_job["frame_ranges"][0]["error_codes"] == []
 # FX sources also treat Picker capabilities as non-authoritative for manual
 # Prompt Range. The Agent receives the user's exact allowed segments.
 fx_state = copy.deepcopy(manual_video)
-fx_state["videos"][0]["video_main_type"] = "FX / Simulation Reference"
-fx_state["videos"][0]["video_sub_type"] = "Explosion"
+fx_state["videos"][0]["video_main_type"] = "FX Reference"
+fx_state["videos"][0]["video_sub_type"] = "FX Effect Only"
 fx_state["videos"][0]["reference_capabilities"] = {
     "schema": "hmb-video-reference-capabilities",
     "version": 1,
