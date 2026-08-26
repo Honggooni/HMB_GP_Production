@@ -491,7 +491,15 @@ try:
         catalog_root,
         asset_library._default_state(),
     )
-    catalog_state = asset_library._select_catalog_project(catalog_state, project_root)
+    catalog_project_path = next(
+        item["path"]
+        for item in catalog_state["projects"]
+        if item["name"] == project_root.name
+    )
+    catalog_state = asset_library._select_catalog_project(
+        catalog_state,
+        catalog_project_path,
+    )
     external_path = temporary / "External.png"
     external_path.write_bytes(png_bytes((13, 13), (120, 30, 180)))
     catalog_state, media_by_uid = asset_library._merge_import_input(
