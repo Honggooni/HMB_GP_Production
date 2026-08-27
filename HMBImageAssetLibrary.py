@@ -6,6 +6,7 @@ from pathlib import Path
 import asyncio
 import base64
 import copy
+import contextvars
 import hashlib
 import importlib.util
 from io import BytesIO
@@ -104,6 +105,10 @@ except Exception:
 WIDGET_NAME = "HMBImageAssetLibraryWidget"
 WIDGET_LIBRARY_NAME = "HMB_GP_Production"
 WIDGET_STATE_PARAMETER = "HMB_IMAGE_ASSET_STATE"
+THUMBNAIL_PATCH_PARAMETER = "HMB_IMAGE_ASSET_THUMBNAIL_PATCH"
+THUMBNAIL_BRIDGE_WIDGET_NAME = "HMBImageAssetThumbnailPatchBridgeWidget"
+THUMBNAIL_BRIDGE_SCHEMA = "hmb-image-asset-thumbnail-bridge"
+THUMBNAIL_BRIDGE_VERSION = 1
 PROJECT_ROOT_PARAMETER = "PROJECT_ROOT"
 IMAGE_IMPORT_PARAMETER = "IMAGE_IMPORT_IN"
 OUTPUT_PARAMETER = "IMAGE_ASSET_OUT"
@@ -226,6 +231,27 @@ _ASSET_THUMBNAIL_CACHE_ROOT = Path(
     )
 )
 _ASSET_THUMBNAIL_CACHE_WARNING_EMITTED = False
+_ASSET_THUMBNAIL_CACHE_PRUNE_PENDING = False
+_ASSET_THUMBNAIL_CACHE_DEFER_COUNT = 0
+_ASSET_CATALOG_INDEX_ROOT = _ASSET_THUMBNAIL_CACHE_ROOT.parent / "image_catalogs"
+_ASSET_CATALOG_INDEX_SCHEMA = "hmb-image-asset-catalog-index"
+_ASSET_CATALOG_INDEX_VERSION = 2
+_ASSET_CATALOG_INDEX_MAX_BYTES = 32 * 1024 * 1024
+_ASSET_CATALOG_INDEX_LOCK = threading.Lock()
+_ASSET_THUMBNAIL_CACHE_PROCESS_LOCK_NAME = ".hmb-thumbnail-cache.lock"
+_ASSET_PROJECT_CACHE_UID_FIELD = "project_cache_uid"
+_ASSET_PROJECT_CACHE_UID_PREFIX = "hmbpc1:"
+_ASSET_PROJECT_CACHE_UID_LOCK = threading.Lock()
+_ASSET_PROJECT_CACHE_UIDS: "OrderedDict[tuple[str, str], str]" = OrderedDict()
+_ASSET_PROJECT_CACHE_UID_LIMIT = 64
+_SHARED_CATALOG_CACHE_LOCK = threading.RLock()
+_SHARED_CATALOG_CACHE: "OrderedDict[tuple[str, str, str], Dict[str, Any]]" = OrderedDict()
+_SHARED_CATALOG_ROOT_BINDINGS: "OrderedDict[str, tuple[str, str, str]]" = OrderedDict()
+_SHARED_CATALOG_CACHE_LIMIT = 32
+CATALOG_PROBE_OPERATION = "catalog_probe"
+CATALOG_PROBE_MANIFEST_SECONDS = 3.0
+CATALOG_PROBE_FOLDER_SECONDS = 10.0
+CATALOG_PROBE_STABLE_WRITE_SECONDS = 1.0
 
 
 def _diagnostic_exception(context: str, exc: BaseException) -> None:
@@ -317,6 +343,101 @@ def _non_negative_int(value: Any) -> int:
 
 def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _default_thumbnail_bridge(runtime_instance_id: Any = "") -> Dict[str, Any]:
+    return {
+        "schema": THUMBNAIL_BRIDGE_SCHEMA,
+        "version": THUMBNAIL_BRIDGE_VERSION,
+        "runtime_instance_id": _clean(runtime_instance_id),
+        "operation": "idle",
+        "phase": "idle",
+        "request_id": "",
+    }
+
+
+def _normalize_thumbnail_bridge(value: Any) -> Dict[str, Any]:
+    raw = _parse_mapping(value)
+    bridge = _default_thumbnail_bridge(raw.get("runtime_instance_id"))
+    operation = _clean(raw.get("operation")).casefold()
+    phase = _clean(raw.get("phase")).casefold()
+    if operation == CATALOG_PROBE_OPERATION and phase in {"request", "result"}:
+        bridge.update(
+            {
+                "operation": CATALOG_PROBE_OPERATION,
+                "phase": phase,
+                "request_id": _clean(raw.get("request_id"))[:128],
+                "project_uid": _clean(raw.get("project_uid"))[:128],
+                "project_cache_uid": _clean(raw.get("project_cache_uid"))[:256],
+                "project_root": _project_root_text(raw.get("project_root"))
+                .replace("\\", "/")[:4096],
+                "manifest_signature": _clean(raw.get("manifest_signature"))[:128],
+                "folder_signature": _clean(raw.get("folder_signature"))[:128],
+                "scan_revision": _non_negative_int(raw.get("scan_revision")),
+                "probe_kind": (
+                    "folder"
+                    if _clean(raw.get("probe_kind")).casefold() == "folder"
+                    else "manifest"
+                ),
+            }
+        )
+        if phase == "result":
+            outcome = _clean(raw.get("outcome")).casefold()
+            bridge["outcome"] = (
+                outcome
+                if outcome in {"no_change", "changed", "deferred", "offline"}
+                else "deferred"
+            )
+        return bridge
+    if operation != "hydrate" or phase not in {"request", "result"}:
+        return bridge
+    bridge.update(
+        {
+            "operation": "hydrate",
+            "phase": phase,
+            "request_id": _clean(raw.get("request_id"))[:128],
+            "project_uid": _clean(raw.get("project_uid"))[:128],
+            "project_cache_uid": _clean(raw.get("project_cache_uid"))[:256],
+            "manifest_signature": _clean(raw.get("manifest_signature"))[:128],
+            "scan_revision": _non_negative_int(raw.get("scan_revision")),
+            "thumbnail_revision": _non_negative_int(raw.get("thumbnail_revision")),
+        }
+    )
+    ids = raw.get("asset_library_ids")
+    if isinstance(ids, list):
+        bridge["asset_library_ids"] = list(
+            # Match the canonical path-derived identity contract. Truncating
+            # only the compact bridge prevents a completed thumbnail from
+            # resolving back to its card and leaves the loader spinning.
+            dict.fromkeys(_clean(item)[:512] for item in ids if _clean(item))
+        )[:MAX_THUMBNAIL_HYDRATION_BATCH]
+    if phase == "result":
+        entries = raw.get("completed_assets")
+        bridge["completed_assets"] = [
+            {
+                # Asset-library IDs and source UIDs are path-derived and the
+                # canonical widget/backend contract permits up to 512 chars.
+                # Truncating them only on the compact bridge makes a completed
+                # thumbnail impossible to match back to its card, leaving the
+                # presentation loader active forever even though the file was
+                # generated successfully.
+                "asset_library_id": _clean(item.get("asset_library_id"))[:512],
+                "source_uid": _clean(item.get("source_uid"))[:512],
+                "media_signature": _clean(item.get("media_signature"))[:128],
+                "thumbnail_url": _clean(item.get("thumbnail_url"))[:4096],
+            }
+            for item in (entries if isinstance(entries, list) else [])
+            if isinstance(item, dict) and _clean(item.get("asset_library_id"))
+        ][:MAX_THUMBNAIL_HYDRATION_BATCH]
+        failed = raw.get("failed_asset_library_ids")
+        bridge["failed_asset_library_ids"] = list(
+            dict.fromkeys(
+                _clean(item)[:512]
+                for item in (failed if isinstance(failed, list) else [])
+                if _clean(item)
+            )
+        )[:MAX_THUMBNAIL_HYDRATION_BATCH]
+    return bridge
 
 
 def _parse_mapping(value: Any) -> Dict[str, Any]:
@@ -656,7 +777,27 @@ def _verified_image_dimensions(source: Any) -> tuple[int, int]:
     return width, height
 
 
-def _asset_file_facts(path: Path) -> tuple[Path, int, int, str]:
+def _asset_content_probe(path: Path, size: int) -> str:
+    """Hash bounded file samples so equal stat metadata cannot alias content."""
+
+    sample_size = 32 * 1024
+    digest = hashlib.sha256()
+    digest.update(str(max(0, int(size))).encode("ascii"))
+    with path.open("rb") as stream:
+        first = stream.read(sample_size)
+        digest.update(first)
+        if size > sample_size:
+            stream.seek(max(sample_size, size - sample_size))
+            digest.update(stream.read(sample_size))
+    return digest.hexdigest()
+
+
+def _asset_file_facts(
+    path: Path,
+    *,
+    project_uid: Any = "",
+    relative_path: Any = "",
+) -> tuple[Path, int, int, str]:
     """Return the stable path+size+mtime identity used by staged media work."""
 
     resolved = path.resolve()
@@ -674,8 +815,16 @@ def _asset_file_facts(path: Path) -> tuple[Path, int, int, str]:
             )
         ),
     )
-    normalized_path = os.path.normcase(str(resolved)).replace("\\", "/")
-    signature_text = "|".join((normalized_path, str(size), str(mtime_ns)))
+    portable_uid = _clean(project_uid)
+    portable_relative = _clean(relative_path).replace("\\", "/").strip("/")
+    if portable_uid and portable_relative:
+        identity = f"project|{portable_uid}|{portable_relative.casefold()}"
+    else:
+        identity = os.path.normcase(str(resolved)).replace("\\", "/")
+    content_probe = _asset_content_probe(resolved, size)
+    signature_text = "|".join(
+        (identity, str(size), str(mtime_ns), content_probe)
+    )
     signature = hashlib.sha256(signature_text.encode("utf-8")).hexdigest()
     return resolved, size, mtime_ns, signature
 
@@ -814,13 +963,70 @@ def _prune_persistent_thumbnail_cache(cache_root: Path) -> None:
         return
 
 
+@contextmanager
+def _thumbnail_cache_process_lock(cache_root: Path):
+    """Serialize cache commit/prune pairs across local Griptape processes."""
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_root / _ASSET_THUMBNAIL_CACHE_PROCESS_LOCK_NAME
+    if _is_reparse_point(lock_path):
+        raise ValueError("Thumbnail cache lock must not be a reparse point.")
+    deadline = time.monotonic() + ASSET_MANIFEST_LOCK_TIMEOUT_SECONDS
+    descriptor = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    acquired = False
+    try:
+        if os.fstat(descriptor).st_size < 1:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        while not acquired:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.lockf(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 0)
+                acquired = True
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Timed out waiting for thumbnail cache maintenance."
+                    )
+                time.sleep(0.05)
+        yield
+    finally:
+        if acquired:
+            try:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.lockf(descriptor, fcntl.LOCK_UN, 1, 0)
+            except Exception as exc:
+                _diagnostic_exception("Thumbnail cache lock release failed", exc)
+        try:
+            os.close(descriptor)
+        except Exception as exc:
+            _diagnostic_exception("Thumbnail cache lock cleanup failed", exc)
+
+
 def _write_persistent_thumbnail_cache(
     signature: str,
     payload: bytes,
     extension: str,
     width: int,
     height: int,
+    *,
+    prune: bool = True,
 ) -> None:
+    global _ASSET_THUMBNAIL_CACHE_PRUNE_PENDING
     global _ASSET_THUMBNAIL_CACHE_WARNING_EMITTED
     try:
         metadata_path, media_path = _thumbnail_cache_paths(signature, extension)
@@ -839,18 +1045,22 @@ def _write_persistent_thumbnail_cache(
         nonce = f"{os.getpid()}.{uuid.uuid4().hex}"
         temporary_media = cache_root / f".{media_path.name}.{nonce}.tmp"
         temporary_metadata = cache_root / f".{metadata_path.name}.{nonce}.tmp"
-        try:
-            temporary_media.write_bytes(payload)
-            temporary_metadata.write_bytes(metadata)
-            os.replace(temporary_media, media_path)
-            os.replace(temporary_metadata, metadata_path)
-            other_extension = "png" if extension == "webp" else "webp"
-            _, other_path = _thumbnail_cache_paths(signature, other_extension)
-            other_path.unlink(missing_ok=True)
-        finally:
-            temporary_media.unlink(missing_ok=True)
-            temporary_metadata.unlink(missing_ok=True)
-        _prune_persistent_thumbnail_cache(cache_root)
+        with _thumbnail_cache_process_lock(cache_root):
+            try:
+                temporary_media.write_bytes(payload)
+                temporary_metadata.write_bytes(metadata)
+                os.replace(temporary_media, media_path)
+                os.replace(temporary_metadata, metadata_path)
+                other_extension = "png" if extension == "webp" else "webp"
+                _, other_path = _thumbnail_cache_paths(signature, other_extension)
+                other_path.unlink(missing_ok=True)
+            finally:
+                temporary_media.unlink(missing_ok=True)
+                temporary_metadata.unlink(missing_ok=True)
+            if prune:
+                _prune_persistent_thumbnail_cache(cache_root)
+            else:
+                _ASSET_THUMBNAIL_CACHE_PRUNE_PENDING = True
     except Exception as exc:
         if not _ASSET_THUMBNAIL_CACHE_WARNING_EMITTED:
             _ASSET_THUMBNAIL_CACHE_WARNING_EMITTED = True
@@ -901,11 +1111,34 @@ def _publish_thumbnail_payload(
     )
 
 
-def _asset_thumbnail_url(path: Path, asset_library_id: str) -> str:
+def _flush_persistent_thumbnail_cache_prune() -> None:
+    """Prune once after a staged hydration batch, not once per new image."""
+
+    global _ASSET_THUMBNAIL_CACHE_PRUNE_PENDING
+    with _ASSET_THUMBNAIL_LOCK:
+        if not _ASSET_THUMBNAIL_CACHE_PRUNE_PENDING:
+            return
+        _ASSET_THUMBNAIL_CACHE_PRUNE_PENDING = False
+        cache_root = Path(_ASSET_THUMBNAIL_CACHE_ROOT)
+        try:
+            with _thumbnail_cache_process_lock(cache_root):
+                _prune_persistent_thumbnail_cache(cache_root)
+        except Exception as exc:
+            # Cache maintenance is fail-open; the next batch can retry it.
+            _ASSET_THUMBNAIL_CACHE_PRUNE_PENDING = True
+            _diagnostic_warning("Thumbnail cache prune deferred", exc)
+
+
+def _asset_thumbnail_url(
+    path: Path,
+    asset_library_id: str,
+    media_signature: Any = "",
+) -> str:
     """Hydrate one browser thumbnail through a bounded persistent local cache."""
 
     try:
-        resolved, _size, _mtime_ns, signature = _asset_file_facts(path)
+        resolved, _size, _mtime_ns, path_signature = _asset_file_facts(path)
+        signature = _clean(media_signature) or path_signature
     except Exception:
         return ""
 
@@ -928,6 +1161,7 @@ def _asset_thumbnail_url(path: Path, asset_library_id: str) -> str:
                 extension,
                 width,
                 height,
+                prune=_ASSET_THUMBNAIL_CACHE_DEFER_COUNT <= 0,
             )
         else:
             payload, extension, _width, _height = cached
@@ -951,6 +1185,22 @@ def _asset_thumbnail_url(path: Path, asset_library_id: str) -> str:
                     break
             _ASSET_THUMBNAIL_URLS[signature] = url
         return url
+
+
+def _asset_thumbnail_url_for_media(
+    path: Path,
+    asset_library_id: str,
+    media_signature: str,
+) -> str:
+    """Keep legacy two-argument test/host overrides source-compatible."""
+
+    try:
+        return _asset_thumbnail_url(path, asset_library_id, media_signature)
+    except TypeError as exc:
+        try:
+            return _asset_thumbnail_url(path, asset_library_id)
+        except TypeError:
+            raise exc
 
 
 def _thumbnail_url_is_live(media_signature: Any, thumbnail_url: Any) -> bool:
@@ -1458,6 +1708,89 @@ def _project_uid(root: Path) -> str:
     return _project_uid_from_id(_project_id(root))
 
 
+def _valid_project_cache_uid(value: Any) -> str:
+    candidate = _clean(value).casefold()
+    if re.fullmatch(r"hmbpc1:[0-9a-f]{32,64}", candidate):
+        return candidate
+    return ""
+
+
+def _invalidate_project_cache_uid(root: Path) -> None:
+    try:
+        root_key = os.path.normcase(str(root.resolve()))
+    except Exception:
+        return
+    with _ASSET_PROJECT_CACHE_UID_LOCK:
+        stale = [key for key in _ASSET_PROJECT_CACHE_UIDS if key[0] == root_key]
+        for key in stale:
+            _ASSET_PROJECT_CACHE_UIDS.pop(key, None)
+
+
+def _project_cache_uid(root: Path) -> str:
+    """Return a cache identity that is portable yet separates same-name shows.
+
+    A manifest-backed UUID survives mapped-drive/UNC aliases and project copies.
+    Projects that have never written managed metadata fall back to the directory
+    file identity, which is still safe for independent same-named projects.
+    """
+
+    resolved = root.resolve()
+    root_key = os.path.normcase(str(resolved))
+    try:
+        manifest_signature = _asset_manifest_signature(resolved)
+    except Exception:
+        manifest_signature = ""
+    cache_key = (root_key, manifest_signature)
+    with _ASSET_PROJECT_CACHE_UID_LOCK:
+        cached = _ASSET_PROJECT_CACHE_UIDS.get(cache_key)
+        if cached:
+            _ASSET_PROJECT_CACHE_UIDS.move_to_end(cache_key)
+            return cached
+
+    persisted = ""
+    try:
+        manifest_path = _existing_asset_manifest_path(resolved)
+        if (
+            manifest_path is not None
+            and manifest_path.is_file()
+            and not _is_reparse_point(manifest_path)
+            and manifest_path.stat().st_size <= 2 * 1024 * 1024
+        ):
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                persisted = _valid_project_cache_uid(
+                    payload.get(_ASSET_PROJECT_CACHE_UID_FIELD)
+                )
+    except Exception:
+        persisted = ""
+
+    if persisted:
+        identity = persisted
+    else:
+        details = resolved.stat()
+        device = max(0, int(getattr(details, "st_dev", 0) or 0))
+        inode = max(0, int(getattr(details, "st_ino", 0) or 0))
+        stable_location = (
+            f"file-id|{device}|{inode}"
+            if device or inode
+            else f"path|{root_key}"
+        )
+        digest = hashlib.sha256(
+            (
+                f"hmb-image-project-cache-v1\n"
+                f"{_project_identity_key(_project_id(resolved))}\n{stable_location}"
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        identity = f"{_ASSET_PROJECT_CACHE_UID_PREFIX}{digest}"
+
+    with _ASSET_PROJECT_CACHE_UID_LOCK:
+        _ASSET_PROJECT_CACHE_UIDS[cache_key] = identity
+        _ASSET_PROJECT_CACHE_UIDS.move_to_end(cache_key)
+        while len(_ASSET_PROJECT_CACHE_UIDS) > _ASSET_PROJECT_CACHE_UID_LIMIT:
+            _ASSET_PROJECT_CACHE_UIDS.popitem(last=False)
+    return identity
+
+
 def _match_catalog_project(
     projects: Sequence[Dict[str, Any]],
     *,
@@ -1755,6 +2088,102 @@ def _asset_manifest_signature(root: Path) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
+def _folder_metadata_signature_from_inventory(
+    root: Path,
+    folder_paths: Sequence[str],
+    image_paths: Sequence[Path],
+) -> str:
+    digest = hashlib.sha256()
+    directory_count = 0
+    image_count = 0
+    for relative in sorted(set(folder_paths), key=_natural_key)[:MAX_FOLDERS]:
+        try:
+            stat_result = (root / Path(relative)).stat()
+        except Exception:
+            continue
+        directory_count += 1
+        digest.update(
+            (
+                f"d|{relative.casefold()}|{stat_result.st_mtime_ns}|"
+                f"{getattr(stat_result, 'st_ctime_ns', 0)}\n"
+            ).encode("utf-8")
+        )
+    for candidate in sorted(
+        image_paths,
+        key=lambda path: str(path).casefold(),
+    )[:MAX_ASSETS]:
+        try:
+            relative = candidate.relative_to(root).as_posix()
+            stat_result = candidate.stat()
+        except Exception:
+            continue
+        image_count += 1
+        digest.update(
+            (
+                f"f|{relative.casefold()}|{stat_result.st_size}|"
+                f"{stat_result.st_mtime_ns}|"
+                f"{getattr(stat_result, 'st_ctime_ns', 0)}\n"
+            ).encode("utf-8")
+        )
+    digest.update(f"counts|{directory_count}|{image_count}".encode("utf-8"))
+    return digest.hexdigest()[:24]
+
+
+def _project_folder_metadata_signature(project_root: Any) -> str:
+    """Hash bounded image/directory metadata without opening image content.
+
+    Network file notification delivery is not reliable enough to be the sole
+    authority.  This intentionally cheap fallback sees raw files copied by a
+    teammate while leaving dimensions/thumbnail decoding to the eventual
+    changed-catalog scan.
+    """
+
+    root_text = _project_root_text(project_root)
+    if not root_text:
+        return ""
+    root = Path(root_text).expanduser().resolve()
+    if not root.is_dir() or _is_reparse_point(root):
+        raise ValueError(f"Project root is unavailable: {root}")
+    folder_paths: List[str] = []
+    image_paths: List[Path] = []
+    for current_text, directory_names, file_names in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+    ):
+        current = Path(current_text)
+        safe_directories: List[str] = []
+        for name in sorted(directory_names, key=_natural_key):
+            if name.startswith(".") or len(folder_paths) >= MAX_FOLDERS:
+                continue
+            candidate = current / name
+            try:
+                relative = candidate.relative_to(root).as_posix()
+                if _is_reparse_point(candidate):
+                    continue
+            except Exception:
+                continue
+            safe_directories.append(name)
+            folder_paths.append(relative)
+        directory_names[:] = safe_directories
+        for name in sorted(file_names, key=_natural_key):
+            if len(image_paths) >= MAX_ASSETS:
+                break
+            candidate = current / name
+            if candidate.suffix.casefold() not in IMAGE_EXTENSIONS:
+                continue
+            try:
+                relative = candidate.relative_to(root)
+                if any(part.startswith(".") for part in relative.parts):
+                    continue
+                if _is_reparse_point(candidate):
+                    continue
+            except Exception:
+                continue
+            image_paths.append(candidate)
+    return _folder_metadata_signature_from_inventory(root, folder_paths, image_paths)
+
+
 def _asset_manifest_cache_root_key(root: Path) -> str:
     return os.path.normcase(str(root.resolve()))
 
@@ -1871,11 +2300,28 @@ def _write_asset_manifest_record_locked(
     else:
         updated_records.append(dict(record))
 
+    persisted_cache_uid = (
+        _valid_project_cache_uid(payload.get(_ASSET_PROJECT_CACHE_UID_FIELD))
+        if isinstance(payload, dict)
+        else ""
+    )
+    if not persisted_cache_uid:
+        # Freeze the already-active directory identity into managed metadata.
+        # Generating a different UUID here would invalidate every media
+        # signature during the first Add and make the just-hydrated cards go
+        # blank until a later full catalog refresh.
+        persisted_cache_uid = _valid_project_cache_uid(
+            _project_cache_uid(root)
+        ) or f"{_ASSET_PROJECT_CACHE_UID_PREFIX}{uuid.uuid4().hex}"
     if isinstance(payload, dict):
         output_payload: Any = dict(payload)
-        output_payload["assets"] = updated_records
     else:
-        output_payload = updated_records
+        output_payload = {
+            "schema": ASSET_MANIFEST_SCHEMA,
+            "version": ASSET_MANIFEST_VERSION,
+        }
+    output_payload[_ASSET_PROJECT_CACHE_UID_FIELD] = persisted_cache_uid
+    output_payload["assets"] = updated_records
     encoded = json.dumps(
         output_payload,
         ensure_ascii=False,
@@ -1900,6 +2346,7 @@ def _write_asset_manifest_record_locked(
             pass
         raise
     _invalidate_asset_manifest_cache(root)
+    _invalidate_project_cache_uid(root)
     _cleanup_legacy_asset_metadata(root)
     return manifest_path
 
@@ -1963,7 +2410,9 @@ def _scan_project_assets(project_root: Any) -> Dict[str, Any]:
             "project_root": "",
             "project_id": "",
             "project_uid": "",
+            "project_cache_uid": "",
             "manifest_signature": "",
+            "folder_signature": "",
             "folders": [],
             "assets": [],
             "warnings": [],
@@ -1978,6 +2427,7 @@ def _scan_project_assets(project_root: Any) -> Dict[str, Any]:
 
     project_id = _project_id(root)
     project_uid = _project_uid(root)
+    project_cache_uid = _project_cache_uid(root)
     manifest_signature = _asset_manifest_signature(root)
     manifest_overrides = _read_asset_manifest(root)
     paths: List[Path] = []
@@ -2028,6 +2478,11 @@ def _scan_project_assets(project_root: Any) -> Dict[str, Any]:
             paths.append(path)
     paths.sort(key=lambda value: str(value.relative_to(root)).casefold())
     folders = sorted(set(folders), key=_natural_key)
+    folder_signature = _folder_metadata_signature_from_inventory(
+        root,
+        folders,
+        paths,
+    )
 
     stem_counts: Dict[str, int] = {}
     for path in paths:
@@ -2061,7 +2516,11 @@ def _scan_project_assets(project_root: Any) -> Dict[str, Any]:
         library_id = _asset_library_id(project_id, relative_text)
         width, height = _asset_dimensions(path)
         try:
-            _resolved, _size, _mtime_ns, media_signature = _asset_file_facts(path)
+            _resolved, _size, _mtime_ns, media_signature = _asset_file_facts(
+                path,
+                project_uid=project_cache_uid,
+                relative_path=relative_text,
+            )
         except Exception:
             media_signature = ""
         color_candidates = taxonomy["color_pick_candidates"]
@@ -2114,7 +2573,9 @@ def _scan_project_assets(project_root: Any) -> Dict[str, Any]:
         "project_root": str(root).replace("\\", "/"),
         "project_id": project_id,
         "project_uid": project_uid,
+        "project_cache_uid": project_cache_uid,
         "manifest_signature": manifest_signature,
+        "folder_signature": folder_signature,
         "folders": folders,
         "assets": assets,
         "warnings": warnings,
@@ -2411,6 +2872,7 @@ def _normalize_thumbnail_request(value: Any) -> Dict[str, Any]:
     return {
         "request_id": request_id,
         "project_uid": project_uid,
+        "project_cache_uid": _clean(value.get("project_cache_uid"))[:256],
         "manifest_signature": _clean(value.get("manifest_signature"))[:128],
         "scan_revision": _non_negative_int(value.get("scan_revision")),
         "asset_library_ids": asset_library_ids,
@@ -2442,6 +2904,7 @@ def _normalize_thumbnail_result(value: Any) -> Dict[str, Any]:
     return {
         "request_id": request_id,
         "project_uid": _clean(value.get("project_uid"))[:256],
+        "project_cache_uid": _clean(value.get("project_cache_uid"))[:256],
         "manifest_signature": _clean(value.get("manifest_signature"))[:128],
         "scan_revision": _non_negative_int(value.get("scan_revision")),
         "completed_asset_library_ids": normalized_ids(
@@ -2595,11 +3058,15 @@ def _normalize_shot_routing(
     }
 
 
-def _shot_routing_catalog_identity(state: Any) -> str:
+def _shot_routing_catalog_identity(
+    state: Any,
+    *,
+    normalized: bool = False,
+) -> str:
     """Hash only fields visible in the compact cross-node Shot catalog."""
 
-    normalized = _normalize_state(state)
-    routing = normalized["shot_routing"]
+    normalized_state = state if normalized else _normalize_state(state)
+    routing = normalized_state["shot_routing"]
     return _sha256_canonical(
         {
             "publisher_instance_uuid": routing["publisher_instance_uuid"],
@@ -2627,7 +3094,9 @@ def _default_state() -> Dict[str, Any]:
         "project_root": "",
         "project_id": "",
         "project_uid": "",
+        "project_cache_uid": "",
         "manifest_signature": "",
+        "folder_signature": "",
         "taxonomy": _taxonomy_payload(),
         "folders": [],
         "assets": [],
@@ -2675,6 +3144,7 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
     project_root = _clean(source.get("project_root")).replace("\\", "/")
     project_id = _clean(source.get("project_id"))
     project_uid = _clean(source.get("project_uid"))
+    project_cache_uid = _clean(source.get("project_cache_uid"))
     assets: List[Dict[str, Any]] = []
     seen_library_ids: set[str] = set()
     seen_asset_ids: set[str] = set()
@@ -2759,7 +3229,9 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
             "project_root": project_root,
             "project_id": project_id,
             "project_uid": project_uid,
+            "project_cache_uid": project_cache_uid,
             "manifest_signature": _clean(source.get("manifest_signature"))[:128],
+            "folder_signature": _clean(source.get("folder_signature"))[:128],
             "folders": folders,
             "assets": assets,
             "shot_routing": _normalize_shot_routing(
@@ -2845,7 +3317,9 @@ _IMAGE_ASSET_RESET_DURABLE_FIELDS = (
     "project_root",
     "project_id",
     "project_uid",
+    "project_cache_uid",
     "manifest_signature",
+    "folder_signature",
     "folders",
     "assets",
 )
@@ -2941,10 +3415,29 @@ def _merge_scan_with_state(
     scan: Dict[str, Any],
     previous_state: Dict[str, Any],
 ) -> Dict[str, Any]:
+    scan_cache_uid = _clean(scan.get("project_cache_uid"))
+    previous_cache_uid = _clean(previous_state.get("project_cache_uid"))
+    same_project = bool(
+        scan_cache_uid
+        and previous_cache_uid
+        and scan_cache_uid == previous_cache_uid
+    )
+    if not previous_cache_uid:
+        same_project = bool(
+            _clean(scan.get("project_uid"))
+            and _clean(scan.get("project_uid"))
+            == _clean(previous_state.get("project_uid"))
+            and _clean(scan.get("project_root")).replace("\\", "/").casefold()
+            == _clean(previous_state.get("project_root"))
+            .replace("\\", "/")
+            .casefold()
+        )
     previous_assets = {
         _clean(asset.get("asset_library_id")): asset
         for asset in previous_state.get("assets", [])
-        if isinstance(asset, dict) and _clean(asset.get("asset_library_id"))
+        if same_project
+        and isinstance(asset, dict)
+        and _clean(asset.get("asset_library_id"))
     }
     assets: List[Dict[str, Any]] = []
     for scanned in scan.get("assets", []):
@@ -2984,7 +3477,9 @@ def _merge_scan_with_state(
             "project_root": scan.get("project_root", ""),
             "project_id": scan.get("project_id", ""),
             "project_uid": scan.get("project_uid", ""),
+            "project_cache_uid": scan.get("project_cache_uid", ""),
             "manifest_signature": scan.get("manifest_signature", ""),
+            "folder_signature": scan.get("folder_signature", ""),
             "folders": scan.get("folders", []),
             "assets": assets,
             "warnings": scan.get("warnings", []),
@@ -3251,9 +3746,218 @@ def _merge_async_registration_result_with_live_state(
     return _normalize_state(merged)
 
 
+def _shared_catalog_cache_key(state: Dict[str, Any]) -> tuple[str, str, str] | None:
+    uid = _clean(state.get("project_cache_uid"))
+    manifest_signature = _clean(state.get("manifest_signature"))
+    folder_signature = _clean(state.get("folder_signature"))
+    if not uid or not manifest_signature or not folder_signature:
+        return None
+    return uid, manifest_signature, folder_signature
+
+
+def _shared_catalog_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy project catalog authority without copying any Shot/UI selection."""
+
+    normalized = _normalize_state(state)
+    assets: List[Dict[str, Any]] = []
+    for raw_asset in normalized["assets"]:
+        if _clean(raw_asset.get("source_kind")).casefold() != "project":
+            continue
+        asset = dict(raw_asset)
+        asset["selected"] = False
+        asset["selection_order"] = 0
+        if not _thumbnail_url_is_live(
+            asset.get("media_signature"), asset.get("thumbnail_url")
+        ):
+            asset["thumbnail_url"] = ""
+        assets.append(asset)
+    return {
+        "catalog_root": normalized["catalog_root"],
+        "projects": [dict(item) for item in normalized["projects"]],
+        "project_root": normalized["project_root"],
+        "project_id": normalized["project_id"],
+        "project_uid": normalized["project_uid"],
+        "project_cache_uid": normalized["project_cache_uid"],
+        "manifest_signature": normalized["manifest_signature"],
+        "folder_signature": normalized["folder_signature"],
+        "folders": list(normalized["folders"]),
+        "assets": assets,
+        "warnings": list(normalized["warnings"]),
+    }
+
+
+def _store_shared_catalog_snapshot(
+    state: Dict[str, Any],
+    *,
+    normalized: bool = False,
+) -> None:
+    normalized_state = state if normalized else _normalize_state(state)
+    key = _shared_catalog_cache_key(normalized_state)
+    if key is None or _clean(normalized_state.get("error")):
+        return
+    snapshot = _shared_catalog_snapshot(normalized_state)
+    root_key = _clean(snapshot.get("project_root")).replace("\\", "/").casefold()
+    with _SHARED_CATALOG_CACHE_LOCK:
+        _SHARED_CATALOG_CACHE[key] = snapshot
+        _SHARED_CATALOG_CACHE.move_to_end(key)
+        if root_key:
+            _SHARED_CATALOG_ROOT_BINDINGS[root_key] = key
+            _SHARED_CATALOG_ROOT_BINDINGS.move_to_end(root_key)
+        while len(_SHARED_CATALOG_CACHE) > _SHARED_CATALOG_CACHE_LIMIT:
+            retired_key, _retired = _SHARED_CATALOG_CACHE.popitem(last=False)
+            stale_roots = [
+                item_root
+                for item_root, item_key in _SHARED_CATALOG_ROOT_BINDINGS.items()
+                if item_key == retired_key
+            ]
+            for item_root in stale_roots:
+                _SHARED_CATALOG_ROOT_BINDINGS.pop(item_root, None)
+        while len(_SHARED_CATALOG_ROOT_BINDINGS) > _SHARED_CATALOG_CACHE_LIMIT * 4:
+            _SHARED_CATALOG_ROOT_BINDINGS.popitem(last=False)
+
+
+def _rebind_shared_catalog_snapshot(
+    snapshot: Dict[str, Any],
+    project_record: Dict[str, Any],
+    catalog: Dict[str, Any],
+) -> Dict[str, Any] | None:
+    """Bind cached relative identities to the currently selected drive alias."""
+
+    project_root_text = _clean(project_record.get("path"))
+    project_id = _clean(project_record.get("project_id"))
+    project_uid = _clean(project_record.get("project_uid"))
+    project_cache_uid = _clean(project_record.get("project_cache_uid"))
+    if not project_cache_uid and project_root_text:
+        try:
+            project_cache_uid = _project_cache_uid(Path(project_root_text))
+        except Exception:
+            project_cache_uid = ""
+    if not project_root_text or not project_id or not project_uid or not project_cache_uid:
+        return None
+    try:
+        root = Path(project_root_text).resolve()
+        if not root.is_dir() or _is_reparse_point(root):
+            return None
+        if _clean(snapshot.get("project_uid")) != project_uid:
+            return None
+        if _clean(snapshot.get("project_cache_uid")) != project_cache_uid:
+            return None
+        if _clean(snapshot.get("manifest_signature")) != _asset_manifest_signature(root):
+            return None
+        if _clean(snapshot.get("folder_signature")) != _project_folder_metadata_signature(root):
+            return None
+        assets: List[Dict[str, Any]] = []
+        for raw_asset in snapshot.get("assets", []):
+            if not isinstance(raw_asset, dict):
+                return None
+            asset = dict(raw_asset)
+            relative_text = _clean(asset.get("relative_path")).replace("\\", "/")
+            relative = Path(relative_text)
+            if (
+                not relative_text
+                or relative.is_absolute()
+                or bool(relative.drive)
+                or ".." in relative.parts
+                or _clean(asset.get("asset_library_id"))
+                != _asset_library_id(project_id, relative.as_posix())
+            ):
+                return None
+            rebound = (root / relative).resolve()
+            rebound.relative_to(root)
+            asset["path"] = str(rebound).replace("\\", "/")
+            asset["asset_project_uid"] = project_uid
+            if not _thumbnail_url_is_live(
+                asset.get("media_signature"), asset.get("thumbnail_url")
+            ):
+                asset["thumbnail_url"] = ""
+            assets.append(asset)
+        rebound_snapshot = dict(snapshot)
+        rebound_snapshot.update(
+            {
+                "catalog_root": catalog["catalog_root"],
+                "projects": [dict(item) for item in catalog["projects"]],
+                "project_root": str(root).replace("\\", "/"),
+                "project_id": project_id,
+                "project_uid": project_uid,
+                "project_cache_uid": project_cache_uid,
+                "assets": assets,
+            }
+        )
+        return rebound_snapshot
+    except Exception:
+        return None
+
+
+def _adopt_shared_catalog_snapshot(
+    catalog: Dict[str, Any],
+    project_record: Dict[str, Any],
+    previous_state: Dict[str, Any],
+) -> Dict[str, Any] | None:
+    """Adopt a process snapshot after cheap identity/version validation."""
+
+    project_root = _clean(project_record.get("path"))
+    project_uid = _clean(project_record.get("project_uid"))
+    try:
+        project_cache_uid = _project_cache_uid(Path(project_root)) if project_root else ""
+    except Exception:
+        project_cache_uid = ""
+    if not project_root or not project_uid or not project_cache_uid:
+        return None
+    try:
+        manifest_signature = _asset_manifest_signature(Path(project_root))
+    except Exception:
+        return None
+    root_key = project_root.replace("\\", "/").casefold()
+    with _SHARED_CATALOG_CACHE_LOCK:
+        exact_key = _SHARED_CATALOG_ROOT_BINDINGS.get(root_key)
+        candidates: List[tuple[tuple[str, str, str], Dict[str, Any]]] = []
+        if exact_key is not None:
+            snapshot = _SHARED_CATALOG_CACHE.get(exact_key)
+            if snapshot is not None:
+                candidates.append((exact_key, dict(snapshot)))
+        for key, snapshot in reversed(_SHARED_CATALOG_CACHE.items()):
+            if key == exact_key:
+                continue
+            if key[0] == project_cache_uid and key[1] == manifest_signature:
+                candidates.append((key, dict(snapshot)))
+    candidates = [
+        item
+        for item in candidates
+        if item[0][0] == project_cache_uid and item[0][1] == manifest_signature
+    ]
+    if not candidates:
+        return None
+    # Same-name projects can share a derived UID. An exact root is sufficient;
+    # cross-drive aliases additionally require the current folder fingerprint
+    # to match exactly before a cached catalog may cross that boundary.
+    if candidates[0][0] != exact_key:
+        try:
+            current_folder_signature = _project_folder_metadata_signature(project_root)
+        except Exception:
+            return None
+        candidates = [item for item in candidates if item[0][2] == current_folder_signature]
+        if not candidates:
+            return None
+    selected_key, snapshot = candidates[0]
+    rebound = _rebind_shared_catalog_snapshot(snapshot, project_record, catalog)
+    if rebound is None:
+        return None
+    merged = _merge_scan_with_state(rebound, previous_state)
+    merged["scan_revision"] = _non_negative_int(previous_state.get("scan_revision"))
+    merged["catalog_root"] = catalog["catalog_root"]
+    merged["projects"] = catalog["projects"]
+    _store_shared_catalog_snapshot(merged)
+    with _SHARED_CATALOG_CACHE_LOCK:
+        _SHARED_CATALOG_ROOT_BINDINGS[root_key] = selected_key
+        _SHARED_CATALOG_ROOT_BINDINGS.move_to_end(root_key)
+    return _normalize_state(merged)
+
+
 def _load_project_catalog(
     projects_root: Any,
     previous_state: Dict[str, Any],
+    *,
+    use_shared_cache: bool = True,
 ) -> Dict[str, Any]:
     catalog = _discover_project_catalog(projects_root)
     state = dict(previous_state)
@@ -3273,9 +3977,13 @@ def _load_project_catalog(
         ).casefold():
             selected_path = _clean(only_project.get("path"))
     if selected_path:
-        state = _merge_scan_with_state(
-            _scan_project_assets(selected_path),
-            state,
+        cached = (
+            _adopt_shared_catalog_snapshot(catalog, selected, state)
+            if use_shared_cache and selected is not None
+            else None
+        )
+        state = cached or _merge_scan_with_state(
+            _scan_project_assets(selected_path), state
         )
         state["catalog_root"] = catalog["catalog_root"]
         state["projects"] = catalog["projects"]
@@ -3285,7 +3993,9 @@ def _load_project_catalog(
                 "project_root": "",
                 "project_id": "",
                 "project_uid": "",
+                "project_cache_uid": "",
                 "manifest_signature": "",
+                "folder_signature": "",
                 "folders": [],
                 "assets": [
                     dict(asset)
@@ -3308,6 +4018,208 @@ def _load_project_catalog(
     return _normalize_state(state)
 
 
+def _catalog_index_path(project_root: Any) -> Path:
+    root_text = _project_root_text(project_root)
+    identity = _project_cache_uid(Path(root_text)) if root_text else ""
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return Path(_ASSET_CATALOG_INDEX_ROOT) / f"{digest}.json"
+
+
+def _catalog_index_projection(
+    state: Dict[str, Any],
+    *,
+    normalized: bool = False,
+) -> Dict[str, Any]:
+    """Return catalog facts only; UI selection and transient URLs stay in state."""
+
+    normalized_state = state if normalized else _normalize_state(state)
+    assets: List[Dict[str, Any]] = []
+    for raw_asset in normalized_state["assets"]:
+        if _clean(raw_asset.get("source_kind")).casefold() != "project":
+            continue
+        asset = dict(raw_asset)
+        asset["selected"] = False
+        asset["selection_order"] = 0
+        asset["thumbnail_url"] = ""
+        assets.append(asset)
+    return {
+        "schema": _ASSET_CATALOG_INDEX_SCHEMA,
+        "version": _ASSET_CATALOG_INDEX_VERSION,
+        "catalog_root": normalized_state["catalog_root"],
+        "projects": normalized_state["projects"],
+        "project_root": normalized_state["project_root"],
+        "project_id": normalized_state["project_id"],
+        "project_uid": normalized_state["project_uid"],
+        "project_cache_uid": normalized_state["project_cache_uid"],
+        "manifest_signature": normalized_state["manifest_signature"],
+        "folder_signature": normalized_state["folder_signature"],
+        "folders": normalized_state["folders"],
+        "assets": assets,
+    }
+
+
+def _write_catalog_index(
+    state: Dict[str, Any],
+    *,
+    normalized: bool = False,
+) -> None:
+    """Atomically persist one bounded, non-authoritative local scan snapshot."""
+
+    project_root = _clean(state.get("project_root"))
+    if not project_root:
+        return
+    try:
+        projection = _catalog_index_projection(state, normalized=normalized)
+        payload = _json_text(projection).encode("utf-8")
+        if len(payload) > _ASSET_CATALOG_INDEX_MAX_BYTES:
+            return
+        index_path = _catalog_index_path(project_root)
+        with _ASSET_CATALOG_INDEX_LOCK:
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = index_path.parent / f".{index_path.name}.{uuid.uuid4().hex}.tmp"
+            try:
+                temporary.write_bytes(payload)
+                os.replace(temporary, index_path)
+            finally:
+                temporary.unlink(missing_ok=True)
+    except Exception as exc:
+        _diagnostic_warning("Local catalog index write failed", exc)
+
+
+def _read_catalog_index(
+    project_root: Any,
+    previous_state: Dict[str, Any],
+) -> Dict[str, Any] | None:
+    """Adopt a local index only when project identity and manifest still match."""
+
+    root_text = _clean(project_root)
+    if not root_text:
+        return None
+    try:
+        index_path = _catalog_index_path(root_text)
+        if (
+            not index_path.is_file()
+            or _is_reparse_point(index_path)
+            or index_path.stat().st_size > _ASSET_CATALOG_INDEX_MAX_BYTES
+        ):
+            return None
+        raw = json.loads(index_path.read_text(encoding="utf-8"))
+        expected_catalog_root = _project_root_text(
+            previous_state.get("catalog_root")
+        ).replace("\\", "/")
+        if (
+            not isinstance(raw, dict)
+            or raw.get("schema") != _ASSET_CATALOG_INDEX_SCHEMA
+            or raw.get("version") != _ASSET_CATALOG_INDEX_VERSION
+            or _project_uid(Path(_clean(raw.get("project_root"))))
+            != _clean(raw.get("project_uid"))
+            or not expected_catalog_root
+        ):
+            return None
+        catalog = _discover_project_catalog(expected_catalog_root)
+        selected = _match_catalog_project(
+            catalog["projects"],
+            previous_path=root_text,
+            previous_uid=raw.get("project_uid"),
+            previous_project_id=raw.get("project_id"),
+        )
+        if selected is None:
+            return None
+        resolved_root = Path(_clean(selected.get("path"))).resolve()
+        if (
+            _clean(raw.get("project_id")) != _project_id(resolved_root)
+            or _clean(raw.get("project_uid")) != _project_uid(resolved_root)
+            or _clean(raw.get("project_cache_uid"))
+            != _project_cache_uid(resolved_root)
+            or _clean(raw.get("manifest_signature"))
+            != _asset_manifest_signature(resolved_root)
+        ):
+            return None
+        if _clean(raw.get("folder_signature")) != _project_folder_metadata_signature(
+            resolved_root
+        ):
+            return None
+        assets = raw.get("assets")
+        if not isinstance(assets, list) or len(assets) > MAX_ASSETS:
+            return None
+        for asset in assets:
+            if not isinstance(asset, dict):
+                return None
+            relative_text = _clean(asset.get("relative_path")).replace("\\", "/")
+            relative = Path(relative_text)
+            if (
+                not relative_text
+                or relative.is_absolute()
+                or bool(relative.drive)
+                or ".." in relative.parts
+                or relative.suffix.casefold() not in IMAGE_EXTENSIONS
+                or _clean(asset.get("asset_library_id"))
+                != _asset_library_id(_project_id(resolved_root), relative.as_posix())
+            ):
+                return None
+            resolved_asset = (resolved_root / relative).resolve()
+            try:
+                resolved_asset.relative_to(resolved_root)
+            except Exception:
+                return None
+            asset["path"] = str(resolved_asset).replace("\\", "/")
+            asset["thumbnail_url"] = ""
+        indexed = dict(previous_state)
+        indexed.update(raw)
+        indexed["catalog_root"] = catalog["catalog_root"]
+        indexed["projects"] = catalog["projects"]
+        indexed["project_root"] = str(resolved_root).replace("\\", "/")
+        indexed["catalog_root"] = catalog["catalog_root"]
+        merged = _merge_scan_with_state(indexed, previous_state)
+        merged["scan_revision"] = _non_negative_int(
+            previous_state.get("scan_revision")
+        )
+        return merged
+    except Exception:
+        return None
+
+
+def _state_catalog_is_current(state: Dict[str, Any]) -> bool:
+    """Cheap SWR guard: validate the managed manifest without walking assets."""
+
+    project_root = _clean(state.get("project_root"))
+    signature = _clean(state.get("manifest_signature"))
+    if not project_root or not signature:
+        return False
+    try:
+        root = Path(project_root).resolve()
+        return (
+            root.is_dir()
+            and not _is_reparse_point(root)
+            and _clean(state.get("project_id")) == _project_id(root)
+            and _clean(state.get("project_uid")) == _project_uid(root)
+            and _clean(state.get("project_cache_uid")) == _project_cache_uid(root)
+            and signature == _asset_manifest_signature(root)
+        )
+    except Exception:
+        return False
+
+
+def _state_project_belongs_to_catalog(
+    state: Dict[str, Any],
+    catalog_root: Any,
+) -> bool:
+    """Reject a valid old project after PROJECT_ROOT switches catalogs."""
+
+    project_text = _clean(state.get("project_root"))
+    catalog_text = _project_root_text(catalog_root)
+    if not project_text or not catalog_text:
+        return False
+    try:
+        project = Path(project_text).resolve()
+        catalog = Path(catalog_text).resolve()
+        # Discovery treats the chosen root either as one direct project or as
+        # a container whose immediate child directories are projects.
+        return project == catalog or project.parent == catalog
+    except Exception:
+        return False
+
+
 def _select_catalog_project(
     state: Dict[str, Any],
     project_path: Any,
@@ -3324,10 +4236,16 @@ def _select_catalog_project(
     )
     if selected is None:
         raise ValueError("Selected project is outside the enumerated project catalog.")
-    merged = _merge_scan_with_state(
-        _scan_project_assets(selected["path"]),
-        normalized,
-    )
+    catalog = {
+        "catalog_root": normalized["catalog_root"],
+        "projects": normalized["projects"],
+    }
+    merged = _adopt_shared_catalog_snapshot(catalog, selected, normalized)
+    if merged is None:
+        merged = _merge_scan_with_state(
+            _scan_project_assets(selected["path"]),
+            normalized,
+        )
     merged["catalog_root"] = normalized["catalog_root"]
     merged["projects"] = normalized["projects"]
     merged["selected_main_type"] = ""
@@ -3638,7 +4556,11 @@ def _resolve_project_asset_file(
     expected_id = _clean(expected_library_id)
     if expected_id and library_id != expected_id:
         raise ValueError("The image identity changed while the operation was pending.")
-    _resolved, _size, _mtime_ns, media_signature = _asset_file_facts(resolved)
+    _resolved, _size, _mtime_ns, media_signature = _asset_file_facts(
+        resolved,
+        project_uid=_project_cache_uid(resolved_root),
+        relative_path=canonical_relative,
+    )
     return resolved, canonical_relative, media_signature
 
 
@@ -3646,7 +4568,7 @@ def _registered_project_asset_row(
     *,
     project_root: Path,
     project_id: str,
-    project_uid: str,
+    project_cache_uid: str,
     relative_text: str,
     manifest_record: Dict[str, Any],
     previous_asset: Dict[str, Any] | None = None,
@@ -3657,6 +4579,10 @@ def _registered_project_asset_row(
 ) -> Dict[str, Any]:
     """Build the authoritative row for one committed manifest record."""
 
+    # ``asset_project_uid`` remains the logical routing identity used by Shot
+    # contracts.  ``project_cache_uid`` is deliberately separate and exists
+    # only to isolate/reuse catalog and thumbnail caches safely.
+    project_uid = _project_uid(project_root)
     path, canonical_relative, media_signature = _resolve_project_asset_file(
         project_root,
         project_id,
@@ -3672,7 +4598,7 @@ def _registered_project_asset_row(
     )
     library_id = _asset_library_id(project_id, canonical_relative)
     thumbnail_url = (
-        _asset_thumbnail_url(path, library_id)
+        _asset_thumbnail_url_for_media(path, library_id, media_signature)
         if hydrate_thumbnail
         else _clean(previous.get("thumbnail_url"))
         if (
@@ -3686,7 +4612,11 @@ def _registered_project_asset_row(
     )
     if thumbnail_url:
         try:
-            _resolved, _size, _mtime_ns, hydrated_signature = _asset_file_facts(path)
+            _resolved, _size, _mtime_ns, hydrated_signature = _asset_file_facts(
+                path,
+                project_uid=project_cache_uid,
+                relative_path=canonical_relative,
+            )
             if hydrated_signature != media_signature:
                 thumbnail_url = ""
         except Exception:
@@ -3879,7 +4809,8 @@ def _apply_asset_registration(
         registered_row = _registered_project_asset_row(
             project_root=selected_root,
             project_id=_clean(selected_project.get("project_id")),
-            project_uid=project_uid,
+            project_cache_uid=_clean(normalized.get("project_cache_uid"))
+            or _project_cache_uid(selected_root),
             relative_text=relative_text,
             manifest_record=record,
             previous_asset=source_asset,
@@ -3953,7 +4884,8 @@ def _apply_asset_registration(
             registered_row = _registered_project_asset_row(
                 project_root=selected_root,
                 project_id=_clean(selected_project.get("project_id")),
-                project_uid=project_uid,
+                project_cache_uid=_clean(normalized.get("project_cache_uid"))
+                or _project_cache_uid(selected_root),
                 relative_text=relative_text,
                 manifest_record=record,
                 selected=source_selection,
@@ -3996,6 +4928,12 @@ def _apply_asset_registration(
         # ordinary poll detects and reconciles it instead of reporting Add as
         # failed after commit because a share became briefly unavailable.
         _diagnostic_warning("Post-registration manifest signature refresh", exc)
+    try:
+        refreshed["folder_signature"] = _project_folder_metadata_signature(
+            selected_root
+        )
+    except Exception as exc:
+        _diagnostic_warning("Post-registration folder signature refresh", exc)
     refreshed["scan_revision"] = _non_negative_int(
         normalized.get("scan_revision")
     ) + 1
@@ -4023,28 +4961,40 @@ def _apply_asset_registration(
 def _hydrate_asset_thumbnails(
     state: Dict[str, Any],
     request_value: Any,
+    *,
+    normalized: bool = False,
+    request_normalized: bool = False,
 ) -> Dict[str, Any]:
     """Hydrate a bounded selected/visible batch without changing media facts."""
 
-    normalized = _normalize_state(state)
-    request = _normalize_thumbnail_request(request_value)
+    normalized_state = state if normalized else _normalize_state(state)
+    request = (
+        dict(request_value)
+        if request_normalized and isinstance(request_value, dict)
+        else _normalize_thumbnail_request(request_value)
+    )
     if not request:
-        return normalized
+        return normalized_state
     requested_ids = list(request["asset_library_ids"])
     completed: List[str] = []
     failed: List[str] = []
-    hydrated = dict(normalized)
+    hydrated = dict(normalized_state)
     hydrated["thumbnail_request"] = {}
 
     context_matches = (
-        request.get("project_uid") == _clean(normalized.get("project_uid"))
+        request.get("project_uid") == _clean(normalized_state.get("project_uid"))
+        and (
+            not _clean(request.get("project_cache_uid"))
+            or request.get("project_cache_uid")
+            == _clean(normalized_state.get("project_cache_uid"))
+        )
         and request.get("manifest_signature")
-        == _clean(normalized.get("manifest_signature"))
+        == _clean(normalized_state.get("manifest_signature"))
         and _non_negative_int(request.get("scan_revision"))
-        == _non_negative_int(normalized.get("scan_revision"))
+        == _non_negative_int(normalized_state.get("scan_revision"))
     )
-    project_root_text = _clean(normalized.get("project_root"))
-    project_id = _clean(normalized.get("project_id"))
+    project_root_text = _clean(normalized_state.get("project_root"))
+    project_id = _clean(normalized_state.get("project_id"))
     if context_matches and project_root_text and project_id:
         try:
             context_matches = (
@@ -4054,7 +5004,7 @@ def _hydrate_asset_thumbnails(
         except Exception:
             context_matches = False
 
-    assets = [dict(asset) for asset in normalized["assets"]]
+    assets = [dict(asset) for asset in normalized_state["assets"]]
     by_library_id = {
         _clean(asset.get("asset_library_id")): (index, asset)
         for index, asset in enumerate(assets)
@@ -4062,7 +5012,7 @@ def _hydrate_asset_thumbnails(
     }
     shot_selected_uids = {
         _clean(source_uid)
-        for shot in normalized.get("shot_routing", {}).get("shots", [])
+        for shot in normalized_state.get("shot_routing", {}).get("shots", [])
         if isinstance(shot, dict)
         for source_uid in (
             shot.get("selected_source_uids")
@@ -4090,67 +5040,92 @@ def _hydrate_asset_thumbnails(
 
     if context_matches:
         project_root = Path(project_root_text)
-        for library_id in requested_ids:
-            match = by_library_id.get(library_id)
-            if match is None:
-                failed.append(library_id)
-                continue
-            index, asset = match
-            if (
-                _non_negative_int(asset.get("import_index")) > 0
-                or not _clean(asset.get("relative_path"))
-            ):
-                failed.append(library_id)
-                continue
-            try:
-                path, _relative_text, media_signature = _resolve_project_asset_file(
-                    project_root,
-                    project_id,
-                    asset.get("relative_path"),
-                    library_id,
-                    allow_user_import_path=True,
-                )
-                expected_signature = _clean(asset.get("media_signature"))
-                if expected_signature and media_signature != expected_signature:
+        global _ASSET_THUMBNAIL_CACHE_DEFER_COUNT
+        with _ASSET_THUMBNAIL_LOCK:
+            _ASSET_THUMBNAIL_CACHE_DEFER_COUNT += 1
+        try:
+            for library_id in requested_ids:
+                match = by_library_id.get(library_id)
+                if match is None:
                     failed.append(library_id)
                     continue
-                thumbnail_url = _asset_thumbnail_url(path, library_id)
-                if not thumbnail_url:
+                index, asset = match
+                if (
+                    _non_negative_int(asset.get("import_index")) > 0
+                    or not _clean(asset.get("relative_path"))
+                ):
                     failed.append(library_id)
                     continue
-                _resolved, _size, _mtime_ns, hydrated_signature = (
-                    _asset_file_facts(path)
-                )
-                if hydrated_signature != media_signature:
+                try:
+                    path, _relative_text, media_signature = _resolve_project_asset_file(
+                        project_root,
+                        project_id,
+                        asset.get("relative_path"),
+                        library_id,
+                        allow_user_import_path=True,
+                    )
+                    expected_signature = _clean(asset.get("media_signature"))
+                    if expected_signature and media_signature != expected_signature:
+                        failed.append(library_id)
+                        continue
+                    thumbnail_url = _asset_thumbnail_url_for_media(
+                        path,
+                        library_id,
+                        media_signature,
+                    )
+                    if not thumbnail_url:
+                        failed.append(library_id)
+                        continue
+                    _resolved, _size, _mtime_ns, hydrated_signature = (
+                        _asset_file_facts(
+                            path,
+                            project_uid=normalized_state.get("project_cache_uid"),
+                            relative_path=asset.get("relative_path"),
+                        )
+                    )
+                    if hydrated_signature != media_signature:
+                        failed.append(library_id)
+                        continue
+                    asset["thumbnail_url"] = thumbnail_url
+                    asset["media_signature"] = media_signature
+                    assets[index] = asset
+                    completed.append(library_id)
+                except Exception as exc:
                     failed.append(library_id)
-                    continue
-                asset["thumbnail_url"] = thumbnail_url
-                asset["media_signature"] = media_signature
-                assets[index] = asset
-                completed.append(library_id)
-            except Exception as exc:
-                failed.append(library_id)
-                _diagnostic_warning(
-                    f"Thumbnail hydration failed for {library_id}",
-                    exc,
+                    _diagnostic_warning(
+                        f"Thumbnail hydration failed for {library_id}",
+                        exc,
+                    )
+        finally:
+            with _ASSET_THUMBNAIL_LOCK:
+                _ASSET_THUMBNAIL_CACHE_DEFER_COUNT = max(
+                    0,
+                    _ASSET_THUMBNAIL_CACHE_DEFER_COUNT - 1,
                 )
+                should_prune = _ASSET_THUMBNAIL_CACHE_DEFER_COUNT == 0
+            if should_prune:
+                _flush_persistent_thumbnail_cache_prune()
     else:
         failed.extend(requested_ids)
 
     hydrated["assets"] = assets
     hydrated["thumbnail_busy"] = False
     hydrated["thumbnail_revision"] = _non_negative_int(
-        normalized.get("thumbnail_revision")
+        normalized_state.get("thumbnail_revision")
     ) + 1
     hydrated["thumbnail_result"] = {
         "request_id": request["request_id"],
         "project_uid": request["project_uid"],
+        "project_cache_uid": _clean(
+            request.get("project_cache_uid")
+            or normalized_state.get("project_cache_uid")
+        ),
         "manifest_signature": request["manifest_signature"],
         "scan_revision": request["scan_revision"],
         "completed_asset_library_ids": completed,
         "failed_asset_library_ids": failed,
     }
-    return _normalize_state(hydrated)
+    return hydrated if normalized else _normalize_state(hydrated)
 
 
 def _merge_async_thumbnail_result_with_live_state(
@@ -4158,26 +5133,51 @@ def _merge_async_thumbnail_result_with_live_state(
     hydration_base: Dict[str, Any],
     live_state: Dict[str, Any],
     request_value: Any,
+    *,
+    inputs_normalized: bool = False,
+    request_normalized: bool = False,
 ) -> Dict[str, Any]:
     """Patch thumbnail_url only when worker and live filesystem identities agree."""
 
-    hydrated = _normalize_state(hydration_result)
-    base = _normalize_state(hydration_base)
-    live = _normalize_state(live_state)
-    request = _normalize_thumbnail_request(request_value)
+    hydrated = (
+        hydration_result
+        if inputs_normalized
+        else _normalize_state(hydration_result)
+    )
+    base = hydration_base if inputs_normalized else _normalize_state(hydration_base)
+    live = live_state if inputs_normalized else _normalize_state(live_state)
+    request = (
+        dict(request_value)
+        if request_normalized and isinstance(request_value, dict)
+        else _normalize_thumbnail_request(request_value)
+    )
     result = _normalize_thumbnail_result(hydrated.get("thumbnail_result"))
     result_matches_request = bool(request) and bool(result) and (
         result.get("request_id") == request.get("request_id")
         and result.get("project_uid") == request.get("project_uid")
+        and (
+            not _clean(request.get("project_cache_uid"))
+            or result.get("project_cache_uid") == request.get("project_cache_uid")
+        )
         and result.get("manifest_signature") == request.get("manifest_signature")
         and _non_negative_int(result.get("scan_revision"))
         == _non_negative_int(request.get("scan_revision"))
         and _clean(hydrated.get("project_uid")) == request.get("project_uid")
+        and (
+            not _clean(request.get("project_cache_uid"))
+            or _clean(hydrated.get("project_cache_uid"))
+            == request.get("project_cache_uid")
+        )
         and _clean(hydrated.get("manifest_signature"))
         == request.get("manifest_signature")
         and _non_negative_int(hydrated.get("scan_revision"))
         == _non_negative_int(request.get("scan_revision"))
         and _clean(base.get("project_uid")) == request.get("project_uid")
+        and (
+            not _clean(request.get("project_cache_uid"))
+            or _clean(base.get("project_cache_uid"))
+            == request.get("project_cache_uid")
+        )
         and _clean(base.get("manifest_signature"))
         == request.get("manifest_signature")
         and _non_negative_int(base.get("scan_revision"))
@@ -4192,6 +5192,11 @@ def _merge_async_thumbnail_result_with_live_state(
     merged["thumbnail_request"] = {}
     context_matches = (
         request.get("project_uid") == _clean(live.get("project_uid"))
+        and (
+            not _clean(request.get("project_cache_uid"))
+            or request.get("project_cache_uid")
+            == _clean(live.get("project_cache_uid"))
+        )
         and request.get("manifest_signature") == _clean(live.get("manifest_signature"))
         and _non_negative_int(request.get("scan_revision"))
         == _non_negative_int(live.get("scan_revision"))
@@ -4234,7 +5239,7 @@ def _merge_async_thumbnail_result_with_live_state(
             "completed_asset_library_ids": actually_completed,
             "failed_asset_library_ids": failed_ids,
         }
-    return _normalize_state(merged)
+    return merged if inputs_normalized else _normalize_state(merged)
 
 
 def _merge_import_input(
@@ -4599,6 +5604,7 @@ def _asset_resolution_cache_key(
             "project_root": _clean(state.get("project_root")),
             "project_id": _clean(state.get("project_id")),
             "project_uid": _clean(state.get("project_uid")),
+            "project_cache_uid": _clean(state.get("project_cache_uid")),
             "manifest_signature": _clean(state.get("manifest_signature")),
             "scan_revision": _non_negative_int(state.get("scan_revision")),
             "asset": {
@@ -4680,6 +5686,7 @@ def _resolution_cache_state_identity(state: Dict[str, Any]) -> str:
             "project_root": _clean(state.get("project_root")),
             "project_id": _clean(state.get("project_id")),
             "project_uid": _clean(state.get("project_uid")),
+            "project_cache_uid": _clean(state.get("project_cache_uid")),
             "manifest_signature": _clean(state.get("manifest_signature")),
             "scan_revision": _non_negative_int(state.get("scan_revision")),
         },
@@ -4697,6 +5704,7 @@ def _resolve_selected_assets(
     resolution_cache: OrderedDict[str, Dict[str, Any]] | None = None,
     import_revision: int = 0,
     force: bool = False,
+    normalized: bool = False,
 ) -> Dict[str, Any]:
     """Resolve one authoritative selection for metadata and generator media.
 
@@ -4705,7 +5713,8 @@ def _resolve_selected_assets(
     requested order and source identity in diagnostics so a missing image can
     never shift ``@imageN`` onto a different fan-out item silently.
     """
-    normalized = _normalize_state(state)
+    normalized_state = state if normalized else _normalize_state(state)
+    normalized = normalized_state
     media_lookup = media_by_uid if isinstance(media_by_uid, dict) else {}
     ordered = sorted(
         [
@@ -5038,6 +6047,7 @@ def _build_synchronized_outputs(
     resolution_cache: OrderedDict[str, Dict[str, Any]] | None = None,
     import_revision: int = 0,
     force: bool = False,
+    normalized: bool = False,
 ) -> tuple[Dict[str, Any], List[str]]:
     """Build both public outputs from one immutable resolution snapshot."""
     selection = _resolve_selected_assets(
@@ -5046,6 +6056,7 @@ def _build_synchronized_outputs(
         resolution_cache=resolution_cache,
         import_revision=import_revision,
         force=force,
+        normalized=normalized,
     )
     return (
         _build_output_payload(
@@ -5133,6 +6144,7 @@ def _build_shot_routing_snapshot(
     import_revision: int = 0,
     force: bool = False,
     generation: int | None = None,
+    normalized: bool = False,
 ) -> Dict[str, Any]:
     """Resolve one immutable metadata/media pair for every configured shot."""
     selection = _resolve_selected_assets(
@@ -5141,6 +6153,7 @@ def _build_shot_routing_snapshot(
         resolution_cache=resolution_cache,
         import_revision=import_revision,
         force=force,
+        normalized=normalized,
     )
     normalized = selection["state"]
     routing = normalized["shot_routing"]
@@ -5330,6 +6343,7 @@ def _project_output_fingerprint(
             "project_root": _clean(state.get("project_root")),
             "project_id": _clean(state.get("project_id")),
             "project_uid": _clean(state.get("project_uid")),
+            "project_cache_uid": _clean(state.get("project_cache_uid")),
             "manifest_signature": _clean(state.get("manifest_signature")),
             "scan_revision": _non_negative_int(state.get("scan_revision")),
             "selected": selected_payload,
@@ -5763,6 +6777,116 @@ def _add_widget_state(node: Any) -> None:
     node.add_parameter(parameter)
 
 
+def _add_thumbnail_patch_bridge(node: Any) -> None:
+    runtime_id = ""
+    try:
+        runtime_id = _normalize_state(
+            _get_parameter_raw(node, WIDGET_STATE_PARAMETER)
+        )["shot_routing"]["publisher_instance_uuid"]
+    except Exception:
+        runtime_id = ""
+    if parameter_exists(node, THUMBNAIL_PATCH_PARAMETER):
+        parameter = _get_parameter_obj(node, THUMBNAIL_PATCH_PARAMETER)
+    else:
+        kwargs: Dict[str, Any] = {
+            "name": THUMBNAIL_PATCH_PARAMETER,
+            "default_value": _default_thumbnail_bridge(runtime_id),
+            "type": "dict",
+            "input_types": ["dict"],
+            "allow_input": False,
+            "allow_output": False,
+            "allow_property": True,
+            "settable": True,
+            "ui_options": {
+                "display_name": "",
+                "is_full_width": True,
+                "height": 0,
+                "min_height": 0,
+                "max_height": 0,
+                "expandable": False,
+                "compact": True,
+                "resizable": False,
+                "hide_label": True,
+                "hide_handles": True,
+                "hide": True,
+                # The row is invisible, but the property must stay mounted so
+                # the dedicated bridge widget can exchange compact patches.
+                "hide_property": False,
+            },
+        }
+        modes = _mode_set("PROPERTY")
+        if modes is not None:
+            kwargs["allowed_modes"] = modes
+        parameter = None
+        last: Exception | None = None
+        for attempt in _parameter_attempts(kwargs):
+            try:
+                parameter = Parameter(**attempt)
+                break
+            except Exception as exc:
+                last = exc
+        if parameter is None:
+            raise last or RuntimeError(
+                "Unable to add HMB image thumbnail patch bridge."
+            )
+        if Widget is not None:
+            try:
+                parameter.add_trait(
+                    Widget(
+                        name=THUMBNAIL_BRIDGE_WIDGET_NAME,
+                        library=WIDGET_LIBRARY_NAME,
+                    )
+                )
+            except Exception:
+                pass
+        node.add_parameter(parameter)
+    for attribute, setting in (
+        ("type", "dict"),
+        ("input_types", ["dict"]),
+        ("settable", True),
+        ("hide", True),
+        ("hide_property", False),
+        ("serializable", True),
+    ):
+        try:
+            setattr(parameter, attribute, setting)
+        except Exception:
+            pass
+    if Widget is not None:
+        try:
+            finder = getattr(parameter, "find_elements_by_type", None)
+            existing = list(finder(Widget, True)) if callable(finder) else []
+            if not existing:
+                parameter.add_trait(
+                    Widget(
+                        name=THUMBNAIL_BRIDGE_WIDGET_NAME,
+                        library=WIDGET_LIBRARY_NAME,
+                    )
+                )
+        except Exception:
+            pass
+    try:
+        options = dict(getattr(parameter, "ui_options", {}) or {})
+        options.update(
+            {
+                "display_name": "",
+                "height": 0,
+                "min_height": 0,
+                "max_height": 0,
+                "expandable": False,
+                "compact": True,
+                "resizable": False,
+                "hide_label": True,
+                "hide_handles": True,
+                "hide": True,
+                "hide_property": False,
+            }
+        )
+        parameter.ui_options = options
+    except Exception:
+        pass
+
+
 def _image_output_side_effect_local(node: Any) -> Any:
     local = getattr(node, "_hmb_output_side_effect_local", None)
     if local is None:
@@ -6078,6 +7202,7 @@ class HMBImageAssetLibrary(DataNode):
             "metadata and additive downstream binding output."
         )
         self._hmb_state_syncing = False
+        self._hmb_thumbnail_bridge_syncing = False
         self._hmb_root_syncing = False
         self._hmb_refresh_revision = 0
         self._hmb_manifest_poll_received = False
@@ -6098,6 +7223,19 @@ class HMBImageAssetLibrary(DataNode):
             str,
             Dict[str, Any],
         ] | None = None
+        self._hmb_catalog_probe_lock = threading.RLock()
+        self._hmb_catalog_probe_generation = 0
+        self._hmb_catalog_probe_pending_key = ""
+        self._hmb_catalog_probe_thread: threading.Thread | None = None
+        self._hmb_catalog_probe_pending_result: tuple[
+            int,
+            str,
+            Dict[str, Any],
+        ] | None = None
+        self._hmb_catalog_probe_last_manifest_at = 0.0
+        self._hmb_catalog_probe_last_folder_at = 0.0
+        self._hmb_catalog_probe_pending_folder_signature = ""
+        self._hmb_catalog_probe_pending_folder_since = 0.0
         self._hmb_node_deleted = False
         self._hmb_initial_catalog_scan_pending = True
         # A newly registered ImageAsset may appear after Prompt. Its first
@@ -6192,6 +7330,7 @@ class HMBImageAssetLibrary(DataNode):
         _add_image_import_input(self)
         _add_project_root(self)
         _add_widget_state(self)
+        _add_thumbnail_patch_bridge(self)
 
     def set_parameter_value(
         self,
@@ -6205,24 +7344,38 @@ class HMBImageAssetLibrary(DataNode):
         """Adopt serialized hydration as a fresh instance-local baseline."""
 
         parent_setter = getattr(super(), "set_parameter_value")
+        if (
+            ParameterMode is None
+            and param_name == WIDGET_STATE_PARAMETER
+            and not emit_change
+            and skip_before_value_set
+        ):
+            values = getattr(self, "parameter_values", None)
+            if isinstance(values, dict):
+                values[WIDGET_STATE_PARAMETER] = value
+            parameter = _get_parameter_obj(self, WIDGET_STATE_PARAMETER)
+            if parameter is not None:
+                parameter.default_value = value
+            return
         if initial_setup and param_name in {
             WIDGET_STATE_PARAMETER,
             PROJECT_ROOT_PARAMETER,
             IMAGE_IMPORT_PARAMETER,
+            THUMBNAIL_PATCH_PARAMETER,
         }:
             self._hmb_fresh_registration_scan_key = ""
         if initial_setup and param_name == WIDGET_STATE_PARAMETER:
             self._accept_widget_state_baseline(value)
         if (
             ParameterMode is None
-            and param_name == WIDGET_STATE_PARAMETER
+            and param_name in {WIDGET_STATE_PARAMETER, THUMBNAIL_PATCH_PARAMETER}
             and not initial_setup
         ):
-            if not self._hmb_state_syncing and not getattr(
+            if param_name == WIDGET_STATE_PARAMETER and not self._hmb_state_syncing and not getattr(
                 self, "_hmb_restoring_widget_state", False
             ):
                 self._hmb_hydration_adopted = True
-            parameter = _get_parameter_obj(self, WIDGET_STATE_PARAMETER)
+            parameter = _get_parameter_obj(self, param_name)
             final_value = (
                 value
                 if skip_before_value_set
@@ -6266,6 +7419,7 @@ class HMBImageAssetLibrary(DataNode):
 
         self._ensure_scan_runtime_state()
         self._ensure_thumbnail_runtime_state()
+        self._ensure_catalog_probe_runtime_state()
         with self._hmb_scan_lock:
             if not bool(getattr(self, "_hmb_initial_catalog_scan_pending", False)):
                 return
@@ -6274,6 +7428,7 @@ class HMBImageAssetLibrary(DataNode):
                 getattr(self, "_hmb_node_deleted", False)
             ):
                 return
+            registration_generation = self._hmb_scan_generation
 
         snapshot = self._current_state()
         requested_root = (
@@ -6295,16 +7450,29 @@ class HMBImageAssetLibrary(DataNode):
         )
         request_key = f"initial:{requested_root.casefold()}"
         with self._hmb_scan_lock:
+            # Snapshot/root resolution happens outside the lock. An explicit
+            # root edit or hydrated workflow can complete its own scan during
+            # that interval, including quickly enough to leave no pending key.
+            # Generation is therefore the authority, not pending-key presence
+            # alone. Keep the final reservation and schedule atomic under the
+            # RLock so the constructor-default scan can never supersede newer
+            # user or hydration state.
+            if (
+                registration_generation != self._hmb_scan_generation
+                or self._hmb_scan_pending_key
+                or bool(getattr(self, "_hmb_node_deleted", False))
+            ):
+                return
             self._hmb_fresh_registration_scan_key = request_key
-        self._schedule_catalog_scan(
-            request_key,
-            candidate,
-            lambda: self._merge_captured_imports_into_scan(
-                _load_project_catalog(requested_root, snapshot),
-                captured_import_value,
-            ),
-            failure_state=snapshot,
-        )
+            self._schedule_catalog_scan(
+                request_key,
+                candidate,
+                lambda: self._merge_captured_imports_into_scan(
+                    _load_project_catalog(requested_root, snapshot),
+                    captured_import_value,
+                ),
+                failure_state=snapshot,
+            )
 
     def _current_state(self) -> Dict[str, Any]:
         return _normalize_state(
@@ -6316,6 +7484,7 @@ class HMBImageAssetLibrary(DataNode):
         state: Dict[str, Any],
         *,
         force: bool = False,
+        normalized: bool = False,
     ) -> Dict[str, Any]:
         import_media = getattr(self, "_hmb_import_media_by_uid", {})
         if not isinstance(import_media, dict):
@@ -6327,7 +7496,7 @@ class HMBImageAssetLibrary(DataNode):
         import_revision = _non_negative_int(
             getattr(self, "_hmb_import_revision", 0)
         )
-        normalized_state = _normalize_state(state)
+        normalized_state = state if normalized else _normalize_state(state)
         routing = normalized_state["shot_routing"]
         routing_contract = {
             "publisher_instance_uuid": routing["publisher_instance_uuid"],
@@ -6369,6 +7538,7 @@ class HMBImageAssetLibrary(DataNode):
             resolution_cache=resolution_cache,
             import_revision=import_revision,
             generation=1,
+            normalized=True,
         )
         media_descriptors = _shot_media_descriptors(
             [item["source_uid"] for item in probe["ordered_assets"]],
@@ -6384,7 +7554,7 @@ class HMBImageAssetLibrary(DataNode):
             }
         )
         configured_generation = _non_negative_int(
-            _normalize_state(state)["shot_routing"].get("generation")
+            normalized_state["shot_routing"].get("generation")
         )
         previous_generation = _non_negative_int(
             getattr(self, "_hmb_shot_routing_generation", 0)
@@ -6397,11 +7567,12 @@ class HMBImageAssetLibrary(DataNode):
         else:
             generation = max(1, configured_generation, previous_generation)
         snapshot = _build_shot_routing_snapshot(
-            state,
+            normalized_state,
             import_media,
             resolution_cache=resolution_cache,
             import_revision=import_revision,
             generation=generation,
+            normalized=True,
         )
         self._hmb_shot_routing_identity = identity
         self._hmb_shot_routing_input_identity = input_identity
@@ -6522,6 +7693,8 @@ class HMBImageAssetLibrary(DataNode):
         """Export only durable image/Shot state for an in-flow node reset."""
 
         self._ensure_scan_runtime_state()
+        self._ensure_thumbnail_runtime_state()
+        self._ensure_catalog_probe_runtime_state()
         with self._hmb_scan_lock:
             state = _normalize_state(self._current_state())
             import_value = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
@@ -6573,6 +7746,8 @@ class HMBImageAssetLibrary(DataNode):
             return False
 
         self._ensure_scan_runtime_state()
+        self._ensure_thumbnail_runtime_state()
+        self._ensure_catalog_probe_runtime_state()
         with self._hmb_scan_lock:
             self._hmb_scan_generation += 1
             self._hmb_scan_pending_key = ""
@@ -6584,6 +7759,12 @@ class HMBImageAssetLibrary(DataNode):
             self._hmb_thumbnail_pending_key = ""
             self._hmb_thumbnail_pending_result = None
             self._hmb_thumbnail_thread = None
+            self._hmb_thumbnail_queued_bridge_request = None
+        with self._hmb_catalog_probe_lock:
+            self._hmb_catalog_probe_generation += 1
+            self._hmb_catalog_probe_pending_key = ""
+            self._hmb_catalog_probe_pending_result = None
+            self._hmb_catalog_probe_thread = None
         self._replace_import_media(dict(import_media))
         self._hmb_last_applied_import_identity = (
             _canonical_import_input_identity(import_value)
@@ -6669,7 +7850,19 @@ class HMBImageAssetLibrary(DataNode):
                 self._hmb_fresh_registration_scan_key = ""
         if fresh_registration:
             self._hmb_hydration_adopted = True
-        return self._publish_state(state)
+        normalized_state = _normalize_state(state)
+        if not _clean(normalized_state.get("error")) and _clean(
+            normalized_state.get("project_root")
+        ):
+            _store_shared_catalog_snapshot(normalized_state, normalized=True)
+            _write_catalog_index(normalized_state, normalized=True)
+        try:
+            return self._publish_state(normalized_state, normalized=True)
+        except TypeError as exc:
+            # Compatibility for legacy monkey-patched publication stubs.
+            if "normalized" not in str(exc):
+                raise
+            return self._publish_state(normalized_state)
 
     @staticmethod
     def _widget_revision_pair(value: Any) -> tuple[int, int] | None:
@@ -6690,14 +7883,21 @@ class HMBImageAssetLibrary(DataNode):
         raw = _parse_mapping(value)
         if not raw:
             return
-        normalized = _normalize_state(raw)
-        self._hmb_last_accepted_widget_state = _json_text(normalized)
+        normalized_state = _normalize_state(raw)
+        self._accept_normalized_widget_state_baseline(normalized_state)
+
+    def _accept_normalized_widget_state_baseline(
+        self,
+        normalized_state: Dict[str, Any],
+        serialized: str = "",
+    ) -> None:
+        self._hmb_last_accepted_widget_state = serialized or _json_text(normalized_state)
         self._hmb_last_accepted_widget_revisions = (
-            _non_negative_int(normalized.get("scan_revision")),
-            _non_negative_int(normalized.get(UI_EDIT_REVISION_KEY)),
+            _non_negative_int(normalized_state.get("scan_revision")),
+            _non_negative_int(normalized_state.get(UI_EDIT_REVISION_KEY)),
         )
         self._hmb_last_accepted_thumbnail_revision = _non_negative_int(
-            normalized.get("thumbnail_revision")
+            normalized_state.get("thumbnail_revision")
         )
 
     def _widget_state_is_stale(self, value: Any) -> bool:
@@ -6739,6 +7939,8 @@ class HMBImageAssetLibrary(DataNode):
             or _non_negative_int(raw.get("scan_revision"))
             != _non_negative_int(cached_raw.get("scan_revision"))
             or _clean(raw.get("project_uid")) != _clean(cached_raw.get("project_uid"))
+            or _clean(raw.get("project_cache_uid"))
+            != _clean(cached_raw.get("project_cache_uid"))
             or _clean(raw.get("manifest_signature"))
             != _clean(cached_raw.get("manifest_signature"))
         ):
@@ -6817,8 +8019,10 @@ class HMBImageAssetLibrary(DataNode):
         state: Dict[str, Any],
         *,
         force: bool = False,
+        normalized: bool = False,
     ) -> Dict[str, Any]:
-        normalized = _normalize_state(state)
+        normalized_state = state if normalized else _normalize_state(state)
+        normalized = normalized_state
         resolution_cache = getattr(self, "_hmb_resolution_cache", None)
         if not isinstance(resolution_cache, OrderedDict):
             resolution_cache = OrderedDict()
@@ -6865,7 +8069,10 @@ class HMBImageAssetLibrary(DataNode):
                 else None
             )
             cached_asset_output, cached_media_output = cached_pair
-            shot_snapshot = self._cache_shot_routing_snapshot(normalized)
+            shot_snapshot = self._cache_shot_routing_snapshot(
+                normalized,
+                normalized=True,
+            )
             shot_token = self._shot_asset_dependency_token(shot_snapshot)
             current_shot_output = (
                 output_getter(SHOT_ASSET_OUTPUT_PARAMETER)
@@ -6906,6 +8113,7 @@ class HMBImageAssetLibrary(DataNode):
             resolution_cache=resolution_cache,
             import_revision=import_revision,
             force=force,
+            normalized=True,
         )
         asset_output_value = _json_text(output_payload)
         media_output_value = (
@@ -6936,7 +8144,7 @@ class HMBImageAssetLibrary(DataNode):
             else None
         )
         shot_snapshot = self._cache_shot_routing_snapshot(
-            normalized, force=force
+            normalized, force=force, normalized=True
         )
         _stage_and_notify_image_output_pair(
             self,
@@ -6946,11 +8154,138 @@ class HMBImageAssetLibrary(DataNode):
         )
         return normalized
 
-    def _publish_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
+    @staticmethod
+    def _thumbnail_runtime_id(state: Dict[str, Any]) -> str:
+        return _clean(
+            state.get("shot_routing", {}).get("publisher_instance_uuid")
+            if isinstance(state.get("shot_routing"), dict)
+            else ""
+        )
+
+    def _set_thumbnail_bridge_value(self, value: Dict[str, Any]) -> None:
+        normalized = _normalize_thumbnail_bridge(value)
+        self._hmb_thumbnail_bridge_syncing = True
+        try:
+            publisher = getattr(self, "publish_update_to_parameter", None)
+            if callable(publisher):
+                # Stage the hidden property without emitting the full node
+                # state, then publish exactly the compact bridge envelope.
+                # Unlike the generic compatibility helper, this path must not
+                # silently fall back to changing only Parameter.default_value:
+                # doing so produces no lifecycle event and leaves the browser
+                # loader waiting forever.
+                try:
+                    self.set_parameter_value(
+                        THUMBNAIL_PATCH_PARAMETER,
+                        normalized,
+                        emit_change=False,
+                        skip_before_value_set=True,
+                    )
+                except TypeError:
+                    self.set_parameter_value(
+                        THUMBNAIL_PATCH_PARAMETER,
+                        normalized,
+                    )
+                publisher(THUMBNAIL_PATCH_PARAMETER, normalized)
+            else:
+                # Legacy/unit hosts have no explicit compact publisher. Keep
+                # their ordinary setter semantics so existing tests and saved
+                # workflows remain operable.
+                _set_parameter_value(
+                    self,
+                    THUMBNAIL_PATCH_PARAMETER,
+                    normalized,
+                )
+        finally:
+            self._hmb_thumbnail_bridge_syncing = False
+
+    def _sync_thumbnail_bridge_identity(self, state: Dict[str, Any]) -> None:
+        runtime_id = self._thumbnail_runtime_id(state)
+        current = _normalize_thumbnail_bridge(
+            _get_parameter_raw(self, THUMBNAIL_PATCH_PARAMETER)
+        )
+        if _clean(current.get("runtime_instance_id")) != runtime_id:
+            self._set_thumbnail_bridge_value(
+                _default_thumbnail_bridge(runtime_id)
+            )
+
+    def _store_thumbnail_state_silently(
+        self,
+        state: Dict[str, Any],
+        *,
+        normalized: bool = False,
+    ) -> Dict[str, Any]:
+        normalized_state = state if normalized else _normalize_state(state)
+        _store_shared_catalog_snapshot(normalized_state, normalized=True)
+        serialized = _json_text(normalized_state)
+        self._accept_normalized_widget_state_baseline(normalized_state, serialized)
+        self._hmb_state_syncing = True
+        try:
+            self.set_parameter_value(
+                WIDGET_STATE_PARAMETER,
+                serialized,
+                emit_change=False,
+                skip_before_value_set=True,
+            )
+        finally:
+            self._hmb_state_syncing = False
+        return normalized_state
+
+    def _publish_thumbnail_bridge_result(
+        self,
+        state: Dict[str, Any],
+        request: Dict[str, Any],
+    ) -> None:
+        result = state.get("thumbnail_result")
+        result = result if isinstance(result, dict) else {}
+        completed_ids = {
+            _clean(item)
+            for item in result.get("completed_asset_library_ids", [])
+            if _clean(item)
+        }
+        entries = [
+            {
+                "asset_library_id": _clean(asset.get("asset_library_id")),
+                "source_uid": _clean(asset.get("source_uid")),
+                "media_signature": _clean(asset.get("media_signature")),
+                "thumbnail_url": _clean(asset.get("thumbnail_url")),
+            }
+            for asset in state.get("assets", [])
+            if isinstance(asset, dict)
+            and _clean(asset.get("asset_library_id")) in completed_ids
+            and _clean(asset.get("thumbnail_url"))
+        ]
+        self._set_thumbnail_bridge_value(
+            {
+                "schema": THUMBNAIL_BRIDGE_SCHEMA,
+                "version": THUMBNAIL_BRIDGE_VERSION,
+                "runtime_instance_id": self._thumbnail_runtime_id(state),
+                "operation": "hydrate",
+                "phase": "result",
+                "request_id": request.get("request_id"),
+                "project_uid": state.get("project_uid"),
+                "project_cache_uid": state.get("project_cache_uid"),
+                "manifest_signature": state.get("manifest_signature"),
+                "scan_revision": state.get("scan_revision"),
+                "thumbnail_revision": state.get("thumbnail_revision"),
+                "completed_assets": entries,
+                "failed_asset_library_ids": result.get(
+                    "failed_asset_library_ids", []
+                ),
+            }
+        )
+
+    def _publish_state(
+        self,
+        state: Dict[str, Any],
+        *,
+        normalized: bool = False,
+    ) -> Dict[str, Any]:
         state = dict(state)
         state["asset_registration_request"] = {}
         state["disconnect_import_uid"] = ""
-        normalized = _normalize_state(state)
+        normalized_state = state if normalized else _normalize_state(state)
+        normalized = normalized_state
         pending_only = bool(
             normalized.get("scan_busy") or normalized.get("thumbnail_busy")
         )
@@ -6959,8 +8294,7 @@ class HMBImageAssetLibrary(DataNode):
             # cache retains media while widget state receives hashes/counts only.
             # A busy acknowledgement deliberately keeps the last staged outputs:
             # it must be paintable without touching a manifest, image, or share.
-            self._cache_shot_routing_snapshot(normalized)
-        self._accept_widget_state_baseline(normalized)
+            self._cache_shot_routing_snapshot(normalized, normalized=True)
         catalog_root = _project_root_text(normalized.get("catalog_root"))
         current_root = _project_root_text(
             _get_parameter_raw(self, PROJECT_ROOT_PARAMETER)
@@ -6979,12 +8313,17 @@ class HMBImageAssetLibrary(DataNode):
                 )
             finally:
                 self._hmb_root_syncing = False
+        serialized = _json_text(normalized)
+        self._accept_normalized_widget_state_baseline(
+            normalized,
+            serialized,
+        )
         self._hmb_state_syncing = True
         try:
             _set_parameter_value(
                 self,
                 WIDGET_STATE_PARAMETER,
-                _json_text(normalized),
+                serialized,
             )
         finally:
             self._hmb_state_syncing = False
@@ -6992,10 +8331,11 @@ class HMBImageAssetLibrary(DataNode):
             normalized.get("refresh_revision")
         )
         if not pending_only:
-            normalized = self._sync_output(normalized)
+            normalized = self._sync_output(normalized, normalized=True)
             self._reconcile_hmb_shot_routing(
-                _shot_routing_catalog_identity(normalized)
+                _shot_routing_catalog_identity(normalized, normalized=True)
             )
+        self._sync_thumbnail_bridge_identity(normalized)
         return normalized
 
     def _scan_owner_is_current(self) -> bool:
@@ -7047,17 +8387,305 @@ class HMBImageAssetLibrary(DataNode):
             self._hmb_thumbnail_thread = None
         if not hasattr(self, "_hmb_thumbnail_pending_result"):
             self._hmb_thumbnail_pending_result = None
+        if not hasattr(self, "_hmb_thumbnail_queued_bridge_request"):
+            self._hmb_thumbnail_queued_bridge_request = None
         if not hasattr(self, "_hmb_node_deleted"):
             self._hmb_node_deleted = False
+
+    def _ensure_catalog_probe_runtime_state(self) -> None:
+        if not hasattr(self, "_hmb_catalog_probe_lock"):
+            self._hmb_catalog_probe_lock = threading.RLock()
+        if not hasattr(self, "_hmb_catalog_probe_generation"):
+            self._hmb_catalog_probe_generation = 0
+        if not hasattr(self, "_hmb_catalog_probe_pending_key"):
+            self._hmb_catalog_probe_pending_key = ""
+        if not hasattr(self, "_hmb_catalog_probe_thread"):
+            self._hmb_catalog_probe_thread = None
+        if not hasattr(self, "_hmb_catalog_probe_pending_result"):
+            self._hmb_catalog_probe_pending_result = None
+        if not hasattr(self, "_hmb_catalog_probe_last_manifest_at"):
+            self._hmb_catalog_probe_last_manifest_at = 0.0
+        if not hasattr(self, "_hmb_catalog_probe_last_folder_at"):
+            self._hmb_catalog_probe_last_folder_at = 0.0
+        if not hasattr(self, "_hmb_catalog_probe_pending_folder_signature"):
+            self._hmb_catalog_probe_pending_folder_signature = ""
+        if not hasattr(self, "_hmb_catalog_probe_pending_folder_since"):
+            self._hmb_catalog_probe_pending_folder_since = 0.0
+        if not hasattr(self, "_hmb_node_deleted"):
+            self._hmb_node_deleted = False
+
+    def _catalog_probe_result_envelope(
+        self,
+        request: Dict[str, Any],
+        outcome: str,
+        state: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        current = state if isinstance(state, dict) else self._current_state()
+        return {
+            "schema": THUMBNAIL_BRIDGE_SCHEMA,
+            "version": THUMBNAIL_BRIDGE_VERSION,
+            "operation": CATALOG_PROBE_OPERATION,
+            "phase": "result",
+            "request_id": _clean(request.get("request_id")),
+            "runtime_instance_id": _clean(request.get("runtime_instance_id")),
+            "project_uid": _clean(current.get("project_uid")),
+            "project_cache_uid": _clean(current.get("project_cache_uid")),
+            "project_root": _clean(current.get("project_root")),
+            "manifest_signature": _clean(current.get("manifest_signature")),
+            "folder_signature": _clean(current.get("folder_signature")),
+            "scan_revision": _non_negative_int(current.get("scan_revision")),
+            "probe_kind": (
+                "folder"
+                if _clean(request.get("probe_kind")).casefold() == "folder"
+                else "manifest"
+            ),
+            "outcome": outcome,
+        }
+
+    def _compute_catalog_probe(
+        self,
+        state: Dict[str, Any],
+        request: Dict[str, Any],
+    ) -> tuple[str, Dict[str, Any] | None]:
+        """Probe metadata only; return a full state solely after a real change."""
+
+        project_root_text = _clean(state.get("project_root"))
+        if not project_root_text:
+            return "no_change", None
+        now = time.monotonic()
+        probe_kind = _clean(request.get("probe_kind")).casefold()
+        if probe_kind == "folder":
+            pending_signature = _clean(
+                self._hmb_catalog_probe_pending_folder_signature
+            )
+            if (
+                not pending_signature
+                and now - self._hmb_catalog_probe_last_folder_at
+                < CATALOG_PROBE_FOLDER_SECONDS
+            ):
+                return "deferred", None
+            signature = _project_folder_metadata_signature(project_root_text)
+            self._hmb_catalog_probe_last_folder_at = now
+            current_signature = _clean(state.get("folder_signature"))
+            if not current_signature:
+                state = dict(state)
+                state["folder_signature"] = signature
+                return "changed", _normalize_state(state)
+            if signature == current_signature:
+                self._hmb_catalog_probe_pending_folder_signature = ""
+                self._hmb_catalog_probe_pending_folder_since = 0.0
+                return "no_change", None
+            if pending_signature != signature:
+                self._hmb_catalog_probe_pending_folder_signature = signature
+                self._hmb_catalog_probe_pending_folder_since = now
+                # Confirm a raw copy/replace once inside this background worker.
+                # This preserves the one-second stable-write guard without
+                # making the browser wait for the next 10-second folder poll.
+                time.sleep(CATALOG_PROBE_STABLE_WRITE_SECONDS + 0.05)
+                confirmed_signature = _project_folder_metadata_signature(
+                    project_root_text
+                )
+                confirmed_at = time.monotonic()
+                self._hmb_catalog_probe_last_folder_at = confirmed_at
+                if confirmed_signature != signature:
+                    self._hmb_catalog_probe_pending_folder_signature = (
+                        confirmed_signature
+                    )
+                    self._hmb_catalog_probe_pending_folder_since = confirmed_at
+                    return "deferred", None
+                signature = confirmed_signature
+                now = confirmed_at
+            if (
+                now - self._hmb_catalog_probe_pending_folder_since
+                < CATALOG_PROBE_STABLE_WRITE_SECONDS
+            ):
+                return "deferred", None
+        else:
+            if (
+                now - self._hmb_catalog_probe_last_manifest_at
+                < CATALOG_PROBE_MANIFEST_SECONDS
+            ):
+                return "deferred", None
+            self._hmb_catalog_probe_last_manifest_at = now
+            signature = _asset_manifest_signature(Path(project_root_text))
+            if signature == _clean(state.get("manifest_signature")):
+                return "no_change", None
+
+        refreshed_scan = _scan_project_assets(project_root_text)
+        refreshed = _merge_scan_with_state(refreshed_scan, state)
+        refreshed["catalog_root"] = state["catalog_root"]
+        refreshed["projects"] = state["projects"]
+        self._hmb_catalog_probe_pending_folder_signature = ""
+        self._hmb_catalog_probe_pending_folder_since = 0.0
+        return "changed", refreshed
+
+    def _consume_pending_catalog_probe_result(self) -> bool:
+        self._ensure_catalog_probe_runtime_state()
+        with self._hmb_catalog_probe_lock:
+            pending = self._hmb_catalog_probe_pending_result
+            if pending is None:
+                return False
+            generation, key, payload = pending
+            if (
+                generation != self._hmb_catalog_probe_generation
+                or key != self._hmb_catalog_probe_pending_key
+                or not self._scan_owner_is_current()
+            ):
+                self._hmb_catalog_probe_pending_result = None
+                self._hmb_catalog_probe_pending_key = ""
+                self._hmb_catalog_probe_thread = None
+                return False
+            self._hmb_catalog_probe_pending_result = None
+            self._hmb_catalog_probe_pending_key = ""
+            self._hmb_catalog_probe_thread = None
+        request = dict(payload.get("request") or {})
+        outcome = _clean(payload.get("outcome")) or "deferred"
+        result_state = payload.get("state")
+        live = self._current_state()
+        base = payload.get("base") if isinstance(payload.get("base"), dict) else {}
+        if any(
+            _clean(base.get(field)).replace("\\", "/").casefold()
+            != _clean(live.get(field)).replace("\\", "/").casefold()
+            for field in (
+                "catalog_root",
+                "project_root",
+                "project_cache_uid",
+                "manifest_signature",
+            )
+        ) or _non_negative_int(base.get("scan_revision")) != _non_negative_int(
+            live.get("scan_revision")
+        ):
+            return False
+        if outcome == "changed" and isinstance(result_state, dict):
+            result_state = _merge_async_scan_result_with_live_state(
+                result_state,
+                base or live,
+                live,
+            )
+            result_state["scan_busy"] = False
+            result_state = self._publish_completed_catalog_scan(
+                result_state,
+                f"probe:{key}",
+            )
+        else:
+            result_state = self._current_state()
+        self._set_thumbnail_bridge_value(
+            self._catalog_probe_result_envelope(request, outcome, result_state)
+        )
+        return True
+
+    def _schedule_catalog_probe(
+        self,
+        request: Dict[str, Any],
+        state: Dict[str, Any],
+    ) -> None:
+        """Run one bounded compact probe; never publish unchanged full state."""
+
+        self._ensure_catalog_probe_runtime_state()
+        key = _clean(request.get("request_id"))[:128]
+        with self._hmb_catalog_probe_lock:
+            if self._hmb_catalog_probe_pending_key:
+                self._set_thumbnail_bridge_value(
+                    self._catalog_probe_result_envelope(request, "deferred", state)
+                )
+                return
+            self._hmb_catalog_probe_generation += 1
+            generation = self._hmb_catalog_probe_generation
+            self._hmb_catalog_probe_pending_key = key
+            self._hmb_catalog_probe_pending_result = None
+        base = _normalize_state(state)
+        node_ref = weakref.ref(self)
+
+        def worker() -> None:
+            owner = node_ref()
+            if owner is None:
+                return
+            try:
+                outcome, result_state = owner._compute_catalog_probe(base, request)
+            except Exception as exc:
+                outcome, result_state = "offline", None
+                message = _clean(exc)
+                if message != getattr(owner, "_hmb_last_manifest_poll_error", ""):
+                    _diagnostic_warning("Shared catalog probe retained last snapshot", exc)
+                    owner._hmb_last_manifest_poll_error = message
+            owner = node_ref()
+            if owner is None:
+                return
+            with owner._hmb_catalog_probe_lock:
+                if (
+                    generation != owner._hmb_catalog_probe_generation
+                    or key != owner._hmb_catalog_probe_pending_key
+                    or bool(getattr(owner, "_hmb_node_deleted", False))
+                ):
+                    return
+                owner._hmb_catalog_probe_pending_result = (
+                    generation,
+                    key,
+                    {
+                        "request": dict(request),
+                        "outcome": outcome,
+                        "state": result_state,
+                        "base": base,
+                    },
+                )
+
+        thread = threading.Thread(
+            target=worker,
+            name=f"HMBImageAssetCatalogProbe-{generation}",
+            daemon=True,
+        )
+        with self._hmb_catalog_probe_lock:
+            self._hmb_catalog_probe_thread = thread
+        thread.start()
+
+    def _drain_queued_thumbnail_bridge_request(self) -> bool:
+        """Start the latest compact request deferred by thumbnail single-flight."""
+
+        self._ensure_thumbnail_runtime_state()
+        with self._hmb_thumbnail_lock:
+            if self._hmb_thumbnail_pending_key:
+                return False
+            queued = self._hmb_thumbnail_queued_bridge_request
+            self._hmb_thumbnail_queued_bridge_request = None
+        if not isinstance(queued, dict):
+            return False
+        current = self._current_state()
+        if (
+            _clean(queued.get("runtime_instance_id"))
+            != self._thumbnail_runtime_id(current)
+            or _clean(queued.get("project_uid"))
+            != _clean(current.get("project_uid"))
+            or _clean(queued.get("manifest_signature"))
+            != _clean(current.get("manifest_signature"))
+            or _non_negative_int(queued.get("scan_revision"))
+            != _non_negative_int(current.get("scan_revision"))
+        ):
+            return False
+        self._schedule_thumbnail_hydration(
+            current,
+            queued,
+            compact_bridge=True,
+            candidate_normalized=True,
+            request_normalized=True,
+        )
+        return True
 
     def _schedule_thumbnail_hydration(
         self,
         candidate_state: Dict[str, Any],
         request_value: Any,
+        *,
+        compact_bridge: bool = False,
+        candidate_normalized: bool = False,
+        request_normalized: bool = False,
     ) -> Dict[str, Any]:
         """Hydrate one bounded batch off-thread with its own stale generation."""
 
-        request = _normalize_thumbnail_request(request_value)
+        request = (
+            dict(request_value)
+            if request_normalized and isinstance(request_value, dict)
+            else _normalize_thumbnail_request(request_value)
+        )
         if not request:
             return _normalize_state(candidate_state)
         self._ensure_thumbnail_runtime_state()
@@ -7070,75 +8698,173 @@ class HMBImageAssetLibrary(DataNode):
                 # after this active bounded batch completes.
                 active_request = True
                 generation = self._hmb_thumbnail_generation
+                if (
+                    compact_bridge
+                    and key != self._hmb_thumbnail_pending_key
+                ):
+                    # A remount may replace the browser's pending request while
+                    # the previous decoder batch is still active. Retain only
+                    # the latest compact intent and start it after completion;
+                    # otherwise the old result is rejected by the new request
+                    # ID and the loader can wait forever.
+                    self._hmb_thumbnail_queued_bridge_request = dict(request)
             else:
                 self._hmb_thumbnail_generation += 1
                 generation = self._hmb_thumbnail_generation
                 self._hmb_thumbnail_pending_key = key
                 self._hmb_thumbnail_pending_result = None
+                # A queued request from an older completed flight must never
+                # run after this newer flight. This closes the small interval
+                # between completion and deferred-queue draining.
+                self._hmb_thumbnail_queued_bridge_request = None
         if active_request:
             current = dict(self._current_state())
             current["thumbnail_request"] = {}
-            current["thumbnail_busy"] = True
-            return _normalize_state(current)
+            if not compact_bridge:
+                current["thumbnail_busy"] = True
+            return current
 
-        hydration_base = _normalize_state(candidate_state)
+        hydration_base = (
+            candidate_state
+            if candidate_normalized
+            else _normalize_state(candidate_state)
+        )
         hydration_base["thumbnail_request"] = {}
         busy = dict(hydration_base)
         busy["thumbnail_busy"] = True
         busy["thumbnail_result"] = {}
-        busy = _normalize_state(busy)
         node_ref = weakref.ref(self)
-        event_loop = None
-        try:
-            event_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            event_loop = None
-        except Exception as exc:
-            _diagnostic_exception("Thumbnail hydration event-loop lookup", exc)
-        if event_loop is None:
+        def resolve_host_event_loop(preferred: Any = None) -> Any:
+            """Return only a live engine loop without constructing an Engine.
+
+            Retained-mode value callbacks can be dispatched from a synchronous
+            request thread, so ``asyncio.get_running_loop()`` alone is not a
+            sufficient host contract.  EventManager owns the engine loop and
+            exposes it specifically for cross-thread scheduling.
+            """
+
+            candidates: List[Any] = []
+            if preferred is not None:
+                candidates.append(preferred)
+            try:
+                candidates.append(asyncio.get_running_loop())
+            except RuntimeError:
+                pass
+            except Exception as exc:
+                _diagnostic_exception("Thumbnail hydration event-loop lookup", exc)
             try:
                 from griptape_nodes.retained_mode.engine import has_current_engine  # type: ignore
                 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes  # type: ignore
 
                 if has_current_engine():
-                    event_loop = GriptapeNodes.EventManager().event_loop
+                    candidates.append(GriptapeNodes.EventManager().event_loop)
             except ImportError:
-                event_loop = None
+                pass
             except Exception as exc:
                 _diagnostic_exception(
                     "Active thumbnail hydration event-loop lookup",
                     exc,
                 )
+            seen: set[int] = set()
+            for candidate in candidates:
+                if candidate is None or id(candidate) in seen:
+                    continue
+                seen.add(id(candidate))
+                try:
+                    if candidate.is_running() and not candidate.is_closed():
+                        return candidate
+                except Exception:
+                    continue
+            return None
+
+        event_loop = resolve_host_event_loop()
+        host_context = contextvars.copy_context()
 
         def apply_result(result: Dict[str, Any]) -> None:
             owner = node_ref()
             if owner is None:
                 return
             with owner._hmb_thumbnail_lock:
-                is_current = (
+                generation_matches = (
                     generation == owner._hmb_thumbnail_generation
                     and key == owner._hmb_thumbnail_pending_key
-                    and owner._scan_owner_is_current()
                 )
-                if not is_current:
+                if not generation_matches:
+                    return
+                if not owner._scan_owner_is_current():
+                    # A deleted/replaced same-name node must not retain a dead
+                    # single-flight slot that can later drain into a new node.
+                    owner._hmb_thumbnail_pending_key = ""
+                    owner._hmb_thumbnail_pending_result = None
+                    owner._hmb_thumbnail_thread = None
+                    owner._hmb_thumbnail_queued_bridge_request = None
+                    return
+            try:
+                merged = _merge_async_thumbnail_result_with_live_state(
+                    result,
+                    hydration_base,
+                    owner._current_state(),
+                    request,
+                    inputs_normalized=True,
+                    request_normalized=True,
+                )
+                _store_shared_catalog_snapshot(merged, normalized=True)
+                if compact_bridge:
+                    merged = owner._store_thumbnail_state_silently(
+                        merged,
+                        normalized=True,
+                    )
+                    owner._publish_thumbnail_bridge_result(merged, request)
+                else:
+                    owner._publish_state(merged, normalized=True)
+            except Exception as exc:
+                # Keep the immutable worker result retrievable.  The next
+                # retained-mode callback (including the browser watchdog's
+                # idempotent same-request probe) can safely drain it on the
+                # engine thread instead of leaving the UI permanently busy.
+                _diagnostic_exception(
+                    "Thumbnail completion publication failed",
+                    exc,
+                )
+                with owner._hmb_thumbnail_lock:
+                    if (
+                        generation == owner._hmb_thumbnail_generation
+                        and key == owner._hmb_thumbnail_pending_key
+                        and not bool(getattr(owner, "_hmb_node_deleted", False))
+                    ):
+                        owner._hmb_thumbnail_pending_result = (
+                            generation,
+                            key,
+                            {
+                                "state": result,
+                                "base": hydration_base,
+                                "request": request,
+                                "compact_bridge": compact_bridge,
+                            },
+                        )
+                return
+            with owner._hmb_thumbnail_lock:
+                if (
+                    generation != owner._hmb_thumbnail_generation
+                    or key != owner._hmb_thumbnail_pending_key
+                ):
                     return
                 owner._hmb_thumbnail_pending_key = ""
                 owner._hmb_thumbnail_thread = None
                 owner._hmb_thumbnail_pending_result = None
-            merged = _merge_async_thumbnail_result_with_live_state(
-                result,
-                hydration_base,
-                owner._current_state(),
-                request,
-            )
-            owner._publish_state(merged)
+            owner._drain_queued_thumbnail_bridge_request()
 
         def worker() -> None:
             owner = node_ref()
             if owner is None:
                 return
             try:
-                result = _hydrate_asset_thumbnails(hydration_base, request)
+                result = _hydrate_asset_thumbnails(
+                    hydration_base,
+                    request,
+                    normalized=True,
+                    request_normalized=True,
+                )
             except Exception as exc:
                 result = dict(hydration_base)
                 result["thumbnail_busy"] = False
@@ -7148,6 +8874,10 @@ class HMBImageAssetLibrary(DataNode):
                 result["thumbnail_result"] = {
                     "request_id": request["request_id"],
                     "project_uid": request["project_uid"],
+                    "project_cache_uid": _clean(
+                        request.get("project_cache_uid")
+                        or hydration_base.get("project_cache_uid")
+                    ),
                     "manifest_signature": request["manifest_signature"],
                     "scan_revision": request["scan_revision"],
                     "completed_asset_library_ids": [],
@@ -7155,7 +8885,6 @@ class HMBImageAssetLibrary(DataNode):
                         request["asset_library_ids"]
                     ),
                 }
-                result = _normalize_state(result)
                 _diagnostic_exception("Background thumbnail hydration failed", exc)
             owner = node_ref()
             if owner is None:
@@ -7168,19 +8897,10 @@ class HMBImageAssetLibrary(DataNode):
                 )
             if not is_current:
                 return
-            try:
-                if (
-                    event_loop is not None
-                    and event_loop.is_running()
-                    and not getattr(event_loop, "is_closed", lambda: False)()
-                ):
-                    event_loop.call_soon_threadsafe(apply_result, result)
-                    return
-            except Exception as exc:
-                _diagnostic_exception(
-                    "Background thumbnail result queue unavailable",
-                    exc,
-                )
+            # Store the immutable completion before queueing it to the host.
+            # ``call_soon_threadsafe`` may accept a callback immediately before
+            # its loop is stopped/replaced; retaining this copy lets the next
+            # official value callback/watchdog probe finish the same request.
             with owner._hmb_thumbnail_lock:
                 if (
                     generation == owner._hmb_thumbnail_generation
@@ -7194,8 +8914,45 @@ class HMBImageAssetLibrary(DataNode):
                             "state": result,
                             "base": hydration_base,
                             "request": request,
+                            "compact_bridge": compact_bridge,
                         },
                     )
+            # Resolve the manager-owned loop again after decoding.  Some hosts
+            # deliver the request during a short bootstrap/remount interval in
+            # which the loop was not yet observable at scheduling time.
+            for retry_delay in (0.0, 0.02, 0.08, 0.20):
+                if retry_delay:
+                    time.sleep(retry_delay)
+                completion_loop = host_context.copy().run(
+                    resolve_host_event_loop,
+                    event_loop,
+                )
+                if completion_loop is None:
+                    continue
+                try:
+                    try:
+                        completion_loop.call_soon_threadsafe(
+                            apply_result,
+                            result,
+                            context=host_context.copy(),
+                        )
+                    except TypeError:
+                        # Python/legacy loop compatibility; current bundled
+                        # hosts support the explicit context argument. Keep
+                        # the captured host identity on older loops as well.
+                        completion_loop.call_soon_threadsafe(
+                            host_context.copy().run,
+                            apply_result,
+                            result,
+                        )
+                    return
+                except Exception as exc:
+                    _diagnostic_exception(
+                        "Background thumbnail result queue unavailable",
+                        exc,
+                    )
+            # No loop accepted the callback. The pre-stored result remains
+            # available to the next retained-mode callback.
 
         with self._hmb_thumbnail_lock:
             if (
@@ -7220,23 +8977,55 @@ class HMBImageAssetLibrary(DataNode):
             if pending is None:
                 return False
             generation, key, payload = pending
+            generation_matches = (
+                generation == self._hmb_thumbnail_generation
+                and key == self._hmb_thumbnail_pending_key
+            )
+            if not generation_matches:
+                self._hmb_thumbnail_pending_result = None
+                return False
+            if not self._scan_owner_is_current():
+                self._hmb_thumbnail_pending_result = None
+                self._hmb_thumbnail_pending_key = ""
+                self._hmb_thumbnail_thread = None
+                self._hmb_thumbnail_queued_bridge_request = None
+                return False
+        try:
+            merged = _merge_async_thumbnail_result_with_live_state(
+                payload.get("state"),
+                payload.get("base"),
+                self._current_state(),
+                payload.get("request"),
+                inputs_normalized=True,
+                request_normalized=True,
+            )
+            _store_shared_catalog_snapshot(merged, normalized=True)
+            if bool(payload.get("compact_bridge")):
+                merged = self._store_thumbnail_state_silently(
+                    merged,
+                    normalized=True,
+                )
+                self._publish_thumbnail_bridge_result(
+                    merged,
+                    payload.get("request") or {},
+                )
+            else:
+                self._publish_state(merged, normalized=True)
+        except Exception as exc:
+            # Leave the immutable completion retrievable for the next official
+            # retained-mode callback instead of losing its terminal event.
+            _diagnostic_exception("Pending thumbnail publication failed", exc)
+            return False
+        with self._hmb_thumbnail_lock:
             if (
                 generation != self._hmb_thumbnail_generation
                 or key != self._hmb_thumbnail_pending_key
-                or not self._scan_owner_is_current()
             ):
-                self._hmb_thumbnail_pending_result = None
                 return False
             self._hmb_thumbnail_pending_result = None
             self._hmb_thumbnail_pending_key = ""
             self._hmb_thumbnail_thread = None
-        merged = _merge_async_thumbnail_result_with_live_state(
-            payload.get("state"),
-            payload.get("base"),
-            self._current_state(),
-            payload.get("request"),
-        )
-        self._publish_state(merged)
+        self._drain_queued_thumbnail_bridge_request()
         return True
 
     def _schedule_catalog_scan(
@@ -7316,6 +9105,47 @@ class HMBImageAssetLibrary(DataNode):
                     "Active background project scan event-loop lookup",
                     exc,
                 )
+        host_context = contextvars.copy_context()
+
+        def resolve_scan_event_loop(preferred: Any = None) -> Any:
+            """Re-resolve the official host loop without constructing Engine."""
+
+            candidates: List[Any] = []
+            if preferred is not None:
+                candidates.append(preferred)
+            try:
+                candidates.append(asyncio.get_running_loop())
+            except RuntimeError:
+                pass
+            except Exception as exc:
+                _diagnostic_exception(
+                    "Background project scan event-loop refresh",
+                    exc,
+                )
+            try:
+                from griptape_nodes.retained_mode.engine import has_current_engine  # type: ignore
+                from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes  # type: ignore
+
+                if has_current_engine():
+                    candidates.append(GriptapeNodes.EventManager().event_loop)
+            except ImportError:
+                pass
+            except Exception as exc:
+                _diagnostic_exception(
+                    "Active background project scan event-loop refresh",
+                    exc,
+                )
+            seen: set[int] = set()
+            for candidate in candidates:
+                if candidate is None or id(candidate) in seen:
+                    continue
+                seen.add(id(candidate))
+                try:
+                    if candidate.is_running() and not candidate.is_closed():
+                        return candidate
+                except Exception:
+                    continue
+            return None
 
         def apply_result(
             result: Dict[str, Any],
@@ -7325,29 +9155,62 @@ class HMBImageAssetLibrary(DataNode):
             if owner is None:
                 return
             with owner._hmb_scan_lock:
-                is_current = (
+                generation_matches = (
                     generation == owner._hmb_scan_generation
                     and key == owner._hmb_scan_pending_key
-                    and owner._scan_owner_is_current()
                 )
-                if not is_current:
+                if not generation_matches:
+                    return
+                if not owner._scan_owner_is_current():
+                    owner._hmb_scan_pending_key = ""
+                    owner._hmb_scan_thread = None
+                    owner._hmb_scan_pending_result = None
+                    return
+            worker_result = result
+            try:
+                live_state = owner._current_state()
+                merger = result_merger or _merge_async_scan_result_with_live_state
+                result = merger(worker_result, scan_base, live_state)
+                if (
+                    media_by_uid is not None
+                    and _non_negative_int(
+                        getattr(owner, "_hmb_import_revision", 0)
+                    ) == scan_import_revision
+                ):
+                    owner._replace_import_media(media_by_uid)
+                result["scan_busy"] = False
+                result["scan_request_id"] = request_id
+                owner._publish_completed_catalog_scan(result, key)
+            except Exception as exc:
+                _diagnostic_exception("Catalog completion publication failed", exc)
+                with owner._hmb_scan_lock:
+                    if (
+                        generation == owner._hmb_scan_generation
+                        and key == owner._hmb_scan_pending_key
+                        and not bool(getattr(owner, "_hmb_node_deleted", False))
+                    ):
+                        owner._hmb_scan_pending_result = (
+                            generation,
+                            key,
+                            request_id,
+                            {
+                                "state": worker_result,
+                                "media_by_uid": media_by_uid,
+                                "scan_base": scan_base,
+                                "scan_import_revision": scan_import_revision,
+                                "result_merger": result_merger,
+                            },
+                        )
+                return
+            with owner._hmb_scan_lock:
+                if (
+                    generation != owner._hmb_scan_generation
+                    or key != owner._hmb_scan_pending_key
+                ):
                     return
                 owner._hmb_scan_pending_key = ""
                 owner._hmb_scan_thread = None
                 owner._hmb_scan_pending_result = None
-            live_state = owner._current_state()
-            merger = result_merger or _merge_async_scan_result_with_live_state
-            result = merger(result, scan_base, live_state)
-            if (
-                media_by_uid is not None
-                and _non_negative_int(
-                    getattr(owner, "_hmb_import_revision", 0)
-                ) == scan_import_revision
-            ):
-                owner._replace_import_media(media_by_uid)
-            result["scan_busy"] = False
-            result["scan_request_id"] = request_id
-            owner._publish_completed_catalog_scan(result, key)
 
         def worker() -> None:
             owner = node_ref()
@@ -7387,41 +9250,59 @@ class HMBImageAssetLibrary(DataNode):
                 )
                 if not is_current:
                     return
-            try:
-                if (
-                    event_loop is not None
-                    and event_loop.is_running()
-                    and not getattr(event_loop, "is_closed", lambda: False)()
-                ):
-                    event_loop.call_soon_threadsafe(
-                        apply_result,
-                        result,
-                        media_by_uid,
-                    )
+                # Retain before enqueue for the same loop-stop race handled by
+                # thumbnail hydration. A later retained callback and the
+                # scheduled callback race on generation/key; only one can win.
+                owner._hmb_scan_pending_result = (
+                    generation,
+                    key,
+                    request_id,
+                    {
+                        "state": result,
+                        "media_by_uid": media_by_uid,
+                        "scan_base": scan_base,
+                        "scan_import_revision": scan_import_revision,
+                        "result_merger": result_merger,
+                    },
+                )
+            # The host loop can become observable shortly after a remount. Use
+            # the captured host ContextVar identity while re-resolving it, then
+            # marshal the completion exactly once onto that loop.
+            for retry_delay in (0.0, 0.02, 0.08, 0.20):
+                if retry_delay:
+                    time.sleep(retry_delay)
+                completion_loop = host_context.copy().run(
+                    resolve_scan_event_loop,
+                    event_loop,
+                )
+                if completion_loop is None:
+                    continue
+                try:
+                    try:
+                        completion_loop.call_soon_threadsafe(
+                            apply_result,
+                            result,
+                            media_by_uid,
+                            context=host_context.copy(),
+                        )
+                    except TypeError:
+                        completion_loop.call_soon_threadsafe(
+                            host_context.copy().run,
+                            apply_result,
+                            result,
+                            media_by_uid,
+                        )
                     return
-            except Exception as exc:
-                _diagnostic_exception("Background scan result queue unavailable", exc)
+                except Exception as exc:
+                    _diagnostic_exception(
+                        "Background scan result queue unavailable",
+                        exc,
+                    )
             # Never call retained-mode host APIs from the worker.
             # A host without a running event loop consumes this result on its
             # next retained-mode callback or explicit process().
-            with owner._hmb_scan_lock:
-                if (
-                    generation == owner._hmb_scan_generation
-                    and key == owner._hmb_scan_pending_key
-                    and not bool(getattr(owner, "_hmb_node_deleted", False))
-                ):
-                    owner._hmb_scan_pending_result = (
-                        generation,
-                        key,
-                        request_id,
-                        {
-                            "state": result,
-                            "media_by_uid": media_by_uid,
-                            "scan_base": scan_base,
-                            "scan_import_revision": scan_import_revision,
-                            "result_merger": result_merger,
-                        },
-                    )
+            # No loop accepted the callback. The pre-stored result remains
+            # available to the next retained-mode callback/process().
 
         def launch() -> None:
             owner = node_ref()
@@ -7457,36 +9338,51 @@ class HMBImageAssetLibrary(DataNode):
             if pending is None:
                 return False
             generation, key, request_id, payload = pending
+            generation_matches = (
+                generation == self._hmb_scan_generation
+                and key == self._hmb_scan_pending_key
+            )
+            if not generation_matches:
+                self._hmb_scan_pending_result = None
+                return False
+            if not self._scan_owner_is_current():
+                self._hmb_scan_pending_result = None
+                self._hmb_scan_pending_key = ""
+                self._hmb_scan_thread = None
+                return False
+        try:
+            live_state = self._current_state()
+            merger = payload.get("result_merger")
+            if not callable(merger):
+                merger = _merge_async_scan_result_with_live_state
+            result = merger(
+                payload.get("state"),
+                payload.get("scan_base"),
+                live_state,
+            )
+            media_by_uid = payload.get("media_by_uid")
+            if (
+                isinstance(media_by_uid, dict)
+                and _non_negative_int(
+                    getattr(self, "_hmb_import_revision", 0)
+                ) == _non_negative_int(payload.get("scan_import_revision"))
+            ):
+                self._replace_import_media(media_by_uid)
+            result["scan_busy"] = False
+            result["scan_request_id"] = request_id
+            self._publish_completed_catalog_scan(result, key)
+        except Exception as exc:
+            _diagnostic_exception("Pending catalog publication failed", exc)
+            return False
+        with self._hmb_scan_lock:
             if (
                 generation != self._hmb_scan_generation
                 or key != self._hmb_scan_pending_key
-                or not self._scan_owner_is_current()
             ):
-                self._hmb_scan_pending_result = None
                 return False
             self._hmb_scan_pending_result = None
             self._hmb_scan_pending_key = ""
             self._hmb_scan_thread = None
-        live_state = self._current_state()
-        merger = payload.get("result_merger")
-        if not callable(merger):
-            merger = _merge_async_scan_result_with_live_state
-        result = merger(
-            payload.get("state"),
-            payload.get("scan_base"),
-            live_state,
-        )
-        media_by_uid = payload.get("media_by_uid")
-        if (
-            isinstance(media_by_uid, dict)
-            and _non_negative_int(
-                getattr(self, "_hmb_import_revision", 0)
-            ) == _non_negative_int(payload.get("scan_import_revision"))
-        ):
-            self._replace_import_media(media_by_uid)
-        result["scan_busy"] = False
-        result["scan_request_id"] = request_id
-        self._publish_completed_catalog_scan(result, key)
         return True
 
     def _load_catalog(self, root_value: Any) -> Dict[str, Any]:
@@ -7516,6 +9412,17 @@ class HMBImageAssetLibrary(DataNode):
         """Acknowledge a picker edit immediately and discover it off-thread."""
 
         self._hmb_initial_catalog_scan_pending = False
+        self._ensure_catalog_probe_runtime_state()
+        with self._hmb_catalog_probe_lock:
+            # A probe belongs to the project snapshot captured when it started.
+            # Retire it before publishing a new catalog root so an old scan can
+            # never merge back over the user's new root selection.
+            self._hmb_catalog_probe_generation += 1
+            self._hmb_catalog_probe_pending_key = ""
+            self._hmb_catalog_probe_pending_result = None
+            self._hmb_catalog_probe_thread = None
+            self._hmb_catalog_probe_pending_folder_signature = ""
+            self._hmb_catalog_probe_pending_folder_since = 0.0
         requested_root = (
             _project_root_text(root_value) or str(DEFAULT_PROJECTS_ROOT)
         ).replace("\\", "/")
@@ -7791,7 +9698,11 @@ class HMBImageAssetLibrary(DataNode):
                 f"refresh:{requested_catalog.casefold()}:{_non_negative_int(state.get('refresh_revision'))}",
                 state,
                 lambda: self._merge_captured_imports_into_scan(
-                    _load_project_catalog(requested_catalog, state),
+                    _load_project_catalog(
+                        requested_catalog,
+                        state,
+                        use_shared_cache=False,
+                    ),
                     captured_import_value,
                 ),
             )
@@ -7844,6 +9755,8 @@ class HMBImageAssetLibrary(DataNode):
                 return self._schedule_thumbnail_hydration(
                     state,
                     thumbnail_request,
+                    candidate_normalized=True,
+                    request_normalized=True,
                 )
             # A repeated presentation request may ride along with a newer
             # selection/order edit while the single worker is active. Ignore
@@ -7860,12 +9773,118 @@ class HMBImageAssetLibrary(DataNode):
             self._reconcile_hmb_shot_routing(catalog_identity)
         return normalized
 
+    def _apply_thumbnail_bridge_request(self, value: Any) -> None:
+        self._consume_pending_catalog_probe_result()
+        bridge = _normalize_thumbnail_bridge(value)
+        if (
+            bridge.get("operation") == CATALOG_PROBE_OPERATION
+            and bridge.get("phase") == "request"
+            and _clean(bridge.get("request_id"))
+        ):
+            current = self._current_state()
+            runtime_id = self._thumbnail_runtime_id(current)
+            if _clean(bridge.get("runtime_instance_id")) != runtime_id:
+                return
+            if (
+                _clean(bridge.get("project_uid"))
+                != _clean(current.get("project_uid"))
+                or (
+                    _clean(bridge.get("project_cache_uid"))
+                    and _clean(bridge.get("project_cache_uid"))
+                    != _clean(current.get("project_cache_uid"))
+                )
+                or _clean(bridge.get("project_root")).replace("\\", "/").casefold()
+                != _clean(current.get("project_root")).replace("\\", "/").casefold()
+                or _clean(bridge.get("manifest_signature"))
+                != _clean(current.get("manifest_signature"))
+                or (
+                    _clean(bridge.get("folder_signature"))
+                    and _clean(bridge.get("folder_signature"))
+                    != _clean(current.get("folder_signature"))
+                )
+                or _non_negative_int(bridge.get("scan_revision"))
+                != _non_negative_int(current.get("scan_revision"))
+            ):
+                return
+            self._schedule_catalog_probe(bridge, current)
+            return
+        if (
+            bridge.get("operation") != "hydrate"
+            or bridge.get("phase") != "request"
+            or not _clean(bridge.get("request_id"))
+        ):
+            return
+        current = self._current_state()
+        runtime_id = self._thumbnail_runtime_id(current)
+        if _clean(bridge.get("runtime_instance_id")) != runtime_id:
+            return
+        if (
+            _clean(bridge.get("project_uid")) != _clean(current.get("project_uid"))
+            or (
+                _clean(bridge.get("project_cache_uid"))
+                and _clean(bridge.get("project_cache_uid"))
+                != _clean(current.get("project_cache_uid"))
+            )
+            or _clean(bridge.get("manifest_signature"))
+            != _clean(current.get("manifest_signature"))
+            or _non_negative_int(bridge.get("scan_revision"))
+            != _non_negative_int(current.get("scan_revision"))
+        ):
+            return
+        canonical_ids = {
+            _clean(asset.get("asset_library_id"))
+            for asset in current.get("assets", [])
+            if isinstance(asset, dict)
+            and _clean(asset.get("source_kind")).casefold() == "project"
+            and _clean(asset.get("asset_library_id"))
+        }
+        requested_ids = list(bridge.get("asset_library_ids", []))
+        if not requested_ids or any(item not in canonical_ids for item in requested_ids):
+            return
+        request = {
+            "runtime_instance_id": runtime_id,
+            "request_id": bridge["request_id"],
+            "project_uid": current["project_uid"],
+            "project_cache_uid": current["project_cache_uid"],
+            "manifest_signature": current["manifest_signature"],
+            "scan_revision": current["scan_revision"],
+            "asset_library_ids": requested_ids,
+        }
+        current_result = _normalize_thumbnail_result(
+            current.get("thumbnail_result")
+        )
+        if (
+            not bool(current.get("thumbnail_busy"))
+            and current_result.get("request_id") == request["request_id"]
+            and current_result.get("project_uid") == request["project_uid"]
+            and current_result.get("project_cache_uid")
+            == request["project_cache_uid"]
+            and current_result.get("manifest_signature")
+            == request["manifest_signature"]
+            and _non_negative_int(current_result.get("scan_revision"))
+            == _non_negative_int(request["scan_revision"])
+        ):
+            # Idempotent result retrieval. The browser watchdog may repeat the
+            # exact compact request if its first response was lost during a
+            # mount/update race. Re-publish the already completed envelope;
+            # never decode again or create a duplicate hydration worker.
+            self._publish_thumbnail_bridge_result(current, request)
+            return
+        self._schedule_thumbnail_hydration(
+            current,
+            request,
+            compact_bridge=True,
+            candidate_normalized=True,
+            request_normalized=True,
+        )
+
     def before_value_set(self, parameter: Any, value: Any) -> Any:
         if not bool(getattr(self, "_hmb_state_syncing", False)) and not bool(
             getattr(self, "_hmb_restoring_widget_state", False)
         ):
             self._consume_pending_catalog_scan_result()
             self._consume_pending_thumbnail_result()
+            self._consume_pending_catalog_probe_result()
         name = _clean(getattr(parameter, "name", ""))
         if name == WIDGET_STATE_PARAMETER:
             raw_state = dict(_parse_mapping(value))
@@ -7934,6 +9953,8 @@ class HMBImageAssetLibrary(DataNode):
             return _json_text(_normalize_state(candidate))
         if name == PROJECT_ROOT_PARAMETER:
             return _project_root_text(value)
+        if name == THUMBNAIL_PATCH_PARAMETER:
+            return _normalize_thumbnail_bridge(value)
         return value
 
     def after_value_set(self, parameter: Any, value: Any) -> Any:
@@ -7944,7 +9965,7 @@ class HMBImageAssetLibrary(DataNode):
                 result = parent(parameter, value)
         except Exception as exc:
             _diagnostic_exception("Parent after_value_set failed", exc)
-        if self._hmb_state_syncing:
+        if self._hmb_state_syncing or self._hmb_thumbnail_bridge_syncing:
             return result
         name = _clean(getattr(parameter, "name", ""))
         if name in {
@@ -7973,6 +9994,8 @@ class HMBImageAssetLibrary(DataNode):
                 if not self._hmb_state_syncing and not self._hmb_restoring_widget_state:
                     self._accept_widget_state_baseline(value)
                 self._apply_widget_state(value)
+            elif name == THUMBNAIL_PATCH_PARAMETER:
+                self._apply_thumbnail_bridge_request(value)
         finally:
             _end_image_output_side_effect_callback(self)
         return result
@@ -8067,11 +10090,25 @@ class HMBImageAssetLibrary(DataNode):
         self._ensure_parameters()
         self._ensure_scan_runtime_state()
         self._ensure_thumbnail_runtime_state()
+        self._ensure_catalog_probe_runtime_state()
+        with self._hmb_scan_lock:
+            # Constructor/initial-scan workers belong to the pre-hydration
+            # snapshot and must not overwrite the saved workflow or index.
+            self._hmb_scan_generation += 1
+            self._hmb_scan_pending_key = ""
+            self._hmb_scan_pending_result = None
+            self._hmb_scan_thread = None
         with self._hmb_thumbnail_lock:
             self._hmb_thumbnail_generation += 1
             self._hmb_thumbnail_pending_key = ""
             self._hmb_thumbnail_pending_result = None
             self._hmb_thumbnail_thread = None
+            self._hmb_thumbnail_queued_bridge_request = None
+        with self._hmb_catalog_probe_lock:
+            self._hmb_catalog_probe_generation += 1
+            self._hmb_catalog_probe_pending_key = ""
+            self._hmb_catalog_probe_pending_result = None
+            self._hmb_catalog_probe_thread = None
         self._hmb_initial_catalog_scan_pending = False
         self._hmb_fresh_registration_scan_key = ""
         saved_state = dict(self._current_state())
@@ -8117,18 +10154,32 @@ class HMBImageAssetLibrary(DataNode):
         import_value = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
         candidate_state = dict(saved_state)
         candidate_state["catalog_root"] = root_value.replace("\\", "/")
-        self._schedule_catalog_scan(
-            (
-                f"deserialize:{root_value.casefold()}:"
-                f"{_non_negative_int(saved_state.get('scan_revision'))}"
-            ),
-            candidate_state,
-            lambda: self._merge_captured_imports_into_scan(
-                _load_project_catalog(root_value, saved_state),
-                import_value,
-            ),
-            failure_state=candidate_state,
+        indexed_state = _read_catalog_index(
+            saved_state.get("project_root"),
+            saved_state,
         )
+        if indexed_state is not None:
+            indexed_state["catalog_root"] = root_value.replace("\\", "/")
+            indexed_state, indexed_media = self._merge_captured_imports_into_scan(
+                indexed_state,
+                import_value,
+            )
+            if isinstance(indexed_media, dict):
+                self._replace_import_media(indexed_media)
+            self._publish_state(indexed_state)
+        else:
+            self._schedule_catalog_scan(
+                (
+                    f"deserialize:{root_value.casefold()}:"
+                    f"{_non_negative_int(saved_state.get('scan_revision'))}"
+                ),
+                candidate_state,
+                lambda: self._merge_captured_imports_into_scan(
+                    _load_project_catalog(root_value, saved_state),
+                    import_value,
+                ),
+                failure_state=candidate_state,
+            )
         self._hmb_hydration_adopted = True
         self._schedule_post_hydration_shot_reconcile()
         return result
@@ -8180,6 +10231,12 @@ class HMBImageAssetLibrary(DataNode):
                 self._hmb_thumbnail_pending_key = ""
                 self._hmb_thumbnail_pending_result = None
                 self._hmb_thumbnail_thread = None
+                self._hmb_thumbnail_queued_bridge_request = None
+            with self._hmb_catalog_probe_lock:
+                self._hmb_catalog_probe_generation += 1
+                self._hmb_catalog_probe_pending_key = ""
+                self._hmb_catalog_probe_pending_result = None
+                self._hmb_catalog_probe_thread = None
         if first_delete and not bool(
             getattr(self, "_hmb_deletion_reconcile_called", False)
         ):
@@ -8206,11 +10263,50 @@ class HMBImageAssetLibrary(DataNode):
         self._hmb_hydration_adopted = True
         self._consume_pending_catalog_scan_result()
         self._consume_pending_thumbnail_result()
+        probe_consumer = getattr(self, "_consume_pending_catalog_probe_result", None)
+        if callable(probe_consumer):
+            probe_consumer()
         self._ensure_parameters()
-        root_value = _project_root_text(
-            _get_parameter_raw(self, PROJECT_ROOT_PARAMETER)
+        root_value = (
+            _project_root_text(
+                _get_parameter_raw(self, PROJECT_ROOT_PARAMETER)
+            )
+            or str(DEFAULT_PROJECTS_ROOT)
         )
-        state = self._load_catalog(root_value or str(DEFAULT_PROJECTS_ROOT))
+        current = self._current_state()
+        requested_catalog_identity = root_value.replace("\\", "/").rstrip("/").casefold()
+        current_catalog_identity = (
+            _project_root_text(current.get("catalog_root"))
+            .replace("\\", "/")
+            .rstrip("/")
+            .casefold()
+        )
+        catalog_root_matches = bool(
+            requested_catalog_identity
+            and requested_catalog_identity == current_catalog_identity
+        )
+        project_belongs_to_catalog = _state_project_belongs_to_catalog(
+            current,
+            root_value,
+        )
+        if (
+            catalog_root_matches
+            and project_belongs_to_catalog
+            and _state_catalog_is_current(current)
+        ):
+            state = current
+        elif catalog_root_matches and project_belongs_to_catalog:
+            indexed = _read_catalog_index(current.get("project_root"), current)
+            if indexed is not None:
+                state = self._publish_state(indexed)
+            else:
+                state = self._load_catalog(root_value)
+        else:
+            # PROJECT_ROOT is the process-time authority.  A programmatic host
+            # update may arrive without the retained widget callback, so an
+            # otherwise-current snapshot/index from the previous root must not
+            # be adopted here.
+            state = self._load_catalog(root_value)
         import_value = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
         if _flatten_import_values(import_value):
             self._apply_import_value(import_value)

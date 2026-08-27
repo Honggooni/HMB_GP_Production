@@ -14,7 +14,7 @@ from _hmb_private_policy_fixture import read_private_policy_fixture_if_available
 
 ROOT = Path(__file__).resolve().parents[2]
 PRODUCTION_CONTRACT_SHA256 = (
-    "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
+    "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
 )
 
 

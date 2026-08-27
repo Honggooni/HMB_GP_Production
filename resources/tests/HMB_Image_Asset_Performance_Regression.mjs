@@ -6,8 +6,13 @@ const ASSET_WIDGET_PATH = new URL(
   "../../widgets/HMBImageAssetLibraryWidget.js",
   import.meta.url,
 );
+const THUMBNAIL_BRIDGE_WIDGET_PATH = new URL(
+  "../../widgets/HMBImageAssetThumbnailPatchBridgeWidget.js",
+  import.meta.url,
+);
 const assetSource = fs.readFileSync(ASSET_WIDGET_PATH, "utf8");
 const assetWidget = await import(ASSET_WIDGET_PATH);
+const thumbnailBridgeWidget = await import(THUMBNAIL_BRIDGE_WIDGET_PATH);
 
 
 const makeSelectedTrayCard = (asset) => {
@@ -845,6 +850,284 @@ const thumbnailPlaceholderMarkup = assetWidget.hmbRenderImageAssetGrid(
 assert.match(thumbnailPlaceholderMarkup, /thumbnail-loading/);
 assert.match(thumbnailPlaceholderMarkup, /asset-thumb-placeholder/);
 
+// The staged placeholder is an inert eight-leaf clockwise indicator, never
+// the retired full-card shimmer. Keep the visual contract deterministic so a
+// later CSS cleanup cannot silently restore the expensive flashing overlay.
+const oneLoaderMarkup = assetWidget.hmbRenderImageAssetGrid(
+  assetWidget.hmbNormalizeImageAssetState({
+    project_uid: "leaf-loader-project",
+    assets: [selectableAsset("leaf-loader")],
+  }),
+).markup;
+assert.deepEqual(
+  Array.from(oneLoaderMarkup.matchAll(/--leaf-index:(\d+)/g), (match) => Number(match[1])),
+  [0, 1, 2, 3, 4, 5, 6, 7],
+  "Every missing thumbnail must render exactly eight ordered leaves.",
+);
+assert.match(assetSource, /--leaf-angle:calc\(var\(--leaf-index\) \* 45deg\)/);
+assert.match(assetSource, /animation-delay:calc\(var\(--leaf-index\) \* \.125s\)/);
+assert.match(
+  assetSource,
+  /\.hmb-image-leaf-loader\{[^}]*pointer-events:none/,
+  "The loader may not intercept card click or drag hit-testing.",
+);
+assert.match(
+  assetSource,
+  /\.thumbnail-loading \.thumbnail-placeholder,[^\n]*display:grid!important/,
+  "The loader wrapper must remain centered despite legacy fallback display rules.",
+);
+assert.match(
+  assetSource,
+  /\.hmb-image-leaf-loader\{[^}]*display:block!important/,
+  "The fixed-size leaf ring must not collapse as an inline span.",
+);
+assert.match(assetSource, /@media \(prefers-reduced-motion:reduce\)[\s\S]*?\.hmb-image-leaf-loader>i\{animation:none/);
+assert.doesNotMatch(assetSource, /@keyframes hmb-image-thumbnail-loading|background-position:120%/);
+
+// Exercise the real hidden bridge widget, not a hand-built request object.
+// Request and result share one schema and runtime identity; duplicate/stale
+// results are never delivered to the mounted ImageAsset consumer.
+const bridgeRuntimeId = "thumbnail-bridge-runtime";
+const bridgeRegistry = thumbnailBridgeWidget.hmbImageAssetThumbnailPatchBridgeRegistry();
+bridgeRegistry.clear();
+const deliveredBridgeResults = [];
+bridgeRegistry.set(bridgeRuntimeId, {
+  consumer(value) { deliveredBridgeResults.push(value); },
+  consumerToken: "test-consumer",
+});
+const bridgeStyles = new Map();
+const bridgeAttributes = new Map();
+const bridgeContainer = {
+  style: {
+    setProperty(name, value, priority) {
+      bridgeStyles.set(name, { value, priority });
+    },
+  },
+  setAttribute(name, value) { bridgeAttributes.set(name, String(value)); },
+};
+const bridgePublished = [];
+const bridgeController = thumbnailBridgeWidget.default(bridgeContainer, {
+  value: {
+    schema: "hmb-image-asset-thumbnail-bridge",
+    version: 1,
+    runtime_instance_id: bridgeRuntimeId,
+    operation: "idle",
+    phase: "idle",
+    request_id: "",
+  },
+  onChange(value) { bridgePublished.push(value); },
+});
+assert.equal(bridgeAttributes.get("aria-hidden"), "true");
+assert.equal(bridgeStyles.get("pointer-events")?.value, "none");
+const liveBridge = bridgeRegistry.get(bridgeRuntimeId);
+assert.equal(typeof liveBridge?.dispatch, "function");
+liveBridge.dispatch({
+  runtime_instance_id: bridgeRuntimeId,
+  request_id: "bridge-request",
+  project_uid: "bridge-project",
+  manifest_signature: "bridge-manifest",
+  scan_revision: 7,
+  asset_library_ids: ["bridge-a", "bridge-a", "bridge-b"],
+});
+assert.deepEqual(bridgePublished, [{
+  schema: "hmb-image-asset-thumbnail-bridge",
+  version: 1,
+  operation: "hydrate",
+  phase: "request",
+  runtime_instance_id: bridgeRuntimeId,
+  request_id: "bridge-request",
+  project_uid: "bridge-project",
+  manifest_signature: "bridge-manifest",
+  scan_revision: 7,
+  asset_library_ids: ["bridge-a", "bridge-b"],
+}]);
+const bridgeResult = {
+  schema: "hmb-image-asset-thumbnail-bridge",
+  version: 1,
+  operation: "hydrate",
+  phase: "result",
+  runtime_instance_id: bridgeRuntimeId,
+  request_id: "bridge-request",
+  project_uid: "bridge-project",
+  manifest_signature: "bridge-manifest",
+  scan_revision: 7,
+  thumbnail_revision: 1,
+  completed_assets: [],
+  failed_asset_library_ids: [],
+};
+bridgeController.update({ value: bridgeResult, onChange() {} });
+bridgeController.update({ value: bridgeResult, onChange() {} });
+bridgeController.update({
+  value: { ...bridgeResult, runtime_instance_id: "stale-runtime", thumbnail_revision: 2 },
+  onChange() {},
+});
+assert.deepEqual(deliveredBridgeResults, [bridgeResult]);
+bridgeController.cleanup();
+assert.equal(typeof bridgeRegistry.get(bridgeRuntimeId)?.dispatch, "undefined");
+assert.equal(typeof bridgeRegistry.get(bridgeRuntimeId)?.consumer, "function");
+assert.equal(
+  bridgeRegistry.get(bridgeRuntimeId)?.consumerToken,
+  "test-consumer",
+  "Bridge-first cleanup must preserve main-consumer ownership for later teardown.",
+);
+if (bridgeRegistry.get(bridgeRuntimeId)?.consumerToken === "test-consumer") {
+  bridgeRegistry.delete(bridgeRuntimeId);
+}
+assert.equal(
+  bridgeRegistry.has(bridgeRuntimeId),
+  false,
+  "The later main-consumer cleanup must be able to release the runtime entry.",
+);
+bridgeRegistry.clear();
+
+// With retained indexes already built, thumbnail completion is O(K): only the
+// addressed card is visited and the widget root is neither searched nor
+// replaced. A tiny DOM double is sufficient because this path must preserve
+// the existing card/root identities and morph only the thumbnail fragment.
+function thumbnailElement(className = "asset-thumb thumbnail-loading") {
+  const values = new Map([["class", className]]);
+  return {
+    nodeType: 1,
+    tagName: "DIV",
+    childNodes: [],
+    firstChild: null,
+    parentNode: null,
+    get attributes() {
+      return Array.from(values, ([name, value]) => ({ name, value }));
+    },
+    getAttribute(name) { return values.get(name) ?? null; },
+    hasAttribute(name) { return values.has(name); },
+    setAttribute(name, value) { values.set(name, String(value)); },
+    removeAttribute(name) { values.delete(name); },
+    matches() { return false; },
+  };
+}
+const targetThumbnail = thumbnailElement();
+const untouchedThumbnail = thumbnailElement("asset-thumb untouched");
+const targetCard = {
+  querySelector(selector) {
+    assert.equal(selector, ".asset-thumb");
+    return targetThumbnail;
+  },
+};
+let untouchedCardQueries = 0;
+const untouchedCard = {
+  querySelector() {
+    untouchedCardQueries += 1;
+    return untouchedThumbnail;
+  },
+};
+const patchOwnerDocument = {
+  createElement(tagName) {
+    assert.equal(tagName, "template");
+    const template = { content: { firstElementChild: null } };
+    Object.defineProperty(template, "innerHTML", {
+      set(markup) {
+        const className = String(markup).match(/class="([^"]+)"/)?.[1] || "asset-thumb";
+        template.content.firstElementChild = thumbnailElement(className);
+      },
+    });
+    return template;
+  },
+};
+targetThumbnail.ownerDocument = patchOwnerDocument;
+untouchedThumbnail.ownerDocument = patchOwnerDocument;
+let rootSearches = 0;
+let rootReplacements = 0;
+const targetOnlyContainer = {
+  __hmbImageAssetByLibraryId: new Map(),
+  __hmbImageAssetCardByLibraryId: new Map([
+    ["patch-target", targetCard],
+    ["patch-untouched", untouchedCard],
+  ]),
+  __hmbImageAssetSelectedCardByLibraryId: new Map(),
+  __hmbImageAssetCompactCardsByLibraryId: new Map(),
+  querySelectorAll() {
+    rootSearches += 1;
+    throw new Error("Indexed thumbnail completion performed a full DOM search.");
+  },
+  set innerHTML(_value) { rootReplacements += 1; },
+};
+const targetOnlyState = assetWidget.hmbNormalizeImageAssetState({
+  project_uid: "target-only-project",
+  assets: [
+    selectableAsset("patch-target", false, 0, { thumbnail_url: "data:image/png;base64,AA==" }),
+    selectableAsset("patch-untouched", false, 0, { thumbnail_url: "data:image/png;base64,BB==" }),
+  ],
+});
+targetOnlyState.assets.forEach((asset) => {
+  targetOnlyContainer.__hmbImageAssetByLibraryId.set(asset.asset_library_id, asset);
+});
+assert.equal(
+  assetWidget.hmbPatchImageAssetThumbnailMedia(
+    targetOnlyContainer,
+    targetOnlyState,
+    ["patch-target"],
+  ),
+  1,
+);
+assert.equal(rootSearches, 0);
+assert.equal(rootReplacements, 0);
+assert.equal(untouchedCardQueries, 0);
+assert.equal(untouchedThumbnail.getAttribute("class"), "asset-thumb untouched");
+
+// The compact thumbnail-only transition must be selected before the legacy
+// whole-state stringify comparison; otherwise large catalogs still pay the
+// serialization cost on every worker completion.
+const applyPropsStart = assetSource.indexOf("const applyProps = (nextProps = {}) => {");
+const applyPropsEnd = assetSource.indexOf("const cleanup = () => {", applyPropsStart);
+const applyPropsSource = assetSource.slice(applyPropsStart, applyPropsEnd);
+assert.ok(applyPropsStart >= 0 && applyPropsEnd > applyPropsStart);
+assert.ok(
+  applyPropsSource.indexOf("imageAssetThumbnailOnlyTransition(")
+    < applyPropsSource.indexOf("const currentValue = JSON.stringify(state)"),
+  "Thumbnail-only fast path must precede whole-state serialization.",
+);
+assert.match(
+  applyPropsSource,
+  /presentationPatch\.changedAssetLibraryIds/,
+  "Compact failed IDs must patch their existing cards, not leave loaders spinning.",
+);
+assert.match(
+  applyPropsSource,
+  /const completed = hmbImageAssetThumbnailResultIds\(merged\)/,
+  "Full-state thumbnail completion must patch both completed and failed cards.",
+);
+assert.match(
+  assetSource,
+  /hmbArmImageAssetThumbnailWatchdog\(container, current, props, bridgeRequest\);/,
+  "Every dispatched hydration request must arm the lost-response watchdog.",
+);
+assert.match(
+  assetSource,
+  /thumbnail-failed[\s\S]*?hmb-image-thumbnail-unavailable/,
+  "Terminal failures must render a static marker instead of an animated leaf loader.",
+);
+assert.ok(
+  applyPropsSource.indexOf("if (nextProps?.value === previousPropValue)")
+    < applyPropsSource.indexOf("const incomingState = normalizeState(nextProps?.value)"),
+  "A callback-only same-value update must return before full catalog normalization.",
+);
+const consumeEchoStart = assetSource.indexOf(
+  "export function hmbConsumeImageAssetStateEcho(container, nextProps = {}) {",
+);
+const consumeEchoEnd = assetSource.indexOf(
+  "export function hmbPublishImageAssetState(",
+  consumeEchoStart,
+);
+const consumeEchoSource = assetSource.slice(consumeEchoStart, consumeEchoEnd);
+assert.ok(consumeEchoStart >= 0 && consumeEchoEnd > consumeEchoStart);
+assert.ok(
+  consumeEchoSource.indexOf("if (!Array.isArray(pending) || !pending.length)")
+    < consumeEchoSource.indexOf("incoming = JSON.stringify(incomingState)"),
+  "Echo matching must not serialize a full catalog when no echo is pending.",
+);
+assert.match(
+  applyPropsSource,
+  /const incomingSerialized = container\.__hmbImageAssetIncomingSerialized;[\s\S]*?const nextValue = typeof incomingSerialized === "string"[\s\S]*?\? incomingSerialized[\s\S]*?: JSON\.stringify\(nextState\)/,
+  "A non-matching echo serialization must be reused by the ordinary state comparison.",
+);
+
 // A delayed thumbnail worker response may patch thumbnail_url only. Local
 // selection, per-Shot ordering, dimensions, names, and every other semantic
 // field remain owned by the latest UI/catalog state.
@@ -960,6 +1243,34 @@ assert.deepEqual(thumbnailMerged.shot_routing, thumbnailMergeLocal.shot_routing)
   assert.deepEqual(
     assetWidget.hmbImageAssetSelectionSnapshot(applied),
     assetWidget.hmbImageAssetSelectionSnapshot(thumbnailMergeLocal),
+  );
+
+  // A publisher/channel reset is semantic Shot authority, not thumbnail-only
+  // presentation. It must take the normal remount path so the bridge and Shot
+  // registry cannot retain the previous runtime identity.
+  const resetPublisherUuid = "33333333-3333-4333-8333-333333333333";
+  const resetChannelUuid = "44444444-4444-4444-8444-444444444444";
+  const authorityResetIncoming = assetWidget.hmbNormalizeImageAssetState({
+    ...JSON.parse(JSON.stringify(applied)),
+    thumbnail_revision: applied.thumbnail_revision + 1,
+    thumbnail_result: {
+      ...applied.thumbnail_result,
+      request_id: "thumbnail-authority-reset",
+    },
+    shot_routing: {
+      ...JSON.parse(JSON.stringify(applied.shot_routing)),
+      publisher_instance_uuid: resetPublisherUuid,
+      channel_uuid: resetChannelUuid,
+    },
+  });
+  staleThumbnailController.update({ value: authorityResetIncoming });
+  assert.equal(
+    staleThumbnailContainer.__hmbImageAssetLatestState.shot_routing.publisher_instance_uuid,
+    resetPublisherUuid,
+  );
+  assert.equal(
+    staleThumbnailContainer.__hmbImageAssetLatestState.shot_routing.channel_uuid,
+    resetChannelUuid,
   );
   staleThumbnailController.cleanup();
 }
@@ -1239,12 +1550,76 @@ try {
     console.error = savedTransportConsoleError;
   }
   assert.equal(failedTransportState.ui_edit_revision, 6);
-  assert.equal(failedTransportState.thumbnail_busy, false);
-  assert.deepEqual(failedTransportState.thumbnail_request, {});
+  assert.equal(failedTransportState.thumbnail_busy, true);
+  assert.ok(failedTransportState.thumbnail_request.request_id);
   assert.deepEqual(failedTransportState.assets, failedTransportAssetsBefore);
   assert.deepEqual(failedTransportState.shot_routing, failedTransportShotRoutingBefore);
+  assert.ok(failedTransportContainer.__hmbImageAssetThumbnailPendingRequestId);
+  assert.equal(failedTransportContainer.__hmbImageAssetThumbnailRequestedIds.size, 1);
+  const failedTransportWatchdog = failedTransportContainer.__hmbImageAssetThumbnailWatchdog;
+  assert.ok(
+    failedTransportWatchdog,
+    "A synchronous dispatch failure must retain one bounded recovery lease.",
+  );
+  const failedTransportTimer = stagedTimers.get(failedTransportWatchdog.timer);
+  assert.ok(failedTransportTimer);
+  stagedTimers.delete(failedTransportWatchdog.timer);
+  failedTransportTimer.callback();
+  assert.equal(failedTransportState.thumbnail_busy, false);
+  assert.deepEqual(failedTransportState.thumbnail_request, {});
+  assert.deepEqual(
+    failedTransportState.thumbnail_result.failed_asset_library_ids,
+    ["thumbnail-transport-asset"],
+  );
   assert.equal(failedTransportContainer.__hmbImageAssetThumbnailPendingRequestId, undefined);
-  assert.equal(failedTransportContainer.__hmbImageAssetThumbnailRequestedIds.size, 0);
+  assert.equal(
+    failedTransportContainer.__hmbImageAssetThumbnailFailedIds.has(
+      "thumbnail-transport-asset",
+    ),
+    true,
+    "A failed transport must end in a static failed presentation, not a loader.",
+  );
+
+  const unavailableTransportState = assetWidget.hmbNormalizeImageAssetState({
+    project_uid: "thumbnail-unavailable-project",
+    manifest_signature: "thumbnail-unavailable-manifest",
+    scan_revision: 3,
+    assets: [selectableAsset("thumbnail-unavailable-asset")],
+  });
+  const unavailableRuntimeId = unavailableTransportState.shot_routing.publisher_instance_uuid;
+  bridgeRegistry.delete(unavailableRuntimeId);
+  const unavailableTransportContainer = {
+    __hmbImageAssetLatestState: unavailableTransportState,
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  assert.equal(
+    assetWidget.hmbScheduleImageAssetThumbnailRequest(
+      unavailableTransportContainer,
+      unavailableTransportState,
+      {},
+    ),
+    true,
+  );
+  flushStagedAfterPaint();
+  const unavailableWatchdog =
+    unavailableTransportContainer.__hmbImageAssetThumbnailWatchdog;
+  assert.ok(unavailableWatchdog, "Bridge bootstrap races need a bounded lease.");
+  const unavailableTimer = stagedTimers.get(unavailableWatchdog.timer);
+  assert.ok(unavailableTimer);
+  stagedTimers.delete(unavailableWatchdog.timer);
+  unavailableTimer.callback();
+  assert.equal(unavailableTransportState.thumbnail_busy, false);
+  assert.deepEqual(
+    unavailableTransportState.thumbnail_result.failed_asset_library_ids,
+    ["thumbnail-unavailable-asset"],
+  );
+  assert.equal(
+    unavailableTransportContainer.__hmbImageAssetThumbnailFailedIds.has(
+      "thumbnail-unavailable-asset",
+    ),
+    true,
+  );
 
   const staleUrl = "http://localhost:8124/workspace/static_files/stale.webp";
   const staleUrlState = assetWidget.hmbNormalizeImageAssetState({
@@ -1505,6 +1880,162 @@ try {
   globalThis.clearTimeout = stagedSavedClearTimeout;
 }
 
+// A bridge result can be lost during a host remount/update race. Keep one
+// bounded exact-request probe and then stop every animation with a terminal
+// failed presentation state; Refresh explicitly clears that retry boundary.
+{
+  const savedWatchdogSetTimeout = globalThis.setTimeout;
+  const savedWatchdogClearTimeout = globalThis.clearTimeout;
+  const watchdogTimers = new Map();
+  let watchdogSequence = 0;
+  globalThis.setTimeout = (callback, delay = 0) => {
+    const id = ++watchdogSequence;
+    watchdogTimers.set(id, { callback, delay: Number(delay) || 0 });
+    return id;
+  };
+  globalThis.clearTimeout = (id) => watchdogTimers.delete(id);
+  try {
+    const longWatchdogId = `asset/${"long-segment-".repeat(22)}image.png`;
+    assert.ok(longWatchdogId.length > 128);
+    const watchdogState = assetWidget.hmbNormalizeImageAssetState({
+      project_uid: "thumbnail-watchdog-project",
+      manifest_signature: "thumbnail-watchdog-manifest",
+      scan_revision: 9,
+      assets: [selectableAsset(longWatchdogId, false, 0, {
+        media_signature: "f".repeat(64),
+      })],
+    });
+    const watchdogRequest = {
+      schema: "hmb-image-asset-thumbnail-bridge",
+      version: 1,
+      operation: "hydrate",
+      phase: "request",
+      runtime_instance_id: watchdogState.shot_routing.publisher_instance_uuid,
+      request_id: "thumbnail-watchdog-request",
+      project_uid: watchdogState.project_uid,
+      manifest_signature: watchdogState.manifest_signature,
+      scan_revision: watchdogState.scan_revision,
+      asset_library_ids: [longWatchdogId],
+    };
+    watchdogState.thumbnail_request = { ...watchdogRequest };
+    watchdogState.thumbnail_busy = true;
+    const watchdogContainer = {
+      __hmbImageAssetLatestState: watchdogState,
+      __hmbImageAssetMountToken: 77,
+      __hmbImageAssetThumbnailPendingRequestId: watchdogRequest.request_id,
+      querySelector() { return null; },
+      querySelectorAll() { return []; },
+    };
+    const probes = [];
+    bridgeRegistry.set(watchdogRequest.runtime_instance_id, {
+      dispatch(request) { probes.push(request); },
+    });
+    assert.equal(
+      assetWidget.hmbArmImageAssetThumbnailWatchdog(
+        watchdogContainer,
+        watchdogState,
+        {},
+        watchdogRequest,
+      ),
+      true,
+    );
+    const runWatchdogTimer = () => {
+      const entry = watchdogTimers.entries().next().value;
+      assert.ok(entry, "The thumbnail watchdog must own one bounded timer.");
+      const [id, timer] = entry;
+      watchdogTimers.delete(id);
+      assert.equal(timer.delay, 15000);
+      timer.callback();
+    };
+    runWatchdogTimer();
+    assert.equal(probes.length, 1, "One lost result receives one exact-request probe.");
+    assert.equal(probes[0].request_id, watchdogRequest.request_id);
+    assert.deepEqual(probes[0].asset_library_ids, [longWatchdogId]);
+    assert.equal(watchdogTimers.size, 1);
+    const savedWarn = console.warn;
+    console.warn = () => {};
+    try { runWatchdogTimer(); } finally { console.warn = savedWarn; }
+    assert.equal(watchdogTimers.size, 0);
+    assert.equal(watchdogState.thumbnail_busy, false);
+    assert.equal(watchdogState.thumbnail_request.request_id, undefined);
+    assert.deepEqual(
+      watchdogState.thumbnail_result.failed_asset_library_ids,
+      [longWatchdogId],
+      "Timeout terminalization must preserve the full path-derived ID.",
+    );
+    assert.equal(
+      watchdogContainer.__hmbImageAssetThumbnailPendingRequestId,
+      undefined,
+    );
+    assert.equal(
+      watchdogContainer.__hmbImageAssetThumbnailFailedIds.has(longWatchdogId),
+      true,
+    );
+    assert.equal(
+      assetWidget.hmbResetImageAssetThumbnailRetryState(
+        watchdogContainer,
+        watchdogState,
+      ),
+      true,
+    );
+    assert.equal(watchdogContainer.__hmbImageAssetThumbnailFailedIds.size, 0);
+    assert.deepEqual(watchdogState.thumbnail_result, {});
+
+    const remountAssetId = "thumbnail-remount-asset";
+    const remountState = assetWidget.hmbNormalizeImageAssetState({
+      project_uid: "thumbnail-remount-project",
+      manifest_signature: "thumbnail-remount-manifest",
+      scan_revision: 10,
+      thumbnail_busy: true,
+      thumbnail_request: {
+        request_id: "thumbnail-remount-request",
+        project_uid: "thumbnail-remount-project",
+        manifest_signature: "thumbnail-remount-manifest",
+        scan_revision: 10,
+        asset_library_ids: [remountAssetId],
+      },
+      assets: [selectableAsset(remountAssetId)],
+    });
+    const remountRuntimeId = remountState.shot_routing.publisher_instance_uuid;
+    const remountDispatches = [];
+    bridgeRegistry.set(remountRuntimeId, {
+      dispatch(request) { remountDispatches.push(request); },
+    });
+    const remountContainer = {
+      __hmbImageAssetLatestState: remountState,
+      __hmbImageAssetMountToken: 78,
+      querySelector() { return null; },
+      querySelectorAll() { return []; },
+    };
+    assert.equal(
+      assetWidget.hmbResumeImageAssetThumbnailRequest(
+        remountContainer,
+        remountState,
+        {},
+      ),
+      true,
+      "A new mount must reconstruct the pending lease from serialized busy state.",
+    );
+    assert.equal(
+      remountContainer.__hmbImageAssetThumbnailPendingRequestId,
+      "thumbnail-remount-request",
+    );
+    assert.equal(remountDispatches.length, 1);
+    assert.equal(remountDispatches[0].request_id, "thumbnail-remount-request");
+    assert.equal(
+      remountContainer.__hmbImageAssetThumbnailRequestedIds.has(remountAssetId),
+      true,
+    );
+    assert.ok(remountContainer.__hmbImageAssetThumbnailWatchdog);
+    assetWidget.hmbCancelImageAssetThumbnailRequest(remountContainer);
+    bridgeRegistry.delete(remountRuntimeId);
+    bridgeRegistry.delete(watchdogRequest.runtime_instance_id);
+  } finally {
+    globalThis.setTimeout = savedWatchdogSetTimeout;
+    globalThis.clearTimeout = savedWatchdogClearTimeout;
+  }
+}
+
 const mergeBase = assetWidget.hmbNormalizeImageAssetState({
   manifest_signature: "manifest-old",
   assets: [selectableAsset("asset-a", true, 1), selectableAsset("asset-b")],
@@ -1755,7 +2286,7 @@ assert.match(
 );
 assert.match(
   assetSource,
-  /if \(hmbConsumeImageAssetStateEcho\(container, nextProps\)\) \{[\s\S]*?__hmbImageAssetLastConsumedEchoWasStale[\s\S]*?return;[\s\S]*?if \(container\.__hmbImageAssetSelectionCommitPending\)/,
+  /const consumedStateEcho = hmbConsumeImageAssetStateEcho\(container, nextProps\);[\s\S]*?if \(consumedStateEcho\) \{[\s\S]*?__hmbImageAssetLastConsumedEchoWasStale[\s\S]*?return;[\s\S]*?if \(container\.__hmbImageAssetSelectionCommitPending\)/,
   "Revision-stale props must be consumed before selection-delta authority is merged.",
 );
 assert.match(

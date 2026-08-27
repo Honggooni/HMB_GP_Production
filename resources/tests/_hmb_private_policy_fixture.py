@@ -16,7 +16,7 @@ PRIVATE_SIGNED_POLICY_FIXTURE = (
     / "hmb_agent_core.dat"
 )
 EXPECTED_ENVELOPE_SHA256 = (
-    "6debb90960499ff6fe163a8a5a6db42a0da028f7a7606f993175edbd5712e65e"
+    "228b54e55dd4167f4cb58f8bdbdb8762818a636018180fe1ae97f7a023ac2144"
 )
 
 
@@ -30,9 +30,18 @@ def read_private_policy_fixture_if_available() -> bytes | None:
         "on",
     }:
         return None
-    if not PRIVATE_SIGNED_POLICY_FIXTURE.is_file():
+    configured_path = os.environ.get(
+        "HMB_TEST_PRIVATE_POLICY_FIXTURE_PATH",
+        "",
+    ).strip()
+    fixture_path = (
+        Path(configured_path).expanduser().resolve()
+        if configured_path
+        else PRIVATE_SIGNED_POLICY_FIXTURE
+    )
+    if not fixture_path.is_file():
         return None
-    encoded = PRIVATE_SIGNED_POLICY_FIXTURE.read_bytes()
+    encoded = fixture_path.read_bytes()
     if hashlib.sha256(encoded).hexdigest() != EXPECTED_ENVELOPE_SHA256:
         raise RuntimeError("Private signed Agent policy fixture identity mismatch.")
     return encoded

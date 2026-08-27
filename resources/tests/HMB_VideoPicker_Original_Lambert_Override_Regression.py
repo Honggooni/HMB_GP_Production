@@ -185,6 +185,14 @@ class FakeMaterialCmds(types.ModuleType):
     def nodeType(self, node):
         return self.node_types[node]
 
+    def unknownNode(self, _node, query=False, **kwargs):
+        assert query is True
+        if kwargs.get("plugin"):
+            return "redshift4maya"
+        if kwargs.get("realClassName"):
+            return "RedshiftColorCorrection"
+        return ""
+
     def listConnections(
         self,
         target,
@@ -532,9 +540,8 @@ scoped_controller.finish()
 assert scoped_fake.connections["outsideSG.surfaceShader"] == outside_connection
 
 
-# A plug-in utility is never bypassed. Even a single upstream Maya file would
-# lose renderer-specific grading/UV behavior; two candidates make that risk
-# especially visible.
+# A recognized renderer utility is already evaluable in this Maya process. Keep
+# its exact output connection; never silently bypass it to one upstream file.
 ambiguous_fake = FakeMaterialCmds()
 ambiguous_fake.node_types.update({
     "PluginUtility": "RedshiftColorLayer",
@@ -554,21 +561,42 @@ for plug in (
 ):
     ambiguous_fake.attr_types[plug] = "double3"
 runner.cmds = ambiguous_fake
-try:
-    runner._original_supported_source("PluginUtility.outColor")
-except RuntimeError as exc:
-    ambiguity_message = str(exc)
-    assert "plug-in-only texture or utility" in ambiguity_message
-else:
-    raise AssertionError(
-        "A Redshift utility was silently reduced to one upstream texture."
-    )
+assert runner._original_supported_source("PluginUtility.outColor") == (
+    "PluginUtility.outColor"
+)
+
+loaded_plugin_fake = FakeMaterialCmds()
+loaded_plugin_fake.node_types["LoadedCorrection"] = "RedshiftColorCorrection"
+loaded_plugin_fake.connections.update({
+    "RedMat.base_color": "LoadedCorrection.outColor",
+    "LoadedCorrection.input": "redFile.outColor",
+})
+for plug in ("LoadedCorrection.outColor", "LoadedCorrection.input"):
+    loaded_plugin_fake.attr_types[plug] = "double3"
+runner.cmds = loaded_plugin_fake
+loaded_plugin_controller = runner._OriginalLambertOverrideController({
+    "original_material_override_profile": runner.ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
+    "_viewport_quality_scope_shapes": list(BASE_SCOPE_SHAPES),
+})
+loaded_plugin_applied = loaded_plugin_controller.apply()
+assert loaded_plugin_applied["loaded_plugin_passthrough_count"] == 1
+assert loaded_plugin_applied["plugin_fallback_count"] == 0
+assert loaded_plugin_applied["texture_identity_preserved"] is True
+loaded_red_shader = loaded_plugin_fake.connections[
+    "redSG.surfaceShader"
+].split(".", 1)[0]
+assert loaded_plugin_fake.connections[loaded_red_shader + ".color"] == (
+    "LoadedCorrection.outColor"
+)
+loaded_plugin_controller.finish()
 
 
-# A Maya-native utility is not safe merely because its output plug is native.
-# If any upstream branch still requires Redshift or an unknown plug-in node,
-# Maya cannot evaluate that graph after the plug-in has failed to load.
-for upstream_type in ("RedshiftColorCorrection", "unknown"):
+# A recognized Redshift dependency remains exact, while a real Maya unknown node
+# requests a numeric fallback instead of being mislabeled or connected.
+for upstream_type, fallback_required in (
+    ("RedshiftColorCorrection", False),
+    ("unknown", True),
+):
     dependent_fake = FakeMaterialCmds()
     dependent_fake.node_types.update({
         "NativeUtility": "multiplyDivide",
@@ -584,55 +612,94 @@ for upstream_type in ("RedshiftColorCorrection", "unknown"):
     ):
         dependent_fake.attr_types[plug] = "double3"
     runner.cmds = dependent_fake
-    try:
-        runner._original_supported_source("NativeUtility.outColor")
-    except RuntimeError as exc:
-        dependency_message = str(exc)
-        assert "depends on an unavailable" in dependency_message
-        assert "PluginUpstream" in dependency_message
+    if fallback_required:
+        try:
+            runner._original_supported_source("NativeUtility.outColor")
+        except runner._OriginalPluginFallbackRequired as exc:
+            dependency_message = str(exc)
+            assert "unavailable plug-in node" in dependency_message
+            assert "PluginUpstream" in dependency_message
+        else:
+            raise AssertionError("An unknown renderer node did not request fallback.")
     else:
-        raise AssertionError(
-            "A Maya-native utility retained an unsafe {0} dependency.".format(
-                upstream_type
-            )
+        assert runner._original_supported_source("NativeUtility.outColor") == (
+            "NativeUtility.outColor"
         )
 
 
-# A plug-in-only texture path is not enough to prove color space, UDIM mode,
-# UV transforms, or frame-sequence behavior.  Reject it instead of publishing
-# a visually different Original under the same texture filename.
+# Reproduce the reported namespaced rsColorCorrection failure. The material's
+# captured value is applied to the disposable Lambert, the Original pass stays
+# publishable, and the authored SG graph is restored afterwards.
 fallback_fake = FakeMaterialCmds()
-fallback_fake.node_types["PluginTexture"] = "RedshiftTextureSampler"
-fallback_fake.attr_types.update({
+fallback_fake.node_types.update({
+    "NativeUtility": "multiplyDivide",
+    "BlackGoldenBoy:rsColorCorrection7": "unknown",
+})
+fallback_fake.connections.update({
+    "RedMat.base_color": "NativeUtility.outColor",
+    "NativeUtility.input1": "BlackGoldenBoy:rsColorCorrection7.outColor",
+})
+fallback_fake.values["RedMat.base_color"] = [(0.21, 0.31, 0.41)]
+for plug in (
+    "NativeUtility.input1",
+    "NativeUtility.outColor",
+    "BlackGoldenBoy:rsColorCorrection7.outColor",
+):
+    fallback_fake.attr_types[plug] = "double3"
+runner.cmds = fallback_fake
+fallback_before = original_connections(fallback_fake)
+fallback_controller = runner._OriginalLambertOverrideController({
+    "original_material_override_profile": runner.ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
+    "_viewport_quality_scope_shapes": list(BASE_SCOPE_SHAPES),
+})
+fallback_applied = fallback_controller.apply()
+assert fallback_applied["plugin_fallback_count"] == 1
+assert fallback_applied["plugin_fallback_material_count"] == 1
+assert fallback_applied["plugin_fallback_node_count"] == 1
+assert fallback_applied["numeric_color_count"] == 2
+assert fallback_applied["texture_connection_count"] == 2
+assert fallback_applied["texture_identity_preserved"] is False
+assert "BlackGoldenBoy:rsColorCorrection7" in fallback_applied["warnings"][0]
+fallback_red_shader = fallback_fake.connections[
+    "redSG.surfaceShader"
+].split(".", 1)[0]
+assert fallback_fake.values[fallback_red_shader + ".color"] == [
+    (0.21, 0.31, 0.41)
+]
+assert fallback_red_shader + ".color" not in fallback_fake.connections
+fallback_finished = fallback_controller.finish()
+assert fallback_finished["restore_ok"] is True
+assert original_connections(fallback_fake) == fallback_before
+
+
+# A loaded renderer texture remains the source itself. No filename-only Maya
+# file clone is created, so color space, UDIM, UV, and sequence behavior are not
+# silently re-authored.
+loaded_texture_fake = FakeMaterialCmds()
+loaded_texture_fake.node_types["PluginTexture"] = "RedshiftTextureSampler"
+loaded_texture_fake.attr_types.update({
     "PluginTexture.outColor": "double3",
     "PluginTexture.texturePath": "string",
     "PluginTexture.description": "string",
 })
 fallback_texture_path = "C:/textures/hero_diffuse.<UDIM>.png"
-fallback_fake.values.update({
+loaded_texture_fake.values.update({
     "PluginTexture.texturePath": fallback_texture_path,
     "PluginTexture.description": "hero diffuse source",
 })
-runner.cmds = fallback_fake
-try:
-    runner._original_supported_source("PluginTexture.outColor")
-except RuntimeError as exc:
-    assert "plug-in-only texture or utility" in str(exc)
-else:
-    raise AssertionError(
-        "A filename-only Redshift texture was accepted without proving its "
-        "color-space, UDIM, UV, and sequence contract."
-    )
+runner.cmds = loaded_texture_fake
+assert runner._original_supported_source("PluginTexture.outColor") == (
+    "PluginTexture.outColor"
+)
 assert not [
     node
-    for node, node_type in fallback_fake.node_types.items()
+    for node, node_type in loaded_texture_fake.node_types.items()
     if node.startswith("HMB_Original_")
     and node_type in ("file", "place2dTexture")
 ]
 
 
-# An authored Lambert is already the requested shader type, but it is not
-# renderer-independent when its color graph still passes through Redshift.
+# A recognized renderer input on an authored Lambert is evaluable and retained.
 existing_lambert_fake = FakeMaterialCmds()
 existing_lambert_fake.node_types["HiddenPlugin"] = "RedshiftColorCorrection"
 existing_lambert_fake.attr_types.update({
@@ -643,15 +710,34 @@ existing_lambert_fake.connections[
     "ExistingLambert.color"
 ] = "HiddenPlugin.outColor"
 runner.cmds = existing_lambert_fake
-try:
-    runner._original_assert_existing_lambert_is_native("ExistingLambert")
-except RuntimeError as exc:
-    assert "Existing Lambert" in str(exc)
-    assert "HiddenPlugin" in str(exc)
-else:
-    raise AssertionError(
-        "An existing Lambert retained a hidden Redshift dependency."
-    )
+runner._original_assert_existing_lambert_is_native("ExistingLambert")
+
+
+# If that same node is genuinely unknown, the authored Lambert is temporarily
+# rebuilt with a deterministic numeric color and restored like every other SG.
+unknown_lambert_fake = FakeMaterialCmds()
+unknown_lambert_fake.node_types["BlackGoldenBoy:rsColorCorrection8"] = "unknown"
+unknown_lambert_fake.attr_types.update({
+    "ExistingLambert.color": "double3",
+    "BlackGoldenBoy:rsColorCorrection8.outColor": "double3",
+})
+unknown_lambert_fake.connections[
+    "ExistingLambert.color"
+] = "BlackGoldenBoy:rsColorCorrection8.outColor"
+runner.cmds = unknown_lambert_fake
+unknown_lambert_before = original_connections(unknown_lambert_fake)
+unknown_lambert_controller = runner._OriginalLambertOverrideController({
+    "original_material_override_profile": runner.ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
+    "_viewport_quality_scope_shapes": list(BASE_SCOPE_SHAPES),
+})
+unknown_lambert_applied = unknown_lambert_controller.apply()
+assert unknown_lambert_applied["existing_lambert_count"] == 0
+assert unknown_lambert_applied["temporary_lambert_count"] == 5
+assert unknown_lambert_applied["plugin_fallback_count"] == 1
+assert unknown_lambert_applied["plugin_fallback_material_count"] == 1
+assert unknown_lambert_applied["texture_identity_preserved"] is False
+unknown_lambert_controller.finish()
+assert original_connections(unknown_lambert_fake) == unknown_lambert_before
 
 
 # Original must use Maya Default Lighting and smooth shaded/textured Viewport
@@ -797,6 +883,14 @@ with tempfile.TemporaryDirectory(prefix="HMB_Original_Lambert_Cache_") as root:
         "existing_lambert_count": 1,
         "texture_connection_count": 3,
         "numeric_color_count": 1,
+        "loaded_plugin_passthrough_count": 0,
+        "loaded_plugin_nodes": [],
+        "plugin_fallback_count": 0,
+        "plugin_fallback_material_count": 0,
+        "plugin_fallback_node_count": 0,
+        "plugin_fallback_records": [],
+        "texture_identity_preserved": True,
+        "warnings": [],
         "transparency_transfer_count": 1,
         "emission_transfer_count": 0,
         "swapped_shading_engine_count": 5,
@@ -834,6 +928,28 @@ with tempfile.TemporaryDirectory(prefix="HMB_Original_Lambert_Cache_") as root:
         )
 
     assert cache_accepts(valid_report)
+    degraded_report = copy.deepcopy(valid_report)
+    degraded_report.update({
+        "texture_connection_count": 2,
+        "numeric_color_count": 2,
+        "plugin_fallback_count": 1,
+        "plugin_fallback_material_count": 1,
+        "plugin_fallback_node_count": 2,
+        "plugin_fallback_records": [{
+            "material": "RedMat",
+            "attribute": "base_color",
+            "source_nodes": ["NativeUtility"],
+            "unavailable_nodes": [
+                {"node": "BlackGoldenBoy:rsColorCorrection7"},
+                {"node": "BlackGoldenBoy:rsColorCorrection8"},
+            ],
+            "fallback_mode": "captured_numeric",
+            "fallback_value": [0.21, 0.31, 0.41],
+        }],
+        "texture_identity_preserved": False,
+        "warnings": ["Original used a numeric plug-in fallback."],
+    })
+    assert cache_accepts(degraded_report)
     inconsistent_reports = []
     for field, value in (
         ("status", "applied"),
@@ -847,6 +963,9 @@ with tempfile.TemporaryDirectory(prefix="HMB_Original_Lambert_Cache_") as root:
         ("default_lighting_verified", False),
         ("textured_render_mode_verified", False),
         ("temporary_nodes_retained_on_restore_failure", True),
+        ("plugin_fallback_material_count", 2),
+        ("plugin_fallback_records", [{}]),
+        ("texture_identity_preserved", False),
     ):
         invalid = copy.deepcopy(valid_report)
         invalid[field] = value

@@ -88,16 +88,22 @@ def reference_capabilities(*, exact_cues: bool) -> dict:
     }
 
 
-def video(slot: int, source_type: str, role: str) -> dict:
+def video(
+    slot: int,
+    main_type: str,
+    sub_type: str,
+    *,
+    end_frame: int = 40,
+) -> dict:
     item = prompt._default_video_item(slot)
     item.update(
         {
             "present": True,
             "label": f"reference-{slot}.mp4",
-            "source_type": source_type,
-            "control_role": role,
+            "video_main_type": main_type,
+            "video_sub_type": sub_type,
             "video_uid": f"video-{slot}",
-            "frame_domain": frame_domain(),
+            "frame_domain": frame_domain(end_frame),
             "reference_capabilities": reference_capabilities(
                 exact_cues=False
             ),
@@ -106,54 +112,74 @@ def video(slot: int, source_type: str, role: str) -> dict:
     return item
 
 
-def two_source_state() -> dict:
-    state = prompt._default_widget_state()
-    image = prompt._default_image_item(1)
-    image.update(
+def ranged_image(
+    slot: int,
+    *,
+    label: str,
+    target: str,
+    sub_type: str,
+    color: str,
+    video_slot: int,
+    end_frame: int,
+    ranges: list[dict[str, int]],
+) -> dict:
+    item = prompt._default_image_item(slot)
+    wire_pair = prompt.image_taxonomy_wire_pair("Character", sub_type)
+    assert wire_pair is not None
+    source_type, scope = wire_pair
+    item.update(
         {
             "present": True,
-            "label": "Jett image",
-            "source_type": "Character Appearance",
-            "owner": "JettMini",
-            "asset_id": "JettMini",
-            "color_picks": ["Red", "Green"],
-            "binding_video_slots": [1, 2],
-            "binding_scopes": [
-                "Full body / full appearance",
-                "Full body / full appearance",
-            ],
+            "label": label,
+            "image_main_type": "Character",
+            "image_sub_type": sub_type,
+            "source_type": source_type,
+            "owner": target,
+            "asset_id": target,
+            "color_picks": [color],
+            "binding_video_slots": [video_slot],
+            "binding_scopes": [scope],
+            "frame_range_intent": {
+                "version": 1,
+                "enabled": True,
+                "start_frame": 1,
+                "end_frame": end_frame,
+                "ranges": copy.deepcopy(ranges),
+                "selected_index": 0,
+            },
             "frame_range_enabled": True,
             "frame_range_color_index": 0,
-            "frame_range_bindings": {
-                "@video1::Red": {
-                    "video_slot": "@video1",
-                    "color_pick": "Red",
-                    "enabled": True,
-                    "origin": "manual",
-                    "start_frame": 1,
-                    "end_frame": 40,
-                    "ranges": [
-                        {"start": 1, "end": 10},
-                        {"start": 20, "end": 30},
-                    ],
-                },
-                "@video2::Green": {
-                    "video_slot": "@video2",
-                    "color_pick": "Green",
-                    "enabled": True,
-                    "origin": "manual",
-                    "start_frame": 1,
-                    "end_frame": 40,
-                    "ranges": [
-                        {"start": 5, "end": 15},
-                        {"start": 25, "end": 35},
-                    ],
-                },
-            },
         }
     )
-    fx = video(1, "FX Reference", "Context Only")
-    timing = video(2, "Timing / Edit Reference", "FX Effect Only")
+    return item
+
+
+def two_source_state() -> dict:
+    state = prompt._default_widget_state()
+    images = [
+        ranged_image(
+            1,
+            label="Jett full image",
+            target="JettMini",
+            sub_type="Full Appearance",
+            color="Red",
+            video_slot=1,
+            end_frame=40,
+            ranges=[{"start": 1, "end": 10}, {"start": 20, "end": 30}],
+        ),
+        ranged_image(
+            2,
+            label="Jett face image",
+            target="JettMini",
+            sub_type="Full Appearance",
+            color="Green",
+            video_slot=2,
+            end_frame=40,
+            ranges=[{"start": 5, "end": 15}, {"start": 25, "end": 35}],
+        ),
+    ]
+    fx = video(1, "FX Reference", "FX Effect Only")
+    timing = video(2, "Maya Preview / Playblast", "Timing / Edit")
     timing["reference_capabilities"] = reference_capabilities(
         exact_cues=True
     )
@@ -197,21 +223,21 @@ def two_source_state() -> dict:
             },
         },
     ]
-    state["images"] = [image]
+    state["images"] = images
     state["videos"] = [fx, timing]
     return state
 
 
 # Main Type, not a stale secondary role, owns FX/Timing interpretation.
-compiled = prompt._build_prompt_package(two_source_state())
+compiled = prompt._build_data_only_prompt_package(two_source_state())
 lines, job, contract, user_data = parse_envelope(compiled)
 agent._assert_public_job_data_contract(compiled)
 agent._assert_fx_timing_source_contract(compiled)
 
 assert user_data == {}
 assert [item["control_role"] for item in job["videos"]] == [
-    "Context Only",
     "FX Effect Only",
+    "Timing Only",
 ]
 fx_source, timing_source = contract["sources"]
 allowed_source_fact_keys = {
@@ -228,8 +254,8 @@ allowed_source_fact_keys = {
 }
 assert set(fx_source).issubset(allowed_source_fact_keys)
 assert set(timing_source).issubset(allowed_source_fact_keys)
-assert fx_source["selected_role"] == "Context Only"
-assert timing_source["selected_role"] == "FX Effect Only"
+assert fx_source["selected_role"] == "FX Effect Only"
+assert timing_source["selected_role"] == "Timing Only"
 assert timing_source["timing_cues"][0]["frame"] == 7
 assert timing_source["timing_cues"][0]["local_point"]["space"] == "local"
 assert [cue["frame"] for cue in timing_source["timing_cues"]] == [7, 12]
@@ -277,8 +303,10 @@ expect_rejected(
 
 # Range OFF retains dormant widget state but publishes source-local full video.
 range_off_state = two_source_state()
-range_off_state["images"][0]["frame_range_enabled"] = False
-range_off = prompt._build_prompt_package(range_off_state)
+for range_off_image in range_off_state["images"]:
+    range_off_image["frame_range_intent"]["enabled"] = False
+    range_off_image["frame_range_enabled"] = False
+range_off = prompt._build_data_only_prompt_package(range_off_state)
 _, range_off_job, range_off_contract, _ = parse_envelope(range_off)
 agent._assert_fx_timing_source_contract(range_off)
 assert range_off_job["frame_ranges"] == []
@@ -291,100 +319,69 @@ assert all(
     for source in derive_runtime(range_off_contract)["sources"]
 )
 
-# One invalid segment does not erase a valid segment from the same binding.
+# A mixed valid/invalid optional Range remains a dormant editing draft. It does
+# not block the source or publish a partial temporal authority.
 partial_state = prompt._default_widget_state()
-partial_image = copy.deepcopy(two_source_state()["images"][0])
-partial_image["color_picks"] = ["Red"]
-partial_image["binding_video_slots"] = [1]
-partial_image["binding_scopes"] = ["Full body / full appearance"]
-partial_image["frame_range_bindings"] = {
-    "@video1::Red": {
-        "video_slot": "@video1",
-        "color_pick": "Red",
-        "enabled": True,
-        "origin": "manual",
-        "start_frame": 1,
-        "end_frame": 40,
-        "ranges": [
-            {"start": 1, "end": 10},
-            {"start": 50, "end": 60},
-        ],
-    }
-}
+partial_image = ranged_image(
+    1,
+    label="Partial range image",
+    target="JettMini",
+    sub_type="Full Appearance",
+    color="Red",
+    video_slot=1,
+    end_frame=40,
+    ranges=[{"start": 1, "end": 10}, {"start": 50, "end": 60}],
+)
 partial_state["images"] = [partial_image]
-partial_state["videos"] = [video(1, "FX Reference", "Timing Only")]
-partial = prompt._build_prompt_package(partial_state)
+partial_state["videos"] = [video(1, "FX Reference", "FX Effect Only")]
+partial = prompt._build_data_only_prompt_package(partial_state)
 _, partial_job, partial_contract, _ = parse_envelope(partial)
 agent._assert_fx_timing_source_contract(partial)
-partial_range = partial_job["frame_ranges"][0]
-assert partial_range["valid"] is True
-assert partial_range["segments"] == [
-    {"start_frame": 1, "end_frame": 10}
-]
-assert partial_range["unresolved_segments"] == [
-    {
-        "start_frame": 50,
-        "end_frame": 60,
-        "error_code": "segment_out_of_domain",
-    }
-]
-assert [
-    (segment["start_frame"], segment["end_frame"])
-    for segment in partial_contract["sources"][0]["range_segments"]
-] == [(1, 10)]
+assert partial_job["frame_ranges"] == []
+assert partial_contract["sources"][0]["range_on"] is False
+assert partial_contract["sources"][0]["range_segments"] == []
+assert derive_runtime(partial_contract)["sources"][0]["range_mode"] == "full_video"
 
 # A disjoint third source is isolated; it cannot erase an independent overlap.
 multi_state = prompt._default_widget_state()
-multi_image = prompt._default_image_item(1)
-multi_image.update(
-    {
-        "present": True,
-        "label": "multi image",
-        "source_type": "Character Appearance",
-        "owner": "Hero",
-        "color_picks": ["Red", "Green", "Blue"],
-        "binding_video_slots": [1, 2, 3],
-        "binding_scopes": ["Full body / full appearance"] * 3,
-        "frame_range_enabled": True,
-        "frame_range_color_index": 0,
-        "frame_range_bindings": {
-            "@video1::Red": {
-                "video_slot": "@video1",
-                "color_pick": "Red",
-                "enabled": True,
-                "origin": "manual",
-                "start_frame": 1,
-                "end_frame": 200,
-                "ranges": [{"start": 1, "end": 100}],
-            },
-            "@video2::Green": {
-                "video_slot": "@video2",
-                "color_pick": "Green",
-                "enabled": True,
-                "origin": "manual",
-                "start_frame": 1,
-                "end_frame": 200,
-                "ranges": [{"start": 1, "end": 10}],
-            },
-            "@video3::Blue": {
-                "video_slot": "@video3",
-                "color_pick": "Blue",
-                "enabled": True,
-                "origin": "manual",
-                "start_frame": 1,
-                "end_frame": 200,
-                "ranges": [{"start": 110, "end": 120}],
-            },
-        },
-    }
-)
-multi_state["images"] = [multi_image]
-multi_state["videos"] = [
-    video(1, "FX Reference", "Context Only"),
-    video(2, "Timing / Edit Reference", "FX Effect Only"),
-    video(3, "Timing / Edit Reference", "Context Only"),
+multi_state["images"] = [
+    ranged_image(
+        1,
+        label="Hero full image",
+        target="Hero",
+        sub_type="Full Appearance",
+        color="Red",
+        video_slot=1,
+        end_frame=200,
+        ranges=[{"start": 1, "end": 100}],
+    ),
+    ranged_image(
+        2,
+        label="Hero face image",
+        target="Hero",
+        sub_type="Full Appearance",
+        color="Green",
+        video_slot=2,
+        end_frame=200,
+        ranges=[{"start": 1, "end": 10}],
+    ),
+    ranged_image(
+        3,
+        label="Hero eye image",
+        target="Hero",
+        sub_type="Full Appearance",
+        color="Blue",
+        video_slot=3,
+        end_frame=200,
+        ranges=[{"start": 110, "end": 120}],
+    ),
 ]
-multi = prompt._build_prompt_package(multi_state)
+multi_state["videos"] = [
+    video(1, "FX Reference", "FX Effect Only", end_frame=200),
+    video(2, "Maya Preview / Playblast", "Timing / Edit", end_frame=200),
+    video(3, "Maya Preview / Playblast", "Timing / Edit", end_frame=200),
+]
+multi = prompt._build_data_only_prompt_package(multi_state)
 _, _, multi_contract, _ = parse_envelope(multi)
 agent._assert_fx_timing_source_contract(multi)
 multi_sources = {

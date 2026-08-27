@@ -39,6 +39,28 @@ def replace_job(package: str, job: dict) -> str:
     lines[2] = json.dumps(job, ensure_ascii=False, separators=(",", ":"))
     return "\n".join(lines)
 
+
+def assert_unbound_image(
+    package: str,
+    *,
+    token: str,
+    reason: str,
+) -> None:
+    """Assert v4.5's relation-local failure without weakening wire validation."""
+
+    validated_job = agent._assert_public_job_data_contract(package)
+    manifest = agent._build_final_output_semantic_manifest(validated_job)
+    row = next(
+        image
+        for image in manifest["images"]
+        if image.get("token") == token
+    )
+    assert row["unbound_authority"] is True
+    assert any(
+        relation.get("reason") == reason
+        for relation in row["unresolved_relations"]
+    )
+
 assert prompt.IMAGE_MAIN_TYPE_CHOICES == [
     "Select Image Main Type",
     "Character",
@@ -122,6 +144,11 @@ for (main_type, sub_type), wire_pair in common.IMAGE_TAXONOMY_WIRE_MAP.items():
         "image_main_type": main_type,
         "image_sub_type": sub_type,
     })
+    if main_type == "Look Reference":
+        if sub_type in common.IMAGE_GENERAL_LOOK_REFERENCE_SUB_TYPES:
+            item["owner"] = common.IMAGE_GLOBAL_LOOK_TARGET
+        elif sub_type in common.IMAGE_SCALE_REFERENCE_SUB_TYPES:
+            item["owner"] = common.IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS[sub_type]
     normalized = prompt._normalize_image_binding_fields(item)
     assert (normalized["source_type"], normalized["scope"]) == wire_pair
     state = prompt._default_widget_state()
@@ -289,7 +316,7 @@ def raw_agent_target_is_valid(subtype: str, target: str) -> bool:
     if subtype in global_scope_look_subtypes:
         return target in {"Global Look", "Custom"}
     if subtype in general_look_subtypes:
-        return target not in (
+        return bool(target) and target not in (
             common.IMAGE_SYSTEM_TARGETS
             | set(common.IMAGE_RESERVED_TARGET_ALIASES)
         ).difference(common.IMAGE_GENERAL_LOOK_ALLOWED_SYSTEM_TARGETS)
@@ -357,6 +384,17 @@ for look_subtype in look_subtypes:
         matrix_package = prompt._build_data_only_prompt_package(
             normalized_matrix_state
         )
+        if look_subtype in general_look_subtypes and not expected_target:
+            # A missing semantic Target remains valid on the public wire so
+            # unrelated shot sources survive. The private v4.5 manifest makes
+            # this Look row non-authoritative until its Target is resolved.
+            assert_unbound_image(
+                matrix_package,
+                token="@image5",
+                reason="missing_required_target",
+            )
+            look_target_matrix_count += 1
+            continue
         matrix_job = agent._assert_public_job_data_contract(matrix_package)
         assert matrix_job["images"][-1]["target_id"] == expected_target
 
@@ -573,7 +611,9 @@ assert target_contract_job["images"][4]["target_id"] == "Hero_A"
 
 # The same normalized address cannot identify both a character-domain and a
 # background-domain recipient. Prompt normalization clears the ambiguous Look
-# target, and a forged public job carrying it must fail closed in the Agent.
+# target. The valid public envelope remains usable but the private manifest
+# makes that unresolved Look relation non-authoritative; forging the ambiguous
+# address onto the wire must still fail closed in the Agent.
 ambiguous_target_state = prompt._default_widget_state()
 ambiguous_target_state["images"] = []
 for slot, label, main_type, sub_type, owner in (
@@ -601,9 +641,12 @@ assert normalized_ambiguous_state["images"][2]["owner"] == ""
 ambiguous_target_package = prompt._build_data_only_prompt_package(
     normalized_ambiguous_state
 )
-ambiguous_target_job = agent._assert_public_job_data_contract(
-    ambiguous_target_package
+assert_unbound_image(
+    ambiguous_target_package,
+    token="@image3",
+    reason="missing_required_target",
 )
+ambiguous_target_job = json.loads(ambiguous_target_package.splitlines()[2])
 forged_ambiguous_target_job = copy.deepcopy(ambiguous_target_job)
 forged_ambiguous_target_job["images"][2]["target_id"] = "Shared_Target"
 expect_rejected(
@@ -614,7 +657,7 @@ expect_rejected(
 
 # Exact canonical Global Look and both renderable address forms are valid:
 # owner wins for Hero_A, while the blank-owner background falls back to label.
-for valid_target in ("", "Global Look", "Hero_A", "forest-file.png"):
+for valid_target in ("Global Look", "Hero_A", "forest-file.png"):
     valid_job = copy.deepcopy(target_contract_job)
     valid_job["images"][4]["target_id"] = valid_target
     validated_job = agent._assert_public_job_data_contract(

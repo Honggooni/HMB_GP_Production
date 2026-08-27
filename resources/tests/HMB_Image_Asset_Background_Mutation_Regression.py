@@ -160,6 +160,37 @@ assert initial_live["state"] == initial_visible_before
 assert initial_node._hmb_initial_catalog_scan_pending is False
 assert initial_node._hmb_fresh_registration_scan_key == "initial:c:/catalog"
 
+# Root/saved-state discovery runs outside the scan lock. If a newer explicit
+# scan generation starts and finishes in that interval, its pending key can be
+# empty again; generation must still prevent the late constructor scan from
+# overwriting the newer catalog.
+race_base, _ = registration_state()
+race_node, race_live, _ = fake_node(race_base)
+race_node._hmb_initial_catalog_scan_pending = True
+race_node._hmb_initial_catalog_root = "C:/fallback"
+race_node._ensure_scan_runtime_state()
+race_calls = []
+race_state_reads = 0
+
+
+def current_state_with_newer_generation():
+    global race_state_reads
+    race_state_reads += 1
+    if race_state_reads == 1:
+        with race_node._hmb_scan_lock:
+            race_node._hmb_scan_generation += 1
+    return race_live["state"]
+
+
+race_node._current_state = current_state_with_newer_generation
+race_node._schedule_catalog_scan = lambda *args, **kwargs: race_calls.append(
+    (args, kwargs)
+)
+race_node._hmb_post_registration_shot_discovery()
+assert race_calls == []
+assert race_node._hmb_scan_generation == 1
+assert getattr(race_node, "_hmb_fresh_registration_scan_key", "") == ""
+
 # Only the exact fresh-registration completion adopts constructor state. The
 # adoption key is one-shot, so a duplicate/stale completion cannot advertise.
 initial_node._publish_completed_catalog_scan(
@@ -193,6 +224,12 @@ pending_publish_node._sync_output = lambda _state: (_ for _ in ()).throw(
 pending_publish_node._reconcile_hmb_shot_routing = lambda *_args: (_ for _ in ()).throw(
     AssertionError("busy publish scanned the graph")
 )
+# The hidden thumbnail bridge has its own compact transport contract and is
+# exercised by the staged-loading/performance regressions.  This deliberately
+# uninitialized pending-only fixture owns no host UI element, so keep that
+# unrelated identity publication inert in both fallback and real-host test
+# environments.
+pending_publish_node._sync_thumbnail_bridge_identity = lambda _state: None
 original_parameter_setter = asset_library._set_parameter_value
 asset_library._set_parameter_value = lambda *_args, **_kwargs: None
 try:
@@ -283,6 +320,51 @@ assert failed["asset_registration_result"] == {
     "message": "simulated durable-write rejection",
 }
 assert failed["error"].endswith("simulated durable-write rejection")
+
+
+# A live loop can accept a callback and be replaced before executing it. The
+# worker must retain the immutable catalog result before enqueueing so the next
+# retained-mode callback can finish the exact request instead of leaving the
+# node permanently busy.
+class DroppingLoop:
+    def is_running(self):
+        return True
+
+    def is_closed(self):
+        return False
+
+    def call_soon_threadsafe(self, *_args, **_kwargs):
+        return None
+
+
+dropped_base, _ = registration_state()
+dropped_node, dropped_live, _ = fake_node(dropped_base)
+dropped_result = deepcopy(dropped_base)
+dropped_result["catalog_root"] = "C:/accepted-dropped"
+dropped_loop = DroppingLoop()
+original_get_running_loop = asset_library.asyncio.get_running_loop
+asset_library.asyncio.get_running_loop = lambda: dropped_loop
+try:
+    dropped_node._schedule_catalog_scan(
+        "dropped-loop-result",
+        dropped_base,
+        lambda: dropped_result,
+        failure_state=dropped_base,
+    )
+    dropped_thread = dropped_node._hmb_scan_thread
+    assert dropped_thread is not None
+    dropped_thread.join(timeout=2.0)
+    assert not dropped_thread.is_alive()
+    assert dropped_node._hmb_scan_pending_result is not None
+    assert dropped_node._hmb_scan_pending_key == "dropped-loop-result"
+    assert dropped_node._consume_pending_catalog_scan_result() is True
+finally:
+    asset_library.asyncio.get_running_loop = original_get_running_loop
+
+assert dropped_live["state"]["catalog_root"] == "C:/accepted-dropped"
+assert dropped_live["state"]["scan_busy"] is False
+assert dropped_node._hmb_scan_pending_result is None
+assert dropped_node._hmb_scan_pending_key == ""
 
 
 # The visible PROJECT_ROOT callback must schedule the generation-owned path,

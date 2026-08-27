@@ -151,9 +151,9 @@ _AGENT_POLICY_ENVELOPE_SCHEMA = "hmb-agent-policy-envelope-v3"
 _AGENT_POLICY_SCHEMA = "hmb-agent-policy-v3"
 # Current package/source baseline metadata. Runtime acceptance intentionally
 # does not compare a signed payload's version to this value.
-_AGENT_POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
+_AGENT_POLICY_VERSION = "2026-08-27.agent-shot-quality.v4.5"
 _AGENT_POLICY_CONTRACT_SHA256 = (
-    "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
+    "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
 )
 _AGENT_POLICY_SIGNATURE_ALGORITHM = "RSASSA-PKCS1-v1_5-SHA256"
 _AGENT_POLICY_SIGNING_KEY_ID = "hmb-policy-local-2026-08-r1"

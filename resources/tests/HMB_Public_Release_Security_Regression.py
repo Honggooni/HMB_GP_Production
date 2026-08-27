@@ -11,12 +11,12 @@ from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[2]
-POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
+POLICY_VERSION = "2026-08-27.agent-shot-quality.v4.5"
 POLICY_CONTRACT_SHA256 = (
-    "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
+    "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
 )
-RELEASE_LABEL = "v0.7.05"
-RELEASE_VERSION = "0.7.5"
+RELEASE_LABEL = "v0.7.07"
+RELEASE_VERSION = "0.7.7"
 EXPECTED_RUNTIME_INSTALL_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
@@ -32,6 +32,7 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "_hmb_screen_space.py",
     "widgets/HMBAgentLibraryWidget.js",
     "widgets/HMBImageAssetLibraryWidget.js",
+    "widgets/HMBImageAssetThumbnailPatchBridgeWidget.js",
     "widgets/HMBPromptLibraryScopedBindingWidget.js",
     "widgets/HMBSeedanceGenerationWidget.js",
     "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
@@ -143,12 +144,12 @@ builder = load_module(
 assert tuple(builder.RUNTIME_INSTALL_FILES) == EXPECTED_RUNTIME_INSTALL_FILES
 assert tuple(builder.DISTRIBUTION_ONLY_FILES) == EXPECTED_DISTRIBUTION_ONLY_FILES
 assert tuple(builder.SOURCE_FILES) == EXPECTED_SOURCE_FILES
-assert len(EXPECTED_RUNTIME_INSTALL_FILES) == 21
-assert len(EXPECTED_DISTRIBUTION_ONLY_FILES) == 4
-assert len(EXPECTED_SOURCE_FILES) == 25
+assert len(EXPECTED_SOURCE_FILES) == (
+    len(EXPECTED_RUNTIME_INSTALL_FILES) + len(EXPECTED_DISTRIBUTION_ONLY_FILES)
+)
 assert builder.RELEASE_LABEL == RELEASE_LABEL
 assert builder.RELEASE_VERSION == RELEASE_VERSION
-assert builder.release_version_parts(RELEASE_VERSION) == (0, 7, 5)
+assert builder.release_version_parts(RELEASE_VERSION) == (0, 7, 7)
 assert builder.release_label_for_version(RELEASE_VERSION) == RELEASE_LABEL
 builder.validate_release_identity(RELEASE_LABEL, RELEASE_VERSION)
 for invalid_version in (
@@ -164,14 +165,14 @@ for invalid_version in (
         pass
     else:
         raise AssertionError(f"Invalid technical SemVer was accepted: {invalid_version}")
-for mismatched_label in ("v0.7.5", "v0.7.04", "0.7.05"):
+for mismatched_label in ("v0.7.7", "v0.7.06", "0.7.07"):
     try:
         builder.validate_release_identity(mismatched_label, RELEASE_VERSION)
     except RuntimeError:
         pass
     else:
         raise AssertionError(f"Mismatched public release label was accepted: {mismatched_label}")
-assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.7.05_Runtime.zip"
+assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.7.07_Runtime.zip"
 assert builder.ARCHIVE_NAME == f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 assert builder.POLICY_VERSION == POLICY_VERSION
 assert builder.POLICY_CONTRACT_SHA256 == POLICY_CONTRACT_SHA256
@@ -254,9 +255,9 @@ closure_manifest = json.loads(
 )
 assert closure_manifest["release_label"] == RELEASE_LABEL
 assert closure_manifest["release_version"] == RELEASE_VERSION
-assert closure_manifest["file_count"] == 25
-assert closure_manifest["install_file_count"] == 21
-assert closure_manifest["distribution_file_count"] == 4
+assert closure_manifest["file_count"] == len(EXPECTED_SOURCE_FILES)
+assert closure_manifest["install_file_count"] == len(EXPECTED_RUNTIME_INSTALL_FILES)
+assert closure_manifest["distribution_file_count"] == len(EXPECTED_DISTRIBUTION_ONLY_FILES)
 closure_by_path = {
     str(record["path"]): record for record in closure_manifest["files"]
 }
@@ -325,7 +326,7 @@ builder.validate_archive(first_archive, release_records, archive_date_time)
 assert abs((datetime.now() - datetime(*archive_date_time)).total_seconds()) < 5
 assert builder.module_string_constant(
     ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_CANDIDATE_VERSION"
-) == "2026-08-12.agent-shot-quality.v4.2"
+) == "2026-08-27.agent-shot-quality.v4.5"
 assert builder.module_string_constant(
     ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_CANDIDATE_CONTRACT_SHA256"
 ) == POLICY_CONTRACT_SHA256
@@ -334,10 +335,10 @@ assert builder.module_string_constant(
 ) == "active"
 check_result = builder.check()
 assert check_result["validated"] is True
-assert check_result["file_count"] == 27
-assert check_result["source_file_count"] == 25
-assert check_result["install_file_count"] == 21
-assert check_result["distribution_file_count"] == 4
+assert check_result["file_count"] == len(EXPECTED_SOURCE_FILES) + 2
+assert check_result["source_file_count"] == len(EXPECTED_SOURCE_FILES)
+assert check_result["install_file_count"] == len(EXPECTED_RUNTIME_INSTALL_FILES)
+assert check_result["distribution_file_count"] == len(EXPECTED_DISTRIBUTION_ONLY_FILES)
 assert check_result["policy_delivery"] == "server-only"
 assert check_result["policy_version"] == POLICY_VERSION
 assert check_result["policy_contract_sha256"] == POLICY_CONTRACT_SHA256

@@ -17,14 +17,14 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.7.05"
-RELEASE_VERSION = "0.7.5"
+RELEASE_LABEL = "v0.7.07"
+RELEASE_VERSION = "0.7.7"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
-POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
+POLICY_VERSION = "2026-08-27.agent-shot-quality.v4.5"
 POLICY_CONTRACT_SHA256 = (
-    "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
+    "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
 )
 POLICY_DELIVERY = "server-only"
 SHOT_ROUTING_PROTOCOL_VERSION = "2026-08-20.shot-routing.v1"
@@ -54,6 +54,7 @@ RUNTIME_INSTALL_FILES = (
     "_hmb_screen_space.py",
     "widgets/HMBAgentLibraryWidget.js",
     "widgets/HMBImageAssetLibraryWidget.js",
+    "widgets/HMBImageAssetThumbnailPatchBridgeWidget.js",
     "widgets/HMBPromptLibraryScopedBindingWidget.js",
     "widgets/HMBSeedanceGenerationWidget.js",
     "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
@@ -69,7 +70,7 @@ DISTRIBUTION_ONLY_FILES = (
     "SBOM.spdx.json",
 )
 SOURCE_FILES = (*RUNTIME_INSTALL_FILES, *DISTRIBUTION_ONLY_FILES)
-if len(RUNTIME_INSTALL_FILES) != 21 or len(DISTRIBUTION_ONLY_FILES) != 4:
+if len(RUNTIME_INSTALL_FILES) != 22 or len(DISTRIBUTION_ONLY_FILES) != 4:
     raise RuntimeError("Runtime/distribution release boundary count mismatch.")
 if set(RUNTIME_INSTALL_FILES) & set(DISTRIBUTION_ONLY_FILES):
     raise RuntimeError("Runtime and distribution-only release files overlap.")

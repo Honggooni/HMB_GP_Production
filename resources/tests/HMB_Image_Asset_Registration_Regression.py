@@ -132,6 +132,12 @@ try:
     assert registered_candidate["image_sub_type"] == "Full Appearance"
     assert registered_candidate["source_type"] == "Character Appearance"
     assert registered_candidate["scope_candidate"] == "Full body / full appearance"
+    assert registered_state["project_cache_uid"] == state["project_cache_uid"]
+    assert registered_candidate["media_signature"] == asset_library._asset_file_facts(
+        candidate_path,
+        project_uid=registered_state["project_cache_uid"],
+        relative_path=candidate["relative_path"],
+    )[3]
     assert registered_state["asset_registration_request"] == {}
     assert registered_state["asset_registration_result"] == {
         "request_id": "register-candidate-1",
@@ -143,6 +149,7 @@ try:
     document = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert document["schema"] == "legacy-project-metadata"
     assert document["note"] == "preserve top-level metadata"
+    assert document["project_cache_uid"] == state["project_cache_uid"]
     assert len(document["assets"]) == 2
     persisted = next(
         item for item in document["assets"] if item.get("asset_id") == "HeroRig"

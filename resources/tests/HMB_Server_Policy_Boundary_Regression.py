@@ -14,9 +14,9 @@ EXPECTED_URL = "https://192.168.203.245:8443/api/v1/agent-core/dat"
 EXPECTED_HOST = "192.168.203.245"
 EXPECTED_PORT = 8443
 EXPECTED_PATH = "/api/v1/agent-core/dat"
-EXPECTED_VERSION = "2026-08-12.agent-shot-quality.v4.2"
+EXPECTED_VERSION = "2026-08-27.agent-shot-quality.v4.5"
 EXPECTED_CONTRACT_SHA256 = (
-    "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
+    "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
 )
 LOAD_FAILURE = "HMB_GP_Agent_Library internal rule payload could not be loaded."
 

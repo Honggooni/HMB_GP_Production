@@ -40,6 +40,8 @@ id_rsa*
 id_ed25519*
 
 # Test and coverage output
+.test-cache/
+reports/
 .coverage
 .coverage.*
 coverage.xml

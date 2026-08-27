@@ -681,18 +681,20 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.7.5"
+assert manifest["metadata"]["library_version"] == "0.7.7"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
 assert registered_widgets == {
     "HMBAgentLibraryWidget",
     "HMBImageAssetLibraryWidget",
+    "HMBImageAssetThumbnailPatchBridgeWidget",
     "HMBPromptLibraryScopedBindingWidget",
     "HMBSeedanceGenerationWidget",
     "HMBVideoPickerCommandBridgeWidget",
     "HMBVideoPickerLibraryWidget",
 }
+assert (ROOT / "widgets/HMBImageAssetThumbnailPatchBridgeWidget.js").is_file()
 assert (ROOT / "widgets/HMBVideoPickerCommandBridgeWidget_v032.js").is_file()
 assert (ROOT / "widgets/HMBSeedanceGenerationWidget.js").is_file()
 obsolete_picker_widgets = (
@@ -741,18 +743,18 @@ for native_size_key in (
 ):
     assert native_size_key not in agent_manifest["metadata"]
 
-# The active runtime is the server-hosted signed v4.2 policy. This internal
+# The active runtime is the server-hosted signed v4.5 policy. This internal
 # regression injects the private signed artifact without creating a local
 # runtime fallback or copying it into the public package.
 assert hashlib.sha256(signed_policy_fixture).hexdigest() == (
-    "6debb90960499ff6fe163a8a5a6db42a0da028f7a7606f993175edbd5712e65e"
+    "228b54e55dd4167f4cb58f8bdbdb8762818a636018180fe1ae97f7a023ac2144"
 )
 policy_payload = common._load_agent_rule_payload()
 assert policy_payload["final_policy_version"] == (
-    "2026-08-12.agent-shot-quality.v4.2"
+    "2026-08-27.agent-shot-quality.v4.5"
 )
 assert policy_payload["final_motion_look_policy_sha256"] == (
-    "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
+    "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
 )
 assert agent._assert_prompt_policy_identity_matches_signed_runtime() == (
     policy_payload["final_policy_version"],
@@ -1845,6 +1847,14 @@ with tempfile.TemporaryDirectory() as temp_dir:
                              "existing_lambert_count": 0,
                              "texture_connection_count": 2,
                              "numeric_color_count": 0,
+                             "loaded_plugin_passthrough_count": 0,
+                             "loaded_plugin_nodes": [],
+                             "plugin_fallback_count": 0,
+                             "plugin_fallback_material_count": 0,
+                             "plugin_fallback_node_count": 0,
+                             "plugin_fallback_records": [],
+                             "texture_identity_preserved": True,
+                             "warnings": [],
                              "swapped_shading_engine_count": 2,
                          },
                          "markers": [],

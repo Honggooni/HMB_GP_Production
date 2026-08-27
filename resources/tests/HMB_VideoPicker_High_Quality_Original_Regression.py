@@ -270,6 +270,14 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
             "existing_lambert_count": 0,
             "texture_connection_count": 1,
             "numeric_color_count": 0,
+            "loaded_plugin_passthrough_count": 0,
+            "loaded_plugin_nodes": [],
+            "plugin_fallback_count": 0,
+            "plugin_fallback_material_count": 0,
+            "plugin_fallback_node_count": 0,
+            "plugin_fallback_records": [],
+            "texture_identity_preserved": True,
+            "warnings": [],
             "swapped_shading_engine_count": 1,
         },
         "accepted_read_dependency_fingerprint": cache_fields[
@@ -310,6 +318,14 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
             "existing_lambert_count": 0,
             "texture_connection_count": 1,
             "numeric_color_count": 0,
+            "loaded_plugin_passthrough_count": 0,
+            "loaded_plugin_nodes": [],
+            "plugin_fallback_count": 0,
+            "plugin_fallback_material_count": 0,
+            "plugin_fallback_node_count": 0,
+            "plugin_fallback_records": [],
+            "texture_identity_preserved": True,
+            "warnings": [],
             "swapped_shading_engine_count": 1,
         },
         "accepted_read_dependency_fingerprint": cache_fields[
@@ -328,6 +344,21 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
     assert not picker._original_preview_cache_is_valid(
         scene_path, state, video_path, sidecar_path
     )
+
+    v1_material_sidecar = copy.deepcopy(current_sidecar)
+    v1_material_sidecar[ORIGINAL_MATERIAL_PROFILE_FIELD] = (
+        "per_source_material_lambert_texture_preserving_v1"
+    )
+    v1_material_sidecar["original_material_override_report"]["profile"] = (
+        "per_source_material_lambert_texture_preserving_v1"
+    )
+    sidecar_path.write_text(
+        json.dumps(v1_material_sidecar, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    assert not picker._original_preview_cache_is_valid(
+        scene_path, state, video_path, sidecar_path
+    ), "The strict v1 material cache must not hide the v2 plug-in fallback fix."
 
     missing_material_profile_sidecar = copy.deepcopy(current_sidecar)
     missing_material_profile_sidecar.pop(ORIGINAL_MATERIAL_PROFILE_FIELD)

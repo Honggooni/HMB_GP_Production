@@ -114,15 +114,70 @@ _FINAL_OUTPUT_SEMANTIC_MANIFEST_HEADER = (
     "HMB FINAL OUTPUT SEMANTIC MANIFEST (JSON):"
 )
 _FINAL_OUTPUT_SEMANTIC_MANIFEST_SCHEMA = "hmb-final-output-semantic-manifest"
-_FINAL_OUTPUT_SEMANTIC_MANIFEST_VERSION = 1
+_FINAL_OUTPUT_SEMANTIC_MANIFEST_VERSION = 2
 _FINAL_OUTPUT_SEMANTIC_CONTRACT = (
     "Preserve every source token and its declared target/authority in the final "
-    "generator instruction. Image references supply only their declared image "
-    "authority. A Look Reference transfers only its declared look attributes "
-    "and must not replace Main Background content. Video references supply only "
+    "generator instruction. Keep every named target ID literal exact. A Global "
+    "Look target may instead be stated unambiguously as a global, scene-wide, or "
+    "shared look authority for that same source. Image references supply only "
+    "their declared image authority. A relation marked unresolved or unbound in "
+    "the manifest is context-only for that exact relation; do not choose a winner "
+    "or let it own output attributes, and continue with every unaffected relation. "
+    "For each unresolved image relation, state its affected domain and local scope "
+    "and deny averaging or a slot-based winner. A video marked unbound because its "
+    "type, role, or relation-required binding is missing is context-only and owns no "
+    "motion, camera, spatial, FX, appearance, lighting, or scene-content attribute. "
+    "Every resolved Look Reference is transfer-only, whether or not a Main "
+    "Background source exists. It transfers only its declared look attributes "
+    "and must never define, supply, copy, replace, or acquire authority over "
+    "scene/background content, scene material identity, species, morphology, "
+    "depicted detail, geometry, objects, terrain, layout, composition, or "
+    "vegetation arrangement. Video references supply only "
     "their declared motion, timing, camera, spatial, FX, or guide evidence and "
-    "must not supply character appearance, identity, skin, body, costume, or "
-    "photorealism. Translate and preserve every custom_instruction; at the end "
+    "must not supply character appearance, identity, skin, body, costume, "
+    "photorealism, material, lighting, or final-look authority. A negative video "
+    "appearance disclaimer never permits a contradictory positive visual grant. "
+    "When Character or Character Prop images coexist with a Look Reference, "
+    "explicitly preserve each subject's intrinsic color, pattern, material, "
+    "stylization, native medium, local value hierarchy, signature accents, and "
+    "material breaks; keep every character visually separable. Character "
+    "distinctiveness is a hard priority over Look transfer, and the Look must "
+    "adapt around those identity cues instead of homogenizing them. "
+    "For every resolved Character, Character Prop, or Background Prop source, "
+    "preserve repeated painted or cel-style highlights as intrinsic authored "
+    "treatment. Remove only illumination that is either demonstrably "
+    "view-dependent captured studio illumination or explicitly typed and scoped "
+    "as captured studio key, fill, or rim evidence; preserve every uncertain "
+    "highlight or edge accent. A Look "
+    "Reference alone must never create or invent a visible light source, sun, "
+    "moon, luminous emitter, god ray, volumetric beam, lens flare, or bloom. "
+    "For every Character, Character Prop, or Background Prop source, state that "
+    "if a source-defined emitter exists, its image owns the emitter's design, "
+    "shape, placement, color, material, and steady emissive state; never remove, "
+    "redesign, recolor, retexture, reshape, relocate, or replace that intrinsic "
+    "component. Only an explicit scoped Shot instruction or fully typed FX source "
+    "may own its activation, timing, rays, bloom, spread, or other temporal "
+    "behavior. Even a typed FX source must not create a persistent light object "
+    "such as a new sun, moon, lamp, visible light source, or emitter. For a "
+    "Color / Look / Lighting source, "
+    "explicitly preserve all "
+    "three authority families: color/palette/grade, lighting/atmosphere/exposure, "
+    "and render/shading/style. An unclassified image or a Character/Character "
+    "Prop image without a Target is unbound context only and has no appearance, "
+    "identity, material, look, lighting, or scene-content authority. Translate "
+    "If a dark shadow threatens face, eye, or expression readability, adjust "
+    "shared low-frequency ambient or reflected bounce across the whole connected "
+    "local shadow field, including affected characters, props, and environment, "
+    "while preserving direct-light reduction and the continuous shadow boundary; "
+    "never apply a selective character-only lift. Protected Primary Unified Shot "
+    "Control wins every overlap with Local or Secondary motion. For every "
+    "conflicting Local/Secondary relation, keep its exact source and competing "
+    "source tokens, target, function, spatial domain, and listed frame interval "
+    "or whole-shot scope together in one conflict statement. That exact relation "
+    "remains unresolved only in its listed overlap and must never be averaged or "
+    "selected by slot. Translate and preserve every "
+    "custom_instruction; "
+    "at the end "
     "of that source's translated lighting clause append its exact "
     "custom_instruction_evidence_tag (the client removes this private tag before "
     "publication). Return natural generator-ready prose; do not reproduce this "
@@ -178,6 +233,7 @@ _PUBLIC_IMAGE_SOURCE_TYPES = frozenset(
     str(value) for value in _hmb.IMAGE_SOURCE_TYPE_CHOICES
 )
 _PUBLIC_VIDEO_SOURCE_TYPES = frozenset({
+    "",
     "Role Required / Select Video Type",
     "Ignore / Unused",
     "Maya Preview / Playblast",
@@ -1205,7 +1261,11 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
         raise RuntimeError("HMB public job collection is invalid.")
 
     def image_target_address(entry: Dict[str, Any]) -> str:
-        return str(entry.get("target_id") or entry.get("label") or "").strip()
+        main_type = str(entry.get("image_main_type") or "").strip()
+        target_id = str(entry.get("target_id") or "").strip()
+        if main_type in {"Character", "Character Prop"}:
+            return target_id
+        return target_id or str(entry.get("label") or "").strip()
 
     def image_target_address_key(entry: Dict[str, Any]) -> str:
         return _hmb.image_target_key(image_target_address(entry))
@@ -1257,7 +1317,8 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
 
     seen_images: set[str] = set()
     image_binding_video_tokens: List[str] = []
-    general_look_claims: List[tuple[str, frozenset[str], str]] = []
+    general_look_claims: List[tuple[str, frozenset[str], str, bool]] = []
+    character_appearance_claims: set[tuple[str, str, str]] = set()
     scale_claims: List[
         tuple[str, frozenset[str], frozenset[str]]
     ] = []
@@ -1287,10 +1348,32 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
         image_sub_type = str(image.get("image_sub_type") or "").strip()
         source_type = str(image.get("source_type") or "").strip()
         source_scope = str(image.get("source_scope") or "").strip()
+        target_id = str(image.get("target_id") or "").strip()
+        target_key = _hmb.image_target_key(target_id)
         target_scope_mode = str(image.get("target_scope_mode") or "").strip()
         custom_look_instruction = str(
             image.get("custom_look_instruction") or ""
         ).strip()
+        normalized_custom_instruction = _hmb.image_target_key(
+            custom_look_instruction
+        )
+        custom_target_keys = {
+            candidate
+            for candidate in general_look_named_targets
+            if re.search(
+                rf"(?<!\w){re.escape(candidate)}(?:"
+                rf"(?:에게서|에게|으로|에서|부터|까지|처럼|보다|은|는|이|가|"
+                rf"을|를|의|와|과|로|에|만)(?!\w)|(?!\w))",
+                normalized_custom_instruction,
+            )
+        }
+        custom_override_explicit = bool(
+            re.search(
+                r"(?:\boverrid(?:e|es|ing|den)\b|재정의|우선\s*적용|"
+                r"덮어\s*쓰(?:기|다)|대신\s*적용)",
+                normalized_custom_instruction,
+            )
+        )
         shared_lighting_sub_type = bool(
             image_main_type == "Look Reference"
             and image_sub_type
@@ -1331,8 +1414,6 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
                 and isinstance(bindings, list)
                 and not bindings
             )
-            target_id = str(image.get("target_id") or "").strip()
-            target_key = _hmb.image_target_key(target_id)
             if image_sub_type == "ch_Scale":
                 taxonomy_authority_valid = (
                     taxonomy_authority_valid
@@ -1397,7 +1478,8 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
                         taxonomy_authority_valid
                         and (
                             not target_id
-                            or target_id
+                            or
+                            target_id
                             in _hmb.IMAGE_GENERAL_LOOK_ALLOWED_SYSTEM_TARGETS
                             or target_key in general_look_named_targets
                         )
@@ -1434,6 +1516,9 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
         ):
             raise RuntimeError("HMB image source fields are invalid.")
         seen_images.add(token)
+        if image_main_type in {"Character", "Character Prop"} and target_id:
+            appearance_claim = (image_main_type, target_key, image_sub_type)
+            character_appearance_claims.add(appearance_claim)
         if (
             image_main_type == "Look Reference"
             and image_sub_type in _hmb.IMAGE_GENERAL_LOOK_REFERENCE_SUB_TYPES
@@ -1448,12 +1533,14 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
                 ),
             }[image_sub_type]
             if target_scope_mode == "custom":
-                normalized_custom_scope = " ".join(
-                    custom_look_instruction.split()
-                ).casefold()
-                claim_target = "custom:" + hashlib.sha256(
-                    normalized_custom_scope.encode("utf-8")
-                ).hexdigest()
+                # A standalone Custom instruction retains its authored broad
+                # scope. Exact named-target resolution is required only when
+                # deciding whether two authority claims are safely disjoint.
+                claim_target = (
+                    next(iter(custom_target_keys))
+                    if len(custom_target_keys) == 1
+                    else ""
+                )
                 claim_mode = "custom"
             elif (
                 target_scope_mode == "global"
@@ -1466,7 +1553,12 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
                 claim_target = _hmb.image_target_key(image.get("target_id"))
                 claim_mode = "named"
             general_look_claims.append(
-                (claim_target, look_domains, claim_mode)
+                (
+                    claim_target,
+                    look_domains,
+                    claim_mode,
+                    custom_override_explicit,
+                )
             )
         if (
             image_main_type == "Look Reference"
@@ -1519,25 +1611,45 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
         left_target,
         left_domains,
         left_mode,
+        left_override,
     ) in enumerate(general_look_claims):
         for (
             right_target,
             right_domains,
             right_mode,
+            right_override,
         ) in general_look_claims[index + 1:]:
-            scopes_overlap = (
-                left_target == right_target
-                or (
-                    left_mode == "global"
-                    and right_mode != "custom"
+            if not left_domains.intersection(right_domains):
+                continue
+            if left_mode == "custom" and right_mode == "custom":
+                # Same-domain Custom claims are disjoint only when each prose
+                # instruction resolves to exactly one different live target.
+                scopes_overlap = not (
+                    left_target
+                    and right_target
+                    and left_target != right_target
                 )
-                or (
-                    right_mode == "global"
-                    and left_mode != "custom"
+            elif left_mode == "global" and right_mode == "custom":
+                scopes_overlap = not (right_target and right_override)
+            elif right_mode == "global" and left_mode == "custom":
+                scopes_overlap = not (left_target and left_override)
+            elif left_mode == "named" and right_mode == "custom":
+                scopes_overlap = not (
+                    right_target and left_target != right_target
                 )
-            )
-            if scopes_overlap and left_domains.intersection(right_domains):
-                raise RuntimeError("HMB Look target attribute authority is ambiguous.")
+            elif right_mode == "named" and left_mode == "custom":
+                scopes_overlap = not (
+                    left_target and left_target != right_target
+                )
+            else:
+                scopes_overlap = (
+                    left_target == right_target
+                    or (left_mode == "global" and right_mode == "named")
+                    or (right_mode == "global" and left_mode == "named")
+                )
+            # Ambiguous Look domains are resolved locally in the private
+            # semantic manifest. They are not a reason to discard unrelated
+            # sources or stop the whole shot.
 
     # A relative-size sheet is measurement authority. Two sheets may describe
     # disjoint targets/domains, but the same named target or a domain-wide
@@ -1805,6 +1917,166 @@ def _assert_public_job_data_contract(prompt_value: Any) -> Dict[str, Any]:
     return job
 
 
+def _normalized_relation_key(value: Any) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _look_authority_domains(sub_type: str) -> set[str]:
+    return {
+        "Color Mood": {"color"},
+        "Lighting / Atmosphere": {"lighting"},
+        "Render Look": {"render"},
+        "Color / Look / Lighting": {"color", "lighting", "render"},
+    }.get(str(sub_type or ""), set())
+
+
+def _append_unresolved_relation(
+    row: Dict[str, Any],
+    *,
+    domain: str,
+    scope: str,
+    reason: str,
+    peers: list[str] | None = None,
+) -> None:
+    relation = {
+        "domain": str(domain or ""),
+        "scope": str(scope or ""),
+        "reason": str(reason or ""),
+        "peers": sorted({str(peer) for peer in (peers or []) if peer}),
+    }
+    unresolved = row.setdefault("unresolved_relations", [])
+    if relation not in unresolved:
+        unresolved.append(relation)
+
+
+def _motion_interval_sweep(
+    video_rows: list[Dict[str, Any]],
+) -> list[Dict[str, Any]]:
+    """Find cross-source Local/Secondary overlap without expanding frames.
+
+    Public jobs may contain thousands of interval records.  Grouped half-open
+    interval events keep this O(n log n), while the active source set is bounded
+    by the public ten-video limit.
+    """
+
+    relation_groups: Dict[
+        tuple[str, str, str],
+        list[tuple[str, int | None, int | None]],
+    ] = {}
+    relation_display: Dict[tuple[str, str, str], tuple[str, str, str]] = {}
+    for row in video_rows:
+        if row.get("control_role") not in {
+            "Local Motion Detail Only", "Secondary Motion Only",
+        }:
+            continue
+        token = str(row.get("token") or "")
+        for relation in row.get("motion_relations", []):
+            if not isinstance(relation, dict) or relation.get("resolved") is not True:
+                continue
+            key = (
+                _normalized_relation_key(relation.get("target")),
+                _normalized_relation_key(relation.get("function")),
+                _normalized_relation_key(relation.get("spatial_domain")),
+            )
+            relation_display.setdefault(key, (
+                str(relation.get("target") or ""),
+                str(relation.get("function") or ""),
+                str(relation.get("spatial_domain") or ""),
+            ))
+            for interval in relation.get("frame_intervals", []):
+                if not isinstance(interval, dict):
+                    continue
+                start = interval.get("start_frame")
+                end = interval.get("end_frame")
+                if start is not None and (
+                    not isinstance(start, int) or isinstance(start, bool)
+                ):
+                    continue
+                if end is not None and (
+                    not isinstance(end, int) or isinstance(end, bool)
+                ):
+                    continue
+                relation_groups.setdefault(key, []).append((token, start, end))
+
+    conflicts: list[Dict[str, Any]] = []
+    for relation_key, intervals in relation_groups.items():
+        target, function, spatial = relation_display[relation_key]
+        events: Dict[float | int, Dict[str, int]] = {}
+        for token, start, end in intervals:
+            begin = -math.inf if start is None else start
+            finish = math.inf if end is None else end + 1
+            events.setdefault(begin, {})[token] = (
+                events.setdefault(begin, {}).get(token, 0) + 1
+            )
+            events.setdefault(finish, {})[token] = (
+                events.setdefault(finish, {}).get(token, 0) - 1
+            )
+        points = sorted(events)
+        active: Dict[str, int] = {}
+        for index, point in enumerate(points[:-1]):
+            for token, delta in events[point].items():
+                next_count = active.get(token, 0) + delta
+                if next_count > 0:
+                    active[token] = next_count
+                else:
+                    active.pop(token, None)
+            next_point = points[index + 1]
+            active_tokens = sorted(active)
+            if len(active_tokens) < 2 or point == next_point:
+                continue
+            for token in active_tokens:
+                conflicts.append({
+                    "video": token,
+                    "target": target,
+                    "function": function,
+                    "spatial_domain": spatial,
+                    "start_frame": None if point == -math.inf else int(point),
+                    "end_frame": (
+                        None if next_point == math.inf else int(next_point) - 1
+                    ),
+                    "competing_videos": [
+                        peer for peer in active_tokens if peer != token
+                    ],
+                    "resolution": "unresolved_no_average_no_slot_winner",
+                })
+
+    # Merge adjacent segments with identical authority signatures.  This keeps
+    # the private prompt compact even when authored ranges are fragmented.
+    conflicts.sort(key=lambda item: (
+        item["video"], item["target"], item["function"],
+        item["spatial_domain"], tuple(item["competing_videos"]),
+        -math.inf if item["start_frame"] is None else item["start_frame"],
+    ))
+    merged: list[Dict[str, Any]] = []
+    for item in conflicts:
+        if merged:
+            previous = merged[-1]
+            same_signature = all(
+                previous.get(key) == item.get(key)
+                for key in (
+                    "video", "target", "function", "spatial_domain",
+                    "competing_videos", "resolution",
+                )
+            )
+            previous_end = previous.get("end_frame")
+            current_start = item.get("start_frame")
+            adjacent = (
+                previous_end is None
+                or current_start is None
+                or previous_end + 1 >= current_start
+            )
+            if same_signature and adjacent:
+                current_end = item.get("end_frame")
+                previous["end_frame"] = (
+                    None
+                    if previous_end is None or current_end is None
+                    else max(previous_end, current_end)
+                )
+                continue
+        merged.append(dict(item))
+    return merged
+
+
 def _build_final_output_semantic_manifest(job: Any) -> Dict[str, Any]:
     """Build a small, policy-free checklist from the validated public job.
 
@@ -1820,7 +2092,16 @@ def _build_final_output_semantic_manifest(job: Any) -> Dict[str, Any]:
     videos = job.get("videos")
     if not isinstance(images, list) or not isinstance(videos, list):
         return {}
+    renderable_target_keys = {
+        _hmb.image_target_key(image.get("target_id"))
+        for image in images
+        if isinstance(image, dict)
+        and str(image.get("image_main_type") or "").strip()
+        in _hmb.IMAGE_GENERAL_LOOK_NAMED_TARGET_MAIN_TYPES
+        and str(image.get("target_id") or "").strip()
+    }.difference(_hmb.IMAGE_SYSTEM_TARGET_KEYS)
     image_rows: list[Dict[str, Any]] = []
+    look_claims: list[Dict[str, Any]] = []
     for image in images:
         if not isinstance(image, dict):
             continue
@@ -1836,11 +2117,31 @@ def _build_final_output_semantic_manifest(job: Any) -> Dict[str, Any]:
         custom_digest = (
             _prompt_text_sha256(custom_instruction) if custom_instruction else ""
         )
-        image_rows.append({
+        target = str(image.get("target_id") or "").strip()
+        authority_domains = sorted(_look_authority_domains(sub_type))
+        unbound_authority = bool(
+            main_type == str(_hmb.IMAGE_MAIN_TYPE_UNCLASSIFIED)
+            or (
+                main_type in {"Character", "Character Prop", "Background Prop"}
+                and not target
+            )
+            or (
+                main_type == "Look Reference"
+                and sub_type in {"Color Mood", "Render Look"}
+                and not target
+            )
+        )
+        row: Dict[str, Any] = {
             "token": token,
             "main_type": main_type,
             "sub_type": sub_type,
-            "target": str(image.get("target_id") or "").strip(),
+            "target": target,
+            "authority_domains": authority_domains,
+            "unresolved_domains": (
+                list(authority_domains) if unbound_authority else []
+            ),
+            "unresolved_relations": [],
+            "unbound_authority": unbound_authority,
             "scope_mode": scope_mode,
             "custom_instruction": custom_instruction,
             "custom_instruction_sha256": custom_digest,
@@ -1849,29 +2150,441 @@ def _build_final_output_semantic_manifest(job: Any) -> Dict[str, Any]:
                 if custom_digest
                 else ""
             ),
-        })
-    video_rows: list[Dict[str, str]] = []
+        }
+        if unbound_authority:
+            _append_unresolved_relation(
+                row,
+                domain="appearance" if not authority_domains else ",".join(authority_domains),
+                scope=target,
+                reason=(
+                    "missing_required_target"
+                    if main_type != str(_hmb.IMAGE_MAIN_TYPE_UNCLASSIFIED)
+                    else "missing_required_type"
+                ),
+            )
+        image_rows.append(row)
+        if main_type == "Look Reference" and authority_domains:
+            normalized_instruction = _hmb.image_target_key(custom_instruction)
+            custom_targets = {
+                candidate
+                for candidate in renderable_target_keys
+                if re.search(
+                    rf"(?<!\w){re.escape(candidate)}(?:(?:에게서|에게|으로|에서|"
+                    rf"부터|까지|처럼|보다|은|는|이|가|을|를|의|와|과|로|에|만)"
+                    rf"(?!\w)|(?!\w))",
+                    normalized_instruction,
+                )
+            }
+            custom_targets.update(
+                _hmb.image_target_key(candidate)
+                for candidate in re.findall(
+                    r"(?<![\w.-])([A-Za-z][A-Za-z0-9_.-]{1,79})\s+only\b",
+                    custom_instruction,
+                    flags=re.IGNORECASE,
+                )
+                if _hmb.image_target_key(candidate)
+                not in _hmb.IMAGE_SYSTEM_TARGET_KEYS
+            )
+            custom_override = bool(re.search(
+                r"(?:\boverrid(?:e|es|ing|den)\b|재정의|우선\s*적용|"
+                r"덮어\s*쓰(?:기|다)|대신\s*적용)",
+                normalized_instruction,
+            ))
+            custom_scene_wide = bool(re.search(
+                r"(?:\b(?:scene[- ]wide|global|whole\s+scene|entire\s+scene|"
+                r"all\s+visible\s+(?:subjects?|characters?|elements?))\b|"
+                r"장면\s*전체|전체\s*장면|전역)",
+                normalized_instruction,
+            ))
+            if scope_mode == "custom":
+                if len(custom_targets) == 1:
+                    claim_mode = "custom"
+                    claim_target = next(iter(custom_targets))
+                elif not custom_targets and custom_scene_wide:
+                    claim_mode = "global"
+                    claim_target = _hmb.image_target_key("Global Look")
+                else:
+                    claim_mode = "custom"
+                    claim_target = ""
+                    row["unresolved_domains"] = list(authority_domains)
+                    row["unbound_authority"] = True
+                    _append_unresolved_relation(
+                        row,
+                        domain=",".join(authority_domains),
+                        scope="custom",
+                        reason="custom_target_missing_or_ambiguous",
+                    )
+            elif scope_mode == "global" or _hmb.image_target_key(target) == _hmb.image_target_key("Global Look"):
+                claim_mode = "global"
+                claim_target = _hmb.image_target_key("Global Look")
+            else:
+                claim_mode = "named"
+                claim_target = _hmb.image_target_key(target)
+            look_claims.append({
+                "row": row,
+                "domains": set(authority_domains),
+                "mode": claim_mode,
+                "target": claim_target,
+                "override": custom_override,
+            })
+
+    # Duplicate appearance relations fail locally: no slot/order based winner.
+    duplicate_claims: Dict[tuple[str, str, str], list[Dict[str, Any]]] = {}
+    for row in image_rows:
+        if row["main_type"] in {"Character", "Character Prop"} and row["target"]:
+            duplicate_claims.setdefault((
+                row["main_type"],
+                _hmb.image_target_key(row["target"]),
+                row["sub_type"],
+            ), []).append(row)
+    for duplicate_rows in duplicate_claims.values():
+        if len(duplicate_rows) < 2:
+            continue
+        peer_tokens = [str(row["token"]) for row in duplicate_rows]
+        for row in duplicate_rows:
+            row["unbound_authority"] = True
+            if "appearance" not in row["unresolved_domains"]:
+                row["unresolved_domains"].append("appearance")
+            _append_unresolved_relation(
+                row,
+                domain="appearance",
+                scope=str(row["target"]),
+                reason="duplicate_same_target_and_sub_type",
+                peers=[token for token in peer_tokens if token != row["token"]],
+            )
+
+    # Resolve Look conflicts per attribute domain and scope.  A global row keeps
+    # its non-overlapping scene authority when only a local scope conflicts.
+    for index, left in enumerate(look_claims):
+        for right in look_claims[index + 1:]:
+            domains = left["domains"].intersection(right["domains"])
+            if not domains:
+                continue
+            left_mode, right_mode = left["mode"], right["mode"]
+            left_target, right_target = left["target"], right["target"]
+            if left_mode == "custom" and right_mode == "custom":
+                overlap = not (
+                    left_target and right_target and left_target != right_target
+                )
+            elif left_mode == "global" and right_mode == "custom":
+                overlap = not (right_target and right["override"])
+            elif right_mode == "global" and left_mode == "custom":
+                overlap = not (left_target and left["override"])
+            elif left_mode == "named" and right_mode == "custom":
+                overlap = not (right_target and left_target != right_target)
+            elif right_mode == "named" and left_mode == "custom":
+                overlap = not (left_target and left_target != right_target)
+            else:
+                overlap = (
+                    left_target == right_target
+                    or (left_mode == "global" and right_mode == "named")
+                    or (right_mode == "global" and left_mode == "named")
+                )
+            if not overlap:
+                continue
+            if left_mode == "global" and right_mode != "global":
+                scope = right_target or "ambiguous local scope"
+            elif right_mode == "global" and left_mode != "global":
+                scope = left_target or "ambiguous local scope"
+            else:
+                scope = left_target or right_target or "ambiguous local scope"
+            for claim, peer in ((left, right), (right, left)):
+                row = claim["row"]
+                for domain in sorted(domains):
+                    _append_unresolved_relation(
+                        row,
+                        domain=domain,
+                        scope=scope,
+                        reason="look_authority_scope_conflict",
+                        peers=[str(peer["row"]["token"])],
+                    )
+                    fully_unresolved_scope = (
+                        claim["mode"] != "global"
+                        or peer["mode"] == "global"
+                    )
+                    if fully_unresolved_scope:
+                        if domain not in row["unresolved_domains"]:
+                            row["unresolved_domains"].append(domain)
+                if (
+                    (
+                        claim["mode"] != "global"
+                        or peer["mode"] == "global"
+                    )
+                    and set(row["authority_domains"]).issubset(
+                        set(row["unresolved_domains"])
+                    )
+                ):
+                    row["unbound_authority"] = True
+
+    source_images = {
+        str(image.get("image") or ""): image
+        for image in images if isinstance(image, dict)
+    }
+    ranges_by_binding: Dict[tuple[str, str, str], list[Dict[str, Any]]] = {}
+    for item in job.get("frame_ranges", []):
+        if not isinstance(item, dict) or item.get("valid") is not True:
+            continue
+        key = (
+            str(item.get("image") or ""),
+            str(item.get("video") or ""),
+            _normalized_relation_key(item.get("marker_color")),
+        )
+        ranges_by_binding.setdefault(key, []).extend(
+            dict(segment)
+            for segment in item.get("segments", [])
+            if isinstance(segment, dict)
+        )
+
+    video_rows: list[Dict[str, Any]] = []
     for video in videos:
         if not isinstance(video, dict):
             continue
         token = str(video.get("video") or "").strip()
         if not token:
             continue
-        video_rows.append({
+        source_type = str(video.get("source_type") or "").strip()
+        control_role = str(video.get("control_role") or "").strip()
+        fully_typed = bool(
+            source_type not in {
+                "", "Role Required / Select Video Type", "Ignore / Unused",
+            }
+            and control_role
+            and bool(video.get("control_role_explicit"))
+            and (
+                source_type != "Custom"
+                or str(video.get("custom_source_type") or "").strip()
+            )
+            and (
+                control_role != "Custom Role"
+                or str(video.get("custom_control_role") or "").strip()
+            )
+        )
+        row: Dict[str, Any] = {
             "token": token,
-            "source_type": str(video.get("source_type") or "").strip(),
-            "control_role": str(video.get("control_role") or "").strip(),
+            "source_type": source_type,
+            "control_role": control_role,
+            "unbound_authority": not fully_typed,
+            "unresolved_reasons": ([] if fully_typed else ["missing_type_or_role"]),
+            "motion_relations": [],
+            "primary_precedence_tokens": [],
+        }
+        video_rows.append(row)
+
+    video_by_token = {str(row["token"]): row for row in video_rows}
+    primary_motion_tokens = [
+        str(row["token"])
+        for row in video_rows
+        if not row["unbound_authority"]
+        and row["control_role"] == "Primary Unified Shot Control"
+    ]
+    for row in video_rows:
+        if row.get("control_role") in {
+            "Local Motion Detail Only", "Secondary Motion Only",
+        }:
+            row["primary_precedence_tokens"] = list(primary_motion_tokens)
+    relation_keys_seen: set[tuple[Any, ...]] = set()
+
+    def add_motion_relation(
+        token: str,
+        *,
+        target: str,
+        function: str,
+        spatial_domain: str,
+        intervals: list[Dict[str, Any]],
+        origin: str,
+    ) -> None:
+        row = video_by_token.get(token)
+        if not row or row.get("control_role") not in {
+            "Local Motion Detail Only", "Secondary Motion Only",
+        }:
+            return
+        resolved = bool(target and function and spatial_domain)
+        normalized_intervals = intervals or [{"start_frame": None, "end_frame": None}]
+        signature = (
+            token,
+            _normalized_relation_key(target),
+            _normalized_relation_key(function),
+            _normalized_relation_key(spatial_domain),
+            tuple((item.get("start_frame"), item.get("end_frame")) for item in normalized_intervals),
+        )
+        if signature in relation_keys_seen:
+            return
+        relation_keys_seen.add(signature)
+        row["motion_relations"].append({
+            "target": target,
+            "function": function,
+            "spatial_domain": spatial_domain,
+            "frame_intervals": normalized_intervals,
+            "origin": origin,
+            "resolved": resolved,
+            "reason": "" if resolved else "missing_required_motion_binding",
+            "primary_precedence_tokens": list(primary_motion_tokens),
         })
+
+    # Image bindings are the canonical Picker address: Target + function/scope
+    # + marker/spatial domain, optionally narrowed by validated frame ranges.
+    bound_range_keys: set[tuple[str, str, str]] = set()
+    for image_token, source_image in source_images.items():
+        target = str(source_image.get("target_id") or "").strip()
+        for binding in source_image.get("bindings", []):
+            if not isinstance(binding, dict):
+                continue
+            token = str(binding.get("video") or "")
+            marker = str(binding.get("marker_color") or "").strip()
+            target_scope = str(binding.get("target_scope") or "").strip()
+            key = (image_token, token, _normalized_relation_key(marker))
+            intervals = ranges_by_binding.get(key, [])
+            if intervals:
+                bound_range_keys.add(key)
+            add_motion_relation(
+                token,
+                target=target,
+                function="motion",
+                spatial_domain=" | ".join(
+                    value for value in (target_scope, marker) if value
+                ),
+                intervals=intervals,
+                origin="image_binding",
+            )
+
+    # A valid Range is itself a typed local address even if the visible binding
+    # row was compacted before publication.
+    for key, intervals in ranges_by_binding.items():
+        if key in bound_range_keys:
+            continue
+        image_token, token, marker = key
+        source_image = source_images.get(image_token, {})
+        add_motion_relation(
+            token,
+            target=str(source_image.get("target_id") or "").strip(),
+            function="motion",
+            spatial_domain=marker,
+            intervals=intervals,
+            origin="frame_range",
+        )
+
+    for control in job.get("control_only_bindings", []):
+        if not isinstance(control, dict):
+            continue
+        boundary = str(control.get("boundary") or "").strip()
+        frame_match = re.fullmatch(
+            r"(?:frames?\s*)?(-?\d+)\s*(?:-|to|through)\s*(-?\d+)",
+            boundary,
+            flags=re.IGNORECASE,
+        )
+        point_match = re.fullmatch(
+            r"(?:frame\s*)?(-?\d+)", boundary, flags=re.IGNORECASE,
+        )
+        intervals: list[Dict[str, Any]] = []
+        if frame_match:
+            start, end = int(frame_match.group(1)), int(frame_match.group(2))
+            if start <= end:
+                intervals = [{"start_frame": start, "end_frame": end}]
+        elif point_match:
+            frame = int(point_match.group(1))
+            intervals = [{"start_frame": frame, "end_frame": frame}]
+        add_motion_relation(
+            str(control.get("video") or ""),
+            target=str(control.get("target_id") or "").strip(),
+            function=str(control.get("function") or "").strip(),
+            spatial_domain=" | ".join(
+                value for value in (
+                    str(control.get("marker_color") or "").strip(),
+                    "" if intervals else boundary,
+                ) if value
+            ),
+            intervals=intervals,
+            origin="control_only_binding",
+        )
+
+    for row in video_rows:
+        if row.get("control_role") in {
+            "Local Motion Detail Only", "Secondary Motion Only",
+        }:
+            if not row["motion_relations"] or not any(
+                relation.get("resolved") is True
+                for relation in row["motion_relations"]
+            ):
+                row["unbound_authority"] = True
+                if "missing_required_motion_binding" not in row["unresolved_reasons"]:
+                    row["unresolved_reasons"].append(
+                        "missing_required_motion_binding"
+                    )
+
+    unresolved_motion_relations = _motion_interval_sweep(video_rows)
+    for conflict in unresolved_motion_relations:
+        row = video_by_token.get(str(conflict.get("video") or ""))
+        if row is not None:
+            row.setdefault("unresolved_motion_relations", []).append(conflict)
+    for row in video_rows:
+        row.setdefault("unresolved_motion_relations", [])
     main_background_tokens = [
         row["token"]
         for row in image_rows
         if row["main_type"] == "Environment / Background"
         and row["sub_type"] == "Main Background"
+        and not row["unbound_authority"]
     ]
     look_tokens = [
         row["token"]
         for row in image_rows
         if row["main_type"] == "Look Reference"
+        and row["sub_type"] in _hmb.IMAGE_GENERAL_LOOK_REFERENCE_SUB_TYPES
+        and not row["unbound_authority"]
+    ]
+    relighting_look_tokens = [
+        row["token"]
+        for row in image_rows
+        if row["main_type"] == "Look Reference"
+        and row["sub_type"] in {
+            "Lighting / Atmosphere",
+            "Color / Look / Lighting",
+        }
+        and not row["unbound_authority"]
+        and "lighting" in set(row["authority_domains"])
+        and "lighting" not in set(row["unresolved_domains"])
+    ]
+    character_tokens = [
+        row["token"]
+        for row in image_rows
+        if row["main_type"] == "Character"
+        and not row["unbound_authority"]
+    ]
+    character_prop_tokens = [
+        row["token"]
+        for row in image_rows
+        if row["main_type"] == "Character Prop"
+        and not row["unbound_authority"]
+    ]
+    background_prop_tokens = [
+        row["token"]
+        for row in image_rows
+        if row["main_type"] == "Background Prop"
+        and not row["unbound_authority"]
+    ]
+    character_intrinsic_tokens = character_tokens + character_prop_tokens
+    intrinsic_emitter_tokens = (
+        character_tokens + character_prop_tokens + background_prop_tokens
+    )
+    appearance_intrinsic_tokens = list(intrinsic_emitter_tokens)
+    shot_fx_behavior_tokens = [
+        row["token"]
+        for row in video_rows
+        if not row["unbound_authority"]
+        and (row["control_role"]
+        in {
+            "FX Effect Only",
+            "FX Behavior Only",
+        }
+        or row["source_type"] == "FX Reference")
+    ]
+    primary_unified_tokens = list(primary_motion_tokens)
+    local_motion_tokens = [
+        row["token"] for row in video_rows
+        if not row["unbound_authority"]
+        and row["control_role"] in {
+            "Local Motion Detail Only", "Secondary Motion Only",
+        }
     ]
     return {
         "schema": _FINAL_OUTPUT_SEMANTIC_MANIFEST_SCHEMA,
@@ -1880,10 +2593,39 @@ def _build_final_output_semantic_manifest(job: Any) -> Dict[str, Any]:
         "videos": video_rows,
         "main_background_tokens": main_background_tokens,
         "look_tokens": look_tokens,
-        "require_background_look_non_substitution": bool(
-            main_background_tokens and look_tokens
-        ),
+        "relighting_look_tokens": relighting_look_tokens,
+        "character_tokens": character_tokens,
+        "character_prop_tokens": character_prop_tokens,
+        "background_prop_tokens": background_prop_tokens,
+        "character_intrinsic_tokens": character_intrinsic_tokens,
+        "intrinsic_emitter_tokens": intrinsic_emitter_tokens,
+        "appearance_intrinsic_tokens": appearance_intrinsic_tokens,
+        "shot_fx_behavior_tokens": shot_fx_behavior_tokens,
+        "primary_unified_tokens": primary_unified_tokens,
+        "local_motion_tokens": local_motion_tokens,
+        "unresolved_motion_relations": unresolved_motion_relations,
+        "require_background_look_non_substitution": bool(look_tokens),
         "require_video_appearance_isolation": bool(video_rows),
+        "require_character_intrinsic_distinctiveness": bool(
+            character_intrinsic_tokens and look_tokens
+        ),
+        "require_shared_shadow_readability": bool(
+            character_tokens
+            and (main_background_tokens or relighting_look_tokens)
+        ),
+        "require_painted_cel_highlight_preservation": bool(
+            appearance_intrinsic_tokens
+        ),
+        "require_look_visible_light_non_creation": bool(look_tokens),
+        "require_intrinsic_emitter_source_separation": bool(
+            intrinsic_emitter_tokens
+        ),
+        "require_primary_motion_precedence": bool(
+            primary_unified_tokens and local_motion_tokens
+        ),
+        "require_local_motion_conflict_isolation": bool(
+            unresolved_motion_relations
+        ),
     }
 
 
@@ -1966,6 +2708,45 @@ def _semantic_literal_present(text: str, value: str) -> bool:
     return normalized in " ".join(text.split()).casefold()
 
 
+def _semantic_target_present(
+    text: str,
+    window: str,
+    target: str,
+    main_type: str,
+    scope_mode: str,
+) -> bool:
+    """Check a target without confusing a UI label with its preserved meaning.
+
+    Renderable/named targets remain exact identifiers. ``Global Look`` is the
+    one reserved scope label whose meaning can be preserved naturally as an
+    unambiguous global or scene-wide look authority without repeating the UI
+    label verbatim.
+    """
+
+    if not target or target == "Custom":
+        return True
+    if _semantic_literal_present(text, target):
+        return True
+    if (
+        target != "Global Look"
+        or main_type != "Look Reference"
+        or scope_mode != "global"
+    ):
+        return False
+    global_terms = (
+        "global", "scene-wide", "scene wide", "shared scene", "entire shot",
+        "across the shot", "across all visible",
+    )
+    look_terms = (
+        "look", "palette", "grade", "lighting", "illumination", "render",
+        "shading", "style", "atmosphere", "exposure",
+    )
+    return (
+        any(term in window for term in global_terms)
+        and any(term in window for term in look_terms)
+    )
+
+
 def _has_global_video_appearance_isolation(text: str) -> bool:
     """Accept one explicit shot-wide video appearance exclusion clause.
 
@@ -1989,6 +2770,1468 @@ def _has_global_video_appearance_isolation(text: str) -> bool:
     return any(re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL) for pattern in patterns)
 
 
+def _semantic_assertion_clauses(text: str) -> list[str]:
+    """Split prose where a later positive grant cannot borrow an earlier denial."""
+
+    boundary = (
+        r"(?:[\r\n]+|(?<=[.!?;])\s+|\b(?:but|however|nevertheless|while|whereas)\b|"
+        r"\b(?:and|while|whereas)\b(?=\s+@(?:image|video)\d+)|"
+        r"\band\b(?=\s+(?:@video\d+|videos?\b|playblasts?\b|proxies?\b|"
+        r"use\b|copy\b|take\b|derive\b|follow\b|match\b|create\b|add\b|"
+        r"invent\b|generate\b|introduce\b|spawn\b|place\b|provide\b|"
+        r"supply\b|define\b|set\b|control\b|own\b|manifest\b|instantiate\b|"
+        r"paint\b|composite\b|render\b|show\b|depict\b|form\b|overwrite\b|"
+        r"replace\b|homogenize\b|repaint\b|retexture\b|restyle\b|has\b|have\b)))"
+    )
+    return [
+        clause.strip()
+        for clause in re.split(boundary, str(text or "").casefold())
+        if clause.strip()
+    ]
+
+
+def _semantic_authority_match_is_negated(clause: str, match: Any) -> bool:
+    """Recognize a local denial without masking another clause's positive grant."""
+
+    claim_start = match.start("claim")
+    claim_end = match.end("claim")
+    domain_start = match.start("domain")
+    before_claim = clause[max(0, claim_start - 56):claim_start]
+    before_domain = clause[max(claim_end, domain_start - 48):domain_start]
+    before_match = clause[max(0, match.start() - 24):match.start()]
+    return bool(
+        re.search(
+            r"\b(?:do(?:es)?|must|should|can|could|may|will|is|are|was|were|"
+            r"has|have)\s+not(?:\s+\w+){0,4}\s*$",
+            before_claim,
+        )
+        or re.search(
+            r"\b(?:do(?:es)?|must|should|can|could|may|will|is|are|was|were|"
+            r"has|have)\s+not\b.{0,48}$",
+            before_claim,
+        )
+        or re.search(r"\b(?:cannot|can't|without)\b.{0,32}$", before_claim)
+        or re.search(r"\bno\s+authority\s+to\b.{0,32}$", before_claim)
+        or re.search(
+            r"\b(?:never|do(?:es)?\s+not|must\s+not)\b"
+            r"(?:[\s,]+[a-z][\w-]*){0,8}[\s,]*$",
+            before_claim,
+        )
+        or re.search(r"\bnever(?:\s+\w+){0,4}\s*$", before_claim)
+        or re.search(r"\bno(?:\s+\w+){0,3}\s*$", before_claim)
+        or re.search(r"\b(?:no|not|never|without)\b", before_domain)
+        or re.search(r"\b(?:no|never)\s*$", before_match)
+    )
+
+
+def _semantic_domain_owned_by_other_source(
+    clause: str,
+    match: Any,
+    allowed_tokens: set[str],
+    authorized_other_tokens: set[str],
+) -> bool:
+    """Accept only an explicit exclusive owner outside the tested sources.
+
+    Merely mentioning another source, or saying that sources act ``jointly``,
+    must never hide an otherwise-positive authority grant.  The exemption is
+    deliberately narrow: the exact matched domain must be assigned solely or
+    exclusively to a source that the manifest already authorizes for it.
+    """
+
+    authorized = {
+        token.casefold()
+        for token in authorized_other_tokens
+        if token and token.casefold() not in {
+            allowed.casefold() for allowed in allowed_tokens
+        }
+    }
+    if not authorized:
+        return False
+
+    domain = str(match.groupdict().get("domain") or "").strip()
+    if not domain:
+        return False
+    domain_pattern = re.escape(domain)
+    window = clause[
+        max(0, match.start() - 160):min(len(clause), match.end() + 200)
+    ]
+    for token in authorized:
+        source = re.escape(token)
+        patterns = (
+            rf"{source}.{{0,80}}\b(?:is|remains?|retains?)?\s*"
+            rf"(?:the\s+)?(?:sole|exclusive)\b.{{0,40}}{domain_pattern}"
+            rf".{{0,40}}\b(?:source|owner|authority|basis)\b",
+            rf"{source}.{{0,80}}\b(?:is|remains?|retains?|acts?\s+as)?\s*"
+            rf"(?:the\s+)?(?:sole|exclusive)\b.{{0,80}}"
+            rf"(?:source|owner|authority|basis|defines?|owns?|supplies?|provides?)"
+            rf"\b.{{0,80}}{domain_pattern}",
+            rf"{source}.{{0,60}}\b(?:alone|solely|exclusively)\b.{{0,60}}"
+            rf"(?:defines?|owns?|supplies?|provides?|governs?|controls?)\b"
+            rf".{{0,80}}{domain_pattern}",
+            rf"{domain_pattern}.{{0,80}}\b(?:comes?|derives?|(?:is\s+)?(?:taken|"
+            rf"sourced|defined)|belongs?|remains?)\b.{{0,50}}"
+            rf"\b(?:solely|exclusively|only)\b.{{0,30}}\b(?:from|with|by)\b"
+            rf".{{0,30}}{source}",
+            rf"{domain_pattern}.{{0,80}}\b(?:is|remains?)\b.{{0,30}}"
+            rf"(?:the\s+)?(?:sole|exclusive)\b.{{0,50}}"
+            rf"(?:authority|property|domain)\b.{{0,30}}(?:of|for)\s+{source}",
+        )
+        if any(re.search(pattern, window, flags=re.DOTALL) for pattern in patterns):
+            return True
+    return False
+
+
+def _has_positive_joint_source_authority(
+    text: str,
+    tested_tokens: set[str],
+    grant_pattern: str,
+    domain_pattern: str,
+) -> bool:
+    """Reject a grant only when a tested token is an actual joint subject.
+
+    The ordinary assertion splitter deliberately separates ``and @imageN`` and
+    ``while @imageN`` clauses.  Joint grants therefore need a pre-pass, but that
+    pre-pass must inspect the coordinated subject itself rather than every token
+    appearing somewhere in the same sentence.
+    """
+
+    tested = {token.casefold() for token in tested_tokens if token}
+    clauses = [
+        clause.strip()
+        for clause in re.split(
+            r"(?:[\r\n]+|(?<=[.!?;])\s+|\b(?:but|however|nevertheless)\b)",
+            str(text or "").casefold(),
+        )
+        if clause.strip()
+    ]
+    address = r"@(?:image|video)\d+"
+    coordinated_subject = (
+        rf"(?P<subjects>{address}(?:\s*(?:,|/|&|\band\b|\bwith\b)\s*"
+        rf"{address})+)"
+    )
+    joint_with_subject = (
+        rf"(?P<subjects>{address}\s+(?:jointly|together)\s+"
+        rf"(?:with|and)\s+{address})"
+    )
+    patterns = (
+        rf"{coordinated_subject}\s+\b(?:jointly|together)\b.{{0,40}}"
+        rf"(?P<claim>{grant_pattern}).{{0,120}}(?P<domain>{domain_pattern})",
+        rf"{joint_with_subject}.{{0,40}}(?P<claim>{grant_pattern})"
+        rf".{{0,120}}(?P<domain>{domain_pattern})",
+        rf"{coordinated_subject}.{{0,40}}(?P<claim>{grant_pattern})"
+        rf".{{0,100}}(?P<domain>{domain_pattern}).{{0,50}}"
+        rf"\b(?:jointly|together)\b",
+        rf"{coordinated_subject}.{{0,30}}(?P<claim>(?:are|remain|act\s+as)?"
+        rf"\s*(?:joint|shared)\s+(?:sources?|authorit(?:y|ies)|owners?|"
+        rf"ownership))\b.{{0,80}}(?P<domain>{domain_pattern})",
+    )
+    for clause in clauses:
+        for pattern in patterns:
+            for match in re.finditer(pattern, clause, flags=re.DOTALL):
+                subject_tokens = {
+                    address.casefold()
+                    for address in re.findall(
+                        r"@(?:image|video)\d+",
+                        str(match.groupdict().get("subjects") or ""),
+                    )
+                }
+                if (
+                    not subject_tokens.intersection(tested)
+                    or not subject_tokens.difference(tested)
+                ):
+                    continue
+                if not _semantic_authority_match_is_negated(clause, match):
+                    return True
+    return False
+
+
+def _has_positive_video_visual_authority(
+    text: str,
+    token: str,
+    appearance_tokens: list[str],
+) -> bool:
+    """Reject positive video/proxy visual grants even beside valid denials."""
+
+    generic_subject = (
+        r"(?<![@\w])(?:"
+        r"(?:(?:all|every|any|each|the|this)\s+)?videos?(?:\s+references?)?|"
+        r"(?:maya\s+)?(?:preview|playblast)s?|motion\s+references?|"
+        r"(?:video\s+)?proxies?|control\s+visualizations?"
+        r")(?!\w)"
+    )
+    subject = (
+        rf"(?:{re.escape(token.casefold())}|"
+        rf"{generic_subject})"
+    )
+    domain = (
+        r"(?:(?:character\s+)?(?:appearance|identity|design)|materials?|"
+        r"final[- ](?:look|lighting)|lighting\s+(?:appearance|look|style|values?|setup)|"
+        r"visual[- ]authority|colou?r|palette|patterns?|textures?|shading|styles?|"
+        r"styli[sz](?:ation|ing)|proportions?|markings?|species|"
+        r"(?:facial\s+)?anatom(?:y|ical\s+(?:detail|structure))|"
+        r"skin\s+(?:texture|pores?|anatomy)|visible\s+pores?|"
+        r"(?:scene|environment|background)\s+(?:content|geometry|objects?|assets?|"
+        r"terrain|vegetation)\b(?![^.;]{0,48}\b(?:motion|movement|animation|"
+        r"alignment|spatial|occlusion|visibility|contact|tracking)\b)|"
+        r"(?:intrinsic|character|prop|persistent)\s+(?:emitters?|emissive\s+"
+        r"components?|light\s+sources?)|"
+        r"(?:emitters?|emissive\s+components?|glowing\s+eyes?|energy\s+cores?|"
+        r"headlamps?|luminous\s+(?:orbs?|discs?))\s+(?:appearance|identity|design|"
+        r"shape|placement|colou?r|materials?)|persistent\s+light\s+objects?|"
+        r"facial\s+features?\b(?![^.;]{0,48}\b(?:motion|movement|performance|"
+        r"animation|deformation|tracking|retarget(?:ing)?|simulation|dynamics?)\b)|"
+        r"body\s+(?:shapes?|forms?)\b(?![^.;]{0,48}\b(?:motion|movement|"
+        r"performance|animation|deformation|tracking|retarget(?:ing)?|simulation|"
+        r"dynamics?)\b)|native\s+medium|medium|"
+        r"(?:skin|body|face|facial|hair|costume|clothing|wardrobe|outfit|accessor(?:y|ies)|"
+        r"silhouettes?)\s+(?:appearance|identity|design|look|style|colou?r|palette|"
+        r"patterns?|textures?|materials?|shading|proportions?|shapes?|forms?|features?)"
+        r"\b(?![^.;]{0,48}\b(?:motion|movement|performance|animation|deformation|"
+        r"tracking|retarget(?:ing)?|simulation|dynamics?)\b)|"
+        r"photoreal(?:ism|istic)?)"
+    )
+    grant = (
+        r"(?:provides?|supplies?|defines?|sets?|controls?|governs?|dictates?|"
+        r"establishes?|determines?|drives?|owns?|carries?|retains?|grants?|"
+        r"guides?|adopts?|borrows?|renders?|depicts?|preserves?|creates?|adds?|"
+        r"invents?|generates?|introduces?|transfers?|imports?|recolou?rs?|"
+        r"retextures?|redesigns?|reshapes?|restyles?)"
+    )
+    if _has_positive_joint_source_authority(
+        text,
+        {token},
+        grant,
+        domain,
+    ):
+        return True
+    patterns = (
+        rf"{subject}.{{0,140}}(?P<claim>{grant}).{{0,120}}(?P<domain>{domain})",
+        rf"(?P<claim>(?:use|copy|follow|match|take|derive))\b.{{0,100}}"
+        rf"{subject}.{{0,120}}(?P<domain>{domain})",
+        rf"(?P<claim>(?:use|copy|follow|match|take|derive))\b.{{0,80}}"
+        rf"(?P<domain>{domain}).{{0,80}}(?:from|using|according\s+to|based\s+on)"
+        rf".{{0,40}}{subject}",
+        rf"{subject}.{{0,100}}(?P<claim>(?:is|are|has|have|serves?\s+as|"
+        rf"acts?\s+as)).{{0,80}}(?:authority|source|basis).{{0,60}}"
+        rf"(?P<domain>{domain})",
+        rf"(?P<domain>{domain}).{{0,80}}(?P<claim>(?:comes?|derives?|"
+        rf"is\s+(?:taken|sourced))).{{0,40}}(?:from\s+)?{subject}",
+    )
+    for clause in _semantic_assertion_clauses(text):
+        for pattern in patterns:
+            for match in re.finditer(pattern, clause, flags=re.DOTALL):
+                if (
+                    not _semantic_domain_owned_by_other_source(
+                        clause,
+                        match,
+                        {token},
+                        set(appearance_tokens),
+                    )
+                    and not _semantic_authority_match_is_negated(clause, match)
+                ):
+                    return True
+    return False
+
+
+def _has_positive_unbound_image_authority(text: str, token: str) -> bool:
+    """An unbound image may be mentioned as context but cannot own output traits."""
+
+    subject = re.escape(token.casefold())
+    domain = (
+        r"(?:(?:character\s+)?(?:appearance|identity)|design|materials?|look|"
+        r"lighting|colou?r|palette|patterns?|textures?|styles?|styli[sz](?:ation|ing)|"
+        r"costume|clothing|outfit|face|hair|proportions?|silhouettes?|markings?|"
+        r"accessories?|facial\s+features?|body\s+(?:shapes?|forms?)|"
+        r"native\s+medium|medium|background|environment|scene[- ]content|"
+        r"geometry|layout)"
+    )
+    grant = (
+        r"(?:provides?|supplies?|defines?|sets?|controls?|governs?|dictates?|"
+        r"establishes?|determines?|drives?|owns?|carries?|retains?|grants?|"
+        r"guides?|adopts?|borrows?|renders?|depicts?)"
+    )
+    if _has_positive_joint_source_authority(
+        text,
+        {token},
+        grant,
+        domain,
+    ):
+        return True
+    patterns = (
+        rf"{subject}.{{0,140}}(?P<claim>{grant}).{{0,120}}(?P<domain>{domain})",
+        rf"(?P<claim>(?:use|copy|follow|match|take|derive))\b.{{0,100}}"
+        rf"{subject}.{{0,120}}(?P<domain>{domain})",
+        rf"{subject}.{{0,100}}(?P<claim>(?:is|are|has|have|serves?\s+as|"
+        rf"acts?\s+as)).{{0,80}}(?P<domain>{domain}).{{0,50}}"
+        rf"(?:authority|source|basis)",
+    )
+    for clause in _semantic_assertion_clauses(text):
+        for pattern in patterns:
+            for match in re.finditer(pattern, clause, flags=re.DOTALL):
+                if not _semantic_authority_match_is_negated(clause, match):
+                    return True
+    return False
+
+
+def _has_unbound_image_isolation(window: str) -> bool:
+    status = re.search(
+        r"\b(?:unbound|unclassified|unresolved|conflicting|context[- ]only|reference[- ]only|"
+        r"no\s+(?:visual|image|appearance)\s+authority)\b",
+        window,
+    )
+    denial = re.search(
+        r"\bno\b.{0,100}\b(?:visual|image|appearance)\b.{0,100}\bauthority\b|"
+        r"\bno\b.{0,120}\b(?:look|lighting|render|colou?r|palette|material|"
+        r"identity|scene[- ]content|motion|camera|fx)\b.{0,100}\bauthority\b|"
+        r"\bno\s+(?:source\s+)?authority\b|"
+        r"\b(?:must\s+not|do(?:es)?\s+not|never)\b.{0,100}\b(?:use|supply|"
+        r"provide|define|control|own|transfer)\w*\b.{0,100}\b(?:appearance|"
+        r"identity|design|material|look|lighting|colou?r|palette|pattern|texture|"
+        r"style|stylization|costume|outfit|face|hair|proportion|silhouette|"
+        r"marking|accessory|facial\s+feature|body\s+(?:shape|form)|native\s+medium|"
+        r"background|environment|scene[- ]content|geometry|layout)\w*\b",
+        window,
+        flags=re.DOTALL,
+    )
+    return bool(status and denial)
+
+
+def _has_unresolved_relation_isolation(window: str) -> bool:
+    return bool(
+        re.search(r"\b(?:unresolved|conflicting|conflict|ambiguous|duplicate)\b", window)
+        and re.search(
+            r"\b(?:no|not|never|neither|without)\b.{0,180}"
+            r"\b(?:authority|winner|average|blend|choose|select|apply|transfer)\w*\b|"
+            r"\b(?:do\s+not|must\s+not|never)\b.{0,120}"
+            r"\b(?:average|blend|choose|select|apply|transfer)\w*\b",
+            window,
+            flags=re.DOTALL,
+        )
+    )
+
+
+def _has_positive_unbound_video_authority(text: str, token: str) -> bool:
+    subject = re.escape(token.casefold())
+    grant = (
+        r"(?:provides?|supplies?|defines?|sets?|controls?|governs?|dictates?|"
+        r"establishes?|determines?|drives?|owns?|carries?|grants?|guides?|"
+        r"use|copy|follow|match|take|derive)"
+    )
+    domain = (
+        r"(?:motion|pose|acting|performance|timing|trajectory|camera|framing|"
+        r"layout|composition|depth|spatial|alignment|occlusion|visibility|fx|"
+        r"effect|simulation|appearance|identity|material|look|lighting|colou?r|"
+        r"palette|shading|style|background|environment|scene[- ]content)"
+    )
+    if _has_positive_joint_source_authority(
+        text,
+        {token},
+        grant,
+        domain,
+    ):
+        return True
+    patterns = (
+        rf"{subject}.{{0,140}}(?P<claim>{grant}).{{0,120}}(?P<domain>{domain})",
+        rf"(?P<claim>{grant}).{{0,100}}{subject}.{{0,120}}(?P<domain>{domain})",
+    )
+    for clause in _semantic_assertion_clauses(text):
+        for pattern in patterns:
+            for match in re.finditer(pattern, clause, flags=re.DOTALL):
+                if not _semantic_authority_match_is_negated(clause, match):
+                    return True
+    return False
+
+
+def _has_unbound_video_isolation(window: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:unbound|untyped|unresolved|context[- ]only|"
+            r"non[- ]authoritative|missing\s+(?:type|role|binding))\b",
+            window,
+        )
+        and re.search(
+            r"\b(?:no|not|never|must\s+not|do(?:es)?\s+not)\b.{0,180}"
+            r"\b(?:authority|control|own|supply|provide|define|drive|transfer)\w*\b",
+            window,
+            flags=re.DOTALL,
+        )
+    )
+
+
+def _has_primary_motion_precedence_guard(
+    text: str,
+    primary_tokens: list[str],
+    local_tokens: list[str],
+) -> bool:
+    folded = str(text or "").casefold()
+    if not all(token.casefold() in folded for token in primary_tokens + local_tokens):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:primary|original\s+preview)\b.{0,220}"
+            r"\b(?:wins?|retains?|preserves?|protected|takes?\s+precedence|"
+            r"overrides?)\b.{0,180}\b(?:overlap|conflict|local|secondary)\b|"
+            r"\b(?:overlap|conflict)\b.{0,180}\b(?:primary|original\s+preview)\b"
+            r".{0,160}\b(?:wins?|retains?|preserves?|protected|precedence)\b",
+            folded,
+            flags=re.DOTALL,
+        )
+    )
+
+
+def _has_local_motion_conflict_guard(text: str) -> bool:
+    folded = str(text or "").casefold()
+    return bool(
+        re.search(r"\b(?:local|secondary)\b.{0,180}\b(?:overlap|conflict)\b", folded, re.DOTALL)
+        and re.search(r"\b(?:unresolved|omit|apply\s+no|no\s+reference[- ]derived\s+change)\b", folded)
+        and re.search(
+            r"\b(?:do\s+not|must\s+not|never|no)\b.{0,120}"
+            r"\b(?:average|blend|choose|select|slot|order)\w*\b",
+            folded,
+            flags=re.DOTALL,
+        )
+    )
+
+
+def _semantic_motion_conflict_interval_present(
+    text: str,
+    start_frame: Any,
+    end_frame: Any,
+) -> bool:
+    """Require one conflict statement to preserve its exact temporal scope."""
+
+    folded = " ".join(str(text or "").casefold().split())
+    if start_frame is None and end_frame is None:
+        return bool(re.search(
+            r"\b(?:whole|entire|full)[- ]shot\b|\b(?:all|every)\s+frames?\b|"
+            r"\bthroughout\s+(?:the\s+)?shot\b",
+            folded,
+        ))
+    if (
+        not isinstance(start_frame, int)
+        or isinstance(start_frame, bool)
+        or not isinstance(end_frame, int)
+        or isinstance(end_frame, bool)
+    ):
+        return False
+    start = re.escape(str(start_frame))
+    end = re.escape(str(end_frame))
+    if start_frame == end_frame:
+        return bool(re.search(rf"\bframe\s*#?\s*{start}(?!\d)", folded))
+    return bool(
+        re.search(
+            rf"\bframes?(?:\s+interval)?\s*#?\s*{start}(?!\d)\s*"
+            rf"(?:-|–|—|to|through)\s*(?:frame\s*)?#?\s*{end}(?!\d)",
+            folded,
+        )
+        or re.search(
+            rf"[\[(]\s*{start}\s*,\s*{end}\s*[\])]",
+            folded,
+        )
+    )
+
+
+def _has_exact_local_motion_conflict_guards(
+    text: str,
+    conflicts: list[Dict[str, Any]],
+) -> bool:
+    """Verify every unresolved Local/Secondary relation, not a generic denial.
+
+    Each relation must be restated as one bounded paragraph containing the exact
+    source/peer addresses, target, function, spatial scope, and temporal scope.
+    This prevents an unrelated global ``do not average conflicts`` sentence from
+    satisfying a different relation in the private manifest.
+    """
+
+    if not conflicts:
+        return True
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n", str(text or ""))
+        if paragraph.strip()
+    ]
+    for conflict in conflicts:
+        if not isinstance(conflict, dict):
+            return False
+        token = str(conflict.get("video") or "").strip()
+        peers = conflict.get("competing_videos")
+        target = str(conflict.get("target") or "").strip()
+        function = str(conflict.get("function") or "").strip()
+        spatial_domain = str(conflict.get("spatial_domain") or "").strip()
+        if (
+            not token
+            or not isinstance(peers, list)
+            or not peers
+            or any(not isinstance(peer, str) or not peer.strip() for peer in peers)
+            or not target
+            or not function
+            or not spatial_domain
+        ):
+            return False
+        candidates = [
+            paragraph
+            for paragraph in paragraphs
+            if _semantic_token_present(paragraph, token)
+            and all(_semantic_token_present(paragraph, peer) for peer in peers)
+        ]
+        relation_preserved = False
+        for paragraph in candidates:
+            folded = paragraph.casefold()
+            if (
+                not _semantic_token_present(paragraph, target)
+                or not _semantic_token_present(paragraph, function)
+                or not _semantic_literal_present(paragraph, spatial_domain)
+                or not _semantic_motion_conflict_interval_present(
+                    paragraph,
+                    conflict.get("start_frame"),
+                    conflict.get("end_frame"),
+                )
+                or not re.search(r"\b(?:overlap|conflict)\w*\b", folded)
+                or not re.search(
+                    r"\b(?:unresolved|omit|apply\s+no|"
+                    r"no\s+reference[- ]derived\s+change)\b",
+                    folded,
+                )
+                or not re.search(
+                    r"\b(?:do\s+not|must\s+not|never|no)\b.{0,160}"
+                    r"\b(?:average|blend|choose|select|slot|order)\w*\b",
+                    folded,
+                    flags=re.DOTALL,
+                )
+            ):
+                continue
+            relation_preserved = True
+            break
+        if not relation_preserved:
+            return False
+    return True
+
+
+def _look_subject_pattern(look_tokens: list[str]) -> str:
+    token_pattern = "|".join(
+        re.escape(token.casefold()) for token in look_tokens if token
+    )
+    generic = r"(?:(?:this|the|a|any)\s+)?(?:look\s+references?|render\s+look)"
+    return rf"(?:{token_pattern}|{generic})" if token_pattern else generic
+
+
+def _look_semantic_clauses(text: str, look_tokens: list[str]) -> list[str]:
+    subject = _look_subject_pattern(look_tokens)
+    allowed = {token.casefold() for token in look_tokens}
+    active_look_subject = False
+    result: list[str] = []
+    for clause in _semantic_assertion_clauses(text):
+        addresses = {
+            address.casefold()
+            for address in re.findall(r"@(?:image|video)\d+", clause)
+        }
+        if re.search(subject, clause):
+            active_look_subject = not bool(addresses.difference(allowed))
+            result.append(clause)
+        elif (
+            active_look_subject
+            and re.match(r"^(?:it|this\s+reference|that\s+reference)\b", clause)
+        ):
+            result.append("look reference " + clause)
+        else:
+            active_look_subject = False
+    return result
+
+
+def _has_positive_look_scene_content_authority(
+    text: str,
+    look_tokens: list[str],
+    authorized_other_tokens: list[str],
+) -> bool:
+    """Reject Look grants that promote depicted scene content into authority.
+
+    Render/shading response remains a valid Look domain.  The narrower domains
+    below describe *what is depicted* (asset/material identity, species,
+    morphology, geometry, and placement), which remain owned by Main Background
+    and other typed image sources.
+    """
+
+    subject = _look_subject_pattern(look_tokens)
+    grant = (
+        r"(?:provides?|supplies?|defines?|sets?|controls?|governs?|dictates?|"
+        r"establishes?|determines?|drives?|owns?|carries?|retains?|grants?|"
+        r"transfers?|imports?|copies?|replicates?|transplants?|substitutes?|"
+        r"replaces?|adopts?|borrows?|preserves?|creates?|adds?|invents?|"
+        r"generates?|introduces?)"
+    )
+    scene_content = (
+        r"(?:scene[- ]content|background[- ]content|environment[- ]content|"
+        r"locations?|terrain(?:\s+(?:topology|geometry|identity|design|content))?|"
+        r"(?:scene|environment|background)\s+(?:geometry|objects?|assets?|layout|"
+        r"composition|identity|design)|"
+        r"(?:object|asset|surface)\s+(?:identity|class|design|species|morphology)|"
+        r"(?:intrinsic|source[- ]defined|asset)\s+material\s+(?:identity|class|type)|"
+        r"species|morphology|depicted\s+(?:details?|content)|"
+        r"micro[- ](?:details?|density)|"
+        r"vegetation\s+(?:identity|species|morphology|arrangement|placement|density)|"
+        r"(?:tree|plant|foliage)\s+(?:species|morphology|arrangement|placement|density))"
+    )
+    if _has_positive_joint_source_authority(
+        text,
+        set(look_tokens),
+        grant,
+        scene_content,
+    ):
+        return True
+    patterns = (
+        rf"{subject}.{{0,140}}(?P<claim>{grant}).{{0,120}}(?P<domain>{scene_content})",
+        rf"(?P<claim>(?:use|copy|follow|match|take|derive|transfer|import))\b"
+        rf".{{0,100}}{subject}.{{0,120}}(?P<domain>{scene_content})",
+        rf"(?P<claim>{grant}).{{0,100}}(?P<domain>{scene_content}).{{0,120}}"
+        rf"(?:from|using|according\s+to|based\s+on).{{0,40}}{subject}",
+        rf"(?P<domain>{scene_content}).{{0,80}}(?P<claim>(?:comes?|derives?|"
+        rf"is\s+(?:taken|sourced|defined)|belongs?|remains?)).{{0,50}}"
+        rf"(?:from|with|to|by)\s+{subject}",
+    )
+    allowed_tokens = {token.casefold() for token in look_tokens}
+    for clause in _look_semantic_clauses(text, look_tokens):
+        for pattern in patterns:
+            for match in re.finditer(pattern, clause, flags=re.DOTALL):
+                if (
+                    not _semantic_domain_owned_by_other_source(
+                        clause,
+                        match,
+                        allowed_tokens,
+                        set(authorized_other_tokens),
+                    )
+                    and not _semantic_authority_match_is_negated(clause, match)
+                ):
+                    return True
+    return False
+
+
+def _has_look_transfer_only_scene_content_guard(
+    text: str,
+    look_tokens: list[str],
+) -> bool:
+    """Require every resolved Look to be explicitly transfer-only.
+
+    This is source-local so an unrelated denial elsewhere in the prompt cannot
+    satisfy a Look source.  One explicit all-Look guard may cover every token.
+    """
+
+    paragraphs = re.split(r"\n\s*\n", str(text or "").casefold())
+    global_paragraphs = [
+        paragraph
+        for paragraph in paragraphs
+        if re.search(
+            r"\b(?:all|each|every)\b.{0,80}\b(?:resolved\s+)?"
+            r"look\s+references?\b",
+            paragraph,
+            flags=re.DOTALL,
+        )
+    ]
+    transfer_only = re.compile(
+        r"\b(?:transfer|attribute|presentation)[- ]only\b|"
+        r"\b(?:transfers?|suppl(?:y|ies)|provides?|contributes?)\b.{0,180}"
+        r"\b(?:colou?r|palette|grade|mood|lighting|illumination|atmosphere|"
+        r"exposure|white\s+balance|render|shading|style|surface|finish|scale|"
+        r"size|ratio|proportion|look\s+attributes?)\b.{0,80}\bonly\b",
+        flags=re.DOTALL,
+    )
+    scene_content = (
+        r"(?:scene|background|environment)(?:[- ]content)?|locations?|terrain|"
+        r"geometry|objects?|assets?|layout|composition|material\s+(?:identity|"
+        r"class|type)|species|morphology|depicted\s+(?:detail|content)|"
+        r"vegetation\s+(?:identity|species|morphology|arrangement|placement|"
+        r"density)"
+    )
+    denial = re.compile(
+        rf"\b(?:must\s+not|do(?:es)?\s+not|never)\b.{{0,100}}"
+        rf"\b(?:define|supply|provide|own|control|copy|replicate|transplant|"
+        rf"substitute|replace|import|create|invent|introduce|acquire)\w*\b"
+        rf".{{0,160}}\b{scene_content}\b|"
+        rf"\b(?:no|without)\b.{{0,80}}\b{scene_content}\b.{{0,80}}"
+        rf"\b(?:authority|ownership|content)\b|"
+        rf"\b{scene_content}\b.{{0,80}}\b(?:is|are|has|have)?\s*"
+        rf"(?:not|never|no)\b.{{0,50}}\b(?:authority|owned|defined|supplied)\b",
+        flags=re.DOTALL,
+    )
+    for token in look_tokens:
+        token_paragraphs = [
+            paragraph for paragraph in paragraphs
+            if token.casefold() in paragraph
+        ]
+        candidates = token_paragraphs + global_paragraphs
+        if not candidates:
+            return False
+        if not any(transfer_only.search(paragraph) for paragraph in candidates):
+            return False
+        if not any(denial.search(paragraph) for paragraph in candidates):
+            return False
+    return True
+
+
+def _has_positive_look_visible_light_creation(
+    text: str,
+    look_tokens: list[str],
+) -> bool:
+    """Reject a Look source that positively invents visible light or light FX."""
+
+    subject = _look_subject_pattern(look_tokens)
+    creation = (
+        r"(?:(?:create|generate|add|invent|introduce|spawn|place|supply|produce|"
+        r"render|show|depict|form|manifest|instantiate|paint|composite)\w*)"
+    )
+    visible = (
+        r"(?:visible\s+(?:light|lighting|emitter|source)|light\s+sources?|"
+        r"spotlights?|sun|moon|luminous\s+orb|radiant\s+disc|stars?|solar\s+disc|"
+        r"god\s+rays?|light\s+(?:streaks?|shafts?)|volumetric\s+(?:beams?|rays?)|"
+        r"lens\s+flares?|halos?|glow|bloom)"
+    )
+    if _has_positive_joint_source_authority(
+        text,
+        set(look_tokens),
+        creation,
+        visible,
+    ):
+        return True
+    patterns = (
+        rf"{subject}.{{0,140}}(?P<claim>{creation}).{{0,120}}(?P<domain>{visible})",
+        rf"(?P<claim>{creation}).{{0,100}}(?P<domain>{visible}).{{0,120}}"
+        rf"(?:from|using|according\s+to|based\s+on).{{0,40}}{subject}",
+        rf"(?P<claim>{creation}).{{0,80}}{subject}.{{0,100}}(?P<domain>{visible})",
+    )
+    for clause in _look_semantic_clauses(text, look_tokens):
+        for pattern in patterns:
+            for match in re.finditer(pattern, clause, flags=re.DOTALL):
+                if not _semantic_authority_match_is_negated(clause, match):
+                    return True
+    return False
+
+
+def _has_look_visible_light_non_creation_guard(
+    text: str,
+    look_tokens: list[str],
+) -> bool:
+    subject = _look_subject_pattern(look_tokens)
+    creation = (
+        r"(?:(?:create|generate|add|invent|introduce|spawn|place|supply|produce|"
+        r"render|show|depict|form|manifest|instantiate|paint|composite|redesign)\w*)"
+    )
+    visible = (
+        r"(?:visible\s+(?:light|lighting|emitter|source)|light\s+sources?|"
+        r"spotlights?|sun|moon|luminous\s+orb|radiant\s+disc|stars?|solar\s+disc|"
+        r"god\s+rays?|light\s+(?:streaks?|shafts?)|volumetric\s+(?:beams?|rays?)|"
+        r"lens\s+flares?|halos?|glow|bloom)"
+    )
+    patterns = (
+        rf"{subject}.{{0,140}}(?P<claim>{creation}).{{0,120}}(?P<domain>{visible})",
+        rf"(?P<claim>{creation}).{{0,100}}(?P<domain>{visible}).{{0,120}}"
+        rf"(?:from|using|according\s+to|based\s+on).{{0,40}}{subject}",
+        rf"(?P<claim>{creation}).{{0,80}}{subject}.{{0,100}}(?P<domain>{visible})",
+    )
+    for clause in _look_semantic_clauses(text, look_tokens):
+        for pattern in patterns:
+            for match in re.finditer(pattern, clause, flags=re.DOTALL):
+                if _semantic_authority_match_is_negated(clause, match):
+                    return True
+    return False
+
+
+def _has_character_intrinsic_distinctiveness_guard(
+    text: str,
+    character_tokens: list[str],
+    character_prop_tokens: list[str],
+) -> bool:
+    """Require a meaningful anti-homogenization guard for every Character source."""
+
+    destructive = re.compile(
+        r"\b(?:overwrite|replace|homogenize|average|flatten|erase|alter|repaint|"
+        r"retexture|restyle|normalize|standardize|conform|convert)\w*\b"
+    )
+    trait = re.compile(
+        r"\b(?:intrinsic|traits?|them|character|prop|colou?r|palette|pattern|"
+        r"material|texture|style|stylization|medium)\b"
+    )
+    for clause in _semantic_assertion_clauses(text):
+        if not trait.search(clause):
+            continue
+        actions = list(destructive.finditer(clause))
+        first_action_negated = False
+        for index, action in enumerate(actions):
+            prefix = clause[max(0, action.start() - 48):action.start()]
+            directly_negated = bool(
+                re.search(
+                    r"\b(?:do(?:es)?\s+not|must\s+not|never|without|"
+                    r"instead\s+of)(?:[\s,]+[a-z][\w-]*){0,8}[\s,]*$",
+                    prefix,
+                )
+            )
+            if index == 0:
+                first_action_negated = directly_negated
+            inherited_list_negation = False
+            if index and first_action_negated:
+                between = clause[actions[0].start():action.start()]
+                residue = destructive.sub("", between)
+                residue = re.sub(r"\b(?:and|or)\b|[\s,/]", "", residue)
+                inherited_list_negation = not residue
+            if not directly_negated and not inherited_list_negation:
+                return False
+
+    domain_groups = (
+        ("color", "colour", "palette"),
+        ("pattern", "patterns", "marking", "markings", "motif"),
+        ("material", "materials", "texture", "textures", "surface"),
+        ("style", "stylization", "stylisation", "design language"),
+        ("medium", "native medium", "technique"),
+    )
+    guarded_paragraphs: list[str] = []
+    global_character_guard = False
+    global_character_prop_guard = False
+    for paragraph in re.split(r"\n\s*\n", str(text or "").casefold()):
+        preservation = re.search(
+            r"\b(?:preserve|retain|protect|keep|remain|unchanged|"
+            r"(?:do\s+not|must\s+not)\s+(?:overwrite|replace|homogenize|average|"
+            r"flatten|erase|alter|repaint|retexture|restyle|normalize|standardize|"
+            r"conform|convert))\b",
+            paragraph,
+        )
+        intrinsic = re.search(
+            r"\b(?:intrinsic|distinctive|distinctiveness|individual|unique|"
+            r"character[- ]specific|subject[- ]specific|source[- ]defined)\b",
+            paragraph,
+        )
+        domain_count = sum(
+            any(term in paragraph for term in group)
+            for group in domain_groups
+        )
+        if not preservation or not intrinsic or domain_count < 4:
+            continue
+        guarded_paragraphs.append(paragraph)
+        if re.search(
+            r"\b(?:all|each|every)\b.{0,100}\bcharacters?\b(?!\s+props?)",
+            paragraph,
+        ):
+            global_character_guard = True
+        if re.search(
+            r"\b(?:all|each|every)\b.{0,100}\bcharacter\s+props?\b",
+            paragraph,
+        ):
+            global_character_prop_guard = True
+    return bool(
+        guarded_paragraphs
+        and all(
+            global_character_guard
+            or any(token.casefold() in paragraph for paragraph in guarded_paragraphs)
+            for token in character_tokens
+        )
+        and all(
+            global_character_prop_guard
+            or any(token.casefold() in paragraph for paragraph in guarded_paragraphs)
+            for token in character_prop_tokens
+        )
+    )
+
+
+def _has_character_distinctiveness_hard_priority_guard(text: str) -> bool:
+    """Require Look transfer to bend around, never flatten, identity cues."""
+
+    folded = str(text or "").casefold()
+    local_value = bool(re.search(
+        r"\b(?:internal|local|character[- ]specific)\s+(?:local[- ]?)?"
+        r"value\s+(?:hierarch(?:y|ies)|structure)\b",
+        folded,
+    ))
+    signature_accents = bool(re.search(
+        r"\b(?:signature|identity[- ]defining|character[- ]specific)\s+"
+        r"(?:colou?r\s+)?accents?\b",
+        folded,
+    ))
+    material_breaks = bool(re.search(
+        r"\b(?:intrinsic|character[- ]specific|distinctive\s+)?"
+        r"material\s+(?:breaks?|separation|boundaries)\b",
+        folded,
+    ))
+    separability = bool(re.search(
+        r"\b(?:keep|preserve|remain|maintain)\w*\b.{0,100}"
+        r"(?:\b(?:each|every|all)\s+(?:visible\s+)?characters?\b.{0,100}"
+        r"\b(?:visually\s+)?(?:separable|distinct|distinguishable)\b|"
+        r"\b(?:characters?|[a-z][\w.-]*)\b.{0,60}\bvisually\s+"
+        r"(?:separable|distinct|distinguishable)\b.{0,60}"
+        r"\b(?:every|each|all)\s+other\s+characters?\b)|"
+        r"\b(?:visual\s+)?separability\b.{0,100}"
+        r"\b(?:each|every|all|other)\s+characters?\b",
+        folded,
+        flags=re.DOTALL,
+    ))
+    priority = bool(re.search(
+        r"\b(?:character(?:-specific)?\s+distinctiveness|identity\s+cues?|"
+        r"intrinsic\s+traits?)\b.{0,140}"
+        r"\b(?:hard|higher|top|absolute)\s+(?:priority|precedence)\b"
+        r".{0,100}\b(?:look|render\s+look|look\s+transfer)\b|"
+        r"\b(?:character(?:-specific)?\s+distinctiveness|identity\s+cues?|"
+        r"intrinsic\s+traits?)\b.{0,100}"
+        r"\b(?:takes?\s+precedence\s+over|outranks?)\b.{0,80}"
+        r"\b(?:look|render\s+look|look\s+transfer)\b",
+        folded,
+        flags=re.DOTALL,
+    ))
+    look_adapts = bool(re.search(
+        r"\b(?:look|render\s+look|look\s+transfer|@image\d+)\b.{0,140}"
+        r"\b(?:adapt|fit|conform)\w*\b.{0,100}"
+        r"\b(?:around|to\s+preserve)\b.{0,100}"
+        r"\b(?:identity\s+cues?|intrinsic\s+traits?|distinctiveness|"
+        r"signature\s+accents?)\b",
+        folded,
+        flags=re.DOTALL,
+    ))
+    return bool(
+        local_value
+        and signature_accents
+        and material_breaks
+        and separability
+        and priority
+        and look_adapts
+    )
+
+
+def _has_positive_character_homogenization(text: str) -> bool:
+    """Reject a positive instruction that makes multiple characters identical."""
+
+    claim = re.compile(
+        r"(?P<claim>\b(?:make|give|apply|assign|force|convert|render|repaint|"
+        r"retexture|restyle|homogenize|average|normalize|standardize|unify|"
+        r"flatten|match|equalize|share)\w*\b)"
+    )
+    group = re.compile(
+        r"\b(?:all|each|every|both|multiple|the)\s+(?:visible\s+)?characters?\b"
+    )
+    same = re.compile(r"\b(?:same|identical|uniform|single|shared|common|one)\b")
+    domain = re.compile(
+        r"(?P<domain>\b(?:local[- ]value\s+(?:hierarch(?:y|ies)|structure)|"
+        r"palette\s+treatment|intrinsic\s+palette|finish|accent\s+scheme|"
+        r"signature\s+accents?|material\s+class|material\s+breaks?|"
+        r"intrinsic\s+colou?r|patterns?|markings?|style|stylization|"
+        r"rendering\s+medium)\b)"
+    )
+    for clause in _semantic_assertion_clauses(text):
+        if not group.search(clause) or not same.search(clause) or not domain.search(clause):
+            continue
+        domain_match = domain.search(clause)
+        if domain_match is None:
+            continue
+        for action in claim.finditer(clause):
+            start = min(action.start(), domain_match.start())
+            end = max(action.end(), domain_match.end())
+            combined = re.search(
+                rf"(?P<claim>{re.escape(action.group('claim'))}).{{0,{max(0, end - action.end() + 8)}}}"
+                rf"(?P<domain>{re.escape(domain_match.group('domain'))})",
+                clause[action.start():],
+                flags=re.DOTALL,
+            )
+            if combined is None:
+                combined = re.search(
+                    rf"(?P<domain>{re.escape(domain_match.group('domain'))}).{{0,{max(0, action.start() - domain_match.end() + 8)}}}"
+                    rf"(?P<claim>{re.escape(action.group('claim'))})",
+                    clause[domain_match.start():],
+                    flags=re.DOTALL,
+                )
+            if combined is not None and not _semantic_authority_match_is_negated(
+                clause[min(action.start(), domain_match.start()):],
+                combined,
+            ):
+                return True
+    return False
+
+
+def _has_shared_shadow_readability_guard(text: str) -> bool:
+    """Require readability correction to affect the shared local light field."""
+
+    for paragraph in re.split(r"\n\s*\n", str(text or "").casefold()):
+        if not re.search(r"\b(?:if|when|where)\b.{0,100}\b(?:dark|shadow)\w*\b", paragraph):
+            continue
+        if not all(term in paragraph for term in ("face", "eye", "expression")):
+            continue
+        if not re.search(r"\bshared\b.{0,80}\b(?:ambient|bounce)\b|\breflected\s+bounce\b", paragraph):
+            continue
+        if not re.search(
+            r"\b(?:whole|entire)\s+connected\s+local\s+(?:shadow|light)\s+field\b",
+            paragraph,
+        ):
+            continue
+        if not all(
+            re.search(pattern, paragraph)
+            for pattern in (
+                r"\bcharacters?\b",
+                r"\bprops?\b",
+                r"\b(?:environment|background)\b",
+            )
+        ):
+            continue
+        if not re.search(
+            r"\b(?:preserv(?:e|es|ed|ing)|retain(?:s|ed|ing)?|"
+            r"maintain(?:s|ed|ing)?)\b.{0,70}\b"
+            r"direct[- ]light\s+reduction\b",
+            paragraph,
+        ):
+            continue
+        if not re.search(
+            r"\b(?:preserv(?:e|es|ed|ing)|retain(?:s|ed|ing)?|"
+            r"maintain(?:s|ed|ing)?)\b.{0,100}\b"
+            r"(?:continuous\s+)?shadow\s+boundar(?:y|ies)\b|"
+            r"\bcontinuous\s+(?:shadow\s+)?boundar(?:y|ies)\b",
+            paragraph,
+        ):
+            continue
+        if not re.search(
+            r"\b(?:never|must\s+not|do\s+not|without)\b.{0,80}"
+            r"\b(?:selective\s+)?character[- ]only\s+(?:lift|fill|brighten|"
+            r"brightness|exposure)\b",
+            paragraph,
+        ):
+            continue
+        return True
+    return False
+
+
+def _has_positive_selective_shadow_lift(text: str) -> bool:
+    """Reject brightening only a subject while its shadow field stays dark."""
+
+    claim = (
+        r"(?P<claim>\b(?:raise|lift|brighten|boost|increase|add|apply|give)\w*\b)"
+    )
+    domain = (
+        r"(?P<domain>\b(?:lift|fill|brightness|exposure|ambient|bounce|"
+        r"illumination|light|saturation|contrast|beautification)\b)"
+    )
+    selective = (
+        r"(?:\b(?:selective(?:ly)?\s+)?(?:character|subject|hero|face|eyes?)"
+        r"[- ]only\b|\bonly\s+(?:the\s+)?(?:character|subject|hero|face|eyes?)\b|"
+        r"\b(?:character|subject|hero|face|eyes?)\s+(?:alone|independently)\b)"
+    )
+    patterns = (
+        rf"{claim}.{{0,100}}{selective}.{{0,100}}{domain}",
+        rf"{claim}.{{0,100}}{domain}.{{0,100}}{selective}",
+        rf"{selective}.{{0,100}}{claim}.{{0,100}}{domain}",
+    )
+    for clause in _semantic_assertion_clauses(text):
+        if not re.search(r"\b(?:dark|shadow)\w*\b", clause):
+            continue
+        for pattern in patterns:
+            for match in re.finditer(pattern, clause, flags=re.DOTALL):
+                if not _semantic_authority_match_is_negated(clause, match):
+                    return True
+    return False
+
+
+def _has_strict_captured_studio_illumination_removal(text: str) -> bool:
+    """Recognize the two narrow, policy-approved captured-light exceptions."""
+
+    folded = " ".join(str(text or "").casefold().split())
+    removal = re.search(
+        r"\b(?:remove|erase|strip|neutralize|replace|suppress|eliminate|discard)"
+        r"\w*\b.{0,60}\bonly\b(?P<scope>.{0,360})",
+        folded,
+        flags=re.DOTALL,
+    )
+    if removal is None:
+        return False
+    scope = removal.group("scope")
+    demonstrably_view_dependent = bool(re.search(
+        r"\b(?:demonstrably|clearly|verifiably)\b.{0,100}"
+        r"\b(?:view|viewpoint|camera)[- ]dependent\b.{0,140}"
+        r"\b(?:captured|reference|studio|key|fill|rim|illumination|lighting)\b",
+        scope,
+        flags=re.DOTALL,
+    ))
+    typed_scope_pair = (
+        r"(?:\bexplicitly\s+(?:typed|classified|identified)\b.{0,50}"
+        r"\b(?:and|as\s+well\s+as)\b.{0,30}\b(?:explicitly\s+)?scoped\b|"
+        r"\b(?:explicitly\s+)?scoped\b.{0,50}"
+        r"\b(?:and|as\s+well\s+as)\b.{0,30}"
+        r"\bexplicitly\s+(?:typed|classified|identified)\b)"
+    )
+    explicitly_typed_and_scoped = bool(re.search(
+        typed_scope_pair
+        + r".{0,160}\bcaptured\b.{0,80}\bstudio\b.{0,80}"
+        r"\b(?:key|fill|rim)\b.{0,80}"
+        r"\b(?:evidence|illumination|lighting|light|highlight)\w*\b",
+        scope,
+        flags=re.DOTALL,
+    ))
+    return demonstrably_view_dependent or explicitly_typed_and_scoped
+
+
+def _has_painted_cel_highlight_preservation_guard(
+    text: str,
+    appearance_tokens: list[str],
+) -> bool:
+    """Require authored graphic highlights and ambiguous accents to survive."""
+
+    guarded_paragraphs: list[str] = []
+    global_guard = False
+    for paragraph in re.split(r"\n\s*\n", str(text or "").casefold()):
+        authored = re.search(
+            r"\b(?:repeated|stable|authored|source[- ]defined|intrinsic)\b.{0,80}"
+            r"\b(?:painted|cel(?:-style)?|graphic)\b.{0,50}"
+            r"\b(?:highlights?|edge\s+accents?|rim\s+accents?)\b|"
+            r"\b(?:painted|cel(?:-style)?|graphic)\b.{0,50}"
+            r"\b(?:highlights?|edge\s+accents?|rim\s+accents?)\b.{0,80}"
+            r"\b(?:repeated|stable|authored|source[- ]defined|intrinsic)\b",
+            paragraph,
+            flags=re.DOTALL,
+        )
+        preserve = re.search(r"\b(?:preserve|retain|keep|remain)\w*\b", paragraph)
+        limited_removal = _has_strict_captured_studio_illumination_removal(
+            paragraph
+        )
+        uncertain = re.search(
+            r"\buncertain\b.{0,60}\b(?:highlights?|edge\s+accents?|rim\s+accents?)\b"
+            r".{0,80}\b(?:preserve|retain|keep|remain|intrinsic)\w*\b|"
+            r"\b(?:preserve|retain|keep)\w*\b.{0,80}\buncertain\b.{0,60}"
+            r"\b(?:highlights?|edge\s+accents?|rim\s+accents?)\b",
+            paragraph,
+            flags=re.DOTALL,
+        )
+        if not authored or not preserve or not limited_removal or not uncertain:
+            continue
+        guarded_paragraphs.append(paragraph)
+        if re.search(
+            r"\b(?:all|each|every)\b.{0,100}\b(?:resolved\s+)?"
+            r"(?:appearance\s+)?(?:sources?|characters?|props?)\b",
+            paragraph,
+        ):
+            global_guard = True
+    return bool(
+        guarded_paragraphs
+        and all(
+            global_guard
+            or any(token.casefold() in paragraph for paragraph in guarded_paragraphs)
+            for token in appearance_tokens
+        )
+    )
+
+
+def _has_positive_protected_highlight_removal(text: str) -> bool:
+    """Reject removal of authored/ambiguous highlights; allow proven studio light."""
+
+    pattern = re.compile(
+        r"(?P<claim>\b(?:remove|erase|strip|neutralize|replace|repaint|suppress|"
+        r"eliminate|discard)\w*\b).{0,120}"
+        r"(?P<domain>\b(?:highlights?|edge\s+accents?|rim\s+accents?)\b)",
+        flags=re.DOTALL,
+    )
+    protected = re.compile(
+        r"\b(?:repeated|stable|authored|source[- ]defined|intrinsic|painted|"
+        r"cel(?:-style)?|graphic|uncertain|edge\s+accents?|rim\s+accents?)\b"
+    )
+    for clause in _semantic_assertion_clauses(text):
+        for match in pattern.finditer(clause):
+            if _semantic_authority_match_is_negated(clause, match):
+                continue
+            window = clause[
+                max(0, match.start() - 80):min(len(clause), match.end() + 320)
+            ]
+            if (
+                protected.search(match.group())
+                or not _has_strict_captured_studio_illumination_removal(window)
+            ):
+                return True
+    return False
+
+
+def _intrinsic_emitter_is_invoked(text: str) -> bool:
+    folded = str(text or "").casefold()
+    return bool(
+        re.search(
+            r"\b(?:source[- ]defined|intrinsic|designed|built[- ]in|character|prop)\b"
+            r".{0,100}\b(?:emitters?|emissive|glowing\s+eyes?|energy\s+core|"
+            r"luminous\s+chest\s+crystal|headlamp|bioluminescent\s+markings?|"
+            r"glowing\s+visor)\b|"
+            r"\b(?:emitters?|emissive|glowing\s+eyes?|energy\s+core|"
+            r"luminous\s+chest\s+crystal|headlamp|bioluminescent\s+markings?|"
+            r"glowing\s+visor)\b.{0,100}\b(?:source[- ]defined|intrinsic|"
+            r"designed|built[- ]in|character|prop)\b",
+            folded,
+            flags=re.DOTALL,
+        )
+    )
+
+
+def _has_intrinsic_emitter_identity_guard(
+    text: str,
+    character_tokens: list[str],
+    character_prop_tokens: list[str],
+    background_prop_tokens: list[str],
+) -> bool:
+    guarded_paragraphs: list[str] = []
+    global_character_guard = False
+    global_character_prop_guard = False
+    global_background_prop_guard = False
+    for paragraph in re.split(r"\n\s*\n", str(text or "").casefold()):
+        conditional = re.search(
+            r"\b(?:if|when|where)\b.{0,120}\b(?:source[- ]defined|intrinsic|"
+            r"designed|built[- ]in)?\s*(?:emitters?|emissive\s+(?:part|component)|"
+            r"glowing\s+component)\b.{0,80}\b(?:exists?|present|appears?)\b",
+            paragraph,
+            flags=re.DOTALL,
+        )
+        if not conditional and not _intrinsic_emitter_is_invoked(paragraph):
+            continue
+        ownership = re.search(
+            r"\b(?:sole\s+source|source\s+for|owns?|authority|defined\s+by|"
+            r"comes?\s+from|preserve|retains?|remains?\s+with)\b",
+            paragraph,
+        )
+        design_or_shape = re.search(
+            r"\b(?:design|identity|shape|form|silhouette)\b",
+            paragraph,
+        )
+        placement = re.search(
+            r"\b(?:placement|position|location)\b",
+            paragraph,
+        )
+        color = re.search(r"\b(?:colou?r|palette)\b", paragraph)
+        material = re.search(r"\b(?:material|texture|surface)\b", paragraph)
+        steady_state = re.search(
+            r"\b(?:steady|base|default|intrinsic|source[- ]defined|designed|"
+            r"built[- ]in|emissive\s+(?:identity|state)|material\s+state)\b",
+            paragraph,
+        )
+        if not all(
+            (
+                ownership,
+                design_or_shape,
+                placement,
+                color,
+                material,
+                steady_state,
+            )
+        ):
+            continue
+        guarded_paragraphs.append(paragraph)
+        if re.search(
+            r"\b(?:all|each|every)\b.{0,120}\bcharacters?\b(?!\s+props?)",
+            paragraph,
+        ):
+            global_character_guard = True
+        if re.search(
+            r"\b(?:all|each|every)\b.{0,120}\bcharacter\s+props?\b",
+            paragraph,
+        ):
+            global_character_prop_guard = True
+        if re.search(
+            r"\b(?:all|each|every)\b.{0,120}\bbackground\s+props?\b",
+            paragraph,
+        ):
+            global_background_prop_guard = True
+    return bool(
+        guarded_paragraphs
+        and all(
+            global_character_guard
+            or any(token.casefold() in paragraph for paragraph in guarded_paragraphs)
+            for token in character_tokens
+        )
+        and all(
+            global_character_prop_guard
+            or any(token.casefold() in paragraph for paragraph in guarded_paragraphs)
+            for token in character_prop_tokens
+        )
+        and all(
+            global_background_prop_guard
+            or any(token.casefold() in paragraph for paragraph in guarded_paragraphs)
+            for token in background_prop_tokens
+        )
+    )
+
+
+def _has_positive_intrinsic_emitter_mutation(
+    text: str,
+    intrinsic_tokens: list[str],
+) -> bool:
+    """Reject destructive edits to image-owned intrinsic emitter design.
+
+    Activation, deactivation, pulsing, rays, bloom, and other temporal behavior
+    are intentionally absent from ``mutation`` so a scoped Shot/FX authority can
+    still animate a preserved emitter without changing its steady design state.
+    """
+
+    token_pattern = "|".join(
+        re.escape(token.casefold()) for token in intrinsic_tokens if token
+    )
+    source = (
+        rf"(?:{token_pattern}|(?:the|this|any|each|every|all)\s+"
+        rf"(?:character|character\s+prop|background\s+prop)(?:\s+images?)?)"
+        if token_pattern
+        else r"(?:the|this|any|each|every|all)\s+(?:character|prop)(?:\s+images?)?"
+    )
+    mutation = (
+        r"(?:remove|delete|erase|eliminate|redesign|recolou?r|retexture|"
+        r"reshape|relocate|replace|swap|substitute|convert|repaint|restyle|"
+        r"strip|discard|omit|destroy)\w*"
+    )
+    passive_mutation = (
+        r"(?:(?:is|are|be|being|become|becomes|may\s+be|should\s+be|will\s+be)\s+)?"
+        r"(?:removed|deleted|erased|eliminated|redesigned|recolou?red|retextured|"
+        r"reshaped|relocated|replaced|swapped|substituted|converted|repainted|"
+        r"restyled|stripped|discarded|omitted|destroyed)"
+    )
+    emitter = (
+        r"(?:(?:source[- ]defined|intrinsic|designed|built[- ]in)\s+"
+        r"(?:emitters?|emissive\s+(?:parts?|components?)|glowing\s+components?)|"
+        r"emitters?\s+(?:design|identity|shape|placement|colou?r|materials?|"
+        r"steady\s+(?:state|appearance))|"
+        r"emissive\s+(?:parts?|components?|identity|state)|glowing\s+eyes?|"
+        r"energy\s+cores?|luminous\s+chest\s+crystals?|headlamps?|"
+        r"bioluminescent\s+markings?|glowing\s+visors?)"
+    )
+    patterns = (
+        rf"{source}.{{0,140}}(?P<claim>{mutation}).{{0,120}}(?P<domain>{emitter})",
+        rf"(?P<claim>{mutation}).{{0,100}}(?P<domain>{emitter}).{{0,100}}"
+        rf"(?:from|on|of|belonging\s+to).{{0,40}}{source}",
+        rf"(?P<claim>{mutation}).{{0,80}}{source}.{{0,100}}(?P<domain>{emitter})",
+        rf"(?P<claim>{mutation}).{{0,100}}(?P<domain>(?:source[- ]defined|intrinsic|"
+        rf"designed|built[- ]in)\s+(?:emitters?|emissive\s+(?:parts?|components?)))",
+        rf"(?P<claim>{mutation}).{{0,100}}(?P<domain>{emitter})",
+    )
+    reverse_patterns = (
+        rf"{source}.{{0,120}}(?P<domain>{emitter}).{{0,80}}"
+        rf"(?P<claim>{passive_mutation})",
+        rf"(?P<domain>(?:source[- ]defined|intrinsic|designed|built[- ]in)\s+"
+        rf"(?:emitters?|emissive\s+(?:parts?|components?))).{{0,80}}"
+        rf"(?P<claim>{passive_mutation})",
+    )
+    active_source = ""
+    for clause in _semantic_assertion_clauses(text):
+        source_tokens = [
+            token.casefold()
+            for token in intrinsic_tokens
+            if token and token.casefold() in clause
+        ]
+        addresses = {
+            address.casefold()
+            for address in re.findall(r"@(?:image|video)\d+", clause)
+        }
+        if source_tokens:
+            active_source = source_tokens[0]
+            source_clause = clause
+        elif addresses:
+            active_source = ""
+            source_clause = clause
+        elif active_source and re.match(
+            r"^[,;:]?\s*(?:(?:however|also|additionally|furthermore|then)"
+            r"[,:]?\s+)?"
+            r"(?:it|its|this\s+(?:emitter|component|source)|the\s+(?:intrinsic|"
+            r"source[- ]defined|designed|built[- ]in|emissive|glowing)|"
+            rf"{mutation})\b",
+            clause,
+        ):
+            source_clause = active_source + " " + clause
+        else:
+            active_source = ""
+            source_clause = clause
+        for pattern in patterns:
+            for match in re.finditer(pattern, source_clause, flags=re.DOTALL):
+                if not _semantic_authority_match_is_negated(source_clause, match):
+                    return True
+        for pattern in reverse_patterns:
+            for match in re.finditer(pattern, source_clause, flags=re.DOTALL):
+                prefix = source_clause[
+                    max(0, match.start("claim") - 72):match.start("claim")
+                ]
+                if not re.search(
+                    r"\b(?:do(?:es)?\s+not|must\s+not|should\s+not|cannot|"
+                    r"can't|never|without|no\s+authority\s+to)\b.{0,64}$",
+                    prefix,
+                ):
+                    return True
+    return False
+
+
+def _has_shot_fx_emitter_behavior_guard(
+    text: str,
+    shot_fx_tokens: list[str],
+) -> bool:
+    for token in shot_fx_tokens:
+        active_source = False
+        source_clauses: list[str] = []
+        for clause in _semantic_assertion_clauses(text):
+            if token.casefold() in clause:
+                active_source = True
+                source_clauses.append(clause)
+            elif active_source and re.match(
+                r"^(?:it|this\s+(?:fx|effect|source|reference))\b",
+                clause,
+            ):
+                source_clauses.append(token.casefold() + " " + clause)
+            else:
+                active_source = False
+        if not any(
+            re.search(r"\b(?:emitter|emission|glow|light|rays?|bloom)\b", clause)
+            and re.search(
+                r"\b(?:activation|deactivation|timing|onset|peak|falloff|pulse|"
+                r"flicker|spread|behavior|behaviour|animation)\b",
+                clause,
+            )
+            and re.search(
+                r"\b(?:controls?|governs?|directs?|owns?|authority|source)\b",
+                clause,
+            )
+            for clause in source_clauses
+        ):
+            return False
+    return bool(shot_fx_tokens)
+
+
+def _has_positive_fx_persistent_light_creation(text: str, token: str) -> bool:
+    """Reject persistent light *objects* created by a fully typed FX source.
+
+    This deliberately does not match particles, dust, smoke, rays, bloom, glow,
+    pulses, or activation/timing language.  Those remain valid temporal FX
+    behavior.  It only catches creation of a new scene-visible source object.
+    """
+
+    subject = re.escape(token.casefold())
+    creation = (
+        r"(?:create|generate|add|invent|introduce|spawn|place|install|manifest|"
+        r"instantiate|render|show|depict|form|paint|composite|build)\w*"
+    )
+    persistent_light = (
+        r"(?:suns?|moons?|solar\s+discs?|lunar\s+discs?|lamps?|light\s+fixtures?|"
+        r"(?:new|additional|persistent|permanent|steady|static|stationary|"
+        r"scene[- ]visible)\s+(?:visible\s+)?(?:light\s+sources?|light\s+objects?|"
+        r"luminous\s+(?:emitters?|orbs?|discs?)|light[- ]emitting\s+objects?)|"
+        r"(?:visible|luminous)\s+light\s+sources?|persistent\s+(?:visible\s+)?"
+        r"emitters?|celestial\s+light\s+objects?)"
+    )
+    patterns = (
+        rf"{subject}.{{0,180}}(?P<claim>{creation}).{{0,120}}"
+        rf"(?P<domain>{persistent_light})",
+        rf"(?P<claim>{creation}).{{0,100}}(?P<domain>{persistent_light})"
+        rf".{{0,120}}(?:from|using|according\s+to|based\s+on|by).{{0,40}}{subject}",
+        rf"(?P<claim>{creation}).{{0,80}}{subject}.{{0,100}}"
+        rf"(?P<domain>{persistent_light})",
+    )
+    active_source = False
+    for clause in _semantic_assertion_clauses(text):
+        addresses = {
+            address.casefold()
+            for address in re.findall(r"@(?:image|video)\d+", clause)
+        }
+        if token.casefold() in clause:
+            active_source = not bool(addresses.difference({token.casefold()}))
+            source_clause = clause
+        elif active_source and re.match(
+            r"^(?:it|this\s+(?:fx|effect|source|reference))\b",
+            clause,
+        ):
+            source_clause = token.casefold() + " " + clause
+        else:
+            active_source = False
+            continue
+        for pattern in patterns:
+            for match in re.finditer(pattern, source_clause, flags=re.DOTALL):
+                if not _semantic_authority_match_is_negated(source_clause, match):
+                    return True
+    return False
+
+
 def _assert_final_output_semantic_integrity(
     final_text: Any,
     manifest: Any,
@@ -2010,26 +4253,96 @@ def _assert_final_output_semantic_integrity(
         or manifest.get("version") != _FINAL_OUTPUT_SEMANTIC_MANIFEST_VERSION
         or not isinstance(manifest.get("images"), list)
         or not isinstance(manifest.get("videos"), list)
+        or any(
+            not isinstance(manifest.get(key), list)
+            or any(
+                not isinstance(token, str) or not token
+                for token in manifest.get(key, [])
+            )
+            for key in (
+                "main_background_tokens",
+                "look_tokens",
+                "relighting_look_tokens",
+                "character_tokens",
+                "character_prop_tokens",
+                "background_prop_tokens",
+                "character_intrinsic_tokens",
+                "intrinsic_emitter_tokens",
+                "appearance_intrinsic_tokens",
+                "shot_fx_behavior_tokens",
+                "primary_unified_tokens",
+                "local_motion_tokens",
+            )
+        )
+        or not isinstance(manifest.get("unresolved_motion_relations"), list)
+        or any(
+            not isinstance(relation, dict)
+            for relation in manifest.get("unresolved_motion_relations", [])
+        )
+        or any(
+            not isinstance(manifest.get(key), bool)
+            for key in (
+                "require_background_look_non_substitution",
+                "require_video_appearance_isolation",
+                "require_character_intrinsic_distinctiveness",
+                "require_shared_shadow_readability",
+                "require_painted_cel_highlight_preservation",
+                "require_look_visible_light_non_creation",
+                "require_intrinsic_emitter_source_separation",
+                "require_primary_motion_precedence",
+                "require_local_motion_conflict_isolation",
+            )
+        )
     ):
         raise RuntimeError("semantic_manifest_invalid")
 
     failures: list[str] = []
     folded = text.casefold()
+    main_background_tokens = list(manifest["main_background_tokens"])
+    look_tokens = list(manifest["look_tokens"])
+    appearance_intrinsic_tokens = list(manifest["appearance_intrinsic_tokens"])
+    character_tokens = list(manifest["character_tokens"])
+    character_prop_tokens = list(manifest["character_prop_tokens"])
+    background_prop_tokens = list(manifest["background_prop_tokens"])
+    shot_fx_behavior_tokens = list(manifest["shot_fx_behavior_tokens"])
+    primary_unified_tokens = list(manifest["primary_unified_tokens"])
+    local_motion_tokens = list(manifest["local_motion_tokens"])
     for image in manifest["images"]:
-        if not isinstance(image, dict):
+        if (
+            not isinstance(image, dict)
+            or not isinstance(image.get("unbound_authority"), bool)
+            or not isinstance(image.get("authority_domains"), list)
+            or not isinstance(image.get("unresolved_domains"), list)
+            or not isinstance(image.get("unresolved_relations"), list)
+        ):
             failures.append("image_manifest_invalid")
             continue
         token = str(image.get("token") or "")
         if not _semantic_token_present(text, token):
             failures.append(f"missing:{token}")
             continue
-        target = str(image.get("target") or "").strip()
-        scope_mode = str(image.get("scope_mode") or "").strip()
-        if target and target != "Custom" and not _semantic_literal_present(text, target):
-            failures.append(f"target:{token}")
         window = _semantic_text_window(text, token)
         main_type = str(image.get("main_type") or "")
         subtype = str(image.get("sub_type") or "")
+        target = str(image.get("target") or "").strip()
+        scope_mode = str(image.get("scope_mode") or "").strip()
+        if not _semantic_target_present(
+            text,
+            window,
+            target,
+            main_type,
+            scope_mode,
+        ):
+            failures.append(f"target:{token}")
+        if image.get("unbound_authority"):
+            if (
+                not _has_unbound_image_isolation(window)
+                or _has_positive_unbound_image_authority(text, token)
+            ):
+                failures.append(f"unbound_image_authority:{token}")
+            continue
+        if image.get("unresolved_relations") and not _has_unresolved_relation_isolation(window):
+            failures.append(f"unresolved_image_relation:{token}")
         if main_type != "Look Reference":
             image_terms = {
                 "Character": (
@@ -2052,31 +4365,48 @@ def _assert_final_output_semantic_integrity(
                 failures.append(f"image_authority:{token}")
             continue
 
+        unresolved_domains = set(image.get("unresolved_domains") or [])
+        look_authority_paragraphs = [
+            paragraph.casefold()
+            for paragraph in re.split(r"\n\s*\n", text)
+            if token.casefold() in paragraph.casefold()
+            and re.search(
+                re.escape(token)
+                + r".{0,240}\b(?:transfer|suppl(?:y|ies)|provide|authority|"
+                r"source|own|define|govern|control)\w*\b",
+                paragraph.casefold(),
+                flags=re.IGNORECASE,
+            )
+        ]
+        look_authority_window = (
+            "\n\n".join(look_authority_paragraphs) or window
+        )
         if subtype in {"ch_Scale", "bg_Scale", "ch_Scale / bg_Scale"}:
-            look_groups = (("scale", "size", "ratio", "proportion", "relative"),)
+            look_groups = (("scale", ("scale", "size", "ratio", "proportion", "relative")),)
         elif subtype == "Color Mood":
-            look_groups = (("color", "colour", "palette", "grade", "mood"),)
+            look_groups = (("color", ("color", "colour", "palette", "grade", "mood")),)
         elif subtype == "Lighting / Atmosphere":
-            look_groups = ((
+            look_groups = (("lighting", (
                 "light", "illumination", "atmosphere", "exposure", "white balance",
-            ),)
+            )),)
         elif subtype == "Render Look":
-            look_groups = (("render", "shading", "style", "surface", "finish"),)
+            look_groups = (("render", ("render", "shading", "style", "surface", "finish")),)
         elif subtype == "Color / Look / Lighting":
             look_groups = (
-                ("color", "colour", "palette", "grade"),
-                ("light", "illumination", "atmosphere", "exposure", "white balance"),
-                ("render", "shading", "style", "surface", "finish"),
+                ("color", ("color", "colour", "palette", "grade")),
+                ("lighting", ("light", "illumination", "atmosphere", "exposure", "white balance")),
+                ("render", ("render", "shading", "style", "surface", "finish")),
             )
         else:
-            look_groups = (("look", "reference", "context"),)
+            look_groups = (("other", ("look", "reference", "context")),)
         if any(
-            not _semantic_term_group_present(window, group)
-            for group in look_groups
+            domain not in unresolved_domains
+            and not _semantic_term_group_present(look_authority_window, terms)
+            for domain, terms in look_groups
         ):
             failures.append(f"look_authority:{token}")
         if scope_mode == "global" and not any(
-            term in window
+            term in look_authority_window
             for term in (
                 "global", "scene-wide", "scene wide", "shared scene",
                 "all visible", "environment and", "same scene lighting",
@@ -2093,19 +4423,58 @@ def _assert_final_output_semantic_integrity(
                 not instruction
                 or not hmac.compare_digest(digest, _prompt_text_sha256(instruction))
                 or not _semantic_custom_instruction_preserved(
-                    window,
+                    look_authority_window,
                     instruction,
                     evidence_tag,
                 )
             ):
                 failures.append(f"custom_look_instruction:{token}")
 
+    if manifest.get("require_character_intrinsic_distinctiveness") and (
+        not _has_character_intrinsic_distinctiveness_guard(
+            text,
+            character_tokens,
+            character_prop_tokens,
+        )
+        or not _has_character_distinctiveness_hard_priority_guard(text)
+        or _has_positive_character_homogenization(text)
+    ):
+        failures.append("character_intrinsic_distinctiveness")
+
+    if manifest.get("require_shared_shadow_readability") and (
+        not _has_shared_shadow_readability_guard(text)
+        or _has_positive_selective_shadow_lift(text)
+    ):
+        failures.append("shadow_readability_shared_field")
+
+    if manifest.get("require_painted_cel_highlight_preservation") and (
+        not _has_painted_cel_highlight_preservation_guard(
+            text,
+            appearance_intrinsic_tokens,
+        )
+        or _has_positive_protected_highlight_removal(text)
+    ):
+        failures.append("painted_cel_highlight_preservation")
+
+    if manifest.get("require_look_visible_light_non_creation") and (
+        _has_positive_look_visible_light_creation(text, look_tokens)
+        or not _has_look_visible_light_non_creation_guard(text, look_tokens)
+    ):
+        failures.append("look_visible_light_non_creation")
+
     global_video_appearance_isolation = (
         bool(manifest.get("require_video_appearance_isolation"))
         and _has_global_video_appearance_isolation(text)
     )
     for video in manifest["videos"]:
-        if not isinstance(video, dict):
+        if (
+            not isinstance(video, dict)
+            or not isinstance(video.get("unbound_authority"), bool)
+            or not isinstance(video.get("unresolved_reasons"), list)
+            or not isinstance(video.get("motion_relations"), list)
+            or not isinstance(video.get("unresolved_motion_relations"), list)
+            or not isinstance(video.get("primary_precedence_tokens"), list)
+        ):
             failures.append("video_manifest_invalid")
             continue
         token = str(video.get("token") or "")
@@ -2113,6 +4482,13 @@ def _assert_final_output_semantic_integrity(
             failures.append(f"missing:{token}")
             continue
         window = _semantic_text_window(text, token)
+        if video.get("unbound_authority"):
+            if (
+                not _has_unbound_video_isolation(window)
+                or _has_positive_unbound_video_authority(text, token)
+            ):
+                failures.append(f"unbound_video_authority:{token}")
+            continue
         role = str(video.get("control_role") or "")
         source_type = str(video.get("source_type") or "")
         role_groups: tuple[tuple[str, ...], ...]
@@ -2152,6 +4528,17 @@ def _assert_final_output_semantic_integrity(
             for group in role_groups
         ):
             failures.append(f"video_authority:{token}")
+        if _has_positive_video_visual_authority(
+            text,
+            token,
+            appearance_intrinsic_tokens,
+        ):
+            failures.append(f"video_forbidden_visual_authority:{token}")
+        if (
+            token in shot_fx_behavior_tokens
+            and _has_positive_fx_persistent_light_creation(text, token)
+        ):
+            failures.append(f"fx_persistent_light_creation:{token}")
 
         if (
             manifest.get("require_video_appearance_isolation")
@@ -2169,19 +4556,53 @@ def _assert_final_output_semantic_integrity(
             ):
                 failures.append(f"video_appearance_isolation:{token}")
 
+    if manifest.get("require_primary_motion_precedence") and not (
+        _has_primary_motion_precedence_guard(
+            text,
+            primary_unified_tokens,
+            local_motion_tokens,
+        )
+    ):
+        failures.append("primary_motion_precedence")
+    if manifest.get("require_local_motion_conflict_isolation") and not (
+        _has_local_motion_conflict_guard(text)
+        and _has_exact_local_motion_conflict_guards(
+            text,
+            list(manifest["unresolved_motion_relations"]),
+        )
+    ):
+        failures.append("local_motion_conflict_isolation")
+
+    if (
+        manifest["intrinsic_emitter_tokens"]
+        and _has_positive_intrinsic_emitter_mutation(
+            text,
+            list(manifest["intrinsic_emitter_tokens"]),
+        )
+    ):
+        failures.append("intrinsic_emitter_source_separation")
+    elif (
+        manifest.get("require_intrinsic_emitter_source_separation")
+        and not _has_intrinsic_emitter_identity_guard(
+            text,
+            character_tokens,
+            character_prop_tokens,
+            background_prop_tokens,
+        )
+    ):
+        failures.append("intrinsic_emitter_source_separation")
+
     if manifest.get("require_background_look_non_substitution"):
-        negative_terms = ("do not", "must not", "never", "without copying", "no ")
-        substitution_terms = (
-            "copy", "replicate", "transplant", "substitute", "replace", "import",
-        )
-        scene_content_terms = (
-            "background", "location", "terrain", "geometry", "object", "layout",
-            "composition", "vegetation", "scene content",
-        )
-        if not (
-            any(term in folded for term in negative_terms)
-            and any(term in folded for term in substitution_terms)
-            and any(term in folded for term in scene_content_terms)
+        if (
+            _has_positive_look_scene_content_authority(
+                text,
+                look_tokens,
+                main_background_tokens + appearance_intrinsic_tokens,
+            )
+            or not _has_look_transfer_only_scene_content_guard(
+                text,
+                look_tokens,
+            )
         ):
             failures.append("background_look_non_substitution")
 

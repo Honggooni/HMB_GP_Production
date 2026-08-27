@@ -9,9 +9,9 @@ from _hmb_private_policy_fixture import install_private_policy_reader
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.7.5"
-EXPECTED_VERSION = "2026-08-12.agent-shot-quality.v4.2"
-EXPECTED_CONTRACT_SHA256 = "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
+EXPECTED_RELEASE_VERSION = "0.7.7"
+EXPECTED_VERSION = "2026-08-27.agent-shot-quality.v4.5"
+EXPECTED_CONTRACT_SHA256 = "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
 
 
 def load_module(name: str):

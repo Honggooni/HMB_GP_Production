@@ -8,14 +8,17 @@ import types
 from itertools import combinations
 from pathlib import Path
 
-from _hmb_private_policy_fixture import install_private_policy_reader
+from _hmb_private_policy_fixture import (
+    install_private_policy_reader,
+    read_private_policy_fixture_if_available,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.7.5"
-EXPECTED_POLICY_VERSION = "2026-08-12.agent-shot-quality.v4.2"
-EXPECTED_CONTRACT_SHA256 = "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
-EXPECTED_SERVER_POLICY_SHA256 = "6debb90960499ff6fe163a8a5a6db42a0da028f7a7606f993175edbd5712e65e"
+EXPECTED_RELEASE_VERSION = "0.7.7"
+EXPECTED_POLICY_VERSION = "2026-08-27.agent-shot-quality.v4.5"
+EXPECTED_CONTRACT_SHA256 = "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
+EXPECTED_SERVER_POLICY_SHA256 = "228b54e55dd4167f4cb58f8bdbdb8762818a636018180fe1ae97f7a023ac2144"
 EXPECTED_SIGNING_KEY_ID = "hmb-policy-local-2026-08-r1"
 PRIVATE_SIGNED_POLICY_FIXTURE = (
     ROOT
@@ -39,8 +42,8 @@ def load(name: str):
 agent = load("HMBAgentLibrary")
 prompt = load("HMBPromptLibrary")
 
-assert PRIVATE_SIGNED_POLICY_FIXTURE.is_file()
-sealed = PRIVATE_SIGNED_POLICY_FIXTURE.read_bytes()
+sealed = read_private_policy_fixture_if_available()
+assert sealed is not None
 assert hashlib.sha256(sealed).hexdigest() == EXPECTED_SERVER_POLICY_SHA256
 original_policy_reader = agent._hmb._read_agent_policy_envelope
 _fixture_reader, installed_sealed = install_private_policy_reader(agent._hmb)

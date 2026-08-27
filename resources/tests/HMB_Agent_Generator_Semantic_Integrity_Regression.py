@@ -175,12 +175,49 @@ semantic_job = agent._assert_public_job_data_contract(
 manifest = agent._build_final_output_semantic_manifest(semantic_job)
 good = """@image1 (ForestSet) is the sole background and scene-content authority.
 
-@image2 (DawnLook) supplies the Global Look scene-wide: transfer its color palette and grade, lighting and exposure, plus render style and shading. Never copy, replace, or import its background location, geometry, objects, or composition.
+@image2 (DawnLook) supplies the Global Look scene-wide: transfer its color palette and grade, lighting and exposure, plus render style and shading. Never copy, replace, or import its background location, geometry, objects, or composition. @image2 must not create, add, invent, or reveal any visible light source, sun, moon, luminous emitter, god ray, volumetric beam, lens flare, or bloom.
 
-@image3 is the exact Hero character appearance, identity, design, proportions, silhouette, and material authority.
+@image3 is the exact Hero character appearance, identity, design, proportions, silhouette, and material authority. Preserve its intrinsic color, pattern, material, stylization, native medium, local value hierarchy, signature accents, and material breaks, and keep the Hero visually separable from every other character. Character distinctiveness is a hard priority over every Look transfer; @image2 must adapt around those identity cues and must not overwrite, replace, homogenize, or average those Hero-specific traits. Preserve every repeated painted or cel-style highlight as intrinsic authored graphic treatment. Remove only demonstrably view-dependent captured studio key, fill, or rim illumination; every uncertain highlight or edge accent remains intrinsic and must be retained. If a source-defined intrinsic emitter exists for @image3, @image3 owns and preserves its design, shape, placement, color, material, and steady emissive state.
+
+If a dark shadow would crush face, eye, or expression readability, adjust shared low-frequency ambient or reflected bounce across the entire connected local shadow field, including affected characters, props, and nearby environment, while preserving direct-light reduction and the continuous shadow boundary; never apply a selective character-only lift.
 
 @video1 is the Primary Unified Shot Control for motion, acting, timing, camera, framing, and layout. Its control visualization is proxy shading only and it has no character appearance authority; character appearance comes solely from @image3."""
 agent._assert_final_output_semantic_integrity(good, manifest)
+
+# ``Global Look`` is a reserved UI scope label rather than a renderable target
+# identifier. Natural generator prose may preserve the same scope semantically
+# without echoing that exact label.
+global_look_semantic_alias = good.replace(
+    "supplies the Global Look scene-wide:",
+    "supplies color, look, and lighting as a global, transfer-only authority:",
+)
+agent._assert_final_output_semantic_integrity(
+    global_look_semantic_alias,
+    manifest,
+)
+expect_rejected(
+    lambda: agent._assert_final_output_semantic_integrity(
+        good.replace(
+            "supplies the Global Look scene-wide:",
+            "supplies transferable attributes:",
+        ),
+        manifest,
+    ),
+    "target:@image2",
+)
+
+# A combined Color / Look / Lighting declaration must retain its render/look
+# axis; color plus lighting alone is semantically incomplete.
+expect_rejected(
+    lambda: agent._assert_final_output_semantic_integrity(
+        good.replace(
+            "color palette and grade, lighting and exposure, plus render style and shading",
+            "color palette and grade, plus lighting and exposure",
+        ),
+        manifest,
+    ),
+    "look_authority:@image2",
+)
 expect_rejected(
     lambda: agent._assert_final_output_semantic_integrity(
         good.replace("@image3", "the character"),
@@ -230,7 +267,9 @@ agent._assert_final_output_semantic_integrity(
 )
 
 
-custom_instruction = "Use a cool moonlit key with warm window bounce."
+custom_instruction = (
+    "Use a cool moonlit key with warm window bounce across the whole scene."
+)
 custom_job = agent._assert_public_job_data_contract(
     envelope(job(images=[
         image(
@@ -247,8 +286,14 @@ custom_job = agent._assert_public_job_data_contract(
 custom_manifest = agent._build_final_output_semantic_manifest(custom_job)
 custom_tag = custom_manifest["images"][0]["custom_instruction_evidence_tag"]
 custom_final = (
-    "@image1 supplies shared scene lighting and atmosphere using a cool moonlit "
-    f"key with warm window bounce across all visible subjects. {custom_tag}"
+    "@image1 is transfer-only visual-attribute authority and supplies shared "
+    "scene lighting and atmosphere using a cool moonlit key with warm window "
+    "bounce across all visible subjects. It has no scene or background content "
+    "authority and must not copy, replace, substitute, or invent any location, "
+    "terrain, geometry, object, material identity, vegetation, species, layout, "
+    "camera, composition, or depicted detail. @image1 must not "
+    "create, add, invent, or reveal any visible light source, sun, moon, luminous "
+    f"emitter, god ray, volumetric beam, lens flare, or bloom. {custom_tag}"
 )
 agent._assert_final_output_semantic_integrity(custom_final, custom_manifest)
 assert custom_tag not in agent._strip_semantic_evidence_tags(custom_final)
@@ -286,17 +331,41 @@ local_custom_tag = local_custom_manifest["images"][0][
     "custom_instruction_evidence_tag"
 ]
 local_custom_final = (
-    "@image1 supplies lighting, exposure, and atmosphere: apply a warm key "
-    f"and reduced exposure to Hero_A only. {local_custom_tag}"
+    "@image1 is transfer-only visual-attribute authority and supplies lighting, "
+    "exposure, and atmosphere: apply a warm key and reduced exposure to Hero_A "
+    "only. It has no scene or background content authority and must not copy, "
+    "replace, substitute, or invent any location, terrain, geometry, object, "
+    "material identity, vegetation, species, layout, camera, composition, or "
+    "depicted detail. @image1 must not create, add, invent, "
+    "or reveal any visible light source, sun, moon, luminous emitter, god ray, "
+    f"volumetric beam, lens flare, or bloom. {local_custom_tag}"
 )
 agent._assert_final_output_semantic_integrity(
     local_custom_final,
     local_custom_manifest,
 )
 
-# Custom has its own authored-scope claim key. A Global claim must not absorb
-# it, and two different local Custom instructions may coexist; an exact
-# duplicate still fails closed for overlapping attribute authority.
+# A Global claim and same-domain local Custom may coexist only when the Custom
+# names one known local Target and explicitly declares its override. Different
+# resolved local Targets may coexist; an exact duplicate still fails closed.
+hero_target = image(
+    "@image3",
+    "Hero",
+    "Character",
+    "Full Appearance",
+    "Hero_A",
+)
+forest_target = image(
+    "@image4",
+    "Forest",
+    "Environment / Background",
+    "Main Background",
+    "Forest_A",
+)
+explicit_local_override = (
+    "Explicitly override the Global Look lighting for Hero_A only with a warm "
+    "key and reduced exposure."
+)
 global_and_local = job(images=[
     image(
         "@image1",
@@ -313,12 +382,13 @@ global_and_local = job(images=[
         "Lighting / Atmosphere",
         "Custom",
         scope_mode="custom",
-        custom_instruction=local_custom_instruction,
+        custom_instruction=explicit_local_override,
     ),
+    hero_target,
 ])
 assert len(agent._assert_public_job_data_contract(
     envelope(global_and_local)
-)["images"]) == 2
+)["images"]) == 3
 
 second_local_instruction = "Apply a cool rim to Forest_A only."
 distinct_custom_scopes = job(images=[
@@ -340,19 +410,30 @@ distinct_custom_scopes = job(images=[
         scope_mode="custom",
         custom_instruction=second_local_instruction,
     ),
+    hero_target,
+    forest_target,
 ])
 assert len(agent._assert_public_job_data_contract(
     envelope(distinct_custom_scopes)
-)["images"]) == 2
+)["images"]) == 4
 duplicate_custom_scope = json.loads(json.dumps(distinct_custom_scopes))
 duplicate_custom_scope["images"][1]["custom_look_instruction"] = (
     local_custom_instruction
 )
-expect_rejected(
-    lambda: agent._assert_public_job_data_contract(
-        envelope(duplicate_custom_scope)
-    ),
-    "Look target attribute authority is ambiguous",
+duplicate_custom_contract = agent._assert_public_job_data_contract(
+    envelope(duplicate_custom_scope)
+)
+duplicate_custom_manifest = agent._build_final_output_semantic_manifest(
+    duplicate_custom_contract
+)
+duplicate_look_rows = duplicate_custom_manifest["images"][:2]
+assert all(row["unbound_authority"] is True for row in duplicate_look_rows)
+assert all(
+    any(
+        relation.get("reason") == "look_authority_scope_conflict"
+        for relation in row["unresolved_relations"]
+    )
+    for row in duplicate_look_rows
 )
 
 

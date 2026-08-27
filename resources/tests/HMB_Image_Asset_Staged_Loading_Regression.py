@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 from io import BytesIO
 import importlib.util
@@ -10,6 +11,8 @@ import shutil
 import sys
 import tempfile
 import threading
+import types
+from types import SimpleNamespace
 import uuid
 
 
@@ -115,6 +118,156 @@ try:
     )
     assert changed_asset["thumbnail_url"] == ""
     assert (changed_asset["width"], changed_asset["height"]) == (21, 7)
+
+    # A completed scan may be projected into a local, non-authoritative index.
+    # Reopening the same project must consume that index without walking the
+    # project again, while every identity/corruption boundary fails closed.
+    original_index_root = asset_library._ASSET_CATALOG_INDEX_ROOT
+    index_root = temporary / "catalog-index"
+    asset_library._ASSET_CATALOG_INDEX_ROOT = index_root
+    indexed_state = asset_library._merge_scan_with_state(
+        asset_library._scan_project_assets(project_root),
+        asset_library._default_state(),
+    )
+    indexed_state["catalog_root"] = str(catalog_root).replace("\\", "/")
+    indexed_state["projects"] = [
+        {
+            "project_id": indexed_state["project_id"],
+            "project_uid": indexed_state["project_uid"],
+            "path": indexed_state["project_root"],
+            "name": "ProjectA",
+        }
+    ]
+    indexed_state = asset_library._normalize_state(indexed_state)
+    try:
+        asset_library._write_catalog_index(indexed_state)
+        index_path = asset_library._catalog_index_path(project_root)
+        assert index_path.is_file()
+        assert index_path.resolve().is_relative_to(index_root.resolve())
+        assert not any(project_root.glob("*.hmb-image-asset-catalog-index*"))
+
+        original_scan_for_index = asset_library._scan_project_assets
+        asset_library._scan_project_assets = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("A valid restart index performed a full project scan.")
+        )
+        try:
+            reopened = asset_library._read_catalog_index(
+                project_root,
+                indexed_state,
+            )
+        finally:
+            asset_library._scan_project_assets = original_scan_for_index
+        assert reopened is not None
+        assert reopened["project_uid"] == indexed_state["project_uid"]
+        assert [item["relative_path"] for item in reopened["assets"]] == [
+            item["relative_path"]
+            for item in indexed_state["assets"]
+            if item["source_kind"] == "project"
+        ]
+        assert all(not item["thumbnail_url"] for item in reopened["assets"])
+
+        valid_index_text = index_path.read_text(encoding="utf-8")
+
+        def rejected_index(mutator):
+            raw = __import__("json").loads(valid_index_text)
+            mutator(raw)
+            index_path.write_text(
+                __import__("json").dumps(raw),
+                encoding="utf-8",
+            )
+            assert asset_library._read_catalog_index(
+                project_root,
+                indexed_state,
+            ) is None
+
+        rejected_index(lambda raw: raw.__setitem__("project_uid", "wrong-project"))
+        rejected_index(lambda raw: raw.__setitem__("manifest_signature", "0" * 64))
+        rejected_index(lambda raw: raw.__setitem__("project_root", str(temporary / "other")))
+
+        def inject_traversal(raw):
+            raw["assets"][0]["relative_path"] = "../escape.png"
+
+        rejected_index(inject_traversal)
+        index_path.write_text("{not-json", encoding="utf-8")
+        assert asset_library._read_catalog_index(
+            project_root,
+            indexed_state,
+        ) is None
+
+        # Refresh remains the explicit full-rescan authority; the index is
+        # only a restart/process accelerator and cannot replace this branch.
+        apply_source = inspect.getsource(
+            asset_library.HMBImageAssetLibrary._apply_widget_state
+        )
+        refresh_branch = apply_source[apply_source.index("if refresh_requested:") :]
+        refresh_branch = refresh_branch[: refresh_branch.index("requested_path =")]
+        assert "_load_project_catalog(" in refresh_branch
+        assert "use_shared_cache=False" in refresh_branch
+        assert "_read_catalog_index" not in refresh_branch
+        process_source = inspect.getsource(asset_library.HMBImageAssetLibrary.process)
+        assert process_source.index("_read_catalog_index(") < process_source.index(
+            "self._load_catalog("
+        )
+
+        # PROJECT_ROOT remains authoritative even when a host changes it
+        # programmatically without delivering the retained widget callback.
+        # Neither an otherwise-current state nor its local index may keep the
+        # node attached to the previous catalog.
+        requested_process_root = str(temporary / "ReplacementProjects")
+        process_current = deepcopy(indexed_state)
+        # Reproduce the async root-change busy snapshot: catalog_root already
+        # reflects the new picker value while project_root/assets still belong
+        # to the previous project.
+        process_current["catalog_root"] = requested_process_root.replace("\\", "/")
+        process_loads = []
+
+        class ProcessRootProbe:
+            def _consume_pending_catalog_scan_result(self):
+                return False
+
+            def _consume_pending_thumbnail_result(self):
+                return False
+
+            def _ensure_parameters(self):
+                return None
+
+            def _current_state(self):
+                return process_current
+
+            def _load_catalog(self, root_value):
+                process_loads.append(root_value)
+                loaded = deepcopy(process_current)
+                loaded["catalog_root"] = str(root_value).replace("\\", "/")
+                return loaded
+
+            def _sync_output(self, state, *, force=False):
+                assert force is True
+                return state
+
+            def _reconcile_hmb_shot_routing(self, _catalog_identity=""):
+                return None
+
+        original_parameter_reader = asset_library._get_parameter_raw
+        original_current_check = asset_library._state_catalog_is_current
+        original_index_reader = asset_library._read_catalog_index
+        asset_library._get_parameter_raw = lambda _node, name: (
+            requested_process_root
+            if name == asset_library.PROJECT_ROOT_PARAMETER
+            else None
+        )
+        asset_library._state_catalog_is_current = lambda _state: True
+        asset_library._read_catalog_index = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("A stale-root catalog index was consulted by process().")
+        )
+        try:
+            asset_library.HMBImageAssetLibrary.process(ProcessRootProbe())
+        finally:
+            asset_library._get_parameter_raw = original_parameter_reader
+            asset_library._state_catalog_is_current = original_current_check
+            asset_library._read_catalog_index = original_index_reader
+        assert process_loads == [requested_process_root]
+    finally:
+        asset_library._ASSET_CATALOG_INDEX_ROOT = original_index_root
 
     # The local cache survives the process-memory URL map and remains bounded.
     cache_root = temporary / "thumbnail-cache"
@@ -256,6 +409,43 @@ try:
     assert merged["shot_routing"] == live["shot_routing"]
     assert merged_hero["thumbnail_url"].startswith("memory://")
 
+    # The compact worker pipeline receives canonical state/request objects.
+    # Its bounded thumbnail mutation and live merge must not re-normalize the
+    # complete O(N) catalog at every internal stage.
+    original_state_normalizer = asset_library._normalize_state
+    normalized_pipeline_calls = []
+
+    def counted_state_normalizer(value):
+        normalized_pipeline_calls.append(value)
+        return original_state_normalizer(value)
+
+    asset_library._normalize_state = counted_state_normalizer
+    asset_library._asset_thumbnail_url = (
+        lambda _path, asset_id: f"memory://normalized/{asset_id}"
+    )
+    try:
+        normalized_hydration = asset_library._hydrate_asset_thumbnails(
+            hydrated_base,
+            hydration_request,
+            normalized=True,
+            request_normalized=True,
+        )
+        normalized_merge = asset_library._merge_async_thumbnail_result_with_live_state(
+            normalized_hydration,
+            hydrated_base,
+            live,
+            hydration_request,
+            inputs_normalized=True,
+            request_normalized=True,
+        )
+    finally:
+        asset_library._normalize_state = original_state_normalizer
+        asset_library._asset_thumbnail_url = original_thumbnail_url
+    assert normalized_pipeline_calls == []
+    assert next(
+        item for item in normalized_merge["assets"] if item["asset_id"] == "Hero"
+    )["thumbnail_url"].startswith("memory://normalized/")
+
     mismatched_result = deepcopy(hydration_result)
     mismatched_result["thumbnail_result"]["request_id"] = "another-worker"
     rejected_mismatch = asset_library._merge_async_thumbnail_result_with_live_state(
@@ -286,6 +476,143 @@ try:
         "failed_asset_library_ids"
     ]
 
+    # Persistent-cache maintenance is amortized over one hydration batch.
+    # Three misses prune once, warm hits do not prune, and nested/exception
+    # paths always return the global defer counter to a safe value.
+    batch_cache_root = temporary / "batch-thumbnail-cache"
+    original_batch_cache_root = asset_library._ASSET_THUMBNAIL_CACHE_ROOT
+    original_batch_publisher = asset_library._publish_thumbnail_payload
+    original_batch_prune = asset_library._prune_persistent_thumbnail_cache
+    original_batch_generator = asset_library._generate_thumbnail_payload
+    original_defer_count = asset_library._ASSET_THUMBNAIL_CACHE_DEFER_COUNT
+    original_prune_pending = asset_library._ASSET_THUMBNAIL_CACHE_PRUNE_PENDING
+    batch_paths = []
+    for index in range(3):
+        batch_path = asset_folder / f"BatchPrune{index}.png"
+        batch_path.write_bytes(png_bytes((14 + index, 10), (40, 60 + index, 90)))
+        batch_paths.append(batch_path)
+    batch_state = asset_library._merge_scan_with_state(
+        asset_library._scan_project_assets(project_root),
+        asset_library._default_state(),
+    )
+    batch_by_path = {
+        Path(item["path"]).resolve(): item
+        for item in batch_state["assets"]
+    }
+    batch_ids = [batch_by_path[path.resolve()]["asset_library_id"] for path in batch_paths]
+    batch_request = {
+        "request_id": "three-cache-misses",
+        "project_uid": batch_state["project_uid"],
+        "manifest_signature": batch_state["manifest_signature"],
+        "scan_revision": batch_state["scan_revision"],
+        "asset_library_ids": batch_ids,
+    }
+    prune_calls = []
+    generate_calls = []
+
+    def counted_batch_prune(root):
+        prune_calls.append(Path(root))
+        return original_batch_prune(root)
+
+    def counted_batch_generator(path):
+        generate_calls.append(Path(path).resolve())
+        return original_batch_generator(path)
+
+    asset_library._ASSET_THUMBNAIL_CACHE_ROOT = batch_cache_root
+    asset_library._ASSET_THUMBNAIL_CACHE_DEFER_COUNT = 0
+    asset_library._ASSET_THUMBNAIL_CACHE_PRUNE_PENDING = False
+    asset_library._ASSET_THUMBNAIL_URLS.clear()
+    asset_library._prune_persistent_thumbnail_cache = counted_batch_prune
+    asset_library._generate_thumbnail_payload = counted_batch_generator
+    asset_library._publish_thumbnail_payload = (
+        lambda _payload, _extension, _asset_id, signature: f"memory://{signature}"
+    )
+    try:
+        batch_result = asset_library._hydrate_asset_thumbnails(
+            batch_state,
+            batch_request,
+        )
+        assert sorted(batch_result["thumbnail_result"]["completed_asset_library_ids"]) == sorted(batch_ids)
+        assert sorted(generate_calls) == sorted(path.resolve() for path in batch_paths)
+        assert len(prune_calls) == 1
+        assert asset_library._ASSET_THUMBNAIL_CACHE_DEFER_COUNT == 0
+        assert asset_library._ASSET_THUMBNAIL_CACHE_PRUNE_PENDING is False
+
+        asset_library._ASSET_THUMBNAIL_URLS.clear()
+        generate_calls.clear()
+        prune_calls.clear()
+        warm_request = {**batch_request, "request_id": "three-warm-hits"}
+        warm_result = asset_library._hydrate_asset_thumbnails(
+            batch_state,
+            warm_request,
+        )
+        assert sorted(warm_result["thumbnail_result"]["completed_asset_library_ids"]) == sorted(batch_ids)
+        assert generate_calls == []
+        assert prune_calls == []
+        assert asset_library._ASSET_THUMBNAIL_CACHE_DEFER_COUNT == 0
+
+        nested_path = asset_folder / "NestedBatch.png"
+        nested_path.write_bytes(png_bytes((19, 13), (81, 42, 23)))
+        nested_state = asset_library._merge_scan_with_state(
+            asset_library._scan_project_assets(project_root),
+            asset_library._default_state(),
+        )
+        nested_asset = next(
+            item
+            for item in nested_state["assets"]
+            if Path(item["path"]).resolve() == nested_path.resolve()
+        )
+        nested_request = {
+            "request_id": "nested-batch",
+            "project_uid": nested_state["project_uid"],
+            "manifest_signature": nested_state["manifest_signature"],
+            "scan_revision": nested_state["scan_revision"],
+            "asset_library_ids": [nested_asset["asset_library_id"]],
+        }
+        prune_calls.clear()
+        asset_library._ASSET_THUMBNAIL_CACHE_DEFER_COUNT = 1
+        nested_result = asset_library._hydrate_asset_thumbnails(
+            nested_state,
+            nested_request,
+        )
+        assert nested_result["thumbnail_result"]["completed_asset_library_ids"] == [
+            nested_asset["asset_library_id"]
+        ]
+        assert asset_library._ASSET_THUMBNAIL_CACHE_DEFER_COUNT == 1
+        assert asset_library._ASSET_THUMBNAIL_CACHE_PRUNE_PENDING is True
+        assert prune_calls == []
+        asset_library._ASSET_THUMBNAIL_CACHE_DEFER_COUNT = 0
+        asset_library._flush_persistent_thumbnail_cache_prune()
+        assert len(prune_calls) == 1
+        assert asset_library._ASSET_THUMBNAIL_CACHE_PRUNE_PENDING is False
+
+        failing_thumbnail = asset_library._asset_thumbnail_url
+
+        def raised_thumbnail(*_args, **_kwargs):
+            raise RuntimeError("simulated thumbnail failure")
+
+        asset_library._asset_thumbnail_url = raised_thumbnail
+        try:
+            failed_batch = asset_library._hydrate_asset_thumbnails(
+                nested_state,
+                {**nested_request, "request_id": "exception-batch"},
+            )
+        finally:
+            asset_library._asset_thumbnail_url = failing_thumbnail
+        assert failed_batch["thumbnail_result"]["completed_asset_library_ids"] == []
+        assert failed_batch["thumbnail_result"]["failed_asset_library_ids"] == [
+            nested_asset["asset_library_id"]
+        ]
+        assert asset_library._ASSET_THUMBNAIL_CACHE_DEFER_COUNT == 0
+    finally:
+        asset_library._ASSET_THUMBNAIL_CACHE_ROOT = original_batch_cache_root
+        asset_library._publish_thumbnail_payload = original_batch_publisher
+        asset_library._prune_persistent_thumbnail_cache = original_batch_prune
+        asset_library._generate_thumbnail_payload = original_batch_generator
+        asset_library._ASSET_THUMBNAIL_CACHE_DEFER_COUNT = original_defer_count
+        asset_library._ASSET_THUMBNAIL_CACHE_PRUNE_PENDING = original_prune_pending
+        asset_library._ASSET_THUMBNAIL_URLS.clear()
+
     # The node-level contract acknowledges immediately, completes off-thread,
     # and publishes through the retained-mode consumer without a catalog scan.
     node = object.__new__(asset_library.HMBImageAssetLibrary)
@@ -304,8 +631,10 @@ try:
 
     node_publications = []
 
-    def publish_node_state(value):
-        normalized_value = asset_library._normalize_state(value)
+    def publish_node_state(value, *, normalized=False):
+        normalized_value = (
+            value if normalized else asset_library._normalize_state(value)
+        )
         node_live["state"] = normalized_value
         node_publications.append(normalized_value)
         return normalized_value
@@ -333,6 +662,528 @@ try:
     assert node_hero["thumbnail_url"].startswith("memory://")
     assert len(node_publications) == 1
 
+    # The hidden bridge owns compact thumbnail request/result traffic. Its
+    # worker completion updates the canonical backend state silently and emits
+    # only the bounded result envelope; the full widget publisher is not used.
+    bridge_node = object.__new__(asset_library.HMBImageAssetLibrary)
+    bridge_live = {"state": deepcopy(hydrated_base)}
+    bridge_results = []
+    bridge_silent_stores = []
+    bridge_node._current_state = lambda: bridge_live["state"]
+    bridge_node._scan_owner_is_current = lambda: True
+    bridge_node._hmb_import_media_by_uid = {}
+    bridge_node._hmb_manifest_poll_received = False
+    bridge_node._hmb_manifest_poll_pending = False
+    bridge_node._hmb_refresh_revision = hydrated_base["refresh_revision"]
+    bridge_node._publish_state = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("Compact thumbnail completion used the full widget publisher.")
+    )
+    bridge_node._accept_normalized_widget_state_baseline = lambda *_args, **_kwargs: None
+
+    def bridge_set_parameter(name, value, *args, **kwargs):
+        assert name == asset_library.WIDGET_STATE_PARAMETER
+        assert kwargs.get("emit_change") is False
+        assert kwargs.get("skip_before_value_set") is True
+        normalized_value = asset_library._normalize_state(value)
+        bridge_live["state"] = normalized_value
+        bridge_silent_stores.append(normalized_value)
+
+    bridge_node.set_parameter_value = bridge_set_parameter
+    bridge_node._set_thumbnail_bridge_value = lambda value: bridge_results.append(
+        asset_library._normalize_thumbnail_bridge(value)
+    )
+    runtime_id = bridge_node._thumbnail_runtime_id(bridge_live["state"])
+    bridge_request = {
+        "schema": asset_library.THUMBNAIL_BRIDGE_SCHEMA,
+        "version": asset_library.THUMBNAIL_BRIDGE_VERSION,
+        "runtime_instance_id": runtime_id,
+        "operation": "hydrate",
+        "phase": "request",
+        "request_id": "compact-bridge-request",
+        "project_uid": hydrated_base["project_uid"],
+        "manifest_signature": hydrated_base["manifest_signature"],
+        "scan_revision": hydrated_base["scan_revision"],
+        "asset_library_ids": [hero["asset_library_id"]],
+    }
+    # Path-derived identities are allowed to exceed 128 characters throughout
+    # the canonical contract. The compact bridge must preserve them verbatim
+    # in both directions or the generated thumbnail can never match its card.
+    long_bridge_id = "asset/" + ("long-segment-" * 24) + "image.png"
+    assert len(long_bridge_id) > 128
+    normalized_long_request = asset_library._normalize_thumbnail_bridge(
+        {**bridge_request, "asset_library_ids": [long_bridge_id]}
+    )
+    assert normalized_long_request["asset_library_ids"] == [long_bridge_id]
+    normalized_long_result = asset_library._normalize_thumbnail_bridge(
+        {
+            **bridge_request,
+            "phase": "result",
+            "completed_assets": [
+                {
+                    "asset_library_id": long_bridge_id,
+                    "source_uid": "project:" + long_bridge_id,
+                    "media_signature": "a" * 64,
+                    "thumbnail_url": "https://static.invalid/long.webp",
+                }
+            ],
+            "failed_asset_library_ids": [long_bridge_id],
+        }
+    )
+    assert normalized_long_result["completed_assets"][0]["asset_library_id"] == (
+        long_bridge_id
+    )
+    assert normalized_long_result["failed_asset_library_ids"] == [long_bridge_id]
+    asset_library._asset_thumbnail_url = lambda _path, asset_id: f"memory://bridge/{asset_id}"
+    try:
+        bridge_node._apply_thumbnail_bridge_request(bridge_request)
+        bridge_thread = bridge_node._hmb_thumbnail_thread
+        assert bridge_thread is not None
+        bridge_thread.join(timeout=5.0)
+        assert bridge_thread.is_alive() is False
+        assert bridge_node._consume_pending_thumbnail_result() is True
+    finally:
+        asset_library._asset_thumbnail_url = original_thumbnail_url
+    assert len(bridge_silent_stores) == 1
+    bridge_hero = next(
+        item
+        for item in bridge_live["state"]["assets"]
+        if item["asset_library_id"] == hero["asset_library_id"]
+    )
+    assert bridge_hero["thumbnail_url"].startswith("memory://bridge/")
+    assert len(bridge_results) == 1
+    bridge_result = bridge_results[0]
+    assert bridge_result["operation"] == "hydrate"
+    assert bridge_result["phase"] == "result"
+    assert bridge_result["request_id"] == bridge_request["request_id"]
+    assert bridge_result["completed_assets"] == [
+        {
+            "asset_library_id": hero["asset_library_id"],
+            "source_uid": bridge_hero["source_uid"],
+            "media_signature": bridge_hero["media_signature"],
+            "thumbnail_url": bridge_hero["thumbnail_url"],
+        }
+    ]
+    assert len(asset_library._json_text(bridge_result)) < 8192
+
+    # The browser watchdog may repeat the exact request after a lost response.
+    # Re-publish the accepted result without starting a second decoder worker.
+    idempotent_generation = bridge_node._hmb_thumbnail_generation
+    idempotent_thread = bridge_node._hmb_thumbnail_thread
+    idempotent_results = len(bridge_results)
+    bridge_node._apply_thumbnail_bridge_request(bridge_request)
+    assert bridge_node._hmb_thumbnail_generation == idempotent_generation
+    assert bridge_node._hmb_thumbnail_thread is idempotent_thread
+    assert len(bridge_results) == idempotent_results + 1
+    assert bridge_results[-1]["request_id"] == bridge_request["request_id"]
+
+    stale_generation = bridge_node._hmb_thumbnail_generation
+    stale_store_count = len(bridge_silent_stores)
+    stale_result_count = len(bridge_results)
+    for stale_request in (
+        {**bridge_request, "request_id": "wrong-runtime", "runtime_instance_id": "stale"},
+        {**bridge_request, "request_id": "wrong-project", "project_uid": "stale"},
+        {**bridge_request, "request_id": "wrong-manifest", "manifest_signature": "stale"},
+        {**bridge_request, "request_id": "wrong-scan", "scan_revision": hydrated_base["scan_revision"] + 1},
+    ):
+        bridge_node._apply_thumbnail_bridge_request(stale_request)
+    assert bridge_node._hmb_thumbnail_generation == stale_generation
+    assert len(bridge_silent_stores) == stale_store_count
+    assert len(bridge_results) == stale_result_count
+
+    # A compact remount can replace request A with request B while A is still
+    # decoding. The backend must coalesce and run B after A; otherwise the
+    # browser rejects A by request ID and waits forever for a B result.
+    queued_started = threading.Event()
+    queued_release = threading.Event()
+    queued_hydrator = asset_library._hydrate_asset_thumbnails
+    queued_calls = []
+
+    def blocking_bridge_hydrator(state_value, request_value, **kwargs):
+        queued_calls.append(request_value["request_id"])
+        queued_started.set()
+        assert queued_release.wait(timeout=5.0)
+        return queued_hydrator(state_value, request_value, **kwargs)
+
+    bridge_request_a = {**bridge_request, "request_id": "compact-flight-a"}
+    bridge_request_b = {**bridge_request, "request_id": "compact-flight-b"}
+    asset_library._hydrate_asset_thumbnails = blocking_bridge_hydrator
+    asset_library._asset_thumbnail_url = (
+        lambda _path, asset_id: f"memory://queued/{asset_id}"
+    )
+    try:
+        bridge_node._apply_thumbnail_bridge_request(bridge_request_a)
+        assert queued_started.wait(timeout=2.0)
+        bridge_thread_a = bridge_node._hmb_thumbnail_thread
+        bridge_node._apply_thumbnail_bridge_request(bridge_request_b)
+        assert bridge_node._hmb_thumbnail_queued_bridge_request["request_id"] == (
+            bridge_request_b["request_id"]
+        )
+        queued_release.set()
+        bridge_thread_a.join(timeout=5.0)
+        assert bridge_node._consume_pending_thumbnail_result() is True
+        bridge_thread_b = bridge_node._hmb_thumbnail_thread
+        assert bridge_thread_b is not None and bridge_thread_b is not bridge_thread_a
+        bridge_thread_b.join(timeout=5.0)
+        assert bridge_node._consume_pending_thumbnail_result() is True
+    finally:
+        queued_release.set()
+        asset_library._hydrate_asset_thumbnails = queued_hydrator
+        asset_library._asset_thumbnail_url = original_thumbnail_url
+    assert queued_calls == ["compact-flight-a", "compact-flight-b"]
+    assert [item["request_id"] for item in bridge_results[-2:]] == [
+        "compact-flight-a",
+        "compact-flight-b",
+    ]
+    assert bridge_node._hmb_thumbnail_queued_bridge_request is None
+
+    # Worker completion belongs on the retained-mode/event-manager loop. Cover
+    # the four host lifecycle paths that a synchronous pending-only test cannot:
+    # a live loop, late loop bootstrap, one failed publish recovered by the
+    # browser's exact-request probe, and deleted/replaced node ownership.
+    def make_host_loop_bridge_node(request_id, *, owner_state=None):
+        live = {"state": deepcopy(hydrated_base)}
+        stores = []
+        results = []
+        owner = owner_state if isinstance(owner_state, dict) else {"current": True}
+        host_node = object.__new__(asset_library.HMBImageAssetLibrary)
+        host_node._current_state = lambda: live["state"]
+        host_node._scan_owner_is_current = lambda: bool(owner["current"])
+        host_node._hmb_import_media_by_uid = {}
+        host_node._hmb_manifest_poll_received = False
+        host_node._hmb_manifest_poll_pending = False
+        host_node._hmb_refresh_revision = hydrated_base["refresh_revision"]
+        host_node._publish_state = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Compact host-loop completion used the full publisher.")
+        )
+        host_node._accept_normalized_widget_state_baseline = (
+            lambda *_args, **_kwargs: None
+        )
+
+        def store_state(name, value, *args, **kwargs):
+            assert name == asset_library.WIDGET_STATE_PARAMETER
+            assert kwargs.get("emit_change") is False
+            assert kwargs.get("skip_before_value_set") is True
+            normalized_value = asset_library._normalize_state(value)
+            live["state"] = normalized_value
+            stores.append(normalized_value)
+
+        host_node.set_parameter_value = store_state
+        host_node._set_thumbnail_bridge_value = lambda value: results.append(
+            asset_library._normalize_thumbnail_bridge(value)
+        )
+        request = {
+            **bridge_request,
+            "request_id": request_id,
+        }
+        return host_node, live, stores, results, owner, request
+
+    async def wait_for_thread(worker, *, timeout=5.0):
+        assert worker is not None
+        await asyncio.to_thread(worker.join, timeout)
+        assert worker.is_alive() is False
+        # The worker schedules completion before exiting. Yield to the owning
+        # loop so its thread-safe callback can run before assertions.
+        await asyncio.sleep(0)
+
+    async def running_host_loop_completion():
+        host_node, _live, stores, results, _owner, request = (
+            make_host_loop_bridge_node("host-loop-once")
+        )
+        loop_thread_id = threading.get_ident()
+        callback_threads = []
+        original_result_publisher = host_node._set_thumbnail_bridge_value
+
+        def record_result(value):
+            callback_threads.append(threading.get_ident())
+            original_result_publisher(value)
+
+        host_node._set_thumbnail_bridge_value = record_result
+        host_node._apply_thumbnail_bridge_request(request)
+        worker = host_node._hmb_thumbnail_thread
+        await wait_for_thread(worker)
+        assert len(stores) == 1
+        assert len(results) == 1
+        assert callback_threads == [loop_thread_id]
+        assert host_node._hmb_thumbnail_pending_key == ""
+        assert host_node._hmb_thumbnail_pending_result is None
+
+    def late_event_manager_loop_completion():
+        injected_modules = {}
+        try:
+            from griptape_nodes.retained_mode import engine as engine_module
+            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        except ModuleNotFoundError:
+            module_names = (
+                "griptape_nodes",
+                "griptape_nodes.retained_mode",
+                "griptape_nodes.retained_mode.engine",
+                "griptape_nodes.retained_mode.griptape_nodes",
+            )
+            injected_modules = {
+                name: sys.modules.get(name)
+                for name in module_names
+            }
+            package = types.ModuleType("griptape_nodes")
+            package.__path__ = []
+            retained = types.ModuleType("griptape_nodes.retained_mode")
+            retained.__path__ = []
+            engine_module = types.ModuleType("griptape_nodes.retained_mode.engine")
+            engine_module.has_current_engine = lambda: True
+
+            class GriptapeNodes:
+                @classmethod
+                def EventManager(cls):
+                    return None
+
+            griptape_module = types.ModuleType(
+                "griptape_nodes.retained_mode.griptape_nodes"
+            )
+            griptape_module.GriptapeNodes = GriptapeNodes
+            retained.engine = engine_module
+            package.retained_mode = retained
+            sys.modules["griptape_nodes"] = package
+            sys.modules["griptape_nodes.retained_mode"] = retained
+            sys.modules["griptape_nodes.retained_mode.engine"] = engine_module
+            sys.modules[
+                "griptape_nodes.retained_mode.griptape_nodes"
+            ] = griptape_module
+
+        host_node, _live, stores, results, _owner, request = (
+            make_host_loop_bridge_node("host-loop-bootstrap")
+        )
+        started = threading.Event()
+        release = threading.Event()
+        published = threading.Event()
+        callback_threads = []
+        loop_ready = threading.Event()
+        loop_thread_id = []
+        loop = asyncio.new_event_loop()
+
+        def run_loop():
+            asyncio.set_event_loop(loop)
+            loop_thread_id.append(threading.get_ident())
+            loop_ready.set()
+            loop.run_forever()
+            loop.close()
+
+        loop_thread = threading.Thread(target=run_loop, daemon=True)
+        loop_thread.start()
+        assert loop_ready.wait(timeout=2.0)
+
+        class FakeEventManager:
+            event_loop = None
+
+        fake_event_manager = FakeEventManager()
+        original_engine_probe = engine_module.has_current_engine
+        original_event_manager_descriptor = GriptapeNodes.__dict__["EventManager"]
+        original_bootstrap_hydrator = asset_library._hydrate_asset_thumbnails
+
+        def blocked_hydrator(state_value, request_value, **kwargs):
+            started.set()
+            assert release.wait(timeout=5.0)
+            return original_bootstrap_hydrator(state_value, request_value, **kwargs)
+
+        def record_result(value):
+            callback_threads.append(threading.get_ident())
+            results.append(asset_library._normalize_thumbnail_bridge(value))
+            published.set()
+
+        host_node._set_thumbnail_bridge_value = record_result
+        engine_module.has_current_engine = lambda: True
+        GriptapeNodes.EventManager = classmethod(lambda _cls: fake_event_manager)
+        asset_library._hydrate_asset_thumbnails = blocked_hydrator
+        try:
+            # There is deliberately no running loop on this caller thread and
+            # EventManager has not been initialized yet.
+            host_node._apply_thumbnail_bridge_request(request)
+            worker = host_node._hmb_thumbnail_thread
+            assert worker is not None
+            assert started.wait(timeout=2.0)
+            fake_event_manager.event_loop = loop
+            release.set()
+            worker.join(timeout=5.0)
+            assert worker.is_alive() is False
+            assert published.wait(timeout=2.0)
+            assert len(stores) == 1
+            assert len(results) == 1
+            assert callback_threads == loop_thread_id
+            assert host_node._hmb_thumbnail_pending_key == ""
+
+            class DroppingLoop:
+                def __init__(self):
+                    self.accepted = 0
+
+                @staticmethod
+                def is_running():
+                    return True
+
+                @staticmethod
+                def is_closed():
+                    return False
+
+                def call_soon_threadsafe(self, *_args, **_kwargs):
+                    self.accepted += 1
+                    return None
+
+            dropping_loop = DroppingLoop()
+            fake_event_manager.event_loop = dropping_loop
+            drop_node, _drop_live, drop_stores, drop_results, _drop_owner, drop_request = (
+                make_host_loop_bridge_node("host-loop-accepted-but-dropped")
+            )
+            drop_node._apply_thumbnail_bridge_request(drop_request)
+            drop_worker = drop_node._hmb_thumbnail_thread
+            drop_worker.join(timeout=5.0)
+            assert drop_worker.is_alive() is False
+            assert dropping_loop.accepted == 1
+            assert drop_node._hmb_thumbnail_pending_result is not None
+            assert drop_node._consume_pending_thumbnail_result() is True
+            assert len(drop_stores) == 1
+            assert len(drop_results) == 1
+            assert drop_node._hmb_thumbnail_pending_key == ""
+            assert drop_node._hmb_thumbnail_pending_result is None
+        finally:
+            release.set()
+            asset_library._hydrate_asset_thumbnails = original_bootstrap_hydrator
+            engine_module.has_current_engine = original_engine_probe
+            GriptapeNodes.EventManager = original_event_manager_descriptor
+            if loop.is_running():
+                loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(timeout=2.0)
+            for module_name, original_module in injected_modules.items():
+                if original_module is None:
+                    sys.modules.pop(module_name, None)
+                else:
+                    sys.modules[module_name] = original_module
+
+    async def failed_publish_probe_recovery():
+        host_node, _live, stores, results, _owner, request = (
+            make_host_loop_bridge_node("host-loop-publish-retry")
+        )
+        attempts = []
+        first_failure_seen = threading.Event()
+        hydrate_calls = 0
+        original_retry_hydrator = asset_library._hydrate_asset_thumbnails
+
+        def count_hydration(state_value, request_value, **kwargs):
+            nonlocal hydrate_calls
+            hydrate_calls += 1
+            return original_retry_hydrator(state_value, request_value, **kwargs)
+
+        def fail_once(value):
+            attempts.append(threading.get_ident())
+            if len(attempts) == 1:
+                first_failure_seen.set()
+                raise RuntimeError("simulated compact bridge publication failure")
+            results.append(asset_library._normalize_thumbnail_bridge(value))
+
+        host_node._set_thumbnail_bridge_value = fail_once
+        asset_library._hydrate_asset_thumbnails = count_hydration
+        try:
+            host_node._apply_thumbnail_bridge_request(request)
+            worker = host_node._hmb_thumbnail_thread
+            await wait_for_thread(worker)
+            for _ in range(50):
+                if first_failure_seen.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert first_failure_seen.is_set()
+            assert host_node._hmb_thumbnail_pending_result is not None
+            assert len(stores) == 1
+            assert results == []
+
+            # An exact-request watchdog probe enters through before_value_set;
+            # that official retained-mode callback drains the immutable result
+            # without starting a replacement decoder.
+            normalized_probe = host_node.before_value_set(
+                SimpleNamespace(name=asset_library.THUMBNAIL_PATCH_PARAMETER),
+                request,
+            )
+            assert normalized_probe["request_id"] == request["request_id"]
+            assert host_node._hmb_thumbnail_pending_result is None
+            assert host_node._hmb_thumbnail_pending_key == ""
+            assert len(stores) == 2
+            assert len(results) == 1
+            assert len(attempts) == 2
+            assert hydrate_calls == 1
+        finally:
+            asset_library._hydrate_asset_thumbnails = original_retry_hydrator
+
+    async def stale_owner_and_delete_completion():
+        original_lifecycle_hydrator = asset_library._hydrate_asset_thumbnails
+
+        async def run_stale_owner_case(*, delete=False):
+            owner_state = {"current": True}
+            request_id = "host-loop-delete" if delete else "host-loop-remount"
+            host_node, _live, _stores, results, owner, request = (
+                make_host_loop_bridge_node(request_id, owner_state=owner_state)
+            )
+            started = threading.Event()
+            release = threading.Event()
+
+            def blocked_hydrator(state_value, request_value, **kwargs):
+                started.set()
+                assert release.wait(timeout=5.0)
+                return original_lifecycle_hydrator(
+                    state_value,
+                    request_value,
+                    **kwargs,
+                )
+
+            asset_library._hydrate_asset_thumbnails = blocked_hydrator
+            host_node._apply_thumbnail_bridge_request(request)
+            worker = host_node._hmb_thumbnail_thread
+            assert worker is not None
+            assert await asyncio.to_thread(started.wait, 2.0)
+            if delete:
+                prepare = getattr(asset_library._hmb_shot_routing, "prepare_node_deletion", None)
+                release_lifecycle = getattr(
+                    asset_library._hmb_shot_routing,
+                    "release_node_lifecycle",
+                    None,
+                )
+                asset_library._hmb_shot_routing.prepare_node_deletion = lambda _node: None
+                asset_library._hmb_shot_routing.release_node_lifecycle = lambda _node: None
+                host_node._hmb_delete_parent_called = True
+                host_node._hmb_deletion_reconcile_called = True
+                try:
+                    host_node.after_node_deleted()
+                finally:
+                    if prepare is None:
+                        delattr(asset_library._hmb_shot_routing, "prepare_node_deletion")
+                    else:
+                        asset_library._hmb_shot_routing.prepare_node_deletion = prepare
+                    if release_lifecycle is None:
+                        delattr(asset_library._hmb_shot_routing, "release_node_lifecycle")
+                    else:
+                        asset_library._hmb_shot_routing.release_node_lifecycle = release_lifecycle
+            else:
+                # NodeManager now resolves the replacement with the same name.
+                owner["current"] = False
+            release.set()
+            await wait_for_thread(worker)
+            await asyncio.sleep(0)
+            assert results == []
+            assert host_node._hmb_thumbnail_pending_key == ""
+            assert host_node._hmb_thumbnail_pending_result is None
+            assert host_node._hmb_thumbnail_queued_bridge_request is None
+
+        try:
+            await run_stale_owner_case(delete=False)
+            await run_stale_owner_case(delete=True)
+        finally:
+            asset_library._hydrate_asset_thumbnails = original_lifecycle_hydrator
+
+    asset_library._asset_thumbnail_url = (
+        lambda _path, asset_id: f"memory://host-loop/{asset_id}"
+    )
+    try:
+        asyncio.run(running_host_loop_completion())
+        late_event_manager_loop_completion()
+        asyncio.run(failed_publish_probe_recovery())
+        asyncio.run(stale_owner_and_delete_completion())
+    finally:
+        asset_library._asset_thumbnail_url = original_thumbnail_url
+
     flight_node = object.__new__(asset_library.HMBImageAssetLibrary)
     flight_live = {"state": deepcopy(hydrated_base)}
     flight_publications = []
@@ -355,8 +1206,10 @@ try:
     flight_node._hmb_last_reconciled_shot_catalog_identity = ""
     flight_node._reconcile_hmb_shot_routing = lambda *_args: None
 
-    def publish_flight_state(value):
-        normalized_value = asset_library._normalize_state(value)
+    def publish_flight_state(value, *, normalized=False):
+        normalized_value = (
+            value if normalized else asset_library._normalize_state(value)
+        )
         flight_live["state"] = normalized_value
         flight_publications.append(normalized_value)
         return normalized_value
@@ -368,7 +1221,7 @@ try:
     flight_counter_lock = threading.Lock()
     flight_counts = {"active": 0, "max_active": 0, "calls": 0}
 
-    def slow_hydrator(state_value, request_value):
+    def slow_hydrator(state_value, request_value, **kwargs):
         with flight_counter_lock:
             flight_counts["active"] += 1
             flight_counts["calls"] += 1
@@ -379,7 +1232,7 @@ try:
         flight_started.set()
         try:
             assert flight_release.wait(timeout=5.0)
-            return original_hydrator(state_value, request_value)
+            return original_hydrator(state_value, request_value, **kwargs)
         finally:
             with flight_counter_lock:
                 flight_counts["active"] -= 1
@@ -475,7 +1328,19 @@ try:
             (key, asset_library._normalize_state(candidate), scan, kwargs)
         )
     )
+    deserialize_node._hmb_thumbnail_queued_bridge_request = {
+        "request_id": "stale-before-deserialize"
+    }
+    deserialize_node._hmb_scan_generation = 7
+    deserialize_node._hmb_scan_pending_key = "constructor-scan"
+    deserialize_node._hmb_scan_pending_result = (7, "constructor-scan", "old", {})
+    deserialize_node._hmb_scan_thread = object()
     deserialize_node.after_deserialize()
+    assert deserialize_node._hmb_thumbnail_queued_bridge_request is None
+    assert deserialize_node._hmb_scan_generation == 8
+    assert deserialize_node._hmb_scan_pending_key == ""
+    assert deserialize_node._hmb_scan_pending_result is None
+    assert deserialize_node._hmb_scan_thread is None
     assert len(deserialize_capture) == 1
     deserialize_candidate = deserialize_capture[0][1]
     assert deserialize_candidate["thumbnail_busy"] is False

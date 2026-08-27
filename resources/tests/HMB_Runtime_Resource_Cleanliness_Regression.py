@@ -38,10 +38,10 @@ packager = load_packager()
 source_files = tuple(packager.SOURCE_FILES)
 runtime_install_files = tuple(packager.RUNTIME_INSTALL_FILES)
 distribution_only_files = tuple(packager.DISTRIBUTION_ONLY_FILES)
-assert len(runtime_install_files) == 21
+assert len(runtime_install_files) == 22
 assert distribution_only_files == DISTRIBUTION_ONLY_FILES
 assert source_files == (*runtime_install_files, *distribution_only_files)
-assert len(source_files) == 25
+assert len(source_files) == 26
 assert not EXCLUDED_PACKAGE_FILES.intersection(source_files)
 assert not set(runtime_install_files).intersection(distribution_only_files)
 assert {

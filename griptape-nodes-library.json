@@ -4,10 +4,10 @@
   "metadata": {
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.7.5",
+    "library_version": "0.7.7",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
-      "archive_source_count": 25,
+      "archive_source_count": 26,
       "mode": "authenticated_broker_session",
       "broker_endpoint": "https://192.168.203.245:8443/api/v1/agent-core/dat",
       "public_ca_path": "resources/tls/hmb_agent_broker_ca.pem",
@@ -361,6 +361,11 @@
       "name": "HMBImageAssetLibraryWidget",
       "path": "widgets/HMBImageAssetLibraryWidget.js",
       "description": "Project catalog and image asset browser backed by the canonical _hmb_common.py taxonomy, with compact Project Set/reload icons, manifest-backed Add registration that copies external media directly into a selected child Asset Folder, explicit registered/unregistered thumbnail footers, and a compact draggable @image1-@image50 generator-order tray."
+    },
+    {
+      "name": "HMBImageAssetThumbnailPatchBridgeWidget",
+      "path": "widgets/HMBImageAssetThumbnailPatchBridgeWidget.js",
+      "description": "Hidden compact request/result transport for ImageAsset thumbnail hydration; persistent catalog and Shot authority remain in HMBImageAssetLibraryWidget."
     },
     {
       "name": "HMBPromptLibraryScopedBindingWidget",

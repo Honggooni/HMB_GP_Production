@@ -135,9 +135,10 @@ assert prompt_state["videos"][0]["label"] == "flow_test_playblast_1"
 assert prompt_state["videos"][0]["picker_auto_label"] == "flow_test_playblast_1"
 assert [item["slot"] for item in prompt_state["videos"]] == [1, 2, 3, 4, 5]
 for video in prompt_state["videos"][1:]:
-    video["control_role"] = "Context Only"
-prompt_state["videos"][1]["source_type"] = "Motion Guide / Retargeting Reference"
-prompt_state["videos"][1]["control_role"] = "Derived Motion Decoding Only"
+    video["video_main_type"] = "Custom / Context"
+    video["video_sub_type"] = "Context"
+prompt_state["videos"][1]["video_main_type"] = "Maya Preview / Playblast"
+prompt_state["videos"][1]["video_sub_type"] = "Motion Guide"
 compiled_prompt = prompt._build_data_only_prompt_package(prompt_state)
 compiled_job = prompt_json_section(compiled_prompt, "HMB JOB DATA (JSON):")
 assert compiled_job["images"][0]["label"] == "Hero"

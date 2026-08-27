@@ -41,10 +41,10 @@ CHARACTER_OUT_RIM_LOCAL_OCCLUSION = 2
 FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE = "hmb_full_smooth_geometry_v2"
 ORIGINAL_VIEWPORT_QUALITY_PROFILE = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
 ORIGINAL_MATERIAL_OVERRIDE_PROFILE = (
-    "per_source_material_lambert_texture_preserving_v1"
+    "per_source_material_lambert_plugin_fallback_v2"
 )
 ORIGINAL_LAMBERT_ASSIGNMENT_MODE = (
-    "original_per_source_material_lambert_texture_preserving"
+    "original_per_source_material_lambert_plugin_fallback"
 )
 SCREEN_SPACE_PATTERN_PROFILE = "hmb_screen_space_pattern_post_v2"
 SCREEN_SPACE_PATTERN_LINEAR_SCALE_DIVISOR = 3
@@ -3929,29 +3929,108 @@ def _original_node_type(node):
         return ""
 
 
-def _original_source_requires_plugin(source_plug):
-    node_type = _original_node_type(_clean(source_plug).split(".", 1)[0])
+_ORIGINAL_UNKNOWN_NODE_TYPES = (
+    "unknown",
+    "unknowndag",
+    "unknowntransform",
+)
+_ORIGINAL_RECOGNIZED_PLUGIN_PREFIXES = (
+    "redshift",
+    "rs",
+    "ai",
+)
+
+
+class _OriginalPluginFallbackRequired(RuntimeError):
+    """Signal that an Original input must use its captured numeric value."""
+
+    def __init__(self, source_plug, unavailable_nodes):
+        self.source_plug = _clean(source_plug)
+        self.unavailable_nodes = list(unavailable_nodes or [])
+        labels = []
+        for record in self.unavailable_nodes[:8]:
+            node = _clean(record.get("node")) if isinstance(record, dict) else ""
+            plugin = _clean(record.get("plugin")) if isinstance(record, dict) else ""
+            real_class = (
+                _clean(record.get("real_class"))
+                if isinstance(record, dict)
+                else ""
+            )
+            provider = plugin or real_class
+            labels.append(
+                "{0}{1}".format(
+                    node or "<unknown>",
+                    " ({0})".format(provider) if provider else "",
+                )
+            )
+        RuntimeError.__init__(
+            self,
+            "Original source {0} depends on unavailable plug-in node(s): {1}.".format(
+                self.source_plug or "<empty>",
+                ", ".join(labels) or "<unknown>",
+            ),
+        )
+
+
+def _original_plugin_node_state(node):
+    """Classify renderer nodes without calling a recognized type unavailable."""
+    node_type = _original_node_type(node)
     lowered = node_type.lower()
-    return (
-        not node_type
-        or lowered in ("unknown", "unknowndag", "unknowntransform")
-        or lowered.startswith("redshift")
-        or lowered.startswith("rs")
-        or lowered.startswith("ai")
-    )
+    if not node_type or lowered in _ORIGINAL_UNKNOWN_NODE_TYPES:
+        return "unavailable"
+    if lowered.startswith(_ORIGINAL_RECOGNIZED_PLUGIN_PREFIXES):
+        # Maya can only return the registered renderer node type after its
+        # provider has loaded.  Preserve that live graph instead of reporting a
+        # false missing-plug-in error merely because it is Redshift/Arnold.
+        return "loaded_plugin"
+    return "maya_native"
 
 
-def _original_upstream_plugin_nodes(source_plug):
-    """Return plug-in-only dependencies hidden behind a Maya-native source."""
+def _original_source_requires_plugin(source_plug):
+    node = _clean(source_plug).split(".", 1)[0]
+    return _original_plugin_node_state(node) != "maya_native"
+
+
+def _original_plugin_node_record(node, state):
+    record = {
+        "node": _clean(node),
+        "node_type": _original_node_type(node),
+        "state": _clean(state),
+        "plugin": "",
+        "real_class": "",
+    }
+    if state == "unavailable" and record["node"]:
+        for field, flag in (("plugin", "plugin"), ("real_class", "realClassName")):
+            try:
+                record[field] = _clean(
+                    cmds.unknownNode(
+                        record["node"],
+                        query=True,
+                        **{flag: True}
+                    )
+                )
+            except Exception:
+                pass
+    return record
+
+
+def _original_plugin_dependency_report(source_plug):
+    """Return loaded and unavailable renderer dependencies for one source graph."""
     root = _clean(source_plug).split(".", 1)[0]
     queue = [root]
     visited = set()
-    plugin_nodes = set()
+    loaded = {}
+    unavailable = {}
     while queue and len(visited) < 512:
-        node = queue.pop(0)
+        node = _clean(queue.pop(0))
         if not node or node in visited:
             continue
         visited.add(node)
+        state = _original_plugin_node_state(node)
+        if state == "loaded_plugin":
+            loaded[node] = _original_plugin_node_record(node, state)
+        elif state == "unavailable":
+            unavailable[node] = _original_plugin_node_record(node, state)
         try:
             upstream = cmds.listConnections(
                 node,
@@ -3963,15 +4042,30 @@ def _original_upstream_plugin_nodes(source_plug):
             upstream = []
         for candidate in upstream:
             source_node = _clean(candidate).split(".", 1)[0]
-            if not source_node or source_node in visited:
-                continue
-            if _original_source_requires_plugin(candidate):
-                plugin_nodes.add(source_node)
-            queue.append(source_node)
-    return sorted(plugin_nodes)
+            if source_node and source_node not in visited:
+                queue.append(source_node)
+    return {
+        "loaded_plugin_nodes": [loaded[key] for key in sorted(loaded)],
+        "unavailable_plugin_nodes": [
+            unavailable[key] for key in sorted(unavailable)
+        ],
+    }
 
 
-def _original_supported_source(source_plug):
+def _original_upstream_plugin_nodes(source_plug):
+    """Compatibility helper returning every renderer dependency node name."""
+    report = _original_plugin_dependency_report(source_plug)
+    return sorted(set(
+        _clean(item.get("node"))
+        for item in (
+            list(report.get("loaded_plugin_nodes") or [])
+            + list(report.get("unavailable_plugin_nodes") or [])
+        )
+        if isinstance(item, dict) and _clean(item.get("node"))
+    ))
+
+
+def _original_supported_source(source_plug, controller=None):
     source_plug = _clean(source_plug)
     if not source_plug or not _original_plug_exists(source_plug):
         raise RuntimeError(
@@ -3979,21 +4073,16 @@ def _original_supported_source(source_plug):
                 source_plug or "<empty>"
             )
         )
-    if not _original_source_requires_plugin(source_plug):
-        plugin_nodes = _original_upstream_plugin_nodes(source_plug)
-        if plugin_nodes:
-            raise RuntimeError(
-                "Original Maya-native utility depends on an unavailable "
-                "plug-in node ({0}); the graph cannot be evaluated safely.".format(
-                    ", ".join(plugin_nodes[:8])
-                )
-            )
-        return source_plug
-    raise RuntimeError(
-        "Original texture identity depends on a plug-in-only texture or utility "
-        "node. Connect the Maya file/texture graph directly to the material "
-        "input for renderer-independent Original Playblast."
+    dependency_report = _original_plugin_dependency_report(source_plug)
+    unavailable_nodes = list(
+        dependency_report.get("unavailable_plugin_nodes") or []
     )
+    if unavailable_nodes:
+        raise _OriginalPluginFallbackRequired(source_plug, unavailable_nodes)
+    loaded_nodes = list(dependency_report.get("loaded_plugin_nodes") or [])
+    if controller is not None and loaded_nodes:
+        controller._record_loaded_plugin_nodes(loaded_nodes)
+    return source_plug
 
 
 def _original_attr_record(material, attributes):
@@ -4021,6 +4110,7 @@ def _original_attr_record(material, attributes):
                 "Original material input has ambiguous compound sources."
             )
         records.append({
+            "material": material,
             "attribute": attribute,
             "plug": plug,
             "source": sources[0] if len(sources) == 1 else "",
@@ -4049,8 +4139,8 @@ def _original_record_sources(record):
     ))
 
 
-def _original_assert_existing_lambert_is_native(material):
-    """Ensure an authored Lambert does not hide a renderer-only dependency."""
+def _original_assert_existing_lambert_is_native(material, controller=None):
+    """Ensure an authored Lambert has no unavailable renderer dependency."""
     records = (
         _original_attr_record(material, _ORIGINAL_COLOR_INPUT_ATTRIBUTES),
         _original_attr_record(
@@ -4063,22 +4153,10 @@ def _original_assert_existing_lambert_is_native(material):
     )
     for record in records:
         for source_plug in _original_record_sources(record):
-            source_node = source_plug.split(".", 1)[0]
-            if _original_source_requires_plugin(source_plug):
-                raise RuntimeError(
-                    "Existing Lambert {0} depends on plug-in-only node {1}; "
-                    "Original cannot preserve that texture graph without the "
-                    "renderer plug-in.".format(material, source_node)
-                )
-            hidden_plugins = _original_upstream_plugin_nodes(source_plug)
-            if hidden_plugins:
-                raise RuntimeError(
-                    "Existing Lambert {0} has a Maya-native input that still "
-                    "depends on plug-in-only node(s): {1}.".format(
-                        material,
-                        ", ".join(hidden_plugins[:8]),
-                    )
-                )
+            _original_supported_source(
+                source_plug,
+                controller=controller,
+            )
 
 
 def _original_vector(values, default):
@@ -4151,10 +4229,22 @@ def _original_wire_record(
                 name="HMB_Original_OpacityReverse#",
             )
             controller.created_nodes.append(reverse_node)
+        connected_count = 0
         for index, source in enumerate(component_sources[:3]):
             if not source:
                 continue
-            supported = _original_supported_source(source)
+            try:
+                supported = _original_supported_source(
+                    source,
+                    controller=controller,
+                )
+            except _OriginalPluginFallbackRequired as exc:
+                controller._record_plugin_fallback(
+                    record,
+                    exc,
+                    values,
+                )
+                continue
             source_target = (
                 reverse_node + ".input" + "XYZ"[index]
                 if reverse_node
@@ -4166,10 +4256,22 @@ def _original_wire_record(
                     reverse_node + ".output" + "XYZ"[index],
                     target_plug + "RGB"[index],
                 )
-        return "texture"
+            connected_count += 1
+        return "texture" if connected_count else "numeric"
     if not source_plug:
         return "numeric"
-    supported = _original_supported_source(source_plug)
+    try:
+        supported = _original_supported_source(
+            source_plug,
+            controller=controller,
+        )
+    except _OriginalPluginFallbackRequired as exc:
+        controller._record_plugin_fallback(
+            record,
+            exc,
+            values,
+        )
+        return "numeric"
     scalar = _original_source_is_scalar(supported)
     if invert:
         reverse_node = cmds.createNode(
@@ -4210,6 +4312,8 @@ class _OriginalLambertOverrideController(object):
         self.created_nodes = []
         self.material_cache = {}
         self.membership_snapshot = {}
+        self._loaded_plugin_nodes = {}
+        self._plugin_fallback_records = {}
         self.finished = False
         self.report = {
             "profile": ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
@@ -4225,6 +4329,14 @@ class _OriginalLambertOverrideController(object):
             "emission_transfer_count": 0,
             "normal_transfer_count": 0,
             "normal_skip_count": 0,
+            "loaded_plugin_passthrough_count": 0,
+            "loaded_plugin_nodes": [],
+            "plugin_fallback_count": 0,
+            "plugin_fallback_material_count": 0,
+            "plugin_fallback_node_count": 0,
+            "plugin_fallback_records": [],
+            "texture_identity_preserved": True,
+            "warnings": [],
             "scoped_shape_path_count": 0,
             "swapped_shading_engine_count": 0,
             "shading_group_membership_preserved": True,
@@ -4243,6 +4355,88 @@ class _OriginalLambertOverrideController(object):
                     requested_profile or "<empty>"
                 )
             )
+
+    def _record_loaded_plugin_nodes(self, records):
+        for record in records or []:
+            if not isinstance(record, dict):
+                continue
+            node = _clean(record.get("node"))
+            if node:
+                self._loaded_plugin_nodes[node] = dict(record)
+        self.report["loaded_plugin_passthrough_count"] = len(
+            self._loaded_plugin_nodes
+        )
+        self.report["loaded_plugin_nodes"] = [
+            self._loaded_plugin_nodes[node]
+            for node in sorted(self._loaded_plugin_nodes)[:32]
+        ]
+
+    def _record_plugin_fallback(self, record, exc, values):
+        source = record if isinstance(record, dict) else {}
+        material = _clean(source.get("material")) or "<unknown>"
+        attribute = _clean(source.get("attribute")) or "<unknown>"
+        key = (material, attribute)
+        fallback = self._plugin_fallback_records.setdefault(
+            key,
+            {
+                "material": material,
+                "attribute": attribute,
+                "source_nodes": set(),
+                "unavailable_nodes": {},
+                "fallback_mode": (
+                    "captured_numeric"
+                    if _numeric_attr_components(source.get("value"))
+                    else "deterministic_default"
+                ),
+                "fallback_value": list(_original_vector(values, (0.0, 0.0, 0.0))),
+            },
+        )
+        source_node = _clean(getattr(exc, "source_plug", "")).split(".", 1)[0]
+        if source_node:
+            fallback["source_nodes"].add(source_node)
+        for unavailable in getattr(exc, "unavailable_nodes", []) or []:
+            if not isinstance(unavailable, dict):
+                continue
+            node = _clean(unavailable.get("node"))
+            if node:
+                fallback["unavailable_nodes"][node] = dict(unavailable)
+
+        serialized = []
+        unavailable_names = set()
+        fallback_materials = set()
+        for fallback_key in sorted(self._plugin_fallback_records):
+            item = self._plugin_fallback_records[fallback_key]
+            fallback_materials.add(item["material"])
+            unavailable_names.update(item["unavailable_nodes"])
+            serialized.append({
+                "material": item["material"],
+                "attribute": item["attribute"],
+                "source_nodes": sorted(item["source_nodes"])[:16],
+                "unavailable_nodes": [
+                    item["unavailable_nodes"][node]
+                    for node in sorted(item["unavailable_nodes"])[:16]
+                ],
+                "fallback_mode": item["fallback_mode"],
+                "fallback_value": list(item["fallback_value"]),
+            })
+        self.report["plugin_fallback_count"] = len(serialized)
+        self.report["plugin_fallback_material_count"] = len(fallback_materials)
+        self.report["plugin_fallback_node_count"] = len(unavailable_names)
+        self.report["plugin_fallback_records"] = serialized[:32]
+        self.report["texture_identity_preserved"] = False
+        visible_names = ", ".join(sorted(unavailable_names)[:8]) or "<unknown>"
+        if len(unavailable_names) > 8:
+            visible_names += ", and {0} more".format(len(unavailable_names) - 8)
+        self.report["warnings"] = [
+            "Original Playblast replaced {0} material input(s) with captured/default "
+            "numeric Maya Lambert values because {1} renderer plug-in node(s) "
+            "were unavailable ({2}). The source scene was not changed; affected "
+            "texture grading may differ in this preview.".format(
+                len(serialized),
+                len(unavailable_names),
+                visible_names,
+            )
+        ]
 
     @staticmethod
     def _group_members(group):
@@ -4487,11 +4681,19 @@ class _OriginalLambertOverrideController(object):
                 source_material = source_plug.split(".", 1)[0]
                 source_materials.add(source_material)
                 if _original_node_type(source_material).lower() == "lambert":
-                    _original_assert_existing_lambert_is_native(
-                        source_material
-                    )
-                    existing_lamberts.add(source_material)
-                    continue
+                    try:
+                        _original_assert_existing_lambert_is_native(
+                            source_material,
+                            controller=self,
+                        )
+                    except _OriginalPluginFallbackRequired:
+                        # Rebuild only the affected Lambert in the disposable
+                        # session so its unavailable graph can use the same
+                        # explicit numeric fallback as renderer materials.
+                        pass
+                    else:
+                        existing_lamberts.add(source_material)
+                        continue
                 shader = self.material_cache.get(source_material)
                 if not shader:
                     shader = self._create_lambert(source_material)
@@ -15617,6 +15819,13 @@ def run(job_path):
                     _OriginalLambertOverrideController(job)
                 )
                 original_material_controller.apply()
+                for warning in original_material_controller.report.get(
+                    "warnings", []
+                ):
+                    warning = _clean(warning)
+                    if warning and warning not in warnings:
+                        warnings.append(warning)
+                        _emit_console("WARNING", warning)
                 original_material_controller.report.update({
                     "default_lighting_verified": bool(
                         render_options_report.get("default_lighting_verified")
@@ -15654,6 +15863,15 @@ def run(job_path):
                     ),
                     swapped_shading_engine_count=int(
                         original_material_report.get("swapped_shading_engine_count") or 0
+                    ),
+                    loaded_plugin_passthrough_count=int(
+                        original_material_report.get(
+                            "loaded_plugin_passthrough_count"
+                        )
+                        or 0
+                    ),
+                    plugin_fallback_count=int(
+                        original_material_report.get("plugin_fallback_count") or 0
                     ),
                 )
             if force_high_quality_viewport and not apply_marker_shaders:

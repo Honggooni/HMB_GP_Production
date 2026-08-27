@@ -115,10 +115,10 @@ PROXY_H264_LEVEL = "4.2"
 FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE = "hmb_full_smooth_geometry_v2"
 ORIGINAL_VIEWPORT_QUALITY_PROFILE = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
 ORIGINAL_MATERIAL_OVERRIDE_PROFILE = (
-    "per_source_material_lambert_texture_preserving_v1"
+    "per_source_material_lambert_plugin_fallback_v2"
 )
 ORIGINAL_LAMBERT_ASSIGNMENT_MODE = (
-    "original_per_source_material_lambert_texture_preserving"
+    "original_per_source_material_lambert_plugin_fallback"
 )
 MOUTH_CARD_INNER_PATCH_POLICY = "temporary_mouth_alpha_inner_patch_v1"
 SCREEN_SPACE_PATTERN_PROFILE = "hmb_screen_space_pattern_post_v2"
@@ -11638,6 +11638,10 @@ def _original_material_report_is_valid(report: Any) -> bool:
         "existing_lambert_count",
         "texture_connection_count",
         "numeric_color_count",
+        "loaded_plugin_passthrough_count",
+        "plugin_fallback_count",
+        "plugin_fallback_material_count",
+        "plugin_fallback_node_count",
         "swapped_shading_engine_count",
     )
     if any(
@@ -11653,6 +11657,19 @@ def _original_material_report_is_valid(report: Any) -> bool:
         }
     except (TypeError, ValueError):
         return False
+    fallback_records = source.get("plugin_fallback_records")
+    loaded_plugin_nodes = source.get("loaded_plugin_nodes")
+    warnings = source.get("warnings")
+    if not isinstance(fallback_records, list):
+        return False
+    if not isinstance(loaded_plugin_nodes, list):
+        return False
+    if not isinstance(warnings, list):
+        return False
+    fallback_count = counts["plugin_fallback_count"]
+    fallback_material_count = counts["plugin_fallback_material_count"]
+    fallback_node_count = counts["plugin_fallback_node_count"]
+    loaded_plugin_count = counts["loaded_plugin_passthrough_count"]
     return bool(
         _clean(source.get("profile"))
         == ORIGINAL_MATERIAL_OVERRIDE_PROFILE
@@ -11677,6 +11694,15 @@ def _original_material_report_is_valid(report: Any) -> bool:
         and counts["texture_connection_count"]
         + counts["numeric_color_count"]
         == counts["temporary_lambert_count"]
+        and fallback_material_count <= counts["temporary_lambert_count"]
+        and fallback_material_count <= fallback_count
+        and (fallback_count == 0) == bool(
+            source.get("texture_identity_preserved")
+        )
+        and len(fallback_records) == min(fallback_count, 32)
+        and len(loaded_plugin_nodes) == min(loaded_plugin_count, 32)
+        and (fallback_count == 0 or fallback_node_count > 0)
+        and (fallback_count == 0 or bool(warnings))
     )
 
 

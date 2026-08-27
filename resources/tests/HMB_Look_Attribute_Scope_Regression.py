@@ -32,9 +32,9 @@ legacy_scope_phrases = (
 for legacy in legacy_scope_phrases:
     assert legacy.casefold() not in source.casefold(), legacy
 
-assert prompt.PROMPT_POLICY_SOURCE_VERSION == "2026-08-12.agent-shot-quality.v4.2"
+assert prompt.PROMPT_POLICY_SOURCE_VERSION == "2026-08-27.agent-shot-quality.v4.5"
 assert prompt.PROMPT_POLICY_SOURCE_CONTRACT_SHA256 == (
-    "7a40ddf71c115ddef29b3bc428ccd9024649d9fac5af607b96173c1cf77b2199"
+    "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
 )
 assert prompt.PROMPT_POLICY_SOURCE_VERSION == prompt._hmb._AGENT_POLICY_VERSION
 assert (
@@ -61,14 +61,6 @@ def prompt_sections(payload: str):
     assert lines[3] == "FX/TIMING SOURCE DATA (JSON):"
     assert lines[5] == "USER DESCRIPTION DATA (JSON):"
     return json.loads(lines[2]), json.loads(lines[4]), json.loads(lines[6])
-
-
-def expect_rejected(callback) -> None:
-    try:
-        callback()
-    except RuntimeError:
-        return
-    raise AssertionError("ambiguous Look attribute authority was accepted")
 
 
 def look_claim_package(*claims: tuple[str, str]) -> str:
@@ -260,29 +252,60 @@ for valid_claims in (
         for row in valid_job["images"][2:]
     ] == list(valid_claims)
 
-for invalid_claims in (
+for invalid_claims, expected_unbound_tokens in (
     (
-        ("Color Mood", "Hero_A"),
-        ("Color Mood", "Hero_A"),
+        (
+            ("Color Mood", "Hero_A"),
+            ("Color Mood", "Hero_A"),
+        ),
+        {"@image3", "@image4"},
     ),
     (
-        ("Color / Look / Lighting", "Global Look"),
-        ("Render Look", "Hero_A"),
+        (
+            ("Color / Look / Lighting", "Global Look"),
+            ("Render Look", "Hero_A"),
+        ),
+        {"@image4"},
     ),
     (
-        ("Color Mood", "Global Look"),
-        ("Color Mood", "Hero_A"),
+        (
+            ("Color Mood", "Global Look"),
+            ("Color Mood", "Hero_A"),
+        ),
+        {"@image4"},
     ),
     (
-        ("Color / Look / Lighting", "Global Look"),
-        ("Lighting / Atmosphere", "Global Look"),
+        (
+            ("Color / Look / Lighting", "Global Look"),
+            ("Lighting / Atmosphere", "Global Look"),
+        ),
+        {"@image4"},
     ),
 ):
     invalid_package = look_claim_package(*invalid_claims)
-    expect_rejected(
-        lambda package=invalid_package: agent._assert_public_job_data_contract(
-            package
+    # v4.5 keeps the public wire contract data-only and structurally valid.
+    # Ambiguous authority fails locally in the private semantic manifest so a
+    # conflicting slot cannot win merely by list order.  A Global Look row may
+    # retain its non-overlapping scene authority, while the narrower row is
+    # fully unbound for the conflicted claim.
+    invalid_job = agent._assert_public_job_data_contract(invalid_package)
+    assert [
+        (row["image_sub_type"], row["target_id"])
+        for row in invalid_job["images"][2:]
+    ] == list(invalid_claims)
+    invalid_manifest = agent._build_final_output_semantic_manifest(invalid_job)
+    invalid_look_rows = invalid_manifest["images"][2:]
+    assert {
+        row["token"]
+        for row in invalid_look_rows
+        if row["unbound_authority"] is True
+    } == expected_unbound_tokens
+    assert all(
+        any(
+            relation.get("reason") == "look_authority_scope_conflict"
+            for relation in row["unresolved_relations"]
         )
+        for row in invalid_look_rows
     )
 
 # Multiple video sources remain independent rows in one closed job schema.

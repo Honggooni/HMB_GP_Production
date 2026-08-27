@@ -71,7 +71,22 @@ const IMAGE_ASSET_ECHO_EXPIRY_MS = 1500;
 const IMAGE_ASSET_RENDER_WINDOW = 60;
 const IMAGE_ASSET_THUMBNAIL_REQUEST_BATCH = 64;
 const IMAGE_ASSET_THUMBNAIL_ERROR_RETRY_LIMIT = 1;
+const IMAGE_ASSET_THUMBNAIL_WATCHDOG_MS = 15000;
+const IMAGE_ASSET_THUMBNAIL_WATCHDOG_RETRIES = 1;
 const IMAGE_ASSET_SEARCH_DEBOUNCE_MS = 72;
+const HMB_IMAGE_ASSET_THUMBNAIL_BRIDGE_REGISTRY_KEY =
+  "__HMB_IMAGE_ASSET_THUMBNAIL_PATCH_BRIDGES_V1__";
+const HMB_IMAGE_ASSET_PRESENTATION_CACHE_KEY =
+  "__HMB_IMAGE_ASSET_PRESENTATION_CACHE_V1__";
+const HMB_IMAGE_ASSET_PRESENTATION_CACHE_LIMIT = 32;
+const IMAGE_ASSET_CATALOG_PROBE_ACTIVE_MS = Object.freeze({
+  manifest: 3000,
+  folder: 10000,
+});
+const IMAGE_ASSET_CATALOG_PROBE_BACKGROUND_MS = Object.freeze({
+  manifest: 15000,
+  folder: 30000,
+});
 let imageAssetWidgetMountSequence = 0;
 const imageAssetMountedContainers = new Set();
 const imageAssetCompactNodeKeys = new Set();
@@ -81,6 +96,250 @@ let imageAssetPublicationSequence = 0;
 let imageAssetAuthoritySequence = 0;
 const IMAGE_ASSET_TRANSPORT_RETRY_MS = 32;
 const IMAGE_ASSET_AUTHORITY_STAMP = Symbol("hmbImageAssetAuthorityStamp");
+const IMAGE_ASSET_THUMBNAIL_FAILED_STAMP = Symbol("hmbImageAssetThumbnailFailed");
+
+function imageAssetThumbnailBridgeRegistry() {
+  const root = typeof globalThis !== "undefined" ? globalThis : null;
+  if (!root) return null;
+  if (!(root[HMB_IMAGE_ASSET_THUMBNAIL_BRIDGE_REGISTRY_KEY] instanceof Map)) {
+    root[HMB_IMAGE_ASSET_THUMBNAIL_BRIDGE_REGISTRY_KEY] = new Map();
+  }
+  return root[HMB_IMAGE_ASSET_THUMBNAIL_BRIDGE_REGISTRY_KEY];
+}
+
+function imageAssetPresentationCacheRegistry() {
+  const root = typeof globalThis !== "undefined" ? globalThis : null;
+  if (!root) return null;
+  if (!(root[HMB_IMAGE_ASSET_PRESENTATION_CACHE_KEY] instanceof Map)) {
+    root[HMB_IMAGE_ASSET_PRESENTATION_CACHE_KEY] = new Map();
+  }
+  return root[HMB_IMAGE_ASSET_PRESENTATION_CACHE_KEY];
+}
+
+export function hmbImageAssetPresentationCacheKey(state) {
+  const projectUid = clean(state?.project_cache_uid || state?.project_uid);
+  if (!projectUid) return "";
+  // The project UUID is location- and manifest-revision-independent. Per-asset
+  // media signatures below invalidate only changed files after a teammate Add,
+  // instead of discarding every unchanged thumbnail in the project.
+  return projectUid;
+}
+
+function imageAssetPresentationCacheEntry(state, create = true) {
+  const key = hmbImageAssetPresentationCacheKey(state);
+  const registry = imageAssetPresentationCacheRegistry();
+  if (!key || !registry) return null;
+  let entry = registry.get(key);
+  if (!entry && create) {
+    entry = {
+      key,
+      thumbnails: new Map(),
+      requested: new Set(),
+      failed: new Set(),
+      errorRetries: new Map(),
+      inflight: new Map(),
+      touchedAt: Date.now(),
+    };
+    registry.set(key, entry);
+  }
+  if (entry) {
+    entry.touchedAt = Date.now();
+    // A process-level LRU keeps node deletion/recreation fast without letting
+    // unrelated projects accumulate for the lifetime of a long Griptape run.
+    registry.delete(key);
+    registry.set(key, entry);
+  }
+  while (registry.size > HMB_IMAGE_ASSET_PRESENTATION_CACHE_LIMIT) {
+    const oldestKey = registry.keys().next().value;
+    if (!oldestKey) break;
+    registry.delete(oldestKey);
+  }
+  return entry;
+}
+
+function imageAssetPresentationIdentity(asset) {
+  return {
+    sourceUid: clean(asset?.source_uid),
+    mediaSignature: clean(asset?.media_signature),
+    relativePath: clean(asset?.relative_path).replaceAll("\\", "/"),
+  };
+}
+
+function imageAssetPresentationIdentityMatches(cached, asset) {
+  if (!cached || !asset) return false;
+  const identity = imageAssetPresentationIdentity(asset);
+  if (cached.sourceUid && identity.sourceUid && cached.sourceUid !== identity.sourceUid) {
+    return false;
+  }
+  if (
+    cached.mediaSignature
+    && identity.mediaSignature
+    && cached.mediaSignature !== identity.mediaSignature
+  ) return false;
+  return Boolean(
+    (cached.mediaSignature && identity.mediaSignature)
+    || (cached.relativePath && cached.relativePath === identity.relativePath),
+  );
+}
+
+export function hmbRememberImageAssetPresentation(state) {
+  const entry = imageAssetPresentationCacheEntry(state, true);
+  if (!entry || !Array.isArray(state?.assets)) return 0;
+  let remembered = 0;
+  state.assets.forEach((asset) => {
+    const key = clean(asset?.asset_library_id);
+    const thumbnailUrl = clean(asset?.thumbnail_url);
+    const persistedProjectAsset = Number(asset?.import_index || 0) === 0
+      && Boolean(clean(asset?.relative_path));
+    if (!key || !thumbnailUrl || !persistedProjectAsset) return;
+    entry.thumbnails.set(key, {
+      ...imageAssetPresentationIdentity(asset),
+      thumbnailUrl,
+    });
+    entry.failed.delete(key);
+    entry.requested.delete(key);
+    entry.inflight.delete(key);
+    remembered += 1;
+  });
+  return remembered;
+}
+
+export function hmbAdoptImageAssetPresentation(state) {
+  const entry = imageAssetPresentationCacheEntry(state, false);
+  if (!entry || !Array.isArray(state?.assets)) return [];
+  const adopted = [];
+  state.assets.forEach((asset) => {
+    const key = clean(asset?.asset_library_id);
+    if (!key || imageSource(asset)) return;
+    const cached = entry.thumbnails.get(key);
+    if (!imageAssetPresentationIdentityMatches(cached, asset)) {
+      if (cached) {
+        entry.thumbnails.delete(key);
+        entry.requested.delete(key);
+        entry.failed.delete(key);
+        entry.errorRetries.delete(key);
+        entry.inflight.delete(key);
+      }
+      return;
+    }
+    asset.thumbnail_url = cached.thumbnailUrl;
+    entry.requested.delete(key);
+    entry.failed.delete(key);
+    entry.inflight.delete(key);
+    adopted.push(key);
+  });
+  return adopted;
+}
+
+export function hmbImageAssetPresentationCacheRegistry() {
+  return imageAssetPresentationCacheRegistry();
+}
+
+function hmbUnregisterImageAssetThumbnailConsumer(container) {
+  const registry = imageAssetThumbnailBridgeRegistry();
+  const runtimeId = clean(container?.__hmbImageAssetThumbnailConsumerRuntimeId);
+  const token = container?.__hmbImageAssetThumbnailConsumerToken;
+  const current = runtimeId ? registry?.get(runtimeId) : null;
+  if (current && token && current.consumerToken === token) {
+    if (current.dispatch) {
+      const { consumer: _consumer, consumerToken: _consumerToken, ...bridge } = current;
+      registry.set(runtimeId, bridge);
+    } else {
+      registry.delete(runtimeId);
+    }
+  }
+  delete container?.__hmbImageAssetThumbnailConsumerRuntimeId;
+  delete container?.__hmbImageAssetThumbnailConsumerToken;
+}
+
+function hmbUnregisterImageAssetCatalogProbeConsumer(container) {
+  const registry = imageAssetThumbnailBridgeRegistry();
+  const runtimeId = clean(container?.__hmbImageAssetCatalogProbeRuntimeId);
+  const token = container?.__hmbImageAssetCatalogProbeConsumerToken;
+  const current = runtimeId ? registry?.get(runtimeId) : null;
+  if (current && token && current.catalogConsumerToken === token) {
+    const {
+      catalogConsumer: _catalogConsumer,
+      catalogConsumerToken: _catalogConsumerToken,
+      catalogWake: _catalogWake,
+      ...bridge
+    } = current;
+    if (bridge.dispatch || bridge.consumer) registry.set(runtimeId, bridge);
+    else registry.delete(runtimeId);
+  }
+  delete container?.__hmbImageAssetCatalogProbeRuntimeId;
+  delete container?.__hmbImageAssetCatalogProbeConsumerToken;
+  delete container?.__hmbImageAssetCatalogProbeConsumer;
+}
+
+function hmbRegisterImageAssetCatalogProbeConsumer(
+  container,
+  state,
+  consumer,
+  wake,
+) {
+  if (!container || typeof consumer !== "function") return false;
+  const runtimeId = imageAssetThumbnailRuntimeId(state);
+  if (!runtimeId) {
+    hmbUnregisterImageAssetCatalogProbeConsumer(container);
+    return false;
+  }
+  if (
+    container.__hmbImageAssetCatalogProbeRuntimeId === runtimeId
+    && container.__hmbImageAssetCatalogProbeConsumer === consumer
+  ) return true;
+  hmbUnregisterImageAssetCatalogProbeConsumer(container);
+  const registry = imageAssetThumbnailBridgeRegistry();
+  const token = `hmb-image-catalog-consumer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const current = registry?.get(runtimeId) || {};
+  registry?.set(runtimeId, {
+    ...current,
+    catalogConsumer: consumer,
+    catalogConsumerToken: token,
+    catalogWake: typeof wake === "function" ? wake : null,
+  });
+  container.__hmbImageAssetCatalogProbeRuntimeId = runtimeId;
+  container.__hmbImageAssetCatalogProbeConsumerToken = token;
+  container.__hmbImageAssetCatalogProbeConsumer = consumer;
+  if (current.catalogPendingResult) {
+    const registered = registry?.get(runtimeId) || {};
+    const { catalogPendingResult: _pending, ...withoutPending } = registered;
+    registry?.set(runtimeId, withoutPending);
+    consumer(current.catalogPendingResult);
+  }
+  if (typeof current.dispatch === "function" && typeof wake === "function") wake();
+  return true;
+}
+
+function hmbRegisterImageAssetThumbnailConsumer(container, state, consumer) {
+  if (!container || typeof consumer !== "function") return false;
+  const runtimeId = imageAssetThumbnailRuntimeId(state);
+  if (!runtimeId) {
+    hmbUnregisterImageAssetThumbnailConsumer(container);
+    return false;
+  }
+  if (
+    container.__hmbImageAssetThumbnailConsumerRuntimeId === runtimeId
+    && container.__hmbImageAssetThumbnailConsumer === consumer
+  ) return true;
+  hmbUnregisterImageAssetThumbnailConsumer(container);
+  const registry = imageAssetThumbnailBridgeRegistry();
+  const token = `hmb-image-thumbnail-consumer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const current = registry?.get(runtimeId) || {};
+  registry?.set(runtimeId, { ...current, consumer, consumerToken: token });
+  container.__hmbImageAssetThumbnailConsumerRuntimeId = runtimeId;
+  container.__hmbImageAssetThumbnailConsumerToken = token;
+  container.__hmbImageAssetThumbnailConsumer = consumer;
+  if (current.pendingResult) {
+    // Consume at most once. The consumer performs exact runtime, pending
+    // request, project, manifest, scan, media-signature, and revision checks.
+    const registered = registry?.get(runtimeId) || {};
+    const { pendingResult: _pendingResult, ...withoutPending } = registered;
+    registry?.set(runtimeId, withoutPending);
+    consumer(current.pendingResult);
+  }
+  return true;
+}
 export function hmbImageAssetShotPalette(value = 1) {
   const number = Number.parseInt(value, 10);
   const index = Number.isInteger(number) && number >= 1 && number <= MAX_IMAGE_ASSET_SHOTS
@@ -462,6 +721,7 @@ function normalizeThumbnailRequest(raw) {
   return {
     request_id: requestId,
     project_uid: projectUid,
+    project_cache_uid: clean(raw.project_cache_uid).slice(0, 256),
     manifest_signature: clean(raw.manifest_signature).slice(0, 128),
     scan_revision: hmbNormalizeImageAssetRevision(raw.scan_revision),
     asset_library_ids: assetLibraryIds,
@@ -476,6 +736,7 @@ function normalizeThumbnailResult(raw) {
   return {
     request_id: requestId,
     project_uid: projectUid,
+    project_cache_uid: clean(raw.project_cache_uid).slice(0, 256),
     manifest_signature: clean(raw.manifest_signature).slice(0, 128),
     scan_revision: hmbNormalizeImageAssetRevision(raw.scan_revision),
     completed_asset_library_ids: uniqueStrings(raw.completed_asset_library_ids)
@@ -760,7 +1021,9 @@ function normalizeState(value) {
     project_root: projectRoot,
     project_id: clean(input.project_id),
     project_uid: clean(input.project_uid),
+    project_cache_uid: clean(input.project_cache_uid),
     manifest_signature: clean(input.manifest_signature).slice(0, 128),
+    folder_signature: clean(input.folder_signature).slice(0, 128),
     taxonomy,
     folders,
     assets,
@@ -820,6 +1083,8 @@ function imageAssetThumbnailContextMatches(state, result) {
     clean(state?.project_uid)
     && clean(result?.request_id)
     && clean(result?.project_uid) === clean(state?.project_uid)
+    && (!clean(result?.project_cache_uid)
+      || clean(result?.project_cache_uid) === clean(state?.project_cache_uid))
     && clean(result?.manifest_signature) === clean(state?.manifest_signature)
     && hmbNormalizeImageAssetRevision(result?.scan_revision)
       === hmbNormalizeImageAssetRevision(state?.scan_revision)
@@ -871,7 +1136,144 @@ export function hmbMergeImageAssetThumbnailResponse(
   if (local.thumbnail_request?.request_id === result.request_id) {
     local.thumbnail_request = {};
   }
+  hmbRememberImageAssetPresentation(local);
   return local;
+}
+
+function imageAssetShotAuthorityMatches(localState, incomingState) {
+  const localRouting = localState?.shot_routing;
+  const incomingRouting = incomingState?.shot_routing;
+  const localShots = Array.isArray(localRouting?.shots) ? localRouting.shots : [];
+  const incomingShots = Array.isArray(incomingRouting?.shots) ? incomingRouting.shots : [];
+  if (
+    clean(localRouting?.schema) !== clean(incomingRouting?.schema)
+    || Number(localRouting?.version || 0) !== Number(incomingRouting?.version || 0)
+    || clean(localRouting?.publisher_instance_uuid)
+      !== clean(incomingRouting?.publisher_instance_uuid)
+    || clean(localRouting?.channel_uuid) !== clean(incomingRouting?.channel_uuid)
+    || Number(localRouting?.generation || 0) !== Number(incomingRouting?.generation || 0)
+    || clean(localRouting?.active_shot_uuid) !== clean(incomingRouting?.active_shot_uuid)
+    || localShots.length !== incomingShots.length
+  ) return false;
+  return localShots.every((shot, index) => {
+    const incoming = incomingShots[index];
+    const localSources = uniqueStrings(shot?.selected_source_uids);
+    const incomingSources = uniqueStrings(incoming?.selected_source_uids);
+    return Boolean(
+      incoming
+      && clean(shot?.shot_uuid) === clean(incoming.shot_uuid)
+      && Number(shot?.number || 0) === Number(incoming.number || 0)
+      && clean(shot?.name) === clean(incoming.name)
+      && localSources.length === incomingSources.length
+      && localSources.every((sourceUid, sourceIndex) => sourceUid === incomingSources[sourceIndex])
+    );
+  });
+}
+
+function imageAssetThumbnailOnlyTransition(localState, incomingState, expectedRequestId = "") {
+  const result = incomingState?.thumbnail_result;
+  const pendingRequestId = clean(expectedRequestId)
+    || clean(localState?.thumbnail_request?.request_id);
+  return Boolean(
+    localState
+    && incomingState
+    && imageAssetThumbnailContextMatches(localState, result)
+    && (!pendingRequestId || clean(result?.request_id) === pendingRequestId)
+    && hmbNormalizeImageAssetRevision(incomingState.thumbnail_revision)
+      > hmbNormalizeImageAssetRevision(localState.thumbnail_revision)
+    && clean(localState.project_uid) === clean(incomingState.project_uid)
+    && clean(localState.project_cache_uid) === clean(incomingState.project_cache_uid)
+    && clean(localState.manifest_signature) === clean(incomingState.manifest_signature)
+    && hmbNormalizeImageAssetRevision(localState.scan_revision)
+      === hmbNormalizeImageAssetRevision(incomingState.scan_revision)
+    && hmbNormalizeImageAssetRevision(localState[IMAGE_ASSET_UI_EDIT_REVISION_KEY])
+      === hmbNormalizeImageAssetRevision(incomingState[IMAGE_ASSET_UI_EDIT_REVISION_KEY])
+    && Boolean(localState.scan_busy) === Boolean(incomingState.scan_busy)
+    && clean(localState.error) === clean(incomingState.error)
+    && clean(localState.asset_registration_result?.request_id)
+      === clean(incomingState.asset_registration_result?.request_id)
+    && imageAssetShotAuthorityMatches(localState, incomingState)
+  );
+}
+
+// Optional compact host transport. Current hosts continue to deliver the full
+// canonical state through `value`; hosts that understand presentation patches
+// may instead send this envelope without retransmitting the catalog. The
+// project/manifest/scan tuple and per-asset media signature keep the patch from
+// becoming semantic state authority.
+function hmbApplyImageAssetThumbnailPresentationPatch(localValue, patchValue) {
+  const local = isCanonicalImageAssetState(localValue)
+    ? localValue
+    : normalizeState(localValue);
+  const patch = patchValue && typeof patchValue === "object" ? patchValue : null;
+  const pendingRequestId = clean(local.thumbnail_request?.request_id);
+  if (
+    !patch
+    || clean(patch.schema) !== "hmb-image-asset-thumbnail-bridge"
+    || clean(patch.operation) !== "hydrate"
+    || clean(patch.phase) !== "result"
+    || clean(patch.project_uid) !== clean(local.project_uid)
+    || (clean(patch.project_cache_uid)
+      && clean(patch.project_cache_uid) !== clean(local.project_cache_uid))
+    || (clean(patch.runtime_instance_id)
+      && clean(patch.runtime_instance_id) !== imageAssetThumbnailRuntimeId(local))
+    || (pendingRequestId && clean(patch.request_id) !== pendingRequestId)
+    || clean(patch.manifest_signature) !== clean(local.manifest_signature)
+    || hmbNormalizeImageAssetRevision(patch.scan_revision)
+      !== hmbNormalizeImageAssetRevision(local.scan_revision)
+    || hmbNormalizeImageAssetRevision(patch.thumbnail_revision)
+      <= hmbNormalizeImageAssetRevision(local.thumbnail_revision)
+  ) return null;
+
+  const entries = Array.isArray(patch.completed_assets) ? patch.completed_assets : [];
+  const localById = new Map(
+    local.assets.map((asset) => [clean(asset.asset_library_id), asset]),
+  );
+  const completed = [];
+  const rejected = [];
+  entries.forEach((entry) => {
+    const key = clean(entry?.asset_library_id);
+    const asset = localById.get(key);
+    const thumbnailUrl = clean(entry?.thumbnail_url);
+    if (
+      !asset
+      || !thumbnailUrl
+      || clean(entry?.source_uid) !== clean(asset.source_uid)
+      || clean(entry?.media_signature) !== clean(asset.media_signature)
+    ) {
+      if (key) rejected.push(key);
+      return;
+    }
+    asset.thumbnail_url = thumbnailUrl;
+    completed.push(key);
+  });
+  const failed = uniqueStrings([
+    ...(Array.isArray(patch.failed_asset_library_ids)
+      ? patch.failed_asset_library_ids
+      : []),
+    ...rejected,
+  ]).map((value) => value.slice(0, 512));
+  local.thumbnail_revision = hmbNormalizeImageAssetRevision(patch.thumbnail_revision);
+  local.thumbnail_busy = false;
+  local.thumbnail_result = {
+    request_id: clean(patch.request_id),
+    project_uid: clean(patch.project_uid),
+    project_cache_uid: clean(patch.project_cache_uid),
+    manifest_signature: clean(patch.manifest_signature),
+    scan_revision: hmbNormalizeImageAssetRevision(patch.scan_revision),
+    completed_asset_library_ids: uniqueStrings(completed),
+    failed_asset_library_ids: failed,
+  };
+  if (local.thumbnail_request?.request_id === local.thumbnail_result.request_id) {
+    local.thumbnail_request = {};
+  }
+  hmbRememberImageAssetPresentation(local);
+  return {
+    state: local,
+    completedAssetLibraryIds: completed,
+    failedAssetLibraryIds: failed,
+    changedAssetLibraryIds: uniqueStrings([...completed, ...failed]),
+  };
 }
 
 function selectedAssets(state) {
@@ -1390,11 +1792,14 @@ function hmbRememberImageAssetStateEcho(container, value, publicationToken) {
 export function hmbConsumeImageAssetStateEcho(container, nextProps = {}) {
   if (!container) return false;
   container.__hmbImageAssetLastConsumedEchoWasStale = false;
+  delete container.__hmbImageAssetIncomingSerialized;
   let incomingState = null;
-  let incoming = "";
   try {
-    incomingState = normalizeState(nextProps?.value);
-    incoming = JSON.stringify(incomingState);
+    const retainedIncomingState = container.__hmbImageAssetIncomingState;
+    delete container.__hmbImageAssetIncomingState;
+    incomingState = isCanonicalImageAssetState(retainedIncomingState)
+      ? retainedIncomingState
+      : normalizeState(nextProps?.value);
   } catch (_error) {
     return false;
   }
@@ -1411,8 +1816,18 @@ export function hmbConsumeImageAssetStateEcho(container, nextProps = {}) {
   if (!Array.isArray(pending) || !pending.length) {
     return false;
   }
+  let incoming = "";
+  try {
+    incoming = JSON.stringify(incomingState);
+    // applyProps reuses this exact canonical serialization when the value is
+    // not an echo, avoiding a second full-catalog JSON walk.
+    container.__hmbImageAssetIncomingSerialized = incoming;
+  } catch (_error) {
+    return false;
+  }
   const match = pending.find((item) => item?.value === incoming);
   if (!match) return false;
+  delete container.__hmbImageAssetIncomingSerialized;
   hmbForgetImageAssetStateEcho(container, match.publicationToken);
   return true;
 }
@@ -2000,14 +2415,27 @@ function thumbnailImageMarkup(asset) {
   const fallback = escapeHtml((asset.extension || ".img").replace(".", "").toUpperCase() || "IMG");
   return source
     ? `<img src="${escapeHtml(source)}" alt="" draggable="false" loading="lazy" decoding="async" fetchpriority="low"/><span>${fallback}</span>`
-    : `<span class="thumbnail-placeholder" aria-hidden="true"></span>`;
+    : `<span class="thumbnail-placeholder" aria-hidden="true">${imageAssetThumbnailFallbackMarkup(asset)}</span>`;
+}
+
+function imageAssetLeafLoaderMarkup() {
+  return `<span class="hmb-image-leaf-loader">${Array.from(
+    { length: 8 },
+    (_unused, index) => `<i style="--leaf-index:${index}"></i>`,
+  ).join("")}</span>`;
+}
+
+function imageAssetThumbnailFallbackMarkup(asset) {
+  return hmbImageAssetThumbnailFailed(asset)
+    ? `<span class="hmb-image-thumbnail-unavailable" title="Thumbnail unavailable; use Refresh to retry">!</span>`
+    : imageAssetLeafLoaderMarkup();
 }
 
 function assetCardThumbnailImageMarkup(asset) {
   const source = imageSource(asset);
   return source
     ? `<img src="${escapeHtml(source)}" alt="" draggable="false" loading="lazy" decoding="async" fetchpriority="low"/>`
-    : `<span class="asset-thumb-placeholder" aria-hidden="true"></span>`;
+    : `<span class="asset-thumb-placeholder" aria-hidden="true">${imageAssetThumbnailFallbackMarkup(asset)}</span>`;
 }
 
 export function hmbImageAssetCanRegister(asset) {
@@ -2020,17 +2448,19 @@ export function hmbImageAssetCanRegister(asset) {
 
 function thumbnailHtml(asset, className = "asset-thumb") {
   const source = imageSource(asset);
-  return `<div class="${className} ${source ? "" : "fallback thumbnail-loading"}" data-thumbnail-loading="${source ? "false" : "true"}">${thumbnailImageMarkup(asset)}</div>`;
+  const failed = !source && hmbImageAssetThumbnailFailed(asset);
+  return `<div class="${className} ${source ? "" : failed ? "fallback thumbnail-failed" : "fallback thumbnail-loading"}" data-thumbnail-loading="${source || failed ? "false" : "true"}" data-thumbnail-failed="${failed ? "true" : "false"}">${thumbnailImageMarkup(asset)}</div>`;
 }
 
 function assetThumbnailHtml(asset, state) {
   const source = imageSource(asset);
+  const failed = !source && hmbImageAssetThumbnailFailed(asset);
   const sourceName = clean(asset.image_name) || clean(asset.asset_id) || "Image";
   const add = hmbImageAssetCanRegister(asset)
     ? `<button type="button" class="asset-add" data-asset-add aria-label="${escapeHtml(imageAssetText(state, "add_image_asset"))}">${escapeHtml(imageAssetText(state, "add"))}</button>`
     : "";
   return `
-    <div class="asset-thumb ${source ? "" : "fallback thumbnail-loading"}" data-thumbnail-loading="${source ? "false" : "true"}">
+    <div class="asset-thumb ${source ? "" : failed ? "fallback thumbnail-failed" : "fallback thumbnail-loading"}" data-thumbnail-loading="${source || failed ? "false" : "true"}" data-thumbnail-failed="${failed ? "true" : "false"}">
       <div class="asset-thumb-media">${assetCardThumbnailImageMarkup(asset)}${add}</div>
       <div class="asset-thumb-footer"><span class="asset-source-name" title="${escapeHtml(sourceName)}">${escapeHtml(sourceName)}</span></div>
     </div>
@@ -2107,7 +2537,7 @@ export function hmbImageAssetCatalogWindow(
 }
 
 function imageAssetThumbnailContextKey(state) {
-  const projectUid = clean(state?.project_uid);
+  const projectUid = clean(state?.project_cache_uid || state?.project_uid);
   if (!projectUid) return "";
   return [
     projectUid,
@@ -2116,10 +2546,16 @@ function imageAssetThumbnailContextKey(state) {
   ].join("\n");
 }
 
+function imageAssetThumbnailRuntimeId(state) {
+  return clean(state?.shot_routing?.publisher_instance_uuid);
+}
+
 function imageAssetThumbnailRequestMatchesState(state, request) {
   return Boolean(
     clean(request?.request_id)
     && clean(request?.project_uid) === clean(state?.project_uid)
+    && (!clean(request?.project_cache_uid)
+      || clean(request?.project_cache_uid) === clean(state?.project_cache_uid))
     && clean(request?.manifest_signature) === clean(state?.manifest_signature)
     && hmbNormalizeImageAssetRevision(request?.scan_revision)
       === hmbNormalizeImageAssetRevision(state?.scan_revision)
@@ -2136,7 +2572,13 @@ export function hmbImageAssetThumbnailRequestIds(
   const visible = options.includeWindow === false
     ? []
     : hmbImageAssetCatalogWindow(canonical, limit, offset).rendered;
-  const candidates = [...selectedAssets(canonical), ...visible];
+  // Hydrate the project catalog once instead of coupling thumbnail availability
+  // to the currently opened folder or Shot. Selected/visible rows keep
+  // priority; the remainder drains through successive 64-item post-paint
+  // batches, so a 5,000-item catalog never blocks the initial paint.
+  const candidates = options.includeCatalog === false
+    ? [...selectedAssets(canonical), ...visible]
+    : [...selectedAssets(canonical), ...visible, ...canonical.assets];
   const seen = new Set();
   return candidates
     .filter((asset) => {
@@ -2160,11 +2602,41 @@ export function hmbImageAssetThumbnailRequestIds(
 
 function imageAssetThumbnailRequestTracking(container, state) {
   const contextKey = imageAssetThumbnailContextKey(state);
-  if (!container || !contextKey) return { contextKey, requested: new Set() };
+  if (!container || !contextKey) {
+    return { contextKey, requested: new Set(), failed: new Set() };
+  }
   if (container.__hmbImageAssetThumbnailContextKey !== contextKey) {
+    hmbClearImageAssetThumbnailWatchdog(container);
+    const priorPending = clean(container.__hmbImageAssetThumbnailPendingRequestId);
+    const priorInflight = container.__hmbImageAssetThumbnailInflight;
+    const priorRequested = container.__hmbImageAssetThumbnailRequestedIds;
+    if (priorPending && priorInflight instanceof Map) {
+      for (const [key, requestId] of priorInflight.entries()) {
+        if (clean(requestId) !== priorPending) continue;
+        priorInflight.delete(key);
+        priorRequested?.delete?.(key);
+      }
+    }
     container.__hmbImageAssetThumbnailContextKey = contextKey;
-    container.__hmbImageAssetThumbnailRequestedIds = new Set();
-    container.__hmbImageAssetThumbnailErrorRetries = new Map();
+    const shared = imageAssetPresentationCacheEntry(state, true);
+    // A new catalog revision may change an asset that previously failed or
+    // was in flight. Valid cached URLs survive by media signature; unresolved
+    // request bookkeeping must not suppress the new revision.
+    const sharedAuthority = [
+      clean(state?.manifest_signature),
+      hmbNormalizeImageAssetRevision(state?.scan_revision),
+    ].join("\n");
+    if (shared && shared.authorityContext && shared.authorityContext !== sharedAuthority) {
+      shared.requested.clear();
+      shared.failed.clear();
+      shared.errorRetries.clear();
+      shared.inflight.clear();
+    }
+    if (shared) shared.authorityContext = sharedAuthority;
+    container.__hmbImageAssetThumbnailRequestedIds = shared?.requested || new Set();
+    container.__hmbImageAssetThumbnailFailedIds = shared?.failed || new Set();
+    container.__hmbImageAssetThumbnailErrorRetries = shared?.errorRetries || new Map();
+    container.__hmbImageAssetThumbnailInflight = shared?.inflight || new Map();
     delete container.__hmbImageAssetThumbnailPendingRequestId;
   }
   if (!(container.__hmbImageAssetThumbnailRequestedIds instanceof Set)) {
@@ -2173,15 +2645,71 @@ function imageAssetThumbnailRequestTracking(container, state) {
   if (!(container.__hmbImageAssetThumbnailErrorRetries instanceof Map)) {
     container.__hmbImageAssetThumbnailErrorRetries = new Map();
   }
+  if (!(container.__hmbImageAssetThumbnailFailedIds instanceof Set)) {
+    container.__hmbImageAssetThumbnailFailedIds = new Set();
+  }
+  if (!(container.__hmbImageAssetThumbnailInflight instanceof Map)) {
+    container.__hmbImageAssetThumbnailInflight = new Map();
+  }
   return {
     contextKey,
     requested: container.__hmbImageAssetThumbnailRequestedIds,
+    failed: container.__hmbImageAssetThumbnailFailedIds,
+    inflight: container.__hmbImageAssetThumbnailInflight,
   };
+}
+
+function hmbImageAssetThumbnailResultIds(state) {
+  const result = state?.thumbnail_result;
+  return uniqueStrings([
+    ...(Array.isArray(result?.completed_asset_library_ids)
+      ? result.completed_asset_library_ids
+      : []),
+    ...(Array.isArray(result?.failed_asset_library_ids)
+      ? result.failed_asset_library_ids
+      : []),
+  ]);
+}
+
+function hmbApplyImageAssetThumbnailFailurePresentation(container, state) {
+  if (!state || !Array.isArray(state.assets)) return state;
+  const failed = container?.__hmbImageAssetThumbnailFailedIds instanceof Set
+    ? container.__hmbImageAssetThumbnailFailedIds
+    : new Set();
+  state.assets.forEach((asset) => {
+    try {
+      Object.defineProperty(asset, IMAGE_ASSET_THUMBNAIL_FAILED_STAMP, {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value: failed.has(clean(asset?.asset_library_id)),
+      });
+    } catch (_error) {}
+  });
+  return state;
+}
+
+function hmbImageAssetThumbnailFailed(asset) {
+  return Boolean(asset?.[IMAGE_ASSET_THUMBNAIL_FAILED_STAMP]);
 }
 
 function hmbAcceptImageAssetThumbnailResult(container, state) {
   const result = state?.thumbnail_result;
   if (!container || !imageAssetThumbnailContextMatches(state, result)) return false;
+  hmbClearImageAssetThumbnailWatchdog(container, result.request_id);
+  const tracking = imageAssetThumbnailRequestTracking(container, state);
+  uniqueStrings(result.completed_asset_library_ids).forEach((key) => {
+    tracking.failed.delete(key);
+    tracking.requested.delete(key);
+    tracking.inflight.delete(key);
+    container.__hmbImageAssetThumbnailErrorRetries?.delete?.(key);
+  });
+  uniqueStrings(result.failed_asset_library_ids).forEach((key) => {
+    tracking.requested.add(key);
+    tracking.failed.add(key);
+    tracking.inflight.delete(key);
+  });
+  hmbRememberImageAssetPresentation(state);
   if (container.__hmbImageAssetThumbnailPendingRequestId === result.request_id) {
     delete container.__hmbImageAssetThumbnailPendingRequestId;
   }
@@ -2189,18 +2717,349 @@ function hmbAcceptImageAssetThumbnailResult(container, state) {
     !state.thumbnail_busy
     && state.thumbnail_request?.request_id === result.request_id
   ) state.thumbnail_request = {};
+  hmbApplyImageAssetThumbnailFailurePresentation(container, state);
   return true;
+}
+
+export function hmbClearImageAssetThumbnailWatchdog(
+  container,
+  expectedRequestId = "",
+) {
+  if (!container) return false;
+  const watchdog = container.__hmbImageAssetThumbnailWatchdog;
+  if (
+    expectedRequestId
+    && clean(watchdog?.requestId) !== clean(expectedRequestId)
+  ) return false;
+  const timer = watchdog?.timer;
+  if (timer !== null && timer !== undefined && typeof clearTimeout === "function") {
+    try { clearTimeout(timer); } catch (_error) {}
+  }
+  delete container.__hmbImageAssetThumbnailWatchdog;
+  return Boolean(watchdog);
 }
 
 export function hmbCancelImageAssetThumbnailRequest(container) {
   if (!container) return false;
+  hmbClearImageAssetThumbnailWatchdog(container);
+  const pendingRequestId = clean(container.__hmbImageAssetThumbnailPendingRequestId);
+  const inflight = container.__hmbImageAssetThumbnailInflight;
+  const requested = container.__hmbImageAssetThumbnailRequestedIds;
+  if (pendingRequestId && inflight instanceof Map) {
+    for (const [key, requestId] of inflight.entries()) {
+      if (clean(requestId) !== pendingRequestId) continue;
+      inflight.delete(key);
+      requested?.delete?.(key);
+    }
+  }
   container.__hmbImageAssetThumbnailScheduleToken =
     (Number(container.__hmbImageAssetThumbnailScheduleToken) || 0) + 1;
   delete container.__hmbImageAssetThumbnailPendingRequestId;
   delete container.__hmbImageAssetThumbnailRequestedIds;
+  delete container.__hmbImageAssetThumbnailFailedIds;
   delete container.__hmbImageAssetThumbnailErrorRetries;
+  delete container.__hmbImageAssetThumbnailInflight;
   delete container.__hmbImageAssetThumbnailContextKey;
   return true;
+}
+
+export function hmbResetImageAssetThumbnailRetryState(container, state) {
+  if (!container || !state) return false;
+  hmbClearImageAssetThumbnailWatchdog(container);
+  container.__hmbImageAssetThumbnailScheduleToken =
+    (Number(container.__hmbImageAssetThumbnailScheduleToken) || 0) + 1;
+  const shared = imageAssetPresentationCacheEntry(state, true);
+  shared?.requested?.clear?.();
+  shared?.failed?.clear?.();
+  shared?.errorRetries?.clear?.();
+  shared?.inflight?.clear?.();
+  container.__hmbImageAssetThumbnailRequestedIds = shared?.requested || new Set();
+  container.__hmbImageAssetThumbnailFailedIds = shared?.failed || new Set();
+  container.__hmbImageAssetThumbnailErrorRetries = shared?.errorRetries || new Map();
+  container.__hmbImageAssetThumbnailInflight = shared?.inflight || new Map();
+  delete container.__hmbImageAssetThumbnailPendingRequestId;
+  state.thumbnail_request = {};
+  state.thumbnail_result = {};
+  state.thumbnail_busy = false;
+  hmbApplyImageAssetThumbnailFailurePresentation(container, state);
+  return true;
+}
+
+export function hmbFinalizeImageAssetThumbnailTimeout(container, state, request) {
+  if (!container || !state || !request) return false;
+  const requestId = clean(request.request_id);
+  const contextKey = imageAssetThumbnailContextKey(state);
+  if (
+    !requestId
+    || !contextKey
+    || clean(request.project_uid) !== clean(state.project_uid)
+    || (clean(request.project_cache_uid)
+      && clean(request.project_cache_uid) !== clean(state.project_cache_uid))
+    || clean(request.manifest_signature) !== clean(state.manifest_signature)
+    || hmbNormalizeImageAssetRevision(request.scan_revision)
+      !== hmbNormalizeImageAssetRevision(state.scan_revision)
+  ) return false;
+  hmbClearImageAssetThumbnailWatchdog(container, requestId);
+  const failedIds = uniqueStrings(request.asset_library_ids);
+  const tracking = imageAssetThumbnailRequestTracking(container, state);
+  failedIds.forEach((key) => {
+    tracking.requested.add(key);
+    tracking.failed.add(key);
+    tracking.inflight.delete(key);
+  });
+  state.thumbnail_request = {};
+  state.thumbnail_busy = false;
+  state.thumbnail_result = {
+    request_id: requestId,
+    project_uid: clean(request.project_uid),
+    project_cache_uid: clean(request.project_cache_uid || state.project_cache_uid),
+    manifest_signature: clean(request.manifest_signature),
+    scan_revision: hmbNormalizeImageAssetRevision(request.scan_revision),
+    completed_asset_library_ids: [],
+    failed_asset_library_ids: failedIds,
+  };
+  if (container.__hmbImageAssetThumbnailPendingRequestId === requestId) {
+    delete container.__hmbImageAssetThumbnailPendingRequestId;
+  }
+  container.__hmbImageAssetLatestState = state;
+  hmbApplyImageAssetThumbnailFailurePresentation(container, state);
+  hmbPatchImageAssetThumbnailMedia(container, state, failedIds);
+  return true;
+}
+
+export function hmbArmImageAssetThumbnailWatchdog(
+  container,
+  state,
+  props,
+  request,
+) {
+  if (!container || !state || !request || typeof setTimeout !== "function") {
+    return false;
+  }
+  hmbClearImageAssetThumbnailWatchdog(container);
+  const watchdog = {
+    requestId: clean(request.request_id),
+    runtimeId: imageAssetThumbnailRuntimeId(state),
+    contextKey: imageAssetThumbnailContextKey(state),
+    mountToken: Number(container.__hmbImageAssetMountToken) || 0,
+    request: {
+      ...request,
+      asset_library_ids: uniqueStrings(request.asset_library_ids),
+    },
+    retries: 0,
+    timer: null,
+  };
+  if (!watchdog.requestId || !watchdog.contextKey) return false;
+
+  const isCurrent = () => {
+    const live = container.__hmbImageAssetLatestState || state;
+    return Boolean(
+      container.__hmbImageAssetThumbnailWatchdog === watchdog
+      && imageAssetThumbnailContextKey(live) === watchdog.contextKey
+      && (!watchdog.mountToken
+        || Number(container.__hmbImageAssetMountToken) === watchdog.mountToken)
+      && clean(container.__hmbImageAssetThumbnailPendingRequestId)
+        === watchdog.requestId
+    );
+  };
+  const schedule = () => {
+    watchdog.timer = setTimeout(onTimeout, IMAGE_ASSET_THUMBNAIL_WATCHDOG_MS);
+  };
+  const terminalize = () => {
+    if (!isCurrent()) {
+      hmbClearImageAssetThumbnailWatchdog(container, watchdog.requestId);
+      return false;
+    }
+    const live = container.__hmbImageAssetLatestState || state;
+    try {
+      console?.warn?.(
+        "[HMBImageAssetLibrary] thumbnail response timed out; use Refresh to retry.",
+        watchdog.requestId,
+      );
+    } catch (_error) {}
+    return hmbFinalizeImageAssetThumbnailTimeout(
+      container,
+      live,
+      watchdog.request,
+    );
+  };
+  const probe = () => {
+    const live = container.__hmbImageAssetLatestState || state;
+    const bridge = imageAssetThumbnailBridgeRegistry()?.get(watchdog.runtimeId);
+    const dispatch = typeof bridge?.dispatch === "function" ? bridge.dispatch : null;
+    try {
+      let result;
+      if (dispatch) {
+        result = dispatch(watchdog.request);
+      } else if (typeof props?.onChange === "function") {
+        // One bounded legacy wake-up is allowed only after the compact result
+        // lease expires. It reuses the exact request ID, so the backend either
+        // drains a pending result or republishes its completed envelope rather
+        // than starting duplicate decode work.
+        result = props.onChange(JSON.stringify({
+          ...live,
+          thumbnail_request: watchdog.request,
+          thumbnail_busy: true,
+          __hmb_thumbnail_watchdog_probe: watchdog.requestId,
+        }));
+      } else {
+        return terminalize();
+      }
+      if (result && typeof result.then === "function") {
+        Promise.resolve(result).catch(() => terminalize());
+      }
+      return true;
+    } catch (_error) {
+      return terminalize();
+    }
+  };
+  const onTimeout = () => {
+    if (!isCurrent()) {
+      hmbClearImageAssetThumbnailWatchdog(container, watchdog.requestId);
+      return;
+    }
+    const live = container.__hmbImageAssetLatestState || state;
+    const result = live.thumbnail_result;
+    if (
+      !live.thumbnail_busy
+      && imageAssetThumbnailContextMatches(live, result)
+      && clean(result?.request_id) === watchdog.requestId
+    ) {
+      hmbAcceptImageAssetThumbnailResult(container, live);
+      hmbPatchImageAssetThumbnailMedia(
+        container,
+        live,
+        hmbImageAssetThumbnailResultIds(live),
+      );
+      return;
+    }
+    if (watchdog.retries >= IMAGE_ASSET_THUMBNAIL_WATCHDOG_RETRIES) {
+      terminalize();
+      return;
+    }
+    watchdog.retries += 1;
+    if (probe() && container.__hmbImageAssetThumbnailWatchdog === watchdog) {
+      schedule();
+    }
+  };
+
+  container.__hmbImageAssetThumbnailWatchdog = watchdog;
+  schedule();
+  return true;
+}
+
+export function hmbResumeImageAssetThumbnailRequest(container, state, props = {}) {
+  if (!container || !state || !state.thumbnail_busy) return false;
+  const existing = container.__hmbImageAssetThumbnailWatchdog;
+  if (
+    clean(container.__hmbImageAssetThumbnailPendingRequestId)
+    && clean(existing?.requestId)
+      === clean(container.__hmbImageAssetThumbnailPendingRequestId)
+  ) return true;
+  const tracking = imageAssetThumbnailRequestTracking(container, state);
+  if (!tracking.contextKey) {
+    state.thumbnail_request = {};
+    state.thumbnail_busy = false;
+    return false;
+  }
+  let request = state.thumbnail_request;
+  if (!imageAssetThumbnailRequestMatchesState(state, request)) {
+    // Legacy full-state acknowledgements intentionally clear the consumed
+    // request. If React recreates the widget during that short busy interval,
+    // reconstruct one bounded lease from the still-missing visible/selected
+    // media. Backend single-flight queues this newer intent safely.
+    const recoveredIds = hmbImageAssetThumbnailRequestIds(
+      state,
+      container.__hmbImageAssetRenderLimit || IMAGE_ASSET_RENDER_WINDOW,
+      container.__hmbImageAssetRenderOffset || 0,
+      { includeWindow: !container.__hmbImageAssetCompact },
+    ).filter((key) => !tracking.failed.has(key));
+    if (!recoveredIds.length) {
+      state.thumbnail_request = {};
+      state.thumbnail_busy = false;
+      return false;
+    }
+    request = {
+      request_id: `thumbnail-resume-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      project_uid: state.project_uid,
+      project_cache_uid: state.project_cache_uid,
+      manifest_signature: state.manifest_signature,
+      scan_revision: state.scan_revision,
+      asset_library_ids: recoveredIds,
+    };
+    state.thumbnail_request = request;
+  }
+  const available = new Map(
+    (Array.isArray(state.assets) ? state.assets : [])
+      .filter((asset) => asset && typeof asset === "object")
+      .map((asset) => [clean(asset.asset_library_id), asset]),
+  );
+  const requestIds = uniqueStrings(request.asset_library_ids)
+    .filter((key) => {
+      const asset = available.get(key);
+      return asset && !imageSource(asset);
+    })
+    .slice(0, IMAGE_ASSET_THUMBNAIL_REQUEST_BATCH);
+  if (!requestIds.length) {
+    state.thumbnail_request = {};
+    state.thumbnail_busy = false;
+    return false;
+  }
+  const requestId = clean(request.request_id);
+  requestIds.forEach((key) => {
+    tracking.requested.add(key);
+    tracking.inflight.set(key, requestId);
+  });
+  container.__hmbImageAssetThumbnailPendingRequestId = requestId;
+  container.__hmbImageAssetLatestState = state;
+  const bridgeRequest = {
+    schema: "hmb-image-asset-thumbnail-bridge",
+    version: 1,
+    operation: "hydrate",
+    phase: "request",
+    runtime_instance_id: imageAssetThumbnailRuntimeId(state),
+    request_id: requestId,
+    project_uid: clean(request.project_uid),
+    project_cache_uid: clean(request.project_cache_uid || state.project_cache_uid),
+    manifest_signature: clean(request.manifest_signature),
+    scan_revision: hmbNormalizeImageAssetRevision(request.scan_revision),
+    asset_library_ids: requestIds,
+  };
+  if (hmbArmImageAssetThumbnailWatchdog(container, state, props, bridgeRequest)) {
+    // Wake the backend immediately. Reusing the same request ID is idempotent:
+    // it either rejoins the active single-flight or republishes its completion.
+    const bridge = imageAssetThumbnailBridgeRegistry()?.get(
+      bridgeRequest.runtime_instance_id,
+    );
+    try {
+      let dispatched = null;
+      if (typeof bridge?.dispatch === "function") {
+        dispatched = bridge.dispatch(bridgeRequest);
+      } else if (typeof props?.onChange === "function") {
+        dispatched = props.onChange(JSON.stringify({
+          ...state,
+          thumbnail_request: {
+            request_id: requestId,
+            project_uid: bridgeRequest.project_uid,
+            project_cache_uid: bridgeRequest.project_cache_uid,
+            manifest_signature: bridgeRequest.manifest_signature,
+            scan_revision: bridgeRequest.scan_revision,
+            asset_library_ids: [...requestIds],
+          },
+          thumbnail_busy: true,
+        }));
+      }
+      if (dispatched && typeof dispatched.then === "function") {
+        Promise.resolve(dispatched).catch(() => {});
+      }
+    } catch (_error) {
+      // The watchdog owns the one bounded retry/finalization path.
+    }
+    return true;
+  }
+  // A browser without timers cannot own a bounded lease. End the visual state
+  // deterministically instead of preserving a loader that can never wake.
+  return hmbFinalizeImageAssetThumbnailTimeout(container, state, bridgeRequest);
 }
 
 function imageAssetThumbnailAssetForElement(container, state, image) {
@@ -2254,17 +3113,25 @@ export function hmbHandleImageAssetThumbnailError(container, state, image, props
   const retries = container.__hmbImageAssetThumbnailErrorRetries;
   const retryCount = Math.max(0, Number(retries.get(key)) || 0);
   asset.thumbnail_url = "";
+  const shared = imageAssetPresentationCacheEntry(liveState, false);
+  shared?.thumbnails?.delete?.(key);
+  shared?.inflight?.delete?.(key);
   container.__hmbImageAssetLatestState = liveState;
   image.closest?.(".asset-thumb,.selected-thumb,.passport-photo,.compact-shot-asset")
     ?.classList?.add?.("fallback");
   if (retryCount >= IMAGE_ASSET_THUMBNAIL_ERROR_RETRY_LIMIT) {
     tracking.requested.add(key);
+    tracking.failed.add(key);
     image.removeAttribute?.("src");
     image.removeAttribute?.("data-hmb-compact-src");
+    hmbApplyImageAssetThumbnailFailurePresentation(container, liveState);
+    hmbPatchImageAssetThumbnailMedia(container, liveState, [key]);
     return true;
   }
   retries.set(key, retryCount + 1);
+  tracking.failed.delete(key);
   tracking.requested.delete(key);
+  hmbApplyImageAssetThumbnailFailurePresentation(container, liveState);
   hmbPatchImageAssetThumbnailMedia(container, liveState, [key]);
   hmbScheduleImageAssetThumbnailRequest(container, liveState, props, {
     includeWindow: !container.__hmbImageAssetCompact,
@@ -2278,7 +3145,10 @@ export function hmbRememberLoadedImageAssetThumbnail(container, state, image) {
   if (!imageAssetThumbnailElementMatchesAsset(image, asset)) return false;
   const tracking = imageAssetThumbnailRequestTracking(container, liveState);
   if (!tracking.contextKey) return false;
-  container.__hmbImageAssetThumbnailErrorRetries.delete(clean(asset.asset_library_id));
+  const key = clean(asset.asset_library_id);
+  container.__hmbImageAssetThumbnailErrorRetries.delete(key);
+  tracking.failed.delete(key);
+  hmbApplyImageAssetThumbnailFailurePresentation(container, liveState);
   return true;
 }
 
@@ -2288,7 +3158,7 @@ export function hmbScheduleImageAssetThumbnailRequest(
   props,
   options = {},
 ) {
-  if (!container || typeof props?.onChange !== "function") return false;
+  if (!container) return false;
   const liveState = container.__hmbImageAssetLatestState || state;
   if (!liveState || liveState.scan_busy || liveState.thumbnail_busy) return false;
   const tracking = imageAssetThumbnailRequestTracking(container, liveState);
@@ -2310,12 +3180,14 @@ export function hmbScheduleImageAssetThumbnailRequest(
     if (container.__hmbImageAssetThumbnailScheduleToken !== token) return;
     const current = container.__hmbImageAssetLatestState || liveState;
     const currentTracking = imageAssetThumbnailRequestTracking(container, current);
+    const runtimeId = imageAssetThumbnailRuntimeId(current);
+    const bridge = imageAssetThumbnailBridgeRegistry()?.get(runtimeId);
+    const bridgeDispatch = typeof bridge?.dispatch === "function" ? bridge.dispatch : null;
     if (
       !currentTracking.contextKey
       || currentTracking.contextKey !== tracking.contextKey
       || current.scan_busy
       || current.thumbnail_busy
-      || typeof props?.onChange !== "function"
       || imageAssetThumbnailRequestMatchesState(current, current.thumbnail_request)
       || container.__hmbImageAssetThumbnailPendingRequestId
     ) return;
@@ -2328,51 +3200,78 @@ export function hmbScheduleImageAssetThumbnailRequest(
     if (!currentIds.length) return;
 
     const requestId = `thumbnail-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-    const presentationBaseline = {
-      thumbnailRequest: current.thumbnail_request,
-      thumbnailResult: current.thumbnail_result,
-      thumbnailBusy: current.thumbnail_busy,
-      pendingRequestId: container.__hmbImageAssetThumbnailPendingRequestId,
-      requestedIds: new Set(currentTracking.requested),
-    };
     current.thumbnail_request = {
       request_id: requestId,
       project_uid: current.project_uid,
+      project_cache_uid: current.project_cache_uid,
       manifest_signature: current.manifest_signature,
       scan_revision: current.scan_revision,
       asset_library_ids: currentIds,
     };
     current.thumbnail_result = {};
     current.thumbnail_busy = true;
-    currentIds.forEach((key) => currentTracking.requested.add(key));
+    currentIds.forEach((key) => {
+      currentTracking.requested.add(key);
+      currentTracking.inflight.set(key, requestId);
+    });
     container.__hmbImageAssetThumbnailPendingRequestId = requestId;
     container.__hmbImageAssetLatestState = current;
-    const revisionBaseline = {
-      uiEditRevision: current[IMAGE_ASSET_UI_EDIT_REVISION_KEY],
-      currentScanRevision: container.__hmbImageAssetCurrentScanRevision,
-      currentUiEditRevision: container.__hmbImageAssetCurrentUiEditRevision,
-      latestLocalUiEditRevision: container.__hmbImageAssetLatestLocalUiEditRevision,
+    const bridgeRequest = {
+      schema: "hmb-image-asset-thumbnail-bridge",
+      version: 1,
+      operation: "hydrate",
+      phase: "request",
+      runtime_instance_id: runtimeId,
+      request_id: requestId,
+      project_uid: current.project_uid,
+      project_cache_uid: current.project_cache_uid,
+      manifest_signature: current.manifest_signature,
+      scan_revision: current.scan_revision,
+      asset_library_ids: [...currentIds],
     };
-    emit(props, current, container, () => {
-      current.thumbnail_request = presentationBaseline.thumbnailRequest;
-      current.thumbnail_result = presentationBaseline.thumbnailResult;
-      current.thumbnail_busy = presentationBaseline.thumbnailBusy;
-      currentTracking.requested.clear();
-      presentationBaseline.requestedIds.forEach((key) => currentTracking.requested.add(key));
-      if (presentationBaseline.pendingRequestId) {
-        container.__hmbImageAssetThumbnailPendingRequestId =
-          presentationBaseline.pendingRequestId;
-      } else {
-        delete container.__hmbImageAssetThumbnailPendingRequestId;
+    // Own one bounded lease for both the compact bridge and legacy transport.
+    // A lost result gets one idempotent same-request probe, then becomes a
+    // static failure marker instead of an infinite animation.
+    hmbArmImageAssetThumbnailWatchdog(container, current, props, bridgeRequest);
+    const preservePendingForWatchdog = () => {
+      const live = container.__hmbImageAssetLatestState || current;
+      if (
+        clean(container.__hmbImageAssetThumbnailPendingRequestId) !== requestId
+        || imageAssetThumbnailContextKey(live) !== currentTracking.contextKey
+      ) return false;
+      // The transport itself can fail before the backend sees the request.
+      // Keep the exact request lease alive: its watchdog performs one bounded
+      // idempotent probe and then turns every affected loader into a static
+      // failure marker. Rolling back here would remove that only wake-up path.
+      current.thumbnail_request = {
+        request_id: requestId,
+        project_uid: bridgeRequest.project_uid,
+        project_cache_uid: bridgeRequest.project_cache_uid,
+        manifest_signature: bridgeRequest.manifest_signature,
+        scan_revision: bridgeRequest.scan_revision,
+        asset_library_ids: [...bridgeRequest.asset_library_ids],
+      };
+      current.thumbnail_result = {};
+      current.thumbnail_busy = true;
+      currentIds.forEach((key) => {
+        currentTracking.requested.add(key);
+        currentTracking.inflight.set(key, requestId);
+      });
+      container.__hmbImageAssetLatestState = current;
+      return true;
+    };
+    if (bridgeDispatch) {
+      try {
+        const dispatched = bridgeDispatch(bridgeRequest);
+        if (dispatched && typeof dispatched.then === "function") {
+          Promise.resolve(dispatched).catch(preservePendingForWatchdog);
+        }
+      } catch (_error) {
+        preservePendingForWatchdog();
       }
-      current[IMAGE_ASSET_UI_EDIT_REVISION_KEY] = hmbNormalizeImageAssetRevision(
-        revisionBaseline.uiEditRevision,
-      );
-      container.__hmbImageAssetCurrentScanRevision = revisionBaseline.currentScanRevision;
-      container.__hmbImageAssetCurrentUiEditRevision = revisionBaseline.currentUiEditRevision;
-      container.__hmbImageAssetLatestLocalUiEditRevision =
-        revisionBaseline.latestLocalUiEditRevision;
-    }, {
+      return;
+    }
+    emit(props, current, container, preservePendingForWatchdog, {
       suppressMatchingEcho: true,
       preserveUiEditRevision: true,
       onSuccess: () => {
@@ -2382,6 +3281,175 @@ export function hmbScheduleImageAssetThumbnailRequest(
       },
     });
   });
+  return true;
+}
+
+function imageAssetCatalogProbeDelay(kind) {
+  const background = typeof document !== "undefined"
+    && (document.hidden || document.visibilityState === "hidden");
+  const table = background
+    ? IMAGE_ASSET_CATALOG_PROBE_BACKGROUND_MS
+    : IMAGE_ASSET_CATALOG_PROBE_ACTIVE_MS;
+  return table[kind] || table.folder;
+}
+
+function imageAssetCatalogProbeContext(state) {
+  const runtimeId = imageAssetThumbnailRuntimeId(state);
+  const projectUid = clean(state?.project_uid);
+  const projectCacheUid = clean(state?.project_cache_uid);
+  const projectRoot = clean(state?.project_root || state?.catalog_root).replaceAll("\\", "/");
+  if (!runtimeId || !projectUid || !projectRoot) return null;
+  return {
+    runtimeId,
+    projectUid,
+    projectCacheUid,
+    projectRoot,
+    manifestSignature: clean(state?.manifest_signature),
+    scanRevision: hmbNormalizeImageAssetRevision(state?.scan_revision),
+    key: [
+      runtimeId,
+      hmbImageAssetPresentationCacheKey(state),
+      projectRoot,
+      hmbNormalizeImageAssetRevision(state?.scan_revision),
+    ].join("\n"),
+  };
+}
+
+export function hmbAcceptImageAssetCatalogProbeResult(container, state, result) {
+  const context = imageAssetCatalogProbeContext(state);
+  if (
+    !container
+    || !context
+    || clean(result?.schema) !== "hmb-image-asset-thumbnail-bridge"
+    || clean(result?.operation) !== "catalog_probe"
+    || clean(result?.phase) !== "result"
+    || clean(result?.runtime_instance_id) !== context.runtimeId
+    || clean(result?.project_uid) !== context.projectUid
+    || (clean(result?.project_cache_uid)
+      && clean(result?.project_cache_uid) !== context.projectCacheUid)
+    || clean(result?.manifest_signature) !== context.manifestSignature
+    || hmbNormalizeImageAssetRevision(result?.scan_revision) !== context.scanRevision
+  ) return false;
+  const kind = clean(result?.probe_kind);
+  if (kind !== "manifest" && kind !== "folder") return false;
+  if (!["no_change", "changed", "deferred", "offline"].includes(clean(result?.outcome))) {
+    return false;
+  }
+  const pending = container.__hmbImageAssetCatalogProbePending;
+  const request = pending instanceof Map ? pending.get(kind) : null;
+  if (request && clean(request.requestId) !== clean(result?.request_id)) return false;
+  pending?.delete?.(kind);
+  return true;
+}
+
+function hmbClearImageAssetCatalogProbeTimers(container) {
+  const timers = container?.__hmbImageAssetCatalogProbeTimers;
+  if (timers instanceof Map && typeof clearTimeout === "function") {
+    for (const timer of timers.values()) {
+      try { clearTimeout(timer); } catch (_error) {}
+    }
+  }
+  timers?.clear?.();
+}
+
+export function hmbStopImageAssetCatalogPolling(container) {
+  if (!container) return false;
+  hmbClearImageAssetCatalogProbeTimers(container);
+  const visibilityHandler = container.__hmbImageAssetCatalogVisibilityHandler;
+  if (visibilityHandler && typeof document !== "undefined") {
+    try { document.removeEventListener?.("visibilitychange", visibilityHandler); } catch (_error) {}
+  }
+  delete container.__hmbImageAssetCatalogVisibilityHandler;
+  delete container.__hmbImageAssetCatalogProbeTimers;
+  delete container.__hmbImageAssetCatalogProbePending;
+  delete container.__hmbImageAssetCatalogProbeContextKey;
+  return true;
+}
+
+export function hmbStartImageAssetCatalogPolling(container, state) {
+  if (!container || typeof setTimeout !== "function") return false;
+  const liveState = container.__hmbImageAssetLatestState || state;
+  const context = imageAssetCatalogProbeContext(liveState);
+  const bridge = context
+    ? imageAssetThumbnailBridgeRegistry()?.get(context.runtimeId)
+    : null;
+  if (!context || typeof bridge?.dispatch !== "function") return false;
+  if (container.__hmbImageAssetCatalogProbeContextKey !== context.key) {
+    hmbStopImageAssetCatalogPolling(container);
+    container.__hmbImageAssetCatalogProbeContextKey = context.key;
+    container.__hmbImageAssetCatalogProbeTimers = new Map();
+    container.__hmbImageAssetCatalogProbePending = new Map();
+  }
+  const timers = container.__hmbImageAssetCatalogProbeTimers;
+  const pending = container.__hmbImageAssetCatalogProbePending;
+
+  const schedule = (kind) => {
+    if (timers.has(kind)) return;
+    const delay = imageAssetCatalogProbeDelay(kind);
+    const timer = setTimeout(() => {
+      timers.delete(kind);
+      const current = container.__hmbImageAssetLatestState || liveState;
+      const currentContext = imageAssetCatalogProbeContext(current);
+      if (
+        !currentContext
+        || currentContext.key !== container.__hmbImageAssetCatalogProbeContextKey
+      ) return;
+      const currentBridge = imageAssetThumbnailBridgeRegistry()?.get(currentContext.runtimeId);
+      const dispatch = typeof currentBridge?.dispatch === "function"
+        ? currentBridge.dispatch
+        : null;
+      const previous = pending.get(kind);
+      const currentDelay = imageAssetCatalogProbeDelay(kind);
+      if (
+        !current.scan_busy
+        && dispatch
+        && (!previous || Date.now() - previous.startedAt >= currentDelay * 2)
+      ) {
+        const requestId = `catalog-${kind}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        const request = {
+          schema: "hmb-image-asset-thumbnail-bridge",
+          version: 1,
+          operation: "catalog_probe",
+          phase: "request",
+          request_id: requestId,
+          runtime_instance_id: currentContext.runtimeId,
+          project_uid: currentContext.projectUid,
+          project_cache_uid: currentContext.projectCacheUid,
+          project_root: currentContext.projectRoot,
+          manifest_signature: currentContext.manifestSignature,
+          scan_revision: currentContext.scanRevision,
+          probe_kind: kind,
+        };
+        pending.set(kind, { requestId, startedAt: Date.now() });
+        try {
+          const dispatched = dispatch(request);
+          if (dispatched && typeof dispatched.then === "function") {
+            Promise.resolve(dispatched).catch(() => pending.delete(kind));
+          }
+        } catch (_error) {
+          pending.delete(kind);
+        }
+      }
+      schedule(kind);
+    }, delay);
+    timers.set(kind, timer);
+  };
+
+  schedule("manifest");
+  schedule("folder");
+  if (
+    !container.__hmbImageAssetCatalogVisibilityHandler
+    && typeof document !== "undefined"
+    && typeof document.addEventListener === "function"
+  ) {
+    const visibilityHandler = () => {
+      hmbClearImageAssetCatalogProbeTimers(container);
+      schedule("manifest");
+      schedule("folder");
+    };
+    container.__hmbImageAssetCatalogVisibilityHandler = visibilityHandler;
+    document.addEventListener("visibilitychange", visibilityHandler);
+  }
   return true;
 }
 
@@ -2436,11 +3504,8 @@ export function hmbReconcileImageAssetCatalog(container, state, options = {}) {
   template.innerHTML = rendered.markup;
   const desired = template.content?.firstElementChild;
   if (desired) hmbPatchImageAssetElement(grid, desired);
-  const cardMap = new Map();
-  grid.querySelectorAll?.("[data-asset-key]").forEach((card) => {
-    cardMap.set(clean(card.getAttribute?.("data-asset-key")), card);
-  });
-  container.__hmbImageAssetCardByLibraryId = cardMap;
+  hmbRebuildImageAssetIndexes(container, state);
+  const cardMap = container.__hmbImageAssetCardByLibraryId || new Map();
   return {
     total: rendered.matches.length,
     rendered: rendered.rendered.length,
@@ -2905,6 +3970,12 @@ export function hmbApplyImageAssetSelectionFeedback(container, state, options = 
     ...options,
     shot,
   });
+  const selectedCardById = new Map();
+  tray?.querySelectorAll?.("[data-selected-key]").forEach((card) => {
+    const key = clean(card.getAttribute?.("data-selected-key"));
+    if (key) selectedCardById.set(key, card);
+  });
+  container.__hmbImageAssetSelectedCardByLibraryId = selectedCardById;
   const status = container.querySelector?.(".toolbar-status strong");
   if (status && !state.error && !state.asset_registration_result?.message) {
     const summary = hmbImageAssetStatusSummary(state);
@@ -3263,6 +4334,8 @@ function renderRegistrationDialog(state, draft) {
     draft.image_main_type,
     draft.image_sub_type,
   );
+  const thumbnailSource = imageSource(asset);
+  const thumbnailFailed = !thumbnailSource && hmbImageAssetThumbnailFailed(asset);
   return `
     <div class="asset-registration-backdrop" data-registration-backdrop>
       <section class="asset-passport" role="dialog" aria-modal="true" aria-labelledby="asset-registration-title">
@@ -3270,7 +4343,7 @@ function renderRegistrationDialog(state, draft) {
           <div><small>${escapeHtml(imageAssetText(state, "hmb_project_asset"))}</small><h2 id="asset-registration-title">${escapeHtml(imageAssetText(state, "asset_passport"))}</h2></div>
           <button type="button" data-registration-cancel aria-label="${escapeHtml(imageAssetText(state, "close_registration"))}">&times;</button>
         </header>
-        <div class="passport-photo ${imageSource(asset) ? "" : "fallback thumbnail-loading"}" data-thumbnail-loading="${imageSource(asset) ? "false" : "true"}">${thumbnailImageMarkup(asset)}</div>
+        <div class="passport-photo ${thumbnailSource ? "" : thumbnailFailed ? "fallback thumbnail-failed" : "fallback thumbnail-loading"}" data-thumbnail-loading="${thumbnailSource || thumbnailFailed ? "false" : "true"}" data-thumbnail-failed="${thumbnailFailed ? "true" : "false"}">${thumbnailImageMarkup(asset)}</div>
         <div class="passport-file"><b>${escapeHtml(asset.relative_path || asset.path || asset.media_ref_kind)}</b><span>${asset.width && asset.height ? `${asset.width} × ${asset.height}` : escapeHtml(imageAssetText(state, "metadata_pending"))}</span></div>
         <div class="passport-fields">
           ${registrationFolderField(state, draft, externalImport)}
@@ -3337,10 +4410,11 @@ function renderImageAssetCompactAsset(asset, index, shotUuid) {
   const key = sourceUid || clean(asset?.asset_library_id) || `compact-${index}`;
   const name = clean(asset?.image_name) || clean(asset?.asset_id) || `Image ${index + 1}`;
   const source = imageSource(asset || {});
+  const failed = !source && hmbImageAssetThumbnailFailed(asset);
   const media = source
     ? `<img data-hmb-compact-src="${escapeHtml(source)}" alt="" draggable="false" loading="lazy" decoding="async" fetchpriority="low"/>`
-    : `<span class="compact-shot-placeholder" aria-hidden="true"></span>`;
-  return `<article class="compact-shot-asset ${source ? "" : "thumbnail-loading"}" data-thumbnail-loading="${source ? "false" : "true"}" data-compact-asset-key="${escapeHtml(key)}" data-shot-source-uid="${escapeHtml(sourceUid)}" data-shot-uuid="${escapeHtml(shotUuid)}" data-compact-order="${index + 1}" title="${escapeHtml(name)}">
+    : `<span class="compact-shot-placeholder" aria-hidden="true">${imageAssetThumbnailFallbackMarkup(asset)}</span>`;
+  return `<article class="compact-shot-asset ${source ? "" : failed ? "thumbnail-failed" : "thumbnail-loading"}" data-thumbnail-loading="${source || failed ? "false" : "true"}" data-thumbnail-failed="${failed ? "true" : "false"}" data-compact-asset-key="${escapeHtml(key)}" data-shot-source-uid="${escapeHtml(sourceUid)}" data-shot-uuid="${escapeHtml(shotUuid)}" data-compact-order="${index + 1}" title="${escapeHtml(name)}">
       <div class="compact-shot-thumb">${media}<small>${String(index + 1).padStart(2, "0")}</small></div>
       <b>${escapeHtml(name)}</b>
     </article>`;
@@ -3371,54 +4445,96 @@ function hmbPatchImageAssetThumbnailFragment(current, markup) {
   return Boolean(desired && hmbPatchImageAssetElement(current, desired));
 }
 
+function hmbRebuildImageAssetIndexes(container, state) {
+  if (!container || !state) return false;
+  const assetsById = new Map();
+  const assetsBySourceUid = new Map();
+  state.assets.forEach((asset) => {
+    const assetId = clean(asset.asset_library_id);
+    const sourceUid = clean(asset.source_uid);
+    if (assetId) assetsById.set(assetId, asset);
+    if (sourceUid) assetsBySourceUid.set(sourceUid, asset);
+  });
+  const cardById = new Map();
+  const selectedById = new Map();
+  const compactById = new Map();
+  container.querySelectorAll?.("[data-asset-key]").forEach((card) => {
+    const key = clean(card.getAttribute?.("data-asset-key"));
+    if (key) cardById.set(key, card);
+  });
+  container.querySelectorAll?.("[data-selected-key]").forEach((card) => {
+    const key = clean(card.getAttribute?.("data-selected-key"));
+    if (key) selectedById.set(key, card);
+  });
+  container.querySelectorAll?.("[data-compact-asset-key]").forEach((card) => {
+    const sourceUid = clean(card.getAttribute?.("data-shot-source-uid"));
+    const assetId = clean(assetsBySourceUid.get(sourceUid)?.asset_library_id);
+    if (!assetId) return;
+    const cards = compactById.get(assetId) || [];
+    cards.push(card);
+    compactById.set(assetId, cards);
+  });
+  container.__hmbImageAssetByLibraryId = assetsById;
+  container.__hmbImageAssetBySourceUid = assetsBySourceUid;
+  container.__hmbImageAssetCardByLibraryId = cardById;
+  container.__hmbImageAssetSelectedCardByLibraryId = selectedById;
+  container.__hmbImageAssetCompactCardsByLibraryId = compactById;
+  return true;
+}
+
 export function hmbPatchImageAssetThumbnailMedia(container, state, assetLibraryIds) {
   if (!container || !state) return 0;
   const changed = new Set(uniqueStrings(assetLibraryIds));
   if (!changed.size) return 0;
-  const assetsById = new Map(
-    state.assets.map((asset) => [clean(asset.asset_library_id), asset]),
-  );
-  const assetsBySourceUid = new Map(
-    state.assets.map((asset) => [clean(asset.source_uid), asset]),
-  );
+  if (!(container.__hmbImageAssetByLibraryId instanceof Map)) {
+    hmbRebuildImageAssetIndexes(container, state);
+  }
+  const assetsById = container.__hmbImageAssetByLibraryId;
   let patched = 0;
-  Array.from(container.querySelectorAll?.("[data-asset-key]") || []).forEach((card) => {
-    const asset = assetsById.get(clean(card.getAttribute?.("data-asset-key")));
-    const thumbnail = card.querySelector?.(".asset-thumb");
-    if (!asset || !thumbnail || !changed.has(asset.asset_library_id)) return;
+  changed.forEach((assetLibraryId) => {
+    const asset = assetsById.get(assetLibraryId);
+    const card = container.__hmbImageAssetCardByLibraryId?.get(assetLibraryId);
+    const thumbnail = card?.querySelector?.(".asset-thumb");
+    if (!asset || !thumbnail) return;
     if (hmbPatchImageAssetThumbnailFragment(thumbnail, assetThumbnailHtml(asset, state))) {
       patched += 1;
     }
   });
-  Array.from(container.querySelectorAll?.("[data-selected-key]") || []).forEach((card) => {
-    const asset = assetsById.get(clean(card.getAttribute?.("data-selected-key")));
-    const thumbnail = card.querySelector?.(".selected-thumb");
-    if (!asset || !thumbnail || !changed.has(asset.asset_library_id)) return;
+  changed.forEach((assetLibraryId) => {
+    const asset = assetsById.get(assetLibraryId);
+    const card = container.__hmbImageAssetSelectedCardByLibraryId?.get(assetLibraryId);
+    const thumbnail = card?.querySelector?.(".selected-thumb");
+    if (!asset || !thumbnail) return;
     if (hmbPatchImageAssetThumbnailFragment(
       thumbnail,
       thumbnailHtml(asset, "selected-thumb"),
     )) patched += 1;
   });
-  Array.from(container.querySelectorAll?.("[data-compact-asset-key]") || []).forEach((card) => {
-    const asset = assetsBySourceUid.get(clean(card.getAttribute?.("data-shot-source-uid")));
-    if (!asset || !changed.has(asset.asset_library_id)) return;
-    const index = Math.max(0, Number(card.getAttribute?.("data-compact-order")) - 1 || 0);
-    const shotUuid = clean(card.getAttribute?.("data-shot-uuid"));
-    if (hmbPatchImageAssetThumbnailFragment(
-      card,
-      renderImageAssetCompactAsset(asset, index, shotUuid),
-    )) patched += 1;
+  changed.forEach((assetLibraryId) => {
+    const asset = assetsById.get(assetLibraryId);
+    const cards = container.__hmbImageAssetCompactCardsByLibraryId?.get(assetLibraryId) || [];
+    if (!asset) return;
+    cards.forEach((card) => {
+      const index = Math.max(0, Number(card.getAttribute?.("data-compact-order")) - 1 || 0);
+      const shotUuid = clean(card.getAttribute?.("data-shot-uuid"));
+      if (hmbPatchImageAssetThumbnailFragment(
+        card,
+        renderImageAssetCompactAsset(asset, index, shotUuid),
+      )) patched += 1;
+    });
   });
   const draftId = clean(container.__hmbImageAssetRegistrationDraft?.asset_library_id);
   if (draftId && changed.has(draftId)) {
     const asset = assetsById.get(draftId);
     const passport = container.querySelector?.(".passport-photo");
+    const source = imageSource(asset || {});
+    const failed = !source && hmbImageAssetThumbnailFailed(asset);
     if (
       asset
       && passport
       && hmbPatchImageAssetThumbnailFragment(
         passport,
-        `<div class="passport-photo ${imageSource(asset) ? "" : "fallback thumbnail-loading"}" data-thumbnail-loading="${imageSource(asset) ? "false" : "true"}">${thumbnailImageMarkup(asset)}</div>`,
+        `<div class="passport-photo ${source ? "" : failed ? "fallback thumbnail-failed" : "fallback thumbnail-loading"}" data-thumbnail-loading="${source || failed ? "false" : "true"}" data-thumbnail-failed="${failed ? "true" : "false"}">${thumbnailImageMarkup(asset)}</div>`,
       )
     ) patched += 1;
   }
@@ -3482,6 +4598,7 @@ export function hmbPatchCompactImageAssetState(container, state) {
   root.style?.setProperty?.("--active-shot-rgb", palette.rgb);
   hmbSetImageAssetCompactThumbnailsActive(summary, !summary.hidden);
   container.__hmbImageAssetLatestState = state;
+  hmbRebuildImageAssetIndexes(container, state);
   container.__hmbImageAssetExpandedDirty = true;
   if (container.__hmbImageAssetExpandedGeometry) {
     hmbSetImageAssetCompactShellGeometry(container, true);
@@ -3528,7 +4645,9 @@ function render(
       .workspace{display:grid;grid-template-columns:minmax(230px,252px) minmax(0,1fr);gap:8px;min-height:0;padding:8px}.panel{min-height:0;border:1px solid var(--line);border-radius:9px;background:rgba(8,13,23,.76);overflow:hidden}.tree-panel{display:flex;flex-direction:column}.panel-title{height:35px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 10px;border-bottom:1px solid var(--line);background:rgba(19,27,42,.78);color:#bed0e3;font-size:9px;font-weight:900;letter-spacing:.07em}.panel-title>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;word-break:keep-all}.panel-title b{flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--accent);font-size:8px}.tree{padding:6px;overflow:auto;scrollbar-gutter:stable}.tree-row{width:100%;min-height:30px;display:grid;grid-template-columns:13px minmax(0,1fr) auto;align-items:center;gap:5px;margin:0 0 3px;padding:5px 8px 5px calc(8px + var(--tree-depth,0) * 14px);border:1px solid transparent;border-radius:6px;background:transparent;color:#96a9bd;font-size:8px;text-align:left;cursor:pointer;transition:border-color 120ms ease,background-color 120ms ease,color 120ms ease}.tree-row i{color:#61778c;font-style:normal}.tree-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tree-row b{color:#587087}.tree-row:hover{border-color:rgba(34,211,238,.3);color:#def9ff}.tree-row.active{border-color:rgba(34,211,238,.52);background:linear-gradient(90deg,rgba(8,145,178,.2),rgba(8,145,178,.04));color:#e7fcff}.tree-row.root{min-height:35px;color:#fff;font-size:10px;font-weight:850}
       .assets-panel{display:flex;flex-direction:column}.toolbar{height:44px;display:flex;align-items:center;gap:8px;padding:7px 9px;border-bottom:1px solid var(--line)}.toolbar input{flex:1;height:30px;border:1px solid rgba(148,163,184,.25);border-radius:7px;background:#070c15;color:#edf5ff;padding:0 9px;font-size:9px;outline:none}.toolbar input:focus{border-color:var(--accent)}.filter-chip{max-width:260px;padding:5px 8px;border:1px solid rgba(244,114,182,.3);border-radius:99px;background:rgba(131,24,67,.1);color:#f8c6df;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-scroll{flex:1;min-height:0;overflow:auto;scrollbar-gutter:stable;padding:9px}.asset-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px}.asset-card{display:grid;grid-template-columns:112px minmax(0,1fr);gap:10px;min-height:152px;padding:9px;border:1px solid rgba(148,163,184,.16);border-radius:9px;background:linear-gradient(145deg,rgba(19,27,42,.86),rgba(9,14,24,.82));cursor:pointer;outline:none;content-visibility:auto;contain-intrinsic-size:167px;transition:border-color 120ms ease,box-shadow 120ms ease,background-color 120ms ease,opacity 120ms ease}.asset-card:hover{border-color:rgba(34,211,238,.34)}.asset-card:focus-visible{box-shadow:0 0 0 2px rgba(34,211,238,.45)}.asset-card.selected{border-color:var(--asset-selection);box-shadow:inset 0 0 0 .3px rgba(244,114,182,.45),0 0 15px rgba(244,114,182,.34),0 0 4px rgba(217,70,239,.55)}.asset-card.selection-blocked{opacity:.58}.asset-card.unregistered{cursor:default}.asset-card.unregistered .asset-state{color:#f3a8ce}.asset-thumb{position:relative;width:112px;height:132px;display:grid;grid-template-rows:2fr 1fr;overflow:hidden;border:1px solid rgba(148,163,184,.2);border-radius:7px;background:#050910;color:#648198;font-size:9px;font-weight:900}.asset-thumb-media{position:relative;display:grid;place-items:center;min-height:0;overflow:hidden;border-bottom:1px solid rgba(148,163,184,.18)}.asset-thumb-media img{width:100%;height:100%;object-fit:cover}.asset-thumb-media>span{display:none}.asset-thumb.fallback .asset-thumb-media img{display:none}.asset-thumb.fallback .asset-thumb-media>span{display:block}.asset-thumb-footer{display:flex;align-items:center;justify-content:center;gap:6px;min-height:0;padding:4px 6px;background:linear-gradient(180deg,#080d16,#050810)}.asset-source-name{min-width:0;flex:1;color:#a8bdd0;font-size:8px;font-weight:800;line-height:1.25;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-extension-badge{flex:0 0 auto;max-width:48px;padding:3px 5px;border:1px solid rgba(34,211,238,.4);border-radius:5px;background:rgba(8,145,178,.1);color:var(--accent);font-family:inherit;font-size:7px;font-weight:900;line-height:1;letter-spacing:.07em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-thumb-media .asset-add{position:absolute;right:5px;bottom:5px;z-index:2}.asset-add{min-width:56px;height:25px;padding:0 13px;border:1px solid rgba(244,114,182,.7);border-radius:99px;background:rgba(131,24,67,.26);color:#ffd5eb;font-size:9px;font-weight:950;letter-spacing:.04em;cursor:pointer;box-shadow:0 0 10px rgba(244,114,182,.16)}.asset-add:hover{border-color:#f9a8d4;background:rgba(190,24,93,.32);box-shadow:0 0 13px rgba(244,114,182,.3)}.asset-content{display:flex;flex-direction:column;gap:8px}.asset-title{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.asset-title-copy{display:flex;flex:1;flex-direction:column;gap:2px;min-width:0}.asset-state{color:var(--accent);font-size:7px;font-weight:900}.asset-id-line{display:flex;align-items:center;gap:5px;min-width:0;color:#9bacc0;font-size:7px;font-weight:500}.asset-id-line em{flex:0 0 auto;color:#6e859c;font-size:6px;font-style:normal;font-weight:900;letter-spacing:.05em}.asset-id-line span{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-meta{display:flex;flex-direction:column;gap:3px;color:#71879c;font-size:7px}.asset-meta b,.asset-meta span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.asset-meta b{color:#bcd0e2}.empty{grid-column:1/-1;padding:30px;border:1px dashed rgba(148,163,184,.2);border-radius:8px;color:#667e94;font-size:9px;text-align:center}.warnings{max-height:64px;overflow:auto;padding:6px 9px;border-top:1px solid rgba(251,191,36,.2);background:rgba(120,53,15,.1);color:#fcd34d;font-size:7px}
       .asset-window-nav{grid-column:1/-1;display:flex;justify-content:center;gap:8px}.asset-window-more{min-width:160px;min-height:34px;border:1px solid rgba(34,211,238,.3);border-radius:8px;background:rgba(8,145,178,.1);color:#a5f3fc;font-size:9px;font-weight:850;cursor:pointer}.asset-window-more:hover,.asset-window-more:focus-visible{border-color:var(--accent);outline:none;background:rgba(8,145,178,.18)}
-      @keyframes hmb-image-thumbnail-loading{0%{background-position:120% 0}100%{background-position:-120% 0}}.thumbnail-loading .thumbnail-placeholder,.thumbnail-loading .asset-thumb-placeholder,.thumbnail-loading .compact-shot-placeholder{display:block;width:100%;height:100%;background:linear-gradient(100deg,rgba(31,41,55,.72) 20%,rgba(71,85,105,.72) 42%,rgba(31,41,55,.72) 64%);background-size:220% 100%;animation:hmb-image-thumbnail-loading 1.25s ease-in-out infinite}.thumbnail-loading .thumbnail-placeholder{min-width:100%;min-height:100%}@media (prefers-reduced-motion:reduce){.thumbnail-loading .thumbnail-placeholder,.thumbnail-loading .asset-thumb-placeholder,.thumbnail-loading .compact-shot-placeholder{animation:none;background:rgba(31,41,55,.78)}}
+      @keyframes hmb-image-leaf-pulse{0%,12.5%{opacity:1;filter:brightness(1.65);box-shadow:0 0 7px rgba(226,232,240,.42)}37.5%,100%{opacity:.2;filter:brightness(.62);box-shadow:none}}.thumbnail-loading .thumbnail-placeholder,.thumbnail-loading .asset-thumb-placeholder,.thumbnail-loading .compact-shot-placeholder{display:grid!important;width:100%;height:100%;place-items:center;background:rgba(5,9,16,.82)}.thumbnail-loading .thumbnail-placeholder{min-width:100%;min-height:100%}.hmb-image-leaf-loader{position:relative;display:block!important;pointer-events:none;width:38px!important;height:38px!important;min-width:38px!important;min-height:38px!important;background:transparent!important}.hmb-image-leaf-loader>i{--leaf-angle:calc(var(--leaf-index) * 45deg);position:absolute;left:50%;top:50%;width:6px;height:12px;margin:-6px 0 0 -3px;border-radius:90% 12% 90% 12%;background:linear-gradient(135deg,#fff 4%,#cbd5e1 48%,#64748b 100%);transform:rotate(var(--leaf-angle)) translateY(-13px) rotate(45deg);transform-origin:50% 50%;opacity:.2;animation:hmb-image-leaf-pulse 1s linear infinite;animation-delay:calc(var(--leaf-index) * .125s)}@media (prefers-reduced-motion:reduce){.hmb-image-leaf-loader>i{animation:none;opacity:.45;filter:none;box-shadow:none}.hmb-image-leaf-loader>i:first-child{opacity:.9}}
+      .hmb-image-leaf-loader,.hmb-image-leaf-loader *{pointer-events:none}
+      .thumbnail-failed .thumbnail-placeholder,.thumbnail-failed .asset-thumb-placeholder,.thumbnail-failed .compact-shot-placeholder{display:grid!important;width:100%;height:100%;place-items:center;background:rgba(5,9,16,.82)}.thumbnail-failed .thumbnail-placeholder{min-width:100%;min-height:100%}.hmb-image-thumbnail-unavailable{display:grid!important;place-items:center;width:30px!important;height:30px!important;border:1px solid rgba(248,113,113,.42);border-radius:50%;background:rgba(69,10,10,.36)!important;color:#fca5a5;font-size:15px;font-weight:950;line-height:1}.thumbnail-failed{animation:none!important}
       .shot-panel .shot-rename{width:29px;height:29px;flex:0 0 29px;padding:0;border:1px solid rgba(var(--shot-rgb),.42);border-radius:7px;background:rgba(var(--shot-rgb),.10);color:var(--shot-accent);font-size:13px;cursor:pointer}.shot-panel .shot-rename:hover,.shot-panel .shot-rename:focus-visible{border-color:var(--shot-accent);background:rgba(var(--shot-rgb),.22);outline:none}.shot-name-input{width:min(180px,100%);height:24px;border:1px solid var(--shot-accent);border-radius:5px;background:#060b13;color:#f8fafc;padding:0 6px;font:inherit;outline:none;box-shadow:0 0 0 2px rgba(var(--shot-rgb),.2)}
       .toolbar-status{flex:0 0 190px;width:190px;min-width:190px;height:30px;display:flex;align-items:center;justify-content:flex-end;overflow:hidden;color:var(--muted);font-size:8px}.toolbar-status strong{display:block;width:100%;color:${state.error ? "#fda4af" : "#86efac"};font-variant-numeric:tabular-nums;letter-spacing:-.02em;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.toolbar .filter-chip{flex:0 0 120px;width:120px;max-width:120px;text-align:center}
       .asset-view-toggle{flex:0 0 31px;width:31px;height:30px;display:grid;place-items:center;padding:0;border:1px solid rgba(96,165,250,.46);border-radius:7px;background:linear-gradient(180deg,rgba(37,99,235,.2),rgba(15,23,42,.88));color:#7dd3fc;cursor:pointer}.asset-view-toggle:hover,.asset-view-toggle:focus-visible,.asset-view-toggle[aria-pressed="true"]{border-color:var(--accent);background:linear-gradient(180deg,rgba(37,99,235,.38),rgba(15,23,42,.94));color:#e0f2fe;outline:none;box-shadow:0 0 10px rgba(34,211,238,.2)}.asset-view-toggle svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
@@ -4501,6 +5620,9 @@ function installEvents(container, state, props, remount, listeners) {
       project_root: state.project_root,
       project_id: state.project_id,
       project_uid: state.project_uid,
+      project_cache_uid: state.project_cache_uid,
+      manifest_signature: state.manifest_signature,
+      folder_signature: state.folder_signature,
       selected_folder_path: state.selected_folder_path,
       expanded_folders: [...state.expanded_folders],
       selected_main_type: state.selected_main_type,
@@ -4654,6 +5776,8 @@ function installEvents(container, state, props, remount, listeners) {
       state.project_root = path;
       state.project_id = "";
       state.project_uid = "";
+      state.project_cache_uid = "";
+      state.folder_signature = "";
       state.selected_folder_path = "";
       state.expanded_folders = [ROOT_FOLDER_KEY];
       state.selected_main_type = "";
@@ -4686,6 +5810,9 @@ function installEvents(container, state, props, remount, listeners) {
     event.preventDefault();
     event.stopPropagation();
     state = container.__hmbImageAssetLatestState || state;
+    // Explicit Refresh is also the user-owned retry boundary for thumbnails
+    // that reached a terminal decode/network failure in the same catalog.
+    hmbResetImageAssetThumbnailRetryState(container, state);
     commitSlowProjectMutation(() => {
       state.refresh_revision = Math.max(0, Number(state.refresh_revision) || 0) + 1;
     });
@@ -5205,6 +6332,8 @@ function installEvents(container, state, props, remount, listeners) {
       state.project_root = "";
       state.project_id = "";
       state.project_uid = "";
+      state.project_cache_uid = "";
+      state.folder_signature = "";
     });
   };
   // PROJECT_ROOT is an explicit host input. Listen only to the actual native
@@ -5248,10 +6377,55 @@ export default function HMBImageAssetLibraryWidget(container, props) {
   };
   rememberNodeInternalsUpdater(props);
   let state = normalizeState(props?.value);
+  hmbRememberImageAssetPresentation(state);
+  hmbAdoptImageAssetPresentation(state);
   container.__hmbImageAssetLatestState = state;
+  hmbAcceptImageAssetThumbnailResult(container, state);
   hmbRememberImageAssetRevisionState(container, state, false);
   let listeners = [];
   let renderRevision = 0;
+
+  const consumeCatalogProbeResult = (result) => hmbAcceptImageAssetCatalogProbeResult(
+    container,
+    container.__hmbImageAssetLatestState || state,
+    result,
+  );
+  const wakeCatalogPolling = () => hmbStartImageAssetCatalogPolling(
+    container,
+    container.__hmbImageAssetLatestState || state,
+  );
+
+  const consumeThumbnailPresentationPatch = (patch) => {
+    const applied = hmbApplyImageAssetThumbnailPresentationPatch(
+      container.__hmbImageAssetLatestState || state,
+      patch,
+    );
+    if (!applied) return false;
+    state = applied.state;
+    container.__hmbImageAssetLatestState = state;
+    hmbAcceptImageAssetThumbnailResult(container, state);
+    hmbPatchImageAssetThumbnailMedia(
+      container,
+      state,
+      applied.changedAssetLibraryIds,
+    );
+    hmbScheduleImageAssetThumbnailRequest(container, state, props, {
+      includeWindow: !container.__hmbImageAssetCompact,
+    });
+    return true;
+  };
+  hmbRegisterImageAssetThumbnailConsumer(
+    container,
+    state,
+    consumeThumbnailPresentationPatch,
+  );
+  hmbRegisterImageAssetCatalogProbeConsumer(
+    container,
+    state,
+    consumeCatalogProbeResult,
+    wakeCatalogPolling,
+  );
+  hmbStartImageAssetCatalogPolling(container, state);
 
   const clearListeners = () => {
     listeners.forEach(([target, type, handler, options]) => {
@@ -5276,11 +6450,27 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     renderRevision += 1;
     if (container.__hmbImageAssetCompact) {
       state = normalizeState(nextState);
+      hmbRememberImageAssetPresentation(state);
+      hmbAdoptImageAssetPresentation(state);
+      hmbApplyImageAssetThumbnailFailurePresentation(container, state);
       hmbRememberImageAssetRevisionState(container, state, false);
       if (typeof container.__hmbImageAssetSearchDraft === "string") {
         state.search = container.__hmbImageAssetSearchDraft.slice(0, 256);
       }
       container.__hmbImageAssetLatestState = state;
+      hmbRegisterImageAssetThumbnailConsumer(
+        container,
+        state,
+        consumeThumbnailPresentationPatch,
+      );
+      hmbRegisterImageAssetCatalogProbeConsumer(
+        container,
+        state,
+        consumeCatalogProbeResult,
+        wakeCatalogPolling,
+      );
+      hmbStartImageAssetCatalogPolling(container, state);
+      hmbResumeImageAssetThumbnailRequest(container, state, props);
       hmbPatchCompactImageAssetState(container, state);
       hmbScheduleImageAssetThumbnailRequest(container, state, props, {
         includeWindow: false,
@@ -5292,11 +6482,27 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     const reusableImages = detachReusableImageAssets(container);
     clearListeners();
     state = normalizeState(nextState);
+    hmbRememberImageAssetPresentation(state);
+    hmbAdoptImageAssetPresentation(state);
+    hmbApplyImageAssetThumbnailFailurePresentation(container, state);
     hmbRememberImageAssetRevisionState(container, state, false);
     if (typeof container.__hmbImageAssetSearchDraft === "string") {
       state.search = container.__hmbImageAssetSearchDraft.slice(0, 256);
     }
     container.__hmbImageAssetLatestState = state;
+    hmbRegisterImageAssetThumbnailConsumer(
+      container,
+      state,
+      consumeThumbnailPresentationPatch,
+    );
+    hmbRegisterImageAssetCatalogProbeConsumer(
+      container,
+      state,
+      consumeCatalogProbeResult,
+      wakeCatalogPolling,
+    );
+    hmbStartImageAssetCatalogPolling(container, state);
+    hmbResumeImageAssetThumbnailRequest(container, state, props);
     const markup = hmbScopeWidgetStyleMarkup(render(
       state,
       container.__hmbImageAssetRegistrationDraft || null,
@@ -5317,11 +6523,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     restoreReusableImageAssets(container, reusableImages);
     concealNativeProjectRootPicker(container);
     installEvents(container, state, props, remount, listeners);
-    const cardMap = new Map();
-    container.querySelectorAll?.("[data-asset-key]").forEach((card) => {
-      cardMap.set(clean(card.getAttribute?.("data-asset-key")), card);
-    });
-    container.__hmbImageAssetCardByLibraryId = cardMap;
+    hmbRebuildImageAssetIndexes(container, state);
     restoreImageAssetUi(container, state, uiMemory);
     delete container.__hmbImageAssetCompactUiMemory;
     const currentNodeRoot = findNodeRoot(container);
@@ -5352,13 +6554,71 @@ export default function HMBImageAssetLibraryWidget(container, props) {
 
   const applyProps = (nextProps = {}) => {
     rememberNodeInternalsUpdater(nextProps);
-    if (hmbConsumeImageAssetStateEcho(container, nextProps)) {
+    const presentationPatch = hmbApplyImageAssetThumbnailPresentationPatch(
+      container.__hmbImageAssetLatestState || state,
+      nextProps?.thumbnailPresentationPatch || nextProps?.presentationPatch,
+    );
+    if (presentationPatch) {
+      props = hmbUpdateImageAssetPropsReference(props, nextProps);
+      hmbInvalidateImageAssetPublication(container);
+      state = presentationPatch.state;
+      container.__hmbImageAssetLatestState = state;
+      hmbAcceptImageAssetThumbnailResult(container, state);
+      hmbPatchImageAssetThumbnailMedia(
+        container,
+        state,
+        presentationPatch.changedAssetLibraryIds,
+      );
+      hmbScheduleImageAssetThumbnailRequest(container, state, props, {
+        includeWindow: !container.__hmbImageAssetCompact,
+      });
+      return;
+    }
+    const previousPropValue = props?.value;
+    if (nextProps?.value === previousPropValue) {
+      // A callback-only host update does not change catalog authority. Keep
+      // the new callbacks, but avoid normalizing/stringifying the same O(N)
+      // state again.
+      props = hmbUpdateImageAssetPropsReference(props, nextProps);
+      return;
+    }
+    const incomingState = normalizeState(nextProps?.value);
+    hmbRememberImageAssetPresentation(incomingState);
+    hmbAdoptImageAssetPresentation(incomingState);
+    if (imageAssetThumbnailOnlyTransition(
+      state,
+      incomingState,
+      container.__hmbImageAssetThumbnailPendingRequestId,
+    )) {
+      props = hmbUpdateImageAssetPropsReference(props, nextProps);
+      hmbInvalidateImageAssetPublication(container);
+      const merged = hmbMergeImageAssetThumbnailResponse(
+        state,
+        incomingState,
+        container.__hmbImageAssetThumbnailPendingRequestId,
+      );
+      const completed = hmbImageAssetThumbnailResultIds(merged);
+      state = merged;
+      container.__hmbImageAssetLatestState = state;
+      hmbRebuildImageAssetIndexes(container, state);
+      hmbAcceptImageAssetThumbnailResult(container, state);
+      hmbPatchImageAssetThumbnailMedia(container, state, completed);
+      hmbScheduleImageAssetThumbnailRequest(container, state, props, {
+        includeWindow: !container.__hmbImageAssetCompact,
+      });
+      return;
+    }
+    container.__hmbImageAssetIncomingState = incomingState;
+    const consumedStateEcho = hmbConsumeImageAssetStateEcho(container, nextProps);
+    const incomingSerialized = container.__hmbImageAssetIncomingSerialized;
+    delete container.__hmbImageAssetIncomingSerialized;
+    if (consumedStateEcho) {
       // A delayed local echo is older than both the visible state and the
       // callback set delivered with its newer sibling.  Ignore it wholesale;
       // otherwise the next user action can publish through an obsolete host
       // callback even though the card DOM correctly stayed on the newer state.
       if (container.__hmbImageAssetLastConsumedEchoWasStale) {
-        const incomingThumbnailState = normalizeState(nextProps?.value);
+        const incomingThumbnailState = incomingState;
         const localThumbnailState = container.__hmbImageAssetLatestState || state;
         const priorThumbnailRevision = localThumbnailState.thumbnail_revision;
         const merged = hmbMergeImageAssetThumbnailResponse(
@@ -5369,11 +6629,12 @@ export default function HMBImageAssetLibraryWidget(container, props) {
         if (merged.thumbnail_revision > priorThumbnailRevision) {
           state = merged;
           container.__hmbImageAssetLatestState = state;
+          hmbRebuildImageAssetIndexes(container, state);
           hmbAcceptImageAssetThumbnailResult(container, state);
           hmbPatchImageAssetThumbnailMedia(
             container,
             state,
-            state.thumbnail_result.completed_asset_library_ids,
+            hmbImageAssetThumbnailResultIds(state),
           );
           hmbScheduleImageAssetThumbnailRequest(container, state, props, {
             includeWindow: !container.__hmbImageAssetCompact,
@@ -5401,21 +6662,21 @@ export default function HMBImageAssetLibraryWidget(container, props) {
         return;
       }
       hmbInvalidateImageAssetPublication(container);
-      const nextState = normalizeState(nextProps?.value);
+      const nextState = incomingState;
       hmbAcceptImageAssetThumbnailResult(container, nextState);
       container.__hmbImageAssetPendingAuthoritativeProps = {
         state: nextState,
       };
       return;
     }
-    const previousPropValue = props?.value;
     props = hmbUpdateImageAssetPropsReference(props, nextProps);
-    if (nextProps?.value === previousPropValue) return;
     hmbInvalidateImageAssetPublication(container);
-    const nextState = normalizeState(nextProps?.value);
+    const nextState = incomingState;
     hmbAcceptImageAssetThumbnailResult(container, nextState);
     const currentValue = JSON.stringify(state);
-    const nextValue = JSON.stringify(nextState);
+    const nextValue = typeof incomingSerialized === "string"
+      ? incomingSerialized
+      : JSON.stringify(nextState);
     if (currentValue === nextValue) return;
     if (hmbDeferImageAssetPropsDuringRegistration(container, props)) return;
     remount(nextState);
@@ -5435,6 +6696,9 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     }
     hmbSetImageAssetNativeResizeLocked(container, false);
     hmbDetachImageAssetRegistryContainer(container);
+    hmbUnregisterImageAssetThumbnailConsumer(container);
+    hmbUnregisterImageAssetCatalogProbeConsumer(container);
+    hmbStopImageAssetCatalogPolling(container);
     hmbInvalidateImageAssetPublication(container);
     // Library removal must be publication-free. A normal structural remount
     // still flushes visible optimistic feedback, but teardown cancels its
@@ -5478,6 +6742,12 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     }
     delete container.__hmbImageAssetSearchTimer;
     delete container.__hmbImageAssetCardByLibraryId;
+    delete container.__hmbImageAssetByLibraryId;
+    delete container.__hmbImageAssetBySourceUid;
+    delete container.__hmbImageAssetSelectedCardByLibraryId;
+    delete container.__hmbImageAssetCompactCardsByLibraryId;
+    delete container.__hmbImageAssetThumbnailConsumer;
+    delete container.__hmbImageAssetCatalogProbeConsumer;
     delete container.__hmbImageAssetRenderLimit;
     delete container.__hmbImageAssetRenderOffset;
     delete container.__hmbImageAssetExpandedFragment;
