@@ -333,6 +333,99 @@ with tempfile.TemporaryDirectory(prefix="hmb-seedance-reopen-") as temporary:
         == completed_without_outputs_id
     ), "Completed task identity remains available as non-blocking history."
 
+    # A submission_unknown recovery starts with an idempotent client_request
+    # identity.  If Refresh later downloads, verifies, and publishes that
+    # exact result, ``local_succeeded`` is the durable consumed-result proof;
+    # the provisional identity must not keep blocking every later explicit
+    # Run.  This is the saved-state shape produced by the 2026-08-28 field
+    # failure (hmb-* ID, successful local artifact, client_request identity).
+    recovered_client_success_id = "hmb-reopen-client-local-success"
+    recovered_client_success = target.HMBSeedanceGeneration(
+        name="Seedance Recovered Client Request Local Success"
+    )
+    recovered_client_success.parameter_output_values.update(
+        {
+            "video_url": None,
+            "VIDEO_OUT": None,
+            "provider_response": {
+                "transport": "fn_ai_broker",
+                "id": recovered_client_success_id,
+                "status": "succeeded",
+                "provider_task_registered": True,
+            },
+            "generation_id": recovered_client_success_id,
+            "generation_status": "succeeded",
+        }
+    )
+    recovered_client_success.set_parameter_value(
+        target.SEEDANCE_RECOVERY_PARAMETER,
+        {
+            "schema": target.SEEDANCE_RECOVERY_SCHEMA,
+            "version": target.SEEDANCE_RECOVERY_VERSION,
+            "revision": 9,
+            "stage": "local_succeeded",
+            "task_id": recovered_client_success_id,
+            "task_identity": "client_request",
+            "status": "succeeded",
+            "terminal": False,
+            "updated_at_ms": 3,
+            "model_id": target.SEEDANCE_2_5_MODEL_ID,
+            "output_format": "mp4",
+            "return_last_frame": False,
+            "output_file": str(present_path),
+        },
+        initial_setup=True,
+        emit_change=False,
+    )
+    assert (
+        recovered_client_success._generation_recovery_blocks_new_submission()
+        is False
+    )
+    recovered_client_success._assert_new_submission_is_safe()
+
+    # StartFlow may hydrate this durable property before provider_response and
+    # video_url.  The node must therefore accept the completed checkpoint even
+    # when those output caches are not available yet.  ``local_succeeded`` is
+    # backend-authored only after verified atomic publication.
+    early_hydrated_client_success_id = "hmb-reopen-early-hydrated-local-success"
+    early_hydrated_client_success = target.HMBSeedanceGeneration(
+        name="Seedance Early Hydrated Client Request Local Success"
+    )
+    early_hydrated_client_success.parameter_output_values.update(
+        {
+            "video_url": None,
+            "VIDEO_OUT": None,
+            "provider_response": None,
+            "generation_id": early_hydrated_client_success_id,
+            "generation_status": "succeeded",
+        }
+    )
+    early_hydrated_client_success.set_parameter_value(
+        target.SEEDANCE_RECOVERY_PARAMETER,
+        {
+            "schema": target.SEEDANCE_RECOVERY_SCHEMA,
+            "version": target.SEEDANCE_RECOVERY_VERSION,
+            "revision": 10,
+            "stage": "local_succeeded",
+            "task_id": early_hydrated_client_success_id,
+            "task_identity": "client_request",
+            "status": "succeeded",
+            "terminal": False,
+            "updated_at_ms": 4,
+            "model_id": target.SEEDANCE_2_5_MODEL_ID,
+            "output_format": "mp4",
+            "return_last_frame": False,
+            "output_file": str(temporary_root / "unproven-missing.mp4"),
+        },
+        initial_setup=True,
+        emit_change=False,
+    )
+    assert (
+        early_hydrated_client_success._generation_recovery_blocks_new_submission()
+        is False
+    )
+    early_hydrated_client_success._assert_new_submission_is_safe()
+
     # Conversely, remote_succeeded means the paid result has not completed
     # local publication.  A stale video from an earlier render must never make
     # that different task look consumed.
@@ -549,6 +642,80 @@ assert bridge.refresh_calls == [(refresh_id, 60)]
 assert bridge.create_calls == []
 assert refresh_node.parameter_output_values["generation_id"] == refresh_id
 assert refresh_node.parameter_output_values["generation_status"] == "running"
+
+
+class ResolvingClientRequestBridge:
+    def __init__(self) -> None:
+        self.refresh_calls: list[tuple[str, float]] = []
+
+    def refresh_job(self, job_id: str, *, timeout: float = 60):
+        self.refresh_calls.append((job_id, timeout))
+        return {"id": "job-resolved-from-client-request", "status": "running"}
+
+
+# A successful same-job lookup promotes the durable pre-submit identity to the
+# Broker's authoritative task identity.  No create call is involved.
+client_refresh_id = "hmb-reopen-client-request-refresh"
+client_refresh = target.HMBSeedanceGeneration(
+    name="Seedance Resolve Client Request Identity"
+)
+client_refresh._runtime_node_is_live = lambda *, require_registered=False: True
+client_refresh.status_component = SimpleNamespace(
+    clear_execution_status=lambda **_kwargs: None
+)
+client_refresh.parameter_output_values.update(
+    {
+        "generation_id": client_refresh_id,
+        "generation_status": "submission_unknown",
+        "provider_response": {
+            "transport": "fn_ai_broker",
+            "id": client_refresh_id,
+            "status": "submission_unknown",
+        },
+    }
+)
+client_refresh._set_generation_recovery_checkpoint(
+    stage="submission_unknown",
+    task_id=client_refresh_id,
+    task_identity="client_request",
+    status="submission_unknown",
+    params={
+        "model_id": target.SEEDANCE_2_0_MODEL_ID,
+        "output_format": "mp4",
+        "return_last_frame": False,
+    },
+)
+resolving_bridge = ResolvingClientRequestBridge()
+client_refresh_saves: list[str] = []
+
+
+async def record_client_refresh_save(*, required: bool, reason: str) -> bool:
+    assert required is False
+    client_refresh_saves.append(reason)
+    return True
+
+
+client_refresh._force_save_generation_recovery_checkpoint = (
+    record_client_refresh_save
+)
+with mock.patch.object(
+    client_refresh,
+    "_ensure_broker_connected",
+    new=mock.AsyncMock(return_value=resolving_bridge),
+), mock.patch.object(client_refresh, "_set_status_results", create=True):
+    asyncio.run(client_refresh._refresh_async())
+
+resolved_checkpoint = target._seedance_recovery_value(
+    client_refresh.get_parameter_value(target.SEEDANCE_RECOVERY_PARAMETER)
+)
+assert resolving_bridge.refresh_calls == [(client_refresh_id, 60)]
+assert resolved_checkpoint["task_id"] == "job-resolved-from-client-request"
+assert resolved_checkpoint["task_identity"] == "broker_task"
+assert resolved_checkpoint["stage"] == "refresh"
+assert client_refresh.parameter_output_values["generation_id"] == (
+    "job-resolved-from-client-request"
+)
+assert client_refresh_saves == ["manual_refresh"]
 
 
 class FakeWorkflowContext:

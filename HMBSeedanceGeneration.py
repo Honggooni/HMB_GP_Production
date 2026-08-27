@@ -4151,9 +4151,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return False
         status = str(checkpoint.get("status") or "").strip().lower()
         stage = str(checkpoint.get("stage") or "").strip().lower()
-        task_identity = str(
-            checkpoint.get("task_identity") or ""
-        ).strip().lower()
         provider_response = self.parameter_output_values.get("provider_response")
         terminal = bool(
             checkpoint.get("terminal") is True
@@ -4173,10 +4170,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             # checkpoint as the authoritative consumed-result signal.  Keep the
             # task ID for audit/recovery history; the next explicit Run replaces
             # it with the new pre-submit checkpoint.
-            if (
-                task_identity == "broker_task"
-                and stage == "local_succeeded"
-            ):
+            if stage == "local_succeeded":
+                # Do not re-check provider_response/video_url here.  Griptape
+                # can hydrate the hidden recovery property before output
+                # parameters during StartFlow, which made a genuinely consumed
+                # result look unconfirmed and permanently blocked re-rendering.
+                # Identity is historical metadata; ``local_succeeded`` is the
+                # durable backend-authored proof and is written only after the
+                # result has passed local publication verification.
                 return False
 
             # A remote success is not yet safe to retire: the visible local
@@ -9181,13 +9182,16 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "succeeded",
             generation_id=generation_id,
         )
-        existing_recovery = self._generation_recovery_state()
         self._set_generation_recovery_checkpoint(
             stage="local_succeeded",
             task_id=generation_id,
-            task_identity=str(
-                existing_recovery.get("task_identity") or "broker_task"
-            ),
+            # Reaching this boundary proves that the Broker returned a
+            # completed task and that its video was downloaded, decoded,
+            # verified, and atomically published.  A recovery that began with
+            # an idempotent ``client_request`` identity is therefore promoted
+            # to an authoritative Broker task here.  Keeping the provisional
+            # identity would make the completed render block every later Run.
+            task_identity="broker_task",
             status="succeeded",
             params={
                 "model_id": effective_model_id,
@@ -9199,6 +9203,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             required=False,
             reason="local_succeeded",
         )
+        self._submission_outcome_unknown = False
         if not self._runtime_node_is_live(require_registered=True):
             return
         self._set_status_results(
@@ -9267,12 +9272,32 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             status = str(task["status"])
             refresh_params = self._get_parameters()
             recovery_contract = self._generation_recovery_state()
+            requested_generation_id = generation_id
+            resolved_generation_id = str(task["id"])
+            if (
+                resolved_generation_id != requested_generation_id
+                and not (
+                    recovery_contract.get("task_identity") == "client_request"
+                    and recovery_contract.get("task_id")
+                    == requested_generation_id
+                )
+            ):
+                raise _BrokerProtocolError(
+                    "FN AI Broker returned a different task ID while refreshing "
+                    "an identity that was not a matching provisional request."
+                )
+            # A successful status lookup resolves a provisional idempotency
+            # key into an actual Broker task.  The Broker may retain the same
+            # hmb-* value or return a canonical job ID; either form is now an
+            # authoritative task identity and must replace the provisional
+            # recovery identity.
+            generation_id = resolved_generation_id
             recovery_destination = (
                 self._build_recovery_output_destination(recovery_contract)
                 if status == "succeeded"
                 else None
             )
-            if recovery_contract.get("task_id") == generation_id:
+            if recovery_contract.get("task_id") == requested_generation_id:
                 if recovery_contract.get("model_id"):
                     refresh_params["model_id"] = recovery_contract["model_id"]
                 if recovery_contract.get("output_format"):
@@ -9302,9 +9327,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     else "refresh"
                 ),
                 task_id=generation_id,
-                task_identity=str(
-                    recovery_contract.get("task_identity") or "broker_task"
-                ),
+                task_identity="broker_task",
                 status=status,
                 params=refresh_params,
                 terminal=bool(
