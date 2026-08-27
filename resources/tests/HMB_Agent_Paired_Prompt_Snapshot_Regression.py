@@ -113,7 +113,8 @@ runtime_prompt = agent._compose_hmb_runtime_prompt(machine_prompt, {"sources": [
 assert runtime_prompt.startswith(machine_prompt.rstrip() + "\n")
 assert visible_prompt not in runtime_prompt
 assert agent._RUNTIME_FX_SCOPE_HEADER in runtime_prompt
-assert agent._ENGLISH_GENERATOR_OUTPUT_CONTRACT_HEADER in runtime_prompt
+assert "HMB GENERATOR OUTPUT CONTRACT" not in runtime_prompt
+assert "HMB FINAL OUTPUT SEMANTIC MANIFEST" not in runtime_prompt
 assert "IMAGE TAXONOMY COMPATIBILITY" not in runtime_prompt
 assert "Scale / Composition Reference" not in runtime_prompt
 

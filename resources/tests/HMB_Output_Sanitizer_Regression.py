@@ -478,6 +478,22 @@ benign_json.set_parameter_value("prompt", visible_prompt)
 list(benign_json.process())
 assert benign_json.parameter_output_values["output"] == benign_json.output_override
 
+# An empty native result is an execution failure, not a semantic or language
+# failure. It must never create a successful generator snapshot/publication.
+empty_output = canonical_hmb_agent()
+empty_output.output_override = ""
+empty_output.set_parameter_value("prompt", visible_prompt)
+try:
+    list(empty_output.process())
+except RuntimeError as exc:
+    assert str(exc) == module._HMB_EXECUTION_FAILED_MESSAGE
+else:
+    raise AssertionError("An empty native Agent result was accepted.")
+assert empty_output.parameter_output_values["output"] == (
+    module._HMB_EXECUTION_FAILED_MESSAGE
+)
+assert empty_output._hmb_last_generator_snapshot == {}
+
 # Runtime-scope text is also no longer inspected at the public string boundary.
 runtime_scope_echo = canonical_hmb_agent()
 runtime_scope_echo.output_override = (

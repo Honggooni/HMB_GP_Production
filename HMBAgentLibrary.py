@@ -98,91 +98,8 @@ _PUBLIC_JOB_CONTRACT_SCHEMA = "hmb-public-job-data"
 _PUBLIC_JOB_CONTRACT_VERSION = 3
 _USER_DESCRIPTION_DATA_HEADER = "USER DESCRIPTION DATA (JSON):"
 _RUNTIME_FX_SCOPE_HEADER = "HMB VERIFIED FX/TIMING RUNTIME SCOPE (JSON):"
-_ENGLISH_GENERATOR_OUTPUT_CONTRACT_HEADER = (
-    "HMB GENERATOR OUTPUT CONTRACT (ENGLISH ONLY):"
-)
-_ENGLISH_GENERATOR_OUTPUT_CONTRACT = (
-    "Write the final video-generator instruction entirely in English. "
-    "Translate every user-authored descriptive sentence into clear natural "
-    "production English. Do not emit Korean prose, explanations, headings, "
-    "or commands. Keep machine addresses such as @image1 and @video1 exact, "
-    "but describe their visual and motion instructions in English. Return "
-    "only the generator-ready instruction, without commentary about this "
-    "language requirement."
-)
-_FINAL_OUTPUT_SEMANTIC_MANIFEST_HEADER = (
-    "HMB FINAL OUTPUT SEMANTIC MANIFEST (JSON):"
-)
 _FINAL_OUTPUT_SEMANTIC_MANIFEST_SCHEMA = "hmb-final-output-semantic-manifest"
 _FINAL_OUTPUT_SEMANTIC_MANIFEST_VERSION = 2
-_FINAL_OUTPUT_SEMANTIC_CONTRACT = (
-    "Preserve every source token and its declared target/authority in the final "
-    "generator instruction. Keep every named target ID literal exact. A Global "
-    "Look target may instead be stated unambiguously as a global, scene-wide, or "
-    "shared look authority for that same source. Image references supply only "
-    "their declared image authority. A relation marked unresolved or unbound in "
-    "the manifest is context-only for that exact relation; do not choose a winner "
-    "or let it own output attributes, and continue with every unaffected relation. "
-    "For each unresolved image relation, state its affected domain and local scope "
-    "and deny averaging or a slot-based winner. A video marked unbound because its "
-    "type, role, or relation-required binding is missing is context-only and owns no "
-    "motion, camera, spatial, FX, appearance, lighting, or scene-content attribute. "
-    "Every resolved Look Reference is transfer-only, whether or not a Main "
-    "Background source exists. It transfers only its declared look attributes "
-    "and must never define, supply, copy, replace, or acquire authority over "
-    "scene/background content, scene material identity, species, morphology, "
-    "depicted detail, geometry, objects, terrain, layout, composition, or "
-    "vegetation arrangement. Video references supply only "
-    "their declared motion, timing, camera, spatial, FX, or guide evidence and "
-    "must not supply character appearance, identity, skin, body, costume, "
-    "photorealism, material, lighting, or final-look authority. A negative video "
-    "appearance disclaimer never permits a contradictory positive visual grant. "
-    "When Character or Character Prop images coexist with a Look Reference, "
-    "explicitly preserve each subject's intrinsic color, pattern, material, "
-    "stylization, native medium, local value hierarchy, signature accents, and "
-    "material breaks; keep every character visually separable. Character "
-    "distinctiveness is a hard priority over Look transfer, and the Look must "
-    "adapt around those identity cues instead of homogenizing them. "
-    "For every resolved Character, Character Prop, or Background Prop source, "
-    "preserve repeated painted or cel-style highlights as intrinsic authored "
-    "treatment. Remove only illumination that is either demonstrably "
-    "view-dependent captured studio illumination or explicitly typed and scoped "
-    "as captured studio key, fill, or rim evidence; preserve every uncertain "
-    "highlight or edge accent. A Look "
-    "Reference alone must never create or invent a visible light source, sun, "
-    "moon, luminous emitter, god ray, volumetric beam, lens flare, or bloom. "
-    "For every Character, Character Prop, or Background Prop source, state that "
-    "if a source-defined emitter exists, its image owns the emitter's design, "
-    "shape, placement, color, material, and steady emissive state; never remove, "
-    "redesign, recolor, retexture, reshape, relocate, or replace that intrinsic "
-    "component. Only an explicit scoped Shot instruction or fully typed FX source "
-    "may own its activation, timing, rays, bloom, spread, or other temporal "
-    "behavior. Even a typed FX source must not create a persistent light object "
-    "such as a new sun, moon, lamp, visible light source, or emitter. For a "
-    "Color / Look / Lighting source, "
-    "explicitly preserve all "
-    "three authority families: color/palette/grade, lighting/atmosphere/exposure, "
-    "and render/shading/style. An unclassified image or a Character/Character "
-    "Prop image without a Target is unbound context only and has no appearance, "
-    "identity, material, look, lighting, or scene-content authority. Translate "
-    "If a dark shadow threatens face, eye, or expression readability, adjust "
-    "shared low-frequency ambient or reflected bounce across the whole connected "
-    "local shadow field, including affected characters, props, and environment, "
-    "while preserving direct-light reduction and the continuous shadow boundary; "
-    "never apply a selective character-only lift. Protected Primary Unified Shot "
-    "Control wins every overlap with Local or Secondary motion. For every "
-    "conflicting Local/Secondary relation, keep its exact source and competing "
-    "source tokens, target, function, spatial domain, and listed frame interval "
-    "or whole-shot scope together in one conflict statement. That exact relation "
-    "remains unresolved only in its listed overlap and must never be averaged or "
-    "selected by slot. Translate and preserve every "
-    "custom_instruction; "
-    "at the end "
-    "of that source's translated lighting clause append its exact "
-    "custom_instruction_evidence_tag (the client removes this private tag before "
-    "publication). Return natural generator-ready prose; do not reproduce this "
-    "manifest or discuss validation."
-)
 _PAIRED_PROMPT_SNAPSHOT_SCHEMA = "hmb-prompt-paired-snapshot"
 _PAIRED_PROMPT_SNAPSHOT_VERSION = 1
 _PAIRED_PROMPT_SNAPSHOT_KEYS = frozenset({
@@ -295,14 +212,6 @@ _PUBLIC_OUTPUT_BLOCKED = (
 )
 _HMB_EXECUTION_FAILED_MESSAGE = (
     "[HMB EXECUTION FAILED] The protected execution ended without a publishable result."
-)
-_HMB_ENGLISH_OUTPUT_REQUIRED_MESSAGE = (
-    "[HMB ENGLISH OUTPUT REQUIRED] The Agent returned non-English generator "
-    "instructions, so publication was stopped before the video generator."
-)
-_HMB_OUTPUT_SEMANTIC_INCOMPLETE_MESSAGE = (
-    "[HMB OUTPUT SEMANTIC INCOMPLETE] Required source, target, or authority "
-    "meaning was not preserved. No generator prompt was published."
 )
 _HMB_REQUIRED_MARKERS = (
     _PUBLIC_JOB_CONTRACT_HEADER,
@@ -5267,7 +5176,14 @@ def _compose_hmb_runtime_prompt(
     runtime_scope: Dict[str, Any],
     semantic_manifest: Dict[str, Any] | None = None,
 ) -> str:
-    """Append private runtime facts and fixed generator-output contracts."""
+    """Append verified runtime facts without policing the Agent's wording.
+
+    The optional third argument is retained only for compatibility with older
+    callers.  Final-output meaning and language are governed by the authenticated
+    server policy and the Agent model, not by client-side phrase matching.
+    """
+
+    del semantic_manifest
 
     value = getattr(prompt_value, "value", prompt_value)
     public_prompt = str(value or "").rstrip()
@@ -5277,54 +5193,18 @@ def _compose_hmb_runtime_prompt(
         sort_keys=True,
         separators=(",", ":"),
     )
-    encoded_manifest = ""
-    if semantic_manifest:
-        encoded_manifest = json.dumps(
-            semantic_manifest,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
     appended_size = (
         len(encoded_scope)
         + len(_RUNTIME_FX_SCOPE_HEADER)
-        + len(encoded_manifest)
-        + (
-            len(_FINAL_OUTPUT_SEMANTIC_MANIFEST_HEADER)
-            + len(_FINAL_OUTPUT_SEMANTIC_CONTRACT)
-            if encoded_manifest
-            else 0
-        )
-        + len(_ENGLISH_GENERATOR_OUTPUT_CONTRACT_HEADER)
-        + len(_ENGLISH_GENERATOR_OUTPUT_CONTRACT)
     )
     if not public_prompt or len(public_prompt) + appended_size > 6_000_000:
         raise RuntimeError("HMB runtime prompt size is invalid.")
-    sections = [
+    return "\n".join((
         public_prompt,
         _RUNTIME_FX_SCOPE_HEADER,
         encoded_scope,
-    ]
-    if encoded_manifest:
-        sections.extend((
-            _FINAL_OUTPUT_SEMANTIC_MANIFEST_HEADER,
-            encoded_manifest,
-            _FINAL_OUTPUT_SEMANTIC_CONTRACT,
-        ))
-    sections.extend((
-        _ENGLISH_GENERATOR_OUTPUT_CONTRACT_HEADER,
-        _ENGLISH_GENERATOR_OUTPUT_CONTRACT,
         "",
     ))
-    return "\n".join(sections)
-
-
-def _contains_korean_script(value: Any) -> bool:
-    """Return whether a final generator instruction contains Korean script."""
-
-    if not isinstance(value, str) or not value:
-        return False
-    return bool(re.search(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3]", value))
 
 
 def _is_private_hmb_runtime_prompt(value: Any) -> bool:
@@ -5763,7 +5643,6 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_shot_context: dict[str, Any] = {}
         self._hmb_shot_catalog_snapshot: dict[str, Any] = {}
         self._hmb_last_generator_snapshot: dict[str, Any] = {}
-        self._hmb_expected_output_semantics: dict[str, Any] = {}
         # Instance-local execution authority.  Display widget writes and
         # same-flow route callbacks may interleave while several Agents run,
         # but they must not change the exact Shot being consumed by this run.
@@ -7476,7 +7355,6 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_ruleset_names = ("", "")
         self._hmb_policy_identity = {}
         self._hmb_runtime_prompt = ""
-        self._hmb_expected_output_semantics = {}
         self._hmb_native_prompt_read_active = False
         self._hmb_verified_prompt_source_node = None
         self._hmb_publication_buffer = {"output": "", "logs": ""}
@@ -7766,7 +7644,12 @@ class HMBAgentLibrary(_BaseAgent):
         return _is_direct_hmb_prompt_library_connection(self)
 
     def _secure_hmb_outputs(self) -> bool:
-        """Sanitize public outputs and report an English-language violation."""
+        """Remove private native state without judging final-text language or meaning.
+
+        The boolean return value remains for compatibility with older host/test
+        adapters and is always ``False`` now that client-side language blocking
+        has been removed.
+        """
 
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return False
@@ -7775,40 +7658,22 @@ class HMBAgentLibrary(_BaseAgent):
             return False
 
         blocked = _PUBLIC_OUTPUT_BLOCKED
-        english_output_failed = False
         self._hmb_last_sanitizer_status = "sanitizer_error"
         try:
             for key, current in list(outputs.items()):
                 if key == "agent" and isinstance(current, dict):
                     _strip_sealed_state_from_agent_wrapper(current)
                     _strip_runtime_scope_from_agent_wrapper(current)
+                sanitized = current
+                leak_detected = key != "agent" and (
+                    _contains_public_output_state_leak(sanitized)
+                )
                 if key == "output":
-                    sanitized = current
-                    english_output_failed = _contains_korean_script(sanitized)
-                    if english_output_failed:
-                        # Never forward Korean instructions to a downstream
-                        # video generator. Translation is the model's job under
-                        # the private contract above; the sanitizer does not
-                        # guess at or rewrite production meaning.
-                        sanitized = _HMB_ENGLISH_OUTPUT_REQUIRED_MESSAGE
-                        leak_detected = False
-                        self._hmb_last_sanitizer_status = "english"
-                    else:
-                        # Server policy wording is valid generator content and
-                        # is never compared, decoded, or blocked on the client.
-                        # Only actual native Agent/runtime-state shapes remain
-                        # private at the FINAL TEXT boundary.
-                        state_leak_detected = _contains_public_output_state_leak(
-                            sanitized
-                        )
-                        leak_detected = state_leak_detected
-                        self._hmb_last_sanitizer_status = (
-                            "state" if state_leak_detected else "clean"
-                        )
-                else:
-                    sanitized = current
-                    leak_detected = key != "agent" and (
-                        _contains_public_output_state_leak(sanitized)
+                    # Authenticated policy instructions may be rendered in any
+                    # natural language or wording.  Only a native Agent/runtime
+                    # state shape is private at the FINAL TEXT boundary.
+                    self._hmb_last_sanitizer_status = (
+                        "state" if leak_detected else "clean"
                     )
                 if leak_detected:
                     sanitized = {} if key == "agent" else blocked
@@ -7823,11 +7688,12 @@ class HMBAgentLibrary(_BaseAgent):
                 # Only now may the native result cross the public parameter
                 # callback boundary; streaming writes were privately buffered.
                 self._set_visible_output(visible_output)
-            return english_output_failed
+            return False
         except Exception:
             # A broken detector cannot establish that FINAL TEXT is free of
             # native Agent/runtime state. Fail closed.
             outputs["agent"] = {}
+            outputs["output"] = blocked
             if "logs" in outputs:
                 outputs["logs"] = ""
             self._hmb_last_sanitizer_status = "sanitizer_error"
@@ -7863,7 +7729,6 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_last_sanitizer_status = "clean"
         self._hmb_suppress_visible_publication = False
         self._hmb_last_generator_snapshot = {}
-        self._hmb_expected_output_semantics = {}
         self._clear_execution_shot_binding()
         # The selector is cable-free in the editor, but the router establishes
         # the same-flow hidden Prompt edge before topology validation so the
@@ -7970,10 +7835,7 @@ class HMBAgentLibrary(_BaseAgent):
             else:
                 self._hmb_shot_context = {}
             source_contract_stage = "public_job"
-            public_job = _assert_public_job_data_contract(machine_prompt)
-            self._hmb_expected_output_semantics = (
-                _build_final_output_semantic_manifest(public_job)
-            )
+            _assert_public_job_data_contract(machine_prompt)
             source_contract_stage = "fx_contract"
             fx_timing_contract = _assert_fx_timing_source_contract(machine_prompt)
             source_contract_stage = "signed_candidate"
@@ -7992,7 +7854,6 @@ class HMBAgentLibrary(_BaseAgent):
             self._hmb_runtime_prompt = _compose_hmb_runtime_prompt(
                 machine_prompt,
                 runtime_scope,
-                self._hmb_expected_output_semantics,
             )
         except _HMBPolicyIdentityMismatchError:
             self._publish_hmb_execution_block(
@@ -8017,8 +7878,6 @@ class HMBAgentLibrary(_BaseAgent):
 
         result = None
         native_failed = False
-        english_output_failed = False
-        semantic_output_failed = False
         sanitizer_ran = False
         self._hmb_suppress_visible_publication = True
         try:
@@ -8033,7 +7892,7 @@ class HMBAgentLibrary(_BaseAgent):
                 lifecycle_generation
             ):
                 try:
-                    english_output_failed = self._secure_hmb_outputs()
+                    self._secure_hmb_outputs()
                     sanitizer_ran = True
                 except Exception:
                     # A future/replaced sanitizer must not leak its exception
@@ -8056,7 +7915,7 @@ class HMBAgentLibrary(_BaseAgent):
                 if not self._hmb_lifecycle_is_live(lifecycle_generation):
                     return None
                 if not sanitizer_ran:
-                    english_output_failed = self._secure_hmb_outputs()
+                    self._secure_hmb_outputs()
                 outputs = getattr(self, "parameter_output_values", None)
                 final_text = outputs.get("output") if isinstance(outputs, dict) else ""
                 sanitizer_status = str(
@@ -8064,42 +7923,30 @@ class HMBAgentLibrary(_BaseAgent):
                 )
                 if (
                     not native_failed
-                    and not english_output_failed
                     and sanitizer_status == "clean"
-                    and isinstance(final_text, str)
-                    and final_text
+                    and (
+                        not isinstance(final_text, str)
+                        or not final_text.strip()
+                    )
                 ):
-                    try:
-                        _assert_final_output_semantic_integrity(
-                            final_text,
-                            self._hmb_expected_output_semantics,
-                        )
-                        final_text = _strip_semantic_evidence_tags(final_text)
-                        if isinstance(outputs, dict):
-                            outputs["output"] = final_text
-                    except RuntimeError as exc:
-                        semantic_output_failed = True
-                        sanitizer_status = "semantic"
-                        self._hmb_last_sanitizer_status = sanitizer_status
-                        final_text = _HMB_OUTPUT_SEMANTIC_INCOMPLETE_MESSAGE
-                        if isinstance(outputs, dict):
-                            outputs["agent"] = {}
-                            outputs["output"] = final_text
-                            if "logs" in outputs:
-                                outputs["logs"] = ""
-                        try:
-                            print(
-                                "[HMB_PRODUCTION][ERROR] "
-                                f"OUTPUT_SEMANTIC_STAGE={exc}"
-                            )
-                        except Exception:
-                            pass
+                    # Empty/non-text native results are execution failures, not
+                    # semantic-policy failures.  Do not publish a successful
+                    # Shot snapshot that contains no generator instruction.
+                    native_failed = True
+                    final_text = _HMB_EXECUTION_FAILED_MESSAGE
+                    if isinstance(outputs, dict):
+                        outputs["agent"] = {}
+                        outputs["output"] = final_text
+                        if "logs" in outputs:
+                            outputs["logs"] = ""
+                # The authenticated policy and the Agent model own final
+                # wording and meaning.  The client does not phrase-match or
+                # rewrite a valid natural-language result at this boundary.
                 self._hmb_suppress_visible_publication = False
                 if isinstance(final_text, str):
                     self._set_visible_output(final_text)
                 if (
                     not native_failed
-                    and not english_output_failed
                     and sanitizer_status == "clean"
                     and self._hmb_shot_context
                     and isinstance(final_text, str)
@@ -8154,20 +8001,6 @@ class HMBAgentLibrary(_BaseAgent):
             self._refresh_agent_shot_route()
         except Exception:
             pass
-        if english_output_failed:
-            self._publish_hmb_execution_block(
-                _HMB_ENGLISH_OUTPUT_REQUIRED_MESSAGE
-            )
-            raise RuntimeError(
-                _HMB_ENGLISH_OUTPUT_REQUIRED_MESSAGE
-            ) from None
-        if semantic_output_failed:
-            self._publish_hmb_execution_block(
-                _HMB_OUTPUT_SEMANTIC_INCOMPLETE_MESSAGE
-            )
-            raise RuntimeError(
-                _HMB_OUTPUT_SEMANTIC_INCOMPLETE_MESSAGE
-            ) from None
         if native_failed:
             self._publish_hmb_execution_block(_HMB_EXECUTION_FAILED_MESSAGE)
             raise RuntimeError(_HMB_EXECUTION_FAILED_MESSAGE) from None

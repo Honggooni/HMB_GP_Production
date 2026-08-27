@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 from pathlib import Path
 from types import MethodType
 import sys
@@ -26,19 +27,28 @@ prompt = load("HMBPromptLibrary")
 picker = load("HMBVideoPickerLibrary")
 
 
-# Korean user input remains valid private source data, but the protected native
-# call always receives one final English-only generator-output contract.
+# Korean and English are both valid source and final-output languages.  The
+# private native call receives verified runtime facts only; client-side wording
+# and semantic contracts must not be appended.
 machine_prompt = "USER DESCRIPTION DATA (JSON):\n{\"scene\":\"천천히 줌인\"}\n"
 runtime_prompt = agent._compose_hmb_runtime_prompt(
     machine_prompt,
     {"sources": [], "shared_windows": []},
 )
 assert machine_prompt.rstrip() in runtime_prompt
-assert agent._ENGLISH_GENERATOR_OUTPUT_CONTRACT_HEADER in runtime_prompt
-assert agent._ENGLISH_GENERATOR_OUTPUT_CONTRACT in runtime_prompt
-assert runtime_prompt.rstrip().endswith(agent._ENGLISH_GENERATOR_OUTPUT_CONTRACT)
-assert not agent._contains_korean_script("Slowly push the camera toward @video1.")
-assert agent._contains_korean_script("카메라를 천천히 전진시킨다.")
+assert "HMB GENERATOR OUTPUT CONTRACT" not in runtime_prompt
+assert "HMB FINAL OUTPUT SEMANTIC MANIFEST" not in runtime_prompt
+assert "Preserve every source token" not in runtime_prompt
+assert runtime_prompt.rstrip().endswith('{"shared_windows":[],"sources":[]}')
+assert runtime_prompt == agent._compose_hmb_runtime_prompt(
+    machine_prompt,
+    {"sources": [], "shared_windows": []},
+    {"schema": "legacy-semantic-manifest", "sources": ["@image1"]},
+)
+process_source = inspect.getsource(agent.HMBAgentLibrary.process)
+assert "_build_final_output_semantic_manifest" not in process_source
+assert "_assert_final_output_semantic_integrity" not in process_source
+assert "OUTPUT_SEMANTIC_STAGE" not in process_source
 
 
 def sanitizer_node(output: str):
@@ -62,13 +72,9 @@ assert english_node._secure_hmb_outputs() is False
 assert english_node.parameter_output_values["output"].startswith("Use @video1")
 
 korean_node = sanitizer_node("@video1의 동작을 유지하고 카메라를 전진시킨다.")
-assert korean_node._secure_hmb_outputs() is True
-assert korean_node.parameter_output_values["output"] == (
-    agent._HMB_ENGLISH_OUTPUT_REQUIRED_MESSAGE
-)
-assert not agent._contains_korean_script(
-    korean_node.parameter_output_values["output"]
-)
+assert korean_node._secure_hmb_outputs() is False
+assert korean_node.parameter_output_values["output"].startswith("@video1의 동작")
+assert korean_node._hmb_last_sanitizer_status == "clean"
 
 
 # Agent/generator snapshot readers must be publication-free. In particular,
@@ -124,5 +130,5 @@ assert picker_node._hmb_shot_route_status["code"] == "ready"
 
 
 print(
-    "HMB Agent English output / Prompt video progression regression: PASS"
+    "HMB Agent language-neutral output / Prompt video progression regression: PASS"
 )
