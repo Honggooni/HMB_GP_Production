@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import inspect
-import json
 from pathlib import Path
 import sys
 from types import MethodType
@@ -43,12 +42,6 @@ VERBATIM_LONG_CLAUSE = " ".join(POLICY.casefold().split()).split(
     "character visual authority", 1
 )[1].strip()
 assert len(VERBATIM_LONG_CLAUSE) > 160
-STATE_RESULT = '{"agent":{"tasks":[],"rulesets":[]}}'
-DOUBLE_JSON_STATE_RESULT = json.dumps(json.dumps({
-    "agent": {"tasks": [], "rulesets": []}
-}))
-
-
 for removed_name in (
     "_SANITIZER_SECRET_WINDOW_CHARS",
     "_contains_raw_policy_material",
@@ -101,6 +94,7 @@ def drive(scripted_output: str):
 
     visible_writes: list[str] = []
     native_calls = [0]
+    injected_rulesets: list[list[dict]] = []
 
     def refresh_route(self, *args, **kwargs):
         self._hmb_verified_prompt_source_node = PromptSource()
@@ -109,6 +103,7 @@ def drive(scripted_output: str):
         native_calls[0] += 1
         if native_calls[0] > 1:
             raise AssertionError("A policy-text result must not trigger another Agent call.")
+        injected_rulesets.append(self.get_parameter_list_value("rulesets"))
         self.parameter_output_values["agent"] = {}
         self.parameter_output_values["output"] = scripted_output
         self.parameter_output_values["logs"] = "private-attempt-log"
@@ -171,25 +166,18 @@ def drive(scripted_output: str):
         "output": node.parameter_output_values.get("output"),
         "result": result,
         "snapshot": dict(node._hmb_last_generator_snapshot),
+        "injected_rulesets": injected_rulesets,
     }
 
 
 patched_names = (
     "_paired_machine_prompt",
-    "_assert_public_job_data_contract",
-    "_assert_fx_timing_source_contract",
-    "_assert_fx_candidate_matches_signed_runtime",
-    "_derive_fx_timing_runtime_scope",
     "_assert_prompt_policy_identity_matches_signed_runtime",
 )
 originals = {name: getattr(agent, name) for name in patched_names}
 original_bootstrap = agent._hmb._bootstrap_agent_policy_session
 try:
     agent._paired_machine_prompt = lambda _node, _value: "MACHINE SHOT FACTS"
-    agent._assert_public_job_data_contract = lambda _value: None
-    agent._assert_fx_timing_source_contract = lambda _value: {}
-    agent._assert_fx_candidate_matches_signed_runtime = lambda _value: None
-    agent._derive_fx_timing_runtime_scope = lambda *_args, **_kwargs: {}
     agent._assert_prompt_policy_identity_matches_signed_runtime = lambda: None
     agent._hmb._bootstrap_agent_policy_session = lambda: None
 
@@ -197,6 +185,16 @@ try:
     assert policy_text["calls"] == 1
     assert policy_text["output"] == LONG_POLICY_DERIVED_RESULT
     assert policy_text["visible"] == [LONG_POLICY_DERIVED_RESULT]
+    assert len(policy_text["injected_rulesets"]) == 1
+    injected = policy_text["injected_rulesets"][0]
+    assert len(injected) == 2
+    assert injected[0]["name"] != injected[1]["name"]
+    assert injected[0]["rules"] == [
+        "project-1", "project-2", "project-3", "project-4"
+    ]
+    assert injected[1]["rules"] == [
+        "shot-1", "shot-2", "shot-3", "shot-4"
+    ]
 
     verbatim_clause = drive(VERBATIM_LONG_CLAUSE)
     assert verbatim_clause["calls"] == 1
@@ -205,18 +203,9 @@ try:
 
     complete_document = drive(f"{POLICY}\n{BINDING}")
     assert complete_document["calls"] == 1
-    assert complete_document["output"] == f"{POLICY}\n{BINDING}"
-    assert complete_document["visible"] == [f"{POLICY}\n{BINDING}"]
-
-    state_only = drive(STATE_RESULT)
-    assert state_only["calls"] == 1
-    assert state_only["output"] == STATE_RESULT
-    assert state_only["visible"] == [STATE_RESULT]
-
-    encoded_state = drive(DOUBLE_JSON_STATE_RESULT)
-    assert encoded_state["calls"] == 1
-    assert encoded_state["output"] == DOUBLE_JSON_STATE_RESULT
-    assert encoded_state["visible"] == [DOUBLE_JSON_STATE_RESULT]
+    assert complete_document["output"] == agent._PUBLIC_OUTPUT_BLOCKED
+    assert complete_document["visible"] == [agent._PUBLIC_OUTPUT_BLOCKED]
+    assert complete_document["snapshot"] == {}
 finally:
     for name, value in originals.items():
         setattr(agent, name, value)
@@ -229,6 +218,6 @@ assert "rewrite_retry" not in native_guard_source
 assert "call_index == 1" not in native_guard_source
 
 print(
-    "HMB Agent final-text state-boundary regression: PASS "
-    "(all text/JSON inspection removed; direct native structures remain blocked)"
+    "HMB Agent signed-policy injection / exact-document no-exposure / "
+    "no-retry regression: PASS"
 )

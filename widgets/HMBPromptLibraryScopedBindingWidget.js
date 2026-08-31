@@ -112,9 +112,32 @@ export function hmbScopeWidgetCss(cssText, rootSelector) {
   return scopeRange(0, css.length);
 }
 
+const HMB_SCOPED_WIDGET_CSS_CACHE_LIMIT = 4;
+const HMB_SCOPED_WIDGET_CSS_CACHE = new Map();
+
+function hmbCachedScopedWidgetCss(cssText, rootSelector) {
+  const css = String(cssText || "");
+  const root = String(rootSelector || "").trim();
+  const cacheKey = `${root}\u0000${css}`;
+  if (HMB_SCOPED_WIDGET_CSS_CACHE.has(cacheKey)) {
+    const cached = HMB_SCOPED_WIDGET_CSS_CACHE.get(cacheKey);
+    // Refresh recency without changing the returned CSS bytes.
+    HMB_SCOPED_WIDGET_CSS_CACHE.delete(cacheKey);
+    HMB_SCOPED_WIDGET_CSS_CACHE.set(cacheKey, cached);
+    return cached;
+  }
+  const scoped = hmbScopeWidgetCss(css, root);
+  HMB_SCOPED_WIDGET_CSS_CACHE.set(cacheKey, scoped);
+  while (HMB_SCOPED_WIDGET_CSS_CACHE.size > HMB_SCOPED_WIDGET_CSS_CACHE_LIMIT) {
+    const oldestKey = HMB_SCOPED_WIDGET_CSS_CACHE.keys().next().value;
+    HMB_SCOPED_WIDGET_CSS_CACHE.delete(oldestKey);
+  }
+  return scoped;
+}
+
 export function hmbScopeWidgetStyleMarkup(markup, rootSelector) {
   return String(markup || "").replace(/<style>([\s\S]*?)<\/style>/g, (_match, css) => (
-    `<style>${hmbScopeWidgetCss(css, rootSelector)}</style>`
+    `<style>${hmbCachedScopedWidgetCss(css, rootSelector)}</style>`
   ));
 }
 
@@ -6286,8 +6309,8 @@ export function hmbPatchPromptShotSelector(container, state) {
   return true;
 }
 
-export function hmbPromptNonShotStateFingerprint(stateValue) {
-  const normalized = normalizeState(stateValue || {});
+function hmbPromptNonShotNormalizedFingerprint(normalizedState) {
+  const normalized = normalizedState || normalizeState({});
   const {
     source_sync_revision: _sourceSyncRevision,
     shot: _shot,
@@ -6303,6 +6326,10 @@ export function hmbPromptNonShotStateFingerprint(stateValue) {
   delete picker.shot_catalog;
   delete picker.shot_routing;
   return JSON.stringify({ ...rest, image_asset: imageAsset, picker });
+}
+
+export function hmbPromptNonShotStateFingerprint(stateValue) {
+  return hmbPromptNonShotNormalizedFingerprint(normalizeState(stateValue || {}));
 }
 
 function renderShotSelector(state) {
@@ -7397,6 +7424,7 @@ export function hmbPatchPromptSourceSection(currentSection, nextSection) {
     hmbPromptDirectSourceRows(currentScrollbox).map((row) => [hmbPromptRowPatchKey(row), row]),
   );
   const retained = new Set();
+  let previousRow = currentHeader || null;
   for (const nextRow of hmbPromptDirectSourceRows(nextScrollbox)) {
     const key = hmbPromptRowPatchKey(nextRow);
     let row = existing.get(key);
@@ -7407,7 +7435,9 @@ export function hmbPatchPromptSourceSection(currentSection, nextSection) {
         hmbIsEditableTextControl(row.ownerDocument?.activeElement)
         && row.contains?.(row.ownerDocument.activeElement)
       );
-      const contentChanged = row.outerHTML !== nextRow.outerHTML;
+      const contentChanged = typeof row.isEqualNode === "function"
+        ? !row.isEqualNode(nextRow)
+        : row.outerHTML !== nextRow.outerHTML;
       hmbCopyPromptElementAttributes(row, nextRow);
       if (contentChanged) {
         if (preserveActiveEditor) {
@@ -7416,7 +7446,17 @@ export function hmbPatchPromptSourceSection(currentSection, nextSection) {
       }
     }
     retained.add(row);
-    currentScrollbox.appendChild(row);
+    const desiredPosition = previousRow
+      ? previousRow.nextSibling
+      : currentScrollbox.firstChild;
+    if (row !== desiredPosition) {
+      if (typeof currentScrollbox.insertBefore === "function") {
+        currentScrollbox.insertBefore(row, desiredPosition || null);
+      } else {
+        currentScrollbox.appendChild(row);
+      }
+    }
+    previousRow = row;
   }
   hmbPromptDirectSourceRows(currentScrollbox).forEach((row) => {
     if (!retained.has(row)) row.remove?.();
@@ -7438,7 +7478,14 @@ export function hmbPatchPromptDashboard(container, markup) {
     || (typeof document !== "undefined" ? document : null);
   if (!currentRoot || !documentRef?.createElement) return false;
   const staging = documentRef.createElement("div");
-  staging.innerHTML = String(markup || "");
+  // The retained dashboard already owns the byte-identical scoped stylesheet.
+  // Excluding it from the temporary tree avoids reparsing the large CSS block
+  // on every state patch; the original markup remains available to the caller
+  // for the full-mount fallback.
+  staging.innerHTML = String(markup || "").replace(
+    /<style>[\s\S]*?<\/style>/g,
+    "",
+  );
   const nextClip = staging.querySelector?.(".hmb-dashboard-clip");
   const nextRoot = nextClip?.querySelector?.(".hmb-dashboard")
     || staging.querySelector?.(".hmb-dashboard");
@@ -7452,10 +7499,14 @@ export function hmbPatchPromptDashboard(container, markup) {
     currentTopbar.innerHTML = nextTopbar.innerHTML;
   }
 
+  const currentSections = new Map(
+    Array.from(currentRoot.querySelectorAll?.("[data-group-id]") || []).map((section) => (
+      [section.getAttribute("data-group-id"), section]
+    )),
+  );
   for (const nextSection of Array.from(nextRoot.querySelectorAll?.("[data-group-id]") || [])) {
     const groupId = nextSection.getAttribute("data-group-id");
-    const currentSection = Array.from(currentRoot.querySelectorAll?.("[data-group-id]") || [])
-      .find((section) => section.getAttribute("data-group-id") === groupId);
+    const currentSection = currentSections.get(groupId);
     if (!currentSection) continue;
     if (["imageSources", "videoSources"].includes(groupId)) {
       hmbPatchPromptSourceSection(currentSection, nextSection);
@@ -8220,13 +8271,18 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
     nextState.disabled = Boolean(nextProps?.disabled);
     nextState.ui = nextState.ui && typeof nextState.ui === "object" ? nextState.ui : defaultUi();
     hmbReconcilePromptSourceIdentities(state, nextState);
-    const currentValue = JSON.stringify(normalizeState(state));
-    const nextValue = JSON.stringify(normalizeState(nextState));
+    // Normalize each side exactly once. The same canonical objects feed both
+    // equality and Shot-region classification, avoiding two additional full
+    // image/video state walks without changing comparison semantics.
+    const normalizedCurrentState = normalizeState(state);
+    const normalizedNextState = normalizeState(nextState);
+    const currentValue = JSON.stringify(normalizedCurrentState);
+    const nextValue = JSON.stringify(normalizedNextState);
     const disabledChanged = Boolean(state.disabled) !== Boolean(nextState.disabled);
     const shotRegionOnly = Boolean(
       !disabledChanged
-      && hmbPromptNonShotStateFingerprint(state)
-        === hmbPromptNonShotStateFingerprint(nextState)
+      && hmbPromptNonShotNormalizedFingerprint(normalizedCurrentState)
+        === hmbPromptNonShotNormalizedFingerprint(normalizedNextState)
     );
     props = nextProps || {};
     if (currentValue === nextValue && !disabledChanged) {

@@ -1,489 +1,190 @@
 from __future__ import annotations
 
-import hashlib
-import importlib.util
-import json
+import ast
+import inspect
 from pathlib import Path
 import sys
-from types import SimpleNamespace
+import textwrap
 from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import HMBAgentLibrary as agent
 
 
-def load(name: str):
-    path = ROOT / f"{name}.py"
-    module_name = f"_hmb_semantic_integrity_{name}"
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Unable to load {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+class BoundaryHarness:
+    """Minimal host surface for the current sanitizer and Shot publication."""
 
-
-agent = load("HMBAgentLibrary")
-
-
-def expect_rejected(callback: Any, fragment: str = "") -> None:
-    try:
-        callback()
-    except RuntimeError as exc:
-        if fragment:
-            assert fragment in str(exc), str(exc)
-        return
-    raise AssertionError("invalid semantic contract was accepted")
-
-
-def envelope(job: dict[str, Any]) -> str:
-    return "\n".join((
-        "HMB_GP_Production",
-        "HMB JOB DATA (JSON):",
-        json.dumps(job, ensure_ascii=False, separators=(",", ":")),
-        "FX/TIMING SOURCE DATA (JSON):",
-        "{}",
-        "USER DESCRIPTION DATA (JSON):",
-        "{}",
-        "",
-    ))
-
-
-def image(
-    token: str,
-    label: str,
-    main_type: str,
-    sub_type: str,
-    target: str,
-    *,
-    scope_mode: str = "",
-    custom_instruction: str = "",
-) -> dict[str, Any]:
-    source_type, source_scope = agent._hmb.image_taxonomy_wire_pair(
-        main_type,
-        sub_type,
+    _secure_hmb_outputs = agent.HMBAgentLibrary._secure_hmb_outputs
+    _hmb_generator_shot_snapshot = (
+        agent.HMBAgentLibrary._hmb_generator_shot_snapshot
     )
-    record: dict[str, Any] = {
-        "image": token,
-        "label": label,
-        "image_main_type": main_type,
-        "image_sub_type": sub_type,
-        "source_type": source_type,
-        "source_scope": source_scope,
-        "custom_source_type": "",
-        "target_id": target,
-        "relationship_targets": [],
-        "bindings": [],
-        "identity": {},
-    }
-    if sub_type in {"Lighting / Atmosphere", "Color / Look / Lighting"}:
-        record["target_scope_mode"] = scope_mode
-        record["custom_look_instruction"] = custom_instruction
-    return record
-
-
-def video(token: str, source_type: str, role: str) -> dict[str, Any]:
-    return {
-        "video": token,
-        "label": token[1:],
-        "source_type": source_type,
-        "custom_source_type": "",
-        "control_role": role,
-        "custom_control_role": "",
-        "control_role_explicit": True,
-        "keep_out": "",
-        "identity": {},
-    }
-
-
-def job(
-    *,
-    images: list[dict[str, Any]] | None = None,
-    videos: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    return {
-        "schema": "hmb-public-job-data",
-        "version": 3,
-        "images": list(images or []),
-        "videos": list(videos or []),
-        "control_only_bindings": [],
-        "frame_ranges": [],
-        "connections": {"image_asset": bool(images), "picker": bool(videos)},
-    }
-
-
-# One primary Original may coexist with every typed auxiliary reference.
-valid_videos = [
-    video(
-        "@video1",
-        "Unified Shot-Control Video",
-        "Primary Unified Shot Control",
-    ),
-    video("@video2", "Mask / Control Reference", "Mask / Guide Only"),
-    video(
-        "@video3",
-        "Depth / Spatial Reference",
-        "Spatial Alignment Verification Only",
-    ),
-    video(
-        "@video4",
-        "Motion Guide / Retargeting Reference",
-        "Derived Motion Decoding Only",
-    ),
-]
-assert agent._assert_public_job_data_contract(
-    envelope(job(videos=valid_videos))
-)["videos"] == valid_videos
-expect_rejected(
-    lambda: agent._assert_public_job_data_contract(
-        envelope(job(videos=[valid_videos[0], {**valid_videos[0], "video": "@video2"}]))
-    ),
-    "multiple Primary Unified",
-)
-
-
-semantic_job = agent._assert_public_job_data_contract(
-    envelope(job(
-        images=[
-            image(
-                "@image1",
-                "ForestSet",
-                "Environment / Background",
-                "Main Background",
-                "ForestSet",
-            ),
-            image(
-                "@image2",
-                "DawnLook",
-                "Look Reference",
-                "Color / Look / Lighting",
-                "Global Look",
-                scope_mode="global",
-            ),
-            image(
-                "@image3",
-                "Hero",
-                "Character",
-                "Full Appearance",
-                "Hero",
-            ),
-        ],
-        videos=[valid_videos[0]],
-    ))
-)
-manifest = agent._build_final_output_semantic_manifest(semantic_job)
-good = """@image1 (ForestSet) is the sole background and scene-content authority.
-
-@image2 (DawnLook) supplies the Global Look scene-wide: transfer its color palette and grade, lighting and exposure, plus render style and shading. Never copy, replace, or import its background location, geometry, objects, or composition. @image2 must not create, add, invent, or reveal any visible light source, sun, moon, luminous emitter, god ray, volumetric beam, lens flare, or bloom.
-
-@image3 is the exact Hero character appearance, identity, design, proportions, silhouette, and material authority. Preserve its intrinsic color, pattern, material, stylization, native medium, local value hierarchy, signature accents, and material breaks, and keep the Hero visually separable from every other character. Character distinctiveness is a hard priority over every Look transfer; @image2 must adapt around those identity cues and must not overwrite, replace, homogenize, or average those Hero-specific traits. Preserve every repeated painted or cel-style highlight as intrinsic authored graphic treatment. Remove only demonstrably view-dependent captured studio key, fill, or rim illumination; every uncertain highlight or edge accent remains intrinsic and must be retained. If a source-defined intrinsic emitter exists for @image3, @image3 owns and preserves its design, shape, placement, color, material, and steady emissive state.
-
-If a dark shadow would crush face, eye, or expression readability, adjust shared low-frequency ambient or reflected bounce across the entire connected local shadow field, including affected characters, props, and nearby environment, while preserving direct-light reduction and the continuous shadow boundary; never apply a selective character-only lift.
-
-@video1 is the Primary Unified Shot Control for motion, acting, timing, camera, framing, and layout. Its control visualization is proxy shading only and it has no character appearance authority; character appearance comes solely from @image3."""
-agent._assert_final_output_semantic_integrity(good, manifest)
-
-# ``Global Look`` is a reserved UI scope label rather than a renderable target
-# identifier. Natural generator prose may preserve the same scope semantically
-# without echoing that exact label.
-global_look_semantic_alias = good.replace(
-    "supplies the Global Look scene-wide:",
-    "supplies color, look, and lighting as a global, transfer-only authority:",
-)
-agent._assert_final_output_semantic_integrity(
-    global_look_semantic_alias,
-    manifest,
-)
-expect_rejected(
-    lambda: agent._assert_final_output_semantic_integrity(
-        good.replace(
-            "supplies the Global Look scene-wide:",
-            "supplies transferable attributes:",
-        ),
-        manifest,
-    ),
-    "target:@image2",
-)
-
-# A combined Color / Look / Lighting declaration must retain its render/look
-# axis; color plus lighting alone is semantically incomplete.
-expect_rejected(
-    lambda: agent._assert_final_output_semantic_integrity(
-        good.replace(
-            "color palette and grade, lighting and exposure, plus render style and shading",
-            "color palette and grade, plus lighting and exposure",
-        ),
-        manifest,
-    ),
-    "look_authority:@image2",
-)
-expect_rejected(
-    lambda: agent._assert_final_output_semantic_integrity(
-        good.replace("@image3", "the character"),
-        manifest,
-    ),
-    "missing:@image3",
-)
-expect_rejected(
-    lambda: agent._assert_final_output_semantic_integrity(
-        good.replace("Hero", "Pilot"),
-        manifest,
-    ),
-    "target:@image3",
-)
-expect_rejected(
-    lambda: agent._assert_final_output_semantic_integrity(
-        good.replace("camera, framing, and layout", "gesture detail"),
-        manifest,
-    ),
-    "video_authority:@video1",
-)
-expect_rejected(
-    lambda: agent._assert_final_output_semantic_integrity(
-        good.replace(
-            "Its control visualization is proxy shading only and it has no character appearance authority; character appearance comes solely from @image3.",
-            "Use it as a general reference.",
-        ),
-        manifest,
-    ),
-    "video_appearance_isolation:@video1",
-)
-
-# A single explicit shot-wide exclusion is valid; repeating identical
-# appearance-isolation prose in every video paragraph is not required.
-global_video_job = agent._assert_public_job_data_contract(
-    envelope(job(videos=[valid_videos[0], valid_videos[1]]))
-)
-global_video_manifest = agent._build_final_output_semantic_manifest(global_video_job)
-global_video_final = """@video1 supplies motion, acting, timing, camera, framing, and layout as the Primary Unified Shot Control.
-
-@video2 supplies mask, occupancy, silhouette, and occlusion guidance only.
-
-All video references provide control information only and have no character appearance authority; appearance and identity come solely from @image references."""
-agent._assert_final_output_semantic_integrity(
-    global_video_final,
-    global_video_manifest,
-)
-
-
-custom_instruction = (
-    "Use a cool moonlit key with warm window bounce across the whole scene."
-)
-custom_job = agent._assert_public_job_data_contract(
-    envelope(job(images=[
-        image(
-            "@image1",
-            "NightLighting",
-            "Look Reference",
-            "Lighting / Atmosphere",
-            "Custom",
-            scope_mode="custom",
-            custom_instruction=custom_instruction,
-        )
-    ]))
-)
-custom_manifest = agent._build_final_output_semantic_manifest(custom_job)
-custom_tag = custom_manifest["images"][0]["custom_instruction_evidence_tag"]
-custom_final = (
-    "@image1 is transfer-only visual-attribute authority and supplies shared "
-    "scene lighting and atmosphere using a cool moonlit key with warm window "
-    "bounce across all visible subjects. It has no scene or background content "
-    "authority and must not copy, replace, substitute, or invent any location, "
-    "terrain, geometry, object, material identity, vegetation, species, layout, "
-    "camera, composition, or depicted detail. @image1 must not "
-    "create, add, invent, or reveal any visible light source, sun, moon, luminous "
-    f"emitter, god ray, volumetric beam, lens flare, or bloom. {custom_tag}"
-)
-agent._assert_final_output_semantic_integrity(custom_final, custom_manifest)
-assert custom_tag not in agent._strip_semantic_evidence_tags(custom_final)
-expect_rejected(
-    lambda: agent._assert_final_output_semantic_integrity(
-        custom_final.replace(custom_tag, ""),
-        custom_manifest,
-    ),
-    "custom_look_instruction:@image1",
-)
-
-# Custom may instead address one named/local recipient. It retains typed
-# lighting authority and exact SHA/tag evidence without being rewritten into
-# a Global Look or requiring any shared/scene-wide wording.
-local_custom_instruction = (
-    "Apply a warm key and reduced exposure to Hero_A only."
-)
-local_custom_job = agent._assert_public_job_data_contract(
-    envelope(job(images=[
-        image(
-            "@image1",
-            "HeroLighting",
-            "Look Reference",
-            "Lighting / Atmosphere",
-            "Custom",
-            scope_mode="custom",
-            custom_instruction=local_custom_instruction,
-        )
-    ]))
-)
-local_custom_manifest = agent._build_final_output_semantic_manifest(
-    local_custom_job
-)
-local_custom_tag = local_custom_manifest["images"][0][
-    "custom_instruction_evidence_tag"
-]
-local_custom_final = (
-    "@image1 is transfer-only visual-attribute authority and supplies lighting, "
-    "exposure, and atmosphere: apply a warm key and reduced exposure to Hero_A "
-    "only. It has no scene or background content authority and must not copy, "
-    "replace, substitute, or invent any location, terrain, geometry, object, "
-    "material identity, vegetation, species, layout, camera, composition, or "
-    "depicted detail. @image1 must not create, add, invent, "
-    "or reveal any visible light source, sun, moon, luminous emitter, god ray, "
-    f"volumetric beam, lens flare, or bloom. {local_custom_tag}"
-)
-agent._assert_final_output_semantic_integrity(
-    local_custom_final,
-    local_custom_manifest,
-)
-
-# A Global claim and same-domain local Custom may coexist only when the Custom
-# names one known local Target and explicitly declares its override. Different
-# resolved local Targets may coexist; an exact duplicate still fails closed.
-hero_target = image(
-    "@image3",
-    "Hero",
-    "Character",
-    "Full Appearance",
-    "Hero_A",
-)
-forest_target = image(
-    "@image4",
-    "Forest",
-    "Environment / Background",
-    "Main Background",
-    "Forest_A",
-)
-explicit_local_override = (
-    "Explicitly override the Global Look lighting for Hero_A only with a warm "
-    "key and reduced exposure."
-)
-global_and_local = job(images=[
-    image(
-        "@image1",
-        "GlobalLighting",
-        "Look Reference",
-        "Lighting / Atmosphere",
-        "Global Look",
-        scope_mode="global",
-    ),
-    image(
-        "@image2",
-        "HeroLighting",
-        "Look Reference",
-        "Lighting / Atmosphere",
-        "Custom",
-        scope_mode="custom",
-        custom_instruction=explicit_local_override,
-    ),
-    hero_target,
-])
-assert len(agent._assert_public_job_data_contract(
-    envelope(global_and_local)
-)["images"]) == 3
-
-second_local_instruction = "Apply a cool rim to Forest_A only."
-distinct_custom_scopes = job(images=[
-    image(
-        "@image1",
-        "HeroLighting",
-        "Look Reference",
-        "Lighting / Atmosphere",
-        "Custom",
-        scope_mode="custom",
-        custom_instruction=local_custom_instruction,
-    ),
-    image(
-        "@image2",
-        "ForestLighting",
-        "Look Reference",
-        "Lighting / Atmosphere",
-        "Custom",
-        scope_mode="custom",
-        custom_instruction=second_local_instruction,
-    ),
-    hero_target,
-    forest_target,
-])
-assert len(agent._assert_public_job_data_contract(
-    envelope(distinct_custom_scopes)
-)["images"]) == 4
-duplicate_custom_scope = json.loads(json.dumps(distinct_custom_scopes))
-duplicate_custom_scope["images"][1]["custom_look_instruction"] = (
-    local_custom_instruction
-)
-duplicate_custom_contract = agent._assert_public_job_data_contract(
-    envelope(duplicate_custom_scope)
-)
-duplicate_custom_manifest = agent._build_final_output_semantic_manifest(
-    duplicate_custom_contract
-)
-duplicate_look_rows = duplicate_custom_manifest["images"][:2]
-assert all(row["unbound_authority"] is True for row in duplicate_look_rows)
-assert all(
-    any(
-        relation.get("reason") == "look_authority_scope_conflict"
-        for relation in row["unresolved_relations"]
+    _hmb_commit_remote_prompt_publication = (
+        agent.HMBAgentLibrary._hmb_commit_remote_prompt_publication
     )
-    for row in duplicate_look_rows
+
+    def __init__(self) -> None:
+        self._hmb_node_deleted = False
+        self._hmb_suppress_visible_publication = False
+        self._hmb_last_sanitizer_status = "clean"
+        self._hmb_last_generator_snapshot: dict[str, Any] = {}
+        self._hmb_remote_prompt_publication: dict[str, Any] = {}
+        self._hmb_remote_prompt_revision = 0
+        self._hmb_remote_prompt_source_token = "boundary-source-token"
+        self.parameter_output_values: dict[str, Any] = {
+            "output": "",
+            "agent": {},
+            "logs": "",
+        }
+        self.visible_output = ""
+
+    def _set_visible_output(self, value: str) -> None:
+        self.visible_output = value
+        self.parameter_output_values["output"] = value
+
+
+def clean_output(value: Any, agent_state: Any | None = None) -> BoundaryHarness:
+    node = BoundaryHarness()
+    node.parameter_output_values["output"] = value
+    node.parameter_output_values["agent"] = agent_state if agent_state is not None else {}
+    assert node._secure_hmb_outputs() is False
+    return node
+
+
+# Final natural language is model/policy-owned. The client boundary must not
+# phrase-match, require @source/target keywords, or rewrite a nonempty result.
+natural_outputs = (
+    "Create one coherent shot.",
+    "배우의 움직임과 장면의 분위기를 자연스럽게 연결한다.",
+    (
+        "A concise instruction with no explicit @image, @video, target, authority, "
+        "identity, lighting, or exclusion phrase."
+    ),
+    (
+        '{"final_prompt":"This serialized user-facing text mentions rulesets and '
+        'conversation_memory but is still ordinary string output."}'
+    ),
 )
+for expected in natural_outputs:
+    boundary = clean_output(expected)
+    assert boundary.parameter_output_values["output"] == expected
+    assert boundary.visible_output == expected
+    assert boundary._hmb_last_sanitizer_status == "clean"
 
 
-# A machine-only Prompt generation change invalidates the old publication even
-# when the concise SHOT_PROMPT_IN bytes are unchanged.
-visible = "Visible Prompt"
-visible_hash = hashlib.sha256(visible.encode("utf-8")).hexdigest()
-base_context = {
-    "schema": "hmb-agent-shot-context",
-    "version": 1,
-    "channel_uuid": "11111111-1111-4111-8111-111111111111",
-    "shot_uuid": "22222222-2222-4222-8222-222222222222",
-    "shot_number": 1,
-    "shot_name": "Shot 1",
-    "prompt_generation": 4,
-    "visible_prompt_sha256": visible_hash,
-    "image_media_sha256": "a" * 64,
-    "video_media_sha256": "b" * 64,
+# Private state is still removed from the separate Agent-state port. Runtime
+# scope and sealed policy fields never survive merely because FINAL TEXT is
+# now opaque natural language.
+policy_wrapper = {
+    "agent": {
+        "conversation_memory": {
+            "runs": [
+                {
+                    "input": (
+                        "PUBLIC PROMPT DATA\n"
+                        f"{agent._RUNTIME_FX_SCOPE_HEADER}\n"
+                        "PRIVATE DERIVED RUNTIME SCOPE"
+                    )
+                }
+            ]
+        }
+    },
+    "rulesets": ["PRIVATE SERVER POLICY"],
+    "system": "PRIVATE SYSTEM PROMPT",
+    "nested": {"instructions": "PRIVATE INTERNAL INSTRUCTIONS"},
 }
-probe = object.__new__(agent.HMBAgentLibrary)
-probe._hmb_shot_context = dict(base_context)
-probe._hmb_last_generator_snapshot = {
-    "schema": "hmb-agent-generator-shot-snapshot",
-    "version": 1,
-    **{key: base_context[key] for key in (
-        "channel_uuid", "shot_uuid", "shot_number", "shot_name",
-        "prompt_generation", "visible_prompt_sha256", "image_media_sha256",
-        "video_media_sha256",
-    )},
-    "final_text_sha256": "c" * 64,
+protected = clean_output("Publish this exact final instruction.", policy_wrapper)
+scrubbed_wrapper = protected.parameter_output_values["agent"]
+assert scrubbed_wrapper["rulesets"] == []
+assert scrubbed_wrapper["system"] == agent._PUBLIC_OUTPUT_BLOCKED
+assert scrubbed_wrapper["nested"]["instructions"] == agent._PUBLIC_OUTPUT_BLOCKED
+memory_input = scrubbed_wrapper["agent"]["conversation_memory"]["runs"][0]["input"]
+assert memory_input == "PUBLIC PROMPT DATA"
+assert "PRIVATE" not in str(scrubbed_wrapper)
+
+# A directly supplied native Agent/runtime object is not final natural language
+# and therefore remains fail-closed at the public output port.
+structured_state = {
+    "agent": {
+        "type": "GriptapeNodesAgent",
+        "conversation_memory": {"runs": []},
+    }
 }
-probe._hmb_remote_prompt_publication = {"published": True}
-same_source = SimpleNamespace(
-    _hmb_agent_shot_context=lambda _value: dict(base_context)
-)
-assert probe._invalidate_stale_generator_authority_for_prompt(
-    visible,
-    source_node=same_source,
-) is False
-changed_context = {**base_context, "prompt_generation": 5}
-changed_source = SimpleNamespace(
-    _hmb_agent_shot_context=lambda _value: dict(changed_context)
-)
-assert probe._invalidate_stale_generator_authority_for_prompt(
-    visible,
-    source_node=changed_source,
-) is True
-assert probe._hmb_shot_context == {}
-assert probe._hmb_last_generator_snapshot == {}
-assert probe._hmb_remote_prompt_publication == {}
+blocked = clean_output(structured_state)
+assert blocked.parameter_output_values["output"] == agent._PUBLIC_OUTPUT_BLOCKED
+assert blocked.visible_output == agent._PUBLIC_OUTPUT_BLOCKED
+assert blocked._hmb_last_sanitizer_status == "state"
 
 
-print("HMB Agent/Generator semantic integrity regression passed")
+# A sanitized nonempty result can become the exact selected-Shot publication.
+# Empty text cannot manufacture a successful snapshot/publication.
+final_text = natural_outputs[2]
+shot_context = {
+    "channel_uuid": "channel-regression",
+    "shot_uuid": "shot-regression",
+    "shot_number": 3,
+    "shot_name": "Shot 3",
+    "prompt_generation": 11,
+    "visible_prompt_sha256": "1" * 64,
+    "image_media_sha256": "2" * 64,
+    "video_media_sha256": "3" * 64,
+}
+publisher = BoundaryHarness()
+publisher._hmb_last_generator_snapshot = {
+    "schema": agent._AGENT_GENERATOR_SNAPSHOT_SCHEMA,
+    "version": agent._AGENT_GENERATOR_SNAPSHOT_VERSION,
+    **shot_context,
+    "final_text_sha256": agent._prompt_text_sha256(final_text),
+}
+publication = publisher._hmb_commit_remote_prompt_publication(final_text)
+assert publication["final_text"] == final_text
+assert publication["final_text_sha256"] == agent._prompt_text_sha256(final_text)
+assert publication["shot_uuid"] == "shot-regression"
+assert publisher._hmb_remote_prompt_publication == publication
+
+empty_publisher = BoundaryHarness()
+empty_publisher._hmb_last_generator_snapshot = {
+    "schema": agent._AGENT_GENERATOR_SNAPSHOT_SCHEMA,
+    "version": agent._AGENT_GENERATOR_SNAPSHOT_VERSION,
+    **shot_context,
+    "final_text_sha256": agent._prompt_text_sha256(""),
+}
+try:
+    empty_publisher._hmb_commit_remote_prompt_publication("")
+except RuntimeError as exc:
+    assert str(exc) == "HMB Agent Shot result snapshot is unavailable."
+else:
+    raise AssertionError("Empty Agent output was published to a Shot.")
+assert empty_publisher._hmb_remote_prompt_publication == {}
+
+
+# Guard the actual process orchestration: sanitizer and Shot publication remain
+# present, while the deleted client-side semantic manifest/phrase-rewrite APIs
+# remain absent. This intentionally does not recreate those old validators.
+process_source = textwrap.dedent(inspect.getsource(agent.HMBAgentLibrary.process))
+process_tree = ast.parse(process_source)
+called_names: set[str] = set()
+for node in ast.walk(process_tree):
+    if not isinstance(node, ast.Call):
+        continue
+    if isinstance(node.func, ast.Name):
+        called_names.add(node.func.id)
+    elif isinstance(node.func, ast.Attribute):
+        called_names.add(node.func.attr)
+
+assert "_secure_hmb_outputs" in called_names
+assert "_hmb_commit_remote_prompt_publication" in called_names
+assert "strip" in called_names  # the sole success criterion is nonempty text
+for obsolete_semantic_api in (
+    "_build_final_output_semantic_manifest",
+    "_assert_final_output_semantic_integrity",
+    "_strip_semantic_evidence_tags",
+    "_rewrite_final_output",
+):
+    assert obsolete_semantic_api not in called_names
+    assert not hasattr(agent, obsolete_semantic_api)
+
+print("HMB Agent generator natural-language publication boundary regression: PASS")

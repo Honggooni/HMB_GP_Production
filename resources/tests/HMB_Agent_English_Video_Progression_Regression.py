@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
-import inspect
 from pathlib import Path
-from types import MethodType
+from types import MethodType, SimpleNamespace
 import sys
 
 
@@ -27,28 +26,17 @@ prompt = load("HMBPromptLibrary")
 picker = load("HMBVideoPickerLibrary")
 
 
-# Korean and English are both valid source and final-output languages.  The
-# private native call receives verified runtime facts only; client-side wording
-# and semantic contracts must not be appended.
+# Korean and English are both valid source and final-output languages. The
+# paired machine prompt is opaque Agent input: no client-side taxonomy, scope,
+# wording, or semantic document may be appended or rewritten.
 machine_prompt = "USER DESCRIPTION DATA (JSON):\n{\"scene\":\"천천히 줌인\"}\n"
-runtime_prompt = agent._compose_hmb_runtime_prompt(
-    machine_prompt,
-    {"sources": [], "shared_windows": []},
+input_node = object.__new__(agent.HMBAgentLibrary)
+input_node._hmb_rules_active = True
+input_node._hmb_runtime_prompt = machine_prompt
+input_node._hmb_native_prompt_read_active = True
+assert input_node.get_parameter_value(agent._AGENT_PROMPT_INPUT_PARAMETER) == (
+    machine_prompt
 )
-assert machine_prompt.rstrip() in runtime_prompt
-assert "HMB GENERATOR OUTPUT CONTRACT" not in runtime_prompt
-assert "HMB FINAL OUTPUT SEMANTIC MANIFEST" not in runtime_prompt
-assert "Preserve every source token" not in runtime_prompt
-assert runtime_prompt.rstrip().endswith('{"shared_windows":[],"sources":[]}')
-assert runtime_prompt == agent._compose_hmb_runtime_prompt(
-    machine_prompt,
-    {"sources": [], "shared_windows": []},
-    {"schema": "legacy-semantic-manifest", "sources": ["@image1"]},
-)
-process_source = inspect.getsource(agent.HMBAgentLibrary.process)
-assert "_build_final_output_semantic_manifest" not in process_source
-assert "_assert_final_output_semantic_integrity" not in process_source
-assert "OUTPUT_SEMANTIC_STAGE" not in process_source
 
 
 def sanitizer_node(output: str):
@@ -91,6 +79,10 @@ def forbidden_reconcile():
 prompt_node._reconcile_shared_shot_edges = forbidden_reconcile
 paired = prompt_node._hmb_agent_prompt_snapshot(visible)
 assert paired["machine_prompt"] == prompt_node._hmb_last_machine_prompt_output
+assert agent._paired_machine_prompt(
+    SimpleNamespace(_hmb_verified_prompt_source_node=prompt_node),
+    visible,
+) == paired["machine_prompt"]
 assert prompt_node._hmb_agent_shot_context(visible) == (
     prompt_node._hmb_last_shot_context
 )

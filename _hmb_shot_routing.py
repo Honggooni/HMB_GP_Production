@@ -85,6 +85,7 @@ class _PendingReconcile:
     generation: int
     phase: str
     fingerprint: tuple[str, bool, str, str] | None
+    owner_token: str = ""
 
 
 class _RoutingFlowGate:
@@ -611,20 +612,86 @@ def _schedule_post_reconcile(node: Any, *, phase: str) -> bool:
             # hydration generation that already owns the newest state.
             if phase == "registration" and previous is not None:
                 return True
-            generation = int(_POST_RECONCILE_GENERATIONS.get(node, 0)) + 1
-            _POST_RECONCILE_GENERATIONS[node] = generation
             fingerprint = (
                 _mark_authoritative(node) if phase == "hydrated" else None
             )
-            pending = _PendingReconcile(generation, phase, fingerprint)
+            owner_token = (
+                _clean(
+                    getattr(
+                        node,
+                        "_hmb_reserved_shot_catalog_identity",
+                        "",
+                    ),
+                    4096,
+                )
+                if phase == "hydrated"
+                else ""
+            )
+            # ImageAsset state setters can publish several presentation-only
+            # echoes before the retained event loop runs.  One identical
+            # catalog/fingerprint reservation is enough, while a changed
+            # subscription fingerprint must supersede the older callback so
+            # an active-Shot switch cannot be lost.
+            if (
+                owner_token
+                and previous is not None
+                and previous.phase == "hydrated"
+                and previous.fingerprint == fingerprint
+                and previous.owner_token == owner_token
+            ):
+                return True
+            generation = int(_POST_RECONCILE_GENERATIONS.get(node, 0)) + 1
+            _POST_RECONCILE_GENERATIONS[node] = generation
+            pending = _PendingReconcile(
+                generation,
+                phase,
+                fingerprint,
+                owner_token,
+            )
             _POST_REGISTRATION_PENDING[node] = pending
     except Exception:
         return False
 
-    def clear_pending(current: Any) -> None:
+    def clear_pending(
+        current: Any,
+        *,
+        completed: bool = False,
+        code: str = "cancelled",
+    ) -> None:
+        owned = False
         with _ROUTING_LOCK:
             if _POST_REGISTRATION_PENDING.get(current) is pending:
                 _POST_REGISTRATION_PENDING.pop(current, None)
+                owned = True
+        if (
+            not owned
+            or pending.phase != "hydrated"
+            or not pending.owner_token
+        ):
+            return
+        callback = getattr(
+            current,
+            "_hmb_shot_routing_reconcile_finished",
+            None,
+        )
+        if not callable(callback):
+            return
+        try:
+            callback({
+                "schema": "hmb-shot-routing-reconcile-ack",
+                "version": 1,
+                "phase": pending.phase,
+                "generation": pending.generation,
+                "owner_token": pending.owner_token,
+                "completed": bool(completed),
+                "code": _clean(code, 128) or "cancelled",
+            })
+        except Exception as exc:
+            _LOGGER.warning(
+                "Shot routing completion callback failed for %s: %s",
+                _clean(getattr(current, "name", ""), 512) or "<unnamed>",
+                exc,
+            )
 
     def queue_initial_attempt() -> bool:
         try:
@@ -762,14 +829,22 @@ def _schedule_post_reconcile(node: Any, *, phase: str) -> bool:
             clear_pending(current)
             return
         result_code = result.get("code") if isinstance(result, dict) else ""
-        if result_code in {"not_registered", "reentrant"}:
+        if result_code in {
+            "not_registered",
+            "reentrant",
+            "hydration_pending",
+        }:
             if attempt + 1 < _POST_REGISTRATION_MAX_ATTEMPTS:
                 queue_delayed_attempt(attempt + 1)
             else:
-                clear_pending(current)
+                clear_pending(current, code=f"{result_code}_retry_exhausted")
             return
-        if not isinstance(result, dict) or not result.get("ok", False):
-            clear_pending(current)
+        if (
+            not isinstance(result, dict)
+            or not result.get("ok", False)
+            or result_code != "ready"
+        ):
+            clear_pending(current, code=result_code or "invalid_result")
             return
         if (
             getattr(current, "_hmb_node_deleted", False)
@@ -788,7 +863,7 @@ def _schedule_post_reconcile(node: Any, *, phase: str) -> bool:
         except Exception:
             clear_pending(current)
             return
-        clear_pending(current)
+        clear_pending(current, completed=True, code="ready")
 
     return queue_initial_attempt()
 

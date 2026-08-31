@@ -15,8 +15,8 @@ POLICY_VERSION = "2026-08-27.agent-shot-quality.v4.5"
 POLICY_CONTRACT_SHA256 = (
     "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
 )
-RELEASE_LABEL = "v0.7.11"
-RELEASE_VERSION = "0.7.11"
+RELEASE_LABEL = "v0.7.13"
+RELEASE_VERSION = "0.7.13"
 EXPECTED_RUNTIME_INSTALL_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
@@ -149,7 +149,7 @@ assert len(EXPECTED_SOURCE_FILES) == (
 )
 assert builder.RELEASE_LABEL == RELEASE_LABEL
 assert builder.RELEASE_VERSION == RELEASE_VERSION
-assert builder.release_version_parts(RELEASE_VERSION) == (0, 7, 11)
+assert builder.release_version_parts(RELEASE_VERSION) == (0, 7, 13)
 assert builder.release_label_for_version(RELEASE_VERSION) == RELEASE_LABEL
 builder.validate_release_identity(RELEASE_LABEL, RELEASE_VERSION)
 for invalid_version in (
@@ -165,14 +165,14 @@ for invalid_version in (
         pass
     else:
         raise AssertionError(f"Invalid technical SemVer was accepted: {invalid_version}")
-for mismatched_label in ("v0.7.011", "v0.7.10", "0.7.11"):
+for mismatched_label in ("v0.7.013", "v0.7.12", "0.7.13"):
     try:
         builder.validate_release_identity(mismatched_label, RELEASE_VERSION)
     except RuntimeError:
         pass
     else:
         raise AssertionError(f"Mismatched public release label was accepted: {mismatched_label}")
-assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.7.11_Runtime.zip"
+assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.7.13_Runtime.zip"
 assert builder.ARCHIVE_NAME == f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 assert builder.POLICY_VERSION == POLICY_VERSION
 assert builder.POLICY_CONTRACT_SHA256 == POLICY_CONTRACT_SHA256

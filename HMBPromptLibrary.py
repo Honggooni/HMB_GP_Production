@@ -11004,6 +11004,7 @@ class HMBPromptLibrary(DataNode):
         self._hmb_sync_lock = threading.RLock()
         self._hmb_output_side_effect_local = threading.local()
         self._hmb_sync_generation = 0
+        self._hmb_sync_queued_token = None
         self._hmb_last_prompt_semantic_fingerprint = ""
         self._hmb_last_prompt_output = None
         self._hmb_last_machine_prompt_output = None
@@ -12949,6 +12950,9 @@ class HMBPromptLibrary(DataNode):
             if bool(getattr(self, "_hmb_node_deleted", False)):
                 return {}
             self._hmb_sync_generation += 1
+            # A synchronous authority commit supersedes any deferred request.
+            # Its callback retains the old token and therefore becomes a no-op.
+            self._hmb_sync_queued_token = None
             if allow_picker_hydration_pending:
                 return self._sync_prompt_output_from_state(
                     allow_picker_hydration_pending=True
@@ -12967,16 +12971,21 @@ class HMBPromptLibrary(DataNode):
             if bool(getattr(self, "_hmb_node_deleted", False)):
                 return
             self._hmb_sync_generation += 1
-            generation = self._hmb_sync_generation
+            if getattr(self, "_hmb_sync_queued_token", None) is not None:
+                return
+            queued_token = object()
+            self._hmb_sync_queued_token = queued_token
 
         def run_sync() -> None:
             try:
                 with self._hmb_sync_lock:
                     if (
                         bool(getattr(self, "_hmb_node_deleted", False))
-                        or generation != self._hmb_sync_generation
+                        or queued_token
+                        is not getattr(self, "_hmb_sync_queued_token", None)
                     ):
                         return
+                    self._hmb_sync_queued_token = None
                     self._sync_prompt_output_from_state()
             except Exception as exc:
                 _diagnostic_exception("Deferred PROMPT_OUT synchronization failed", exc)
@@ -13147,6 +13156,7 @@ class HMBPromptLibrary(DataNode):
             self._hmb_sync_generation = (
                 int(getattr(self, "_hmb_sync_generation", 0) or 0) + 1
             )
+            self._hmb_sync_queued_token = None
             self._hmb_prompt_notification_generation = (
                 int(
                     getattr(

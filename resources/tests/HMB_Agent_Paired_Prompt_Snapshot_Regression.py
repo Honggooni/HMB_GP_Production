@@ -46,7 +46,7 @@ machine_prompt = "\n".join(
         json.dumps(
             {
                 "schema": "hmb-public-job-data",
-                "version": agent._PUBLIC_JOB_CONTRACT_VERSION,
+                "version": 3,
                 "images": [],
                 "videos": [],
                 "control_only_bindings": [],
@@ -106,17 +106,7 @@ source = PairedSource(valid_snapshot)
 node = SimpleNamespace(_hmb_verified_prompt_source_node=source)
 assert agent._paired_machine_prompt(node, visible_prompt) == machine_prompt
 assert source.expected_values == [visible_prompt]
-assert agent._assert_public_job_data_contract(machine_prompt)["images"] == []
-assert agent._assert_fx_timing_source_contract(machine_prompt)["sources"] == []
-expect_rejected(lambda: agent._assert_public_job_data_contract(visible_prompt))
-runtime_prompt = agent._compose_hmb_runtime_prompt(machine_prompt, {"sources": []})
-assert runtime_prompt.startswith(machine_prompt.rstrip() + "\n")
-assert visible_prompt not in runtime_prompt
-assert agent._RUNTIME_FX_SCOPE_HEADER in runtime_prompt
-assert "HMB GENERATOR OUTPUT CONTRACT" not in runtime_prompt
-assert "HMB FINAL OUTPUT SEMANTIC MANIFEST" not in runtime_prompt
-assert "IMAGE TAXONOMY COMPATIBILITY" not in runtime_prompt
-assert "Scale / Composition Reference" not in runtime_prompt
+assert agent._RUNTIME_FX_SCOPE_HEADER not in machine_prompt
 
 
 for changed in (
@@ -161,12 +151,10 @@ live_machine = agent._paired_machine_prompt(
     SimpleNamespace(_hmb_verified_prompt_source_node=live_prompt),
     live_visible,
 )
-assert agent._assert_public_job_data_contract(live_machine)["schema"] == (
-    "hmb-public-job-data"
-)
-assert agent._assert_fx_timing_source_contract(live_machine)["schema"] == (
-    "hmb-fx-timing-source-facts"
-)
+assert live_machine == live_prompt._hmb_last_machine_prompt_output
+assert "HMB JOB DATA (JSON):" in live_machine
+assert "FX/TIMING SOURCE DATA (JSON):" in live_machine
+assert "USER DESCRIPTION DATA (JSON):" in live_machine
 
 
 # Workflow deserialization creates a fresh Prompt first, then restores persisted

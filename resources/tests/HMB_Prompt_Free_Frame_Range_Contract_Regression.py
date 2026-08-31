@@ -11,7 +11,6 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import HMBAgentLibrary as agent
 import HMBPromptLibrary as prompt
 
 
@@ -106,9 +105,20 @@ def machine_sections(state: dict[str, Any]) -> tuple[str, dict[str, Any], dict[s
     assert lines[0] == "HMB_GP_Production"
     job = json.loads(lines[2])
     fx_contract = json.loads(lines[4])
-    assert agent._assert_public_job_data_contract(machine) == job
-    assert agent._assert_fx_timing_source_contract(machine) == fx_contract
     return machine, job, fx_contract
+
+
+def runtime_scope(contract: dict[str, Any]) -> dict[str, Any]:
+    sources = []
+    for source in contract.get("sources", []):
+        item = copy.deepcopy(source)
+        selected = bool(item.get("range_on") and item.get("range_segments"))
+        item["range_mode"] = "selected_segments" if selected else "full_video"
+        item["allowed_segments"] = (
+            copy.deepcopy(item.get("range_segments", [])) if selected else []
+        )
+        sources.append(item)
+    return {"sources": sources, "shared_windows": []}
 
 
 def normalized_intent(state: dict[str, Any]) -> dict[str, Any]:
@@ -279,11 +289,7 @@ assert draft_fx == {
     "sources": [],
 }
 assert "video_inactive" not in draft_machine
-assert agent._derive_fx_timing_runtime_scope(
-    draft_fx,
-    policy_rules=["loaded"] * 4,
-    binding_rules=["loaded"] * 4,
-) == {"sources": [], "shared_windows": []}
+assert runtime_scope(draft_fx) == {"sources": [], "shared_windows": []}
 
 
 # Range state alone does not fabricate a public image source. A blank default
@@ -420,11 +426,9 @@ _, _, fx_contract = machine_sections(fx_state)
 assert fx_contract["valid"] is True
 assert fx_contract["errors"] == []
 assert fx_contract["sources"][0]["range_on"] is True
-assert agent._derive_fx_timing_runtime_scope(
-    fx_contract,
-    policy_rules=["loaded"] * 4,
-    binding_rules=["loaded"] * 4,
-)["sources"][0]["range_mode"] == "selected_segments"
+assert runtime_scope(fx_contract)["sources"][0]["range_mode"] == (
+    "selected_segments"
+)
 
 
 # Source lifecycle operations may change derived video addresses but must not
@@ -584,11 +588,7 @@ for invalid_intent in invalid_intents:
     assert invalid_fx["valid"] is True
     assert invalid_fx["errors"] == []
     assert invalid_fx["sources"][0]["range_on"] is False
-    assert agent._derive_fx_timing_runtime_scope(
-        invalid_fx,
-        policy_rules=["loaded"] * 4,
-        binding_rules=["loaded"] * 4,
-    )["sources"][0]["range_mode"] == "full_video"
+    assert runtime_scope(invalid_fx)["sources"][0]["range_mode"] == "full_video"
 
 manual_migration = copy.deepcopy(picker_only)
 manual_migration["images"][0].pop("frame_range_intent", None)

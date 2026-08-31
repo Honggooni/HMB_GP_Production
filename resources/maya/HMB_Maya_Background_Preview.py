@@ -41,7 +41,7 @@ CHARACTER_OUT_RIM_LOCAL_OCCLUSION = 2
 FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE = "hmb_full_smooth_geometry_v2"
 ORIGINAL_VIEWPORT_QUALITY_PROFILE = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
 ORIGINAL_MATERIAL_OVERRIDE_PROFILE = (
-    "per_source_material_lambert_plugin_fallback_v2"
+    "per_source_material_lambert_plugin_fallback_v3"
 )
 ORIGINAL_LAMBERT_ASSIGNMENT_MODE = (
     "original_per_source_material_lambert_plugin_fallback"
@@ -4126,6 +4126,30 @@ def _original_attr_record(material, attributes):
     return {}
 
 
+def _original_output_color_record(material, source_plug=""):
+    """Use a shader's evaluated output when it has no conventional color input.
+
+    Wrapper, layered, switch, sprite and other special-purpose materials often
+    expose only ``outColor`` to their shadingEngine.  That output is still the
+    best available appearance authority for the temporary Maya Lambert.  Keep
+    it as a source plug so loaded native/renderer graphs remain live; an
+    unavailable plug-in automatically falls back to the captured numeric value
+    through ``_OriginalPluginFallbackRequired``.
+    """
+
+    plug = _clean(source_plug) or material + ".outColor"
+    if not _original_plug_exists(plug):
+        return {}
+    return {
+        "material": material,
+        "attribute": "outColor",
+        "plug": plug,
+        "source": plug,
+        "component_sources": [],
+        "value": _plug_value(plug),
+    }
+
+
 def _original_record_sources(record):
     if not isinstance(record, dict):
         return []
@@ -4137,6 +4161,20 @@ def _original_record_sources(record):
         )
         if _clean(item)
     ))
+
+
+def _original_record_has_signal(record):
+    if not isinstance(record, dict) or not record:
+        return False
+    if _original_record_sources(record):
+        return True
+    return any(
+        abs(value) > 1.0e-9
+        for value in _original_vector(
+            record.get("value"),
+            (0.0, 0.0, 0.0),
+        )
+    )
 
 
 def _original_assert_existing_lambert_is_native(material, controller=None):
@@ -4335,6 +4373,8 @@ class _OriginalLambertOverrideController(object):
             "plugin_fallback_material_count": 0,
             "plugin_fallback_node_count": 0,
             "plugin_fallback_records": [],
+            "unsupported_color_fallback_count": 0,
+            "unsupported_color_fallback_materials": [],
             "texture_identity_preserved": True,
             "warnings": [],
             "scoped_shape_path_count": 0,
@@ -4427,7 +4467,7 @@ class _OriginalLambertOverrideController(object):
         visible_names = ", ".join(sorted(unavailable_names)[:8]) or "<unknown>"
         if len(unavailable_names) > 8:
             visible_names += ", and {0} more".format(len(unavailable_names) - 8)
-        self.report["warnings"] = [
+        warning = (
             "Original Playblast replaced {0} material input(s) with captured/default "
             "numeric Maya Lambert values because {1} renderer plug-in node(s) "
             "were unavailable ({2}). The source scene was not changed; affected "
@@ -4436,7 +4476,34 @@ class _OriginalLambertOverrideController(object):
                 len(unavailable_names),
                 visible_names,
             )
-        ]
+        )
+        self.report["warnings"] = [
+            item
+            for item in list(self.report.get("warnings") or [])
+            if not str(item).startswith("Original Playblast replaced ")
+        ] + [warning]
+
+    def _record_unsupported_color_fallback(self, material):
+        materials = sorted(set(
+            list(self.report.get("unsupported_color_fallback_materials") or [])
+            + [_clean(material) or "<unknown>"]
+        ))
+        self.report["unsupported_color_fallback_count"] = len(materials)
+        self.report["unsupported_color_fallback_materials"] = materials[:32]
+        self.report["texture_identity_preserved"] = False
+        warning = (
+            "Original Playblast used a neutral per-material Maya Lambert for "
+            "{0} material(s) that exposed no base, diffuse, emission, or outColor "
+            "input. Shading assignments and the source scene were preserved; "
+            "only those materials may lose texture detail in this preview."
+        ).format(len(materials))
+        self.report["warnings"] = [
+            item
+            for item in list(self.report.get("warnings") or [])
+            if not str(item).startswith(
+                "Original Playblast used a neutral per-material Maya Lambert"
+            )
+        ] + [warning]
 
     @staticmethod
     def _group_members(group):
@@ -4453,7 +4520,7 @@ class _OriginalLambertOverrideController(object):
                 )
             )
 
-    def _create_lambert(self, source_material):
+    def _create_lambert(self, source_material, source_plug=""):
         shader = cmds.shadingNode(
             "lambert",
             asShader=True,
@@ -4483,16 +4550,51 @@ class _OriginalLambertOverrideController(object):
             color_attributes,
         )
         if not color_record:
-            raise RuntimeError(
-                "Original material has no supported base/diffuse color input; "
-                "its texture identity cannot be preserved with Maya Lambert."
+            emission_color_record = _original_attr_record(
+                source_material,
+                _ORIGINAL_EMISSION_INPUT_ATTRIBUTES,
             )
-        color_mode = _original_wire_record(
-            self,
-            color_record,
-            shader + ".color",
-            default=(0.5, 0.5, 0.5),
-        )
+            if _original_record_has_signal(emission_color_record):
+                color_record = emission_color_record
+        if not color_record:
+            color_record = _original_output_color_record(
+                source_material,
+                source_plug,
+            )
+        if not color_record:
+            self._record_unsupported_color_fallback(source_material)
+            color_record = {
+                "material": source_material,
+                "attribute": "neutral_fallback",
+                "plug": "",
+                "source": "",
+                "component_sources": [],
+                "value": [(0.5, 0.5, 0.5)],
+            }
+        try:
+            color_mode = _original_wire_record(
+                self,
+                color_record,
+                shader + ".color",
+                default=(0.5, 0.5, 0.5),
+            )
+        except Exception:
+            # Some renderer wrappers expose a closure or other non-color SG
+            # output even though the plug is named outColor. Maya rejects that
+            # connection to Lambert.color. Localize the degradation to this
+            # one source material instead of cancelling Original and every
+            # other selected Playblast role.
+            if _clean(color_record.get("attribute")) != "outColor":
+                raise
+            self._record_unsupported_color_fallback(source_material)
+            _original_set_vector(
+                shader + ".color",
+                _original_vector(
+                    color_record.get("value"),
+                    (0.5, 0.5, 0.5),
+                ),
+            )
+            color_mode = "numeric"
         if color_mode == "texture":
             self.report["texture_connection_count"] += 1
         elif color_mode == "numeric":
@@ -4696,7 +4798,10 @@ class _OriginalLambertOverrideController(object):
                         continue
                 shader = self.material_cache.get(source_material)
                 if not shader:
-                    shader = self._create_lambert(source_material)
+                    shader = self._create_lambert(
+                        source_material,
+                        source_plug,
+                    )
                     self.material_cache[source_material] = shader
                 self.connections.append((group, source_plug))
                 _original_connect(shader + ".outColor", group + ".surfaceShader")

@@ -246,13 +246,13 @@ for valid_claims in (
     ),
 ):
     valid_package = look_claim_package(*valid_claims)
-    valid_job = agent._assert_public_job_data_contract(valid_package)
+    valid_job, _valid_fx, _valid_user = prompt_sections(valid_package)
     assert [
         (row["image_sub_type"], row["target_id"])
         for row in valid_job["images"][2:]
     ] == list(valid_claims)
 
-for invalid_claims, expected_unbound_tokens in (
+for invalid_claims, _retired_local_conflict_tokens in (
     (
         (
             ("Color Mood", "Hero_A"),
@@ -283,30 +283,18 @@ for invalid_claims, expected_unbound_tokens in (
     ),
 ):
     invalid_package = look_claim_package(*invalid_claims)
-    # v4.5 keeps the public wire contract data-only and structurally valid.
-    # Ambiguous authority fails locally in the private semantic manifest so a
-    # conflicting slot cannot win merely by list order.  A Global Look row may
-    # retain its non-overlapping scene authority, while the narrower row is
-    # fully unbound for the conflicted claim.
-    invalid_job = agent._assert_public_job_data_contract(invalid_package)
+    # The public wire contract remains data-only and transmits every authored
+    # claim without Agent-side semantic rejection.  The authenticated policy
+    # model resolves authority; Generator owns provider/media constraints.
+    invalid_job, _invalid_fx, _invalid_user = prompt_sections(invalid_package)
     assert [
         (row["image_sub_type"], row["target_id"])
         for row in invalid_job["images"][2:]
     ] == list(invalid_claims)
-    invalid_manifest = agent._build_final_output_semantic_manifest(invalid_job)
-    invalid_look_rows = invalid_manifest["images"][2:]
-    assert {
-        row["token"]
-        for row in invalid_look_rows
-        if row["unbound_authority"] is True
-    } == expected_unbound_tokens
-    assert all(
-        any(
-            relation.get("reason") == "look_authority_scope_conflict"
-            for relation in row["unresolved_relations"]
-        )
-        for row in invalid_look_rows
-    )
+
+assert "_assert_final_output_semantic_integrity" not in agent_source
+assert "_build_final_output_semantic_manifest" not in agent_source
+assert "_assert_public_job_data_contract(machine_prompt)" not in agent_source
 
 # Multiple video sources remain independent rows in one closed job schema.
 multi = prompt._default_widget_state()

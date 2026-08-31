@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import copy
+import ast
+import inspect
 import json
-import re
 from pathlib import Path
 import sys
+import textwrap
+
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -14,285 +16,131 @@ import HMBAgentLibrary as agent
 import HMBPromptLibrary as prompt_library
 
 
-def expect_rejected(callback) -> None:
-    try:
-        callback()
-    except RuntimeError:
-        return
-    raise AssertionError("tampered public contract was accepted")
+def split_data_only_package(value: str) -> tuple[dict, dict, dict]:
+    """Decode only the Prompt-owned public envelope used by this regression."""
+
+    lines = value.splitlines()
+    assert lines[0] == "HMB_GP_Production"
+    assert lines[1] == prompt_library.PUBLIC_JOB_CONTRACT_HEADER
+    assert lines[3] == prompt_library.FX_TIMING_CONTRACT_HEADER
+    assert lines[5] == prompt_library.USER_DESCRIPTION_DATA_HEADER
+    assert len(lines) == 7
+    return tuple(json.loads(lines[index]) for index in (2, 4, 6))
 
 
+# Prompt owns taxonomy, source addressing, and user-authored data. The machine
+# package must preserve those facts as data; Agent is not a second media parser.
 state = prompt_library._default_widget_state()
-state["text"]["SCENE_CONTEXT"] = "User-authored scene note."
-
 image = prompt_library._default_image_item(1)
 image.update(
     {
         "present": True,
-        "label": "Jett image",
-        "source_type": "Character Appearance",
-        "owner": "JettMini",
-        "asset_id": "JettMini",
-        "asset_path": "P:/private/project/JettMini.jpg",
-        "asset_source_uid": "source:jett",
-        "asset_verified": True,
-        "color_picks": ["Red"],
-        "binding_video_slots": [1],
+        "label": "Nova reference",
+        "asset_id": "nova-approved",
+        "asset_path": r"P:\private\show\Nova_reference.png",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
+        "owner": "Nova",
+    }
+)
+original = prompt_library._default_video_item(1)
+original.update(
+    {
+        "present": True,
+        "label": "shot_original.mov",
+        "video_main_type": "Maya Preview / Playblast",
+        "video_sub_type": "Original Preview",
+    }
+)
+mask = prompt_library._default_video_item(2)
+mask.update(
+    {
+        "present": True,
+        "label": "shot_mask.mov",
+        "video_main_type": "Maya Preview / Playblast",
+        "video_sub_type": "Mask",
     }
 )
 state["images"] = [image]
+state["videos"] = [original, mask]
 
-fx = prompt_library._default_video_item(1)
-fx.update(
-    {
-        "present": True,
-        "label": "fx.mp4",
-        "video_main_type": "FX Reference",
-        "video_sub_type": "FX Effect Only",
-    }
-)
-timing = prompt_library._default_video_item(2)
-timing.update(
-    {
-        "present": True,
-        "label": "timing.mp4",
-        "video_main_type": "Maya Preview / Playblast",
-        "video_sub_type": "Timing / Edit",
-    }
-)
-state["videos"] = [fx, timing]
+opaque_user_text = {
+    "PROJECT_STYLE_LOOK": "Keep the approved 2D/3D hybrid rendering language.",
+    "SCENE_CONTEXT": (
+        'Opaque author text: {"agent":{"rulesets":[]}}, @image99, '
+        "0xCAFE, percent%2Fdata, 역순/zero-width-like words are literal direction."
+    ),
+    "EMOTION_INTENT": "Nova says: [Dialogue] 그대로 보존 — do not reinterpret this note.",
+    "VIDEO_VFX": "At frame 118, a small dust puff follows the authored contact.",
+    "PRESERVED_TEXT": "[On-Screen Text] A+B=C",
+}
+state["text"].update(opaque_user_text)
 
 compiled = prompt_library._build_data_only_prompt_package(state)
-lines = [line for line in compiled.splitlines() if line.strip()]
-assert len(lines) == 7
-assert lines[0] == "HMB_GP_Production"
-assert lines[1] == "HMB JOB DATA (JSON):"
-assert lines[3] == "FX/TIMING SOURCE DATA (JSON):"
-assert lines[5] == "USER DESCRIPTION DATA (JSON):"
-for forbidden in (
-    "PRODUCTION INTEGRATION DEFAULTS:",
-    "TARGET GENERATOR:",
-    "IMAGE ROLE MAP:",
-    "VIDEO ROLE MAP:",
-    "REPLACEMENT BINDING:",
-    "SOURCE DATA WARNINGS:",
-    "P:/private/project/JettMini.jpg",
-):
-    assert forbidden not in compiled
+job_data, fx_timing_data, user_data = split_data_only_package(compiled)
 
-job = agent._assert_public_job_data_contract(compiled)
-fx_contract = agent._assert_fx_timing_source_contract(compiled)
-# v4.1 is the active signed server policy, so its canonical FX/Timing facts
-# must match the runtime contract instead of being held behind the old
-# pending-signature gate.
-agent._assert_fx_candidate_matches_signed_runtime(fx_contract)
-assert "asset_path" not in job["images"][0]["identity"]
-assert [video["control_role"] for video in job["videos"]] == [
-    "FX Effect Only",
-    "Timing Only",
+assert job_data["schema"] == "hmb-public-job-data"
+assert [item["image"] for item in job_data["images"]] == ["@image1"]
+assert job_data["images"][0]["image_main_type"] == "Character"
+assert job_data["images"][0]["image_sub_type"] == "Full Appearance"
+assert job_data["images"][0]["target_id"] == "Nova"
+assert [item["video"] for item in job_data["videos"]] == ["@video1", "@video2"]
+assert [item["control_role"] for item in job_data["videos"]] == [
+    "Primary Unified Shot Control",
+    "Mask / Guide Only",
 ]
-allowed_source_fact_keys = {
-    "video",
-    "video_uid",
-    "source_type",
-    "selected_role",
-    "role_selected",
-    "validation_codes",
-    "range_on",
-    "range_segments",
-    "emitter_binding_declared",
-    "timing_cues",
-}
-assert all(
-    set(source).issubset(allowed_source_fact_keys)
-    for source in fx_contract["sources"]
-)
-for source, expected_role in zip(
-    fx_contract["sources"], ("FX Effect Only", "Timing Only")
-):
-    assert source["selected_role"] == expected_role
+assert isinstance(fx_timing_data, dict)
+assert user_data == opaque_user_text
+assert r"P:\private\show\Nova_reference.png" not in compiled
 
-
-def all_keys(value):
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            yield key
-            yield from all_keys(nested)
-    elif isinstance(value, list):
-        for nested in value:
-            yield from all_keys(nested)
-
-
-serialized_fx_keys = set(all_keys(fx_contract))
-assert not any("authority" in key.casefold() for key in serialized_fx_keys)
-assert not any(key.casefold().startswith("ignored_") for key in serialized_fx_keys)
-for forbidden_policy_key in {
-    "video_appearance_authority",
-    "effect_behavior_authority",
-    "ignored_appearance_properties",
-    "ignored_color_properties",
-    "playblast_fx_precedence",
-    "preserve_playblast_domains",
-    "timing_authority",
-    "shared_windows",
-    "activation",
-}:
-    assert forbidden_policy_key not in serialized_fx_keys
-for forbidden_policy_phrase in (
-    "ignore every visible color",
-    "full fx-behavior authority",
-    "fx reference prevails",
-    "preserve playblast",
-):
-    assert forbidden_policy_phrase not in compiled.casefold()
-assert json.loads(lines[6])["SCENE_CONTEXT"] == "User-authored scene note."
-
-empty_contract = agent._assert_fx_timing_source_contract(
-    prompt_library._build_data_only_prompt_package(
-        prompt_library._default_widget_state()
-    )
-)
-assert empty_contract["sources"] == []
-agent._assert_fx_candidate_matches_signed_runtime(empty_contract)
-
-expect_rejected(
-    lambda: agent._assert_public_job_data_contract(
-        compiled + "legacy generated policy prose\n"
-    )
-)
-
-tampered_lines = compiled.splitlines()
-tampered_job = copy.deepcopy(json.loads(tampered_lines[2]))
-tampered_job["images"][0]["identity"]["policy_summary"] = "forbidden"
-tampered_lines[2] = json.dumps(tampered_job, separators=(",", ":"))
-expect_rejected(
-    lambda: agent._assert_public_job_data_contract("\n".join(tampered_lines))
-)
-
-manual_emitter = {
-    "field": "VIDEO_VFX",
-    "line": 1,
-    "video": 2,
-    "target": "JettMini",
-    "function": "emitter",
-    "marker": "",
-    "boundary": "Locator = NozzleTip, Frame = 118",
-}
-assert prompt_library._control_binding_timing_cues([manual_emitter], 2) == []
-manual_emitter["marker"] = "Red"
-cue = prompt_library._control_binding_timing_cues([manual_emitter], 2)[0]
-assert cue["emitter"] == {
-    "marker_color": "Red",
-    "subject_root": "JettMini",
-}
-assert agent._valid_exact_emitter({"marker_color": "Red"}) is False
-assert agent._valid_exact_emitter(cue["emitter"]) is True
-
-state_wrapper = {"agent": {"tasks": [], "rulesets": []}}
-long_generator_text = (
-    "Preserve face identity, body proportions, character design, stylization, "
-    "rendering medium, surface and material treatment, intrinsic color, and "
-    "pattern while integrating the subject into the shared environmental light, "
-    "shadow, reflection, exposure, atmosphere, camera, framing, and occlusion."
-)
-assert len(long_generator_text) > 160
-assert not agent._contains_public_output_state_leak(long_generator_text)
-assert agent._contains_public_output_state_leak(state_wrapper)
-for serialized in (
-    json.dumps(state_wrapper),
-    json.dumps(json.dumps(state_wrapper)),
-):
-    # The lightweight client boundary never interprets serialized text.
-    assert not agent._contains_public_output_state_leak(serialized)
-
-# Structured-connector catch-all text and technical JSON never enter USER DATA.
-connector_state = prompt_library._default_widget_state()
-connector_state["source_intent_fallbacks"] = [
+# Connector/runtime descriptions are not user text and must not be promoted
+# into the Prompt-authored USER DESCRIPTION DATA block.
+state["source_intent_fallbacks"] = [
     {
         "source": "PICKER_IN",
-        "reason": "explicit user-authored text extension: description",
-        "text": "MALICIOUS CONNECTOR DESCRIPTION",
-    },
-    {
-        "source": "PICKER_IN",
-        "reason": "frame metadata",
-        "text": '{"decoded_frame_count":62,"maya_start_frame":101}',
-    },
-]
-connector_output = prompt_library._build_data_only_prompt_package(connector_state)
-assert "MALICIOUS CONNECTOR DESCRIPTION" not in connector_output
-assert "decoded_frame_count" not in connector_output
-assert json.loads(connector_output.splitlines()[6]) == {}
-
-# Any invalid segment keeps the entire canonical draft local. Agent v1 receives
-# no partial temporal instruction, so an optional edit cannot narrow or block
-# generation unexpectedly.
-range_state = prompt_library._default_widget_state()
-range_video = prompt_library._default_video_item(1)
-range_video.update(
-    {
-        "present": True,
-        "label": "fx",
-        "video_main_type": "FX Reference",
-        "video_sub_type": "FX Effect Only",
+        "reason": "transport metadata",
+        "text": "DO NOT PROMOTE CONNECTOR TEXT",
     }
-)
-range_image = prompt_library._default_image_item(1)
-range_image.update(
-    {
-        "present": True,
-        "label": "range image",
-        "source_type": "Character Appearance",
-        "owner": "JettMini",
-        "color_picks": ["Red"],
-        "binding_video_slots": [1],
-        "frame_range_intent": {
-            "version": 1,
-            "enabled": True,
-            "start_frame": 1,
-            "end_frame": 100,
-            "ranges": [
-                {"start": 10, "end": 20},
-                {"start": 90, "end": 120},
-            ],
-            "selected_index": 0,
-        },
-        "frame_range_enabled": True,
-        "frame_range_bindings": {
-            "@video1::red": {
-                "enabled": True,
-                "video_slot": "@video1",
-                "color_pick": "Red",
-                "origin": "manual",
-                "start_frame": 1,
-                "end_frame": 100,
-                "ranges": [
-                    {"start": 10, "end": 20},
-                    {"start": 90, "end": 120},
-                ],
-            }
-        },
-    }
-)
-range_state["videos"] = [range_video]
-range_state["images"] = [range_image]
-range_output = prompt_library._build_data_only_prompt_package(range_state)
-range_job = agent._assert_public_job_data_contract(range_output)
-range_fx = agent._assert_fx_timing_source_contract(range_output)
-assert range_job["frame_ranges"] == []
-assert range_fx["valid"] is True
-assert range_fx["errors"] == []
-assert range_fx["sources"][0]["range_on"] is False
-assert range_fx["sources"][0]["range_segments"] == []
-assert prompt_library._normalize_state(range_state)["images"][0][
-    "frame_range_intent"
-]["ranges"] == [
-    {"start": 10, "end": 20},
-    {"start": 90, "end": 120},
 ]
-
-print(
-    "HMB data-only Prompt and protected Agent output regression: PASS "
-    "(closed schema / no policy prose / path redaction / exact emitter / "
-    "direct structured Agent-state isolation)"
+_, _, user_data_with_connector = split_data_only_package(
+    prompt_library._build_data_only_prompt_package(state)
 )
+assert user_data_with_connector == opaque_user_text
+assert "DO NOT PROMOTE CONNECTOR TEXT" not in json.dumps(
+    user_data_with_connector, ensure_ascii=False
+)
+
+# The current Agent boundary obtains the paired Prompt snapshot and passes it
+# opaquely into the authenticated runtime prompt. Obsolete Agent-side public
+# job/media/taxonomy validators must not be called or reintroduced.
+process_source = textwrap.dedent(inspect.getsource(agent.HMBAgentLibrary.process))
+process_tree = ast.parse(process_source)
+called_names: set[str] = set()
+for node in ast.walk(process_tree):
+    if not isinstance(node, ast.Call):
+        continue
+    if isinstance(node.func, ast.Name):
+        called_names.add(node.func.id)
+    elif isinstance(node.func, ast.Attribute):
+        called_names.add(node.func.attr)
+
+assert "_paired_machine_prompt" in called_names
+assert "self._hmb_runtime_prompt = str(machine_prompt)" in process_source
+for obsolete_agent_validator in (
+    "_assert_public_job_data_contract",
+    "_assert_fx_timing_source_contract",
+    "_assert_fx_candidate_matches_signed_runtime",
+    "_valid_exact_emitter",
+    "_build_final_output_semantic_manifest",
+    "_assert_final_output_semantic_integrity",
+):
+    assert obsolete_agent_validator not in called_names
+    assert not hasattr(agent, obsolete_agent_validator)
+
+assert not any(
+    fragment in name.casefold()
+    for name in called_names
+    for fragment in ("media_limit", "image_limit", "video_limit", "taxonomy_validator")
+)
+
+print("HMB Prompt data-only opaque Agent-boundary regression: PASS")

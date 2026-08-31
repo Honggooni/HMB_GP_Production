@@ -71,11 +71,13 @@ class FakeMaterialCmds(types.ModuleType):
         fail_target: str = "",
         fail_restore_target: str = "",
         fail_viewport_attr: str = "",
+        fail_color_source: str = "",
     ) -> None:
         super().__init__("maya.cmds")
         self.fail_target = fail_target
         self.fail_restore_target = fail_restore_target
         self.fail_viewport_attr = fail_viewport_attr
+        self.fail_color_source = fail_color_source
         self.counter = 0
         self.node_types: dict[str, str] = {
             "meshA": "mesh",
@@ -387,6 +389,12 @@ class FakeMaterialCmds(types.ModuleType):
 
     def connectAttr(self, source, target, force=False):
         assert force is True
+        if (
+            self.fail_color_source == source
+            and "HMB_Original_" in target
+            and target.endswith(".color")
+        ):
+            raise RuntimeError("intentional incompatible shader output")
         if self.fail_target == target and "HMB_Original_" in source:
             raise RuntimeError("intentional SG swap failure")
         if (
@@ -672,6 +680,185 @@ assert fallback_finished["restore_ok"] is True
 assert original_connections(fallback_fake) == fallback_before
 
 
+# Wrapper/switch materials may expose no conventional base/diffuse input even
+# though their exact shadingEngine source output is valid.  Bridge that output
+# into one disposable Lambert per source material and restore both SGs that
+# share the same wrapper afterwards.
+wrapper_fake = FakeMaterialCmds()
+wrapper_fake.node_types["RedMat"] = "RedshiftMaterialBlender"
+wrapper_fake.connections.pop("RedMat.base_color", None)
+wrapper_fake.attr_types.pop("RedMat.base_color", None)
+runner.cmds = wrapper_fake
+wrapper_before = original_connections(wrapper_fake)
+wrapper_controller = runner._OriginalLambertOverrideController({
+    "original_material_override_profile": runner.ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
+    "_viewport_quality_scope_shapes": list(BASE_SCOPE_SHAPES),
+})
+wrapper_applied = wrapper_controller.apply()
+wrapper_red_shader = wrapper_fake.connections[
+    "redSG.surfaceShader"
+].split(".", 1)[0]
+assert wrapper_red_shader == wrapper_fake.connections[
+    "redSG2.surfaceShader"
+].split(".", 1)[0]
+assert wrapper_fake.connections[wrapper_red_shader + ".color"] == (
+    "RedMat.outColor"
+)
+assert wrapper_applied["temporary_lambert_count"] == 4
+assert wrapper_applied["texture_connection_count"] == 3
+assert wrapper_applied["numeric_color_count"] == 1
+assert wrapper_applied["loaded_plugin_passthrough_count"] >= 1
+assert wrapper_applied["plugin_fallback_count"] == 0
+assert wrapper_applied["unsupported_color_fallback_count"] == 0
+assert wrapper_applied["texture_identity_preserved"] is True
+wrapper_finished = wrapper_controller.finish()
+assert wrapper_finished["restore_ok"] is True
+assert original_connections(wrapper_fake) == wrapper_before
+
+
+# A renderer closure may be connected to SG.surfaceShader through a plug that
+# is named outColor but is not type-compatible with Lambert.color.  Keep the
+# other source materials intact and use the captured numeric value only for
+# that one incompatible wrapper.
+closure_fake = FakeMaterialCmds(fail_color_source="RedMat.outColor")
+closure_fake.node_types["RedMat"] = "RedshiftMaterialBlender"
+closure_fake.connections.pop("RedMat.base_color", None)
+closure_fake.attr_types.pop("RedMat.base_color", None)
+runner.cmds = closure_fake
+closure_before = original_connections(closure_fake)
+closure_controller = runner._OriginalLambertOverrideController({
+    "original_material_override_profile": runner.ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
+    "_viewport_quality_scope_shapes": list(BASE_SCOPE_SHAPES),
+})
+closure_applied = closure_controller.apply()
+closure_red_shader = closure_fake.connections[
+    "redSG.surfaceShader"
+].split(".", 1)[0]
+assert closure_fake.values[closure_red_shader + ".color"] == [
+    (0.5, 0.5, 0.5)
+]
+assert closure_applied["temporary_lambert_count"] == 4
+assert closure_applied["texture_connection_count"] == 2
+assert closure_applied["numeric_color_count"] == 2
+assert closure_applied["plugin_fallback_count"] == 0
+assert closure_applied["unsupported_color_fallback_count"] == 1
+assert closure_applied["unsupported_color_fallback_materials"] == ["RedMat"]
+assert closure_applied["texture_identity_preserved"] is False
+closure_finished = closure_controller.finish()
+assert closure_finished["restore_ok"] is True
+assert original_connections(closure_fake) == closure_before
+
+
+# An emission-only material still has an authored color/texture authority.
+# Reuse that graph for Lambert.color before falling back to the shader output,
+# and keep its incandescence transfer as the existing appearance aid.
+emission_fake = FakeMaterialCmds()
+emission_fake.node_types["RedMat"] = "RedshiftIncandescent"
+emission_fake.connections.pop("RedMat.base_color", None)
+emission_fake.attr_types.pop("RedMat.base_color", None)
+emission_fake.connections["RedMat.emission_color"] = "redFile.outColor"
+emission_fake.attr_types["RedMat.emission_color"] = "double3"
+runner.cmds = emission_fake
+emission_before = original_connections(emission_fake)
+emission_controller = runner._OriginalLambertOverrideController({
+    "original_material_override_profile": runner.ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
+    "_viewport_quality_scope_shapes": list(BASE_SCOPE_SHAPES),
+})
+emission_applied = emission_controller.apply()
+emission_red_shader = emission_fake.connections[
+    "redSG.surfaceShader"
+].split(".", 1)[0]
+assert emission_fake.connections[emission_red_shader + ".color"] == (
+    "redFile.outColor"
+)
+assert emission_fake.connections[emission_red_shader + ".incandescence"] == (
+    "redFile.outColor"
+)
+assert emission_applied["temporary_lambert_count"] == 4
+assert emission_applied["texture_connection_count"] == 3
+assert emission_applied["numeric_color_count"] == 1
+assert emission_applied["emission_transfer_count"] == 1
+assert emission_applied["plugin_fallback_count"] == 0
+assert emission_applied["unsupported_color_fallback_count"] == 0
+assert emission_applied["texture_identity_preserved"] is True
+emission_finished = emission_controller.finish()
+assert emission_finished["restore_ok"] is True
+assert original_connections(emission_fake) == emission_before
+
+
+# On a workstation without the renderer plug-in, an output-only wrapper is an
+# unknown node.  The exact SG output must enter the established deterministic
+# numeric plug-in fallback rather than aborting every checked playblast role.
+unknown_wrapper_fake = FakeMaterialCmds()
+unknown_wrapper_fake.node_types["RedMat"] = "unknown"
+unknown_wrapper_fake.connections.pop("RedMat.base_color", None)
+unknown_wrapper_fake.attr_types.pop("RedMat.base_color", None)
+runner.cmds = unknown_wrapper_fake
+unknown_wrapper_before = original_connections(unknown_wrapper_fake)
+unknown_wrapper_controller = runner._OriginalLambertOverrideController({
+    "original_material_override_profile": runner.ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
+    "_viewport_quality_scope_shapes": list(BASE_SCOPE_SHAPES),
+})
+unknown_wrapper_applied = unknown_wrapper_controller.apply()
+unknown_wrapper_red_shader = unknown_wrapper_fake.connections[
+    "redSG.surfaceShader"
+].split(".", 1)[0]
+assert unknown_wrapper_fake.values[
+    unknown_wrapper_red_shader + ".color"
+] == [(0.5, 0.5, 0.5)]
+assert unknown_wrapper_applied["temporary_lambert_count"] == 4
+assert unknown_wrapper_applied["texture_connection_count"] == 2
+assert unknown_wrapper_applied["numeric_color_count"] == 2
+assert unknown_wrapper_applied["plugin_fallback_count"] == 1
+assert unknown_wrapper_applied["plugin_fallback_material_count"] == 1
+assert unknown_wrapper_applied["plugin_fallback_node_count"] == 1
+assert unknown_wrapper_applied["unsupported_color_fallback_count"] == 0
+assert unknown_wrapper_applied["texture_identity_preserved"] is False
+assert "RedMat" in unknown_wrapper_applied["warnings"][0]
+unknown_wrapper_finished = unknown_wrapper_controller.finish()
+assert unknown_wrapper_finished["restore_ok"] is True
+assert original_connections(unknown_wrapper_fake) == unknown_wrapper_before
+
+
+# A malformed/special material may expose neither a known input nor a readable
+# SG output.  It still receives its own neutral Lambert, is reported as a
+# localized degradation, and cannot invalidate the other material identities.
+no_output_fake = FakeMaterialCmds()
+no_output_fake.node_types["RedMat"] = "UnsupportedNoOutput"
+no_output_fake.connections.pop("RedMat.base_color", None)
+no_output_fake.attr_types.pop("RedMat.base_color", None)
+no_output_fake.attr_types.pop("RedMat.outColor", None)
+runner.cmds = no_output_fake
+no_output_before = original_connections(no_output_fake)
+no_output_controller = runner._OriginalLambertOverrideController({
+    "original_material_override_profile": runner.ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
+    "_viewport_quality_scope_shapes": list(BASE_SCOPE_SHAPES),
+})
+no_output_applied = no_output_controller.apply()
+no_output_red_shader = no_output_fake.connections[
+    "redSG.surfaceShader"
+].split(".", 1)[0]
+assert no_output_red_shader == no_output_fake.connections[
+    "redSG2.surfaceShader"
+].split(".", 1)[0]
+assert no_output_fake.values[no_output_red_shader + ".color"] == [
+    (0.5, 0.5, 0.5)
+]
+assert no_output_applied["temporary_lambert_count"] == 4
+assert no_output_applied["texture_connection_count"] == 2
+assert no_output_applied["numeric_color_count"] == 2
+assert no_output_applied["plugin_fallback_count"] == 0
+assert no_output_applied["unsupported_color_fallback_count"] == 1
+assert no_output_applied["unsupported_color_fallback_materials"] == [
+    "RedMat"
+]
+assert no_output_applied["texture_identity_preserved"] is False
+assert "neutral per-material Maya Lambert" in no_output_applied["warnings"][0]
+no_output_finished = no_output_controller.finish()
+assert no_output_finished["restore_ok"] is True
+assert original_connections(no_output_fake) == no_output_before
+
+
 # A loaded renderer texture remains the source itself. No filename-only Maya
 # file clone is created, so color space, UDIM, UV, and sequence behavior are not
 # silently re-authored.
@@ -889,6 +1076,8 @@ with tempfile.TemporaryDirectory(prefix="HMB_Original_Lambert_Cache_") as root:
         "plugin_fallback_material_count": 0,
         "plugin_fallback_node_count": 0,
         "plugin_fallback_records": [],
+        "unsupported_color_fallback_count": 0,
+        "unsupported_color_fallback_materials": [],
         "texture_identity_preserved": True,
         "warnings": [],
         "transparency_transfer_count": 1,
@@ -946,6 +1135,8 @@ with tempfile.TemporaryDirectory(prefix="HMB_Original_Lambert_Cache_") as root:
             "fallback_mode": "captured_numeric",
             "fallback_value": [0.21, 0.31, 0.41],
         }],
+        "unsupported_color_fallback_count": 0,
+        "unsupported_color_fallback_materials": [],
         "texture_identity_preserved": False,
         "warnings": ["Original used a numeric plug-in fallback."],
     })

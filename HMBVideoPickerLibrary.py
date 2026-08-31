@@ -115,7 +115,7 @@ PROXY_H264_LEVEL = "4.2"
 FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE = "hmb_full_smooth_geometry_v2"
 ORIGINAL_VIEWPORT_QUALITY_PROFILE = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
 ORIGINAL_MATERIAL_OVERRIDE_PROFILE = (
-    "per_source_material_lambert_plugin_fallback_v2"
+    "per_source_material_lambert_plugin_fallback_v3"
 )
 ORIGINAL_LAMBERT_ASSIGNMENT_MODE = (
     "original_per_source_material_lambert_plugin_fallback"
@@ -4621,6 +4621,89 @@ def _apply_picker_authoring_context(
     context = _normalize_picker_authoring_context(value)
     for key in _PICKER_AUTHORING_CONTEXT_FIELDS:
         state[key] = copy.deepcopy(context[key])
+
+
+def _restore_picker_workspace_projection(
+    state: Dict[str, Any],
+    workspace: Any,
+) -> bool:
+    """Restore one durable workspace before global compatibility projection.
+
+    ``_normalize_picker_workspace_fields`` intentionally mirrors the active
+    workspace through legacy top-level controls.  When the previous active
+    Shot was just deleted, those controls still belong to the removed row and
+    must be replaced before normalization selects a surviving fallback.
+    """
+
+    if not isinstance(state, dict) or not isinstance(workspace, dict):
+        return False
+    workspace_uuid = _uuid_text(workspace.get("workspace_uuid"))
+    if not workspace_uuid:
+        return False
+    try:
+        current_frame = float(workspace.get("current_frame") or 0.0)
+        if not math.isfinite(current_frame):
+            current_frame = 0.0
+    except Exception:
+        current_frame = 0.0
+    try:
+        selected_video_slot = max(
+            1,
+            int(workspace.get("selected_video_slot") or 1),
+        )
+    except Exception:
+        selected_video_slot = 1
+    preview_video_uid = _clean(workspace.get("preview_video_uid"))
+    selected_order = {
+        _clean(uid): index
+        for index, uid in enumerate(
+            workspace.get("selected_video_uids", []),
+            start=1,
+        )
+        if _clean(uid)
+    }
+    projected_videos: List[Dict[str, Any]] = []
+    for raw in state.get("videos", []):
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        uid = _clean(item.get("video_uid") or item.get("source_uid"))
+        order = selected_order.get(uid, 0)
+        item["selected"] = bool(order)
+        item["selection_order"] = order
+        item["video_slot"] = order
+        if isinstance(item.get("frame_metadata"), dict):
+            item["frame_metadata"] = dict(item["frame_metadata"])
+            item["frame_metadata"]["video_slot"] = (
+                f"@video{order}" if order else ""
+            )
+        projected_videos.append(item)
+    state.update({
+        "active_picker_shot_uuid": workspace_uuid,
+        "videos": projected_videos,
+        "active_slot_count": max(1, len(selected_order)),
+        "selected_video_count": len(selected_order),
+        "preview_video_uid": preview_video_uid,
+        "selected_video_uid": preview_video_uid,
+        "scene_draft_path": _maya_scene_path_text(
+            workspace.get("scene_draft_path")
+        ),
+        "current_frame": current_frame,
+        "viewport_mode": (
+            "snapshot"
+            if _clean(workspace.get("viewport_mode")).lower() == "snapshot"
+            else "video"
+        ),
+        "active_snapshot_uid": _clean(
+            workspace.get("active_snapshot_uid")
+        ),
+        "selected_video_slot": selected_video_slot,
+    })
+    _apply_picker_authoring_context(
+        state,
+        workspace.get("authoring_context"),
+    )
+    return True
 
 
 def _new_picker_workspace_row(
@@ -11642,6 +11725,7 @@ def _original_material_report_is_valid(report: Any) -> bool:
         "plugin_fallback_count",
         "plugin_fallback_material_count",
         "plugin_fallback_node_count",
+        "unsupported_color_fallback_count",
         "swapped_shading_engine_count",
     )
     if any(
@@ -11658,9 +11742,12 @@ def _original_material_report_is_valid(report: Any) -> bool:
     except (TypeError, ValueError):
         return False
     fallback_records = source.get("plugin_fallback_records")
+    unsupported_materials = source.get("unsupported_color_fallback_materials")
     loaded_plugin_nodes = source.get("loaded_plugin_nodes")
     warnings = source.get("warnings")
     if not isinstance(fallback_records, list):
+        return False
+    if not isinstance(unsupported_materials, list):
         return False
     if not isinstance(loaded_plugin_nodes, list):
         return False
@@ -11669,6 +11756,7 @@ def _original_material_report_is_valid(report: Any) -> bool:
     fallback_count = counts["plugin_fallback_count"]
     fallback_material_count = counts["plugin_fallback_material_count"]
     fallback_node_count = counts["plugin_fallback_node_count"]
+    unsupported_count = counts["unsupported_color_fallback_count"]
     loaded_plugin_count = counts["loaded_plugin_passthrough_count"]
     return bool(
         _clean(source.get("profile"))
@@ -11696,13 +11784,23 @@ def _original_material_report_is_valid(report: Any) -> bool:
         == counts["temporary_lambert_count"]
         and fallback_material_count <= counts["temporary_lambert_count"]
         and fallback_material_count <= fallback_count
-        and (fallback_count == 0) == bool(
+        and unsupported_count <= counts["temporary_lambert_count"]
+        and (fallback_count == 0 and unsupported_count == 0) == bool(
             source.get("texture_identity_preserved")
         )
         and len(fallback_records) == min(fallback_count, 32)
+        and len(unsupported_materials) == min(unsupported_count, 32)
+        and len(set(unsupported_materials)) == len(unsupported_materials)
+        and all(
+            isinstance(material, str) and bool(material.strip())
+            for material in unsupported_materials
+        )
         and len(loaded_plugin_nodes) == min(loaded_plugin_count, 32)
         and (fallback_count == 0 or fallback_node_count > 0)
-        and (fallback_count == 0 or bool(warnings))
+        and (
+            fallback_count == 0 and unsupported_count == 0
+            or bool(warnings)
+        )
     )
 
 
@@ -14003,13 +14101,102 @@ class HMBVideoPickerLibrary(DataNode):
             if isinstance(row, dict)
             and _uuid_text(row.get("bound_shot_uuid"))
         }
+        workspaces_by_uuid = {
+            _uuid_text(row.get("workspace_uuid")): dict(row)
+            for row in current.get("picker_shots", [])
+            if isinstance(row, dict)
+            and _uuid_text(row.get("workspace_uuid"))
+        }
         selected_shot_uuid = _uuid_text(current.get("shot_uuid"))
         catalog_ids = {item["shot_uuid"] for item in snapshot["shots"]}
-        if selected_shot_uuid and selected_shot_uuid not in catalog_ids:
+        selected_shot_deleted = bool(
+            selected_shot_uuid and selected_shot_uuid not in catalog_ids
+        )
+        requested_active_workspace_uuid = _uuid_text(
+            current.get("active_picker_shot_uuid")
+        )
+        requested_active_workspace = workspaces_by_uuid.get(
+            requested_active_workspace_uuid
+        )
+        requested_active_bound_uuid = _uuid_text(
+            requested_active_workspace.get("bound_shot_uuid")
+            if isinstance(requested_active_workspace, dict)
+            else ""
+        )
+        active_workspace_deleted = bool(
+            requested_active_bound_uuid
+            and requested_active_bound_uuid not in catalog_ids
+        )
+        active_workspace_missing = bool(
+            requested_active_workspace_uuid
+            and requested_active_workspace is None
+        )
+        previous_workspace_order = [
+            row
+            for row in sorted(
+                workspaces_by_uuid.values(),
+                key=lambda item: (
+                    max(1, int(item.get("number") or 1)),
+                    _uuid_text(item.get("workspace_uuid")),
+                ),
+            )
+            if _uuid_text(row.get("bound_shot_uuid"))
+        ]
+        removed_workspace_index = next(
+            (
+                index
+                for index, row in enumerate(previous_workspace_order)
+                if _uuid_text(row.get("bound_shot_uuid"))
+                == requested_active_bound_uuid
+            ),
+            -1,
+        )
+        durable_active_workspace: Optional[Dict[str, Any]] = (
+            requested_active_workspace
+            if isinstance(requested_active_workspace, dict)
+            and not active_workspace_deleted
+            else None
+        )
+        if selected_shot_deleted:
             # A validated newer ImageAsset catalog is authoritative deletion.
             # Normalization below removes that bound workspace and its owned
-            # media, then falls back to the first remaining ImageAsset Shot.
+            # media, then applies ImageAsset's positional survivor fallback.
             selected_shot_uuid = ""
+
+        if (
+            selected_shot_deleted
+            or active_workspace_deleted
+            or active_workspace_missing
+        ):
+            # The legacy top-level controls still project the removed active
+            # workspace. Restore the same surviving row that normalization
+            # will choose before parsing, otherwise its Maya camera/FPS/frame
+            # metadata and slot state are overwritten by the deleted Shot.
+            if durable_active_workspace is None:
+                fallback_index = (
+                    min(removed_workspace_index, len(snapshot["shots"]) - 1)
+                    if removed_workspace_index >= 0
+                    else 0
+                )
+                first_shot = snapshot["shots"][fallback_index]
+                durable_active_workspace = workspaces_by_bound_uuid.get(
+                    first_shot["shot_uuid"]
+                )
+                if durable_active_workspace is None:
+                    durable_active_workspace = _new_picker_workspace_row(
+                        first_shot["number"],
+                        bound_shot_uuid=first_shot["shot_uuid"],
+                        state={},
+                        workspace_uuid=(
+                            _picker_workspace_uuid_for_bound_shot(
+                                first_shot["shot_uuid"]
+                            )
+                        ),
+                    )
+            _restore_picker_workspace_projection(
+                current,
+                durable_active_workspace,
+            )
 
         normalized_rows: List[Dict[str, Any]] = []
         for catalog_shot in snapshot["shots"]:
@@ -14050,6 +14237,17 @@ class HMBVideoPickerLibrary(DataNode):
             ],
         })
         normalized = self._apply_selected_view_fields(_parse_state(current))
+        if durable_active_workspace is not None:
+            # Keep the existing selected-video viewport projection, but restore
+            # the survivor's independent Maya authoring state before it is
+            # serialized. Without this second projection, selected-video
+            # metadata is persisted back over that workspace's camera/FPS/
+            # frame/Mask state on the next parse after any catalog mutation.
+            _restore_picker_workspace_projection(
+                normalized,
+                durable_active_workspace,
+            )
+            normalized = _parse_state(normalized)
         self._hmb_shot_catalog_snapshot = copy.deepcopy(snapshot)
         self._hmb_shot_catalog_refresh_count = max(
             0,

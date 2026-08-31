@@ -18,14 +18,6 @@ def load(name: str, filename: str):
     return module
 
 
-def expect_rejected(callback) -> None:
-    try:
-        callback()
-    except RuntimeError:
-        return
-    raise AssertionError("invalid user description contract was accepted")
-
-
 def replace_user_data(package: str, payload: dict) -> str:
     lines = package.splitlines()
     assert lines[5] == prompt.USER_DESCRIPTION_DATA_HEADER
@@ -35,6 +27,15 @@ def replace_user_data(package: str, payload: dict) -> str:
 
 prompt = load("_hmb_prompt_field_authority_prompt", "HMBPromptLibrary.py")
 agent = load("_hmb_prompt_field_authority_agent", "HMBAgentLibrary.py")
+
+
+def prompt_sections(payload: str):
+    lines = payload.splitlines()
+    assert lines[0] == "HMB_GP_Production"
+    assert lines[1] == prompt.PUBLIC_JOB_CONTRACT_HEADER
+    assert lines[3] == prompt.FX_TIMING_CONTRACT_HEADER
+    assert lines[5] == prompt.USER_DESCRIPTION_DATA_HEADER
+    return json.loads(lines[2]), json.loads(lines[4]), json.loads(lines[6])
 
 assert "prompt_guidance" not in prompt._default_widget_state()
 
@@ -59,9 +60,8 @@ for mask in range(1, 1 << len(field_names)):
             state["text"][key] = field_values[key]
             expected[key] = field_values[key]
     package = prompt._build_data_only_prompt_package(state)
-    job, user_data = agent._prompt_data_only_envelope(package)
+    job, _fx_data, user_data = prompt_sections(package)
     assert user_data == expected
-    assert agent._assert_public_job_data_contract(package) == job
     assert "prompt_guidance" not in package
     assert "qa_coverage_not_provider_attention" not in package
     assert "HMB QA" not in package
@@ -71,7 +71,7 @@ for mask in range(1, 1 << len(field_names)):
 transcript_state = prompt._default_widget_state()
 transcript_state["text"]["PRESERVED_TEXT"] = field_values["PRESERVED_TEXT"]
 transcript_package = prompt._build_data_only_prompt_package(transcript_state)
-transcript_job, transcript_user_data = agent._prompt_data_only_envelope(
+transcript_job, _transcript_fx, transcript_user_data = prompt_sections(
     transcript_package
 )
 assert transcript_job["images"] == []
@@ -80,7 +80,8 @@ assert set(transcript_user_data) == {"PRESERVED_TEXT"}
 assert transcript_user_data["PRESERVED_TEXT"] == field_values["PRESERVED_TEXT"]
 assert all("lip" not in key.casefold() for key in transcript_job)
 
-# Python normalization and the Agent boundary enforce the same per-field limits.
+# Prompt authoring still enforces its own UI/storage bounds. Agent no longer
+# rejects or truncates an already paired Prompt snapshot based on field size.
 limit_state = prompt._default_widget_state()
 for key in field_names:
     limit_state["text"][key] = "V" * (
@@ -89,27 +90,30 @@ for key in field_names:
         else prompt.MAX_DESCRIPTION_CHARS
     )
 limit_package = prompt._build_data_only_prompt_package(limit_state)
-agent._assert_public_job_data_contract(limit_package)
+_limit_job, _limit_fx, limit_user_data = prompt_sections(limit_package)
+assert set(limit_user_data) == set(field_names)
 
 base_package = prompt._build_data_only_prompt_package(prompt._default_widget_state())
-expect_rejected(
-    lambda: agent._assert_public_job_data_contract(
-        replace_user_data(
-            base_package,
-            {"PROJECT_STYLE_LOOK": "X" * (prompt.MAX_DESCRIPTION_CHARS + 1)},
-        )
-    )
+oversized_style = replace_user_data(
+    base_package,
+    {"PROJECT_STYLE_LOOK": "X" * (prompt.MAX_DESCRIPTION_CHARS + 1)},
 )
-expect_rejected(
-    lambda: agent._assert_public_job_data_contract(
-        replace_user_data(
-            base_package,
-            {"VIDEO_VFX": "X" * (prompt.MAX_VIDEO_VFX_CHARS + 1)},
-        )
-    )
+oversized_vfx = replace_user_data(
+    base_package,
+    {"VIDEO_VFX": "X" * (prompt.MAX_VIDEO_VFX_CHARS + 1)},
 )
+assert len(prompt_sections(oversized_style)[2]["PROJECT_STYLE_LOOK"]) == (
+    prompt.MAX_DESCRIPTION_CHARS + 1
+)
+assert len(prompt_sections(oversized_vfx)[2]["VIDEO_VFX"]) == (
+    prompt.MAX_VIDEO_VFX_CHARS + 1
+)
+agent_source = (ROOT / "HMBAgentLibrary.py").read_text(encoding="utf-8")
+assert "_MAX_USER_DESCRIPTION_FIELD_CHARS" not in agent_source
+assert "_MAX_USER_VIDEO_VFX_CHARS" not in agent_source
+assert "_assert_public_job_data_contract(machine_prompt)" not in agent_source
 
 print(
     "HMB Prompt field authority regression: PASS "
-    "(31 field combinations, exact transcript, no QA display state, server limits)"
+    "(31 field combinations, exact transcript, no QA display state, opaque Agent transport)"
 )

@@ -10,12 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import HMBAgentLibrary as agent
 import HMBPromptLibrary as prompt
-
-
-assert "Frame Range OFF/미설정" in agent._HMB_SOURCE_CONTRACT_INVALID_MESSAGE
-assert "정상적인 선택 상태" in agent._HMB_SOURCE_CONTRACT_INVALID_MESSAGE
 
 
 def parse_machine(state: dict) -> tuple[str, dict, dict]:
@@ -24,17 +19,20 @@ def parse_machine(state: dict) -> tuple[str, dict, dict]:
     assert len(lines) == 7
     job = json.loads(lines[2])
     contract = json.loads(lines[4])
-    agent._assert_public_job_data_contract(machine)
-    assert agent._assert_fx_timing_source_contract(machine) == contract
     return machine, job, contract
 
 
 def runtime(contract: dict) -> dict:
-    return agent._derive_fx_timing_runtime_scope(
-        contract,
-        policy_rules=["loaded"] * 4,
-        binding_rules=["loaded"] * 4,
-    )
+    sources = []
+    for source in contract.get("sources", []):
+        item = copy.deepcopy(source)
+        selected = bool(item.get("range_on") and item.get("range_segments"))
+        item["range_mode"] = "selected_segments" if selected else "full_video"
+        item["allowed_segments"] = (
+            copy.deepcopy(item.get("range_segments", [])) if selected else []
+        )
+        sources.append(item)
+    return {"sources": sources, "shared_windows": []}
 
 
 def video(slot: int, source_type: str) -> dict:

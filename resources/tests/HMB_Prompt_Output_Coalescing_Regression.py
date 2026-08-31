@@ -429,6 +429,17 @@ try:
     assert len(sync_calls) == 1, "The connection hook must perform one immediate synchronization."
     scheduled_callbacks.pop()()
     assert len(sync_calls) == 1, "The stale scheduled connection callback must be coalesced."
+
+    # Five expanded Prompt nodes can each receive a burst of retained-mode
+    # updates. One node must enqueue one callback for the entire loop tick,
+    # while that callback still compiles the latest state exactly once.
+    scheduled_callbacks.clear()
+    sync_calls.clear()
+    for _ in range(20):
+        sync_node._schedule_prompt_sync()
+    assert len(scheduled_callbacks) == 1, "A Prompt sync burst must own one host-loop callback."
+    scheduled_callbacks.pop()()
+    assert len(sync_calls) == 1, "A coalesced Prompt sync burst must compile exactly once."
 finally:
     prompt._set_parameter_value = original_set_parameter_value
     for module_name, original_module in saved_modules.items():

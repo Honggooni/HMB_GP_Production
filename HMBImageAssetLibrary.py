@@ -3063,7 +3063,14 @@ def _shot_routing_catalog_identity(
     *,
     normalized: bool = False,
 ) -> str:
-    """Hash only fields visible in the compact cross-node Shot catalog."""
+    """Hash every ImageAsset fact that can change a routing pass.
+
+    ``active_shot_uuid`` is intentionally not part of the public compact
+    catalog, but it is part of the ImageAsset subscription used by the central
+    router.  Including it in this private scheduling identity ensures that a
+    pure Shot selection change cannot be mistaken for a presentation-only
+    echo and skipped before the router sees the new subscription.
+    """
 
     normalized_state = state if normalized else _normalize_state(state)
     routing = normalized_state["shot_routing"]
@@ -3072,6 +3079,7 @@ def _shot_routing_catalog_identity(
             "publisher_instance_uuid": routing["publisher_instance_uuid"],
             "channel_uuid": routing["channel_uuid"],
             "generation": routing["generation"],
+            "active_shot_uuid": routing["active_shot_uuid"],
             "shots": [
                 {
                     "shot_uuid": shot["shot_uuid"],
@@ -7305,6 +7313,7 @@ class HMBImageAssetLibrary(DataNode):
         self._hmb_shot_routing_identity = ""
         self._hmb_shot_routing_generation = 0
         self._hmb_last_reconciled_shot_catalog_identity = ""
+        self._hmb_reserved_shot_catalog_identity = ""
         self._ensure_parameters()
         self._accept_widget_state_baseline(
             _get_parameter_raw(self, WIDGET_STATE_PARAMETER)
@@ -7404,10 +7413,31 @@ class HMBImageAssetLibrary(DataNode):
     def _schedule_post_hydration_shot_reconcile(self) -> bool:
         """Re-advertise the restored Shot catalog after host hydration."""
 
-        scheduler = getattr(
-            _hmb_shot_routing, "schedule_post_hydration_reconcile", None
+        if not bool(getattr(self, "_hmb_hydration_adopted", False)):
+            return False
+        identity = _shot_routing_catalog_identity(
+            self._current_state()
         )
-        return bool(callable(scheduler) and scheduler(self))
+        self._reconcile_hmb_shot_routing(identity)
+        return bool(
+            identity
+            and (
+                _clean(
+                    getattr(
+                        self,
+                        "_hmb_reserved_shot_catalog_identity",
+                        "",
+                    )
+                ) == identity
+                or _clean(
+                    getattr(
+                        self,
+                        "_hmb_last_reconciled_shot_catalog_identity",
+                        "",
+                    )
+                ) == identity
+            )
+        )
 
     def _hmb_post_registration_shot_discovery(self) -> None:
         """Start the first catalog scan only after exact host registration.
@@ -7815,14 +7845,75 @@ class HMBImageAssetLibrary(DataNode):
         )
         if not callable(scheduler):
             return
+        identity = (
+            _clean(catalog_identity)
+            or _shot_routing_catalog_identity(self._current_state())
+        )
+        if not identity or identity == _clean(
+            getattr(self, "_hmb_last_reconciled_shot_catalog_identity", "")
+        ):
+            return
+        # Reservation and completion are deliberately separate.  The router
+        # snapshots this token into its queued generation and acknowledges it
+        # only after a registered, exact-flow ``ready`` pass.  Repeated state
+        # setters may still call the scheduler so a changed subscription
+        # fingerprint supersedes an older pending callback safely.
+        self._hmb_reserved_shot_catalog_identity = identity
         try:
-            if scheduler(self):
-                self._hmb_last_reconciled_shot_catalog_identity = (
-                    _clean(catalog_identity)
-                    or _shot_routing_catalog_identity(self._current_state())
-                )
+            scheduled = bool(scheduler(self))
+            if (
+                not scheduled
+                and _clean(
+                    getattr(
+                        self,
+                        "_hmb_reserved_shot_catalog_identity",
+                        "",
+                    )
+                ) == identity
+            ):
+                self._hmb_reserved_shot_catalog_identity = ""
         except Exception as exc:
+            if _clean(
+                getattr(
+                    self,
+                    "_hmb_reserved_shot_catalog_identity",
+                    "",
+                )
+            ) == identity:
+                self._hmb_reserved_shot_catalog_identity = ""
             _diagnostic_exception("Shot routing reconciliation failed", exc)
+
+    def _hmb_shot_routing_reconcile_finished(
+        self,
+        acknowledgement: Any,
+    ) -> None:
+        """Commit one catalog identity only after the router really finished."""
+
+        if (
+            bool(getattr(self, "_hmb_node_deleted", False))
+            or not isinstance(acknowledgement, dict)
+            or acknowledgement.get("schema")
+            != "hmb-shot-routing-reconcile-ack"
+            or acknowledgement.get("version") != 1
+            or acknowledgement.get("phase") != "hydrated"
+        ):
+            return
+        token = _clean(acknowledgement.get("owner_token"))
+        if not token or token != _clean(
+            getattr(self, "_hmb_reserved_shot_catalog_identity", "")
+        ):
+            return
+        self._hmb_reserved_shot_catalog_identity = ""
+        if (
+            acknowledgement.get("completed") is not True
+            or _clean(acknowledgement.get("code")) != "ready"
+        ):
+            return
+        current_identity = _shot_routing_catalog_identity(
+            self._current_state()
+        )
+        if current_identity == token:
+            self._hmb_last_reconciled_shot_catalog_identity = token
 
     def _publish_completed_catalog_scan(
         self,
@@ -10207,6 +10298,7 @@ class HMBImageAssetLibrary(DataNode):
         first_delete = not bool(getattr(self, "_hmb_node_deleted", False))
         if first_delete:
             self._hmb_node_deleted = True
+            self._hmb_reserved_shot_catalog_identity = ""
             self._hmb_fresh_registration_scan_key = ""
             release = getattr(
                 _hmb_shot_routing,

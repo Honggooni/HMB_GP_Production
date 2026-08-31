@@ -681,7 +681,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.7.11"
+assert manifest["metadata"]["library_version"] == "0.7.13"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
@@ -1853,6 +1853,8 @@ with tempfile.TemporaryDirectory() as temp_dir:
                              "plugin_fallback_material_count": 0,
                              "plugin_fallback_node_count": 0,
                              "plugin_fallback_records": [],
+                             "unsupported_color_fallback_count": 0,
+                             "unsupported_color_fallback_materials": [],
                              "texture_identity_preserved": True,
                              "warnings": [],
                              "swapped_shading_engine_count": 2,

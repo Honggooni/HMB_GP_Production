@@ -4,7 +4,7 @@
   "metadata": {
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.7.11",
+    "library_version": "0.7.13",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
       "archive_source_count": 26,
@@ -205,7 +205,44 @@
       "metadata": {
         "category": "HMB_GP_Production",
         "description": "Runs Griptape Agent with authenticated Broker policy.\nOnly mode works; invalid policy blocks execution.",
-        "display_name": "HMBAgentLibrary"
+        "display_name": "HMBAgentLibrary",
+        "declarations": [
+          {
+            "type": "model_usage",
+            "model_ids": [
+              "gtc_claude_sonnet_5",
+              "gtc_claude_opus_5",
+              "gtc_claude_haiku_4_5",
+              "gtc_gemini_3_6_flash",
+              "gtc_gemini_3_5_flash",
+              "gtc_gemini_3_5_flash_lite",
+              "gtc_gemini_3_1_pro",
+              "gtc_gemini_3_1_flash_lite",
+              "gtc_gemini_3_flash",
+              "gtc_gemini_2_5_pro",
+              "gtc_gemini_2_5_flash",
+              "gtc_gemini_2_5_flash_lite",
+              "gtc_gpt_5_2",
+              "gtc_gpt_5_2_chat",
+              "gtc_gpt_5_1",
+              "gtc_gpt_5",
+              "gtc_gpt_5_mini",
+              "gtc_gpt_5_nano",
+              "gtc_gpt_4_1",
+              "gtc_gpt_4_1_mini",
+              "gtc_gpt_4_1_nano",
+              "gtc_gpt_4o",
+              "gtc_o4_mini",
+              "gtc_o3",
+              "gtc_o3_mini",
+              "gtc_o1",
+              "gtc_deepseek_v3",
+              "gtc_deepseek_r1",
+              "gtc_llama_3_3_70b",
+              "gtc_llama_3_1_70b"
+            ]
+          }
+        ]
       }
     },
     {
