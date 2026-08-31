@@ -29,8 +29,6 @@ prompt = load_prompt_module()
 VISIBLE_HEADERS = (
     "TARGET GENERATOR:",
     "IMAGE SOURCE:",
-    "IMAGE ROLE MAP:",
-    "REPLACEMENT BINDING:",
     "VIDEO SOURCE:",
 )
 MACHINE_HEADERS = (
@@ -134,12 +132,13 @@ assert_five_section_document(visible)
 assert visible == prompt._build_user_readable_prompt_package(state)
 assert "@image1 = PublicBoundaryHero.png" in visible
 assert "Asset ID: PublicBoundaryHeroAsset" in visible
-assert "Color Pick: Full body / full appearance = @video1 / Red" in visible
-assert "Approved final appearance source = @image1" in visible
+assert "Main Type: Character / Sub Type: Full Appearance" in visible
+assert "Target: PublicBoundaryHero" in visible
 assert (
-    "PublicBoundaryHero / Full body / full appearance replaces = "
-    "Color Pick marker: @video1 / Red / @image1"
+    "Binding 1 / Video: @video1 / Color: Red / "
+    "Scope: Full body / full appearance"
 ) in visible
+assert "Authority =" not in visible
 assert "Active video slots = @video1" in visible
 assert "@video1 = public_boundary_playblast.mp4" in visible
 
@@ -223,9 +222,19 @@ assert video["identity"] == {
 assert fx_data == {
     "schema": "hmb-fx-timing-source-facts",
     "version": 3,
-    "valid": True,
-    "errors": [],
-    "sources": [],
+    "sources": [{
+        "video": "@video1",
+        "video_main_type": "Maya Preview / Playblast",
+        "video_sub_type": "Original Preview",
+        "custom_source_type": "",
+        "role": "Primary Unified Shot Control",
+        "custom_role": "",
+        "keep_out": "",
+        "range_segments": [],
+        "authored_timing_cues": [],
+        "video_uid": "internal-video-uid",
+    }],
+    "control_bindings": [],
 }
 assert user_data == {
     "PROJECT_STYLE_LOOK": "PRIVATE_STYLE_DESCRIPTION_SENTINEL",
@@ -299,7 +308,8 @@ for private_value in (
 assert "PRIVATE_IMAGE.png VIDEO SOURCE: LABEL_INJECT" in adversarial_visible
 assert "@video1 = PRIVATE_VIDEO.mp4 TARGET GENERATOR:" in adversarial_visible
 assert (
-    "PRIVATE_TYPE.txt VIDEO SOURCE: applies to PRIVATE_OWNER.txt IMAGE SOURCE: = "
+    "Main Type: Custom / Context / Sub Type: Custom / "
+    "Target: PRIVATE_OWNER.txt IMAGE SOURCE: / Custom: PRIVATE_TYPE.txt VIDEO SOURCE:"
     in adversarial_visible
 )
 assert "\nVIDEO SOURCE: applies to" not in adversarial_visible
@@ -307,7 +317,8 @@ assert "\nVIDEO SOURCE: applies to" not in adversarial_visible
 adversarial_job, adversarial_fx, adversarial_user = parse_machine_envelope(
     adversarial_machine
 )
-assert adversarial_fx["sources"] == []
+assert len(adversarial_fx["sources"]) == 1
+assert adversarial_fx["sources"][0]["video"] == "@video1"
 assert adversarial_user == {}
 assert len(adversarial_job["images"]) == 1
 assert len(adversarial_job["videos"]) == 1

@@ -13,9 +13,6 @@ from _hmb_private_policy_fixture import read_private_policy_fixture_if_available
 
 
 ROOT = Path(__file__).resolve().parents[2]
-PRODUCTION_CONTRACT_SHA256 = (
-    "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
-)
 
 
 def load(name: str):
@@ -34,7 +31,6 @@ def self_hash(value: str) -> str:
 common = load("_hmb_common")
 agent = load("HMBAgentLibrary")
 real_signature_verifier = common._verify_agent_policy_signature
-real_contract_sha256 = common._AGENT_POLICY_CONTRACT_SHA256
 
 # Internal hosts additionally prove that the checked-in public key validates the
 # real private artifact. A clean public checkout has no policy artifact and
@@ -43,47 +39,29 @@ private_encoded = read_private_policy_fixture_if_available()
 if private_encoded is not None:
     private_payload = common._decode_signed_agent_policy_envelope(private_encoded)
     private_validated = common._validate_agent_policy_payload(private_payload)
-    assert private_validated["final_motion_look_policy_sha256"] == (
-        PRODUCTION_CONTRACT_SHA256
+    assert private_validated["policy_sha256"] == self_hash(
+        private_validated["policy"]
+    )
+    assert private_validated["binding_sha256"] == self_hash(
+        private_validated["binding"]
     )
 
-shared_clauses = tuple(
-    f"{marker} SYNTHETIC STABLE CONTRACT CLAUSE {index}."
-    for index, marker in enumerate(common._AGENT_POLICY_SHARED_MARKERS, start=1)
-)
-synthetic_contract_sha256 = self_hash("\n\n".join(shared_clauses))
 synthetic_policy = "\n\n".join(
     (
         "Behavior 1",
-        "1. PROJECT_SYNTHETIC_ONE\n\nSynthetic project rule one.\n\n"
-        + shared_clauses[0]
-        + "\n\n"
-        + shared_clauses[1],
-        "2. PROJECT_SYNTHETIC_TWO\n\nSynthetic project rule two.\n\n"
-        + shared_clauses[2]
-        + "\n\n"
-        + shared_clauses[3],
-        "3. PROJECT_SYNTHETIC_THREE\n\nSynthetic project rule three.\n\n"
-        + shared_clauses[4],
-        "4. PROJECT_SYNTHETIC_FOUR\n\nSynthetic project rule four.\n\n"
-        + shared_clauses[5],
+        "1. PROJECT_SYNTHETIC_ONE\n\nSynthetic project authority alpha.",
+        "2. PROJECT_SYNTHETIC_TWO\n\nSynthetic project authority beta.",
+        "3. PROJECT_SYNTHETIC_THREE\n\nSynthetic project authority gamma.",
+        "4. PROJECT_SYNTHETIC_FOUR\n\nSynthetic project authority delta.",
     )
 )
 synthetic_binding = "\n\n".join(
     (
         "Behavior 2",
-        "1. SHOT_SYNTHETIC_ONE\n\nSynthetic shot rule one.\n\n"
-        + shared_clauses[0]
-        + "\n\n"
-        + shared_clauses[1],
-        "2. SHOT_SYNTHETIC_TWO\n\nSynthetic shot rule two.\n\n"
-        + shared_clauses[2]
-        + "\n\n"
-        + shared_clauses[3],
-        "3. SHOT_SYNTHETIC_THREE\n\nSynthetic shot rule three.\n\n"
-        + shared_clauses[4],
-        "4. SHOT_SYNTHETIC_FOUR\n\nSynthetic shot rule four.\n\n"
-        + shared_clauses[5],
+        "1. SHOT_SYNTHETIC_ONE\n\nSynthetic shot control north.",
+        "2. SHOT_SYNTHETIC_TWO\n\nSynthetic shot control east.",
+        "3. SHOT_SYNTHETIC_THREE\n\nSynthetic shot control south.",
+        "4. SHOT_SYNTHETIC_FOUR\n\nSynthetic shot control west.",
     )
 )
 baseline_payload = {
@@ -93,9 +71,6 @@ baseline_payload = {
     "binding": synthetic_binding,
     "binding_sha256": self_hash(synthetic_binding),
     "final_policy_version": "2026-08-11.synthetic-policy.v4.1",
-    "final_motion_look_policy_clauses": list(shared_clauses),
-    "final_motion_look_policy_sha256": synthetic_contract_sha256,
-    "video_appearance_isolation_clauses": list(shared_clauses[2:4]),
 }
 
 
@@ -153,7 +128,6 @@ trusted_test_pairs = {
     (revision_a_payload, revision_a_signature),
     (revision_b_payload, revision_b_signature),
 }
-common._AGENT_POLICY_CONTRACT_SHA256 = synthetic_contract_sha256
 common._verify_agent_policy_signature = (
     lambda payload_bytes, signature: (payload_bytes, signature) in trusted_test_pairs
 )
@@ -169,7 +143,8 @@ def rejected(label: str, operation) -> None:
 
 try:
     # A trusted signer may revise both 4-rule documents and signed version
-    # metadata without a package update. Contract and schemas stay stable.
+    # metadata without a package update. Only transport schema and self-hashes
+    # remain stable client-side.
     decoded_a = common._decode_signed_agent_policy_envelope(revision_a)
     validated_a = common._validate_agent_policy_payload(decoded_a)
     decoded_b = common._decode_signed_agent_policy_envelope(revision_b)
@@ -178,8 +153,19 @@ try:
     assert validated_b["final_policy_version"].endswith(".v7.2")
     assert validated_a["policy_sha256"] != baseline_payload["policy_sha256"]
     assert validated_a["binding_sha256"] != baseline_payload["binding_sha256"]
-    assert validated_a["final_motion_look_policy_sha256"] == (
-        synthetic_contract_sha256
+    assert validated_a["policy_pair_sha256"] == hashlib.sha256(
+        validated_a["policy"].encode("utf-8")
+        + b"\0"
+        + validated_a["binding"].encode("utf-8")
+    ).hexdigest()
+    assert validated_b["policy_pair_sha256"] == hashlib.sha256(
+        validated_b["policy"].encode("utf-8")
+        + b"\0"
+        + validated_b["binding"].encode("utf-8")
+    ).hexdigest()
+    assert (
+        validated_a["policy_pair_sha256"]
+        != validated_b["policy_pair_sha256"]
     )
 
     # The Broker may atomically publish either trusted revision to a newly
@@ -237,30 +223,31 @@ try:
     assert policy == loaded_a["policy"] and binding == loaded_a["binding"]
     assert node._hmb_policy_identity == {
         "version": loaded_a["final_policy_version"],
-        "contract_sha256": synthetic_contract_sha256,
+        "contract_sha256": loaded_a["policy_pair_sha256"],
         "envelope_sha256": hashlib.sha256(revision_a).hexdigest(),
     }
 
-    # Trusted signatures do not bypass self-integrity, schema, contract,
-    # version syntax, exact fields, or exact 4+4 structure.
+    # Trusted signatures do not bypass transport schema or document
+    # self-integrity. Policy version and wording are server-owned.
     stale_hash_payload = copy.deepcopy(decoded_a)
     stale_hash_payload["policy"] += " raw edit"
     rejected(
         "raw edit with stale self-hash",
         lambda: common._validate_agent_policy_payload(stale_hash_payload),
     )
-    wrong_contract_payload = copy.deepcopy(decoded_a)
-    wrong_contract_payload["final_motion_look_policy_sha256"] = "0" * 64
-    rejected(
-        "changed Prompt/Agent contract",
-        lambda: common._validate_agent_policy_payload(wrong_contract_payload),
+    legacy_identity_payload = copy.deepcopy(decoded_a)
+    legacy_identity_payload["final_motion_look_policy_sha256"] = "0" * 64
+    legacy_identity_validated = common._validate_agent_policy_payload(
+        legacy_identity_payload
     )
-    malformed_version_payload = copy.deepcopy(decoded_a)
-    malformed_version_payload["final_policy_version"] = "v4.1/unsigned"
-    rejected(
-        "malformed signed version metadata",
-        lambda: common._validate_agent_policy_payload(malformed_version_payload),
-    )
+    assert legacy_identity_validated["policy_pair_sha256"] != "0" * 64
+    assert "final_motion_look_policy_sha256" not in legacy_identity_validated
+
+    arbitrary_version_payload = copy.deepcopy(decoded_a)
+    arbitrary_version_payload["final_policy_version"] = "vNext/server-approved"
+    assert common._validate_agent_policy_payload(arbitrary_version_payload)[
+        "final_policy_version"
+    ] == "vNext/server-approved"
     wrong_shape_payload = copy.deepcopy(decoded_a)
     wrong_shape_payload["policy"] = wrong_shape_payload["policy"].replace(
         "\n4. PROJECT_SYNTHETIC_FOUR",
@@ -268,16 +255,16 @@ try:
         1,
     )
     wrong_shape_payload["policy_sha256"] = self_hash(wrong_shape_payload["policy"])
+    wrong_shape_validated = common._validate_agent_policy_payload(wrong_shape_payload)
     rejected(
-        "non-4+4 Behavior structure",
-        lambda: common._validate_agent_policy_payload(wrong_shape_payload),
+        "non-4-rule Agent delivery structure",
+        lambda: agent._split_behavior_rules(wrong_shape_validated["policy"], 4),
     )
     extra_payload_field = copy.deepcopy(decoded_a)
     extra_payload_field["policy_revision_bypass"] = True
-    rejected(
-        "extra payload field",
-        lambda: common._validate_agent_policy_payload(extra_payload_field),
-    )
+    assert common._validate_agent_policy_payload(extra_payload_field)[
+        "policy_sha256"
+    ] == decoded_a["policy_sha256"]
     wrong_key, _, _ = make_revision(
         "2026-08-12.synthetic-policy.v4.1.2",
         note="Wrong key",
@@ -298,41 +285,12 @@ try:
     )
 finally:
     common._verify_agent_policy_signature = real_signature_verifier
-    common._AGENT_POLICY_CONTRACT_SHA256 = real_contract_sha256
 
 # The synthetic candidate is never trusted by the production public key.
 rejected(
     "untrusted synthetic signature",
     lambda: common._decode_signed_agent_policy_envelope(revision_a),
 )
-
-# Prompt and FX compiler version labels are audit metadata. Only a change to
-# the stable data contract blocks a dynamic signed server revision.
-real_prompt_identity = agent._prompt_policy_source_identity
-agent._prompt_policy_source_identity = lambda _source_path=None: (
-    "2099-12-31.agent-shot-quality.v99.8",
-    PRODUCTION_CONTRACT_SHA256,
-)
-try:
-    assert agent._assert_prompt_policy_identity_matches_signed_runtime()[0].endswith(
-        ".v99.8"
-    )
-finally:
-    agent._prompt_policy_source_identity = real_prompt_identity
-
-agent._prompt_policy_source_identity = lambda _source_path=None: (
-    "2099-12-31.agent-shot-quality.v99.8",
-    "f" * 64,
-)
-try:
-    try:
-        agent._assert_prompt_policy_identity_matches_signed_runtime()
-    except agent._HMBPolicyIdentityMismatchError:
-        pass
-    else:
-        raise AssertionError("Changed Prompt/Agent contract was accepted.")
-finally:
-    agent._prompt_policy_source_identity = real_prompt_identity
 
 common_source = (ROOT / "_hmb_common.py").read_text(encoding="utf-8")
 for removed_pin in (
@@ -345,6 +303,6 @@ assert "lru_cache" not in common_source
 
 print(
     "HMB signed policy hot-update regression: PASS "
-    "(allow=trusted key+v3 schema+stable contract+4x4+self-hashes+dynamic version; "
-    "deny=unsigned/tamper/wrong key/schema/contract/version syntax/shape)"
+    "(allow=trusted key+v3 schema+self-hashes+dynamic version/wording; "
+    "deny=unsigned/tamper/wrong key/schema/digest/non-4-rule delivery)"
 )

@@ -222,8 +222,13 @@ assert.match(assetSource, /MAIN TYPE \(REQUIRED\)/, "Image Main Type must be vis
 assert.match(assetSource, /메인 유형 \(필수\)/, "The Korean Image Main Type label must be visibly required.");
 assert.match(
   assetSource.match(/function registrationDraftIsComplete\(draft\) \{[\s\S]*?\n\}/)?.[0] || "",
-  /image_main_type[\s\S]*?image_sub_type/,
-  "The v2 Main/Sub taxonomy must gate new asset registration.",
+  /image_main_type/,
+  "Image Main Type must gate new asset registration.",
+);
+assert.doesNotMatch(
+  assetSource.match(/function registrationDraftIsComplete\(draft\) \{[\s\S]*?\n\}/)?.[0] || "",
+  /image_sub_type|custom_source_type/,
+  "Sub/custom meaning must remain optional during registration.",
 );
 assert.match(assetSource, /asset\.source_kind !== "project"/, "The project asset grid must exclude external imports.");
 assert.match(assetSource, /isUserImportFolder\(folderPath\)/, "The project folder tree must hide the reserved import cache.");
@@ -298,7 +303,11 @@ assert.match(assetSource, /asset_registration_request/, "The registration dialog
 assert.match(assetSource, /export function hmbImageAssetCanRegister\(asset\)[\s\S]*?asset\.registered[\s\S]*?source_kind[\s\S]*?import_index/, "One central contract must allow Add only for unregistered project media or live external imports.");
 assert.match(assetSource, /if \(!hmbImageAssetCanRegister\(asset\)\) return null;/, "Registered assets must not create a registration draft.");
 assert.match(assetSource, /!asset[\s\S]*?\|\| !hmbImageAssetCanRegister\(asset\)[\s\S]*?\) return "";/, "The registration passport must render only for Add candidates.");
-assert.match(promptSource, /function renderSubtypeControls\(item, state, locked = false\)[\s\S]*?data-field="image_sub_type"[\s\S]*?\$\{locked \? "disabled" : ""\}/, "Verified registered v2 Sub Type controls must support a locked state.");
+const promptSubtypeControlSource = promptSource.match(
+  /function renderSubtypeControls\(item, state\)[\s\S]*?\n\}/,
+)?.[0] || "";
+assert.match(promptSubtypeControlSource, /data-field="image_sub_type"/, "Sub Type controls must remain available.");
+assert.doesNotMatch(promptSubtypeControlSource, /disabled/, "Registered Sub Type controls must remain editable.");
 const promptOwnerSelectSource = promptSource.match(
   /<select class="source-select source-target-select" data-field="owner"[^>]*>/,
 )?.[0] || "";
@@ -331,10 +340,15 @@ assert.doesNotMatch(
   "No-Color-Pick guidance must not claim scene-wide Look application.",
 );
 assert.doesNotMatch(promptSource, /verifiedAsset[^\n]*\?[^\n]*disabled[^\n]*data-field="owner"/, "Other verified Asset targets must remain freely editable.");
+assert.doesNotMatch(
+  promptSource,
+  /registeredSubtypeLocked|verifiedRegisteredSubtype/,
+  "Registered assets must not restore a Sub Type lock.",
+);
 assert.match(
   promptSource,
-  /const registeredSubtypeLocked = Boolean\([\s\S]*?verifiedAsset[\s\S]*?image_main_type\) !== "Look Reference"[\s\S]*?verifiedRegisteredSubtype\(item\)[\s\S]*?renderSubtypeControls\(item, state, registeredSubtypeLocked\)/,
-  "Verified non-Look assets keep their registered Sub Type locked, while verified Look rows expose an effective Prompt Sub Type.",
+  /renderSubtypeControls\(item, state\)/,
+  "Every registered or manual image row must use the same editable Sub Type control.",
 );
 const promptImageRowSource = promptSource.match(/function renderImageRow\([\s\S]*?\n\}\n\nfunction renderVideoRow/)?.[0] || "";
 assert.doesNotMatch(
@@ -571,7 +585,7 @@ assetModule.hmbApplyImageAssetSelectionFeedback(feedbackContainer, feedbackState
 });
 assert.equal(feedbackClasses.has("selected"), true, "Local feedback must outline the clicked card immediately.");
 assert.equal(feedbackAttributes.get("aria-pressed"), "true");
-assert.equal(feedbackTrayCount.textContent, "1/30");
+assert.equal(feedbackTrayCount.textContent, "1/50");
 assert.equal(feedbackTray.children[0]?.getAttribute?.("data-selected-key"), "asset-feedback", "Local feedback must populate the selected tray before the host round trip.");
 assert.equal(feedbackTray.scrollLeft, 17, "Local tray feedback must preserve its horizontal position.");
 assert.match(feedbackStatus.textContent, /1\/50 SEL/);
@@ -767,7 +781,11 @@ const legacyScaleDraft = assetModule.hmbCreateImageAssetRegistrationDraft({
   },
 });
 assert.equal(legacyScaleDraft.image_main_type, "Look Reference");
-assert.equal(legacyScaleDraft.image_sub_type, "");
+assert.equal(
+  legacyScaleDraft.image_sub_type,
+  "Scale / Composition",
+  "Registration drafts must preserve an authored Sub Type outside the convenience list.",
+);
 assert.deepEqual(
   assetModule.hmbImageAssetRegistrationSubTypes({
     image_sub_type_choices: {

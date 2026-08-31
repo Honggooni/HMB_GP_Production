@@ -6,6 +6,7 @@ import io
 import json
 import queue
 import random
+import re
 import sys
 import tempfile
 import threading
@@ -681,7 +682,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.7.15"
+assert manifest["metadata"]["library_version"] == "0.7.17"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
@@ -743,22 +744,14 @@ for native_size_key in (
 ):
     assert native_size_key not in agent_manifest["metadata"]
 
-# The active runtime is the server-hosted signed v4.5 policy. This internal
+# The active runtime is the server-hosted signed policy. This internal
 # regression injects the private signed artifact without creating a local
 # runtime fallback or copying it into the public package.
-assert hashlib.sha256(signed_policy_fixture).hexdigest() == (
-    "228b54e55dd4167f4cb58f8bdbdb8762818a636018180fe1ae97f7a023ac2144"
-)
 policy_payload = common._load_agent_rule_payload()
-assert policy_payload["final_policy_version"] == (
-    "2026-08-27.agent-shot-quality.v4.5"
-)
-assert policy_payload["final_motion_look_policy_sha256"] == (
-    "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
-)
-assert agent._assert_prompt_policy_identity_matches_signed_runtime() == (
-    policy_payload["final_policy_version"],
-    policy_payload["final_motion_look_policy_sha256"],
+assert str(policy_payload["final_policy_version"]).strip()
+assert re.fullmatch(
+    r"[0-9a-f]{64}",
+    str(policy_payload["policy_pair_sha256"]),
 )
 
 widget_source = (ROOT / "widgets/HMBVideoPickerLibraryWidget_v032.js").read_text(encoding="utf-8")
@@ -904,16 +897,16 @@ assert prompt._hmb.OBJECT_COLOR_PICK_CHOICES == expected_object
 assert prompt._hmb.COLOR_PICK_CHOICES == picker.MARKER_ORDER
 assert prompt.image_color_pick_choices_for_taxonomy(
     "Character", "Full Appearance"
-) == expected_actor
+) == picker.MARKER_ORDER
 assert prompt.image_color_pick_choices_for_taxonomy(
     "Character Prop", "Handheld Prop"
-) == expected_actor
+) == picker.MARKER_ORDER
 assert prompt.image_color_pick_choices_for_taxonomy(
     "Environment / Background", "Main Background"
-) == expected_object
+) == picker.MARKER_ORDER
 assert prompt.image_color_pick_choices_for_taxonomy(
     "Background Prop", "Independent Scene Prop"
-) == expected_object
+) == picker.MARKER_ORDER
 
 original_mayabatch_candidates = picker._mayabatch_candidates
 try:
@@ -2366,7 +2359,6 @@ assert applied["videos"][0]["video_sub_type"] == "Original Preview"
 assert applied["videos"][0]["source_type"] == "Unified Shot-Control Video"
 assert applied["videos"][0]["control_role"] == "Primary Unified Shot Control"
 compiled_picker_prompt = prompt._build_prompt_package(applied)
-assert agent._is_hmb_prompt_library_payload(compiled_picker_prompt)
 
 # The four patterns use reserved categorical Surface Shader IDs. A host-side
 # frame-global compositor replaces them without reading UVs or object bounds.

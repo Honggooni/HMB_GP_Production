@@ -430,7 +430,8 @@ try:
     assert forged_row["source_type"] == "Role Required / Select Source Type"
     assert forged_row["custom_source_type"] == ""
 
-    # Retired/unknown legacy classification values never migrate into v2.
+    # Unknown legacy classification remains authored context instead of being
+    # discarded by taxonomy normalization.
     future_type_payload = payload(["FutureType"])
     future_type_payload["ordered_images"][0].pop("image_main_type", None)
     future_type_payload["ordered_images"][0].pop("image_sub_type", None)
@@ -442,10 +443,10 @@ try:
         connected=True,
     )
     future_type_row = future_type_prompt["images"][0]
-    assert future_type_row["image_main_type"] == "Select Image Main Type"
+    assert future_type_row["image_main_type"] == ""
     assert future_type_row["image_sub_type"] == ""
     assert future_type_row["source_type"] == "Role Required / Select Source Type"
-    assert future_type_row["custom_source_type"] == ""
+    assert future_type_row["custom_source_type"] == "Future Asset Type"
 
     cleared_import_state = asset_library._remove_live_imports(imported_state)
     assert not any(
@@ -529,7 +530,7 @@ try:
         row["color_picks"] = [colors[index]]
         expected_final[row["label"]] = {
             "owner": row["owner"],
-            "binding_scopes": ["Custom scope"],
+            "binding_scopes": [scopes[index]],
             "color_picks": list(row["color_picks"]),
         }
     prompt_state["text"]["SCENE_CONTEXT"] = "Use @image1 with @image3."
@@ -594,10 +595,10 @@ try:
     )
     refreshed_look_row = refreshed_look["images"][0]
     assert refreshed_look_row["asset_image_sub_type_candidate"] == "Color Mood"
-    assert refreshed_look_row["image_sub_type"] == "Color Mood"
-    assert refreshed_look_row["source_type"] == "Color / Look Reference"
-    assert refreshed_look_row["scope"] == "Color mood only"
-    assert refreshed_look_row["owner"] == ""
+    assert refreshed_look_row["image_sub_type"] == "Scale"
+    assert refreshed_look_row["source_type"] == "Role Required / Select Source Type"
+    assert refreshed_look_row["scope"] == ""
+    assert refreshed_look_row["owner"] == "Camera / Composition"
 
     changed_registered_look = prompt_library._apply_image_asset_payload(
         refreshed_look,
@@ -607,8 +608,8 @@ try:
     assert changed_registered_look["images"][0][
         "asset_image_sub_type_candidate"
     ] == "Render Look"
-    assert changed_registered_look["images"][0]["image_sub_type"] == "Render Look"
-    assert changed_registered_look["images"][0]["owner"] == ""
+    assert changed_registered_look["images"][0]["image_sub_type"] == "Scale"
+    assert changed_registered_look["images"][0]["owner"] == "Camera / Composition"
 
     dormant_look = prompt_library._apply_image_asset_payload(
         changed_registered_look,
@@ -630,15 +631,15 @@ try:
         for item in dormant_look["image_asset"]["dormant_asset_rows"]
         if item["asset_source_uid"] == "source:MasterLook"
     )
-    assert cached_look["image_sub_type"] == "Render Look"
-    assert cached_look["owner"] == ""
+    assert cached_look["image_sub_type"] == "Scale"
+    assert cached_look["owner"] == "Camera / Composition"
     restored_look = prompt_library._apply_image_asset_payload(
         dormant_look,
         look_payload("Render Look"),
         connected=True,
     )
-    assert restored_look["images"][0]["image_sub_type"] == "Render Look"
-    assert restored_look["images"][0]["owner"] == ""
+    assert restored_look["images"][0]["image_sub_type"] == "Scale"
+    assert restored_look["images"][0]["owner"] == "Camera / Composition"
 
     # Lighting-bearing Look rows default to Global Look and expose Custom as a
     # reserved shared-scope mode. The authored instruction must survive source
@@ -697,13 +698,12 @@ try:
         "Use dawn lighting globally, with a readable foreground."
     )
 
-    # Returning from Scale to a general Look releases the generated scale-only
-    # all target. The blank survives source refresh, dormant cache, and restore;
-    # a verified Look never acquires scene-wide Global Look implicitly.
+    # Returning from a retired Scale label to a general Look preserves the
+    # authored Target through source refresh, dormant cache, and restore.
     returned_general = deepcopy(restored_look)
     returned_general["images"][0]["image_sub_type"] = "Color Mood"
     prompt_library._normalize_image_binding_fields(returned_general["images"][0])
-    assert returned_general["images"][0]["owner"] == ""
+    assert returned_general["images"][0]["owner"] == "Camera / Composition"
     assert returned_general["images"][0]["asset_default_target"] == ""
     refreshed_general = prompt_library._apply_image_asset_payload(
         returned_general,
@@ -711,7 +711,7 @@ try:
         connected=True,
     )
     assert refreshed_general["images"][0]["image_sub_type"] == "Color Mood"
-    assert refreshed_general["images"][0]["owner"] == ""
+    assert refreshed_general["images"][0]["owner"] == "Camera / Composition"
     assert refreshed_general["images"][0]["asset_default_target"] == ""
     dormant_general = prompt_library._apply_image_asset_payload(
         refreshed_general,
@@ -734,18 +734,17 @@ try:
         if item["asset_source_uid"] == "source:MasterLook"
     )
     assert cached_general["image_sub_type"] == "Color Mood"
-    assert cached_general["owner"] == ""
+    assert cached_general["owner"] == "Camera / Composition"
     restored_general = prompt_library._apply_image_asset_payload(
         dormant_general,
         look_payload("Render Look"),
         connected=True,
     )
     assert restored_general["images"][0]["image_sub_type"] == "Color Mood"
-    assert restored_general["images"][0]["owner"] == ""
+    assert restored_general["images"][0]["owner"] == "Camera / Composition"
 
-    # Look is the only verified Main Type whose Target is always Prompt-owned.
-    # Other verified defaults still follow an upstream rename until the user
-    # authors a different Target, after which that explicit choice is retained.
+    # Target is Prompt-owned for every verified Main Type. A source rename
+    # updates only the suggested default and never overwrites the authored value.
     character_state = prompt_library._apply_image_asset_payload(
         prompt_library._default_widget_state(),
         character_payload("Hero Old"),
@@ -757,7 +756,8 @@ try:
         character_payload("Hero New"),
         connected=True,
     )
-    assert renamed_character["images"][0]["owner"] == "Hero New"
+    assert renamed_character["images"][0]["owner"] == "Hero Old"
+    assert renamed_character["images"][0]["asset_default_target"] == "Hero New"
     renamed_character["images"][0]["owner"] = "Hero Custom Target"
     authored_character = prompt_library._apply_image_asset_payload(
         renamed_character,

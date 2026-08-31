@@ -108,19 +108,6 @@ def machine_sections(state: dict[str, Any]) -> tuple[str, dict[str, Any], dict[s
     return machine, job, fx_contract
 
 
-def runtime_scope(contract: dict[str, Any]) -> dict[str, Any]:
-    sources = []
-    for source in contract.get("sources", []):
-        item = copy.deepcopy(source)
-        selected = bool(item.get("range_on") and item.get("range_segments"))
-        item["range_mode"] = "selected_segments" if selected else "full_video"
-        item["allowed_segments"] = (
-            copy.deepcopy(item.get("range_segments", [])) if selected else []
-        )
-        sources.append(item)
-    return {"sources": sources, "shared_windows": []}
-
-
 def normalized_intent(state: dict[str, Any]) -> dict[str, Any]:
     return prompt._normalize_state(copy.deepcopy(state))["images"][0][
         "frame_range_intent"
@@ -238,12 +225,10 @@ boundary_record = boundary_job["frame_ranges"][0]
 assert boundary_record["domain"] == {
     "start_frame": INT32_MIN,
     "end_frame": INT32_MAX,
-    "frame_count": 1 << 32,
-    "fps": 0.0,
 }
-assert boundary_record["marker_color"] == "Video-wide"
+assert boundary_record["marker_color"] == ""
 assert boundary_record["origin"] == "manual"
-assert boundary_record["valid"] is True
+assert "valid" not in boundary_record
 
 
 # Finite legacy numerics inside signed-int32 still round. Out-of-domain values,
@@ -270,9 +255,7 @@ assert normalized_numeric["ranges"] == [
 ]
 
 
-# Range is a user-owned draft even when no video exists. Public Agent v1 has no
-# address for that draft, so it emits no fabricated @video1 record and remains
-# a valid, non-blocking prompt-only generation contract.
+# An authored Range remains literal even when its video address is inactive.
 draft = prompt._default_widget_state()
 draft_intent = intent()
 draft["images"] = [image_row(draft_intent)]
@@ -280,16 +263,18 @@ draft["videos"] = []
 assert normalized_intent(draft) == draft_intent
 draft_machine, draft_job, draft_fx = machine_sections(draft)
 assert draft_job["videos"] == []
-assert draft_job["frame_ranges"] == []
+assert draft_job["frame_ranges"][0]["video"] == "@video1"
+assert draft_job["frame_ranges"][0]["segments"] == [
+    {"start_frame": -1_500_000_000, "end_frame": -1_000_000_000},
+    {"start_frame": 1_000_000_000, "end_frame": 1_500_000_000},
+]
 assert draft_fx == {
     "schema": "hmb-fx-timing-source-facts",
     "version": 3,
-    "valid": True,
-    "errors": [],
     "sources": [],
+    "control_bindings": [],
 }
 assert "video_inactive" not in draft_machine
-assert runtime_scope(draft_fx) == {"sources": [], "shared_windows": []}
 
 
 # Range state alone does not fabricate a public image source. A blank default
@@ -311,12 +296,12 @@ manual_video["videos"] = [video_row()]
 _, manual_job, _ = machine_sections(manual_video)
 manual_record = manual_job["frame_ranges"][0]
 assert manual_record["video"] == "@video1"
-assert manual_record["marker_color"] == "Video-wide"
+assert manual_record["marker_color"] == ""
 assert manual_record["segments"] == [
     {"start_frame": -1_500_000_000, "end_frame": -1_000_000_000},
     {"start_frame": 1_000_000_000, "end_frame": 1_500_000_000},
 ]
-assert manual_record["valid"] is True
+assert "valid" not in manual_record
 
 
 # Picker metadata is suggestion-only. Missing, empty, shorter, longer,
@@ -404,8 +389,8 @@ color_conflict["images"][0]["color_picks"] = ["Pink"]
 color_conflict["picker"] = picker_oracles[2]
 _, color_job, _ = machine_sections(color_conflict)
 assert color_job["frame_ranges"][0]["marker_color"] == "Pink"
-assert color_job["frame_ranges"][0]["valid"] is True
-assert color_job["frame_ranges"][0]["error_codes"] == []
+assert "valid" not in color_job["frame_ranges"][0]
+assert "error_codes" not in color_job["frame_ranges"][0]
 
 
 # FX sources also treat Picker capabilities as non-authoritative for manual
@@ -423,12 +408,23 @@ fx_state["videos"][0]["reference_capabilities"] = {
 }
 fx_state["picker"] = picker_oracles[2]
 _, _, fx_contract = machine_sections(fx_state)
-assert fx_contract["valid"] is True
-assert fx_contract["errors"] == []
-assert fx_contract["sources"][0]["range_on"] is True
-assert runtime_scope(fx_contract)["sources"][0]["range_mode"] == (
-    "selected_segments"
-)
+assert set(fx_contract) == {"schema", "version", "sources", "control_bindings"}
+assert fx_contract["sources"][0]["range_segments"] == [
+    {
+        "image": "@image1",
+        "video": "@video1",
+        "marker_color": "",
+        "start_frame": -1_500_000_000,
+        "end_frame": -1_000_000_000,
+    },
+    {
+        "image": "@image1",
+        "video": "@video1",
+        "marker_color": "",
+        "start_frame": 1_000_000_000,
+        "end_frame": 1_500_000_000,
+    },
+]
 
 
 # Source lifecycle operations may change derived video addresses but must not
@@ -486,11 +482,17 @@ for lifecycle_index in (0, 1, 2, 4):
     assert len(job["frame_ranges"]) == 1, (lifecycle_index, job)
     assert job["frame_ranges"][0]["domain"]["start_frame"] == -400
     assert job["frame_ranges"][0]["domain"]["end_frame"] == 120_000
-    assert job["frame_ranges"][0]["valid"] is True
+    assert "valid" not in job["frame_ranges"][0]
 
 for lifecycle_index in (3, 5):
     _, empty_lifecycle_job, _ = machine_sections(lifecycle_states[lifecycle_index])
-    assert empty_lifecycle_job["frame_ranges"] == []
+    assert any(
+        record["segments"] == [
+            {"start_frame": -50, "end_frame": 10},
+            {"start_frame": 80_000, "end_frame": 90_000},
+        ]
+        for record in empty_lifecycle_job["frame_ranges"]
+    ), (lifecycle_index, empty_lifecycle_job)
 
 
 # A higher-source stale echo at the same UI revision keeps new source structure
@@ -565,13 +567,32 @@ assert normalized_picker_only["images"][0]["frame_range_intent"] == intent(
     selected_index=-1,
 )
 _, picker_only_job, picker_only_fx = machine_sections(normalized_picker_only)
-assert picker_only_job["frame_ranges"] == []
-assert picker_only_fx["valid"] is True
+picker_only_ranges = {
+    record["marker_color"]: record for record in picker_only_job["frame_ranges"]
+}
+assert picker_only_ranges[""] == {
+    "image": "@image1",
+    "video": "@video1",
+    "marker_color": "",
+    "enabled": True,
+    "origin": "manual",
+    "domain": {},
+    "segments": [],
+}
+assert picker_only_ranges["Red"] == {
+    "image": "@image1",
+    "video": "@video1",
+    "marker_color": "Red",
+    "enabled": True,
+    "origin": "picker-authored",
+    "domain": {"start_frame": 1, "end_frame": 48},
+    "segments": [{"start_frame": 10, "end_frame": 20}],
+}
+assert set(picker_only_fx) == {"schema", "version", "sources", "control_bindings"}
 
 
-# Incomplete, reversed, and out-of-domain user drafts remain byte-stable local
-# intent but are omitted from Agent v1. Generation falls back to full-video use
-# instead of turning an optional edit into a workflow-wide validation gate.
+# Incomplete, reversed, and out-of-domain drafts remain byte-stable literal
+# records; no semantic validity fields are added.
 invalid_intents = [
     intent(start=-100, end=None, ranges=[{"start": -10, "end": 10}], selected_index=0),
     intent(start=100, end=-100, ranges=[{"start": -10, "end": 10}], selected_index=0),
@@ -584,11 +605,24 @@ for invalid_intent in invalid_intents:
     invalid_state["videos"] = [video_row(source_type="FX Reference")]
     assert normalized_intent(invalid_state) == invalid_intent
     _, invalid_job, invalid_fx = machine_sections(invalid_state)
-    assert invalid_job["frame_ranges"] == []
-    assert invalid_fx["valid"] is True
-    assert invalid_fx["errors"] == []
-    assert invalid_fx["sources"][0]["range_on"] is False
-    assert runtime_scope(invalid_fx)["sources"][0]["range_mode"] == "full_video"
+    record = invalid_job["frame_ranges"][0]
+    assert record["domain"] == {
+        key: value
+        for key, value in {
+            "start_frame": invalid_intent["start_frame"],
+            "end_frame": invalid_intent["end_frame"],
+        }.items()
+        if value is not None
+    }
+    assert record["segments"] == [
+        {
+            "start_frame": segment["start"],
+            "end_frame": segment["end"],
+        }
+        for segment in invalid_intent["ranges"]
+    ]
+    assert "valid" not in record
+    assert invalid_fx["sources"][0]["range_segments"]
 
 manual_migration = copy.deepcopy(picker_only)
 manual_migration["images"][0].pop("frame_range_intent", None)

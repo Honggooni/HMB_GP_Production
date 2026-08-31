@@ -206,81 +206,13 @@ def canonical_hmb_agent():
     )
     return instance
 
-hmb_payload = "\n".join(
-    (
-        "HMB_GP_Production",
-        module._PUBLIC_JOB_CONTRACT_HEADER,
-        json.dumps(
-            {
-                "schema": module._PUBLIC_JOB_CONTRACT_SCHEMA,
-                "version": module._PUBLIC_JOB_CONTRACT_VERSION,
-                "images": [],
-                "videos": [],
-                "control_only_bindings": [],
-                "frame_ranges": [],
-                "connections": {"image_asset": False, "picker": False},
-            },
-            separators=(",", ":"),
-        ),
-        module._FX_TIMING_CONTRACT_HEADER,
-        json.dumps(
-            {
-                "schema": module._FX_TIMING_CONTRACT_SCHEMA,
-                "version": module._FX_TIMING_CONTRACT_VERSION,
-                "valid": True,
-                "errors": [],
-                "sources": [],
-            },
-            separators=(",", ":"),
-        ),
-        module._USER_DESCRIPTION_DATA_HEADER,
-        "{}",
-    )
-)
+# Prompt owns taxonomy and serialization. Agent receives the verified paired
+# document opaquely, so this sanitizer regression intentionally avoids pinning
+# retired Prompt schema/header constants into the Agent module.
+hmb_payload = "opaque authored Prompt package for sanitizer regression"
 visible_prompt = "Describe the selected shot in production-ready English."
 
 module._paired_machine_prompt = lambda _node, prompt_value: str(prompt_value or "")
-
-SIGNED_V4_PROMPT_IDENTITY = (
-    str(module._hmb._AGENT_POLICY_VERSION),
-    str(module._hmb._AGENT_POLICY_CONTRACT_SHA256).lower(),
-)
-actual_prompt_identity_reader = module._prompt_policy_source_identity
-actual_prompt_identity = actual_prompt_identity_reader()
-assert actual_prompt_identity == SIGNED_V4_PROMPT_IDENTITY
-
-# A compiler version label is audit metadata, but a changed stable contract
-# must fail before loading or executing the signed runtime.
-module._prompt_policy_source_identity = lambda _source_path=None: (
-    SIGNED_V4_PROMPT_IDENTITY[0] + ".1",
-    "0" * 64,
-)
-identity_mismatch = canonical_hmb_agent()
-identity_mismatch.set_parameter_value("prompt", visible_prompt)
-try:
-    list(identity_mismatch.process())
-except RuntimeError as exc:
-    assert exc.__cause__ is None
-    assert str(exc) == module._HMB_POLICY_IDENTITY_MISMATCH_MESSAGE
-else:
-    raise AssertionError("A synthetic Prompt/runtime contract mismatch was accepted.")
-assert identity_mismatch.native_calls == 0
-assert identity_mismatch.parameter_output_values["agent"] == {}
-assert identity_mismatch.parameter_output_values["output"] == (
-    module._HMB_POLICY_IDENTITY_MISMATCH_MESSAGE
-)
-
-
-def synthetic_signed_v4_prompt_identity(_source_path=None):
-    """Explicit test-only identity for the signed-v4 sanitizer fixture."""
-
-    return SIGNED_V4_PROMPT_IDENTITY
-
-
-module._prompt_policy_source_identity = synthetic_signed_v4_prompt_identity
-assert module._assert_prompt_policy_identity_matches_signed_runtime() == (
-    SIGNED_V4_PROMPT_IDENTITY
-)
 
 node = canonical_hmb_agent()
 assert module._AGENT_WIDGET_PARAMETER in node.parameters
@@ -347,26 +279,30 @@ assert node.get_parameter_value("additional_context") == "CALLER CONTEXT"
 assert node.get_parameter_value("rulesets") == ["USER RULE"]
 assert node.get_parameter_value("tools") == ["SIDE EFFECT TOOL"]
 assert node.get_parameter_value("agent_memory") == {"runs": [{"input": "before", "output": "before"}]}
-assert len(node.captured_rules) == 2
-assert node.captured_additional_context == ""
-assert node.captured_include_details is False
-assert node.captured_agent_memory == {}
-assert node.captured_agent_input is None
-assert node.captured_output_schema is None
-assert node.captured_tools == []
+assert len(node.captured_rules) == 3
+assert node.captured_rules[0] == "USER RULE"
+assert node.captured_additional_context == "CALLER CONTEXT"
+assert node.captured_include_details is True
+assert node.captured_agent_memory == {
+    "runs": [{"input": "before", "output": "before"}]
+}
+assert node.captured_agent_input == {"conversation_memory": {"runs": ["before"]}}
+assert node.captured_output_schema == {"description": "CALLER SCHEMA"}
+assert node.captured_tools == ["SIDE EFFECT TOOL"]
 expected_project_rules = module._split_behavior_rules(_sealed_policy, 4)
 expected_shot_rules = module._split_behavior_rules(_sealed_binding, 4)
-captured_names = [str(ruleset.get("name", "")) for ruleset in node.captured_rules]
+sealed_rulesets = node.captured_rules[-2:]
+captured_names = [str(ruleset.get("name", "")) for ruleset in sealed_rulesets]
 assert len(set(captured_names)) == 2
 assert all(
     len(name) == 32
     and all(character in "0123456789abcdef" for character in name)
     for name in captured_names
 )
-assert node.captured_rules[0]["rules"] == expected_project_rules
-assert node.captured_rules[1]["rules"] == expected_shot_rules
-assert len(node.captured_rules[0]["rules"]) == 4
-assert len(node.captured_rules[1]["rules"]) == 4
+assert sealed_rulesets[0]["rules"] == expected_project_rules
+assert sealed_rulesets[1]["rules"] == expected_shot_rules
+assert len(sealed_rulesets[0]["rules"]) == 4
+assert len(sealed_rulesets[1]["rules"]) == 4
 assert node.parameter_output_values["output"] == "FINAL ENGLISH OUTPUT"
 # The public Agent wrapper is chain state only. All active rule containers are
 # scrubbed after the native call, including the caller's ruleset copy.
@@ -479,7 +415,7 @@ list(benign_json.process())
 assert benign_json.parameter_output_values["output"] == benign_json.output_override
 
 # An empty native result is an execution failure, not a semantic or language
-# failure. It must never create a successful generator snapshot/publication.
+# failure. It must publish only the fixed execution-failure result.
 empty_output = canonical_hmb_agent()
 empty_output.output_override = ""
 empty_output.set_parameter_value("prompt", visible_prompt)
@@ -492,7 +428,6 @@ else:
 assert empty_output.parameter_output_values["output"] == (
     module._HMB_EXECUTION_FAILED_MESSAGE
 )
-assert empty_output._hmb_last_generator_snapshot == {}
 
 # Runtime-scope text is also no longer inspected at the public string boundary.
 runtime_scope_echo = canonical_hmb_agent()
@@ -630,7 +565,5 @@ assert SEALED_TEST_FRAGMENT not in str(exceptional.parameter_output_values["agen
 
 for obsolete in ("PROJECT", "project", "episode", "shot", "projects_root", "project_load_path", "Task"):
     assert obsolete not in node.parameters
-
-module._prompt_policy_source_identity = actual_prompt_identity_reader
 
 print("HMB native single-execution and runtime-state protection regression: PASS")

@@ -257,7 +257,8 @@ color_direct_job, color_direct_fx, color_direct_user = prompt_sections(
 )
 assert color_direct_job["videos"][0]["source_type"] == "Unified Shot-Control Video"
 assert color_direct_job["videos"][0]["control_role"] == "Primary Unified Shot Control"
-assert color_direct_fx["sources"] == []
+assert [source["video"] for source in color_direct_fx["sources"]] == ["@video1"]
+assert color_direct_fx["sources"][0]["role"] == "Primary Unified Shot Control"
 assert color_direct_user == {}
 
 color_depth_state = prompt._apply_picker_payload(
@@ -282,7 +283,14 @@ technical_error_prompt = prompt._build_data_only_prompt_package(technical_error_
 technical_job, technical_fx, technical_user = prompt_sections(technical_error_prompt)
 assert technical_job["images"] == []
 assert technical_job["videos"] == []
-assert technical_fx["valid"] is True
+assert technical_fx == {
+    "schema": "hmb-fx-timing-source-facts",
+    "version": 3,
+    "sources": [],
+    "control_bindings": [],
+}
+assert "valid" not in technical_fx
+assert "errors" not in technical_fx
 assert technical_user == {}
 
 # Picker connections merge their evidence into the current state. A shorter
@@ -373,31 +381,32 @@ assert (
     == "Use [deselected image source #2] silhouette"
 )
 
-# Unknown or retired taxonomy text is released. Current Main/Sub is the only
-# authoring contract and existing assets are intentionally reset on upgrade.
+# Unknown derived wire values are released because current Main/Sub is the
+# authoring contract. Blank Main/Sub and independent custom/Target fields are
+# serialized exactly as authored rather than filled or semantically rewritten.
 future_image = prompt._normalize_image_item({
     "source_type": "Future Image",
     "custom_source_type": "Future Image",
     "owner": "ExistingTarget",
     "binding_scopes": ["Handheld prop"],
 }, 1)
-assert future_image["image_main_type"] == "Select Image Main Type"
+assert future_image["image_main_type"] == ""
 assert future_image["image_sub_type"] == ""
 assert future_image["source_type"] == "Role Required / Select Source Type"
-assert future_image["custom_source_type"] == ""
-assert future_image["owner"] == ""
+assert future_image["custom_source_type"] == "Future Image"
+assert future_image["owner"] == "ExistingTarget"
 future_video = prompt._migrate_old_video_item({
     "source_type": "Future Video",
     "custom_source_type": "Future Video",
     "control_role": "Future Role",
     "custom_control_role": "Future Role",
 }, 1)
-assert future_video["video_main_type"] == "Select Video Main Type"
+assert future_video["video_main_type"] == ""
 assert future_video["video_sub_type"] == ""
 assert future_video["source_type"] == "Role Required / Select Video Type"
-assert future_video["custom_source_type"] == ""
+assert future_video["custom_source_type"] == "Future Video"
 assert future_video["control_role"] == ""
-assert future_video["custom_control_role"] == ""
+assert future_video["custom_control_role"] == "Future Role"
 
 # Enabling an incomplete optional Range preserves it as an unresolved typed
 # constraint. Missing optional fields are not technical corruption and add no warning.
@@ -430,7 +439,15 @@ incomplete_range_prompt = assert_prompt_is_additive(
 incomplete_job = prompt_sections(incomplete_range_prompt)[0]
 assert incomplete_job["images"][0]["label"] == "Range-independent idea"
 assert incomplete_job["videos"][0]["label"] == "range-source.mp4"
-assert incomplete_job["frame_ranges"] == []
+assert incomplete_job["frame_ranges"] == [{
+    "image": "@image1",
+    "video": "@video1",
+    "marker_color": "",
+    "enabled": True,
+    "origin": "manual",
+    "domain": {},
+    "segments": [],
+}]
 
 # Exceeding the advisory production budget no longer replaces the user goal
 # with a conflict-only response. The complete prompt remains available with a
@@ -459,7 +476,16 @@ long_state["text"].update({
 long_prompt = prompt._build_data_only_prompt_package(long_state)
 long_job, long_fx, long_user = prompt_sections(long_prompt)
 assert len(long_job["videos"]) == prompt.MAX_VIDEOS
-assert long_fx["sources"] == []
+assert len(long_fx["sources"]) == prompt.MAX_VIDEOS
+for slot, source in enumerate(long_fx["sources"], start=1):
+    assert source["video"] == f"@video{slot}"
+    assert source["video_main_type"] == "Motion Reference"
+    assert source["video_sub_type"] == "Secondary Motion"
+    assert source["role"] == "Secondary Motion Only"
+    assert source["keep_out"] == "K" * prompt.MAX_KEEP_OUT_CHARS
+    assert "role_selected" not in source
+assert "valid" not in long_fx
+assert "errors" not in long_fx
 assert long_user["PROJECT_STYLE_LOOK"].startswith("GOAL_SENTINEL ")
 assert len(long_user["SCENE_CONTEXT"]) == prompt.MAX_DESCRIPTION_CHARS
 assert len(long_user["EMOTION_INTENT"]) == prompt.MAX_DESCRIPTION_CHARS
@@ -545,7 +571,6 @@ assert process_warning_capture.messages == []
 # does not read or inject the sealed HMB policy. Stub only the native model call
 # so this regression proves routing without making a request.
 plain_prompt = "Independent non-HMB design assistant request."
-assert agent._is_hmb_prompt_library_payload(plain_prompt) is False
 # CI may not load the optional Standard Library implementation. Construct only
 # the HMB routing shell so the test never turns that environment limitation into
 # a model request or skips the non-HMB branch contract.

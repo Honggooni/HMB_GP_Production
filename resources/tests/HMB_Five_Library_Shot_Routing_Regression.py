@@ -603,7 +603,10 @@ assert 'participant_kind == "prompt"' in agent_source
 seedance_source = source_by_kind[routing.KIND_SEEDANCE].read_text(encoding="utf-8")
 assert 'source_counts = {"image_asset": 0, "video_picker": 0}' in seedance_source
 assert "def _manual_agent_prompt_source" in seedance_source
-assert "Agent and direct Shot media generations do not match" in seedance_source
+assert "def _validate_direct_media_snapshot" in seedance_source
+assert "Seedance selected Shot identity does not match its direct sources" in seedance_source
+assert "Agent and direct Shot media generations do not match" not in seedance_source
+assert "Prompt changed after the Agent result" not in seedance_source
 assert "schedule_post_deletion_reconcile(self)" in seedance_source
 
 picker_source = source_by_kind[routing.KIND_VIDEO_PICKER].read_text(encoding="utf-8")

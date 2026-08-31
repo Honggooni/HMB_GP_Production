@@ -22,6 +22,7 @@ prompt = load_module("HMBPromptLibrary")
 agent = load_module("HMBAgentLibrary")
 source = (ROOT / "HMBPromptLibrary.py").read_text(encoding="utf-8")
 agent_source = (ROOT / "HMBAgentLibrary.py").read_text(encoding="utf-8")
+common_source = (ROOT / "_hmb_common.py").read_text(encoding="utf-8")
 legacy_scope_phrases = (
     "explicit user goal may use any visible property",
     "explicit current user goal may use any visible or supplied property",
@@ -32,26 +33,34 @@ legacy_scope_phrases = (
 for legacy in legacy_scope_phrases:
     assert legacy.casefold() not in source.casefold(), legacy
 
-assert prompt.PROMPT_POLICY_SOURCE_VERSION == "2026-08-27.agent-shot-quality.v4.5"
-assert prompt.PROMPT_POLICY_SOURCE_CONTRACT_SHA256 == (
-    "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
-)
-assert prompt.PROMPT_POLICY_SOURCE_VERSION == prompt._hmb._AGENT_POLICY_VERSION
-assert (
-    prompt.PROMPT_POLICY_SOURCE_CONTRACT_SHA256
-    == prompt._hmb._AGENT_POLICY_CONTRACT_SHA256
-)
-assert agent._prompt_policy_source_identity() == (
-    prompt.PROMPT_POLICY_SOURCE_VERSION,
-    prompt.PROMPT_POLICY_SOURCE_CONTRACT_SHA256,
-)
-assert agent._assert_prompt_policy_identity_matches_signed_runtime() == (
-    prompt.PROMPT_POLICY_SOURCE_VERSION,
-    prompt.PROMPT_POLICY_SOURCE_CONTRACT_SHA256,
-)
+# Prompt and Agent must not pin one server revision, prose contract digest, or
+# locally reviewed policy candidate.  The signed server session is the sole
+# policy source; these retired symbols would recreate a client-side policy gate.
+for retired_symbol in (
+    "PROMPT_POLICY_SOURCE_VERSION",
+    "PROMPT_POLICY_SOURCE_CONTRACT_SHA256",
+    "PROMPT_POLICY_CANDIDATE_VERSION",
+    "PROMPT_POLICY_CANDIDATE_CONTRACT_SHA256",
+    "PROMPT_POLICY_CANDIDATE_STATUS",
+):
+    assert not hasattr(prompt, retired_symbol), retired_symbol
+    assert retired_symbol not in source, retired_symbol
+for retired_symbol in (
+    "_AGENT_POLICY_VERSION",
+    "_AGENT_POLICY_CONTRACT_SHA256",
+):
+    assert not hasattr(prompt._hmb, retired_symbol), retired_symbol
+    assert retired_symbol not in common_source, retired_symbol
+for retired_symbol in (
+    "_prompt_policy_source_identity",
+    "_assert_prompt_policy_identity_matches_signed_runtime",
+):
+    assert not hasattr(agent, retired_symbol), retired_symbol
+    assert retired_symbol not in agent_source, retired_symbol
 assert "[HMB SERVER POLICY REQUIRED]" in agent_source
 assert "사용자 로컬에 동봉된 hmb_agent_core.dat" not in agent_source
-assert "_assert_prompt_policy_identity_matches_signed_runtime()" in agent_source
+assert "_bootstrap_agent_policy_session()" in agent_source
+assert "resources/agent/hmb_agent_core.dat" not in agent_source
 
 def prompt_sections(payload: str):
     lines = payload.splitlines()
@@ -108,6 +117,7 @@ assert job["images"] == []
 assert job["videos"] == []
 assert job["control_only_bindings"] == []
 assert fx_contract["sources"] == []
+assert fx_contract["control_bindings"] == []
 assert user_data == {}
 for forbidden in (
     "PRODUCTION INTEGRATION DEFAULTS:",
@@ -131,7 +141,18 @@ job, fx_contract, user_data = prompt_sections(
 )
 assert job["videos"][0]["source_type"] == "Maya Preview / Playblast"
 assert job["videos"][0]["control_role"] == "Mask / Guide Only"
-assert fx_contract["sources"] == []
+assert fx_contract["sources"] == [{
+    "video": "@video1",
+    "video_main_type": "Maya Preview / Playblast",
+    "video_sub_type": "Mask",
+    "custom_source_type": "",
+    "role": "Mask / Guide Only",
+    "custom_role": "",
+    "keep_out": "",
+    "range_segments": [],
+    "authored_timing_cues": [],
+}]
+assert fx_contract["control_bindings"] == []
 assert user_data == {}
 
 # Structured control-only data is transported as fields while its direct UI
@@ -153,6 +174,7 @@ job, _fx_contract, user_data = prompt_sections(
 assert job["control_only_bindings"] == [{
     "source_field": "SCENE_CONTEXT",
     "line": 1,
+    "raw": "@video1 | Target = Hero_A | Function = Focus | Marker = Red | Boundary = Frames 48-72",
     "video": "@video1",
     "target_id": "Hero_A",
     "function": "Focus",
@@ -175,20 +197,19 @@ job, fx_contract, _user_data = prompt_sections(
 )
 assert job["videos"][0]["control_role"] == "FX Effect Only"
 fx_source = fx_contract["sources"][0]
-assert fx_source["source_type"] == "FX Reference"
-assert fx_source["selected_role"] == "FX Effect Only"
-assert set(fx_source).issubset({
+assert fx_source["video_main_type"] == "FX Reference"
+assert fx_source["role"] == "FX Effect Only"
+assert set(fx_source) == {
     "video",
-    "video_uid",
-    "source_type",
-    "selected_role",
-    "role_selected",
-    "validation_codes",
-    "range_on",
+    "video_main_type",
+    "video_sub_type",
+    "custom_source_type",
+    "role",
+    "custom_role",
+    "keep_out",
     "range_segments",
-    "emitter_binding_declared",
-    "timing_cues",
-})
+    "authored_timing_cues",
+}
 
 # Image look intent and routing remain explicit fields, without generated
 # appearance-policy prose.

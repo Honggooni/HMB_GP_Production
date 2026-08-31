@@ -783,20 +783,20 @@ const preservedTaxonomyState = prompt.normalizeState({
   }],
 });
 assert.equal(preservedTaxonomyState.images[0].source_type, "Role Required / Select Source Type");
-assert.equal(preservedTaxonomyState.images[0].custom_source_type, "");
-assert.equal(preservedTaxonomyState.images[0].owner, "");
+assert.equal(preservedTaxonomyState.images[0].custom_source_type, "Future Image");
+assert.equal(preservedTaxonomyState.images[0].owner, "ExistingTarget");
 assert.equal(preservedTaxonomyState.videos[0].video_main_type, "Select Video Main Type");
 assert.equal(preservedTaxonomyState.videos[0].video_sub_type, "");
 assert.equal(preservedTaxonomyState.videos[0].source_type, "Role Required / Select Video Type");
-assert.equal(preservedTaxonomyState.videos[0].custom_source_type, "");
+assert.equal(preservedTaxonomyState.videos[0].custom_source_type, "Future Video");
 assert.equal(preservedTaxonomyState.videos[0].control_role, "");
-assert.equal(preservedTaxonomyState.videos[0].custom_control_role, "");
+assert.equal(preservedTaxonomyState.videos[0].custom_control_role, "Future Role");
 
 const unnamedMeaningState = prompt.normalizeState({
   images: [{ source_type: "Custom", custom_source_type: "Unnamed idea" }],
   videos: [{ source_type: "Motion Reference", control_role: "Context Only" }],
 });
-assert.equal(unnamedMeaningState.images[0].present, false);
+assert.equal(unnamedMeaningState.images[0].present, true);
 assert.equal(unnamedMeaningState.videos[0].present, false);
 
 const textInput = fakeElement();

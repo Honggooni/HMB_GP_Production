@@ -66,6 +66,61 @@ for mask in range(1, 1 << len(field_names)):
     assert "qa_coverage_not_provider_attention" not in package
     assert "HMB QA" not in package
 
+# Current authored VFX and per-video Keep Out text are opaque values. Retired
+# compatibility fields must neither append labeled prose nor merge/deduplicate
+# lines into either current field.
+verbatim_state = prompt._default_widget_state()
+verbatim_state["text"].update({
+    "VIDEO_VFX": "  repeat VFX\nrepeat VFX\n  tail VFX  ",
+    "FX_ADDITIONAL_INSTRUCTION": "retired additional VFX",
+    "FALLBACK_MISSING_FUNCTION": "retired fallback function",
+    "FALLBACK_INSTRUCTION": "retired fallback instruction",
+    "VIDEO_CONTEXT": "retired video context",
+    "VIDEO_MARKER": "retired video marker",
+    "VIDEO_DESCRIPTION": "retired video description",
+})
+verbatim_state["videos"][0].update({
+    "present": True,
+    "label": "verbatim.mp4",
+    "video_main_type": "Custom / Context",
+    "video_sub_type": "Custom",
+    "keep_out": "  repeat Keep Out\nrepeat Keep Out\n  tail Keep Out  ",
+    "keepOut": "retired camel-case Keep Out",
+    "exclusion_note": "retired exclusion",
+    "negative_prompt": "retired negative prompt",
+    "video_marker": "retired marker",
+    "marker": "retired marker alias",
+    "description": "retired description",
+})
+normalized_verbatim = prompt._normalize_state(verbatim_state)
+assert normalized_verbatim["text"]["VIDEO_VFX"] == (
+    "  repeat VFX\nrepeat VFX\n  tail VFX  "
+)
+assert normalized_verbatim["videos"][0]["keep_out"] == (
+    "  repeat Keep Out\nrepeat Keep Out\n  tail Keep Out  "
+)
+verbatim_package = prompt._build_data_only_prompt_package(normalized_verbatim)
+_verbatim_job, verbatim_fx, verbatim_user = prompt_sections(verbatim_package)
+assert verbatim_user["VIDEO_VFX"] == "  repeat VFX\nrepeat VFX\n  tail VFX  "
+assert verbatim_fx["sources"][0]["keep_out"] == (
+    "  repeat Keep Out\nrepeat Keep Out\n  tail Keep Out  "
+)
+for retired_text in (
+    "retired additional VFX",
+    "retired fallback function",
+    "retired fallback instruction",
+    "retired video context",
+    "retired video marker",
+    "retired video description",
+    "retired camel-case Keep Out",
+    "retired exclusion",
+    "retired negative prompt",
+    "retired marker",
+    "retired marker alias",
+    "retired description",
+):
+    assert retired_text not in verbatim_package
+
 # A transcript is exact text evidence only. It neither creates media nor adds a
 # task/activation field to the public job contract.
 transcript_state = prompt._default_widget_state()

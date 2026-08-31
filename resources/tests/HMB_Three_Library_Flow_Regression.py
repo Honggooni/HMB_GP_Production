@@ -151,9 +151,8 @@ assert compiled_job["videos"][0]["video"] == "@video1"
 assert compiled_job["videos"][0]["label"] == "flow_test_playblast_1"
 assert "video_path" not in compiled_job["videos"][0]
 
-# AgentLibrary recognizes the Prompt output and prepares exactly four rules from
-# each internal behavior without changing the downstream native Agent contract.
-assert agent._is_hmb_prompt_library_payload(compiled_prompt)
+# AgentLibrary prepares exactly four rules from each authenticated internal
+# behavior without changing the downstream native Agent contract.
 policy_document, binding_document = agent._hmb._load_verified_behavior_documents()
 policy_rules = agent._split_behavior_rules(policy_document, 4)
 binding_rules = agent._split_behavior_rules(binding_document, 4)

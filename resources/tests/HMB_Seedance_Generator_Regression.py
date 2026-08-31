@@ -1574,12 +1574,10 @@ def assert_payload_and_media_contract() -> None:
             "video_references": ["https://cdn.example/video-2.mp4"],
         }
     )
-    try:
-        node._validate_parameters(gap_params)
-    except ValueError as exc:
-        assert "reference_video_2 requires reference_video_1" in str(exc)
-    else:
-        raise AssertionError("A gap before reference_video_2 was accepted")
+    node._validate_parameters(gap_params)
+    assert gap_params["video_references"] == [
+        "https://cdn.example/video-2.mp4"
+    ]
 
     legacy_node = target.HMBSeedanceGeneration(name="Legacy List Regression")
     legacy_node.set_parameter_value(

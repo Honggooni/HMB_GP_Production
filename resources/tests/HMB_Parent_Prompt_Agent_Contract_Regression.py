@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -35,19 +36,6 @@ def prompt_json_section(payload: str, header: str):
     assert lines[0] == "HMB_GP_Production"
     assert len(lines) == 7
     return json.loads(lines[lines.index(header) + 1])
-
-# This topology/4+4 behavior test supplies synthetic policy documents while the
-# compiler/runtime identity remains synchronized to the checked-in signed v4
-# baseline.
-SYNTHETIC_SIGNED_V4_PROMPT_IDENTITY = (
-    str(agent._hmb._AGENT_POLICY_VERSION),
-    str(agent._hmb._AGENT_POLICY_CONTRACT_SHA256).lower(),
-)
-assert agent._prompt_policy_source_identity() == SYNTHETIC_SIGNED_V4_PROMPT_IDENTITY
-assert agent._assert_prompt_policy_identity_matches_signed_runtime() == (
-    SYNTHETIC_SIGNED_V4_PROMPT_IDENTITY
-)
-
 
 def make_source(
     source_class: type,
@@ -270,15 +258,6 @@ def exercise_agent_route(
 
     def native_once(self):
         names = tuple(self._hmb_ruleset_names)
-        if self._hmb_rules_active:
-            assert agent._RUNTIME_FX_SCOPE_HEADER in self._hmb_runtime_prompt
-            assert len(
-                [
-                    line
-                    for line in prompt_value.splitlines()
-                    if line.strip()
-                ]
-            ) == 7
         observations.append(
             (
                 bool(self._hmb_rules_active),
@@ -293,6 +272,7 @@ def exercise_agent_route(
                 len(self._hmb_binding_rules),
             )
         )
+        self.parameter_output_values["output"] = "native-complete"
         if False:
             yield None
         return "native-complete"
@@ -316,8 +296,36 @@ def exercise_agent_route(
         ),
         node,
     )
+    class PairedPromptSource:
+        @staticmethod
+        def _hmb_agent_prompt_snapshot(expected_visible):
+            visible = str(expected_visible or "")
+            machine_prompt = str(prompt_value or "")
+            return {
+                "schema": agent._PAIRED_PROMPT_SNAPSHOT_SCHEMA,
+                "version": agent._PAIRED_PROMPT_SNAPSHOT_VERSION,
+                "generation": 1,
+                "visible_sha256": hashlib.sha256(
+                    visible.encode("utf-8")
+                ).hexdigest(),
+                "machine_sha256": hashlib.sha256(
+                    machine_prompt.encode("utf-8")
+                ).hexdigest(),
+                "machine_prompt": machine_prompt,
+            }
+
+    paired_source = PairedPromptSource()
+
+    def canonical_prompt_topology(self):
+        setattr(
+            self,
+            agent._VERIFIED_PROMPT_SOURCE_ATTRIBUTE,
+            paired_source if direct_prompt_edge else None,
+        )
+        return direct_prompt_edge
+
     node._has_canonical_hmb_prompt_connection = MethodType(
-        lambda _self: direct_prompt_edge,
+        canonical_prompt_topology,
         node,
     )
     node._load_hmb_rules = MethodType(load_rules, node)
@@ -409,18 +417,17 @@ assert exercise_agent_route(
     direct_prompt_edge=False,
 ) == native_route
 
-# Topology activates HMB, but the canonical edge must also carry the current
-# typed source envelope. Missing or stale Prompt packages fail closed instead
-# of bypassing the FX/Timing contract.
-for invalid_topology_owned_payload in (
+# The paired transport still requires non-empty visible and machine snapshots,
+# but Agent treats every non-empty Prompt-owned document as opaque authored data.
+assert exercise_agent_route(
     "",
+    direct_prompt_edge=True,
+    expected_contract_error=True,
+) == (False, False, 0, 0, 0, False, 1, 0)
+assert exercise_agent_route(
     "future Prompt package with no legacy headings",
-):
-    assert exercise_agent_route(
-        invalid_topology_owned_payload,
-        direct_prompt_edge=True,
-        expected_contract_error=True,
-    ) == (False, False, 0, 0, 0, False, 1, 0)
+    direct_prompt_edge=True,
+) == hmb_route
 
 assert exercise_agent_route(
     compiled_prompt_copy,
@@ -503,7 +510,9 @@ for mode_name, (state, expected_counts) in four_prompt_modes.items():
     assert len([line for line in compiled.splitlines() if line.strip()]) == 7
     prompt_json_section(compiled, "HMB JOB DATA (JSON):")
     fx_facts = prompt_json_section(compiled, "FX/TIMING SOURCE DATA (JSON):")
-    assert set(fx_facts) == {"schema", "version", "valid", "errors", "sources"}
+    assert set(fx_facts) == {
+        "schema", "version", "sources", "control_bindings"
+    }
     prompt_json_section(compiled, "USER DESCRIPTION DATA (JSON):")
     compiled_modes[mode_name] = compiled
 

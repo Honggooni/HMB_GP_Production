@@ -29,7 +29,7 @@ widget.normalizeImageTaxonomy(globalLook);
 assert.equal(globalLook.owner, "Global Look");
 assert.match(
   widget.hmbImageSubtypeAuthorityHint(globalLook, { ui: { language: "ko" } }),
-  /기본적으로 전체 룩.*영향 속성과 대상 이름\/로컬 범위.*개별 대상이 표시되지 않습니다.*복제하지 않습니다/,
+  /기본적으로 전체 룩.*개별 대상 또는 사용자 지정 지시.*로컬 범위.*빈 대상도 그대로 유지.*복제하지 않습니다/,
 );
 
 const freshGeneralLook = {
@@ -39,21 +39,24 @@ const freshGeneralLook = {
   asset_default_target: "Global Look",
 };
 widget.normalizeImageTaxonomy(freshGeneralLook);
-assert.equal(freshGeneralLook.owner, "");
-assert.equal(freshGeneralLook.asset_default_target, "");
+assert.equal(freshGeneralLook.owner, "ch_all");
+assert.equal(freshGeneralLook.asset_default_target, "Global Look");
 const freshGeneralChoices = widget.imageTargetChoicesForRow(
   freshGeneralLook,
   [{ present: true, label: "Jett_11", image_main_type: "Character" }],
 );
-assert.ok(!freshGeneralChoices.includes("Camera / Composition"));
+assert.ok(freshGeneralChoices.includes("Camera / Composition"));
+assert.ok(freshGeneralChoices.includes("Custom"));
 assert.ok(freshGeneralChoices.includes("Global Look"));
 assert.ok(freshGeneralChoices.includes("Jett_11"));
-for (const scaleOnlyTarget of ["ch_all", "bg_all", "ch_all / bg_all", "None"]) {
+assert.ok(freshGeneralChoices.includes("ch_all"));
+for (const scaleOnlyTarget of ["bg_all", "ch_all / bg_all", "None"]) {
   assert.ok(!freshGeneralChoices.includes(scaleOnlyTarget));
 }
 freshGeneralLook.owner = "Camera / Composition";
 widget.normalizeImageTaxonomy(freshGeneralLook);
-assert.equal(freshGeneralLook.owner, "");
+assert.equal(freshGeneralLook.owner, "Camera / Composition");
+assert.ok(widget.imageTargetChoicesForRow(freshGeneralLook, []).includes("Camera / Composition"));
 
 const scopedLookState = widget.normalizeState({
   images: [
@@ -96,20 +99,20 @@ const scopedLookState = widget.normalizeState({
 });
 const scopedLook = scopedLookState.images.find((row) => row.label === "Self Look");
 assert.ok(scopedLook);
-assert.equal(scopedLook.owner, "", "A general Look must not target itself.");
+assert.equal(scopedLook.owner, "Self Look", "An explicitly authored self Target remains intact.");
 const scopedChoices = widget.imageTargetChoicesForRow(
   scopedLook,
   scopedLookState.images,
   scopedLookState,
 );
 assert.ok(scopedChoices.includes("JettCanonical"));
-assert.ok(!scopedChoices.includes("Jett display"), "Canonical owner must take priority over label.");
-for (const excluded of [
-  "Camera / Composition", "ch_all", "bg_all", "ch_all / bg_all", "None",
-  "Other Look", "OtherLookCanonical", "Shot notes", "NotesCanonical", "Self Look",
+for (const included of [
+  "Jett display", "Camera / Composition", "Other Look", "OtherLookCanonical",
+  "Shot notes", "NotesCanonical", "Global Look", "Custom",
 ]) {
-  assert.ok(!scopedChoices.includes(excluded), `${excluded} is not a valid general Look Target.`);
+  assert.ok(scopedChoices.includes(included), `${included} must remain an available Target candidate.`);
 }
+assert.ok(scopedChoices.includes("Self Look"), "The current authored Target remains selectable.");
 
 for (const subtype of [
   "Render Look",
@@ -138,20 +141,23 @@ for (const subtype of ["Lighting / Atmosphere", "Color / Look / Lighting"]) {
     look_custom_instruction: "Keep the foreground readable.",
   };
   widget.normalizeImageTaxonomy(sharedLightingReference);
-  assert.equal(sharedLightingReference.owner, "Global Look");
-  assert.deepEqual(
-    widget.imageTargetChoicesForRow(sharedLightingReference, scopedLookState.images),
-    ["Global Look", "Custom"],
+  assert.equal(sharedLightingReference.owner, "Jett_11");
+  const sharedChoices = widget.imageTargetChoicesForRow(
+    sharedLightingReference,
+    scopedLookState.images,
   );
+  for (const choice of ["JettCanonical", "Global Look", "Custom", "Jett_11"]) {
+    assert.ok(sharedChoices.includes(choice));
+  }
   const sharedHint = widget.hmbImageSubtypeAuthorityHint(
     sharedLightingReference,
     { ui: { language: "en" } },
   );
   assert.match(sharedHint, /Global Look by default/i);
   assert.match(sharedHint, /affected properties/i);
-  assert.match(sharedHint, /named target\/local scope/i);
-  assert.match(sharedHint, /scene-wide scope/i);
-  assert.match(sharedHint, /named Targets remain hidden/i);
+  assert.match(sharedHint, /named Target or Custom instruction/i);
+  assert.match(sharedHint, /local scope/i);
+  assert.match(sharedHint, /blank Target is also preserved/i);
   sharedLightingReference.owner = "Custom";
   const restored = widget.normalizeState(JSON.parse(JSON.stringify({
     images: [sharedLightingReference],
@@ -180,7 +186,10 @@ for (const [subtype, target, phrase] of [
     owner: "Camera / Composition",
   };
   widget.normalizeImageTaxonomy(scaleReference);
-  assert.equal(scaleReference.owner, target);
+  assert.equal(scaleReference.owner, "Camera / Composition");
+  const scaleChoices = widget.imageTargetChoicesForRow(scaleReference, []);
+  assert.ok(!scaleChoices.includes(target), "Target defaults must not be inferred from Sub Type.");
+  assert.ok(scaleChoices.includes("Camera / Composition"));
   const hint = widget.hmbImageSubtypeAuthorityHint(
     scaleReference,
     { ui: { language: "en" } },
@@ -200,6 +209,11 @@ const exactState = widget.normalizeState({
   text: { PRESERVED_TEXT: exactLegacyAndCurrent },
 });
 assert.equal(exactState.text.PRESERVED_TEXT, exactLegacyAndCurrent);
+const whitespaceSensitiveText = "  keep leading space\nkeep trailing space  ";
+assert.equal(
+  widget.normalizeState({ text: { VIDEO_VFX: whitespaceSensitiveText } }).text.VIDEO_VFX,
+  whitespaceSensitiveText,
+);
 
 assert.match(source, /EXACT LITERALS \(TEXT ONLY\)/);
 assert.match(source, /\[Lip-sync Transcript\]/);

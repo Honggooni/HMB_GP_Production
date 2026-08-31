@@ -513,11 +513,6 @@ def hydration_probe() -> tuple[
     probe.get_parameter_by_name = (  # type: ignore[method-assign]
         lambda name: parameters.get(name)
     )
-    probe._clear_remote_prompt_authority = lambda _reason: None  # type: ignore[method-assign]
-    probe._remember_direct_prompt = lambda _value: None  # type: ignore[method-assign]
-    probe._set_remote_prompt_control_value = (  # type: ignore[method-assign]
-        lambda _name, _value: None
-    )
     probe._reconcile_shared_shot_routing = (  # type: ignore[method-assign]
         lambda strict=False: {"ok": True, "strict": strict}
     )
@@ -831,6 +826,34 @@ for model_id, allowed_tasks in (
             task_name
         )
 
+# Provider task constraints remain, but the client must not infer intent from
+# English keywords. Authored non-English edit/extension instructions pass
+# through unchanged to the Broker/model.
+for task_name, authored_prompt in (
+    (TASK_VIDEO_EDITING, "원본 영상의 캐릭터 동작을 더 부드럽게 수정"),
+    (TASK_VIDEO_EXTENSION, "이 장면 다음 동작을 자연스럽게 이어서 생성"),
+):
+    localized = task_params(SEEDANCE_2_5_MODEL_ID, task_name)
+    localized["prompt"] = authored_prompt
+    validation_probe._validate_parameters(localized)
+    assert validation_probe._build_broker_payload(localized)["prompt"] == (
+        authored_prompt
+    )
+
+sparse_legacy_slots = task_params(
+    target.SEEDANCE_2_0_MODEL_ID,
+    TASK_REFERENCE_TO_VIDEO,
+)
+sparse_legacy_slots["video_reference_slots"] = [
+    None,
+    "https://media.example/video-slot-2.mp4",
+    None,
+]
+sparse_legacy_slots["video_references"] = [
+    "https://media.example/video-slot-2.mp4"
+]
+validation_probe._validate_parameters(sparse_legacy_slots)
+
 # Stock 2.0 Multimodal References remains a valid prompt-only selection, while
 # 2.5 Reference-to-Video is a declared provider subtask and needs a reference.
 seedance_2_0_empty_multimodal = task_params(
@@ -894,7 +917,6 @@ else:
 try:
     generator(None, None)._resolve_exact_shot_generation_inputs(
         seedance_2_5_audio_only,
-        verify_agent_prompt=False,
     )
 except RuntimeError as exc:
     assert "direct media source" in str(exc)
@@ -915,13 +937,9 @@ seedance_2_5_unrouted_probe = generator(None, None)
 seedance_2_5_unrouted_probe._hmb_shot_channel_subscription = lambda: {  # type: ignore[method-assign]
     "enabled": False,
 }
-seedance_2_5_unrouted_probe._clear_remote_prompt_authority = (  # type: ignore[method-assign]
-    lambda _reason: None
-)
 seedance_2_5_audio_unrouted = (
     seedance_2_5_unrouted_probe._resolve_exact_shot_generation_inputs(
         seedance_2_5_audio_only,
-        verify_agent_prompt=False,
     )
 )
 assert seedance_2_5_audio_unrouted["input_mode"] == (
@@ -1229,10 +1247,7 @@ preflight_only._get_parameters = (  # type: ignore[method-assign]
 
 def resolve_only_preflight(
     params: dict[str, Any],
-    *,
-    verify_agent_prompt: bool = True,
 ) -> dict[str, Any]:
-    assert verify_agent_prompt is False
     return dict(params)
 
 
@@ -1289,130 +1304,20 @@ async def assert_blocking_stage_is_background_and_cleanup_safe() -> None:
 asyncio.run(assert_blocking_stage_is_background_and_cleanup_safe())
 
 
-class AgentPromptSource:
-    def __init__(self, *, prompt_generation: int = 4) -> None:
-        self.prompt_generation = prompt_generation
-
-    def _hmb_generator_shot_snapshot(
-        self,
-        expected_images: Any,
-        expected_videos: Any,
-    ) -> dict[str, Any]:
-        images = list(expected_images)
-        videos = list(expected_videos)
-        return {
-            "schema": "hmb-prompt-generator-shot-snapshot",
-            "version": 1,
-            "channel_uuid": CHANNEL,
-            "shot_uuid": SHOT,
-            "shot_number": 2,
-            "shot_name": "Second Shot",
-            "prompt_generation": self.prompt_generation,
-            "visible_prompt_sha256": "1" * 64,
-            "image_media_sha256": target.HMBSeedanceGeneration._media_list_sha256(images),
-            "video_media_sha256": target.HMBSeedanceGeneration._media_list_sha256(videos),
-            "image_media": images,
-            "video_media": videos,
-        }
-
-
-class AgentSource:
-    def __init__(
-        self,
-        *,
-        shot_uuid: str = SHOT,
-        image_hash: str = "",
-        prompt_generation: int = 4,
-        current_prompt_generation: int = 4,
-    ) -> None:
-        self.shot_uuid = shot_uuid
-        self.image_hash = image_hash
-        self.prompt_generation = prompt_generation
-        self.prompt_source = AgentPromptSource(
-            prompt_generation=current_prompt_generation
-        )
-        self.invalidated = False
-
-    def _hmb_shot_channel_subscription(self) -> dict[str, Any]:
-        return {
-            "participant_kind": "agent",
-            "enabled": True,
-            "channel_uuid": CHANNEL,
-            "shot_uuid": self.shot_uuid,
-            "shot_number": 2,
-            "shot_name": "Second Shot",
-        }
-
-    def _hmb_generator_shot_snapshot(self, final_text: Any) -> dict[str, Any]:
-        text = str(final_text or "")
-        return {
-            "schema": "hmb-agent-generator-shot-snapshot",
-            "version": 1,
-            "channel_uuid": CHANNEL,
-            "shot_uuid": self.shot_uuid,
-            "shot_number": 2,
-            "shot_name": "Second Shot",
-            "prompt_generation": self.prompt_generation,
-            "visible_prompt_sha256": "1" * 64,
-            "image_media_sha256": self.image_hash or target.HMBSeedanceGeneration._media_list_sha256(
-                ["@image2", "@image1"]
-            ),
-            "video_media_sha256": target.HMBSeedanceGeneration._media_list_sha256(
-                ["@video1"]
-            ),
-            "final_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-        }
-
-    def _hmb_generator_prompt_source_node(self, final_text: Any) -> AgentPromptSource:
-        self._hmb_generator_shot_snapshot(final_text)
-        return self.prompt_source
-
-    def _invalidate_generator_authority_for_prompt_change(self) -> None:
-        self.invalidated = True
-
-
-# A manually connected HMBAgent prompt is accepted only when its immutable
-# result snapshot matches the exact direct media generation for this Shot.
-agent_source = AgentSource()
-agent_resolved = generator(image, picker, agent_source)._resolve_exact_shot_generation_inputs(
-    {"prompt": "Agent FINAL TEXT"}
-)
-assert agent_resolved["prompt"] == "Agent FINAL TEXT"
-
-try:
-    generator(
-        image,
-        picker,
-        AgentSource(shot_uuid="66666666-6666-4666-8666-666666666666"),
-    )._resolve_exact_shot_generation_inputs({"prompt": "wrong Shot"})
-except RuntimeError as exc:
-    assert "another Shot" in str(exc) or "do not match" in str(exc)
-else:
-    raise AssertionError("Seedance accepted an HMBAgent prompt from another Shot.")
-
-try:
-    generator(
-        image,
-        picker,
-        AgentSource(image_hash="f" * 64),
-    )._resolve_exact_shot_generation_inputs({"prompt": "stale media"})
-except RuntimeError as exc:
-    assert "media generations" in str(exc)
-else:
-    raise AssertionError("Seedance accepted a stale HMBAgent media generation.")
-
-stale_prompt_source = AgentSource(current_prompt_generation=5)
-try:
-    generator(
-        image,
-        picker,
-        stale_prompt_source,
-    )._resolve_exact_shot_generation_inputs({"prompt": "stale Prompt generation"})
-except RuntimeError as exc:
-    assert "Prompt changed after the Agent result" in str(exc)
-    assert stale_prompt_source.invalidated is True
-else:
-    raise AssertionError("Seedance accepted an Agent result from an older Prompt generation.")
+# Prompt text is opaque user/Agent output. Generator proves the directly
+# connected Shot media and provider limits, but it no longer imposes a second
+# Agent snapshot, taxonomy, media-hash, or Prompt-revision semantic contract.
+for authored_prompt in (
+    "Agent FINAL TEXT",
+    "Prompt changed after the previous result",
+    "Use a deliberately different creative interpretation",
+):
+    resolved_prompt = generator(image, picker, object())._resolve_exact_shot_generation_inputs(
+        {"prompt": authored_prompt}
+    )
+    assert resolved_prompt["prompt"] == authored_prompt
+    assert resolved_prompt["reference_images"] == ["@image2", "@image1"]
+    assert resolved_prompt["video_references"] == ["@video1"]
 
 # ImageAsset alone is sufficient for image + prompt generation.
 image_only = generator(image, None)._resolve_exact_shot_generation_inputs(
@@ -1468,7 +1373,6 @@ def transition_subscription() -> dict[str, Any]:
 
 
 transition._hmb_shot_channel_subscription = transition_subscription  # type: ignore[method-assign]
-transition._clear_remote_prompt_authority = lambda _reason: None  # type: ignore[method-assign]
 authored_only = {
     "prompt": "manual edit survives mode changes",
     "task": TASK_VIDEO_EDITING,

@@ -134,16 +134,19 @@ if stored_canonical_prompt is None:
         module._AGENT_SHOT_PROMPT_INPUT_PARAMETER
     )
 stored_canonical_prompt = str(stored_canonical_prompt)
-real_node.set_parameter_value("additional_context", "CALLER_CONTEXT_MUST_NOT_RUN")
-real_node.set_parameter_value("rulesets", ["CALLER_RULE_MUST_NOT_RUN"])
-real_node.set_parameter_value("tools", ["CALLER_TOOL_MUST_NOT_RUN"])
+real_node.set_parameter_value("additional_context", "CALLER_CONTEXT_MUST_RUN")
+real_node.set_parameter_value("rulesets", ["CALLER_RULE_MUST_RUN"])
 real_node.set_parameter_value(
     "agent_memory",
-    {"runs": ["CALLER_MEMORY_MUST_NOT_RUN"]},
+    {"runs": [{"input": "before", "output": "before"}]},
 )
 real_node.set_parameter_value(
     "output_schema",
-    {"description": "CALLER_SCHEMA_MUST_NOT_RUN"},
+    {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+    },
 )
 
 captured = {}
@@ -154,16 +157,16 @@ def non_billable_model_step(self, agent, prompt):
     task = agent.tasks[0]
     prompt_value = getattr(prompt, "value", prompt)
     runtime_prompt = str(prompt_value)
-    captured["prompt_exact"] = runtime_prompt == self._hmb_runtime_prompt
+    captured["prompt_exact"] = runtime_prompt == (
+        self._hmb_runtime_prompt + "\nCALLER_CONTEXT_MUST_RUN"
+    )
     captured["public_prompt_prefix_exact"] = runtime_prompt.startswith(
         stored_canonical_prompt.rstrip()
         + "\n"
         + module._RUNTIME_FX_SCOPE_HEADER
         + "\n"
     )
-    captured["caller_context_absent"] = (
-        "CALLER_CONTEXT_MUST_NOT_RUN" not in runtime_prompt
-    )
+    captured["caller_context_present"] = "CALLER_CONTEXT_MUST_RUN" in runtime_prompt
     captured["rule_counts"] = [len(ruleset.rules or []) for ruleset in rulesets]
     captured["ruleset_names"] = [str(ruleset.name or "") for ruleset in rulesets]
     captured["tool_count"] = len(getattr(task, "tools", ()) or ())
@@ -171,7 +174,7 @@ def non_billable_model_step(self, agent, prompt):
     captured["memory_runs"] = len(
         getattr(getattr(agent, "conversation_memory", None), "runs", ()) or ()
     )
-    sealed_rule = rulesets[0].rules[0]
+    sealed_rule = rulesets[-2].rules[0]
     captured["sealed_rule"] = str(getattr(sealed_rule, "value", sealed_rule))
     self.append_value_to_parameter("output", "PRIVATE_REAL_STREAM_FRAGMENT")
     self.append_value_to_parameter("logs", captured["sealed_rule"])
@@ -207,19 +210,25 @@ finally:
 
 assert captured["prompt_exact"] is True
 assert captured["public_prompt_prefix_exact"] is True
-assert captured["caller_context_absent"] is True
-assert captured["rule_counts"] == [4, 4]
-assert len(set(captured["ruleset_names"])) == 2
+assert captured["caller_context_present"] is True
+assert captured["rule_counts"] == [1, 4, 4]
+assert captured["ruleset_names"][0] == "behavior_1"
+sealed_ruleset_names = captured["ruleset_names"][-2:]
+assert len(set(sealed_ruleset_names)) == 2
 assert all(
     len(name) == 32 and all(character in "0123456789abcdef" for character in name)
-    for name in captured["ruleset_names"]
+    for name in sealed_ruleset_names
 )
 assert captured["tool_count"] == 0
-assert captured["output_schema"] is None
-assert captured["memory_runs"] == 0
+assert captured["output_schema"] is not None
+assert captured["memory_runs"] == 1
 assert real_node.parameter_output_values["output"] == "FINAL_SAFE_OUTPUT"
 assert captured["sealed_rule"] not in str(real_node.parameter_output_values)
-assert real_node.parameter_output_values["agent"]["rulesets"] == []
+assert "CALLER_RULE_MUST_RUN" in str(real_node.parameter_output_values["agent"])
+assert all(
+    name not in str(real_node.parameter_output_values["agent"])
+    for name in sealed_ruleset_names
+)
 assert real_node._hmb_rules_active is False
 assert real_node._hmb_capture_publications is False
 assert real_node._hmb_policy == ""

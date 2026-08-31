@@ -48,7 +48,7 @@ export function hmbScopeWidgetStyleMarkup(markup, rootSelector) {
 }
 const MAX_SELECTED_IMAGES = 50;
 const MAX_IMAGE_ASSET_SHOTS = 5;
-const MAX_SHOT_IMAGES = 30;
+const MAX_SHOT_IMAGES = MAX_SELECTED_IMAGES;
 const HMB_IMAGE_ASSET_SHOT_PALETTE = Object.freeze([
   Object.freeze({ number: 1, accent: "#F472B6", rgb: "244,114,182" }),
   Object.freeze({ number: 2, accent: "#3B82F6", rgb: "59,130,246" }),
@@ -397,7 +397,7 @@ const IMAGE_ASSET_UI_TEXT = {
     main_type_label: "MAIN TYPE (REQUIRED)",
     select_main_type: "Select Main Type",
     custom_main_type: "CUSTOM MAIN TYPE",
-    sub_type_label: "SUB TYPE (REQUIRED)",
+    sub_type_label: "SUB TYPE (OPTIONAL)",
     taxonomy_contract: "AGENT MEANING",
     select_sub_type: "Select Sub Type",
     cancel: "Cancel",
@@ -464,7 +464,7 @@ const IMAGE_ASSET_UI_TEXT = {
     main_type_label: "메인 유형 (필수)",
     select_main_type: "메인 유형 선택",
     custom_main_type: "사용자 정의 메인 유형",
-    sub_type_label: "하위 유형 (필수)",
+    sub_type_label: "하위 유형 (선택)",
     taxonomy_contract: "에이전트 적용 의미",
     select_sub_type: "하위 유형 선택",
     cancel: "취소",
@@ -935,20 +935,10 @@ function normalizeImageTaxonomyContract(value) {
     .filter((pair) => pair.main_type && pair.sub_type && pair.source_type);
   const pairKeys = Object.entries(subTypes)
     .flatMap(([mainType, values]) => values.map((subType) => `${mainType}\u0000${subType}`));
-  const semanticKeys = new Set(
-    semanticPairs.map((pair) => `${pair.main_type}\u0000${pair.sub_type}`),
-  );
   const selectableMainCount = Math.max(0, mainTypes.length - 1);
   const subTypeCount = Object.values(subTypes)
     .reduce((sum, values) => sum + values.length, 0);
-  if (
-    mainTypes[0] !== "Select Image Main Type"
-    || Number(raw.main_type_count) !== selectableMainCount
-    || Number(raw.sub_type_count) !== subTypeCount
-    || Number(raw.pair_count) !== pairKeys.length
-    || semanticKeys.size !== pairKeys.length
-    || !pairKeys.every((key) => semanticKeys.has(key))
-  ) return {};
+  if (mainTypes[0] !== "Select Image Main Type") return {};
   const labels = raw.labels && typeof raw.labels === "object" && !Array.isArray(raw.labels)
     ? {
         en: { ...(raw.labels.en && typeof raw.labels.en === "object" ? raw.labels.en : {}) },
@@ -985,15 +975,6 @@ function normalizeState(value) {
   (Array.isArray(input.assets) ? input.assets : []).forEach((raw) => {
     const asset = normalizeAsset(raw);
     if (!asset || seenAssets.has(asset.asset_library_id)) return;
-    const allowedSubTypes = taxonomy.image_sub_type_choices?.[asset.image_main_type];
-    if (!Array.isArray(allowedSubTypes) || !allowedSubTypes.includes(asset.image_sub_type)) {
-      asset.image_main_type = "Select Image Main Type";
-      asset.image_sub_type = "";
-      asset.source_type = "Role Required / Select Source Type";
-      asset.scope_candidate = "";
-      asset.custom_source_type = "";
-      asset.color_pick_candidates = [];
-    }
     seenAssets.add(asset.asset_library_id);
     assets.push(asset);
   });
@@ -4124,13 +4105,9 @@ export function hmbImageAssetRegistrationSubTypes(taxonomy, sourceType) {
 
 export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}) {
   if (!hmbImageAssetCanRegister(asset)) return null;
-  const mainTypes = registrationMainTypes(taxonomy);
   const assetMainType = clean(asset.image_main_type);
   const assetSubType = clean(asset.image_sub_type);
-  const sourceType = mainTypes.includes(assetMainType)
-    ? assetMainType
-    : "";
-  const subTypes = hmbImageAssetRegistrationSubTypes(taxonomy, sourceType);
+  const sourceType = assetMainType !== "Select Image Main Type" ? assetMainType : "";
   const sourceKind = clean(asset.source_kind).toLowerCase() === "user" ? "user" : "project";
   const relativePath = clean(asset.relative_path).replaceAll("\\", "/");
   const lockedFolder = relativePath.includes("/")
@@ -4146,9 +4123,7 @@ export function hmbCreateImageAssetRegistrationDraft(asset, taxonomy = {}) {
     image_name: clean(asset.image_name).slice(0, 256),
     asset_id: clean(asset.asset_id).slice(0, 256),
     image_main_type: sourceType,
-    image_sub_type: subTypes.includes(assetSubType)
-      ? assetSubType
-      : "",
+    image_sub_type: assetSubType,
     custom_source_type: clean(asset.custom_source_type).slice(0, 256),
   };
 }
@@ -4273,11 +4248,6 @@ function registrationDraftIsComplete(draft) {
     clean(draft?.image_name)
     && clean(draft?.asset_id)
     && clean(draft?.image_main_type)
-    && clean(draft?.image_sub_type)
-    && (
-      !(draft?.image_main_type === "Custom / Context" && draft?.image_sub_type === "Custom")
-      || clean(draft?.custom_source_type)
-    )
     && (
       draft?.source_kind !== "user"
       || (
@@ -4324,8 +4294,14 @@ function renderRegistrationDialog(state, draft) {
     !asset
     || !hmbImageAssetCanRegister(asset)
   ) return "";
-  const mainTypes = registrationMainTypes(state.taxonomy);
-  const subTypes = hmbImageAssetRegistrationSubTypes(state.taxonomy, draft.image_main_type);
+  const mainTypes = uniqueStrings([
+    ...registrationMainTypes(state.taxonomy),
+    clean(draft.image_main_type),
+  ]).filter(Boolean);
+  const subTypes = uniqueStrings([
+    ...hmbImageAssetRegistrationSubTypes(state.taxonomy, draft.image_main_type),
+    clean(draft.image_sub_type),
+  ]).filter(Boolean);
   const customMainType = draft.image_main_type === "Custom / Context" && draft.image_sub_type === "Custom"
     ? `<label><span>${escapeHtml(imageAssetText(state, "custom_main_type"))}</span><input data-registration-field="custom_source_type" maxlength="256" value="${escapeHtml(draft.custom_source_type)}"/></label>`
     : "";
@@ -6199,9 +6175,6 @@ function installEvents(container, state, props, remount, listeners) {
     const draft = container.__hmbImageAssetRegistrationDraft;
     if (!draft) return;
     draft.image_main_type = clean(registrationMain.value);
-    draft.custom_source_type = "";
-    const choices = hmbImageAssetRegistrationSubTypes(state.taxonomy, draft.image_main_type);
-    if (!choices.includes(draft.image_sub_type)) draft.image_sub_type = "";
     remount(state);
   });
   const registrationSub = container.querySelector("[data-registration-sub]");
@@ -6209,7 +6182,6 @@ function installEvents(container, state, props, remount, listeners) {
     const draft = container.__hmbImageAssetRegistrationDraft;
     if (!draft) return;
     draft.image_sub_type = clean(registrationSub.value);
-    if (draft.image_sub_type !== "Custom") draft.custom_source_type = "";
     remount(state);
   });
   on(container.querySelector("[data-registration-submit]"), "click", (event) => {

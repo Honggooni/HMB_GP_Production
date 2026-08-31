@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
@@ -25,6 +26,10 @@ image_library = load(
 picker = load(
     "HMBVideoPickerLibrary",
     "hmb_fx_timing_range_video_picker",
+)
+prompt = load(
+    "HMBPromptLibrary",
+    "hmb_fx_timing_range_prompt",
 )
 
 
@@ -91,13 +96,12 @@ assert image_payload["verified_assets"][0]["binding_capabilities"][
     "image_source_frame_range"
 ] is True
 assert "authority" not in image_payload
-assert image_payload["authority_scope"]["schema"] == (
-    "hmb-image-source-authority-scope"
-)
+assert "authority_scope" not in image_payload
 
 
-# Distinct Maya instances of one reusable asset remain distinct. Timing cues
-# are accepted only when both an exact frame and emitter instance are valid.
+# Distinct Maya instances of one reusable asset remain distinct. Picker may
+# still publish exact typed cues as transport evidence; Prompt does not turn
+# those facts into a semantic validity or authority decision.
 markers = [
     {
         "color": "Red",
@@ -148,66 +152,6 @@ video_state["videos"] = [
                     "locator_path": "|shot|JettMini_A|FX_Nozzle_LOC",
                 },
             },
-            {
-                "frame": 999,
-                "phase": "peak",
-                "emitter": {"maya_uuid": "UUID-A"},
-                "local_point": {
-                    "kind": "coordinates",
-                    "space": "local",
-                    "unit": "scene_unit",
-                    "xyz": [0, 0, 0],
-                },
-            },
-            {
-                "frame": 120,
-                "phase": "point",
-                "description": "No emitter identity",
-                "local_point": {
-                    "kind": "coordinates",
-                    "space": "local",
-                    "unit": "scene_unit",
-                    "xyz": [0, 0, 0],
-                },
-            },
-            {
-                "frame": 121,
-                "phase": "point",
-                "emitter": {"maya_uuid": "UUID-A"},
-                "description": "Emitter identity without an exact local point",
-            },
-            {
-                "frame": 122,
-                "phase": "point",
-                "emitter": {"maya_uuid": "UUID-A"},
-                "local_point": {
-                    "kind": "coordinates",
-                    "space": "world",
-                    "unit": "scene_unit",
-                    "xyz": [0, 0, 0],
-                },
-            },
-            {
-                "frame": 123,
-                "phase": "point",
-                "emitter": {"maya_uuid": "UUID-A"},
-                "local_point": {
-                    "kind": "coordinates",
-                    "space": "local",
-                    "xyz": [0, 0, 0],
-                },
-            },
-            {
-                "frame": 124.5,
-                "phase": "point",
-                "emitter": {"maya_uuid": "UUID-A"},
-                "local_point": {
-                    "kind": "coordinates",
-                    "space": "local",
-                    "unit": "scene_unit",
-                    "xyz": [0, 0, 0],
-                },
-            },
         ],
     }
 ]
@@ -245,22 +189,6 @@ assert locator_cue["local_point"] == {
     "locator_id": "FX_Nozzle_LOC",
     "locator_path": "|shot|JettMini_A|FX_Nozzle_LOC",
 }
-unresolved_cues = picker._normalize_timing_cues(
-    [
-        {
-            "frame": 140,
-            "phase": "point",
-            "emitter": {"maya_uuid": "UUID-A"},
-        }
-    ],
-    video["markers"],
-    video["frame_domain"],
-)
-assert unresolved_cues == []
-assert picker._video_reference_capabilities(
-    video["frame_domain"],
-    unresolved_cues,
-)["exact_emitter_cues"] is False
 assert video["reference_capabilities"] == {
     "schema": "hmb-video-reference-capabilities",
     "version": 1,
@@ -278,4 +206,122 @@ for forbidden in (
     assert forbidden not in video["reference_capabilities"]
 
 
-print("HMB FX/Timing/Range typed upstream contract regression: PASS")
+# Prompt serializes authored timing/control data neutrally. A semantically
+# free-form cue and incomplete control lines survive ordinary field
+# normalization instead of being rejected, inferred, or converted to policy.
+prompt_state = prompt._default_widget_state()
+prompt_video = prompt._default_video_item(1)
+prompt_video.update(
+    {
+        "present": True,
+        "label": "fx-reference.mp4",
+        "video_uid": "video-fx-reference",
+        "video_main_type": "FX Reference",
+        "video_sub_type": "FX Effect Only",
+        "custom_source_type": "Authored smoke timing reference",
+        "custom_control_role": "Use only where explicitly directed",
+        "keep_out": "Do not invent extra smoke emitters",
+        "timing_cues": [
+            cue,
+            {
+                "cue_id": "authored-freeform-cue",
+                "cue_type": "artist_note",
+                "cue_phase": "afterglow",
+                "frame": 999,
+                "description": "Preserve this authored timing note literally",
+            },
+        ],
+    }
+)
+prompt_state["videos"] = [prompt_video]
+prompt_state["images"] = []
+prompt_state["text"]["SCENE_CONTEXT"] = "\n".join(
+    [
+        "CONTROL_ONLY_BINDING: authored free text without a video",
+        "VFX_CONTROL_BINDING: @video1 | Target = JettMini_B | Function = emitter",
+    ]
+)
+
+normalized_prompt = prompt._normalize_state(prompt_state)
+machine = prompt._build_data_only_prompt_package(prompt_state)
+lines = [line for line in machine.splitlines() if line.strip()]
+assert len(lines) == 7
+job = json.loads(lines[2])
+fx_contract = json.loads(lines[4])
+
+assert job["control_only_bindings"] == [
+    {
+        "source_field": "SCENE_CONTEXT",
+        "line": 1,
+        "raw": "authored free text without a video",
+        "video": "",
+        "target_id": "",
+        "function": "",
+        "marker_color": "",
+        "boundary": "",
+    },
+    {
+        "source_field": "SCENE_CONTEXT",
+        "line": 2,
+        "raw": "@video1 | Target = JettMini_B | Function = emitter",
+        "video": "@video1",
+        "target_id": "JettMini_B",
+        "function": "emitter",
+        "marker_color": "",
+        "boundary": "",
+    },
+]
+assert fx_contract["schema"] == "hmb-fx-timing-source-facts"
+assert fx_contract["version"] == 3
+assert set(fx_contract) == {"schema", "version", "sources", "control_bindings"}
+source = fx_contract["sources"][0]
+assert source == {
+    "video": "@video1",
+    "video_main_type": "FX Reference",
+    "video_sub_type": "FX Effect Only",
+    "custom_source_type": "Authored smoke timing reference",
+    "role": "FX Effect Only",
+    "custom_role": "Use only where explicitly directed",
+    "keep_out": "Do not invent extra smoke emitters",
+    "range_segments": [],
+    "authored_timing_cues": normalized_prompt["videos"][0]["timing_cues"],
+    "video_uid": "video-fx-reference",
+}
+assert source["authored_timing_cues"][1]["cue_type"] == "artist_note"
+assert source["authored_timing_cues"][1]["cue_phase"] == "afterglow"
+assert source["authored_timing_cues"][1]["frame"] == 999
+for forbidden in (
+    "valid",
+    "errors",
+    "validation_codes",
+    "role_selected",
+    "emitter_binding_declared",
+    "range_on",
+):
+    assert forbidden not in fx_contract
+    assert forbidden not in source
+assert fx_contract["control_bindings"] == [
+    {
+        "field": "SCENE_CONTEXT",
+        "line": 1,
+        "raw": "authored free text without a video",
+        "video": 0,
+        "target": "",
+        "function": "",
+        "marker": "",
+        "boundary": "",
+    },
+    {
+        "field": "SCENE_CONTEXT",
+        "line": 2,
+        "raw": "@video1 | Target = JettMini_B | Function = emitter",
+        "video": 1,
+        "target": "JettMini_B",
+        "function": "emitter",
+        "marker": "",
+        "boundary": "",
+    },
+]
+
+
+print("HMB FX/Timing/Range neutral pass-through contract regression: PASS")

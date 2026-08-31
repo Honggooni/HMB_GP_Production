@@ -328,7 +328,7 @@ assert empty_picker_repeat["images"][0]["frame_range_intent"] == empty_picker_re
 ][0]["frame_range_intent"]
 
 
-# Unknown Picker markers cannot become taxonomy authority.
+# Unknown Picker markers are authored relationship addresses and survive.
 unknown_payload = copy.deepcopy(picker_payload)
 unknown_payload["markers"][0]["color"] = "Infrared dream marker"
 unknown_state = prompt._default_widget_state()
@@ -342,7 +342,7 @@ unknown_state["images"] = [{
     "source_type": "Character Appearance",
 }]
 unknown_result = prompt._apply_picker_payload(unknown_state, unknown_payload, connected=True)
-assert unknown_result["images"][0]["color_picks"] == [""]
+assert unknown_result["images"][0]["color_picks"] == ["Infrared dream marker"]
 
 
 # Only the current Prompt Target and active video addresses enter the Agent
@@ -366,7 +366,11 @@ goal_job = prompt_json_section(goal_prompt, "HMB JOB DATA (JSON):")
 goal_image = goal_job["images"][0]
 assert goal_image["target_id"] == "Hero hand"
 assert goal_image["relationship_targets"] == []
-assert goal_image["bindings"] == []
+assert goal_image["bindings"] == [{
+    "video": "@video3",
+    "marker_color": "Red",
+    "target_scope": "Handheld prop",
+}]
 assert goal_state["images"][0]["binding_video_slots"] == [3]
 goal_user = prompt_json_section(goal_prompt, "USER DESCRIPTION DATA (JSON):")
 assert goal_user == {"SCENE_CONTEXT": "Resolve @video5 as a dream-memory rhythm"}

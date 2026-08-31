@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 from pathlib import Path
 import hashlib
 import hmac
@@ -51,7 +50,6 @@ except Exception:
 _BuiltinAgent = find_builtin_agent_class()
 _BaseAgent = _BuiltinAgent or DataNode
 
-_HMB_TITLE = "HMB_GP_Production"
 _HMB_LIBRARY_NAME = "HMB_GP_Production"
 _HMB_PROMPT_NODE_TYPE = "HMBPromptLibrary"
 _HMB_PROMPT_OUTPUT_PARAMETER = "PROMPT_OUT"
@@ -63,10 +61,6 @@ _AGENT_WIDGET_PARAMETER = "HMB_AGENT_UI"
 _AGENT_WIDGET_HEIGHT = 64
 _AGENT_SHOT_CONTEXT_SCHEMA = "hmb-agent-shot-context"
 _AGENT_SHOT_CONTEXT_VERSION = 1
-_AGENT_GENERATOR_SNAPSHOT_SCHEMA = "hmb-agent-generator-shot-snapshot"
-_AGENT_GENERATOR_SNAPSHOT_VERSION = 1
-_AGENT_REMOTE_PROMPT_PUBLICATION_SCHEMA = "hmb-agent-remote-prompt-publication"
-_AGENT_REMOTE_PROMPT_PUBLICATION_VERSION = 1
 _AGENT_STATE_WARNING_NAME = "HMB_AGENT_STATE_DISPLAY_WARNING"
 _HMB_POLICY_WARNING_NAME = "HMB_AGENT_POLICY_REQUIRED_WARNING"
 _HMB_TOPOLOGY_WARNING_NAME = "HMB_AGENT_CONNECTION_CHECK_WARNING"
@@ -77,21 +71,12 @@ _HMB_POLICY_UNAVAILABLE_MESSAGE = (
     "Close Griptape completely, verify the existing FN AI Broker login and "
     "server connection, then restart the official Griptape Desktop application."
 )
-_HMB_POLICY_IDENTITY_MISMATCH_MESSAGE = (
-    "[HMB POLICY CONTRACT MISMATCH] HMBPromptLibrary와 서버의 서명된 "
-    "Agent 정책이 서로 호환되는 입력 계약을 사용하지 않습니다. "
-    "HMB_GP_Production을 동일한 배포 버전으로 다시 설치하거나 업데이트한 뒤 "
-    "Griptape를 다시 시작하고 재시도하십시오."
-)
 _HMB_SOURCE_CONTRACT_INVALID_MESSAGE = (
     "[HMB SOURCE CONTRACT INVALID] 구조화된 HMB 소스 데이터의 형식 또는 주소가 "
     "일치하지 않아 실행을 중단했습니다. Frame Range OFF/미설정, 선택 역할 미지정 "
     "및 emitter 미지정은 정상적인 선택 상태이며 이 오류의 원인이 아닙니다. "
     "HMBPromptLibrary와 HMBVideoPickerLibrary의 구조화 데이터 연결 상태를 확인하십시오."
 )
-_FX_TIMING_CONTRACT_HEADER = "FX/TIMING SOURCE DATA (JSON):"
-_PUBLIC_JOB_CONTRACT_HEADER = "HMB JOB DATA (JSON):"
-_USER_DESCRIPTION_DATA_HEADER = "USER DESCRIPTION DATA (JSON):"
 _RUNTIME_FX_SCOPE_HEADER = "HMB VERIFIED FX/TIMING RUNTIME SCOPE (JSON):"
 _PAIRED_PROMPT_SNAPSHOT_SCHEMA = "hmb-prompt-paired-snapshot"
 _PAIRED_PROMPT_SNAPSHOT_VERSION = 1
@@ -104,10 +89,6 @@ _PAIRED_PROMPT_SNAPSHOT_KEYS = frozenset({
     "machine_prompt",
 })
 _VERIFIED_PROMPT_SOURCE_ATTRIBUTE = "_hmb_verified_prompt_source_node"
-
-
-class _HMBPolicyIdentityMismatchError(RuntimeError):
-    """Internal typed signal for the public fail-closed version diagnostic."""
 
 
 _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE = (
@@ -190,11 +171,6 @@ def _hmb_native_failure_code(exc: BaseException) -> str:
     return "MODEL_PROVIDER"
 
 
-_HMB_REQUIRED_MARKERS = (
-    _PUBLIC_JOB_CONTRACT_HEADER,
-    _FX_TIMING_CONTRACT_HEADER,
-    _USER_DESCRIPTION_DATA_HEADER,
-)
 _LEGACY_HMB_ELEMENTS = {
     "PROJECT",
     "projects_root",
@@ -257,21 +233,6 @@ _SEALED_POLICY_STATE_KEYS = frozenset(
         "system_prompt",
     }
 )
-_HMB_ISOLATED_SCALAR_INPUTS = frozenset(
-    {
-        "additional_context",
-        "agent",
-        "agent_memory",
-        "memory",
-        "conversation_memory",
-        "messages",
-        "instructions",
-        "output_schema",
-        "system",
-        "system_prompt",
-    }
-)
-_HMB_ISOLATED_LIST_INPUTS = frozenset({"tool", "tools"})
 _SANITIZER_MAX_DEPTH = 64
 _SANITIZER_MAX_NODES = 10_000
 
@@ -798,94 +759,6 @@ def _ensure_agent_widget(node: Any) -> None:
     _move_agent_widget_below_ports(node)
 
 
-def _prompt_policy_source_identity(
-    source_path: Path | None = None,
-) -> tuple[str, str]:
-    """Read the Prompt compiler's declared policy identity without importing it.
-
-    HMBPromptLibrary can advance to a reviewed source candidate before the
-    authorized signer produces a matching runtime envelope. Reading the two
-    literal assignments through the AST avoids circular imports and prevents a
-    comment or unrelated legacy digest from satisfying the runtime guard.
-    """
-
-    path = Path(source_path) if source_path is not None else _THIS_DIR / "HMBPromptLibrary.py"
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    except Exception as exc:
-        raise RuntimeError("HMB Prompt policy source identity could not be read.") from exc
-    wanted = {
-        "PROMPT_POLICY_SOURCE_VERSION": "",
-        "PROMPT_POLICY_SOURCE_CONTRACT_SHA256": "",
-    }
-    seen: set[str] = set()
-    for node in tree.body:
-        targets: list[ast.expr] = []
-        value_node: ast.expr | None = None
-        if isinstance(node, ast.Assign):
-            targets = list(node.targets)
-            value_node = node.value
-        elif isinstance(node, ast.AnnAssign):
-            targets = [node.target]
-            value_node = node.value
-        if value_node is None:
-            continue
-        for target in targets:
-            if not isinstance(target, ast.Name) or target.id not in wanted:
-                continue
-            if target.id in seen:
-                raise RuntimeError(f"Duplicate HMB Prompt policy identity: {target.id}")
-            seen.add(target.id)
-            try:
-                value = ast.literal_eval(value_node)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"HMB Prompt policy identity is not a string literal: {target.id}"
-                ) from exc
-            if not isinstance(value, str):
-                raise RuntimeError(
-                    f"HMB Prompt policy identity is not a string literal: {target.id}"
-                )
-            wanted[target.id] = value.strip()
-    version = wanted["PROMPT_POLICY_SOURCE_VERSION"]
-    contract = wanted["PROMPT_POLICY_SOURCE_CONTRACT_SHA256"].lower()
-    if not version or not re.fullmatch(r"[0-9a-f]{64}", contract):
-        raise RuntimeError("HMB Prompt policy source identity is incomplete.")
-    return version, contract
-
-
-def _assert_prompt_policy_identity_matches_signed_runtime() -> tuple[str, str]:
-    """Require the stable Prompt/Agent contract, not one policy revision label."""
-
-    prompt_identity = _prompt_policy_source_identity()
-    if not hmac.compare_digest(
-        prompt_identity[1],
-        str(_hmb._AGENT_POLICY_CONTRACT_SHA256).lower(),
-    ):
-        raise _HMBPolicyIdentityMismatchError(
-            _HMB_POLICY_IDENTITY_MISMATCH_MESSAGE
-        )
-    return prompt_identity
-
-
-def _is_private_hmb_runtime_prompt(value: Any) -> bool:
-    """Recognize the private machine/runtime envelope at a public UI boundary."""
-
-    text = str(getattr(value, "value", value) or "")
-    if not text:
-        return False
-    folded = text.casefold()
-    if _RUNTIME_FX_SCOPE_HEADER.casefold() in folded:
-        return True
-    return bool(
-        text.lstrip().startswith("HMB_GP_Production")
-        and _PUBLIC_JOB_CONTRACT_HEADER.casefold() in folded
-        and _FX_TIMING_CONTRACT_HEADER.casefold() in folded
-        and _USER_DESCRIPTION_DATA_HEADER.casefold() in folded
-    )
-
-
-
 def _is_direct_hmb_prompt_library_connection(
     node: Any,
     *,
@@ -1003,27 +876,14 @@ def _paired_machine_prompt(node: Any, prompt_value: Any) -> str:
     """Return the machine envelope paired with one visible ``PROMPT_OUT``.
 
     A verified live HMB Prompt source must provide an exact, hashed paired
-    snapshot. Tests and legacy in-process mocks that bypass graph resolution
-    have no retained source instance, so they may use the input itself only
-    when it already passes the complete legacy seven-line machine contract.
+    snapshot. Content markers are not provenance and never activate a fallback
+    transport path.
     """
 
     visible_prompt = _prompt_transport_text(prompt_value)
     source_node = getattr(node, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
     if source_node is None:
-        # Legacy/public regression adapters have no retained source instance.
-        # They may still exercise the protected path with the opaque prompt;
-        # media taxonomy and provider limits belong to Prompt/Generator, not
-        # to HMBAgentLibrary.
-        if (
-            not visible_prompt.startswith(_HMB_TITLE)
-            or not all(
-                marker in visible_prompt
-                for marker in _HMB_REQUIRED_MARKERS
-            )
-        ):
-            raise RuntimeError("HMB Prompt paired transport is invalid.")
-        return visible_prompt
+        raise RuntimeError("HMB Prompt paired snapshot source is unavailable.")
 
     snapshot_getter = getattr(source_node, "_hmb_agent_prompt_snapshot", None)
     if not callable(snapshot_getter):
@@ -1321,9 +1181,10 @@ class HMBAgentLibrary(_BaseAgent):
     Prompt+Asset+Picker are equally valid; the Agent neither identifies nor
     requires those upstream sources itself. The model, schema, output handling,
     and Agent wire format remain owned by the Standard Library Agent. Canonical
-    HMB execution admits only PROMPT_OUT plus the two sealed Behaviors: caller
-    context, memory, rulesets, and tools are not passed to the native run. Once
-    the canonical HMB Prompt edge is present, a missing or
+    HMB execution swaps only the authenticated Prompt bytes and appends the two
+    sealed Behaviors; caller context, memory, rulesets, tools, schema, and native
+    execution settings otherwise remain unchanged. Once the canonical HMB
+    Prompt edge is present, a missing or
     invalid policy blocks execution and reports the configuration error instead
     of silently falling back to a stock native execution.
     """
@@ -1387,14 +1248,10 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_native_failure_code = ""
         self._hmb_shot_context: dict[str, Any] = {}
         self._hmb_shot_catalog_snapshot: dict[str, Any] = {}
-        self._hmb_last_generator_snapshot: dict[str, Any] = {}
         # Instance-local execution authority.  Display widget writes and
         # same-flow route callbacks may interleave while several Agents run,
         # but they must not change the exact Shot being consumed by this run.
         self._hmb_execution_shot_binding: dict[str, Any] = {}
-        self._hmb_remote_prompt_publication: dict[str, Any] = {}
-        self._hmb_remote_prompt_revision = 0
-        self._hmb_remote_prompt_source_token = secrets.token_hex(16)
         self._hmb_shot_route_status: dict[str, Any] = {}
         self._hmb_shot_clear_syncing = False
         self._hmb_shot_catalog_syncing = False
@@ -1719,9 +1576,7 @@ class HMBAgentLibrary(_BaseAgent):
 
         self._hmb_shot_catalog_snapshot = {}
         self._hmb_shot_context = {}
-        self._hmb_last_generator_snapshot = {}
         self._clear_execution_shot_binding()
-        self._hmb_remote_prompt_publication = {}
         self._hmb_shot_route_status = {
             "ok": False,
             "code": str(reason or "publisher_unavailable")[:128],
@@ -1857,9 +1712,7 @@ class HMBAgentLibrary(_BaseAgent):
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return self._hmb_shot_channel_subscription()
         self._hmb_shot_context = {}
-        self._hmb_last_generator_snapshot = {}
         self._clear_execution_shot_binding()
-        self._hmb_remote_prompt_publication = {}
         self._hmb_initial_shot_autoclaim_pending = False
         self._hmb_initial_shot_preferred_uuid = ""
         self._hmb_shot_route_status = {
@@ -2065,283 +1918,11 @@ class HMBAgentLibrary(_BaseAgent):
             self._hmb_shot_catalog_syncing = False
             pass
 
-    def _hmb_generator_shot_snapshot(self, expected_final_text: Any) -> dict[str, Any]:
-        text = str(getattr(expected_final_text, "value", expected_final_text) or "")
-        snapshot = dict(self._hmb_last_generator_snapshot)
-        if (
-            not text
-            or set(snapshot) != {
-                "schema",
-                "version",
-                "channel_uuid",
-                "shot_uuid",
-                "shot_number",
-                "shot_name",
-                "prompt_generation",
-                "visible_prompt_sha256",
-                "image_media_sha256",
-                "video_media_sha256",
-                "final_text_sha256",
-            }
-            or snapshot.get("schema") != _AGENT_GENERATOR_SNAPSHOT_SCHEMA
-            or snapshot.get("version") != _AGENT_GENERATOR_SNAPSHOT_VERSION
-            or not hmac.compare_digest(
-                str(snapshot.get("final_text_sha256") or ""),
-                _prompt_text_sha256(text),
-            )
-        ):
-            raise RuntimeError("HMB Agent Shot result snapshot is unavailable.")
-        return snapshot
-
-    def _hmb_generator_prompt_source_node(self, expected_final_text: Any) -> Any:
-        """Return the exact Prompt node that supplied this Agent result.
-
-        The verified source is instance-authoritative and should not be derived
-        from payload text. The stored pointer can disappear after policy cleanup,
-        so we re-verify the current canonical edge when needed.
-        """
-
-        self._hmb_generator_shot_snapshot(expected_final_text)
-        source_node = getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
-        if source_node is None:
-            if not _is_direct_hmb_prompt_library_connection(self):
-                raise RuntimeError(
-                    "Remote Agent result source is not a verified HMB Prompt."
-                )
-            source_node = getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
-            if source_node is None:
-                raise RuntimeError(
-                    "Remote Agent source is unresolved."
-                )
-        return source_node
-
-    def _hmb_commit_remote_prompt_publication(
-        self,
-        final_text: Any,
-    ) -> dict[str, Any]:
-        """Commit one successful FINAL TEXT as the selected Shot's remote authority.
-
-        The publication is process-local and instance-owned.  It is deliberately
-        separate from the visible ``output`` parameter so a generator node created
-        after this Agent can still pull the exact successful result without a
-        visible editor wire or a process-global payload registry.
-        """
-
-        text = str(getattr(final_text, "value", final_text) or "")
-        snapshot = self._hmb_generator_shot_snapshot(text)
-        revision = int(getattr(self, "_hmb_remote_prompt_revision", 0) or 0) + 1
-        self._hmb_remote_prompt_revision = revision
-        publication = {
-            "schema": _AGENT_REMOTE_PROMPT_PUBLICATION_SCHEMA,
-            "version": _AGENT_REMOTE_PROMPT_PUBLICATION_VERSION,
-            "source_token": str(self._hmb_remote_prompt_source_token),
-            "publication_revision": revision,
-            **{
-                key: snapshot[key]
-                for key in (
-                    "channel_uuid",
-                    "shot_uuid",
-                    "shot_number",
-                    "shot_name",
-                    "prompt_generation",
-                    "visible_prompt_sha256",
-                    "image_media_sha256",
-                    "video_media_sha256",
-                    "final_text_sha256",
-                )
-            },
-            "final_text": text,
-        }
-        self._hmb_remote_prompt_publication = publication
-        return dict(publication)
-
-    def _hmb_invalidate_remote_prompt_publication(self) -> None:
-        """Remove remote authority without changing the user's visible Agent output."""
-
-        self._hmb_remote_prompt_publication = {}
-
-    def _invalidate_generator_authority_for_prompt_change(self) -> None:
-        """Drop only derived Agent authority; keep user-visible FINAL TEXT intact."""
-
-        self._hmb_shot_context = {}
-        self._hmb_last_generator_snapshot = {}
-        self._hmb_invalidate_remote_prompt_publication()
-
-    def _invalidate_stale_generator_authority_for_prompt(
-        self,
-        prompt_value: Any,
-        *,
-        source_node: Any | None = None,
-    ) -> bool:
-        """Invalidate a completed Agent result when its paired Prompt advances.
-
-        A concise Prompt document may remain byte-identical while a private
-        field, target, or media generation changes. The cheap visible hash
-        catches ordinary edits immediately; when the routed source instance is
-        available, its exact paired Shot context also catches machine-only and
-        media-only changes before Generator can adopt the old publication.
-        """
-
-        snapshot = getattr(self, "_hmb_last_generator_snapshot", None)
-        publication = getattr(self, "_hmb_remote_prompt_publication", None)
-        if not isinstance(snapshot, dict) or not snapshot:
-            snapshot = publication if isinstance(publication, dict) else {}
-        if not snapshot:
-            return False
-
-        text = str(getattr(prompt_value, "value", prompt_value) or "")
-        visible_sha256 = _prompt_text_sha256(text.rstrip("\r\n"))
-        stale = not hmac.compare_digest(
-            str(snapshot.get("visible_prompt_sha256") or ""),
-            visible_sha256,
-        )
-        if not stale and source_node is not None:
-            context_getter = getattr(source_node, "_hmb_agent_shot_context", None)
-            if not callable(context_getter):
-                stale = True
-            else:
-                try:
-                    current = self._normalize_shot_context(context_getter(prompt_value))
-                except Exception:
-                    current = {}
-                compared = (
-                    "channel_uuid",
-                    "shot_uuid",
-                    "shot_number",
-                    "shot_name",
-                    "prompt_generation",
-                    "visible_prompt_sha256",
-                    "image_media_sha256",
-                    "video_media_sha256",
-                )
-                stale = not current or any(
-                    current.get(key) != snapshot.get(key) for key in compared
-                )
-        if stale:
-            self._invalidate_generator_authority_for_prompt_change()
-        return stale
-
-    def _hmb_remote_prompt_publication_for_generator(self) -> dict[str, Any]:
-        """Return the current exact-Shot publication, or no authority at all.
-
-        The generator must already have the router-managed hidden dependency on this
-        exact Agent instance.  This method additionally binds the publication to
-        the Agent's current Shot selection and its immutable generator snapshot,
-        preventing a stale Shot 2 result from being adopted by Shot 3.
-        """
-
-        if bool(getattr(self, "_hmb_node_deleted", False)):
-            return {}
-        publication = getattr(self, "_hmb_remote_prompt_publication", None)
-        if not isinstance(publication, dict):
-            return {}
-        required = {
-            "schema",
-            "version",
-            "source_token",
-            "publication_revision",
-            "channel_uuid",
-            "shot_uuid",
-            "shot_number",
-            "shot_name",
-            "prompt_generation",
-            "visible_prompt_sha256",
-            "image_media_sha256",
-            "video_media_sha256",
-            "final_text_sha256",
-            "final_text",
-        }
-        if (
-            set(publication) != required
-            or publication.get("schema") != _AGENT_REMOTE_PROMPT_PUBLICATION_SCHEMA
-            or publication.get("version") != _AGENT_REMOTE_PROMPT_PUBLICATION_VERSION
-            or not isinstance(publication.get("source_token"), str)
-            or not hmac.compare_digest(
-                str(publication.get("source_token")),
-                str(getattr(self, "_hmb_remote_prompt_source_token", "")),
-            )
-            or not isinstance(publication.get("publication_revision"), int)
-            or isinstance(publication.get("publication_revision"), bool)
-            or int(publication["publication_revision"]) <= 0
-            or not isinstance(publication.get("final_text"), str)
-            or not publication["final_text"]
-            or not hmac.compare_digest(
-                str(publication.get("final_text_sha256") or ""),
-                _prompt_text_sha256(publication["final_text"]),
-            )
-        ):
-            return {}
-        subscription = self._hmb_shot_channel_subscription()
-        if (
-            not subscription.get("enabled")
-            or publication.get("channel_uuid") != subscription.get("channel_uuid")
-            or publication.get("shot_uuid") != subscription.get("shot_uuid")
-            or publication.get("shot_number") != subscription.get("shot_number")
-            or publication.get("shot_name") != subscription.get("shot_name")
-        ):
-            return {}
-        try:
-            snapshot = self._hmb_generator_shot_snapshot(publication["final_text"])
-        except RuntimeError:
-            return {}
-        snapshot_fields = required - {
-            "schema",
-            "version",
-            "source_token",
-            "publication_revision",
-            "final_text",
-        }
-        if any(publication[key] != snapshot[key] for key in snapshot_fields):
-            return {}
-        return dict(publication)
-
     def _hmb_shot_routing_status(self, value: Any) -> None:
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return
         if isinstance(value, dict):
             self._hmb_shot_route_status = dict(value)
-            if bool(value.get("ok")) and str(value.get("code") or "") == "ready":
-                claimed = self._hmb_offer_shot_to_generator_recipients()
-                if claimed:
-                    try:
-                        from _hmb_shot_routing import schedule_post_hydration_reconcile
-
-                        # The recipient changed from Remote waiting to a real
-                        # Shot during this routing pass. A hydration pass (not
-                        # registration-only polling) is required to create its
-                        # Agent text and paired image/video dependencies.
-                        schedule_post_hydration_reconcile(self)
-                    except Exception:
-                        pass
-
-    def _hmb_offer_shot_to_generator_recipients(self) -> int:
-        """Offer one complete Prompt/Agent Shot pair to blank generator recipients.
-
-        The recipient owns the adoption policy. Keeping this callback generic
-        preserves Agent/provider neutrality while making creation order
-        irrelevant: a generator may appear before or after the active pair.
-        """
-
-        if bool(getattr(self, "_hmb_node_deleted", False)):
-            return 0
-        try:
-            from _hmb_shot_routing import _same_flow_nodes
-
-            _flow_name, nodes = _same_flow_nodes(self)
-        except Exception:
-            return 0
-        claimed = 0
-        for candidate in nodes:
-            if candidate is self or bool(getattr(candidate, "_hmb_node_deleted", False)):
-                continue
-            callback = getattr(candidate, "_hmb_consider_agent_shot_autoclaim", None)
-            if not callable(callback):
-                continue
-            try:
-                claimed += int(callback(self) is True)
-            except Exception:
-                continue
-        return claimed
 
     def _refresh_agent_shot_route(self, *, strict: bool = False) -> dict[str, Any]:
         if bool(getattr(self, "_hmb_node_deleted", False)):
@@ -2448,6 +2029,21 @@ class HMBAgentLibrary(_BaseAgent):
             parameter = _parameter_by_name(self, name)
             return getattr(parameter, "default_value", default) if parameter else default
 
+    def _matches_active_private_runtime_prompt(self, value: Any) -> bool:
+        """Match only this execution's exact private prompt bytes.
+
+        Content markers alone are not sufficient: an Only-mode user is free to
+        author text that happens to resemble the HMB machine envelope.
+        """
+
+        runtime_prompt = str(getattr(self, "_hmb_runtime_prompt", "") or "")
+        candidate = str(getattr(value, "value", value) or "")
+        return bool(
+            runtime_prompt
+            and candidate
+            and hmac.compare_digest(candidate, runtime_prompt)
+        )
+
     def _set_native_prompt_preview(self, value: Any, *, enabled: bool) -> None:
         """Show the routed Prompt document without changing HMB execution input.
 
@@ -2469,7 +2065,7 @@ class HMBAgentLibrary(_BaseAgent):
         previous_preview = str(
             getattr(self, "_hmb_prompt_preview_value", "") or ""
         )
-        current_is_private = _is_private_hmb_runtime_prompt(current)
+        current_is_private = self._matches_active_private_runtime_prompt(current)
         target = current
         if preview:
             if not active:
@@ -2509,7 +2105,7 @@ class HMBAgentLibrary(_BaseAgent):
     def _public_prompt_value_after_private_echo(self, value: Any) -> Any:
         """Replace a host echo of the private runtime envelope with safe UI text."""
 
-        if not _is_private_hmb_runtime_prompt(value):
+        if not self._matches_active_private_runtime_prompt(value):
             return value
         candidates = (
             getattr(self, "_hmb_prompt_preview_value", ""),
@@ -2519,7 +2115,9 @@ class HMBAgentLibrary(_BaseAgent):
         )
         for candidate in candidates:
             candidate_value = getattr(candidate, "value", candidate)
-            if candidate_value and not _is_private_hmb_runtime_prompt(candidate_value):
+            if candidate_value and not self._matches_active_private_runtime_prompt(
+                candidate_value
+            ):
                 return candidate_value
         return ""
 
@@ -2574,10 +2172,6 @@ class HMBAgentLibrary(_BaseAgent):
         if value is sentinel:
             return False
         self.set_parameter_value(_AGENT_SHOT_PROMPT_INPUT_PARAMETER, value)
-        self._invalidate_stale_generator_authority_for_prompt(
-            value,
-            source_node=source_node,
-        )
         self._refresh_routed_prompt_preview()
         return True
 
@@ -2691,9 +2285,7 @@ class HMBAgentLibrary(_BaseAgent):
                 getattr(self, "_hmb_execution_shot_binding", {})
             )
             selected = normalized.get("shot", {})
-            previous = getattr(self, "_hmb_last_generator_snapshot", {})
-            if not isinstance(previous, dict) or not previous:
-                previous = getattr(self, "_hmb_shot_context", {})
+            previous = getattr(self, "_hmb_shot_context", {})
             if (
                 not execution_binding
                 and isinstance(previous, dict)
@@ -2708,12 +2300,9 @@ class HMBAgentLibrary(_BaseAgent):
                     )
                 )
             ):
-                # A real Only/Shot change is authority-changing, unlike an
-                # execution-phase display echo. Invalidate the old result now,
-                # before the central router mutates managed edges.
+                # A real Only/Shot change clears only the former route context;
+                # FINAL TEXT remains an ordinary public Agent result.
                 self._hmb_shot_context = {}
-                self._hmb_last_generator_snapshot = {}
-                self._hmb_invalidate_remote_prompt_publication()
                 setattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
             if (
                 not getattr(self, "_hmb_shot_clear_syncing", False)
@@ -2725,14 +2314,6 @@ class HMBAgentLibrary(_BaseAgent):
                 self._refresh_agent_shot_route()
             self._refresh_routed_prompt_preview()
         elif str(getattr(parameter, "name", "") or "") == _AGENT_SHOT_PROMPT_INPUT_PARAMETER:
-            self._invalidate_stale_generator_authority_for_prompt(
-                value,
-                source_node=getattr(
-                    self,
-                    _VERIFIED_PROMPT_SOURCE_ATTRIBUTE,
-                    None,
-                ),
-            )
             self._refresh_routed_prompt_preview()
         return result
 
@@ -2908,7 +2489,8 @@ class HMBAgentLibrary(_BaseAgent):
         if str(getattr(target_parameter, "name", "") or "") == (
             _AGENT_SHOT_PROMPT_INPUT_PARAMETER
         ):
-            self._invalidate_generator_authority_for_prompt_change()
+            self._hmb_shot_context = {}
+            setattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
             try:
                 self.set_parameter_value(_AGENT_SHOT_PROMPT_INPUT_PARAMETER, "")
             except Exception:
@@ -2993,9 +2575,7 @@ class HMBAgentLibrary(_BaseAgent):
             self._clear_hmb_runtime_policy()
             self._hmb_shot_catalog_snapshot = {}
             self._hmb_shot_context = {}
-            self._hmb_last_generator_snapshot = {}
             self._clear_execution_shot_binding()
-            self._hmb_invalidate_remote_prompt_publication()
             self._hmb_shot_route_status = {
                 "ok": False,
                 "code": "deleted",
@@ -3015,22 +2595,29 @@ class HMBAgentLibrary(_BaseAgent):
         return parent(*args, **kwargs) if callable(parent) else None
 
     def get_parameter_list_value(self, name: str):
-        """Expose only sealed rules and no caller tools during canonical HMB runs."""
+        """Add sealed policy rules without changing Standard Agent inputs."""
         normalized_name = str(name or "").strip().casefold()
-        if self._hmb_rules_active and normalized_name in _HMB_ISOLATED_LIST_INPUTS:
-            return []
+        parent_getter = getattr(super(), "get_parameter_list_value", None)
         if normalized_name != "rulesets" or not self._hmb_rules_active:
-            return super().get_parameter_list_value(name)
+            return parent_getter(name) if callable(parent_getter) else []
         project_name, shot_name = self._hmb_ruleset_names
         if not project_name or not shot_name or project_name == shot_name:
             raise RuntimeError("HMBAgentLibrary sealed rule scope is unavailable.")
-        return [
+        caller_rulesets = parent_getter(name) if callable(parent_getter) else []
+        if caller_rulesets in (None, ""):
+            merged_rulesets = []
+        elif isinstance(caller_rulesets, (list, tuple)):
+            merged_rulesets = list(caller_rulesets)
+        else:
+            merged_rulesets = [caller_rulesets]
+        merged_rulesets.extend([
             {"name": project_name, "rules": list(self._hmb_policy_rules)},
             {"name": shot_name, "rules": list(self._hmb_binding_rules)},
-        ]
+        ])
+        return merged_rulesets
 
     def get_parameter_value(self, name: str):
-        """Keep canonical HMB execution stateless and free of external context."""
+        """Swap only the authenticated prompt; preserve Standard Agent values."""
 
         normalized_name = str(name or "").strip().casefold()
         if self._hmb_rules_active:
@@ -3042,26 +2629,12 @@ class HMBAgentLibrary(_BaseAgent):
                     getattr(self, "_hmb_native_prompt_read_active", False)
                 ):
                     return runtime_prompt
-            if normalized_name in {"include_details", "stream", "streaming"}:
-                return False
-            if normalized_name in _HMB_ISOLATED_SCALAR_INPUTS:
-                if normalized_name in {"agent", "output_schema"}:
-                    return None
-                if normalized_name in {
-                    "additional_context", "instructions", "system", "system_prompt"
-                }:
-                    return ""
-                if normalized_name == "messages":
-                    return []
-                return {}
-            if normalized_name in _HMB_ISOLATED_LIST_INPUTS or normalized_name == "rulesets":
-                return []
         return super().get_parameter_value(name)
 
     def _load_hmb_rules(self) -> tuple[str, str, list[str], list[str]]:
-        # Every HMB execution reads the fixed server DAT again.  The decoded
-        # policy exists only for this native call and is cleared immediately
-        # afterward; no process-scoped policy session is retained.
+        # The signed policy session supplies the fixed server DAT.  Decoded
+        # rule text exists only for this native call and is cleared immediately
+        # afterward; no plaintext policy is persisted on the node.
         payload = _hmb._load_agent_rule_payload()
         policy = str(payload.get("policy") or "").strip()
         binding = str(payload.get("binding") or "").strip()
@@ -3072,7 +2645,7 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_policy_identity = {
             "version": str(payload.get("final_policy_version") or ""),
             "contract_sha256": str(
-                payload.get("final_motion_look_policy_sha256") or ""
+                payload.get("policy_pair_sha256") or ""
             ),
             "envelope_sha256": str(payload.get("envelope_sha256") or ""),
         }
@@ -3149,8 +2722,6 @@ class HMBAgentLibrary(_BaseAgent):
         self._set_agent_execution_phase("")
         self._clear_execution_shot_binding()
         self._clear_hmb_runtime_policy()
-        self._hmb_last_generator_snapshot = {}
-        self._hmb_invalidate_remote_prompt_publication()
         outputs = getattr(self, "parameter_output_values", None)
         if isinstance(outputs, dict):
             outputs["agent"] = {}
@@ -3255,87 +2826,15 @@ class HMBAgentLibrary(_BaseAgent):
         except Exception:
             pass
 
-    def _run_protected_agent_non_streaming(self, agent: Any, prompt: Any) -> Any:
-        """Run one protected HMB request without the Cloud SSE transport.
-
-        Griptape Cloud's streaming endpoint can return an error event whose
-        payload has no text delta.  The current Griptape driver retries that
-        final answer exists.  HMB cannot expose partial stream fragments in any
-        case, so its protected path uses the driver's ordinary single-response
-        request.  Standalone/Only mode continues to use the native Agent path
-        unchanged.
-        """
-
-        self._hmb_native_failure_stage = "build_agent"
-        try:
-            tasks = list(getattr(agent, "tasks", ()) or ())
-            if not tasks:
-                raise RuntimeError("Protected Agent has no prompt task.")
-            task = tasks[0]
-            prompt_driver = getattr(task, "prompt_driver", None)
-            if prompt_driver is None:
-                raise RuntimeError("Protected Agent prompt driver is unavailable.")
-            prompt_driver.stream = False
-            runner = getattr(agent, "run", None)
-            if not callable(runner):
-                raise RuntimeError("Protected Agent synchronous runner is unavailable.")
-        except Exception as exc:
-            self._record_hmb_native_failure(
-                "build_agent",
-                exc,
-                code="HOST_ADAPTER",
-            )
-            raise RuntimeError("Protected Agent host adapter is unavailable.") from exc
-        self._hmb_native_failure_stage = "invoke_model"
-        try:
-            runner(*([prompt] if prompt else []))
-        except Exception as exc:
-            self._record_hmb_native_failure("invoke_model", exc)
-            raise
-
-        self._hmb_native_failure_stage = "capture_output"
-        final_text = ""
-        for candidate in (
-            getattr(agent, "output", None),
-            getattr(task, "output", None),
-        ):
-            if candidate is None:
-                continue
-            if _is_native_error_artifact(candidate):
-                self._record_hmb_native_failure(
-                    "capture_output",
-                    code="MODEL_PROVIDER",
-                )
-                raise RuntimeError("Protected Agent returned an error artifact.")
-            output_value = getattr(candidate, "value", candidate)
-            if output_value is None:
-                continue
-            if _is_native_error_artifact(output_value):
-                self._record_hmb_native_failure(
-                    "capture_output",
-                    code="MODEL_PROVIDER",
-                )
-                raise RuntimeError("Protected Agent returned an error artifact.")
-            serializer = getattr(output_value, "model_dump_json", None)
-            serialized = (
-                str(serializer())
-                if callable(serializer)
-                else str(output_value)
-            )
-            if serialized.strip():
-                final_text = serialized
-                break
-        self._last_raw_output = final_text
-        self.set_parameter_value("output", final_text)
-        self._hmb_native_failure_stage = "node_finalize"
-        return agent
-
     def _process(self, agent: Any, prompt: Any) -> Any:
-        """Keep native streaming for Only; use one response for protected HMB."""
+        """Use the Standard Agent processor in both Only and HMB modes."""
 
-        if bool(getattr(self, "_hmb_rules_active", False)):
-            return self._run_protected_agent_non_streaming(agent, prompt)
-        return super()._process(agent, prompt)
+        native_processor = getattr(super(), "_process", None)
+        if not callable(native_processor):
+            # Import-only/test fallback. Official Griptape always supplies the
+            # native processor; never emulate a second, HMB-specific model path.
+            return agent
+        return native_processor(agent, prompt)
 
     def _run_native_agent_once(self, lifecycle_generation: int | None = None):
         if lifecycle_generation is None:
@@ -3570,7 +3069,6 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_suppress_visible_publication = False
         self._hmb_native_failure_stage = ""
         self._hmb_native_failure_code = ""
-        self._hmb_last_generator_snapshot = {}
         self._clear_execution_shot_binding()
         # The selector is cable-free in the editor, but the router establishes
         # the same-flow hidden Prompt edge before topology validation so the
@@ -3610,14 +3108,6 @@ class HMBAgentLibrary(_BaseAgent):
             # initialize the protected session.
             self._set_agent_execution_phase("authorizing")
             _hmb._bootstrap_agent_policy_session()
-            _assert_prompt_policy_identity_matches_signed_runtime()
-        except _HMBPolicyIdentityMismatchError:
-            self._publish_hmb_execution_block(
-                _HMB_POLICY_IDENTITY_MISMATCH_MESSAGE
-            )
-            raise RuntimeError(
-                _HMB_POLICY_IDENTITY_MISMATCH_MESSAGE
-            ) from None
         except Exception:
             self._publish_hmb_execution_block(_HMB_POLICY_UNAVAILABLE_MESSAGE)
             raise RuntimeError(_HMB_POLICY_UNAVAILABLE_MESSAGE) from None
@@ -3683,13 +3173,6 @@ class HMBAgentLibrary(_BaseAgent):
             # selections before the model sees them.
             source_contract_stage = "opaque_prompt"
             self._hmb_runtime_prompt = str(machine_prompt)
-        except _HMBPolicyIdentityMismatchError:
-            self._publish_hmb_execution_block(
-                _HMB_POLICY_IDENTITY_MISMATCH_MESSAGE
-            )
-            raise RuntimeError(
-                _HMB_POLICY_IDENTITY_MISMATCH_MESSAGE
-            ) from None
         except Exception:
             # Do not echo parser details, runtime derivations, or job payload
             # fragments. The public message is fixed and policy-free; the
@@ -3763,8 +3246,7 @@ class HMBAgentLibrary(_BaseAgent):
                     )
                 ):
                     # Empty/non-text native results are execution failures, not
-                    # semantic-policy failures.  Do not publish a successful
-                    # Shot snapshot that contains no generator instruction.
+                    # semantic-policy failures.
                     native_failed = True
                     self._record_hmb_native_failure(
                         "capture_output",
@@ -3782,36 +3264,6 @@ class HMBAgentLibrary(_BaseAgent):
                 self._hmb_suppress_visible_publication = False
                 if isinstance(final_text, str):
                     self._set_visible_output(final_text)
-                if (
-                    not native_failed
-                    and sanitizer_status == "clean"
-                    and self._hmb_shot_context
-                    and isinstance(final_text, str)
-                    and final_text
-                    and final_text != _PUBLIC_OUTPUT_BLOCKED
-                ):
-                    self._hmb_last_generator_snapshot = {
-                        "schema": _AGENT_GENERATOR_SNAPSHOT_SCHEMA,
-                        "version": _AGENT_GENERATOR_SNAPSHOT_VERSION,
-                        **{
-                            key: self._hmb_shot_context[key]
-                            for key in (
-                                "channel_uuid",
-                                "shot_uuid",
-                                "shot_number",
-                                "shot_name",
-                                "prompt_generation",
-                                "visible_prompt_sha256",
-                                "image_media_sha256",
-                                "video_media_sha256",
-                            )
-                        },
-                        "final_text_sha256": _prompt_text_sha256(final_text),
-                    }
-                    self._hmb_commit_remote_prompt_publication(final_text)
-                else:
-                    self._hmb_last_generator_snapshot = {}
-                    self._hmb_invalidate_remote_prompt_publication()
             except Exception:
                 # A replaced/future sanitizer can still raise outside its own
                 # guard. Without a completed state check, fail closed.
@@ -3827,8 +3279,6 @@ class HMBAgentLibrary(_BaseAgent):
                     )
                 except Exception:
                     pass
-                self._hmb_last_generator_snapshot = {}
-                self._hmb_invalidate_remote_prompt_publication()
             finally:
                 self._hmb_suppress_visible_publication = False
                 self._clear_hmb_runtime_policy()

@@ -179,8 +179,8 @@ assert merged["videos"][0]["video_sub_type"] == "FX Effect Only"
 assert merged["videos"][0]["keep_out"] == "Ignore proxy sparks."
 assert merged["videos"][0]["label"] == "Source Video"
 
-# A verified Look keeps source-owned registration provenance. Retired pre-v2
-# Prompt text is released instead of being migrated across revision axes.
+# A verified asset keeps source-owned Main provenance while Prompt-owned Sub
+# and Target survive crossed revision axes verbatim.
 look_source = prompt._default_widget_state()
 look_source["images"][0].update(
     {
@@ -205,10 +205,10 @@ look_merged = prompt._merge_prompt_revision_axes(look_source, look_ui)
 look_row = look_merged["images"][0]
 assert look_row["asset_image_sub_type_candidate"] == "Render Look"
 assert look_row["image_main_type"] == "Look Reference"
-assert look_row["image_sub_type"] == "Render Look"
-assert look_row["source_type"] == "Color / Look Reference"
-assert look_row["scope"] == "Render look only"
-assert look_row["owner"] == ""
+assert look_row["image_sub_type"] == "Scale"
+assert look_row["source_type"] == "Role Required / Select Source Type"
+assert look_row["scope"] == ""
+assert look_row["owner"] == "Camera / Composition"
 assert look_row["color_picks"] == [""]
 
 # A stale registered default is not an override. A newer global registration
@@ -221,7 +221,7 @@ look_default_merged = prompt._merge_prompt_revision_axes(
     look_source,
     look_default_ui,
 )
-assert look_default_merged["images"][0]["image_sub_type"] == "Render Look"
+assert look_default_merged["images"][0]["image_sub_type"] == "Color Mood"
 assert look_default_merged["images"][0]["owner"] == "Jett_08"
 
 # Only is a real Prompt-owned selection too. A simultaneous source callback

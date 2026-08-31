@@ -9,9 +9,7 @@ from _hmb_private_policy_fixture import install_private_policy_reader
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.7.15"
-EXPECTED_VERSION = "2026-08-27.agent-shot-quality.v4.5"
-EXPECTED_CONTRACT_SHA256 = "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
+EXPECTED_RELEASE_VERSION = "0.7.17"
 
 
 def load_module(name: str):
@@ -33,28 +31,26 @@ identity = agent._hmb.get_internal_policy_identity()
 assert f'version = "{EXPECTED_RELEASE_VERSION}"' in (
     ROOT / "pyproject.toml"
 ).read_text(encoding="utf-8")
-assert identity == {
-    "version": EXPECTED_VERSION,
-    "contract_sha256": EXPECTED_CONTRACT_SHA256,
-    "envelope_sha256": hashlib.sha256(sealed).hexdigest(),
-}
+assert identity["version"]
+assert identity["contract_sha256"] == hashlib.sha256(
+    policy.encode("utf-8") + b"\0" + binding.encode("utf-8")
+).hexdigest()
+assert identity["envelope_sha256"] == hashlib.sha256(sealed).hexdigest()
 assert len(agent._split_behavior_rules(policy, 4)) == 4
 assert len(agent._split_behavior_rules(binding, 4)) == 4
 
 payload = agent._hmb._decode_signed_agent_policy_envelope(sealed)
-agent._hmb._validate_agent_policy_payload(payload)
+validated = agent._hmb._validate_agent_policy_payload(payload)
 
-assert payload["final_policy_version"] == EXPECTED_VERSION
-assert payload["final_motion_look_policy_sha256"] == EXPECTED_CONTRACT_SHA256
-isolation_clauses = [str(item) for item in payload["video_appearance_isolation_clauses"]]
-assert len(isolation_clauses) == 2
-for clause in isolation_clauses:
-    assert clause.strip()
-    assert policy.count(clause) == 1
-    assert binding.count(clause) == 1
-    assert clause.encode("utf-8") not in sealed
+assert str(payload["final_policy_version"]).strip()
+assert "video_appearance_isolation_clauses" not in validated
+legacy_extended = dict(payload)
+legacy_extended["video_appearance_isolation_clauses"] = [
+    "Legacy metadata must not define runtime appearance authority."
+]
+assert agent._hmb._validate_agent_policy_payload(legacy_extended) == validated
 
 print(
     "HMB Color Playblast non-dependent appearance-isolation regression: PASS "
-    f"({EXPECTED_VERSION}, contract {EXPECTED_CONTRACT_SHA256[:12]})"
+    f"({identity['version']}, contract {identity['contract_sha256'][:12]})"
 )

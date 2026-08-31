@@ -129,14 +129,12 @@ MAX_UI_EDIT_REVISION = (1 << 53) - 1
 OUTPUT_VERSION = 4
 IMAGE_BINDING_CAPABILITY_SCHEMA = "hmb-image-source-binding-capabilities"
 IMAGE_BINDING_CAPABILITY_VERSION = 1
-IMAGE_AUTHORITY_SCOPE_SCHEMA = "hmb-image-source-authority-scope"
-IMAGE_AUTHORITY_SCOPE_VERSION = 1
 MAX_ASSETS = 5000
 MAX_FOLDERS = 5000
 MAX_PROJECTS = 500
 MAX_SELECTED_IMAGES = 50
 MAX_SHOTS = 5
-MAX_SHOT_IMAGES = 30
+MAX_SHOT_IMAGES = MAX_SELECTED_IMAGES
 MAX_THUMBNAIL_HYDRATION_BATCH = 64
 SHOT_ROUTING_SCHEMA = "hmb-shot-routing"
 SHOT_ROUTING_VERSION = 1
@@ -525,39 +523,17 @@ def _taxonomy_payload() -> Dict[str, Any]:
 
 
 def _normalize_image_taxonomy_fields(raw: Any) -> Dict[str, Any]:
-    """Normalize fields against the current shared authoring contract."""
+    """Preserve authored taxonomy and derive a wire pair only when exact."""
     source = raw if isinstance(raw, dict) else {}
     main_type = _clean(source.get("image_main_type"))
     sub_type = _clean(source.get("image_sub_type"))
-    if (
-        main_type not in IMAGE_MAIN_TYPE_CHOICES
-        or main_type == IMAGE_MAIN_TYPE_UNCLASSIFIED
-        or sub_type not in image_sub_type_choices_for_main_type(main_type)
-    ):
-        return {
-            "image_main_type": IMAGE_MAIN_TYPE_UNCLASSIFIED,
-            "image_sub_type": "",
-            "source_type": IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED,
-            "scope_candidate": "",
-            "custom_source_type": "",
-            "color_pick_candidates": [],
-        }
     wire_pair = image_taxonomy_wire_pair(main_type, sub_type)
-    if wire_pair is None:
-        return {
-            "image_main_type": IMAGE_MAIN_TYPE_UNCLASSIFIED,
-            "image_sub_type": "",
-            "source_type": IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED,
-            "scope_candidate": "",
-            "custom_source_type": "",
-            "color_pick_candidates": [],
-        }
-    source_type, scope_candidate = wire_pair
-    custom_source_type = (
-        _clean(source.get("custom_source_type"))
-        if main_type == "Custom / Context" and sub_type == "Custom"
-        else ""
+    source_type, scope_candidate = (
+        wire_pair
+        if wire_pair is not None
+        else (IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED, "")
     )
+    custom_source_type = _clean(source.get("custom_source_type"))
     return {
         "image_main_type": main_type,
         "image_sub_type": sub_type,
@@ -2603,14 +2579,13 @@ def _normalize_asset(raw: Any) -> Dict[str, Any] | None:
     image_sub_type = taxonomy["image_sub_type"]
     source_type = taxonomy["source_type"]
     scope_candidate = taxonomy["scope_candidate"]
-    allowed_colors = taxonomy["color_pick_candidates"]
     raw_colors = raw.get("color_pick_candidates")
     if not isinstance(raw_colors, (list, tuple)):
-        raw_colors = allowed_colors
+        raw_colors = taxonomy["color_pick_candidates"]
     colors = [
         _clean(value)
         for value in raw_colors
-        if _clean(value) in allowed_colors
+        if _clean(value)
     ]
     try:
         width = max(0, int(raw.get("width") or 0))
@@ -4288,8 +4263,6 @@ def _registration_record(
         "image_sub_type": requested_sub_type,
         "custom_source_type": request.get("custom_source_type"),
     })
-    if requested_main_type and taxonomy["image_main_type"] == IMAGE_MAIN_TYPE_UNCLASSIFIED:
-        raise ValueError("Select a valid Image Main Type and Sub Type pair.")
     custom_source_type = taxonomy["custom_source_type"]
     if len(custom_source_type) > 256:
         raise ValueError("Custom Main Type exceeds 256 characters.")
@@ -6021,30 +5994,6 @@ def _build_output_payload(
             "unresolved": [dict(item) for item in selection["unresolved"]],
         },
         "warnings": list(selection["warnings"]),
-        "authority_scope": {
-            "schema": IMAGE_AUTHORITY_SCOPE_SCHEMA,
-            "version": IMAGE_AUTHORITY_SCOPE_VERSION,
-            "verified_metadata_fields": [
-                "project_uid",
-                "image_main_type",
-                "image_sub_type",
-                "source_type",
-                "asset_id",
-                "image_name",
-                "scope_candidate",
-                "color_pick_candidates",
-            ],
-            "external_metadata_fields": [
-                "source_uid",
-                "image_name",
-                "selection_order",
-            ],
-            "downstream_binding_fields": [
-                "target",
-                "color_pick",
-                "image_source_frame_range",
-            ],
-        },
     }
 
 
@@ -6651,7 +6600,7 @@ def _add_project_root(node: Any) -> None:
         "Select a projects catalog. Each direct child "
         "folder is one project; a direct project folder is also accepted. Optional "
         "hmb_image_assets.json records may override inferred Asset ID, Image "
-        "Name, Main Type, registered Sub Type, and default selection. Registered "
+        "Name, optional Main/Sub metadata, and default selection. Registered "
         "records are read-only; only unregistered project media can use Add."
     )
     trait = None

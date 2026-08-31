@@ -60,7 +60,8 @@ const baseState = (image, overrides = {}) => prompt.normalizeState({
   ...overrides,
 });
 
-// Full signed INT32 normalization, including raw-bound rejection and MAX-safe merge.
+// Full signed INT32 normalization rejects invalid endpoints but preserves the
+// user's exact range order, segmentation, overlap, adjacency, and duplicates.
 assert.deepEqual(
   prompt.normalizeFrameRanges([
     { start: 97, end: 120 },
@@ -68,7 +69,12 @@ assert.deepEqual(
     { start: 121, end: 144 },
     { start: 40, end: 60 },
   ]),
-  [{ start: 1, end: 60 }, { start: 97, end: 144 }],
+  [
+    { start: 97, end: 120 },
+    { start: 1, end: 48 },
+    { start: 121, end: 144 },
+    { start: 40, end: 60 },
+  ],
 );
 assert.deepEqual(
   prompt.normalizeFrameRanges([
@@ -80,7 +86,25 @@ assert.deepEqual(
     { start: 0, end: INT32_MAX + 0.4 },
     { start: true, end: 1 },
   ]),
-  [{ start: INT32_MIN, end: -1 }, { start: INT32_MAX - 1, end: INT32_MAX }],
+  [
+    { start: INT32_MIN, end: INT32_MIN },
+    { start: INT32_MIN + 1, end: -1 },
+    { start: INT32_MAX - 1, end: INT32_MAX },
+    { start: INT32_MAX, end: INT32_MAX },
+  ],
+);
+assert.deepEqual(
+  prompt.normalizeFrameRanges([
+    { start: 10, end: 20 },
+    { start: 10, end: 20 },
+    { start: 15, end: 25 },
+  ]),
+  [
+    { start: 10, end: 20 },
+    { start: 10, end: 20 },
+    { start: 15, end: 25 },
+  ],
+  "Duplicate and overlapping authored segments must not be merged or deduplicated.",
 );
 assert.deepEqual(
   prompt.normalizeFrameRanges([{ start: -1.5, end: 1.5 }]),
@@ -166,7 +190,13 @@ prompt.storeCurrentFrameRanges(noVideoImage, [
   { start: 12001, end: 24000 },
   { start: -12000, end: -11000 },
 ], 1);
-assert.deepEqual(noVideoImage.frame_range_intent, activeIntent());
+assert.deepEqual(noVideoImage.frame_range_intent, {
+  ...activeIntent(),
+  ranges: [
+    { start: 12001, end: 24000 },
+    { start: -12000, end: -11000 },
+  ],
+});
 assert.equal(
   JSON.stringify({
     enabled: noVideoImage.frame_range_enabled,
@@ -185,7 +215,10 @@ assert.equal(status.domainReadonly, false);
 assert.equal(status.domainComplete, true);
 assert.equal(status.metadata.origin, "manual");
 assert.deepEqual([status.domainStart, status.domainEnd], [-12000, 24000]);
-assert.deepEqual(status.ranges, activeIntent().ranges);
+assert.deepEqual(status.ranges, [
+  { start: 12001, end: 24000 },
+  { start: -12000, end: -11000 },
+]);
 
 const beforeOff = structuredClone(noVideoImage.frame_range_intent);
 assert.equal(prompt.setFrameRangeEnabled(noVideoImage, false), false);

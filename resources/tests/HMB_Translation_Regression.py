@@ -66,16 +66,12 @@ assert len(agent._split_behavior_rules(binding_file, 4)) == 4
 prompt_state = prompt._default_widget_state()
 prompt_state["text"]["SCENE_CONTEXT"] = "어두운 창고"
 hmb_payload = prompt._build_data_only_prompt_package(prompt_state)
-assert agent._is_hmb_prompt_library_payload(hmb_payload)
 payload_lines = hmb_payload.splitlines()
 assert len(payload_lines) == 7
 assert payload_lines[5] == "USER DESCRIPTION DATA (JSON):"
 assert __import__("json").loads(payload_lines[6]) == {
     "SCENE_CONTEXT": "어두운 창고",
 }
-assert not agent._is_hmb_prompt_library_payload("ordinary standalone prompt")
-assert not agent._is_hmb_prompt_library_payload("HMB_GP_Production\nTARGET GENERATOR:\nonly")
-
 source = (ROOT / "HMBAgentLibrary.py").read_text(encoding="utf-8")
 for removed_name in (
     "_build_hmb_agent_task",

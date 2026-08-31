@@ -107,7 +107,7 @@ try:
     )
     assert hero["source_type"] == "Character Appearance"
     assert hero["scope_candidate"] == "Full body / full appearance"
-    assert hero["color_pick_candidates"] == common.ACTOR_COLOR_PICK_CHOICES
+    assert hero["color_pick_candidates"] == common.COLOR_PICK_CHOICES
     assert hero["registered"] is True
     assert background["source_type"] == common.IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED
     assert background["scope_candidate"] == ""
@@ -139,14 +139,7 @@ try:
         }
     ]
     assert "authority" not in output_payload
-    assert output_payload["authority_scope"]["schema"] == (
-        "hmb-image-source-authority-scope"
-    )
-    assert output_payload["authority_scope"]["downstream_binding_fields"] == [
-        "target",
-        "color_pick",
-        "image_source_frame_range",
-    ]
+    assert "authority_scope" not in output_payload
     assert output_payload["binding_contract"]["image_source_frame_range"] == {
         "supported": True,
         "enabled_by_default": False,
@@ -180,7 +173,7 @@ try:
     default_bound_row = default_bound_state["images"][0]
     assert default_bound_row["owner"] == "Hero Beauty"
     assert default_bound_row["asset_default_target"] == "Hero Beauty"
-    assert default_bound_row["binding_scopes"] == ["Full body / full appearance"]
+    assert default_bound_row["binding_scopes"] == [""]
     assert default_bound_row["scope"] == "Full body / full appearance"
     default_bound_prompt = prompt_library._build_data_only_prompt_package(
         default_bound_state
@@ -190,7 +183,9 @@ try:
         "HMB JOB DATA (JSON):",
     )
     assert default_bound_job["images"][0]["target_id"] == "Hero Beauty"
-    assert default_bound_job["images"][0]["bindings"] == []
+    assert default_bound_job["images"][0]["bindings"] == [
+        {"video": "@video1", "marker_color": "", "target_scope": ""}
+    ]
     assert default_bound_job["images"][0]["identity"]["asset_id"] == "HeroRig"
     default_bound_row["owner"] = ""
     default_bound_row["color_picks"] = ["Red", "Green"]
@@ -201,8 +196,8 @@ try:
     )
     assert cleared_target_state["images"][0]["owner"] == ""
     assert cleared_target_state["images"][0]["binding_scopes"] == [
-        "Full body / full appearance",
-        "Full body / full appearance",
+        "",
+        "",
     ]
     assert prompt_library._default_image_target_for_main_type(
         "Environment / Background", "Night City"
@@ -223,9 +218,8 @@ try:
         "Lighting / Atmosphere Reference", "Blue Hour"
     ) == ""
 
-    # Prompt may already hold a freely authored Target and Color Pick. Applying
-    # Asset Library metadata preserves those fields but replaces the Prompt Sub
-    # Type with the registered authoritative value.
+    # Prompt may already hold freely authored Sub Type, Target, scope, and Color
+    # Pick values. Asset metadata remains a candidate and does not rewrite them.
     prompt_state = prompt_library._default_widget_state()
     prompt_state["images"][0].update(
         {
@@ -259,11 +253,12 @@ try:
     assert prompt_row["asset_id"] == "HeroRig"
     assert prompt_row["label"] == "Hero Beauty"
     assert prompt_row["owner"] == "Hero Custom Target"
-    assert prompt_row["binding_scopes"] == ["Full body / full appearance"]
-    assert prompt_row["scope"] == "Full body / full appearance"
+    assert prompt_row["image_sub_type"] == "Head / Face"
+    assert prompt_row["binding_scopes"] == ["Head / face only"]
+    assert prompt_row["scope"] == "Head / face only"
     assert prompt_row["color_picks"] == ["Blue"]
     assert prompt_row["asset_scope_candidate"] == "Full body / full appearance"
-    assert prompt_row["asset_color_pick_candidates"] == common.ACTOR_COLOR_PICK_CHOICES
+    assert prompt_row["asset_color_pick_candidates"] == common.COLOR_PICK_CHOICES
 
     # Video Picker markers bind against the exact Asset ID even when Image Name
     # differs; legacy rows still fall back to Image Name.
@@ -287,7 +282,7 @@ try:
     assert compiled_image["bindings"] == [{
         "video": "@video1",
         "marker_color": "Blue",
-        "target_scope": "Full body / full appearance",
+        "target_scope": "Head / face only",
     }]
 
     # The fourth stage receives its rules only through the signed Agent payload.

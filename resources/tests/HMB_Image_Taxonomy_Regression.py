@@ -57,7 +57,7 @@ assert taxonomy_payload["pair_count"] == 26
 assert len(common.IMAGE_TAXONOMY_WIRE_MAP) == 26
 
 
-# Retired taxonomy is released by both authoring libraries; media identity stays.
+# A stale/omitted Sub Type no longer erases the valid Main Type, Target, or media.
 for retired_subtype in ("Scale", "Composition", "Scale / Composition"):
     item = prompt._default_image_item(1)
     item.update({
@@ -68,15 +68,16 @@ for retired_subtype in ("Scale", "Composition", "Scale / Composition"):
         "owner": "Camera / Composition",
     })
     prompt._normalize_image_binding_fields(item)
-    assert item["image_main_type"] == "Select Image Main Type"
-    assert item["image_sub_type"] == ""
-    assert item["owner"] == ""
+    assert item["image_main_type"] == "Look Reference"
+    assert item["image_sub_type"] == retired_subtype
+    assert item["owner"] == "Camera / Composition"
+    assert item["source_type"] == "Role Required / Select Source Type"
     asset_fields = image_asset._normalize_image_taxonomy_fields({
         "image_main_type": "Look Reference",
         "image_sub_type": retired_subtype,
     })
-    assert asset_fields["image_main_type"] == "Select Image Main Type"
-    assert asset_fields["image_sub_type"] == ""
+    assert asset_fields["image_main_type"] == "Look Reference"
+    assert asset_fields["image_sub_type"] == retired_subtype
 
 
 legacy = prompt._default_widget_state()
@@ -94,9 +95,39 @@ assert released["image_main_type"] == "Select Image Main Type"
 assert released["image_sub_type"] == ""
 assert released["source_type"] == "Role Required / Select Source Type"
 assert released["scope"] == ""
-assert released["owner"] == ""
+assert released["owner"] == "hero"
 assert released["label"] == "legacy.png"
 assert released["asset_id"] == "legacy"
+
+
+# Main Type alone is broad, publishable metadata rather than an execution gate.
+main_only = prompt._default_widget_state()
+main_only["images"][0].update({
+    "present": True,
+    "label": "broad-character.png",
+    "image_main_type": "Character",
+    "image_sub_type": "",
+    "owner": "hero",
+    "color_picks": ["Red"],
+    "binding_scopes": ["authored broad relationship"],
+    "binding_video_slots": [1],
+})
+main_only["videos"][0].update({
+    "present": True,
+    "label": "broad-motion.mp4",
+    "video_main_type": "Motion Reference",
+    "video_sub_type": "",
+})
+main_only_job = prompt_job(prompt._build_data_only_prompt_package(main_only))
+assert main_only_job["images"][0]["image_main_type"] == "Character"
+assert main_only_job["images"][0]["image_sub_type"] == ""
+assert main_only_job["images"][0]["source_type"] == ""
+assert main_only_job["images"][0]["target_id"] == "hero"
+assert main_only_job["images"][0]["bindings"] == [{
+    "video": "@video1",
+    "marker_color": "Red",
+    "target_scope": "authored broad relationship",
+}]
 
 
 # Prompt owns taxonomy normalization and the exact machine JSON projection.
@@ -141,7 +172,7 @@ assert len(visible_documents) == 26
 assert len(fingerprints) == 26
 
 
-# Typed Look targets are authored and normalized by Prompt, not re-policed by Agent.
+# Target is optional authored data and is never inferred or re-policed by Agent.
 for sub_type, expected_target in common.IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS.items():
     item = prompt._default_image_item(1)
     item.update({
@@ -151,7 +182,9 @@ for sub_type, expected_target in common.IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS.it
         "image_sub_type": sub_type,
     })
     normalized = prompt._normalize_image_binding_fields(item)
-    assert normalized["owner"] == expected_target
+    assert normalized["owner"] == ""
+    normalized["owner"] = expected_target
+    assert prompt._normalize_image_binding_fields(normalized)["owner"] == expected_target
 
 look = prompt._default_image_item(1)
 look.update({
@@ -168,9 +201,30 @@ assert prompt_job(prompt._build_data_only_prompt_package(look_state))["images"][
 ] == "Global Look"
 
 
-# Agent authenticates the Prompt contract and transports its paired machine bytes
-# unchanged. It does not rebuild taxonomy or append a semantic manifest.
-agent._assert_prompt_policy_identity_matches_signed_runtime()
+# The two broad Look subtypes serialize the authored scope exactly; a named or
+# blank Target must never be rewritten into scene-wide authority.
+for authored_target in ("Global Look", "Custom", "hero", ""):
+    scoped_look = prompt._default_image_item(1)
+    scoped_look.update({
+        "present": True,
+        "label": "lighting-look.png",
+        "image_main_type": "Look Reference",
+        "image_sub_type": "Lighting / Atmosphere",
+        "owner": authored_target,
+        "look_custom_instruction": "Hero lighting only",
+    })
+    scoped_state = prompt._default_widget_state()
+    scoped_state["images"] = [scoped_look]
+    scoped_record = prompt_job(
+        prompt._build_data_only_prompt_package(scoped_state)
+    )["images"][0]
+    assert "target_scope_mode" not in scoped_record
+    assert scoped_record["target_id"] == authored_target
+    assert scoped_record["custom_look_instruction"] == "Hero lighting only"
+
+
+# Agent transports the paired machine bytes unchanged. It does not rebuild
+# taxonomy, pin one policy revision, or append a semantic manifest.
 snapshot = {
     "schema": "hmb-prompt-paired-snapshot",
     "version": 1,
@@ -185,6 +239,5 @@ source = SimpleNamespace(
 assert agent._paired_machine_prompt(
     SimpleNamespace(_hmb_verified_prompt_source_node=source), sample_visible
 ) == sample_machine
-assert agent._is_private_hmb_runtime_prompt(sample_machine)
 
 print("HMB image taxonomy Prompt-authority / opaque Agent boundary: PASS")

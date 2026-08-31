@@ -1,22 +1,22 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import importlib.util
 import io
 import json
 import os
 import re
+import tempfile
 import zipfile
+import zlib
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[2]
-POLICY_VERSION = "2026-08-27.agent-shot-quality.v4.5"
-POLICY_CONTRACT_SHA256 = (
-    "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
-)
-RELEASE_LABEL = "v0.7.15"
-RELEASE_VERSION = "0.7.15"
+RELEASE_LABEL = "v0.7.17"
+RELEASE_VERSION = "0.7.17"
 EXPECTED_RUNTIME_INSTALL_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
@@ -140,6 +140,10 @@ builder = load_module(
     "_hmb_public_release_in_memory_builder",
     ROOT / "tools" / "package_runtime_release.py",
 )
+common = load_module(
+    "_hmb_public_release_policy_verifier",
+    ROOT / "_hmb_common.py",
+)
 
 assert tuple(builder.RUNTIME_INSTALL_FILES) == EXPECTED_RUNTIME_INSTALL_FILES
 assert tuple(builder.DISTRIBUTION_ONLY_FILES) == EXPECTED_DISTRIBUTION_ONLY_FILES
@@ -149,7 +153,7 @@ assert len(EXPECTED_SOURCE_FILES) == (
 )
 assert builder.RELEASE_LABEL == RELEASE_LABEL
 assert builder.RELEASE_VERSION == RELEASE_VERSION
-assert builder.release_version_parts(RELEASE_VERSION) == (0, 7, 15)
+assert builder.release_version_parts(RELEASE_VERSION) == (0, 7, 17)
 assert builder.release_label_for_version(RELEASE_VERSION) == RELEASE_LABEL
 builder.validate_release_identity(RELEASE_LABEL, RELEASE_VERSION)
 for invalid_version in (
@@ -165,20 +169,27 @@ for invalid_version in (
         pass
     else:
         raise AssertionError(f"Invalid technical SemVer was accepted: {invalid_version}")
-for mismatched_label in ("v0.7.015", "v0.7.14", "0.7.15"):
+for mismatched_label in ("v0.7.017", "v0.7.16", "0.7.17"):
     try:
         builder.validate_release_identity(mismatched_label, RELEASE_VERSION)
     except RuntimeError:
         pass
     else:
         raise AssertionError(f"Mismatched public release label was accepted: {mismatched_label}")
-assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.7.15_Runtime.zip"
+assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.7.17_Runtime.zip"
 assert builder.ARCHIVE_NAME == f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
-assert builder.POLICY_VERSION == POLICY_VERSION
-assert builder.POLICY_CONTRACT_SHA256 == POLICY_CONTRACT_SHA256
 assert builder.POLICY_DELIVERY == "server-only"
-for retired_name in ("POLICY_RELATIVE", "POLICY_SHA256", "POLICY_SIGNING_KEY_ID"):
+for retired_name in (
+    "POLICY_RELATIVE",
+    "POLICY_SHA256",
+    "POLICY_SIGNING_KEY_ID",
+    "POLICY_VERSION",
+    "POLICY_CONTRACT_SHA256",
+    "assert_release_policy_candidate_is_active",
+):
     assert not hasattr(builder, retired_name)
+for retired_name in ("_AGENT_POLICY_VERSION", "_AGENT_POLICY_CONTRACT_SHA256"):
+    assert not hasattr(common, retired_name)
 
 manifest = json.loads(
     (ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8")
@@ -190,8 +201,84 @@ assert set(registered_secrets) == EXPECTED_SECRET_NAMES
 assert all(value == "" for value in registered_secrets.values())
 delivery = manifest["metadata"]["agent_policy_delivery"]
 assert delivery["archive_source_count"] == len(EXPECTED_SOURCE_FILES)
+assert delivery["mode"] == "authenticated_broker_session"
+assert delivery["broker_endpoint"].endswith("/api/v1/agent-core/dat")
+assert delivery["public_ca_path"] == "resources/tls/hmb_agent_broker_ca.pem"
+assert delivery["verification"] == (
+    "pinned_tls_dpapi_bearer_rsa3072_sha256_v3_contract_once_per_process"
+)
 assert "launcher_path" not in delivery
 assert "bootstrap_marker" not in delivery
+
+# The public runtime trusts the authenticated server envelope, not a package-
+# pinned policy revision. Exercise the stable signature boundary and the two
+# document digests with a deliberately non-production revision identifier.
+policy_document = "Behavior server revision\n1. SERVER_AUTHORED_POLICY"
+binding_document = "Behavior server binding\n1. SERVER_AUTHORED_BINDING"
+signed_policy_payload = {
+    "schema": common._AGENT_POLICY_SCHEMA,
+    "policy": policy_document,
+    "policy_sha256": hashlib.sha256(policy_document.encode("utf-8")).hexdigest(),
+    "binding": binding_document,
+    "binding_sha256": hashlib.sha256(binding_document.encode("utf-8")).hexdigest(),
+    "final_policy_version": "server-controlled-revision",
+}
+validated_policy_payload = common._validate_agent_policy_payload(
+    signed_policy_payload
+)
+assert validated_policy_payload["final_policy_version"] == "server-controlled-revision"
+assert validated_policy_payload["policy_sha256"] == signed_policy_payload["policy_sha256"]
+assert validated_policy_payload["binding_sha256"] == signed_policy_payload["binding_sha256"]
+assert validated_policy_payload["policy_pair_sha256"] == hashlib.sha256(
+    policy_document.encode("utf-8") + b"\0" + binding_document.encode("utf-8")
+).hexdigest()
+for document_field in ("policy", "binding"):
+    tampered_payload = dict(signed_policy_payload)
+    tampered_payload[document_field] += "\nTAMPERED"
+    try:
+        common._validate_agent_policy_payload(tampered_payload)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError(f"Tampered {document_field} document digest was accepted.")
+
+compressed_payload = zlib.compress(common._canonical_json_bytes(signed_policy_payload))
+trusted_signature = b"trusted-public-release-regression-signature"
+signed_envelope = {
+    "schema": common._AGENT_POLICY_ENVELOPE_SCHEMA,
+    "algorithm": common._AGENT_POLICY_SIGNATURE_ALGORITHM,
+    "key_id": common._AGENT_POLICY_SIGNING_KEY_ID,
+    "payload_sha256": hashlib.sha256(compressed_payload).hexdigest(),
+    "payload": base64.b64encode(compressed_payload).decode("ascii"),
+    "signature": base64.b64encode(trusted_signature).decode("ascii"),
+}
+real_signature_verifier = common._verify_agent_policy_signature
+try:
+    common._verify_agent_policy_signature = lambda payload, signature: (
+        payload == compressed_payload and signature == trusted_signature
+    )
+    assert common._decode_signed_agent_policy_envelope(
+        common._canonical_json_bytes(signed_envelope)
+    ) == signed_policy_payload
+    for envelope_field, tampered_value in (
+        ("signature", base64.b64encode(b"untrusted-signature").decode("ascii")),
+        ("payload_sha256", "0" * 64),
+    ):
+        tampered_envelope = dict(signed_envelope)
+        tampered_envelope[envelope_field] = tampered_value
+        try:
+            common._decode_signed_agent_policy_envelope(
+                common._canonical_json_bytes(tampered_envelope)
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(
+                f"Tampered policy envelope {envelope_field} was accepted."
+            )
+finally:
+    common._verify_agent_policy_signature = real_signature_verifier
+
 agent_model_ids = builder.node_model_usage_ids(manifest, "HMBAgentLibrary")
 assert len(agent_model_ids) == 30
 assert len(agent_model_ids) == len(set(agent_model_ids))
@@ -267,6 +354,11 @@ assert re.search(
     r"Team releases require an odd(?: technical)? patch version",
     workflow_text,
 )
+assert "Require tested even-to-odd runtime parity" in workflow_text
+assert (
+    "python tools/package_runtime_release.py --check-parity-proof "
+    ".github/hmb-release-parity.json"
+) in workflow_text
 
 release_version, records = builder.validate_sources()
 record_paths = tuple(str(record["path"]) for record in records)
@@ -364,15 +456,191 @@ second_archive = builder.make_archive(release_records, archive_date_time)
 assert first_archive == second_archive
 builder.validate_archive(first_archive, release_records, archive_date_time)
 assert abs((datetime.now() - datetime(*archive_date_time)).total_seconds()) < 5
-assert builder.module_string_constant(
-    ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_CANDIDATE_VERSION"
-) == "2026-08-27.agent-shot-quality.v4.5"
-assert builder.module_string_constant(
-    ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_CANDIDATE_CONTRACT_SHA256"
-) == POLICY_CONTRACT_SHA256
-assert builder.module_string_constant(
-    ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_CANDIDATE_STATUS"
-) == "active"
+for canonical_crlf_member in builder.CANONICAL_CRLF_SOURCE_FILES:
+    canonical_record = next(
+        record
+        for record in records
+        if record["path"] == canonical_crlf_member.as_posix()
+    )
+    canonical_data = canonical_record["data"]
+    assert b"\r\n" in canonical_data
+    assert b"\n" not in canonical_data.replace(b"\r\n", b"")
+    assert builder.canonical_release_source_data(
+        canonical_crlf_member,
+        canonical_data.replace(b"\r\n", b"\n"),
+    ) == canonical_data
+
+previous_version_parts = builder.release_version_parts(RELEASE_VERSION)
+previous_version = (
+    f"{previous_version_parts[0]}.{previous_version_parts[1]}."
+    f"{previous_version_parts[2] - 1}"
+)
+previous_source_records = []
+for record in records:
+    previous_record = dict(record)
+    previous_data = bytes(record["data"])
+    if record["path"] == "griptape-nodes-library.json":
+        previous_payload = json.loads(previous_data.decode("utf-8"))
+        previous_payload["metadata"]["library_version"] = previous_version
+        previous_data = (
+            json.dumps(previous_payload, ensure_ascii=False, indent=2) + "\n"
+        ).encode("utf-8")
+    elif record["path"] == "SBOM.spdx.json":
+        previous_payload = json.loads(previous_data.decode("utf-8"))
+        previous_payload["name"] = f"HMB_GP_Production-{previous_version}"
+        previous_payload["documentNamespace"] = (
+            f"https://hmb.local/spdx/HMB_GP_Production/{previous_version}"
+        )
+        next(
+            item
+            for item in previous_payload["packages"]
+            if item["SPDXID"] == "SPDXRef-HMB-GP-Production"
+        )["versionInfo"] = previous_version
+        previous_data = (
+            json.dumps(previous_payload, ensure_ascii=False, indent=2) + "\n"
+        ).encode("utf-8")
+    previous_record.update(
+        bytes=len(previous_data),
+        data=previous_data,
+        sha256=builder.digest(previous_data),
+    )
+    previous_source_records.append(previous_record)
+previous_release_records = builder.make_release_records(
+    previous_version, previous_source_records
+)
+builder.validate_release_inventory(previous_version, previous_release_records)
+previous_archive = builder.make_archive(previous_release_records, archive_date_time)
+parity_result = builder.validate_release_pair_parity(
+    previous_archive,
+    RELEASE_VERSION,
+    records,
+)
+assert parity_result["reference_version"] == previous_version
+assert parity_result["current_version"] == RELEASE_VERSION
+assert parity_result["functional_file_count"] == len(EXPECTED_SOURCE_FILES)
+
+lf_previous_sources = [dict(record) for record in previous_source_records]
+for lf_record in lf_previous_sources:
+    member = PurePosixPath(str(lf_record["path"]))
+    if member not in builder.CANONICAL_CRLF_SOURCE_FILES:
+        continue
+    lf_data = bytes(lf_record["data"]).replace(b"\r\n", b"\n")
+    lf_record.update(
+        bytes=len(lf_data),
+        data=lf_data,
+        sha256=builder.digest(lf_data),
+    )
+lf_previous_archive = builder.make_archive(
+    builder.make_release_records(previous_version, lf_previous_sources),
+    archive_date_time,
+)
+builder.validate_release_pair_parity(
+    lf_previous_archive,
+    RELEASE_VERSION,
+    records,
+)
+
+tampered_previous_sources = [dict(record) for record in previous_source_records]
+tampered_python_record = next(
+    record
+    for record in tampered_previous_sources
+    if record["path"] == "HMBAgentLibrary.py"
+)
+tampered_python_data = bytes(tampered_python_record["data"]) + b"# parity mutation\n"
+tampered_python_record.update(
+    bytes=len(tampered_python_data),
+    data=tampered_python_data,
+    sha256=builder.digest(tampered_python_data),
+)
+tampered_previous_archive = builder.make_archive(
+    builder.make_release_records(previous_version, tampered_previous_sources),
+    archive_date_time,
+)
+try:
+    builder.validate_release_pair_parity(
+        tampered_previous_archive,
+        RELEASE_VERSION,
+        records,
+    )
+except RuntimeError:
+    pass
+else:
+    raise AssertionError("Release parity accepted a Python behavior change.")
+with tempfile.TemporaryDirectory(prefix="hmb-release-parity-") as temporary_root:
+    temporary_path = Path(temporary_root)
+    previous_archive_path = (
+        temporary_path
+        / f"HMB_GP_Production_{builder.release_label_for_version(previous_version)}"
+        "_Runtime.zip"
+    )
+    previous_archive_path.write_bytes(previous_archive)
+    checked_pair = builder.check_parity(
+        previous_archive_path,
+        builder.digest(previous_archive),
+    )
+    assert checked_pair["parity"] is True
+    try:
+        builder.check_parity(previous_archive_path, "0" * 64)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Release parity accepted the wrong trusted ZIP SHA256.")
+    current_parts = builder.release_version_parts(RELEASE_VERSION)
+    if current_parts[2] % 2 == 0:
+        current_archive_path = temporary_path / builder.ARCHIVE_NAME
+        current_archive_path.write_bytes(first_archive)
+        proof_path = temporary_path / "hmb-release-parity.json"
+        written_proof = builder.write_parity_proof(
+            proof_path,
+            current_archive_path,
+        )
+        assert written_proof["tested_even_version"] == RELEASE_VERSION
+        target_odd_version = written_proof["target_odd_version"]
+        proof_payload = json.loads(proof_path.read_text(encoding="utf-8"))
+    else:
+        tested_even_version = (
+            f"{current_parts[0]}.{current_parts[1]}.{current_parts[2] - 1}"
+        )
+        target_odd_version = RELEASE_VERSION
+        proof_payload = {
+            "canonical_source_sha256": builder.canonical_source_fingerprint(records),
+            "schema": builder.RELEASE_PARITY_PROOF_SCHEMA,
+            "target_odd_release_label": builder.release_label_for_version(
+                target_odd_version
+            ),
+            "target_odd_version": target_odd_version,
+            "tested_even_archive_sha256": builder.digest(first_archive),
+            "tested_even_release_label": builder.release_label_for_version(
+                tested_even_version
+            ),
+            "tested_even_version": tested_even_version,
+            "version": builder.RELEASE_PARITY_PROOF_VERSION,
+        }
+    validated_proof = builder.validate_parity_proof_payload(
+        proof_payload,
+        target_odd_version,
+        records,
+    )
+    assert validated_proof["parity"] is True
+    mutated_proof_sources = [dict(record) for record in records]
+    mutated_proof_record = next(
+        record
+        for record in mutated_proof_sources
+        if record["path"] == "HMBPromptLibrary.py"
+    )
+    mutated_proof_record["data"] = (
+        bytes(mutated_proof_record["data"]) + b"# parity proof mutation\n"
+    )
+    try:
+        builder.validate_parity_proof_payload(
+            proof_payload,
+            target_odd_version,
+            mutated_proof_sources,
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Parity proof accepted a behavior-surface mutation.")
 check_result = builder.check()
 assert check_result["validated"] is True
 assert check_result["file_count"] == len(EXPECTED_SOURCE_FILES) + 2
@@ -380,8 +648,8 @@ assert check_result["source_file_count"] == len(EXPECTED_SOURCE_FILES)
 assert check_result["install_file_count"] == len(EXPECTED_RUNTIME_INSTALL_FILES)
 assert check_result["distribution_file_count"] == len(EXPECTED_DISTRIBUTION_ONLY_FILES)
 assert check_result["policy_delivery"] == "server-only"
-assert check_result["policy_version"] == POLICY_VERSION
-assert check_result["policy_contract_sha256"] == POLICY_CONTRACT_SHA256
+assert "policy_version" not in check_result
+assert "policy_contract_sha256" not in check_result
 assert check_result["release_label"] == RELEASE_LABEL
 assert check_result["release_version"] == RELEASE_VERSION
 

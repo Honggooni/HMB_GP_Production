@@ -432,11 +432,14 @@ def prompt_payload_with_pairs(
     return value
 
 
-def assert_auto_depth_preserved_as_independent_media(state: dict) -> None:
+def assert_auto_depth_preserved_as_independent_media(
+    state: dict,
+    expected_main_type: str = "Select Video Main Type",
+) -> None:
     item = state["videos"][1]
     assert item["label"] == "depth_contract_depth_playblast_2"
     assert item["present"] is True
-    assert item["video_main_type"] == "Select Video Main Type"
+    assert item["video_main_type"] == expected_main_type
     assert item["video_sub_type"] == ""
     assert item["source_type"] == "Role Required / Select Video Type"
     assert item["custom_source_type"] == ""
@@ -677,7 +680,10 @@ legacy_invalid_state = prompt._apply_picker_payload(
     ),
     connected=True,
 )
-assert_auto_depth_preserved_as_independent_media(legacy_invalid_state)
+assert_auto_depth_preserved_as_independent_media(
+    legacy_invalid_state,
+    expected_main_type="",
+)
 legacy_invalid_state["videos"][1]["label"] = "manual-new-label"
 legacy_invalid_state["videos"][1]["present"] = True
 legacy_reactivated_prompt = prompt._build_data_only_prompt_package(
@@ -688,7 +694,7 @@ legacy_job = json.loads(
     legacy_lines[legacy_lines.index("HMB JOB DATA (JSON):") + 1]
 )
 legacy_depth = legacy_job["videos"][1]
-assert legacy_depth["source_type"] == "Role Required / Select Video Type"
+assert legacy_depth["source_type"] == ""
 assert legacy_depth["control_role"] == ""
 
 

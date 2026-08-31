@@ -169,13 +169,6 @@ class ExecutionBindingHarness(agent.HMBAgentLibrary):
         self._hmb_execution_shot_binding = {}
         self._hmb_shot_catalog_snapshot = concurrent_catalog
         self._hmb_shot_context = {}
-        self._hmb_last_generator_snapshot = {
-            "channel_uuid": concurrent_channel,
-            "shot_uuid": selected["shot_uuid"],
-            "shot_number": selected["number"],
-            "shot_name": selected["name"],
-        }
-        self._hmb_remote_prompt_publication = {"authority": "completed"}
         self._hmb_shot_clear_syncing = False
         self._hmb_shot_catalog_syncing = False
         self._hmb_execution_phase_syncing = False
@@ -278,22 +271,20 @@ only_gate_probe._hmb_execution_shot_binding.update(
 assert only_gate_probe._adopt_verified_execution_shot_binding({}) == {}
 assert only_gate_probe._hmb_execution_shot_binding == {}
 
-# The binding is execution-scoped. Once released, a real Only selection and a
-# real Shot switch immediately invalidate the old completed authority; Seedance
-# must not fall back to the retained result snapshot.
-authority_probe = agents[0]
-authority_probe._clear_execution_shot_binding()
-authority_probe.set_parameter_value(
+# The binding is execution-scoped. Once released, Only and later Shot choices
+# immediately become the routing identity. There is no retained Agent result
+# snapshot/publication for selector changes to invalidate.
+selector_probe = agents[0]
+selector_probe._clear_execution_shot_binding()
+selector_probe.set_parameter_value(
     agent._AGENT_WIDGET_PARAMETER,
     agent._agent_widget_value({}, concurrent_catalog),
 )
-assert authority_probe._hmb_last_generator_snapshot == {}
-assert authority_probe._hmb_remote_prompt_publication == {}
-only_subscription = authority_probe._hmb_shot_channel_subscription()
+only_subscription = selector_probe._hmb_shot_channel_subscription()
 assert only_subscription.get("participant_kind") == "agent"
 assert only_subscription.get("enabled") is False
 
-authority_probe._widget_parameter.default_value = agent._agent_widget_value(
+selector_probe._widget_parameter.default_value = agent._agent_widget_value(
     {
         "channel_uuid": concurrent_channel,
         "shot_uuid": concurrent_shots[0]["shot_uuid"],
@@ -302,14 +293,7 @@ authority_probe._widget_parameter.default_value = agent._agent_widget_value(
     },
     concurrent_catalog,
 )
-authority_probe._hmb_last_generator_snapshot = {
-    "channel_uuid": concurrent_channel,
-    "shot_uuid": concurrent_shots[0]["shot_uuid"],
-    "shot_number": 1,
-    "shot_name": "Shot 1",
-}
-authority_probe._hmb_remote_prompt_publication = {"authority": "completed"}
-authority_probe.set_parameter_value(
+selector_probe.set_parameter_value(
     agent._AGENT_WIDGET_PARAMETER,
     agent._agent_widget_value(
         {
@@ -321,8 +305,12 @@ authority_probe.set_parameter_value(
         concurrent_catalog,
     ),
 )
-assert authority_probe._hmb_last_generator_snapshot == {}
-assert authority_probe._hmb_remote_prompt_publication == {}
+switched_subscription = selector_probe._hmb_shot_channel_subscription()
+assert switched_subscription.get("enabled") is True
+assert switched_subscription.get("shot_uuid") == concurrent_shots[1]["shot_uuid"]
+assert switched_subscription.get("shot_number") == 2
+assert not hasattr(selector_probe, "_hmb_last_generator_snapshot")
+assert not hasattr(selector_probe, "_hmb_remote_prompt_publication")
 
 print(
     "HMB Agent Shot binding regression: PASS "

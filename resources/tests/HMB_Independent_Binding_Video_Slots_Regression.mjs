@@ -89,8 +89,8 @@ const normalized = prompt.normalizeState(state);
 assert.deepEqual(normalized.images[0].binding_video_slots, [1, 3]);
 assert.deepEqual(
   normalized.images[0].binding_scopes,
-  ["Full body / full appearance", "Full body / full appearance"],
-  "Sub Type is image-level authority, so legacy per-binding overrides must collapse to the first value.",
+  ["Full body / full appearance", "Head / face only"],
+  "Independent per-binding scopes must survive normalization.",
 );
 assert.equal(
   normalized.images[0].marker_video,
@@ -104,8 +104,8 @@ assert.deepEqual(
 );
 assert.deepEqual(
   prompt.normalizeState(normalized).images[0].binding_scopes,
-  ["Full body / full appearance", "Full body / full appearance"],
-  "Repeated widget normalization must keep the shared image subtype stable.",
+  ["Full body / full appearance", "Head / face only"],
+  "Repeated widget normalization must preserve independent scopes.",
 );
 
 // The image-row video number selector exposes only video slots that currently
@@ -157,11 +157,51 @@ const customScopeState = prompt.normalizeState({
     binding_custom_scopes: ["Hero silhouette", "Face detail"],
   }],
 });
-assert.deepEqual(customScopeState.images[0].binding_scopes, ["Custom scope", "Custom scope"]);
+assert.deepEqual(customScopeState.images[0].binding_scopes, ["Custom scope", "Head / face only"]);
 assert.deepEqual(
   customScopeState.images[0].binding_custom_scopes,
-  ["Hero silhouette", "Hero silhouette"],
-  "Custom Sub Type text must also be shared by every Color Pick/video binding.",
+  ["Hero silhouette", "Face detail"],
+  "Custom scope text must remain independent for every Color Pick/video binding.",
+);
+
+const longestParallelArrayState = prompt.normalizeState({
+  ...state,
+  images: [{
+    ...state.images[0],
+    color_picks: ["Red"],
+    binding_scopes: ["Full body / full appearance", "Head / face only"],
+    binding_custom_scopes: ["Dormant A", "Dormant B", "Dormant C"],
+    binding_video_slots: [1, 3, 2],
+  }],
+});
+assert.deepEqual(
+  longestParallelArrayState.images[0].color_picks,
+  ["Red", "", ""],
+  "The longest of all four binding arrays determines the row count.",
+);
+assert.deepEqual(
+  longestParallelArrayState.images[0].binding_custom_scopes,
+  ["Dormant A", "Dormant B", "Dormant C"],
+  "Dormant custom scopes must not be truncated when another array is shorter.",
+);
+assert.deepEqual(
+  longestParallelArrayState.images[0].binding_video_slots,
+  [1, 3, 2],
+  "Dormant video-slot bindings must not be truncated when Color Pick is shorter.",
+);
+
+const nonCustomDormantState = prompt.normalizeState({
+  ...state,
+  images: [{
+    ...state.images[0],
+    binding_scopes: ["Full body / full appearance", "Head / face only"],
+    binding_custom_scopes: ["Return to custom A", "Return to custom B"],
+  }],
+});
+assert.deepEqual(
+  nonCustomDormantState.images[0].binding_custom_scopes,
+  ["Return to custom A", "Return to custom B"],
+  "Selecting a non-Custom scope must not erase dormant Custom text.",
 );
 
 const legacyOwnerState = prompt.normalizeState({
@@ -174,7 +214,7 @@ const legacyOwnerState = prompt.normalizeState({
 });
 assert.deepEqual(
   legacyOwnerState.images[0].binding_scopes,
-  ["Full body / full appearance", "Full body / full appearance"],
+  ["Full body / full appearance", "Handheld prop"],
 );
 assert.equal(
   legacyOwnerState.images[0].owner,
@@ -386,8 +426,17 @@ assert.match(
 );
 assert.match(
   addSource,
-  /scopes\.push\(scopes\[0\] \|\| ""\)/,
-  "Adding a Color Pick must inherit the image-level Sub Type.",
+  /scopes\.push\(""\)/,
+  "Adding a Color Pick must create an independent blank scope.",
+);
+
+const sourceSelectStart = promptSource.indexOf('container.querySelectorAll(".source-select")');
+const sourceSelectEnd = promptSource.indexOf('container.querySelectorAll(".move-image-up', sourceSelectStart);
+const sourceSelectSource = promptSource.slice(sourceSelectStart, sourceSelectEnd);
+assert.doesNotMatch(
+  sourceSelectSource,
+  /binding_custom_scopes\[bindingIndex\]\s*=/,
+  "Changing a scope selector must not erase or rewrite dormant Custom text.",
 );
 
 

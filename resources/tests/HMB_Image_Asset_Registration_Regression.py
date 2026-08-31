@@ -428,7 +428,7 @@ try:
         if item["asset_id"] == "UnclassifiedUserIdea"
     )
     assert optional_project_asset["registered"] is True
-    assert optional_project_asset["image_main_type"] == "Select Image Main Type"
+    assert optional_project_asset["image_main_type"] == ""
     assert optional_project_asset["image_sub_type"] == ""
     assert optional_project_asset["source_type"] == "Role Required / Select Source Type"
     assert optional_project_asset["custom_source_type"] == ""
@@ -542,28 +542,43 @@ try:
         }
     )
 
-    manifest_before_invalid = manifest_path.read_bytes()
-    invalid_scope = dict(validation_request)
-    invalid_scope["request_id"] = "invalid-scope"
-    invalid_scope["image_sub_type"] = "Main Background"
-    try:
-        asset_library._apply_asset_registration(registered_state, invalid_scope)
-    except ValueError as exc:
-        assert "valid Image Main Type and Sub Type pair" in str(exc)
-    else:
-        raise AssertionError("A Main/Sub Type mismatch must be rejected.")
-    assert manifest_path.read_bytes() == manifest_before_invalid
+    manifest_before_main_only = manifest_path.read_bytes()
+    main_only_request = dict(validation_request)
+    main_only_request["request_id"] = "main-only"
+    main_only_request["image_sub_type"] = "Main Background"
+    main_only_state = asset_library._apply_asset_registration(
+        registered_state,
+        main_only_request,
+    )
+    main_only_asset = next(
+        item
+        for item in main_only_state["assets"]
+        if item["asset_id"] == "ValidationCandidate"
+    )
+    assert main_only_asset["image_main_type"] == "Character"
+    assert main_only_asset["image_sub_type"] == "Main Background"
+    assert main_only_asset["source_type"] == "Role Required / Select Source Type"
+    manifest_after_main_only = manifest_path.read_bytes()
+    assert manifest_after_main_only != manifest_before_main_only
 
+    duplicate_path = project_root / "Validation" / "duplicate.png"
+    duplicate_path.write_bytes(PNG_1X1)
+    duplicate_relative = duplicate_path.relative_to(project_root).as_posix()
     duplicate_id = dict(validation_request)
     duplicate_id["request_id"] = "duplicate-id"
+    duplicate_id["asset_library_id"] = asset_library._asset_library_id(
+        main_only_state["project_id"],
+        duplicate_relative,
+    )
+    duplicate_id["relative_path"] = duplicate_relative
     duplicate_id["asset_id"] = "ExistingBackground"
     try:
-        asset_library._apply_asset_registration(registered_state, duplicate_id)
+        asset_library._apply_asset_registration(main_only_state, duplicate_id)
     except ValueError as exc:
         assert "already registered" in str(exc)
     else:
         raise AssertionError("A duplicate registered Asset ID must be rejected.")
-    assert manifest_path.read_bytes() == manifest_before_invalid
+    assert manifest_path.read_bytes() == manifest_after_main_only
 
     stale = dict(request)
     stale["request_id"] = "stale-project"
@@ -574,7 +589,7 @@ try:
         assert "stale project" in str(exc)
     else:
         raise AssertionError("A stale project request must be rejected.")
-    assert manifest_path.read_bytes() == manifest_before_invalid
+    assert manifest_path.read_bytes() == manifest_after_main_only
 
     # Registration is create-only. Even a forged/stale Edit request cannot
     # change Image Name, Asset ID, Main Type, or Sub Type after Add succeeds.

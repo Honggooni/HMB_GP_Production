@@ -17,20 +17,18 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.7.15"
-RELEASE_VERSION = "0.7.15"
+RELEASE_LABEL = "v0.7.17"
+RELEASE_VERSION = "0.7.17"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
-POLICY_VERSION = "2026-08-27.agent-shot-quality.v4.5"
-POLICY_CONTRACT_SHA256 = (
-    "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
-)
 POLICY_DELIVERY = "server-only"
 SHOT_ROUTING_PROTOCOL_VERSION = "2026-08-20.shot-routing.v1"
 RELEASE_MANIFEST_PATH = "release-manifest.json"
 SHA256SUMS_PATH = "SHA256SUMS"
 REPRODUCIBLE_ZIP_MODE = 0o100644
+RELEASE_PARITY_PROOF_SCHEMA = "hmb-release-pair-parity"
+RELEASE_PARITY_PROOF_VERSION = 1
 MAX_NESTED_ARCHIVE_DEPTH = 3
 MAX_NESTED_ARCHIVE_BYTES = 64 * 1024 * 1024
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 128 * 1024 * 1024
@@ -70,6 +68,10 @@ DISTRIBUTION_ONLY_FILES = (
     "SBOM.spdx.json",
 )
 SOURCE_FILES = (*RUNTIME_INSTALL_FILES, *DISTRIBUTION_ONLY_FILES)
+CANONICAL_CRLF_SOURCE_FILES = {
+    PurePosixPath("Install_HMB_GP_Production.ps1"),
+    PurePosixPath("resources/tls/hmb_agent_broker_ca.pem"),
+}
 if len(RUNTIME_INSTALL_FILES) != 22 or len(DISTRIBUTION_ONLY_FILES) != 4:
     raise RuntimeError("Runtime/distribution release boundary count mismatch.")
 if set(RUNTIME_INSTALL_FILES) & set(DISTRIBUTION_ONLY_FILES):
@@ -126,6 +128,15 @@ STANDARD_AGENT_MODEL_CATALOG_SHA256 = (
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def canonical_release_source_data(member: PurePosixPath, data: bytes) -> bytes:
+    """Make audited Windows text payloads checkout-independent."""
+
+    if member not in CANONICAL_CRLF_SOURCE_FILES:
+        return data
+    normalized = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return normalized.replace(b"\n", b"\r\n")
 
 
 def release_version_parts(release_version: str) -> tuple[int, int, int]:
@@ -476,12 +487,6 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
     ):
         raise RuntimeError("SBOM and technical release versions differ.")
     if module_string_constant(
-        ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_SOURCE_VERSION"
-    ) != POLICY_VERSION or module_string_constant(
-        ROOT / "HMBPromptLibrary.py", "PROMPT_POLICY_SOURCE_CONTRACT_SHA256"
-    ) != POLICY_CONTRACT_SHA256:
-        raise RuntimeError("Prompt compiler and required server policy identities differ.")
-    if module_string_constant(
         ROOT / "_hmb_shot_routing.py", "SHOT_ROUTING_PROTOCOL_VERSION"
     ) != SHOT_ROUTING_PROTOCOL_VERSION:
         raise RuntimeError("Shot-routing protocol and release bundle identities differ.")
@@ -515,7 +520,7 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
         path = ROOT / Path(relative)
         if not path.is_file() or path.is_symlink():
             raise RuntimeError(f"Missing or linked runtime release member: {relative}")
-        data = path.read_bytes()
+        data = canonical_release_source_data(member, path.read_bytes())
         if member == PUBLIC_CA_MEMBER and PUBLIC_CERTIFICATE.fullmatch(data) is None:
             raise RuntimeError("Agent Broker public CA bundle is invalid.")
         if PRIVATE_KEY_HEADER.search(data) is not None:
@@ -549,6 +554,8 @@ def make_release_records(
 ) -> list[dict[str, Any]]:
     """Append a deterministic release manifest and checksum inventory."""
 
+    release_label = release_label_for_version(release_version)
+
     source_inventory = [
         {
             "bytes": int(record["bytes"]),
@@ -565,7 +572,7 @@ def make_release_records(
         "files": source_inventory,
         "install_file_count": len(RUNTIME_INSTALL_FILES),
         "library": "HMB_GP_Production",
-        "release_label": RELEASE_LABEL,
+        "release_label": release_label,
         "release_version": release_version,
         "schema": "hmb-release-closure",
         "shot_routing_protocol": SHOT_ROUTING_PROTOCOL_VERSION,
@@ -600,6 +607,7 @@ def validate_release_inventory(
     release_version: str,
     records: list[dict[str, Any]],
 ) -> None:
+    release_label = release_label_for_version(release_version)
     by_path = {str(record["path"]): record for record in records}
     if set((RELEASE_MANIFEST_PATH, SHA256SUMS_PATH)) - set(by_path):
         raise RuntimeError("Runtime release closure inventory is missing.")
@@ -611,7 +619,7 @@ def validate_release_inventory(
     if (
         manifest.get("schema") != "hmb-release-closure"
         or manifest.get("version") != 1
-        or manifest.get("release_label") != RELEASE_LABEL
+        or manifest.get("release_label") != release_label
         or manifest.get("release_version") != release_version
         or manifest.get("shot_routing_protocol") != SHOT_ROUTING_PROTOCOL_VERSION
         or manifest.get("file_count") != len(SOURCE_FILES)
@@ -639,6 +647,382 @@ def validate_release_inventory(
     ]
     if checksum_lines != expected_lines:
         raise RuntimeError("Runtime release checksum inventory is inconsistent.")
+
+
+def parity_normalized_source_data(relative: str, data: bytes) -> bytes:
+    """Normalize only the approved odd/even release-version metadata."""
+
+    data = canonical_release_source_data(PurePosixPath(relative), data)
+    if relative == "griptape-nodes-library.json":
+        payload = json.loads(data.decode("utf-8"))
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict) or not isinstance(
+            metadata.get("library_version"), str
+        ):
+            raise RuntimeError("Parity manifest version field is missing.")
+        metadata["library_version"] = "<VERSION>"
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    if relative == "SBOM.spdx.json":
+        payload = json.loads(data.decode("utf-8"))
+        packages = payload.get("packages")
+        if not isinstance(packages, list):
+            raise RuntimeError("Parity SBOM package inventory is missing.")
+        package = next(
+            (
+                item
+                for item in packages
+                if isinstance(item, dict)
+                and item.get("SPDXID") == "SPDXRef-HMB-GP-Production"
+            ),
+            None,
+        )
+        if not isinstance(package, dict):
+            raise RuntimeError("Parity SBOM HMB package is missing.")
+        payload["name"] = "HMB_GP_Production-<VERSION>"
+        payload["documentNamespace"] = (
+            "https://hmb.local/spdx/HMB_GP_Production/<VERSION>"
+        )
+        package["versionInfo"] = "<VERSION>"
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    return data
+
+
+def canonical_source_fingerprint(source_records: list[dict[str, Any]]) -> str:
+    """Hash the installed/distributed behavior surface with versions masked."""
+
+    by_path = {
+        str(record["path"]): bytes(record["data"])
+        for record in source_records
+    }
+    expected_paths = [str(path) for path in SOURCE_FILES]
+    if set(by_path) != set(expected_paths):
+        raise RuntimeError("Release parity fingerprint source inventory differs.")
+    state = hashlib.sha256()
+    for relative in expected_paths:
+        path_bytes = relative.encode("utf-8")
+        data = parity_normalized_source_data(relative, by_path[relative])
+        state.update(len(path_bytes).to_bytes(4, "big"))
+        state.update(path_bytes)
+        state.update(len(data).to_bytes(8, "big"))
+        state.update(data)
+    return state.hexdigest()
+
+
+def read_validated_release_archive(encoded: bytes) -> tuple[str, dict[str, bytes]]:
+    """Validate and read an audited release without assuming its version."""
+
+    validate_no_policy_artifacts_in_zip(encoded, label="release parity reference")
+    expected_paths = [
+        *(str(path) for path in SOURCE_FILES),
+        RELEASE_MANIFEST_PATH,
+        SHA256SUMS_PATH,
+    ]
+    expected_members = {f"{ARCHIVE_ROOT}/{path}" for path in expected_paths}
+    with zipfile.ZipFile(io.BytesIO(encoded), "r") as archive:
+        infos = archive.infolist()
+        if archive.testzip() is not None:
+            raise RuntimeError("Release parity reference ZIP is corrupt.")
+        member_names = [info.filename for info in infos]
+        if len(member_names) != len(set(member_names)) or set(member_names) != expected_members:
+            raise RuntimeError("Release parity reference member boundary mismatch.")
+        date_times = {info.date_time for info in infos}
+        if len(date_times) != 1:
+            raise RuntimeError("Release parity reference timestamps are inconsistent.")
+        contents = {
+            PurePosixPath(*PurePosixPath(info.filename).parts[1:]).as_posix(): archive.read(info)
+            for info in infos
+        }
+
+    manifest = json.loads(contents[RELEASE_MANIFEST_PATH].decode("utf-8"))
+    reference_version = str(manifest.get("release_version") or "")
+    reference_label = str(manifest.get("release_label") or "")
+    validate_release_identity(reference_label, reference_version)
+    source_paths = [str(path) for path in SOURCE_FILES]
+    manifest_files = manifest.get("files")
+    if not isinstance(manifest_files, list):
+        raise RuntimeError("Release parity reference inventory is missing.")
+    manifest_paths = [str(item.get("path") or "") for item in manifest_files]
+    manifest_install_flags = [item.get("install") for item in manifest_files]
+    expected_install_flags = [path in RUNTIME_INSTALL_FILES for path in SOURCE_FILES]
+    if (
+        manifest.get("schema") != "hmb-release-closure"
+        or manifest.get("version") != 1
+        or manifest.get("file_count") != len(SOURCE_FILES)
+        or manifest.get("install_file_count") != len(RUNTIME_INSTALL_FILES)
+        or manifest.get("distribution_file_count") != len(DISTRIBUTION_ONLY_FILES)
+        or manifest.get("shot_routing_protocol") != SHOT_ROUTING_PROTOCOL_VERSION
+        or manifest_paths != source_paths
+        or manifest_install_flags != expected_install_flags
+        or any(type(flag) is not bool for flag in manifest_install_flags)
+    ):
+        raise RuntimeError("Release parity reference manifest is inconsistent.")
+    for item in manifest_files:
+        relative = str(item["path"])
+        data = contents.get(relative)
+        if (
+            data is None
+            or int(item.get("bytes", -1)) != len(data)
+            or str(item.get("sha256") or "") != digest(data)
+        ):
+            raise RuntimeError(f"Release parity reference hash mismatch: {relative}")
+    checksum_lines = contents[SHA256SUMS_PATH].decode("utf-8").splitlines()
+    expected_checksum_lines = [
+        *(f"{digest(contents[path])}  {path}" for path in source_paths),
+        f"{digest(contents[RELEASE_MANIFEST_PATH])}  {RELEASE_MANIFEST_PATH}",
+    ]
+    if checksum_lines != expected_checksum_lines:
+        raise RuntimeError("Release parity reference checksum inventory is inconsistent.")
+
+    library_manifest = json.loads(contents["griptape-nodes-library.json"].decode("utf-8"))
+    if library_manifest.get("metadata", {}).get("library_version") != reference_version:
+        raise RuntimeError("Release parity reference library version is inconsistent.")
+    sbom = json.loads(contents["SBOM.spdx.json"].decode("utf-8"))
+    sbom_package = next(
+        (
+            item
+            for item in sbom.get("packages", [])
+            if isinstance(item, dict)
+            and item.get("SPDXID") == "SPDXRef-HMB-GP-Production"
+        ),
+        None,
+    )
+    if (
+        sbom.get("name") != f"HMB_GP_Production-{reference_version}"
+        or sbom.get("documentNamespace")
+        != f"https://hmb.local/spdx/HMB_GP_Production/{reference_version}"
+        or not isinstance(sbom_package, dict)
+        or sbom_package.get("versionInfo") != reference_version
+    ):
+        raise RuntimeError("Release parity reference SBOM version is inconsistent.")
+    return reference_version, {path: contents[path] for path in source_paths}
+
+
+def validate_release_pair_parity(
+    reference_encoded: bytes,
+    current_release_version: str,
+    current_source_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Require adjacent odd/even releases to differ only by version metadata."""
+
+    reference_version, reference_sources = read_validated_release_archive(
+        reference_encoded
+    )
+    reference_parts = release_version_parts(reference_version)
+    current_parts = release_version_parts(current_release_version)
+    if (
+        current_parts[:2] != reference_parts[:2]
+        or current_parts[2] != reference_parts[2] + 1
+    ):
+        raise RuntimeError(
+            "Release parity requires the immediately preceding technical version."
+        )
+    current_sources = {
+        str(record["path"]): bytes(record["data"])
+        for record in current_source_records
+    }
+    if set(current_sources) != set(reference_sources):
+        raise RuntimeError("Release parity source inventory differs.")
+    mismatches = [
+        relative
+        for relative in SOURCE_FILES
+        if parity_normalized_source_data(
+            str(relative), reference_sources[str(relative)]
+        )
+        != parity_normalized_source_data(
+            str(relative), current_sources[str(relative)]
+        )
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "Release pair contains non-version changes: " + ", ".join(mismatches)
+        )
+    return {
+        "current_version": current_release_version,
+        "functional_file_count": len(SOURCE_FILES),
+        "reference_version": reference_version,
+        "version_only_files": ["griptape-nodes-library.json", "SBOM.spdx.json"],
+    }
+
+
+def check_parity(
+    reference_path: Path,
+    expected_reference_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Compare current sources with an independently validated prior ZIP."""
+
+    release_version, source_records = validate_sources()
+    release_records = make_release_records(release_version, source_records)
+    validate_release_inventory(release_version, release_records)
+    archive_date_time = current_zip_date_time()
+    first = make_archive(release_records, archive_date_time)
+    second = make_archive(release_records, archive_date_time)
+    if first != second:
+        raise RuntimeError("Runtime archive is not reproducible.")
+    validate_archive(first, release_records, archive_date_time)
+    reference = reference_path.resolve()
+    if not reference.is_file():
+        raise RuntimeError(f"Release parity reference is missing: {reference}")
+    reference_encoded = reference.read_bytes()
+    reference_sha256 = digest(reference_encoded)
+    if expected_reference_sha256 is not None:
+        expected_digest = expected_reference_sha256.strip().casefold()
+        if re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None:
+            raise RuntimeError("Expected release parity SHA256 is invalid.")
+        if reference_sha256 != expected_digest:
+            raise RuntimeError("Release parity reference SHA256 differs.")
+    result = validate_release_pair_parity(
+        reference_encoded, release_version, source_records
+    )
+    expected_name = (
+        f"HMB_GP_Production_{release_label_for_version(result['reference_version'])}"
+        "_Runtime.zip"
+    )
+    if reference.name != expected_name:
+        raise RuntimeError(
+            f"Release parity reference filename mismatch; expected {expected_name}."
+        )
+    return {
+        "current_release_label": RELEASE_LABEL,
+        "current_release_version": release_version,
+        "functional_file_count": result["functional_file_count"],
+        "parity": True,
+        "reference_archive": str(reference),
+        "reference_release_version": result["reference_version"],
+        "reference_sha256": reference_sha256,
+        "version_only_files": result["version_only_files"],
+    }
+
+
+def write_parity_proof(proof_path: Path, tested_archive_path: Path) -> dict[str, Any]:
+    """Bind an audited local even ZIP to its unchanged next odd team release."""
+
+    release_version, source_records = validate_sources()
+    major, minor, patch = release_version_parts(release_version)
+    if patch % 2 != 0:
+        raise RuntimeError("Parity proof creation requires an even local-test version.")
+    archive_result = check_output(tested_archive_path)
+    archive = tested_archive_path.resolve()
+    tested_archive_sha256 = digest(archive.read_bytes())
+    target_version = f"{major}.{minor}.{patch + 1}"
+    payload = {
+        "canonical_source_sha256": canonical_source_fingerprint(source_records),
+        "schema": RELEASE_PARITY_PROOF_SCHEMA,
+        "target_odd_release_label": release_label_for_version(target_version),
+        "target_odd_version": target_version,
+        "tested_even_archive_sha256": tested_archive_sha256,
+        "tested_even_release_label": release_label_for_version(release_version),
+        "tested_even_version": release_version,
+        "version": RELEASE_PARITY_PROOF_VERSION,
+    }
+    proof = proof_path.resolve()
+    proof.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode(
+        "utf-8"
+    )
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        prefix=proof.name + ".",
+        suffix=".tmp",
+        dir=proof.parent,
+        delete=False,
+    ) as stream:
+        temporary = Path(stream.name)
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+    try:
+        os.replace(temporary, proof)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return {
+        **payload,
+        "proof": str(proof),
+        "tested_archive": archive_result["archive"],
+    }
+
+
+def validate_parity_proof_payload(
+    payload: Any,
+    release_version: str,
+    source_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Validate one proof against a candidate odd release behavior surface."""
+
+    major, minor, patch = release_version_parts(release_version)
+    if patch % 2 != 1 or patch == 0:
+        raise RuntimeError("Parity proof validation requires an odd team version.")
+    expected_keys = {
+        "canonical_source_sha256",
+        "schema",
+        "target_odd_release_label",
+        "target_odd_version",
+        "tested_even_archive_sha256",
+        "tested_even_release_label",
+        "tested_even_version",
+        "version",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_keys:
+        raise RuntimeError("Release parity proof boundary is invalid.")
+    even_version = f"{major}.{minor}.{patch - 1}"
+    if (
+        payload.get("schema") != RELEASE_PARITY_PROOF_SCHEMA
+        or payload.get("version") != RELEASE_PARITY_PROOF_VERSION
+        or payload.get("tested_even_version") != even_version
+        or payload.get("tested_even_release_label")
+        != release_label_for_version(even_version)
+        or payload.get("target_odd_version") != release_version
+        or payload.get("target_odd_release_label")
+        != release_label_for_version(release_version)
+    ):
+        raise RuntimeError("Release parity proof version pair is invalid.")
+    tested_archive_sha256 = str(payload.get("tested_even_archive_sha256") or "")
+    canonical_sha256 = str(payload.get("canonical_source_sha256") or "")
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", tested_archive_sha256) is None
+        or re.fullmatch(r"[0-9a-f]{64}", canonical_sha256) is None
+    ):
+        raise RuntimeError("Release parity proof digest is invalid.")
+    actual_canonical_sha256 = canonical_source_fingerprint(source_records)
+    if canonical_sha256 != actual_canonical_sha256:
+        raise RuntimeError(
+            "Team release differs from the tested even-version behavior surface."
+        )
+    return {
+        "canonical_source_sha256": actual_canonical_sha256,
+        "parity": True,
+        "release_label": release_label_for_version(release_version),
+        "release_version": release_version,
+        "tested_even_archive_sha256": tested_archive_sha256,
+        "tested_even_version": even_version,
+    }
+
+
+def check_parity_proof(proof_path: Path) -> dict[str, Any]:
+    """Fail a team release unless it matches the tested local even build."""
+
+    check()
+    release_version, source_records = validate_sources()
+    proof = proof_path.resolve()
+    if not proof.is_file():
+        raise RuntimeError(f"Release parity proof is missing: {proof}")
+    payload = json.loads(proof.read_text(encoding="utf-8"))
+    result = validate_parity_proof_payload(
+        payload,
+        release_version,
+        source_records,
+    )
+    return {**result, "proof": str(proof)}
 
 
 def current_zip_date_time() -> tuple[int, int, int, int, int, int]:
@@ -748,32 +1132,7 @@ def validate_archive(
             raise RuntimeError("Runtime archive omitted an allowlisted member.")
 
 
-def assert_release_policy_candidate_is_active() -> None:
-    """Block packaging while reviewed policy source still awaits signing."""
-
-    prompt_path = ROOT / "HMBPromptLibrary.py"
-    candidate_version = module_string_constant(
-        prompt_path, "PROMPT_POLICY_CANDIDATE_VERSION"
-    )
-    candidate_contract = module_string_constant(
-        prompt_path, "PROMPT_POLICY_CANDIDATE_CONTRACT_SHA256"
-    )
-    candidate_status = module_string_constant(
-        prompt_path, "PROMPT_POLICY_CANDIDATE_STATUS"
-    ).casefold()
-    if (
-        candidate_version != POLICY_VERSION
-        or candidate_contract != POLICY_CONTRACT_SHA256
-        or candidate_status != "active"
-    ):
-        raise RuntimeError(
-            "Runtime release is blocked: the reviewed policy candidate is not "
-            "the active signed server policy."
-        )
-
-
 def build(output_path: Path = ARCHIVE_PATH) -> dict[str, Any]:
-    assert_release_policy_candidate_is_active()
     release_version, source_records = validate_sources()
     records = make_release_records(release_version, source_records)
     validate_release_inventory(release_version, records)
@@ -810,9 +1169,7 @@ def build(output_path: Path = ARCHIVE_PATH) -> dict[str, Any]:
         "distribution_file_count": len(DISTRIBUTION_ONLY_FILES),
         "file_count": len(records),
         "install_file_count": len(RUNTIME_INSTALL_FILES),
-        "policy_contract_sha256": POLICY_CONTRACT_SHA256,
         "policy_delivery": POLICY_DELIVERY,
-        "policy_version": POLICY_VERSION,
         "release_label": RELEASE_LABEL,
         "release_version": release_version,
         "shot_routing_protocol": SHOT_ROUTING_PROTOCOL_VERSION,
@@ -821,7 +1178,6 @@ def build(output_path: Path = ARCHIVE_PATH) -> dict[str, Any]:
 
 
 def check() -> dict[str, Any]:
-    assert_release_policy_candidate_is_active()
     release_version, source_records = validate_sources()
     records = make_release_records(release_version, source_records)
     validate_release_inventory(release_version, records)
@@ -836,9 +1192,7 @@ def check() -> dict[str, Any]:
         "archive_built_at_local": format_zip_date_time(archive_date_time),
         "distribution_file_count": len(DISTRIBUTION_ONLY_FILES),
         "install_file_count": len(RUNTIME_INSTALL_FILES),
-        "policy_contract_sha256": POLICY_CONTRACT_SHA256,
         "policy_delivery": POLICY_DELIVERY,
-        "policy_version": POLICY_VERSION,
         "release_label": RELEASE_LABEL,
         "release_version": release_version,
         "shot_routing_protocol": SHOT_ROUTING_PROTOCOL_VERSION,
@@ -850,7 +1204,6 @@ def check() -> dict[str, Any]:
 def check_output(output_path: Path = ARCHIVE_PATH) -> dict[str, Any]:
     """Verify existing timestamped artifact contents against current sources."""
 
-    assert_release_policy_candidate_is_active()
     release_version, source_records = validate_sources()
     records = make_release_records(release_version, source_records)
     validate_release_inventory(release_version, records)
@@ -898,16 +1251,66 @@ def main() -> None:
         default=ARCHIVE_PATH,
         help="Runtime ZIP destination. The production release files are never modified.",
     )
-    args = parser.parse_args()
-    if args.check and args.check_output:
-        parser.error("--check and --check-output are mutually exclusive")
-    result = (
-        check_output(args.output)
-        if args.check_output
-        else check()
-        if args.check
-        else build(args.output)
+    parser.add_argument(
+        "--parity-with",
+        type=Path,
+        help=(
+            "Validate that current sources differ from the immediately preceding "
+            "audited ZIP only by approved release-version metadata."
+        ),
     )
+    parser.add_argument(
+        "--reference-sha256",
+        help="Require the --parity-with ZIP to match this trusted SHA256.",
+    )
+    parser.add_argument(
+        "--write-parity-proof",
+        type=Path,
+        help=(
+            "Write a CI proof binding the validated even --output ZIP to the "
+            "next odd team release."
+        ),
+    )
+    parser.add_argument(
+        "--check-parity-proof",
+        type=Path,
+        help="Validate a tested even-to-odd parity proof for the current release.",
+    )
+    args = parser.parse_args()
+    primary_modes = (
+        args.check,
+        args.check_output,
+        args.write_parity_proof,
+        args.check_parity_proof,
+    )
+    if sum(bool(item) for item in primary_modes) > 1:
+        parser.error(
+            "--check, --check-output, --write-parity-proof, and "
+            "--check-parity-proof are mutually exclusive"
+        )
+    if args.reference_sha256 and not args.parity_with:
+        parser.error("--reference-sha256 requires --parity-with")
+    if args.parity_with and not args.reference_sha256:
+        parser.error("--parity-with requires --reference-sha256")
+    if args.parity_with and not (args.check or args.check_output):
+        parser.error("--parity-with requires --check or --check-output")
+    if args.parity_with and (args.write_parity_proof or args.check_parity_proof):
+        parser.error("--parity-with cannot be combined with parity proof modes")
+    if args.write_parity_proof:
+        result = write_parity_proof(args.write_parity_proof, args.output)
+    elif args.check_parity_proof:
+        result = check_parity_proof(args.check_parity_proof)
+    elif args.check_output:
+        result = check_output(args.output)
+    elif args.check:
+        result = check()
+    else:
+        result = build(args.output)
+    if args.parity_with:
+        result["release_pair_parity"] = check_parity(
+            args.parity_with,
+            args.reference_sha256,
+        )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
 
 

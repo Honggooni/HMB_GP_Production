@@ -5,7 +5,6 @@ import base64
 import binascii
 import ctypes
 import hashlib
-import hmac
 import importlib
 import ipaddress
 import io
@@ -325,15 +324,6 @@ MODEL_TASK_CHOICES = {
     SEEDANCE_2_5_MODEL_ID: TASK_STORAGE_CHOICES,
 }
 
-_VIDEO_EDITING_PROMPT_PATTERN = re.compile(
-    r"\b(?:add|delete|edit|editing|replace|remove|change|modify|transform)\b",
-    re.IGNORECASE,
-)
-_VIDEO_EXTENSION_PROMPT_PATTERN = re.compile(
-    r"\b(?:extend|extension|continue|continuation|continuing)\b",
-    re.IGNORECASE,
-)
-
 # Keep the exact HMB client-approved Volcengine IDs explicit so an arbitrary
 # catalog entry can never be submitted merely because its name contains
 # "seedance".  The corresponding BytePlus ``dreamina-*`` IDs below are saved-
@@ -468,9 +458,6 @@ SHOT_VIDEO_INPUT_PARAMETER = "SHOT_VIDEO_IN"
 SHOT_ASSET_INPUT_PARAMETER = "SHOT_ASSET_IN"
 SHOT_PICKER_INPUT_PARAMETER = "SHOT_PICKER_IN"
 SHOT_PICKER_LEGACY_JSON_MAX_BYTES = 1024 * 1024
-SHOT_LOCAL_PROMPT_PARAMETER = "HMB_LOCAL_PROMPT_FALLBACK"
-SHOT_LOCAL_PROMPT_CAPTURED_PARAMETER = "HMB_LOCAL_PROMPT_CAPTURED"
-SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER = "HMB_REMOTE_PROMPT_OVERLAY"
 SHOT_AUTOCLAIM_ENABLED_PARAMETER = "HMB_SHOT_AUTOCLAIM_ENABLED"
 SHOT_SELECTOR_PARAMETER = "shot_selector"
 SEEDANCE_SHOT_WIDGET_PARAMETER = "HMB_SEEDANCE_SHOT_UI"
@@ -509,9 +496,6 @@ SHOT_CONNECTION_PENDING_LABEL = "Shot connection pending"
 # is the ordinary prompt-only ``Only`` choice.
 SHOT_REMOTE_WAITING_LABEL = SHOT_CONNECTION_PENDING_LABEL
 SHOT_ONLY_LABEL = "Only"
-AGENT_REMOTE_PROMPT_PUBLICATION_SCHEMA = "hmb-agent-remote-prompt-publication"
-AGENT_REMOTE_PROMPT_PUBLICATION_VERSION = 1
-MAX_REMOTE_PROMPT_CHARACTERS = 2_000_000
 SHOT_UNAVAILABLE_LABEL = SHOT_ONLY_LABEL
 
 GENERATION_PREVIEW_SCHEMA = "hmb-seedance-generation-preview"
@@ -2115,9 +2099,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._hmb_shot_selector_map: dict[str, dict[str, Any]] = {}
         self._hmb_shot_route_status: dict[str, Any] = {}
         self._hmb_remote_prompt_route = _seedance_remote_prompt_route_value()
-        self._hmb_remote_prompt_syncing = False
-        self._hmb_prompt_initial_setup_active = False
-        self._hmb_remote_prompt_authority: dict[str, Any] = {}
         self._hmb_autoclaim_in_progress = False
 
         self.add_parameter(
@@ -2507,7 +2488,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 ui_options={"display_name": "Prompt"},
             )
         )
-        remote_prompt_hidden_ui = {
+        hidden_routing_control_ui = {
             "display_name": "",
             "hide": True,
             "hide_property": True,
@@ -2518,35 +2499,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "max_height": 1,
             "is_full_width": True,
         }
-        for remote_prompt_parameter in (
-            ParameterString(
-                name=SHOT_LOCAL_PROMPT_PARAMETER,
-                default_value="",
-                allowed_modes={ParameterMode.PROPERTY},
-                hide=True,
-                hide_property=True,
-                hide_label=True,
-                multiline=True,
-                ui_options=dict(remote_prompt_hidden_ui),
-            ),
-            ParameterBool(
-                name=SHOT_LOCAL_PROMPT_CAPTURED_PARAMETER,
-                default_value=False,
-                allowed_modes={ParameterMode.PROPERTY},
-                hide=True,
-                hide_property=True,
-                hide_label=True,
-                ui_options=dict(remote_prompt_hidden_ui),
-            ),
-            ParameterBool(
-                name=SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER,
-                default_value=False,
-                allowed_modes={ParameterMode.PROPERTY},
-                hide=True,
-                hide_property=True,
-                hide_label=True,
-                ui_options=dict(remote_prompt_hidden_ui),
-            ),
+        self.add_parameter(
             ParameterBool(
                 name=SHOT_AUTOCLAIM_ENABLED_PARAMETER,
                 default_value=True,
@@ -2554,10 +2507,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 hide=True,
                 hide_property=True,
                 hide_label=True,
-                ui_options=dict(remote_prompt_hidden_ui),
-            ),
-        ):
-            self.add_parameter(remote_prompt_parameter)
+                ui_options=dict(hidden_routing_control_ui),
+            )
+        )
         self.add_parameter(
             ParameterImage(
                 name="first_frame",
@@ -3195,8 +3147,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         except TypeError:
             self.set_parameter_value(name, value)
 
-    def _set_remote_prompt_control_value(self, name: str, value: Any) -> None:
-        """Persist one hidden authority value without exposing a graph handle."""
+    def _set_hidden_control_value(self, name: str, value: Any) -> None:
+        """Persist one hidden routing control without exposing a graph handle."""
 
         if self.get_parameter_value(name) == value:
             return
@@ -3204,269 +3156,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self.set_parameter_value(name, value, emit_change=False)
         except TypeError:
             self.set_parameter_value(name, value)
-
-    def _local_prompt_baseline(self) -> str:
-        captured = self.get_parameter_value(SHOT_LOCAL_PROMPT_CAPTURED_PARAMETER)
-        if captured is True:
-            return str(self.get_parameter_value(SHOT_LOCAL_PROMPT_PARAMETER) or "")
-        current = str(self.get_parameter_value("prompt") or "")
-        self._set_remote_prompt_control_value(SHOT_LOCAL_PROMPT_PARAMETER, current)
-        self._set_remote_prompt_control_value(
-            SHOT_LOCAL_PROMPT_CAPTURED_PARAMETER,
-            True,
-        )
-        return current
-
-    def _remember_direct_prompt(self, value: Any) -> None:
-        text = str(getattr(value, "value", value) or "")
-        self._set_remote_prompt_control_value(SHOT_LOCAL_PROMPT_PARAMETER, text)
-        self._set_remote_prompt_control_value(
-            SHOT_LOCAL_PROMPT_CAPTURED_PARAMETER,
-            True,
-        )
-
-    def _set_visible_prompt_from_remote(self, value: str) -> None:
-        if self.get_parameter_value("prompt") == value:
-            return
-        self._hmb_remote_prompt_syncing = True
-        try:
-            try:
-                self.set_parameter_value("prompt", value, emit_change=True)
-            except TypeError:
-                self.set_parameter_value("prompt", value)
-        finally:
-            self._hmb_remote_prompt_syncing = False
-
-    def _clear_remote_prompt_authority(
-        self,
-        reason: str = "remote_unavailable",
-        *,
-        restore: bool = True,
-    ) -> None:
-        """Drop remote ownership and restore the last direct Seedance prompt."""
-
-        del reason  # A bounded reason belongs in routing status, never prompt text.
-        marked = self.get_parameter_value(SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER) is True
-        had_authority = bool(self._hmb_remote_prompt_authority) or marked
-        self._hmb_remote_prompt_authority = {}
-        if (
-            restore
-            and had_authority
-            and not bool(getattr(self, "_hmb_node_deleted", False))
-        ):
-            self._set_visible_prompt_from_remote(self._local_prompt_baseline())
-        self._set_remote_prompt_control_value(
-            SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER,
-            False,
-        )
-
-    @staticmethod
-    def _validate_remote_prompt_publication(value: Any) -> dict[str, Any]:
-        required = {
-            "schema",
-            "version",
-            "source_token",
-            "publication_revision",
-            "channel_uuid",
-            "shot_uuid",
-            "shot_number",
-            "shot_name",
-            "prompt_generation",
-            "visible_prompt_sha256",
-            "image_media_sha256",
-            "video_media_sha256",
-            "final_text_sha256",
-            "final_text",
-        }
-        if not isinstance(value, dict) or set(value) != required:
-            raise RuntimeError("Seedance remote Agent prompt publication is malformed.")
-        if (
-            value.get("schema") != AGENT_REMOTE_PROMPT_PUBLICATION_SCHEMA
-            or value.get("version") != AGENT_REMOTE_PROMPT_PUBLICATION_VERSION
-            or re.fullmatch(r"[0-9a-f]{32}", str(value.get("source_token") or ""))
-            is None
-            or not isinstance(value.get("publication_revision"), int)
-            or isinstance(value.get("publication_revision"), bool)
-            or int(value["publication_revision"]) <= 0
-            or not isinstance(value.get("prompt_generation"), int)
-            or isinstance(value.get("prompt_generation"), bool)
-            or int(value["prompt_generation"]) <= 0
-            or not isinstance(value.get("shot_number"), int)
-            or isinstance(value.get("shot_number"), bool)
-            or not 1 <= int(value["shot_number"]) <= SHOT_ROUTING_MAX_SHOTS
-            or not isinstance(value.get("shot_name"), str)
-            or not value["shot_name"]
-            or value["shot_name"] != value["shot_name"].strip()[:128]
-            or not HMBSeedanceGeneration._shot_uuid(value.get("channel_uuid"))
-            or not HMBSeedanceGeneration._shot_uuid(value.get("shot_uuid"))
-            or not isinstance(value.get("final_text"), str)
-            or not value["final_text"]
-            or len(value["final_text"]) > MAX_REMOTE_PROMPT_CHARACTERS
-        ):
-            raise RuntimeError("Seedance remote Agent prompt publication is invalid.")
-        for key in (
-            "visible_prompt_sha256",
-            "image_media_sha256",
-            "video_media_sha256",
-            "final_text_sha256",
-        ):
-            if re.fullmatch(r"[0-9a-f]{64}", str(value.get(key) or "")) is None:
-                raise RuntimeError("Seedance remote Agent prompt hash is invalid.")
-        expected_hash = hashlib.sha256(value["final_text"].encode("utf-8")).hexdigest()
-        if not hmac.compare_digest(str(value["final_text_sha256"]), expected_hash):
-            raise RuntimeError("Seedance remote Agent prompt hash does not match.")
-        return deepcopy(value)
-
-    def _apply_remote_prompt_publication(self, value: Any) -> dict[str, Any]:
-        publication = self._validate_remote_prompt_publication(value)
-        subscription = self._hmb_shot_channel_subscription()
-        if (
-            not subscription["enabled"]
-            or publication["channel_uuid"] != subscription["channel_uuid"]
-            or publication["shot_uuid"] != subscription["shot_uuid"]
-            or publication["shot_number"] != subscription["shot_number"]
-            or publication["shot_name"] != subscription["shot_name"]
-        ):
-            raise RuntimeError("Seedance remote Agent prompt belongs to another Shot.")
-        previous = self._hmb_remote_prompt_authority
-        if (
-            isinstance(previous, dict)
-            and previous.get("source_token") == publication["source_token"]
-        ):
-            previous_revision = int(previous.get("publication_revision") or 0)
-            if publication["publication_revision"] < previous_revision:
-                raise RuntimeError("Seedance rejected a stale Agent prompt publication.")
-            if (
-                publication["publication_revision"] == previous_revision
-                and publication["final_text_sha256"]
-                != previous.get("final_text_sha256")
-            ):
-                raise RuntimeError("Seedance rejected a conflicting Agent publication.")
-        self._local_prompt_baseline()
-        self._hmb_remote_prompt_authority = publication
-        self._set_remote_prompt_control_value(
-            SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER,
-            True,
-        )
-        self._set_visible_prompt_from_remote(publication["final_text"])
-        return deepcopy(publication)
-
-    def _refresh_remote_prompt_authority(
-        self,
-        *,
-        strict: bool = False,
-        source_node: Any | None = None,
-    ) -> dict[str, Any]:
-        subscription = self._hmb_shot_channel_subscription()
-        if not subscription["enabled"]:
-            self._clear_remote_prompt_authority("remote_waiting")
-            return {}
-        try:
-            source = source_node or self._exact_incoming_source(
-                SHOT_PROMPT_INPUT_PARAMETER,
-                "output",
-            )
-            source_subscription_getter = getattr(
-                source,
-                "_hmb_shot_channel_subscription",
-                None,
-            )
-            publication_getter = getattr(
-                source,
-                "_hmb_remote_prompt_publication_for_generator",
-                None,
-            )
-            if not callable(source_subscription_getter) or not callable(
-                publication_getter
-            ):
-                raise RuntimeError("Seedance remote Agent authority is unavailable.")
-            source_subscription = source_subscription_getter()
-            if (
-                not isinstance(source_subscription, dict)
-                or source_subscription.get("participant_kind") != "agent"
-                or not source_subscription.get("enabled")
-                or source_subscription.get("channel_uuid")
-                != subscription["channel_uuid"]
-                or source_subscription.get("shot_uuid") != subscription["shot_uuid"]
-                or source_subscription.get("shot_number")
-                != subscription["shot_number"]
-                or source_subscription.get("shot_name") != subscription["shot_name"]
-            ):
-                raise RuntimeError("Seedance remote Agent Shot identity is invalid.")
-            publication = publication_getter()
-            if not publication:
-                raise RuntimeError("Seedance remote Agent FINAL TEXT is unavailable.")
-            return self._apply_remote_prompt_publication(publication)
-        except Exception as exc:
-            self._clear_remote_prompt_authority("remote_invalid")
-            if strict:
-                if isinstance(exc, RuntimeError):
-                    raise
-                raise RuntimeError("Seedance remote Agent authority is unavailable.") from exc
-            return {}
-
-    def _hmb_unique_complete_prompt_agent_pair(
-        self,
-    ) -> tuple[Any, dict[str, Any]] | None:
-        """Find exactly one hydrated Prompt+Agent Shot pair in this flow."""
-
-        try:
-            same_flow = getattr(_shot_routing, "_same_flow_nodes")
-            _flow_name, nodes = same_flow(self)
-        except Exception:
-            return None
-        prompts: dict[tuple[str, str], list[tuple[Any, dict[str, Any]]]] = {}
-        agents: dict[tuple[str, str], list[tuple[Any, dict[str, Any]]]] = {}
-        for candidate in nodes:
-            if candidate is self or bool(getattr(candidate, "_hmb_node_deleted", False)):
-                continue
-            getter = getattr(candidate, "_hmb_shot_channel_subscription", None)
-            if not callable(getter):
-                continue
-            try:
-                subscription = getter()
-            except Exception:
-                continue
-            if not isinstance(subscription, dict) or not subscription.get("enabled"):
-                continue
-            kind = str(subscription.get("participant_kind") or "")
-            key = (
-                str(subscription.get("channel_uuid") or ""),
-                str(subscription.get("shot_uuid") or ""),
-            )
-            if not all(key):
-                continue
-            status = getattr(candidate, "_hmb_shot_route_status", None)
-            if (
-                not isinstance(status, dict)
-                or not status.get("ok")
-                or str(status.get("code") or "") != "ready"
-            ):
-                continue
-            if kind == "prompt":
-                prompts.setdefault(key, []).append((candidate, subscription))
-            elif kind == "agent":
-                agents.setdefault(key, []).append((candidate, subscription))
-        claimed_by_other_generators = self._hmb_other_seedance_shot_claims()
-        complete: list[tuple[Any, dict[str, Any]]] = []
-        for key in sorted(set(prompts) | set(agents)):
-            if key in claimed_by_other_generators:
-                continue
-            prompt_matches = prompts.get(key, [])
-            agent_matches = agents.get(key, [])
-            if len(prompt_matches) == 1 and len(agent_matches) == 1:
-                complete.append(agent_matches[0])
-        return complete[0] if len(complete) == 1 else None
-
-    def _hmb_consider_agent_shot_autoclaim(self, trigger_agent: Any = None) -> bool:
-        """Compatibility callback for older Agent builds.
-
-        Agent is no longer routing authority for Seedance. ImageAsset catalog
-        delivery and the exact VideoPicker source determine Shot availability.
-        """
-
-        del trigger_agent
-        return False
 
     def _set_seedance_shot_choices(self, labels: list[str]) -> None:
         # Prompt-only generation is always available.  Remote Shot choices are
@@ -4363,18 +4052,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self._set_shot_value(SHOT_SELECTOR_PARAMETER, SHOT_ONLY_LABEL)
         finally:
             self._hmb_shot_syncing = False
-        current_identity = self._shot_identity()
-        if (
-            previous_identity["channel_uuid"],
-            previous_identity["shot_uuid"],
-        ) != (
-            current_identity["channel_uuid"],
-            current_identity["shot_uuid"],
-        ):
-            self._clear_remote_prompt_authority("shot_selection_changed")
-            # Keep the previous exact-edge descriptor until the central router
-            # has actually removed/replaced that public connection. Clearing
-            # it here would reveal the still-live cable for one UI frame.
         # Five concurrent Shot generators must never publish into the same
         # legacy default path. Only HMB-managed defaults are renamed; explicit
         # output destinations and connected FileOutputSettings remain owned by
@@ -4442,11 +4119,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             else:
                 self._hmb_remote_prompt_route = discovered_route
             self._sync_seedance_shot_widget(emit_change=True)
-            # Migrate any saved Agent overlay once. The visible prompt is now
-            # always direct input: authored text in Only or an exact public
-            # Agent.output connection in Shot mode.
-            if self.get_parameter_value(SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER) is True:
-                self._clear_remote_prompt_authority("manual_prompt_authority")
 
     def _hmb_prepare_remote_prompt_route(self, source_node: Any) -> bool:
         """Pre-arm exact old/new edge hiding before retained-mode mutation.
@@ -4513,8 +4185,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         try:
             source_node = self._manual_agent_prompt_source()
         except Exception:
-            # UI decoration is fail-visible. Execution still performs the
-            # strict connection/provenance validation and reports its error.
+            # UI decoration is fail-visible. Runtime prompt text is accepted
+            # independently; direct Shot media retains its own strict proof.
             return disconnected
         if source_node is None:
             return disconnected
@@ -4645,7 +4317,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     ) -> dict[str, Any]:
         """Clear remote authority without touching standalone generation inputs."""
 
-        self._clear_remote_prompt_authority(reason)
         self._hmb_shot_catalog_snapshot = None
         self._hmb_shot_catalog_generation = 0
         self._hmb_shot_selector_map = {}
@@ -4668,11 +4339,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return self._hmb_shot_channel_subscription()
-        self._set_remote_prompt_control_value(
+        self._set_hidden_control_value(
             SHOT_AUTOCLAIM_ENABLED_PARAMETER,
             False,
         )
-        self._clear_remote_prompt_authority(reason)
         self._apply_seedance_shot_selection(
             "",
             fallback_to_available=False,
@@ -4896,9 +4566,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     self._hmb_list_parent_syncing = False
                 return
         parent = super().set_parameter_value
-        prompt_initial_setup = param_name == "prompt" and initial_setup
-        if prompt_initial_setup:
-            self._hmb_prompt_initial_setup_active = True
         if param_name == "model_id" and not initial_setup:
             self._hmb_model_switch_previous_id = previous_model_id
         try:
@@ -4910,8 +4577,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 skip_before_value_set=skip_before_value_set,
             )
         finally:
-            if prompt_initial_setup:
-                self._hmb_prompt_initial_setup_active = False
             if param_name == "model_id" and not initial_setup:
                 with suppress(AttributeError):
                     del self._hmb_model_switch_previous_id
@@ -5132,12 +4797,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     def after_value_set(self, parameter: Parameter, value: Any) -> None:
         """Mirror Standard Seedance media visibility for the selected mode."""
-        if (
-            parameter.name == "prompt"
-            and not self._hmb_remote_prompt_syncing
-            and not self._hmb_prompt_initial_setup_active
-        ):
-            self._remember_direct_prompt(value)
         if parameter.name == "model_id" and self._hmb_retired_model_migration_pending:
             resolution_parameter = self.get_parameter_by_name("resolution")
             if resolution_parameter is not None:
@@ -5192,7 +4851,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             and parameter.name == SEEDANCE_SHOT_WIDGET_PARAMETER
         ):
             if not self._hmb_autoclaim_in_progress:
-                self._set_remote_prompt_control_value(
+                self._set_hidden_control_value(
                     SHOT_AUTOCLAIM_ENABLED_PARAMETER,
                     False,
                 )
@@ -5209,7 +4868,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self._update_parameter_visibility()
         elif not self._hmb_shot_syncing and parameter.name == SHOT_SELECTOR_PARAMETER:
             if not self._hmb_autoclaim_in_progress:
-                self._set_remote_prompt_control_value(
+                self._set_hidden_control_value(
                     SHOT_AUTOCLAIM_ENABLED_PARAMETER,
                     False,
                 )
@@ -5277,14 +4936,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # equivalent and repairs invalid cross-model values deterministically.
         with suppress(Exception):
             self._synchronize_model_resolution()
-        if self.get_parameter_value(SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER) is True:
-            self._clear_remote_prompt_authority("manual_prompt_authority")
-        elif self.get_parameter_value(SHOT_LOCAL_PROMPT_CAPTURED_PARAMETER) is not True:
-            self._remember_direct_prompt(self.get_parameter_value("prompt"))
-            self._set_remote_prompt_control_value(
-                SHOT_REMOTE_PROMPT_OVERLAY_PARAMETER,
-                False,
-            )
         with suppress(Exception):
             _shot_routing.schedule_post_hydration_reconcile(self)
         with suppress(Exception):
@@ -5992,95 +5643,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             or source_subscription.get("participant_kind") != "agent"
         ):
             return None
-        snapshot_getter = getattr(source_node, "_hmb_generator_shot_snapshot", None)
-        if not callable(snapshot_getter):
-            return None
         if str(getattr(connection, "source_parameter_name", "") or "") != "output":
             raise RuntimeError("Seedance HMBAgent prompt must use the Agent output port.")
         return source_node
-
-    @classmethod
-    def _media_list_sha256(cls, values: list[str]) -> str:
-        return cls._canonical_sha256({"media": values})
-
-    @staticmethod
-    def _validate_agent_shot_snapshot(value: Any) -> dict[str, Any]:
-        required = {
-            "schema", "version", "channel_uuid", "shot_uuid", "shot_number",
-            "shot_name", "prompt_generation", "visible_prompt_sha256",
-            "image_media_sha256", "video_media_sha256", "final_text_sha256",
-        }
-        if not isinstance(value, dict) or set(value) != required:
-            raise RuntimeError("Seedance Agent Shot snapshot is malformed.")
-        if value.get("schema") != "hmb-agent-generator-shot-snapshot" or value.get("version") != 1:
-            raise RuntimeError("Seedance Agent Shot snapshot schema is invalid.")
-        channel = HMBSeedanceGeneration._shot_uuid(value.get("channel_uuid"))
-        shot_uuid = HMBSeedanceGeneration._shot_uuid(value.get("shot_uuid"))
-        shot_number = value.get("shot_number")
-        prompt_generation = value.get("prompt_generation")
-        shot_name = value.get("shot_name")
-        if (
-            not channel or not shot_uuid
-            or not isinstance(shot_number, int) or isinstance(shot_number, bool)
-            or not 1 <= shot_number <= SHOT_ROUTING_MAX_SHOTS
-            or not isinstance(shot_name, str) or not shot_name
-            or shot_name != shot_name.strip()[:128]
-            or not isinstance(prompt_generation, int) or isinstance(prompt_generation, bool)
-            or prompt_generation <= 0
-        ):
-            raise RuntimeError("Seedance Agent Shot identity/revision is invalid.")
-        for key in (
-            "visible_prompt_sha256", "image_media_sha256", "video_media_sha256",
-            "final_text_sha256",
-        ):
-            if re.fullmatch(r"[0-9a-f]{64}", str(value.get(key) or "")) is None:
-                raise RuntimeError("Seedance Agent Shot snapshot hash is invalid.")
-        return deepcopy(value)
-
-    @staticmethod
-    def _validate_prompt_shot_snapshot(value: Any) -> dict[str, Any]:
-        required = {
-            "schema", "version", "channel_uuid", "shot_uuid", "shot_number",
-            "shot_name", "prompt_generation", "visible_prompt_sha256",
-            "image_media_sha256", "video_media_sha256", "image_media",
-            "video_media",
-        }
-        if not isinstance(value, dict) or set(value) != required:
-            raise RuntimeError("Seedance Prompt Shot snapshot is malformed.")
-        if value.get("schema") != "hmb-prompt-generator-shot-snapshot" or value.get("version") != 1:
-            raise RuntimeError("Seedance Prompt Shot snapshot schema is invalid.")
-        channel = HMBSeedanceGeneration._shot_uuid(value.get("channel_uuid"))
-        shot_uuid = HMBSeedanceGeneration._shot_uuid(value.get("shot_uuid"))
-        shot_number = value.get("shot_number")
-        prompt_generation = value.get("prompt_generation")
-        shot_name = value.get("shot_name")
-        if (
-            not channel or not shot_uuid
-            or not isinstance(shot_number, int) or isinstance(shot_number, bool)
-            or not 1 <= shot_number <= SHOT_ROUTING_MAX_SHOTS
-            or not isinstance(shot_name, str) or not shot_name
-            or shot_name != shot_name.strip()[:128]
-            or not isinstance(prompt_generation, int) or isinstance(prompt_generation, bool)
-            or prompt_generation <= 0
-        ):
-            raise RuntimeError("Seedance Prompt Shot identity/revision is invalid.")
-        for key in (
-            "visible_prompt_sha256", "image_media_sha256", "video_media_sha256",
-        ):
-            if re.fullmatch(r"[0-9a-f]{64}", str(value.get(key) or "")) is None:
-                raise RuntimeError("Seedance Prompt Shot snapshot hash is invalid.")
-        if (
-            not isinstance(value.get("image_media"), list)
-            or not isinstance(value.get("video_media"), list)
-            or len(value["image_media"]) > MAX_REFERENCE_IMAGES
-            or len(value["video_media"]) > 10
-            or any(
-                not isinstance(item, str) or not item
-                for item in value["image_media"] + value["video_media"]
-            )
-        ):
-            raise RuntimeError("Seedance Prompt Shot media snapshot is invalid.")
-        return deepcopy(value)
 
     @classmethod
     def _validate_direct_media_snapshot(
@@ -6266,8 +5831,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     def _resolve_exact_shot_generation_inputs(
         self,
         params: dict[str, Any],
-        *,
-        verify_agent_prompt: bool = True,
     ) -> dict[str, Any]:
         # A newly added or deserialized Seedance node may still have a blank
         # durable quartet. Reconcile the same-flow catalog before deciding
@@ -6275,7 +5838,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._reconcile_shared_shot_routing(strict=True)
         subscription = self._hmb_shot_channel_subscription()
         if not subscription["enabled"]:
-            self._clear_remote_prompt_authority("remote_waiting")
             resolved = dict(params)
             resolved["prompt"] = str(params.get("prompt") or "")
             task = str(params.get(TASK_PARAMETER) or "").strip()
@@ -6398,135 +5960,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 f"Selected Shot contains {len(videos)} videos; {model_name} accepts "
                 f"at most {video_limit}. No request was submitted."
             )
-
-        # The public prompt input remains manual.  When its exact source is an
-        # HMBAgent, however, text alone is not provenance: require the Agent's
-        # immutable generator snapshot to match this Seedance Shot and the two
-        # direct media publications byte-for-byte.  Ordinary manual text and
-        # non-HMB prompt sources remain independent.
-        # StartFlow validates the whole graph before an upstream prompt node has
-        # executed.  At that point its connected output can legitimately still
-        # be blank, so preflight resolves the immutable media snapshot without
-        # attempting to authenticate a not-yet-produced Agent result.  The real
-        # process path always leaves ``verify_agent_prompt`` enabled and proves
-        # the final text + exact Shot media hashes before any billable request.
-        prompt_source = (
-            self._manual_agent_prompt_source()
-            if verify_agent_prompt
-            else None
-        )
-        if prompt_source is not None:
-            source_subscription = self._direct_source_subscription(
-                prompt_source,
-                "agent",
-            )
-            if any(
-                source_subscription.get(key) != subscription.get(key)
-                for key in (
-                    "channel_uuid",
-                    "shot_uuid",
-                    "shot_number",
-                    "shot_name",
-                )
-            ):
-                raise RuntimeError(
-                    "Seedance Agent prompt belongs to another Shot."
-                )
-            snapshot_getter = getattr(
-                prompt_source,
-                "_hmb_generator_shot_snapshot",
-                None,
-            )
-            if not callable(snapshot_getter):
-                raise RuntimeError("Seedance Agent Shot snapshot is unavailable.")
-            agent_snapshot = self._validate_agent_shot_snapshot(
-                snapshot_getter(params.get("prompt"))
-            )
-            prompt_text = str(params.get("prompt") or "")
-            if not hmac.compare_digest(
-                agent_snapshot["final_text_sha256"],
-                hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
-            ):
-                raise RuntimeError(
-                    "Seedance Agent final text does not match its Shot snapshot."
-                )
-            if any(
-                agent_snapshot.get(key) != subscription.get(key)
-                for key in (
-                    "channel_uuid",
-                    "shot_uuid",
-                    "shot_number",
-                    "shot_name",
-                )
-            ):
-                raise RuntimeError(
-                    "Seedance Agent and selected Shot generations do not match."
-                )
-            if (
-                agent_snapshot["image_media_sha256"]
-                != self._media_list_sha256(images)
-                or agent_snapshot["video_media_sha256"]
-                != self._media_list_sha256(videos)
-            ):
-                raise RuntimeError(
-                    "Seedance Agent and direct Shot media generations do not match."
-                )
-            # Media equality alone cannot prove that the Agent result still
-            # represents the current Prompt. A user can change target, Look,
-            # VFX, or another machine-only field without changing the visible
-            # media lists (and sometimes without changing concise PROMPT_OUT
-            # text). Resolve the exact Prompt instance behind this Agent and
-            # compare its current atomic generation before any billable submit.
-            prompt_node_getter = getattr(
-                prompt_source,
-                "_hmb_generator_prompt_source_node",
-                None,
-            )
-            if not callable(prompt_node_getter):
-                raise RuntimeError(
-                    "Seedance Agent Prompt source snapshot is unavailable."
-                )
-            prompt_node = prompt_node_getter(prompt_text)
-            prompt_snapshot_getter = getattr(
-                prompt_node,
-                "_hmb_generator_shot_snapshot",
-                None,
-            )
-            if not callable(prompt_snapshot_getter):
-                raise RuntimeError(
-                    "Seedance current Prompt Shot snapshot is unavailable."
-                )
-            prompt_snapshot = self._validate_prompt_shot_snapshot(
-                prompt_snapshot_getter(images, videos)
-            )
-            prompt_comparison_fields = (
-                "channel_uuid",
-                "shot_uuid",
-                "shot_number",
-                "shot_name",
-                "prompt_generation",
-                "visible_prompt_sha256",
-                "image_media_sha256",
-                "video_media_sha256",
-            )
-            if any(
-                agent_snapshot.get(key) != prompt_snapshot.get(key)
-                for key in prompt_comparison_fields
-            ):
-                invalidator = getattr(
-                    prompt_source,
-                    "_invalidate_generator_authority_for_prompt_change",
-                    None,
-                )
-                if callable(invalidator):
-                    try:
-                        invalidator()
-                    except Exception:
-                        pass
-                raise RuntimeError(
-                    "Seedance Prompt changed after the Agent result was created. "
-                    "Run HMBAgentLibrary again; no render was submitted."
-                )
 
         resolved = dict(params)
         resolved["prompt"] = str(params.get("prompt") or "")
@@ -6757,21 +6190,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 f"{model_name} accepts at most {video_limit} reference videos; "
                 f"received {len(videos)}. No references were discarded."
             )
-        video_slots = params.get("video_reference_slots") or []
-        if len(video_slots) >= 2:
-            if self._has_reference_value(video_slots[1]) and not self._has_reference_value(
-                video_slots[0]
-            ):
-                raise ValueError(
-                    "reference_video_2 requires reference_video_1 to be connected first."
-                )
-        if len(video_slots) >= 3:
-            if self._has_reference_value(video_slots[2]) and not self._has_reference_value(
-                video_slots[1]
-            ):
-                raise ValueError(
-                    "reference_video_3 requires reference_video_2 to be connected first."
-                )
         if len(audio) > audio_limit:
             raise ValueError(
                 f"{model_name} accepts at most {audio_limit} reference audio files; "
@@ -6834,18 +6252,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 raise ValueError(f"{task} requires at least one reference video.")
             if params["ratio"] != "adaptive":
                 raise ValueError(f"{task} requires adaptive ratio.")
-            if task == TASK_VIDEO_EDITING and not _VIDEO_EDITING_PROMPT_PATTERN.search(
-                prompt
-            ):
-                raise ValueError(
-                    "Video Editing prompt must state an edit action in English."
-                )
-            if task == TASK_VIDEO_EXTENSION and not _VIDEO_EXTENSION_PROMPT_PATTERN.search(
-                prompt
-            ):
-                raise ValueError(
-                    "Video Extension prompt must include extend or continue in English."
-                )
 
         if not prompt and not (has_frames or has_references):
             raise ValueError("Provide a prompt or supported media input before generation.")
@@ -6885,15 +6291,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # represented in the public parameter lists. Resolve them during
         # StartFlow validation as well as execution so a valid media-backed Shot
         # is not rejected as an empty node.
-        params = self._resolve_exact_shot_generation_inputs(
-            params,
-            verify_agent_prompt=False,
-        )
+        params = self._resolve_exact_shot_generation_inputs(params)
         # The graph validator runs before connected Prompt/Agent nodes. A
         # temporary sentinel validates only the connection shape; it never
         # enters runtime state or a Broker payload. Execution reads the actual
-        # output and performs the full Agent snapshot proof, then fails closed
-        # if the produced text is empty or stale.
+        # connected output without imposing a second semantic contract.
         if (
             not str(params.get("prompt") or "").strip()
             and self._has_incoming_parameter_connection("prompt")

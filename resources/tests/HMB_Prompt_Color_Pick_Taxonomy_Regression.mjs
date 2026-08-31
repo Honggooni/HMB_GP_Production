@@ -17,13 +17,13 @@ const state = prompt.normalizeState({
 
 assert.deepEqual(
   prompt.colorPickChoicesForImageTaxonomy("Character", "Full Appearance"),
-  actor,
-  "Character Main/Sub must expose the configured actor palette.",
+  all,
+  "Character Main/Sub must not filter the user-selectable palette.",
 );
 assert.deepEqual(
   prompt.colorPickChoicesForImageTaxonomy("Environment / Background", "Main Background"),
-  object,
-  "Environment Main/Sub must expose the configured object palette.",
+  all,
+  "Environment Main/Sub must not filter the user-selectable palette.",
 );
 assert.deepEqual(
   prompt.colorPickChoicesForImageTaxonomy("Custom / Context", "Custom"),

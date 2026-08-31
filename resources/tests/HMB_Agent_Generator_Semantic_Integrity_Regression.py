@@ -16,24 +16,14 @@ import HMBAgentLibrary as agent
 
 
 class BoundaryHarness:
-    """Minimal host surface for the current sanitizer and Shot publication."""
+    """Minimal host surface for the current public-output sanitizer."""
 
     _secure_hmb_outputs = agent.HMBAgentLibrary._secure_hmb_outputs
-    _hmb_generator_shot_snapshot = (
-        agent.HMBAgentLibrary._hmb_generator_shot_snapshot
-    )
-    _hmb_commit_remote_prompt_publication = (
-        agent.HMBAgentLibrary._hmb_commit_remote_prompt_publication
-    )
 
     def __init__(self) -> None:
         self._hmb_node_deleted = False
         self._hmb_suppress_visible_publication = False
         self._hmb_last_sanitizer_status = "clean"
-        self._hmb_last_generator_snapshot: dict[str, Any] = {}
-        self._hmb_remote_prompt_publication: dict[str, Any] = {}
-        self._hmb_remote_prompt_revision = 0
-        self._hmb_remote_prompt_source_token = "boundary-source-token"
         self.parameter_output_values: dict[str, Any] = {
             "output": "",
             "agent": {},
@@ -119,51 +109,10 @@ assert blocked.visible_output == agent._PUBLIC_OUTPUT_BLOCKED
 assert blocked._hmb_last_sanitizer_status == "state"
 
 
-# A sanitized nonempty result can become the exact selected-Shot publication.
-# Empty text cannot manufacture a successful snapshot/publication.
-final_text = natural_outputs[2]
-shot_context = {
-    "channel_uuid": "channel-regression",
-    "shot_uuid": "shot-regression",
-    "shot_number": 3,
-    "shot_name": "Shot 3",
-    "prompt_generation": 11,
-    "visible_prompt_sha256": "1" * 64,
-    "image_media_sha256": "2" * 64,
-    "video_media_sha256": "3" * 64,
-}
-publisher = BoundaryHarness()
-publisher._hmb_last_generator_snapshot = {
-    "schema": agent._AGENT_GENERATOR_SNAPSHOT_SCHEMA,
-    "version": agent._AGENT_GENERATOR_SNAPSHOT_VERSION,
-    **shot_context,
-    "final_text_sha256": agent._prompt_text_sha256(final_text),
-}
-publication = publisher._hmb_commit_remote_prompt_publication(final_text)
-assert publication["final_text"] == final_text
-assert publication["final_text_sha256"] == agent._prompt_text_sha256(final_text)
-assert publication["shot_uuid"] == "shot-regression"
-assert publisher._hmb_remote_prompt_publication == publication
-
-empty_publisher = BoundaryHarness()
-empty_publisher._hmb_last_generator_snapshot = {
-    "schema": agent._AGENT_GENERATOR_SNAPSHOT_SCHEMA,
-    "version": agent._AGENT_GENERATOR_SNAPSHOT_VERSION,
-    **shot_context,
-    "final_text_sha256": agent._prompt_text_sha256(""),
-}
-try:
-    empty_publisher._hmb_commit_remote_prompt_publication("")
-except RuntimeError as exc:
-    assert str(exc) == "HMB Agent Shot result snapshot is unavailable."
-else:
-    raise AssertionError("Empty Agent output was published to a Shot.")
-assert empty_publisher._hmb_remote_prompt_publication == {}
-
-
-# Guard the actual process orchestration: sanitizer and Shot publication remain
-# present, while the deleted client-side semantic manifest/phrase-rewrite APIs
-# remain absent. This intentionally does not recreate those old validators.
+# Guard the actual process orchestration: the sanitizer remains, while the
+# deleted client-side semantic validators and the obsolete second Agent ->
+# Generator snapshot/publication/freshness channel remain absent. The native
+# Agent output parameter is now the only downstream prompt publication.
 process_source = textwrap.dedent(inspect.getsource(agent.HMBAgentLibrary.process))
 process_tree = ast.parse(process_source)
 called_names: set[str] = set()
@@ -176,7 +125,6 @@ for node in ast.walk(process_tree):
         called_names.add(node.func.attr)
 
 assert "_secure_hmb_outputs" in called_names
-assert "_hmb_commit_remote_prompt_publication" in called_names
 assert "strip" in called_names  # the sole success criterion is nonempty text
 for obsolete_semantic_api in (
     "_build_final_output_semantic_manifest",
@@ -187,4 +135,34 @@ for obsolete_semantic_api in (
     assert obsolete_semantic_api not in called_names
     assert not hasattr(agent, obsolete_semantic_api)
 
-print("HMB Agent generator natural-language publication boundary regression: PASS")
+obsolete_agent_publication_apis = (
+    "_hmb_generator_shot_snapshot",
+    "_hmb_generator_prompt_source_node",
+    "_hmb_commit_remote_prompt_publication",
+    "_hmb_invalidate_remote_prompt_publication",
+    "_invalidate_generator_authority_for_prompt_change",
+    "_invalidate_stale_generator_authority_for_prompt",
+    "_hmb_remote_prompt_publication_for_generator",
+)
+for obsolete_api in obsolete_agent_publication_apis:
+    assert obsolete_api not in called_names
+    assert not hasattr(agent.HMBAgentLibrary, obsolete_api)
+
+for obsolete_constant in (
+    "_AGENT_GENERATOR_SNAPSHOT_SCHEMA",
+    "_AGENT_GENERATOR_SNAPSHOT_VERSION",
+    "_AGENT_REMOTE_PROMPT_PUBLICATION_SCHEMA",
+    "_AGENT_REMOTE_PROMPT_PUBLICATION_VERSION",
+):
+    assert not hasattr(agent, obsolete_constant)
+
+agent_source = inspect.getsource(agent.HMBAgentLibrary)
+for obsolete_field in (
+    "_hmb_last_generator_snapshot",
+    "_hmb_remote_prompt_publication",
+    "_hmb_remote_prompt_revision",
+    "_hmb_remote_prompt_source_token",
+):
+    assert obsolete_field not in agent_source
+
+print("HMB Agent natural-language output / no second publication boundary: PASS")

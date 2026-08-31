@@ -501,7 +501,11 @@ const verifiedImageMerge = widget.hmbMergePromptRevisionAxes(
 );
 assert.equal(verifiedImageMerge.images[0].label, "Verified source label");
 assert.equal(verifiedImageMerge.images[0].image_main_type, "Environment / Background");
-assert.equal(verifiedImageMerge.images[0].image_sub_type, "Main Background");
+assert.equal(
+  verifiedImageMerge.images[0].image_sub_type,
+  "Full Appearance",
+  "Prompt-owned Sub Type must survive a source revision even when Main Type is registered.",
+);
 assert.equal(verifiedImageMerge.images[0].frame_range_intent.enabled, true);
 assert.deepEqual(verifiedImageMerge.images[0].frame_range_intent.ranges, [{ start: 21, end: 35 }]);
 
@@ -542,10 +546,10 @@ const verifiedLookOverrideMerge = widget.hmbMergePromptRevisionAxes(
 const verifiedLookOverrideRow = verifiedLookOverrideMerge.images[0];
 assert.equal(verifiedLookOverrideRow.asset_image_sub_type_candidate, "Render Look");
 assert.equal(verifiedLookOverrideRow.image_main_type, "Look Reference");
-assert.equal(verifiedLookOverrideRow.image_sub_type, "Render Look");
-assert.equal(verifiedLookOverrideRow.source_type, "Color / Look Reference");
-assert.equal(verifiedLookOverrideRow.scope, "Render look only");
-assert.equal(verifiedLookOverrideRow.owner, "");
+assert.equal(verifiedLookOverrideRow.image_sub_type, "Scale");
+assert.equal(verifiedLookOverrideRow.source_type, "Role Required / Select Source Type");
+assert.equal(verifiedLookOverrideRow.scope, "");
+assert.equal(verifiedLookOverrideRow.owner, "Camera / Composition");
 assert.deepEqual(verifiedLookOverrideRow.color_picks, [""]);
 
 const verifiedLookDefaultMerge = widget.hmbMergePromptRevisionAxes(
@@ -582,8 +586,8 @@ const verifiedLookDefaultMerge = widget.hmbMergePromptRevisionAxes(
 );
 assert.equal(
   verifiedLookDefaultMerge.images[0].image_sub_type,
-  "Render Look",
-  "A stale registered default is not a Prompt override and must not defeat a newer Asset registration.",
+  "Color Mood",
+  "Prompt-owned Sub Type must survive regardless of the registered asset default.",
 );
 assert.equal(
   verifiedLookDefaultMerge.images[0].owner,

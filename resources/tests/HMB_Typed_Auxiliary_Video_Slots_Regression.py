@@ -169,9 +169,7 @@ def state_with(*items: dict) -> dict:
 # metadata-based so a later user reorder does not change semantic authority.
 assert picker.PRIMARY_COLOR_VIDEO_SLOT == 1
 assert tuple(picker.AUXILIARY_VIDEO_SLOTS) == AUXILIARY_SLOTS
-assert "Maya Preview / Playblast" in prompt.PRIMARY_VIDEO_SOURCE_TYPES
-assert "Motion Reference" in prompt.PRIMARY_VIDEO_SOURCE_TYPES
-assert "Unified Shot-Control Video" in prompt.PRIMARY_VIDEO_SOURCE_TYPES
+assert not hasattr(prompt, "PRIMARY_VIDEO_SOURCE_TYPES")
 assert not hasattr(picker, "DEPTH_VIDEO_SLOT")
 assert not hasattr(picker, "MOTION_GUIDE_VIDEO_SLOT")
 for runtime_path in (ROOT / "HMBVideoPickerLibrary.py", ROOT / "HMBPromptLibrary.py"):
@@ -750,7 +748,7 @@ unverified_job = json.loads(
     unverified_lines[unverified_lines.index("HMB JOB DATA (JSON):") + 1]
 )
 assert unverified_job["videos"][1]["video"] == "@video2"
-assert unverified_job["videos"][1]["source_type"] == "Role Required / Select Video Type"
+assert unverified_job["videos"][1]["source_type"] == ""
 assert "companion" not in unverified_job["videos"][1]
 
 

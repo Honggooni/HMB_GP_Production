@@ -197,6 +197,10 @@ jobs:
           $artifact = Join-Path $env:RUNNER_TEMP $env:HMB_RUNTIME_ARCHIVE
           python tools/package_runtime_release.py --output $artifact
           python tools/package_runtime_release.py --check-output --output $artifact
+      - name: Require tested even-to-odd runtime parity
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        shell: pwsh
+        run: python tools/package_runtime_release.py --check-parity-proof .github/hmb-release-parity.json
       - name: Prepare tagged team distribution
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh

@@ -38,7 +38,6 @@ class FakeAgent:
 
 
 node = object.__new__(agent.HMBAgentLibrary)
-node._hmb_rules_active = True
 node._last_raw_output = None
 node.parameter_output_values = {}
 
@@ -48,63 +47,84 @@ def set_value(self, name: str, value: object, *args, **kwargs) -> None:
 
 
 node.set_parameter_value = MethodType(set_value, node)
-fake_agent = FakeAgent()
-result = node._process(fake_agent, "protected prompt")
-assert result is fake_agent
-assert fake_agent.tasks[0].prompt_driver.stream is False
-assert fake_agent.run_calls == [("protected prompt",)]
-assert node._last_raw_output == "FINAL NONSTREAMING RESULT"
-assert node.parameter_output_values["output"] == "FINAL NONSTREAMING RESULT"
+base_agent = agent.HMBAgentLibrary.__mro__[1]
+had_base_process = hasattr(base_agent, "_process")
+original_base_process = getattr(base_agent, "_process", None)
+native_calls: list[tuple[object, object]] = []
 
 
-class TaskOutputAgent(FakeAgent):
-    def __init__(self) -> None:
-        super().__init__()
-        self.output = None
-        self.tasks[0].output = FakeOutput("")
-
-    def run(self, *args: object) -> None:
-        self.run_calls.append(args)
-        self.tasks[0].output = FakeOutput("FINAL TASK OUTPUT")
+def native_process(self, native_agent, native_prompt):
+    native_calls.append((native_agent, native_prompt))
+    return native_agent
 
 
-task_output_agent = TaskOutputAgent()
-assert node._process(task_output_agent, "protected prompt") is task_output_agent
-assert node.parameter_output_values["output"] == "FINAL TASK OUTPUT"
-
-
-class ErrorArtifact:
-    def __str__(self) -> str:
-        return "private provider payload"
-
-
-class InnerErrorAgent(FakeAgent):
-    def run(self, *args: object) -> None:
-        self.run_calls.append(args)
-        self.output = FakeOutput(ErrorArtifact())
-
-
+setattr(base_agent, "_process", native_process)
 try:
-    node._process(InnerErrorAgent(), "protected prompt")
-except RuntimeError as exc:
-    assert "error artifact" in str(exc)
-else:
-    raise AssertionError("inner ErrorArtifact was published as FINAL TEXT")
-assert node._hmb_native_failure_code == "MODEL_PROVIDER"
+    for rules_active in (False, True):
+        node._hmb_rules_active = rules_active
+        fake_agent = FakeAgent()
+        result = node._process(fake_agent, "native prompt")
+        assert result is fake_agent
+        assert fake_agent.tasks[0].prompt_driver.stream is True
+        assert fake_agent.run_calls == []
+finally:
+    if had_base_process:
+        setattr(base_agent, "_process", original_base_process)
+    else:
+        delattr(base_agent, "_process")
+assert [prompt for _native_agent, prompt in native_calls] == [
+    "native prompt", "native prompt",
+]
 
-
-class MissingTaskAgent:
-    tasks: list[object] = []
-
-
+# Protected HMB execution now has Standard Agent input parity: only the exact
+# authenticated prompt bytes are substituted, while ordinary scalar/list
+# inputs and caller rulesets remain native inputs.
+had_base_get = hasattr(base_agent, "get_parameter_value")
+had_base_get_list = hasattr(base_agent, "get_parameter_list_value")
+original_base_get = getattr(base_agent, "get_parameter_value", None)
+original_base_get_list = getattr(base_agent, "get_parameter_list_value", None)
+native_values = {
+    "prompt": "VISIBLE PROMPT",
+    "additional_context": "CALLER CONTEXT",
+    "agent_memory": {"runs": [{"input": "before", "output": "before"}]},
+    "output_schema": {"type": "object"},
+    "include_details": True,
+}
+native_lists = {
+    "rulesets": ["CALLER RULE"],
+    "tools": ["CALLER TOOL"],
+}
+setattr(base_agent, "get_parameter_value", lambda _self, name: native_values.get(name))
+setattr(base_agent, "get_parameter_list_value", lambda _self, name: native_lists.get(name, []))
 try:
-    node._process(MissingTaskAgent(), "protected prompt")
-except RuntimeError as exc:
-    assert "host adapter" in str(exc)
-else:
-    raise AssertionError("missing Standard Agent task was not rejected")
-assert node._hmb_native_failure_stage == "build_agent"
-assert node._hmb_native_failure_code == "HOST_ADAPTER"
+    node._hmb_rules_active = True
+    node._hmb_runtime_prompt = "PRIVATE RUNTIME PROMPT"
+    node._hmb_native_prompt_read_active = False
+    node._hmb_ruleset_names = ("a" * 32, "b" * 32)
+    node._hmb_policy_rules = ["project-1", "project-2", "project-3", "project-4"]
+    node._hmb_binding_rules = ["shot-1", "shot-2", "shot-3", "shot-4"]
+    assert node.get_parameter_value("prompt") == "VISIBLE PROMPT"
+    assert node.get_parameter_value("additional_context") == "CALLER CONTEXT"
+    assert node.get_parameter_value("agent_memory") == native_values["agent_memory"]
+    assert node.get_parameter_value("output_schema") == native_values["output_schema"]
+    assert node.get_parameter_value("include_details") is True
+    assert node.get_parameter_list_value("tools") == ["CALLER TOOL"]
+    merged_rules = node.get_parameter_list_value("rulesets")
+    assert merged_rules[0] == "CALLER RULE"
+    assert [entry["name"] for entry in merged_rules[1:]] == ["a" * 32, "b" * 32]
+    node._hmb_native_prompt_read_active = True
+    assert node.get_parameter_value("prompt") == "PRIVATE RUNTIME PROMPT"
+finally:
+    node._hmb_rules_active = False
+    node._hmb_native_prompt_read_active = False
+    if had_base_get:
+        setattr(base_agent, "get_parameter_value", original_base_get)
+    else:
+        delattr(base_agent, "get_parameter_value")
+    if had_base_get_list:
+        setattr(base_agent, "get_parameter_list_value", original_base_get_list)
+    else:
+        delattr(base_agent, "get_parameter_list_value")
 
 
 class RateLimitError(RuntimeError):
@@ -116,11 +136,10 @@ assert agent._hmb_native_failure_code(RateLimitError("private provider text")) =
 )
 assert agent._hmb_native_failure_code(KeyError("text")) == "HOST_ADAPTER"
 
-protected_source = inspect.getsource(
-    agent.HMBAgentLibrary._run_protected_agent_non_streaming
-)
-assert ".run_stream(" not in protected_source
-assert "prompt_driver.stream = False" in protected_source
+process_adapter_source = inspect.getsource(agent.HMBAgentLibrary._process)
+assert "_run_protected_agent_non_streaming" not in process_adapter_source
+assert "prompt_driver.stream = False" not in process_adapter_source
+assert "native_processor" in process_adapter_source
 
 process_source = inspect.getsource(agent.HMBAgentLibrary.process)
 for retired_gate in (
@@ -218,29 +237,4 @@ assert node._secure_hmb_outputs() is False
 assert node.parameter_output_values["output"] == "ordinary generator instruction"
 assert node._hmb_last_sanitizer_status == "clean"
 
-# Only mode remains the installed Standard Agent implementation. The temporary
-# base method keeps this assertion runnable in public CI where Griptape itself
-# may not be installed and HMBAgentLibrary therefore uses the lightweight stub.
-base_agent = agent.HMBAgentLibrary.__mro__[1]
-had_base_process = hasattr(base_agent, "_process")
-original_base_process = getattr(base_agent, "_process", None)
-only_calls: list[tuple[object, object]] = []
-
-
-def only_process(self, native_agent, native_prompt):
-    only_calls.append((native_agent, native_prompt))
-    return "ONLY NATIVE RESULT"
-
-
-setattr(base_agent, "_process", only_process)
-try:
-    node._hmb_rules_active = False
-    assert node._process("native-agent", "native prompt") == "ONLY NATIVE RESULT"
-finally:
-    if had_base_process:
-        setattr(base_agent, "_process", original_base_process)
-    else:
-        delattr(base_agent, "_process")
-assert only_calls == [("native-agent", "native prompt")]
-
-print("HMB_AGENT_CLOUD_NONSTREAMING=PASS")
+print("HMB_AGENT_STANDARD_PROCESSOR_PARITY=PASS")

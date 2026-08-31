@@ -129,7 +129,7 @@ assert.equal(
   "A click must outline its card locally before the host round trip.",
 );
 assert.equal(feedbackAttributes.get("aria-pressed"), "true");
-assert.equal(trayCount.textContent, "1/30");
+assert.equal(trayCount.textContent, "1/50");
 assert.equal(
   tray.children[0]?.getAttribute?.("data-selected-key"),
   "asset-feedback",

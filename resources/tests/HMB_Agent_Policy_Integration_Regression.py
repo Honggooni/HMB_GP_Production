@@ -15,10 +15,7 @@ from _hmb_private_policy_fixture import (
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.7.15"
-EXPECTED_POLICY_VERSION = "2026-08-27.agent-shot-quality.v4.5"
-EXPECTED_CONTRACT_SHA256 = "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
-EXPECTED_SERVER_POLICY_SHA256 = "228b54e55dd4167f4cb58f8bdbdb8762818a636018180fe1ae97f7a023ac2144"
+EXPECTED_RELEASE_VERSION = "0.7.17"
 EXPECTED_SIGNING_KEY_ID = "hmb-policy-local-2026-08-r1"
 PRIVATE_SIGNED_POLICY_FIXTURE = (
     ROOT
@@ -44,20 +41,10 @@ prompt = load("HMBPromptLibrary")
 
 sealed = read_private_policy_fixture_if_available()
 assert sealed is not None
-assert hashlib.sha256(sealed).hexdigest() == EXPECTED_SERVER_POLICY_SHA256
 original_policy_reader = agent._hmb._read_agent_policy_envelope
 _fixture_reader, installed_sealed = install_private_policy_reader(agent._hmb)
 assert _fixture_reader is original_policy_reader
 assert installed_sealed == sealed
-
-assert agent._prompt_policy_source_identity() == (
-    prompt.PROMPT_POLICY_SOURCE_VERSION,
-    prompt.PROMPT_POLICY_SOURCE_CONTRACT_SHA256,
-)
-assert agent._assert_prompt_policy_identity_matches_signed_runtime() == (
-    EXPECTED_POLICY_VERSION,
-    EXPECTED_CONTRACT_SHA256,
-)
 
 policy, binding = agent._hmb._load_verified_behavior_documents()
 policy = policy.strip()
@@ -67,11 +54,11 @@ identity = agent._hmb.get_internal_policy_identity()
 assert f'version = "{EXPECTED_RELEASE_VERSION}"' in (
     ROOT / "pyproject.toml"
 ).read_text(encoding="utf-8")
-assert identity == {
-    "version": EXPECTED_POLICY_VERSION,
-    "contract_sha256": EXPECTED_CONTRACT_SHA256,
-    "envelope_sha256": hashlib.sha256(sealed).hexdigest(),
-}
+assert isinstance(identity["version"], str) and identity["version"]
+assert identity["contract_sha256"] == hashlib.sha256(
+    policy.encode("utf-8") + b"\0" + binding.encode("utf-8")
+).hexdigest()
+assert identity["envelope_sha256"] == hashlib.sha256(sealed).hexdigest()
 policy_rule_list = agent._split_behavior_rules(policy, 4)
 binding_rule_list = agent._split_behavior_rules(binding, 4)
 assert len(policy_rule_list) == 4
@@ -79,7 +66,7 @@ assert len(binding_rule_list) == 4
 assert all(rule.strip() for rule in policy_rule_list + binding_rule_list)
 assert policy_rule_list != binding_rule_list
 
-# The signed/compressed v4.2 envelope is read from the private test fixture only.
+# The signed/compressed server envelope is read from the private test fixture only.
 # Runtime and public packages never use this path or carry a local fallback.
 assert policy.encode("utf-8") not in sealed
 assert binding.encode("utf-8") not in sealed
@@ -92,25 +79,13 @@ assert envelope["key_id"] == EXPECTED_SIGNING_KEY_ID
 assert envelope["payload_sha256"]
 assert envelope["signature"]
 payload = agent._hmb._decode_signed_agent_policy_envelope(sealed)
-agent._hmb._validate_agent_policy_payload(payload)
+validated_payload = agent._hmb._validate_agent_policy_payload(payload)
 assert payload["schema"] == "hmb-agent-policy-v3"
-assert payload["final_policy_version"] == EXPECTED_POLICY_VERSION
-assert payload["final_motion_look_policy_sha256"] == EXPECTED_CONTRACT_SHA256
+assert payload["final_policy_version"] == identity["version"]
 assert hashlib.sha256(policy.encode("utf-8")).hexdigest() == payload["policy_sha256"]
 assert hashlib.sha256(binding.encode("utf-8")).hexdigest() == payload["binding_sha256"]
-final_clauses = [str(item) for item in payload["final_motion_look_policy_clauses"]]
-assert len(final_clauses) == 6
-assert hashlib.sha256("\n\n".join(final_clauses).encode("utf-8")).hexdigest() == (
-    EXPECTED_CONTRACT_SHA256
-)
-for clause in final_clauses:
-    assert policy.count(clause) == 1
-    assert binding.count(clause) == 1
-assert len(payload["video_appearance_isolation_clauses"]) == 2
-assert all(
-    clause in final_clauses
-    for clause in payload["video_appearance_isolation_clauses"]
-)
+assert validated_payload["policy_sha256"] == payload["policy_sha256"]
+assert validated_payload["binding_sha256"] == payload["binding_sha256"]
 
 
 def assert_policy_rejected(encoded: bytes) -> None:
@@ -138,7 +113,6 @@ assert_policy_rejected(
 for required_field in (
     "policy_sha256",
     "binding_sha256",
-    "final_motion_look_policy_sha256",
     "final_policy_version",
 ):
     altered_payload = dict(payload)
@@ -159,8 +133,6 @@ empty_hmb_prompt = prompt._build_prompt_package(empty_prompt_state)
 empty_hmb_machine_prompt = prompt._build_data_only_prompt_package(
     empty_prompt_state
 )
-assert not agent._is_hmb_prompt_library_payload(plain_prompt)
-assert agent._is_hmb_prompt_library_payload(empty_hmb_prompt)
 assert policy not in empty_hmb_prompt
 assert binding not in empty_hmb_prompt
 
@@ -191,6 +163,7 @@ def exercise_agent_route(
     node._hmb_binding_rules = []
     node._hmb_ruleset_names = ("", "")
     node._hmb_native_calls_this_process = 0
+    node.parameter_output_values = {"agent": {}, "output": ""}
     paired_source = None
     if canonical_prompt_connected:
         assert paired_machine_prompt
@@ -232,6 +205,7 @@ def exercise_agent_route(
                 len(self._hmb_binding_rules),
             )
         )
+        self.parameter_output_values["output"] = "native-complete"
         if False:
             yield None
         return "native-complete"
@@ -370,7 +344,6 @@ direct_source_payloads = (
     "HMB_GP_Production\nTARGET GENERATOR:\nincomplete but readable user intent",
 )
 for direct_payload in direct_source_payloads:
-    assert not agent._is_hmb_prompt_library_payload(direct_payload)
     assert exercise_agent_route(direct_payload) == (False, False, 0, 0, 0, False)
 
 # Empty, image-only, video-described, and mixed typed Prompt packages all
@@ -414,7 +387,6 @@ payload_variant_states = (
 for variant_state in payload_variant_states:
     variant = prompt._build_prompt_package(variant_state)
     machine_variant = prompt._build_data_only_prompt_package(variant_state)
-    assert agent._is_hmb_prompt_library_payload(variant)
     assert exercise_agent_route(
         variant,
         canonical_prompt_connected=True,
@@ -477,8 +449,8 @@ assert_policy_rejected(tampered_policy_bytes)
 assert agent._hmb.get_internal_policy_identity() == identity
 
 # Runtime source contains no stable ruleset labels or legacy synthesized-policy
-# fallback. Trusted signing, self-hashes, stable contract, and strict 4+4 shape
-# are the gate; a compatible signed document revision is not byte-pinned.
+# fallback. Trusted signing and document self-hashes are the transport gate;
+# signed server version and wording are not byte-pinned.
 agent_source = (ROOT / "HMBAgentLibrary.py").read_text(encoding="utf-8")
 common_source = (ROOT / "_hmb_common.py").read_text(encoding="utf-8")
 assert "secrets.token_hex(16)" in agent_source
@@ -496,5 +468,5 @@ agent._hmb._read_agent_policy_envelope = original_policy_reader
 
 print(
     "HMB independent hybrid Agent policy integration regression: PASS "
-    f"(15 compositions / 8 Agent subsets; contract {EXPECTED_CONTRACT_SHA256[:12]})"
+    f"(15 compositions / 8 Agent subsets; contract {identity['contract_sha256'][:12]})"
 )

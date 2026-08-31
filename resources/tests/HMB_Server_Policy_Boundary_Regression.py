@@ -14,10 +14,16 @@ EXPECTED_URL = "https://192.168.203.245:8443/api/v1/agent-core/dat"
 EXPECTED_HOST = "192.168.203.245"
 EXPECTED_PORT = 8443
 EXPECTED_PATH = "/api/v1/agent-core/dat"
-EXPECTED_VERSION = "2026-08-27.agent-shot-quality.v4.5"
-EXPECTED_CONTRACT_SHA256 = (
-    "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
-)
+RUNTIME_POLICY_VERSION = "server-policy-v5.0-regression"
+RUNTIME_POLICY = "authenticated project policy revision supplied by Broker"
+RUNTIME_BINDING = "authenticated shot binding revision supplied by Broker"
+RUNTIME_POLICY_SHA256 = hashlib.sha256(RUNTIME_POLICY.encode("utf-8")).hexdigest()
+RUNTIME_BINDING_SHA256 = hashlib.sha256(RUNTIME_BINDING.encode("utf-8")).hexdigest()
+RUNTIME_CONTRACT_SHA256 = hashlib.sha256(
+    RUNTIME_POLICY.encode("utf-8")
+    + b"\0"
+    + RUNTIME_BINDING.encode("utf-8")
+).hexdigest()
 LOAD_FAILURE = "HMB_GP_Agent_Library internal rule payload could not be loaded."
 
 
@@ -40,8 +46,8 @@ assert common._AGENT_POLICY_BROKER_URL == EXPECTED_URL
 assert common._AGENT_POLICY_BROKER_HOST == EXPECTED_HOST
 assert common._AGENT_POLICY_BROKER_PORT == EXPECTED_PORT
 assert common._AGENT_POLICY_BROKER_PATH == EXPECTED_PATH
-assert common._AGENT_POLICY_VERSION == EXPECTED_VERSION
-assert common._AGENT_POLICY_CONTRACT_SHA256 == EXPECTED_CONTRACT_SHA256
+assert not hasattr(common, "_AGENT_POLICY_VERSION")
+assert not hasattr(common, "_AGENT_POLICY_CONTRACT_SHA256")
 assert common._AGENT_POLICY_ENVELOPE_SCHEMA == "hmb-agent-policy-envelope-v3"
 assert common._AGENT_POLICY_SCHEMA == "hmb-agent-policy-v3"
 assert not hasattr(common, "AGENT_RULE_DATA_PATH_ENV")
@@ -67,6 +73,34 @@ ca_der = ssl.PEM_cert_to_DER_cert(ca_text)
 assert hashlib.sha256(ca_der).hexdigest() == (
     common._AGENT_POLICY_BROKER_CA_DER_SHA256
 )
+
+# Policy wording and revision are server-owned.  The client accepts an
+# arbitrary authenticated revision and checks only the two document digests;
+# the diagnostic contract digest is derived locally from those documents.
+runtime_payload = {
+    "schema": "hmb-agent-policy-v3",
+    "policy": RUNTIME_POLICY,
+    "policy_sha256": RUNTIME_POLICY_SHA256,
+    "binding": RUNTIME_BINDING,
+    "binding_sha256": RUNTIME_BINDING_SHA256,
+    "final_policy_version": RUNTIME_POLICY_VERSION,
+}
+validated_runtime_payload = common._validate_agent_policy_payload(runtime_payload)
+assert validated_runtime_payload["final_policy_version"] == RUNTIME_POLICY_VERSION
+assert validated_runtime_payload["policy_sha256"] == RUNTIME_POLICY_SHA256
+assert validated_runtime_payload["binding_sha256"] == RUNTIME_BINDING_SHA256
+assert (
+    validated_runtime_payload["policy_pair_sha256"]
+    == RUNTIME_CONTRACT_SHA256
+)
+tampered_runtime_payload = dict(runtime_payload)
+tampered_runtime_payload["policy"] += " (tampered)"
+try:
+    common._validate_agent_policy_payload(tampered_runtime_payload)
+except RuntimeError as exc:
+    assert "project rule integrity check failed" in str(exc)
+else:
+    raise AssertionError("policy document digest mismatch was accepted")
 
 
 class FakeSocket:
@@ -229,10 +263,12 @@ else:
     raise AssertionError("uninitialized policy session was accepted")
 
 verified_snapshot = {
-    "policy": "verified project rules",
-    "binding": "verified shot rules",
-    "final_policy_version": EXPECTED_VERSION,
-    "final_motion_look_policy_sha256": EXPECTED_CONTRACT_SHA256,
+    "policy": RUNTIME_POLICY,
+    "binding": RUNTIME_BINDING,
+    "policy_sha256": RUNTIME_POLICY_SHA256,
+    "binding_sha256": RUNTIME_BINDING_SHA256,
+    "final_policy_version": RUNTIME_POLICY_VERSION,
+    "policy_pair_sha256": RUNTIME_CONTRACT_SHA256,
 }
 bootstrap_fetches: list[bool] = []
 real_provenance = common._agent_policy_process_provenance_valid
@@ -256,6 +292,10 @@ assert bootstrap_fetches == [True]
 
 common_source = (ROOT / "_hmb_common.py").read_text(encoding="utf-8")
 agent_source = (ROOT / "HMBAgentLibrary.py").read_text(encoding="utf-8")
+prompt_source = (ROOT / "HMBPromptLibrary.py").read_text(encoding="utf-8")
+package_source = (ROOT / "tools" / "package_runtime_release.py").read_text(
+    encoding="utf-8"
+)
 for retired_marker in (
     "_BUNDLED_AGENT_POLICY_FILE",
     "_AGENT_POLICY_SERVER_UNC",
@@ -265,6 +305,28 @@ for retired_marker in (
     "lru_cache",
 ):
     assert retired_marker not in common_source
+for retired_marker in (
+    "_AGENT_POLICY_VERSION",
+    "_AGENT_POLICY_CONTRACT_SHA256",
+):
+    assert retired_marker not in common_source
+for retired_marker in (
+    "PROMPT_POLICY_SOURCE_VERSION",
+    "PROMPT_POLICY_SOURCE_CONTRACT_SHA256",
+    "PROMPT_POLICY_CANDIDATE_VERSION",
+    "PROMPT_POLICY_CANDIDATE_CONTRACT_SHA256",
+    "PROMPT_POLICY_CANDIDATE_STATUS",
+):
+    assert retired_marker not in prompt_source
+for retired_marker in (
+    "POLICY_VERSION =",
+    "POLICY_CONTRACT_SHA256 =",
+    "assert_release_policy_candidate_is_active",
+):
+    assert retired_marker not in package_source
+assert "_verify_agent_policy_signature(payload_bytes, signature)" in common_source
+assert "hashlib.sha256(policy.encode(\"utf-8\")).hexdigest()" in common_source
+assert "hashlib.sha256(binding.encode(\"utf-8\")).hexdigest()" in common_source
 assert "_bootstrap_agent_policy_session()" in agent_source
 assert "[HMB SERVER POLICY REQUIRED]" in agent._HMB_POLICY_UNAVAILABLE_MESSAGE
 assert "HMB LOCAL POLICY REQUIRED" not in agent_source

@@ -266,7 +266,10 @@ dormant_state["images"][0]["frame_range_bindings"] = {
 }
 assert prompt._build_prompt_package(dormant_state) == baseline_prompt
 normalized_dormant = prompt._normalize_state(dormant_state)["images"][0]
-assert normalized_dormant["frame_range_bindings"] == {}
+assert set(normalized_dormant["frame_range_bindings"]) == {"@video1::Green"}
+assert normalized_dormant["frame_range_bindings"]["@video1::Green"]["ranges"] == [
+    {"start": 1, "end": 48},
+]
 assert normalized_dormant["frame_range_intent"] == {
     "version": 1,
     "enabled": False,
@@ -279,8 +282,8 @@ assert normalized_dormant["frame_range_binding"] is None
 assert normalized_dormant["frame_range_selected_index"] == -1
 
 
-# The Prompt library consumes frame metadata, restores sorted multi-ranges, and
-# emits the section only for a complete valid binding.
+# Prompt publishes authored ranges literally; Picker metadata is context, not
+# a semantic validator or range-rewriting oracle.
 prompt_state = prompt._default_widget_state()
 prompt_state["images"][0].update(
     {
@@ -338,32 +341,45 @@ image["frame_range_bindings"] = {
 }
 compiled = prompt._build_data_only_prompt_package(prompt_state)
 compiled_job = prompt_json_section(compiled, "HMB JOB DATA (JSON):")
-assert compiled_job["frame_ranges"] == [{
+compiled_ranges = {
+    (record["video"], record["marker_color"]): record
+    for record in compiled_job["frame_ranges"]
+}
+assert set(compiled_ranges) == {
+    ("@video1", "Green"),
+    ("@video2", "Green"),
+    ("@video3", "Blue"),
+}
+assert compiled_ranges[("@video2", "Green")] == {
     "image": "@image1",
     "video": "@video2",
     "marker_color": "Green",
     "enabled": True,
     "origin": "manual",
-    "domain": {
-        "start_frame": 1,
-        "end_frame": 144,
-        "frame_count": 144,
-        "fps": 0.0,
-    },
+    "domain": {"start_frame": 1, "end_frame": 144},
     "segments": [
+        {"start_frame": 97, "end_frame": 120},
+        {"start_frame": 121, "end_frame": 144},
         {"start_frame": 1, "end_frame": 48},
-        {"start_frame": 97, "end_frame": 144},
     ],
-    "unresolved_segments": [],
-    "valid": True,
-    "error_codes": [],
-}]
+}
+assert compiled_ranges[("@video1", "Green")]["segments"] == [
+    {"start_frame": 10, "end_frame": 20},
+]
+assert compiled_ranges[("@video3", "Blue")]["segments"] == [
+    {"start_frame": 30, "end_frame": 40},
+]
 
 normalized_image = prompt._normalize_state(prompt_state)["images"][0]
-assert set(normalized_image["frame_range_bindings"]) == {"@video2::Green"}
+assert set(normalized_image["frame_range_bindings"]) == {
+    "@video1::Green",
+    "@video2::Green",
+    "@video3::Blue",
+}
 assert normalized_image["frame_range_bindings"]["@video2::Green"]["ranges"] == [
+    {"start": 97, "end": 120},
+    {"start": 121, "end": 144},
     {"start": 1, "end": 48},
-    {"start": 97, "end": 144},
 ]
 
 range_off_state = json.loads(json.dumps(prompt_state))
@@ -373,7 +389,11 @@ assert prompt_json_section(
     "HMB JOB DATA (JSON):",
 )["frame_ranges"] == []
 normalized_range_off = prompt._normalize_state(range_off_state)["images"][0]
-assert set(normalized_range_off["frame_range_bindings"]) == {"@video2::Green"}
+assert set(normalized_range_off["frame_range_bindings"]) == {
+    "@video1::Green",
+    "@video2::Green",
+    "@video3::Blue",
+}
 assert normalized_range_off["frame_range_binding"] == normalized_range_off[
     "frame_range_bindings"
 ]["@video2::Green"]
@@ -382,10 +402,15 @@ assert normalized_range_off["frame_range_selected_index"] == 0
 range_restarted_state = json.loads(json.dumps(prompt._normalize_state(range_off_state)))
 range_restarted_state["images"][0]["frame_range_intent"]["enabled"] = True
 normalized_range_restarted = prompt._normalize_state(range_restarted_state)["images"][0]
-assert set(normalized_range_restarted["frame_range_bindings"]) == {"@video2::Green"}
+assert set(normalized_range_restarted["frame_range_bindings"]) == {
+    "@video1::Green",
+    "@video2::Green",
+    "@video3::Blue",
+}
 assert normalized_range_restarted["frame_range_bindings"]["@video2::Green"]["ranges"] == [
+    {"start": 97, "end": 120},
+    {"start": 121, "end": 144},
     {"start": 1, "end": 48},
-    {"start": 97, "end": 144},
 ]
 assert normalized_range_restarted["frame_range_binding"] == normalized_range_restarted[
     "frame_range_bindings"
@@ -394,8 +419,9 @@ assert prompt_json_section(
     prompt._build_data_only_prompt_package(range_restarted_state),
     "HMB JOB DATA (JSON):",
 )["frame_ranges"][0]["segments"] == [
+    {"start_frame": 97, "end_frame": 120},
+    {"start_frame": 121, "end_frame": 144},
     {"start_frame": 1, "end_frame": 48},
-    {"start_frame": 97, "end_frame": 144},
 ]
 
 image["frame_range_intent"]["ranges"] = [{"start": 1, "end": 145}]
@@ -403,7 +429,10 @@ invalid_range_job = prompt_json_section(
     prompt._build_data_only_prompt_package(prompt_state),
     "HMB JOB DATA (JSON):",
 )
-assert invalid_range_job["frame_ranges"] == []
+assert invalid_range_job["frame_ranges"][0]["segments"] == [
+    {"start_frame": 1, "end_frame": 145}
+]
+assert "valid" not in invalid_range_job["frame_ranges"][0]
 assert prompt._normalize_state(prompt_state)["images"][0][
     "frame_range_intent"
 ]["ranges"] == [{"start": 1, "end": 145}]
@@ -424,8 +453,8 @@ assert missing_metadata_range["segments"] == [
     {"start_frame": 1, "end_frame": 48},
     {"start_frame": 97, "end_frame": 144},
 ]
-assert missing_metadata_range["valid"] is True
-assert missing_metadata_range["error_codes"] == []
+assert "valid" not in missing_metadata_range
+assert "error_codes" not in missing_metadata_range
 
 
 # Picker metadata is optional when the user supplies an explicit manual frame
@@ -462,17 +491,6 @@ manual_image["frame_range_bindings"]["@video2::Green"] = {
         {"start": 1100, "end": 1110},
     ],
 }
-manual_binding, manual_metadata, manual_errors = prompt._frame_range_binding_validation(
-    manual_state,
-    manual_image,
-    {1, 2},
-)
-assert manual_errors == []
-assert manual_binding is not None
-assert manual_metadata is not None
-assert manual_metadata["origin"] == "manual"
-assert manual_metadata["fps"] == 0.0
-assert (manual_metadata["start_frame"], manual_metadata["end_frame"]) == (1001, 1120)
 manual_compiled = prompt._build_data_only_prompt_package(manual_state)
 manual_range = prompt_json_section(
     manual_compiled,
@@ -481,14 +499,12 @@ manual_range = prompt_json_section(
 assert manual_range["domain"] == {
     "start_frame": 1001,
     "end_frame": 1120,
-    "frame_count": 120,
-    "fps": 0.0,
 }
 assert manual_range["segments"] == [
     {"start_frame": 1010, "end_frame": 1020},
     {"start_frame": 1100, "end_frame": 1110},
 ]
-assert manual_range["valid"] is True
+assert "valid" not in manual_range
 
 normalized_manual = prompt._normalize_state(manual_state)["images"][0]
 normalized_manual_binding = normalized_manual["frame_range_bindings"]["@video2::Green"]
@@ -501,9 +517,15 @@ missing_manual_job = prompt_json_section(
     prompt._build_data_only_prompt_package(missing_manual_end),
     "HMB JOB DATA (JSON):",
 )
-assert missing_manual_job["frame_ranges"] == []
+assert missing_manual_job["frame_ranges"][0]["domain"] == {
+    "start_frame": 1001,
+}
+assert missing_manual_job["frame_ranges"][0]["segments"] == [
+    {"start_frame": 1010, "end_frame": 1020},
+    {"start_frame": 1100, "end_frame": 1110},
+]
 assert prompt._normalize_state(missing_manual_end)["images"][0][
     "frame_range_intent"
 ]["end_frame"] is None
 
-print("HMB Picker frame metadata and Prompt multi-frame range regression: PASS")
+print("HMB Picker metadata and literal Prompt frame range regression: PASS")

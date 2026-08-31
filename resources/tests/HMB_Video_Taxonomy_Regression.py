@@ -77,8 +77,10 @@ expected_migrations = {
     ("FX Reference", "Dust"): ("FX Reference", "FX Effect Only"),
     ("FX Reference", "Particle"): ("FX Reference", "FX Effect Only"),
 }
-assert prompt.VIDEO_TAXONOMY_PAIR_MIGRATIONS == expected_migrations
+assert not hasattr(prompt, "VIDEO_TAXONOMY_PAIR_MIGRATIONS")
+assert not hasattr(prompt, "VIDEO_ROLE_ALIASES")
 for old_pair, canonical_pair in expected_migrations.items():
+    assert prompt._migrate_video_taxonomy_pair(*old_pair) == old_pair
     state = prompt._default_widget_state()
     state["videos"][0].update({
         "present": True,
@@ -89,11 +91,9 @@ for old_pair, canonical_pair in expected_migrations.items():
         "picker_auto_video_sub_type": old_pair[1],
     })
     migrated = prompt._normalize_state(state)["videos"][0]
-    assert (migrated["video_main_type"], migrated["video_sub_type"]) == (
-        canonical_pair
-    )
+    assert (migrated["video_main_type"], migrated["video_sub_type"]) == old_pair
     assert (migrated["source_type"], migrated["control_role"]) == (
-        expected[canonical_pair]
+        "Role Required / Select Video Type", "",
     )
 
 
@@ -119,8 +119,31 @@ for index, ((main_type, sub_type), wire_pair) in enumerate(expected.items(), 1):
     sample_visible = prompt._build_prompt_package(normalized)
 
 
-# Two Original Preview rows remain a Prompt authority conflict; neither row is
-# silently demoted before publication.
+# Main Type alone is broad authored metadata. It remains present in the public
+# job even when no exact wire role can be projected from an optional Sub Type.
+main_only = prompt._default_widget_state()
+main_only["videos"][0].update({
+    "present": True,
+    "label": "main-only-motion.mp4",
+    "video_main_type": "Motion Reference",
+    "video_sub_type": "",
+    "custom_source_type": "authored broad motion context",
+})
+normalized_main_only = prompt._normalize_state(main_only)
+main_only_video = normalized_main_only["videos"][0]
+assert main_only_video["video_main_type"] == "Motion Reference"
+assert main_only_video["video_sub_type"] == ""
+assert main_only_video["custom_source_type"] == "authored broad motion context"
+main_only_job, _main_only_fx = prompt_records(
+    prompt._build_data_only_prompt_package(normalized_main_only)
+)
+assert main_only_job["videos"][0]["video_main_type"] == "Motion Reference"
+assert main_only_job["videos"][0]["video_sub_type"] == ""
+assert main_only_job["videos"][0]["source_type"] == ""
+
+
+# Multiple Original Preview rows are ordinary authored inputs. Prompt neither
+# rejects them nor silently demotes either role before Agent publication.
 multi_primary = prompt._default_widget_state()
 multi_primary["videos"] = []
 for slot in (1, 2):
@@ -133,20 +156,24 @@ for slot in (1, 2):
     })
     multi_primary["videos"].append(row)
 normalized_primary = prompt._normalize_state(multi_primary)
-try:
+primary_job, _primary_fx = prompt_records(
     prompt._build_data_only_prompt_package(normalized_primary)
-except RuntimeError as error:
-    message = str(error)
-    assert "[HMB VIDEO AUTHORITY CONFLICT]" in message
-    assert "@video1" in message and "@video2" in message
-else:
-    raise AssertionError("Multiple Original Preview primaries were published.")
+)
+assert [row["video"] for row in primary_job["videos"]] == [
+    "@video1", "@video2",
+]
+assert [row["label"] for row in primary_job["videos"]] == [
+    "original-1.mp4", "original-2.mp4",
+]
+assert [row["control_role"] for row in primary_job["videos"]] == [
+    "Primary Unified Shot Control", "Primary Unified Shot Control",
+]
 assert [row["control_role"] for row in normalized_primary["videos"]] == [
     "Primary Unified Shot Control", "Primary Unified Shot Control",
 ]
 
 
-# Legacy FX labels normalize to one Prompt-owned canonical role in both records.
+# Legacy FX labels remain authored values; no migration is imposed.
 legacy_fx = prompt._default_widget_state()
 legacy_fx["videos"][0].update({
     "present": True,
@@ -156,15 +183,39 @@ legacy_fx["videos"][0].update({
     "control_role": "FX Behavior Only",
 })
 canonical_fx = prompt._normalize_state(legacy_fx)
-assert canonical_fx["videos"][0]["control_role"] == "FX Effect Only"
+assert canonical_fx["videos"][0]["video_main_type"] == "FX / Simulation Reference"
+assert canonical_fx["videos"][0]["video_sub_type"] == "Explosion"
+assert canonical_fx["videos"][0]["control_role"] == ""
 job, fx = prompt_records(prompt._build_data_only_prompt_package(canonical_fx))
-assert job["videos"][0]["control_role"] == "FX Effect Only"
-assert fx["sources"][0]["selected_role"] == "FX Effect Only"
+assert job["videos"][0]["control_role"] == ""
+assert fx["sources"][0]["role"] == ""
 
 
-# Agent verifies policy identity and transports the exact paired Prompt bytes;
-# it does not revalidate video counts, roles, FX ranges, or provider limits.
-agent._assert_prompt_policy_identity_matches_signed_runtime()
+# Retired one-field role labels are not semantic migration input. Only the
+# current authored Main/Sub pair may derive source/control wire metadata.
+retired_role = prompt._default_widget_state()
+retired_role["videos"][0].update({
+    "present": True,
+    "label": "retired-role.mp4",
+    "role": "Motion / Timing Reference",
+    "source_type": "Future Wire Source",
+    "control_role": "Future Wire Role",
+    "custom_source_type": "Authored custom source",
+    "custom_control_role": "Authored custom role",
+    "custom_video_type": "Retired custom source alias",
+    "custom_video_role": "Retired custom role alias",
+})
+normalized_retired_role = prompt._normalize_state(retired_role)["videos"][0]
+assert normalized_retired_role["video_main_type"] == "Select Video Main Type"
+assert normalized_retired_role["video_sub_type"] == ""
+assert normalized_retired_role["source_type"] == "Role Required / Select Video Type"
+assert normalized_retired_role["control_role"] == ""
+assert normalized_retired_role["custom_source_type"] == "Authored custom source"
+assert normalized_retired_role["custom_control_role"] == "Authored custom role"
+
+
+# Agent transports the exact paired Prompt bytes and does not pin a policy
+# revision or revalidate video counts, roles, FX ranges, or provider limits.
 snapshot = {
     "schema": "hmb-prompt-paired-snapshot",
     "version": 1,
@@ -179,6 +230,5 @@ source = SimpleNamespace(
 assert agent._paired_machine_prompt(
     SimpleNamespace(_hmb_verified_prompt_source_node=source), sample_visible
 ) == sample_machine
-assert agent._is_private_hmb_runtime_prompt(sample_machine)
 
 print("HMB video taxonomy Prompt-authority / opaque Agent boundary: PASS")

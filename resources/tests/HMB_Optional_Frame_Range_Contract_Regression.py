@@ -22,19 +22,6 @@ def parse_machine(state: dict) -> tuple[str, dict, dict]:
     return machine, job, contract
 
 
-def runtime(contract: dict) -> dict:
-    sources = []
-    for source in contract.get("sources", []):
-        item = copy.deepcopy(source)
-        selected = bool(item.get("range_on") and item.get("range_segments"))
-        item["range_mode"] = "selected_segments" if selected else "full_video"
-        item["allowed_segments"] = (
-            copy.deepcopy(item.get("range_segments", [])) if selected else []
-        )
-        sources.append(item)
-    return {"sources": sources, "shared_windows": []}
-
-
 def video(slot: int, source_type: str) -> dict:
     item = prompt._default_video_item(slot)
     taxonomy = {
@@ -97,8 +84,7 @@ def bound_image(*, range_enabled: bool, valid_range: bool) -> dict:
     return item
 
 
-# No FX/Timing source and no Range are ordinary valid inputs. An empty typed
-# source list is never a requirement for the user to add another source.
+# Every active video is represented neutrally, even when no Range is authored.
 empty = prompt._default_widget_state()
 empty["images"] = []
 empty["videos"] = [video(1, "Maya Preview / Playblast")]
@@ -107,11 +93,19 @@ assert empty_job["frame_ranges"] == []
 assert empty_contract == {
     "schema": "hmb-fx-timing-source-facts",
     "version": 3,
-    "valid": True,
-    "errors": [],
-    "sources": [],
+    "sources": [{
+        "video": "@video1",
+        "video_main_type": "Maya Preview / Playblast",
+        "video_sub_type": "Mask",
+        "custom_source_type": "",
+        "role": "Mask / Guide Only",
+        "custom_role": "",
+        "keep_out": "",
+        "range_segments": [],
+        "authored_timing_cues": [],
+    }],
+    "control_bindings": [],
 }
-assert runtime(empty_contract) == {"sources": [], "shared_windows": []}
 
 
 # FX and Timing/Edit Main Types remain full-video sources when the optional
@@ -122,12 +116,8 @@ for main_type in ("FX Reference", "Timing / Edit Reference"):
     no_range["videos"] = [video(1, main_type)]
     _, job, contract = parse_machine(no_range)
     assert job["frame_ranges"] == []
-    assert contract["valid"] is True and contract["errors"] == []
-    assert contract["sources"][0]["role_selected"] is True
-    assert contract["sources"][0]["emitter_binding_declared"] is False
-    assert contract["sources"][0]["range_on"] is False
     assert contract["sources"][0]["range_segments"] == []
-    assert runtime(contract)["sources"][0]["range_mode"] == "full_video"
+    assert set(contract) == {"schema", "version", "sources", "control_bindings"}
 
 
 # Range OFF keeps a dormant authored selection in widget state but publishes
@@ -139,8 +129,7 @@ normalized_off = prompt._normalize_state(copy.deepcopy(range_off))
 assert normalized_off["images"][0]["frame_range_bindings"]
 _, off_job, off_contract = parse_machine(range_off)
 assert off_job["frame_ranges"] == []
-assert off_contract["sources"][0]["range_on"] is False
-assert runtime(off_contract)["sources"][0]["range_mode"] == "full_video"
+assert off_contract["sources"][0]["range_segments"] == []
 
 
 # A valid explicit Range ON selection wins over the source-local full-video
@@ -158,29 +147,16 @@ assert on_job["frame_ranges"] == [{
     "domain": {
         "start_frame": 1,
         "end_frame": 48,
-        "frame_count": 48,
-        "fps": 0.0,
     },
     "segments": [{"start_frame": 12, "end_frame": 24}],
-    "unresolved_segments": [],
-    "valid": True,
-    "error_codes": [],
 }]
-assert on_contract["sources"][0]["range_on"] is True
 assert [
     (segment["start_frame"], segment["end_frame"])
     for segment in on_contract["sources"][0]["range_segments"]
 ] == [(12, 24)]
-on_runtime = runtime(on_contract)["sources"][0]
-assert on_runtime["range_mode"] == "selected_segments"
-assert on_runtime["allowed_segments"] == on_contract["sources"][0][
-    "range_segments"
-]
 
 
-# An incomplete/invalid Range ON selection stays in canonical Prompt state but
-# is omitted from public Agent v1. The source therefore remains full-video and
-# generation cannot be blocked by an optional unfinished edit.
+# Reversed endpoints and segments are still literal authored facts.
 invalid_on = prompt._default_widget_state()
 invalid_on["images"] = [bound_image(range_enabled=True, valid_range=False)]
 invalid_on["videos"] = [video(1, "FX Reference")]
@@ -194,12 +170,21 @@ assert normalized_invalid["images"][0]["frame_range_intent"] == {
     "ranges": [{"start": 30, "end": 20}],
     "selected_index": 0,
 }
-assert invalid_job["frame_ranges"] == []
-assert invalid_contract["valid"] is True
-assert invalid_contract["errors"] == []
-assert invalid_contract["sources"][0]["range_on"] is False
-assert invalid_contract["sources"][0]["range_segments"] == []
-assert runtime(invalid_contract)["sources"][0]["range_mode"] == "full_video"
+assert invalid_job["frame_ranges"][0]["domain"] == {
+    "start_frame": 101,
+    "end_frame": 40,
+}
+assert invalid_job["frame_ranges"][0]["segments"] == [
+    {"start_frame": 30, "end_frame": 20}
+]
+assert "valid" not in invalid_job["frame_ranges"][0]
+assert invalid_contract["sources"][0]["range_segments"] == [{
+    "image": "@image1",
+    "video": "@video1",
+    "marker_color": "Red",
+    "start_frame": 30,
+    "end_frame": 20,
+}]
 
 
 # A bad optional Range attached to a non-FX video also cannot disable an
@@ -211,15 +196,18 @@ isolated["videos"] = [
     video(2, "FX Reference"),
 ]
 _, isolated_job, isolated_contract = parse_machine(isolated)
-assert isolated_job["frame_ranges"] == []
-assert [source["video"] for source in isolated_contract["sources"]] == [
-    "@video2"
+assert isolated_job["frame_ranges"][0]["segments"] == [
+    {"start_frame": 30, "end_frame": 20}
 ]
-assert isolated_contract["sources"][0]["range_on"] is False
-assert runtime(isolated_contract)["sources"][0]["range_mode"] == "full_video"
+assert [source["video"] for source in isolated_contract["sources"]] == [
+    "@video1",
+    "@video2",
+]
+assert isolated_contract["sources"][0]["range_segments"]
+assert isolated_contract["sources"][1]["range_segments"] == []
 
 
 print(
     "HMB optional Frame Range contract regression: PASS "
-    "(empty / off / unset / valid ON priority / invalid ON non-blocking omission)"
+    "(neutral sources / off / unset / literal ON preservation)"
 )

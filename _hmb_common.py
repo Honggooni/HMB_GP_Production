@@ -149,12 +149,6 @@ def _agent_policy_log_stage(stage: str) -> None:
 
 _AGENT_POLICY_ENVELOPE_SCHEMA = "hmb-agent-policy-envelope-v3"
 _AGENT_POLICY_SCHEMA = "hmb-agent-policy-v3"
-# Current package/source baseline metadata. Runtime acceptance intentionally
-# does not compare a signed payload's version to this value.
-_AGENT_POLICY_VERSION = "2026-08-27.agent-shot-quality.v4.5"
-_AGENT_POLICY_CONTRACT_SHA256 = (
-    "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
-)
 _AGENT_POLICY_SIGNATURE_ALGORITHM = "RSASSA-PKCS1-v1_5-SHA256"
 _AGENT_POLICY_SIGNING_KEY_ID = "hmb-policy-local-2026-08-r1"
 _AGENT_POLICY_TRUST_CERTIFICATE_SHA256 = (
@@ -177,35 +171,6 @@ _AGENT_POLICY_RSA_EXPONENT = 65537
 _AGENT_POLICY_ENVELOPE_FIELDS = frozenset(
     {"schema", "algorithm", "key_id", "payload_sha256", "payload", "signature"}
 )
-_AGENT_POLICY_PAYLOAD_FIELDS = frozenset(
-    {
-        "schema",
-        "policy",
-        "policy_sha256",
-        "binding",
-        "binding_sha256",
-        "final_policy_version",
-        "final_motion_look_policy_clauses",
-        "final_motion_look_policy_sha256",
-        "video_appearance_isolation_clauses",
-    }
-)
-_AGENT_POLICY_SHARED_MARKERS = (
-    "HYBRID COMPOSITION INDEPENDENCE:",
-    "MISSING SOURCE AUTHORITY:",
-    "OPTIONAL VIDEO CONTROL:",
-    "COLOR PLAYBLAST ISOLATION WITHOUT DEPENDENCY:",
-    "ADAPTIVE CONFLICT RESOLUTION:",
-    "FINAL OUTPUT CONTINUITY:",
-)
-_AGENT_POLICY_VERSION_PATTERN = re.compile(
-    r"[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])"
-    r"\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
-    r"(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*"
-    r"\.v(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))*"
-)
-
-
 def _load_agent_process_session_module() -> Any:
     """Load one process-stable memory cell across HMB library hot reloads."""
 
@@ -632,18 +597,14 @@ def image_color_pick_choices_for_taxonomy(
     main_type: Any,
     sub_type: Any = "",
 ) -> List[str]:
-    """Return authoring colors without granting Look Reference marker authority."""
-    main = str(main_type or "").strip()
-    sub = str(sub_type or "").strip()
-    if main in IMAGE_CHARACTER_COLOR_MAIN_TYPES:
-        return list(ACTOR_COLOR_PICK_CHOICES)
-    if main in IMAGE_BACKGROUND_COLOR_MAIN_TYPES:
-        return list(OBJECT_COLOR_PICK_CHOICES)
-    if main == "Custom / Context" and sub == "Custom":
-        return list(COLOR_PICK_CHOICES)
-    # Look Reference and Context use their explicit Target rather than a
-    # per-marker video address, so they never expose a Color Pick here.
-    return []
+    """Return every relationship address without interpreting taxonomy.
+
+    Main/Sub values describe the user's intent; they do not grant this shared
+    catalog permission to hide, reject, or reinterpret a Color Pick.  Widgets
+    may present convenient groupings, but the underlying relationship address
+    set is identical for every taxonomy value.
+    """
+    return list(COLOR_PICK_CHOICES)
 
 
 def _try_add(node: Any, element: Any) -> bool:
@@ -1506,24 +1467,26 @@ def _decode_signed_agent_policy_envelope(encoded: bytes) -> Dict[str, Any]:
 
 
 def _validate_agent_policy_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Accept a trusted-signer revision only inside the stable v3 contract."""
-    if set(payload) != {
+    """Accept any authenticated server policy without policing its meaning.
+
+    The signed envelope is the authority for policy version and wording.  The
+    client verifies only the stable transport fields and the two document
+    digests; it must not pin a policy revision, clause list, heading, or
+    semantic contract that could reject a legitimate server update.
+    """
+    required_fields = {
         "schema",
         "policy",
         "policy_sha256",
         "binding",
         "binding_sha256",
         "final_policy_version",
-        "final_motion_look_policy_clauses",
-        "final_motion_look_policy_sha256",
-        "video_appearance_isolation_clauses",
-    }:
+    }
+    if not required_fields.issubset(payload):
         raise RuntimeError("HMB_GP_Agent_Library internal rule payload is incomplete.")
     policy = payload.get("policy")
     binding = payload.get("binding")
     final_policy_version = payload.get("final_policy_version")
-    final_clause_items = payload.get("final_motion_look_policy_clauses")
-    isolation_clause_items = payload.get("video_appearance_isolation_clauses")
     if (
         payload.get("schema") != "hmb-agent-policy-v3"
         or not isinstance(policy, str)
@@ -1533,24 +1496,9 @@ def _validate_agent_policy_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         or not binding
         or binding != binding.strip()
         or not isinstance(final_policy_version, str)
+        or not final_policy_version
+        or final_policy_version != final_policy_version.strip()
         or len(final_policy_version) > 128
-        or _AGENT_POLICY_VERSION_PATTERN.fullmatch(final_policy_version) is None
-        or not isinstance(final_clause_items, list)
-        or not isinstance(isolation_clause_items, list)
-        or len(final_clause_items) != len(_AGENT_POLICY_SHARED_MARKERS)
-        or len(isolation_clause_items) != 2
-        or any(
-            not isinstance(item, str) or not item or item != item.strip()
-            for item in final_clause_items + isolation_clause_items
-        )
-    ):
-        raise RuntimeError("HMB_GP_Agent_Library internal rule payload is incomplete.")
-    final_clauses = tuple(final_clause_items)
-    isolation_clauses = tuple(isolation_clause_items)
-    if (
-        tuple(item.split(":", 1)[0] + ":" for item in final_clauses)
-        != _AGENT_POLICY_SHARED_MARKERS
-        or isolation_clauses != final_clauses[2:4]
     ):
         raise RuntimeError("HMB_GP_Agent_Library internal rule payload is incomplete.")
     expected_policy_hash = payload.get("policy_sha256")
@@ -1577,62 +1525,20 @@ def _validate_agent_policy_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise RuntimeError(
             "HMB_GP_Agent_Library internal shot rule integrity check failed."
         )
-    final_block = "\n\n".join(final_clauses)
-    expected_final_hash = payload.get("final_motion_look_policy_sha256")
-    if (
-        not isinstance(expected_final_hash, str)
-        or not hmac.compare_digest(
-            expected_final_hash,
-            _AGENT_POLICY_CONTRACT_SHA256,
-        )
-        or not hmac.compare_digest(
-            hashlib.sha256(final_block.encode("utf-8")).hexdigest(),
-            expected_final_hash,
-        )
-        or not _has_exact_behavior_structure(policy, 1)
-        or not _has_exact_behavior_structure(binding, 2)
-        or len(final_clauses) != len(set(final_clauses))
-        or len(isolation_clauses) != len(set(isolation_clauses))
-        or any(policy.count(clause) != 1 for clause in final_clauses)
-        or any(binding.count(clause) != 1 for clause in final_clauses)
-        or any(clause not in final_clauses for clause in isolation_clauses)
-    ):
-        raise RuntimeError(
-            "HMB_GP_Agent_Library final motion/look policy integrity check failed."
-        )
+    # This identity is diagnostic only.  It is derived from the authenticated
+    # documents locally instead of trusting or enforcing a server-side clause
+    # inventory field.
+    policy_pair_sha256 = hashlib.sha256(
+        policy.encode("utf-8") + b"\0" + binding.encode("utf-8")
+    ).hexdigest()
     return {
         "policy": policy,
         "binding": binding,
         "binding_sha256": expected_binding_hash,
         "final_policy_version": final_policy_version,
-        "final_motion_look_policy_sha256": expected_final_hash,
+        "policy_pair_sha256": policy_pair_sha256,
         "policy_sha256": expected_policy_hash,
     }
-
-
-def _has_exact_behavior_structure(document: str, behavior_number: int) -> bool:
-    """Require one canonical Behavior header and exactly four non-empty rules."""
-    lines = document.splitlines()
-    if not lines or lines[0] != f"Behavior {behavior_number}":
-        return False
-    body = "\n".join(lines[1:]).strip()
-    matches = list(
-        re.finditer(r"(?m)^(\d+)\. ([A-Z][A-Z0-9_]+)$", body)
-    )
-    if (
-        not matches
-        or matches[0].start() != 0
-        or [match.group(1) for match in matches] != ["1", "2", "3", "4"]
-    ):
-        return False
-    return all(
-        body[
-            match.end() : matches[index + 1].start()
-            if index + 1 < len(matches)
-            else len(body)
-        ].strip()
-        for index, match in enumerate(matches)
-    )
 
 
 def _fetch_verified_agent_rule_payload() -> Dict[str, Any]:
@@ -1717,7 +1623,7 @@ def get_internal_policy_identity() -> Dict[str, str]:
     payload = _load_agent_rule_payload()
     return {
         "version": str(payload["final_policy_version"]),
-        "contract_sha256": str(payload["final_motion_look_policy_sha256"]),
+        "contract_sha256": str(payload["policy_pair_sha256"]),
         "envelope_sha256": str(payload["envelope_sha256"]),
     }
 

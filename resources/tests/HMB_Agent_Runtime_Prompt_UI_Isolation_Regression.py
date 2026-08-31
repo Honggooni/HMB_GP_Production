@@ -43,18 +43,9 @@ node.add_parameter(
 node._ensure_hmb_shot_prompt_input()
 
 visible = "HMB_GP_Production\n\nIMAGE SOURCE:\n@image1 = Jett_02\n"
-machine = "\n".join((
-    "HMB_GP_Production",
-    agent._PUBLIC_JOB_CONTRACT_HEADER,
-    '{"schema":"hmb-public-job-data","version":3,"images":[],"videos":[],"control_only_bindings":[],"frame_ranges":[],"connections":{"image_asset":false,"picker":false}}',
-    agent._FX_TIMING_CONTRACT_HEADER,
-    '{"schema":"hmb-fx-timing-source-facts","version":3,"valid":true,"errors":[],"sources":[]}',
-    agent._USER_DESCRIPTION_DATA_HEADER,
-    "{}",
-    agent._RUNTIME_FX_SCOPE_HEADER,
-    '{"shared_windows":[],"sources":[]}',
-    "",
-))
+# The private Prompt payload is deliberately opaque here. UI isolation must be
+# based on exact active bytes, not recognizable headers or content markers.
+machine = "PRIVATE RUNTIME PROMPT\nopaque authenticated bytes\n"
 node.set_parameter_value(agent._AGENT_SHOT_PROMPT_INPUT_PARAMETER, visible)
 node._hmb_shot_channel_subscription = lambda: {"enabled": True}
 node._refresh_routed_prompt_preview()
@@ -106,12 +97,16 @@ finally:
     else:
         agent._BaseAgent.process = original_base_process
 
-# Also recover a value that an older build already stored directly.
+# An active private prompt is recognized only by exact runtime bytes, never by
+# content markers. A near miss must remain ordinary user-authored text.
 agent.DataNode.set_parameter_value(node, agent._AGENT_PROMPT_INPUT_PARAMETER, machine)
 stored_after_direct_base_set = node._native_parameter_value(
     agent._AGENT_PROMPT_INPUT_PARAMETER
 )
-if agent._is_private_hmb_runtime_prompt(stored_after_direct_base_set):
+assert node._matches_active_private_runtime_prompt(stored_after_direct_base_set)
+assert not node._matches_active_private_runtime_prompt(machine + "\n")
+assert not hasattr(agent, "_is_private_hmb_runtime_prompt")
+if node._matches_active_private_runtime_prompt(stored_after_direct_base_set):
     node._set_native_prompt_preview(visible, enabled=True)
 assert node._native_parameter_value(agent._AGENT_PROMPT_INPUT_PARAMETER) == visible
 assert machine not in node._hmb_prompt_before_preview

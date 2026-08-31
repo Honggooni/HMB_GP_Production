@@ -27,14 +27,48 @@ prompt = load(
 )
 
 
-# Prompt and Agent share one signed contract identity. The local Agent does not
-# interpret policy prose or manufacture a second semantic contract.
-source_identity = agent._prompt_policy_source_identity()
-assert agent._assert_prompt_policy_identity_matches_signed_runtime() == (
-    source_identity
-)
-assert source_identity[0] == prompt.PROMPT_POLICY_SOURCE_VERSION
-assert source_identity[1] == prompt.PROMPT_POLICY_SOURCE_CONTRACT_SHA256
+# Prompt and Agent must not carry a local revision/candidate identity.  The
+# authenticated server documents may advance independently of this package;
+# only their signature and document digests are client-side integrity gates.
+prompt_source = (ROOT / "HMBPromptLibrary.py").read_text(encoding="utf-8")
+agent_source = (ROOT / "HMBAgentLibrary.py").read_text(encoding="utf-8")
+common_source = (ROOT / "_hmb_common.py").read_text(encoding="utf-8")
+for retired_symbol in (
+    "PROMPT_POLICY_SOURCE_VERSION",
+    "PROMPT_POLICY_SOURCE_CONTRACT_SHA256",
+    "PROMPT_POLICY_CANDIDATE_VERSION",
+    "PROMPT_POLICY_CANDIDATE_CONTRACT_SHA256",
+    "PROMPT_POLICY_CANDIDATE_STATUS",
+):
+    assert not hasattr(prompt, retired_symbol), retired_symbol
+    assert retired_symbol not in prompt_source, retired_symbol
+for retired_symbol in (
+    "_prompt_policy_source_identity",
+    "_assert_prompt_policy_identity_matches_signed_runtime",
+):
+    assert not hasattr(agent, retired_symbol), retired_symbol
+    assert retired_symbol not in agent_source, retired_symbol
+for retired_symbol in (
+    "_AGENT_POLICY_VERSION",
+    "_AGENT_POLICY_CONTRACT_SHA256",
+):
+    assert not hasattr(agent._hmb, retired_symbol), retired_symbol
+    assert retired_symbol not in common_source, retired_symbol
+
+runtime_policy = "server-owned policy wording for this runtime"
+runtime_binding = "server-owned binding wording for this runtime"
+runtime_payload = {
+    "schema": "hmb-agent-policy-v3",
+    "policy": runtime_policy,
+    "policy_sha256": hashlib.sha256(runtime_policy.encode("utf-8")).hexdigest(),
+    "binding": runtime_binding,
+    "binding_sha256": hashlib.sha256(runtime_binding.encode("utf-8")).hexdigest(),
+    "final_policy_version": "future-server-revision",
+}
+validated_runtime = agent._hmb._validate_agent_policy_payload(runtime_payload)
+assert validated_runtime["final_policy_version"] == "future-server-revision"
+assert "_verify_agent_policy_signature(payload_bytes, signature)" in common_source
+assert "resources/agent/hmb_agent_core.dat" not in agent_source
 
 
 def sanitizer_node(output: str, agent_state: dict | None = None):
@@ -107,7 +141,6 @@ source = SimpleNamespace(
 assert agent._paired_machine_prompt(
     SimpleNamespace(_hmb_verified_prompt_source_node=source), visible
 ) == machine
-assert agent._is_private_hmb_runtime_prompt(machine)
 assert "BEHAVIOR 1" not in visible
 assert "BEHAVIOR 2" not in visible
 

@@ -87,7 +87,6 @@ def drive(scripted_output: str):
     node._hmb_publication_buffer = {"output": "", "logs": ""}
     node._hmb_scheduler_step_failed = False
     node._hmb_shot_context = {}
-    node._hmb_last_generator_snapshot = {}
     node._hmb_execution_shot_binding = {}
     node._hmb_native_calls_this_process = 0
     node.parameter_output_values = {"agent": {}, "output": "", "logs": ""}
@@ -146,12 +145,6 @@ def drive(scripted_output: str):
     node._run_native_agent_once = MethodType(native_once, node)
     node._set_visible_output = MethodType(set_visible, node)
     node._publish_hmb_execution_block = MethodType(publish_block, node)
-    node._hmb_commit_remote_prompt_publication = MethodType(
-        lambda self, _text: None, node
-    )
-    node._hmb_invalidate_remote_prompt_publication = MethodType(
-        lambda self: None, node
-    )
 
     iterator = node.process()
     result = None
@@ -165,20 +158,15 @@ def drive(scripted_output: str):
         "visible": visible_writes,
         "output": node.parameter_output_values.get("output"),
         "result": result,
-        "snapshot": dict(node._hmb_last_generator_snapshot),
         "injected_rulesets": injected_rulesets,
     }
 
 
-patched_names = (
-    "_paired_machine_prompt",
-    "_assert_prompt_policy_identity_matches_signed_runtime",
-)
+patched_names = ("_paired_machine_prompt",)
 originals = {name: getattr(agent, name) for name in patched_names}
 original_bootstrap = agent._hmb._bootstrap_agent_policy_session
 try:
     agent._paired_machine_prompt = lambda _node, _value: "MACHINE SHOT FACTS"
-    agent._assert_prompt_policy_identity_matches_signed_runtime = lambda: None
     agent._hmb._bootstrap_agent_policy_session = lambda: None
 
     policy_text = drive(LONG_POLICY_DERIVED_RESULT)
@@ -205,7 +193,6 @@ try:
     assert complete_document["calls"] == 1
     assert complete_document["output"] == agent._PUBLIC_OUTPUT_BLOCKED
     assert complete_document["visible"] == [agent._PUBLIC_OUTPUT_BLOCKED]
-    assert complete_document["snapshot"] == {}
 finally:
     for name, value in originals.items():
         setattr(agent, name, value)

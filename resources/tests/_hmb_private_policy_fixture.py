@@ -15,11 +15,6 @@ PRIVATE_SIGNED_POLICY_FIXTURE = (
     / "artifact"
     / "hmb_agent_core.dat"
 )
-EXPECTED_ENVELOPE_SHA256 = (
-    "228b54e55dd4167f4cb58f8bdbdb8762818a636018180fe1ae97f7a023ac2144"
-)
-
-
 def read_private_policy_fixture_if_available() -> bytes | None:
     """Return the internal signed fixture, or None in a clean public checkout."""
 
@@ -41,10 +36,10 @@ def read_private_policy_fixture_if_available() -> bytes | None:
     )
     if not fixture_path.is_file():
         return None
-    encoded = fixture_path.read_bytes()
-    if hashlib.sha256(encoded).hexdigest() != EXPECTED_ENVELOPE_SHA256:
-        raise RuntimeError("Private signed Agent policy fixture identity mismatch.")
-    return encoded
+    # Policy revisions are server-owned.  The production decoder verifies the
+    # envelope signature and document digests; a test-only revision hash must
+    # not reject a newly signed DAT before that real verification runs.
+    return fixture_path.read_bytes()
 
 
 def install_private_policy_reader(common: Any) -> tuple[Callable[[], bytes], bytes]:
@@ -76,11 +71,11 @@ def install_private_policy_reader(common: Any) -> tuple[Callable[[], bytes], byt
         current = session.read_ready()
         expected_identity = (
             validated.get("final_policy_version"),
-            validated.get("final_motion_look_policy_sha256"),
+            validated.get("policy_pair_sha256"),
         )
         current_identity = (
             current.get("final_policy_version"),
-            current.get("final_motion_look_policy_sha256"),
+            current.get("policy_pair_sha256"),
         )
         if current_identity != expected_identity:
             raise RuntimeError("Private Agent policy regression session identity mismatch.")

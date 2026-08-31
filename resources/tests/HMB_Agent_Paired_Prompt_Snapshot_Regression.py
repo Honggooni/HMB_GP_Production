@@ -135,9 +135,10 @@ expect_rejected(
     )
 )
 
-# The fallback exists only for legacy tests/mocks that bypass live topology.
+# Content markers are not source provenance. Tests/mocks that bypass live
+# topology must be rejected even when their input resembles a machine envelope.
 legacy = SimpleNamespace(_hmb_verified_prompt_source_node=None)
-assert agent._paired_machine_prompt(legacy, machine_prompt) == machine_prompt
+expect_rejected(lambda: agent._paired_machine_prompt(legacy, machine_prompt))
 expect_rejected(lambda: agent._paired_machine_prompt(legacy, visible_prompt))
 
 

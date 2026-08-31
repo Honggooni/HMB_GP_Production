@@ -54,10 +54,9 @@ def active_video(slot: int, label: str, source_type: str, control_role: str):
     return item
 
 
-# One image may bind independent Color Pick rows to different videos, but Sub
-# Type is image-level authority. Repeated normalization must preserve the slot
-# array while collapsing legacy per-binding subtype overrides to the first one;
-# marker_video remains only the backwards-compatible alias of the first binding.
+# One image may bind independent Color Pick rows to different videos. Repeated
+# normalization preserves every authored scope/custom scope and slot; the
+# image-level Main/Sub pair does not rewrite those relationship fields.
 state = prompt._default_widget_state()
 state["images"] = [prompt._default_image_item(1)]
 state["images"][0].update(
@@ -95,7 +94,7 @@ assert image["binding_video_slots"] == [1, 3]
 assert image["marker_video"] == 1
 assert image["binding_scopes"] == [
     "Full body / full appearance",
-    "Full body / full appearance",
+    "Head / face only",
 ]
 assert prompt._normalize_state(copy.deepcopy(normalized)) == normalized
 
@@ -112,10 +111,10 @@ custom_scope_image.update(
     }
 )
 prompt._normalize_image_binding_fields(custom_scope_image)
-assert custom_scope_image["binding_scopes"] == ["Custom scope", "Custom scope"]
+assert custom_scope_image["binding_scopes"] == ["Custom scope", "Head / face only"]
 assert custom_scope_image["binding_custom_scopes"] == [
-    "Hero custom binding",
-    "Hero custom binding",
+    "Hero silhouette",
+    "Face detail",
 ]
 
 legacy_owner_state = prompt._default_widget_state()
@@ -138,7 +137,7 @@ legacy_owner_state["images"] = [
 legacy_owner_image = prompt._normalize_state(legacy_owner_state)["images"][0]
 assert legacy_owner_image["binding_scopes"] == [
     "Full body / full appearance",
-    "Full body / full appearance",
+    "Handheld prop",
 ]
 assert legacy_owner_image["owner"] == ""
 
@@ -148,7 +147,7 @@ assert [
     for entry in entries
 ] == [
     (1, "Red", "Full body / full appearance"),
-    (3, "Green", "Full body / full appearance"),
+    (3, "Green", "Head / face only"),
 ]
 
 compiled = prompt._build_data_only_prompt_package(normalized)
@@ -162,10 +161,11 @@ assert compiled_job["images"][0]["bindings"] == [
     {
         "video": "@video3",
         "marker_color": "Green",
-        "target_scope": "Full body / full appearance",
+        "target_scope": "Head / face only",
     },
 ]
-assert agent._is_hmb_prompt_library_payload(compiled)
+assert compiled_job["images"][0]["image_main_type"] == "Character"
+assert compiled_job["images"][0]["image_sub_type"] == "Full Appearance"
 
 
 # The selected Color Pick index owns the Range address. Index 1 must resolve to
@@ -225,16 +225,6 @@ assert current_binding["video_slot"] == "@video3"
 assert current_binding["color_pick"] == "Green"
 assert current_binding["ranges"] == [{"start": 5, "end": 12}]
 
-validated_binding, metadata, errors = prompt._frame_range_binding_validation(
-    range_state,
-    range_image,
-    {1, 3},
-)
-assert errors == []
-assert validated_binding is not None
-assert validated_binding["video_slot"] == "@video3"
-assert metadata is not None
-assert metadata["video_slot"] == "@video3"
 range_compiled = prompt._build_data_only_prompt_package(range_state)
 assert prompt_json_section(
     range_compiled,
@@ -245,16 +235,8 @@ assert prompt_json_section(
     "marker_color": "Green",
     "enabled": True,
     "origin": "manual",
-    "domain": {
-        "start_frame": 1,
-        "end_frame": 24,
-        "frame_count": 24,
-        "fps": 0.0,
-    },
+    "domain": {"start_frame": 1, "end_frame": 24},
     "segments": [{"start_frame": 5, "end_frame": 12}],
-    "unresolved_segments": [],
-    "valid": True,
-    "error_codes": [],
 }]
 
 
@@ -295,7 +277,7 @@ assert "@video3::Green" in inactive["frame_range_bindings"]
 assert inactive["frame_range_color_index"] == 1
 assert inactive["binding_scopes"] == [
     "Full body / full appearance",
-    "Full body / full appearance",
+    "Head / face only",
 ]
 assert inactive["marker_video"] == 1
 
@@ -361,7 +343,7 @@ assert picker_image["color_picks"] == ["Green", "Yellow"]
 assert picker_image["binding_video_slots"] == [2, 3]
 assert picker_image["binding_scopes"] == [
     "Full body / full appearance",
-    "Full body / full appearance",
+    "Head / face only",
 ]
 assert picker_image["picker_auto_color"] == "Green"
 assert picker_image["picker_auto_video"] == 2

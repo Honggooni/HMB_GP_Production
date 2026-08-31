@@ -40,9 +40,10 @@ assert (
     in prompt.VIDEO_SOURCE_TYPE_CHOICES
 )
 assert "Derived Motion Decoding Only" in prompt.VIDEO_CONTROL_ROLE_CHOICES
-assert prompt.VIDEO_ROLE_COMPATIBILITY[
-    "Motion Guide / Retargeting Reference"
-] == {"Derived Motion Decoding Only"}
+assert not hasattr(prompt, "VIDEO_ROLE_COMPATIBILITY")
+assert prompt.VIDEO_TAXONOMY_WIRE_MAP[
+    ("Maya Preview / Playblast", "Motion Guide")
+] == ("Motion Guide / Retargeting Reference", "Derived Motion Decoding Only")
 
 
 # A companion request always binds generation identity to @video1.
