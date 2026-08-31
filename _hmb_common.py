@@ -4,13 +4,11 @@ import base64
 import ctypes
 import hashlib
 import hmac
-import http.client
 import importlib
 import importlib.util
 import json
 import os
 import re
-import ssl
 import stat
 import sys
 import unicodedata
@@ -69,21 +67,12 @@ except Exception:  # Local validation fallback only.
 
 
 ROOT = Path(__file__).resolve().parent
-_AGENT_POLICY_BROKER_URL = "https://192.168.203.245:8443/api/v1/agent-core/dat"
-_AGENT_POLICY_BROKER_HOST = "192.168.203.245"
-_AGENT_POLICY_BROKER_PORT = 8443
-_AGENT_POLICY_BROKER_PATH = "/api/v1/agent-core/dat"
-_AGENT_POLICY_BROKER_CA_FILE = ROOT / "resources" / "tls" / "hmb_agent_broker_ca.pem"
-_AGENT_POLICY_BROKER_CA_DER_SHA256 = (
-    "3eb0a51f18c6b55866e3299585cabb29166b7b158a59bb9741b0bc98b6e96120"
-)
-_AGENT_POLICY_REQUEST_TIMEOUT_SECONDS = 15.0
+_AGENT_POLICY_FILE = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
 _AGENT_POLICY_MAX_ENVELOPE_BYTES = 128 * 1024
 _AGENT_POLICY_MAX_DECOMPRESSED_BYTES = 512 * 1024
 _AGENT_POLICY_MAX_DPAPI_FILE_BYTES = 64 * 1024
 _AGENT_POLICY_MAX_DPAPI_PLAINTEXT_BYTES = 16 * 1024
 _AGENT_POLICY_MAX_BEARER_TOKEN_BYTES = 8192
-_AGENT_POLICY_MAX_CA_PEM_BYTES = 64 * 1024
 _AGENT_POLICY_WINDOWS_REPARSE_POINT = 0x400
 _AGENT_POLICY_BEARER_TOKEN_BYTES = frozenset(
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~+/=-"
@@ -109,29 +98,9 @@ _AGENT_POLICY_DIAGNOSTIC_STAGES = frozenset(
         "provenance_arguments_rejected",
         "provenance_parent_rejected",
         "provenance_probe_exception",
-        "broker_fetch_enter",
-        "broker_private_ssl_context_restored",
-        "broker_tls_context_ready",
-        "broker_connect_enter",
-        "broker_connect_ok",
-        "broker_connect_permission_denied",
-        "broker_connect_refused",
-        "broker_connect_timeout",
-        "broker_connect_tls_failed",
-        "broker_connect_http_failed",
-        "broker_connect_os_failed",
-        "broker_peer_certificate_missing",
-        "broker_peer_pin_mismatch",
-        "broker_tls_peer_verified",
-        "broker_token_ready",
-        "broker_http_200",
-        "broker_http_401",
-        "broker_http_403",
-        "broker_http_429",
-        "broker_http_other",
-        "broker_headers_verified",
-        "broker_envelope_received",
-        "broker_fetch_failed",
+        "local_dat_read_enter",
+        "local_dat_read_ok",
+        "local_dat_read_failed",
         "policy_verify_enter",
         "policy_verified",
         "policy_verify_failed",
@@ -1059,319 +1028,75 @@ def _agent_policy_path_is_reparse(value: os.stat_result) -> bool:
     )
 
 
-def _agent_policy_ca_path_chain() -> tuple[Path, ...]:
-    expected = ROOT / "resources" / "tls" / "hmb_agent_broker_ca.pem"
-    if not _agent_policy_exact_windows_path(str(_AGENT_POLICY_BROKER_CA_FILE), expected):
-        raise RuntimeError("HMB Agent Broker CA is unavailable.")
-    target, root = Path(os.path.abspath(str(expected))), Path(os.path.abspath(str(ROOT)))
-    chain: list[Path] = []
-    current = target
-    while True:
-        chain.append(current)
-        if _agent_policy_exact_windows_path(str(current), root):
-            return tuple(chain)
-        if current.parent == current:
-            raise RuntimeError("HMB Agent Broker CA is unavailable.")
-        current = current.parent
+def _read_agent_policy_envelope() -> bytes:
+    """Read the one signed DAT bundled with this installed HMB runtime."""
 
-
-def _agent_policy_lstat_ca_chain(chain: tuple[Path, ...]) -> tuple[os.stat_result, ...]:
-    values: list[os.stat_result] = []
-    for index, path in enumerate(chain):
-        value = path.lstat()
-        if (
-            _agent_policy_path_is_reparse(value)
-            or (index == 0 and not stat.S_ISREG(value.st_mode))
-            or (index != 0 and not stat.S_ISDIR(value.st_mode))
-        ):
-            raise RuntimeError("HMB Agent Broker CA is unavailable.")
-        values.append(value)
-    return tuple(values)
-
-
-def _canonical_agent_policy_ca_pem(encoded: bytes) -> bytes:
-    if re.search(rb"\r(?!\n)", encoded) is not None:
-        raise RuntimeError("HMB Agent Broker CA is unavailable.")
-    lf_count, crlf_count = encoded.count(b"\n"), encoded.count(b"\r\n")
-    if crlf_count not in (0, lf_count):
-        raise RuntimeError("HMB Agent Broker CA is unavailable.")
-    normalized = encoded.replace(b"\r\n", b"\n")
-    if not normalized.endswith(b"\n"):
-        raise RuntimeError("HMB Agent Broker CA is unavailable.")
+    _agent_policy_log_stage("local_dat_read_enter")
+    expected = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
     try:
-        normalized.decode("ascii")
-    except UnicodeError as exc:
-        raise RuntimeError("HMB Agent Broker CA is unavailable.") from exc
-    lines = normalized[:-1].split(b"\n")
-    if (
-        len(lines) < 3
-        or lines[0] != b"-----BEGIN CERTIFICATE-----"
-        or lines[-1] != b"-----END CERTIFICATE-----"
-    ):
-        raise RuntimeError("HMB Agent Broker CA is unavailable.")
-    body = lines[1:-1]
-    if (
-        not body
-        or any(
-            len(line) != 64
-            or re.fullmatch(rb"[A-Za-z0-9+/]{64}", line) is None
-            for line in body[:-1]
-        )
-        or not 4 <= len(body[-1]) <= 64
-        or len(body[-1]) % 4 != 0
-        or re.fullmatch(rb"[A-Za-z0-9+/]+={0,2}", body[-1]) is None
-    ):
-        raise RuntimeError("HMB Agent Broker CA is unavailable.")
-    try:
-        if not base64.b64decode(b"".join(body), validate=True):
-            raise ValueError("empty certificate")
-    except (ValueError, TypeError) as exc:
-        raise RuntimeError("HMB Agent Broker CA is unavailable.") from exc
-    return normalized
+        if not _agent_policy_exact_windows_path(str(_AGENT_POLICY_FILE), expected):
+            raise RuntimeError("HMB Agent policy DAT is unavailable.")
+        target = Path(os.path.abspath(str(expected)))
+        root = Path(os.path.abspath(str(ROOT)))
+        chain: list[Path] = []
+        current = target
+        while True:
+            chain.append(current)
+            if _agent_policy_exact_windows_path(str(current), root):
+                break
+            if current.parent == current:
+                raise RuntimeError("HMB Agent policy DAT is unavailable.")
+            current = current.parent
 
+        def lstat_chain() -> tuple[os.stat_result, ...]:
+            values: list[os.stat_result] = []
+            for index, path in enumerate(chain):
+                value = path.lstat()
+                if (
+                    _agent_policy_path_is_reparse(value)
+                    or (index == 0 and not stat.S_ISREG(value.st_mode))
+                    or (index != 0 and not stat.S_ISDIR(value.st_mode))
+                ):
+                    raise RuntimeError("HMB Agent policy DAT is unavailable.")
+                values.append(value)
+            return tuple(values)
 
-def _read_agent_policy_broker_ca_pem() -> bytes:
-    try:
-        chain = _agent_policy_ca_path_chain()
-        before_chain = _agent_policy_lstat_ca_chain(chain)
+        before_chain = lstat_chain()
         before_path = before_chain[0]
-        if not 0 < before_path.st_size <= _AGENT_POLICY_MAX_CA_PEM_BYTES:
-            raise RuntimeError("HMB Agent Broker CA is unavailable.")
-        with chain[0].open("rb") as stream:
+        if not 0 < before_path.st_size <= _AGENT_POLICY_MAX_ENVELOPE_BYTES:
+            raise RuntimeError("HMB Agent policy DAT is unavailable.")
+        with target.open("rb") as stream:
             before_handle = os.fstat(stream.fileno())
             if (
                 not stat.S_ISREG(before_handle.st_mode)
-                or not 0 < before_handle.st_size <= _AGENT_POLICY_MAX_CA_PEM_BYTES
+                or not 0 < before_handle.st_size <= _AGENT_POLICY_MAX_ENVELOPE_BYTES
                 or _agent_policy_cross_view_identity(before_handle)
                 != _agent_policy_cross_view_identity(before_path)
             ):
-                raise RuntimeError("HMB Agent Broker CA is unavailable.")
-            encoded = stream.read(_AGENT_POLICY_MAX_CA_PEM_BYTES + 1)
+                raise RuntimeError("HMB Agent policy DAT is unavailable.")
+            encoded = stream.read(_AGENT_POLICY_MAX_ENVELOPE_BYTES + 1)
             after_handle = os.fstat(stream.fileno())
-        after_chain = _agent_policy_lstat_ca_chain(chain)
-    except RuntimeError:
-        raise
-    except OSError as exc:
-        raise RuntimeError("HMB Agent Broker CA is unavailable.") from exc
-    if (
-        _agent_policy_file_identity(before_handle) != _agent_policy_file_identity(after_handle)
-        or tuple(map(_agent_policy_file_identity, before_chain))
-        != tuple(map(_agent_policy_file_identity, after_chain))
-        or _agent_policy_cross_view_identity(after_handle)
-        != _agent_policy_cross_view_identity(after_chain[0])
-        or not encoded
-        or len(encoded) != before_handle.st_size
-        or len(encoded) > _AGENT_POLICY_MAX_CA_PEM_BYTES
-    ):
-        raise RuntimeError("HMB Agent Broker CA is unavailable.")
-    return _canonical_agent_policy_ca_pem(encoded)
-
-
-def _agent_policy_tls_context() -> ssl.SSLContext:
-    ca_pem = _read_agent_policy_broker_ca_pem()
-    try:
-        ca_text = ca_pem.decode("ascii")
-        ca_der = ssl.PEM_cert_to_DER_cert(ca_text)
-    except (UnicodeError, ValueError, ssl.SSLError) as exc:
-        raise RuntimeError("HMB Agent Broker CA is unavailable.") from exc
-    if not hmac.compare_digest(
-        hashlib.sha256(ca_der).hexdigest(), _AGENT_POLICY_BROKER_CA_DER_SHA256
-    ):
-        raise RuntimeError("HMB Agent Broker CA integrity check failed.")
-    try:
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        original_context_super: Optional[super] = None
-        # Griptape Desktop globally injects truststore.SSLContext at app start.
-        # On Windows, truststore rejects our deliberately self-signed pinned
-        # server certificate (CA:FALSE) before the independent DER pin can run.
-        # Restore only this private Broker context to the original CPython SSL
-        # class; do not mutate Griptape's process-wide SSL configuration.
-        if getattr(ssl.SSLContext, "__module__", "") == "truststore._api":
-            constants = importlib.import_module("truststore._ssl_constants")
-            original_context_type = getattr(constants, "_original_SSLContext", None)
-            original_context_super = getattr(
-                constants, "_original_super_SSLContext", None
-            )
-            if (
-                not isinstance(original_context_type, type)
-                or getattr(original_context_type, "__module__", "") != "ssl"
-                or getattr(original_context_type, "__name__", "") != "SSLContext"
-                or not isinstance(original_context_super, super)
-            ):
-                raise RuntimeError("HMB Agent Broker TLS context is unavailable.")
-            context = original_context_type(ssl.PROTOCOL_TLS_CLIENT)
-            if type(context) is not original_context_type:
-                raise RuntimeError("HMB Agent Broker TLS context is unavailable.")
-            _agent_policy_log_stage("broker_private_ssl_context_restored")
-        if original_context_super is None:
-            context.verify_mode = ssl.CERT_REQUIRED
-            context.check_hostname = True
-            context.minimum_version = ssl.TLSVersion.TLSv1_2
-        else:
-            # ssl.py property setters refer to the process-global SSLContext
-            # name. After truststore injection that name would recurse, so use
-            # the captured original C descriptors for this original instance.
-            original_context_super.verify_mode.__set__(context, ssl.CERT_REQUIRED)
-            original_context_super.check_hostname.__set__(context, True)
-            original_context_super.minimum_version.__set__(
-                context, ssl.TLSVersion.TLSv1_2
-            )
-        context.load_verify_locations(cadata=ca_text)
-        return context
-    except (OSError, ssl.SSLError) as exc:
-        raise RuntimeError("HMB Agent Broker CA is unavailable.") from exc
-
-
-def _fetch_agent_policy_envelope() -> bytes:
-    _agent_policy_log_stage("broker_fetch_enter")
-    if (
-        _AGENT_POLICY_BROKER_URL
-        != "https://192.168.203.245:8443/api/v1/agent-core/dat"
-        or _AGENT_POLICY_BROKER_HOST != "192.168.203.245"
-        or _AGENT_POLICY_BROKER_PORT != 8443
-        or _AGENT_POLICY_BROKER_PATH != "/api/v1/agent-core/dat"
-    ):
-        raise RuntimeError("HMB Agent policy delivery is unavailable.")
-    context = _agent_policy_tls_context()
-    _agent_policy_log_stage("broker_tls_context_ready")
-    connection = http.client.HTTPSConnection(
-        _AGENT_POLICY_BROKER_HOST, _AGENT_POLICY_BROKER_PORT,
-        timeout=_AGENT_POLICY_REQUEST_TIMEOUT_SECONDS, context=context,
-    )
-    token: Optional[bytearray] = None
-    authorization: Optional[str] = None
-    response: Optional[http.client.HTTPResponse] = None
-    try:
-        _agent_policy_log_stage("broker_connect_enter")
-        try:
-            connection.connect()
-        except ssl.SSLError:
-            _agent_policy_log_stage("broker_connect_tls_failed")
-            raise
-        except TimeoutError:
-            _agent_policy_log_stage("broker_connect_timeout")
-            raise
-        except OSError as exc:
-            winerror = int(getattr(exc, "winerror", 0) or 0)
-            if winerror == 10013:
-                _agent_policy_log_stage("broker_connect_permission_denied")
-            elif winerror == 10061:
-                _agent_policy_log_stage("broker_connect_refused")
-            elif winerror == 10060:
-                _agent_policy_log_stage("broker_connect_timeout")
-            else:
-                _agent_policy_log_stage("broker_connect_os_failed")
-            raise
-        except http.client.HTTPException:
-            _agent_policy_log_stage("broker_connect_http_failed")
-            raise
-        _agent_policy_log_stage("broker_connect_ok")
-        verified_socket = connection.sock
-        peer_der = verified_socket.getpeercert(binary_form=True) if verified_socket else None
-        if not peer_der:
-            _agent_policy_log_stage("broker_peer_certificate_missing")
-            raise RuntimeError("HMB Agent Broker certificate pin mismatch.")
-        if not hmac.compare_digest(
-            hashlib.sha256(peer_der).hexdigest(), _AGENT_POLICY_BROKER_CA_DER_SHA256
-        ):
-            _agent_policy_log_stage("broker_peer_pin_mismatch")
-            raise RuntimeError("HMB Agent Broker certificate pin mismatch.")
-        _agent_policy_log_stage("broker_tls_peer_verified")
-        token = _load_agent_policy_bearer_token()
-        _agent_policy_log_stage("broker_token_ready")
-        authorization = "Bearer " + token.decode("ascii")
-        _wipe_agent_policy_buffer(token)
-        token = None
-        if connection.sock is not verified_socket:
-            raise RuntimeError("HMB Agent policy delivery is unavailable.")
-        connection.putrequest("GET", _AGENT_POLICY_BROKER_PATH, skip_host=True, skip_accept_encoding=True)
-        connection.putheader("Host", "192.168.203.245:8443")
-        connection.putheader("Accept", "application/octet-stream")
-        connection.putheader("Accept-Encoding", "identity")
-        connection.putheader("Authorization", authorization)
-        connection.putheader("Cache-Control", "no-store")
-        connection.endheaders()
-        authorization = None
-        if connection.sock is not verified_socket:
-            raise RuntimeError("HMB Agent policy delivery is unavailable.")
-        response = connection.getresponse()
-        status = int(getattr(response, "status", 0))
-        if status != 200:
-            if status == 401:
-                _agent_policy_log_stage("broker_http_401")
-                raise RuntimeError("FN AI Broker login is required.")
-            if status == 403:
-                _agent_policy_log_stage("broker_http_403")
-                raise RuntimeError("FN AI Broker Agent policy access is denied.")
-            if status == 429:
-                _agent_policy_log_stage("broker_http_429")
-                raise RuntimeError("FN AI Broker Agent policy delivery is busy; retry later.")
-            _agent_policy_log_stage("broker_http_other")
-            raise RuntimeError("HMB Agent policy delivery is unavailable.")
-        _agent_policy_log_stage("broker_http_200")
-        names = (
-            "Content-Type", "Content-Disposition", "Cache-Control", "Content-Encoding",
-            "Content-Length", "Transfer-Encoding", "Accept-Ranges",
-            "X-Content-Type-Options", "X-Request-Id",
-        )
-        values = {name: response.headers.get_all(name, []) for name in names}
-        required = (
-            "Content-Type", "Content-Disposition", "Cache-Control", "Content-Length",
-            "Accept-Ranges", "X-Content-Type-Options", "X-Request-Id",
-        )
-        vary_values = response.headers.get_all("Vary", [])
-        vary_tokens = {
-            item.strip().casefold() for value in vary_values
-            for item in str(value).split(",") if item.strip()
-        }
+        after_chain = lstat_chain()
         if (
-            any(len(values[name]) != 1 for name in required)
-            or any(len(values[name]) != 0 for name in ("Content-Encoding", "Transfer-Encoding"))
-            or len(vary_values) == 0
+            _agent_policy_file_identity(before_handle)
+            != _agent_policy_file_identity(after_handle)
+            or tuple(map(_agent_policy_file_identity, before_chain))
+            != tuple(map(_agent_policy_file_identity, after_chain))
+            or _agent_policy_cross_view_identity(after_handle)
+            != _agent_policy_cross_view_identity(after_chain[0])
+            or not encoded
+            or len(encoded) != before_handle.st_size
+            or len(encoded) > _AGENT_POLICY_MAX_ENVELOPE_BYTES
         ):
-            raise RuntimeError("FN AI Broker returned an invalid Agent policy response.")
-        _agent_policy_log_stage("broker_headers_verified")
-        length_text = str(values["Content-Length"][0]).strip()
-        if (
-            str(values["Content-Type"][0]).strip().casefold() != "application/octet-stream"
-            or str(values["Content-Disposition"][0]).strip()
-            != 'attachment; filename="hmb_agent_core.dat"'
-            or str(values["Cache-Control"][0]).strip().casefold()
-            != "private, no-store, no-transform"
-            or str(values["Accept-Ranges"][0]).strip().casefold() != "none"
-            or str(values["X-Content-Type-Options"][0]).strip().casefold() != "nosniff"
-            or re.fullmatch(r"[0-9a-f]{24}", str(values["X-Request-Id"][0]).strip().casefold()) is None
-            or vary_tokens != {"authorization"}
-            or re.fullmatch(r"[1-9][0-9]*", length_text) is None
-        ):
-            raise RuntimeError("FN AI Broker returned an invalid Agent policy response.")
-        length = int(length_text)
-        if length > _AGENT_POLICY_MAX_ENVELOPE_BYTES:
-            raise RuntimeError("FN AI Broker returned an invalid Agent policy response.")
-        encoded = response.read(_AGENT_POLICY_MAX_ENVELOPE_BYTES + 1)
-        if not encoded or len(encoded) != length:
-            raise RuntimeError("FN AI Broker returned an invalid Agent policy response.")
-        _agent_policy_log_stage("broker_envelope_received")
+            raise RuntimeError("HMB Agent policy DAT is unavailable.")
+        _agent_policy_log_stage("local_dat_read_ok")
         return encoded
     except RuntimeError:
+        _agent_policy_log_stage("local_dat_read_failed")
         raise
-    except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
-        raise RuntimeError("HMB Agent policy delivery is unavailable.") from exc
-    finally:
-        if response is not None:
-            response.close()
-        _wipe_agent_policy_buffer(token)
-        token = None
-        authorization = None
-        request_buffer = getattr(connection, "_buffer", None)
-        if isinstance(request_buffer, list):
-            request_buffer.clear()
-        connection.close()
-
-
-def _read_agent_policy_envelope() -> bytes:
-    """Compatibility name for the one pinned authenticated transport."""
-    return _fetch_agent_policy_envelope()
+    except OSError as exc:
+        _agent_policy_log_stage("local_dat_read_failed")
+        raise RuntimeError("HMB Agent policy DAT is unavailable.") from exc
 
 
 def _json_object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -1474,12 +1199,12 @@ def _decode_signed_agent_policy_envelope(encoded: bytes) -> Dict[str, Any]:
 
 
 def _validate_agent_policy_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Accept any authenticated server policy without policing its meaning.
+    """Accept any signed bundled policy without policing its meaning.
 
     The signed envelope is the authority for policy version and wording.  The
-    client verifies only the stable transport fields and the two document
+    client verifies only the stable envelope fields and the two document
     digests; it must not pin a policy revision, clause list, heading, or
-    semantic contract that could reject a legitimate server update.
+    semantic contract that could reject a legitimate signed package update.
     """
     required_fields = {
         "schema",
@@ -1548,13 +1273,12 @@ def _validate_agent_policy_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _fetch_verified_agent_rule_payload() -> Dict[str, Any]:
-    """Perform the process's sole authenticated DAT GET and verification."""
+def _load_verified_agent_rule_payload() -> Dict[str, Any]:
+    """Perform the process's sole bundled DAT read and signature verification."""
 
     try:
-        encoded = bytearray(_fetch_agent_policy_envelope())
+        encoded = bytearray(_read_agent_policy_envelope())
     except Exception:
-        _agent_policy_log_stage("broker_fetch_failed")
         raise
     try:
         _agent_policy_log_stage("policy_verify_enter")
@@ -1587,7 +1311,7 @@ def _bootstrap_agent_policy_session() -> None:
 
     Exact executable, command-line and parent-process provenance is the sole
     bootstrap authority. An arbitrary Python child cannot initialize the
-    session or reach transport.
+    session or bypass the packaged DAT boundary.
     """
 
     _agent_policy_log_stage("bootstrap_enter")
@@ -1599,12 +1323,11 @@ def _bootstrap_agent_policy_session() -> None:
     )
     try:
         # Claim EMPTY -> LOADING using exact packaged-process provenance. The
-        # authenticated Broker GET and signature verification then run outside
-        # the shared condition so status/READY readers do not freeze behind a
-        # 15-second network wait.
+        # bundled DAT read and signature verification then run outside the
+        # shared condition so status/READY readers do not freeze during I/O.
         _agent_process_session.bootstrap_once_authorized(
             _agent_policy_process_provenance_valid,
-            _fetch_verified_agent_rule_payload,
+            _load_verified_agent_rule_payload,
         )
         _agent_policy_log_stage("session_ready")
     except Exception as exc:
@@ -1861,5 +1584,4 @@ def find_builtin_agent_class() -> Optional[Type[Any]]:
 
 # The signed Agent policy session is opened by HMBAgentLibrary.process() only
 # after a canonical HMB Prompt edge has been proven. Importing this shared
-# module from Seedance or during library discovery must remain network-free and
-# must not turn a transient startup/login race into a process-sticky failure.
+# module from Seedance or during library discovery does not initialize policy.

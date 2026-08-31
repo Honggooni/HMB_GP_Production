@@ -8,23 +8,15 @@ import types
 from itertools import combinations
 from pathlib import Path
 
-from _hmb_private_policy_fixture import (
-    install_private_policy_reader,
-    read_private_policy_fixture_if_available,
+from _hmb_bundled_policy_session import (
+    install_bundled_policy_session,
+    read_bundled_policy_artifact,
 )
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.7.19"
+EXPECTED_RELEASE_VERSION = "0.7.21"
 EXPECTED_SIGNING_KEY_ID = "hmb-policy-local-2026-08-r1"
-PRIVATE_SIGNED_POLICY_FIXTURE = (
-    ROOT
-    / "resources"
-    / "policy"
-    / "HMB_GP_Production_Rule"
-    / "artifact"
-    / "hmb_agent_core.dat"
-)
 
 
 def load(name: str):
@@ -39,11 +31,10 @@ def load(name: str):
 agent = load("HMBAgentLibrary")
 prompt = load("HMBPromptLibrary")
 
-sealed = read_private_policy_fixture_if_available()
-assert sealed is not None
+sealed = read_bundled_policy_artifact()
 original_policy_reader = agent._hmb._read_agent_policy_envelope
-_fixture_reader, installed_sealed = install_private_policy_reader(agent._hmb)
-assert _fixture_reader is original_policy_reader
+_bundled_reader, installed_sealed = install_bundled_policy_session(agent._hmb)
+assert _bundled_reader is original_policy_reader
 assert installed_sealed == sealed
 
 policy, binding = agent._hmb._load_verified_behavior_documents()
@@ -66,8 +57,7 @@ assert len(binding_rule_list) == 4
 assert all(rule.strip() for rule in policy_rule_list + binding_rule_list)
 assert policy_rule_list != binding_rule_list
 
-# The signed/compressed server envelope is read from the private test fixture only.
-# Runtime and public packages never use this path or carry a local fallback.
+# The signed/compressed envelope is read from the exact bundled runtime DAT.
 assert policy.encode("utf-8") not in sealed
 assert binding.encode("utf-8") not in sealed
 

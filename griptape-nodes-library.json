@@ -224,14 +224,16 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.7.19",
+    "library_version": "0.7.21",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
       "archive_source_count": 26,
-      "mode": "authenticated_broker_session",
-      "broker_endpoint": "https://192.168.203.245:8443/api/v1/agent-core/dat",
-      "public_ca_path": "resources/tls/hmb_agent_broker_ca.pem",
-      "verification": "pinned_tls_dpapi_bearer_rsa3072_sha256_v3_contract_once_per_process"
+      "mode": "bundled_signed_dat",
+      "runtime_path": "resources/agent/hmb_agent_core.dat",
+      "policy_version": "2026-08-31.agent-shot-quality.v5.0",
+      "envelope_sha256": "0e5e77fca3496693b51e3dcff60007947716d0654274d88272deb60011d9ad00",
+      "contract_sha256": "60d03ffff5125b1eae89c1f98364cf8afbbb7e93559aaeb61486def7d5caa7af",
+      "verification": "rsa3072_sha256_v3_contract_once_per_process"
     },
     "tags": [
       "Griptape",
@@ -415,7 +417,7 @@
       "file_path": "HMBAgentLibrary.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "Runs the stock Griptape Agent model surface with authenticated Broker policy.\nThe model declaration mirrors the installed Standard Agent for host permission and accounting; it is not an HMB content allowlist.",
+        "description": "Runs the stock Griptape Agent model surface with the bundled signed HMB policy.\nThe model declaration mirrors the installed Standard Agent for host permission and accounting; it is not an HMB content allowlist.",
         "display_name": "HMBAgentLibrary",
         "declarations": [
           {

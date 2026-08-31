@@ -9,7 +9,7 @@ import shutil
 import sys
 import tempfile
 
-from _hmb_private_policy_fixture import install_private_policy_reader
+from _hmb_bundled_policy_session import install_bundled_policy_session
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -286,14 +286,14 @@ try:
     }]
 
     # The fourth stage receives its rules only through the signed Agent payload.
-    _original_policy_reader, sealed_policy = install_private_policy_reader(common)
+    _original_policy_reader, sealed_policy = install_bundled_policy_session(common)
     policy, _binding = common._load_verified_behavior_documents()
     policy_identity = common.get_internal_policy_identity()
     assert policy
     assert len(policy_identity["contract_sha256"]) == 64
     assert policy.encode("utf-8") not in sealed_policy
-    assert common._AGENT_POLICY_BROKER_URL == (
-        "https://192.168.203.245:8443/api/v1/agent-core/dat"
+    assert common._AGENT_POLICY_FILE == (
+        ROOT / "resources" / "agent" / "hmb_agent_core.dat"
     )
 finally:
     shutil.rmtree(project_root, ignore_errors=True)

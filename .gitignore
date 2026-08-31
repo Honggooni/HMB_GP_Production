@@ -16,18 +16,17 @@ backups/
 dist/
 *.zip
 
-# Agent policy artifacts are server-managed and never enter this repository or
-# an installable package. Policy source/review material also remains separate.
-resources/agent/
+# Only the signed runtime Agent DAT is tracked. Policy source/review material
+# and every stray DAT copy remain outside the repository and package.
 resources/policy/
 policies/
 **/hmb_agent_core.dat
+!resources/agent/hmb_agent_core.dat
 
 # Credentials and machine-local configuration
 .env
 .env.*
 *.pem
-!resources/tls/hmb_agent_broker_ca.pem
 *.key
 *.p12
 *.pfx

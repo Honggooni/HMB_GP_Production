@@ -5,11 +5,11 @@ import importlib.util
 import sys
 from pathlib import Path
 
-from _hmb_private_policy_fixture import install_private_policy_reader
+from _hmb_bundled_policy_session import install_bundled_policy_session
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.7.19"
+EXPECTED_RELEASE_VERSION = "0.7.21"
 
 
 def load_module(name: str):
@@ -22,7 +22,7 @@ def load_module(name: str):
 
 
 agent = load_module("HMBAgentLibrary")
-_original_policy_reader, sealed = install_private_policy_reader(agent._hmb)
+_original_policy_reader, sealed = install_bundled_policy_session(agent._hmb)
 policy, binding = agent._hmb._load_verified_behavior_documents()
 policy = policy.strip()
 binding = binding.strip()

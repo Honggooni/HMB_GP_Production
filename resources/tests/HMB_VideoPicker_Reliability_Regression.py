@@ -13,7 +13,7 @@ import threading
 import time
 import types
 
-from _hmb_private_policy_fixture import install_private_policy_reader
+from _hmb_bundled_policy_session import install_bundled_policy_session
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -96,9 +96,9 @@ common = load("_hmb_common")
 picker = load("HMBVideoPickerLibrary")
 prompt = load("HMBPromptLibrary")
 agent = load("HMBAgentLibrary")
-_original_policy_reader, signed_policy_fixture = install_private_policy_reader(common)
+_original_policy_reader, signed_policy_fixture = install_bundled_policy_session(common)
 if agent._hmb is not common:
-    install_private_policy_reader(agent._hmb)
+    install_bundled_policy_session(agent._hmb)
 
 assert prompt.PICKER_DEPTH_PROFILE == picker.DEPTH_PLAYBLAST_PROFILE
 assert picker.DEPTH_PLAYBLAST_PROFILE == "hmb_camera_space_depth_v7"
@@ -682,7 +682,7 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.7.19"
+assert manifest["metadata"]["library_version"] == "0.7.21"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}

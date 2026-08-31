@@ -7,7 +7,7 @@ import sys
 import tempfile
 import types
 
-from _hmb_private_policy_fixture import install_private_policy_reader
+from _hmb_bundled_policy_session import install_bundled_policy_session
 
 ROOT = Path(__file__).resolve().parents[2]
 SEALED_TEST_FRAGMENT = ""
@@ -164,7 +164,7 @@ spec = importlib.util.spec_from_file_location("HMBAgentLibrary_regression", ROOT
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
-install_private_policy_reader(module._hmb)
+install_bundled_policy_session(module._hmb)
 _sealed_policy, _sealed_binding = module._hmb._load_verified_behavior_documents()
 SEALED_TEST_FRAGMENT = module._split_behavior_rules(_sealed_policy, 4)[0].splitlines()[0]
 assert SEALED_TEST_FRAGMENT

@@ -3,7 +3,7 @@ import importlib.util
 import json
 import sys
 
-from _hmb_private_policy_fixture import install_private_policy_reader
+from _hmb_bundled_policy_session import install_bundled_policy_session
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -21,7 +21,7 @@ def load(name):
 picker = load("HMBVideoPickerLibrary")
 prompt = load("HMBPromptLibrary")
 agent = load("HMBAgentLibrary")
-install_private_policy_reader(agent._hmb)
+install_bundled_policy_session(agent._hmb)
 
 
 def prompt_json_section(payload: str, header: str):

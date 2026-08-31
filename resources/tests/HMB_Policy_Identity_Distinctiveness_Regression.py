@@ -68,7 +68,7 @@ runtime_payload = {
 validated_runtime = agent._hmb._validate_agent_policy_payload(runtime_payload)
 assert validated_runtime["final_policy_version"] == "future-server-revision"
 assert "_verify_agent_policy_signature(payload_bytes, signature)" in common_source
-assert "resources/agent/hmb_agent_core.dat" not in agent_source
+assert '"resources" / "agent" / "hmb_agent_core.dat"' in common_source
 
 
 def sanitizer_node(output: str, agent_state: dict | None = None):

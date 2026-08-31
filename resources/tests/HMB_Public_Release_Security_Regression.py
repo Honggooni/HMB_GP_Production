@@ -15,8 +15,8 @@ from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[2]
-RELEASE_LABEL = "v0.7.19"
-RELEASE_VERSION = "0.7.19"
+RELEASE_LABEL = "v0.7.21"
+RELEASE_VERSION = "0.7.21"
 EXPECTED_RUNTIME_INSTALL_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
@@ -39,7 +39,7 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "widgets/HMBVideoPickerLibraryWidget_v032.js",
     "resources/maya/HMB_Maya_Background_Preview.py",
     "resources/picker/HMB_Marker_Catalog.json",
-    "resources/tls/hmb_agent_broker_ca.pem",
+    "resources/agent/hmb_agent_core.dat",
 )
 EXPECTED_DISTRIBUTION_ONLY_FILES = (
     "Install_HMB_GP_Production.ps1",
@@ -79,9 +79,6 @@ COMMON_TOKEN_PATTERNS = (
     re.compile(rb"sk-[A-Za-z0-9_-]{20,}"),
 )
 FORBIDDEN_PACKAGE_POLICY_MARKERS = (
-    b"_BUNDLED_AGENT_POLICY_FILE",
-    b"resources/agent/hmb_agent_core.dat",
-    b"resources\\agent\\hmb_agent_core.dat",
     b"resources/policy/HMB_GP_Production_Rule",
 )
 RETIRED_USAGE_MARKERS = (
@@ -153,7 +150,7 @@ assert len(EXPECTED_SOURCE_FILES) == (
 )
 assert builder.RELEASE_LABEL == RELEASE_LABEL
 assert builder.RELEASE_VERSION == RELEASE_VERSION
-assert builder.release_version_parts(RELEASE_VERSION) == (0, 7, 19)
+assert builder.release_version_parts(RELEASE_VERSION) == (0, 7, 21)
 assert builder.release_label_for_version(RELEASE_VERSION) == RELEASE_LABEL
 builder.validate_release_identity(RELEASE_LABEL, RELEASE_VERSION)
 for invalid_version in (
@@ -169,16 +166,16 @@ for invalid_version in (
         pass
     else:
         raise AssertionError(f"Invalid technical SemVer was accepted: {invalid_version}")
-for mismatched_label in ("v0.7.019", "v0.7.18", "0.7.19"):
+for mismatched_label in ("v0.7.021", "v0.7.20", "0.7.21"):
     try:
         builder.validate_release_identity(mismatched_label, RELEASE_VERSION)
     except RuntimeError:
         pass
     else:
         raise AssertionError(f"Mismatched public release label was accepted: {mismatched_label}")
-assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.7.19_Runtime.zip"
+assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.7.21_Runtime.zip"
 assert builder.ARCHIVE_NAME == f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
-assert builder.POLICY_DELIVERY == "server-only"
+assert builder.POLICY_DELIVERY == "bundled-signed-dat"
 for retired_name in (
     "POLICY_RELATIVE",
     "POLICY_SHA256",
@@ -201,18 +198,14 @@ assert set(registered_secrets) == EXPECTED_SECRET_NAMES
 assert all(value == "" for value in registered_secrets.values())
 delivery = manifest["metadata"]["agent_policy_delivery"]
 assert delivery["archive_source_count"] == len(EXPECTED_SOURCE_FILES)
-assert delivery["mode"] == "authenticated_broker_session"
-assert delivery["broker_endpoint"].endswith("/api/v1/agent-core/dat")
-assert delivery["public_ca_path"] == "resources/tls/hmb_agent_broker_ca.pem"
-assert delivery["verification"] == (
-    "pinned_tls_dpapi_bearer_rsa3072_sha256_v3_contract_once_per_process"
-)
+assert delivery["mode"] == "bundled_signed_dat"
+assert delivery["runtime_path"] == "resources/agent/hmb_agent_core.dat"
+assert delivery["verification"] == "rsa3072_sha256_v3_contract_once_per_process"
 assert "launcher_path" not in delivery
 assert "bootstrap_marker" not in delivery
 
-# The public runtime trusts the authenticated server envelope, not a package-
-# pinned policy revision. Exercise the stable signature boundary and the two
-# document digests with a deliberately non-production revision identifier.
+# The public runtime trusts the signed bundled envelope. Exercise the stable
+# signature boundary and the two document digests independently of wording.
 policy_document = "Behavior server revision\n1. SERVER_AUTHORED_POLICY"
 binding_document = "Behavior server binding\n1. SERVER_AUTHORED_BINDING"
 signed_policy_payload = {
@@ -647,7 +640,7 @@ assert check_result["file_count"] == len(EXPECTED_SOURCE_FILES) + 2
 assert check_result["source_file_count"] == len(EXPECTED_SOURCE_FILES)
 assert check_result["install_file_count"] == len(EXPECTED_RUNTIME_INSTALL_FILES)
 assert check_result["distribution_file_count"] == len(EXPECTED_DISTRIBUTION_ONLY_FILES)
-assert check_result["policy_delivery"] == "server-only"
+assert check_result["policy_delivery"] == "bundled-signed-dat"
 assert "policy_version" not in check_result
 assert "policy_contract_sha256" not in check_result
 assert check_result["release_label"] == RELEASE_LABEL
@@ -668,22 +661,29 @@ with zipfile.ZipFile(io.BytesIO(first_archive), "r") as archive:
     ]
     assert [info.filename for info in infos] == expected_names
     assert {info.date_time for info in infos} == {archive_date_time}
-    assert not any(
-        PurePosixPath(info.filename).suffix.casefold() == ".dat" for info in infos
+    dat_members = [
+        info for info in infos
+        if PurePosixPath(info.filename).suffix.casefold() == ".dat"
+    ]
+    assert len(dat_members) == 1
+    assert PurePosixPath(dat_members[0].filename).parts[-3:] == (
+        "resources", "agent", "hmb_agent_core.dat"
     )
 
     for info in infos:
         member = PurePosixPath(info.filename)
         lowered = info.filename.casefold()
         relative = member.relative_to(builder.ARCHIVE_ROOT).as_posix()
-        # The authenticated Broker contract intentionally ships one pinned
-        # public CA certificate.  Private keys and every other PEM remain
-        # forbidden, including PEM files at look-alike paths.
-        if relative == builder.PUBLIC_CA_MEMBER.as_posix():
-            assert member.suffix.casefold() == ".pem"
+        # The signed Agent DAT is the sole permitted policy artifact. Private
+        # keys, PEM files, other DAT files and review/source documents remain
+        # forbidden, including look-alike paths.
+        if relative == builder.BUNDLED_AGENT_POLICY_MEMBER.as_posix():
+            assert member.suffix.casefold() == ".dat"
+            builder.verify_signed_agent_policy_bytes(archive.read(info))
         else:
             assert member.suffix.casefold() not in FORBIDDEN_SUFFIXES
-        assert "/resources/agent/" not in f"/{lowered}"
+        if "/resources/agent/" in f"/{lowered}":
+            assert relative == builder.BUNDLED_AGENT_POLICY_MEMBER.as_posix()
         assert "/resources/policy/" not in f"/{lowered}"
         assert "/policies/" not in f"/{lowered}"
         assert not re.search(
@@ -700,28 +700,25 @@ with zipfile.ZipFile(io.BytesIO(first_archive), "r") as archive:
         assert not any(marker in content for marker in RETIRED_USAGE_MARKERS)
         assert not any(marker in content for marker in RETIRED_DIRECT_PROVIDER_MARKERS)
 
-# The server-path contract is allowed in source, but no package layer may carry
-# the signed data file or English/Korean policy documents. Inspect nested ZIPs
-# because the team installer wraps the library ZIP in another ZIP.
+# The exact signed runtime DAT is allowed, while all other DAT and policy
+# documents remain forbidden. Inspect nested ZIPs because installers may wrap
+# the library ZIP in another ZIP.
 safe_nested = zip_bytes({"docs/readme.txt": b"safe"})
 builder.validate_no_policy_artifacts_in_zip(
     zip_bytes({"package/safe.zip": safe_nested})
 )
 assert_forbidden_archive(zip_bytes({"package/hmb_agent_core.dat": b"sealed"}))
-try:
-    builder.make_archive(
-        [{"path": "resources/agent/hmb_agent_core.dat", "data": b"sealed"}],
-        archive_date_time,
-    )
-except RuntimeError:
-    pass
-else:
-    raise AssertionError("The archive builder accepted a direct .dat record.")
-assert_forbidden_archive(
+signed_dat = (ROOT / "resources" / "agent" / "hmb_agent_core.dat").read_bytes()
+builder.verify_signed_agent_policy_bytes(signed_dat)
+builder.make_archive(
+    [{"path": "resources/agent/hmb_agent_core.dat", "data": signed_dat}],
+    archive_date_time,
+)
+builder.validate_no_policy_artifacts_in_zip(
     zip_bytes(
         {
             "package/library.zip": zip_bytes(
-                {"HMB_GP_Production/resources/agent/hmb_agent_core.dat": b"sealed"}
+                {"HMB_GP_Production/resources/agent/hmb_agent_core.dat": signed_dat}
             )
         }
     )
@@ -752,10 +749,9 @@ assert_forbidden_archive(
 )
 
 gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
-assert "resources/agent/" in gitignore
 assert "resources/policy/" in gitignore
 assert "policies/" in gitignore
 assert "**/hmb_agent_core.dat" in gitignore
-assert "!resources/agent/hmb_agent_core.dat" not in gitignore
+assert "!resources/agent/hmb_agent_core.dat" in gitignore
 
-print("HMB in-memory server-only release/credential boundary regression: PASS")
+print("HMB bundled signed-DAT release/credential boundary regression: PASS")

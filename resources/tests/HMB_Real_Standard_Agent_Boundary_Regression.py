@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT))
 
 import HMBAgentLibrary as module  # noqa: E402
 import HMBPromptLibrary as prompt_module  # noqa: E402
-from _hmb_private_policy_fixture import install_private_policy_reader  # noqa: E402
+from _hmb_bundled_policy_session import install_bundled_policy_session  # noqa: E402
 
 
 # A source checkout can exist without the Standard Library's import-time
@@ -101,7 +101,7 @@ finally:
 # replace only its billable scheduler step. This proves that the native Agent
 # object receives exactly the two sealed 4-rule sets and that the callable-yield
 # contract remains intact through final publication and cleanup.
-install_private_policy_reader(module._hmb)
+install_bundled_policy_session(module._hmb)
 standard_module = inspect.getmodule(base_agent)
 assert standard_module is not None
 original_resolve_cloud_api_key = standard_module.resolve_cloud_api_key

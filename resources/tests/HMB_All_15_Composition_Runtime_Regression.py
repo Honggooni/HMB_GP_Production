@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import json
 import sys
@@ -9,7 +10,7 @@ import types
 from itertools import combinations
 from pathlib import Path
 
-from _hmb_private_policy_fixture import install_private_policy_reader
+from _hmb_bundled_policy_session import install_bundled_policy_session
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -29,7 +30,7 @@ image = load("HMBImageAssetLibrary")
 video = load("HMBVideoPickerLibrary")
 prompt = load("HMBPromptLibrary")
 agent = load("HMBAgentLibrary")
-install_private_policy_reader(agent._hmb)
+install_bundled_policy_session(agent._hmb)
 
 COMPOSITIONS = tuple(
     frozenset(values)
@@ -201,6 +202,33 @@ def exercise_agent_once(
     node._hmb_native_calls_this_process = 0
     calls: list[tuple[bool, bool, int, int, int]] = []
 
+    if canonical_prompt_connected:
+        class PromptSnapshotSource:
+            @staticmethod
+            def _hmb_agent_prompt_snapshot(visible_prompt: str) -> dict:
+                return {
+                    "schema": agent._PAIRED_PROMPT_SNAPSHOT_SCHEMA,
+                    "version": agent._PAIRED_PROMPT_SNAPSHOT_VERSION,
+                    "generation": 1,
+                    "visible_sha256": hashlib.sha256(
+                        visible_prompt.encode("utf-8")
+                    ).hexdigest(),
+                    "machine_sha256": hashlib.sha256(
+                        prompt_value.encode("utf-8")
+                    ).hexdigest(),
+                    "machine_prompt": prompt_value,
+                }
+
+            @staticmethod
+            def _hmb_shot_channel_subscription():
+                return None
+
+        setattr(
+            node,
+            agent._VERIFIED_PROMPT_SOURCE_ATTRIBUTE,
+            PromptSnapshotSource(),
+        )
+
     def native_once(self):
         names = tuple(self._hmb_ruleset_names)
         calls.append(
@@ -217,6 +245,7 @@ def exercise_agent_once(
                 len(self._hmb_binding_rules),
             )
         )
+        self.parameter_output_values = {"agent": {}, "output": "agent-output"}
         if False:
             yield None
         return "agent-output"
@@ -230,7 +259,10 @@ def exercise_agent_once(
         node,
     )
     node._run_native_agent_once = types.MethodType(native_once, node)
-    node._secure_hmb_outputs = types.MethodType(lambda _self: None, node)
+    node._secure_hmb_outputs = types.MethodType(
+        lambda _self: setattr(_self, "_hmb_last_sanitizer_status", "clean"),
+        node,
+    )
     node._has_canonical_hmb_prompt_connection = types.MethodType(
         lambda _self: canonical_prompt_connected,
         node,

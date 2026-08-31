@@ -70,15 +70,14 @@ jobs:
         run: |
           $tracked = @(git ls-files)
           $forbidden = @($tracked | Where-Object {
+            if ($_ -eq 'resources/agent/hmb_agent_core.dat') { return $false }
             $_ -match '(^|/)(\.tmp|\.venv|backups|dist|GriptapeNodes|resources/agent|resources/policy|policies?)/' -or
             $_ -match '(^|/)hmb_agent_core\.dat$' -or
             $_ -match '(policy|policies).*(?:_ko(?:\.|$)|korean)' -or
             $_ -match '(^|/)\.env($|\.)' -or
             $_ -match '(^|/)(credentials|secrets)[^/]*\.json$' -or
             $_ -match '(^|/)(id_rsa|id_ed25519)[^/]*$' -or
-            $_ -match '\.(dat|jwk|key|p12|pfx|secret|token|zip)$' -or
-            ($_ -match '\.pem$' -and
-              $_ -ne 'resources/tls/hmb_agent_broker_ca.pem')
+            $_ -match '\.(dat|jwk|key|p12|pfx|secret|token|zip|pem)$'
           })
           if ($forbidden.Count -ne 0) {
             throw "Forbidden private/generated tracked paths: $($forbidden -join ', ')"
@@ -90,8 +89,7 @@ jobs:
         env:
           HMB_IMAGE_PROJECTS_ROOT: ${{ github.workspace }}
         run: |
-          # Live-host policy-content regressions run only on protected internal
-          # hosts. Public CI verifies the server-only loader and package boundary.
+          # Public CI verifies the exact bundled signed DAT and package boundary.
           $tests = @(
             "HMB_Look_Attribute_Scope_Regression.py",
             "HMB_Data_Only_Prompt_Security_Regression.py",

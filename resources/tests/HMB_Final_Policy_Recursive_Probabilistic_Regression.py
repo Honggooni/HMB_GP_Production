@@ -10,11 +10,11 @@ import sys
 from itertools import combinations
 from pathlib import Path
 
-from _hmb_private_policy_fixture import install_private_policy_reader
+from _hmb_bundled_policy_session import install_bundled_policy_session
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.7.19"
+EXPECTED_RELEASE_VERSION = "0.7.21"
 BASE_MASTER_SEEDS = (
     20260729,
     0x484D42,
@@ -45,7 +45,7 @@ def load_module(name: str):
 prompt_lib = load_module("HMBPromptLibrary")
 agent_lib = load_module("HMBAgentLibrary")
 common = agent_lib._hmb
-_original_policy_reader, sealed = install_private_policy_reader(common)
+_original_policy_reader, sealed = install_bundled_policy_session(common)
 
 
 def prompt_description_json(compiled: str) -> dict:

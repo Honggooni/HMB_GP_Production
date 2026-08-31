@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_RESOURCES = {
     "resources/maya/HMB_Maya_Background_Preview.py",
     "resources/picker/HMB_Marker_Catalog.json",
-    "resources/tls/hmb_agent_broker_ca.pem",
+    "resources/agent/hmb_agent_core.dat",
 }
 DISTRIBUTION_ONLY_FILES = (
     "Install_HMB_GP_Production.ps1",

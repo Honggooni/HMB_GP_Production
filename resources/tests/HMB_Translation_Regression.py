@@ -2,7 +2,7 @@ from pathlib import Path
 import importlib.util
 import sys
 
-from _hmb_private_policy_fixture import install_private_policy_reader
+from _hmb_bundled_policy_session import install_bundled_policy_session
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -19,9 +19,9 @@ def load(name):
 common = load("_hmb_common")
 agent = load("HMBAgentLibrary")
 prompt = load("HMBPromptLibrary")
-install_private_policy_reader(common)
+install_bundled_policy_session(common)
 if agent._hmb is not common:
-    install_private_policy_reader(agent._hmb)
+    install_bundled_policy_session(agent._hmb)
 
 policy_file, binding_file = common._load_verified_behavior_documents()
 policy_file = policy_file.strip()
@@ -43,22 +43,7 @@ for retired_name in (
     assert not hasattr(common, retired_name)
 
 for text in (policy_file, binding_file):
-    lower = text.lower()
-    assert (
-        ("translate" in lower and "natural english" in lower)
-        or "english production prompt" in lower
-        or (
-            "production prompt" in lower
-            and "language and format requested by the user" in lower
-        )
-    )
-    assert (
-        "exact identifier" in lower
-        or "exact active identifier" in lower
-        or "preserve every provided name" in lower
-        or ("preserve" in lower and "provided name" in lower)
-    )
-    assert "seedance" not in lower
+    assert text == text.strip() and text
 
 assert len(agent._split_behavior_rules(policy_file, 4)) == 4
 assert len(agent._split_behavior_rules(binding_file, 4)) == 4

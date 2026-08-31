@@ -9,7 +9,7 @@ import sys
 import zlib
 from pathlib import Path
 
-from _hmb_private_policy_fixture import read_private_policy_fixture_if_available
+from _hmb_bundled_policy_session import read_bundled_policy_artifact
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -32,19 +32,16 @@ common = load("_hmb_common")
 agent = load("HMBAgentLibrary")
 real_signature_verifier = common._verify_agent_policy_signature
 
-# Internal hosts additionally prove that the checked-in public key validates the
-# real private artifact. A clean public checkout has no policy artifact and
-# continues through the fully synthetic structural/security fixture below.
-private_encoded = read_private_policy_fixture_if_available()
-if private_encoded is not None:
-    private_payload = common._decode_signed_agent_policy_envelope(private_encoded)
-    private_validated = common._validate_agent_policy_payload(private_payload)
-    assert private_validated["policy_sha256"] == self_hash(
-        private_validated["policy"]
-    )
-    assert private_validated["binding_sha256"] == self_hash(
-        private_validated["binding"]
-    )
+# The production public key must validate the exact DAT included in the runtime.
+bundled_encoded = read_bundled_policy_artifact()
+bundled_payload = common._decode_signed_agent_policy_envelope(bundled_encoded)
+bundled_validated = common._validate_agent_policy_payload(bundled_payload)
+assert bundled_validated["policy_sha256"] == self_hash(
+    bundled_validated["policy"]
+)
+assert bundled_validated["binding_sha256"] == self_hash(
+    bundled_validated["binding"]
+)
 
 synthetic_policy = "\n\n".join(
     (
@@ -143,8 +140,8 @@ def rejected(label: str, operation) -> None:
 
 try:
     # A trusted signer may revise both 4-rule documents and signed version
-    # metadata without a package update. Only transport schema and self-hashes
-    # remain stable client-side.
+    # metadata in a new package. Only envelope schema and self-hashes remain
+    # stable client-side.
     decoded_a = common._decode_signed_agent_policy_envelope(revision_a)
     validated_a = common._validate_agent_policy_payload(decoded_a)
     decoded_b = common._decode_signed_agent_policy_envelope(revision_b)
@@ -168,37 +165,37 @@ try:
         != validated_b["policy_pair_sha256"]
     )
 
-    # The Broker may atomically publish either trusted revision to a newly
-    # launched process.  Verify each candidate at the transport boundary; an
+    # A package may atomically install either trusted revision before a newly
+    # launched process. Verify each candidate at the local read boundary; an
     # already bootstrapped process deliberately remains on its one snapshot.
     reads = iter((revision_a, revision_b))
-    real_envelope_reader = common._fetch_agent_policy_envelope
-    common._fetch_agent_policy_envelope = lambda: next(reads)
+    real_envelope_reader = common._read_agent_policy_envelope
+    common._read_agent_policy_envelope = lambda: next(reads)
     try:
-        loaded_a = common._fetch_verified_agent_rule_payload()
-        loaded_b = common._fetch_verified_agent_rule_payload()
+        loaded_a = common._load_verified_agent_rule_payload()
+        loaded_b = common._load_verified_agent_rule_payload()
     finally:
-        common._fetch_agent_policy_envelope = real_envelope_reader
+        common._read_agent_policy_envelope = real_envelope_reader
     assert loaded_a["final_policy_version"].endswith(".v4.1.1")
     assert loaded_b["final_policy_version"].endswith(".v7.2")
     assert loaded_a["envelope_sha256"] == hashlib.sha256(revision_a).hexdigest()
     assert loaded_b["envelope_sha256"] == hashlib.sha256(revision_b).hexdigest()
 
-    # One authenticated bootstrap owns an immutable process snapshot. Reads are
-    # defensive copies and never reach the Broker a second time.
+    # One verified bootstrap owns an immutable process snapshot. Reads are
+    # defensive copies and never read the DAT a second time.
     common._agent_process_session.bootstrap_once(
         True,
         lambda: True,
         lambda: dict(loaded_a),
     )
-    common._fetch_agent_policy_envelope = lambda: (_ for _ in ()).throw(
-        AssertionError("READY session performed another Broker fetch")
+    common._read_agent_policy_envelope = lambda: (_ for _ in ()).throw(
+        AssertionError("READY session performed another bundled DAT read")
     )
     try:
         session_a = common._load_agent_rule_payload()
         session_b = common._load_agent_rule_payload()
     finally:
-        common._fetch_agent_policy_envelope = real_envelope_reader
+        common._read_agent_policy_envelope = real_envelope_reader
     assert session_a == session_b == loaded_a
     assert session_a is not session_b
 
@@ -228,7 +225,7 @@ try:
     }
 
     # Trusted signatures do not bypass transport schema or document
-    # self-integrity. Policy version and wording are server-owned.
+    # self-integrity. Policy version and wording are signed-DAT-owned.
     stale_hash_payload = copy.deepcopy(decoded_a)
     stale_hash_payload["policy"] += " raw edit"
     rejected(

@@ -67,9 +67,9 @@ _HMB_TOPOLOGY_WARNING_NAME = "HMB_AGENT_CONNECTION_CHECK_WARNING"
 _FINAL_TEXT_DISPLAY_NAME = "FINAL TEXT · GENERATOR"
 _AGENT_STATE_DISPLAY_NAME = "AGENT STATE · CHAIN ONLY"
 _HMB_POLICY_UNAVAILABLE_MESSAGE = (
-    "[HMB SERVER POLICY REQUIRED] Agent policy session is unavailable. "
-    "Close Griptape completely, verify the existing FN AI Broker login and "
-    "server connection, then restart the official Griptape Desktop application."
+    "[HMB LOCAL POLICY REQUIRED] The signed local Agent policy is unavailable "
+    "or invalid. Reinstall or update HMB_GP_Production from the approved "
+    "package, then restart the official Griptape Desktop application."
 )
 _HMB_SOURCE_CONTRACT_INVALID_MESSAGE = (
     "[HMB SOURCE CONTRACT INVALID] 구조화된 HMB 소스 데이터의 형식 또는 주소가 "
@@ -2632,7 +2632,7 @@ class HMBAgentLibrary(_BaseAgent):
         return super().get_parameter_value(name)
 
     def _load_hmb_rules(self) -> tuple[str, str, list[str], list[str]]:
-        # The signed policy session supplies the fixed server DAT.  Decoded
+        # The signed policy session supplies the bundled DAT. Decoded
         # rule text exists only for this native call and is cleared immediately
         # afterward; no plaintext policy is persisted on the node.
         payload = _hmb._load_agent_rule_payload()
@@ -3102,10 +3102,9 @@ class HMBAgentLibrary(_BaseAgent):
             self._publish_hmb_execution_block(_HMB_TOPOLOGY_UNAVAILABLE_MESSAGE)
             raise RuntimeError(_HMB_TOPOLOGY_UNAVAILABLE_MESSAGE) from None
         try:
-            # Authenticate and verify the signed Broker policy exactly once for
-            # this packaged Griptape engine process. Library discovery remains
-            # network-free; only a canonical HMB Prompt -> Agent execution can
-            # initialize the protected session.
+            # Read and verify the bundled signed policy exactly once for this
+            # packaged Griptape engine process. Only a canonical HMB Prompt ->
+            # Agent execution can initialize the protected in-memory session.
             self._set_agent_execution_phase("authorizing")
             _hmb._bootstrap_agent_policy_session()
         except Exception:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -17,12 +18,12 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.7.19"
-RELEASE_VERSION = "0.7.19"
+RELEASE_LABEL = "v0.7.21"
+RELEASE_VERSION = "0.7.21"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
-POLICY_DELIVERY = "server-only"
+POLICY_DELIVERY = "bundled-signed-dat"
 SHOT_ROUTING_PROTOCOL_VERSION = "2026-08-20.shot-routing.v1"
 RELEASE_MANIFEST_PATH = "release-manifest.json"
 SHA256SUMS_PATH = "SHA256SUMS"
@@ -59,7 +60,7 @@ RUNTIME_INSTALL_FILES = (
     "widgets/HMBVideoPickerLibraryWidget_v032.js",
     "resources/maya/HMB_Maya_Background_Preview.py",
     "resources/picker/HMB_Marker_Catalog.json",
-    "resources/tls/hmb_agent_broker_ca.pem",
+    "resources/agent/hmb_agent_core.dat",
 )
 DISTRIBUTION_ONLY_FILES = (
     "Install_HMB_GP_Production.ps1",
@@ -70,7 +71,6 @@ DISTRIBUTION_ONLY_FILES = (
 SOURCE_FILES = (*RUNTIME_INSTALL_FILES, *DISTRIBUTION_ONLY_FILES)
 CANONICAL_CRLF_SOURCE_FILES = {
     PurePosixPath("Install_HMB_GP_Production.ps1"),
-    PurePosixPath("resources/tls/hmb_agent_broker_ca.pem"),
 }
 if len(RUNTIME_INSTALL_FILES) != 22 or len(DISTRIBUTION_ONLY_FILES) != 4:
     raise RuntimeError("Runtime/distribution release boundary count mismatch.")
@@ -95,9 +95,6 @@ FORBIDDEN_SUFFIXES = {
     ".token",
 }
 FORBIDDEN_RELEASE_CONTENT_MARKERS = (
-    b"_BUNDLED_AGENT_POLICY_FILE",
-    b"resources/agent/hmb_agent_core.dat",
-    b"resources\\agent\\hmb_agent_core.dat",
     b"resources/policy/HMB_GP_Production_Rule",
 )
 # A policy source must be rejected by filename even when an adversarial nested
@@ -107,11 +104,10 @@ POLICY_DOCUMENT_NAME = re.compile(r"(?i)polic(?:y|ies)")
 PRIVATE_KEY_HEADER = re.compile(
     rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
 )
-PUBLIC_CA_MEMBER = PurePosixPath("resources/tls/hmb_agent_broker_ca.pem")
-PUBLIC_CERTIFICATE = re.compile(
-    rb"\A-----BEGIN CERTIFICATE-----\r?\n"
-    rb"[A-Za-z0-9+/=\r\n]+"
-    rb"-----END CERTIFICATE-----\r?\n?\Z"
+BUNDLED_AGENT_POLICY_MEMBER = PurePosixPath("resources/agent/hmb_agent_core.dat")
+AGENT_POLICY_SOURCE_ENV = "HMB_AGENT_POLICY_SOURCE_PATH"
+DEFAULT_AGENT_POLICY_SOURCE = Path(
+    r"D:\AI\HMB_Agent_Core_Manager\build\hmb_agent_core.dat"
 )
 COMMON_TOKEN_PATTERNS = (
     re.compile(rb"AKIA[0-9A-Z]{16}"),
@@ -128,6 +124,81 @@ STANDARD_AGENT_MODEL_CATALOG_SHA256 = (
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def verify_signed_agent_policy_bytes(encoded: bytes) -> dict[str, str]:
+    """Verify the bundled policy with the same production trust implementation."""
+
+    module_path = ROOT / "_hmb_common.py"
+    spec = importlib.util.spec_from_file_location(
+        "_hmb_release_policy_verifier", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Production Agent policy verifier is unavailable.")
+    common = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(common)
+    payload = common._validate_agent_policy_payload(
+        common._decode_signed_agent_policy_envelope(encoded)
+    )
+    return {
+        "envelope_sha256": digest(encoded),
+        "final_policy_version": str(payload["final_policy_version"]),
+        "policy_pair_sha256": str(payload["policy_pair_sha256"]),
+    }
+
+
+def synchronize_bundled_agent_policy() -> dict[str, str]:
+    """Mirror the approved Manager build DAT into the runtime package.
+
+    Developer builds use the canonical Manager output (or the explicit CI
+    override). Public/isolated validation may use the already mirrored DAT
+    when that external build tree is unavailable. In both cases the exact
+    production RSA verifier runs before packaging.
+    """
+
+    override = os.environ.get(AGENT_POLICY_SOURCE_ENV, "").strip()
+    source = Path(override) if override else DEFAULT_AGENT_POLICY_SOURCE
+    destination = ROOT / Path(BUNDLED_AGENT_POLICY_MEMBER.as_posix())
+    encoded: bytes
+    if source.exists():
+        if not source.is_file() or source.is_symlink():
+            raise RuntimeError("Canonical Agent policy source is invalid.")
+        encoded = source.read_bytes()
+        if not encoded or len(encoded) > 128 * 1024:
+            raise RuntimeError("Canonical Agent policy source has an invalid size.")
+        verify_signed_agent_policy_bytes(encoded)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        current = destination.read_bytes() if destination.is_file() else None
+        if current != encoded:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=destination.name + ".",
+                suffix=".tmp",
+                dir=destination.parent,
+                delete=False,
+            ) as stream:
+                temporary = Path(stream.name)
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.replace(temporary, destination)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+    else:
+        if not destination.is_file() or destination.is_symlink():
+            raise RuntimeError(
+                "Canonical Agent policy source and bundled fallback are unavailable."
+            )
+        encoded = destination.read_bytes()
+    if (
+        not destination.is_file()
+        or destination.is_symlink()
+        or destination.read_bytes() != encoded
+    ):
+        raise RuntimeError("Bundled Agent policy mirror is invalid.")
+    return verify_signed_agent_policy_bytes(encoded)
 
 
 def canonical_release_source_data(member: PurePosixPath, data: bytes) -> bytes:
@@ -386,20 +457,25 @@ def validate_standard_agent_model_parity(
 
 
 def assert_release_member_allowed(member: PurePosixPath) -> None:
-    """Reject policy artifacts and review documents from every release layer."""
+    """Allow only the signed runtime DAT; reject all other policy artifacts."""
 
     relative = member.as_posix()
     lowered_parts = tuple(part.casefold() for part in member.parts)
     lowered_pairs = set(zip(lowered_parts, lowered_parts[1:]))
     if member.is_absolute() or ".." in member.parts or "\\" in relative:
         raise RuntimeError(f"Unsafe runtime release path: {relative}")
-    is_public_ca = tuple(part.casefold() for part in member.parts[-3:]) == tuple(
-        part.casefold() for part in PUBLIC_CA_MEMBER.parts
+    is_bundled_agent_policy = tuple(
+        part.casefold() for part in member.parts[-3:]
+    ) == tuple(
+        part.casefold() for part in BUNDLED_AGENT_POLICY_MEMBER.parts
     )
-    if member.suffix.casefold() in FORBIDDEN_SUFFIXES and not is_public_ca:
+    if (
+        member.suffix.casefold() in FORBIDDEN_SUFFIXES
+        and not is_bundled_agent_policy
+    ):
         raise RuntimeError(f"Forbidden runtime release member: {relative}")
     if (
-        ("resources", "agent") in lowered_pairs
+        (("resources", "agent") in lowered_pairs and not is_bundled_agent_policy)
         or ("resources", "policy") in lowered_pairs
         or "policy" in lowered_parts
         or "policies" in lowered_parts
@@ -414,7 +490,7 @@ def validate_no_policy_artifacts_in_zip(
     label: str = "release archive",
     depth: int = 0,
 ) -> None:
-    """Recursively reject .dat and policy documents, including nested ZIPs."""
+    """Allow the signed runtime DAT and reject every other policy artifact."""
 
     if not encoded or len(encoded) > MAX_NESTED_ARCHIVE_BYTES:
         raise RuntimeError(f"{label} has an invalid size.")
@@ -434,6 +510,14 @@ def validate_no_policy_artifacts_in_zip(
                     continue
                 if info.file_size > MAX_NESTED_ARCHIVE_BYTES:
                     raise RuntimeError(f"{label} member is too large: {info.filename}")
+                is_bundled_agent_policy = tuple(
+                    part.casefold() for part in member.parts[-3:]
+                ) == tuple(
+                    part.casefold() for part in BUNDLED_AGENT_POLICY_MEMBER.parts
+                )
+                if is_bundled_agent_policy:
+                    verify_signed_agent_policy_bytes(archive.read(info))
+                    continue
                 if member.suffix.casefold() != ".zip":
                     continue
                 if depth >= MAX_NESTED_ARCHIVE_DEPTH:
@@ -450,6 +534,7 @@ def validate_no_policy_artifacts_in_zip(
 
 
 def validate_sources() -> tuple[str, list[dict[str, Any]]]:
+    policy_identity = synchronize_bundled_agent_policy()
     validate_release_identity()
     library_manifest = json.loads(
         (ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8")
@@ -498,6 +583,22 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
     ):
         raise RuntimeError("Library secret registration boundary mismatch.")
     validate_standard_agent_model_parity(library_manifest)
+    delivery = library_manifest.get("metadata", {}).get("agent_policy_delivery", {})
+    if (
+        not isinstance(delivery, dict)
+        or delivery.get("archive_source_count") != len(SOURCE_FILES)
+        or delivery.get("mode") != "bundled_signed_dat"
+        or delivery.get("runtime_path") != BUNDLED_AGENT_POLICY_MEMBER.as_posix()
+        or delivery.get("policy_version")
+        != policy_identity["final_policy_version"]
+        or delivery.get("envelope_sha256")
+        != policy_identity["envelope_sha256"]
+        or delivery.get("contract_sha256")
+        != policy_identity["policy_pair_sha256"]
+        or delivery.get("verification")
+        != "rsa3072_sha256_v3_contract_once_per_process"
+    ):
+        raise RuntimeError("Bundled Agent policy delivery metadata mismatch.")
 
     declared_widget_paths = {
         str(item.get("path") or "").strip()
@@ -521,8 +622,10 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
         if not path.is_file() or path.is_symlink():
             raise RuntimeError(f"Missing or linked runtime release member: {relative}")
         data = canonical_release_source_data(member, path.read_bytes())
-        if member == PUBLIC_CA_MEMBER and PUBLIC_CERTIFICATE.fullmatch(data) is None:
-            raise RuntimeError("Agent Broker public CA bundle is invalid.")
+        if member == BUNDLED_AGENT_POLICY_MEMBER:
+            verified = verify_signed_agent_policy_bytes(data)
+            if verified != policy_identity:
+                raise RuntimeError("Bundled Agent policy identity mismatch.")
         if PRIVATE_KEY_HEADER.search(data) is not None:
             raise RuntimeError(f"Private signing key material remains in {relative}")
         if any(pattern.search(data) for pattern in COMMON_TOKEN_PATTERNS):
@@ -1076,6 +1179,8 @@ def make_archive(
                 raise RuntimeError(
                     f"Package-local or private policy reference remains in {relative}"
                 )
+            if member == BUNDLED_AGENT_POLICY_MEMBER:
+                verify_signed_agent_policy_bytes(data)
             if member.suffix.casefold() == ".zip":
                 validate_no_policy_artifacts_in_zip(
                     data,
@@ -1233,7 +1338,7 @@ def check_output(output_path: Path = ARCHIVE_PATH) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build a verified runtime-only ZIP that uses server-only policy delivery."
+        description="Build a verified runtime ZIP with the approved signed Agent DAT."
     )
     parser.add_argument(
         "--check",
