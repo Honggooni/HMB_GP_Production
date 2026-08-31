@@ -173,6 +173,18 @@ assert model_usage["model_ids"] == [
     "gtc_llama_3_3_70b",
     "gtc_llama_3_1_70b",
 ]
+model_catalog = next(
+    item
+    for item in manifest["metadata"]["declarations"]
+    if item.get("type") == "model_catalog"
+)
+catalog_model_ids = {
+    model_id
+    for provider in model_catalog["providers"].values()
+    for model_id in provider["models"]
+}
+assert len(catalog_model_ids) == 30
+assert catalog_model_ids == set(model_usage["model_ids"])
 
 # Direct server-policy disclosure is the only text-content guard retained.
 # It is exact and in-memory only: no semantic, translated, encoded, or fuzzy

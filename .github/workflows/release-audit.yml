@@ -273,7 +273,7 @@ jobs:
             "## HMB GP Production $releaseLabel",
             "",
             "- Keeps HMBAgentLibrary focused on authenticated server-policy execution, exact Shot routing, protected-state non-exposure, and publishable final text while leaving provider media limits to the Generator.",
-            "- Declares the supported Standard Agent model surface and reports bounded execution stage/error codes without exposing credentials, prompts, URLs, or policy content.",
+            "- Keeps HMBAgentLibrary model declarations in exact parity with the installed Standard Agent surface, preserving host permission and accounting without adding an HMB-specific model allowlist.",
             "- Keeps each visual Look Reference Target editable per shot for active named renderable targets or explicit Global Look; camera/composition remains isolated to its dedicated video or Custom authority.",
             "- Prefers Griptape Cloud HTTPS for local/Base64 images and local videos only when authentication and an accessible bucket are ready; otherwise images retain bounded Base64 and videos retain public HTTPS, asset://, or configured TOS fallbacks.",
             "- Recomputes VideoPicker Generate availability immediately for Original, Mask, Depth, and Motion Guide output choices while preserving command locks.",

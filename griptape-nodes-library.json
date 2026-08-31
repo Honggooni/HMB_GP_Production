@@ -2,9 +2,229 @@
   "name": "HMB_GP_Production",
   "library_schema_version": "0.10.0",
   "metadata": {
+    "declarations": [
+      {
+        "type": "model_catalog",
+        "providers": {
+          "anthropic": {
+            "display_name": "Anthropic",
+            "models": {
+              "gtc_claude_haiku_4_5": {
+                "display_name": "Claude Haiku 4.5",
+                "family": "Claude 4",
+                "provider_model_id": "claude-haiku-4-5",
+                "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
+              },
+              "gtc_claude_opus_5": {
+                "display_name": "Claude Opus 5",
+                "family": "Claude 5",
+                "provider_model_id": "claude-opus-5",
+                "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
+              },
+              "gtc_claude_sonnet_5": {
+                "display_name": "Claude Sonnet 5",
+                "family": "Claude 5",
+                "provider_model_id": "claude-sonnet-5",
+                "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
+              }
+            }
+          },
+          "deepseek": {
+            "display_name": "DeepSeek",
+            "models": {
+              "gtc_deepseek_v3": {
+                "display_name": "DeepSeek V3",
+                "family": "DeepSeek V3",
+                "provider_model_id": "deepseek-v3",
+                "key_support": "REQUIRES_GRIPTAPE_KEY"
+              },
+              "gtc_deepseek_r1": {
+                "display_name": "DeepSeek R1",
+                "family": "DeepSeek R1",
+                "provider_model_id": "deepseek.r1-v1",
+                "key_support": "REQUIRES_GRIPTAPE_KEY"
+              }
+            }
+          },
+          "meta": {
+            "display_name": "Meta",
+            "models": {
+              "gtc_llama_3_3_70b": {
+                "display_name": "Llama 3.3 70B Instruct",
+                "family": "Llama 3",
+                "provider_model_id": "llama3-3-70b-instruct-v1",
+                "key_support": "REQUIRES_GRIPTAPE_KEY"
+              },
+              "gtc_llama_3_1_70b": {
+                "display_name": "Llama 3.1 70B Instruct",
+                "family": "Llama 3",
+                "provider_model_id": "llama3-1-70b-instruct-v1",
+                "key_support": "REQUIRES_GRIPTAPE_KEY"
+              }
+            }
+          },
+          "google": {
+            "display_name": "Google",
+            "models": {
+              "gtc_gemini_3_1_pro": {
+                "display_name": "Gemini 3.1 Pro",
+                "family": "Gemini",
+                "provider_model_id": "gemini-3.1-pro",
+                "key_support": "REQUIRES_GRIPTAPE_KEY"
+              },
+              "gtc_gemini_3_1_flash_lite": {
+                "display_name": "Gemini 3.1 Flash-Lite",
+                "family": "Gemini",
+                "provider_model_id": "gemini-3.1-flash-lite",
+                "key_support": "REQUIRES_GRIPTAPE_KEY"
+              },
+              "gtc_gemini_3_flash": {
+                "display_name": "Gemini 3 Flash",
+                "family": "Gemini",
+                "provider_model_id": "gemini-3-flash",
+                "key_support": "REQUIRES_GRIPTAPE_KEY"
+              },
+              "gtc_gemini_2_5_pro": {
+                "display_name": "Gemini 2.5 Pro",
+                "family": "Gemini",
+                "provider_model_id": "gemini-2.5-pro",
+                "key_support": "REQUIRES_GRIPTAPE_KEY"
+              },
+              "gtc_gemini_2_5_flash": {
+                "display_name": "Gemini 2.5 Flash",
+                "family": "Gemini",
+                "provider_model_id": "gemini-2.5-flash",
+                "key_support": "REQUIRES_GRIPTAPE_KEY"
+              },
+              "gtc_gemini_2_5_flash_lite": {
+                "display_name": "Gemini 2.5 Flash-Lite",
+                "family": "Gemini",
+                "provider_model_id": "gemini-2.5-flash-lite",
+                "key_support": "REQUIRES_GRIPTAPE_KEY"
+              },
+              "gtc_gemini_3_6_flash": {
+                "display_name": "Gemini 3.6 Flash",
+                "family": "Gemini",
+                "provider_model_id": "gemini-3.6-flash",
+                "key_support": "REQUIRES_GRIPTAPE_KEY"
+              },
+              "gtc_gemini_3_5_flash": {
+                "display_name": "Gemini 3.5 Flash",
+                "family": "Gemini",
+                "provider_model_id": "gemini-3.5-flash",
+                "key_support": "REQUIRES_GRIPTAPE_KEY"
+              },
+              "gtc_gemini_3_5_flash_lite": {
+                "display_name": "Gemini 3.5 Flash-Lite",
+                "family": "Gemini",
+                "provider_model_id": "gemini-3.5-flash-lite",
+                "key_support": "REQUIRES_GRIPTAPE_KEY"
+              }
+            }
+          },
+          "openai": {
+            "display_name": "OpenAI",
+            "models": {
+              "gtc_gpt_5_2": {
+                "display_name": "GPT-5.2",
+                "family": "GPT",
+                "provider_model_id": "gpt-5.2",
+                "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
+              },
+              "gtc_gpt_5_2_chat": {
+                "display_name": "GPT-5.2 Chat",
+                "family": "GPT",
+                "provider_model_id": "gpt-5.2-chat",
+                "key_support": "REQUIRES_GRIPTAPE_KEY"
+              },
+              "gtc_gpt_5_1": {
+                "display_name": "GPT-5.1",
+                "family": "GPT",
+                "provider_model_id": "gpt-5.1",
+                "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
+              },
+              "gtc_gpt_5": {
+                "display_name": "GPT-5",
+                "family": "GPT",
+                "provider_model_id": "gpt-5",
+                "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
+              },
+              "gtc_gpt_5_mini": {
+                "display_name": "GPT-5 mini",
+                "family": "GPT",
+                "provider_model_id": "gpt-5-mini",
+                "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
+              },
+              "gtc_gpt_5_nano": {
+                "display_name": "GPT-5 nano",
+                "family": "GPT",
+                "provider_model_id": "gpt-5-nano",
+                "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
+              },
+              "gtc_gpt_4_1": {
+                "display_name": "GPT-4.1",
+                "family": "GPT",
+                "provider_model_id": "gpt-4.1",
+                "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
+              },
+              "gtc_gpt_4_1_mini": {
+                "display_name": "GPT-4.1 mini",
+                "family": "GPT",
+                "provider_model_id": "gpt-4.1-mini",
+                "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
+              },
+              "gtc_gpt_4_1_nano": {
+                "display_name": "GPT-4.1 nano",
+                "family": "GPT",
+                "provider_model_id": "gpt-4.1-nano",
+                "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
+              },
+              "gtc_gpt_4o": {
+                "display_name": "GPT-4o",
+                "family": "GPT",
+                "provider_model_id": "gpt-4o",
+                "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
+              },
+              "gtc_o4_mini": {
+                "display_name": "o4 mini",
+                "family": "o-series",
+                "provider_model_id": "o4-mini",
+                "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
+              },
+              "gtc_o3": {
+                "display_name": "o3",
+                "family": "o-series",
+                "provider_model_id": "o3",
+                "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
+              },
+              "gtc_o3_mini": {
+                "display_name": "o3 mini",
+                "family": "o-series",
+                "provider_model_id": "o3-mini",
+                "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
+              },
+              "gtc_o1": {
+                "display_name": "o1",
+                "family": "o-series",
+                "provider_model_id": "o1",
+                "key_support": "SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY"
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "worker_mode_compatibility",
+        "compatibility": "INCOMPATIBLE"
+      },
+      {
+        "type": "suggested_worker_mode",
+        "mode": "ORCHESTRATOR"
+      }
+    ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.7.13",
+    "library_version": "0.7.15",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
       "archive_source_count": 26,
@@ -99,6 +319,7 @@
       "MotionGuideSidecarFrames",
       "OptionalArtifactFailureIsolation",
       "NativeAgentWithoutHMBPrompt",
+      "StandardAgentModelParity",
       "CanonicalHMBPolicyFailClosed",
       "NestedPropReferences",
       "LazyOriginalPlayblast",
@@ -161,17 +382,7 @@
         "httpx==0.28.1",
         "tos==2.9.2"
       ]
-    },
-    "declarations": [
-      {
-        "type": "worker_mode_compatibility",
-        "compatibility": "INCOMPATIBLE"
-      },
-      {
-        "type": "suggested_worker_mode",
-        "mode": "ORCHESTRATOR"
-      }
-    ]
+    }
   },
   "settings": [
     {
@@ -204,7 +415,7 @@
       "file_path": "HMBAgentLibrary.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "Runs Griptape Agent with authenticated Broker policy.\nOnly mode works; invalid policy blocks execution.",
+        "description": "Runs the stock Griptape Agent model surface with authenticated Broker policy.\nThe model declaration mirrors the installed Standard Agent for host permission and accounting; it is not an HMB content allowlist.",
         "display_name": "HMBAgentLibrary",
         "declarations": [
           {

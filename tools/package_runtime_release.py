@@ -17,8 +17,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.7.13"
-RELEASE_VERSION = "0.7.13"
+RELEASE_LABEL = "v0.7.15"
+RELEASE_VERSION = "0.7.15"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -117,6 +117,11 @@ COMMON_TOKEN_PATTERNS = (
     re.compile(rb"gh[opsu]_[A-Za-z0-9]{30,}"),
     re.compile(rb"sk-[A-Za-z0-9_-]{20,}"),
 )
+STANDARD_AGENT_LIBRARY_ENV = "HMB_GRIPTAPE_STANDARD_LIBRARY_PATH"
+STANDARD_AGENT_MANIFEST_NAME = "griptape_nodes_library.json"
+STANDARD_AGENT_MODEL_CATALOG_SHA256 = (
+    "7ce86d43b7039126a51d433d72563aefc7bec3aaf86a5a3f88f362da987e39ed"
+)
 
 
 def digest(data: bytes) -> str:
@@ -170,6 +175,203 @@ def module_string_constant(path: Path, name: str) -> str:
     if len(matches) != 1:
         raise RuntimeError(f"Expected one {name} assignment in {path.name}.")
     return matches[0]
+
+
+def node_model_usage_ids(
+    library_manifest: dict[str, Any],
+    class_name: str,
+) -> tuple[str, ...]:
+    """Return one node's exact, unique model-usage declaration."""
+
+    nodes = library_manifest.get("nodes")
+    if not isinstance(nodes, list):
+        raise RuntimeError("Library node declarations are missing or invalid.")
+    matches = [
+        node
+        for node in nodes
+        if isinstance(node, dict) and node.get("class_name") == class_name
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(f"Expected one {class_name} node declaration.")
+    metadata = matches[0].get("metadata")
+    declarations = metadata.get("declarations") if isinstance(metadata, dict) else None
+    usages = [
+        item
+        for item in declarations if isinstance(item, dict) and item.get("type") == "model_usage"
+    ] if isinstance(declarations, list) else []
+    if len(usages) != 1:
+        raise RuntimeError(f"Expected one {class_name} model-usage declaration.")
+    raw_ids = usages[0].get("model_ids")
+    if (
+        not isinstance(raw_ids, list)
+        or not raw_ids
+        or any(not isinstance(item, str) or not item.strip() for item in raw_ids)
+        or len(raw_ids) != len(set(raw_ids))
+    ):
+        raise RuntimeError(f"{class_name} model-usage declaration is invalid.")
+    return tuple(raw_ids)
+
+
+def library_model_catalog_providers(
+    library_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the sole library model catalog's provider mapping."""
+
+    metadata = library_manifest.get("metadata")
+    declarations = metadata.get("declarations") if isinstance(metadata, dict) else None
+    catalogs = [
+        item
+        for item in declarations if isinstance(item, dict) and item.get("type") == "model_catalog"
+    ] if isinstance(declarations, list) else []
+    if len(catalogs) != 1:
+        raise RuntimeError("Expected one library model catalog declaration.")
+    providers = catalogs[0].get("providers")
+    if not isinstance(providers, dict) or not providers:
+        raise RuntimeError("Library model catalog providers are missing or invalid.")
+    return providers
+
+
+def library_model_catalog_ids(
+    library_manifest: dict[str, Any],
+) -> tuple[str, ...]:
+    """Return the exact unique model ids declared by this library's catalog."""
+
+    providers = library_model_catalog_providers(library_manifest)
+    ids: list[str] = []
+    for provider in providers.values():
+        models = provider.get("models") if isinstance(provider, dict) else None
+        if not isinstance(models, dict) or not models:
+            raise RuntimeError("Library model catalog provider is missing models.")
+        ids.extend(str(model_id) for model_id in models)
+    if any(not model_id.strip() for model_id in ids) or len(ids) != len(set(ids)):
+        raise RuntimeError("Library model catalog contains invalid or duplicate ids.")
+    return tuple(ids)
+
+
+def library_model_catalog_contract_sha256(
+    library_manifest: dict[str, Any],
+) -> str:
+    """Hash every provider and model field in the pinned Agent catalog subset."""
+
+    providers = library_model_catalog_providers(library_manifest)
+    canonical = json.dumps(
+        providers,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return digest(canonical)
+
+
+def standard_agent_manifest_candidates() -> tuple[Path, ...]:
+    """Return explicit and conventional installed Standard Agent manifests."""
+
+    candidates: list[Path] = []
+    configured = str(os.environ.get(STANDARD_AGENT_LIBRARY_ENV, "") or "").strip()
+    if configured:
+        configured_path = Path(configured).expanduser()
+        if configured_path.suffix.casefold() == ".json":
+            candidates.append(configured_path)
+        elif configured_path.name.casefold() == "agent.py":
+            candidates.append(configured_path.parents[2] / STANDARD_AGENT_MANIFEST_NAME)
+        elif configured_path.name.casefold() == "griptape_nodes_library":
+            candidates.append(configured_path.parent / STANDARD_AGENT_MANIFEST_NAME)
+        else:
+            candidates.append(configured_path / STANDARD_AGENT_MANIFEST_NAME)
+    candidates.append(
+        Path.home()
+        / "Documents"
+        / "GriptapeNodes"
+        / "libraries"
+        / "griptape-nodes-library-standard"
+        / STANDARD_AGENT_MANIFEST_NAME
+    )
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate.resolve(strict=False)).casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return tuple(unique)
+
+
+def validate_standard_agent_model_parity(
+    library_manifest: dict[str, Any],
+) -> Path | None:
+    """Keep HMB's host declaration equal to the installed stock Agent surface.
+
+    ``model_usage`` is the Griptape permission/accounting declaration required
+    before a model call; it is not an HMB content allowlist.  Public CI may not
+    have the Standard Library checkout, so the HMB declaration is always
+    validated for shape and uniqueness, and exact stock parity is additionally
+    enforced whenever the canonical installed manifest is available.
+    """
+
+    hmb_ids = node_model_usage_ids(library_manifest, "HMBAgentLibrary")
+    catalog_ids = library_model_catalog_ids(library_manifest)
+    catalog_contract_sha256 = library_model_catalog_contract_sha256(library_manifest)
+    if catalog_contract_sha256 != STANDARD_AGENT_MODEL_CATALOG_SHA256:
+        raise RuntimeError(
+            "HMBAgentLibrary pinned Standard Agent model catalog contract changed "
+            f"({catalog_contract_sha256})."
+        )
+    if set(hmb_ids) != set(catalog_ids):
+        unresolved = sorted(set(hmb_ids) - set(catalog_ids))
+        unused = sorted(set(catalog_ids) - set(hmb_ids))
+        raise RuntimeError(
+            "HMBAgentLibrary model usage does not resolve inside its own catalog "
+            f"(unresolved={unresolved}, unused={unused})."
+        )
+    for candidate in standard_agent_manifest_candidates():
+        if not candidate.is_file():
+            continue
+        try:
+            standard_manifest = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Installed Standard Agent manifest is invalid: {candidate}"
+            ) from exc
+        standard_ids = node_model_usage_ids(standard_manifest, "Agent")
+        if hmb_ids != standard_ids:
+            missing = sorted(set(standard_ids) - set(hmb_ids))
+            extra = sorted(set(hmb_ids) - set(standard_ids))
+            raise RuntimeError(
+                "HMBAgentLibrary model declaration differs from the installed "
+                f"Standard Agent (missing={missing}, extra={extra})."
+            )
+        hmb_providers = library_model_catalog_providers(library_manifest)
+        standard_providers = library_model_catalog_providers(standard_manifest)
+        for provider_id, hmb_provider in hmb_providers.items():
+            standard_provider = standard_providers.get(provider_id)
+            if not isinstance(hmb_provider, dict) or not isinstance(standard_provider, dict):
+                raise RuntimeError(
+                    f"Standard Agent model provider mismatch: {provider_id}."
+                )
+            hmb_provider_metadata = {
+                key: value for key, value in hmb_provider.items() if key != "models"
+            }
+            standard_provider_metadata = {
+                key: value for key, value in standard_provider.items() if key != "models"
+            }
+            if hmb_provider_metadata != standard_provider_metadata:
+                raise RuntimeError(
+                    f"Standard Agent model provider metadata mismatch: {provider_id}."
+                )
+            hmb_models = hmb_provider.get("models")
+            standard_models = standard_provider.get("models")
+            if not isinstance(hmb_models, dict) or not isinstance(standard_models, dict):
+                raise RuntimeError(
+                    f"Standard Agent model provider payload mismatch: {provider_id}."
+                )
+            for model_id, hmb_model in hmb_models.items():
+                if standard_models.get(model_id) != hmb_model:
+                    raise RuntimeError(
+                        "Standard Agent model catalog field mismatch: "
+                        f"{provider_id}/{model_id}."
+                    )
+        return candidate
+    return None
 
 
 def assert_release_member_allowed(member: PurePosixPath) -> None:
@@ -290,6 +492,7 @@ def validate_sources() -> tuple[str, list[dict[str, Any]]]:
         value != "" for value in registered_secrets.values()
     ):
         raise RuntimeError("Library secret registration boundary mismatch.")
+    validate_standard_agent_model_parity(library_manifest)
 
     declared_widget_paths = {
         str(item.get("path") or "").strip()

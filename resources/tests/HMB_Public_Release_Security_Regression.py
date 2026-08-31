@@ -15,8 +15,8 @@ POLICY_VERSION = "2026-08-27.agent-shot-quality.v4.5"
 POLICY_CONTRACT_SHA256 = (
     "86852214d3e1a29eab12a2b0cff0302f6920d5d3ce3b00947d96ef1eb952c872"
 )
-RELEASE_LABEL = "v0.7.13"
-RELEASE_VERSION = "0.7.13"
+RELEASE_LABEL = "v0.7.15"
+RELEASE_VERSION = "0.7.15"
 EXPECTED_RUNTIME_INSTALL_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
@@ -149,7 +149,7 @@ assert len(EXPECTED_SOURCE_FILES) == (
 )
 assert builder.RELEASE_LABEL == RELEASE_LABEL
 assert builder.RELEASE_VERSION == RELEASE_VERSION
-assert builder.release_version_parts(RELEASE_VERSION) == (0, 7, 13)
+assert builder.release_version_parts(RELEASE_VERSION) == (0, 7, 15)
 assert builder.release_label_for_version(RELEASE_VERSION) == RELEASE_LABEL
 builder.validate_release_identity(RELEASE_LABEL, RELEASE_VERSION)
 for invalid_version in (
@@ -165,14 +165,14 @@ for invalid_version in (
         pass
     else:
         raise AssertionError(f"Invalid technical SemVer was accepted: {invalid_version}")
-for mismatched_label in ("v0.7.013", "v0.7.12", "0.7.13"):
+for mismatched_label in ("v0.7.015", "v0.7.14", "0.7.15"):
     try:
         builder.validate_release_identity(mismatched_label, RELEASE_VERSION)
     except RuntimeError:
         pass
     else:
         raise AssertionError(f"Mismatched public release label was accepted: {mismatched_label}")
-assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.7.13_Runtime.zip"
+assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.7.15_Runtime.zip"
 assert builder.ARCHIVE_NAME == f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 assert builder.POLICY_VERSION == POLICY_VERSION
 assert builder.POLICY_CONTRACT_SHA256 == POLICY_CONTRACT_SHA256
@@ -192,6 +192,46 @@ delivery = manifest["metadata"]["agent_policy_delivery"]
 assert delivery["archive_source_count"] == len(EXPECTED_SOURCE_FILES)
 assert "launcher_path" not in delivery
 assert "bootstrap_marker" not in delivery
+agent_model_ids = builder.node_model_usage_ids(manifest, "HMBAgentLibrary")
+assert len(agent_model_ids) == 30
+assert len(agent_model_ids) == len(set(agent_model_ids))
+catalog_model_ids = builder.library_model_catalog_ids(manifest)
+assert len(catalog_model_ids) == 30
+assert set(agent_model_ids) == set(catalog_model_ids)
+assert (
+    builder.library_model_catalog_contract_sha256(manifest)
+    == builder.STANDARD_AGENT_MODEL_CATALOG_SHA256
+)
+saved_standard_root = os.environ.get(builder.STANDARD_AGENT_LIBRARY_ENV)
+synthetic_standard_root = ROOT / "_not_materialized_standard_library"
+try:
+    configured_manifest_shapes = (
+        (synthetic_standard_root, synthetic_standard_root / builder.STANDARD_AGENT_MANIFEST_NAME),
+        (
+            synthetic_standard_root / "griptape_nodes_library",
+            synthetic_standard_root / builder.STANDARD_AGENT_MANIFEST_NAME,
+        ),
+        (
+            synthetic_standard_root / "griptape_nodes_library" / "agents" / "agent.py",
+            synthetic_standard_root / builder.STANDARD_AGENT_MANIFEST_NAME,
+        ),
+        (
+            synthetic_standard_root / builder.STANDARD_AGENT_MANIFEST_NAME,
+            synthetic_standard_root / builder.STANDARD_AGENT_MANIFEST_NAME,
+        ),
+    )
+    for configured_path, expected_manifest in configured_manifest_shapes:
+        os.environ[builder.STANDARD_AGENT_LIBRARY_ENV] = str(configured_path)
+        assert builder.standard_agent_manifest_candidates()[0] == expected_manifest
+finally:
+    if saved_standard_root is None:
+        os.environ.pop(builder.STANDARD_AGENT_LIBRARY_ENV, None)
+    else:
+        os.environ[builder.STANDARD_AGENT_LIBRARY_ENV] = saved_standard_root
+standard_manifest_path = builder.validate_standard_agent_model_parity(manifest)
+if standard_manifest_path is not None:
+    standard_manifest = json.loads(standard_manifest_path.read_text(encoding="utf-8"))
+    assert agent_model_ids == builder.node_model_usage_ids(standard_manifest, "Agent")
 assert sbom["name"] == f"HMB_GP_Production-{RELEASE_VERSION}"
 assert sbom["documentNamespace"].endswith(f"/{RELEASE_VERSION}")
 assert next(
