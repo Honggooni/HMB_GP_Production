@@ -191,24 +191,24 @@ look_source["images"][0].update(
         "asset_source_kind": "project",
         "asset_source_uid": "verified-look-axis",
         "asset_image_main_type_candidate": "Look Reference",
-        "asset_image_sub_type_candidate": "Render Look",
+        "asset_image_sub_type_candidate": "Render Style",
         "image_main_type": "Look Reference",
-        "image_sub_type": "Render Look",
+        "image_sub_type": "Render Style",
         "owner": "Global Look",
     }
 )
 look_ui = copy.deepcopy(look_source)
 look_ui["images"][0]["asset_image_sub_type_candidate"] = "Color Mood"
 look_ui["images"][0]["image_sub_type"] = "Scale"
-look_ui["images"][0]["owner"] = "Camera / Composition"
+look_ui["images"][0]["owner"] = "Director Camera"
 look_merged = prompt._merge_prompt_revision_axes(look_source, look_ui)
 look_row = look_merged["images"][0]
-assert look_row["asset_image_sub_type_candidate"] == "Render Look"
+assert look_row["asset_image_sub_type_candidate"] == "Render Style"
 assert look_row["image_main_type"] == "Look Reference"
 assert look_row["image_sub_type"] == "Scale"
 assert look_row["source_type"] == "Role Required / Select Source Type"
 assert look_row["scope"] == ""
-assert look_row["owner"] == "Camera / Composition"
+assert look_row["owner"] == "Director Camera"
 assert look_row["color_picks"] == [""]
 
 # A stale registered default is not an override. A newer global registration

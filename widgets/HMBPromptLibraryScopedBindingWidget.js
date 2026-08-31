@@ -142,7 +142,7 @@ export function hmbScopeWidgetStyleMarkup(markup, rootSelector) {
 }
 
 const IMAGE_TAXONOMY_SCHEMA = "hmb-image-taxonomy";
-const IMAGE_TAXONOMY_VERSION = 2;
+const IMAGE_TAXONOMY_VERSION = 3;
 let IMAGE_MAIN_TYPES = [
   "Select Image Main Type",
   "Character",
@@ -167,8 +167,9 @@ let IMAGE_SUB_TYPES = {
     "Independent Scene Prop", "Interactive Scene Prop", "Set / Structure",
   ],
   "Look Reference": [
-    "Color Mood", "Lighting / Atmosphere", "Render Look",
-    "Color / Look / Lighting", "ch_Scale", "bg_Scale", "ch_Scale / bg_Scale",
+    "Color Mood", "Lighting / Atmosphere", "Render Style",
+    "Color / Look / Lighting", "Camera / Composition",
+    "ch_Scale", "bg_Scale", "ch_Scale / bg_Scale",
   ],
   "Custom / Context": ["Context", "Custom"],
 };
@@ -194,8 +195,9 @@ let IMAGE_TAXONOMY_WIRE_MAP = Object.freeze({
   "Background Prop\u0000Set / Structure": ["Set / Structure", "Set geometry / structure only"],
   "Look Reference\u0000Color Mood": ["Color / Look Reference", "Color mood only"],
   "Look Reference\u0000Lighting / Atmosphere": ["Lighting / Atmosphere Reference", "Lighting mood only"],
-  "Look Reference\u0000Render Look": ["Color / Look Reference", "Render look only"],
+  "Look Reference\u0000Render Style": ["Color / Look Reference", "Render style only"],
   "Look Reference\u0000Color / Look / Lighting": ["Color + Look + Lighting Mood Reference", "All color + look + lighting functions"],
+  "Look Reference\u0000Camera / Composition": ["Camera / Composition Reference", "Camera framing / composition only"],
   "Look Reference\u0000ch_Scale": ["Relative Size Reference", "Character Relative Size Only"],
   "Look Reference\u0000bg_Scale": ["Relative Size Reference", "Background Relative Size / Placement Only"],
   "Look Reference\u0000ch_Scale / bg_Scale": ["Relative Size Reference", "Character / Background Relative Size / Placement Only"],
@@ -205,7 +207,45 @@ let IMAGE_TAXONOMY_WIRE_MAP = Object.freeze({
 
 const IMAGE_GLOBAL_LOOK_TARGET = "Global Look";
 const IMAGE_CUSTOM_LOOK_TARGET = "Custom";
+const IMAGE_CAMERA_COMPOSITION_SUB_TYPE = "Camera / Composition";
 const imageTargetKey = (value) => clean(value).normalize("NFKC").toLowerCase();
+const IMAGE_NON_TARGET_KEYS = new Set([
+  IMAGE_GLOBAL_LOOK_TARGET,
+  IMAGE_CUSTOM_LOOK_TARGET,
+  IMAGE_CAMERA_COMPOSITION_SUB_TYPE,
+].map(imageTargetKey));
+
+function isLookReferenceImage(item) {
+  return clean(item && item.image_main_type) === "Look Reference";
+}
+
+function isImageTargetModeToken(value) {
+  return IMAGE_NON_TARGET_KEYS.has(imageTargetKey(value));
+}
+
+function normalizeImageTargetAuthority(item) {
+  if (!item || typeof item !== "object") return item;
+  const lookReference = isLookReferenceImage(item);
+  const ownerKey = imageTargetKey(item.owner);
+  const globalLookKey = imageTargetKey(IMAGE_GLOBAL_LOOK_TARGET);
+  const customLookKey = imageTargetKey(IMAGE_CUSTOM_LOOK_TARGET);
+  const cameraCompositionKey = imageTargetKey(IMAGE_CAMERA_COMPOSITION_SUB_TYPE);
+  if (
+    ownerKey === cameraCompositionKey
+    || (!lookReference && (ownerKey === globalLookKey || ownerKey === customLookKey))
+  ) {
+    item.owner = "";
+  }
+  if (!lookReference) item.look_custom_instruction = "";
+  return item;
+}
+
+export function hmbImageCustomTargetInstructionVisible(item) {
+  return Boolean(
+    isLookReferenceImage(item)
+    && imageTargetKey(item && item.owner) === imageTargetKey(IMAGE_CUSTOM_LOOK_TARGET)
+  );
+}
 
 // Compact authoring taxonomy.  These values are saved by Prompt only; the
 // established source_type/control_role pair remains the signed Agent wire
@@ -257,7 +297,7 @@ const LOOK_REFERENCE_AUTHORITY_HINTS = Object.freeze({
     en: "Environmental palette, grade, color spill and value/saturation response apply only to the selected Target; intrinsic albedo, hue family, markings, pattern and material class stay unchanged. Choose Global Look for scene-wide use. Reference content is never copied.",
     ko: "환경 팔레트·그레이드·색 번짐·명도/채도 반응만 선택한 대상에 적용하며 고유 색상군·마킹·패턴·재질 종류는 유지합니다. 장면 전체는 전체 룩을 선택하세요. 참조 내용은 절대 복제하지 않습니다.",
   }),
-  "Render Look": Object.freeze({
+  "Render Style": Object.freeze({
     en: "Shading response, detail and finish harmonize only within the selected Target's approved stylization, rendering medium and material class. Choose Global Look for scene-wide use; medium/material family stays unchanged and reference content is never copied.",
     ko: "선택한 대상의 승인된 스타일화·렌더링 매체·재질 종류 안에서 셰이딩 반응·디테일·마감만 조화시킵니다. 장면 전체는 전체 룩을 선택하며 매체·재질 계열 변경이나 참조 내용 복제를 금지합니다.",
   }),
@@ -268,6 +308,10 @@ const LOOK_REFERENCE_AUTHORITY_HINTS = Object.freeze({
   "Lighting / Atmosphere": Object.freeze({
     en: "Light direction and quality, exposure, white balance and atmosphere use Global Look by default. A named Target or Custom instruction may narrow the affected properties and local scope; blank Target is also preserved. Identity and content stay unchanged and reference scenery is never copied.",
     ko: "광원 방향·광질·노출·화이트밸런스·대기는 기본적으로 전체 룩으로 적용할 수 있습니다. 개별 대상 또는 사용자 지정 지시로 영향 속성과 로컬 범위를 좁힐 수 있으며 빈 대상도 그대로 유지합니다. 정체성과 실제 내용은 유지하고 참조 배경은 복제하지 않습니다.",
+  }),
+  "Camera / Composition": Object.freeze({
+    en: "Camera framing, layout and composition evidence only. It does not transfer depicted objects, identity, color, material, lighting, motion or FX from the reference.",
+    ko: "카메라 프레이밍·레이아웃·구도 참고만 제공합니다. 참조 이미지의 오브젝트·정체성·색·재질·조명·모션·FX는 전달하지 않습니다.",
   }),
   ch_Scale: Object.freeze({
     en: "Measurement-only character/Character Prop size against the actual background. Use an individual character target or ch_all. Never copy color, lighting, objects, pixels, or pictorial content from the sheet.",
@@ -371,7 +415,7 @@ const HMB_OPTION_KO = {
   "Set / Structure": "세트 / 구조물",
   "Color Mood": "색감 분위기",
   "Lighting / Atmosphere": "조명 / 분위기",
-  "Render Look": "렌더 룩",
+  "Render Style": "렌더 스타일",
   "Color / Look / Lighting": "색감 / 룩 / 조명",
   "ch_Scale": "캐릭터 상대 크기",
   "bg_Scale": "배경 상대 크기 / 배치",
@@ -389,6 +433,7 @@ const HMB_OPTION_KO = {
   "Color / Look Reference": "색감 / 룩 참조",
   "Color + Look + Lighting Mood Reference": "색감 + 룩 + 조명 분위기 참조",
   "Lighting / Atmosphere Reference": "조명 / 분위기 참조",
+  "Camera / Composition Reference": "카메라 / 구도 참조",
   "Relative Size Reference": "상대 크기 참조",
   "Custom": "사용자 지정",
   "Camera / Composition": "카메라 / 구도",
@@ -414,8 +459,9 @@ const HMB_OPTION_KO = {
   "Foreground element": "전경 요소",
   "Color mood only": "색감 분위기만",
   "Lighting mood only": "조명 분위기만",
-  "Render look only": "렌더 룩만",
+  "Render style only": "렌더 스타일만",
   "All color + look + lighting functions": "색감 + 룩 + 조명 전체",
+  "Camera framing / composition only": "카메라 프레이밍 / 구도만",
   "Character Relative Size Only": "캐릭터 상대 크기만",
   "Background Relative Size / Placement Only": "배경 상대 크기 / 배치만",
   "Character / Background Relative Size / Placement Only": "캐릭터 / 배경 상대 크기 / 배치만",
@@ -1401,6 +1447,7 @@ export function normalizeImageTaxonomy(item) {
   }
   item.owner = clean(item.owner);
   item.look_custom_instruction = clean(item.look_custom_instruction).slice(0, MAX_DESCRIPTION_CHARS);
+  normalizeImageTargetAuthority(item);
   item.custom_source_type = clean(item.custom_source_type);
   item.color_picks = normalizeColorPicks(item.color_picks);
   return [mainType, subType];
@@ -2706,7 +2753,7 @@ export function normalizeState(input) {
   const videos = normalizeRows(input && input.videos, "video", MAX_VIDEOS);
 
   const imageReset = resetImagesBoundToInactiveVideos(normalizeRows(input && input.images, "image", MAX_IMAGES), videos);
-  const images = imageReset.images;
+  const images = hmbReconcileImageTargetContract(imageReset.images);
   const imageAssetConnected = Boolean(input?.image_asset?.enabled);
   const activeImageCount = images.filter(
     (item) => isActiveImage(item) && (!imageAssetConnected || Boolean(item?.asset_managed)),
@@ -5229,22 +5276,74 @@ function targetCandidateRows(images) {
   return (images || []).filter((row) => isActiveImage(row));
 }
 
+function nonLookTargetCandidateRows(images) {
+  return targetCandidateRows(images).filter((row) => !isLookReferenceImage(row));
+}
+
+function lookReferenceTargetKeys(images) {
+  return new Set(
+    targetCandidateRows(images)
+      .filter((row) => isLookReferenceImage(row))
+      .flatMap((row, idx) => [clean(row?.owner), clean(row?.label), imageTargetLabel(row, idx)])
+      .filter((value) => Boolean(value) && !isImageTargetModeToken(value))
+      .map(imageTargetKey),
+  );
+}
+
+export function hmbReconcileImageTargetContract(images) {
+  const rows = Array.isArray(images) ? images : [];
+  rows.forEach(normalizeImageTargetAuthority);
+  const activeRows = targetCandidateRows(rows);
+  const lookKeys = lookReferenceTargetKeys(activeRows);
+  activeRows.forEach((item) => {
+    if (isLookReferenceImage(item)) return;
+    const ownerKey = imageTargetKey(item.owner);
+    if (!ownerKey || !lookKeys.has(ownerKey)) return;
+    const nonLookCandidateKeys = new Set();
+    activeRows.forEach((candidate) => {
+      if (isLookReferenceImage(candidate)) return;
+      const values = candidate === item
+        ? [clean(candidate?.label)]
+        : [clean(candidate?.owner), clean(candidate?.label), imageTargetLabel(candidate)];
+      values
+        .filter((value) => Boolean(value) && !isImageTargetModeToken(value))
+        .forEach((value) => nonLookCandidateKeys.add(imageTargetKey(value)));
+    });
+    if (!nonLookCandidateKeys.has(ownerKey)) item.owner = "";
+  });
+  return rows;
+}
+
 export function imageTargetChoicesForRow(item, images, state = null) {
   void state;
   const dynamicTargets = uniqueTargetList(
-    targetCandidateRows(images)
+    nonLookTargetCandidateRows(images)
       .flatMap((row, idx) => [clean(row?.owner), clean(row?.label), imageTargetLabel(row, idx)])
-      .filter(Boolean),
+      .filter((value) => Boolean(value) && !isImageTargetModeToken(value)),
   );
+  const dynamicTargetKeys = new Set(dynamicTargets.map(imageTargetKey));
+  const lookDerivedTargetKeys = lookReferenceTargetKeys(images);
+  const lookReference = isLookReferenceImage(item);
   const currentTarget = clean(item && item.owner);
-  return uniqueTargetList([
+  const currentKey = imageTargetKey(currentTarget);
+  const currentAllowed = Boolean(
+    currentTarget
+    && !isImageTargetModeToken(currentTarget)
+    && (
+      lookReference
+      || !lookDerivedTargetKeys.has(currentKey)
+      || dynamicTargetKeys.has(currentKey)
+    )
+  );
+  const choices = [
     "",
     ...dynamicTargets,
-    IMAGE_GLOBAL_LOOK_TARGET,
-    IMAGE_CUSTOM_LOOK_TARGET,
-    "Camera / Composition",
-    currentTarget,
-  ]);
+  ];
+  if (lookReference) {
+    choices.push(IMAGE_GLOBAL_LOOK_TARGET, IMAGE_CUSTOM_LOOK_TARGET);
+  }
+  if (currentAllowed) choices.push(currentTarget);
+  return uniqueTargetList(choices);
 }
 
 function targetSelectOptions(item, images, state) {
@@ -5257,7 +5356,7 @@ function targetSelectOptions(item, images, state) {
 }
 
 function renderImageTargetControls(item, images, state) {
-  const customVisible = imageTargetKey(item && item.owner) === imageTargetKey(IMAGE_CUSTOM_LOOK_TARGET);
+  const customVisible = hmbImageCustomTargetInstructionVisible(item);
   return `<select class="source-select source-target-select" data-field="owner" data-hmb-base-disabled="0">${targetSelectOptions(item, images, state)}</select><textarea class="source-target-input custom-field-input look-custom-instruction ${customVisible ? "" : "is-hidden"}" data-field="look_custom_instruction" maxlength="${MAX_DESCRIPTION_CHARS}" rows="2" aria-hidden="${customVisible ? "false" : "true"}" placeholder="${escapeHtml(uiText(state, "custom_look_instruction", "Specify affected properties and scope: name a target (for example, Hero lighting only) or state scene-wide."))}">${escapeHtml(item.look_custom_instruction || "")}</textarea>`;
 }
 
@@ -5280,7 +5379,7 @@ function refreshImageTargetControls(container, state) {
       select.setAttribute?.("data-hmb-base-disabled", "0");
       const customInstruction = row.querySelector?.('[data-field="look_custom_instruction"]');
       if (customInstruction) {
-        const customVisible = imageTargetKey(item.owner) === imageTargetKey(IMAGE_CUSTOM_LOOK_TARGET);
+        const customVisible = hmbImageCustomTargetInstructionVisible(item);
         hmbSetVisible(customInstruction, customVisible);
         customInstruction.value = clean(item.look_custom_instruction);
       }
@@ -5288,10 +5387,11 @@ function refreshImageTargetControls(container, state) {
   } catch (_e) {}
 }
 
-function reconcileImageBindingAfterTypeChange(item, _images) {
+function reconcileImageBindingAfterTypeChange(item, images) {
   if (!item) return;
   normalizeImageTaxonomy(item);
   normalizeImageBindingFields(item, MAX_VIDEOS);
+  hmbReconcileImageTargetContract(images);
 }
 
 function renderImageCustomPanel(item, state) {

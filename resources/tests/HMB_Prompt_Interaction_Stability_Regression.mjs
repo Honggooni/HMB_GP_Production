@@ -520,9 +520,9 @@ const verifiedLookOverrideMerge = widget.hmbMergePromptRevisionAxes(
       asset_source_kind: "project",
       asset_source_uid: "verified-look-image",
       asset_image_main_type_candidate: "Look Reference",
-      asset_image_sub_type_candidate: "Render Look",
+      asset_image_sub_type_candidate: "Render Style",
       image_main_type: "Look Reference",
-      image_sub_type: "Render Look",
+      image_sub_type: "Render Style",
       owner: "Global Look",
     }],
   },
@@ -538,18 +538,18 @@ const verifiedLookOverrideMerge = widget.hmbMergePromptRevisionAxes(
       asset_image_main_type_candidate: "Look Reference",
       asset_image_sub_type_candidate: "Color Mood",
       image_main_type: "Look Reference",
-      image_sub_type: "Scale",
-      owner: "Camera / Composition",
+      image_sub_type: "Camera / Composition",
+      owner: "Shot Camera",
     }],
   },
 );
 const verifiedLookOverrideRow = verifiedLookOverrideMerge.images[0];
-assert.equal(verifiedLookOverrideRow.asset_image_sub_type_candidate, "Render Look");
+assert.equal(verifiedLookOverrideRow.asset_image_sub_type_candidate, "Render Style");
 assert.equal(verifiedLookOverrideRow.image_main_type, "Look Reference");
-assert.equal(verifiedLookOverrideRow.image_sub_type, "Scale");
-assert.equal(verifiedLookOverrideRow.source_type, "Role Required / Select Source Type");
-assert.equal(verifiedLookOverrideRow.scope, "");
-assert.equal(verifiedLookOverrideRow.owner, "Camera / Composition");
+assert.equal(verifiedLookOverrideRow.image_sub_type, "Camera / Composition");
+assert.equal(verifiedLookOverrideRow.source_type, "Camera / Composition Reference");
+assert.equal(verifiedLookOverrideRow.scope, "Camera framing / composition only");
+assert.equal(verifiedLookOverrideRow.owner, "Shot Camera");
 assert.deepEqual(verifiedLookOverrideRow.color_picks, [""]);
 
 const verifiedLookDefaultMerge = widget.hmbMergePromptRevisionAxes(
@@ -562,9 +562,9 @@ const verifiedLookDefaultMerge = widget.hmbMergePromptRevisionAxes(
       asset_source_kind: "project",
       asset_source_uid: "verified-look-default",
       asset_image_main_type_candidate: "Look Reference",
-      asset_image_sub_type_candidate: "Render Look",
+      asset_image_sub_type_candidate: "Render Style",
       image_main_type: "Look Reference",
-      image_sub_type: "Render Look",
+      image_sub_type: "Render Style",
       owner: "Global Look",
     }],
   },

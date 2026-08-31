@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   colorPickChoicesForImageTaxonomy,
   imageTargetChoicesForRow,
+  hmbReconcileImageTargetContract,
   normalizeImageTaxonomy,
   normalizeState,
 } from "../../widgets/HMBPromptLibraryScopedBindingWidget.js";
@@ -57,19 +58,130 @@ const retiredPair = {
   image_sub_type: "Scale / Composition",
   source_type: "Director Reference",
   scope: "Approved broad scope",
-  owner: "Camera / Composition",
+  owner: "Director Camera",
 };
 normalizeImageTaxonomy(retiredPair);
 assert.equal(retiredPair.image_main_type, "Look Reference");
 assert.equal(retiredPair.image_sub_type, "Scale / Composition");
 assert.equal(retiredPair.source_type, "Role Required / Select Source Type");
 assert.equal(retiredPair.scope, "");
-assert.equal(retiredPair.owner, "Camera / Composition");
+assert.equal(retiredPair.owner, "Director Camera");
+
+for (const forbiddenTarget of ["Global Look", "Custom", "Camera / Composition"]) {
+  const nonLookRow = {
+    image_main_type: "Character",
+    image_sub_type: "Full Appearance",
+    owner: forbiddenTarget,
+    look_custom_instruction: "Hidden look instruction must not survive.",
+  };
+  normalizeImageTaxonomy(nonLookRow);
+  assert.equal(nonLookRow.owner, "", `${forbiddenTarget} must clear outside Look Reference.`);
+  assert.equal(
+    nonLookRow.look_custom_instruction,
+    "",
+    "Non-Look rows must not retain a hidden Look custom instruction.",
+  );
+}
+
+for (const allowedTarget of ["Global Look", "Custom", "Hero_A"]) {
+  const lookRow = {
+    image_main_type: "Look Reference",
+    image_sub_type: "Render Style",
+    owner: allowedTarget,
+    look_custom_instruction: "Approved Look instruction.",
+  };
+  normalizeImageTaxonomy(lookRow);
+  assert.equal(lookRow.owner, allowedTarget);
+  assert.equal(lookRow.look_custom_instruction, "Approved Look instruction.");
+}
+
+const transitionedLookRow = {
+  image_main_type: "Look Reference",
+  image_sub_type: "Render Style",
+  owner: "Global Look",
+  look_custom_instruction: "Scene-wide finish.",
+};
+normalizeImageTaxonomy(transitionedLookRow);
+transitionedLookRow.image_main_type = "Environment / Background";
+transitionedLookRow.image_sub_type = "Main Background";
+normalizeImageTaxonomy(transitionedLookRow);
+assert.equal(transitionedLookRow.owner, "");
+assert.equal(transitionedLookRow.look_custom_instruction, "");
+
+const retiredCameraTarget = {
+  image_main_type: "Look Reference",
+  image_sub_type: "Camera / Composition",
+  owner: "Camera / Composition",
+};
+normalizeImageTaxonomy(retiredCameraTarget);
+assert.equal(
+  retiredCameraTarget.owner,
+  "",
+  "Camera / Composition is a Sub Type and must never survive as a Target.",
+);
+
+const lookOnlyNamedTargetRows = hmbReconcileImageTargetContract([
+  {
+    present: true,
+    label: "DawnLook",
+    image_main_type: "Look Reference",
+    image_sub_type: "Render Style",
+    owner: "Global Look",
+  },
+  {
+    present: true,
+    label: "Hero",
+    image_main_type: "Character",
+    image_sub_type: "Full Appearance",
+    owner: "DawnLook",
+  },
+]);
+assert.equal(
+  lookOnlyNamedTargetRows[1].owner,
+  "",
+  "A non-Look row must clear a Target name supplied exclusively by a Look row.",
+);
+
+const sharedNamedTargetRows = hmbReconcileImageTargetContract([
+  {
+    present: true,
+    label: "DawnLook",
+    image_main_type: "Look Reference",
+    image_sub_type: "Render Style",
+    owner: "Global Look",
+  },
+  {
+    present: true,
+    label: "DawnLook",
+    image_main_type: "Character",
+    image_sub_type: "Full Appearance",
+    owner: "DawnLook",
+  },
+  {
+    present: true,
+    label: "Forest",
+    image_main_type: "Environment / Background",
+    image_sub_type: "Main Background",
+    owner: "DawnLook",
+  },
+]);
+assert.equal(sharedNamedTargetRows[1].owner, "DawnLook");
+assert.equal(sharedNamedTargetRows[2].owner, "DawnLook");
+
+const arbitraryNamedTargetRows = hmbReconcileImageTargetContract([{
+  present: true,
+  label: "Hero",
+  image_main_type: "Character",
+  image_sub_type: "Full Appearance",
+  owner: "Director Target",
+}]);
+assert.equal(arbitraryNamedTargetRows[0].owner, "Director Target");
 
 for (const [mainType, subType] of [
   ["Character", "Full Appearance"],
   ["Environment / Background", "Main Background"],
-  ["Look Reference", "Render Look"],
+  ["Look Reference", "Render Style"],
+  ["Look Reference", "Camera / Composition"],
   ["Custom / Context", "Custom"],
 ]) {
   assert.deepEqual(
@@ -96,14 +208,46 @@ const look = {
 };
 const targetChoices = imageTargetChoicesForRow(look, [...rows, look]);
 for (const expected of [
-  "", "Hero", "Hero display", "Forest", "Forest display", "DawnLook",
-  "Notes", "Look Sheet", "Global Look", "Custom", "Camera / Composition",
+  "", "Hero", "Hero display", "Forest", "Forest display",
+  "Notes", "Global Look", "Custom",
   "Director Target",
 ]) {
   assert.ok(targetChoices.includes(expected), `Target choices must include ${expected}.`);
 }
+for (const excluded of ["DawnLook", "Look Sheet", "Camera / Composition"]) {
+  assert.ok(!targetChoices.includes(excluded), `${excluded} must not leak into Look Target choices.`);
+}
 assert.ok(targetChoices.includes("Dormant"), "Saved candidate names must not be hidden by semantic filtering.");
 assert.equal(look.owner, "Director Target");
+
+for (const mainType of [
+  "Character", "Character Prop", "Environment / Background",
+  "Background Prop", "Custom / Context",
+]) {
+  const row = { present: true, label: `${mainType} row`, image_main_type: mainType, owner: "Named Target" };
+  const choices = imageTargetChoicesForRow(row, [
+    row,
+    { present: true, label: "Look label", owner: "Global Look", image_main_type: "Look Reference" },
+    { present: true, label: "Custom look", owner: "Custom", image_main_type: "Look Reference" },
+    { present: true, label: "Legacy camera", owner: "Camera / Composition", image_main_type: "Look Reference" },
+  ]);
+  for (const excluded of [
+    "Global Look", "Custom", "Camera / Composition",
+    "Look label", "Custom look", "Legacy camera",
+  ]) {
+    assert.ok(!choices.includes(excluded), `${mainType} must not expose ${excluded}.`);
+  }
+  assert.ok(choices.includes("Named Target"));
+  assert.ok(choices.includes(`${mainType} row`));
+}
+
+const cameraComposition = {
+  image_main_type: "Look Reference",
+  image_sub_type: "Camera / Composition",
+};
+normalizeImageTaxonomy(cameraComposition);
+assert.equal(cameraComposition.source_type, "Camera / Composition Reference");
+assert.equal(cameraComposition.scope, "Camera framing / composition only");
 
 // Normalization is stable and never rewrites the user's saved taxonomy.
 const roundTrip = normalizeState(JSON.parse(JSON.stringify(authored)));

@@ -63,7 +63,7 @@ const IMAGE_ASSET_UI_EDIT_REVISION_KEY = "ui_edit_revision";
 const ROOT_FOLDER_KEY = "$root";
 const IMAGE_ASSET_STATE_VERSION = 4;
 const IMAGE_TAXONOMY_SCHEMA = "hmb-image-taxonomy";
-const IMAGE_TAXONOMY_VERSION = 2;
+const IMAGE_TAXONOMY_VERSION = 3;
 const IMAGE_ASSET_SELECTION_COMMIT_FALLBACK_MS = 120;
 const IMAGE_ASSET_ECHO_EXPIRY_MS = 1500;
 // Search covers the complete in-memory catalog, but foreground DOM work stays

@@ -48,8 +48,8 @@ assert agent_library._hmb is prompt_library._hmb
 assert prompt_library._image_taxonomy_payload() == asset_library._taxonomy_payload()
 assert prompt_library._image_taxonomy_payload() == common.image_taxonomy_payload()
 assert common.IMAGE_MAIN_TYPE_COUNT == 6
-assert common.IMAGE_SUB_TYPE_COUNT == 26
-assert common.IMAGE_TAXONOMY_PAIR_COUNT == 26
+assert common.IMAGE_SUB_TYPE_COUNT == 27
+assert common.IMAGE_TAXONOMY_PAIR_COUNT == 27
 
 
 png_1x1 = base64.b64decode(

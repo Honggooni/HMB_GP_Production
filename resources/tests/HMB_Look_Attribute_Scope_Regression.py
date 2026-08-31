@@ -250,7 +250,7 @@ for valid_claims in (
     (
         ("Color Mood", "Hero_A"),
         ("Lighting / Atmosphere", "Global Look"),
-        ("Render Look", "Hero_A"),
+        ("Render Style", "Hero_A"),
     ),
     (
         ("Color Mood", "Hero_A"),
@@ -263,7 +263,7 @@ for valid_claims in (
     (
         ("Color Mood", "Global Look"),
         ("Lighting / Atmosphere", "Global Look"),
-        ("Render Look", "Global Look"),
+        ("Render Style", "Global Look"),
     ),
 ):
     valid_package = look_claim_package(*valid_claims)
@@ -284,7 +284,7 @@ for invalid_claims, _retired_local_conflict_tokens in (
     (
         (
             ("Color / Look / Lighting", "Global Look"),
-            ("Render Look", "Hero_A"),
+            ("Render Style", "Hero_A"),
         ),
         {"@image4"},
     ),

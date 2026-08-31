@@ -15,7 +15,7 @@ from _hmb_private_policy_fixture import (
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.7.17"
+EXPECTED_RELEASE_VERSION = "0.7.19"
 EXPECTED_SIGNING_KEY_ID = "hmb-policy-local-2026-08-r1"
 PRIVATE_SIGNED_POLICY_FIXTURE = (
     ROOT

@@ -50,11 +50,31 @@ taxonomy_payload = common.image_taxonomy_payload()
 assert prompt._image_taxonomy_payload() == taxonomy_payload
 assert image_asset._taxonomy_payload() == taxonomy_payload
 assert taxonomy_payload["schema"] == "hmb-image-taxonomy"
-assert taxonomy_payload["version"] == 2
+assert taxonomy_payload["version"] == 3
 assert taxonomy_payload["main_type_count"] == 6
-assert taxonomy_payload["sub_type_count"] == 26
-assert taxonomy_payload["pair_count"] == 26
-assert len(common.IMAGE_TAXONOMY_WIRE_MAP) == 26
+assert taxonomy_payload["sub_type_count"] == 27
+assert taxonomy_payload["pair_count"] == 27
+assert len(common.IMAGE_TAXONOMY_WIRE_MAP) == 27
+assert common.image_taxonomy_wire_pair(
+    "Look Reference",
+    "Camera / Composition",
+) == ("Camera / Composition Reference", "Camera framing / composition only")
+assert common.image_taxonomy_wire_pair(
+    "Look Reference",
+    "Render Style",
+) == ("Color / Look Reference", "Render style only")
+assert "Camera / Composition Reference" in common.IMAGE_SOURCE_TYPE_CHOICES
+assert (
+    taxonomy_payload["labels"]["ko"]["Camera / Composition"]
+    == "카메라 / 구도"
+)
+assert taxonomy_payload["labels"]["ko"]["Render Style"] == "렌더 스타일"
+camera_asset_fields = image_asset._normalize_image_taxonomy_fields({
+    "image_main_type": "Look Reference",
+    "image_sub_type": "Camera / Composition",
+})
+assert camera_asset_fields["source_type"] == "Camera / Composition Reference"
+assert camera_asset_fields["scope_candidate"] == "Camera framing / composition only"
 
 
 # A stale/omitted Sub Type no longer erases the valid Main Type, Target, or media.
@@ -65,12 +85,12 @@ for retired_subtype in ("Scale", "Composition", "Scale / Composition"):
         "label": "retired-scale-sheet.png",
         "image_main_type": "Look Reference",
         "image_sub_type": retired_subtype,
-        "owner": "Camera / Composition",
+        "owner": "Director Camera",
     })
     prompt._normalize_image_binding_fields(item)
     assert item["image_main_type"] == "Look Reference"
     assert item["image_sub_type"] == retired_subtype
-    assert item["owner"] == "Camera / Composition"
+    assert item["owner"] == "Director Camera"
     assert item["source_type"] == "Role Required / Select Source Type"
     asset_fields = image_asset._normalize_image_taxonomy_fields({
         "image_main_type": "Look Reference",
@@ -167,12 +187,85 @@ for (main_type, sub_type), wire_pair in common.IMAGE_TAXONOMY_WIRE_MAP.items():
     fingerprints.add(prompt._prompt_semantic_fingerprint(state))
     sample_machine, sample_visible = machine, visible
 
-assert len(records) == len(common.IMAGE_TAXONOMY_WIRE_MAP) == 26
-assert len(visible_documents) == 26
-assert len(fingerprints) == 26
+assert len(records) == len(common.IMAGE_TAXONOMY_WIRE_MAP) == 27
+assert len(visible_documents) == 27
+assert len(fingerprints) == 27
+
+camera_composition = prompt._default_image_item(1)
+camera_composition.update({
+    "present": True,
+    "label": "approved-framing.png",
+    "image_main_type": "Look Reference",
+    "image_sub_type": "Camera / Composition",
+})
+camera_composition_state = prompt._default_widget_state()
+camera_composition_state["images"] = [camera_composition]
+camera_composition_record = prompt_job(
+    prompt._build_data_only_prompt_package(camera_composition_state)
+)["images"][0]
+assert camera_composition_record["source_type"] == "Camera / Composition Reference"
+assert camera_composition_record["source_scope"] == "Camera framing / composition only"
+assert camera_composition_record["target_id"] == ""
 
 
-# Target is optional authored data and is never inferred or re-policed by Agent.
+# Look-only UI tokens and Look-row-only names cannot remain hidden on a
+# Character/Prop/Environment row and then leak into the Agent contract.
+target_transition_state = prompt._default_widget_state()
+target_transition_state["images"] = [
+    {
+        "present": True,
+        "label": "hero.png",
+        "image_main_type": "Character",
+        "image_sub_type": "Full Appearance",
+        "owner": "Global Look",
+        "look_custom_instruction": "Hidden hero lighting",
+    },
+    {
+        "present": True,
+        "label": "forest.png",
+        "image_main_type": "Environment / Background",
+        "image_sub_type": "Main Background",
+        "owner": "Camera / Composition",
+    },
+    {
+        "present": True,
+        "label": "DawnLook",
+        "image_main_type": "Look Reference",
+        "image_sub_type": "Color Mood",
+        "owner": "Global Look",
+    },
+    {
+        "present": True,
+        "label": "look-target-leak.png",
+        "image_main_type": "Character Prop",
+        "image_sub_type": "Handheld Prop",
+        "owner": "DawnLook",
+    },
+]
+transition_records = prompt_job(
+    prompt._build_data_only_prompt_package(target_transition_state)
+)["images"]
+assert transition_records[0]["target_id"] == ""
+assert transition_records[0]["custom_look_instruction"] == ""
+assert transition_records[1]["target_id"] == ""
+assert transition_records[2]["target_id"] == "Global Look"
+assert transition_records[3]["target_id"] == ""
+
+named_target_state = prompt._default_widget_state()
+named_target_state["images"] = [{
+    "present": True,
+    "label": "hero.png",
+    "image_main_type": "Character",
+    "image_sub_type": "Full Appearance",
+    "owner": "HeroRig",
+}]
+assert prompt_job(
+    prompt._build_data_only_prompt_package(named_target_state)
+)["images"][0]["target_id"] == "HeroRig"
+
+
+# Optional named Target data is never inferred; only the explicit Look-only
+# token boundary above is reconciled.
 for sub_type, expected_target in common.IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS.items():
     item = prompt._default_image_item(1)
     item.update({

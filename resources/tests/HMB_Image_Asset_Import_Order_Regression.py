@@ -586,7 +586,7 @@ try:
     assert look_state["images"][0]["owner"] == ""
     assert look_state["images"][0]["asset_default_target"] == ""
     look_state["images"][0]["image_sub_type"] = "Scale"
-    look_state["images"][0]["owner"] = "Camera / Composition"
+    look_state["images"][0]["owner"] = "Director Camera"
     prompt_library._normalize_image_binding_fields(look_state["images"][0])
     refreshed_look = prompt_library._apply_image_asset_payload(
         look_state,
@@ -598,18 +598,18 @@ try:
     assert refreshed_look_row["image_sub_type"] == "Scale"
     assert refreshed_look_row["source_type"] == "Role Required / Select Source Type"
     assert refreshed_look_row["scope"] == ""
-    assert refreshed_look_row["owner"] == "Camera / Composition"
+    assert refreshed_look_row["owner"] == "Director Camera"
 
     changed_registered_look = prompt_library._apply_image_asset_payload(
         refreshed_look,
-        look_payload("Render Look"),
+        look_payload("Render Style"),
         connected=True,
     )
     assert changed_registered_look["images"][0][
         "asset_image_sub_type_candidate"
-    ] == "Render Look"
+    ] == "Render Style"
     assert changed_registered_look["images"][0]["image_sub_type"] == "Scale"
-    assert changed_registered_look["images"][0]["owner"] == "Camera / Composition"
+    assert changed_registered_look["images"][0]["owner"] == "Director Camera"
 
     dormant_look = prompt_library._apply_image_asset_payload(
         changed_registered_look,
@@ -632,14 +632,14 @@ try:
         if item["asset_source_uid"] == "source:MasterLook"
     )
     assert cached_look["image_sub_type"] == "Scale"
-    assert cached_look["owner"] == "Camera / Composition"
+    assert cached_look["owner"] == "Director Camera"
     restored_look = prompt_library._apply_image_asset_payload(
         dormant_look,
-        look_payload("Render Look"),
+        look_payload("Render Style"),
         connected=True,
     )
     assert restored_look["images"][0]["image_sub_type"] == "Scale"
-    assert restored_look["images"][0]["owner"] == "Camera / Composition"
+    assert restored_look["images"][0]["owner"] == "Director Camera"
 
     # Lighting-bearing Look rows default to Global Look and expose Custom as a
     # reserved shared-scope mode. The authored instruction must survive source
@@ -703,15 +703,15 @@ try:
     returned_general = deepcopy(restored_look)
     returned_general["images"][0]["image_sub_type"] = "Color Mood"
     prompt_library._normalize_image_binding_fields(returned_general["images"][0])
-    assert returned_general["images"][0]["owner"] == "Camera / Composition"
+    assert returned_general["images"][0]["owner"] == "Director Camera"
     assert returned_general["images"][0]["asset_default_target"] == ""
     refreshed_general = prompt_library._apply_image_asset_payload(
         returned_general,
-        look_payload("Render Look"),
+        look_payload("Render Style"),
         connected=True,
     )
     assert refreshed_general["images"][0]["image_sub_type"] == "Color Mood"
-    assert refreshed_general["images"][0]["owner"] == "Camera / Composition"
+    assert refreshed_general["images"][0]["owner"] == "Director Camera"
     assert refreshed_general["images"][0]["asset_default_target"] == ""
     dormant_general = prompt_library._apply_image_asset_payload(
         refreshed_general,
@@ -734,14 +734,14 @@ try:
         if item["asset_source_uid"] == "source:MasterLook"
     )
     assert cached_general["image_sub_type"] == "Color Mood"
-    assert cached_general["owner"] == "Camera / Composition"
+    assert cached_general["owner"] == "Director Camera"
     restored_general = prompt_library._apply_image_asset_payload(
         dormant_general,
-        look_payload("Render Look"),
+        look_payload("Render Style"),
         connected=True,
     )
     assert restored_general["images"][0]["image_sub_type"] == "Color Mood"
-    assert restored_general["images"][0]["owner"] == "Camera / Composition"
+    assert restored_general["images"][0]["owner"] == "Director Camera"
 
     # Target is Prompt-owned for every verified Main Type. A source rename
     # updates only the suggested default and never overwrites the authored value.

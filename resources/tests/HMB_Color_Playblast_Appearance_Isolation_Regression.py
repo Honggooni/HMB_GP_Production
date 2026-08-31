@@ -9,7 +9,7 @@ from _hmb_private_policy_fixture import install_private_policy_reader
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.7.17"
+EXPECTED_RELEASE_VERSION = "0.7.19"
 
 
 def load_module(name: str):

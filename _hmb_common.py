@@ -210,7 +210,7 @@ _agent_process_session = _load_agent_process_session_module()
 IMAGE_SOURCE_TYPE_UNCLASSIFIED = "Select Source Type"
 IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED = "Role Required / Select Source Type"
 IMAGE_TAXONOMY_SCHEMA = "hmb-image-taxonomy"
-IMAGE_TAXONOMY_VERSION = 2
+IMAGE_TAXONOMY_VERSION = 3
 
 IMAGE_SOURCE_TYPE_CHOICES = [
     IMAGE_SOURCE_TYPE_LEGACY_UNCLASSIFIED,
@@ -227,6 +227,7 @@ IMAGE_SOURCE_TYPE_CHOICES = [
     "Color + Look + Lighting Mood Reference",
     "Lighting / Atmosphere Reference",
     "Relative Size Reference",
+    "Camera / Composition Reference",
     "Custom",
 ]
 
@@ -335,8 +336,9 @@ IMAGE_SUB_TYPE_CHOICES = {
     "Look Reference": [
         "Color Mood",
         "Lighting / Atmosphere",
-        "Render Look",
+        "Render Style",
         "Color / Look / Lighting",
+        "Camera / Composition",
         "ch_Scale",
         "bg_Scale",
         "ch_Scale / bg_Scale",
@@ -424,13 +426,17 @@ IMAGE_TAXONOMY_WIRE_MAP = {
         "Lighting / Atmosphere Reference",
         "Lighting mood only",
     ),
-    ("Look Reference", "Render Look"): (
+    ("Look Reference", "Render Style"): (
         "Color / Look Reference",
-        "Render look only",
+        "Render style only",
     ),
     ("Look Reference", "Color / Look / Lighting"): (
         "Color + Look + Lighting Mood Reference",
         "All color + look + lighting functions",
+    ),
+    ("Look Reference", "Camera / Composition"): (
+        "Camera / Composition Reference",
+        "Camera framing / composition only",
     ),
     ("Look Reference", "ch_Scale"): (
         "Relative Size Reference",
@@ -478,8 +484,9 @@ IMAGE_TAXONOMY_LABELS_KO = {
     "Set / Structure": "세트 / 구조물",
     "Color Mood": "색감 분위기",
     "Lighting / Atmosphere": "조명 / 분위기",
-    "Render Look": "렌더 룩",
+    "Render Style": "렌더 스타일",
     "Color / Look / Lighting": "색감 / 룩 / 조명",
+    "Camera / Composition": "카메라 / 구도",
     "ch_Scale": "캐릭터 상대 크기",
     "bg_Scale": "배경 상대 크기 / 배치",
     "ch_Scale / bg_Scale": "캐릭터 / 배경 상대 크기 / 배치",
@@ -506,7 +513,7 @@ IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS = {
 IMAGE_GENERAL_LOOK_REFERENCE_SUB_TYPES = frozenset({
     "Color Mood",
     "Lighting / Atmosphere",
-    "Render Look",
+    "Render Style",
     "Color / Look / Lighting",
 })
 IMAGE_GLOBAL_SCOPE_LOOK_REFERENCE_SUB_TYPES = frozenset({

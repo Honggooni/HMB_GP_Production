@@ -45,18 +45,41 @@ const freshGeneralChoices = widget.imageTargetChoicesForRow(
   freshGeneralLook,
   [{ present: true, label: "Jett_11", image_main_type: "Character" }],
 );
-assert.ok(freshGeneralChoices.includes("Camera / Composition"));
 assert.ok(freshGeneralChoices.includes("Custom"));
 assert.ok(freshGeneralChoices.includes("Global Look"));
 assert.ok(freshGeneralChoices.includes("Jett_11"));
 assert.ok(freshGeneralChoices.includes("ch_all"));
+assert.ok(!freshGeneralChoices.includes("Camera / Composition"));
 for (const scaleOnlyTarget of ["bg_all", "ch_all / bg_all", "None"]) {
   assert.ok(!freshGeneralChoices.includes(scaleOnlyTarget));
 }
-freshGeneralLook.owner = "Camera / Composition";
-widget.normalizeImageTaxonomy(freshGeneralLook);
-assert.equal(freshGeneralLook.owner, "Camera / Composition");
-assert.ok(widget.imageTargetChoicesForRow(freshGeneralLook, []).includes("Camera / Composition"));
+const cameraComposition = {
+  image_main_type: "Look Reference",
+  image_sub_type: "Camera / Composition",
+  owner: "",
+};
+widget.normalizeImageTaxonomy(cameraComposition);
+assert.equal(cameraComposition.source_type, "Camera / Composition Reference");
+assert.equal(cameraComposition.scope, "Camera framing / composition only");
+assert.ok(!widget.imageTargetChoicesForRow(cameraComposition, []).includes("Camera / Composition"));
+assert.match(
+  widget.hmbImageSubtypeAuthorityHint(cameraComposition, { ui: { language: "en" } }),
+  /framing, layout and composition evidence only/i,
+);
+assert.equal(
+  widget.hmbImageCustomTargetInstructionVisible({
+    image_main_type: "Look Reference",
+    owner: "Custom",
+  }),
+  true,
+);
+assert.equal(
+  widget.hmbImageCustomTargetInstructionVisible({
+    image_main_type: "Character",
+    owner: "Custom",
+  }),
+  false,
+);
 
 const scopedLookState = widget.normalizeState({
   images: [
@@ -107,15 +130,17 @@ const scopedChoices = widget.imageTargetChoicesForRow(
 );
 assert.ok(scopedChoices.includes("JettCanonical"));
 for (const included of [
-  "Jett display", "Camera / Composition", "Other Look", "OtherLookCanonical",
-  "Shot notes", "NotesCanonical", "Global Look", "Custom",
+  "Jett display", "JettCanonical", "Shot notes", "NotesCanonical", "Global Look", "Custom",
 ]) {
   assert.ok(scopedChoices.includes(included), `${included} must remain an available Target candidate.`);
 }
 assert.ok(scopedChoices.includes("Self Look"), "The current authored Target remains selectable.");
+for (const excluded of ["Camera / Composition", "Other Look", "OtherLookCanonical"]) {
+  assert.ok(!scopedChoices.includes(excluded), `${excluded} must not appear as a Look Target candidate.`);
+}
 
 for (const subtype of [
-  "Render Look",
+  "Render Style",
 ]) {
   const targetedReference = {
     image_main_type: "Look Reference",
@@ -183,13 +208,13 @@ for (const [subtype, target, phrase] of [
   const scaleReference = {
     image_main_type: "Look Reference",
     image_sub_type: subtype,
-    owner: "Camera / Composition",
+    owner: "Jett_11",
   };
   widget.normalizeImageTaxonomy(scaleReference);
-  assert.equal(scaleReference.owner, "Camera / Composition");
+  assert.equal(scaleReference.owner, "Jett_11");
   const scaleChoices = widget.imageTargetChoicesForRow(scaleReference, []);
   assert.ok(!scaleChoices.includes(target), "Target defaults must not be inferred from Sub Type.");
-  assert.ok(scaleChoices.includes("Camera / Composition"));
+  assert.ok(!scaleChoices.includes("Camera / Composition"));
   const hint = widget.hmbImageSubtypeAuthorityHint(
     scaleReference,
     { ui: { language: "en" } },
@@ -227,6 +252,8 @@ assert.doesNotMatch(source, /대상·에미터, 입력 영상·오디오/);
 assert.doesNotMatch(source, /HMB_PROMPT_QA_COVERAGE/);
 assert.doesNotMatch(source, /class="qa-badge"/);
 assert.doesNotMatch(source, /qa_coverage_not_provider_attention/);
+assert.doesNotMatch(source, /"Render Look"/);
+assert.match(source, /"Render Style"/);
 
 console.log(
   "HMB Prompt field guidance regression: PASS "

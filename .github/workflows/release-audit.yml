@@ -278,7 +278,7 @@ jobs:
             "",
             "- Keeps HMBAgentLibrary focused on authenticated server-policy execution, exact Shot routing, protected-state non-exposure, and publishable final text while leaving provider media limits to the Generator.",
             "- Keeps HMBAgentLibrary model declarations in exact parity with the installed Standard Agent surface, preserving host permission and accounting without adding an HMB-specific model allowlist.",
-            "- Keeps each visual Look Reference Target editable per shot for active named renderable targets or explicit Global Look; camera/composition remains isolated to its dedicated video or Custom authority.",
+            "- Keeps each Look Reference Target editable per shot for active named targets or explicit Global Look; Camera / Composition is available only as a Look Reference Sub Type and never as a Target for Character, Prop, or Environment rows.",
             "- Prefers Griptape Cloud HTTPS for local/Base64 images and local videos only when authentication and an accessible bucket are ready; otherwise images retain bounded Base64 and videos retain public HTTPS, asset://, or configured TOS fallbacks.",
             "- Recomputes VideoPicker Generate availability immediately for Original, Mask, Depth, and Motion Guide output choices while preserving command locks.",
             "- Renders Original Playblast with temporary per-source Maya Lambert materials, preserving compatible texture identity, safely falling back per unsupported material, and restoring every authored shading assignment after capture so Redshift is not required on team workstations.",

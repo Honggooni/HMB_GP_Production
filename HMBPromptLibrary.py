@@ -2089,7 +2089,7 @@ def _default_image_target_for_main_type(
             IMAGE_GLOBAL_SCOPE_LOOK_REFERENCE_SUB_TYPES
         ):
             return IMAGE_GLOBAL_LOOK_TARGET
-        # Color Mood and Render Look remain opt-in: a newly connected verified
+        # Color Mood and Render Style remain opt-in: a newly connected verified
         # row stays blank until the user chooses Global Look or one renderable
         # named target. Lighting-bearing Look subtypes returned above always
         # start at Global Look.
@@ -2635,6 +2635,67 @@ def _normalize_items(state: Dict[str, Any], key: str, max_count: int) -> List[Di
 
 def _is_active_image(item: Dict[str, Any]) -> bool:
     return _has_image_meaning(item) and item.get("source_type") != "Ignore / Unused"
+
+
+def _reconcile_image_target_contract(
+    images: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Remove hidden Look-only Target state from non-Look image rows.
+
+    Target choices are an authoring aid rather than a general semantic gate,
+    so ordinary named targets remain untouched.  The three UI mode tokens are
+    different: Global Look and Custom belong only to Look Reference, while
+    Camera / Composition is a Sub Type and is never a Target.  A named target
+    supplied exclusively by another Look Reference row is likewise not a
+    valid Character/Prop/Environment address.
+    """
+
+    global_key = image_target_key(IMAGE_GLOBAL_LOOK_TARGET)
+    custom_key = image_target_key(IMAGE_CUSTOM_LOOK_TARGET)
+    camera_key = image_target_key("Camera / Composition")
+    mode_keys = {global_key, custom_key, camera_key}
+    active_rows = [item for item in images if _is_active_image(item)]
+    look_target_keys: set[str] = set()
+
+    for row in active_rows:
+        keys = {
+            image_target_key(value)
+            for value in (row.get("owner"), row.get("label"))
+            if _clean_string(value)
+        } - mode_keys
+        if _clean_string(row.get("image_main_type")) == "Look Reference":
+            look_target_keys.update(keys)
+
+    for item in images:
+        is_look_reference = (
+            _clean_string(item.get("image_main_type")) == "Look Reference"
+        )
+        owner = _clean_string(item.get("owner"))
+        owner_key = image_target_key(owner)
+        invalid_owner = owner_key == camera_key
+        if not is_look_reference:
+            invalid_owner = invalid_owner or owner_key in {global_key, custom_key}
+            if bool(owner_key) and owner_key in look_target_keys:
+                supported_non_look_keys: set[str] = set()
+                for row in active_rows:
+                    if _clean_string(row.get("image_main_type")) == "Look Reference":
+                        continue
+                    candidate_values = [row.get("label")]
+                    if row is not item:
+                        candidate_values.append(row.get("owner"))
+                    supported_non_look_keys.update(
+                        image_target_key(value)
+                        for value in candidate_values
+                        if _clean_string(value)
+                    )
+                supported_non_look_keys.difference_update(mode_keys)
+                invalid_owner = (
+                    invalid_owner or owner_key not in supported_non_look_keys
+                )
+            item["look_custom_instruction"] = ""
+        if invalid_owner:
+            item["owner"] = ""
+    return images
 
 
 def _image_asset_connection_enabled(state: Dict[str, Any]) -> bool:
@@ -4054,7 +4115,9 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
     )
     videos = _normalize_items(state, "videos", MAX_VIDEOS)
 
-    images = _normalize_items(state, "images", MAX_IMAGES)
+    images = _reconcile_image_target_contract(
+        _normalize_items(state, "images", MAX_IMAGES)
+    )
     active_images = len(_active_image_rows_for_state(images, state))
     active_videos = sum(1 for item in videos if _is_active_video(item))
 
@@ -8624,7 +8687,7 @@ def _public_job_data_contract(
             "image": f"@image{slot}",
             "label": _clean_string(item.get("label")),
             # Preserve the exact user-facing taxonomy. ``source_type`` remains
-            # the stable Agent wire role, but it is not one-to-one: 26 valid
+            # the stable Agent wire role, but it is not one-to-one: 27 valid
             # Main/Sub pairs previously collapsed to 13 no-video records.
             "image_main_type": _clean_string(item.get("image_main_type")),
             "image_sub_type": _clean_string(item.get("image_sub_type")),
