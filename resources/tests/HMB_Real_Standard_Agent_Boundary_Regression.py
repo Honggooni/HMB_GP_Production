@@ -158,7 +158,9 @@ def non_billable_model_step(self, agent, prompt):
     prompt_value = getattr(prompt, "value", prompt)
     runtime_prompt = str(prompt_value)
     captured["prompt_exact"] = runtime_prompt == (
-        self._hmb_runtime_prompt + "\nCALLER_CONTEXT_MUST_RUN"
+        self._hmb_runtime_prompt
+        + "\nCALLER_CONTEXT_MUST_RUN\n\n"
+        + module._AGENT_ENGLISH_OUTPUT_CONTRACT
     )
     captured["public_prompt_prefix_exact"] = runtime_prompt.startswith(
         stored_canonical_prompt.rstrip()
@@ -167,6 +169,9 @@ def non_billable_model_step(self, agent, prompt):
         + "\n"
     )
     captured["caller_context_present"] = "CALLER_CONTEXT_MUST_RUN" in runtime_prompt
+    captured["english_output_contract_count"] = runtime_prompt.count(
+        module._AGENT_ENGLISH_OUTPUT_CONTRACT
+    )
     captured["rule_counts"] = [len(ruleset.rules or []) for ruleset in rulesets]
     captured["ruleset_names"] = [str(ruleset.name or "") for ruleset in rulesets]
     captured["tool_count"] = len(getattr(task, "tools", ()) or ())
@@ -211,6 +216,7 @@ finally:
 assert captured["prompt_exact"] is True
 assert captured["public_prompt_prefix_exact"] is True
 assert captured["caller_context_present"] is True
+assert captured["english_output_contract_count"] == 1
 assert captured["rule_counts"] == [1, 4, 4]
 assert captured["ruleset_names"][0] == "behavior_1"
 sealed_ruleset_names = captured["ruleset_names"][-2:]

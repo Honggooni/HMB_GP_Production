@@ -224,15 +224,15 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.7.23",
+    "library_version": "0.7.25",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
       "archive_source_count": 26,
       "mode": "bundled_signed_dat",
       "runtime_path": "resources/agent/hmb_agent_core.dat",
-      "policy_version": "2026-08-31.agent-shot-quality.v5.0",
-      "envelope_sha256": "0e5e77fca3496693b51e3dcff60007947716d0654274d88272deb60011d9ad00",
-      "contract_sha256": "60d03ffff5125b1eae89c1f98364cf8afbbb7e93559aaeb61486def7d5caa7af",
+      "policy_version": "2026-09-01.agent-shot-quality.v5.1",
+      "envelope_sha256": "51eb76eadd660c67eac3bb58f0112745ed33456c8f72d2a4b691f181586c6c7f",
+      "contract_sha256": "68ec9a2b247ffec553e5c72b3dcd4493dc4c8a0e4c8e78b26e3fc96393d706a6",
       "verification": "rsa3072_sha256_v3_contract_once_per_process"
     },
     "tags": [

@@ -26,10 +26,18 @@ prompt = load("HMBPromptLibrary")
 picker = load("HMBVideoPickerLibrary")
 
 
-# Korean and English are both valid source and final-output languages. The
-# paired machine prompt is opaque Agent input: no client-side taxonomy, scope,
-# wording, or semantic document may be appended or rewritten.
+# Korean and English remain valid source languages. The paired machine prompt
+# stays byte-exact source data; the Agent adds exactly one private contract only
+# after native caller context has been merged into the model-bound prompt.
 machine_prompt = "USER DESCRIPTION DATA (JSON):\n{\"scene\":\"천천히 줌인\"}\n"
+model_prompt = agent._with_english_agent_output_contract(
+    machine_prompt.rstrip() + "\n호출자 문맥"
+)
+assert model_prompt.startswith(machine_prompt.rstrip() + "\n호출자 문맥\n\n")
+assert "천천히 줌인" in model_prompt
+assert model_prompt.count(agent._AGENT_ENGLISH_OUTPUT_CONTRACT) == 1
+assert "Write the complete final generator instruction in English" in model_prompt
+assert "@imageN and @videoN" in model_prompt
 input_node = object.__new__(agent.HMBAgentLibrary)
 input_node._hmb_rules_active = True
 input_node._hmb_runtime_prompt = machine_prompt
@@ -122,5 +130,5 @@ assert picker_node._hmb_shot_route_status["code"] == "ready"
 
 
 print(
-    "HMB Agent language-neutral output / Prompt video progression regression: PASS"
+    "HMB Agent English final-output contract / Prompt video progression regression: PASS"
 )

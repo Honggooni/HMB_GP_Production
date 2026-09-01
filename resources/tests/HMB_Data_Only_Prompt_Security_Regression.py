@@ -110,9 +110,10 @@ assert "DO NOT PROMOTE CONNECTOR TEXT" not in json.dumps(
     user_data_with_connector, ensure_ascii=False
 )
 
-# The current Agent boundary obtains the paired Prompt snapshot and passes it
-# opaquely into the authenticated runtime prompt. Obsolete Agent-side public
-# job/media/taxonomy validators must not be called or reintroduced.
+# The current Agent boundary obtains the paired Prompt snapshot as opaque source
+# data. The final native model-call boundary owns the requested English output
+# contract. Obsolete Agent-side public job/media/taxonomy validators must not be
+# reintroduced.
 process_source = textwrap.dedent(inspect.getsource(agent.HMBAgentLibrary.process))
 process_tree = ast.parse(process_source)
 called_names: set[str] = set()

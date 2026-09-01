@@ -78,6 +78,15 @@ _HMB_SOURCE_CONTRACT_INVALID_MESSAGE = (
     "HMBPromptLibrary와 HMBVideoPickerLibrary의 구조화 데이터 연결 상태를 확인하십시오."
 )
 _RUNTIME_FX_SCOPE_HEADER = "HMB VERIFIED FX/TIMING RUNTIME SCOPE (JSON):"
+_AGENT_ENGLISH_OUTPUT_CONTRACT = (
+    "HMB FINAL OUTPUT LANGUAGE CONTRACT:\n"
+    "Write the complete final generator instruction in English, regardless of "
+    "the language used in the source fields. Translate the source meaning "
+    "faithfully without adding, omitting, weakening, or reinterpreting it. "
+    "Preserve source addresses such as @imageN and @videoN, identifiers, proper "
+    "nouns, numeric values, and exact quoted dialogue, lyrics, chants, or "
+    "on-screen text when the source explicitly requires those words verbatim."
+)
 _PAIRED_PROMPT_SNAPSHOT_SCHEMA = "hmb-prompt-paired-snapshot"
 _PAIRED_PROMPT_SNAPSHOT_VERSION = 1
 _PAIRED_PROMPT_SNAPSHOT_KEYS = frozenset({
@@ -872,6 +881,15 @@ def _prompt_text_sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _with_english_agent_output_contract(final_prompt: Any) -> str:
+    """Append one private output-language rule to the model-bound prompt."""
+
+    prompt_text = str(getattr(final_prompt, "value", final_prompt) or "")
+    if prompt_text.strip():
+        return prompt_text.rstrip() + "\n\n" + _AGENT_ENGLISH_OUTPUT_CONTRACT
+    return _AGENT_ENGLISH_OUTPUT_CONTRACT
+
+
 def _paired_machine_prompt(node: Any, prompt_value: Any) -> str:
     """Return the machine envelope paired with one visible ``PROMPT_OUT``.
 
@@ -1181,9 +1199,11 @@ class HMBAgentLibrary(_BaseAgent):
     Prompt+Asset+Picker are equally valid; the Agent neither identifies nor
     requires those upstream sources itself. The model, schema, output handling,
     and Agent wire format remain owned by the Standard Library Agent. Canonical
-    HMB execution swaps only the authenticated Prompt bytes and appends the two
-    sealed Behaviors; caller context, memory, rulesets, tools, schema, and native
-    execution settings otherwise remain unchanged. Once the canonical HMB
+    HMB execution swaps in the exact authenticated Prompt bytes, lets the native
+    Agent merge caller context, appends one private English-output contract to
+    the final model-bound prompt, and appends the two sealed Behaviors; caller
+    context, memory, rulesets, tools, schema, and native execution settings
+    otherwise remain unchanged. Once the canonical HMB
     Prompt edge is present, a missing or
     invalid policy blocks execution and reports the configuration error instead
     of silently falling back to a stock native execution.
@@ -2827,13 +2847,18 @@ class HMBAgentLibrary(_BaseAgent):
             pass
 
     def _process(self, agent: Any, prompt: Any) -> Any:
-        """Use the Standard Agent processor in both Only and HMB modes."""
+        """Use the Standard processor; constrain only canonical HMB output prose."""
 
         native_processor = getattr(super(), "_process", None)
         if not callable(native_processor):
             # Import-only/test fallback. Official Griptape always supplies the
             # native processor; never emulate a second, HMB-specific model path.
             return agent
+        if self._hmb_rules_active:
+            # Standard Agent has already merged any typed additional_context at
+            # this point. Append the output-language contract here so dict/Jinja,
+            # numeric, and string caller context keep their native semantics.
+            prompt = _with_english_agent_output_contract(prompt)
         return native_processor(agent, prompt)
 
     def _run_native_agent_once(self, lifecycle_generation: int | None = None):
@@ -3169,7 +3194,9 @@ class HMBAgentLibrary(_BaseAgent):
             # owns taxonomy and shot authoring; Generator owns model/media
             # limits. Agent adds the authenticated hidden policy and must not
             # reject, clip, renumber, reinterpret, or delete image/video/FX
-            # selections before the model sees them.
+            # selections before the model sees them. A private model-bound
+            # instruction fixes the final generator document language to English;
+            # it does not translate or mutate the paired source snapshot itself.
             source_contract_stage = "opaque_prompt"
             self._hmb_runtime_prompt = str(machine_prompt)
         except Exception:
@@ -3257,9 +3284,9 @@ class HMBAgentLibrary(_BaseAgent):
                         outputs["output"] = final_text
                         if "logs" in outputs:
                             outputs["logs"] = ""
-                # The authenticated policy and the Agent model own final
-                # wording and meaning.  The client does not phrase-match or
-                # rewrite a valid natural-language result at this boundary.
+                # The authenticated policy, fixed English-output instruction,
+                # and Agent model own final wording and meaning. The client does
+                # not phrase-match, translate, or rewrite a valid result here.
                 self._hmb_suppress_visible_publication = False
                 if isinstance(final_text, str):
                     self._set_visible_output(final_text)

@@ -73,7 +73,8 @@ finally:
     else:
         delattr(base_agent, "_process")
 assert [prompt for _native_agent, prompt in native_calls] == [
-    "native prompt", "native prompt",
+    "native prompt",
+    "native prompt\n\n" + agent._AGENT_ENGLISH_OUTPUT_CONTRACT,
 ]
 
 # Protected HMB execution now has Standard Agent input parity: only the exact
@@ -114,6 +115,7 @@ try:
     assert [entry["name"] for entry in merged_rules[1:]] == ["a" * 32, "b" * 32]
     node._hmb_native_prompt_read_active = True
     assert node.get_parameter_value("prompt") == "PRIVATE RUNTIME PROMPT"
+    assert node.get_parameter_value("additional_context") == "CALLER CONTEXT"
 finally:
     node._hmb_rules_active = False
     node._hmb_native_prompt_read_active = False
