@@ -115,6 +115,19 @@ post_registration_id = "reopen-post-registration-running"
 post_registration = target.HMBSeedanceGeneration(
     name="Seedance Reopened Post Registration"
 )
+# Remote Shot routing hides its managed inputs and prompt cable, never the
+# public rendered-video output used to chain a result into Video Editing or
+# Video Extension.  The preview-only ``video_url`` property remains separate.
+video_out = post_registration.get_parameter_by_name("VIDEO_OUT")
+assert video_out.allowed_modes == {target.ParameterMode.OUTPUT}
+assert video_out.hide is False
+assert video_out.hide_property is True
+assert video_out.hide_label is False
+assert video_out.ui_options["grid_item"] is True
+assert video_out.ui_options["hide"] is False
+assert video_out.ui_options["hide_property"] is True
+assert video_out.ui_options["hide_label"] is False
+assert video_out.ui_options["hide_handles"] is False
 post_registration.parameter_output_values.update(
     {
         "generation_id": post_registration_id,

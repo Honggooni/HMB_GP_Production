@@ -615,8 +615,21 @@ def assert_constructor_and_public_contract() -> None:
     assert type(video_alias).__name__ == "Parameter"
     assert video_alias.type == "VideoUrlArtifact"
     assert video_alias.allowed_modes == {target.ParameterMode.OUTPUT}
+    assert video_alias.hide is False
     assert video_alias.hide_property is True
+    assert video_alias.hide_label is False
     assert video_alias.ui_options["display_name"] == "video_url"
+    assert video_alias.ui_options["grid_item"] is True
+    assert video_alias.ui_options["hide"] is False
+    assert video_alias.ui_options["hide_property"] is True
+    assert video_alias.ui_options["hide_label"] is False
+    assert video_alias.ui_options["hide_handles"] is False
+    for task in target.TASK_STORAGE_CHOICES:
+        node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_5)
+        node.set_parameter_value(target.TASK_PARAMETER, task)
+        assert video_alias.hide is False
+        assert video_alias.ui_options["hide"] is False
+        assert video_alias.ui_options["hide_handles"] is False
     assert [
         parameter.name
         for parameter in (video_parameter, video_alias)
@@ -1034,6 +1047,15 @@ def assert_only_shot_task_and_reference_state_contract() -> None:
         "https://cdn.example/manual-audio-02.wav",
         "https://cdn.example/manual-audio-01.wav",
     ]
+
+    def assert_public_video_output_visibility() -> None:
+        video_out = node.get_parameter_by_name("VIDEO_OUT")
+        assert video_out.hide is False
+        assert video_out.hide_property is True
+        assert video_out.ui_options["grid_item"] is True
+        assert video_out.ui_options["hide"] is False
+        assert video_out.ui_options["hide_handles"] is False
+
     node.set_parameter_value("reference_images", manual_images)
     node.set_parameter_value(target.VIDEO_REFERENCES_PARAMETER, manual_videos)
     audio_parameter = node.get_parameter_by_name("reference_audio")
@@ -1058,6 +1080,7 @@ def assert_only_shot_task_and_reference_state_contract() -> None:
 
     node._update_parameter_visibility()
     assert_manual_reference_visibility(True)
+    assert_public_video_output_visibility()
     assert node.get_parameter_by_name(target.TASK_PARAMETER).hide is False
     assert node.get_parameter_value("task") == target.TASK_VIDEO_EDITING
     assert node.get_parameter_value("reference_images") == manual_images
@@ -1087,6 +1110,7 @@ def assert_only_shot_task_and_reference_state_contract() -> None:
     assert node._hmb_shot_channel_subscription()["enabled"] is True
     node._update_parameter_visibility()
     assert_manual_reference_visibility(False)
+    assert_public_video_output_visibility()
     assert node.get_parameter_by_name(target.TASK_PARAMETER).hide is True
     assert node.get_parameter_value("task") == target.TASK_VIDEO_EDITING
     assert node.get_parameter_value("reference_images") == manual_images
@@ -1108,6 +1132,7 @@ def assert_only_shot_task_and_reference_state_contract() -> None:
     assert node._hmb_shot_channel_subscription()["enabled"] is False
     node._update_parameter_visibility()
     assert_manual_reference_visibility(True)
+    assert_public_video_output_visibility()
     assert node.get_parameter_by_name(target.TASK_PARAMETER).hide is False
     assert node.get_parameter_value("task") == target.TASK_VIDEO_EDITING
     assert node.get_parameter_value("reference_images") == manual_images

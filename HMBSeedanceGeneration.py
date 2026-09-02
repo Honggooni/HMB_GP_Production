@@ -2882,8 +2882,22 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 tooltip="HMB alias of the verified local MP4/MOV output.",
                 allowed_modes={ParameterMode.OUTPUT},
                 settable=False,
+                hide=False,
                 hide_property=True,
-                ui_options={"display_name": "video_url", "pulse_on_run": True},
+                hide_label=False,
+                ui_options={
+                    "display_name": "video_url",
+                    "pulse_on_run": True,
+                    # Griptape classifies every VideoUrlArtifact as an
+                    # expandable media row even when its property editor is
+                    # hidden. Keep this output-only alias in a normal grid
+                    # row so its cable endpoint stays centred on its label.
+                    "grid_item": True,
+                    "hide": False,
+                    "hide_property": True,
+                    "hide_label": False,
+                    "hide_handles": False,
+                },
             )
         )
         self.add_parameter(

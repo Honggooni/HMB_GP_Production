@@ -9,7 +9,7 @@ from _hmb_bundled_policy_session import install_bundled_policy_session
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.7.31"
+EXPECTED_RELEASE_VERSION = "0.7.33"
 
 
 def load_module(name: str):

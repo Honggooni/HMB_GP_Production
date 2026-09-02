@@ -112,6 +112,17 @@ assert.equal(
 );
 assert.equal(
   widget.hmbSeedanceRemotePromptEdgeMatches(
+    edge(
+      "HMB Seedance Generation_4-VIDEO_OUT-HMB Seedance Generation_5-VIDEO_REFERENCES-1700000000000",
+      "Edge from HMB Seedance Generation_4 to HMB Seedance Generation_5",
+    ),
+    connectedRoute,
+  ),
+  false,
+  "Generator VIDEO_OUT cables must remain visible while only the managed prompt cable is hidden.",
+);
+assert.equal(
+  widget.hmbSeedanceRemotePromptEdgeMatches(
     edge(exactEdgeId, "Edge from HMBAgentLibrary_4 to Another Generator"),
     connectedRoute,
   ),
