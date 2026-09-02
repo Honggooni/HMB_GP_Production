@@ -2066,14 +2066,19 @@ def _default_image_target_for_main_type(
     main_type = _clean_string(source_type)
     if main_type == "Ignore / Unused":
         return "None"
-    # Environment authority is already explicit in Main/Sub Type.  A second
-    # scene-wide Target is redundant and used to render as "Scene / Environment".
+    # Every verified Environment / Background asset starts with its own readable
+    # name as an editable Target, just like Character assets.  This is only an
+    # initial value for a newly created Prompt row; saved user edits (including
+    # an intentionally cleared Target) are preserved by the caller.
     if main_type in {
         "Environment / Background",
         "Sky / Exterior Background",
-        "Set / Structure",
         "Foreground / Ground",
     }:
+        return _clean_string(image_name) or _clean_string(asset_id)
+    # Set / Structure belongs to the separate Background Prop Main Type and is
+    # not part of the Environment / Background default requested above.
+    if main_type == "Set / Structure":
         return ""
     if main_type == "Relative Size Reference":
         return IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS.get(

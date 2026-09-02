@@ -3565,7 +3565,9 @@ export function hmbInstallPromptInteractionIsolation(container, listeners) {
     if (["Backspace", "Delete"].includes(event?.key)) event.stopPropagation?.();
   };
   const stopSelectedNodeDeleteShortcut = (event) => hmbGuardSelectedNodeKeyboardDelete(container, event);
-  const stopInteriorNodeSelection = (event) => event.stopPropagation();
+  const stopInteriorNodeSelection = (event) => {
+    if (Number(event?.button) !== 1) event.stopPropagation?.();
+  };
   container.addEventListener?.("keydown", stopNodeDeleteShortcut);
   container.addEventListener?.("pointerdown", stopInteriorNodeSelection);
   listeners.push([container, "keydown", stopNodeDeleteShortcut]);
@@ -4968,9 +4970,11 @@ function hmbInstallFrameRangeInteractions(container, state, props, listeners) {
     const trackRect = track.getBoundingClientRect();
     const anchorFrame = frameFromPointer(event, track, minimum, maximum, trackRect);
     const anchorClientX = Number(event.clientX || 0);
+    const pointerId = event.pointerId;
     let previewRanges = originalRanges.map((range) => ({ ...range }));
     let previewSelected = rangeIndex;
     let movedPixels = 0;
+    let dragClosed = false;
 
     const moveHandler = (moveEvent) => {
       moveEvent.preventDefault();
@@ -5004,21 +5008,30 @@ function hmbInstallFrameRangeInteractions(container, state, props, listeners) {
     };
 
     const removeDocumentListeners = () => {
+      if (dragClosed) return false;
+      dragClosed = true;
       hmbClearScheduledFrameTrackPreview(container);
       document.removeEventListener("pointermove", moveHandler, true);
       document.removeEventListener("pointerup", upHandler, true);
       document.removeEventListener("pointercancel", cancelHandler, true);
-      if (container.__hmbFrameRangeDragCleanup === removeDocumentListeners) {
+      track.removeEventListener?.("lostpointercapture", cancelHandler);
+      window.removeEventListener?.("blur", cancelHandler, true);
+      document.removeEventListener?.("visibilitychange", visibilityHandler);
+      try { track.releasePointerCapture?.(pointerId); } catch (_error) {}
+      if (container.__hmbFrameRangeDragCleanup === cancelHandler) {
         delete container.__hmbFrameRangeDragCleanup;
       }
+      return true;
     };
     const cancelHandler = () => {
-      removeDocumentListeners();
+      if (!removeDocumentListeners()) return;
       updateFrameTrackPreview(track, originalRanges, metadata, Number(status.intent.selected_index), status.status);
     };
+    const visibilityHandler = () => {
+      if (document.visibilityState === "hidden") cancelHandler();
+    };
     const upHandler = (upEvent) => {
-      removeDocumentListeners();
-      try { track.releasePointerCapture?.(upEvent.pointerId); } catch (_error) {}
+      if (!removeDocumentListeners()) return;
       if (mode === "create" && movedPixels < 6) {
         updateFrameTrackPreview(track, originalRanges, metadata, Number(status.intent.selected_index), status.status);
         return;
@@ -5041,11 +5054,14 @@ function hmbInstallFrameRangeInteractions(container, state, props, listeners) {
       commitFrameState(row, item);
     };
 
-    container.__hmbFrameRangeDragCleanup = removeDocumentListeners;
+    container.__hmbFrameRangeDragCleanup = cancelHandler;
     try { track.setPointerCapture?.(event.pointerId); } catch (_error) {}
     document.addEventListener("pointermove", moveHandler, true);
     document.addEventListener("pointerup", upHandler, true);
     document.addEventListener("pointercancel", cancelHandler, true);
+    track.addEventListener?.("lostpointercapture", cancelHandler);
+    window.addEventListener?.("blur", cancelHandler, true);
+    document.addEventListener?.("visibilitychange", visibilityHandler);
   };
 
   const bind = (element, eventName, handler) => {
@@ -6248,6 +6264,120 @@ function hmbReadStoredGroupHeight(container, key) {
   return null;
 }
 
+function hmbSnapshotPromptObjectEntry(owner, key) {
+  const object = owner && typeof owner === "object" ? owner : null;
+  return {
+    existed: Boolean(object),
+    had_key: Boolean(object && Object.prototype.hasOwnProperty.call(object, key)),
+    value: object ? object[key] : undefined,
+  };
+}
+
+function hmbRestorePromptObjectEntry(owner, key, snapshot) {
+  if (!owner || typeof owner !== "object" || !snapshot) return;
+  if (snapshot.had_key) owner[key] = snapshot.value;
+  else delete owner[key];
+}
+
+function hmbSnapshotPromptGroupHeightStorage(container, key) {
+  const memory = container?.__hmbPromptLibraryGroupHeightMemory;
+  const memoryObject = memory && typeof memory === "object" ? memory : null;
+  const datasetKey = hmbGroupDatasetKey(key);
+  const dataset = container?.dataset;
+  return {
+    memory_existed: Boolean(memoryObject),
+    memory_entry: hmbSnapshotPromptObjectEntry(memoryObject, key),
+    dataset_key: datasetKey,
+    dataset_entry: hmbSnapshotPromptObjectEntry(dataset, datasetKey),
+  };
+}
+
+function hmbRestorePromptGroupHeightStorage(container, key, snapshot) {
+  if (!container || !snapshot) return;
+  let memory = container.__hmbPromptLibraryGroupHeightMemory;
+  if (!memory || typeof memory !== "object") {
+    if (snapshot.memory_existed || snapshot.memory_entry?.had_key) {
+      memory = {};
+      container.__hmbPromptLibraryGroupHeightMemory = memory;
+    }
+  }
+  if (memory && typeof memory === "object") {
+    hmbRestorePromptObjectEntry(memory, key, snapshot.memory_entry);
+    if (!snapshot.memory_existed && Object.keys(memory).length === 0) {
+      delete container.__hmbPromptLibraryGroupHeightMemory;
+    }
+  }
+  if (container.dataset) {
+    hmbRestorePromptObjectEntry(
+      container.dataset,
+      snapshot.dataset_key || hmbGroupDatasetKey(key),
+      snapshot.dataset_entry,
+    );
+  }
+}
+
+function hmbSnapshotPromptInlineStyles(element, names) {
+  const values = {};
+  (Array.isArray(names) ? names : []).forEach((name) => {
+    values[name] = element?.style ? element.style[name] : "";
+  });
+  return values;
+}
+
+function hmbRestorePromptInlineStyles(element, snapshot) {
+  if (!element?.style || !snapshot || typeof snapshot !== "object") return;
+  Object.entries(snapshot).forEach(([name, value]) => {
+    try { element.style[name] = value == null ? "" : String(value); } catch (_error) {}
+  });
+}
+
+function hmbSnapshotPromptGroupLayout(container, state) {
+  const groupHeightsEntry = hmbSnapshotPromptObjectEntry(state?.ui, "group_heights");
+  if (groupHeightsEntry.had_key && groupHeightsEntry.value && typeof groupHeightsEntry.value === "object") {
+    groupHeightsEntry.value = { ...groupHeightsEntry.value };
+  }
+  return {
+    group_heights_entry: groupHeightsEntry,
+    storage: Object.fromEntries(HMB_GROUP_KEYS.map((key) => [
+      key,
+      hmbSnapshotPromptGroupHeightStorage(container, key),
+    ])),
+    cards: HMB_GROUP_KEYS.map((key) => {
+      const card = container?.querySelector?.(`.group-card[data-group-id="${key}"]`) || null;
+      return {
+        key,
+        card,
+        styles: hmbSnapshotPromptInlineStyles(card, [
+          "flex",
+          "flexBasis",
+          "minHeight",
+          "height",
+        ]),
+      };
+    }),
+  };
+}
+
+function hmbRestorePromptGroupLayout(container, state, snapshot) {
+  if (!state || !snapshot) return;
+  state.ui = state.ui && typeof state.ui === "object" ? state.ui : {};
+  const groupHeightsEntry = snapshot.group_heights_entry;
+  if (groupHeightsEntry?.had_key) {
+    const original = groupHeightsEntry.value;
+    state.ui.group_heights = original && typeof original === "object"
+      ? { ...original }
+      : original;
+  } else {
+    delete state.ui.group_heights;
+  }
+  HMB_GROUP_KEYS.forEach((key) => {
+    hmbRestorePromptGroupHeightStorage(container, key, snapshot.storage?.[key]);
+  });
+  (Array.isArray(snapshot.cards) ? snapshot.cards : []).forEach((entry) => {
+    hmbRestorePromptInlineStyles(entry?.card, entry?.styles);
+  });
+}
+
 function hmbMergeStoredGroupHeights(container, state) {
   if (!state) return state;
   state.ui = normalizeUi(state.ui);
@@ -6471,17 +6601,28 @@ function hmbInstallGroupResizers(container, state, props, listeners) {
       hmbClearActivePromptResize(container);
 
       hmbCaptureSourceScroll(container);
-      hmbFitGroupHeightsToCenter(container, state);
-      hmbSetGroupResizeDragging(container, true);
-
       const nodeShell = hmbFindSafeReactFlowNode(container);
       if (!nodeShell || !nodeShell.style) {
         hmbSetGroupResizeDragging(container, false);
         return;
       }
+      const groupLayoutBefore = hmbSnapshotPromptGroupLayout(container, state);
+      const outerNodeHeightBefore = hmbNodeShellHeight(nodeShell);
+      const outerNodeStylesBefore = hmbSnapshotPromptInlineStyles(nodeShell, [
+        "height",
+        "minHeight",
+        "maxHeight",
+        "overflow",
+        "boxSizing",
+      ]);
+      const center = container.querySelector?.(".center") || null;
+      const centerStylesBefore = hmbSnapshotPromptInlineStyles(center, ["overflowY"]);
+      hmbFitGroupHeightsToCenter(container, state);
+      hmbSetGroupResizeDragging(container, true);
 
       const minHeight = HMB_GROUP_MIN_HEIGHTS[groupId] || 120;
       const startY = Number(event.clientY) || 0;
+      const pointerId = event.pointerId;
       const scaleY = hmbElementVisualScaleY(card) || 1;
       const startHeight = Math.max(minHeight, hmbCurrentGroupHeight(card) || minHeight);
       const startNodeHeight = Math.max(HMB_MIN_NODE_HEIGHT, hmbNodeShellHeight(nodeShell) || hmbRequiredOuterNodeHeight(container, state));
@@ -6489,6 +6630,7 @@ function hmbInstallGroupResizers(container, state, props, listeners) {
       const startingSlack = Math.max(0, startNodeHeight - startRequiredHeight);
       let lastHeight = startHeight;
       let lastNodeHeight = startNodeHeight;
+      let dragClosed = false;
 
       state.ui = normalizeUi(state.ui);
       try { document.body && document.body.classList && document.body.classList.add("hmb-group-resizing"); } catch (_e) {}
@@ -6509,28 +6651,45 @@ function hmbInstallGroupResizers(container, state, props, listeners) {
 
       const move = (moveEvent) => {
         moveEvent.preventDefault();
-        moveEvent.stopPropagation();
         const currentY = Number(moveEvent.clientY) || startY;
         const cssDelta = (currentY - startY) / Math.max(0.05, scaleY);
         applyResize(cssDelta);
       };
 
       const cleanupDrag = () => {
+        if (dragClosed) return false;
+        dragClosed = true;
         document.removeEventListener("pointermove", move, true);
         document.removeEventListener("pointerup", up, true);
-        document.removeEventListener("pointercancel", up, true);
+        document.removeEventListener("pointercancel", cancelDrag, true);
+        handle.removeEventListener?.("lostpointercapture", cancelDrag);
+        window.removeEventListener?.("blur", cancelDrag, true);
+        document.removeEventListener?.("visibilitychange", visibilityHandler);
         try { document.body?.classList?.remove("hmb-group-resizing"); } catch (_e) {}
-        if (container.__hmbPromptLibraryResizeCleanup === cleanupDrag) {
+        try { handle.releasePointerCapture?.(pointerId); } catch (_e) {}
+        if (container.__hmbPromptLibraryResizeCleanup === cancelDrag) {
           delete container.__hmbPromptLibraryResizeCleanup;
         }
         hmbSetGroupResizeDragging(container, false);
+        return true;
+      };
+
+      const cancelDrag = () => {
+        if (!cleanupDrag()) return;
+        hmbRestorePromptGroupLayout(container, state, groupLayoutBefore);
+        hmbApplyDashboardHostSizing(container, state);
+        hmbRestorePromptInlineStyles(center, centerStylesBefore);
+        hmbRestorePromptInlineStyles(nodeShell, outerNodeStylesBefore);
+        if (outerNodeHeightBefore > 0) hmbRequestPromptHostResize(container, nodeShell);
+        hmbRestoreSourceScroll(container);
+      };
+      const visibilityHandler = () => {
+        if (document.visibilityState === "hidden") cancelDrag();
       };
 
       const up = (upEvent) => {
         upEvent.preventDefault();
-        upEvent.stopPropagation();
-        try { handle.releasePointerCapture?.(event.pointerId); } catch (_e) {}
-        cleanupDrag();
+        if (!cleanupDrag()) return;
 
         state.ui = normalizeUi(state.ui);
         state.ui.group_heights[groupId] = lastHeight;
@@ -6547,11 +6706,14 @@ function hmbInstallGroupResizers(container, state, props, listeners) {
         });
       };
 
-      try { handle.setPointerCapture?.(event.pointerId); } catch (_e) {}
-      container.__hmbPromptLibraryResizeCleanup = cleanupDrag;
+      try { handle.setPointerCapture?.(pointerId); } catch (_e) {}
+      container.__hmbPromptLibraryResizeCleanup = cancelDrag;
       document.addEventListener("pointermove", move, true);
       document.addEventListener("pointerup", up, true);
-      document.addEventListener("pointercancel", up, true);
+      document.addEventListener("pointercancel", cancelDrag, true);
+      handle.addEventListener?.("lostpointercapture", cancelDrag);
+      window.addEventListener?.("blur", cancelDrag, true);
+      document.addEventListener?.("visibilitychange", visibilityHandler);
     };
 
     handle.addEventListener("pointerdown", pointerDown);
@@ -6602,19 +6764,39 @@ function hmbInstallKeepOutResizers(container, state, props, listeners) {
       hmbClearActivePromptResize(container);
 
       hmbCaptureSourceScroll(container);
-      hmbFitGroupHeightsToCenter(container, state);
-      hmbSetGroupResizeDragging(container, true);
-
       const nodeShell = hmbFindSafeReactFlowNode(container);
       if (!nodeShell || !nodeShell.style) {
         hmbSetGroupResizeDragging(container, false);
         return;
       }
+      const groupId = "videoSources";
+      const groupLayoutBefore = hmbSnapshotPromptGroupLayout(container, state);
+      const textareaStateBefore = hmbSnapshotPromptObjectEntry(
+        state?.ui?.textarea_heights,
+        key,
+      );
+      const textareaStylesBefore = hmbSnapshotPromptInlineStyles(textarea, [
+        "height",
+        "minHeight",
+        "maxHeight",
+      ]);
+      const outerNodeHeightBefore = hmbNodeShellHeight(nodeShell);
+      const outerNodeStylesBefore = hmbSnapshotPromptInlineStyles(nodeShell, [
+        "height",
+        "minHeight",
+        "maxHeight",
+        "overflow",
+        "boxSizing",
+      ]);
+      const center = container.querySelector?.(".center") || null;
+      const centerStylesBefore = hmbSnapshotPromptInlineStyles(center, ["overflowY"]);
+      hmbFitGroupHeightsToCenter(container, state);
+      hmbSetGroupResizeDragging(container, true);
 
       state.ui = normalizeUi(state.ui);
-      const groupId = "videoSources";
       const groupMinHeight = HMB_GROUP_MIN_HEIGHTS[groupId] || 130;
       const startY = Number(event.clientY) || 0;
+      const pointerId = event.pointerId;
       const scaleY = hmbElementVisualScaleY(textarea) || 1;
       const startTextareaHeight = Math.max(
         HMB_KEEP_OUT_MIN_HEIGHT,
@@ -6631,6 +6813,7 @@ function hmbInstallKeepOutResizers(container, state, props, listeners) {
       let lastTextareaHeight = startTextareaHeight;
       let lastGroupHeight = startGroupHeight;
       let lastNodeHeight = startNodeHeight;
+      let dragClosed = false;
 
       try { document.body && document.body.classList && document.body.classList.add("hmb-group-resizing"); } catch (_e) {}
 
@@ -6668,28 +6851,51 @@ function hmbInstallKeepOutResizers(container, state, props, listeners) {
 
       const move = (moveEvent) => {
         moveEvent.preventDefault();
-        moveEvent.stopPropagation();
         const currentY = Number(moveEvent.clientY) || startY;
         const cssDelta = (currentY - startY) / Math.max(0.05, scaleY);
         applyResize(cssDelta);
       };
 
       const cleanupDrag = () => {
+        if (dragClosed) return false;
+        dragClosed = true;
         document.removeEventListener("pointermove", move, true);
         document.removeEventListener("pointerup", up, true);
-        document.removeEventListener("pointercancel", up, true);
+        document.removeEventListener("pointercancel", cancelDrag, true);
+        handle.removeEventListener?.("lostpointercapture", cancelDrag);
+        window.removeEventListener?.("blur", cancelDrag, true);
+        document.removeEventListener?.("visibilitychange", visibilityHandler);
         try { document.body?.classList?.remove("hmb-group-resizing"); } catch (_e) {}
-        if (container.__hmbPromptLibraryResizeCleanup === cleanupDrag) {
+        try { handle.releasePointerCapture?.(pointerId); } catch (_e) {}
+        if (container.__hmbPromptLibraryResizeCleanup === cancelDrag) {
           delete container.__hmbPromptLibraryResizeCleanup;
         }
         hmbSetGroupResizeDragging(container, false);
+        return true;
+      };
+
+      const cancelDrag = () => {
+        if (!cleanupDrag()) return;
+        hmbRestorePromptGroupLayout(container, state, groupLayoutBefore);
+        state.ui = state.ui && typeof state.ui === "object" ? state.ui : {};
+        state.ui.textarea_heights = state.ui.textarea_heights && typeof state.ui.textarea_heights === "object"
+          ? state.ui.textarea_heights
+          : {};
+        hmbRestorePromptObjectEntry(state.ui.textarea_heights, key, textareaStateBefore);
+        hmbApplyDashboardHostSizing(container, state);
+        hmbRestorePromptInlineStyles(textarea, textareaStylesBefore);
+        hmbRestorePromptInlineStyles(center, centerStylesBefore);
+        hmbRestorePromptInlineStyles(nodeShell, outerNodeStylesBefore);
+        if (outerNodeHeightBefore > 0) hmbRequestPromptHostResize(container, nodeShell);
+        hmbRestoreSourceScroll(container);
+      };
+      const visibilityHandler = () => {
+        if (document.visibilityState === "hidden") cancelDrag();
       };
 
       const up = (upEvent) => {
         upEvent.preventDefault();
-        upEvent.stopPropagation();
-        try { handle.releasePointerCapture?.(event.pointerId); } catch (_e) {}
-        cleanupDrag();
+        if (!cleanupDrag()) return;
 
         state.ui = normalizeUi(state.ui);
         state.ui.textarea_heights[key] = lastTextareaHeight;
@@ -6707,11 +6913,14 @@ function hmbInstallKeepOutResizers(container, state, props, listeners) {
         });
       };
 
-      try { handle.setPointerCapture?.(event.pointerId); } catch (_e) {}
-      container.__hmbPromptLibraryResizeCleanup = cleanupDrag;
+      try { handle.setPointerCapture?.(pointerId); } catch (_e) {}
+      container.__hmbPromptLibraryResizeCleanup = cancelDrag;
       document.addEventListener("pointermove", move, true);
       document.addEventListener("pointerup", up, true);
-      document.addEventListener("pointercancel", up, true);
+      document.addEventListener("pointercancel", cancelDrag, true);
+      handle.addEventListener?.("lostpointercapture", cancelDrag);
+      window.addEventListener?.("blur", cancelDrag, true);
+      document.addEventListener?.("visibilitychange", visibilityHandler);
     };
 
     handle.addEventListener("pointerdown", pointerDown);

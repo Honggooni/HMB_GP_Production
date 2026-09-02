@@ -13316,7 +13316,18 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     currentState: currentWidgetState,
     commitState: commitSharedLoaderVideoDrag,
   }));
+  let pointerInteractionActive = false;
   container.querySelectorAll("[data-resize-section]").forEach((handle) => {
+    // One stable teardown slot owns the currently active drag for this handle.
+    // Pointerdown may run many times during one mount, so registering a new
+    // factory cleanup for every gesture would retain already-finished closures.
+    let cancelActiveSectionResize = null;
+    const cancelOwnedSectionResize = () => {
+      const cancel = cancelActiveSectionResize;
+      cancelActiveSectionResize = null;
+      if (typeof cancel === "function") cancel();
+    };
+    activeCleanup.push(cancelOwnedSectionResize);
     on(handle, "pointerdown", (event) => {
       if (event.button !== undefined && event.button !== 0) return;
       event.preventDefault();
@@ -13324,7 +13335,10 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       const key = clean(handle.getAttribute("data-resize-section"));
       const section = handle.closest(".side-section");
       if (!key || !section) return;
+      cancelOwnedSectionResize();
+      pointerInteractionActive = true;
       const startY = Number(event.clientY || 0);
+      const pointerId = event.pointerId;
       const sectionRect = section.getBoundingClientRect?.();
       const offsetHeight = Number(section.offsetHeight || 0);
       const rectHeight = Number(sectionRect?.height || 0);
@@ -13332,7 +13346,33 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       const renderScale = offsetHeight > 0 && rectHeight > 0 ? rectHeight / offsetHeight : 1;
       const safeScale = Number.isFinite(renderScale) && renderScale > 0.05 ? renderScale : 1;
       let latestHeight = startHeight;
-      try { handle.setPointerCapture?.(event.pointerId); } catch (_error) {}
+      let dragClosed = false;
+      const originalInlineHeight = {
+        value: clean(section.style?.getPropertyValue?.("height") || section.style?.height),
+        priority: clean(section.style?.getPropertyPriority?.("height")),
+      };
+      const originalInlineFlexBasis = {
+        value: clean(section.style?.getPropertyValue?.("flex-basis") || section.style?.flexBasis),
+        priority: clean(section.style?.getPropertyPriority?.("flex-basis")),
+      };
+      const restoreInlineProperty = (cssName, fieldName, snapshot) => {
+        if (!section.style) return;
+        if (snapshot.value) {
+          if (typeof section.style.setProperty === "function") {
+            section.style.setProperty(cssName, snapshot.value, snapshot.priority);
+          } else {
+            section.style[fieldName] = snapshot.value;
+          }
+          return;
+        }
+        section.style.removeProperty?.(cssName);
+        try { section.style[fieldName] = ""; } catch (_error) {}
+      };
+      const restoreSectionInlineSize = () => {
+        restoreInlineProperty("height", "height", originalInlineHeight);
+        restoreInlineProperty("flex-basis", "flexBasis", originalInlineFlexBasis);
+      };
+      try { handle.setPointerCapture?.(pointerId); } catch (_error) {}
       const move = (moveEvent) => {
         moveEvent.preventDefault();
         const screenDelta = Number(moveEvent.clientY || startY) - startY;
@@ -13341,11 +13381,31 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
         section.style.flexBasis = `${latestHeight}px`;
         hmbApplyPickerHostSizing(container, hmbPickerInnerRequiredHeight(container));
       };
-      const end = (endEvent) => {
+      const cleanupGesture = () => {
+        if (dragClosed) return false;
+        dragClosed = true;
         window.removeEventListener("pointermove", move, true);
         window.removeEventListener("pointerup", end, true);
-        window.removeEventListener("pointercancel", end, true);
-        try { handle.releasePointerCapture?.(endEvent?.pointerId ?? event.pointerId); } catch (_error) {}
+        window.removeEventListener("pointercancel", cancel, true);
+        window.removeEventListener("blur", cancel, true);
+        document.removeEventListener?.("visibilitychange", visibilityHandler);
+        handle.removeEventListener?.("lostpointercapture", cancel);
+        try { handle.releasePointerCapture?.(pointerId); } catch (_error) {}
+        if (cancelActiveSectionResize === cancel) cancelActiveSectionResize = null;
+        return true;
+      };
+      const cancel = () => {
+        if (!cleanupGesture()) return;
+        pointerInteractionActive = false;
+        restoreSectionInlineSize();
+        schedulePickerFit(true, true);
+      };
+      const visibilityHandler = () => {
+        if (document.visibilityState === "hidden") cancel();
+      };
+      const end = () => {
+        if (!cleanupGesture()) return;
+        pointerInteractionActive = false;
         const currentLocal = normalize(container.__hmbPendingPickerState || state);
         const heights = hmbNormalizeRightSectionHeights(currentLocal.right_section_heights);
         heights[key] = latestHeight;
@@ -13357,18 +13417,16 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       };
       window.addEventListener("pointermove", move, true);
       window.addEventListener("pointerup", end, true);
-      window.addEventListener("pointercancel", end, true);
-      activeCleanup.push(() => {
-        window.removeEventListener("pointermove", move, true);
-        window.removeEventListener("pointerup", end, true);
-        window.removeEventListener("pointercancel", end, true);
-      });
+      window.addEventListener("pointercancel", cancel, true);
+      window.addEventListener("blur", cancel, true);
+      document.addEventListener?.("visibilitychange", visibilityHandler);
+      handle.addEventListener?.("lostpointercapture", cancel);
+      cancelActiveSectionResize = cancel;
     });
   });
 
   let resizeFrame = 0;
   let resizeApplying = false;
-  let pointerInteractionActive = false;
   let nativeNodeResizeActive = false;
   let nativeNodeResizeFrame = 0;
   let nativeNodeResizeFinalize = false;
@@ -13579,17 +13637,24 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     }
     schedulePickerFit(true);
   };
+  const settleAfterVisibilityLoss = () => {
+    if (document.visibilityState === "hidden") settleAfterPointer();
+  };
   window.addEventListener("pointerdown", pauseFitDuringPointer, true);
   window.addEventListener("pointermove", repairDuringNativePointer, true);
   window.addEventListener("pointerup", settleAfterPointer, true);
   window.addEventListener("pointercancel", settleAfterPointer, true);
   window.addEventListener("mouseup", settleAfterPointer, true);
+  window.addEventListener("blur", settleAfterPointer, true);
+  document.addEventListener?.("visibilitychange", settleAfterVisibilityLoss);
   activeCleanup.push(() => {
     window.removeEventListener("pointerdown", pauseFitDuringPointer, true);
     window.removeEventListener("pointermove", repairDuringNativePointer, true);
     window.removeEventListener("pointerup", settleAfterPointer, true);
     window.removeEventListener("pointercancel", settleAfterPointer, true);
     window.removeEventListener("mouseup", settleAfterPointer, true);
+    window.removeEventListener("blur", settleAfterPointer, true);
+    document.removeEventListener?.("visibilitychange", settleAfterVisibilityLoss);
     nativeNodeResizeActive = false;
     nativeNodeResizeSession = null;
     if (resizeFrame && typeof cancelAnimationFrame === "function") cancelAnimationFrame(resizeFrame);

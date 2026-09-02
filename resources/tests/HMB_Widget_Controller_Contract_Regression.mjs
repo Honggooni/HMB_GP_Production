@@ -6,11 +6,13 @@ const commandPath = new URL("../../widgets/HMBVideoPickerCommandBridgeWidget_v03
 const promptPath = new URL("../../widgets/HMBPromptLibraryScopedBindingWidget.js", import.meta.url);
 const agentPath = new URL("../../widgets/HMBAgentLibraryWidget.js", import.meta.url);
 const assetPath = new URL("../../widgets/HMBImageAssetLibraryWidget.js", import.meta.url);
+const seedancePath = new URL("../../widgets/HMBSeedanceGenerationWidget.js", import.meta.url);
 const videoSource = fs.readFileSync(videoPath, "utf8");
 const commandSource = fs.readFileSync(commandPath, "utf8");
 const promptSource = fs.readFileSync(promptPath, "utf8");
 const agentSource = fs.readFileSync(agentPath, "utf8");
 const assetSource = fs.readFileSync(assetPath, "utf8");
+const seedanceSource = fs.readFileSync(seedancePath, "utf8");
 const pickerModule = await import(videoPath);
 const assetModule = await import(assetPath);
 const promptModule = await import(promptPath);
@@ -889,6 +891,11 @@ assert.doesNotMatch(
   "Agent markup must never ship with a pan or wheel blocker.",
 );
 assert.match(agentSource, /container\.addEventListener\?\.\("pointerdown", stopInteriorNodeSelection\)/);
+assert.match(
+  agentSource,
+  /const stopInteriorNodeSelection = \(event\) => \{\s*if \(Number\(event\?\.button\) !== 1\) event\.stopPropagation\?\.\(\);\s*\};/,
+  "Agent background must pass middle-button pan to Griptape.",
+);
 assert.doesNotMatch(
   agentSource,
   /(?:^|[;{])\s*cursor\s*:|pointer-events\s*:/m,
@@ -1470,6 +1477,16 @@ assert.match(
   /stopInteriorNodeSelection/,
   "Prompt interior clicks must not select or resize the node; the native title bar owns activation.",
 );
+assert.match(
+  promptSource,
+  /const stopInteriorNodeSelection = \(event\) => \{\s*if \(Number\(event\?\.button\) !== 1\) event\.stopPropagation\?\.\(\);\s*\};/,
+  "Prompt background must pass middle-button pan to Griptape.",
+);
+assert.match(
+  seedanceSource,
+  /const stopInteriorSelection = \(event\) => \{\s*if \(Number\(event\?\.button\) !== 1\) event\.stopPropagation\?\.\(\);\s*\};/,
+  "Seedance background must pass middle-button pan to Griptape.",
+);
 assert.match(promptSource, /container\.querySelector\?\.\("\.image-card"\)/);
 assert.match(
   promptSource,
@@ -1494,6 +1511,99 @@ for (const source of [videoSource, promptSource]) {
   );
 }
 assert.match(videoSource, /class="hmbvp-clip nodrag"/);
+assert.ok(
+  (promptSource.match(/"lostpointercapture", (?:cancelHandler|cancelDrag)/g) || []).length >= 3,
+  "Every Prompt pointer-capture gesture needs a lostpointercapture cancel path.",
+);
+assert.ok(
+  (promptSource.match(/"blur", (?:cancelHandler|cancelDrag), true/g) || []).length >= 6,
+  "Prompt gesture setup and teardown must both cover window blur.",
+);
+assert.ok(
+  (promptSource.match(/"visibilitychange", visibilityHandler/g) || []).length >= 6,
+  "Prompt gesture setup and teardown must both cover document visibility loss.",
+);
+assert.match(
+  promptSource,
+  /function hmbSnapshotPromptGroupHeightStorage\(container, key\)/,
+  "Prompt resize cancellation must snapshot the pre-gesture stored group height.",
+);
+assert.match(
+  promptSource,
+  /function hmbRestorePromptGroupHeightStorage\(container, key, snapshot\)/,
+  "Prompt resize cancellation must restore the exact stored-height presence and value.",
+);
+assert.ok(
+  (promptSource.match(/const groupLayoutBefore = hmbSnapshotPromptGroupLayout\(container, state\)/g) || []).length >= 2,
+  "Both Prompt group and keep-out resize gestures must snapshot the complete group layout before mutation.",
+);
+assert.ok(
+  (promptSource.match(/hmbRestorePromptGroupLayout\(container, state, groupLayoutBefore\)/g) || []).length >= 2,
+  "Both Prompt cancellation paths must roll back the complete group layout without emitting.",
+);
+assert.match(
+  promptSource,
+  /function hmbSnapshotPromptGroupLayout\(container, state\)[\s\S]*?storage: Object\.fromEntries\(HMB_GROUP_KEYS\.map[\s\S]*?cards: HMB_GROUP_KEYS\.map/,
+  "A Prompt resize snapshot must cover every group storage entry and every group card DOM geometry.",
+);
+assert.match(
+  promptSource,
+  /function hmbRestorePromptGroupLayout\(container, state, snapshot\)[\s\S]*?HMB_GROUP_KEYS\.forEach[\s\S]*?hmbRestorePromptGroupHeightStorage[\s\S]*?snapshot\.cards/,
+  "Prompt cancellation must restore all group state, memory, dataset, and card geometry changed by fit normalization.",
+);
+assert.ok(
+  (promptSource.match(/hmbRestorePromptInlineStyles\(nodeShell, outerNodeStylesBefore\)/g) || []).length >= 2,
+  "Both Prompt cancellation paths must restore the outer node's pre-gesture geometry.",
+);
+assert.match(
+  promptSource,
+  /const textareaStateBefore = hmbSnapshotPromptObjectEntry\([\s\S]*?hmbRestorePromptObjectEntry\(state\.ui\.textarea_heights, key, textareaStateBefore\)/,
+  "Keep-out cancellation must restore its raw textarea-height entry as well as group geometry.",
+);
+assert.match(
+  videoSource,
+  /handle\.addEventListener\?\.\("lostpointercapture", cancel\)/,
+  "Picker section resizing must cancel when pointer capture is lost.",
+);
+assert.match(
+  videoSource,
+  /window\.addEventListener\("blur", cancel, true\)/,
+  "Picker section resizing must cancel when the app loses focus.",
+);
+const pickerSectionResizeStart = videoSource.indexOf(
+  'container.querySelectorAll("[data-resize-section]").forEach((handle) => {',
+);
+const pickerSectionResizeEnd = videoSource.indexOf("  let resizeFrame = 0;", pickerSectionResizeStart);
+assert.ok(
+  pickerSectionResizeStart >= 0 && pickerSectionResizeEnd > pickerSectionResizeStart,
+  "Picker section-resize controller must remain discoverable as one bounded source region.",
+);
+const pickerSectionResizeSource = videoSource.slice(pickerSectionResizeStart, pickerSectionResizeEnd);
+assert.equal(
+  (pickerSectionResizeSource.match(/activeCleanup\.push\(cancelOwnedSectionResize\)/g) || []).length,
+  1,
+  "Each section handle must own one mutable teardown slot instead of retaining one cleanup per drag.",
+);
+assert.doesNotMatch(
+  pickerSectionResizeSource,
+  /activeCleanup\.push\(cancel\)/,
+  "A completed section drag must not accumulate its cancel closure in factory cleanup.",
+);
+assert.match(
+  pickerSectionResizeSource,
+  /const originalInlineHeight = \{[\s\S]*?const originalInlineFlexBasis = \{[\s\S]*?const restoreSectionInlineSize = \(\) => \{/,
+  "A cancelled section resize must retain both pre-gesture inline dimensions for rollback.",
+);
+assert.match(
+  pickerSectionResizeSource,
+  /const cancel = \(\) => \{[\s\S]*?pointerInteractionActive = false;[\s\S]*?restoreSectionInlineSize\(\);[\s\S]*?schedulePickerFit\(true, true\);/,
+  "Lost capture, blur, visibility loss, and teardown must restore geometry and resume forced fitting.",
+);
+assert.match(
+  pickerSectionResizeSource,
+  /handle\.releasePointerCapture\?\.\(pointerId\)[\s\S]*?cancelActiveSectionResize === cancel[\s\S]*?cancelActiveSectionResize = null/,
+  "Gesture cleanup must release the exact pointer and clear the handle-owned active cancel slot.",
+);
 assert.match(promptSource, /class="hmb-dashboard-clip nodrag"/);
 assert.match(videoSource, /hmbRememberVideoPickerViewMode\(container, storedViewMode === true\)/);
 assert.match(videoSource, /export function hmbBindVideoPickerRuntimeIdentity\(/);

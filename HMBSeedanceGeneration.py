@@ -6,6 +6,7 @@ import binascii
 import ctypes
 import hashlib
 import importlib
+import inspect
 import ipaddress
 import io
 import json
@@ -2948,14 +2949,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "replacement render or creates a second charge."
                 ),
                 on_click=self._on_refresh_clicked,
-                # Retain the parameter/callback for saved-host compatibility,
-                # but do not expose React's native loading button.  The visible
-                # preview action uses the bounded, zero-height command bridge;
-                # a lost native SendNodeMessage response could otherwise leave
-                # the button (and selected node) permanently loading.
-                state="hidden",
-                hide=True,
-                hide_property=True,
+                # Keep the Status fallback visible even after a completed video
+                # has replaced the viewport recovery overlay.  The callback
+                # acknowledges immediately and schedules a same-task-only
+                # refresh, so this control never creates a replacement render.
+                state="normal",
+                hide=False,
+                hide_property=False,
                 serializable=False,
             )
         )
@@ -3964,26 +3964,45 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         except Exception:
             current = getattr(parameter, "default_value", None)
         parameter.default_value = deepcopy(next_value)
-        if current == next_value:
+        last_published = getattr(
+            self,
+            "_hmb_last_published_seedance_shot_widget",
+            None,
+        )
+        needs_explicit_publish = bool(
+            emit_change
+            and (
+                not hasattr(
+                    self,
+                    "_hmb_last_published_seedance_shot_widget",
+                )
+                or last_published != next_value
+            )
+        )
+        if current == next_value and not needs_explicit_publish:
             return
         self._hmb_shot_syncing = True
         try:
-            self._set_shot_value(
-                SEEDANCE_SHOT_WIDGET_PARAMETER,
-                next_value,
-                # Runtime preview publication has one authority path.  Calling
-                # set_parameter_value(..., emit_change=True) and then the
-                # explicit publisher duplicated the same retained-mode update,
-                # which amplified React/WebSocket work during result refresh.
-                emit_change=False,
-            )
-            if emit_change:
+            if current != next_value:
+                self._set_shot_value(
+                    SEEDANCE_SHOT_WIDGET_PARAMETER,
+                    next_value,
+                    # Runtime preview publication has one authority path.
+                    # Calling set_parameter_value(..., emit_change=True) and
+                    # then the explicit publisher duplicated the same retained-
+                    # mode update, amplifying React/WebSocket work.
+                    emit_change=False,
+                )
+            if needs_explicit_publish:
                 # One explicit value event is sufficient for runtime progress;
                 # lifecycle invalidation here would duplicate the same state
                 # and can cascade through every selected React node.
                 publisher = getattr(self, "publish_update_to_parameter", None)
                 if callable(publisher):
                     publisher(SEEDANCE_SHOT_WIDGET_PARAMETER, next_value)
+                    self._hmb_last_published_seedance_shot_widget = deepcopy(
+                        next_value
+                    )
         finally:
             self._hmb_shot_syncing = False
 
@@ -4057,6 +4076,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # output destinations and connected FileOutputSettings remain owned by
         # the user/workflow.
         self._sync_shot_output_filenames()
+        # Mutate silently here. The router's final status pass publishes one
+        # complete widget state after any Agent route has also been pre-armed.
+        # _sync_seedance_shot_widget remembers explicit publications, so an
+        # equal backend value still reaches a newly mounted React widget once.
         self._sync_seedance_shot_widget()
 
     def _shot_identity(self) -> dict[str, Any]:
@@ -4568,6 +4591,20 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         parent = super().set_parameter_value
         if param_name == "model_id" and not initial_setup:
             self._hmb_model_switch_previous_id = previous_model_id
+        child_list_sync = parent_container_name in {
+            "reference_images",
+            VIDEO_REFERENCES_PARAMETER,
+            "reference_audio",
+        }
+        previous_list_sync = bool(
+            getattr(self, "_hmb_list_parent_syncing", False)
+        )
+        if child_list_sync:
+            # BaseNode recomputes a ParameterList's aggregate value by calling
+            # this override again after one child is set. Mark that recursive
+            # parent write as an aggregate echo so it cannot clear and recreate
+            # the very child whose stable identity Griptape just hydrated.
+            self._hmb_list_parent_syncing = True
         try:
             parent(
                 param_name,
@@ -4577,6 +4614,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 skip_before_value_set=skip_before_value_set,
             )
         finally:
+            if child_list_sync:
+                self._hmb_list_parent_syncing = previous_list_sync
             if param_name == "model_id" and not initial_setup:
                 with suppress(AttributeError):
                     del self._hmb_model_switch_previous_id
@@ -5491,24 +5530,167 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         return True
 
     def _has_incoming_parameter_connection(self, name: str) -> bool:
-        """Return True when the current node has any incoming connection on *name*."""
+        """Return True for an incoming edge on *name* or one of its list rows."""
 
+        try:
+            registered = GriptapeNodes.NodeManager().get_node_by_name(
+                str(self.name)
+            )
+        except (KeyError, ValueError):
+            return False
+        except Exception:
+            registered = self
+        if registered is not self:
+            return False
         try:
             from griptape_nodes.retained_mode.retained_mode import RetainedMode  # type: ignore
 
-            result = RetainedMode.get_connections_for_parameter(
-                str(name),
-                str(self.name),
-            )
+            result = RetainedMode.get_connections_for_node(str(self.name))
         except Exception:
-            return False
+            result = None
         incoming = getattr(result, "incoming_connections", None)
-        if not isinstance(incoming, (list, tuple)):
+        if isinstance(incoming, (list, tuple)):
+            return any(
+                self._connection_targets_parameter_or_list_child(
+                    str(name),
+                    str(getattr(item, "target_parameter_name", "") or ""),
+                )
+                for item in incoming
+            )
+        if result is not None:
             return False
-        return any(
-            str(getattr(item, "target_parameter_name", "") or "") == str(name)
-            for item in incoming
+
+        # Compatibility fallback for older hosts and isolated regression stubs
+        # that expose only the parameter-scoped retained-mode query. Query the
+        # parent plus every surviving dynamic row; older APIs do not expand a
+        # ParameterList parent query to its children.
+        query_names = [str(name)]
+        container = None
+        with suppress(Exception):
+            container = self.get_parameter_by_name(str(name))
+        if isinstance(container, ParameterList):
+            with suppress(Exception):
+                query_names.extend(
+                    str(child.name)
+                    for child in container.get_child_parameters()
+                    if str(getattr(child, "name", "") or "")
+                )
+        for query_name in dict.fromkeys(query_names):
+            try:
+                result = RetainedMode.get_connections_for_parameter(
+                    query_name,
+                    str(self.name),
+                )
+            except Exception:
+                continue
+            incoming = getattr(result, "incoming_connections", None)
+            if isinstance(incoming, (list, tuple)) and any(
+                self._connection_targets_parameter_or_list_child(
+                    str(name),
+                    str(getattr(item, "target_parameter_name", "") or ""),
+                )
+                for item in incoming
+            ):
+                return True
+        return False
+
+    def _connection_targets_parameter_or_list_child(
+        self,
+        parent_name: str,
+        target_name: str,
+    ) -> bool:
+        """Match a retained edge to a parameter or a stable ParameterList row."""
+
+        parent = str(parent_name or "")
+        target = str(target_name or "")
+        if not parent or not target:
+            return False
+        if target == parent:
+            return True
+        parameter = None
+        with suppress(Exception):
+            parameter = self.get_parameter_by_name(target)
+        if str(getattr(parameter, "parent_container_name", "") or "") == parent:
+            return True
+        container = None
+        with suppress(Exception):
+            container = self.get_parameter_by_name(parent)
+        return bool(
+            isinstance(container, ParameterList)
+            and target.startswith(f"{parent}_ParameterListUniqueParamID_")
         )
+
+    def _discard_dangling_owned_list_connections_before_delete(self) -> int:
+        """Remove only invalid edges whose HMB list row no longer exists.
+
+        Griptape validates both endpoint parameters before deleting an edge. A
+        historic parent-list hydration could replace a connected dynamic row,
+        leaving the retained connection object alive after that row disappeared.
+        Such an edge makes the host abort deletion/reset before it can release
+        this generator's Shot. During the node's deletion hook it is safe to
+        discard only those already-invalid, HMB-owned list-row edges directly;
+        valid user connections continue through the normal host lifecycle.
+        """
+
+        try:
+            connections = GriptapeNodes.FlowManager().get_connections()
+            incoming_index = getattr(connections, "incoming_index", {})
+            connection_map = getattr(connections, "connections", {})
+            by_parameter = incoming_index.get(str(self.name), {})
+        except Exception:
+            return 0
+        if not isinstance(by_parameter, dict) or not isinstance(connection_map, dict):
+            return 0
+
+        owned_lists = (
+            "reference_images",
+            VIDEO_REFERENCES_PARAMETER,
+            "reference_audio",
+        )
+        connection_ids = {
+            connection_id
+            for values in tuple(by_parameter.values())
+            if isinstance(values, (list, tuple, set))
+            for connection_id in tuple(values)
+        }
+        removed = 0
+        failed: list[str] = []
+        remover = getattr(connections, "remove_connection_by_object", None)
+        for connection_id in connection_ids:
+            connection = connection_map.get(connection_id)
+            if connection is None:
+                continue
+            target_node = getattr(connection, "target_node", None)
+            if target_node is not self:
+                continue
+            target_parameter = getattr(connection, "target_parameter", None)
+            target_name = str(getattr(target_parameter, "name", "") or "")
+            if not target_name or self.get_parameter_by_name(target_name) is not None:
+                continue
+            if not any(
+                self._connection_targets_parameter_or_list_child(
+                    parent_name,
+                    target_name,
+                )
+                for parent_name in owned_lists
+            ):
+                continue
+            if not callable(remover) or remover(connection) is not True:
+                failed.append(target_name)
+                continue
+            removed += 1
+        if failed:
+            raise ValueError(
+                "Unable to release dangling HMB list connection(s): "
+                + ", ".join(sorted(set(failed)))
+            )
+        if removed:
+            logger.warning(
+                "Removed %d dangling HMB list connection(s) before deleting %s.",
+                removed,
+                self.name,
+            )
+        return removed
 
     def _get_list_input(self, name: str) -> list[Any]:
         """Read the current list value, then an older serialized top-level value."""
@@ -6703,12 +6885,28 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 raise RuntimeError(
                     "No default Griptape Cloud storage bucket is available."
                 )
+        config_manager = GriptapeNodes.ConfigManager()
+        driver_kwargs = {
+            "bucket_id": bucket_id,
+            "api_key": cloud_credential,
+            "base_url": base_url,
+            "request_timeout": 30.0,
+        }
+        try:
+            driver_parameters = inspect.signature(
+                GriptapeCloudStorageDriver
+            ).parameters
+        except (TypeError, ValueError):
+            driver_parameters = {}
+        if "config_manager" in driver_parameters:
+            # Current Griptape hosts require the ConfigManager itself so the
+            # storage driver can resolve the active workspace safely.
+            return GriptapeCloudStorageDriver(config_manager, **driver_kwargs)
+        # Compatibility with older hosts whose driver accepted only the
+        # resolved workspace directory.
         return GriptapeCloudStorageDriver(
-            workspace_directory=GriptapeNodes.ConfigManager().workspace_path,
-            bucket_id=bucket_id,
-            api_key=cloud_credential,
-            base_url=base_url,
-            request_timeout=30.0,
+            workspace_directory=config_manager.workspace_path,
+            **driver_kwargs,
         )
 
     def _try_create_gt_cloud_storage_driver(
@@ -8957,6 +9155,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     def after_node_deleted(self, *args: Any, **kwargs: Any) -> Any:
         """Invalidate every delayed Broker/UI callback without blocking delete."""
 
+        # Run before marking this object deleted. If recovery cannot remove an
+        # already-invalid dynamic-list edge, raising ValueError lets the host
+        # abort cleanly without leaving a live node that has surrendered Shot
+        # ownership.
+        self._discard_dangling_owned_list_connections_before_delete()
         if not bool(getattr(self, "_hmb_node_deleted", False)):
             self._hmb_node_deleted = True
             with self._generation_refresh_lock:

@@ -2,8 +2,8 @@
   "SPDXID": "SPDXRef-DOCUMENT",
   "spdxVersion": "SPDX-2.3",
   "dataLicense": "CC0-1.0",
-  "name": "HMB_GP_Production-0.7.25",
-  "documentNamespace": "https://hmb.local/spdx/HMB_GP_Production/0.7.25",
+  "name": "HMB_GP_Production-0.7.27",
+  "documentNamespace": "https://hmb.local/spdx/HMB_GP_Production/0.7.27",
   "creationInfo": {
     "created": "2026-08-05T00:00:00Z",
     "creators": [
@@ -15,7 +15,7 @@
     {
       "SPDXID": "SPDXRef-HMB-GP-Production",
       "name": "hmb-gp-production",
-      "versionInfo": "0.7.25",
+      "versionInfo": "0.7.27",
       "downloadLocation": "NOASSERTION",
       "filesAnalyzed": false,
       "licenseConcluded": "LicenseRef-HMB-Internal-1.0",

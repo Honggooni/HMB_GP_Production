@@ -2224,6 +2224,8 @@ def reconcile_shot_routing(
                     seedance_groups.setdefault(
                         (target.channel_uuid, target.shot_uuid), []
                     ).append(target)
+            duplicate_seedance_claims_released = False
+            rejected_seedance_ids: set[int] = set()
             for contenders in seedance_groups.values():
                 if len(contenders) < 2:
                     continue
@@ -2252,6 +2254,8 @@ def reconcile_shot_routing(
                         except Exception:
                             rejected = False
                     if rejected:
+                        duplicate_seedance_claims_released = True
+                        rejected_seedance_ids.add(id(contender.node))
                         _notify_status(
                             contender.node,
                             ok=True,
@@ -2273,6 +2277,68 @@ def reconcile_shot_routing(
                             details=(
                                 "Another Seedance generator already owns this Shot."
                             ),
+                        )
+
+            if duplicate_seedance_claims_released:
+                # A failed host reset can leave ``name`` and ``name_temp``
+                # hydrated with the same Shot. Rejection releases both claims,
+                # but the first catalog delivery was computed while those
+                # claims still existed. Re-deliver each node's already-
+                # validated snapshot once so every surviving/fresh generator
+                # immediately sees the newly available Shot choices. Rejected
+                # contenders have auto-claim disabled and therefore stay Only.
+                seedance_candidates: list[Any] = []
+                for candidate in tuple(nodes):
+                    candidate_subscription = _subscription_for(candidate)
+                    if (
+                        candidate_subscription is not None
+                        and candidate_subscription.kind == KIND_SEEDANCE
+                    ):
+                        seedance_candidates.append(candidate)
+                # Let surviving/fresh generators claim a released Shot before
+                # the rejected stale contenders rebuild their Only catalogs.
+                # This prevents a transient selectable Shot from reappearing on
+                # a node that was just rejected for duplicate ownership.
+                seedance_candidates.sort(
+                    key=lambda candidate: (
+                        id(candidate) in rejected_seedance_ids,
+                        str(getattr(candidate, "name", "") or ""),
+                    )
+                )
+                for candidate in seedance_candidates:
+                    subscription = _subscription_for(candidate)
+                    if (
+                        subscription is None
+                        or subscription.kind != KIND_SEEDANCE
+                        or id(candidate) in catalog_rejected_node_ids
+                    ):
+                        continue
+                    snapshot = getattr(
+                        candidate,
+                        "_hmb_shot_catalog_snapshot",
+                        None,
+                    )
+                    callback = getattr(
+                        candidate,
+                        "_hmb_reconcile_shot_routing",
+                        None,
+                    )
+                    if not isinstance(snapshot, dict) or not callable(callback):
+                        continue
+                    try:
+                        callback(snapshot)
+                        _mark_authoritative(candidate)
+                    except Exception as exc:
+                        detail = _clean(exc, 256) or exc.__class__.__name__
+                        catalog_rejected_node_ids.add(id(candidate))
+                        failures.append(
+                            f"{subscription.node_name}: catalog_rejected: {detail}"
+                        )
+                        _notify_status(
+                            candidate,
+                            ok=False,
+                            code="catalog_rejected",
+                            details=detail,
                         )
 
             # Rejection callbacks change the durable quartet.  Re-read before

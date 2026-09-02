@@ -201,7 +201,63 @@ try:
     ]
     assert prompt_library._default_image_target_for_main_type(
         "Environment / Background", "Night City"
+    ) == "Night City"
+    assert prompt_library._default_image_target_for_main_type(
+        "Sky / Exterior Background", "Dawn Sky"
+    ) == "Dawn Sky"
+    assert prompt_library._default_image_target_for_main_type(
+        "Foreground / Ground", "", "GroundAsset"
+    ) == "GroundAsset"
+    assert prompt_library._default_image_target_for_main_type(
+        "Set / Structure", "Bridge Set"
     ) == ""
+
+    # A newly connected verified Environment / Background row receives its own
+    # readable name, while a user-cleared Target remains blank on reconnect.
+    environment_payload = json.loads(json.dumps(output_payload))
+    environment_record = dict(environment_payload["verified_assets"][0])
+    environment_record.update(
+        {
+            "order_key": "project:night-city",
+            "source_uid": "project:night-city",
+            "asset_library_id": "environment-night-city",
+            "asset_id": "NightCityAsset",
+            "image_name": "Night City",
+            "image_main_type": "Environment / Background",
+            "image_sub_type": "Main Background",
+            "source_type": "Environment / Background",
+            "scope_candidate": "Main background",
+            "selection_order": 1,
+        }
+    )
+    environment_payload["verified_assets"] = [dict(environment_record)]
+    environment_payload["selected_assets"] = [dict(environment_record)]
+    environment_payload["ordered_images"] = [
+        {
+            "order_key": "project:night-city",
+            "image_name": "Night City",
+            "selection_order": 1,
+        }
+    ]
+    environment_state = prompt_library._apply_image_asset_payload(
+        prompt_library._default_widget_state(),
+        environment_payload,
+        connected=True,
+    )
+    assert environment_state["images"][0]["owner"] == "Night City"
+    assert environment_state["images"][0]["asset_default_target"] == "Night City"
+    environment_state["images"][0]["owner"] = ""
+    environment_reconnected = prompt_library._apply_image_asset_payload(
+        environment_state,
+        environment_payload,
+        connected=True,
+    )
+    assert environment_reconnected["images"][0]["owner"] == ""
+    assert (
+        environment_reconnected["images"][0]["asset_default_target"]
+        == "Night City"
+    )
+
     assert prompt_library._default_image_target_for_main_type(
         "Relative Size Reference", "Wide Shot", "", "ch_Scale"
     ) == "ch_all"

@@ -1505,7 +1505,9 @@ export default function HMBSeedanceGenerationWidget(container, props) {
   const stopInteriorDelete = (event) => {
     if (["Backspace", "Delete"].includes(event?.key)) event.stopPropagation?.();
   };
-  const stopInteriorSelection = (event) => event.stopPropagation?.();
+  const stopInteriorSelection = (event) => {
+    if (Number(event?.button) !== 1) event.stopPropagation?.();
+  };
   container.addEventListener?.("keydown", stopInteriorDelete);
   container.addEventListener?.("pointerdown", stopInteriorSelection);
   const cleanup = () => {

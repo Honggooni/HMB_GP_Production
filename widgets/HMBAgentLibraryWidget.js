@@ -466,7 +466,9 @@ export default function HMBAgentLibraryWidget(container, props) {
   const stopNodeDeleteShortcut = (event) => {
     if (["Backspace", "Delete"].includes(event?.key)) event.stopPropagation?.();
   };
-  const stopInteriorNodeSelection = (event) => event.stopPropagation();
+  const stopInteriorNodeSelection = (event) => {
+    if (Number(event?.button) !== 1) event.stopPropagation?.();
+  };
   container.addEventListener?.("keydown", stopNodeDeleteShortcut);
   container.addEventListener?.("pointerdown", stopInteriorNodeSelection);
 

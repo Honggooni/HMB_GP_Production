@@ -372,12 +372,46 @@ routing._ensure_edge = ensure_edge
 # Ambiguous duplicate Seedance claimants are both returned to Only.  The router
 # must not leave their selections active while merely removing dependencies.
 class RejectingSeedance(Participant):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.auto_claim_enabled = True
+        self._hmb_shot_catalog_snapshot: dict[str, Any] | None = None
+
+    def _hmb_reconcile_shot_routing(self, snapshot: Any) -> None:
+        assert snapshot == CATALOG
+        self.catalog_count += 1
+        self._hmb_shot_catalog_snapshot = snapshot
+        if not self.auto_claim_enabled:
+            self.enabled = False
+            self.channel_uuid = ""
+            self.shot_uuid = ""
+            self.shot_name = "Only"
+
     def _hmb_reject_duplicate_shot_selection(self, _reason: Any = "") -> dict[str, Any]:
+        self.auto_claim_enabled = False
         self.enabled = False
         self.channel_uuid = ""
         self.shot_uuid = ""
         self.shot_name = "Only"
         return self._hmb_shot_channel_subscription()
+
+
+class FreshClaimingSeedance(RejectingSeedance):
+    def _hmb_reconcile_shot_routing(self, snapshot: Any) -> None:
+        assert snapshot == CATALOG
+        self.catalog_count += 1
+        self._hmb_shot_catalog_snapshot = snapshot
+        if self.catalog_count == 1:
+            # The first delivery sees Shot 1 occupied by both stale claimants.
+            self.enabled = False
+            self.channel_uuid = ""
+            self.shot_uuid = ""
+            self.shot_name = "Only"
+            return
+        self.enabled = True
+        self.channel_uuid = CHANNEL
+        self.shot_uuid = SHOT
+        self.shot_name = "Opening"
 
 
 duplicate_image = Participant(
@@ -402,7 +436,16 @@ duplicate_b = RejectingSeedance(
     channel_uuid=CHANNEL,
     shot_uuid=SHOT,
 )
-NODES[:] = [duplicate_image, duplicate_a, duplicate_b]
+fresh_after_duplicate = FreshClaimingSeedance(
+    "SeedanceFreshAfterDuplicate",
+    routing.KIND_SEEDANCE,
+)
+NODES[:] = [
+    duplicate_image,
+    duplicate_a,
+    duplicate_b,
+    fresh_after_duplicate,
+]
 created_edges.clear()
 duplicate_result = routing.reconcile_shot_routing(
     duplicate_image,
@@ -410,8 +453,20 @@ duplicate_result = routing.reconcile_shot_routing(
 )
 assert duplicate_result["ok"] is True, duplicate_result
 assert duplicate_a.enabled is False and duplicate_b.enabled is False
+assert duplicate_a.catalog_count == 2 and duplicate_b.catalog_count == 2
 assert duplicate_a.statuses[-1]["code"] == "only"
 assert duplicate_b.statuses[-1]["code"] == "only"
+assert fresh_after_duplicate.catalog_count == 2
+assert fresh_after_duplicate.enabled is True
+assert fresh_after_duplicate.shot_uuid == SHOT
+assert created_edges == {
+    (
+        "DuplicateImage",
+        "SHOT_ASSET_OUT",
+        "SeedanceFreshAfterDuplicate",
+        "SHOT_ASSET_IN",
+    )
+}
 
 
 # Five independent Shot chains must remain exact even though every managed

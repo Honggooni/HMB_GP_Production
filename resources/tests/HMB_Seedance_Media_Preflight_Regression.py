@@ -302,8 +302,38 @@ with tempfile.TemporaryDirectory() as temporary:
             cls.default_calls += 1
             return cls.default_bucket
 
-        def __init__(self, **kwargs) -> None:
+        def __init__(
+            self,
+            config_manager,
+            *,
+            bucket_id: str,
+            api_key: str | None = None,
+            **kwargs,
+        ) -> None:
+            self.config_manager = config_manager
+            self.kwargs = {
+                "bucket_id": bucket_id,
+                "api_key": api_key,
+                **kwargs,
+            }
+
+    class LegacyReadinessStorageDriver(ReadinessStorageDriver):
+        def __init__(
+            self,
+            *,
+            workspace_directory,
+            bucket_id: str,
+            api_key: str | None = None,
+            **kwargs,
+        ) -> None:
+            self.workspace_directory = workspace_directory
             self.kwargs = dict(kwargs)
+            self.kwargs.update(
+                {
+                    "bucket_id": bucket_id,
+                    "api_key": api_key,
+                }
+            )
 
     original_nodes = seedance.GriptapeNodes
     original_driver_class = seedance.GriptapeCloudStorageDriver
@@ -314,9 +344,10 @@ with tempfile.TemporaryDirectory() as temporary:
         seedance.GT_CLOUD_BUCKET_ID_SECRET: "explicit-bucket",
     }
     readiness_secrets = ReadinessSecrets(readiness_values)
+    readiness_config_manager = SimpleNamespace(workspace_path=folder)
     seedance.GriptapeNodes = SimpleNamespace(
         SecretsManager=lambda: readiness_secrets,
-        ConfigManager=lambda: SimpleNamespace(workspace_path=folder),
+        ConfigManager=lambda: readiness_config_manager,
     )
     seedance.GriptapeCloudStorageDriver = ReadinessStorageDriver
     seedance.resolve_cloud_credential = (
@@ -330,8 +361,18 @@ with tempfile.TemporaryDirectory() as temporary:
     try:
         seedance.os.environ["GT_CLOUD_BASE_URL"] = "https://cloud.griptape.ai"
         explicit_driver = readiness_node._create_gt_cloud_storage_driver()
+        assert explicit_driver.config_manager is readiness_config_manager
         assert explicit_driver.kwargs["bucket_id"] == "explicit-bucket"
+        assert explicit_driver.kwargs["api_key"] == "credential-value"
+        assert explicit_driver.kwargs["base_url"] == "https://cloud.griptape.ai"
+        assert explicit_driver.kwargs["request_timeout"] == 30.0
         assert ReadinessStorageDriver.bucket_checks == ["explicit-bucket"]
+
+        seedance.GriptapeCloudStorageDriver = LegacyReadinessStorageDriver
+        legacy_driver = readiness_node._create_gt_cloud_storage_driver()
+        assert legacy_driver.workspace_directory == folder
+        assert legacy_driver.kwargs["bucket_id"] == "explicit-bucket"
+        seedance.GriptapeCloudStorageDriver = ReadinessStorageDriver
 
         readiness_values.pop(seedance.GT_CLOUD_BUCKET_ID_SECRET)
         readiness_secrets.values = dict(readiness_values)

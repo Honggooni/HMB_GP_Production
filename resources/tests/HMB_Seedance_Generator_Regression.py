@@ -26,8 +26,14 @@ from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.events.parameter_events import (
+    AddParameterToNodeRequest,
+    AddParameterToNodeResultSuccess,
     SetParameterValueRequest,
     SetParameterValueResultSuccess,
+)
+from griptape_nodes.retained_mode.events.node_events import (
+    DeleteNodeRequest,
+    DeleteNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     DeleteWorkflowRequest,
@@ -619,10 +625,22 @@ def assert_constructor_and_public_contract() -> None:
     refresh_parameter = node.get_parameter_by_name("generation_refresh")
     assert type(refresh_parameter).__name__ == "ParameterButton"
     assert refresh_parameter.label == "Refresh / Retrieve Result"
-    assert refresh_parameter.state == "hidden"
-    assert refresh_parameter.hide is True
-    assert refresh_parameter.hide_property is True
+    assert refresh_parameter.icon == "refresh-cw"
+    assert refresh_parameter.full_width is True
+    assert refresh_parameter.state == "normal"
+    assert refresh_parameter.hide is False
+    assert refresh_parameter.hide_property is False
     assert refresh_parameter.serializable is False
+    assert refresh_parameter.on_click_callback.__self__ is node
+    assert (
+        refresh_parameter.on_click_callback.__func__
+        is target.HMBSeedanceGeneration._on_refresh_clicked
+    )
+    assert [child.name for child in node.status_component.get_parameter_group().children][-3:] == [
+        "generation_id",
+        "generation_status",
+        "generation_refresh",
+    ]
     shot_widget_parameter = node.get_parameter_by_name(
         target.SEEDANCE_SHOT_WIDGET_PARAMETER
     )
@@ -1147,6 +1165,155 @@ def assert_only_shot_task_and_reference_state_contract() -> None:
     assert empty_video_params["video_reference_slots"] == []
 
 
+def assert_seedance_recreate_widget_and_list_lifecycle_contract() -> None:
+    """A fresh generator publishes Shot 1 and preserves connected list rows."""
+
+    node = target.HMBSeedanceGeneration(name="Seedance Recreate Widget Regression")
+    channel_uuid = "11111111-1111-4111-8111-111111111111"
+    shot_uuid = "22222222-2222-4222-8222-222222222222"
+    shots = [
+        {
+            "shot_uuid": shot_uuid,
+            "number": 1,
+            "name": "Shot 1",
+            "revision": 0,
+        }
+    ]
+    metadata = {
+        "channel_uuid": channel_uuid,
+        "generation": 1,
+        "shots": shots,
+    }
+    catalog = {
+        "schema": "hmb-shot-routing-catalog",
+        "version": 1,
+        "publisher_instance_uuid": "33333333-3333-4333-8333-333333333333",
+        **metadata,
+        "metadata_sha256": target.HMBSeedanceGeneration._canonical_sha256(
+            metadata
+        ),
+    }
+    node._hmb_shot_catalog_snapshot = catalog
+    node._hmb_shot_catalog_generation = 1
+    node._hmb_shot_selector_map = {"01 · Shot 1": shots[0]}
+    node._set_seedance_shot_choices(["01 · Shot 1"])
+    publications: list[tuple[str, object]] = []
+    node.publish_update_to_parameter = (  # type: ignore[method-assign]
+        lambda name, value: publications.append((name, value))
+    )
+    with mock.patch.object(
+        node,
+        "_hmb_available_seedance_shot_catalog",
+        return_value=catalog,
+    ):
+        node._apply_seedance_shot_selection(shot_uuid)
+        node._apply_seedance_shot_selection(shot_uuid)
+        assert not any(
+            name == target.SEEDANCE_SHOT_WIDGET_PARAMETER
+            for name, _value in publications
+        )
+        node._sync_seedance_shot_widget(emit_change=True)
+        node._sync_seedance_shot_widget(emit_change=True)
+    widget_publications = [
+        value
+        for name, value in publications
+        if name == target.SEEDANCE_SHOT_WIDGET_PARAMETER
+    ]
+    assert len(widget_publications) == 1
+    assert widget_publications[0]["shot"]["shot_uuid"] == shot_uuid
+    assert widget_publications[0]["shot_catalog"]["shots"] == shots
+    assert node._shot_identity()["shot_name"] == "Shot 1"
+    assert node.get_parameter_by_name(target.SHOT_SELECTOR_PARAMETER).ui_options[
+        "simple_dropdown"
+    ] == [target.SHOT_ONLY_LABEL, "01 · Shot 1"]
+
+    # A retained connection can target a stable ParameterList child rather
+    # than the parent handle. Parent hydration must not replace that child and
+    # strand the host's connection object.
+    list_node = target.HMBSeedanceGeneration(
+        name="Seedance Connected List Child Regression"
+    )
+    container = list_node.get_parameter_by_name(target.VIDEO_REFERENCES_PARAMETER)
+    child = container.append_child_parameter()
+    list_node.set_parameter_value(
+        child.name,
+        "https://example.test/connected-video.mp4",
+    )
+    connection_result = SimpleNamespace(
+        incoming_connections=[
+            SimpleNamespace(target_parameter_name=child.name)
+        ]
+    )
+    from griptape_nodes.retained_mode.retained_mode import RetainedMode
+
+    with mock.patch.object(
+        RetainedMode,
+        "get_connections_for_node",
+        return_value=connection_result,
+    ), mock.patch.object(
+        target.GriptapeNodes,
+        "NodeManager",
+        return_value=SimpleNamespace(
+            get_node_by_name=lambda _name: list_node
+        ),
+    ):
+        assert list_node._has_incoming_parameter_connection(
+            target.VIDEO_REFERENCES_PARAMETER
+        )
+        list_node.set_parameter_value(
+            target.VIDEO_REFERENCES_PARAMETER,
+            ["https://example.test/connected-video.mp4"],
+            initial_setup=True,
+        )
+    assert container.get_child_parameters() == [child]
+    assert list_node.get_parameter_by_name(child.name) is child
+
+    # Older in-memory workflows can already contain a retained edge whose
+    # dynamic child disappeared. The deletion hook removes only that invalid
+    # owned edge so Griptape can finish deleting the node and release Shot 1.
+    stale_node = target.HMBSeedanceGeneration(
+        name="Seedance Dangling List Delete Regression"
+    )
+    stale_container = stale_node.get_parameter_by_name(
+        target.VIDEO_REFERENCES_PARAMETER
+    )
+    stale_child = stale_container.append_child_parameter()
+    stale_container.remove_child(stale_child)
+    stale_connection = SimpleNamespace(
+        target_node=stale_node,
+        target_parameter=stale_child,
+    )
+    stale_id = id(stale_connection)
+
+    class FakeConnections:
+        def __init__(self) -> None:
+            self.connections = {stale_id: stale_connection}
+            self.incoming_index = {
+                stale_node.name: {stale_child.name: [stale_id]}
+            }
+
+        def remove_connection_by_object(self, connection: object) -> bool:
+            assert connection is stale_connection
+            self.connections.pop(stale_id)
+            self.incoming_index.clear()
+            return True
+
+    fake_connections = FakeConnections()
+    with mock.patch.object(
+        target.GriptapeNodes,
+        "FlowManager",
+        return_value=SimpleNamespace(
+            get_connections=lambda: fake_connections
+        ),
+    ):
+        assert (
+            stale_node._discard_dangling_owned_list_connections_before_delete()
+            == 1
+        )
+    assert fake_connections.connections == {}
+    assert fake_connections.incoming_index == {}
+
+
 def assert_image_asset_single_wire_host_contract() -> None:
     context_manager = GriptapeNodes.ContextManager()
     assert not context_manager.has_current_workflow(), (
@@ -1411,6 +1578,220 @@ def assert_video_picker_single_wire_host_contract() -> None:
             type(deleted).__name__,
             getattr(deleted, "result_details", ""),
         )
+        assert not context_manager.has_current_workflow()
+        assert not context_manager.has_current_flow()
+
+
+def assert_seedance_delete_recreate_shot1_publication_contract() -> None:
+    """Deleting and recreating a generator republishes its reclaimed Shot 1."""
+
+    async def scenario() -> None:
+        GriptapeNodes.EventManager().initialize_queue()
+        stamp = time.time_ns()
+        ensured = GriptapeNodes.handle_request(
+            EnsureWorkflowAndFlowRequest(
+                display_name=f"Seedance recreate publication {stamp}",
+                flow_name=f"SeedanceRecreatePublication_{stamp}",
+            )
+        )
+        assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
+        flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
+
+        def register(node: object) -> None:
+            flow.add_node(node)
+            GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
+            GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = (
+                flow.name
+            )
+
+        async def settle() -> None:
+            for _ in range(8):
+                await asyncio.sleep(0.06)
+
+        def shot_choices(node: object) -> list[str]:
+            parameter = node.get_parameter_by_name(target.SHOT_SELECTOR_PARAMETER)
+            return list(parameter.ui_options.get("simple_dropdown", []))
+
+        try:
+            with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+                image_asset_target,
+                "DEFAULT_PROJECTS_ROOT",
+                Path(temporary),
+            ):
+                image = image_asset_target.HMBImageAssetLibrary(
+                    name=f"ImageAssetRecreate_{stamp}"
+                )
+                old = target.HMBSeedanceGeneration(
+                    name=f"SeedanceRecreate_{stamp}"
+                )
+                register(image)
+                register(old)
+                await settle()
+                old_subscription = old._hmb_shot_channel_subscription()
+                assert old_subscription["enabled"] is True
+                assert old_subscription["shot_number"] == 1
+                assert old_subscription["shot_name"] == "Shot 1"
+
+                old_name = old.name
+                deleted = await GriptapeNodes.ahandle_request(
+                    DeleteNodeRequest(node_name=old_name)
+                )
+                assert isinstance(deleted, DeleteNodeResultSuccess)
+                assert old._hmb_node_deleted is True
+
+                fresh = target.HMBSeedanceGeneration(name=old_name)
+                published: list[str] = []
+                original_publish = fresh.publish_update_to_parameter
+
+                def traced_publish(name: str, value: object) -> object:
+                    published.append(name)
+                    return original_publish(name, value)
+
+                fresh.publish_update_to_parameter = (  # type: ignore[method-assign]
+                    traced_publish
+                )
+                assert fresh._hmb_shot_channel_subscription()["enabled"] is False
+                assert shot_choices(fresh) == [target.SHOT_ONLY_LABEL]
+
+                register(fresh)
+                await settle()
+
+                subscription = fresh._hmb_shot_channel_subscription()
+                assert subscription["enabled"] is True
+                assert subscription["shot_number"] == 1
+                assert subscription["shot_name"] == "Shot 1"
+                assert shot_choices(fresh) == [
+                    target.SHOT_ONLY_LABEL,
+                    "01 · Shot 1",
+                ]
+                widget = fresh.get_parameter_value(
+                    target.SEEDANCE_SHOT_WIDGET_PARAMETER
+                )
+                assert widget["shot"]["shot_uuid"] == subscription["shot_uuid"]
+                assert widget["shot_catalog"]["shots"][0]["number"] == 1
+                widget_publications = [
+                    name
+                    for name in published
+                    if name == target.SEEDANCE_SHOT_WIDGET_PARAMETER
+                ]
+                assert widget_publications == [
+                    target.SEEDANCE_SHOT_WIDGET_PARAMETER
+                ]
+        finally:
+            deleted_workflow = await GriptapeNodes.ahandle_request(
+                DeleteWorkflowRequest(name=ensured.workflow_name)
+            )
+            assert isinstance(deleted_workflow, DeleteWorkflowResultSuccess)
+
+    asyncio.run(scenario())
+
+
+def assert_seedance_dangling_list_delete_live_host_contract() -> None:
+    """A vanished connected list row cannot block real host node deletion."""
+
+    context_manager = GriptapeNodes.ContextManager()
+    assert not context_manager.has_current_workflow(), (
+        "Dangling-list deletion regression must run in an isolated process."
+    )
+    GriptapeNodes.EventManager().initialize_queue()
+    stamp = time.time_ns()
+    ensured = GriptapeNodes.handle_request(
+        EnsureWorkflowAndFlowRequest(
+            display_name=f"Seedance dangling list deletion {stamp}",
+            flow_name=f"SeedanceDanglingListDeletion_{stamp}",
+        )
+    )
+    assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
+    flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
+
+    def register(node: object) -> None:
+        flow.add_node(node)
+        GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
+        GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = (
+            flow.name
+        )
+
+    try:
+        source = target.HMBSeedanceGeneration(
+            name=f"SeedanceDanglingSource_{stamp}"
+        )
+        destination = target.HMBSeedanceGeneration(
+            name=f"SeedanceDanglingDestination_{stamp}"
+        )
+        register(source)
+        register(destination)
+        container = destination.get_parameter_by_name(
+            target.VIDEO_REFERENCES_PARAMETER
+        )
+        added = GriptapeNodes.handle_request(
+            AddParameterToNodeRequest(
+                node_name=destination.name,
+                parent_container_name=target.VIDEO_REFERENCES_PARAMETER,
+            )
+        )
+        assert isinstance(added, AddParameterToNodeResultSuccess), (
+            type(added).__name__,
+            getattr(added, "result_details", ""),
+        )
+        child_name = added.parameter_name
+        assert destination.get_parameter_by_name(child_name) is not None
+        connected = GriptapeNodes.handle_request(
+            CreateConnectionRequest(
+                source_node_name=source.name,
+                source_parameter_name="VIDEO_OUT",
+                target_node_name=destination.name,
+                target_parameter_name=child_name,
+            )
+        )
+        assert isinstance(connected, CreateConnectionResultSuccess), (
+            type(connected).__name__,
+            getattr(connected, "result_details", ""),
+        )
+
+        container.clear_list()
+        assert destination.get_parameter_by_name(child_name) is None
+        listed_before = GriptapeNodes.handle_request(
+            ListConnectionsForNodeRequest(node_name=destination.name)
+        )
+        assert isinstance(listed_before, ListConnectionsForNodeResultSuccess)
+        stale_edges = [
+            edge
+            for edge in listed_before.incoming_connections
+            if edge.target_parameter_name == child_name
+        ]
+        assert len(stale_edges) == 1
+
+        deleted = asyncio.run(
+            GriptapeNodes.ahandle_request(
+                DeleteNodeRequest(node_name=destination.name)
+            )
+        )
+        assert isinstance(deleted, DeleteNodeResultSuccess), (
+            type(deleted).__name__,
+            getattr(deleted, "result_details", ""),
+        )
+        listed_source = GriptapeNodes.handle_request(
+            ListConnectionsForNodeRequest(node_name=source.name)
+        )
+        assert isinstance(listed_source, ListConnectionsForNodeResultSuccess)
+        assert listed_source.outgoing_connections == []
+        assert (
+            GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(
+                destination.name,
+                type(destination),
+            )
+            is None
+        )
+        registered_names = GriptapeNodes.NodeManager()._name_to_parent_flow_name
+        assert destination.name not in registered_names
+        assert f"{destination.name}_temp" not in registered_names
+    finally:
+        deleted_workflow = asyncio.run(
+            GriptapeNodes.ahandle_request(
+                DeleteWorkflowRequest(name=ensured.workflow_name)
+            )
+        )
+        assert isinstance(deleted_workflow, DeleteWorkflowResultSuccess)
         assert not context_manager.has_current_workflow()
         assert not context_manager.has_current_flow()
 
@@ -3896,8 +4277,11 @@ def assert_broker_server_accounting_contract() -> None:
 assert_constructor_and_public_contract()
 assert_seedance_25_output_format_and_last_frame_ui_contract()
 assert_only_shot_task_and_reference_state_contract()
+assert_seedance_recreate_widget_and_list_lifecycle_contract()
 assert_image_asset_single_wire_host_contract()
 assert_video_picker_single_wire_host_contract()
+assert_seedance_delete_recreate_shot1_publication_contract()
+assert_seedance_dangling_list_delete_live_host_contract()
 assert_payload_and_media_contract()
 assert_seedance_25_model_contract()
 with mock.patch.object(
