@@ -16,6 +16,14 @@ function fakeContainer() {
 }
 
 const container = fakeContainer();
+const scheduledFrames = [];
+container.__hmbPromptLibraryScheduleFrame = (callback) => {
+  scheduledFrames.push(callback);
+  return scheduledFrames.length;
+};
+function flushScheduledFrames() {
+  while (scheduledFrames.length) scheduledFrames.shift()();
+}
 let emitted = "";
 let matchingEchoConsumed = false;
 let remounts = 0;
@@ -378,6 +386,10 @@ widget.hmbCommitLocalPromptStructure(container, props, state, () => {
   return state;
 });
 
+assert.equal(matchingEchoConsumed, false, "A structural edit must not enter the host transaction in its pointer task.");
+assert.equal(emitted, "", "The host payload must wait until the optimistic paint is visible.");
+assert.deepEqual(commitOrder, ["remount"], "Structural feedback must paint immediately.");
+flushScheduledFrames();
 assert.equal(matchingEchoConsumed, true, "A matching synchronous props echo must be consumed.");
 assert.equal(remounts, 1, "A structural edit must repaint locally even when the host echo is consumed.");
 assert.deepEqual(commitOrder, ["remount", "emit"], "Structural feedback must paint before the host transaction.");
@@ -387,23 +399,180 @@ assert.equal(JSON.parse(emitted).images[1].manual, true);
 state.videos.push({ slot: 2, label: "", present: false, manual: true });
 matchingEchoConsumed = false;
 widget.hmbCommitLocalPromptStructure(container, props, state, () => { remounts += 1; });
+flushScheduledFrames();
 assert.equal(matchingEchoConsumed, true);
 assert.equal(remounts, 2);
 assert.equal(JSON.parse(emitted).videos.length, 2, "A manual video row must repaint and persist independently.");
 
 assert.equal(widget.moveImageRowWithoutReset(state, 1, 0), true);
 widget.hmbCommitLocalPromptStructure(container, props, state, () => { remounts += 1; });
+flushScheduledFrames();
 assert.equal(JSON.parse(emitted).images[0].manual, true, "Reordering must persist the same local row state.");
 
 assert.equal(widget.removeImageRowAndPromote(state, 0).changed, true);
 widget.hmbCommitLocalPromptStructure(container, props, state, () => { remounts += 1; });
+flushScheduledFrames();
 assert.equal(JSON.parse(emitted).images.length, 1, "Deletion must repaint and persist without an external Picker event.");
 
 assert.match(
   source,
-  /export function hmbCommitLocalPromptStructure[\s\S]*?hmbCaptureUiBeforeStateEmit\(container, state\);[\s\S]*?rollbackValue[\s\S]*?remount\(\)[\s\S]*?hmbEmitLocalPromptState\(container, props, committedState,[\s\S]*?remount\(rollbackState\)/,
+  /export function hmbCommitLocalPromptStructure[\s\S]*?hmbCaptureUiBeforeStateEmit\(container, state\);[\s\S]*?rollbackValue[\s\S]*?remount\(\)[\s\S]*?hmbSchedulePromptInteractionCommit\(container, props, committedState,[\s\S]*?remount\(rollbackState\)/,
   "Structural commits must capture geometry, repaint locally, then persist through the host.",
 );
+
+const sourcePropsContainer = fakeContainer();
+const sourceFrames = [];
+sourcePropsContainer.__hmbPromptLibraryScheduleFrame = (callback) => {
+  sourceFrames.push(callback);
+  return sourceFrames.length;
+};
+sourcePropsContainer.__hmbPromptCurrentSourceSyncRevision = 7;
+const sourceBaseState = widget.normalizeState({ source_sync_revision: 7 });
+const sourceGeneration8 = JSON.stringify(widget.normalizeState({
+  source_sync_revision: 8,
+  picker: { enabled: true, ordered_video_uids: ["video-a"] },
+}));
+const sourceGeneration9 = JSON.stringify(widget.normalizeState({
+  source_sync_revision: 9,
+  picker: { enabled: true, ordered_video_uids: ["video-b", "video-a"] },
+}));
+assert.equal(
+  widget.hmbShouldDeferPromptSourceProps(
+    sourcePropsContainer,
+    { value: sourceGeneration8, disabled: false },
+    sourceBaseState,
+  ),
+  true,
+  "A newer Picker generation must leave the source drag task before Prompt rendering.",
+);
+const appliedSourceProps = [];
+widget.hmbSchedulePromptSourcePropsApply(
+  sourcePropsContainer,
+  { value: sourceGeneration8, disabled: false },
+  (nextProps) => appliedSourceProps.push(nextProps.value),
+);
+widget.hmbSchedulePromptSourcePropsApply(
+  sourcePropsContainer,
+  { value: sourceGeneration9, disabled: false },
+  (nextProps) => appliedSourceProps.push(nextProps.value),
+);
+assert.equal(appliedSourceProps.length, 0, "Source props must not normalize/render in the incoming task.");
+sourceFrames.shift()();
+assert.equal(appliedSourceProps.length, 0, "The first frame is reserved for immediate source UI paint.");
+sourceFrames.shift()();
+assert.deepEqual(
+  appliedSourceProps,
+  [sourceGeneration9],
+  "A Picker burst must apply only its newest order after paint.",
+);
+
+const crossedDirectContainer = fakeContainer();
+const crossedDirectFrames = [];
+crossedDirectContainer.__hmbPromptLibraryScheduleFrame = (callback) => {
+  crossedDirectFrames.push(callback);
+  return crossedDirectFrames.length;
+};
+const crossedDirectApplies = [];
+widget.hmbSchedulePromptSourcePropsApply(
+  crossedDirectContainer,
+  { value: sourceGeneration9, disabled: false, callback_id: "source-old" },
+  (nextProps) => crossedDirectApplies.push(nextProps),
+);
+const directOlderSource = JSON.stringify(widget.normalizeState({
+  source_sync_revision: 8,
+  ui_edit_revision: 12,
+}));
+assert.equal(
+  widget.hmbPreparePromptDirectPropsApply(crossedDirectContainer, {
+    value: directOlderSource,
+    disabled: true,
+    callback_id: "direct-new",
+  }),
+  false,
+  "A direct local echo must not discard a newer delayed source generation.",
+);
+while (crossedDirectFrames.length) crossedDirectFrames.shift()();
+assert.equal(crossedDirectApplies.length, 1);
+assert.equal(crossedDirectApplies[0].value, sourceGeneration9);
+assert.equal(crossedDirectApplies[0].disabled, true);
+assert.equal(
+  crossedDirectApplies[0].callback_id,
+  "direct-new",
+  "The delayed source generation must use the newest props envelope.",
+);
+
+const supersededSourceContainer = fakeContainer();
+const supersededSourceFrames = [];
+supersededSourceContainer.__hmbPromptLibraryScheduleFrame = (callback) => {
+  supersededSourceFrames.push(callback);
+  return supersededSourceFrames.length;
+};
+const supersededSourceApplies = [];
+widget.hmbSchedulePromptSourcePropsApply(
+  supersededSourceContainer,
+  { value: sourceGeneration8, disabled: false },
+  (nextProps) => supersededSourceApplies.push(nextProps),
+);
+assert.equal(
+  widget.hmbPreparePromptDirectPropsApply(supersededSourceContainer, {
+    value: sourceGeneration9,
+    disabled: false,
+  }),
+  true,
+  "An equal/newer direct source generation must cancel the delayed owner.",
+);
+while (supersededSourceFrames.length) supersededSourceFrames.shift()();
+assert.deepEqual(supersededSourceApplies, []);
+
+const failingCommitContainer = fakeContainer();
+const failingCommitFrames = [];
+failingCommitContainer.__hmbPromptLibraryScheduleFrame = (callback) => {
+  failingCommitFrames.push(callback);
+  return failingCommitFrames.length;
+};
+let inheritedRollbackCalls = 0;
+widget.hmbSchedulePromptInteractionCommit(
+  failingCommitContainer,
+  { disabled: false, onChange() {} },
+  widget.normalizeState({ images: [{ label: "Moved", present: true }] }),
+  () => { inheritedRollbackCalls += 1; },
+);
+const originalSetTimeout = globalThis.setTimeout;
+const originalClearTimeout = globalThis.clearTimeout;
+const originalConsoleError = console.error;
+const retryTimers = new Map();
+let retryTimerId = 0;
+globalThis.setTimeout = (callback, delay) => {
+  retryTimerId += 1;
+  retryTimers.set(retryTimerId, { callback, delay });
+  return retryTimerId;
+};
+globalThis.clearTimeout = (timerId) => retryTimers.delete(timerId);
+console.error = () => {};
+try {
+  widget.hmbEmitLocalPromptState(
+    failingCommitContainer,
+    { disabled: false, onChange() { throw new Error("transport unavailable"); } },
+    widget.normalizeState({ images: [{ label: "Moved and edited", present: true }] }),
+  );
+  assert.equal(
+    failingCommitContainer.__hmbPromptLibraryInteractionCommit,
+    undefined,
+    "The direct publication must supersede the delayed structural payload.",
+  );
+  const retry = [...retryTimers.values()].find((timer) => timer.delay === 32);
+  assert.ok(retry, "The failed direct publication must schedule its one transport retry.");
+  retry.callback();
+  assert.equal(
+    inheritedRollbackCalls,
+    1,
+    "A superseding direct publication must retain the structural rollback boundary.",
+  );
+} finally {
+  globalThis.setTimeout = originalSetTimeout;
+  globalThis.clearTimeout = originalClearTimeout;
+  console.error = originalConsoleError;
+}
 assert.match(
   source,
   /const remount = \(nextState = null\) => \{[\s\S]*?hmbCapturePromptControlFocus\(container\);[\s\S]*?hmbRestoreSourceScroll\(container\);[\s\S]*?hmbRestorePromptControlFocus\(container\);/,
@@ -780,6 +949,7 @@ assert.ok(slotLocalPickerState.videos[2].picker_auto_motion_guide.fields.label, 
 
 matchingEchoConsumed = false;
 widget.hmbCommitLocalPromptStructure(container, props, slotLocalPickerState, () => { remounts += 1; });
+flushScheduledFrames();
 const slotLocalEmission = JSON.parse(emitted);
 assert.deepEqual(slotLocalEmission.picker.slot_suppressions, { "2": "picker-run-a" });
 assert.equal(slotLocalEmission.picker.markers.length, 1, "The local slot edit must reach PROMPT_OUT state immediately without clearing Picker data.");

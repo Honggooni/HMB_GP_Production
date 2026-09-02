@@ -479,6 +479,38 @@ assert all(
 )
 
 
+# A contributing native Maya file node with unreadable pixels must fail before
+# a white/default Original can be published. The failed preflight must leave
+# every authored SG connection untouched.
+missing_texture_fake = FakeMaterialCmds()
+missing_texture_fake.attr_types["redFile.fileTextureName"] = "string"
+missing_texture_fake.values["redFile.fileTextureName"] = (
+    "P:/missing/BuckyMini_mainCol_dif.jpg"
+)
+runner.cmds = missing_texture_fake
+missing_texture_connections = original_connections(missing_texture_fake)
+missing_texture_controller = runner._OriginalLambertOverrideController(
+    {
+        "original_material_override_profile": (
+            runner.ORIGINAL_MATERIAL_OVERRIDE_PROFILE
+        ),
+        "_viewport_quality_scope_shapes": list(BASE_SCOPE_SHAPES),
+    }
+)
+try:
+    missing_texture_controller.apply()
+except RuntimeError as exc:
+    assert "Original texture dependency is unavailable" in str(exc)
+    assert "BuckyMini_mainCol_dif.jpg" in str(exc)
+else:
+    raise AssertionError("Missing Original texture pixels were accepted.")
+assert original_connections(missing_texture_fake) == missing_texture_connections
+assert all(
+    not node.startswith("HMB_Original_")
+    for node in missing_texture_fake.node_types
+)
+
+
 # A mid-transaction SG failure must restore every earlier surface connection,
 # preserve every component membership and remove all temporary Maya nodes.
 failing_fake = FakeMaterialCmds(fail_target="solidSG.surfaceShader")
@@ -1078,6 +1110,10 @@ with tempfile.TemporaryDirectory(prefix="HMB_Original_Lambert_Cache_") as root:
         "plugin_fallback_records": [],
         "unsupported_color_fallback_count": 0,
         "unsupported_color_fallback_materials": [],
+        "required_texture_dependency_count": 3,
+        "missing_texture_dependency_count": 0,
+        "missing_texture_dependencies": [],
+        "texture_dependency_preflight_passed": True,
         "texture_identity_preserved": True,
         "warnings": [],
         "transparency_transfer_count": 1,
@@ -1141,6 +1177,18 @@ with tempfile.TemporaryDirectory(prefix="HMB_Original_Lambert_Cache_") as root:
         "warnings": ["Original used a numeric plug-in fallback."],
     })
     assert cache_accepts(degraded_report)
+    missing_texture_report = copy.deepcopy(valid_report)
+    missing_texture_report.update({
+        "missing_texture_dependency_count": 1,
+        "missing_texture_dependencies": [{
+            "material": "RedMat",
+            "node": "redFile",
+            "paths": ["P:/missing/red.png"],
+            "available": False,
+        }],
+        "texture_dependency_preflight_passed": False,
+    })
+    assert not cache_accepts(missing_texture_report)
     inconsistent_reports = []
     for field, value in (
         ("status", "applied"),

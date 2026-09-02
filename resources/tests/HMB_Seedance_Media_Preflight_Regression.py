@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -422,5 +423,88 @@ with tempfile.TemporaryDirectory() as temporary:
             seedance.os.environ.pop("GT_CLOUD_BASE_URL", None)
         else:
             seedance.os.environ["GT_CLOUD_BASE_URL"] = original_base_url
+
+
+# The Broker transport is the single exact JSON serialization/size boundary.
+# A request exactly at the limit is sent byte-for-byte, while the next smaller
+# limit rejects the same body before the opener (and therefore the network) is
+# touched.  This keeps the early media projection without materializing and
+# serializing the final Base64 request a second time in the node builder.
+transport_payload = {
+    "prompt": "single serialization boundary",
+    "image_urls": ["data:image/png;base64,QUJDRA=="],
+}
+expected_transport_body = json.dumps(
+    transport_payload,
+    ensure_ascii=False,
+    separators=(",", ":"),
+).encode("utf-8")
+
+
+class BrokerResponse:
+    status = 200
+
+    def __init__(self, url: str) -> None:
+        self._url = url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def geturl(self) -> str:
+        return self._url
+
+    def read(self, _limit: int) -> bytes:
+        return b'{"status":"accepted"}'
+
+
+class CapturingOpener:
+    def __init__(self) -> None:
+        self.requests = []
+
+    def open(self, request, *, timeout: float):
+        self.requests.append((request, timeout))
+        return BrokerResponse(request.full_url)
+
+
+original_request_limit = seedance.MAX_REQUEST_BYTES
+original_load_token = seedance._broker_load_token
+capturing_opener = CapturingOpener()
+seedance.MAX_REQUEST_BYTES = len(expected_transport_body)
+seedance._broker_load_token = lambda: "regression-token"
+try:
+    bridge = seedance._HMBAIBrokerBridge(opener=capturing_opener)
+    response = bridge._request_json(
+        "POST",
+        "/api/v1/generate/video",
+        payload=transport_payload,
+        timeout=3.0,
+        submission=True,
+    )
+    assert response == {"status": "accepted", "_http_status": 200}
+    assert len(capturing_opener.requests) == 1
+    sent_request, sent_timeout = capturing_opener.requests[0]
+    assert sent_request.data == expected_transport_body
+    assert sent_timeout == 3.0
+
+    seedance.MAX_REQUEST_BYTES = len(expected_transport_body) - 1
+    try:
+        bridge._request_json(
+            "POST",
+            "/api/v1/generate/video",
+            payload=transport_payload,
+            timeout=3.0,
+            submission=True,
+        )
+    except ValueError as exc:
+        assert "64 MB" in str(exc)
+    else:
+        raise AssertionError("Oversized exact Broker body reached the opener")
+    assert len(capturing_opener.requests) == 1
+finally:
+    seedance.MAX_REQUEST_BYTES = original_request_limit
+    seedance._broker_load_token = original_load_token
 
 print("HMB Seedance media preflight/streaming regression: PASS")

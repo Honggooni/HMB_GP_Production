@@ -583,8 +583,33 @@ try:
         connected=True,
     )
     assert look_state["images"][0]["image_sub_type"] == "Color Mood"
-    assert look_state["images"][0]["owner"] == ""
-    assert look_state["images"][0]["asset_default_target"] == ""
+    assert look_state["images"][0]["owner"] == "Master Look"
+    assert look_state["images"][0]["asset_default_target"] == "Master Look"
+
+    render_style_state = prompt_library._apply_image_asset_payload(
+        prompt_library._default_widget_state(),
+        look_payload("Render Style"),
+        connected=True,
+    )
+    assert render_style_state["images"][0]["owner"] == "Master Look"
+    assert render_style_state["images"][0]["asset_default_target"] == "Master Look"
+
+    camera_state = prompt_library._apply_image_asset_payload(
+        prompt_library._default_widget_state(),
+        look_payload("Camera / Composition"),
+        connected=True,
+    )
+    assert camera_state["images"][0]["owner"] == "Global Look"
+    assert camera_state["images"][0]["asset_default_target"] == "Global Look"
+
+    subtypeless_state = prompt_library._apply_image_asset_payload(
+        prompt_library._default_widget_state(),
+        look_payload(""),
+        connected=True,
+    )
+    assert subtypeless_state["images"][0]["owner"] == ""
+    assert subtypeless_state["images"][0]["asset_default_target"] == ""
+
     look_state["images"][0]["image_sub_type"] = "Scale"
     look_state["images"][0]["owner"] = "Director Camera"
     prompt_library._normalize_image_binding_fields(look_state["images"][0])
@@ -712,7 +737,7 @@ try:
     )
     assert refreshed_general["images"][0]["image_sub_type"] == "Color Mood"
     assert refreshed_general["images"][0]["owner"] == "Director Camera"
-    assert refreshed_general["images"][0]["asset_default_target"] == ""
+    assert refreshed_general["images"][0]["asset_default_target"] == "Master Look"
     dormant_general = prompt_library._apply_image_asset_payload(
         refreshed_general,
         {

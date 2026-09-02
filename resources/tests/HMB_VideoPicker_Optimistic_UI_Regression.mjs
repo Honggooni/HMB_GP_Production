@@ -130,7 +130,7 @@ assert.match(main, /on\(outlinerScroll, "click"/);
 assert.doesNotMatch(main, /on\(row, "click"/);
 assert.match(main, /availability\.operationBusy \|\| container\.__hmbPickerOperationSubmissionPending/);
 assert.match(main, /hmbSetPickerVisibilityBusy\(container, true\)/);
-assert.match(main, /hmbApplyPickerCameraSelectionToDom\(container, next\);\s*commit\(next\);/);
+assert.match(main, /hmbApplyPickerCameraSelectionToDom\(container, next\);\s*schedulePickerStatePublicationAfterPaint\(next\);/);
 assert.match(main, /hmbApplyPickerResolutionToDom\(container, selected\.width, selected\.height\);\s*commit\(next\);/);
 assert.match(
   main,

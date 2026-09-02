@@ -147,13 +147,22 @@ assert.equal(interactionFinal.images[0].image_sub_type, "Full Appearance");
 assert.equal(interactionContainer.__hmbPromptLibraryInteractionCommit, undefined);
 
 const applyPropsSource = source.slice(
-  source.indexOf("const applyProps ="),
-  source.indexOf("container.__hmbPromptLibraryApplyProps = applyProps"),
+  source.indexOf("const applyPropsNow ="),
+  source.indexOf("const applyProps =", source.indexOf("const applyPropsNow =")),
 );
 assert.match(
   applyPropsSource,
   /const pendingInteraction = container\.__hmbPromptLibraryInteractionCommit;[\s\S]*?if \(revisionMergedState\)[\s\S]*?pendingInteraction\.state = state;[\s\S]*?pendingInteraction\.props = props;[\s\S]*?hmbClearPromptInteractionCommit\(container\)/,
   "A crossed newer source update must replace the pending 2-rAF snapshot with the merged state.",
+);
+const deferredApplyPropsSource = source.slice(
+  source.indexOf("const applyProps =", source.indexOf("const applyPropsNow =")),
+  source.indexOf("container.__hmbPromptLibraryApplyProps = applyProps"),
+);
+assert.match(
+  deferredApplyPropsSource,
+  /hmbShouldDeferPromptSourceProps\(container, nextProps, state\)[\s\S]*?hmbSchedulePromptSourcePropsApply\(container, nextProps, applyPropsNow\)/,
+  "A newer Picker/Image source revision must paint first and enter the latest-only deferred apply queue.",
 );
 
 const sourceSelectHandler = source.slice(

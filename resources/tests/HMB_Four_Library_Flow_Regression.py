@@ -200,16 +200,31 @@ try:
         "",
     ]
     assert prompt_library._default_image_target_for_main_type(
-        "Environment / Background", "Night City"
+        "Environment / Background", "Night City", "", "Main Background"
     ) == "Night City"
     assert prompt_library._default_image_target_for_main_type(
-        "Sky / Exterior Background", "Dawn Sky"
+        "Sky / Exterior Background", "Dawn Sky", "", "Sky / Exterior"
     ) == "Dawn Sky"
     assert prompt_library._default_image_target_for_main_type(
-        "Foreground / Ground", "", "GroundAsset"
+        "Foreground / Ground", "", "GroundAsset", "Ground / Floor"
     ) == "GroundAsset"
     assert prompt_library._default_image_target_for_main_type(
-        "Set / Structure", "Bridge Set"
+        "Set / Structure", "Bridge Set", "", "Set / Structure"
+    ) == "Bridge Set"
+    assert prompt_library._default_image_target_for_main_type(
+        "Color / Look Reference", "Dawn Mood", "", "Color Mood"
+    ) == "Dawn Mood"
+    assert prompt_library._default_image_target_for_main_type(
+        "Color / Look Reference", "Painted Style", "", "Render Style"
+    ) == "Painted Style"
+    assert prompt_library._default_image_target_for_main_type(
+        "Camera / Composition Reference",
+        "Wide Camera",
+        "",
+        "Camera / Composition",
+    ) == "Global Look"
+    assert prompt_library._default_image_target_for_main_type(
+        "Character Appearance", "Hero", "HeroAsset", ""
     ) == ""
 
     # A newly connected verified Environment / Background row receives its own
@@ -273,6 +288,12 @@ try:
     assert prompt_library._default_image_target_for_main_type(
         "Lighting / Atmosphere Reference", "Blue Hour"
     ) == ""
+    assert prompt_library._default_image_target_for_main_type(
+        "Lighting / Atmosphere Reference",
+        "Blue Hour",
+        "",
+        "Lighting / Atmosphere",
+    ) == "Global Look"
 
     # Prompt may already hold freely authored Sub Type, Target, scope, and Color
     # Pick values. Asset metadata remains a candidate and does not rewrite them.

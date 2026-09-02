@@ -221,7 +221,10 @@ assert.match(assetSource, /data-project-select/, "ImageAssetLibrary must expose 
 assert.doesNotMatch(assetSource, /Project and Custom \/ User Imports share this order/, "External imports must not be presented as project Custom assets.");
 assert.match(assetSource, /Image \+ available metadata/, "IMAGE_IMPORT_IN must expose readable image content plus optional metadata.");
 assert.match(assetSource, /MAIN TYPE \(REQUIRED\)/, "Image Main Type must be visibly required for registration.");
-assert.match(assetSource, /메인 유형 \(필수\)/, "The Korean Image Main Type label must be visibly required.");
+assert.match(assetSource, /주요 유형 \(필수\)/, "The Korean Image Main Type label must match PromptLibrary.");
+assert.match(assetSource, /세부 유형 \(선택\)/, "The Korean Image Sub Type label must match PromptLibrary.");
+assert.match(assetSource, /사용자 지정 주요 유형 입력/, "The Korean custom Image Main Type prompt must match PromptLibrary.");
+assert.doesNotMatch(assetSource, /메인 유형|하위 유형/, "Retired ImageAsset taxonomy labels must not return.");
 assert.match(
   assetSource.match(/function registrationDraftIsComplete\(draft\) \{[\s\S]*?\n\}/)?.[0] || "",
   /image_main_type/,
@@ -1203,7 +1206,7 @@ assert.equal(
 );
 assert.match(
   promptSource,
-  /export function hmbCommitLocalPromptStructure[\s\S]*?rollbackValue[\s\S]*?committedState = remount\(\) \|\| state[\s\S]*?hmbEmitLocalPromptState\(container, props, committedState,[\s\S]*?remount\(rollbackState\)/,
+  /export function hmbCommitLocalPromptStructure[\s\S]*?rollbackValue[\s\S]*?committedState = remount\(\) \|\| state[\s\S]*?hmbSchedulePromptInteractionCommit\(container, props, committedState,[\s\S]*?remount\(rollbackState\)/,
   "Prompt structural source edits must repaint before publishing without waiting for a Picker props event.",
 );
 assert.match(

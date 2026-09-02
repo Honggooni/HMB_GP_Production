@@ -11067,6 +11067,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     if (container.__hmbPickerPaintFirstState) {
       hmbCancelVideoPickerPaintFirstTask(container, "state-publication");
       delete container.__hmbPickerPaintFirstState;
+      delete container.__hmbPickerPaintFirstPublication;
       container.removeAttribute?.("data-hmb-picker-state-publication-pending");
     }
     const previousPendingState = (
@@ -11381,7 +11382,9 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     if (container.__hmbVideoPickerDeleted === true) {
       return { command: null, delivered: false, deliveryPromise: null };
     }
-    const liveState = currentWidgetState();
+    const liveState = ["read_scene", "render_original_preview", "run_video", "render_snapshot"].includes(clean(action))
+      ? flushPickerStatePublicationBeforeCommand()
+      : currentWidgetState();
     const resolvedActionId = clean(actionId)
       || `${clean(action) || "command"}-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
     const commandPayload = hmbPickerCommandPayload(liveState, payload);
@@ -11567,18 +11570,37 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     deferredVisualUpdate = null,
   ) => {
     container.__hmbPickerPaintFirstState = nextState;
+    container.__hmbPickerPaintFirstPublication = { options, deferredVisualUpdate };
     container.setAttribute?.("data-hmb-picker-state-publication-pending", "true");
     return hmbScheduleVideoPickerPaintFirstTask(container, "state-publication", () => {
       const finalState = container.__hmbPickerPaintFirstState || nextState;
+      const publication = container.__hmbPickerPaintFirstPublication || { options, deferredVisualUpdate };
       delete container.__hmbPickerPaintFirstState;
+      delete container.__hmbPickerPaintFirstPublication;
       container.removeAttribute?.("data-hmb-picker-state-publication-pending");
       try {
-        deferredVisualUpdate?.(finalState);
+        publication.deferredVisualUpdate?.(finalState);
       } finally {
-        if (options.workspacePublication === true) publishPickerWorkspaceMutation(finalState);
-        else commit(finalState, options.commitOptions || { suppressMatchingEcho: true });
+        if (publication.options?.workspacePublication === true) publishPickerWorkspaceMutation(finalState);
+        else commit(finalState, publication.options?.commitOptions || { suppressMatchingEcho: true });
       }
     });
+  };
+  const flushPickerStatePublicationBeforeCommand = () => {
+    const queuedState = container.__hmbPickerPaintFirstState;
+    if (!queuedState) return currentWidgetState();
+    const publication = container.__hmbPickerPaintFirstPublication || {};
+    hmbCancelVideoPickerPaintFirstTask(container, "state-publication");
+    delete container.__hmbPickerPaintFirstState;
+    delete container.__hmbPickerPaintFirstPublication;
+    container.removeAttribute?.("data-hmb-picker-state-publication-pending");
+    publication.deferredVisualUpdate?.(queuedState);
+    if (publication.options?.workspacePublication === true) {
+      publishPickerWorkspaceMutation(queuedState);
+    } else {
+      commit(queuedState, publication.options?.commitOptions || { suppressMatchingEcho: true });
+    }
+    return currentWidgetState();
   };
   const toggleSharedLoaderVideoSelection = (event, selectionSurface) => {
     event?.preventDefault?.();
@@ -12277,7 +12299,9 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
         duplicateState,
         pickerLocalInteractionLocked(duplicateState),
       );
-      commit(duplicateState, { suppressMatchingEcho: true });
+      schedulePickerStatePublicationAfterPaint(duplicateState, {
+        commitOptions: { suppressMatchingEcho: true },
+      });
       return;
     }
     const existingIndex = current.findIndex((item) => (
@@ -12319,7 +12343,9 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     const interactionLocked = pickerLocalInteractionLocked(next);
     const outlinerUpdated = hmbRenderPickerOutlinerLocal(container, next, tr, interactionLocked);
     hmbApplyPickerPaletteSelectionToDom(container, next, interactionLocked);
-    commit(next, { suppressMatchingEcho: outlinerUpdated });
+    schedulePickerStatePublicationAfterPaint(next, {
+      commitOptions: { suppressMatchingEcho: outlinerUpdated },
+    });
   };
 
   const scenePathInput = container.querySelector("#maya-scene-path");
@@ -13016,7 +13042,9 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     const interactionLocked = pickerLocalInteractionLocked(next);
     const outlinerUpdated = hmbRenderPickerOutlinerLocal(container, next, tr, interactionLocked);
     hmbApplyPickerPaletteSelectionToDom(container, next, interactionLocked);
-    commit(next, { suppressMatchingEcho: outlinerUpdated });
+    schedulePickerStatePublicationAfterPaint(next, {
+      commitOptions: { suppressMatchingEcho: outlinerUpdated },
+    });
   };
   const toggleOutlinerPath = (path) => {
     const liveState = currentWidgetState();
@@ -13029,7 +13057,9 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       tr,
       pickerLocalInteractionLocked(next),
     );
-    commit(next, { suppressMatchingEcho: outlinerUpdated });
+    schedulePickerStatePublicationAfterPaint(next, {
+      commitOptions: { suppressMatchingEcho: outlinerUpdated },
+    });
   };
   const toggleOutlinerVisibility = (path) => {
     const liveState = currentWidgetState();
@@ -13062,7 +13092,9 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       tr,
       pickerLocalInteractionLocked(next),
     );
-    commit(next, { suppressMatchingEcho: outlinerUpdated });
+    schedulePickerStatePublicationAfterPaint(next, {
+      commitOptions: { suppressMatchingEcho: outlinerUpdated },
+    });
   };
   on(outlinerScroll, "pointerdown", (event) => event.stopPropagation?.());
   on(outlinerScroll, "click", (event) => {
@@ -13173,7 +13205,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     (cameraPath) => {
       const next = { ...currentWidgetState(), selected_camera: cameraPath };
       hmbApplyPickerCameraSelectionToDom(container, next);
-      commit(next);
+      schedulePickerStatePublicationAfterPaint(next);
     },
     activeCleanup,
   );

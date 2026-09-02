@@ -1080,7 +1080,7 @@ const applyPropsSource = assetSource.slice(applyPropsStart, applyPropsEnd);
 assert.ok(applyPropsStart >= 0 && applyPropsEnd > applyPropsStart);
 assert.ok(
   applyPropsSource.indexOf("imageAssetThumbnailOnlyTransition(")
-    < applyPropsSource.indexOf("const currentValue = JSON.stringify(state)"),
+    < applyPropsSource.indexOf("const currentValue = hmbCachedImageAssetSerialization"),
   "Thumbnail-only fast path must precede whole-state serialization.",
 );
 assert.match(
@@ -2293,5 +2293,28 @@ assert.match(
   assetSource,
   /const cleanup = \(\) => \{[\s\S]*?delete container\.__hmbImageAssetCurrentScanRevision;[\s\S]*?delete container\.__hmbImageAssetCurrentUiEditRevision;[\s\S]*?delete container\.__hmbImageAssetLatestLocalUiEditRevision;/,
   "Cleanup must discard ImageAsset revision baselines before workflow hydration.",
+);
+const shotMutationSource = installEventsSource.match(
+  /const commitShotMutation = \(mutate, paint = null\) => \{[\s\S]*?\n  \};\n  const paintActiveShotSelection/,
+)?.[0] || "";
+assert.match(
+  shotMutationSource,
+  /startsBurst[\s\S]*?hmbScheduleImageAssetSelectionCommit\(container/,
+  "Shot structure edits must share the latest-only two-paint coordinator and one burst boundary.",
+);
+assert.match(
+  shotMutationSource,
+  /__hmbImageAssetPendingAuthoritativeProps[\s\S]*?hmbMergeImageAssetSelectionDelta/,
+  "A catalog generation crossing a pending Shot structure edit must merge with the newest authority.",
+);
+assert.match(
+  assetSource,
+  /__hmbImageAssetSelectionCommitPending[\s\S]*?hmbFlushImageAssetSelectionCommit\(container\);[\s\S]*?hmbClearImageAssetTransportRetry/,
+  "An explicit command publication must flush a visible pending Shot edit first.",
+);
+assert.match(
+  assetSource,
+  /__hmbImageAssetCanonicalSerialization[\s\S]*?scanRevision[\s\S]*?uiEditRevision[\s\S]*?hmbCachedImageAssetSerialization/,
+  "Canonical full-state serialization reuse must be guarded by both authority revisions.",
 );
 console.log("HMB ImageAsset immediate feedback + no-remount performance regression: PASS");

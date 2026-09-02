@@ -115,7 +115,7 @@ PROXY_H264_LEVEL = "4.2"
 FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE = "hmb_full_smooth_geometry_v2"
 ORIGINAL_VIEWPORT_QUALITY_PROFILE = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
 ORIGINAL_MATERIAL_OVERRIDE_PROFILE = (
-    "per_source_material_lambert_plugin_fallback_v3"
+    "per_source_material_lambert_plugin_fallback_v4"
 )
 ORIGINAL_LAMBERT_ASSIGNMENT_MODE = (
     "original_per_source_material_lambert_plugin_fallback"
@@ -11726,6 +11726,8 @@ def _original_material_report_is_valid(report: Any) -> bool:
         "plugin_fallback_material_count",
         "plugin_fallback_node_count",
         "unsupported_color_fallback_count",
+        "required_texture_dependency_count",
+        "missing_texture_dependency_count",
         "swapped_shading_engine_count",
     )
     if any(
@@ -11782,6 +11784,10 @@ def _original_material_report_is_valid(report: Any) -> bool:
         and counts["texture_connection_count"]
         + counts["numeric_color_count"]
         == counts["temporary_lambert_count"]
+        and source.get("texture_dependency_preflight_passed") is True
+        and counts["missing_texture_dependency_count"] == 0
+        and isinstance(source.get("missing_texture_dependencies"), list)
+        and not source.get("missing_texture_dependencies")
         and fallback_material_count <= counts["temporary_lambert_count"]
         and fallback_material_count <= fallback_count
         and unsupported_count <= counts["temporary_lambert_count"]

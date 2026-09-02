@@ -164,6 +164,10 @@ SOURCE_SYNC_REVISION_KEY = "source_sync_revision"
 UI_EDIT_REVISION_KEY = "ui_edit_revision"
 MANUAL_VIDEO_CONTEXT_KEY = "manual_video_context"
 MAX_SOURCE_SYNC_REVISION = (1 << 53) - 1
+# Picker/ImageAsset can publish sibling public and exact-Shot updates for one
+# pointer action. Keep that burst outside the source widget's critical path and
+# compile only its newest generation on the retained host loop.
+PROMPT_SOURCE_BURST_DELAY_SECONDS = 0.04
 UI_RESIZE_MODE = "stacked_outer_1000"
 UI_HEADER_LAYOUT_VERSION = 2
 LEGACY_IMAGE_SOURCES_DEFAULT_HEIGHT = 542
@@ -2064,6 +2068,11 @@ def _default_image_target_for_main_type(
 ) -> str:
     """Return the editable initial Target implied by a verified Main Type."""
     main_type = _clean_string(source_type)
+    sub_type = _clean_string(image_sub_type)
+    # A Main Type alone describes only a broad authority class.  Do not invent
+    # a Target until the registered asset also supplies a concrete Sub Type.
+    if not sub_type:
+        return ""
     if main_type == "Ignore / Unused":
         return "None"
     # Every verified Environment / Background asset starts with its own readable
@@ -2076,13 +2085,11 @@ def _default_image_target_for_main_type(
         "Foreground / Ground",
     }:
         return _clean_string(image_name) or _clean_string(asset_id)
-    # Set / Structure belongs to the separate Background Prop Main Type and is
-    # not part of the Environment / Background default requested above.
     if main_type == "Set / Structure":
-        return ""
+        return _clean_string(image_name) or _clean_string(asset_id)
     if main_type == "Relative Size Reference":
         return IMAGE_SCALE_REFERENCE_DEFAULT_TARGETS.get(
-            _clean_string(image_sub_type),
+            sub_type,
             "",
         )
     if main_type in {
@@ -2090,15 +2097,16 @@ def _default_image_target_for_main_type(
         "Color + Look + Lighting Mood Reference",
         "Lighting / Atmosphere Reference",
     }:
-        if _clean_string(image_sub_type) in (
-            IMAGE_GLOBAL_SCOPE_LOOK_REFERENCE_SUB_TYPES
-        ):
+        if sub_type in IMAGE_GLOBAL_SCOPE_LOOK_REFERENCE_SUB_TYPES:
             return IMAGE_GLOBAL_LOOK_TARGET
-        # Color Mood and Render Style remain opt-in: a newly connected verified
-        # row stays blank until the user chooses Global Look or one renderable
-        # named target. Lighting-bearing Look subtypes returned above always
-        # start at Global Look.
+        if sub_type in {"Color Mood", "Render Style"}:
+            return _clean_string(image_name) or _clean_string(asset_id)
         return ""
+    if (
+        main_type == "Camera / Composition Reference"
+        and sub_type == "Camera / Composition"
+    ):
+        return IMAGE_GLOBAL_LOOK_TARGET
     if main_type in {
         "Character Appearance",
         "Partial Character Detail",
@@ -9403,6 +9411,8 @@ class HMBPromptLibrary(DataNode):
         self._hmb_output_side_effect_local = threading.local()
         self._hmb_sync_generation = 0
         self._hmb_sync_queued_token = None
+        self._hmb_sync_queued_source_burst = False
+        self._hmb_sync_publish_shot_media_pending = False
         self._hmb_last_prompt_semantic_fingerprint = ""
         self._hmb_last_prompt_output = None
         self._hmb_last_machine_prompt_output = None
@@ -10432,11 +10442,12 @@ class HMBPromptLibrary(DataNode):
                     )
                     normalized = _normalize_state(normalized)
                     # One compact callback is only a change signal/catalog
-                    # refresh. Resolve the exact connected source snapshot and
-                    # publish PROMPT_OUT/Shot media in this same transaction;
-                    # otherwise a live ImageAsset membership/name edit can
-                    # leave already connected Prompt outputs stale until the
-                    # user touches or runs the Prompt node again.
+                    # refresh. Persist that small authority update now, then
+                    # resolve the exact connected source snapshot through the
+                    # latest-only source-burst scheduler below. This prevents
+                    # a catalog/drag callback from waiting for full Prompt and
+                    # downstream publication while still publishing the newest
+                    # accepted generation automatically.
                     self._hmb_compact_route_syncing = True
                     try:
                         _set_parameter_value(
@@ -10447,8 +10458,8 @@ class HMBPromptLibrary(DataNode):
                     finally:
                         self._hmb_compact_route_syncing = False
                     # Active UUID deletion is also an authoritative change.
-                    # Compile it immediately so the Prompt returns to Only and
-                    # publishes empty Shot media instead of retaining the
+                    # Queue it with media publication so the Prompt returns to
+                    # Only and publishes empty Shot media without retaining the
                     # deleted Shot until the next unrelated edit. A Prompt that
                     # was already in Only receives choices only; asking it for
                     # exact source data before managed edges exist would erase
@@ -10459,7 +10470,8 @@ class HMBPromptLibrary(DataNode):
                         not initial_autoclaim
                         and (selected is not None or current["shot_uuid"])
                     ):
-                        self._sync_prompt_output_from_state(
+                        self._schedule_prompt_sync(
+                            source_burst=True,
                             publish_shot_media=True,
                         )
                 return self._hmb_shot_channel_subscription()
@@ -10948,14 +10960,16 @@ class HMBPromptLibrary(DataNode):
                     picker_payload,
                     connected=picker_connected,
                 )
+            serialized_state = _json_dumps(state)
             source_application_changed_state = (
-                _json_dumps(state) != state_before_source_sync
+                serialized_state != state_before_source_sync
             )
             if upstream_source_changed and source_application_changed_state:
                 state[SOURCE_SYNC_REVISION_KEY] = min(
                     MAX_SOURCE_SYNC_REVISION,
                     source_sync_revision + 1,
                 )
+                serialized_state = _json_dumps(state)
             # A widget edit has already stored its complete canonical state before
             # this deferred synchronization runs. Writing the same value back
             # produces a second frontend props update and can remount the full
@@ -10963,7 +10977,7 @@ class HMBPromptLibrary(DataNode):
             # and Picker synchronization authoritative, but publish the widget
             # parameter only when either operation actually changed its value.
             if state != current_state or not isinstance(raw_widget_value, str):
-                _set_parameter_value(self, WIDGET_PARAMETER_NAME, _json_dumps(state))
+                _set_parameter_value(self, WIDGET_PARAMETER_NAME, serialized_state)
             if (
                 (image_exact or picker_exact)
                 and not picker_route_hydration_pending
@@ -11350,29 +11364,62 @@ class HMBPromptLibrary(DataNode):
             self._hmb_sync_generation += 1
             # A synchronous authority commit supersedes any deferred request.
             # Its callback retains the old token and therefore becomes a no-op.
+            publish_shot_media = bool(
+                getattr(self, "_hmb_sync_publish_shot_media_pending", False)
+            )
             self._hmb_sync_queued_token = None
+            self._hmb_sync_queued_source_burst = False
+            self._hmb_sync_publish_shot_media_pending = False
             if allow_picker_hydration_pending:
                 return self._sync_prompt_output_from_state(
-                    allow_picker_hydration_pending=True
+                    publish_shot_media=publish_shot_media,
+                    allow_picker_hydration_pending=True,
+                )
+            if publish_shot_media:
+                return self._sync_prompt_output_from_state(
+                    publish_shot_media=True,
                 )
             return self._sync_prompt_output_from_state()
 
-    def _schedule_prompt_sync(self) -> None:
+    def _schedule_prompt_sync(
+        self,
+        *,
+        source_burst: bool = False,
+        publish_shot_media: bool = False,
+    ) -> None:
         """Schedule on the host loop, or synchronize on the current host thread.
 
         Griptape node/parameter APIs are host-thread state.  A raw
         ``threading.Timer`` fallback could call them concurrently with the
-        editor transaction, so environments without a running host loop use a
-        guarded synchronous commit instead.
+        editor transaction. Official retained-mode source bursts therefore use
+        a short host-loop delay, while environments without a running host loop
+        retain the guarded synchronous compatibility path.
         """
         with self._hmb_sync_lock:
             if bool(getattr(self, "_hmb_node_deleted", False)):
                 return
             self._hmb_sync_generation += 1
-            if getattr(self, "_hmb_sync_queued_token", None) is not None:
-                return
+            self._hmb_sync_publish_shot_media_pending = bool(
+                getattr(
+                    self,
+                    "_hmb_sync_publish_shot_media_pending",
+                    False,
+                )
+                or publish_shot_media
+            )
+            existing_token = getattr(self, "_hmb_sync_queued_token", None)
+            existing_source_burst = bool(
+                getattr(self, "_hmb_sync_queued_source_burst", False)
+            )
+            if existing_token is not None:
+                if source_burst or not existing_source_burst:
+                    return
+                # A local Prompt edit must not wait behind a source-only burst.
+                # Invalidate its delayed owner and enqueue one immediate owner
+                # that will still read the newest combined state.
             queued_token = object()
             self._hmb_sync_queued_token = queued_token
+            self._hmb_sync_queued_source_burst = bool(source_burst)
 
         def run_sync() -> None:
             try:
@@ -11384,7 +11431,17 @@ class HMBPromptLibrary(DataNode):
                     ):
                         return
                     self._hmb_sync_queued_token = None
-                    self._sync_prompt_output_from_state()
+                    self._hmb_sync_queued_source_burst = False
+                    publish_media = bool(
+                        self._hmb_sync_publish_shot_media_pending
+                    )
+                    self._hmb_sync_publish_shot_media_pending = False
+                    if publish_media:
+                        self._sync_prompt_output_from_state(
+                            publish_shot_media=True,
+                        )
+                    else:
+                        self._sync_prompt_output_from_state()
             except Exception as exc:
                 _diagnostic_exception("Deferred PROMPT_OUT synchronization failed", exc)
 
@@ -11392,7 +11449,19 @@ class HMBPromptLibrary(DataNode):
             from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes  # type: ignore
             event_loop = GriptapeNodes.EventManager().event_loop
             if event_loop is not None and event_loop.is_running():
-                event_loop.call_soon_threadsafe(run_sync)
+                if source_burst and hasattr(event_loop, "call_later"):
+                    def arm_source_burst() -> None:
+                        with self._hmb_sync_lock:
+                            if queued_token is not self._hmb_sync_queued_token:
+                                return
+                        event_loop.call_later(
+                            PROMPT_SOURCE_BURST_DELAY_SECONDS,
+                            run_sync,
+                        )
+
+                    event_loop.call_soon_threadsafe(arm_source_burst)
+                else:
+                    event_loop.call_soon_threadsafe(run_sync)
                 return
         except ImportError:
             pass
@@ -11448,7 +11517,14 @@ class HMBPromptLibrary(DataNode):
                 } and not getattr(self, "_hmb_ui_syncing", False) and not getattr(
                     self, "_hmb_compact_route_syncing", False
                 ):
-                    self._schedule_prompt_sync()
+                    self._schedule_prompt_sync(
+                        source_burst=name in {
+                            PICKER_INPUT_PARAMETER_NAME,
+                            IMAGE_ASSET_INPUT_PARAMETER_NAME,
+                            SHOT_ASSET_INPUT_PARAMETER_NAME,
+                            SHOT_PICKER_INPUT_PARAMETER_NAME,
+                        }
+                    )
             except Exception as exc:
                 _diagnostic_exception("after_value_set scheduling failed", exc)
             return result

@@ -1620,6 +1620,11 @@ class _HMBAIBrokerBridge:
             body = json.dumps(
                 payload, ensure_ascii=False, separators=(",", ":")
             ).encode("utf-8")
+            if len(body) > MAX_REQUEST_BYTES:
+                raise ValueError(
+                    "FN AI Broker request body exceeds the 64 MB limit. "
+                    "Reduce or externally host reference media."
+                )
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(
             self.server_url + path,
@@ -7564,14 +7569,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             for key, value in payload.items()
             if value is not None and value != []
         }
-        encoded_payload = json.dumps(
-            payload, ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
-        if len(encoded_payload) > MAX_REQUEST_BYTES:
-            raise ValueError(
-                "FN AI Broker request body exceeds the 64 MB limit. "
-                "Reduce or externally host reference media."
-            )
         return payload
 
     @staticmethod

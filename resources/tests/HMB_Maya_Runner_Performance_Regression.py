@@ -2792,6 +2792,7 @@ class AuxiliaryScopeCmds:
         self.attributes = {}
         self.node_types = {
             "|Visible|meshShape": "mesh",
+            "|Visible|emptyMeshShape": "mesh",
             "|Visible|surfaceShape": "nurbsSurface",
             "|EyeOff|meshShape": "mesh",
             "|Rig|aim_CTRLShape": "nurbsCurve",
@@ -2805,6 +2806,10 @@ class AuxiliaryScopeCmds:
 
     def nodeType(self, name):
         return self.node_types[name]
+
+    def polyEvaluate(self, name, face=False, **_kwargs):
+        assert face is True
+        return 0 if name == "|Visible|emptyMeshShape" else 12
 
     def createDisplayLayer(self, empty=False, name="", number=1):
         assert empty is True
@@ -2850,6 +2855,7 @@ try:
     aux_job = {
         "_auxiliary_authored_visible_shapes": [
             "|Visible|meshShape",
+            "|Visible|emptyMeshShape",
             "|Visible|surfaceShape",
             "|EyeOff|meshShape",
             "|Rig|aim_CTRLShape",
@@ -2868,6 +2874,7 @@ try:
     defensive_depth_scope = runner._all_depth_renderable_shapes({
         "_render_scope_shapes": [
             "|Visible|meshShape",
+            "|Visible|emptyMeshShape",
             "|Visible|surfaceShape",
             "|Rig|aim_CTRLShape",
             "|Rig|pivot_LOCShape",
@@ -2891,8 +2898,10 @@ assert aux_job["_render_scope_shapes"] == [
 ]
 assert aux_report["supported_surface_types"] == ["mesh", "nurbsSurface"]
 assert aux_report["allowed_shape_path_count"] == 2
-assert aux_report["excluded_shape_path_count"] == 3
+assert aux_report["excluded_shape_path_count"] == 4
 assert aux_report["unsupported_control_shape_path_count"] == 2
+assert aux_report["empty_mesh_shape_path_count"] == 1
+assert aux_report["empty_mesh_shape_paths"] == ["|Visible|emptyMeshShape"]
 assert aux_report["unsupported_control_shape_type_counts"] == {
     "locator": 1,
     "nurbsCurve": 1,
@@ -2905,6 +2914,7 @@ assert aux_cmds.layers["HMB_Picker_Aux_Excluded"] == [
     "|EyeOff|meshShape",
     "|Rig|aim_CTRLShape",
     "|Rig|pivot_LOCShape",
+    "|Visible|emptyMeshShape",
 ]
 assert defensive_depth_scope == [
     "|Visible|meshShape",

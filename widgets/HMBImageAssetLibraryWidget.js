@@ -428,7 +428,7 @@ const IMAGE_ASSET_UI_TEXT = {
     project_root: "프로젝트 루트",
     project_folders: "프로젝트 폴더",
     ready: "준비됨",
-    search_placeholder: "이미지 이름, 에셋 ID, 경로, 메인 유형 또는 하위 유형 검색",
+    search_placeholder: "이미지 이름, 에셋 ID, 경로, 주요 유형 또는 세부 유형 검색",
     no_match: "이 프로젝트 폴더 또는 검색 조건에 맞는 이미지 에셋이 없습니다.",
     selected_images: "선택 이미지 / 생성기 순서",
     drag_hint: "카드를 드래그하면 프롬프트 이미지 순서가 자동으로 갱신됩니다.",
@@ -453,20 +453,20 @@ const IMAGE_ASSET_UI_TEXT = {
     unregistered_state: "ADD",
     image_name: "이미지 이름",
     asset_id: "에셋 ID",
-    main_type: "메인 유형",
+    main_type: "주요 유형",
     unclassified: "미분류",
-    sub_type: "하위 유형",
-    sub_unassigned: "하위 유형 후보가 지정되지 않음",
+    sub_type: "세부 유형",
+    sub_unassigned: "세부 유형 후보가 지정되지 않음",
     hmb_project_asset: "HMB 프로젝트 에셋",
     asset_passport: "에셋 등록 정보",
     close_registration: "에셋 등록 창 닫기",
     final_image_name: "최종 이미지 이름",
-    main_type_label: "메인 유형 (필수)",
-    select_main_type: "메인 유형 선택",
-    custom_main_type: "사용자 정의 메인 유형",
-    sub_type_label: "하위 유형 (선택)",
+    main_type_label: "주요 유형 (필수)",
+    select_main_type: "주요 유형 선택",
+    custom_main_type: "사용자 지정 주요 유형 입력",
+    sub_type_label: "세부 유형 (선택)",
     taxonomy_contract: "에이전트 적용 의미",
-    select_sub_type: "하위 유형 선택",
+    select_sub_type: "세부 유형 선택",
     cancel: "취소",
     register_asset: "에셋 등록",
     import_in: "이미지 가져오기",
@@ -1820,6 +1820,17 @@ export function hmbPublishImageAssetState(
   onFailure = null,
   options = {},
 ) {
+  // Explicit commands and non-batched transports are ordering boundaries. A
+  // visible optimistic Shot edit must become host authority before the command
+  // publishes its following state. The coordinator marks its own callback as
+  // running, preventing recursive flush when that callback reaches here.
+  if (
+    container?.__hmbImageAssetSelectionCommitPending
+    && !container.__hmbImageAssetSelectionCommitRunning
+  ) {
+    hmbFlushImageAssetSelectionCommit(container);
+    state = container.__hmbImageAssetLatestState || state;
+  }
   hmbClearImageAssetTransportRetry(container);
   const normalized = isCanonicalImageAssetState(state) ? state : normalizeState(state);
   const revisionBaseline = {
@@ -1838,6 +1849,21 @@ export function hmbPublishImageAssetState(
   normalized[IMAGE_ASSET_UI_EDIT_REVISION_KEY] = nextUiEditRevision;
   hmbRememberImageAssetRevisionState(container, normalized, !preserveUiEditRevision);
   const value = JSON.stringify(normalized);
+  if (container) {
+    // Cache only the exact canonical snapshot that is about to become host
+    // authority. Live state remains mutable; callers may reuse this string only
+    // while no optimistic commit is pending and both revision clocks still
+    // match, which makes the cache an immutable publication snapshot rather
+    // than an object-identity shortcut.
+    container.__hmbImageAssetCanonicalSerialization = {
+      state: normalized,
+      scanRevision: hmbNormalizeImageAssetRevision(normalized.scan_revision),
+      uiEditRevision: hmbNormalizeImageAssetRevision(
+        normalized[IMAGE_ASSET_UI_EDIT_REVISION_KEY],
+      ),
+      value,
+    };
+  }
   const publicationToken = ++imageAssetPublicationSequence;
   if (container) container.__hmbImageAssetPublicationOwner = publicationToken;
   if (options?.suppressMatchingEcho === true) {
@@ -1948,6 +1974,22 @@ export function hmbInvalidateImageAssetPublication(container) {
 
 function emit(props, state, container = null, onFailure = null, options = {}) {
   return hmbPublishImageAssetState(container, props, state, onFailure, options);
+}
+
+function hmbCachedImageAssetSerialization(container, state) {
+  const cached = container?.__hmbImageAssetCanonicalSerialization;
+  if (
+    !cached
+    || cached.state !== state
+    || container.__hmbImageAssetSelectionCommitPending
+    || typeof container.__hmbImageAssetSearchDraft === "string"
+    || clean(state?.thumbnail_request?.request_id)
+    || Boolean(state?.thumbnail_busy)
+    || hmbNormalizeImageAssetRevision(state?.scan_revision) !== cached.scanRevision
+    || hmbNormalizeImageAssetRevision(state?.[IMAGE_ASSET_UI_EDIT_REVISION_KEY])
+      !== cached.uiEditRevision
+  ) return "";
+  return typeof cached.value === "string" ? cached.value : "";
 }
 
 export function hmbDeferImageAssetPropsDuringRegistration(container, nextProps = {}) {
@@ -5543,12 +5585,35 @@ function installEvents(container, state, props, remount, listeners) {
   hmbInstallImageAssetScrollGestures(container, on);
 
   const commitShotMutation = (mutate, paint = null) => {
-    const baseRouting = cloneImageAssetShotRouting(state.shot_routing);
-    const baseSelection = hmbImageAssetSelectionSnapshot(state);
-    const baseCurrentScanRevision = container.__hmbImageAssetCurrentScanRevision;
-    const baseCurrentUiEditRevision = container.__hmbImageAssetCurrentUiEditRevision;
-    const baseLatestLocalUiEditRevision = container.__hmbImageAssetLatestLocalUiEditRevision;
+    const startsBurst = !container.__hmbImageAssetSelectionCommitPending;
+    const baseSelection = startsBurst ? hmbImageAssetSelectionSnapshot(state) : null;
+    const baseAuthority = startsBurst ? imageAssetAuthorityStamp(state) : 0;
+    const basePropValue = startsBurst ? props?.value : undefined;
+    const baseRouting = startsBurst
+      ? cloneImageAssetShotRouting(state.shot_routing)
+      : null;
+    const baseCurrentScanRevision = startsBurst
+      ? container.__hmbImageAssetCurrentScanRevision
+      : null;
+    const baseCurrentUiEditRevision = startsBurst
+      ? container.__hmbImageAssetCurrentUiEditRevision
+      : null;
+    const baseLatestLocalUiEditRevision = startsBurst
+      ? container.__hmbImageAssetLatestLocalUiEditRevision
+      : null;
     if (typeof mutate !== "function" || !mutate()) return false;
+    hmbInvalidateImageAssetPublication(container);
+    if (startsBurst) {
+      container.__hmbImageAssetSelectionBase = baseSelection;
+      container.__hmbImageAssetSelectionBaseAuthority = baseAuthority;
+      container.__hmbImageAssetSelectionBasePropValue = basePropValue;
+      container.__hmbImageAssetShotRoutingBase = baseRouting;
+      container.__hmbImageAssetSelectionBaseCurrentScanRevision = baseCurrentScanRevision;
+      container.__hmbImageAssetSelectionBaseCurrentUiEditRevision = baseCurrentUiEditRevision;
+      container.__hmbImageAssetSelectionBaseLatestLocalUiEditRevision =
+        baseLatestLocalUiEditRevision;
+    }
+    delete container.__hmbImageAssetCanonicalSerialization;
     container.__hmbImageAssetLatestState = state;
     // Paint one optimistic frame immediately, then quarantine its exact host
     // echo.  A failed transport restores only when this publication still owns
@@ -5561,23 +5626,66 @@ function installEvents(container, state, props, remount, listeners) {
       }
       return remount(state);
     };
-    state = paintState();
-    let failedSynchronously = false;
-    const published = emit(props, state, container, () => {
-      failedSynchronously = true;
-      if (baseRouting) state.shot_routing = cloneImageAssetShotRouting(baseRouting);
-      hmbRestoreImageAssetSelectionSnapshot(state, baseSelection);
-      state[IMAGE_ASSET_UI_EDIT_REVISION_KEY] = hmbNormalizeImageAssetRevision(
-        baseCurrentUiEditRevision,
-      );
-      container.__hmbImageAssetCurrentScanRevision = baseCurrentScanRevision;
-      container.__hmbImageAssetCurrentUiEditRevision = baseCurrentUiEditRevision;
-      container.__hmbImageAssetLatestLocalUiEditRevision = baseLatestLocalUiEditRevision;
+    const priorCommitRunning = Boolean(
+      container.__hmbImageAssetSelectionCommitRunning,
+    );
+    container.__hmbImageAssetSelectionCommitRunning = true;
+    try {
       state = paintState();
-      container.__hmbImageAssetLatestState = state;
-    }, { suppressMatchingEcho: true });
-    if (!failedSynchronously) state = published;
-    container.__hmbImageAssetLatestState = state;
+    } finally {
+      container.__hmbImageAssetSelectionCommitRunning = priorCommitRunning;
+    }
+    hmbScheduleImageAssetSelectionCommit(container, () => {
+      const pending = container.__hmbImageAssetPendingAuthoritativeProps;
+      const baseSelection = container.__hmbImageAssetSelectionBase || [];
+      const baseAuthority = Number(container.__hmbImageAssetSelectionBaseAuthority) || 0;
+      const baseRouting = container.__hmbImageAssetShotRoutingBase;
+      const baseCurrentScanRevision = container.__hmbImageAssetSelectionBaseCurrentScanRevision;
+      const baseCurrentUiEditRevision = container.__hmbImageAssetSelectionBaseCurrentUiEditRevision;
+      const baseLatestLocalUiEditRevision =
+        container.__hmbImageAssetSelectionBaseLatestLocalUiEditRevision;
+      delete container.__hmbImageAssetPendingAuthoritativeProps;
+      delete container.__hmbImageAssetSelectionBase;
+      delete container.__hmbImageAssetSelectionBaseAuthority;
+      delete container.__hmbImageAssetSelectionBasePropValue;
+      delete container.__hmbImageAssetShotRoutingBase;
+      delete container.__hmbImageAssetSelectionBaseCurrentScanRevision;
+      delete container.__hmbImageAssetSelectionBaseCurrentUiEditRevision;
+      delete container.__hmbImageAssetSelectionBaseLatestLocalUiEditRevision;
+      let publishedState = state;
+      let rollbackState = null;
+      if (pending) {
+        publishedState = hmbMergeImageAssetSelectionDelta(
+          pending.state,
+          baseSelection,
+          state,
+        );
+        if (JSON.stringify(publishedState) !== JSON.stringify(state)) {
+          state = remount(publishedState);
+        }
+        rollbackState = pending.state;
+      }
+      emit(props, publishedState, container, () => {
+        if (rollbackState) {
+          state = remount(rollbackState);
+          container.__hmbImageAssetLatestLocalUiEditRevision =
+            hmbNormalizeImageAssetRevision(
+              state?.[IMAGE_ASSET_UI_EDIT_REVISION_KEY],
+            );
+        } else if (imageAssetAuthorityStamp(state) === baseAuthority) {
+          if (baseRouting) state.shot_routing = cloneImageAssetShotRouting(baseRouting);
+          hmbRestoreImageAssetSelectionSnapshot(state, baseSelection);
+          state[IMAGE_ASSET_UI_EDIT_REVISION_KEY] = hmbNormalizeImageAssetRevision(
+            baseCurrentUiEditRevision ?? state[IMAGE_ASSET_UI_EDIT_REVISION_KEY],
+          );
+          state = remount(state);
+          container.__hmbImageAssetCurrentScanRevision = baseCurrentScanRevision;
+          container.__hmbImageAssetCurrentUiEditRevision = baseCurrentUiEditRevision;
+          container.__hmbImageAssetLatestLocalUiEditRevision =
+            baseLatestLocalUiEditRevision;
+        }
+      }, { suppressMatchingEcho: true });
+    });
     return true;
   };
   const paintActiveShotSelection = () => hmbApplyImageAssetSelectionFeedback(
@@ -6645,7 +6753,8 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     hmbInvalidateImageAssetPublication(container);
     const nextState = incomingState;
     hmbAcceptImageAssetThumbnailResult(container, nextState);
-    const currentValue = JSON.stringify(state);
+    const currentValue = hmbCachedImageAssetSerialization(container, state)
+      || JSON.stringify(state);
     const nextValue = typeof incomingSerialized === "string"
       ? incomingSerialized
       : JSON.stringify(nextState);
@@ -6708,6 +6817,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     delete container.__hmbImageAssetCurrentUiEditRevision;
     delete container.__hmbImageAssetLatestLocalUiEditRevision;
     delete container.__hmbImageAssetLastConsumedEchoWasStale;
+    delete container.__hmbImageAssetCanonicalSerialization;
     delete container.__hmbImageAssetThumbnailScheduleToken;
     if (container.__hmbImageAssetSearchTimer != null && typeof clearTimeout === "function") {
       clearTimeout(container.__hmbImageAssetSearchTimer);

@@ -2,6 +2,7 @@
 from __future__ import absolute_import, division, print_function
 
 import io
+import glob
 import hashlib
 import json
 import math
@@ -41,7 +42,7 @@ CHARACTER_OUT_RIM_LOCAL_OCCLUSION = 2
 FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE = "hmb_full_smooth_geometry_v2"
 ORIGINAL_VIEWPORT_QUALITY_PROFILE = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
 ORIGINAL_MATERIAL_OVERRIDE_PROFILE = (
-    "per_source_material_lambert_plugin_fallback_v3"
+    "per_source_material_lambert_plugin_fallback_v4"
 )
 ORIGINAL_LAMBERT_ASSIGNMENT_MODE = (
     "original_per_source_material_lambert_plugin_fallback"
@@ -1472,6 +1473,17 @@ def _depth_supported_surface_shapes(paths):
             shape_type = ""
         if shape_type not in ("mesh", "nurbsSurface"):
             continue
+        if shape_type == "mesh" and hasattr(cmds, "polyEvaluate"):
+            try:
+                polygon_count = int(cmds.polyEvaluate(shape, face=True) or 0)
+            except Exception:
+                # Keep an unreadable non-intermediate mesh in scope so the
+                # strict API verifier can fail closed with its exact path.
+                # Only a mesh proven to contain no renderable faces is safe to
+                # ignore: it cannot contribute a pixel to Color or Depth.
+                polygon_count = None
+            if polygon_count == 0:
+                continue
         if shape not in result:
             result.append(shape)
     return result
@@ -1523,7 +1535,7 @@ def _all_depth_renderable_shapes(job=None):
             if shape not in result:
                 result.append(shape)
     return [
-        shape for shape in _marker_renderable_shapes(result)
+        shape for shape in _depth_supported_surface_shapes(result)
         if shape not in excluded
     ]
 
@@ -2171,10 +2183,16 @@ def _prepare_unassigned_auxiliary_scope(job, hidden_paths, color_scope_report):
         shape for shape in candidates
         if shape_types.get(shape) not in supported_types
     ]
+    supported_surfaces = set(_depth_supported_surface_shapes(candidates))
+    empty_meshes = [
+        shape for shape in candidates
+        if shape_types.get(shape) == "mesh"
+        and shape not in supported_surfaces
+    ]
     allowed = [
         shape
         for shape in candidates
-        if shape_types.get(shape) in supported_types
+        if shape in supported_surfaces
         if not _picker_path_is_hidden(shape, hidden_paths)
     ]
     allowed_set = set(allowed)
@@ -2224,6 +2242,7 @@ def _prepare_unassigned_auxiliary_scope(job, hidden_paths, color_scope_report):
         "allowed_shape_path_count": len(allowed),
         "excluded_shape_path_count": len(excluded),
         "unsupported_control_shape_path_count": len(unsupported_controls),
+        "empty_mesh_shape_path_count": len(empty_meshes),
         "unsupported_control_shape_type_counts": dict(
             (shape_type, len([
                 shape for shape in unsupported_controls
@@ -2236,6 +2255,7 @@ def _prepare_unassigned_auxiliary_scope(job, hidden_paths, color_scope_report):
         # Full paths belong in the on-disk runner sidecar.  Picker UI state
         # publishes only the compact count/type summary derived from it.
         "unsupported_control_shape_paths": list(unsupported_controls),
+        "empty_mesh_shape_paths": list(empty_meshes),
         "hidden_path_count": len(hidden_paths or []),
         "hidden_paths": list(hidden_paths or []),
         "temporary_exclusion_layer": layer,
@@ -4065,6 +4085,186 @@ def _original_upstream_plugin_nodes(source_plug):
     ))
 
 
+def _original_upstream_file_nodes(source_plug):
+    """Return native Maya file nodes contributing to one appearance source."""
+    root = _clean(source_plug).split(".", 1)[0]
+    queue = [root]
+    visited = set()
+    file_nodes = set()
+    while queue and len(visited) < 512:
+        node = _clean(queue.pop(0))
+        if not node or node in visited:
+            continue
+        visited.add(node)
+        if _original_node_type(node).lower() == "file":
+            file_nodes.add(node)
+            continue
+        try:
+            upstream = cmds.listConnections(
+                node,
+                source=True,
+                destination=False,
+                plugs=True,
+            ) or []
+        except Exception:
+            upstream = []
+        for candidate in upstream:
+            source_node = _clean(candidate).split(".", 1)[0]
+            if source_node and source_node not in visited:
+                queue.append(source_node)
+    return sorted(file_nodes)
+
+
+def _original_texture_search_paths(raw_path):
+    """Resolve one Maya texture path without altering the authored file node."""
+    value = os.path.expandvars(os.path.expanduser(_clean(raw_path)))
+    if not value:
+        return []
+    candidates = [value]
+    if not os.path.isabs(value):
+        bases = []
+        try:
+            bases.append(_clean(cmds.workspace(query=True, rootDirectory=True)))
+        except Exception:
+            pass
+        try:
+            scene_name = _clean(cmds.file(query=True, sceneName=True))
+            if scene_name:
+                bases.append(os.path.dirname(os.path.abspath(scene_name)))
+        except Exception:
+            pass
+        candidates = [
+            os.path.join(base, value)
+            for base in bases
+            if base
+        ] + candidates
+    return list(dict.fromkeys(
+        os.path.abspath(candidate) for candidate in candidates if candidate
+    ))
+
+
+def _original_texture_path_exists(raw_path):
+    """Accept a concrete texture or a populated Maya UDIM/frame pattern."""
+    for candidate in _original_texture_search_paths(raw_path):
+        if os.path.isfile(candidate):
+            return True
+        pattern = candidate
+        pattern = re.sub(r"<udim>", "[0-9][0-9][0-9][0-9]", pattern, flags=re.I)
+        pattern = re.sub(r"<uvtile>", "u[0-9]*_v[0-9]*", pattern, flags=re.I)
+        pattern = re.sub(r"<f\d*>", "*", pattern, flags=re.I)
+        pattern = re.sub(r"#+", "*", pattern)
+        pattern = re.sub(r"%0?\d*d", "*", pattern, flags=re.I)
+        if pattern != candidate and any(
+            os.path.isfile(path) for path in glob.glob(pattern)
+        ):
+            return True
+    return False
+
+
+def _original_file_texture_record(file_node):
+    authored_paths = []
+    for attribute in (
+        "computedFileTextureNamePattern",
+        "fileTextureName",
+    ):
+        plug = file_node + "." + attribute
+        if not _original_plug_exists(plug):
+            continue
+        try:
+            value = _clean(cmds.getAttr(plug))
+        except Exception:
+            value = ""
+        if value and value not in authored_paths:
+            authored_paths.append(value)
+    # Real Maya file nodes always expose fileTextureName.  Test doubles and
+    # nonstandard compatibility shims that do not expose it are left to the
+    # existing graph verification rather than being falsely classified.
+    if not _original_plug_exists(file_node + ".fileTextureName"):
+        return {}
+    return {
+        "node": file_node,
+        "paths": authored_paths,
+        "available": any(
+            _original_texture_path_exists(path) for path in authored_paths
+        ),
+    }
+
+
+def _original_material_authority_records(material, source_plug=""):
+    """Select the exact color/cutout/emission records used by Original."""
+    color_attributes = _ORIGINAL_COLOR_INPUT_ATTRIBUTES
+    if _original_node_type(material).lower() == "surfaceshader":
+        color_attributes = color_attributes + ("outColor",)
+    color_record = _original_attr_record(material, color_attributes)
+    if not color_record:
+        emission_record = _original_attr_record(
+            material,
+            _ORIGINAL_EMISSION_INPUT_ATTRIBUTES,
+        )
+        if _original_record_has_signal(emission_record):
+            color_record = emission_record
+    if not color_record:
+        color_record = _original_output_color_record(material, source_plug)
+
+    transparency_record = _original_attr_record(
+        material,
+        _ORIGINAL_DIRECT_TRANSPARENCY_ATTRIBUTES,
+    )
+    if not transparency_record or not (
+        transparency_record.get("source")
+        or any(transparency_record.get("component_sources") or [])
+        or any(abs(value) > 1.0e-9 for value in _original_vector(
+            transparency_record.get("value"),
+            (0.0, 0.0, 0.0),
+        ))
+    ):
+        opacity_record = _original_attr_record(
+            material,
+            _ORIGINAL_OPACITY_ATTRIBUTES,
+        )
+        if opacity_record:
+            transparency_record = opacity_record
+
+    emission_record = _original_attr_record(
+        material,
+        _ORIGINAL_EMISSION_INPUT_ATTRIBUTES,
+    )
+    return [
+        record for record in (
+            color_record,
+            transparency_record,
+            emission_record,
+        )
+        if record
+    ]
+
+
+def _original_texture_dependency_report(material_sources):
+    """Audit readable texture pixels before any temporary Lambert swap."""
+    records = {}
+    for material, source_plug in sorted(material_sources.items()):
+        for authority in _original_material_authority_records(
+            material,
+            source_plug,
+        ):
+            for source in _original_record_sources(authority):
+                for file_node in _original_upstream_file_nodes(source):
+                    record = _original_file_texture_record(file_node)
+                    if not record:
+                        continue
+                    record["material"] = material
+                    record["attribute"] = _clean(authority.get("attribute"))
+                    records[(material, file_node)] = record
+    serialized = [records[key] for key in sorted(records)]
+    missing = [record for record in serialized if not record.get("available")]
+    return {
+        "required_texture_dependency_count": len(serialized),
+        "missing_texture_dependency_count": len(missing),
+        "missing_texture_dependencies": missing[:32],
+        "texture_dependency_preflight_passed": not bool(missing),
+    }
+
+
 def _original_supported_source(source_plug, controller=None):
     source_plug = _clean(source_plug)
     if not source_plug or not _original_plug_exists(source_plug):
@@ -4375,6 +4575,10 @@ class _OriginalLambertOverrideController(object):
             "plugin_fallback_records": [],
             "unsupported_color_fallback_count": 0,
             "unsupported_color_fallback_materials": [],
+            "required_texture_dependency_count": 0,
+            "missing_texture_dependency_count": 0,
+            "missing_texture_dependencies": [],
+            "texture_dependency_preflight_passed": False,
             "texture_identity_preserved": True,
             "warnings": [],
             "scoped_shape_path_count": 0,
@@ -4770,8 +4974,7 @@ class _OriginalLambertOverrideController(object):
                 self.membership_snapshot[group] = members
                 active_groups.append(group)
             self.report["inspected_shading_engine_count"] = len(active_groups)
-            source_materials = set()
-            existing_lamberts = set()
+            material_sources = {}
             for group in active_groups:
                 source_plugs = _incoming_source_plugs(group + ".surfaceShader")
                 if len(source_plugs) != 1:
@@ -4780,6 +4983,44 @@ class _OriginalLambertOverrideController(object):
                         "surfaceShader source for Original Playblast."
                     )
                 source_plug = source_plugs[0]
+                source_material = source_plug.split(".", 1)[0]
+                material_sources.setdefault(source_material, source_plug)
+            texture_report = _original_texture_dependency_report(
+                material_sources
+            )
+            self.report.update(texture_report)
+            missing_textures = list(
+                texture_report.get("missing_texture_dependencies") or []
+            )
+            if missing_textures:
+                examples = []
+                for record in missing_textures[:8]:
+                    paths = list(record.get("paths") or [])
+                    examples.append(
+                        "{0} [{1}]: {2}".format(
+                            _clean(record.get("material")) or "<material>",
+                            _clean(record.get("node")) or "<file>",
+                            " | ".join(paths) or "<empty texture path>",
+                        )
+                    )
+                raise RuntimeError(
+                    "Original texture dependency is unavailable; Maya Lambert "
+                    "cannot preserve texture identity for {0} contributing file "
+                    "node(s). Make the mapped drive/UNC texture paths available "
+                    "to the Griptape Maya process, then retry. First paths: {1}"
+                    .format(
+                        int(texture_report.get(
+                            "missing_texture_dependency_count"
+                        ) or 0),
+                        " ; ".join(examples),
+                    )
+                )
+            source_materials = set()
+            existing_lamberts = set()
+            for group in active_groups:
+                source_plug = _incoming_source_plugs(
+                    group + ".surfaceShader"
+                )[0]
                 source_material = source_plug.split(".", 1)[0]
                 source_materials.add(source_material)
                 if _original_node_type(source_material).lower() == "lambert":

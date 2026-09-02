@@ -427,7 +427,7 @@ IMAGE_TAXONOMY_WIRE_MAP = {
 # English keys above; localization is display-only and can never change the
 # Agent wire meaning.
 IMAGE_TAXONOMY_LABELS_KO = {
-    "Select Image Main Type": "이미지 메인 타입 선택",
+    "Select Image Main Type": "이미지 주요 유형 선택",
     "Character": "캐릭터",
     "Character Prop": "캐릭터 프랍",
     "Environment / Background": "환경 / 배경",

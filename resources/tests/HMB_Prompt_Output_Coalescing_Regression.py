@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.util
+import inspect
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 import sys
@@ -349,6 +350,7 @@ module_names = [
 ]
 saved_modules = {name: sys.modules.get(name) for name in module_names}
 scheduled_callbacks = []
+delayed_callbacks = []
 
 
 class _FakeEventLoop:
@@ -359,6 +361,11 @@ class _FakeEventLoop:
     @staticmethod
     def call_soon_threadsafe(callback):
         scheduled_callbacks.append(callback)
+
+    @staticmethod
+    def call_later(delay, callback):
+        assert delay == prompt.PROMPT_SOURCE_BURST_DELAY_SECONDS
+        delayed_callbacks.append(callback)
 
 
 class _FakeEventManager:
@@ -440,6 +447,72 @@ try:
     assert len(scheduled_callbacks) == 1, "A Prompt sync burst must own one host-loop callback."
     scheduled_callbacks.pop()()
     assert len(sync_calls) == 1, "A coalesced Prompt sync burst must compile exactly once."
+
+    # Picker publishes public and exact-Shot siblings for one UI action. Their
+    # Prompt work must leave the incoming callback, wait briefly on the host
+    # loop, and collapse to one latest-state compile.
+    scheduled_callbacks.clear()
+    delayed_callbacks.clear()
+    sync_calls.clear()
+    latest_shot_seen = []
+    sync_node._sync_prompt_output_from_state = MethodType(
+        lambda self: (
+            latest_shot_seen.append(self._regression_latest_shot_uuid) or {}
+        ),
+        sync_node,
+    )
+    for index in range(20):
+        sync_node._regression_latest_shot_uuid = f"shot-{index + 1:02d}"
+        sync_node._schedule_prompt_sync(source_burst=True)
+    assert len(scheduled_callbacks) == 1
+    assert delayed_callbacks == []
+    scheduled_callbacks.pop()()
+    assert len(delayed_callbacks) == 1
+    assert sync_calls == []
+    delayed_callbacks.pop()()
+    assert latest_shot_seen == ["shot-20"], (
+        "The delayed source batch must resolve the newest Shot binding rather "
+        "than replaying the first queued snapshot."
+    )
+
+    # A direct Prompt edit arriving during that short source window owns an
+    # immediate callback and invalidates the older delayed owner.
+    scheduled_callbacks.clear()
+    delayed_callbacks.clear()
+    sync_calls.clear()
+    sync_node._sync_prompt_output_from_state = MethodType(
+        lambda self: (sync_calls.append(self._hmb_sync_generation) or {}),
+        sync_node,
+    )
+    sync_node._schedule_prompt_sync(source_burst=True)
+    sync_node._schedule_prompt_sync()
+    assert len(scheduled_callbacks) == 2
+    scheduled_callbacks.pop(0)()
+    assert delayed_callbacks == []
+    scheduled_callbacks.pop(0)()
+    assert len(sync_calls) == 1
+
+    # A synchronous connection/run reconciliation may supersede a delayed Shot
+    # catalog callback. It must consume, not discard, that batch's media-output
+    # publication requirement.
+    scheduled_callbacks.clear()
+    delayed_callbacks.clear()
+    media_sync_calls = []
+    media_sync_node = prompt.HMBPromptLibrary(name="prompt_media_intent_coalescing")
+    media_sync_node._sync_prompt_output_from_state = MethodType(
+        lambda self, **kwargs: (media_sync_calls.append(dict(kwargs)) or {}),
+        media_sync_node,
+    )
+    media_sync_node._schedule_prompt_sync(
+        source_burst=True,
+        publish_shot_media=True,
+    )
+    media_sync_node._sync_prompt_output_now()
+    assert media_sync_calls == [{"publish_shot_media": True}]
+    assert len(scheduled_callbacks) == 1
+    scheduled_callbacks.pop()()
+    assert delayed_callbacks == []
+    assert media_sync_calls == [{"publish_shot_media": True}]
 finally:
     prompt._set_parameter_value = original_set_parameter_value
     for module_name, original_module in saved_modules.items():
@@ -1125,6 +1198,28 @@ else:
         "A live VideoPicker Shot channel mismatch was incorrectly deferred."
     )
 assert pending_picker.snapshot_calls == 1
+
+
+# A changed source synchronization serializes the final normalized dashboard
+# exactly once, then reuses those exact bytes for the retained-mode setter.
+# The functional revision tests above prove that this optimization does not
+# alter source/UI authority or the published payload.
+dashboard_writer_source = inspect.getsource(
+    prompt.HMBPromptLibrary._write_dashboard_state
+)
+assert dashboard_writer_source.count("_json_dumps(state)") == 2
+assert "serialized_state = _json_dumps(state)" in dashboard_writer_source
+assert "serialized_state != state_before_source_sync" in dashboard_writer_source
+assert (
+    "state[SOURCE_SYNC_REVISION_KEY] = min(" in dashboard_writer_source
+    and "serialized_state = _json_dumps(state)" in dashboard_writer_source.split(
+        "state[SOURCE_SYNC_REVISION_KEY] = min(", 1
+    )[1]
+)
+assert (
+    "_set_parameter_value(self, WIDGET_PARAMETER_NAME, serialized_state)"
+    in dashboard_writer_source
+)
 
 
 print("HMB Prompt paired-output coalescing regression passed.")

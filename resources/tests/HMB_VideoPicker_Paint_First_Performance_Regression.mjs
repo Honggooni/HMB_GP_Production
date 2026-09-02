@@ -113,6 +113,47 @@ assert.ok(
 );
 assert.match(selectionSource, /suppressMatchingEcho:\s*true/);
 
+const paletteStart = source.indexOf("const applyColor = (color) => {");
+const paletteEnd = source.indexOf("const scenePathInput =", paletteStart);
+const paletteSource = source.slice(paletteStart, paletteEnd);
+assert.ok(paletteStart >= 0 && paletteEnd > paletteStart);
+assert.equal(
+  (paletteSource.match(/schedulePickerStatePublicationAfterPaint\(/g) || []).length,
+  2,
+  "Both palette-color mutations must share the paint-first latest-only publisher.",
+);
+assert.doesNotMatch(
+  paletteSource,
+  /\bcommit\(/,
+  "Palette feedback must not synchronously publish the full picker state.",
+);
+
+const outlinerStart = source.indexOf("const selectOutlinerPath = (path) => {");
+const outlinerEnd = source.indexOf("on(outlinerScroll", outlinerStart);
+const outlinerSource = source.slice(outlinerStart, outlinerEnd);
+assert.ok(outlinerStart >= 0 && outlinerEnd > outlinerStart);
+assert.equal(
+  (outlinerSource.match(/schedulePickerStatePublicationAfterPaint\(/g) || []).length,
+  3,
+  "Outliner select, expand, and visibility mutations must share one coalescing publisher.",
+);
+assert.doesNotMatch(
+  outlinerSource,
+  /\bcommit\(/,
+  "Outliner feedback must not synchronously publish the full picker state.",
+);
+
+const cameraStart = source.indexOf("hmbInstallPickerValueControlDelegation(\n    container.querySelector(\".picker-camera-control\")");
+const cameraEnd = source.indexOf("hmbInstallPickerValueControlDelegation(\n    container.querySelector(\".palette-head\")", cameraStart);
+const cameraSource = source.slice(cameraStart, cameraEnd);
+assert.ok(cameraStart >= 0 && cameraEnd > cameraStart);
+assert.match(cameraSource, /schedulePickerStatePublicationAfterPaint\(next\)/);
+assert.doesNotMatch(
+  cameraSource,
+  /\bcommit\(/,
+  "Camera selection must not synchronously publish the full picker state.",
+);
+
 const commitStart = source.indexOf("const commit = (next, options = {}) => {");
 const commitEnd = source.indexOf("const currentWidgetState = () => {", commitStart);
 const commitSource = source.slice(commitStart, commitEnd);
@@ -121,6 +162,35 @@ assert.match(
   /hmbCancelVideoPickerPaintFirstTask\(container, "state-publication"\)/,
   "A newer synchronous mutation must cancel a queued draft before it can replay stale media.",
 );
+assert.match(commitSource, /delete container\.__hmbPickerPaintFirstPublication/);
+
+const currentStateStart = source.indexOf("const currentWidgetState = () => {");
+const currentStateEnd = source.indexOf("const commandBridge = () => {", currentStateStart);
+const currentStateSource = source.slice(currentStateStart, currentStateEnd);
+assert.ok(currentStateStart >= 0 && currentStateEnd > currentStateStart);
+assert.match(
+  currentStateSource,
+  /container\.__hmbPickerPaintFirstState[\s\S]*container\.__hmbPendingPickerState[\s\S]*state/,
+  "Commands must observe the queued paint-first draft before pending or committed state.",
+);
+
+const dispatchStart = source.indexOf("const dispatchCommand = (action,");
+const dispatchEnd = source.indexOf("const scheduleReadAckTimeout", dispatchStart);
+const dispatchSource = source.slice(dispatchStart, dispatchEnd);
+assert.ok(dispatchStart >= 0 && dispatchEnd > dispatchStart);
+assert.match(
+  dispatchSource,
+  /\["read_scene", "render_original_preview", "run_video", "render_snapshot"\][\s\S]*flushPickerStatePublicationBeforeCommand\(\)/,
+  "READ, Generate, and Snapshot must flush a queued UI draft before command dispatch.",
+);
+
+const flushStart = source.indexOf("const flushPickerStatePublicationBeforeCommand = () => {");
+const flushEnd = source.indexOf("const toggleSharedLoaderVideoSelection = (", flushStart);
+const flushSource = source.slice(flushStart, flushEnd);
+assert.ok(flushStart >= 0 && flushEnd > flushStart);
+assert.match(flushSource, /hmbCancelVideoPickerPaintFirstTask\(container, "state-publication"\)/);
+assert.match(flushSource, /commit\(queuedState/);
+assert.match(flushSource, /return currentWidgetState\(\)/);
 
 const toggleStart = source.indexOf("const togglePickerView = () => {");
 const toggleEnd = source.indexOf("const commandBridge = () => {", toggleStart);

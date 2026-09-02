@@ -119,8 +119,8 @@ const source = fs.readFileSync(
   new URL("../../widgets/HMBPromptLibraryScopedBindingWidget.js", import.meta.url),
   "utf8",
 );
-const cssMatch = source.match(/return `<style>\n([\s\S]*?)<\/style>/);
-assert.ok(cssMatch, "Prompt widget CSS literal must remain in its original render location.");
+const cssMatch = source.match(/includeStyle \? `<style>\n([\s\S]*?)<\/style>` : ""/);
+assert.ok(cssMatch, "Prompt widget CSS literal must remain byte-identical behind the full-mount guard.");
 const css = cssMatch[1];
 const markup = `<style>${css}</style><div class="hmb-dashboard"></div>`;
 const expected = `<style>${hmbScopeWidgetCss(css, ".hmb-dashboard")}</style><div class="hmb-dashboard"></div>`;
@@ -133,6 +133,26 @@ assert.equal(
   hmbScopeWidgetStyleMarkup(markup, ".hmb-dashboard"),
   expected,
   "A cache hit must remain byte-identical to the uncached scoping result.",
+);
+assert.match(
+  source,
+  /let HMB_PROMPT_SCOPED_STYLE_MARKUP = "";/,
+  "The fully scoped Prompt style must have one module-local full-mount cache.",
+);
+assert.match(
+  source,
+  /return HMB_PROMPT_SCOPED_STYLE_MARKUP \+ render\(state, false\);/,
+  "Later full mounts must reuse the exact cached style bytes.",
+);
+assert.match(
+  source,
+  /const dynamicMarkup = render\(state, false\);[\s\S]*hmbPatchPromptDashboard\(container, dynamicMarkup\)/,
+  "Retained remounts must render and parse only dynamic dashboard markup.",
+);
+assert.doesNotMatch(
+  source,
+  /hmbPatchPromptDashboard\(container, hmbScopeWidgetStyleMarkup\(/,
+  "Retained remounts must not scope or parse the fixed Prompt stylesheet.",
 );
 
 console.log("HMB Prompt five-node performance-path regression: PASS");

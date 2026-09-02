@@ -382,7 +382,7 @@ assert.match(
 );
 assert.match(
   source,
-  /const remount = \(nextState = null\) => \{[\s\S]*?const compositionWasActive = Boolean\([\s\S]*?if \(!hmbPatchPromptDashboard\(container, markup\)\) container\.innerHTML = markup;[\s\S]*?if \(\s*compositionWasActive[\s\S]*?\) hmbReleasePromptCompositionLatch\(container\);/,
+  /const remount = \(nextState = null\) => \{[\s\S]*?const compositionWasActive = Boolean\([\s\S]*?if \(dashboardMounted\) \{[\s\S]*?const dynamicMarkup = render\(state, false\);[\s\S]*?if \(!hmbPatchPromptDashboard\(container, dynamicMarkup\)\) \{\s*container\.innerHTML = hmbPromptFullDashboardMarkup\(state\);\s*\}[\s\S]*?if \(\s*compositionWasActive[\s\S]*?\) hmbReleasePromptCompositionLatch\(container\);/,
   "A remount must patch first and release composition only when the composing control was replaced.",
 );
 assert.match(
