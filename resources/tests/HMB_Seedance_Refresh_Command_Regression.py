@@ -114,6 +114,64 @@ with mock.patch.object(
 assert node.get_parameter_value(target.SEEDANCE_SHOT_WIDGET_PARAMETER) == shot_before
 assert node.parameter_output_values["generation_id"] == authoritative_id
 
+# The browser still supplies no task ID when only the durable recovery
+# checkpoint has hydrated. Python must authorize the one-shot command against
+# that checkpoint instead of dropping the visible recovery button action.
+checkpoint_node = target.HMBSeedanceGeneration(
+    name="Seedance Checkpoint Refresh Command Regression"
+)
+checkpoint_command_parameter = checkpoint_node.get_parameter_by_name(
+    target.SEEDANCE_REFRESH_COMMAND_PARAMETER
+)
+checkpoint_id = "hmb-checkpoint-command-19"
+checkpoint_node.set_parameter_value(
+    target.SEEDANCE_RECOVERY_PARAMETER,
+    {
+        "schema": target.SEEDANCE_RECOVERY_SCHEMA,
+        "version": target.SEEDANCE_RECOVERY_VERSION,
+        "revision": 19,
+        "stage": "pre_submit",
+        "task_id": checkpoint_id,
+        "task_identity": "client_request",
+        "status": "submitting",
+        "terminal": False,
+        "updated_at_ms": 19,
+        "model_id": target.SEEDANCE_2_5_MODEL_ID,
+        "output_format": "mp4",
+        "return_last_frame": False,
+        "output_file": "checkpoint-command.mp4",
+    },
+    initial_setup=True,
+    emit_change=False,
+)
+checkpoint_node.parameter_output_values["generation_id"] = ""
+checkpoint_node._hmb_generation_preview_state = target._seedance_generation_preview_value(
+    {
+        "phase": "submission_unknown",
+        "job_id": checkpoint_id,
+        "action": "refresh_existing",
+    }
+)
+checkpoint_schedules: list[str] = []
+checkpoint_command = dict(browser_command, action_id="refresh-command-19")
+with mock.patch.object(
+    checkpoint_node,
+    "_schedule_existing_generation_refresh",
+    side_effect=lambda: checkpoint_schedules.append("scheduled"),
+):
+    normalized_checkpoint_command = checkpoint_node.before_value_set(
+        checkpoint_command_parameter,
+        checkpoint_command,
+    )
+    checkpoint_node.parameter_values[target.SEEDANCE_REFRESH_COMMAND_PARAMETER] = (
+        normalized_checkpoint_command
+    )
+    checkpoint_node.after_value_set(
+        checkpoint_command_parameter,
+        normalized_checkpoint_command,
+    )
+assert checkpoint_schedules == ["scheduled"]
+
 # Runtime preview state is stored without a lifecycle event and then published
 # exactly once. This prevents the prior lifecycle + value WebSocket duplicate.
 node._hmb_generation_preview_state = target._seedance_generation_preview_value(
@@ -155,6 +213,6 @@ assert publish_calls[0][1] == set_calls[0][1]
 
 print(
     "HMB Seedance refresh-command regression: PASS "
-    "(minimal action, no browser task ID, dedupe, authoritative same-job gate, "
-    "Shot isolation, single preview publication)"
+    "(minimal action, no browser task ID, dedupe, checkpoint fallback, "
+    "authoritative same-job gate, Shot isolation, single preview publication)"
 )

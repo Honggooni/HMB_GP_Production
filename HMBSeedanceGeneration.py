@@ -3421,6 +3421,42 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
         return checkpoint
 
+    def _authoritative_existing_generation_id(self) -> str:
+        """Resolve the same-task identity used by every manual refresh path.
+
+        Griptape may briefly replay non-serializable output parameters after the
+        durable recovery property has hydrated.  An unresolved checkpoint is
+        therefore selected before a possibly stale output ID.  For completed
+        history the existing output/resume behavior remains primary, while
+        ``resume_generation_id`` can never redirect an unresolved paid task.
+        """
+
+        checkpoint = self._generation_recovery_state()
+        checkpoint_id = str(checkpoint.get("task_id") or "").strip()
+        checkpoint_status = str(checkpoint.get("status") or "").strip().lower()
+        checkpoint_requires_resolution = bool(
+            checkpoint_id
+            and checkpoint.get("stage") != "local_succeeded"
+            and checkpoint.get("terminal") is not True
+            and checkpoint_status not in TERMINAL_FAILURE_STATUSES
+        )
+        output_id = self.parameter_output_values.get("generation_id")
+        resume_id = self.get_parameter_value("resume_generation_id")
+        candidates = (
+            (checkpoint_id, output_id, resume_id)
+            if checkpoint_requires_resolution
+            else (output_id, resume_id, checkpoint_id)
+        )
+        for candidate in candidates:
+            task_id = str(candidate or "").strip()
+            if not task_id:
+                continue
+            try:
+                return self._validate_task_id(task_id)
+            except _BrokerProtocolError:
+                continue
+        return ""
+
     def _set_generation_recovery_checkpoint(
         self,
         *,
@@ -3798,7 +3834,28 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             video_present,
             int(checkpoint.get("revision") or 0),
         )
-        if self._hmb_generation_recovery_restore_fingerprint == fingerprint:
+        current_generation_id = str(
+            self.parameter_output_values.get("generation_id") or ""
+        ).strip()
+        current_generation_status = str(
+            self.parameter_output_values.get("generation_status") or ""
+        ).strip().lower()
+        provider_matches = bool(
+            isinstance(provider_response, dict)
+            and str(provider_response.get("id") or "").strip() == generation_id
+            and str(provider_response.get("status") or "").strip().lower()
+            == restored_status
+            and (not terminal or provider_response.get("terminal") is True)
+        )
+        outputs_match_recovery = bool(
+            current_generation_id == generation_id
+            and current_generation_status == restored_status
+            and provider_matches
+        )
+        if (
+            self._hmb_generation_recovery_restore_fingerprint == fingerprint
+            and outputs_match_recovery
+        ):
             return
         self.parameter_output_values["generation_id"] = generation_id
         self.parameter_output_values["generation_status"] = restored_status
@@ -3904,9 +3961,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         preview = _seedance_generation_preview_value(
             self._hmb_generation_preview_state
         )
-        authoritative_id = str(
-            self.parameter_output_values.get("generation_id") or ""
-        ).strip()
+        authoritative_id = self._authoritative_existing_generation_id()
         if (
             preview["action"] != "refresh_existing"
             or not authoritative_id
@@ -4755,9 +4810,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             preview = _seedance_generation_preview_value(
                 self._hmb_generation_preview_state
             )
-            authoritative_id = str(
-                self.parameter_output_values.get("generation_id") or ""
-            ).strip()
+            authoritative_id = self._authoritative_existing_generation_id()
             if (
                 normalized["action"] == "refresh_existing"
                 and action_id
@@ -4785,9 +4838,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 preview = _seedance_generation_preview_value(
                     self._hmb_generation_preview_state
                 )
-                authoritative_id = str(
-                    self.parameter_output_values.get("generation_id") or ""
-                ).strip()
+                authoritative_id = self._authoritative_existing_generation_id()
                 self._hmb_pending_generation_action = bool(
                     preview["action"] == "refresh_existing"
                     and authoritative_id
@@ -8822,11 +8873,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return
         generation_id = ""
         try:
-            generation_id = str(
-                self.parameter_output_values.get("generation_id")
-                or self.get_parameter_value("resume_generation_id")
-                or ""
-            ).strip()
+            generation_id = self._authoritative_existing_generation_id()
             if not generation_id:
                 if self._generation_run_active.is_set():
                     return
@@ -8871,6 +8918,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             recovery_contract = self._generation_recovery_state()
             requested_generation_id = generation_id
             resolved_generation_id = str(task["id"])
+            preserve_local_success = bool(
+                recovery_contract.get("stage") == "local_succeeded"
+                and recovery_contract.get("task_id") == requested_generation_id
+            )
             if (
                 resolved_generation_id != requested_generation_id
                 and not (
@@ -8914,28 +8965,29 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     else "none"
                 ),
             )
-            self._set_generation_recovery_checkpoint(
-                stage=(
-                    "remote_succeeded"
-                    if status == "succeeded"
-                    else "terminal"
-                    if status in TERMINAL_FAILURE_STATUSES
-                    or task.get("terminal") is True
-                    else "refresh"
-                ),
-                task_id=generation_id,
-                task_identity="broker_task",
-                status=status,
-                params=refresh_params,
-                terminal=bool(
-                    status in TERMINAL_FAILURE_STATUSES
-                    or task.get("terminal") is True
-                ),
-            )
-            await self._force_save_generation_recovery_checkpoint(
-                required=False,
-                reason="manual_refresh",
-            )
+            if not preserve_local_success:
+                self._set_generation_recovery_checkpoint(
+                    stage=(
+                        "remote_succeeded"
+                        if status == "succeeded"
+                        else "terminal"
+                        if status in TERMINAL_FAILURE_STATUSES
+                        or task.get("terminal") is True
+                        else "refresh"
+                    ),
+                    task_id=generation_id,
+                    task_identity="broker_task",
+                    status=status,
+                    params=refresh_params,
+                    terminal=bool(
+                        status in TERMINAL_FAILURE_STATUSES
+                        or task.get("terminal") is True
+                    ),
+                )
+                await self._force_save_generation_recovery_checkpoint(
+                    required=False,
+                    reason="manual_refresh",
+                )
             if status == "succeeded":
                 refresh_output_format = str(
                     refresh_params.get("output_format") or DEFAULT_OUTPUT_FORMAT

@@ -613,6 +613,157 @@ class RecordingBridge:
         raise AssertionError("Recovery must never call the create endpoint.")
 
 
+# A saved checkpoint can hydrate before (or outlive) non-serializable output
+# replay.  Both the final restore callback and Status Refresh must recover the
+# same provisional request without requiring generation_id or Resume Task ID.
+checkpoint_only_id = "hmb-checkpoint-only-refresh"
+checkpoint_only = target.HMBSeedanceGeneration(
+    name="Seedance Checkpoint Only Refresh"
+)
+checkpoint_only.set_parameter_value(
+    target.SEEDANCE_RECOVERY_PARAMETER,
+    {
+        "schema": target.SEEDANCE_RECOVERY_SCHEMA,
+        "version": target.SEEDANCE_RECOVERY_VERSION,
+        "revision": 17,
+        "stage": "pre_submit",
+        "task_id": checkpoint_only_id,
+        "task_identity": "client_request",
+        "status": "submitting",
+        "terminal": False,
+        "updated_at_ms": 17,
+        "model_id": target.SEEDANCE_2_5_MODEL_ID,
+        "output_format": "mp4",
+        "return_last_frame": False,
+        "output_file": "checkpoint-only.mp4",
+    },
+    initial_setup=True,
+    emit_change=False,
+)
+checkpoint_only._hmb_post_hydration_state_restore()
+assert checkpoint_only.parameter_output_values["generation_id"] == checkpoint_only_id
+checkpoint_only_preview = target._seedance_generation_preview_value(
+    checkpoint_only._hmb_generation_preview_state
+)
+assert checkpoint_only_preview["job_id"] == checkpoint_only_id
+assert checkpoint_only_preview["action"] == "refresh_existing"
+
+# Reproduce the desktop race: the host replays empty output defaults after the
+# first successful restore.  An identical recovery fingerprint must still
+# repair the outputs rather than returning early.
+checkpoint_only.parameter_output_values.update(
+    {
+        "generation_id": "",
+        "generation_status": "",
+        "provider_response": None,
+    }
+)
+checkpoint_only._hmb_post_hydration_state_restore()
+assert checkpoint_only.parameter_output_values["generation_id"] == checkpoint_only_id
+assert checkpoint_only.parameter_output_values["generation_status"] == (
+    "submission_unknown"
+)
+
+# Status Refresh is also independently safe during the small window before a
+# deferred restore callback: clear the volatile outputs again and prove the
+# durable checkpoint alone drives one GET and zero billable creates.
+checkpoint_only.parameter_output_values.update(
+    {
+        "generation_id": "",
+        "generation_status": "",
+        "provider_response": None,
+    }
+)
+assert (
+    checkpoint_only._authoritative_existing_generation_id() == checkpoint_only_id
+)
+
+# A valid but stale output from an older render must not outrank the unresolved
+# paid request in the durable checkpoint.
+checkpoint_only.parameter_output_values.update(
+    {
+        "generation_id": "stale-output-job",
+        "generation_status": "succeeded",
+        "provider_response": {
+            "transport": "fn_ai_broker",
+            "id": "stale-output-job",
+            "status": "succeeded",
+        },
+    }
+)
+checkpoint_only_bridge = RecordingBridge()
+checkpoint_only._runtime_node_is_live = lambda *, require_registered=False: True
+checkpoint_only.status_component = SimpleNamespace(
+    clear_execution_status=lambda **_kwargs: None
+)
+with mock.patch.object(
+    checkpoint_only,
+    "_ensure_broker_connected",
+    new=mock.AsyncMock(return_value=checkpoint_only_bridge),
+), mock.patch.object(checkpoint_only, "_set_status_results", create=True):
+    asyncio.run(checkpoint_only._refresh_async())
+
+assert checkpoint_only_bridge.refresh_calls == [(checkpoint_only_id, 60)]
+assert checkpoint_only_bridge.create_calls == []
+assert checkpoint_only.parameter_output_values["generation_id"] == checkpoint_only_id
+
+
+# Refreshing historical completed output may repopulate a missing viewport, but
+# it must never downgrade the durable proof that this paid result was already
+# downloaded, verified, and atomically published.
+local_success_id = "reopen-local-success-refresh-monotonic"
+local_success = target.HMBSeedanceGeneration(
+    name="Seedance Local Success Refresh Monotonic"
+)
+local_success.set_parameter_value(
+    target.SEEDANCE_RECOVERY_PARAMETER,
+    {
+        "schema": target.SEEDANCE_RECOVERY_SCHEMA,
+        "version": target.SEEDANCE_RECOVERY_VERSION,
+        "revision": 18,
+        "stage": "local_succeeded",
+        "task_id": local_success_id,
+        "task_identity": "broker_task",
+        "status": "succeeded",
+        "terminal": False,
+        "updated_at_ms": 18,
+        "model_id": target.SEEDANCE_2_5_MODEL_ID,
+        "output_format": "mp4",
+        "return_last_frame": False,
+        "output_file": "local-success.mp4",
+    },
+    initial_setup=True,
+    emit_change=False,
+)
+local_success.parameter_output_values.update(
+    {
+        "generation_id": "",
+        "generation_status": "",
+        "provider_response": None,
+    }
+)
+local_success_bridge = RecordingBridge()
+local_success._runtime_node_is_live = lambda *, require_registered=False: True
+local_success.status_component = SimpleNamespace(
+    clear_execution_status=lambda **_kwargs: None
+)
+with mock.patch.object(
+    local_success,
+    "_ensure_broker_connected",
+    new=mock.AsyncMock(return_value=local_success_bridge),
+), mock.patch.object(local_success, "_set_status_results", create=True):
+    asyncio.run(local_success._refresh_async())
+
+local_success_checkpoint = target._seedance_recovery_value(
+    local_success.get_parameter_value(target.SEEDANCE_RECOVERY_PARAMETER)
+)
+assert local_success_bridge.refresh_calls == [(local_success_id, 60)]
+assert local_success_bridge.create_calls == []
+assert local_success_checkpoint["stage"] == "local_succeeded"
+assert local_success_checkpoint["task_id"] == local_success_id
+assert local_success._generation_recovery_blocks_new_submission() is False
+
+
 # Execute the backend operation reached by the restored button.  It performs
 # one GET/refresh for the authoritative ID and zero billable creates.
 refresh_id = "reopen-safe-refresh-only"
@@ -1234,7 +1385,9 @@ asyncio.run(verify_submission_liveness_gates())
 print(
     "HMB Seedance crash/reopen recovery regression: PASS "
     "(persisted same-job action, submitting checkpoint, no-ID fail-closed, "
-    "missing-media recovery, terminal no-restart, refresh-only backend path, "
+    "checkpoint-only refresh, stale-output priority, late-output repair, "
+    "monotonic local success, missing-media recovery, "
+    "terminal no-restart, refresh-only backend path, "
     "five-node serialized save coordinator, pre-submit save billing boundary, "
     "definitive client lookup cleanup, original output target, submission gates)"
 )
