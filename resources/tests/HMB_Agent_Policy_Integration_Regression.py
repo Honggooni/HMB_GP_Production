@@ -15,7 +15,7 @@ from _hmb_bundled_policy_session import (
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.7.35"
+EXPECTED_RELEASE_VERSION = "0.7.37"
 EXPECTED_SIGNING_KEY_ID = "hmb-policy-local-2026-08-r1"
 
 
