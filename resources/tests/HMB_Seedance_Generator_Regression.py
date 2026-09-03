@@ -585,6 +585,23 @@ def assert_constructor_and_public_contract() -> None:
     )
     node.set_parameter_value("task", target.TASK_VIDEO_EDITING)
     assert node.get_parameter_value("task") == target.TASK_VIDEO_EDITING
+    assert node.get_parameter_value("resolution") == "720p"
+    assert node.get_parameter_by_name("resolution").ui_options["simple_dropdown"] == [
+        "720p",
+        "1080p",
+    ]
+    assert node.get_parameter_value("duration") == -1
+    assert node.get_parameter_by_name("duration").ui_options["simple_dropdown"] == [
+        -1,
+    ]
+    assert node.get_parameter_value("ratio") == "adaptive"
+    assert node.get_parameter_by_name("ratio").ui_options["simple_dropdown"] == [
+        "adaptive",
+    ]
+    node.set_parameter_value("task", target.TASK_VIDEO_EXTENSION)
+    node.set_parameter_value("duration", -1)
+    node.set_parameter_value("task", target.TASK_VIDEO_EDITING)
+    assert node.get_parameter_value("duration") == -1
     assert (
         node.get_parameter_value("input_mode")
         == target.INPUT_MODE_MULTIMODAL_REFERENCES
@@ -2296,6 +2313,7 @@ def assert_seedance_25_model_contract() -> None:
     assert high_definition_payload["quality"] == "1080p"
     assert high_definition_payload["resolution"] == "1080p"
     assert high_definition_payload["aspect_ratio"] == "9:16"
+
     unsupported_resolution = dict(params)
     unsupported_resolution["resolution"] = "480p"
     try:
@@ -2304,6 +2322,50 @@ def assert_seedance_25_model_contract() -> None:
         assert "does not support 480p" in str(exc)
     else:
         raise AssertionError("Seedance 2.5 accepted 480p")
+
+    editing = dict(params)
+    editing.update(
+        {
+            "task": target.TASK_VIDEO_EDITING,
+            "duration": -1,
+            "ratio": "adaptive",
+            "reference_images": [],
+            "reference_audio": [],
+            "video_references": ["https://cdn.example/edit-source.mp4"],
+        }
+    )
+    node._validate_parameters(editing)
+    editing_payload = node._build_broker_payload(editing)
+    assert editing_payload["duration_seconds"] == -1
+    assert editing_payload["aspect_ratio"] == "adaptive"
+
+    for unsupported_ratio in set(target.RATIOS) - {"adaptive"}:
+        ratio_case = dict(editing)
+        ratio_case["ratio"] = unsupported_ratio
+        try:
+            node._validate_parameters(ratio_case)
+        except ValueError as exc:
+            assert "requires adaptive ratio" in str(exc)
+        else:
+            raise AssertionError(
+                f"Seedance 2.5 Video Editing accepted ratio={unsupported_ratio}"
+            )
+
+    editing_explicit_duration = dict(editing)
+    editing_explicit_duration["duration"] = 5
+    try:
+        node._validate_parameters(editing_explicit_duration)
+    except ValueError as exc:
+        assert "duration must be -1" in str(exc)
+    else:
+        raise AssertionError("Seedance 2.5 Video Editing accepted duration=5")
+
+    editing_1080p = dict(editing)
+    editing_1080p["resolution"] = "1080p"
+    node._validate_parameters(editing_1080p)
+    editing_1080p_payload = node._build_broker_payload(editing_1080p)
+    assert editing_1080p_payload["quality"] == "1080p"
+    assert editing_1080p_payload["resolution"] == "1080p"
 
     overflow_cases = (
         (
@@ -2368,6 +2430,55 @@ def assert_broker_generation_contract() -> None:
     )
     assert "oversized reference-media request" in safe_error_message
     assert "secret-canary" not in safe_error_message
+
+    class HttpErrorOpener:
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+
+        def open(self, request, timeout: float):
+            assert timeout > 0
+            raise target.urllib.error.HTTPError(
+                request.full_url,
+                self.status_code,
+                "simulated Broker response",
+                {},
+                io.BytesIO(b"{}"),
+            )
+
+    def broker_http_error(status_code: int, *, submission: bool):
+        http_bridge = target._HMBAIBrokerBridge(
+            opener=HttpErrorOpener(status_code)
+        )
+        with (
+            mock.patch.object(target, "_broker_load_token", return_value="test-token"),
+            mock.patch.object(
+                target,
+                "_broker_validated_server_url",
+                return_value="https://broker.example",
+            ),
+        ):
+            try:
+                http_bridge._request_json(
+                    "POST",
+                    "/api/v1/generate/video",
+                    payload={},
+                    timeout=1,
+                    submission=submission,
+                )
+            except target._BrokerError as exc:
+                return exc
+        raise AssertionError("Simulated Broker HTTP failure was accepted")
+
+    for status_code in (500, 502, 503, 504):
+        create_error = broker_http_error(status_code, submission=True)
+        assert create_error.status_code == status_code
+        assert create_error.submission_outcome_unknown is True
+    rate_limit_error = broker_http_error(429, submission=True)
+    assert rate_limit_error.status_code == 429
+    assert rate_limit_error.submission_outcome_unknown is False
+    polling_error = broker_http_error(502, submission=False)
+    assert polling_error.status_code == 502
+    assert polling_error.submission_outcome_unknown is False
 
     detached_bridge = FakeBrokerBridge([])
     detached = target.HMBSeedanceGeneration(name="Detached Broker Guard Regression")

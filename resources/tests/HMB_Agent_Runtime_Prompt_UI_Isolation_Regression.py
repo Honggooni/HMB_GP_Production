@@ -1,11 +1,24 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import sys
 
 
 ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_STANDARD_ROOT = (
+    Path.home()
+    / "Documents"
+    / "GriptapeNodes"
+    / "libraries"
+    / "griptape-nodes-library-standard"
+)
+if (DEFAULT_STANDARD_ROOT / "griptape_nodes_library" / "agents" / "agent.py").is_file():
+    os.environ.setdefault(
+        "HMB_GRIPTAPE_STANDARD_LIBRARY_PATH",
+        str(DEFAULT_STANDARD_ROOT),
+    )
 SPEC = importlib.util.spec_from_file_location(
     "_hmb_agent_runtime_prompt_ui_isolation_regression",
     ROOT / "HMBAgentLibrary.py",
@@ -23,7 +36,25 @@ assert agent._agent_widget_value(execution_phase="private-policy-text")[
 ] == ""
 
 
-node = object.__new__(agent.HMBAgentLibrary)
+if agent._BuiltinAgent is None:
+    # Public CI intentionally has no Standard Library checkout. Build the same
+    # minimal DataNode surface used by the production-independent UI guard.
+    node = object.__new__(agent.HMBAgentLibrary)
+    agent.DataNode.__init__(node, name="agent_runtime_prompt_ui_isolation")
+    node.add_parameter(
+        agent.Parameter(
+            name=agent._AGENT_PROMPT_INPUT_PARAMETER,
+            type="str",
+            default_value="Manual Only prompt",
+        )
+    )
+    node._ensure_hmb_shot_prompt_input()
+else:
+    node = agent.HMBAgentLibrary(name="agent_runtime_prompt_ui_isolation")
+    node.set_parameter_value(
+        agent._AGENT_PROMPT_INPUT_PARAMETER,
+        "Manual Only prompt",
+    )
 node._hmb_node_deleted = False
 node._hmb_rules_active = False
 node._hmb_capture_publications = False
@@ -32,36 +63,28 @@ node._hmb_prompt_preview_syncing = False
 node._hmb_prompt_preview_active = False
 node._hmb_prompt_preview_value = ""
 node._hmb_prompt_before_preview = "Manual Only prompt"
-agent.DataNode.__init__(node, name="agent_runtime_prompt_ui_isolation")
-node.add_parameter(
-    agent.Parameter(
-        name=agent._AGENT_PROMPT_INPUT_PARAMETER,
-        type="str",
-        default_value="Manual Only prompt",
-    )
-)
-node._ensure_hmb_shot_prompt_input()
 
 visible = "HMB_GP_Production\n\nIMAGE SOURCE:\n@image1 = Jett_02\n"
+visible_editor = visible.rstrip()
 # The private Prompt payload is deliberately opaque here. UI isolation must be
 # based on exact active bytes, not recognizable headers or content markers.
 machine = "PRIVATE RUNTIME PROMPT\nopaque authenticated bytes\n"
 node.set_parameter_value(agent._AGENT_SHOT_PROMPT_INPUT_PARAMETER, visible)
 node._hmb_shot_channel_subscription = lambda: {"enabled": True}
 node._refresh_routed_prompt_preview()
-assert node._native_parameter_value(agent._AGENT_PROMPT_INPUT_PARAMETER) == visible
+assert node._native_parameter_value(agent._AGENT_PROMPT_INPUT_PARAMETER) == visible_editor
 
 # Simulate a host graph/UI refresh reading the protected value during an Agent
 # run and echoing it back through either setter path. The public prompt must
 # remain the concise Prompt document.
 node._hmb_rules_active = True
 node._hmb_runtime_prompt = machine
-assert node.get_parameter_value(agent._AGENT_PROMPT_INPUT_PARAMETER) == visible
+assert node.get_parameter_value(agent._AGENT_PROMPT_INPUT_PARAMETER) == visible_editor
 node._hmb_native_prompt_read_active = True
 assert node.get_parameter_value(agent._AGENT_PROMPT_INPUT_PARAMETER) == machine
 node._hmb_native_prompt_read_active = False
 node.set_parameter_value(agent._AGENT_PROMPT_INPUT_PARAMETER, machine)
-assert node._native_parameter_value(agent._AGENT_PROMPT_INPUT_PARAMETER) == visible
+assert node._native_parameter_value(agent._AGENT_PROMPT_INPUT_PARAMETER) == visible_editor
 prompt_parameter = agent._parameter_by_name(node, agent._AGENT_PROMPT_INPUT_PARAMETER)
 assert node.before_value_set(prompt_parameter, machine) == visible
 
@@ -89,7 +112,7 @@ try:
     assert callable(protected_step)
     assert observed_native_prompts == [machine]
     assert node._hmb_native_prompt_read_active is False
-    assert node.get_parameter_value(agent._AGENT_PROMPT_INPUT_PARAMETER) == visible
+    assert node.get_parameter_value(agent._AGENT_PROMPT_INPUT_PARAMETER) == visible_editor
     native_wrapper.close()
 finally:
     if original_base_process is None:
@@ -99,7 +122,9 @@ finally:
 
 # An active private prompt is recognized only by exact runtime bytes, never by
 # content markers. A near miss must remain ordinary user-authored text.
-agent.DataNode.set_parameter_value(node, agent._AGENT_PROMPT_INPUT_PARAMETER, machine)
+# Simulate a retained-mode hydration write that has already bypassed callback
+# normalization by placing the raw value in the native parameter store.
+node.parameter_values[agent._AGENT_PROMPT_INPUT_PARAMETER] = machine
 stored_after_direct_base_set = node._native_parameter_value(
     agent._AGENT_PROMPT_INPUT_PARAMETER
 )
@@ -108,7 +133,7 @@ assert not node._matches_active_private_runtime_prompt(machine + "\n")
 assert not hasattr(agent, "_is_private_hmb_runtime_prompt")
 if node._matches_active_private_runtime_prompt(stored_after_direct_base_set):
     node._set_native_prompt_preview(visible, enabled=True)
-assert node._native_parameter_value(agent._AGENT_PROMPT_INPUT_PARAMETER) == visible
+assert node._native_parameter_value(agent._AGENT_PROMPT_INPUT_PARAMETER) == visible_editor
 assert machine not in node._hmb_prompt_before_preview
 
 node._clear_hmb_runtime_policy()

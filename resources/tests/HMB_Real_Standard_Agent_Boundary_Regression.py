@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import hashlib
 import os
 from pathlib import Path
 import sys
@@ -107,11 +108,45 @@ assert standard_module is not None
 original_resolve_cloud_api_key = standard_module.resolve_cloud_api_key
 original_require_model_invocation_sync = standard_module.require_model_invocation_sync
 original_try_throw_error = standard_module.try_throw_error
+original_native_process_step = base_agent._process
 
-canonical_prompt = prompt_module._build_data_only_prompt_package(
-    prompt_module._default_widget_state()
-)
+canonical_state = prompt_module._default_widget_state()
+visible_prompt = prompt_module._build_prompt_package(canonical_state)
+machine_prompt = prompt_module._build_data_only_prompt_package(canonical_state)
+
+
+class PairedPromptSource:
+    @staticmethod
+    def _hmb_agent_prompt_snapshot(prompt_value):
+        assert str(prompt_value) == visible_prompt
+        return {
+            "schema": module._PAIRED_PROMPT_SNAPSHOT_SCHEMA,
+            "version": module._PAIRED_PROMPT_SNAPSHOT_VERSION,
+            "generation": 1,
+            "visible_sha256": hashlib.sha256(
+                visible_prompt.encode("utf-8")
+            ).hexdigest(),
+            "machine_sha256": hashlib.sha256(
+                machine_prompt.encode("utf-8")
+            ).hexdigest(),
+            "machine_prompt": machine_prompt,
+        }
+
+    @staticmethod
+    def _hmb_agent_shot_context(_prompt_value):
+        return {}
+
+    @staticmethod
+    def _hmb_shot_channel_subscription():
+        return {"participant_kind": "prompt", "enabled": False}
+
+
 real_node = module.HMBAgentLibrary(name="hmb_real_standard_4x4_boundary")
+real_node._hmb_verified_prompt_source_node = PairedPromptSource()
+real_node._refresh_agent_shot_route = types.MethodType(
+    lambda self, **_kwargs: {"ok": True, "code": "ready", "changed": 0},
+    real_node,
+)
 real_node._has_canonical_hmb_prompt_connection = types.MethodType(
     lambda self: True,
     real_node,
@@ -122,20 +157,28 @@ real_node._model_access.raise_if_denied = lambda *args, **kwargs: None
 # seed only that authoritative input so this fixture matches current topology.
 real_node.set_parameter_value(
     module._AGENT_SHOT_PROMPT_INPUT_PARAMETER,
-    canonical_prompt,
+    visible_prompt,
 )
-stored_canonical_prompt = getattr(
+stored_visible_prompt = getattr(
     real_node.get_parameter_value(module._AGENT_SHOT_PROMPT_INPUT_PARAMETER),
     "value",
     None,
 )
-if stored_canonical_prompt is None:
-    stored_canonical_prompt = real_node.get_parameter_value(
+if stored_visible_prompt is None:
+    stored_visible_prompt = real_node.get_parameter_value(
         module._AGENT_SHOT_PROMPT_INPUT_PARAMETER
     )
-stored_canonical_prompt = str(stored_canonical_prompt)
+stored_visible_prompt = str(stored_visible_prompt)
+assert stored_visible_prompt == visible_prompt
+assert module._paired_machine_prompt(real_node, stored_visible_prompt) == machine_prompt
 real_node.set_parameter_value("additional_context", "CALLER_CONTEXT_MUST_RUN")
-real_node.set_parameter_value("rulesets", ["CALLER_RULE_MUST_RUN"])
+caller_ruleset_parameter = module.Parameter(
+    name="Behavior_1",
+    type="str",
+    default_value="CALLER_RULE_MUST_RUN",
+)
+real_node.get_parameter_by_name("rulesets").add_child(caller_ruleset_parameter)
+real_node.set_parameter_value("Behavior_1", "CALLER_RULE_MUST_RUN")
 real_node.set_parameter_value(
     "agent_memory",
     {"runs": [{"input": "before", "output": "before"}]},
@@ -162,18 +205,17 @@ def non_billable_model_step(self, agent, prompt):
         + "\nCALLER_CONTEXT_MUST_RUN\n\n"
         + module._AGENT_ENGLISH_OUTPUT_CONTRACT
     )
-    captured["public_prompt_prefix_exact"] = runtime_prompt.startswith(
-        stored_canonical_prompt.rstrip()
-        + "\n"
-        + module._RUNTIME_FX_SCOPE_HEADER
-        + "\n"
-    )
+    captured["paired_snapshot_exact"] = self._hmb_runtime_prompt == machine_prompt
     captured["caller_context_present"] = "CALLER_CONTEXT_MUST_RUN" in runtime_prompt
     captured["english_output_contract_count"] = runtime_prompt.count(
         module._AGENT_ENGLISH_OUTPUT_CONTRACT
     )
     captured["rule_counts"] = [len(ruleset.rules or []) for ruleset in rulesets]
     captured["ruleset_names"] = [str(ruleset.name or "") for ruleset in rulesets]
+    captured["caller_rule_present_during_native_call"] = any(
+        str(getattr(rule, "value", rule)) == "CALLER_RULE_MUST_RUN"
+        for rule in (rulesets[0].rules or [])
+    )
     captured["tool_count"] = len(getattr(task, "tools", ()) or ())
     captured["output_schema"] = getattr(task, "output_schema", None)
     captured["memory_runs"] = len(
@@ -192,7 +234,9 @@ try:
     standard_module.resolve_cloud_api_key = lambda: "non-billable-test-key"
     standard_module.require_model_invocation_sync = lambda *args, **kwargs: None
     standard_module.try_throw_error = lambda *args, **kwargs: None
-    real_node._process = types.MethodType(non_billable_model_step, real_node)
+    # Patch only the Standard Agent's billable processor so the HMB override
+    # still appends its private English-output contract before delegating the call.
+    base_agent._process = non_billable_model_step
 
     generator = real_node.process()
     protected_step = next(generator)
@@ -212,12 +256,14 @@ finally:
         original_require_model_invocation_sync
     )
     standard_module.try_throw_error = original_try_throw_error
+    base_agent._process = original_native_process_step
 
 assert captured["prompt_exact"] is True
-assert captured["public_prompt_prefix_exact"] is True
+assert captured["paired_snapshot_exact"] is True
 assert captured["caller_context_present"] is True
 assert captured["english_output_contract_count"] == 1
 assert captured["rule_counts"] == [1, 4, 4]
+assert captured["caller_rule_present_during_native_call"] is True
 assert captured["ruleset_names"][0] == "behavior_1"
 sealed_ruleset_names = captured["ruleset_names"][-2:]
 assert len(set(sealed_ruleset_names)) == 2
@@ -230,7 +276,9 @@ assert captured["output_schema"] is not None
 assert captured["memory_runs"] == 1
 assert real_node.parameter_output_values["output"] == "FINAL_SAFE_OUTPUT"
 assert captured["sealed_rule"] not in str(real_node.parameter_output_values)
-assert "CALLER_RULE_MUST_RUN" in str(real_node.parameter_output_values["agent"])
+# The caller rule reaches the native invocation above, but runtime rule state is
+# intentionally absent from the public Agent wrapper after final sanitization.
+assert "CALLER_RULE_MUST_RUN" not in str(real_node.parameter_output_values["agent"])
 assert all(
     name not in str(real_node.parameter_output_values["agent"])
     for name in sealed_ruleset_names

@@ -390,8 +390,9 @@ MODEL_DEFAULT_RESOLUTIONS = {
 MODEL_DURATION_CHOICES = {
     SEEDANCE_2_0_MODEL_ID: (-1, *range(4, 16)),
     SEEDANCE_2_0_FAST_MODEL_ID: (-1, *range(4, 16)),
-    # The 2.5 Broker contract is literal 4–30 seconds; smart-duration (-1)
-    # is not sent for this model.
+    # Ordinary 2.5 generation uses literal 4–30 seconds. Video Editing keeps
+    # the source video's duration and is narrowed to -1 by its task-specific
+    # synchronization and validation below.
     SEEDANCE_2_5_MODEL_ID: (*range(4, 31),),
 }
 
@@ -1663,6 +1664,13 @@ class _HMBAIBrokerBridge:
             raise _BrokerError(
                 self._safe_http_error_message(exc),
                 status_code=exc.code,
+                # A gateway/server failure does not prove that an idempotent
+                # create was never accepted upstream. Preserve the provisional
+                # client request ID and recover through Refresh instead of
+                # allowing a second create with a different key.
+                submission_outcome_unknown=bool(
+                    submission and 500 <= int(exc.code) <= 599
+                ),
             ) from exc
         except _BrokerError:
             raise
@@ -2699,7 +2707,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 default_value=5,
                 tooltip=(
                     "Duration: Seedance 2.0 supports 4-15 seconds or -1 smart "
-                    "duration; Seedance 2.5 uses an explicit 4-30 seconds."
+                    "duration; ordinary Seedance 2.5 generation uses 4-30 "
+                    "seconds. Video Editing is locked to -1 and preserves "
+                    "the source video's duration."
                 ),
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
                 # The static converter must accept the union so saved 2.0
@@ -5574,6 +5584,29 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "duration",
                     -1 if current_task == TASK_VIDEO_EDITING else 5,
                 )
+
+        # Video Editing inherits the source video's frame dimensions. Keep the
+        # authored control valid as soon as the task is selected instead of
+        # waiting for execution-time validation to reject a fixed ratio.
+        ratio_choices = (
+            ("adaptive",)
+            if model_id == SEEDANCE_2_5_MODEL_ID
+            and current_task == TASK_VIDEO_EDITING
+            else RATIOS
+        )
+        ratio_parameter = self.get_parameter_by_name("ratio")
+        if ratio_parameter is not None:
+            visible_ratio_choices = list(ratio_choices)
+            if (
+                ratio_parameter.ui_options.get("simple_dropdown")
+                != visible_ratio_choices
+            ):
+                ratio_parameter.ui_options = {
+                    **ratio_parameter.ui_options,
+                    "simple_dropdown": visible_ratio_choices,
+                }
+            if self.get_parameter_value("ratio") not in ratio_choices:
+                self.set_parameter_value("ratio", "adaptive")
         if migrated_retired_model:
             self._hmb_retired_model_migration_pending = False
         self._synchronize_model_output_contract(model_id)
@@ -6221,10 +6254,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "duration" in resolved
             and resolved.get("duration") not in reference_duration_choices
         ):
-            # Only may author Video Editing with its required smart duration
-            # (-1). Shot always executes Reference to Video, whose 2.5 duration
-            # is explicit. Normalize only this execution copy; returning to
-            # Only restores the untouched authored Task and duration controls.
+            # Only may author a task-specific smart duration (-1) for Video
+            # Editing or Extension. Shot always executes Reference to Video,
+            # whose 2.5 duration is explicit. Normalize only this execution
+            # copy; returning to Only restores the untouched authored controls.
             resolved["duration"] = 5
         resolved["first_frame"] = None
         resolved["last_frame"] = None
@@ -6417,11 +6450,19 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if duration not in duration_choices:
             maximum_duration = max(duration_choices)
             if task == TASK_VIDEO_EDITING:
-                raise ValueError("Video Editing duration must be -1.")
+                raise ValueError(
+                    "Video Editing duration must be -1 so the output matches "
+                    "the source video."
+                )
             if task == TASK_VIDEO_EXTENSION:
                 raise ValueError(
                     "Video Extension duration must be -1 or an integer from 4 "
                     "through 30."
+                )
+            if model_id == SEEDANCE_2_5_MODEL_ID:
+                raise ValueError(
+                    f"{model_name} duration must be an integer from 4 through "
+                    f"{maximum_duration}."
                 )
             raise ValueError(
                 f"{model_name} duration must be -1 or an integer from 4 through "

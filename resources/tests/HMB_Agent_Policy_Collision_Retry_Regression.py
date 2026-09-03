@@ -137,9 +137,14 @@ def drive(scripted_output: str):
         ),
         node,
     )
-    node.get_parameter_value = MethodType(
-        lambda self, _name: "VISIBLE SHOT PROMPT", node
-    )
+    def get_parameter_value(self, name):
+        if name == agent._AGENT_SHOT_PROMPT_INPUT_PARAMETER:
+            return "VISIBLE SHOT PROMPT"
+        if name == "rulesets":
+            return ["CALLER_RULE_MUST_RUN"]
+        return ""
+
+    node.get_parameter_value = MethodType(get_parameter_value, node)
     node._hide_hmb_policy_warning = MethodType(lambda self: None, node)
     node._set_agent_execution_phase = MethodType(lambda self, _phase: None, node)
     node._run_native_agent_once = MethodType(native_once, node)
@@ -175,12 +180,13 @@ try:
     assert policy_text["visible"] == [LONG_POLICY_DERIVED_RESULT]
     assert len(policy_text["injected_rulesets"]) == 1
     injected = policy_text["injected_rulesets"][0]
-    assert len(injected) == 2
-    assert injected[0]["name"] != injected[1]["name"]
-    assert injected[0]["rules"] == [
+    assert len(injected) == 3
+    assert injected[0] == "CALLER_RULE_MUST_RUN"
+    assert injected[1]["name"] != injected[2]["name"]
+    assert injected[1]["rules"] == [
         "project-1", "project-2", "project-3", "project-4"
     ]
-    assert injected[1]["rules"] == [
+    assert injected[2]["rules"] == [
         "shot-1", "shot-2", "shot-3", "shot-4"
     ]
 

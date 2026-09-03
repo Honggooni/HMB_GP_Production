@@ -43,9 +43,29 @@ except Exception:
     print("HMB Picker -> Prompt -> Agent live host regression: SKIP (host unavailable)")
     raise SystemExit(0)
 
+try:
+    from griptape_nodes.retained_mode.engine import current_engine
+except (AttributeError, ImportError):
+    current_engine = None
+
 import HMBAgentLibrary as agent_library
 import HMBPromptLibrary as prompt_library
 import HMBVideoPickerLibrary as picker_library
+
+
+def create_control_flow(name: str) -> ControlFlow:
+    """Bind modern ControlFlow instances to the active host engine."""
+    if current_engine is not None:
+        engine = current_engine()
+        try:
+            return ControlFlow(name=name, engine=engine)
+        except TypeError as modern_error:
+            # Older hosts own the engine implicitly and reject this keyword.
+            try:
+                return ControlFlow(name=name)
+            except TypeError:
+                raise modern_error
+    return ControlFlow(name=name)
 
 
 def register(flow: ControlFlow, node: Any) -> None:
@@ -200,7 +220,7 @@ def manual_surface(state: dict[str, Any]) -> dict[str, Any]:
 
 GriptapeNodes.EventManager().initialize_queue()
 stamp = time.time_ns()
-flow = ControlFlow(name=f"HMBPickerPromptAgentLive_{stamp}")
+flow = create_control_flow(name=f"HMBPickerPromptAgentLive_{stamp}")
 GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
 
 
