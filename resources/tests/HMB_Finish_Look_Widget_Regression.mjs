@@ -183,6 +183,41 @@ assert.deepEqual(preservedEn.finish_look,preservedKo.finish_look);
 assert.deepEqual(preservedEn.catalog,preservedKo.catalog);
 
 const defaultMarkup = widget.hmbRenderFinishLookWidget(defaultState);
+// Every numeric authoring control has exactly one discrete, localized slider.
+assert.deepEqual(Object.keys(widget.HMB_FINISH_LOOK_STEPS), Object.keys(widget.HMB_FINISH_LOOK_NUMBER_RULES));
+assert.equal((defaultMarkup.match(/<input[^>]*type="range"/g) || []).length, 22);
+assert.doesNotMatch(defaultMarkup, /<input[^>]*type="number"|data-finish-number/);
+let stepCount = 0;
+for (const [path, options] of Object.entries(widget.HMB_FINISH_LOOK_STEPS)) {
+  const [group, key] = path.split(".");
+  assert.ok(options.some((option) => option.value === defaultState.finish_look[group][key]), `${path} default retained`);
+  assert.equal(new Set(options.map((option) => option.ko)).size, options.length);
+  for (const [index, option] of options.entries()) {
+    stepCount += 1;
+    assert.ok(option.ko && option.en);
+    assert.equal(widget.hmbValidateFinishLookNumber(path, String(option.value)).ok, true);
+    assert.equal(widget.hmbFinishLookStepIndex(path, option.value), index);
+    assert.equal(widget.hmbFinishLookStepValue(path, String(index)), option.value);
+    const changed = structuredClone(defaultState);
+    changed.finish_look[group][key] = option.value;
+    const restored = widget.hmbFinishLookPublication(JSON.parse(JSON.stringify(changed)));
+    assert.equal(restored.finish_look[group][key], option.value, `${path} save/restore`);
+    for (const language of ["ko", "en"]) {
+      assert.equal(widget.hmbFinishLookStepLabel(path, option.value, language), option[language]);
+      const markup = widget.hmbRenderFinishLookWidget({ ...restored, language });
+      assert.ok(markup.includes(`aria-valuetext="${option[language]}"`));
+    }
+  }
+  for (const invalid of ["", "-1", "0.5", "Infinity", String(options.length)]) {
+    assert.equal(widget.hmbFinishLookStepValue(path, invalid), null);
+  }
+}
+// Legacy and remote values are not silently changed merely by rendering.
+const legacySteps = structuredClone(defaultState);
+legacySteps.finish_look.beauty.brightness = 1.234;
+assert.match(widget.hmbRenderFinishLookWidget(legacySteps), /기존 설정 ≈/);
+assert.equal(widget.hmbFinishLookPublication(legacySteps).finish_look.beauty.brightness, 1.234);
+console.log(`Finish Look discrete steps: PASS (22 controls, ${stepCount} stops, KO/EN, save/restore)`);
 assert.doesNotMatch(defaultMarkup, /<[^>]+data-video-drawer(?:\s|=)/);
 assert.equal((defaultMarkup.match(/data-concat-input=/g) || []).length, 0);
 assert.match(defaultMarkup, /data-workspace-mode="finish"/);
@@ -224,10 +259,10 @@ const remoteFilmMarkup = remoteMarkup.match(
   /data-finish-section="film"[\s\S]*?<\/main>/,
 )?.[0] || "";
 assert.match(remoteBeautyMarkup, /data-enable="beauty"[^>]* disabled/);
-assert.match(remoteBeautyMarkup, /data-finish-number="beauty\.saturation"[^>]* disabled/);
+assert.match(remoteBeautyMarkup, /data-finish-step="beauty\.saturation"[^>]* disabled/);
 assert.match(remoteFilmMarkup, /data-enable="film"[^>]* disabled/);
 assert.match(remoteFilmMarkup, /data-stock-trigger[^>]* disabled/);
-assert.match(remoteFilmMarkup, /data-finish-number="film\.scale_cc"[^>]* disabled/);
+assert.match(remoteFilmMarkup, /data-finish-step="film\.scale_cc"[^>]* disabled/);
 const remoteVideoInputTag = remoteMarkup.match(
   /<input[^>]*data-video-field="crop\.input"[^>]*>/,
 )?.[0] || "";

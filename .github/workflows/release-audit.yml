@@ -101,6 +101,7 @@ jobs:
           # Public CI verifies the exact bundled signed DAT and package boundary.
           $tests = @(
             "HMB_Finish_Look_Regression.py",
+            "HMB_Finish_Look_Steps_Regression.py",
             "HMB_Picker_Video_Tools_Regression.py",
             "HMB_Picker_Video_Tools_Source_Lifecycle_Regression.py",
             "HMB_Picker_Tools_Output_Path_Regression.py",

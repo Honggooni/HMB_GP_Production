@@ -50,6 +50,69 @@ export const HMB_FINISH_LOOK_NUMBER_RULES = Object.freeze({
   "film.vignette": Object.freeze({ min: 0, max: 1, step: 0.01, precision: 2 }),
 });
 
+// Discrete UI stops use representative values of the existing compiler contract.
+// The transport remains numeric; arbitrary numeric editing is not exposed.
+const strengthSteps = (values = [0, 0.05, 0.1, 0.2, 0.4, 0.8]) => steps(values,
+  ["끔", "거의 없음", "매우 약함", "약함", "보통", "강함"],
+  ["Off", "Almost none", "Very subtle", "Subtle", "Moderate", "Strong"]);
+function steps(values, ko, en) {
+  return Object.freeze(values.map((value, index) => Object.freeze({ value, ko: ko[index], en: en[index] })));
+}
+const exposureSteps = (print = false) => steps([-2, -1, -0.5, -0.25, -0.1, 0, 0.1, 0.25, 0.5, 1, 2],
+  print
+    ? ["매우 밝게", "많이 밝게", "보통 밝게", "약하게 밝게", "미세하게 밝게", "중립", "미세하게 어둡게", "약하게 어둡게", "보통 어둡게", "많이 어둡게", "매우 어둡게"]
+    : ["매우 어둡게", "많이 어둡게", "보통 어둡게", "약하게 어둡게", "미세하게 어둡게", "중립", "미세하게 밝게", "약하게 밝게", "보통 밝게", "많이 밝게", "매우 밝게"],
+  print
+    ? ["Very light", "Much lighter", "Moderately lighter", "Slightly lighter", "Very slightly lighter", "Neutral", "Very slightly darker", "Slightly darker", "Moderately darker", "Much darker", "Very dark"]
+    : ["Very dark", "Much darker", "Moderately darker", "Slightly darker", "Very slightly darker", "Neutral", "Very slightly brighter", "Slightly brighter", "Moderately brighter", "Much brighter", "Very bright"]);
+const printerSteps = (lowKo, highKo, lowEn, highEn) => steps([17, 21, 23, 24, 25, 26, 27, 29, 33],
+  [`${lowKo} 강`, `${lowKo} 중`, `${lowKo} 약`, `${lowKo} 미세`, "중립", `${highKo} 미세`, `${highKo} 약`, `${highKo} 중`, `${highKo} 강`],
+  [`Strong ${lowEn}`, `Moderate ${lowEn}`, `Subtle ${lowEn}`, `Very subtle ${lowEn}`, "Neutral", `Very subtle ${highEn}`, `Subtle ${highEn}`, `Moderate ${highEn}`, `Strong ${highEn}`]);
+export const HMB_FINISH_LOOK_STEPS = Object.freeze({
+  "beauty.soften_shadows": steps([-0.5, -0.1, 0, 0.11, 0.2, 0.5],
+    ["그림자 강하게", "그림자 선명하게", "중립", "살짝 부드럽게", "보통 부드럽게", "많이 부드럽게"],
+    ["Strong definition", "Moderate definition", "Neutral", "Gently softened", "Moderately softened", "Strongly softened"]),
+  "beauty.shadow_threshold": steps([0.1, 0.27, 0.6], ["낮음", "보통", "넓은 범위"], ["Low", "Moderate", "Broad range"]),
+  "beauty.saturation": steps([-1.5, -0.8, -0.2, 0, 0.8, 0.95, 1, 1.05, 1.2],
+    ["강한 색 반전", "색 반전", "약한 색 반전", "흑백", "채도 감소", "채도 약간 감소", "중립", "채도 약간 증가", "채도 증가"],
+    ["Strong inverted chroma", "Inverted chroma", "Subtle inverted chroma", "Monochrome", "Reduced saturation", "Slightly reduced", "Neutral", "Slightly increased", "Increased saturation"]),
+  "beauty.brightness": steps([0.5, 0.8, 1, 1.2, 1.5], ["많이 어둡게", "어둡게", "중립", "밝게", "많이 밝게"], ["Much darker", "Darker", "Neutral", "Brighter", "Much brighter"]),
+  "beauty.glow_brightness": strengthSteps(),
+  "beauty.glow_threshold": steps([0, 0.2, 0.5, 0.8], ["검정 외 전체", "낮음", "보통", "높음"], ["All non-black areas", "Low", "Moderate", "High"]),
+  "beauty.glow_width": steps([0, 8, 16, 32, 64], ["최소", "좁게", "기본", "넓게", "매우 넓게"], ["Minimum", "Narrow", "Default", "Wide", "Very wide"]),
+  "beauty.soft_focus": strengthSteps(),
+  "beauty.blur_amount": strengthSteps(),
+  "beauty.pore_size": steps([0, 0.05, 0.1, 0.2, 0.4, 0.8], ["끔", "아주 작은 결", "작은 결", "보통 결", "큰 결", "아주 큰 결"], ["Off", "Very fine texture", "Fine texture", "Medium texture", "Coarse texture", "Very coarse texture"]),
+  "beauty.reduce_shine": strengthSteps(),
+  "film.scale_cc": steps([0, 0.1, 0.3, 0.6, 0.8, 1], ["끔", "매우 약함", "약함", "보통", "강함", "매우 강함"], ["Off", "Very subtle", "Subtle", "Moderate", "Strong", "Very strong"]),
+  "film.printer_light_r": printerSteps("빨강", "시안", "red", "cyan"),
+  "film.printer_light_g": steps([17, 21, 23, 25, 27, 29, 33],
+    ["초록 강", "초록 중", "초록 약", "중립", "마젠타 약", "마젠타 중", "마젠타 강"],
+    ["Strong green", "Moderate green", "Subtle green", "Neutral", "Subtle magenta", "Moderate magenta", "Strong magenta"]),
+  "film.printer_light_b": printerSteps("파랑", "노랑", "blue", "yellow"),
+  "film.input_gamma": steps([0.6, 0.9, 1.2, 1.5, 1.8], ["매우 낮음", "낮음", "기본", "높음", "매우 높음"], ["Very low", "Low", "Default", "High", "Very high"]),
+  "film.output_gamma": steps([1.4, 1.8, 2.2, 2.6, 3], ["매우 낮음", "낮음", "기본", "높음", "매우 높음"], ["Very low", "Low", "Default", "High", "Very high"]),
+  "film.negative_exposure": exposureSteps(),
+  "film.print_exposure": exposureSteps(true),
+  "film.glow_brightness": strengthSteps(),
+  "film.soft_focus": strengthSteps(),
+  "film.vignette": strengthSteps(),
+});
+
+export function hmbFinishLookStepIndex(path, value) {
+  const options = HMB_FINISH_LOOK_STEPS[path];
+  if (!options) return -1;
+  return options.reduce((best, option, index) => (
+    Math.abs(option.value - Number(value)) < Math.abs(options[best].value - Number(value)) ? index : best
+  ), 0);
+}
+
+export function hmbFinishLookStepValue(path, index) {
+  if (String(index).trim() === "") return null;
+  const number = Number(index);
+  return Number.isInteger(number) ? HMB_FINISH_LOOK_STEPS[path]?.[number]?.value ?? null : null;
+}
+
 const HMB_TEXT = Object.freeze({
   en: Object.freeze({
     subtitle: "Character Beauty and photographic filter application",
@@ -640,11 +703,19 @@ export function hmbFinishLookNonShotStateFingerprint(input) {
   return JSON.stringify(rest);
 }
 
-function hmbNumericField(path, label, value, disabled = false) {
-  const rule = HMB_FINISH_LOOK_NUMBER_RULES[path];
-  const min = rule.min === null ? "" : ` min="${rule.min}"`;
-  const max = rule.max === null ? "" : ` max="${rule.max}"`;
-  return `<label class="hmb-finish-look__field"><span>${hmbEscape(label)}</span><input type="number" data-finish-number="${hmbEscape(path)}" value="${hmbUiNumber(value, rule.precision)}" step="${rule.step}"${min}${max}${disabled ? " disabled" : ""}></label>`;
+export function hmbFinishLookStepLabel(path, value, language = "ko") {
+  const option = HMB_FINISH_LOOK_STEPS[path][hmbFinishLookStepIndex(path, value)];
+  const text = option[language === "ko" ? "ko" : "en"];
+  // Do not silently quantize an existing saved/remote setting just by viewing it.
+  return option.value === Number(value) ? text : `${language === "ko" ? "기존 설정 ≈" : "Existing setting ≈"} ${text}`;
+}
+
+function hmbStepField(path, label, value, disabled, language) {
+  const options = HMB_FINISH_LOOK_STEPS[path];
+  const index = hmbFinishLookStepIndex(path, value);
+  const text = hmbFinishLookStepLabel(path, value, language);
+  const lang = language === "ko" ? "ko" : "en";
+  return `<label class="hmb-finish-look__field"><span>${hmbEscape(label)}</span><output data-step-label="${hmbEscape(path)}">${hmbEscape(text)}</output><input type="range" data-finish-step="${hmbEscape(path)}" value="${index}" min="0" max="${options.length - 1}" step="1" aria-label="${hmbEscape(label)}" aria-valuetext="${hmbEscape(text)}"${disabled ? " disabled" : ""}><span class="hmb-finish-look__step-ends" aria-hidden="true"><small>${hmbEscape(options[0][lang])}</small><small>${hmbEscape(options.at(-1)[lang])}</small></span></label>`;
 }
 
 function hmbStockDropdown(kind, label, value, options, disabled, note = "") {
@@ -665,11 +736,13 @@ function hmbRenderFinishLook(state) {
   const beautyDisabled = !beauty.enabled || remoteLocked;
   const filmDisabled = !film.enabled || remoteLocked;
   const reversal = state.catalog.reversal.includes(film.print_film);
+  const hmbNumericField = (path, label, value, disabled) => hmbStepField(path, label, value, disabled, state.language);
   const headerMark = "FL";
   const headerTitle = "HMB Finish Look";
   const headerSubtitle = t.subtitle;
   return `
     <style>
+      .hmb-finish-look__field output{color:var(--hmb-shot-soft);font-size:11px;font-weight:750;min-height:16px;overflow-wrap:anywhere}.hmb-finish-look__field input[type="range"]{width:100%;height:26px;margin:0;cursor:ew-resize;accent-color:var(--hmb-shot-accent);touch-action:pan-y}.hmb-finish-look__field .hmb-finish-look__step-ends{display:flex;justify-content:space-between;gap:8px;color:var(--hmb-muted);font-size:8px}.hmb-finish-look__step-ends small:last-child{text-align:right}.hmb-finish-look__field:has(input:disabled) output{opacity:.42}
       .hmb-finish-look{--jewel-pink:#F472B6;--jewel-blue:#3B82F6;--jewel-green:#10B981;--jewel-purple:#8B5CF6;--jewel-yellow:#EAB308;--hmb-bg:#090c16;--hmb-panel:#0f1726;--hmb-panel-2:#111c2d;--hmb-line:#263b58;--hmb-text:#e8eef7;--hmb-muted:#91a2b7;--hmb-accent:#3B82F6;--hmb-soft:#DBEAFE;position:relative;width:100%;height:100%;min-height:720px;overflow:hidden;container-type:inline-size;border:1px solid rgba(59,130,246,.52);border-radius:11px;background:radial-gradient(circle at 8% -24%,rgba(59,130,246,.2),transparent 42%),linear-gradient(180deg,#0b1020,var(--hmb-bg));color:var(--hmb-text);box-shadow:inset 0 1px 0 rgba(255,255,255,.035),0 8px 24px rgba(0,0,0,.24);font-family:"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif;box-sizing:border-box;user-select:none}
       .hmb-finish-look *{box-sizing:border-box;min-width:0}.hmb-finish-look [hidden]{display:none!important}.hmb-finish-look__scroll{height:100%;min-height:720px;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding-bottom:12px}.hmb-finish-look[data-dropdown-open="true"] .hmb-finish-look__scroll{padding-bottom:230px}
       .hmb-finish-look__topbar{position:sticky;z-index:30;top:0;display:flex;align-items:center;height:68px;min-height:68px;gap:16px;padding:0 16px;border-bottom:1px solid rgba(59,130,246,.35);background:linear-gradient(90deg,rgba(30,58,96,.98),rgba(9,12,22,.98))}.hmb-finish-look__mark{flex:0 0 30px;width:30px;height:30px;display:grid;place-items:center;border:1px solid rgba(59,130,246,.65);border-radius:8px;background:rgba(59,130,246,.13);color:#93c5fd;font-size:9px;font-weight:950;letter-spacing:.06em}.hmb-finish-look__heading{display:flex;flex:1 1 auto;flex-direction:column;gap:2px;overflow:hidden}.hmb-finish-look__heading b,.hmb-finish-look__heading span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hmb-finish-look__heading b{font-size:15px}.hmb-finish-look__heading span{color:var(--hmb-muted);font-size:9px}.hmb-finish-look__remote-badge{padding:4px 7px;border:1px solid rgba(244,114,182,.65);border-radius:999px;background:rgba(190,24,93,.25);color:#fbcfe8;font-size:8px;font-weight:950;letter-spacing:.12em}.hmb-finish-look__language{height:30px;min-width:58px;padding:0 10px;border:1px solid rgba(96,165,250,.55);border-radius:7px;background:#101a2a;color:#bfdbfe;font-size:12px;font-weight:800;cursor:pointer}
@@ -934,20 +1007,25 @@ export default function HMBFinishLookLibraryWidget(container, props) {
         mutate((next) => { next.finish_look[group].enabled = Boolean(toggle.checked); }, true);
       });
     }
-    for (const input of container.querySelectorAll?.("[data-finish-number]") || []) {
+    for (const input of container.querySelectorAll?.("[data-finish-step]") || []) {
+      const path = input.getAttribute("data-finish-step");
+      const preview = () => {
+        if (input.disabled || state.remote_connected) return null;
+        const value = hmbFinishLookStepValue(path, input.value);
+        if (value === null) return null;
+        const text = hmbFinishLookStepLabel(path, value, state.language);
+        input.setAttribute?.("aria-valuetext", text);
+        const output = container.querySelector?.(`[data-step-label="${path}"]`);
+        if (output) output.textContent = text;
+        return value;
+      };
+      // Dragging is local-only. Commit once on release/keyboard change, without remounting.
+      bind(input, "input", preview);
       bind(input, "change", () => {
-        if (state.remote_connected) return;
-        const path = input.getAttribute("data-finish-number");
-        const validation = hmbValidateFinishLookNumber(path, input.value);
-        if (!validation.ok) {
-          input.setAttribute?.("aria-invalid", "true");
-          input.value = hmbUiNumber(hmbGetPath(state.finish_look, path), HMB_FINISH_LOOK_NUMBER_RULES[path].precision);
-          hmbSetStatus(container, validation.error, "error");
-          return;
-        }
+        const value = preview();
+        if (value === null || hmbGetPath(state.finish_look, path) === value) return;
         const previous = cloneState();
-        hmbSetPath(state.finish_look, path, validation.value);
-        input.removeAttribute?.("aria-invalid");
+        hmbSetPath(state.finish_look, path, value);
         publish(previous, false);
       });
     }
