@@ -84,6 +84,15 @@ jobs:
           }
       - name: Install pinned direct dependencies
         run: python -m pip install "Pillow==12.3.0" "imageio-ffmpeg==0.6.0" "httpx==0.28.1" "tos==2.9.2"
+      - name: Install pinned media probe for real stream-copy regressions
+        shell: pwsh
+        run: |
+          # imageio-ffmpeg supplies FFmpeg, but not the FFprobe stream metadata
+          # required to test lossless stream copy without mocking the media tool.
+          choco install ffmpeg --version=8.1.1 --yes --no-progress --limit-output
+          if ($LASTEXITCODE -ne 0) { throw "Could not install the CI media tools." }
+          ffprobe -version
+          if ($LASTEXITCODE -ne 0) { throw "FFprobe is unavailable in the CI PATH." }
       - name: Python release regressions
         shell: pwsh
         env:
