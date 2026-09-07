@@ -175,6 +175,11 @@ assert model_usage["model_ids"] == [
     "gtc_gemini_2_5_pro",
     "gtc_gemini_2_5_flash",
     "gtc_gemini_2_5_flash_lite",
+    "gtc_gpt_5_6_sol",
+    "gtc_gpt_5_6_terra",
+    "gtc_gpt_5_6_luna",
+    "gtc_gpt_5_5",
+    "gtc_gpt_5_4",
     "gtc_gpt_5_2",
     "gtc_gpt_5_2_chat",
     "gtc_gpt_5_1",
@@ -204,7 +209,7 @@ catalog_model_ids = {
     for provider in model_catalog["providers"].values()
     for model_id in provider["models"]
 }
-assert len(catalog_model_ids) == 30
+assert len(catalog_model_ids) == 35
 assert catalog_model_ids == set(model_usage["model_ids"])
 
 # Direct server-policy disclosure is the only text-content guard retained.

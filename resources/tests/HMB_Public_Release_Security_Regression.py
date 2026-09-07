@@ -276,10 +276,10 @@ finally:
     common._verify_agent_policy_signature = real_signature_verifier
 
 agent_model_ids = builder.node_model_usage_ids(manifest, "HMBAgentLibrary")
-assert len(agent_model_ids) == 30
+assert len(agent_model_ids) == 35
 assert len(agent_model_ids) == len(set(agent_model_ids))
 catalog_model_ids = builder.library_model_catalog_ids(manifest)
-assert len(catalog_model_ids) == 30
+assert len(catalog_model_ids) == 35
 assert set(agent_model_ids) == set(catalog_model_ids)
 assert (
     builder.library_model_catalog_contract_sha256(manifest)

@@ -305,6 +305,7 @@ jobs:
             "- Adds independent Picker Concatenate and Video Crop tools with individual cross-Shot card dragging, ordered edit queues, and first-input source-folder output paths.",
             "- Concatenate captures the first input card's Shot at Run and adds the completed result there only on explicit request; Crop retains its own single input and work-Shot destination.",
             "- Includes Shot-bound Finish Look and preserves exact Shot routing and safe Seedance gateway/retrieval recovery.",
+            "- Replaces all 22 Finish Look numeric fields with localized discrete step sliders; dragging previews locally and commits on release while preserving Shot binding and remote locks.",
             "- Includes the manifest-verified runtime installer and exact SHA256 checksum.",
             "",
             "Close Griptape completely before running the included installer."
