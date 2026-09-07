@@ -31,7 +31,8 @@ with patch.object(picker, "_request_parameter_value", return_value=False), \
      patch.object(picker, "_external_media_url", side_effect=lambda path: Path(path).as_uri()), \
      patch.object(picker, "_video_asset_thumbnail_url", return_value=("", "")), \
      tempfile.TemporaryDirectory(prefix="hmb-concat-result-shot-") as temporary:
-    folder = Path(temporary)
+    # Match the canonical paths returned by the media service on Windows CI.
+    folder = Path(temporary).resolve()
     source = folder / "source.mp4"
     subprocess.run([media._find_ffmpeg(), "-v", "error", "-f", "lavfi", "-i",
         "color=c=red:s=96x64:r=24:d=0.5", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)], check=True, timeout=20)

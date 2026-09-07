@@ -39,7 +39,8 @@ with patch.object(picker, "_request_parameter_value", return_value=False), \
      patch.object(picker, "_external_media_url", side_effect=lambda path: Path(path).as_uri()), \
      patch.object(picker, "_video_asset_thumbnail_url", return_value=("", "")), \
      tempfile.TemporaryDirectory(prefix="hmb-picker-destinations-") as temporary:
-    folder = Path(temporary)
+    # Match the canonical paths returned by the media service on Windows CI.
+    folder = Path(temporary).resolve()
     source_dirs = [folder / "first imported", folder / "other shot"]
     project = folder / "project copies"
     custom = folder / "custom output"

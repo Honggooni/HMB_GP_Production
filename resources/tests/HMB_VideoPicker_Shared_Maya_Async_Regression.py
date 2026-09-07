@@ -99,7 +99,8 @@ def finish(worker, release):
 
 
 with tempfile.TemporaryDirectory(prefix="hmb-shared-maya-") as temp:
-    root = Path(temp)
+    # Maya staging normalizes paths; Windows CI TEMP may use an 8.3 alias.
+    root = Path(temp).resolve()
     scene_a, scene_b = root / "scene_A.ma", root / "scene_B.ma"
     scene_a.write_text("// Maya staging A", encoding="utf-8")
     scene_b.write_text("// Maya staging B", encoding="utf-8")

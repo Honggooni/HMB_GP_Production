@@ -66,7 +66,10 @@ with patch.object(picker, "_request_parameter_value", return_value=False), \
      patch.object(picker, "_external_media_url", side_effect=lambda p: Path(p).as_uri()), \
      patch.object(picker, "_video_asset_thumbnail_url", return_value=("", "")), \
      tempfile.TemporaryDirectory(prefix="hmb-tools-lifecycle-") as temporary:
-    folder = Path(temporary)
+    # Windows runners may expose TEMP through an 8.3 alias or junction. The
+    # native chooser and media service return canonical paths, so author the
+    # fixture in that same spelling without weakening its exact-path checks.
+    folder = Path(temporary).resolve()
     paths = []
     for index, color in enumerate(("red", "green", "blue")):
         source = folder / f"source-{index}.mp4"
