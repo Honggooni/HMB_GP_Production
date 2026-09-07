@@ -5,6 +5,7 @@ import base64
 import binascii
 import ctypes
 import hashlib
+import hmac
 import importlib
 import inspect
 import ipaddress
@@ -29,7 +30,7 @@ from copy import deepcopy
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import quote, urljoin, urlparse
 from uuid import uuid4
 
@@ -459,6 +460,9 @@ SHOT_IMAGE_INPUT_PARAMETER = "SHOT_IMAGE_IN"
 SHOT_VIDEO_INPUT_PARAMETER = "SHOT_VIDEO_IN"
 SHOT_ASSET_INPUT_PARAMETER = "SHOT_ASSET_IN"
 SHOT_PICKER_INPUT_PARAMETER = "SHOT_PICKER_IN"
+SHOT_FINISH_LOOK_INPUT_PARAMETER = "SHOT_FINISH_LOOK_IN"
+FINISH_LOOK_SHOT_SNAPSHOT_SCHEMA = "hmb-finish-look-shot-snapshot"
+FINISH_LOOK_SHOT_SNAPSHOT_VERSION = 1
 SHOT_PICKER_LEGACY_JSON_MAX_BYTES = 1024 * 1024
 SHOT_AUTOCLAIM_ENABLED_PARAMETER = "HMB_SHOT_AUTOCLAIM_ENABLED"
 SHOT_SELECTOR_PARAMETER = "shot_selector"
@@ -1521,12 +1525,15 @@ class _HMBAIBrokerBridge:
         return cls._account_from_mapping(value.get("user"))
 
     @classmethod
-    def _safe_http_error_message(cls, exc: urllib.error.HTTPError) -> str:
+    def _safe_http_error_message(
+        cls, exc: urllib.error.HTTPError, *, body: bytes | None = None
+    ) -> str:
         status_code = int(getattr(exc, "code", 0) or 0)
-        try:
-            body = exc.read(cls._MAX_ERROR_CLASSIFICATION_BYTES + 1)
-        except Exception:
-            body = b""
+        if body is None:
+            try:
+                body = exc.read(cls._MAX_ERROR_CLASSIFICATION_BYTES + 1)
+            except Exception:
+                body = b""
         if len(body) > cls._MAX_ERROR_CLASSIFICATION_BYTES:
             body = b""
         try:
@@ -1647,22 +1654,41 @@ class _HMBAIBrokerBridge:
                 raise _BrokerAuthenticationError(
                     "FN AI Broker login has expired.", status_code=401
                 ) from exc
-            if exc.code == 410 and not submission:
+            error_body: bytes | None = None
+            if (
+                not submission
+                and method.upper() == "POST"
+                and re.fullmatch(r"/api/v1/jobs/[^/]+/refresh", path)
+                and (exc.code == 410 or 500 <= int(exc.code) <= 599)
+            ):
+                # Some Broker builds return the durable task's failure inside
+                # HTTP 502. A status lookup is not a create request: consume an
+                # explicit terminal job record, not the gateway code alone.
+                # The caller still verifies exact/canonical task identity.
+                _broker_require_exact_response_url(exc, request.full_url)
                 try:
-                    expired_result = json.loads(
-                        exc.read(self._MAX_ERROR_CLASSIFICATION_BYTES) or b"{}"
-                    )
-                except (UnicodeError, json.JSONDecodeError):
-                    expired_result = {}
+                    error_body = exc.read(self._MAX_ERROR_CLASSIFICATION_BYTES + 1)
+                    if len(error_body) > self._MAX_ERROR_CLASSIFICATION_BYTES:
+                        error_body = b""
+                    terminal_result = json.loads(error_body or b"{}")
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    terminal_result = {}
+                terminal_id = str(
+                    terminal_result.get("job_id")
+                    or terminal_result.get("id")
+                    or terminal_result.get("task_id")
+                    or ""
+                ).strip() if isinstance(terminal_result, dict) else ""
                 if (
-                    isinstance(expired_result, dict)
-                    and str(expired_result.get("status") or "").strip().lower()
-                    in BROKER_EXPIRED_STATUSES
+                    isinstance(terminal_result, dict)
+                    and _TASK_ID_PATTERN.fullmatch(terminal_id) is not None
+                    and str(terminal_result.get("status") or "").strip().lower()
+                    in (BROKER_FAILURE_STATUSES | BROKER_CANCELLED_STATUSES | BROKER_EXPIRED_STATUSES)
                 ):
-                    expired_result["_http_status"] = 410
-                    return expired_result
+                    terminal_result["_http_status"] = int(exc.code)
+                    return terminal_result
             raise _BrokerError(
-                self._safe_http_error_message(exc),
+                self._safe_http_error_message(exc, body=error_body),
                 status_code=exc.code,
                 # A gateway/server failure does not prove that an idempotent
                 # create was never accepted upstream. Preserve the provisional
@@ -2266,6 +2292,25 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 hide=True,
                 hide_label=True,
                 hide_property=True,
+                ui_options=dict(hidden_shot_input_ui),
+            )
+        )
+        self.add_parameter(
+            ParameterDict(
+                name=SHOT_FINISH_LOOK_INPUT_PARAMETER,
+                type="dict",
+                input_types=["dict"],
+                accept_any=False,
+                default_value={},
+                tooltip=(
+                    "Hidden exact Finish Look dependency for the selected Shot. "
+                    "The public Agent prompt route remains unchanged."
+                ),
+                allowed_modes={ParameterMode.INPUT},
+                hide=True,
+                hide_label=True,
+                hide_property=True,
+                serializable=False,
                 ui_options=dict(hidden_shot_input_ui),
             )
         )
@@ -3927,6 +3972,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         status = str(checkpoint.get("status") or "").strip().lower()
         stage = str(checkpoint.get("stage") or "").strip().lower()
         provider_response = self.parameter_output_values.get("provider_response")
+        if stage != "local_succeeded" and (
+            status == "submission_unknown"
+            or (
+                isinstance(provider_response, dict)
+                and str(provider_response.get("id") or "") == checkpoint["task_id"]
+                and provider_response.get("resubmit_allowed") is False
+                and provider_response.get("error_code")
+                in {"submission_unknown", "provider_overdue"}
+            )
+        ):
+            return True
         terminal = bool(
             checkpoint.get("terminal") is True
             or status in TERMINAL_FAILURE_STATUSES
@@ -3975,8 +4031,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._restore_generation_recovery_preview()
         raise RuntimeError(
             "A previously submitted Seedance task still requires confirmation. "
-            f"Task ID: {checkpoint['task_id']}. Use the central Existing Task "
-            "Result button; a replacement render was not submitted."
+            f"Task ID: {checkpoint['task_id']}. Click Status > Refresh / Retrieve "
+            "Result (or the central Existing Task Result button) to resolve this "
+            "same request first. A confirmed failed/cancelled/expired task or a "
+            "successfully retrieved video allows the next explicit Run. "
+            "A replacement render was not submitted."
         )
 
     def _request_existing_generation_refresh(self) -> None:
@@ -6113,6 +6172,93 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise RuntimeError(f"Seedance {expected_kind} source identity is invalid.")
         return subscription
 
+    @staticmethod
+    def _validate_finish_look_shot_snapshot(
+        value: Any,
+        *,
+        expected_subscription: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Validate the exact post-Agent finishing sidecar before submission."""
+
+        required = {
+            "schema",
+            "version",
+            "channel_uuid",
+            "shot_uuid",
+            "shot_number",
+            "shot_name",
+            "generation",
+            "finish_look_sha256",
+            "state_sha256",
+            "finish_look_out",
+        }
+        if not isinstance(value, dict) or set(value) != required:
+            raise RuntimeError("Seedance Finish Look snapshot shape is invalid.")
+        if (
+            value.get("schema") != FINISH_LOOK_SHOT_SNAPSHOT_SCHEMA
+            or value.get("version") != FINISH_LOOK_SHOT_SNAPSHOT_VERSION
+        ):
+            raise RuntimeError("Seedance Finish Look snapshot version is invalid.")
+        if (
+            str(value.get("channel_uuid") or "")
+            != str(expected_subscription.get("channel_uuid") or "")
+            or str(value.get("shot_uuid") or "")
+            != str(expected_subscription.get("shot_uuid") or "")
+            or value.get("shot_number") != expected_subscription.get("shot_number")
+            or value.get("shot_name") != expected_subscription.get("shot_name")
+        ):
+            raise RuntimeError("Seedance Finish Look snapshot does not match the selected Shot.")
+        generation = value.get("generation")
+        instruction = value.get("finish_look_out")
+        finish_sha256 = str(value.get("finish_look_sha256") or "").casefold()
+        state_sha256 = str(value.get("state_sha256") or "").casefold()
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or not 1 <= generation <= (1 << 53) - 1
+            or not isinstance(instruction, str)
+            or re.fullmatch(r"[0-9a-f]{64}", finish_sha256) is None
+            or re.fullmatch(r"[0-9a-f]{64}", state_sha256) is None
+            or not hmac.compare_digest(
+                finish_sha256,
+                hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+            )
+        ):
+            raise RuntimeError("Seedance Finish Look snapshot integrity is invalid.")
+        return {
+            **value,
+            "finish_look_sha256": finish_sha256,
+            "state_sha256": state_sha256,
+        }
+
+    @staticmethod
+    def _compose_finish_look_prompt(base_prompt: Any, finish_look: Any) -> str:
+        """Append exact Finish Look bytes after Agent output, then final guards."""
+
+        base = str(base_prompt or "").strip()
+        finish = str(finish_look or "")
+        if not finish:
+            return base
+        return (
+            "HMB RESOLVED SHOT INSTRUCTION\n"
+            f"{base}\n\n"
+            "HMB FINISH LOOK — APPLY AFTER THE RESOLVED GLOBAL LOOK (VERBATIM)\n"
+            f"{finish}\n\n"
+            "HMB FINAL RENDER RULES\n"
+            "Apply the verbatim Finish Look block after the resolved Global Look and before "
+            "final rendering. It may affect only Character Beauty and Filter Application. "
+            "Apply Character Beauty exclusively to character-owned surfaces, including the "
+            "face, body, hair, costume, and character materials; never apply it to the "
+            "background, environment, sky, ground, set dressing, independent props, FX, or "
+            "the camera image as a whole. Filter Application may affect the completed frame "
+            "only through its explicitly authored film-stock color and tonal response, "
+            "printer-light balance, gamma/exposure response, highlight glow, soft-focus "
+            "diffusion, and vignette. It must not alter "
+            "character identity, design, geometry, camera, framing, animation, timing, FX "
+            "placement, environment content, or the Global Look's lighting direction and "
+            "composition. Do not introduce or simulate film grain."
+        )
+
     def _resolve_exact_shot_generation_inputs(
         self,
         params: dict[str, Any],
@@ -6246,8 +6392,56 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 f"at most {video_limit}. No request was submitted."
             )
 
+        finish_look_out = ""
+        finish_node = self._exact_incoming_source(
+            SHOT_FINISH_LOOK_INPUT_PARAMETER,
+            "SHOT_FINISH_LOOK_OUT",
+            required=False,
+        )
+        if finish_node is not None:
+            finish_subscription = self._direct_source_subscription(
+                finish_node,
+                "finish_look",
+            )
+            if (
+                finish_subscription.get("channel_uuid") != subscription["channel_uuid"]
+                or finish_subscription.get("shot_uuid") != subscription["shot_uuid"]
+                or finish_subscription.get("shot_number") != subscription["shot_number"]
+                or finish_subscription.get("shot_name") != subscription["shot_name"]
+            ):
+                raise RuntimeError(
+                    "Seedance Finish Look source does not match the selected Shot identity."
+                )
+            snapshot_api = getattr(
+                finish_node,
+                "_hmb_finish_look_shot_snapshot",
+                None,
+            )
+            if not callable(snapshot_api):
+                raise RuntimeError(
+                    "Seedance Finish Look source does not expose its atomic snapshot API."
+                )
+            routed_snapshot = self.get_parameter_value(
+                SHOT_FINISH_LOOK_INPUT_PARAMETER
+            )
+            try:
+                finish_snapshot = snapshot_api(
+                    routed_snapshot if routed_snapshot else None
+                )
+            except TypeError:
+                finish_snapshot = snapshot_api()
+            finish_snapshot = self._validate_finish_look_shot_snapshot(
+                finish_snapshot,
+                expected_subscription=subscription,
+            )
+            finish_look_out = finish_snapshot["finish_look_out"]
+
         resolved = dict(params)
         resolved["prompt"] = str(params.get("prompt") or "")
+        # Keep the Agent prompt untouched through normal validation. The exact
+        # Finish Look sidecar is composed only at Broker payload construction,
+        # after the upstream Agent has published its final text.
+        resolved["_hmb_finish_look_out"] = finish_look_out
         resolved[TASK_PARAMETER] = TASK_REFERENCE_TO_VIDEO
         reference_duration_choices = MODEL_DURATION_CHOICES.get(model_id, ())
         if (
@@ -7585,6 +7779,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         """Map the HMB media contract to the FN AI Broker Seedance schema."""
         self._validate_parameters(params)
         self._validate_broker_model(params.get("model_id"))
+        submitted_prompt = self._compose_finish_look_prompt(
+            params.get("prompt"),
+            params.get("_hmb_finish_look_out"),
+        )
         # Seedance 2.5 uses the provider's canonical resolution enum.  Keeping
         # the legacy 720-pixel dimensions here produced contradictory requests
         # such as ``quality=1080p`` beside ``resolution=1280x720``.  Aspect
@@ -7605,7 +7803,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         payload: dict[str, Any] = {
             "provider": "volcengine_ark",
             "model": params["model_id"],
-            "prompt": params["prompt"].strip(),
+            "prompt": submitted_prompt,
             TASK_PARAMETER: task,
             "input_mode": input_mode,
             "duration_seconds": params["duration"],
@@ -7807,6 +8005,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         recovery_action = str(response.get("recovery_action") or "").strip().lower()
         if _BROKER_PUBLIC_CODE_PATTERN.fullmatch(recovery_action):
             task["recovery_action"] = recovery_action
+        if (
+            response.get("resubmit_allowed") is False
+            and error_code in {"submission_unknown", "provider_overdue"}
+        ):
+            # A Broker recovery window ending is not proof that the provider
+            # render failed or never started. Keep this identity unresolved
+            # even if that Broker row itself is labelled failed/terminal.
+            task["status"] = "submission_unknown"
+            task["terminal"] = False
         if "provider_job_id" in response:
             task["provider_task_registered"] = bool(
                 str(response.get("provider_job_id") or "").strip()
@@ -7845,6 +8052,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         ):
             parts.append("Contact an administrator before starting another render.")
         return " ".join(parts)
+
+    @staticmethod
+    def _broker_unconfirmed_task_message(task: dict[str, Any], generation_id: str) -> str:
+        return (
+            f"FN AI Broker task {generation_id} still needs provider confirmation "
+            f"({task.get('error_code') or 'submission_unknown'}). The Broker ended "
+            "its recovery window without confirming a failed or unsubmitted render. "
+            "The task ID was retained. Use Status > Refresh / Retrieve Result for "
+            "this same task, or ask the Broker administrator to reconcile its provider "
+            "record. Do not delete the node or replace the task ID to retry."
+        )
 
     def _set_broker_task_outputs(
         self,
@@ -9016,7 +9234,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 status=status,
                 preview_action=(
                     "refresh_existing"
-                    if status in {"queued", "running"}
+                    if status in {"queued", "running", "submission_unknown"}
                     else "none"
                 ),
             )
@@ -9025,6 +9243,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     stage=(
                         "remote_succeeded"
                         if status == "succeeded"
+                        else "submission_unknown"
+                        if status == "submission_unknown"
                         else "terminal"
                         if status in TERMINAL_FAILURE_STATUSES
                         or task.get("terminal") is True
@@ -9067,12 +9287,19 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     ),
                 )
                 return
+            if status == "submission_unknown":
+                self._set_status_results(
+                    was_successful=False,
+                    result_details=self._broker_unconfirmed_task_message(task, generation_id),
+                )
+                return
             if status in TERMINAL_FAILURE_STATUSES:
                 self._set_status_results(
                     was_successful=False,
                     result_details=self._broker_terminal_failure_message(
                         task, generation_id
-                    ),
+                    ) + " The task is confirmed terminal. The next explicit Run "
+                    "can start a new render; Refresh did not submit one.",
                 )
                 return
             self.status_component.clear_execution_status(
@@ -9087,35 +9314,31 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if not self._runtime_node_is_live(require_registered=True):
                 return
             recovery_checkpoint = self._generation_recovery_state()
-            definitive_missing_client_request = bool(
+            missing_client_request = bool(
                 isinstance(exc, _BrokerError)
                 and exc.status_code in {404, 410}
                 and recovery_checkpoint.get("task_identity") == "client_request"
                 and recovery_checkpoint.get("task_id") == generation_id
             )
-            if definitive_missing_client_request:
-                # The durable pre-submit identity can legitimately exist even
-                # when the process stopped before POST. Only an explicit Broker
-                # not-found/gone response for that provisional identity proves
-                # that no same-task recovery remains and permits a later create.
-                self.parameter_output_values["generation_id"] = ""
-                self.parameter_output_values["provider_response"] = None
-                self._clear_generation_recovery_checkpoint()
-                self._set_generation_status(
-                    "failed",
-                    generation_id="",
-                    preview_action="none",
-                )
-                await self._force_save_generation_recovery_checkpoint(
-                    required=False,
-                    reason="client_request_not_found",
+            if missing_client_request:
+                # A bare 404/410 can be a different account/server, an older
+                # Broker without client-key lookup, or a missing audit record.
+                # It does not prove the provider never accepted this request.
+                # A structured expired task was handled above as terminal.
+                self._publish_generation_preview(
+                    "submission_unknown", generation_id=generation_id,
+                    action="refresh_existing",
                 )
                 self._set_status_results(
                     was_successful=False,
                     result_details=(
-                        "The Broker confirmed that the saved pre-submit request no "
-                        "longer identifies a server task. Recovery was cleared; no "
-                        "replacement render was started automatically."
+                        f"The Broker could not find client request {generation_id} "
+                        f"(HTTP {exc.status_code}). This alone does not confirm that "
+                        "no render was accepted. The saved ID was retained. Check "
+                        "the same Broker server and login used for submission, then "
+                        "click Status > Refresh / Retrieve Result. If it still cannot "
+                        "be found, ask the Broker administrator to confirm the request's "
+                        "provider-side outcome; no replacement render was submitted."
                     ),
                 )
                 return
@@ -9309,7 +9532,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         requested_resume_id = str(
             self.get_parameter_value("resume_generation_id") or ""
         ).strip()
-        if not requested_resume_id:
+        recovery_before_run = self._generation_recovery_state()
+        if not requested_resume_id or (
+            self._generation_recovery_blocks_new_submission()
+            and requested_resume_id != recovery_before_run.get("task_id")
+        ):
             self._assert_new_submission_is_safe()
         self._set_safe_defaults()
         self._begin_generation_preview()
@@ -9400,7 +9627,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self._set_generation_recovery_checkpoint(
                 stage="resume",
                 task_id=generation_id,
-                task_identity="broker_task",
+                task_identity=(
+                    "client_request"
+                    if recovery_before_run.get("task_id") == generation_id
+                    and recovery_before_run.get("task_identity") == "client_request"
+                    else "broker_task"
+                ),
                 status="resuming",
                 params=params,
             )
@@ -9676,8 +9908,26 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 response,
                 fallback_job_id=generation_id,
             )
-            if str(task["id"]) != generation_id:
+            provisional = self._generation_recovery_state()
+            resolving_client_request = bool(
+                provisional.get("task_identity") == "client_request"
+                and provisional.get("task_id") == generation_id
+            )
+            if str(task["id"]) != generation_id and not resolving_client_request:
                 raise _BrokerError("FN AI Broker returned a different task ID.")
+            if resolving_client_request:
+                # Resume Task ID can explicitly resume the saved client key.
+                # Only its first successful same-key lookup may promote that
+                # provisional identity to the canonical Broker job ID.
+                generation_id = str(task["id"])
+                self._set_generation_recovery_checkpoint(
+                    stage="accepted", task_id=generation_id,
+                    task_identity="broker_task", status=str(task["status"]),
+                    params=params,
+                )
+                await self._force_save_generation_recovery_checkpoint(
+                    required=False, reason="resume_client_request_resolved",
+                )
             status = str(task["status"])
             if not self._runtime_node_is_live(require_registered=True):
                 return
@@ -9692,6 +9942,16 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 generation_id,
                 status,
             )
+            if status == "submission_unknown":
+                self._submission_outcome_unknown = True
+                self._set_generation_recovery_checkpoint(
+                    stage="submission_unknown", task_id=generation_id,
+                    task_identity="broker_task", status=status, params=params,
+                )
+                await self._force_save_generation_recovery_checkpoint(
+                    required=False, reason="provider_confirmation_required",
+                )
+                raise RuntimeError(self._broker_unconfirmed_task_message(task, generation_id))
             if status == "succeeded":
                 self._set_generation_recovery_checkpoint(
                     stage="remote_succeeded",
@@ -9917,6 +10177,9 @@ __all__ = [
     "MAX_REFERENCE_AUDIO",
     "LEGACY_VIDEO_REFERENCE_SLOTS",
     "VIDEO_REFERENCES_PARAMETER",
+    "SHOT_FINISH_LOOK_INPUT_PARAMETER",
+    "FINISH_LOOK_SHOT_SNAPSHOT_SCHEMA",
+    "FINISH_LOOK_SHOT_SNAPSHOT_VERSION",
     "GENERATION_PREVIEW_SCHEMA",
     "GENERATION_PREVIEW_VERSION",
     "GENERATION_PREVIEW_PHASES",

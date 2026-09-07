@@ -1766,23 +1766,27 @@ assert.match(videoSource, /data-resize-section="color"/);
 assert.doesNotMatch(
   videoSource,
   /data-resize-section="settings"/,
-  "Playblast Settings now belongs to the viewport header and must not reserve a separate right-column panel.",
+  "Playblast Settings belongs below the viewport and must not reserve a separate right-column panel.",
 );
 assert.ok(
-  videoSource.indexOf('<div class="snapshot-toolbar">')
+  videoSource.indexOf('<div class="panel-title viewport-title">')
+    < videoSource.indexOf('<div class="viewport-stage">')
+    && videoSource.indexOf('<div class="viewport-stage">')
+      < videoSource.indexOf('<div class="frame-info-strip">')
+    && videoSource.indexOf('<div class="frame-info-strip">')
+      < videoSource.indexOf('<div class="snapshot-toolbar">')
+    && videoSource.indexOf('<div class="snapshot-toolbar">')
     < videoSource.indexOf('<div class="generate-playblast-toolbar"')
     && videoSource.indexOf('<div class="generate-playblast-toolbar"')
       < videoSource.indexOf('<div class="playblast-settings-toolbar">')
     && videoSource.indexOf('<div class="playblast-settings-toolbar">')
-      < videoSource.indexOf('<div class="panel-title viewport-title">')
-    && videoSource.indexOf('<div class="panel-title viewport-title">')
-      < videoSource.indexOf('<div class="viewport-stage">'),
-  "The center column must render Snapshot/CAM, Generate, Settings, then Viewport while Current Cut Videos owns the right column.",
+      < videoSource.indexOf('<section class="picker-tools-panel '),
+  "The center column must keep all mode controls below the shared viewport and transport while Current Cut Videos owns the right column.",
 );
 assert.equal((videoSource.match(/id="run-video"/g) || []).length, 1);
 assert.match(
   videoSource,
-  /class="generate-playblast-toolbar" role="group" aria-label="\$\{escapeHtml\(tr\.generate\)\}"[\s\S]*?id="run-video" aria-label="\$\{escapeHtml\(tr\.generate\)\}"/,
+  /class="generate-playblast-toolbar" role="group" aria-label="\$\{escapeHtml\(tr\.generate\)\}"[\s\S]*?id="run-video" aria-label="\$\{escapeHtml\(hmbPickerGenerateCaption\(state, container\)\)\}"/,
   "Moving Generate must preserve the existing control ID and add explicit accessible naming.",
 );
 assert.doesNotMatch(videoSource, /HMB_RIGHT_SECTION_HEIGHTS_KEY|hmbWriteRightSectionHeights/);

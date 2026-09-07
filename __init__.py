@@ -11,6 +11,11 @@ except Exception:
     HMBImageAssetLibrary = None  # type: ignore
 
 try:
+    from .HMBFinishLookLibrary import HMBFinishLookLibrary
+except Exception:
+    HMBFinishLookLibrary = None  # type: ignore
+
+try:
     from .HMBPromptLibrary import HMBPromptLibrary
 except Exception:
     HMBPromptLibrary = None  # type: ignore
@@ -27,6 +32,7 @@ except Exception:
 
 __all__ = [
     "HMBAgentLibrary",
+    "HMBFinishLookLibrary",
     "HMBImageAssetLibrary",
     "HMBPromptLibrary",
     "HMBSeedanceGeneration",

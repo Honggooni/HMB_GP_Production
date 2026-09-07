@@ -224,10 +224,10 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.7.38",
+    "library_version": "0.7.41",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
-      "archive_source_count": 26,
+      "archive_source_count": 29,
       "mode": "bundled_signed_dat",
       "runtime_path": "resources/agent/hmb_agent_core.dat",
       "policy_version": "2026-09-03.agent-shot-quality.v5.2",
@@ -355,6 +355,15 @@
       "KeyboardDeleteProtection",
       "InstantColorAssignment",
       "HMBSeedanceGeneration",
+      "HMBFinishLookLibrary",
+      "FinishLook",
+      "Beauty",
+      "FilterApplication",
+      "DeterministicFinishLookCompiler",
+      "RemoteFinishLookPatch",
+      "ConcatenateVideos",
+      "CropVideo",
+      "VideoToolsWorkspace",
       "VolcengineArk",
       "FNAIBroker",
       "ServerManagedProviderCredentials",
@@ -456,6 +465,63 @@
             ]
           }
         ]
+      }
+    },
+    {
+      "class_name": "HMBFinishLookLibrary",
+      "file_path": "HMBFinishLookLibrary.py",
+      "metadata": {
+        "category": "HMB_GP_Production",
+        "description": "Compiles character-matte-only Character Beauty and full-frame Filter Application values into deterministic English production prose, with Shot binding and validated dict remote control. Video editing is provided by HMBVideoPickerLibrary expanded mode.",
+        "display_name": "HMB Finish Look",
+        "icon": "SlidersHorizontal",
+        "group": "edit",
+        "width": 980,
+        "height": 1040,
+        "default_width": 980,
+        "default_height": 1040,
+        "preferred_width": 980,
+        "preferred_height": 1040,
+        "initial_width": 980,
+        "initial_height": 1040,
+        "min_width": 700,
+        "min_height": 620,
+        "resizable": true,
+        "tags": [
+          "HMB",
+          "finish-look",
+          "character-beauty",
+          "filter-application",
+          "deterministic-compiler",
+          "remote-state",
+          "video-concatenate",
+          "video-crop"
+        ],
+        "ui_options": {
+          "width": 980,
+          "height": 1040,
+          "default_width": 980,
+          "default_height": 1040,
+          "preferred_width": 980,
+          "preferred_height": 1040,
+          "initial_width": 980,
+          "initial_height": 1040,
+          "node_size": {
+            "width": 980,
+            "height": 1040
+          },
+          "default_size": {
+            "width": 980,
+            "height": 1040
+          },
+          "initial_size": {
+            "width": 980,
+            "height": 1040
+          },
+          "min_width": 700,
+          "min_height": 620,
+          "resizable": true
+        }
       }
     },
     {
@@ -572,7 +638,7 @@
       "file_path": "HMBVideoPickerLibrary.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "Captures Maya snapshots and playblast variants.\nOrders videos for prompts or generators.",
+        "description": "Captures Maya snapshots and playblast variants.\nOrders videos for prompts or generators. Expanded mode includes independent concatenation and spatial crop tools.",
         "display_name": "HMBVideoPickerLibrary",
         "width": 1400,
         "height": 360,
@@ -608,6 +674,11 @@
       "description": "Compact HMBAgentLibrary header with an explicit standalone Only mode and a backend-verified selector containing only same-flow Prompt-owned Shots; native Agent controls and output behavior remain unchanged."
     },
     {
+      "name": "HMBFinishLookLibraryWidget",
+      "path": "widgets/HMBFinishLookLibraryWidget.js",
+      "description": "Bilingual, Shot-bound Character Beauty and Filter Application editor. Video editing is provided by HMBVideoPickerLibrary expanded mode; Finish Look retains its finishing controls and generator prompt output."
+    },
+    {
       "name": "HMBImageAssetLibraryWidget",
       "path": "widgets/HMBImageAssetLibraryWidget.js",
       "description": "Project catalog and image asset browser backed by the canonical _hmb_common.py taxonomy, with compact Project Set/reload icons, manifest-backed Add registration that copies external media directly into a selected child Asset Folder, explicit registered/unregistered thumbnail footers, and a compact draggable @image1-@image50 generator-order tray."
@@ -635,7 +706,7 @@
     {
       "name": "HMBVideoPickerLibraryWidget",
       "path": "widgets/HMBVideoPickerLibraryWidget_v032.js",
-      "description": "Maya playblast viewport with ImageAsset-synchronized one-to-five Shot video workspaces. Each Shot owns at most ten imported or generated assets; the expanded view shows only the active Shot, and only that Shot's ordered selected subset drives PICKER_OUT and VIDEO_OUT. The compact loader renders actual owned cards only, reuses one on-demand player, and sizes itself to visible rows. Maya scene changes preserve durable video history and stable video UIDs."
+      "description": "Maya playblast viewport with ImageAsset-synchronized one-to-five Shot video workspaces. Each Shot owns at most ten imported or generated assets; only that Shot's ordered selected subset drives PICKER_OUT and VIDEO_OUT. Expanded mode adds Preview, Concatenate and Crop tabs using the same player, with an independent edit queue and source-local crop regions. Editing outputs are separate and are added to the loader only on request without automatic Prompt selection. The compact loader and its selection, playback and reorder behavior are unchanged."
     }
   ]
 }

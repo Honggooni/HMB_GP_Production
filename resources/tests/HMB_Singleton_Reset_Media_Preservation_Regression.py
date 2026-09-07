@@ -245,40 +245,6 @@ try:
             ],
         }
     )
-    authored_context = picker._empty_picker_authoring_context()
-    authored_context.update(
-        {
-            "scene_stage": "OUTLINER_READY",
-            "scene_path": "C:/shots/retired.mb",
-            "scene_draft_path": "C:/shots/retired.mb",
-            "scene_request_path": "C:/shots/retired.mb",
-            "native_read_ready": True,
-            "selected_camera": "|shotCam",
-            "cameras": [{"name": "shotCam", "full_path": "|shotCam"}],
-            "selected_outliner_path": "|SET|Hero",
-            "selected_outliner_name": "Hero",
-            "selected_outliner_uuid": uuid_text(),
-            "selected_color": "Red",
-            "outliner_nodes": [
-                {"name": "Hero", "full_path": "|SET|Hero"}
-            ],
-            "slot_assignments": [
-                {
-                    "video_slot": 1,
-                    "bindings": [
-                        {
-                            "group_name": "Hero",
-                            "full_dag_path": "|SET|Hero",
-                            "color": "Red",
-                            "enabled": True,
-                        }
-                    ],
-                }
-            ],
-            "status": "OUTLINER_READY",
-            "message": "Retired authoring state",
-        }
-    )
     picker_state = picker._default_widget_state()
     picker_state.update(
         {
@@ -360,12 +326,10 @@ try:
                     "video_asset_uids": [video_a, video_b],
                     "selected_video_uids": [video_b, video_a],
                     "preview_video_uid": video_b,
-                    "scene_draft_path": "C:/shots/retired.mb",
-                    "current_frame": 120.0,
+                    "preview_frame": 120.0,
                     "viewport_mode": "snapshot",
                     "active_snapshot_uid": "retired-snapshot",
                     "selected_video_slot": 1,
-                    "authoring_context": authored_context,
                 },
                 {
                     "workspace_uuid": workspace_2,
@@ -377,12 +341,10 @@ try:
                     "video_asset_uids": [video_c],
                     "selected_video_uids": [video_c],
                     "preview_video_uid": video_c,
-                    "scene_draft_path": "C:/shots/second.mb",
-                    "current_frame": 44.0,
+                    "preview_frame": 44.0,
                     "viewport_mode": "video",
                     "active_snapshot_uid": "",
                     "selected_video_slot": 1,
-                    "authoring_context": authored_context,
                 },
             ],
             "active_picker_shot_uuid": workspace_1,
@@ -490,19 +452,10 @@ try:
     assert adopted_picker["active_process_pid"] == 0
     assert adopted_picker["status"] == "READY"
     assert adopted_picker["warnings"] == []
+    assert adopted_picker["slot_assignments"] == [{"video_slot": 1, "bindings": []}]
     for row in adopted_picker["picker_shots"]:
-        context = row["authoring_context"]
-        assert context["scene_path"] == ""
-        assert context["outliner_nodes"] == []
-        # The active row may expose one empty control slot per retained Loader
-        # selection.  Reset's authoring guarantee is that no retired Maya
-        # binding survives, not that the compatibility list has length one.
-        assert context["slot_assignments"]
-        assert all(
-            assignment.get("bindings") == []
-            for assignment in context["slot_assignments"]
-            if isinstance(assignment, dict)
-        )
+        assert "authoring_context" not in row
+        assert "scene_draft_path" not in row
     invalid_picker = copy.deepcopy(new_picker._hmb_export_reset_handoff())
     invalid_picker["participant_kind"] = "image_asset"
     assert new_picker._hmb_adopt_reset_handoff(invalid_picker) is False

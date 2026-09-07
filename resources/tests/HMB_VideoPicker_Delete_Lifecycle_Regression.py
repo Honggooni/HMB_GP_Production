@@ -46,6 +46,11 @@ def command(node, action: str, action_id: str, payload: dict | None = None) -> N
         "action_id": action_id,
         "payload": payload or {},
     })
+    if action == "delete_video_asset":
+        worker = getattr(node, "_hmb_video_removal_sync_thread", None)
+        if worker is not None:
+            worker.join(10)
+            assert not worker.is_alive(), "Deferred output publication did not settle"
 
 
 node = picker.HMBVideoPickerLibrary(name="Video Delete Lifecycle Contract")
@@ -64,7 +69,7 @@ state_store = {
 published_outputs: list[dict] = []
 node._picker_state = lambda: deepcopy(state_store["value"])
 node._write_state = lambda value: state_store.__setitem__("value", deepcopy(value))
-node._sync_outputs_from_state = lambda value: published_outputs.append(deepcopy(value))
+node._sync_outputs_from_state = lambda value, **_kwargs: published_outputs.append(deepcopy(value))
 
 
 # Deleting the active preview is an immediate metadata command. It must return

@@ -83,17 +83,26 @@ assert.deepEqual(
   "Reordering never mutates catalog ownership/order.",
 );
 
-// Maya authoring follows the active Shot while generated/imported videos stay
-// owned by their original Shot. A fresh Shot starts with an empty Outliner;
-// returning restores the previous Shot's READ result and Color Pick binding.
+// All Shots share the current Maya input. Shot navigation changes only the
+// destination media workspace; loading B replaces A for every destination.
 {
   const loadedShot1 = shotLocalState();
   Object.assign(loadedShot1, {
-    scene_stage: "READ_DONE",
+    scene_stage: "OUTLINER_READY",
     scene_draft_path: "C:/maya/shot_1.ma",
     scene_request_path: "C:/maya/shot_1.ma",
     scene_path: "C:/maya/shot_1.ma",
     native_read_ready: true,
+    maya_available: true,
+    maya_executable: "C:/Maya/bin/mayabatch.exe",
+    cameras: [{ full_path: "|camera1" }],
+    selected_camera: "|camera1",
+    source_fps: 24,
+    start_frame: 1001,
+    end_frame: 1048,
+    current_frame: 1024,
+    preview_frame: 1012,
+    mask_enabled: true,
     native_metadata: { scene_path: "C:/maya/shot_1.ma" },
     selected_outliner_path: "|Shot1_GRP",
     selected_outliner_name: "Shot1_GRP",
@@ -103,17 +112,21 @@ assert.deepEqual(
     slot_assignments: [{ video_slot: 1, bindings: [{ full_dag_path: "|Shot1_GRP", maya_uuid: "shot-1-root", color: "Green" }] }],
   });
   const onShot2 = widget.hmbSwitchLocalPickerShot(loadedShot1, shotB);
-  assert.equal(onShot2.native_read_ready, false);
-  assert.equal(onShot2.scene_path, "");
-  assert.deepEqual(onShot2.outliner_nodes, []);
-  assert.deepEqual(onShot2.slot_assignments, [{ video_slot: 1, bindings: [] }]);
+  assert.equal(onShot2.native_read_ready, true);
+  assert.equal(onShot2.scene_path, "C:/maya/shot_1.ma");
+  assert.deepEqual(onShot2.outliner_nodes, loadedShot1.outliner_nodes);
+  assert.equal(onShot2.slot_assignments[0].bindings[0].color, "Green");
+  assert.equal(onShot2.current_frame, 1024);
+  assert.equal(onShot2.preview_frame, 0);
+  assert.equal(widget.pickerButtonAvailability(onShot2).playblastEnabled, true);
+  assert.ok(onShot2.picker_shots.every((row) => !("authoring_context" in row) && !("scene_draft_path" in row)));
   assert.deepEqual(
     onShot2.picker_shots.find((row) => row.workspace_uuid === shotA).video_asset_uids,
     ["video-a", "video-b", "video-c"],
   );
 
   Object.assign(onShot2, {
-    scene_stage: "READ_DONE",
+    scene_stage: "OUTLINER_READY",
     scene_draft_path: "C:/maya/shot_2.ma",
     scene_request_path: "C:/maya/shot_2.ma",
     scene_path: "C:/maya/shot_2.ma",
@@ -127,10 +140,13 @@ assert.deepEqual(
   });
   const restoredShot1 = widget.hmbSwitchLocalPickerShot(onShot2, shotA);
   assert.equal(restoredShot1.native_read_ready, true);
-  assert.equal(restoredShot1.scene_path, "C:/maya/shot_1.ma");
-  assert.equal(restoredShot1.selected_outliner_uuid, "shot-1-root");
-  assert.equal(restoredShot1.selected_color, "Green");
-  assert.equal(restoredShot1.slot_assignments[0].bindings[0].color, "Green");
+  assert.equal(restoredShot1.scene_path, "C:/maya/shot_2.ma");
+  assert.equal(restoredShot1.selected_outliner_uuid, "shot-2-root");
+  assert.equal(restoredShot1.selected_color, "Red");
+  assert.equal(restoredShot1.slot_assignments[0].bindings[0].color, "Red");
+  assert.equal(restoredShot1.current_frame, 1024);
+  assert.equal(restoredShot1.preview_frame, 1012);
+  assert.equal(widget.pickerButtonAvailability(restoredShot1).playblastEnabled, true);
   assert.deepEqual(
     restoredShot1.picker_shots.find((row) => row.workspace_uuid === shotB).video_asset_uids,
     ["video-d"],

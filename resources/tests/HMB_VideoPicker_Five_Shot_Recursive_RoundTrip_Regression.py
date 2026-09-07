@@ -140,6 +140,9 @@ def shot_catalog(count: int, generation: int) -> dict[str, Any]:
 
 def configure_memory_node(node: Any, state: Any | None = None) -> Any:
     normalized = picker._parse_state(state if state is not None else node._picker_state())
+    # Mirror the production writer's derived Video Tools fields before taking
+    # the durable baseline; hydration must not be compared to a partial mock.
+    node._reconcile_video_tools_state(normalized)
     node.parameter_values = {
         picker.WIDGET_STATE_PARAMETER: copy.deepcopy(normalized),
     }
@@ -152,6 +155,7 @@ def configure_memory_node(node: Any, state: Any | None = None) -> Any:
 
     def write_state(next_state: Any) -> None:
         parsed = picker._parse_state(next_state)
+        node._reconcile_video_tools_state(parsed)
         node.parameter_values[picker.WIDGET_STATE_PARAMETER] = copy.deepcopy(parsed)
         node._hmb_authoritative_state = copy.deepcopy(parsed)
         node._hmb_latest_widget_state = copy.deepcopy(parsed)
@@ -352,7 +356,8 @@ def run_hook_order_round_trips(
             assert_recursive_five_shot_invariants(current)
             assert semantic_bytes(current) == baseline_semantics, (
                 f"Durable state changed at round {round_number}, hook {hook_name}, "
-                f"order {tuple(hook_order)}."
+                f"order {tuple(hook_order)}. "
+                + first_difference(json.loads(baseline_semantics), json.loads(semantic_bytes(current)))
             )
         prompt_consumer_read_without_picker_mutation(node)
         payload = copy.deepcopy(node._picker_state())

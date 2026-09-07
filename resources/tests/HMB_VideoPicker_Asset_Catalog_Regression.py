@@ -335,7 +335,8 @@ for command_name in (
     assert command_name in picker_source
 chooser_source = inspect.getsource(picker._choose_video_asset_files)
 assert "*.mp4" in chooser_source
-assert "Multiselect=$true" in chooser_source
+assert "multiple: bool = True" in chooser_source
+assert "'$true' if multiple else '$false'" in chooser_source
 
 tmp_parent = ROOT / ".tmp"
 tmp_parent.mkdir(parents=True, exist_ok=True)
@@ -444,7 +445,7 @@ with tempfile.TemporaryDirectory(
     node._write_state = lambda value: command_state.__setitem__(
         "value", deepcopy(value)
     )
-    node._sync_outputs_from_state = lambda _value: ""
+    node._sync_outputs_from_state = lambda _value, **_kwargs: ""
     deleted_uid = imported_records[0]["video_uid"]
     retained_uid = imported_records[1]["video_uid"]
     node._handle_picker_command({

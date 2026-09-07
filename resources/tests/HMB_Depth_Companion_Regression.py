@@ -848,8 +848,9 @@ assert preserved_override["picker_auto_depth"] == {}
 
 
 # Publishing a new Mask appends one immutable catalog asset. Existing catalog
-# rows (including a validated typed Depth) and Maya authoring metadata are not
-# replaced, renumbered, or cleared.
+# rows (including a validated typed Depth), Snapshot history, and the single
+# shared Maya authoring row are preserved. Retired per-media authoring rows
+# are not part of that shared staging context.
 fixture_pair_run_id = "paired-regression-run-id"
 publish_state = picker._parse_state({
     **default_state,
@@ -943,6 +944,11 @@ publish_state = picker._parse_state({
     ],
 })
 captured_state = {}
+retained_media_identity = [
+    (item["video_uid"], item["video_path"])
+    for item in publish_state["videos"]
+]
+retained_snapshot_history = copy.deepcopy(publish_state["snapshots"])
 publish_node = object.__new__(picker.HMBVideoPickerLibrary)
 publish_node._write_state = lambda state: captured_state.update(
     {"value": copy.deepcopy(state)}
@@ -972,6 +978,10 @@ assert published_mask["generation_role"] == "mask"
 assert published_mask["media_kind"] == picker.MASK_MEDIA_KIND
 assert published_mask["pair_run_id"] == pair_run_id
 assert len({item["video_uid"] for item in published["videos"]}) == 3
+assert [
+    (item["video_uid"], item["video_path"])
+    for item in published["videos"][:2]
+] == retained_media_identity
 
 assignments_by_slot = {
     int(item["video_slot"]): item["bindings"]
@@ -982,10 +992,11 @@ visibility_by_slot = {
     for item in published["slot_visibility"]
 }
 assert assignments_by_slot[1][0]["group_name"] == "Hero"
-assert assignments_by_slot[2][0]["group_name"] == "StaleDepthBinding"
+assert set(assignments_by_slot) == {1}
 assert visibility_by_slot[1] == ["|KeepColorHidden"]
-assert visibility_by_slot[2] == ["|StaleDepthHidden"]
+assert set(visibility_by_slot) == {1}
 assert [item["video_slot"] for item in published["snapshots"]] == [1, 2]
+assert published["snapshots"] == retained_snapshot_history
 # A successful Generate keeps immutable Snapshot history and its navigation
 # pointer, but returns the shared viewport to Video mode.
 assert published["viewport_mode"] == "video"

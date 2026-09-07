@@ -1171,14 +1171,14 @@ class MissingTaskBridge:
         )
 
 
-async def verify_definitive_client_request_cleanup() -> None:
+async def verify_missing_client_request_is_not_proof_of_rejection() -> None:
     cases = (
-        (404, "client_request", True),
-        (410, "client_request", True),
-        (404, "broker_task", False),
-        (503, "client_request", False),
+        (404, "client_request"),
+        (410, "client_request"),
+        (404, "broker_task"),
+        (503, "client_request"),
     )
-    for status_code, identity, should_clear in cases:
+    for status_code, identity in cases:
         task_id = f"hmb-lookup-{status_code}-{identity}"
         node = target.HMBSeedanceGeneration(
             name=f"Seedance Lookup {status_code} {identity}"
@@ -1229,19 +1229,13 @@ async def verify_definitive_client_request_cleanup() -> None:
             node.get_parameter_value(target.SEEDANCE_RECOVERY_PARAMETER)
         )
         assert bridge.refresh_calls == [task_id]
-        if should_clear:
-            assert checkpoint["task_id"] == ""
-            assert node.parameter_output_values["generation_id"] == ""
-            assert node._generation_recovery_blocks_new_submission() is False
-            assert saves == ["client_request_not_found"]
-        else:
-            assert checkpoint["task_id"] == task_id
-            assert node.parameter_output_values["generation_id"] == task_id
-            assert node._generation_recovery_blocks_new_submission() is True
-            assert saves == []
+        assert checkpoint["task_id"] == task_id
+        assert node.parameter_output_values["generation_id"] == task_id
+        assert node._generation_recovery_blocks_new_submission() is True
+        assert saves == []
 
 
-asyncio.run(verify_definitive_client_request_cleanup())
+asyncio.run(verify_missing_client_request_is_not_proof_of_rejection())
 
 
 async def verify_submission_liveness_gates() -> None:
@@ -1402,5 +1396,5 @@ print(
     "monotonic local success, missing-media recovery, "
     "terminal no-restart, refresh-only backend path, "
     "five-node serialized save coordinator, pre-submit save billing boundary, "
-    "definitive client lookup cleanup, original output target, submission gates)"
+    "missing client lookup retention, original output target, submission gates)"
 )

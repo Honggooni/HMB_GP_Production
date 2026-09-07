@@ -186,13 +186,8 @@ def append_shot_videos(
     return normalized
 
 
-def install_distinct_authoring_contexts(state: Any) -> dict[str, Any]:
+def install_shared_maya_staging(state: Any) -> dict[str, Any]:
     normalized = picker._parse_state(state)
-    videos_by_uid = {
-        str(item.get("video_uid") or item.get("source_uid") or ""): item
-        for item in normalized.get("videos", [])
-        if isinstance(item, dict)
-    }
     rows = sorted(
         [
             row
@@ -202,65 +197,51 @@ def install_distinct_authoring_contexts(state: Any) -> dict[str, Any]:
         key=lambda row: int(row.get("number") or 0),
     )
     for number, row in enumerate(rows, start=1):
-        preview_item = videos_by_uid[row["preview_video_uid"]]
-        context = picker._empty_picker_authoring_context()
-        context.update({
-            "scene_request_status": f"SHOT_{number}_READY",
-            "native_read_ready": True,
-            "native_read_mode": f"shot-{number}-mode",
-            "camera": f"camera{number}",
-            "selected_camera": f"camera{number}",
-            "cameras": [{
-                "name": f"camera{number}",
-                "full_path": f"|camera{number}",
-                "default_camera": False,
-            }],
-            "source_fps": float(20 + number),
-            "output_fps": float(24 + number),
-            "output_frame_count": float(100 + number),
-            "decoded_frame_count": float(100 + number),
-            "current_frame": float(number * 10),
-            "frame_metadata": picker._video_frame_metadata(
-                preview_item,
-                number,
-            ),
-            "workspace_view": "outliner",
-            "selected_outliner_path": f"|shot{number}|character",
-            "selected_outliner_name": f"character{number}",
-            "selected_color": f"color-{number}",
-            "slot_assignments": [
-                {
-                    "video_slot": slot,
-                    "bindings": [{
-                        "group_name": f"character{number}",
-                        "full_dag_path": f"|shot{number}|slot{slot}",
-                        "maya_uuid": "",
-                        "reference_node": "",
-                        "reference_file": "",
-                        "proxy_manager": "",
-                        "proxy_tag": "",
-                        "color": "Red",
-                        "enabled": True,
-                        "video_slot": slot,
-                        "picker_order": 1,
-                    }],
-                }
-                for slot in range(1, number + 1)
-            ],
-            "slot_visibility": [
-                {"video_slot": slot, "hidden_paths": []}
-                for slot in range(1, number + 1)
-            ],
-            "status": "READY",
-            "message": f"Shot {number} authoring context",
-        })
-        row["authoring_context"] = picker._normalize_picker_authoring_context(
-            context
-        )
-        row["current_frame"] = float(number * 10)
+        row["preview_frame"] = float(number * 10)
         row["selected_video_slot"] = number
     normalized["picker_shots"] = rows
+    # Maya is one shared input; only stored video views are Shot-local.
+    normalized.update({
+        "scene_path": "C:/maya/shared-current.ma",
+        "scene_request_path": "C:/maya/shared-current.ma",
+        "scene_draft_path": "C:/maya/shared-current.ma",
+        "scene_request_status": "READY",
+        "native_read_ready": True,
+        "camera": "sharedCamera",
+        "selected_camera": "sharedCamera",
+        "cameras": [{"name": "sharedCamera", "full_path": "|sharedCamera"}],
+        "start_frame": 1001.0,
+        "end_frame": 1096.0,
+        "current_frame": 1024.0,
+        "source_fps": 24.0,
+        "output_fps": 24.0,
+        "selected_outliner_path": "|shared|character",
+        "selected_outliner_name": "sharedCharacter",
+        "selected_color": "Red",
+        "slot_assignments": [{"video_slot": 1, "bindings": [{
+            "group_name": "sharedCharacter",
+            "full_dag_path": "|shared|character",
+            "color": "Red", "enabled": True,
+            "video_slot": 1, "picker_order": 1,
+        }]}],
+        "slot_visibility": [{"video_slot": 1, "hidden_paths": ["|shared|hidden"]}],
+        "original_enabled": True,
+        "mask_enabled": True,
+        "depth_enabled": True,
+        "motion_guide_enabled": True,
+        "status": "READY",
+    })
     return normalized
+
+
+def shared_maya_semantics(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: copy.deepcopy(state.get(key))
+        for key in (
+            *picker._MAYA_OPERATION_AUTHORING_FIELDS,
+            "selected_outliner_path", "selected_outliner_name", "selected_color",
+        )
+    }
 
 
 def row_durable_semantics(row: dict[str, Any]) -> dict[str, Any]:
@@ -272,12 +253,10 @@ def row_durable_semantics(row: dict[str, Any]) -> dict[str, Any]:
             "video_asset_uids",
             "selected_video_uids",
             "preview_video_uid",
-            "scene_draft_path",
-            "current_frame",
+            "preview_frame",
             "viewport_mode",
             "active_snapshot_uid",
             "selected_video_slot",
-            "authoring_context",
         )
     }
 
@@ -353,7 +332,7 @@ with tempfile.TemporaryDirectory(
             state = node._picker_state()
             for shot_number in range(1, 6):
                 state = append_shot_videos(state, shot_number, media_root)
-            state = install_distinct_authoring_contexts(state)
+            state = install_shared_maya_staging(state)
 
             # Every permutation begins by deleting its current active Shot.
             # Later transitions naturally cover both active and non-active
@@ -373,6 +352,7 @@ with tempfile.TemporaryDirectory(
             # all 5! orders produce the complete 480-transition matrix.
             for deleted_shot_uuid in deletion_order[:-1]:
                 before = node._picker_state()
+                before_maya = shared_maya_semantics(before)
                 before_rows = {
                     row["bound_shot_uuid"]: copy.deepcopy(row)
                     for row in state_rows(before)
@@ -398,7 +378,18 @@ with tempfile.TemporaryDirectory(
                     shot_catalog(survivor_uuids, generation)
                 )
                 after = node._picker_state()
+                assert shared_maya_semantics(after) == before_maya, (
+                    "Shot deletion changed the shared Maya input", deletion_order,
+                    deleted_shot_uuid,
+                    first_difference(before_maya, shared_maya_semantics(after)),
+                )
                 after_rows = state_rows(after)
+                assert all(
+                    not any(key in row for key in (
+                        "authoring_context", "scene_draft_path", "current_frame"
+                    ))
+                    for row in after_rows
+                )
                 after_by_shot = {
                     row["bound_shot_uuid"]: row
                     for row in after_rows
@@ -428,12 +419,6 @@ with tempfile.TemporaryDirectory(
                         survivor_uuid,
                         differing_fields,
                         first_difference(before_semantics, after_semantics),
-                        before_semantics.get("authoring_context", {}).get(
-                            "slot_assignments"
-                        ),
-                        after_semantics.get("authoring_context", {}).get(
-                            "slot_assignments"
-                        ),
                     )
 
                 after_video_uids = {

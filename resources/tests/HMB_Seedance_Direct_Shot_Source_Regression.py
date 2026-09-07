@@ -287,10 +287,51 @@ class Source:
         return deepcopy(self.value)
 
 
+class FinishSource:
+    def __init__(self, value: dict[str, Any]) -> None:
+        self.kind = "finish_look"
+        self.value = value
+
+    def _hmb_shot_channel_subscription(self) -> dict[str, Any]:
+        return {
+            "participant_kind": self.kind,
+            "enabled": True,
+            "channel_uuid": CHANNEL,
+            "shot_uuid": SHOT,
+            "shot_number": 2,
+            "shot_name": "Second Shot",
+        }
+
+    def _hmb_finish_look_shot_snapshot(
+        self,
+        expected_output: Any = None,
+    ) -> dict[str, Any]:
+        if expected_output is not None:
+            assert expected_output == self.value
+        return deepcopy(self.value)
+
+
+def finish_snapshot(instruction: str) -> dict[str, Any]:
+    return {
+        "schema": target.FINISH_LOOK_SHOT_SNAPSHOT_SCHEMA,
+        "version": target.FINISH_LOOK_SHOT_SNAPSHOT_VERSION,
+        "channel_uuid": CHANNEL,
+        "shot_uuid": SHOT,
+        "shot_number": 2,
+        "shot_name": "Second Shot",
+        "generation": 4,
+        "finish_look_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+        "state_sha256": "a" * 64,
+        "finish_look_out": instruction,
+    }
+
+
 def generator(
     image: Source | None,
     picker: Source | None,
     agent_source: Any | None = None,
+    *,
+    finish: FinishSource | None = None,
 ) -> target.HMBSeedanceGeneration:
     node = object.__new__(target.HMBSeedanceGeneration)
     node._reconcile_shared_shot_routing = lambda strict=False: {  # type: ignore[method-assign]
@@ -309,16 +350,19 @@ def generator(
         sources[target.SHOT_ASSET_INPUT_PARAMETER] = image
     if picker is not None:
         sources[target.SHOT_PICKER_INPUT_PARAMETER] = picker
+    if finish is not None:
+        sources[target.SHOT_FINISH_LOOK_INPUT_PARAMETER] = finish
 
     def exact(
         target_name: str,
         source_name: str,
         *,
         required: bool = True,
-    ) -> Source | None:
+    ) -> Any | None:
         expected = {
             target.SHOT_ASSET_INPUT_PARAMETER: "SHOT_ASSET_OUT",
             target.SHOT_PICKER_INPUT_PARAMETER: "SHOT_PICKER_OUT",
+            target.SHOT_FINISH_LOOK_INPUT_PARAMETER: "SHOT_FINISH_LOOK_OUT",
         }
         assert source_name == expected[target_name]
         if target_name not in sources:
@@ -329,6 +373,9 @@ def generator(
 
     node._exact_incoming_source = exact  # type: ignore[method-assign]
     node._manual_agent_prompt_source = lambda: agent_source  # type: ignore[method-assign]
+    node.get_parameter_value = lambda name: deepcopy(  # type: ignore[method-assign]
+        sources[name].value if name in sources else None
+    )
     return node
 
 
@@ -376,6 +423,7 @@ assert resolved["video_references"] == ["@video1"]
 assert resolved["video_reference_slots"] == []
 assert resolved["reference_audio"] == []
 assert resolved["input_mode"] == target.INPUT_MODE_MULTIMODAL_REFERENCES
+assert resolved["_hmb_finish_look_out"] == ""
 
 
 def valid_params(*, prompt: str = "") -> dict[str, Any]:
@@ -407,6 +455,96 @@ def valid_params(*, prompt: str = "") -> dict[str, Any]:
         "tos_endpoint": target.DEFAULT_TOS_ENDPOINT,
         "tos_url_validity_seconds": target.DEFAULT_TOS_URL_VALIDITY_SECONDS,
     }
+
+
+# Finish Look is an optional sixth same-Shot sidecar. Resolution keeps the
+# Agent/user prompt opaque and carries the exact Finish bytes separately. The
+# Broker payload alone wraps them after the resolved Shot instruction and
+# before one fixed final-render guard, so no Agent/LLM can rewrite the finish.
+finish_instruction = (
+    "Apply restrained beauty processing.\n"
+    "Preserve this exact UTF-8 phrase: 새벽의 차가운 응답."
+)
+finish = FinishSource(finish_snapshot(finish_instruction))
+finish_node = generator(image, picker, finish=finish)
+finish_resolved = finish_node._resolve_exact_shot_generation_inputs(
+    valid_params(prompt="Exact Agent instruction")
+)
+assert finish_resolved["prompt"] == "Exact Agent instruction"
+assert finish_resolved["_hmb_finish_look_out"] == finish_instruction
+finish_payload_params = deepcopy(finish_resolved)
+finish_payload_params["reference_images"] = [
+    "https://media.example/image-2.png",
+    "https://media.example/image-1.png",
+]
+finish_payload_params["video_references"] = [
+    "https://media.example/motion.mp4",
+]
+finish_payload = finish_node._build_broker_payload(finish_payload_params)
+submitted_prompt = finish_payload["prompt"]
+assert submitted_prompt.count(finish_instruction) == 1
+assert submitted_prompt.index("Exact Agent instruction") < submitted_prompt.index(
+    finish_instruction
+)
+assert submitted_prompt.index(finish_instruction) < submitted_prompt.index(
+    "HMB FINAL RENDER RULES"
+)
+assert "HMB FINISH LOOK — APPLY AFTER THE RESOLVED GLOBAL LOOK (VERBATIM)" in submitted_prompt
+assert submitted_prompt.endswith("Do not introduce or simulate film grain.")
+assert "Apply Character Beauty exclusively to character-owned surfaces" in submitted_prompt
+assert "never apply it to the background, environment" in submitted_prompt
+assert "Filter Application may affect the completed frame" in submitted_prompt
+for authored_filter_effect in (
+    "film-stock color and tonal response",
+    "highlight glow",
+    "soft-focus diffusion",
+    "vignette",
+):
+    assert authored_filter_effect in submitted_prompt
+
+# Without a Finish node, both direct resolution and Broker submission preserve
+# the pre-existing prompt behavior byte-for-byte.
+without_finish = generator(image, picker)._resolve_exact_shot_generation_inputs(
+    valid_params(prompt="No finish sidecar")
+)
+assert without_finish["_hmb_finish_look_out"] == ""
+without_finish_payload_params = deepcopy(without_finish)
+without_finish_payload_params["reference_images"] = [
+    "https://media.example/image-2.png",
+    "https://media.example/image-1.png",
+]
+without_finish_payload_params["video_references"] = [
+    "https://media.example/motion.mp4",
+]
+assert generator(image, picker)._build_broker_payload(without_finish_payload_params)["prompt"] == (
+    "No finish sidecar"
+)
+
+tampered_finish_value = finish_snapshot(finish_instruction)
+tampered_finish_value["finish_look_out"] += " altered"
+try:
+    generator(
+        image,
+        picker,
+        finish=FinishSource(tampered_finish_value),
+    )._resolve_exact_shot_generation_inputs(valid_params(prompt="reject tamper"))
+except RuntimeError as exc:
+    assert "integrity" in str(exc)
+else:
+    raise AssertionError("A tampered Finish Look sidecar reached Seedance")
+
+wrong_shot_finish_value = finish_snapshot(finish_instruction)
+wrong_shot_finish_value["shot_uuid"] = "another-shot"
+try:
+    generator(
+        image,
+        picker,
+        finish=FinishSource(wrong_shot_finish_value),
+    )._resolve_exact_shot_generation_inputs(valid_params(prompt="reject wrong Shot"))
+except RuntimeError as exc:
+    assert "selected Shot" in str(exc)
+else:
+    raise AssertionError("A cross-Shot Finish Look sidecar reached Seedance")
 
 
 # Seedance 2.5 is a separate active Broker contract.  Persisted BytePlus model

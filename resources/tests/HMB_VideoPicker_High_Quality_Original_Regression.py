@@ -423,8 +423,8 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
     )
 
 
-# Selecting Original must replace stale Color-slot camera/range/FPS metadata,
-# not only its URL and marker list.
+# Selecting Original projects its own media metadata into the player without
+# overwriting the single shared Maya camera/range/FPS or authored markers.
 view_node = picker.HMBVideoPickerLibrary(name="high_quality_original_view")
 contaminated_view = picker._default_widget_state()
 contaminated_view.update(
@@ -437,7 +437,15 @@ contaminated_view.update(
         "start_frame": 1.0,
         "end_frame": 300.0,
         "source_frame_count": 300,
-        "markers": [{"color": "Red"}],
+        "markers": [{
+            "color": "Red",
+            "asset_id": "Hero",
+            "group_name": "Hero",
+            "subject_root": "|Hero",
+            "full_dag_path": "|Hero",
+            "video_slot": 1,
+            "picker_order": 1,
+        }],
         "original_metadata": {
             "camera": "|originalCam",
             "fps": 24.0,
@@ -448,15 +456,17 @@ contaminated_view.update(
         },
     }
 )
+normalized_stage = picker._parse_state(contaminated_view)
 original_view = view_node._apply_selected_view_fields(contaminated_view)
-assert original_view["camera"] == "|originalCam"
-assert original_view["source_fps"] == 24.0
-assert original_view["start_frame"] == 1001.0
-assert original_view["end_frame"] == 1010.0
-assert original_view["source_frame_count"] == 10
-assert original_view["output_width"] == 1920
-assert original_view["output_height"] == 1080
-assert original_view["markers"] == []
+for key in (
+    "camera", "source_fps", "start_frame", "end_frame", "source_frame_count",
+    "output_width", "output_height", "markers", "slot_assignments", "slot_visibility",
+):
+    assert original_view[key] == normalized_stage[key], key
+assert original_view["markers"][0]["group_name"] == "Hero"
+assert original_view["video_path"] == contaminated_view["original_video_path"]
+assert original_view["video_url"] == contaminated_view["original_video_url"]
+assert original_view["preview_metadata"] == contaminated_view["original_metadata"]
 
 
 class FakeMayaCmds(types.ModuleType):

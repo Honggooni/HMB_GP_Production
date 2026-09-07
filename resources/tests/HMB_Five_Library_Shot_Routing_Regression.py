@@ -30,6 +30,7 @@ routing = load_routing()
 assert routing.KNOWN_KINDS == {
     routing.KIND_IMAGE_ASSET,
     routing.KIND_VIDEO_PICKER,
+    routing.KIND_FINISH_LOOK,
     routing.KIND_PROMPT,
     routing.KIND_AGENT,
     routing.KIND_SEEDANCE,
@@ -96,6 +97,9 @@ class Participant:
         self.catalog_count = 0
         self.statuses: list[dict[str, Any]] = []
         self.prepared_prompt_sources: list[str] = []
+        self.hydrated_picker_sources: list[tuple[str, str]] = []
+        self.picker_hydrate_result = True
+        self.picker_projection_clears: list[tuple[str, str]] = []
         self._hmb_node_deleted = False
 
     def _hmb_shot_channel_subscription(self) -> dict[str, Any]:
@@ -137,6 +141,22 @@ class Participant:
         self.prepared_prompt_sources.append(str(source.name))
         return True
 
+    def _hmb_hydrate_shot_picker_from_source(
+        self,
+        source: Any,
+        source_parameter: str,
+    ) -> bool:
+        self.hydrated_picker_sources.append((str(source.name), source_parameter))
+        return self.picker_hydrate_result
+
+    def _hmb_clear_picker_source_projection(
+        self,
+        code: str = "picker_unavailable",
+        message: str = "",
+    ) -> bool:
+        self.picker_projection_clears.append((code, message))
+        return True
+
 
 image = Participant(
     "ImageAsset",
@@ -146,10 +166,11 @@ image = Participant(
     shot_uuid=SHOT,
 )
 video = Participant("VideoPicker", routing.KIND_VIDEO_PICKER)
+finish = Participant("FinishLook", routing.KIND_FINISH_LOOK)
 prompt = Participant("Prompt", routing.KIND_PROMPT)
 agent = Participant("Agent", routing.KIND_AGENT)
 seedance = Participant("Seedance", routing.KIND_SEEDANCE)
-NODES = [image, video, prompt, agent, seedance]
+NODES = [image, video, finish, prompt, agent, seedance]
 CATALOG = catalog()
 image._hmb_shot_routing_catalog = lambda: CATALOG  # type: ignore[attr-defined]
 
@@ -185,10 +206,12 @@ result = routing.reconcile_shot_routing(
 assert result["ok"] is True, result
 assert result["code"] == "ready", result
 assert video.catalog_count == 1
+assert finish.catalog_count == 1
 assert prompt.catalog_count == 1
 assert agent.catalog_count == 1
 assert seedance.catalog_count == 1
 assert prompt.shot_uuid == SHOT
+assert finish.shot_uuid == SHOT
 assert agent.shot_uuid == SHOT
 assert seedance.shot_uuid == SHOT
 assert seedance.prepared_prompt_sources == ["Agent"]
@@ -200,7 +223,9 @@ assert created_edges == {
     ("Agent", "output", "Seedance", "prompt"),
     ("ImageAsset", "SHOT_ASSET_OUT", "Seedance", "SHOT_ASSET_IN"),
     ("VideoPicker", "SHOT_PICKER_OUT", "Seedance", "SHOT_PICKER_IN"),
+    ("FinishLook", "SHOT_FINISH_LOOK_OUT", "Seedance", "SHOT_FINISH_LOOK_IN"),
 }
+assert finish.hydrated_picker_sources == []
 saved_edges = set(created_edges)
 reload_result = routing.reconcile_shot_routing(
     image,
@@ -209,6 +234,91 @@ reload_result = routing.reconcile_shot_routing(
 assert reload_result["ok"] is True, reload_result
 assert reload_result["changed"] == 0, reload_result
 assert created_edges == saved_edges
+assert finish.hydrated_picker_sources == []
+
+
+# Video Tools lives inside Picker. Finish still receives the Shot catalog, but
+# never acquires a media dependency with or without a Seedance node present.
+finish_only_image = Participant(
+    "FinishOnlyImage",
+    routing.KIND_IMAGE_ASSET,
+    enabled=True,
+    channel_uuid=CHANNEL,
+    shot_uuid=SHOT,
+)
+finish_only_image._hmb_shot_routing_catalog = lambda: CATALOG  # type: ignore[attr-defined]
+finish_only_picker = Participant("FinishOnlyPicker", routing.KIND_VIDEO_PICKER)
+finish_only_target = Participant("FinishOnlyTarget", routing.KIND_FINISH_LOOK)
+NODES[:] = [finish_only_image, finish_only_picker, finish_only_target]
+created_edges.clear()
+finish_only_result = routing.reconcile_shot_routing(
+    finish_only_image,
+    _allow_unready_cleanup=True,
+)
+assert finish_only_result["ok"] is True, finish_only_result
+assert created_edges == set()
+assert finish_only_target.catalog_count == 1
+assert finish_only_target.shot_uuid == SHOT
+assert finish_only_target.hydrated_picker_sources == []
+
+
+# A legacy projection callback is not consulted, even when it would fail.
+optional_image = Participant(
+    "OptionalImage",
+    routing.KIND_IMAGE_ASSET,
+    enabled=True,
+    channel_uuid=CHANNEL,
+    shot_uuid=SHOT,
+)
+optional_image._hmb_shot_routing_catalog = lambda: CATALOG  # type: ignore[attr-defined]
+optional_picker = Participant("OptionalPicker", routing.KIND_VIDEO_PICKER)
+optional_finish = Participant("OptionalFinish", routing.KIND_FINISH_LOOK)
+optional_finish.picker_hydrate_result = False
+NODES[:] = [optional_image, optional_picker, optional_finish]
+created_edges.clear()
+optional_hydrate_result = routing.reconcile_shot_routing(
+    optional_image,
+    _allow_unready_cleanup=True,
+)
+assert optional_hydrate_result["ok"] is True, optional_hydrate_result
+assert optional_hydrate_result["failures"] == (), optional_hydrate_result
+assert optional_finish.hydrated_picker_sources == []
+assert created_edges == set()
+
+
+# A host that cannot create the retired edge must never be asked to do so.
+def reject_optional_picker_edge(edge: Any, _subscriptions: Any) -> tuple[bool, str]:
+    if (
+        edge.source_parameter == "SHOT_PICKER_OUT"
+        and edge.target_parameter == "SHOT_PICKER_IN"
+        and edge.target.kind == routing.KIND_FINISH_LOOK
+    ):
+        raise AssertionError("The retired Picker -> Finish edge was requested")
+    return ensure_edge(edge, _subscriptions)
+
+
+routing._ensure_edge = reject_optional_picker_edge
+edge_failure_image = Participant(
+    "EdgeFailureImage",
+    routing.KIND_IMAGE_ASSET,
+    enabled=True,
+    channel_uuid=CHANNEL,
+    shot_uuid=SHOT,
+)
+edge_failure_image._hmb_shot_routing_catalog = lambda: CATALOG  # type: ignore[attr-defined]
+edge_failure_picker = Participant("EdgeFailurePicker", routing.KIND_VIDEO_PICKER)
+edge_failure_finish = Participant("EdgeFailureFinish", routing.KIND_FINISH_LOOK)
+NODES[:] = [edge_failure_image, edge_failure_picker, edge_failure_finish]
+created_edges.clear()
+optional_edge_result = routing.reconcile_shot_routing(
+    edge_failure_image,
+    _allow_unready_cleanup=True,
+)
+assert optional_edge_result["ok"] is True, optional_edge_result
+assert optional_edge_result["failures"] == (), optional_edge_result
+assert edge_failure_finish.picker_projection_clears == []
+assert created_edges == set()
+routing._ensure_edge = ensure_edge
 
 
 # Seedance must route either media source independently. Without an exact Agent
@@ -469,7 +579,85 @@ assert created_edges == {
 }
 
 
-# Five independent Shot chains must remain exact even though every managed
+# Finish Look ownership follows the same one-node-per-Shot rule. Duplicate
+# Finish nodes are released to Only without touching their authored look state,
+# and Seedance continues with the existing Image/Video/Agent routes but no
+# ambiguous finishing sidecar.
+class RejectingFinish(Participant):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.reject_count = 0
+        self.finish_state = {"beauty": {"enabled": True}, "film": {"scale_cc": 0.3}}
+
+    def _hmb_reject_duplicate_shot_selection(self, _reason: Any = "") -> dict[str, Any]:
+        self.reject_count += 1
+        self.enabled = False
+        self.channel_uuid = ""
+        self.shot_uuid = ""
+        self.shot_name = "Only"
+        return self._hmb_shot_channel_subscription()
+
+
+duplicate_finish_image = Participant(
+    "DuplicateFinishImage",
+    routing.KIND_IMAGE_ASSET,
+    enabled=True,
+    channel_uuid=CHANNEL,
+    shot_uuid=SHOT,
+)
+duplicate_finish_image._hmb_shot_routing_catalog = lambda: CATALOG  # type: ignore[attr-defined]
+duplicate_finish_a = RejectingFinish(
+    "FinishDuplicateA",
+    routing.KIND_FINISH_LOOK,
+    enabled=True,
+    channel_uuid=CHANNEL,
+    shot_uuid=SHOT,
+)
+duplicate_finish_b = RejectingFinish(
+    "FinishDuplicateB",
+    routing.KIND_FINISH_LOOK,
+    enabled=True,
+    channel_uuid=CHANNEL,
+    shot_uuid=SHOT,
+)
+duplicate_finish_seedance = Participant(
+    "SeedanceAfterFinishDuplicate",
+    routing.KIND_SEEDANCE,
+    enabled=True,
+    channel_uuid=CHANNEL,
+    shot_uuid=SHOT,
+)
+finish_a_state = dict(duplicate_finish_a.finish_state)
+finish_b_state = dict(duplicate_finish_b.finish_state)
+NODES[:] = [
+    duplicate_finish_image,
+    duplicate_finish_a,
+    duplicate_finish_b,
+    duplicate_finish_seedance,
+]
+created_edges.clear()
+duplicate_finish_result = routing.reconcile_shot_routing(
+    duplicate_finish_image,
+    _allow_unready_cleanup=True,
+)
+assert duplicate_finish_result["ok"] is True, duplicate_finish_result
+assert duplicate_finish_a.reject_count == 1
+assert duplicate_finish_b.reject_count == 1
+assert duplicate_finish_a.enabled is False and duplicate_finish_b.enabled is False
+assert duplicate_finish_a.finish_state == finish_a_state
+assert duplicate_finish_b.finish_state == finish_b_state
+assert created_edges == {
+    (
+        "DuplicateFinishImage",
+        "SHOT_ASSET_OUT",
+        "SeedanceAfterFinishDuplicate",
+        "SHOT_ASSET_IN",
+    )
+}
+
+
+# Five independent Shot chains across all six libraries must remain exact even
+# though every managed
 # edge is hidden from the canvas. No node age/name fallback may cross-connect
 # Prompt 1 to Agent/Seedance 2 through 5.
 multi_shots = [
@@ -529,6 +717,7 @@ multi_image._hmb_shot_routing_catalog = lambda: MULTI_CATALOG  # type: ignore[at
 multi_nodes: list[Participant] = [multi_image, multi_video]
 for shot in multi_shots:
     for kind, prefix in (
+        (routing.KIND_FINISH_LOOK, "FinishLook"),
         (routing.KIND_PROMPT, "Prompt"),
         (routing.KIND_AGENT, "Agent"),
         (routing.KIND_SEEDANCE, "Seedance"),
@@ -552,7 +741,7 @@ multi_result = routing.reconcile_shot_routing(
     _allow_unready_cleanup=True,
 )
 assert multi_result["ok"] is True, multi_result
-assert len(created_edges) == 30, created_edges
+assert len(created_edges) == 35, created_edges
 for shot in multi_shots:
     number = shot["number"]
     exact_edges = {
@@ -562,10 +751,16 @@ for shot in multi_shots:
         (f"Agent{number}", "output", f"Seedance{number}", "prompt"),
         ("ImageAssetExact", "SHOT_ASSET_OUT", f"Seedance{number}", "SHOT_ASSET_IN"),
         ("VideoPickerExact", "SHOT_PICKER_OUT", f"Seedance{number}", "SHOT_PICKER_IN"),
+        (
+            f"FinishLook{number}",
+            "SHOT_FINISH_LOOK_OUT",
+            f"Seedance{number}",
+            "SHOT_FINISH_LOOK_IN",
+        ),
     }
     assert exact_edges <= created_edges
 for source_name, _source_port, target_name, _target_port in created_edges:
-    source_number = source_name[-1:] if source_name.startswith(("Prompt", "Agent")) else ""
+    source_number = source_name[-1:] if source_name.startswith(("Prompt", "Agent", "FinishLook")) else ""
     target_number = target_name[-1:] if target_name.startswith(("Prompt", "Agent", "Seedance")) else ""
     if source_number and target_number:
         assert source_number == target_number, (source_name, target_name)
@@ -634,10 +829,122 @@ assert deleted_edges == [managed_prompt_edge]
 assert foreign_prompt_edge in incoming_edges
 assert different_handle_edge in incoming_edges
 
+# Finish Only/delete cleanup owns only the automatic Picker dependency. A
+# foreign edge on the same hidden target remains user-owned.
+cleanup_picker_node = Participant("CleanupPicker", cleanup_routing.KIND_VIDEO_PICKER)
+cleanup_finish_node = Participant("CleanupFinish", cleanup_routing.KIND_FINISH_LOOK)
+cleanup_picker = cleanup_routing.ShotSubscription(
+    cleanup_picker_node,
+    cleanup_picker_node.name,
+    cleanup_routing.KIND_VIDEO_PICKER,
+    True,
+    CHANNEL,
+    "",
+    1,
+    "Only",
+)
+cleanup_finish = cleanup_routing.ShotSubscription(
+    cleanup_finish_node,
+    cleanup_finish_node.name,
+    cleanup_routing.KIND_FINISH_LOOK,
+    False,
+    "",
+    "",
+    1,
+    "Only",
+)
+managed_picker_edge = Incoming(cleanup_picker_node.name, "SHOT_PICKER_OUT")
+managed_picker_edge.target_node_name = cleanup_finish_node.name
+managed_picker_edge.target_parameter_name = "SHOT_PICKER_IN"
+foreign_picker_edge = Incoming("ExternalPicker", "SHOT_PICKER_OUT")
+foreign_picker_edge.target_node_name = cleanup_finish_node.name
+foreign_picker_edge.target_parameter_name = "SHOT_PICKER_IN"
+incoming_edges[:] = [managed_picker_edge, foreign_picker_edge]
+deleted_edges.clear()
+removed, cleanup_failures = cleanup_routing._clear_remote_edges(
+    cleanup_finish,
+    {
+        cleanup_picker.node_name: cleanup_picker,
+        cleanup_finish.node_name: cleanup_finish,
+    },
+)
+assert removed == 1
+assert cleanup_failures == []
+assert deleted_edges == [managed_picker_edge]
+assert incoming_edges == [foreign_picker_edge]
+
+
+# Loading a saved Finish, including Only, retires the old automatic dependency.
+# It must preserve different handles and non-Picker HMB participants, not just
+# completely foreign nodes. Legacy projection is cleared only when no manual
+# source remains on that input, and a second pass does nothing.
+cleanup_other_node = Participant("CleanupPrompt", cleanup_routing.KIND_PROMPT)
+cleanup_nodes = [cleanup_picker_node, cleanup_finish_node, cleanup_other_node]
+cleanup_routing._same_flow_nodes = lambda _node: ("RetiredFinishRouteFlow", cleanup_nodes)
+cleanup_routing._incoming_connections = lambda target: [
+    edge for edge in incoming_edges if edge.target_node_name == target.name
+]
+
+
+def reject_retired_finish_edge(edge: Any, _subscriptions: Any) -> tuple[bool, str]:
+    assert not (
+        edge.target is cleanup_finish_node
+        and edge.target_parameter == "SHOT_PICKER_IN"
+    ), "Picker -> Finish must not be re-created during workflow restore"
+    return True, "existing"
+
+
+cleanup_routing._ensure_edge = reject_retired_finish_edge
+wrong_handle_edge = Incoming(cleanup_picker_node.name, "VIDEO_OUT")
+wrong_handle_edge.target_node_name = cleanup_finish_node.name
+wrong_handle_edge.target_parameter_name = "SHOT_PICKER_IN"
+non_picker_hmb_edge = Incoming(cleanup_other_node.name, "SHOT_PICKER_OUT")
+non_picker_hmb_edge.target_node_name = cleanup_finish_node.name
+non_picker_hmb_edge.target_parameter_name = "SHOT_PICKER_IN"
+incoming_edges[:] = [
+    managed_picker_edge, foreign_picker_edge, wrong_handle_edge, non_picker_hmb_edge
+]
+deleted_edges.clear()
+cleanup_finish_node.enabled = True
+cleanup_finish_node.channel_uuid = CHANNEL
+cleanup_finish_node.shot_uuid = SHOT
+migration_result = cleanup_routing.reconcile_shot_routing(
+    cleanup_finish_node, _allow_unready_cleanup=True
+)
+assert migration_result["ok"] is True, migration_result
+assert migration_result["changed"] == 1, migration_result
+assert deleted_edges == [managed_picker_edge]
+assert incoming_edges == [foreign_picker_edge, wrong_handle_edge, non_picker_hmb_edge]
+assert cleanup_finish_node.picker_projection_clears == []
+
+incoming_edges[:] = [managed_picker_edge]
+deleted_edges.clear()
+cleanup_finish_node.enabled = False
+cleanup_finish_node.channel_uuid = ""
+cleanup_finish_node.shot_uuid = ""
+projection_migration_result = cleanup_routing.reconcile_shot_routing(
+    cleanup_finish_node, _allow_unready_cleanup=True
+)
+assert projection_migration_result["ok"] is True, projection_migration_result
+assert projection_migration_result["changed"] == 1, projection_migration_result
+assert incoming_edges == []
+assert cleanup_finish_node.picker_projection_clears == [
+    (
+        "video_tools_moved_to_picker",
+        "Video Tools is available in VideoPicker expanded mode.",
+    )
+]
+repeat_migration_result = cleanup_routing.reconcile_shot_routing(
+    cleanup_finish_node, _allow_unready_cleanup=True
+)
+assert repeat_migration_result["changed"] == 0, repeat_migration_result
+assert len(cleanup_finish_node.picker_projection_clears) == 1
+
 
 source_by_kind = {
     routing.KIND_IMAGE_ASSET: ROOT / "HMBImageAssetLibrary.py",
     routing.KIND_VIDEO_PICKER: ROOT / "HMBVideoPickerLibrary.py",
+    routing.KIND_FINISH_LOOK: ROOT / "HMBFinishLookLibrary.py",
     routing.KIND_PROMPT: ROOT / "HMBPromptLibrary.py",
     routing.KIND_AGENT: ROOT / "HMBAgentLibrary.py",
     routing.KIND_SEEDANCE: ROOT / "HMBSeedanceGeneration.py",
@@ -675,15 +982,23 @@ widget_paths = {
     item["name"]: ROOT / item["path"]
     for item in manifest.get("widgets", [])
 }
-for name in (
+shot_widget_names = (
     "HMBAgentLibraryWidget",
     "HMBImageAssetLibraryWidget",
+    "HMBFinishLookLibraryWidget",
     "HMBPromptLibraryScopedBindingWidget",
     "HMBSeedanceGenerationWidget",
     "HMBVideoPickerLibraryWidget",
-):
+)
+for name in shot_widget_names:
     assert name in widget_paths, name
     assert widget_paths[name].is_file(), widget_paths[name]
+
+shared_shot_colors = ("#F472B6", "#3B82F6", "#10B981", "#8B5CF6", "#EAB308")
+for name in shot_widget_names:
+    source = widget_paths[name].read_text(encoding="utf-8")
+    for color in shared_shot_colors:
+        assert color in source, (name, color)
 
 agent_widget = widget_paths["HMBAgentLibraryWidget"].read_text(encoding="utf-8")
 assert "hmbAgentShotOptions" in agent_widget
@@ -700,11 +1015,23 @@ assert "Remote waiting" not in seedance_widget
 assert "data-seedance-shot-number" in seedance_widget
 assert 'name: "Only"' in seedance_widget
 
+finish_widget = widget_paths["HMBFinishLookLibraryWidget"].read_text(
+    encoding="utf-8"
+)
+assert "hmbFinishLookShotOptions" in finish_widget
+assert 'class="hmb-finish-look__shot-select' in finish_widget
+assert "shot_catalog" in finish_widget
+assert "data-shot-number" in finish_widget
+for color in shared_shot_colors:
+    assert color in finish_widget
+
 seedance_source = source_by_kind[routing.KIND_SEEDANCE].read_text(encoding="utf-8")
 assert 'SHOT_CONNECTION_PENDING_LABEL = "Shot connection pending"' in seedance_source
 assert 'SHOT_ONLY_LABEL = "Only"' in seedance_source
 assert 'SHOT_ASSET_INPUT_PARAMETER = "SHOT_ASSET_IN"' in seedance_source
 assert 'SHOT_PICKER_INPUT_PARAMETER = "SHOT_PICKER_IN"' in seedance_source
+assert 'SHOT_FINISH_LOOK_INPUT_PARAMETER = "SHOT_FINISH_LOOK_IN"' in seedance_source
+assert "_compose_finish_look_prompt" in seedance_source
 assert 'resolved["prompt"] = str(params.get("prompt") or "")' in seedance_source
 
 release_builder = (ROOT / "tools/package_runtime_release.py").read_text(
@@ -715,7 +1042,7 @@ for path in widget_paths.values():
     assert f'"{relative}"' in release_builder, relative
 
 print(
-    "HMB five-library Shot routing regression: PASS "
+    "HMB six-library Shot routing regression: PASS "
     "(catalog fan-out, exact managed edges, Prompt-filtered Agent UI, "
     "direct-source Seedance UI, release widget coverage)"
 )

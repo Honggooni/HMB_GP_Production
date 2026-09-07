@@ -126,7 +126,8 @@ assert.match(
 );
 assert.match(
   selectedSnapshotSource,
-  /snapshotForViewport = viewportMode === "snapshot"[\s\S]*?hmbSnapshotMediaUrl\(selectedSnapshot\)/,
+  /snapshotForViewport = !initialToolPreview && viewportMode === "snapshot"[\s\S]*?hmbSnapshotMediaUrl\(selectedSnapshot\)/,
+  "Snapshot media remains available in Video Output but cannot occupy an independent tool viewport.",
 );
 assert.doesNotMatch(
   JSON.stringify(firstHistory),
@@ -148,20 +149,24 @@ const generateToolbarStart = widgetSource.indexOf('class="generate-playblast-too
 const playblastToolbarStart = widgetSource.indexOf('class="playblast-settings-toolbar"', viewportMarkupStart);
 const viewportTitleStart = widgetSource.indexOf('class="panel-title viewport-title"', viewportMarkupStart);
 const viewportStageStart = widgetSource.indexOf('class="viewport-stage"', viewportMarkupStart);
+const frameStripStart = widgetSource.indexOf('class="frame-info-strip"', viewportMarkupStart);
+const toolsPanelStart = widgetSource.indexOf('class="picker-tools-panel ', viewportMarkupStart);
 const rightStackStart = widgetSource.indexOf('class="right-stack"', viewportMarkupStart);
 const rightStackEnd = widgetSource.indexOf("</aside>", rightStackStart);
 assert.ok(viewportMarkupStart >= 0 && snapshotToolbarStart > viewportMarkupStart);
 assert.ok(
-  snapshotToolbarStart < generateToolbarStart
+  viewportTitleStart < viewportStageStart
+    && viewportStageStart < frameStripStart
+    && frameStripStart < snapshotToolbarStart
+    && snapshotToolbarStart < generateToolbarStart
     && generateToolbarStart < playblastToolbarStart
-    && playblastToolbarStart < viewportTitleStart
-    && viewportTitleStart < viewportStageStart,
-  "Center-column controls must render Snapshot/CAM, Generate, Settings, then Viewport.",
+    && playblastToolbarStart < toolsPanelStart,
+  "All modes share the upper tabs, viewport and transport; Snapshot/CAM, Generate and Settings belong below the frame strip beside the alternate tools panel.",
 );
 assert.match(
   widgetSource,
   /\.playblast-settings-toolbar\{[^}]*min-height:88px;flex:0 0 88px;[^}]*display:block;[^}]*padding:7px 10px;/,
-  "The Settings area must expand downward into the former Viewport-header position.",
+  "Moving Settings below the viewport must preserve its original height and spacing.",
 );
 assert.match(
   widgetSource,
@@ -173,14 +178,14 @@ assert.match(
   /\.settings-grid-inline \.settings-compact-row\{grid-column:1\/-1;grid-row:2;grid-template-columns:repeat\(3,minmax\(0,1fr\)\);/,
   "FPS, Format, and Maya must receive equal thirds of the lower Settings row.",
 );
-const playblastToolbarMarkup = widgetSource.slice(playblastToolbarStart, viewportTitleStart);
+const playblastToolbarMarkup = widgetSource.slice(playblastToolbarStart, toolsPanelStart);
 assert.equal((playblastToolbarMarkup.match(/class="settings-primary-item"/g) || []).length, 2);
 assert.doesNotMatch(playblastToolbarMarkup, /playblast-settings-heading|tr\.playblastSettings|PLAYBLAST SETTINGS/);
 assert.equal((widgetSource.match(/id="run-video"/g) || []).length, 1);
 assert.match(
   widgetSource.slice(generateToolbarStart, playblastToolbarStart),
-  /role="group"[^>]*aria-label="\$\{escapeHtml\(tr\.generate\)\}"[\s\S]*?id="run-video"[^>]*aria-label="\$\{escapeHtml\(tr\.generate\)\}"/,
-  "The separated Generate row must retain an accessible name and the existing run-video control identity.",
+  /role="group"[^>]*aria-label="\$\{escapeHtml\(tr\.generate\)\}"[\s\S]*?id="run-video"[^>]*aria-label="\$\{escapeHtml\(hmbPickerGenerateCaption\(state, container\)\)\}"/,
+  "The Generate row keeps its control identity and names the shared Maya input and destination Shot.",
 );
 assert.match(widgetSource.slice(rightStackStart, rightStackEnd), /video-assets-section/);
 assert.doesNotMatch(widgetSource.slice(rightStackStart, rightStackEnd), /playblast-settings-section/);

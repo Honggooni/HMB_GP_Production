@@ -196,7 +196,7 @@ assert [
     row["video_slot"]
     for row in packed["slot_assignments"]
     if row["bindings"]
-] == [1, 4]
+] == [1]
 assert packed["mask_authoring_slot"] == 1
 assert picker._slot_assignment_bindings(packed, picker._mask_authoring_slot(packed))[0][
     "full_dag_path"
@@ -312,12 +312,10 @@ assert picker._operation_input_digest(
     "run_video", digest_scene, changed_mask_controls, 1,
 ) != mask_digest
 changed_original_controls = copy.deepcopy(packed)
-next(
-    row for row in changed_original_controls["slot_assignments"]
-    if int(row.get("video_slot") or 0) == 2
-)["bindings"] = [{
-    "full_dag_path": "|presentation-only", "color": "Green",
-}]
+changed_original_controls["slot_assignments"].append({
+    "video_slot": 2,
+    "bindings": [{"full_dag_path": "|presentation-only", "color": "Green"}],
+})
 assert picker._operation_input_digest(
     "run_video", digest_scene, changed_original_controls, 1,
 ) == mask_digest
@@ -682,12 +680,13 @@ assert [child.name for child in order_node.root_ui_element.children] == [
 # Package, Agent freeze, policy, and custom-widget lifecycle contracts.
 # ---------------------------------------------------------------------------
 manifest = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))
-assert manifest["metadata"]["library_version"] == "0.7.38"
+assert manifest["metadata"]["library_version"] == "0.7.41"
 assert "TypedAuxiliaryVideoAssets" in manifest["metadata"]["tags"]
 assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencies"]
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
 assert registered_widgets == {
     "HMBAgentLibraryWidget",
+    "HMBFinishLookLibraryWidget",
     "HMBImageAssetLibraryWidget",
     "HMBImageAssetThumbnailPatchBridgeWidget",
     "HMBPromptLibraryScopedBindingWidget",
@@ -695,6 +694,7 @@ assert registered_widgets == {
     "HMBVideoPickerCommandBridgeWidget",
     "HMBVideoPickerLibraryWidget",
 }
+assert (ROOT / "widgets/HMBFinishLookLibraryWidget.js").is_file()
 assert (ROOT / "widgets/HMBImageAssetThumbnailPatchBridgeWidget.js").is_file()
 assert (ROOT / "widgets/HMBVideoPickerCommandBridgeWidget_v032.js").is_file()
 assert (ROOT / "widgets/HMBSeedanceGenerationWidget.js").is_file()

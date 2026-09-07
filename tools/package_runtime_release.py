@@ -18,8 +18,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.7.38"
-RELEASE_VERSION = "0.7.38"
+RELEASE_LABEL = "v0.7.41"
+RELEASE_VERSION = "0.7.41"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -42,6 +42,7 @@ RUNTIME_INSTALL_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
     "HMBAgentLibrary.py",
+    "HMBFinishLookLibrary.py",
     "HMBImageAssetLibrary.py",
     "HMBPromptLibrary.py",
     "HMBSeedanceGeneration.py",
@@ -51,7 +52,9 @@ RUNTIME_INSTALL_FILES = (
     "_hmb_mp4_verify.py",
     "_hmb_common.py",
     "_hmb_screen_space.py",
+    "_hmb_video_tools.py",
     "widgets/HMBAgentLibraryWidget.js",
+    "widgets/HMBFinishLookLibraryWidget.js",
     "widgets/HMBImageAssetLibraryWidget.js",
     "widgets/HMBImageAssetThumbnailPatchBridgeWidget.js",
     "widgets/HMBPromptLibraryScopedBindingWidget.js",
@@ -72,7 +75,7 @@ SOURCE_FILES = (*RUNTIME_INSTALL_FILES, *DISTRIBUTION_ONLY_FILES)
 CANONICAL_CRLF_SOURCE_FILES = {
     PurePosixPath("Install_HMB_GP_Production.ps1"),
 }
-if len(RUNTIME_INSTALL_FILES) != 22 or len(DISTRIBUTION_ONLY_FILES) != 4:
+if len(RUNTIME_INSTALL_FILES) != 25 or len(DISTRIBUTION_ONLY_FILES) != 4:
     raise RuntimeError("Runtime/distribution release boundary count mismatch.")
 if set(RUNTIME_INSTALL_FILES) & set(DISTRIBUTION_ONLY_FILES):
     raise RuntimeError("Runtime and distribution-only release files overlap.")

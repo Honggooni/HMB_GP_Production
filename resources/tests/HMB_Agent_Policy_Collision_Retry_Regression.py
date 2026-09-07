@@ -4,6 +4,7 @@ import inspect
 from pathlib import Path
 import sys
 from types import MethodType
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -153,10 +154,21 @@ def drive(scripted_output: str):
 
     iterator = node.process()
     result = None
-    try:
-        next(iterator)
-    except StopIteration as stop:
-        result = stop.value
+    # This unit fixture supplies the Standard Agent's parent list API as well
+    # as its scalar API. Public CI has no Standard Library, and the import-only
+    # DataNode fallback intentionally does not implement get_parameter_list_value.
+    # Keep testing the real HMB merge and its caller-rule preservation in either
+    # environment; do not replace HMBAgentLibrary.get_parameter_list_value.
+    with patch.object(
+        agent._BaseAgent,
+        "get_parameter_list_value",
+        lambda self, name: self.get_parameter_value(name),
+        create=True,
+    ):
+        try:
+            next(iterator)
+        except StopIteration as stop:
+            result = stop.value
 
     return {
         "calls": native_calls[0],

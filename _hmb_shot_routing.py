@@ -30,6 +30,7 @@ KIND_VIDEO_PICKER = "video_picker"
 KIND_PROMPT = "prompt"
 KIND_AGENT = "agent"
 KIND_SEEDANCE = "seedance"
+KIND_FINISH_LOOK = "finish_look"
 KNOWN_KINDS = frozenset(
     {
         KIND_IMAGE_ASSET,
@@ -37,6 +38,7 @@ KNOWN_KINDS = frozenset(
         KIND_PROMPT,
         KIND_AGENT,
         KIND_SEEDANCE,
+        KIND_FINISH_LOOK,
     }
 )
 SINGLETON_KINDS = frozenset({KIND_IMAGE_ASSET, KIND_VIDEO_PICKER})
@@ -1189,7 +1191,18 @@ def _clear_remote_edges(
             # Current direct Shot-source routes.
             ("SHOT_ASSET_IN", "SHOT_ASSET_OUT"),
             ("SHOT_PICKER_IN", "SHOT_PICKER_OUT"),
+            ("SHOT_FINISH_LOOK_IN", "SHOT_FINISH_LOOK_OUT"),
         )
+    elif subscription.kind == KIND_FINISH_LOOK:
+        # Migration cleanup only: Video Tools now lives inside VideoPicker.
+        # Keep recognizing the retired HMB edge in saved workflows without
+        # claiming a foreign/manual source on this former hidden input.
+        routes = (("SHOT_PICKER_IN", "SHOT_PICKER_OUT"),)
+        subscriptions = {
+            name: item
+            for name, item in subscriptions.items()
+            if item.kind == KIND_VIDEO_PICKER
+        }
     else:
         routes = ()
 
@@ -1236,6 +1249,21 @@ def _reject_duplicate_agent_selection(node: Any) -> bool:
         return False
     try:
         callback("duplicate_agent_shot")
+        _mark_authoritative(node)
+    except Exception:
+        return False
+    current = _subscription_for(node)
+    return current is not None and not current.enabled
+
+
+def _reject_duplicate_finish_look_selection(node: Any) -> bool:
+    """Return a duplicate Finish Look claimant to Only."""
+
+    callback = getattr(node, "_hmb_reject_duplicate_shot_selection", None)
+    if not callable(callback):
+        return False
+    try:
+        callback("duplicate_finish_look_shot")
         _mark_authoritative(node)
     except Exception:
         return False
@@ -1352,6 +1380,47 @@ def reconcile_shot_routing(
                         },
                         covered_node_ids=(id(value) for value in nodes),
                     )
+
+            # Video Tools migrated into VideoPicker; Finish Look no longer
+            # consumes Picker media. Retire the former automatic dependency
+            # for enabled and Only nodes alike, after workflow hydration is
+            # complete. Exact HMB Picker handles are owned by the router;
+            # foreign inputs and every other Finish connection remain intact.
+            picker_subscriptions = {
+                name: item
+                for name, item in by_name.items()
+                if item.kind == KIND_VIDEO_PICKER
+            }
+            for recipient in values:
+                if recipient.kind != KIND_FINISH_LOOK:
+                    continue
+                removed, detail = _clear_hmb_route(
+                    recipient.node,
+                    "SHOT_PICKER_IN",
+                    picker_subscriptions,
+                    source_parameter="SHOT_PICKER_OUT",
+                )
+                changed += removed
+                if detail.startswith("unable"):
+                    failures.append(f"{recipient.node_name}: {detail}")
+                elif removed and not any(
+                    str(getattr(edge, "target_parameter_name", ""))
+                    == "SHOT_PICKER_IN"
+                    for edge in _incoming_connections(recipient.node)
+                ):
+                    clear_projection = getattr(
+                        recipient.node,
+                        "_hmb_clear_picker_source_projection",
+                        None,
+                    )
+                    if callable(clear_projection):
+                        try:
+                            clear_projection(
+                                "video_tools_moved_to_picker",
+                                "Video Tools is available in VideoPicker expanded mode.",
+                            )
+                        except Exception:
+                            pass
 
             # Compact catalog reconciliation occurs before edge changes so the
             # participant UI can update names without storing media payloads.
@@ -1522,11 +1591,12 @@ def reconcile_shot_routing(
                 key=lambda item: (
                     {
                         KIND_VIDEO_PICKER: 0,
-                        KIND_PROMPT: 1,
-                        KIND_AGENT: 2,
-                        KIND_SEEDANCE: 3,
-                        KIND_IMAGE_ASSET: 4,
-                    }.get(item.kind, 5),
+                        KIND_FINISH_LOOK: 1,
+                        KIND_PROMPT: 2,
+                        KIND_AGENT: 3,
+                        KIND_SEEDANCE: 4,
+                        KIND_IMAGE_ASSET: 5,
+                    }.get(item.kind, 6),
                     item.node_name,
                 ),
             )
@@ -1615,6 +1685,53 @@ def reconcile_shot_routing(
                                         preferred_prompt.get("shot_uuid"),
                                         128,
                                     )
+                                )
+                            except Exception:
+                                pass
+                    if recipient.kind == KIND_FINISH_LOOK and not recipient.channel_uuid:
+                        prepare_initial = getattr(
+                            recipient.node,
+                            "_hmb_prepare_initial_shot_selection",
+                            None,
+                        )
+                        if callable(prepare_initial):
+                            try:
+                                live_values = [
+                                    item
+                                    for item in (
+                                        _subscription_for(value)
+                                        for value in nodes
+                                    )
+                                    if item is not None
+                                ]
+                                claimed_finish_shots = {
+                                    item.shot_uuid
+                                    for item in live_values
+                                    if item.kind == KIND_FINISH_LOOK
+                                    and item.node is not recipient.node
+                                    and item.enabled
+                                    and item.channel_uuid == source.channel_uuid
+                                }
+                                available_finish_shots = [
+                                    item
+                                    for item in snapshot.get("shots", [])
+                                    if isinstance(item, dict)
+                                    and _clean(item.get("shot_uuid"), 128)
+                                    not in claimed_finish_shots
+                                ]
+                                preferred_finish = next(
+                                    (
+                                        item
+                                        for item in available_finish_shots
+                                        if _clean(item.get("shot_uuid"), 128)
+                                        == source.shot_uuid
+                                    ),
+                                    available_finish_shots[0]
+                                    if available_finish_shots
+                                    else {},
+                                )
+                                prepare_initial(
+                                    _clean(preferred_finish.get("shot_uuid"), 128)
                                 )
                             except Exception:
                                 pass
@@ -2210,6 +2327,91 @@ def reconcile_shot_routing(
                     failures.append(f"{agent.node_name}: {detail}")
                 _notify_status(agent.node, ok=ok, code="ready" if ok else "route_incomplete")
 
+            # Finish Look is optional for a Shot, but when present it has one
+            # unambiguous owner. Duplicate claimants are returned to Only so a
+            # stale or newly duplicated node can never inject two finishing
+            # contracts into one billable generation request.
+            finish_groups: dict[tuple[str, str], list[ShotSubscription]] = {}
+            for finish in routable_values:
+                if finish.kind == KIND_FINISH_LOOK and finish.enabled:
+                    finish_groups.setdefault(
+                        (finish.channel_uuid, finish.shot_uuid), []
+                    ).append(finish)
+            finish_claims_released = False
+            unresolved_finish_ids: set[int] = set()
+            for contenders in finish_groups.values():
+                if len(contenders) < 2:
+                    continue
+                for contender in contenders:
+                    if _reject_duplicate_finish_look_selection(contender.node):
+                        finish_claims_released = True
+                        _notify_status(
+                            contender.node,
+                            ok=True,
+                            code="only",
+                            details=(
+                                "Duplicate Finish Look Shot ownership was rejected; "
+                                "Only mode is active."
+                            ),
+                        )
+                    else:
+                        unresolved_finish_ids.add(id(contender.node))
+                        failures.append(
+                            f"{contender.node_name}: duplicate_finish_look_shot"
+                        )
+                        _notify_status(
+                            contender.node,
+                            ok=False,
+                            code="duplicate_finish_look_shot",
+                        )
+            if finish_claims_released:
+                values = [
+                    item
+                    for item in (_subscription_for(value) for value in nodes)
+                    if item is not None
+                ]
+                by_name = {item.node_name: item for item in values}
+                routable_values = [
+                    item
+                    for item in values
+                    if id(item.node) not in catalog_rejected_node_ids
+                ]
+                for candidate in tuple(routable_values):
+                    if candidate.kind != KIND_FINISH_LOOK:
+                        continue
+                    snapshot = getattr(
+                        candidate.node,
+                        "_hmb_shot_catalog_snapshot",
+                        None,
+                    )
+                    callback = getattr(
+                        candidate.node,
+                        "_hmb_reconcile_shot_routing",
+                        None,
+                    )
+                    if not isinstance(snapshot, dict) or not snapshot or not callable(callback):
+                        continue
+                    try:
+                        callback(snapshot)
+                        _mark_authoritative(candidate.node)
+                    except Exception as exc:
+                        detail = _clean(exc, 256) or exc.__class__.__name__
+                        catalog_rejected_node_ids.add(id(candidate.node))
+                        failures.append(
+                            f"{candidate.node_name}: catalog_rejected: {detail}"
+                        )
+                values = [
+                    item
+                    for item in (_subscription_for(value) for value in nodes)
+                    if item is not None
+                ]
+                by_name = {item.node_name: item for item in values}
+                routable_values = [
+                    item
+                    for item in values
+                    if id(item.node) not in catalog_rejected_node_ids
+                ]
+
             # Seedance receives the exact Agent final text selected for the
             # same Shot through its public prompt input.  Keeping a real public
             # edge lets the host render both ports as connected; the Seedance
@@ -2384,9 +2586,20 @@ def reconcile_shot_routing(
                     kind=KIND_VIDEO_PICKER,
                     channel_uuid=target.channel_uuid,
                 )
+                finish, finish_duplicate = _single(
+                    (
+                        item
+                        for item in routable_values
+                        if id(item.node) not in unresolved_finish_ids
+                    ),
+                    kind=KIND_FINISH_LOOK,
+                    channel_uuid=target.channel_uuid,
+                    shot_uuid=target.shot_uuid,
+                )
                 source_rejected = bool(
                     image is not None and id(image.node) in catalog_rejected_node_ids
                     or picker is not None and id(picker.node) in catalog_rejected_node_ids
+                    or finish is not None and id(finish.node) in catalog_rejected_node_ids
                 )
                 agent_identity_mismatch = bool(
                     agent is not None
@@ -2395,11 +2608,29 @@ def reconcile_shot_routing(
                         or agent.shot_name != target.shot_name
                     )
                 )
+                finish_identity_mismatch = bool(
+                    finish is not None
+                    and (
+                        finish.shot_number != target.shot_number
+                        or finish.shot_name != target.shot_name
+                    )
+                )
+                unresolved_finish = any(
+                    item.kind == KIND_FINISH_LOOK
+                    and item.enabled
+                    and item.channel_uuid == target.channel_uuid
+                    and item.shot_uuid == target.shot_uuid
+                    and id(item.node) in unresolved_finish_ids
+                    for item in values
+                )
                 if (
                     agent_duplicate
                     or agent_identity_mismatch
                     or image_duplicate
                     or picker_duplicate
+                    or finish_duplicate
+                    or finish_identity_mismatch
+                    or unresolved_finish
                     or (image is None and picker is None)
                     or source_rejected
                 ):
@@ -2408,6 +2639,10 @@ def reconcile_shot_routing(
                         if agent_duplicate
                         else "shot_identity_mismatch"
                         if agent_identity_mismatch
+                        else "duplicate_finish_look"
+                        if (finish_duplicate or unresolved_finish)
+                        else "finish_look_identity_mismatch"
+                        if finish_identity_mismatch
                         else "duplicate_shot_source"
                         if (image_duplicate or picker_duplicate)
                         else "shot_source_unavailable"
@@ -2422,6 +2657,7 @@ def reconcile_shot_routing(
                         ("SHOT_PROMPT_IN", "output"),
                         ("SHOT_IMAGE_IN", "SHOT_IMAGE_OUT"),
                         ("SHOT_VIDEO_IN", "SHOT_VIDEO_OUT"),
+                        ("SHOT_FINISH_LOOK_IN", "SHOT_FINISH_LOOK_OUT"),
                     ):
                         removed, detail = _clear_hmb_route(
                             target.node,
@@ -2488,6 +2724,7 @@ def reconcile_shot_routing(
                 for source, source_parameter, target_parameter in (
                     (image, "SHOT_ASSET_OUT", "SHOT_ASSET_IN"),
                     (picker, "SHOT_PICKER_OUT", "SHOT_PICKER_IN"),
+                    (finish, "SHOT_FINISH_LOOK_OUT", "SHOT_FINISH_LOOK_IN"),
                 ):
                     if source is None:
                         removed, detail = _clear_hmb_route(
@@ -2510,6 +2747,21 @@ def reconcile_shot_routing(
                         by_name,
                     )
                     changed += int(ok and detail == "created")
+                    if ok and source.kind == KIND_FINISH_LOOK:
+                        publish_finish = getattr(
+                            source.node,
+                            "_hmb_publish_routed_finish_snapshot",
+                            None,
+                        )
+                        if callable(publish_finish):
+                            try:
+                                published = publish_finish(force=detail == "created")
+                                if published is not True:
+                                    ok = False
+                                    detail = "unable to publish exact Finish Look snapshot"
+                            except Exception:
+                                ok = False
+                                detail = "unable to publish exact Finish Look snapshot"
                     if not ok:
                         failures.append(f"{target.node_name}: {detail}")
                 target_failed = any(item.startswith(target.node_name + ":") for item in failures)
@@ -2542,6 +2794,7 @@ def reconcile_shot_routing(
 
 __all__ = [
     "KIND_AGENT",
+    "KIND_FINISH_LOOK",
     "KIND_IMAGE_ASSET",
     "KIND_PROMPT",
     "KIND_SEEDANCE",

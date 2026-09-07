@@ -91,6 +91,16 @@ jobs:
         run: |
           # Public CI verifies the exact bundled signed DAT and package boundary.
           $tests = @(
+            "HMB_Finish_Look_Regression.py",
+            "HMB_Picker_Video_Tools_Regression.py",
+            "HMB_Picker_Video_Tools_Source_Lifecycle_Regression.py",
+            "HMB_Picker_Tools_Output_Path_Regression.py",
+            "HMB_Picker_Concatenate_Result_Shot_Regression.py",
+            "HMB_Picker_Edit_Delete_RoundTrip_Regression.py",
+            "HMB_VideoPicker_Shared_Maya_Async_Regression.py",
+            "HMB_VideoPicker_Shared_Maya_RoundTrip_Regression.py",
+            "HMB_Video_Tools_Engine_Regression.py",
+            "HMB_Seedance_Gateway_Recovery_Regression.py",
             "HMB_Look_Attribute_Scope_Regression.py",
             "HMB_Data_Only_Prompt_Security_Regression.py",
             "HMB_Agent_Paired_Prompt_Snapshot_Regression.py",
@@ -188,8 +198,8 @@ jobs:
       - name: Runtime package static syntax audit
         shell: pwsh
         run: |
-          # Public CI never receives or materializes a signed policy artifact or
-          # policy review document. This check builds only an in-memory ZIP.
+          # Verify the bundled signed DAT and runtime package; policy source
+          # and review documents are never part of the team distribution.
           python -m py_compile tools/package_runtime_release.py
           python tools/package_runtime_release.py --check
           $artifact = Join-Path $env:RUNNER_TEMP $env:HMB_RUNTIME_ARCHIVE
@@ -274,7 +284,7 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
-            "- Keeps HMBAgentLibrary focused on authenticated server-policy execution, exact Shot routing, protected-state non-exposure, and publishable final text while leaving provider media limits to the Generator.",
+            "- Includes the current bundled signed Agent DAT; policy source files and server configuration are not modified.",
             "- Keeps HMBAgentLibrary model declarations in exact parity with the installed Standard Agent surface, preserving host permission and accounting without adding an HMB-specific model allowlist.",
             "- Keeps each Look Reference Target editable per shot for active named targets or explicit Global Look; Camera / Composition is available only as a Look Reference Sub Type and never as a Target for Character, Prop, or Environment rows.",
             "- Prefers Griptape Cloud HTTPS for local/Base64 images and local videos only when authentication and an accessible bucket are ready; otherwise images retain bounded Base64 and videos retain public HTTPS, asset://, or configured TOS fallbacks.",
@@ -282,6 +292,9 @@ jobs:
             "- Renders Original Playblast with temporary per-source Maya Lambert materials, preserving compatible texture identity, safely falling back per unsupported material, and restoring every authored shading assignment after capture so Redshift is not required on team workstations.",
             "- Enlarges only the Object pattern swatch visual by 10% while preserving its 20px hitbox, palette layout, marker identity, and Maya render behavior.",
             "- Loads ImageAsset thumbnails in staged batches while preserving shot selection, drag order, registration, and Agent routing contracts.",
+            "- Adds independent Picker Concatenate and Video Crop tools with individual cross-Shot card dragging, ordered edit queues, and first-input source-folder output paths.",
+            "- Concatenate captures the first input card's Shot at Run and adds the completed result there only on explicit request; Crop retains its own single input and work-Shot destination.",
+            "- Includes Shot-bound Finish Look and preserves exact Shot routing and safe Seedance gateway/retrieval recovery.",
             "- Includes the manifest-verified runtime installer and exact SHA256 checksum.",
             "",
             "Close Griptape completely before running the included installer."

@@ -15,12 +15,13 @@ from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[2]
-RELEASE_LABEL = "v0.7.38"
-RELEASE_VERSION = "0.7.38"
+RELEASE_LABEL = "v0.7.41"
+RELEASE_VERSION = "0.7.41"
 EXPECTED_RUNTIME_INSTALL_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
     "HMBAgentLibrary.py",
+    "HMBFinishLookLibrary.py",
     "HMBImageAssetLibrary.py",
     "HMBPromptLibrary.py",
     "HMBSeedanceGeneration.py",
@@ -30,7 +31,9 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "_hmb_mp4_verify.py",
     "_hmb_common.py",
     "_hmb_screen_space.py",
+    "_hmb_video_tools.py",
     "widgets/HMBAgentLibraryWidget.js",
+    "widgets/HMBFinishLookLibraryWidget.js",
     "widgets/HMBImageAssetLibraryWidget.js",
     "widgets/HMBImageAssetThumbnailPatchBridgeWidget.js",
     "widgets/HMBPromptLibraryScopedBindingWidget.js",
@@ -150,7 +153,7 @@ assert len(EXPECTED_SOURCE_FILES) == (
 )
 assert builder.RELEASE_LABEL == RELEASE_LABEL
 assert builder.RELEASE_VERSION == RELEASE_VERSION
-assert builder.release_version_parts(RELEASE_VERSION) == (0, 7, 38)
+assert builder.release_version_parts(RELEASE_VERSION) == (0, 7, 41)
 assert builder.release_label_for_version(RELEASE_VERSION) == RELEASE_LABEL
 builder.validate_release_identity(RELEASE_LABEL, RELEASE_VERSION)
 for invalid_version in (
@@ -166,14 +169,14 @@ for invalid_version in (
         pass
     else:
         raise AssertionError(f"Invalid technical SemVer was accepted: {invalid_version}")
-for mismatched_label in ("v0.7.038", "v0.7.37", "0.7.38"):
+for mismatched_label in ("v0.7.041", "v0.7.40", "0.7.41"):
     try:
         builder.validate_release_identity(mismatched_label, RELEASE_VERSION)
     except RuntimeError:
         pass
     else:
         raise AssertionError(f"Mismatched public release label was accepted: {mismatched_label}")
-assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.7.38_Runtime.zip"
+assert builder.ARCHIVE_NAME == "HMB_GP_Production_v0.7.41_Runtime.zip"
 assert builder.ARCHIVE_NAME == f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 assert builder.POLICY_DELIVERY == "bundled-signed-dat"
 for retired_name in (

@@ -108,9 +108,9 @@ if ($records.Count -ne [int]$manifest.file_count) {
     throw 'HMB release manifest file_count does not match its file list.'
 }
 if (
-    [int]$manifest.install_file_count -ne 22 -or
+    [int]$manifest.install_file_count -ne 25 -or
     [int]$manifest.distribution_file_count -ne 4 -or
-    $records.Count -ne 26
+    $records.Count -ne 29
 ) {
     throw 'HMB release manifest install/distribution boundary mismatch.'
 }

@@ -54,6 +54,7 @@ for (const relativePath of [
   "widgets/HMBPromptLibraryScopedBindingWidget.js",
   "widgets/HMBVideoPickerLibraryWidget_v032.js",
   "widgets/HMBSeedanceGenerationWidget.js",
+  "widgets/HMBFinishLookLibraryWidget.js",
 ]) {
   const module = await loadWidget(relativePath);
   const guard = module.hmbGuardSelectedNodeKeyboardDelete;
@@ -90,4 +91,4 @@ for (const relativePath of [
   assert.deepEqual(toolbarClick.calls, { preventDefault: 0, stopPropagation: 0, stopImmediatePropagation: 0 });
 }
 
-console.log("HMB five-library keyboard delete guard regression: PASS");
+console.log("HMB six-library keyboard delete guard regression: PASS");

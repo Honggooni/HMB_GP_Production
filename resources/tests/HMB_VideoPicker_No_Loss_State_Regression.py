@@ -33,7 +33,7 @@ expanded = picker._parse_state({
         {"video_slot": 2, "video_path": "C:/media/manual-depth.mp4"},
     ],
     "slot_assignments": [{
-        "video_slot": 3,
+        "video_slot": 1,
         "bindings": [{
             "group_name": "Actor",
             "full_dag_path": "|Actor",
@@ -41,7 +41,7 @@ expanded = picker._parse_state({
         }],
     }],
     "slot_visibility": [{
-        "video_slot": 4,
+        "video_slot": 1,
         "hidden_paths": ["|HiddenA"],
     }],
     "snapshots": [{
@@ -58,8 +58,15 @@ assert [(item["video_slot"], item["video_path"]) for item in expanded["videos"]]
     (1, "C:/media/manual-color.mp4"),
     (2, "C:/media/manual-depth.mp4"),
 ]
-assert expanded["slot_assignments"][1]["bindings"][0]["full_dag_path"] == "|Actor"
-assert expanded["slot_visibility"][1]["hidden_paths"] == ["|HiddenA"]
+# Maya authoring is one shared staging context, regardless of selected video
+# count. Author the current Maya bindings/visibility in canonical slot 1;
+# only media and immutable snapshot slots have independent slot positions.
+assert len(expanded["slot_assignments"]) == 1
+assert expanded["slot_assignments"][0]["video_slot"] == 1
+assert expanded["slot_assignments"][0]["bindings"][0]["full_dag_path"] == "|Actor"
+assert len(expanded["slot_visibility"]) == 1
+assert expanded["slot_visibility"][0]["video_slot"] == 1
+assert expanded["slot_visibility"][0]["hidden_paths"] == ["|HiddenA"]
 assert expanded["snapshots"][0]["video_slot"] == 5
 assert expanded["snapshots"][0]["snapshot_uid"].startswith("snapshot-legacy-")
 
@@ -87,13 +94,15 @@ duplicate_with_authored_control = picker._parse_state({
         {"video_slot": 1, "video_path": "C:/media/second.mp4"},
     ],
     "slot_assignments": [{
-        "video_slot": 2,
+        "video_slot": 1,
         "bindings": [{"group_name": "Reserved", "color": "Red"}],
     }],
 })
 assert duplicate_with_authored_control["active_slot_count"] == 2
 assert [item["video_slot"] for item in duplicate_with_authored_control["videos"]] == [1, 2]
-assert duplicate_with_authored_control["slot_assignments"][1]["bindings"][0]["group_name"] == "Reserved"
+assert len(duplicate_with_authored_control["slot_assignments"]) == 1
+assert duplicate_with_authored_control["slot_assignments"][0]["video_slot"] == 1
+assert duplicate_with_authored_control["slot_assignments"][0]["bindings"][0]["group_name"] == "Reserved"
 
 
 merged_controls = picker._parse_state({
