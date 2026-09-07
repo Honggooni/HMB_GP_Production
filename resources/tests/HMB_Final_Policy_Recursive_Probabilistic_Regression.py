@@ -14,7 +14,7 @@ from _hmb_bundled_policy_session import install_bundled_policy_session
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.7.42"
+EXPECTED_RELEASE_VERSION = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))["metadata"]["library_version"]
 BASE_MASTER_SEEDS = (
     20260729,
     0x484D42,

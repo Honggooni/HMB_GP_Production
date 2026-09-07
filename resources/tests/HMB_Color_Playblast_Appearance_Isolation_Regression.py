@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from _hmb_bundled_policy_session import install_bundled_policy_session
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RELEASE_VERSION = "0.7.42"
+EXPECTED_RELEASE_VERSION = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))["metadata"]["library_version"]
 
 
 def load_module(name: str):
