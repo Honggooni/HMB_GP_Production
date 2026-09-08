@@ -11387,6 +11387,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   const sharedImportInputMarkup = `
           <input type="file" id="import-video-asset" data-picker-shared-import-input accept=".mp4,video/mp4" multiple hidden/>`;
   const fixedTopPaintMarkup = `<style>
+      .hmbvp :is(button,input,select,textarea){font-family:inherit}
       .hmbvp>.app-header.top[data-picker-toggle-surface="header"]{--hmb-primary-top:#F472B6;--hmb-primary-bottom:#BE185D;--hmb-primary-line:#F3A8CE;--hmb-focus:#22D3EE;--hmb-accent:#22D3EE;--hmb-glow:rgba(168,85,247,.16);--selection-rgb:244,114,182;--selection-deep-rgb:190,24,93;--selection-text:#F8C6DF;--selection-soft:#F3A8CE;--selection-strong:#FFE4F2;background:linear-gradient(90deg,rgba(72,35,101,.44),rgba(14,23,38,.92) 44%,rgba(6,9,18,.96))!important;background-color:#060912!important;border-bottom-color:rgba(148,163,184,.19)!important;box-shadow:none!important;filter:none!important;backdrop-filter:none!important;transition:none!important}
       .hmbvp>.app-header.top[data-picker-toggle-surface="header"] *{transition:none!important}.hmbvp>.app-header.top[data-picker-toggle-surface="header"] button{box-shadow:none!important}.hmbvp>.app-header.top[data-picker-toggle-surface="header"] .brand-mark{border-color:rgba(34,211,238,.70)!important;background:rgba(8,145,178,.12)!important;color:#22D3EE!important;box-shadow:none!important}
       .hmbvp>.app-header.top[data-picker-toggle-surface="header"][data-picker-view-transition-pending="true"]{cursor:progress!important}
@@ -12356,7 +12357,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     if (container.__hmbVideoPickerDeleted === true) {
       return { command: null, delivered: false, deliveryPromise: null };
     }
-    const liveState = ["read_scene", "render_original_preview", "run_video", "render_snapshot"].includes(clean(action))
+    const liveState = ["read_scene", "render_original_preview", "run_video", "render_snapshot", "video_tools"].includes(clean(action))
       ? flushPickerStatePublicationBeforeCommand()
       : currentWidgetState();
     const resolvedActionId = clean(actionId)
@@ -12577,6 +12578,12 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     }
     return currentWidgetState();
   };
+  const schedulePickerWorkspaceMutation = (nextState) => {
+    // Keep the newest workspace available immediately to every local control.
+    // Host persistence/normalization coalesces with the next edit after paint.
+    schedulePickerStatePublicationAfterPaint(nextState, { workspacePublication: true });
+    return patchPickerWorkspaceExperience(nextState);
+  };
   const toggleSharedLoaderVideoSelection = (event, selectionSurface) => {
     event?.preventDefault?.();
     event?.stopPropagation?.();
@@ -12677,7 +12684,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     label.textContent = save && requestedName ? requestedName : shot.name;
     input.replaceWith?.(label);
     if (save && requestedName && requestedName !== shot.name && !pickerWorkspaceInteractionLocked(liveState)) {
-      publishPickerWorkspaceMutation(hmbRenameLocalPickerShot(liveState, workspaceUuid, requestedName));
+      schedulePickerWorkspaceMutation(hmbRenameLocalPickerShot(liveState, workspaceUuid, requestedName));
     } else {
       hmbPatchVideoPickerShotWorkspace(
         container,
@@ -12739,7 +12746,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       hmbPauseVideoPickerMedia(container);
       delete container.__hmbAutoplayVideoUid;
       delete container.__hmbForceVideoPreviewUid;
-      publishPickerWorkspaceMutation(hmbSwitchLocalPickerShot(liveState, workspaceUuid));
+      schedulePickerWorkspaceMutation(hmbSwitchLocalPickerShot(liveState, workspaceUuid));
     },
     rename: (event, button) => {
       event?.preventDefault?.(); event?.stopPropagation?.();
@@ -13236,7 +13243,10 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   activeCleanup.push(() => mediaController?.cleanup());
   const pickerToolsController = hmbInstallPickerVideoTools(container, {
     currentState: currentWidgetState,
-    commit,
+    commit: (next, options) => {
+      schedulePickerStatePublicationAfterPaint(next, { commitOptions: options });
+      return { state: next, deferred: true };
+    },
     dispatch: dispatchCommand,
     patchPreview: (nextState) => {
       hmbPatchVideoPickerPreviewDom(container, nextState, TEXT[nextState.language] || TEXT.ko);
@@ -13943,7 +13953,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       message: `Playblast resolution set to ${selected.label}.`,
     }, "INFO", `Playblast resolution set to ${selected.label}.`);
     hmbApplyPickerResolutionToDom(container, selected.width, selected.height);
-    commit(next);
+    schedulePickerStatePublicationAfterPaint(next, { commitOptions: {} });
   });
   on(container.querySelector("#clear-activity-log"), "click", () => {
     commit({

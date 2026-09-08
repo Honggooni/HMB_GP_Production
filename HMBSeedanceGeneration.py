@@ -1698,7 +1698,13 @@ class _HMBAIBrokerBridge:
                     submission and 500 <= int(exc.code) <= 599
                 ),
             ) from exc
-        except _BrokerError:
+        except _BrokerError as exc:
+            # The POST has already crossed the transport boundary. An invalid
+            # JSON/origin response cannot prove that it was never accepted.
+            # HTTP rejections are classified separately above; preflight errors
+            # occur before this try block and must not acquire this flag.
+            if submission:
+                exc.submission_outcome_unknown = True
             raise
         except (TimeoutError, urllib.error.URLError, OSError) as exc:
             _broker_log_transport_error(
@@ -1713,7 +1719,8 @@ class _HMBAIBrokerBridge:
             ) from exc
         if not isinstance(result, dict):
             raise _BrokerProtocolError(
-                "FN AI Broker returned an invalid response."
+                "FN AI Broker returned an invalid response.",
+                submission_outcome_unknown=submission,
             )
         result["_http_status"] = status_code
         return result
@@ -3473,6 +3480,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     status in TERMINAL_FAILURE_STATUSES
                     or (
                         isinstance(provider_response, dict)
+                        and str(provider_response.get("id") or "").strip() == generation_id
                         and provider_response.get("terminal") is True
                     )
                 ),
@@ -3849,6 +3857,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             or status in TERMINAL_FAILURE_STATUSES
             or (
                 isinstance(provider_response, dict)
+                and str(provider_response.get("id") or "").strip() == generation_id
                 and provider_response.get("terminal") is True
             )
         )
@@ -3988,6 +3997,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             or status in TERMINAL_FAILURE_STATUSES
             or (
                 isinstance(provider_response, dict)
+                and str(provider_response.get("id") or "").strip() == checkpoint["task_id"]
                 and provider_response.get("terminal") is True
             )
         )
@@ -9708,6 +9718,20 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     payload,
                     timeout=min(float(timeout), 1200.0),
                 )
+                try:
+                    if not isinstance(response, dict):
+                        raise _BrokerProtocolError("FN AI Broker returned an invalid task response.")
+                    task = self._normalize_broker_task(response)
+                except _BrokerError as exc:
+                    # Keep the pre-submit client key and reference uploads if
+                    # the accepted response lacks a usable task identity/status.
+                    # This is not a rejection and must use the existing unknown
+                    # submission checkpoint/Refresh path, never a second POST.
+                    raise _BrokerProtocolError(
+                        "FN AI Broker returned an incomplete task response. "
+                        "Submission could not be confirmed; use Refresh / Retrieve Result.",
+                        submission_outcome_unknown=True,
+                    ) from exc
             except _SubmissionCancelledBeforeStart:
                 await self._discard_unsent_generation_checkpoint(
                     reason="cancelled_at_submission_gate",
@@ -9773,7 +9797,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 raise
             if not self._runtime_node_is_live(require_registered=True):
                 return
-            task = self._normalize_broker_task(response)
             generation_id = str(task["id"])
             status = str(task["status"])
             self._submission_outcome_unknown = False
@@ -10074,6 +10097,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             provider_response = self.parameter_output_values.get("provider_response")
             terminal = generation_status in TERMINAL_FAILURE_STATUSES or (
                 isinstance(provider_response, dict)
+                and bool(generation_id)
+                and str(provider_response.get("id") or "").strip() == generation_id
                 and provider_response.get("terminal") is True
             )
             submission_unknown = (

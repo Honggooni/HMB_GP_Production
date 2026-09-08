@@ -102,7 +102,14 @@ def incoming(target: asset_library.HMBImageAssetLibrary) -> list[object]:
 
 GriptapeNodes.EventManager().initialize_queue()
 stamp = time.time_ns()
-flow = ControlFlow(name=f"HMBImageDisconnectFlow_{stamp}")
+try:
+    from griptape_nodes.retained_mode.engine import current_engine
+except ImportError:
+    current_engine = None
+if current_engine is None:
+    flow = ControlFlow(name=f"HMBImageDisconnectFlow_{stamp}")
+else:
+    flow = ControlFlow(name=f"HMBImageDisconnectFlow_{stamp}", engine=current_engine())
 GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
 
 image_a = "https://example.test/host-disconnect-a.png"

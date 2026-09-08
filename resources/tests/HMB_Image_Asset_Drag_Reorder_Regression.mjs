@@ -362,4 +362,82 @@ assert.match(source, /entry\?\.target\?\.closest\?\.\(IMAGE_ASSET_DRAG_CONTROL_S
 assert.match(source, /delete container\.__hmbImageAssetDragSession;[\s\S]*?commitReorder\(details\)/);
 assert.match(source, /hmbApplyImageAssetShotSourceOrderToDom\(container, state, shotUuid\)/);
 
-console.log("HMB ImageAsset full-card Shot-local drag reorder regression: PASS");
+// Compact mode uses the same gesture controller and Shot-local mutation path.
+class CompactCard extends FakeCard {
+  constructor(uid, shotUuid) {
+    super(uid, shotUuid);
+    this.attributes.delete("data-selected-key");
+    this.attributes.set("data-compact-asset-key", uid);
+    this.attributes.set("aria-grabbed", "false");
+    this.classList = new FakeClassList("compact-shot-asset");
+  }
+  closest(selector) {
+    if (selector === "[data-compact-asset-key]") return this;
+    if (selector === "[data-compact-shot-assets]") return this.tray;
+    return null;
+  }
+  querySelector(selector) { return selector === ".compact-shot-thumb > small" ? this.slot : null; }
+}
+class CompactTray extends FakeTray {
+  getAttribute(name) { return name === "data-compact-shot-assets" ? this.shotUuid : null; }
+  querySelectorAll(selector) { return selector === "[data-compact-asset-key]" ? [...this.children] : []; }
+}
+class CompactContainer extends FakeContainer {
+  constructor(trays) { super(trays[0]); this.trays = trays; }
+  querySelector() { return null; }
+  querySelectorAll(selector) {
+    if (selector === "[data-compact-shot-assets]") return this.trays;
+    const cards = this.trays.flatMap(tray => tray.children);
+    if (selector === "[data-compact-asset-key]") return cards;
+    if (selector.startsWith(".compact-shot-asset.")) return cards.filter(card => card.classList.contains(selector.split(".")[2]));
+    return [];
+  }
+  contains(item) { return item === this || this.trays.some(tray => tray.contains(item)); }
+}
+{
+  const state = initialState();
+  const trays = state.shot_routing.shots.map(shot => new CompactTray(shot.shot_uuid,
+    shot.selected_source_uids.map(uid => new CompactCard(uid, shot.shot_uuid))));
+  const container = new CompactContainer(trays);
+  let commits = 0;
+  const cleanup = widget.hmbInstallImageAssetShotDragReorder(container, {
+    currentState: () => state,
+    commitReorder: ({shotUuid, sourceUid, targetUid}) => {
+      if (!widget.hmbReorderImageAssetShotSource(state, shotUuid, sourceUid, targetUid)) return false;
+      widget.hmbApplyImageAssetShotSourceOrderToDom(container, state, shotUuid);
+      commits++;
+      return true;
+    },
+  });
+  for (const tray of trays) {
+    const before = [...tray.children], transfer = dataTransfer();
+    container.dispatch("dragstart", fakeEvent(before[0], transfer));
+    container.dispatch("dragover", fakeEvent(before.at(-1), transfer));
+    container.dispatch("drop", fakeEvent(before.at(-1), transfer));
+    container.dispatch("dragend", fakeEvent(before[0], transfer));
+    assert.deepEqual(tray.children, [...before.slice(1), before[0]], "Move existing thumbnail nodes immediately.");
+    assert.deepEqual(tray.children.map(card => card.slot.textContent), tray.children.map((_, i) => String(i + 1).padStart(2, "0")));
+    tray.children.forEach((card, i) => {
+      assert.equal(card.getAttribute("aria-grabbed"), "false");
+      assert.equal(card.getAttribute("data-compact-order"), String(i + 1));
+    });
+  }
+  assert.equal(commits, 2, "Inactive compact Shot also owns its reorder; drop/dragend must not duplicate it.");
+  assert.equal(container.__hmbImageAssetExpandedDirty, true);
+  // Deletion while a native gesture is outstanding must not target a newly
+  // renumbered Shot at the old position.
+  const source = trays[0].children[0], target = trays[0].children[1];
+  container.dispatch("dragstart", fakeEvent(source, dataTransfer()));
+  container.dispatch("dragover", fakeEvent(target, dataTransfer()));
+  assert.equal(widget.hmbDeleteImageAssetShot(state, shotOneUuid), true);
+  container.dispatch("drop", fakeEvent(target));
+  container.dispatch("dragend", fakeEvent(source));
+  assert.equal(commits, 2);
+  assert.equal(state.shot_routing.shots[0].shot_uuid, shotTwoUuid);
+  assert.equal(state.shot_routing.shots[0].number, 1);
+  cleanup();
+}
+const compactMarkup = widget.hmbRenderImageAssetCompactSummary(initialState());
+assert.match(compactMarkup, /class="compact-shot-asset [^"]*" draggable="true"/);
+assert.match(compactMarkup, /role="listitem" aria-posinset="1" aria-setsize="3"/);
+console.log("HMB ImageAsset expanded + compact Shot-local drag reorder regression: PASS");

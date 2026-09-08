@@ -182,11 +182,11 @@ function imageAssetPresentationIdentityMatches(cached, asset) {
   );
 }
 
-export function hmbRememberImageAssetPresentation(state) {
+export function hmbRememberImageAssetPresentation(state, changedAssets = null) {
   const entry = imageAssetPresentationCacheEntry(state, true);
   if (!entry || !Array.isArray(state?.assets)) return 0;
   let remembered = 0;
-  state.assets.forEach((asset) => {
+  (Array.isArray(changedAssets) ? changedAssets : state.assets).forEach((asset) => {
     const key = clean(asset?.asset_library_id);
     const thumbnailUrl = clean(asset?.thumbnail_url);
     const persistedProjectAsset = Number(asset?.import_index || 0) === 0
@@ -1211,6 +1211,7 @@ function hmbApplyImageAssetThumbnailPresentationPatch(localValue, patchValue) {
     local.assets.map((asset) => [clean(asset.asset_library_id), asset]),
   );
   const completed = [];
+  const completedAssets = [];
   const rejected = [];
   entries.forEach((entry) => {
     const key = clean(entry?.asset_library_id);
@@ -1227,6 +1228,7 @@ function hmbApplyImageAssetThumbnailPresentationPatch(localValue, patchValue) {
     }
     asset.thumbnail_url = thumbnailUrl;
     completed.push(key);
+    completedAssets.push(asset);
   });
   const failed = uniqueStrings([
     ...(Array.isArray(patch.failed_asset_library_ids)
@@ -1248,7 +1250,7 @@ function hmbApplyImageAssetThumbnailPresentationPatch(localValue, patchValue) {
   if (local.thumbnail_request?.request_id === local.thumbnail_result.request_id) {
     local.thumbnail_request = {};
   }
-  hmbRememberImageAssetPresentation(local);
+  hmbRememberImageAssetPresentation(local, completedAssets);
   return {
     state: local,
     completedAssetLibraryIds: completed,
@@ -1276,9 +1278,9 @@ function activeImageAssetShot(state) {
     || null;
 }
 
-function imageAssetShotAssets(state, shot = activeImageAssetShot(state)) {
+function imageAssetShotAssets(state, shot = activeImageAssetShot(state), selectedByUid = null) {
   if (!shot || !Array.isArray(state?.assets)) return [];
-  const bySourceUid = new Map(
+  const bySourceUid = selectedByUid || new Map(
     selectedAssets(state).map((asset) => [clean(asset.source_uid), asset]),
   );
   return shot.selected_source_uids
@@ -3678,31 +3680,42 @@ export function hmbApplyImageAssetShotSourceOrderToDom(container, state, shotUui
   const uuid = imageAssetUuid(shotUuid);
   const shot = (Array.isArray(state?.shot_routing?.shots) ? state.shot_routing.shots : [])
     .find((item) => imageAssetUuid(item?.shot_uuid) === uuid);
-  const tray = container?.querySelector?.("[data-shot-tray]") || null;
-  if (!uuid || !shot || !tray) return false;
-  const mountedShotUuid = imageAssetUuid(tray.getAttribute?.("data-shot-tray"));
-  if (mountedShotUuid && mountedShotUuid !== uuid) return false;
-  const cards = Array.from(tray.querySelectorAll?.("[data-selected-key]") || []);
-  const cardsByUid = new Map(cards.map((card) => [
-    clean(card.getAttribute?.("data-shot-source-uid")),
-    card,
-  ]));
-  const orderedCards = shot.selected_source_uids
-    .map((sourceUid) => cardsByUid.get(clean(sourceUid)))
-    .filter(Boolean);
-  orderedCards.forEach((card, index) => {
-    const current = tray.children?.[index] || null;
-    if (current !== card) {
-      if (typeof tray.insertBefore === "function") tray.insertBefore(card, current);
-      else tray.appendChild?.(card);
-    }
-    card.setAttribute?.("data-shot-uuid", uuid);
-    card.setAttribute?.("aria-posinset", String(index + 1));
-    card.setAttribute?.("aria-setsize", String(orderedCards.length));
-    const slot = card.querySelector?.(".slot");
-    if (slot) slot.textContent = String(index + 1).padStart(2, "0");
+  if (!uuid || !shot) return false;
+  const trays = [
+    container?.querySelector?.("[data-shot-tray]"),
+    ...Array.from(container?.querySelectorAll?.("[data-compact-shot-assets]") || []),
+  ].filter((tray) => tray && imageAssetUuid(
+    tray.getAttribute?.("data-shot-tray") || tray.getAttribute?.("data-compact-shot-assets"),
+  ) === uuid);
+  if (!trays.length) return false;
+  trays.forEach((tray) => {
+    const compact = Boolean(tray.getAttribute?.("data-compact-shot-assets"));
+    const cards = Array.from(tray.querySelectorAll?.(compact ? "[data-compact-asset-key]" : "[data-selected-key]") || []);
+    const cardsByUid = new Map(cards.map((card) => [
+      clean(card.getAttribute?.("data-shot-source-uid")),
+      card,
+    ]));
+    const orderedCards = shot.selected_source_uids
+      .map((sourceUid) => cardsByUid.get(clean(sourceUid)))
+      .filter(Boolean);
+    orderedCards.forEach((card, index) => {
+      const current = tray.children?.[index] || null;
+      if (current !== card) {
+        if (typeof tray.insertBefore === "function") tray.insertBefore(card, current);
+        else tray.appendChild?.(card);
+      }
+      card.setAttribute?.("data-shot-uuid", uuid);
+      card.setAttribute?.("aria-posinset", String(index + 1));
+      card.setAttribute?.("aria-setsize", String(orderedCards.length));
+      if (compact) card.setAttribute?.("data-compact-order", String(index + 1));
+      const slot = card.querySelector?.(compact ? ".compact-shot-thumb > small" : ".slot");
+      if (slot) slot.textContent = String(index + 1).padStart(2, "0");
+    });
+    // The expanded tray may be parked in a detached fragment in compact mode.
+    // Rebuild it from the current Shot state on expansion, never its old order.
+    if (compact) container.__hmbImageAssetExpandedDirty = true;
   });
-  return orderedCards.map((card) => clean(card.getAttribute?.("data-shot-source-uid")));
+  return [...shot.selected_source_uids];
 }
 
 function hmbImageAssetShotForDrag(state, shotUuid) {
@@ -3713,17 +3726,23 @@ function hmbImageAssetShotForDrag(state, shotUuid) {
 
 function hmbImageAssetSelectedCardFromDragEvent(container, event) {
   const target = event?.target?.nodeType === 3 ? event.target.parentElement : event?.target;
-  const card = target?.closest?.("[data-selected-key]") || null;
+  const card = target?.closest?.("[data-selected-key]") || target?.closest?.("[data-compact-asset-key]") || null;
   if (!card || (typeof container?.contains === "function" && !container.contains(card))) return null;
-  const tray = card.closest?.("[data-shot-tray]") || null;
+  const tray = card.closest?.("[data-shot-tray]") || card.closest?.("[data-compact-shot-assets]") || null;
   if (!tray || (typeof container?.contains === "function" && !container.contains(tray))) return null;
   return { card, tray, target };
 }
 
 function hmbClearImageAssetDropTargets(container) {
-  Array.from(container?.querySelectorAll?.(".selected-card.drop-target") || []).forEach((card) => {
+  hmbImageAssetDragCards(container, ".drop-target").forEach((card) => {
     card.classList?.remove?.("drop-target");
   });
+}
+
+function hmbImageAssetDragCards(container, suffix = "") {
+  return [".selected-card", ".compact-shot-asset"].flatMap((selector) => (
+    Array.from(container?.querySelectorAll?.(`${selector}${suffix}`) || [])
+  ));
 }
 
 const IMAGE_ASSET_DRAG_CONTROL_SELECTOR = [
@@ -3765,7 +3784,7 @@ export function hmbInstallImageAssetShotDragReorder(container, options = {}) {
   };
   const clearSession = () => {
     hmbClearImageAssetDropTargets(container);
-    Array.from(container.querySelectorAll?.(".selected-card.dragging") || []).forEach((card) => {
+    hmbImageAssetDragCards(container, ".dragging").forEach((card) => {
       card.classList?.remove?.("dragging");
       card.setAttribute?.("aria-grabbed", "false");
     });
@@ -3835,7 +3854,10 @@ export function hmbInstallImageAssetShotDragReorder(container, options = {}) {
   const retainedSession = container.__hmbImageAssetDragSession;
   if (retainedSession) {
     hmbClearImageAssetDropTargets(container);
-    const cards = Array.from(container.querySelectorAll?.("[data-selected-key]") || []);
+    const cards = [
+      ...Array.from(container.querySelectorAll?.("[data-selected-key]") || []),
+      ...Array.from(container.querySelectorAll?.("[data-compact-asset-key]") || []),
+    ];
     const sourceCard = cards.find((card) => (
       clean(card.getAttribute?.("data-shot-source-uid")) === clean(retainedSession.sourceUid)
       && imageAssetUuid(card.getAttribute?.("data-shot-uuid")) === imageAssetUuid(retainedSession.shotUuid)
@@ -3933,7 +3955,7 @@ export function hmbInstallImageAssetShotDragReorder(container, options = {}) {
       container.removeEventListener?.(eventName, handler, true);
     });
     hmbClearImageAssetDropTargets(container);
-    Array.from(container.querySelectorAll?.(".selected-card.dragging") || []).forEach((card) => {
+    hmbImageAssetDragCards(container, ".dragging").forEach((card) => {
       card.classList?.remove?.("dragging");
     });
     // Deliberately retain __hmbImageAssetDragSession: a normal host update
@@ -4410,20 +4432,23 @@ function renderImageAssetShotStack(state) {
 export function hmbImageAssetCompactShotRows(state) {
   const routing = ensureImageAssetShotRouting(state);
   if (!routing) return [];
+  // One ephemeral index per projection, not five full-catalog scans/sorts.
+  // Never cache by array identity: selection is intentionally mutated in place.
+  const selectedByUid = new Map(selectedAssets(state).map((asset) => [clean(asset.source_uid), asset]));
   return routing.shots.slice(0, MAX_IMAGE_ASSET_SHOTS).map((shot) => ({
     shot_uuid: shot.shot_uuid,
     number: shot.number,
     name: shot.name,
     active: shot.shot_uuid === routing.active_shot_uuid,
     palette: hmbImageAssetShotPalette(shot.number),
-    assets: imageAssetShotAssets(state, shot).map((asset, index) => ({
+    assets: imageAssetShotAssets(state, shot, selectedByUid).map((asset, index) => ({
       ...asset,
       order: index + 1,
     })),
   }));
 }
 
-function renderImageAssetCompactAsset(asset, index, shotUuid) {
+function renderImageAssetCompactAsset(asset, index, shotUuid, count) {
   const sourceUid = clean(asset?.source_uid);
   const key = sourceUid || clean(asset?.asset_library_id) || `compact-${index}`;
   const name = clean(asset?.image_name) || clean(asset?.asset_id) || `Image ${index + 1}`;
@@ -4432,7 +4457,7 @@ function renderImageAssetCompactAsset(asset, index, shotUuid) {
   const media = source
     ? `<img data-hmb-compact-src="${escapeHtml(source)}" alt="" draggable="false" loading="lazy" decoding="async" fetchpriority="low"/>`
     : `<span class="compact-shot-placeholder" aria-hidden="true">${imageAssetThumbnailFallbackMarkup(asset)}</span>`;
-  return `<article class="compact-shot-asset ${source ? "" : failed ? "thumbnail-failed" : "thumbnail-loading"}" data-thumbnail-loading="${source || failed ? "false" : "true"}" data-thumbnail-failed="${failed ? "true" : "false"}" data-compact-asset-key="${escapeHtml(key)}" data-shot-source-uid="${escapeHtml(sourceUid)}" data-shot-uuid="${escapeHtml(shotUuid)}" data-compact-order="${index + 1}" title="${escapeHtml(name)}">
+  return `<article class="compact-shot-asset ${source ? "" : failed ? "thumbnail-failed" : "thumbnail-loading"}" draggable="true" aria-grabbed="false" role="listitem" aria-posinset="${index + 1}" aria-setsize="${count}" data-thumbnail-loading="${source || failed ? "false" : "true"}" data-thumbnail-failed="${failed ? "true" : "false"}" data-compact-asset-key="${escapeHtml(key)}" data-shot-source-uid="${escapeHtml(sourceUid)}" data-shot-uuid="${escapeHtml(shotUuid)}" data-compact-order="${index + 1}" title="${escapeHtml(name)}">
       <div class="compact-shot-thumb">${media}<small>${String(index + 1).padStart(2, "0")}</small></div>
       <b>${escapeHtml(name)}</b>
     </article>`;
@@ -4442,7 +4467,7 @@ function renderImageAssetCompactShotRow(state, row) {
   const assets = Array.isArray(row?.assets) ? row.assets.slice(0, MAX_SHOT_IMAGES) : [];
   return `<article class="compact-shot-row ${row.active ? "active" : ""}" data-compact-shot-row="${escapeHtml(row.shot_uuid)}" data-shot-number="${row.number}" style="--shot-accent:${row.palette.accent};--shot-rgb:${row.palette.rgb}">
       <header class="compact-shot-head"><small>${String(row.number).padStart(2, "0")}</small><b data-compact-shot-name>${escapeHtml(row.name)}</b><span>${escapeHtml(imageAssetText(state, "selected_images"))}</span><em data-compact-shot-count>${assets.length}/${MAX_SHOT_IMAGES}</em><i>REMOTE</i></header>
-      <div class="compact-shot-assets ${assets.length ? "" : "empty"}" data-compact-shot-assets="${escapeHtml(row.shot_uuid)}">${assets.map((asset, index) => renderImageAssetCompactAsset(asset, index, row.shot_uuid)).join("") || `<span class="compact-shot-empty">${escapeHtml(imageAssetText(state, "tray_empty"))}</span>`}</div>
+      <div class="compact-shot-assets ${assets.length ? "" : "empty"}" role="list" data-compact-shot-assets="${escapeHtml(row.shot_uuid)}">${assets.map((asset, index) => renderImageAssetCompactAsset(asset, index, row.shot_uuid, assets.length)).join("") || `<span class="compact-shot-empty">${escapeHtml(imageAssetText(state, "tray_empty"))}</span>`}</div>
     </article>`;
 }
 
@@ -4658,6 +4683,10 @@ function render(
   const viewToggleLabel = imageAssetText(state, detailView ? "image_only_view" : "details_view");
   return `
     <style>
+      .hmb-image-assets :is(button,input,select,textarea){font-family:inherit}
+      .hmb-image-assets .compact-shot-asset[draggable="true"]{cursor:grab;user-select:none}
+      .hmb-image-assets .compact-shot-asset.dragging{cursor:grabbing;opacity:.6}
+      .hmb-image-assets .compact-shot-asset.drop-target{border-color:var(--shot-accent);box-shadow:inset 0 0 0 1px var(--shot-accent)}
       .hmb-image-assets{--bg:#090c16;--panel:#101523;--line:rgba(148,163,184,.19);--accent:#22d3ee;--pink:#f472b6;--asset-selection:#f472b6;--text:#e6edf7;--muted:#8fa3b8;--selection-rgb:244,114,182;--selection-deep-rgb:190,24,93;--selection-secondary-rgb:217,70,239;--selection-text:#f8c6df;--selection-soft:#f3a8ce;--selection-strong:#ffe4f2;--selection-panel:rgba(30,14,30,.9);--selection-card:rgba(61,23,49,.6);--header-tint:rgba(72,35,101,.44);container-type:inline-size;position:relative;width:100%;height:100%;min-height:680px;display:grid;grid-template-rows:58px minmax(0,1fr);overflow:hidden;border:1px solid var(--line);border-radius:11px;background:radial-gradient(circle at 8% -10%,rgba(168,85,247,.16),transparent 34%),linear-gradient(180deg,#0b1020,#060912);color:var(--text);font-family:"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif;font-synthesis:none;-webkit-font-smoothing:antialiased;box-sizing:border-box}
       .hmb-image-assets *{box-sizing:border-box;min-width:0}.top{display:flex;align-items:center;gap:12px;padding:8px 13px;border-bottom:1px solid var(--line);background:linear-gradient(90deg,rgba(72,35,101,.44),rgba(14,23,38,.9) 44%)}.mark{flex:0 0 35px;width:35px;height:35px;display:grid;place-items:center;border:1px solid rgba(34,211,238,.7);border-radius:8px;background:rgba(8,145,178,.12);color:var(--accent);font-size:11px;font-weight:950}.heading{display:flex;flex:0 1 auto;flex-direction:column;gap:2px;overflow:hidden}.heading b{overflow:hidden;font-size:15px;letter-spacing:.01em;white-space:nowrap;text-overflow:ellipsis}.heading span{max-width:360px;color:var(--muted);font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.project-switch{margin-left:auto;display:grid;grid-template-columns:auto auto minmax(150px,260px);align-items:center;gap:7px;min-width:0}.project-actions{display:flex;align-items:center;gap:5px}.project-action{width:31px;height:31px;display:grid;place-items:center;padding:0;border:1px solid rgba(96,165,250,.5);border-radius:7px;background:linear-gradient(180deg,rgba(37,99,235,.3),rgba(15,23,42,.9));color:#93c5fd;font-size:12px;font-weight:950;cursor:pointer}.project-action:hover{border-color:var(--accent);color:#fff;box-shadow:0 0 10px rgba(34,211,238,.2)}.project-action svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.project-switch label{min-width:max-content;color:#aebed0;font-size:8px;font-weight:900;letter-spacing:.08em;white-space:nowrap;word-break:keep-all}.project-switch select{width:100%;height:31px;border:1px solid rgba(148,163,184,.28);border-radius:7px;background:#080d17;color:#edf5ff;padding:0 8px;font-size:10px;outline:none}.project-switch select:focus{border-color:var(--accent)}.status{display:flex;flex:0 1 auto;flex-direction:column;align-items:flex-end;gap:2px;font-size:8px;color:var(--muted)}.status strong{max-width:260px;color:${state.error ? "#fda4af" : "#86efac"};white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       .workspace{display:grid;grid-template-columns:minmax(230px,252px) minmax(0,1fr);gap:8px;min-height:0;padding:8px}.panel{min-height:0;border:1px solid var(--line);border-radius:9px;background:rgba(8,13,23,.76);overflow:hidden}.tree-panel{display:flex;flex-direction:column}.panel-title{height:35px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 10px;border-bottom:1px solid var(--line);background:rgba(19,27,42,.78);color:#bed0e3;font-size:9px;font-weight:900;letter-spacing:.07em}.panel-title>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;word-break:keep-all}.panel-title b{flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--accent);font-size:8px}.tree{padding:6px;overflow:auto;scrollbar-gutter:stable}.tree-row{width:100%;min-height:30px;display:grid;grid-template-columns:13px minmax(0,1fr) auto;align-items:center;gap:5px;margin:0 0 3px;padding:5px 8px 5px calc(8px + var(--tree-depth,0) * 14px);border:1px solid transparent;border-radius:6px;background:transparent;color:#96a9bd;font-size:8px;text-align:left;cursor:pointer;transition:border-color 120ms ease,background-color 120ms ease,color 120ms ease}.tree-row i{color:#61778c;font-style:normal}.tree-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tree-row b{color:#587087}.tree-row:hover{border-color:rgba(34,211,238,.3);color:#def9ff}.tree-row.active{border-color:rgba(34,211,238,.52);background:linear-gradient(90deg,rgba(8,145,178,.2),rgba(8,145,178,.04));color:#e7fcff}.tree-row.root{min-height:35px;color:#fff;font-size:10px;font-weight:850}
@@ -5003,6 +5032,8 @@ function hmbImageAssetStyleValue(element, property) {
 function hmbSetImageAssetStyleValue(element, property, value, priority = "important") {
   const style = element?.style;
   if (!style) return;
+  const previous = hmbImageAssetStyleValue(element, property);
+  if (previous.value === value && previous.priority === priority) return;
   if (typeof style.setProperty === "function") {
     style.setProperty(property, value, priority);
     return;
@@ -5036,13 +5067,24 @@ function hmbImageAssetLayoutHeight(element) {
 }
 
 function hmbImageAssetOffsetWithin(element, ancestor) {
+  // offsetTop is relative to offsetParent, not parentElement. Summing it for
+  // every wrapper counts the same native input rows several times. Rects also
+  // reflect list expansion; remove the canvas zoom before using the distance.
+  try {
+    const outer = ancestor?.getBoundingClientRect?.();
+    const inner = element?.getBoundingClientRect?.();
+    const width = Number(ancestor?.offsetWidth) || 0;
+    const zoom = width > 0 ? Number(outer?.width) / width : 0;
+    const delta = Number(inner?.top) - Number(outer?.top);
+    if (zoom > 0 && Number.isFinite(delta)) return Math.max(0, delta / zoom);
+  } catch (_error) {}
   let offset = 0;
   for (let current = element, depth = 0; current && depth < 16; depth += 1) {
     if (current === ancestor) return Math.max(0, offset);
     offset += Number(current.offsetTop) || 0;
-    current = current.parentElement;
+    current = current.offsetParent;
   }
-  return 0;
+  return null;
 }
 
 function hmbImageAssetCompactSummaryHeight(summary) {
@@ -5097,20 +5139,7 @@ function hmbCaptureImageAssetExpandedGeometry(container) {
   }));
   const expandedNodeHeight = hmbImageAssetLayoutHeight(nodeRoot);
   const expandedWidgetHeight = hmbImageAssetLayoutHeight(root);
-  let widgetOffset = hmbImageAssetOffsetWithin(root, nodeRoot);
-  if (!(widgetOffset > 0)) {
-    try {
-      const nodeRect = nodeRoot.getBoundingClientRect?.();
-      const widgetRect = root.getBoundingClientRect?.();
-      const renderedDelta = Number(widgetRect?.top) - Number(nodeRect?.top);
-      const layoutWidth = Number(nodeRoot.offsetWidth) || 0;
-      const renderedWidth = Number(nodeRect?.width) || 0;
-      const zoom = layoutWidth > 0 && renderedWidth > 0 ? renderedWidth / layoutWidth : 1;
-      if (Number.isFinite(renderedDelta) && renderedDelta > 0) {
-        widgetOffset = renderedDelta / (Number.isFinite(zoom) && zoom > 0 ? zoom : 1);
-      }
-    } catch (_error) {}
-  }
+  const widgetOffset = hmbImageAssetOffsetWithin(root, nodeRoot);
   const heightDifference = expandedNodeHeight > expandedWidgetHeight
     ? expandedNodeHeight - expandedWidgetHeight
     : 0;
@@ -5145,6 +5174,7 @@ function hmbRequestImageAssetNodeInternals(container, nodeRoot) {
 export function hmbSetImageAssetCompactShellGeometry(container, compactMode) {
   if (!container) return false;
   if (!compactMode) {
+    hmbStopImageAssetCompactGeometryObserver(container);
     const geometry = container.__hmbImageAssetExpandedGeometry;
     if (!geometry) return false;
     geometry.records.slice().reverse().forEach(({ element, properties }) => {
@@ -5159,12 +5189,31 @@ export function hmbSetImageAssetCompactShellGeometry(container, compactMode) {
   const geometry = hmbCaptureImageAssetExpandedGeometry(container);
   const summary = container.querySelector?.("[data-library-compact-summary]");
   if (!geometry || !summary) return false;
-  geometry.records.forEach(({ element }) => {
-    if (element === geometry.nodeRoot) return;
+  // React can replace row wrappers when a native ParameterList changes. Only
+  // size the current ancestor chain, and retain each original style for exit.
+  const activeShells = new Set([geometry.nodeRoot]);
+  for (let element = container, depth = 0; element && depth < 16; depth += 1, element = element.parentElement) {
+    if (element === geometry.nodeRoot) break;
+    activeShells.add(element);
+    if (!geometry.records.some((record) => record.element === element)) {
+      geometry.records.push({ element, properties: Object.fromEntries(
+        IMAGE_ASSET_COMPACT_GEOMETRY_PROPERTIES.map((property) => [property, hmbImageAssetStyleValue(element, property)]),
+      ) });
+    }
     hmbSetImageAssetStyleValue(element, "height", "auto");
     hmbSetImageAssetStyleValue(element, "min-height", "0px");
     hmbSetImageAssetStyleValue(element, "max-height", "none");
+  }
+  geometry.records = geometry.records.filter(({ element, properties }) => {
+    if (activeShells.has(element)) return true;
+    IMAGE_ASSET_COMPACT_GEOMETRY_PROPERTIES.forEach((property) => {
+      hmbRestoreImageAssetStyleValue(element, property, properties[property]);
+    });
+    return false;
   });
+  const root = container.querySelector?.(".hmb-image-assets");
+  const liveChrome = hmbImageAssetOffsetWithin(root, geometry.nodeRoot);
+  if (liveChrome != null) geometry.chromeHeight = liveChrome;
   const fixedTop = container.querySelector?.(".top[data-library-toggle-surface='header']");
   const fixedTopHeight = hmbImageAssetLayoutHeight(fixedTop) || 58;
   const targetHeight = Math.max(
@@ -5172,15 +5221,82 @@ export function hmbSetImageAssetCompactShellGeometry(container, compactMode) {
     Math.ceil(
       geometry.chromeHeight
       + fixedTopHeight
-      + hmbImageAssetCompactSummaryHeight(summary),
+      + hmbImageAssetCompactSummaryHeight(summary)
+      + 2, // widget border; never trim the last compact Shot row
     ),
   );
   const height = `${targetHeight}px`;
+  const changed = IMAGE_ASSET_COMPACT_GEOMETRY_PROPERTIES.some((property) => (
+    hmbImageAssetStyleValue(geometry.nodeRoot, property).value !== height
+    || hmbImageAssetStyleValue(geometry.nodeRoot, property).priority !== "important"
+  ));
   hmbSetImageAssetStyleValue(geometry.nodeRoot, "height", height);
   hmbSetImageAssetStyleValue(geometry.nodeRoot, "min-height", height);
   hmbSetImageAssetStyleValue(geometry.nodeRoot, "max-height", height);
-  hmbRequestImageAssetNodeInternals(container, geometry.nodeRoot);
+  if (changed) hmbRequestImageAssetNodeInternals(container, geometry.nodeRoot);
+  hmbWatchImageAssetCompactGeometry(container);
   return true;
+}
+
+function hmbStopImageAssetCompactGeometryObserver(container) {
+  const watch = container?.__hmbImageAssetCompactGeometryObserver;
+  if (!watch) return;
+  watch.mutations?.disconnect?.();
+  watch.resize?.disconnect?.();
+  if (watch.frame != null) watch.view.cancelAnimationFrame?.(watch.frame);
+  delete container.__hmbImageAssetCompactGeometryObserver;
+}
+
+function hmbWatchImageAssetCompactGeometry(container) {
+  const geometry = container.__hmbImageAssetExpandedGeometry;
+  const nodeRoot = geometry?.nodeRoot;
+  const view = nodeRoot?.ownerDocument?.defaultView;
+  if (!nodeRoot || !view?.requestAnimationFrame) return;
+  let watch = container.__hmbImageAssetCompactGeometryObserver;
+  if (watch && watch.nodeRoot !== nodeRoot) {
+    hmbStopImageAssetCompactGeometryObserver(container);
+    watch = null;
+  }
+  if (!watch) {
+    watch = { nodeRoot, view, frame: null, targets: new Set() };
+    const schedule = () => {
+      if (watch.frame != null) return;
+      watch.frame = view.requestAnimationFrame(() => {
+        watch.frame = null;
+        if (container.__hmbImageAssetCompactGeometryObserver !== watch) return;
+        if (!container.__hmbImageAssetCompact || !hmbImageAssetMountIsVisible(container)) return;
+        hmbSetImageAssetCompactShellGeometry(container, true);
+      });
+    };
+    // No polling or state publication. Native input rows change outside the
+    // widget's props/update path; observe their layout, not thumbnail churn.
+    if (view.MutationObserver) {
+      watch.mutations = new view.MutationObserver((records) => {
+        if (records.some(({ target }) => !container.contains?.(target))) schedule();
+      });
+      watch.mutations.observe(nodeRoot, {
+        subtree: true, childList: true, attributes: true,
+        attributeFilter: ["style", "class", "hidden", "aria-expanded"],
+      });
+    }
+    if (view.ResizeObserver) watch.resize = new view.ResizeObserver(schedule);
+    container.__hmbImageAssetCompactGeometryObserver = watch;
+  }
+  const targets = new Set([container.querySelector?.("[data-library-compact-summary]")]);
+  for (let element = container, depth = 0; element && depth < 16; depth += 1, element = element.parentElement) {
+    targets.add(element);
+    if (element === nodeRoot) break;
+    // Includes IMAGE_IMPORT_IN and any live import children, without changing
+    // their native controls or the input handles used for connections.
+    Array.from(element.parentElement?.children || []).forEach((sibling) => {
+      if (sibling !== element && !["STYLE", "SCRIPT"].includes(sibling.tagName)) targets.add(sibling);
+    });
+  }
+  targets.delete(null);
+  targets.delete(undefined);
+  watch.targets.forEach((element) => { if (!targets.has(element)) watch.resize?.unobserve?.(element); });
+  targets.forEach((element) => { if (!watch.targets.has(element)) watch.resize?.observe?.(element); });
+  watch.targets = targets;
 }
 
 function hmbCancelImageAssetCompactGeometrySettle(container) {

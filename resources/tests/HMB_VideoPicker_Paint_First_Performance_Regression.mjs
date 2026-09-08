@@ -180,8 +180,8 @@ const dispatchSource = source.slice(dispatchStart, dispatchEnd);
 assert.ok(dispatchStart >= 0 && dispatchEnd > dispatchStart);
 assert.match(
   dispatchSource,
-  /\["read_scene", "render_original_preview", "run_video", "render_snapshot"\][\s\S]*flushPickerStatePublicationBeforeCommand\(\)/,
-  "READ, Generate, and Snapshot must flush a queued UI draft before command dispatch.",
+  /\["read_scene", "render_original_preview", "run_video", "render_snapshot", "video_tools"\][\s\S]*flushPickerStatePublicationBeforeCommand\(\)/,
+  "READ, Generate, Snapshot, Concatenate and Crop must flush a queued UI draft before command dispatch.",
 );
 
 const flushStart = source.indexOf("const flushPickerStatePublicationBeforeCommand = () => {");
