@@ -9,6 +9,7 @@ contacts the Broker automatically and never submits a replacement render.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import importlib.util
 import sys
 import tempfile
@@ -43,6 +44,9 @@ def load_target():
 
 
 target = load_target()
+_journal_directory = tempfile.TemporaryDirectory(prefix="hmb-crash-recovery-")
+atexit.register(_journal_directory.cleanup)
+target._seedance_recovery_journal_path = lambda key: Path(_journal_directory.name) / f"{key}.json"
 
 
 def artifact(path: Path):
@@ -882,116 +886,37 @@ assert client_refresh.parameter_output_values["generation_id"] == (
 assert client_refresh_saves == ["manual_refresh"]
 
 
-class FakeWorkflowContext:
-    def __init__(self, name: str) -> None:
-        self.name = name
-
-    def has_current_workflow(self) -> bool:
-        return True
-
-    def get_current_workflow_name(self) -> str:
-        return self.name
-
-
 async def verify_five_node_save_coordinator() -> None:
-    from griptape_nodes.retained_mode.events.workflow_events import (
-        SaveWorkflowResultSuccess,
-    )
+    """Recovery writes are serialized; native workflow saves are never called."""
+    import time
+    import threading
 
-    nodes = [
-        target.HMBSeedanceGeneration(name=f"Checkpoint Generator {number}")
-        for number in range(1, 6)
-    ]
-    for number, node in enumerate(nodes, start=1):
-        node._set_generation_recovery_checkpoint(
-            stage="pre_submit",
-            task_id=f"hmb-five-save-{number}",
-            task_identity="client_request",
-            status="submitting",
-            params={
-                "model_id": target.SEEDANCE_2_5_MODEL_ID,
-                "output_format": "mov",
-                "return_last_frame": True,
-            },
-        )
+    nodes = [target.HMBSeedanceGeneration(name=f"Checkpoint Generator {i}") for i in range(5)]
+    for i, node in enumerate(nodes):
+        node._set_generation_recovery_checkpoint(stage="pre_submit", task_id=f"hmb-five-save-{i}", task_identity="client_request", status="submitting")
+    activity = {"active": 0, "maximum": 0}
+    guard = threading.Lock()
+    original_write = target._write_seedance_recovery_journal
 
-    requests: list[object] = []
-    active_saves = 0
-    maximum_active_saves = 0
-
-    async def recording_save(request):
-        nonlocal active_saves, maximum_active_saves
-        requests.append(request)
-        active_saves += 1
-        maximum_active_saves = max(maximum_active_saves, active_saves)
+    def record_write(checkpoint):
+        with guard:
+            activity["active"] += 1
+            activity["maximum"] = max(activity["maximum"], activity["active"])
         try:
-            await asyncio.sleep(0.01)
-            return SaveWorkflowResultSuccess(
-                file_path="C:/synthetic/saved-workflow.py",
-                workflow_name="saved-workflow",
-                result_details="saved",
-            )
+            time.sleep(0.01)
+            original_write(checkpoint)
         finally:
-            active_saves -= 1
+            with guard:
+                activity["active"] -= 1
 
-    with mock.patch.object(
-        target.GriptapeNodes,
-        "ContextManager",
-        new=lambda: FakeWorkflowContext("saved-workflow"),
-        create=True,
-    ), mock.patch.object(
-        target.GriptapeNodes,
-        "ahandle_request",
-        new=recording_save,
-        create=True,
-    ):
-        results = await asyncio.gather(
-            *(
-                node._force_save_generation_recovery_checkpoint(
-                    required=True,
-                    reason="pre_submit",
-                )
-                for node in nodes
-            )
-        )
-
-    assert results == [True] * 5
-    assert maximum_active_saves == 1
-    assert len(requests) == 5
-    assert all(getattr(request, "file_name") == "saved-workflow" for request in requests)
-    assert all(getattr(request, "broadcast_result") is False for request in requests)
-    assert all(getattr(request, "create_versioned") is False for request in requests)
-    assert all(getattr(request, "overwrite_existing") is True for request in requests)
-
-    first_save_requests: list[object] = []
-
-    async def first_save(request):
-        first_save_requests.append(request)
-        return SaveWorkflowResultSuccess(
-            file_path="C:/synthetic/untitled.py",
-            workflow_name="untitled",
-            result_details="saved",
-        )
-
-    with mock.patch.object(
-        target.GriptapeNodes,
-        "ContextManager",
-        new=lambda: FakeWorkflowContext("unsaved:recovery-test"),
-        create=True,
-    ), mock.patch.object(
-        target.GriptapeNodes,
-        "ahandle_request",
-        new=first_save,
-        create=True,
-    ):
-        assert await nodes[0]._force_save_generation_recovery_checkpoint(
-            required=True,
-            reason="pre_submit",
-        )
-
-    assert len(first_save_requests) == 1
-    assert getattr(first_save_requests[0], "file_name") is None
-    assert getattr(first_save_requests[0], "broadcast_result") is True
+    with tempfile.TemporaryDirectory() as folder, \
+         mock.patch.object(target, "_seedance_recovery_journal_path", side_effect=lambda key: Path(folder) / f"{key}.json"), \
+         mock.patch.object(target, "_write_seedance_recovery_journal", side_effect=record_write), \
+         mock.patch.object(target.GriptapeNodes, "ahandle_request", new=mock.AsyncMock(side_effect=AssertionError("No HMB workflow saves")), create=True) as save:
+        assert await asyncio.gather(*(n._force_save_generation_recovery_checkpoint(required=True, reason="pre_submit") for n in nodes)) == [True] * 5
+        assert activity["maximum"] == 1
+        assert len(list(Path(folder).glob("*.json"))) == 5
+        save.assert_not_called()
 
 
 asyncio.run(verify_five_node_save_coordinator())

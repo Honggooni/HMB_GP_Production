@@ -699,6 +699,7 @@ def _seedance_recovery_value(value: Any = None) -> dict[str, Any]:
     return {
         "schema": SEEDANCE_RECOVERY_SCHEMA,
         "version": SEEDANCE_RECOVERY_VERSION,
+        "journal_id": _seedance_uuid_text(source.get("journal_id")),
         "revision": bounded_integer(source.get("revision"), 2_147_483_647),
         "stage": stage,
         "task_id": task_id,
@@ -716,7 +717,7 @@ def _seedance_recovery_value(value: Any = None) -> dict[str, Any]:
 
 
 def _workflow_checkpoint_lock() -> asyncio.Lock:
-    """Return one save coordinator per event loop without binding stale loops."""
+    """Coordinate local checkpoint writes without touching host workflow saves."""
 
     loop = asyncio.get_running_loop()
     with _WORKFLOW_CHECKPOINT_LOCKS_GUARD:
@@ -733,6 +734,46 @@ def _seedance_uuid_text(value: Any) -> str:
         r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
         text,
     ) else ""
+
+
+def _seedance_recovery_journal_path(journal_id: str) -> Path:
+    identity = _seedance_uuid_text(journal_id)
+    if not identity:
+        raise ValueError("The local recovery journal identity is missing.")
+    root = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / ".local" / "share"))
+    return root / "HMB_GP_Production" / "generation-recovery" / f"{identity}.json"
+
+
+def _read_seedance_recovery_journal(journal_id: str) -> dict[str, Any] | None:
+    path = _seedance_recovery_journal_path(journal_id)
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(65_537)
+    except FileNotFoundError:
+        return None
+    if len(raw) > 65_536:
+        raise ValueError("The local recovery journal is oversized.")
+    checkpoint = _seedance_recovery_value(json.loads(raw))
+    if checkpoint["journal_id"] != journal_id:
+        raise ValueError("The local recovery journal identity does not match.")
+    return checkpoint
+
+
+def _write_seedance_recovery_journal(checkpoint: dict[str, Any]) -> None:
+    """Atomically persist task metadata only, never a workflow, prompt or key."""
+    checkpoint = _seedance_recovery_value(checkpoint)
+    path = _seedance_recovery_journal_path(checkpoint["journal_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.stem}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            json.dump(checkpoint, stream, ensure_ascii=False, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        with suppress(FileNotFoundError):
+            temporary.unlink()
 
 
 def _seedance_widget_catalog(value: Any) -> dict[str, Any]:
@@ -2116,6 +2157,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             tuple[Any, ...] | None
         ) = None
         self._hmb_last_saved_recovery_revision = 0
+        self._hmb_recovery_journal_checked_id = ""
         self._hmb_generation_started_monotonic: float | None = None
         self._hmb_generation_started_at_ms = 0
         self._hmb_generation_media_revision = 0
@@ -3100,7 +3142,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self.add_parameter(
             ParameterDict(
                 name=SEEDANCE_RECOVERY_PARAMETER,
-                default_value=_seedance_recovery_value(),
+                default_value=_seedance_recovery_value({"journal_id": str(uuid4())}),
                 tooltip="Durable same-task Seedance crash recovery checkpoint.",
                 allowed_modes={ParameterMode.PROPERTY},
                 settable=False,
@@ -3442,7 +3484,24 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         checkpoint = _seedance_recovery_value(
             self.get_parameter_value(SEEDANCE_RECOVERY_PARAMETER)
         )
+        journal_id = checkpoint["journal_id"]
+        if journal_id and self._hmb_recovery_journal_checked_id != journal_id:
+            # A small local read occurs once per hydrated identity, not on each
+            # UI refresh. A normal manual save persists the identity even before
+            # the first render, allowing a newer task checkpoint to be restored.
+            self._hmb_recovery_journal_checked_id = journal_id
+            try:
+                recovered = _read_seedance_recovery_journal(journal_id)
+                if recovered and recovered["updated_at_ms"] > checkpoint["updated_at_ms"]:
+                    checkpoint = recovered
+                    self.set_parameter_value(SEEDANCE_RECOVERY_PARAMETER, checkpoint, emit_change=False)
+            except (OSError, ValueError, TypeError) as exc:
+                logger.warning("Local Seedance recovery journal could not be read (%s).", type(exc).__name__)
         if checkpoint["task_id"]:
+            return checkpoint
+        if checkpoint["updated_at_ms"]:
+            # An explicit clear is a durable tombstone, not an invitation to
+            # revive an old non-serializable generation_id from the host.
             return checkpoint
 
         generation_id = str(
@@ -3461,6 +3520,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         checkpoint = _seedance_recovery_value(
             {
                 "revision": 1,
+                "journal_id": journal_id,
                 "stage": (
                     "pre_submit"
                     if status == "submitting"
@@ -3546,9 +3606,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     ) -> dict[str, Any]:
         """Update the serializable, bounded checkpoint without emitting UI state."""
 
-        previous = _seedance_recovery_value(
-            self.get_parameter_value(SEEDANCE_RECOVERY_PARAMETER)
-        )
+        previous = self._generation_recovery_state()
         source_params = params if isinstance(params, dict) else {}
         raw_model = str(
             source_params.get("model_id")
@@ -3587,6 +3645,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
         checkpoint = _seedance_recovery_value(
             {
+                "journal_id": previous["journal_id"] or str(uuid4()),
                 "revision": min(
                     2_147_483_647,
                     int(previous.get("revision") or 0) + 1,
@@ -3596,7 +3655,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "task_identity": task_identity,
                 "status": status,
                 "terminal": terminal,
-                "updated_at_ms": int(time.time() * 1000),
+                "updated_at_ms": max(int(time.time() * 1000), previous["updated_at_ms"] + 1),
                 "model_id": model_id,
                 "output_format": raw_format,
                 "return_last_frame": return_last_frame,
@@ -3612,9 +3671,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         return checkpoint
 
     def _clear_generation_recovery_checkpoint(self) -> None:
+        previous = _seedance_recovery_value(self.get_parameter_value(SEEDANCE_RECOVERY_PARAMETER))
         self.set_parameter_value(
             SEEDANCE_RECOVERY_PARAMETER,
-            _seedance_recovery_value(),
+            _seedance_recovery_value({
+                "journal_id": previous["journal_id"] or str(uuid4()),
+                "revision": previous["revision"] + 1,
+                "updated_at_ms": max(int(time.time() * 1000), previous["updated_at_ms"] + 1),
+            }),
             emit_change=False,
         )
         self._hmb_generation_recovery_restore_fingerprint = None
@@ -3625,11 +3689,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         required: bool,
         reason: str,
     ) -> bool:
-        """Persist the current workflow, serializing all five nodes in order.
+        """Persist only task recovery metadata; stock Save/auto-save stay untouched.
 
-        A pre-submit save is fail-closed: no successful save means no billable
-        POST. Once the Broker has accepted a request, bounded retries are best
-        effort because the earlier client-request checkpoint is already safe.
+        The historical method name is retained for the submission boundary.
+        No workflow API, registry mutation, editor event or whole-graph save is
+        allowed here. Required persistence still precedes the billable POST.
         """
 
         checkpoint = self._generation_recovery_state()
@@ -3643,33 +3707,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         attempts = 1 if required else 3
         for attempt in range(1, attempts + 1):
             try:
-                from griptape_nodes.retained_mode.events.workflow_events import (
-                    SaveWorkflowRequest,
-                    SaveWorkflowResultSuccess,
-                )
-
                 async with _workflow_checkpoint_lock():
-                    context_factory = getattr(GriptapeNodes, "ContextManager", None)
-                    request_handler = getattr(GriptapeNodes, "ahandle_request", None)
-                    if not callable(context_factory) or not callable(request_handler):
-                        raise RuntimeError("The host workflow save API is unavailable.")
-                    context = context_factory()
-                    if not context.has_current_workflow():
-                        raise RuntimeError("There is no active workflow to save.")
-                    current_name = str(context.get_current_workflow_name() or "")
-                    if not current_name:
-                        raise RuntimeError("The active workflow identity is missing.")
-                    first_save = current_name.startswith("unsaved:")
-                    result = await request_handler(
-                        SaveWorkflowRequest(
-                            file_name=None if first_save else current_name,
-                            broadcast_result=first_save,
-                            create_versioned=False,
-                            overwrite_existing=True,
-                        )
-                    )
-                    if not isinstance(result, SaveWorkflowResultSuccess):
-                        raise RuntimeError("The host rejected the workflow save.")
+                    checkpoint = self._generation_recovery_state()
+                    if not checkpoint["journal_id"]:
+                        checkpoint["journal_id"] = str(uuid4())
+                        self.set_parameter_value(SEEDANCE_RECOVERY_PARAMETER, checkpoint, emit_change=False)
+                    await asyncio.to_thread(_write_seedance_recovery_journal, checkpoint)
                 self._hmb_last_saved_recovery_revision = int(
                     checkpoint.get("revision") or 0
                 )
@@ -3689,7 +3732,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if required:
             raise RuntimeError(
                 "Seedance recovery checkpoint could not be saved. "
-                "No render was submitted. Save the workflow and try again."
+                "No render was submitted. Check local recovery-folder write access and disk space, then retry."
             ) from failure
         return False
 
@@ -4604,6 +4647,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
         if param_name == SEEDANCE_RECOVERY_PARAMETER:
             value = _seedance_recovery_value(value)
+            if not value["journal_id"]:
+                previous = _seedance_recovery_value(self.get_parameter_value(param_name))
+                value["journal_id"] = previous["journal_id"] or str(uuid4())
         elif param_name == SHOT_PICKER_INPUT_PARAMETER:
             if isinstance(value, dict):
                 value = deepcopy(value)
@@ -9691,9 +9737,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             except Exception:
                 # No POST was reached. Remove the in-memory provisional ID so
                 # the current session neither claims a remote render exists nor
-                # blocks a corrected retry after the workflow-save problem is
-                # fixed. The failed save cannot have persisted this mutation,
-                # and the previously saved workflow remains untouched on disk.
+                # blocks a corrected retry after the local journal write is
+                # fixed. Atomic replacement failed before persisting this
+                # mutation; the user's workflow is never written by HMB.
                 self.parameter_output_values["generation_id"] = ""
                 self.parameter_output_values["provider_response"] = None
                 self._clear_generation_recovery_checkpoint()

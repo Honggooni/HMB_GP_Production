@@ -112,6 +112,7 @@ jobs:
             "HMB_Video_Tools_Engine_Regression.py",
             "HMB_Seedance_Gateway_Recovery_Regression.py",
             "HMB_Seedance_Submission_Identity_Regression.py",
+              "HMB_Seedance_Native_Save_Regression.py",
             "HMB_Four_Library_Flow_Regression.py",
             "HMB_Three_Library_Flow_Regression.py",
             "HMB_Agent_Policy_Integration_Regression.py",
