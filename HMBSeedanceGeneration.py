@@ -129,6 +129,8 @@ _WORKFLOW_CHECKPOINT_LOCKS: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, asyncio.Lock
 ] = weakref.WeakKeyDictionary()
 _WORKFLOW_CHECKPOINT_LOCKS_GUARD = threading.Lock()
+_RECOVERY_JOURNAL_OWNERS: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
+_RECOVERY_JOURNAL_OWNERS_GUARD = threading.Lock()
 
 LOCAL_VIDEO_UPLOAD_GRIPTAPE = "Griptape Cloud (Existing)"
 LOCAL_VIDEO_UPLOAD_TOS = "Volcengine TOS"
@@ -2158,6 +2160,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         ) = None
         self._hmb_last_saved_recovery_revision = 0
         self._hmb_recovery_journal_checked_id = ""
+        self._hmb_recovery_journal_owner_id = ""
         self._hmb_generation_started_monotonic: float | None = None
         self._hmb_generation_started_at_ms = 0
         self._hmb_generation_media_revision = 0
@@ -3163,6 +3166,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 },
             )
         )
+        self._claim_generation_recovery_journal(
+            _seedance_recovery_value(self.get_parameter_value(SEEDANCE_RECOVERY_PARAMETER))
+        )
         self._update_parameter_visibility()
         _shot_routing.schedule_post_registration_reconcile(self)
 
@@ -3478,12 +3484,34 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 reason=reason,
             )
 
+    def _claim_generation_recovery_journal(self, checkpoint: dict[str, Any]) -> dict[str, Any]:
+        """Fork a copied live node's journal, but retain identity on real reopen."""
+        identity = checkpoint["journal_id"]
+        if not identity:
+            return checkpoint
+        changed = False
+        with _RECOVERY_JOURNAL_OWNERS_GUARD:
+            owner = _RECOVERY_JOURNAL_OWNERS.get(identity)
+            if owner is not None and owner is not self and owner._runtime_node_is_live(require_registered=True):
+                checkpoint = dict(checkpoint, journal_id=str(uuid4()))
+                identity = checkpoint["journal_id"]
+                changed = True
+            previous = self._hmb_recovery_journal_owner_id
+            if previous != identity and _RECOVERY_JOURNAL_OWNERS.get(previous) is self:
+                _RECOVERY_JOURNAL_OWNERS.pop(previous, None)
+            _RECOVERY_JOURNAL_OWNERS[identity] = self
+            self._hmb_recovery_journal_owner_id = identity
+        if changed:
+            self.set_parameter_value(SEEDANCE_RECOVERY_PARAMETER, checkpoint, emit_change=False)
+        return checkpoint
+
     def _generation_recovery_state(self) -> dict[str, Any]:
         """Return the durable checkpoint, migrating older serialized outputs."""
 
         checkpoint = _seedance_recovery_value(
             self.get_parameter_value(SEEDANCE_RECOVERY_PARAMETER)
         )
+        checkpoint = self._claim_generation_recovery_journal(checkpoint)
         journal_id = checkpoint["journal_id"]
         if journal_id and self._hmb_recovery_journal_checked_id != journal_id:
             # A small local read occurs once per hydrated identity, not on each

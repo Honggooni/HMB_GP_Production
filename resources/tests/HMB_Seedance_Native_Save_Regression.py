@@ -36,6 +36,16 @@ async def verify(folder):
         nodes = [target.HMBSeedanceGeneration(name=f"Generator {i}") for i in range(5)]
         saved = [checkpoint(n) for n in nodes]
         assert len({cp["journal_id"] for cp in saved}) == 5
+        # Native copy/paste serializes hidden parameters too. Live copies must
+        # fork the recovery file; real reopen after the old node is gone must
+        # keep the original identity and load its newer task metadata.
+        with mock.patch.object(nodes[0], "_runtime_node_is_live", return_value=True):
+            copied = reopen(saved[0])
+            assert checkpoint(copied)["journal_id"] != saved[0]["journal_id"]
+            copied._set_generation_recovery_checkpoint(stage="pre_submit", task_id="hmb-copy-only", task_identity="client_request", status="submitting")
+            assert await copied._force_save_generation_recovery_checkpoint(required=True, reason="copy")
+            assert nodes[0]._generation_recovery_state()["task_id"] == ""
+        assert checkpoint(reopen(saved[0]))["journal_id"] == saved[0]["journal_id"]
         for i, n in enumerate(nodes):
             n._set_generation_recovery_checkpoint(stage="pre_submit", task_id=f"hmb-stock-{i}", task_identity="client_request", status="submitting")
         assert await asyncio.gather(*(n._force_save_generation_recovery_checkpoint(required=True, reason="pre_submit") for n in nodes)) == [True] * 5
