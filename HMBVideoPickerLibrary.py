@@ -12296,6 +12296,19 @@ def _picker_tools_resolve_source(source: Dict[str, Any]) -> tuple[Path, Path]:
     return resolved, origin
 
 
+def _call_picker_sidecar_api(function: Any, *args: Any) -> Any:
+    """Supply the current host engine when required, without retrying a write."""
+    engine_parameter = inspect.signature(function).parameters.get("engine")
+    if engine_parameter is None:
+        return function(*args)
+    from griptape_nodes.retained_mode.engine import current_engine  # type: ignore
+
+    engine = current_engine()
+    if engine_parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+        return function(*args, engine)
+    return function(*args, engine=engine)
+
+
 def _copy_video_to_griptape_project(
     node: Any,
     path: Path,
@@ -12437,7 +12450,7 @@ def _copy_video_to_griptape_project(
             )
 
         actual_metadata = Path(
-            _resolve_sidecar_path(actual_target)
+            _call_picker_sidecar_api(_resolve_sidecar_path, actual_target)
         ).resolve()
         if _scene_path_key(actual_metadata) == _scene_path_key(actual_target):
             raise RuntimeError(
@@ -12452,7 +12465,7 @@ def _copy_video_to_griptape_project(
         )
         if actual_metadata.exists():
             actual_metadata.unlink()
-        write_sidecar(actual_target, sidecar_content)
+        _call_picker_sidecar_api(write_sidecar, actual_target, sidecar_content)
         if not actual_metadata.is_file():
             raise RuntimeError(
                 "Griptape project metadata sidecar was not created."

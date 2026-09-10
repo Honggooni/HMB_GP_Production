@@ -327,4 +327,14 @@ def install_clean_ci_griptape_stubs() -> None:
         "griptape_nodes.retained_mode.griptape_nodes",
         GriptapeNodes=StubGriptapeNodes,
     )
+    # Standalone fixtures represent property-only manual inputs unless a test
+    # supplies actual source connections. Match the host's empty topology shape.
+    module(
+        "griptape_nodes.retained_mode.retained_mode",
+        RetainedMode=types.SimpleNamespace(
+            get_connections_for_parameter=lambda *_args, **_kwargs: types.SimpleNamespace(
+                incoming_connections=[], outgoing_connections=[],
+            ),
+        ),
+    )
     module("griptape_nodes.traits.options", Options=StubValue)

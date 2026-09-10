@@ -8376,6 +8376,11 @@ class HMBImageAssetLibrary(DataNode):
                 _shot_routing_catalog_identity(normalized, normalized=True)
             )
         self._sync_thumbnail_bridge_identity(normalized)
+        # Optional finishing UI only; no catalog scan, selection or output change.
+        try:
+            _hmb_shot_routing.notify_color_lut_project_change(self, normalized)
+        except Exception:
+            pass
         return normalized
 
     def _scan_owner_is_current(self) -> bool:

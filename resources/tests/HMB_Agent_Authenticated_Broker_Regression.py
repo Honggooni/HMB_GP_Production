@@ -34,7 +34,7 @@ assert "_broker_load_bearer_token_readonly" in seedance_source
 
 assert delivery["mode"] == "bundled_signed_dat"
 assert delivery["runtime_path"] == "resources/agent/hmb_agent_core.dat"
-assert delivery["archive_source_count"] == 29
+assert delivery["archive_source_count"] == 32
 assert delivery["verification"] == "rsa3072_sha256_v3_contract_once_per_process"
 
 encoded = common._read_agent_policy_envelope()

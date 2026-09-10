@@ -190,6 +190,11 @@ class FakeBrokerBridge:
 class RuntimeRegisteredSeedance(target.HMBSeedanceGeneration):
     """Exercise live-node paths without weakening production liveness guards."""
 
+    def _manual_agent_prompt_source(self):
+        # Broker/media fixtures have no retained graph or Agent input. The real
+        # failed-Agent gate remains covered by the dedicated host DAG suite.
+        return None
+
     def _runtime_node_is_live(self, *, require_registered: bool = False) -> bool:
         del require_registered
         return True
@@ -2603,19 +2608,14 @@ def assert_broker_generation_contract() -> None:
         lambda **kwargs: polling_status_results.append(dict(kwargs))
     )
 
-    def raise_polling_failure(exc: BaseException) -> None:
-        raise exc
-
-    polling_error_node._handle_failure_exception = raise_polling_failure
-    try:
-        asyncio.run(polling_error_node._aprocess_impl())
-    except RuntimeError as exc:
-        polling_message = str(exc)
-        assert "HTTP 429" in polling_message
-        assert "Existing task ID: broker-authoritative-429" in polling_message
-        assert "no new render was started" not in polling_message
-    else:
-        raise AssertionError("Authoritative task polling error was accepted")
+    # Per-Shot failures now remain Failed results so sibling shots continue;
+    # the task identity/retrieval contract is unchanged, not an uncaught raise.
+    asyncio.run(polling_error_node._aprocess_impl())
+    failed_status = next(item for item in reversed(polling_status_results) if item.get("was_successful") is False)
+    polling_message = str(failed_status.get("result_details") or "")
+    assert "HTTP 429" in polling_message
+    assert "Existing task ID: broker-authoritative-429" in polling_message
+    assert "no new render was started" not in polling_message
     assert polling_error.definitive_submission_rejection is False
     assert polling_error_node.parameter_output_values["generation_id"] == (
         "broker-authoritative-429"
@@ -3383,21 +3383,14 @@ def assert_local_video_temporary_publication() -> None:
             lambda **kwargs: failure_status_results.append(dict(kwargs))
         )
 
-        def raise_reported_failure(exc: BaseException) -> None:
-            raise exc
-
-        failing_node._handle_failure_exception = raise_reported_failure
-        try:
-            asyncio.run(failing_node._aprocess_impl())
-        except RuntimeError as exc:
-            failure_message = str(exc)
-            assert "HTTP 429" in failure_message
-            assert "no new render was started" in failure_message
-            assert "Existing task ID" not in failure_message
-            assert "server render can continue" not in failure_message
-            assert "Refresh / Retrieve Result" not in failure_message
-        else:
-            raise AssertionError("Definitive Broker rejection was accepted")
+        asyncio.run(failing_node._aprocess_impl())
+        failed_status = next(item for item in reversed(failure_status_results) if item.get("was_successful") is False)
+        failure_message = str(failed_status.get("result_details") or "")
+        assert "HTTP 429" in failure_message
+        assert "no new render was started" in failure_message
+        assert "Existing task ID" not in failure_message
+        assert "server render can continue" not in failure_message
+        assert "Refresh / Retrieve Result" not in failure_message
         assert failing_bridge.generate_seedance.call_count == 1
         provisional_payload = failing_bridge.generate_seedance.call_args.args[0]
         assert provisional_payload["client_request_id"].startswith("hmb-")

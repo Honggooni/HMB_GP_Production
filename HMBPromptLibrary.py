@@ -218,12 +218,36 @@ VIDEO_SOURCE_TYPE_CHOICES = [
     "Custom",
 ]
 
+LAYOUT_REFERENCE_CONTROL_ROLE = "Camera / Layout Preserved; Free Character Motion"
+LAYOUT_REFERENCE_SCOPE = {
+    "camera": "preserve framing, lens, camera movement and camera timing",
+    "layout": (
+        "preserve background structure, relative scale and spatial staging; "
+        "character movement within that layout remains flexible"
+    ),
+    "character_motion": (
+        "allow full reinterpretation of body and limb motion, poses, gestures, "
+        "facial expressions, acting, in-betweens and character-motion timing; "
+        "not limited to interpolation between the source key poses"
+    ),
+    "lip_sync": (
+        "regenerate speech-related mouth motion and facial performance from "
+        "explicitly assigned speech audio or dialogue, including reference-video "
+        "audio when assigned; preserve the supplied words and any assigned speech "
+        "timing, not the source mouth poses; no invented speech when none is supplied"
+    ),
+    "required_action": "user-specified action intent, event order and contact conditions",
+    "frame_by_frame_motion_matching": False,
+    "appearance": "unchanged assigned image and look-reference authority",
+}
+
 VIDEO_CONTROL_ROLE_CHOICES = [
     "",
     "Primary Unified Shot Control",
     "Timing Only",
     "Local Motion Detail Only",
     "Secondary Motion Only",
+    LAYOUT_REFERENCE_CONTROL_ROLE,
     "Spatial Alignment Verification Only",
     "Derived Motion Decoding Only",
     "FX Effect Only",
@@ -260,6 +284,7 @@ VIDEO_SUB_TYPE_CHOICES = {
     "Motion Reference": [
         "Local Motion",
         "Secondary Motion",
+        "Layout Reference",
     ],
     "Scene / Look Reference": [
         "Camera / Layout",
@@ -302,6 +327,10 @@ VIDEO_TAXONOMY_WIRE_MAP = {
     ("Motion Reference", "Secondary Motion"): (
         "Motion Reference",
         "Secondary Motion Only",
+    ),
+    ("Motion Reference", "Layout Reference"): (
+        "Motion Reference",
+        LAYOUT_REFERENCE_CONTROL_ROLE,
     ),
     ("Scene / Look Reference", "Camera / Layout"): (
         "Camera / Layout Reference",
@@ -512,6 +541,7 @@ def _normalize_image_taxonomy(item: Dict[str, Any]) -> tuple[str, str]:
     sub_type = _clean_string(item.get("image_sub_type"))
     item["image_main_type"] = main_type
     item["image_sub_type"] = sub_type
+    item["surface_2d"] = main_type == "Character" and item.get("surface_2d") is True
 
     candidate_main_type = _clean_string(
         item.get("asset_image_main_type_candidate")
@@ -1380,6 +1410,7 @@ def _default_image_item(slot: int) -> Dict[str, Any]:
         # Used only when a lighting-bearing Look subtype selects the reserved
         # Custom scope mode. It is never interpreted as an image Target ID.
         "look_custom_instruction": "",
+        "surface_2d": False,
         "scope": "",
         "binding_scopes": [""],
         "binding_custom_scopes": [""],
@@ -2409,6 +2440,7 @@ def _normalize_image_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
     out["look_custom_instruction"] = _clean_string(
         item.get("look_custom_instruction")
     )[:MAX_DESCRIPTION_CHARS]
+    out["surface_2d"] = item.get("surface_2d") is True
     out["scope"] = _clean_string(item.get("scope"))
     out["color_picks"] = _normalize_color_picks(item.get("color_picks") or item.get("colorPick") or item.get("color_pick") or item.get("color") or item.get("preview_color"))
     out["binding_custom_scopes"] = _normalize_parallel_text_list(item.get("binding_custom_scopes") or item.get("custom_scopes"), len(out["color_picks"]), MAX_COLOR_PICKS)
@@ -2829,6 +2861,7 @@ _MANUAL_VIDEO_CONTEXT_IMAGE_FIELDS = (
     "image_sub_type",
     "custom_source_type",
     "look_custom_instruction",
+    "surface_2d",
     "color_picks",
     "binding_scopes",
     "binding_custom_scopes",
@@ -4299,6 +4332,7 @@ _PROMPT_IMAGE_UI_FIELDS = (
     "image_sub_type",
     "custom_source_type",
     "look_custom_instruction",
+    "surface_2d",
     "color_picks",
     "binding_scopes",
     "binding_custom_scopes",
@@ -8657,6 +8691,29 @@ def _valid_public_frame_domain_for_prompt(value: Any) -> bool:
     )
 
 
+def _surface_2d_instruction(item: Dict[str, Any]) -> str:
+    """Expand only the user's opt-in mouth treatment; never change motion authority."""
+
+    if item.get("image_main_type") != "Character" or item.get("surface_2d") is not True:
+        return ""
+    image_token = f"@image{int(item.get('slot') or 1)}"
+    target = _clean_string(item.get("owner"))
+    target_scope = f"Target {json.dumps(target, ensure_ascii=False)}" if target else "its assigned character"
+    return (
+        f"User-selected 2DSurface for {image_token}, {target_scope}, within this image connection's active range: "
+        "apply a surface-conforming graphic mouth only. Preserve the approved mouth's graphic contours, "
+        "color relationships, and stylized tooth and tongue shapes. Keep it naturally registered to the "
+        "curved 3D facial surface, following its perspective, orientation, occlusion, and shared "
+        "scene-lighting response, not a detached or independently lit flat sticker. Do not reinterpret "
+        "it as a volumetric opening or add recessed oral depth, extruded lips, volumetric teeth or tongue, "
+        "or new internal shading that implies a 3D cavity. Lighting may follow the existing facial "
+        "surface without creating new mouth geometry. Animate the graphic mouth shapes according to "
+        "the assigned performance and lip-sync authority; do not freeze the mouth or change protected "
+        "motion, timing, or camera. Keep the rest of the character's approved design, geometry, and "
+        "materials unchanged. This selection applies only to this character's mouth, not other targets."
+    )
+
+
 def _public_job_data_contract(
     state: Dict[str, Any],
     active_images: List[Dict[str, Any]],
@@ -8730,6 +8787,10 @@ def _public_job_data_contract(
         image_record["custom_look_instruction"] = _clean_string(
             item.get("look_custom_instruction")
         )
+        surface_instruction = _surface_2d_instruction(item)
+        if surface_instruction:
+            image_record["surface_2d"] = True
+            image_record["surface_2d_instruction"] = surface_instruction
         images.append(image_record)
 
     videos: List[Dict[str, Any]] = []
@@ -8758,6 +8819,14 @@ def _public_job_data_contract(
                 "selection_order": int(item.get("selection_order") or 0),
             }),
         }
+        if (
+            _clean_string(item.get("video_main_type")) == "Motion Reference"
+            and _clean_string(item.get("video_sub_type")) == "Layout Reference"
+        ):
+            # Selection-derived source scope, not a validator or a policy
+            # override. Derive it only at publication so changing Sub Type
+            # cannot leave free-motion authority in a saved Original Preview.
+            record["reference_scope"] = copy.deepcopy(LAYOUT_REFERENCE_SCOPE)
         capabilities = _normalize_video_reference_capabilities(
             item.get("reference_capabilities")
         )
@@ -8934,6 +9003,9 @@ def _build_user_readable_prompt_package(state: Dict[str, Any]) -> str:
             )
             asset_suffix = f" / Asset ID: {asset_id}" if asset_id else ""
             lines.append(f"@image{seq} = {label}{asset_suffix}")
+            surface_instruction = _surface_2d_instruction(item)
+            if surface_instruction:
+                lines.append(f"2DSurface: {surface_instruction}")
             lines.append(
                 " / ".join([
                     f"Main Type: {_public_single_line(item.get('image_main_type'))}",
@@ -8981,6 +9053,12 @@ def _build_user_readable_prompt_package(state: Dict[str, Any]) -> str:
                     f"Keep Out: {_public_single_line(item.get('keep_out'))}",
                 ])
             )
+            if (
+                item.get("video_main_type") == "Motion Reference"
+                and item.get("video_sub_type") == "Layout Reference"
+            ):
+                lines.append(f"Reference Scope: {LAYOUT_REFERENCE_CONTROL_ROLE}")
+                lines.append("Character Performance: Full Motion Reinterpretation and Lip Sync")
     else:
         lines.append("No video source assigned in HMBPromptLibrary.")
     lines.append("")

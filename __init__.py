@@ -16,6 +16,11 @@ except Exception:
     HMBFinishLookLibrary = None  # type: ignore
 
 try:
+    from .HMBColorLUTLibrary import HMBColorLUTLibrary
+except Exception:
+    HMBColorLUTLibrary = None  # type: ignore
+
+try:
     from .HMBPromptLibrary import HMBPromptLibrary
 except Exception:
     HMBPromptLibrary = None  # type: ignore
@@ -33,6 +38,7 @@ except Exception:
 __all__ = [
     "HMBAgentLibrary",
     "HMBFinishLookLibrary",
+    "HMBColorLUTLibrary",
     "HMBImageAssetLibrary",
     "HMBPromptLibrary",
     "HMBSeedanceGeneration",

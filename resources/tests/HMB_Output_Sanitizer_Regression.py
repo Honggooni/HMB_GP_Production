@@ -27,6 +27,7 @@ class Agent:
         self.native_calls = 0
         self.emit_hidden_rule = False
         self.raise_after_publish = False
+        self.native_failure_override = None
         self.intermediate_override = None
         self.output_override = None
         self.nested_output_override = None
@@ -116,7 +117,9 @@ class Agent:
             "rulesets": configs,
         }
         if self.raise_after_publish:
-            raise RuntimeError("simulated native Agent failure after partial publication")
+            raise self.native_failure_override or RuntimeError(
+                "simulated native Agent failure after partial publication"
+            )
         if False:
             yield None
         return None
@@ -415,19 +418,20 @@ list(benign_json.process())
 assert benign_json.parameter_output_values["output"] == benign_json.output_override
 
 # An empty native result is an execution failure, not a semantic or language
-# failure. It must publish only the fixed execution-failure result.
+# failure. It must publish only the bounded EMPTY_OUTPUT diagnostic.
 empty_output = canonical_hmb_agent()
 empty_output.output_override = ""
 empty_output.set_parameter_value("prompt", visible_prompt)
 try:
     list(empty_output.process())
 except RuntimeError as exc:
-    assert str(exc) == module._HMB_EXECUTION_FAILED_MESSAGE
+    assert str(exc) == module._hmb_execution_failure_message("EMPTY_OUTPUT")
 else:
     raise AssertionError("An empty native Agent result was accepted.")
 assert empty_output.parameter_output_values["output"] == (
-    module._HMB_EXECUTION_FAILED_MESSAGE
+    module._hmb_execution_failure_message("EMPTY_OUTPUT")
 )
+assert module._HMB_POLICY_WARNING_NAME not in empty_output.shown_messages
 
 # Runtime-scope text is also no longer inspected at the public string boundary.
 runtime_scope_echo = canonical_hmb_agent()
@@ -538,7 +542,7 @@ sanitizer_failure_after_native_error._secure_hmb_outputs = types.MethodType(
 try:
     list(sanitizer_failure_after_native_error.process())
 except RuntimeError as exc:
-    assert str(exc) == module._HMB_EXECUTION_FAILED_MESSAGE
+    assert str(exc) == module._hmb_execution_failure_message("MODEL_PROVIDER")
 else:
     raise AssertionError("The protected native failure did not fail closed.")
 assert sanitizer_failure_after_native_error._hmb_policy == ""
@@ -552,16 +556,41 @@ exceptional.set_parameter_value("prompt", visible_prompt)
 try:
     list(exceptional.process())
 except RuntimeError as exc:
-    assert str(exc) == module._HMB_EXECUTION_FAILED_MESSAGE
+    assert str(exc) == module._hmb_execution_failure_message("MODEL_PROVIDER")
 else:
     raise AssertionError("The protected native failure did not fail closed.")
 assert exceptional.native_calls == 1
 assert exceptional._hmb_rules_active is False
 assert exceptional.parameter_output_values["output"] == (
-    module._HMB_EXECUTION_FAILED_MESSAGE
+    module._hmb_execution_failure_message("MODEL_PROVIDER")
 )
+assert module._HMB_POLICY_WARNING_NAME not in exceptional.shown_messages
 assert exceptional.parameter_output_values["agent"] == {}
 assert SEALED_TEST_FRAGMENT not in str(exceptional.parameter_output_values["agent"])
+
+# A Cloud stream timeout retains the same one-call execution contract, publishes
+# the classified reason, hides the DAT banner, and can succeed on the next run.
+timed_out = canonical_hmb_agent()
+timed_out.raise_after_publish = True
+timed_out.native_failure_override = TimeoutError("private Cloud request: Read timed out")
+timed_out.set_parameter_value("prompt", visible_prompt)
+try:
+    list(timed_out.process())
+except RuntimeError as exc:
+    assert str(exc) == module._hmb_execution_failure_message("MODEL_TIMEOUT")
+    assert "private Cloud request" not in str(exc)
+else:
+    raise AssertionError("A native model timeout was accepted")
+assert timed_out.native_calls == 1
+assert timed_out.parameter_output_values["output"] == module._hmb_execution_failure_message("MODEL_TIMEOUT")
+assert timed_out.parameter_output_values["agent"] == {}
+assert module._HMB_POLICY_WARNING_NAME not in timed_out.shown_messages
+timed_out.raise_after_publish = False
+timed_out.set_parameter_value("prompt", visible_prompt)
+list(timed_out.process())
+assert timed_out.native_calls == 2
+assert timed_out._hmb_native_failure_code == ""
+assert timed_out.parameter_output_values["output"] == "FINAL ENGLISH OUTPUT"
 
 for obsolete in ("PROJECT", "project", "episode", "shot", "projects_root", "project_load_path", "Task"):
     assert obsolete not in node.parameters

@@ -34,6 +34,7 @@ assert routing.KNOWN_KINDS == {
     routing.KIND_PROMPT,
     routing.KIND_AGENT,
     routing.KIND_SEEDANCE,
+    routing.KIND_COLOR_LUT,
 }
 assert (
     routing.SHOT_ROUTING_PROTOCOL_VERSION

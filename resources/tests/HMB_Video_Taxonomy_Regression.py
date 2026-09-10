@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -36,14 +37,33 @@ def prompt_records(machine_prompt: str) -> tuple[dict, dict]:
     return job, fx
 
 
-expected = dict(prompt.VIDEO_TAXONOMY_WIRE_MAP)
+layout_pair = ("Motion Reference", "Layout Reference")
+layout_role = "Camera / Layout Preserved; Free Character Motion"
+expected = {
+    ("Maya Preview / Playblast", "Original Preview"): ("Unified Shot-Control Video", "Primary Unified Shot Control"),
+    ("Maya Preview / Playblast", "Mask"): ("Maya Preview / Playblast", "Mask / Guide Only"),
+    ("Maya Preview / Playblast", "Depth"): ("Depth / Spatial Reference", "Spatial Alignment Verification Only"),
+    ("Maya Preview / Playblast", "Motion Guide"): ("Motion Guide / Retargeting Reference", "Derived Motion Decoding Only"),
+    ("Maya Preview / Playblast", "Timing / Edit"): ("Timing / Edit Reference", "Timing Only"),
+    ("Motion Reference", "Local Motion"): ("Motion Reference", "Local Motion Detail Only"),
+    ("Motion Reference", "Secondary Motion"): ("Motion Reference", "Secondary Motion Only"),
+    layout_pair: ("Motion Reference", layout_role),
+    ("Scene / Look Reference", "Camera / Layout"): ("Camera / Layout Reference", "Spatial Alignment Verification Only"),
+    ("Scene / Look Reference", "Lighting / Look"): ("Lighting / Look Reference", "Lighting / Look Only"),
+    ("Scene / Look Reference", "Composition"): ("Camera / Layout Reference", "Local Composition Check Only"),
+    ("FX Reference", "FX Effect Only"): ("FX Reference", "FX Effect Only"),
+    ("Custom / Context", "Context"): ("Custom", "Context Only"),
+    ("Custom / Context", "Custom"): ("Custom", "Custom Role"),
+}
+assert prompt.VIDEO_TAXONOMY_WIRE_MAP == expected
+assert layout_role in prompt.VIDEO_CONTROL_ROLE_CHOICES
 assert len(prompt.VIDEO_MAIN_TYPE_CHOICES) == 6
-assert sum(len(values) for values in prompt.VIDEO_SUB_TYPE_CHOICES.values()) == 13
+assert sum(len(values) for values in prompt.VIDEO_SUB_TYPE_CHOICES.values()) == 14
 assert prompt.VIDEO_SUB_TYPE_CHOICES["Maya Preview / Playblast"] == [
     "Original Preview", "Mask", "Depth", "Motion Guide", "Timing / Edit",
 ]
 assert prompt.VIDEO_SUB_TYPE_CHOICES["Motion Reference"] == [
-    "Local Motion", "Secondary Motion",
+    "Local Motion", "Secondary Motion", "Layout Reference",
 ]
 assert prompt.VIDEO_SUB_TYPE_CHOICES["FX Reference"] == ["FX Effect Only"]
 assert "Unified Shot-Control Video" not in prompt.VIDEO_MAIN_TYPE_CHOICES
@@ -115,8 +135,107 @@ for index, ((main_type, sub_type), wire_pair) in enumerate(expected.items(), 1):
     job, _fx = prompt_records(machine)
     assert job["videos"][0]["source_type"] == wire_pair[0]
     assert job["videos"][0]["control_role"] == wire_pair[1]
+    assert _fx["sources"][0]["role"] == wire_pair[1]
+    assert ("reference_scope" in job["videos"][0]) == ((main_type, sub_type) == layout_pair)
     sample_machine = machine
     sample_visible = prompt._build_prompt_package(normalized)
+
+
+# Layout Reference is an explicit camera/layout assignment, not Original's
+# frame-locked acting and not just interpolation of the source key poses.
+layout_state = prompt._default_widget_state()
+layout_state["videos"][0].update({
+    "present": True,
+    "label": "blocking-with-dialogue.mp4",
+    "video_main_type": layout_pair[0],
+    "video_sub_type": layout_pair[1],
+    "custom_control_role": "Keep my authored note",
+    "keep_out": "  no added props\nno added props\n",
+})
+layout_state["text"]["PRESERVED_TEXT"] = "[Dialogue] 안녕, 반가워!"
+layout_state = prompt._normalize_state(layout_state)
+for _ in range(25):
+    restored = prompt._normalize_state(json.loads(json.dumps(layout_state)))
+    assert restored == layout_state
+    layout_state = restored
+layout_machine = prompt._build_data_only_prompt_package(layout_state)
+layout_visible = prompt._build_prompt_package(layout_state)
+layout_job, layout_fx = prompt_records(layout_machine)
+layout_scope = layout_job["videos"][0]["reference_scope"]
+assert "camera movement and camera timing" in layout_scope["camera"]
+assert "relative scale and spatial staging" in layout_scope["layout"]
+assert "full reinterpretation" in layout_scope["character_motion"]
+assert "not limited to interpolation" in layout_scope["character_motion"]
+assert "speech audio or dialogue" in layout_scope["lip_sync"]
+assert "preserve the supplied words" in layout_scope["lip_sync"]
+assert "no invented speech" in layout_scope["lip_sync"]
+assert layout_scope["frame_by_frame_motion_matching"] is False
+assert "assigned image and look-reference" in layout_scope["appearance"]
+assert layout_job["videos"][0]["custom_control_role"] == "Keep my authored note"
+assert layout_job["videos"][0]["keep_out"] == "  no added props\nno added props\n"
+assert json.loads(layout_machine.splitlines()[6])["PRESERVED_TEXT"] == "[Dialogue] 안녕, 반가워!"
+assert "Primary Unified Shot Control" not in layout_machine
+assert f"Reference Scope: {layout_role}" in layout_visible
+assert "Full Motion Reinterpretation and Lip Sync" in layout_visible
+
+# Deriving scope at publication prevents stale data from authorizing free
+# motion after any other subtype (including Original Preview) is selected.
+for next_pair in [*expected, ("Motion Reference", "")]:
+    changed = copy.deepcopy(layout_state)
+    changed["videos"][0].update({
+        "video_main_type": next_pair[0],
+        "video_sub_type": next_pair[1],
+        "reference_scope": copy.deepcopy(layout_scope),
+    })
+    changed_job, _ = prompt_records(prompt._build_data_only_prompt_package(changed))
+    changed_record = changed_job["videos"][0]
+    assert ("reference_scope" in changed_record) == (next_pair == layout_pair)
+    if next_pair in expected:
+        assert changed_record["control_role"] == expected[next_pair][1]
+    if next_pair != layout_pair:
+        assert "Full Motion Reinterpretation and Lip Sync" not in prompt._build_prompt_package(changed)
+
+# Picker reordering/reconnect must keep the author-selected subtype attached
+# to its UID, not to the old slot, without changing the other video's role.
+def layout_picker_payload(uids):
+    return {
+        "schema": "hmb-prompt-library-picker-binding",
+        "schema_version": 5,
+        "mode": "maya",
+        "media_ready": True,
+        "active_slot_count": len(uids),
+        "selected_video_count": len(uids),
+        "selection_id": "layout-test-" + "-".join(uids),
+        "ordered_video_uids": list(uids),
+        "videos": [{
+            "video_uid": uid, "source_uid": uid, "order_key": uid,
+            "selected": True, "selection_order": slot, "video_slot": slot,
+            "video_path": f"https://example.test/{uid}.mp4",
+        } for slot, uid in enumerate(uids, 1)],
+        "markers": [],
+    }
+
+
+picker_state = prompt._apply_picker_payload(
+    prompt._default_widget_state(), layout_picker_payload(("blocking", "other")), connected=True,
+)
+picker_state["videos"][0].update({
+    "video_main_type": layout_pair[0], "video_sub_type": layout_pair[1], "manual": True,
+})
+picker_state["videos"][1].update({
+    "video_main_type": "Motion Reference", "video_sub_type": "Secondary Motion", "manual": True,
+})
+for order in (("other", "blocking"), ("blocking", "other")):
+    picker_state = prompt._apply_picker_payload(picker_state, layout_picker_payload(order), connected=True)
+    picker_state = prompt._normalize_state(json.loads(json.dumps(picker_state)))
+    by_uid = {row["video_uid"]: row for row in picker_state["videos"]}
+    assert by_uid["blocking"]["video_sub_type"] == "Layout Reference"
+    assert by_uid["other"]["video_sub_type"] == "Secondary Motion"
+disconnected = prompt._apply_picker_payload(picker_state, {}, connected=False)
+reconnected = prompt._apply_picker_payload(
+    disconnected, layout_picker_payload(("blocking", "other")), connected=True,
+)
+assert reconnected["videos"][0]["video_sub_type"] == "Layout Reference"
 
 
 # Main Type alone is broad authored metadata. It remains present in the public
@@ -230,5 +349,18 @@ source = SimpleNamespace(
 assert agent._paired_machine_prompt(
     SimpleNamespace(_hmb_verified_prompt_source_node=source), sample_visible
 ) == sample_machine
+
+# The new scope and lip-sync intent reach Agent as the exact paired data;
+# no model call, new validator, or policy override is introduced here.
+layout_snapshot = {
+    **snapshot,
+    "visible_sha256": hashlib.sha256(layout_visible.encode("utf-8")).hexdigest(),
+    "machine_sha256": hashlib.sha256(layout_machine.encode("utf-8")).hexdigest(),
+    "machine_prompt": layout_machine,
+}
+layout_source = SimpleNamespace(_hmb_agent_prompt_snapshot=lambda _: dict(layout_snapshot))
+assert agent._paired_machine_prompt(
+    SimpleNamespace(_hmb_verified_prompt_source_node=layout_source), layout_visible,
+) == layout_machine
 
 print("HMB video taxonomy Prompt-authority / opaque Agent boundary: PASS")

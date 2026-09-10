@@ -38,10 +38,10 @@ packager = load_packager()
 source_files = tuple(packager.SOURCE_FILES)
 runtime_install_files = tuple(packager.RUNTIME_INSTALL_FILES)
 distribution_only_files = tuple(packager.DISTRIBUTION_ONLY_FILES)
-assert len(runtime_install_files) == 25
+assert len(runtime_install_files) == 28
 assert distribution_only_files == DISTRIBUTION_ONLY_FILES
 assert source_files == (*runtime_install_files, *distribution_only_files)
-assert len(source_files) == 29
+assert len(source_files) == 32
 assert not EXCLUDED_PACKAGE_FILES.intersection(source_files)
 assert not set(runtime_install_files).intersection(distribution_only_files)
 assert {
@@ -79,8 +79,8 @@ assert "LocalApplicationData" in installer
 assert "Rollback data must be stored outside the Griptape libraries folder" in installer
 assert "MyInvocation.MyCommand.Path" in installer
 assert "Could not resolve the extracted HMB package directory" in installer
-assert "[int]$manifest.install_file_count -ne 25" in installer
-assert "$records.Count -ne 29" in installer
+assert "[int]$manifest.install_file_count -ne 28" in installer
+assert "$records.Count -ne 32" in installer
 assert "Remove-Item" not in installer
 assert "backup" not in installer.casefold()
 

@@ -254,10 +254,10 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.7.50",
+    "library_version": "0.7.51",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
-      "archive_source_count": 29,
+      "archive_source_count": 32,
       "mode": "bundled_signed_dat",
       "runtime_path": "resources/agent/hmb_agent_core.dat",
       "policy_version": "2026-09-03.agent-shot-quality.v5.2",
@@ -451,6 +451,24 @@
     }
   ],
   "nodes": [
+    {
+      "class_name": "HMBColorLUTLibrary",
+      "file_path": "HMBColorLUTLibrary.py",
+      "metadata": {
+        "category": "HMB_GP_Production",
+        "description": "Local post-generation SDR color grading with live preview, five project profiles, exact Shot binding and single-pass final video export.",
+        "display_name": "HMB Color LUT",
+        "icon": "Palette",
+        "group": "edit",
+        "width": 1220,
+        "height": 1080,
+        "min_width": 760,
+        "min_height": 700,
+        "resizable": true,
+        "tags": ["HMB", "color-lut", "video", "post-production"],
+        "ui_options": {"width": 1220, "height": 1080, "min_width": 760, "min_height": 700, "resizable": true}
+      }
+    },
     {
       "class_name": "HMBAgentLibrary",
       "file_path": "HMBAgentLibrary.py",
@@ -703,6 +721,11 @@
     }
   ],
   "widgets": [
+    {
+      "name": "HMBColorLUTLibraryWidget",
+      "path": "widgets/HMBColorLUTLibraryWidget.js",
+      "description": "Bilingual Shot-bound live Color LUT preview, stage controls, project profiles and local final export."
+    },
     {
       "name": "HMBAgentLibraryWidget",
       "path": "widgets/HMBAgentLibraryWidget.js",

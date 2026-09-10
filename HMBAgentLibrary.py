@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import asyncio
 import hashlib
 import hmac
 import importlib.util
@@ -64,6 +65,8 @@ _AGENT_SHOT_CONTEXT_VERSION = 1
 _AGENT_STATE_WARNING_NAME = "HMB_AGENT_STATE_DISPLAY_WARNING"
 _HMB_POLICY_WARNING_NAME = "HMB_AGENT_POLICY_REQUIRED_WARNING"
 _HMB_TOPOLOGY_WARNING_NAME = "HMB_AGENT_CONNECTION_CHECK_WARNING"
+_AGENT_EXECUTION_RESULT_PARAMETER = "HMB_AGENT_EXECUTION_RESULT"
+_AGENT_EXECUTION_FAILED_WARNING = "HMB_AGENT_EXECUTION_FAILED_WARNING"
 _FINAL_TEXT_DISPLAY_NAME = "FINAL TEXT · GENERATOR"
 _AGENT_STATE_DISPLAY_NAME = "AGENT STATE · CHAIN ONLY"
 _HMB_POLICY_UNAVAILABLE_MESSAGE = (
@@ -122,6 +125,31 @@ _HMB_NATIVE_FAILURE_CODES = frozenset({
     "HOST_ADAPTER",
     "EMPTY_OUTPUT",
 })
+
+
+def _hmb_execution_failure_message(code: str) -> str:
+    """Describe an existing native failure without publishing provider payloads."""
+
+    guidance = {
+        "MODEL_TIMEOUT": (
+            "The Agent model response timed out. This is not a local policy DAT "
+            "error. Retry the Agent or check the selected model/provider. "
+            "For generators with an existing task ID, retrieve that result before "
+            "starting another render."
+        ),
+        "MODEL_CREDENTIAL": "Check the credentials for the selected Agent model provider.",
+        "MODEL_ACCESS": "Check access to the selected Agent model with its provider.",
+        "MODEL_RATE_LIMIT": "The Agent model provider reported a rate or quota limit.",
+        "MODEL_NETWORK": "The Agent model connection failed. Check the provider connection.",
+        "MODEL_PROVIDER": "The Agent model provider reported an execution failure.",
+        "HOST_ADAPTER": "The native Agent or model adapter could not complete execution.",
+        "EMPTY_OUTPUT": "The Agent model returned no final text.",
+    }
+    normalized = str(code or "").strip().upper()
+    detail = guidance.get(normalized)
+    if detail is None:
+        return _HMB_EXECUTION_FAILED_MESSAGE
+    return f"{_HMB_EXECUTION_FAILED_MESSAGE} Reason: {normalized}. {detail}"
 
 
 def _hmb_native_failure_code(exc: BaseException) -> str:
@@ -1266,6 +1294,7 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_scheduler_step_failed = False
         self._hmb_native_failure_stage = ""
         self._hmb_native_failure_code = ""
+        self._hmb_execution_result: dict[str, Any] = {}
         self._hmb_shot_context: dict[str, Any] = {}
         self._hmb_shot_catalog_snapshot: dict[str, Any] = {}
         # Instance-local execution authority.  Display widget writes and
@@ -1309,6 +1338,105 @@ class HMBAgentLibrary(_BaseAgent):
         _ensure_hmb_policy_warning(self)
         _ensure_hmb_topology_warning(self)
         _ensure_agent_widget(self)
+        self._ensure_hmb_execution_result()
+
+    def _ensure_hmb_execution_result(self) -> None:
+        """Persist handled failure separately from text and private Agent state."""
+        if not _parameter_exists(self, _AGENT_EXECUTION_RESULT_PARAMETER):
+            self.add_parameter(Parameter(
+                name=_AGENT_EXECUTION_RESULT_PARAMETER,
+                type="dict", default_value={},
+                allowed_modes={ParameterMode.PROPERTY, ParameterMode.OUTPUT},
+                settable=False, hide=True, hide_property=True, hide_label=True,
+                ui_options={"hide": True, "hide_property": True, "hide_handles": True},
+            ))
+        if ParameterMessage is not None:
+            root = getattr(self, "root_ui_element", None)
+            children = getattr(root, "children", None) or getattr(root, "_children", [])
+            if not any(getattr(child, "name", "") == _AGENT_EXECUTION_FAILED_WARNING
+                       for child in children):
+                self.add_node_element(ParameterMessage(
+                    name=_AGENT_EXECUTION_FAILED_WARNING,
+                    title="Agent failed · other shots continue",
+                    variant="error", hide=True,
+                    value="This Agent failed. Its new render is skipped; independent shots continue. See FINAL TEXT for the reason.",
+                ))
+
+    def _hmb_execution_result_snapshot(self) -> dict[str, Any]:
+        result = getattr(self, "_hmb_execution_result", None)
+        if not isinstance(result, dict) or not result:
+            result = getattr(self, "parameter_values", {}).get(_AGENT_EXECUTION_RESULT_PARAMETER)
+        return dict(result) if isinstance(result, dict) else {}
+
+    def _set_hmb_execution_result(self, status: str, *, code: str = "", message: str = "") -> None:
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            return
+        output = str(getattr(self, "parameter_output_values", {}).get("output") or "").strip()
+        previous = self._hmb_execution_result_snapshot()
+        result = {
+            "schema": "hmb-agent-execution-result", "version": 1,
+            "status": status, "code": code, "message": message,
+            "run_id": secrets.token_hex(16) if status == "running" else str(previous.get("run_id") or ""),
+            "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest() if status == "succeeded" else "",
+        }
+        # The host clears output values before scheduling a new run. Preserve
+        # the handled result in an instance-owned value and serializable property.
+        self._hmb_execution_result = result
+        self.parameter_values[_AGENT_EXECUTION_RESULT_PARAMETER] = dict(result)
+        self.parameter_output_values[_AGENT_EXECUTION_RESULT_PARAMETER] = dict(result)
+        try:
+            if status == "failed":
+                self.show_message_by_name(_AGENT_EXECUTION_FAILED_WARNING)
+            else:
+                self.hide_message_by_name(_AGENT_EXECUTION_FAILED_WARNING)
+        except Exception:
+            pass
+
+    async def aprocess(self) -> None:
+        """Handle this Agent's failure without canceling independent host tasks.
+
+        The synchronous process keeps its strict error contract. Only the host
+        execution boundary handles it, publishes an explicit failure, and lets
+        downstream generation skip the failed data dependency before a new submission.
+        """
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            return
+        self._set_hmb_execution_result("running")
+        self._set_visible_output("")
+        self.parameter_output_values["agent"] = {}
+        self._last_raw_output = None
+        try:
+            await super().aprocess()
+        except asyncio.CancelledError:
+            if not bool(getattr(self, "_hmb_node_deleted", False)):
+                message = "[HMB EXECUTION CANCELLED] Agent execution was cancelled. No new render was submitted."
+                self._publish_hmb_execution_block(message)
+                self._set_hmb_execution_result("failed", code="CANCELLED", message=message)
+            raise  # Explicit user/host cancellation must still stop work.
+        except Exception as exc:
+            code = str(getattr(self, "_hmb_native_failure_code", "") or _hmb_native_failure_code(exc))
+            known = {
+                _HMB_POLICY_UNAVAILABLE_MESSAGE: "POLICY_UNAVAILABLE",
+                _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE: "SOURCE_UNAVAILABLE",
+                _HMB_SOURCE_CONTRACT_INVALID_MESSAGE: "SOURCE_UNAVAILABLE",
+            }
+            if str(exc) in known:
+                message, code = str(exc), known[str(exc)]
+            else:
+                message = _hmb_execution_failure_message(code)
+            self._publish_hmb_execution_block(message)
+            self._set_hmb_execution_result("failed", code=code, message=message)
+            return
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            return
+        output = self.parameter_output_values.get("output")
+        if not isinstance(output, str) or not output.strip() or output == _PUBLIC_OUTPUT_BLOCKED:
+            code = "EMPTY_OUTPUT" if not output else "OUTPUT_UNAVAILABLE"
+            message = _hmb_execution_failure_message(code) if code == "EMPTY_OUTPUT" else _PUBLIC_OUTPUT_BLOCKED
+            self._publish_hmb_execution_block(message)
+            self._set_hmb_execution_result("failed", code=code, message=message)
+            return
+        self._set_hmb_execution_result("succeeded")
 
     def _ensure_hmb_shot_prompt_input(self) -> None:
         """Register the private, router-owned Prompt dependency port.
@@ -2747,15 +2875,18 @@ class HMBAgentLibrary(_BaseAgent):
             outputs["agent"] = {}
         self._set_visible_output(message)
         self._hide_hmb_policy_warning()
-        warning_name = (
-            _HMB_TOPOLOGY_WARNING_NAME
-            if message == _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE
-            else _HMB_POLICY_WARNING_NAME
-        )
-        try:
-            self.show_message_by_name(warning_name)
-        except Exception:
-            pass
+        # These static banners describe only their exact failures. Native model
+        # and source-contract failures already publish their own output/error;
+        # showing the DAT banner for them falsely claims the policy is invalid.
+        warning_name = {
+            _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE: _HMB_TOPOLOGY_WARNING_NAME,
+            _HMB_POLICY_UNAVAILABLE_MESSAGE: _HMB_POLICY_WARNING_NAME,
+        }.get(message)
+        if warning_name is not None:
+            try:
+                self.show_message_by_name(warning_name)
+            except Exception:
+                pass
         try:
             print(f"[HMB_PRODUCTION][ERROR] {message}")
         except Exception:
@@ -3315,6 +3446,9 @@ class HMBAgentLibrary(_BaseAgent):
         except Exception:
             pass
         if native_failed:
-            self._publish_hmb_execution_block(_HMB_EXECUTION_FAILED_MESSAGE)
-            raise RuntimeError(_HMB_EXECUTION_FAILED_MESSAGE) from None
+            failure_message = _hmb_execution_failure_message(
+                getattr(self, "_hmb_native_failure_code", "")
+            )
+            self._publish_hmb_execution_block(failure_message)
+            raise RuntimeError(failure_message) from None
         return result

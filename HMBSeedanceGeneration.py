@@ -80,6 +80,25 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import write_si
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.traits.options import Options
 
+
+def _write_generation_sidecar(file_path: Path, metadata: Any) -> None:
+    """Use the installed host's sidecar API, without retrying a partial write."""
+
+    parameters = inspect.signature(write_sidecar).parameters
+    engine_parameter = parameters.get("engine")
+    if engine_parameter is None:
+        # Older hosts accept only (file_path, metadata).
+        write_sidecar(file_path, metadata)
+        return
+    from griptape_nodes.retained_mode.engine import current_engine
+
+    engine = current_engine()
+    if engine_parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+        write_sidecar(file_path, metadata, engine)
+    else:
+        write_sidecar(file_path, metadata, engine=engine)
+
+
 try:
     from griptape_nodes.traits.widget import Widget
 except Exception:  # Older Griptape Nodes builds keep the legacy selector alive.
@@ -463,6 +482,8 @@ SHOT_VIDEO_INPUT_PARAMETER = "SHOT_VIDEO_IN"
 SHOT_ASSET_INPUT_PARAMETER = "SHOT_ASSET_IN"
 SHOT_PICKER_INPUT_PARAMETER = "SHOT_PICKER_IN"
 SHOT_FINISH_LOOK_INPUT_PARAMETER = "SHOT_FINISH_LOOK_IN"
+GENERATED_VIDEO_SOURCE_PARAMETER = "HMB_GENERATED_VIDEO_SOURCE"
+GENERATED_VIDEO_SOURCE_SCHEMA = "hmb-generated-video-source"
 FINISH_LOOK_SHOT_SNAPSHOT_SCHEMA = "hmb-finish-look-shot-snapshot"
 FINISH_LOOK_SHOT_SNAPSHOT_VERSION = 1
 SHOT_PICKER_LEGACY_JSON_MAX_BYTES = 1024 * 1024
@@ -643,6 +664,43 @@ def _seedance_refresh_command_value(value: Any = None) -> dict[str, Any]:
     }
 
 
+def _generated_video_origin(value: Any = None) -> dict[str, Any]:
+    """Accept only an explicitly captured Shot identity, never infer one."""
+    if not isinstance(value, dict):
+        return {}
+    channel = _seedance_uuid_text(value.get("channel_uuid"))
+    shot = _seedance_uuid_text(value.get("shot_uuid"))
+    instance = _seedance_uuid_text(value.get("source_node_instance_id"))
+    number = value.get("number")
+    name = str(value.get("name") or "").strip()
+    if (not channel or not shot or not instance or type(number) is not int
+            or not 1 <= number <= 5 or not name or len(name) > 128):
+        return {}
+    return {"channel_uuid": channel, "shot_uuid": shot, "number": number,
+            "name": name, "source_node_instance_id": instance}
+
+
+def _generated_video_source_value(value: Any = None) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    origin = _generated_video_origin(value)
+    task_id = str(value.get("task_id") or "").strip()
+    path = str(value.get("path") or "").strip()
+    revision = value.get("result_revision")
+    if (not origin or value.get("schema") != GENERATED_VIDEO_SOURCE_SCHEMA
+            or value.get("version") != 1 or value.get("completed") is not True
+            or not task_id or _TASK_ID_PATTERN.fullmatch(task_id) is None
+            or value.get("generation_id") != task_id
+            or type(revision) is not int or not 1 <= revision <= 2_147_483_647
+            or not path or len(path) > 4096 or not Path(path).is_absolute()
+            or str(value.get("url") or "") != path):
+        return {}
+    return {"schema": GENERATED_VIDEO_SOURCE_SCHEMA, "version": 1, **origin,
+            "generation_id": task_id, "task_id": task_id,
+            "result_revision": revision, "path": path, "url": path,
+            "completed": True}
+
+
 def _seedance_recovery_value(value: Any = None) -> dict[str, Any]:
     """Normalize the durable, non-sensitive same-task recovery checkpoint."""
 
@@ -715,6 +773,7 @@ def _seedance_recovery_value(value: Any = None) -> dict[str, Any]:
         "output_format": output_format,
         "return_last_frame": source.get("return_last_frame") is True,
         "output_file": output_file,
+        "generation_origin": _generated_video_origin(source.get("generation_origin")) if task_id else {},
     }
 
 
@@ -2125,6 +2184,10 @@ class LocalReferenceVideoError(RuntimeError):
     """A selected local/project video cannot be resolved or read."""
 
 
+class _AgentResultUnavailable(RuntimeError):
+    """A handled upstream failure: do not submit a replacement render."""
+
+
 class HMBSeedanceGeneration(SuccessFailureNode):
     """Generate video with a supported Seedance model through FN AI Broker.
 
@@ -2165,6 +2228,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._hmb_generation_started_at_ms = 0
         self._hmb_generation_media_revision = 0
         self._hmb_last_success_video: VideoUrlArtifact | None = None
+        self._hmb_generated_source_instance_id = str(uuid4())
+        self._hmb_generated_video_source: dict[str, Any] = {}
+        self._hmb_generated_video_source_published: dict[str, Any] = {}
+        self._hmb_generation_run_origin: dict[str, Any] = {}
         self._hmb_last_success_last_frame_url: ImageUrlArtifact | None = None
         self._hmb_output_format_initial_setup_seen = False
         self._hmb_return_last_frame_initial_setup_seen = False
@@ -3018,6 +3085,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 ui_options={"display_name": "Last Frame Image"},
             )
         )
+        self.add_parameter(
+            ParameterDict(
+                name=GENERATED_VIDEO_SOURCE_PARAMETER,
+                default_value={},
+                tooltip="Verified completed video with its immutable generation Shot identity.",
+                allowed_modes={ParameterMode.PROPERTY, ParameterMode.OUTPUT},
+                settable=False,
+                hide=True, hide_property=True, hide_label=True,
+                ui_options={"hide": True, "hide_property": True, "hide_handles": True},
+            )
+        )
         self._output_file = ProjectFileParameter(
             node=self,
             name="output_file",
@@ -3505,6 +3583,129 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self.set_parameter_value(SEEDANCE_RECOVERY_PARAMETER, checkpoint, emit_change=False)
         return checkpoint
 
+    def _capture_generated_video_origin(self) -> dict[str, Any]:
+        """Capture the selected Shot synchronously before generation awaits."""
+        try:
+            subscription = self._hmb_shot_channel_subscription()
+        except Exception:
+            return {}
+        if not subscription.get("enabled"):
+            return {}
+        instance = getattr(self, "_hmb_generated_source_instance_id", "")
+        if not instance:
+            instance = self._hmb_generated_source_instance_id = str(uuid4())
+        return _generated_video_origin({
+            "channel_uuid": subscription.get("channel_uuid"),
+            "shot_uuid": subscription.get("shot_uuid"),
+            "number": subscription.get("shot_number"),
+            "name": subscription.get("shot_name"),
+            "source_node_instance_id": instance,
+        })
+
+    def _hmb_generated_video_source_snapshot(self) -> dict[str, Any]:
+        source = _generated_video_source_value(getattr(self, "_hmb_generated_video_source", None))
+        if not source:
+            source = _generated_video_source_value(
+                self.get_parameter_value(GENERATED_VIDEO_SOURCE_PARAMETER)
+            )
+        if not source:
+            source = self._restore_completed_video_source_for_lut()
+        return deepcopy(source)
+
+    def _restore_completed_video_source_for_lut(self) -> dict[str, Any]:
+        """Adopt a saved pre-LUT success, without rendering or downloading again."""
+        if getattr(self, "_hmb_node_deleted", False):
+            return {}
+        artifact = self.parameter_output_values.get("VIDEO_OUT") or self.parameter_output_values.get("video_url")
+        location = str(getattr(artifact, "value", artifact) or "").strip()
+        if not location or urlparse(location).scheme in {"http", "https"}:
+            return {}
+        checkpoint = _seedance_recovery_value(self.get_parameter_value(SEEDANCE_RECOVERY_PARAMETER))
+        widget = self.get_parameter_value(SEEDANCE_SHOT_WIDGET_PARAMETER)
+        preview = _seedance_generation_preview_value(widget.get("generation") if isinstance(widget, dict) else {})
+        if preview["phase"] != "succeeded" and checkpoint.get("stage") != "local_succeeded":
+            return {}
+        task_id = str(preview.get("job_id") or checkpoint.get("task_id") or self.parameter_output_values.get("generation_id") or "")
+        identity = _generated_video_origin(checkpoint.get("generation_origin"))
+        if not identity:
+            identity = self._capture_generated_video_origin()
+            # Old exports encode their Shot number in the filename. Do not
+            # assign a stale Shot 1 movie to a newly selected Shot 2.
+            match = re.search(r"_shot_(\d+)(?:_|\.)", location, re.IGNORECASE)
+            if not identity or not match or int(match.group(1)) != identity["number"]:
+                return {}
+        try:
+            resolved = File(location).resolve()
+            path = Path(str(getattr(resolved, "location", resolved)))
+            if not path.is_absolute() or not path.is_file():
+                return {}
+        except Exception:
+            return {}
+        source = _generated_video_source_value({"schema": GENERATED_VIDEO_SOURCE_SCHEMA, "version": 1,
+            **identity, "generation_id": task_id, "task_id": task_id, "result_revision": 1,
+            "path": str(path), "url": str(path), "completed": True})
+        if source:
+            self._hmb_generated_video_source = deepcopy(source)
+            self.parameter_values[GENERATED_VIDEO_SOURCE_PARAMETER] = deepcopy(source)
+            self.parameter_output_values[GENERATED_VIDEO_SOURCE_PARAMETER] = deepcopy(source)
+        return source
+
+    def _hmb_publish_generated_video_source(self, *, force: bool = False) -> bool:
+        """Republish the last success without executing this generator."""
+        if getattr(self, "_hmb_node_deleted", False):
+            return False
+        source = self._hmb_generated_video_source_snapshot()
+        if not source:
+            return False
+        self.parameter_output_values[GENERATED_VIDEO_SOURCE_PARAMETER] = deepcopy(source)
+        if not force and source == getattr(self, "_hmb_generated_video_source_published", None):
+            return True
+        publisher = getattr(self, "publish_update_to_parameter", None)
+        try:
+            if callable(publisher):
+                publisher(GENERATED_VIDEO_SOURCE_PARAMETER, deepcopy(source))
+        except Exception:
+            return False
+        self._hmb_generated_video_source_published = deepcopy(source)
+        return True
+
+    def _record_completed_video_source(
+        self, origin: Any, generation_id: str, saved: Any,
+    ) -> bool:
+        """Publish only verified local success; failed/legacy runs keep the last one."""
+        identity = _generated_video_origin(origin)
+        if not identity or getattr(self, "_hmb_node_deleted", False):
+            return False
+        try:
+            resolved = saved.resolve()
+            path = str(getattr(resolved, "location", resolved))
+        except Exception:
+            path = str(getattr(saved, "location", "") or "")
+        if not Path(path).is_absolute():
+            path = str(getattr(saved, "location", "") or "")
+        previous = self._hmb_generated_video_source_snapshot()
+        source = _generated_video_source_value({
+            "schema": GENERATED_VIDEO_SOURCE_SCHEMA, "version": 1,
+            **identity, "generation_id": generation_id, "task_id": generation_id,
+            "result_revision": min(2_147_483_647, int(previous.get("result_revision") or 0) + 1),
+            "path": path, "url": path, "completed": True,
+        })
+        if not source:
+            return False
+        if previous and all(previous.get(key) == value for key, value in source.items()
+                            if key != "result_revision"):
+            source = previous
+        self._hmb_generated_video_source = deepcopy(source)
+        self.parameter_values[GENERATED_VIDEO_SOURCE_PARAMETER] = deepcopy(source)
+        self.parameter_output_values[GENERATED_VIDEO_SOURCE_PARAMETER] = deepcopy(source)
+        # The resulting route belongs to the completed origin even if the UI
+        # has already selected another Shot. This never invokes upstream work.
+        try:
+            _shot_routing.reconcile_completed_video_routes(self)
+        except Exception:
+            logger.warning("%s completed-video route refresh was unavailable.", self.name)
+        return self._hmb_publish_generated_video_source()
+
     def _generation_recovery_state(self) -> dict[str, Any]:
         """Return the durable checkpoint, migrating older serialized outputs."""
 
@@ -3688,6 +3889,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "output_format": raw_format,
                 "return_last_frame": return_last_frame,
                 "output_file": output_file,
+                "generation_origin": (
+                    source_params.get("_hmb_generation_origin")
+                    if "_hmb_generation_origin" in source_params
+                    else previous.get("generation_origin")
+                    if stage != "pre_submit" and previous.get("task_id") == task_id
+                    else {}
+                ),
             }
         )
         self.set_parameter_value(
@@ -8791,6 +8999,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         start_state_lock = threading.Lock()
         cancel_before_start = threading.Event()
         submission_started = False
+        submission_prompt = getattr(self, "_hmb_agent_submission_prompt", None)
 
         def invoke_paced_submission() -> Any:
             nonlocal submission_started
@@ -8800,6 +9009,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     require_registered=False
                 ):
                     raise _SubmissionCancelledBeforeStart()
+                # The cadence gate can wait for several sibling submissions.
+                # Recheck the captured upstream run after that wait, before a
+                # billable request can begin. Manual inputs have no run token.
+                if getattr(self, "_hmb_expected_agent_result", None) is not None:
+                    self._assert_agent_result_available(submission_prompt, allow_resume=False)
                 submission_started = True
             return function(*args, **kwargs)
 
@@ -8950,7 +9164,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 if published_macro_index is not None:
                     variables["_index"] = published_macro_index
             try:
-                write_sidecar(published, metadata)
+                _write_generation_sidecar(published, metadata)
             except Exception as exc:
                 logger.warning(
                     "Generated video was saved, but its metadata sidecar could not "
@@ -9091,6 +9305,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     ) -> None:
         if not self._runtime_node_is_live(require_registered=True):
             return
+        recovery_at_download = self._generation_recovery_state()
+        completed_origin = _generated_video_origin(
+            recovery_at_download.get("generation_origin")
+            if recovery_at_download.get("task_id") == generation_id else None
+        )
         video_download_url = self._extract_video_url(final_task)
         if not video_download_url:
             raise RuntimeError(
@@ -9202,8 +9421,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "model_id": effective_model_id,
                 "output_format": effective_output_format,
                 "return_last_frame": requested_last_frame,
+                "_hmb_generation_origin": completed_origin,
             },
         )
+        # Stage the verified source before the persistence await. Normal workflow
+        # saves retain this property; the journal retains the pending origin.
+        self._record_completed_video_source(completed_origin, generation_id, saved)
         await self._force_save_generation_recovery_checkpoint(
             required=False,
             reason="local_succeeded",
@@ -9274,6 +9497,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             refresh_params = self._get_parameters()
             recovery_contract = self._generation_recovery_state()
             requested_generation_id = generation_id
+            refresh_params["_hmb_generation_origin"] = _generated_video_origin(
+                recovery_contract.get("generation_origin")
+                if recovery_contract.get("task_id") == requested_generation_id else None
+            )
             resolved_generation_id = str(task["id"])
             preserve_local_success = bool(
                 recovery_contract.get("stage") == "local_succeeded"
@@ -9595,6 +9822,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         return parent(*args, **kwargs) if callable(parent) else None
 
     async def _process_generation(self) -> None:
+        self._hmb_generation_run_origin = (
+            {} if str(self.get_parameter_value("resume_generation_id") or "").strip()
+            else self._capture_generated_video_origin()
+        )
         await self._run_blocking_generation_stage(
             self._cleanup_temporary_video_uploads
         )
@@ -9631,6 +9862,16 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             # before destination preparation, authentication, uploads, or a
             # billable Broker create-task request. Prompt text remains manual.
             params = self._resolve_exact_shot_generation_inputs(params)
+            resolved_origin = self._capture_generated_video_origin()
+            captured_origin = _generated_video_origin(getattr(self, "_hmb_generation_run_origin", None))
+            if captured_origin and captured_origin != resolved_origin:
+                raise ValueError("The selected Shot changed before generation inputs were prepared. Run the selected Shot again.")
+            params["_hmb_generation_origin"] = captured_origin or resolved_origin
+        else:
+            params["_hmb_generation_origin"] = _generated_video_origin(
+                recovery_before_run.get("generation_origin")
+                if recovery_before_run.get("task_id") == params["resume_generation_id"] else None
+            )
         self._validate_parameters(params)
         resume_generation_id = params["resume_generation_id"]
         decode_verifier: _MP4DecodeVerifier | None = None
@@ -9739,6 +9980,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self._build_broker_payload,
                 params,
             )
+            self._assert_agent_result_available(str(params.get("prompt") or ""), allow_resume=False)
             client_request_id = "hmb-" + uuid4().hex
             payload["client_request_id"] = client_request_id
             if not self._runtime_node_is_live(require_registered=True):
@@ -9777,6 +10019,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     preview_action="none",
                 )
                 raise
+            try:
+                self._assert_agent_result_available(str(params.get("prompt") or ""), allow_resume=False)
+            except _AgentResultUnavailable:
+                await self._discard_unsent_generation_checkpoint(reason="agent_result_changed_before_submission")
+                raise
             if not self._submission_start_is_authorized(
                 require_registered=True
             ):
@@ -9806,6 +10053,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         "Submission could not be confirmed; use Refresh / Retrieve Result.",
                         submission_outcome_unknown=True,
                     ) from exc
+            except _AgentResultUnavailable:
+                await self._discard_unsent_generation_checkpoint(
+                    reason="agent_result_changed_at_submission_gate",
+                )
+                raise
             except _SubmissionCancelledBeforeStart:
                 await self._discard_unsent_generation_checkpoint(
                     reason="cancelled_at_submission_gate",
@@ -10120,8 +10372,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if not self._runtime_node_is_live(require_registered=True):
             return
         self._clear_execution_status()
+        self._hmb_expected_agent_result = None
+        self._hmb_agent_submission_prompt = None
         try:
+            self._assert_agent_result_available()
             await self._process_generation()
+        except _AgentResultUnavailable as exc:
+            self._publish_agent_result_skipped(str(exc))
         except asyncio.CancelledError:
             if not self._runtime_node_is_live(require_registered=True):
                 return
@@ -10247,7 +10504,87 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 was_successful=False,
                 result_details=f"FAILURE: {safe_message}",
             )
-            self._handle_failure_exception(RuntimeError(safe_message))
+            # A handled per-shot failure is a Failed result, not a global DAG
+            # exception. Other shots (including their active polling) continue.
+            logger.error("%s failed; independent shots continue: %s", self.name, safe_message)
+
+    def _assert_agent_result_available(self, prompt: str | None = None, *, allow_resume: bool = True) -> None:
+        """Gate only failed/pending Agent results, never prompt meaning or roles."""
+        if allow_resume and str(self.get_parameter_value("resume_generation_id") or "").strip():
+            return  # Retrieving an already submitted task does not need an Agent.
+        text = str((self.get_parameter_value("prompt") if prompt is None else prompt) or "").strip()
+        reserved_errors = (
+            "[HMB EXECUTION FAILED]", "[HMB EXECUTION CANCELLED]",
+            "[HMB OUTPUT BLOCKED]", "[HMB LOCAL POLICY REQUIRED]",
+            "[HMB CONNECTION CHECK FAILED]", "[HMB SOURCE CONTRACT INVALID]",
+        )
+        try:
+            source = self._manual_agent_prompt_source()
+        except Exception:
+            raise _AgentResultUnavailable(
+                "Agent prompt connection is unavailable. No new render was submitted."
+            ) from None
+        getter = getattr(source, "_hmb_execution_result_snapshot", None)
+        if not callable(getter):
+            if text.startswith(reserved_errors):
+                raise _AgentResultUnavailable("Upstream Agent failed. No new render was submitted; independent shots continue.")
+            if getattr(self, "_hmb_expected_agent_result", None) is not None:
+                raise _AgentResultUnavailable("Agent source changed during preparation. No new render was submitted.")
+            return  # Manual text/other nodes and valid saved legacy outputs stay native.
+        try:
+            snapshot = getter()
+        except Exception:
+            raise _AgentResultUnavailable(
+                "Agent execution result is unavailable. No new render was submitted."
+            ) from None
+        if not isinstance(snapshot, dict):
+            raise _AgentResultUnavailable("Agent execution result is unavailable. No new render was submitted.")
+        status = snapshot.get("status")
+        if status in {"failed", "running"}:
+            fallback_code = "AGENT_RUNNING" if status == "running" else "AGENT_FAILED"
+            code = str(snapshot.get("code") or fallback_code)
+            if code not in {
+                "MODEL_TIMEOUT", "MODEL_CREDENTIAL", "MODEL_ACCESS", "MODEL_RATE_LIMIT",
+                "MODEL_NETWORK", "MODEL_PROVIDER", "HOST_ADAPTER", "EMPTY_OUTPUT",
+                "OUTPUT_UNAVAILABLE", "POLICY_UNAVAILABLE", "SOURCE_UNAVAILABLE", "CANCELLED",
+            }:
+                code = fallback_code
+            raise _AgentResultUnavailable(
+                f"Upstream Agent has no completed result ({code}). No new render was submitted; independent shots continue."
+            )
+        if text.startswith(reserved_errors):
+            raise _AgentResultUnavailable("Upstream Agent failed. No new render was submitted; independent shots continue.")
+        if not text:
+            raise _AgentResultUnavailable("Upstream Agent has no final text. No new render was submitted.")
+        expected = str(snapshot.get("output_sha256") or "")
+        if status == "succeeded" and expected and hashlib.sha256(text.encode("utf-8")).hexdigest() != expected:
+            raise _AgentResultUnavailable("Agent result changed or has not reached this Generator yet. No stale prompt was submitted.")
+        token = (id(source), str(snapshot.get("run_id") or ""), expected)
+        previous = getattr(self, "_hmb_expected_agent_result", None)
+        if previous is not None and token != previous:
+            raise _AgentResultUnavailable("Agent result changed during preparation. No new render was submitted.")
+        self._hmb_expected_agent_result = token
+        if not allow_resume:
+            self._hmb_agent_submission_prompt = text
+
+    def _publish_agent_result_skipped(self, message: str) -> None:
+        if not self._runtime_node_is_live(require_registered=True):
+            return
+        # Output maps can be cleared by the host before a new run; the durable
+        # recovery record remains authoritative for existing paid tasks.
+        checkpoint = self._generation_recovery_state()
+        generation_id = str(self.parameter_output_values.get("generation_id") or checkpoint.get("task_id") or "").strip()
+        if generation_id:
+            self.parameter_output_values["generation_id"] = generation_id
+            self.parameter_output_values["generation_status"] = str(
+                self.parameter_output_values.get("generation_status") or checkpoint.get("status") or ""
+            )
+            self._publish_generation_preview("failed", generation_id=generation_id, action="refresh_existing")
+            message += f" Existing task {generation_id} is preserved; Refresh / Retrieve Result checks that same task."
+        else:
+            self._set_generation_status("skipped", generation_id="")
+        self._set_status_results(was_successful=False, result_details=f"SKIPPED: {message}")
+        logger.error("%s skipped: %s", self.name, message)
 
 __all__ = [
     "GT_CLOUD_API_KEY_SECRET",

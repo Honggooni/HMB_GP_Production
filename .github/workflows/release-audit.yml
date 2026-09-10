@@ -100,6 +100,12 @@ jobs:
         run: |
           # Public CI verifies the exact bundled signed DAT and package boundary.
           $tests = @(
+            "HMB_Color_LUT_Engine_Regression.py",
+            "HMB_Color_LUT_Node_Regression.py",
+            "HMB_Color_LUT_Routing_Regression.py",
+            "HMB_Prompt_Surface_2D_Regression.py",
+            "HMB_Agent_Failure_Diagnostic_Regression.py",
+            "HMB_Seedance_Sidecar_API_Regression.py",
             "HMB_Finish_Look_Regression.py",
             "HMB_Finish_Look_Steps_Regression.py",
             "HMB_Picker_Video_Tools_Regression.py",
@@ -116,6 +122,7 @@ jobs:
             "HMB_Four_Library_Flow_Regression.py",
             "HMB_Three_Library_Flow_Regression.py",
             "HMB_Agent_Policy_Integration_Regression.py",
+            "HMB_Agent_Result_Skip_Regression.py",
             "HMB_Look_Attribute_Scope_Regression.py",
             "HMB_Data_Only_Prompt_Security_Regression.py",
             "HMB_Agent_Paired_Prompt_Snapshot_Regression.py",
@@ -142,6 +149,7 @@ jobs:
             "HMB_Image_Taxonomy_Regression.py",
             "HMB_Cutout_Transparency_Regression.py",
             "HMB_Depth_Companion_Regression.py",
+            "HMB_VideoPicker_Reliability_Regression.py",
             "HMB_Depth_Visual_Contract_Regression.py",
             "HMB_Maya_Runner_Performance_Regression.py",
             "HMB_Mouth_Card_Inner_Patch_Regression.py",
@@ -299,6 +307,9 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Fixes Picker project-media publication for current and legacy Griptape sidecar APIs, passing the active Engine without retrying writes or changing Maya Depth calculation.",
+            "- Includes HMB Color LUT with Shot-bound completed Generator video, shared ImageAsset project selection, named presets, automatic LUT archival, and twelve-step controls.",
+            "- Includes optional per-image 2D Surface guidance (disabled by default), Layout Reference motion guidance, and Agent failure isolation so other Shot branches continue.",
             "- Includes the current bundled signed Agent DAT; policy source files and server configuration are not modified.",
             "- Keeps HMBAgentLibrary model declarations in exact parity with the installed Standard Agent surface, preserving host permission and accounting without adding an HMB-specific model allowlist.",
             "- Keeps each Look Reference Target editable per shot for active named targets or explicit Global Look; Camera / Composition is available only as a Look Reference Sub Type and never as a Target for Character, Prop, or Environment rows.",

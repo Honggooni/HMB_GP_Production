@@ -686,6 +686,7 @@ assert "Pillow==12.3.0" in manifest["metadata"]["dependencies"]["pip_dependencie
 registered_widgets = {item["name"] for item in manifest.get("widgets", [])}
 assert registered_widgets == {
     "HMBAgentLibraryWidget",
+    "HMBColorLUTLibraryWidget",
     "HMBFinishLookLibraryWidget",
     "HMBImageAssetLibraryWidget",
     "HMBImageAssetThumbnailPatchBridgeWidget",

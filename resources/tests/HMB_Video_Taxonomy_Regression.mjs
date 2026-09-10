@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   compatibleVideoRoleChoices,
+  hmbSyncSelectOptions,
   normalizeState,
   normalizeVideoTaxonomy,
   primaryVideoTypeChoices,
@@ -35,6 +36,7 @@ const expected = new Map([
   ["Maya Preview / Playblast\0Timing / Edit", ["Timing / Edit Reference", "Timing Only"]],
   ["Motion Reference\0Local Motion", ["Motion Reference", "Local Motion Detail Only"]],
   ["Motion Reference\0Secondary Motion", ["Motion Reference", "Secondary Motion Only"]],
+  ["Motion Reference\0Layout Reference", ["Motion Reference", "Camera / Layout Preserved; Free Character Motion"]],
   ["Scene / Look Reference\0Camera / Layout", ["Camera / Layout Reference", "Spatial Alignment Verification Only"]],
   ["Scene / Look Reference\0Lighting / Look", ["Lighting / Look Reference", "Lighting / Look Only"]],
   ["Scene / Look Reference\0Composition", ["Camera / Layout Reference", "Local Composition Check Only"]],
@@ -110,6 +112,40 @@ assert.deepEqual(
   compatibleVideoRoleChoices({ video_main_type: "Maya Preview / Playblast" }),
   ["Original Preview", "Mask", "Depth", "Motion Guide", "Timing / Edit"],
 );
+assert.deepEqual(
+  compatibleVideoRoleChoices({ video_main_type: "Motion Reference" }),
+  ["Local Motion", "Secondary Motion", "Layout Reference"],
+);
+
+// Saved UI state and every subtype transition use the same explicit wire
+// mapping. No old Original Preview lock survives selecting Layout Reference.
+let layoutState = normalizeState({ videos: [{
+  present: true, label: "blocking.mp4", video_uid: "blocking",
+  video_main_type: "Motion Reference", video_sub_type: "Layout Reference",
+  control_role: "Primary Unified Shot Control", custom_control_role: "Authored note",
+}] });
+for (let round = 0; round < 25; round++) {
+  const restored = normalizeState(JSON.parse(JSON.stringify(layoutState)));
+  assert.deepEqual(restored, layoutState);
+  layoutState = restored;
+}
+for (const [key, wirePair] of expected) {
+  const [mainType, subType] = key.split("\0");
+  const item = { ...layoutState.videos[0], video_main_type: mainType, video_sub_type: subType };
+  normalizeVideoTaxonomy(item);
+  assert.deepEqual([item.source_type, item.control_role], wirePair);
+  assert.equal(item.custom_control_role, "Authored note");
+}
+for (const [language, label] of [["ko", "레이아웃 참조"], ["en", "Layout Reference"]]) {
+  const select = { options: [], innerHTML: "", value: "" };
+  hmbSyncSelectOptions(
+    select, compatibleVideoRoleChoices(layoutState.videos[0]), "Layout Reference", "",
+    normalizeState({ ui: { language } }),
+  );
+  assert.equal(select.value, "Layout Reference");
+  assert.ok(select.innerHTML.includes(`value="Layout Reference" selected>${label}</option>`));
+  assert.equal((select.innerHTML.match(/<option /g) || []).length, 3);
+}
 
 // Picker provenance sanitization must not rewrite its captured taxonomy values.
 const pickerState = normalizeState({

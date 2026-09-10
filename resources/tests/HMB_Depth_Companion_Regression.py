@@ -2361,6 +2361,7 @@ module_names = (
     "griptape_nodes.files.file",
     "griptape_nodes.files.project_file",
     "griptape_nodes.retained_mode",
+    "griptape_nodes.retained_mode.engine",
     "griptape_nodes.retained_mode.events",
     "griptape_nodes.retained_mode.events.os_events",
     "griptape_nodes.retained_mode.file_metadata",
@@ -2546,6 +2547,73 @@ try:
         picker.HMBVideoPickerLibrary._restore_playblast_bundle(records)
         assert project_target.read_bytes() == b"old-project-video"
         assert metadata_target.read_bytes() == b"old-project-metadata"
+
+        # Current hosts require an Engine for both metadata operations. Keep the
+        # same copy/rollback checks with positional and keyword-only signatures.
+        current_engine = object()
+        fake_modules["griptape_nodes.retained_mode.engine"].current_engine = lambda: current_engine
+        sidecar_module = fake_modules["griptape_nodes.retained_mode.file_metadata.sidecar_metadata"]
+        engine_calls = []
+
+        def current_resolver(media_path, engine):
+            assert engine is current_engine
+            engine_calls.append("resolve")
+            return fake_resolve_sidecar_path(media_path)
+
+        def current_writer(media_path, content, engine):
+            assert engine is current_engine
+            engine_calls.append("write")
+            return fake_write_sidecar(media_path, content)
+
+        def keyword_resolver(media_path, *, engine):
+            return current_resolver(media_path, engine)
+
+        def keyword_writer(media_path, content, *, engine):
+            return current_writer(media_path, content, engine)
+
+        def positional_resolver(media_path, engine, /):
+            return current_resolver(media_path, engine)
+
+        def positional_writer(media_path, content, engine, /):
+            return current_writer(media_path, content, engine)
+
+        for index, (resolver, writer) in enumerate(((current_resolver, current_writer),
+                (keyword_resolver, keyword_writer), (positional_resolver, positional_writer))):
+            sidecar_module._resolve_sidecar_path = resolver
+            sidecar_module.write_sidecar = writer
+            engine_calls.clear()
+            records = []
+            artifact, returned_path = picker._copy_video_to_griptape_project(
+                fake_node, source, 2, transaction_records=records,
+                backup_folder=root / f"current-engine-{index}",
+            )
+            assert returned_path == "{inputs}/video.mp4"
+            assert project_target.read_bytes() == source.read_bytes()
+            assert metadata_target.is_file()
+            assert engine_calls == ["resolve", "write"]
+            picker.HMBVideoPickerLibrary._restore_playblast_bundle(records)
+            assert project_target.read_bytes() == b"old-project-video"
+            assert metadata_target.read_bytes() == b"old-project-metadata"
+
+        def partial_write_failure(media_path, content, engine):
+            current_writer(media_path, content, engine)
+            raise TypeError("failure after sidecar write; do not retry")
+
+        sidecar_module._resolve_sidecar_path = current_resolver
+        sidecar_module.write_sidecar = partial_write_failure
+        engine_calls.clear()
+        try:
+            picker._copy_video_to_griptape_project(fake_node, source, 2,
+                transaction_records=[], backup_folder=root / "current-partial-failure")
+        except TypeError as exc:
+            assert "do not retry" in str(exc)
+        else:
+            raise AssertionError("A partial metadata write failure was hidden.")
+        assert engine_calls == ["resolve", "write"]
+        assert project_target.read_bytes() == b"old-project-video"
+        assert metadata_target.read_bytes() == b"old-project-metadata"
+        sidecar_module._resolve_sidecar_path = fake_resolve_sidecar_path
+        sidecar_module.write_sidecar = fake_write_sidecar
 
         project_target.unlink()
         metadata_target.unlink()
@@ -2858,7 +2926,7 @@ assert "FileDestination.write_bytes(" in project_copy_source
 assert project_copy_source.index(
     "_created_publish_target_record("
 ) < project_copy_source.index(
-    "_resolve_sidecar_path(actual_target)"
+    "_call_picker_sidecar_api(_resolve_sidecar_path, actual_target)"
 )
 
 for artifact_records in (

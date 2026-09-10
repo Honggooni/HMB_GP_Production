@@ -15,6 +15,7 @@ registry.
 from dataclasses import dataclass
 from contextlib import contextmanager
 import logging
+import json
 import threading
 from typing import Any, Iterable, Iterator
 import weakref
@@ -31,6 +32,7 @@ KIND_PROMPT = "prompt"
 KIND_AGENT = "agent"
 KIND_SEEDANCE = "seedance"
 KIND_FINISH_LOOK = "finish_look"
+KIND_COLOR_LUT = "color_lut"
 KNOWN_KINDS = frozenset(
     {
         KIND_IMAGE_ASSET,
@@ -39,6 +41,7 @@ KNOWN_KINDS = frozenset(
         KIND_AGENT,
         KIND_SEEDANCE,
         KIND_FINISH_LOOK,
+        KIND_COLOR_LUT,
     }
 )
 SINGLETON_KINDS = frozenset({KIND_IMAGE_ASSET, KIND_VIDEO_PICKER})
@@ -1134,6 +1137,166 @@ def _notify_status(node: Any, *, ok: bool, code: str, details: str = "") -> None
         pass
 
 
+def _color_lut_edge_would_cycle(
+    source: Any, target: Any, nodes: list[Any],
+) -> bool:
+    # Include ordinary/manual intermediary nodes, not only HMB participants.
+    # A LUT -> utility -> Generator path would also become a cycle.
+    by_name = {str(node.name): node for node in nodes}
+    pending = [str(source.name)]
+    visited: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name == str(target.name):
+            return True
+        if name in visited:
+            continue
+        visited.add(name)
+        node = by_name.get(name)
+        if node is not None:
+            pending.extend(str(getattr(edge, "source_node_name", ""))
+                           for edge in _incoming_connections(node))
+    return False
+
+
+def _reconcile_color_lut_routes(
+    values: list[ShotSubscription], subscriptions: dict[str, ShotSubscription],
+    nodes: list[Any],
+) -> int:
+    """Attach completed results by origin, independent of current source selection."""
+    _reconcile_color_lut_projects(nodes)
+    completed: dict[tuple[str, str], list[ShotSubscription]] = {}
+    eligible = {id(item.node) for item in values}
+    generators = {name: item for name, item in subscriptions.items()
+                  if item.kind == KIND_SEEDANCE}
+    for source in generators.values():
+        getter = getattr(source.node, "_hmb_generated_video_source_snapshot", None)
+        try:
+            snapshot = getter() if callable(getter) else None
+        except Exception:
+            continue
+        if (not isinstance(snapshot, dict)
+                or snapshot.get("schema") != "hmb-generated-video-source"
+                or snapshot.get("version") != 1 or snapshot.get("completed") is not True
+                or not snapshot.get("generation_id")
+                or snapshot.get("generation_id") != snapshot.get("task_id")
+                or type(snapshot.get("result_revision")) is not int
+                or snapshot["result_revision"] < 1
+                or not snapshot.get("path") or not snapshot.get("source_node_instance_id")):
+            continue
+        channel = _clean(snapshot.get("channel_uuid"), 128)
+        shot = _clean(snapshot.get("shot_uuid"), 128)
+        if channel and shot:
+            completed.setdefault((channel, shot), []).append(source)
+
+    changed = 0
+    for target in subscriptions.values():
+        if target.kind != KIND_COLOR_LUT:
+            continue
+        candidates = completed.get((target.channel_uuid, target.shot_uuid), [])
+        available = target.enabled and id(target.node) in eligible
+        if not available or len(candidates) != 1:
+            removed, detail = _clear_hmb_route(
+                target.node, "COLOR_LUT_SOURCE_IN", generators,
+                source_parameter="HMB_GENERATED_VIDEO_SOURCE",
+            )
+            changed += removed
+            _notify_status(
+                target.node, ok=not detail.startswith("unable"),
+                code="only" if not target.enabled else "duplicate_generated_source"
+                if len(candidates) > 1 else "waiting_for_completed_video",
+            )
+            continue
+        source = candidates[0]
+        if _color_lut_edge_would_cycle(source.node, target.node, nodes):
+            removed, _detail = _clear_hmb_route(
+                target.node, "COLOR_LUT_SOURCE_IN", generators,
+                source_parameter="HMB_GENERATED_VIDEO_SOURCE",
+            )
+            changed += removed
+            _notify_status(target.node, ok=False, code="cycle_prevented")
+            continue
+        ok, detail = _ensure_edge(ShotEdge(
+            source.node, "HMB_GENERATED_VIDEO_SOURCE", target.node, "COLOR_LUT_SOURCE_IN",
+        ), generators)
+        changed += int(ok and detail == "created")
+        if ok:
+            hydrate = getattr(target.node, "_hmb_hydrate_color_lut_from_source", None)
+            publish = getattr(source.node, "_hmb_publish_generated_video_source", None)
+            try:
+                if callable(hydrate) and hydrate(source.node, "HMB_GENERATED_VIDEO_SOURCE") is not True:
+                    ok, detail = False, "completed source hydration failed"
+                if ok and callable(publish) and publish(force=detail == "created") is not True:
+                    ok, detail = False, "completed source publication failed"
+            except Exception:
+                ok, detail = False, "completed source publication failed"
+        _notify_status(target.node, ok=ok, code="ready" if ok else "route_incomplete", details=detail)
+    return changed
+
+
+def _reconcile_color_lut_projects(nodes: list[Any], project_source: Any = None, project_state: Any = None) -> None:
+    targets = [n for n in nodes if callable(getattr(n, "_hmb_follow_image_asset_project", None))]
+    if not targets:
+        return
+    project = {}
+    for source in nodes:
+        sub = _subscription_for(source)
+        if sub is None or sub.kind != KIND_IMAGE_ASSET or getattr(source, "_hmb_node_deleted", False):
+            continue
+        raw = project_state if source is project_source else getattr(source, "get_parameter_value", lambda _name: None)("HMB_IMAGE_ASSET_STATE")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                raw = {}
+        if isinstance(raw, dict):
+            root = _clean(raw.get("project_root"), 4096)
+            identity = _clean(raw.get("project_uid") or root or raw.get("project_id"), 4096)
+            if identity:
+                project = {"id": identity, "name": _clean(raw.get("project_id"), 256) or root.replace("\\", "/").rstrip("/").split("/")[-1], "root": root}
+        break
+    for target in targets:
+        target._hmb_follow_image_asset_project(project)
+
+
+def notify_color_lut_project_change(source: Any, state: dict[str, Any]) -> None:
+    identity = (state.get("project_id"), state.get("project_uid"), state.get("project_root"))
+    if identity == getattr(source, "_hmb_color_lut_project_identity", None):
+        return
+    flow, nodes = _same_flow_nodes(source)
+    if flow:
+        _reconcile_color_lut_projects(nodes, source, state)
+        source._hmb_color_lut_project_identity = identity
+
+
+def reconcile_completed_video_routes(node: Any) -> dict[str, Any]:
+    """Publish finishing routes without revisiting any generation dependencies."""
+    flow_name, nodes = _same_flow_nodes(node)
+    if not flow_name:
+        return {"ok": True, "code": "not_registered", "changed": 0}
+    with _claim_routing_flow(flow_name) as claimed:
+        if not claimed:
+            return {"ok": True, "code": "reentrant", "changed": 0}
+        current_flow, nodes = _same_flow_nodes(node)
+        if current_flow != flow_name:
+            return {"ok": True, "code": "flow_changed", "changed": 0}
+        values = [item for value in nodes if (item := _subscription_for(value)) is not None]
+        subscriptions = {item.node_name: item for item in values}
+        # Deferred workflow hydration still owns initial Shot selection. Do not
+        # connect or clear an unready LUT from a transient constructor quartet.
+        subscriptions = {
+            name: item for name, item in subscriptions.items()
+            if item.kind != KIND_COLOR_LUT or _subscription_is_authoritative(item)
+        }
+        previous_cache = getattr(_ROUTING_PASS_LOCAL, "incoming_by_node", None)
+        _ROUTING_PASS_LOCAL.incoming_by_node = {}
+        try:
+            changed = _reconcile_color_lut_routes(values, subscriptions, nodes)
+        finally:
+            _ROUTING_PASS_LOCAL.incoming_by_node = previous_cache
+        return {"ok": True, "code": "ready", "changed": changed}
+
+
 def _clear_remote_catalog(node: Any, reason: str) -> None:
     """Return one participant to its local-only selector state.
 
@@ -1203,6 +1366,12 @@ def _clear_remote_edges(
             for name, item in subscriptions.items()
             if item.kind == KIND_VIDEO_PICKER
         }
+    elif subscription.kind == KIND_COLOR_LUT:
+        routes = (("COLOR_LUT_SOURCE_IN", "HMB_GENERATED_VIDEO_SOURCE"),)
+        subscriptions = {
+            name: item for name, item in subscriptions.items()
+            if item.kind == KIND_SEEDANCE
+        }
     else:
         routes = ()
 
@@ -1218,7 +1387,10 @@ def _clear_remote_edges(
         changed += removed
         if detail.startswith("unable"):
             failures.append(detail)
-    return changed, failures
+    # The optional downstream finisher must not invalidate generation when a
+    # stale finishing edge cannot be removed. Its own reconciliation reports
+    # that failure on the LUT node and refuses source hydration.
+    return changed, [] if subscription.kind == KIND_COLOR_LUT else failures
 
 
 def _reject_duplicate_prompt_selection(node: Any) -> bool:
@@ -1486,7 +1658,7 @@ def reconcile_shot_routing(
                 publisher_available = bool(
                     recipient.channel_uuid in known_image_channels
                     or (
-                        recipient.kind in {KIND_VIDEO_PICKER, KIND_SEEDANCE}
+                        recipient.kind in {KIND_VIDEO_PICKER, KIND_SEEDANCE, KIND_COLOR_LUT}
                         and recipient.channel_uuid in standalone_picker_channels
                     )
                 )
@@ -1620,7 +1792,7 @@ def reconcile_shot_routing(
                     orphan_replacement = False
                     if recipient.channel_uuid and recipient.channel_uuid != source.channel_uuid:
                         orphan_replacement = bool(
-                            recipient.kind in {KIND_VIDEO_PICKER, KIND_SEEDANCE}
+                            recipient.kind in {KIND_VIDEO_PICKER, KIND_SEEDANCE, KIND_COLOR_LUT}
                             and recipient.channel_uuid not in {
                                 item.channel_uuid for item in image_sources
                             }
@@ -1795,9 +1967,10 @@ def reconcile_shot_routing(
                             # ready or receive a newly managed edge.
                             detail = _clean(exc, 256) or exc.__class__.__name__
                             catalog_rejected_node_ids.add(id(recipient.node))
-                            failures.append(
-                                f"{recipient.node_name}: catalog_rejected: {detail}"
-                            )
+                            if recipient.kind != KIND_COLOR_LUT:
+                                failures.append(
+                                    f"{recipient.node_name}: catalog_rejected: {detail}"
+                                )
                             _notify_status(
                                 recipient.node,
                                 ok=False,
@@ -1811,7 +1984,7 @@ def reconcile_shot_routing(
             if not image_sources and len(standalone_picker_catalogs) == 1:
                 source, snapshot = standalone_picker_catalogs[0]
                 for recipient in catalog_recipients:
-                    if recipient.kind != KIND_SEEDANCE:
+                    if recipient.kind not in {KIND_SEEDANCE, KIND_COLOR_LUT}:
                         continue
                     replacement = bool(
                         recipient.channel_uuid
@@ -1834,9 +2007,10 @@ def reconcile_shot_routing(
                     except Exception as exc:
                         detail = _clean(exc, 256) or exc.__class__.__name__
                         catalog_rejected_node_ids.add(id(recipient.node))
-                        failures.append(
-                            f"{recipient.node_name}: catalog_rejected: {detail}"
-                        )
+                        if recipient.kind != KIND_COLOR_LUT:
+                            failures.append(
+                                f"{recipient.node_name}: catalog_rejected: {detail}"
+                            )
                         _notify_status(
                             recipient.node,
                             ok=False,
@@ -1893,7 +2067,7 @@ def reconcile_shot_routing(
             for recipient in tuple(values):
                 if recipient.enabled:
                     continue
-                if recipient.kind not in {KIND_PROMPT, KIND_AGENT, KIND_SEEDANCE}:
+                if recipient.kind not in {KIND_PROMPT, KIND_AGENT, KIND_SEEDANCE, KIND_COLOR_LUT}:
                     continue
                 removed, clear_failures = _clear_remote_edges(
                     recipient, by_name
@@ -2767,6 +2941,10 @@ def reconcile_shot_routing(
                 target_failed = any(item.startswith(target.node_name + ":") for item in failures)
                 _notify_status(target.node, ok=not target_failed, code="ready" if not target_failed else "route_incomplete")
 
+            # Post-generation finishing is optional and never invalidates the
+            # existing generation routes when its own input is unavailable.
+            changed += _reconcile_color_lut_routes(routable_values, by_name, nodes)
+
             return _ReconcileResult(
                 {
                     "ok": not failures,
@@ -2793,7 +2971,9 @@ def reconcile_shot_routing(
 
 
 __all__ = [
+    "reconcile_completed_video_routes",
     "KIND_AGENT",
+    "KIND_COLOR_LUT",
     "KIND_FINISH_LOOK",
     "KIND_IMAGE_ASSET",
     "KIND_PROMPT",

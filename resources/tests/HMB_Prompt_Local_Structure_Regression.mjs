@@ -206,6 +206,7 @@ const manualContextImageFields = [
   "image_sub_type",
   "custom_source_type",
   "look_custom_instruction",
+  "surface_2d",
   "color_picks",
   "binding_scopes",
   "binding_custom_scopes",
