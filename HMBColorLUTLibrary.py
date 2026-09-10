@@ -69,7 +69,9 @@ def _selection_key(state: Mapping[str, Any]) -> str:
 
 def _source_identity(source: Any) -> tuple[str, str, str]:
     source = source if isinstance(source, Mapping) else {}
-    return (str(source.get("path") or ""), str(source.get("generation_id") or source.get("task_id") or ""),
+    # Probing resolves short Windows paths and aliases. Retain the received
+    # reference for identity instead of treating that resolution as a new video.
+    return (str(source.get("_reference_path") or source.get("path") or ""), str(source.get("generation_id") or source.get("task_id") or ""),
             str(source.get("result_revision") or source.get("revision") or ""))
 
 
@@ -328,7 +330,8 @@ class HMBColorLUTLibrary(DataNode):
                 try:
                     info = probe_source(path)
                     media = Path(str(info.get("path") or path)).resolve()
-                    source = {**snap, **info, "path": str(media), "url": _media_url(media), "name": media.name,
+                    source = {**snap, **info, "_reference_path": str(snap.get("_reference_path") or path),
+                              "path": str(media), "url": _media_url(media), "name": media.name,
                               "fps": float(info.get("frame_rate") or info.get("fps") or 0),
                               "revision": str(snap.get("result_revision") or media.stat().st_mtime_ns)}
                     with self._lock:

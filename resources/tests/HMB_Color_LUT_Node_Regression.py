@@ -171,6 +171,29 @@ class ColorLUTNodeRegression(unittest.TestCase):
         self.assertEqual(self.node._hmb_color_lut_state["result"]["path"], first["path"])
         self.assertEqual(self.node.parameter_output_values.get("video_url", ""), first_url)
 
+    def test_resolved_source_path_keeps_same_shot_result_identity(self):
+        self.select()
+        snapshot = self.source()
+        # Windows CI uses a short TEMP alias. A lexical dot component gives
+        # the same path-before/after-resolve distinction on every platform.
+        snapshot["path"] = str(self.root) + "/./original.mp4"
+        self.assertNotEqual(snapshot["path"], str(Path(snapshot["path"]).resolve()))
+        self.node._queue_source(snapshot)
+        self.drain()
+        with mock.patch.object(target, "export_video", side_effect=self.successful_export):
+            self.export()
+        first = copy.deepcopy(self.node._hmb_color_lut_state["result"])
+        self.assertTrue(first.get("path"))
+        self.select(SHOT_B)
+        self.select(SHOT_A)
+        self.node._queue_source(snapshot)
+        self.drain()
+        self.assertEqual(self.node._hmb_color_lut_state["result"].get("path"), first["path"])
+        self.assertEqual(self.node.parameter_output_values.get("video_url"), first["url"])
+        # A genuinely new generation at the same path still invalidates it.
+        self.node._queue_source({**snapshot, "generation_id": "g2", "result_revision": "g2"})
+        self.assertFalse(self.node._hmb_color_lut_state["result"])
+
     def test_same_shot_replacement_does_not_publish_older_source_export(self):
         self.select()
         self.load()
