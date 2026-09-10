@@ -1906,6 +1906,10 @@ def _validated_picker_hidden_paths(job):
             )
             continue
         resolved_path = _clean(long_names[0])
+        mesh_identity = ((job or {}).get("hidden_mesh_identities") or {}).get(path)
+        if mesh_identity and _clean((cmds.ls(resolved_path, uuid=True) or [""])[0]) != mesh_identity:
+            failures.append("{0}: mesh identity changed; READ the scene again".format(path))
+            continue
         if resolved_path not in resolved:
             resolved.append(resolved_path)
     if failures:
@@ -7054,7 +7058,8 @@ def _sampled_shot_depth_range(
                     if api_records is not None
                     else None
                 )
-                if role != "foreground" and foreground_shape_set:
+                if (role != "foreground" and foreground_shape_set
+                        and _clean((job or {}).get("depth_range_mode")) not in ("middle", "far")):
                     # Actor markers have first authority for the effective
                     # range.  Context stays fully shaded/rendered/audited but
                     # does not pay per-frame vertex sampling cost when it
@@ -7504,6 +7509,7 @@ def _sampled_shot_depth_range(
             "Depth playblast complete-sequence bounds collapsed to an invalid "
             "range: near={0}, far={1}.".format(sampled_near, sampled_far)
         )
+    report["scene_far"] = min(camera_far_clip_max, max(normalization_representative_depths))
     report["near"] = sampled_near
     report["far"] = sampled_far
     report["range_candidate_scope"] = range_candidate_scope
@@ -7656,6 +7662,12 @@ def _depth_range(camera, job, frame_values=None, width=None, height=None):
                     requested_far,
                 )
             )
+    range_mode = _clean((job or {}).get("depth_range_mode")) or "close"
+    close_far = depth_far
+    scene_far = max(close_far, float(sampled_range.get("scene_far") or close_far))
+    if requested_near is None and range_mode in ("middle", "far"):
+        depth_far = _depth_distance_far(close_far, scene_far, range_mode)
+        policy = "fixed_shot_range_clamped_to_camera"
     if depth_far <= depth_near:
         raise RuntimeError(
             "Depth playblast range does not overlap the camera clipping range."
@@ -7665,6 +7677,9 @@ def _depth_range(camera, job, frame_values=None, width=None, height=None):
         "space": "camera",
         "source": "object_bbox_camera_depth",
         "normalization_policy": policy,
+        "distance_mode": range_mode,
+        "close_far": close_far,
+        "scene_far": scene_far,
         "near": depth_near,
         "far": depth_far,
         # Compatibility fields expose the complete animated clip envelope.
@@ -7704,6 +7719,12 @@ def _depth_range(camera, job, frame_values=None, width=None, height=None):
     if sampled_range:
         report["shot_range_sample"] = sampled_range
     return report
+
+
+def _depth_distance_far(close_far, scene_far, mode):
+    """Three fixed shot ranges; leave the current near endpoint untouched."""
+    weight = {"close": 0.0, "middle": 0.5, "far": 1.0}.get(mode, 0.0)
+    return close_far + (max(close_far, scene_far) - close_far) * weight
 
 
 def _depth_camera_world_inverse_matrix(camera):
@@ -15310,11 +15331,21 @@ def _scan_outliner_nodes(progress_callback=None):
         return value
 
     asset_root_reference = {}
+    depth_meshes_by_root = {}
     for shape in renderable_shapes:
         transform = parent_of(shape)
         root, reference_node = _asset_root_from_transform(transform, parent_of, reference_node_of)
         if root:
             asset_root_reference[root] = reference_node
+            meshes = depth_meshes_by_root.setdefault(root, {})
+            if transform != root and transform not in meshes:
+                meshes[transform] = {
+                    "name": transform.split("|")[-1],
+                    "full_path": transform,
+                    "parent_path": root,
+                    "node_kind": "mesh",
+                    "maya_uuid": _clean((cmds.ls(transform, uuid=True) or [""])[0]),
+                }
     proxy_manager_by_reference = {}
     proxy_tag_by_reference = {}
     for proxy_record in _proxy_reference_sets():
@@ -15487,6 +15518,7 @@ def _scan_outliner_nodes(progress_callback=None):
             "proxy_tag": proxy_tag_by_reference.get(reference_node, ""),
             "node_kind": "asset_root",
             "asset_root": True,
+            "depth_meshes": sorted(depth_meshes_by_root.get(transform, {}).values(), key=lambda item: item["full_path"]),
             "outliner_filter": "asset_roots_v1",
             "scene_visible": bool(visible_count.get(transform, 0)),
             "visible_shape_count": visible_count.get(transform, 0),

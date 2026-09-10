@@ -134,8 +134,8 @@ const outlinerSource = source.slice(outlinerStart, outlinerEnd);
 assert.ok(outlinerStart >= 0 && outlinerEnd > outlinerStart);
 assert.equal(
   (outlinerSource.match(/schedulePickerStatePublicationAfterPaint\(/g) || []).length,
-  3,
-  "Outliner select, expand, and visibility mutations must share one coalescing publisher.",
+  4,
+  "Outliner select, expand, visibility, and Depth settings must share one coalescing publisher.",
 );
 assert.doesNotMatch(
   outlinerSource,

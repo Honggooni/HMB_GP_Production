@@ -287,6 +287,11 @@ const TEXT = {
     sceneScanning: "SCANNING SCENE",
     resyncRequired: "RESYNC REQUIRED",
     outliner: "OUTLINER",
+    depthRange: "Depth distance",
+    depthClose: "Near · current default",
+    depthMiddle: "Middle",
+    depthFar: "Far background · whole shot",
+    depthPass: "Mesh color / visibility",
     filteredPolygon: "Asset Roots Only",
     search: "Search asset roots...",
     name: "Name",
@@ -386,6 +391,11 @@ const TEXT = {
     sceneScanning: "씬 검사 중",
     resyncRequired: "재동기화 필요",
     outliner: "아웃라이너",
+    depthRange: "Depth 거리 범위",
+    depthClose: "가까운 · 현재 기본",
+    depthMiddle: "중간",
+    depthFar: "먼 배경 · 샷 전체",
+    depthPass: "하위 메시 컬러 / 표시",
     filteredPolygon: "에셋 루트만 표시",
     search: "에셋 루트 검색...",
     name: "이름",
@@ -2791,6 +2801,7 @@ function defaultState() {
     mask_enabled: true,
     original_preview_enabled: false,
     depth_enabled: false,
+    depth_settings: { range: "close", expanded_roots: [] },
     motion_guide_enabled: false,
     depth_video_slot: 0,
     motion_guide_video_slot: 0,
@@ -3090,11 +3101,14 @@ function normalizeAssignments(value) {
   return [{ video_slot: 1, bindings: hmbDedupePickerBindings(authoring?.bindings, 1) }];
 }
 
+export function hmbPickerAllOutlinerNodes(state) {
+  return (Array.isArray(state?.outliner_nodes) ? state.outliner_nodes : []).filter(root => root && typeof root === "object").flatMap(root => [root,
+    ...(Array.isArray(root.depth_meshes) ? root.depth_meshes.map(mesh => ({ ...mesh, parent_path: clean(root.full_path), node_kind: "mesh" })) : [])]);
+}
+
 export function hmbPickerSelectedOutlinerNode(stateValue) {
   const state = stateValue && typeof stateValue === "object" ? stateValue : {};
-  const nodes = Array.isArray(state.outliner_nodes)
-    ? state.outliner_nodes.filter((item) => item && typeof item === "object" && clean(item.full_path))
-    : [];
+  const nodes = hmbPickerAllOutlinerNodes(state).filter(item => item && typeof item === "object" && clean(item.full_path));
   if (!nodes.length) return null;
   const requestedUuid = clean(state.selected_outliner_uuid).toLowerCase();
   const requestedPath = clean(state.selected_outliner_path);
@@ -4102,6 +4116,7 @@ function normalize(value) {
   state.mask_enabled = state.mask_enabled !== false;
   state.original_preview_enabled = !!state.original_preview_enabled;
   state.depth_enabled = !!state.depth_enabled;
+  state.depth_settings = hmbNormalizeDepthSettings(state.depth_settings);
   state.motion_guide_enabled = !!state.motion_guide_enabled;
   for (const key of ["depth_video_slot", "motion_guide_video_slot"]) {
     const typedSlot = Math.floor(Number(state[key] || 0));
@@ -5031,6 +5046,10 @@ export function hmbApplyPickerCommandAvailabilityToDom(container, availability =
 
 export function hmbApplyPickerOutputChoicesToDom(container, state, disabled = false) {
   if (!container?.querySelector) return false;
+  const rangePanel = container.querySelector(".depth-range-settings");
+  if (rangePanel) rangePanel.hidden = !state?.depth_enabled;
+  const rangeControl = container.querySelector("#depth-distance-range");
+  if (rangeControl) rangeControl.disabled = !!disabled;
   const choices = [
     ["#original-preview-toggle", !!state?.original_enabled],
     ["#mask-playblast-toggle", state?.mask_enabled !== false],
@@ -8027,11 +8046,23 @@ function nodeDepthMap(nodes) {
   return memo;
 }
 
+export function hmbNormalizeDepthSettings(value) {
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    range: ["close", "middle", "far"].includes(source.range) ? source.range : "close",
+    expanded_roots: Array.from(new Set((Array.isArray(source.expanded_roots) ? source.expanded_roots : []).map(clean).filter(Boolean))),
+  };
+}
+
 function filteredVisibleNodes(state) {
-  const nodes = Array.isArray(state?.outliner_nodes) ? state.outliner_nodes : [];
-  const byPath = new Map(nodes.map((node) => [clean(node.full_path), node]));
+  const settings = hmbNormalizeDepthSettings(state.depth_settings);
+  const depthExpanded = new Set(settings.expanded_roots);
   const query = clean(state.outliner_search).toLowerCase();
-  const expanded = new Set(state.outliner_expanded);
+  const roots = Array.isArray(state?.outliner_nodes) ? state.outliner_nodes : [];
+  const nodes = roots.flatMap(root => [root, ...((query || depthExpanded.has(clean(root.full_path))) && Array.isArray(root.depth_meshes)
+    ? root.depth_meshes.map(mesh => ({ ...mesh, node_kind: "mesh", parent_path: clean(root.full_path) })) : [])]);
+  const byPath = new Map(nodes.map((node) => [clean(node.full_path), node]));
+  const expanded = new Set([...(state.outliner_expanded || []), ...settings.expanded_roots]);
   if (query) {
     const keep = new Set();
     nodes.forEach((node) => {
@@ -8108,7 +8139,7 @@ function outlinerHtml(state, bindings, tr, locked = false, options = {}) {
   if (!Array.isArray(state?.outliner_nodes) || !state.outliner_nodes.length) {
     return `<div class="empty-pane"><b>${escapeHtml(tr.noPreviewTitle)}</b><span>${escapeHtml(tr.noPreviewBody)}</span></div>`;
   }
-  const depthMap = nodeDepthMap(state.outliner_nodes);
+  const depthMap = nodeDepthMap(hmbPickerAllOutlinerNodes(state));
   const expanded = new Set(state.outliner_expanded);
   const assignedByPath = new Map(bindings.map((item) => [clean(item.full_dag_path), clean(item.color)]));
   const visibilitySlot = 1;
@@ -8116,6 +8147,7 @@ function outlinerHtml(state, bindings, tr, locked = false, options = {}) {
     (item) => Number(item?.video_slot || 0) === visibilitySlot,
   );
   const hiddenPaths = new Set(Array.isArray(selectedVisibility?.hidden_paths) ? selectedVisibility.hidden_paths.map(clean) : []);
+  const depthSettings = hmbNormalizeDepthSettings(state.depth_settings);
   const windowed = hmbPickerOutlinerWindow(
     state,
     options.scrollTop,
@@ -8129,21 +8161,23 @@ function outlinerHtml(state, bindings, tr, locked = false, options = {}) {
     const visibleIndex = windowed.start + localIndex;
     const path = clean(node.full_path);
     const name = clean(node.name) || path.split("|").pop();
+    const hasDepthMeshes = Array.isArray(node.depth_meshes) && node.depth_meshes.length > 0;
     const hasChildren = Number(node.child_count || 0) > 0;
     const selected = path === state.selected_outliner_path;
     const assignedColor = assignedByPath.get(path) || "";
-    const outputVisible = !hiddenPaths.has(path);
+    const parentHidden = Array.from(hiddenPaths).some(root => path.startsWith(root + "|"));
+    const outputVisible = !parentHidden && !hiddenPaths.has(path);
     const indent = Number(depthMap.get(path) || 0) * 17;
     const rowTabIndex = selected || (!clean(state.selected_outliner_path) && visibleIndex === 0) ? 0 : -1;
     const toggleLabel = expanded.has(path) ? tr.collapseNode : tr.expandNode;
     const visibilityLabel = outputVisible ? tr.outputOn : tr.outputOff;
     return `<div class="outliner-row ${selected ? "selected" : ""} ${outputVisible ? "" : "output-off"}" data-group-path="${escapeHtml(path)}" title="${escapeHtml(path)}" role="treeitem" tabindex="${rowTabIndex}" aria-level="${Number(depthMap.get(path) || 0) + 1}" aria-posinset="${visibleIndex + 1}" aria-setsize="${windowed.total}" aria-selected="${selected ? "true" : "false"}" ${hasChildren ? `aria-expanded="${expanded.has(path) ? "true" : "false"}"` : ""}>
-      <button type="button" class="tree-toggle ${hasChildren ? "" : "leaf"}" data-toggle-path="${escapeHtml(path)}" style="margin-left:${indent}px" aria-label="${escapeHtml(hasChildren ? toggleLabel : name)}" ${hasChildren ? "" : "disabled"}>${hasChildren ? (expanded.has(path) ? "▾" : "▸") : ""}</button>
+      ${hasDepthMeshes ? `<button type="button" class="tree-toggle" data-depth-toggle-path="${escapeHtml(path)}" aria-expanded="${depthSettings.expanded_roots.includes(path)}" aria-label="${escapeHtml(name + ': ' + tr.depthPass)}">${depthSettings.expanded_roots.includes(path) ? "▾" : "▸"}</button>` : `<button type="button" class="tree-toggle ${hasChildren ? "" : "leaf"}" data-toggle-path="${escapeHtml(path)}" style="margin-left:${indent}px" aria-label="${escapeHtml(hasChildren ? toggleLabel : name)}" ${hasChildren ? "" : "disabled"}>${hasChildren ? (expanded.has(path) ? "▾" : "▸") : ""}</button>`}
       <span class="node-icon">${node.node_kind === "mesh" ? "◆" : "◇"}</span>
       <span class="group-name">${escapeHtml(name)}</span>
       ${node.referenced ? `<span class="ref-tag">${escapeHtml(tr.reference)}</span>` : ""}
       ${assignedColor ? `<span class="assigned-chip" style="${hmbPickerColorStyle(assignedColor, state.marker_catalog)}" title="${escapeHtml(assignedColor)}"></span>` : ""}
-      <button type="button" class="eye-toggle ${outputVisible ? "on" : "off"}" data-visibility-path="${escapeHtml(path)}" title="${escapeHtml(visibilityLabel)}" aria-label="${escapeHtml(`${name}: ${visibilityLabel}`)}" aria-pressed="${outputVisible ? "true" : "false"}" aria-disabled="${locked ? "true" : "false"}" ${locked ? "disabled" : ""}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"></path><circle cx="12" cy="12" r="3"></circle></svg></button>
+      <button type="button" class="eye-toggle ${outputVisible ? "on" : "off"}" data-visibility-path="${escapeHtml(path)}" data-inherited-hidden="${parentHidden}" title="${escapeHtml(visibilityLabel)}" aria-label="${escapeHtml(`${name}: ${visibilityLabel}`)}" aria-pressed="${outputVisible ? "true" : "false"}" aria-disabled="${locked || parentHidden ? "true" : "false"}" ${locked || parentHidden ? "disabled" : ""}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"></path><circle cx="12" cy="12" r="3"></circle></svg></button>
     </div>`;
   }).join("")}${spacer("bottom", windowed.bottomSpacer)}</div>`;
 }
@@ -10144,8 +10178,9 @@ export function hmbApplyPickerResolutionToDom(container, width, height) {
 
 export function hmbSetPickerVisibilityBusy(container, busy) {
   for (const button of container?.querySelectorAll?.("[data-visibility-path]") || []) {
-    button.disabled = !!busy;
-    button.setAttribute?.("aria-disabled", busy ? "true" : "false");
+    const disabled = !!busy || button.getAttribute?.("data-inherited-hidden") === "true";
+    button.disabled = disabled;
+    button.setAttribute?.("aria-disabled", disabled ? "true" : "false");
   }
 }
 
@@ -11274,7 +11309,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   const initialLocked = runningOperation;
   const bindings = selectedBindings(state, 1);
   const frameMetadata = selectedFrameMetadata(state, video, selectedSlot);
-  const selectedNode = state.outliner_nodes.find((item) => clean(item.full_path) === state.selected_outliner_path) || null;
+  const selectedNode = hmbPickerAllOutlinerNodes(state).find((item) => clean(item.full_path) === state.selected_outliner_path) || null;
   const tr = TEXT[state.language] || TEXT.ko;
   const uiTheme = "P";
   const activePickerWorkspace = hmbActivePickerWorkspace(state);
@@ -11569,8 +11604,10 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
             </div>
           </div>
           <div class="outliner-toolbar"><input id="outliner-search" class="search-input" value="${escapeHtml(state.outliner_search)}" placeholder="${escapeHtml(tr.search)}" aria-label="${escapeHtml(tr.search)}"/></div>
+          <style>.hmbvp .depth-range-settings{display:flex;flex-direction:column;gap:6px;padding:9px;border-top:1px solid var(--hmb-line-soft,#303947);font-size:11px;flex-shrink:0}.hmbvp .depth-range-settings[hidden]{display:none}.hmbvp .depth-range-settings select{min-height:30px;background:#0d1420;color:inherit;border:1px solid var(--hmb-line-soft,#303947);border-radius:4px;padding:4px}</style>
           <div class="column-head"><span>${escapeHtml(tr.name)}</span></div>
           <div class="outliner-scroll">${outlinerHtml(state, bindings, tr, initialLocked, outlinerRenderOptions)}</div>
+          <div class="depth-range-settings" ${depthChecked ? "" : "hidden"}><label for="depth-distance-range">${escapeHtml(tr.depthRange)}</label><select id="depth-distance-range" ${initialLocked ? "disabled" : ""}>${[["close", tr.depthClose], ["middle", tr.depthMiddle], ["far", tr.depthFar]].map(([value, label]) => `<option value="${value}" ${state.depth_settings.range === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></div>
         </section>
         <div class="center-stack">
         <section class="panel viewport-panel">
@@ -12942,6 +12979,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
         nextState.outliner_search,
         nextState.selected_outliner_path,
         nextState.slot_visibility,
+        nextState.depth_settings,
         nextState.slot_assignments,
         nextState.marker_catalog_version,
         nextLocked,
@@ -12952,6 +12990,11 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
         container.__hmbPickerOutlinerPatchKey = outlinerKey;
       }
       hmbPatchPickerCameraControlDom(container, nextState, nextTr, immediateMediaLocked);
+      const depthRange = container.querySelector("#depth-distance-range");
+      if (depthRange) {
+        depthRange.value = hmbNormalizeDepthSettings(nextState.depth_settings).range;
+        depthRange.disabled = !!nextLocked;
+      }
       hmbApplyPickerPaletteSelectionToDom(container, nextState, immediateMediaLocked);
     } else {
       const compactContentHeight = hmbApplyVideoPickerCompactHostSizing(container, visibleState);
@@ -13915,6 +13958,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       include_depth: depthEnabled,
       include_motion_guide: motionGuideEnabled,
       authoring_state: {
+        depth_settings: hmbNormalizeDepthSettings(currentLocal.depth_settings),
         state_revision: Number(currentLocal.state_revision || 0),
         selected_camera: clean(currentLocal.selected_camera || currentLocal.camera),
         slot_assignments: Array.isArray(currentLocal.slot_assignments)
@@ -14073,7 +14117,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   });
   const selectOutlinerPath = (path) => {
     const liveState = currentWidgetState();
-    const node = liveState.outliner_nodes.find((item) => clean(item.full_path) === clean(path));
+    const node = hmbPickerAllOutlinerNodes(liveState).find((item) => clean(item.full_path) === clean(path));
     if (!node) return;
     const next = hmbEnsurePickerOutlinerSelection({
       ...liveState,
@@ -14106,6 +14150,15 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       commitOptions: { suppressMatchingEcho: outlinerUpdated },
     });
   };
+  const publishDepthSettings = (next) => {
+    const updated = hmbRenderPickerOutlinerLocal(container, next, tr, pickerLocalInteractionLocked(next));
+    schedulePickerStatePublicationAfterPaint(next, { commitOptions: { suppressMatchingEcho: updated } });
+  };
+  on(container.querySelector("#depth-distance-range"), "change", event => {
+    const live = currentWidgetState();
+    if (pickerLocalInteractionLocked(live) || container.__hmbPickerOperationSubmissionPending) return;
+    publishDepthSettings({ ...live, depth_settings: { ...hmbNormalizeDepthSettings(live.depth_settings), range: event.target.value } });
+  });
   const toggleOutlinerVisibility = (path) => {
     const liveState = currentWidgetState();
     const availability = pickerButtonAvailability(
@@ -14122,6 +14175,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     const liveSlot = 1;
     const currentEntry = liveState.slot_visibility.find((item) => Number(item?.video_slot || 0) === liveSlot);
     const hiddenPaths = new Set(Array.isArray(currentEntry?.hidden_paths) ? currentEntry.hidden_paths.map(clean) : []);
+    if (Array.from(hiddenPaths).some(root => path.startsWith(root + "|"))) return;
     if (hiddenPaths.has(path)) hiddenPaths.delete(path); else hiddenPaths.add(path);
     const next = {
       ...liveState,
@@ -14144,6 +14198,17 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   on(outlinerScroll, "pointerdown", (event) => event.stopPropagation?.());
   on(outlinerScroll, "click", (event) => {
     event.stopPropagation?.();
+    const depthToggle = event.target?.closest?.("[data-depth-toggle-path]");
+    if (depthToggle) {
+      event.preventDefault?.();
+      const live = currentWidgetState();
+      const settings = hmbNormalizeDepthSettings(live.depth_settings);
+      const expanded = new Set(settings.expanded_roots);
+      const path = clean(depthToggle.getAttribute("data-depth-toggle-path"));
+      if (expanded.has(path)) expanded.delete(path); else expanded.add(path);
+      publishDepthSettings({ ...live, depth_settings: { ...settings, expanded_roots: Array.from(expanded) } });
+      return;
+    }
     const visibility = event.target?.closest?.("[data-visibility-path]");
     if (visibility) {
       event.preventDefault?.();
@@ -14210,8 +14275,19 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
     const path = clean(row.getAttribute?.("data-group-path"));
     const liveState = currentWidgetState();
-    const node = liveState.outliner_nodes.find((item) => clean(item.full_path) === path);
+    const node = hmbPickerAllOutlinerNodes(liveState).find((item) => clean(item.full_path) === path);
     if (!node) return;
+    if (Array.isArray(node.depth_meshes) && node.depth_meshes.length) {
+      const settings = hmbNormalizeDepthSettings(liveState.depth_settings);
+      const expanded = new Set(settings.expanded_roots);
+      const shouldExpand = event.key === "ArrowRight";
+      if (expanded.has(path) !== shouldExpand) {
+        event.preventDefault();
+        if (shouldExpand) expanded.add(path); else expanded.delete(path);
+        publishDepthSettings({ ...liveState, depth_settings: { ...settings, expanded_roots: Array.from(expanded) } });
+      }
+      return;
+    }
     const expanded = new Set(liveState.outliner_expanded);
     if (event.key === "ArrowRight" && Number(node.child_count || 0) > 0 && !expanded.has(path)) {
       event.preventDefault();

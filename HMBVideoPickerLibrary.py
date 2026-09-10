@@ -4046,10 +4046,75 @@ def _reorder_video_picker_parameters(node: Any, active_count: int = 0) -> None:
         _diagnostic_exception("VideoPicker parameter-map reorder failed", exc)
 
 
+def _normalize_depth_settings(value: Any, nodes: Any = None) -> Dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    mode = _clean(source.get("range"))
+    expanded = list(dict.fromkeys(
+        _clean(path) for path in source.get("expanded_roots", []) if _clean(path)
+    )) if isinstance(source.get("expanded_roots"), list) else []
+    if isinstance(nodes, list):
+        roots = {_clean(root.get("full_path")) for root in nodes if isinstance(root, dict)}
+        expanded = [path for path in expanded if path in roots]
+    return {"range": mode if mode in {"close", "middle", "far"} else "close",
+            "expanded_roots": expanded}
+
+
+def _all_picker_outliner_nodes(nodes: Any) -> List[Dict[str, Any]]:
+    roots = [row for row in nodes if isinstance(row, dict)] if isinstance(nodes, list) else []
+    return [row for root in roots for row in [root, *[
+        mesh for mesh in (root.get("depth_meshes") if isinstance(root.get("depth_meshes"), list) else []) if isinstance(mesh, dict)
+    ]]]
+
+
+def _reconcile_picker_mesh_authoring(state: Dict[str, Any], nodes: Any) -> Dict[str, Any]:
+    """Rebind newly exposed child meshes by identity without changing root controls."""
+    old = {row["full_path"]: row for row in _all_picker_outliner_nodes(state.get("outliner_nodes"))
+           if row.get("node_kind") == "mesh" and row.get("parent_path")}
+    current = _all_picker_outliner_nodes(nodes)
+    by_uuid = {}
+    for row in current:
+        uuid_value = _clean(row.get("maya_uuid"))
+        if uuid_value:
+            by_uuid.setdefault(uuid_value, []).append(row)
+    resolved = {}
+    for path, row in old.items():
+        uuid_value = _clean(row.get("maya_uuid"))
+        matches = by_uuid.get(uuid_value, [])
+        exact = next((new for new in matches if new.get("full_path") == path), None)
+        resolved[path] = exact or (matches[0] if len(matches) == 1 else None)
+    result = dict(state)
+    result["slot_visibility"] = [{**entry, "hidden_paths": list(dict.fromkeys(
+        resolved[path]["full_path"] if path in resolved else path
+        for path in entry.get("hidden_paths", []) if path not in resolved or resolved[path]
+    ))} for entry in state.get("slot_visibility", [])]
+    assignments = []
+    for entry in state.get("slot_assignments", []):
+        bindings = []
+        for binding in entry.get("bindings", []):
+            path = binding.get("full_dag_path")
+            if path not in resolved:
+                bindings.append(dict(binding))
+            elif resolved[path]:
+                target = resolved[path]
+                bindings.append({**binding, "full_dag_path": target["full_path"],
+                                 "group_name": target["name"], "maya_uuid": target["maya_uuid"]})
+        assignments.append({**entry, "bindings": bindings})
+    result["slot_assignments"] = assignments
+    return result
+
+
+def _picker_hidden_mesh_identities(state: Dict[str, Any]) -> Dict[str, str]:
+    hidden = {path for entry in state.get("slot_visibility", []) for path in entry.get("hidden_paths", [])}
+    return {row["full_path"]: _clean(row.get("maya_uuid"))
+            for row in _all_picker_outliner_nodes(state.get("outliner_nodes"))
+            if row.get("node_kind") == "mesh" and row.get("full_path") in hidden}
+
+
 def _default_widget_state() -> Dict[str, Any]:
     picker_workspace_uuid = PICKER_DEFAULT_WORKSPACE_UUID
     return {
         "schema": "maya-video-picker-state",
+        "depth_settings": _normalize_depth_settings(None),
         "state_revision": 0,
         "state_writer": "",
         "writer_runtime_instance_id": "",
@@ -6927,7 +6992,7 @@ def _outliner_selection_after_read(
         if isinstance(outliner_nodes, list)
         else []
     )
-    readable_nodes = [item for item in nodes if _clean(item.get("full_path"))]
+    readable_nodes = [item for item in _all_picker_outliner_nodes(nodes) if _clean(item.get("full_path"))]
     if not readable_nodes:
         return {"path": "", "name": "", "uuid": "", "color": ""}
 
@@ -8867,6 +8932,7 @@ def _parse_state(value: Any) -> Dict[str, Any]:
     outliner_nodes = state.get("outliner_nodes") if isinstance(state.get("outliner_nodes"), list) else []
     cameras = state.get("cameras") if isinstance(state.get("cameras"), list) else []
     state["outliner_nodes"] = [dict(item) for item in outliner_nodes if isinstance(item, dict)]
+    state["depth_settings"] = _normalize_depth_settings(state.get("depth_settings"))
     state["cameras"] = [dict(item) for item in cameras if isinstance(item, dict)]
     state["outliner_expanded"] = [_clean(item) for item in state.get("outliner_expanded", []) if _clean(item)] if isinstance(state.get("outliner_expanded"), list) else []
     state["warnings"] = _normalize_ui_warnings(state.get("warnings"))
@@ -11875,7 +11941,7 @@ _MAYA_OPERATION_AUTHORING_FIELDS = (
     "camera", "selected_camera", "cameras", "start_frame", "end_frame", "current_frame",
     "source_fps", "output_fps", "output_width", "output_height", "has_maya_frame_range",
     "source_frame_count", "source_duration_seconds", "outliner_nodes",
-    "slot_assignments", "slot_visibility", "original_enabled", "mask_enabled",
+    "slot_assignments", "slot_visibility", "depth_settings", "original_enabled", "mask_enabled",
     "depth_enabled", "motion_guide_enabled", "snapshot_frame", "snapshot_request_frame", "snapshot_request_video_uid",
 )
 
@@ -11991,6 +12057,7 @@ def _operation_input_digest(kind: str, scene_text: Any, state: Dict[str, Any], s
                 "depth_enabled": depth_enabled,
                 "depth_video_slot": depth_video_slot,
                 "depth_profile": DEPTH_PLAYBLAST_PROFILE if depth_enabled else "",
+                "depth_range_mode": normalized["depth_settings"]["range"] if depth_enabled else "",
                 "mouth_card_inner_patch_policy": (
                     MOUTH_CARD_INNER_PATCH_POLICY
                     if depth_enabled or normalized.get("original_enabled")
@@ -13201,6 +13268,7 @@ class HMBVideoPickerLibrary(DataNode):
             "workspace_view", "selected_outliner_path", "selected_outliner_name", "selected_outliner_uuid",
             "selected_color", "outliner_expanded", "outliner_search", "selected_camera",
             "slot_assignments", "slot_visibility", "snapshot_frame", "snapshot_video_slot",
+            "depth_settings",
             "scene_draft_path", "scene_request_path",
             "output_width", "output_height",
             "original_enabled", "mask_enabled",
@@ -15983,6 +16051,9 @@ class HMBVideoPickerLibrary(DataNode):
             and _scene_path_key(previous_state.get("scene_path") or previous_state.get("scene_request_path"))
             == _scene_path_key(scene_text)
         )
+        if not same_scene_request:
+            state = _reconcile_picker_mesh_authoring(state, [])
+            state["depth_settings"] = _normalize_depth_settings(None)
         state.update({
             "scene_stage": "EMPTY",
             "scene_path": "",
@@ -17494,6 +17565,7 @@ class HMBVideoPickerLibrary(DataNode):
                 "selected_camera",
                 "slot_assignments",
                 "slot_visibility",
+                "depth_settings",
                 "original_enabled",
                 "mask_enabled",
                 "depth_enabled",
@@ -19110,8 +19182,10 @@ class HMBVideoPickerLibrary(DataNode):
         previous_state = self._picker_state()
         active_slot_count = max(1, min(MAX_VIDEO_SLOTS, int(previous_state.get("active_slot_count") or 1)))
         selected_video_slot = max(1, min(active_slot_count, int(previous_state.get("selected_video_slot") or 1)))
-        valid_paths = {_clean(item.get("full_path")) for item in outliner_nodes if _clean(item.get("full_path"))}
-        valid_uuids = {_clean(item.get("maya_uuid")) for item in outliner_nodes if _clean(item.get("maya_uuid"))}
+        assignable_nodes = _all_picker_outliner_nodes(outliner_nodes)
+        previous_state = _reconcile_picker_mesh_authoring(previous_state, outliner_nodes)
+        valid_paths = {_clean(item.get("full_path")) for item in assignable_nodes if _clean(item.get("full_path"))}
+        valid_uuids = {_clean(item.get("maya_uuid")) for item in assignable_nodes if _clean(item.get("maya_uuid"))}
         preserved_assignments: List[Dict[str, Any]] = []
         for slot_item in _normalize_slot_assignments(
             previous_state.get("slot_assignments"), active_slot_count, previous_state.get("videos")
@@ -19165,6 +19239,7 @@ class HMBVideoPickerLibrary(DataNode):
             "source_frame_count": source_frame_count,
             "source_duration_seconds": source_duration,
             "outliner_nodes": outliner_nodes,
+            "depth_settings": _normalize_depth_settings(previous_state.get("depth_settings"), outliner_nodes),
             "outliner_expanded": root_paths,
             "selected_outliner_path": outliner_selection["path"],
             "selected_outliner_name": outliner_selection["name"],
@@ -20262,6 +20337,7 @@ class HMBVideoPickerLibrary(DataNode):
             "video_slot": video_slot,
             "bindings": bindings,
             "hidden_paths": self._selected_slot_hidden_paths(state, video_slot),
+            "hidden_mesh_identities": _picker_hidden_mesh_identities(state),
         })
 
         command: List[str] = [str(mayabatch)]
@@ -20641,6 +20717,8 @@ class HMBVideoPickerLibrary(DataNode):
                 mask_authoring_slot,
             ),
             "generate_depth_playblast": depth_enabled,
+            "hidden_mesh_identities": _picker_hidden_mesh_identities(state),
+            "depth_range_mode": state["depth_settings"]["range"],
             "depth_video_slot": depth_video_slot,
             "depth_output_name": depth_output_name if depth_enabled else "",
             "depth_frames_folder": (

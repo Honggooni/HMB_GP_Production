@@ -149,6 +149,7 @@ jobs:
             "HMB_Image_Taxonomy_Regression.py",
             "HMB_Cutout_Transparency_Regression.py",
             "HMB_Depth_Companion_Regression.py",
+            "HMB_Picker_Depth_Range_Mesh_Regression.py",
             "HMB_VideoPicker_Reliability_Regression.py",
             "HMB_Depth_Visual_Contract_Regression.py",
             "HMB_Maya_Runner_Performance_Regression.py",
@@ -307,6 +308,7 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Adds Picker Near (unchanged default), Middle, and Whole-shot Far Depth ranges, shown only when Depth is enabled, plus expandable per-mesh color assignment and shared eye pass-through controls.",
             "- Fixes Picker project-media publication for current and legacy Griptape sidecar APIs, passing the active Engine without retrying writes or changing Maya Depth calculation.",
             "- Includes HMB Color LUT with Shot-bound completed Generator video, shared ImageAsset project selection, named presets, automatic LUT archival, and twelve-step controls.",
             "- Includes optional per-image 2D Surface guidance (disabled by default), Layout Reference motion guidance, and Agent failure isolation so other Shot branches continue.",
