@@ -93,8 +93,12 @@ try {
   await page.evaluate(() => { window.beforeModeDraw = window.drawCount; });
   await page.locator('[data-view="graded"]').click();
   await page.waitForFunction(() => window.drawCount > window.beforeModeDraw);
-  await page.evaluate(() => { window.originalPixels = Array.from(window.lastPixels); window.beforeDraw = window.drawCount; });
-  await page.locator('[data-adjust="temperature"]').evaluate((el) => { el.value = "11"; el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true })); });
+  await page.locator('[data-adjust="temperature"]').evaluate((el) => {
+    // Capture the baseline and dispatch the edit in one browser task. A queued
+    // wipe/mode frame between separate evaluations is not the edited frame.
+    window.originalPixels = Array.from(window.lastPixels); window.beforeDraw = window.drawCount;
+    el.value = "11"; el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true }));
+  });
   await page.waitForFunction(() => window.drawCount > window.beforeDraw);
   const difference = await page.evaluate(() => {
     let sum = 0, changed = 0;

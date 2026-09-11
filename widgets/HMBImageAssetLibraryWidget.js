@@ -612,9 +612,21 @@ function normalizeRelativeFolder(value) {
   return parts.some((part) => part === "..") ? "" : parts.join("/");
 }
 
+const PRODUCTION_PROJECTS_ROOT = "//192.168.200.19/v/projects/Ai_Ct_image";
+const RETIRED_PROJECTS_ROOT = "//fin-rcomp1/Composite_Team/projects_AI";
+
+export function hmbRelocateImageProjectPath(value) {
+  const text = clean(value);
+  const path = text.replaceAll("\\", "/");
+  const prefix = RETIRED_PROJECTS_ROOT;
+  return path.toLowerCase() === prefix.toLowerCase() || path.toLowerCase().startsWith(prefix.toLowerCase() + "/")
+    ? PRODUCTION_PROJECTS_ROOT + path.slice(prefix.length)
+    : text;
+}
+
 function normalizeProject(raw) {
   if (!raw || typeof raw !== "object") return null;
-  const path = clean(raw.path).replaceAll("\\", "/");
+  const path = hmbRelocateImageProjectPath(raw.path).replaceAll("\\", "/");
   const name = clean(raw.name) || path.split("/").filter(Boolean).pop() || "";
   const projectId = clean(raw.project_id);
   if (!path || !name || !projectId) return null;
@@ -644,8 +656,8 @@ function normalizeAsset(raw) {
     asset_project_uid: clean(raw.asset_project_uid),
     asset_id: assetId,
     image_name: imageName,
-    path: clean(raw.path || raw.asset_path).replaceAll("\\", "/"),
-    thumbnail_url: clean(raw.thumbnail_url),
+    path: hmbRelocateImageProjectPath(raw.path || raw.asset_path).replaceAll("\\", "/"),
+    thumbnail_url: hmbRelocateImageProjectPath(raw.thumbnail_url),
     media_signature: clean(raw.media_signature).slice(0, 64),
     relative_path: clean(raw.relative_path).replaceAll("\\", "/"),
     extension: clean(raw.extension).toLowerCase(),
@@ -985,7 +997,7 @@ function normalizeState(value) {
   const expandedFolders = uniqueStrings(input.expanded_folders)
     .map((item) => item === ROOT_FOLDER_KEY ? ROOT_FOLDER_KEY : normalizeRelativeFolder(item))
     .filter((item) => item === ROOT_FOLDER_KEY || folders.includes(item));
-  const projectRoot = clean(input.project_root).replaceAll("\\", "/");
+  const projectRoot = hmbRelocateImageProjectPath(input.project_root).replaceAll("\\", "/");
   if (projectRoot && !hasExpandedFolders) expandedFolders.push(ROOT_FOLDER_KEY);
   const selectedSourceView = clean(input.selected_source_view).toLowerCase() === "user"
     ? "user"
@@ -995,8 +1007,8 @@ function normalizeState(value) {
   return markCanonicalImageAssetState({
     schema: "hmb-image-asset-library-state",
     version: IMAGE_ASSET_STATE_VERSION,
-    catalog_root: clean(
-      input.catalog_root || "//fin-rcomp1/Composite_Team/projects_AI",
+    catalog_root: hmbRelocateImageProjectPath(
+      input.catalog_root || PRODUCTION_PROJECTS_ROOT,
     ).replaceAll("\\", "/"),
     projects,
     project_root: projectRoot,
@@ -6521,7 +6533,7 @@ function installEvents(container, state, props, remount, listeners) {
 
   const syncNativeRoot = () => {
     state = container.__hmbImageAssetLatestState || state;
-    const nativePath = clean(nativeProjectRootValue(container)).replaceAll("\\", "/");
+    const nativePath = hmbRelocateImageProjectPath(nativeProjectRootValue(container)).replaceAll("\\", "/");
     if (!nativePath || nativePath.toLowerCase() === state.catalog_root.toLowerCase()) return;
     commitSlowProjectMutation(() => {
       state.catalog_root = nativePath;

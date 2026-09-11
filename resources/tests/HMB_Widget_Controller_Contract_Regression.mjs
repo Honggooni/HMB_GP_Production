@@ -208,7 +208,7 @@ assert.match(videoSource, /\.brand-mark:after\{content:"VP";transform:none;/, "V
 assert.match(assetSource, /class="mark">IA<\/div>/, "ImageAsset must retain the rounded IA mark.");
 assert.equal(
   assetModule.hmbNormalizeImageAssetState({}).catalog_root,
-  "//fin-rcomp1/Composite_Team/projects_AI",
+  "//192.168.200.19/v/projects/Ai_Ct_image",
   "ImageAssetLibrary must default new state to the shared production projects root.",
 );
 assert.equal(

@@ -137,6 +137,7 @@ jobs:
             "HMB_Public_Release_Security_Regression.py",
             "HMB_State_Normalization_Property_Regression.py",
             "HMB_Image_Asset_Import_Order_Regression.py",
+            "HMB_Image_Asset_Project_Root_Relocation_Regression.py",
             "HMB_Image_Asset_Staged_Loading_Regression.py",
             "HMB_Image_Asset_Shared_Catalog_Cache_Regression.py",
             "HMB_Image_Asset_Resolved_Selection_Regression.py",
@@ -308,6 +309,7 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Moves the ImageAsset production catalog to //192.168.200.19/v/projects/Ai_Ct_image and automatically rebases saved paths under the retired share, preserving Shot selections, asset identities, ordering, and other custom roots.",
             "- Adds Picker Near (unchanged default), Middle, and Whole-shot Far Depth ranges, shown only when Depth is enabled, plus expandable per-mesh color assignment and shared eye pass-through controls.",
             "- Fixes Picker project-media publication for current and legacy Griptape sidecar APIs, passing the active Engine without retrying writes or changing Maya Depth calculation.",
             "- Includes HMB Color LUT with Shot-bound completed Generator video, shared ImageAsset project selection, named presets, automatic LUT archival, and twelve-step controls.",

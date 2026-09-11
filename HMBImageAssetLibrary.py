@@ -159,11 +159,25 @@ ASSET_MANIFEST_SCHEMA = "hmb-image-assets"
 ASSET_MANIFEST_VERSION = 1
 ASSET_MANIFEST_LOCK_NAME = ".hmb_image_assets.lock"
 ASSET_MANIFEST_LOCK_TIMEOUT_SECONDS = 10.0
+PRODUCTION_PROJECTS_ROOT = "//192.168.200.19/v/projects/Ai_Ct_image"
+_RETIRED_PROJECTS_ROOT = "//fin-rcomp1/Composite_Team/projects_AI"
+
+
+def _relocate_image_project_path(value: Any) -> str:
+    """Rebase only the retired share; keep project identity and custom roots."""
+    text = str(value or "").strip()
+    path = text.replace("\\", "/")
+    prefix = _RETIRED_PROJECTS_ROOT
+    if path.casefold() == prefix.casefold() or path.casefold().startswith(prefix.casefold() + "/"):
+        return PRODUCTION_PROJECTS_ROOT + path[len(prefix):]
+    return text
+
+
 DEFAULT_PROJECTS_ROOT = Path(
-    os.environ.get(
+    _relocate_image_project_path(os.environ.get(
         "HMB_IMAGE_PROJECTS_ROOT",
-        r"\\fin-rcomp1\Composite_Team\projects_AI",
-    )
+        PRODUCTION_PROJECTS_ROOT,
+    ))
 )
 IMAGE_EXTENSIONS = frozenset(
     {
@@ -282,9 +296,9 @@ def _project_root_text(value: Any) -> str:
         if current is None or depth > MAX_INPUT_NESTING:
             continue
         if isinstance(current, Path):
-            return str(current)
+            return _relocate_image_project_path(current)
         if isinstance(current, bytes):
-            return current.decode("utf-8", errors="replace").strip()
+            return _relocate_image_project_path(current.decode("utf-8", errors="replace"))
         if isinstance(current, dict):
             identity = id(current)
             if identity in visited:
@@ -328,7 +342,7 @@ def _project_root_text(value: Any) -> str:
                 pass
         if text.casefold().startswith("file:"):
             text = _decode_file_uri(text)
-        return os.path.expandvars(text)
+        return _relocate_image_project_path(os.path.expandvars(text))
     return ""
 
 
@@ -2564,7 +2578,7 @@ def _normalize_asset(raw: Any) -> Dict[str, Any] | None:
     library_id = _clean(raw.get("asset_library_id") or raw.get("asset_key"))
     asset_id = _clean(raw.get("asset_id"))
     image_name = _clean(raw.get("image_name") or raw.get("label"))
-    path = _clean(raw.get("path") or raw.get("asset_path")).replace("\\", "/")
+    path = _relocate_image_project_path(raw.get("path") or raw.get("asset_path")).replace("\\", "/")
     if not library_id or not asset_id or not image_name:
         return None
     source_kind = _clean(raw.get("source_kind")).casefold()
@@ -2602,7 +2616,7 @@ def _normalize_asset(raw: Any) -> Dict[str, Any] | None:
         "asset_id": asset_id,
         "image_name": image_name,
         "path": path,
-        "thumbnail_url": _clean(raw.get("thumbnail_url")),
+        "thumbnail_url": _relocate_image_project_path(raw.get("thumbnail_url")),
         "media_signature": _clean(raw.get("media_signature"))[:64],
         "relative_path": _clean(raw.get("relative_path")).replace("\\", "/"),
         "extension": _clean(raw.get("extension")).casefold(),
@@ -2731,7 +2745,7 @@ def _normalize_project_catalog(value: Any) -> List[Dict[str, str]]:
     for raw in value[:MAX_PROJECTS]:
         if not isinstance(raw, dict):
             continue
-        path = _clean(raw.get("path")).replace("\\", "/")
+        path = _relocate_image_project_path(raw.get("path")).replace("\\", "/")
         name = _clean(raw.get("name")) or (Path(path).name if path else "")
         project_id = _clean(raw.get("project_id"))
         project_uid = _clean(raw.get("project_uid"))
@@ -3120,11 +3134,11 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
     source = _parse_mapping(value)
     state = _default_state()
     catalog_root = (
-        _clean(source.get("catalog_root")).replace("\\", "/")
+        _relocate_image_project_path(source.get("catalog_root")).replace("\\", "/")
         or str(DEFAULT_PROJECTS_ROOT).replace("\\", "/")
     )
     projects = _normalize_project_catalog(source.get("projects"))
-    project_root = _clean(source.get("project_root")).replace("\\", "/")
+    project_root = _relocate_image_project_path(source.get("project_root")).replace("\\", "/")
     project_id = _clean(source.get("project_id"))
     project_uid = _clean(source.get("project_uid"))
     project_cache_uid = _clean(source.get("project_cache_uid"))
