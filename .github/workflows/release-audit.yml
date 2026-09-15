@@ -117,6 +117,7 @@ jobs:
             "HMB_VideoPicker_Shared_Maya_RoundTrip_Regression.py",
             "HMB_Video_Tools_Engine_Regression.py",
             "HMB_Seedance_Gateway_Recovery_Regression.py",
+            "HMB_Seedance_Error_Details_Regression.py",
             "HMB_Seedance_Submission_Identity_Regression.py",
               "HMB_Seedance_Native_Save_Regression.py",
             "HMB_Seedance_Reset_Delete_Fresh_State_Regression.py",
@@ -311,6 +312,7 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Preserves sanitized Broker/provider failure reasons and request IDs in Generator status and saved diagnostics, including HTTP errors and same-task Refresh, without changing rendering, retry, Reset, or Shot routing behavior.",
             "- Reopening a workflow restores the saved Generator task and exact saved video; discarded newer local recovery journals never replace that snapshot or attach a different render to it. Explicit Refresh keeps the saved/live task ID.",
             "- Moves the ImageAsset production catalog to //192.168.200.19/v/projects/Ai_Ct_image and automatically rebases saved paths under the retired share, preserving Shot selections, asset identities, ordering, and other custom roots.",
             "- Adds Picker Near (unchanged default), Middle, and Whole-shot Far Depth ranges, shown only when Depth is enabled, plus expandable per-mesh color assignment and shared eye pass-through controls.",

@@ -1102,8 +1102,85 @@ _DATA_URI_PATTERN = re.compile(
     re.DOTALL,
 )
 
+_BROKER_ERROR_DETAIL_LIMIT = 3000
+_BROKER_ERROR_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(\b(?:authorization|proxy[-_ ]authorization|api[-_ ]?key|provider[-_ ]?key|"
+    r"access[-_ ]key[-_ ]id|secret[-_ ]access[-_ ]key|access[-_ ]token|refresh[-_ ]token|"
+    r"client[-_ ]secret|key|token|secret|password|passwd|credential|cookie|signature)"
+    r"\b[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"
+)
+_BROKER_ERROR_FIELDS = frozenset({
+    "error", "errors", "detail", "details", "message", "msg", "reason", "code", "error_code", "type",
+    "param", "parameter", "field", "loc", "request_id", "requestid",
+})
+
+
+def _broker_safe_error_text(value: Any, *, secret: str = "") -> str:
+    """Bounded diagnostic text, not an executable/raw provider response."""
+
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return ""
+    text = str(value)
+    # Never truncate in the middle of a secret before redacting it.
+    if len(text) > 64 * 1024:
+        return "[Oversized server detail omitted]"
+    if secret:
+        text = text.replace(secret, "[REDACTED]")
+    text = _BEARER_PATTERN.sub("Bearer [REDACTED]", text)
+    text = re.sub(r"(?i)\bBasic\s+[A-Za-z0-9+/=]+", "Basic [REDACTED]", text)
+    # Error URLs may contain credentials in userinfo, query, fragment or path.
+    text = re.sub(r"(?i)\b(?:https?|s3|tos)://[^\s\"'<>]+", "[URL REDACTED]", text)
+    text = re.sub(r"(?i)\bdata:[^\s\"'<>]+", "[MEDIA DATA REDACTED]", text)
+    text = re.sub(r"(?im)\b(?:authorization|proxy-authorization|set-cookie|cookie)\s*:\s*[^\r\n]+",
+                  "[AUTH HEADER REDACTED]", text)
+    text = _BROKER_ERROR_SECRET_ASSIGNMENT.sub(r"\1[REDACTED]", text)
+    text = re.sub(r"\b(?:ib_|sk-|AKIA|ASIA)[A-Za-z0-9_-]{16,}\b", "[REDACTED]", text)
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", " ", text)
+    text = " ".join(text.split())
+    if len(text) > _BROKER_ERROR_DETAIL_LIMIT:
+        text = text[:_BROKER_ERROR_DETAIL_LIMIT] + " [truncated]"
+    return text
+
+
+def _broker_error_details(response: Any, *, secret: str = "") -> str:
+    """Keep failure reasons/field paths, excluding credentials and input echoes."""
+
+    if not isinstance(response, dict):
+        return ""
+    parts: list[str] = []
+
+    def visit(value: Any, label: str, depth: int = 0) -> None:
+        if depth > 5 or len(parts) >= 16:
+            return
+        if isinstance(value, dict):
+            for key, item in list(value.items())[:64]:
+                if str(key).lower() in _BROKER_ERROR_FIELDS:
+                    visit(item, f"{label}.{key}", depth + 1)
+        elif isinstance(value, list):
+            for item in value[:16]:
+                visit(item, label, depth + 1)
+        elif isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+                try:
+                    nested = json.loads(value) if len(value) <= 64 * 1024 else None
+                except (ValueError, RecursionError):
+                    nested = None
+                if isinstance(nested, (dict, list)):
+                    visit(nested, label, depth + 1)
+                    return
+            safe = _broker_safe_error_text(value, secret=secret)
+            if safe:
+                parts.append(f"{label}: {safe}")
+
+    for field in ("error", "errors", "detail", "details", "message", "error_code", "code", "request_id"):
+        if field in response:
+            visit(response[field], field)
+    return _broker_safe_error_text("; ".join(parts))
+
+
 class _BrokerError(RuntimeError):
-    """Safe Broker failure without response bodies or credential values."""
+    """Broker failure with sanitized diagnostics, never raw bodies/credentials."""
 
     def __init__(
         self,
@@ -1613,7 +1690,7 @@ class _HMBAIBrokerBridge:
 
     @classmethod
     def _safe_http_error_message(
-        cls, exc: urllib.error.HTTPError, *, body: bytes | None = None
+        cls, exc: urllib.error.HTTPError, *, body: bytes | None = None, secret: str = ""
     ) -> str:
         status_code = int(getattr(exc, "code", 0) or 0)
         if body is None:
@@ -1633,6 +1710,13 @@ class _HMBAIBrokerBridge:
             else ""
         )
         lowered = body.decode("utf-8", "replace").casefold()
+        summary = cls._http_error_summary(status_code, error_code, lowered)
+        safe_detail = _broker_error_details(detail, secret=secret)
+        return summary + ("\nServer details: " + safe_detail if safe_detail else "")
+
+    @staticmethod
+    def _http_error_summary(status_code: int, error_code: str, lowered: str) -> str:
+        # Classification and submission/retry decisions remain unchanged.
         if status_code == 413 or error_code == "request_body_too_large" or any(
             token in lowered
             for token in ("request body", "too large", "payload", "너무 큽")
@@ -1739,7 +1823,11 @@ class _HMBAIBrokerBridge:
                 with suppress(Exception):
                     _broker_clear_token()
                 raise _BrokerAuthenticationError(
-                    "FN AI Broker login has expired.", status_code=401
+                    "FN AI Broker login has expired.\n"
+                    + self._safe_http_error_message(
+                        exc, secret=headers["Authorization"][7:]
+                    ),
+                    status_code=401,
                 ) from exc
             error_body: bytes | None = None
             if (
@@ -1775,7 +1863,9 @@ class _HMBAIBrokerBridge:
                     terminal_result["_http_status"] = int(exc.code)
                     return terminal_result
             raise _BrokerError(
-                self._safe_http_error_message(exc, body=error_body),
+                self._safe_http_error_message(
+                    exc, body=error_body, secret=headers["Authorization"][7:]
+                ),
                 status_code=exc.code,
                 # A gateway/server failure does not prove that an idempotent
                 # create was never accepted upstream. Preserve the provisional
@@ -8337,6 +8427,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             task["provider_task_registered"] = bool(
                 str(response.get("provider_job_id") or "").strip()
             )
+        if status in TERMINAL_FAILURE_STATUSES or response.get("error") or response.get("detail"):
+            safe_detail = _broker_error_details(response)
+            if safe_detail:
+                task["error_details"] = safe_detail
         if video_url or last_frame_url:
             task["content"] = {}
             if video_url:
@@ -8356,6 +8450,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         ]
         if error_code:
             parts.append(f"Broker error code: {error_code}.")
+        safe_detail = _broker_safe_error_text(task.get("error_details"))
+        if safe_detail:
+            parts.append("Server details: " + safe_detail)
         if error_code == "submission_unknown":
             parts.append(
                 "Provider acceptance could not be confirmed because no provider "
@@ -8374,6 +8471,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     @staticmethod
     def _broker_unconfirmed_task_message(task: dict[str, Any], generation_id: str) -> str:
+        safe_detail = _broker_safe_error_text(task.get("error_details"))
         return (
             f"FN AI Broker task {generation_id} still needs provider confirmation "
             f"({task.get('error_code') or 'submission_unknown'}). The Broker ended "
@@ -8381,7 +8479,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "The task ID was retained. Use Status > Refresh / Retrieve Result for "
             "this same task, or ask the Broker administrator to reconcile its provider "
             "record. Do not delete the node or replace the task ID to retry."
-        )
+        ) + ("\nServer details: " + safe_detail if safe_detail else "")
 
     def _set_broker_task_outputs(
         self,
@@ -8409,6 +8507,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         ):
             if name in task:
                 provider_response[name] = task[name]
+        safe_detail = _broker_safe_error_text(task.get("error_details"))
+        if safe_detail:
+            provider_response["error_details"] = safe_detail
         self.parameter_output_values["provider_response"] = provider_response
         self._publish_generation_preview(
             self._generation_preview_phase_for_status(status),
