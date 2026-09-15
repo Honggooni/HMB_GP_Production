@@ -3569,6 +3569,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return checkpoint
         changed = False
         with _RECOVERY_JOURNAL_OWNERS_GUARD:
+            if bool(getattr(self, "_hmb_node_deleted", False)):
+                return checkpoint
             owner = _RECOVERY_JOURNAL_OWNERS.get(identity)
             if owner is not None and owner is not self and owner._runtime_node_is_live(require_registered=True):
                 checkpoint = dict(checkpoint, journal_id=str(uuid4()))
@@ -3932,6 +3934,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         allowed here. Required persistence still precedes the billable POST.
         """
 
+        if bool(getattr(self, "_hmb_node_deleted", False)):
+            if required:
+                raise RuntimeError("The Generator was deleted or reset. No new render was submitted.")
+            return False
         checkpoint = self._generation_recovery_state()
         if not checkpoint["task_id"] and required:
             raise RuntimeError(
@@ -3944,17 +3950,25 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         for attempt in range(1, attempts + 1):
             try:
                 async with _workflow_checkpoint_lock():
+                    if bool(getattr(self, "_hmb_node_deleted", False)):
+                        raise RuntimeError("The Generator was deleted or reset; its recovery journal is retired.")
                     checkpoint = self._generation_recovery_state()
                     if not checkpoint["journal_id"]:
                         checkpoint["journal_id"] = str(uuid4())
                         self.set_parameter_value(SEEDANCE_RECOVERY_PARAMETER, checkpoint, emit_change=False)
-                    await asyncio.to_thread(_write_seedance_recovery_journal, checkpoint)
+                    await asyncio.to_thread(self._write_live_generation_recovery_journal, checkpoint)
+                if bool(getattr(self, "_hmb_node_deleted", False)):
+                    raise RuntimeError("The Generator was deleted or reset; its recovery journal is retired.")
                 self._hmb_last_saved_recovery_revision = int(
                     checkpoint.get("revision") or 0
                 )
                 return True
             except Exception as exc:
                 failure = exc
+                if bool(getattr(self, "_hmb_node_deleted", False)):
+                    if required:
+                        raise RuntimeError("The Generator was deleted or reset. No new render was submitted.") from exc
+                    return False
                 if attempt < attempts:
                     await asyncio.sleep(0.05 * attempt)
 
@@ -3971,6 +3985,40 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "No render was submitted. Check local recovery-folder write access and disk space, then retry."
             ) from failure
         return False
+
+    def _write_live_generation_recovery_journal(self, checkpoint: dict[str, Any]) -> None:
+        """Reject queued writes from a deleted/Reset instance.
+
+        Native Reset creates a separate journal identity. Its previous node
+        cannot resume publishing recovery state after replacement.
+        """
+        with self._generation_refresh_lock:
+            if bool(getattr(self, "_hmb_node_deleted", False)):
+                raise RuntimeError("The Generator was deleted or reset; its recovery journal is retired.")
+            _write_seedance_recovery_journal(checkpoint)
+
+    def _retire_deleted_generation_recovery(self) -> None:
+        """Detach only this deleted instance. Never cancel a server task or delete media.
+
+        Native Reset deletes the old instance too, so Reset and Delete/New have
+        exactly the same local retirement semantics, even for uncertain jobs.
+        The host also calls this hook when closing a whole workflow: keep its
+        disk checkpoint for normal reopen. A newly created node has a new UUID
+        and never adopts that checkpoint by node name or Shot number.
+        """
+        identity = _seedance_uuid_text(getattr(self, "_hmb_recovery_journal_owner_id", ""))
+        with _RECOVERY_JOURNAL_OWNERS_GUARD:
+            owns_journal = bool(identity and _RECOVERY_JOURNAL_OWNERS.get(identity) is self)
+            if owns_journal:
+                _RECOVERY_JOURNAL_OWNERS.pop(identity, None)
+        self._hmb_recovery_journal_owner_id = ""
+        self._hmb_recovery_journal_checked_id = ""
+        self._hmb_generation_recovery_restore_fingerprint = None
+        self._hmb_last_saved_recovery_revision = 0
+        for key in ("generation_id", "generation_status"):
+            self.parameter_output_values[key] = ""
+        self.parameter_output_values["provider_response"] = None
+        self._hmb_generation_preview_state = _seedance_generation_preview_value()
 
     @staticmethod
     def _generation_artifact_is_present(value: Any) -> bool:
@@ -9809,6 +9857,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 with suppress(Exception):
                     task.cancel()
             self._detached_submission_tasks.clear()
+            self._retire_deleted_generation_recovery()
             # Release this exact (channel_uuid, shot_uuid) claim while the host
             # still exposes the deleted object as a same-flow anchor.  The
             # shared helper excludes `_hmb_node_deleted`, so surviving Seedance

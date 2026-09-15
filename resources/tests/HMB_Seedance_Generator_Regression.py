@@ -32,8 +32,11 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import (
+    CreateNodeResultSuccess,
     DeleteNodeRequest,
     DeleteNodeResultSuccess,
+    ResetNodeToDefaultsRequest,
+    ResetNodeToDefaultsResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     DeleteWorkflowRequest,
@@ -1730,6 +1733,63 @@ def assert_seedance_delete_recreate_shot1_publication_contract() -> None:
             )
             assert isinstance(deleted_workflow, DeleteWorkflowResultSuccess)
 
+    asyncio.run(scenario())
+
+
+def assert_seedance_native_reset_fresh_recovery_contract() -> None:
+    """Use the stock Reset handler, real delete/rename and HMB constructors.
+
+    Only library discovery is replaced by the source-under-test factory. The
+    actual desktop workflow is untouched: this runs in an isolated process.
+    """
+    async def scenario():
+        GriptapeNodes.EventManager().initialize_queue()
+        stamp = time.time_ns()
+        ensured = GriptapeNodes.handle_request(EnsureWorkflowAndFlowRequest(
+            display_name=f"Reset recovery audit {stamp}", flow_name=f"ResetRecovery_{stamp}",
+        ))
+        assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
+        flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
+        manager = GriptapeNodes.NodeManager()
+        def register(node):
+            node.metadata["library"] = "HMB_GP_Production"
+            flow.add_node(node)
+            GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
+            manager._name_to_parent_flow_name[node.name] = flow.name
+        def factory(request):
+            node = target.HMBSeedanceGeneration(name=request.node_name)
+            register(node)
+            return CreateNodeResultSuccess(node_name=node.name, node_type=type(node).__name__,
+                                           specific_library_name="HMB_GP_Production", parent_flow_name=flow.name,
+                                           result_details="Created source-under-test Generator")
+        try:
+            with tempfile.TemporaryDirectory(prefix="hmb-native-reset-") as temporary, \
+                 mock.patch.object(target, "_seedance_recovery_journal_path", side_effect=lambda key: Path(temporary) / f"{key}.json"), \
+                 mock.patch.object(manager, "on_create_node_request", side_effect=factory), \
+                 mock.patch.object(target._HMBAIBrokerBridge, "_request_json", side_effect=AssertionError("Reset contacted server")):
+                for status in ("running", "submission_unknown", "failed", "succeeded"):
+                    old = target.HMBSeedanceGeneration(name=f"NativeReset_{status}_{stamp}")
+                    register(old)
+                    old._set_generation_recovery_checkpoint(stage="accepted", task_id=f"job-{status}",
+                        task_identity="broker_task", status=status, terminal=status in ("failed", "succeeded"))
+                    assert await old._force_save_generation_recovery_checkpoint(required=True, reason="reset audit")
+                    identity = old._generation_recovery_state()["journal_id"]
+                    result = manager.on_reset_node_to_defaults_request(ResetNodeToDefaultsRequest(node_name=old.name))
+                    assert isinstance(result, ResetNodeToDefaultsResultSuccess), result
+                    fresh = manager.get_node_by_name(result.node_name)
+                    assert fresh is not old and old._hmb_node_deleted
+                    assert fresh._generation_recovery_state()["journal_id"] != identity
+                    assert fresh._generation_recovery_state()["task_id"] == ""
+                    assert not fresh._generation_recovery_blocks_new_submission()
+                    assert not fresh.parameter_output_values.get("generation_id")
+                    # Host workflow-close uses the same delete hook; keep its
+                    # checkpoint while a native Reset gets a distinct UUID.
+                    assert target._seedance_recovery_journal_path(identity).exists()
+                    assert not old._runtime_node_is_live(require_registered=True)
+                    assert fresh._runtime_node_is_live(require_registered=True)
+        finally:
+            result = await GriptapeNodes.ahandle_request(DeleteWorkflowRequest(name=ensured.workflow_name))
+            assert isinstance(result, DeleteWorkflowResultSuccess)
     asyncio.run(scenario())
 
 
@@ -4410,6 +4470,7 @@ assert_seedance_recreate_widget_and_list_lifecycle_contract()
 assert_image_asset_single_wire_host_contract()
 assert_video_picker_single_wire_host_contract()
 assert_seedance_delete_recreate_shot1_publication_contract()
+assert_seedance_native_reset_fresh_recovery_contract()
 assert_seedance_dangling_list_delete_live_host_contract()
 assert_payload_and_media_contract()
 assert_seedance_25_model_contract()
