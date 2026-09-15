@@ -134,7 +134,7 @@ async def verify(folder):
     fresh(new(race.name), cp["journal_id"])
 
     # Native workflow close uses the same hook; keep its disk checkpoint so a
-    # normal reopen with its saved UUID can recover. No disk deletion required.
+    # normal reopen restores its saved checkpoint. No disk deletion required.
     denied = new("Read-only retired journal")
     cp = pending(denied, "running")
     with mock.patch.object(Path, "unlink", side_effect=PermissionError("read-only")):

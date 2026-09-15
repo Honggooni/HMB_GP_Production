@@ -805,21 +805,6 @@ def _seedance_recovery_journal_path(journal_id: str) -> Path:
     return root / "HMB_GP_Production" / "generation-recovery" / f"{identity}.json"
 
 
-def _read_seedance_recovery_journal(journal_id: str) -> dict[str, Any] | None:
-    path = _seedance_recovery_journal_path(journal_id)
-    try:
-        with path.open("rb") as stream:
-            raw = stream.read(65_537)
-    except FileNotFoundError:
-        return None
-    if len(raw) > 65_536:
-        raise ValueError("The local recovery journal is oversized.")
-    checkpoint = _seedance_recovery_value(json.loads(raw))
-    if checkpoint["journal_id"] != journal_id:
-        raise ValueError("The local recovery journal identity does not match.")
-    return checkpoint
-
-
 def _write_seedance_recovery_journal(checkpoint: dict[str, Any]) -> None:
     """Atomically persist task metadata only, never a workflow, prompt or key."""
     checkpoint = _seedance_recovery_value(checkpoint)
@@ -2222,7 +2207,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             tuple[Any, ...] | None
         ) = None
         self._hmb_last_saved_recovery_revision = 0
-        self._hmb_recovery_journal_checked_id = ""
         self._hmb_recovery_journal_owner_id = ""
         self._hmb_generation_started_monotonic: float | None = None
         self._hmb_generation_started_at_ms = 0
@@ -3709,25 +3693,21 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         return self._hmb_publish_generated_video_source()
 
     def _generation_recovery_state(self) -> dict[str, Any]:
-        """Return the durable checkpoint, migrating older serialized outputs."""
+        """Use this node's saved/live checkpoint, never newer external state.
+
+        A journal is written independently of native Save. Its newer task may
+        belong to edits explicitly discarded when closing the workflow. The
+        shared UUID identifies a checkpoint lineage, not permission to replace
+        the user's saved task or pair its saved video with a different render.
+        Explicit Refresh still uses the saved/live task ID; legacy serialized
+        outputs below are migrated only from this same node instance.
+        """
 
         checkpoint = _seedance_recovery_value(
             self.get_parameter_value(SEEDANCE_RECOVERY_PARAMETER)
         )
         checkpoint = self._claim_generation_recovery_journal(checkpoint)
         journal_id = checkpoint["journal_id"]
-        if journal_id and self._hmb_recovery_journal_checked_id != journal_id:
-            # A small local read occurs once per hydrated identity, not on each
-            # UI refresh. A normal manual save persists the identity even before
-            # the first render, allowing a newer task checkpoint to be restored.
-            self._hmb_recovery_journal_checked_id = journal_id
-            try:
-                recovered = _read_seedance_recovery_journal(journal_id)
-                if recovered and recovered["updated_at_ms"] > checkpoint["updated_at_ms"]:
-                    checkpoint = recovered
-                    self.set_parameter_value(SEEDANCE_RECOVERY_PARAMETER, checkpoint, emit_change=False)
-            except (OSError, ValueError, TypeError) as exc:
-                logger.warning("Local Seedance recovery journal could not be read (%s).", type(exc).__name__)
         if checkpoint["task_id"]:
             return checkpoint
         if checkpoint["updated_at_ms"]:
@@ -4002,9 +3982,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
         Native Reset deletes the old instance too, so Reset and Delete/New have
         exactly the same local retirement semantics, even for uncertain jobs.
-        The host also calls this hook when closing a whole workflow: keep its
-        disk checkpoint for normal reopen. A newly created node has a new UUID
-        and never adopts that checkpoint by node name or Shot number.
+        The host also calls this hook when closing a whole workflow. Keep the
+        diagnostic disk record, but never load it into a reopened saved node.
+        A newly created node has a new UUID and no prior task or result.
         """
         identity = _seedance_uuid_text(getattr(self, "_hmb_recovery_journal_owner_id", ""))
         with _RECOVERY_JOURNAL_OWNERS_GUARD:
@@ -4012,7 +3992,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if owns_journal:
                 _RECOVERY_JOURNAL_OWNERS.pop(identity, None)
         self._hmb_recovery_journal_owner_id = ""
-        self._hmb_recovery_journal_checked_id = ""
         self._hmb_generation_recovery_restore_fingerprint = None
         self._hmb_last_saved_recovery_revision = 0
         for key in ("generation_id", "generation_status"):

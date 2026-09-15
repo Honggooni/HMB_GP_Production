@@ -38,7 +38,7 @@ async def verify(folder):
         assert len({cp["journal_id"] for cp in saved}) == 5
         # Native copy/paste serializes hidden parameters too. Live copies must
         # fork the recovery file; real reopen after the old node is gone must
-        # keep the original identity and load its newer task metadata.
+        # keep the saved snapshot, never load discarded newer task metadata.
         with mock.patch.object(nodes[0], "_runtime_node_is_live", return_value=True):
             copied = reopen(saved[0])
             assert checkpoint(copied)["journal_id"] != saved[0]["journal_id"]
@@ -53,6 +53,7 @@ async def verify(folder):
         assert context.name == "unsaved:manual-audit" and not file.exists()
         assert context.autosave is False
         await host(SimpleNamespace(action="user_save"))
+        saved_pending = [checkpoint(n) for n in nodes]
         before = (file.read_bytes(), file.stat().st_mtime_ns)
         for i, n in enumerate(nodes):
             n._set_generation_recovery_checkpoint(stage="accepted", task_id=f"job-accepted-{i}", task_identity="broker_task", status="running")
@@ -61,15 +62,18 @@ async def verify(folder):
         assert (file.read_bytes(), file.stat().st_mtime_ns) == before
         for i, cp in enumerate(saved):
             restored = reopen(cp)
-            assert restored._authoritative_existing_generation_id() == f"job-accepted-{i}"
-            assert restored._generation_recovery_blocks_new_submission()
+            assert restored._authoritative_existing_generation_id() == ""
+            assert not restored._generation_recovery_blocks_new_submission()
+            saved_running = reopen(saved_pending[i])
+            assert saved_running._authoritative_existing_generation_id() == f"hmb-stock-{i}"
+            assert saved_running._generation_recovery_blocks_new_submission()
         n = nodes[0]
         n._set_generation_recovery_checkpoint(stage="local_succeeded", task_id="job-accepted-0", task_identity="broker_task", status="succeeded", terminal=True)
         assert await n._force_save_generation_recovery_checkpoint(required=False, reason="local_succeeded")
         assert not reopen(saved[0])._generation_recovery_blocks_new_submission()
         n._clear_generation_recovery_checkpoint()
         assert await n._force_save_generation_recovery_checkpoint(required=False, reason="discard")
-        restored = reopen(saved[0])
+        restored = reopen(checkpoint(n))
         restored.parameter_output_values["generation_id"] = "job-stale-output"
         assert restored._generation_recovery_state()["task_id"] == ""
         assert not restored._generation_recovery_blocks_new_submission()
@@ -112,4 +116,4 @@ with tempfile.TemporaryDirectory(prefix="hmb-stock-save-") as root:
         asyncio.run(verify(folder))
 source = (ROOT / "HMBSeedanceGeneration.py").read_text(encoding="utf-8")
 assert "SaveWorkflowRequest" not in source and "SetWorkflowContextRequest" not in source
-print("HMB native save: PASS (5 nodes, zero host saves, reopen, rerender, clear, isolation, atomic failure)")
+print("HMB native save: PASS (5 nodes, zero host saves, saved-only reopen, discarded journal isolation, rerender, clear, atomic failure)")

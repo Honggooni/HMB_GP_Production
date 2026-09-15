@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from copy import deepcopy
 import io
 import importlib.util
 import json
@@ -1790,6 +1791,135 @@ def assert_seedance_native_reset_fresh_recovery_contract() -> None:
         finally:
             result = await GriptapeNodes.ahandle_request(DeleteWorkflowRequest(name=ensured.workflow_name))
             assert isinstance(result, DeleteWorkflowResultSuccess)
+    asyncio.run(scenario())
+
+
+def assert_seedance_discarded_workflow_snapshot_contract() -> None:
+    """Real host close/reopen must restore the saved result, not a newer journal.
+
+    Snapshot values stand in for the user's manual save. No workflow file,
+    provider request, render, or application config is created by this case.
+    """
+
+    async def scenario() -> None:
+        GriptapeNodes.EventManager().initialize_queue()
+        assert not GriptapeNodes.ContextManager().has_current_workflow()
+        manager = GriptapeNodes.NodeManager()
+        stamp = time.time_ns()
+        current_workflow = None
+
+        def open_node(name: str):
+            nonlocal current_workflow
+            ensured = GriptapeNodes.handle_request(EnsureWorkflowAndFlowRequest(
+                display_name=f"Saved snapshot audit {stamp}",
+                flow_name=f"SavedSnapshot_{stamp}",
+            ))
+            assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
+            current_workflow = ensured.workflow_name
+            flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
+            node = target.HMBSeedanceGeneration(name=name)
+            flow.add_node(node)
+            GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
+            manager._name_to_parent_flow_name[node.name] = flow.name
+            return node
+
+        async def close_workflow() -> None:
+            nonlocal current_workflow
+            if current_workflow is not None:
+                closed = await GriptapeNodes.ahandle_request(
+                    DeleteWorkflowRequest(name=current_workflow)
+                )
+                assert isinstance(closed, DeleteWorkflowResultSuccess), closed
+                current_workflow = None
+                assert not GriptapeNodes.ContextManager().has_current_workflow()
+
+        async def replay(node, key: str, value, *, is_output: bool = False) -> None:
+            restored = await GriptapeNodes.ahandle_request(SetParameterValueRequest(
+                node_name=node.name, parameter_name=key, value=deepcopy(value),
+                initial_setup=True, is_output=is_output,
+            ))
+            assert isinstance(restored, SetParameterValueResultSuccess), (key, restored)
+
+        origin = {
+            "channel_uuid": "11111111-1111-4111-8111-111111111111",
+            "shot_uuid": "22222222-2222-4222-8222-222222222222",
+            "number": 1, "name": "Shot 1",
+            "source_node_instance_id": "33333333-3333-4333-8333-333333333333",
+        }
+        with tempfile.TemporaryDirectory(prefix="hmb-discarded-snapshot-") as temporary, \
+             mock.patch.object(target, "_seedance_recovery_journal_path",
+                               side_effect=lambda key: Path(temporary) / f"{key}.json"), \
+             mock.patch.object(target._HMBAIBrokerBridge, "_request_json",
+                               side_effect=AssertionError("Snapshot reopen contacted the server")):
+            root = Path(temporary)
+            media_a, media_b = root / "saved_A.mp4", root / "discarded_B.mp4"
+            media_a.write_bytes(VALID_MP4_BYTES)
+            media_b.write_bytes(VALID_MP4_BYTES)
+
+            def complete(node, job_id: str, media: Path) -> None:
+                artifact = target.VideoUrlArtifact(value=str(media), name=media.name)
+                node.parameter_output_values.update({
+                    "video_url": artifact, "VIDEO_OUT": artifact,
+                    "generation_id": job_id, "generation_status": "succeeded",
+                    "provider_response": {"id": job_id, "status": "succeeded", "terminal": True},
+                })
+                node._set_generation_recovery_checkpoint(
+                    stage="local_succeeded", task_id=job_id, task_identity="broker_task",
+                    status="succeeded", terminal=True,
+                    params={"_hmb_generation_origin": origin},
+                )
+                assert node._record_completed_video_source(origin, job_id, target.File(str(media)))
+
+            try:
+                for saved_success in (True, False):
+                    name = f"SnapshotGenerator_{stamp}_{saved_success}"
+                    old = open_node(name)
+                    if saved_success:
+                        complete(old, "job-saved-A", media_a)
+                    saved_checkpoint = deepcopy(old.get_parameter_value(target.SEEDANCE_RECOVERY_PARAMETER))
+                    saved_source = deepcopy(old.get_parameter_value(target.GENERATED_VIDEO_SOURCE_PARAMETER))
+                    output_keys = ("video_url", "VIDEO_OUT", "generation_id", "generation_status", "provider_response")
+                    saved_outputs = {key: deepcopy(old.parameter_output_values.get(key)) for key in output_keys}
+                    # The later completion is deliberately NOT in the saved snapshot.
+                    await asyncio.sleep(0.002)
+                    complete(old, "job-discarded-B", media_b)
+                    assert await old._force_save_generation_recovery_checkpoint(required=True, reason="discarded audit")
+                    journal_id = old._generation_recovery_state()["journal_id"]
+                    journal_path = target._seedance_recovery_journal_path(journal_id)
+                    assert json.loads(journal_path.read_text(encoding="utf-8"))["task_id"] == "job-discarded-B"
+                    await close_workflow()
+                    assert old._hmb_node_deleted and not old._runtime_node_is_live(require_registered=True)
+                    assert journal_path.is_file(), "Keep detached task audit; do not erase saved recovery evidence."
+
+                    reopened = open_node(name)
+                    assert reopened is not old and reopened._runtime_node_is_live(require_registered=True)
+                    for key, value in saved_outputs.items():
+                        await replay(reopened, key, value, is_output=True)
+                    await replay(reopened, target.GENERATED_VIDEO_SOURCE_PARAMETER, saved_source)
+                    # Native hydration replays the checkpoint last, after output fields.
+                    await replay(reopened, target.SEEDANCE_RECOVERY_PARAMETER, saved_checkpoint)
+                    reopened._hmb_post_registration_shot_discovery()
+                    reopened._restore_generation_recovery_preview()
+                    assert reopened._generation_recovery_state()["task_id"] == ("job-saved-A" if saved_success else "")
+                    assert not reopened._generation_recovery_blocks_new_submission()
+                    source = reopened._hmb_generated_video_source_snapshot()
+                    if saved_success:
+                        for key in ("video_url", "VIDEO_OUT"):
+                            artifact = reopened.parameter_output_values[key]
+                            assert str(getattr(artifact, "value", artifact)) == str(media_a), (key, artifact)
+                        assert reopened.parameter_output_values["generation_id"] == "job-saved-A"
+                        assert source["path"] == str(media_a) and source["task_id"] == "job-saved-A"
+                        assert all(source[key] == value for key, value in origin.items())
+                    else:
+                        assert not reopened.parameter_output_values.get("video_url")
+                        assert not reopened.parameter_output_values.get("VIDEO_OUT")
+                        assert not reopened.parameter_output_values.get("generation_id")
+                        assert not source
+                    assert media_a.read_bytes() == media_b.read_bytes() == VALID_MP4_BYTES
+                    await close_workflow()
+            finally:
+                await close_workflow()
+
     asyncio.run(scenario())
 
 
@@ -4471,6 +4601,7 @@ assert_image_asset_single_wire_host_contract()
 assert_video_picker_single_wire_host_contract()
 assert_seedance_delete_recreate_shot1_publication_contract()
 assert_seedance_native_reset_fresh_recovery_contract()
+assert_seedance_discarded_workflow_snapshot_contract()
 assert_seedance_dangling_list_delete_live_host_contract()
 assert_payload_and_media_contract()
 assert_seedance_25_model_contract()

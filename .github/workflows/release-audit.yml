@@ -120,6 +120,7 @@ jobs:
             "HMB_Seedance_Submission_Identity_Regression.py",
               "HMB_Seedance_Native_Save_Regression.py",
             "HMB_Seedance_Reset_Delete_Fresh_State_Regression.py",
+            "HMB_Seedance_Discarded_Workflow_Recovery_Regression.py",
             "HMB_Four_Library_Flow_Regression.py",
             "HMB_Three_Library_Flow_Regression.py",
             "HMB_Agent_Policy_Integration_Regression.py",
@@ -310,6 +311,7 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Reopening a workflow restores the saved Generator task and exact saved video; discarded newer local recovery journals never replace that snapshot or attach a different render to it. Explicit Refresh keeps the saved/live task ID.",
             "- Moves the ImageAsset production catalog to //192.168.200.19/v/projects/Ai_Ct_image and automatically rebases saved paths under the retired share, preserving Shot selections, asset identities, ordering, and other custom roots.",
             "- Adds Picker Near (unchanged default), Middle, and Whole-shot Far Depth ranges, shown only when Depth is enabled, plus expandable per-mesh color assignment and shared eye pass-through controls.",
             "- Fixes Picker project-media publication for current and legacy Griptape sidecar APIs, passing the active Engine without retrying writes or changing Maya Depth calculation.",
