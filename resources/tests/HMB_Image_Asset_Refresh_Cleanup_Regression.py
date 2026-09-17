@@ -81,10 +81,14 @@ class RefreshCleanupRegression(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="hmb-refresh-regression-")
         self.addCleanup(self.temporary.cleanup)
-        index_root = patch.object(library, "_ASSET_CATALOG_INDEX_ROOT", Path(self.temporary.name) / "catalog-index")
+        # Windows CI can return an 8.3 TEMP alias (RUNNER~1), while the real
+        # audit resolves it to runneradmin. Use one physical path for fixture
+        # state, fault-injection predicates and backup assertions alike.
+        temporary_root = Path(self.temporary.name).resolve(strict=True)
+        index_root = patch.object(library, "_ASSET_CATALOG_INDEX_ROOT", temporary_root / "catalog-index")
         index_root.start()
         self.addCleanup(index_root.stop)
-        self.root = Path(self.temporary.name) / "ProjectA"
+        self.root = temporary_root / "ProjectA"
         self.root.mkdir()
         self.manifest = self.root / ".json" / library.MANIFEST_NAMES[0]
         self.manifest.parent.mkdir()
