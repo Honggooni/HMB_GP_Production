@@ -1526,7 +1526,7 @@ def _import_record(
             and Path(artifact_name).suffix.casefold() in IMAGE_EXTENSIONS
             else _embedded_extension(reference)
         )
-    elif reference.startswith(("http://", "https://", "blob:")):
+    elif reference.lower().startswith(("http://", "https://", "blob:")):
         media_ref_kind = "url"
         display_reference = reference
         parsed_path = unquote(urlparse(reference).path)
@@ -1539,15 +1539,21 @@ def _import_record(
             resolved = path.resolve()
         except Exception:
             resolved = path
-        if resolved.is_file() and resolved.suffix.casefold() in IMAGE_EXTENSIONS:
+        # File identity must not depend on a transient SMB/mapped-drive outage.
+        # Keep the same canonical path/UID even while thumbnail I/O is unavailable.
+        if resolved.suffix.casefold() in IMAGE_EXTENSIONS and _canonical_import_path(reference):
             media_ref_kind = "path"
             display_reference = str(resolved).replace("\\", "/")
             identity_material = display_reference.casefold()
             image_name = resolved.stem
             extension = resolved.suffix.casefold()
-            width, height = _asset_dimensions(resolved)
-            thumbnail_path = resolved
             media_value = display_reference
+            try:
+                if resolved.is_file():
+                    width, height = _asset_dimensions(resolved)
+                    thumbnail_path = resolved
+            except OSError:
+                pass
         else:
             media_ref_kind = "url" if ":" in reference else "artifact"
             display_reference = reference
@@ -1593,6 +1599,22 @@ def _import_record(
     return record, media_value
 
 
+def _canonical_import_path(value: Any) -> str:
+    text = _clean(value)
+    if not text or "{" in text:
+        return ""
+    if (re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", text)
+        and not re.match(r"^[a-zA-Z]:[\\/]", text)
+        and not text.lower().startswith("file:")):
+        return ""
+    try:
+        return os.path.normpath(os.path.abspath(os.path.expanduser(
+            _decode_file_uri(text)
+        ))).replace("\\", "/").casefold()
+    except (OSError, ValueError):
+        return ""
+
+
 def _normalize_import_input(
     value: Any,
     previous_assets: Sequence[Dict[str, Any]],
@@ -1602,6 +1624,11 @@ def _normalize_import_input(
         for asset in previous_assets
         if isinstance(asset, dict)
         and _clean(asset.get("source_kind")) == "user"
+    }
+    previous_paths = {
+        _canonical_import_path(asset.get("path")): asset
+        for asset in previous.values()
+        if _canonical_import_path(asset.get("path"))
     }
     imports: List[Dict[str, Any]] = []
     media_by_uid: Dict[str, Any] = {}
@@ -1642,6 +1669,12 @@ def _normalize_import_input(
         if imported is None:
             continue
         record, media_value = imported
+        # Saved workflows may contain the old availability-dependent URL UID.
+        # Keep that exact addressed image stable; do not relink by file name.
+        prior_path = previous_paths.get(_canonical_import_path(record.get("path")))
+        if prior_path is not None and record.get("media_ref_kind") == "path":
+            record["source_uid"] = _clean(prior_path.get("source_uid")) or record["source_uid"]
+            record["asset_library_id"] = record["source_uid"]
         uid = record["source_uid"]
         if uid in seen:
             continue
@@ -2392,6 +2425,335 @@ def _read_asset_manifest(root: Path) -> Dict[str, Dict[str, Any]]:
     return overrides
 
 
+def _refresh_manifest_regular_stat(path: Path) -> os.stat_result:
+    """Unlike a best-effort catalog probe, never hide inaccessible/reparse paths."""
+    facts = path.lstat()
+    if stat.S_ISLNK(facts.st_mode) or int(
+        getattr(facts, "st_file_attributes", 0)
+    ) & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
+        raise ValueError(f"Refresh cannot verify a symlink or reparse point: {path}")
+    return facts
+
+
+def _refresh_manifest_document(
+    root: Path,
+) -> tuple[Path | None, bytes, Any, List[Any]]:
+    """Read without creating metadata or silently ignoring a permissions error."""
+    metadata = root / ASSET_METADATA_DIRECTORY_NAME
+    try:
+        metadata_facts = _refresh_manifest_regular_stat(metadata)
+    except FileNotFoundError:
+        metadata_exists = False
+    else:
+        metadata_exists = True
+        if not stat.S_ISDIR(metadata_facts.st_mode):
+            raise ValueError("Refresh requires .json to be a regular directory.")
+    candidates = (
+        [metadata / name for name in MANIFEST_NAMES] if metadata_exists else []
+    ) + [root / name for name in MANIFEST_NAMES]
+    for candidate in candidates:
+        try:
+            facts = _refresh_manifest_regular_stat(candidate)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(facts.st_mode):
+            raise ValueError(f"Refresh manifest is not a regular file: {candidate}")
+        if facts.st_size > 2 * 1024 * 1024:
+            raise ValueError("Refresh manifest exceeds 2 MiB.")
+        original = candidate.read_bytes()
+        if len(original) > 2 * 1024 * 1024:
+            raise ValueError("Refresh manifest exceeds 2 MiB.")
+        payload = json.loads(original.decode("utf-8-sig"))
+        records = payload.get("assets") if isinstance(payload, dict) else payload
+        if not isinstance(records, list) or len(records) > MAX_ASSETS:
+            raise ValueError("Refresh requires a complete, bounded assets list.")
+        return candidate, original, payload, records
+    return None, b"", None, []
+
+
+def _refresh_manifest_relative_path(record: Any) -> str:
+    if not isinstance(record, dict):
+        raise ValueError("Refresh cannot clean a malformed manifest record.")
+    raw = record.get("path") or record.get("relative_path")
+    if not isinstance(raw, str):
+        raise ValueError("Refresh manifest record has no relative image path.")
+    relative = raw.replace("\\", "/")
+    parts = relative.split("/")
+    if (
+        not relative
+        or relative.startswith("/")
+        or ":" in relative
+        or any(
+            not part or part.startswith(".") or part.endswith((".", " "))
+            for part in parts
+        )
+        or Path(relative).suffix.casefold() not in IMAGE_EXTENSIONS
+    ):
+        raise ValueError(f"Refresh cannot verify this manifest image path: {relative}")
+    return relative
+
+
+def _audit_project_manifest_refresh(root: Path) -> Dict[str, Any]:
+    """Explicit Refresh only: compare a stable, fully accessible image inventory.
+
+    Ordinary polling deliberately remains best effort. This separate audit is
+    fail-closed because a missing inventory row alone never authorizes deletion.
+    It does not create folders, rewrite JSON, or read image pixels.
+    """
+    review: Dict[str, Any] = {
+        "project_root": str(root).replace("\\", "/"),
+        "manifest_path": "",
+        "manifest_digest": "",
+        "inventory_digest": "",
+        "missing_records": [],
+        "missing_paths": [],
+        "unregistered_paths": [],
+        "registered_count": 0,
+        "file_count": 0,
+        "missing_count": 0,
+        "unregistered_count": 0,
+        "safe_to_clean": False,
+        "error": "",
+    }
+    try:
+        root = Path(root).expanduser()
+        root_facts = _refresh_manifest_regular_stat(root)
+        if not stat.S_ISDIR(root_facts.st_mode):
+            raise ValueError("Refresh project root is not a regular directory.")
+        root = root.resolve(strict=True)
+        review["project_root"] = root.as_posix()
+        source_path, original, _payload, records = _refresh_manifest_document(root)
+        review["manifest_path"] = source_path.as_posix() if source_path else ""
+        review["manifest_digest"] = hashlib.sha256(original).hexdigest()
+        review["registered_count"] = len(records)
+        registered: Dict[str, tuple[str, Dict[str, Any]]] = {}
+        for record in records:
+            relative = _refresh_manifest_relative_path(record)
+            key = relative.casefold()
+            if key in registered:
+                raise ValueError(f"Refresh found duplicate registration paths: {relative}")
+            registered[key] = (relative, record)
+
+        def directory_identity(facts: os.stat_result) -> tuple[int, int, int, int]:
+            return (facts.st_dev, facts.st_ino, facts.st_mtime_ns, facts.st_ctime_ns)
+
+        directories: Dict[Path, tuple[int, int, int, int]] = {}
+        inventory: Dict[str, tuple[str, int, int, int, int]] = {}
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            facts = _refresh_manifest_regular_stat(directory)
+            if not stat.S_ISDIR(facts.st_mode):
+                raise ValueError(f"Refresh folder changed during inspection: {directory}")
+            directories[directory] = directory_identity(facts)
+            if len(directories) - 1 > MAX_FOLDERS:
+                raise ValueError("Refresh exceeded the complete-folder inspection limit.")
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    entry_facts = _refresh_manifest_regular_stat(path)
+                    # Match the normal catalog's intentional hidden-file scope.
+                    # Registered hidden paths were rejected above, not deleted.
+                    if entry.name.startswith("."):
+                        continue
+                    if stat.S_ISDIR(entry_facts.st_mode):
+                        pending.append(path)
+                        if len(directories) + len(pending) - 1 > MAX_FOLDERS:
+                            raise ValueError("Refresh exceeded the complete-folder inspection limit.")
+                    elif path.suffix.casefold() in IMAGE_EXTENSIONS:
+                        if not stat.S_ISREG(entry_facts.st_mode):
+                            raise ValueError(f"Refresh image is not a regular file: {path}")
+                        relative = path.relative_to(root).as_posix()
+                        key = relative.casefold()
+                        if key in inventory:
+                            raise ValueError(f"Refresh found case-colliding image paths: {relative}")
+                        inventory[key] = (
+                            relative,
+                            entry_facts.st_size,
+                            entry_facts.st_mtime_ns,
+                            entry_facts.st_dev,
+                            entry_facts.st_ino,
+                        )
+                        if len(inventory) > MAX_ASSETS:
+                            raise ValueError("Refresh exceeded the complete-image inspection limit.")
+        review["file_count"] = len(inventory)
+        missing_records: List[Dict[str, Any]] = []
+        missing_paths: List[str] = []
+        for key, (relative, record) in registered.items():
+            if key in inventory:
+                continue
+            # A full successful walk must agree with a direct lookup. A
+            # permission/network error, changed folder, or restored file aborts.
+            try:
+                _refresh_manifest_regular_stat(root.joinpath(*relative.split("/")))
+            except FileNotFoundError:
+                missing_records.append(copy.deepcopy(record))
+                missing_paths.append(relative)
+            else:
+                raise ValueError(f"Refresh image changed during inspection: {relative}")
+        for directory, before in directories.items():
+            after = _refresh_manifest_regular_stat(directory)
+            if not stat.S_ISDIR(after.st_mode) or directory_identity(after) != before:
+                raise ValueError("Project folders changed during Refresh; please refresh again.")
+        after_path, after_bytes, _after_payload, _after_records = _refresh_manifest_document(root)
+        if after_path != source_path or after_bytes != original:
+            raise ValueError("Registration JSON changed during Refresh; please refresh again.")
+        # Final enumeration confirms that the share/root did not disappear
+        # while ENOENT candidates were being checked.
+        with os.scandir(root) as entries:
+            for _entry in entries:
+                pass
+        unregistered = sorted(
+            (row[0] for key, row in inventory.items() if key not in registered),
+            key=str.casefold,
+        )
+        inventory_payload = {
+            "files": [inventory[key] for key in sorted(inventory)],
+            "folders": sorted(
+                directory.relative_to(root).as_posix() for directory in directories
+            ),
+        }
+        review.update({
+            "inventory_digest": hashlib.sha256(
+                json.dumps(inventory_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "missing_records": missing_records,
+            "missing_paths": missing_paths,
+            "unregistered_paths": unregistered,
+            "missing_count": len(missing_paths),
+            "unregistered_count": len(unregistered),
+            "safe_to_clean": True,
+        })
+    except Exception as exc:
+        review["safe_to_clean"] = False
+        review["error"] = str(exc) or type(exc).__name__
+    return review
+
+
+def _clean_project_manifest_refresh(
+    review: Dict[str, Any],
+    is_current: Callable[[], bool],
+) -> Dict[str, Any]:
+    """Remove only confirmed missing registrations; never delete media files."""
+    if not isinstance(review, dict) or review.get("safe_to_clean") is not True:
+        raise ValueError("Refresh inspection is incomplete; no registrations were removed.")
+    root = Path(_clean(review.get("project_root")))
+    if not root.is_absolute() or not _clean(review.get("manifest_path")):
+        raise ValueError("No verified registration JSON is available for cleanup.")
+    if not is_current():
+        raise ValueError("Refresh confirmation expired; please refresh again.")
+    with _asset_manifest_lock(root):
+        with _asset_manifest_process_lock(root):
+            if not is_current():
+                raise ValueError("Refresh confirmation expired while waiting for the project lock.")
+            current = _audit_project_manifest_refresh(root)
+            if current.get("safe_to_clean") is not True:
+                raise ValueError(current.get("error") or "Project inspection could not be completed.")
+            for field in (
+                "project_root", "manifest_path", "manifest_digest", "inventory_digest",
+                "missing_paths", "missing_records",
+            ):
+                if current.get(field) != review.get(field):
+                    raise ValueError("Project files or registration JSON changed; please refresh and confirm again.")
+            missing_keys = {
+                _refresh_manifest_relative_path(record).casefold()
+                for record in current["missing_records"]
+            }
+            if not missing_keys:
+                return {**current, "cleaned_count": 0, "backup_path": ""}
+            manifest_path, original, payload, records = _refresh_manifest_document(root)
+            if (
+                manifest_path is None
+                or manifest_path.as_posix() != current["manifest_path"]
+                or hashlib.sha256(original).hexdigest() != current["manifest_digest"]
+            ):
+                raise ValueError("Registration JSON changed; please refresh again.")
+            remaining = [
+                record for record in records
+                if _refresh_manifest_relative_path(record).casefold() not in missing_keys
+            ]
+            if isinstance(payload, dict):
+                updated: Any = dict(payload)
+                updated["assets"] = remaining
+            else:
+                updated = remaining
+            encoded = (json.dumps(updated, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+            if len(encoded) > 2 * 1024 * 1024:
+                raise ValueError("Updated registration JSON would exceed 2 MiB.")
+            metadata = _asset_metadata_directory(root, create=True)
+            backup = metadata / f"hmb_image_assets.refresh-{time.time_ns()}-{uuid.uuid4().hex}.json.bak"
+            temporary = manifest_path.with_name(f".{manifest_path.name}.refresh-{uuid.uuid4().hex}.tmp")
+            replace_attempted = False
+            try:
+                if not is_current():
+                    raise ValueError("Refresh confirmation expired before cleanup.")
+                with backup.open("xb") as handle:
+                    handle.write(original)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                with temporary.open("xb") as handle:
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                latest_path, latest_bytes, _latest_payload, _latest_records = _refresh_manifest_document(root)
+                if latest_path != manifest_path or latest_bytes != original:
+                    raise ValueError("Registration JSON changed before cleanup; please refresh again.")
+                for relative in current["missing_paths"]:
+                    try:
+                        _refresh_manifest_regular_stat(root.joinpath(*relative.split("/")))
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise ValueError("An image was restored before cleanup; please refresh again.")
+                with os.scandir(root) as entries:
+                    for _entry in entries:
+                        pass
+                if not is_current():
+                    raise ValueError("Refresh confirmation expired before saving; nothing was removed.")
+                replace_attempted = True
+                os.replace(temporary, manifest_path)
+            except Exception as exc:
+                # SMB may commit a rename before its acknowledgement is lost.
+                # Retain rollback bytes whenever the commit outcome is unknown.
+                for staged in ((temporary,) if replace_attempted else (temporary, backup)):
+                    try:
+                        staged.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                if replace_attempted:
+                    raise RuntimeError(
+                        f"Registration cleanup save could not be confirmed. Refresh to verify the current JSON; backup retained: {backup}. {exc}"
+                    ) from exc
+                raise
+            _invalidate_asset_manifest_cache(root)
+            _invalidate_project_cache_uid(root)
+            # Rotate only this feature's own regular backups, never arbitrary
+            # user backup files or legacy manifests. A completed write remains
+            # successful even if a later network outage delays backup pruning.
+            backup_warning = ""
+            try:
+                backups = []
+                with os.scandir(metadata) as entries:
+                    for entry in entries:
+                        if re.fullmatch(r"hmb_image_assets\.refresh-\d+-[0-9a-f]{32}\.json\.bak", entry.name):
+                            candidate = Path(entry.path)
+                            facts = _refresh_manifest_regular_stat(candidate)
+                            if not stat.S_ISREG(facts.st_mode):
+                                raise ValueError("Refresh backup is not a regular file.")
+                            backups.append(candidate)
+                for obsolete in sorted(backups, key=lambda path: path.name, reverse=True)[3:]:
+                    obsolete.unlink()
+            except Exception as exc:
+                backup_warning = f"Registration cleanup completed; older backup pruning was deferred: {exc}"
+            result = _audit_project_manifest_refresh(root)
+            result.update({
+                "cleaned_count": len(missing_keys),
+                "backup_path": backup.as_posix(),
+                "backup_warning": backup_warning,
+            })
+            return result
+
+
 def _scan_project_assets(project_root: Any) -> Dict[str, Any]:
     """Scan one selected project and classify image files with common taxonomy."""
     root_text = _project_root_text(project_root)
@@ -3082,6 +3444,34 @@ def _shot_routing_catalog_identity(
     )
 
 
+def _normalize_asset_refresh_review(value: Any) -> Dict[str, Any]:
+    """Presentation only: cleanup authority is never restored from widget JSON."""
+    source = _parse_mapping(value)
+    token = _clean(source.get("request_id"))[:128]
+    if not token:
+        return {}
+    result = {
+        "request_id": token,
+        "project_root": _clean(source.get("project_root")).replace("\\", "/"),
+        "project_id": _clean(source.get("project_id"))[:256],
+        "status": _clean(source.get("status")) if source.get("status") in (
+            "review", "cleaned", "error"
+        ) else "review",
+        "safe_to_clean": source.get("safe_to_clean") is True,
+        "error": _clean(source.get("error"))[:4096],
+        "backup_path": _clean(source.get("backup_path"))[:4096],
+    }
+    for key in ("registered_count", "file_count", "missing_count",
+                "unregistered_count", "cleaned_count"):
+        result[key] = _non_negative_int(source.get(key))
+    for key in ("missing_paths", "unregistered_paths"):
+        values = source.get(key)
+        result[key] = [
+            _clean(item)[:4096] for item in values if isinstance(item, str) and _clean(item)
+        ][:MAX_ASSETS] if isinstance(values, list) else []
+    return result
+
+
 def _default_state() -> Dict[str, Any]:
     state = {
         "schema": STATE_SCHEMA,
@@ -3118,6 +3508,8 @@ def _default_state() -> Dict[str, Any]:
         "thumbnail_busy": False,
         "asset_registration_request": {},
         "asset_registration_result": {},
+        "asset_refresh_review": {},
+        "asset_cleanup_request": {},
         "disconnect_import_uid": "",
         "warnings": [],
         "error": "",
@@ -3274,6 +3666,14 @@ def _normalize_state(value: Any) -> Dict[str, Any]:
             "asset_registration_result": _normalize_asset_registration_result(
                 source.get("asset_registration_result")
             ),
+            "asset_refresh_review": _normalize_asset_refresh_review(
+                source.get("asset_refresh_review")
+            ),
+            "asset_cleanup_request": {
+                "request_id": _clean(
+                    _parse_mapping(source.get("asset_cleanup_request")).get("request_id")
+                )[:128]
+            } if _clean(_parse_mapping(source.get("asset_cleanup_request")).get("request_id")) else {},
             "disconnect_import_uid": _normalize_disconnect_import_uid(
                 source.get("disconnect_import_uid")
             ),
@@ -4846,10 +5246,8 @@ def _apply_asset_registration(
         if request["source_uid"] not in media_lookup:
             raise ValueError("The external IMAGE_IMPORT_IN payload is no longer available.")
         media_value = media_lookup[request["source_uid"]]
-        authoritative_import = _import_record(
-            media_value,
-            _non_negative_int(source_asset.get("import_index")) or 1,
-        )
+        authoritative_rows, _ = _normalize_import_input([media_value], [source_asset])
+        authoritative_import = (authoritative_rows[0], media_value) if len(authoritative_rows) == 1 else None
         if (
             authoritative_import is None
             or _clean(authoritative_import[0].get("source_uid"))
@@ -5382,6 +5780,7 @@ def _single_import_connection_for_uid(
     incoming_connections: Sequence[Any],
     source_uid: str,
     target_parameter_names: Sequence[str] | None = None,
+    previous_assets: Sequence[Dict[str, Any]] = (),
 ) -> Any:
     """Resolve exactly one single-image IMAGE_IMPORT_IN edge for a card X."""
     requested_uid = _normalize_disconnect_import_uid(source_uid)
@@ -5414,7 +5813,7 @@ def _single_import_connection_for_uid(
             if not readable:
                 unresolved.append(source_node_name)
                 continue
-            imports, _media_by_uid = _normalize_import_input(source_value, [])
+            imports, _media_by_uid = _normalize_import_input(source_value, previous_assets)
         except Exception:
             unresolved.append(source_node_name)
             continue
@@ -5484,6 +5883,7 @@ def _disconnect_import_connection(node: Any, source_uid: str) -> None:
         result.incoming_connections,
         source_uid,
         _image_import_target_parameter_names(node),
+        node._current_state().get("assets", []),
     )
     delete_result = GriptapeNodes.handle_request(
         DeleteConnectionRequest(
@@ -5498,6 +5898,144 @@ def _disconnect_import_connection(node: Any, source_uid: str) -> None:
         raise RuntimeError(
             details or "Griptape could not disconnect the selected external image."
         )
+
+
+def _import_connection_snapshot(node: Any) -> Any:
+    from griptape_nodes.retained_mode.events.connection_events import (
+        ListConnectionsForNodeRequest, ListConnectionsForNodeResultSuccess,
+    )
+    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+    node_name = _clean(getattr(node, "name", ""))
+    if not node_name:
+        raise RuntimeError("The Image Asset node has no graph identity.")
+    result = GriptapeNodes.handle_request(ListConnectionsForNodeRequest(node_name=node_name))
+    if not isinstance(result, ListConnectionsForNodeResultSuccess):
+        raise RuntimeError("IMAGE_IMPORT_IN connections could not be inspected safely.")
+    return result
+
+
+def _remove_import_child_parameter(node: Any, parameter_name: str) -> bool:
+    """Remove only an empty, disconnected child; never its aggregate parent."""
+    from griptape_nodes.retained_mode.events.parameter_events import (
+        RemoveParameterFromNodeRequest, RemoveParameterFromNodeResultSuccess,
+    )
+    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+    name = _clean(parameter_name)
+    if not name or name == IMAGE_IMPORT_PARAMETER:
+        raise RuntimeError("The IMAGE_IMPORT_IN aggregate must not be removed.")
+    if name not in _image_import_target_parameter_names(node):
+        if _get_parameter_obj(node, name) is None:
+            return False  # Already removed by the host's minus-button request.
+        raise RuntimeError("The input is not an IMAGE_IMPORT_IN child.")
+    child = _get_parameter_obj(node, name)
+    if child is None or not _is_image_import_parameter(child):
+        raise RuntimeError("The input no longer belongs to IMAGE_IMPORT_IN.")
+    snapshot = _import_connection_snapshot(node)
+    if any(_clean(getattr(edge, "target_parameter_name", "")) == name
+           for edge in snapshot.incoming_connections) or any(
+        _clean(getattr(edge, "source_parameter_name", "")) == name
+        for edge in getattr(snapshot, "outgoing_connections", [])
+    ):
+        raise RuntimeError("The input is still connected; it was not removed.")
+    if _flatten_import_values(_get_parameter_raw(node, name)):
+        raise RuntimeError("The input still contains media; it was not removed.")
+    result = GriptapeNodes.handle_request(RemoveParameterFromNodeRequest(
+        node_name=_clean(getattr(node, "name", "")), parameter_name=name,
+    ))
+    if not isinstance(result, RemoveParameterFromNodeResultSuccess):
+        raise RuntimeError("Griptape could not remove the empty image input.")
+    if name in _image_import_target_parameter_names(node):
+        raise RuntimeError("The empty image input is still present.")
+    return True
+
+
+def _retire_registered_import_connection(
+    node: Any, source_uid: str, target_parameter_name: str | None = None,
+    *, previous_assets: Sequence[Dict[str, Any]] = (),
+) -> bool:
+    """Disconnect one proven image, verify it, then remove its exact UUID child."""
+    from griptape_nodes.retained_mode.events.connection_events import (
+        DeleteConnectionRequest, DeleteConnectionResultSuccess,
+    )
+    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+    targets = _image_import_target_parameter_names(node)
+    if target_parameter_name:
+        targets &= {_clean(target_parameter_name)}
+    connection = _single_import_connection_for_uid(
+        GriptapeNodes.NodeManager(), _import_connection_snapshot(node).incoming_connections,
+        source_uid, targets, previous_assets,
+    )
+    name = _clean(connection.target_parameter_name)
+    if name == IMAGE_IMPORT_PARAMETER:
+        raise RuntimeError("A list-level image connection cannot be removed as one image input.")
+    previous_guard = bool(getattr(node, "_hmb_import_cleanup_active", False))
+    node._hmb_import_cleanup_active = True
+    try:
+        result = GriptapeNodes.handle_request(DeleteConnectionRequest(
+            source_node_name=connection.source_node_name,
+            source_parameter_name=connection.source_parameter_name,
+            target_node_name=_clean(getattr(node, "name", "")),
+            target_parameter_name=name,
+        ))
+        if not isinstance(result, DeleteConnectionResultSuccess):
+            raise RuntimeError("Griptape could not disconnect the registered image.")
+        return _remove_import_child_parameter(node, name)
+    finally:
+        node._hmb_import_cleanup_active = previous_guard
+
+
+def _capture_import_registration_edges(node: Any, source_uid: str) -> List[tuple[Any, str, str]]:
+    """Capture exact source objects and UUID slots, not mutable display numbers."""
+    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+    captured = []
+    targets = _image_import_target_parameter_names(node) - {IMAGE_IMPORT_PARAMETER}
+    snapshot = _import_connection_snapshot(node)
+    for edge in snapshot.incoming_connections:
+        name = _clean(getattr(edge, "target_parameter_name", ""))
+        if name not in targets:
+            continue
+        try:
+            match = _single_import_connection_for_uid(
+                GriptapeNodes.NodeManager(), [edge], source_uid, {name},
+                node._current_state().get("assets", []),
+            )
+        except RuntimeError:
+            # Multi-image edges must keep their other unregistered inputs.
+            continue
+        captured.append((
+            GriptapeNodes.NodeManager().get_node_by_name(match.source_node_name),
+            _clean(match.source_parameter_name), name,
+        ))
+    return captured
+
+
+def _defer_empty_import_child_cleanup(node: Any, parameter_name: str) -> None:
+    """Wait for a native minus request to finish before pruning a detached slot."""
+    name = _clean(parameter_name)
+    node_ref = weakref.ref(node)
+    host_context = contextvars.copy_context()
+
+    def cleanup() -> None:
+        owner = node_ref()
+        if owner is None or not owner._scan_owner_is_current():
+            return
+        try:
+            _remove_import_child_parameter(owner, name)
+        except Exception as exc:
+            _diagnostic_warning("Empty image input cleanup deferred", exc)
+
+    try:
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        loop = GriptapeNodes.EventManager().event_loop
+        if loop is not None and loop.is_running() and not loop.is_closed():
+            loop.call_soon_threadsafe(host_context.run, cleanup)
+    except Exception as exc:
+        # No worker-thread graph mutation or nested parameter deletion fallback.
+        _diagnostic_warning("Empty image input cleanup unavailable", exc)
 
 
 def _resolved_media_value(media_value: Any) -> str:
@@ -5775,6 +6313,11 @@ def _resolve_selected_assets(
                 "relative_path": relative_path,
                 "media": media_value,
                 "reason": reason,
+                # Only a manifest-backed registration may carry an identity
+                # handover. A frontend-edited alias cannot claim a Prompt row.
+                "import_source_uid": _clean(
+                    (manifest_records or {}).get(relative_path.casefold(), {}).get("import_source_uid")
+                ) if relative_path else "",
             }
             _resolution_cache_put(resolution_cache, cache_key, cached)
         relative_path = _clean(cached.get("relative_path"))
@@ -5798,6 +6341,7 @@ def _resolve_selected_assets(
                 "requested_selection_order": requested_order,
                 "selection_order": len(resolved) + 1,
                 "relative_path": relative_path,
+                "import_source_uid": _clean(cached.get("import_source_uid")),
             }
         )
     warnings = [
@@ -5949,6 +6493,7 @@ def _build_output_payload(
                 "binding_mode": "verified_asset",
                 "order_key": asset["source_uid"],
                 "source_uid": asset["source_uid"],
+                "import_source_uid": _clean(resolved_item.get("import_source_uid")),
                 "source_kind": "project",
                 "asset_library_id": asset["asset_library_id"],
                 "asset_id": asset["asset_id"],
@@ -6054,6 +6599,7 @@ def _shot_asset_metadata(
         "binding_mode": "verified_asset" if verified else "external_image",
         "order_key": source_uid,
         "source_uid": source_uid,
+        "import_source_uid": _clean(resolved_item.get("import_source_uid")) if verified else "",
         "source_kind": _clean(asset.get("source_kind")),
         "asset_project_uid": _clean(asset.get("asset_project_uid")),
         "asset_library_id": _clean(asset.get("asset_library_id")),
@@ -6256,6 +6802,7 @@ def _apply_shot_routing_state_facts(
 _OUTPUT_FINGERPRINT_ASSET_FIELDS = (
     "asset_library_id",
     "source_uid",
+    "import_source_uid",
     "source_kind",
     "asset_project_uid",
     "asset_id",
@@ -7176,6 +7723,7 @@ class HMBImageAssetLibrary(DataNode):
         self._hmb_thumbnail_bridge_syncing = False
         self._hmb_root_syncing = False
         self._hmb_refresh_revision = 0
+        self._hmb_refresh_authority = None
         self._hmb_manifest_poll_received = False
         self._hmb_manifest_poll_pending = False
         self._hmb_last_manifest_poll_nonce = ""
@@ -7713,6 +8261,7 @@ class HMBImageAssetLibrary(DataNode):
         }
 
     def _hmb_adopt_reset_handoff(self, value: Any) -> bool:
+        self._hmb_refresh_authority = None
         """Adopt a predecessor's Shot images without restoring its UI/error state."""
 
         payload = value if isinstance(value, dict) else {}
@@ -8337,6 +8886,7 @@ class HMBImageAssetLibrary(DataNode):
     ) -> Dict[str, Any]:
         state = dict(state)
         state["asset_registration_request"] = {}
+        state["asset_cleanup_request"] = {}
         state["disconnect_import_uid"] = ""
         normalized_state = state if normalized else _normalize_state(state)
         normalized = normalized_state
@@ -9098,6 +9648,7 @@ class HMBImageAssetLibrary(DataNode):
             Dict[str, Any],
         ]
         | None = None,
+        on_published: Callable[[Dict[str, Any]], None] | None = None,
     ) -> Dict[str, Any]:
         """Publish a busy snapshot and run filesystem work off the UI thread.
 
@@ -9239,7 +9790,9 @@ class HMBImageAssetLibrary(DataNode):
                     owner._replace_import_media(media_by_uid)
                 result["scan_busy"] = False
                 result["scan_request_id"] = request_id
-                owner._publish_completed_catalog_scan(result, key)
+                published = owner._publish_completed_catalog_scan(result, key)
+                if on_published is not None:
+                    owner._run_catalog_publication_callback(on_published, published)
             except Exception as exc:
                 _diagnostic_exception("Catalog completion publication failed", exc)
                 with owner._hmb_scan_lock:
@@ -9258,6 +9811,7 @@ class HMBImageAssetLibrary(DataNode):
                                 "scan_base": scan_base,
                                 "scan_import_revision": scan_import_revision,
                                 "result_merger": result_merger,
+                                "on_published": on_published,
                             },
                         )
                 return
@@ -9322,6 +9876,7 @@ class HMBImageAssetLibrary(DataNode):
                         "scan_base": scan_base,
                         "scan_import_revision": scan_import_revision,
                         "result_merger": result_merger,
+                        "on_published": on_published,
                     },
                 )
             # The host loop can become observable shortly after a remount. Use
@@ -9388,10 +9943,22 @@ class HMBImageAssetLibrary(DataNode):
         launch()
         return busy
 
+    def _run_catalog_publication_callback(
+        self, callback: Callable[[Dict[str, Any]], None], published: Dict[str, Any],
+    ) -> None:
+        previous = bool(getattr(self, "_hmb_catalog_completion_active", False))
+        self._hmb_catalog_completion_active = True
+        try:
+            callback(published)
+        finally:
+            self._hmb_catalog_completion_active = previous
+
     def _consume_pending_catalog_scan_result(self) -> bool:
         """Apply a worker result only from a retained-mode/UI callback."""
 
         self._ensure_scan_runtime_state()
+        if bool(getattr(self, "_hmb_catalog_completion_active", False)):
+            return False
         with self._hmb_scan_lock:
             pending = self._hmb_scan_pending_result
             if pending is None:
@@ -9429,7 +9996,10 @@ class HMBImageAssetLibrary(DataNode):
                 self._replace_import_media(media_by_uid)
             result["scan_busy"] = False
             result["scan_request_id"] = request_id
-            self._publish_completed_catalog_scan(result, key)
+            published = self._publish_completed_catalog_scan(result, key)
+            on_published = payload.get("on_published")
+            if callable(on_published):
+                self._run_catalog_publication_callback(on_published, published)
         except Exception as exc:
             _diagnostic_exception("Pending catalog publication failed", exc)
             return False
@@ -9471,6 +10041,7 @@ class HMBImageAssetLibrary(DataNode):
         """Acknowledge a picker edit immediately and discover it off-thread."""
 
         self._hmb_initial_catalog_scan_pending = False
+        self._hmb_refresh_authority = None
         self._ensure_catalog_probe_runtime_state()
         with self._hmb_catalog_probe_lock:
             # A probe belongs to the project snapshot captured when it started.
@@ -9486,6 +10057,8 @@ class HMBImageAssetLibrary(DataNode):
             _project_root_text(root_value) or str(DEFAULT_PROJECTS_ROOT)
         ).replace("\\", "/")
         previous = self._current_state()
+        previous["asset_refresh_review"] = {}
+        previous["asset_cleanup_request"] = {}
         candidate = dict(previous)
         candidate["catalog_root"] = requested_root
         candidate["error"] = ""
@@ -9607,8 +10180,168 @@ class HMBImageAssetLibrary(DataNode):
             # is offline or another client is midway through a bad write.
             return normalized
 
+    def _schedule_project_manifest_refresh(
+        self, state: Dict[str, Any], catalog_root: str, import_value: Any
+    ) -> Dict[str, Any]:
+        """Explicit Refresh only: audit in the worker, never prune implicitly."""
+        self._hmb_refresh_authority = None
+        state = dict(state)
+        state["asset_refresh_review"] = {}
+        token = uuid.uuid4().hex
+        project_root = _project_root_text(state.get("project_root"))
+        report: Dict[str, Any] = {}
+
+        def refresh() -> Any:
+            if project_root:
+                audit = _audit_project_manifest_refresh(Path(project_root))
+                report.update(audit)
+                report.update({
+                    "request_id": token,
+                    "project_uid": _clean(state.get("project_uid")),
+                    "project_id": _clean(state.get("project_id")),
+                    "status": "error" if audit.get("error") else "review",
+                })
+                if audit.get("error"):
+                    # Do not replace a verified catalog with a partial share walk.
+                    return state
+            loaded = _load_project_catalog(catalog_root, state, use_shared_cache=False)
+            if project_root and (
+                _project_root_text(loaded.get("project_root")).casefold() != project_root.casefold()
+                or _clean(loaded.get("project_uid")) != _clean(state.get("project_uid"))
+            ):
+                raise ValueError("The selected project is no longer available; the previous catalog was retained.")
+            return self._merge_captured_imports_into_scan(loaded, import_value)
+
+        def merge(result: Dict[str, Any], base: Dict[str, Any], live: Dict[str, Any]) -> Dict[str, Any]:
+            merged = _merge_async_scan_result_with_live_state(result, base, live)
+            if not project_root:
+                return merged
+            if result.get("error"):
+                report.update({"request_id": token, "project_root": project_root,
+                               "status": "error", "safe_to_clean": False,
+                               "error": _clean(result.get("error"))})
+            same_project = (
+                _project_root_text(merged.get("project_root")).casefold() == project_root.casefold()
+                and _clean(merged.get("project_uid")) == _clean(state.get("project_uid"))
+            )
+            if same_project:
+                merged["asset_refresh_review"] = _normalize_asset_refresh_review(report)
+                if report.get("error"):
+                    merged["error"] = _clean(report["error"])
+                if report.get("safe_to_clean") and not report.get("error"):
+                    # Assigned only after the scheduler's owner/generation guard.
+                    self._hmb_refresh_authority = copy.deepcopy(report)
+            return _normalize_state(merged)
+
+        return self._schedule_catalog_scan(
+            f"refresh:{catalog_root.casefold()}:{_non_negative_int(state.get('refresh_revision'))}",
+            state, refresh, failure_state=state, result_merger=merge,
+        )
+
+    def _schedule_project_manifest_cleanup(
+        self, state: Dict[str, Any], request: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Consume one locally issued review token, then revalidate under lock."""
+        self._ensure_scan_runtime_state()
+        token = _clean(request.get("request_id"))
+        key = f"refresh-cleanup:{token}"
+        if self._hmb_scan_pending_key == key:
+            return self._current_state()
+        authority = getattr(self, "_hmb_refresh_authority", None)
+        valid = (
+            isinstance(authority, dict)
+            and token and token == authority.get("request_id")
+            and authority.get("safe_to_clean") is True
+            and _project_root_text(authority.get("project_root")).casefold()
+            == _project_root_text(state.get("project_root")).casefold()
+            and _clean(authority.get("project_uid")) == _clean(state.get("project_uid"))
+            and self._scan_owner_is_current()
+        )
+        if not valid:
+            failed = dict(state)
+            message = "Refresh this project again before confirming registration cleanup."
+            failed["asset_refresh_review"] = {
+                **dict(state.get("asset_refresh_review") or {}),
+                "request_id": token or uuid.uuid4().hex,
+                "project_root": _clean(state.get("project_root")),
+                "status": "error", "safe_to_clean": False, "error": message,
+            }
+            failed["error"] = message
+            return self._publish_state(failed)
+        confirmed = copy.deepcopy(authority)
+        self._hmb_refresh_authority = None  # Single use; even failure needs a new review.
+        expected_generation = self._hmb_scan_generation + 1
+        report: Dict[str, Any] = dict(confirmed)
+        report["safe_to_clean"] = False
+        captured_import = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
+
+        def is_current() -> bool:
+            if (bool(getattr(self, "_hmb_node_deleted", False))
+                or self._hmb_scan_generation != expected_generation
+                or self._hmb_scan_pending_key != key):
+                return False
+            current = self._current_state()
+            return (
+                _project_root_text(current.get("project_root")).casefold()
+                == _project_root_text(confirmed.get("project_root")).casefold()
+                and _clean(current.get("project_uid")) == _clean(confirmed.get("project_uid"))
+            )
+
+        def cleanup() -> Any:
+            cleaned = _clean_project_manifest_refresh(confirmed, is_current)
+            report.update(cleaned)
+            report.update({"request_id": token, "status": "cleaned", "safe_to_clean": False})
+            if cleaned.get("backup_warning"):
+                report["error"] = "\n".join(filter(None, (
+                    _clean(report.get("error")), _clean(cleaned["backup_warning"])
+                )))
+            if cleaned.get("error"):
+                # The manifest commit succeeded; retain the last usable catalog
+                # if the share became unavailable during post-write verification.
+                return state
+            loaded = _load_project_catalog(
+                state["catalog_root"], state, use_shared_cache=False
+            )
+            if (
+                _project_root_text(loaded.get("project_root")).casefold()
+                != _project_root_text(confirmed.get("project_root")).casefold()
+                or _clean(loaded.get("project_uid")) != _clean(confirmed.get("project_uid"))
+            ):
+                raise ValueError("Registration cleanup completed, but the project became unavailable; the previous catalog was retained.")
+            return self._merge_captured_imports_into_scan(loaded, captured_import)
+
+        def merge(result: Dict[str, Any], base: Dict[str, Any], live: Dict[str, Any]) -> Dict[str, Any]:
+            merged = _merge_async_scan_result_with_live_state(result, base, live)
+            if result.get("error"):
+                report.update({"status": "cleaned" if report.get("cleaned_count") else "error", "safe_to_clean": False,
+                               "error": _clean(result["error"])})
+            merged["asset_refresh_review"] = _normalize_asset_refresh_review(report)
+            if report.get("error"):
+                merged["error"] = _clean(report["error"])
+            return _normalize_state(merged)
+
+        return self._schedule_catalog_scan(
+            key, state, cleanup, failure_state=state, result_merger=merge
+        )
+
     def _apply_widget_state(self, value: Any) -> Dict[str, Any]:
         state = _normalize_state(value)
+        cleanup_request = dict(state.get("asset_cleanup_request") or {})
+        state["asset_cleanup_request"] = {}
+        # A displayed report is not a durable permission to modify a project.
+        # Switching projects invalidates both the report and its private token.
+        authority = getattr(self, "_hmb_refresh_authority", None)
+        if isinstance(authority, dict) and (
+            _project_root_text(authority.get("project_root")).casefold()
+            != _project_root_text(state.get("project_root")).casefold()
+            or _clean(authority.get("project_uid")) != _clean(state.get("project_uid"))
+        ):
+            self._hmb_refresh_authority = None
+        review = state.get("asset_refresh_review") or {}
+        if review and _project_root_text(review.get("project_root")).casefold() != _project_root_text(state.get("project_root")).casefold():
+            state["asset_refresh_review"] = {}
+        if cleanup_request:
+            return self._schedule_project_manifest_cleanup(state, cleanup_request)
         thumbnail_request = dict(state.get("thumbnail_request") or {})
         state["thumbnail_request"] = {}
         manifest_poll_received = bool(self._hmb_manifest_poll_received)
@@ -9694,6 +10427,15 @@ class HMBImageAssetLibrary(DataNode):
                 IMAGE_IMPORT_PARAMETER,
             )
             captured_import_media = dict(self._hmb_import_media_by_uid)
+            cleanup_edges: List[tuple[Any, str, str]] = []
+            cleanup_capture_error = ""
+            if _clean(request_snapshot.get("source_kind")) == "user":
+                try:
+                    cleanup_edges = _capture_import_registration_edges(
+                        self, _clean(request_snapshot.get("source_uid")),
+                    )
+                except Exception as exc:
+                    cleanup_capture_error = str(exc)
 
             def register_and_patch() -> Any:
                 registered = _apply_asset_registration(
@@ -9704,6 +10446,62 @@ class HMBImageAssetLibrary(DataNode):
                 if not _flatten_import_values(captured_import_value):
                     return registered
                 return _merge_import_input(registered, captured_import_value)
+
+            cleanup_finished = False
+
+            def finish_registration(published: Dict[str, Any]) -> None:
+                nonlocal cleanup_finished
+                if cleanup_finished:
+                    return
+                cleanup_finished = True
+                result = dict(published.get("asset_registration_result") or {})
+                if (not result.get("ok")
+                    or _clean(result.get("request_id")) != _clean(request_snapshot.get("request_id"))
+                    or _clean(request_snapshot.get("source_kind")) != "user"
+                    or not self._scan_owner_is_current()):
+                    return
+                # Publication above transfers every Shot and its authored Prompt
+                # row before any connection callback can retire the live import.
+                warnings = []
+                if cleanup_capture_error:
+                    warnings.append("The registered image is saved; input cleanup was unavailable.")
+                try:
+                    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+                    for source_node, source_parameter, target_name in cleanup_edges:
+                        try:
+                            # A changed/replaced connection during a slow Add is
+                            # newer user intent; never delete it by display index.
+                            snapshot = _import_connection_snapshot(self)
+                            current = [edge for edge in snapshot.incoming_connections
+                                       if _clean(getattr(edge, "target_parameter_name", "")) == target_name]
+                            if not current:
+                                _remove_import_child_parameter(self, target_name)
+                                continue
+                            if (len(current) != 1
+                                or GriptapeNodes.NodeManager().get_node_by_name(current[0].source_node_name) is not source_node
+                                or _clean(current[0].source_parameter_name) != source_parameter):
+                                warnings.append("An input changed during Add and was left connected.")
+                                continue
+                            _retire_registered_import_connection(
+                                self, _clean(request_snapshot.get("source_uid")), target_name,
+                                previous_assets=state.get("assets", []),
+                            )
+                        except Exception as exc:
+                            warnings.append(f"Registered image saved; input cleanup: {exc}")
+                    if not cleanup_edges and not cleanup_capture_error and _flatten_import_values(
+                        _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
+                    ):
+                        warnings.append("A shared/multi-image input was retained to preserve its other images.")
+                except Exception as exc:
+                    warnings.append(f"Registered image saved; input cleanup: {exc}")
+                if warnings:
+                    state_now = dict(self._current_state())
+                    result["message"] = " ".join(filter(None, (
+                        _clean(result.get("message")), *dict.fromkeys(warnings),
+                    )))
+                    state_now["asset_registration_result"] = result
+                    self._publish_state(state_now)
 
             return self._schedule_catalog_scan(
                 (
@@ -9721,6 +10519,7 @@ class HMBImageAssetLibrary(DataNode):
                         request_snapshot,
                     )
                 ),
+                on_published=finish_registration,
             )
         refresh_requested = _non_negative_int(
             state.get("refresh_revision")
@@ -9740,6 +10539,8 @@ class HMBImageAssetLibrary(DataNode):
             IMAGE_IMPORT_PARAMETER,
         )
         if requested_catalog.casefold() != current_catalog.casefold():
+            self._hmb_refresh_authority = None
+            state["asset_refresh_review"] = {}
             return self._schedule_catalog_scan(
                 f"catalog:{requested_catalog.casefold()}",
                 state,
@@ -9753,17 +10554,8 @@ class HMBImageAssetLibrary(DataNode):
                 },
             )
         if refresh_requested:
-            return self._schedule_catalog_scan(
-                f"refresh:{requested_catalog.casefold()}:{_non_negative_int(state.get('refresh_revision'))}",
-                state,
-                lambda: self._merge_captured_imports_into_scan(
-                    _load_project_catalog(
-                        requested_catalog,
-                        state,
-                        use_shared_cache=False,
-                    ),
-                    captured_import_value,
-                ),
+            return self._schedule_project_manifest_refresh(
+                state, requested_catalog, captured_import_value
             )
         requested_path = _clean(state.get("project_root")).replace("\\", "/")
         selected_record = next(
@@ -10130,11 +10922,17 @@ class HMBImageAssetLibrary(DataNode):
                 self._apply_import_value(
                     _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
                 )
+                if (not bool(getattr(self, "_hmb_import_cleanup_active", False))
+                    and _clean(getattr(target_parameter, "name", "")) != IMAGE_IMPORT_PARAMETER):
+                    # A manually severed wire retires its empty UUID slot too.
+                    # The native list reindexes labels without renaming survivors.
+                    _defer_empty_import_child_cleanup(self, target_parameter.name)
         except Exception as exc:
             _diagnostic_exception("Image import disconnect synchronization failed", exc)
         return result
 
     def after_deserialize(self, *args: Any, **kwargs: Any) -> Any:
+        self._hmb_refresh_authority = None
         result = None
         try:
             parent = getattr(super(), "after_deserialize", None)
@@ -10171,6 +10969,8 @@ class HMBImageAssetLibrary(DataNode):
         self._hmb_initial_catalog_scan_pending = False
         self._hmb_fresh_registration_scan_key = ""
         saved_state = dict(self._current_state())
+        saved_state["asset_refresh_review"] = {}
+        saved_state["asset_cleanup_request"] = {}
         saved_assets: List[Dict[str, Any]] = []
         retired_thumbnail_url = False
         for raw_asset in saved_state.get("assets", []):

@@ -201,9 +201,16 @@ try:
         )
         refresh_branch = apply_source[apply_source.index("if refresh_requested:") :]
         refresh_branch = refresh_branch[: refresh_branch.index("requested_path =")]
-        assert "_load_project_catalog(" in refresh_branch
-        assert "use_shared_cache=False" in refresh_branch
+        assert "_schedule_project_manifest_refresh(" in refresh_branch
+        refresh_worker = inspect.getsource(
+            asset_library.HMBImageAssetLibrary._schedule_project_manifest_refresh
+        )
+        assert "_load_project_catalog(" in refresh_worker
+        assert "use_shared_cache=False" in refresh_worker
+        assert "_audit_project_manifest_refresh(" in refresh_worker
+        assert "_clean_project_manifest_refresh(" not in refresh_worker
         assert "_read_catalog_index" not in refresh_branch
+        assert "_read_catalog_index" not in refresh_worker
         process_source = inspect.getsource(asset_library.HMBImageAssetLibrary.process)
         assert process_source.index("_read_catalog_index(") < process_source.index(
             "self._load_catalog("

@@ -787,7 +787,7 @@ const selectableAsset = (id, selected = false, order = 0, extra = {}) => ({
   ...extra,
 });
 
-// Foreground catalog work is a 60-card page. Selected assets take thumbnail
+// Foreground catalog work defaults to an 80-card page. Selected assets take thumbnail
 // priority even when they live outside that page, and browser-safe media does
 // not enter the hydration queue.
 const thumbnailWindowState = assetWidget.hmbNormalizeImageAssetState({
@@ -805,9 +805,9 @@ const thumbnailWindowState = assetWidget.hmbNormalizeImageAssetState({
         : {},
   )),
 });
-assert.equal(assetWidget.hmbImageAssetCatalogWindow(thumbnailWindowState).rendered.length, 60);
+assert.equal(assetWidget.hmbImageAssetCatalogWindow(thumbnailWindowState).rendered.length, 70);
 assert.equal(assetWidget.hmbImageAssetCatalogWindow(thumbnailWindowState, 60, 60).rendered.length, 10);
-const thumbnailWindowIds = assetWidget.hmbImageAssetThumbnailRequestIds(thumbnailWindowState);
+const thumbnailWindowIds = assetWidget.hmbImageAssetThumbnailRequestIds(thumbnailWindowState, 60);
 assert.deepEqual(
   thumbnailWindowIds.slice(0, 2),
   ["thumbnail-window-65", "thumbnail-window-69"],

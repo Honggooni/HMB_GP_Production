@@ -34,6 +34,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: Install pinned widget browser-test runtime
+        shell: pwsh
+        run: |
+          npm install --no-save --package-lock=false "playwright@1.62.1"
+          if ($LASTEXITCODE -ne 0) { throw "Could not install the pinned browser-test runtime." }
+          npx playwright install chromium
+          if ($LASTEXITCODE -ne 0) { throw "Could not install the browser-test Chromium." }
+          $browser = node -p "require('playwright').chromium.executablePath()"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "$browser")) { throw "Browser-test Chromium is unavailable." }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_IMAGE_ASSET_TEST_BROWSER=$browser"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_PICKER_TEST_BROWSER=$browser"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_PICKER_REQUIRE_BROWSER=1"
       - name: Resolve validated release metadata
         id: release_metadata
         shell: pwsh
@@ -146,6 +158,10 @@ jobs:
             "HMB_Image_Asset_Resolved_Selection_Regression.py",
             "HMB_Prompt_No_Loss_Connection_Regression.py",
             "HMB_Image_Asset_Registration_Regression.py",
+            "HMB_Image_Asset_Import_Child_Cleanup_Regression.py",
+            "HMB_Image_Asset_Disconnect_Regression.py",
+            "HMB_Image_Asset_Refresh_Cleanup_Regression.py",
+            "HMB_Prompt_Registration_Identity_Regression.py",
             "HMB_Image_Asset_Background_Mutation_Regression.py",
             "HMB_Image_Asset_Server_Sharing_Regression.py",
             "HMB_Image_Asset_Process_Lock_Regression.py",
@@ -204,6 +220,9 @@ jobs:
             "HMB_Singleton_Reset_Lifecycle_Regression.py",
             "HMB_Singleton_Reset_Media_Preservation_Regression.py",
             "HMB_VideoPicker_Asset_Catalog_Regression.py",
+            "HMB_VideoPicker_Delete_Lifecycle_Regression.py",
+            "HMB_VideoPicker_Staged_Import_Regression.py",
+            "HMB_VideoPicker_Staged_Import_Host_Regression.py",
             "HMB_VideoPicker_Five_Shot_Deletion_Permutation_Regression.py",
             "HMB_VideoPicker_Five_Shot_Output_Cohesion_Regression.py",
             "HMB_VideoPicker_Live_Output_Regression.py",
@@ -312,6 +331,10 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Registers ImageAsset imports without losing authored Prompt fields or Shot references, then removes the exact individual input connection and empty slot; manual disconnect compacts remaining inputs without deleting media.",
+            "- Keeps unregistered image usage optional, stabilizes file identities across temporary share outages, displays 80 images per page, and unifies expanded image-import handle indicators.",
+            "- Adds explicit ImageAsset Refresh review and confirmed registration-only cleanup with backups; files and Shot selections are preserved.",
+            "- Shows Picker import loading cards before background media work, improves cold-mount readiness, and previews total frames and duration before concatenation output.",
             "- Preserves sanitized Broker/provider failure reasons and request IDs in Generator status and saved diagnostics, including HTTP errors and same-task Refresh, without changing rendering, retry, Reset, or Shot routing behavior.",
             "- Reopening a workflow restores the saved Generator task and exact saved video; discarded newer local recovery journals never replace that snapshot or attach a different render to it. Explicit Refresh keeps the saved/live task ID.",
             "- Moves the ImageAsset production catalog to //192.168.200.19/v/projects/Ai_Ct_image and automatically rebases saved paths under the retired share, preserving Shot selections, asset identities, ordering, and other custom roots.",

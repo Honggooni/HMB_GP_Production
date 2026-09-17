@@ -327,8 +327,10 @@ assert next(
 )["versionInfo"] == RELEASE_VERSION
 assert "http://192.168.203.245:8080" in security_policy
 assert "Seedance 생성 Broker 내부망 예외" in security_policy
-assert "Agent 정책 Broker" in security_policy
-assert "서명 정책 조회나 정책 본문 전달에는 적용되지 않습니다" in security_policy
+assert "로컬 DAT의 서명을 검증해 읽습니다" in security_policy
+assert "Broker를 통한 정책 다운로드는 사용하지 않습니다" in security_policy
+assert "승인 DAT를 런타임 패키지에 함께 포함합니다" in security_policy
+assert "비밀 정보의 암호화를 의미하지 않습니다" in security_policy
 assert "임의의 외부 HTTP 주소" in security_policy
 workflow_text = (ROOT / ".github" / "workflows" / "release-audit.yml").read_text(
     encoding="utf-8"

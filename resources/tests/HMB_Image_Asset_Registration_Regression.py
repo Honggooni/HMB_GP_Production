@@ -264,6 +264,19 @@ try:
     assert copied_asset["selected"] is True
     assert copied_asset["selection_order"] == 1
     assert copied_asset["import_source_uid"] == imported_asset["source_uid"]
+    registration_output = asset_library._build_output_payload(imported_registered)
+    registered_output = next(item for item in registration_output["verified_assets"]
+                             if item["source_uid"] == copied_asset["source_uid"])
+    assert registered_output["import_source_uid"] == imported_asset["source_uid"]
+    # Handover comes from the durable manifest, never a modified widget alias.
+    tampered_alias = deepcopy(imported_registered)
+    for item in tampered_alias["assets"]:
+        if item["source_uid"] == copied_asset["source_uid"]:
+            item["import_source_uid"] = "import:unrelated-source"
+    resolved_alias = asset_library._resolve_selected_assets(tampered_alias)
+    durable_item = next(item for item in resolved_alias["resolved"]
+                        if item["source_uid"] == copied_asset["source_uid"])
+    assert asset_library._shot_asset_metadata(durable_item)["import_source_uid"] == imported_asset["source_uid"]
     merged_again, _media_again = asset_library._merge_import_input(
         imported_registered,
         [str(external_source)],

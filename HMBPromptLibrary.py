@@ -698,6 +698,7 @@ _IMAGE_ASSET_ROW_KEYS = frozenset({
     "order_key",
     "source_uid",
     "source_kind",
+    "import_source_uid",
     "asset_library_id",
     "asset_key",
     "asset_id",
@@ -5545,6 +5546,18 @@ def _apply_image_asset_payload(
                 ).hexdigest()[:24]
             )
         )
+        import_source_uid = _clean_string(metadata.get("import_source_uid"))
+        if not (
+            project_verified
+            and metadata.get("verified_asset") is True
+            and source_uid == f"project:{library_id}"
+            and _clean_string(
+                metadata.get("source_uid") or metadata.get("order_key")
+            ) == source_uid
+            and import_source_uid.startswith("import:")
+            and len(import_source_uid) <= MAX_IDENTIFIER_CHARS
+        ):
+            import_source_uid = ""
         if not image_name or not source_uid:
             _append_source_intent(
                 normalized,
@@ -5616,6 +5629,7 @@ def _apply_image_asset_payload(
         selected_assets.append(
             {
                 "source_uid": source_uid,
+                "import_source_uid": import_source_uid,
                 "asset_library_id": library_id,
                 "asset_project_uid": (
                     _clean_string(metadata.get("asset_project_uid"))
@@ -5699,6 +5713,11 @@ def _apply_image_asset_payload(
     used_initial_manual_seed_ids: set[int] = set()
     assigned: set[int] = set()
     ordered_managed_rows: List[Dict[str, Any]] = []
+    registration_claims: Dict[str, int] = {}
+    for asset in selected_assets:
+        import_uid = asset["import_source_uid"]
+        if import_uid:
+            registration_claims[import_uid] = registration_claims.get(import_uid, 0) + 1
     for asset in selected_assets:
         match_index: int | None = None
         for index, item in enumerate(candidates):
@@ -5768,6 +5787,39 @@ def _apply_image_asset_payload(
             if cached is not None:
                 candidates.append(cached)
                 match_index = len(candidates) - 1
+        import_uid = asset["import_source_uid"]
+        if (
+            match_index is None
+            and import_uid
+            and registration_claims.get(import_uid) == 1
+            and import_uid not in seen_source_uids
+        ):
+            # A committed Add supplies the only accepted identity handover.
+            # Reuse the exact import row object so authored fields and @imageN
+            # references follow its durable replacement through slot remapping.
+            import_matches = [
+                index
+                for index, item in enumerate(candidates)
+                if index not in assigned
+                and _image_asset_row_uid(item) == import_uid
+                and not item.get("asset_verified")
+                and item.get("asset_source_kind") == "user"
+            ]
+            if len(import_matches) == 1:
+                match_index = import_matches[0]
+                _pop_dormant_asset_row(asset_cache, import_uid)
+            elif not import_matches:
+                cached_matches = [
+                    item for item in asset_cache
+                    if _image_asset_row_uid(item) == import_uid
+                    and not item.get("asset_verified")
+                    and item.get("asset_source_kind") == "user"
+                ]
+                if len(cached_matches) == 1:
+                    cached = _pop_dormant_asset_row(asset_cache, import_uid)
+                    if cached is not None:
+                        candidates.append(cached)
+                        match_index = len(candidates) - 1
         if match_index is None:
             # First connection only: a unique exact native identity may seed
             # the newly managed row, preserving already-authored Role/Target/

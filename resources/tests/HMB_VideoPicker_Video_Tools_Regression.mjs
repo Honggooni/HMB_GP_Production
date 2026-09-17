@@ -116,6 +116,9 @@ const overlay = new Element(), box = new Element(), stage = new Element(); stage
 const buttons = Object.fromEntries(["cancel", "result", "add_result"].map((name) => [name, new Element({ "data-picker-tool-action": name })]));
 statusRoot.querySelector = (selector) => selector === "[data-picker-tool-message]" ? message : selector === "progress" ? progress : Object.entries(buttons).find(([key]) => selector.includes(`\"${key}\"`))?.[1] || null;
 const elements = new Map([["[data-picker-tools-panel]", panel], ["[data-picker-tools-status]", statusRoot], [".viewport-panel", viewport], ["#picker-video", player], [".viewport-stage", stage], ["[data-picker-crop-overlay]", overlay], ["[data-picker-crop-box]", box]]);
+const totalLength = new Element(), totalLabel = new Element();
+elements.set("#frame-info-total", totalLength);
+elements.set("#frame-info-total-label", totalLabel);
 root.querySelector = (selector) => elements.get(selector) || null;
 const commands = [], previews = [];
 let mediaController = null;
@@ -135,6 +138,19 @@ const controller = picker.hmbInstallPickerVideoTools(root, {
 });
 // A populated Picker and the hidden external metadata index never occupy either
 // tool automatically, including the existing viewport or its timeline context.
+assert.equal(totalLength.textContent, "Metadata pending 2/2");
+const beforeLengthPreview = liveState;
+liveState = picker.hmbUpdatePickerVideoTools({ ...liveState, videos: liveState.videos.map((item) => ({
+  ...item, video_metadata: { frame_rate: 24, duration_seconds: 2 },
+})) }, (tools) => {
+  tools.concatenate.inputs = ["C:/shots/a.mp4", "C:/shots/c.mp4"];
+  tools.concatenate.input_uids = ["a", "c"];
+});
+controller.refresh(liveState);
+assert.equal(totalLength.textContent, "≈ 96 frames / 4 s");
+assert.equal(totalLabel.textContent, "TOTAL");
+assert.equal(commands.length, 0, "Output-length preview must not submit an encode or any backend command.");
+liveState = beforeLengthPreview; controller.refresh(liveState);
 const populated = liveState;
 for (const mode of ["concatenate", "crop"]) {
   liveState = picker.hmbUpdatePickerVideoTools(initial, (tools) => {

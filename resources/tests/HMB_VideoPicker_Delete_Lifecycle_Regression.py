@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import sys
 import tempfile
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -38,14 +39,24 @@ def asset(uid: str, order: int) -> dict:
 
 
 def command(node, action: str, action_id: str, payload: dict | None = None) -> None:
-    node._handle_picker_command({
+    request = {
         "schema": picker.COMMAND_SCHEMA,
         "version": picker.COMMAND_VERSION,
         "runtime_instance_id": node._hmb_runtime_instance_id,
         "action": action,
         "action_id": action_id,
         "payload": payload or {},
-    })
+    }
+    if action == "import_video_asset":
+        # The command now only reserves cards; settle its scheduled copy before
+        # inspecting the terminal catalog and closing the source fixture.
+        scheduled = []
+        with patch.object(node, "_schedule_action_worker", side_effect=lambda *args: scheduled.append(args)):
+            node._handle_picker_command(request)
+        assert len(scheduled) == 1 and scheduled[0][0] == "video_import_copy"
+        scheduled[0][2]()
+    else:
+        node._handle_picker_command(request)
     if action == "delete_video_asset":
         worker = getattr(node, "_hmb_video_removal_sync_thread", None)
         if worker is not None:

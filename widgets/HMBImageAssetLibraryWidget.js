@@ -68,7 +68,7 @@ const IMAGE_ASSET_SELECTION_COMMIT_FALLBACK_MS = 120;
 const IMAGE_ASSET_ECHO_EXPIRY_MS = 1500;
 // Search covers the complete in-memory catalog, but foreground DOM work stays
 // bounded for projects containing thousands of images.
-const IMAGE_ASSET_RENDER_WINDOW = 60;
+const IMAGE_ASSET_RENDER_WINDOW = 80;
 const IMAGE_ASSET_THUMBNAIL_REQUEST_BATCH = 64;
 const IMAGE_ASSET_THUMBNAIL_ERROR_RETRY_LIMIT = 1;
 const IMAGE_ASSET_THUMBNAIL_WATCHDOG_MS = 15000;
@@ -91,6 +91,7 @@ let imageAssetWidgetMountSequence = 0;
 const imageAssetMountedContainers = new Set();
 const imageAssetCompactNodeKeys = new Set();
 const imageAssetNativeResizeLocks = new WeakMap();
+const imageAssetImportHandleDecorations = new WeakMap();
 let imageAssetSelectionCommitSequence = 0;
 let imageAssetPublicationSequence = 0;
 let imageAssetAuthoritySequence = 0;
@@ -415,6 +416,22 @@ const IMAGE_ASSET_UI_TEXT = {
     rename_shot: "Rename Shot",
     busy_loading: "Loading project assets…",
     transport_failed: "The change could not be saved. Please try again.",
+    refresh_review: "Refresh review",
+    refresh_files: "Image files",
+    refresh_missing: "Registered paths without files",
+    refresh_missing_hint: "These files may have been moved or renamed. Check the paths before removing their registrations.",
+    refresh_unregistered: "Unregistered image files",
+    refresh_unregistered_hint: "These files are not added automatically. Use Add to register them.",
+    refresh_none: "None",
+    refresh_cleanup: "Clean registrations without files",
+    refresh_confirm: "Confirm cleanup",
+    refresh_confirm_hint: "Only the missing registrations in JSON metadata will be removed. Media files are unaffected. A backup is created before cleanup. Existing Shots are not edited.",
+    refresh_cleaning: "Cleaning registrations…",
+    refresh_cleaned: "Registrations cleaned",
+    refresh_backup: "Backup",
+    refresh_unsafe: "Cleanup is unavailable for this review. Check the error and refresh again.",
+    refresh_close: "Close refresh review",
+    close: "Close",
   },
   ko: {
     select_project: "프로젝트 선택",
@@ -482,6 +499,22 @@ const IMAGE_ASSET_UI_TEXT = {
     rename_shot: "Shot 이름 변경",
     busy_loading: "프로젝트 에셋 불러오는 중…",
     transport_failed: "변경 사항을 저장하지 못했습니다. 다시 시도하세요.",
+    refresh_review: "새로고침 검토",
+    refresh_files: "이미지 파일",
+    refresh_missing: "파일이 없는 등록 경로",
+    refresh_missing_hint: "파일이 이동되었거나 이름이 바뀌었을 수 있습니다. 등록을 정리하기 전에 경로를 확인하세요.",
+    refresh_unregistered: "미등록 이미지 파일",
+    refresh_unregistered_hint: "자동으로 등록하지 않습니다. Add로 개별 등록하세요.",
+    refresh_none: "없음",
+    refresh_cleanup: "파일 없는 등록 정리",
+    refresh_confirm: "정리 실행 확인",
+    refresh_confirm_hint: "파일이 없는 등록의 JSON 메타데이터만 정리합니다. 실제 이미지 파일은 변경하지 않습니다. 정리 전에 백업을 생성하며, 기존 Shot은 수정하지 않습니다.",
+    refresh_cleaning: "등록 정리 중…",
+    refresh_cleaned: "정리한 등록",
+    refresh_backup: "백업",
+    refresh_unsafe: "현재 검토 결과로는 정리할 수 없습니다. 오류를 확인하고 다시 새로고침하세요.",
+    refresh_close: "새로고침 검토 닫기",
+    close: "닫기",
   },
 };
 
@@ -720,6 +753,36 @@ function normalizeRegistrationResult(raw) {
     asset_library_id: clean(raw.asset_library_id).slice(0, 512),
     message: clean(raw.message).slice(0, 1000),
   };
+}
+
+function normalizeAssetRefreshReview(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const requestId = clean(raw.request_id).slice(0, 128);
+  const status = clean(raw.status);
+  if (!requestId || !["review", "cleaned", "error"].includes(status)) return {};
+  const count = (value) => hmbNormalizeImageAssetRevision(value);
+  return {
+    request_id: requestId,
+    project_root: clean(raw.project_root).replaceAll("\\", "/"),
+    project_id: clean(raw.project_id),
+    status,
+    registered_count: count(raw.registered_count),
+    file_count: count(raw.file_count),
+    missing_count: count(raw.missing_count),
+    unregistered_count: count(raw.unregistered_count),
+    safe_to_clean: raw.safe_to_clean === true,
+    error: clean(raw.error),
+    missing_paths: uniqueStrings(raw.missing_paths),
+    unregistered_paths: uniqueStrings(raw.unregistered_paths),
+    cleaned_count: count(raw.cleaned_count),
+    backup_path: clean(raw.backup_path),
+  };
+}
+
+function normalizeAssetCleanupRequest(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const requestId = clean(raw.request_id).slice(0, 128);
+  return requestId ? { request_id: requestId } : {};
 }
 
 function normalizeThumbnailRequest(raw) {
@@ -1047,6 +1110,8 @@ function normalizeState(value) {
     thumbnail_busy: Boolean(input.thumbnail_busy),
     asset_registration_request: normalizeRegistrationRequest(input.asset_registration_request),
     asset_registration_result: normalizeRegistrationResult(input.asset_registration_result),
+    asset_refresh_review: normalizeAssetRefreshReview(input.asset_refresh_review),
+    asset_cleanup_request: normalizeAssetCleanupRequest(input.asset_cleanup_request),
     disconnect_import_uid: clean(input.disconnect_import_uid).startsWith("import:")
       ? clean(input.disconnect_import_uid).slice(0, 512)
       : "",
@@ -1185,6 +1250,8 @@ function imageAssetThumbnailOnlyTransition(localState, incomingState, expectedRe
     && clean(localState.error) === clean(incomingState.error)
     && clean(localState.asset_registration_result?.request_id)
       === clean(incomingState.asset_registration_result?.request_id)
+    && JSON.stringify(localState.asset_refresh_review)
+      === JSON.stringify(incomingState.asset_refresh_review)
     && imageAssetShotAuthorityMatches(localState, incomingState)
   );
 }
@@ -2186,6 +2253,9 @@ function imageAssetFocusDescriptor(container) {
     "data-registration-main",
     "data-registration-sub",
     "data-registration-submit",
+    "data-refresh-review-cancel",
+    "data-refresh-cleanup-start",
+    "data-refresh-cleanup-confirm",
   ];
   for (const attribute of directAttributes) {
     if (!active.hasAttribute?.(attribute)) continue;
@@ -2284,6 +2354,7 @@ function imageAssetDomKey(node) {
     "data-shot-uuid",
     "data-folder-key",
     "data-registration-backdrop",
+    "data-refresh-review-backdrop",
     "id",
   ]) {
     if (!node.hasAttribute?.(attribute)) continue;
@@ -4415,6 +4486,220 @@ function renderRegistrationDialog(state, draft) {
   `;
 }
 
+function imageAssetRefreshReviewKey(review) {
+  return review?.request_id
+    ? JSON.stringify([clean(review.project_root).toLowerCase(), review.project_id, review.request_id])
+    : "";
+}
+
+export function hmbImageAssetRefreshCleanupEligible(state, review = state?.asset_refresh_review) {
+  return Boolean(
+    review?.request_id
+    && review.status === "review"
+    && review.safe_to_clean === true
+    && review.missing_count > 0
+    && clean(review.project_root).toLowerCase() === clean(state?.project_root).toLowerCase()
+    && clean(review.project_id) === clean(state?.project_id),
+  );
+}
+
+export function hmbSyncImageAssetRefreshReview(container, state) {
+  if (!container) return null;
+  const review = state?.asset_refresh_review;
+  const key = imageAssetRefreshReviewKey(review);
+  if (
+    !key
+    || clean(review.project_root).toLowerCase() !== clean(state?.project_root).toLowerCase()
+    || clean(review.project_id) !== clean(state?.project_id)
+  ) {
+    delete container.__hmbImageAssetRefreshReviewOpen;
+    delete container.__hmbImageAssetRefreshReviewConfirm;
+    delete container.__hmbImageAssetRefreshCleanupPending;
+    return null;
+  }
+  const seen = container.__hmbImageAssetRefreshReviewsSeen ||= new Set();
+  if (!seen.has(key)) {
+    seen.add(key);
+    while (seen.size > 64) seen.delete(seen.values().next().value);
+    container.__hmbImageAssetRefreshReviewOpen = key;
+    delete container.__hmbImageAssetRefreshReviewConfirm;
+    delete container.__hmbImageAssetRefreshReviewError;
+  }
+  if (
+    container.__hmbImageAssetRefreshCleanupPending !== key
+    || review.status !== "review"
+  ) delete container.__hmbImageAssetRefreshCleanupPending;
+  if (review.status !== "review") {
+    delete container.__hmbImageAssetRefreshReviewConfirm;
+    delete container.__hmbImageAssetRefreshReviewError;
+  }
+  // Dismissal is local UI state. A thumbnail echo or the completion of an
+  // already-dismissed report must not reopen that report or write a command.
+  if (container.__hmbImageAssetRefreshReviewOpen !== key) return null;
+  return {
+    review,
+    confirming: container.__hmbImageAssetRefreshReviewConfirm === key,
+    busy: container.__hmbImageAssetRefreshCleanupPending === key,
+    error: clean(container.__hmbImageAssetRefreshReviewError),
+  };
+}
+
+export function hmbRenderImageAssetRefreshReview(state, view) {
+  if (!view?.review?.request_id) return "";
+  const { review, confirming, busy } = view;
+  const label = (key) => escapeHtml(imageAssetText(state, key));
+  const paths = (items) => items.length
+    ? `<ul>${items.map((path) => `<li>${escapeHtml(path)}</li>`).join("")}</ul>`
+    : `<p>${label("refresh_none")}</p>`;
+  const canClean = hmbImageAssetRefreshCleanupEligible(state, review) && !busy && !state.scan_busy;
+  return `<div class="asset-registration-backdrop asset-refresh-backdrop nodrag nopan nowheel" data-refresh-review-backdrop>
+    <section class="asset-passport asset-refresh-review" role="dialog" aria-modal="true" aria-label="${label(confirming ? "refresh_confirm" : "refresh_review")}" ${busy ? 'aria-busy="true"' : ""}>
+      <header class="passport-head"><div><small>${label("project")} · ${escapeHtml(review.project_id)}</small><h2>${label(confirming ? "refresh_confirm" : "refresh_review")}</h2></div><button type="button" data-refresh-review-cancel aria-label="${label("refresh_close")}">&times;</button></header>
+      <div class="refresh-review-body">
+        <p class="refresh-review-root">${escapeHtml(review.project_root)}</p>
+        <p>${label("registered")}: ${review.registered_count} · ${label("refresh_files")}: ${review.file_count}</p>
+        ${review.status === "cleaned" ? `<p role="status">${label("refresh_cleaned")}: ${review.cleaned_count}</p>${review.backup_path ? `<p>${label("refresh_backup")}: <span class="refresh-review-path">${escapeHtml(review.backup_path)}</span></p>` : ""}` : ""}
+        ${view.error || review.error ? `<p class="refresh-review-error" role="alert">${escapeHtml(view.error || review.error)}</p>` : ""}
+        ${review.status === "review" && !review.safe_to_clean ? `<p class="refresh-review-error">${label("refresh_unsafe")}</p>` : ""}
+        <h3>${label("refresh_missing")}: ${review.missing_count}</h3><p>${label("refresh_missing_hint")}</p>${paths(review.missing_paths)}
+        <h3>${label("refresh_unregistered")}: ${review.unregistered_count}</h3><p>${label("refresh_unregistered_hint")}</p>${paths(review.unregistered_paths)}
+        ${confirming ? `<p class="refresh-review-confirm">${label("refresh_confirm_hint")}</p>` : ""}
+        ${busy ? `<p role="status">${label("refresh_cleaning")}</p>` : ""}
+      </div>
+      <footer class="passport-actions"><button type="button" data-refresh-review-cancel>${label(review.status === "review" ? "cancel" : "close")}</button>${review.status === "review" ? `<button type="button" class="passport-register" ${confirming ? "data-refresh-cleanup-confirm" : "data-refresh-cleanup-start"} ${canClean ? "" : "disabled"}>${label(busy ? "refresh_cleaning" : confirming ? "refresh_confirm" : "refresh_cleanup")}</button>` : ""}</footer>
+    </section>
+  </div>`;
+}
+
+function hmbSetImageAssetRefreshReviewInert(container, active) {
+  const root = container.querySelector?.(".hmb-image-assets");
+  root?.querySelectorAll?.("[data-refresh-review-inert]").forEach((element) => {
+    element.removeAttribute?.("inert");
+    element.removeAttribute?.("aria-hidden");
+    element.removeAttribute?.("data-refresh-review-inert");
+  });
+  if (!active) return;
+  for (const selector of [".top", "[data-library-expanded]", "[data-library-compact-summary]"]) {
+    const element = root?.querySelector?.(selector);
+    element?.setAttribute?.("inert", "");
+    element?.setAttribute?.("aria-hidden", "true");
+    element?.setAttribute?.("data-refresh-review-inert", "");
+  }
+}
+
+export function hmbPatchImageAssetRefreshReview(container, state, view) {
+  const root = container.querySelector?.(".hmb-image-assets");
+  if (!root) return false;
+  const current = root.querySelector?.("[data-refresh-review-backdrop]");
+  const ownerDocument = root.ownerDocument || container.ownerDocument;
+  if (view && ownerDocument?.createElement) {
+    const template = ownerDocument.createElement("template");
+    template.innerHTML = hmbRenderImageAssetRefreshReview(state, view).trim();
+    const desired = template.content?.firstElementChild;
+    if (current && desired) hmbPatchImageAssetElement(current, desired);
+    else if (desired) root.appendChild?.(desired);
+  } else current?.remove?.();
+  hmbSetImageAssetRefreshReviewInert(container, Boolean(view));
+  return true;
+}
+
+export function hmbInstallImageAssetRefreshReviewEvents(container, state, props, remount) {
+  container.__hmbImageAssetRefreshReviewCleanup?.();
+  delete container.__hmbImageAssetRefreshReviewCleanup;
+  const backdrop = container.querySelector("[data-refresh-review-backdrop]");
+  if (!backdrop) return;
+  const listeners = [];
+  const on = (target, type, handler, options) => {
+    if (!target?.addEventListener) return;
+    target.addEventListener(type, handler, options);
+    listeners.push([target, type, handler, options]);
+  };
+  container.__hmbImageAssetRefreshReviewCleanup = () => {
+    listeners.forEach(([target, type, handler, options]) => target.removeEventListener?.(type, handler, options));
+  };
+  const currentState = () => container.__hmbImageAssetLatestState || state;
+  const close = () => {
+    delete container.__hmbImageAssetRefreshReviewOpen;
+    delete container.__hmbImageAssetRefreshReviewConfirm;
+    delete container.__hmbImageAssetRefreshReviewError;
+    remount(currentState());
+    container.querySelector("[data-project-reload]")?.focus?.();
+  };
+  container.querySelectorAll("[data-refresh-review-cancel]").forEach((button) => {
+    on(button, "click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      close();
+    });
+  });
+  hmbInstallImageAssetRegistrationBackdropDismissal(backdrop, close, on);
+  for (const type of ["click", "dblclick", "pointerdown", "mousedown", "pointerup", "mouseup", "wheel"]) {
+    on(backdrop, type, (event) => event.stopPropagation(), type === "wheel" ? { passive: true } : undefined);
+  }
+  on(backdrop, "keydown", (event) => {
+    event.stopPropagation();
+    if (event.key === "Escape") {
+      event.preventDefault();
+      close();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const buttons = Array.from(backdrop.querySelectorAll("button:not([disabled])"));
+    if (!buttons.length) return;
+    const active = typeof document !== "undefined" ? document.activeElement : null;
+    const index = buttons.indexOf(active);
+    if (event.shiftKey && index <= 0) {
+      event.preventDefault();
+      buttons[buttons.length - 1].focus?.();
+    } else if (!event.shiftKey && (index < 0 || index >= buttons.length - 1)) {
+      event.preventDefault();
+      buttons[0].focus?.();
+    }
+  });
+  on(container.querySelector("[data-refresh-cleanup-start]"), "click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    state = currentState();
+    if (!hmbImageAssetRefreshCleanupEligible(state) || state.scan_busy || container.__hmbImageAssetRefreshCleanupPending) return;
+    container.__hmbImageAssetRefreshReviewConfirm = imageAssetRefreshReviewKey(state.asset_refresh_review);
+    remount(state);
+    container.querySelector("[data-refresh-cleanup-confirm]")?.focus?.();
+  });
+  on(container.querySelector("[data-refresh-cleanup-confirm]"), "click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    state = currentState();
+    const key = imageAssetRefreshReviewKey(state.asset_refresh_review);
+    if (
+      !hmbImageAssetRefreshCleanupEligible(state)
+      || state.scan_busy
+      || container.__hmbImageAssetRefreshCleanupPending
+      || container.__hmbImageAssetRefreshReviewConfirm !== key
+    ) return;
+    container.__hmbImageAssetRefreshCleanupPending = key;
+    delete container.__hmbImageAssetRefreshReviewError;
+    const baseline = remount(state);
+    const commandState = normalizeState(baseline);
+    commandState.asset_cleanup_request = { request_id: commandState.asset_refresh_review.request_id };
+    const published = emit(props, commandState, container, (error) => {
+      if (container.__hmbImageAssetRefreshCleanupPending !== key) return;
+      delete container.__hmbImageAssetRefreshCleanupPending;
+      container.__hmbImageAssetRefreshReviewError = clean(error?.message || error)
+        || imageAssetText(currentState(), "transport_failed");
+      remount(currentState());
+    });
+    // The command belongs only to this publication. Never replay it through a
+    // later language/selection/thumbnail update, or replace a synchronous
+    // authoritative completion with the pre-cleanup review.
+    published.asset_cleanup_request = {};
+    delete container.__hmbImageAssetCanonicalSerialization;
+    if (container.__hmbImageAssetLatestState === baseline) {
+      state = published;
+      container.__hmbImageAssetLatestState = state;
+    }
+  });
+}
+
 function renderImageAssetShotStack(state) {
   const routing = ensureImageAssetShotRouting(state);
   const active = routing.shots.find((shot) => shot.shot_uuid === routing.active_shot_uuid)
@@ -4676,6 +4961,7 @@ function render(
   registrationDraft = null,
   renderLimit = IMAGE_ASSET_RENDER_WINDOW,
   renderOffset = 0,
+  refreshReview = null,
 ) {
   const catalog = hmbRenderImageAssetGrid(state, renderLimit, renderOffset);
   const activeShot = activeImageAssetShot(state);
@@ -4717,6 +5003,7 @@ function render(
       .shot-stack{max-height:360px;margin:0 8px 8px;display:flex;flex-direction:column;gap:5px;overflow:auto;scrollbar-gutter:stable}.shot-panel{flex:0 0 auto;overflow:hidden;border:1px solid rgba(var(--shot-rgb),.34);border-radius:10px;background:linear-gradient(180deg,rgba(var(--shot-rgb),.10),rgba(8,11,19,.96));box-shadow:0 0 16px rgba(var(--shot-rgb),.07)}.shot-panel-head{height:38px;display:flex;align-items:center;gap:6px;padding:4px 7px;border-bottom:1px solid transparent}.shot-panel.active .shot-panel-head{border-bottom-color:rgba(var(--shot-rgb),.20)}.shot-panel-toggle{height:29px;min-width:0;flex:1;display:grid;grid-template-columns:30px minmax(70px,auto) minmax(120px,1fr) auto auto;align-items:center;gap:7px;padding:0 8px;border:1px solid rgba(var(--shot-rgb),.32);border-radius:7px;background:linear-gradient(90deg,rgba(var(--shot-rgb),.16),rgba(8,13,23,.72));color:#d9e6f3;text-align:left;cursor:pointer}.shot-panel-toggle small{color:var(--shot-accent);font-size:8px;font-weight:950}.shot-panel-toggle b{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f8fafc;font-size:10px}.shot-panel-toggle span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(var(--shot-rgb),.92);font-size:8px;font-weight:900;letter-spacing:.06em}.shot-panel-toggle em{color:var(--shot-accent);font-size:8px;font-style:normal;font-weight:900}.shot-panel-toggle i{color:#7f95a8;font-size:7px;font-style:normal;letter-spacing:.08em}.shot-panel.active{border-color:rgba(var(--shot-rgb),.68);box-shadow:0 0 18px rgba(var(--shot-rgb),.14)}.shot-panel.active .shot-panel-toggle{border-color:var(--shot-accent);box-shadow:0 0 10px rgba(var(--shot-rgb),.14)}.shot-panel .shot-delete{width:29px;height:29px;flex:0 0 29px;padding:0;border:1px solid rgba(var(--shot-rgb),.42);border-radius:7px;background:rgba(var(--shot-rgb),.10);color:var(--shot-accent);font-size:16px;line-height:1;cursor:pointer}.shot-panel .shot-delete:hover:not(:disabled),.shot-panel .shot-delete:focus-visible{border-color:var(--shot-accent);background:rgba(var(--shot-rgb),.22);outline:none;box-shadow:0 0 10px rgba(var(--shot-rgb),.18)}.shot-panel .shot-delete:disabled{opacity:.25;cursor:default}.shot-panel .shot-add{height:29px;padding:0 11px;border:1px solid rgba(var(--shot-rgb),.54);border-radius:7px;background:rgba(var(--shot-rgb),.14);color:var(--shot-accent);font-size:8px;font-weight:950;white-space:nowrap;cursor:pointer}.shot-panel .shot-add:disabled{opacity:.3;cursor:default}.shot-panel .tray-scroll{height:132px;display:flex;align-items:stretch;gap:8px;overflow-x:auto;overflow-y:hidden;padding:7px}.shot-panel .selected-card{border-color:rgba(var(--shot-rgb),.30);background:linear-gradient(145deg,rgba(var(--shot-rgb),.15),rgba(12,17,28,.94))}.shot-panel .selected-thumb{border-color:rgba(var(--shot-rgb),.30)}.shot-panel .slot{border-color:rgba(var(--shot-rgb),.70);background:rgba(var(--shot-rgb),.20);color:var(--shot-accent)}.shot-panel .tray-empty{border-color:rgba(var(--shot-rgb),.22);color:rgba(var(--shot-rgb),.72)}.hmb-image-assets .asset-card.selected{border-color:var(--active-shot-accent);box-shadow:inset 0 0 0 .3px rgba(var(--active-shot-rgb),.48),0 0 15px rgba(var(--active-shot-rgb),.34),0 0 4px rgba(var(--active-shot-rgb),.55)}
       .asset-registration-backdrop{position:absolute;inset:0;z-index:80;display:grid;place-items:center;padding:18px;background:rgba(1,4,10,.78);backdrop-filter:blur(5px)}.asset-passport{width:min(390px,100%);max-height:calc(100% - 12px);display:flex;flex-direction:column;overflow:auto;border:1px solid rgba(244,114,182,.62);border-radius:18px 18px 28px 28px;background:radial-gradient(circle at 50% -8%,rgba(190,24,93,.24),transparent 30%),linear-gradient(180deg,#171020,#090d17 45%,#060912);box-shadow:0 24px 70px rgba(0,0,0,.62),0 0 28px rgba(244,114,182,.2)}.passport-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 10px;border-bottom:1px solid rgba(244,114,182,.2)}.passport-head small{display:block;color:#d8a2be;font-size:7px;font-weight:900;letter-spacing:.18em}.passport-head h2{margin:3px 0 0;color:#fff1f8;font-size:15px;letter-spacing:.08em}.passport-head button{width:28px;height:28px;border:1px solid rgba(244,114,182,.25);border-radius:50%;background:#0b0d16;color:#e7b9d1;font-size:18px;line-height:1;cursor:pointer}.passport-photo{position:relative;width:128px;aspect-ratio:3/4;display:grid;place-items:center;align-self:center;margin:14px 0 8px;overflow:hidden;border:1px solid rgba(244,114,182,.38);border-radius:8px;background:#050910;color:#84677a;font-size:10px;font-weight:900;box-shadow:0 0 18px rgba(244,114,182,.12)}.passport-photo img{width:100%;height:100%;object-fit:cover}.passport-photo>span{display:none}.passport-photo.fallback img{display:none}.passport-photo.fallback>span{display:block}.passport-file{display:flex;flex-direction:column;gap:3px;padding:0 18px 12px;text-align:center}.passport-file b,.passport-file span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.passport-file b{color:#d7e2ef;font-size:8px}.passport-file span{color:#73899d;font-size:7px}.passport-fields{display:grid;grid-template-columns:1fr 1fr;gap:9px;padding:12px 16px;border-top:1px dashed rgba(244,114,182,.24)}.passport-fields label{display:flex;flex-direction:column;gap:4px}.passport-fields label:nth-last-child(1){grid-column:1/-1}.passport-fields label span{color:#bb8fa8;font-size:7px;font-weight:900;letter-spacing:.06em}.passport-fields input,.passport-fields select{width:100%;height:32px;border:1px solid rgba(148,163,184,.27);border-radius:7px;background:#060b13;color:#eef5ff;padding:0 8px;font-size:9px;outline:none}.passport-fields input:focus,.passport-fields select:focus{border-color:var(--asset-selection);box-shadow:0 0 0 1px rgba(244,114,182,.18)}.passport-fields select:disabled{opacity:.42}.passport-actions{display:flex;justify-content:flex-end;gap:7px;padding:11px 16px 15px}.passport-actions button{height:31px;padding:0 13px;border:1px solid rgba(148,163,184,.24);border-radius:7px;background:#0a101a;color:#bac9d8;font-size:8px;font-weight:900;cursor:pointer}.passport-actions .passport-register{border-color:rgba(244,114,182,.62);background:linear-gradient(180deg,rgba(190,24,93,.55),rgba(88,28,135,.42));color:#ffe4f2;box-shadow:0 0 12px rgba(244,114,182,.18)}.passport-actions button:disabled{opacity:.32;cursor:default;box-shadow:none}
       .passport-fields .passport-folder{grid-column:1/-1}.passport-taxonomy-contract{grid-column:1/-1;display:flex;flex-direction:column;gap:4px;padding:8px 9px;border:1px solid rgba(148,163,184,.18);border-radius:7px;background:rgba(2,6,14,.58)}.passport-taxonomy-contract[hidden]{display:none}.passport-taxonomy-contract small{color:#bb8fa8;font-size:7px;font-weight:900;letter-spacing:.06em}.passport-taxonomy-contract span{color:#cbd8e6;font-size:8px;line-height:1.45}
+      .asset-refresh-review{width:min(580px,100%)}.refresh-review-body{padding:4px 16px 12px;font-size:10px;line-height:1.6;color:#cbd8e6}.refresh-review-body h3{margin:14px 0 4px;font-size:11px;color:var(--selection-text)}.refresh-review-body p{margin:7px 0}.refresh-review-body ul{max-height:120px;overflow:auto;margin:8px 0;padding:9px 9px 9px 26px;border:1px solid rgba(148,163,184,.2);border-radius:7px;background:#060b13}.refresh-review-body li,.refresh-review-root,.refresh-review-path{overflow-wrap:anywhere;white-space:pre-wrap}.refresh-review-error{color:#fca5a5}.refresh-review-confirm{padding:10px;border:1px solid var(--selection-soft);border-radius:7px;color:var(--selection-strong);background:rgba(var(--selection-rgb),.12)}
       /* Fixed P-base visual language. Shot 1-5 are the only accent authority. */
       .hmb-image-assets[data-theme] .top{background:linear-gradient(90deg,var(--header-tint),rgba(14,23,38,.92) 44%,rgba(6,9,18,.96))}.hmb-image-assets[data-theme] .mark{border-color:rgba(var(--selection-rgb),.54);background:linear-gradient(145deg,rgba(var(--selection-rgb),.16),rgba(8,13,23,.86));color:var(--accent);box-shadow:inset 0 0 0 1px rgba(255,255,255,.025),0 0 14px rgba(var(--selection-rgb),.11)}
       .hmb-image-assets[data-theme] .filter-chip{border-color:rgba(var(--selection-rgb),.3);background:rgba(var(--selection-deep-rgb),.1);color:var(--selection-text)}.hmb-image-assets[data-theme] .asset-card.selected{box-shadow:inset 0 0 0 .3px rgba(var(--selection-rgb),.45),0 0 15px rgba(var(--selection-rgb),.34),0 0 4px rgba(var(--selection-secondary-rgb),.55)}.hmb-image-assets[data-theme] .asset-card.unregistered .asset-state{color:var(--selection-soft)}.hmb-image-assets[data-theme] .asset-add{border-color:rgba(var(--selection-rgb),.7);background:rgba(var(--selection-deep-rgb),.26);color:var(--selection-strong);box-shadow:0 0 10px rgba(var(--selection-rgb),.16)}.hmb-image-assets[data-theme] .asset-add:hover{border-color:var(--selection-soft);background:rgba(var(--selection-deep-rgb),.34);box-shadow:0 0 13px rgba(var(--selection-rgb),.3)}
@@ -4760,6 +5047,7 @@ function render(
       <div class="transport-status" data-transport-status role="alert" aria-live="assertive" aria-atomic="true"></div>
       </div>
       ${hmbRenderImageAssetCompactSummary(state)}
+      ${registrationDraft ? "" : hmbRenderImageAssetRefreshReview(state, refreshReview)}
     </div>
   `;
 }
@@ -4777,6 +5065,111 @@ function findNodeRoot(container) {
     )) fallback = current;
   }
   return fallback || container?.parentElement || container || null;
+}
+
+// Griptape's ParameterList uses the same ghost handle id for its collapsed
+// header and its expanded Add item row. The native header has
+// data-parameter-name; the Add item row deliberately omits it. These contracts
+// and the 16x16 SVG circle are verified against the installed editor renderer.
+// Decorate only this ImageAsset mount's node. Native handles, ids, listeners,
+// accepted types and connection state remain owned by the editor.
+export function hmbInstallImageAssetImportHandleDecoration(container) {
+  const nodeRoot = findNodeRoot(container);
+  const document = nodeRoot?.ownerDocument;
+  const view = document?.defaultView;
+  if (!nodeRoot?.classList?.contains("react-flow__node") || !document?.createElementNS) {
+    return () => {};
+  }
+  let record = imageAssetImportHandleDecorations.get(nodeRoot);
+  if (!record) {
+    record = { owners: new Set(), parents: new Map(), overlays: new Map(), observer: null, frame: null };
+    const restoreParent = (handle, snapshot) => {
+      hmbRestoreImageAssetStyleValue(handle, "visibility", snapshot);
+      record.parents.delete(handle);
+    };
+    const sync = () => {
+      const nodeId = hmbImageAssetNodeId(nodeRoot);
+      const ghostId = `ghost-item-${nodeId}-IMAGE_IMPORT_IN`;
+      const handles = Array.from(nodeRoot.querySelectorAll(
+        ".react-flow__handle.target[data-handleid]",
+      )).filter((handle) => handle.getAttribute("data-nodeid") === nodeId);
+      const parents = handles.filter((handle) => handle.getAttribute("data-handleid") === "IMAGE_IMPORT_IN");
+      const addHandles = handles.filter((handle) => {
+        if (handle.getAttribute("data-handleid") !== ghostId) return false;
+        if (handle.closest("[data-parameter-name]")) return false;
+        // Confirm the native ghost row, rather than relying on displayed text.
+        for (let row = handle.parentElement; row && row !== nodeRoot; row = row.parentElement) {
+          if (row.classList?.contains(ghostId)) return true;
+        }
+        return false;
+      });
+      const wantedParents = new Set(addHandles.length ? parents : []);
+      record.parents.forEach((snapshot, handle) => {
+        if (!wantedParents.has(handle)) restoreParent(handle, snapshot);
+      });
+      const blue = parents[0]?.querySelector("svg circle")?.getAttribute("stroke") || "#3b82f6";
+      wantedParents.forEach((handle) => {
+        if (!record.parents.has(handle)) record.parents.set(handle, hmbImageAssetStyleValue(handle, "visibility"));
+        // visibility preserves the handle's measured box and existing edges.
+        hmbSetImageAssetStyleValue(handle, "visibility", "hidden");
+      });
+      const wantedSvgs = new Set(addHandles.map((handle) => handle.querySelector("svg"))
+        .filter((svg) => svg?.getAttribute("viewBox") === "0 0 16 16" && svg.querySelector("circle")));
+      record.overlays.forEach((overlay, svg) => {
+        if (!wantedSvgs.has(svg) || overlay.parentElement !== svg) {
+          overlay.remove();
+          record.overlays.delete(svg);
+        }
+      });
+      wantedSvgs.forEach((svg) => {
+        let overlay = record.overlays.get(svg);
+        if (!overlay) {
+          overlay = document.createElementNS("http://www.w3.org/2000/svg", "path");
+          overlay.setAttribute("data-hmb-image-import-universal", "");
+          overlay.setAttribute("d", "M 8 1 A 7 7 0 0 1 8 15");
+          overlay.setAttribute("fill", "none");
+          overlay.setAttribute("stroke-width", "2");
+          overlay.setAttribute("pointer-events", "none");
+          overlay.setAttribute("aria-hidden", "true");
+          svg.appendChild(overlay);
+          record.overlays.set(svg, overlay);
+        }
+        if (overlay.getAttribute("stroke") !== blue) overlay.setAttribute("stroke", blue);
+      });
+    };
+    const schedule = () => {
+      if (record.frame != null) return;
+      if (!view?.requestAnimationFrame) { sync(); return; }
+      record.frame = view.requestAnimationFrame(() => { record.frame = null; sync(); });
+    };
+    if (view?.MutationObserver) {
+      record.observer = new view.MutationObserver((mutations) => {
+        if (mutations.some(({ target }) => !Array.from(record.owners).some((owner) => owner.contains(target)))) schedule();
+      });
+      record.observer.observe(nodeRoot, {
+        subtree: true, childList: true, attributes: true,
+        attributeFilter: ["data-id", "data-nodeid", "data-handleid", "data-parameter-name", "class", "stroke"],
+      });
+    }
+    record.sync = sync;
+    record.restoreParent = restoreParent;
+    imageAssetImportHandleDecorations.set(nodeRoot, record);
+  }
+  record.owners.add(container);
+  record.sync();
+  let disposed = false;
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    record.owners.delete(container);
+    if (record.owners.size) return;
+    record.observer?.disconnect();
+    if (record.frame != null) view?.cancelAnimationFrame?.(record.frame);
+    record.parents.forEach((snapshot, handle) => record.restoreParent(handle, snapshot));
+    record.overlays.forEach((overlay) => overlay.remove());
+    record.overlays.clear();
+    imageAssetImportHandleDecorations.delete(nodeRoot);
+  };
 }
 
 const IMAGE_ASSET_INTERNAL_TOGGLE_INTERACTIVE_SELECTOR = [
@@ -5826,7 +6219,7 @@ function installEvents(container, state, props, remount, listeners) {
     },
   );
   const commitSlowProjectMutation = (mutate) => {
-    if (container.__hmbImageAssetBusy || typeof mutate !== "function") return false;
+    if (container.__hmbImageAssetBusy || container.__hmbImageAssetRefreshCleanupPending || typeof mutate !== "function") return false;
     const previous = {
       catalog_root: state.catalog_root,
       project_root: state.project_root,
@@ -6381,6 +6774,7 @@ function installEvents(container, state, props, remount, listeners) {
     closeRegistration,
     on,
   );
+  hmbInstallImageAssetRefreshReviewEvents(container, state, props, remount);
   const updateRegistrationSubmit = () => {
     const submit = container.querySelector("[data-registration-submit]");
     if (submit) {
@@ -6584,6 +6978,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     if (typeof updater === "function") container.__hmbImageAssetUpdateNodeInternals = updater;
   };
   rememberNodeInternalsUpdater(props);
+  const cleanupImportHandles = hmbInstallImageAssetImportHandleDecoration(container);
   let state = normalizeState(props?.value);
   hmbRememberImageAssetPresentation(state);
   hmbAdoptImageAssetPresentation(state);
@@ -6680,6 +7075,9 @@ export default function HMBImageAssetLibraryWidget(container, props) {
       hmbStartImageAssetCatalogPolling(container, state);
       hmbResumeImageAssetThumbnailRequest(container, state, props);
       hmbPatchCompactImageAssetState(container, state);
+      const refreshReview = hmbSyncImageAssetRefreshReview(container, state);
+      hmbPatchImageAssetRefreshReview(container, state, refreshReview);
+      hmbInstallImageAssetRefreshReviewEvents(container, state, props, remount);
       hmbScheduleImageAssetThumbnailRequest(container, state, props, {
         includeWindow: false,
       });
@@ -6711,11 +7109,13 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     );
     hmbStartImageAssetCatalogPolling(container, state);
     hmbResumeImageAssetThumbnailRequest(container, state, props);
+    const refreshReview = hmbSyncImageAssetRefreshReview(container, state);
     const markup = hmbScopeWidgetStyleMarkup(render(
       state,
       container.__hmbImageAssetRegistrationDraft || null,
       container.__hmbImageAssetRenderLimit || IMAGE_ASSET_RENDER_WINDOW,
       container.__hmbImageAssetRenderOffset || 0,
+      refreshReview,
     ), ".hmb-image-assets");
     hmbPatchImageAssetMarkup(container, markup);
     if (container.__hmbImageAssetRegistrationDraft) {
@@ -6727,12 +7127,20 @@ export default function HMBImageAssetLibraryWidget(container, props) {
         element.setAttribute?.("aria-hidden", "true");
       });
     }
+    hmbSetImageAssetRefreshReviewInert(container, Boolean(refreshReview && !container.__hmbImageAssetRegistrationDraft));
     hmbPrepareImageAssetCanvasGestures(container);
     restoreReusableImageAssets(container, reusableImages);
     concealNativeProjectRootPicker(container);
     installEvents(container, state, props, remount, listeners);
     hmbRebuildImageAssetIndexes(container, state);
     restoreImageAssetUi(container, state, uiMemory);
+    if (refreshReview && !container.__hmbImageAssetRegistrationDraft) {
+      const backdrop = container.querySelector("[data-refresh-review-backdrop]");
+      const active = typeof document !== "undefined" ? document.activeElement : null;
+      if (!active || !backdrop?.contains?.(active)) {
+        backdrop?.querySelector?.("[data-refresh-review-cancel]")?.focus?.();
+      }
+    }
     delete container.__hmbImageAssetCompactUiMemory;
     const currentNodeRoot = findNodeRoot(container);
     if (
@@ -6899,6 +7307,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
   container.__hmbImageAssetApplyProps = applyProps;
 
   const cleanup = () => {
+    cleanupImportHandles();
     hmbCancelImageAssetCompactGeometrySettle(container);
     if (container.__hmbImageAssetExpandedGeometry) {
       hmbSetImageAssetCompactShellGeometry(container, false);
@@ -6920,6 +7329,8 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     // Its bounded RAF/task may still run, but the token guard makes it inert.
     delete container.__hmbImageAssetSlowActionToken;
     clearListeners();
+    container.__hmbImageAssetRefreshReviewCleanup?.();
+    delete container.__hmbImageAssetRefreshReviewCleanup;
     if (container.__hmbImageAssetCleanup === cleanup) {
       delete container.__hmbImageAssetCleanup;
     }

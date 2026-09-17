@@ -2719,6 +2719,16 @@ function hmbRestoreRejectedPickerToolDrafts(state, record, local = state) {
 }
 
 export function hmbApplyOptimisticPickerVideoDeletions(container, incoming) {
+  const cancelledImports = container?.__hmbCancelledVideoImports;
+  if (cancelledImports?.size) {
+    let candidate = incoming && typeof incoming === "object" ? incoming : normalize(incoming);
+    for (const item of candidate.videos || []) {
+      if (item.import_request_id && cancelledImports.has(`${candidate.runtime_instance_id}:${item.import_request_id}`)) {
+        candidate = hmbDeleteVideoAsset(candidate, item.video_uid);
+      }
+    }
+    incoming = candidate;
+  }
   const deletions = container?.__hmbPickerVideoDeletions;
   if (!(deletions instanceof Map) || !deletions.size) return incoming;
   let state = incoming && typeof incoming === "object" ? incoming : normalize(incoming);
@@ -3314,6 +3324,80 @@ export function hmbPickerToolsSourceAssets(state) {
 }
 const hmbPickerToolsAssets = hmbPickerToolsSourceAssets;
 
+// Display-only: use each input's own metadata, never the last Maya scene's
+// timing or the duration of a different video retained in the shared player.
+function hmbPickerVideoLength(asset) {
+  const positive = (...values) => {
+    for (const value of values) {
+      const parts = typeof value === "string" ? value.split("/") : [];
+      const number = parts.length === 2 ? Number(parts[0]) / Number(parts[1]) : Number(value);
+      if (Number.isFinite(number) && number > 0) return number;
+    }
+    return 0;
+  };
+  const item = asset || {}, frame = item.frame_metadata || {}, player = item.video_metadata || {};
+  const fps = positive(item.output_fps, frame.fps, item.source_fps, item.frame_rate, item.fps, player.frame_rate);
+  const frames = positive(item.decoded_frame_count, item.output_frame_count, frame.frame_count,
+    item.source_frame_count, item.frame_count, player.frame_count, player.nb_frames);
+  const seconds = positive(item.output_duration_seconds, frame.duration_seconds,
+    item.source_duration_seconds, item.duration_seconds, item.duration, player.duration_seconds,
+    fps && frames ? frames / fps : 0);
+  return { fps, frames: frames ? Math.round(frames) : null, seconds: seconds || null };
+}
+
+export function hmbPickerOutputLength(state) {
+  const tools = hmbPickerToolsEntry(state);
+  const mode = tools.active_tool;
+  let inputs = [], requestedFps = 0;
+  if (mode !== "preview") {
+    const assets = hmbPickerToolsAssets(state);
+    const find = (path, uid) => assets.find((asset) => uid
+      ? clean(asset.video_uid) === uid : hmbPickerToolLocalPath(asset) === path);
+    if (mode === "concatenate") {
+      inputs = tools.concatenate.inputs.map((path, index) => find(path, tools.concatenate.input_uids[index]));
+      requestedFps = tools.concatenate.output_frame_rate === "auto"
+        ? 0 : Number(tools.concatenate.output_frame_rate);
+    } else if (tools.crop.input) {
+      inputs = [find(tools.crop.input, tools.crop.source_uid)];
+    }
+  } else {
+    const asset = previewVideo(state);
+    if (asset) inputs = [asset];
+    else if (state?.native_read_ready) {
+      const start = Number(state.start_frame), end = Number(state.end_frame);
+      const frames = Number.isFinite(start) && Number.isFinite(end) && end >= start ? end - start + 1 : 0;
+      inputs = [{ frame_count: frames, fps: state.source_fps }];
+    }
+  }
+  if (!inputs.length) return { frames: 0, seconds: 0, estimated: false, missing: 0, count: 0 };
+  const lengths = inputs.map(hmbPickerVideoLength);
+  const missing = lengths.filter((item) => !item.seconds).length;
+  // An unknown input must not silently disappear from the total.
+  if (missing) return { frames: null, seconds: null, estimated: true, missing, count: inputs.length };
+  const seconds = lengths.reduce((sum, item) => sum + item.seconds, 0);
+  const fps = requestedFps || lengths[0].fps;
+  const keepsFrameCounts = lengths.every((item) => item.frames !== null)
+    && (mode !== "concatenate" || (fps > 0 && lengths.every((item) => Math.abs(item.fps - fps) < 0.000001)));
+  const frames = keepsFrameCounts ? lengths.reduce((sum, item) => sum + item.frames, 0)
+    : fps > 0 ? lengths.reduce((sum, item) => sum + Math.round(item.seconds * fps), 0) : null;
+  return { frames, seconds, estimated: mode === "concatenate" || !keepsFrameCounts, missing: 0, count: inputs.length };
+}
+
+export function hmbPickerOutputLengthText(state) {
+  const total = hmbPickerOutputLength(state), ko = state?.language !== "en";
+  if (total.missing) return ko ? `정보 대기 ${total.missing}/${total.count}` : `Metadata pending ${total.missing}/${total.count}`;
+  const frames = total.frames === null ? "—" : String(total.frames);
+  const seconds = total.seconds.toFixed(2).replace(/\.?0+$/, "");
+  return `${total.estimated ? "≈ " : ""}${frames}${ko ? "프레임" : " frames"} / ${seconds}${ko ? "초" : " s"}`;
+}
+
+function hmbPatchPickerOutputLength(container, state) {
+  const label = container?.querySelector?.("#frame-info-total-label");
+  const value = container?.querySelector?.("#frame-info-total");
+  if (label) label.textContent = state?.language === "en" ? "TOTAL" : "총 길이";
+  if (value) value.textContent = hmbPickerOutputLengthText(state);
+}
+
 export function hmbPickerToolOutputDirectory(state, kind) {
   const tools = hmbPickerToolsEntry(state);
   const uid = kind === "crop" ? tools.crop.source_uid : tools.concatenate.input_uids[0];
@@ -3616,6 +3700,7 @@ export function hmbInstallPickerVideoTools(container, options = {}) {
     box.setAttribute("data-size", `${rect.width} × ${rect.height} · ${rect.x}, ${rect.y}`);
   };
   const refresh = (state = current(), { mediaOnly = false } = {}) => {
+    hmbPatchPickerOutputLength(container, state);
     if (disposed) return;
     if (mediaOnly) { paintCrop(); return; }
     panelResizer.refresh(state);
@@ -8308,6 +8393,58 @@ function hmbVideoAssetCardHtml(item, catalogIndex, order, selectionFull, tr, loc
   </article>`;
 }
 
+export function hmbPickerPendingImports(state, workspaceUuid, container = null) {
+  const cancelled = container?.__hmbCancelledVideoImports;
+  // Optimistic Shot/order drafts own navigation, not background progress. Use
+  // the latest same-runtime jobs while still filtering by the VISIBLE Shot;
+  // otherwise a pre-dialog draft hides cards or puts them into another Shot.
+  const authoritative = container?.__hmbAuthoritativePickerState;
+  const progress = state?.runtime_instance_id && authoritative?.runtime_instance_id === state.runtime_instance_id
+    ? authoritative : state;
+  return (Array.isArray(progress?.video_imports) ? progress.video_imports : []).filter((job) => (
+    job && clean(job.import_id) && job.picker_shot_uuid === workspaceUuid
+    && job.runtime_instance_id === state.runtime_instance_id
+    && !cancelled?.has?.(`${state.runtime_instance_id}:${job.import_id}`)
+  ));
+}
+
+export function hmbPickerImportCardHtml(job, language = "ko", compact = false) {
+  const ko = language !== "en", failed = job.status === "failed";
+  const status = failed ? (ko ? "불러오기 실패" : "Import failed") : (ko ? "불러오는 중…" : "Loading…");
+  return `<article class="picker-import-card" data-picker-import-id="${escapeHtml(job.import_id)}" data-picker-import-fingerprint="${escapeHtml(JSON.stringify([job.label, job.status, job.error, language]))}" draggable="false" style="position:relative;box-sizing:border-box;${compact ? "width:112px;flex:0 0 112px;" : "min-width:0;"}min-height:108px;padding:12px 8px;border:1px solid var(--local-shot-accent,#ed65b1);border-radius:9px;background:#101623;display:flex;flex-direction:column;justify-content:center;gap:8px;text-align:center;font-size:11px" title="${escapeHtml(job.error || job.label)}"><button type="button" data-picker-import-cancel="${escapeHtml(job.import_id)}" aria-label="${ko ? "불러오기 취소" : "Cancel import"}" style="position:absolute;top:5px;right:5px;width:25px;height:25px;border-radius:6px">×</button>${failed ? "<span aria-hidden=\"true\">!</span>" : `<progress aria-label="${escapeHtml(status)}" style="width:50%;height:5px;align-self:center;margin-top:10px"></progress>`}<span role="status">${escapeHtml(status)}</span><b style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(job.label)}</b></article>`;
+}
+
+export function hmbPatchPickerImportCards(container, state) {
+  const targets = Array.from(container?.querySelectorAll?.("[data-compact-shot-assets]") || []).map((host) => ({
+    host, workspace: clean(host.getAttribute?.("data-compact-shot-assets")), compact: true,
+  }));
+  const grid = container?.querySelector?.(".video-asset-grid");
+  if (grid) targets.push({ host: grid, workspace: hmbPickerToolsSourceDisplayState(container, state).active_picker_shot_uuid, compact: false });
+  for (const { host, workspace, compact } of targets) {
+    const jobs = hmbPickerPendingImports(state, workspace, container);
+    const existing = new Map(Array.from(host.querySelectorAll?.("[data-picker-import-id]") || [])
+      .map((card) => [card.getAttribute?.("data-picker-import-id"), card]));
+    for (const job of jobs) {
+      const fingerprint = JSON.stringify([job.label, job.status, job.error, state.language]);
+      let card = existing.get(job.import_id);
+      existing.delete(job.import_id);
+      if (card?.getAttribute?.("data-picker-import-fingerprint") === fingerprint) continue;
+      const template = host.ownerDocument?.createElement?.("template");
+      if (!template) continue;
+      template.innerHTML = hmbPickerImportCardHtml(job, state.language, compact);
+      const replacement = template.content?.firstElementChild || template.firstElementChild;
+      if (!replacement) continue;
+      if (card) card.replaceWith?.(replacement);
+      else host.appendChild?.(replacement);
+    }
+    existing.forEach((card) => card.remove?.());
+    if (jobs.length) {
+      host.querySelector?.(compact ? ".compact-shot-empty" : ".video-assets-empty")?.remove?.();
+      host.classList?.remove?.("empty");
+    }
+  }
+}
+
 function videoAssetCardsHtml(state, tr, locked) {
   const selected = hmbSelectedVideoAssets(state);
   const orderByUid = new Map(selected.map((item, index) => [clean(item.video_uid), index + 1]));
@@ -8321,7 +8458,9 @@ function videoAssetCardsHtml(state, tr, locked) {
       if (rightOrder) return 1;
       return left.catalogIndex - right.catalogIndex;
     });
-  if (!assets.length) {
+  const loading = hmbPickerPendingImports(state, state.active_picker_shot_uuid)
+    .map((job) => hmbPickerImportCardHtml(job, state.language)).join("");
+  if (!assets.length && !loading) {
     return `<div class="video-assets-empty">${escapeHtml(tr.emptyVideoHistory)}</div>`;
   }
   const selectionFull = selected.length >= HMB_PICKER_MAX_REPRESENTATIVE_VIDEOS;
@@ -8333,7 +8472,7 @@ function videoAssetCardsHtml(state, tr, locked) {
     tr,
     locked,
     selected.length > 1,
-  )).join("");
+  )).join("") + loading;
 }
 
 export function hmbVideoPickerCompactStructureKey(value) {
@@ -8405,6 +8544,7 @@ export function hmbReconcileVideoPickerCards(container, stateValue, tr = TEXT.en
     empty.textContent = tr.emptyVideoHistory;
     const count = container.querySelector?.(".video-selected-count");
     if (count) count.textContent = `0/${HMB_PICKER_MAX_REPRESENTATIVE_VIDEOS}`;
+    hmbPatchPickerImportCards(container, authoredState);
     return true;
   }
   grid.querySelector?.(".video-assets-empty")?.remove?.();
@@ -8441,6 +8581,7 @@ export function hmbReconcileVideoPickerCards(container, stateValue, tr = TEXT.en
   });
   existingCards.forEach((card, uid) => { if (!retained.has(uid)) card.remove?.(); });
   hmbApplySelectedVideoAssetOrderToDomNormalized(container, authoredState, tr, locked);
+  hmbPatchPickerImportCards(container, authoredState);
   return true;
 }
 
@@ -8565,10 +8706,12 @@ function hmbVideoPickerCompactVideoHtml(state, row, video, tr, locked = false, s
 
 function hmbVideoPickerCompactVideosHtml(state, row, tr, locked = false) {
   const videos = hmbVideoPickerWorkspaceVideos(state, row);
-  if (!videos.length) return `<span class="compact-shot-empty">${escapeHtml(tr.emptyVideoHistory || "No videos")}</span>`;
+  const loading = hmbPickerPendingImports(state, row.workspace_uuid)
+    .map((job) => hmbPickerImportCardHtml(job, state.language, true)).join("");
+  if (!videos.length && !loading) return `<span class="compact-shot-empty">${escapeHtml(tr.emptyVideoHistory || "No videos")}</span>`;
   return videos.map((video, index) => (
     hmbVideoPickerCompactVideoHtml(state, row, video, tr, locked, index + 1)
-  )).join("");
+  )).join("") + loading;
 }
 
 export function hmbVideoPickerCompactSharedPlayer(container, state, uidValue, card) {
@@ -9124,10 +9267,13 @@ function hmbVideoPickerCompactShotPanelHtml(state, row, tr, locked = false) {
   const palette = hmbPickerShotPalette(row.number);
   const active = row.workspace_uuid === clean(state.active_picker_shot_uuid);
   const assetCount = hmbPickerWorkspaceAssetUids(row).length;
+  const imports = hmbPickerPendingImports(state, row.workspace_uuid);
+  const hasCards = assetCount > 0 || imports.length > 0;
+  const reservedCount = assetCount + imports.filter((job) => job.status !== "failed").length;
   const selectedCount = Math.min(row.selected_video_uids.length, HMB_PICKER_MAX_REPRESENTATIVE_VIDEOS);
-  return `<article class="compact-shot-row ${active ? "active" : ""} ${assetCount ? "" : "empty"}" data-picker-shot-row="${escapeHtml(row.workspace_uuid)}" data-shot-number="${row.number}" data-picker-shot-layout="compact" aria-current="${active ? "true" : "false"}" style="--local-shot-accent:${palette.accent};--local-shot-deep:${palette.deep};--shot-accent:${palette.accent};--shot-rgb:${palette.rgb.join(",")}">
-      <header class="compact-shot-head"><button type="button" class="picker-shot-number" data-picker-shot-activate="${escapeHtml(row.workspace_uuid)}" aria-label="${escapeHtml(row.name)}" aria-pressed="${active ? "true" : "false"}" >${String(row.number).padStart(2, "0")}</button><b class="picker-shot-name-label" data-picker-shot-name>${escapeHtml(row.name)}</b><span class="compact-shot-status">VIDEOS ${assetCount}/10 · USE ${selectedCount}</span><em class="picker-shot-video-count">${assetCount}/${HMB_PICKER_MAX_ASSETS_PER_SHOT}</em><button type="button" class="picker-shot-rename compact-shot-rename" data-picker-shot-rename="${escapeHtml(row.workspace_uuid)}" aria-label="${escapeHtml(`Rename ${row.name}`)}" ${locked ? "disabled" : ""}>✎</button><button type="button" class="compact-shot-load import-video-button" data-picker-shot-load="${escapeHtml(row.workspace_uuid)}" ${locked || assetCount >= HMB_PICKER_MAX_ASSETS_PER_SHOT ? "disabled" : ""}>${escapeHtml(tr.load || tr.importVideoAsset || "LOAD")}</button></header>
-      <div class="compact-shot-assets ${assetCount ? "" : "empty"}" data-compact-shot-assets="${escapeHtml(row.workspace_uuid)}">${hmbVideoPickerCompactVideosHtml(state, row, tr, locked)}</div>
+  return `<article class="compact-shot-row ${active ? "active" : ""} ${hasCards ? "" : "empty"}" data-picker-shot-row="${escapeHtml(row.workspace_uuid)}" data-shot-number="${row.number}" data-picker-shot-layout="compact" aria-current="${active ? "true" : "false"}" style="--local-shot-accent:${palette.accent};--local-shot-deep:${palette.deep};--shot-accent:${palette.accent};--shot-rgb:${palette.rgb.join(",")}">
+      <header class="compact-shot-head"><button type="button" class="picker-shot-number" data-picker-shot-activate="${escapeHtml(row.workspace_uuid)}" aria-label="${escapeHtml(row.name)}" aria-pressed="${active ? "true" : "false"}" >${String(row.number).padStart(2, "0")}</button><b class="picker-shot-name-label" data-picker-shot-name>${escapeHtml(row.name)}</b><span class="compact-shot-status">VIDEOS ${assetCount}/10 · USE ${selectedCount}</span><em class="picker-shot-video-count">${assetCount}/${HMB_PICKER_MAX_ASSETS_PER_SHOT}</em><button type="button" class="picker-shot-rename compact-shot-rename" data-picker-shot-rename="${escapeHtml(row.workspace_uuid)}" aria-label="${escapeHtml(`Rename ${row.name}`)}" ${locked ? "disabled" : ""}>✎</button><button type="button" class="compact-shot-load import-video-button" data-picker-shot-load="${escapeHtml(row.workspace_uuid)}" ${locked || reservedCount >= HMB_PICKER_MAX_ASSETS_PER_SHOT ? "disabled" : ""}>${escapeHtml(tr.load || tr.importVideoAsset || "LOAD")}</button></header>
+      <div class="compact-shot-assets ${hasCards ? "" : "empty"}" data-compact-shot-assets="${escapeHtml(row.workspace_uuid)}">${hmbVideoPickerCompactVideosHtml(state, row, tr, locked)}</div>
     </article>`;
 }
 
@@ -9222,7 +9368,8 @@ export function hmbPatchVideoPickerShotWorkspace(
       const name = row.querySelector?.("[data-picker-shot-name]");
       if (!activeRenameInput && name && name.textContent !== shot.name) name.textContent = shot.name;
       const assetCount = hmbPickerWorkspaceAssetUids(shot).length;
-      row.classList?.toggle?.("empty", assetCount === 0);
+      const imports = hmbPickerPendingImports(state, workspaceUuid, container);
+      row.classList?.toggle?.("empty", assetCount === 0 && imports.length === 0);
       const selectedCount = Math.min(
         Array.isArray(shot.selected_video_uids) ? shot.selected_video_uids.length : 0,
         HMB_PICKER_MAX_REPRESENTATIVE_VIDEOS,
@@ -9273,13 +9420,13 @@ export function hmbPatchVideoPickerShotWorkspace(
           if (atIndex !== card) compactAssets.insertBefore?.(card, atIndex);
         });
         existingCards.forEach((card, uid) => { if (!retainedCards.has(uid)) card.remove?.(); });
-        if (!desiredVideos.length && !compactAssets.querySelector?.(".compact-shot-empty")) {
+        if (!desiredVideos.length && !imports.length && !compactAssets.querySelector?.(".compact-shot-empty")) {
           const empty = ownerDocument.createElement("span");
           empty.className = "compact-shot-empty";
           empty.textContent = tr.emptyVideoHistory || "No videos";
           compactAssets.appendChild?.(empty);
         }
-        compactAssets.classList?.toggle?.("empty", !desiredVideos.length);
+        compactAssets.classList?.toggle?.("empty", !desiredVideos.length && !imports.length);
       }
       const atIndex = tabs.children?.[desiredIndex] || null;
       if (atIndex !== row) tabs.insertBefore?.(row, atIndex);
@@ -9324,12 +9471,14 @@ export function hmbPatchVideoPickerShotWorkspace(
     const targetShot = owner
       ? state.picker_shots.find((row) => row.workspace_uuid === owner)
       : active;
-    const targetCount = hmbPickerWorkspaceAssetUids(targetShot).length;
+    const targetCount = hmbPickerWorkspaceAssetUids(targetShot).length
+      + hmbPickerPendingImports(state, targetShot?.workspace_uuid, container).filter((job) => job.status !== "failed").length;
     load.disabled = resolvedLoadLocked
       || !targetShot
       || targetCount >= HMB_PICKER_MAX_ASSETS_PER_SHOT;
   }
   if (mode === "compact") hmbSyncVideoPickerCompactThumbnails(container);
+  hmbPatchPickerImportCards(container, state);
   return !!tabs;
 }
 
@@ -9797,11 +9946,10 @@ export function hmbCreateVideoPickerMediaController(container, options = {}) {
       if (button) button.disabled = snapshotCount < 1;
     }
     const fpsInfo = container.querySelector?.("#frame-info-fps");
-    const rangeInfo = container.querySelector?.("#frame-info-range");
     if (fpsInfo) fpsInfo.textContent = Number.isInteger(frameContext.fps)
       ? String(frameContext.fps)
       : frameContext.fps.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
-    if (rangeInfo) rangeInfo.textContent = `${frameContext.start}–${frameContext.end}`;
+    hmbPatchPickerOutputLength(container, frameContext.state);
     updateFrameUi(previewIdentityChanged ? requestedFrame(frameContext) : null);
     updatePlayUi();
     return frameContext;
@@ -11615,7 +11763,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
           <div class="viewport-stage">${viewportMediaHtml}<div class="picker-crop-overlay nodrag nopan" data-picker-crop-overlay hidden><div class="picker-crop-box" data-picker-crop-box></div></div><div id="picker-preview-load-status" class="preview-load-status" role="alert" aria-live="assertive" hidden><span data-preview-load-message></span><button type="button" id="retry-picker-preview-load">${escapeHtml(tr.retryPreview || "Retry")}</button></div></div>
           <div class="video-seekbar"><input type="range" id="video-seek" min="${frameStart}" max="${frameEnd}" step="1" value="${Math.round(initialViewportFrame)}" aria-label="Video timeline" ${!selectedVideoUrl || snapshotForViewport || !hasFrameRange ? "disabled" : ""}/></div>
           <div class="video-controls"><button type="button" class="transport-button" id="snapshot-prev" title="${escapeHtml(tr.previousSnapshot || "Previous snapshot")}" aria-label="${escapeHtml(tr.previousSnapshot || "Previous snapshot")}" ${snapshotHistory.length ? "" : "disabled"}>◀</button><button type="button" class="transport-button" id="video-play-toggle" title="${escapeHtml(tr.playVideo || "Play")}" aria-label="${escapeHtml(tr.playVideo || "Play")}" ${selectedVideoUrl ? "" : "disabled"}>▶</button><button type="button" class="transport-button" id="snapshot-next" title="${escapeHtml(tr.nextSnapshot || "Next snapshot")}" aria-label="${escapeHtml(tr.nextSnapshot || "Next snapshot")}" ${snapshotHistory.length ? "" : "disabled"}>▶</button><label class="frame-number-label">${escapeHtml(tr.frameLabel)} <input type="number" id="video-frame-number" min="${frameStart}" max="${frameEnd}" step="1" value="${Math.round(initialViewportFrame)}" aria-label="${escapeHtml(tr.frameLabel)}" ${!hasFrameRange || snapshotForViewport ? "disabled" : ""}/></label></div>
-          <div class="frame-info-strip"><span>FRAME <b id="frame-info-frame">${Math.round(initialViewportFrame)} / ${frameEnd}</b></span><span>TIME <b id="frame-info-time">${escapeHtml(initialTimecode)}</b></span><span>FPS <b id="frame-info-fps">${escapeHtml(frameInfoFps || "—")}</b></span><span>RANGE <b id="frame-info-range">${frameStart}–${frameEnd}</b></span></div>
+          <div class="frame-info-strip"><span>FRAME <b id="frame-info-frame">${Math.round(initialViewportFrame)} / ${frameEnd}</b></span><span>TIME <b id="frame-info-time">${escapeHtml(initialTimecode)}</b></span><span>FPS <b id="frame-info-fps">${escapeHtml(frameInfoFps || "—")}</b></span><span><span id="frame-info-total-label">${state.language === "en" ? "TOTAL" : "총 길이"}</span> <b id="frame-info-total">${escapeHtml(hmbPickerOutputLengthText(state))}</b></span></div>
           <div class="snapshot-toolbar"><button type="button" id="create-snapshot" ${!buttonAvailability.snapshotEnabled ? "disabled" : ""}>${escapeHtml(tr.snapshot || "Snapshot")}</button><button type="button" id="delete-snapshot" ${!snapshotDeleteEnabled ? "disabled" : ""}>${escapeHtml(tr.deleteSnapshot || "Delete Snapshot")}</button><div class="output-camera-inline"><span class="output-camera-label">${escapeHtml(tr.cameraPrefix)} :</span><div class="picker-camera-control">${cameraControlHtml(state, tr, runningOperation)}</div></div></div>
           <div class="generate-playblast-toolbar" role="group" aria-label="${escapeHtml(tr.generate)}"><button type="button" class="generate-button" id="run-video" aria-label="${escapeHtml(hmbPickerGenerateCaption(state, container))}" title="${escapeHtml(state.scene_path)}" ${!buttonAvailability.playblastEnabled ? "disabled" : ""}>▶&nbsp; ${escapeHtml(hmbPickerGenerateCaption(state, container))}</button></div>
           <div class="playblast-settings-toolbar">
@@ -12499,6 +12647,26 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     element.addEventListener(eventName, handler, options);
     activeCleanup.push(() => element.removeEventListener(eventName, handler, options));
   };
+  // Register only after the listener helper is initialized (cold factory mount).
+  on(container, "click", (event) => {
+    const button = event.target?.closest?.("[data-picker-import-cancel]");
+    if (!button) return;
+    event.preventDefault?.(); event.stopPropagation?.();
+    const live = currentWidgetState(), importId = clean(button.getAttribute("data-picker-import-cancel"));
+    const key = `${live.runtime_instance_id}:${importId}`;
+    const cancelled = container.__hmbCancelledVideoImports || new Set();
+    container.__hmbCancelledVideoImports = cancelled;
+    if (cancelled.size >= 128) cancelled.delete(cancelled.values().next().value);
+    cancelled.add(key);
+    button.closest?.("[data-picker-import-id]")?.remove?.();
+    const result = dispatchCommand("cancel_video_import", { import_id: importId });
+    const rollback = () => {
+      cancelled.delete(key);
+      if (currentWidgetState().runtime_instance_id === live.runtime_instance_id) hmbPatchPickerImportCards(container, currentWidgetState());
+    };
+    if (!result.delivered) rollback();
+    result.deliveryPromise?.then?.((delivery) => { if (delivery?.ok === false) rollback(); });
+  });
   hmbInstallPickerInteractionIsolation(container, activeCleanup);
   // Do not attach Picker listeners to the React Flow canvas. Media suspension
   // is owned by this widget's own transition/cleanup lifecycle.

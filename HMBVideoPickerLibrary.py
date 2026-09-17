@@ -7454,6 +7454,7 @@ def _append_video_asset(
     item: Dict[str, Any],
     *,
     picker_shot_uuid: Any = "",
+    defer_thumbnail: bool = False,
 ) -> Dict[str, Any]:
     """Append and auto-select one asset in its captured local workspace."""
     try:
@@ -7501,7 +7502,7 @@ def _append_video_asset(
         == _VIDEO_THUMBNAIL_RUNTIME_ID
         else ""
     )
-    if not thumbnail_url:
+    if not thumbnail_url and not defer_thumbnail:
         local_video = _resolved_video_asset_path(record)
         if local_video is not None:
             thumbnail_url, thumbnail_signature = _video_asset_thumbnail_url(
@@ -10918,13 +10919,13 @@ def _choose_video_asset_files(initial_value: Any = "", *, multiple: bool = True)
                 "HMB_VIDEO_ASSET_TEST_SELECTIONS must be a JSON list."
             )
         return [
-            str(_norm_path(item))
+            _clean(item)
             for item in decoded[:maximum]
             if _clean(item)
         ]
     test_selection = _clean(os.environ.get("HMB_VIDEO_ASSET_TEST_SELECTION"))
     if test_selection:
-        return [str(_norm_path(test_selection))]
+        return [test_selection]
     initial_path = _norm_path(initial_value) if _clean(initial_value) else None
     initial_dir = initial_path.parent if initial_path and initial_path.suffix else initial_path
     if os.name == "nt":
@@ -11012,8 +11013,12 @@ def _choose_video_asset_files(initial_value: Any = "", *, multiple: bool = True)
             ) from tkinter_exc
     if isinstance(selected, (str, Path)):
         selected = [selected] if _clean(selected) else []
+    # Preserve the selected names lexically. Path.resolve() contacts a UNC
+    # server on Windows, so doing it here leaves the UI empty after the dialog
+    # closes. The import worker resolves/validates paths AFTER reservations are
+    # published; this is not permission to skip source/media validation.
     return [
-        str(_norm_path(item))
+        _clean(item)
         for item in list(selected or [])[:maximum]
         if _clean(item)
     ]
@@ -12797,6 +12802,8 @@ class HMBVideoPickerLibrary(DataNode):
         # browsers may run concurrently, but no stale whole-state import may
         # overwrite another import or resurrect an ImageAsset-deleted Shot.
         self._hmb_catalog_commit_lock = threading.RLock()
+        self._hmb_video_import_io_lock = threading.Lock()
+        self._hmb_video_import_jobs: Dict[str, Dict[str, Any]] = {}
         self._hmb_shot_snapshot_lock = threading.RLock()
         self._hmb_thumbnail_worker_lock = threading.Lock()
         self._hmb_thumbnail_worker: Optional[threading.Thread] = None
@@ -13123,6 +13130,24 @@ class HMBVideoPickerLibrary(DataNode):
                 normalized = _activate_picker_workspace_projection(
                     normalized, live.get("active_picker_shot_uuid")
                 )
+            # Loading cards are runtime-owned, not reusable saved media. Use
+            # the merged Shot routing so stale Maya progress cannot cancel a
+            # current import or revive one from a different binding/save.
+            workspaces = {row["workspace_uuid"]: row for row in normalized.get("picker_shots", [])}
+            jobs = getattr(self, "_hmb_video_import_jobs", {})
+            for key, job in list(jobs.items()):
+                row = workspaces.get(job["picker_shot_uuid"])
+                if (row is None
+                        or _uuid_text(normalized.get("channel_uuid")) != job["channel_uuid"]
+                        or _uuid_text(row.get("bound_shot_uuid")) != job["bound_shot_uuid"]):
+                    jobs.pop(key, None)
+            if jobs:
+                normalized["video_imports"] = [
+                    {key: job.get(key, "") for key in ("import_id", "picker_shot_uuid", "label", "status", "error", "runtime_instance_id")}
+                    for job in jobs.values()
+                ]
+            else:
+                normalized.pop("video_imports", None)
             self._reconcile_video_tools_state(normalized)
             active_context = getattr(self, "_hmb_active_operation", None)
             if active_context is not None and active_context.picker_shot_uuid:
@@ -16646,6 +16671,7 @@ class HMBVideoPickerLibrary(DataNode):
         *,
         label: Any = "",
         picker_shot_uuid: Any = "",
+        defer_thumbnail: bool = False,
     ) -> Dict[str, Any]:
         """Import one MP4 once per Shot, reusing an existing source card."""
         source = _norm_path(source_path)
@@ -16798,6 +16824,7 @@ class HMBVideoPickerLibrary(DataNode):
             state,
             item,
             picker_shot_uuid=captured_picker_shot_uuid,
+            defer_thumbnail=defer_thumbnail,
         )
         appended = result.get("videos", [])[-1] if result.get("videos") else {}
         result.update({
@@ -16828,7 +16855,142 @@ class HMBVideoPickerLibrary(DataNode):
         *,
         captured_picker_shot_uuid: Any,
         action_id: str,
+        background: bool = False,
     ) -> Dict[str, Any]:
+        """Paint reserved cards before disk I/O, then publish each ready file.
+
+        No pending record enters VIDEO_OUT/Shot routing. Copy/metadata/poster
+        work is serialized per node, outside the UI/catalog locks. Cancellation
+        and captured workspace identity are checked again at the durable commit.
+        """
+        lexical_key = lambda value: os.path.normcase(os.path.normpath(_clean(value))).replace("\\", "/")
+        with self._hmb_catalog_state_commit():
+            state, workspace = _assert_picker_workspace_capacity(self._picker_state(), captured_picker_shot_uuid, 0)
+            captured = _activate_picker_workspace_projection(state, workspace) or state
+            captured_row = next(row for row in captured["picker_shots"] if row["workspace_uuid"] == workspace)
+            jobs = self._hmb_video_import_jobs
+            batch = []
+            for source in list(sources)[:MAX_VIDEO_IMPORT_BATCH]:
+                path = _clean(source.get("source_path"))
+                if not path:
+                    continue
+                key = lexical_key(path)
+                same = [job for job in jobs.values() if job["picker_shot_uuid"] == workspace and job["source_key"] == key]
+                if any(job["status"] != "failed" for job in same):
+                    continue
+                for job in same:
+                    jobs.pop(job["import_id"], None)
+                if len(jobs) >= MAX_PICKER_VIDEO_ASSETS:
+                    expired = next((uid for uid, job in jobs.items() if job["status"] == "failed"), None)
+                    if expired:
+                        jobs.pop(expired, None)
+                    else:
+                        continue
+                existing = next((item for item in state.get("videos", [])
+                    if item.get("picker_shot_uuid") == workspace
+                    and lexical_key(item.get("import_source_path")) == key), None)
+                pending = sum(job["picker_shot_uuid"] == workspace and job["status"] != "failed"
+                    and not job.get("duplicate_uid") for job in jobs.values())
+                try:
+                    _assert_picker_workspace_capacity(state, workspace, pending + (0 if existing else 1))
+                except RuntimeError as exc:
+                    _append_activity_log(state, "WARNING", _clean(exc))
+                    continue
+                job = {
+                    "import_id": f"import-{uuid.uuid4().hex}", "picker_shot_uuid": workspace,
+                    "runtime_instance_id": self._hmb_runtime_instance_id, "source_key": key,
+                    "source_path": path, "label": _clean(source.get("label")) or Path(path).name,
+                    "status": "loading", "error": "", "duplicate_uid": _clean((existing or {}).get("video_uid")),
+                    "scene_path": captured.get("scene_path", ""),
+                    "scene_request_path": captured.get("scene_request_path", ""),
+                    "channel_uuid": _uuid_text(captured.get("channel_uuid")),
+                    "bound_shot_uuid": _uuid_text(captured_row.get("bound_shot_uuid")),
+                }
+                jobs[job["import_id"]] = job
+                batch.append(job)
+            state["backend_ack_action_id"] = action_id
+            state["pending_action"] = state["pending_action_id"] = ""
+            self._write_state(state)
+        _diagnostic(f"video import reservations published: {action_id}; files={len(batch)}; background={background}")
+        if background:
+            # End the native-dialog/command transaction before launching any
+            # path lookup, metadata probe or copy. The retained event loop can
+            # deliver the loading snapshot while the independent worker runs.
+            self._schedule_action_worker(
+                "video_import_copy", action_id,
+                lambda: self._process_video_import_batch(batch, workspace, action_id),
+            )
+            return self._picker_state()
+        return self._process_video_import_batch(batch, workspace, action_id)
+
+    def _process_video_import_batch(
+        self, batch: Sequence[Dict[str, Any]], workspace: str, action_id: str,
+    ) -> Dict[str, Any]:
+        """Resolve/copy reserved sources without keeping the dialog worker alive."""
+        completed = 0
+        with self._hmb_video_import_io_lock:
+            # Defer reuse until copies finish: deleting a pre-existing card
+            # during this batch wins instead of re-importing that source.
+            ordered = [job for job in batch if not job["duplicate_uid"]] + [job for job in batch if job["duplicate_uid"]]
+            for job in ordered:
+                import_id = job["import_id"]
+                try:
+                    with self._hmb_catalog_state_commit():
+                        if not self._video_import_job_alive(job):
+                            continue
+                        if job["duplicate_uid"]:
+                            latest = self._picker_state()
+                            existing = next((item for item in latest.get("videos", []) if item.get("video_uid") == job["duplicate_uid"]), None)
+                            self._hmb_video_import_jobs.pop(import_id, None)
+                            if existing is not None:
+                                latest = _reuse_picker_imported_asset(latest, workspace, existing)
+                            else:
+                                _append_activity_log(latest, "INFO", "Skipped removed source; no deleted card was restored.")
+                            self._write_state(latest)
+                    if job["duplicate_uid"]:
+                        self._schedule_video_removal_output_sync()
+                        continue
+                    result = self._commit_ready_video_import_sources(
+                        [{"source_path": job["source_path"], "label": job["label"]}],
+                        captured_picker_shot_uuid=workspace, action_id=action_id, import_job=job,
+                    )
+                    completed += int(result is not None)
+                except Exception as exc:
+                    with self._hmb_catalog_state_commit():
+                        if self._video_import_job_alive(job):
+                            job["status"] = "failed"
+                            job["error"] = _compact_ui_diagnostic(str(exc), 500)
+                            self._write_state(self._picker_state())
+                    continue
+            if not self._hmb_node_deleted:
+                with self._hmb_catalog_state_commit():
+                    latest = self._picker_state()
+                    latest["message"] = f"Imported {completed} MP4 file(s); loading cards show any unfinished or failed inputs."
+                    _append_activity_log(latest, "INFO", latest["message"])
+                    self._write_state(latest)
+                self._schedule_video_removal_output_sync()
+        return self._picker_state()
+
+    def _video_import_job_alive(self, job: Dict[str, Any]) -> bool:
+        state = self._picker_state()
+        return (
+            not self._hmb_node_deleted
+            and self._hmb_video_import_jobs.get(job["import_id"]) is job
+            and job["runtime_instance_id"] == self._hmb_runtime_instance_id
+            and _uuid_text(state.get("channel_uuid")) == job["channel_uuid"]
+            and any(row.get("workspace_uuid") == job["picker_shot_uuid"]
+                    and _uuid_text(row.get("bound_shot_uuid")) == job["bound_shot_uuid"]
+                    for row in state.get("picker_shots", []))
+        )
+
+    def _commit_ready_video_import_sources(
+        self,
+        sources: Sequence[Dict[str, str]],
+        *,
+        captured_picker_shot_uuid: Any,
+        action_id: str,
+        import_job: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Serialize one import delta against the newest committed catalog.
 
         File dialogs may finish in any order. The commit mutex also covers
@@ -16845,6 +17007,9 @@ class HMBVideoPickerLibrary(DataNode):
             captured_picker_shot_uuid,
             0,
         )
+        if import_job is not None:
+            staging_state["scene_path"] = import_job["scene_path"]
+            staging_state["scene_request_path"] = import_job["scene_request_path"]
         baseline_warning_set = {
             _clean(value)
             for value in staging_state.get("warnings", [])
@@ -16873,6 +17038,7 @@ class HMBVideoPickerLibrary(DataNode):
                     source_path,
                     label=source.get("label"),
                     picker_shot_uuid=captured_workspace_uuid,
+                    defer_thumbnail=import_job is not None,
                 )
                 appended = [
                     dict(item)
@@ -16905,6 +17071,8 @@ class HMBVideoPickerLibrary(DataNode):
         # Re-read immediately before the durable write. Merge only the imported
         # records into that newest state and revalidate the captured workspace.
         with self._hmb_catalog_state_commit():
+            if import_job is not None and not self._video_import_job_alive(import_job):
+                return None
             state, captured_workspace_uuid = _assert_picker_workspace_capacity(
                 self._picker_state(),
                 captured_workspace_uuid,
@@ -16955,17 +17123,23 @@ class HMBVideoPickerLibrary(DataNode):
                     # Never resurrect the old card or report it as reused.
                     removed_duplicate_count += 1
             for imported_record in pending_records:
+                if import_job is not None:
+                    imported_record["import_request_id"] = import_job["import_id"]
                 state = _append_video_asset(
                     state,
                     imported_record,
                     picker_shot_uuid=captured_workspace_uuid,
+                    defer_thumbnail=import_job is not None,
                 )
+            if import_job is not None:
+                self._hmb_video_import_jobs.pop(import_job["import_id"], None)
             state["backend_ack_action_id"] = action_id
             state["pending_action"] = ""
             state["pending_action_id"] = ""
-            state["status"] = "VIDEO_READY"
-            state["scene_stage"] = "VIDEO_READY"
-            state["workspace_view"] = "playblast"
+            if not (self._hmb_active_operation is not None or self._hmb_pending_operation_id or self._hmb_process_lock.locked()):
+                state["status"] = "VIDEO_READY"
+                state["scene_stage"] = "VIDEO_READY"
+                state["workspace_view"] = "playblast"
             imported_count = len(pending_records)
             if imported_count:
                 state["message"] = (
@@ -17019,8 +17193,24 @@ class HMBVideoPickerLibrary(DataNode):
                 state["warnings"] = warnings[-20:]
                 _append_activity_log(state, "WARNING", warning)
             self._write_state(state)
-            self._sync_outputs_from_state(state)
-            return state
+        self._schedule_video_removal_output_sync()
+        # The ready card is visible before poster extraction. Enrich only the
+        # exact surviving UID; a deleted card must never be appended again.
+        for record in pending_records:
+            path = _resolved_video_asset_path(record)
+            if path is None or self._hmb_node_deleted:
+                continue
+            uid = _clean(record.get("video_uid"))
+            url, signature = _video_asset_thumbnail_url(path, uid)
+            if not url:
+                continue
+            with self._hmb_catalog_state_commit():
+                latest = self._picker_state()
+                surviving = next((item for item in latest.get("videos", []) if item.get("video_uid") == uid), None)
+                if surviving is not None and not self._hmb_node_deleted:
+                    surviving.update(thumbnail_url=url, thumbnail_runtime_id=_VIDEO_THUMBNAIL_RUNTIME_ID, thumbnail_source_signature=signature)
+                    self._write_state(latest)
+        return self._picker_state()
 
     def _acknowledge_video_import_failure(
         self,
@@ -17810,6 +18000,23 @@ class HMBVideoPickerLibrary(DataNode):
                 video_uid=payload.get("video_uid") or payload.get("source_uid"),
             )
             return
+        if action == "cancel_video_import":
+            with self._hmb_catalog_state_commit():
+                state = self._picker_state()
+                import_id = _clean(payload.get("import_id"))
+                self._hmb_video_import_jobs.pop(import_id, None)
+                # Cancellation may cross the ready-card publication. Remove
+                # that exact import only; originals on disk are never deleted.
+                ready_uids = [item["video_uid"] for item in state.get("videos", [])
+                    if import_id and item.get("import_request_id") == import_id]
+                if ready_uids:
+                    state = _remove_video_asset_uids(state, ready_uids, record_tool_deletion=True)
+                state["backend_ack_action_id"] = action_id
+                state["message"] = "Video import cancelled; source media was not deleted."
+                self._write_state(state)
+            if ready_uids:
+                self._schedule_video_removal_output_sync()
+            return
         if action in {"cancel_pending", "stop_read", "cancel_operation"}:
             self._hmb_cancel_requested.set()
             self._handle_cancel_action(state)
@@ -17839,6 +18046,7 @@ class HMBVideoPickerLibrary(DataNode):
                     {"source_path": source_path, "label": ""}
                     for source_path in _choose_video_asset_files(initial_path)
                 ]
+                _diagnostic(f"native video selection returned: {action_id}; files={len(sources)}")
             elif isinstance(payload.get("sources"), list):
                 for raw_source in payload["sources"][:MAX_VIDEO_IMPORT_BATCH]:
                     if isinstance(raw_source, dict):
@@ -17885,6 +18093,7 @@ class HMBVideoPickerLibrary(DataNode):
                     sources,
                     captured_picker_shot_uuid=captured_picker_shot_uuid,
                     action_id=action_id,
+                    background=True,
                 )
             except Exception as exc:
                 self._acknowledge_video_import_failure(action_id, exc)
