@@ -936,6 +936,10 @@ class NoPostBridge:
 # clears the unsent provisional identity and reaches neither the Broker create
 # method nor the submission wrapper, so a corrected retry is not blocked.
 pre_submit = target.HMBSeedanceGeneration(name="Seedance Save Boundary")
+# These synthetic nodes are not registered in the retained host. Model a
+# manual prompt source so the real Agent connection guard does not mask the
+# checkpoint/Stop boundary this fixture is intended to exercise.
+pre_submit._manual_agent_prompt_source = lambda: None
 pre_submit_bridge = NoPostBridge()
 pre_submit._runtime_node_is_live = lambda *, require_registered=False: True
 pre_submit._output_file = SimpleNamespace(build_file=lambda: object())
@@ -1191,6 +1195,7 @@ async def verify_submission_liveness_gates() -> None:
     # The engine-loop gate is repeated after the required save because five
     # generators can wait there. A deletion during that await also wins.
     saved_node = target.HMBSeedanceGeneration(name="Seedance Post Save Gate")
+    saved_node._manual_agent_prompt_source = lambda: None
     saved_node._runtime_node_is_live = (
         lambda *, require_registered=False: not saved_node._hmb_node_deleted
     )
@@ -1252,6 +1257,7 @@ async def verify_submission_liveness_gates() -> None:
             return self._test_cancellation_requested
 
     stopped_node = StopGateNode(name="Seedance Post Save Stop Gate")
+    stopped_node._manual_agent_prompt_source = lambda: None
     stopped_node._runtime_node_is_live = lambda *, require_registered=False: True
     stopped_node._output_file = SimpleNamespace(build_file=lambda: object())
     stopped_node._get_parameters = lambda: {

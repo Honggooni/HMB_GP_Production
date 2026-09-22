@@ -485,7 +485,7 @@ SHOT_FINISH_LOOK_INPUT_PARAMETER = "SHOT_FINISH_LOOK_IN"
 GENERATED_VIDEO_SOURCE_PARAMETER = "HMB_GENERATED_VIDEO_SOURCE"
 GENERATED_VIDEO_SOURCE_SCHEMA = "hmb-generated-video-source"
 FINISH_LOOK_SHOT_SNAPSHOT_SCHEMA = "hmb-finish-look-shot-snapshot"
-FINISH_LOOK_SHOT_SNAPSHOT_VERSION = 1
+FINISH_LOOK_SHOT_SNAPSHOT_VERSION = 2
 SHOT_PICKER_LEGACY_JSON_MAX_BYTES = 1024 * 1024
 SHOT_AUTOCLAIM_ENABLED_PARAMETER = "HMB_SHOT_AUTOCLAIM_ENABLED"
 SHOT_SELECTOR_PARAMETER = "shot_selector"
@@ -572,7 +572,7 @@ GENERATION_PREVIEW_GUIDANCE = {
         "자동 조회 시간이 끝났습니다. 기존 작업 결과만 다시 확인합니다."
     ),
     "submission_unknown": (
-        "제출 응답을 확인하지 못했습니다. 새 작업을 만들지 않고 기존 요청만 확인합니다."
+        "접수 여부가 불명확합니다. 결과 조회는 기존 요청만 확인하며, 새 Run은 별도 렌더를 제출합니다. 중복 과금될 수 있습니다."
     ),
     "failed": "작업 상태 또는 결과 수신을 확인해야 합니다.",
     "succeeded": "",
@@ -4430,10 +4430,25 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
         return True
 
-    def _assert_new_submission_is_safe(self) -> None:
+    def _assert_new_submission_is_safe(self, *, explicit_run: bool = False) -> None:
+        """Unresolved history prevents automatic replay, not a fresh explicit Run.
+
+        The live run/refresh lock in ``aprocess`` still serializes this node.
+        Do not clear or mark the previous remote task terminal here: preflight
+        may fail, and Refresh must still be able to inspect the saved identity.
+        Only a validated new pre-submit checkpoint replaces that identity.
+        """
         if not self._generation_recovery_blocks_new_submission():
             return
         checkpoint = self._generation_recovery_state()
+        if explicit_run:
+            logger.warning(
+                "%s explicit Run supersedes unresolved task %s (%s). "
+                "The remote task was not cancelled; duplicate charges are possible. "
+                "No automatic resubmission is enabled.",
+                self.name, checkpoint["task_id"], checkpoint.get("status"),
+            )
+            return
         self._restore_generation_recovery_preview()
         raise RuntimeError(
             "A previously submitted Seedance task still requires confirmation. "
@@ -6587,7 +6602,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         *,
         expected_subscription: Mapping[str, Any],
     ) -> dict[str, Any]:
-        """Validate the exact post-Agent finishing sidecar before submission."""
+        """Verify the sidecar, then compile only its canonical Character Beauty."""
+
+        if isinstance(value, dict) and value.get("version") == 1:
+            # The retired snapshot carried only a state hash, not the state.
+            # Its prose can contain removed film instructions and must never be
+            # reused, guessed from text, or stripped out of the user's prompt.
+            raise RuntimeError(
+                "Seedance Finish Look snapshot requires a Character Beauty refresh. "
+                "Refresh or reopen the Finish Look node so it republishes its saved "
+                "settings in the current format. Retired filter instructions were not applied."
+            )
 
         required = {
             "schema",
@@ -6600,11 +6625,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "finish_look_sha256",
             "state_sha256",
             "finish_look_out",
+            "finish_look_state",
         }
         if not isinstance(value, dict) or set(value) != required:
             raise RuntimeError("Seedance Finish Look snapshot shape is invalid.")
         if (
             value.get("schema") != FINISH_LOOK_SHOT_SNAPSHOT_SCHEMA
+            or type(value.get("version")) is not int
             or value.get("version") != FINISH_LOOK_SHOT_SNAPSHOT_VERSION
         ):
             raise RuntimeError("Seedance Finish Look snapshot version is invalid.")
@@ -6634,17 +6661,63 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
         ):
             raise RuntimeError("Seedance Finish Look snapshot integrity is invalid.")
+        state = value.get("finish_look_state")
+        try:
+            encoded_state = json.dumps(
+                state,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError("Seedance Finish Look state integrity is invalid.") from exc
+        if not hmac.compare_digest(state_sha256, hashlib.sha256(encoded_state).hexdigest()):
+            raise RuntimeError("Seedance Finish Look state integrity is invalid.")
+        if (
+            not isinstance(state, dict)
+            or set(state) != {"schema_version", "beauty"}
+            or type(state.get("schema_version")) is not int
+            or state["schema_version"] != 2
+        ):
+            raise RuntimeError(
+                "Seedance Finish Look state requires a Character Beauty refresh. "
+                "Republish the Finish Look node before rendering."
+            )
+        try:
+            from HMBFinishLookLibrary import (
+                compile_finish_look_prompt,
+                validate_finish_look_state,
+            )
+
+            canonical_state = validate_finish_look_state(state)
+            # Even correctly hashed saved prose is not execution authority.
+            # Recompile with the active Beauty-only implementation so an older
+            # full-frame film block cannot return after workflow hydration.
+            instruction = compile_finish_look_prompt(canonical_state)
+        except Exception as exc:
+            raise RuntimeError("Seedance Finish Look Character Beauty state is invalid.") from exc
         return {
             **value,
-            "finish_look_sha256": finish_sha256,
-            "state_sha256": state_sha256,
+            "finish_look_out": instruction,
+            "finish_look_state": canonical_state,
+            "finish_look_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+            "state_sha256": hashlib.sha256(
+                json.dumps(
+                    canonical_state,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest(),
         }
 
     @staticmethod
     def _compose_finish_look_prompt(base_prompt: Any, finish_look: Any) -> str:
-        """Append exact Finish Look bytes after Agent output, then final guards."""
+        """Append verified Character Beauty without rewriting Agent/user text."""
 
-        base = str(base_prompt or "").strip()
+        base = str(base_prompt or "")
         finish = str(finish_look or "")
         if not finish:
             return base
@@ -6655,17 +6728,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             f"{finish}\n\n"
             "HMB FINAL RENDER RULES\n"
             "Apply the verbatim Finish Look block after the resolved Global Look and before "
-            "final rendering. It may affect only Character Beauty and Filter Application. "
+            "final rendering. It may affect only Character Beauty. "
             "Apply Character Beauty exclusively to character-owned surfaces, including the "
             "face, body, hair, costume, and character materials; never apply it to the "
             "background, environment, sky, ground, set dressing, independent props, FX, or "
-            "the camera image as a whole. Filter Application may affect the completed frame "
-            "only through its explicitly authored film-stock color and tonal response, "
-            "printer-light balance, gamma/exposure response, highlight glow, soft-focus "
-            "diffusion, and vignette. It must not alter "
+            "the camera image as a whole. It must not alter "
             "character identity, design, geometry, camera, framing, animation, timing, FX "
             "placement, environment content, or the Global Look's lighting direction and "
-            "composition. Do not introduce or simulate film grain."
+            "composition."
         )
 
     def _resolve_exact_shot_generation_inputs(
@@ -6680,6 +6750,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if not subscription["enabled"]:
             resolved = dict(params)
             resolved["prompt"] = str(params.get("prompt") or "")
+            # Only has no exact Shot finishing source. Discard a previous
+            # bound-Shot transient sidecar without touching authored text.
+            resolved["_hmb_finish_look_out"] = ""
             task = str(params.get(TASK_PARAMETER) or "").strip()
             if not task:
                 task = INPUT_MODE_TASKS.get(
@@ -8478,7 +8551,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "its recovery window without confirming a failed or unsubmitted render. "
             "The task ID was retained. Use Status > Refresh / Retrieve Result for "
             "this same task, or ask the Broker administrator to reconcile its provider "
-            "record. Do not delete the node or replace the task ID to retry."
+            "record. A new explicit Run with Resume Task ID empty submits a separate "
+            "render without cancelling the previous task; duplicate charges are possible."
         ) + ("\nServer details: " + safe_detail if safe_detail else "")
 
     def _set_broker_task_outputs(
@@ -8488,6 +8562,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         generation_id: str,
         status: str,
         preview_action: str = "none",
+        requested_generation_id: str = "",
     ) -> None:
         if getattr(self, "_hmb_node_deleted", False):
             return
@@ -8511,11 +8586,43 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if safe_detail:
             provider_response["error_details"] = safe_detail
         self.parameter_output_values["provider_response"] = provider_response
+        self._retire_failed_resume_id(
+            task, generation_id, requested_generation_id=requested_generation_id
+        )
         self._publish_generation_preview(
             self._generation_preview_phase_for_status(status),
             generation_id=generation_id,
             action=preview_action,
         )
+
+    def _retire_failed_resume_id(
+        self,
+        task: dict[str, Any],
+        generation_id: str,
+        *,
+        requested_generation_id: str = "",
+    ) -> None:
+        """Release only the Resume field for this confirmed failed lookup.
+
+        Keep the task ID, error and recovery checkpoint for audit/Refresh. This
+        does not submit anything: the user must explicitly Run again. A validated
+        lookup may promote a client key to a Broker job ID; either identity then
+        refers to the same failed request. Never clear another manually entered ID.
+        """
+        if (
+            getattr(self, "_hmb_node_deleted", False)
+            or not generation_id
+            or str(task.get("id") or "") != generation_id
+            or str(task.get("status") or "").strip().lower() not in TERMINAL_FAILURE_STATUSES
+            or (
+                task.get("resubmit_allowed") is False
+                and task.get("error_code") in {"submission_unknown", "provider_overdue"}
+            )
+        ):
+            return
+        resume_id = str(self.get_parameter_value("resume_generation_id") or "").strip()
+        if resume_id and resume_id in {generation_id, requested_generation_id}:
+            self.set_parameter_value("resume_generation_id", "")
 
     def _set_generation_status(
         self,
@@ -9671,6 +9778,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 task,
                 generation_id=generation_id,
                 status=status,
+                requested_generation_id=requested_generation_id,
                 preview_action=(
                     "refresh_existing"
                     if status in {"queued", "running", "submission_unknown"}
@@ -9977,11 +10085,33 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self.get_parameter_value("resume_generation_id") or ""
         ).strip()
         recovery_before_run = self._generation_recovery_state()
+        if (
+            requested_resume_id
+            and requested_resume_id == recovery_before_run.get("task_id")
+            and not self._generation_recovery_blocks_new_submission()
+        ):
+            # Saved pre-patch workflows can still contain a Resume ID whose
+            # confirmed failure was already recorded. Run starts fresh; Refresh
+            # remains available for inspecting that preserved terminal record.
+            self._retire_failed_resume_id(
+                {
+                    "id": requested_resume_id,
+                    "status": recovery_before_run.get("status"),
+                },
+                requested_resume_id,
+            )
+            requested_resume_id = str(
+                self.get_parameter_value("resume_generation_id") or ""
+            ).strip()
         if not requested_resume_id or (
             self._generation_recovery_blocks_new_submission()
             and requested_resume_id != recovery_before_run.get("task_id")
         ):
-            self._assert_new_submission_is_safe()
+            # Run without an explicit Resume ID means a fresh render, even if
+            # an older request is still unknown/running remotely. This is not
+            # a retry loop: one new client key and at most one create per Run.
+            # An explicit Resume remains a same-task, non-billable lookup.
+            self._assert_new_submission_is_safe(explicit_run=not requested_resume_id)
         self._set_safe_defaults()
         self._begin_generation_preview()
         self._set_generation_status("resolving_inputs", generation_id="")
@@ -10372,9 +10502,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 raise TimeoutError(
                     f"FN AI Broker task {generation_id} did not finish within "
                     f"{timeout} seconds. The server render continues; use Refresh / "
-                    "Retrieve Result for this same ID instead of starting a new render."
+                    "Retrieve Result to check this same ID. A new explicit Run submits "
+                    "a separate render and may incur duplicate charges."
                 )
 
+            requested_generation_id = generation_id
             response = await asyncio.to_thread(
                 bridge.refresh_job,
                 generation_id,
@@ -10413,6 +10545,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 task,
                 generation_id=generation_id,
                 status=status,
+                requested_generation_id=requested_generation_id,
             )
             logger.info(
                 "%s FN AI Broker task %s status: %s",
@@ -10582,15 +10715,19 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 elif terminal:
                     safe_message += (
                         f"\nExisting task ID: {generation_id}. This Broker job is "
-                        "terminal. Refresh / Retrieve Result only retrieves the same "
+                        "terminal. The next explicit Run can start a new render. "
+                        "Refresh / Retrieve Result only retrieves the same "
                         "final state; it does not resume, restart, or duplicate "
-                        "a render."
+                        "a render. No automatic render was submitted."
                     )
                 else:
                     safe_message += (
                         f"\nExisting task ID: {generation_id}. The server render can "
                         "continue after a disconnect. Use Refresh / Retrieve Result to "
-                        "check this same task without creating a duplicate."
+                        "check this same task without creating a duplicate. A new "
+                        "explicit Run with Resume Task ID empty submits a separate "
+                        "render; the previous task is not cancelled and duplicate "
+                        "charges are possible."
                     )
             if submission_unknown:
                 if not self._runtime_node_is_live(require_registered=True):
@@ -10604,6 +10741,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     "\nRefresh / Retrieve Result checks the same client request ID "
                     "only. It never repeats the create-task request or creates a new "
                     "idempotency key."
+                    "\nA new explicit Run with Resume Task ID empty submits a separate "
+                    "render. The previous task is not cancelled; duplicate charges "
+                    "are possible. No automatic resubmission was performed."
                     "\nTemporary local video uploads are being retained for up to "
                     "30 minutes so an accepted remote task can still fetch them."
                 )

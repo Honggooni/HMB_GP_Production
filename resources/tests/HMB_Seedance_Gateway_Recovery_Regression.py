@@ -103,6 +103,7 @@ async def verify_recovery():
     # The canonical failed job recovered after an unknown POST unlocks Run,
     # while keeping the ID as terminal history. Refresh never creates a job.
     node = node_with_checkpoint()
+    node.set_parameter_value("resume_generation_id", "hmb-client-key")
     bridge = ResponseBridge(request(502, {"status": "failed", "job_id": "job-canonical"}))
     node._ensure_broker_connected = mock.AsyncMock(return_value=bridge)
     await node._refresh_async()
@@ -111,6 +112,7 @@ async def verify_recovery():
     assert checkpoint["task_identity"] == "broker_task"
     assert checkpoint["terminal"] is True
     assert node._generation_recovery_blocks_new_submission() is False
+    assert not node.get_parameter_value("resume_generation_id")
     node._assert_new_submission_is_safe()
     assert bridge.lookups == ["hmb-client-key"] and bridge.create_count == 0
 
@@ -166,6 +168,7 @@ async def verify_recovery():
         assert bridge.lookups == [resume] and bridge.create_count == 0
         assert node._generation_recovery_state()["task_id"] == response_id
         assert node._generation_recovery_blocks_new_submission() is False
+        assert not node.get_parameter_value("resume_generation_id")
 
 
 asyncio.run(verify_recovery())

@@ -11,7 +11,7 @@ import re
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Mapping, NamedTuple, Sequence
+from typing import Any, Mapping, Sequence
 
 
 _THIS_DIR = Path(__file__).resolve().parent
@@ -50,7 +50,7 @@ except Exception:
 
 LOGGER = logging.getLogger("griptape_nodes")
 EPSILON = 1e-6
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 WIDGET_NAME = "HMBFinishLookLibraryWidget"
 WIDGET_LIBRARY_NAME = "HMB_GP_Production"
 WIDGET_PARAMETER_NAME = "HMB_FINISH_LOOK_UI_STATE"
@@ -69,7 +69,7 @@ SHOT_ROUTING_CATALOG_VERSION = 1
 SHOT_SUBSCRIPTION_SCHEMA = "hmb-shot-channel-subscription"
 SHOT_SUBSCRIPTION_VERSION = 1
 FINISH_LOOK_SHOT_SNAPSHOT_SCHEMA = "hmb-finish-look-shot-snapshot"
-FINISH_LOOK_SHOT_SNAPSHOT_VERSION = 1
+FINISH_LOOK_SHOT_SNAPSHOT_VERSION = 2
 MAX_SHOTS = 5
 FINISH_LOOK_NODE_WIDTH = 980
 FINISH_LOOK_NODE_HEIGHT = 1040
@@ -83,49 +83,10 @@ class FinishLookValidationError(ValueError):
     """A state or remote request violates the public Finish Look contract."""
 
 
-class FilmStock(NamedTuple):
-    name: str
-    kind: str
-    ignores_negative: bool = False
-
-
-FILM_STOCK_CATALOG: tuple[FilmStock, ...] = (
-    FilmStock("None", "negative"),
-    FilmStock("Kodak 5245", "negative"),
-    FilmStock("Kodak 5246", "negative"),
-    FilmStock("Kodak 5248", "negative"),
-    FilmStock("Kodak 5274", "negative"),
-    FilmStock("Kodak 5277", "negative"),
-    FilmStock("Kodak 5279", "negative"),
-    FilmStock("Kodak 5284", "negative"),
-    FilmStock("Kodak 5289", "negative"),
-    FilmStock("Kodak 5293", "negative"),
-    FilmStock("Kodak 5298", "negative"),
-    FilmStock("K SFX200T", "negative"),
-    FilmStock("Kodak 5217", "negative"),
-    FilmStock("Kodak 5218", "negative"),
-    FilmStock("None", "print"),
-    FilmStock("Kodak 2383", "print"),
-    FilmStock("Kodak 2393", "print"),
-    FilmStock("Kodak 2395", "print"),
-    FilmStock("Kodak 5386", "print"),
-    FilmStock("Kodak 5285 Rev", "reversal", True),
-    FilmStock("Kodak 7270 Rev", "reversal", True),
-)
-NEGATIVE_FILM_STOCKS: tuple[str, ...] = tuple(
-    stock.name for stock in FILM_STOCK_CATALOG if stock.kind == "negative"
-)
-PRINT_FILM_STOCKS: tuple[str, ...] = tuple(
-    stock.name for stock in FILM_STOCK_CATALOG if stock.kind in {"print", "reversal"}
-)
-REVERSAL_FILM_STOCKS: frozenset[str] = frozenset(
-    stock.name for stock in FILM_STOCK_CATALOG if stock.ignores_negative
-)
-
 DEFAULT_FINISH_LOOK_STATE: dict[str, Any] = {
     "schema_version": SCHEMA_VERSION,
     "beauty": {
-        "enabled": True,
+        "enabled": False,
         "soften_shadows": 0.11,
         "shadow_threshold": 0.27,
         "saturation": 1.0,
@@ -138,26 +99,10 @@ DEFAULT_FINISH_LOOK_STATE: dict[str, Any] = {
         "pore_size": 0.0,
         "reduce_shine": 0.0,
     },
-    "film": {
-        "enabled": True,
-        "negative_film": "Kodak 5245",
-        "print_film": "Kodak 2383",
-        "scale_cc": 0.3,
-        "printer_light_r": 26,
-        "printer_light_g": 25,
-        "printer_light_b": 24,
-        "input_gamma": 1.2,
-        "output_gamma": 2.2,
-        "negative_exposure": 0.0,
-        "print_exposure": 0.0,
-        "glow_brightness": 0.1,
-        "soft_focus": 0.0,
-        "vignette": 0.0,
-    },
 }
 
 DEFAULT_REMOTE_STATUS: dict[str, Any] = {
-    "schema_version": SCHEMA_VERSION,
+    "schema_version": 1,
     "status": "idle",
     "code": "idle",
     "message": "",
@@ -167,14 +112,6 @@ DEFAULT_REMOTE_STATUS: dict[str, Any] = {
 
 def default_finish_look_state() -> dict[str, Any]:
     return copy.deepcopy(DEFAULT_FINISH_LOOK_STATE)
-
-
-def film_stock_catalog_payload() -> dict[str, list[str]]:
-    return {
-        "negative": list(NEGATIVE_FILM_STOCKS),
-        "print": list(PRINT_FILM_STOCKS),
-        "reversal": sorted(REVERSAL_FILM_STOCKS),
-    }
 
 
 def _shot_only() -> dict[str, Any]:
@@ -404,19 +341,6 @@ def _number(
     return result
 
 
-def _integer(
-    value: Any,
-    field: str,
-    *,
-    minimum: int | None = None,
-    maximum: int | None = None,
-) -> int:
-    result = _number(value, field, minimum=minimum, maximum=maximum)
-    if not result.is_integer():
-        raise FinishLookValidationError(f"{field} must be an integer.")
-    return int(result)
-
-
 def _choice(value: Any, choices: Sequence[str], field: str) -> str:
     if not isinstance(value, str) or value not in choices:
         raise FinishLookValidationError(f"{field} must be one of: {', '.join(choices)}.")
@@ -425,9 +349,14 @@ def _choice(value: Any, choices: Sequence[str], field: str) -> str:
 
 def validate_finish_look_state(value: Any) -> dict[str, Any]:
     state = _mapping(value, "Finish Look state")
-    _exact_keys(state, {"schema_version", "beauty", "film"}, "Finish Look state")
-    if type(state.get("schema_version")) is not int or state["schema_version"] != SCHEMA_VERSION:
-        raise FinishLookValidationError("schema_version must be integer 1.")
+    version = state.get("schema_version")
+    if type(version) is not int or version not in (1, SCHEMA_VERSION):
+        raise FinishLookValidationError("schema_version must be integer 1 or 2.")
+    # Old workflows migrate Beauty settings, never their retired film instructions.
+    expected = {"schema_version", "beauty"}
+    if version == 1 and "film" in state:
+        expected.add("film")
+    _exact_keys(state, expected, "Finish Look state")
 
     beauty = _mapping(state["beauty"], "beauty")
     beauty_keys = {
@@ -460,44 +389,9 @@ def validate_finish_look_state(value: Any) -> dict[str, Any]:
         "reduce_shine": _number(beauty["reduce_shine"], "beauty.reduce_shine", minimum=0, maximum=1),
     }
 
-    film = _mapping(state["film"], "film")
-    film_keys = {
-        "enabled",
-        "negative_film",
-        "print_film",
-        "scale_cc",
-        "printer_light_r",
-        "printer_light_g",
-        "printer_light_b",
-        "input_gamma",
-        "output_gamma",
-        "negative_exposure",
-        "print_exposure",
-        "glow_brightness",
-        "soft_focus",
-        "vignette",
-    }
-    _exact_keys(film, film_keys, "film")
-    normalized_film = {
-        "enabled": _boolean(film["enabled"], "film.enabled"),
-        "negative_film": _choice(film["negative_film"], NEGATIVE_FILM_STOCKS, "film.negative_film"),
-        "print_film": _choice(film["print_film"], PRINT_FILM_STOCKS, "film.print_film"),
-        "scale_cc": _number(film["scale_cc"], "film.scale_cc", minimum=0, maximum=5),
-        "printer_light_r": _integer(film["printer_light_r"], "film.printer_light_r", minimum=0, maximum=50),
-        "printer_light_g": _integer(film["printer_light_g"], "film.printer_light_g", minimum=0, maximum=50),
-        "printer_light_b": _integer(film["printer_light_b"], "film.printer_light_b", minimum=0, maximum=50),
-        "input_gamma": _number(film["input_gamma"], "film.input_gamma", minimum=0.1),
-        "output_gamma": _number(film["output_gamma"], "film.output_gamma", minimum=0.1),
-        "negative_exposure": _number(film["negative_exposure"], "film.negative_exposure"),
-        "print_exposure": _number(film["print_exposure"], "film.print_exposure"),
-        "glow_brightness": _number(film["glow_brightness"], "film.glow_brightness", minimum=0),
-        "soft_focus": _number(film["soft_focus"], "film.soft_focus", minimum=0, maximum=1),
-        "vignette": _number(film["vignette"], "film.vignette", minimum=0, maximum=1),
-    }
     return {
         "schema_version": SCHEMA_VERSION,
         "beauty": normalized_beauty,
-        "film": normalized_film,
     }
 
 
@@ -601,8 +495,11 @@ def compile_beauty_glow_prompt(beauty: Mapping[str, Any]) -> str:
 
 def compile_beauty_prompt(state: Mapping[str, Any]) -> str:
     beauty = state.get("beauty") if isinstance(state.get("beauty"), Mapping) else state
-    if not bool(beauty.get("enabled", True)):
+    if not bool(beauty.get("enabled", False)):
         return ""
+    shadow_phrase = _beauty_shadow_phrase(float(beauty["soften_shadows"]))
+    if not is_zero(float(beauty["soften_shadows"])):
+        shadow_phrase += " " + _beauty_threshold_phrase(float(beauty["shadow_threshold"]))
     parts = [
         (
             "Apply Character Beauty exclusively inside each visible character's matte and silhouette, "
@@ -617,8 +514,7 @@ def compile_beauty_prompt(state: Mapping[str, Any]) -> str:
         ),
         (
             "Within that character-only scope, apply restrained beauty processing with "
-            f"{_beauty_shadow_phrase(float(beauty['soften_shadows']))} "
-            f"{_beauty_threshold_phrase(float(beauty['shadow_threshold']))}, while preserving "
+            f"{shadow_phrase}, while preserving "
             "clean character edges, material definition, and natural character-surface texture."
         ),
         (
@@ -662,285 +558,13 @@ def compile_beauty_prompt(state: Mapping[str, Any]) -> str:
     return "CHARACTER BEAUTY — CHARACTER-MATTE-ONLY SCOPE\n" + join_sentences(parts)
 
 
-def _is_reversal(print_film: str) -> bool:
-    return print_film in REVERSAL_FILM_STOCKS
-
-
-def _film_stock_clause(film: Mapping[str, Any]) -> str:
-    negative = str(film["negative_film"])
-    print_film = str(film["print_film"])
-    if _is_reversal(print_film):
-        return f"a clean {print_film} reversal-film response"
-    if negative != "None" and print_film != "None":
-        return (
-            f"a clean {negative} negative-film response combined with "
-            f"a {print_film} print-film response"
-        )
-    if negative != "None":
-        return f"a clean {negative} negative-film response without an additional print-film stock response"
-    if print_film != "None":
-        return f"a clean {print_film} print-film response"
-    return ""
-
-
-def compile_film_stock_prompt(film: Mapping[str, Any]) -> str:
-    clause = _film_stock_clause(film)
-    return f"Apply {clause}." if clause else ""
-
-
-def _scale_cc_clause(value: float) -> str:
-    if value <= EPSILON:
-        return ""
-    if value <= 0.15:
-        return "extremely restrained film color correction"
-    if value <= 0.35:
-        return "restrained film color correction at low strength"
-    if value <= 0.60:
-        return "moderate film color correction"
-    if value <= 0.85:
-        return "strong film color correction"
-    return "high-strength film color correction"
-
-
-def compile_scale_cc_prompt(film: Mapping[str, Any]) -> str:
-    clause = _scale_cc_clause(float(film["scale_cc"]))
-    return f"Use {clause}." if clause else ""
-
-
-def _printer_strength(value: float) -> str:
-    magnitude = abs(float(value))
-    if magnitude <= EPSILON:
-        return "neutral"
-    if magnitude <= 1:
-        return "very subtle"
-    if magnitude <= 2:
-        return "subtle"
-    if magnitude <= 4:
-        return "moderate"
-    return "strong"
-
-
-def analyze_printer_lights(r: float, g: float, b: float) -> dict[str, Any]:
-    values = tuple(_number(value, f"printer light {name}", minimum=0, maximum=50) for name, value in zip("RGB", (r, g, b)))
-    dr, dg, db = (value - 25.0 for value in values)
-    common = (dr + dg + db) / 3.0
-    relative = {"R": dr - common, "G": dg - common, "B": db - common}
-    color_for = {
-        ("R", 1): "cyan",
-        ("R", -1): "red",
-        ("G", 1): "magenta",
-        ("G", -1): "green",
-        ("B", 1): "yellow",
-        ("B", -1): "blue",
-    }
-    order = {"R": 0, "G": 1, "B": 2}
-    selected = sorted(
-        ((channel, delta) for channel, delta in relative.items() if abs(delta) > EPSILON),
-        key=lambda item: (-abs(item[1]), order[item[0]]),
-    )[:2]
-    colors = [color_for[(channel, 1 if delta > 0 else -1)] for channel, delta in selected]
-    temperature = ""
-    if colors and all(color in {"cyan", "blue"} for color in colors):
-        temperature = "cool"
-    elif colors and all(color in {"red", "yellow"} for color in colors):
-        temperature = "warm"
-    return {
-        "common_density": common,
-        "red_channel_delta": relative["R"],
-        "green_channel_delta": relative["G"],
-        "blue_channel_delta": relative["B"],
-        "density_direction": "darker" if common > EPSILON else "lighter" if common < -EPSILON else "neutral",
-        "density_strength": _printer_strength(common),
-        "colors": colors,
-        "temperature": temperature,
-        "color_strength": _printer_strength(max((abs(delta) for _, delta in selected), default=0.0)),
-    }
-
-
-def _printer_lights_clause(film: Mapping[str, Any]) -> str:
-    analysis = analyze_printer_lights(
-        float(film["printer_light_r"]),
-        float(film["printer_light_g"]),
-        float(film["printer_light_b"]),
-    )
-    common = float(analysis["common_density"])
-    colors = list(analysis["colors"])
-    if abs(common) <= EPSILON and not colors:
-        return "a neutral printer-light balance"
-
-    density = ""
-    if abs(common) > EPSILON:
-        density = (
-            f"a {analysis['density_strength']} {analysis['density_direction']} "
-            "printer-light density"
-        )
-    color = ""
-    if colors:
-        temperature = f" {analysis['temperature']}" if analysis["temperature"] else ""
-        color = (
-            f"a {analysis['color_strength']}{temperature} printer-light bias leaning toward "
-            + "-".join(colors)
-        )
-    if density and color:
-        return f"{density}, followed by {color}"
-    if density:
-        return f"{density} with no color bias"
-    return color
-
-
-def compile_printer_lights_prompt(film: Mapping[str, Any]) -> str:
-    return f"Use {_printer_lights_clause(film)}."
-
-
-def compile_gamma_prompt(film: Mapping[str, Any]) -> str:
-    return (
-        "Maintain a gently controlled input tonal response corresponding to gamma "
-        f"{format_number(float(film['input_gamma']))} and a clean output gamma response around "
-        f"{format_number(float(film['output_gamma']))}."
-    )
-
-
-def _exposure_strength(value: float) -> str:
-    magnitude = abs(float(value))
-    if magnitude <= EPSILON:
-        return ""
-    if magnitude <= 0.15:
-        return "very slight"
-    if magnitude <= 0.35:
-        return "slight"
-    if magnitude <= 0.75:
-        return "moderate"
-    if magnitude <= 1.5:
-        return "strong"
-    return "pronounced"
-
-
-def compile_exposure_prompt(film: Mapping[str, Any]) -> str:
-    parts: list[str] = []
-    negative = float(film["negative_exposure"])
-    if abs(negative) > EPSILON:
-        result = "brighter" if negative > 0 else "darker"
-        parts.append(
-            f"Apply a {_exposure_strength(negative)} negative exposure adjustment of "
-            f"{format_number(negative)} stops for a {result} negative response."
-        )
-    print_value = float(film["print_exposure"])
-    if abs(print_value) > EPSILON:
-        result = "darker" if print_value > 0 else "lighter"
-        parts.append(
-            f"Apply a {_exposure_strength(print_value)} print exposure adjustment of "
-            f"{format_number(print_value)} stops for a {result} print response."
-        )
-    return join_sentences(parts)
-
-
-def compile_film_glow_prompt(film: Mapping[str, Any]) -> str:
-    value = float(film["glow_brightness"])
-    if value <= EPSILON:
-        return ""
-    if value <= 0.05:
-        return "Add only a nearly imperceptible highlight glow."
-    if value <= 0.12:
-        return "Add only a very subtle, nearly imperceptible highlight glow."
-    if value <= 0.25:
-        return "Add a subtle highlight glow."
-    if value <= 0.40:
-        return "Add a moderate highlight glow."
-    return "Add a pronounced highlight glow."
-
-
-def compile_film_soft_focus_prompt(film: Mapping[str, Any]) -> str:
-    value = float(film["soft_focus"])
-    if value <= EPSILON:
-        return ""
-    return (
-        f"Mix in a {_common_strength(value)} soft-focus response at value {format_number(value)} "
-        "without increasing overall brightness."
-    )
-
-
-def compile_vignette_prompt(film: Mapping[str, Any]) -> str:
-    value = float(film["vignette"])
-    if value <= EPSILON:
-        return ""
-    return f"Apply a {_common_strength(value)} corner vignette at value {format_number(value)}."
-
-
-def compile_film_prompt(film: Mapping[str, Any], *, follows_beauty: bool = False) -> str:
-    if not bool(film.get("enabled", True)):
-        return ""
-    parts: list[str] = [
-        (
-            "Apply Filter Application across the complete already-resolved final frame as one post-process, "
-            "including all characters, the complete background and environment, and resolved FX."
-        ),
-        (
-            "This full-frame filter may change only the final image response. Do not add, remove, replace, "
-            "relayout, or regenerate scene content, and do not change character identity or design, geometry, "
-            "camera or framing, animation or timing, FX placement, or the established lighting direction."
-        ),
-    ]
-    color_enabled = (
-        float(film["scale_cc"]) > EPSILON
-        and not (film["negative_film"] == "None" and film["print_film"] == "None")
-    )
-    if color_enabled:
-        stock = _film_stock_clause(film)
-        first = f"{'Then apply' if follows_beauty else 'Apply'} {stock}"
-        scale = _scale_cc_clause(float(film["scale_cc"]))
-        printer = _printer_lights_clause(film)
-        if scale:
-            first += f", using {scale}"
-        if printer:
-            first += f" and {printer}"
-        parts.append(first + ".")
-        parts.append(compile_gamma_prompt(film))
-        parts.append(compile_exposure_prompt(film))
-    parts.extend(
-        [
-            compile_film_glow_prompt(film),
-            compile_film_soft_focus_prompt(film),
-            compile_vignette_prompt(film),
-            "Preserve clean local colors, controlled highlights, rich but readable shadows, and stable color separation.",
-            "Do not introduce or simulate any film grain.",
-        ]
-    )
-    return "FILTER APPLICATION — FULL-FRAME SCOPE\n" + join_sentences(parts)
-
-
 def compile_finish_look_prompt(state: Mapping[str, Any]) -> str:
     normalized = validate_finish_look_state(state)
-    beauty = compile_beauty_prompt(normalized["beauty"]) if normalized["beauty"]["enabled"] else ""
-    film = compile_film_prompt(normalized["film"], follows_beauty=bool(beauty)) if normalized["film"]["enabled"] else ""
-    return "\n\n".join(section for section in (beauty, film) if section)
+    return compile_beauty_prompt(normalized["beauty"]) if normalized["beauty"]["enabled"] else ""
 
 
-EXPECTED_DEFAULT_FINISH_LOOK_OUT = (
-    "CHARACTER BEAUTY — CHARACTER-MATTE-ONLY SCOPE\n"
-    "Apply Character Beauty exclusively inside each visible character's matte and silhouette, including only "
-    "character-owned face, eyes, teeth, skin when present, hair, clothing, accessories, and intrinsic material "
-    "surfaces. Treat every character matte as a hard processing boundary. Exclude the background and environment "
-    "completely, including sets, terrain, architecture, vegetation, sky, atmosphere, and environment-only objects; "
-    "Character Beauty must not alter their pixels, lighting, color, contrast, detail, or material response. Within "
-    "that character-only scope, apply restrained beauty processing with gently softened shadow transitions at a "
-    "moderate threshold, while preserving clean character edges, material definition, and natural character-surface "
-    "texture. Keep character-surface saturation neutral at full strength and maintain neutral character-surface "
-    "brightness. Do not add character soft-focus diffusion, skin blur, pore removal, shine reduction, or any "
-    "airbrushed or plasticky character smoothing. Preserve a clean, natural, polished character appearance with "
-    "stable color fidelity and intact local detail. Every Character Beauty control in this block is character-only "
-    "and must not spill, feather, or propagate beyond the character matte into the background or environment.\n\n"
-    "FILTER APPLICATION — FULL-FRAME SCOPE\n"
-    "Apply Filter Application across the complete already-resolved final frame as one post-process, including all "
-    "characters, the complete background and environment, and resolved FX. This full-frame filter may change only "
-    "the final image response. Do not add, remove, replace, relayout, or regenerate scene content, and do not change "
-    "character identity or design, geometry, camera or framing, animation or timing, FX placement, or the established "
-    "lighting direction. Then apply a clean Kodak 5245 negative-film response combined with a Kodak 2383 print-film response, "
-    "using restrained film color correction at low strength and a very subtle cool printer-light bias leaning "
-    "toward cyan-blue. Maintain a gently controlled input tonal response corresponding to gamma 1.2 and a clean "
-    "output gamma response around 2.2. Add only a very subtle, nearly imperceptible highlight glow. Preserve clean "
-    "local colors, controlled highlights, rich but readable shadows, and stable color separation. Do not introduce "
-    "or simulate any film grain."
-)
+# New nodes are opt-in and do not alter the project's approved look.
+EXPECTED_DEFAULT_FINISH_LOOK_OUT = ""
 
 
 def _deep_patch(base: dict[str, Any], changes: Mapping[str, Any], path: str = "state") -> dict[str, Any]:
@@ -974,8 +598,8 @@ def normalize_remote_request(value: Any) -> dict[str, Any]:
     if not isinstance(request["changes"], Mapping):
         raise FinishLookValidationError("remote changes must be a dict object.")
     changes = request["changes"]
-    if not changes or any(key not in {"beauty", "film"} for key in changes):
-        raise FinishLookValidationError("remote changes must contain only beauty and/or film.")
+    if not changes or any(key != "beauty" for key in changes):
+        raise FinishLookValidationError("remote changes must contain only beauty.")
     return {
         "schema": REMOTE_SCHEMA,
         "version": 1,
@@ -1034,7 +658,6 @@ def default_widget_state() -> dict[str, Any]:
         "shot_catalog": {},
         "shot": _shot_only(),
         "finish_look": default_finish_look_state(),
-        "catalog": film_stock_catalog_payload(),
     }
 
 
@@ -1045,9 +668,9 @@ def validate_widget_state(value: Any) -> dict[str, Any]:
         "language",
         "remote_connected",
         "finish_look",
-        "catalog",
     }
     allowed = required | {
+        "catalog",  # Discard the obsolete catalog during legacy hydration.
         "shot_catalog",
         "shot",
     }
@@ -1064,9 +687,6 @@ def validate_widget_state(value: Any) -> dict[str, Any]:
     if type(state["schema_version"]) is not int or state["schema_version"] != 1:
         raise FinishLookValidationError("widget schema_version must be integer 1.")
     language = _choice(state["language"], ("ko", "en"), "widget language")
-    catalog = _mapping(state["catalog"], "widget catalog")
-    if list(catalog.get("negative", [])) != list(NEGATIVE_FILM_STOCKS) or list(catalog.get("print", [])) != list(PRINT_FILM_STOCKS):
-        raise FinishLookValidationError("widget Film Stock catalog does not match the backend catalog.")
     shot_catalog = _normalize_shot_catalog(
         state.get("shot_catalog"), allow_sparse=True
     )
@@ -1078,7 +698,6 @@ def validate_widget_state(value: Any) -> dict[str, Any]:
         "shot_catalog": shot_catalog,
         "shot": shot,
         "finish_look": validate_finish_look_state(state["finish_look"]),
-        "catalog": film_stock_catalog_payload(),
     }
 
 
@@ -1286,7 +905,7 @@ def _set_parameter_silently(node: Any, name: str, value: Any) -> None:
 
 
 class HMBFinishLookLibrary(DataNode):
-    """Deterministic Character Beauty and Filter Application compiler with auxiliary video tools."""
+    """Opt-in, character-matte-only Beauty instruction compiler."""
 
     def __init__(self, **kwargs: Any) -> None:
         serialized_metadata = kwargs.get("metadata")
@@ -1365,7 +984,7 @@ class HMBFinishLookLibrary(DataNode):
             pass
         self.category = "HMB_GP_Production"
         self.description = (
-            "Compiles character-matte-only Character Beauty and full-frame Filter Application values "
+            "Compiles opt-in character-matte-only Character Beauty values "
             "into deterministic English production prose."
         )
         self._state_lock = threading.RLock()
@@ -1486,7 +1105,7 @@ class HMBFinishLookLibrary(DataNode):
                 FINISH_LOOK_OUTPUT_PARAMETER_NAME,
                 "",
                 "str",
-                "Deterministic English Character Beauty and full-frame Filter Application prose.",
+                "Deterministic English character-matte-only Beauty prose; empty when disabled.",
             ),
             (
                 SHOT_FINISH_LOOK_OUTPUT_PARAMETER_NAME,
@@ -1494,7 +1113,7 @@ class HMBFinishLookLibrary(DataNode):
                 "dict",
                 "Hidden same-Shot Finish Look dependency for HMBSeedanceGeneration.",
             ),
-            (FINISH_LOOK_STATE_OUTPUT_PARAMETER_NAME, default_finish_look_state(), "dict", "Canonical schema_version 1 state."),
+            (FINISH_LOOK_STATE_OUTPUT_PARAMETER_NAME, default_finish_look_state(), "dict", "Canonical schema_version 2 Beauty-only state."),
             (REMOTE_STATUS_OUTPUT_PARAMETER_NAME, copy.deepcopy(DEFAULT_REMOTE_STATUS), "dict", "Latest strict remote patch result."),
         )
         for name, default, type_name, tooltip in outputs:
@@ -1638,6 +1257,7 @@ class HMBFinishLookLibrary(DataNode):
             "finish_look_sha256": prompt_sha256,
             "state_sha256": state_sha256,
             "finish_look_out": prompt,
+            "finish_look_state": copy.deepcopy(dict(state)),
         }
         return changed
 
@@ -1687,7 +1307,6 @@ class HMBFinishLookLibrary(DataNode):
             "shot_catalog": shot_catalog,
             "shot": shot,
             "finish_look": copy.deepcopy(self._last_valid_state),
-            "catalog": film_stock_catalog_payload(),
             }
         try:
             self._syncing_widget = True
@@ -1911,7 +1530,7 @@ class HMBFinishLookLibrary(DataNode):
         self,
         reason: str = "publisher_unavailable",
     ) -> dict[str, Any]:
-        """Return to Only while retaining Character Beauty and Filter Application."""
+        """Return to Only while retaining authored Character Beauty values."""
 
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return self._hmb_shot_channel_subscription()
@@ -1988,8 +1607,9 @@ class HMBFinishLookLibrary(DataNode):
         """Return a validated atomic Finish Look snapshot for Seedance."""
 
         with self._state_lock:
-            prompt = compile_finish_look_prompt(self._last_valid_state)
-            self._update_finish_snapshot_locked(prompt, self._last_valid_state)
+            state = validate_finish_look_state(self._last_valid_state)
+            prompt = compile_finish_look_prompt(state)
+            self._update_finish_snapshot_locked(prompt, state)
             snapshot = copy.deepcopy(self._hmb_finish_snapshot)
         required = {
             "schema",
@@ -2002,16 +1622,64 @@ class HMBFinishLookLibrary(DataNode):
             "finish_look_sha256",
             "state_sha256",
             "finish_look_out",
+            "finish_look_state",
         }
         if not snapshot or set(snapshot) != required:
             raise RuntimeError("Finish Look Shot snapshot is unavailable.")
-        if expected_output is not None and expected_output != snapshot:
-            raise RuntimeError("Finish Look hidden output does not match its atomic snapshot.")
-        if not hmac.compare_digest(
-            snapshot["finish_look_sha256"],
-            hashlib.sha256(snapshot["finish_look_out"].encode("utf-8")).hexdigest(),
+        if (
+            snapshot["schema"] != FINISH_LOOK_SHOT_SNAPSHOT_SCHEMA
+            or type(snapshot["version"]) is not int
+            or snapshot["version"] != FINISH_LOOK_SHOT_SNAPSHOT_VERSION
+            or snapshot["finish_look_state"] != state
+            or not isinstance(snapshot["state_sha256"], str)
+            or not hmac.compare_digest(snapshot["state_sha256"], _canonical_sha256(state))
+        ):
+            raise RuntimeError("Finish Look state hash does not match its canonical Beauty state.")
+        if (
+            not isinstance(snapshot["finish_look_sha256"], str)
+            or snapshot["finish_look_out"] != prompt
+            or not hmac.compare_digest(
+                snapshot["finish_look_sha256"],
+                hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            )
         ):
             raise RuntimeError("Finish Look instruction hash does not match.")
+        if expected_output is not None and expected_output != snapshot:
+            # During legacy workflow hydration the connected input may restore
+            # its old v1 value after this source has migrated and published v2.
+            # Only that well-formed, same-Shot stale transport is replaceable.
+            # Its prose/state hash never supplies settings: the current source's
+            # canonical Beauty state above remains the sole execution authority.
+            legacy = expected_output if isinstance(expected_output, dict) else {}
+            legacy_prompt = legacy.get("finish_look_out")
+            legacy_prompt_hash = legacy.get("finish_look_sha256")
+            legacy_state_hash = legacy.get("state_sha256")
+            legacy_generation = legacy.get("generation")
+            legacy_matches_source = (
+                set(legacy) == required - {"finish_look_state"}
+                and legacy.get("schema") == FINISH_LOOK_SHOT_SNAPSHOT_SCHEMA
+                and type(legacy.get("version")) is int
+                and legacy["version"] == 1
+                and all(
+                    legacy.get(key) == snapshot[key]
+                    for key in ("channel_uuid", "shot_uuid", "shot_number", "shot_name")
+                )
+                and type(legacy_generation) is int
+                and 1 <= legacy_generation <= (1 << 53) - 1
+                and isinstance(legacy_prompt, str)
+                and isinstance(legacy_prompt_hash, str)
+                and re.fullmatch(r"[0-9a-f]{64}", legacy_prompt_hash) is not None
+                and isinstance(legacy_state_hash, str)
+                and re.fullmatch(r"[0-9a-f]{64}", legacy_state_hash) is not None
+                and hmac.compare_digest(
+                    legacy_prompt_hash,
+                    hashlib.sha256(legacy_prompt.encode("utf-8")).hexdigest(),
+                )
+            )
+            if not legacy_matches_source:
+                raise RuntimeError("Finish Look hidden output does not match its atomic snapshot.")
+            if self._hmb_publish_routed_finish_snapshot(force=True) is not True:
+                raise RuntimeError("Finish Look could not republish its migrated Character Beauty snapshot.")
         return snapshot
 
     def _hmb_publish_routed_finish_snapshot(self, *, force: bool = False) -> bool:
@@ -2304,31 +1972,16 @@ __all__ = [
     "DEFAULT_FINISH_LOOK_STATE",
     "EPSILON",
     "EXPECTED_DEFAULT_FINISH_LOOK_OUT",
-    "FILM_STOCK_CATALOG",
     "FINISH_LOOK_SHOT_SNAPSHOT_SCHEMA",
     "FINISH_LOOK_SHOT_SNAPSHOT_VERSION",
     "SHOT_FINISH_LOOK_OUTPUT_PARAMETER_NAME",
     "HMBFinishLookLibrary",
-    "NEGATIVE_FILM_STOCKS",
-    "PRINT_FILM_STOCKS",
-    "REVERSAL_FILM_STOCKS",
-    "analyze_printer_lights",
     "apply_finish_look_remote_request",
     "compile_beauty_glow_prompt",
     "compile_beauty_prompt",
-    "compile_exposure_prompt",
-    "compile_film_glow_prompt",
-    "compile_film_prompt",
-    "compile_film_soft_focus_prompt",
-    "compile_film_stock_prompt",
     "compile_finish_look_prompt",
-    "compile_gamma_prompt",
-    "compile_printer_lights_prompt",
-    "compile_scale_cc_prompt",
-    "compile_vignette_prompt",
     "default_finish_look_state",
     "default_widget_state",
-    "film_stock_catalog_payload",
     "format_number",
     "is_zero",
     "join_sentences",

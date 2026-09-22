@@ -32,128 +32,62 @@ def contains_forbidden_key(value):
 
 
 state = target.default_finish_look_state()
-assert state["schema_version"] == 1
-assert state["beauty"]["enabled"] is True
-assert "preset" not in state["beauty"]
+assert state["schema_version"] == 2
+assert set(state) == {"schema_version", "beauty"}
+assert state["beauty"]["enabled"] is False
 assert state["beauty"]["soften_shadows"] == 0.11
 assert state["beauty"]["shadow_threshold"] == 0.27
 assert state["beauty"]["saturation"] == 1.0
 assert state["beauty"]["brightness"] == 1.0
-assert state["film"]["negative_film"] == "Kodak 5245"
-assert state["film"]["print_film"] == "Kodak 2383"
-assert state["film"]["scale_cc"] == 0.3
-assert (
-    state["film"]["printer_light_r"],
-    state["film"]["printer_light_g"],
-    state["film"]["printer_light_b"],
-) == (26, 25, 24)
-assert state["film"]["negative_exposure"] == 0.0
-assert state["film"]["print_exposure"] == 0.0
-assert state["film"]["glow_brightness"] == 0.1
 assert not contains_forbidden_key(state)
-
 default_output = target.compile_finish_look_prompt(state)
-assert default_output == target.EXPECTED_DEFAULT_FINISH_LOOK_OUT
-assert target.compile_finish_look_prompt(copy.deepcopy(state)) == default_output
-assert default_output == default_output.strip()
-assert "\r" not in default_output
-assert not default_output.endswith("\n")
-character_beauty_block, filter_application_block = default_output.split("\n\n", 1)
-assert character_beauty_block.startswith("CHARACTER BEAUTY — CHARACTER-MATTE-ONLY SCOPE\n")
-assert filter_application_block.startswith("FILTER APPLICATION — FULL-FRAME SCOPE\n")
-assert default_output.count("CHARACTER BEAUTY — CHARACTER-MATTE-ONLY SCOPE") == 1
-assert default_output.count("FILTER APPLICATION — FULL-FRAME SCOPE") == 1
-assert "Apply Character Beauty exclusively inside each visible character's matte and silhouette" in character_beauty_block
-assert "Exclude the background and environment completely" in character_beauty_block
-assert "must not alter their pixels, lighting, color, contrast, detail, or material response" in character_beauty_block
-assert "must not spill, feather, or propagate beyond the character matte" in character_beauty_block
-assert "complete already-resolved final frame as one post-process" in filter_application_block
-assert "all characters, the complete background and environment, and resolved FX" in filter_application_block
-assert "This full-frame filter may change only the final image response" in filter_application_block
-assert "do not change character identity or design" in filter_application_block
-assert "established lighting direction" in filter_application_block
-assert "overall brightness" not in character_beauty_block
-assert "character-surface brightness" in character_beauty_block
-assert "exposure" not in default_output.casefold()
-assert "Kodak 5245" in default_output
-assert "Kodak 2383" in default_output
-assert "cyan-blue" in default_output
-assert "warm printer-light" not in default_output
-assert "red over blue" not in default_output
-assert default_output.endswith("Do not introduce or simulate any film grain.")
-
-beauty_off = copy.deepcopy(state)
-beauty_off["beauty"]["enabled"] = False
-beauty_off_output = target.compile_finish_look_prompt(beauty_off)
-assert "CHARACTER BEAUTY — CHARACTER-MATTE-ONLY SCOPE" not in beauty_off_output
-assert beauty_off_output.startswith("FILTER APPLICATION — FULL-FRAME SCOPE")
-assert "Apply a clean Kodak 5245" in beauty_off_output
-assert "\n\n" not in beauty_off_output
-
-film_off = copy.deepcopy(state)
-film_off["film"]["enabled"] = False
-film_off_output = target.compile_finish_look_prompt(film_off)
-assert film_off_output.startswith("CHARACTER BEAUTY — CHARACTER-MATTE-ONLY SCOPE")
-assert "FILTER APPLICATION — FULL-FRAME SCOPE" not in film_off_output
-assert "Kodak" not in film_off_output
-assert "film grain" not in film_off_output.casefold()
-
-both_off = copy.deepcopy(state)
-both_off["beauty"]["enabled"] = False
-both_off["film"]["enabled"] = False
-assert target.compile_finish_look_prompt(both_off) == ""
-
-changed_stock = copy.deepcopy(state)
-changed_stock["film"]["negative_film"] = "Kodak 5218"
-assert changed_stock["film"]["print_film"] == "Kodak 2383"
-assert "Kodak 5218" in target.compile_finish_look_prompt(changed_stock)
-
-reversal = copy.deepcopy(state)
-reversal["film"]["print_film"] = "Kodak 5285 Rev"
-reversal_output = target.compile_finish_look_prompt(reversal)
-assert "a clean Kodak 5285 Rev reversal-film response" in reversal_output
-assert "Kodak 5245" not in reversal_output
-
-no_stocks = copy.deepcopy(state)
-no_stocks["film"]["negative_film"] = "None"
-no_stocks["film"]["print_film"] = "None"
-no_stocks_output = target.compile_finish_look_prompt(no_stocks)
-for omitted in ("Kodak", "gamma", "printer-light", "exposure"):
-    assert omitted not in no_stocks_output.casefold()
-assert "highlight glow" in no_stocks_output
-assert no_stocks_output.endswith("Do not introduce or simulate any film grain.")
-
-scale_off = copy.deepcopy(state)
-scale_off["film"]["scale_cc"] = 0.0
-scale_off_output = target.compile_finish_look_prompt(scale_off)
-for omitted in ("Kodak", "gamma", "printer-light", "exposure"):
-    assert omitted not in scale_off_output.casefold()
-assert "highlight glow" in scale_off_output
-
-neutral_printer = copy.deepcopy(state["film"])
-neutral_printer.update(printer_light_r=25, printer_light_g=25, printer_light_b=25)
-assert target.compile_printer_lights_prompt(neutral_printer) == "Use a neutral printer-light balance."
-
-density_printer = copy.deepcopy(state["film"])
-density_printer.update(printer_light_r=26, printer_light_g=26, printer_light_b=26)
-density_phrase = target.compile_printer_lights_prompt(density_printer)
-assert "very subtle darker printer-light density" in density_phrase
-assert "no color bias" in density_phrase
-
-default_analysis = target.analyze_printer_lights(26, 25, 24)
-assert default_analysis["colors"] == ["cyan", "blue"]
-assert default_analysis["temperature"] == "cool"
-assert math.isclose(default_analysis["common_density"], 0.0)
-
-for field, value, expected in (
-    ("negative_exposure", 0.5, "brighter negative response"),
-    ("negative_exposure", -0.5, "darker negative response"),
-    ("print_exposure", 0.5, "darker print response"),
-    ("print_exposure", -0.5, "lighter print response"),
+assert default_output == target.EXPECTED_DEFAULT_FINISH_LOOK_OUT == ""
+enabled_state = copy.deepcopy(state)
+enabled_state["beauty"]["enabled"] = True
+beauty_output = target.compile_finish_look_prompt(enabled_state)
+assert beauty_output.startswith("CHARACTER BEAUTY — CHARACTER-MATTE-ONLY SCOPE\n")
+for text in (
+    "Apply Character Beauty exclusively inside each visible character's matte and silhouette",
+    "Exclude the background and environment completely",
+    "must not alter their pixels, lighting, color, contrast, detail, or material response",
+    "must not spill, feather, or propagate beyond the character matte",
+    "character-surface brightness",
 ):
-    film = copy.deepcopy(state["film"])
-    film[field] = value
-    assert expected in target.compile_exposure_prompt(film)
+    assert text in beauty_output
+for text in ("FILTER APPLICATION", "Kodak", "grain", "gamma", "printer-light", "vignette"):
+    assert text not in beauty_output
+assert target.compile_finish_look_prompt(copy.deepcopy(enabled_state)) == beauty_output
+legacy = copy.deepcopy(enabled_state)
+legacy["schema_version"] = 1
+legacy["film"] = {"enabled": True, "negative_film": "Kodak 5245", "extra": "obsolete"}
+assert target.validate_finish_look_state(legacy) == enabled_state
+assert target.compile_finish_look_prompt(legacy) == beauty_output
+legacy_widget = target.default_widget_state()
+legacy_widget["finish_look"] = legacy
+legacy_widget["catalog"] = {"negative": ["retired"]}
+migrated = target.validate_widget_state(legacy_widget)
+assert "catalog" not in migrated
+assert migrated["finish_look"] == enabled_state
+assert migrated["shot"] == legacy_widget["shot"]
+for invalid_version in (True, 0, 3, "2"):
+    invalid = copy.deepcopy(state)
+    invalid["schema_version"] = invalid_version
+    try:
+        target.validate_finish_look_state(invalid)
+    except target.FinishLookValidationError:
+        pass
+    else:
+        raise AssertionError("Invalid version accepted")
+invalid = copy.deepcopy(state)
+invalid["film"] = {"enabled": True}
+try:
+    target.validate_finish_look_state(invalid)
+except target.FinishLookValidationError:
+    pass
+else:
+    raise AssertionError("New state reintroduced retired film")
+# Explicit authoring tests use the opted-in state; new nodes below stay disabled.
+state = enabled_state
 
 negative_saturation = copy.deepcopy(state)
 negative_saturation["beauty"]["saturation"] = -0.5
@@ -168,6 +102,23 @@ assert "threshold 0.75" not in advanced_output
 assert "glow width" not in advanced_output
 assert "subtle character-surface soft-focus diffusion at value 0.2" in advanced_output
 
+shadow_off = copy.deepcopy(state)
+shadow_off["beauty"]["soften_shadows"] = 0
+shadow_off_prompt = target.compile_finish_look_prompt(shadow_off)
+shadow_off["beauty"]["shadow_threshold"] = 1
+assert target.compile_finish_look_prompt(shadow_off) == shadow_off_prompt
+
+retired_remote = {
+    "schema": target.REMOTE_SCHEMA, "version": 1, "request_id": "retired-film",
+    "base_revision": 0, "changes": {"film": {"enabled": True}},
+}
+try:
+    target.apply_finish_look_remote_request(state, retired_remote)
+except target.FinishLookValidationError:
+    pass
+else:
+    raise AssertionError("Remote patch restored retired film")
+
 beauty_glow = copy.deepcopy(state)
 beauty_glow["beauty"]["glow_brightness"] = 0.2
 beauty_glow["beauty"]["glow_threshold"] = 0.4
@@ -176,14 +127,7 @@ beauty_glow_output = target.compile_finish_look_prompt(beauty_glow)
 beauty_glow_index = beauty_glow_output.index("beauty glow")
 assert beauty_glow_output.index("threshold 0.4", beauty_glow_index) > beauty_glow_index
 assert beauty_glow_output.index("glow width of 22", beauty_glow_index) > beauty_glow_index
-assert "highlight glow" in beauty_glow_output
-
-film_advanced = copy.deepcopy(state)
-film_advanced["film"]["soft_focus"] = 0.2
-film_advanced["film"]["vignette"] = 0.4
-film_advanced_output = target.compile_finish_look_prompt(film_advanced)
-assert "subtle soft-focus response at value 0.2" in film_advanced_output
-assert "moderate corner vignette at value 0.4" in film_advanced_output
+assert "beauty glow" in beauty_glow_output
 
 invalid = copy.deepcopy(state)
 invalid["beauty"]["preset"] = "Custom"
@@ -197,10 +141,10 @@ else:
 for field, value in (
     (("beauty", "saturation"), float("nan")),
     (("beauty", "soften_shadows"), 1.01),
-    (("film", "scale_cc"), 5.01),
-    (("film", "input_gamma"), 0.09),
-    (("film", "vignette"), 1.01),
-    (("film", "printer_light_r"), 25.5),
+    (("beauty", "brightness"), -1),
+    (("beauty", "reduce_shine"), 1.01),
+    (("beauty", "glow_width"), -1),
+    (("beauty", "enabled"), 1),
 ):
     invalid = copy.deepcopy(state)
     invalid[field[0]][field[1]] = value
@@ -240,6 +184,7 @@ except target.FinishLookValidationError as exc:
 else:
     raise AssertionError("A JSON string bypassed strict dict-only remote changes")
 
+state = target.default_finish_look_state()
 node = target.HMBFinishLookLibrary(name="Finish Look Regression")
 
 
@@ -430,7 +375,9 @@ assert node._hmb_shot_channel_subscription()["shot_uuid"] == "shot-three"
 finish_snapshot = node.parameter_output_values[target.SHOT_FINISH_LOOK_OUTPUT_PARAMETER_NAME]
 assert finish_snapshot == node._hmb_finish_look_shot_snapshot(finish_snapshot)
 assert finish_snapshot["schema"] == target.FINISH_LOOK_SHOT_SNAPSHOT_SCHEMA
-assert finish_snapshot["version"] == target.FINISH_LOOK_SHOT_SNAPSHOT_VERSION
+assert finish_snapshot["version"] == target.FINISH_LOOK_SHOT_SNAPSHOT_VERSION == 2
+assert finish_snapshot["finish_look_state"] == node._last_valid_state
+assert finish_snapshot["state_sha256"] == target._canonical_sha256(finish_snapshot["finish_look_state"])
 assert finish_snapshot["shot_uuid"] == "shot-three"
 assert finish_snapshot["finish_look_out"] == default_output
 assert finish_snapshot["finish_look_sha256"] == hashlib.sha256(
@@ -589,12 +536,9 @@ widget_state["language"] = "en"
 widget_state["finish_look"]["beauty"]["enabled"] = False
 node.after_value_set(parameters[target.WIDGET_PARAMETER_NAME], widget_state)
 assert node.parameter_output_values[target.FINISH_LOOK_STATE_OUTPUT_PARAMETER_NAME]["beauty"]["enabled"] is False
-assert node.parameter_output_values[target.FINISH_LOOK_OUTPUT_PARAMETER_NAME].startswith(
-    "FILTER APPLICATION — FULL-FRAME SCOPE"
-)
-assert "Apply a clean Kodak 5245" in node.parameter_output_values[target.FINISH_LOOK_OUTPUT_PARAMETER_NAME]
+assert node.parameter_output_values[target.FINISH_LOOK_OUTPUT_PARAMETER_NAME] == ""
 local_revision = node.parameter_output_values[target.REMOTE_STATUS_OUTPUT_PARAMETER_NAME]["revision"]
-assert local_revision == 1
+assert local_revision == 0  # New default OFF; language-only edits do not author a look.
 
 node_remote = {
     "schema": target.REMOTE_SCHEMA,
@@ -625,7 +569,7 @@ node.after_incoming_connection(None, None, parameters[target.REMOTE_INPUT_PARAME
 assert node._widget_state["remote_connected"] is True
 locked_before = copy.deepcopy(node.parameter_output_values[target.FINISH_LOOK_STATE_OUTPUT_PARAMETER_NAME])
 locked_edit = copy.deepcopy(node._widget_state)
-locked_edit["finish_look"]["film"]["enabled"] = False
+locked_edit["finish_look"]["beauty"]["brightness"] = 2.0
 locked_edit["language"] = "ko"
 node.after_value_set(parameters[target.WIDGET_PARAMETER_NAME], locked_edit)
 assert node.parameter_output_values[target.FINISH_LOOK_STATE_OUTPUT_PARAMETER_NAME] == locked_before
@@ -666,7 +610,7 @@ assert node.parameter_output_values[target.REMOTE_STATUS_OUTPUT_PARAMETER_NAME][
 
 print(
     "HMB Finish Look regression: PASS "
-    "(character-matte-only Character Beauty, full-frame Filter Application, deterministic compiler, "
+    "(character-matte-only opt-in Beauty, retired-film migration, deterministic compiler, "
     "strict remote patch, "
     "UUID Shot routing and finishing-only surface)"
 )

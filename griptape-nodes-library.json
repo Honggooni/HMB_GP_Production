@@ -254,15 +254,15 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.7.64",
+    "library_version": "0.7.65",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
       "archive_source_count": 32,
       "mode": "bundled_signed_dat",
       "runtime_path": "resources/agent/hmb_agent_core.dat",
-      "policy_version": "2026-09-03.agent-shot-quality.v5.2",
-      "envelope_sha256": "f1ac2138d6cc4e77bf89413a862060bea3f7695f3b95c66d05b2050af4da1d73",
-      "contract_sha256": "fea2a6fe26208ec54a1c6b664c51b2cde960a5f21cd7051bd5cc7df64bce14ae",
+      "policy_version": "2026-09-22.agent-shot-quality.v5.5",
+      "envelope_sha256": "f47adfebdaab6440aa34f0b1674e6eaeb391bdbb851db8ee0faff602190b5454",
+      "contract_sha256": "c25efff25acf1357d3c307ec07d8fd5258c0779609f839009f5e463bd711f20c",
       "verification": "rsa3072_sha256_v3_contract_once_per_process"
     },
     "tags": [
@@ -525,7 +525,7 @@
       "file_path": "HMBFinishLookLibrary.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "Compiles character-matte-only Character Beauty and full-frame Filter Application values into deterministic English production prose, with Shot binding and validated dict remote control. Video editing is provided by HMBVideoPickerLibrary expanded mode.",
+        "description": "Compiles optional character-matte-only Character Beauty controls into deterministic English production prose, with Shot binding and validated dict remote control. Character Beauty is disabled by default. Final color finishing is provided by HMB Color LUT; video editing is provided by HMBVideoPickerLibrary expanded mode.",
         "display_name": "HMB Finish Look",
         "icon": "SlidersHorizontal",
         "group": "edit",
@@ -544,11 +544,8 @@
           "HMB",
           "finish-look",
           "character-beauty",
-          "filter-application",
           "deterministic-compiler",
-          "remote-state",
-          "video-concatenate",
-          "video-crop"
+          "remote-state"
         ],
         "ui_options": {
           "width": 980,
@@ -734,7 +731,7 @@
     {
       "name": "HMBFinishLookLibraryWidget",
       "path": "widgets/HMBFinishLookLibraryWidget.js",
-      "description": "Bilingual, Shot-bound Character Beauty and Filter Application editor. Video editing is provided by HMBVideoPickerLibrary expanded mode; Finish Look retains its finishing controls and generator prompt output."
+      "description": "Bilingual, Shot-bound Character Beauty editor with 11 discrete controls, disabled by default. Final color finishing is provided by HMB Color LUT; video editing is provided by HMBVideoPickerLibrary expanded mode."
     },
     {
       "name": "HMBImageAssetLibraryWidget",

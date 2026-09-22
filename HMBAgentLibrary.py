@@ -2977,6 +2977,28 @@ class HMBAgentLibrary(_BaseAgent):
         except Exception:
             pass
 
+    def _handle_additional_context(self, prompt: str, additional_context: Any) -> str:
+        """Keep verified HMB machine data literal; preserve ordinary Agent templates."""
+
+        if self._hmb_rules_active and isinstance(additional_context, dict):
+            # process() enables this flag only after validating the canonical
+            # Prompt's paired snapshot. That machine envelope contains user data,
+            # not a Jinja template: rendering it would consume literal {{...}}
+            # or {%...%} text before the model ever receives the approved data.
+            context_json = json.dumps(
+                additional_context,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+            return (
+                prompt
+                + "\n\nHMB ADDITIONAL CONTEXT DATA (JSON):\n"
+                + context_json
+                + "\nEND HMB ADDITIONAL CONTEXT DATA"
+            )
+        return super()._handle_additional_context(prompt, additional_context)
+
     def _process(self, agent: Any, prompt: Any) -> Any:
         """Use the Standard processor; constrain only canonical HMB output prose."""
 
@@ -2987,8 +3009,8 @@ class HMBAgentLibrary(_BaseAgent):
             return agent
         if self._hmb_rules_active:
             # Standard Agent has already merged any typed additional_context at
-            # this point. Append the output-language contract here so dict/Jinja,
-            # numeric, and string caller context keep their native semantics.
+            # this point. Canonical HMB dictionaries are delimited literal data;
+            # numeric/string context and non-HMB templates retain native behavior.
             prompt = _with_english_agent_output_contract(prompt)
         return native_processor(agent, prompt)
 

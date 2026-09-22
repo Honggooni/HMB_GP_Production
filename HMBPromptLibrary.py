@@ -9027,19 +9027,15 @@ def _compile_prompt_with_budget(lines: List[str]) -> str:
 
 
 def _build_user_readable_prompt_package(state: Dict[str, Any]) -> str:
-    """Render the documented source map shown on the public PROMPT_OUT port."""
+    """Show connection summaries, not the detailed model-bound instructions."""
 
     state = _normalize_state(state)
     active_images = _active_image_rows_for_state(state["images"], state)
     active_videos = [item for item in state["videos"] if _is_active_video(item)]
     lines: List[str] = ["HMB_GP_Production", ""]
 
-    lines.extend([
-        "TARGET GENERATOR:",
-        "This prompt is written for the active downstream target generator or execution system.",
-        "",
-        "IMAGE SOURCE:",
-    ])
+    korean = state.get("ui", {}).get("language") == "ko"
+    lines.append("IMAGE SOURCE:")
     if active_images:
         for item in active_images:
             seq = int(item.get("slot") or 1)
@@ -9048,46 +9044,34 @@ def _build_user_readable_prompt_package(state: Dict[str, Any]) -> str:
                 f"image source {seq}",
                 strip_extension=False,
             )
-            asset_id = _public_path_basename(
-                item.get("asset_id"),
-                "",
-                strip_extension=False,
-            )
-            asset_suffix = f" / Asset ID: {asset_id}" if asset_id else ""
-            lines.append(f"@image{seq} = {label}{asset_suffix}")
-            surface_instruction = _surface_2d_instruction(item)
-            if surface_instruction:
-                lines.append(f"2DSurface: {surface_instruction}")
-            lines.append(
-                " / ".join([
-                    f"Main Type: {_public_single_line(item.get('image_main_type'))}",
-                    f"Sub Type: {_public_single_line(item.get('image_sub_type'))}",
-                    f"Target: {_public_single_line(item.get('owner'))}",
-                    f"Custom: {_public_single_line(item.get('custom_source_type'))}",
-                ])
-            )
+            summary = [f"@image{seq} = {label}"]
+            for title, key in (
+                ("Main Type", "image_main_type"),
+                ("Sub Type", "image_sub_type"),
+                ("Target", "owner"),
+            ):
+                value = _public_single_line(item.get(key))
+                if value:
+                    summary.append(f"{title}: {value}")
+            if item.get("image_main_type") == "Character" and item.get("surface_2d") is True:
+                summary.append("2D표현: 사용" if korean else "2DSurface: On")
+            lines.append(" / ".join(summary))
             for binding in _image_binding_entries(item):
-                lines.append(
-                    " / ".join([
-                        f"Binding {int(binding.get('index') or 0) + 1}",
-                        f"Video: @video{int(binding.get('marker_video') or 1)}",
-                        f"Color: {_public_single_line(binding.get('color'))}",
-                        f"Scope: {_public_single_line(binding.get('scope_choice'))}",
-                        f"Custom Scope: {_public_single_line(binding.get('custom_scope'))}",
-                    ])
-                )
+                summary = [
+                    f"Binding {int(binding.get('index') or 0) + 1}",
+                    f"Video: @video{int(binding.get('marker_video') or 1)}",
+                ]
+                for title, key in (("Color", "color"), ("Scope", "scope_choice")):
+                    value = _public_single_line(binding.get(key))
+                    if value:
+                        summary.append(f"{title}: {value}")
+                lines.append(" / ".join(summary))
     else:
         lines.append("No image source assigned in HMBPromptLibrary.")
     lines.append("")
 
     lines.append("VIDEO SOURCE:")
     if active_videos:
-        lines.append(
-            "Active video slots = "
-            + ", ".join(
-                f"@video{int(item.get('slot') or 1)}" for item in active_videos
-            )
-        )
         for item in active_videos:
             seq = int(item.get("slot") or 1)
             label = _public_path_basename(
@@ -9095,22 +9079,12 @@ def _build_user_readable_prompt_package(state: Dict[str, Any]) -> str:
                 f"video source {seq}",
                 strip_extension=bool(_clean_string(item.get("picker_auto_label"))),
             )
-            lines.append(f"@video{seq} = {label}")
-            lines.append(
-                " / ".join([
-                    f"Main Type: {_public_single_line(item.get('video_main_type'))}",
-                    f"Sub Type: {_public_single_line(item.get('video_sub_type'))}",
-                    f"Custom Type: {_public_single_line(item.get('custom_source_type'))}",
-                    f"Custom Role: {_public_single_line(item.get('custom_control_role'))}",
-                    f"Keep Out: {_public_single_line(item.get('keep_out'))}",
-                ])
-            )
-            if (
-                item.get("video_main_type") == "Motion Reference"
-                and item.get("video_sub_type") == "Layout Reference"
-            ):
-                lines.append(f"Reference Scope: {LAYOUT_REFERENCE_CONTROL_ROLE}")
-                lines.append("Character Performance: Full Motion Reinterpretation and Lip Sync")
+            summary = [f"@video{seq} = {label}"]
+            for title, key in (("Main Type", "video_main_type"), ("Sub Type", "video_sub_type")):
+                value = _public_single_line(item.get(key))
+                if value:
+                    summary.append(f"{title}: {value}")
+            lines.append(" / ".join(summary))
     else:
         lines.append("No video source assigned in HMBPromptLibrary.")
     lines.append("")

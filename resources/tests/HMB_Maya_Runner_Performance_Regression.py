@@ -251,14 +251,11 @@ finally:
     for name, value in shader_originals.items():
         setattr(runner, name, value)
 
-assert shader_calls["surface"] == [], (
-    "Unassigned Maya geometry must never receive a fallback shader or enter "
-    "the Color Picker render."
-)
-assert [item[0] for item in shader_calls["lambert"]] == [
-    "HMB_Sky_Blue", "HMB_Sky_Blue", "HMB_Mint", "HMB_Beige",
+assert shader_calls["lambert"] == [], "Ghost must not reuse Actor-style Lambert shading."
+assert [item[0] for item in shader_calls["surface"]] == [
+    "HMB_Sky_Blue_Ghost", "HMB_Sky_Blue_Ghost", "HMB_Mint_Ghost", "HMB_Beige_Ghost",
 ]
-assert [item[1] for item in shader_calls["lambert"]] == [
+assert [item[1] for item in shader_calls["surface"]] == [
     runner.MARKER_COLORS["Sky Blue"],
     runner.MARKER_COLORS["Sky Blue"],
     runner.MARKER_COLORS["Mint"],
@@ -276,7 +273,7 @@ assert [item[1] for item in shader_calls["screen_pattern"]] == [
     runner.MARKER_PATTERN_IDS["Floor Grid"],
     runner.MARKER_PATTERN_IDS["Position Pattern"],
 ]
-assert sum(1 for _shapes, group in shader_calls["assign"] if group == "lambert:HMB_Sky_Blue") == 2
+assert sum(1 for _shapes, group in shader_calls["assign"] if group == "surface:HMB_Sky_Blue_Ghost") == 2
 try:
     runner._apply_marker_shaders([], {
         "screen_space_patterns": True,

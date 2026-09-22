@@ -1832,28 +1832,22 @@ with tempfile.TemporaryDirectory() as temp_dir:
                              "status": "restored",
                              "restore_ok": True,
                              "shading_group_membership_preserved": True,
-                             "one_lambert_per_source_material": True,
                              "default_lighting_verified": True,
-                             "textured_render_mode_verified": True,
+                             "solid_render_mode_verified": True,
+                             "soft_shading_verified": True,
+                             "authored_materials_ignored": True,
+                             "textures_ignored": True,
+                             "opaque_surface_verified": True,
+                             "base_color": [0.5, 0.5, 0.5],
+                             "fill_color": [0.22, 0.22, 0.22],
+                             "diffuse": 0.45,
                              "inspected_shading_engine_count": 2,
-                             "source_material_count": 2,
-                             "temporary_lambert_count": 2,
-                             "existing_lambert_count": 0,
-                             "texture_connection_count": 2,
-                             "numeric_color_count": 0,
-                             "loaded_plugin_passthrough_count": 0,
-                             "loaded_plugin_nodes": [],
-                             "plugin_fallback_count": 0,
-                             "plugin_fallback_material_count": 0,
-                             "plugin_fallback_node_count": 0,
-                             "plugin_fallback_records": [],
-                             "unsupported_color_fallback_count": 0,
-                             "unsupported_color_fallback_materials": [],
-                             "required_texture_dependency_count": 2,
-                             "missing_texture_dependency_count": 0,
-                             "missing_texture_dependencies": [],
-                             "texture_dependency_preflight_passed": True,
-                             "texture_identity_preserved": True,
+                             "contributing_shading_engine_count": 2,
+                             "temporary_lambert_count": 1,
+                             "texture_connection_count": 0,
+                             "transparency_transfer_count": 0,
+                             "emission_transfer_count": 0,
+                             "normal_transfer_count": 0,
                              "warnings": [],
                              "swapped_shading_engine_count": 2,
                          },
@@ -2055,7 +2049,7 @@ assert [item["asset_id"] for item in shared_background_markers] == [
 assert len(picker._normalize_markers([
     {"color": "Red", "asset_id": "ActorA", "subject_root": "|ActorA"},
     {"color": "Red", "asset_id": "ActorB", "subject_root": "|ActorB"},
-], 1)) == 1
+], 1)) == 2
 
 shared_background_state = picker._default_widget_state()
 shared_background_state["slot_assignments"] = [{
@@ -2085,12 +2079,7 @@ assert len(node._selected_slot_job_bindings(shared_background_state, 1)) == 2
 duplicate_actor_state = copy.deepcopy(shared_background_state)
 for binding in duplicate_actor_state["slot_assignments"][0]["bindings"]:
     binding["color"] = "Red"
-try:
-    node._selected_slot_job_bindings(duplicate_actor_state, 1)
-except RuntimeError as exc:
-    assert "Duplicate Color Pick" in str(exc)
-else:
-    raise AssertionError("Actor Color Picks must remain unique.")
+assert len(node._selected_slot_job_bindings(duplicate_actor_state, 1)) == 2
 duplicate_root_state = copy.deepcopy(shared_background_state)
 duplicate_root_state["slot_assignments"][0]["bindings"][1]["full_dag_path"] = "|BackgroundA"
 try:
@@ -2435,7 +2424,7 @@ maya_runner._load_marker_catalog({
 })
 assert maya_runner.CHARACTER_MARKERS == set(expected_actor)
 assert maya_runner.BACKGROUND_MARKERS == set(expected_object)
-assert maya_runner.REPEATABLE_MARKERS == set(expected_object)
+assert maya_runner.REPEATABLE_MARKERS == set(maya_runner.MARKER_OPTIONS)
 assert maya_runner.CHARACTER_LAMBERT_DIFFUSE == 0.55
 assert maya_runner.CHARACTER_LAMBERT_AMBIENT_GAIN == 0.0
 assert maya_runner.CHARACTER_LAMBERT_INCANDESCENCE_GAIN == 0.25
@@ -2485,10 +2474,18 @@ assert marker_payload_probe[0]["shading_profile"] == {
     "out_rim": "none",
 }
 for solid_background_payload in marker_payload_probe[1:4]:
-    assert solid_background_payload["shader_model"] == "lambert"
-    assert solid_background_payload["visual_profile"] == "color_stable_lambert_profile"
+    assert solid_background_payload["shader_model"] == "surfaceShader"
+    assert solid_background_payload["visual_profile"] == "ghost_flat_unlit_palette_v1"
     assert solid_background_payload["out_rim"] == ""
-    assert solid_background_payload["shading_profile"] == marker_payload_probe[0]["shading_profile"]
+    assert solid_background_payload["shading_profile"] == {
+        "profile": "ghost_flat_unlit_palette_v1",
+        "palette_rgb": list(maya_runner.MARKER_COLORS[solid_background_payload["color"]]),
+        "lighting_response": "unlit_palette",
+        "specular": False,
+        "receives_shadows": False,
+        "viewport_render_mode": "smooth_shaded_textured",
+        "out_rim": "none",
+    }
 for pattern_payload in marker_payload_probe[4:]:
     assert pattern_payload["shader_model"] == "surfaceShader"
     assert pattern_payload["visual_profile"] == "hmb_maya_world_root_projection_v1"
@@ -2539,17 +2536,13 @@ try:
         ],
     })
     assert len(repeated_runner_bindings) == 4
-    try:
-        maya_runner._read_job_bindings({
-            "bindings": [
-                {"group_name": "ActorA", "color": "Red", "asset_id": "ActorA"},
-                {"group_name": "ActorB", "color": "Red", "asset_id": "ActorB"},
-            ],
-        })
-    except RuntimeError as exc:
-        assert "Duplicate marker color" in str(exc)
-    else:
-        raise AssertionError("Maya runner must reject duplicate Actor colors.")
+    repeated_actor_bindings = maya_runner._read_job_bindings({
+        "bindings": [
+            {"group_name": "ActorA", "color": "Red", "asset_id": "ActorA"},
+            {"group_name": "ActorB", "color": "Red", "asset_id": "ActorB"},
+        ],
+    })
+    assert [entry["asset_id"] for entry in repeated_actor_bindings] == ["ActorA", "ActorB"]
 finally:
     maya_runner._resolve_group_root = original_resolve_group_root
 legacy_outline_probe = maya_runner._marker_payload(

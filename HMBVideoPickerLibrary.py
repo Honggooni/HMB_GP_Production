@@ -116,10 +116,10 @@ PROXY_H264_LEVEL = "4.2"
 FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE = "hmb_full_smooth_geometry_v2"
 ORIGINAL_VIEWPORT_QUALITY_PROFILE = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
 ORIGINAL_MATERIAL_OVERRIDE_PROFILE = (
-    "per_source_material_lambert_plugin_fallback_v4"
+    "maya-midgray-solid-studio-v1"
 )
 ORIGINAL_LAMBERT_ASSIGNMENT_MODE = (
-    "original_per_source_material_lambert_plugin_fallback"
+    "original_midgray_solid_studio"
 )
 MOUTH_CARD_INNER_PATCH_POLICY = "temporary_mouth_alpha_inner_patch_v1"
 SCREEN_SPACE_PATTERN_PROFILE = "hmb_screen_space_pattern_post_v2"
@@ -698,9 +698,9 @@ BACKGROUND_MARKERS = frozenset(
     _clean_catalog_name(item.get("name"))
     for item in MARKER_CATALOG["background"]
 )
-# Multiple Maya roots may form one logical background mask. Actor colors remain
-# unique because each actor color is one appearance-authority address.
-REPEATABLE_MARKERS = BACKGROUND_MARKERS
+# A marker identifies a mask region, which may contain several Maya objects.
+# Object identity remains unique; reusing a color never steals another object.
+REPEATABLE_MARKERS = set(MARKER_ORDER)
 
 
 def _screen_space_preflight(bindings: Sequence[Dict[str, Any]]) -> tuple[str, ...]:
@@ -4066,6 +4066,48 @@ def _all_picker_outliner_nodes(nodes: Any) -> List[Dict[str, Any]]:
     ]]]
 
 
+def _normalize_outliner_selection_fields(state: Dict[str, Any]) -> None:
+    """Retain an explicit root/mesh selection only in its current scene/Shot."""
+    nodes = {
+        _clean(row.get("full_path")): row
+        for row in _all_picker_outliner_nodes(state.get("outliner_nodes"))
+        if _clean(row.get("full_path"))
+    }
+    scene = _clean(
+        state.get("scene_request_path")
+        or state.get("scene_path")
+        or state.get("scene_draft_path")
+    ).replace("\\", "/")
+    workspace = _clean(state.get("active_picker_shot_uuid") or state.get("shot_uuid"))
+    scope = scene + "|" + workspace
+    previous_scope = _clean(state.get("outliner_selection_scope"))
+    primary = _clean(state.get("selected_outliner_path"))
+    raw_paths = state.get("selected_outliner_paths")
+    explicit_selection = isinstance(raw_paths, list) and previous_scope == scope
+    if explicit_selection or (not previous_scope and isinstance(raw_paths, list) and raw_paths):
+        paths = list(dict.fromkeys(
+            _clean(path) for path in raw_paths if _clean(path) in nodes
+        ))
+    else:
+        # A legacy single selection or a different Shot must never carry an
+        # old multi-target selection into a new palette edit.
+        paths = [primary] if primary in nodes else []
+    if paths and primary not in paths:
+        primary = paths[-1]
+    elif not paths:
+        primary = ""
+    row = nodes.get(primary, {})
+    state["selected_outliner_paths"] = paths
+    state["selected_outliner_path"] = primary
+    state["selected_outliner_name"] = _clean(
+        row.get("name") or row.get("display_name") or primary.rsplit("|", 1)[-1]
+    )
+    state["selected_outliner_uuid"] = _clean(row.get("maya_uuid"))
+    anchor = _clean(state.get("outliner_selection_anchor"))
+    state["outliner_selection_anchor"] = anchor if anchor in nodes else primary
+    state["outliner_selection_scope"] = scope
+
+
 def _reconcile_picker_mesh_authoring(state: Dict[str, Any], nodes: Any) -> Dict[str, Any]:
     """Rebind newly exposed child meshes by identity without changing root controls."""
     old = {row["full_path"]: row for row in _all_picker_outliner_nodes(state.get("outliner_nodes"))
@@ -4100,6 +4142,16 @@ def _reconcile_picker_mesh_authoring(state: Dict[str, Any], nodes: Any) -> Dict[
                                  "group_name": target["name"], "maya_uuid": target["maya_uuid"]})
         assignments.append({**entry, "bindings": bindings})
     result["slot_assignments"] = assignments
+    result["selected_outliner_paths"] = list(dict.fromkeys(
+        resolved[path]["full_path"] if path in resolved else path
+        for path in state.get("selected_outliner_paths", [])
+        if path not in resolved or resolved[path]
+    ))
+    anchor = _clean(state.get("outliner_selection_anchor"))
+    if anchor in resolved:
+        result["outliner_selection_anchor"] = (
+            resolved[anchor]["full_path"] if resolved[anchor] else ""
+        )
     return result
 
 
@@ -4242,6 +4294,9 @@ def _default_widget_state() -> Dict[str, Any]:
         "selected_outliner_path": "",
         "selected_outliner_name": "",
         "selected_outliner_uuid": "",
+        "selected_outliner_paths": [],
+        "outliner_selection_anchor": "",
+        "outliner_selection_scope": "",
         "selected_color": "",
         "outliner_nodes": [],
         "outliner_expanded": [],
@@ -6943,7 +6998,10 @@ def _normalize_slot_assignments(
                     _normalized_video_slot(item.get("video_slot"), 1),
                 ),
             )
-            if by_slot.get(slot):
+            # An explicit empty authoring row records a user color clear. Only
+            # genuinely absent legacy rows may be inferred from saved videos;
+            # otherwise a later READ would revive the last deleted assignment.
+            if slot in by_slot:
                 continue
             inferred: List[Dict[str, Any]] = []
             for index, marker in enumerate(_normalize_markers(item.get("markers"), slot), start=1):
@@ -7851,8 +7909,8 @@ def _original_video_item_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "generation_role": "original",
         "media_kind": ORIGINAL_MEDIA_KIND,
         "video_role": "maya_original_playblast",
-        "source_type_hint": "Original Maya Viewport Reference",
-        "control_role_hint": "Original Appearance and Motion Reference",
+        "source_type_hint": "Neutral Midgray Maya Viewport Reference",
+        "control_role_hint": "Neutral Geometry and Motion Reference",
         "label": "Original Playblast",
     }
 
@@ -8819,11 +8877,21 @@ def _parse_state(value: Any) -> Dict[str, Any]:
     )
     state["video_library_version"] = 1
     state["markers"] = _normalize_markers(state.get("markers"), state["selected_video_slot"])
+    legacy_assignment_videos = []
+    if isinstance(source, dict) and "slot_assignments" not in source:
+        # Migrate genuinely older saves before defaults hide the absent field.
+        # Only the selected primary video can seed the one Maya authoring row;
+        # an explicitly empty field/row always means the user cleared it.
+        legacy_assignment_videos = [
+            item for item in state["videos"]
+            if _readable_video_slot(item.get("video_slot")) == PRIMARY_COLOR_VIDEO_SLOT
+        ]
+        state["slot_assignments"] = []
     state["slot_assignments"] = _normalize_slot_assignments(
         [row for row in (state.get("slot_assignments") if isinstance(state.get("slot_assignments"), list) else [])
          if isinstance(row, dict) and _normalized_video_slot(row.get("video_slot"), 1) == 1],
         1,
-        [],
+        legacy_assignment_videos,
         recovery_diagnostics,
     )
     visibility_by_slot: Dict[int, List[str]] = {}
@@ -8971,6 +9039,7 @@ def _parse_state(value: Any) -> Dict[str, Any]:
         source.get("picker_shots") if isinstance(source, dict) else None,
         picker_shots_present=isinstance(source, dict) and "picker_shots" in source,
     )
+    _normalize_outliner_selection_fields(state)
     tools_by_shot = state.get("video_tools_by_shot")
     tools_by_shot = tools_by_shot if isinstance(tools_by_shot, dict) else {}
     state["video_tools_by_shot"] = {
@@ -11717,21 +11786,21 @@ def _original_preview_cache_fields(scene_path: Path, state: Dict[str, Any]) -> D
 
 
 def _original_material_report_is_valid(report: Any) -> bool:
+    """Accept only a restored, opaque, texture-free neutral Original pass.
+
+    The versioned profile deliberately invalidates old textured Original
+    caches. Source shader identity is no longer a publication requirement;
+    shading-group membership and restoration still are.
+    """
     source = report if isinstance(report, dict) else {}
     count_keys = (
         "inspected_shading_engine_count",
-        "source_material_count",
+        "contributing_shading_engine_count",
         "temporary_lambert_count",
-        "existing_lambert_count",
         "texture_connection_count",
-        "numeric_color_count",
-        "loaded_plugin_passthrough_count",
-        "plugin_fallback_count",
-        "plugin_fallback_material_count",
-        "plugin_fallback_node_count",
-        "unsupported_color_fallback_count",
-        "required_texture_dependency_count",
-        "missing_texture_dependency_count",
+        "transparency_transfer_count",
+        "emission_transfer_count",
+        "normal_transfer_count",
         "swapped_shading_engine_count",
     )
     if any(
@@ -11747,23 +11816,36 @@ def _original_material_report_is_valid(report: Any) -> bool:
         }
     except (TypeError, ValueError):
         return False
-    fallback_records = source.get("plugin_fallback_records")
-    unsupported_materials = source.get("unsupported_color_fallback_materials")
-    loaded_plugin_nodes = source.get("loaded_plugin_nodes")
-    warnings = source.get("warnings")
-    if not isinstance(fallback_records, list):
+    base_color = source.get("base_color")
+    fill_color = source.get("fill_color")
+    diffuse = source.get("diffuse")
+    if not isinstance(base_color, (list, tuple)) or len(base_color) != 3:
         return False
-    if not isinstance(unsupported_materials, list):
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or abs(float(value) - 0.5) > 1e-6
+        for value in base_color
+    ):
         return False
-    if not isinstance(loaded_plugin_nodes, list):
+    if not isinstance(fill_color, (list, tuple)) or len(fill_color) != 3:
         return False
-    if not isinstance(warnings, list):
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or abs(float(value) - 0.22) > 1e-6
+        for value in fill_color
+    ):
         return False
-    fallback_count = counts["plugin_fallback_count"]
-    fallback_material_count = counts["plugin_fallback_material_count"]
-    fallback_node_count = counts["plugin_fallback_node_count"]
-    unsupported_count = counts["unsupported_color_fallback_count"]
-    loaded_plugin_count = counts["loaded_plugin_passthrough_count"]
+    if (
+        isinstance(diffuse, bool)
+        or not isinstance(diffuse, (int, float))
+        or not math.isfinite(diffuse)
+        or abs(float(diffuse) - 0.45) > 1e-6
+    ):
+        return False
     return bool(
         _clean(source.get("profile"))
         == ORIGINAL_MATERIAL_OVERRIDE_PROFILE
@@ -11771,46 +11853,26 @@ def _original_material_report_is_valid(report: Any) -> bool:
         and _clean(source.get("status")) == "restored"
         and source.get("restore_ok") is True
         and source.get("shading_group_membership_preserved") is True
-        and source.get("one_lambert_per_source_material") is True
         and source.get("default_lighting_verified") is True
-        and source.get("textured_render_mode_verified") is True
+        and source.get("solid_render_mode_verified") is True
+        and source.get("soft_shading_verified") is True
+        and source.get("authored_materials_ignored") is True
+        and source.get("textures_ignored") is True
+        and source.get("opaque_surface_verified") is True
         and not bool(
             source.get("temporary_nodes_retained_on_restore_failure")
         )
         and min(counts.values()) >= 0
         and counts["inspected_shading_engine_count"]
         >= counts["swapped_shading_engine_count"]
-        and counts["source_material_count"]
-        == counts["temporary_lambert_count"]
-        + counts["existing_lambert_count"]
+        and counts["swapped_shading_engine_count"]
+        == counts["contributing_shading_engine_count"]
         and counts["temporary_lambert_count"]
-        <= counts["swapped_shading_engine_count"]
-        and counts["texture_connection_count"]
-        + counts["numeric_color_count"]
-        == counts["temporary_lambert_count"]
-        and source.get("texture_dependency_preflight_passed") is True
-        and counts["missing_texture_dependency_count"] == 0
-        and isinstance(source.get("missing_texture_dependencies"), list)
-        and not source.get("missing_texture_dependencies")
-        and fallback_material_count <= counts["temporary_lambert_count"]
-        and fallback_material_count <= fallback_count
-        and unsupported_count <= counts["temporary_lambert_count"]
-        and (fallback_count == 0 and unsupported_count == 0) == bool(
-            source.get("texture_identity_preserved")
-        )
-        and len(fallback_records) == min(fallback_count, 32)
-        and len(unsupported_materials) == min(unsupported_count, 32)
-        and len(set(unsupported_materials)) == len(unsupported_materials)
-        and all(
-            isinstance(material, str) and bool(material.strip())
-            for material in unsupported_materials
-        )
-        and len(loaded_plugin_nodes) == min(loaded_plugin_count, 32)
-        and (fallback_count == 0 or fallback_node_count > 0)
-        and (
-            fallback_count == 0 and unsupported_count == 0
-            or bool(warnings)
-        )
+        == int(counts["contributing_shading_engine_count"] > 0)
+        and counts["texture_connection_count"] == 0
+        and counts["transparency_transfer_count"] == 0
+        and counts["emission_transfer_count"] == 0
+        and counts["normal_transfer_count"] == 0
     )
 
 
@@ -11970,7 +12032,8 @@ def _operation_input_digest(kind: str, scene_text: Any, state: Dict[str, Any], s
         selected_slot = PRIMARY_COLOR_VIDEO_SLOT
     if kind_text == "render_original_preview":
         # Original preview identity is deliberately independent of marker/color
-        # bindings and their catalog version. It represents the unmodified scene.
+        # bindings and their catalog version. Only geometry, camera and timing
+        # are inherited from the scene; material appearance is neutral midgray.
         payload.pop("marker_catalog_version", None)
         original_fields = _original_preview_cache_fields(_norm_path(scene_text), normalized)
         payload.update({
@@ -13291,6 +13354,7 @@ class HMBVideoPickerLibrary(DataNode):
         }
         widget_authoring_fields = {
             "workspace_view", "selected_outliner_path", "selected_outliner_name", "selected_outliner_uuid",
+            "selected_outliner_paths", "outliner_selection_anchor", "outliner_selection_scope",
             "selected_color", "outliner_expanded", "outliner_search", "selected_camera",
             "slot_assignments", "slot_visibility", "snapshot_frame", "snapshot_video_slot",
             "depth_settings",
@@ -16104,6 +16168,9 @@ class HMBVideoPickerLibrary(DataNode):
             "selected_outliner_path": "",
             "selected_outliner_name": "",
             "selected_outliner_uuid": "",
+            "selected_outliner_paths": [],
+            "outliner_selection_anchor": "",
+            "outliner_selection_scope": "",
             "selected_color": "",
             "video_path": "",
             "video_url": "",
@@ -16141,6 +16208,7 @@ class HMBVideoPickerLibrary(DataNode):
                 "source_fps", "source_frame_count", "output_frame_count", "source_duration_seconds",
                 "output_duration_seconds", "outliner_nodes", "outliner_expanded", "selected_outliner_path",
                 "selected_outliner_name", "selected_outliner_uuid", "selected_color",
+                "selected_outliner_paths", "outliner_selection_anchor", "outliner_selection_scope",
                 "video_path", "video_url", "original_video_path", "original_video_url",
                 "snapshot_active", "snapshot_frame",
                 "snapshot_video_slot", "snapshot_data_uri", "snapshot_path",
@@ -17742,13 +17810,14 @@ class HMBVideoPickerLibrary(DataNode):
             # can yield. Maya browse is valid without a workspace UUID, while
             # video imports additionally persist their captured projection.
             self._write_state(state)
-        if action == "run_video" and isinstance(
+        if action in {"run_video", "render_snapshot"} and isinstance(
             payload.get("authoring_state"),
             dict,
         ):
             authoring_state = dict(payload["authoring_state"])
+            current_authoring_state = copy.deepcopy(state)
             # WIDGET_STATE and HMB_PICKER_COMMAND are independent transports.
-            # Freeze the exact authoring snapshot visible when Generate was
+            # Freeze the exact authoring snapshot visible when Generate/Snapshot was
             # clicked so a just-applied color/visibility edit cannot arrive
             # behind the command and invalidate or misconfigure this run.
             for field in (
@@ -17766,6 +17835,32 @@ class HMBVideoPickerLibrary(DataNode):
                 if field in authoring_state:
                     state[field] = copy.deepcopy(authoring_state[field])
             state = _parse_state(state)
+            requested_workspace = _uuid_text(
+                current_authoring_state.get("operation_requested_picker_shot_uuid")
+            )
+            if (
+                action == "render_snapshot"
+                and requested_workspace
+                and requested_workspace != _uuid_text(current_authoring_state.get("active_picker_shot_uuid"))
+                and any(
+                    state.get(field) != current_authoring_state.get(field)
+                    for field in (
+                        "selected_camera", "slot_assignments", "slot_visibility",
+                        "depth_settings", "output_width", "output_height",
+                    )
+                )
+            ):
+                # Maya authoring is shared across Shots. A delayed Snapshot
+                # may retain its captured destination but must not overwrite
+                # newer colors/settings edited after the user navigated away.
+                current_authoring_state.pop("operation_requested_picker_shot_uuid", None)
+                current_authoring_state["message"] = (
+                    "Snapshot was not started because Maya settings changed after switching Shots. "
+                    "Current settings were preserved. Select the intended Shot and retry Snapshot."
+                )
+                _append_activity_log(current_authoring_state, "WARNING", current_authoring_state["message"])
+                self._write_state(current_authoring_state)
+                return
             state["backend_ack_action_id"] = action_id
             state["pending_action"] = ""
             state["pending_action_id"] = ""
@@ -19420,7 +19515,7 @@ class HMBVideoPickerLibrary(DataNode):
             "scene_stage": "OUTLINER_READY",
             "message": (
                 f"Maya Outliner loaded with {len(outliner_nodes)} selectable asset roots. "
-                "Enable Original Playblast when an unmodified viewport preview is needed."
+                "Enable Original Playblast for a neutral midgray geometry and motion preview."
             ),
             "scene_path": str(scene_path).replace("\\", "/"),
             "scene_draft_path": str(scene_path).replace("\\", "/"),
@@ -19453,6 +19548,12 @@ class HMBVideoPickerLibrary(DataNode):
             "selected_outliner_path": outliner_selection["path"],
             "selected_outliner_name": outliner_selection["name"],
             "selected_outliner_uuid": outliner_selection["uuid"],
+            "selected_outliner_paths": (
+                [path for path in previous_state.get("selected_outliner_paths", []) if path in valid_paths]
+                or ([outliner_selection["path"]] if outliner_selection["path"] else [])
+            ),
+            "outliner_selection_anchor": outliner_selection["path"],
+            "outliner_selection_scope": "",
             "selected_color": outliner_selection["color"],
             "workspace_view": "outliner",
             "active_slot_count": active_slot_count,
@@ -19831,7 +19932,7 @@ class HMBVideoPickerLibrary(DataNode):
         state.update({
             "status": "GENERATING_ORIGINAL",
             "scene_stage": "GENERATING_ORIGINAL",
-            "message": f"Maya {maya_version} is rendering the on-demand original preview.",
+            "message": f"Maya {maya_version} is rendering the texture-free midgray Original preview.",
             "original_preview_enabled": False,
             "maya_executable": str(mayabatch).replace("\\", "/"),
             "maya_version": maya_version,
@@ -19970,7 +20071,7 @@ class HMBVideoPickerLibrary(DataNode):
             _clean(runner_sidecar.get("original_material_override_profile"))
             != ORIGINAL_MATERIAL_OVERRIDE_PROFILE
         ):
-            validation_errors.append("Original Lambert material profile")
+            validation_errors.append("Original midgray material profile")
         runner_material_report = (
             dict(runner_sidecar.get("original_material_override_report"))
             if isinstance(
@@ -19979,7 +20080,7 @@ class HMBVideoPickerLibrary(DataNode):
             else {}
         )
         if not _original_material_report_is_valid(runner_material_report):
-            validation_errors.append("Original Lambert restoration report")
+            validation_errors.append("Original midgray restoration report")
         if list(runner_sidecar.get("markers") or []):
             validation_errors.append("marker isolation")
         if not runner_dependency_paths:

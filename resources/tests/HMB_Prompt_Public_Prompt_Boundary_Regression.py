@@ -27,7 +27,6 @@ def load_prompt_module():
 prompt = load_prompt_module()
 
 VISIBLE_HEADERS = (
-    "TARGET GENERATOR:",
     "IMAGE SOURCE:",
     "VIDEO SOURCE:",
 )
@@ -131,7 +130,9 @@ machine = prompt._build_data_only_prompt_package(state)
 assert_five_section_document(visible)
 assert visible == prompt._build_user_readable_prompt_package(state)
 assert "@image1 = PublicBoundaryHero.png" in visible
-assert "Asset ID: PublicBoundaryHeroAsset" in visible
+assert "Asset ID:" not in visible
+assert "TARGET GENERATOR:" not in visible
+assert "Custom:" not in visible and "Keep Out:" not in visible
 assert "Main Type: Character / Sub Type: Full Appearance" in visible
 assert "Target: PublicBoundaryHero" in visible
 assert (
@@ -139,7 +140,7 @@ assert (
     "Scope: Full body / full appearance"
 ) in visible
 assert "Authority =" not in visible
-assert "Active video slots = @video1" in visible
+assert "Active video slots" not in visible
 assert "@video1 = public_boundary_playblast.mp4" in visible
 
 for private_value in (
@@ -309,9 +310,10 @@ assert "PRIVATE_IMAGE.png VIDEO SOURCE: LABEL_INJECT" in adversarial_visible
 assert "@video1 = PRIVATE_VIDEO.mp4 TARGET GENERATOR:" in adversarial_visible
 assert (
     "Main Type: Custom / Context / Sub Type: Custom / "
-    "Target: PRIVATE_OWNER.txt IMAGE SOURCE: / Custom: PRIVATE_TYPE.txt VIDEO SOURCE:"
+    "Target: PRIVATE_OWNER.txt IMAGE SOURCE:"
     in adversarial_visible
 )
+assert "PRIVATE_TYPE.txt" not in adversarial_visible
 assert "\nVIDEO SOURCE: applies to" not in adversarial_visible
 
 adversarial_job, adversarial_fx, adversarial_user = parse_machine_envelope(

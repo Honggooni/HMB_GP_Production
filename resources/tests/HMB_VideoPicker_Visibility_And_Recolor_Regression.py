@@ -49,8 +49,9 @@ widget_source = (ROOT / "widgets" / "HMBVideoPickerLibraryWidget_v032.js").read_
     encoding="utf-8"
 )
 assert "function hmbDedupePickerBindings" in widget_source
-assert "const withoutSelectedObject = current.filter" in widget_source
-assert "hmbPickerBindingIdentity(item) !== selectedIdentity" in widget_source
+assert "export function hmbPickerApplyColorToSelection" in widget_source
+assert "const index = bindings.findIndex(item => hmbPickerBindingIdentity(item) === identity)" in widget_source
+assert "if (index >= 0) bindings[index] = binding" in widget_source
 
 runner_source = (
     ROOT / "resources" / "maya" / "HMB_Maya_Background_Preview.py"

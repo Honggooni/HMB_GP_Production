@@ -72,8 +72,27 @@ class Surface2DTests(unittest.TestCase):
                          "lip-sync authority", "do not freeze the mouth", "not other targets"):
             self.assertIn(fragment, instruction)
         self.assertEqual(off_job, on_job)
-        self.assertIn(instruction, prompt._build_user_readable_prompt_package(on))
+        visible = prompt._build_user_readable_prompt_package(on)
+        self.assertNotIn(instruction, visible)
+        self.assertIn("2D표현: 사용", visible)
+        self.assertEqual(visible.count("2D표현: 사용"), 1)
         self.assertEqual(off["text"], on["text"])
+
+    def test_summary_language_does_not_change_machine_instructions(self):
+        state = state_for([character(enabled=True), character("partner")])
+        korean_machine = prompt._build_data_only_prompt_package(state)
+        korean_visible = prompt._build_user_readable_prompt_package(state)
+        state["ui"]["language"] = "en"
+        english_visible = prompt._build_user_readable_prompt_package(state)
+        self.assertIn("2DSurface: On", english_visible)
+        self.assertEqual(english_visible.count("2DSurface: On"), 1)
+        self.assertEqual(korean_machine, prompt._build_data_only_prompt_package(state))
+        for visible in (korean_visible, english_visible):
+            for detailed in ("User-selected 2DSurface", "graphic mouth", "Custom:",
+                             "Custom Type:", "Custom Role:", "Keep Out:", "TARGET GENERATOR:"):
+                self.assertNotIn(detailed, visible)
+        state["images"][0]["surface_2d"] = False
+        self.assertNotIn("2DSurface", prompt._build_user_readable_prompt_package(state))
 
     def test_no_stale_instruction_after_uncheck_or_main_type_change(self):
         for main in prompt.IMAGE_MAIN_TYPE_CHOICES:

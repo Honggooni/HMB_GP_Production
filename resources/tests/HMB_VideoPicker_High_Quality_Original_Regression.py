@@ -261,28 +261,22 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
             "status": "restored",
             "restore_ok": True,
             "shading_group_membership_preserved": True,
-            "one_lambert_per_source_material": True,
             "default_lighting_verified": True,
-            "textured_render_mode_verified": True,
+            "solid_render_mode_verified": True,
+            "soft_shading_verified": True,
+            "authored_materials_ignored": True,
+            "textures_ignored": True,
+            "opaque_surface_verified": True,
+            "base_color": [0.5, 0.5, 0.5],
+            "fill_color": [0.22, 0.22, 0.22],
+            "diffuse": 0.45,
             "inspected_shading_engine_count": 1,
-            "source_material_count": 1,
+            "contributing_shading_engine_count": 1,
             "temporary_lambert_count": 1,
-            "existing_lambert_count": 0,
-            "texture_connection_count": 1,
-            "numeric_color_count": 0,
-            "loaded_plugin_passthrough_count": 0,
-            "loaded_plugin_nodes": [],
-            "plugin_fallback_count": 0,
-            "plugin_fallback_material_count": 0,
-            "plugin_fallback_node_count": 0,
-            "plugin_fallback_records": [],
-            "unsupported_color_fallback_count": 0,
-            "unsupported_color_fallback_materials": [],
-            "required_texture_dependency_count": 1,
-            "missing_texture_dependency_count": 0,
-            "missing_texture_dependencies": [],
-            "texture_dependency_preflight_passed": True,
-            "texture_identity_preserved": True,
+            "texture_connection_count": 0,
+            "transparency_transfer_count": 0,
+            "emission_transfer_count": 0,
+            "normal_transfer_count": 0,
             "warnings": [],
             "swapped_shading_engine_count": 1,
         },
@@ -300,6 +294,29 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
         scene_path, state, video_path, sidecar_path
     )
 
+    # A matching profile alone must not accept textured or heavily shadowed
+    # output, an un-restored temporary assignment, or a non-neutral shader.
+    valid_material_report = current_sidecar["original_material_override_report"]
+    for key, invalid_value in (
+        ("diffuse", 0.8),
+        ("fill_color", [0.0, 0.0, 0.0]),
+        ("base_color", [0.5, 0.5, float("nan")]),
+        ("soft_shading_verified", False),
+        ("solid_render_mode_verified", False),
+        ("textures_ignored", False),
+        ("opaque_surface_verified", False),
+        ("restore_ok", False),
+        ("texture_connection_count", 1),
+        ("transparency_transfer_count", 1),
+        ("emission_transfer_count", 1),
+        ("normal_transfer_count", 1),
+        ("contributing_shading_engine_count", 2),
+        ("temporary_lambert_count", 2),
+    ):
+        invalid_report = dict(valid_material_report, **{key: invalid_value})
+        assert not picker._original_material_report_is_valid(invalid_report), key
+    assert video_path.is_file() and sidecar_path.is_file()
+
     reference_path.write_bytes(b"reference-v2")
     assert not picker._original_preview_cache_is_valid(
         scene_path, state, video_path, sidecar_path
@@ -315,28 +332,22 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
             "status": "restored",
             "restore_ok": True,
             "shading_group_membership_preserved": True,
-            "one_lambert_per_source_material": True,
             "default_lighting_verified": True,
-            "textured_render_mode_verified": True,
+            "solid_render_mode_verified": True,
+            "soft_shading_verified": True,
+            "authored_materials_ignored": True,
+            "textures_ignored": True,
+            "opaque_surface_verified": True,
+            "base_color": [0.5, 0.5, 0.5],
+            "fill_color": [0.22, 0.22, 0.22],
+            "diffuse": 0.45,
             "inspected_shading_engine_count": 1,
-            "source_material_count": 1,
+            "contributing_shading_engine_count": 1,
             "temporary_lambert_count": 1,
-            "existing_lambert_count": 0,
-            "texture_connection_count": 1,
-            "numeric_color_count": 0,
-            "loaded_plugin_passthrough_count": 0,
-            "loaded_plugin_nodes": [],
-            "plugin_fallback_count": 0,
-            "plugin_fallback_material_count": 0,
-            "plugin_fallback_node_count": 0,
-            "plugin_fallback_records": [],
-            "unsupported_color_fallback_count": 0,
-            "unsupported_color_fallback_materials": [],
-            "required_texture_dependency_count": 1,
-            "missing_texture_dependency_count": 0,
-            "missing_texture_dependencies": [],
-            "texture_dependency_preflight_passed": True,
-            "texture_identity_preserved": True,
+            "texture_connection_count": 0,
+            "transparency_transfer_count": 0,
+            "emission_transfer_count": 0,
+            "normal_transfer_count": 0,
             "warnings": [],
             "swapped_shading_engine_count": 1,
         },
@@ -370,7 +381,22 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
     )
     assert not picker._original_preview_cache_is_valid(
         scene_path, state, video_path, sidecar_path
-    ), "The strict v1 material cache must not hide the v2 plug-in fallback fix."
+    ), "A textured material cache must not hide the neutral midgray profile."
+
+    textured_v4_sidecar = copy.deepcopy(current_sidecar)
+    textured_v4_sidecar[ORIGINAL_MATERIAL_PROFILE_FIELD] = (
+        "per_source_material_lambert_plugin_fallback_v4"
+    )
+    textured_v4_sidecar["original_material_override_report"]["profile"] = (
+        "per_source_material_lambert_plugin_fallback_v4"
+    )
+    sidecar_path.write_text(
+        json.dumps(textured_v4_sidecar, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    assert not picker._original_preview_cache_is_valid(
+        scene_path, state, video_path, sidecar_path
+    ), "Previously cached textured Original must be regenerated in midgray."
 
     missing_material_profile_sidecar = copy.deepcopy(current_sidecar)
     missing_material_profile_sidecar.pop(ORIGINAL_MATERIAL_PROFILE_FIELD)

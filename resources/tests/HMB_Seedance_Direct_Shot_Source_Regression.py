@@ -5,11 +5,13 @@ import hashlib
 import importlib.util
 import json
 import sys
+import threading
 import time
 import types
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 
 def _install_clean_ci_griptape_stubs() -> None:
@@ -185,6 +187,7 @@ sys.path.insert(0, str(ROOT))
 
 import HMBSeedanceGeneration as target
 import HMBVideoPickerLibrary as picker_target
+import HMBFinishLookLibrary as finish_target
 
 
 CHANNEL = "11111111-1111-4111-8111-111111111111"
@@ -311,7 +314,16 @@ class FinishSource:
         return deepcopy(self.value)
 
 
-def finish_snapshot(instruction: str) -> dict[str, Any]:
+def finish_snapshot(
+    instruction: str | None = None,
+    *,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if state is None:
+        state = finish_target.default_finish_look_state()
+        state["beauty"]["enabled"] = True
+    if instruction is None:
+        instruction = finish_target.compile_finish_look_prompt(state)
     return {
         "schema": target.FINISH_LOOK_SHOT_SNAPSHOT_SCHEMA,
         "version": target.FINISH_LOOK_SHOT_SNAPSHOT_VERSION,
@@ -321,8 +333,9 @@ def finish_snapshot(instruction: str) -> dict[str, Any]:
         "shot_name": "Second Shot",
         "generation": 4,
         "finish_look_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
-        "state_sha256": "a" * 64,
+        "state_sha256": canonical(state),
         "finish_look_out": instruction,
+        "finish_look_state": deepcopy(state),
     }
 
 
@@ -458,19 +471,18 @@ def valid_params(*, prompt: str = "") -> dict[str, Any]:
 
 
 # Finish Look is an optional sixth same-Shot sidecar. Resolution keeps the
-# Agent/user prompt opaque and carries the exact Finish bytes separately. The
+# Agent/user prompt opaque and carries canonical Beauty bytes separately. The
 # Broker payload alone wraps them after the resolved Shot instruction and
 # before one fixed final-render guard, so no Agent/LLM can rewrite the finish.
-finish_instruction = (
-    "Apply restrained beauty processing.\n"
-    "Preserve this exact UTF-8 phrase: 새벽의 차가운 응답."
-)
-finish = FinishSource(finish_snapshot(finish_instruction))
+finish_value = finish_snapshot()
+finish_instruction = finish_value["finish_look_out"]
+finish = FinishSource(finish_value)
 finish_node = generator(image, picker, finish=finish)
+authored_prompt = "  Exact Agent instruction\nKeep authored Kodak 2383 film grain. 새벽의 차가운 응답.\n "
 finish_resolved = finish_node._resolve_exact_shot_generation_inputs(
-    valid_params(prompt="Exact Agent instruction")
+    valid_params(prompt=authored_prompt)
 )
-assert finish_resolved["prompt"] == "Exact Agent instruction"
+assert finish_resolved["prompt"] == authored_prompt
 assert finish_resolved["_hmb_finish_look_out"] == finish_instruction
 finish_payload_params = deepcopy(finish_resolved)
 finish_payload_params["reference_images"] = [
@@ -483,24 +495,47 @@ finish_payload_params["video_references"] = [
 finish_payload = finish_node._build_broker_payload(finish_payload_params)
 submitted_prompt = finish_payload["prompt"]
 assert submitted_prompt.count(finish_instruction) == 1
-assert submitted_prompt.index("Exact Agent instruction") < submitted_prompt.index(
+assert submitted_prompt.index(authored_prompt) < submitted_prompt.index(
     finish_instruction
 )
 assert submitted_prompt.index(finish_instruction) < submitted_prompt.index(
     "HMB FINAL RENDER RULES"
 )
 assert "HMB FINISH LOOK — APPLY AFTER THE RESOLVED GLOBAL LOOK (VERBATIM)" in submitted_prompt
-assert submitted_prompt.endswith("Do not introduce or simulate film grain.")
+assert submitted_prompt.startswith("HMB RESOLVED SHOT INSTRUCTION\n" + authored_prompt + "\n\n")
+assert submitted_prompt.count(authored_prompt) == 1
 assert "Apply Character Beauty exclusively to character-owned surfaces" in submitted_prompt
 assert "never apply it to the background, environment" in submitted_prompt
-assert "Filter Application may affect the completed frame" in submitted_prompt
-for authored_filter_effect in (
+for retired_filter_effect in (
+    "Filter Application",
     "film-stock color and tonal response",
-    "highlight glow",
-    "soft-focus diffusion",
     "vignette",
+    "Do not introduce or simulate film grain.",
 ):
-    assert authored_filter_effect in submitted_prompt
+    assert retired_filter_effect not in submitted_prompt
+assert "Keep authored Kodak 2383 film grain." in submitted_prompt
+
+# A correctly hashed old prose block must not become authority. Only verified
+# canonical state is compiled, so restored/connected stale Filter text vanishes.
+retired_instruction = finish_instruction + "\nApply Filter Application: Kodak 5245, vignette, film grain."
+stale_finish_value = finish_snapshot(retired_instruction)
+stale_resolved = generator(
+    image, picker, finish=FinishSource(stale_finish_value)
+)._resolve_exact_shot_generation_inputs(valid_params(prompt=authored_prompt))
+assert stale_resolved["_hmb_finish_look_out"] == finish_instruction
+assert stale_resolved["prompt"] == authored_prompt
+assert stale_finish_value["finish_look_out"] == retired_instruction
+
+# New default Beauty is OFF; valid historical prose cannot override that state.
+disabled_finish_state = finish_target.default_finish_look_state()
+assert disabled_finish_state["beauty"]["enabled"] is False
+disabled_resolved = generator(
+    image,
+    picker,
+    finish=FinishSource(finish_snapshot(retired_instruction, state=disabled_finish_state)),
+)._resolve_exact_shot_generation_inputs(valid_params(prompt=authored_prompt))
+assert disabled_resolved["_hmb_finish_look_out"] == ""
+assert finish_node._compose_finish_look_prompt(authored_prompt, "") == authored_prompt
 
 # Without a Finish node, both direct resolution and Broker submission preserve
 # the pre-existing prompt behavior byte-for-byte.
@@ -533,6 +568,45 @@ except RuntimeError as exc:
 else:
     raise AssertionError("A tampered Finish Look sidecar reached Seedance")
 
+tampered_finish_state = finish_snapshot()
+tampered_finish_state["finish_look_state"]["beauty"]["enabled"] = False
+try:
+    generator(
+        image, picker, finish=FinishSource(tampered_finish_state)
+    )._resolve_exact_shot_generation_inputs(valid_params(prompt="reject state tamper"))
+except RuntimeError as exc:
+    assert "state integrity" in str(exc)
+else:
+    raise AssertionError("A tampered Finish Look state reached Seedance")
+
+# v1 has no state to verify/recompile. Demand current-node republication rather
+# than accidentally executing its retired film text or guessing a text split.
+legacy_finish_value = finish_snapshot(retired_instruction)
+legacy_finish_value["version"] = 1
+legacy_finish_value.pop("finish_look_state")
+try:
+    generator(
+        image, picker, finish=FinishSource(legacy_finish_value)
+    )._resolve_exact_shot_generation_inputs(valid_params(prompt="reject stale snapshot"))
+except RuntimeError as exc:
+    assert "Character Beauty refresh" in str(exc)
+    assert "Retired filter instructions were not applied" in str(exc)
+else:
+    raise AssertionError("A retired state-less Finish Look snapshot reached Seedance")
+
+# Even with matching hashes, v2 must contain canonical Beauty-only state.
+legacy_state_in_v2 = finish_snapshot(retired_instruction)
+legacy_state_in_v2["finish_look_state"]["film"] = {"enabled": True, "negative_film": "Kodak 5245"}
+legacy_state_in_v2["state_sha256"] = canonical(legacy_state_in_v2["finish_look_state"])
+try:
+    generator(
+        image, picker, finish=FinishSource(legacy_state_in_v2)
+    )._resolve_exact_shot_generation_inputs(valid_params(prompt="reject noncanonical state"))
+except RuntimeError as exc:
+    assert "Character Beauty refresh" in str(exc)
+else:
+    raise AssertionError("A noncanonical Finish Look state reached Seedance")
+
 wrong_shot_finish_value = finish_snapshot(finish_instruction)
 wrong_shot_finish_value["shot_uuid"] = "another-shot"
 try:
@@ -545,6 +619,119 @@ except RuntimeError as exc:
     assert "selected Shot" in str(exc)
 else:
     raise AssertionError("A cross-Shot Finish Look sidecar reached Seedance")
+
+
+# Exercise real Finish Look hydration/publication and the real atomic API, not
+# merely FinishSource's transport fixture. Only host storage/edge publication
+# are local adapters; no flow registry, user state, or model is accessed.
+legacy_saved_state = {
+    "schema_version": 1,
+    "beauty": deepcopy(finish_value["finish_look_state"]["beauty"]),
+    "film": {"enabled": True, "negative_film": "Kodak 5245", "print_film": "Kodak 2383"},
+}
+legacy_saved_widget = finish_target.default_widget_state()
+catalog_metadata = {
+    "channel_uuid": CHANNEL,
+    "generation": 1,
+    "shots": [
+        {"shot_uuid": "first-shot", "number": 1, "name": "First Shot", "revision": 1},
+        {"shot_uuid": SHOT, "number": 2, "name": "Second Shot", "revision": 1},
+    ],
+}
+legacy_saved_widget["shot_catalog"] = {
+    "schema": finish_target.SHOT_ROUTING_CATALOG_SCHEMA,
+    "version": 1,
+    "publisher_instance_uuid": "offline-image-publisher",
+    **catalog_metadata,
+    "metadata_sha256": canonical(catalog_metadata),
+}
+legacy_saved_widget["shot"] = {
+    "channel_uuid": CHANNEL, "shot_uuid": SHOT, "number": 2, "name": "Second Shot",
+}
+legacy_saved_widget["finish_look"] = legacy_saved_state
+hydrated_finish = object.__new__(finish_target.HMBFinishLookLibrary)
+hydrated_finish.name = "Offline Hydrated Finish Look"
+hydrated_finish.parameters = {
+    finish_target.WIDGET_PARAMETER_NAME: types.SimpleNamespace(default_value=deepcopy(legacy_saved_widget)),
+}
+hydrated_finish.parameter_output_values = {}
+hydrated_finish._state_lock = threading.RLock()
+hydrated_finish._last_valid_state = finish_target.default_finish_look_state()
+hydrated_finish._widget_state = finish_target.default_widget_state()
+hydrated_finish._remote_revision = 0
+hydrated_finish._remote_connected = False
+hydrated_finish._remote_status = deepcopy(finish_target.DEFAULT_REMOTE_STATUS)
+hydrated_finish._hmb_node_deleted = False
+hydrated_finish._node_deleted = False
+hydrated_finish._hmb_shot_catalog_snapshot = {}
+hydrated_finish._hmb_shot_catalog_syncing = False
+hydrated_finish._hmb_finish_snapshot_generation = 0
+hydrated_finish._hmb_finish_snapshot_fingerprint = ""
+hydrated_finish._hmb_finish_snapshot_live_fingerprint = ""
+hydrated_finish._hmb_finish_route_ready = False
+hydrated_finish._hmb_finish_snapshot = {}
+hydrated_finish._repair_ui_contract = lambda: None
+hydrated_finish.get_parameter_value = lambda name: deepcopy(
+    hydrated_finish.parameters[name].default_value
+    if name in hydrated_finish.parameters else hydrated_finish.parameter_output_values.get(name)
+)
+hydrated_finish._hmb_available_finish_shot_catalog = lambda *_args: deepcopy(legacy_saved_widget["shot_catalog"])
+hydration_publications = []
+finish_wire = {"value": None}
+
+
+def publish_hydrated_finish(name, value, *, live):
+    assert live is True
+    hydration_publications.append((name, deepcopy(value)))
+    if name == finish_target.SHOT_FINISH_LOOK_OUTPUT_PARAMETER_NAME:
+        finish_wire["value"] = deepcopy(value)
+    return True
+
+
+hydrated_finish._publish_parameter = publish_hydrated_finish
+hydrated_finish._reconcile_shared_shot_routing = lambda: hydrated_finish._hmb_publish_routed_finish_snapshot(force=True)
+with mock.patch.object(target._shot_routing, "schedule_post_hydration_reconcile", return_value=False):
+    hydrated_finish.after_deserialize()
+assert hydrated_finish._last_valid_state == finish_value["finish_look_state"]
+assert hydrated_finish._widget_state["finish_look"]["schema_version"] == 2
+assert "film" not in hydrated_finish._widget_state["finish_look"]
+assert legacy_saved_widget["finish_look"]["schema_version"] == 1
+assert finish_wire["value"]["version"] == 2
+assert finish_wire["value"]["finish_look_state"] == finish_value["finish_look_state"]
+assert finish_wire["value"]["finish_look_out"] == finish_instruction
+assert hydrated_finish._hmb_finish_look_shot_snapshot(finish_wire["value"]) == finish_wire["value"]
+
+# Late native restoration of an old connected v1 value must self-republish from
+# this migrated live source, never apply old film prose and never require Reset.
+finish_wire["value"] = deepcopy(legacy_finish_value)
+real_finish_generator = generator(image, picker, finish=hydrated_finish)
+original_finish_getter = real_finish_generator.get_parameter_value
+real_finish_generator.get_parameter_value = lambda name: deepcopy(finish_wire["value"]) if (
+    name == target.SHOT_FINISH_LOOK_INPUT_PARAMETER
+) else original_finish_getter(name)
+real_finish_resolved = real_finish_generator._resolve_exact_shot_generation_inputs(
+    valid_params(prompt=authored_prompt)
+)
+assert real_finish_resolved["_hmb_finish_look_out"] == finish_instruction
+assert real_finish_resolved["prompt"] == authored_prompt
+assert finish_wire["value"]["version"] == 2
+assert finish_wire["value"]["finish_look_state"]["schema_version"] == 2
+
+for changed_key, changed_value in (
+    ("shot_uuid", "wrong-shot"),
+    ("channel_uuid", "wrong-channel"),
+    ("finish_look_out", retired_instruction + " tampered"),
+):
+    invalid_legacy_wire = deepcopy(legacy_finish_value)
+    invalid_legacy_wire[changed_key] = changed_value
+    before_publications = len(hydration_publications)
+    try:
+        hydrated_finish._hmb_finish_look_shot_snapshot(invalid_legacy_wire)
+    except RuntimeError as exc:
+        assert "hidden output" in str(exc)
+    else:
+        raise AssertionError("Invalid legacy Finish Look wire was accepted during hydration")
+    assert len(hydration_publications) == before_publications
 
 
 # Seedance 2.5 is a separate active Broker contract.  Persisted BytePlus model
@@ -1550,6 +1737,18 @@ transition_mode["shot"] = False
 only_after = transition._resolve_exact_shot_generation_inputs(authored_only)
 assert only_after == only_before
 assert authored_only == authored_snapshot
+
+# Switching away from a bound Shot cannot retain its transient finishing text,
+# including an old Filter block. Manual user film instructions remain opaque.
+stale_only_params = {
+    **authored_only,
+    "prompt": authored_prompt,
+    "_hmb_finish_look_out": retired_instruction,
+}
+stale_only = transition._resolve_exact_shot_generation_inputs(stale_only_params)
+assert stale_only["_hmb_finish_look_out"] == ""
+assert stale_only["prompt"] == authored_prompt
+assert stale_only_params["_hmb_finish_look_out"] == retired_instruction
 
 # Exact UUID/name/number matching is fail-closed.
 bad_picker_snapshot = snapshot(

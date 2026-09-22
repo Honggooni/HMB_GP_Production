@@ -119,23 +119,32 @@ const paletteSource = source.slice(paletteStart, paletteEnd);
 assert.ok(paletteStart >= 0 && paletteEnd > paletteStart);
 assert.equal(
   (paletteSource.match(/schedulePickerStatePublicationAfterPaint\(/g) || []).length,
-  2,
-  "Both palette-color mutations must share the paint-first latest-only publisher.",
+  1,
+  "A palette assignment must publish all selected objects atomically through the paint-first latest-only publisher.",
 );
+const paletteMutationIndex = paletteSource.indexOf("hmbPickerApplyColorToSelection(liveState, color)");
+const paletteFeedbackIndex = paletteSource.indexOf("hmbRenderPickerOutlinerLocal(container, next");
+const paletteSelectionIndex = paletteSource.indexOf("hmbApplyPickerPaletteSelectionToDom(container, next");
+const palettePublicationIndex = paletteSource.indexOf("schedulePickerStatePublicationAfterPaint(next");
+assert.ok(paletteMutationIndex >= 0 && paletteFeedbackIndex > paletteMutationIndex);
+assert.ok(paletteSelectionIndex > paletteFeedbackIndex && palettePublicationIndex > paletteSelectionIndex,
+  "Both outliner and palette selection feedback must paint before the single deferred host publication.");
 assert.doesNotMatch(
   paletteSource,
   /\bcommit\(/,
   "Palette feedback must not synchronously publish the full picker state.",
 );
 
-const outlinerStart = source.indexOf("const selectOutlinerPath = (path) => {");
+const outlinerStart = source.indexOf("const selectOutlinerPath = (path, modifiers = {}) => {");
 const outlinerEnd = source.indexOf("on(outlinerScroll", outlinerStart);
 const outlinerSource = source.slice(outlinerStart, outlinerEnd);
 assert.ok(outlinerStart >= 0 && outlinerEnd > outlinerStart);
+assert.match(outlinerSource, /hmbPickerSelectOutlinerPath\(currentWidgetState\(\), path, modifiers\)/,
+  "Outliner selection must preserve Ctrl/Cmd/Shift modifiers for the atomic selected-object set.");
 assert.equal(
   (outlinerSource.match(/schedulePickerStatePublicationAfterPaint\(/g) || []).length,
-  4,
-  "Outliner select, expand, visibility, and Depth settings must share one coalescing publisher.",
+  5,
+  "Outliner select, expand, visibility, color clear, and Depth settings must share one coalescing publisher.",
 );
 assert.doesNotMatch(
   outlinerSource,

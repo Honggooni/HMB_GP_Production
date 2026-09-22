@@ -5,9 +5,7 @@ import fs from "node:fs";
 const widgetPath = new URL("../../widgets/HMBFinishLookLibraryWidget.js", import.meta.url);
 const widgetSource = fs.readFileSync(widgetPath, "utf8");
 
-assert.match(widgetSource, /film:\s*"FILTER APPLICATION"/);
-assert.match(widgetSource, /film:\s*"필터 적용"/);
-assert.doesNotMatch(widgetSource, /film:\s*"(?:FILM RESPONSE|필름 응답)"/);
+assert.doesNotMatch(widgetSource, /data-finish-section="film"|data-stock-|FILTER APPLICATION|필터 적용|필름 스톡/);
 assert.match(widgetSource, /beauty:\s*"CHARACTER BEAUTY"/);
 assert.match(widgetSource, /beauty:\s*"캐릭터 뷰티"/);
 const widget = await import(
@@ -21,7 +19,6 @@ assert.deepEqual(Object.keys(defaultState), [
   "remote_connected",
   "shot_catalog",
   "shot",
-  "catalog",
   "finish_look",
 ]);
 assert.equal(defaultState.schema_version, 1);
@@ -44,11 +41,9 @@ assert.deepEqual(widget.HMB_FINISH_LOOK_SHOT_PALETTE, {
 });
 assert.equal(widget.hmbFinishLookPaletteShotNumber(defaultState), 0);
 assert.equal(widget.hmbFinishLookShotAccent(defaultState), "#64748B");
-assert.deepEqual(defaultState.catalog, {
-  negative: ["None", "Kodak 5245"],
-  print: ["None", "Kodak 2383"],
-  reversal: [],
-});
+assert.equal("catalog" in defaultState, false);
+assert.deepEqual(Object.keys(defaultState.finish_look), ["schema_version", "beauty"]);
+assert.equal(defaultState.finish_look.schema_version, 2);
 assert.deepEqual(Object.keys(defaultState.finish_look.beauty), [
   "enabled",
   "soften_shadows",
@@ -108,9 +103,8 @@ const catalogState = widget.hmbNormalizeFinishLookWidgetValue({
     },
   },
 });
-assert.deepEqual(catalogState.catalog, backendCatalog, "Backend catalog must be the UI source of truth.");
-assert.equal(catalogState.finish_look.film.negative_film, "Lab Negative B");
-assert.equal(catalogState.finish_look.film.print_film, "Lab Reversal");
+assert.equal("catalog" in catalogState, false, "Legacy stock catalogs are discarded.");
+assert.equal("film" in catalogState.finish_look, false, "Legacy Film cannot survive normalization.");
 assert.equal(catalogState.finish_look.beauty.enabled, false);
 assert.equal(catalogState.finish_look.beauty.saturation, 1.75);
 assert.equal("preset" in catalogState.finish_look.beauty, false);
@@ -153,11 +147,7 @@ assert.equal(
   widget.hmbFinishLookNonShotStateFingerprint(onlySelection),
   "Shot-only changes must not force a full Finish Look UI remount.",
 );
-assert.doesNotMatch(
-  widgetSource,
-  /Kodak 5246|Kodak 5248|Kodak 5274|Kodak 2393|Kodak 5285 Rev/,
-  "The widget must not duplicate the backend's complete stock catalog.",
-);
+assert.doesNotMatch(widgetSource, /Kodak|hmbNormalizeFilmStockCatalog|HMB_FILM_STOCK/);
 
 const catalogMarkup = widget.hmbRenderFinishLookWidget(catalogState);
 assert.match(catalogMarkup, /data-shot-number="3"/);
@@ -165,27 +155,21 @@ assert.match(catalogMarkup, /data-shot-bound="true"/);
 assert.match(catalogMarkup, /class="hmb-finish-look__shot-select/);
 assert.match(catalogMarkup, /03 · Forest/);
 assert.match(catalogMarkup, /hmb-finish-look__bound-badge/);
-assert.match(catalogMarkup, /Lab Negative A/);
-assert.match(catalogMarkup, /Lab Reversal/);
-assert.match(
-  catalogMarkup,
-  /data-stock-dropdown="negative_film"[\s\S]*?data-stock-trigger[\s\S]*? disabled/,
-  "A backend-declared reversal print stock must disable the negative selector.",
-);
+assert.doesNotMatch(catalogMarkup, /Lab Negative|Lab Reversal|data-stock-|data-finish-section="film"/);
 const beautyMarkup = catalogMarkup.match(
-  /data-finish-section="beauty"[\s\S]*?data-finish-section="film"/,
+  /data-finish-section="beauty"[\s\S]*?<\/main>/,
 )?.[0] || "";
 assert.doesNotMatch(beautyMarkup, /preset|custom/i);
 
 const preservedKo = widget.hmbNormalizeFinishLookWidgetValue({...catalogState, language:"ko"});
 const preservedEn = widget.hmbNormalizeFinishLookWidgetValue({...preservedKo, language:"en"});
 assert.deepEqual(preservedEn.finish_look,preservedKo.finish_look);
-assert.deepEqual(preservedEn.catalog,preservedKo.catalog);
+assert.equal("catalog" in preservedEn, false);
 
 const defaultMarkup = widget.hmbRenderFinishLookWidget(defaultState);
 // Every numeric authoring control has exactly one discrete, localized slider.
 assert.deepEqual(Object.keys(widget.HMB_FINISH_LOOK_STEPS), Object.keys(widget.HMB_FINISH_LOOK_NUMBER_RULES));
-assert.equal((defaultMarkup.match(/<input[^>]*type="range"/g) || []).length, 22);
+assert.equal((defaultMarkup.match(/<input[^>]*type="range"/g) || []).length, 11);
 assert.doesNotMatch(defaultMarkup, /<input[^>]*type="number"|data-finish-number/);
 let stepCount = 0;
 for (const [path, options] of Object.entries(widget.HMB_FINISH_LOOK_STEPS)) {
@@ -217,7 +201,7 @@ const legacySteps = structuredClone(defaultState);
 legacySteps.finish_look.beauty.brightness = 1.234;
 assert.match(widget.hmbRenderFinishLookWidget(legacySteps), /기존 설정 ≈/);
 assert.equal(widget.hmbFinishLookPublication(legacySteps).finish_look.beauty.brightness, 1.234);
-console.log(`Finish Look discrete steps: PASS (22 controls, ${stepCount} stops, KO/EN, save/restore)`);
+console.log(`Finish Look discrete steps: PASS (11 controls, ${stepCount} stops, KO/EN, save/restore)`);
 assert.doesNotMatch(defaultMarkup, /<[^>]+data-video-drawer(?:\s|=)/);
 assert.equal((defaultMarkup.match(/data-concat-input=/g) || []).length, 0);
 assert.match(defaultMarkup, /data-workspace-mode="finish"/);
@@ -226,6 +210,8 @@ assert.match(defaultMarkup, />FL<\/div>/);
 assert.match(defaultMarkup, /<main class="hmb-finish-look__content">/);
 assert.doesNotMatch(defaultMarkup, /data-video-workspace/);
 assert.match(widgetSource, /height:68px;min-height:68px/);
+assert.match(widgetSource, /hmb-finish-look__content\{display:grid;grid-template-columns:minmax\(0,1fr\)/);
+assert.equal((defaultMarkup.match(/data-finish-section=/g) || []).length, 1);
 assert.match(widgetSource, /hmb-finish-look__mark\{flex:0 0 30px;width:30px;height:30px/);
 assert.match(widgetSource, /width:210px;min-width:120px;max-width:210px/);
 assert.match(widgetSource, /hmb-finish-look__shot-select\{[^}]*height:44px[^}]*font-size:13px/);
@@ -253,16 +239,10 @@ assert.doesNotMatch(
   "REMOTE locks Finish authoring only; the Shot selector remains independent.",
 );
 const remoteBeautyMarkup = remoteMarkup.match(
-  /data-finish-section="beauty"[\s\S]*?data-finish-section="film"/,
-)?.[0] || "";
-const remoteFilmMarkup = remoteMarkup.match(
-  /data-finish-section="film"[\s\S]*?<\/main>/,
+  /data-finish-section="beauty"[\s\S]*?<\/main>/,
 )?.[0] || "";
 assert.match(remoteBeautyMarkup, /data-enable="beauty"[^>]* disabled/);
 assert.match(remoteBeautyMarkup, /data-finish-step="beauty\.saturation"[^>]* disabled/);
-assert.match(remoteFilmMarkup, /data-enable="film"[^>]* disabled/);
-assert.match(remoteFilmMarkup, /data-stock-trigger[^>]* disabled/);
-assert.match(remoteFilmMarkup, /data-finish-step="film\.scale_cc"[^>]* disabled/);
 const remoteVideoInputTag = remoteMarkup.match(
   /<input[^>]*data-video-field="crop\.input"[^>]*>/,
 )?.[0] || "";
@@ -282,19 +262,12 @@ assert.deepEqual(widget.hmbValidateFinishLookNumber("beauty.saturation", "2.25")
 });
 assert.equal(widget.hmbValidateFinishLookNumber("beauty.saturation", "Infinity").ok, false);
 assert.equal(widget.hmbValidateFinishLookNumber("beauty.reduce_shine", "1.1").ok, false);
-assert.equal(widget.hmbValidateFinishLookNumber("film.input_gamma", "0").ok, false);
-assert.equal(widget.hmbValidateFinishLookNumber("film.printer_light_r", "25.5").ok, false);
+assert.equal(widget.hmbValidateFinishLookNumber("film.input_gamma", "1.2").ok, false);
+assert.equal(widget.hmbValidateFinishLookNumber("film.printer_light_r", "25").ok, false);
 
 
-assert.deepEqual(widget.hmbDropdownNavigationIndex("ArrowDown", 2, 4), 3);
-assert.deepEqual(widget.hmbDropdownNavigationIndex("ArrowDown", 3, 4), 0);
-assert.deepEqual(widget.hmbDropdownNavigationIndex("ArrowUp", 0, 4), 3);
-assert.deepEqual(widget.hmbDropdownNavigationIndex("Home", 3, 4), 0);
-assert.deepEqual(widget.hmbDropdownNavigationIndex("End", 0, 4), 3);
-assert.match(widgetSource, /pointerdown[\s\S]*?data-stock-dropdown/);
-assert.match(widgetSource, /ArrowDown/);
-assert.match(widgetSource, /Escape/);
-assert.match(widgetSource, /data-stock-option/);
+assert.equal(widget.hmbNormalizeFilmStockCatalog, undefined);
+assert.equal(widget.hmbDropdownNavigationIndex, undefined);
 
 const scopedCss = widget.hmbScopeWidgetCss(
   ".field,.hmb-finish-look .owned{color:red}@media(max-width:2px){button{display:none}}",

@@ -146,7 +146,8 @@ expect_rejected(lambda: agent._paired_machine_prompt(legacy, visible_prompt))
 # exact seven-line machine envelope from the same initial state.
 live_prompt = prompt.HMBPromptLibrary(name="paired_prompt_live")
 live_visible = live_prompt.parameter_output_values["PROMPT_OUT"]
-assert "TARGET GENERATOR:" in live_visible
+assert "IMAGE SOURCE:" in live_visible and "VIDEO SOURCE:" in live_visible
+assert "TARGET GENERATOR:" not in live_visible
 assert "HMB JOB DATA (JSON):" not in live_visible
 live_machine = agent._paired_machine_prompt(
     SimpleNamespace(_hmb_verified_prompt_source_node=live_prompt),

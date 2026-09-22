@@ -155,6 +155,80 @@ class ErrorDetailTests(unittest.TestCase):
         node._set_broker_task_outputs({"id": "job-new", "status": "succeeded"}, generation_id="job-new", status="succeeded")
         self.assertNotIn("error_details", node.parameter_output_values["provider_response"])
 
+    def test_only_matching_failed_resume_is_retired_and_history_is_preserved(self):
+        for number in range(1, 6):
+            for status in target.TERMINAL_FAILURE_STATUSES:
+                node = self.node(number)
+                job_id = f"job-shot-{number}"
+                node.set_parameter_value("resume_generation_id", job_id)
+                node.parameter_output_values["video_url"] = "previous-saved-video.mp4"
+                task = target.HMBSeedanceGeneration._normalize_broker_task({
+                    "job_id": job_id, "status": status, "error": "provider task ended with status failed",
+                    "request_id": "10295ed1141229ddca80a262",
+                })
+                node._set_broker_task_outputs(task, generation_id=job_id, status=status)
+                self.assertFalse(node.get_parameter_value("resume_generation_id"))
+                self.assertEqual(node.parameter_output_values["generation_id"], job_id)
+                self.assertEqual(node.parameter_output_values["video_url"], "previous-saved-video.mp4")
+                self.assertIn("10295ed1141229ddca80a262", node.parameter_output_values["provider_response"]["error_details"])
+                node.set_parameter_value("resume_generation_id", "job-other-shot")
+                node._set_broker_task_outputs(task, generation_id=job_id, status=status)
+                self.assertEqual(node.get_parameter_value("resume_generation_id"), "job-other-shot")
+
+    def test_active_unknown_and_successful_resumes_are_not_retired(self):
+        node = self.node()
+        node.set_parameter_value("resume_generation_id", "job-diag")
+        for status in ("running", "queued", "succeeded"):
+            task = target.HMBSeedanceGeneration._normalize_broker_task({"job_id": "job-diag", "status": status})
+            node._set_broker_task_outputs(task, generation_id="job-diag", status=task["status"])
+            self.assertEqual(node.get_parameter_value("resume_generation_id"), "job-diag")
+        for code in ("submission_unknown", "provider_overdue"):
+            task = self.task(error_code=code, resubmit_allowed=False)
+            node._set_broker_task_outputs(task, generation_id="job-diag", status=task["status"])
+            self.assertEqual(node.get_parameter_value("resume_generation_id"), "job-diag")
+
+    def test_explicit_runs_after_saved_failed_resume_create_once_each(self):
+        async def check():
+            node = self.node()
+            node._clear_execution_status = mock.Mock()
+            node._set_generation_recovery_checkpoint(
+                stage="terminal", task_id="job-old", task_identity="broker_task", status="failed", terminal=True,
+            )
+            node.set_parameter_value("resume_generation_id", "job-old")
+            node._submission_start_is_authorized = lambda **kwargs: True
+            node._output_file = SimpleNamespace(build_file=lambda: object(), _default_filename="output.mp4")
+            node._get_parameters = lambda: {
+                "resume_generation_id": node.get_parameter_value("resume_generation_id") or "",
+                "model_id": target.SEEDANCE_2_0_MODEL_ID, target.TASK_PARAMETER: target.TASK_TEXT_ONLY,
+                "output_format": "mp4", "return_last_frame": False,
+                "generation_timeout_seconds": 600, "poll_interval_seconds": 5,
+            }
+            node._resolve_exact_shot_generation_inputs = lambda params: dict(params)
+            node._validate_parameters = lambda params: None
+            node._preflight_output_destination = lambda *args: None
+            node._prepare_video_references_for_run = lambda params: params
+            node._build_broker_payload = lambda params: {}
+            bridge = SimpleNamespace(
+                generate_seedance=mock.Mock(side_effect=[
+                    {"job_id": f"job-new-{i}", "status": "failed", "error": "provider task ended with status failed"}
+                    for i in range(2)
+                ]),
+                refresh_job=mock.Mock(side_effect=AssertionError("Run must not query the already failed Resume task")),
+            )
+            node._ensure_broker_connected = mock.AsyncMock(return_value=bridge)
+            with mock.patch.object(target, "_resolve_mp4_decode_verifier", return_value=SimpleNamespace(executable="fake", backend="regression")):
+                for count in range(1, 3):
+                    await node._aprocess_impl()
+                    self.assertEqual(bridge.generate_seedance.call_count, count)
+                    self.assertFalse(node.get_parameter_value("resume_generation_id"))
+                    self.assertFalse(node._generation_recovery_blocks_new_submission())
+                    self.assertEqual(node._generation_recovery_state()["task_id"], f"job-new-{count - 1}")
+                    self.assertIn("next explicit Run", node._set_status_results.call_args.kwargs["result_details"])
+            bridge.refresh_job.assert_not_called()
+            keys = [call.args[0]["client_request_id"] for call in bridge.generate_seedance.call_args_list]
+            self.assertEqual(len(set(keys)), 2)
+        asyncio.run(check())
+
     def test_malformed_oversized_and_html_http_bodies_are_bounded(self):
         for body in (b"<html>private-canary</html>", b"not-json-private-canary", b"x" * 70000):
             exc = target.urllib.error.HTTPError("https://broker.invalid", 502, "error", {}, io.BytesIO(body))

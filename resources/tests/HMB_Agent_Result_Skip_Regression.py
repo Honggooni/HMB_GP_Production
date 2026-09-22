@@ -128,7 +128,8 @@ def make_generator(source, number: int = 1):
     node._generation_recovery_state = lambda: copy.deepcopy(node.checkpoint)
     node._generation_recovery_blocks_new_submission = lambda: bool(node.checkpoint.get("task_id"))
 
-    def assert_new_submission_safe():
+    def assert_new_submission_safe(*, explicit_run: bool = False):
+        assert type(explicit_run) is bool
         assert not node.checkpoint.get("task_id"), "Existing task must be explicitly resumed"
 
     def checkpoint(**value):

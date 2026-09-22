@@ -76,7 +76,8 @@ const markerCatalogProbe = {
 };
 assert.equal(pickerModule.hmbPickerMarkerAllowsRepeat("Sky Blue", markerCatalogProbe), true);
 assert.equal(pickerModule.hmbPickerMarkerAllowsRepeat("Direction Checker", markerCatalogProbe), true);
-assert.equal(pickerModule.hmbPickerMarkerAllowsRepeat("Red", markerCatalogProbe), false);
+assert.equal(pickerModule.hmbPickerMarkerAllowsRepeat("Red", markerCatalogProbe), true);
+assert.equal(pickerModule.hmbPickerMarkerAllowsRepeat("Unknown Marker", markerCatalogProbe), false);
 assert.equal(
   pickerModule.hmbPickerColorStyle("Green", markerCatalogProbe),
   "background:rgb(0,255,0)",
@@ -1294,9 +1295,12 @@ assert.match(
 );
 assert.match(
   videoSource,
-  /snapshotEnabled:[\s\S]*?&& readSnapshotReady[\s\S]*?&& cameraReady[\s\S]*?&& outputReady/,
-  "Snapshot availability keeps only READ, camera, frame, and output technical conditions.",
+  /snapshotEnabled:\s*!operationBusy[\s\S]*?&& snapshotReadReady[\s\S]*?&& cameraReady[\s\S]*?&& outputReady/,
+  "Snapshot availability keeps completed READ, camera, frame, and output technical conditions, including retry after capture failure.",
 );
+assert.match(videoSource,
+  /const snapshotReadReady = readSnapshotReady \|\| \([\s\S]*?!!state\.native_read_ready && validFile && !sceneChanged[\s\S]*?\["FAILED", "CANCELLED"\]\.includes\(sceneStage\)/,
+  "Snapshot failure recovery must never bypass completed READ or the unchanged valid Maya scene requirement.");
 assert.doesNotMatch(videoSource, /PLAYBLAST requires[^\n]*Color Pick binding/);
 assert.doesNotMatch(videoSource, /SNAPSHOT requires[^\n]*Color Pick binding/);
 assert.match(videoSource, /const HMB_PICKER_MAX_SELECTED_VIDEOS = 10;/);

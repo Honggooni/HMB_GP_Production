@@ -330,6 +330,7 @@ const TEXT = {
     mesh: "MESH",
     outputOn: "Included in Playblast",
     outputOff: "Excluded from Playblast",
+    clearOutlinerColor: "Clear assigned color (keep object)",
     expandNode: "Expand group",
     collapseNode: "Collapse group",
     selectCamera: "Select Camera",
@@ -447,6 +448,7 @@ const TEXT = {
     mesh: "메시",
     outputOn: "플레이블라스트 포함",
     outputOff: "플레이블라스트 제외",
+    clearOutlinerColor: "컬러 해제 (오브젝트 유지)",
     expandNode: "그룹 펼치기",
     collapseNode: "그룹 접기",
     unassignedBlack: "컬러가 지정되지 않은 오브젝트와 눈 아이콘으로 제외한 항목은 플레이블라스트 출력에서 제외됩니다.",
@@ -2891,6 +2893,9 @@ function defaultState() {
     selected_outliner_path: "",
     selected_outliner_name: "",
     selected_outliner_uuid: "",
+    selected_outliner_paths: [],
+    outliner_selection_anchor: "",
+    outliner_selection_scope: "",
     selected_color: "",
     outliner_nodes: [],
     outliner_expanded: [],
@@ -3122,6 +3127,12 @@ export function hmbPickerSelectedOutlinerNode(stateValue) {
   if (!nodes.length) return null;
   const requestedUuid = clean(state.selected_outliner_uuid).toLowerCase();
   const requestedPath = clean(state.selected_outliner_path);
+  if (clean(state.outliner_selection_scope) === hmbPickerOutlinerSelectionScope(state)
+      && Array.isArray(state.selected_outliner_paths)) {
+    const paths = new Set(state.selected_outliner_paths.map(clean));
+    const selected = nodes.filter(item => paths.has(clean(item.full_path)));
+    return selected.find(item => clean(item.full_path) === requestedPath) || selected[0] || null;
+  }
   return (
     (requestedUuid
       ? nodes.find((item) => clean(item.maya_uuid).toLowerCase() === requestedUuid)
@@ -3134,9 +3145,120 @@ export function hmbPickerSelectedOutlinerNode(stateValue) {
   );
 }
 
+function hmbPickerOutlinerSelectionScope(state) {
+  const scene = clean(state?.scene_request_path || state?.scene_path || state?.scene_draft_path).replace(/\\/g, "/");
+  return `${scene}|${clean(state?.active_picker_shot_uuid || state?.shot_uuid)}`;
+}
+
+export function hmbPickerSelectedOutlinerNodes(state) {
+  if (clean(state?.outliner_selection_scope) === hmbPickerOutlinerSelectionScope(state)
+      && Array.isArray(state?.selected_outliner_paths)) {
+    const paths = new Set(state.selected_outliner_paths.map(clean));
+    return hmbPickerAllOutlinerNodes(state).filter(item => paths.has(clean(item.full_path)));
+  }
+  const selected = hmbPickerSelectedOutlinerNode(state);
+  return selected ? [selected] : [];
+}
+
+export function hmbPickerSelectOutlinerPath(stateValue, pathValue, modifiers = {}) {
+  const state = hmbEnsurePickerOutlinerSelection(stateValue);
+  const path = clean(pathValue);
+  const nodes = hmbPickerAllOutlinerNodes(state);
+  const node = nodes.find(item => clean(item.full_path) === path);
+  if (!node) return state;
+  const previous = hmbPickerSelectedOutlinerNodes(state).map(item => clean(item.full_path));
+  const additive = !!(modifiers.ctrlKey || modifiers.metaKey);
+  const anchor = clean(state.outliner_selection_anchor || state.selected_outliner_path || path);
+  let paths;
+  if (modifiers.shiftKey) {
+    const visible = filteredVisibleNodes(state).map(item => clean(item.full_path));
+    const start = visible.indexOf(anchor);
+    const end = visible.indexOf(path);
+    const range = start >= 0 && end >= 0 ? visible.slice(Math.min(start, end), Math.max(start, end) + 1) : [path];
+    paths = additive ? Array.from(new Set([...previous, ...range])) : range;
+  } else if (additive) {
+    paths = previous.includes(path) ? previous.filter(item => item !== path) : [...previous, path];
+  } else {
+    paths = [path];
+  }
+  const primary = paths.includes(path) ? node : nodes.find(item => clean(item.full_path) === paths.at(-1));
+  return hmbEnsurePickerOutlinerSelection({
+    ...state,
+    selected_outliner_paths: paths,
+    outliner_selection_anchor: modifiers.shiftKey ? anchor : path,
+    outliner_selection_scope: hmbPickerOutlinerSelectionScope(state),
+    selected_outliner_path: clean(primary?.full_path),
+    selected_outliner_name: clean(primary?.name),
+    selected_outliner_uuid: clean(primary?.maya_uuid),
+    selected_color: "",
+  });
+}
+
+export function hmbPickerApplyColorToSelection(stateValue, colorValue) {
+  const state = hmbEnsurePickerOutlinerSelection(stateValue);
+  const color = clean(colorValue);
+  const nodes = hmbPickerSelectedOutlinerNodes(state);
+  if (!color || !nodes.length) return state;
+  const bindings = selectedBindings(state, 1).map(item => ({ ...item }));
+  for (const node of nodes) {
+    const identity = hmbPickerBindingIdentity({ maya_uuid: node.maya_uuid, full_dag_path: node.full_path });
+    const index = bindings.findIndex(item => hmbPickerBindingIdentity(item) === identity);
+    const binding = {
+      group_name: clean(node.name), full_dag_path: clean(node.full_path), maya_uuid: clean(node.maya_uuid),
+      reference_node: clean(node.reference_node), reference_file: clean(node.reference_file),
+      proxy_manager: clean(node.proxy_manager), proxy_tag: clean(node.proxy_tag),
+      color, enabled: true, video_slot: 1,
+      picker_order: index >= 0 ? bindings[index].picker_order : bindings.length + 1,
+    };
+    if (index >= 0) bindings[index] = binding;
+    else bindings.push(binding);
+  }
+  return {
+    ...setSlotBindings(state, 1, bindings),
+    selected_color: color,
+    status: "READY",
+    message: `${nodes.length} selected object(s) → ${color} for the current cut.`,
+  };
+}
+
+export function hmbPickerClearOutlinerColor(stateValue, pathValue) {
+  const state = stateValue && typeof stateValue === "object" ? stateValue : {};
+  const path = clean(pathValue);
+  const node = hmbPickerAllOutlinerNodes(state).find(item => clean(item.full_path) === path);
+  if (!node) return state;
+  const identity = hmbPickerBindingIdentity({ maya_uuid: node.maya_uuid, full_dag_path: path });
+  const rows = Array.isArray(state.slot_assignments) ? state.slot_assignments : [];
+  let changed = false;
+  const assignments = rows.map(row => {
+    if (Number(row?.video_slot || 0) !== 1 || !Array.isArray(row.bindings)) return row;
+    const bindings = row.bindings.filter(binding => !(
+      hmbPickerBindingIdentity(binding) === identity
+      || clean(binding.full_dag_path || binding.subject_root) === path
+    ));
+    if (bindings.length === row.bindings.length) return row;
+    changed = true;
+    // Keep an explicit empty slot so saved clip metadata cannot restore a cleared color.
+    return { ...row, bindings };
+  });
+  if (!changed) return state;
+  const primary = hmbPickerSelectedOutlinerNode(state);
+  return hmbEnsurePickerOutlinerSelection({
+    ...state,
+    slot_assignments: assignments,
+    selected_color: clean(primary?.full_path) === path ? "" : state.selected_color,
+    message: `${clean(node.name) || path}: assigned color cleared; object and visibility preserved.`,
+  });
+}
+
 export function hmbEnsurePickerOutlinerSelection(stateValue) {
   const state = stateValue && typeof stateValue === "object" ? { ...stateValue } : {};
+  const selection = hmbPickerSelectedOutlinerNodes(state);
   const selected = hmbPickerSelectedOutlinerNode(state);
+  state.selected_outliner_paths = selection.map(item => clean(item.full_path));
+  state.outliner_selection_scope = hmbPickerOutlinerSelectionScope(state);
+  if (!selection.some(item => clean(item.full_path) === clean(state.outliner_selection_anchor))) {
+    state.outliner_selection_anchor = clean(selected?.full_path);
+  }
   if (!selected) {
     state.selected_outliner_path = "";
     state.selected_outliner_name = "";
@@ -4191,6 +4313,10 @@ function normalize(value) {
   state.selected_outliner_path = clean(state.selected_outliner_path);
   state.selected_outliner_name = clean(state.selected_outliner_name);
   state.selected_outliner_uuid = clean(state.selected_outliner_uuid);
+  state.selected_outliner_paths = Array.from(new Set((Array.isArray(state.selected_outliner_paths)
+    ? state.selected_outliner_paths : []).map(clean).filter(Boolean)));
+  state.outliner_selection_anchor = clean(state.outliner_selection_anchor);
+  state.outliner_selection_scope = clean(state.outliner_selection_scope);
   state.selected_color = clean(state.selected_color);
   if (state.selected_color && !state.marker_catalog.options.includes(state.selected_color)) state.selected_color = "";
   state.selected_camera = clean(state.selected_camera);
@@ -4911,6 +5037,13 @@ export function pickerButtonAvailability(
   const readSnapshotReady = !!state.native_read_ready
     && ["OUTLINER_READY", "VIDEO_READY"].includes(sceneStage)
     && !sceneChanged;
+  // A failed capture does not invalidate an already completed Maya READ.
+  // Keep retrying Snapshot possible, but never enable it for a failed READ,
+  // changed scene, or still-running operation.
+  const snapshotReadReady = readSnapshotReady || (
+    !!state.native_read_ready && validFile && !sceneChanged
+    && ["FAILED", "CANCELLED"].includes(sceneStage)
+  );
 
   const outlinerReady = Array.isArray(state.outliner_nodes) && state.outliner_nodes.length > 0;
   const cameras = Array.isArray(state.cameras) ? state.cameras : [];
@@ -4956,8 +5089,7 @@ export function pickerButtonAvailability(
       && cameraReady
       && frameRangeReady,
     snapshotEnabled: !operationBusy
-      && !terminalFailure
-      && readSnapshotReady
+      && snapshotReadReady
       && cameraReady
       && outputReady,
     snapshotDeleteEnabled: !operationBusy && snapshotAvailable,
@@ -5211,11 +5343,9 @@ export function hmbPickerPaletteGroups(markerCatalog) {
 
 export function hmbPickerMarkerAllowsRepeat(name, markerCatalog) {
   const markerName = clean(name);
-  const catalog = markerCatalog && typeof markerCatalog === "object" ? markerCatalog : {};
-  const background = Array.isArray(catalog.background) && catalog.background.length
-    ? catalog.background
-    : FALLBACK_MARKER_OPTIONS.slice(7).map((fallbackName) => ({ name: fallbackName }));
-  return background.some((item) => clean(item?.name) === markerName);
+  const rows = markerCatalogRows(markerCatalog);
+  return rows.some(item => clean(item?.name) === markerName)
+    || FALLBACK_MARKER_OPTIONS.includes(markerName);
 }
 
 function markerRgb(name, markerCatalog) {
@@ -8227,6 +8357,7 @@ function outlinerHtml(state, bindings, tr, locked = false, options = {}) {
   const depthMap = nodeDepthMap(hmbPickerAllOutlinerNodes(state));
   const expanded = new Set(state.outliner_expanded);
   const assignedByPath = new Map(bindings.map((item) => [clean(item.full_dag_path), clean(item.color)]));
+  const selectedPaths = new Set(hmbPickerSelectedOutlinerNodes(state).map(item => clean(item.full_path)));
   const visibilitySlot = 1;
   const selectedVisibility = state.slot_visibility.find(
     (item) => Number(item?.video_slot || 0) === visibilitySlot,
@@ -8242,13 +8373,13 @@ function outlinerHtml(state, bindings, tr, locked = false, options = {}) {
   const spacer = (edge, height) => height > 0
     ? `<div class="outliner-virtual-spacer" data-outliner-spacer="${edge}" style="height:${Math.round(height)}px;flex:0 0 ${Math.round(height)}px" aria-hidden="true"></div>`
     : "";
-  return `<div class="outliner-list" role="tree" aria-label="${escapeHtml(tr.outliner)}" data-outliner-total="${windowed.total}" data-outliner-start="${windowed.start}" data-outliner-end="${windowed.end}" data-outliner-virtualized="${windowed.virtualized ? "true" : "false"}">${spacer("top", windowed.topSpacer)}${windowed.nodes.map((node, localIndex) => {
+  return `<div class="outliner-list" role="tree" aria-multiselectable="true" aria-label="${escapeHtml(tr.outliner)}" data-outliner-total="${windowed.total}" data-outliner-start="${windowed.start}" data-outliner-end="${windowed.end}" data-outliner-virtualized="${windowed.virtualized ? "true" : "false"}">${spacer("top", windowed.topSpacer)}${windowed.nodes.map((node, localIndex) => {
     const visibleIndex = windowed.start + localIndex;
     const path = clean(node.full_path);
     const name = clean(node.name) || path.split("|").pop();
     const hasDepthMeshes = Array.isArray(node.depth_meshes) && node.depth_meshes.length > 0;
     const hasChildren = Number(node.child_count || 0) > 0;
-    const selected = path === state.selected_outliner_path;
+    const selected = selectedPaths.has(path);
     const assignedColor = assignedByPath.get(path) || "";
     const parentHidden = Array.from(hiddenPaths).some(root => path.startsWith(root + "|"));
     const outputVisible = !parentHidden && !hiddenPaths.has(path);
@@ -8263,6 +8394,7 @@ function outlinerHtml(state, bindings, tr, locked = false, options = {}) {
       ${node.referenced ? `<span class="ref-tag">${escapeHtml(tr.reference)}</span>` : ""}
       ${assignedColor ? `<span class="assigned-chip" style="${hmbPickerColorStyle(assignedColor, state.marker_catalog)}" title="${escapeHtml(assignedColor)}"></span>` : ""}
       <button type="button" class="eye-toggle ${outputVisible ? "on" : "off"}" data-visibility-path="${escapeHtml(path)}" data-inherited-hidden="${parentHidden}" title="${escapeHtml(visibilityLabel)}" aria-label="${escapeHtml(`${name}: ${visibilityLabel}`)}" aria-pressed="${outputVisible ? "true" : "false"}" aria-disabled="${locked || parentHidden ? "true" : "false"}" ${locked || parentHidden ? "disabled" : ""}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"></path><circle cx="12" cy="12" r="3"></circle></svg></button>
+      <button type="button" class="outliner-color-clear" data-clear-color-path="${escapeHtml(path)}" data-has-assigned-color="${assignedColor ? "true" : "false"}" title="${escapeHtml(tr.clearOutlinerColor)}" aria-label="${escapeHtml(`${name}: ${tr.clearOutlinerColor}`)}" aria-disabled="${locked || !assignedColor ? "true" : "false"}" ${locked || !assignedColor ? "disabled" : ""}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"></path></svg></button>
     </div>`;
   }).join("")}${spacer("bottom", windowed.bottomSpacer)}</div>`;
 }
@@ -10330,6 +10462,11 @@ export function hmbSetPickerVisibilityBusy(container, busy) {
     button.disabled = disabled;
     button.setAttribute?.("aria-disabled", disabled ? "true" : "false");
   }
+  for (const button of container?.querySelectorAll?.("[data-clear-color-path]") || []) {
+    const disabled = !!busy || button.getAttribute?.("data-has-assigned-color") !== "true";
+    button.disabled = disabled;
+    button.setAttribute?.("aria-disabled", disabled ? "true" : "false");
+  }
 }
 
 export function hmbApplySnapshotNavigationFeedback(container, snapshot, tr, frameStart, fps) {
@@ -11635,6 +11772,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       .viewport-panel{background:#131c23}.output-scope-inline{position:relative;z-index:20;min-height:38px;display:flex;align-items:center;justify-content:flex-start;gap:12px;padding:4px 10px;border-bottom:1px solid #2a353e;background:#151f27;white-space:nowrap;overflow:visible}.output-scope-title{font-size:10px;font-weight:800;color:#d7dfe5;flex:0 0 auto;text-align:center}.output-scope-options{display:flex;align-items:center;justify-content:flex-start;gap:14px;min-width:max-content}.output-scope-option{display:flex;align-items:center;gap:5px;font-size:10px;color:#d7dfe5;cursor:pointer}.output-scope-option input{margin:0;accent-color:#4c8fd7}.output-scope-option span{white-space:nowrap}.output-camera-inline{display:flex;align-items:center;gap:7px;margin-left:auto;flex:0 0 auto}.output-camera-label{font-size:10px;font-weight:800;color:#d7dfe5}.camera-fixed,.camera-dropdown{position:relative;min-width:200px}.camera-fixed{height:28px;display:flex;align-items:center;gap:7px;padding:0 9px;background:#111a21;border:1px solid #33414c;border-radius:3px}.camera-fixed b{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.camera-fixed em{font-size:9px;color:#79aee4;font-style:normal}.camera-fixed.disabled{opacity:.5}.camera-dropdown summary{list-style:none;height:29px;display:flex;align-items:center;gap:7px;padding:0 9px;background:#111a21;border:1px solid #33414c;border-radius:3px;cursor:pointer}.camera-dropdown summary::-webkit-details-marker{display:none}.camera-dropdown summary b{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.camera-menu{position:absolute;z-index:60;left:0;right:0;top:32px;max-height:240px;overflow:auto;background:#17232c;border:1px solid #3b4a56;box-shadow:0 8px 18px rgba(0,0,0,.5);padding:4px}.camera-menu button{width:100%;display:flex;justify-content:space-between;align-items:center;border:0;background:transparent;padding:8px;text-align:left;cursor:pointer}.camera-menu button:hover,.camera-menu button.active{background:#24415e}.camera-menu button span{font-size:9px;color:#9dacb6}.viewport-stage{position:relative;flex:1;min-height:0;background:radial-gradient(circle at 50% 44%,#5a5a59 0,#373b3d 36%,#20282d 80%);display:flex;align-items:center;justify-content:center;overflow:hidden}.preview-image{width:100%;height:100%;object-fit:contain;background:#232a2e}.viewport-empty{position:relative;width:82%;height:76%;border:1px solid #3fa578;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#b5c0c8;text-align:center;gap:7px;background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(0,0,0,.08))}.viewport-empty .camera-frame{position:absolute;inset:5% 6%;border:1px solid rgba(65,173,124,.8)}.viewport-empty b,.viewport-empty span{position:relative;z-index:2}.viewport-empty span{max-width:420px;color:#93a0aa}.preview-nav{height:42px;flex:0 0 42px;border-top:1px solid #2b363e;background:#111a21;display:grid;grid-template-columns:38px minmax(0,1fr) 38px;align-items:center;gap:8px;padding:6px 10px}.preview-nav button{height:28px;border:1px solid #303e49;background:#1b2730;border-radius:3px;cursor:pointer;font-weight:800}.preview-nav button:disabled{opacity:.35;cursor:not-allowed}.preview-frame-label{min-width:0;text-align:center;color:#aeb9c1;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       .right-stack{display:flex;flex-direction:column;gap:8px;min-height:0;overflow:hidden;background:transparent}.side-section{position:relative;flex:0 0 auto;min-height:96px;background:#151f27;border:1px solid #2c3740;border-radius:10px;display:flex;flex-direction:column;overflow:hidden}.playblast-settings-section{min-height:150px}.video-assets-section{min-height:240px;flex:1 1 0}.section-head{height:34px;flex:0 0 34px;display:flex;align-items:center;padding:0 10px;border-bottom:1px solid #2c3740;background:#18232b;font-weight:700}.section-head .grow{flex:1}.section-head .section-tools{margin-left:auto;display:flex;align-items:center;gap:5px}.video-selected-count{margin-left:auto;color:#aeb9c1;font-size:10px;font-variant-numeric:tabular-nums}.import-video-button{height:24px;margin-left:8px;padding:0 8px;border:1px solid #35434e;border-radius:6px;background:#111a21;color:#dce5eb;cursor:pointer;font-size:9px}.activity-section{min-height:150px}.activity-section .section-head{justify-content:flex-start}.activity-clear{height:23px;border:1px solid #35434e;background:#111a21;color:#c7d0d7;border-radius:7px;padding:0 8px;cursor:pointer;font-size:9px}.activity-elapsed{min-width:74px;text-align:right;font-size:9px;color:#aeb9c1;font-variant-numeric:tabular-nums}.activity-body{flex:1;min-width:0;min-height:0;overflow:hidden;padding:0;background:#0e161d;contain:layout paint}.activity-log-view{display:block;width:100%;height:100%;min-width:0;min-height:0;max-width:100%;margin:0;padding:6px 8px;overflow-x:auto;overflow-y:auto;scrollbar-gutter:stable both-edges;color:#cbd5dc;background:transparent;font:10px/1.5 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;user-select:text;-webkit-user-select:text;pointer-events:auto}.activity-log-row{display:grid;grid-template-columns:68px 58px max-content;align-items:center;width:max-content;min-width:100%;height:18px;min-height:18px;max-height:18px;overflow:visible;white-space:nowrap;color:#cbd5dc}.activity-log-time{overflow:hidden;color:#7f8e99;font-variant-numeric:tabular-nums}.activity-log-level{overflow:hidden;font-weight:800}.activity-log-message{display:block;min-width:max-content;max-width:none;overflow:visible;text-overflow:clip;white-space:nowrap}.activity-log-row[data-level="ERROR"]{color:#fb7185}.activity-log-row[data-level="ERROR"] .activity-log-time{color:#fb7185}.activity-log-row[data-level="WARNING"]{color:#fbbf24}.activity-log-row[data-level="WARNING"] .activity-log-time{color:#d6a51d}.activity-log-row[data-level="SUCCESS"]{color:#4ade80}.activity-log-row[data-level="SUCCESS"] .activity-log-time{color:#3bbd6b}.activity-log-empty{padding:4px 0;color:#7f8e99;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.section-resize-handle{position:relative;left:auto;right:auto;bottom:auto;flex:0 0 10px;min-height:10px;height:10px;border-top:1px solid #2c3740;cursor:ns-resize;background:linear-gradient(90deg,transparent,rgba(148,163,184,.16),transparent);touch-action:none}.section-resize-handle:before{content:"";position:absolute;left:50%;top:3px;width:44px;height:3px;transform:translateX(-50%);border-radius:99px;background:rgba(148,163,184,.48)}.section-resize-handle:hover:before{background:#fff}.section-body{padding:9px}.side-section>.section-body{flex:1;min-height:0;overflow:auto;padding-bottom:9px}.palette-head{display:flex;flex-direction:column;align-items:stretch;gap:7px;min-width:0}.palette-group{display:grid;grid-template-columns:minmax(82px,92px) minmax(0,1fr);align-items:center;gap:6px;min-width:0}.palette-label{height:26px;min-width:0;display:flex;align-items:center;padding:0 7px;background:#26343f;border:1px solid #364652;border-radius:7px;color:#d5dde3;white-space:nowrap;font-size:10px}.palette-grid{display:flex;gap:4px;flex-wrap:wrap;min-width:0}.palette-button{width:20px;height:20px;border:2px solid transparent;border-radius:3px;cursor:pointer;padding:0}.palette-pattern-chip{position:relative;isolation:isolate;overflow:visible;width:20px;height:20px;flex:0 0 20px}.palette-pattern-chip>.palette-button{position:absolute;inset:0;z-index:1;width:20px;height:20px;background:transparent}.palette-pattern-visual{position:absolute;inset:0;z-index:0;border-radius:3px;transform:scale(1.1);transform-origin:center;pointer-events:none}.palette-pattern-chip>.palette-button:disabled+.palette-pattern-visual{opacity:.4}.palette-button.active{border-color:#f4f7f9;box-shadow:0 0 0 1px #111}.video-assets-body{flex:1;min-height:0;overflow:auto;padding:8px}.video-asset-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-content:start;gap:8px}.video-assets-empty{grid-column:1/-1;min-height:130px;display:grid;place-items:center;padding:16px;border:1px dashed #35434e;border-radius:8px;color:#8998a3;text-align:center}.video-asset-card{position:relative;overflow:hidden;border:1px solid var(--hmb-line-soft,#344550);border-radius:9px;background:linear-gradient(145deg,rgba(255,255,255,.025),rgba(255,255,255,.006)),var(--hmb-field,#101820);transition:border-color 100ms ease,box-shadow 100ms ease}.video-asset-card[draggable="true"]{cursor:grab}.video-asset-card.dragging{opacity:.5;transform:scale(.985)}.video-asset-card.drop-target{border-color:rgb(var(--selection-rgb));box-shadow:0 0 0 1px rgba(var(--selection-rgb),.35)}.video-asset-card.selected{border-color:rgb(var(--selection-rgb));background:linear-gradient(145deg,rgba(var(--selection-rgb),.12),var(--selection-card));box-shadow:0 0 0 1px rgba(var(--selection-rgb),.16),0 0 18px rgba(var(--selection-rgb),.12)}.video-asset-thumb{position:relative;aspect-ratio:16/9;overflow:hidden;background:#080d14}.video-asset-thumb-media{width:100%;height:100%;object-fit:cover;pointer-events:none}.video-asset-thumb-fallback{position:absolute;inset:0;display:grid;place-items:center;color:#667684;font-size:10px;font-weight:800}.video-asset-role,.selected-video-order{position:absolute;top:7px;padding:3px 6px;border-radius:5px;background:rgba(5,8,18,.82);color:#fff;font-size:9px;font-weight:800}.video-asset-role{left:7px}.selected-video-order{right:7px;color:var(--selection-strong)}.video-asset-play{position:absolute;left:50%;top:50%;width:38px;height:38px;transform:translate(-50%,-50%);display:grid;place-items:center;border:1px solid rgba(255,255,255,.30);border-radius:50%;background:rgba(5,8,18,.76);color:#fff;cursor:pointer}.video-asset-delete{position:absolute;right:7px;bottom:7px;width:26px;height:26px;border:1px solid rgba(251,113,133,.45);border-radius:6px;background:rgba(76,5,25,.80);color:#ffe4e8;cursor:pointer}.video-asset-copy{padding:8px}.video-asset-copy>b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#edf2f5}.video-asset-footer{display:flex;align-items:center;gap:6px;margin-top:6px}.video-asset-footer>span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8f9da7;font-size:9px}.video-asset-footer button,.video-order-actions button{height:25px;padding:0 7px;border:1px solid #35434e;border-radius:6px;background:#111a21;color:#dce5eb;cursor:pointer;font-size:9px}.video-order-actions{display:flex;justify-content:flex-end;gap:4px;margin-top:5px}.video-order-hint{flex:0 0 auto;padding:5px 8px;border-top:1px solid #2c3740;color:#7f8e99;font-size:9px;text-align:center}
       .radio-list{display:flex;flex-direction:column;gap:9px}.radio-row{display:grid;grid-template-columns:18px 1fr;align-items:start;cursor:pointer}.radio-row input{margin-top:3px;accent-color:#4c8fd7}.radio-row b{display:block;font-size:11px}.radio-row span{display:block;font-size:9px;color:#8f9ca6;margin-top:2px}.settings-action{position:sticky;top:0;z-index:4;padding:0 0 8px;background:linear-gradient(180deg,var(--hmb-panel-top,#151f27) 82%,rgba(21,31,39,0));}.settings-action .setting-checks{margin-top:7px}.settings-grid{display:grid;grid-template-columns:78px minmax(0,1fr);gap:7px 8px;align-items:center;font-size:10px}.setting-value{height:27px;display:flex;align-items:center;padding:0 8px;background:#202d36;border:1px solid #2c3b46;color:#d7dfe4;border-radius:2px}.setting-value.split{justify-content:space-between}.settings-compact-row{grid-column:1/-1;display:grid;grid-template-columns:minmax(0,.72fr) minmax(0,1.28fr) minmax(0,1fr);gap:5px;min-width:0}.settings-compact-item{height:27px;min-width:0;display:flex;align-items:center;justify-content:space-between;gap:4px;padding:0 6px;background:#202d36;border:1px solid #2c3b46;color:#d7dfe4;border-radius:2px;white-space:nowrap;overflow:hidden}.settings-compact-item b{flex:0 0 auto;font-size:8px;color:#8f9ca6}.settings-compact-item span{min-width:0;overflow:hidden;text-overflow:ellipsis}.setting-checks{display:flex;gap:12px;margin-top:0;font-size:9px;color:#aab6bf}.setting-checks label{display:flex;align-items:center;gap:5px}.setting-checks input{accent-color:#4c8fd7}.generate-button{width:100%;height:34px;margin:0;border:1px solid #346ba4;background:#285b91;color:#fff;font-weight:700;cursor:pointer}.generate-button:disabled,.palette-button:disabled{opacity:.4;cursor:not-allowed}
+      .outliner-color-clear{flex:0 0 22px;width:22px;height:22px;padding:3px;border:1px solid transparent;border-radius:4px;background:transparent;color:#fb7185;cursor:pointer;display:flex;align-items:center;justify-content:center}.outliner-color-clear svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;pointer-events:none}.outliner-color-clear:not(:disabled):hover{background:rgba(251,113,133,.14);border-color:rgba(251,113,133,.5)}.outliner-color-clear:disabled{color:var(--hmb-muted,#8998a3);opacity:.3;cursor:default}
       .empty-pane{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;color:#8998a3;text-align:center;padding:20px}.empty-pane b{color:#c9d2d8}
       .video-asset-grid{grid-template-columns:repeat(auto-fill,minmax(132px,1fr))}
       .video-asset-thumb{cursor:pointer;outline:0}.video-asset-thumb:focus-visible{box-shadow:inset 0 0 0 2px var(--hmb-focus),inset 0 0 18px var(--hmb-glow)}.video-asset-thumb.is-playing .video-asset-play{border-color:var(--hmb-focus);background:rgba(5,8,18,.88);box-shadow:0 0 14px var(--hmb-glow)}.video-asset-play{z-index:3;pointer-events:none;font-size:15px;font-weight:900}.video-asset-delete{top:7px;right:7px;bottom:auto;z-index:5}.selected-video-order{top:auto;right:7px;bottom:7px}.video-asset-copy{display:grid;gap:3px;padding:7px 8px 8px}.video-asset-title{display:block;width:100%;min-width:0;padding:0;border:0;background:transparent;color:#edf2f5;font:inherit;font-size:11px;font-weight:800;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}.video-asset-title:not(:disabled):hover{color:var(--selection-strong)}.video-asset-title:disabled{opacity:.48;cursor:not-allowed}.video-asset-details{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8f9da7;font-size:9px}.import-video-button{display:inline-flex;align-items:center;justify-content:center;gap:5px;font-weight:800}.import-video-icon{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
@@ -13542,70 +13680,8 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   const applyColor = (color) => {
     if (!color || pickerLocalInteractionLocked()) return;
     const liveState = hmbEnsurePickerOutlinerSelection(currentWidgetState());
-    const liveSelectedNode = hmbPickerSelectedOutlinerNode(liveState);
-    if (!liveSelectedNode) return;
-    const liveSlot = 1;
-    const current = selectedBindings(liveState, liveSlot);
-    const selectedIdentity = hmbPickerBindingIdentity({
-      maya_uuid: liveSelectedNode.maya_uuid,
-      full_dag_path: liveSelectedNode.full_path,
-    });
-    const duplicateColor = current.find((item) => (
-      clean(item.color) === color
-      && hmbPickerBindingIdentity(item) !== selectedIdentity
-    ));
-    if (duplicateColor && !hmbPickerMarkerAllowsRepeat(color, liveState.marker_catalog)) {
-      const duplicateState = {
-        ...liveState,
-        selected_color: color,
-        message: `Color ${color} is already used by ${duplicateColor.group_name} in the current cut.`,
-      };
-      hmbApplyPickerPaletteSelectionToDom(
-        container,
-        duplicateState,
-        pickerLocalInteractionLocked(duplicateState),
-      );
-      schedulePickerStatePublicationAfterPaint(duplicateState, {
-        commitOptions: { suppressMatchingEcho: true },
-      });
-      return;
-    }
-    const existingIndex = current.findIndex((item) => (
-      hmbPickerBindingIdentity(item) === selectedIdentity
-    ));
-    const nextBinding = {
-      group_name: clean(liveSelectedNode.name),
-      full_dag_path: clean(liveSelectedNode.full_path),
-      maya_uuid: clean(liveSelectedNode.maya_uuid),
-      reference_node: clean(liveSelectedNode.reference_node),
-      reference_file: clean(liveSelectedNode.reference_file),
-      proxy_manager: clean(liveSelectedNode.proxy_manager),
-      proxy_tag: clean(liveSelectedNode.proxy_tag),
-      color,
-      enabled: true,
-      video_slot: liveSlot,
-      picker_order: existingIndex >= 0 ? current[existingIndex].picker_order : current.length + 1,
-    };
-    const withoutSelectedObject = current.filter((item) => (
-      hmbPickerBindingIdentity(item) !== selectedIdentity
-    ));
-    if (existingIndex >= 0) {
-      withoutSelectedObject.splice(
-        Math.min(existingIndex, withoutSelectedObject.length),
-        0,
-        nextBinding,
-      );
-    } else {
-      withoutSelectedObject.push(nextBinding);
-    }
-    const next = setSlotBindings(
-      { ...liveState },
-      liveSlot,
-      withoutSelectedObject,
-    );
-    next.selected_color = color;
-    next.status = "READY";
-    next.message = `${clean(liveSelectedNode.name)} → ${color} ${existingIndex >= 0 ? "updated" : "added"} for the current cut.`;
+    if (!hmbPickerSelectedOutlinerNodes(liveState).length) return;
+    const next = hmbPickerApplyColorToSelection(liveState, color);
     const interactionLocked = pickerLocalInteractionLocked(next);
     const outlinerUpdated = hmbRenderPickerOutlinerLocal(container, next, tr, interactionLocked);
     hmbApplyPickerPaletteSelectionToDom(container, next, interactionLocked);
@@ -14035,10 +14111,10 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       );
       return;
     }
-    hmbPauseVideoPickerWithDebt(viewportVideo);
+    mediaController.pause();
     const liveSlot = 1;
     const frame = clamp(
-      Number(frameNumberInput?.value || container.__hmbViewportFrame || currentLocal.current_frame),
+      Number(container.querySelector("#video-frame-number")?.value || container.__hmbViewportFrame || currentLocal.current_frame),
       Number(currentLocal.start_frame || 0),
       Number(currentLocal.end_frame || currentLocal.start_frame || 0),
     );
@@ -14049,6 +14125,15 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       snapshot_frame: frame,
       output_width: Number(currentLocal.output_width || 1280),
       output_height: Number(currentLocal.output_height || 720),
+      authoring_state: {
+        depth_settings: hmbNormalizeDepthSettings(currentLocal.depth_settings),
+        state_revision: Number(currentLocal.state_revision || 0),
+        selected_camera: clean(currentLocal.selected_camera || currentLocal.camera),
+        slot_assignments: Array.isArray(currentLocal.slot_assignments) ? currentLocal.slot_assignments : [],
+        slot_visibility: Array.isArray(currentLocal.slot_visibility) ? currentLocal.slot_visibility : [],
+        output_width: Number(currentLocal.output_width || 1280),
+        output_height: Number(currentLocal.output_height || 720),
+      },
     }, "", { reserveVisibility: true });
     if (result.duplicate) return;
     if (!result.delivered) {
@@ -14283,19 +14368,8 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     else clearTimeout(outlinerVirtualScrollFrame);
     outlinerVirtualScrollFrame = 0;
   });
-  const selectOutlinerPath = (path) => {
-    const liveState = currentWidgetState();
-    const node = hmbPickerAllOutlinerNodes(liveState).find((item) => clean(item.full_path) === clean(path));
-    if (!node) return;
-    const next = hmbEnsurePickerOutlinerSelection({
-      ...liveState,
-      selected_outliner_path: clean(path),
-      selected_outliner_name: clean(node.name),
-      selected_outliner_uuid: clean(node.maya_uuid),
-      // normalize() restores the selected target's actual binding color. Clear
-      // the previous row's transient selection so it cannot leak to this row.
-      selected_color: "",
-    });
+  const selectOutlinerPath = (path, modifiers = {}) => {
+    const next = hmbPickerSelectOutlinerPath(currentWidgetState(), path, modifiers);
     const interactionLocked = pickerLocalInteractionLocked(next);
     const outlinerUpdated = hmbRenderPickerOutlinerLocal(container, next, tr, interactionLocked);
     hmbApplyPickerPaletteSelectionToDom(container, next, interactionLocked);
@@ -14363,9 +14437,26 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       commitOptions: { suppressMatchingEcho: outlinerUpdated },
     });
   };
+  const clearOutlinerColor = (path) => {
+    const liveState = currentWidgetState();
+    if (pickerLocalInteractionLocked(liveState)) return;
+    const next = hmbPickerClearOutlinerColor(liveState, path);
+    if (next === liveState) return;
+    const outlinerUpdated = hmbRenderPickerOutlinerLocal(container, next, tr, false);
+    hmbApplyPickerPaletteSelectionToDom(container, next, false);
+    schedulePickerStatePublicationAfterPaint(next, {
+      commitOptions: { suppressMatchingEcho: outlinerUpdated },
+    });
+  };
   on(outlinerScroll, "pointerdown", (event) => event.stopPropagation?.());
   on(outlinerScroll, "click", (event) => {
     event.stopPropagation?.();
+    const clearColor = event.target?.closest?.("[data-clear-color-path]");
+    if (clearColor) {
+      event.preventDefault?.();
+      if (!clearColor.disabled) clearOutlinerColor(clean(clearColor.getAttribute?.("data-clear-color-path")));
+      return;
+    }
     const depthToggle = event.target?.closest?.("[data-depth-toggle-path]");
     if (depthToggle) {
       event.preventDefault?.();
@@ -14390,7 +14481,10 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       return;
     }
     const row = event.target?.closest?.("[data-group-path]");
-    if (row) selectOutlinerPath(clean(row.getAttribute?.("data-group-path")));
+    if (row) {
+      event.preventDefault?.();
+      selectOutlinerPath(clean(row.getAttribute?.("data-group-path")), event);
+    }
   });
   on(outlinerScroll, "keydown", (event) => {
     const row = event.target?.closest?.("[data-group-path]");
@@ -14398,7 +14492,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     if (["Enter", " "].includes(event.key)) {
       event.preventDefault();
       event.stopPropagation();
-      selectOutlinerPath(clean(row.getAttribute?.("data-group-path")));
+      selectOutlinerPath(clean(row.getAttribute?.("data-group-path")), event);
       return;
     }
     if (["ArrowUp", "ArrowDown"].includes(event.key)) {
@@ -14413,6 +14507,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       const targetPath = clean(visibleNodes[nextIndex]?.full_path);
       if (!targetPath || targetPath === path) return;
       event.preventDefault();
+      if (event.shiftKey) selectOutlinerPath(targetPath, event);
       let target = Array.from(outlinerScroll.querySelectorAll?.("[data-group-path]") || [])
         .find((item) => clean(item.getAttribute?.("data-group-path")) === targetPath);
       if (!target) {

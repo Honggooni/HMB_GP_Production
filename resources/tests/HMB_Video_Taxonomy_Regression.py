@@ -139,6 +139,12 @@ for index, ((main_type, sub_type), wire_pair) in enumerate(expected.items(), 1):
     assert ("reference_scope" in job["videos"][0]) == ((main_type, sub_type) == layout_pair)
     sample_machine = machine
     sample_visible = prompt._build_prompt_package(normalized)
+    assert (
+        f"@video1 = taxonomy-{index}.mp4 / Main Type: {main_type} / Sub Type: {sub_type}"
+        in sample_visible
+    )
+    assert prompt.PUBLIC_JOB_CONTRACT_HEADER not in sample_visible
+    assert "Reference Scope:" not in sample_visible
 
 
 # Layout Reference is an explicit camera/layout assignment, not Original's
@@ -175,8 +181,19 @@ assert layout_job["videos"][0]["custom_control_role"] == "Keep my authored note"
 assert layout_job["videos"][0]["keep_out"] == "  no added props\nno added props\n"
 assert json.loads(layout_machine.splitlines()[6])["PRESERVED_TEXT"] == "[Dialogue] 안녕, 반가워!"
 assert "Primary Unified Shot Control" not in layout_machine
-assert f"Reference Scope: {layout_role}" in layout_visible
-assert "Full Motion Reinterpretation and Lip Sync" in layout_visible
+# Public output is the connection summary; the detailed scope and authored
+# notes remain in the exact paired machine package verified above and below.
+assert (
+    "@video1 = blocking-with-dialogue.mp4 / Main Type: Motion Reference / Sub Type: Layout Reference"
+    in layout_visible
+)
+for private_text in (
+    "Reference Scope:", layout_role, "Full Motion Reinterpretation and Lip Sync",
+    "Keep my authored note", "no added props", "[Dialogue] 안녕, 반가워!",
+    prompt.PUBLIC_JOB_CONTRACT_HEADER, prompt.FX_TIMING_CONTRACT_HEADER,
+    prompt.USER_DESCRIPTION_DATA_HEADER,
+):
+    assert private_text not in layout_visible
 
 # Deriving scope at publication prevents stale data from authorizing free
 # motion after any other subtype (including Original Preview) is selected.
@@ -192,8 +209,12 @@ for next_pair in [*expected, ("Motion Reference", "")]:
     assert ("reference_scope" in changed_record) == (next_pair == layout_pair)
     if next_pair in expected:
         assert changed_record["control_role"] == expected[next_pair][1]
-    if next_pair != layout_pair:
-        assert "Full Motion Reinterpretation and Lip Sync" not in prompt._build_prompt_package(changed)
+    changed_visible = prompt._build_prompt_package(changed)
+    assert "Full Motion Reinterpretation and Lip Sync" not in changed_visible
+    assert "Reference Scope:" not in changed_visible
+    assert f"Main Type: {next_pair[0]}" in changed_visible
+    if next_pair[1]:
+        assert f"Sub Type: {next_pair[1]}" in changed_visible
 
 # Picker reordering/reconnect must keep the author-selected subtype attached
 # to its UID, not to the old slot, without changing the other video's role.
@@ -238,7 +259,7 @@ reconnected = prompt._apply_picker_payload(
 assert reconnected["videos"][0]["video_sub_type"] == "Layout Reference"
 
 
-# Main Type alone is broad authored metadata. It remains present in the public
+# Main Type alone is broad authored metadata. It remains present in the machine
 # job even when no exact wire role can be projected from an optional Sub Type.
 main_only = prompt._default_widget_state()
 main_only["videos"][0].update({
