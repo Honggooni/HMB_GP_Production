@@ -69,11 +69,11 @@ const handlerText = source.slice(source.indexOf("  const clearOutlinerColor = (p
 let live = state, locked = false;
 const order = [];
 const handler = new Function("currentWidgetState", "pickerLocalInteractionLocked", "hmbPickerClearOutlinerColor",
-  "hmbRenderPickerOutlinerLocal", "hmbApplyPickerPaletteSelectionToDom", "schedulePickerStatePublicationAfterPaint", "container", "tr",
+  "hmbPatchPickerOutlinerFeedback", "hmbApplyPickerPaletteSelectionToDom", "schedulePickerStatePublicationAfterPaint", "container", "tr", "hmbRememberPickerOutlinerDraft",
   handlerText + "\nreturn clearOutlinerColor;")(
   () => live, () => locked, picker.hmbPickerClearOutlinerColor,
   (_container, next) => { order.push("paint"); assert.equal(next.selected_color, ""); return true; },
-  () => order.push("palette"), next => { order.push("publish"); live = next; }, {}, tr,
+  () => order.push("palette"), next => { order.push("publish"); live = next; }, {}, tr, picker.hmbRememberPickerOutlinerDraft,
 );
 locked = true; handler("|A"); assert.deepEqual(order, []);
 locked = false; handler("|A"); assert.deepEqual(order, ["paint", "palette", "publish"]);

@@ -1845,7 +1845,8 @@ assert.match(
   "A delegated palette click must immediately assign its color through the healed Outliner target after removing the redundant Target/APPLY row.",
 );
 assert.match(videoSource, /export function hmbEnsurePickerOutlinerSelection/);
-assert.match(videoSource, /const liveState = hmbEnsurePickerOutlinerSelection\(currentWidgetState\(\)\)/);
+assert.match(videoSource, /export function hmbPickerApplyColorToSelection\(stateValue, colorValue\) \{\s+const state = hmbEnsurePickerOutlinerSelection\(stateValue\)/);
+assert.match(videoSource, /const applyColor = \(color\) => \{\s+const liveState = currentWidgetState\(false\)/);
 assert.doesNotMatch(videoSource, /assignmentHtml\(|id="clear-colors"|No color assignments/);
 assert.doesNotMatch(videoSource, /id="node-(?:width|height)-handle"/);
 

@@ -342,6 +342,9 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Updates Picker color assignment, color clearing and multi-selection immediately in-place, then publishes state after paint without replacing focused outliner rows.",
+            "- Prevents delayed or crossed backend replies from reverting Shot navigation, palette choices and local controls while keeping real progress, errors and authoritative changes visible.",
+            "- Covers all 20 directed transitions and 120 rapid permutations across Shots 1-5; verifies repeated Maya replacements and delayed Original/Mask/Depth/Motion outputs stay with the Shot captured at Generate.",
             "- Uses a temporary mid-gray Original Playblast shader with gentle shading and no source-texture dependency; original scene materials are restored after capture.",
             "- Adds Picker outliner multi-selection, shared color assignment, per-row color clearing, and Snapshot reliability fixes. Ghost presets use nearly unshaded flat colors while Actor shading remains distinct.",
             "- Simplifies Finish Look to character-only Beauty controls, disabled by default; removes film/filter controls and disables dependent sliders when their parent effect is off.",

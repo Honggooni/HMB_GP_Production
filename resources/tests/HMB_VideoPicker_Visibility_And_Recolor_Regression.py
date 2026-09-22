@@ -50,7 +50,8 @@ widget_source = (ROOT / "widgets" / "HMBVideoPickerLibraryWidget_v032.js").read_
 )
 assert "function hmbDedupePickerBindings" in widget_source
 assert "export function hmbPickerApplyColorToSelection" in widget_source
-assert "const index = bindings.findIndex(item => hmbPickerBindingIdentity(item) === identity)" in widget_source
+assert "const bindingIndices = new Map(bindings.map((item, index) => [hmbPickerBindingIdentity(item), index]))" in widget_source
+assert "const index = bindingIndices.get(identity) ?? -1" in widget_source
 assert "if (index >= 0) bindings[index] = binding" in widget_source
 
 runner_source = (

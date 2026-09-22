@@ -3200,9 +3200,10 @@ export function hmbPickerApplyColorToSelection(stateValue, colorValue) {
   const nodes = hmbPickerSelectedOutlinerNodes(state);
   if (!color || !nodes.length) return state;
   const bindings = selectedBindings(state, 1).map(item => ({ ...item }));
+  const bindingIndices = new Map(bindings.map((item, index) => [hmbPickerBindingIdentity(item), index]));
   for (const node of nodes) {
     const identity = hmbPickerBindingIdentity({ maya_uuid: node.maya_uuid, full_dag_path: node.full_path });
-    const index = bindings.findIndex(item => hmbPickerBindingIdentity(item) === identity);
+    const index = bindingIndices.get(identity) ?? -1;
     const binding = {
       group_name: clean(node.name), full_dag_path: clean(node.full_path), maya_uuid: clean(node.maya_uuid),
       reference_node: clean(node.reference_node), reference_file: clean(node.reference_file),
@@ -3211,7 +3212,10 @@ export function hmbPickerApplyColorToSelection(stateValue, colorValue) {
       picker_order: index >= 0 ? bindings[index].picker_order : bindings.length + 1,
     };
     if (index >= 0) bindings[index] = binding;
-    else bindings.push(binding);
+    else {
+      bindingIndices.set(identity, bindings.length);
+      bindings.push(binding);
+    }
   }
   return {
     ...setSlotBindings(state, 1, bindings),
@@ -4513,6 +4517,138 @@ function normalize(value) {
 function hmbPickerStateFromProps(props) {
   if (!props || typeof props !== "object") return {};
   return props.value ?? props.parameterValue ?? props.defaultValue;
+}
+
+// UI authoring needs its own ACK floor: navigation does not change card-row
+// revisions. Backend progress, catalog membership/results and ACKs stay live.
+const HMB_PICKER_INTERACTION_FIELDS = [
+  "active_picker_shot_uuid", "outliner_expanded", "outliner_search", "depth_settings", "slot_visibility",
+  "original_enabled", "mask_enabled", "depth_enabled", "motion_guide_enabled",
+  "output_width", "output_height", "selected_camera", "language", "viewport_mode",
+];
+
+export function hmbRememberPickerInteractionDraft(container, next, previous) {
+  const runtime = clean(next?.runtime_instance_id);
+  const scene = clean(next?.scene_request_path || next?.scene_path);
+  let draft = container.__hmbPickerInteractionDraft;
+  if (!draft || draft.runtime !== runtime) draft = { runtime, fields: new Map() };
+  for (const key of HMB_PICKER_INTERACTION_FIELDS) {
+    if (JSON.stringify(next?.[key]) === JSON.stringify(previous?.[key])) continue;
+    draft.fields.set(key, { value: next[key], scene, revision: 0, publishedAtMs: 0 });
+  }
+  container.__hmbPickerInteractionDraft = draft;
+}
+
+export function hmbStampPickerInteractionDraft(container, state) {
+  for (const entry of container.__hmbPickerInteractionDraft?.fields?.values?.() || []) {
+    if (entry.revision) continue;
+    entry.revision = Number(state.state_revision || 0);
+    entry.publishedAtMs = Number(state.state_published_at_ms || 0);
+  }
+}
+
+export function hmbProtectPickerInteractionDraft(container, incomingValue) {
+  const draft = container.__hmbPickerInteractionDraft;
+  if (!draft?.fields?.size) {
+    delete container.__hmbPickerInteractionDraft;
+    return { state: incomingValue, protected: false };
+  }
+  let incoming = typeof incomingValue === "string" ? normalize(incomingValue) : incomingValue;
+  if (!incoming || draft.runtime !== clean(incoming.runtime_instance_id)) {
+    delete container.__hmbPickerInteractionDraft;
+    return { state: incomingValue, protected: false };
+  }
+  const patch = {};
+  let revisionFloor = 0, publishedFloor = 0;
+  for (const [key, entry] of draft.fields) {
+    const globalField = key === "active_picker_shot_uuid" || key === "language";
+    if ((!globalField && entry.scene !== clean(incoming.scene_request_path || incoming.scene_path))
+        || (key === "active_picker_shot_uuid" && !incoming.picker_shots?.some(row => row.workspace_uuid === entry.value))) {
+      draft.fields.delete(key);
+      continue;
+    }
+    const matches = JSON.stringify(incoming[key]) === JSON.stringify(entry.value);
+    const currentRevision = entry.revision > 0 && Number(incoming.state_revision || 0) >= entry.revision
+      && Number(incoming.state_published_at_ms || 0) >= entry.publishedAtMs;
+    if (currentRevision && (matches || (incoming.state_writer === "python"
+        && Number(incoming.frontend_seen_revision || 0) >= entry.revision))) {
+      // A confirmed rejection/edit wins; accepted values keep their floor so
+      // crossed older responses cannot resurrect a previous choice.
+      if (!matches) draft.fields.delete(key);
+      continue;
+    }
+    patch[key] = entry.value;
+    revisionFloor = Math.max(revisionFloor, entry.revision);
+    publishedFloor = Math.max(publishedFloor, entry.publishedAtMs);
+  }
+  if (!Object.keys(patch).length) return { state: incomingValue, protected: false };
+  if (patch.active_picker_shot_uuid && patch.active_picker_shot_uuid !== incoming.active_picker_shot_uuid) {
+    // Project the destination's own preview/cards, never another Shot's media.
+    incoming = hmbSwitchLocalPickerShot(incoming, patch.active_picker_shot_uuid);
+  }
+  return { state: { ...incoming, ...patch,
+    state_revision: Math.max(Number(incoming.state_revision || 0), revisionFloor),
+    state_published_at_ms: Math.max(Number(incoming.state_published_at_ms || 0), publishedFloor),
+  }, protected: true };
+}
+
+const HMB_PICKER_OUTLINER_SELECTION_FIELDS = [
+  "selected_outliner_path", "selected_outliner_name", "selected_outliner_uuid",
+  "selected_outliner_paths", "outliner_selection_anchor", "outliner_selection_scope", "selected_color",
+];
+
+function hmbPickerOutlinerDraftScope(state) {
+  return `${clean(state?.runtime_instance_id)}|${hmbPickerOutlinerSelectionScope(state)}`;
+}
+
+export function hmbRememberPickerOutlinerDraft(container, state, includeBindings = false) {
+  const previous = container.__hmbPickerOutlinerDraft;
+  const scope = hmbPickerOutlinerDraftScope(state);
+  const fields = [...HMB_PICKER_OUTLINER_SELECTION_FIELDS];
+  if (includeBindings || (previous?.scope === scope && previous.fields.includes("slot_assignments"))) {
+    fields.push("slot_assignments");
+  }
+  // This draft is controller-local, never saved in the workflow or sent to Maya.
+  container.__hmbPickerOutlinerDraft = { scope, state, fields, revision: 0, publishedAtMs: 0 };
+}
+
+export function hmbStampPickerOutlinerDraft(container, state) {
+  const draft = container?.__hmbPickerOutlinerDraft;
+  if (!draft) return;
+  if (draft.scope !== hmbPickerOutlinerDraftScope(state)) {
+    delete container.__hmbPickerOutlinerDraft;
+    return;
+  }
+  draft.state = state;
+  draft.revision = Number(state.state_revision || 0);
+  draft.publishedAtMs = Number(state.state_published_at_ms || 0);
+}
+
+export function hmbProtectPickerOutlinerDraft(container, incomingValue) {
+  const draft = container?.__hmbPickerOutlinerDraft;
+  if (!draft) return { state: incomingValue, protected: false };
+  const incoming = typeof incomingValue === "string" ? normalize(incomingValue) : incomingValue;
+  if (!incoming || draft.scope !== hmbPickerOutlinerDraftScope(incoming)) {
+    delete container.__hmbPickerOutlinerDraft;
+    return { state: incomingValue, protected: false };
+  }
+  const matches = draft.fields.every(key => JSON.stringify(incoming[key]) === JSON.stringify(draft.state[key]));
+  const currentRevision = draft.revision > 0
+    && Number(incoming.state_revision || 0) >= draft.revision
+    && Number(incoming.state_published_at_ms || 0) >= draft.publishedAtMs;
+  const acknowledged = currentRevision && (matches
+    || (incoming.state_writer === "python" && Number(incoming.frontend_seen_revision || 0) >= draft.revision));
+  if (acknowledged) {
+    // A confirmed rejection/new backend edit wins. Keep an accepted draft's
+    // revision floor so crossed older responses cannot flash its colors back.
+    if (!matches) delete container.__hmbPickerOutlinerDraft;
+    return { state: incomingValue, protected: false };
+  }
+  const state = { ...incoming };
+  for (const key of draft.fields) state[key] = draft.state[key];
+  // Preserve status, command ACK, errors and media from Python; protect only
+  // the locally authored outliner fields until their own publication returns.
+  return { state, protected: true };
 }
 
 function hmbPickerStateEchoValue(value) {
@@ -10382,6 +10518,11 @@ function hmbMarkPickerDynamicControls(root) {
   }
 }
 
+function hmbPickerOutlinerStructureKey(state, locked = false) {
+  return JSON.stringify([state.outliner_nodes, state.outliner_expanded, state.outliner_search,
+    state.slot_visibility, state.depth_settings, state.marker_catalog_version, locked, state.language]);
+}
+
 export function hmbRenderPickerOutlinerLocal(container, state, tr, locked = false, options = {}) {
   const scroll = container?.querySelector?.(".outliner-scroll");
   const ownerDocument = scroll?.ownerDocument || (typeof document !== "undefined" ? document : null);
@@ -10409,6 +10550,44 @@ export function hmbRenderPickerOutlinerLocal(container, state, tr, locked = fals
       .find((row) => clean(row.getAttribute?.("data-group-path")) === restoreFocusPath)
       ?.focus?.({ preventScroll: true });
   }
+  container.__hmbPickerOutlinerPatchKey = hmbPickerOutlinerStructureKey(state, locked);
+  return true;
+}
+
+export function hmbPatchPickerOutlinerFeedback(container, state, locked = false) {
+  const scroll = container?.querySelector?.(".outliner-scroll");
+  if (!scroll?.querySelector?.(".outliner-list")) return false;
+  const selected = new Set(state.selected_outliner_paths || []);
+  const colors = new Map((state.slot_assignments?.find(item => Number(item.video_slot) === 1)?.bindings || [])
+    .map(item => [clean(item.full_dag_path || item.subject_root), clean(item.color)]));
+  const setAttribute = (element, name, value) => {
+    if (element?.getAttribute?.(name) !== value) element?.setAttribute?.(name, value);
+  };
+  for (const row of scroll.querySelectorAll?.("[data-group-path]") || []) {
+    const path = clean(row.getAttribute("data-group-path"));
+    const active = selected.has(path);
+    row.classList.toggle("selected", active);
+    setAttribute(row, "aria-selected", String(active));
+    setAttribute(row, "tabindex", active ? "0" : "-1");
+    const color = colors.get(path) || "";
+    let chip = row.querySelector(".assigned-chip");
+    if (color) {
+      if (!chip) {
+        chip = row.ownerDocument.createElement("span");
+        chip.className = "assigned-chip";
+        row.insertBefore(chip, row.querySelector("[data-visibility-path]"));
+      }
+      setAttribute(chip, "title", color);
+      setAttribute(chip, "style", hmbPickerColorStyle(color, state.marker_catalog));
+    } else chip?.remove?.();
+    const clearButton = row.querySelector("[data-clear-color-path]");
+    if (clearButton) {
+      setAttribute(clearButton, "data-has-assigned-color", String(!!color));
+      setAttribute(clearButton, "aria-disabled", String(locked || !color));
+      if (clearButton.disabled !== (locked || !color)) clearButton.disabled = locked || !color;
+    }
+  }
+  // No tree morph, focus restoration or scroll writes on selection/color input.
   return true;
 }
 
@@ -11341,6 +11520,9 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       hmbCancelVideoPickerNodeInternalsUpdate(container);
       hmbClearPendingPickerStateEcho(container);
       delete container.__hmbPendingPickerState;
+      delete container.__hmbPickerOutlinerDraft;
+      delete container.__hmbPickerInteractionDraft;
+      delete container.__hmbPickerStateRevisionFloor;
       delete container.__hmbAuthoritativePickerState;
       delete container.__hmbPickerStatePublicationPredecessors;
       delete container.__hmbFailedPickerStatePublications;
@@ -12358,6 +12540,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     if (container.__hmbVideoPickerDeleted === true) {
       return { state: normalize(next), delivered: false, deliveryPromise: null };
     }
+    hmbRememberPickerInteractionDraft(container, next, container.__hmbPickerPaintFirstState || container.__hmbPendingPickerState || state);
     // Any newer synchronous action (delete, Shot switch, command setting, etc.)
     // is built from currentWidgetState(), which already includes this draft.
     // It therefore supersedes the queued publication and must cancel that job
@@ -12383,10 +12566,14 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     normalized.state_revision = Math.max(
       Number(state.state_revision || 0),
       Number(container.__hmbPendingPickerState?.state_revision || 0),
+      Number(container.__hmbPickerStateRevisionFloor || 0),
     ) + 1;
+    container.__hmbPickerStateRevisionFloor = normalized.state_revision;
     normalized.frontend_seen_revision = Number(state.state_revision || 0);
     normalized.state_writer = "widget";
     normalized.state_published_at_ms = Date.now();
+    hmbStampPickerOutlinerDraft(container, normalized);
+    hmbStampPickerInteractionDraft(container, normalized);
     if (!(container.__hmbPickerStatePublicationPredecessors instanceof Map)) {
       container.__hmbPickerStatePublicationPredecessors = new Map();
     }
@@ -12419,10 +12606,19 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
         previousAuthoritativeState,
       );
       if (rolledBack) {
+        for (const [key, entry] of container.__hmbPickerInteractionDraft?.fields || []) {
+          if (entry.revision === normalized.state_revision) container.__hmbPickerInteractionDraft.fields.delete(key);
+        }
+        if (container.__hmbPickerOutlinerDraft?.revision === normalized.state_revision
+            && !container.__hmbPickerPaintFirstState) delete container.__hmbPickerOutlinerDraft;
         const rollbackState = previousPendingState || previousAuthoritativeState || state;
         const resolvedRollbackState = hmbPickerStateRollbackFallback(container, normalized);
         const visiblePublicationError = container.__hmbVisiblePickerStatePublicationError;
         applyImmediateCommandUi(resolvedRollbackState || rollbackState);
+        const visibleOutliner = container.__hmbPickerPaintFirstState || resolvedRollbackState || rollbackState;
+        hmbPatchPickerOutlinerFeedback(container, visibleOutliner, pickerLocalInteractionLocked(visibleOutliner));
+        hmbApplyPickerPaletteSelectionToDom(container, visibleOutliner, pickerLocalInteractionLocked(visibleOutliner));
+        hmbRenderPickerOutlinerLocal(container, visibleOutliner, TEXT[visibleOutliner.language] || TEXT.ko, pickerLocalInteractionLocked(visibleOutliner));
         if (resolvedRollbackState) {
           hmbApplyPickerShotFeedbackNormalized(
             container,
@@ -12508,18 +12704,22 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     }
     return { state: normalized, delivered, deliveryPromise };
   };
-  const currentWidgetState = () => {
-    const current = normalize(
+  const currentWidgetState = (normalizeState = true) => {
+    const source = (
       container.__hmbPickerPaintFirstState
       || container.__hmbPendingPickerState
-      || state,
+      || state
     );
+    // Local outliner input starts from the already-normalized live state.
+    // Full media/catalog normalization belongs to the post-paint publisher.
+    const current = normalizeState ? normalize(source) : { ...source };
     const draft = container.__hmbOutlinerSearchDraft;
     if (draft && Number(draft.expiresAtMs || 0) > Date.now()) {
       current.outliner_search = clean(draft.value);
     }
     return current;
   };
+  container.__hmbPickerOutlinerPatchKey = hmbPickerOutlinerStructureKey(state, pickerButtonAvailability(state).operationBusy);
   const pickerLocalInteractionLocked = (candidateState = null) => {
     const latest = candidateState && typeof candidateState === "object"
       ? candidateState
@@ -12888,6 +13088,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     options = {},
     deferredVisualUpdate = null,
   ) => {
+    hmbRememberPickerInteractionDraft(container, nextState, container.__hmbPickerPaintFirstState || container.__hmbPendingPickerState || state);
     container.__hmbPickerPaintFirstState = nextState;
     container.__hmbPickerPaintFirstPublication = { options, deferredVisualUpdate };
     container.setAttribute?.("data-hmb-picker-state-publication-pending", "true");
@@ -13279,29 +13480,18 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     mediaController?.refresh(visibleState);
     container.__hmbPickerToolsController?.refresh?.(visibleState);
     if (liveExpanded) {
-      const outlinerKey = JSON.stringify([
-        nextState.outliner_nodes,
-        nextState.outliner_expanded,
-        nextState.outliner_search,
-        nextState.selected_outliner_path,
-        nextState.slot_visibility,
-        nextState.depth_settings,
-        nextState.slot_assignments,
-        nextState.marker_catalog_version,
-        nextLocked,
-        nextState.language,
-      ]);
+      const outlinerKey = hmbPickerOutlinerStructureKey(visibleState, immediateMediaLocked);
       if (container.__hmbPickerOutlinerPatchKey !== outlinerKey) {
-        hmbRenderPickerOutlinerLocal(container, nextState, nextTr, nextLocked);
+        hmbRenderPickerOutlinerLocal(container, visibleState, nextTr, immediateMediaLocked);
         container.__hmbPickerOutlinerPatchKey = outlinerKey;
-      }
+      } else hmbPatchPickerOutlinerFeedback(container, visibleState, immediateMediaLocked);
       hmbPatchPickerCameraControlDom(container, nextState, nextTr, immediateMediaLocked);
       const depthRange = container.querySelector("#depth-distance-range");
       if (depthRange) {
         depthRange.value = hmbNormalizeDepthSettings(nextState.depth_settings).range;
         depthRange.disabled = !!nextLocked;
       }
-      hmbApplyPickerPaletteSelectionToDom(container, nextState, immediateMediaLocked);
+      hmbApplyPickerPaletteSelectionToDom(container, visibleState, immediateMediaLocked);
     } else {
       const compactContentHeight = hmbApplyVideoPickerCompactHostSizing(container, visibleState);
       hmbApplyVideoPickerCompactGeometry(container, compactContentHeight);
@@ -13678,13 +13868,14 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   };
 
   const applyColor = (color) => {
-    if (!color || pickerLocalInteractionLocked()) return;
-    const liveState = hmbEnsurePickerOutlinerSelection(currentWidgetState());
-    if (!hmbPickerSelectedOutlinerNodes(liveState).length) return;
+    const liveState = currentWidgetState(false);
+    if (!color || pickerLocalInteractionLocked(liveState)) return;
     const next = hmbPickerApplyColorToSelection(liveState, color);
+    if (!next.selected_outliner_paths?.length) return;
     const interactionLocked = pickerLocalInteractionLocked(next);
-    const outlinerUpdated = hmbRenderPickerOutlinerLocal(container, next, tr, interactionLocked);
+    const outlinerUpdated = hmbPatchPickerOutlinerFeedback(container, next, interactionLocked);
     hmbApplyPickerPaletteSelectionToDom(container, next, interactionLocked);
+    hmbRememberPickerOutlinerDraft(container, next, true);
     schedulePickerStatePublicationAfterPaint(next, {
       commitOptions: { suppressMatchingEcho: outlinerUpdated },
     });
@@ -14369,10 +14560,17 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     outlinerVirtualScrollFrame = 0;
   });
   const selectOutlinerPath = (path, modifiers = {}) => {
-    const next = hmbPickerSelectOutlinerPath(currentWidgetState(), path, modifiers);
+    const next = hmbPickerSelectOutlinerPath(currentWidgetState(false), path, modifiers);
     const interactionLocked = pickerLocalInteractionLocked(next);
-    const outlinerUpdated = hmbRenderPickerOutlinerLocal(container, next, tr, interactionLocked);
+    const outlinerUpdated = hmbPatchPickerOutlinerFeedback(container, next, interactionLocked);
     hmbApplyPickerPaletteSelectionToDom(container, next, interactionLocked);
+    hmbRememberPickerOutlinerDraft(container, next);
+    if (modifiers.type === "keydown") {
+      const row = Array.from(outlinerScroll?.querySelectorAll?.("[data-group-path]") || [])
+        .find(item => clean(item.getAttribute("data-group-path")) === path);
+      if (row) row.focus?.({ preventScroll: true });
+      else hmbRenderPickerOutlinerLocal(container, next, tr, interactionLocked, { forcePath: path, focusPath: path });
+    }
     schedulePickerStatePublicationAfterPaint(next, {
       commitOptions: { suppressMatchingEcho: outlinerUpdated },
     });
@@ -14438,12 +14636,13 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     });
   };
   const clearOutlinerColor = (path) => {
-    const liveState = currentWidgetState();
+    const liveState = currentWidgetState(false);
     if (pickerLocalInteractionLocked(liveState)) return;
     const next = hmbPickerClearOutlinerColor(liveState, path);
     if (next === liveState) return;
-    const outlinerUpdated = hmbRenderPickerOutlinerLocal(container, next, tr, false);
+    const outlinerUpdated = hmbPatchPickerOutlinerFeedback(container, next, false);
     hmbApplyPickerPaletteSelectionToDom(container, next, false);
+    hmbRememberPickerOutlinerDraft(container, next, true);
     schedulePickerStatePublicationAfterPaint(next, {
       commitOptions: { suppressMatchingEcho: outlinerUpdated },
     });
@@ -15084,6 +15283,15 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     nextProps = { ...(nextProps || {}), value: hmbApplyOptimisticPickerVideoDeletions(
       container, hmbPickerStateFromProps(nextProps || {}),
     ) };
+    const interactionEcho = hmbProtectPickerInteractionDraft(container, hmbPickerStateFromProps(nextProps));
+    if (interactionEcho.protected) nextProps = { ...nextProps, value: interactionEcho.state };
+    const outlinerEcho = hmbProtectPickerOutlinerDraft(container, hmbPickerStateFromProps(nextProps));
+    if (outlinerEcho.protected) {
+      nextProps = { ...nextProps, value: outlinerEcho.state };
+      // Keep every local control on the same projected state, including the
+      // latest backend locks/status, instead of retaining an obsolete snapshot.
+      container.__hmbPendingPickerState = normalize(outlinerEcho.state);
+    }
     const workspaceEchoMatches = hmbPickerWorkspacePublicationMatchesEcho(
       container,
       hmbPickerStateFromProps(nextProps || {}),

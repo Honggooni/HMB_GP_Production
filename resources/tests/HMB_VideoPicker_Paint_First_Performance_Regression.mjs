@@ -123,7 +123,7 @@ assert.equal(
   "A palette assignment must publish all selected objects atomically through the paint-first latest-only publisher.",
 );
 const paletteMutationIndex = paletteSource.indexOf("hmbPickerApplyColorToSelection(liveState, color)");
-const paletteFeedbackIndex = paletteSource.indexOf("hmbRenderPickerOutlinerLocal(container, next");
+const paletteFeedbackIndex = paletteSource.indexOf("hmbPatchPickerOutlinerFeedback(container, next");
 const paletteSelectionIndex = paletteSource.indexOf("hmbApplyPickerPaletteSelectionToDom(container, next");
 const palettePublicationIndex = paletteSource.indexOf("schedulePickerStatePublicationAfterPaint(next");
 assert.ok(paletteMutationIndex >= 0 && paletteFeedbackIndex > paletteMutationIndex);
@@ -139,7 +139,7 @@ const outlinerStart = source.indexOf("const selectOutlinerPath = (path, modifier
 const outlinerEnd = source.indexOf("on(outlinerScroll", outlinerStart);
 const outlinerSource = source.slice(outlinerStart, outlinerEnd);
 assert.ok(outlinerStart >= 0 && outlinerEnd > outlinerStart);
-assert.match(outlinerSource, /hmbPickerSelectOutlinerPath\(currentWidgetState\(\), path, modifiers\)/,
+assert.match(outlinerSource, /hmbPickerSelectOutlinerPath\(currentWidgetState\(false\), path, modifiers\)/,
   "Outliner selection must preserve Ctrl/Cmd/Shift modifiers for the atomic selected-object set.");
 assert.equal(
   (outlinerSource.match(/schedulePickerStatePublicationAfterPaint\(/g) || []).length,
@@ -173,7 +173,7 @@ assert.match(
 );
 assert.match(commitSource, /delete container\.__hmbPickerPaintFirstPublication/);
 
-const currentStateStart = source.indexOf("const currentWidgetState = () => {");
+const currentStateStart = source.indexOf("const currentWidgetState = (normalizeState = true) => {");
 const currentStateEnd = source.indexOf("const commandBridge = () => {", currentStateStart);
 const currentStateSource = source.slice(currentStateStart, currentStateEnd);
 assert.ok(currentStateStart >= 0 && currentStateEnd > currentStateStart);

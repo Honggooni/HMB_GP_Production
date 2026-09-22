@@ -113,7 +113,7 @@ paletteCleanup.forEach((cleanup) => cleanup());
 
 assert.match(
   widgetSource,
-  /hmbApplyPickerPaletteSelectionToDom\(container, nextState, immediateMediaLocked\);/,
+  /hmbApplyPickerPaletteSelectionToDom\(container, visibleState, immediateMediaLocked\);/,
   "Palette activation must follow the local Maya operation lock, not Shot workspace publication.",
 );
 assert.match(widgetSource, /class="picker-camera-control"/);

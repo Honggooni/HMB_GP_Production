@@ -188,6 +188,52 @@ for source in workspaces:
         assert reloaded["active_snapshot_uid"] == expected_snapshot_pointers[target]
         snapshot_transitions += 1
 
-print(json.dumps({"result": "PASS", "maya_replacements": 5, "shot_transitions": transitions,
-                  "shot_owned_results": 5, "snapshot_transitions": snapshot_transitions,
+# Two more complete rounds of .mb replacement, including all four outputs.
+# Navigate away after the command destination has been captured, then finish
+# into that captured UUID. No existing Shot media/snapshots may be displaced.
+late_completions = 0
+for round_number in (2, 3):
+    for index, workspace in enumerate(workspaces, 1):
+        scene = f"C:/shared-maya-contract/round-{round_number}-scene-{index}.mb"
+        actor = f"Round{round_number}Actor{index}"
+        state.update({
+            "scene_path": scene, "scene_draft_path": scene, "scene_request_path": scene,
+            "native_read_ready": True, "scene_stage": "OUTLINER_READY",
+            "native_metadata": {"scene_path": scene, "start_frame": 101, "end_frame": 148},
+            "camera": f"camera{index}", "selected_camera": f"camera{index}",
+            "cameras": [{"full_path": f"camera{index}", "name": f"camera{index}"}],
+            "outliner_nodes": [{"name": actor, "full_path": f"|{actor}", "maya_uuid": actor}],
+            "selected_outliner_path": f"|{actor}", "selected_outliner_name": actor,
+            "selected_outliner_uuid": actor, "selected_color": "Green",
+            "slot_assignments": [{"video_slot": 1, "bindings": [{"full_dag_path": f"|{actor}", "maya_uuid": actor, "color": "Green"}]}],
+            "slot_visibility": [{"video_slot": 1, "hidden_paths": []}],
+        })
+        state = switch_through_widget(picker._parse_state(state), workspace)
+        captured_destination = state["active_picker_shot_uuid"]
+        captured_maya = current_maya_fields(state)
+        previous_media = {row["workspace_uuid"]: list(row["video_asset_uids"]) for row in state["picker_shots"]}
+        browsed_workspace = workspaces[index % len(workspaces)]
+        state = switch_through_widget(state, browsed_workspace)
+        added = []
+        for role in ("original", "mask", "depth", "motion_guide"):
+            uid = f"round-{round_number}-shot-{index}-{role}"
+            added.append(uid)
+            state = picker._append_video_asset(state, {
+                "video_uid": uid, "source_uid": uid,
+                "video_path": f"C:/shared-maya-contract/{uid}.mp4",
+                "label": uid, "generation_role": role,
+            }, picker_shot_uuid=captured_destination)
+            assert state["active_picker_shot_uuid"] == browsed_workspace
+            assert current_maya_fields(state) == captured_maya
+            assert snapshot_semantics(state) == expected_snapshots
+            expected_media = copy.deepcopy(previous_media)
+            expected_media[captured_destination] += added
+            assert {row["workspace_uuid"]: list(row["video_asset_uids"]) for row in state["picker_shots"]} == expected_media
+            late_completions += 1
+        state = picker._parse_state(json.dumps(state))
+        assert current_maya_fields(state) == captured_maya
+
+print(json.dumps({"result": "PASS", "maya_replacements": 15, "shot_transitions": transitions,
+                  "shot_owned_results": 45, "late_output_completions": late_completions,
+                  "snapshot_transitions": snapshot_transitions,
                   "runtime_root": str(root)}))
