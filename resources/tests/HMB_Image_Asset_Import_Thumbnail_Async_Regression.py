@@ -34,8 +34,11 @@ def live_imports(state):
 
 
 with tempfile.TemporaryDirectory(prefix="hmb_import_preview_async_") as temp:
-    path_a = Path(temp) / "A.png"
-    path_b = Path(temp) / "B.png"
+    # The runtime resolves imported paths. Windows CI may expose TEMP through
+    # an 8.3 alias, so compare against the same canonical filesystem spelling.
+    temp_root = Path(temp).resolve()
+    path_a = temp_root / "A.png"
+    path_b = temp_root / "B.png"
     make_png(path_a, (230, 30, 50))
     make_png(path_b, (20, 80, 190))
     node = library.HMBImageAssetLibrary(name="import_preview_async_regression")
@@ -132,7 +135,8 @@ with tempfile.TemporaryDirectory(prefix="hmb_import_preview_async_") as temp:
 print("ImageAsset path preview async freshness/output regression: PASS")
 
 with tempfile.TemporaryDirectory(prefix="hmb_import_preview_bounded_") as temp:
-    paths = {name: Path(temp) / f"{name}.png" for name in "ABCD"}
+    temp_root = Path(temp).resolve()
+    paths = {name: temp_root / f"{name}.png" for name in "ABCD"}
     for index, path in enumerate(paths.values()):
         make_png(path, (20 + index * 30, 50, 80))
     node = library.HMBImageAssetLibrary(name="import_preview_bounded_regression")
