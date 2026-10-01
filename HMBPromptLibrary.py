@@ -70,6 +70,8 @@ MAX_SHOT_IMAGES = MAX_IMAGES
 MAX_VIDEOS = 10
 PICKER_DEPTH_PROFILE = "hmb_camera_space_depth_v7"
 PICKER_MOTION_GUIDE_PROFILE = "hmb_target_neutral_motion_guide_v5"
+BLENDER_DEPTH_PROFILE = "hmb_blender_camera_depth_v1"
+BLENDER_MOTION_GUIDE_PROFILE = "hmb_blender_motion_guide_v1"
 PICKER_LEGACY_MOTION_GUIDE_PROFILES = frozenset({
     "hmb_target_neutral_motion_guide_v4",
 })
@@ -268,6 +270,7 @@ VIDEO_CONTROL_ROLE_CHOICES = [
 VIDEO_MAIN_TYPE_CHOICES = [
     "Select Video Main Type",
     "Maya Preview / Playblast",
+    "Blender Preview / Render",
     "Motion Reference",
     "Scene / Look Reference",
     "FX Reference",
@@ -275,6 +278,13 @@ VIDEO_MAIN_TYPE_CHOICES = [
 ]
 VIDEO_SUB_TYPE_CHOICES = {
     "Maya Preview / Playblast": [
+        "Original Preview",
+        "Mask",
+        "Depth",
+        "Motion Guide",
+        "Timing / Edit",
+    ],
+    "Blender Preview / Render": [
         "Original Preview",
         "Mask",
         "Depth",
@@ -317,6 +327,26 @@ VIDEO_TAXONOMY_WIRE_MAP = {
         "Derived Motion Decoding Only",
     ),
     ("Maya Preview / Playblast", "Timing / Edit"): (
+        "Timing / Edit Reference",
+        "Timing Only",
+    ),
+    ("Blender Preview / Render", "Original Preview"): (
+        "Unified Shot-Control Video",
+        "Primary Unified Shot Control",
+    ),
+    ("Blender Preview / Render", "Mask"): (
+        "Mask / Control Reference",
+        "Mask / Guide Only",
+    ),
+    ("Blender Preview / Render", "Depth"): (
+        "Depth / Spatial Reference",
+        "Spatial Alignment Verification Only",
+    ),
+    ("Blender Preview / Render", "Motion Guide"): (
+        "Motion Guide / Retargeting Reference",
+        "Derived Motion Decoding Only",
+    ),
+    ("Blender Preview / Render", "Timing / Edit"): (
         "Timing / Edit Reference",
         "Timing Only",
     ),
@@ -651,7 +681,7 @@ _HMB_CONNECTED_SIGNATURE_PREFIX_CHARS = 4096
 _HMB_CONNECTED_SIGNATURES = {
     PICKER_INPUT_PARAMETER_NAME: {
         "schema": frozenset({"hmb-prompt-library-picker-binding"}),
-        "mode": frozenset({"maya"}),
+        "mode": frozenset({"maya", "blender"}),
     },
     IMAGE_ASSET_INPUT_PARAMETER_NAME: {
         "schema": frozenset({"hmb-image-asset-library-binding"}),
@@ -730,6 +760,7 @@ _PICKER_PAYLOAD_KEYS = frozenset({
     "mode",
     "run_id",
     "scene_path",
+    "scene_engine",
     "scene_fingerprint",
     "marker_catalog_version",
     "media_ready",
@@ -2543,9 +2574,9 @@ def _migrate_old_video_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
             "_",
             _clean_string(item.get("media_kind")).casefold(),
         ).strip("_")
-        if media_kind == "maya_depth_playblast" or out["picker_auto_depth"]:
+        if media_kind in {"maya_depth_playblast", "blender_depth_render"} or out["picker_auto_depth"]:
             companion_kind = "depth"
-        elif media_kind == "maya_motion_guide" or out["picker_auto_motion_guide"]:
+        elif media_kind in {"maya_motion_guide", "blender_motion_guide"} or out["picker_auto_motion_guide"]:
             companion_kind = "motion_guide"
     out["picker_companion_kind"] = (
         companion_kind if companion_kind in {"depth", "motion_guide"} else ""
@@ -6539,7 +6570,7 @@ def _picker_video_claims_generated_depth(item: Any, slot: int) -> bool:
         "_",
         _clean_string(item.get("media_kind")).casefold(),
     ).strip("_")
-    if media_kind == "maya_depth_playblast":
+    if media_kind in {"maya_depth_playblast", "blender_depth_render"}:
         return True
     source_type_hint = _clean_string(item.get("source_type_hint"))
     control_role_hint = _canonical_video_role(item.get("control_role_hint"))
@@ -6612,6 +6643,7 @@ def _picker_video_is_generated_depth(
     item: Any,
     slot: int,
     source_pair_run_id: str = "",
+    picker_mode: str = "",
 ) -> bool:
     """Recognize a validated Picker relative-depth output.
 
@@ -6639,11 +6671,25 @@ def _picker_video_is_generated_depth(
         or depth_pair_run_id != expected_pair_run_id
     ):
         return False
+    media_contract = (
+        _clean_string(item.get("media_kind")),
+        _clean_string(item.get("video_role")),
+        _clean_string(item.get("depth_profile")),
+    )
+    maya_contract = (
+        "maya_depth_playblast",
+        "maya_depth_companion",
+        PICKER_DEPTH_PROFILE,
+    )
+    blender_contract = (
+        "blender_depth_render",
+        "blender_depth_companion",
+        BLENDER_DEPTH_PROFILE,
+    )
+    source_mode = _clean_string(picker_mode).casefold()
     return bool(
-        _clean_string(item.get("media_kind")) == "maya_depth_playblast"
-        and _clean_string(item.get("video_role")) == "maya_depth_companion"
-        and _clean_string(item.get("depth_profile"))
-        == PICKER_DEPTH_PROFILE
+        (source_mode in {"", "maya"} and media_contract == maya_contract)
+        or (source_mode == "blender" and media_contract == blender_contract)
     )
 
 
@@ -6663,7 +6709,7 @@ def _normalize_picker_motion_guide_summary(value: Any) -> Dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     profile = _clean_string(value.get("profile"))
-    if profile not in PICKER_MOTION_GUIDE_PROFILES:
+    if profile not in (PICKER_MOTION_GUIDE_PROFILES | {BLENDER_MOTION_GUIDE_PROFILE}):
         return {}
 
     def bounded_count(field: str) -> int:
@@ -6671,6 +6717,24 @@ def _normalize_picker_motion_guide_summary(value: Any) -> Dict[str, Any]:
             return max(0, int(value.get(field) or 0))
         except Exception:
             return 0
+
+    if profile == BLENDER_MOTION_GUIDE_PROFILE:
+        # The Blender guide is a camera-projected spatial/rig guide. It does
+        # not carry Maya's face-channel or blendshape provenance, even when a
+        # restored dashboard state contains stale or hand-edited face fields.
+        return {
+            "profile": profile,
+            "semantic_face": False,
+            "target_count": 0,
+            "channel_count": 0,
+            "driver_count": 0,
+            "landmark_count": 0,
+            "rasterized_sample_count": 0,
+            "hidden_or_occluded_sample_count": 0,
+            "semantic_groups": [],
+            "final_blendshape_values_in_sidecar": False,
+            "raw_curve_geometry_rendered": False,
+        }
 
     groups = sorted({
         _clean_string(item)
@@ -6700,7 +6764,7 @@ def _picker_motion_guide_summary(item: Any) -> Dict[str, Any]:
     if not isinstance(item, dict):
         return {}
     profile = _clean_string(item.get("motion_guide_profile"))
-    if profile not in PICKER_MOTION_GUIDE_PROFILES:
+    if profile not in (PICKER_MOTION_GUIDE_PROFILES | {BLENDER_MOTION_GUIDE_PROFILE}):
         return {}
     report = (
         item.get("motion_guide_report")
@@ -6805,7 +6869,7 @@ def _picker_video_claims_generated_motion_guide(
         "_",
         _clean_string(item.get("media_kind")).casefold(),
     ).strip("_")
-    if media_kind == "maya_motion_guide":
+    if media_kind in {"maya_motion_guide", "blender_motion_guide"}:
         return True
     source_slot_value = (
         item.get("source_video_slot")
@@ -6825,13 +6889,14 @@ def _picker_video_is_generated_motion_guide(
     item: Any,
     slot: int,
     source_bundle_run_id: str = "",
+    picker_mode: str = "",
 ) -> bool:
     if not _picker_video_claims_generated_motion_guide(item, slot):
         return False
     source_slot = _picker_companion_source_slot(item)
     item_bundle_run_id = _clean_string(item.get("bundle_run_id"))
     expected_bundle_run_id = _clean_string(source_bundle_run_id)
-    return bool(
+    valid_provenance = bool(
         source_slot >= 0
         and item_bundle_run_id
         and (
@@ -6841,11 +6906,32 @@ def _picker_video_is_generated_motion_guide(
                 and item_bundle_run_id == expected_bundle_run_id
             )
         )
-        and _clean_string(item.get("media_kind")) == "maya_motion_guide"
-        and _clean_string(item.get("video_role"))
-        == "maya_motion_guide_companion"
-        and _clean_string(item.get("motion_guide_profile"))
-        in PICKER_MOTION_GUIDE_PROFILES
+    )
+    media_contract = (
+        _clean_string(item.get("media_kind")),
+        _clean_string(item.get("video_role")),
+        _clean_string(item.get("motion_guide_profile")),
+    )
+    source_mode = _clean_string(picker_mode).casefold()
+    return bool(
+        valid_provenance
+        and (
+            (
+                source_mode in {"", "maya"}
+                and media_contract[:2]
+                == ("maya_motion_guide", "maya_motion_guide_companion")
+                and media_contract[2] == PICKER_MOTION_GUIDE_PROFILE
+            )
+            or (
+                source_mode == "blender"
+                and media_contract
+                == (
+                    "blender_motion_guide",
+                    "blender_motion_guide_companion",
+                    BLENDER_MOTION_GUIDE_PROFILE,
+                )
+            )
+        )
     )
 
 
@@ -7115,7 +7201,7 @@ def _picker_match_candidates(images: List[Dict[str, Any]], marker: Dict[str, Any
 def _picker_video_has_media(value: Any) -> bool:
     """Return whether a PICKER_OUT video row names concrete media.
 
-    Picker UI slot rows can exist before Maya/FFmpeg has produced anything.
+    Picker UI slot rows can exist before the DCC/FFmpeg has produced anything.
     Those rows are configuration placeholders and must never activate Prompt
     @video slots.
     """
@@ -7126,7 +7212,7 @@ def _picker_video_has_media(value: Any) -> bool:
 
 
 def _picker_video_is_mask_bundle_source(item: Any, slot: int) -> bool:
-    """Recognize a packed Mask or the untyped legacy @video1 Color source."""
+    """Recognize a typed Mask or the untyped legacy Maya @video1 Color source."""
 
     if not isinstance(item, dict):
         return False
@@ -7145,11 +7231,49 @@ def _picker_video_is_mask_bundle_source(item: Any, slot: int) -> bool:
         or video_role == "maya_color_assignment_mask"
     ):
         return True
+    if (
+        media_kind == "blender_color_assignment_mask"
+        or video_role == "blender_color_assignment_mask"
+    ):
+        return bool(
+            media_kind == "blender_color_assignment_mask"
+            and video_role == "blender_color_assignment_mask"
+        )
     # Pre-packed Picker payloads authored the Color bundle at @video1 without
     # a media_kind/video_role discriminator.  Do not let a typed Original (or
     # another typed row) inherit that compatibility authority merely because
     # packing placed it first.
     return bool(int(slot or 0) == 1 and not media_kind and not video_role)
+
+
+def _picker_media_engine(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    media_kind = _clean_string(item.get("media_kind")).casefold()
+    video_role = _clean_string(item.get("video_role")).casefold()
+    if media_kind.startswith("blender_") or video_role.startswith("blender_"):
+        return "blender"
+    if media_kind.startswith("maya_") or video_role.startswith("maya_"):
+        return "maya"
+    return ""
+
+
+def _picker_blender_media_role_valid(item: Any) -> bool:
+    """Require an exact Blender kind/role pair before claiming DCC provenance."""
+
+    if not isinstance(item, dict):
+        return False
+    blender_roles = {
+        "blender_original_render": "blender_original_render",
+        "blender_color_assignment_mask": "blender_color_assignment_mask",
+        "blender_depth_render": "blender_depth_companion",
+        "blender_motion_guide": "blender_motion_guide_companion",
+    }
+    media_kind = _clean_string(item.get("media_kind"))
+    return (
+        media_kind in blender_roles
+        and _clean_string(item.get("video_role")) == blender_roles[media_kind]
+    )
 
 
 def _picker_companion_expected_run_id(
@@ -7173,11 +7297,21 @@ def _picker_companion_expected_run_id(
         return None
     # Preserve the historical typed-@video1 shape, where the companion row
     # itself also carried the old implicit Color bundle identity.
-    if source is item and source_slot == int(slot or 0) == 1:
+    if (
+        source is item
+        and source_slot == int(slot or 0) == 1
+        and _picker_media_engine(item) != "blender"
+    ):
         return _clean_string(
             item.get("bundle_run_id") or item.get("pair_run_id")
         ) or None
     if not _picker_video_is_mask_bundle_source(source, source_slot):
+        return None
+    companion_engine = _picker_media_engine(item)
+    mask_engine = _picker_media_engine(source)
+    if companion_engine == "blender" and mask_engine != "blender":
+        return None
+    if companion_engine == "maya" and mask_engine == "blender":
         return None
     return _clean_string(
         source.get("bundle_run_id") or source.get("pair_run_id")
@@ -7228,13 +7362,13 @@ def _renumber_video_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connected: bool = False) -> Dict[str, Any]:
-    """Apply Maya binding data while preserving manual Color Pick edits.
+    """Apply DCC picker binding data while preserving manual Color Pick edits.
 
     A marker is assigned only when its exact Asset ID equals the image row's
     Asset ID, or its Image Name for native legacy rows with no upstream
     provenance. External IMAGE_IMPORT_IN rows never enter this fallback.
     Picker data never authors image Main Type, Target, Image Sub Type,
-    ordinary-video roles, Keep Out, or VFX. Valid generated Maya media adds its
+    ordinary-video roles, Keep Out, or VFX. Valid generated DCC media adds its
     declared type/role and provenance without deleting user Color Picks, local
     bindings, or optional frame ranges. Invalid companion provenance keeps the
     connected file as an independent ordinary source while dropping only its
@@ -7255,17 +7389,19 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
         return _normalize_state(normalized)
     payload_mode = _clean_string(payload.get("mode")).lower() if isinstance(payload, dict) else ""
     payload_schema = _clean_string(payload.get("schema")) if isinstance(payload, dict) else ""
+    scene_engine = _clean_string(payload.get("scene_engine")).lower() if isinstance(payload, dict) else ""
     payload_has_foreign_identity = bool(
         payload
         and (
-            payload_mode not in {"", "maya"}
+            payload_mode not in {"", "maya", "blender"}
             or payload_schema not in {"", "hmb-prompt-library-picker-binding"}
+            or (payload_mode == "blender" and scene_engine not in {"", "blender"})
         )
     )
     payload_has_picker_identity = bool(
         payload
         and (
-            payload_mode == "maya"
+            payload_mode in {"maya", "blender"}
             or payload_schema == "hmb-prompt-library-picker-binding"
             or any(key in payload for key in _PICKER_IDENTITY_KEYS)
         )
@@ -7350,6 +7486,20 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             )
             continue
         item_uid = _picker_video_uid(item)
+        if payload_mode == "blender" and not _picker_blender_media_role_valid(item):
+            has_readable_unstructured_video_rows = True
+            error = (
+                f"PICKER_OUT Blender video row {video_index} has no exact "
+                "Blender media kind/role pair; the row remains ordinary intent."
+            )
+            rejected_video_contract_errors.append(error)
+            _append_source_intent(
+                normalized,
+                PICKER_INPUT_PARAMETER_NAME,
+                error,
+                item,
+            )
+            continue
         if uid_order_managed and item.get("selected") is False:
             error = (
                 f"PICKER_OUT UID-managed video row {video_index} is not selected; "
@@ -7737,6 +7887,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
                 raw_video,
                 candidate_slot,
                 expected_run_id,
+                picker_mode=payload_mode,
             )
         ):
             generated_depth_slots.add(candidate_slot)
@@ -7755,6 +7906,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
                 raw_video,
                 candidate_slot,
                 expected_run_id,
+                picker_mode=payload_mode,
             )
         ):
             generated_motion_guide_slots.add(candidate_slot)
@@ -8065,7 +8217,8 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
                     video_item["picker_auto_video_main_type"] = ""
                     video_item["picker_auto_video_sub_type"] = ""
                     if (
-                        video_item.get("source_type") == "Maya Preview / Playblast"
+                        video_item.get("source_type")
+                        in {"Maya Preview / Playblast", "Blender Preview / Render"}
                         and not _clean_string(video_item.get("control_role"))
                         and not _clean_string(video_item.get("keep_out"))
                     ):
@@ -8130,10 +8283,21 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
         ).casefold()
         raw_media_kind = _clean_string(raw_video.get("media_kind")).casefold()
         raw_video_role = _clean_string(raw_video.get("video_role")).casefold()
+        picker_main_type = (
+            "Blender Preview / Render"
+            if payload_mode == "blender"
+            else "Maya Preview / Playblast"
+        )
         generated_mask = bool(
             raw_generation_role == "mask"
-            or raw_media_kind == "maya_color_assignment_mask"
-            or raw_video_role == "maya_color_assignment_mask"
+            or raw_media_kind in {
+                "maya_color_assignment_mask",
+                "blender_color_assignment_mask",
+            }
+            or raw_video_role in {
+                "maya_color_assignment_mask",
+                "blender_color_assignment_mask",
+            }
         )
         declared_depth = slot in claimed_depth_slots
         declared_motion_guide = slot in claimed_motion_guide_slots
@@ -8159,7 +8323,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             video_item["picker_companion_validated"] = False
         if generated_depth:
             assigned_depth_values: Dict[str, Any] = {
-                "video_main_type": "Maya Preview / Playblast",
+                "video_main_type": picker_main_type,
                 "video_sub_type": "Depth",
                 "source_type": "Depth / Spatial Reference",
                 "custom_source_type": "",
@@ -8180,7 +8344,7 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             )
         elif generated_motion_guide:
             assigned_motion_values: Dict[str, Any] = {
-                "video_main_type": "Maya Preview / Playblast",
+                "video_main_type": picker_main_type,
                 "video_sub_type": "Motion Guide",
                 "source_type": "Motion Guide / Retargeting Reference",
                 "custom_source_type": "",
@@ -8248,20 +8412,24 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
             )
             if taxonomy_is_picker_owned:
                 auto_sub_type = "Mask" if generated_mask else "Original Preview"
-                video_item["video_main_type"] = "Maya Preview / Playblast"
+                video_item["video_main_type"] = picker_main_type
                 video_item["video_sub_type"] = auto_sub_type
                 video_item["picker_auto_video_main_type"] = (
-                    "Maya Preview / Playblast"
+                    picker_main_type
                 )
                 video_item["picker_auto_video_sub_type"] = auto_sub_type
                 _normalize_video_taxonomy(video_item)
         if (
             not generated_depth
             and not generated_motion_guide
+            and (
+                payload_mode != "blender"
+                or not (declared_depth or declared_motion_guide)
+            )
             and video_item.get("source_type")
             in ("", "Role Required / Select Video Type")
         ):
-            video_item["source_type"] = "Maya Preview / Playblast"
+            video_item["source_type"] = picker_main_type
         video_item["manual"] = True
     normalized["videos"] = videos
 
@@ -9787,11 +9955,12 @@ class HMBPromptLibrary(DataNode):
         image_source_node: Any = None,
         picker_source_node: Any = None,
         allow_picker_hydration_pending: bool = False,
+        already_normalized: bool = False,
     ) -> tuple[Dict[str, Any], List[str], List[str], bool, bool]:
         """Project one graph-owned shot generation onto Prompt state/media."""
 
         self._hmb_picker_route_hydration_pending = False
-        normalized = _normalize_state(state)
+        normalized = state if already_normalized else _normalize_state(state)
         sources = getattr(self, "_hmb_connected_source_nodes", {})
         legacy_image_source_selected = False
         if image_source_node is None and isinstance(sources, dict):
@@ -10926,8 +11095,8 @@ class HMBPromptLibrary(DataNode):
             current_state = self._current_state()
             state = _normalize_state(current_state)
             source_sync_revision = int(state.get(SOURCE_SYNC_REVISION_KEY) or 0)
-            source_state_before_sync = state
-            state_before_source_sync = _json_dumps(source_state_before_sync)
+            state_before_source_sync = _json_dumps(state)
+            source_state_before_sync: Dict[str, Any] | None = None
             previous_source_fingerprints = getattr(
                 self,
                 "_hmb_source_input_fingerprints",
@@ -10944,6 +11113,7 @@ class HMBPromptLibrary(DataNode):
                 allow_picker_hydration_pending=(
                     allow_picker_hydration_pending
                 ),
+                already_normalized=True,
             )
             picker_route_hydration_pending = bool(
                 getattr(self, "_hmb_picker_route_hydration_pending", False)
@@ -11042,13 +11212,21 @@ class HMBPromptLibrary(DataNode):
                 disconnected_fingerprint = _connected_source_fingerprint(
                     {}, False
                 )
-                establishes_hydrated_baseline = bool(
+                may_establish_hydrated_baseline = bool(
                     (
                         previous_fingerprint == disconnected_fingerprint
                         or str(previous_fingerprint or "").startswith(
                             "persisted-"
                         )
                     )
+                )
+                if may_establish_hydrated_baseline and source_state_before_sync is None:
+                    # The exact-route projector can edit its normalized input.
+                    # Recover the pre-sync snapshot only for an actual baseline
+                    # comparison instead of cloning every large dashboard.
+                    source_state_before_sync = _parse_state(state_before_source_sync)
+                establishes_hydrated_baseline = bool(
+                    may_establish_hydrated_baseline
                     and _source_identity_already_applied(
                         source_state_before_sync,
                         name,

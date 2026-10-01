@@ -3,6 +3,8 @@ import fs from "node:fs";
 
 import {
   hmbPatchPromptSourceSection,
+  hmbClearImageDragIndicators,
+  hmbUpdateImageDragIndicators,
   hmbScopeWidgetCss,
   hmbScopeWidgetStyleMarkup,
 } from "../../widgets/HMBPromptLibraryScopedBindingWidget.js";
@@ -115,10 +117,77 @@ assert.equal(hmbPatchPromptSourceSection(currentSection, reorderedSection), true
 assert.deepEqual(currentScroll.children.slice(1), [currentB, currentA]);
 assert.equal(currentScroll.mutations, 1, "A two-row reorder must perform only the required DOM move.");
 
+function dragRow() {
+  const names = new Set();
+  const writes = { add: 0, remove: 0 };
+  return {
+    writes,
+    names,
+    classList: {
+      add(name) { writes.add += 1; names.add(name); },
+      remove(...values) { writes.remove += 1; values.forEach((name) => names.delete(name)); },
+    },
+  };
+}
+const dragSource = dragRow();
+const dragHoverA = dragRow();
+const dragHoverB = dragRow();
+let dragSourceQueries = 0;
+const dragContainer = {
+  querySelector() { dragSourceQueries += 1; return dragSource; },
+};
+assert.equal(hmbUpdateImageDragIndicators(dragContainer, dragHoverA, 2, false), true);
+for (let index = 0; index < 100; index += 1) {
+  assert.equal(hmbUpdateImageDragIndicators(dragContainer, dragHoverA, 2, false), false);
+}
+assert.equal(dragSourceQueries, 1, "Repeated dragover must reuse the source row.");
+assert.equal(dragHoverA.writes.add, 1, "The same hover position must not mutate DOM again.");
+assert.equal(hmbUpdateImageDragIndicators(dragContainer, dragHoverA, 2, true), true);
+assert.equal(hmbUpdateImageDragIndicators(dragContainer, dragHoverB, 2, false), true);
+assert.equal(dragHoverA.names.size, 0);
+assert.equal(dragHoverB.names.has("image-drop-before"), true);
+hmbClearImageDragIndicators(dragContainer);
+assert.equal(dragSource.names.size, 0);
+assert.equal(dragHoverB.names.size, 0);
+assert.equal(dragContainer.__hmbPromptImageDragIndicators, undefined);
+
 const source = fs.readFileSync(
   new URL("../../widgets/HMBPromptLibraryScopedBindingWidget.js", import.meta.url),
   "utf8",
 );
+const instrumentedSource = source.replace(
+  "export function normalizeState(input) {",
+  "export function normalizeState(input) { globalThis.__hmbPromptNormalizeCalls += 1;",
+);
+assert.notEqual(instrumentedSource, source);
+const instrumentedWidget = await import(
+  `data:text/javascript;base64,${Buffer.from(instrumentedSource).toString("base64")}`
+);
+const largePropsValue = JSON.stringify({
+  images: Array.from({ length: 50 }, (_unused, index) => ({
+    slot: index + 1,
+    label: `Image ${index + 1}`,
+    present: true,
+  })),
+  videos: Array.from({ length: 10 }, (_unused, index) => ({
+    slot: index + 1,
+    label: `Video ${index + 1}`,
+    present: true,
+  })),
+});
+globalThis.__hmbPromptNormalizeCalls = 0;
+assert.equal(
+  instrumentedWidget.hmbConsumePendingPromptStateEcho(
+    {}, { value: largePropsValue, disabled: false }, null,
+  ),
+  false,
+);
+assert.equal(
+  globalThis.__hmbPromptNormalizeCalls,
+  1,
+  "One retained-mode echo must normalize a 50-image/10-video payload once.",
+);
+delete globalThis.__hmbPromptNormalizeCalls;
 const cssMatch = source.match(/includeStyle \? `<style>\n([\s\S]*?)<\/style>` : ""/);
 assert.ok(cssMatch, "Prompt widget CSS literal must remain byte-identical behind the full-mount guard.");
 const css = cssMatch[1];

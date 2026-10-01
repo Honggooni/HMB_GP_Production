@@ -794,8 +794,10 @@ def _agent_policy_cross_view_identity(value: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _read_agent_policy_token_blob() -> bytes:
-    for path in _agent_policy_token_paths():
+def _read_agent_policy_token_blob(
+    paths: tuple[Path, ...] | None = None,
+) -> bytes:
+    for path in _agent_policy_token_paths() if paths is None else paths:
         try:
             stream = path.open("rb")
         except FileNotFoundError:
@@ -859,11 +861,13 @@ def _agent_policy_dpapi_unprotect(value: bytes) -> bytearray:
             ctypes.windll.kernel32.LocalFree(destination.pbData)
 
 
-def _load_agent_policy_bearer_token() -> bytearray:
+def _load_agent_policy_bearer_token(
+    paths: tuple[Path, ...] | None = None,
+) -> bytearray:
     plaintext: Optional[bytearray] = None
     token: Optional[bytearray] = None
     try:
-        plaintext = _agent_policy_dpapi_unprotect(_read_agent_policy_token_blob())
+        plaintext = _agent_policy_dpapi_unprotect(_read_agent_policy_token_blob(paths))
         if not isinstance(plaintext, bytearray):
             raise TypeError("DPAPI plaintext must be mutable")
         start, end = 0, len(plaintext)
@@ -894,6 +898,17 @@ def _broker_load_bearer_token_readonly() -> str:
     token: Optional[bytearray] = None
     try:
         token = _load_agent_policy_bearer_token()
+        return token.decode("ascii")
+    finally:
+        _wipe_agent_policy_buffer(token)
+
+
+def _broker_load_bearer_token_from_path_readonly(path: Path) -> str:
+    """Use the same bounded DPAPI reader for one Broker-specific token file."""
+
+    token: Optional[bytearray] = None
+    try:
+        token = _load_agent_policy_bearer_token((path,))
         return token.decode("ascii")
     finally:
         _wipe_agent_policy_buffer(token)

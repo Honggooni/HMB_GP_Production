@@ -29,10 +29,10 @@ const widgetSource = fs.readFileSync(path.join(workspace, "widgets/HMBColorLUTLi
 const videoBytes = fs.readFileSync(videoPath);
 const pageSource = `<!doctype html><html><head><meta charset="UTF-8"><style>body{background:#070910;margin:20px}#widget{width:${initialWidth}px;height:${initialHeight}px}</style></head><body><div id="widget"></div><script type="module">
 import mount, * as widget from '/widget.js';
-window.widget=widget;window.publications=[];window.media=[];window.drawCount=0;
+window.widget=widget;window.publications=[];window.media=[];window.drawCount=0;window.clearCount=0;
 const create=document.createElement.bind(document);document.createElement=(tag,...args)=>{const el=create(tag,...args);if(tag==='video')window.media.push(el);return el;};
 const getContext=HTMLCanvasElement.prototype.getContext;
-HTMLCanvasElement.prototype.getContext=function(type,...args){const context=getContext.call(this,type,...args);if(type==='webgl2'&&context&&!context.__testCapture){context.__testCapture=true;const draw=context.drawArrays.bind(context);context.drawArrays=(...args)=>{draw(...args);const pixels=new Uint8Array(this.width*this.height*4);context.readPixels(0,0,this.width,this.height,context.RGBA,context.UNSIGNED_BYTE,pixels);window.lastPixels=pixels;window.drawCount++;window.glError=context.getError();};}return context;};
+HTMLCanvasElement.prototype.getContext=function(type,...args){const context=getContext.call(this,type,...args);if(type==='webgl2'&&context&&!context.__testCapture){context.__testCapture=true;const clear=context.clear.bind(context);context.clear=(...args)=>{window.clearCount++;return clear(...args);};const draw=context.drawArrays.bind(context);context.drawArrays=(...args)=>{draw(...args);const pixels=new Uint8Array(this.width*this.height*4);context.readPixels(0,0,this.width,this.height,context.RGBA,context.UNSIGNED_BYTE,pixels);window.lastPixels=pixels;window.drawCount++;window.glError=context.getError();};}return context;};
 const catalog={schema:'hmb-shot-routing-catalog',version:1,publisher_instance_uuid:'test-publisher',channel_uuid:'test-channel',generation:1,metadata_sha256:'a'.repeat(64),shots:[1,2,3,4,5].map(number=>({shot_uuid:'shot-'+number,number,name:'Shot '+number,revision:1}))};
 window.state=widget.hmbColorLUTState({shot_catalog:catalog,shot:{channel_uuid:'test-channel',shot_uuid:'shot-1'},source:{path:'test-source.mp4',url:location.origin+'/video.mp4',name:'Live source · 320 × 180',shot_uuid:'shot-1',channel_uuid:'test-channel',revision:'r1',fps:24,duration:3}});
 window.controller=mount(document.getElementById('widget'),{value:window.state,onChange:(value)=>window.publications.push(value)});
@@ -73,6 +73,7 @@ try {
   const failures = []; page.on("pageerror", (error) => failures.push(error.message));
   await page.goto(`http://127.0.0.1:${server.address().port}`, { waitUntil: "networkidle" });
   await page.waitForFunction(() => window.ready && window.drawCount > 0 && window.media[0].readyState >= 2);
+  assert.equal(await page.locator('[data-empty]').evaluate(el => getComputedStyle(el).display), 'none', 'Loaded preview must not leave its loading overlay visible.');
   await checkInitialLayout('Shot / ko');
   assert.equal(await page.evaluate(() => !!window.originalCanvas.getContext("webgl2")), true, "Real WebGL2 renderer must compile and draw.");
   assert.equal(await page.evaluate(() => window.glError), 0, "WebGL LUT/video upload must have no GL errors.");
@@ -99,7 +100,12 @@ try {
     window.originalPixels = Array.from(window.lastPixels); window.beforeDraw = window.drawCount;
     el.value = "11"; el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true }));
   });
-  await page.waitForFunction(() => window.drawCount > window.beforeDraw);
+  await page.waitForFunction(() => {
+    if (window.drawCount <= window.beforeDraw) return false;
+    let sum = 0;
+    window.lastPixels.forEach((value, index) => { if (index % 4 !== 3) sum += Math.abs(value - window.originalPixels[index]); });
+    return sum / (window.lastPixels.length * .75) > 2;
+  });
   const difference = await page.evaluate(() => {
     let sum = 0, changed = 0;
     window.lastPixels.forEach((value, index) => { if (index % 4 !== 3) { const d = Math.abs(value - window.originalPixels[index]); sum += d; if (d > 2) changed++; } });
@@ -118,6 +124,21 @@ try {
   await page.waitForFunction(() => !window.media[0].seeking && Math.abs(window.media[0].currentTime - 1) < .005);
   await page.locator("[data-step]").click();
   await page.waitForFunction(() => !window.media[0].seeking && Math.abs(window.media[0].currentTime - 25 / 24) < .005);
+  await page.locator('[data-seek]').evaluate(el => { el.value = el.max; el.dispatchEvent(new Event('input', { bubbles: true })); });
+  await page.waitForFunction(() => !window.media[0].seeking && window.media[0].currentTime > 2.9);
+  await page.locator('[data-play]').click();
+  await page.waitForFunction(() => window.media[0].ended);
+  const beforeReplay = await page.evaluate(() => { window.beforeReplayDraws = window.drawCount; return { clears: window.clearCount, mediaCount: window.media.length }; });
+  await page.locator('[data-play]').click();
+  await page.waitForFunction(() => window.drawCount > window.beforeReplayDraws && window.media[0].currentTime < .5, null, { timeout: 10000 }).catch(async (error) => {
+    const state = await page.evaluate(() => ({ draws: window.drawCount, time: window.media[0].currentTime, ended: window.media[0].ended }));
+    throw new Error(`End-to-start replay did not decode the beginning: ${JSON.stringify(state)}; ${error.message}`);
+  });
+  assert.equal(await page.evaluate(() => window.clearCount), beforeReplay.clears, 'End-to-start replay must not clear the preview canvas.');
+  assert.equal(await page.evaluate(() => window.media.length), beforeReplay.mediaCount, 'End-to-start replay must reuse the decoded media element.');
+  assert.equal(await page.evaluate(() => document.querySelector('[data-preview]') === window.originalCanvas), true, 'End-to-start replay must retain the preview canvas.');
+  assert.equal(await page.locator('[data-empty]').evaluate(el => getComputedStyle(el).display), 'none', 'End-to-start replay must not show a loading overlay.');
+  await page.locator('[data-play]').click();
   await page.locator('[data-view="compare"]').click();
   await page.locator("[data-language-toggle]").click();
   assert.equal(await page.locator("[data-language-toggle]").innerText(), "EN");

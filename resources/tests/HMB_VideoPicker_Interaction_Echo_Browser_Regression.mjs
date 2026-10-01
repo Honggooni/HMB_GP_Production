@@ -24,6 +24,7 @@ if (!fs.existsSync(executablePath)) {
 const html = `<!doctype html><meta charset="utf-8"><style>body{margin:0}#widget{width:1600px;min-height:1200px}</style><div id="widget"></div><script type="module">
 import mount from '/widget.js';
 window.host=document.getElementById('widget');window.publications=[];
+window.mountPicker=mount;
 window.props=value=>({value,onChange:next=>{window.publications.push(structuredClone(next));if(window.hold)return new Promise((resolve,reject)=>{window.heldReject=reject;});}});
 window.start=value=>{window.controller?.cleanup();const fresh=document.createElement('div');fresh.id='widget';window.host.replaceWith(fresh);window.host=fresh;window.publications=[];window.controller=mount(window.host,window.props(value));};
 window.live=()=>window.host.__hmbPickerPaintFirstState||window.host.__hmbPendingPickerState||window.host.__hmbAuthoritativePickerState;
@@ -140,6 +141,85 @@ try {
     await page.evaluate(()=>window.oldEcho(window.baseline));
     assert.equal(await page.locator('.viewport-panel').getAttribute('data-picker-tool-mode'),'crop');
   });
+  await check('Crop tool paints directly without an intermediate Output or Concatenate mode',async()=>{
+    await page.locator('[data-picker-tool-tab="concatenate"]').click();
+    await page.waitForFunction(()=>!window.host.__hmbPickerPaintFirstState);
+    await page.evaluate(()=>{
+      window.beforeCrop=structuredClone(window.live());
+      window.toolModes=[];
+      const panel=window.host.querySelector('.viewport-panel');
+      window.toolModeObserver=new MutationObserver(()=>{
+        window.toolModes.push(panel.getAttribute('data-picker-tool-mode'));
+      });
+      window.toolModeObserver.observe(panel,{attributes:true,attributeFilter:['data-picker-tool-mode']});
+    });
+    await page.locator('[data-picker-tool-tab="crop"]').click();
+    await page.evaluate(()=>window.oldEcho(window.beforeCrop));
+    await page.waitForFunction(()=>!window.host.__hmbPickerPaintFirstState);
+    const modes=await page.evaluate(()=>{
+      window.toolModeObserver.disconnect();
+      return [...window.toolModes,window.host.querySelector('.viewport-panel').getAttribute('data-picker-tool-mode')];
+    });
+    assert.ok(modes.length>0);
+    assert.deepEqual([...new Set(modes)],['crop'],`intermediate tool modes: ${modes}`);
+    assert.equal(await page.locator('[data-picker-tool-tab="crop"]').getAttribute('aria-pressed'),'true');
+  },true);
+  await check('Crop mode survives a host row replacement before deferred publication',async()=>{
+    await page.locator('[data-picker-tool-tab="concatenate"]').click();
+    await page.waitForFunction(()=>!window.host.__hmbPickerPaintFirstState);
+    const first=await page.evaluate(()=>{
+      const old=structuredClone(window.live());
+      window.host.querySelector('[data-picker-tool-tab="crop"]').click();
+      const before=window.host.querySelector('.viewport-panel')?.getAttribute('data-picker-tool-mode');
+      window.controller=window.mountPicker(window.host,window.props(old));
+      return {before,after:window.host.querySelector('.viewport-panel')?.getAttribute('data-picker-tool-mode')};
+    });
+    assert.equal(first.before,'crop');
+    await page.waitForFunction(()=>!!window.host.querySelector('.viewport-panel'));
+    assert.equal(await page.locator('.viewport-panel').getAttribute('data-picker-tool-mode'),'crop',`first remount mode: ${JSON.stringify(first)}`);
+    await page.waitForFunction(()=>!window.host.__hmbPickerPaintFirstState);
+    assert.equal(await page.locator('.viewport-panel').getAttribute('data-picker-tool-mode'),'crop');
+  },true);
+  await check('Crossed same-tool-revision stale echo cannot repaint another tab',async()=>{
+    await page.locator('[data-picker-tool-tab="concatenate"]').click();
+    await page.waitForFunction(()=>!window.host.__hmbPickerPaintFirstState);
+    await page.locator('[data-picker-tool-tab="crop"]').click();
+    await page.waitForFunction(()=>!window.host.__hmbPickerPaintFirstState);
+    const mode=await page.evaluate(()=>{
+      const fresh=structuredClone(window.live());
+      const stale=structuredClone(fresh);
+      stale.video_tools_by_shot[stale.active_picker_shot_uuid].active_tool='concatenate';
+      stale.state_revision=Math.max(0,Number(fresh.state_revision||0)-1);
+      stale.state_published_at_ms=Math.max(0,Number(fresh.state_published_at_ms||0)-1);
+      stale.state_writer='python';
+      window.controller.update(window.props(stale));
+      return window.host.querySelector('.viewport-panel')?.getAttribute('data-picker-tool-mode');
+    });
+    assert.equal(mode,'crop');
+  },true);
+  await check('Crop intent owns media pause before any old-mode media event',async()=>{
+    const installed=await page.evaluate(()=>{
+      const media=window.host.querySelector('#picker-video');
+      if(!media)return false;
+      window.pauseModes=[];
+      const original=media.pause.bind(media);
+      media.pause=()=>{
+        const live=window.live();
+        window.pauseModes.push(live.video_tools_by_shot?.[live.active_picker_shot_uuid]?.active_tool||'preview');
+        return original();
+      };
+      return true;
+    });
+    assert.equal(installed,true);
+    await page.locator('[data-picker-tool-tab="crop"]').click();
+    const modes=await page.evaluate(()=>window.pauseModes);
+    assert.ok(modes.length>0);
+    assert.deepEqual([...new Set(modes)],['crop']);
+    await page.locator('[data-picker-tool-tab="crop"]').click();
+    const reselectedModes=await page.evaluate(()=>window.pauseModes);
+    assert.ok(reselectedModes.length>modes.length,'reselecting Crop still pauses media');
+    assert.deepEqual([...new Set(reselectedModes)],['crop']);
+  },true);
   await check('Output checkboxes and resolution retain choices through stale echo',async()=>{
     for(const id of ['original-preview-toggle','mask-playblast-toggle','depth-playblast-toggle','motion-guide-toggle']) {
       const before=await page.locator('#'+id).isChecked();

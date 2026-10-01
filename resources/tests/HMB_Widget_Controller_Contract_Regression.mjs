@@ -1202,8 +1202,13 @@ assert.doesNotMatch(
 );
 assert.equal(
   (promptSource.match(/\bremount\(\);/g) || []).length,
-  2,
-  "PromptLibrary must keep only initial and authoritative-props full remounts.",
+  1,
+  "PromptLibrary must keep one initial full remount.",
+);
+assert.equal(
+  (promptSource.match(/\bremount\(null, !hadUncommittedText\);/g) || []).length,
+  1,
+  "Authoritative props must reuse normalized state while protecting pending text.",
 );
 assert.match(
   promptSource,
@@ -1212,7 +1217,7 @@ assert.match(
 );
 assert.match(
   promptSource,
-  /if \(currentValue === nextValue && !disabledChanged\) \{[\s\S]*?return;[\s\S]*?\}[\s\S]*?state = nextState;[\s\S]*?hmbRememberPromptRevisionState\(container, state, state\.disabled, false\);[\s\S]*?if \(shotRegionOnly\) \{[\s\S]*?hmbApplyPromptShotFeedback\(container, state\);[\s\S]*?\} else \{\s*remount\(\);/,
+  /if \(currentValue === nextValue && !disabledChanged\) \{[\s\S]*?return;[\s\S]*?\}[\s\S]*?state = normalizedNextState;[\s\S]*?hmbRememberPromptRevisionState\(container, state, state\.disabled, false\);[\s\S]*?if \(shotRegionOnly\) \{[\s\S]*?hmbApplyPromptShotFeedback\(container, state\);[\s\S]*?\} else \{\s*remount\(null, !hadUncommittedText\);/,
   "A newer state must patch only the Shot selector when possible and reserve full Prompt remounting for other authoritative changes.",
 );
 assert.match(promptSource, /hmbCapturePromptControlFocus\(container\)[\s\S]*?hmbRestorePromptControlFocus\(container\)/, "Prompt structural refreshes must preserve non-text control focus.");

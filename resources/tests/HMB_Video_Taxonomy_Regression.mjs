@@ -34,6 +34,11 @@ const expected = new Map([
   ["Maya Preview / Playblast\0Depth", ["Depth / Spatial Reference", "Spatial Alignment Verification Only"]],
   ["Maya Preview / Playblast\0Motion Guide", ["Motion Guide / Retargeting Reference", "Derived Motion Decoding Only"]],
   ["Maya Preview / Playblast\0Timing / Edit", ["Timing / Edit Reference", "Timing Only"]],
+  ["Blender Preview / Render\0Original Preview", ["Unified Shot-Control Video", "Primary Unified Shot Control"]],
+  ["Blender Preview / Render\0Mask", ["Mask / Control Reference", "Mask / Guide Only"]],
+  ["Blender Preview / Render\0Depth", ["Depth / Spatial Reference", "Spatial Alignment Verification Only"]],
+  ["Blender Preview / Render\0Motion Guide", ["Motion Guide / Retargeting Reference", "Derived Motion Decoding Only"]],
+  ["Blender Preview / Render\0Timing / Edit", ["Timing / Edit Reference", "Timing Only"]],
   ["Motion Reference\0Local Motion", ["Motion Reference", "Local Motion Detail Only"]],
   ["Motion Reference\0Secondary Motion", ["Motion Reference", "Secondary Motion Only"]],
   ["Motion Reference\0Layout Reference", ["Motion Reference", "Camera / Layout Preserved; Free Character Motion"]],
@@ -102,6 +107,7 @@ assert.deepEqual(
   [
     "Select Video Main Type",
     "Maya Preview / Playblast",
+    "Blender Preview / Render",
     "Motion Reference",
     "Scene / Look Reference",
     "FX Reference",
@@ -112,6 +118,22 @@ assert.deepEqual(
   compatibleVideoRoleChoices({ video_main_type: "Maya Preview / Playblast" }),
   ["Original Preview", "Mask", "Depth", "Motion Guide", "Timing / Edit"],
 );
+assert.deepEqual(
+  compatibleVideoRoleChoices({ video_main_type: "Blender Preview / Render" }),
+  ["Original Preview", "Mask", "Depth", "Motion Guide", "Timing / Edit"],
+);
+const blenderCompanions = normalizeState({ videos: [
+  { slot: 1, label: "depth.mp4", present: true, media_kind: "blender_depth_render" },
+  { slot: 2, label: "motion.mp4", present: true, media_kind: "blender_motion_guide",
+    picker_motion_guide_summary: { profile: "hmb_blender_motion_guide_v1", semantic_face: true,
+      target_count: 1, channel_count: 3, semantic_groups: ["brow"],
+      final_blendshape_values_in_sidecar: true } },
+] });
+assert.deepEqual(blenderCompanions.videos.slice(0, 2).map((item) => item.picker_companion_kind), ["depth", "motion_guide"]);
+assert.equal(blenderCompanions.videos[1].picker_motion_guide_summary.profile, "hmb_blender_motion_guide_v1");
+assert.equal(blenderCompanions.videos[1].picker_motion_guide_summary.semantic_face, false);
+assert.equal(blenderCompanions.videos[1].picker_motion_guide_summary.target_count, 0);
+assert.deepEqual(blenderCompanions.videos[1].picker_motion_guide_summary.semantic_groups, []);
 assert.deepEqual(
   compatibleVideoRoleChoices({ video_main_type: "Motion Reference" }),
   ["Local Motion", "Secondary Motion", "Layout Reference"],

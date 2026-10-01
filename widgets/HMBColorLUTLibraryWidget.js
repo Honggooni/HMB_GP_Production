@@ -98,11 +98,35 @@ export function hmbColorLUTCube(settings, size = HMB_COLOR_LUT_CUBE_SIZE) {
   if (!Number.isInteger(size) || size < 2 || size > 65) throw new Error("Unsupported cube size.");
   const normalized = hmbColorLUTSettings(settings);
   const cube = new Float32Array(size ** 3 * 3);
-  let index = 0;
-  for (let b = 0; b < size; b++) for (let g = 0; g < size; g++) for (let r = 0; r < size; r++) {
-    for (const value of transformNormalized([r / (size - 1), g / (size - 1), b / (size - 1)], normalized)) cube[index++] = Math.floor(value * 1e9 + .5) / 1e9;
-  }
+  fillCube(cube, normalized, size, 0, size ** 3);
   return cube;
+}
+function fillCube(cube, normalized, size, start, end) {
+  const plane = size * size;
+  for (let cell = start; cell < end; cell++) {
+    const r = cell % size, g = Math.floor(cell / size) % size, b = Math.floor(cell / plane);
+    const rgb = transformNormalized([r / (size - 1), g / (size - 1), b / (size - 1)], normalized);
+    for (let channel = 0; channel < 3; channel++) cube[cell * 3 + channel] = Math.floor(rgb[channel] * 1e9 + .5) / 1e9;
+  }
+}
+// One slider movement must not occupy an entire animation frame. The same
+// vertex math and order as the exported cube are spread across short tasks.
+export function hmbColorLUTCubeChunked(settings, schedule, cancelScheduled, complete, size = HMB_COLOR_LUT_CUBE_SIZE, chunkSize = 4096) {
+  if (!Number.isInteger(size) || size < 2 || size > 65) throw new Error("Unsupported cube size.");
+  const normalized = hmbColorLUTSettings(settings), cube = new Float32Array(size ** 3 * 3);
+  const total = size ** 3;
+  let next = 0, ticket = 0, cancelled = false;
+  const step = () => {
+    ticket = 0;
+    if (cancelled) return;
+    const end = Math.min(total, next + Math.max(1, Math.trunc(chunkSize)));
+    fillCube(cube, normalized, size, next, end);
+    next = end;
+    if (next < total) ticket = schedule(step);
+    else complete(cube);
+  };
+  ticket = schedule(step);
+  return () => { cancelled = true; if (ticket) cancelScheduled(ticket); };
 }
 export function hmbColorLUTSample(cube, rgb, size = HMB_COLOR_LUT_CUBE_SIZE) {
   const p = rgb.map((v) => clamp(v) * (size - 1)), lo = p.map(Math.floor), hi = lo.map((v) => Math.min(size - 1, v + 1)), f = p.map((v, i) => v - lo[i]);
@@ -113,6 +137,26 @@ export function hmbColorLUTSample(cube, rgb, size = HMB_COLOR_LUT_CUBE_SIZE) {
     for (let c = 0; c < 3; c++) out[c] += cube[index + c] * weight;
   }
   return out;
+}
+// The 2D fallback avoids allocating several arrays for every video pixel.
+// Keep the same eight samples and summation order as hmbColorLUTSample.
+export function hmbColorLUTGradePixels(data, width, cube, mode, wipe, size = HMB_COLOR_LUT_CUBE_SIZE) {
+  const scale = size - 1, compareEdge = wipe * width;
+  for (let i = 0; i < data.length; i += 4) {
+    if (mode === 1 && (i / 4) % width < compareEdge) continue;
+    const rp = data[i] / 255 * scale, gp = data[i + 1] / 255 * scale, bp = data[i + 2] / 255 * scale;
+    const r0 = Math.floor(rp), g0 = Math.floor(gp), b0 = Math.floor(bp);
+    const r1 = Math.min(scale, r0 + 1), g1 = Math.min(scale, g0 + 1), b1 = Math.min(scale, b0 + 1);
+    const rf = rp - r0, gf = gp - g0, bf = bp - b0;
+    let red = 0, green = 0, blue = 0;
+    for (let z = 0; z < 2; z++) for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) {
+      const index = (((z ? b1 : b0) * size + (y ? g1 : g0)) * size + (x ? r1 : r0)) * 3;
+      const weight = (x ? rf : 1 - rf) * (y ? gf : 1 - gf) * (z ? bf : 1 - bf);
+      red += cube[index] * weight; green += cube[index + 1] * weight; blue += cube[index + 2] * weight;
+    }
+    data[i] = Math.round(red * 255); data[i + 1] = Math.round(green * 255); data[i + 2] = Math.round(blue * 255);
+  }
+  return data;
 }
 export function hmbColorLUTCommand(action, state, id = `cl-${Date.now()}-${Math.random().toString(36).slice(2)}`) {
   if (!["browse_video", "export", "cancel", "save_profile"].includes(action)) throw new Error("Unsupported Color LUT action.");
@@ -219,11 +263,7 @@ function createRenderer(canvas) {
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       if (mode === 0 || !cube) return;
       const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height), d = pixels.data;
-      for (let i = 0; i < d.length; i += 4) {
-        if (mode === 1 && (i / 4) % canvas.width < wipe * canvas.width) continue;
-        const color = hmbColorLUTSample(cube, [d[i] / 255, d[i + 1] / 255, d[i + 2] / 255]);
-        for (let c = 0; c < 3; c++) d[i + c] = Math.round(color[c] * 255);
-      }
+      hmbColorLUTGradePixels(d, canvas.width, cube, mode, wipe);
       ctx.putImageData(pixels, 0, 0);
     }, dispose() { cube = null; } };
 }
@@ -233,12 +273,14 @@ export default function HMBColorLUTLibraryWidget(container, props = {}) {
   if (container.__hmbColorLUTController) { container.__hmbColorLUTController.update(props); return container.__hmbColorLUTController; }
   let latestProps = props, state = hmbColorLUTState(props), disposed = false, visible = true, sourceRevision = 0;
   let renderer = null, video = null, sourceKey = "", drawFrame = 0, playbackFrame = 0, videoFrame = 0, commitTimer = 0;
-  let mode = "compare", wipe = 0.5, cubeKey = "", localMessage = "", pendingEdit = false, lastSeek = 0;
-  const cleanups = [], videoCleanups = [], settingsCache = new Map();
+  let mode = "compare", wipe = 0.5, cubeKey = "", pendingCube = null, pendingShot = null, localMessage = "", pendingEdit = false, lastSeek = 0;
+  const cleanups = [], videoCleanups = [], settingsCache = new Map(), cubeCache = new Map();
   const doc = container.ownerDocument || globalThis.document, win = doc?.defaultView || globalThis;
   const raf = (fn) => win.requestAnimationFrame(fn), caf = (id) => { if (id) win.cancelAnimationFrame(id); };
   const bind = (target, type, fn, options, list = cleanups) => { target?.addEventListener?.(type, fn, options); list.push(() => target?.removeEventListener?.(type, fn, options)); };
   const cacheKey = (s = state) => `${s.project_id}\u001f${s.shot.channel_uuid}\u001f${s.shot.shot_uuid}`;
+  const shotKey = (s) => s.shot.shot_uuid
+    ? `${s.shot.channel_uuid}\u001f${s.shot.shot_uuid}` : HMB_COLOR_LUT_ONLY_SHOT_VALUE;
   const q = (selector) => container.querySelector?.(selector), all = (selector) => Array.from(container.querySelectorAll?.(selector) || []);
   container.innerHTML = hmbRenderColorLUTWidget(state); // The only mount: updates patch existing controls and preserve the canvas.
   container.classList?.add("nodrag"); container.setAttribute?.("data-hmb-node-delete-protected", "true");
@@ -255,12 +297,33 @@ export default function HMBColorLUTLibraryWidget(container, props = {}) {
   };
   const stopLoop = () => { caf(playbackFrame); playbackFrame = 0; if (videoFrame && video?.cancelVideoFrameCallback) video.cancelVideoFrameCallback(videoFrame); videoFrame = 0; };
   const pause = () => { stopLoop(); video?.pause?.(); updateFrameLabel(); };
+  const cancelPendingCube = () => { pendingCube?.cancel(); pendingCube = null; };
+  const installCube = (key, cube) => {
+    cancelPendingCube(); renderer.setCube(cube); cubeKey = key;
+    cubeCache.delete(key); cubeCache.set(key, cube);
+    if (cubeCache.size > 4) cubeCache.delete(cubeCache.keys().next().value);
+  };
   const draw = () => {
     drawFrame = 0;
     if (!canDraw() || !renderer || !video || video.readyState < 2) return;
     try {
       const key = JSON.stringify(state.settings);
-      if (key !== cubeKey) { renderer.setCube(hmbColorLUTCube(state.settings)); cubeKey = key; }
+      if (key === cubeKey && pendingCube) cancelPendingCube();
+      if (key !== cubeKey) {
+        if (cubeCache.has(key)) installCube(key, cubeCache.get(key));
+        else if (!cubeKey) installCube(key, hmbColorLUTCube(state.settings));
+        else if (pendingCube?.key !== key) {
+          cancelPendingCube();
+          const requested = { key, cancel: null };
+          requested.cancel = hmbColorLUTCubeChunked(state.settings,
+            (fn) => win.setTimeout(fn, 0), (ticket) => win.clearTimeout(ticket),
+            (cube) => {
+              if (disposed || pendingCube !== requested || key !== JSON.stringify(state.settings) || !renderer) return;
+              installCube(key, cube); queueDraw();
+            });
+          pendingCube = requested;
+        }
+      }
       const ratio = Math.min(1, renderer.maxWidth / Math.max(1, video.videoWidth)), width = Math.max(1, Math.round(video.videoWidth * ratio)), height = Math.max(1, Math.round(video.videoHeight * ratio));
       if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
       renderer.draw(video, mode === "original" ? 0 : mode === "compare" ? 1 : 2, wipe); updateFrameLabel();
@@ -276,7 +339,7 @@ export default function HMBColorLUTLibraryWidget(container, props = {}) {
     else playbackFrame = raf(() => { playbackFrame = 0; if (disposed || token !== sourceRevision || video !== ownedVideo) return; queueDraw(); playLoop(); });
   };
   const clearVideo = () => {
-    sourceRevision++; stopLoop(); caf(drawFrame); drawFrame = 0;
+    sourceRevision++; stopLoop(); caf(drawFrame); drawFrame = 0; cancelPendingCube();
     for (const cleanup of videoCleanups.splice(0)) cleanup();
     if (video) { video.pause(); video.removeAttribute("src"); video.load(); video = null; }
     renderer?.clear(); updateFrameLabel();
@@ -337,14 +400,15 @@ export default function HMBColorLUTLibraryWidget(container, props = {}) {
     loadSource(); if (!video) q("[data-empty]").textContent = t.empty; else if (video.readyState < 2 && !video.error) q("[data-empty]").textContent = t.loading;
     updateFrameLabel(); queueDraw();
   };
-  const publish = () => {
+  const publish = (shotSelection = false) => {
     if (commitTimer) { win.clearTimeout(commitTimer); commitTimer = 0; }
     if (disposed) return false;
     pendingEdit = false; state.revision++; settingsCache.set(cacheKey(), copy(state.settings));
-    if (typeof latestProps.onChange !== "function") { say(textFor(state).transportError); return false; }
+    if (typeof latestProps.onChange !== "function") { if (shotSelection) pendingShot = null; say(textFor(state).transportError); return false; }
     const captured = copy(state);
-    try { Promise.resolve(latestProps.onChange(captured)).catch((error) => { if (!disposed) say(`${textFor(state).transportError}: ${error.message || error}`); }); return true; }
-    catch (error) { say(`${textFor(state).transportError}: ${error.message || error}`); return false; }
+    const shotRequest = shotSelection ? pendingShot : null;
+    try { Promise.resolve(latestProps.onChange(captured)).catch((error) => { if (!disposed) { if (shotRequest && pendingShot === shotRequest) pendingShot = null; say(`${textFor(state).transportError}: ${error.message || error}`); } }); return true; }
+    catch (error) { if (shotRequest && pendingShot === shotRequest) pendingShot = null; say(`${textFor(state).transportError}: ${error.message || error}`); return false; }
   };
   const scheduleCommit = () => { pendingEdit = true; if (commitTimer) win.clearTimeout(commitTimer); commitTimer = win.setTimeout(publish, 180); };
   const command = (action) => {
@@ -361,8 +425,13 @@ export default function HMBColorLUTLibraryWidget(container, props = {}) {
     } catch (error) { say(`${textFor(state).commandError}: ${error.message || error}`); }
   };
   const switchContext = (mutate) => {
-    if (pendingEdit) publish(); settingsCache.set(cacheKey(), copy(state.settings)); pause(); mutate();
-    state.settings = copy(settingsCache.get(cacheKey()) || hmbColorLUTSettings()); state.source = {}; state.result = {}; localMessage = ""; publish(); sync();
+    if (pendingEdit) publish(); settingsCache.set(cacheKey(), copy(state.settings)); pause();
+    const previousKey = shotKey(state);
+    mutate();
+    const blockedKeys = new Set(pendingShot?.blockedKeys || []);
+    blockedKeys.add(previousKey);
+    pendingShot = { targetKey: shotKey(state), blockedKeys };
+    state.settings = copy(settingsCache.get(cacheKey()) || hmbColorLUTSettings()); state.source = {}; state.result = {}; localMessage = ""; publish(true); sync();
   };
   bind(q("[data-shot-selector]"), "change", (event) => { const option = hmbColorLUTShotOptions(state).find((s) => s.key === event.target.value); if (option) switchContext(() => { state.shot = option.only ? onlyShot() : { channel_uuid: option.channel_uuid, shot_uuid: option.shot_uuid, number: option.number, name: option.name }; }); });
   bind(q("[data-profile-name]"), "change", (event) => { state.preset_name = clean(event.target.value, 80); publish(); sync(); });
@@ -392,13 +461,13 @@ export default function HMBColorLUTLibraryWidget(container, props = {}) {
   bind(q("[data-seek]"), "input", (event) => seekTo(finite(event.target.value)));
   bind(q("[data-step]"), "click", () => seekTo(Math.floor((video?.currentTime || lastSeek) * (state.source.fps || 24) + 0.001) + 1));
   bind(q("[data-play]"), "click", () => { if (!video) return; if (!video.paused) pause(); else { if (video.ended) video.currentTime = 0; const owned = video, token = sourceRevision; Promise.resolve(video.play()).then(() => { if (disposed || owned !== video || token !== sourceRevision) { owned.pause(); return; } updateFrameLabel(); playLoop(); }).catch((error) => { if (token === sourceRevision) say(error.message || error); }); } });
-  bind(doc, "visibilitychange", () => { if (doc.hidden) { pause(); caf(drawFrame); drawFrame = 0; } else queueDraw(); });
+  bind(doc, "visibilitychange", () => { if (doc.hidden) { pause(); caf(drawFrame); drawFrame = 0; cancelPendingCube(); } else queueDraw(); });
   bind(container, "pointerdown", (event) => { if (event.target?.closest?.("button,input,select,a")) event.stopPropagation?.(); });
   bind(container, "keydown", (event) => { if (["Backspace", "Delete"].includes(event.key) || event.target?.closest?.("button,input,select")) event.stopPropagation?.(); });
-  bind(canvas, "webglcontextlost", (event) => { event.preventDefault(); pause(); renderer?.dispose(); renderer = null; say(textFor(state).previewError); });
+  bind(canvas, "webglcontextlost", (event) => { event.preventDefault(); pause(); cancelPendingCube(); renderer?.dispose(); renderer = null; say(textFor(state).previewError); });
   bind(canvas, "webglcontextrestored", () => { try { renderer = createRenderer(canvas); cubeKey = ""; queueDraw(); } catch (error) { say(error.message || error); } });
   let observer = null;
-  if (typeof win.IntersectionObserver === "function") { observer = new win.IntersectionObserver((entries) => { visible = entries.some((entry) => entry.isIntersecting); if (!visible) { pause(); caf(drawFrame); drawFrame = 0; } else queueDraw(); }); observer.observe(container); }
+  if (typeof win.IntersectionObserver === "function") { observer = new win.IntersectionObserver((entries) => { visible = entries.some((entry) => entry.isIntersecting); if (!visible) { pause(); caf(drawFrame); drawFrame = 0; cancelPendingCube(); } else queueDraw(); }); observer.observe(container); }
   try { renderer = createRenderer(canvas); } catch (error) { say(`${textFor(state).previewError}: ${error.message || error}`); }
   const presetListId = `cl-presets-${Math.random().toString(36).slice(2)}`;
   q("[data-presets]").id = presetListId; q("[data-profile-name]").setAttribute("list", presetListId);
@@ -406,6 +475,27 @@ export default function HMBColorLUTLibraryWidget(container, props = {}) {
     update(nextProps = {}) {
       if (disposed) return;
       latestProps = nextProps; const incoming = hmbColorLUTState(nextProps), sameShot = incoming.shot.channel_uuid === state.shot.channel_uuid && incoming.shot.shot_uuid === state.shot.shot_uuid;
+      if (pendingShot) {
+        const incomingKey = shotKey(incoming);
+        if (incomingKey === pendingShot.targetKey) pendingShot = null;
+        else {
+          const targetAvailable = pendingShot.targetKey === HMB_COLOR_LUT_ONLY_SHOT_VALUE
+            || (incoming.shot_catalog.shots || []).some(
+              (shot) => `${incoming.shot_catalog.channel_uuid}\u001f${shot.shot_uuid}` === pendingShot.targetKey,
+            );
+          const catalogAdvanced = Number(incoming.shot_catalog.generation || 0) > Number(state.shot_catalog.generation || 0);
+          if (!targetAvailable && catalogAdvanced) {
+            pendingShot = null;
+            settingsCache.set(cacheKey(), copy(state.settings)); state = incoming; settingsCache.set(cacheKey(), copy(state.settings));
+            sync(); return;
+          }
+          if (pendingShot.blockedKeys.has(incomingKey)) {
+            if (catalogAdvanced) state.shot_catalog = incoming.shot_catalog;
+            sync(); return;
+          }
+          pendingShot = null;
+        }
+      }
       if (incoming.revision < state.revision || pendingEdit) {
         // Host echoes can arrive after a newer local drag/shot selection. Preserve authored data.
         if (sameShot && incoming.revision >= state.revision) { state.source = incoming.source; state.status = incoming.status; state.result = incoming.result; state.revision = incoming.revision; }
@@ -417,8 +507,9 @@ export default function HMBColorLUTLibraryWidget(container, props = {}) {
     cleanup() {
       if (disposed) return;
       if (pendingEdit) publish(); disposed = true;
+      pendingShot = null;
       if (commitTimer) win.clearTimeout(commitTimer); clearVideo(); observer?.disconnect();
-      for (const cleanup of cleanups.splice(0)) cleanup(); renderer?.dispose(); renderer = null; settingsCache.clear();
+      cancelPendingCube(); for (const cleanup of cleanups.splice(0)) cleanup(); renderer?.dispose(); renderer = null; settingsCache.clear(); cubeCache.clear();
       container.innerHTML = ""; container.classList?.remove("nodrag"); container.removeAttribute?.("data-hmb-node-delete-protected");
       if (container.__hmbColorLUTController === controller) delete container.__hmbColorLUTController;
     },

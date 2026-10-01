@@ -387,7 +387,11 @@ async def run():
 
     # A saved paid task survives the failed dependency even with empty outputs.
     existing = make_generator(source)
-    existing.checkpoint = {"task_id": "existing-paid-task", "task_identity": "broker_task", "status": "running", "stage": "accepted"}
+    existing.checkpoint = {
+        "task_id": "existing-paid-task", "task_identity": "broker_task",
+        "status": "running", "stage": "accepted",
+        "broker_server_url": seedance_module._broker_validated_server_url(),
+    }
     saved = copy.deepcopy(existing.checkpoint)
     await existing.aprocess()
     assert existing.checkpoint == saved

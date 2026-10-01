@@ -1436,6 +1436,8 @@ def _import_record(
     value: Any,
     index: int,
     resolved_embedded: Any = _IMPORT_EMBEDDED_UNSET,
+    *,
+    defer_thumbnail: bool = False,
 ) -> tuple[Dict[str, Any], Any] | None:
     media_value = value
     reference = ""
@@ -1565,7 +1567,7 @@ def _import_record(
     ).hexdigest()[:24]
     thumbnail_url = (
         _asset_thumbnail_url(thumbnail_path, source_uid)
-        if thumbnail_path is not None
+        if thumbnail_path is not None and not defer_thumbnail
         else ""
     )
     asset_id_base = re.sub(r"\s+", "_", image_name).strip("_") or f"Import_{index:02d}"
@@ -1618,6 +1620,8 @@ def _canonical_import_path(value: Any) -> str:
 def _normalize_import_input(
     value: Any,
     previous_assets: Sequence[Dict[str, Any]],
+    *,
+    defer_thumbnail: bool = False,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     previous = {
         _clean(asset.get("source_uid") or asset.get("asset_library_id")): asset
@@ -1665,7 +1669,12 @@ def _normalize_import_input(
                 f"{MAX_IMPORT_TOTAL_BYTES // (1024 * 1024)} MiB safety budget. "
                 "Raise HMB_IMAGE_IMPORT_TOTAL_BYTES for an approved larger batch."
             )
-        imported = _import_record(raw, index, resolved_embedded)
+        imported = _import_record(
+            raw,
+            index,
+            resolved_embedded,
+            defer_thumbnail=defer_thumbnail,
+        )
         if imported is None:
             continue
         record, media_value = imported
@@ -1675,6 +1684,14 @@ def _normalize_import_input(
         if prior_path is not None and record.get("media_ref_kind") == "path":
             record["source_uid"] = _clean(prior_path.get("source_uid")) or record["source_uid"]
             record["asset_library_id"] = record["source_uid"]
+            if defer_thumbnail and _thumbnail_url_is_live(
+                prior_path.get("media_signature"),
+                prior_path.get("thumbnail_url"),
+            ):
+                # Keep a loaded card painted while the new input snapshot is
+                # validated in the background. A failed recheck clears it.
+                record["media_signature"] = _clean(prior_path.get("media_signature"))
+                record["thumbnail_url"] = _clean(prior_path.get("thumbnail_url"))
         uid = record["source_uid"]
         if uid in seen:
             continue
@@ -5638,6 +5655,8 @@ def _merge_async_thumbnail_result_with_live_state(
 def _merge_import_input(
     state: Dict[str, Any],
     value: Any,
+    *,
+    defer_thumbnail: bool = False,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     normalized = _normalize_state(state)
     if not _flatten_import_values(value):
@@ -5645,6 +5664,7 @@ def _merge_import_input(
     imports, media_by_uid = _normalize_import_input(
         value,
         normalized["assets"],
+        defer_thumbnail=defer_thumbnail,
     )
     # IMAGE_IMPORT_IN is an authoritative ParameterList snapshot.  Preserve
     # verified project assets, but rebuild live external rows from the current
@@ -5711,6 +5731,77 @@ def _merge_import_input(
         normalized.get("scan_revision")
     ) + 1
     return _normalize_state(normalized), media_by_uid
+
+
+def _hydrate_live_import_thumbnails(
+    rows: Sequence[tuple[str, str]],
+    is_current: Callable[[], bool],
+) -> Dict[str, tuple[str, str, str]]:
+    """Decode path previews off-thread; never use these as media validation."""
+
+    results: Dict[str, tuple[str, str, str]] = {}
+    for uid, path_text in rows:
+        if not is_current():
+            break
+        signature = ""
+        url = ""
+        try:
+            path, _size, _mtime_ns, signature = _asset_file_facts(
+                Path(path_text)
+            )
+            url = _asset_thumbnail_url_for_media(path, uid, signature)
+            if url:
+                _resolved, _size, _mtime_ns, current_signature = (
+                    _asset_file_facts(path)
+                )
+            else:
+                current_signature = ""
+            if current_signature != signature:
+                signature = ""
+                url = ""
+        except Exception:
+            signature = ""
+            url = ""
+        results[uid] = (path_text, signature, url)
+    return results
+
+
+def _merge_live_import_thumbnail_result(
+    live_state: Dict[str, Any],
+    results: Dict[str, tuple[str, str, str]],
+) -> Dict[str, Any] | None:
+    """Patch presentation only for the same still-connected input path."""
+
+    merged = dict(live_state)
+    assets: List[Dict[str, Any]] = []
+    changed = False
+    for raw_asset in live_state.get("assets", []):
+        asset = dict(raw_asset)
+        uid = _clean(asset.get("source_uid"))
+        update = results.get(uid)
+        if (
+            update is not None
+            and _clean(asset.get("source_kind")) == "user"
+            and _non_negative_int(asset.get("import_index")) > 0
+            and _clean(asset.get("media_ref_kind")) == "path"
+            and _clean(asset.get("path")) == update[0]
+        ):
+            _path, signature, url = update
+            if (
+                _clean(asset.get("media_signature")) != signature
+                or _clean(asset.get("thumbnail_url")) != url
+            ):
+                asset["media_signature"] = signature
+                asset["thumbnail_url"] = url
+                changed = True
+        assets.append(asset)
+    if not changed:
+        return None
+    merged["assets"] = assets
+    merged["thumbnail_revision"] = (
+        _non_negative_int(live_state.get("thumbnail_revision")) + 1
+    )
+    return _normalize_state(merged)
 
 
 def _remove_live_imports(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -7742,6 +7833,16 @@ class HMBImageAssetLibrary(DataNode):
             str,
             Dict[str, Any],
         ] | None = None
+        self._hmb_import_thumbnail_lock = threading.RLock()
+        self._hmb_import_thumbnail_generation = 0
+        self._hmb_import_thumbnail_processing_generation = 0
+        self._hmb_import_thumbnail_active_workers = 0
+        self._hmb_import_thumbnail_queued_task: tuple[int, Callable[[], None]] | None = None
+        self._hmb_import_thumbnail_thread: threading.Thread | None = None
+        self._hmb_import_thumbnail_pending_result: tuple[
+            int,
+            Dict[str, tuple[str, str, str]],
+        ] | None = None
         self._hmb_catalog_probe_lock = threading.RLock()
         self._hmb_catalog_probe_generation = 0
         self._hmb_catalog_probe_pending_key = ""
@@ -9001,6 +9102,22 @@ class HMBImageAssetLibrary(DataNode):
         if not hasattr(self, "_hmb_node_deleted"):
             self._hmb_node_deleted = False
 
+    def _ensure_import_thumbnail_runtime_state(self) -> None:
+        if not hasattr(self, "_hmb_import_thumbnail_lock"):
+            self._hmb_import_thumbnail_lock = threading.RLock()
+        if not hasattr(self, "_hmb_import_thumbnail_generation"):
+            self._hmb_import_thumbnail_generation = 0
+        if not hasattr(self, "_hmb_import_thumbnail_processing_generation"):
+            self._hmb_import_thumbnail_processing_generation = 0
+        if not hasattr(self, "_hmb_import_thumbnail_active_workers"):
+            self._hmb_import_thumbnail_active_workers = 0
+        if not hasattr(self, "_hmb_import_thumbnail_queued_task"):
+            self._hmb_import_thumbnail_queued_task = None
+        if not hasattr(self, "_hmb_import_thumbnail_thread"):
+            self._hmb_import_thumbnail_thread = None
+        if not hasattr(self, "_hmb_import_thumbnail_pending_result"):
+            self._hmb_import_thumbnail_pending_result = None
+
     def _ensure_catalog_probe_runtime_state(self) -> None:
         if not hasattr(self, "_hmb_catalog_probe_lock"):
             self._hmb_catalog_probe_lock = threading.RLock()
@@ -10076,6 +10193,202 @@ class HMBImageAssetLibrary(DataNode):
             failure_state=previous,
         )
 
+    def _consume_pending_import_thumbnail_result(self) -> bool:
+        """Apply a path preview only from the retained-mode callback thread."""
+
+        self._ensure_import_thumbnail_runtime_state()
+        with self._hmb_import_thumbnail_lock:
+            pending = self._hmb_import_thumbnail_pending_result
+            if pending is None:
+                return False
+            generation, results = pending
+            if generation != self._hmb_import_thumbnail_generation:
+                self._hmb_import_thumbnail_pending_result = None
+                return False
+            if self._hmb_import_thumbnail_processing_generation == generation:
+                return False
+            if not self._scan_owner_is_current():
+                self._hmb_import_thumbnail_pending_result = None
+                self._hmb_import_thumbnail_thread = None
+                return False
+            self._hmb_import_thumbnail_processing_generation = generation
+        completed = False
+        try:
+            merged = _merge_live_import_thumbnail_result(
+                self._current_state(), results,
+            )
+            with self._hmb_import_thumbnail_lock:
+                if (
+                    generation != self._hmb_import_thumbnail_generation
+                    or not self._scan_owner_is_current()
+                ):
+                    return False
+            if merged is not None:
+                self._publish_state(merged, normalized=True)
+            completed = True
+            return True
+        except Exception as exc:
+            _diagnostic_exception(
+                "Imported image preview publication failed", exc,
+            )
+            return False
+        finally:
+            with self._hmb_import_thumbnail_lock:
+                if self._hmb_import_thumbnail_processing_generation == generation:
+                    self._hmb_import_thumbnail_processing_generation = 0
+                if completed and generation == self._hmb_import_thumbnail_generation:
+                    self._hmb_import_thumbnail_pending_result = None
+                    self._hmb_import_thumbnail_thread = None
+
+    def _schedule_live_import_thumbnail_hydration(
+        self, state: Dict[str, Any],
+    ) -> None:
+        """Keep validated media immediate while decoding path previews later."""
+
+        self._ensure_import_thumbnail_runtime_state()
+        rows = [
+            (_clean(asset.get("source_uid")), _clean(asset.get("path")))
+            for asset in state.get("assets", [])
+            if isinstance(asset, dict)
+            and _clean(asset.get("source_kind")) == "user"
+            and _non_negative_int(asset.get("import_index")) > 0
+            and _clean(asset.get("media_ref_kind")) == "path"
+            and _clean(asset.get("source_uid"))
+            and _clean(asset.get("path"))
+        ]
+        with self._hmb_import_thumbnail_lock:
+            self._hmb_import_thumbnail_generation += 1
+            self._hmb_import_thumbnail_processing_generation = 0
+            generation = self._hmb_import_thumbnail_generation
+            self._hmb_import_thumbnail_pending_result = None
+            self._hmb_import_thumbnail_queued_task = None
+        if not rows:
+            return
+        node_ref = weakref.ref(self)
+        host_context = contextvars.copy_context()
+
+        def active_loop() -> Any:
+            try:
+                loop = asyncio.get_running_loop()
+                if loop.is_running() and not loop.is_closed():
+                    return loop
+            except RuntimeError:
+                pass
+            except Exception:
+                pass
+            try:
+                from griptape_nodes.retained_mode.engine import has_current_engine  # type: ignore
+                from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes  # type: ignore
+
+                if has_current_engine():
+                    loop = GriptapeNodes.EventManager().event_loop
+                    if loop.is_running() and not loop.is_closed():
+                        return loop
+            except Exception:
+                pass
+            return None
+
+        event_loop = active_loop()
+
+        def is_current() -> bool:
+            owner = node_ref()
+            if owner is None:
+                return False
+            with owner._hmb_import_thumbnail_lock:
+                return (
+                    generation == owner._hmb_import_thumbnail_generation
+                    and owner._scan_owner_is_current()
+                )
+
+        def run_once() -> None:
+            results = _hydrate_live_import_thumbnails(rows, is_current)
+            owner = node_ref()
+            if owner is None or not is_current():
+                return
+            with owner._hmb_import_thumbnail_lock:
+                if generation != owner._hmb_import_thumbnail_generation:
+                    return
+                owner._hmb_import_thumbnail_pending_result = (
+                    generation, results,
+                )
+            loop = host_context.copy().run(active_loop) or event_loop
+            if loop is not None:
+                try:
+                    try:
+                        loop.call_soon_threadsafe(
+                            owner._consume_pending_import_thumbnail_result,
+                            context=host_context.copy(),
+                        )
+                    except TypeError:
+                        loop.call_soon_threadsafe(
+                            host_context.copy().run,
+                            owner._consume_pending_import_thumbnail_result,
+                        )
+                except Exception as exc:
+                    _diagnostic_warning(
+                        "Imported image preview callback queue unavailable", exc,
+                    )
+            # With no running host loop, the next retained-mode callback or
+            # process() consumes the saved completion on its own thread.
+
+        def worker() -> None:
+            task: Callable[[], None] | None = run_once
+            released = False
+            try:
+                while task is not None:
+                    try:
+                        task()
+                    except Exception as exc:
+                        _diagnostic_exception(
+                            "Imported image preview worker failed", exc,
+                        )
+                    owner = node_ref()
+                    if owner is None:
+                        return
+                    with owner._hmb_import_thumbnail_lock:
+                        queued = owner._hmb_import_thumbnail_queued_task
+                        if queued and queued[0] == owner._hmb_import_thumbnail_generation:
+                            task = queued[1]
+                            owner._hmb_import_thumbnail_queued_task = None
+                        else:
+                            owner._hmb_import_thumbnail_active_workers = max(
+                                0, owner._hmb_import_thumbnail_active_workers - 1,
+                            )
+                            released = True
+                            return
+            finally:
+                owner = node_ref()
+                if owner is not None and not released:
+                    with owner._hmb_import_thumbnail_lock:
+                        owner._hmb_import_thumbnail_active_workers = max(
+                            0, owner._hmb_import_thumbnail_active_workers - 1,
+                        )
+
+        thread = threading.Thread(
+            target=worker,
+            name=f"HMBImageImportPreview-{generation}",
+            daemon=True,
+        )
+        with self._hmb_import_thumbnail_lock:
+            if generation != self._hmb_import_thumbnail_generation:
+                return
+            if self._hmb_import_thumbnail_active_workers >= 2:
+                # Keep only the newest pending input. An older blocked decoder
+                # must not create an unbounded thread for every rapid edit.
+                self._hmb_import_thumbnail_queued_task = (generation, run_once)
+                return
+            self._hmb_import_thumbnail_active_workers += 1
+            self._hmb_import_thumbnail_thread = thread
+            try:
+                thread.start()
+            except Exception as exc:
+                self._hmb_import_thumbnail_active_workers = max(
+                    0, self._hmb_import_thumbnail_active_workers - 1,
+                )
+                if generation == self._hmb_import_thumbnail_generation:
+                    self._hmb_import_thumbnail_thread = None
+                _diagnostic_warning("Imported image preview worker unavailable", exc)
+
     def _apply_import_value(self, value: Any) -> Dict[str, Any]:
         state = self._current_state()
         input_identity = _canonical_import_input_identity(value)
@@ -10089,12 +10402,16 @@ class HMBImageAssetLibrary(DataNode):
         if not _flatten_import_values(value):
             self._replace_import_media({})
             published = self._publish_state(_remove_live_imports(state))
+            self._schedule_live_import_thumbnail_hydration(published)
             self._hmb_last_applied_import_identity = input_identity
             return published
         try:
-            state, media_by_uid = _merge_import_input(state, value)
+            state, media_by_uid = _merge_import_input(
+                state, value, defer_thumbnail=True,
+            )
             self._replace_import_media(media_by_uid)
             published = self._publish_state(state)
+            self._schedule_live_import_thumbnail_hydration(published)
             # A non-empty aggregate that normalized to no concrete media is an
             # incomplete/unsupported host snapshot. Never latch it as success.
             if media_by_uid:
@@ -10113,10 +10430,14 @@ class HMBImageAssetLibrary(DataNode):
     def _merge_captured_imports_into_scan(
         state: Dict[str, Any],
         import_value: Any,
+        *,
+        defer_thumbnail: bool = False,
     ) -> tuple[Dict[str, Any], Dict[str, Any] | None]:
         if not _flatten_import_values(import_value):
             return state, None
-        merged, media_by_uid = _merge_import_input(state, import_value)
+        merged, media_by_uid = _merge_import_input(
+            state, import_value, defer_thumbnail=defer_thumbnail,
+        )
         return merged, media_by_uid
 
     def _compute_manifest_poll(
@@ -10818,6 +11139,7 @@ class HMBImageAssetLibrary(DataNode):
             _diagnostic_exception("Parent after_value_set failed", exc)
         if self._hmb_state_syncing or self._hmb_thumbnail_bridge_syncing:
             return result
+        self._consume_pending_import_thumbnail_result()
         name = _clean(getattr(parameter, "name", ""))
         if name in {
             PROJECT_ROOT_PARAMETER,
@@ -10947,6 +11269,7 @@ class HMBImageAssetLibrary(DataNode):
         self._ensure_parameters()
         self._ensure_scan_runtime_state()
         self._ensure_thumbnail_runtime_state()
+        self._ensure_import_thumbnail_runtime_state()
         self._ensure_catalog_probe_runtime_state()
         with self._hmb_scan_lock:
             # Constructor/initial-scan workers belong to the pre-hydration
@@ -10961,6 +11284,12 @@ class HMBImageAssetLibrary(DataNode):
             self._hmb_thumbnail_pending_result = None
             self._hmb_thumbnail_thread = None
             self._hmb_thumbnail_queued_bridge_request = None
+        with self._hmb_import_thumbnail_lock:
+            self._hmb_import_thumbnail_generation += 1
+            self._hmb_import_thumbnail_processing_generation = 0
+            self._hmb_import_thumbnail_queued_task = None
+            self._hmb_import_thumbnail_pending_result = None
+            self._hmb_import_thumbnail_thread = None
         with self._hmb_catalog_probe_lock:
             self._hmb_catalog_probe_generation += 1
             self._hmb_catalog_probe_pending_key = ""
@@ -11022,10 +11351,12 @@ class HMBImageAssetLibrary(DataNode):
             indexed_state, indexed_media = self._merge_captured_imports_into_scan(
                 indexed_state,
                 import_value,
+                defer_thumbnail=True,
             )
             if isinstance(indexed_media, dict):
                 self._replace_import_media(indexed_media)
-            self._publish_state(indexed_state)
+            indexed_state = self._publish_state(indexed_state)
+            self._schedule_live_import_thumbnail_hydration(indexed_state)
         else:
             self._schedule_catalog_scan(
                 (
@@ -11063,6 +11394,7 @@ class HMBImageAssetLibrary(DataNode):
                 )
         self._ensure_scan_runtime_state()
         self._ensure_thumbnail_runtime_state()
+        self._ensure_import_thumbnail_runtime_state()
         first_delete = not bool(getattr(self, "_hmb_node_deleted", False))
         if first_delete:
             self._hmb_node_deleted = True
@@ -11092,6 +11424,12 @@ class HMBImageAssetLibrary(DataNode):
                 self._hmb_thumbnail_pending_result = None
                 self._hmb_thumbnail_thread = None
                 self._hmb_thumbnail_queued_bridge_request = None
+            with self._hmb_import_thumbnail_lock:
+                self._hmb_import_thumbnail_generation += 1
+                self._hmb_import_thumbnail_processing_generation = 0
+                self._hmb_import_thumbnail_queued_task = None
+                self._hmb_import_thumbnail_pending_result = None
+                self._hmb_import_thumbnail_thread = None
             with self._hmb_catalog_probe_lock:
                 self._hmb_catalog_probe_generation += 1
                 self._hmb_catalog_probe_pending_key = ""
@@ -11123,6 +11461,11 @@ class HMBImageAssetLibrary(DataNode):
         self._hmb_hydration_adopted = True
         self._consume_pending_catalog_scan_result()
         self._consume_pending_thumbnail_result()
+        import_thumbnail_consumer = getattr(
+            self, "_consume_pending_import_thumbnail_result", None,
+        )
+        if callable(import_thumbnail_consumer):
+            import_thumbnail_consumer()
         probe_consumer = getattr(self, "_consume_pending_catalog_probe_result", None)
         if callable(probe_consumer):
             probe_consumer()

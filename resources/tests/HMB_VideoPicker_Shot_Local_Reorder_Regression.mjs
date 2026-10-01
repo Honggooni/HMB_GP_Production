@@ -337,4 +337,26 @@ function dragEvent(target) {
   cleanup();
 }
 
+// High-frequency dragover events on one card only change the marker once.
+{
+  const cards = [new Card("video-c", 1), new Card("video-a", 2), new Card("video-b", 3)];
+  const container = new Container(cards);
+  let targetAdds = 0;
+  let targetRemoves = 0;
+  const add = cards[0].classList.add.bind(cards[0].classList);
+  const remove = cards[0].classList.remove.bind(cards[0].classList);
+  cards[0].classList.add = (...names) => { if (names.includes("drop-target")) targetAdds += 1; add(...names); };
+  cards[0].classList.remove = (...names) => { if (names.includes("drop-target")) targetRemoves += 1; remove(...names); };
+  const cleanup = widget.hmbInstallVideoAssetDragReorder(container, {
+    currentState: shotLocalState,
+  });
+  container.dispatch("dragstart", dragEvent(cards[2]));
+  for (let index = 0; index < 100; index += 1) container.dispatch("dragover", dragEvent(cards[0]));
+  assert.equal(targetAdds, 1);
+  assert.equal(targetRemoves, 0);
+  container.dispatch("dragleave", { target: container, relatedTarget: null });
+  assert.equal(targetRemoves, 1);
+  cleanup();
+}
+
 console.log("HMB VideoPicker Shot-local reorder regression: PASS");

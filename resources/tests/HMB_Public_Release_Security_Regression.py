@@ -46,6 +46,7 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
     "widgets/HMBVideoPickerLibraryWidget_v032.js",
     "resources/maya/HMB_Maya_Background_Preview.py",
+    "resources/blender/HMB_Blender_Background_Preview.py",
     "resources/picker/HMB_Marker_Catalog.json",
     "resources/agent/hmb_agent_core.dat",
 )

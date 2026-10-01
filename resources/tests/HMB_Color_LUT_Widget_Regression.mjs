@@ -55,6 +55,22 @@ for (const key of widget.HMB_COLOR_LUT_CONTROLS) {
 assert.deepEqual(widget.hmbColorLUTTransform([0.2, 0.5, 0.8], { ...defaults.settings, exposure: 3 }), [0.2, 0.5, 0.8]);
 const grade = { enabled: true, exposure: 1, temperature: -2, contrast: 2, saturation: 1, shadows: 2, highlights: -1 };
 const cube = widget.hmbColorLUTCube(grade);
+const cubeJobs = new Map(); let nextCubeJob = 1, completedCube = null;
+const enqueueCube = (fn) => { const id = nextCubeJob++; cubeJobs.set(id, fn); return id; };
+const cancelCube = (id) => cubeJobs.delete(id);
+widget.hmbColorLUTCubeChunked(grade, enqueueCube, cancelCube, (value) => { completedCube = value; }, 33, 1024);
+assert.equal(completedCube, null, "LUT recalculation must yield before working on a slider frame.");
+while (cubeJobs.size) { const [id, fn] = cubeJobs.entries().next().value; cubeJobs.delete(id); fn(); }
+assert.deepEqual(completedCube, cube, "Chunked preview must preserve every exported LUT vertex.");
+const originalPixels = Uint8ClampedArray.from([21, 53, 101, 255, 188, 172, 99, 255, 0, 255, 134, 255]);
+const expectedPixels = Uint8ClampedArray.from(originalPixels);
+for (let i = 0; i < expectedPixels.length; i += 4) {
+  if ((i / 4) % 3 < 1.5) continue;
+  const rgb = widget.hmbColorLUTSample(cube, [expectedPixels[i] / 255, expectedPixels[i + 1] / 255, expectedPixels[i + 2] / 255]);
+  for (let c = 0; c < 3; c++) expectedPixels[i + c] = Math.round(rgb[c] * 255);
+}
+assert.deepEqual(widget.hmbColorLUTGradePixels(Uint8ClampedArray.from(originalPixels), 3, cube, 1, .5), expectedPixels,
+  "Allocation-free 2D fallback must preserve the compare wipe and pixel results.");
 for (const [r, g, b] of [[0, 0, 0], [7, 12, 20], [32, 32, 32]]) {
   const offset = ((b * 33 + g) * 33 + r) * 3;
   near(Array.from(cube.slice(offset, offset + 3)), widget.hmbColorLUTTransform([r / 32, g / 32, b / 32], grade));
@@ -183,6 +199,22 @@ assert.equal(ui.publications.at(-1).shot.shot_uuid, "shot-5"); assert.equal(ui.q
 assert.equal(ui.container.mounts, 1);
 assert.equal(widget.default(ui.container, ui.props(ui.publications.at(-1))), ui.controller, "Host repeated mount must reuse the controller.");
 ui.controller.cleanup(); assert.equal(ui.frames.size, 0); assert.equal(ui.timers.size, 0); assert.equal(ui.container.__hmbColorLUTController, undefined);
+const dragUI = harness({ ...bound, settings: grade });
+dragUI.videos[0].ready(); dragUI.flushFrames();
+const firstPreview = dragUI.draws.length;
+dragUI.q('[data-adjust="temperature"]').value = "2"; dragUI.q('[data-adjust="temperature"]').dispatch("input"); dragUI.flushFrames();
+assert.equal(dragUI.draws.length, firstPreview + 1, "Slider movement paints immediately while LUT recalculation yields.");
+dragUI.q('[data-adjust="temperature"]').value = "3"; dragUI.q('[data-adjust="temperature"]').dispatch("input"); dragUI.flushFrames();
+assert.equal(dragUI.timers.size, 2, "Rapid drag retains only one pending LUT job and one debounced publication.");
+dragUI.controller.cleanup(); assert.equal(dragUI.timers.size, 0, "Unmount cancels LUT work and commits the final authored value.");
+const reboundUI = harness({ ...bound, settings: grade });
+reboundUI.videos[0].ready(); reboundUI.flushFrames();
+reboundUI.q('[data-adjust="temperature"]').value = "2"; reboundUI.q('[data-adjust="temperature"]').dispatch("input"); reboundUI.flushFrames();
+const staleCubeStep = [...reboundUI.timers.values()].at(-1);
+reboundUI.q('[data-adjust="temperature"]').value = "-8"; reboundUI.q('[data-adjust="temperature"]').dispatch("input"); reboundUI.flushFrames();
+staleCubeStep();
+assert.equal(reboundUI.frames.size, 0, "A stale LUT task cannot repaint after A → B → A drag reversal.");
+reboundUI.controller.cleanup();
 const legacyUI = harness({...bound, settings:{enabled:true,exposure:1,contrast:-2,temperature:3}});
 assert.equal(legacyUI.q('[data-adjust="exposure"]').value, '4');
 assert.equal(legacyUI.q('[data-adjust="contrast"]').value, '-8');

@@ -844,6 +844,28 @@ assert.deepEqual(
   "Persisted User-folder assets hydrate, while live/unpersisted IMAGE_IMPORT_IN rows do not.",
 );
 assert.equal(new Set(thumbnailWindowIds).size, thumbnailWindowIds.length);
+const backfillState = assetWidget.hmbNormalizeImageAssetState({
+  project_uid: "thumbnail-backfill-project",
+  manifest_signature: "thumbnail-backfill-manifest",
+  scan_revision: 1,
+  assets: Array.from({ length: 130 }, (_value, index) => selectableAsset(
+    `thumbnail-backfill-${index}`,
+  )),
+});
+const attemptedBackfillIds = new Set(Array.from(
+  { length: 64 },
+  (_value, index) => `thumbnail-backfill-${index}`,
+));
+assert.deepEqual(
+  assetWidget.hmbImageAssetThumbnailRequestIds(
+    backfillState,
+    60,
+    0,
+    { excludeIds: attemptedBackfillIds },
+  ),
+  Array.from({ length: 64 }, (_value, index) => `thumbnail-backfill-${index + 64}`),
+  "Already attempted thumbnails must be excluded before the 64-item batch limit.",
+);
 const thumbnailPlaceholderMarkup = assetWidget.hmbRenderImageAssetGrid(
   thumbnailWindowState,
 ).markup;
@@ -1500,6 +1522,49 @@ try {
     ),
     false,
     "A failed asset is attempted once per scan context instead of looping while idle.",
+  );
+  const allFailedContainer = {
+    __hmbImageAssetLatestState: backfillState,
+    __hmbImageAssetRenderLimit: 60,
+    __hmbImageAssetRenderOffset: 0,
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  const backfillPublished = [];
+  const backfillProps = {
+    onChange(value) { backfillPublished.push(JSON.parse(value)); },
+  };
+  assert.equal(assetWidget.hmbScheduleImageAssetThumbnailRequest(
+    allFailedContainer, backfillState, backfillProps,
+  ), true);
+  flushStagedAfterPaint();
+  const failedFirstBatch = backfillPublished[0].thumbnail_request;
+  assert.deepEqual(failedFirstBatch.asset_library_ids, Array.from(
+    { length: 64 }, (_value, index) => `thumbnail-backfill-${index}`,
+  ));
+  const afterFailure = assetWidget.hmbNormalizeImageAssetState({
+    ...backfillPublished[0],
+    thumbnail_request: {},
+    thumbnail_busy: false,
+    thumbnail_revision: 1,
+    thumbnail_result: {
+      request_id: failedFirstBatch.request_id,
+      project_uid: failedFirstBatch.project_uid,
+      manifest_signature: failedFirstBatch.manifest_signature,
+      scan_revision: failedFirstBatch.scan_revision,
+      completed_asset_library_ids: [],
+      failed_asset_library_ids: failedFirstBatch.asset_library_ids,
+    },
+  });
+  allFailedContainer.__hmbImageAssetLatestState = afterFailure;
+  delete allFailedContainer.__hmbImageAssetThumbnailPendingRequestId;
+  assert.equal(assetWidget.hmbScheduleImageAssetThumbnailRequest(
+    allFailedContainer, afterFailure, backfillProps,
+  ), true, "A failed first batch must not prevent the catalog tail from loading.");
+  flushStagedAfterPaint();
+  assert.deepEqual(
+    backfillPublished[1].thumbnail_request.asset_library_ids,
+    Array.from({ length: 64 }, (_value, index) => `thumbnail-backfill-${index + 64}`),
   );
   assert.equal(
     assetWidget.hmbScheduleImageAssetThumbnailRequest(

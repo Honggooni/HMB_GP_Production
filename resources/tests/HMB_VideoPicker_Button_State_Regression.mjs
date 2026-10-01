@@ -153,6 +153,22 @@ assert.equal(result.readEnabled, true);
 assert.equal(result.playblastEnabled, false);
 assert.equal(result.stopEnabled, false);
 
+const blenderPath = "C:/shots/scissors.blend";
+result = buttons({
+  ...base,
+  maya_available: false,
+  maya_executable: "",
+  blender_available: true,
+  blender_executable: "C:/Program Files/Blender Foundation/Blender/blender.exe",
+}, blenderPath);
+assert.equal(result.readEnabled, true, "Blender READ uses its own engine in the shared Picker UI.");
+result = buttons({
+  ...base,
+  blender_available: false,
+  blender_executable: "",
+}, blenderPath);
+assert.equal(result.readEnabled, false, "A Blender file cannot be sent to Maya when Blender is unavailable.");
+
 const readComplete = {
   ...base,
   status: "OUTLINER_READY",

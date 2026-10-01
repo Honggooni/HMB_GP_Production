@@ -576,7 +576,7 @@ try {
 }
 assert.match(
   source,
-  /const remount = \(nextState = null\) => \{[\s\S]*?hmbCapturePromptControlFocus\(container\);[\s\S]*?hmbRestoreSourceScroll\(container\);[\s\S]*?hmbRestorePromptControlFocus\(container\);/,
+  /const remount = \(nextState = null, stateIsNormalized = false\) => \{[\s\S]*?hmbCapturePromptControlFocus\(container\);[\s\S]*?hmbRestoreSourceScroll\(container\);[\s\S]*?hmbRestorePromptControlFocus\(container\);/,
   "Immediate structural remounts must preserve source scrolling and keyboard focus.",
 );
 assert.match(
@@ -668,7 +668,16 @@ function expectedParseDiagnostic(sourceName, text, errorOffset) {
 // diagnostic schema as Python without retaining any raw path/body.
 const legacyPickerOne = malformedHmb("PICKER_IN", "one", 10_000);
 const legacyPickerLatest = malformedHmb("PICKER_IN", "two", 9_000);
+const legacyBlenderPicker = malformedHmb("PICKER_IN", "blender", 1_000)
+  .replace('"mode":"maya"', '"mode":"blender"');
 const legacyImage = malformedHmb("IMAGE_ASSET_IN", "one", 8_000);
+const compactBlenderRaw = widget.normalizeState({
+  source_intent_fallbacks: [
+    { source: "PICKER_IN", reason: "readable non-JSON connected input", text: legacyBlenderPicker },
+  ],
+});
+assert.equal(compactBlenderRaw.source_intent_fallbacks[0].kind, "parse_diagnostic");
+assert.equal(JSON.stringify(compactBlenderRaw).includes(legacyBlenderPicker), false);
 const exactHumanWhitespace = `  사용자가 직접 작성한 의도\n${"장면 설명 🧭 ".repeat(20_000)}END  `;
 const compactMixed = widget.normalizeState({
   source_intent_fallbacks: [

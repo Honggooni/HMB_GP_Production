@@ -674,10 +674,49 @@ function hmbSetStatus(container, message, tone = "neutral") {
   return true;
 }
 
+export function hmbCaptureFinishLookView(container) {
+  const scroll = container?.querySelector?.(".hmb-finish-look__scroll");
+  const active = container?.ownerDocument?.activeElement
+    || (typeof document !== "undefined" ? document.activeElement : null);
+  const focusKeys = ["data-finish-step", "data-enable", "data-shot-selector", "data-language-toggle"];
+  let focus = null;
+  if (active && container?.contains?.(active)) {
+    for (const key of focusKeys) {
+      if (active.hasAttribute?.(key)) {
+        focus = { key, value: active.getAttribute(key) };
+        break;
+      }
+    }
+  }
+  return scroll ? { top: scroll.scrollTop, left: scroll.scrollLeft, focus } : { focus };
+}
+
+export function hmbRestoreFinishLookView(container, view) {
+  if (!container || !view) return;
+  if (view.focus) {
+    const { key, value } = view.focus;
+    const candidate = Array.from(container.querySelectorAll?.(`[${key}]`) || [])
+      .find((control) => control.getAttribute?.(key) === value);
+    if (candidate && !candidate.disabled) {
+      try { candidate.focus?.({ preventScroll: true }); }
+      catch (_error) { candidate.focus?.(); }
+    }
+  }
+  const scroll = container.querySelector?.(".hmb-finish-look__scroll");
+  if (scroll && Number.isFinite(view.top) && Number.isFinite(view.left)) {
+    scroll.scrollTop = view.top;
+    scroll.scrollLeft = view.left;
+  }
+}
+
+function hmbFinishLookShotKey(state) {
+  return state?.shot?.shot_uuid
+    ? `${state.shot.channel_uuid}\u001f${state.shot.shot_uuid}` : HMB_FINISH_LOOK_ONLY_SHOT_VALUE;
+}
+
 export default function HMBFinishLookLibraryWidget(container, props) {
   if (!container) return { cleanup() {}, update() {} };
   const incoming = props || container.__hmbFinishLookLatestProps || {};
-  container.__hmbFinishLookLatestProps = incoming;
   if (typeof container.__hmbFinishLookCleanupProxy !== "function") {
     container.__hmbFinishLookCleanupProxy = () => container.__hmbFinishLookCleanup?.();
   }
@@ -693,6 +732,8 @@ export default function HMBFinishLookLibraryWidget(container, props) {
   let disposed = false;
   let listenerCleanups = [];
   let publicationOwner = 0;
+  let pendingShot = null;
+  container.__hmbFinishLookLatestProps = incoming;
 
   const clearListeners = () => {
     for (const cleanup of listenerCleanups.splice(0)) {
@@ -708,15 +749,18 @@ export default function HMBFinishLookLibraryWidget(container, props) {
 
   const remount = () => {
     if (disposed) return;
+    const view = hmbCaptureFinishLookView(container);
     clearListeners();
     container.innerHTML = hmbRenderFinishLookWidget(state);
     container.classList?.add("nodrag");
     container.setAttribute?.("data-hmb-node-delete-protected", "true");
     installInteractions();
+    hmbRestoreFinishLookView(container, view);
   };
 
   const rollback = (previous, owner, error) => {
     if (disposed || owner !== publicationOwner) return;
+    pendingShot = null;
     state = previous;
     remount();
     hmbSetStatus(container, String(error?.message || error || "Publication failed."), "error");
@@ -732,6 +776,7 @@ export default function HMBFinishLookLibraryWidget(container, props) {
     const payload = hmbFinishLookPublication(state);
     let result;
     try { result = liveProps.onChange(payload); } catch (error) { rollback(previous, owner, error); return false; }
+    if (owner !== publicationOwner) return true;
     const persisted = hmbFinishLookPublication(state);
     container.__hmbFinishLookLatestProps = {
       ...liveProps,
@@ -763,12 +808,16 @@ export default function HMBFinishLookLibraryWidget(container, props) {
         return;
       }
       const previous = cloneState();
+      const previousKey = hmbFinishLookShotKey(state);
       state.shot = option.only ? hmbFinishLookOnlyShot() : {
         channel_uuid: option.channel_uuid,
         shot_uuid: option.shot_uuid,
         number: option.number,
         name: option.name,
       };
+      const blockedKeys = new Set(pendingShot?.blockedKeys || []);
+      blockedKeys.add(previousKey);
+      pendingShot = { targetKey: hmbFinishLookShotKey(state), blockedKeys };
       hmbApplyFinishLookShotFeedback(container, state);
       publish(previous, false);
     });
@@ -822,9 +871,34 @@ export default function HMBFinishLookLibraryWidget(container, props) {
 
   container.__hmbFinishLookApplyProps = (nextProps = {}) => {
     if (disposed) return;
+    const nextState = hmbNormalizeFinishLookWidgetValue(nextProps);
+    if (pendingShot && nextProps !== container.__hmbFinishLookLatestProps) {
+      const incomingKey = hmbFinishLookShotKey(nextState);
+      if (incomingKey === pendingShot.targetKey) pendingShot = null;
+      else {
+        const catalogOlder = nextState.shot_catalog.channel_uuid === state.shot_catalog.channel_uuid
+          && Number(nextState.shot_catalog.generation || 0) < Number(state.shot_catalog.generation || 0);
+        const catalog = catalogOlder ? state.shot_catalog : nextState.shot_catalog;
+        const targetAvailable = pendingShot.targetKey === HMB_FINISH_LOOK_ONLY_SHOT_VALUE
+          || (catalog.shots || []).some(
+            (shot) => `${catalog.channel_uuid}\u001f${shot.shot_uuid}` === pendingShot.targetKey,
+          );
+        if (targetAvailable && pendingShot.blockedKeys.has(incomingKey)) {
+          const retained = hmbFinishLookPublication(state);
+          container.__hmbFinishLookLatestProps = {
+            ...nextProps, value: retained, parameterValue: retained, defaultValue: retained,
+          };
+          if (nextState.remote_connected && !state.remote_connected) {
+            state.remote_connected = true;
+            remount();
+          }
+          return;
+        }
+        pendingShot = null;
+      }
+    }
     publicationOwner += 1;
     const previousFingerprint = hmbFinishLookNonShotStateFingerprint(state);
-    const nextState = hmbNormalizeFinishLookWidgetValue(nextProps);
     container.__hmbFinishLookLatestProps = nextProps;
     state = nextState;
     const authoredUnchanged = previousFingerprint === hmbFinishLookNonShotStateFingerprint(nextState);
@@ -836,6 +910,7 @@ export default function HMBFinishLookLibraryWidget(container, props) {
   const cleanup = () => {
     disposed = true;
     publicationOwner += 1;
+    pendingShot = null;
     clearListeners();
     container.removeAttribute?.("data-hmb-node-delete-protected");
     container.classList?.remove("nodrag");

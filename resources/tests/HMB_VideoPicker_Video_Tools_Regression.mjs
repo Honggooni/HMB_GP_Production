@@ -37,6 +37,20 @@ assert.deepEqual(echoed.video_tools_by_shot, second.video_tools_by_shot);
 assert.equal(echoed.video_tools_status.progress, 0.5);
 assert.equal(picker.hmbPreservePickerToolDrafts({ runtime_instance_id: "new" }, second).video_tools_by_shot, undefined);
 assert.deepEqual(picker.hmbNormalizePickerVideoToolsByShot(JSON.parse(JSON.stringify(second.video_tools_by_shot))), second.video_tools_by_shot);
+const cropDraft = picker.hmbUpdatePickerVideoTools(second, (tools) => { tools.active_tool = "crop"; });
+const olderEqualToolRevision = {
+  ...cropDraft,
+  state_revision: 19,
+  state_published_at_ms: 190,
+  video_tools_by_shot: {
+    ...cropDraft.video_tools_by_shot,
+    [shotB]: { ...cropDraft.video_tools_by_shot[shotB], active_tool: "concatenate" },
+  },
+};
+const newerLocalCrop = { ...cropDraft, state_revision: 20, state_published_at_ms: 200 };
+assert.equal(picker.hmbPreservePickerToolDrafts(olderEqualToolRevision, newerLocalCrop).video_tools_by_shot[shotB].active_tool, "crop");
+assert.equal(picker.hmbPreservePickerToolDrafts({ ...olderEqualToolRevision, state_revision: 21 }, newerLocalCrop).video_tools_by_shot[shotB].active_tool, "concatenate",
+  "A newer authoritative response may still change the tab.");
 
 // An 800x600 player letterboxes a 1920x1080 source into 800x450 at y=75.
 const geometry = picker.hmbPickerCropContainGeometry({ left: 100, top: 50, width: 800, height: 600 }, 1920, 1080);

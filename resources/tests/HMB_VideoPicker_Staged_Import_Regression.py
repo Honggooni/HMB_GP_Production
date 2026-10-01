@@ -189,4 +189,36 @@ stale["video_imports"] = failed
 fresh._write_state(stale)
 assert "video_imports" not in fresh._picker_state()
 assert not errors, errors
+
+# One multi-file ready commit publishes the cards first, then batches poster
+# enrichment while preserving exact Shot ownership and catalog order.
+batch_node, batch_shot, _ = node_state()
+poster_writes = []
+original_write_state = batch_node._write_state
+
+
+def count_poster_writes(value):
+    poster_writes.append(copy.deepcopy(value))
+    original_write_state(value)
+
+
+batch_node._write_state = count_poster_writes
+with patch.object(batch_node, "_import_video_asset", side_effect=record), \
+        patch.object(picker, "_resolved_video_asset_path", side_effect=lambda item: Path(item["video_path"])), \
+        patch.object(picker, "_video_thumbnail_signature", side_effect=lambda path: Path(path).stem), \
+        patch.object(picker, "_video_asset_thumbnail_url", side_effect=lambda path, _uid: (f"poster://{Path(path).stem}", Path(path).stem)):
+    batch_node._commit_ready_video_import_sources(
+        [{"source_path": f"C:/batch-{index}.mp4", "label": f"Batch {index}"} for index in range(5)],
+        captured_picker_shot_uuid=batch_shot,
+        action_id="poster-batch",
+    )
+batch_state = batch_node._picker_state()
+assert len(poster_writes) == 3, "Five posters need one card publication and two poster batches."
+assert len(batch_state["videos"]) == 5
+assert all(item["picker_shot_uuid"] == batch_shot for item in batch_state["videos"])
+assert [item["thumbnail_url"] for item in batch_state["videos"]] == [
+    f"poster://batch-{index}" for index in range(5)
+]
+assert [item["video_uid"] for item in batch_state["videos"]] == \
+    batch_state["picker_shots"][0]["video_asset_uids"]
 print("PASS: staged imports paint before blocked I/O, publish incrementally, release UI locks, preserve Shot identity, cancel queued/ready entries, isolate failures/retry and discard deleted Shot/node results.")

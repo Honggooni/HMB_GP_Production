@@ -377,12 +377,12 @@ assert.ok(transportDiagnostics.length >= 3, "Transport failures must remain diag
 
 assert.match(
   source,
-  /const dirtyText = hmbPromptDirtyTextEntries\(container\);[\s\S]*?if \(dirtyText\.length\) \{\s*nextState = hmbMergePromptDirtyTextState\(nextState, dirtyText\);\s*\}[\s\S]*?state = nextState;[\s\S]*?if \(shotRegionOnly\)[\s\S]*?else \{\s*remount\(\);\s*\}[\s\S]*?if \(dirtyText\.length \|\| shouldRepublishRevisionMerge\) \{\s*hmbScheduleImmediateStateCommit/,
+  /const dirtyText = hmbPromptDirtyTextEntries\(container\);[\s\S]*?if \(dirtyText\.length\) \{\s*nextState = hmbMergePromptDirtyTextState\(nextState, dirtyText\);\s*\}[\s\S]*?state = normalizedNextState;[\s\S]*?if \(shotRegionOnly\)[\s\S]*?else \{\s*remount\(null, !hadUncommittedText\);\s*\}[\s\S]*?if \(dirtyText\.length \|\| shouldRepublishRevisionMerge\) \{\s*hmbScheduleImmediateStateCommit/,
   "External props must merge unresolved text and rearm its trailing commit against the authoritative state.",
 );
 assert.match(
   source,
-  /const remount = \(nextState = null\) => \{[\s\S]*?const compositionWasActive = Boolean\([\s\S]*?if \(dashboardMounted\) \{[\s\S]*?const dynamicMarkup = render\(state, false\);[\s\S]*?if \(!hmbPatchPromptDashboard\(container, dynamicMarkup\)\) \{\s*container\.innerHTML = hmbPromptFullDashboardMarkup\(state\);\s*\}[\s\S]*?if \(\s*compositionWasActive[\s\S]*?\) hmbReleasePromptCompositionLatch\(container\);/,
+  /const remount = \(nextState = null, stateIsNormalized = false\) => \{[\s\S]*?const compositionWasActive = Boolean\([\s\S]*?if \(dashboardMounted\) \{[\s\S]*?const dynamicMarkup = render\(state, false\);[\s\S]*?if \(!hmbPatchPromptDashboard\(container, dynamicMarkup\)\) \{\s*container\.innerHTML = hmbPromptFullDashboardMarkup\(state\);\s*\}[\s\S]*?if \(\s*compositionWasActive[\s\S]*?\) hmbReleasePromptCompositionLatch\(container\);/,
   "A remount must patch first and release composition only when the composing control was replaced.",
 );
 assert.match(

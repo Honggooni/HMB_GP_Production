@@ -781,7 +781,8 @@ assert "HMBVideoPickerLibraryWidget(container, {" not in widget_source
 assert "emit(props, state);\n          remount();" not in prompt_widget_source
 assert "emit(props, state, container);\n        remount();" not in prompt_widget_source
 assert 'state.ui.language = uiLanguage(state) === "ko" ? "en" : "ko";' in prompt_widget_source
-assert prompt_widget_source.count("remount();") == 2
+assert prompt_widget_source.count("remount();") == 1  # Initial mount only.
+assert prompt_widget_source.count("remount(null, !hadUncommittedText);") == 1
 assert "hmbCommitLocalPromptStructure(container, props, state, remount)" in prompt_widget_source
 assert "if (currentValue === nextValue && !disabledChanged) {" in prompt_widget_source
 assert "if (dirtyText.length || shouldRepublishRevisionMerge) {" in prompt_widget_source
@@ -794,7 +795,9 @@ assert "Pending operation cancelled before an external process PID existed." in 
 assert "READ request submitted through HMB_PICKER_COMMAND. Waiting for Python acknowledgement." in widget_source
 assert "READ transport timed out before Python acknowledgement (20 seconds)." in widget_source
 assert "export function pickerButtonAvailability" in widget_source
-assert "const mayaAvailable = Boolean(state.maya_available && clean(state.maya_executable));" in widget_source
+assert "const blenderScene = /\\.blend$/i.test(draftPath);" in widget_source
+assert "? Boolean(state.blender_available && clean(state.blender_executable))" in widget_source
+assert ": Boolean(state.maya_available && clean(state.maya_executable));" in widget_source
 assert "stopEnabled: (operationBusy || !!localReadPending || !!localOriginalPending) && !stopping" in widget_source
 assert "const HMB_PICKER_CONTENT_FALLBACK_HEIGHT = 960;" in widget_source
 assert ".hmbvp-clip{width:100%;height:100%;" in widget_source

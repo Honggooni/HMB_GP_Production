@@ -254,6 +254,7 @@ export function hmbImageCustomTargetInstructionVisible(item) {
 const VIDEO_MAIN_TYPES = [
   "Select Video Main Type",
   "Maya Preview / Playblast",
+  "Blender Preview / Render",
   "Motion Reference",
   "Scene / Look Reference",
   "FX Reference",
@@ -262,6 +263,7 @@ const VIDEO_MAIN_TYPES = [
 
 const VIDEO_SUB_TYPES = Object.freeze({
   "Maya Preview / Playblast": ["Original Preview", "Mask", "Depth", "Motion Guide", "Timing / Edit"],
+  "Blender Preview / Render": ["Original Preview", "Mask", "Depth", "Motion Guide", "Timing / Edit"],
   "Motion Reference": ["Local Motion", "Secondary Motion", "Layout Reference"],
   "Scene / Look Reference": ["Camera / Layout", "Lighting / Look", "Composition"],
   "FX Reference": ["FX Effect Only"],
@@ -274,6 +276,11 @@ const VIDEO_TAXONOMY_WIRE_MAP = Object.freeze({
   "Maya Preview / Playblast\u0000Depth": ["Depth / Spatial Reference", "Spatial Alignment Verification Only"],
   "Maya Preview / Playblast\u0000Motion Guide": ["Motion Guide / Retargeting Reference", "Derived Motion Decoding Only"],
   "Maya Preview / Playblast\u0000Timing / Edit": ["Timing / Edit Reference", "Timing Only"],
+  "Blender Preview / Render\u0000Original Preview": ["Unified Shot-Control Video", "Primary Unified Shot Control"],
+  "Blender Preview / Render\u0000Mask": ["Mask / Control Reference", "Mask / Guide Only"],
+  "Blender Preview / Render\u0000Depth": ["Depth / Spatial Reference", "Spatial Alignment Verification Only"],
+  "Blender Preview / Render\u0000Motion Guide": ["Motion Guide / Retargeting Reference", "Derived Motion Decoding Only"],
+  "Blender Preview / Render\u0000Timing / Edit": ["Timing / Edit Reference", "Timing Only"],
   "Motion Reference\u0000Local Motion": ["Motion Reference", "Local Motion Detail Only"],
   "Motion Reference\u0000Secondary Motion": ["Motion Reference", "Secondary Motion Only"],
   "Motion Reference\u0000Layout Reference": ["Motion Reference", "Camera / Layout Preserved; Free Character Motion"],
@@ -472,6 +479,7 @@ const HMB_OPTION_KO = {
   "Custom scope": "사용자 지정 범위",
   "Role Required / Select Video Type": "비디오 유형 선택 (선택 사항)",
   "Maya Preview / Playblast": "Maya 프리뷰 / 플레이블라스트",
+  "Blender Preview / Render": "Blender 프리뷰 / 렌더",
   "Unified Shot-Control Video": "통합 샷 제어 비디오",
   "Motion Reference": "모션 참조",
   "Camera / Layout Reference": "카메라 / 레이아웃 참조",
@@ -824,24 +832,25 @@ function normalizePickerAutoMotionGuide(value) {
 function normalizePickerMotionGuideSummary(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const profile = clean(value.profile);
-  if (profile !== "hmb_target_neutral_motion_guide_v5") return {};
+  if (!["hmb_target_neutral_motion_guide_v5", "hmb_blender_motion_guide_v1"].includes(profile)) return {};
+  const blenderGuide = profile === "hmb_blender_motion_guide_v1";
   const count = (field) => Math.max(0, Math.floor(Number(value[field]) || 0));
   const allowedGroups = new Set(["brow", "eyelid", "mouth", "jaw"]);
   return {
     profile,
-    semantic_face: Boolean(value.semantic_face),
-    target_count: count("target_count"),
-    channel_count: count("channel_count"),
-    driver_count: count("driver_count"),
-    landmark_count: count("landmark_count"),
-    rasterized_sample_count: count("rasterized_sample_count"),
-    hidden_or_occluded_sample_count: count("hidden_or_occluded_sample_count"),
-    semantic_groups: uniqueList(
+    semantic_face: !blenderGuide && Boolean(value.semantic_face),
+    target_count: blenderGuide ? 0 : count("target_count"),
+    channel_count: blenderGuide ? 0 : count("channel_count"),
+    driver_count: blenderGuide ? 0 : count("driver_count"),
+    landmark_count: blenderGuide ? 0 : count("landmark_count"),
+    rasterized_sample_count: blenderGuide ? 0 : count("rasterized_sample_count"),
+    hidden_or_occluded_sample_count: blenderGuide ? 0 : count("hidden_or_occluded_sample_count"),
+    semantic_groups: blenderGuide ? [] : uniqueList(
       (Array.isArray(value.semantic_groups) ? value.semantic_groups : [])
         .map(clean)
         .filter((group) => allowedGroups.has(group)),
     ).sort(),
-    final_blendshape_values_in_sidecar: Boolean(
+    final_blendshape_values_in_sidecar: !blenderGuide && Boolean(
       value.final_blendshape_values_in_sidecar,
     ),
     raw_curve_geometry_rendered: false,
@@ -996,7 +1005,7 @@ const LEGACY_MACHINE_PREFIX_CHARS = 4096;
 const SOURCE_MACHINE_SIGNATURES = Object.freeze({
   PICKER_IN: Object.freeze({
     schema: "hmb-prompt-library-picker-binding",
-    mode: "maya",
+    modes: ["maya", "blender"],
   }),
   IMAGE_ASSET_IN: Object.freeze({
     schema: "hmb-image-asset-library-binding",
@@ -1178,7 +1187,8 @@ function hmbLegacyMachineRaw(source, reason, text) {
   if (!prefix.startsWith("{")) return false;
   const quoted = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`(?:^|[,{])\\s*"schema"\\s*:\\s*"${quoted(signature.schema)}"`).test(prefix)
-    && new RegExp(`(?:^|[,{])\\s*"mode"\\s*:\\s*"${quoted(signature.mode)}"`).test(prefix);
+    && (signature.modes || [signature.mode]).some((mode) =>
+      new RegExp(`(?:^|[,{])\\s*"mode"\\s*:\\s*"${quoted(mode)}"`).test(prefix));
 }
 
 function hmbPythonInteger(value) {
@@ -2115,10 +2125,11 @@ function migrateVideo(item, slot) {
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "_")
       .replace(/^_+|_+$/g, "");
-    if (mediaKind === "maya_depth_playblast" || Object.keys(out.picker_auto_depth).length) {
+    if (["maya_depth_playblast", "blender_depth_render"].includes(mediaKind)
+      || Object.keys(out.picker_auto_depth).length) {
       companionKind = "depth";
     } else if (
-      mediaKind === "maya_motion_guide"
+      ["maya_motion_guide", "blender_motion_guide"].includes(mediaKind)
       || Object.keys(out.picker_auto_motion_guide).length
     ) {
       companionKind = "motion_guide";
@@ -3625,6 +3636,9 @@ function hmbRestorePromptControlFocus(container) {
     target = group ? [...group.querySelectorAll(HMB_PROMPT_FOCUSABLE_SELECTOR)][memory.index] || null : null;
   }
   if (!target || target.disabled || target.hidden) return;
+  // A retained select may still have its native option popup open. Focusing
+  // that same node again can dismiss the popup before the user picks an item.
+  if (target.ownerDocument?.activeElement === target) return;
   try { target.focus({ preventScroll: true }); } catch (_error) { try { target.focus(); } catch (__error) {} }
 }
 
@@ -4832,7 +4846,9 @@ export function hmbConsumePendingPromptStateEcho(container, nextProps, currentSt
   let incoming = "";
   let incomingState = null;
   try {
-    incomingState = normalizeState(parseValue(nextProps.value));
+    // parseValue already returns a canonical state. A second normalization
+    // walks every image/video row again on each retained-mode props update.
+    incomingState = parseValue(nextProps.value);
     incoming = JSON.stringify(incomingState);
   } catch (_error) {
     return false;
@@ -5988,12 +6004,16 @@ export function hmbPatchPromptShotSelector(container, state) {
     if (!option && ownerDocument?.createElement) option = ownerDocument.createElement("option");
     if (!option) return;
     retained.add(item.value);
-    option.value = item.value;
-    option.textContent = hmbPromptShotOptionLabel(item);
-    option.selected = Boolean(item.selected);
-    option.setAttribute?.("value", item.value);
-    if (item.only) option.removeAttribute?.("data-shot-number");
-    else option.setAttribute?.("data-shot-number", String(item.number));
+    const label = hmbPromptShotOptionLabel(item);
+    if (option.value !== item.value) option.value = item.value;
+    if (option.textContent !== label) option.textContent = label;
+    if (option.selected !== Boolean(item.selected)) option.selected = Boolean(item.selected);
+    if (option.getAttribute?.("value") !== item.value) option.setAttribute?.("value", item.value);
+    if (item.only) {
+      if (option.hasAttribute?.("data-shot-number")) option.removeAttribute?.("data-shot-number");
+    } else if (option.getAttribute?.("data-shot-number") !== String(item.number)) {
+      option.setAttribute?.("data-shot-number", String(item.number));
+    }
     const ordered = hmbPromptShotOptionNodes(selector);
     const currentAtIndex = ordered[desiredIndex] || null;
     if (currentAtIndex !== option) {
@@ -6009,11 +6029,14 @@ export function hmbPatchPromptShotSelector(container, state) {
   });
 
   const selected = desired.find((item) => item.selected) || desired[0];
-  selector.value = selected?.value || HMB_PROMPT_ONLY_SHOT_VALUE;
+  const selectedValue = selected?.value || HMB_PROMPT_ONLY_SHOT_VALUE;
+  if (selector.value !== selectedValue) selector.value = selectedValue;
   const hasRemote = desired.length > 1;
-  selector.disabled = !hasRemote || Boolean(state?.disabled);
-  if (selector.disabled) selector.setAttribute?.("disabled", "");
-  else selector.removeAttribute?.("disabled");
+  const shouldDisable = !hasRemote || Boolean(state?.disabled);
+  if (selector.disabled !== shouldDisable) selector.disabled = shouldDisable;
+  if (shouldDisable) {
+    if (!selector.hasAttribute?.("disabled")) selector.setAttribute?.("disabled", "");
+  } else if (selector.hasAttribute?.("disabled")) selector.removeAttribute?.("disabled");
 
   const shell = selector.closest?.(".shot-selector-shell")
     || container?.querySelector?.(".shot-selector-shell");
@@ -6023,7 +6046,7 @@ export function hmbPatchPromptShotSelector(container, state) {
       remoteStatus = ownerDocument.createElement("i");
       shell?.appendChild?.(remoteStatus);
     }
-    if (remoteStatus) remoteStatus.textContent = "REMOTE";
+    if (remoteStatus && remoteStatus.textContent !== "REMOTE") remoteStatus.textContent = "REMOTE";
   } else {
     remoteStatus?.remove?.();
   }
@@ -7172,11 +7195,29 @@ export function hmbImageDropTargetIndex(sourceIndex, hoverIndex, placeAfter, ima
   return Math.max(0, Math.min(count - 1, target));
 }
 
-function hmbClearImageDragIndicators(container) {
+export function hmbClearImageDragIndicators(container) {
   if (!container) return;
-  container.querySelectorAll?.(".source-row.image").forEach((row) => {
-    row.classList?.remove("image-row-dragging", "image-drop-before", "image-drop-after");
-  });
+  const active = container.__hmbPromptImageDragIndicators;
+  active?.source?.classList?.remove("image-row-dragging");
+  active?.hover?.classList?.remove("image-drop-before", "image-drop-after");
+  delete container.__hmbPromptImageDragIndicators;
+}
+
+export function hmbUpdateImageDragIndicators(container, row, sourceIndex, after) {
+  let indicator = container?.__hmbPromptImageDragIndicators;
+  if (!indicator || indicator.sourceIndex !== sourceIndex) {
+    hmbClearImageDragIndicators(container);
+    const sourceRow = container?.querySelector?.(`.source-row.image[data-index="${sourceIndex}"]`);
+    sourceRow?.classList?.add("image-row-dragging");
+    indicator = { source: sourceRow, hover: null, after: false, sourceIndex };
+    container.__hmbPromptImageDragIndicators = indicator;
+  }
+  if (indicator.hover === row && indicator.after === after) return false;
+  indicator.hover?.classList?.remove("image-drop-before", "image-drop-after");
+  row?.classList?.add(after ? "image-drop-after" : "image-drop-before");
+  indicator.hover = row;
+  indicator.after = after;
+  return true;
 }
 
 function hmbSyncSourceRowActivation(row) {
@@ -7187,7 +7228,7 @@ function hmbSyncSourceRowActivation(row) {
     if (control === nameInput) return;
     if (!control.hasAttribute("data-hmb-base-disabled")) control.setAttribute("data-hmb-base-disabled", control.disabled ? "1" : "0");
     const baseDisabled = control.getAttribute("data-hmb-base-disabled") === "1";
-    control.disabled = baseDisabled;
+    if (control.disabled !== baseDisabled) control.disabled = baseDisabled;
   });
 }
 
@@ -7208,15 +7249,30 @@ function hmbCopyPromptElementAttributes(target, source) {
   });
 }
 
-// Retain only the active editor path while adopting every authoritative
-// sibling. This prevents a focused label/textarea (or active IME session) from
-// making its whole source row or text group stale.
+// Retain only the active control path while adopting every authoritative
+// sibling. This keeps a focused label/textarea (or active IME session) and an
+// open native select mounted without making its whole row or group stale.
+function hmbIsRetainedPromptControl(element) {
+  return hmbIsEditableTextControl(element)
+    || Boolean(element?.matches?.("select"));
+}
+
 function hmbPromptEditablePatchKey(element) {
-  if (!hmbIsEditableTextControl(element)) return "";
+  if (!hmbIsRetainedPromptControl(element)) return "";
+  if (element.matches?.("[data-shot-selector]")) return "shot-selector";
   const textKey = element.getAttribute?.("data-text-key") || "";
   if (textKey) return `text:${textKey}`;
   const row = element.closest?.(".source-row") || null;
   const sourceKey = row?.getAttribute?.("data-source-key") || "";
+  if (element.matches?.("select")) {
+    return [
+      "select", sourceKey || row?.getAttribute?.("data-index") || "",
+      row?.getAttribute?.("data-kind") || "",
+      element.getAttribute?.("data-field") || "",
+      element.getAttribute?.("data-binding-index") || "",
+      element.getAttribute?.("data-color-index") || "",
+    ].join(":");
+  }
   return [
     "source", sourceKey,
     row?.getAttribute?.("data-kind") || "",
@@ -7231,7 +7287,7 @@ function hmbPromptEditableDescendants(root) {
   const found = [];
   const visit = (node) => {
     if (!node) return;
-    if (hmbIsEditableTextControl(node)) found.push(node);
+    if (hmbIsRetainedPromptControl(node)) found.push(node);
     Array.from(node.childNodes || []).forEach(visit);
   };
   visit(root);
@@ -7262,6 +7318,7 @@ export function hmbPatchPromptElementTree(current, next, activeEditor = null) {
 
   const patchAnchored = (currentNode, nextNode) => {
     const protectsActiveEditor = currentNode === activeEditor;
+    const protectsOpenSelect = protectsActiveEditor && currentNode.matches?.("select");
     const value = protectsActiveEditor && "value" in currentNode ? currentNode.value : undefined;
     const selectionStart = protectsActiveEditor && Number.isFinite(Number(currentNode.selectionStart))
       ? Number(currentNode.selectionStart) : null;
@@ -7269,7 +7326,12 @@ export function hmbPatchPromptElementTree(current, next, activeEditor = null) {
       ? Number(currentNode.selectionEnd) : null;
     const selectionDirection = protectsActiveEditor
       ? (currentNode.selectionDirection || "none") : "none";
-    hmbCopyPromptElementAttributes(currentNode, nextNode);
+    // Keep a native select and its options untouched until the pending choice
+    // completes. Replacing option nodes or writing unchanged attributes can
+    // close Chromium's native popup even when the select itself stays mounted.
+    if (!protectsOpenSelect || Boolean(currentNode.disabled) !== Boolean(nextNode.disabled)) {
+      hmbCopyPromptElementAttributes(currentNode, nextNode);
+    }
     if (protectsActiveEditor) {
       if (value !== undefined && currentNode.value !== value) currentNode.value = value;
       if (
@@ -7352,7 +7414,7 @@ export function hmbPatchPromptSourceSection(currentSection, nextSection) {
       row = nextRow;
     } else {
       const preserveActiveEditor = Boolean(
-        hmbIsEditableTextControl(row.ownerDocument?.activeElement)
+        hmbIsRetainedPromptControl(row.ownerDocument?.activeElement)
         && row.contains?.(row.ownerDocument.activeElement)
       );
       const contentChanged = typeof row.isEqualNode === "function"
@@ -7431,7 +7493,14 @@ export function hmbPatchPromptDashboard(container, markup) {
   const currentTopbar = currentRoot.querySelector?.(".topbar");
   const nextTopbar = nextRoot.querySelector?.(".topbar");
   if (currentTopbar && nextTopbar && currentTopbar.innerHTML !== nextTopbar.innerHTML) {
-    currentTopbar.innerHTML = nextTopbar.innerHTML;
+    const active = currentTopbar.ownerDocument?.activeElement;
+    if (
+      active?.matches?.("select")
+      && currentTopbar.contains?.(active)
+      && hmbPatchPromptElementTree(currentTopbar, nextTopbar, active)
+    ) {
+      // The Shot dropdown remains open across an unrelated topbar repaint.
+    } else currentTopbar.innerHTML = nextTopbar.innerHTML;
   }
 
   const currentSections = new Map(
@@ -7564,7 +7633,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
   hmbApplyDashboardHostSizing(container, state);
   let discoveryRequested = false;
   let renderRevision = 0;
-  const remount = (nextState = null) => {
+  const remount = (nextState = null, stateIsNormalized = false) => {
     const ownRenderRevision = ++renderRevision;
     if (nextState && typeof nextState === "object") {
       const normalizedNextState = hmbMergeStoredGroupHeights(container, normalizeState(nextState));
@@ -7588,7 +7657,10 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
     for (const [el, event, handler, options] of listeners.splice(0)) {
       try { el.removeEventListener(event, handler, options); } catch (_e) {}
     }
-    state = hmbMergeStoredGroupHeights(container, normalizeState(state));
+    state = hmbMergeStoredGroupHeights(
+      container,
+      stateIsNormalized ? state : normalizeState(state),
+    );
     const dashboardMounted = Boolean(
       container.querySelector?.(".hmb-dashboard-clip .hmb-dashboard")
       || container.querySelector?.(".hmb-dashboard"),
@@ -7889,8 +7961,10 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
           return;
         }
         hmbCaptureSourceScroll(container);
+        hmbClearImageDragIndicators(container);
         container.__hmbPromptImageDragIndex = sourceIndex;
         row?.classList?.add("image-row-dragging");
+        container.__hmbPromptImageDragIndicators = { source: row, hover: null, after: false, sourceIndex };
         try {
           event.dataTransfer.effectAllowed = "move";
           event.dataTransfer.setData("text/plain", String(sourceIndex));
@@ -7934,10 +8008,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
         event.preventDefault();
         event.stopPropagation();
         try { event.dataTransfer.dropEffect = "move"; } catch (_error) {}
-        hmbClearImageDragIndicators(container);
-        const sourceRow = container.querySelector(`.source-row.image[data-index="${sourceIndex}"]`);
-        sourceRow?.classList?.add("image-row-dragging");
-        row.classList.add(dropPosition(event) ? "image-drop-after" : "image-drop-before");
+        hmbUpdateImageDragIndicators(container, row, sourceIndex, dropPosition(event));
       };
       const drop = (event) => {
         if (state?.image_asset?.enabled && state?.image_asset?.order_managed) return;
@@ -8224,11 +8295,12 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
     nextState.disabled = Boolean(nextProps?.disabled);
     nextState.ui = nextState.ui && typeof nextState.ui === "object" ? nextState.ui : defaultUi();
     hmbReconcilePromptSourceIdentities(state, nextState);
-    // Normalize each side exactly once. The same canonical objects feed both
-    // equality and Shot-region classification, avoiding two additional full
-    // image/video state walks without changing comparison semantics.
+    // parseValue, revision merging, and dirty-text merging each return a
+    // canonical state; the two UI helpers above only adjust normalized UI
+    // heights and non-serializable row identities. Reuse that state for both
+    // equality and Shot-region classification.
     const normalizedCurrentState = normalizeState(state);
-    const normalizedNextState = normalizeState(nextState);
+    const normalizedNextState = nextState;
     const currentValue = JSON.stringify(normalizedCurrentState);
     const nextValue = JSON.stringify(normalizedNextState);
     const disabledChanged = Boolean(state.disabled) !== Boolean(nextState.disabled);
@@ -8244,7 +8316,8 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
       }
       return;
     }
-    state = nextState;
+    state = normalizedNextState;
+    state.disabled = Boolean(nextProps?.disabled);
     const pendingInteraction = container.__hmbPromptLibraryInteractionCommit;
     if (pendingInteraction && !pendingInteraction.cancelled) {
       if (revisionMergedState) {
@@ -8269,7 +8342,7 @@ export default function HMBPromptLibraryScopedBindingWidget(container, props) {
       );
       try { container.__hmbPromptLastPaintedValue = JSON.stringify(state); } catch (_e) {}
     } else {
-      remount();
+      remount(null, !hadUncommittedText);
     }
     if (dirtyText.length || shouldRepublishRevisionMerge) {
       hmbScheduleImmediateStateCommit(container, props, state);

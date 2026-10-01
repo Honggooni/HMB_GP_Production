@@ -295,6 +295,38 @@ function hmbRefreshAgentDashboard(container, props) {
   return true;
 }
 
+function hmbAgentShotKey(state) {
+  return state?.shot?.shot_uuid
+    ? `${state.shot.channel_uuid}\u001f${state.shot.shot_uuid}` : "__hmb_only__";
+}
+
+function hmbAgentResolveShotEcho(container, incomingProps) {
+  const pending = container.__hmbAgentPendingShot;
+  if (!pending || incomingProps === container.__hmbAgentLatestProps) return { props: incomingProps, stale: false };
+  const incoming = hmbAgentState(incomingProps);
+  const selected = hmbAgentState(container.__hmbAgentLatestProps);
+  const catalogOlder = incoming.shot_catalog.channel_uuid === selected.shot_catalog.channel_uuid
+    && Number(incoming.shot_catalog.generation || 0) < Number(selected.shot_catalog.generation || 0);
+  const catalog = catalogOlder ? selected.shot_catalog : incoming.shot_catalog;
+  const incomingKey = hmbAgentShotKey(incoming);
+  if (incomingKey === pending.targetKey) {
+    delete container.__hmbAgentPendingShot;
+    return { props: incomingProps, stale: false };
+  }
+  const targetAvailable = pending.targetKey === "__hmb_only__" || (catalog.shots || []).some(
+    (shot) => `${catalog.channel_uuid}\u001f${shot.shot_uuid}` === pending.targetKey,
+  );
+  if (!targetAvailable || !pending.blockedKeys.has(incomingKey)) {
+    delete container.__hmbAgentPendingShot;
+    return { props: incomingProps, stale: false };
+  }
+  const retained = { ...incoming, shot_catalog: catalog, shot: selected.shot };
+  return {
+    props: { ...incomingProps, value: retained, parameterValue: retained, defaultValue: retained },
+    stale: true,
+  };
+}
+
 export function hmbPrepareAgentCanvasGestures(container) {
   if (!container) return;
   // The widget surface must not drag the node itself, but it must not retain
@@ -352,13 +384,15 @@ export default function HMBAgentLibraryWidget(container, props) {
   // Keep callbacks/state pointed at the newest props instead of the first
   // mount's closure.
   const incomingProps = props || container.__hmbAgentLatestProps || {};
-  if (container.__hmbAgentLatestProps && incomingProps !== container.__hmbAgentLatestProps) {
+  const resolved = hmbAgentResolveShotEcho(container, incomingProps);
+  if (!resolved.stale && container.__hmbAgentLatestProps && incomingProps !== container.__hmbAgentLatestProps) {
     container.__hmbAgentShotChangeOwner = Math.max(
       0,
       Number(container.__hmbAgentShotChangeOwner) || 0,
     ) + 1;
   }
-  container.__hmbAgentLatestProps = incomingProps;
+  container.__hmbAgentLatestProps = resolved.props;
+  props = resolved.props;
   if (typeof container.__hmbAgentCleanupProxy !== "function") {
     container.__hmbAgentCleanupProxy = () => {
       const currentCleanup = container.__hmbAgentCleanup;
@@ -369,15 +403,17 @@ export default function HMBAgentLibraryWidget(container, props) {
   // Griptape can invoke the widget factory again for an ordinary value or
   // selection refresh. Keep the mounted dashboard intact so the host never
   // observes the former cleanup -> empty container -> rebuild sequence.
-  if (typeof previousCleanup === "function" && hmbRefreshAgentDashboard(container, props)) {
+  if (typeof previousCleanup === "function" && hmbRefreshAgentDashboard(container, resolved.props)) {
     return {
       cleanup: container.__hmbAgentCleanupProxy,
       update(nextProps) {
-        container.__hmbAgentShotChangeOwner = Math.max(0, Number(container.__hmbAgentShotChangeOwner) || 0) + 1;
-        props = nextProps || props || {};
-        container.__hmbAgentLatestProps = props;
-        if (!hmbRefreshAgentDashboard(container, props)) {
-          HMBAgentLibraryWidget(container, props);
+        const incoming = nextProps || container.__hmbAgentLatestProps || {};
+        const next = hmbAgentResolveShotEcho(container, incoming);
+        if (!next.stale) container.__hmbAgentShotChangeOwner = Math.max(0, Number(container.__hmbAgentShotChangeOwner) || 0) + 1;
+        props = next.props;
+        container.__hmbAgentLatestProps = next.props;
+        if (!hmbRefreshAgentDashboard(container, next.props)) {
+          HMBAgentLibraryWidget(container, next.props);
         }
       },
     };
@@ -430,6 +466,10 @@ export default function HMBAgentLibraryWidget(container, props) {
     };
     const owner = Math.max(0, Number(container.__hmbAgentShotChangeOwner) || 0) + 1;
     container.__hmbAgentShotChangeOwner = owner;
+    const previousKey = hmbAgentShotKey(hmbAgentState(liveProps));
+    const blockedKeys = new Set(container.__hmbAgentPendingShot?.blockedKeys || []);
+    blockedKeys.add(previousKey);
+    container.__hmbAgentPendingShot = { targetKey: hmbAgentShotKey(next), blockedKeys };
     const optimisticProps = { ...liveProps, value: next, parameterValue: next, defaultValue: next };
     const accept = () => {
       if (!ownsLifecycle() || container.__hmbAgentShotChangeOwner !== owner) return false;
@@ -441,12 +481,14 @@ export default function HMBAgentLibraryWidget(container, props) {
     };
     const rollback = (error) => {
       if (!ownsLifecycle() || container.__hmbAgentShotChangeOwner !== owner) return false;
+      delete container.__hmbAgentPendingShot;
       props = previousProps;
       container.__hmbAgentLatestProps = previousProps;
       container.__hmbAgentShotChangeError = String(error?.message || error || "Shot selection publication failed");
       hmbRefreshAgentDashboard(container, previousProps);
       return true;
     };
+    accept();
     let result;
     try {
       result = liveProps.onChange(next);
@@ -454,7 +496,6 @@ export default function HMBAgentLibraryWidget(container, props) {
       rollback(error);
       return;
     }
-    accept();
     if (result && typeof result.then === "function") {
       Promise.resolve(result).catch(rollback);
     }
@@ -498,6 +539,7 @@ export default function HMBAgentLibraryWidget(container, props) {
       delete container.__hmbAgentCleanup;
     }
     delete container.__hmbAgentLatestProps;
+    delete container.__hmbAgentPendingShot;
     // Preserve monotonic ownership across a real cleanup/remount. Deleting
     // this counter allowed a replacement mount to reuse an old pending
     // request's owner value.
@@ -512,11 +554,13 @@ export default function HMBAgentLibraryWidget(container, props) {
   return {
     cleanup: container.__hmbAgentCleanupProxy,
     update(nextProps) {
-      container.__hmbAgentShotChangeOwner = Math.max(0, Number(container.__hmbAgentShotChangeOwner) || 0) + 1;
-      props = nextProps || props || {};
-      container.__hmbAgentLatestProps = props;
-      if (!hmbRefreshAgentDashboard(container, props)) {
-        HMBAgentLibraryWidget(container, props);
+      const incoming = nextProps || container.__hmbAgentLatestProps || {};
+      const next = hmbAgentResolveShotEcho(container, incoming);
+      if (!next.stale) container.__hmbAgentShotChangeOwner = Math.max(0, Number(container.__hmbAgentShotChangeOwner) || 0) + 1;
+      props = next.props;
+      container.__hmbAgentLatestProps = next.props;
+      if (!hmbRefreshAgentDashboard(container, next.props)) {
+        HMBAgentLibraryWidget(container, next.props);
       }
     },
   };

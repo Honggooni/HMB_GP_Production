@@ -1009,6 +1009,8 @@ class HMBFinishLookLibrary(DataNode):
         self._hmb_finish_snapshot_generation = 0
         self._hmb_finish_snapshot_fingerprint = ""
         self._hmb_finish_snapshot_live_fingerprint = ""
+        self._hmb_finish_live_values: dict[str, Any] = {}
+        self._hmb_finish_live_publication_owner = 0
         # A hidden Shot snapshot may publish only after the router has attached
         # the exact same-UUID Seedance edge.  Keep this false across
         # construction, hydration, and Shot changes so a stale edge can never
@@ -1194,8 +1196,11 @@ class HMBFinishLookLibrary(DataNode):
         ):
             _hide_transport_parameter(_parameter_object(self, name))
 
-    def _publish_parameter(self, name: str, value: Any, *, live: bool) -> bool:
-        set_output(self, name, copy.deepcopy(value))
+    def _publish_parameter(
+        self, name: str, value: Any, *, live: bool, stage_output: bool = True
+    ) -> bool:
+        if stage_output:
+            set_output(self, name, copy.deepcopy(value))
         if not live:
             return True
         publisher = getattr(self, "publish_update_to_parameter", None)
@@ -1274,24 +1279,52 @@ class HMBFinishLookLibrary(DataNode):
                 and shot_fingerprint != self._hmb_finish_snapshot_live_fingerprint
             )
             remote_status = copy.deepcopy(self._remote_status)
-        # Stage the sibling values before any live publication can wake a consumer.
-        values = (
-            (FINISH_LOOK_STATE_OUTPUT_PARAMETER_NAME, state),
-            (FINISH_LOOK_OUTPUT_PARAMETER_NAME, prompt),
-            (SHOT_FINISH_LOOK_OUTPUT_PARAMETER_NAME, shot_snapshot),
-            (REMOTE_STATUS_OUTPUT_PARAMETER_NAME, remote_status),
-        )
-        for name, value in values:
-            set_output(self, name, copy.deepcopy(value))
+            self._hmb_finish_live_publication_owner += 1
+            owner = self._hmb_finish_live_publication_owner
+            # Stage every changed sibling under the same owner before any live
+            # publication can wake a consumer. A reentrant newer publication
+            # invalidates this owner's remaining work.
+            values = (
+                (FINISH_LOOK_STATE_OUTPUT_PARAMETER_NAME, state),
+                (FINISH_LOOK_OUTPUT_PARAMETER_NAME, prompt),
+                (SHOT_FINISH_LOOK_OUTPUT_PARAMETER_NAME, shot_snapshot),
+                (REMOTE_STATUS_OUTPUT_PARAMETER_NAME, remote_status),
+            )
+            staged = getattr(self, "parameter_output_values", {})
+            for name, value in values:
+                if owner != self._hmb_finish_live_publication_owner:
+                    return
+                if (
+                    not isinstance(staged, Mapping)
+                    or name not in staged
+                    or staged[name] != value
+                ):
+                    set_output(self, name, copy.deepcopy(value))
         if live:
             for name, value in values:
+                with self._state_lock:
+                    if owner != self._hmb_finish_live_publication_owner:
+                        break
                 if name == SHOT_FINISH_LOOK_OUTPUT_PARAMETER_NAME:
                     if publish_shot_snapshot:
-                        if self._publish_parameter(name, value, live=True):
+                        if self._publish_parameter(
+                            name, value, live=True, stage_output=False
+                        ):
                             with self._state_lock:
-                                self._hmb_finish_snapshot_live_fingerprint = shot_fingerprint
+                                if owner == self._hmb_finish_live_publication_owner:
+                                    self._hmb_finish_snapshot_live_fingerprint = shot_fingerprint
                     continue
-                self._publish_parameter(name, value, live=True)
+                with self._state_lock:
+                    already_live = (
+                        name in self._hmb_finish_live_values
+                        and self._hmb_finish_live_values[name] == value
+                    )
+                if already_live:
+                    continue
+                if self._publish_parameter(name, value, live=True, stage_output=False):
+                    with self._state_lock:
+                        if owner == self._hmb_finish_live_publication_owner:
+                            self._hmb_finish_live_values[name] = copy.deepcopy(value)
 
     def _restore_widget_parameter(self, *, live: bool = False) -> None:
         shot_catalog = _normalize_shot_catalog(
@@ -1926,6 +1959,15 @@ class HMBFinishLookLibrary(DataNode):
         if isinstance(persisted_shot, Mapping) and persisted_shot.get("shot_uuid"):
             self._hmb_initial_shot_autoclaim_pending = False
             self._hmb_initial_shot_preferred_uuid = ""
+        # Hydration starts a new host output epoch even when the saved Beauty
+        # values match those last sent by this Python instance.
+        with self._state_lock:
+            self._hmb_finish_live_publication_owner = int(
+                getattr(self, "_hmb_finish_live_publication_owner", 0) or 0
+            ) + 1
+            self._hmb_finish_live_values = {}
+            self._hmb_finish_route_ready = False
+            self._hmb_finish_snapshot_live_fingerprint = ""
         self._apply_widget_value(value)
         try:
             from _hmb_shot_routing import schedule_post_hydration_reconcile

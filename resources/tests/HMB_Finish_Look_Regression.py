@@ -608,6 +608,75 @@ node.after_value_set(parameters[target.WIDGET_PARAMETER_NAME], invalid_widget)
 assert node.parameter_output_values[target.FINISH_LOOK_STATE_OUTPUT_PARAMETER_NAME] == before_invalid
 assert node.parameter_output_values[target.REMOTE_STATUS_OUTPUT_PARAMETER_NAME]["code"] == "invalid_ui_state"
 
+# Ordinary output listeners receive each value once. A repeat request stages
+# the same values but does not wake downstream consumers; a failed publication
+# is retried, and an edit with unchanged prose publishes only the changed
+# canonical state. Hidden Shot snapshots keep their separate routing gate.
+quiet_node = target.HMBFinishLookLibrary(name="Finish Look Idempotent Publication")
+ordinary_publications = []
+quiet_node.publish_update_to_parameter = lambda name, value: ordinary_publications.append(
+    (name, copy.deepcopy(value))
+)
+quiet_node._publish_all(live=True)
+assert [name for name, _value in ordinary_publications] == [
+    target.FINISH_LOOK_STATE_OUTPUT_PARAMETER_NAME,
+    target.FINISH_LOOK_OUTPUT_PARAMETER_NAME,
+    target.REMOTE_STATUS_OUTPUT_PARAMETER_NAME,
+]
+ordinary_publications.clear()
+quiet_node._publish_all(live=True)
+assert ordinary_publications == []
+quiet_node._last_valid_state["beauty"]["saturation"] = 1.25
+quiet_node._publish_all(live=True)
+assert [name for name, _value in ordinary_publications] == [
+    target.FINISH_LOOK_STATE_OUTPUT_PARAMETER_NAME
+]
+assert quiet_node.parameter_output_values[target.FINISH_LOOK_OUTPUT_PARAMETER_NAME] == ""
+ordinary_publications.clear()
+quiet_node._remote_status["code"] = "retry-probe"
+failed_status_once = False
+
+
+def retry_status_publication(name, value):
+    global failed_status_once
+    ordinary_publications.append((name, copy.deepcopy(value)))
+    if name == target.REMOTE_STATUS_OUTPUT_PARAMETER_NAME and not failed_status_once:
+        failed_status_once = True
+        raise RuntimeError("transient transport failure")
+
+
+quiet_node.publish_update_to_parameter = retry_status_publication
+quiet_node._publish_all(live=True)
+quiet_node._publish_all(live=True)
+quiet_node._publish_all(live=True)
+assert [name for name, _value in ordinary_publications] == [
+    target.REMOTE_STATUS_OUTPUT_PARAMETER_NAME,
+    target.REMOTE_STATUS_OUTPUT_PARAMETER_NAME,
+]
+
+reentrant_node = target.HMBFinishLookLibrary(name="Finish Look Reentrant Publication")
+reentrant_publications = []
+reentered = False
+
+
+def reentrant_publish(name, value):
+    global reentered
+    reentrant_publications.append((name, copy.deepcopy(value)))
+    if name == target.FINISH_LOOK_STATE_OUTPUT_PARAMETER_NAME and not reentered:
+        reentered = True
+        reentrant_node._last_valid_state["beauty"]["enabled"] = True
+        reentrant_node._publish_all(live=True)
+
+
+reentrant_node.publish_update_to_parameter = reentrant_publish
+reentrant_node._publish_all(live=True)
+assert reentrant_node.parameter_output_values[target.FINISH_LOOK_STATE_OUTPUT_PARAMETER_NAME]["beauty"]["enabled"]
+assert reentrant_node.parameter_output_values[target.FINISH_LOOK_OUTPUT_PARAMETER_NAME]
+assert reentrant_node._hmb_finish_live_values[target.FINISH_LOOK_STATE_OUTPUT_PARAMETER_NAME]["beauty"]["enabled"]
+assert [value for name, value in reentrant_publications if name == target.FINISH_LOOK_OUTPUT_PARAMETER_NAME] == [
+    reentrant_node.parameter_output_values[target.FINISH_LOOK_OUTPUT_PARAMETER_NAME]
+]
+
 print(
     "HMB Finish Look regression: PASS "
     "(character-matte-only opt-in Beauty, retired-film migration, deterministic compiler, "

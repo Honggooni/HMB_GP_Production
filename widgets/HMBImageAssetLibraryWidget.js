@@ -2701,6 +2701,7 @@ export function hmbImageAssetThumbnailRequestIds(
       return key
         && persistedProjectAsset
         && !imageSource(asset)
+        && !options.excludeIds?.has(key)
         && !seen.has(key)
         && seen.add(key);
     })
@@ -3080,8 +3081,11 @@ export function hmbResumeImageAssetThumbnailRequest(container, state, props = {}
       state,
       container.__hmbImageAssetRenderLimit || IMAGE_ASSET_RENDER_WINDOW,
       container.__hmbImageAssetRenderOffset || 0,
-      { includeWindow: !container.__hmbImageAssetCompact },
-    ).filter((key) => !tracking.failed.has(key));
+      {
+        includeWindow: !container.__hmbImageAssetCompact,
+        excludeIds: tracking.failed,
+      },
+    );
     if (!recoveredIds.length) {
       state.thumbnail_request = {};
       state.thumbnail_busy = false;
@@ -3278,8 +3282,8 @@ export function hmbScheduleImageAssetThumbnailRequest(
     liveState,
     options.limit ?? container.__hmbImageAssetRenderLimit ?? IMAGE_ASSET_RENDER_WINDOW,
     options.offset ?? container.__hmbImageAssetRenderOffset ?? 0,
-    options,
-  ).filter((key) => !tracking.requested.has(key));
+    { ...options, excludeIds: tracking.requested },
+  );
   if (!requestIds.length) return false;
 
   const token = (Number(container.__hmbImageAssetThumbnailScheduleToken) || 0) + 1;
@@ -3303,8 +3307,8 @@ export function hmbScheduleImageAssetThumbnailRequest(
       current,
       options.limit ?? container.__hmbImageAssetRenderLimit ?? IMAGE_ASSET_RENDER_WINDOW,
       options.offset ?? container.__hmbImageAssetRenderOffset ?? 0,
-      options,
-    ).filter((key) => !currentTracking.requested.has(key));
+      { ...options, excludeIds: currentTracking.requested },
+    );
     if (!currentIds.length) return;
 
     const requestId = `thumbnail-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;

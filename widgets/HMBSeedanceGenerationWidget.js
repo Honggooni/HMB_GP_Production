@@ -4,6 +4,8 @@ const HMB_SEEDANCE_PREVIEW_VERSION = 1;
 const HMB_SEEDANCE_COMMAND_SCHEMA = "hmb-seedance-refresh-command";
 const HMB_SEEDANCE_COMMAND_VERSION = 1;
 const HMB_SEEDANCE_COMMAND_REGISTRY_KEY = "__HMB_SEEDANCE_REFRESH_BRIDGES_V1__";
+const HMB_SEEDANCE_BROKER_PARAMETER = "broker_server_url";
+const HMB_SEEDANCE_BROKER_DIALOGS = new WeakMap();
 const HMB_SEEDANCE_PROMPT_EDGE_REGISTRY_KEY = "__HMB_SEEDANCE_PROMPT_EDGE_REGISTRY_V1__";
 const HMB_SEEDANCE_PROMPT_EDGE_ATTRIBUTE = "data-hmb-seedance-prompt-edge";
 export const HMB_SEEDANCE_PREVIEW_ACTION_WATCHDOG_MS = 10_000;
@@ -726,14 +728,348 @@ function hmbSeedanceCommandContainer(container) {
   return false;
 }
 
+function hmbSeedanceBrokerContainer(container) {
+  let current = container || null;
+  for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+    if (current.getAttribute?.("data-parameter-name") === HMB_SEEDANCE_BROKER_PARAMETER) return true;
+  }
+  return false;
+}
+
+export function hmbSeedanceNormalizeBrokerUrl(raw) {
+  const value = String(raw ?? "").trim();
+  if (!value) return { ok: true, value: "", error: "" };
+  if (value.length > 2048) {
+    return { ok: false, value: "", error: "브로커 주소가 너무 깁니다." };
+  }
+  let parsed;
+  try { parsed = new URL(value); } catch {
+    return { ok: false, value: "", error: "올바른 HTTPS 브로커 주소를 입력하세요." };
+  }
+  if (
+    parsed.protocol !== "https:"
+    || !parsed.hostname
+    || parsed.username
+    || parsed.password
+    || !["", "/"].includes(parsed.pathname)
+    || value.includes("?")
+    || value.includes("#")
+  ) {
+    return {
+      ok: false,
+      value: "",
+      error: "기본 브로커 외의 주소는 HTTPS 서버 원점만 허용합니다. 경로·계정·쿼리는 제외하세요.",
+    };
+  }
+  return { ok: true, value: parsed.origin, error: "" };
+}
+
+function hmbSeedanceInstallBrokerStyles(ownerDocument) {
+  if (!ownerDocument?.head || ownerDocument.getElementById?.("hmb-seedance-broker-settings-style")) return;
+  const style = ownerDocument.createElement("style");
+  style.id = "hmb-seedance-broker-settings-style";
+  style.textContent = `
+    .hmb-seedance-broker-icon{position:absolute;right:8px;top:50%;transform:translateY(-50%);z-index:2;width:29px;height:29px;padding:0;display:grid;place-items:center;border:1px solid #64748b;border-radius:7px;background:#151c2b;color:#dbeafe;font:18px system-ui;line-height:1;cursor:pointer}
+    .hmb-seedance-broker-icon:hover,.hmb-seedance-broker-icon:focus-visible{border-color:#f472b6;color:#fff;outline:2px solid transparent;box-shadow:0 0 0 2px rgba(244,114,182,.25)}
+    .hmb-seedance-broker-backdrop{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(1,5,14,.78);font-family:Inter,"Noto Sans KR",system-ui,sans-serif;color:#e7edf7}
+    .hmb-seedance-broker-dialog{width:min(520px,100%);padding:20px;border:1px solid #9b4d7d;border-radius:13px;background:#0b1120;box-shadow:0 20px 50px rgba(0,0,0,.55)}
+    .hmb-seedance-broker-dialog h2{margin:0 0 12px;font-size:18px}.hmb-seedance-broker-dialog p{margin:0 0 16px;color:#b5c2d5;font-size:12px;line-height:1.55}
+    .hmb-seedance-broker-dialog label{display:block;margin-bottom:7px;font-size:12px;font-weight:700}.hmb-seedance-broker-dialog input{box-sizing:border-box;width:100%;height:40px;padding:8px 11px;border:1px solid #61708c;border-radius:7px;outline:none;background:#060b16;color:#f8fafc;font:13px system-ui}
+    .hmb-seedance-broker-dialog input:focus{border-color:#f472b6;box-shadow:0 0 0 2px rgba(244,114,182,.2)}.hmb-seedance-broker-error{min-height:18px;margin:8px 0;color:#fb7185;font-size:12px}
+    .hmb-seedance-broker-actions{display:flex;justify-content:flex-end;gap:9px}.hmb-seedance-broker-actions button{min-width:78px;padding:8px 12px;border:1px solid #52617a;border-radius:7px;background:#182338;color:#e7edf7;font:12px system-ui;cursor:pointer}
+    .hmb-seedance-broker-actions button[data-broker-save]{border-color:#f472b6;background:#9d326d;color:#fff}.hmb-seedance-broker-actions button:disabled{opacity:.55;cursor:wait}
+  `;
+  ownerDocument.head.appendChild(style);
+}
+
+function hmbSeedanceBrokerSettingsWidget(container, props) {
+  if (!container) return { cleanup() {}, update() {} };
+  const existing = container.__hmbSeedanceBrokerInstance;
+  if (existing && typeof existing.update === "function") {
+    existing.update(props);
+    return existing;
+  }
+  hmbSeedanceMakeCommandContainerInert(container);
+  let latestProps = props || {};
+  let nodeRoot = null;
+  let modelRow = null;
+  let button = null;
+  let modelStyle = null;
+  let observer = null;
+  let observedRoot = null;
+  let syncQueued = false;
+  let closeDialog = null;
+  let disposed = false;
+
+  const detachButton = () => {
+    if (button) button.remove();
+    if (modelRow?.style && modelStyle) {
+      for (const [property, value, priority] of modelStyle) {
+        if (value) modelRow.style.setProperty(property, value, priority);
+        else modelRow.style.removeProperty(property);
+      }
+    }
+    modelRow = null;
+    modelStyle = null;
+    button = null;
+  };
+
+  const openDialog = () => {
+    const ownerDocument = container.ownerDocument;
+    if (!ownerDocument?.body) return;
+    hmbSeedanceInstallBrokerStyles(ownerDocument);
+    HMB_SEEDANCE_BROKER_DIALOGS.get(ownerDocument)?.();
+    const backdrop = ownerDocument.createElement("div");
+    backdrop.className = "hmb-seedance-broker-backdrop";
+    backdrop.innerHTML = `
+      <form class="hmb-seedance-broker-dialog" role="dialog" aria-modal="true" aria-labelledby="hmb-seedance-broker-title" aria-describedby="hmb-seedance-broker-help">
+        <h2 id="hmb-seedance-broker-title">FN AI Broker 주소</h2>
+        <p id="hmb-seedance-broker-help">다른 서버는 HTTPS 주소만 입력하세요. 비워두면 기존 기본 브로커를 사용합니다. 저장해도 렌더나 연결을 시작하지 않습니다.</p>
+        <label for="hmb-seedance-broker-url">서버 주소</label>
+        <input id="hmb-seedance-broker-url" data-broker-url type="url" inputmode="url" autocomplete="off" spellcheck="false" maxlength="2048" placeholder="https://broker.example.com:8080" value="${escapeHtml(latestProps?.value ?? latestProps?.parameterValue ?? latestProps?.defaultValue ?? "")}">
+        <div class="hmb-seedance-broker-error" data-broker-error role="alert" aria-live="polite"></div>
+        <div class="hmb-seedance-broker-actions"><button type="button" data-broker-cancel>취소</button><button type="submit" data-broker-save>저장</button></div>
+      </form>`;
+    const form = backdrop.querySelector("form");
+    const input = backdrop.querySelector("[data-broker-url]");
+    const error = backdrop.querySelector("[data-broker-error]");
+    const save = backdrop.querySelector("[data-broker-save]");
+    const cancel = backdrop.querySelector("[data-broker-cancel]");
+    let pending = false;
+    const close = () => {
+      backdrop.remove();
+      if (HMB_SEEDANCE_BROKER_DIALOGS.get(ownerDocument) === close) {
+        HMB_SEEDANCE_BROKER_DIALOGS.delete(ownerDocument);
+      }
+      if (closeDialog === close) closeDialog = null;
+      button?.focus?.();
+    };
+    closeDialog = close;
+    HMB_SEEDANCE_BROKER_DIALOGS.set(ownerDocument, close);
+    const stop = (event) => event.stopPropagation?.();
+    backdrop.addEventListener("pointerdown", stop);
+    backdrop.addEventListener("keydown", (event) => {
+      event.stopPropagation?.();
+      if (event.key === "Escape") { event.preventDefault?.(); if (!pending) close(); }
+      if (event.key === "Tab") {
+        const controls = [input, cancel, save].filter((element) => !element.disabled);
+        if (!controls.length) return;
+        const first = controls[0];
+        const last = controls[controls.length - 1];
+        if (event.shiftKey && ownerDocument.activeElement === first) {
+          event.preventDefault?.();
+          last.focus?.();
+        } else if (!event.shiftKey && ownerDocument.activeElement === last) {
+          event.preventDefault?.();
+          first.focus?.();
+        }
+      }
+    });
+    backdrop.addEventListener("click", (event) => {
+      event.stopPropagation?.();
+      if (event.target === backdrop && !pending) close();
+    });
+    cancel.addEventListener("click", () => { if (!pending) close(); });
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      if (pending) return;
+      const parsed = hmbSeedanceNormalizeBrokerUrl(input.value);
+      if (!parsed.ok) { error.textContent = parsed.error; input.focus?.(); return; }
+      if (typeof latestProps?.onChange !== "function") {
+        error.textContent = "브로커 주소 저장 기능을 사용할 수 없습니다. 노드를 다시 열어주세요.";
+        return;
+      }
+      pending = true;
+      save.disabled = true;
+      cancel.disabled = true;
+      error.textContent = "";
+      try {
+        await latestProps.onChange(parsed.value);
+        close();
+      } catch {
+        error.textContent = "브로커 주소를 저장하지 못했습니다. 주소와 연결 상태를 확인하세요.";
+        pending = false;
+        save.disabled = false;
+        cancel.disabled = false;
+      }
+    });
+    ownerDocument.body.appendChild(backdrop);
+    input.focus?.();
+    input.select?.();
+  };
+
+  const syncButton = () => {
+    if (disposed) return;
+    nodeRoot = hmbSeedanceNodeRoot(container);
+    const nextRow = nodeRoot?.querySelector?.(
+      '[data-parameter-name="model_id"], [data-parameter="model_id"], .model_id',
+    ) || null;
+    if (!nextRow || (nextRow === modelRow && button?.isConnected)) return;
+    detachButton();
+    if (!nextRow || !nextRow.style) return;
+    hmbSeedanceInstallBrokerStyles(container.ownerDocument);
+    modelRow = nextRow;
+    modelStyle = ["position", "padding-right"].map((property) => [
+      property,
+      modelRow.style.getPropertyValue(property),
+      modelRow.style.getPropertyPriority(property),
+    ]);
+    const computedPadding = container.ownerDocument?.defaultView?.getComputedStyle?.(modelRow)?.paddingRight || "0px";
+    modelRow.style.setProperty("position", "relative");
+    modelRow.style.setProperty("padding-right", `calc(${computedPadding} + 38px)`);
+    button = container.ownerDocument.createElement("button");
+    button.type = "button";
+    button.className = "hmb-seedance-broker-icon nodrag";
+    button.textContent = "⚙";
+    button.setAttribute("aria-label", "FN AI Broker 서버 주소 설정");
+    button.setAttribute("aria-haspopup", "dialog");
+    button.title = "FN AI Broker 서버 주소 설정";
+    button.addEventListener("pointerdown", (event) => event.stopPropagation?.());
+    button.addEventListener("click", (event) => {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      openDialog();
+    });
+    modelRow.appendChild(button);
+  };
+
+  const scheduleSync = () => {
+    if (disposed || syncQueued) return;
+    syncQueued = true;
+    Promise.resolve().then(() => { syncQueued = false; syncButton(); });
+  };
+  const Observer = container.ownerDocument?.defaultView?.MutationObserver
+    || (typeof MutationObserver === "function" ? MutationObserver : null);
+  const observeRoot = () => {
+    if (!Observer || nodeRoot === observedRoot) return;
+    observer?.disconnect?.();
+    observedRoot = nodeRoot;
+    if (!nodeRoot) return;
+    observer = new Observer(() => {
+      if (!modelRow?.isConnected || !button?.isConnected) scheduleSync();
+    });
+    observer.observe(nodeRoot, { childList: true, subtree: true });
+  };
+  syncButton();
+  observeRoot();
+  const cleanup = () => {
+    disposed = true;
+    observer?.disconnect?.();
+    closeDialog?.();
+    detachButton();
+    hmbSeedanceRestoreCarrierLayout(container);
+    if (container.__hmbSeedanceBrokerInstance === instance) delete container.__hmbSeedanceBrokerInstance;
+  };
+  const instance = {
+    cleanup,
+    update(nextProps) {
+      latestProps = nextProps || {};
+      hmbSeedanceMakeCommandContainerInert(container);
+      syncButton();
+      observeRoot();
+    },
+  };
+  container.__hmbSeedanceBrokerInstance = instance;
+  return instance;
+}
+
 function hmbSeedanceMakeCommandContainerInert(container) {
   if (!container?.style) return;
-  container.setAttribute?.("aria-hidden", "true");
-  for (const [name, value] of [
-    ["height", "0px"], ["min-height", "0px"], ["max-height", "0px"],
-    ["margin", "0"], ["padding", "0"], ["border", "0"],
-    ["overflow", "hidden"], ["opacity", "0"], ["pointer-events", "none"],
-  ]) container.style.setProperty?.(name, value, "important");
+  const existing = container.__hmbSeedanceCarrierLayout;
+  if (existing) { existing.sync(); return; }
+  const documentRef = container.ownerDocument;
+  if (documentRef?.head && !documentRef.getElementById("hmb-seedance-carrier-layout-style")) {
+    const style = documentRef.createElement("style");
+    style.id = "hmb-seedance-carrier-layout-style";
+    style.textContent = `
+      [data-hmb-seedance-hidden-carrier="true"]{height:0!important;min-height:0!important;max-height:0!important;flex:0 0 0!important;margin:0!important;padding:0!important;border:0!important;overflow:hidden!important;opacity:0!important;pointer-events:none!important}
+      [data-hmb-seedance-carrier-slot="true"]{position:absolute!important;height:0!important;min-height:0!important;max-height:0!important;flex:0 0 0!important;margin:0!important;padding:0!important;border:0!important;overflow:hidden!important;opacity:0!important;pointer-events:none!important}
+    `;
+    documentRef.head.appendChild(style);
+  }
+  const snapshots = new Map();
+  let observer = null;
+  let observedRoot = null;
+  let syncQueued = false;
+  let disposed = false;
+  const restore = (element, attributes) => {
+    for (const [name, value] of attributes) {
+      if (value === null) element.removeAttribute?.(name);
+      else element.setAttribute?.(name, value);
+    }
+  };
+  const sync = () => {
+    if (disposed) return;
+    const nodeRoot = hmbSeedanceNodeRoot(container);
+    let parameterRow = null;
+    for (let current = container, depth = 0; current && current !== nodeRoot && depth < 8; current = current.parentElement, depth += 1) {
+      const name = current.getAttribute?.("data-parameter-name");
+      if (name === HMB_SEEDANCE_BROKER_PARAMETER || name === "HMB_SEEDANCE_REFRESH_COMMAND") {
+        parameterRow = current;
+        break;
+      }
+    }
+    const targets = new Map([[container, "data-hmb-seedance-hidden-carrier"]]);
+    if (parameterRow) {
+      targets.set(parameterRow, "data-hmb-seedance-hidden-carrier");
+      const parameterName = parameterRow.getAttribute("data-parameter-name");
+      // Griptape allocates its own 40px slot outside the widget. Collapse only
+      // this dedicated slot, leaving the mounted command/settings transport
+      // and the shared parameter stack intact.
+      for (let current = parameterRow.parentElement, depth = 0; current && current !== nodeRoot && depth < 8; current = current.parentElement, depth += 1) {
+        const parameters = Array.from(current.querySelectorAll?.("[data-parameter-name]") || []);
+        if (parameters.some((element) => element.getAttribute("data-parameter-name") !== parameterName)) break;
+        if (current.classList?.contains("flex-shrink-0")
+          && current.classList.contains("overflow-hidden")
+          && current.parentElement?.classList?.contains("flex-col")) {
+          targets.set(current, "data-hmb-seedance-carrier-slot");
+          break;
+        }
+      }
+    }
+    for (const [element, attributes] of snapshots) {
+      if (!targets.has(element)) { restore(element, attributes); snapshots.delete(element); }
+    }
+    for (const [element, marker] of targets) {
+      if (!snapshots.has(element)) {
+        snapshots.set(element, [marker, "aria-hidden"].map((name) => [name, element.getAttribute?.(name) ?? null]));
+      }
+      if (element.getAttribute?.(marker) !== "true") element.setAttribute?.(marker, "true");
+      if (element.getAttribute?.("aria-hidden") !== "true") element.setAttribute?.("aria-hidden", "true");
+    }
+    if (nodeRoot !== observedRoot) {
+      observer?.disconnect?.();
+      observedRoot = nodeRoot;
+      const Observer = documentRef?.defaultView?.MutationObserver;
+      if (nodeRoot && Observer) {
+        observer = new Observer((records) => {
+          const moved = records.some((record) => [...record.addedNodes, ...record.removedNodes].some(
+            (element) => element === container || element.contains?.(container),
+          ));
+          if (!moved || syncQueued || disposed) return;
+          syncQueued = true;
+          Promise.resolve().then(() => { syncQueued = false; sync(); });
+        });
+        observer.observe(nodeRoot, { childList: true, subtree: true });
+      }
+    }
+  };
+  container.__hmbSeedanceCarrierLayout = {
+    sync,
+    cleanup() {
+      disposed = true;
+      observer?.disconnect?.();
+      for (const [element, attributes] of snapshots) restore(element, attributes);
+      snapshots.clear();
+    },
+  };
+  sync();
+}
+
+function hmbSeedanceRestoreCarrierLayout(container) {
+  container?.__hmbSeedanceCarrierLayout?.cleanup();
+  if (container) delete container.__hmbSeedanceCarrierLayout;
 }
 
 function hmbSeedanceCommandBridgeWidget(container, props) {
@@ -778,6 +1114,7 @@ function hmbSeedanceCommandBridgeWidget(container, props) {
       registry.delete(registeredRoot);
     }
     registeredRoot = null;
+    hmbSeedanceRestoreCarrierLayout(container);
     if (container.__hmbSeedanceCommandBridgeCleanup === cleanup) {
       delete container.__hmbSeedanceCommandBridgeCleanup;
     }
@@ -1417,27 +1754,64 @@ function refresh(container, props) {
   return true;
 }
 
+function hmbSeedanceShotKey(state) {
+  return state?.shot?.shot_uuid
+    ? `${state.shot.channel_uuid}\u001f${state.shot.shot_uuid}` : HMB_SHOT_ONLY_KEY;
+}
+
+function hmbSeedanceResolveShotEcho(container, incomingProps) {
+  const pending = container.__hmbSeedancePendingShot;
+  if (!pending || incomingProps === container.__hmbSeedanceLatestProps) return { props: incomingProps, stale: false };
+  const incoming = hmbSeedanceShotState(incomingProps);
+  const retained = hmbSeedanceShotState(container.__hmbSeedanceLatestProps);
+  const catalogOlder = incoming.shot_catalog.channel_uuid === retained.shot_catalog.channel_uuid
+    && Number(incoming.shot_catalog.generation || 0) < Number(retained.shot_catalog.generation || 0);
+  const catalog = catalogOlder ? retained.shot_catalog : incoming.shot_catalog;
+  const incomingKey = hmbSeedanceShotKey(incoming);
+  if (incomingKey === pending.targetKey) {
+    delete container.__hmbSeedancePendingShot;
+    return { props: incomingProps, stale: false };
+  }
+  const targetAvailable = pending.targetKey === HMB_SHOT_ONLY_KEY || (catalog.shots || []).some(
+    (shot) => `${catalog.channel_uuid}\u001f${shot.shot_uuid}` === pending.targetKey,
+  );
+  if (!targetAvailable || !pending.blockedKeys.has(incomingKey)) {
+    delete container.__hmbSeedancePendingShot;
+    return { props: incomingProps, stale: false };
+  }
+  return {
+    props: { ...incomingProps, value: retained, parameterValue: retained, defaultValue: retained },
+    stale: true,
+  };
+}
+
 export default function HMBSeedanceGenerationWidget(container, props) {
   if (!container) return { cleanup() {}, update() {} };
   if (hmbSeedanceCommandProps(props) || hmbSeedanceCommandContainer(container)) {
     return hmbSeedanceCommandBridgeWidget(container, props);
   }
+  if (hmbSeedanceBrokerContainer(container)) {
+    return hmbSeedanceBrokerSettingsWidget(container, props);
+  }
   delete container.__hmbSeedancePreviewDisposed;
   const latest = props || container.__hmbSeedanceLatestProps || {};
-  container.__hmbSeedanceLatestProps = latest;
+  const resolved = hmbSeedanceResolveShotEcho(container, latest);
+  container.__hmbSeedanceLatestProps = resolved.props;
   const previousCleanup = container.__hmbSeedanceCleanup;
   // A factory call with new props is an authoritative lifecycle refresh, just
   // like update(). Invalidate any optimistic promise before accepting it so a
   // late rejection cannot roll the refreshed selector back.
-  if (typeof previousCleanup === "function") hmbSeedanceNextChangeOwner(container);
-  if (typeof previousCleanup === "function" && refresh(container, latest)) {
+  if (typeof previousCleanup === "function" && !resolved.stale) hmbSeedanceNextChangeOwner(container);
+  if (typeof previousCleanup === "function" && refresh(container, resolved.props)) {
     return {
       cleanup: container.__hmbSeedanceCleanupProxy,
       update(nextProps) {
-        hmbSeedanceNextChangeOwner(container);
-        container.__hmbSeedanceLatestProps = nextProps || container.__hmbSeedanceLatestProps || {};
-        if (!refresh(container, container.__hmbSeedanceLatestProps)) {
-          HMBSeedanceGenerationWidget(container, container.__hmbSeedanceLatestProps);
+        const incoming = nextProps || container.__hmbSeedanceLatestProps || {};
+        const next = hmbSeedanceResolveShotEcho(container, incoming);
+        if (!next.stale) hmbSeedanceNextChangeOwner(container);
+        container.__hmbSeedanceLatestProps = next.props;
+        if (!refresh(container, next.props)) {
+          HMBSeedanceGenerationWidget(container, next.props);
         }
       },
     };
@@ -1450,7 +1824,7 @@ export default function HMBSeedanceGenerationWidget(container, props) {
     };
   }
   compactHost(container);
-  const initialState = hmbSeedanceShotState(latest);
+  const initialState = hmbSeedanceShotState(resolved.props);
   container.innerHTML = render(initialState);
   hmbSeedanceSyncPreviewOverlay(container, initialState);
   installPreviewObserver(container);
@@ -1479,6 +1853,10 @@ export default function HMBSeedanceGenerationWidget(container, props) {
     // Preserve the prior descriptor until retained mode has removed or
     // replaced the real edge. This prevents a cable flash during transition.
     const owner = hmbSeedanceNextChangeOwner(container);
+    const previousKey = hmbSeedanceShotKey(previousState);
+    const blockedKeys = new Set(container.__hmbSeedancePendingShot?.blockedKeys || []);
+    blockedKeys.add(previousKey);
+    container.__hmbSeedancePendingShot = { targetKey: hmbSeedanceShotKey(next), blockedKeys };
     const optimisticProps = { ...liveProps, value: next, parameterValue: next, defaultValue: next };
     const accept = () => {
       if (!hmbSeedanceOwnsChange(container, owner)) return;
@@ -1488,15 +1866,16 @@ export default function HMBSeedanceGenerationWidget(container, props) {
     };
     const rollback = (error) => {
       if (!hmbSeedanceOwnsChange(container, owner)) return;
+      delete container.__hmbSeedancePendingShot;
       container.__hmbSeedanceLatestProps = previousProps;
       container.__hmbSeedanceShotChangeError = String(
         error?.message || error || "Shot selection publication failed",
       );
       refresh(container, previousProps);
     };
+    accept();
     let result;
     try { result = liveProps.onChange(next); } catch (error) { rollback(error); return; }
-    accept();
     if (result && typeof result.then === "function") Promise.resolve(result).catch(rollback);
   };
   select?.addEventListener?.("change", onShotChange);
@@ -1524,6 +1903,7 @@ export default function HMBSeedanceGenerationWidget(container, props) {
     if (container.__hmbSeedanceCleanup === cleanup) delete container.__hmbSeedanceCleanup;
     delete container.__hmbSeedanceLatestProps;
     delete container.__hmbSeedanceShotChangeError;
+    delete container.__hmbSeedancePendingShot;
     // Invalidate promise callbacks from this lifecycle without resetting the
     // monotonic token. A remount can otherwise reuse owner=1 and let an old
     // rejection roll the new selector back.
@@ -1534,10 +1914,12 @@ export default function HMBSeedanceGenerationWidget(container, props) {
   return {
     cleanup: container.__hmbSeedanceCleanupProxy,
     update(nextProps) {
-      hmbSeedanceNextChangeOwner(container);
-      container.__hmbSeedanceLatestProps = nextProps || container.__hmbSeedanceLatestProps || {};
-      if (!refresh(container, container.__hmbSeedanceLatestProps)) {
-        HMBSeedanceGenerationWidget(container, container.__hmbSeedanceLatestProps);
+      const incoming = nextProps || container.__hmbSeedanceLatestProps || {};
+      const next = hmbSeedanceResolveShotEcho(container, incoming);
+      if (!next.stale) hmbSeedanceNextChangeOwner(container);
+      container.__hmbSeedanceLatestProps = next.props;
+      if (!refresh(container, next.props)) {
+        HMBSeedanceGenerationWidget(container, next.props);
       }
     },
   };

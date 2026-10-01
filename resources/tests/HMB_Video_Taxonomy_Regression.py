@@ -45,6 +45,11 @@ expected = {
     ("Maya Preview / Playblast", "Depth"): ("Depth / Spatial Reference", "Spatial Alignment Verification Only"),
     ("Maya Preview / Playblast", "Motion Guide"): ("Motion Guide / Retargeting Reference", "Derived Motion Decoding Only"),
     ("Maya Preview / Playblast", "Timing / Edit"): ("Timing / Edit Reference", "Timing Only"),
+    ("Blender Preview / Render", "Original Preview"): ("Unified Shot-Control Video", "Primary Unified Shot Control"),
+    ("Blender Preview / Render", "Mask"): ("Mask / Control Reference", "Mask / Guide Only"),
+    ("Blender Preview / Render", "Depth"): ("Depth / Spatial Reference", "Spatial Alignment Verification Only"),
+    ("Blender Preview / Render", "Motion Guide"): ("Motion Guide / Retargeting Reference", "Derived Motion Decoding Only"),
+    ("Blender Preview / Render", "Timing / Edit"): ("Timing / Edit Reference", "Timing Only"),
     ("Motion Reference", "Local Motion"): ("Motion Reference", "Local Motion Detail Only"),
     ("Motion Reference", "Secondary Motion"): ("Motion Reference", "Secondary Motion Only"),
     layout_pair: ("Motion Reference", layout_role),
@@ -57,9 +62,12 @@ expected = {
 }
 assert prompt.VIDEO_TAXONOMY_WIRE_MAP == expected
 assert layout_role in prompt.VIDEO_CONTROL_ROLE_CHOICES
-assert len(prompt.VIDEO_MAIN_TYPE_CHOICES) == 6
-assert sum(len(values) for values in prompt.VIDEO_SUB_TYPE_CHOICES.values()) == 14
+assert len(prompt.VIDEO_MAIN_TYPE_CHOICES) == 7
+assert sum(len(values) for values in prompt.VIDEO_SUB_TYPE_CHOICES.values()) == 19
 assert prompt.VIDEO_SUB_TYPE_CHOICES["Maya Preview / Playblast"] == [
+    "Original Preview", "Mask", "Depth", "Motion Guide", "Timing / Edit",
+]
+assert prompt.VIDEO_SUB_TYPE_CHOICES["Blender Preview / Render"] == [
     "Original Preview", "Mask", "Depth", "Motion Guide", "Timing / Edit",
 ]
 assert prompt.VIDEO_SUB_TYPE_CHOICES["Motion Reference"] == [

@@ -254,10 +254,10 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.7.68",
+    "library_version": "0.7.69",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
-      "archive_source_count": 32,
+      "archive_source_count": 33,
       "mode": "bundled_signed_dat",
       "runtime_path": "resources/agent/hmb_agent_core.dat",
       "policy_version": "2026-09-22.agent-shot-quality.v5.5",
@@ -270,6 +270,7 @@
       "HMB",
       "Production",
       "Maya",
+      "Blender",
       "Prompt",
       "Library",
       "CustomWidget",
@@ -300,6 +301,7 @@
       "VIDEO_VFX",
       "HMBVideoPickerLibrary",
       "MayaAutoDetect",
+      "BlenderAutoDetect",
       "ExactSourceTiming",
       "HighQualityBT709Proxy",
       "MarkerCatalog14",
@@ -357,7 +359,7 @@
       "LazyOriginalPlayblast",
       "FrameSnapshot",
       "VideoTransportControls",
-      "MayaOnlyPicker",
+      "MayaAndBlenderPicker",
       "GeneratorNeutralAgent",
       "FourRuleBehaviors",
       "GoalFirstShotComposition",
@@ -688,7 +690,7 @@
       "file_path": "HMBVideoPickerLibrary.py",
       "metadata": {
         "category": "HMB_GP_Production",
-        "description": "Captures Maya snapshots and playblast variants.\nOrders videos for prompts or generators. Expanded mode includes independent concatenation and spatial crop tools.",
+        "description": "Captures Maya .mb/.ma and Blender .blend scene snapshots and video variants in one Shot-bound picker.\nOrders videos for prompts or generators. Expanded mode includes independent concatenation and spatial crop tools.",
         "display_name": "HMBVideoPickerLibrary",
         "width": 1400,
         "height": 360,
@@ -761,7 +763,7 @@
     {
       "name": "HMBVideoPickerLibraryWidget",
       "path": "widgets/HMBVideoPickerLibraryWidget_v032.js",
-      "description": "Maya playblast viewport with ImageAsset-synchronized one-to-five Shot video workspaces. Each Shot owns at most ten imported or generated assets; only that Shot's ordered selected subset drives PICKER_OUT and VIDEO_OUT. Expanded mode adds Preview, Concatenate and Crop tabs using the same player, with an independent edit queue and source-local crop regions. Editing outputs are separate and are added to the loader only on request without automatic Prompt selection. The compact loader and its selection, playback and reorder behavior are unchanged."
+      "description": "Maya and Blender scene preview viewport with ImageAsset-synchronized one-to-five Shot video workspaces. Each Shot owns at most ten imported or generated assets; only that Shot's ordered selected subset drives PICKER_OUT and VIDEO_OUT. Expanded mode adds Preview, Concatenate and Crop tabs using the same player, with an independent edit queue and source-local crop regions. Editing outputs are separate and are added to the loader only on request without automatic Prompt selection. The compact loader and its selection, playback and reorder behavior are unchanged."
     }
   ]
 }

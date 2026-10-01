@@ -273,7 +273,7 @@ const TEXT = {
   en: {
     load: "LOAD",
     browse: "BROWSE",
-    scenePath: "Maya .mb/.ma absolute path",
+    scenePath: "Maya .mb/.ma or Blender .blend absolute path",
     pickPreview: "PICK & SNAPSHOT",
     playblast: "PLAYBLAST",
     read: "READ",
@@ -377,7 +377,7 @@ const TEXT = {
     originalPreview: "\uC6D0\uBCF8 \uD50C\uB808\uC774\uBE14\uB77C\uC2A4\uD2B8",
     generatingOriginal: "\uC6D0\uBCF8 \uD504\uB9AC\uBDF0",
     browse: "찾아보기",
-    scenePath: "Maya .mb/.ma 절대 경로",
+    scenePath: "Maya .mb/.ma 또는 Blender .blend 절대 경로",
     load: "불러오기",
     pickPreview: "컬러 선택 및 스냅샷",
     playblast: "플레이블라스트",
@@ -1146,8 +1146,8 @@ export function hmbNormalizeMayaScenePath(value) {
   if (absoluteUnc && text.includes(":")) return "";
   if (/(?:^|[\t ])(?:[A-Za-z]:[\\/]|\\\\|\/\/|\/)/.test(pathTail)) return "";
   if (/(?:^|[\s\]])(?:SUCCESS|ERROR|WARNING|INFO)(?:\s|$)/i.test(text)) return "";
-  if (/\.(?:ma|mb)(?:\s|[\\/]).*\.(?:ma|mb)$/i.test(text)) return "";
-  return /\.(?:ma|mb)$/i.test(text) ? text : "";
+  if (/\.(?:ma|mb|blend)(?:\s|[\\/]).*\.(?:ma|mb|blend)$/i.test(text)) return "";
+  return /\.(?:ma|mb|blend)$/i.test(text) ? text : "";
 }
 
 function isMayaScenePath(value) {
@@ -1166,7 +1166,7 @@ function videoPickerNodeRoot(container) {
       const nativeSceneElements = current.querySelectorAll?.(
         '[data-parameter-name="MAYA_SCENE"], [data-parameter="MAYA_SCENE"], [data-parameter-key="MAYA_SCENE"], '
         + 'input[name="MAYA_SCENE"], textarea[name="MAYA_SCENE"], input[aria-label*="MAYA_SCENE" i], '
-        + 'textarea[aria-label*="MAYA_SCENE" i], input[placeholder*=".mb" i], input[placeholder*=".ma" i]',
+        + 'textarea[aria-label*="MAYA_SCENE" i], input[placeholder*=".mb" i], input[placeholder*=".ma" i], input[placeholder*=".blend" i]',
       );
       if (
         !nativePickerFallback
@@ -1249,8 +1249,10 @@ function hmbNativeMayaPickerSnapshot(container) {
     'textarea[aria-label*="MAYA_SCENE" i]',
     'input[placeholder*=".mb" i]',
     'input[placeholder*=".ma" i]',
+    'input[placeholder*=".blend" i]',
     'input[type="file"][accept*=".mb" i]',
     'input[type="file"][accept*=".ma" i]',
+    'input[type="file"][accept*=".blend" i]',
   ];
   const elements = [];
   const seen = new Set();
@@ -2388,10 +2390,11 @@ export function hmbInstallVideoAssetDragReorder(container, options = {}) {
   const clearCandidate = () => {
     const session = container.__hmbVideoDragSession;
     if (session && typeof session === "object") {
+      session.targetCard?.classList?.remove?.("drop-target");
+      session.targetCard = null;
       session.targetUid = "";
       session.targetIndex = -1;
     }
-    hmbClearVideoAssetDropTargets(container);
   };
   const clearSession = () => {
     hmbClearVideoAssetDropTargets(container);
@@ -2429,8 +2432,11 @@ export function hmbInstallVideoAssetDragReorder(container, options = {}) {
     event?.preventDefault?.();
     event?.stopPropagation?.();
     try { if (event?.dataTransfer) event.dataTransfer.dropEffect = "move"; } catch (_error) {}
-    hmbClearVideoAssetDropTargets(container);
-    card.classList?.add?.("drop-target");
+    if (session.targetCard !== card) {
+      session.targetCard?.classList?.remove?.("drop-target");
+      card.classList?.add?.("drop-target");
+      session.targetCard = card;
+    }
     session.targetUid = targetUid;
     session.targetIndex = targetIndex;
     return true;
@@ -2504,6 +2510,7 @@ export function hmbInstallVideoAssetDragReorder(container, options = {}) {
       ));
     sourceCard?.classList?.add?.("dragging");
     targetCard?.classList?.add?.("drop-target");
+    retainedSession.targetCard = targetCard || null;
   }
 
   listen("dragstart", (event) => {
@@ -2804,7 +2811,8 @@ function defaultState() {
     scene_request_path: "",
     mode: "maya",
     status: "READY",
-    message: "Browse to a Maya scene, then press READ.",
+    message: "Browse to a Maya or Blender scene, then press READ.",
+    scene_engine: "maya",
     video_path: "",
     video_url: "",
     original_video_path: "",
@@ -2858,6 +2866,9 @@ function defaultState() {
     maya_executable: "",
     maya_version: "",
     maya_available: false,
+    blender_executable: "",
+    blender_version: "",
+    blender_available: false,
     active_process_pid: 0,
     active_process_kind: "",
     last_log_path: "",
@@ -3121,9 +3132,10 @@ export function hmbPickerAllOutlinerNodes(state) {
     ...(Array.isArray(root.depth_meshes) ? root.depth_meshes.map(mesh => ({ ...mesh, parent_path: clean(root.full_path), node_kind: "mesh" })) : [])]);
 }
 
-export function hmbPickerSelectedOutlinerNode(stateValue) {
+export function hmbPickerSelectedOutlinerNode(stateValue, cachedNodes = null) {
   const state = stateValue && typeof stateValue === "object" ? stateValue : {};
-  const nodes = hmbPickerAllOutlinerNodes(state).filter(item => item && typeof item === "object" && clean(item.full_path));
+  const nodes = (cachedNodes || hmbPickerAllOutlinerNodes(state))
+    .filter(item => item && typeof item === "object" && clean(item.full_path));
   if (!nodes.length) return null;
   const requestedUuid = clean(state.selected_outliner_uuid).toLowerCase();
   const requestedPath = clean(state.selected_outliner_path);
@@ -3150,13 +3162,13 @@ function hmbPickerOutlinerSelectionScope(state) {
   return `${scene}|${clean(state?.active_picker_shot_uuid || state?.shot_uuid)}`;
 }
 
-export function hmbPickerSelectedOutlinerNodes(state) {
+export function hmbPickerSelectedOutlinerNodes(state, cachedNodes = null) {
   if (clean(state?.outliner_selection_scope) === hmbPickerOutlinerSelectionScope(state)
       && Array.isArray(state?.selected_outliner_paths)) {
     const paths = new Set(state.selected_outliner_paths.map(clean));
-    return hmbPickerAllOutlinerNodes(state).filter(item => paths.has(clean(item.full_path)));
+    return (cachedNodes || hmbPickerAllOutlinerNodes(state)).filter(item => paths.has(clean(item.full_path)));
   }
-  const selected = hmbPickerSelectedOutlinerNode(state);
+  const selected = hmbPickerSelectedOutlinerNode(state, cachedNodes);
   return selected ? [selected] : [];
 }
 
@@ -3366,8 +3378,19 @@ export function hmbUpdatePickerVideoTools(state, update) {
 export function hmbPreservePickerToolDrafts(incoming, local) {
   if (!local || clean(incoming?.runtime_instance_id) !== clean(local.runtime_instance_id)) return incoming;
   const next = hmbNormalizePickerVideoToolsByShot(incoming?.video_tools_by_shot);
+  const incomingRevision = Number(incoming?.state_revision || 0);
+  const localRevision = Number(local?.state_revision || 0);
+  const incomingPublished = Number(incoming?.state_published_at_ms || 0);
+  const localPublished = Number(local?.state_published_at_ms || 0);
+  const localStateIsNewer = localRevision > incomingRevision
+    || (localRevision === incomingRevision && localPublished > incomingPublished);
   for (const [uid, tools] of Object.entries(hmbNormalizePickerVideoToolsByShot(local.video_tools_by_shot))) {
-    if (tools.revision > Number(next[uid]?.revision || 0)) next[uid] = tools;
+    const incomingToolRevision = Number(next[uid]?.revision || 0);
+    // Two crossed host responses can carry the same per-tool revision but
+    // different tab modes. A lower state revision is still stale and must not
+    // paint Output/Concatenate between the click and the confirmed Crop view.
+    if (tools.revision > incomingToolRevision
+      || (tools.revision === incomingToolRevision && localStateIsNewer)) next[uid] = tools;
   }
   return { ...incoming, video_tools_by_shot: next };
 }
@@ -4010,11 +4033,15 @@ export function hmbInstallPickerVideoTools(container, options = {}) {
     const mode = target.getAttribute("data-picker-tool-tab");
     if (mode) {
       clearOverride();
-      if (mode === "crop") pause();
-      const state = current();
+      // Publish the new mode before a media pause/source swap can dispatch a
+      // synchronous event. refresh() pauses on entry to Crop using that mode.
+      const wasCrop = hmbPickerToolsEntry(current()).active_tool === "crop";
       update((tools) => {
         tools.active_tool = mode;
       }, true);
+      // Re-clicking the already active Crop tab keeps its previous pause
+      // behavior; no context transition runs refresh()'s entry pause.
+      if (mode === "crop" && wasCrop) pause();
       return;
     }
     const state = current(), tools = hmbPickerToolsEntry(state);
@@ -4253,6 +4280,10 @@ function normalize(value) {
   state.maya_executable = clean(state.maya_executable);
   state.maya_version = clean(state.maya_version);
   state.maya_available = Boolean(state.maya_available && state.maya_executable);
+  state.blender_executable = clean(state.blender_executable);
+  state.blender_version = clean(state.blender_version);
+  state.blender_available = Boolean(state.blender_available && state.blender_executable);
+  state.scene_engine = /\.blend$/i.test(clean(state.scene_path || state.scene_draft_path)) ? "blender" : "maya";
   state.active_process_pid = Math.max(0, Math.floor(Number(state.active_process_pid || 0)));
   state.active_process_kind = clean(state.active_process_kind);
   const requestedResolution = HMB_PLAYBLAST_RESOLUTIONS.find(
@@ -5147,7 +5178,10 @@ export function pickerButtonAvailability(
     || state.scene_path,
   ).replace(/^["']|["']$/g, "");
   const validFile = isMayaScenePath(draftPath);
-  const mayaAvailable = Boolean(state.maya_available && clean(state.maya_executable));
+  const blenderScene = /\.blend$/i.test(draftPath);
+  const engineAvailable = blenderScene
+    ? Boolean(state.blender_available && clean(state.blender_executable))
+    : Boolean(state.maya_available && clean(state.maya_executable));
   const terminalFailure = ["FAILED", "CANCELLED"].includes(status)
     || ["FAILED", "LOAD_FAILED", "CANCELLED", "STALE_RESULT_DISCARDED"].includes(sceneStage);
   const stopping = status === "CANCELLING" || sceneStage === "CANCELLING";
@@ -5164,7 +5198,7 @@ export function pickerButtonAvailability(
     || !!localReadPending
     || !!localOriginalPending
     || ["READING_SCENE", "RUNNING", "GENERATING_VIDEO", "GENERATING_ORIGINAL", "SNAPSHOT_RENDERING"].includes(status)
-    || ["MAYA_READING", "PYTHON_COMMAND_RECEIVED", "ORIGINAL_RENDERING", "SNAPSHOT_RENDERING"].includes(sceneStage)
+    || ["MAYA_READING", "BLENDER_READING", "PYTHON_COMMAND_RECEIVED", "ORIGINAL_RENDERING", "SNAPSHOT_RENDERING"].includes(sceneStage)
     || operationLifecycleOpen
   );
   const completedScenePath = mayaScenePathKey(state.scene_path);
@@ -5210,7 +5244,7 @@ export function pickerButtonAvailability(
     );
 
   return {
-    readEnabled: mayaAvailable && validFile && !operationBusy && !localReadPending && !localOriginalPending && (terminalFailure || !readSnapshotReady),
+    readEnabled: engineAvailable && validFile && !operationBusy && !localReadPending && !localOriginalPending && (terminalFailure || !readSnapshotReady),
     stopEnabled: (operationBusy || !!localReadPending || !!localOriginalPending) && !stopping,
     playblastEnabled: !operationBusy
       && !terminalFailure
@@ -5242,13 +5276,25 @@ export function hmbPickerGenerateCaption(state, container = null) {
   const operationTarget = clean(pending ? container?.__hmbPickerGenerateTargetUuid : state?.operation_picker_shot_uuid);
   const targetUuid = isGenerating && (busy || pending) && operationTarget ? operationTarget : clean(state?.active_picker_shot_uuid);
   const target = (state?.picker_shots || []).find((shot) => shot.workspace_uuid === targetUuid);
-  const scene = clean(state?.scene_path).split(/[\\/]/).at(-1) || (state?.language === "en" ? "Read Maya scene" : "Maya 읽기 필요");
+  const scene = clean(state?.scene_path).split(/[\\/]/).at(-1) || (state?.language === "en" ? "Read Maya or Blender scene" : "Maya 또는 Blender 읽기 필요");
   const action = busy || pending ? (state?.language === "en" ? "Processing" : "처리 중") : ((TEXT[state?.language] || TEXT.ko).generate || "Generate");
   return `${action} · ${scene} → ${target?.name || "Shot 1"}`;
 }
 
 export function hmbPatchPickerMayaSettingsMetadata(container, state) {
   const ready = state?.native_read_ready === true;
+  const path = hmbResolveMayaSceneDraftPath(container, state);
+  const blenderScene = /\.blend$/i.test(path);
+  const engineName = blenderScene ? "Blender" : "Maya";
+  const engineVersion = clean(blenderScene ? state?.blender_version : state?.maya_version) || ((TEXT[state?.language] || TEXT.ko).autoDetect);
+  const engineLabel = container?.querySelector?.(".scene-load-label");
+  if (engineLabel) engineLabel.textContent = `${engineName.toUpperCase()} INPUT`;
+  const settingsLabel = container?.querySelector?.("[data-picker-engine-label]");
+  if (settingsLabel) settingsLabel.textContent = engineName;
+  const settingsVersion = container?.querySelector?.("[data-picker-engine-version]");
+  if (settingsVersion) settingsVersion.textContent = engineVersion;
+  const settingsItem = container?.querySelector?.("[data-picker-engine-metadata]");
+  if (settingsItem) settingsItem.title = `${engineName}: ${engineVersion}`;
   for (const [selector, value] of [
     ["[data-picker-maya-frame-start]", state?.start_frame],
     ["[data-picker-maya-frame-end]", state?.end_frame],
@@ -8439,8 +8485,30 @@ function filteredVisibleNodes(state) {
   });
 }
 
+// A state revision replaces the outliner array. Scroll events within that
+// revision can reuse the same tree projection and depth map.
+const hmbPickerOutlinerDerivedByNodes = new WeakMap();
+
+function hmbPickerOutlinerDerived(state) {
+  const roots = Array.isArray(state?.outliner_nodes) ? state.outliner_nodes : [];
+  const visibilityKey = JSON.stringify([
+    state?.outliner_expanded, state?.outliner_search, state?.depth_settings,
+  ]);
+  const cached = hmbPickerOutlinerDerivedByNodes.get(roots);
+  if (cached?.visibilityKey === visibilityKey) return cached;
+  const allNodes = cached?.allNodes || hmbPickerAllOutlinerNodes(state);
+  const derived = {
+    visibilityKey,
+    visible: filteredVisibleNodes(state),
+    allNodes,
+    depthMap: cached?.depthMap || nodeDepthMap(allNodes),
+  };
+  hmbPickerOutlinerDerivedByNodes.set(roots, derived);
+  return derived;
+}
+
 export function hmbPickerOutlinerWindow(state, scrollTop = 0, viewportHeight = 0, options = {}) {
-  const visible = filteredVisibleNodes(state);
+  const visible = hmbPickerOutlinerDerived(state).visible;
   const rowHeight = Math.max(1, Number(options.rowHeight || HMB_PICKER_OUTLINER_ROW_HEIGHT));
   const maximumRows = Math.max(24, Number(options.maximumRows || HMB_PICKER_OUTLINER_WINDOW_ROWS));
   const overscanRows = Math.max(2, Number(options.overscanRows || HMB_PICKER_OUTLINER_OVERSCAN_ROWS));
@@ -8490,10 +8558,14 @@ function outlinerHtml(state, bindings, tr, locked = false, options = {}) {
   if (!Array.isArray(state?.outliner_nodes) || !state.outliner_nodes.length) {
     return `<div class="empty-pane"><b>${escapeHtml(tr.noPreviewTitle)}</b><span>${escapeHtml(tr.noPreviewBody)}</span></div>`;
   }
-  const depthMap = nodeDepthMap(hmbPickerAllOutlinerNodes(state));
+  const derived = hmbPickerOutlinerDerived(state);
+  const depthMap = derived.depthMap;
   const expanded = new Set(state.outliner_expanded);
   const assignedByPath = new Map(bindings.map((item) => [clean(item.full_dag_path), clean(item.color)]));
-  const selectedPaths = new Set(hmbPickerSelectedOutlinerNodes(state).map(item => clean(item.full_path)));
+  const selectedPaths = clean(state.outliner_selection_scope) === hmbPickerOutlinerSelectionScope(state)
+    && Array.isArray(state.selected_outliner_paths)
+    ? new Set(state.selected_outliner_paths.map(clean))
+    : new Set(hmbPickerSelectedOutlinerNodes(state, derived.allNodes).map(item => clean(item.full_path)));
   const visibilitySlot = 1;
   const selectedVisibility = state.slot_visibility.find(
     (item) => Number(item?.video_slot || 0) === visibilitySlot,
@@ -8967,7 +9039,7 @@ function hmbVideoPickerCompactVideoHtml(state, row, video, tr, locked = false, s
     && (Array.isArray(row?.selected_video_uids) ? row.selected_video_uids.length : 0) > 1;
   const selectionLabel = selectedAsset ? tr.deselectVideoAsset : tr.selectVideoAsset;
   return `<article class="compact-shot-slot compact-shot-asset${selectedAsset ? " selected" : ""}" data-compact-asset-key="${escapeHtml(`${row.workspace_uuid}:video:${video.uid}`)}" data-compact-video-fingerprint="${escapeHtml(fingerprint)}" data-picker-shot-slot="${slot}" data-video-uid="${escapeHtml(video.uid)}" data-picker-shot-video-owner="${escapeHtml(row.workspace_uuid)}" data-selected-video-order="${Number(video.order || 0)}" ${selectedAsset ? `data-selected-video-uid="${escapeHtml(video.uid)}"` : ""} draggable="${reorderEnabled ? "true" : "false"}" title="${escapeHtml(title)}" aria-label="${escapeHtml(`${row.name} video ${slot}: ${title}`)}">
-      <div class="compact-shot-thumb${serverPoster ? " thumbnail-ready" : ""}" data-compact-thumbnail-source="${escapeHtml(thumbnailSource)}" data-compact-thumbnail-poster="${escapeHtml(serverPoster)}"><span class="compact-shot-placeholder" aria-hidden="true"${serverPoster ? " hidden" : ""}><i>VIDEO</i></span><img class="compact-video-poster" alt="" loading="lazy" decoding="async" draggable="false"${serverPoster ? ` src="${escapeHtml(serverPoster)}"` : " hidden"}><button type="button" class="compact-video-play" data-play-video-uid="${escapeHtml(video.uid)}" data-video-title="${escapeHtml(title)}" aria-label="${escapeHtml(`${title}: ${tr.playVideo || "Play"}`)}" aria-pressed="false">▶</button><small class="compact-slot-number">${String(slot).padStart(2, "0")}</small><button type="button" class="compact-video-delete" data-delete-video-uid="${escapeHtml(video.uid)}" aria-label="${escapeHtml(`${title}: ${tr.deleteVideoAsset}`)}" ${locked ? "disabled" : ""}>×</button></div>
+      <div class="compact-shot-thumb" data-compact-thumbnail-source="${escapeHtml(thumbnailSource)}" data-compact-thumbnail-poster="${escapeHtml(serverPoster)}"><span class="compact-shot-placeholder" aria-hidden="true"><i>VIDEO</i></span><img class="compact-video-poster" alt="" loading="lazy" decoding="async" draggable="false" hidden${serverPoster ? ` src="${escapeHtml(serverPoster)}"` : ""}><button type="button" class="compact-video-play" data-play-video-uid="${escapeHtml(video.uid)}" data-video-title="${escapeHtml(title)}" aria-label="${escapeHtml(`${title}: ${tr.playVideo || "Play"}`)}" aria-pressed="false">▶</button><small class="compact-slot-number">${String(slot).padStart(2, "0")}</small><button type="button" class="compact-video-delete" data-delete-video-uid="${escapeHtml(video.uid)}" aria-label="${escapeHtml(`${title}: ${tr.deleteVideoAsset}`)}" ${locked ? "disabled" : ""}>×</button></div>
       <div class="compact-video-select-label" data-toggle-video-uid="${escapeHtml(video.uid)}" role="button" tabindex="${locked ? "-1" : "0"}" aria-disabled="${locked ? "true" : "false"}" aria-pressed="${selectedAsset ? "true" : "false"}" aria-label="${escapeHtml(`${title}: ${selectionLabel}`)}">${escapeHtml(title)}</div>
     </article>`;
 }
@@ -9056,14 +9128,32 @@ export function hmbPauseVideoPickerCompactPlayerNow(container, uidValue, tr = TE
 
 function hmbApplyVideoPickerCompactPoster(thumb, dataUrl) {
   if (!thumb || !clean(dataUrl)) return false;
-  const poster = thumb.querySelector?.(".compact-video-poster") || null;
+  let pending = thumb.querySelector?.("[data-pending-compact-poster]") || null;
+  let poster = pending || thumb.querySelector?.(".compact-video-poster") || null;
   const placeholder = thumb.querySelector?.(".compact-shot-placeholder") || null;
   if (!poster) return false;
+  if (!pending && !poster.hidden && poster.complete && Number(poster.naturalWidth || 0) > 0
+    && clean(poster.getAttribute?.("src")) !== dataUrl
+    && typeof poster.cloneNode === "function" && typeof thumb.appendChild === "function") {
+    pending = poster.cloneNode(false);
+    pending.removeAttribute?.("src");
+    pending.hidden = true;
+    pending.setAttribute?.("data-pending-compact-poster", "true");
+    thumb.appendChild(pending);
+    poster = pending;
+  }
   if (clean(poster.getAttribute?.("src")) !== dataUrl) poster.setAttribute?.("src", dataUrl);
-  poster.hidden = false;
-  if (placeholder) placeholder.hidden = true;
-  thumb.classList?.add?.("thumbnail-ready");
-  thumb.removeAttribute?.("data-compact-thumbnail-failure");
+  const ready = !!poster.complete && Number(poster.naturalWidth || 0) > 0;
+  if (pending && ready) {
+    const previous = thumb.querySelector?.(".compact-video-poster") || null;
+    if (previous && previous !== pending) previous.remove?.();
+    pending.removeAttribute?.("data-pending-compact-poster");
+  }
+  if (pending && !ready) return true;
+  poster.hidden = !ready;
+  if (placeholder) placeholder.hidden = ready;
+  thumb.classList?.toggle?.("thumbnail-ready", ready);
+  if (ready) thumb.removeAttribute?.("data-compact-thumbnail-failure");
   return true;
 }
 
@@ -9083,6 +9173,7 @@ export function hmbEnsureVideoPickerCompactThumbnailController(container) {
   const retryAfter = new Map();
   const failedServerPosters = new Map();
   const queuedSources = new Set();
+  const prioritySources = new Set();
   const observed = new WeakSet();
   const queue = [];
   let busy = false;
@@ -9126,6 +9217,7 @@ export function hmbEnsureVideoPickerCompactThumbnailController(container) {
       cancelled = true;
     }
     queuedSources.delete(source);
+    prioritySources.delete(source);
     if (activeSource === source) {
       jobGeneration += 1;
       activeSource = "";
@@ -9140,6 +9232,11 @@ export function hmbEnsureVideoPickerCompactThumbnailController(container) {
     const previousPoster = clean(thumb.getAttribute?.("data-compact-thumbnail-poster"));
     thumb.removeAttribute?.("data-compact-thumbnail-poster");
     if (!previousPoster) return false;
+    const pending = thumb.querySelector?.("[data-pending-compact-poster]") || null;
+    if (pending && clean(pending.getAttribute?.("src")) === previousPoster) {
+      pending.remove?.();
+      return true;
+    }
     const poster = thumb.querySelector?.(".compact-video-poster") || null;
     if (poster && clean(poster.getAttribute?.("src")) === previousPoster) {
       poster.removeAttribute?.("src");
@@ -9156,9 +9253,17 @@ export function hmbEnsureVideoPickerCompactThumbnailController(container) {
     if (!poster || poster.parentElement !== thumb || typeof poster.cloneNode !== "function") {
       return false;
     }
+    const pending = thumb.querySelector?.("[data-pending-compact-poster]") || null;
+    pending?.remove?.();
     const replacement = poster.cloneNode(false);
     replacement.removeAttribute?.("src");
     replacement.hidden = true;
+    if (!poster.hidden && poster.complete && Number(poster.naturalWidth || 0) > 0
+      && typeof thumb.appendChild === "function") {
+      replacement.setAttribute?.("data-pending-compact-poster", "true");
+      thumb.appendChild(replacement);
+      return true;
+    }
     poster.replaceWith?.(replacement);
     thumb.classList?.remove?.("thumbnail-ready");
     const placeholder = thumb.querySelector?.(".compact-shot-placeholder") || null;
@@ -9263,6 +9368,7 @@ export function hmbEnsureVideoPickerCompactThumbnailController(container) {
       scheduleRetryWake();
     }
     queuedSources.delete(source);
+    prioritySources.delete(source);
     activeSource = "";
     busy = false;
     if (resolvedDataUrl) paintSource(source, resolvedDataUrl);
@@ -9325,7 +9431,9 @@ export function hmbEnsureVideoPickerCompactThumbnailController(container) {
     if (disposed || busy || container.__hmbVideoPickerExpanded === true) return;
     let source = "";
     while (queue.length && !source) {
-      const candidate = clean(queue.shift());
+      const priorityIndex = queue.findIndex((candidate) => prioritySources.has(candidate));
+      const candidate = clean(queue.splice(priorityIndex >= 0 ? priorityIndex : 0, 1)[0]);
+      prioritySources.delete(candidate);
       if (!candidate || cache.has(candidate)) queuedSources.delete(candidate);
       else source = candidate;
     }
@@ -9393,7 +9501,7 @@ export function hmbEnsureVideoPickerCompactThumbnailController(container) {
       settle(source, generation, jobProbe, "", "load_error");
     }
   }
-  const enqueue = (thumb) => {
+  const enqueue = (thumb, priority = false) => {
     if (disposed || !thumb) return false;
     const suppliedPoster = clean(thumb.getAttribute?.("data-compact-thumbnail-poster"));
     if (suppliedPoster) {
@@ -9413,6 +9521,7 @@ export function hmbEnsureVideoPickerCompactThumbnailController(container) {
       queuedSources.add(source);
       queue.push(source);
     }
+    if (priority) prioritySources.add(source);
     processNext();
     return true;
   };
@@ -9423,7 +9532,7 @@ export function hmbEnsureVideoPickerCompactThumbnailController(container) {
       for (const entry of entries || []) {
         if (!entry?.isIntersecting) continue;
         observer?.unobserve?.(entry.target);
-        enqueue(entry.target);
+        enqueue(entry.target, true);
       }
     }, { root: null, rootMargin: "240px" });
   }
@@ -9438,11 +9547,13 @@ export function hmbEnsureVideoPickerCompactThumbnailController(container) {
     for (let index = queue.length - 1; index >= 0; index -= 1) {
       if (liveSources.has(queue[index])) continue;
       queuedSources.delete(queue[index]);
+      prioritySources.delete(queue[index]);
       queue.splice(index, 1);
     }
     if (activeSource && !liveSources.has(activeSource)) {
       jobGeneration += 1;
       queuedSources.delete(activeSource);
+      prioritySources.delete(activeSource);
       activeSource = "";
       busy = false;
       resetProbe();
@@ -9498,6 +9609,7 @@ export function hmbEnsureVideoPickerCompactThumbnailController(container) {
     activeSource = "";
     queue.length = 0;
     queuedSources.clear();
+    prioritySources.clear();
     cache.clear();
     retryAfter.clear();
     failedServerPosters.clear();
@@ -9816,6 +9928,121 @@ export function hmbVideoPickerPlaybackFailureKind(error, media = null) {
   return "media-error";
 }
 
+// Keep the decoded Snapshot currently on screen until its successor is ready.
+// Changing the src of the visible <img> exposes an empty decode frame, most
+// noticeably when Previous/Next wraps from one end of history to the other.
+export function hmbStageVideoPickerSnapshotImage(container, snapshotUrl) {
+  const stage = container?.querySelector?.(".compact-preview")
+    || container?.querySelector?.(".viewport-stage");
+  const ownerDocument = stage?.ownerDocument || (typeof document !== "undefined" ? document : null);
+  if (!stage || !ownerDocument?.createElement || !clean(snapshotUrl)) return false;
+  const existing = stage.querySelector?.("#picker-snapshot-image");
+  const pending = container.__hmbPendingPickerSnapshotImage;
+  if (pending?.stage === stage && pending.url === snapshotUrl) return true;
+  delete container.__hmbPendingPickerSnapshotImage;
+  const showSnapshot = (image) => {
+    image.hidden = false;
+    const video = stage.querySelector?.("#picker-video");
+    const empty = stage.querySelector?.(".viewport-empty");
+    if (video) video.hidden = true;
+    if (empty) empty.hidden = true;
+    hmbClearPickerPreviewLoadFailure(container);
+  };
+  if (existing && clean(existing.getAttribute?.("src")) === snapshotUrl) {
+    // The mounted image can already be decoded (for example after returning
+    // from Video mode). Never assign its src a second time.
+    if (existing.complete !== false && Number(existing.naturalWidth || 0) > 0) {
+      showSnapshot(existing);
+    } else {
+      const request = { stage, url: snapshotUrl, image: existing };
+      container.__hmbPendingPickerSnapshotImage = request;
+      const currentRequest = () => container.__hmbPendingPickerSnapshotImage === request
+        && container.__hmbVideoPickerDeleted !== true
+        && (container.querySelector?.(".compact-preview") || container.querySelector?.(".viewport-stage")) === stage;
+      const showLoaded = () => {
+        if (!currentRequest()) return;
+        showSnapshot(existing);
+        delete container.__hmbPendingPickerSnapshotImage;
+      };
+      const fail = () => {
+        if (!currentRequest()) return;
+        delete container.__hmbPendingPickerSnapshotImage;
+        hmbShowPickerPreviewLoadFailure(container, "The selected snapshot could not be loaded. The previous preview is still shown.");
+      };
+      let decodeStarted = false;
+      const onLoad = () => {
+        if (decodeStarted || !currentRequest()) return;
+        decodeStarted = true;
+        if (typeof existing.decode !== "function") { showLoaded(); return; }
+        try {
+          Promise.resolve(existing.decode()).then(showLoaded, () => {
+            if (existing.complete && Number(existing.naturalWidth || 0) > 0) showLoaded();
+            else fail();
+          });
+        } catch (_error) {
+          if (existing.complete && Number(existing.naturalWidth || 0) > 0) showLoaded();
+          else fail();
+        }
+      };
+      existing.addEventListener?.("load", onLoad, { once: true });
+      existing.addEventListener?.("error", fail, { once: true });
+      // A cache hit can complete between the readiness check and listeners.
+      if (existing.complete && Number(existing.naturalWidth || 0) > 0) onLoad();
+    }
+    return true;
+  }
+  const nextImage = ownerDocument.createElement("img");
+  nextImage.id = "picker-snapshot-image";
+  nextImage.className = "preview-image";
+  nextImage.alt = "Colored snapshot";
+  const request = { stage, url: snapshotUrl, image: nextImage };
+  container.__hmbPendingPickerSnapshotImage = request;
+  const currentRequest = () => (
+    container.__hmbPendingPickerSnapshotImage === request
+    && container.__hmbVideoPickerDeleted !== true
+    && (container.querySelector?.(".compact-preview") || container.querySelector?.(".viewport-stage")) === stage
+  );
+  const publish = () => {
+    if (!currentRequest()) return;
+    const mounted = stage.querySelector?.("#picker-snapshot-image");
+    if (mounted?.replaceWith) mounted.replaceWith(nextImage);
+    else {
+      stage.insertBefore?.(nextImage, stage.querySelector?.("#picker-preview-load-status") || stage.firstChild || null);
+      mounted?.remove?.();
+    }
+    showSnapshot(nextImage);
+    delete container.__hmbPendingPickerSnapshotImage;
+  };
+  const fail = () => {
+    if (!currentRequest()) return;
+    delete container.__hmbPendingPickerSnapshotImage;
+    hmbShowPickerPreviewLoadFailure(
+      container,
+      "The selected snapshot could not be loaded. The previous preview is still shown.",
+    );
+  };
+  let decodeStarted = false;
+  const onLoad = () => {
+    if (decodeStarted || !currentRequest()) return;
+    decodeStarted = true;
+    if (typeof nextImage.decode !== "function") { publish(); return; }
+    try {
+      Promise.resolve(nextImage.decode()).then(publish, () => {
+        if (nextImage.complete && Number(nextImage.naturalWidth || 0) > 0) publish();
+        else fail();
+      });
+    } catch (_error) {
+      if (nextImage.complete && Number(nextImage.naturalWidth || 0) > 0) publish();
+      else fail();
+    }
+  };
+  nextImage.addEventListener?.("load", onLoad, { once: true });
+  nextImage.addEventListener?.("error", fail, { once: true });
+  nextImage.setAttribute?.("src", snapshotUrl);
+  if (nextImage.complete && Number(nextImage.naturalWidth || 0) > 0) onLoad();
+  return true;
+}
+
 export function hmbPatchVideoPickerPreviewDom(container, stateValue, tr = TEXT.en, options = {}) {
   const stage = container?.querySelector?.(".compact-preview") || container?.querySelector?.(".viewport-stage");
   const ownerDocument = stage?.ownerDocument || (typeof document !== "undefined" ? document : null);
@@ -9826,6 +10053,7 @@ export function hmbPatchVideoPickerPreviewDom(container, stateValue, tr = TEXT.e
   let snapshot = stage.querySelector?.("#picker-snapshot-image");
   let empty = stage.querySelector?.(".viewport-empty");
   if (descriptor.kind === "video") {
+    delete container.__hmbPendingPickerSnapshotImage;
     if (snapshot) snapshot.hidden = true;
     if (empty) empty.hidden = true;
     if (!video) {
@@ -9884,18 +10112,10 @@ export function hmbPatchVideoPickerPreviewDom(container, stateValue, tr = TEXT.e
   } else if (descriptor.kind === "snapshot") {
     hmbCancelVideoPickerPlaybackIntent(container, video);
     hmbPauseVideoPickerWithDebt(video);
-    if (video) video.hidden = true;
-    if (empty) empty.hidden = true;
-    if (!snapshot) {
-      snapshot = ownerDocument.createElement("img");
-      snapshot.id = "picker-snapshot-image";
-      snapshot.className = "preview-image";
-      snapshot.alt = "Colored snapshot";
-      stage.insertBefore?.(snapshot, status || stage.firstChild || null);
-    }
-    snapshot.hidden = false;
-    if (clean(snapshot.getAttribute?.("src")) !== descriptor.url) snapshot.setAttribute?.("src", descriptor.url);
+    hmbStageVideoPickerSnapshotImage(container, descriptor.url);
+    snapshot = stage.querySelector?.("#picker-snapshot-image");
   } else {
+    delete container.__hmbPendingPickerSnapshotImage;
     hmbCancelVideoPickerPlaybackIntent(container, video);
     hmbPauseVideoPickerWithDebt(video);
     if (video) video.hidden = true;
@@ -10648,32 +10868,29 @@ export function hmbSetPickerVisibilityBusy(container, busy) {
   }
 }
 
-export function hmbApplySnapshotNavigationFeedback(container, snapshot, tr, frameStart, fps) {
+export function hmbApplySnapshotNavigationFeedback(container, snapshot, tr, frameStart, fps, stateValue = null) {
+  // The crop/concatenate preview owns this viewport while its tab is active.
+  // Keep the selected Snapshot in state for Video Output without replacing the
+  // tool's current media surface.
+  if (stateValue && hmbPickerToolsOverride(stateValue, container)) return true;
   const snapshotUrl = hmbSnapshotMediaUrl(snapshot);
   const frame = Number(snapshot?.frame || frameStart || 0);
-  const image = container?.querySelector?.("#picker-snapshot-image");
   const title = container?.querySelector?.(".viewport-title small");
   if (title) title.textContent = `(${clean(tr?.snapshot) || "Snapshot"})`;
-  if (image && snapshotUrl) {
-    image.setAttribute?.("src", snapshotUrl);
-    try { image.src = snapshotUrl; } catch (_error) {}
-    const frameInput = container?.querySelector?.("#video-frame-number");
-    const seek = container?.querySelector?.("#video-seek");
-    const frameInfo = container?.querySelector?.("#frame-info-frame");
-    const timeInfo = container?.querySelector?.("#frame-info-time");
-    if (frameInput) frameInput.value = String(Math.round(frame));
-    if (seek) seek.value = String(Math.round(frame));
-    if (frameInfo) {
-      const end = Math.round(Number(frameInput?.max || seek?.max || frame));
-      frameInfo.textContent = `${Math.round(frame)} / ${end}`;
-    }
-    if (timeInfo) timeInfo.textContent = formatFrameTimecode(frame, frameStart, fps);
-    return true;
+  const frameInput = container?.querySelector?.("#video-frame-number");
+  const seek = container?.querySelector?.("#video-seek");
+  const frameInfo = container?.querySelector?.("#frame-info-frame");
+  const timeInfo = container?.querySelector?.("#frame-info-time");
+  if (frameInput) frameInput.value = String(Math.round(frame));
+  if (seek) seek.value = String(Math.round(frame));
+  if (frameInput) frameInput.disabled = true;
+  if (seek) seek.disabled = true;
+  if (frameInfo) {
+    const end = Math.round(Number(frameInput?.max || seek?.max || frame));
+    frameInfo.textContent = `${Math.round(frame)} / ${end}`;
   }
-  const panel = container?.querySelector?.(".viewport-panel");
-  panel?.classList?.add?.("is-switching");
-  panel?.setAttribute?.("aria-busy", "true");
-  return false;
+  if (timeInfo) timeInfo.textContent = formatFrameTimecode(frame, frameStart, fps);
+  return hmbStageVideoPickerSnapshotImage(container, snapshotUrl);
 }
 
 export function hmbClearPickerPreviewLoadFailure(container) {
@@ -11726,6 +11943,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       hmbCancelVideoPickerPendingPreviewStart(container);
       hmbCancelVideoPickerPlaybackIntent(container);
       delete container.__hmbPickerPreviewPlaybackFrames;
+      delete container.__hmbPendingPickerSnapshotImage;
     }
     hmbRestoreVideoPickerExpandedHostHeightPropagation(container);
     hmbRestoreVideoPickerCompactTailReclaim(container);
@@ -12052,7 +12270,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     <div class="hmbvp-clip nodrag"><div class="hmbvp" data-picker-view="expanded" data-theme="${uiTheme}" data-shot-number="${shotPalette.number}" data-state-revision="${Number(state.state_revision || 0)}" data-canvas-motion="false" style="${shotPaletteStyle}">
       ${fixedTopMarkup}
       <div class="scene-load-bar">
-        <span class="scene-load-label" title="${escapeHtml(state.language === "en" ? "Shared Maya input for every Shot" : "모든 Shot이 공유하는 Maya 입력")}">MAYA INPUT</span>
+        <span class="scene-load-label" title="${escapeHtml(state.language === "en" ? "Shared Maya or Blender input for every Shot" : "모든 Shot이 공유하는 Maya 또는 Blender 입력")}">${/\.blend$/i.test(mayaSceneDraftPath) ? "BLENDER INPUT" : "MAYA INPUT"}</span>
         <input type="text" class="scene-path-input nodrag" id="maya-scene-path" value="${escapeHtml(mayaSceneDraftPath)}" placeholder="${escapeHtml(tr.scenePath)}" ${runningOperation ? "disabled" : ""}/>
         <button type="button" id="browse-maya-scene" ${runningOperation ? "disabled" : ""}>${escapeHtml(tr.browse)}</button>
         <button type="button" class="load-scene-button read-button" id="read-scene" ${!buttonAvailability.readEnabled ? "disabled" : ""}>${escapeHtml(tr.read)}</button>
@@ -12090,7 +12308,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
             <div class="settings-grid settings-grid-inline">
               <label class="settings-primary-item"><span class="settings-primary-label">${escapeHtml(tr.resolution)}</span><select id="playblast-resolution" class="setting-select" ${runningOperation ? "disabled" : ""}>${HMB_PLAYBLAST_RESOLUTIONS.map((item) => `<option value="${item.value}" ${item.width === Number(state.output_width) && item.height === Number(state.output_height) ? "selected" : ""}>${item.label}</option>`).join("")}</select></label>
               <div class="settings-primary-item"><span class="settings-primary-label">${escapeHtml(tr.frameRange)}</span><span class="setting-value split"><b data-picker-maya-frame-start>${escapeHtml(frameStartText)}</b><span>–</span><b data-picker-maya-frame-end>${escapeHtml(frameEndText)}</b></span></div>
-              <div class="settings-compact-row"><span class="settings-compact-item"><b>${escapeHtml(tr.fps)}</b><span data-picker-maya-fps>${escapeHtml(fpsText)}</span></span><span class="settings-compact-item" title="${escapeHtml(`${tr.format}: MPEG-4 / H.264`)}"><b>${escapeHtml(tr.format)}</b><span>H.264</span></span><span class="settings-compact-item" title="${escapeHtml(`${tr.mayaVersion}: ${state.maya_version ? `Maya ${state.maya_version}` : tr.autoDetect}`)}"><b>${escapeHtml(tr.mayaVersion)}</b><span>${escapeHtml(state.maya_version || tr.autoDetect)}</span></span></div>
+              <div class="settings-compact-row"><span class="settings-compact-item"><b>${escapeHtml(tr.fps)}</b><span data-picker-maya-fps>${escapeHtml(fpsText)}</span></span><span class="settings-compact-item" title="${escapeHtml(`${tr.format}: MPEG-4 / H.264`)}"><b>${escapeHtml(tr.format)}</b><span>H.264</span></span><span class="settings-compact-item" data-picker-engine-metadata title="${escapeHtml(/\.blend$/i.test(mayaSceneDraftPath) ? `Blender: ${state.blender_version || tr.autoDetect}` : `${tr.mayaVersion}: ${state.maya_version ? `Maya ${state.maya_version}` : tr.autoDetect}`)}"><b data-picker-engine-label>${/\.blend$/i.test(mayaSceneDraftPath) ? "Blender" : escapeHtml(tr.mayaVersion)}</b><span data-picker-engine-version>${escapeHtml((/\.blend$/i.test(mayaSceneDraftPath) ? state.blender_version : state.maya_version) || tr.autoDetect)}</span></span></div>
             </div>
           </div>
           <div class="picker-tools-resize nodrag nopan nowheel" data-picker-tools-resize role="separator" aria-orientation="horizontal" tabindex="0" hidden></div>
@@ -13691,14 +13909,32 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     );
     activeCleanup.push(() => hmbReleaseVideoPickerCompactSharedPlayer(container));
     activeCleanup.push(() => hmbDisposeVideoPickerCompactThumbnailController(container));
+    on(container, "load", (event) => {
+      if (container.__hmbVideoPickerExpanded === true) return;
+      const poster = event?.target;
+      if (!poster?.classList?.contains?.("compact-video-poster")) return;
+      const thumb = poster.closest?.("[data-compact-thumbnail-source]") || null;
+      if (!thumb || (
+        poster !== thumb.querySelector?.(".compact-video-poster")
+        && poster !== thumb.querySelector?.("[data-pending-compact-poster]")
+      )) return;
+      const source = clean(poster.getAttribute?.("src"));
+      if (!source) return;
+      const supplied = clean(thumb.getAttribute?.("data-compact-thumbnail-poster"));
+      if (supplied && supplied !== source) return;
+      hmbApplyVideoPickerCompactPoster(thumb, source);
+    }, true);
     const recoverFailedCompactPoster = (event) => {
       if (container.__hmbVideoPickerExpanded === true) return;
       const poster = event?.target;
       if (!poster?.classList?.contains?.("compact-video-poster")) return;
       const thumb = poster.closest?.("[data-compact-thumbnail-source]") || null;
       if (!thumb) return;
+      const currentPosterUrl = clean(thumb.getAttribute?.("data-compact-thumbnail-poster"));
+      if (!currentPosterUrl) return;
+      if (currentPosterUrl && clean(poster.getAttribute?.("src")) !== currentPosterUrl) return;
       const failedPosterUrl = clean(
-        thumb.getAttribute?.("data-compact-thumbnail-poster")
+        currentPosterUrl
         || poster.getAttribute?.("src")
         || poster.currentSrc,
       );
@@ -13836,6 +14072,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       liveTr,
       frameContext.start,
       frameContext.fps,
+      next,
     );
     commit(next, { suppressMatchingEcho: snapshotUpdated });
   };
@@ -13947,7 +14184,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
           stopNativeSelectionPolling(true, browseActionId);
           for (const pendingTimer of nativeRefreshTimers) window.clearTimeout(pendingTimer);
           nativeRefreshTimers.clear();
-          if (selectedPath) appendImmediateLogLine("SUCCESS", `Maya scene selected: ${selectedPath}`);
+          if (selectedPath) appendImmediateLogLine("SUCCESS", `Scene selected: ${selectedPath}`);
           return;
         }
         if (focusReturnedFromBrowse && delay > 0 && hmbNativeMayaBrowseSessionActive(container)) {
@@ -13993,7 +14230,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       if (!selectedPath || mayaScenePathKey(selectedPath) === mayaScenePathKey(pathBeforeBrowse)) return;
       syncNativeMayaPath({ explicitBrowseResult: true });
       stopNativeSelectionPolling(true, ownerActionId);
-      appendImmediateLogLine("SUCCESS", `Maya scene selected: ${selectedPath}`);
+      appendImmediateLogLine("SUCCESS", `Scene selected: ${selectedPath}`);
     };
     const scheduleNextCheck = () => {
       if (!hmbNativeMayaBrowseSessionOwnedBy(container, ownerActionId)) return;
@@ -14035,7 +14272,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
         appendImmediateLogLine("ERROR", "The native Maya scene browser command could not be delivered to HMB_PICKER_COMMAND.");
       }
     } else {
-      appendImmediateLogLine("INFO", "Opening the native Maya .ma/.mb scene browser.");
+      appendImmediateLogLine("INFO", "Opening the native Maya .ma/.mb or Blender .blend scene browser.");
       if (result.deliveryPromise) {
         result.deliveryPromise.then((outcome) => {
           if (outcome?.ok) return;
@@ -14088,15 +14325,15 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       !!container.__hmbOriginalCommandPending,
     );
     if (!isMayaScenePath(liveScenePath)) {
-      appendImmediateLogLine("ERROR", `${sourceLabel} requires a Maya .mb or .ma absolute path.`);
+      appendImmediateLogLine("ERROR", `${sourceLabel} requires a Maya .mb/.ma or Blender .blend absolute path.`);
       return false;
     }
     if (!currentAvailability.readEnabled) {
       appendImmediateLogLine(
         "WARNING",
-        currentLocal.maya_available
+        ((/\.blend$/i.test(liveScenePath) ? currentLocal.blender_available : currentLocal.maya_available))
           ? "READ is already pending, running, or complete for this scene."
-          : "READ is disabled because no Maya mayabatch executable is available.",
+          : `READ is disabled because no ${/\.blend$/i.test(liveScenePath) ? "Blender" : "Maya mayabatch"} executable is available.`,
       );
       return false;
     }
@@ -14527,7 +14764,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   const renderVirtualOutlinerWindow = () => {
     outlinerVirtualScrollFrame = 0;
     if (!outlinerScroll) return;
-    const liveState = currentWidgetState();
+    const liveState = currentWidgetState(false);
     const desired = hmbPickerOutlinerWindow(
       liveState,
       Number(outlinerScroll.scrollTop || 0),
@@ -14960,6 +15197,20 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       const safeScale = Number.isFinite(renderScale) && renderScale > 0.05 ? renderScale : 1;
       let latestHeight = startHeight;
       let dragClosed = false;
+      let sectionResizeFrame = 0;
+      const requestSectionFrame = typeof window.requestAnimationFrame === "function"
+        ? window.requestAnimationFrame.bind(window)
+        : (callback) => window.setTimeout(callback, 0);
+      const cancelSectionFrame = typeof window.cancelAnimationFrame === "function"
+        ? window.cancelAnimationFrame.bind(window)
+        : window.clearTimeout.bind(window);
+      const applySectionHeight = () => {
+        sectionResizeFrame = 0;
+        if (dragClosed) return;
+        section.style.height = `${latestHeight}px`;
+        section.style.flexBasis = `${latestHeight}px`;
+        hmbApplyPickerHostSizing(container, hmbPickerInnerRequiredHeight(container));
+      };
       const originalInlineHeight = {
         value: clean(section.style?.getPropertyValue?.("height") || section.style?.height),
         priority: clean(section.style?.getPropertyPriority?.("height")),
@@ -14990,12 +15241,12 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
         moveEvent.preventDefault();
         const screenDelta = Number(moveEvent.clientY || startY) - startY;
         latestHeight = clamp(Math.round(startHeight + screenDelta / safeScale), 96, 900);
-        section.style.height = `${latestHeight}px`;
-        section.style.flexBasis = `${latestHeight}px`;
-        hmbApplyPickerHostSizing(container, hmbPickerInnerRequiredHeight(container));
+        if (!sectionResizeFrame) sectionResizeFrame = requestSectionFrame(applySectionHeight);
       };
       const cleanupGesture = () => {
         if (dragClosed) return false;
+        if (sectionResizeFrame) cancelSectionFrame(sectionResizeFrame);
+        sectionResizeFrame = 0;
         dragClosed = true;
         window.removeEventListener("pointermove", move, true);
         window.removeEventListener("pointerup", end, true);
@@ -15018,6 +15269,9 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       };
       const end = () => {
         if (!cleanupGesture()) return;
+        section.style.height = `${latestHeight}px`;
+        section.style.flexBasis = `${latestHeight}px`;
+        hmbApplyPickerHostSizing(container, hmbPickerInnerRequiredHeight(container));
         pointerInteractionActive = false;
         const currentLocal = normalize(container.__hmbPendingPickerState || state);
         const heights = hmbNormalizeRightSectionHeights(currentLocal.right_section_heights);

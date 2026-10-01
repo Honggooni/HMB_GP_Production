@@ -680,7 +680,7 @@ hydration_publications = []
 finish_wire = {"value": None}
 
 
-def publish_hydrated_finish(name, value, *, live):
+def publish_hydrated_finish(name, value, *, live, stage_output=True):
     assert live is True
     hydration_publications.append((name, deepcopy(value)))
     if name == finish_target.SHOT_FINISH_LOOK_OUTPUT_PARAMETER_NAME:
@@ -692,6 +692,8 @@ hydrated_finish._publish_parameter = publish_hydrated_finish
 hydrated_finish._reconcile_shared_shot_routing = lambda: hydrated_finish._hmb_publish_routed_finish_snapshot(force=True)
 with mock.patch.object(target._shot_routing, "schedule_post_hydration_reconcile", return_value=False):
     hydrated_finish.after_deserialize()
+assert hydrated_finish._hmb_finish_live_publication_owner > 0
+assert isinstance(hydrated_finish._hmb_finish_live_values, dict)
 assert hydrated_finish._last_valid_state == finish_value["finish_look_state"]
 assert hydrated_finish._widget_state["finish_look"]["schema_version"] == 2
 assert "film" not in hydrated_finish._widget_state["finish_look"]

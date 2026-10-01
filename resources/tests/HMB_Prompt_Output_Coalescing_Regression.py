@@ -1207,7 +1207,7 @@ assert pending_picker.snapshot_calls == 1
 dashboard_writer_source = inspect.getsource(
     prompt.HMBPromptLibrary._write_dashboard_state
 )
-assert dashboard_writer_source.count("_json_dumps(state)") == 2
+assert dashboard_writer_source.count("_json_dumps(state)") == 3
 assert "serialized_state = _json_dumps(state)" in dashboard_writer_source
 assert "serialized_state != state_before_source_sync" in dashboard_writer_source
 assert (
@@ -1220,6 +1220,36 @@ assert (
     "_set_parameter_value(self, WIDGET_PARAMETER_NAME, serialized_state)"
     in dashboard_writer_source
 )
+
+# The dashboard has already been normalized before exact-route projection.
+# Reusing it removes one full image/video walk while preserving the projected
+# value. The final normalization in the projector remains authoritative.
+recomposition_node = prompt.HMBPromptLibrary(name="prompt_recomposition")
+canonical_state = prompt._normalize_state(prompt._default_widget_state())
+original_normalize_state = prompt._normalize_state
+normalize_calls = []
+
+
+def counted_normalize_state(value):
+    normalize_calls.append(1)
+    return original_normalize_state(value)
+
+
+prompt._normalize_state = counted_normalize_state
+try:
+    pre_normalized_projection = recomposition_node._apply_exact_shot_routes(
+        copy.deepcopy(canonical_state), already_normalized=True
+    )
+    optimized_calls = len(normalize_calls)
+    normalize_calls.clear()
+    default_projection = recomposition_node._apply_exact_shot_routes(
+        copy.deepcopy(canonical_state)
+    )
+    default_calls = len(normalize_calls)
+finally:
+    prompt._normalize_state = original_normalize_state
+assert pre_normalized_projection == default_projection
+assert optimized_calls + 1 == default_calls
 
 
 print("HMB Prompt paired-output coalescing regression passed.")

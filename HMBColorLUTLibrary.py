@@ -198,7 +198,10 @@ class HMBColorLUTLibrary(DataNode):
                 message = {"Loading video…": "영상을 불러오는 중…", "Processing original source…": "원본 영상 처리 중…",
                     "Encoding original source…": "원본 영상 인코딩 중…", "Preset saved.": "프리셋을 저장했습니다.",
                     "A local operation is already running.": "로컬 작업이 이미 진행 중입니다."}.get(message, message)
-            self._hmb_color_lut_state["status"] = {"phase": phase, "message": message, "progress": progress}
+            status = {"phase": phase, "message": message, "progress": progress}
+            if status == self._hmb_color_lut_state["status"]:
+                return
+            self._hmb_color_lut_state["status"] = status
         self._publish()
 
     def _remember_selection(self) -> None:
@@ -632,8 +635,10 @@ class HMBColorLUTLibrary(DataNode):
     def process(self) -> None:
         # Workflow traversal only refreshes the source; paid upstream generation
         # is never invoked by the widget's local preview/export commands.
+        # _queue_source publishes when the source actually changes. A second
+        # unconditional full-state publication here duplicates that large
+        # payload and can stall the editor without changing any output.
         self._queue_source(_raw_parameter(self, SOURCE))
-        self._publish()
 
     def after_node_deleted(self, *args: Any, **kwargs: Any) -> Any:
         if self._hmb_node_deleted:

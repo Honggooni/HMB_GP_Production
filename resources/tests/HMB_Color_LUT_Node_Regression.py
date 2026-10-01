@@ -104,6 +104,19 @@ class ColorLUTNodeRegression(unittest.TestCase):
         self.node._queue_source(self.source(**changes))
         self.drain()
 
+    def test_unchanged_status_and_process_do_not_republish_full_dashboard(self):
+        self.node.publish_update_to_parameter.reset_mock()
+        self.node._status("idle", "", 0)
+        self.node.process()
+        self.node.publish_update_to_parameter.assert_not_called()
+        self.node._status("working", "Encoding original source…", .25)
+        self.assertEqual(self.node.publish_update_to_parameter.call_count, 1)
+        self.node._status("working", "Encoding original source…", .25)
+        self.node.process()
+        self.assertEqual(self.node.publish_update_to_parameter.call_count, 1)
+        self.node._status("working", "Encoding original source…", .5)
+        self.assertEqual(self.node.publish_update_to_parameter.call_count, 2)
+
     def successful_export(self, source, destination, settings, **kwargs):
         destination = Path(destination)
         if destination.exists():

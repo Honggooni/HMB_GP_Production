@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import suppress
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import importlib.util
 from pathlib import Path
@@ -64,6 +65,7 @@ def install_fake_static_manager() -> None:
 def reset_thumbnail_cache() -> None:
     picker._VIDEO_THUMBNAIL_URLS.clear()
     picker._VIDEO_THUMBNAIL_ATTEMPTED.clear()
+    picker._VIDEO_THUMBNAIL_SOURCE_LOCKS.clear()
     picker._VIDEO_THUMBNAIL_FFMPEG = None
     picker._VIDEO_THUMBNAIL_FFMPEG_RESOLVED = False
     published_static_files.clear()
@@ -150,6 +152,24 @@ try:
     ) as temporary:
         media_path = Path(temporary) / "source.mp4"
         media_path.write_bytes(b"local-video-source")
+
+        repeated = fifty_video_state(media_path)
+        repeated["original_video_path"] = str(media_path.resolve())
+        original_probe = picker._probe_readable_video_reference
+        probe_calls: list[str] = []
+
+        def counted_probe(value):
+            probe_calls.append(str(value))
+            return original_probe(value)
+
+        picker._probe_readable_video_reference = counted_probe
+        try:
+            refreshed, _ = picker._refresh_saved_video_media_urls(repeated)
+        finally:
+            picker._probe_readable_video_reference = original_probe
+        assert len(probe_calls) == 1, "One saved source needs one restore probe."
+        assert refreshed["saved_video_restore_count"] == 50
+        assert refreshed["original_video_url"]
 
         immediate_calls: list[list[str]] = []
 
@@ -304,6 +324,34 @@ try:
             not item["thumbnail_url"]
             for item in retired_store["value"]["videos"]
         )
+
+        # Independent files may decode concurrently, while publication stays
+        # serialized by the static-file/cache lock.
+        reset_thumbnail_cache()
+        second_media = Path(temporary) / "source-two.mp4"
+        second_media.write_bytes(b"another-local-video-source")
+        decode_barrier = threading.Barrier(2)
+
+        def concurrent_run(_command, **_kwargs):
+            decode_barrier.wait(timeout=5.0)
+            return SimpleNamespace(
+                returncode=0,
+                stdout=b"\x89PNG\r\n\x1a\nparallel-poster",
+                stderr=b"",
+            )
+
+        picker.subprocess.run = concurrent_run
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            first_future = workers.submit(
+                picker._video_asset_thumbnail_url, media_path, "parallel-a"
+            )
+            second_future = workers.submit(
+                picker._video_asset_thumbnail_url, second_media, "parallel-b"
+            )
+            first_url, first_signature = first_future.result(timeout=8.0)
+            second_url, second_signature = second_future.result(timeout=8.0)
+        assert first_url and second_url and first_signature != second_signature
+        assert len(published_static_files) == 2
 finally:
     picker.subprocess.run = saved_run
     picker._find_ffmpeg = saved_find_ffmpeg

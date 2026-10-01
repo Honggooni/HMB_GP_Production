@@ -78,6 +78,7 @@ except Exception:
 
 
 MAYA_RUNNER = _THIS_DIR / "resources" / "maya" / "HMB_Maya_Background_Preview.py"
+BLENDER_RUNNER = _THIS_DIR / "resources" / "blender" / "HMB_Blender_Background_Preview.py"
 MARKER_CATALOG_PATH = _THIS_DIR / "resources" / "picker" / "HMB_Marker_Catalog.json"
 WIDGET_NAME = "HMBVideoPickerLibraryWidget"
 WIDGET_LIBRARY_NAME = "HMB_GP_Production"
@@ -189,6 +190,12 @@ MOTION_GUIDE_SOURCE_TYPE = "Motion Guide / Retargeting Reference"
 MOTION_GUIDE_CONTROL_ROLE = "Derived Motion Decoding Only"
 ORIGINAL_MEDIA_KIND = "maya_original_playblast"
 MASK_MEDIA_KIND = "maya_color_assignment_mask"
+BLENDER_ORIGINAL_MEDIA_KIND = "blender_original_render"
+BLENDER_MASK_MEDIA_KIND = "blender_color_assignment_mask"
+BLENDER_DEPTH_MEDIA_KIND = "blender_depth_render"
+BLENDER_MOTION_GUIDE_MEDIA_KIND = "blender_motion_guide"
+BLENDER_DEPTH_PROFILE = "hmb_blender_camera_depth_v1"
+BLENDER_MOTION_GUIDE_PROFILE = "hmb_blender_motion_guide_v1"
 PRIMARY_COLOR_VIDEO_SLOT = 1
 MAX_SELECTED_VIDEOS = 10
 # Selection/output order remains bounded to ten within the active Shot. Durable
@@ -225,6 +232,8 @@ _VIDEO_THUMBNAIL_RUNTIME_ID = uuid.uuid4().hex
 _VIDEO_THUMBNAIL_LOCK = threading.RLock()
 _VIDEO_THUMBNAIL_URLS: Dict[str, str] = {}
 _VIDEO_THUMBNAIL_ATTEMPTED: set[str] = set()
+_VIDEO_THUMBNAIL_SOURCE_LOCKS: Dict[str, threading.Lock] = {}
+_VIDEO_THUMBNAIL_DECODE_SLOTS = threading.BoundedSemaphore(2)
 _VIDEO_THUMBNAIL_FFMPEG: Optional[Path] = None
 _VIDEO_THUMBNAIL_FFMPEG_RESOLVED = False
 PICKER_DEFAULT_WORKSPACE_UUID = "00000000-0000-4000-8000-000000000001"
@@ -3853,8 +3862,8 @@ def _add_maya_scene_picker(node: Any) -> None:
         )
         return
     tooltip = (
-        "Select one Maya .mb or .ma scene. READ loads cameras, exact frame range, "
-        "FPS, and Outliner metadata with the highest installed Maya; it does not render video."
+        "Select one Maya .mb/.ma or Blender .blend scene. READ loads cameras, exact frame range, "
+        "FPS, and Outliner metadata with the matching installed scene engine; it does not render video."
     )
     trait = None
     if FileSystemPicker is not None:
@@ -3862,8 +3871,8 @@ def _add_maya_scene_picker(node: Any) -> None:
         # unfiltered fallback could succeed on newer Griptape builds and turn
         # this Maya picker into the same generic/video browser used by Preview.
         for trait_kwargs in (
-            {"allow_files": True, "allow_directories": False, "multiple": False, "file_types": [".mb", ".ma"]},
-            {"allow_files": True, "file_types": [".mb", ".ma"]},
+            {"allow_files": True, "allow_directories": False, "multiple": False, "file_types": [".mb", ".ma", ".blend"]},
+            {"allow_files": True, "file_types": [".mb", ".ma", ".blend"]},
         ):
             try:
                 trait = FileSystemPicker(**trait_kwargs)
@@ -4179,6 +4188,7 @@ def _default_widget_state() -> Dict[str, Any]:
         "marker_catalog_version": int(MARKER_CATALOG["version"]),
         "scene_request_path": "",
         "mode": "maya",
+        "scene_engine": "maya",
         "status": "READY",
         "message": "Browse to a Maya scene, then press READ.",
         "video_path": "",
@@ -4237,6 +4247,9 @@ def _default_widget_state() -> Dict[str, Any]:
         "maya_executable": "",
         "maya_version": "",
         "maya_available": False,
+        "blender_executable": "",
+        "blender_version": "",
+        "blender_available": False,
         "active_process_pid": 0,
         "active_process_kind": "",
         "last_log_path": "",
@@ -5589,6 +5602,12 @@ def _video_frame_metadata(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
     A disagreement is reported instead of shifting either side automatically.
     """
     source = item if isinstance(item, dict) else {}
+    blender_origin = (
+        _clean(source.get("scene_engine")) == "blender"
+        or _clean(source.get("media_kind")).startswith("blender_")
+        or _clean(source.get("video_role")).startswith("blender_")
+    )
+    range_engine = "Blender" if blender_origin else "Maya"
     warnings: List[str] = []
 
     decoded_frame_count = next(
@@ -5725,7 +5744,7 @@ def _video_frame_metadata(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
         conflict = True
         warnings.append(
             "Decoded video frame count "
-            f"({decoded_frame_count}) does not match the Maya display range "
+            f"({decoded_frame_count}) does not match the {range_engine} display range "
             f"{maya_start_frame}–{maya_end_frame} ({maya_frame_count} frames)."
         )
     if frame_count <= 0:
@@ -5743,6 +5762,15 @@ def _video_frame_metadata(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
         if color and color not in available_color_picks:
             available_color_picks.append(color)
 
+    if decoded_frame_count > 0:
+        origin = f"decoded_video+{range_engine.lower()}" if has_maya_range else "decoded_video"
+    elif has_maya_range:
+        origin = range_engine.lower()
+    elif derived_frame_count > 0:
+        origin = "fps_duration"
+    else:
+        origin = "manual"
+
     return {
         "video_slot": f"@video{slot}",
         "fps": fps,
@@ -5750,8 +5778,13 @@ def _video_frame_metadata(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
         "end_frame": end_frame,
         "frame_count": frame_count,
         "decoded_frame_count": decoded_frame_count,
-        "maya_start_frame": maya_start_frame if has_maya_range else None,
-        "maya_end_frame": maya_end_frame if has_maya_range else None,
+        "maya_start_frame": maya_start_frame if has_maya_range and not blender_origin else None,
+        "maya_end_frame": maya_end_frame if has_maya_range and not blender_origin else None,
+        **({
+            "blender_start_frame": maya_start_frame if has_maya_range else None,
+            "blender_end_frame": maya_end_frame if has_maya_range else None,
+            "scene_engine": "blender",
+        } if blender_origin else {}),
         "duration_seconds": duration_seconds,
         "timebase": _fps_timebase(fps),
         "width": raster_width,
@@ -5760,17 +5793,7 @@ def _video_frame_metadata(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
         "frame_index_start": 0 if frame_count > 0 else None,
         "frame_index_end": frame_count - 1 if frame_count > 0 else None,
         "available_color_picks": available_color_picks,
-        "origin": (
-            "decoded_video+maya"
-            if decoded_frame_count > 0 and has_maya_range
-            else "decoded_video"
-            if decoded_frame_count > 0
-            else "maya"
-            if has_maya_range
-            else "fps_duration"
-            if derived_frame_count > 0
-            else "manual"
-        ),
+        "origin": origin,
         "conflict": conflict,
         "valid": bool(
             frame_count > 0
@@ -6147,7 +6170,7 @@ def _scene_path_text(value: Any) -> str:
 
 
 def _maya_scene_path_text(value: Any) -> str:
-    """Return exactly one lexical absolute Maya scene path.
+    """Return exactly one lexical absolute supported scene path.
 
     This boundary is intentionally filesystem-independent: a saved workflow
     may point at a portable/non-mounted scene and READ owns the later existence
@@ -6246,9 +6269,37 @@ def _maya_scene_path_text(value: Any) -> str:
 
     if not components or any(not component for component in components):
         return ""
-    if Path(components[-1]).suffix.casefold() not in {".ma", ".mb"}:
+    if Path(components[-1]).suffix.casefold() not in {".ma", ".mb", ".blend"}:
         return ""
     return text
+
+
+def _picker_scene_engine(value: Any) -> str:
+    """Select the native scene engine without changing legacy Maya requests."""
+    path_text = _maya_scene_path_text(value)
+    if not path_text:
+        return ""
+    return "blender" if Path(path_text).suffix.casefold() == ".blend" else "maya"
+
+
+def _validate_blender_marker_bindings(bindings: Sequence[Dict[str, Any]]) -> None:
+    """Allow only marker semantics implemented by the Blender-native worker."""
+    supported_patterns = {"direction_checker", "sky_grid", "floor_grid", "position_pattern"}
+    unsupported = {
+        _clean(item.get("name"))
+        for item in MARKER_CATALOG["background"]
+        if _clean(item.get("kind")).casefold() == "pattern"
+        and _clean(item.get("pattern")) not in supported_patterns
+    }
+    selected = sorted({
+        _clean(item.get("color")) for item in bindings
+        if isinstance(item, dict) and _clean(item.get("color")) in unsupported
+    })
+    if selected:
+        raise RuntimeError(
+            "Blender has no verified world-space equivalent for Color Pick "
+            f"markers ({', '.join(selected)}). Use a supported marker or a Maya scene."
+        )
 
 
 _UI_WARNING_MESSAGE_LIMIT = 480
@@ -6562,8 +6613,9 @@ def _compact_video_payload_for_state(value: Any) -> Dict[str, Any]:
 # sibling metadata is semantic-only, so runtime/project paths must not cross
 # this private snapshot boundary when new Picker fields are added later.
 _SHOT_VIDEO_METADATA_FIELDS = frozenset({
-    "video_uid", "source_uid", "label", "generation_role", "media_kind",
+    "video_uid", "source_uid", "label", "scene_engine", "generation_role", "media_kind",
     "video_role", "source_type_hint", "control_role_hint", "camera",
+    "render_profile", "assignment_mode",
     "run_id", "pair_run_id", "bundle_run_id", "created_at_ms",
     "catalog_order", "source_fps", "output_fps", "fps", "start_frame",
     "end_frame", "frame_count", "source_frame_count", "output_frame_count",
@@ -7751,31 +7803,11 @@ def _is_generated_depth_video_item(value: Any) -> bool:
         and _clean(value.get("media_kind")) == DEPTH_MEDIA_KIND
     ):
         return True
-    try:
-        slot = int(value.get("video_slot") or 0)
-        source_slot = int(
-            value.get("source_video_slot")
-            or value.get("companion_of_video_slot")
-            or 0
-        )
-    except Exception:
-        return False
-    return (
-        slot in AUXILIARY_VIDEO_SLOTS
-        and source_slot == PRIMARY_COLOR_VIDEO_SLOT
-        and _clean(value.get("media_kind")) == DEPTH_MEDIA_KIND
-        and _clean(value.get("video_role")) == "maya_depth_companion"
-        and _clean(value.get("depth_profile"))
-        in ({DEPTH_PLAYBLAST_PROFILE} | LEGACY_DEPTH_PLAYBLAST_PROFILES)
-    )
-
-
-def _is_generated_motion_guide_video_item(value: Any) -> bool:
-    if not isinstance(value, dict):
-        return False
     if (
-        _clean(value.get("generation_role")) == "motion_guide"
-        and _clean(value.get("media_kind")) == MOTION_GUIDE_MEDIA_KIND
+        _clean(value.get("generation_role")) == "depth"
+        and _clean(value.get("media_kind")) == BLENDER_DEPTH_MEDIA_KIND
+        and _clean(value.get("video_role")) == "blender_depth_companion"
+        and _clean(value.get("depth_profile")) == BLENDER_DEPTH_PROFILE
     ):
         return True
     try:
@@ -7790,12 +7822,59 @@ def _is_generated_motion_guide_video_item(value: Any) -> bool:
     return (
         slot in AUXILIARY_VIDEO_SLOTS
         and source_slot == PRIMARY_COLOR_VIDEO_SLOT
-        and _clean(value.get("media_kind"))
-        == MOTION_GUIDE_MEDIA_KIND
-        and _clean(value.get("video_role"))
-        == "maya_motion_guide_companion"
-        and _clean(value.get("motion_guide_profile"))
-        in MOTION_GUIDE_COMPATIBLE_PROFILES
+        and (
+            (
+                _clean(value.get("media_kind")) == DEPTH_MEDIA_KIND
+                and _clean(value.get("video_role")) == "maya_depth_companion"
+                and _clean(value.get("depth_profile"))
+                in ({DEPTH_PLAYBLAST_PROFILE} | LEGACY_DEPTH_PLAYBLAST_PROFILES)
+            ) or (
+                _clean(value.get("media_kind")) == BLENDER_DEPTH_MEDIA_KIND
+                and _clean(value.get("video_role")) == "blender_depth_companion"
+                and _clean(value.get("depth_profile")) == BLENDER_DEPTH_PROFILE
+            )
+        )
+    )
+
+
+def _is_generated_motion_guide_video_item(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if (
+        _clean(value.get("generation_role")) == "motion_guide"
+        and _clean(value.get("media_kind")) == MOTION_GUIDE_MEDIA_KIND
+    ):
+        return True
+    if (
+        _clean(value.get("generation_role")) == "motion_guide"
+        and _clean(value.get("media_kind")) == BLENDER_MOTION_GUIDE_MEDIA_KIND
+        and _clean(value.get("video_role")) == "blender_motion_guide_companion"
+        and _clean(value.get("motion_guide_profile")) == BLENDER_MOTION_GUIDE_PROFILE
+    ):
+        return True
+    try:
+        slot = int(value.get("video_slot") or 0)
+        source_slot = int(
+            value.get("source_video_slot")
+            or value.get("companion_of_video_slot")
+            or 0
+        )
+    except Exception:
+        return False
+    return (
+        slot in AUXILIARY_VIDEO_SLOTS
+        and source_slot == PRIMARY_COLOR_VIDEO_SLOT
+        and (
+            (
+                _clean(value.get("media_kind")) == MOTION_GUIDE_MEDIA_KIND
+                and _clean(value.get("video_role")) == "maya_motion_guide_companion"
+                and _clean(value.get("motion_guide_profile")) in MOTION_GUIDE_COMPATIBLE_PROFILES
+            ) or (
+                _clean(value.get("media_kind")) == BLENDER_MOTION_GUIDE_MEDIA_KIND
+                and _clean(value.get("video_role")) == "blender_motion_guide_companion"
+                and _clean(value.get("motion_guide_profile")) == BLENDER_MOTION_GUIDE_PROFILE
+            )
+        )
     )
 
 
@@ -7817,7 +7896,7 @@ def _is_generated_mask_video_item(
         return False
     if (
         _clean(value.get("generation_role")) == "mask"
-        or _clean(value.get("media_kind")) == MASK_MEDIA_KIND
+        or _clean(value.get("media_kind")) in {MASK_MEDIA_KIND, BLENDER_MASK_MEDIA_KIND}
         or _clean(value.get("video_role")) == "maya_color_assignment_mask"
     ):
         return True
@@ -7887,8 +7966,10 @@ def _original_video_item_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
     fps = float(metadata.get("fps") or 0.0)
     frame_count = int(metadata.get("frame_count") or 0)
     duration = frame_count / fps if fps > 0.0 else 0.0
+    blender_origin = _clean(metadata.get("scene_engine")) == "blender" or _picker_scene_engine(state.get("scene_path")) == "blender"
     return {
         "video_slot": 1,
+        **({"scene_engine": "blender"} if blender_origin else {}),
         "video_path": _clean(state.get("original_video_path")),
         "project_video_path": "",
         "video_url": _clean(state.get("original_video_url")),
@@ -7907,9 +7988,9 @@ def _original_video_item_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "end_frame": float(metadata.get("end_frame") or 0.0),
         "has_maya_frame_range": bool(frame_count),
         "generation_role": "original",
-        "media_kind": ORIGINAL_MEDIA_KIND,
-        "video_role": "maya_original_playblast",
-        "source_type_hint": "Neutral Midgray Maya Viewport Reference",
+        "media_kind": BLENDER_ORIGINAL_MEDIA_KIND if blender_origin else ORIGINAL_MEDIA_KIND,
+        "video_role": "blender_original_render" if blender_origin else "maya_original_playblast",
+        "source_type_hint": "Neutral Midgray Blender Viewport Reference" if blender_origin else "Neutral Midgray Maya Viewport Reference",
         "control_role_hint": "Neutral Geometry and Motion Reference",
         "label": "Original Playblast",
     }
@@ -8078,17 +8159,18 @@ def _append_selected_generation_videos(
         item["selection_order"] = 0
         item["video_slot"] = 0
         item["generation_role"] = role
+        blender_origin = _clean(source.get("media_kind")).startswith("blender_")
         if role == "original":
             item.update({
-                "media_kind": ORIGINAL_MEDIA_KIND,
-                "video_role": "maya_original_playblast",
+                "media_kind": BLENDER_ORIGINAL_MEDIA_KIND if blender_origin else ORIGINAL_MEDIA_KIND,
+                "video_role": "blender_original_render" if blender_origin else "maya_original_playblast",
                 "markers": [],
                 "label": "Original Playblast",
             })
         elif role == "mask":
             item.update({
-                "media_kind": MASK_MEDIA_KIND,
-                "video_role": "maya_color_assignment_mask",
+                "media_kind": BLENDER_MASK_MEDIA_KIND if blender_origin else MASK_MEDIA_KIND,
+                "video_role": "blender_color_assignment_mask" if blender_origin else "maya_color_assignment_mask",
                 "source_type_hint": "Color Assignment Mask / Segmentation Reference",
                 "control_role_hint": "Object and Character Region Guidance",
                 "label": "Mask",
@@ -8127,6 +8209,89 @@ def _append_selected_generation_videos(
 # Older serialized Python-side integrations may still resolve the former
 # helper name. It now points to append-only semantics and performs no packing.
 _pack_selected_generation_videos = _append_selected_generation_videos
+
+
+def _restore_terminal_only_generated_selection(
+    selected_uids: Sequence[str],
+    *,
+    scene_engine: str,
+    owned_uids: Sequence[str],
+    terminal_selected_uids: Sequence[str],
+    generated_uid_by_role: Dict[str, str],
+    actual_uid_by_role: Dict[str, str],
+    provisional_roles: set[str],
+    ordered_roles: Sequence[str],
+) -> List[str]:
+    """Select newly created results absent from the live provisional catalog.
+
+    A freshly rendered Original has no provisional card, while companion
+    cards can be selected/deselected during generation. Only Original-like
+    terminal-only records are restored, before their generated successors.
+    """
+    selected = list(selected_uids)
+    if scene_engine != "blender":
+        return selected
+    owned = set(owned_uids)
+    terminal_selected = set(terminal_selected_uids)
+    for role_index, role in enumerate(ordered_roles):
+        generated_uid = generated_uid_by_role.get(role, "")
+        actual_uid = actual_uid_by_role.get(role, "")
+        if (
+            role in provisional_roles
+            or generated_uid not in terminal_selected
+            or actual_uid not in owned
+            or actual_uid in selected
+            or len(selected) >= MAX_SELECTED_VIDEOS
+        ):
+            continue
+        next_index = next(
+            (
+                selected.index(actual_uid_by_role[next_role])
+                for next_role in ordered_roles[role_index + 1:]
+                if actual_uid_by_role.get(next_role) in selected
+            ),
+            len(selected),
+        )
+        selected.insert(next_index, actual_uid)
+    return selected
+
+
+def _blender_generated_item_for_result(
+    videos: Sequence[Dict[str, Any]],
+    role: str,
+    result: Dict[str, Any],
+    picker_shot_uuid: str,
+) -> Dict[str, Any]:
+    """Resolve only a Blender card produced by this run in its frozen Shot."""
+    path_field = {
+        "mask": "video",
+        "depth": "depth_video",
+        "motion_guide": "motion_guide_video",
+    }.get(role)
+    if not path_field:
+        raise ValueError(f"Unsupported Blender generation role: {role}")
+    expected_path = _clean(result.get(path_field))
+    bundle_run_id = _clean(result.get("bundle_run_id"))
+    if not expected_path or not bundle_run_id:
+        raise RuntimeError(f"Blender {role} did not return its generated media identity.")
+    matched = next(
+        (
+            dict(item)
+            for item in reversed(videos)
+            if isinstance(item, dict)
+            and _clean(item.get("generation_role")) == role
+            and _clean(item.get("scene_engine")) == "blender"
+            and _uuid_text(item.get("picker_shot_uuid")) == picker_shot_uuid
+            and _clean(item.get("bundle_run_id")) == bundle_run_id
+            and _scene_path_key(item.get("video_path")) == _scene_path_key(expected_path)
+        ),
+        {},
+    )
+    if not matched:
+        raise RuntimeError(
+            f"Blender {role} was not published to the captured Shot and current bundle."
+        )
+    return matched
 
 
 def _resolve_generated_companion_slots(
@@ -8625,6 +8790,10 @@ def _parse_state(value: Any) -> Dict[str, Any]:
     state["pending_action_id"] = _clean(state.get("pending_action_id"))
     state["backend_ack_action_id"] = _clean(state.get("backend_ack_action_id"))
     state["maya_available"] = bool(state.get("maya_available") and _clean(state.get("maya_executable")))
+    state["blender_available"] = bool(state.get("blender_available") and _clean(state.get("blender_executable")))
+    state["scene_engine"] = _picker_scene_engine(
+        state.get("scene_request_path") or state.get("scene_path")
+    ) or "maya"
     try:
         state["active_process_pid"] = max(0, int(float(state.get("active_process_pid") or 0)))
     except Exception:
@@ -9019,7 +9188,8 @@ def _parse_state(value: Any) -> Dict[str, Any]:
     state["activity_log_text_user_edited"] = bool(state.get("activity_log_text_user_edited"))
     state["activity_log_cleared"] = bool(state.get("activity_log_cleared"))
     for key in (
-        "maya_executable", "maya_version", "last_log_path", "log_folder", "operation_kind",
+        "maya_executable", "maya_version", "blender_executable", "blender_version",
+        "last_log_path", "log_folder", "operation_kind",
         "python_core_path", "runtime_instance_id", "scene_request_id", "scene_request_source",
         "scene_request_status",
     ):
@@ -9448,6 +9618,10 @@ def _build_synchronized_video_outputs(
             # This is the exact string in VIDEO_OUT, so Prompt metadata and the
             # generator can never describe different selected media.
             "video_path": media,
+            **({"scene_engine": "blender"} if (
+                _clean(item.get("media_kind")).startswith("blender_")
+                or _clean(item.get("scene_engine")) == "blender"
+            ) else {}),
             "camera": _clean(item.get("camera")),
             "markers": markers,
             "fps": frame_metadata["fps"],
@@ -9476,6 +9650,8 @@ def _build_synchronized_video_outputs(
             "generation_role",
             "media_kind",
             "video_role",
+            "render_profile",
+            "assignment_mode",
             "source_type_hint",
             "control_role_hint",
             "depth_profile",
@@ -9538,7 +9714,8 @@ def _build_synchronized_video_outputs(
     semantic: Dict[str, Any] = {
         "schema": "hmb-prompt-library-picker-binding",
         "schema_version": 5,
-        "mode": "maya",
+        "mode": _picker_scene_engine(normalized.get("scene_path")) or "maya",
+        **({"scene_engine": "blender"} if _picker_scene_engine(normalized.get("scene_path")) == "blender" else {}),
         "scene_path": _clean(normalized.get("scene_path")),
         "scene_fingerprint": _scene_fingerprint(normalized.get("scene_path")),
         "marker_catalog_version": int(MARKER_CATALOG["version"]),
@@ -10463,9 +10640,9 @@ def _video_asset_thumbnail_url(
 ) -> tuple[str, str]:
     """Decode and publish one cached 320x180 PNG poster for a local video.
 
-    Cache identity follows file path, size, and mtime.  The lock intentionally
-    covers extraction and publication: simultaneous append/recovery workers for
-    the same source therefore invoke FFmpeg and ``save_static_file`` only once.
+    Cache identity follows file path, size, and mtime. Workers for the same
+    source share one lock; two different sources may decode concurrently.
+    Static-file publication and cache mutation remain serialized.
     Failures are non-fatal because the video card and playback URL remain the
     durable authority.
     """
@@ -10482,20 +10659,38 @@ def _video_asset_thumbnail_url(
         cached = _clean(_VIDEO_THUMBNAIL_URLS.get(signature))
         if cached:
             return cached, signature
-        if signature in _VIDEO_THUMBNAIL_ATTEMPTED:
-            return "", signature
-        if len(_VIDEO_THUMBNAIL_ATTEMPTED) >= MAX_PICKER_VIDEO_ASSETS * 4:
-            try:
-                _VIDEO_THUMBNAIL_ATTEMPTED.pop()
-            except KeyError:
-                pass
-        _VIDEO_THUMBNAIL_ATTEMPTED.add(signature)
+        source_lock = _VIDEO_THUMBNAIL_SOURCE_LOCKS.setdefault(
+            signature, threading.Lock()
+        )
+
+    def release_source_lock() -> None:
+        with _VIDEO_THUMBNAIL_LOCK:
+            if _VIDEO_THUMBNAIL_SOURCE_LOCKS.get(signature) is source_lock:
+                _VIDEO_THUMBNAIL_SOURCE_LOCKS.pop(signature, None)
+
+    with source_lock:
+        with _VIDEO_THUMBNAIL_LOCK:
+            cached = _clean(_VIDEO_THUMBNAIL_URLS.get(signature))
+            if cached:
+                release_source_lock()
+                return cached, signature
+            if signature in _VIDEO_THUMBNAIL_ATTEMPTED:
+                release_source_lock()
+                return "", signature
+            if len(_VIDEO_THUMBNAIL_ATTEMPTED) >= MAX_PICKER_VIDEO_ASSETS * 4:
+                try:
+                    _VIDEO_THUMBNAIL_ATTEMPTED.pop()
+                except KeyError:
+                    pass
+            _VIDEO_THUMBNAIL_ATTEMPTED.add(signature)
         try:
             ffmpeg = _video_thumbnail_ffmpeg()
         except Exception as exc:
             _diagnostic_exception("Video thumbnail FFmpeg lookup failed", exc)
+            release_source_lock()
             return "", signature
         if ffmpeg is None:
+            release_source_lock()
             return "", signature
         command = [
             str(ffmpeg),
@@ -10523,15 +10718,16 @@ def _video_asset_thumbnail_url(
             "pipe:1",
         ]
         try:
-            completed = subprocess.run(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=VIDEO_THUMBNAIL_TIMEOUT_SECONDS,
-                check=False,
-                creationflags=_creation_flags(),
-            )
+            with _VIDEO_THUMBNAIL_DECODE_SLOTS:
+                completed = subprocess.run(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=VIDEO_THUMBNAIL_TIMEOUT_SECONDS,
+                    check=False,
+                    creationflags=_creation_flags(),
+                )
             png_bytes = bytes(completed.stdout or b"")
             if (
                 completed.returncode != 0
@@ -10549,24 +10745,29 @@ def _video_asset_thumbnail_url(
                 _clean(video_uid),
             )[:32] or "video"
             filename = f"hmb_video_thumb_{safe_uid}_{signature}.png"
-            url = _clean(
-                GriptapeNodes.StaticFilesManager().save_static_file(
-                    png_bytes,
-                    filename,
+            if _video_thumbnail_signature(resolved) != signature:
+                return "", signature
+            with _VIDEO_THUMBNAIL_LOCK:
+                url = _clean(
+                    GriptapeNodes.StaticFilesManager().save_static_file(
+                        png_bytes,
+                        filename,
+                    )
                 )
-            )
+                if url:
+                    if len(_VIDEO_THUMBNAIL_URLS) >= MAX_PICKER_VIDEO_ASSETS * 2:
+                        try:
+                            _VIDEO_THUMBNAIL_URLS.pop(
+                                next(iter(_VIDEO_THUMBNAIL_URLS))
+                            )
+                        except (KeyError, StopIteration):
+                            pass
+                    _VIDEO_THUMBNAIL_URLS[signature] = url
         except Exception as exc:
             _diagnostic_exception("Video thumbnail publication failed", exc)
             url = ""
-        if url:
-            if len(_VIDEO_THUMBNAIL_URLS) >= MAX_PICKER_VIDEO_ASSETS * 2:
-                try:
-                    _VIDEO_THUMBNAIL_URLS.pop(
-                        next(iter(_VIDEO_THUMBNAIL_URLS))
-                    )
-                except (KeyError, StopIteration):
-                    pass
-            _VIDEO_THUMBNAIL_URLS[signature] = url
+        finally:
+            release_source_lock()
         return url, signature
 
 
@@ -10592,6 +10793,10 @@ def _refresh_saved_video_media_urls(
     warnings = _normalize_ui_warnings(state.get("warnings"))
     changed = False
     restored_count = 0
+    # Multiple cards and the original preview can reference the same saved
+    # file. One restore pass needs one readability probe per reference, while
+    # each later state synchronization still performs fresh validation.
+    probe_cache: Dict[str, Optional[Path]] = {}
 
     for item in videos:
         # ``thumbnail_url`` is served by the current process' static manager,
@@ -10620,7 +10825,9 @@ def _refresh_saved_video_media_urls(
             (
                 candidate
                 for candidate in (
-                    _resolve_readable_video_reference(reference)
+                    _resolve_readable_video_reference(
+                        reference, probe_cache=probe_cache
+                    )
                     for reference in references
                 )
                 if candidate is not None
@@ -10653,7 +10860,7 @@ def _refresh_saved_video_media_urls(
     original_reference = _clean(state.get("original_video_path"))
     if original_reference:
         original_resolved = _resolve_readable_video_reference(
-            original_reference
+            original_reference, probe_cache=probe_cache
         )
         if original_resolved is not None:
             refreshed_original_url = _external_media_url(original_resolved)
@@ -10769,6 +10976,48 @@ def _find_mayabatch() -> Optional[Path]:
     # fallback and never override a detected numbered installation.
     candidates.sort(key=lambda item: (_maya_major_from_path(item), str(item).lower()), reverse=True)
     return candidates[0]
+
+
+def _find_blender() -> Optional[Path]:
+    """Find an installed Blender executable for the same Picker node."""
+    candidates: List[Path] = []
+    for env_name in ("BLENDER_PATH", "BLENDER_EXECUTABLE"):
+        value = _clean(os.environ.get(env_name))
+        if value:
+            candidates.append(Path(os.path.expandvars(os.path.expanduser(value))))
+    location = _clean(os.environ.get("BLENDER_LOCATION"))
+    if location:
+        root = Path(os.path.expandvars(os.path.expanduser(location)))
+        candidates.extend((root / "blender.exe", root / "blender"))
+    if os.name == "nt":
+        for env_name in ("ProgramFiles", "ProgramW6432"):
+            root_text = _clean(os.environ.get(env_name))
+            if root_text:
+                root = Path(root_text) / "Blender Foundation"
+                try:
+                    candidates.extend(root.glob("Blender */blender.exe"))
+                except OSError:
+                    pass
+    for executable in ("blender.exe", "blender"):
+        found = shutil.which(executable)
+        if found:
+            candidates.append(Path(found))
+    found_paths: Dict[str, Path] = {}
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+            if resolved.is_file():
+                found_paths[str(resolved).casefold()] = resolved
+        except OSError:
+            continue
+    if not found_paths:
+        return None
+    return sorted(found_paths.values(), key=lambda item: str(item).casefold(), reverse=True)[0]
+
+
+def _blender_display_version(blender: Path) -> str:
+    matched = re.search(r"(?i)blender[ /\\]+(?:blender[ _-]*)?(\d+(?:\.\d+){0,2})", str(blender))
+    return matched.group(1) if matched else "Detected"
 
 
 def _maya_display_version(mayabatch: Path) -> str:
@@ -10923,9 +11172,10 @@ def _choose_maya_scene_file(initial_value: Any = "") -> str:
                 title="Open Maya Scene",
                 initialdir=str(initial_dir) if initial_dir and initial_dir.is_dir() else None,
                 filetypes=[
-                    ("Maya Scene", "*.mb *.ma"),
+                    ("Maya / Blender Scene", "*.mb *.ma *.blend"),
                     ("Maya Binary", "*.mb"),
                     ("Maya ASCII", "*.ma"),
+                    ("Blender Scene", "*.blend"),
                 ],
             )
         finally:
@@ -10941,8 +11191,8 @@ def _choose_maya_scene_file(initial_value: Any = "") -> str:
             "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
             "Add-Type -AssemblyName System.Windows.Forms; "
             "$d=New-Object System.Windows.Forms.OpenFileDialog; "
-            "$d.Title='Open Maya Scene'; "
-            "$d.Filter='Maya Scene (*.mb;*.ma)|*.mb;*.ma|Maya Binary (*.mb)|*.mb|Maya ASCII (*.ma)|*.ma'; "
+            "$d.Title='Open Maya or Blender Scene'; "
+            "$d.Filter='Maya / Blender Scene (*.mb;*.ma;*.blend)|*.mb;*.ma;*.blend|Maya Binary (*.mb)|*.mb|Maya ASCII (*.ma)|*.ma|Blender Scene (*.blend)|*.blend'; "
             "$d.Multiselect=$false; "
             f"$d.InitialDirectory='{escaped_initial}'; "
             "if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Out.Write($d.FileName)}"
@@ -12004,6 +12254,7 @@ def _original_view_metadata(metadata: Any) -> Dict[str, Any]:
 
 _MAYA_OPERATION_AUTHORING_FIELDS = (
     "scene_path", "scene_request_path", "scene_draft_path",
+    "scene_engine", "mode",
     "native_read_ready", "native_read_mode", "native_source_version", "native_metadata",
     "camera", "selected_camera", "cameras", "start_frame", "end_frame", "current_frame",
     "source_fps", "output_fps", "output_width", "output_height", "has_maya_frame_range",
@@ -12035,25 +12286,38 @@ def _operation_input_digest(kind: str, scene_text: Any, state: Dict[str, Any], s
         # bindings and their catalog version. Only geometry, camera and timing
         # are inherited from the scene; material appearance is neutral midgray.
         payload.pop("marker_catalog_version", None)
-        original_fields = _original_preview_cache_fields(_norm_path(scene_text), normalized)
-        payload.update({
-            "camera": original_fields["camera"],
-            "start_frame": original_fields["start_frame"],
-            "end_frame": original_fields["end_frame"],
-            "fps": original_fields["fps"],
-            "width": original_fields["resolution"]["width"],
-            "height": original_fields["resolution"]["height"],
-            "encoding_profile": original_fields["encoding_profile"],
-            "viewport_quality_profile": original_fields["viewport_quality_profile"],
-            "original_material_override_profile": original_fields[
-                "original_material_override_profile"
-            ],
-            "mouth_card_inner_patch_policy": original_fields[
-                "mouth_card_inner_patch_policy"
-            ],
-            "scene_dependency_complete": original_fields["scene_dependency_complete"],
-            "scene_dependency_fingerprint": original_fields["scene_dependency_fingerprint"],
-        })
+        if _picker_scene_engine(scene_text) == "blender":
+            width, height = _playblast_resolution(normalized)
+            payload.update({
+                "scene_engine": "blender",
+                "camera": _clean(normalized.get("selected_camera")),
+                "start_frame": normalized.get("start_frame"),
+                "end_frame": normalized.get("end_frame"),
+                "fps": normalized.get("source_fps"),
+                "width": width,
+                "height": height,
+                "render_profile": "blender-workbench-neutral-gray-v1",
+            })
+        else:
+            original_fields = _original_preview_cache_fields(_norm_path(scene_text), normalized)
+            payload.update({
+                "camera": original_fields["camera"],
+                "start_frame": original_fields["start_frame"],
+                "end_frame": original_fields["end_frame"],
+                "fps": original_fields["fps"],
+                "width": original_fields["resolution"]["width"],
+                "height": original_fields["resolution"]["height"],
+                "encoding_profile": original_fields["encoding_profile"],
+                "viewport_quality_profile": original_fields["viewport_quality_profile"],
+                "original_material_override_profile": original_fields[
+                    "original_material_override_profile"
+                ],
+                "mouth_card_inner_patch_policy": original_fields[
+                    "mouth_card_inner_patch_policy"
+                ],
+                "scene_dependency_complete": original_fields["scene_dependency_complete"],
+                "scene_dependency_fingerprint": original_fields["scene_dependency_fingerprint"],
+            })
     elif kind_text != "read_scene":
         depth_enabled = bool(
             kind_text == "run_video"
@@ -12124,7 +12388,10 @@ def _operation_input_digest(kind: str, scene_text: Any, state: Dict[str, Any], s
                 "mask_enabled": bool(normalized.get("mask_enabled")),
                 "depth_enabled": depth_enabled,
                 "depth_video_slot": depth_video_slot,
-                "depth_profile": DEPTH_PLAYBLAST_PROFILE if depth_enabled else "",
+                "depth_profile": (
+                    BLENDER_DEPTH_PROFILE if _picker_scene_engine(scene_text) == "blender"
+                    else DEPTH_PLAYBLAST_PROFILE
+                ) if depth_enabled else "",
                 "depth_range_mode": normalized["depth_settings"]["range"] if depth_enabled else "",
                 "mouth_card_inner_patch_policy": (
                     MOUTH_CARD_INNER_PATCH_POLICY
@@ -12134,8 +12401,9 @@ def _operation_input_digest(kind: str, scene_text: Any, state: Dict[str, Any], s
                 "motion_guide_enabled": motion_guide_enabled,
                 "motion_guide_video_slot": motion_guide_video_slot,
                 "motion_guide_profile": (
-                    MOTION_GUIDE_PROFILE if motion_guide_enabled else ""
-                ),
+                    BLENDER_MOTION_GUIDE_PROFILE if _picker_scene_engine(scene_text) == "blender"
+                    else MOTION_GUIDE_PROFILE
+                ) if motion_guide_enabled else "",
             })
         if kind_text == "render_snapshot":
             requested_frame = normalized.get("snapshot_request_frame")
@@ -13006,6 +13274,17 @@ class HMBVideoPickerLibrary(DataNode):
                 "WARNING",
                 "No mayabatch was detected at node startup. READ remains disabled until Maya is available.",
             )
+        blender = _find_blender()
+        if blender is not None:
+            state["blender_executable"] = str(blender).replace("\\", "/")
+            state["blender_version"] = _blender_display_version(blender)
+            state["blender_available"] = True
+            _append_activity_log(state, "SUCCESS", f"Blender detected: {blender}")
+        else:
+            state["blender_executable"] = ""
+            state["blender_version"] = ""
+            state["blender_available"] = False
+            _append_activity_log(state, "WARNING", "No Blender executable was detected; .blend READ requires Blender.")
         _append_activity_log(state, "SUCCESS", "Runtime mode: Shared / Orchestrator. Isolated Worker mode is disabled for HMB_GP_Production.")
         parameter = _get_parameter_obj(self, WIDGET_STATE_PARAMETER)
         widget_settable = bool(getattr(parameter, "settable", True)) if parameter is not None else False
@@ -13022,7 +13301,7 @@ class HMBVideoPickerLibrary(DataNode):
             "SUCCESS",
             f"Action transport: execution and language commands use the independent {WIDGET_COMMAND_PARAMETER} minimal JSON path; {WIDGET_STATE_PARAMETER} carries dashboard state only.",
         )
-        _append_activity_log(state, "INFO", "Waiting for a Maya .mb or .ma file.")
+        _append_activity_log(state, "INFO", "Waiting for a Maya .mb/.ma or Blender .blend file.")
         _begin_state_sync(self)
         try:
             setter = getattr(self, "set_parameter_value", None)
@@ -13897,6 +14176,9 @@ class HMBVideoPickerLibrary(DataNode):
             "maya_executable",
             "maya_version",
             "maya_available",
+            "blender_executable",
+            "blender_version",
+            "blender_available",
             "expanded_node_size",
             "activity_log",
         ):
@@ -15011,7 +15293,7 @@ class HMBVideoPickerLibrary(DataNode):
     ) -> _OperationContext:
         strict_scene_text = _maya_scene_path_text(scene_text)
         if not strict_scene_text:
-            raise ValueError("A single absolute Maya .mb or .ma scene is required.")
+            raise ValueError("A single absolute Maya .mb/.ma or Blender .blend scene is required.")
         normalized_scene = str(_norm_path(strict_scene_text)).replace("\\", "/")
         kind_text = _clean(kind)
         slot = max(
@@ -15338,6 +15620,12 @@ class HMBVideoPickerLibrary(DataNode):
                 if isinstance(row, dict)
                 and _uuid_text(row.get("workspace_uuid"))
             }
+            terminal_rows = {
+                _uuid_text(row.get("workspace_uuid")): dict(row)
+                for row in terminal_state.get("picker_shots", [])
+                if isinstance(row, dict)
+                and _uuid_text(row.get("workspace_uuid"))
+            }
             latest_videos = [
                 dict(item)
                 for item in latest.get("videos", [])
@@ -15394,9 +15682,14 @@ class HMBVideoPickerLibrary(DataNode):
                 len(generation_records),
             )
             actual_uid_by_role: Dict[str, str] = {}
+            generated_uid_by_role: Dict[str, str] = {}
             for raw_record in generation_records:
                 record = dict(raw_record)
                 role = _clean(record.get("generation_role"))
+                if role:
+                    generated_uid_by_role[role] = _clean(
+                        record.get("video_uid") or record.get("source_uid")
+                    )
                 if role in {"depth", "motion_guide"} and actual_uid_by_role.get(
                     "mask"
                 ):
@@ -15445,6 +15738,23 @@ class HMBVideoPickerLibrary(DataNode):
                         selected_uids.append(uid)
                     if len(selected_uids) >= MAX_SELECTED_VIDEOS:
                         break
+                ordered_roles = [
+                    _clean(record.get("generation_role"))
+                    for record in generation_records
+                    if _clean(record.get("generation_role"))
+                ]
+                selected_uids = _restore_terminal_only_generated_selection(
+                    selected_uids,
+                    scene_engine=_picker_scene_engine(context.scene_path),
+                    owned_uids=owned_uids,
+                    terminal_selected_uids=_picker_representative_video_uids(
+                        terminal_rows.get(workspace_uuid, {}).get("selected_video_uids")
+                    ),
+                    generated_uid_by_role=generated_uid_by_role,
+                    actual_uid_by_role=actual_uid_by_role,
+                    provisional_roles=set(provisional_role_by_uid.values()),
+                    ordered_roles=ordered_roles,
+                )
                 preview_uid = finalized_uid(
                     latest_row.get("preview_video_uid")
                 )
@@ -15586,8 +15896,8 @@ class HMBVideoPickerLibrary(DataNode):
         )
         try:
             scene_path = _norm_path(scene_text)
-            if scene_path.suffix.lower() not in {".ma", ".mb"} or not scene_path.is_file():
-                raise FileNotFoundError(f"Select an existing Maya .mb or .ma scene before {action}.")
+            if scene_path.suffix.lower() not in {".ma", ".mb", ".blend"} or not scene_path.is_file():
+                raise FileNotFoundError(f"Select an existing Maya .mb/.ma or Blender .blend scene before {action}.")
             slot = max(
                 1,
                 min(
@@ -15613,6 +15923,7 @@ class HMBVideoPickerLibrary(DataNode):
             raise
         self._hmb_active_operation = context
         self._hmb_operation_thread_id = threading.get_ident()
+        source_engine_label = "Blender" if _picker_scene_engine(context.scene_path) == "blender" else "Maya"
         incoming = self._mark_operation_started(incoming, action)
         incoming.update({
             "operation_id": context.operation_id,
@@ -15630,13 +15941,17 @@ class HMBVideoPickerLibrary(DataNode):
             korean = _clean(incoming.get("language")).lower() == "ko"
             incoming.update({
                 "status": "READING_SCENE",
-                "scene_stage": "MAYA_READING",
-                "message": "읽기가 시작되었습니다. 설치된 Maya mayabatch를 확인합니다." if korean else "READ started. Detecting the highest installed Maya mayabatch.",
+                "scene_stage": "BLENDER_READING" if _picker_scene_engine(context.scene_path) == "blender" else "MAYA_READING",
+                "message": (
+                    "읽기가 시작되었습니다. 설치된 Blender를 확인합니다." if korean else "READ started. Detecting Blender."
+                ) if _picker_scene_engine(context.scene_path) == "blender" else (
+                    "읽기가 시작되었습니다. 설치된 Maya mayabatch를 확인합니다." if korean else "READ started. Detecting the highest installed Maya mayabatch."
+                ),
             })
             _append_activity_log(
                 incoming,
                 "INFO",
-                "읽기 시작. 백그라운드 Maya 아웃라이너 스캔이 실행 중입니다." if korean else "READ started. The background Maya Outliner scan is active.",
+                f"읽기 시작. 백그라운드 {source_engine_label} 아웃라이너 스캔이 실행 중입니다." if korean else f"READ started. The background {source_engine_label} Outliner scan is active.",
             )
             _append_activity_log(incoming, "INFO", "Stage 1/5: Python command accepted and worker lock acquired.")
             _append_activity_log(incoming, "INFO", "Stage 2/5: Starting background worker thread.")
@@ -15647,7 +15962,7 @@ class HMBVideoPickerLibrary(DataNode):
             incoming.update({
                 "status": "SNAPSHOT_RENDERING",
                 "scene_stage": "SNAPSHOT_RENDERING",
-                "message": f"Rendering the colored snapshot for @video{slot} at Maya frame {frame:g}.",
+                "message": f"Rendering the colored snapshot for @video{slot} at {source_engine_label} frame {frame:g}.",
             })
             _append_activity_log(
                 incoming,
@@ -15658,7 +15973,7 @@ class HMBVideoPickerLibrary(DataNode):
             incoming.update({
                 "status": "GENERATING_ORIGINAL",
                 "scene_stage": "GENERATING_ORIGINAL",
-                "message": "Preparing the on-demand original Maya playblast.",
+                "message": f"Preparing the on-demand original {source_engine_label} playblast.",
                 "original_preview_enabled": False,
             })
             _append_activity_log(
@@ -15694,7 +16009,7 @@ class HMBVideoPickerLibrary(DataNode):
             message = (
                 "Preparing checked Generate Playblast outputs ("
                 + ", ".join(selected_labels)
-                + "). Detecting the highest installed Maya mayabatch."
+                + f"). Preparing {source_engine_label}."
             )
             log_message = (
                 "Generate request received. Successful results will be appended "
@@ -15716,17 +16031,27 @@ class HMBVideoPickerLibrary(DataNode):
             self._cleanup_transient_paths()
             self._assert_operation_current(context, "worker start")
             scene_text = context.scene_path
+            blender_scene = _picker_scene_engine(scene_text) == "blender"
             if action == "read_scene":
-                self._read_scene_mode(scene_text, context=context)
+                if blender_scene:
+                    self._blender_read_scene_mode(scene_text, context=context)
+                else:
+                    self._read_scene_mode(scene_text, context=context)
             elif action == "render_snapshot":
-                self._snapshot_mode(
-                    scene_text,
-                    context.video_slot,
-                    context=context,
-                    video_uid=context.snapshot_video_uid,
-                )
+                if blender_scene:
+                    self._blender_snapshot_mode(scene_text, context=context, video_uid=context.snapshot_video_uid)
+                else:
+                    self._snapshot_mode(
+                        scene_text,
+                        context.video_slot,
+                        context=context,
+                        video_uid=context.snapshot_video_uid,
+                    )
             elif action == "render_original_preview":
-                self._render_original_preview_mode(scene_text, context=context)
+                if blender_scene:
+                    self._blender_render_original_preview_mode(scene_text, context=context)
+                else:
+                    self._render_original_preview_mode(scene_text, context=context)
             else:
                 selected_roles = list(context.selected_roles)
                 accepted_generation_flags = {
@@ -15740,11 +16065,14 @@ class HMBVideoPickerLibrary(DataNode):
                 generation_warnings: List[str] = []
                 if "original" in selected_roles:
                     try:
-                        self._render_original_preview_mode(
-                            scene_text,
-                            context=context,
-                            publish_public=False,
-                        )
+                        if blender_scene:
+                            self._blender_render_original_preview_mode(
+                                scene_text, context=context, publish_public=False,
+                            )
+                        else:
+                            self._render_original_preview_mode(
+                                scene_text, context=context, publish_public=False,
+                            )
                         original_state = self._picker_state()
                         original_state = _snapshot_original_preview_asset(
                             _norm_path(scene_text),
@@ -15783,18 +16111,24 @@ class HMBVideoPickerLibrary(DataNode):
                     core_generation_succeeded = False
                     core_result: Dict[str, Any] = {}
                     try:
-                        self._prepare_run_state(
-                            scene_text,
-                            context.video_slot,
-                            context=context,
-                            publish_public=False,
-                        )
-                        core_result = self._maya_mode(
-                            scene_text,
-                            context.video_slot,
-                            context=context,
-                            publish_public=False,
-                        )
+                        if blender_scene:
+                            core_result = self._blender_mode(
+                                scene_text, context.video_slot,
+                                context=context, publish_public=False,
+                            )
+                        else:
+                            self._prepare_run_state(
+                                scene_text,
+                                context.video_slot,
+                                context=context,
+                                publish_public=False,
+                            )
+                            core_result = self._maya_mode(
+                                scene_text,
+                                context.video_slot,
+                                context=context,
+                                publish_public=False,
+                            )
                         core_generation_succeeded = True
                     except _StaleOperationError:
                         raise
@@ -15819,47 +16153,58 @@ class HMBVideoPickerLibrary(DataNode):
                         _append_activity_log(partial_state, "WARNING", warning)
                         self._write_state(partial_state)
                     generated_state = self._picker_state()
-                    mask_item = next(
-                        (
-                            dict(item)
-                            for item in reversed(generated_state.get("videos", []))
-                            if isinstance(item, dict)
-                            and _clean(item.get("generation_role")) == "mask"
-                        ),
-                        {},
-                    )
-                    if core_generation_succeeded and mask_item:
-                        generated_by_role["mask"] = mask_item
-                    depth_item = next(
-                        (
-                            dict(item)
-                            for item in reversed(generated_state.get("videos", []))
-                            if isinstance(item, dict)
-                            and _is_generated_depth_video_item(item)
-                        ),
-                        {},
-                    )
-                    if (
-                        core_generation_succeeded
-                        and bool(core_result.get("depth_succeeded"))
-                        and depth_item
-                    ):
-                        generated_by_role["depth"] = depth_item
-                    motion_item = next(
-                        (
-                            dict(item)
-                            for item in reversed(generated_state.get("videos", []))
-                            if isinstance(item, dict)
-                            and _is_generated_motion_guide_video_item(item)
-                        ),
-                        {},
-                    )
-                    if (
-                        core_generation_succeeded
-                        and bool(core_result.get("motion_guide_succeeded"))
-                        and motion_item
-                    ):
-                        generated_by_role["motion_guide"] = motion_item
+                    if blender_scene and core_generation_succeeded:
+                        for role in ("mask", "depth", "motion_guide"):
+                            if role not in selected_roles:
+                                continue
+                            generated_by_role[role] = _blender_generated_item_for_result(
+                                generated_state.get("videos", []),
+                                role,
+                                core_result,
+                                context.picker_shot_uuid,
+                            )
+                    elif not blender_scene:
+                        mask_item = next(
+                            (
+                                dict(item)
+                                for item in reversed(generated_state.get("videos", []))
+                                if isinstance(item, dict)
+                                and _clean(item.get("generation_role")) == "mask"
+                            ),
+                            {},
+                        )
+                        if core_generation_succeeded and mask_item:
+                            generated_by_role["mask"] = mask_item
+                        depth_item = next(
+                            (
+                                dict(item)
+                                for item in reversed(generated_state.get("videos", []))
+                                if isinstance(item, dict)
+                                and _is_generated_depth_video_item(item)
+                            ),
+                            {},
+                        )
+                        if (
+                            core_generation_succeeded
+                            and bool(core_result.get("depth_succeeded"))
+                            and depth_item
+                        ):
+                            generated_by_role["depth"] = depth_item
+                        motion_item = next(
+                            (
+                                dict(item)
+                                for item in reversed(generated_state.get("videos", []))
+                                if isinstance(item, dict)
+                                and _is_generated_motion_guide_video_item(item)
+                            ),
+                            {},
+                        )
+                        if (
+                            core_generation_succeeded
+                            and bool(core_result.get("motion_guide_succeeded"))
+                            and motion_item
+                        ):
+                            generated_by_role["motion_guide"] = motion_item
 
                 final_base_state = self._picker_state()
                 final_base_state.update(accepted_generation_flags)
@@ -16135,6 +16480,7 @@ class HMBVideoPickerLibrary(DataNode):
         active_slot_count = max(1, min(MAX_VIDEO_SLOTS, int(state.get("active_slot_count") or 1)))
         selected_video_slot = max(1, min(active_slot_count, int(state.get("selected_video_slot") or 1)))
         scene_text = _maya_scene_path_text(scene_text)
+        scene_engine = _picker_scene_engine(scene_text)
         same_scene_request = bool(
             scene_text
             and _scene_path_key(previous_state.get("scene_path") or previous_state.get("scene_request_path"))
@@ -16145,11 +16491,13 @@ class HMBVideoPickerLibrary(DataNode):
             state["depth_settings"] = _normalize_depth_settings(None)
         state.update({
             "scene_stage": "EMPTY",
+            "mode": scene_engine or "maya",
+            "scene_engine": scene_engine or "maya",
             "scene_path": "",
             "scene_draft_path": scene_text,
             "scene_request_path": scene_text,
             "native_read_ready": False,
-            "native_read_mode": "maya-batch-atomic",
+            "native_read_mode": "blender-background-atomic" if scene_engine == "blender" else "maya-batch-atomic",
             "native_source_version": "",
             "native_metadata": {},
             "camera": "",
@@ -16224,15 +16572,38 @@ class HMBVideoPickerLibrary(DataNode):
         if not scene_text:
             state.update({
                 "status": "READY",
-                "message": "Select a Maya .mb or .ma scene.",
+                "message": "Select a Maya .mb/.ma or Blender .blend scene.",
             })
             return _parse_state(state)
         try:
             scene_path = _norm_path(scene_text)
-            if scene_path.suffix.lower() not in {".mb", ".ma"}:
-                raise ValueError(f"MAYA_SCENE must be .mb or .ma: {scene_path}")
+            if scene_path.suffix.lower() not in {".mb", ".ma", ".blend"}:
+                raise ValueError(f"MAYA_SCENE must be .mb, .ma, or .blend: {scene_path}")
             if not scene_path.is_file():
-                raise FileNotFoundError(f"Maya scene does not exist: {scene_path}")
+                raise FileNotFoundError(f"Scene does not exist: {scene_path}")
+            if scene_engine == "blender":
+                blender = _find_blender()
+                if blender is None:
+                    raise FileNotFoundError("No Blender installation was found. Install Blender or set BLENDER_PATH.")
+                if not BLENDER_RUNNER.is_file():
+                    raise FileNotFoundError(f"Blender support is not packaged: {BLENDER_RUNNER}")
+                blender_version = _blender_display_version(blender)
+                normalized_path = str(scene_path).replace("\\", "/")
+                state.update({
+                    "status": "SCANNING_SCENE",
+                    "scene_stage": "BLENDER_READING",
+                    "message": f"Blender {blender_version} is ready to read cameras, frame range, FPS, and Outliner metadata.",
+                    "scene_path": normalized_path,
+                    "scene_draft_path": normalized_path,
+                    "scene_request_path": normalized_path,
+                    "native_read_ready": False,
+                    "native_read_mode": "blender-background-atomic",
+                    "blender_executable": str(blender).replace("\\", "/"),
+                    "blender_version": blender_version,
+                    "blender_available": True,
+                })
+                _append_activity_log(state, "SUCCESS", f"Blender scene selected: {normalized_path}")
+                return _parse_state(state)
             mayabatch = _find_mayabatch()
             if mayabatch is None:
                 raise FileNotFoundError("No mayabatch installation was found. Install Maya or set MAYA_LOCATION/PATH.")
@@ -16264,6 +16635,7 @@ class HMBVideoPickerLibrary(DataNode):
         except Exception as exc:
             error_text = _clean(exc) or exc.__class__.__name__
             detected_maya = _find_mayabatch()
+            detected_blender = _find_blender()
             state.update({
                 "status": "FAILED",
                 "scene_stage": "LOAD_FAILED",
@@ -16274,9 +16646,12 @@ class HMBVideoPickerLibrary(DataNode):
                 "maya_executable": str(detected_maya).replace("\\", "/") if detected_maya else "",
                 "maya_version": _maya_display_version(detected_maya) if detected_maya else "",
                 "maya_available": detected_maya is not None,
+                "blender_executable": str(detected_blender).replace("\\", "/") if detected_blender else "",
+                "blender_version": _blender_display_version(detected_blender) if detected_blender else "",
+                "blender_available": detected_blender is not None,
             })
             _append_activity_log(state, "ERROR", error_text)
-            _diagnostic_exception("Maya LOAD validation failed", exc)
+            _diagnostic_exception(f"{scene_engine or 'Scene'} LOAD validation failed", exc)
         return _parse_state(state)
 
     def _schedule_scene_selection(self, scene_text: Any, source: str) -> None:
@@ -16310,7 +16685,11 @@ class HMBVideoPickerLibrary(DataNode):
                 "scene_stage": "LOAD_READY",
                 "scene_request_status": "COMPLETE",
                 "native_read_ready": False,
-                "message": "Maya scene selected. Press READ to load cameras, frame range, FPS, and Outliner metadata without rendering video.",
+                "message": (
+                    "Blender scene selected. Press READ to load cameras, frame range, FPS, and Outliner metadata without rendering video."
+                    if _picker_scene_engine(resolved_text) == "blender" else
+                    "Maya scene selected. Press READ to load cameras, frame range, FPS, and Outliner metadata without rendering video."
+                ),
             })
             _append_activity_log(prepared, "SUCCESS", f"LOAD ready: {resolved_text}")
             _append_activity_log(prepared, "INFO", "Press READ to start the Maya scene scan.")
@@ -17264,20 +17643,49 @@ class HMBVideoPickerLibrary(DataNode):
         self._schedule_video_removal_output_sync()
         # The ready card is visible before poster extraction. Enrich only the
         # exact surviving UID; a deleted card must never be appended again.
+        pending_posters: Dict[str, tuple[str, str]] = {}
+
+        def publish_posters() -> None:
+            if not pending_posters or self._hmb_node_deleted:
+                pending_posters.clear()
+                return
+            with self._hmb_catalog_state_commit():
+                latest = self._picker_state()
+                changed = False
+                for surviving in latest.get("videos", []):
+                    uid = _clean(surviving.get("video_uid"))
+                    poster = pending_posters.get(uid)
+                    if poster is None:
+                        continue
+                    url, signature = poster
+                    current_path = _resolved_video_asset_path(surviving)
+                    if (
+                        current_path is None
+                        or _video_thumbnail_signature(current_path) != signature
+                    ):
+                        continue
+                    surviving.update(
+                        thumbnail_url=url,
+                        thumbnail_runtime_id=_VIDEO_THUMBNAIL_RUNTIME_ID,
+                        thumbnail_source_signature=signature,
+                    )
+                    changed = True
+                if changed and not self._hmb_node_deleted:
+                    self._write_state(latest)
+            pending_posters.clear()
+
         for record in pending_records:
             path = _resolved_video_asset_path(record)
             if path is None or self._hmb_node_deleted:
                 continue
             uid = _clean(record.get("video_uid"))
             url, signature = _video_asset_thumbnail_url(path, uid)
-            if not url:
+            if not url or not signature:
                 continue
-            with self._hmb_catalog_state_commit():
-                latest = self._picker_state()
-                surviving = next((item for item in latest.get("videos", []) if item.get("video_uid") == uid), None)
-                if surviving is not None and not self._hmb_node_deleted:
-                    surviving.update(thumbnail_url=url, thumbnail_runtime_id=_VIDEO_THUMBNAIL_RUNTIME_ID, thumbnail_source_signature=signature)
-                    self._write_state(latest)
+            pending_posters[uid] = (url, signature)
+            if len(pending_posters) >= 4:
+                publish_posters()
+        publish_posters()
         return self._picker_state()
 
     def _acknowledge_video_import_failure(
@@ -18265,8 +18673,8 @@ class HMBVideoPickerLibrary(DataNode):
                 self._write_state(state)
                 return
             selected_path = _norm_path(selected)
-            if selected_path.suffix.lower() not in {".ma", ".mb"}:
-                raise ValueError(f"Select a Maya .ma or .mb scene: {selected_path}")
+            if selected_path.suffix.lower() not in {".ma", ".mb", ".blend"}:
+                raise ValueError(f"Select a Maya .ma/.mb or Blender .blend scene: {selected_path}")
             if not selected_path.is_file():
                 raise FileNotFoundError(f"Maya scene does not exist: {selected_path}")
             normalized_selected = str(selected_path).replace("\\", "/")
@@ -18922,8 +19330,10 @@ class HMBVideoPickerLibrary(DataNode):
         )
         state["run_id"] = run_id
         state["markers"] = markers
+        blender_source = _picker_scene_engine(state.get("scene_path")) == "blender"
         new_video = {
             "video_slot": video_slot,
+            **({"scene_engine": "blender"} if blender_source else {}),
             "video_path": _clean(state.get("video_path")),
             "project_video_path": _clean(state.get("project_video_path")),
             "video_metadata": dict(state.get("video_metadata") or {}),
@@ -18954,12 +19364,15 @@ class HMBVideoPickerLibrary(DataNode):
             "pair_run_id": _clean(state.get("pair_run_id")),
             "bundle_run_id": _clean(state.get("bundle_run_id")),
             "generation_role": "mask",
-            "media_kind": MASK_MEDIA_KIND,
-            "video_role": "maya_color_assignment_mask",
+            "media_kind": BLENDER_MASK_MEDIA_KIND if blender_source else MASK_MEDIA_KIND,
+            "video_role": "blender_color_assignment_mask" if blender_source else "maya_color_assignment_mask",
             "source_type_hint": "Color Assignment Mask / Segmentation Reference",
             "control_role_hint": "Object and Character Region Guidance",
             "label": "Mask",
         }
+        if blender_source:
+            new_video["render_profile"] = _clean(state.get("blender_render_profile"))
+            new_video["assignment_mode"] = _clean(state.get("blender_assignment_mode"))
         state = _append_video_asset(
             state,
             new_video,
@@ -22301,6 +22714,690 @@ class HMBVideoPickerLibrary(DataNode):
             "motion_guide_profile": (
                 MOTION_GUIDE_PROFILE if motion_guide_succeeded else ""
             ),
+        }
+
+    def _blender_execute_job(
+        self,
+        scene_path: Path,
+        operation: str,
+        options: Dict[str, Any],
+        context: Optional[_OperationContext],
+    ) -> tuple[Dict[str, Any], Dict[str, Any], Path, Path]:
+        """Run Blender behind the existing Picker command/Shot lifecycle."""
+        self._assert_operation_current(context, f"Blender {operation} preflight")
+        if _picker_scene_engine(scene_path) != "blender" or not scene_path.is_file():
+            raise FileNotFoundError(f"Select an existing Blender .blend file: {scene_path}")
+        blender = _find_blender()
+        if blender is None:
+            raise FileNotFoundError("Blender is not installed or BLENDER_PATH is not set.")
+        if not BLENDER_RUNNER.is_file():
+            raise FileNotFoundError(f"Blender support is not packaged: {BLENDER_RUNNER}")
+        output_folder = _ensure_scene_output_folder(scene_path)
+        token = hashlib.sha1(
+            f"blender|{operation}|{scene_path}|{time.time_ns()}".encode("utf-8")
+        ).hexdigest()[:12]
+        job_folder = output_folder / ".hmb_video_picker" / f"blender_{operation}_{token}"
+        _ensure_private_job_folder(job_folder, output_folder)
+        self._register_cleanup_dir(job_folder)
+        job_path = job_folder / "job.json"
+        result_path = job_folder / "result.json"
+        progress_path = job_folder / "progress.json"
+        log_path = output_folder / f"Blender_{_safe_scene_name(scene_path.stem)}_{operation}_{token}.log"
+        options = dict(options)
+        job: Dict[str, Any] = {
+            "operation": operation,
+            "scene_path": str(scene_path),
+            "result_path": str(result_path),
+            "progress_path": str(progress_path),
+            **options,
+        }
+        if operation != "scan":
+            job.setdefault("frames_folder", str(job_folder / "frames"))
+            job.setdefault("sidecar_path", str(job_folder / "render.hmb.json"))
+            job.setdefault("output_name", f"blender_{operation}_{token}")
+            if job.get("generate_depth_playblast"):
+                job.setdefault("depth_frames_folder", str(job_folder / "depth_frames"))
+                job.setdefault("depth_sidecar_path", str(job_folder / "depth.hmb.json"))
+                job.setdefault("depth_output_name", f"blender_depth_{token}")
+                job.setdefault("depth_profile", BLENDER_DEPTH_PROFILE)
+            if job.get("generate_motion_guide"):
+                job.setdefault("motion_guide_frames_folder", str(job_folder / "motion_guide_frames"))
+                job.setdefault("motion_guide_sidecar_path", str(job_folder / "motion_guide.hmb.json"))
+                job.setdefault("motion_guide_output_name", f"blender_motion_guide_{token}")
+                job.setdefault("motion_guide_profile", BLENDER_MOTION_GUIDE_PROFILE)
+        _write_json(job_path, job)
+        command = [
+            str(blender), "--background", "--factory-startup", "--disable-autoexec",
+            "--python-exit-code", "5", str(scene_path), "--python", str(BLENDER_RUNNER),
+            "--", str(job_path),
+        ]
+        state = self._picker_state()
+        state.update({
+            "mode": "blender", "scene_engine": "blender",
+            "blender_executable": str(blender).replace("\\", "/"),
+            "blender_version": _blender_display_version(blender),
+            "blender_available": True,
+            "last_log_path": str(log_path).replace("\\", "/"),
+            "log_folder": str(output_folder).replace("\\", "/"),
+        })
+        _append_activity_log(state, "INFO", f"Blender {operation} started for {scene_path.name}.")
+        self._write_state(state)
+        with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
+            log_handle.write("BLENDER PICKER COMMAND\n" + _command_text(command) + "\n\n")
+            log_handle.flush()
+            process = subprocess.Popen(
+                command, stdout=log_handle, stderr=subprocess.STDOUT,
+                cwd=str(job_folder), creationflags=_creation_flags(),
+            )
+            self._register_active_process(process, "Blender")
+            try:
+                return_code = self._wait_for_process_with_progress(
+                    process, progress_path,
+                    PLAYBLAST_OVERALL_TIMEOUT_SECONDS,
+                    PLAYBLAST_STALL_TIMEOUT_SECONDS,
+                    f"Blender {operation}",
+                    activity_paths=tuple(
+                        Path(job[key]) for key in (
+                            "frames_folder", "depth_frames_folder", "motion_guide_frames_folder"
+                        ) if _clean(job.get(key))
+                    ),
+                    process_name="Blender",
+                )
+            finally:
+                self._clear_active_process(process)
+        self._assert_operation_current(context, f"Blender {operation} completion")
+        if not result_path.is_file():
+            raise RuntimeError(f"Blender did not produce a {operation} result. See {log_path}")
+        result = _read_json(result_path)
+        if not result.get("ok") or return_code not in (0, None):
+            raise RuntimeError(
+                f"{_clean(result.get('error')) or f'Blender exited with code {return_code}.'} See {log_path}"
+            )
+        returned_scene = _clean(result.get("scene_path"))
+        if returned_scene and _scene_path_key(returned_scene) != _scene_path_key(scene_path):
+            raise RuntimeError("Blender result belongs to a different scene.")
+        return result, job, job_folder, log_path
+
+    def _blender_read_scene_mode(
+        self, scene_text: str, context: Optional[_OperationContext] = None,
+    ) -> Dict[str, Any]:
+        scene_path = _norm_path(_maya_scene_path_text(scene_text))
+        result, _job, _folder, log_path = self._blender_execute_job(
+            scene_path, "scan", {"camera": _clean(self._picker_state().get("selected_camera"))}, context,
+        )
+        try:
+            start_frame = float(result["start_frame"])
+            end_frame = float(result["end_frame"])
+            current_frame = float(result.get("current_frame", start_frame))
+            source_fps = float(result["fps"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Blender READ returned incomplete frame/FPS data. See {log_path}") from exc
+        if end_frame < start_frame or source_fps <= 0:
+            raise RuntimeError(f"Blender READ returned invalid frame/FPS data. See {log_path}")
+        outliner_nodes = [dict(item) for item in result.get("outliner_nodes", []) if isinstance(item, dict)]
+        cameras = [dict(item) for item in result.get("cameras", []) if isinstance(item, dict)]
+        selected_camera = _clean(result.get("selected_camera"))
+        if selected_camera and selected_camera not in {
+            _clean(item.get("full_path")) for item in cameras
+        }:
+            raise RuntimeError("Blender READ selected a camera not present in the camera catalog.")
+        if not selected_camera and cameras:
+            selected_camera = _clean(cameras[0].get("full_path"))
+        previous = self._picker_state()
+        active_slot_count = max(1, min(MAX_VIDEO_SLOTS, int(previous.get("active_slot_count") or 1)))
+        previous = _reconcile_picker_mesh_authoring(previous, outliner_nodes)
+        valid_paths = {_clean(item.get("full_path")) for item in _all_picker_outliner_nodes(outliner_nodes)}
+        preserved_assignments = [
+            {
+                "video_slot": int(item.get("video_slot") or 1),
+                "bindings": [
+                    dict(binding) for binding in item.get("bindings", [])
+                    if _clean(binding.get("full_dag_path")) in valid_paths
+                ],
+            }
+            for item in _normalize_slot_assignments(
+                previous.get("slot_assignments"), active_slot_count, previous.get("videos")
+            )
+        ]
+        selected_slot = max(1, min(active_slot_count, int(previous.get("selected_video_slot") or 1)))
+        outliner_selection = _outliner_selection_after_read(
+            outliner_nodes, preserved_assignments, selected_slot,
+            previous.get("selected_outliner_path"), previous.get("selected_outliner_uuid"),
+        )
+        source_frame_count = _maya_sequence_frame_count(start_frame, end_frame)
+        metadata = {
+            "schema": "hmb-blender-scene-read",
+            "read_mode": "blender-background-atomic",
+            "scene_engine": "blender",
+            "scene_path": str(scene_path).replace("\\", "/"),
+            "source_version": _clean(result.get("blender_version")) or _blender_display_version(_find_blender() or scene_path),
+            "start_frame": start_frame, "end_frame": end_frame,
+            "current_frame": current_frame, "fps": source_fps,
+            "cameras": cameras, "camera_count": len(cameras),
+            "outliner_group_count": len(outliner_nodes),
+            "scene_dependency_paths": [
+                _clean(item) for item in result.get("scene_dependency_paths", []) if _clean(item)
+            ],
+        }
+        state = {
+            **previous,
+            "mode": "blender", "scene_engine": "blender",
+            "status": "OUTLINER_READY", "scene_stage": "OUTLINER_READY",
+            "message": f"Blender Outliner loaded with {len(outliner_nodes)} selectable asset roots.",
+            "scene_path": str(scene_path).replace("\\", "/"),
+            "scene_draft_path": str(scene_path).replace("\\", "/"),
+            "scene_request_path": str(scene_path).replace("\\", "/"),
+            "scene_request_status": "COMPLETE",
+            "native_read_ready": True,
+            "native_read_mode": "blender-background-atomic",
+            "native_source_version": metadata["source_version"],
+            "native_metadata": metadata,
+            "camera": selected_camera, "selected_camera": selected_camera,
+            "cameras": cameras,
+            "start_frame": start_frame, "end_frame": end_frame,
+            "current_frame": current_frame,
+            "has_maya_frame_range": True,
+            "source_fps": source_fps, "output_fps": source_fps,
+            "source_frame_count": source_frame_count,
+            "source_duration_seconds": source_frame_count / source_fps,
+            "outliner_nodes": outliner_nodes,
+            "outliner_expanded": [
+                _clean(item.get("full_path")) for item in outliner_nodes
+                if not _clean(item.get("parent_path")) and _clean(item.get("full_path"))
+            ],
+            "selected_outliner_path": outliner_selection["path"],
+            "selected_outliner_name": outliner_selection["name"],
+            "selected_outliner_uuid": outliner_selection["uuid"],
+            "selected_outliner_paths": [outliner_selection["path"]] if outliner_selection["path"] else [],
+            "outliner_selection_anchor": outliner_selection["path"],
+            "selected_color": outliner_selection["color"],
+            "slot_assignments": preserved_assignments,
+            "workspace_view": "outliner",
+            "snapshot_frame": current_frame,
+            "markers": [],
+            "warnings": [_clean(item) for item in result.get("warnings", []) if _clean(item)],
+            "pending_action": "",
+            "static_frame_range_valid": True,
+            "static_camera_metadata_valid": bool(cameras),
+            "static_metadata_complete": True,
+        }
+        state = self._mark_operation_finished(_parse_state(state))
+        _append_activity_log(state, "SUCCESS", f"Blender READ completed: {len(outliner_nodes)} asset roots, {len(cameras)} cameras, {source_frame_count} frames.")
+        self._assert_operation_current(context, "Blender READ state publish")
+        self._write_state(state)
+        self._sync_outputs_from_state(state)
+        return result
+
+    @staticmethod
+    def _blender_render_inputs(scene_path: Path, state: Dict[str, Any]) -> tuple[str, float, float, float, int, int]:
+        metadata = state.get("native_metadata") if isinstance(state.get("native_metadata"), dict) else {}
+        if not state.get("native_read_ready") or _clean(metadata.get("schema")) != "hmb-blender-scene-read":
+            raise RuntimeError("Run READ for this Blender scene before rendering.")
+        if _scene_path_key(metadata.get("scene_path")) != _scene_path_key(scene_path):
+            raise RuntimeError("The completed Blender READ belongs to a different scene. Run READ again.")
+        camera = _clean(state.get("selected_camera") or state.get("camera"))
+        if not camera or camera not in {_clean(row.get("full_path")) for row in state.get("cameras", []) if isinstance(row, dict)}:
+            raise RuntimeError("Select a camera found by Blender READ before rendering.")
+        first = float(state.get("start_frame") or 0.0)
+        last = float(state.get("end_frame") or 0.0)
+        fps = float(state.get("source_fps") or 0.0)
+        if last < first or fps <= 0 or not all(math.isfinite(value) for value in (first, last, fps)):
+            raise RuntimeError("Blender READ has no valid frame range and FPS.")
+        width, height = _playblast_resolution(state)
+        return camera, first, last, fps, width, height
+
+    @staticmethod
+    def _blender_validate_sequence(
+        result: Dict[str, Any], job: Dict[str, Any], scene_path: Path,
+        *, prefix: str, expected_frames: int, expected_fps: float,
+        width: int, height: int, camera: str, marker_mode: bool,
+    ) -> tuple[Path, Dict[str, Any], Path]:
+        stem = f"{prefix}_" if prefix else ""
+        folder_key, sidecar_key, count_key = f"{stem}frames_folder", f"{stem}sidecar_path", f"{stem}frame_count"
+        output_key = f"{stem}output_name"
+        folder = Path(_clean(job.get(folder_key)))
+        sidecar_path = Path(_clean(job.get(sidecar_key)))
+        if (
+            _scene_path_key(result.get(folder_key)) != _scene_path_key(folder)
+            or _scene_path_key(result.get(sidecar_key)) != _scene_path_key(sidecar_path)
+            or int(result.get(count_key) or 0) != expected_frames
+            or not sidecar_path.is_file()
+        ):
+            raise RuntimeError(f"Blender {prefix or 'color'} result path or frame count does not match the accepted job.")
+        sidecar = _read_json(sidecar_path)
+        resolution = sidecar.get("resolution") if isinstance(sidecar.get("resolution"), dict) else {}
+        expected_schema = {
+            "": "hmb-blender-picker-render",
+            "depth": "hmb-blender-depth-playblast",
+            "motion_guide": "hmb-blender-motion-guide",
+        }[prefix]
+        if (
+            _clean(sidecar.get("schema")) != expected_schema
+            or _scene_path_key(sidecar.get("scene_path")) != _scene_path_key(scene_path)
+            or _clean(sidecar.get("camera")) != camera
+            or abs(float(sidecar.get("fps") or 0.0) - expected_fps) > 1e-5
+            or int(sidecar.get("frame_count") or 0) != expected_frames
+            or int(resolution.get("width") or 0) != width
+            or int(resolution.get("height") or 0) != height
+        ):
+            raise RuntimeError(f"Blender {prefix or 'color'} sidecar disagrees with READ or the accepted job.")
+        if not prefix:
+            requested_pattern = marker_mode and any(
+                _clean(binding.get("color")) in {
+                    _clean(item.get("name")) for item in MARKER_CATALOG["background"]
+                    if _clean(item.get("kind")) == "pattern"
+                }
+                for binding in job.get("bindings", []) if isinstance(binding, dict)
+            )
+            expected_profile = (
+                "hmb_blender_eevee_world_patterns_v1" if requested_pattern
+                else "hmb_blender_workbench_flat_markers_v1" if marker_mode
+                else "hmb_blender_workbench_midgray_v1"
+            )
+            expected_assignment = (
+                "blender_object_world_pattern_marker" if requested_pattern
+                else "blender_object_solid_marker" if marker_mode
+                else "blender_original_neutral_grayscale"
+            )
+            if _clean(sidecar.get("render_profile")) != expected_profile:
+                raise RuntimeError("Blender color render did not confirm the requested native render profile.")
+            if _clean(sidecar.get("assignment_mode")) != expected_assignment:
+                raise RuntimeError("Blender color render did not confirm the requested Original/Mask mode.")
+        elif _clean(sidecar.get("profile")) != (BLENDER_DEPTH_PROFILE if prefix == "depth" else BLENDER_MOTION_GUIDE_PROFILE):
+            raise RuntimeError(f"Blender {prefix} profile is not the agreed Blender-native profile.")
+        pattern = folder / f"{_clean(job.get(output_key))}.%06d.png"
+        frame_map = result.get(f"{stem}frame_map")
+        if not isinstance(frame_map, list) or len(frame_map) != expected_frames:
+            raise RuntimeError(f"Blender {prefix or 'color'} frame map is incomplete.")
+        for index in range(expected_frames):
+            image_path = folder / f"{_clean(job.get(output_key))}.{index:06d}.png"
+            if not image_path.is_file() or image_path.stat().st_size < 24:
+                raise RuntimeError(f"Blender {prefix or 'color'} frame {index} is missing.")
+            with image_path.open("rb") as source:
+                header = source.read(24)
+            if (
+                header[:8] != b"\x89PNG\r\n\x1a\n"
+                or header[12:16] != b"IHDR"
+                or int.from_bytes(header[16:20], "big") != width
+                or int.from_bytes(header[20:24], "big") != height
+            ):
+                raise RuntimeError(f"Blender {prefix or 'color'} frame {index} is not the requested PNG size.")
+        return pattern, sidecar, sidecar_path
+
+    def _blender_snapshot_mode(
+        self, scene_text: str, context: Optional[_OperationContext] = None, *, video_uid: Any = "",
+    ) -> Dict[str, Any]:
+        scene_path = _norm_path(_maya_scene_path_text(scene_text))
+        state = self._operation_stage_state(context)
+        camera, first, last, fps, width, height = self._blender_render_inputs(scene_path, state)
+        bindings = self._selected_slot_job_bindings(state, PRIMARY_COLOR_VIDEO_SLOT)
+        _validate_blender_marker_bindings(bindings)
+        requested = state.get("snapshot_request_frame")
+        frame = max(first, min(last, float(requested if requested is not None else state.get("snapshot_frame") or first)))
+        result, job, folder, log_path = self._blender_execute_job(scene_path, "snapshot", {
+            "camera": camera, "width": width, "height": height,
+            "start_frame": frame, "end_frame": frame, "fps": fps,
+            "apply_marker_shaders": True, "marker_catalog_path": str(MARKER_CATALOG_PATH),
+            "bindings": bindings, "hidden_paths": self._selected_slot_hidden_paths(state, PRIMARY_COLOR_VIDEO_SLOT),
+            "video_slot": PRIMARY_COLOR_VIDEO_SLOT,
+        }, context)
+        self._blender_validate_sequence(result, job, scene_path, prefix="", expected_frames=1,
+                                        expected_fps=fps, width=width, height=height, camera=camera, marker_mode=True)
+        snapshot_uid = f"snapshot-{uuid.uuid4().hex}"
+        cache_path = self._snapshot_cache_path(scene_path, snapshot_uid)
+        staged = folder / "snapshot.partial.png"
+        shutil.copy2(Path(job["frames_folder"]) / f"{job['output_name']}.000000.png", staged)
+        self._assert_operation_current(context, "Blender Snapshot atomic publish")
+        os.replace(staged, cache_path)
+        associated_uid = _clean(video_uid or state.get("snapshot_request_video_uid") or state.get("preview_video_uid"))
+        current = _append_snapshot_history_record(self._picker_state(), {
+            "snapshot_uid": snapshot_uid, "video_uid": associated_uid,
+            "render_video_slot": PRIMARY_COLOR_VIDEO_SLOT, "video_slot": PRIMARY_COLOR_VIDEO_SLOT,
+            "frame": frame, "path": str(cache_path).replace("\\", "/"),
+            "url": _external_media_url(cache_path), "sha256": _sha256_file(cache_path),
+            "created_at_ms": int(time.time() * 1000),
+        }, scene_path=scene_path, picker_shot_uuid=context.picker_shot_uuid if context else "")
+        ready = "VIDEO_READY" if current.get("videos") else "OUTLINER_READY"
+        current.update({"status": ready, "scene_stage": ready,
+                        "message": f"Blender Snapshot ready at frame {frame:g}.",
+                        "snapshot_request_video_uid": "", "workspace_view": "playblast",
+                        "warnings": [_clean(item) for item in result.get("warnings", []) if _clean(item)]})
+        current = self._mark_operation_finished(current)
+        _append_activity_log(current, "SUCCESS", f"Blender Snapshot ready: {cache_path}; log {log_path}")
+        self._write_state(current)
+        return {"mode": "blender_snapshot", "snapshot_uid": snapshot_uid, "snapshot": str(cache_path)}
+
+    def _blender_render_original_preview_mode(
+        self, scene_text: str, context: Optional[_OperationContext] = None,
+        *, publish_public: bool = True,
+    ) -> Dict[str, Any]:
+        scene_path = _norm_path(_maya_scene_path_text(scene_text))
+        state = self._operation_stage_state(context)
+        camera, first, last, fps, width, height = self._blender_render_inputs(scene_path, state)
+        frame_count = _maya_sequence_frame_count(first, last)
+        ffmpeg = _find_ffmpeg()
+        if ffmpeg is None:
+            raise FileNotFoundError("FFmpeg is required to encode Blender Original frames.")
+        metadata = dict(state.get("native_metadata") or {})
+        dependencies = [scene_path.as_posix(), *metadata.get("scene_dependency_paths", [])]
+        dependency_summary = _dependency_paths_summary(dependencies)
+        identity = {
+            "schema": "hmb-blender-original-cache-v1",
+            "scene_fingerprint": _scene_fingerprint(scene_path),
+            "dependency_fingerprint": dependency_summary["fingerprint"],
+            "camera": camera, "start_frame": first, "end_frame": last,
+            "fps": fps, "width": width, "height": height,
+        }
+        identity_hash = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
+        output_folder = _ensure_scene_output_folder(scene_path)
+        target_video = output_folder / f"{_safe_scene_name(scene_path.stem)}_blender_original_{identity_hash[:16]}.mp4"
+        target_sidecar = target_video.with_suffix(".hmb.json")
+        cached: Dict[str, Any] = {}
+        cache_valid = False
+        if target_video.is_file() and target_sidecar.is_file():
+            try:
+                cached = _read_json(target_sidecar)
+                cache_valid = (
+                    _clean(cached.get("schema")) == "hmb-blender-original-cache-v1"
+                    and _clean(cached.get("cache_identity_sha256")) == identity_hash
+                    and _scene_path_key(cached.get("video_path")) == _scene_path_key(target_video)
+                    and _is_structurally_valid_mp4(target_video)
+                )
+                if cache_valid:
+                    _validate_encoded_playblast(
+                        target_video, ffmpeg=ffmpeg, expected_fps=fps,
+                        expected_frame_count=frame_count, expected_width=width,
+                        expected_height=height, label="Blender Original cache",
+                    )
+            except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+                cache_valid = False
+        if cache_valid:
+                current = self._picker_state()
+                ready = "VIDEO_READY" if current.get("videos") else "OUTLINER_READY"
+                current.update({"status": ready, "scene_stage": ready,
+                                "message": "Blender Original loaded from the validated cache.",
+                                "original_video_path": str(target_video).replace("\\", "/"),
+                                "original_video_url": _external_media_url(target_video),
+                                "original_metadata": {**_original_view_metadata(cached), "scene_engine": "blender"},
+                                "original_preview_enabled": True, "workspace_view": "playblast"})
+                if publish_public:
+                    current = self._mark_operation_finished(current)
+                current = self._apply_selected_view_fields(current)
+                self._write_state(current)
+                if publish_public:
+                    self._sync_outputs_from_state(current)
+                return {"mode": "blender_original_cache", "video": str(target_video), "cached": True}
+
+        result, job, folder, log_path = self._blender_execute_job(scene_path, "render", {
+            "camera": camera, "width": width, "height": height,
+            "start_frame": first, "end_frame": last, "fps": fps,
+            "apply_marker_shaders": False,
+            "marker_catalog_path": str(MARKER_CATALOG_PATH),
+            "generate_depth_playblast": False, "generate_motion_guide": False,
+        }, context)
+        pattern, sidecar, _ = self._blender_validate_sequence(
+            result, job, scene_path, prefix="", expected_frames=frame_count,
+            expected_fps=fps, width=width, height=height, camera=camera, marker_mode=False,
+        )
+        staged_video = folder / "original.partial.mp4"
+        staged_sidecar = folder / "original.partial.hmb.json"
+        self._encode_playblast_sequence(
+            ffmpeg=ffmpeg, frame_pattern=pattern, staged_video_path=staged_video,
+            source_fps=fps, frame_count=frame_count, width=width, height=height,
+            log_path=log_path, output_folder=output_folder, label="Blender Original",
+        )
+        _validate_encoded_playblast(
+            staged_video, ffmpeg=ffmpeg, expected_fps=fps,
+            expected_frame_count=frame_count, expected_width=width,
+            expected_height=height, label="Blender Original",
+        )
+        sidecar.update({
+            "schema": "hmb-blender-original-cache-v1", "scene_engine": "blender",
+            "cache_identity_sha256": identity_hash,
+            "cache_identity": identity,
+            "scene_dependency_paths": dependencies,
+            "scene_dependency_fingerprint": dependency_summary["fingerprint"],
+            "video": target_video.name,
+            "video_path": str(target_video).replace("\\", "/"),
+            "video_size_bytes": staged_video.stat().st_size,
+            "duration_policy": "exact_source_timing",
+        })
+        _write_json(staged_sidecar, sidecar)
+        self._assert_operation_current(context, "Blender Original atomic publish")
+        with _playblast_publish_guard(scene_path):
+            self._publish_validated_playblast_artifact(
+                staged_video=staged_video, staged_sidecar=staged_sidecar,
+                target_video=target_video, target_sidecar=target_sidecar,
+                backup_folder=folder / "backup", label="Blender Original",
+            )
+        current = self._picker_state()
+        ready = "VIDEO_READY" if current.get("videos") else "OUTLINER_READY"
+        current.update({"status": ready, "scene_stage": ready,
+                        "message": f"Blender Original ready: {frame_count} frames at {fps:g} FPS.",
+                        "original_video_path": str(target_video).replace("\\", "/"),
+                        "original_video_url": _external_media_url(target_video),
+                        "original_metadata": {**_original_view_metadata(sidecar), "scene_engine": "blender"},
+                        "original_preview_enabled": True, "workspace_view": "playblast",
+                        "warnings": [_clean(item) for item in result.get("warnings", []) if _clean(item)]})
+        if publish_public:
+            current = self._mark_operation_finished(current)
+        current = self._apply_selected_view_fields(current)
+        _append_activity_log(current, "SUCCESS", f"Blender Original published: {target_video}")
+        self._write_state(current)
+        if publish_public:
+            self._sync_outputs_from_state(current)
+        return {"mode": "blender_original", "video": str(target_video),
+                "json": str(target_sidecar), "cached": False,
+                "frame_count": frame_count, "fps": fps}
+
+    def _blender_mode(
+        self, scene_text: str, video_slot: int,
+        context: Optional[_OperationContext] = None, *, publish_public: bool = True,
+    ) -> Dict[str, Any]:
+        scene_path = _norm_path(_maya_scene_path_text(scene_text))
+        state = self._operation_stage_state(context)
+        camera, first, last, fps, width, height = self._blender_render_inputs(scene_path, state)
+        frame_count = _maya_sequence_frame_count(first, last)
+        mask_requested = bool(state.get("mask_enabled"))
+        depth_requested = bool(state.get("depth_enabled"))
+        motion_requested = bool(state.get("motion_guide_enabled"))
+        if not (mask_requested or depth_requested or motion_requested):
+            raise RuntimeError("Select a Blender Mask, Depth, or Motion Guide output first.")
+        if context is not None:
+            depth_slot, motion_slot = context.depth_video_slot, context.motion_guide_video_slot
+            mask_slot = context.mask_authoring_slot
+        else:
+            depth_slot, motion_slot = _resolve_generated_companion_slots(
+                state, depth_enabled=depth_requested, motion_guide_enabled=motion_requested,
+            )
+            mask_slot = _mask_authoring_slot(state)
+        if depth_requested != bool(depth_slot) or motion_requested != bool(motion_slot):
+            raise RuntimeError("The frozen Blender companion slot plan changed before render.")
+        bindings = self._selected_slot_job_bindings(state, mask_slot)
+        _validate_blender_marker_bindings(bindings)
+        if not bindings:
+            raise RuntimeError("Assign at least one solid Blender Color Pick before Mask/Depth/Motion generation.")
+        ffmpeg = _find_ffmpeg()
+        if ffmpeg is None:
+            raise FileNotFoundError("FFmpeg is required to encode Blender Mask/Depth/Motion frames.")
+        output_folder = _ensure_scene_output_folder(scene_path)
+        token = hashlib.sha256(f"blender-bundle|{scene_path}|{time.time_ns()}".encode("utf-8")).hexdigest()[:12]
+        bundle_run_id = f"blender-{token}"
+        result, job, folder, log_path = self._blender_execute_job(scene_path, "render", {
+            "camera": camera, "width": width, "height": height,
+            "start_frame": first, "end_frame": last, "fps": fps,
+            "apply_marker_shaders": True, "marker_catalog_path": str(MARKER_CATALOG_PATH),
+            "bindings": bindings, "hidden_paths": self._selected_slot_hidden_paths(state, mask_slot),
+            "video_slot": mask_slot,
+            "generate_depth_playblast": depth_requested,
+            "generate_motion_guide": motion_requested,
+        }, context)
+        artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), dict) else {}
+        for key, requested in (("color", True), ("depth", depth_requested), ("motion_guide", motion_requested)):
+            status = artifacts.get(key) if isinstance(artifacts.get(key), dict) else {}
+            if bool(status.get("requested")) != requested or (requested and not bool(status.get("ok"))):
+                raise RuntimeError(f"Blender {key} artifact did not confirm the accepted request: {_clean(status.get('error'))}")
+        roles = ["mask"] + (["depth"] if depth_requested else []) + (["motion_guide"] if motion_requested else [])
+        role_prefix = {"mask": "", "depth": "depth", "motion_guide": "motion_guide"}
+        role_meta = {
+            "mask": (BLENDER_MASK_MEDIA_KIND, "blender_color_assignment_mask", "Color Assignment Mask / Segmentation Reference", "Object and Character Region Guidance"),
+            "depth": (BLENDER_DEPTH_MEDIA_KIND, "blender_depth_companion", DEPTH_SOURCE_TYPE, DEPTH_CONTROL_ROLE),
+            "motion_guide": (BLENDER_MOTION_GUIDE_MEDIA_KIND, "blender_motion_guide_companion", MOTION_GUIDE_SOURCE_TYPE, MOTION_GUIDE_CONTROL_ROLE),
+        }
+        target_pairs: List[tuple[Path, Path]] = []
+        role_assets: Dict[str, Dict[str, Any]] = {}
+        for role in roles:
+            prefix = role_prefix[role]
+            pattern, sidecar, _ = self._blender_validate_sequence(
+                result, job, scene_path, prefix=prefix, expected_frames=frame_count,
+                expected_fps=fps, width=width, height=height, camera=camera, marker_mode=True,
+            )
+            target_video = output_folder / f"{_safe_scene_name(scene_path.stem)}_blender_{role}_{token}.mp4"
+            target_sidecar = target_video.with_suffix(".hmb.json")
+            staged_video = folder / f"{role}.partial.mp4"
+            staged_sidecar = folder / f"{role}.partial.hmb.json"
+            self._encode_playblast_sequence(
+                ffmpeg=ffmpeg, frame_pattern=pattern, staged_video_path=staged_video,
+                source_fps=fps, frame_count=frame_count, width=width, height=height,
+                log_path=log_path, output_folder=output_folder, label=f"Blender {role}",
+            )
+            validation = _validate_encoded_playblast(
+                staged_video, ffmpeg=ffmpeg, expected_fps=fps,
+                expected_frame_count=frame_count, expected_width=width,
+                expected_height=height, label=f"Blender {role}",
+            )
+            media_kind, video_role, source_hint, control_hint = role_meta[role]
+            sidecar.update({
+                "scene_engine": "blender", "mode": "blender", "media_kind": media_kind,
+                "video_role": video_role, "source_type_hint": source_hint,
+                "control_role_hint": control_hint,
+                "video": target_video.name, "video_path": str(target_video).replace("\\", "/"),
+                "video_size_bytes": staged_video.stat().st_size,
+                "source_fps": fps, "source_frame_count": frame_count,
+                "source_duration_seconds": frame_count / fps,
+                "output_fps": fps, "output_frame_count": frame_count,
+                "output_duration_seconds": frame_count / fps,
+                "encoded_stream_validation": validation,
+                "duration_policy": "exact_source_timing",
+                "bundle_run_id": bundle_run_id,
+                "pair_run_id": bundle_run_id if depth_requested else "",
+                "video_slot": PRIMARY_COLOR_VIDEO_SLOT if role == "mask" else depth_slot if role == "depth" else motion_slot,
+                "companion_of_video_slot": PRIMARY_COLOR_VIDEO_SLOT if role != "mask" else 0,
+                "source_video_slot": PRIMARY_COLOR_VIDEO_SLOT if role != "mask" else 0,
+            })
+            _write_json(staged_sidecar, sidecar)
+            target_pairs.extend(((staged_video, target_video), (staged_sidecar, target_sidecar)))
+            role_assets[role] = {"video": target_video, "sidecar": target_sidecar, "metadata": sidecar}
+        self._assert_operation_current(context, "Blender bundle atomic publish")
+        prior_state = self._picker_state()
+        with _playblast_publish_guard(scene_path):
+            records = self._publish_playblast_bundle(target_pairs, folder / "backup")
+            try:
+                for role in roles:
+                    item = role_assets[role]
+                    if not _is_structurally_valid_mp4(item["video"]) or not item["sidecar"].is_file():
+                        raise RuntimeError(f"Published Blender {role} pair failed final validation.")
+                current = _apply_active_snapshot_projection(self._picker_state(), viewport_mode="video")
+                mask_asset = role_assets["mask"]
+                mask_metadata = mask_asset["metadata"]
+                markers = [dict(row) for row in mask_metadata.get("markers", []) if isinstance(row, dict)]
+                current.update({
+                    "mode": "blender", "scene_engine": "blender",
+                    "status": "VIDEO_READY", "scene_stage": "VIDEO_READY",
+                    "message": "Blender Mask/Depth/Motion validated for video history.",
+                    "video_path": str(mask_asset["video"]).replace("\\", "/"),
+                    "video_url": _external_media_url(mask_asset["video"]),
+                    "project_video_path": "", "video_metadata": {},
+                    "scene_path": str(scene_path).replace("\\", "/"),
+                    "camera": camera, "source_fps": fps, "output_fps": fps,
+                    "output_width": width, "output_height": height,
+                    "source_frame_count": frame_count, "output_frame_count": frame_count,
+                    "decoded_frame_count": frame_count,
+                    "source_duration_seconds": frame_count / fps,
+                    "output_duration_seconds": frame_count / fps,
+                    "has_maya_frame_range": True, "markers": markers,
+                    "blender_render_profile": _clean(mask_metadata.get("render_profile")),
+                    "blender_assignment_mode": _clean(mask_metadata.get("assignment_mode")),
+                    "warnings": [_clean(item) for item in result.get("warnings", []) if _clean(item)],
+                    "original_preview_enabled": False, "workspace_view": "playblast",
+                    "pair_run_id": bundle_run_id if depth_requested else "",
+                    "bundle_run_id": bundle_run_id,
+                    "depth_video_slot": depth_slot if depth_requested else 0,
+                    "motion_guide_video_slot": motion_slot if motion_requested else 0,
+                })
+                shot_uuid = context.picker_shot_uuid if context else ""
+                mask_item: Dict[str, Any] = {}
+                if mask_requested:
+                    self._publish_outputs(current, PRIMARY_COLOR_VIDEO_SLOT,
+                                          publish_public=False, picker_shot_uuid=shot_uuid)
+                    current = self._picker_state()
+                    mask_item = next((dict(row) for row in reversed(current.get("videos", []))
+                                      if isinstance(row, dict) and _clean(row.get("generation_role")) == "mask"
+                                      and _scene_path_key(row.get("video_path")) == _scene_path_key(mask_asset["video"])), {})
+                for role, enabled, slot in (("depth", depth_requested, depth_slot),
+                                             ("motion_guide", motion_requested, motion_slot)):
+                    if not enabled:
+                        continue
+                    asset = role_assets[role]
+                    metadata_row = asset["metadata"]
+                    media_kind, video_role, source_hint, control_hint = role_meta[role]
+                    current = _append_video_asset(current, {
+                        "video_slot": slot,
+                        "scene_engine": "blender",
+                        "video_path": str(asset["video"]).replace("\\", "/"),
+                        "video_url": _external_media_url(asset["video"]),
+                        "camera": camera, "markers": [],
+                        "source_fps": fps, "output_fps": fps,
+                        "output_width": width, "output_height": height,
+                        "source_frame_count": frame_count, "output_frame_count": frame_count,
+                        "decoded_frame_count": frame_count,
+                        "source_duration_seconds": frame_count / fps,
+                        "output_duration_seconds": frame_count / fps,
+                        "start_frame": first, "end_frame": last, "has_maya_frame_range": True,
+                        "media_kind": media_kind, "video_role": video_role,
+                        "source_type_hint": source_hint, "control_role_hint": control_hint,
+                        "companion_of_video_slot": PRIMARY_COLOR_VIDEO_SLOT,
+                        "source_video_slot": PRIMARY_COLOR_VIDEO_SLOT,
+                        "pair_run_id": bundle_run_id if depth_requested else "",
+                        "bundle_run_id": bundle_run_id,
+                        "depth_profile": BLENDER_DEPTH_PROFILE if role == "depth" else "",
+                        "depth_range_report": metadata_row.get("depth_range_report", {}) if role == "depth" else {},
+                        "motion_guide_profile": BLENDER_MOTION_GUIDE_PROFILE if role == "motion_guide" else "",
+                        "motion_guide_report": metadata_row.get("motion_guide_report", {}) if role == "motion_guide" else {},
+                        "generation_role": role,
+                        "companion_video_uid": _clean(mask_item.get("video_uid")),
+                        "source_video_uid": _clean(mask_item.get("video_uid")),
+                        "label": "Depth" if role == "depth" else "Motion Guide",
+                    }, picker_shot_uuid=shot_uuid)
+                if publish_public:
+                    current = self._mark_operation_finished(current)
+                _append_activity_log(current, "SUCCESS", f"Blender render published {', '.join(roles)}: {frame_count} frames at {fps:g} FPS.")
+                self._write_state(current)
+                if publish_public:
+                    self._sync_outputs_from_state(current)
+            except Exception:
+                self._restore_playblast_bundle(records)
+                self._write_state(prior_state)
+                raise
+        return {
+            "mode": "blender", "video_slot": PRIMARY_COLOR_VIDEO_SLOT,
+            "bundle_run_id": bundle_run_id,
+            "video": str(role_assets["mask"]["video"]),
+            "json": str(role_assets["mask"]["sidecar"]),
+            "source_fps": fps, "output_fps": fps,
+            "output_width": width, "output_height": height,
+            "source_frame_count": frame_count, "output_frame_count": frame_count,
+            "source_duration_seconds": frame_count / fps,
+            "output_duration_seconds": frame_count / fps,
+            "marker_count": len(bindings), "mask_item": mask_item,
+            "depth_enabled": depth_requested, "depth_succeeded": depth_requested,
+            "depth_video_slot": depth_slot if depth_requested else 0,
+            "depth_video": str(role_assets["depth"]["video"]) if depth_requested else "",
+            "depth_profile": BLENDER_DEPTH_PROFILE if depth_requested else "",
+            "motion_guide_enabled": motion_requested, "motion_guide_succeeded": motion_requested,
+            "motion_guide_video_slot": motion_slot if motion_requested else 0,
+            "motion_guide_video": str(role_assets["motion_guide"]["video"]) if motion_requested else "",
+            "motion_guide_profile": BLENDER_MOTION_GUIDE_PROFILE if motion_requested else "",
         }
 
     def process(self) -> None:

@@ -7,6 +7,22 @@ import { createRequire } from "node:module";
 
 const source = fs.readFileSync(new URL("../../widgets/HMBVideoPickerLibraryWidget_v032.js", import.meta.url), "utf8");
 const widget = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+let outlinerPathReads = 0;
+const largeRoot = { name: "Actor", full_path: "|Actor", depth_meshes: Array.from({ length: 2500 }, (_, index) => ({
+  name: `Mesh${index}`,
+  get full_path() { outlinerPathReads += 1; return `|Actor|Mesh${index}`; },
+})) };
+const largeState = { outliner_nodes: [largeRoot], outliner_expanded: [], outliner_search: "",
+  depth_settings: { expanded_roots: ["|Actor"] } };
+const firstWindow = widget.hmbPickerOutlinerWindow(largeState, 0, 400);
+const firstReadCount = outlinerPathReads;
+const scrolledWindow = widget.hmbPickerOutlinerWindow(largeState, 1600, 400);
+assert.equal(firstWindow.total, 2501);
+assert.ok(scrolledWindow.start > firstWindow.start);
+assert.equal(outlinerPathReads, firstReadCount, "Scrolling a stable tree reuses its visible projection.");
+largeState.outliner_search = "Mesh2499";
+assert.equal(widget.hmbPickerOutlinerWindow(largeState, 0, 400).total, 2);
+assert.ok(outlinerPathReads > firstReadCount, "Search changes invalidate the visible projection.");
 const owner = { runtime_instance_id: "r1", active_picker_shot_uuid: "s1", scene_request_path: "C:/scene.mb",
   selected_outliner_path: "|A", selected_outliner_paths: ["|A"], selected_color: "Red",
   slot_assignments: [{ video_slot: 1, bindings: [{ full_dag_path: "|A", color: "Red" }] }] };
@@ -156,6 +172,40 @@ try {
   assert.ok(pendingOnFailure.colors.every(color=>color==='Pink'),"Failure of an older publication cannot repaint over a newer uncommitted color");
   await page.waitForFunction(() => window.publications.length === 6);
   assert.deepEqual(await page.evaluate(() => window.projection()),pendingOnFailure);
+  const resizeFrame = await page.evaluate(() => {
+    const handle = document.querySelector("[data-resize-section]");
+    const section = handle?.closest(".side-section");
+    if (!handle || !section) throw new Error("Picker section resize handle is missing.");
+    const originalRequest = window.requestAnimationFrame;
+    const originalCancel = window.cancelAnimationFrame;
+    const frames = new Map();
+    let nextFrame = 1;
+    window.requestAnimationFrame = (callback) => { const id = nextFrame++; frames.set(id, callback); return id; };
+    window.cancelAnimationFrame = (id) => frames.delete(id);
+    try {
+      const pointer = (type, y) => new PointerEvent(type, {
+        bubbles: true, button: 0, pointerId: 81, clientY: y,
+      });
+      const before = section.style.height;
+      handle.dispatchEvent(pointer("pointerdown", 200));
+      for (let index = 1; index <= 40; index += 1) {
+        window.dispatchEvent(pointer("pointermove", 200 + index));
+      }
+      const during = section.style.height;
+      const queued = frames.size;
+      for (const callback of frames.values()) callback();
+      frames.clear();
+      const after = section.style.height;
+      window.dispatchEvent(pointer("pointerup", 240));
+      return { before, during, queued, after };
+    } finally {
+      window.requestAnimationFrame = originalRequest;
+      window.cancelAnimationFrame = originalCancel;
+    }
+  });
+  assert.equal(resizeFrame.during, resizeFrame.before, "Pointer bursts defer section layout until the next frame.");
+  assert.equal(resizeFrame.queued, 1, "Forty pointer moves coalesce into one section resize frame.");
+  assert.notEqual(resizeFrame.after, resizeFrame.before);
   await page.evaluate(() => {window.observer.disconnect();window.controller.cleanup();});
   assert.deepEqual(failures,[]);
   console.log(`Picker outliner paint-first: PASS (2000 meshes, Ctrl/Cmd/Shift, immediate chips, 0 row removals, crossed ACKs, scoped drafts, rejection rollback; 4 input actions ${first.ms.toFixed(1)}ms)`);

@@ -219,6 +219,11 @@ class RuntimeRegisteredSeedance(target.HMBSeedanceGeneration):
 class BrokerScriptedNode(RuntimeRegisteredSeedance):
     def __init__(self, bridge: FakeBrokerBridge) -> None:
         super().__init__(name="HMB Seedance Broker Scripted Regression")
+        # The scripted result bytes and expected payload are the legacy 2.0
+        # MP4 contract, independent of the fresh-node 2.5 MOV defaults.
+        self.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0)
+        self.set_parameter_value("duration", 5)
+        self.set_parameter_value("ratio", "adaptive")
         self.set_parameter_value(target.TASK_PARAMETER, target.TASK_TEXT_ONLY)
         self.bridge = bridge
         self.destination = FakeDestination()
@@ -497,7 +502,31 @@ def assert_constructor_and_public_contract() -> None:
     assert node.get_parameter_value("tos_endpoint") == "tos-cn-beijing.volces.com"
     assert node.get_parameter_value("tos_url_validity_seconds") == 86400
     assert node.get_parameter_by_name("tos_region").hide is True
-    assert node.get_parameter_value("model_id") == target.MODEL_NAME_SEEDANCE_2_0
+    # A newly created node follows the user-facing Seedance 2.5 preset.
+    # Explicit 2.0/2.0 Fast selection below must retain the legacy contract.
+    assert node.get_parameter_value("model_id") == target.MODEL_NAME_SEEDANCE_2_5
+    assert node.get_parameter_value("resolution") == "720p"
+    assert node.get_parameter_value("ratio") == "16:9"
+    assert node.get_parameter_value("duration") == 4
+    assert node.get_parameter_value("generate_audio") is False
+    assert node.get_parameter_value("output_format") == "mov"
+    assert str(node.get_parameter_value("output_file")).lower().endswith(".mov")
+    fresh_params = node._get_parameters()
+    fresh_params.update(
+        {
+            "prompt": "fresh default options",
+            "task": target.TASK_TEXT_ONLY,
+            "input_mode": target.INPUT_MODE_TEXT_ONLY,
+        }
+    )
+    fresh_payload = node._build_broker_payload(fresh_params)
+    assert fresh_payload["model"] == target.SEEDANCE_2_5_MODEL_ID
+    assert fresh_payload["quality"] == "720p"
+    assert fresh_payload["resolution"] == "720p"
+    assert fresh_payload["aspect_ratio"] == "16:9"
+    assert fresh_payload["duration_seconds"] == 4
+    assert fresh_payload["generate_audio"] is False
+    assert fresh_payload["output_format"] == "mov"
     assert node.get_parameter_by_name("model_id").ui_options["simple_dropdown"] == [
         target.MODEL_NAME_SEEDANCE_2_0,
         target.MODEL_NAME_SEEDANCE_2_0_FAST,
@@ -505,6 +534,14 @@ def assert_constructor_and_public_contract() -> None:
     ]
     task_parameter = node.get_parameter_by_name("task")
     assert task_parameter is not None
+    assert task_parameter.hide is False
+    assert task_parameter.hide_property is False
+    assert task_parameter.ui_options["display_name"] == "Task"
+    assert task_parameter.ui_options["simple_dropdown"] == list(
+        target.TASK_STORAGE_CHOICES
+    )
+    assert node.get_parameter_by_name("input_mode").hide is True
+    node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0)
     assert task_parameter.hide is True
     assert task_parameter.hide_property is True
     assert task_parameter.ui_options["display_name"] == ""
@@ -550,11 +587,13 @@ def assert_constructor_and_public_contract() -> None:
         "720p",
         "480p",
     ]
-    assert node.get_parameter_value("ratio") == "adaptive"
+    # Ratio and duration are authored independently of a model switch when
+    # they remain valid for the selected task.
+    assert node.get_parameter_value("ratio") == "16:9"
     assert node.get_parameter_by_name("ratio").ui_options["simple_dropdown"] == list(
         target.RATIOS
     )
-    assert node.get_parameter_value("duration") == 5
+    assert node.get_parameter_value("duration") == 4
     assert node.get_parameter_by_name("duration").ui_options["simple_dropdown"] == [
         -1,
         *range(4, 16),
@@ -759,7 +798,7 @@ def assert_constructor_and_public_contract() -> None:
     assert "GriptapeCloudStorageDriver" in source
     assert 'importlib.import_module("tos")' in source
     assert (
-        "Options(choices=list(MODEL_RESOLUTIONS[SEEDANCE_2_0_MODEL_ID]))"
+        "Options(choices=list(MODEL_RESOLUTIONS[SEEDANCE_2_5_MODEL_ID]))"
         in source
     )
 
@@ -782,7 +821,8 @@ def assert_seedance_25_output_format_and_last_frame_ui_contract() -> None:
 
     output_format = node.get_parameter_by_name("output_format")
     assert type(output_format).__name__ == "ParameterString"
-    assert node.get_parameter_value("output_format") == "mp4"
+    assert node.get_parameter_value("output_format") == "mov"
+    assert str(node.get_parameter_value("output_file")).lower().endswith(".mov")
     choices = output_format.ui_options.get("simple_dropdown")
     if choices is None:
         option_traits = output_format.find_elements_by_type(target.Options)
@@ -813,13 +853,18 @@ def assert_seedance_25_output_format_and_last_frame_ui_contract() -> None:
     assert node.parameter_output_values["video_url"] is prior_video
     assert node.parameter_output_values["last_frame_url"] is prior_frame
 
-    # The unified HMB node defaults to 2.0. Both 2.5-only controls and their
-    # optional output must therefore start hidden, not merely ignored later.
-    assert node.get_parameter_value("model_id") == target.MODEL_NAME_SEEDANCE_2_0
+    # The fresh node starts with 2.5/MOV; an explicit legacy model switch still
+    # hides the 2.5-only controls and restores the MP4-only output contract.
+    assert node.get_parameter_value("model_id") == target.MODEL_NAME_SEEDANCE_2_5
+    assert output_format.hide is False
+    assert return_last_frame.hide is False
+    node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0)
     assert output_format.hide is True
     assert return_last_frame.hide is True
     assert last_frame_output.hide is True
     assert last_frame_file.hide is True
+    assert node.get_parameter_value("output_format") == "mp4"
+    assert str(node.get_parameter_value("output_file")).lower().endswith(".mp4")
 
     node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_5)
     node.set_parameter_value(target.TASK_PARAMETER, target.TASK_TEXT_ONLY)
@@ -1493,6 +1538,11 @@ def assert_image_asset_single_wire_host_contract() -> None:
             )
             register(overflow_source)
             register(overflow_destination)
+            # The fresh-node default is 2.5; keep the legacy nine-image
+            # boundary explicit and cover the new model on the same wire.
+            overflow_destination.set_parameter_value(
+                "model_id", target.MODEL_NAME_SEEDANCE_2_0
+            )
             overflow = [
                 f"https://example.test/overflow-{index}.png"
                 for index in range(10)
@@ -1508,6 +1558,16 @@ def assert_image_asset_single_wire_host_contract() -> None:
                 assert "at most 9 reference images" in str(exc)
             else:
                 raise AssertionError("Connected ten-image batch was accepted")
+
+            overflow_destination.set_parameter_value(
+                "model_id", target.MODEL_NAME_SEEDANCE_2_5
+            )
+            overflow_destination._validate_parameters(
+                overflow_destination._get_parameters()
+            )
+            assert overflow_destination._build_broker_payload(
+                overflow_destination._get_parameters()
+            )["image_urls"] == overflow
     finally:
         deleted = asyncio.run(
             GriptapeNodes.ahandle_request(
@@ -1775,7 +1835,7 @@ def assert_seedance_native_reset_fresh_recovery_contract() -> None:
                         task_identity="broker_task", status=status, terminal=status in ("failed", "succeeded"))
                     assert await old._force_save_generation_recovery_checkpoint(required=True, reason="reset audit")
                     identity = old._generation_recovery_state()["journal_id"]
-                    result = manager.on_reset_node_to_defaults_request(ResetNodeToDefaultsRequest(node_name=old.name))
+                    result = await manager.on_reset_node_to_defaults_request(ResetNodeToDefaultsRequest(node_name=old.name))
                     assert isinstance(result, ResetNodeToDefaultsResultSuccess), result
                     fresh = manager.get_node_by_name(result.node_name)
                     assert fresh is not old and old._hmb_node_deleted
@@ -2037,6 +2097,9 @@ def assert_seedance_dangling_list_delete_live_host_contract() -> None:
 
 def assert_payload_and_media_contract() -> None:
     node = target.HMBSeedanceGeneration(name="Payload Regression")
+    # This suite exercises the established 2.0 payload/limits; 2.5 has a
+    # separate contract below and must not redefine these legacy fixtures.
+    node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0)
     with tempfile.TemporaryDirectory() as temporary:
         temporary_path = Path(temporary)
         image_path = temporary_path / "reference.png"
@@ -2157,6 +2220,7 @@ def assert_payload_and_media_contract() -> None:
     overflow_video_node = target.HMBSeedanceGeneration(
         name="Picker Video Overflow Regression"
     )
+    overflow_video_node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0)
     overflow_video_node.set_parameter_value("prompt", "reject four videos")
     overflow_video_node.set_parameter_value(
         "VIDEO_REFERENCES",
@@ -4497,6 +4561,7 @@ def assert_atomic_final_output_publication() -> None:
         project_node = RuntimeRegisteredSeedance(
             name="Atomic ProjectFileParameter Regression"
         )
+        project_node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0)
         project_node._broker_bridge_instance = bridge
         project_node.set_parameter_value(
             target.TASK_PARAMETER,

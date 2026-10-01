@@ -72,8 +72,9 @@ assert.match(
 assert.match(
   serverPosterMarkup,
   /class="compact-video-poster"[^>]*src="https:\/\/static\.invalid\/video-a-poster\.png"/,
-  "A backend poster must paint immediately without opening a card decoder.",
+  "A backend poster starts loading without opening a card decoder.",
 );
+assert.match(serverPosterMarkup, /class="compact-video-poster"[^>]*hidden[^>]*src="https:\/\/static\.invalid\/video-a-poster\.png"/);
 assert.match(widgetSource, /const cache = new Map\(\);[\s\S]*let probe = null;/);
 assert.doesNotMatch(widgetSource, /URL\.createObjectURL|URL\.revokeObjectURL/);
 assert.match(
@@ -540,11 +541,17 @@ class FakePoster {
     this.hidden = true;
     this.currentSrc = "";
     this.parentElement = parent;
+    this.complete = false;
+    this.naturalWidth = 0;
   }
   getAttribute(name) { return this.attributes.get(name) ?? null; }
   setAttribute(name, value) {
     this.attributes.set(name, String(value));
-    if (name === "src") this.currentSrc = String(value);
+    if (name === "src") {
+      this.currentSrc = String(value);
+      this.complete = false;
+      this.naturalWidth = 0;
+    }
   }
   removeAttribute(name) {
     this.attributes.delete(name);
@@ -555,6 +562,8 @@ class FakePoster {
     clone.attributes = new Map(this.attributes);
     clone.hidden = this.hidden;
     clone.currentSrc = this.currentSrc;
+    clone.complete = this.complete;
+    clone.naturalWidth = this.naturalWidth;
     return clone;
   }
   replaceWith(replacement) {
@@ -564,27 +573,35 @@ class FakePoster {
     }
     this.parentElement = null;
   }
+  remove() {
+    if (this.parentElement?.poster === this) this.parentElement.poster = null;
+    if (this.parentElement?.pending === this) this.parentElement.pending = null;
+    this.parentElement = null;
+  }
 }
 class FakeThumb {
   constructor(source, suppliedPoster = "") {
     this.attributes = new Map([["data-compact-thumbnail-source", source]]);
     if (suppliedPoster) this.attributes.set("data-compact-thumbnail-poster", suppliedPoster);
     this.poster = new FakePoster(this);
+    this.pending = null;
     this.placeholder = { hidden: false };
-    this.classList = { add() {}, remove() {} };
+    this.classList = { add() {}, remove() {}, toggle() {} };
   }
   getAttribute(name) { return this.attributes.get(name) ?? null; }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
   removeAttribute(name) { this.attributes.delete(name); }
   querySelector(selector) {
-    if (selector === ".compact-video-poster") return this.poster;
+    if (selector === ".compact-video-poster") return this.poster || this.pending;
+    if (selector === "[data-pending-compact-poster]") return this.pending?.getAttribute("data-pending-compact-poster") ? this.pending : null;
     if (selector === ".compact-shot-placeholder") return this.placeholder;
     return null;
   }
+  appendChild(poster) { this.pending = poster; poster.parentElement = this; }
 }
 
 // A backend-generated poster is the primary path. It must skip the browser
-// video/canvas probe entirely and still reveal the image immediately.
+// video/canvas probe entirely; the placeholder remains until image decode.
 {
   let videoCreates = 0;
   const thumb = new FakeThumb("/external/a.mp4", "/static/a-poster.png");
@@ -605,9 +622,45 @@ class FakeThumb {
   assert.equal(widget.hmbSyncVideoPickerCompactThumbnails(container), 1);
   assert.equal(videoCreates, 0);
   assert.equal(thumb.poster.getAttribute("src"), "/static/a-poster.png");
+  assert.equal(thumb.poster.hidden, true);
+  assert.equal(thumb.placeholder.hidden, false);
+  thumb.poster.complete = true;
+  thumb.poster.naturalWidth = 320;
+  widget.hmbEnsureVideoPickerCompactThumbnailController(container)
+    .applyServerPoster(thumb, "/static/a-poster.png");
   assert.equal(thumb.poster.hidden, false);
   assert.equal(thumb.placeholder.hidden, true);
   widget.hmbDisposeVideoPickerCompactThumbnailController(container);
+}
+
+// A replacement URL keeps the decoded old image visible until its successor
+// has decoded, then swaps the image without showing the placeholder.
+{
+  const thumb = new FakeThumb("/external/same.mp4", "/static/old.png");
+  const container = {
+    ownerDocument: { defaultView: {}, createElement() { return {}; } },
+    __hmbVideoPickerExpanded: false,
+    querySelectorAll(selector) {
+      return selector === "[data-compact-thumbnail-source]" ? [thumb] : [];
+    },
+  };
+  const controller = widget.hmbEnsureVideoPickerCompactThumbnailController(container);
+  controller.applyServerPoster(thumb, "/static/old.png");
+  thumb.poster.complete = true;
+  thumb.poster.naturalWidth = 320;
+  controller.applyServerPoster(thumb, "/static/old.png");
+  const oldPoster = thumb.poster;
+  controller.applyServerPoster(thumb, "/static/new.png");
+  assert.equal(oldPoster.hidden, false);
+  assert.equal(thumb.placeholder.hidden, true);
+  assert.equal(thumb.pending?.getAttribute("src"), "/static/new.png");
+  thumb.pending.complete = true;
+  thumb.pending.naturalWidth = 320;
+  controller.applyServerPoster(thumb, "/static/new.png");
+  assert.equal(oldPoster.parentElement, null);
+  assert.equal(thumb.pending.hidden, false);
+  assert.equal(thumb.placeholder.hidden, true);
+  controller.dispose();
 }
 
 // A late backend poster must cancel the in-flight browser decoder. A failed
@@ -771,8 +824,51 @@ assert.match(
     "end:/external/b.mp4",
   ]);
   assert.ok(thumbs.every((thumb) => thumb.poster.getAttribute("src")?.startsWith("data:image/webp")));
+  assert.ok(thumbs.every((thumb) => thumb.poster.hidden && !thumb.placeholder.hidden));
+  thumbs.forEach((thumb) => { thumb.poster.complete = true; thumb.poster.naturalWidth = 212; });
+  widget.hmbSyncVideoPickerCompactThumbnails(container);
   assert.ok(thumbs.every((thumb) => thumb.poster.hidden === false && thumb.placeholder.hidden === true));
   widget.hmbDisposeVideoPickerCompactThumbnailController(container);
+}
+
+// A card entering the viewport may move ahead of previously queued background
+// retries without creating a second simultaneous decoder.
+{
+  let observer;
+  const probes = [];
+  class DeferredObserver {
+    constructor(callback) { this.callback = callback; observer = this; }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  const thumbs = ["a", "b", "c"].map((id) => new FakeThumb(`/external/${id}.mp4`));
+  const container = {
+    ownerDocument: {
+      defaultView: { IntersectionObserver: DeferredObserver },
+      createElement(tag) {
+        assert.equal(tag, "video");
+        const probe = { setAttribute(name, value) { if (name === "src") this.src = value; },
+          removeAttribute() {}, load() {}, pause() {} };
+        probes.push(probe);
+        return probe;
+      },
+    },
+    __hmbVideoPickerExpanded: false,
+    querySelectorAll(selector) {
+      return selector === "[data-compact-thumbnail-source]" ? thumbs : [];
+    },
+  };
+  const controller = widget.hmbEnsureVideoPickerCompactThumbnailController(container);
+  controller.sync();
+  controller.enqueue(thumbs[0]);
+  controller.enqueue(thumbs[1]);
+  observer.callback([{ target: thumbs[2], isIntersecting: true }]);
+  assert.equal(probes[0].src, "/external/a.mp4");
+  probes[0].onerror();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(probes[1].src, "/external/c.mp4");
+  controller.dispose();
 }
 
 console.log("HMB VideoPicker unified Loader playback and lazy-thumbnail regression: PASS");

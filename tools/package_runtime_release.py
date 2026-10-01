@@ -18,8 +18,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.7.68"
-RELEASE_VERSION = "0.7.68"
+RELEASE_LABEL = "v0.7.69"
+RELEASE_VERSION = "0.7.69"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -65,6 +65,7 @@ RUNTIME_INSTALL_FILES = (
     "widgets/HMBVideoPickerCommandBridgeWidget_v032.js",
     "widgets/HMBVideoPickerLibraryWidget_v032.js",
     "resources/maya/HMB_Maya_Background_Preview.py",
+    "resources/blender/HMB_Blender_Background_Preview.py",
     "resources/picker/HMB_Marker_Catalog.json",
     "resources/agent/hmb_agent_core.dat",
 )
@@ -78,7 +79,7 @@ SOURCE_FILES = (*RUNTIME_INSTALL_FILES, *DISTRIBUTION_ONLY_FILES)
 CANONICAL_CRLF_SOURCE_FILES = {
     PurePosixPath("Install_HMB_GP_Production.ps1"),
 }
-if len(RUNTIME_INSTALL_FILES) != 28 or len(DISTRIBUTION_ONLY_FILES) != 4:
+if len(RUNTIME_INSTALL_FILES) != 29 or len(DISTRIBUTION_ONLY_FILES) != 4:
     raise RuntimeError("Runtime/distribution release boundary count mismatch.")
 if set(RUNTIME_INSTALL_FILES) & set(DISTRIBUTION_ONLY_FILES):
     raise RuntimeError("Runtime and distribution-only release files overlap.")

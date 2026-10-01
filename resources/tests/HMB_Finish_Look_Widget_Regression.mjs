@@ -320,4 +320,46 @@ assert.equal(
   false,
 );
 
+// A language/enable update rebuilds the panel. Preserve the precise control
+// and viewport position through that rebuild; a newly locked slider cannot
+// be focused, but its prior scroll position still survives.
+function viewControl(key, value, disabled = false) {
+  const attributes = new Map([[key, value]]);
+  return {
+    disabled,
+    focusOptions: null,
+    hasAttribute(name) { return attributes.has(name); },
+    getAttribute(name) { return attributes.get(name) ?? null; },
+    focus(options) { this.focusOptions = options; },
+  };
+}
+const oldSlider = viewControl("data-finish-step", "beauty.saturation");
+const newSlider = viewControl("data-finish-step", "beauty.saturation");
+const oldScroll = { scrollTop: 321, scrollLeft: 7 };
+const newScroll = { scrollTop: 0, scrollLeft: 0 };
+const viewContainer = {
+  ownerDocument: { activeElement: oldSlider },
+  currentScroll: oldScroll,
+  currentControls: [oldSlider],
+  contains(control) { return this.currentControls.includes(control); },
+  querySelector(selector) {
+    return selector === ".hmb-finish-look__scroll" ? this.currentScroll : null;
+  },
+  querySelectorAll(selector) {
+    return selector === "[data-finish-step]" ? this.currentControls : [];
+  },
+};
+const savedView = widget.hmbCaptureFinishLookView(viewContainer);
+viewContainer.currentScroll = newScroll;
+viewContainer.currentControls = [newSlider];
+widget.hmbRestoreFinishLookView(viewContainer, savedView);
+assert.deepEqual(newScroll, oldScroll);
+assert.deepEqual(newSlider.focusOptions, { preventScroll: true });
+const lockedSlider = viewControl("data-finish-step", "beauty.saturation", true);
+viewContainer.currentControls = [lockedSlider];
+newScroll.scrollTop = 0;
+widget.hmbRestoreFinishLookView(viewContainer, savedView);
+assert.equal(lockedSlider.focusOptions, null);
+assert.equal(newScroll.scrollTop, 321);
+
 console.log("HMB Finish Look widget regression: PASS");
