@@ -30,6 +30,40 @@ window.start=value=>{window.controller?.cleanup();const fresh=document.createEle
 window.live=()=>window.host.__hmbPickerPaintFirstState||window.host.__hmbPendingPickerState||window.host.__hmbAuthoritativePickerState;
 window.oldEcho=value=>window.controller.update(window.props({...structuredClone(value),state_writer:'python',message:'Delayed progress',backend_ack_action_id:'progress-ack'}));
 window.active=()=>window.host.querySelector('[data-picker-shot-activate][aria-pressed="true"]')?.getAttribute('data-picker-shot-activate');
+window.viewportSnapshot=()=>{
+  const live=window.live(),media=window.host.__hmbVideoPickerExpanded===true
+    ?window.host.querySelector('#picker-video'):window.host.__hmbCompactSharedVideoPlayer;
+  return {mode:window.host.querySelector('.viewport-panel')?.getAttribute('data-picker-tool-mode'),
+    liveMode:live.video_tools_by_shot?.[live.active_picker_shot_uuid]?.active_tool||'preview',
+    preview:live.preview_video_uid,src:media?.getAttribute('src')||'',uid:media?.getAttribute('data-video-uid')||''};
+};
+window.observeViewport=()=>{
+  window.viewportObserver?.disconnect();window.viewportChanges=[];
+  window.viewportObserver=new MutationObserver(records=>{
+    records.forEach((record,index)=>{
+      if(record.type==='attributes'){
+        const name=record.attributeName;
+        if(name==='data-picker-tool-mode'&&!record.target.matches('.viewport-panel'))return;
+        const activeMedia=window.host.__hmbVideoPickerExpanded===true
+          ?record.target.matches('#picker-video'):record.target===window.host.__hmbCompactSharedVideoPlayer;
+        if(name!=='data-picker-tool-mode'&&!activeMedia)return;
+        // Reading only the final attribute loses an A -> B flash in one turn.
+        // The next record's oldValue is the value written by this mutation.
+        const following=records.slice(index+1).find(next=>next.type==='attributes'&&next.target===record.target&&next.attributeName===name);
+        window.viewportChanges.push({name,value:following?following.oldValue:record.target.getAttribute(name)});
+      }else for(const added of record.addedNodes){
+        if(added.nodeType!==1)continue;
+        for(const element of [added,...added.querySelectorAll('.viewport-panel,#picker-video,.compact-shared-video-player')]){
+          if(element.matches('.viewport-panel'))window.viewportChanges.push({name:'data-picker-tool-mode',value:element.getAttribute('data-picker-tool-mode')});
+          const activeMedia=window.host.__hmbVideoPickerExpanded===true
+            ?element.matches('#picker-video'):element===window.host.__hmbCompactSharedVideoPlayer;
+          if(activeMedia)for(const name of ['src','data-video-uid'])window.viewportChanges.push({name,value:element.getAttribute(name)});
+        }
+      }
+    });
+  });
+  window.viewportObserver.observe(window.host,{subtree:true,childList:true,attributes:true,attributeOldValue:true,attributeFilter:['src','data-video-uid','data-picker-tool-mode']});
+};
 window.ready=true;
 </script>`;
 const server = http.createServer((req,res)=>{res.setHeader('Content-Type',req.url==='/widget.js'?'text/javascript; charset=utf-8':'text/html; charset=utf-8');res.end(req.url==='/widget.js'?source:html);});
@@ -50,6 +84,16 @@ const fixture = (media=false) => ({
   outliner_nodes:[{name:'Actor',full_path:'|Actor',maya_uuid:'root',depth_meshes:[{name:'Eye',full_path:'|Actor|Eye',maya_uuid:'eye'}]}],
   depth_settings:{range:'close',expanded_roots:['|Actor']},
 });
+const crossedEchoFixture=()=>{
+  const value=fixture(true),row=value.picker_shots[2];
+  row.video_asset_uids.push('s3-c');
+  value.videos.push({video_uid:'s3-c',source_uid:'s3-c',video_path:'C:/fixture/s3-c.mp4',
+    label:'Shot 3 c',picker_shot_uuid:shots[2],frame_count:24,fps:24});
+  value.video_tools_by_shot={[shots[2]]:{active_tool:'preview',revision:1,
+    concatenate:{inputs:['C:/fixture/s3-b.mp4'],input_uids:['s3-b']},
+    crop:{input:'C:/fixture/s3-c.mp4',source_uid:'s3-c'}}};
+  return value;
+};
 let browser;
 const failures=[];
 try {
@@ -61,12 +105,61 @@ try {
   page.setDefaultTimeout(5000);
   await page.goto(origin);await page.waitForFunction(()=>window.ready);
   const reset=async(media=false)=>{
-    await page.evaluate(value=>window.start(value),fixture(media));
+    await page.evaluate(value=>window.start(value),typeof media==='object'?media:fixture(media));
     if(await page.locator('.hmbvp').getAttribute('data-picker-view')!=='expanded') await page.locator('[data-picker-toggle-surface="header"]').dispatchEvent('dblclick');
     await page.waitForTimeout(140);
     await page.evaluate(()=>{window.publications=[];window.baseline=structuredClone(window.live());});
   };
   const check=async(name,body,media=false)=>{try{await reset(media);await body();console.log('PASS '+name);}catch(error){failures.push(name+': '+error.message);console.log('FAIL '+name+': '+error.message);}};
+  const publishChoice=async selector=>{
+    const before=await page.evaluate(()=>window.publications.length);
+    await page.locator(selector).click();
+    await page.waitForFunction(count=>window.publications.length>count&&!window.host.__hmbPickerPaintFirstState,before);
+    return page.evaluate(()=>structuredClone(window.publications.at(-1)));
+  };
+  const acknowledgeSetup=async value=>{
+    await page.evaluate(value=>{
+      window.controller.update(window.props({...structuredClone(value),state_writer:'python'}));
+      window.publications=[];
+    },value);
+  };
+  const probeCrossedExactEchoes=async publications=>page.evaluate(async values=>{
+    const expected=window.viewportSnapshot();
+    const queue=window.host.__hmbPendingPickerStateEchoes||[];
+    const queued=values.map(value=>queue.some(entry=>entry.revision===value.state_revision&&entry.publishedAtMs===value.state_published_at_ms));
+    window.observeViewport();
+    const snapshots=[];
+    // These exact Python echoes must arrive while all publications are still
+    // in the 1.5-second disposable-echo queue, newest ACK before delayed old ACK.
+    for(const value of [...values].reverse()){
+      window.controller.update(window.props({...structuredClone(value),state_writer:'python'}));
+      snapshots.push({event:'exact '+value.state_revision,...window.viewportSnapshot()});
+    }
+    // A DOM-noop must not secretly replace controller authority. A subsequent
+    // functional progress response exposes that hidden regression on repaint.
+    for(const value of values.slice(0,-1)){
+      window.oldEcho(value);
+      snapshots.push({event:'stale progress '+value.state_revision,...window.viewportSnapshot()});
+    }
+    window.controller.update(window.props({...structuredClone(values[0]),state_writer:'python',
+      message:'Next delayed progress',backend_ack_action_id:'next-progress-ack'}));
+    snapshots.push({event:'next stale update',...window.viewportSnapshot()});
+    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+    snapshots.push({event:'after media/update frames',...window.viewportSnapshot()});
+    window.viewportObserver.disconnect();
+    return {expected,queued,snapshots,changes:window.viewportChanges,backendMessage:window.live().message};
+  },publications);
+  const assertLatestViewport=(result,label)=>{
+    assert.ok(result.queued.every(Boolean),label+': exact publications were not all inside the 1.5-second echo queue');
+    assert.equal(result.backendMessage,'Next delayed progress',label+': backend progress was swallowed');
+    for(const actual of result.snapshots){
+      for(const key of ['mode','liveMode','preview','src','uid'])assert.equal(actual[key],result.expected[key],`${label}: ${actual.event} regressed ${key}`);
+    }
+    for(const change of result.changes){
+      const expected=change.name==='data-picker-tool-mode'?result.expected.mode:change.name==='src'?result.expected.src:result.expected.uid;
+      assert.equal(change.value||'',expected||'',`${label}: transient ${change.name} changed to ${change.value}`);
+    }
+  };
   await check('Shot 3 -> 1 retains navigation through delayed progress and duplicate ACK',async()=>{
     await page.locator(`[data-picker-shot-activate="${shots[0]}"]`).click();
     assert.equal(await page.evaluate(()=>window.active()),shots[0]);
@@ -197,6 +290,95 @@ try {
     });
     assert.equal(mode,'crop');
   },true);
+  for(const from of ['preview','concatenate','crop'])for(const to of ['preview','concatenate','crop']){
+    if(from===to)continue;
+    await check(`Exact ACK ${to} then delayed ${from} cannot regress tab or source`,async()=>{
+      const setup=['preview','concatenate','crop'].find(mode=>mode!==from&&mode!==to);
+      await acknowledgeSetup(await publishChoice(`[data-picker-tool-tab="${setup}"]`));
+      const first=await publishChoice(`[data-picker-tool-tab="${from}"]`);
+      const latest=await publishChoice(`[data-picker-tool-tab="${to}"]`);
+      const result=await probeCrossedExactEchoes([first,latest]);
+      assert.equal(result.expected.mode,to);
+      assert.notEqual(first.video_tools_by_shot[shots[2]].active_tool,latest.video_tools_by_shot[shots[2]].active_tool);
+      assertLatestViewport(result,`${from} -> ${to}`);
+    },crossedEchoFixture());
+  }
+  const cardUids=['s3-a','s3-b','s3-c'];
+  const setupCard=async uid=>{
+    if(await page.evaluate(()=>window.live().preview_video_uid)===uid){
+      const other=cardUids.find(candidate=>candidate!==uid);
+      await acknowledgeSetup(await publishChoice(`[data-play-video-uid="${other}"]`));
+    }
+    await acknowledgeSetup(await publishChoice(`[data-play-video-uid="${uid}"]`));
+  };
+  for(const firstUid of cardUids)for(const latestUid of cardUids){
+    if(firstUid===latestUid)continue;
+    await check(`Play exact ACK ${latestUid} then delayed ${firstUid} never restores old media`,async()=>{
+      const setupUid=cardUids.find(uid=>uid!==firstUid&&uid!==latestUid);
+      await setupCard(setupUid);
+      const first=await publishChoice(`[data-play-video-uid="${firstUid}"]`);
+      const latest=await publishChoice(`[data-play-video-uid="${latestUid}"]`);
+      const result=await probeCrossedExactEchoes([first,latest]);
+      assert.equal(result.expected.preview,latestUid);
+      assert.equal(result.expected.mode,'preview');
+      assert.ok(result.expected.src.includes(latestUid+'.mp4'),'latest card owns the media source');
+      assertLatestViewport(result,`${firstUid} -> ${latestUid}`);
+    },crossedEchoFixture());
+  }
+  for(const firstUid of cardUids)for(const secondUid of cardUids){
+    if(firstUid===secondUid)continue;
+    const latestUid=cardUids.find(uid=>uid!==firstUid&&uid!==secondUid);
+    await check(`Three-card Play ${firstUid} -> ${secondUid} -> ${latestUid} keeps newest ACK authority`,async()=>{
+      await setupCard(latestUid);
+      const publications=[];
+      for(const uid of [firstUid,secondUid,latestUid])publications.push(await publishChoice(`[data-play-video-uid="${uid}"]`));
+      const result=await probeCrossedExactEchoes(publications);
+      assert.equal(result.expected.preview,latestUid);
+      assert.ok(result.expected.src.includes(latestUid+'.mp4'),'third card owns the media source');
+      assertLatestViewport(result,`${firstUid} -> ${secondUid} -> ${latestUid}`);
+    },crossedEchoFixture());
+  }
+  await check('Backend progress and terminal error remain live after obsolete exact Play ACK',async()=>{
+    await setupCard('s3-c');
+    const first=await publishChoice('[data-play-video-uid="s3-a"]');
+    const latest=await publishChoice('[data-play-video-uid="s3-b"]');
+    const result=await probeCrossedExactEchoes([first,latest]);
+    const backend=await page.evaluate(latest=>{
+      const before=Number(window.host.__hmbPickerEchoNoopCount||0);
+      window.controller.update(window.props({...structuredClone(latest),state_writer:'python',
+        state_revision:latest.state_revision+1,message:'Backend progress still live',
+        activity_log:[{level:'INFO',message:'Backend progress still live'}]}));
+      const progress={message:window.live().message,log:window.host.querySelector('#activity-log-view')?.textContent||''};
+      window.controller.update(window.props({...structuredClone(latest),state_writer:'python',
+        state_revision:latest.state_revision+2,status:'ERROR',message:'Backend terminal error still live',
+        activity_log:[{level:'ERROR',message:'Backend terminal error still live'}]}));
+      return {before,after:Number(window.host.__hmbPickerEchoNoopCount||0),progress,
+        error:{status:window.live().status,message:window.live().message,
+          log:window.host.querySelector('#activity-log-view')?.textContent||''}};
+    },latest);
+    assert.equal(backend.progress.message,'Backend progress still live');
+    assert.ok(backend.progress.log.includes('Backend progress still live'));
+    assert.equal(backend.error.status,'ERROR');
+    assert.equal(backend.error.message,'Backend terminal error still live');
+    assert.ok(backend.error.log.includes('Backend terminal error still live'));
+    assert.equal(backend.after,backend.before,'real backend updates must not use disposable echo shortcut');
+    assertLatestViewport(result,'backend updates after Play ACK');
+  },crossedEchoFixture());
+  await check('Compact three-card replay keeps newest media through crossed exact ACKs and progress',async()=>{
+    await setupCard('s3-c');
+    await page.locator('[data-picker-toggle-surface="header"]').dispatchEvent('dblclick');
+    await page.waitForFunction(()=>window.host.querySelector('.hmbvp')?.dataset.pickerView==='compact');
+    const publications=[];
+    for(const uid of cardUids)publications.push(await publishChoice(`[data-play-video-uid="${uid}"]`));
+    const result=await probeCrossedExactEchoes(publications);
+    assert.equal(result.expected.preview,'s3-c');
+    assert.ok(result.expected.src.includes('s3-c.mp4'),'compact shared player owns the newest source');
+    assertLatestViewport(result,'compact A -> B -> C');
+    await page.locator('[data-picker-toggle-surface="header"]').dispatchEvent('dblclick');
+    await page.waitForFunction(()=>window.host.querySelector('.hmbvp')?.dataset.pickerView==='expanded');
+    assert.equal(await page.evaluate(()=>window.live().preview_video_uid),'s3-c','expanding must retain compact replay authority');
+    assert.ok((await page.locator('#picker-video').getAttribute('src')).includes('s3-c.mp4'));
+  },crossedEchoFixture());
   await check('Crop intent owns media pause before any old-mode media event',async()=>{
     const installed=await page.evaluate(()=>{
       const media=window.host.querySelector('#picker-video');
