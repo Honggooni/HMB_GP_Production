@@ -4858,14 +4858,26 @@ export function hmbProtectVideoPickerWorkspaceFromStaleEcho(incomingValue, local
   }
   const staleGlobalRevision = Number(incoming.state_revision || 0)
     < Number(local.state_revision || 0);
+  const activeWorkspaceUuid = staleGlobalRevision
+    ? clean(local.active_picker_shot_uuid)
+    : clean(incoming.active_picker_shot_uuid);
+  const protectedActiveRow = protectedWorkspaceSet.has(activeWorkspaceUuid)
+    ? protectedRows.find((row) => clean(row.workspace_uuid) === activeWorkspaceUuid)
+    : null;
   return {
     state: normalize({
       ...incoming,
       videos: protectedVideos,
       picker_shots: protectedRows,
-      active_picker_shot_uuid: staleGlobalRevision
-        ? clean(local.active_picker_shot_uuid)
-        : clean(incoming.active_picker_shot_uuid),
+      active_picker_shot_uuid: activeWorkspaceUuid,
+      // normalize() overlays the active row from these legacy preview scalars.
+      // Project the protected cursor too, otherwise an old progress response
+      // immediately undoes the row protection and reloads the previous clip.
+      ...(protectedActiveRow ? {
+        preview_video_uid: clean(protectedActiveRow.preview_video_uid),
+        selected_video_uid: clean(protectedActiveRow.preview_video_uid),
+        selected_video_slot: Math.max(1, Number(protectedActiveRow.selected_video_slot || 1)),
+      } : {}),
       state_revision: Math.max(
         Number(incoming.state_revision || 0),
         Number(local.state_revision || 0),
@@ -13724,6 +13736,18 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     const incoming = normalize(
       nextProps?.value ?? nextProps?.parameterValue ?? nextProps?.defaultValue,
     );
+    // An exact echo is a receipt for one local publication, not new backend
+    // authority. Older receipts may arrive after a newer preview/tab was ACKed
+    // (and its pending draft cleared). Never let that no-DOM shortcut silently
+    // roll the controller back and replay the old media on its next refresh.
+    if (
+      hmbPickerStateEchoValue(incoming) !== hmbPickerStateEchoValue(currentWidgetState(false))
+      || Boolean(nextProps?.disabled) !== Boolean(props?.disabled)
+    ) {
+      container.querySelector?.(".hmbvp")?.setAttribute?.("data-picker-update-mode", "echo-noop");
+      container.__hmbPickerEchoNoopCount = Number(container.__hmbPickerEchoNoopCount || 0) + 1;
+      return true;
+    }
     hmbReconcilePickerCommandAcknowledgements(container, incoming);
     props = nextProps || {};
     state = incoming;
