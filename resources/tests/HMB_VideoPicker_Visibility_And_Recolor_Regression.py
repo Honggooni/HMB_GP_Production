@@ -58,7 +58,9 @@ runner_source = (
     ROOT / "resources" / "maya" / "HMB_Maya_Background_Preview.py"
 ).read_text(encoding="utf-8")
 assert (
-    "if generate_depth_playblast or (generate_motion_guide and not bindings):"
+    "if generate_depth_playblast or (\n"
+    "                generate_motion_guide and (not bindings or motion_guide_full_scene_scope)\n"
+    "            ):"
     in runner_source
 )
 assert (
