@@ -16411,18 +16411,16 @@ class HMBVideoPickerLibrary(DataNode):
             depth_video_slot = 0
             motion_guide_video_slot = 0
         message = (
-            "Maya is generating Mask, shader Depth, and Motion Guide from one "
-            "scene load. Existing delivery remains "
-            "active until all three results succeed."
+            "Maya is generating Mask, shader Depth, and Motion Guide. "
+            "Successful results will be validated and appended independently."
             if depth_enabled and motion_guide_enabled
             else
-            "Maya is generating paired Mask and shader Depth "
-            "from one scene load. Existing library delivery remains active until both results succeed."
+            "Maya is generating Mask and shader Depth. "
+            "Successful results will be validated and appended independently."
             if depth_enabled
             else
-            "Maya is generating Mask and Motion Guide from one "
-            "scene load. Existing library delivery remains active until both "
-            "results succeed."
+            "Maya is generating Mask and Motion Guide. "
+            "Successful results will be validated and appended independently."
             if motion_guide_enabled
             else
             "Maya is generating a Mask from the current Group Name + Color Pick "
@@ -21251,6 +21249,166 @@ class HMBVideoPickerLibrary(DataNode):
         ):
             raise RuntimeError(f"H.264 encoding for {label} failed. See {log_path}")
 
+    def _execute_maya_capture_passes(
+        self,
+        *,
+        job: Dict[str, Any],
+        command: Sequence[str],
+        job_path: Path,
+        result_path: Path,
+        log_path: Path,
+        context: Optional[_OperationContext],
+    ) -> Dict[str, Any]:
+        """Keep native auxiliary crashes outside the completed Mask process."""
+        private_folder = _assert_safe_private_path(job_path.parent)
+        for candidate in (job_path, result_path):
+            _assert_safe_private_path(candidate)
+            if not _path_is_within(candidate, private_folder):
+                raise RuntimeError("Maya capture job/result escaped the private job folder.")
+        capture_warnings: List[str] = []
+
+        def assert_current(stage: str) -> None:
+            self._assert_operation_current(context, stage)
+            if self._hmb_cancel_requested.is_set():
+                raise RuntimeError("Maya Playblast cancelled by user.")
+
+        def native_crash(return_code: int) -> bool:
+            # Ordinary Python/worker errors and user termination do not justify
+            # a second capture. Windows may expose NTSTATUS signed or unsigned.
+            if os.name == "nt":
+                return (int(return_code) & 0xFFFFFFFF) in {
+                    0xC0000005, 0xC000001D, 0xC0000094, 0xC0000096,
+                    0xC00000FD, 0xC0000374, 0xC0000409,
+                }
+            return int(return_code) in {-4, -6, -7, -8, -11}
+
+        def capture(capture_pass: str) -> Dict[str, Any]:
+            label = {"color": "Mask", "depth": "Depth", "motion_guide": "Motion Guide"}[capture_pass]
+            prefix = "" if capture_pass == "color" else f"{capture_pass}_"
+            expected_frames = Path(job[f"{prefix}frames_folder"])
+            expected_sidecar = Path(job[f"{prefix}sidecar_path"])
+            for candidate in (expected_frames, expected_sidecar):
+                _assert_safe_private_path(candidate)
+                if not _path_is_within(candidate, private_folder):
+                    raise RuntimeError(f"Maya {label} capture escaped the private job folder.")
+            for evaluation_mode in ("serial", "off"):
+                assert_current(f"{label} isolated Maya preflight")
+                attempt_name = f"render.{capture_pass}.{evaluation_mode}"
+                pass_job_path = job_path.parent / f"{attempt_name}.job.json"
+                pass_result_path = job_path.parent / f"{attempt_name}.result.json"
+                pass_progress_path = job_path.parent / f"{attempt_name}.progress.json"
+                for transient in (pass_job_path, pass_result_path, pass_progress_path, Path(str(pass_progress_path) + ".tmp")):
+                    self._register_cleanup_file(transient)
+                if evaluation_mode == "off":
+                    # A retry owns only this private sequence, never a completed
+                    # sibling or public media. Drop partial frames before retry.
+                    if expected_frames.exists():
+                        _safe_remove_private_tree(expected_frames)
+                    if expected_sidecar.exists():
+                        _assert_safe_private_path(expected_sidecar).unlink(missing_ok=True)
+                pass_job = {
+                    **job,
+                    "capture_pass": capture_pass,
+                    "maya_evaluation_mode": evaluation_mode,
+                    "generate_depth_playblast": capture_pass == "depth",
+                    "generate_motion_guide": capture_pass == "motion_guide",
+                    # Legacy Depth+Motion released Mask-only exclusions before
+                    # both auxiliaries; Motion-only retained the assigned scope.
+                    "motion_guide_full_scene_scope": (
+                        capture_pass == "motion_guide"
+                        and bool(job.get("generate_depth_playblast"))
+                    ),
+                    "result_path": str(pass_result_path),
+                    "progress_path": str(pass_progress_path),
+                }
+                _write_json(pass_job_path, pass_job)
+                env = _maya_subprocess_environment(pass_job_path)
+                assert_current(f"{label} isolated Maya launch")
+                state = self._picker_state()
+                state["message"] = f"Maya is rendering {label} in an isolated process ({'DG' if evaluation_mode == 'off' else 'Serial'} evaluation)."
+                _append_activity_log(state, "INFO", state["message"])
+                self._write_state(state)
+                with log_path.open("a", encoding="utf-8", errors="replace") as log_handle:
+                    log_handle.write(f"\nMAYA {label.upper()} CAPTURE ({evaluation_mode})\n" + _command_text(command) + "\n")
+                    log_handle.write("MAYA VP2 DEVICE OVERRIDE\n" + (_clean(env.get("MAYA_VP2_DEVICE_OVERRIDE")) or "user preference") + "\n\n")
+                    log_handle.flush()
+                    assert_current(f"{label} isolated Maya process launch")
+                    process = subprocess.Popen(
+                        list(command), stdout=log_handle, stderr=subprocess.STDOUT,
+                        env=env, cwd=str(pass_job_path.parent), creationflags=_creation_flags(),
+                    )
+                    self._register_active_process(process, "Maya")
+                    try:
+                        return_code = self._wait_for_process_with_progress(
+                            process, pass_progress_path,
+                            PLAYBLAST_OVERALL_TIMEOUT_SECONDS, PLAYBLAST_STALL_TIMEOUT_SECONDS,
+                            f"Maya isolated {label}", activity_paths=(expected_frames,),
+                        )
+                    finally:
+                        self._clear_active_process(process)
+                assert_current(f"{label} isolated Maya completion")
+                if evaluation_mode == "serial" and return_code is not None and native_crash(return_code):
+                    warning = f"Maya {label} crashed with native exit code {return_code}; retrying only {label} with DG evaluation."
+                    capture_warnings.append(warning)
+                    state = self._picker_state()
+                    _append_activity_log(state, "WARNING", warning)
+                    self._write_state(state)
+                    _append_full_diagnostic_log(log_path, "HMB MAYA NATIVE CRASH RETRY", warning)
+                    continue
+                if return_code not in (0, None):
+                    raise RuntimeError(f"Maya {label} exited with code {return_code}. See {log_path}")
+                if not pass_result_path.is_file():
+                    raise RuntimeError(f"Maya did not write the {label} result. See {log_path}")
+                pass_result = _read_json(pass_result_path)
+                if not pass_result.get("ok"):
+                    raise RuntimeError(f"{_clean(pass_result.get('error')) or f'Maya {label} capture failed.'} See {log_path}")
+                if _clean(pass_result.get("capture_pass")) != capture_pass:
+                    raise RuntimeError(f"Maya returned a different capture pass for {label}.")
+                if _clean(pass_result.get("scene_path")) and _scene_path_key(pass_result.get("scene_path")) != _scene_path_key(job["scene_path"]):
+                    raise RuntimeError(f"Maya {label} result belongs to a different scene.")
+                _validated_runner_result_path(pass_result, "frames_folder", expected_frames)
+                _validated_runner_result_path(pass_result, "sidecar_path", expected_sidecar)
+                if capture_pass != "color":
+                    _validated_runner_result_path(pass_result, f"{prefix}frames_folder", expected_frames)
+                    _validated_runner_result_path(pass_result, f"{prefix}sidecar_path", expected_sidecar)
+                if not expected_sidecar.is_file():
+                    raise RuntimeError(f"Maya did not create the {label} sidecar. See {log_path}")
+                return pass_result
+            raise RuntimeError(f"Maya {label} capture did not complete.")
+
+        # The primary Mask remains the strict frame/timing/visibility authority.
+        # Optional failures never throw away its complete frames or sidecar.
+        result = capture("color")
+        primary_sidecar = _read_json(Path(job["sidecar_path"]))
+        isolated_job = dict(job)
+        for key in ("camera", "start_frame", "end_frame", "fps"):
+            if primary_sidecar.get(key) is not None:
+                isolated_job[key] = primary_sidecar[key]
+        job = isolated_job
+        artifacts = dict(result.get("artifacts") or {})
+        artifacts["color"] = {**dict(artifacts.get("color") or {}), "ok": True}
+        for capture_pass, enabled in (
+            ("depth", bool(job.get("generate_depth_playblast"))),
+            ("motion_guide", bool(job.get("generate_motion_guide"))),
+        ):
+            if not enabled:
+                continue
+            try:
+                pass_result = capture(capture_pass)
+            except _StaleOperationError:
+                raise
+            except Exception as exc:
+                assert_current(f"{capture_pass} isolated Maya failure")
+                artifacts[capture_pass] = {"ok": False, "error": _clean(exc) or exc.__class__.__name__}
+                _append_full_diagnostic_log(log_path, "HMB ISOLATED OPTIONAL CAPTURE ERROR", artifacts[capture_pass]["error"])
+                continue
+            result.update({key: value for key, value in pass_result.items() if key.startswith(f"{capture_pass}_")})
+            artifacts[capture_pass] = dict((pass_result.get("artifacts") or {}).get(capture_pass) or {"ok": True})
+        result["artifacts"] = artifacts
+        result["capture_warnings"] = capture_warnings
+        _write_json(result_path, result)
+        return result
+
     def _maya_mode(
         self,
         scene_text: str,
@@ -21485,15 +21643,15 @@ class HMBVideoPickerLibrary(DataNode):
             "status": "GENERATING_VIDEO",
             "message": (
                 f"Maya {maya_version} is rendering Mask, shader Depth, and Motion "
-                "Guide from one scene load."
+                "Guide in isolated processes."
                 if depth_enabled and motion_guide_enabled
                 else
                 f"Maya {maya_version} is rendering paired Mask and shader Depth "
-                "from one scene load."
+                "in isolated processes."
                 if depth_enabled
                 else
                 f"Maya {maya_version} is rendering Mask and "
-                "Motion Guide from one scene load."
+                "Motion Guide in isolated processes."
                 if motion_guide_enabled
                 else
                 f"Maya {maya_version} is applying temporary marker shaders and rendering the playblast."
@@ -21535,79 +21693,21 @@ class HMBVideoPickerLibrary(DataNode):
             )
         self._write_state(state)
 
-        env = _maya_subprocess_environment(job_path)
         _ensure_private_job_folder(job_folder, output_folder)
-
         with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
             log_handle.write("MAYA COMMAND\n" + _command_text(command) + "\n\n")
-            log_handle.write(
-                "MAYA VP2 DEVICE OVERRIDE\n"
-                + (_clean(env.get("MAYA_VP2_DEVICE_OVERRIDE")) or "user preference")
-                + "\n\n"
-            )
-            log_handle.flush()
-            process = subprocess.Popen(
-                command,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                env=env,
-                cwd=str(job_path.parent),
-                creationflags=_creation_flags(),
-            )
-            self._register_active_process(process, "Maya")
-            try:
-                return_code = self._wait_for_process_with_progress(
-                    process,
-                    progress_path,
-                    PLAYBLAST_OVERALL_TIMEOUT_SECONDS,
-                    PLAYBLAST_STALL_TIMEOUT_SECONDS,
-                    (
-                        f"Maya Mask + @video{depth_video_slot} shader Depth + "
-                        f"@video{motion_guide_video_slot} Motion Guide bundle"
-                        if depth_enabled and motion_guide_enabled
-                        else
-                        f"Maya Mask + @video{depth_video_slot} shader Depth Playblast"
-                        if depth_enabled
-                        else
-                        f"Maya Mask + @video{motion_guide_video_slot} Motion Guide bundle"
-                        if motion_guide_enabled
-                        else f"Maya @video{video_slot} Playblast"
-                    ),
-                    activity_paths=(
-                        tuple(
-                            [
-                                frames_folder,
-                                *(
-                                    [depth_frames_folder]
-                                    if depth_enabled else []
-                                ),
-                                *(
-                                    [motion_guide_frames_folder]
-                                    if motion_guide_enabled else []
-                                ),
-                            ]
-                        )
-                    ),
-                )
-            finally:
-                self._clear_active_process(process)
-
+        result = self._execute_maya_capture_passes(
+            job=_read_json(job_path), command=command, job_path=job_path,
+            result_path=result_path, log_path=log_path, context=context,
+        )
         self._assert_operation_current(context, "PLAYBLAST Maya completion")
         state = self._picker_state()
         _append_activity_log(
             state,
             "INFO",
-            f"Maya playblast process finished with exit code {return_code}.",
+            "Maya isolated capture processes finished; completed artifacts will be validated independently.",
         )
         self._write_state(state)
-
-        if not result_path.is_file():
-            raise RuntimeError(f"Maya did not write a result file. Exit code={return_code}. See {log_path}")
-        result = _read_json(result_path)
-        if not result.get("ok"):
-            raise RuntimeError(f"{_clean(result.get('error')) or 'Maya background preview failed.'} See {log_path}")
-        if return_code not in (0, None):
-            raise RuntimeError(f"Maya exited with code {return_code}. See {log_path}")
 
         runner_artifacts = (
             dict(result.get("artifacts"))
@@ -22015,6 +22115,9 @@ class HMBVideoPickerLibrary(DataNode):
         )
         pair_run_id = bundle_run_id if depth_succeeded else ""
         warnings = [_clean(item) for item in sidecar.get("warnings", []) if _clean(item)]
+        for capture_warning in result.get("capture_warnings", []):
+            if _clean(capture_warning) and _clean(capture_warning) not in warnings:
+                warnings.append(_clean(capture_warning))
         for warning in auxiliary_failure_warnings:
             if warning not in warnings:
                 warnings.append(warning)

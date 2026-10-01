@@ -502,6 +502,10 @@ class FakeMayaCmds(types.ModuleType):
         super().__init__("maya.cmds")
         self.quality_nodes = ["|BBox_GRP", "|Full_GRP", "|Authored_GRP"]
         self.values: dict[str, Any] = {
+            "defaultRenderGlobals.imageFormat": 51,
+            "defaultRenderGlobals.animation": 1,
+            "defaultRenderGlobals.putFrameBeforeExt": 0,
+            "defaultRenderGlobals.extensionPadding": 4,
             "|BBox_GRP.overrideEnabled": True,
             "|BBox_GRP.overrideLevelOfDetail": 1,
             "|Full_GRP.overrideEnabled": True,
@@ -525,6 +529,12 @@ class FakeMayaCmds(types.ModuleType):
         self.values[self.visible_nurbs + ".intermediateObject"] = False
         self.values[self.history_nurbs + ".intermediateObject"] = True
         self.nurbs_calls: list[tuple[str, bool, dict[str, Any]]] = []
+        self.evaluation_mode = "parallel"
+
+    def evaluationManager(self, query=False, mode=None):
+        if query:
+            return [self.evaluation_mode]
+        self.evaluation_mode = mode
 
     def about(self, version: bool = False, **_kwargs):
         return "2027" if version else ""
@@ -633,6 +643,128 @@ assert runner.ORIGINAL_LAMBERT_ASSIGNMENT_MODE == (
     picker.ORIGINAL_LAMBERT_ASSIGNMENT_MODE
 )
 production_switch_proxy_reference = runner._switch_proxy_reference
+
+
+PNG_CAPTURE_VALUES = {
+    "defaultRenderGlobals.imageFormat": 32,
+    "defaultRenderGlobals.animation": 0,
+    "defaultRenderGlobals.putFrameBeforeExt": 1,
+    "defaultRenderGlobals.extensionPadding": 6,
+}
+
+
+class CaptureOutputCmds(FakeMayaCmds):
+    """Model authored EXR output and native viewport modes without rendering."""
+
+    def __init__(self, *, failure_plug="", failure_kind="") -> None:
+        super().__init__()
+        self.values.update({
+            "hardwareRenderingGlobals.lightingMode": 3,
+            "hardwareRenderingGlobals.renderMode": 4,
+            "hardwareRenderingGlobals.multiSampleEnable": 1,
+            "hardwareRenderingGlobals.lineAAEnable": 1,
+            "hardwareRenderingGlobals.ssaoEnable": 1,
+            "hardwareRenderingGlobals.shadows": 1,
+            "hardwareRenderingGlobals.bloomEnable": 1,
+            "hardwareRenderingGlobals.motionBlurEnable": 1,
+            "hardwareRenderingGlobals.renderDepthOfField": 1,
+            "hardwareRenderingGlobals.hwFogEnable": 1,
+            "hardwareRenderingGlobals.xrayMode": 1,
+            "defaultRenderGlobals.currentRenderer": "redshift",
+            "redshiftOptions.exrCompression": 3,
+        })
+        self.settable.update({name: True for name in self.values})
+        self.output_transform_enabled = True
+        self.failure_plug = failure_plug
+        self.failure_kind = failure_kind
+
+    def attributeQuery(self, attribute, node="", listEnum=False, **kwargs):
+        if listEnum and node == "hardwareRenderingGlobals" and attribute == "renderMode":
+            return ["Wireframe=0:Shaded=2:Textured=4"]
+        return super().attributeQuery(attribute, node=node, **kwargs)
+
+    def colorManagementPrefs(self, **kwargs):
+        if kwargs.get("edit") and "outputTransformEnabled" in kwargs:
+            self.output_transform_enabled = bool(kwargs["outputTransformEnabled"])
+        if kwargs.get("query") and kwargs.get("outputTransformEnabled"):
+            return self.output_transform_enabled
+        return None
+
+    def getAttr(self, name, **kwargs):
+        if name == self.failure_plug and self.failure_kind == "read" and not kwargs:
+            raise RuntimeError("intentional capture setting read failure")
+        return super().getAttr(name, **kwargs)
+
+    def setAttr(self, name, value, *args, **kwargs):
+        if name == self.failure_plug:
+            if self.failure_kind == "write":
+                raise RuntimeError("intentional capture setting write failure")
+            if self.failure_kind == "not_retained":
+                self.set_calls.append((name, value))
+                return None
+        return super().setAttr(name, value, *args, **kwargs)
+
+
+# Original previously returned before the shared PNG setters and inherited the
+# authored EXR format. Exercise the production option function, not its helper,
+# so the Original early return and every other capture mode remain covered.
+capture_modes = (
+    ("Original", {"preserve_authored_look": True, "original_lambert_mode": True}),
+    ("Mask", {"marker_mode": True, "screen_space_patterns": True}),
+    ("Snapshot", {"marker_mode": True, "screen_space_patterns": True}),
+    ("Depth", {"depth_mode": True}),
+    ("Authored viewport", {"preserve_authored_look": True}),
+)
+try:
+    for mode_name, mode_options in capture_modes:
+        capture_cmds = CaptureOutputCmds()
+        runner.cmds = capture_cmds
+        capture_report = runner._set_viewport_render_options(**mode_options)
+        assert {
+            plug: capture_cmds.values[plug] for plug in PNG_CAPTURE_VALUES
+        } == PNG_CAPTURE_VALUES, f"{mode_name} inherited authored EXR/output settings."
+        if mode_name == "Original":
+            assert capture_report["solid_render_mode_verified"] is True
+            assert capture_cmds.values["hardwareRenderingGlobals.renderMode"] == 2
+            assert ("hardwareRenderingGlobals.renderMode", 4) not in capture_cmds.set_calls
+        assert capture_cmds.values["defaultRenderGlobals.currentRenderer"] == "redshift"
+        assert capture_cmds.values["redshiftOptions.exrCompression"] == 3
+
+    # A correct locked output is already safe: avoid unnecessary writes/unlocks.
+    locked_correct = CaptureOutputCmds()
+    locked_correct.values.update(PNG_CAPTURE_VALUES)
+    locked_correct.settable.update({plug: False for plug in PNG_CAPTURE_VALUES})
+    runner.cmds = locked_correct
+    runner._set_viewport_render_options(**capture_modes[0][1])
+    assert not [call for call in locked_correct.set_calls if call[0] in PNG_CAPTURE_VALUES]
+    assert all(locked_correct.settable[plug] is False for plug in PNG_CAPTURE_VALUES)
+
+    # Incorrect locked, unreadable, unwritable, or silently ignored settings must
+    # fail before changing the Original look rather than reach EXR frame capture.
+    for failed_plug in PNG_CAPTURE_VALUES:
+        for failure_kind in ("locked", "read", "write", "not_retained"):
+            capture_cmds = CaptureOutputCmds(
+                failure_plug=failed_plug,
+                failure_kind=failure_kind,
+            )
+            if failure_kind == "locked":
+                capture_cmds.settable[failed_plug] = False
+            runner.cmds = capture_cmds
+            try:
+                runner._set_viewport_render_options(**capture_modes[0][1])
+            except RuntimeError as exc:
+                assert "PNG capture output setting" in str(exc), str(exc)
+                assert failed_plug in str(exc), str(exc)
+            else:
+                raise AssertionError(
+                    f"Unsafe PNG capture setting was accepted: {failed_plug} ({failure_kind})."
+                )
+            assert capture_cmds.values["hardwareRenderingGlobals.renderMode"] == 4
+            assert capture_cmds.values["hardwareRenderingGlobals.lightingMode"] == 3
+            if failure_kind == "locked":
+                assert capture_cmds.settable[failed_plug] is False
+finally:
+    runner.cmds = fake_cmds
 
 
 def authored_quality_snapshot() -> dict[str, Any]:
@@ -1459,5 +1591,6 @@ print(
     "HMB VideoPicker best-effort full-smooth viewport, bbox/LOD restore, "
     "safe proxyActivate/reference diagnostics, nonblocking quality warnings, damaged-state "
     "repair, nested-reference loading, cache-profile invalidation, and "
-    "metadata-only READ isolation regression: PASS"
+    "metadata-only READ isolation, PNG capture settings, and Original solid-mode "
+    "regression: PASS"
 )

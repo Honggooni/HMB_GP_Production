@@ -182,6 +182,7 @@ jobs:
             "HMB_Depth_Companion_Regression.py",
             "HMB_Picker_Depth_Range_Mesh_Regression.py",
             "HMB_VideoPicker_Reliability_Regression.py",
+            "HMB_VideoPicker_Isolated_Maya_Capture_Regression.py",
             "HMB_VideoPicker_Blender_Cross_Shot_Mask_Regression.py",
             "HMB_VideoPicker_Generate_Terminal_Selection_Regression.py",
             "HMB_VideoPicker_Multi_Selection_Snapshot_Regression.py",
@@ -190,6 +191,7 @@ jobs:
             "HMB_VideoPicker_Ghost_Flat_Shader_Regression.py",
             "HMB_Depth_Visual_Contract_Regression.py",
             "HMB_Maya_Runner_Performance_Regression.py",
+            "HMB_Maya_Capture_Pass_Isolation_Regression.py",
             "HMB_Mouth_Card_Inner_Patch_Regression.py",
             "HMB_Motion_Guide_Regression.py",
             "HMB_Prompt_Field_Authority_Regression.py",
@@ -350,6 +352,7 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
+            "- Fixes Maya Original PNG capture when scenes use EXR and isolates Mask, Depth and Motion capture failures; verified Serial evaluation with one DG retry preserves completed outputs, existing visibility scope, timing and source scenes.",
             "- Extends the same Video Picker to Blender .blend scenes with automatic installed-engine selection, camera/frame/FPS discovery, snapshots and Original/Mask/Depth/Motion outputs; existing Maya .mb/.ma commands remain supported.",
             "- Keeps generated companions in the Shot and scene bundle captured at Generate, including delayed terminal results and cross-Shot Blender mask bindings.",
             "- Removes snapshot wraparound flicker by retaining the displayed frame until its replacement is ready; preserves playback, frame stepping and video editing controls.",

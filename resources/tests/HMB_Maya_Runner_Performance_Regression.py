@@ -2471,6 +2471,14 @@ with tempfile.TemporaryDirectory(prefix="hmb_maya_runner_regression_") as temp_d
 
 
 class RunCmds:
+    def __init__(self):
+        self.evaluation_mode = "parallel"
+
+    def evaluationManager(self, query=False, mode=None):
+        if query:
+            return [self.evaluation_mode]
+        self.evaluation_mode = mode
+
     @staticmethod
     def about(version=False):
         return "2027" if version else ""

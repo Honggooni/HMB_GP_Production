@@ -8018,11 +8018,13 @@ def _validate_render_storage_budget(job, frames, width, height):
                 width, height, max_dimension
             )
         )
+    capture_pass = _clean(job.get("capture_pass"))
     pass_count = 1
-    if bool(job.get("generate_depth_playblast")):
-        pass_count += 1
-    if bool(job.get("generate_motion_guide")):
-        pass_count += 1
+    if not capture_pass:
+        if bool(job.get("generate_depth_playblast")):
+            pass_count += 1
+        if bool(job.get("generate_motion_guide")):
+            pass_count += 1
     # Four bytes/pixel is a conservative staging estimate for PNG plus a 10%
     # transaction margin. This is a capacity check, not a creative limit.
     estimated_bytes = int(
@@ -9076,6 +9078,35 @@ def _restore_full_smooth_viewport(restore_state):
     return warnings
 
 
+def _set_png_capture_output_options():
+    """Set verified capture encoding independently of the viewport appearance.
+
+    Original's solid-material branch returns before the other look settings.
+    Capture format must still be PNG even when the authored scene uses EXR.
+    These globals only affect the disposable Maya session; no scene is saved.
+    Correct values are left untouched, including already-correct locked plugs.
+    """
+    for plug, expected in (
+        ("defaultRenderGlobals.imageFormat", 32),
+        ("defaultRenderGlobals.animation", 0),
+        ("defaultRenderGlobals.putFrameBeforeExt", 1),
+        ("defaultRenderGlobals.extensionPadding", 6),
+    ):
+        try:
+            if cmds.getAttr(plug) != expected:
+                cmds.setAttr(plug, expected)
+            actual = cmds.getAttr(plug)
+            if actual != expected:
+                raise RuntimeError(
+                    "expected {0}, found {1}".format(expected, actual)
+                )
+        except Exception as exc:
+            raise RuntimeError(
+                "Maya PNG capture output setting could not be applied: "
+                "{0} ({1}).".format(plug, exc)
+            )
+
+
 def _set_viewport_render_options(
     marker_mode=False,
     preserve_authored_look=False,
@@ -9083,6 +9114,7 @@ def _set_viewport_render_options(
     depth_mode=False,
     original_lambert_mode=False,
 ):
+    _set_png_capture_output_options()
     report = {
         "output_transform_disabled": False,
         "multisample_disabled": False,
@@ -9264,13 +9296,6 @@ def _set_viewport_render_options(
                         exc,
                     )
                 )
-    try:
-        cmds.setAttr("defaultRenderGlobals.imageFormat", 32)
-        cmds.setAttr("defaultRenderGlobals.animation", 0)
-        cmds.setAttr("defaultRenderGlobals.putFrameBeforeExt", 1)
-        cmds.setAttr("defaultRenderGlobals.extensionPadding", 6)
-    except Exception:
-        pass
     return report
 
 
@@ -15485,12 +15510,48 @@ def _marker_payload(
     return result
 
 
+def _query_capture_evaluation_mode():
+    modes = cmds.evaluationManager(query=True, mode=True)
+    if isinstance(modes, str):
+        modes = [modes]
+    if not isinstance(modes, (list, tuple)):
+        raise RuntimeError("Maya returned an ambiguous evaluation mode: {0!r}.".format(modes))
+    # Maya 2027 can append status text such as "Evaluation graph is ready."
+    # to its query result. Require exactly one real mode, not one result item.
+    recognized_modes = [
+        _clean(item).lower()
+        for item in modes
+        if isinstance(item, str) and _clean(item).lower() in ("off", "serial", "parallel")
+    ]
+    if len(recognized_modes) != 1:
+        raise RuntimeError("Maya returned an ambiguous evaluation mode: {0!r}.".format(modes))
+    return recognized_modes[0]
+
+
+def _set_capture_evaluation_mode(mode, restoring=False):
+    """Change only this disposable Maya session, never saved preferences."""
+    action = "restored" if restoring else "applied"
+    try:
+        if _query_capture_evaluation_mode() != mode:
+            cmds.evaluationManager(mode=mode)
+        actual = _query_capture_evaluation_mode()
+        if actual != mode:
+            raise RuntimeError("expected {0}, read back {1}".format(mode, actual))
+    except Exception as exc:
+        raise RuntimeError(
+            "Maya capture evaluation mode could not be {0}: {1} ({2}).".format(
+                action, mode, exc
+            )
+        )
+
+
 def run(job_path):
     job_path = os.path.abspath(job_path)
     job = _read_json(job_path)
     _validate_job_write_paths(job_path, job)
     result_path = os.path.abspath(job["result_path"])
     result = {"ok": False, "job_path": job_path}
+    previous_evaluation_mode = None
     try:
         _emit_console("INFO", "Background runner started.")
         _emit_console("INFO", "Job file: {0}".format(job_path))
@@ -15504,12 +15565,32 @@ def run(job_path):
                 )
             )
 
+        operation = _clean(job.get("operation")) or "render"
+        if operation != "scan":
+            evaluation_mode = _clean(job.get("maya_evaluation_mode") or "serial").lower()
+            if evaluation_mode not in ("serial", "off"):
+                raise RuntimeError(
+                    "Unsupported Maya capture evaluation mode: {0}. "
+                    "Only serial or off is permitted.".format(evaluation_mode)
+                )
+            try:
+                previous_evaluation_mode = _query_capture_evaluation_mode()
+            except Exception as exc:
+                raise RuntimeError("Maya capture evaluation mode could not be read: {0}.".format(exc))
+            _set_capture_evaluation_mode(evaluation_mode)
+
         _write_progress(job, "maya_ready", "Maya batch initialized. Opening the scene safely.")
         scene_path = _open_scene_for_job(job)
 
-        operation = _clean(job.get("operation")) or "render"
         if operation == "scan":
             return _scan_scene(job, result_path, maya_version, scene_path)
+        # Scene load callbacks may change evaluation mode. Reassert and verify
+        # before any capture-specific time changes, bounding boxes or rendering.
+        _set_capture_evaluation_mode(evaluation_mode)
+        capture_pass = _clean(job.get("capture_pass"))
+        if capture_pass not in ("", "color", "depth", "motion_guide"):
+            raise RuntimeError("Unsupported Maya capture pass: {0}.".format(capture_pass))
+        capture_auxiliary_only = capture_pass in ("depth", "motion_guide")
 
         apply_marker_shaders = bool(job.get("apply_marker_shaders", True))
         apply_original_lambert_override = bool(
@@ -15520,6 +15601,9 @@ def run(job_path):
         world_space_patterns = bool(job.get("world_space_patterns"))
         generate_depth_playblast = bool(job.get("generate_depth_playblast"))
         generate_motion_guide = bool(job.get("generate_motion_guide"))
+        if capture_pass:
+            generate_depth_playblast = capture_pass == "depth"
+            generate_motion_guide = capture_pass == "motion_guide"
         requested_original_material_profile = _clean(
             job.get("original_material_override_profile")
         )
@@ -15768,7 +15852,7 @@ def run(job_path):
 
         # Full-smooth preparation only touches the already-scoped concrete Maya
         # shapes and never promotes authored-hidden proxy caches.
-        if apply_marker_shaders:
+        if apply_marker_shaders and not capture_auxiliary_only:
             if world_space_patterns:
                 job["_world_pattern_reference_frame"] = float(frames[0])
                 cmds.currentTime(frames[0], edit=True, update=True)
@@ -15886,7 +15970,7 @@ def run(job_path):
             completed_frames=0,
         )
         artifact_status = {
-            "color": {"requested": True, "ok": False, "error": ""},
+            "color": {"requested": not capture_auxiliary_only, "ok": False, "error": ""},
             "depth": {
                 "requested": bool(generate_depth_playblast),
                 "ok": False,
@@ -15904,6 +15988,8 @@ def run(job_path):
         original_mouth_report = {}
         original_material_controller = None
         original_material_report = {}
+        output_paths = []
+        frame_map = []
         if apply_original_lambert_override:
             _write_progress(
                 job,
@@ -15971,32 +16057,33 @@ def run(job_path):
                         original_material_report.get("plugin_fallback_count") or 0
                     ),
                 )
-            if force_high_quality_viewport and not apply_marker_shaders and not apply_original_lambert_override:
+            if force_high_quality_viewport and not apply_marker_shaders and not apply_original_lambert_override and not capture_auxiliary_only:
                 original_mouth_controller = _MouthCardInnerPatchController(
                     job,
                     "original",
                 )
             try:
-                output_paths, frame_map = _render_frames(
-                    camera=camera,
-                    frame_values=frames,
-                    width=width,
-                    height=height,
-                    frames_folder=frames_folder,
-                    output_name=output_name,
-                    job=job,
-                    progress_stage="rendering_frames",
-                    pre_frame_callback=(
-                        original_mouth_controller.prepare_frame
-                        if original_mouth_controller is not None
-                        else None
-                    ),
-                    post_frame_callback=(
-                        original_mouth_controller.restore_frame
-                        if original_mouth_controller is not None
-                        else None
-                    ),
-                )
+                if not capture_auxiliary_only:
+                    output_paths, frame_map = _render_frames(
+                        camera=camera,
+                        frame_values=frames,
+                        width=width,
+                        height=height,
+                        frames_folder=frames_folder,
+                        output_name=output_name,
+                        job=job,
+                        progress_stage="rendering_frames",
+                        pre_frame_callback=(
+                            original_mouth_controller.prepare_frame
+                            if original_mouth_controller is not None
+                            else None
+                        ),
+                        post_frame_callback=(
+                            original_mouth_controller.restore_frame
+                            if original_mouth_controller is not None
+                            else None
+                        ),
+                    )
             finally:
                 if original_mouth_controller is not None:
                     original_mouth_report = original_mouth_controller.finish()
@@ -16006,13 +16093,20 @@ def run(job_path):
                     quality_report["mouth_card_inner_patch"] = dict(
                         original_mouth_report
                     )
-            artifact_status["color"]["ok"] = True
+            artifact_status["color"]["ok"] = not capture_auxiliary_only
             # Depth is a scene-space pass, not a Color Assignment pass.  After
             # the assignment-scoped Mask has rendered, release its disposable
             # exclusion layer and rebuild Depth from Maya-authored visibility
             # plus the Picker eye state even when Color bindings exist.
-            # Motion Guide retains its prior no-binding fallback behavior.
-            if generate_depth_playblast or (generate_motion_guide and not bindings):
+            # An isolated Motion job retains the scope release that preceded it
+            # in a legacy Depth+Motion bundle, without rendering Depth again.
+            motion_guide_full_scene_scope = (
+                capture_pass == "motion_guide"
+                and bool(job.get("motion_guide_full_scene_scope"))
+            )
+            if generate_depth_playblast or (
+                generate_motion_guide and (not bindings or motion_guide_full_scene_scope)
+            ):
                 try:
                     _prepare_unassigned_auxiliary_scope(
                         job,
@@ -16048,11 +16142,11 @@ def run(job_path):
                         output_name=depth_output_name,
                         job=job,
                     )
-                    if len(depth_output_paths) != len(output_paths):
+                    if len(depth_output_paths) != (len(frames) if capture_auxiliary_only else len(output_paths)):
                         raise RuntimeError(
                             "Depth frame count does not match the color frame count."
                         )
-                    color_times = [
+                    color_times = [float(frame) for frame in frames] if capture_auxiliary_only else [
                         float(item.get("maya_frame"))
                         for item in frame_map
                     ]
@@ -16097,12 +16191,12 @@ def run(job_path):
                         hidden_paths=hidden_paths,
                         job=job,
                     )
-                    if len(motion_guide_output_paths) != len(output_paths):
+                    if len(motion_guide_output_paths) != (len(frames) if capture_auxiliary_only else len(output_paths)):
                         raise RuntimeError(
                             "Motion Guide frame count does not match the Color "
                             "frame count."
                         )
-                    color_times = [
+                    color_times = [float(frame) for frame in frames] if capture_auxiliary_only else [
                         float(item.get("maya_frame"))
                         for item in frame_map
                     ]
@@ -16143,6 +16237,14 @@ def run(job_path):
                 )
             if material_restore_error is not None:
                 raise material_restore_error
+
+        if capture_auxiliary_only and not artifact_status[capture_pass]["ok"]:
+            result["artifacts"] = artifact_status
+            raise RuntimeError(
+                "Requested {0} capture failed: {1}".format(
+                    capture_pass, artifact_status[capture_pass]["error"]
+                )
+            )
 
         auxiliary_render_scope_report = dict(
             job.get("_auxiliary_render_scope_report") or {}
@@ -16219,7 +16321,8 @@ def run(job_path):
             )
         elif force_high_quality_viewport and not apply_marker_shaders:
             payload["assignment_mode"] = "original_full_detail_no_marker"
-        _write_json(sidecar_path, payload)
+        if not capture_auxiliary_only:
+            _write_json(sidecar_path, payload)
 
         if artifact_status["depth"]["ok"]:
             depth_payload = {
@@ -16243,6 +16346,7 @@ def run(job_path):
                     depth_output_name + ".%06d.png",
                 ).replace("\\", "/"),
                 "frame_map": depth_frame_map,
+                "markers": payload["markers"],
                 "depth_range_report": depth_range_report,
                 "mouth_card_inner_patch": dict(
                     job.get("_mouth_inner_patch_depth_report") or {}
@@ -16294,6 +16398,7 @@ def run(job_path):
                     motion_guide_output_name + ".%06d.png",
                 ).replace("\\", "/"),
                 "frame_map": motion_guide_frame_map,
+                "markers": payload["markers"],
                 "motion_guide_report": motion_guide_report,
                 "viewport_quality_profile": (
                     FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
@@ -16312,6 +16417,7 @@ def run(job_path):
                     job.get("_script_node_report") or {}
                 ),
                 "auxiliary_render_scope": auxiliary_render_scope_report,
+                "render_scope": dict(render_scope_report),
             }
             _write_json(
                 motion_guide_sidecar_path,
@@ -16355,6 +16461,18 @@ def run(job_path):
                 "motion_guide_report": motion_guide_report,
                 "motion_guide_frame_map": motion_guide_frame_map,
             })
+        if capture_pass:
+            result["capture_pass"] = capture_pass
+        if capture_auxiliary_only:
+            prefix = "depth" if capture_pass == "depth" else "motion_guide"
+            result.update({
+                "frames_folder": result[prefix + "_frames_folder"],
+                "output_name": result[prefix + "_output_name"],
+                "sidecar_path": result[prefix + "_sidecar_path"],
+                "frame_count": result[prefix + "_frame_count"],
+                "frame_map": result[prefix + "_frame_map"],
+            })
+            sidecar_path = result["sidecar_path"]
         if force_high_quality_viewport:
             result["viewport_quality_profile"] = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
             result["viewport_quality_report"] = quality_report
@@ -16387,7 +16505,7 @@ def run(job_path):
                 if artifact_status["motion_guide"]["ok"]
                 else "Viewport frame generation completed."
             ),
-            frame_count=len(output_paths),
+            frame_count=result["frame_count"],
             depth_frame_count=len(depth_output_paths),
             motion_guide_frame_count=len(motion_guide_output_paths),
             depth_profile=(
@@ -16412,6 +16530,22 @@ def run(job_path):
         _emit_console("ERROR", str(exc))
         traceback.print_exc()
         raise
+    finally:
+        if previous_evaluation_mode is not None:
+            try:
+                _set_capture_evaluation_mode(previous_evaluation_mode, restoring=True)
+            except Exception as exc:
+                result.update({
+                    "ok": False,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                })
+                try:
+                    _write_json(result_path, result)
+                except Exception:
+                    pass
+                _emit_console("ERROR", str(exc))
+                raise
 
 
 def run_from_env():

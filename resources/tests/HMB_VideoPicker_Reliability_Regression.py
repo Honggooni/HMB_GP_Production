@@ -1516,8 +1516,8 @@ assert "enableMultisample" in maya_runner_source
 assert "force_high_quality_viewport and not apply_marker_shaders" in maya_runner_source
 assert "cmds.displaySmoothness(" in maya_runner_source
 assert picker_source.count("activity_paths=(frames_folder,)") == 2
-assert "[depth_frames_folder]" in picker_source
-assert "[motion_guide_frames_folder]" in picker_source
+assert "def _execute_maya_capture_passes(" in picker_source
+assert "activity_paths=(expected_frames,)" in picker_source
 assert "if motion_guide_enabled" in picker_source
 assert "if depth_enabled" in picker_source
 assert "activity_paths=(original_frames_folder,)" not in picker_source

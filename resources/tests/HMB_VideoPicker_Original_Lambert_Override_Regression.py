@@ -459,6 +459,12 @@ class MidgrayCmds(FakeMaterialCmds):
         self.authored_reads = []
         self.output_transform_enabled = True
         self.render_mode_labels = "Wire:Shaded:Wire on Shaded:Textured"
+        self.values.update({
+            "defaultRenderGlobals.imageFormat": 51,
+            "defaultRenderGlobals.animation": 1,
+            "defaultRenderGlobals.putFrameBeforeExt": 0,
+            "defaultRenderGlobals.extensionPadding": 4,
+        })
         for attribute in (
             "ssaoEnable", "shadows", "bloomEnable", "motionBlurEnable",
             "renderDepthOfField", "hwFogEnable", "xrayMode",
@@ -482,7 +488,8 @@ class MidgrayCmds(FakeMaterialCmds):
 
     def _guard_authored_read(self, node, operation):
         node = str(node).split(".", 1)[0]
-        if (node not in self.members and node != "hardwareRenderingGlobals"
+        if (node not in self.members
+                and node not in ("hardwareRenderingGlobals", "defaultRenderGlobals")
                 and not node.startswith("HMB_Original_")
                 and self.node_types.get(node) not in ("mesh", "transform")):
             self.authored_reads.append((operation, node))
@@ -646,6 +653,10 @@ assert options["default_lighting_verified"] is True
 assert options["solid_render_mode_verified"] is True
 assert options["soft_shading_verified"] is True
 assert viewport.output_transform_enabled is False
+assert viewport.values["defaultRenderGlobals.imageFormat"] == 32
+assert viewport.values["defaultRenderGlobals.animation"] == 0
+assert viewport.values["defaultRenderGlobals.putFrameBeforeExt"] == 1
+assert viewport.values["defaultRenderGlobals.extensionPadding"] == 6
 for attribute in ("ssaoEnable", "shadows", "bloomEnable", "motionBlurEnable",
                   "renderDepthOfField", "hwFogEnable", "xrayMode"):
     assert viewport.values["hardwareRenderingGlobals." + attribute] == 0
