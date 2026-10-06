@@ -367,6 +367,9 @@ jobs:
             "- Preserves sanitized Broker/provider failure details and exact workflow/Shot recovery identity without overwriting saved results with discarded newer recovery records.",
             "- Includes the compact signed Agent policy v5.5 with the Super Wings default look, shared Actor colors, scoped user overrides, and unchanged Maya camera/motion authority.",
             "- Keeps Agent models in exact parity with the installed Standard Agent manifest and preserves five-Shot routing, image registration, and independent video editing tools.",
+            "- Adds Cyan Actor and Lavender Ghost presets with distinct color identities throughout Picker, Prompt binding and Maya/Blender outputs; existing presets and shaders remain unchanged.",
+            "- Prevents delayed Color LUT state/command failures from overwriting newer edits or accepted Project/Shot results, including pending slider edits and leave-and-return navigation; current errors remain visible.",
+            "- Refreshes persistence, sanitizer and Picker-to-Seedance fixtures for current host APIs and model limits, and adds production-controller asynchronous ownership regression coverage.",
             "- Includes the manifest-verified runtime installer and SHA256 checksum. Private policy source files, signing keys, and server configuration are not distributed.",
             "",
             "Close Griptape completely before running the included installer."

@@ -33,6 +33,10 @@ class Agent:
         self.nested_output_override = None
         self.shown_messages = []
         self.hidden_messages = []
+        # The installed BaseNode owns non-parameter UI elements separately.
+        # Model that API so current Agent failure advisories are constructed
+        # through the same host surface as the real Standard Agent.
+        self.root_ui_element = types.SimpleNamespace(children=[])
         for name, value in (
             ("prompt", ""),
             ("additional_context", ""),
@@ -48,6 +52,9 @@ class Agent:
 
     def add_parameter(self, parameter):
         self.parameters[parameter.name] = parameter
+
+    def add_node_element(self, element):
+        self.root_ui_element.children.append(element)
 
     def get_parameter_by_name(self, name):
         return self.parameters.get(name)
@@ -218,6 +225,10 @@ visible_prompt = "Describe the selected shot in production-ready English."
 module._paired_machine_prompt = lambda _node, prompt_value: str(prompt_value or "")
 
 node = canonical_hmb_agent()
+assert any(
+    getattr(element, "name", "") == module._AGENT_EXECUTION_FAILED_WARNING
+    for element in node.root_ui_element.children
+)
 assert module._AGENT_WIDGET_PARAMETER in node.parameters
 assert node.get_parameter_by_name("output").ui_options["display_name"] == (
     "FINAL TEXT · GENERATOR"

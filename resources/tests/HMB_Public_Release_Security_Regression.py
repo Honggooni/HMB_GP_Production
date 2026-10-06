@@ -281,10 +281,10 @@ finally:
     common._verify_agent_policy_signature = real_signature_verifier
 
 agent_model_ids = builder.node_model_usage_ids(manifest, "HMBAgentLibrary")
-assert len(agent_model_ids) == 35
+assert agent_model_ids
 assert len(agent_model_ids) == len(set(agent_model_ids))
 catalog_model_ids = builder.library_model_catalog_ids(manifest)
-assert len(catalog_model_ids) == 35
+assert len(catalog_model_ids) == len(agent_model_ids)
 assert set(agent_model_ids) == set(catalog_model_ids)
 assert (
     builder.library_model_catalog_contract_sha256(manifest)
@@ -319,7 +319,33 @@ finally:
 standard_manifest_path = builder.validate_standard_agent_model_parity(manifest)
 if standard_manifest_path is not None:
     standard_manifest = json.loads(standard_manifest_path.read_text(encoding="utf-8"))
-    assert agent_model_ids == builder.node_model_usage_ids(standard_manifest, "Agent")
+    # Read the installed declaration independently of the package helper; the
+    # Standard Agent's current ordered model surface is the release authority.
+    standard_agent_node = next(
+        node for node in standard_manifest["nodes"] if node["class_name"] == "Agent"
+    )
+    standard_agent_ids = next(
+        declaration["model_ids"]
+        for declaration in standard_agent_node["metadata"]["declarations"]
+        if declaration["type"] == "model_usage"
+    )
+    assert list(agent_model_ids) == standard_agent_ids
+    assert len(catalog_model_ids) == len(standard_agent_ids)
+    standard_providers = next(
+        declaration["providers"]
+        for declaration in standard_manifest["metadata"]["declarations"]
+        if declaration["type"] == "model_catalog"
+    )
+    for provider_id, provider in builder.library_model_catalog_providers(manifest).items():
+        standard_provider = standard_providers[provider_id]
+        assert {key: value for key, value in provider.items() if key != "models"} == {
+            key: value for key, value in standard_provider.items() if key != "models"
+        }
+        assert provider["models"] == {
+            model_id: metadata
+            for model_id, metadata in standard_provider["models"].items()
+            if model_id in standard_agent_ids
+        }
 assert sbom["name"] == f"HMB_GP_Production-{RELEASE_VERSION}"
 assert sbom["documentNamespace"].endswith(f"/{RELEASE_VERSION}")
 assert next(

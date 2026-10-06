@@ -147,8 +147,18 @@ saved_picker_state.update({
     "right_section_heights": {"settings": 230, "color": 510, "log": 270},
     "ui_theme": "T",
     "outliner_search": "hero",
+    "outliner_nodes": [
+        {"name": "Hero_GRP", "full_path": "|SET|Hero_GRP", "maya_uuid": "hero-group"},
+        {"name": "BackgroundA", "full_path": "|SET|BackgroundA", "maya_uuid": "background-a"},
+        {"name": "BackgroundB", "full_path": "|SET|BackgroundB", "maya_uuid": "background-b"},
+        {"name": "Hidden_GRP", "full_path": "|SET|Hidden_GRP", "maya_uuid": "hidden-group"},
+    ],
     "selected_outliner_path": "|SET|Hero_GRP",
     "selected_outliner_name": "Hero_GRP",
+    "selected_outliner_uuid": "hero-group",
+    "selected_outliner_paths": ["|SET|Hero_GRP"],
+    "outliner_selection_anchor": "|SET|Hero_GRP",
+    "outliner_selection_scope": "|" + saved_picker_state["active_picker_shot_uuid"],
     "selected_color": "Red",
     "videos": [
         {
@@ -186,15 +196,16 @@ saved_picker_state.update({
         },
     ],
     "slot_assignments": [
-        {"video_slot": 1, "bindings": []},
-        {"video_slot": 2, "bindings": [
+        # Mask/color authoring is the unified primary row, independent of the
+        # selected preview video or the three ordered video catalog entries.
+        {"video_slot": picker.PRIMARY_COLOR_VIDEO_SLOT, "bindings": [
             {
                 "group_name": "BackgroundA",
                 "full_dag_path": "|SET|BackgroundA",
                 "maya_uuid": "background-a",
                 "color": "Sky Blue",
                 "enabled": True,
-                "video_slot": 2,
+                "video_slot": picker.PRIMARY_COLOR_VIDEO_SLOT,
                 "picker_order": 1,
             },
             {
@@ -203,18 +214,51 @@ saved_picker_state.update({
                 "maya_uuid": "background-b",
                 "color": "Sky Blue",
                 "enabled": True,
-                "video_slot": 2,
+                "video_slot": picker.PRIMARY_COLOR_VIDEO_SLOT,
                 "picker_order": 2,
             },
         ]},
-        {"video_slot": 3, "bindings": []},
     ],
     "slot_visibility": [
-        {"video_slot": 1, "hidden_paths": []},
-        {"video_slot": 2, "hidden_paths": ["|SET|Hidden_GRP"]},
-        {"video_slot": 3, "hidden_paths": []},
+        {"video_slot": picker.PRIMARY_COLOR_VIDEO_SLOT, "hidden_paths": ["|SET|Hidden_GRP"]},
     ],
 })
+
+# Selection restoration is scoped to actual scene rows. A persisted scalar
+# path without a corresponding Outliner row is an orphan, not a valid saved
+# selection. Cover its removal without weakening the valid restoration below.
+orphan_node = picker.HMBVideoPickerLibrary(name="picker_orphan_selection_restore")
+orphan_state = copy.deepcopy(saved_picker_state)
+orphan_state["outliner_nodes"] = []
+orphan_parameter = picker._get_parameter_obj(orphan_node, picker.WIDGET_STATE_PARAMETER)
+orphan_node.set_parameter_value(
+    picker.WIDGET_STATE_PARAMETER,
+    orphan_node.before_value_set(orphan_parameter, orphan_state),
+    initial_setup=True,
+    skip_before_value_set=True,
+)
+restored_orphan = orphan_node._picker_state()
+assert restored_orphan["selected_outliner_path"] == ""
+assert restored_orphan["selected_outliner_name"] == ""
+assert restored_orphan["selected_outliner_uuid"] == ""
+assert restored_orphan["selected_outliner_paths"] == []
+assert restored_orphan["outliner_selection_anchor"] == ""
+expected_orphan_videos = picker._parse_state(saved_picker_state)["videos"]
+for video in expected_orphan_videos:
+    # Restoration derives a usable local preview URL without losing/changing
+    # the durable catalog. The input fixture intentionally stores paths only.
+    video["video_url"] = video["video_url"] or Path(video["video_path"]).as_uri()
+assert restored_orphan["videos"] == expected_orphan_videos
+
+# Pre-multi-selection workflows only stored the scalar selection. That valid
+# legacy selection must hydrate when its scene row is still present.
+legacy_selection = copy.deepcopy(saved_picker_state)
+for key in ("selected_outliner_paths", "outliner_selection_scope", "outliner_selection_anchor"):
+    legacy_selection.pop(key, None)
+legacy_selection = picker._parse_state(legacy_selection)
+assert legacy_selection["selected_outliner_path"] == "|SET|Hero_GRP"
+assert legacy_selection["selected_outliner_paths"] == ["|SET|Hero_GRP"]
+assert picker._parse_state(legacy_selection)["selected_outliner_paths"] == ["|SET|Hero_GRP"]
 
 picker_parameter = picker._get_parameter_obj(picker_node, picker.WIDGET_STATE_PARAMETER)
 hydrated_picker_state = picker_node.before_value_set(picker_parameter, saved_picker_state)
@@ -242,6 +286,10 @@ for key in (
     "outliner_search",
     "selected_outliner_path",
     "selected_outliner_name",
+    "selected_outliner_uuid",
+    "selected_outliner_paths",
+    "outliner_selection_anchor",
+    "outliner_selection_scope",
     "selected_color",
 ):
     assert restored_picker_state[key] == saved_picker_state[key], key
@@ -250,8 +298,10 @@ assert [
     item["selection_order"] for item in restored_picker_state["videos"]
 ] == [1, 2, 3]
 assert restored_picker_state["preview_video_uid"] == "persist-video-2"
-assert restored_picker_state["slot_visibility"][1]["hidden_paths"] == ["|SET|Hidden_GRP"]
-restored_background_bindings = restored_picker_state["slot_assignments"][1]["bindings"]
+assert [row["video_slot"] for row in restored_picker_state["slot_visibility"]] == [picker.PRIMARY_COLOR_VIDEO_SLOT]
+assert restored_picker_state["slot_visibility"][0]["hidden_paths"] == ["|SET|Hidden_GRP"]
+assert [row["video_slot"] for row in restored_picker_state["slot_assignments"]] == [picker.PRIMARY_COLOR_VIDEO_SLOT]
+restored_background_bindings = restored_picker_state["slot_assignments"][0]["bindings"]
 assert [item["color"] for item in restored_background_bindings] == ["Sky Blue", "Sky Blue"]
 assert [item["full_dag_path"] for item in restored_background_bindings] == [
     "|SET|BackgroundA", "|SET|BackgroundB",

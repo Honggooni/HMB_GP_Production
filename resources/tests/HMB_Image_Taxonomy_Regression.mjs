@@ -9,8 +9,8 @@ import {
 } from "../../widgets/HMBPromptLibraryScopedBindingWidget.js";
 
 const fullPalette = [
-  "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink",
-  "Sky Blue", "Mint", "Beige", "Direction Checker", "Sky Grid",
+  "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink", "Cyan",
+  "Sky Blue", "Mint", "Beige", "Lavender", "Direction Checker", "Sky Grid",
   "Floor Grid", "Position Pattern",
 ];
 

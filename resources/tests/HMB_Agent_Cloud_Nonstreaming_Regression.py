@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 import HMBAgentLibrary as agent  # noqa: E402
+from tools.package_runtime_release import standard_agent_manifest_candidates  # noqa: E402
 
 
 class FakeDriver:
@@ -162,43 +163,22 @@ model_usage = next(
     for item in agent_manifest["metadata"]["declarations"]
     if item.get("type") == "model_usage"
 )
-assert model_usage["model_ids"] == [
-    "gtc_claude_sonnet_5",
-    "gtc_claude_opus_5",
-    "gtc_claude_haiku_4_5",
-    "gtc_gemini_3_6_flash",
-    "gtc_gemini_3_5_flash",
-    "gtc_gemini_3_5_flash_lite",
-    "gtc_gemini_3_1_pro",
-    "gtc_gemini_3_1_flash_lite",
-    "gtc_gemini_3_flash",
-    "gtc_gemini_2_5_pro",
-    "gtc_gemini_2_5_flash",
-    "gtc_gemini_2_5_flash_lite",
-    "gtc_gpt_5_6_sol",
-    "gtc_gpt_5_6_terra",
-    "gtc_gpt_5_6_luna",
-    "gtc_gpt_5_5",
-    "gtc_gpt_5_4",
-    "gtc_gpt_5_2",
-    "gtc_gpt_5_2_chat",
-    "gtc_gpt_5_1",
-    "gtc_gpt_5",
-    "gtc_gpt_5_mini",
-    "gtc_gpt_5_nano",
-    "gtc_gpt_4_1",
-    "gtc_gpt_4_1_mini",
-    "gtc_gpt_4_1_nano",
-    "gtc_gpt_4o",
-    "gtc_o4_mini",
-    "gtc_o3",
-    "gtc_o3_mini",
-    "gtc_o1",
-    "gtc_deepseek_v3",
-    "gtc_deepseek_r1",
-    "gtc_llama_3_3_70b",
-    "gtc_llama_3_1_70b",
-]
+assert model_usage["model_ids"]
+assert len(model_usage["model_ids"]) == len(set(model_usage["model_ids"]))
+standard_manifest_path = next(
+    (path for path in standard_agent_manifest_candidates() if path.is_file()), None
+)
+if standard_manifest_path is not None:
+    standard_manifest = json.loads(standard_manifest_path.read_text(encoding="utf-8"))
+    standard_agent = next(
+        node for node in standard_manifest["nodes"] if node["class_name"] == "Agent"
+    )
+    standard_model_ids = next(
+        declaration["model_ids"]
+        for declaration in standard_agent["metadata"]["declarations"]
+        if declaration["type"] == "model_usage"
+    )
+    assert model_usage["model_ids"] == standard_model_ids
 model_catalog = next(
     item
     for item in manifest["metadata"]["declarations"]
@@ -209,7 +189,7 @@ catalog_model_ids = {
     for provider in model_catalog["providers"].values()
     for model_id in provider["models"]
 }
-assert len(catalog_model_ids) == 35
+assert len(catalog_model_ids) == len(model_usage["model_ids"])
 assert catalog_model_ids == set(model_usage["model_ids"])
 
 # Direct server-policy disclosure is the only text-content guard retained.

@@ -157,7 +157,7 @@ assert "character_outline_mode=CHARACTER_OUTLINE_NATIVE" in runner_source
 
 runner._load_marker_catalog({
     "marker_catalog_path": str(CATALOG_PATH),
-    "marker_catalog_version": 4,
+    "marker_catalog_version": 5,
 })
 assert runner.MARKER_PATTERNS == {
     "Direction Checker": "direction_checker",
@@ -2516,7 +2516,7 @@ with tempfile.TemporaryDirectory(prefix="hmb_maya_depth_run_") as temp_dir:
         "require_full_smooth_geometry": True,
         "screen_space_patterns": True,
         "screen_space_pattern_profile": runner.SCREEN_SPACE_PATTERN_PROFILE,
-        "marker_catalog_version": 4,
+        "marker_catalog_version": 5,
         "generate_depth_playblast": True,
         "depth_frames_folder": str(depth_frames),
         "depth_output_name": "shot_depth",

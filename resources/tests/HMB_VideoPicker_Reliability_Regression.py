@@ -884,11 +884,11 @@ assert "Select at least one output: Original, Mask, Depth, or Motion Guide." in 
 # ---------------------------------------------------------------------------
 catalog_path = ROOT / "resources/picker/HMB_Marker_Catalog.json"
 catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-assert catalog["version"] == 4
+assert catalog["version"] == 5
 character = [item["name"] for item in catalog["character"]]
 background = [item["name"] for item in catalog["background"]]
-expected_actor = ["Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink"]
-expected_ghost = ["Sky Blue", "Mint", "Beige"]
+expected_actor = ["Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink", "Cyan"]
+expected_ghost = ["Sky Blue", "Mint", "Beige", "Lavender"]
 expected_object = [
     *expected_ghost,
     "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern",
@@ -2024,7 +2024,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
         picker._find_ffmpeg = original_find_ffmpeg
         picker.subprocess.Popen = original_popen
 
-# Every packaged marker survives normalization; legacy choices are rejected.
+# Every packaged marker survives normalization; unknown choices are rejected.
 raw_markers = [
     {
         "color": name,
@@ -2038,7 +2038,7 @@ raw_markers = [
 normalized_markers = picker._normalize_markers(raw_markers, 1)
 assert [item["color"] for item in normalized_markers] == picker.MARKER_ORDER
 assert picker._normalize_markers([
-    {"color": "Cyan", "asset_id": "Legacy", "subject_root": "|Legacy"}
+    {"color": "Unknown Marker", "asset_id": "Legacy", "subject_root": "|Legacy"}
 ]) == []
 shared_background_markers = picker._normalize_markers([
     {"color": "Sky Blue", "asset_id": "BackgroundA", "subject_root": "|BackgroundA"},
@@ -2262,7 +2262,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
         == read_digest
     )
 
-# PICKER_OUT uses the same 14-choice vocabulary and Prompt binds exact Asset IDs.
+# PICKER_OUT uses the same 16-choice vocabulary and Prompt binds exact Asset IDs.
 picker_state = picker._default_widget_state()
 picker_state.update({
     "scene_path": "C:/show/shot.mb",

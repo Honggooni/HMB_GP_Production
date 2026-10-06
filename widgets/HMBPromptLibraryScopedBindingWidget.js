@@ -13,13 +13,15 @@ const MAX_MANUAL_FRAME_NUMBER = 2147483647;
 const FRAME_RANGE_INTENT_VERSION = 1;
 const MAX_SOURCE_SYNC_REVISION = Number.MAX_SAFE_INTEGER;
 const UI_EDIT_REVISION_KEY = "ui_edit_revision";
-let ACTOR_COLOR_PICK_CHOICES = [
-  "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink",
-];
-let OBJECT_COLOR_PICK_CHOICES = [
-  "Sky Blue", "Mint", "Beige",
+const DEFAULT_ACTOR_COLOR_PICK_CHOICES = Object.freeze([
+  "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink", "Cyan",
+]);
+const DEFAULT_OBJECT_COLOR_PICK_CHOICES = Object.freeze([
+  "Sky Blue", "Mint", "Beige", "Lavender",
   "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern",
-];
+]);
+let ACTOR_COLOR_PICK_CHOICES = [...DEFAULT_ACTOR_COLOR_PICK_CHOICES];
+let OBJECT_COLOR_PICK_CHOICES = [...DEFAULT_OBJECT_COLOR_PICK_CHOICES];
 let COLOR_PICK_CHOICES = [
   ...new Set([...ACTOR_COLOR_PICK_CHOICES, ...OBJECT_COLOR_PICK_CHOICES]),
 ];
@@ -529,9 +531,11 @@ const HMB_OPTION_KO = {
   "Purple": "보라",
   "Orange": "주황",
   "Pink": "분홍",
+  "Cyan": "시안",
   "Sky Blue": "하늘색",
   "Mint": "민트",
   "Beige": "베이지",
+  "Lavender": "라벤더",
   "Direction Checker": "방향 체커",
   "Sky Grid": "하늘 그리드",
   "Floor Grid": "바닥 그리드",
@@ -1393,10 +1397,16 @@ function applyImageTaxonomy(input) {
   }
 
   // Palettes are display data within the same versioned Main/Sub contract.
+  // A valid saved taxonomy may predate catalog additions. Keep its custom
+  // names available while ensuring every current standard marker is offered.
   const actorColors = uniqueStrings(taxonomy.actor_color_pick_choices);
   const objectColors = uniqueStrings(taxonomy.object_color_pick_choices);
-  if (actorColors.length) ACTOR_COLOR_PICK_CHOICES = actorColors;
-  if (objectColors.length) OBJECT_COLOR_PICK_CHOICES = objectColors;
+  if (actorColors.length) ACTOR_COLOR_PICK_CHOICES = [...new Set([
+    ...DEFAULT_ACTOR_COLOR_PICK_CHOICES, ...actorColors,
+  ])];
+  if (objectColors.length) OBJECT_COLOR_PICK_CHOICES = [...new Set([
+    ...DEFAULT_OBJECT_COLOR_PICK_CHOICES, ...objectColors,
+  ])];
   COLOR_PICK_CHOICES = [...new Set([
     ...ACTOR_COLOR_PICK_CHOICES,
     ...OBJECT_COLOR_PICK_CHOICES,

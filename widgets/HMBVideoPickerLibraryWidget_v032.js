@@ -7,14 +7,24 @@ const COLOR_RGB = {
   Orange: [255, 133, 46],
   Purple: [145, 71, 255],
   Pink: [232, 77, 145],
+  Cyan: [0, 217, 217],
   "Sky Blue": [92, 184, 255],
   Mint: [102, 235, 186],
   Beige: [219, 199, 163],
+  Lavender: [184, 166, 217],
 };
 
+const FALLBACK_ACTOR_MARKER_OPTIONS = [
+  "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink", "Cyan",
+];
+const FALLBACK_GHOST_MARKER_OPTIONS = ["Sky Blue", "Mint", "Beige", "Lavender"];
+const FALLBACK_PATTERN_MARKER_OPTIONS = [
+  "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern",
+];
 const FALLBACK_MARKER_OPTIONS = [
-  "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink",
-  "Sky Blue", "Mint", "Beige", "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern",
+  ...FALLBACK_ACTOR_MARKER_OPTIONS,
+  ...FALLBACK_GHOST_MARKER_OPTIONS,
+  ...FALLBACK_PATTERN_MARKER_OPTIONS,
 ];
 const HMB_DEFAULT_NODE_WIDTH = 1400;
 const HMB_DEFAULT_NODE_HEIGHT = 1200;
@@ -2800,14 +2810,8 @@ function defaultState() {
     frontend_seen_revision: 0,
     scene_stage: "EMPTY",
     scene_draft_path: "",
-    marker_catalog: {
-      schema: "hmb-marker-catalog",
-      version: 4,
-      character: FALLBACK_MARKER_OPTIONS.slice(0, 7).map((name) => ({ name })),
-      background: FALLBACK_MARKER_OPTIONS.slice(7).map((name) => ({ name })),
-      options: [...FALLBACK_MARKER_OPTIONS],
-    },
-    marker_catalog_version: 4,
+    marker_catalog: hmbNormalizePickerMarkerCatalog(null),
+    marker_catalog_version: 5,
     scene_request_path: "",
     mode: "maya",
     status: "READY",
@@ -4252,20 +4256,8 @@ function normalize(value) {
   }
   const state = { ...defaultState(), ...(source && typeof source === "object" ? source : {}) };
   state.video_tools_by_shot = hmbNormalizePickerVideoToolsByShot(state.video_tools_by_shot);
-  const rawCatalog = state.marker_catalog && typeof state.marker_catalog === "object" ? state.marker_catalog : {};
-  const catalogRows = [
-    ...(Array.isArray(rawCatalog.character) ? rawCatalog.character : []),
-    ...(Array.isArray(rawCatalog.background) ? rawCatalog.background : []),
-  ];
-  const catalogOptions = catalogRows.map((item) => clean(item?.name)).filter(Boolean);
-  state.marker_catalog = {
-    schema: "hmb-marker-catalog",
-    version: Number(rawCatalog.version || state.marker_catalog_version || 3),
-    character: Array.isArray(rawCatalog.character) ? rawCatalog.character : [],
-    background: Array.isArray(rawCatalog.background) ? rawCatalog.background : [],
-    options: catalogOptions.length === 14 ? catalogOptions : [...FALLBACK_MARKER_OPTIONS],
-  };
-  state.marker_catalog_version = Number(state.marker_catalog.version || 3);
+  state.marker_catalog = hmbNormalizePickerMarkerCatalog(state.marker_catalog);
+  state.marker_catalog_version = state.marker_catalog.version;
   state.state_revision = Math.max(0, Math.floor(Number(state.state_revision || 0)));
   state.state_writer = clean(state.state_writer);
   state.state_published_at_ms = Math.max(0, Math.floor(Number(state.state_published_at_ms || 0)));
@@ -5499,8 +5491,45 @@ function setSlotBindings(state, slot, bindings) {
   };
 }
 
+export function hmbNormalizePickerMarkerCatalog(markerCatalog) {
+  const raw = markerCatalog && typeof markerCatalog === "object" ? markerCatalog : {};
+  const rows = (items) => (Array.isArray(items) ? items : []).map((item) => ({
+    ...item,
+    name: clean(item?.name),
+    kind: clean(item?.kind).toLowerCase()
+      || (FALLBACK_PATTERN_MARKER_OPTIONS.includes(clean(item?.name)) ? "pattern" : "solid"),
+  })).filter((item) => item.name);
+  let actor = rows(raw.character);
+  const background = rows(raw.background);
+  let ghost = background.filter((item) => item.kind === "solid");
+  let object = background.filter((item) => item.kind === "pattern");
+  const legacy = actor.length === 7 && ghost.length === 3 && object.length === 4;
+  const current = actor.length === FALLBACK_ACTOR_MARKER_OPTIONS.length
+    && ghost.length === FALLBACK_GHOST_MARKER_OPTIONS.length
+    && object.length === FALLBACK_PATTERN_MARKER_OPTIONS.length;
+  const names = [...actor, ...ghost, ...object].map((item) => item.name);
+  if ((!legacy && !current) || new Set(names).size !== names.length
+      || (legacy && (names.includes("Cyan") || names.includes("Lavender")))) {
+    actor = FALLBACK_ACTOR_MARKER_OPTIONS.map((name) => ({ name, kind: "solid" }));
+    ghost = FALLBACK_GHOST_MARKER_OPTIONS.map((name) => ({ name, kind: "solid" }));
+    object = FALLBACK_PATTERN_MARKER_OPTIONS.map((name) => ({ name, kind: "pattern" }));
+  } else if (legacy) {
+    // Additive v4 -> v5 migration: keep existing names, RGB metadata and order.
+    // Reopened workflows must not hide the new choices or discard their bindings.
+    actor.push({ name: "Cyan", kind: "solid" });
+    ghost.push({ name: "Lavender", kind: "solid" });
+  }
+  return {
+    schema: "hmb-marker-catalog",
+    version: Math.max(5, Number(raw.version) || 5),
+    character: actor,
+    background: [...ghost, ...object],
+    options: [...actor, ...ghost, ...object].map((item) => item.name),
+  };
+}
+
 function markerCatalogRows(markerCatalog) {
-  const catalog = markerCatalog && typeof markerCatalog === "object" ? markerCatalog : {};
+  const catalog = hmbNormalizePickerMarkerCatalog(markerCatalog);
   return [
     ...(Array.isArray(catalog.character) ? catalog.character : []),
     ...(Array.isArray(catalog.background) ? catalog.background : []),
@@ -5508,7 +5537,7 @@ function markerCatalogRows(markerCatalog) {
 }
 
 export function hmbPickerPaletteGroups(markerCatalog) {
-  const catalog = markerCatalog && typeof markerCatalog === "object" ? markerCatalog : {};
+  const catalog = hmbNormalizePickerMarkerCatalog(markerCatalog);
   const characterRows = Array.isArray(catalog.character) ? catalog.character : [];
   const backgroundRows = Array.isArray(catalog.background) ? catalog.background : [];
   const names = (rows) => rows.map((item) => clean(item?.name)).filter(Boolean);
@@ -5519,20 +5548,7 @@ export function hmbPickerPaletteGroups(markerCatalog) {
   const object = names(backgroundRows.filter(
     (item) => clean(item?.kind).toLowerCase() === "pattern",
   ));
-  const ordered = [...actor, ...ghost, ...object];
-  if (
-    actor.length === 7
-    && ghost.length === 3
-    && object.length === 4
-    && new Set(ordered).size === 14
-  ) {
-    return { actor, ghost, object };
-  }
-  return {
-    actor: FALLBACK_MARKER_OPTIONS.slice(0, 7),
-    ghost: FALLBACK_MARKER_OPTIONS.slice(7, 10),
-    object: FALLBACK_MARKER_OPTIONS.slice(10, 14),
-  };
+  return { actor, ghost, object };
 }
 
 export function hmbPickerMarkerAllowsRepeat(name, markerCatalog) {

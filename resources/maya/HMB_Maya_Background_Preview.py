@@ -236,8 +236,10 @@ def _load_marker_catalog(job):
     actor_count = len(character_rows)
     object_count = len(background_rows)
     names = [_clean(item.get("name")) for item in rows]
-    if actor_count != 7 or object_count != 7 or len(names) != len(set(names)) or any(not name for name in names):
-        raise RuntimeError("HMB marker catalog must contain seven Actor and seven Object choices.")
+    # Existing saved jobs can still carry the 14-choice catalog.  The current
+    # palette appends one Actor and one Ghost without changing those markers.
+    if (actor_count, object_count) not in ((7, 7), (8, 8)) or len(names) != len(set(names)) or any(not name for name in names):
+        raise RuntimeError("HMB marker catalog must contain seven or eight Actor and Object choices each.")
     colors = {}
     patterns = {}
     pattern_ids = {}
@@ -291,7 +293,7 @@ def _load_marker_catalog(job):
     # intentionally share one color; their DAG paths/asset IDs stay distinct.
     REPEATABLE_MARKERS = set(MARKER_OPTIONS)
     if any(name not in MARKER_COLORS for name in CHARACTER_MARKERS):
-        raise RuntimeError("All seven Character markers must be solid Lambert colors.")
+        raise RuntimeError("All Actor markers must be solid Lambert colors.")
     return payload
 
 

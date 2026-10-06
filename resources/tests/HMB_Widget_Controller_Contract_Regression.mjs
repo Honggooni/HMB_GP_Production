@@ -101,9 +101,9 @@ const paletteGroups = pickerModule.hmbPickerPaletteGroups({
   ].map((name) => ({ name, kind: "pattern" }))),
 });
 assert.deepEqual(paletteGroups.actor, [
-  "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink",
+  "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink", "Cyan",
 ]);
-assert.deepEqual(paletteGroups.ghost, ["Sky Blue", "Mint", "Beige"]);
+assert.deepEqual(paletteGroups.ghost, ["Sky Blue", "Mint", "Beige", "Lavender"]);
 assert.deepEqual(paletteGroups.object, [
   "Direction Checker", "Sky Grid", "Floor Grid", "Position Pattern",
 ]);

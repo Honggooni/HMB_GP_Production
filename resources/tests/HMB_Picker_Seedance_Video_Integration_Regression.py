@@ -7,6 +7,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
@@ -245,24 +246,37 @@ def assert_host_connection_reorder_and_payload() -> None:
         ) == reordered_four
         assert destination._get_parameters()["video_references"] == reordered_four
 
-        # Four selected videos must fail before any billable POST, and no item may
-        # be silently discarded to fit Seedance's three-video provider limit.
-        destination.set_parameter_value("prompt", "four-video preflight rejection")
-        request_calls: list[tuple[Any, ...]] = []
+        # Default 2.5 accepts all four references. Validate/build locally only;
+        # reference ordering must not be silently truncated to the older 2.0
+        # limit and this integration regression must never submit a task.
+        destination.set_parameter_value("prompt", "ordered video preflight")
+        four_params = destination._get_parameters()
+        assert four_params["model_id"] == seedance.SEEDANCE_2_5_MODEL_ID
+        assert seedance.MODEL_REFERENCE_LIMITS[four_params["model_id"]][1] == 10
+        destination._validate_parameters(four_params)
+        assert destination._build_broker_payload(four_params)["video_urls"] == reordered_four
 
-        async def forbidden_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
-            request_calls.append((*args, kwargs))
-            raise AssertionError("Provider request occurred before preflight rejection")
-
-        destination._request_json = forbidden_request
-        try:
-            asyncio.run(destination._process_generation_impl())
-        except ValueError as exc:
-            assert "Seedance 2.0 accepts at most 3" in str(exc)
-            assert "No request was submitted" in str(exc)
-        else:
-            raise AssertionError("Four connected Picker videos were accepted")
-        assert request_calls == []
+        # Explicit 2.0 must reject four references before authentication or a
+        # billable POST. Guard the current Broker route, not the retired node
+        # _request_json method. Both guarded call counts must remain zero.
+        destination.set_parameter_value("model_id", seedance.SEEDANCE_2_0_MODEL_ID)
+        with mock.patch.object(
+            destination, "_ensure_broker_connected",
+            side_effect=AssertionError("Broker authentication occurred before local preflight"),
+        ) as broker_connect, mock.patch.object(
+            seedance._HMBAIBrokerBridge, "_request_json",
+            side_effect=AssertionError("Broker request occurred before local preflight"),
+        ) as broker_request:
+            try:
+                asyncio.run(destination._process_generation_impl())
+            except ValueError as exc:
+                assert "Seedance 2.0 accepts at most 3" in str(exc)
+                assert "No request was submitted" in str(exc)
+            else:
+                raise AssertionError("Four connected Picker videos were accepted by explicit 2.0")
+            assert broker_connect.call_count == 0
+            assert broker_request.call_count == 0
+        assert destination.get_parameter_value(seedance.VIDEO_REFERENCES_PARAMETER) == reordered_four
 
         # Deselecting only the fourth-position item leaves the requested 4->1
         # order intact. The resulting three URLs become Ark content in that order.

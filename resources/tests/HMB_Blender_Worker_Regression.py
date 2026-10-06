@@ -185,6 +185,93 @@ class BlenderWorkerRegression(unittest.TestCase):
                 "blender_object_world_pattern_marker",
             )
 
+    def test_extended_actor_and_ghost_render_all_auxiliary_outputs(self):
+        with tempfile.TemporaryDirectory(prefix="hmb-blender-palette-") as temporary:
+            directory = Path(temporary)
+            scene = self._make_scene(directory)
+            job, result, process = self._run_job(
+                directory, scene, "render", width=384, height=240,
+                apply_marker_shaders=True,
+                marker_catalog_path=str(ROOT / "resources" / "picker" / "HMB_Marker_Catalog.json"),
+                bindings=[
+                    {"full_dag_path": "|Cube", "color": "Cyan", "enabled": True},
+                    {"full_dag_path": "|PatternSky", "color": "Lavender", "enabled": True},
+                ],
+                generate_depth_playblast=True,
+                depth_frames_folder=str(directory / "render" / "depth"),
+                depth_sidecar_path=str(directory / "render" / "depth.json"),
+                depth_output_name="depth",
+                generate_motion_guide=True,
+                motion_guide_frames_folder=str(directory / "render" / "motion"),
+                motion_guide_sidecar_path=str(directory / "render" / "motion.json"),
+                motion_guide_output_name="motion",
+            )
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            self.assertTrue(result["ok"], result.get("error"))
+            self.assertEqual(result["render_profile"], "hmb_blender_workbench_flat_markers_v1")
+            for kind in ("color", "depth", "motion_guide"):
+                self.assertTrue(result["artifacts"][kind]["ok"], result["artifacts"][kind])
+            sidecar = json.loads(Path(job["sidecar_path"]).read_text(encoding="utf-8"))
+            markers = {row["color"]: row for row in sidecar["markers"]}
+            self.assertEqual(markers["Cyan"]["rgb"], [0.0, 217 / 255, 217 / 255])
+            self.assertEqual(markers["Lavender"]["rgb"], [184 / 255, 166 / 255, 217 / 255])
+            self.assertEqual(sidecar["marker_catalog_version"], 5)
+            for folder, name in (("frames", "preview"), ("depth", "depth"), ("motion", "motion")):
+                for index in (0, 1):
+                    frame = directory / "render" / folder / (name + ".{:06d}.png".format(index))
+                    self.assertTrue(frame.is_file(), str(frame))
+                    with Image.open(frame) as image:
+                        self.assertEqual(image.size, (384, 240))
+                        self.assertGreater(max(ImageStat.Stat(image.convert("RGB")).stddev), 5)
+            retained = os.environ.get("HMB_BLEND_KEEP_PALETTE_QA", "")
+            if retained:
+                destination = Path(retained)
+                destination.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(directory / "render", destination / "render", dirs_exist_ok=True)
+            with Image.open(directory / "render" / "frames" / "preview.000000.png") as image:
+                pixels = list(image.convert("RGB").get_flattened_data())
+                self.assertGreater(sum(g - r > 35 and b - r > 35 and abs(g - b) < 15 for r, g, b in pixels), 100)
+                # Workbench keeps the scene's authored display transform; AgX
+                # compresses this pastel's hue while the sidecar stays exact.
+                self.assertGreater(sum(b - r > 2 and r - g > 2 and g > 100 for r, g, b in pixels), 100)
+            _, original, process = self._run_job(
+                directory, scene, "snapshot", width=384, height=240,
+                start_frame=1, end_frame=2, apply_marker_shaders=False,
+            )
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            self.assertTrue(original["ok"], original.get("error"))
+            self.assertEqual(original["frame_count"], 2)
+            self.assertEqual(original["render_profile"], "hmb_blender_workbench_midgray_v1")
+            for index in (0, 1):
+                frame = directory / "snapshot" / "frames" / ("preview.{:06d}.png".format(index))
+                with Image.open(frame) as image:
+                    self.assertGreater(ImageStat.Stat(image.convert("L")).stddev[0], 10)
+            if retained:
+                shutil.copytree(directory / "snapshot", destination / "snapshot", dirs_exist_ok=True)
+
+    def test_extended_solid_colors_survive_pattern_render_path(self):
+        with tempfile.TemporaryDirectory(prefix="hmb-blender-palette-pattern-") as temporary:
+            directory = Path(temporary)
+            scene = self._make_scene(directory)
+            job, result, process = self._run_job(
+                directory, scene, "render", width=320, height=200,
+                start_frame=1, end_frame=1, apply_marker_shaders=True,
+                bindings=[
+                    {"full_dag_path": "|Cube", "color": "Cyan", "enabled": True},
+                    {"full_dag_path": "|PatternSky", "color": "Lavender", "enabled": True},
+                    {"full_dag_path": "|PatternFloor", "color": "Sky Grid", "enabled": True},
+                ],
+            )
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            self.assertTrue(result["ok"], result.get("error"))
+            self.assertEqual(result["render_profile"], "hmb_blender_eevee_world_patterns_v1")
+            with Image.open(Path(job["frames_folder"]) / "preview.000000.png") as image:
+                pixels = list(image.convert("RGB").get_flattened_data())
+                # Raw emission keeps the new solids distinct from the pure
+                # cyan Pattern ID and from one another in the mixed pass.
+                self.assertGreater(sum(max(abs(channel - expected) for channel, expected in zip(pixel, (0, 217, 217))) <= 2 for pixel in pixels), 100)
+                self.assertGreater(sum(max(abs(channel - expected) for channel, expected in zip(pixel, (184, 166, 217))) <= 2 for pixel in pixels), 100)
+
     def test_scripted_driver_is_reported_and_render_fails_closed(self):
         with tempfile.TemporaryDirectory(prefix="hmb-blender-driver-") as temporary:
             directory = Path(temporary)

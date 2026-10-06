@@ -657,8 +657,8 @@ def _load_marker_catalog() -> Dict[str, Any]:
     actor = [dict(item) for item in payload.get("character", []) if isinstance(item, dict)]
     object_items = [dict(item) for item in payload.get("background", []) if isinstance(item, dict)]
     names = [_clean_catalog_name(item.get("name")) for item in actor + object_items]
-    if len(actor) != 7 or len(object_items) != 7 or len(names) != len(set(names)) or any(not name for name in names):
-        raise RuntimeError("HMB marker catalog must contain seven unique Actor choices and seven unique Object choices.")
+    if (len(actor), len(object_items)) not in {(7, 7), (8, 8)} or len(names) != len(set(names)) or any(not name for name in names):
+        raise RuntimeError("HMB marker catalog must contain the legacy 7/7 or extended 8/8 unique Actor/Object choices.")
     pattern_ids = []
     for item in object_items:
         if _clean_catalog_name(item.get("kind")).lower() != "pattern":

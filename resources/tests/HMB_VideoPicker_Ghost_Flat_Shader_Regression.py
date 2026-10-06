@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -18,10 +20,31 @@ spec = importlib.util.spec_from_file_location("hmb_ghost_flat_shader_regression"
 assert spec and spec.loader
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
+catalog_path = ROOT / "resources" / "picker" / "HMB_Marker_Catalog.json"
+catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
 runner._load_marker_catalog({
-    "marker_catalog_path": str(ROOT / "resources" / "picker" / "HMB_Marker_Catalog.json"),
-    "marker_catalog_version": 4,
+    "marker_catalog_path": str(catalog_path),
+    "marker_catalog_version": catalog["version"],
 })
+assert len(runner.CHARACTER_MARKERS) == 8
+assert len(runner.BACKGROUND_MARKERS) == 8
+assert len(runner.MARKER_OPTIONS) == 16
+assert runner.MARKER_COLORS["Cyan"] == (0.0, 217 / 255, 217 / 255)
+assert runner.MARKER_COLORS["Lavender"] == (184 / 255, 166 / 255, 217 / 255)
+solid_rgb8 = {
+    name: tuple(round(channel * 255) for channel in rgb)
+    for name, rgb in runner.MARKER_COLORS.items()
+}
+assert len(set(solid_rgb8.values())) == len(solid_rgb8), "Actor/Ghost solid colors overlap"
+actor_rgb8 = {solid_rgb8[name] for name in runner.CHARACTER_MARKERS}
+ghost_rgb8 = {solid_rgb8[name] for name in runner.BACKGROUND_MARKERS if name in solid_rgb8}
+assert actor_rgb8.isdisjoint(ghost_rgb8), "Actor/Ghost categories share an RGB color"
+pattern_ids = set(runner.MARKER_PATTERN_IDS.values())
+assert len(pattern_ids) == 4
+assert set(solid_rgb8.values()).isdisjoint(pattern_ids), "Solid marker aliases a reserved Pattern ID"
+for color in ("Cyan", "Lavender"):
+    rgb8 = tuple(round(channel * 255) for channel in runner.MARKER_COLORS[color])
+    assert rgb8 not in pattern_ids, "New solid marker aliases a screen-space Pattern ID"
 
 
 class ShaderCommands:
@@ -71,7 +94,7 @@ class ShaderCommands:
 fake = ShaderCommands()
 runner.cmds = fake
 assignments = {}
-alpha_shapes = {"|GhostMint|shape"}
+alpha_shapes = {"|GhostMint|shape", "|GhostLavender|shape"}
 runner._descendant_shapes = lambda root: [root + "|shape"]
 runner._marker_renderable_shapes = lambda shapes: [item for item in shapes if "Hidden" not in item]
 runner._long_names = lambda names: list(names)
@@ -99,6 +122,7 @@ ghosts = [
     {"color": "Sky Blue", "asset_id": "GhostSky", "subject_root": "|GhostSky"},
     {"color": "Mint", "asset_id": "GhostMint", "subject_root": "|GhostMint"},
     {"color": "Beige", "asset_id": "GhostBeige", "subject_root": "|GhostBeige"},
+    {"color": "Lavender", "asset_id": "GhostLavender", "subject_root": "|GhostLavender"},
     {"color": "Sky Blue", "asset_id": "GhostRepeat", "subject_root": "|GhostRepeat"},
 ]
 hidden = {"color": "Mint", "asset_id": "HiddenGhost", "subject_root": "|HiddenGhost"}
@@ -106,7 +130,7 @@ job = {"result_path": str(ROOT / "reports" / "unused-ghost-result.json")}
 warnings = runner._apply_marker_shaders(actors + ghosts + [hidden], job)
 assert len(warnings) == 1 and "authored-hidden" in warnings[0]
 assert "|HiddenGhost|shape" not in assignments
-assert job["_marker_cutout_transparency"]["verified_shape_path_count"] == 1
+assert job["_marker_cutout_transparency"]["verified_shape_path_count"] == 2
 
 for record in actors + ghosts:
     shape = record["subject_root"] + "|shape"
@@ -151,4 +175,25 @@ for record in payload[len(actors):]:
     assert record["shading_profile"]["specular"] is False
     assert record["shading_profile"]["receives_shadows"] is False
 
-print("HMB VideoPicker Ghost flat shader: PASS (3 exact palette colors, 7 unchanged Actors, alpha cutout, repeat color, recolor and hidden-object isolation)")
+# Legacy catalogs embedded in existing jobs retain their original RGB/shaders.
+legacy_catalog = copy.deepcopy(catalog)
+legacy_catalog["version"] = 4
+legacy_catalog["character"] = [row for row in catalog["character"] if row["name"] != "Cyan"]
+legacy_catalog["background"] = [row for row in catalog["background"] if row["name"] != "Lavender"]
+with tempfile.TemporaryDirectory(prefix="hmb-maya-legacy-palette-") as directory:
+    legacy_path = Path(directory) / "catalog.json"
+    legacy_path.write_text(json.dumps(legacy_catalog), encoding="utf-8")
+    runner._load_marker_catalog({"marker_catalog_path": str(legacy_path), "marker_catalog_version": 4})
+    assert len(runner.MARKER_OPTIONS) == 14
+    assert len(runner.CHARACTER_MARKERS) == 7
+    assert len(runner.BACKGROUND_MARKERS) == 7
+    assert "Cyan" not in runner.MARKER_OPTIONS and "Lavender" not in runner.MARKER_OPTIONS
+    assert runner.MARKER_PATTERN_IDS == {
+        row["name"]: tuple(row["screen_space_id_rgb"])
+        for row in legacy_catalog["background"] if row["kind"] == "pattern"
+    }
+    for row in legacy_catalog["character"] + legacy_catalog["background"]:
+        if row["kind"] == "solid":
+            assert runner.MARKER_COLORS[row["name"]] == tuple(row["rgb"])
+
+print("HMB VideoPicker Ghost flat shader: PASS (4 exact Ghost colors, 8 Actors, legacy 14-choice jobs, Pattern ID separation, alpha cutout, repeat color, recolor and hidden-object isolation)")

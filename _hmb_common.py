@@ -247,11 +247,13 @@ ACTOR_COLOR_PICK_CHOICES = [
     "Orange",
     "Purple",
     "Pink",
+    "Cyan",
 ]
 GHOST_COLOR_PICK_CHOICES = [
     "Sky Blue",
     "Mint",
     "Beige",
+    "Lavender",
 ]
 PATTERN_COLOR_PICK_CHOICES = [
     "Direction Checker",

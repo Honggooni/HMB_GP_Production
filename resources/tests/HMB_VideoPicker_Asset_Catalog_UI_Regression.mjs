@@ -465,7 +465,7 @@ assert.ok(
   paletteIndex >= 0
     && paletteIndex < ghostPaletteIndex
     && ghostPaletteIndex < objectPaletteIndex,
-  "The compact Actor/Ghost/Object Color Assignment rows remain ordered 7/3/4.",
+  "The compact Actor/Ghost/Object Color Assignment rows remain ordered 8/4/4.",
 );
 assert.ok(outlinerIndex >= 0, "The asset-root Outliner remains available for cut authoring.");
 assert.ok(

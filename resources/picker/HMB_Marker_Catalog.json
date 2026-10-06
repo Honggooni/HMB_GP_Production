@@ -1,6 +1,6 @@
 {
   "schema": "hmb-marker-catalog",
-  "version": 4,
+  "version": 5,
   "character": [
     {"name": "Red", "kind": "solid", "rgb": [1.0, 0.0, 0.0]},
     {"name": "Green", "kind": "solid", "rgb": [0.0, 1.0, 0.0]},
@@ -8,12 +8,14 @@
     {"name": "Yellow", "kind": "solid", "rgb": [1.0, 0.90, 0.0]},
     {"name": "Orange", "kind": "solid", "rgb": [1.0, 0.52, 0.18]},
     {"name": "Purple", "kind": "solid", "rgb": [0.57, 0.28, 1.0]},
-    {"name": "Pink", "kind": "solid", "rgb": [0.91, 0.30, 0.57]}
+    {"name": "Pink", "kind": "solid", "rgb": [0.91, 0.30, 0.57]},
+    {"name": "Cyan", "kind": "solid", "rgb": [0.0, 0.8509803921568627, 0.8509803921568627]}
   ],
   "background": [
     {"name": "Sky Blue", "kind": "solid", "rgb": [0.36, 0.72, 1.0]},
     {"name": "Mint", "kind": "solid", "rgb": [0.40, 0.92, 0.73]},
     {"name": "Beige", "kind": "solid", "rgb": [0.86, 0.78, 0.64]},
+    {"name": "Lavender", "kind": "solid", "rgb": [0.7215686274509804, 0.6509803921568628, 0.8509803921568627]},
     {
       "name": "Direction Checker",
       "kind": "pattern",

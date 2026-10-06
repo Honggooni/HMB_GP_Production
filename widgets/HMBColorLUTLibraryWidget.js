@@ -273,7 +273,7 @@ export default function HMBColorLUTLibraryWidget(container, props = {}) {
   if (container.__hmbColorLUTController) { container.__hmbColorLUTController.update(props); return container.__hmbColorLUTController; }
   let latestProps = props, state = hmbColorLUTState(props), disposed = false, visible = true, sourceRevision = 0;
   let renderer = null, video = null, sourceKey = "", drawFrame = 0, playbackFrame = 0, videoFrame = 0, commitTimer = 0;
-  let mode = "compare", wipe = 0.5, cubeKey = "", pendingCube = null, pendingShot = null, localMessage = "", pendingEdit = false, lastSeek = 0;
+  let mode = "compare", wipe = 0.5, cubeKey = "", pendingCube = null, pendingShot = null, localMessage = "", pendingEdit = false, lastSeek = 0, responseRevision = 0;
   const cleanups = [], videoCleanups = [], settingsCache = new Map(), cubeCache = new Map();
   const doc = container.ownerDocument || globalThis.document, win = doc?.defaultView || globalThis;
   const raf = (fn) => win.requestAnimationFrame(fn), caf = (id) => { if (id) win.cancelAnimationFrame(id); };
@@ -281,6 +281,10 @@ export default function HMBColorLUTLibraryWidget(container, props = {}) {
   const cacheKey = (s = state) => `${s.project_id}\u001f${s.shot.channel_uuid}\u001f${s.shot.shot_uuid}`;
   const shotKey = (s) => s.shot.shot_uuid
     ? `${s.shot.channel_uuid}\u001f${s.shot.shot_uuid}` : HMB_COLOR_LUT_ONLY_SHOT_VALUE;
+  // Transport completions belong to the intent that created them, not merely
+  // to a matching Project/Shot (which can leave and return before completion).
+  const responseStateKey = () => JSON.stringify([state.revision, cacheKey(), state.settings, state.source, state.output, state.preset_name, state.status, state.result]);
+  const acceptResponseState = (previousKey) => { if (responseStateKey() !== previousKey) responseRevision++; };
   const q = (selector) => container.querySelector?.(selector), all = (selector) => Array.from(container.querySelectorAll?.(selector) || []);
   container.innerHTML = hmbRenderColorLUTWidget(state); // The only mount: updates patch existing controls and preserve the canvas.
   container.classList?.add("nodrag"); container.setAttribute?.("data-hmb-node-delete-protected", "true");
@@ -404,25 +408,28 @@ export default function HMBColorLUTLibraryWidget(container, props = {}) {
     if (commitTimer) { win.clearTimeout(commitTimer); commitTimer = 0; }
     if (disposed) return false;
     pendingEdit = false; state.revision++; settingsCache.set(cacheKey(), copy(state.settings));
+    const token = ++responseRevision, current = () => !disposed && token === responseRevision;
     if (typeof latestProps.onChange !== "function") { if (shotSelection) pendingShot = null; say(textFor(state).transportError); return false; }
     const captured = copy(state);
     const shotRequest = shotSelection ? pendingShot : null;
-    try { Promise.resolve(latestProps.onChange(captured)).catch((error) => { if (!disposed) { if (shotRequest && pendingShot === shotRequest) pendingShot = null; say(`${textFor(state).transportError}: ${error.message || error}`); } }); return true; }
-    catch (error) { if (shotRequest && pendingShot === shotRequest) pendingShot = null; say(`${textFor(state).transportError}: ${error.message || error}`); return false; }
+    try { Promise.resolve(latestProps.onChange(captured)).catch((error) => { if (current()) { if (shotRequest && pendingShot === shotRequest) pendingShot = null; say(`${textFor(state).transportError}: ${error.message || error}`); } }); return true; }
+    catch (error) { if (current()) { if (shotRequest && pendingShot === shotRequest) pendingShot = null; say(`${textFor(state).transportError}: ${error.message || error}`); } return false; }
   };
-  const scheduleCommit = () => { pendingEdit = true; if (commitTimer) win.clearTimeout(commitTimer); commitTimer = win.setTimeout(publish, 180); };
+  const scheduleCommit = () => { responseRevision++; pendingEdit = true; if (commitTimer) win.clearTimeout(commitTimer); commitTimer = win.setTimeout(publish, 180); };
   const command = (action) => {
     if (commitTimer) { win.clearTimeout(commitTimer); commitTimer = 0; } pendingEdit = false;
     state.output.path = clean(q("[data-output-path]").value);
     state.preset_name = clean(q("[data-profile-name]").value, 80);
     state.revision++; settingsCache.set(cacheKey(), copy(state.settings)); const captured = copy(state), request = hmbColorLUTCommand(action, captured);
+    const token = ++responseRevision, current = () => !disposed && token === responseRevision;
     try {
       let result;
       if (typeof latestProps.onCommand === "function") result = latestProps.onCommand(JSON.stringify(request));
       else if (typeof latestProps.onChange === "function") result = latestProps.onChange({ ...captured, [HMB_COLOR_LUT_COMMAND_FIELD]: request });
       else throw new Error(textFor(state).transportError);
-      say(textFor(state).pending); sync(); Promise.resolve(result).catch((error) => { if (!disposed) say(`${textFor(state).commandError}: ${error.message || error}`); });
-    } catch (error) { say(`${textFor(state).commandError}: ${error.message || error}`); }
+      if (current()) { say(textFor(state).pending); sync(); }
+      Promise.resolve(result).catch((error) => { if (current()) say(`${textFor(state).commandError}: ${error.message || error}`); });
+    } catch (error) { if (current()) say(`${textFor(state).commandError}: ${error.message || error}`); }
   };
   const switchContext = (mutate) => {
     if (pendingEdit) publish(); settingsCache.set(cacheKey(), copy(state.settings)); pause();
@@ -475,6 +482,7 @@ export default function HMBColorLUTLibraryWidget(container, props = {}) {
     update(nextProps = {}) {
       if (disposed) return;
       latestProps = nextProps; const incoming = hmbColorLUTState(nextProps), sameShot = incoming.shot.channel_uuid === state.shot.channel_uuid && incoming.shot.shot_uuid === state.shot.shot_uuid;
+      const previousResponseState = responseStateKey();
       if (pendingShot) {
         const incomingKey = shotKey(incoming);
         if (incomingKey === pendingShot.targetKey) pendingShot = null;
@@ -487,6 +495,7 @@ export default function HMBColorLUTLibraryWidget(container, props = {}) {
           if (!targetAvailable && catalogAdvanced) {
             pendingShot = null;
             settingsCache.set(cacheKey(), copy(state.settings)); state = incoming; settingsCache.set(cacheKey(), copy(state.settings));
+            acceptResponseState(previousResponseState);
             sync(); return;
           }
           if (pendingShot.blockedKeys.has(incomingKey)) {
@@ -501,12 +510,13 @@ export default function HMBColorLUTLibraryWidget(container, props = {}) {
         if (sameShot && incoming.revision >= state.revision) { state.source = incoming.source; state.status = incoming.status; state.result = incoming.result; state.revision = incoming.revision; }
         if (incoming.shot_catalog.generation >= (state.shot_catalog.generation || 0)) state.shot_catalog = incoming.shot_catalog;
       } else { settingsCache.set(cacheKey(), copy(state.settings)); state = incoming; settingsCache.set(cacheKey(), copy(state.settings)); }
+      acceptResponseState(previousResponseState);
       if (state.status.message || state.status.phase !== "idle") localMessage = "";
       sync();
     },
     cleanup() {
       if (disposed) return;
-      if (pendingEdit) publish(); disposed = true;
+      if (pendingEdit) publish(); disposed = true; responseRevision++;
       pendingShot = null;
       if (commitTimer) win.clearTimeout(commitTimer); clearVideo(); observer?.disconnect();
       cancelPendingCube(); for (const cleanup of cleanups.splice(0)) cleanup(); renderer?.dispose(); renderer = null; settingsCache.clear(); cubeCache.clear();
