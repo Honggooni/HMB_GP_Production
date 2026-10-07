@@ -79,6 +79,12 @@ SOURCE_FILES = (*RUNTIME_INSTALL_FILES, *DISTRIBUTION_ONLY_FILES)
 CANONICAL_CRLF_SOURCE_FILES = {
     PurePosixPath("Install_HMB_GP_Production.ps1"),
 }
+CANONICAL_LF_SOURCE_FILES = {
+    PurePosixPath(relative)
+    for relative in SOURCE_FILES
+    if PurePosixPath(relative).suffix.casefold() in {".py", ".js", ".json", ".md"}
+    or relative == "LICENSE"
+}
 if len(RUNTIME_INSTALL_FILES) != 29 or len(DISTRIBUTION_ONLY_FILES) != 4:
     raise RuntimeError("Runtime/distribution release boundary count mismatch.")
 if set(RUNTIME_INSTALL_FILES) & set(DISTRIBUTION_ONLY_FILES):
@@ -209,12 +215,14 @@ def synchronize_bundled_agent_policy() -> dict[str, str]:
 
 
 def canonical_release_source_data(member: PurePosixPath, data: bytes) -> bytes:
-    """Make audited Windows text payloads checkout-independent."""
+    """Canonicalize declared release text without altering signed/binary bytes."""
 
-    if member not in CANONICAL_CRLF_SOURCE_FILES:
-        return data
-    normalized = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-    return normalized.replace(b"\n", b"\r\n")
+    if member in CANONICAL_CRLF_SOURCE_FILES:
+        normalized = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        return normalized.replace(b"\n", b"\r\n")
+    if member in CANONICAL_LF_SOURCE_FILES:
+        return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return data
 
 
 def release_version_parts(release_version: str) -> tuple[int, int, int]:
