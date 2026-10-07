@@ -68,7 +68,7 @@ except Exception:
 MAX_IMAGES = 50
 MAX_SHOT_IMAGES = MAX_IMAGES
 MAX_VIDEOS = 10
-PICKER_DEPTH_PROFILE = "hmb_camera_space_depth_v7"
+PICKER_DEPTH_PROFILE = "hmb_camera_space_depth_v8"
 PICKER_MOTION_GUIDE_PROFILE = "hmb_target_neutral_motion_guide_v5"
 BLENDER_DEPTH_PROFILE = "hmb_blender_camera_depth_v1"
 BLENDER_MOTION_GUIDE_PROFILE = "hmb_blender_motion_guide_v1"

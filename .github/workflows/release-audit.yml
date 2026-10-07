@@ -181,6 +181,7 @@ jobs:
             "HMB_Cutout_Transparency_Regression.py",
             "HMB_Depth_Companion_Regression.py",
             "HMB_Picker_Depth_Range_Mesh_Regression.py",
+            "HMB_VideoPicker_Snapshot_Navigation_Revision_Regression.py",
             "HMB_VideoPicker_Reliability_Regression.py",
             "HMB_VideoPicker_Isolated_Maya_Capture_Regression.py",
             "HMB_VideoPicker_Blender_Cross_Shot_Mask_Regression.py",
@@ -190,8 +191,12 @@ jobs:
             "HMB_VideoPicker_Clear_Color_Regression.py",
             "HMB_VideoPicker_Ghost_Flat_Shader_Regression.py",
             "HMB_Depth_Visual_Contract_Regression.py",
+            "HMB_Screen_Space_Pattern_Regression.py",
+            "HMB_Maya_Depth_Close_Focus_Regression.py",
+            "HMB_Maya_Depth_Visible_Floor_Regression.py",
             "HMB_Maya_Runner_Performance_Regression.py",
             "HMB_Maya_Capture_Pass_Isolation_Regression.py",
+            "HMB_Maya_Render_Layer_Isolation_Regression.py",
             "HMB_Mouth_Card_Inner_Patch_Regression.py",
             "HMB_Motion_Guide_Regression.py",
             "HMB_Prompt_Field_Authority_Regression.py",
@@ -250,7 +255,8 @@ jobs:
             "HMB_VideoPicker_No_Loss_State_Regression.py",
             "HMB_VideoPicker_Publisher_Replacement_Regression.py",
             "HMB_VideoPicker_Server_Media_Reload_Regression.py",
-            "HMB_VideoPicker_Snapshot_History_Regression.py"
+            "HMB_VideoPicker_Snapshot_History_Regression.py",
+            "HMB_VideoPicker_Selected_Pass_Snapshot_Regression.py"
           )
           foreach ($test in $tests) {
             python (Join-Path "resources/tests" $test)
@@ -355,10 +361,10 @@ jobs:
             "- Fixes Maya Original PNG capture when scenes use EXR and isolates Mask, Depth and Motion capture failures; verified Serial evaluation with one DG retry preserves completed outputs, existing visibility scope, timing and source scenes.",
             "- Extends the same Video Picker to Blender .blend scenes with automatic installed-engine selection, camera/frame/FPS discovery, snapshots and Original/Mask/Depth/Motion outputs; existing Maya .mb/.ma commands remain supported.",
             "- Keeps generated companions in the Shot and scene bundle captured at Generate, including delayed terminal results and cross-Shot Blender mask bindings.",
-            "- Removes snapshot wraparound flicker by retaining the displayed frame until its replacement is ready; preserves playback, frame stepping and video editing controls.",
+            "- Prevents stale Snapshot history and delayed replies from flashing the previous image during navigation; preserves playback, frame stepping and video editing controls.",
             "- Updates Picker color assignment, clearing, multi-selection and local controls in-place; prevents stale replies from reverting Shot, tab, palette or editing choices.",
             "- Preserves focused Prompt controls and open type selectors through updates, hydrates imported image thumbnails asynchronously and spreads Color LUT preview work across short tasks.",
-            "- Uses a temporary mid-gray Original Playblast shader with gentle shading and no source-texture dependency; original scene materials are restored after capture.",
+            "- Uses temporary mid-gray Original shading while preserving authored Eye materials, with Maya Lambert fallback when the shader plugin is unavailable; source scene materials are restored after capture.",
             "- Preserves Ghost flat-color and Actor shading behavior, character-only Finish Look Beauty controls and authoritative progress/error updates across libraries.",
             "- New Seedance nodes use Seedance 2.5, 720p, 16:9, four seconds, audio off and MOV; saved workflow settings and Seedance 2.0 MP4 compatibility are preserved.",
             "- Adds a Broker settings icon beside Model with per-node HTTPS server selection, origin-specific login tokens and saved-task server binding; hidden command/settings rows no longer leave blank spacing.",
@@ -370,6 +376,9 @@ jobs:
             "- Adds Cyan Actor and Lavender Ghost presets with distinct color identities throughout Picker, Prompt binding and Maya/Blender outputs; existing presets and shaders remain unchanged.",
             "- Prevents delayed Color LUT state/command failures from overwriting newer edits or accepted Project/Shot results, including pending slider edits and leave-and-return navigation; current errors remain visible.",
             "- Refreshes persistence, sanitizer and Picker-to-Seedance fixtures for current host APIs and model limits, and adds production-controller asynchronous ownership regression coverage.",
+            "- Fixes compact Video Picker and Color LUT bottom clipping after delayed host size allocation and preserves expanded layouts.",
+            "- Captures only checked Original, Mask and Depth Snapshot passes and applies assigned Outliner Mask colors; Snapshot deletion updates immediately with rollback and stale-response protection.",
+            "- Corrects black oversized Depth floors using visible mesh surfaces and emphasizes close characters and nearby context without excluding distant scene geometry; keeps flat grayscale per mesh and a stable sequence range.",
             "- Includes the manifest-verified runtime installer and SHA256 checksum. Private policy source files, signing keys, and server configuration are not distributed.",
             "",
             "Close Griptape completely before running the included installer."

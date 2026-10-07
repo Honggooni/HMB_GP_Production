@@ -14,8 +14,9 @@ const pythonSource = fs.readFileSync(
 const visibleWidgetOptions = pythonSource.match(
   /def _configure_picker_widget_parameter[\s\S]*?options\.update\(\{([\s\S]*?)\n\s*\}\)/,
 );
+// Preserve the actual UI contract extraction on both Windows CRLF and LF.
 const newWidgetOptions = pythonSource.match(
-  /def _add_picker_widget[\s\S]*?"ui_options": \{([\s\S]*?)\n\s*\},\n\s*\}/,
+  /def _add_picker_widget[\s\S]*?"ui_options": \{([\s\S]*?)\r?\n\s*\},\r?\n\s*\}/,
 );
 assert.ok(visibleWidgetOptions, "Existing Picker state rows must expose an explicit UI contract.");
 assert.ok(newWidgetOptions, "New Picker state rows must expose an explicit UI contract.");

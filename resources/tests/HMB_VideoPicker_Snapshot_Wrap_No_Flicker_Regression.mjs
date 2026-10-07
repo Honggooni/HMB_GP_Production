@@ -236,4 +236,51 @@ const cropState = {
 picker.hmbApplySnapshotNavigationFeedback(tool.container, firstSnapshot, {}, 1, 24, cropState);
 assert.equal(tool.stage.created.length, 0);
 assert.equal(tool.stage.video.hidden, false);
-console.log("Snapshot wrap, predecode, rapid clicks, video transition, Shot ownership and failure: PASS");
+// Progress may carry the previous Snapshot aliases while the interaction
+// draft protects a newer cursor. Canonical immutable history must own both
+// image and pass identity before the decode helper is given a source URL.
+const roleHistory = ["original", "mask", "depth"].map((artifact_type, index) => ({
+  snapshot_uid: `role-${artifact_type}`, artifact_type, snapshot_batch_uid: "batch-145",
+  frame: 145, video_slot: 1, created_at_ms: index + 1,
+  path: `C:/snapshot/${artifact_type}.png`, url: `file:///C:/snapshot/${artifact_type}.png`,
+}));
+for (const oldIndex of [0, 1, 2]) for (const newIndex of [0, 1, 2]) {
+  if (oldIndex === newIndex) continue;
+  const oldSnapshot = roleHistory[oldIndex], selected = roleHistory[newIndex];
+  const oldState = { runtime_instance_id: "snapshot-cursor", scene_path: "C:/scene.mb",
+    state_revision: 10, state_published_at_ms: 100, state_writer: "python",
+    viewport_mode: "snapshot", snapshot_active: true, snapshots: roleHistory, videos: [],
+    active_snapshot_uid: oldSnapshot.snapshot_uid, snapshot_frame: 145, snapshot_video_slot: 1,
+    snapshot_path: oldSnapshot.path, snapshot_url: oldSnapshot.url };
+  const localState = { ...oldState, state_revision: 11, state_published_at_ms: 200,
+    state_writer: "widget", active_snapshot_uid: selected.snapshot_uid,
+    snapshot_path: selected.path, snapshot_url: selected.url };
+  const draftOwner = {};
+  picker.hmbRememberPickerInteractionDraft(draftOwner, localState, oldState);
+  picker.hmbStampPickerInteractionDraft(draftOwner, localState);
+  // ACK the latest publication first, then deliver crossed old progress twice.
+  picker.hmbProtectPickerInteractionDraft(draftOwner, { ...localState, state_writer: "python",
+    frontend_seen_revision: 11 });
+  for (const revision of [9, 10]) {
+    const projected = picker.hmbProtectPickerInteractionDraft(draftOwner,
+      { ...oldState, state_revision: revision, message: `Late progress ${revision}` });
+    assert.equal(projected.state.active_snapshot_uid, selected.snapshot_uid);
+    assert.equal(projected.state.snapshot_url, oldSnapshot.url, "This reproduces mixed stale scalar aliases.");
+    const descriptor = picker.hmbVideoPickerPreviewDescriptor(projected.state);
+    const normalized = picker.hmbVideoPickerMediaFrameContext(projected.state).state;
+    assert.equal(descriptor.uid, selected.snapshot_uid);
+    assert.equal(descriptor.url, selected.url, "The previous frame must not become the protected cursor's image.");
+    assert.equal(normalized.snapshot_artifact_type, selected.artifact_type);
+    assert.equal(normalized.message, `Late progress ${revision}`, "Backend status must remain live.");
+    assert.deepEqual(normalized.snapshots.map(item => [item.snapshot_uid, item.url, item.artifact_type]),
+      roleHistory.map(item => [item.snapshot_uid, item.url, item.artifact_type]), "Stale scalars cannot rewrite history.");
+  }
+}
+// Old workflows with only scalar Snapshot fields still synthesize history.
+const legacyDescriptor = picker.hmbVideoPickerPreviewDescriptor({ viewport_mode: "snapshot",
+  snapshot_active: true, snapshot_video_slot: 1, snapshot_frame: 7,
+  active_snapshot_uid: "legacy", snapshot_path: "C:/snapshot/legacy.png",
+  snapshot_url: "file:///C:/snapshot/legacy.png", snapshots: [] });
+assert.equal(legacyDescriptor.uid, "legacy");
+assert.equal(legacyDescriptor.url, "file:///C:/snapshot/legacy.png");
+console.log("Snapshot wrap, predecode, rapid clicks, video transition, Shot ownership, immutable history and failure: PASS");

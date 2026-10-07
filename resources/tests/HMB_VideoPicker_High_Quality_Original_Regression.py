@@ -265,8 +265,31 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
             "solid_render_mode_verified": True,
             "soft_shading_verified": True,
             "authored_materials_ignored": True,
+            "authored_material_ignore_scope": "non_eye_surfaces",
             "textures_ignored": True,
             "opaque_surface_verified": True,
+            "eye_materials_preserved": True,
+            "eye_assignments_preserved": True,
+            "eye_textures_enabled": False,
+            "textured_render_mode_verified": False,
+            "preserved_eye_shape_count": 0,
+            "preserved_eye_component_count": 0,
+            "preserved_eye_shading_engine_count": 0,
+            "split_shading_engine_count": 0,
+            "split_body_member_count": 0,
+            "eye_texture_dependency_count": 0,
+            "eye_missing_texture_dependency_count": 0,
+            "eye_unavailable_plugin_dependency_count": 0,
+            "eye_dependency_preflight_passed": True,
+            "eye_unavailable_plugin_nodes": [],
+            "eye_fallback_policy": "maya_default_shader_for_unavailable_eye_dependencies_v1",
+            "eye_fallback_applied": False,
+            "eye_fallback_verified": False,
+            "eye_fallback_shading_engine_count": 0,
+            "eye_fallback_shape_count": 0,
+            "eye_fallback_material_count": 0,
+            "eye_fallback_texture_connection_count": 0,
+            "eye_fallback_records": [],
             "base_color": [0.5, 0.5, 0.5],
             "fill_color": [0.22, 0.22, 0.22],
             "diffuse": 0.45,
@@ -294,8 +317,89 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
         scene_path, state, video_path, sidecar_path
     )
 
-    # A matching profile alone must not accept textured or heavily shadowed
-    # output, an un-restored temporary assignment, or a non-neutral shader.
+    # A fully restored shared head-eye/body capture can use textured VP2.
+    # Cache reuse requires explicit proof that only authored eyes kept textures.
+    eye_sidecar = copy.deepcopy(current_sidecar)
+    eye_report = eye_sidecar["original_material_override_report"]
+    eye_report.update({
+        "solid_render_mode_verified": False,
+        "textured_render_mode_verified": True,
+        "eye_textures_enabled": True,
+        "preserved_eye_shape_count": 1,
+        "preserved_eye_component_count": 4,
+        "preserved_eye_shading_engine_count": 1,
+        "split_shading_engine_count": 1,
+        "split_body_member_count": 1,
+        "swapped_shading_engine_count": 0,
+        "eye_texture_dependency_count": 4,
+    })
+    sidecar_path.write_text(json.dumps(eye_sidecar, ensure_ascii=False, indent=2), encoding="utf-8")
+    assert picker._original_preview_cache_is_valid(scene_path, state, video_path, sidecar_path)
+    for field, invalid_value in (
+        ("eye_materials_preserved", False), ("eye_assignments_preserved", False),
+        ("eye_dependency_preflight_passed", False), ("eye_textures_enabled", False),
+        ("solid_render_mode_verified", True), ("textured_render_mode_verified", False),
+        ("preserved_eye_shape_count", 0), ("preserved_eye_component_count", True),
+        ("preserved_eye_shading_engine_count", 0), ("split_body_member_count", 0),
+        ("eye_missing_texture_dependency_count", 1), ("eye_unavailable_plugin_dependency_count", 1),
+        ("authored_material_ignore_scope", "all_surfaces"),
+    ):
+        invalid_eye_sidecar = copy.deepcopy(eye_sidecar)
+        invalid_eye_sidecar["original_material_override_report"][field] = invalid_value
+        sidecar_path.write_text(json.dumps(invalid_eye_sidecar, ensure_ascii=False, indent=2), encoding="utf-8")
+        assert not picker._original_preview_cache_is_valid(
+            scene_path, state, video_path, sidecar_path,
+        ), field
+    sidecar_path.write_text(json.dumps(current_sidecar, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # A verified, fully restored native fallback is reusable. Its explicit
+    # unavailable dependency and native shader evidence must agree in the cache.
+    fallback_sidecar = copy.deepcopy(eye_sidecar)
+    fallback_report = fallback_sidecar["original_material_override_report"]
+    unavailable_dependency = {
+        "node": "EyeMat", "node_type": "unknown", "state": "unavailable",
+        "plugin": "redshift4maya", "real_class": "RedshiftMaterial",
+    }
+    fallback_report.update({
+        "eye_fallback_applied": True, "eye_fallback_verified": True,
+        "eye_fallback_shading_engine_count": 1, "eye_fallback_shape_count": 1,
+        "eye_fallback_material_count": 1, "eye_fallback_texture_connection_count": 2,
+        "eye_unavailable_plugin_dependency_count": 1,
+        "eye_unavailable_plugin_nodes": [copy.deepcopy(unavailable_dependency)],
+        "eye_fallback_records": [{
+            "shading_engine": "eyeSG", "source_shader_plug": "EyeMat.outColor",
+            "native_shader": "HMB_Original_EyeFallback_Lambert1",
+            "affected_shapes": ["|Hero|EyeShape"], "reason": "unavailable_plugin_dependency",
+            "unavailable_plugin_nodes": [copy.deepcopy(unavailable_dependency)],
+            "color_mode": "native_texture", "color_source": "EyeColor.outColor",
+            "color_value": [0.15, 0.35, 0.7], "texture_connection_count": 2,
+        }],
+    })
+    sidecar_path.write_text(json.dumps(fallback_sidecar, ensure_ascii=False, indent=2), encoding="utf-8")
+    assert picker._original_preview_cache_is_valid(scene_path, state, video_path, sidecar_path)
+    for field, invalid_value in (
+        ("eye_fallback_policy", "unverified"), ("eye_fallback_applied", False),
+        ("eye_fallback_verified", False), ("restore_ok", False),
+        ("eye_missing_texture_dependency_count", 1), ("eye_fallback_records", []),
+        ("eye_fallback_material_count", 2), ("eye_fallback_texture_connection_count", 1),
+        ("eye_unavailable_plugin_nodes", []),
+    ):
+        invalid_fallback_sidecar = copy.deepcopy(fallback_sidecar)
+        invalid_fallback_sidecar["original_material_override_report"][field] = invalid_value
+        sidecar_path.write_text(json.dumps(invalid_fallback_sidecar, ensure_ascii=False, indent=2), encoding="utf-8")
+        assert not picker._original_preview_cache_is_valid(scene_path, state, video_path, sidecar_path), field
+    missing_fallback_policy = copy.deepcopy(fallback_sidecar)
+    missing_fallback_policy["original_material_override_report"].pop("eye_fallback_policy")
+    sidecar_path.write_text(json.dumps(missing_fallback_policy, ensure_ascii=False, indent=2), encoding="utf-8")
+    assert not picker._original_preview_cache_is_valid(scene_path, state, video_path, sidecar_path)
+    forged_fallback_sidecar = copy.deepcopy(fallback_sidecar)
+    forged_fallback_sidecar["original_material_override_report"]["eye_fallback_records"][0]["native_shader"] = "EyeMat"
+    sidecar_path.write_text(json.dumps(forged_fallback_sidecar, ensure_ascii=False, indent=2), encoding="utf-8")
+    assert not picker._original_preview_cache_is_valid(scene_path, state, video_path, sidecar_path)
+    sidecar_path.write_text(json.dumps(current_sidecar, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # A matching profile alone must not accept a non-neutral body,
+    # unverified eye preservation, or an un-restored temporary assignment.
     valid_material_report = current_sidecar["original_material_override_report"]
     for key, invalid_value in (
         ("diffuse", 0.8),
@@ -336,8 +440,31 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
             "solid_render_mode_verified": True,
             "soft_shading_verified": True,
             "authored_materials_ignored": True,
+            "authored_material_ignore_scope": "non_eye_surfaces",
             "textures_ignored": True,
             "opaque_surface_verified": True,
+            "eye_materials_preserved": True,
+            "eye_assignments_preserved": True,
+            "eye_textures_enabled": False,
+            "textured_render_mode_verified": False,
+            "preserved_eye_shape_count": 0,
+            "preserved_eye_component_count": 0,
+            "preserved_eye_shading_engine_count": 0,
+            "split_shading_engine_count": 0,
+            "split_body_member_count": 0,
+            "eye_texture_dependency_count": 0,
+            "eye_missing_texture_dependency_count": 0,
+            "eye_unavailable_plugin_dependency_count": 0,
+            "eye_dependency_preflight_passed": True,
+            "eye_unavailable_plugin_nodes": [],
+            "eye_fallback_policy": "maya_default_shader_for_unavailable_eye_dependencies_v1",
+            "eye_fallback_applied": False,
+            "eye_fallback_verified": False,
+            "eye_fallback_shading_engine_count": 0,
+            "eye_fallback_shape_count": 0,
+            "eye_fallback_material_count": 0,
+            "eye_fallback_texture_connection_count": 0,
+            "eye_fallback_records": [],
             "base_color": [0.5, 0.5, 0.5],
             "fill_color": [0.22, 0.22, 0.22],
             "diffuse": 0.45,
@@ -382,6 +509,26 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
     assert not picker._original_preview_cache_is_valid(
         scene_path, state, video_path, sidecar_path
     ), "A textured material cache must not hide the neutral midgray profile."
+
+    # The immediately previous neutral profile grayed out eyes. A readable
+    # MP4 and otherwise valid metadata must not reuse that appearance.
+    gray_eye_v1_sidecar = copy.deepcopy(current_sidecar)
+    gray_eye_v1_sidecar[ORIGINAL_MATERIAL_PROFILE_FIELD] = "maya-midgray-solid-studio-v1"
+    gray_eye_v1_sidecar["original_material_override_report"]["profile"] = "maya-midgray-solid-studio-v1"
+    sidecar_path.write_text(
+        json.dumps(gray_eye_v1_sidecar, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    assert not picker._original_preview_cache_is_valid(
+        scene_path, state, video_path, sidecar_path
+    ), "The former gray-eye Original must be regenerated with authored eyes."
+
+    no_fallback_v2_sidecar = copy.deepcopy(current_sidecar)
+    no_fallback_v2_sidecar[ORIGINAL_MATERIAL_PROFILE_FIELD] = "maya-midgray-solid-studio-v2"
+    no_fallback_v2_sidecar["original_material_override_report"]["profile"] = "maya-midgray-solid-studio-v2"
+    sidecar_path.write_text(json.dumps(no_fallback_v2_sidecar, ensure_ascii=False, indent=2), encoding="utf-8")
+    assert not picker._original_preview_cache_is_valid(scene_path, state, video_path, sidecar_path), (
+        "The pre-fallback v2 profile must not hide the unavailable eye plug-in policy."
+    )
 
     textured_v4_sidecar = copy.deepcopy(current_sidecar)
     textured_v4_sidecar[ORIGINAL_MATERIAL_PROFILE_FIELD] = (
@@ -851,6 +998,19 @@ finally:
     runner._emit_console = original_emit_console
 
 
+
+
+def _mock_capture_render_layer():
+    return {"report": {"capture_layer": "defaultRenderLayer",
+                       "default_layer_verified": True, "restored": False,
+                       "restore_ok": False}}
+
+
+def _mock_restore_capture_render_layer(context):
+    context["report"].update({"restored": True, "restore_ok": True})
+
+runner._apply_capture_render_layer = _mock_capture_render_layer
+runner._restore_capture_render_layer = _mock_restore_capture_render_layer
 runner._open_scene_for_job = lambda _job: "C:/show/shot.mb"
 runner._resolve_camera = lambda camera: camera or "|shotCam"
 runner._load_marker_catalog = lambda _job: {}

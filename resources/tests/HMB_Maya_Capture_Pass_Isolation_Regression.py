@@ -26,6 +26,18 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
 
+
+
+def _mock_capture_render_layer():
+    return {"report": {"capture_layer": "defaultRenderLayer",
+                       "default_layer_verified": True, "restored": False,
+                       "restore_ok": False}}
+
+
+def _mock_restore_capture_render_layer(context):
+    context["report"].update({"restored": True, "restore_ok": True})
+
+
 class EvaluationCmds:
     def __init__(self, prior="parallel", *, fail_set=(), ignore_set=(), fail_read=False):
         self.mode = prior
@@ -106,6 +118,8 @@ def mocked_capture(cmds, calls, *, open_mode=None, fail_role="", wrong_role="", 
 
     replacements = {
         "cmds": cmds,
+        "_apply_capture_render_layer": _mock_capture_render_layer,
+        "_restore_capture_render_layer": _mock_restore_capture_render_layer,
         "_open_scene_for_job": open_scene,
         "_scan_scene": lambda *_args: {"ok": True, "operation": "scan"},
         "_load_marker_catalog": lambda _job: {},

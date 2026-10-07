@@ -117,10 +117,13 @@ PROXY_H264_LEVEL = "4.2"
 FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE = "hmb_full_smooth_geometry_v2"
 ORIGINAL_VIEWPORT_QUALITY_PROFILE = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
 ORIGINAL_MATERIAL_OVERRIDE_PROFILE = (
-    "maya-midgray-solid-studio-v1"
+    "maya-midgray-solid-studio-v3"
+)
+ORIGINAL_EYE_FALLBACK_POLICY = (
+    "maya_default_shader_for_unavailable_eye_dependencies_v1"
 )
 ORIGINAL_LAMBERT_ASSIGNMENT_MODE = (
-    "original_midgray_solid_studio"
+    "original_midgray_body_authored_eyes"
 )
 MOUTH_CARD_INNER_PATCH_POLICY = "temporary_mouth_alpha_inner_patch_v1"
 SCREEN_SPACE_PATTERN_PROFILE = "hmb_screen_space_pattern_post_v2"
@@ -137,7 +140,7 @@ MAYA_WORLD_PATTERN_PROJECTIONS = {
     "position_pattern": ("TriPlanar", "XYZ"),
     "sky_grid": ("TriPlanar", "XYZ"),
 }
-DEPTH_PLAYBLAST_PROFILE = "hmb_camera_space_depth_v7"
+DEPTH_PLAYBLAST_PROFILE = "hmb_camera_space_depth_v8"
 LEGACY_DEPTH_PLAYBLAST_PROFILES = frozenset({
     "hmb_camera_space_depth_v1",
     "hmb_camera_space_depth_v2",
@@ -145,7 +148,12 @@ LEGACY_DEPTH_PLAYBLAST_PROFILES = frozenset({
     "hmb_camera_space_depth_v4",
     "hmb_camera_space_depth_v5",
     "hmb_camera_space_depth_v6",
+    "hmb_camera_space_depth_v7",
 })
+DEPTH_VISIBLE_SURFACE_FALLBACK_POLICY = (
+    "out_of_range_bbox_camera_ray_surface_median_v1"
+)
+DEPTH_CLOSE_FOCUS_POLICY = "robust_compact_binding_local_context_v1"
 DEPTH_MEDIA_KIND = "maya_depth_playblast"
 DEPTH_SOURCE_TYPE = "Depth / Spatial Reference"
 DEPTH_CONTROL_ROLE = "Spatial Alignment Verification Only"
@@ -772,6 +780,247 @@ def _postprocess_screen_space_frames(
     return report
 
 
+def _validate_depth_visible_surface_fallback(
+    report: Any, *, shape_count: int, frame_values: Sequence[float],
+    far_distance: float, camera_near: float, camera_far: float,
+) -> Dict[str, Any]:
+    """Verify bounded flat-mesh correction for far-clamped visible surfaces."""
+    if not isinstance(report, dict):
+        raise RuntimeError("Depth visible-surface fallback evidence is missing.")
+    if (
+        report.get("policy") != DEPTH_VISIBLE_SURFACE_FALLBACK_POLICY
+        or report.get("visibility_scope") != "target_mesh_camera_projection"
+    ):
+        raise RuntimeError("Depth visible-surface fallback policy is unsupported.")
+
+    def integer(value: Any, label: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError(f"Depth visible-surface fallback {label} must be a nonnegative integer.")
+        return value
+
+    def number(value: Any, label: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise RuntimeError(f"Depth visible-surface fallback {label} must be finite numeric evidence.")
+        return float(value)
+
+    for key, expected in (("grid_columns", 7), ("grid_rows", 5), ("max_rays_per_shape", 35)):
+        if integer(report.get(key), key) != expected:
+            raise RuntimeError("Depth visible-surface fallback camera grid is unsupported.")
+    count_keys = (
+        "candidate_shape_frame_count", "sampled_shape_frame_count",
+        "replaced_shape_frame_count", "ray_test_count", "hit_count",
+    )
+    counts = {key: integer(report.get(key), key) for key in count_keys}
+    for key in ("unavailable_shape_frame_count", "ray_error_count"):
+        if key in report:
+            integer(report[key], key)
+    if (
+        not 0 <= counts["replaced_shape_frame_count"] <= counts["sampled_shape_frame_count"]
+        <= counts["candidate_shape_frame_count"] <= shape_count * len(frame_values)
+        or counts["ray_test_count"] > 35 * counts["sampled_shape_frame_count"]
+        or counts["hit_count"] > counts["ray_test_count"]
+        or (
+            counts["sampled_shape_frame_count"]
+            + report.get("unavailable_shape_frame_count", 0)
+            > counts["candidate_shape_frame_count"]
+        )
+        or report.get("ray_error_count", 0) > counts["ray_test_count"]
+    ):
+        raise RuntimeError("Depth visible-surface fallback counts are inconsistent.")
+    records = report.get("records")
+    if not isinstance(records, list) or len(records) != counts["replaced_shape_frame_count"]:
+        raise RuntimeError("Depth visible-surface fallback replacement records are inconsistent.")
+    seen: set[tuple[str, float]] = set()
+    recorded_rays = recorded_hits = 0
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("shape"), str) or not _clean(record["shape"]):
+            raise RuntimeError("Depth visible-surface fallback replacement shape is invalid.")
+        frame = number(record.get("frame"), "frame")
+        bbox_depth = number(record.get("bbox_depth"), "bbox depth")
+        visible_depth = number(record.get("visible_depth"), "visible depth")
+        rays = integer(record.get("ray_test_count"), "replacement ray count")
+        hits = integer(record.get("hit_count"), "replacement hit count")
+        identity = (_clean(record["shape"]), frame)
+        if (
+            identity in seen
+            or not any(abs(frame - float(value)) <= 1e-6 for value in frame_values)
+            or bbox_depth < far_distance - 1e-6
+            or not 0.0 < visible_depth < far_distance
+            or visible_depth < camera_near - 1e-6
+            or visible_depth > camera_far + 1e-6
+            or not 0 < hits <= rays <= 35
+        ):
+            raise RuntimeError("Depth visible-surface fallback replacement evidence is invalid.")
+        # Visible floor hits may lie closer than the fixed normalization near.
+        # The established flat palette deliberately clamps them to near white.
+        seen.add(identity)
+        recorded_rays += rays
+        recorded_hits += hits
+    if recorded_rays > counts["ray_test_count"] or recorded_hits > counts["hit_count"]:
+        raise RuntimeError("Depth visible-surface fallback aggregate evidence is inconsistent.")
+    return dict(report)
+
+
+def _validate_depth_close_focus_report(
+    report: Any, *, normalization_policy: str, frame_count: int,
+    foreground_samples: int, context_samples: int, binding_reports: Sequence[Dict[str, Any]],
+    near_distance: float, far_distance: float, camera_near: float,
+    camera_far: float,
+) -> None:
+    """Check compact-root authority and its bounded local context window."""
+    active_policy = normalization_policy == "close_focus_binding_cluster_bounds"
+    if report is None and not active_policy:
+        return
+    if (
+        not isinstance(report, dict)
+        or report.get("policy") != DEPTH_CLOSE_FOCUS_POLICY
+        or report.get("hint_source") != "depth_range_bindings"
+        or not isinstance(report.get("applied"), bool)
+        or report["applied"] is not active_policy
+    ):
+        raise RuntimeError("Depth close-focus policy evidence is inconsistent.")
+
+    def number(value: Any, label: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise RuntimeError(f"Depth close-focus {label} must be finite numeric evidence.")
+        return float(value)
+
+    def integer(value: Any, label: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError(f"Depth close-focus {label} must be a nonnegative integer.")
+        return value
+
+    def close(actual: Any, expected: float, label: str) -> None:
+        if not math.isclose(number(actual, label), expected, rel_tol=1e-7, abs_tol=1e-6):
+            raise RuntimeError(f"Depth close-focus {label} is inconsistent.")
+
+    def roots(value: Any, label: str) -> List[str]:
+        if (
+            not isinstance(value, list)
+            or any(not isinstance(root, str) or not _clean(root) for root in value)
+            or len(set(value)) != len(value)
+        ):
+            raise RuntimeError(f"Depth close-focus {label} must contain unique root paths.")
+        return value
+
+    chosen = roots(report.get("chosen_roots"), "chosen roots")
+    excluded = roots(report.get("excluded_roots"), "excluded roots")
+    stats = report.get("root_statistics")
+    if not isinstance(stats, list):
+        raise RuntimeError("Depth close-focus root statistics are missing.")
+    context_count = integer(report.get("local_context_sample_count"), "context sample count")
+    seen: set[str] = set()
+    for row in stats:
+        if (
+            not isinstance(row, dict) or not isinstance(row.get("root"), str)
+            or not _clean(row["root"]) or row["root"] in seen
+            or not isinstance(row.get("selected"), bool)
+            or row.get("reason") not in {
+                "", "compact_or_coherent_hint", "far_and_spatially_wide_outlier",
+            }
+        ):
+            raise RuntimeError("Depth close-focus root selection evidence is invalid.")
+        seen.add(row["root"])
+        count = integer(row.get("sample_count"), "root sample count")
+        frames = integer(row.get("frame_count"), "root frame count")
+        median = number(row.get("median_depth"), "root median")
+        near = number(row.get("near_percentile"), "root near percentile")
+        far = number(row.get("far_percentile"), "root far percentile")
+        span = number(row.get("spatial_span"), "root spatial span")
+        if (
+            not 0 < frames <= frame_count or count < frames
+            or not 0 < near <= median <= far or span < 0
+            or span > far - near + 1e-6
+        ):
+            raise RuntimeError("Depth close-focus root statistics are inconsistent.")
+
+    if not active_policy:
+        if (
+            report.get("fallback_reason") not in {
+                "manual_or_non_close_range", "fewer_than_three_screen_valid_hint_roots",
+                "fewer_than_three_coherent_hint_roots", "invalid_optional_range_hints",
+            }
+            or chosen or excluded or context_count
+            or any(report.get(key) is not None for key in (
+                "foreground_near", "foreground_far", "local_context_near",
+                "local_context_far", "near", "far",
+            ))
+        ):
+            raise RuntimeError("Depth inactive close-focus bounds are inconsistent.")
+        for key in ("median_upper_fence", "span_upper_fence"):
+            if report.get(key) is not None:
+                number(report[key], key)
+        return
+
+    if report.get("fallback_reason") != "" or len(chosen) < 3:
+        raise RuntimeError("Depth close-focus requires at least three coherent hint roots.")
+
+    def percentile(values: Sequence[float], fraction: float) -> float:
+        ordered = sorted(float(value) for value in values)
+        position = fraction * (len(ordered) - 1)
+        lo, hi = int(math.floor(position)), int(math.ceil(position))
+        weight = position - lo
+        return ordered[lo] * (1 - weight) + ordered[hi] * weight
+
+    def fence(values: Sequence[float]) -> float:
+        lo, hi = percentile(values, .25), percentile(values, .75)
+        return hi + 1.5 * (hi - lo)
+
+    if len(stats) < 3:
+        raise RuntimeError("Depth close-focus root statistics are insufficient.")
+    median_fence = fence([row["median_depth"] for row in stats])
+    span_fence = fence([row["spatial_span"] for row in stats])
+    close(report.get("median_upper_fence"), median_fence, "median upper fence")
+    close(report.get("span_upper_fence"), span_fence, "spatial-span upper fence")
+    expected_chosen, expected_excluded = set(), set()
+    for row in stats:
+        outlier = row["median_depth"] > median_fence and row["spatial_span"] > span_fence
+        expected_reason = "far_and_spatially_wide_outlier" if outlier else "compact_or_coherent_hint"
+        if row["selected"] is outlier or row["reason"] != expected_reason:
+            raise RuntimeError("Depth close-focus must exclude only dual far-and-wide outliers.")
+        (expected_excluded if outlier else expected_chosen).add(row["root"])
+    if set(chosen) != expected_chosen or set(excluded) != expected_excluded:
+        raise RuntimeError("Depth close-focus chosen/excluded root evidence is inconsistent.")
+    selected = [row for row in stats if row["selected"]]
+    selected_sample_count = sum(row["sample_count"] for row in selected)
+    if (
+        sum(row["sample_count"] for row in stats) > foreground_samples
+        or context_count > foreground_samples + context_samples - selected_sample_count
+    ):
+        raise RuntimeError("Depth close-focus normalization sample evidence is inconsistent.")
+    selected_binding_roots = {
+        _clean(row.get("root")) for row in binding_reports
+        if row.get("selected_for_normalization") is True
+    }
+    if not set(chosen).issubset(selected_binding_roots):
+        raise RuntimeError("Depth close-focus chosen roots lack selected binding evidence.")
+    foreground_near = min(row["near_percentile"] for row in selected)
+    foreground_far = max(row["far_percentile"] for row in selected)
+    close(report.get("foreground_near"), foreground_near, "foreground near")
+    close(report.get("foreground_far"), foreground_far, "foreground far")
+    window_far = foreground_far + max(
+        foreground_far - foreground_near, max(abs(foreground_far) * .02, .01)
+    )
+    close(report.get("local_context_near"), camera_near, "local context near")
+    close(report.get("local_context_far"), window_far, "local context window")
+    close(report.get("near"), camera_near, "camera-clip near")
+    close(near_distance, camera_near, "fixed normalization near")
+    focus_far = number(report.get("far"), "fixed focus far")
+    minimum_focus_far = max(
+        foreground_far, min(camera_near + .01, camera_far)
+    )
+    if (
+        focus_far < minimum_focus_far - 1e-6
+        or focus_far > window_far + 1e-6
+        or (not context_count and not math.isclose(
+            focus_far, minimum_focus_far,
+            rel_tol=1e-7, abs_tol=1e-6,
+        ))
+    ):
+        raise RuntimeError("Depth close-focus far exceeds its bounded local context.")
+    close(far_distance, focus_far, "fixed normalization far")
+
+
 def _validate_depth_companion_inputs(
     *,
     result: Dict[str, Any],
@@ -967,11 +1216,11 @@ def _validate_depth_companion_inputs(
     required_semantics = {
         "profile": DEPTH_PLAYBLAST_PROFILE,
         "space": "camera",
-        "source": "object_bbox_camera_depth",
+        "source": "object_camera_depth_with_visible_surface_fallback",
         "assignment_mode": "color_picker_style_shared_gray_material_buckets",
         "depth_update_scope": "per_shape_path_per_output_frame",
         "representative_depth": (
-            "median_positive_camera_depth_of_world_bbox_corners"
+            "median_positive_bbox_depth_with_visible_ray_hit_fallback"
         ),
         "shader_model": "surfaceShader",
         "direction": "near_white_far_black",
@@ -1032,6 +1281,7 @@ def _validate_depth_companion_inputs(
     normalization_policy = _clean(range_report.get("normalization_policy"))
     if normalization_policy not in {
         "screen_valid_foreground_percentile_bounds",
+        "close_focus_binding_cluster_bounds",
         "screen_valid_shape_robust_fallback_bounds",
         "screen_valid_shape_extrema_fallback_bounds",
         "camera_clip_planes_fallback",
@@ -1242,6 +1492,11 @@ def _validate_depth_companion_inputs(
         raise RuntimeError("Depth binding role-excluded evidence is inconsistent.")
 
     policy_contracts = {
+        "close_focus_binding_cluster_bounds": (
+            "close_focus_compact_bindings_and_local_context",
+            "complete_sequence_robust_binding_cluster_local_context",
+            "close_focus_camera_clip_near",
+        ),
         "screen_valid_foreground_percentile_bounds": (
             "screen_valid_foreground_actor_shapes",
             "complete_sequence_screen_valid_foreground_representative_percentiles",
@@ -1565,6 +1820,21 @@ def _validate_depth_companion_inputs(
     ):
         raise RuntimeError("Depth shader assignment verification is inconsistent.")
 
+    _validate_depth_close_focus_report(
+        shot_range_sample.get("close_focus"),
+        normalization_policy=normalization_policy,
+        frame_count=expected_frame_count,
+        foreground_samples=foreground_samples, context_samples=context_samples,
+        binding_reports=binding_range_reports,
+        near_distance=near_value, far_distance=far_value,
+        camera_near=camera_near_min, camera_far=camera_far_max,
+    )
+    _validate_depth_visible_surface_fallback(
+        range_report.get("visible_surface_fallback"),
+        shape_count=renderable_shape_count, frame_values=evaluated_frames,
+        far_distance=far_value, camera_near=camera_near_min,
+        camera_far=camera_far_max,
+    )
     render_options = range_report.get("render_options")
     if not isinstance(render_options, dict):
         raise RuntimeError("Depth raw-render option evidence is missing.")
@@ -7946,6 +8216,11 @@ def _generation_choice_roles(state: Dict[str, Any]) -> List[str]:
     ]
 
 
+def _snapshot_choice_roles(state: Dict[str, Any]) -> List[str]:
+    """Snapshots capture the checked still-image passes in public output order."""
+    return [role for role in _generation_choice_roles(state) if role in {"original", "mask", "depth"}]
+
+
 def _mask_authoring_slot(state: Dict[str, Any]) -> int:
     """Return the cut-authoring staging slot, independent of asset order."""
     del state
@@ -8388,6 +8663,8 @@ def _snapshot_catalog_uid_by_slot(videos: Any) -> Dict[int, str]:
 def _snapshot_record_signature(item: Dict[str, Any]) -> str:
     payload = {
         "video_uid": _clean(item.get("video_uid")),
+        "artifact_type": _clean(item.get("artifact_type")) or "mask",
+        "snapshot_batch_uid": _clean(item.get("snapshot_batch_uid")),
         "render_video_slot": _normalized_video_slot(
             item.get("render_video_slot") or item.get("video_slot"),
             PRIMARY_COLOR_VIDEO_SLOT,
@@ -8449,6 +8726,8 @@ def _normalized_snapshot_record(
     record = {
         "snapshot_uid": supplied_snapshot_uid,
         "video_uid": supplied_video_uid or migrated_video_uid,
+        "artifact_type": _clean(raw.get("artifact_type")) if _clean(raw.get("artifact_type")) in {"original", "mask", "depth"} else "mask",
+        "snapshot_batch_uid": _clean(raw.get("snapshot_batch_uid")),
         "render_video_slot": render_slot,
         # Keep the readable compatibility name, but never use its mutable
         # selection order as the snapshot's identity.
@@ -12035,12 +12314,122 @@ def _original_preview_cache_fields(scene_path: Path, state: Dict[str, Any]) -> D
     }
 
 
-def _original_material_report_is_valid(report: Any) -> bool:
-    """Accept only a restored, opaque, texture-free neutral Original pass.
+def _original_eye_fallback_report_is_valid(
+    source: Dict[str, Any], counts: Dict[str, int],
+) -> bool:
+    """Require explicit native fallback evidence only for unavailable eye plug-ins."""
+    if (
+        source.get("eye_fallback_policy") != ORIGINAL_EYE_FALLBACK_POLICY
+        or not isinstance(source.get("eye_fallback_applied"), bool)
+        or not isinstance(source.get("eye_fallback_verified"), bool)
+        or not isinstance(source.get("eye_fallback_records"), list)
+    ):
+        return False
+    records = source["eye_fallback_records"]
+    fallback_count_keys = (
+        "eye_fallback_shading_engine_count", "eye_fallback_shape_count",
+        "eye_fallback_material_count", "eye_fallback_texture_connection_count",
+    )
+    if not source["eye_fallback_applied"]:
+        return bool(
+            source["eye_fallback_verified"] is False
+            and not records
+            and not counts["eye_unavailable_plugin_dependency_count"]
+            and source.get("eye_unavailable_plugin_nodes", []) == []
+            and all(counts[key] == 0 for key in fallback_count_keys)
+        )
+    if (
+        source["eye_fallback_verified"] is not True
+        or counts["eye_unavailable_plugin_dependency_count"] <= 0
+        or not 0 < counts["eye_fallback_shading_engine_count"] <= counts["preserved_eye_shading_engine_count"]
+        or not 0 < counts["eye_fallback_shape_count"] <= counts["preserved_eye_shape_count"]
+        or not 0 < counts["eye_fallback_material_count"] <= counts["eye_fallback_shading_engine_count"]
+        or len(records) != counts["eye_fallback_shading_engine_count"]
+    ):
+        return False
 
-    The versioned profile deliberately invalidates old textured Original
-    caches. Source shader identity is no longer a publication requirement;
-    shading-group membership and restoration still are.
+    def plugin_records(raw: Any) -> Optional[Dict[str, Dict[str, Any]]]:
+        if not isinstance(raw, list) or not raw:
+            return None
+        result: Dict[str, Dict[str, Any]] = {}
+        for item in raw:
+            if (
+                not isinstance(item, dict)
+                or any(not isinstance(item.get(key), str) for key in (
+                    "node", "node_type", "state", "plugin", "real_class",
+                ))
+                or not _clean(item["node"])
+                or item["state"] != "unavailable"
+                or item["node"] in result
+            ):
+                return None
+            result[item["node"]] = item
+        return result
+
+    shading_engines: set[str] = set()
+    materials: set[str] = set()
+    shapes: set[str] = set()
+    unavailable_nodes: Dict[str, Dict[str, Any]] = {}
+    texture_connections = 0
+    for record in records:
+        if (
+            not isinstance(record, dict)
+            or any(not isinstance(record.get(key), str) or not _clean(record[key])
+                   for key in ("shading_engine", "source_shader_plug", "native_shader"))
+            or "." not in record["source_shader_plug"]
+            or not all(_clean(part) for part in record["source_shader_plug"].split(".", 1))
+            or "." in record["native_shader"]
+            or record["native_shader"] == record["source_shader_plug"].split(".", 1)[0]
+            or record["shading_engine"] in shading_engines
+            or record.get("reason") != "unavailable_plugin_dependency"
+            or record.get("color_mode") not in {"native_texture", "cached_numeric", "maya_default"}
+            or not isinstance(record.get("color_source"), str)
+            or not isinstance(record.get("affected_shapes"), list)
+            or not record["affected_shapes"]
+            or any(not isinstance(path, str) or not _clean(path) for path in record["affected_shapes"])
+            or len(set(record["affected_shapes"])) != len(record["affected_shapes"])
+            or isinstance(record.get("texture_connection_count"), bool)
+            or not isinstance(record.get("texture_connection_count"), int)
+            or record["texture_connection_count"] < 0
+        ):
+            return False
+        color = record.get("color_value")
+        if (
+            not isinstance(color, (list, tuple)) or len(color) != 3
+            or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                   or not math.isfinite(value) for value in color)
+            or (record["color_mode"] == "native_texture"
+                and (not _clean(record["color_source"]) or record["texture_connection_count"] <= 0))
+        ):
+            return False
+        dependencies = plugin_records(record.get("unavailable_plugin_nodes"))
+        if dependencies is None or record["native_shader"] in dependencies:
+            return False
+        for node, dependency in dependencies.items():
+            if node in unavailable_nodes and unavailable_nodes[node] != dependency:
+                return False
+            unavailable_nodes[node] = dependency
+        shading_engines.add(record["shading_engine"])
+        materials.add(record["native_shader"])
+        shapes.update(record["affected_shapes"])
+        texture_connections += record["texture_connection_count"]
+    declared_unavailable = plugin_records(source.get("eye_unavailable_plugin_nodes"))
+    return bool(
+        len(shading_engines) == counts["eye_fallback_shading_engine_count"]
+        and len(materials) == counts["eye_fallback_material_count"]
+        and len(shapes) == counts["eye_fallback_shape_count"]
+        and texture_connections == counts["eye_fallback_texture_connection_count"]
+        and len(unavailable_nodes) == counts["eye_unavailable_plugin_dependency_count"]
+        and declared_unavailable == unavailable_nodes
+    )
+
+
+def _original_material_report_is_valid(report: Any) -> bool:
+    """Accept a restored neutral body pass with usable eye shaders.
+
+    The versioned profile invalidates gray-eye and pre-fallback caches. Authored
+    eyes remain intact when usable; unavailable plug-ins need a verified native
+    eye fallback, followed by exact original connection and assignment restore.
     """
     source = report if isinstance(report, dict) else {}
     count_keys = (
@@ -12052,6 +12441,18 @@ def _original_material_report_is_valid(report: Any) -> bool:
         "emission_transfer_count",
         "normal_transfer_count",
         "swapped_shading_engine_count",
+        "preserved_eye_shape_count",
+        "preserved_eye_component_count",
+        "preserved_eye_shading_engine_count",
+        "split_shading_engine_count",
+        "split_body_member_count",
+        "eye_texture_dependency_count",
+        "eye_missing_texture_dependency_count",
+        "eye_unavailable_plugin_dependency_count",
+        "eye_fallback_shading_engine_count",
+        "eye_fallback_shape_count",
+        "eye_fallback_material_count",
+        "eye_fallback_texture_connection_count",
     )
     if any(
         isinstance(source.get(key), bool)
@@ -12104,21 +12505,35 @@ def _original_material_report_is_valid(report: Any) -> bool:
         and source.get("restore_ok") is True
         and source.get("shading_group_membership_preserved") is True
         and source.get("default_lighting_verified") is True
-        and source.get("solid_render_mode_verified") is True
+        and source.get("solid_render_mode_verified") is (counts["preserved_eye_shading_engine_count"] == 0)
+        and source.get("textured_render_mode_verified") is (counts["preserved_eye_shading_engine_count"] > 0)
+        and source.get("eye_textures_enabled") is (counts["preserved_eye_shading_engine_count"] > 0)
+        and source.get("eye_materials_preserved") is True
+        and source.get("eye_assignments_preserved") is True
+        and source.get("eye_dependency_preflight_passed") is True
         and source.get("soft_shading_verified") is True
         and source.get("authored_materials_ignored") is True
         and source.get("textures_ignored") is True
+        and source.get("authored_material_ignore_scope") == "non_eye_surfaces"
         and source.get("opaque_surface_verified") is True
         and not bool(
             source.get("temporary_nodes_retained_on_restore_failure")
         )
         and min(counts.values()) >= 0
         and counts["inspected_shading_engine_count"]
-        >= counts["swapped_shading_engine_count"]
-        and counts["swapped_shading_engine_count"]
+        >= counts["contributing_shading_engine_count"]
+        and counts["swapped_shading_engine_count"] + counts["preserved_eye_shading_engine_count"]
         == counts["contributing_shading_engine_count"]
+        and counts["split_shading_engine_count"] <= counts["preserved_eye_shading_engine_count"]
+        and (counts["split_body_member_count"] > 0) == (counts["split_shading_engine_count"] > 0)
+        and counts["split_body_member_count"] >= counts["split_shading_engine_count"]
+        and (counts["preserved_eye_shape_count"] > 0) == (counts["preserved_eye_shading_engine_count"] > 0)
+        and (counts["preserved_eye_component_count"] == 0 or counts["preserved_eye_shape_count"] > 0)
+        and (counts["eye_texture_dependency_count"] == 0 or counts["preserved_eye_shading_engine_count"] > 0)
+        and counts["eye_missing_texture_dependency_count"] == 0
+        and _original_eye_fallback_report_is_valid(source, counts)
         and counts["temporary_lambert_count"]
-        == int(counts["contributing_shading_engine_count"] > 0)
+        == int(counts["swapped_shading_engine_count"] + counts["split_shading_engine_count"] > 0)
         and counts["texture_connection_count"] == 0
         and counts["transparency_transfer_count"] == 0
         and counts["emission_transfer_count"] == 0
@@ -12282,9 +12697,10 @@ def _operation_input_digest(kind: str, scene_text: Any, state: Dict[str, Any], s
     if kind_text == "render_snapshot":
         selected_slot = PRIMARY_COLOR_VIDEO_SLOT
     if kind_text == "render_original_preview":
-        # Original preview identity is deliberately independent of marker/color
-        # bindings and their catalog version. Only geometry, camera and timing
-        # are inherited from the scene; material appearance is neutral midgray.
+        # Original identity is independent of marker/color bindings and their
+        # catalog version. The scene supplies geometry, camera, timing and the
+        # eye shader inputs and unavailable-renderer fallback; non-eye materials
+        # use the neutral body profile.
         payload.pop("marker_catalog_version", None)
         if _picker_scene_engine(scene_text) == "blender":
             width, height = _playblast_resolution(normalized)
@@ -12330,7 +12746,7 @@ def _operation_input_digest(kind: str, scene_text: Any, state: Dict[str, Any], s
         depth_video_slot = 0
         motion_guide_video_slot = 0
         binding_slot = selected_slot
-        if kind_text == "run_video":
+        if kind_text in {"run_video", "render_snapshot"}:
             selected_slot = PRIMARY_COLOR_VIDEO_SLOT
             binding_slot = _mask_authoring_slot(normalized)
         if depth_enabled or motion_guide_enabled:
@@ -12405,7 +12821,29 @@ def _operation_input_digest(kind: str, scene_text: Any, state: Dict[str, Any], s
                     else MOTION_GUIDE_PROFILE
                 ) if motion_guide_enabled else "",
             })
+        if (
+            kind_text in {"run_video", "render_snapshot"}
+            and normalized.get("depth_enabled")
+        ):
+            # Range hints affect only Depth normalization. Include their
+            # independent policy and native identity in operation/cache basis.
+            payload["depth_close_focus_policy"] = DEPTH_CLOSE_FOCUS_POLICY
+            payload["depth_range_bindings"] = [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "full_dag_path", "maya_uuid", "group_name", "color",
+                        "enabled", "picker_order", "reference_node",
+                        "reference_file", "proxy_manager", "proxy_tag",
+                    )
+                }
+                for item in bindings if bool(item.get("enabled", True))
+            ]
         if kind_text == "render_snapshot":
+            payload["selected_roles"] = _snapshot_choice_roles(normalized)
+            payload["original_material_override_profile"] = ORIGINAL_MATERIAL_OVERRIDE_PROFILE if normalized.get("original_enabled") else ""
+            payload["depth_profile"] = DEPTH_PLAYBLAST_PROFILE if normalized.get("depth_enabled") else ""
+            payload["depth_range_mode"] = normalized["depth_settings"]["range"] if normalized.get("depth_enabled") else ""
             requested_frame = normalized.get("snapshot_request_frame")
             payload["snapshot_frame"] = float(
                 requested_frame if requested_frame is not None else normalized.get("snapshot_frame") or 0.0
@@ -13602,7 +14040,17 @@ class HMBVideoPickerLibrary(DataNode):
         # browser echo may carry an incomplete catalog/ownership list; parsing
         # that echo first would discard an otherwise valid selection before it
         # can be filtered against the authoritative workspace membership.
-        raw_incoming = dict(incoming) if isinstance(incoming, dict) else {}
+        if isinstance(incoming, dict):
+            raw_incoming = dict(incoming)
+        else:
+            try:
+                decoded_incoming = json.loads(str(incoming or ""))
+            except (TypeError, ValueError):
+                decoded_incoming = {}
+            raw_incoming = (
+                dict(decoded_incoming) if isinstance(decoded_incoming, dict) else {}
+            )
+        has_workspace_rows = "picker_shots" in raw_incoming
         raw_incoming_rows = (
             list(raw_incoming.get("picker_shots") or [])
             if isinstance(raw_incoming.get("picker_shots"), list)
@@ -13838,10 +14286,35 @@ class HMBVideoPickerLibrary(DataNode):
                         resolved_preview_slot
                     )
                     merged["selected_video_slot"] = resolved_preview_slot
-        # Snapshot media/history is backend authoritative. A current widget may
-        # move only the active pointer/view mode, and an older browser echo may
-        # not roll either pointer back after Python has published new history.
-        if int(incoming.get("state_revision") or 0) >= int(
+        # Snapshot history is backend authority. Modern cursor/view edits obey
+        # the same per-Shot revision token as selection and preview above.
+        # Project the accepted row before parsing: an equal-global, older-row
+        # browser echo must not overwrite it through the legacy top-level UID.
+        # A Shot switch similarly restores that Shot's committed cursor.
+        if has_workspace_rows:
+            active_workspace_uuid = _uuid_text(
+                merged.get("active_picker_shot_uuid")
+            )
+            active_workspace = next(
+                (
+                    row for row in merged.get("picker_shots", [])
+                    if isinstance(row, dict)
+                    and _uuid_text(row.get("workspace_uuid"))
+                    == active_workspace_uuid
+                ),
+                None,
+            )
+            if isinstance(active_workspace, dict):
+                merged["active_snapshot_uid"] = _clean(
+                    active_workspace.get("active_snapshot_uid")
+                )
+                merged["viewport_mode"] = (
+                    "snapshot"
+                    if _clean(active_workspace.get("viewport_mode")).lower()
+                    == "snapshot" else "video"
+                )
+        # Older clients have no Shot rows and author only the global cursor.
+        elif int(incoming.get("state_revision") or 0) >= int(
             merged.get("state_revision") or 0
         ):
             merged["active_snapshot_uid"] = _clean(
@@ -13852,6 +14325,27 @@ class HMBVideoPickerLibrary(DataNode):
                 if _clean(incoming.get("viewport_mode")).lower() == "snapshot"
                 else "video"
             )
+            # Promote a rowless client's accepted cursor to one monotonic row
+            # edit. The native store/after hook receives this normalized modern
+            # state and must not mistake it for an equal-token stale echo.
+            active_workspace_uuid = _uuid_text(
+                merged.get("active_picker_shot_uuid")
+            )
+            for row in merged.get("picker_shots", []):
+                if (
+                    isinstance(row, dict)
+                    and _uuid_text(row.get("workspace_uuid"))
+                    == active_workspace_uuid
+                    and (
+                        _clean(row.get("active_snapshot_uid"))
+                        != merged["active_snapshot_uid"]
+                        or _clean(row.get("viewport_mode")).lower()
+                        != merged["viewport_mode"]
+                    )
+                ):
+                    row["active_snapshot_uid"] = merged["active_snapshot_uid"]
+                    row["viewport_mode"] = merged["viewport_mode"]
+                    row["revision"] = int(row.get("revision") or 0) + 1
         merged["activity_log"] = _merge_activity_logs(merged.get("activity_log"), incoming.get("activity_log"))
         merged["state_revision"] = max(
             int(merged.get("state_revision") or 0),
@@ -13897,6 +14391,15 @@ class HMBVideoPickerLibrary(DataNode):
         leaf = text.split('|')[-1] if '|' in text else text.split('/')[-1]
         leaf = leaf or text
         return _clean(leaf)
+
+    def _depth_range_job_bindings(self, state: Dict[str, Any], slot: int) -> List[Dict[str, Any]]:
+        """Optional exact-root hints; never establish Color render scope."""
+        try:
+            return copy.deepcopy(self._selected_slot_job_bindings(state, slot))
+        except (ValueError, RuntimeError):
+            # Incomplete/invalid Color authoring is not a Depth prerequisite.
+            # The native normalizer retains its established generic fallback.
+            return []
 
     def _selected_slot_job_bindings(self, state: Dict[str, Any], slot: int) -> List[Dict[str, Any]]:
         bindings = self._editable_assignments_for_slot(state, slot)
@@ -15339,6 +15842,9 @@ class HMBVideoPickerLibrary(DataNode):
                     motion_guide_enabled=motion_guide_enabled,
                 )
         elif kind_text == "render_snapshot":
+            selected_roles = tuple(_snapshot_choice_roles(state))
+            if not selected_roles:
+                raise ValueError("Snapshot requires a checked Original, Mask, or Depth output. Motion Guide is a video output.")
             # Snapshot authoring always uses the one Maya Color staging slot.
             # ``snapshot_video_uid`` freezes the catalog identity separately;
             # later card reorder cannot change what the image belongs to.
@@ -15962,7 +16468,7 @@ class HMBVideoPickerLibrary(DataNode):
             incoming.update({
                 "status": "SNAPSHOT_RENDERING",
                 "scene_stage": "SNAPSHOT_RENDERING",
-                "message": f"Rendering the colored snapshot for @video{slot} at {source_engine_label} frame {frame:g}.",
+                "message": f"Rendering {', '.join(role.title() for role in context.selected_roles)} snapshots at {source_engine_label} frame {frame:g}.",
             })
             _append_activity_log(
                 incoming,
@@ -16886,7 +17392,9 @@ class HMBVideoPickerLibrary(DataNode):
                         getattr(self, "_hmb_authoritative_state", None) or {}
                     )
                     if authoritative:
-                        incoming = self._merge_widget_state(authoritative, incoming)
+                        # Keep raw Shot-row presence for legacy cursor clients;
+                        # the merge itself performs complete state normalization.
+                        incoming = self._merge_widget_state(authoritative, value)
 
                     action_id = _clean(incoming.get("pending_action_id"))
                     if action_id and action_id in self._hmb_processed_action_ids:
@@ -18326,7 +18834,7 @@ class HMBVideoPickerLibrary(DataNode):
         except Exception:
             selected_slot = int(state.get("selected_video_slot") or 1)
         state["selected_video_slot"] = max(1, min(int(state.get("active_slot_count") or 1), selected_slot))
-        if action == "run_video":
+        if action in {"run_video", "render_snapshot"}:
             if "include_original" in payload:
                 state["original_enabled"] = bool(payload.get("include_original"))
             if "include_mask" in payload:
@@ -18337,7 +18845,9 @@ class HMBVideoPickerLibrary(DataNode):
                 state["motion_guide_enabled"] = bool(
                     payload.get("include_motion_guide")
                 )
-            if not _generation_choice_roles(state):
+            if action == "render_snapshot" and not _snapshot_choice_roles(state):
+                raise ValueError("Snapshot requires at least one checked still output: Original, Mask, or Depth. Motion Guide is a video output.")
+            if action == "run_video" and not _generation_choice_roles(state):
                 raise ValueError(
                     "Generate Playblast requires at least one checked output: "
                     "Original, Mask, Depth, or Motion Guide."
@@ -18751,7 +19261,7 @@ class HMBVideoPickerLibrary(DataNode):
                     # snapshot must not hide the just-stored widget value.
                     with self._hmb_catalog_state_commit():
                         authored = self._merge_widget_state(
-                            self._picker_state(), _parse_state(value)
+                            self._picker_state(), value
                         )
                         self._write_state(authored)
 
@@ -18790,7 +19300,7 @@ class HMBVideoPickerLibrary(DataNode):
                 self._sync_outputs_from_state(restored)
                 return
 
-            merged = self._merge_widget_state(previous_state, incoming)
+            merged = self._merge_widget_state(previous_state, value)
             merged = self._apply_selected_view_fields(merged)
             self._reconcile_video_tools_state(merged)
             self._synchronize_picker_expanded_geometry_metadata(merged)
@@ -19926,7 +20436,7 @@ class HMBVideoPickerLibrary(DataNode):
             "scene_stage": "OUTLINER_READY",
             "message": (
                 f"Maya Outliner loaded with {len(outliner_nodes)} selectable asset roots. "
-                "Enable Original Playblast for a neutral midgray geometry and motion preview."
+                "Enable Original Playblast for a neutral midgray body with scene eye shaders, using Maya defaults when their renderer is unavailable."
             ),
             "scene_path": str(scene_path).replace("\\", "/"),
             "scene_draft_path": str(scene_path).replace("\\", "/"),
@@ -20343,7 +20853,7 @@ class HMBVideoPickerLibrary(DataNode):
         state.update({
             "status": "GENERATING_ORIGINAL",
             "scene_stage": "GENERATING_ORIGINAL",
-            "message": f"Maya {maya_version} is rendering the texture-free midgray Original preview.",
+            "message": f"Maya {maya_version} is rendering the midgray Original body and scene eye shaders with Maya fallback for unavailable renderers.",
             "original_preview_enabled": False,
             "maya_executable": str(mayabatch).replace("\\", "/"),
             "maya_version": maya_version,
@@ -20363,7 +20873,7 @@ class HMBVideoPickerLibrary(DataNode):
                 f"Original preview Maya render started with camera {camera}, frames "
                 f"{start_frame:g}-{end_frame:g}, {source_fps:g} FPS, and forced "
                 f"full-detail viewport profile {ORIGINAL_VIEWPORT_QUALITY_PROFILE} "
-                "with a per-source-material Maya Lambert compatibility pass."
+                "with a neutral Maya Lambert body and scene eye shaders or verified Maya fallback for unavailable renderers."
             ),
         )
         self._write_state(state)
@@ -20482,7 +20992,7 @@ class HMBVideoPickerLibrary(DataNode):
             _clean(runner_sidecar.get("original_material_override_profile"))
             != ORIGINAL_MATERIAL_OVERRIDE_PROFILE
         ):
-            validation_errors.append("Original midgray material profile")
+            validation_errors.append("Original body/eye material profile")
         runner_material_report = (
             dict(runner_sidecar.get("original_material_override_report"))
             if isinstance(
@@ -20491,7 +21001,7 @@ class HMBVideoPickerLibrary(DataNode):
             else {}
         )
         if not _original_material_report_is_valid(runner_material_report):
-            validation_errors.append("Original midgray restoration report")
+            validation_errors.append("Original body/eye restoration report")
         if list(runner_sidecar.get("markers") or []):
             validation_errors.append("marker isolation")
         if not runner_dependency_paths:
@@ -20844,6 +21354,13 @@ class HMBVideoPickerLibrary(DataNode):
         snapshot_uid: Any = "",
         video_uid: Any = "",
     ) -> None:
+        action_id = _clean(incoming.get("backend_ack_action_id") or incoming.get("pending_action_id"))
+        def acknowledge(state, status, uid):
+            results = dict(state.get("snapshot_delete_results")) if isinstance(state.get("snapshot_delete_results"), dict) else {}
+            if action_id:
+                results[action_id] = {"status": status, "snapshot_uid": _clean(uid), "reason": _clean(state.get("message"))}
+            state["snapshot_delete_results"] = dict(list(results.items())[-64:])
+            state["backend_ack_action_id"] = action_id
         with self._hmb_operation_control_lock:
             operation_active = bool(
                 self._hmb_pending_operation_id
@@ -20860,6 +21377,7 @@ class HMBVideoPickerLibrary(DataNode):
                 "Snapshot deletion was ignored while a Picker operation is "
                 "running. Wait for it to finish, then delete the Snapshot."
             )
+            acknowledge(state, "rejected", snapshot_uid)
             _append_activity_log(state, "WARNING", state["message"])
             self._write_state(state)
             return
@@ -20958,24 +21476,159 @@ class HMBVideoPickerLibrary(DataNode):
             "pending_action": "",
             "pending_action_id": "",
         })
+        acknowledge(state, "removed" if target_uid else "absent", target_uid or snapshot_uid)
         _append_activity_log(state, "INFO", state["message"])
         self._write_state(state)
 
+    def _capture_maya_snapshot_role(
+        self, *, role: str, scene_path: Path, state: Dict[str, Any],
+        frame: float, binding_slot: int, job_folder: Path, log_path: Path,
+        mayabatch: Path, context: Optional[_OperationContext],
+    ) -> tuple[Path, Dict[str, Any]]:
+        """Capture one PNG in a fresh Maya process without video encoding."""
+        self._assert_operation_current(context, f"SNAPSHOT {role} preflight")
+        width, height = _playblast_resolution(state)
+        maya_version = _maya_display_version(mayabatch)
+        frames_folder = job_folder / "frames"
+        output_name = f"snapshot_{role}"
+        job_path = job_folder / "snapshot.job.json"
+        result_path = job_folder / "snapshot.result.json"
+        progress_path = job_folder / "snapshot.progress.json"
+        sidecar_path = job_folder / "snapshot.hmb.json"
+        # Auxiliary-only capture still requires distinct unused Color staging
+        # paths; the runner promotes its Depth paths into the primary result.
+        captured_frames_folder = job_folder / "depth_frames" if role == "depth" else frames_folder
+        captured_sidecar_path = job_folder / "snapshot.depth.hmb.json" if role == "depth" else sidecar_path
+        self._register_cleanup_dir(job_folder)
+        _ensure_private_job_folder(job_folder, _ensure_scene_output_folder(scene_path))
+        bindings = self._selected_slot_job_bindings(state, binding_slot) if role == "mask" else []
+        if role == "mask":
+            _world_pattern_preflight(bindings)
+        job = {
+            "operation": "snapshot", "scene_path": str(scene_path),
+            "output_name": output_name, "frames_folder": str(frames_folder),
+            "sidecar_path": str(sidecar_path), "result_path": str(result_path),
+            "progress_path": str(progress_path), "camera": _clean(state.get("selected_camera")),
+            "width": width, "height": height, "start_frame": frame, "end_frame": frame,
+            "fps": float(state.get("source_fps") or 0.0) or None,
+            "apply_marker_shaders": role != "original",
+            "character_outline_mode": "native_lambert",
+            "force_high_quality_viewport": True,
+            "viewport_quality_profile": FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE,
+            "mouth_card_inner_patch_policy": MOUTH_CARD_INNER_PATCH_POLICY,
+            "require_full_smooth_geometry": True,
+            "world_space_patterns": role == "mask",
+            "world_pattern_profile": MAYA_WORLD_PATTERN_PROFILE if role == "mask" else "",
+            "world_pattern_cell_units": WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS,
+            "world_pattern_density_multiplier": WORLD_PATTERN_DENSITY_MULTIPLIER,
+            "screen_space_patterns": False,
+            "expected_maya_major": maya_version if maya_version.isdigit() else "",
+            "marker_catalog_path": str(MARKER_CATALOG_PATH),
+            "marker_catalog_version": int(MARKER_CATALOG["version"]),
+            "video_slot": binding_slot, "bindings": bindings,
+            "hidden_paths": self._selected_slot_hidden_paths(state, binding_slot) if role != "original" else [],
+            "hidden_mesh_identities": _picker_hidden_mesh_identities(state) if role != "original" else [],
+        }
+        if role == "original":
+            job.update(apply_original_lambert_override=True,
+                       original_material_override_profile=ORIGINAL_MATERIAL_OVERRIDE_PROFILE)
+        elif role == "mask":
+            job["capture_pass"] = "color"
+        elif role == "depth":
+            job.update(capture_pass="depth", generate_depth_playblast=True,
+                       depth_frames_folder=str(captured_frames_folder), depth_output_name=output_name,
+                       depth_sidecar_path=str(captured_sidecar_path), depth_profile=DEPTH_PLAYBLAST_PROFILE,
+                       depth_range_mode=state["depth_settings"]["range"],
+                       depth_range_bindings=self._depth_range_job_bindings(state, binding_slot))
+        else:
+            raise ValueError("Unsupported Snapshot artifact type: " + role)
+        _write_json(job_path, job)
+        command = [str(mayabatch)]
+        maya_project = _find_maya_project(scene_path)
+        if maya_project is not None:
+            command.extend(["-proj", str(maya_project)])
+        command.extend(["-command", _maya_runner_command()])
+        env = _maya_subprocess_environment(job_path)
+        with log_path.open("a", encoding="utf-8", errors="replace") as log_handle:
+            log_handle.write(f"\nMAYA {role.upper()} SNAPSHOT COMMAND\n" + _command_text(command) + "\n\n")
+            log_handle.flush()
+            process = subprocess.Popen(command, stdout=log_handle, stderr=subprocess.STDOUT,
+                                       env=env, cwd=str(job_folder), creationflags=_creation_flags())
+            self._register_active_process(process, "Maya")
+            try:
+                return_code = self._wait_for_process_with_progress(
+                    process, progress_path, PLAYBLAST_OVERALL_TIMEOUT_SECONDS,
+                    PLAYBLAST_STALL_TIMEOUT_SECONDS, f"Maya {role.title()} Snapshot",
+                    activity_paths=(captured_frames_folder,))
+            finally:
+                self._clear_active_process(process)
+        self._assert_operation_current(context, f"SNAPSHOT {role} completion")
+        result = _read_json(result_path) if result_path.is_file() else {}
+        if return_code not in (0, None) or not result.get("ok"):
+            raise RuntimeError(f"{_clean(result.get('error')) or 'Maya did not complete the requested Snapshot.'} See {log_path}")
+        _validated_runner_result_path(result, "frames_folder", captured_frames_folder)
+        _validated_runner_result_path(result, "sidecar_path", captured_sidecar_path)
+        if role == "depth":
+            _validated_runner_result_path(result, "depth_frames_folder", captured_frames_folder)
+            _validated_runner_result_path(result, "depth_sidecar_path", captured_sidecar_path)
+        sidecar = _read_json(captured_sidecar_path) if captured_sidecar_path.is_file() else {}
+        _validate_full_smooth_confirmation(result, sidecar, label=f"{role.title()} Snapshot")
+        layer_report = result.get("capture_render_layer") if isinstance(result.get("capture_render_layer"), dict) else {}
+        if (
+            sidecar.get("capture_render_layer") != layer_report
+            or layer_report.get("capture_layer") != "defaultRenderLayer"
+            or layer_report.get("default_layer_verified") is not True
+            or layer_report.get("restored") is not True
+            or layer_report.get("restore_ok") is not True
+        ):
+            raise RuntimeError("Maya Snapshot did not verify isolated default render-layer capture and restoration.")
+        expected_pass = "color" if role == "mask" else "depth" if role == "depth" else ""
+        if _clean(result.get("capture_pass")) != expected_pass:
+            raise RuntimeError("Maya returned a different Snapshot capture pass.")
+        if int(sidecar.get("frame_count") or 0) != 1 or any(
+            abs(float(sidecar.get(key)) - frame) > 1e-6 for key in ("start_frame", "end_frame")
+        ):
+            raise RuntimeError("Maya Snapshot did not return exactly the requested frame.")
+        if _clean(sidecar.get("camera")) != _clean(state.get("selected_camera")):
+            raise RuntimeError("Maya Snapshot returned a different camera.")
+        expected_fps = float(state.get("source_fps") or 0.0)
+        if expected_fps > 0.0 and abs(float(sidecar.get("fps") or 0.0) - expected_fps) > 1e-6:
+            raise RuntimeError("Maya Snapshot returned a different source FPS.")
+        rendered_path = captured_frames_folder / f"{output_name}.000000.png"
+        if not rendered_path.is_file():
+            raise RuntimeError(f"Maya did not create the requested {role.title()} Snapshot. See {log_path}")
+        with rendered_path.open("rb") as handle:
+            header = handle.read(24)
+        if len(header) != 24 or header[:8] != b"\x89PNG\r\n\x1a\n" or (
+            int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big")
+        ) != (width, height):
+            raise RuntimeError("Maya Snapshot PNG dimensions do not match the requested output.")
+        if role == "mask":
+            _validate_world_pattern_runner_confirmation(result, sidecar)
+            if len(sidecar.get("markers") or []) != len(bindings):
+                raise RuntimeError("Mask Snapshot did not retain the requested Color Assignment.")
+        elif role == "original":
+            if _clean(sidecar.get("original_material_override_profile")) != ORIGINAL_MATERIAL_OVERRIDE_PROFILE or not _original_material_report_is_valid(sidecar.get("original_material_override_report")):
+                raise RuntimeError("Original Snapshot did not verify neutral body, usable eye shaders, and original shader restoration.")
+            if sidecar.get("markers"):
+                raise RuntimeError("Original Snapshot inherited Color Assignment markers.")
+        else:
+            _validate_depth_companion_inputs(
+                result=result, color_sidecar=sidecar, depth_sidecar=sidecar,
+                color_frame_paths=[rendered_path], depth_frame_paths=[rendered_path],
+                expected_frame_count=1, expected_fps=float(sidecar.get("fps") or 0.0),
+                expected_start_frame=frame, expected_end_frame=frame,
+                expected_width=width, expected_height=height)
+        return rendered_path, sidecar
+
     def _snapshot_mode(
-        self,
-        scene_text: str,
-        video_slot: int,
-        context: Optional[_OperationContext] = None,
-        *,
-        video_uid: Any = "",
+        self, scene_text: str, video_slot: int,
+        context: Optional[_OperationContext] = None, *, video_uid: Any = "",
     ) -> Dict[str, Any]:
         self._assert_operation_current(context, "SNAPSHOT preflight")
-        video_slot = PRIMARY_COLOR_VIDEO_SLOT
         strict_scene_text = _maya_scene_path_text(scene_text)
         if not strict_scene_text:
-            raise ValueError(
-                "A single absolute Maya .mb or .ma scene is required before SNAPSHOT."
-            )
+            raise ValueError("A single absolute Maya .mb or .ma scene is required before SNAPSHOT.")
         scene_path = _norm_path(strict_scene_text)
         if not scene_path.is_file() or scene_path.suffix.lower() not in {".ma", ".mb"}:
             raise FileNotFoundError(f"Select an existing Maya .mb or .ma scene before SNAPSHOT: {scene_path}")
@@ -20984,206 +21637,98 @@ class HMBVideoPickerLibrary(DataNode):
         mayabatch = _find_mayabatch()
         if mayabatch is None:
             raise FileNotFoundError("No mayabatch installation was found.")
-        maya_version = _maya_display_version(mayabatch)
-
         state = self._operation_stage_state(context)
-        output_width, output_height = _playblast_resolution(state)
-        bindings = self._selected_slot_job_bindings(state, video_slot)
-        _world_pattern_preflight(bindings)
+        roles = tuple(context.selected_roles) if context is not None else tuple(_snapshot_choice_roles(state))
+        if not roles:
+            raise ValueError("Snapshot requires a checked Original, Mask, or Depth output. Motion Guide is a video output.")
+        if any(role not in {"original", "mask", "depth"} for role in roles):
+            raise ValueError("Unsupported selected Snapshot output.")
+        binding_slot = context.mask_authoring_slot if context is not None else _mask_authoring_slot(state)
         start_frame = float(state.get("start_frame") or 0.0)
         end_frame = float(state.get("end_frame") or start_frame)
         requested_frame = state.get("snapshot_request_frame")
         frame = max(start_frame, min(end_frame, float(
-            requested_frame if requested_frame is not None else state.get("snapshot_frame") or start_frame
-        )))
+            requested_frame if requested_frame is not None else state.get("snapshot_frame") or start_frame)))
         output_folder = _ensure_scene_output_folder(scene_path)
-        snapshot_uid = f"snapshot-{uuid.uuid4().hex}"
+        batch_uid = f"snapshot-batch-{uuid.uuid4().hex}"
         created_at_ms = int(time.time() * 1000)
-        associated_video_uid = _clean(
-            video_uid
-            or state.get("snapshot_request_video_uid")
-            or state.get("preview_video_uid")
-            or state.get("selected_video_uid")
-        )
-        cache_path = self._snapshot_cache_path(scene_path, snapshot_uid)
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        token = hashlib.sha1(
-            f"snapshot|{scene_path}|{snapshot_uid}|{frame}|{time.time_ns()}".encode("utf-8")
-        ).hexdigest()[:12]
-        job_folder = output_folder / ".hmb_video_picker" / f"snapshot_{token}"
-        frames_folder = job_folder / "frames"
-        output_name = f"snapshot_video{video_slot}"
-        job_path = job_folder / "snapshot.job.json"
-        result_path = job_folder / "snapshot.result.json"
-        progress_path = job_folder / "snapshot.progress.json"
-        sidecar_path = job_folder / "snapshot.hmb.json"
-        staged_cache_path = job_folder / "snapshot.partial.png"
-        log_path = output_folder / f"Snapshot_{_safe_scene_name(scene_path.stem)}_Video{video_slot}.log"
+        associated_video_uid = _clean(video_uid or state.get("snapshot_request_video_uid")
+                                      or state.get("preview_video_uid") or state.get("selected_video_uid"))
+        job_folder = output_folder / ".hmb_video_picker" / batch_uid
         self._register_cleanup_dir(job_folder)
-        self._register_cleanup_dir(frames_folder)
-        for transient in (
-            job_path, result_path, progress_path, Path(str(progress_path) + ".tmp"),
-            sidecar_path, staged_cache_path,
-        ):
-            self._register_cleanup_file(transient)
         _ensure_private_job_folder(job_folder, output_folder)
-        _write_json(job_path, {
-            "operation": "snapshot",
-            "scene_path": str(scene_path),
-            "output_name": output_name,
-            "frames_folder": str(frames_folder),
-            "sidecar_path": str(sidecar_path),
-            "result_path": str(result_path),
-            "progress_path": str(progress_path),
-            "camera": _clean(state.get("selected_camera")),
-            "width": output_width,
-            "height": output_height,
-            "start_frame": frame,
-            "end_frame": frame,
-            "fps": float(state.get("source_fps") or 0.0) or None,
-            "apply_marker_shaders": True,
-            "character_outline_mode": "native_lambert",
-            "force_high_quality_viewport": True,
-            "viewport_quality_profile": FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE,
-            "mouth_card_inner_patch_policy": MOUTH_CARD_INNER_PATCH_POLICY,
-            "require_full_smooth_geometry": True,
-            "world_space_patterns": True,
-            "world_pattern_profile": MAYA_WORLD_PATTERN_PROFILE,
-            "world_pattern_cell_units": WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS,
-            "world_pattern_density_multiplier": WORLD_PATTERN_DENSITY_MULTIPLIER,
-            "screen_space_patterns": False,
-            "expected_maya_major": maya_version if maya_version.isdigit() else "",
-            "marker_catalog_path": str(MARKER_CATALOG_PATH),
-            "marker_catalog_version": int(MARKER_CATALOG["version"]),
-            "video_slot": video_slot,
-            "bindings": bindings,
-            "hidden_paths": self._selected_slot_hidden_paths(state, video_slot),
-            "hidden_mesh_identities": _picker_hidden_mesh_identities(state),
-        })
-
-        command: List[str] = [str(mayabatch)]
-        maya_project = _find_maya_project(scene_path)
-        if maya_project is not None:
-            command.extend(["-proj", str(maya_project)])
-        command.extend([
-            "-command", _maya_runner_command(),
-        ])
-        state.update({
-            "status": "SNAPSHOT_RENDERING",
-            "scene_stage": "SNAPSHOT_RENDERING",
-            "message": f"Maya {maya_version} is rendering @video{video_slot} frame {frame:g}.",
-            "snapshot_frame": frame,
-            "snapshot_video_slot": video_slot,
-            "last_log_path": str(log_path).replace("\\", "/"),
-            "log_folder": str(output_folder).replace("\\", "/"),
-        })
-        _append_activity_log(
-            state,
-            "INFO",
-            f"Maya {maya_version} snapshot started for @video{video_slot}, frame {frame:g}.",
-        )
+        log_path = output_folder / f"Snapshot_{_safe_scene_name(scene_path.stem)}_Video{PRIMARY_COLOR_VIDEO_SLOT}.log"
+        log_path.write_text("MAYA SELECTED SNAPSHOT OUTPUTS: " + ", ".join(roles) + "\n", encoding="utf-8")
+        state.update(status="SNAPSHOT_RENDERING", scene_stage="SNAPSHOT_RENDERING",
+                     message=f"Rendering {', '.join(role.title() for role in roles)} snapshots at Maya frame {frame:g}.",
+                     snapshot_frame=frame, snapshot_video_slot=PRIMARY_COLOR_VIDEO_SLOT,
+                     last_log_path=str(log_path).replace("\\", "/"), log_folder=str(output_folder).replace("\\", "/"))
         self._write_state(state)
-
-        env = _maya_subprocess_environment(job_path)
-        with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
-            log_handle.write("MAYA SNAPSHOT COMMAND\n" + _command_text(command) + "\n\n")
-            log_handle.write(
-                "MAYA VP2 DEVICE OVERRIDE\n"
-                + (_clean(env.get("MAYA_VP2_DEVICE_OVERRIDE")) or "user preference")
-                + "\n\n"
-            )
-            log_handle.flush()
-            process = subprocess.Popen(
-                command,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                env=env,
-                cwd=str(job_path.parent),
-                creationflags=_creation_flags(),
-            )
-            self._register_active_process(process, "Maya")
+        staged = []
+        warnings = []
+        for role in roles:
+            rendered, metadata = self._capture_maya_snapshot_role(
+                role=role, scene_path=scene_path, state=state, frame=frame,
+                binding_slot=binding_slot, job_folder=job_folder / role,
+                log_path=log_path, mayabatch=mayabatch, context=context)
+            snapshot_uid = f"snapshot-{uuid.uuid4().hex}"
+            target = self._snapshot_cache_path(scene_path, snapshot_uid)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            partial = job_folder / f"{role}.partial.png"
+            shutil.copy2(rendered, partial)
+            staged.append((partial, target, {
+                "snapshot_uid": snapshot_uid, "snapshot_batch_uid": batch_uid,
+                "artifact_type": role, "video_uid": associated_video_uid,
+                "render_video_slot": PRIMARY_COLOR_VIDEO_SLOT, "video_slot": PRIMARY_COLOR_VIDEO_SLOT,
+                "frame": frame, "path": str(target).replace("\\", "/"),
+                "url": _external_media_url(target), "sha256": _sha256_file(partial),
+                "created_at_ms": created_at_ms,
+            }))
+            warnings.extend(_clean(item) for item in metadata.get("warnings", []) if _clean(item))
+        self._assert_operation_current(context, "SNAPSHOT batch atomic publish")
+        published_paths = []
+        def history_paths(snapshot_state):
+            containers = [snapshot_state] + [
+                row for row in snapshot_state.get("picker_shots", []) if isinstance(row, dict)
+            ]
+            return {
+                _clean(record.get("path"))
+                for container in containers for record in container.get("snapshots", [])
+                if isinstance(record, dict) and _clean(record.get("path"))
+            }
+        before_publish_state = self._picker_state()
+        old_snapshot_paths = history_paths(before_publish_state)
+        try:
+            completed = before_publish_state
+            for partial, target, record in staged:
+                os.replace(partial, target)
+                published_paths.append(target)
+                completed = _append_snapshot_history_record(
+                    completed, record, picker_shot_uuid=context.picker_shot_uuid if context is not None else "")
+            self._assert_operation_current(context, "SNAPSHOT batch state publish")
+            ready_stage = "VIDEO_READY" if completed.get("videos") else "OUTLINER_READY"
+            completed.update(status=ready_stage, scene_stage=ready_stage,
+                             message=f"{', '.join(role.title() for role in roles)} snapshots ready at Maya frame {frame:g}.",
+                             snapshot_request_video_uid="", workspace_view="playblast", warnings=warnings)
+            completed = self._mark_operation_finished(completed)
+            _append_activity_log(completed, "SUCCESS", completed["message"])
+            self._write_state(completed)
+        except Exception:
+            for target in published_paths:
+                _safe_delete_snapshot_cache_file(scene_path, target)
+            raise
+        # Drop evicted private cache files only after the complete batch state
+        # commits; a failed sibling must never delete previous history.
+        for obsolete_path in old_snapshot_paths - history_paths(completed):
             try:
-                return_code = self._wait_for_process_with_progress(
-                    process,
-                    progress_path,
-                    PLAYBLAST_OVERALL_TIMEOUT_SECONDS,
-                    PLAYBLAST_STALL_TIMEOUT_SECONDS,
-                    f"Maya @video{video_slot} Snapshot",
-                    activity_paths=(frames_folder,),
-                )
-            finally:
-                self._clear_active_process(process)
-
-        self._assert_operation_current(context, "SNAPSHOT Maya completion")
-        if not result_path.is_file():
-            raise RuntimeError(f"Maya did not write a snapshot result. See {log_path}")
-        result = _read_json(result_path)
-        if not result.get("ok") or return_code not in (0, None):
-            raise RuntimeError(
-                f"{_clean(result.get('error')) or f'Maya exited with code {return_code}.'} See {log_path}"
-            )
-        runner_sidecar = (
-            _read_json(sidecar_path)
-            if sidecar_path.is_file()
-            else {}
-        )
-        _validate_full_smooth_confirmation(
-            result,
-            runner_sidecar,
-            label=f"@video{video_slot} Snapshot",
-        )
-        _validate_world_pattern_runner_confirmation(
-            result,
-            runner_sidecar,
-        )
-        rendered_folder = Path(_clean(result.get("frames_folder")) or frames_folder)
-        rendered_path = rendered_folder / f"{output_name}.000000.png"
-        if not rendered_path.is_file() or rendered_path.stat().st_size <= 0:
-            raise RuntimeError(f"Maya did not create the requested snapshot frame. See {log_path}")
-        shutil.copy2(rendered_path, staged_cache_path)
-        self._assert_operation_current(context, "SNAPSHOT atomic publish")
-        os.replace(staged_cache_path, cache_path)
-
-        state = _append_snapshot_history_record(
-            self._picker_state(),
-            {
-            "snapshot_uid": snapshot_uid,
-            "video_uid": associated_video_uid,
-            "render_video_slot": PRIMARY_COLOR_VIDEO_SLOT,
-            "video_slot": video_slot,
-            "frame": frame,
-            "path": str(cache_path).replace("\\", "/"),
-            "url": _external_media_url(cache_path),
-            "sha256": _sha256_file(cache_path),
-            "created_at_ms": created_at_ms,
-            },
-            scene_path=scene_path,
-            picker_shot_uuid=context.picker_shot_uuid if context is not None else "",
-        )
-        ready_stage = "VIDEO_READY" if state.get("videos") else "OUTLINER_READY"
-        state.update({
-            "status": ready_stage,
-            "scene_stage": ready_stage,
-            "message": f"Snapshot ready at Maya frame {frame:g}.",
-            "snapshot_request_video_uid": "",
-            "workspace_view": "playblast",
-            "warnings": [_clean(item) for item in result.get("warnings", []) if _clean(item)],
-        })
-        state = self._mark_operation_finished(state)
-        _append_activity_log(
-            state,
-            "SUCCESS",
-            f"Snapshot {snapshot_uid} completed at Maya frame {frame:g}.",
-        )
-        self._write_state(state)
-        return {
-            "mode": "snapshot",
-            "snapshot_uid": snapshot_uid,
-            "video_uid": associated_video_uid,
-            "video_slot": video_slot,
-            "frame": frame,
-            "snapshot": str(cache_path),
-        }
+                _safe_delete_snapshot_cache_file(scene_path, obsolete_path)
+            except Exception as exc:
+                _diagnostic_exception("Snapshot history cache cleanup failed", exc)
+        active = staged[-1][2]
+        return {"mode": "snapshot", "snapshot_batch_uid": batch_uid,
+                "snapshots": [dict(record) for _partial, _target, record in staged],
+                "snapshot_uid": active["snapshot_uid"], "video_uid": associated_video_uid,
+                "video_slot": PRIMARY_COLOR_VIDEO_SLOT, "frame": frame, "snapshot": active["path"]}
 
     def _encode_playblast_sequence(
         self,
@@ -21598,6 +22143,7 @@ class HMBVideoPickerLibrary(DataNode):
                 mask_authoring_slot,
             ),
             "generate_depth_playblast": depth_enabled,
+            "depth_range_bindings": copy.deepcopy(job_bindings) if depth_enabled else [],
             "hidden_mesh_identities": _picker_hidden_mesh_identities(state),
             "depth_range_mode": state["depth_settings"]["range"],
             "depth_video_slot": depth_video_slot,

@@ -43,10 +43,10 @@ CHARACTER_OUT_RIM_LOCAL_OCCLUSION = 2
 FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE = "hmb_full_smooth_geometry_v2"
 ORIGINAL_VIEWPORT_QUALITY_PROFILE = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
 ORIGINAL_MATERIAL_OVERRIDE_PROFILE = (
-    "maya-midgray-solid-studio-v1"
+    "maya-midgray-solid-studio-v3"
 )
 ORIGINAL_LAMBERT_ASSIGNMENT_MODE = (
-    "original_midgray_solid_studio"
+    "original_midgray_body_authored_eyes"
 )
 SCREEN_SPACE_PATTERN_PROFILE = "hmb_screen_space_pattern_post_v2"
 SCREEN_SPACE_PATTERN_LINEAR_SCALE_DIVISOR = 3
@@ -66,7 +66,7 @@ WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS = (
 WORLD_PATTERN_MIN_CELL_WORLD_UNITS = 1.0e-3
 WORLD_PATTERN_MAX_CELL_WORLD_UNITS = 1.0e6
 WORLD_PATTERN_MAX_TEXTURE_REPEAT = 4096.0
-DEPTH_PLAYBLAST_PROFILE = "hmb_camera_space_depth_v7"
+DEPTH_PLAYBLAST_PROFILE = "hmb_camera_space_depth_v8"
 # Production Depth uses the full 0.0..0.9 signal range.  The final 0.1 is
 # deliberately left unused so near-plane/bounds approximation cannot turn a
 # close subject into clipped pure white.
@@ -80,6 +80,8 @@ DEPTH_FOREGROUND_NEAR_PERCENTILE = 0.01
 DEPTH_FOREGROUND_FAR_PERCENTILE = 0.99
 DEPTH_GENERIC_FAR_PERCENTILE = 0.95
 DEPTH_GENERIC_PERCENTILE_MIN_SHAPES = 20
+DEPTH_VISIBLE_SURFACE_GRID_COLUMNS = 7
+DEPTH_VISIBLE_SURFACE_GRID_ROWS = 5
 DEPTH_SCREEN_VERTEX_SAMPLE_LIMIT = 128
 DEPTH_SCREEN_POLYGON_CENTER_SAMPLE_LIMIT = 64
 DEPTH_REJECTION_ACCOUNTING_POLICY = "disjoint_normalization_outcomes"
@@ -4554,12 +4556,95 @@ def _original_wire_record(
     return "texture"
 
 
-class _OriginalLambertOverrideController(object):
-    """Render Original as one opaque midgray surface without reading materials.
+def _original_eye_semantic(value):
+    """Recognize bounded eye names without matching brow or namespace text."""
+    # The closest explicit shape/ancestor semantic wins: an eyebrow below
+    # Eyes stays neutral, and a true Eye_GEO below a brow rig stays authored.
+    for segment in reversed(_clean(value).split("|")):
+        leaf = segment.rsplit(":", 1)[-1].split(".", 1)[0]
+        words = re.sub(r"([a-z])([A-Z])", r"\1 \2", leaf)
+        words = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", words)
+        tokens = set(re.findall(r"[a-z]+", words.lower()))
+        if tokens.intersection(("brow", "brows", "eyebrow", "eyebrows")):
+            return False
+        if tokens.intersection(
+            ("eye", "eyes", "eyeball", "eyeballs", "iris", "pupil", "cornea", "sclera")
+        ):
+            return True
+    return False
 
-    Preserve all object/face/instance SG memberships. Only SG surface,
-    displacement and volume connections are changed in the disposable Maya
-    process, and restored before publication. No source scene is saved.
+
+def _original_eye_shape(shape):
+    """Use the concrete DAG path and parents as the eye material authority."""
+    path = _clean(shape)
+    visited = set()
+    while path and path not in visited:
+        visited.add(path)
+        leaf = path.rsplit("|", 1)[-1].rsplit(":", 1)[-1]
+        leaf_words = re.sub(r"([a-z])([A-Z])", r"\1 \2", leaf)
+        if set(re.findall(r"[a-z]+", leaf_words.lower())).intersection(("brow", "brows", "eyebrow", "eyebrows")):
+            return False
+        if _original_eye_semantic(path):
+            return True
+        try:
+            parents = cmds.listRelatives(path, parent=True, fullPath=True) or []
+        except Exception:
+            parents = []
+        if len(parents) != 1:
+            break
+        path = _clean(parents[0])
+    return False
+
+
+def _original_eye_dependency_error(report):
+    """Name the missing authored eye inputs without substituting their pixels."""
+    message = (
+        "Original cannot preserve the authored eye appearance: {0} missing "
+        "texture(s), {1} unavailable plug-in node(s).".format(
+            int(report.get("eye_missing_texture_dependency_count") or 0),
+            int(report.get("eye_unavailable_plugin_dependency_count") or 0),
+        )
+    )
+    unavailable = list(report.get("eye_unavailable_plugin_nodes") or [])
+    providers = sorted(set(
+        _clean(record.get("plugin")) for record in unavailable
+        if _clean(record.get("plugin"))
+    ))
+    if providers:
+        message += " Required eye plug-in(s): {0}.".format(", ".join(providers))
+    if unavailable:
+        labels = []
+        for record in unavailable[:4]:
+            node = _clean(record.get("node")) or "<unknown>"
+            node_class = _clean(record.get("real_class"))
+            labels.append(node + (" (" + node_class + ")" if node_class else ""))
+        remaining = len(unavailable) - len(labels)
+        message += " Unavailable eye nodes: {0}{1}.".format(
+            ", ".join(labels),
+            "; +{0} more".format(remaining) if remaining else "",
+        )
+    missing = list(report.get("eye_missing_texture_dependencies") or [])
+    if missing:
+        labels = []
+        for record in missing[:2]:
+            paths = list(record.get("paths") or [])
+            labels.append("{0}: {1}".format(
+                _clean(record.get("node")) or "<unknown>",
+                _clean(paths[0]) if paths else "<empty texture path>",
+            ))
+        remaining = len(missing) - len(labels)
+        message += " Missing eye textures: {0}{1}.".format(
+            "; ".join(labels),
+            "; +{0} more".format(remaining) if remaining else "",
+        )
+    return message + " Restore the eye shader dependencies for this Maya version and retry."
+
+
+class _OriginalLambertOverrideController(object):
+    """Render a neutral body while preserving the scene's authored eye shaders.
+
+    Eye SG connections stay untouched. A shared eye/body SG is split using
+    exact body memberships, then restored before publication. No scene is saved.
     """
 
     def __init__(self, job):
@@ -4569,6 +4654,15 @@ class _OriginalLambertOverrideController(object):
         self.connections = []
         self.created_nodes = []
         self.membership_snapshot = {}
+        self.split_memberships = []
+        self.eye_connection_snapshot = {}
+        self.eye_fallback_groups = {}
+        self.eye_fallback_expected_connections = {}
+        self.eye_native_sources = {}
+        self.eye_native_clones = {}
+        self.eye_native_resolving = set()
+        self.eye_fallback_shaders = {}
+        self.eye_fallback_shader_info = {}
         self.finished = False
         self.report = {
             "profile": ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
@@ -4578,8 +4672,10 @@ class _OriginalLambertOverrideController(object):
             "diffuse": 0.45,
             "fill_color": [0.22, 0.22, 0.22],
             "soft_shading_verified": False,
+            # Legacy flags describe the neutral body; eyes retain their graph.
             "authored_materials_ignored": True,
             "textures_ignored": True,
+            "authored_material_ignore_scope": "non_eye_surfaces",
             "opaque_surface_verified": False,
             "inspected_shading_engine_count": 0,
             "contributing_shading_engine_count": 0,
@@ -4592,11 +4688,35 @@ class _OriginalLambertOverrideController(object):
             "normal_transfer_count": 0,
             "scoped_shape_path_count": 0,
             "swapped_shading_engine_count": 0,
+            "preserved_eye_shape_count": 0,
+            "preserved_eye_component_count": 0,
+            "preserved_eye_shading_engine_count": 0,
+            "split_shading_engine_count": 0,
+            "split_body_member_count": 0,
+            "eye_materials_preserved": True,
+            "eye_assignments_preserved": True,
+            "eye_textures_enabled": False,
+            "eye_texture_dependency_count": 0,
+            "eye_missing_texture_dependency_count": 0,
+            "eye_unavailable_plugin_dependency_count": 0,
+            "eye_dependency_preflight_passed": True,
+            "eye_loaded_plugin_nodes": [],
+            "eye_unavailable_plugin_nodes": [],
+            "eye_missing_texture_dependencies": [],
+            "eye_fallback_policy": "maya_default_shader_for_unavailable_eye_dependencies_v1",
+            "eye_fallback_applied": False,
+            "eye_fallback_verified": False,
+            "eye_fallback_shading_engine_count": 0,
+            "eye_fallback_shape_count": 0,
+            "eye_fallback_material_count": 0,
+            "eye_fallback_texture_connection_count": 0,
+            "eye_fallback_records": [],
             "shading_group_membership_preserved": True,
             "restore_ok": False,
             "temporary_nodes_retained_on_restore_failure": False,
             "default_lighting_verified": False,
             "solid_render_mode_verified": False,
+            "textured_render_mode_verified": False,
             "warnings": [],
         }
 
@@ -4609,11 +4729,374 @@ class _OriginalLambertOverrideController(object):
 
     def _scoped_shading_groups(self):
         shapes = _authored_cutout_scope_shapes(self.job)
+        self.scope_shapes = list(shapes)
         self.report["scoped_shape_path_count"] = len(shapes)
         groups = set()
         for shape in shapes:
             groups.update(_shape_shading_groups(shape))
         return sorted(group for group in groups if _clean(group))
+
+    @staticmethod
+    def _member_shape(member):
+        owner, separator, component = _clean(member).partition(".")
+        if separator and not re.match(r"^f\[[0-9]+(?::[0-9]+)?\]$", component):
+            raise RuntimeError("Original eye/body shared shadingEngine has an unsupported component: " + member)
+        try:
+            paths = sorted(set(cmds.ls(owner, long=True, allPaths=True) or []))
+            if len(paths) != 1:
+                raise RuntimeError("ambiguous instance path")
+            path = paths[0]
+            if cmds.nodeType(path) in ("transform", "joint"):
+                # SG face members use the transform owner in real Maya. Resolve
+                # only its immediate final surfaces; scope filters accept shape
+                # paths and do not expand transforms or retain hidden members.
+                shapes = sorted(set(
+                    shape for shape in (
+                        cmds.listRelatives(path, shapes=True, noIntermediate=True, fullPath=True) or []
+                    )
+                    if cmds.nodeType(shape) in ("mesh", "nurbsSurface")
+                    and not _is_intermediate_shape(shape)
+                ))
+                if len(shapes) != 1:
+                    raise RuntimeError("transform does not identify one surface")
+                path = shapes[0]
+            if cmds.nodeType(path) not in ("mesh", "nurbsSurface"):
+                raise RuntimeError("member is not a supported surface")
+            return path
+        except Exception as exc:
+            raise RuntimeError("Original eye/body membership cannot be resolved exactly: {0} ({1})".format(member, exc))
+
+    @staticmethod
+    def _eye_face_member(member):
+        owner, separator, component = _clean(member).partition(".")
+        match = re.match(r"^f\[([0-9]+)(?::([0-9]+))?\]$", component) if separator else None
+        if not match:
+            return 0
+        leaf = owner.rsplit("|", 1)[-1].rsplit(":", 1)[-1]
+        words = re.sub(r"([a-z])([A-Z])", r"\1 \2", leaf)
+        tokens = set(re.findall(r"[a-z]+", words.lower()))
+        # A known body/brow member stays neutral even if it shares EyeMat.
+        if tokens.intersection(("body", "bodies", "torso", "brow", "brows", "eyebrow", "eyebrows")):
+            return 0
+        first = int(match.group(1))
+        last = int(match.group(2) or first)
+        if last < first:
+            raise RuntimeError("Original eye face membership has an invalid range: " + member)
+        return last - first + 1
+
+    def _eye_group_plan(self, active_groups):
+        named_eye_shapes = [shape for shape in self.scope_shapes if _original_eye_shape(shape)]
+        named_eye_groups = set()
+        for shape in named_eye_shapes:
+            named_eye_groups.update(_shape_shading_groups(shape))
+        retained_shapes = set()
+        retained_face_count = 0
+        plan = {}
+        for group in active_groups:
+            members = self.membership_snapshot[group]
+            surface_sources = list(_incoming_source_plugs(group + ".surfaceShader"))
+            eye_face_authority = (
+                any(self._eye_face_member(member) for member in members)
+                and (_original_eye_semantic(group) or any(
+                    _original_eye_semantic(source.split(".", 1)[0]) for source in surface_sources
+                ))
+            )
+            if group not in named_eye_groups and not eye_face_authority:
+                continue
+            body_members = []
+            eye_member_count = 0
+            for member in members:
+                shape = self._member_shape(member)
+                face_count = self._eye_face_member(member)
+                if _original_eye_shape(shape) or (eye_face_authority and face_count):
+                    eye_member_count += 1
+                    retained_shapes.add(shape)
+                    # Count concrete face components rather than range strings.
+                    if "." in member:
+                        component = member.partition(".")[2]
+                        match = re.match(r"^f\[([0-9]+)(?::([0-9]+))?\]$", component)
+                        retained_face_count += int(match.group(2) or match.group(1)) - int(match.group(1)) + 1
+                else:
+                    body_members.append(member)
+            if not eye_member_count:
+                if group in named_eye_groups:
+                    raise RuntimeError("Original could not resolve the authored eye memberships: " + group)
+                continue
+            plan[group] = body_members
+            for attribute in ("surfaceShader", "displacementShader", "volumeShader"):
+                destination = group + "." + attribute
+                if cmds.objExists(destination):
+                    self.eye_connection_snapshot[destination] = list(_incoming_source_plugs(destination))
+            if not self.eye_connection_snapshot.get(group + ".surfaceShader"):
+                raise RuntimeError("Original eye shadingEngine has no authored surface shader: " + group)
+        if named_eye_shapes and not plan:
+            raise RuntimeError("Original found eye geometry without a resolvable authored eye shadingEngine.")
+        self.report["preserved_eye_shape_count"] = len(retained_shapes)
+        self.report["preserved_eye_component_count"] = retained_face_count
+        self.report["preserved_eye_shading_engine_count"] = len(plan)
+        self.report["eye_textures_enabled"] = bool(plan)
+        material_sources = {}
+        loaded_plugins = {}
+        unavailable_plugins = {}
+        file_records = {}
+        for destination, sources in self.eye_connection_snapshot.items():
+            for source in sources:
+                if destination.endswith(".surfaceShader"):
+                    material_sources[source.split(".", 1)[0]] = source
+                plugin_report = _original_plugin_dependency_report(source)
+                for record in plugin_report["loaded_plugin_nodes"]:
+                    loaded_plugins[record["node"]] = record
+                for record in plugin_report["unavailable_plugin_nodes"]:
+                    unavailable_plugins[record["node"]] = record
+                    group = destination.rsplit(".", 1)[0]
+                    self.eye_fallback_groups.setdefault(group, {})[record["node"]] = record
+                # Inspect all authored eye input graphs, including normal and
+                # displacement maps, without evaluating or replacing the shader.
+                for file_node in _original_upstream_file_nodes(source):
+                    record = _original_file_texture_record(file_node)
+                    if record:
+                        file_records[file_node] = record
+        texture_report = _original_texture_dependency_report(material_sources) if material_sources else {}
+        missing_files = [record for record in file_records.values() if not record.get("available")]
+        self.report["eye_texture_dependency_count"] = len(file_records)
+        self.report["eye_missing_texture_dependency_count"] = max(
+            len(missing_files), int(texture_report.get("missing_texture_dependency_count") or 0)
+        )
+        self.report["eye_unavailable_plugin_dependency_count"] = len(unavailable_plugins)
+        self.report["eye_loaded_plugin_nodes"] = [loaded_plugins[node] for node in sorted(loaded_plugins)]
+        self.report["eye_unavailable_plugin_nodes"] = [
+            unavailable_plugins[node] for node in sorted(unavailable_plugins)
+        ]
+        missing_records = {record["node"]: record for record in missing_files}
+        for record in texture_report.get("missing_texture_dependencies") or []:
+            missing_records.setdefault(record["node"], record)
+        self.report["eye_missing_texture_dependencies"] = [
+            missing_records[node] for node in sorted(missing_records)
+        ]
+        self.report["eye_dependency_preflight_passed"] = not bool(missing_files or unavailable_plugins or
+            texture_report.get("missing_texture_dependency_count"))
+        if missing_files or texture_report.get("missing_texture_dependency_count"):
+            raise RuntimeError(_original_eye_dependency_error(self.report))
+        return plan
+
+    def _record_loaded_plugin_nodes(self, records):
+        known = {row["node"]: row for row in self.report["eye_loaded_plugin_nodes"]}
+        known.update({row["node"]: row for row in records})
+        self.report["eye_loaded_plugin_nodes"] = [known[node] for node in sorted(known)]
+
+    def _record_plugin_fallback(self, record, error, values):
+        # Numeric fallbacks are explicit evidence, never a connection to an
+        # unavailable renderer. Available native/file inputs are preferred.
+        self.report["warnings"].append(
+            "Unavailable eye input {0} used its cached Maya value.".format(
+                _clean(record.get("plug")) or error.source_plug
+            )
+        )
+
+    def _eye_native_source(self, source):
+        source = _clean(source)
+        if not source:
+            return ""
+        if source in self.eye_native_sources:
+            return self.eye_native_sources[source]
+        if source in self.eye_native_resolving or len(self.eye_native_resolving) >= 64:
+            return ""
+        dependency = _original_plugin_dependency_report(source)
+        if not dependency["unavailable_plugin_nodes"]:
+            return _original_supported_source(source, controller=self)
+        self.eye_native_resolving.add(source)
+        try:
+            node, _, attribute = source.partition(".")
+            if _original_plugin_node_state(node) == "unavailable":
+                shader = self._create_eye_fallback_shader(node, source)
+                replacement = shader + (
+                    ".transparency" if "transparen" in attribute.lower()
+                    else ".colorR" if _original_source_is_scalar(source)
+                    else ".color"
+                )
+            else:
+                clone = self.eye_native_clones.get(node)
+                if not clone:
+                    # Duplicate only this utility/shader node and its incoming
+                    # links. Never edit the authored graph or duplicate DAGs.
+                    if _original_node_type(node) in ("mesh", "transform", "joint", "shadingEngine"):
+                        return ""
+                    cloned = cmds.duplicate(
+                        node, inputConnections=True,
+                        name="HMB_Original_EyeNativeGraph#",
+                    ) or []
+                    if len(cloned) != 1:
+                        raise RuntimeError("Eye fallback utility duplication was ambiguous: " + node)
+                    clone = cloned[0]
+                    self.created_nodes.append(clone)
+                    self.eye_native_clones[node] = clone
+                    pairs = cmds.listConnections(
+                        node, source=True, destination=False,
+                        plugs=True, connections=True,
+                    ) or []
+                    if len(pairs) % 2:
+                        raise RuntimeError("Eye fallback utility input pairs were ambiguous: " + node)
+                    for destination, incoming in zip(pairs[0::2], pairs[1::2]):
+                        clone_target = clone + "." + destination.split(".", 1)[1]
+                        try:
+                            is_message = _clean(cmds.getAttr(destination, type=True)) == "message"
+                        except Exception:
+                            is_message = False
+                        if is_message:
+                            if incoming in _incoming_source_plugs(clone_target):
+                                cmds.disconnectAttr(incoming, clone_target)
+                            continue
+                        mapped = self._eye_native_source(incoming)
+                        if mapped:
+                            _original_connect(mapped, clone_target)
+                        else:
+                            if incoming in _incoming_source_plugs(clone_target):
+                                cmds.disconnectAttr(incoming, clone_target)
+                            value = _numeric_attr_components(_plug_value(destination))
+                            if len(value) == 1:
+                                cmds.setAttr(clone_target, value[0])
+                            elif len(value) >= 3:
+                                _original_set_vector(clone_target, value[:3])
+                            else:
+                                raise RuntimeError("Eye fallback input has no usable Maya value: " + destination)
+                replacement = clone + "." + attribute
+            if _original_plugin_dependency_report(replacement)["unavailable_plugin_nodes"]:
+                raise RuntimeError("Eye fallback still depends on unavailable plug-ins: " + source)
+            self.eye_native_sources[source] = replacement
+            return replacement
+        finally:
+            self.eye_native_resolving.discard(source)
+
+    def _eye_fallback_wire(self, record, target, default, invert=False):
+        safe = dict(record or {})
+        if safe.get("source"):
+            safe["source"] = self._eye_native_source(safe["source"])
+        if safe.get("component_sources"):
+            safe["component_sources"] = [
+                self._eye_native_source(source) if source else ""
+                for source in safe["component_sources"]
+            ]
+        mode = _original_wire_record(self, safe, target, invert=invert, default=default)
+        return mode, _clean(safe.get("source"))
+
+    def _create_eye_fallback_shader(self, material, source):
+        if material in self.eye_fallback_shaders:
+            return self.eye_fallback_shaders[material]
+        shader = cmds.shadingNode(
+            "lambert", asShader=True, name="HMB_Original_EyeFallback_Lambert#",
+        )
+        self.created_nodes.append(shader)
+        self.eye_fallback_shaders[material] = shader
+        # RedshiftArchitectural uses diffuse; color corrections use input.
+        # These recorded inputs remain readable even while their provider is
+        # absent. The shader's unknown output is never reused as a live input.
+        color = _original_attr_record(
+            material, _ORIGINAL_COLOR_INPUT_ATTRIBUTES +
+            ("diffuse", "input", "input_color", "inputColor"),
+        )
+        if not color and _original_plugin_node_state(material) != "unavailable":
+            color = _original_output_color_record(material, source)
+        color_mode, color_source = self._eye_fallback_wire(
+            color, shader + ".color", (0.5, 0.5, 0.5),
+        )
+        texture_count = int(color_mode == "texture")
+        transparency = _original_attr_record(material, _ORIGINAL_DIRECT_TRANSPARENCY_ATTRIBUTES)
+        invert_opacity = False
+        if not _original_record_has_signal(transparency):
+            opacity = _original_attr_record(material, _ORIGINAL_OPACITY_ATTRIBUTES)
+            if opacity:
+                transparency = opacity
+                invert_opacity = True
+        alpha_mode, _ = self._eye_fallback_wire(
+            transparency, shader + ".transparency", (0.0, 0.0, 0.0),
+            invert=invert_opacity,
+        )
+        texture_count += int(alpha_mode == "texture")
+        emission = _original_attr_record(material, _ORIGINAL_EMISSION_INPUT_ATTRIBUTES)
+        emission_mode, _ = self._eye_fallback_wire(
+            emission, shader + ".incandescence", (0.0, 0.0, 0.0),
+        )
+        texture_count += int(emission_mode == "texture")
+        cmds.setAttr(shader + ".diffuse", 0.8)
+        self.eye_fallback_shader_info[shader] = {
+            "color_mode": "native_texture" if color_mode == "texture" else
+                "cached_numeric" if color else "maya_default",
+            "color_source": color_source,
+            "color_value": list(_original_vector((color or {}).get("value"), (0.5, 0.5, 0.5))),
+            "texture_connection_count": texture_count,
+        }
+        return shader
+
+    def _apply_eye_fallback(self, group):
+        surface = group + ".surfaceShader"
+        sources = self.eye_connection_snapshot.get(surface) or []
+        if len(sources) != 1:
+            raise RuntimeError("Eye fallback requires exactly one authored surface shader: " + group)
+        source = sources[0]
+        shader = self._create_eye_fallback_shader(source.split(".", 1)[0], source)
+        for attribute in ("surfaceShader", "displacementShader", "volumeShader"):
+            destination = group + "." + attribute
+            if destination not in self.eye_connection_snapshot:
+                continue
+            authored = self.eye_connection_snapshot[destination]
+            self.connections.append((destination, list(authored)))
+            if attribute == "surfaceShader":
+                _original_connect(shader + ".outColor", destination)
+                expected = [shader + ".outColor"]
+            else:
+                for incoming in _incoming_source_plugs(destination):
+                    cmds.disconnectAttr(incoming, destination)
+                expected = []
+            self.eye_fallback_expected_connections[destination] = expected
+        shapes = sorted(set(self._member_shape(member) for member in self._group_members(group)))
+        self.report["eye_fallback_records"].append({
+            "shading_engine": group, "source_shader_plug": source,
+            "native_shader": shader, "affected_shapes": shapes,
+            "reason": "unavailable_plugin_dependency",
+            "unavailable_plugin_nodes": [
+                self.eye_fallback_groups[group][node]
+                for node in sorted(self.eye_fallback_groups[group])
+            ],
+            **self.eye_fallback_shader_info[shader],
+        })
+        self.report["eye_fallback_applied"] = True
+
+    def _finish_eye_fallback_report(self):
+        records = self.report["eye_fallback_records"]
+        if not records:
+            return
+        self.report["eye_fallback_shading_engine_count"] = len(records)
+        self.report["eye_fallback_shape_count"] = len(set(
+            shape for record in records for shape in record["affected_shapes"]
+        ))
+        self.report["eye_fallback_material_count"] = len(set(
+            record["native_shader"] for record in records
+        ))
+        self.report["eye_fallback_texture_connection_count"] = sum(
+            record["texture_connection_count"] for record in records
+        )
+        self.report["eye_fallback_verified"] = True
+        self.report["eye_dependency_preflight_passed"] = True
+        plugins = sorted(set(
+            _clean(record.get("plugin"))
+            for record in self.report["eye_unavailable_plugin_nodes"]
+            if _clean(record.get("plugin"))
+        ))
+        self.report["warnings"].append(
+            "Authored eye plug-in(s) {0} unavailable; {1} eye shadingEngine(s) "
+            "temporarily use Maya Lambert with available native inputs/cached colors. "
+            "Original shader connections are restored after capture.".format(
+                ", ".join(plugins) or "<unknown>",
+                len(records),
+            )
+        )
+
+    def _create_split_group(self, shader):
+        group = cmds.sets(renderable=True, noSurfaceShader=True, empty=True,
+                          name="HMB_Original_Midgray_SplitSG#")
+        self.created_nodes.append(group)
+        _original_connect(shader + ".outColor", group + ".surfaceShader")
+        return group
 
     def _create_lambert(self):
         shader = cmds.shadingNode("lambert", asShader=True, name="HMB_Original_Midgray_Lambert#")
@@ -4640,6 +5123,11 @@ class _OriginalLambertOverrideController(object):
 
     def _restore(self):
         failures = []
+        for group, members in reversed(self.split_memberships):
+            try:
+                cmds.sets(members, edit=True, forceElement=group)
+            except Exception as exc:
+                failures.append("{0} membership: {1}".format(group, exc))
         for destination, sources in reversed(self.connections):
             try:
                 # Force-connect a saved source before disconnecting the safe
@@ -4662,6 +5150,14 @@ class _OriginalLambertOverrideController(object):
             except Exception as exc:
                 self.report["shading_group_membership_preserved"] = False
                 failures.append("{0}: {1}".format(group, exc))
+        for destination, sources in self.eye_connection_snapshot.items():
+            try:
+                if sorted(_incoming_source_plugs(destination)) != sorted(sources):
+                    raise RuntimeError("authored eye shader connection changed")
+            except Exception as exc:
+                self.report["eye_materials_preserved"] = False
+                failures.append("{0}: {1}".format(destination, exc))
+        self.report["eye_assignments_preserved"] = self.report["shading_group_membership_preserved"]
         if failures:
             # Keep the temporary shader if any SG could still depend on it.
             self.report["temporary_nodes_retained_on_restore_failure"] = True
@@ -4688,11 +5184,30 @@ class _OriginalLambertOverrideController(object):
                     active_groups.append(group)
             self.report["inspected_shading_engine_count"] = len(active_groups)
             self.report["contributing_shading_engine_count"] = len(active_groups)
-            shader = self._create_lambert() if active_groups else ""
+            eye_plan = self._eye_group_plan(active_groups)
+            body_group_count = sum(group not in eye_plan or bool(eye_plan[group]) for group in active_groups)
+            shader = self._create_lambert() if body_group_count else ""
             self.report["temporary_lambert_count"] = int(bool(shader))
             self.report["opaque_surface_verified"] = True
             source_materials = set()
             for group in active_groups:
+                if group in eye_plan:
+                    body_members = eye_plan[group]
+                    if body_members:
+                        split_group = self._create_split_group(shader)
+                        # Record before forceElement: a failed Maya call can
+                        # still have reassigned a subset of the members.
+                        self.split_memberships.append((group, body_members))
+                        cmds.sets(body_members, edit=True, forceElement=split_group)
+                        if self._group_members(group) != sorted(set(self.membership_snapshot[group]) - set(body_members)):
+                            raise RuntimeError("Original eye/body split did not preserve the exact eye memberships.")
+                        if self._group_members(split_group) != sorted(body_members):
+                            raise RuntimeError("Original eye/body split did not retain the exact body memberships.")
+                        self.report["split_shading_engine_count"] += 1
+                        self.report["split_body_member_count"] += len(body_members)
+                    if group in self.eye_fallback_groups:
+                        self._apply_eye_fallback(group)
+                    continue
                 # Even existing Lambert/unknown/plugin/empty surface assignments
                 # are overridden; no authored color, alpha or texture is read.
                 for attribute in ("surfaceShader", "displacementShader", "volumeShader"):
@@ -4715,13 +5230,21 @@ class _OriginalLambertOverrideController(object):
                     raise RuntimeError("Original solid override changed shadingEngine membership.")
                 self.report["swapped_shading_engine_count"] += 1
             self.report["source_material_count"] = len(source_materials)
+            for destination, sources in self.eye_connection_snapshot.items():
+                expected = self.eye_fallback_expected_connections.get(destination, sources)
+                if sorted(_incoming_source_plugs(destination)) != sorted(expected):
+                    self.report["eye_materials_preserved"] = False
+                    raise RuntimeError("Original changed an authored eye shader connection: " + destination)
+            self._finish_eye_fallback_report()
             self.report["status"] = "applied"
             return dict(self.report)
         except Exception as original_exc:
             try:
                 self._restore()
             except Exception as restore_exc:
+                self.job["_original_material_override_report"] = dict(self.report)
                 raise RuntimeError("Original solid override and rollback failed: {0} | {1}".format(original_exc, restore_exc))
+            self.job["_original_material_override_report"] = dict(self.report)
             raise
 
     def finish(self):
@@ -6407,6 +6930,142 @@ def _depth_api_camera_points(record, camera_matrix, om, frame):
     return camera_points
 
 
+
+def _depth_prepare_range_hints(job, shapes):
+    """Resolve optional depth-only hints without applying Color render scope."""
+    if "depth_range_bindings" not in (job or {}):
+        return None
+    try:
+        raw = job.get("depth_range_bindings")
+        if not isinstance(raw, list):
+            return {"roles": {}, "roots": [], "invalid": True}
+        bindings = _read_job_bindings(dict(job, bindings=raw))
+        roots = {}
+        for row in bindings:
+            root = _clean(row.get("subject_root") or row.get("full_dag_path"))
+            if root and root not in roots:
+                roots[root] = _clean(row.get("color"))
+        roles = {}
+        available = set(shapes or [])
+        # The most specific real DAG root owns overlaps. One mesh and one root
+        # summary cannot be counted twice merely through nested bindings.
+        for root in sorted(roots, key=lambda value: (value.count("|"), value)):
+            marker = roots[root]
+            for shape in _descendant_shapes(root):
+                if shape in available:
+                    roles[shape] = {
+                        "root": root, "marker": marker,
+                        "role": "foreground" if marker in CHARACTER_MARKERS else "context",
+                    }
+        return {"roles": roles, "roots": sorted(roots), "invalid": False}
+    except Exception:
+        # Optional range hints never impose Color capture prerequisites.
+        return {"roles": {}, "roots": [], "invalid": True}
+
+
+def _depth_close_focus_range(records, hint_roots, camera_near, mode, manual=False, camera_far=None):
+    """Equal-weight compact roots define only the close normalization range."""
+    evidence = {
+        "policy": "robust_compact_binding_local_context_v1",
+        "hint_source": "depth_range_bindings", "applied": False,
+        "fallback_reason": "", "chosen_roots": [], "excluded_roots": [],
+        "root_statistics": [], "median_upper_fence": None, "span_upper_fence": None,
+        "foreground_near": None, "foreground_far": None,
+        "local_context_near": None, "local_context_far": None,
+        "local_context_sample_count": 0, "near": None, "far": None,
+    }
+    if manual or mode != "close":
+        evidence["fallback_reason"] = "manual_or_non_close_range"
+        return evidence
+    grouped = {}
+    for row in records or []:
+        root = _clean(row.get("root"))
+        if (root not in set(hint_roots or []) or row.get("role") != "foreground"
+                or not row.get("normalization_eligible")):
+            continue
+        grouped.setdefault(root, {}).setdefault(float(row["frame"]), []).append(float(row["depth"]))
+    stats = []
+    for root, frames in sorted(grouped.items()):
+        near_values = [_depth_percentile(values, DEPTH_FOREGROUND_NEAR_PERCENTILE) for values in frames.values()]
+        far_values = [_depth_percentile(values, DEPTH_FOREGROUND_FAR_PERCENTILE) for values in frames.values()]
+        stats.append({
+            "root": root, "sample_count": sum(len(values) for values in frames.values()),
+            "frame_count": len(frames),
+            "median_depth": _depth_median([_depth_median(values) for values in frames.values()]),
+            "near_percentile": min(near_values), "far_percentile": max(far_values),
+            # Spatial span is measured independently on each frame. A compact
+            # actor moving far across the sequence is still a compact actor.
+            "spatial_span": max(far - near for near, far in zip(near_values, far_values)),
+            "selected": False, "reason": "",
+        })
+    evidence["root_statistics"] = stats
+    if len(stats) < 3:
+        evidence["fallback_reason"] = "fewer_than_three_screen_valid_hint_roots"
+        return evidence
+    def upper_fence(values):
+        lower, upper = _depth_percentile(values, .25), _depth_percentile(values, .75)
+        return upper + 1.5 * (upper - lower)
+    median_fence = upper_fence([row["median_depth"] for row in stats])
+    span_fence = upper_fence([row["spatial_span"] for row in stats])
+    evidence["median_upper_fence"], evidence["span_upper_fence"] = median_fence, span_fence
+    for row in stats:
+        far_and_wide = row["median_depth"] > median_fence and row["spatial_span"] > span_fence
+        row["selected"] = not far_and_wide
+        row["reason"] = "far_and_spatially_wide_outlier" if far_and_wide else "compact_or_coherent_hint"
+    selected = [row for row in stats if row["selected"]]
+    if len(selected) < 3:
+        evidence["fallback_reason"] = "fewer_than_three_coherent_hint_roots"
+        return evidence
+    chosen = {row["root"] for row in selected}
+    near = min(row["near_percentile"] for row in selected)
+    far = max(row["far_percentile"] for row in selected)
+    span = max(far - near, max(abs(far) * .02, .01))
+    window_far = far + span
+    context = [
+        row for row in records or []
+        if row.get("normalization_eligible") and _clean(row.get("root")) not in chosen
+        and float(camera_near) <= float(row["depth"]) <= window_far
+    ]
+    local_far = max([far] + [float(row["depth"]) for row in context])
+    guard_endpoint = float(camera_near) + .01
+    if camera_far is not None:
+        # The numerical minimum span must also obey the physical camera clip.
+        # In a valid tiny clip interval, the report and final range stay equal.
+        guard_endpoint = min(guard_endpoint, float(camera_far))
+    evidence.update({
+        "applied": True, "chosen_roots": sorted(chosen),
+        "excluded_roots": sorted(row["root"] for row in stats if not row["selected"]),
+        "foreground_near": near, "foreground_far": far,
+        "local_context_near": float(camera_near), "local_context_far": window_far,
+        "local_context_sample_count": len(context), "near": float(camera_near),
+        "far": max(local_far, guard_endpoint),
+    })
+    return evidence
+
+
+def _depth_camera_ray_projection(camera, width, height):
+    """Use the actual Maya output gate, including orthographic camera width."""
+    from maya.api import OpenMaya as om
+    selection = om.MSelectionList()
+    selection.add(camera)
+    path = selection.getDagPath(0)
+    if not path.node().hasFn(om.MFn.kCamera):
+        path.extendToShape()
+    camera_fn = om.MFnCamera(path)
+    orthographic = camera_fn.isOrtho
+    if callable(orthographic):
+        orthographic = orthographic()
+    near = float(camera_fn.nearClippingPlane)
+    frustum = camera_fn.getViewingFrustum(
+        float(width) / float(max(1, height)), True, True, True,
+    )
+    left, right, bottom, top = [float(value) for value in frustum[:4]]
+    if near <= 0.0 or not all(math.isfinite(v) for v in (near, left, right, bottom, top)):
+        raise RuntimeError("Depth camera projection gate is invalid.")
+    return {"near": near, "is_ortho": bool(orthographic),
+            "left": left, "right": right, "bottom": bottom, "top": top}
+
+
 def _sampled_shot_depth_range(
     camera,
     frame_values,
@@ -6438,6 +7097,21 @@ def _sampled_shot_depth_range(
         if _clean(item)
     )
 
+    hint_resolution = _depth_prepare_range_hints(job, shapes)
+    close_hint_sampling = bool(
+        hint_resolution is not None and not hint_resolution["invalid"]
+        and len({role["root"] for role in hint_resolution["roles"].values()
+                 if role["role"] == "foreground"}) >= 3
+        and _clean((job or {}).get("depth_range_mode")) in ("", "close")
+        and (job or {}).get("depth_near") is None
+        and (job or {}).get("depth_far") is None
+    )
+    if close_hint_sampling:
+        shape_roles = hint_resolution["roles"]
+        foreground_shape_set = {
+            shape for shape, role in shape_roles.items()
+            if role["role"] == "foreground"
+        }
     try:
         from maya.api import OpenMaya as om
     except Exception as exc:
@@ -6719,7 +7393,8 @@ def _sampled_shot_depth_range(
                     else None
                 )
                 if (role != "foreground" and foreground_shape_set
-                        and _clean((job or {}).get("depth_range_mode")) not in ("middle", "far")):
+                        and _clean((job or {}).get("depth_range_mode")) not in ("middle", "far")
+                        and not close_hint_sampling):
                     # Actor markers have first authority for the effective
                     # range.  Context stays fully shaded/rendered/audited but
                     # does not pay per-frame vertex sampling cost when it
@@ -7098,7 +7773,35 @@ def _sampled_shot_depth_range(
         report["fallback_reason"] = "all_api_mesh_screen_samples_rejected"
         report["range_extrema_sources"] = {}
         return report
-    if foreground_representative_depths:
+    close_focus = _depth_close_focus_range(
+        representative_records,
+        hint_resolution["roots"] if close_hint_sampling else [],
+        camera_near_clip_min,
+        _clean((job or {}).get("depth_range_mode")) or "close",
+        manual=(job or {}).get("depth_near") is not None or (job or {}).get("depth_far") is not None,
+        camera_far=camera_far_clip_max,
+    )
+    if hint_resolution is not None and hint_resolution["invalid"]:
+        close_focus["fallback_reason"] = "invalid_optional_range_hints"
+    report["close_focus"] = close_focus
+    if close_hint_sampling and not close_focus["applied"]:
+        # Sparse/offscreen hints are optional. Re-evaluate exactly the legacy
+        # population rather than changing its roles merely through a hint.
+        legacy_job = dict(job or {})
+        legacy_job.pop("depth_range_bindings", None)
+        legacy = _sampled_shot_depth_range(
+            camera, frame_values, width, height, legacy_job,
+        )
+        legacy["close_focus"] = close_focus
+        return legacy
+    if close_focus["applied"]:
+        minimum, maximum = close_focus["near"], close_focus["far"]
+        range_candidates = normalization_representative_depths
+        range_candidate_scope = "close_focus_compact_bindings_and_local_context"
+        range_basis = "complete_sequence_robust_binding_cluster_local_context"
+        fallback_percentile = None
+        fallback_reason = ""
+    elif foreground_representative_depths:
         range_candidates = foreground_representative_depths
         minimum = _depth_percentile(
             range_candidates,
@@ -7175,7 +7878,9 @@ def _sampled_shot_depth_range(
     report["range_candidate_scope"] = range_candidate_scope
     report["range_basis"] = range_basis
     report["near_anchor"] = (
-        "effective_screen_valid_foreground_near"
+        "close_focus_camera_clip_near"
+        if close_focus["applied"]
+        else "effective_screen_valid_foreground_near"
         if foreground_representative_depths
         else "effective_screen_valid_shape_near"
     )
@@ -7190,14 +7895,32 @@ def _sampled_shot_depth_range(
                 else True
             )
         )
+    if close_focus["applied"]:
+        for binding_report in binding_range_reports:
+            binding_report["selected_for_normalization"] = bool(
+                binding_report["root"] in close_focus["chosen_roots"]
+                or any(
+                    record.get("normalization_eligible")
+                    and record["root"] == binding_report["root"]
+                    and close_focus["local_context_near"] <= float(record["depth"]) <= close_focus["local_context_far"]
+                    for record in representative_records
+                )
+            )
     candidate_records = [
         record
         for record in representative_records
         if record.get("normalization_eligible")
         and (
-            record["role"] == "foreground"
-            if foreground_representative_depths
-            else True
+            (
+                record["root"] in close_focus["chosen_roots"]
+                or close_focus["local_context_near"] <= float(record["depth"]) <= close_focus["local_context_far"]
+            )
+            if close_focus["applied"]
+            else (
+                record["role"] == "foreground"
+                if foreground_representative_depths
+                else True
+            )
         )
     ]
     extrema_sources = {}
@@ -7301,7 +8024,9 @@ def _depth_range(camera, job, frame_values=None, width=None, height=None):
     ):
         depth_near = float(sampled_range["near"])
         depth_far = float(sampled_range["far"])
-        if sampled_range.get("foreground_representative_sample_count"):
+        if (sampled_range.get("close_focus") or {}).get("applied"):
+            policy = "close_focus_binding_cluster_bounds"
+        elif sampled_range.get("foreground_representative_sample_count"):
             policy = "screen_valid_foreground_percentile_bounds"
         elif sampled_range.get("fallback_percentile") is not None:
             policy = "screen_valid_shape_robust_fallback_bounds"
@@ -7335,7 +8060,7 @@ def _depth_range(camera, job, frame_values=None, width=None, height=None):
     report = {
         "profile": DEPTH_PLAYBLAST_PROFILE,
         "space": "camera",
-        "source": "object_bbox_camera_depth",
+        "source": "object_camera_depth_with_visible_surface_fallback",
         "normalization_policy": policy,
         "distance_mode": range_mode,
         "close_far": close_far,
@@ -7468,13 +8193,107 @@ def _depth_percentile(values, fraction):
     )
 
 
+
+def _depth_visible_surface_fallback(shape, camera_matrix, om, bbox_depth, context):
+    """Sample only a far-clamped mesh whose bbox overlaps the useful range.
+
+    Rays intersect the actual shape instance, so a huge ground quad remains
+    measurable even when every vertex and polygon centre is off screen.
+    This changes one constant bucket for that mesh, never its flat-gray policy.
+    """
+    report = context["report"]
+    report["candidate_shape_frame_count"] += 1
+    if _clean(cmds.nodeType(shape)) != "mesh":
+        return bbox_depth
+    try:
+        projection = context.get("projection")
+        if projection is None:
+            projection = _depth_camera_ray_projection(
+                context["camera"], context["width"], context["height"],
+            )
+            context["projection"] = projection
+        selection = om.MSelectionList()
+        selection.add(shape)
+        dag_path = selection.getDagPath(0)
+        mesh_function = om.MFnMesh(dag_path)
+        # Maya caches the accelerator for this exact mesh/instance and reuses
+        # it for all 35 rays; dense ground meshes never pay 35 full scans.
+        acceleration = mesh_function.autoUniformGridParams()
+        camera_world = camera_matrix.inverse()
+        origin = om.MPoint(0.0, 0.0, 0.0, 1.0) * camera_world
+        camera_shape = _camera_shape(context["camera"])
+        clip_near = float(cmds.getAttr(camera_shape + ".nearClipPlane"))
+        clip_far = float(cmds.getAttr(camera_shape + ".farClipPlane"))
+    except Exception:
+        report["unavailable_shape_frame_count"] += 1
+        return bbox_depth
+    depths = []
+    ray_count = 0
+    for row in range(DEPTH_VISIBLE_SURFACE_GRID_ROWS):
+        v = (float(row) + 0.5) / float(DEPTH_VISIBLE_SURFACE_GRID_ROWS)
+        y = projection["bottom"] + v * (projection["top"] - projection["bottom"])
+        for column in range(DEPTH_VISIBLE_SURFACE_GRID_COLUMNS):
+            u = (float(column) + 0.5) / float(DEPTH_VISIBLE_SURFACE_GRID_COLUMNS)
+            x = projection["left"] + u * (projection["right"] - projection["left"])
+            near = float(projection["near"])
+            ray_origin = om.MPoint(x, y, -near, 1.0) * camera_world
+            if projection["is_ortho"]:
+                ray_target = om.MPoint(x, y, -clip_far, 1.0) * camera_world
+            else:
+                scale = clip_far / near
+                ray_target = om.MPoint(x * scale, y * scale, -clip_far, 1.0) * camera_world
+            direction = ray_target - ray_origin
+            length = float(direction.length())
+            if not math.isfinite(length) or length <= 1.0e-9:
+                continue
+            direction /= length
+            ray_count += 1
+            try:
+                result = mesh_function.closestIntersection(
+                    om.MFloatPoint(ray_origin.x, ray_origin.y, ray_origin.z),
+                    om.MFloatVector(direction.x, direction.y, direction.z),
+                    om.MSpace.kWorld,
+                    length,
+                    False,
+                    accelParams=acceleration,
+                )
+            except Exception:
+                report["ray_error_count"] += 1
+                continue
+            if not result:
+                continue
+            try:
+                point = result[0]
+                camera_point = om.MPoint(point.x, point.y, point.z, 1.0) * camera_matrix
+                depth = -float(camera_point.z)
+            except Exception:
+                continue
+            if math.isfinite(depth) and clip_near <= depth <= clip_far:
+                depths.append(depth)
+    report["sampled_shape_frame_count"] += 1
+    report["ray_test_count"] += ray_count
+    report["hit_count"] += len(depths)
+    visible_depth = _depth_median(depths) if depths else None
+    replaced = bool(visible_depth is not None and 0.0 < visible_depth < context["far"])
+    if replaced:
+        report["replaced_shape_frame_count"] += 1
+    if replaced:
+        report["records"].append({
+            "shape": shape, "frame": context["frame"],
+            "bbox_depth": bbox_depth, "visible_depth": visible_depth,
+            "hit_count": len(depths), "ray_test_count": ray_count,
+        })
+    return visible_depth if replaced else bbox_depth
+
+
 def _depth_shape_representative_camera_depth(
     shape,
     camera_matrix,
     om,
     frame=None,
+    visible_fallback=None,
 ):
-    """Return median positive camera depth of the exact world bbox corners.
+    """Return bbox median depth, refining only far-clamped visible mesh interiors.
 
     Bounds are queried with ``ignoreInvisible=False`` because an animated path
     can be hidden on one output frame and visible on another.  It must retain a
@@ -7512,6 +8331,7 @@ def _depth_shape_representative_camera_depth(
     ys = (values[1], values[4])
     zs = (values[2], values[5])
     positive_depths = []
+    raw_depths = []
     try:
         for x_value in xs:
             for y_value in ys:
@@ -7521,6 +8341,8 @@ def _depth_shape_representative_camera_depth(
                         * camera_matrix
                     )
                     depth = -float(point.z)
+                    if math.isfinite(depth):
+                        raw_depths.append(depth)
                     if math.isfinite(depth) and depth > 0.0:
                         positive_depths.append(depth)
     except Exception as exc:
@@ -7529,7 +8351,17 @@ def _depth_shape_representative_camera_depth(
             "frame {1}: {2}".format(shape, frame, exc)
         )
     if positive_depths:
-        return _depth_median(positive_depths)
+        representative = _depth_median(positive_depths)
+        if (
+            visible_fallback is not None
+            and representative >= float(visible_fallback["far"])
+            and min(raw_depths) < float(visible_fallback["far"])
+            and max(raw_depths) > 0.0
+        ):
+            return _depth_visible_surface_fallback(
+                shape, camera_matrix, om, representative, visible_fallback,
+            )
+        return representative
 
     try:
         center = om.MPoint(
@@ -7722,14 +8554,14 @@ def _apply_depth_shader(
     range_report["nurbs_surface_shape_count"] = int(
         shape_type_counts.get("nurbsSurface") or 0
     )
-    range_report["source"] = "object_bbox_camera_depth"
+    range_report["source"] = "object_camera_depth_with_visible_surface_fallback"
     range_report[
         "assignment_mode"
     ] = "color_picker_style_shared_gray_material_buckets"
     range_report["depth_update_scope"] = "per_shape_path_per_output_frame"
     range_report[
         "representative_depth"
-    ] = "median_positive_camera_depth_of_world_bbox_corners"
+    ] = "median_positive_bbox_depth_with_visible_ray_hit_fallback"
     range_report["shader_model"] = "surfaceShader"
     range_report["grayscale_bucket_count"] = DEPTH_GRAYSCALE_BUCKET_COUNT
     range_report["proxy_preview_recovery"] = recovery_report
@@ -7744,10 +8576,33 @@ def _apply_depth_shader(
         "ambiguous_shape_path_count": 0,
         "unsupported_shape_path_count": 0,
     }
+    visible_surface_report = {
+        "policy": "out_of_range_bbox_camera_ray_surface_median_v1",
+        "visibility_scope": "target_mesh_camera_projection",
+        "grid_columns": DEPTH_VISIBLE_SURFACE_GRID_COLUMNS,
+        "grid_rows": DEPTH_VISIBLE_SURFACE_GRID_ROWS,
+        "max_rays_per_shape": (
+            DEPTH_VISIBLE_SURFACE_GRID_COLUMNS * DEPTH_VISIBLE_SURFACE_GRID_ROWS
+        ),
+        "candidate_shape_frame_count": 0,
+        "sampled_shape_frame_count": 0,
+        "replaced_shape_frame_count": 0,
+        "unavailable_shape_frame_count": 0,
+        "ray_error_count": 0,
+        "ray_test_count": 0,
+        "hit_count": 0,
+        "records": [],
+    }
+    range_report["visible_surface_fallback"] = visible_surface_report
     previous_assignments = {}
 
     def assign_depth_frame(frame, _frame_index=None, _frame_count=None):
         om, camera_matrix = _depth_camera_world_inverse_matrix(camera)
+        visible_context = {
+            "camera": camera, "width": width or 1280, "height": height or 720,
+            "near": range_report["near"], "far": range_report["far"],
+            "frame": frame, "report": visible_surface_report,
+        }
         expected_assignments = {}
         assignments_by_group = {}
         for shape in shapes:
@@ -7756,6 +8611,7 @@ def _apply_depth_shader(
                 camera_matrix,
                 om,
                 frame=frame,
+                visible_fallback=visible_context,
             )
             bucket_index = _depth_grayscale_bucket_index(
                 representative_depth,
@@ -9115,6 +9971,7 @@ def _set_viewport_render_options(
     screen_space_patterns=False,
     depth_mode=False,
     original_lambert_mode=False,
+    original_eye_textures=False,
 ):
     _set_png_capture_output_options()
     report = {
@@ -9137,14 +9994,15 @@ def _set_viewport_render_options(
         labels = cmds.attributeQuery("renderMode", node="hardwareRenderingGlobals", listEnum=True) or []
         solid_mode = None
         enum_index = -1
+        desired_modes = ("textured", "shadedandtextured") if original_eye_textures else ("shaded", "smoothshaded")
         for field in (labels[0].split(":") if labels else []):
             name, separator, explicit_index = field.partition("=")
             enum_index = int(explicit_index) if separator else enum_index + 1
-            if re.sub(r"[^a-z]", "", name.lower()) in ("shaded", "smoothshaded"):
+            if re.sub(r"[^a-z]", "", name.lower()) in desired_modes:
                 solid_mode = enum_index
                 break
         if solid_mode is None:
-            raise RuntimeError("Maya did not expose its native untextured shaded render mode.")
+            raise RuntimeError("Maya did not expose the requested native Original render mode.")
         for attr, value in (
             ("hardwareRenderingGlobals.lightingMode", 0),
             ("hardwareRenderingGlobals.renderMode", solid_mode),
@@ -9168,7 +10026,8 @@ def _set_viewport_render_options(
             raise RuntimeError("Original solid output transform remained enabled.")
         report.update({
             "default_lighting_verified": True,
-            "solid_render_mode_verified": True,
+            "solid_render_mode_verified": not original_eye_textures,
+            "textured_render_mode_verified": bool(original_eye_textures),
             "soft_shading_verified": True,
             "output_transform_disabled": True,
             "ssao_disabled": True,
@@ -9361,8 +10220,14 @@ def _rendered_file_for_unique_prefix(folder, prefix, started_at):
                 candidates.append((modified, path))
     if not candidates:
         return ""
-    candidates.sort()
-    return candidates[-1][1]
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "Ambiguous OGS output for one capture frame: {0}. "
+            "Only the isolated default render layer may produce an image.".format(
+                ", ".join(sorted(path for _, path in candidates))
+            )
+        )
+    return candidates[0][1]
 
 
 def _render_frames(
@@ -9444,6 +10309,9 @@ def _render_frames(
                     "width": int(width),
                     "height": int(height),
                     "noRenderView": True,
+                    # OGS otherwise renders every authored renderable legacy
+                    # layer; its last image can overwrite the requested pass.
+                    "layer": "defaultRenderLayer",
                 }
                 if bool((job or {}).get("screen_space_patterns")):
                     render_options["enableMultisample"] = False
@@ -15547,6 +16415,91 @@ def _set_capture_evaluation_mode(mode, restoring=False):
         )
 
 
+def _apply_capture_render_layer():
+    """Isolate temporary capture mutations from authored layer overrides."""
+    previous_legacy_layer = _clean(
+        cmds.editRenderLayerGlobals(query=True, currentRenderLayer=True)
+    )
+    if not previous_legacy_layer:
+        raise RuntimeError("Maya returned no current legacy render layer.")
+    if (
+        not cmds.objExists("defaultRenderLayer")
+        or cmds.nodeType("defaultRenderLayer") != "renderLayer"
+    ):
+        raise RuntimeError("The Maya default render layer is unavailable.")
+    context = {
+        "previous_legacy_layer": previous_legacy_layer,
+        "render_setup": None,
+        "previous_render_setup_layer": None,
+        "report": {
+            "capture_layer": "defaultRenderLayer",
+            "previous_legacy_layer": previous_legacy_layer,
+            "previous_render_setup_layer": "",
+            "render_setup_switched": False,
+            "default_layer_verified": False,
+            "restored": False,
+            "restore_ok": False,
+        },
+    }
+    try:
+        # Render Setup visibility can carry material/geometry overrides even
+        # though ogsRender itself only understands legacy render layers.
+        if cmds.ls(type="renderSetupLayer"):
+            import maya.app.renderSetup.model.renderSetup as render_setup
+            setup = render_setup.instance()
+            previous = setup.getVisibleRenderLayer()
+            default = setup.getDefaultRenderLayer()
+            if previous is None or default is None:
+                raise RuntimeError("Render Setup returned no visible/default layer.")
+            context["render_setup"] = setup
+            context["previous_render_setup_layer"] = previous
+            context["report"]["previous_render_setup_layer"] = _clean(previous.name())
+            setup.switchToLayer(default)
+            if setup.getVisibleRenderLayer() != default:
+                raise RuntimeError("Render Setup did not activate its default layer.")
+            context["report"]["render_setup_switched"] = True
+        cmds.editRenderLayerGlobals(currentRenderLayer="defaultRenderLayer")
+        actual = _clean(
+            cmds.editRenderLayerGlobals(query=True, currentRenderLayer=True)
+        )
+        if actual != "defaultRenderLayer":
+            raise RuntimeError(
+                "Maya capture layer could not be isolated: {0}.".format(actual)
+            )
+        context["report"]["default_layer_verified"] = True
+        return context
+    except Exception:
+        _restore_capture_render_layer(context)
+        raise
+
+
+def _restore_capture_render_layer(context):
+    if context is None or context["report"].get("restored"):
+        return
+    try:
+        setup = context.get("render_setup")
+        previous_setup = context.get("previous_render_setup_layer")
+        if setup is not None and previous_setup is not None:
+            setup.switchToLayer(previous_setup)
+            if setup.getVisibleRenderLayer() != previous_setup:
+                raise RuntimeError("Render Setup visible layer was not restored.")
+        previous = context["previous_legacy_layer"]
+        cmds.editRenderLayerGlobals(currentRenderLayer=previous)
+        actual = _clean(
+            cmds.editRenderLayerGlobals(query=True, currentRenderLayer=True)
+        )
+        if actual != previous:
+            raise RuntimeError(
+                "Expected legacy layer {0}, read back {1}.".format(previous, actual)
+            )
+        context["report"].update({"restored": True, "restore_ok": True})
+    except Exception as exc:
+        context["report"]["restore_ok"] = False
+        raise RuntimeError(
+            "Maya capture render layer could not be restored: {0}.".format(exc)
+        )
+
+
 def run(job_path):
     job_path = os.path.abspath(job_path)
     job = _read_json(job_path)
@@ -15554,6 +16507,7 @@ def run(job_path):
     result_path = os.path.abspath(job["result_path"])
     result = {"ok": False, "job_path": job_path}
     previous_evaluation_mode = None
+    capture_render_layer = None
     try:
         _emit_console("INFO", "Background runner started.")
         _emit_console("INFO", "Job file: {0}".format(job_path))
@@ -15589,6 +16543,9 @@ def run(job_path):
         # Scene load callbacks may change evaluation mode. Reassert and verify
         # before any capture-specific time changes, bounding boxes or rendering.
         _set_capture_evaluation_mode(evaluation_mode)
+        capture_render_layer = _apply_capture_render_layer()
+        job["_capture_render_layer_report"] = capture_render_layer["report"]
+        result["capture_render_layer"] = capture_render_layer["report"]
         capture_pass = _clean(job.get("capture_pass"))
         if capture_pass not in ("", "color", "depth", "motion_guide"):
             raise RuntimeError("Unsupported Maya capture pass: {0}.".format(capture_pass))
@@ -15996,13 +16953,19 @@ def run(job_path):
             _write_progress(
                 job,
                 "preparing_original_lambert_materials",
-                "Replacing authored materials with one texture-free soft midgray surface.",
+                "Applying a soft midgray body while preserving authored eye shaders.",
             )
             try:
                 original_material_controller = (
                     _OriginalLambertOverrideController(job)
                 )
                 original_material_controller.apply()
+                if original_material_controller.report["eye_textures_enabled"]:
+                    render_options_report = _set_viewport_render_options(
+                        preserve_authored_look=True,
+                        original_lambert_mode=True,
+                        original_eye_textures=True,
+                    )
                 for warning in original_material_controller.report.get(
                     "warnings", []
                 ):
@@ -16020,6 +16983,7 @@ def run(job_path):
                         )
                     ),
                     "soft_shading_verified": bool(render_options_report.get("soft_shading_verified")),
+                    "textured_render_mode_verified": bool(render_options_report.get("textured_render_mode_verified")),
                 })
                 original_material_report = dict(
                     original_material_controller.report
@@ -16028,18 +16992,20 @@ def run(job_path):
                     original_material_report
                 )
             except Exception:
-                if quality_restore is not None:
-                    warnings.extend(
-                        _restore_full_smooth_viewport(quality_restore)
-                    )
-                    quality_restore = None
+                try:
+                    if original_material_controller is not None:
+                        original_material_controller.finish()
+                finally:
+                    if quality_restore is not None:
+                        warnings.extend(_restore_full_smooth_viewport(quality_restore))
+                        quality_restore = None
                 raise
         try:
             if original_material_controller is not None:
                 _write_progress(
                     job,
                     "original_lambert_materials_ready",
-                    "Texture-free midgray solid preview with soft shading is active.",
+                    "Soft midgray body preview with authored eye shaders is active.",
                     temporary_lambert_count=int(
                         original_material_report.get("temporary_lambert_count") or 0
                     ),
@@ -16251,6 +17217,7 @@ def run(job_path):
         auxiliary_render_scope_report = dict(
             job.get("_auxiliary_render_scope_report") or {}
         )
+        _restore_capture_render_layer(capture_render_layer)
         sidecar_path = os.path.abspath(job["sidecar_path"])
         payload = {
             "video": "",
@@ -16290,6 +17257,7 @@ def run(job_path):
             "scene_dependency_paths": list(job.get("_scene_dependency_paths") or []),
             "script_node_report": dict(job.get("_script_node_report") or {}),
             "render_scope": dict(render_scope_report),
+            "capture_render_layer": dict(capture_render_layer["report"]),
             "auxiliary_render_scope": auxiliary_render_scope_report,
             "cutout_transparency": dict(
                 job.get("_marker_cutout_transparency")
@@ -16370,6 +17338,7 @@ def run(job_path):
                     job.get("_script_node_report") or {}
                 ),
                 "render_scope": dict(render_scope_report),
+                "capture_render_layer": dict(capture_render_layer["report"]),
                 "auxiliary_render_scope": auxiliary_render_scope_report,
             }
             _write_json(depth_sidecar_path, depth_payload)
@@ -16420,6 +17389,7 @@ def run(job_path):
                 ),
                 "auxiliary_render_scope": auxiliary_render_scope_report,
                 "render_scope": dict(render_scope_report),
+                "capture_render_layer": dict(capture_render_layer["report"]),
             }
             _write_json(
                 motion_guide_sidecar_path,
@@ -16525,6 +17495,9 @@ def run(job_path):
             "error": str(exc),
             "traceback": traceback.format_exc(),
         })
+        original_failure_report = job.get("_original_material_override_report")
+        if isinstance(original_failure_report, dict) and original_failure_report:
+            result["original_material_override_report"] = dict(original_failure_report)
         try:
             _write_json(result_path, result)
         except Exception:
@@ -16533,6 +17506,20 @@ def run(job_path):
         traceback.print_exc()
         raise
     finally:
+        layer_restore_error = None
+        if capture_render_layer is not None:
+            try:
+                _restore_capture_render_layer(capture_render_layer)
+            except Exception as exc:
+                layer_restore_error = exc
+                result.update({
+                    "ok": False, "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                })
+            try:
+                _write_json(result_path, result)
+            except Exception:
+                pass
         if previous_evaluation_mode is not None:
             try:
                 _set_capture_evaluation_mode(previous_evaluation_mode, restoring=True)
@@ -16548,6 +17535,9 @@ def run(job_path):
                     pass
                 _emit_console("ERROR", str(exc))
                 raise
+        if layer_restore_error is not None:
+            _emit_console("ERROR", str(layer_restore_error))
+            raise layer_restore_error
 
 
 def run_from_env():

@@ -27,6 +27,16 @@ runner = importlib.util.module_from_spec(spec)
 assert spec and spec.loader
 spec.loader.exec_module(runner)
 
+def _mock_capture_render_layer():
+    return {"report": {"capture_layer": "defaultRenderLayer",
+                       "default_layer_verified": True, "restored": False,
+                       "restore_ok": False}}
+
+
+def _mock_restore_capture_render_layer(context):
+    context["report"].update({"restored": True, "restore_ok": True})
+
+
 runner_source = RUNNER_PATH.read_text(encoding="utf-8")
 runner_tree = ast.parse(runner_source, filename=str(RUNNER_PATH))
 assert runner.MAYA_WORLD_PATTERN_PROFILE == "hmb_maya_world_root_projection_v1"
@@ -83,7 +93,7 @@ assert runner.SCREEN_SPACE_PATTERN_PROFILE == "hmb_screen_space_pattern_post_v2"
 assert runner.SCREEN_SPACE_PATTERN_LINEAR_SCALE_DIVISOR == 3
 assert runner.SCREEN_SPACE_PATTERN_CELL_DIVISOR == 24
 assert runner.POSITION_PATTERN_REPEATS == 3
-assert runner.DEPTH_PLAYBLAST_PROFILE == "hmb_camera_space_depth_v7"
+assert runner.DEPTH_PLAYBLAST_PROFILE == "hmb_camera_space_depth_v8"
 assert runner.DEPTH_NEAR_COLOR == 0.9
 assert runner.DEPTH_FAR_COLOR == 0.0
 assert runner.DEPTH_CAMERA_NEAR_SAFETY_MARGIN == 0.1
@@ -906,7 +916,7 @@ try:
     runner._marker_renderable_shapes = lambda shapes: list(shapes)
     runner._depth_camera_world_inverse_matrix = lambda _camera: (object(), object())
     runner._depth_shape_representative_camera_depth = (
-        lambda shape, _matrix, _om, frame=None: (
+        lambda shape, _matrix, _om, frame=None, visible_fallback=None: (
             1.0 if shape.endswith("HeroShape") else 100.0
         )
     )
@@ -965,7 +975,7 @@ assert depth_report["temporal_normalization"] == "fixed_for_complete_sequence"
 assert depth_report["renderable_shape_count"] == 2
 assert depth_report["mesh_shape_count"] == 1
 assert depth_report["nurbs_surface_shape_count"] == 1
-assert depth_report["source"] == "object_bbox_camera_depth"
+assert depth_report["source"] == "object_camera_depth_with_visible_surface_fallback"
 assert (
     depth_report["assignment_mode"]
     == "color_picker_style_shared_gray_material_buckets"
@@ -973,7 +983,7 @@ assert (
 assert depth_report["depth_update_scope"] == "per_shape_path_per_output_frame"
 assert (
     depth_report["representative_depth"]
-    == "median_positive_camera_depth_of_world_bbox_corners"
+    == "median_positive_bbox_depth_with_visible_ray_hit_fallback"
 )
 assert depth_report["shader_model"] == "surfaceShader"
 assert depth_report["grayscale_bucket_count"] == 256
@@ -2527,6 +2537,8 @@ with tempfile.TemporaryDirectory(prefix="hmb_maya_depth_run_") as temp_dir:
     run_calls = []
     run_originals = {
         "cmds": runner.cmds,
+        "_apply_capture_render_layer": runner._apply_capture_render_layer,
+        "_restore_capture_render_layer": runner._restore_capture_render_layer,
         "_open_scene_for_job": runner._open_scene_for_job,
         "_load_marker_catalog": runner._load_marker_catalog,
         "_read_job_bindings": runner._read_job_bindings,
@@ -2576,6 +2588,8 @@ with tempfile.TemporaryDirectory(prefix="hmb_maya_depth_run_") as temp_dir:
 
     try:
         runner.cmds = RunCmds()
+        runner._apply_capture_render_layer = _mock_capture_render_layer
+        runner._restore_capture_render_layer = _mock_restore_capture_render_layer
         runner._open_scene_for_job = (
             lambda _job: run_calls.append("open") or str(scene_path)
         )
@@ -2696,6 +2710,8 @@ with tempfile.TemporaryDirectory(prefix="hmb_maya_independent_aux_") as temp_dir
     independent_calls = []
     originals = {
         "cmds": runner.cmds,
+        "_apply_capture_render_layer": runner._apply_capture_render_layer,
+        "_restore_capture_render_layer": runner._restore_capture_render_layer,
         "_open_scene_for_job": runner._open_scene_for_job,
         "_load_marker_catalog": runner._load_marker_catalog,
         "_read_job_bindings": runner._read_job_bindings,
@@ -2746,6 +2762,8 @@ with tempfile.TemporaryDirectory(prefix="hmb_maya_independent_aux_") as temp_dir
 
     try:
         runner.cmds = RunCmds()
+        runner._apply_capture_render_layer = _mock_capture_render_layer
+        runner._restore_capture_render_layer = _mock_restore_capture_render_layer
         runner._open_scene_for_job = lambda _job: str(scene_path)
         runner._load_marker_catalog = lambda _job: {}
         runner._read_job_bindings = lambda _job: [{

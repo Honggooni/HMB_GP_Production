@@ -1870,6 +1870,130 @@ function hmbSnapshotUid(item, snapshotIndex = 0) {
   return `snapshot-${hmbVideoAssetHash(identity)}`;
 }
 
+export function hmbSnapshotOutputSelection(state, container = null) {
+  const checked = (selector, value) => {
+    const input = container?.querySelector?.(selector);
+    return input && typeof input.checked === "boolean" ? input.checked : !!value;
+  };
+  return {
+    include_original: checked("#original-preview-toggle", state?.original_enabled),
+    include_mask: checked("#mask-playblast-toggle", state?.mask_enabled !== false),
+    include_depth: checked("#depth-playblast-toggle", state?.depth_enabled),
+  };
+}
+
+export function hmbSnapshotArtifactType(item) {
+  const role = clean(item?.artifact_type).toLowerCase();
+  return ["original", "mask", "depth"].includes(role) ? role : "mask";
+}
+
+export function hmbSnapshotViewportLabel(item, tr = TEXT.en) {
+  const role = hmbSnapshotArtifactType(item);
+  const roleLabel = role === "original" ? "Original" : role === "depth" ? (tr.depth || "Depth") : (tr.mask || "Mask");
+  return `${tr.snapshot || "Snapshot"} · ${roleLabel}`;
+}
+
+function hmbSnapshotSelectionState(state, snapshot, viewportMode = "snapshot") {
+  return {
+    ...state,
+    viewport_mode: snapshot && viewportMode === "snapshot" ? "snapshot" : "video",
+    active_snapshot_uid: clean(snapshot?.snapshot_uid),
+    snapshot_active: !!snapshot && viewportMode === "snapshot",
+    snapshot_frame: Number(snapshot?.frame ?? state?.snapshot_frame ?? 0),
+    snapshot_video_slot: snapshot ? Number(snapshot.render_video_slot || snapshot.video_slot || 1) : 0,
+    snapshot_data_uri: "",
+    snapshot_path: clean(snapshot?.path), snapshot_url: clean(snapshot?.url), snapshot_sha256: clean(snapshot?.sha256),
+    snapshot_artifact_type: hmbSnapshotArtifactType(snapshot),
+    snapshot_batch_uid: clean(snapshot?.snapshot_batch_uid),
+  };
+}
+
+export function hmbDeletePickerSnapshot(state, uid) {
+  const targetUid = clean(uid), history = hmbSnapshotHistory(state);
+  const index = history.findIndex((item) => clean(item.snapshot_uid) === targetUid);
+  const remaining = history.filter((item) => clean(item.snapshot_uid) !== targetUid);
+  const next = { ...state, snapshots: remaining };
+  if (clean(state?.active_snapshot_uid) !== targetUid) return next;
+  const fallback = remaining[Math.max(0, Math.min(index - 1, remaining.length - 1))] || null;
+  return hmbSnapshotSelectionState(next, fallback, clean(state?.viewport_mode) || "snapshot");
+}
+
+// A snapshot delete owns only one immutable history UID. Local tombstones stay
+// after success so crossed backend echoes cannot restore the deleted image.
+export function hmbBeginOptimisticPickerSnapshotDeletion(container, state, uid, actionId = "") {
+  const snapshot = hmbSnapshotHistory(state).find((item) => clean(item.snapshot_uid) === clean(uid));
+  if (!snapshot) return { state, action_id: "" };
+  if (!(container.__hmbPickerSnapshotDeletions instanceof Map)) container.__hmbPickerSnapshotDeletions = new Map();
+  const deleted = hmbDeletePickerSnapshot(state, snapshot.snapshot_uid);
+  const record = {
+    snapshot: { ...snapshot }, snapshot_uid: snapshot.snapshot_uid,
+    runtime_instance_id: clean(state.runtime_instance_id),
+    action_id: clean(actionId) || `delete_snapshot-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`,
+    previous_active_uid: clean(state.active_snapshot_uid), previous_viewport_mode: clean(state.viewport_mode),
+    deleted_active_uid: clean(deleted.active_snapshot_uid), deleted_viewport_mode: clean(deleted.viewport_mode),
+  };
+  container.__hmbPickerSnapshotDeletions.set(record.action_id, record);
+  return { state: deleted, action_id: record.action_id, snapshot_uid: record.snapshot_uid };
+}
+
+function hmbRestoreRejectedPickerSnapshot(state, record, local = state) {
+  const history = hmbSnapshotHistory(state);
+  if (record.snapshot && !history.some((item) => clean(item.snapshot_uid) === record.snapshot_uid)) history.push({ ...record.snapshot });
+  let restored = { ...state, snapshots: hmbSnapshotHistory({ snapshots: history }) };
+  const unchangedSelection = clean(local?.active_snapshot_uid) === record.deleted_active_uid
+    && clean(local?.viewport_mode) === record.deleted_viewport_mode;
+  const selectedUid = unchangedSelection ? record.previous_active_uid : clean(local?.active_snapshot_uid);
+  const selected = restored.snapshots.find((item) => clean(item.snapshot_uid) === selectedUid) || null;
+  return hmbSnapshotSelectionState(restored, selected,
+    unchangedSelection ? record.previous_viewport_mode : clean(local?.viewport_mode));
+}
+
+export function hmbApplyOptimisticPickerSnapshotDeletions(container, incoming) {
+  const deletions = container?.__hmbPickerSnapshotDeletions;
+  if (!(deletions instanceof Map) || !deletions.size) return incoming;
+  let state = normalize(incoming);
+  for (const [actionId, record] of deletions) {
+    if (clean(state.runtime_instance_id) !== record.runtime_instance_id) {
+      deletions.delete(actionId);
+      continue;
+    }
+    const result = state.snapshot_delete_results?.[actionId];
+    if (clean(state.state_writer) === "python" && result?.status === "rejected" && !record.confirmed) {
+      state = hmbRestoreRejectedPickerSnapshot(state, record, container.__hmbPendingPickerState || state);
+      deletions.delete(actionId);
+      continue;
+    }
+    if (clean(state.state_writer) === "python" && ["removed", "absent"].includes(result?.status)) {
+      record.confirmed = true;
+      delete record.snapshot;
+    }
+    state = hmbDeletePickerSnapshot(state, record.snapshot_uid);
+  }
+  for (const [actionId, record] of deletions) {
+    if (deletions.size <= 512) break;
+    if (record.confirmed) deletions.delete(actionId);
+  }
+  return state;
+}
+
+export function hmbClearDeletedPickerSnapshotPreview(container, snapshot) {
+  const url = hmbSnapshotMediaUrl(snapshot);
+  const pending = container?.__hmbPendingPickerSnapshotImage;
+  if (pending?.url === url) delete container.__hmbPendingPickerSnapshotImage;
+  const image = container?.querySelector?.("#picker-snapshot-image");
+  if (image && clean(image.getAttribute?.("src")) === url) {
+    image.hidden = true;
+    image.remove?.();
+  }
+}
+
+export function hmbRejectOptimisticPickerSnapshotDeletion(container, state, actionId) {
+  const record = container?.__hmbPickerSnapshotDeletions?.get?.(actionId);
+  if (!record || record.confirmed || clean(state?.runtime_instance_id) !== record.runtime_instance_id) return state;
+  container.__hmbPickerSnapshotDeletions.delete(actionId);
+  return hmbApplyOptimisticPickerSnapshotDeletions(container, hmbRestoreRejectedPickerSnapshot(state, record));
+}
+
 export function hmbSnapshotHistory(state) {
   return (Array.isArray(state?.snapshots) ? state.snapshots : [])
     .map((item, snapshotIndex) => ({ item, snapshotIndex }))
@@ -1881,6 +2005,8 @@ export function hmbSnapshotHistory(state) {
     .map(({ item, snapshotIndex }) => ({
       ...item,
       snapshot_uid: hmbSnapshotUid(item, snapshotIndex),
+      artifact_type: hmbSnapshotArtifactType(item),
+      snapshot_batch_uid: clean(item?.snapshot_batch_uid),
       __snapshot_index: snapshotIndex,
     }))
     .sort((left, right) => (
@@ -4391,6 +4517,8 @@ function normalize(value) {
     );
     snapshotByUid.set(snapshotUid, {
       snapshot_uid: snapshotUid,
+      artifact_type: hmbSnapshotArtifactType(raw),
+      snapshot_batch_uid: clean(raw?.snapshot_batch_uid),
       video_uid: clean(raw?.video_uid),
       render_video_slot: renderVideoSlot,
       video_slot: renderVideoSlot,
@@ -4403,7 +4531,11 @@ function normalize(value) {
       created_at_ms: Math.max(0, Number(raw?.created_at_ms || raw?.created_at || 0)),
     });
   });
-  if (state.snapshot_active && state.snapshot_video_slot && (state.snapshot_path || state.snapshot_url)) {
+  // Immutable history owns a selected UID. A crossed backend echo can carry
+  // the protected local cursor alongside older scalar URL/frame aliases; those
+  // aliases must never overwrite the selected record with the previous image.
+  if (state.snapshot_active && state.snapshot_video_slot && (state.snapshot_path || state.snapshot_url)
+      && !snapshotByUid.has(clean(state.active_snapshot_uid))) {
     const matchingSnapshot = Array.from(snapshotByUid.values()).find((item) => (
       clean(item.path) === state.snapshot_path
       && Number(item.frame || 0) === Number(state.snapshot_frame || 0)
@@ -4420,6 +4552,8 @@ function normalize(value) {
       }, rawSnapshots.length);
     snapshotByUid.set(snapshotUid, {
       snapshot_uid: snapshotUid,
+      artifact_type: hmbSnapshotArtifactType(matchingSnapshot || { artifact_type: state.snapshot_artifact_type }),
+      snapshot_batch_uid: clean(matchingSnapshot?.snapshot_batch_uid || state.snapshot_batch_uid),
       video_uid: clean(matchingSnapshot?.video_uid || state.preview_video_uid || state.selected_video_uid),
       render_video_slot: state.snapshot_video_slot,
       video_slot: state.snapshot_video_slot,
@@ -4462,6 +4596,8 @@ function normalize(value) {
     state.snapshot_path = clean(activeSnapshot.path);
     state.snapshot_url = clean(activeSnapshot.url);
     state.snapshot_sha256 = clean(activeSnapshot.sha256);
+    state.snapshot_artifact_type = hmbSnapshotArtifactType(activeSnapshot);
+    state.snapshot_batch_uid = clean(activeSnapshot.snapshot_batch_uid);
   } else {
     state.snapshot_active = false;
     state.active_snapshot_uid = "";
@@ -4547,7 +4683,7 @@ function hmbPickerStateFromProps(props) {
 const HMB_PICKER_INTERACTION_FIELDS = [
   "active_picker_shot_uuid", "outliner_expanded", "outliner_search", "depth_settings", "slot_visibility",
   "original_enabled", "mask_enabled", "depth_enabled", "motion_guide_enabled",
-  "output_width", "output_height", "selected_camera", "language", "viewport_mode",
+  "output_width", "output_height", "selected_camera", "language", "viewport_mode", "active_snapshot_uid",
 ];
 
 export function hmbRememberPickerInteractionDraft(container, next, previous) {
@@ -5235,6 +5371,7 @@ export function pickerButtonAvailability(
   const maskGenerationSelected = Object.prototype.hasOwnProperty.call(state, "mask_enabled")
     ? !!state.mask_enabled
     : true;
+  const snapshotOutputSelected = !!state.original_enabled || maskGenerationSelected || !!state.depth_enabled;
   const generationOutputSelected = !!state.original_enabled
     || maskGenerationSelected
     || !!state.depth_enabled
@@ -5265,7 +5402,8 @@ export function pickerButtonAvailability(
     snapshotEnabled: !operationBusy
       && snapshotReadReady
       && cameraReady
-      && outputReady,
+      && outputReady
+      && snapshotOutputSelected,
     snapshotDeleteEnabled: !operationBusy && snapshotAvailable,
     operationBusy,
     sceneChanged,
@@ -7219,7 +7357,7 @@ function hmbVideoPickerCompactShellTopInset(container, shell) {
   return 0;
 }
 
-const HMB_VIDEO_PICKER_COMPACT_TAIL_ROW_PROPERTIES = Object.freeze(["height"]);
+const HMB_VIDEO_PICKER_COMPACT_TAIL_ROW_PROPERTIES = Object.freeze(["height", "min-height"]);
 const HMB_VIDEO_PICKER_COMPACT_TAIL_SPACER_PROPERTIES = Object.freeze([
   "height",
   "min-height",
@@ -7664,7 +7802,16 @@ export function hmbInstallVideoPickerExpandedHostReconciliation(
 export function hmbRestoreVideoPickerCompactTailReclaim(container) {
   const record = hmbVideoPickerCompactTailReclaims.get(container) || null;
   if (!record) return false;
-  hmbRestoreVideoPickerCompactTailStyle(record.layoutRow, record.rowSnapshot);
+  const rowSnapshot = { ...record.rowSnapshot };
+  const currentMinimum = hmbVideoPickerHybridStyleValue(record.layoutRow, "min-height");
+  if (
+    currentMinimum.value !== `${record.appliedContentHeight}px`
+    || currentMinimum.priority !== "important"
+  ) {
+    // A newer host declaration belongs to the Editor, including at cleanup.
+    delete rowSnapshot["min-height"];
+  }
+  hmbRestoreVideoPickerCompactTailStyle(record.layoutRow, rowSnapshot);
   hmbRestoreVideoPickerCompactTailStyle(record.trailingSpacer, record.spacerSnapshot);
   hmbVideoPickerCompactTailReclaims.delete(container);
   return true;
@@ -7714,9 +7861,11 @@ export function hmbApplyVideoPickerCompactTailReclaim(
     hmbVideoPickerCompactTailReclaims.set(container, record);
   } else if (record.appliedContentHeight > 0) {
     const previousPixels = `${record.appliedContentHeight}px`;
-    const currentRow = hmbVideoPickerHybridStyleValue(record.layoutRow, "height");
-    if (currentRow.value !== previousPixels || currentRow.priority !== "important") {
-      record.rowSnapshot.height = currentRow;
+    for (const property of HMB_VIDEO_PICKER_COMPACT_TAIL_ROW_PROPERTIES) {
+      const currentRow = hmbVideoPickerHybridStyleValue(record.layoutRow, property);
+      if (currentRow.value !== previousPixels || currentRow.priority !== "important") {
+        record.rowSnapshot[property] = currentRow;
+      }
     }
     const appliedSpacerValues = {
       height: "0px",
@@ -7740,6 +7889,9 @@ export function hmbApplyVideoPickerCompactTailReclaim(
   );
   const pixels = `${contentHeight}px`;
   record.layoutRow.style.setProperty?.("height", pixels, "important");
+  // React can replace the allocator's inline height after our settled pass.
+  // Keep the complete Shot content visible without an observer feedback loop.
+  record.layoutRow.style.setProperty?.("min-height", pixels, "important");
   record.trailingSpacer.style.setProperty?.("height", "0px", "important");
   record.trailingSpacer.style.setProperty?.("min-height", "0px", "important");
   record.trailingSpacer.style.setProperty?.("max-height", "0px", "important");
@@ -10022,7 +10174,7 @@ export function hmbStageVideoPickerSnapshotImage(container, snapshotUrl) {
   const nextImage = ownerDocument.createElement("img");
   nextImage.id = "picker-snapshot-image";
   nextImage.className = "preview-image";
-  nextImage.alt = "Colored snapshot";
+  nextImage.alt = "Snapshot";
   const request = { stage, url: snapshotUrl, image: nextImage };
   container.__hmbPendingPickerSnapshotImage = request;
   const currentRequest = () => (
@@ -10180,7 +10332,7 @@ export function hmbPatchVideoPickerPreviewDom(container, stateValue, tr = TEXT.e
     button.closest?.(".video-asset-thumb")?.classList?.toggle?.("is-playing", active);
   }
   const viewportLabel = container.querySelector?.(".viewport-title small");
-  if (viewportLabel) viewportLabel.textContent = `(${descriptor.kind === "snapshot" ? (tr.snapshot || "Snapshot") : (tr.preview || "Video")})`;
+  if (viewportLabel) viewportLabel.textContent = `(${descriptor.kind === "snapshot" ? hmbSnapshotViewportLabel(hmbSnapshotHistory(stateValue).find((item) => clean(item.snapshot_uid) === descriptor.uid), tr) : (tr.preview || "Video")})`;
   container.__hmbPickerToolsController?.refresh?.(stateValue, { mediaOnly: true });
   return descriptor.kind === "video" ? video : descriptor.kind === "snapshot" ? snapshot : empty;
 }
@@ -10432,7 +10584,8 @@ export function hmbCreateVideoPickerMediaController(container, options = {}) {
     );
     if (previewIdentityChanged) {
       container.__hmbViewportFrame = Math.round(clamp(
-        Number(frameContext.state.preview_frame ?? frameContext.start),
+        Number(nextDescriptor.kind === "snapshot"
+          ? frameContext.state.snapshot_frame : (frameContext.state.preview_frame ?? frameContext.start)),
         frameContext.start,
         frameContext.end,
       ));
@@ -10904,7 +11057,7 @@ export function hmbApplySnapshotNavigationFeedback(container, snapshot, tr, fram
   const snapshotUrl = hmbSnapshotMediaUrl(snapshot);
   const frame = Number(snapshot?.frame || frameStart || 0);
   const title = container?.querySelector?.(".viewport-title small");
-  if (title) title.textContent = `(${clean(tr?.snapshot) || "Snapshot"})`;
+  if (title) title.textContent = `(${hmbSnapshotViewportLabel(snapshot, tr)})`;
   const frameInput = container?.querySelector?.("#video-frame-number");
   const seek = container?.querySelector?.("#video-seek");
   const frameInfo = container?.querySelector?.("#frame-info-frame");
@@ -11809,6 +11962,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       delete container.__hmbPickerWorkspacePublicationGeneration;
       delete container.__hmbVideoPickerExpanded;
       delete container.__hmbVideoPickerRuntimeInstanceId;
+      delete container.__hmbPickerSnapshotDeletions;
       delete container.__hmbVideoPickerExpandedCache;
       delete container.__hmbVideoPickerExpandedFragment;
       delete container.__hmbVideoPickerCompactFragment;
@@ -11830,8 +11984,10 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   const previousCleanup = container.__hmbVideoPickerCleanup;
   if (typeof previousCleanup === "function") previousCleanup();
   container.setAttribute?.("data-hmb-node-delete-protected", "true");
-  const engineState = normalize(hmbApplyOptimisticPickerVideoDeletions(container,
-    normalize(props?.value ?? props?.parameterValue ?? props?.defaultValue),
+  const engineState = normalize(hmbApplyOptimisticPickerSnapshotDeletions(container,
+    hmbApplyOptimisticPickerVideoDeletions(container,
+      normalize(props?.value ?? props?.parameterValue ?? props?.defaultValue),
+    ),
   ));
   hmbBindVideoPickerRuntimeIdentity(container, engineState.runtime_instance_id);
   hmbReconcilePickerCommandAcknowledgements(container, engineState);
@@ -12090,11 +12246,11 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   const initialTimecode = formatFrameTimecode(initialViewportFrame, frameStart, sourceFps);
   const frameInfoFps = Number.isInteger(sourceFps) ? String(sourceFps) : sourceFps.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
   const viewportMediaHtml = snapshotForViewport
-    ? `<img id="picker-snapshot-image" class="preview-image" src="${escapeHtml(hmbSnapshotMediaUrl(selectedSnapshot))}" alt="Colored snapshot"/>`
+    ? `<img id="picker-snapshot-image" class="preview-image" src="${escapeHtml(hmbSnapshotMediaUrl(selectedSnapshot))}" alt="${escapeHtml(hmbSnapshotViewportLabel(selectedSnapshot, tr))}"/>`
     : selectedVideoUrl
       ? `<video id="picker-video" class="preview-video" src="${escapeHtml(selectedVideoUrl)}" preload="metadata" playsinline></video>`
       : `<div class="viewport-empty"><div class="camera-frame"></div><b>${escapeHtml(initialToolPreview?.empty ? (state.language === "en" ? "No tool input" : "입력 영상 없음") : tr.noPreviewTitle)}</b><span>${escapeHtml(initialToolPreview?.empty ? (state.language === "en" ? "Drag one video card from the right into this tool." : "오른쪽의 영상 카드를 한 개씩 이 도구에 드래그하세요.") : tr.noPreviewBody)}</span></div>`;
-  const viewportModeLabel = snapshotForViewport ? (tr.snapshot || "Snapshot") : (tr.preview || "Video");
+  const viewportModeLabel = snapshotForViewport ? hmbSnapshotViewportLabel(selectedSnapshot, tr) : (tr.preview || "Video");
   const snapshotDeleteEnabled = !runningOperation && !!selectedSnapshot;
   const activityRows = hmbActivityLogRowsForDisplay(state);
   const priorOutlinerScroll = container.querySelector?.(".outliner-scroll");
@@ -13279,7 +13435,8 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     const nextTr = TEXT[nextState.language] || TEXT.ko;
     const locked = pickerWorkspaceInteractionLocked(nextState);
     const immediateMediaLocked = pickerLocalInteractionLocked(nextState);
-    container.__hmbViewportFrame = Number(nextState.preview_frame || 0);
+    container.__hmbViewportFrame = Number(nextState.viewport_mode === "snapshot" && !hmbPickerToolsOverride(nextState, container)
+      ? nextState.snapshot_frame : (nextState.preview_frame || 0));
     hmbPatchVideoPickerShotWorkspace(
       container,
       nextState,
@@ -14566,8 +14723,15 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     event?.preventDefault?.();
     event?.stopPropagation?.();
     const currentLocal = currentWidgetState();
+    const outputSelection = hmbSnapshotOutputSelection(currentLocal, container);
+    const selectedRoles = ["original", "mask", "depth"].filter((role) => outputSelection[`include_${role}`]);
+    if (!selectedRoles.length) {
+      appendImmediateLogLine("WARNING", "Select at least one Snapshot output: Original, Mask, or Depth.");
+      return;
+    }
     const currentAvailability = pickerButtonAvailability(
-      currentLocal,
+      { ...currentLocal, original_enabled: outputSelection.include_original,
+        mask_enabled: outputSelection.include_mask, depth_enabled: outputSelection.include_depth },
       clean(currentLocal.scene_request_path || currentLocal.scene_path),
       !!container.__hmbReadCommandPending,
       !!container.__hmbOriginalCommandPending,
@@ -14591,9 +14755,13 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       selected_video_slot: liveSlot,
       video_uid: clean(currentLocal.preview_video_uid || currentLocal.selected_video_uid),
       snapshot_frame: frame,
+      ...outputSelection,
       output_width: Number(currentLocal.output_width || 1280),
       output_height: Number(currentLocal.output_height || 720),
       authoring_state: {
+        original_enabled: outputSelection.include_original,
+        mask_enabled: outputSelection.include_mask,
+        depth_enabled: outputSelection.include_depth,
         depth_settings: hmbNormalizeDepthSettings(currentLocal.depth_settings),
         state_revision: Number(currentLocal.state_revision || 0),
         selected_camera: clean(currentLocal.selected_camera || currentLocal.camera),
@@ -14607,7 +14775,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     if (!result.delivered) {
       appendImmediateLogLine("ERROR", "SNAPSHOT could not be delivered to HMB_PICKER_COMMAND.");
     } else {
-      appendImmediateLogLine("INFO", `Current-cut snapshot requested at Maya frame ${frame}.`);
+      appendImmediateLogLine("INFO", `Snapshot requested at Maya frame ${frame}: ${selectedRoles.join(", ")}.`);
     }
   });
   on(container.querySelector("#delete-snapshot"), "click", (event) => {
@@ -14622,13 +14790,34 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
       return;
     }
     const liveSlot = Number(activeSnapshot.render_video_slot || activeSnapshot.video_slot || 1);
+    const deletion = hmbBeginOptimisticPickerSnapshotDeletion(container, currentLocal, activeSnapshot.snapshot_uid);
+    if (!deletion.action_id) return;
+    hmbClearDeletedPickerSnapshotPreview(container, activeSnapshot);
+    container.__hmbPendingPickerState = normalize(deletion.state);
+    if (container.__hmbPickerPaintFirstState) {
+      hmbCancelVideoPickerPaintFirstTask(container, "state-publication");
+      delete container.__hmbPickerPaintFirstState;
+      delete container.__hmbPickerPaintFirstPublication;
+    }
+    patchPickerWorkspaceExperience(deletion.state);
+    applyImmediateCommandUi(deletion.state);
+    const rollback = () => {
+      if (container.__hmbVideoPickerDeleted === true) return;
+      const restored = hmbRejectOptimisticPickerSnapshotDeletion(container, currentWidgetState(), deletion.action_id);
+      container.__hmbPendingPickerState = normalize(restored);
+      patchPickerWorkspaceExperience(restored);
+      applyImmediateCommandUi(restored);
+    };
     const result = dispatchCommand("delete_snapshot", {
       scene_path: clean(currentLocal.scene_request_path || currentLocal.scene_path),
       selected_video_slot: liveSlot,
       snapshot_uid: clean(activeSnapshot.snapshot_uid),
-    }, "", HMB_PICKER_GUARDED_COMMAND_OPTIONS);
-    if (result.duplicate) return;
-    if (!result.delivered) appendImmediateLogLine("ERROR", "Snapshot delete command could not be delivered.");
+    }, deletion.action_id);
+    if (!result.delivered) {
+      rollback();
+      appendImmediateLogLine("ERROR", "Snapshot delete command could not be delivered.");
+    }
+    result.deliveryPromise?.then?.((outcome) => { if (outcome?.ok === false) rollback(); });
   });
   on(container.querySelector("#run-video"), "click", (event) => {
     event?.preventDefault?.();
@@ -15574,8 +15763,8 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
   });
   schedulePickerFit(true);
   container.__hmbVideoPickerControllerUpdate = (nextProps) => {
-    nextProps = { ...(nextProps || {}), value: hmbApplyOptimisticPickerVideoDeletions(
-      container, hmbPickerStateFromProps(nextProps || {}),
+    nextProps = { ...(nextProps || {}), value: hmbApplyOptimisticPickerSnapshotDeletions(container,
+      hmbApplyOptimisticPickerVideoDeletions(container, hmbPickerStateFromProps(nextProps || {})),
     ) };
     const interactionEcho = hmbProtectPickerInteractionDraft(container, hmbPickerStateFromProps(nextProps));
     if (interactionEcho.protected) nextProps = { ...nextProps, value: interactionEcho.state };

@@ -101,7 +101,7 @@ if agent._hmb is not common:
     install_bundled_policy_session(agent._hmb)
 
 assert prompt.PICKER_DEPTH_PROFILE == picker.DEPTH_PLAYBLAST_PROFILE
-assert picker.DEPTH_PLAYBLAST_PROFILE == "hmb_camera_space_depth_v7"
+assert picker.DEPTH_PLAYBLAST_PROFILE == "hmb_camera_space_depth_v8"
 
 # Generate Playblast owns the only execution trigger. Four inert choices pack
 # their validated results in Original -> Mask -> Depth -> Motion Guide order.
@@ -760,7 +760,7 @@ command_widget_source = (ROOT / "widgets/HMBVideoPickerCommandBridgeWidget_v032.
 prompt_widget_source = (ROOT / "widgets/HMBPromptLibraryScopedBindingWidget.js").read_text(encoding="utf-8")
 picker_source = (ROOT / "HMBVideoPickerLibrary.py").read_text(encoding="utf-8")
 
-assert picker.DEPTH_PLAYBLAST_PROFILE == "hmb_camera_space_depth_v7"
+assert picker.DEPTH_PLAYBLAST_PROFILE == "hmb_camera_space_depth_v8"
 assert picker.LEGACY_DEPTH_PLAYBLAST_PROFILES == frozenset({
     "hmb_camera_space_depth_v1",
     "hmb_camera_space_depth_v2",
@@ -768,8 +768,9 @@ assert picker.LEGACY_DEPTH_PLAYBLAST_PROFILES == frozenset({
     "hmb_camera_space_depth_v4",
     "hmb_camera_space_depth_v5",
     "hmb_camera_space_depth_v6",
+    "hmb_camera_space_depth_v7",
 })
-assert "hmb_camera_space_depth_v7" not in widget_source
+assert "hmb_camera_space_depth_v8" not in widget_source
 assert "HMB_PICKER_COMMAND" in widget_source
 assert "HMB_VIDEO_PICKER_COMMAND_REGISTRY_KEY" in widget_source
 assert "return latestProps.onChange(command)" in command_widget_source
@@ -1515,7 +1516,9 @@ assert "MARKER_PATTERN_IDS.get(color)" in maya_runner_source
 assert "enableMultisample" in maya_runner_source
 assert "force_high_quality_viewport and not apply_marker_shaders" in maya_runner_source
 assert "cmds.displaySmoothness(" in maya_runner_source
-assert picker_source.count("activity_paths=(frames_folder,)") == 2
+# Original monitors its own frames; Snapshot now uses the shared isolated-pass
+# executor below, whose expected frame path is monitored independently.
+assert picker_source.count("activity_paths=(frames_folder,)") == 1
 assert "def _execute_maya_capture_passes(" in picker_source
 assert "activity_paths=(expected_frames,)" in picker_source
 assert "if motion_guide_enabled" in picker_source
@@ -1839,8 +1842,31 @@ with tempfile.TemporaryDirectory() as temp_dir:
                              "solid_render_mode_verified": True,
                              "soft_shading_verified": True,
                              "authored_materials_ignored": True,
+                             "authored_material_ignore_scope": "non_eye_surfaces",
                              "textures_ignored": True,
                              "opaque_surface_verified": True,
+                             "eye_materials_preserved": True,
+                             "eye_assignments_preserved": True,
+                             "eye_textures_enabled": False,
+                             "textured_render_mode_verified": False,
+                             "preserved_eye_shape_count": 0,
+                             "preserved_eye_component_count": 0,
+                             "preserved_eye_shading_engine_count": 0,
+                             "split_shading_engine_count": 0,
+                             "split_body_member_count": 0,
+                             "eye_texture_dependency_count": 0,
+                             "eye_missing_texture_dependency_count": 0,
+                             "eye_unavailable_plugin_dependency_count": 0,
+                             "eye_dependency_preflight_passed": True,
+                             "eye_unavailable_plugin_nodes": [],
+                             "eye_fallback_policy": "maya_default_shader_for_unavailable_eye_dependencies_v1",
+                             "eye_fallback_applied": False,
+                             "eye_fallback_verified": False,
+                             "eye_fallback_shading_engine_count": 0,
+                             "eye_fallback_shape_count": 0,
+                             "eye_fallback_material_count": 0,
+                             "eye_fallback_texture_connection_count": 0,
+                             "eye_fallback_records": [],
                              "base_color": [0.5, 0.5, 0.5],
                              "fill_color": [0.22, 0.22, 0.22],
                              "diffuse": 0.45,

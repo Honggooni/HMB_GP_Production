@@ -37,12 +37,27 @@ def shader_depth_range_report(frame_values=None) -> dict:
     return {
         "profile": picker.DEPTH_PLAYBLAST_PROFILE,
         "space": "camera",
-        "source": "object_bbox_camera_depth",
+        "source": "object_camera_depth_with_visible_surface_fallback",
         "assignment_mode": "color_picker_style_shared_gray_material_buckets",
         "depth_update_scope": "per_shape_path_per_output_frame",
         "representative_depth": (
-            "median_positive_camera_depth_of_world_bbox_corners"
+            "median_positive_bbox_depth_with_visible_ray_hit_fallback"
         ),
+        "visible_surface_fallback": {
+            "policy": picker.DEPTH_VISIBLE_SURFACE_FALLBACK_POLICY,
+            "visibility_scope": "target_mesh_camera_projection",
+            "grid_columns": 7,
+            "grid_rows": 5,
+            "max_rays_per_shape": 35,
+            "candidate_shape_frame_count": 0,
+            "sampled_shape_frame_count": 0,
+            "replaced_shape_frame_count": 0,
+            "ray_test_count": 0,
+            "hit_count": 0,
+            "unavailable_shape_frame_count": 0,
+            "ray_error_count": 0,
+            "records": [],
+        },
         "normalization_policy": "screen_valid_foreground_percentile_bounds",
         "near": 10.5,
         "far": 30.25,
@@ -222,9 +237,9 @@ def depth_video(path: str, slot: int = 2) -> dict:
     }
 
 
-# Shader Depth authority is deliberately pinned. v1-v6 remain cleanup-only;
+# Shader Depth authority is deliberately pinned. v1-v7 remain cleanup-only;
 # any future semantic change requires an explicit contract migration.
-assert picker.DEPTH_PLAYBLAST_PROFILE == "hmb_camera_space_depth_v7"
+assert picker.DEPTH_PLAYBLAST_PROFILE == "hmb_camera_space_depth_v8"
 assert picker.LEGACY_DEPTH_PLAYBLAST_PROFILES == frozenset({
     "hmb_camera_space_depth_v1",
     "hmb_camera_space_depth_v2",
@@ -232,6 +247,7 @@ assert picker.LEGACY_DEPTH_PLAYBLAST_PROFILES == frozenset({
     "hmb_camera_space_depth_v4",
     "hmb_camera_space_depth_v5",
     "hmb_camera_space_depth_v6",
+    "hmb_camera_space_depth_v7",
 })
 assert picker.DEPTH_CONTRAST_EXPONENT == 1.0
 
@@ -1693,7 +1709,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
             depth_frame_paths=depth_frames,
         )
 
-    # The v7 shader contract is fixed for the whole shot. Legacy range
+    # The v8 shader contract is fixed for the whole shot. Legacy range
     # contracts and any per-frame normalization are rejected.
     for label, field, value in (
         ("camera space", "space", "relative_inverse"),
@@ -1714,7 +1730,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
             "object_origin_camera_depth",
         ),
         ("surfaceShader model", "shader_model", "lambert"),
-        ("v7 range report profile", "profile", "hmb_camera_space_depth_v3"),
+        ("v8 range report profile", "profile", "hmb_camera_space_depth_v3"),
         ("pure-black background", "background", "gray"),
         (
             "fixed-shot normalization",
@@ -1741,6 +1757,352 @@ with tempfile.TemporaryDirectory() as temp_dir:
         ("far distance inside camera clip", "far", 1000.1),
     ):
         assert_invalid_range_field(label, field, value)
+
+    # Use the actual pure native close-focus normalizer for a complete raw
+    # sidecar boundary. No Maya import/render or duplicated clustering function.
+    native_tree = ast.parse(
+        (ROOT / "resources/maya/HMB_Maya_Background_Preview.py").read_text(
+            encoding="utf-8-sig"
+        )
+    )
+    native_function_names = {
+        "_depth_close_focus_range", "_depth_percentile", "_depth_median",
+    }
+    native_namespace = {
+        "_clean": picker._clean,
+        "DEPTH_FOREGROUND_NEAR_PERCENTILE": picker.DEPTH_FOREGROUND_NEAR_PERCENTILE,
+        "DEPTH_FOREGROUND_FAR_PERCENTILE": picker.DEPTH_FOREGROUND_FAR_PERCENTILE,
+        "math": __import__("math"),
+    }
+    exec(
+        compile(ast.Module(body=[
+            node for node in native_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in native_function_names
+        ], type_ignores=[]), "<native-close-focus-fixture>", "exec"),
+        native_namespace,
+    )
+    compact_roots = ["|ActorA", "|ActorB", "|ActorC"]
+    hint_roots = compact_roots + ["|WideBackground"]
+    root_depths = {
+        "|ActorA": (10.0, 12.0), "|ActorB": (15.0, 17.0),
+        "|ActorC": (20.0, 22.0), "|WideBackground": (500.0, 900.0),
+        "|NearEnvironment": (24.0, 28.0),
+    }
+    focus_records = [
+        {"root": root, "frame": frame, "depth": depth,
+         "role": "foreground" if root in hint_roots else "context",
+         "normalization_eligible": True}
+        for root, depths in root_depths.items()
+        for frame in (101.0, 102.0) for depth in depths
+    ]
+    focus_proof = native_namespace["_depth_close_focus_range"](
+        focus_records, hint_roots, 0.1, "close"
+    )
+    assert focus_proof["applied"] is True
+    assert focus_proof["chosen_roots"] == compact_roots
+    assert focus_proof["excluded_roots"] == ["|WideBackground"]
+    assert focus_proof["near"] == 0.1 and focus_proof["far"] == 28.0
+    assert focus_proof["local_context_sample_count"] == 4
+
+    focus_sidecar = copy.deepcopy(depth_sidecar)
+    focus_range = focus_sidecar["depth_range_report"]
+    focus_range.update({
+        "normalization_policy": "close_focus_binding_cluster_bounds",
+        "near": focus_proof["near"], "far": focus_proof["far"],
+        "renderable_shape_count": 10, "mesh_shape_count": 10,
+    })
+    focus_range["assignment_verification"].update({
+        "shape_path_count": 10, "mesh_path_count": 10,
+        "verified_shape_path_count": 10, "verified_mesh_face_count": 120,
+        "expected_frame_assignment_count": 20, "verified_frame_assignment_count": 20,
+    })
+    focus_range["cutout_transparency"]["captured_shape_path_count"] = 10
+    focus_sample = focus_range["shot_range_sample"]
+    focus_sample.update({
+        "close_focus": focus_proof,
+        "representative_sample_count": 20,
+        "foreground_representative_sample_count": 16,
+        "context_representative_sample_count": 4,
+        "normalization_candidate_shape_path_count": 10,
+        "screen_sample_tested_bbox_count": 20,
+        "screen_sample_visible_bbox_count": 20,
+        "range_candidate_scope": "close_focus_compact_bindings_and_local_context",
+        "range_basis": "complete_sequence_robust_binding_cluster_local_context",
+        "near_anchor": "close_focus_camera_clip_near",
+        "fallback_percentile": None, "fallback_reason": "",
+    })
+    binding_template = copy.deepcopy(focus_sample["binding_range_reports"][0])
+    focus_sample["binding_range_reports"] = []
+    for hint_root, depths in root_depths.items():
+        binding_report = copy.deepcopy(binding_template)
+        binding_report.update({
+            "root": hint_root, "role": "foreground" if hint_root in hint_roots else "context",
+            "representative_near": min(depths), "representative_far": max(depths),
+            "normalization_candidate_near": min(depths),
+            "normalization_candidate_far": max(depths),
+            "selected_for_normalization": hint_root != "|WideBackground",
+        })
+        focus_sample["binding_range_reports"].append(binding_report)
+    for label, extrema_root, depth in (
+        ("near", "|ActorA", 10.0), ("far", "|NearEnvironment", 28.0),
+    ):
+        focus_sample["range_extrema_sources"][label].update({
+            "root": extrema_root, "shape": extrema_root + "|Shape",
+            "role": "foreground" if extrema_root in hint_roots else "context",
+            "representative_depth": depth,
+        })
+    focus_validation = validate_depth(
+        result=result_matching_range(focus_sidecar),
+        color_sidecar=color_sidecar, depth_sidecar=focus_sidecar,
+        color_frame_paths=color_frames, depth_frame_paths=depth_frames,
+        expected_frame_count=2, expected_fps=24.0,
+        expected_start_frame=101.0, expected_end_frame=102.0,
+        expected_width=64, expected_height=36,
+    )
+    assert focus_validation["validated"] is True
+
+    # A legal 0.1..0.105 camera clip is narrower than the ordinary .01
+    # numeric span. The native guard must stop at far clip and the complete
+    # backend contract must agree without weakening equality or safety checks.
+    tiny_records = [
+        {"root": hint_root, "frame": frame, "depth": .102,
+         "role": "foreground", "normalization_eligible": True}
+        for hint_root in compact_roots for frame in (101.0, 102.0)
+        for _shape in range(2)
+    ]
+    tiny_proof = native_namespace["_depth_close_focus_range"](
+        tiny_records, compact_roots, .1, "close", camera_far=.105,
+    )
+    assert tiny_proof["applied"] is True
+    assert tiny_proof["near"] == .1 and tiny_proof["far"] == .105
+    tiny_sidecar = copy.deepcopy(focus_sidecar)
+    tiny_range = tiny_sidecar["depth_range_report"]
+    tiny_range.update({
+        "near": .1, "far": .105,
+        "camera_far_clip": .105, "camera_far_clip_min": .105,
+        "camera_far_clip_max": .105,
+    })
+    tiny_sample = tiny_range["shot_range_sample"]
+    tiny_sample.update({
+        "close_focus": tiny_proof,
+        "representative_sample_count": 12,
+        "foreground_representative_sample_count": 12,
+        "context_representative_sample_count": 0,
+        "normalization_candidate_shape_path_count": 6,
+        "screen_sample_tested_bbox_count": 12,
+        "screen_sample_visible_bbox_count": 12,
+    })
+    tiny_sample["binding_range_reports"] = copy.deepcopy(
+        focus_sample["binding_range_reports"][:3]
+    )
+    for tiny_binding in tiny_sample["binding_range_reports"]:
+        tiny_binding.update({
+            "representative_near": .102, "representative_far": .102,
+            "normalization_candidate_near": .102,
+            "normalization_candidate_far": .102,
+        })
+    for tiny_extrema in tiny_sample["range_extrema_sources"].values():
+        tiny_extrema.update({
+            "root": compact_roots[0], "shape": compact_roots[0] + "|Shape",
+            "role": "foreground", "representative_depth": .102,
+        })
+    tiny_validation = validate_depth(
+        result=result_matching_range(tiny_sidecar),
+        color_sidecar=color_sidecar, depth_sidecar=tiny_sidecar,
+        color_frame_paths=color_frames, depth_frame_paths=depth_frames,
+        expected_frame_count=2, expected_fps=24.0,
+        expected_start_frame=101.0, expected_end_frame=102.0,
+        expected_width=64, expected_height=36,
+    )
+    assert tiny_validation["validated"] is True
+    for tiny_label, tiny_far in (
+        ("tiny clip ignores camera far boundary", .11),
+        ("tiny clip omits bounded numerical guard", .102),
+    ):
+        tiny_invalid = copy.deepcopy(tiny_sidecar)
+        tiny_invalid["depth_range_report"]["far"] = tiny_far
+        tiny_invalid["depth_range_report"]["shot_range_sample"][
+            "close_focus"
+        ]["far"] = tiny_far
+        assert_depth_invalid(
+            tiny_label, result=result_matching_range(tiny_invalid),
+            color_sidecar=color_sidecar, depth_sidecar=tiny_invalid,
+            color_frame_paths=color_frames, depth_frame_paths=depth_frames,
+        )
+
+    def assert_invalid_close_focus(label, proof_fields=None, root_fields=None,
+                                   sample_fields=None, range_fields=None):
+        invalid = copy.deepcopy(focus_sidecar)
+        invalid_range = invalid["depth_range_report"]
+        invalid_sample = invalid_range["shot_range_sample"]
+        if proof_fields is not None:
+            invalid_sample["close_focus"].update(proof_fields)
+        if root_fields is not None:
+            invalid_sample["close_focus"]["root_statistics"][0].update(root_fields)
+        if sample_fields is not None:
+            invalid_sample.update(sample_fields)
+        if range_fields is not None:
+            invalid_range.update(range_fields)
+        assert_depth_invalid(
+            label, result=result_matching_range(invalid),
+            color_sidecar=color_sidecar, depth_sidecar=invalid,
+            color_frame_paths=color_frames, depth_frame_paths=depth_frames,
+        )
+
+    for label, replacements in (
+        ("wrong close-focus policy", {"policy": "nearest_object_only"}),
+        ("wrong close-focus hint source", {"hint_source": "asset_name_guess"}),
+        ("inactive proof with active policy", {"applied": False}),
+        ("untyped close-focus applied", {"applied": 1}),
+        ("active proof claims fallback", {"fallback_reason": "invalid_optional_range_hints"}),
+        ("too few coherent roots", {"chosen_roots": compact_roots[:2]}),
+        ("duplicate chosen roots", {"chosen_roots": compact_roots + [compact_roots[0]]}),
+        ("missing excluded root", {"excluded_roots": []}),
+        ("forged median fence", {"median_upper_fence": 1000.0}),
+        ("forged spatial-span fence", {"span_upper_fence": 1000.0}),
+        ("wrong foreground near", {"foreground_near": 1.0}),
+        ("wrong foreground far", {"foreground_far": 1000.0}),
+        ("unbounded context window", {"local_context_far": 1000.0}),
+        ("wrong local context near", {"local_context_near": 10.0}),
+        ("too many context samples", {"local_context_sample_count": 9}),
+        ("untyped context sample count", {"local_context_sample_count": True}),
+        ("missing context far contributor", {"local_context_sample_count": 0}),
+        ("forged clip near anchor", {"near": 10.0}),
+        ("far outside local context window", {"far": 1000.0}),
+        ("nonfinite focus far", {"far": float("nan")}),
+    ):
+        assert_invalid_close_focus(label, proof_fields=replacements)
+    for label, replacements in (
+        ("bool root sample count", {"sample_count": True}),
+        ("more root frames than requested", {"frame_count": 3}),
+        ("root samples missing per-frame evidence", {"sample_count": 1}),
+        ("nonfinite root median", {"median_depth": float("inf")}),
+        ("negative root span", {"spatial_span": -1.0}),
+        ("spatial span exceeds temporal bounds", {"spatial_span": 1000.0}),
+        ("selected coherent root falsely excluded", {"selected": False}),
+        ("wrong exclusion reason", {"reason": "far_and_spatially_wide_outlier"}),
+        ("forged foreground sample volume", {"sample_count": 100}),
+    ):
+        assert_invalid_close_focus(label, root_fields=replacements)
+    assert_invalid_close_focus(
+        "wrong close-focus near anchor",
+        sample_fields={"near_anchor": "effective_screen_valid_foreground_near"},
+    )
+    assert_invalid_close_focus(
+        "changed outer range after focus proof", range_fields={"far": 30.0},
+    )
+    assert_invalid_close_focus(
+        "focus proof under generic policy",
+        range_fields={"normalization_policy": "screen_valid_shape_robust_fallback_bounds"},
+    )
+    assert_invalid_close_focus(
+        "missing close-focus proof", sample_fields={"close_focus": None},
+    )
+    missing_chosen_binding = copy.deepcopy(focus_sidecar)
+    missing_chosen_binding["depth_range_report"]["shot_range_sample"][
+        "binding_range_reports"
+    ][0]["selected_for_normalization"] = False
+    assert_depth_invalid(
+        "chosen compact root missing selected binding",
+        result=result_matching_range(missing_chosen_binding),
+        color_sidecar=color_sidecar, depth_sidecar=missing_chosen_binding,
+        color_frame_paths=color_frames, depth_frame_paths=depth_frames,
+    )
+
+    visible_floor_sidecar = copy.deepcopy(depth_sidecar)
+    visible_floor_report = {
+        "policy": picker.DEPTH_VISIBLE_SURFACE_FALLBACK_POLICY,
+        "visibility_scope": "target_mesh_camera_projection",
+        "grid_columns": 7, "grid_rows": 5, "max_rays_per_shape": 35,
+        "candidate_shape_frame_count": 2,
+        "sampled_shape_frame_count": 2,
+        "replaced_shape_frame_count": 1,
+        "ray_test_count": 70, "hit_count": 21,
+        "unavailable_shape_frame_count": 0, "ray_error_count": 0,
+        "records": [{
+            "shape": "|Stage|FloorShape", "frame": 101.0,
+            "bbox_depth": 900.0, "visible_depth": 3.743,
+            "hit_count": 21, "ray_test_count": 35,
+        }],
+    }
+    visible_floor_sidecar["depth_range_report"]["visible_surface_fallback"] = (
+        visible_floor_report
+    )
+    floor_validation = validate_depth(
+        result=result_matching_range(visible_floor_sidecar),
+        color_sidecar=color_sidecar, depth_sidecar=visible_floor_sidecar,
+        color_frame_paths=color_frames, depth_frame_paths=depth_frames,
+        expected_frame_count=2, expected_fps=24.0,
+        expected_start_frame=101.0, expected_end_frame=102.0,
+        expected_width=64, expected_height=36,
+    )
+    assert floor_validation["validated"] is True
+    assert 0 < visible_floor_report["records"][0]["visible_depth"] < (
+        visible_floor_sidecar["depth_range_report"]["near"]
+    )
+
+    def assert_invalid_visible_fallback(label, replacement=None, record=None):
+        invalid = copy.deepcopy(visible_floor_sidecar)
+        report = invalid["depth_range_report"]["visible_surface_fallback"]
+        if replacement is not None:
+            report.update(replacement)
+        if record is not None:
+            report["records"][0].update(record)
+        assert_depth_invalid(
+            label, result=result_matching_range(invalid),
+            color_sidecar=color_sidecar, depth_sidecar=invalid,
+            color_frame_paths=color_frames, depth_frame_paths=depth_frames,
+        )
+
+    for label, replacements in (
+        ("wrong visible-surface policy", {"policy": "unbounded_global_depth"}),
+        ("wrong visibility scope", {"visibility_scope": "global_scene_occlusion"}),
+        ("unsupported camera grid", {"grid_rows": 8}),
+        ("bool visible count", {"candidate_shape_frame_count": True}),
+        ("negative visible count", {"sampled_shape_frame_count": -1}),
+        ("too many shape-frames", {"candidate_shape_frame_count": 5}),
+        ("replacement without sampling", {"sampled_shape_frame_count": 0}),
+        ("ray tests exceed bounded budget", {"ray_test_count": 71}),
+        ("more hits than rays", {"hit_count": 71}),
+        ("missing replacement record", {"records": []}),
+        ("too many unavailable targets", {"unavailable_shape_frame_count": 3}),
+        ("untyped API errors", {"ray_error_count": "1"}),
+        ("API errors exceed attempted rays", {"ray_error_count": 71}),
+        ("sampled and unavailable targets overlap", {"unavailable_shape_frame_count": 1}),
+        ("unaccounted replacement rays", {"ray_test_count": 34, "hit_count": 21}),
+        ("unaccounted replacement hits", {"hit_count": 20}),
+    ):
+        assert_invalid_visible_fallback(label, replacements)
+    for label, record in (
+        ("missing shape", {"shape": ""}),
+        ("untyped shape", {"shape": 7}),
+        ("unexpected frame", {"frame": 103}),
+        ("nonfinite visible depth", {"visible_depth": float("nan")}),
+        ("bool visible depth", {"visible_depth": True}),
+        ("behind camera visible depth", {"visible_depth": 0}),
+        ("visible surface beyond far", {"visible_depth": 30.25}),
+        ("visible surface outside camera clip", {"visible_depth": 0.01}),
+        ("in-range bbox is not a fallback candidate", {"bbox_depth": 20}),
+        ("no visible ray hit", {"hit_count": 0}),
+        ("too many per-shape ray tests", {"ray_test_count": 36}),
+        ("ray-hit count exceeds per-shape rays", {"hit_count": 36}),
+    ):
+        assert_invalid_visible_fallback(label, record=record)
+    assert_invalid_visible_fallback(
+        "duplicate shape/frame replacement",
+        {
+            "replaced_shape_frame_count": 2,
+            "hit_count": 42,
+            "records": [copy.deepcopy(visible_floor_report["records"][0])] * 2,
+        },
+    )
+    assert_invalid_range_field(
+        "missing visible-surface fallback evidence", "visible_surface_fallback", None
+    )
+    assert_invalid_range_field(
+        "legacy v7 range profile", "profile", "hmb_camera_space_depth_v7"
+    )
 
     missing_screen_extrema = copy.deepcopy(depth_sidecar)
     missing_screen_extrema["depth_range_report"]["shot_range_sample"][

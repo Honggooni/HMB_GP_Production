@@ -152,8 +152,9 @@ assert.doesNotMatch(
   "Outliner feedback must not synchronously publish the full picker state.",
 );
 
-const cameraStart = source.indexOf("hmbInstallPickerValueControlDelegation(\n    container.querySelector(\".picker-camera-control\")");
-const cameraEnd = source.indexOf("hmbInstallPickerValueControlDelegation(\n    container.querySelector(\".palette-head\")", cameraStart);
+const cameraStart = source.search(/hmbInstallPickerValueControlDelegation\(\s*container\.querySelector\("\.picker-camera-control"\)/);
+const cameraEndOffset = source.slice(Math.max(0, cameraStart)).search(/hmbInstallPickerValueControlDelegation\(\s*container\.querySelector\("\.palette-head"\)/);
+const cameraEnd = cameraEndOffset < 0 ? -1 : cameraStart + cameraEndOffset;
 const cameraSource = source.slice(cameraStart, cameraEnd);
 assert.ok(cameraStart >= 0 && cameraEnd > cameraStart);
 assert.match(cameraSource, /schedulePickerStatePublicationAfterPaint\(next\)/);
@@ -164,7 +165,8 @@ assert.doesNotMatch(
 );
 
 const commitStart = source.indexOf("const commit = (next, options = {}) => {");
-const commitEnd = source.indexOf("const currentWidgetState = () => {", commitStart);
+const commitEnd = source.indexOf("const currentWidgetState = (normalizeState = true) => {", commitStart);
+assert.ok(commitStart >= 0 && commitEnd > commitStart);
 const commitSource = source.slice(commitStart, commitEnd);
 assert.match(
   commitSource,

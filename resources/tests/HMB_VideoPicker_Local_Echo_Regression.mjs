@@ -420,7 +420,7 @@ assert.match(
 );
 assert.doesNotMatch(
   snapshotHandler,
-  /depth_enabled|include_depth|selection_order/,
+  /selection_order|liveSlot\s*=.*depth_enabled/,
   "Asset-card order must not redirect Maya Snapshot authoring away from slot 1.",
 );
 

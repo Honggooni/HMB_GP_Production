@@ -167,7 +167,7 @@ assert (
     == "near_white_far_black"
 )
 depth_range_report = depth_sidecar["depth_range_report"]
-assert depth_range_report["source"] == "object_bbox_camera_depth"
+assert depth_range_report["source"] == "object_camera_depth_with_visible_surface_fallback"
 assert (
     depth_range_report["assignment_mode"]
     == "color_picker_style_shared_gray_material_buckets"
@@ -176,7 +176,7 @@ assert depth_range_report["depth_update_scope"] == (
     "per_shape_path_per_output_frame"
 )
 assert depth_range_report["representative_depth"] == (
-    "median_positive_camera_depth_of_world_bbox_corners"
+    "median_positive_bbox_depth_with_visible_ray_hit_fallback"
 )
 assert depth_range_report["shader_model"] == "surfaceShader"
 assert depth_range_report["grayscale_bucket_count"] == 256

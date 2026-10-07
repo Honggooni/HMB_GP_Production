@@ -28,7 +28,7 @@ picker = load("HMBVideoPickerLibrary")
 prompt = load("HMBPromptLibrary")
 
 
-EXPECTED_PROFILE = "hmb_camera_space_depth_v7"
+EXPECTED_PROFILE = "hmb_camera_space_depth_v8"
 LEGACY_PROFILES = (
     "hmb_camera_space_depth_v1",
     "hmb_camera_space_depth_v2",
@@ -36,6 +36,7 @@ LEGACY_PROFILES = (
     "hmb_camera_space_depth_v4",
     "hmb_camera_space_depth_v5",
     "hmb_camera_space_depth_v6",
+    "hmb_camera_space_depth_v7",
 )
 FRAME_COUNT = 7
 WIDTH = 192
@@ -65,12 +66,27 @@ def range_report() -> dict:
     return {
         "profile": picker.DEPTH_PLAYBLAST_PROFILE,
         "space": "camera",
-        "source": "object_bbox_camera_depth",
+        "source": "object_camera_depth_with_visible_surface_fallback",
         "assignment_mode": "color_picker_style_shared_gray_material_buckets",
         "depth_update_scope": "per_shape_path_per_output_frame",
         "representative_depth": (
-            "median_positive_camera_depth_of_world_bbox_corners"
+            "median_positive_bbox_depth_with_visible_ray_hit_fallback"
         ),
+        "visible_surface_fallback": {
+            "policy": picker.DEPTH_VISIBLE_SURFACE_FALLBACK_POLICY,
+            "visibility_scope": "target_mesh_camera_projection",
+            "grid_columns": 7,
+            "grid_rows": 5,
+            "max_rays_per_shape": 35,
+            "candidate_shape_frame_count": 0,
+            "sampled_shape_frame_count": 0,
+            "replaced_shape_frame_count": 0,
+            "ray_test_count": 0,
+            "hit_count": 0,
+            "unavailable_shape_frame_count": 0,
+            "ray_error_count": 0,
+            "records": [],
+        },
         "normalization_policy": "screen_valid_foreground_percentile_bounds",
         "near": 2.0,
         "far": 250.0,

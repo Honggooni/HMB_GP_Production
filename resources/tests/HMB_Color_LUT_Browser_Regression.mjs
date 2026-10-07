@@ -21,13 +21,14 @@ const workspace = fileURLToPath(new URL("../../", import.meta.url));
 const nodeSource = fs.readFileSync(path.join(workspace, "HMBColorLUTLibrary.py"), "utf8");
 const initialWidth = Number(/COLOR_LUT_WIDGET_WIDTH = (\d+)/.exec(nodeSource)[1]);
 const initialHeight = Number(/COLOR_LUT_WIDGET_HEIGHT = (\d+)/.exec(nodeSource)[1]);
+const minimumWidgetHeight = Number(/"min_height": (\d+)/.exec(nodeSource)[1]);
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "hmb-color-lut-browser-"));
 const videoPath = path.join(temporary, "source.mp4");
 const generated = spawnSync(ffmpeg, ["-hide_banner", "-v", "error", "-nostdin", "-n", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=3", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", videoPath], { encoding: "utf8", timeout: 30000 });
 assert.equal(generated.status, 0, generated.stderr);
 const widgetSource = fs.readFileSync(path.join(workspace, "widgets/HMBColorLUTLibraryWidget.js"));
 const videoBytes = fs.readFileSync(videoPath);
-const pageSource = `<!doctype html><html><head><meta charset="UTF-8"><style>body{background:#070910;margin:20px}#widget{width:${initialWidth}px;height:${initialHeight}px}</style></head><body><div id="widget"></div><script type="module">
+const pageSource = `<!doctype html><html><head><meta charset="UTF-8"><style>*{box-sizing:border-box}body{background:#070910;margin:20px}#widget{width:${initialWidth}px;height:${initialHeight}px}</style></head><body><div id="widget"></div><script type="module">
 import mount, * as widget from '/widget.js';
 window.widget=widget;window.publications=[];window.media=[];window.drawCount=0;window.clearCount=0;
 const create=document.createElement.bind(document);document.createElement=(tag,...args)=>{const el=create(tag,...args);if(tag==='video')window.media.push(el);return el;};
@@ -180,10 +181,48 @@ try {
     await page.evaluate(({language, revision}) => {window.controller.update({value:{...window.state, revision, language, shot:{}, source:{}}, onChange:value=>window.publications.push(value)});}, {language, revision:1000+index});
     await checkInitialLayout(`Only / ${language}`);
   }
+  const heightAllocations = [];
+  async function checkHeightAllocation(height, width, label) {
+    // Editor 0.127 writes the same allocated height to its overflow-hidden
+    // layout row and widget-container. Its global CSS uses border-box sizing.
+    await page.locator('#widget').evaluate((container, size) => {
+      let row = document.getElementById('allocation-row');
+      if (!row) {
+        row = document.createElement('div'); row.id = 'allocation-row';
+        container.before(row); row.appendChild(container);
+      }
+      row.style.height = `${size.height}px`; row.style.overflow = 'hidden';
+      container.style.height = `${size.height}px`; container.style.width = `${size.width}px`;
+    }, {height, width});
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const allocation = await page.locator('.hmb-color-lut').evaluate(root => {
+      root.scrollTop = root.scrollHeight;
+      const own = root.getBoundingClientRect(), row = root.closest('#allocation-row').getBoundingClientRect();
+      const status = root.querySelector('.cl-status').getBoundingClientRect();
+      const exportButton = root.querySelector('[data-action="export"]').getBoundingClientRect();
+      return {height:own.height, rowHeight:row.height, bottomClip:Math.max(0,own.bottom-row.bottom),
+        statusVisible:status.top>=row.top && status.bottom<=row.bottom,
+        exportVisible:exportButton.top>=row.top && exportButton.bottom<=row.bottom,
+        horizontalOverflow:root.scrollWidth>root.clientWidth+1,
+        retainedCanvas:root.querySelector('[data-preview]')===window.originalCanvas};
+    });
+    assert.equal(allocation.height, height, `${label}: dashboard must fit the allocated height.`);
+    assert.equal(allocation.bottomClip, 0, `${label}: host row must not clip the dashboard bottom.`);
+    assert.equal(allocation.statusVisible, true, `${label}: scrolling must reach the full status row.`);
+    assert.equal(allocation.exportVisible, true, `${label}: scrolling must reach the export control.`);
+    assert.equal(allocation.horizontalOverflow, false, `${label}: no horizontal overflow.`);
+    assert.equal(allocation.retainedCanvas, true, `${label}: allocation changes retain the preview canvas.`);
+    heightAllocations.push({label, ...allocation});
+  }
+  await checkHeightAllocation(minimumWidgetHeight, initialWidth, 'declared minimum / wide');
+  await checkHeightAllocation(minimumWidgetHeight + 48, initialWidth, 'late row and container allocation / wide');
+  await checkHeightAllocation(minimumWidgetHeight, 430, 'declared minimum / narrow');
+  await page.evaluate(() => window.controller.update({value:{...window.state,revision:1010,language:'en',shot:{},source:{}},onChange:value=>window.publications.push(value)}));
+  await checkHeightAllocation(minimumWidgetHeight, initialWidth, 'declared minimum after props update');
   await page.evaluate(() => window.controller.cleanup());
   assert.equal(await page.locator("#widget").innerHTML(), "");
   assert.deepEqual(failures, []);
-  console.log(JSON.stringify({ result: "PASS", initialLayouts, realWebGL2: true, difference, decodedPlayback: true, seekFrame: 25, capturedExport: true, retainedCanvas: true, shots: true, screenshots: [wideScreenshot, narrowScreenshot] }, null, 2));
+  console.log(JSON.stringify({ result: "PASS", initialLayouts, heightAllocations, realWebGL2: true, difference, decodedPlayback: true, seekFrame: 25, capturedExport: true, retainedCanvas: true, shots: true, screenshots: [wideScreenshot, narrowScreenshot] }, null, 2));
 } finally {
   await browser?.close();
   await new Promise((resolve) => server.close(resolve));

@@ -402,19 +402,20 @@ def _function_source(name: str) -> str:
     )
 
 
-snapshot_source = _function_source("_snapshot_mode")
+snapshot_source = _function_source("_capture_maya_snapshot_role")
 playblast_source = _function_source("_maya_mode")
 encode_source = _function_source("_encode_playblast_sequence")
 for function_source in (snapshot_source, playblast_source):
     assert '"force_high_quality_viewport": True' in function_source
     assert '"require_full_smooth_geometry": True' in function_source
-    assert '"world_space_patterns": True' in function_source
     assert '"world_pattern_profile": MAYA_WORLD_PATTERN_PROFILE' in function_source
     assert '"world_pattern_cell_units": WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS' in function_source
     assert '"world_pattern_density_multiplier": WORLD_PATTERN_DENSITY_MULTIPLIER' in function_source
     assert '"screen_space_patterns": False' in function_source
     assert "_world_pattern_preflight(" in function_source
     assert "_postprocess_screen_space_frames(" not in function_source
+assert '"world_space_patterns": role == "mask"' in snapshot_source
+assert '"world_space_patterns": True' in playblast_source
 assert "_build_ffmpeg_encode_command(" in encode_source
 
 

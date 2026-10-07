@@ -172,6 +172,7 @@ let liveState = { ...ready, slot_assignments: assigned.slot_assignments, selecte
 const installHandler = new Function(
   "on", "container", "currentWidgetState", "pickerButtonAvailability", "clean",
   "appendImmediateLogLine", "mediaController", "clamp", "dispatchCommand", "hmbNormalizeDepthSettings",
+  "hmbSnapshotOutputSelection",
   snapshotHandler,
 );
 installHandler(
@@ -181,6 +182,7 @@ installHandler(
   (value, min, max) => Math.max(min, Math.min(max, value)),
   (action, payload, id, options) => { commands.push({ action, payload, id, options }); return { delivered: true }; },
   picker.hmbNormalizeDepthSettings,
+  picker.hmbSnapshotOutputSelection,
 );
 assert.equal(typeof click, "function");
 assert.doesNotThrow(() => click({ preventDefault() {}, stopPropagation() {} }));
@@ -188,6 +190,9 @@ assert.equal(pauses, 1);
 assert.equal(commands.length, 1);
 assert.equal(commands[0].action, "render_snapshot");
 assert.equal(commands[0].payload.snapshot_frame, 117);
+assert.equal(commands[0].payload.include_original, false);
+assert.equal(commands[0].payload.include_mask, true);
+assert.equal(commands[0].payload.include_depth, false);
 assert.equal(commands[0].payload.authoring_state.selected_camera, "|latestCamera");
 assert.deepEqual(commands[0].payload.authoring_state.slot_assignments, assigned.slot_assignments);
 assert.equal(commands[0].options.reserveVisibility, true);

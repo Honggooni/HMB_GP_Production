@@ -195,7 +195,7 @@ assert.match(widgetSource, /data-resize-section="color"/);
 assert.doesNotMatch(widgetSource, /data-resize-panel|panel-resize-handle/);
 assert.match(
   widgetSource,
-  /const viewportModeLabel = snapshotForViewport \? \(tr\.snapshot \|\| "Snapshot"\) : \(tr\.preview \|\| "Video"\)/,
+  /const viewportModeLabel = snapshotForViewport \? hmbSnapshotViewportLabel\(selectedSnapshot, tr\) : \(tr\.preview \|\| "Video"\)/,
 );
 assert.match(
   widgetSource,

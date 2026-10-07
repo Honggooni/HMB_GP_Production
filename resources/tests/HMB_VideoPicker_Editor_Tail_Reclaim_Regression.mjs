@@ -157,6 +157,8 @@ assert.equal(
 );
 assert.equal(fixture.layoutRow.style.getPropertyValue("height"), "252px");
 assert.equal(fixture.layoutRow.style.getPropertyPriority("height"), "important");
+assert.equal(fixture.layoutRow.style.getPropertyValue("min-height"), "252px");
+assert.equal(fixture.layoutRow.style.getPropertyPriority("min-height"), "important");
 assert.equal(fixture.trailingSpacer.style.getPropertyValue("height"), "0px");
 assert.equal(fixture.trailingSpacer.style.getPropertyValue("min-height"), "0px");
 assert.equal(fixture.trailingSpacer.style.getPropertyValue("flex"), "0 0 0px");
@@ -171,6 +173,7 @@ assert.equal(
 assert.equal(picker.hmbRestoreVideoPickerCompactTailReclaim(fixture.container), true);
 assert.equal(fixture.layoutRow.style.getPropertyValue("height"), "220px");
 assert.equal(fixture.layoutRow.style.getPropertyPriority("height"), "");
+assert.equal(fixture.layoutRow.style.getPropertyValue("min-height"), "");
 assert.equal(fixture.trailingSpacer.style.getPropertyValue("height"), "");
 assert.equal(fixture.trailingSpacer.style.getPropertyValue("min-height"), "");
 assert.equal(fixture.trailingSpacer.style.getPropertyValue("flex"), "");
@@ -191,6 +194,7 @@ for (const [shotIndex, contentHeight] of compactContentHeights.entries()) {
     `${expectedShellHeight}px`,
   );
   assert.equal(recognizedGeometry.layoutRow.style.getPropertyValue("height"), `${contentHeight}px`);
+  assert.equal(recognizedGeometry.layoutRow.style.getPropertyValue("min-height"), `${contentHeight}px`);
   assert.equal(recognizedGeometry.trailingSpacer.style.getPropertyValue("height"), "0px");
   if (shotIndex > 0) {
     assert.equal(
@@ -206,7 +210,29 @@ for (const [shotIndex, contentHeight] of compactContentHeights.entries()) {
     `recognized Shot ${shotIndex + 1} must restore the Editor allocation`,
   );
   assert.equal(recognizedGeometry.trailingSpacer.style.getPropertyValue("height"), "");
+  assert.equal(recognizedGeometry.layoutRow.style.getPropertyValue("min-height"), "");
 }
+
+const minimumFixture = allocatorFixture();
+minimumFixture.layoutRow.style.setProperty("min-height", "17px", "important");
+picker.hmbApplyVideoPickerCompactTailReclaim(minimumFixture.container, 996);
+picker.hmbApplyVideoPickerCompactTailReclaim(minimumFixture.container, 252);
+assert.equal(minimumFixture.layoutRow.style.getPropertyValue("min-height"), "252px");
+picker.hmbRestoreVideoPickerCompactTailReclaim(minimumFixture.container);
+assert.equal(minimumFixture.layoutRow.style.getPropertyValue("min-height"), "17px");
+assert.equal(minimumFixture.layoutRow.style.getPropertyPriority("min-height"), "important");
+
+picker.hmbApplyVideoPickerCompactTailReclaim(minimumFixture.container, 252);
+minimumFixture.layoutRow.style.setProperty("min-height", "19px");
+picker.hmbRestoreVideoPickerCompactTailReclaim(minimumFixture.container);
+assert.equal(minimumFixture.layoutRow.style.getPropertyValue("min-height"), "19px");
+assert.equal(minimumFixture.layoutRow.style.getPropertyPriority("min-height"), "");
+
+picker.hmbApplyVideoPickerCompactTailReclaim(minimumFixture.container, 252);
+minimumFixture.layoutRow.style.setProperty("min-height", "23px");
+picker.hmbApplyVideoPickerCompactTailReclaim(minimumFixture.container, 438);
+picker.hmbRestoreVideoPickerCompactTailReclaim(minimumFixture.container);
+assert.equal(minimumFixture.layoutRow.style.getPropertyValue("min-height"), "23px");
 
 for (const inset of [72, 100, 120]) {
   for (const [shotIndex, contentHeight] of compactContentHeights.entries()) {
