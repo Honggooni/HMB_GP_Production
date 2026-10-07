@@ -499,6 +499,65 @@ for canonical_crlf_member in builder.CANONICAL_CRLF_SOURCE_FILES:
         canonical_data.replace(b"\r\n", b"\n"),
     ) == canonical_data
 
+
+# Git and working checkouts must produce one package, including checksum and
+# closure metadata, even when source text has LF, CRLF, or mixed line endings.
+expected_lf_members = {
+    PurePosixPath(relative)
+    for relative in EXPECTED_SOURCE_FILES
+    if PurePosixPath(relative).suffix in {".py", ".js", ".json", ".md"}
+    or relative == "LICENSE"
+}
+expected_text_members = expected_lf_members | builder.CANONICAL_CRLF_SOURCE_FILES
+checkout_source_records = {}
+reference_fingerprint = builder.canonical_source_fingerprint(records)
+for form in ("lf", "crlf", "mixed"):
+    raw_sources, canonical_sources = [], []
+    for record in records:
+        member = PurePosixPath(str(record["path"]))
+        data = bytes(record["data"])
+        if member in expected_text_members:
+            lf_data = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            if form == "lf":
+                data = lf_data
+            elif form == "crlf":
+                data = lf_data.replace(b"\n", b"\r\n")
+            else:
+                parts = lf_data.split(b"\n")
+                data = b"".join(
+                    part + (b"\r\n" if index % 2 else b"\n")
+                    for index, part in enumerate(parts[:-1])
+                ) + parts[-1]
+        raw_sources.append(dict(record, data=data, bytes=len(data), sha256=builder.digest(data)))
+        canonical = builder.canonical_release_source_data(member, data)
+        canonical_sources.append(dict(
+            record, data=canonical, bytes=len(canonical), sha256=builder.digest(canonical),
+        ))
+    assert builder.canonical_source_fingerprint(raw_sources) == reference_fingerprint, (
+        f"{form} checkout changed the release parity fingerprint."
+    )
+    canonical_release = builder.make_release_records(release_version, canonical_sources)
+    builder.validate_release_inventory(release_version, canonical_release)
+    checkout_archive = builder.make_archive(canonical_release, archive_date_time)
+    builder.validate_archive(checkout_archive, canonical_release, archive_date_time)
+    assert checkout_archive == first_archive, f"{form} checkout changed the release ZIP."
+    checkout_source_records[form] = raw_sources
+assert builder.CANONICAL_LF_SOURCE_FILES == expected_lf_members
+assert not builder.CANONICAL_LF_SOURCE_FILES & builder.CANONICAL_CRLF_SOURCE_FILES
+for member in expected_lf_members:
+    assert b"\r" not in record_by_path[member.as_posix()]["data"]
+# A file suffix alone gives no authority to rewrite binary or unlisted bytes.
+binary_probe = b"\x00\xffA\r\nB\rC\n"
+for member in (
+    builder.BUNDLED_AGENT_POLICY_MEMBER,
+    PurePosixPath("unlisted.py"),
+    PurePosixPath("resources/unknown.bin"),
+):
+    assert builder.canonical_release_source_data(member, binary_probe) == binary_probe
+assert record_by_path[builder.BUNDLED_AGENT_POLICY_MEMBER.as_posix()]["data"] == (
+    ROOT / Path(builder.BUNDLED_AGENT_POLICY_MEMBER)
+).read_bytes()
+
 previous_version_parts = builder.release_version_parts(RELEASE_VERSION)
 previous_version = (
     f"{previous_version_parts[0]}.{previous_version_parts[1]}."
@@ -573,9 +632,12 @@ tampered_previous_sources = [dict(record) for record in previous_source_records]
 tampered_python_record = next(
     record
     for record in tampered_previous_sources
-    if record["path"] == "HMBAgentLibrary.py"
+    if record["path"] == "HMBVideoPickerLibrary.py"
 )
-tampered_python_data = bytes(tampered_python_record["data"]) + b"# parity mutation\n"
+tampered_python_data = bytes(tampered_python_record["data"]).replace(
+    b"MAX_SELECTED_VIDEOS = 10", b"MAX_SELECTED_VIDEOS = 9", 1,
+)
+assert tampered_python_data != tampered_python_record["data"]
 tampered_python_record.update(
     bytes=len(tampered_python_data),
     data=tampered_python_data,
@@ -651,15 +713,20 @@ with tempfile.TemporaryDirectory(prefix="hmb-release-parity-") as temporary_root
         records,
     )
     assert validated_proof["parity"] is True
+    for form, checkout_sources in checkout_source_records.items():
+        assert builder.validate_parity_proof_payload(
+            proof_payload, target_odd_version, checkout_sources,
+        )["parity"] is True, f"{form} checkout rejected a truthful release proof."
     mutated_proof_sources = [dict(record) for record in records]
     mutated_proof_record = next(
         record
         for record in mutated_proof_sources
-        if record["path"] == "HMBPromptLibrary.py"
+        if record["path"] == "HMBVideoPickerLibrary.py"
     )
-    mutated_proof_record["data"] = (
-        bytes(mutated_proof_record["data"]) + b"# parity proof mutation\n"
+    mutated_proof_record["data"] = bytes(mutated_proof_record["data"]).replace(
+        b"MAX_SELECTED_VIDEOS = 10", b"MAX_SELECTED_VIDEOS = 9", 1,
     )
+    assert mutated_proof_record["data"] != record_by_path["HMBVideoPickerLibrary.py"]["data"]
     try:
         builder.validate_parity_proof_payload(
             proof_payload,
