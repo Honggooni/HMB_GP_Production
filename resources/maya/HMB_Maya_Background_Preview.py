@@ -43,7 +43,7 @@ CHARACTER_OUT_RIM_LOCAL_OCCLUSION = 2
 FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE = "hmb_full_smooth_geometry_v2"
 ORIGINAL_VIEWPORT_QUALITY_PROFILE = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
 ORIGINAL_MATERIAL_OVERRIDE_PROFILE = (
-    "maya-midgray-solid-studio-v3"
+    "maya-midgray-solid-studio-v4-eye-groups"
 )
 ORIGINAL_LAMBERT_ASSIGNMENT_MODE = (
     "original_midgray_body_authored_eyes"
@@ -4557,42 +4557,34 @@ def _original_wire_record(
 
 
 def _original_eye_semantic(value):
-    """Recognize bounded eye names without matching brow or namespace text."""
-    # The closest explicit shape/ancestor semantic wins: an eyebrow below
-    # Eyes stays neutral, and a true Eye_GEO below a brow rig stays authored.
-    for segment in reversed(_clean(value).split("|")):
-        leaf = segment.rsplit(":", 1)[-1].split(".", 1)[0]
-        words = re.sub(r"([a-z])([A-Z])", r"\1 \2", leaf)
-        words = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", words)
-        tokens = set(re.findall(r"[a-z]+", words.lower()))
-        if tokens.intersection(("brow", "brows", "eyebrow", "eyebrows")):
-            return False
-        if tokens.intersection(
-            ("eye", "eyes", "eyeball", "eyeballs", "iris", "pupil", "cornea", "sclera")
-        ):
-            return True
-    return False
+    """Match the two authored-material pass groups, excluding namespaces."""
+    leaf = _clean(value).rsplit("|", 1)[-1].rsplit(":", 1)[-1]
+    return leaf in ("eye_GEO_GRP", "eye_GRP")
 
 
 def _original_eye_shape(shape):
-    """Use the concrete DAG path and parents as the eye material authority."""
+    """Preserve surfaces below an explicit pass group, regardless of mesh names."""
     path = _clean(shape)
+    try:
+        if cmds.nodeType(path) not in ("mesh", "nurbsSurface"):
+            return False
+    except Exception:
+        return False
     visited = set()
     while path and path not in visited:
         visited.add(path)
-        leaf = path.rsplit("|", 1)[-1].rsplit(":", 1)[-1]
-        leaf_words = re.sub(r"([a-z])([A-Z])", r"\1 \2", leaf)
-        if set(re.findall(r"[a-z]+", leaf_words.lower())).intersection(("brow", "brows", "eyebrow", "eyebrows")):
-            return False
-        if _original_eye_semantic(path):
-            return True
         try:
-            parents = cmds.listRelatives(path, parent=True, fullPath=True) or []
+            # Keep the current instance's ancestry when a concrete DAG path is
+            # available; listRelatives may otherwise choose another instance.
+            if path.startswith("|"):
+                path = path.rsplit("|", 1)[0]
+            else:
+                parents = cmds.listRelatives(path, parent=True, fullPath=True) or []
+                path = _clean(parents[0]) if len(parents) == 1 else ""
+            if path and _original_eye_semantic(path) and cmds.nodeType(path) == "transform":
+                return True
         except Exception:
-            parents = []
-        if len(parents) != 1:
             break
-        path = _clean(parents[0])
     return False
 
 
@@ -4768,15 +4760,9 @@ class _OriginalLambertOverrideController(object):
 
     @staticmethod
     def _eye_face_member(member):
-        owner, separator, component = _clean(member).partition(".")
+        _owner, separator, component = _clean(member).partition(".")
         match = re.match(r"^f\[([0-9]+)(?::([0-9]+))?\]$", component) if separator else None
         if not match:
-            return 0
-        leaf = owner.rsplit("|", 1)[-1].rsplit(":", 1)[-1]
-        words = re.sub(r"([a-z])([A-Z])", r"\1 \2", leaf)
-        tokens = set(re.findall(r"[a-z]+", words.lower()))
-        # A known body/brow member stays neutral even if it shares EyeMat.
-        if tokens.intersection(("body", "bodies", "torso", "brow", "brows", "eyebrow", "eyebrows")):
             return 0
         first = int(match.group(1))
         last = int(match.group(2) or first)
@@ -4794,28 +4780,17 @@ class _OriginalLambertOverrideController(object):
         plan = {}
         for group in active_groups:
             members = self.membership_snapshot[group]
-            surface_sources = list(_incoming_source_plugs(group + ".surfaceShader"))
-            eye_face_authority = (
-                any(self._eye_face_member(member) for member in members)
-                and (_original_eye_semantic(group) or any(
-                    _original_eye_semantic(source.split(".", 1)[0]) for source in surface_sources
-                ))
-            )
-            if group not in named_eye_groups and not eye_face_authority:
+            if group not in named_eye_groups:
                 continue
             body_members = []
             eye_member_count = 0
             for member in members:
                 shape = self._member_shape(member)
-                face_count = self._eye_face_member(member)
-                if _original_eye_shape(shape) or (eye_face_authority and face_count):
+                if _original_eye_shape(shape):
                     eye_member_count += 1
                     retained_shapes.add(shape)
                     # Count concrete face components rather than range strings.
-                    if "." in member:
-                        component = member.partition(".")[2]
-                        match = re.match(r"^f\[([0-9]+)(?::([0-9]+))?\]$", component)
-                        retained_face_count += int(match.group(2) or match.group(1)) - int(match.group(1)) + 1
+                    retained_face_count += self._eye_face_member(member)
                 else:
                     body_members.append(member)
             if not eye_member_count:

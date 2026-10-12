@@ -25,7 +25,7 @@ import urllib.request
 import webbrowser
 import weakref
 from collections.abc import Iterator
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from copy import deepcopy
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -126,6 +126,7 @@ from _hmb_common import (
 )
 
 logger = logging.getLogger("griptape_nodes")
+_WEB_RERENDER_SESSION_EPOCH = str(uuid4())
 
 GT_CLOUD_API_KEY_SECRET = "GT_CLOUD_API_KEY"
 GT_CLOUD_BUCKET_ID_SECRET = "GT_CLOUD_BUCKET_ID"
@@ -10909,7 +10910,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 params,
             )
             self._assert_agent_result_available(str(params.get("prompt") or ""), allow_resume=False)
-            client_request_id = "hmb-" + uuid4().hex
+            client_request_id = self._new_generation_client_request_id()
             payload["client_request_id"] = client_request_id
             await self._run_blocking_generation_stage(
                 self._start_review_case, client_request_id, str(payload.get("prompt") or ""),
@@ -11289,6 +11290,239 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
 
 
+    def _new_generation_client_request_id(self) -> str:
+        """Ordinary Run always creates a new intent; web requests override privately."""
+        return "hmb-" + uuid4().hex
+
+    def _hmb_web_rerender_capture_inputs(self) -> dict[str, Any]:
+        """Read a local execution snapshot without editing any retained node.
+
+        This private value stays inside the engine. It is not a browser request
+        body and contains native source references which the public readiness
+        projection intentionally excludes. Authored Prompt text is never read.
+        """
+        if not self._runtime_node_is_live(require_registered=True):
+            raise RuntimeError("The connected Generator is no longer available.")
+        agent = self._manual_agent_prompt_source()
+        if agent is None or not callable(getattr(agent, "_hmb_run_web_rerender", None)):
+            raise RuntimeError("Connect an HMB Agent before requesting a web rerender.")
+        view = _HMBWebRerenderExecution.read_view(self)
+        params = view._get_parameters()
+        params["resume_generation_id"] = ""
+        params = view._resolve_exact_shot_generation_inputs(params)
+        params.pop("prompt", None)
+        params["_hmb_generation_origin"] = deepcopy(self._capture_generated_video_origin())
+        params["_hmb_broker_server_url"] = self._selected_broker_server_url()
+        # Validation needs text, but neither original Prompt text nor this
+        # non-submitted sentinel is put into the returned execution snapshot.
+        view._validate_parameters(dict(params, prompt="Web rerender readiness"))
+        try:
+            flow_name = str(GriptapeNodes.NodeManager().get_node_parent_flow_by_name(self.name))
+        except Exception as exc:
+            raise RuntimeError("The Generator workflow binding is unavailable.") from exc
+        target = {
+            "flow_name": flow_name,
+            "node_name": str(self.name),
+            "runtime_instance_id": str(self._hmb_generated_source_instance_id),
+            "session_epoch": _WEB_RERENDER_SESSION_EPOCH,
+            "agent_name": str(agent.name),
+            "agent_instance_id": str(id(agent)),
+            "shot_selection": {key: _web_rerender_plain(self.get_parameter_value(key)) for key in (
+                SHOT_SELECTOR_PARAMETER, SHOT_CHANNEL_UUID_PARAMETER, SHOT_UUID_PARAMETER,
+                SHOT_NUMBER_PARAMETER, SHOT_NAME_PARAMETER)},
+        }
+        source_bindings = []
+        for port, source_port in (
+            (SHOT_ASSET_INPUT_PARAMETER, "SHOT_ASSET_OUT"),
+            (SHOT_PICKER_INPUT_PARAMETER, "SHOT_PICKER_OUT"),
+            (SHOT_FINISH_LOOK_INPUT_PARAMETER, "SHOT_FINISH_LOOK_OUT"),
+        ):
+            source = self._exact_incoming_source(port, source_port, required=False)
+            if source is not None:
+                source_bindings.append({"port": port, "source": str(source.name), "instance": str(id(source))})
+        references = _web_rerender_reference_identity(params)
+        digest = _web_rerender_digest({"target": target, "params": params,
+                                      "source_bindings": source_bindings, "references": references,
+                                      "source_snapshots": view._web_source_snapshots})
+        images = list(params.get("reference_images") or [])
+        if params.get("first_frame") is not None:
+            images.insert(0, params["first_frame"])
+        if params.get("last_frame") is not None:
+            images.append(params["last_frame"])
+        media = {"schema": "hmb-agent-reference-media", "version": 1,
+                 "images": [{"token": f"@image{index + 1}", "source": str(self._coerce_reference_value(value)),
+                             "source_type": "generator_reference"} for index, value in enumerate(images)],
+                 "videos": [{"token": f"@video{index + 1}", "source": str(self._coerce_reference_value(value)),
+                             "source_type": "generator_reference"}
+                            for index, value in enumerate(params.get("video_references") or [])]}
+        origin = params.get("_hmb_generation_origin") or {}
+        for kind, records_key, destination in (("image_asset", "ordered_assets", media["images"]),
+                                               ("video_picker", "ordered_videos", media["videos"])):
+            raw = view._web_source_snapshots.get(kind, {})
+            shot = next((row for row in raw.get("shots", []) if row.get("shot_uuid") == origin.get("shot_uuid")), {})
+            metadata = {row.get("source_uid"): row.get("metadata", {}) for row in raw.get(records_key, [])}
+            for record, uid in zip(destination, shot.get("selected_source_uids", [])):
+                info = deepcopy(metadata.get(uid) or {})
+                record["identity"] = {"source_uid": uid}
+                for key in ("frame_metadata", "frame_domain", "source_type", "image_main_type", "image_sub_type",
+                            "video_main_type", "video_sub_type", "reference_scope", "frame_ranges", "control_role"):
+                    if key in info:
+                        record[key] = info[key]
+                role = str(info.get("generation_role") or info.get("video_role") or "").lower()
+                if kind == "video_picker" and "video_sub_type" not in record:
+                    subtype = {"original": "Original Preview", "mask": "Mask", "depth": "Depth",
+                               "motion_guide": "Motion Guide"}.get(role)
+                    if subtype:
+                        record["video_sub_type"] = subtype
+        return {"schema": "hmb-web-rerender-generator-snapshot", "version": 1,
+                "target": target, "params": deepcopy(params), "media_snapshot": deepcopy(media),
+                "generation_settings": {key: deepcopy(params[key]) for key in _review.SETTINGS if key in params},
+                "agent_name": str(agent.name), "source_bindings": source_bindings,
+                "references": references, "binding_fingerprint": digest}
+
+    def _hmb_web_rerender_readiness(self) -> dict[str, Any]:
+        """Bounded local readiness; the worker adds auth, policy and lease checks."""
+        reason = ""
+        try:
+            with self._generation_refresh_lock:
+                if self._generation_run_active.is_set() or self._generation_refresh_running:
+                    raise RuntimeError("The connected Generator is busy.")
+            if self._hmb_web_rerender_recovery_blocked():
+                raise RuntimeError("An earlier Generator submission still requires confirmation.")
+            snapshot = self._hmb_web_rerender_capture_inputs()
+        except Exception as exc:
+            reason = str(exc)[:240]
+            snapshot = {}
+        return {"ready": not reason, "reason": reason, "target": snapshot.get("target", {}),
+                "binding_fingerprint": snapshot.get("binding_fingerprint", "")}
+
+    def _hmb_web_rerender_recovery_blocked(self) -> bool:
+        """Read readiness without journal adoption or legacy artifact filesystem IO."""
+        checkpoint = _seedance_recovery_value(self.get_parameter_value(SEEDANCE_RECOVERY_PARAMETER))
+        task_id = str(checkpoint.get("task_id") or self.parameter_output_values.get("generation_id") or "")
+        if not task_id:
+            return False
+        status = str(checkpoint.get("status") or self.parameter_output_values.get("generation_status") or "")
+        response = self.parameter_output_values.get("provider_response")
+        if status == "submission_unknown" or (isinstance(response, dict) and response.get("id") == task_id
+                and response.get("resubmit_allowed") is False):
+            return True
+        if checkpoint.get("stage") == "local_succeeded" or checkpoint.get("terminal") or status in TERMINAL_FAILURE_STATUSES:
+            return False
+        # Legacy completed outputs can be ready without touching their paths.
+        # The new operation has separate media preflight and its own output path.
+        return not (not checkpoint.get("stage") and status in BROKER_SUCCESS_STATUSES
+                    and self._generation_artifact_is_present(self.parameter_output_values.get("video_url")))
+
+    @asynccontextmanager
+    async def _hmb_web_rerender_claim(self, snapshot: dict[str, Any]):
+        """Serialize web Agent + render with native Run and native Refresh."""
+        with self._generation_refresh_lock:
+            if self._generation_run_active.is_set() or self._generation_refresh_running:
+                raise RuntimeError("The connected Generator is busy.")
+            if self._hmb_web_rerender_recovery_blocked():
+                raise RuntimeError("An earlier Generator submission still requires confirmation.")
+            claim = _HMBWebRerenderClaim(self, deepcopy(snapshot))
+            self._hmb_web_rerender_active_claim = claim
+            self._generation_run_active.set()
+        try:
+            self._hmb_web_rerender_validate_claim(claim)
+            yield claim
+        finally:
+            with self._generation_refresh_lock:
+                if getattr(self, "_hmb_web_rerender_active_claim", None) is claim:
+                    self._hmb_web_rerender_active_claim = None
+                    self._generation_run_active.clear()
+                claim.active = False
+
+    def _hmb_web_rerender_validate_claim(self, claim: Any) -> None:
+        if (not isinstance(claim, _HMBWebRerenderClaim) or claim.owner is not self
+                or not claim.active or getattr(self, "_hmb_web_rerender_active_claim", None) is not claim):
+            raise RuntimeError("The web rerender reservation is no longer valid.")
+        current = self._hmb_web_rerender_capture_inputs()
+        if (current["target"] != claim.snapshot.get("target")
+                or current["binding_fingerprint"] != claim.snapshot.get("binding_fingerprint")
+                or _web_rerender_digest(current) != _web_rerender_digest(claim.snapshot)):
+            raise RuntimeError("The Generator inputs or connection changed; request a new web rerender.")
+
+    async def _hmb_web_rerender_prepare_media(self, claim: Any) -> dict[str, Any]:
+        """Check selected local bytes off the engine loop, before invoking Agent."""
+        self._hmb_web_rerender_validate_claim(claim)
+        identity = await asyncio.to_thread(_web_rerender_reference_identity, claim.snapshot["params"], True)
+        self._hmb_web_rerender_validate_claim(claim)
+        if claim.media_identity is not None and identity != claim.media_identity:
+            raise RuntimeError("A web rerender reference changed after the request was prepared.")
+        claim.media_identity = identity
+        prepared = deepcopy(claim.snapshot["params"])
+        replacements = {}
+        for row in identity:
+            if "resolved_path" not in row:
+                continue
+            field, index = row["field"], row["index"]
+            current = prepared.get(field)
+            authored = current[index] if isinstance(current, (list, tuple)) else current
+            replacements[str(self._coerce_reference_value(authored))] = row["resolved_path"]
+            if isinstance(current, (list, tuple)):
+                current = list(current)
+                current[index] = row["resolved_path"]
+                prepared[field] = current
+            else:
+                prepared[field] = row["resolved_path"]
+        # Legacy slots are redundant once the canonical ordered references
+        # have been captured; do not re-resolve a different project later.
+        prepared["video_reference_slots"] = []
+        claim.prepared_params = prepared
+        media = deepcopy(claim.snapshot["media_snapshot"])
+        for row in media["images"] + media["videos"]:
+            row["source"] = replacements.get(row["source"], row["source"])
+        return media
+
+    async def _hmb_web_rerender_execute(
+        self, claim: Any, agent_result: dict[str, Any], *, client_request_id: str,
+        output_directory: str | Path, checkpoint_sink: Any, submission_bridge: Any,
+        parent_task_id: str = "", command_id: str = "",
+    ) -> dict[str, Any]:
+        """Run a worker-authorized intent in an isolated, non-registered facade.
+
+        The worker owns durable command deduplication and Broker authorization.
+        A raw browser parameter cannot invoke this API or supply a valid claim.
+        """
+        self._hmb_web_rerender_validate_claim(claim)
+        if claim.executed:
+            raise RuntimeError("This web rerender reservation has already been executed.")
+        if not callable(checkpoint_sink) or submission_bridge is None:
+            raise ValueError("A durable checkpoint sink and command-bound Broker bridge are required.")
+        if claim.media_identity is None:
+            raise RuntimeError("Prepare the web rerender references before running the Agent.")
+        await self._hmb_web_rerender_prepare_media(claim)
+        client_request_id = self._validate_task_id(client_request_id)
+        if not isinstance(agent_result, dict):
+            raise ValueError("A completed Agent result is required.")
+        text = agent_result.get("text")
+        if (not isinstance(text, str) or not text.strip() or not agent_result.get("run_id")
+                or hashlib.sha256(text.encode("utf-8")).hexdigest() != agent_result.get("output_sha256")):
+            raise ValueError("The Agent result does not match its completed output.")
+        claim.executed = True
+        run = _HMBWebRerenderExecution.for_request(
+            self, claim, agent_result, client_request_id, Path(output_directory),
+            checkpoint_sink, submission_bridge, parent_task_id, command_id,
+        )
+        try:
+            await run._process_generation()
+        except BaseException:
+            # The sink already holds pre-submit identity before any POST. Save
+            # the last observable state too, without replacing the source node.
+            with suppress(Exception):
+                await run._force_save_generation_recovery_checkpoint(required=False, reason="web_interrupted")
+            raise
+        return {"task_id": str(run.parameter_output_values.get("generation_id") or ""),
+                "client_request_id": client_request_id, "parent_task_id": parent_task_id,
+                "command_id": command_id, "case_id": run._hmb_review_case_id,
+                "status": str(run.parameter_output_values.get("generation_status") or ""),
+                "checkpoint": deepcopy(run._generation_recovery_state()),
+                "video": _web_rerender_plain(run.parameter_output_values.get("video_url")),
+                "agent_run_id": agent_result["run_id"]}
+
     async def aprocess(self) -> None:
         if not self._runtime_node_is_live(require_registered=True):
             return
@@ -11529,6 +11763,317 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self._set_generation_status("skipped", generation_id="")
         self._set_status_results(was_successful=False, result_details=f"SKIPPED: {message}")
         logger.error("%s skipped: %s", self.name, message)
+
+def _web_rerender_plain(value: Any) -> Any:
+    """Stable private serialization of native reference artifacts, never repr()."""
+    if value is None or type(value) in {str, bool, int, float}:
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        return [_web_rerender_plain(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _web_rerender_plain(item) for key, item in value.items()}
+    native_value = getattr(value, "value", None)
+    if isinstance(native_value, (str, Path)):
+        return str(native_value)
+    raise ValueError("The Generator contains an unsupported reference value.")
+
+
+def _web_rerender_digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(_web_rerender_plain(value), ensure_ascii=False,
+                                     sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def _web_rerender_reference_identity(params: dict[str, Any], inspect_files: bool = False) -> list[dict[str, Any]]:
+    result = []
+    for field in ("reference_images", "video_references", "reference_audio", "first_frame", "last_frame"):
+        raw = params.get(field)
+        values = list(raw) if isinstance(raw, (list, tuple)) else [raw] if raw is not None else []
+        for index, value in enumerate(values):
+            text = str(HMBSeedanceGeneration._coerce_reference_value(value))
+            record = {"field": field, "index": index, "source_sha256": hashlib.sha256(text.encode()).hexdigest()}
+            if inspect_files and not text.startswith(("http://", "https://", "data:", "asset://")):
+                path = Path(text)
+                if not path.is_absolute():
+                    path = Path(File(text).resolve())
+                if not path.is_file():
+                    raise ValueError("A selected web rerender reference is no longer available.")
+                stat = path.stat()
+                digest = hashlib.sha256()
+                with path.open("rb") as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(block)
+                after = path.stat()
+                if (stat.st_size, stat.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                    raise ValueError("A selected web rerender reference changed while being read.")
+                record.update(bytes=stat.st_size, mtime_ns=stat.st_mtime_ns, content_sha256=digest.hexdigest(),
+                              resolved_path=str(path))
+            result.append(record)
+    return result
+
+
+@dataclass(eq=False)
+class _HMBWebRerenderClaim:
+    owner: Any
+    snapshot: dict[str, Any]
+    active: bool = True
+    executed: bool = False
+    media_identity: Any = None
+    prepared_params: Any = None
+
+
+class _HMBWebRerenderOutput:
+    def __init__(self, path: Path, node_name: str):
+        self.path, self.node_name = path, node_name
+        self._default_filename = str(path)
+
+    def build_file(self) -> Any:
+        return ProjectFileDestination.from_situation(
+            str(self.path), ProjectFileParameter.DEFAULT_SITUATION, node_name=self.node_name,
+        )
+
+
+class _HMBWebRerenderSource:
+    """Consume source metadata with an explicit no-filesystem readiness mode."""
+    def __init__(self, source: Any, snapshots: dict[str, Any], kind: str):
+        self.source, self.snapshots, self.kind = source, snapshots, kind
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.source, name)
+
+    def _hmb_shot_routing_snapshot(self, channel_uuid: str = "") -> dict[str, Any]:
+        method = self.source._hmb_shot_routing_snapshot
+        if self.kind == "video_picker":
+            raw = method(channel_uuid, validate_media=False)
+        else:
+            raw = method(channel_uuid, cached_only=True)
+        self.snapshots[self.kind] = deepcopy(raw)
+        return raw
+
+
+class _HMBWebRerenderExecution(HMBSeedanceGeneration):
+    """Request-local adapter for the production pipeline, never registered in a flow.
+
+    All UI/output dictionaries, upload lists, checkpoints and observation state
+    are request owned. The source object remains the sole liveness authority.
+    """
+
+    @classmethod
+    def read_view(cls, owner: HMBSeedanceGeneration) -> Any:
+        view = object.__new__(cls)
+        view.__dict__.update(owner.__dict__)
+        view._web_owner = owner
+        view._web_request = False
+        view._web_claim = None
+        view._web_parameter_cache = {}
+        view._web_source_snapshots = {}
+        view.parameter_values = deepcopy(getattr(owner, "parameter_values", {}))
+        view.parameter_output_values = {}
+        return view
+
+    @classmethod
+    def for_request(cls, owner: HMBSeedanceGeneration, claim: _HMBWebRerenderClaim,
+                    agent_result: dict[str, Any], client_request_id: str, output_directory: Path,
+                    checkpoint_sink: Any, bridge: Any, parent_task_id: str, command_id: str) -> Any:
+        run = cls.read_view(owner)
+        run._web_request = True
+        run._web_claim = claim
+        run._web_loop = asyncio.get_running_loop()
+        run._web_engine_thread = threading.get_ident()
+        run._web_agent_result = deepcopy(agent_result)
+        run._web_client_request_id = client_request_id
+        run._web_checkpoint_sink = checkpoint_sink
+        run._web_parent_task_id = parent_task_id
+        run._web_command_id = command_id
+        run._web_params = deepcopy(claim.prepared_params)
+        run._web_params["prompt"] = agent_result["text"]
+        run._web_params["resume_generation_id"] = ""
+        run._web_parameter_cache.update(run._web_params)
+        run._web_parameter_cache[BROKER_SERVER_URL_PARAMETER] = run._web_params["_hmb_broker_server_url"]
+        run._web_parameter_cache[SEEDANCE_RECOVERY_PARAMETER] = _seedance_recovery_value({"journal_id": str(uuid4())})
+        run._temporary_video_uploads = []
+        run._temporary_tos_video_uploads = []
+        run._detached_submission_tasks = set()
+        run._submission_outcome_unknown = False
+        run._broker_bridge_instance = bridge
+        run._hmb_generation_run_origin = deepcopy(run._web_params.get("_hmb_generation_origin") or {})
+        run._hmb_generation_preview_state = _seedance_generation_preview_value()
+        run._hmb_generation_recovery_restore_fingerprint = None
+        run._hmb_generation_started_monotonic = None
+        run._hmb_generation_started_at_ms = 0
+        run._hmb_generation_media_revision = 0
+        run._hmb_last_success_video = None
+        run._hmb_last_success_last_frame_url = None
+        run._hmb_generated_video_source = {}
+        run._hmb_generated_video_source_published = {}
+        run._hmb_review_case_id = ""
+        run._hmb_review_stage_seconds = {}
+        run._hmb_review_sync_jobs = set()
+        run._hmb_review_sync_lock = threading.Lock()
+        run._hmb_expected_agent_result = (agent_result["run_id"], agent_result["output_sha256"])
+        run._hmb_agent_submission_prompt = agent_result["text"]
+        output_directory = output_directory.resolve()
+        output_directory.mkdir(parents=True, exist_ok=True)
+        suffix = str(run._web_params.get("output_format") or "mp4")
+        basename = hashlib.sha256(client_request_id.encode()).hexdigest()
+        run._output_file = _HMBWebRerenderOutput(output_directory / f"{basename}.{suffix}", owner.name)
+        run._last_frame_file = _HMBWebRerenderOutput(output_directory / f"{basename}_last.png", owner.name)
+        return run
+
+    def get_parameter_value(self, name: str) -> Any:
+        if name == "prompt" and not self._web_request:
+            return ""
+        if name in self._web_parameter_cache:
+            return deepcopy(self._web_parameter_cache[name])
+        value = deepcopy(self._web_owner.get_parameter_value(name))
+        self._web_parameter_cache[name] = value
+        return deepcopy(value)
+
+    def set_parameter_value(self, name: str, value: Any, *args: Any, **kwargs: Any) -> None:
+        self._web_parameter_cache[name] = deepcopy(value)
+        self.parameter_values[name] = deepcopy(value)
+
+    def publish_update_to_parameter(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def _synchronize_model_resolution(self) -> str:
+        raw = str(self.get_parameter_value("model_id") or MODEL_NAME_SEEDANCE_2_0).strip()
+        return MODEL_ID_ALIASES.get(raw, raw)
+
+    def _exact_incoming_source(self, target_parameter_name: str, expected_source_parameter_name: str,
+                               *, required: bool = True) -> Any:
+        source = self._web_owner._exact_incoming_source(
+            target_parameter_name, expected_source_parameter_name, required=required,
+        )
+        kind = {SHOT_ASSET_INPUT_PARAMETER: "image_asset", SHOT_PICKER_INPUT_PARAMETER: "video_picker"}.get(target_parameter_name)
+        return _HMBWebRerenderSource(source, self._web_source_snapshots, kind) if source is not None and kind else source
+
+    def _reconcile_shared_shot_routing(self, *, strict: bool = False) -> dict[str, Any]:
+        # Reconciliation can rewrite several real nodes and graph edges. Web
+        # requests only consume an already connected, hydrated source contract.
+        status = getattr(self._web_owner, "_hmb_shot_route_status", {})
+        if strict and self._hmb_shot_channel_subscription()["enabled"] and status and not status.get("ok", True):
+            raise RuntimeError("The connected Generator Shot is not ready.")
+        return {"ok": True, "code": "read_only_snapshot", "changed": 0}
+
+    def _get_parameters(self) -> dict[str, Any]:
+        return deepcopy(self._web_params) if self._web_request else super()._get_parameters()
+
+    def _resolve_exact_shot_generation_inputs(self, params: dict[str, Any]) -> dict[str, Any]:
+        if self._web_request:
+            self._web_owner._hmb_web_rerender_validate_claim(self._web_claim)
+            return deepcopy(params)
+        return super()._resolve_exact_shot_generation_inputs(params)
+
+    def _capture_generated_video_origin(self) -> dict[str, Any]:
+        if self._web_request:
+            return deepcopy(self._web_params.get("_hmb_generation_origin") or {})
+        return self._web_owner._capture_generated_video_origin()
+
+    def _runtime_node_is_live(self, *, require_registered: bool = False) -> bool:
+        owner = self._web_owner
+        live = (not bool(getattr(owner, "_hmb_node_deleted", False))
+                if self._web_request and threading.get_ident() != self._web_engine_thread
+                else owner._runtime_node_is_live(require_registered=True))
+        return bool(live and (
+            not self._web_request or (self._web_claim.active
+                and getattr(owner, "_hmb_web_rerender_active_claim", None) is self._web_claim)))
+
+    @property
+    def is_cancellation_requested(self) -> bool:
+        return bool(getattr(self._web_owner, "is_cancellation_requested", False))
+
+    def _submission_start_is_authorized(self, *, require_registered: bool) -> bool:
+        if not self._runtime_node_is_live(require_registered=True) or self.is_cancellation_requested:
+            return False
+        self._validate_request_on_engine_loop()
+        if threading.get_ident() != self._web_engine_thread:
+            current = _web_rerender_reference_identity(self._web_claim.snapshot["params"], True)
+            if current != self._web_claim.media_identity:
+                raise _AgentResultUnavailable("A web rerender reference changed before submission.")
+        return True
+
+    def _validate_request_on_engine_loop(self) -> None:
+        async def validate() -> None:
+            self._web_owner._hmb_web_rerender_validate_claim(self._web_claim)
+        try:
+            if threading.get_ident() == self._web_engine_thread:
+                self._web_owner._hmb_web_rerender_validate_claim(self._web_claim)
+            else:
+                future = asyncio.run_coroutine_threadsafe(validate(), self._web_loop)
+                try:
+                    future.result(timeout=10)
+                except BaseException:
+                    future.cancel()
+                    raise
+        except (RuntimeError, ValueError, TimeoutError) as exc:
+            raise _AgentResultUnavailable("The web rerender target changed before submission.") from exc
+
+    def _assert_agent_result_available(self, prompt: str | None = None, *, allow_resume: bool = True) -> None:
+        self._validate_request_on_engine_loop()
+        text = self._web_agent_result["text"] if prompt is None else prompt
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != self._web_agent_result["output_sha256"]:
+            raise _AgentResultUnavailable("The web Agent result changed before submission.")
+
+    def _new_generation_client_request_id(self) -> str:
+        return self._web_client_request_id
+
+    def _generation_recovery_state(self) -> dict[str, Any]:
+        return _seedance_recovery_value(self.get_parameter_value(SEEDANCE_RECOVERY_PARAMETER))
+
+    def _claim_generation_recovery_journal(self, checkpoint: dict[str, Any]) -> dict[str, Any]:
+        return checkpoint
+
+    def _current_recovery_output_file(self) -> str:
+        return str(self._output_file.path)
+
+    async def _force_save_generation_recovery_checkpoint(self, *, required: bool, reason: str) -> bool:
+        checkpoint = deepcopy(self._generation_recovery_state())
+        checkpoint.update(parent_task_id=self._web_parent_task_id, command_id=self._web_command_id,
+                          client_request_id=self._web_client_request_id, case_id=self._hmb_review_case_id)
+        try:
+            result = self._web_checkpoint_sink(checkpoint, reason=reason, required=required)
+            if inspect.isawaitable(result):
+                await result
+            return True
+        except Exception:
+            if required:
+                raise
+            logger.warning("Web rerender checkpoint update was unavailable; its saved request identity remains authoritative.")
+            return False
+
+    def _get_broker_bridge(self, *, server_url: str | None = None) -> Any:
+        expected = self._web_params["_hmb_broker_server_url"]
+        if server_url is not None and _broker_validated_server_url(server_url) != expected:
+            raise _BrokerProtocolError("The web rerender Broker origin changed.")
+        return self._broker_bridge_instance
+
+    def _apply_broker_snapshot(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def _sync_seedance_shot_widget(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def _publish_generation_preview(self, phase: str, *, generation_id: str | None = None,
+                                    **kwargs: Any) -> None:
+        self._hmb_generation_preview_state = {"phase": phase, "job_id": generation_id or ""}
+        self._record_review_stage(phase, generation_id or "")
+
+    def _record_completed_video_source(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def _set_status_results(self, **kwargs: Any) -> None:
+        self._web_status_results = deepcopy(kwargs)
+
+    def _start_review_case(self, client_request_id: str, submitted_prompt: str) -> None:
+        inputs = deepcopy(self._hmb_review_inputs)
+        inputs["web_rerender"] = {"parent_task_id": self._web_parent_task_id, "command_id": self._web_command_id}
+        self._hmb_review_case_id = _review.start_case(
+            client_request_id, inputs, submitted_prompt, _get_build_diagnostics(),
+            deepcopy(self._web_agent_result.get("observation") or {}),
+        )
+
 
 __all__ = [
     "GT_CLOUD_API_KEY_SECRET",

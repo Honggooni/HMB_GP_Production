@@ -10,6 +10,7 @@ import json
 import re
 import secrets
 import sys
+import threading
 from typing import Any
 
 
@@ -102,6 +103,90 @@ _PAIRED_PROMPT_SNAPSHOT_KEYS = frozenset({
     "machine_prompt",
 })
 _VERIFIED_PROMPT_SOURCE_ATTRIBUTE = "_hmb_verified_prompt_source_node"
+
+_WEB_AUTHORITY_SEAL = object()
+_EXECUTION_GATE_GUARD = threading.Lock()
+
+
+class _HMBWebRerenderAuthority:
+    """An engine-issued, process-local, single-use permission, never JSON input."""
+
+    __slots__ = ("_seal", "agent", "generator", "request_id", "owner_key", "_claimed", "_lock")
+
+    def __init__(self, seal, agent, generator, request_id, owner_key):
+        if seal is not _WEB_AUTHORITY_SEAL:
+            raise TypeError("Web rerender authority must be issued by the engine.")
+        self._seal = seal
+        self.agent = agent
+        self.generator = generator
+        self.request_id = request_id
+        self.owner_key = owner_key
+        self._claimed = False
+        self._lock = threading.Lock()
+
+    def _claim(self, agent):
+        with self._lock:
+            if self._seal is not _WEB_AUTHORITY_SEAL or self.agent is not agent or self._claimed:
+                raise RuntimeError("Web rerender authority is unavailable or already used.")
+            self._claimed = True
+
+    def __reduce__(self):
+        raise TypeError("Web rerender authority cannot be serialized.")
+
+
+def _issue_hmb_web_rerender_authority(agent, *, request_id, generator, owner_key):
+    """Called only by the authenticated engine worker after target validation.
+
+    This is an in-process capability boundary, not a remotely exposed request or
+    a marker accepted from a parameter. The worker owns authentication, target
+    registration, Generator reservation and durable request deduplication.
+    """
+    if not isinstance(agent, HMBAgentLibrary) or generator is None:
+        raise TypeError("Web rerender requires an HMB Agent and a reserved Generator.")
+    if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,191}", request_id):
+        raise ValueError("Web rerender request identity is invalid.")
+    if not isinstance(owner_key, str) or not owner_key or len(owner_key) > 512:
+        raise ValueError("Web rerender owner identity is invalid.")
+    return _HMBWebRerenderAuthority(_WEB_AUTHORITY_SEAL, agent, generator, request_id, owner_key)
+
+
+def _agent_execution_gate(node):
+    with _EXECUTION_GATE_GUARD:
+        gate = getattr(node, "_hmb_execution_gate", None)
+        if gate is None:
+            gate = threading.Lock()
+            node._hmb_execution_gate = gate
+        return gate
+
+
+async def _acquire_agent_execution_gate(node):
+    gate = _agent_execution_gate(node)
+    # A cancellable wait must never leave a to_thread(lock.acquire) pending;
+    # that worker could acquire the lock after its cancelled waiter has gone.
+    while not gate.acquire(blocking=False):
+        await asyncio.sleep(0.05)
+    return gate
+
+
+async def _run_web_rerender_worker(execution, callback):
+    """Keep policy/model I/O off the loop and drain before facade cleanup."""
+    pending = asyncio.create_task(asyncio.to_thread(callback))
+    try:
+        return await asyncio.shield(pending)
+    except asyncio.CancelledError:
+        execution._hmb_web_cancelled = True
+        # Neither a policy load nor native stream may outlive its reservation
+        # and write into a cleared facade. Repeated cancellation remains safe.
+        while not pending.done():
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if pending.done() and not pending.cancelled():
+            pending.exception()
+        raise
 
 
 _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE = (
@@ -1518,7 +1603,125 @@ class HMBAgentLibrary(_BaseAgent):
         except Exception:
             pass
 
+    def _hmb_issue_web_rerender_authority(self, *, request_id, generator, owner_key):
+        return _issue_hmb_web_rerender_authority(
+            self, request_id=request_id, generator=generator, owner_key=owner_key
+        )
+
+    def _hmb_web_rerender_busy(self) -> bool:
+        return _agent_execution_gate(self).locked()
+
+    def _hmb_web_rerender_policy_status(self) -> dict[str, Any]:
+        """Read-only signed artifact readiness; no model call or session claim.
+
+        The worker may call this in to_thread for heartbeat publication. Actual
+        execution still performs the authenticated session bootstrap and load.
+        """
+        try:
+            state = _hmb._agent_process_session._status_for_regression()[0]
+            if str(state).casefold() in {"failed", "closed"}:
+                return {"ready": False, "version": "", "sha256": "", "reason": "policy_session_unavailable"}
+            encoded = _hmb._read_agent_policy_envelope()
+            payload = _hmb._validate_agent_policy_payload(_hmb._decode_signed_agent_policy_envelope(encoded))
+            return {
+                "ready": True,
+                "version": str(payload.get("final_policy_version") or ""),
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+                "reason": "",
+            }
+        except Exception:
+            return {"ready": False, "version": "", "sha256": "", "reason": "policy_unavailable"}
+
+    async def _hmb_run_web_rerender(
+        self, prompt, media_snapshot, generation_settings, request_identity
+    ) -> dict[str, Any]:
+        """Run one authenticated web prompt without publishing or editing nodes.
+
+        The engine worker reserves and verifies the exact Generator first. A
+        local capability, never request JSON, authorizes the separate policy
+        path. Original Prompt text and paired snapshots are intentionally not
+        consulted. Ordinary editor execution retains its canonical edge gate.
+        """
+        if type(request_identity) is not _HMBWebRerenderAuthority:
+            raise TypeError("Web rerender requires engine-issued authority.")
+        request_identity._claim(self)
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 54000:
+            raise ValueError("Web rerender prompt must contain 1 to 54000 characters.")
+        media, settings = _web_rerender_snapshots(media_snapshot, generation_settings, prompt)
+        gate = await _acquire_agent_execution_gate(self)
+        execution = None
+        try:
+            if not self._hmb_lifecycle_is_live() or bool(getattr(self, "is_cancellation_requested", False)):
+                raise RuntimeError("Web rerender Agent is unavailable.")
+            if bool(getattr(request_identity.generator, "_hmb_node_deleted", False)):
+                raise RuntimeError("Web rerender Generator is unavailable.")
+            execution = _HMBWebRerenderExecution._from_owner(self, prompt, media, settings)
+            try:
+                def load_policy():
+                    _hmb._bootstrap_agent_policy_session()
+                    return execution._load_hmb_rules()
+
+                (
+                    execution._hmb_policy,
+                    execution._hmb_binding,
+                    execution._hmb_policy_rules,
+                    execution._hmb_binding_rules,
+                ) = await _run_web_rerender_worker(execution, load_policy)
+            except Exception:
+                raise RuntimeError(_HMB_POLICY_UNAVAILABLE_MESSAGE) from None
+            execution._hmb_ruleset_names = (secrets.token_hex(16), secrets.token_hex(16))
+            execution._hmb_rules_active = True
+            policy_identity = dict(execution._hmb_policy_identity)
+            run_id = secrets.token_hex(16)
+            execution._hmb_execution_result = {"status": "running", "run_id": run_id}
+            iterator = execution._run_native_agent_once()
+            try:
+                try:
+                    step = next(iterator)
+                    while True:
+                        value = await _run_web_rerender_worker(execution, step)
+                        step = iterator.send(value)
+                except StopIteration:
+                    pass
+            finally:
+                iterator.close()
+            if not execution._hmb_lifecycle_is_live() or execution.is_cancellation_requested:
+                raise asyncio.CancelledError()
+            execution._secure_hmb_outputs()
+            text = execution.parameter_output_values.get("output")
+            if execution._hmb_last_sanitizer_status != "clean" or not isinstance(text, str) or not text.strip() or len(text) > 50000:
+                raise RuntimeError(_HMB_EXECUTION_FAILED_MESSAGE)
+            return {
+                "text": text,
+                "run_id": run_id,
+                "output_sha256": _prompt_text_sha256(text),
+                "policy_identity": policy_identity,
+                "observation": execution._hmb_agent_reference_observation_snapshot(),
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if str(exc) == _HMB_POLICY_UNAVAILABLE_MESSAGE:
+                raise
+            code = str(getattr(execution, "_hmb_native_failure_code", "") or _hmb_native_failure_code(exc))
+            raise RuntimeError(_hmb_execution_failure_message(code)) from None
+        finally:
+            if execution is not None:
+                execution._hmb_web_cancelled = True
+                execution._clear_hmb_runtime_policy()
+                execution.parameter_values.clear()
+                execution.parameter_output_values.clear()
+                execution._hmb_verified_prompt_source_node = None
+            gate.release()
+
     async def aprocess(self) -> None:
+        gate = await _acquire_agent_execution_gate(self)
+        try:
+            await self._hmb_aprocess_locked()
+        finally:
+            gate.release()
+
+    async def _hmb_aprocess_locked(self) -> None:
         """Handle this Agent's failure without canceling independent host tasks.
 
         The synchronous process keeps its strict error contract. Only the host
@@ -3662,3 +3865,157 @@ class HMBAgentLibrary(_BaseAgent):
             self._publish_hmb_execution_block(failure_message)
             raise RuntimeError(failure_message) from None
         return result
+
+
+def _web_rerender_snapshots(media_snapshot, generation_settings, prompt):
+    if (
+        not isinstance(media_snapshot, dict)
+        or media_snapshot.get("schema") != "hmb-agent-reference-media"
+        or media_snapshot.get("version") != 1
+        or not isinstance(generation_settings, dict)
+    ):
+        raise ValueError("Web rerender source snapshot is invalid.")
+    media = copy.deepcopy(media_snapshot)
+    for kind in ("image", "video"):
+        records = media.get(kind + "s", [])
+        if not isinstance(records, list) or len(records) > 64:
+            raise ValueError("Web rerender source order is invalid.")
+        for index, record in enumerate(records, 1):
+            if (
+                not isinstance(record, dict)
+                or record.get("token") != f"@{kind}{index}"
+                or not isinstance(record.get("source"), str)
+                or not record["source"].strip()
+            ):
+                raise ValueError("Web rerender source identity is invalid.")
+        media[kind + "s"] = records
+    media["machine_sha256"] = _prompt_text_sha256(prompt)
+    allowed = {
+        "model_id", "task", "duration", "duration_seconds", "duration_mode",
+        "aspect_ratio", "ratio", "resolution", "output_format", "seed",
+        "return_last_frame", "generate_audio", "camera_fixed", "watermark",
+    }
+    settings = {key: copy.deepcopy(value) for key, value in generation_settings.items() if key in allowed}
+    # These snapshots cross no policy/auth boundary and contain data only. Do
+    # not carry a client instance, credential or executable object to the LLM.
+    json.dumps(media, ensure_ascii=False, allow_nan=False)
+    json.dumps(settings, ensure_ascii=False, allow_nan=False)
+    return media, settings
+
+
+class _HMBWebRerenderSource:
+    def __init__(self, prompt, media, settings):
+        self.prompt = prompt
+        self.media = media
+        self.settings = settings
+
+    def _hmb_agent_reference_media(self, expected_machine):
+        if expected_machine != self.prompt:
+            raise RuntimeError("Web rerender source snapshot changed.")
+        return copy.deepcopy(self.media)
+
+    def _hmb_agent_generation_context(self, expected_machine):
+        if expected_machine != self.prompt:
+            raise RuntimeError("Web rerender source snapshot changed.")
+        return copy.deepcopy(self.settings)
+
+
+class _HMBWebRerenderExecution(HMBAgentLibrary):
+    """Unregistered execution facade; native setters never reach the editor."""
+
+    @classmethod
+    def _from_owner(cls, owner, prompt, media, settings):
+        node = object.__new__(cls)
+        node.__dict__.update(owner.__dict__)
+        for name in (
+            "get_parameter_value", "get_parameter_list_value", "set_parameter_value",
+            "append_value_to_parameter", "_set_visible_output", "show_message_by_name",
+            "hide_message_by_name", "_hmb_lifecycle_is_live",
+        ):
+            node.__dict__.pop(name, None)
+        node._hmb_web_owner = owner
+        node._hmb_web_owner_generation = int(getattr(owner, "_hmb_lifecycle_generation", 0) or 0)
+        node._hmb_web_cancelled = False
+        node.parameter_values = {}
+        node.parameter_output_values = {}
+        node.metadata = copy.deepcopy(getattr(owner, "metadata", {}))
+        # Copy effective native settings, including connected values, without
+        # ever reading Prompt/SHOT_PROMPT_IN or any previous Agent output.
+        for key in (
+            "model", "model_provider", "agent", "include_details", "output_schema",
+            "additional_context", "agent_memory",
+        ):
+            node.parameter_values[key] = copy.deepcopy(owner.get_parameter_value(key))
+        for key in ("tools", "rulesets"):
+            node.parameter_values[key] = copy.deepcopy(owner.get_parameter_list_value(key))
+        for key in ("_model_access", "_provider"):
+            component = getattr(owner, key, None)
+            if component is not None:
+                component = copy.copy(component)
+                if hasattr(component, "_node"):
+                    component._node = node
+                setattr(node, key, component)
+        if getattr(node, "_provider", None) is not None and hasattr(node._provider, "_model_access"):
+            node._provider._model_access = node._model_access
+        node._clear_hmb_runtime_policy()
+        node._hmb_runtime_prompt = prompt
+        node._hmb_verified_prompt_source_node = _HMBWebRerenderSource(prompt, media, settings)
+        node._hmb_native_calls_this_process = 0
+        node._hmb_reference_observation = {}
+        node._hmb_reference_observation_run_id = ""
+        node._hmb_execution_shot_binding = {}
+        node._hmb_shot_context = {}
+        node._hmb_native_failure_stage = ""
+        node._hmb_native_failure_code = ""
+        node._last_raw_output = None
+        node._hmb_suppress_visible_publication = True
+        return node
+
+    @property
+    def is_cancellation_requested(self):
+        return self._hmb_web_cancelled or bool(getattr(self._hmb_web_owner, "is_cancellation_requested", False))
+
+    def _hmb_lifecycle_is_live(self, generation=None):
+        return (
+            not self._hmb_web_cancelled
+            and self._hmb_web_owner._hmb_lifecycle_is_live(self._hmb_web_owner_generation)
+            and (generation is None or generation == self._hmb_lifecycle_generation)
+        )
+
+    def get_parameter_value(self, name):
+        if str(name).casefold() == "prompt" and self._hmb_rules_active:
+            return self._hmb_runtime_prompt
+        return self.parameter_values.get(name)
+
+    def get_parameter_list_value(self, name):
+        values = list(self.parameter_values.get(name) or [])
+        if name == "rulesets" and self._hmb_rules_active:
+            values.extend([
+                {"name": self._hmb_ruleset_names[0], "rules": list(self._hmb_policy_rules)},
+                {"name": self._hmb_ruleset_names[1], "rules": list(self._hmb_binding_rules)},
+            ])
+        return values
+
+    def set_parameter_value(self, name, value, *args, **kwargs):
+        key = self._publication_parameter_name(name)
+        if self._hmb_capture_publications and key in {"output", "logs"}:
+            self._hmb_publication_buffer[key] = str(value or "")
+        else:
+            self.parameter_values[str(name)] = value
+            self.parameter_output_values[str(name)] = value
+
+    def append_value_to_parameter(self, name, value=None, *args, **kwargs):
+        key = self._publication_parameter_name(name)
+        if self._hmb_capture_publications and key in {"output", "logs"}:
+            self._hmb_publication_buffer[key] += str(value or "")
+        else:
+            self.set_parameter_value(name, str(self.parameter_output_values.get(str(name), "")) + str(value or ""))
+
+    def _set_visible_output(self, value):
+        self.parameter_output_values["output"] = value
+
+    def show_message_by_name(self, *args, **kwargs):
+        return None
+
+    def hide_message_by_name(self, *args, **kwargs):
+        return None

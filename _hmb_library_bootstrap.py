@@ -5,6 +5,9 @@ The official engine bootstrap prepares only an otherwise empty editor session.
 """
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+import sys
 import threading
 import weakref
 from typing import Any
@@ -83,8 +86,37 @@ class _Registration:
         self.active = True
         # Store this exact callable for matching add/remove across lifecycle.
         self.hook = self.before_create
+        self.web_worker_module = None
+
+    def start_web_worker(self) -> None:
+        engine = self.engine()
+        if not self.active or not self.owners or engine is None:
+            return
+        try:
+            loop = engine.event_manager.event_loop
+            if loop is None or loop.is_closed() or not loop.is_running():
+                return
+            if self.web_worker_module is None:
+                path = Path(__file__).with_name("_hmb_web_rerender.py")
+                name = "_hmb_web_rerender"
+                module = sys.modules.get(name)
+                if module is None:
+                    spec = importlib.util.spec_from_file_location(name, path)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    sys.modules[name] = module
+                elif Path(module.__file__).resolve() != path.resolve():
+                    return  # Do not bind another installed library's worker.
+                self.web_worker_module = module
+            self.web_worker_module.ensure_engine_worker(engine)
+        except Exception:
+            # Older hosts and optional Broker failures cannot block editing.
+            return
 
     def before_create(self, request: Any, _result_context: Any) -> Any:
+        # Dispatch is also the late-loop wakeup after a desktop startup that
+        # loaded libraries before initializing its event queue.
+        self.start_web_worker()
         if (
             type(request) is not CreateNodeRequest
             or request.node_type != _NODE_TYPE
@@ -205,6 +237,7 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
                 with registration.lock:
                     registration.owners[self] = library_reference
                     self._registrations.add(registration)
+                    registration.start_web_worker()
         except Exception:
             # Optional cold-start compatibility never blocks library loading.
             return
@@ -217,6 +250,9 @@ class HMBProductionLibrary(AdvancedNodeLibrary):
                     if registration.owners:
                         continue
                     registration.active = False
+                    engine = registration.engine()
+                    if registration.web_worker_module is not None and engine is not None:
+                        registration.web_worker_module.stop_engine_worker(engine)
                     manager = registration.manager()
                     if manager is not None:
                         try:

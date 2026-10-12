@@ -24,7 +24,7 @@ RUNTIME_FILE_PATHS = (
     "HMBColorLUTLibrary.py", "HMBFinishLookLibrary.py", "HMBImageAssetLibrary.py",
     "HMBPromptLibrary.py", "HMBSeedanceGeneration.py", "HMBVideoPickerLibrary.py",
     "_hmb_agent_media.py", "_hmb_agent_session.py", "_hmb_build_diagnostics.py",
-    "_hmb_library_bootstrap.py", "_hmb_review.py", "_hmb_shot_routing.py", "_hmb_mp4_verify.py", "_hmb_common.py",
+    "_hmb_library_bootstrap.py", "_hmb_review.py", "_hmb_web_rerender.py", "_hmb_shot_routing.py", "_hmb_mp4_verify.py", "_hmb_common.py",
     "_hmb_color_lut.py", "_hmb_screen_space.py", "_hmb_video_tools.py",
     "widgets/HMBAgentLibraryWidget.js", "widgets/HMBColorLUTLibraryWidget.js",
     "widgets/HMBFinishLookLibraryWidget.js", "widgets/HMBImageAssetLibraryWidget.js",

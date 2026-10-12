@@ -1898,14 +1898,36 @@ function hmbRememberImageAssetStateEcho(container, value, publicationToken, comp
   return true;
 }
 
+function imageAssetCompactEditEcho(container, value, request = parseValue(value)) {
+  if (request?.schema !== IMAGE_ASSET_EDIT_SCHEMA) return null;
+  // The host can optimistically echo onChange's request before Python expands
+  // it into a canonical state. This command has no assets/projects and must
+  // never replace the retained catalog or advance its authority clocks.
+  const wire = typeof value === "string" ? value : JSON.stringify(request);
+  const known = container?.__hmbImageAssetPendingStateEchoes?.some?.(
+    (entry) => entry?.compact && entry.value === wire,
+  );
+  return {
+    current: Boolean(known && hmbImageAssetRevisionDisposition(container, request) !== "stale"),
+  };
+}
+
 export function hmbConsumeImageAssetStateEcho(container, nextProps = {}) {
   if (!container) return false;
+  const retainedIncomingState = container.__hmbImageAssetIncomingState;
+  delete container.__hmbImageAssetIncomingState;
+  const commandEcho = isCanonicalImageAssetState(retainedIncomingState)
+    ? null : imageAssetCompactEditEcho(container, nextProps?.value);
+  if (commandEcho) {
+    container.__hmbImageAssetLastConsumedEchoWasStale = !commandEcho.current;
+    // Keep the pending entry: the later full canonical response is the actual
+    // acknowledgement, and must still be matched against this publication.
+    return true;
+  }
   container.__hmbImageAssetLastConsumedEchoWasStale = false;
   delete container.__hmbImageAssetIncomingSerialized;
   let incomingState = null;
   try {
-    const retainedIncomingState = container.__hmbImageAssetIncomingState;
-    delete container.__hmbImageAssetIncomingState;
     incomingState = isCanonicalImageAssetState(retainedIncomingState)
       ? retainedIncomingState
       : normalizeState(nextProps?.value);
@@ -7356,7 +7378,13 @@ export default function HMBImageAssetLibraryWidget(container, props) {
       props = hmbUpdateImageAssetPropsReference(props, nextProps);
       return;
     }
-    const incomingState = normalizeState(nextProps?.value);
+    const rawIncoming = parseValue(nextProps?.value);
+    const commandEcho = imageAssetCompactEditEcho(container, nextProps?.value, rawIncoming);
+    if (commandEcho) {
+      if (commandEcho.current) props = hmbUpdateImageAssetPropsReference(props, nextProps);
+      return;
+    }
+    const incomingState = normalizeState(rawIncoming);
     const queuedOwnerAction = container.__hmbImageAssetPendingSlowAction;
     if (
       queuedOwnerAction

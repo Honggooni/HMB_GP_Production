@@ -431,7 +431,7 @@ def original_connections(fake: FakeMaterialCmds) -> dict[str, str]:
 
 # The fake Maya foundation above is retained for portable SG-membership tests.
 # No old per-material/color/alpha/renderer-fallback expectations remain.
-PROFILE = "maya-midgray-solid-studio-v3"
+PROFILE = "maya-midgray-solid-studio-v4-eye-groups"
 assert runner.ORIGINAL_MATERIAL_OVERRIDE_PROFILE == PROFILE
 
 
@@ -491,7 +491,7 @@ class MidgrayCmds(FakeMaterialCmds):
         if (node not in self.members
                 and node not in ("hardwareRenderingGlobals", "defaultRenderGlobals")
                 and not node.startswith("HMB_Original_")
-                and self.node_types.get(node) not in ("mesh", "transform")):
+                and self.node_types.get(node) not in ("mesh", "nurbsSurface", "transform")):
             self.authored_reads.append((operation, node))
             raise AssertionError("Original must not evaluate authored appearance: " + node)
 
@@ -543,10 +543,10 @@ def controller_for(fake, scope=None):
 class EyeMidgrayCmds(MidgrayCmds):
     """An authored native eye graph and exact face memberships, not a renderer stub."""
 
-    EYE_LEFT = "|hero:ROOT|hero:Face_GRP|hero:Eyes_GRP|hero:Eye_L_GEO|hero:renderShape"
-    EYE_RIGHT = "|hero:ROOT|hero:Face_GRP|hero:Eyes_GRP|hero:Eye_R_GEO|hero:renderShape"
+    EYE_LEFT = "|hero:ROOT|hero:Face_GRP|hero:eye_GEO_GRP|hero:Eye_L_GEO|hero:renderShape"
+    EYE_RIGHT = "|hero:ROOT|hero:Face_GRP|hero:eye_GRP|hero:nested_GRP|hero:Eye_R_GEO|hero:renderShape"
     BODY = "|hero:ROOT|hero:Body_GEO|hero:bodyShape"
-    BROW = "|hero:ROOT|hero:Face_GRP|hero:Eyes_GRP|hero:Eyebrow_L_GEO|hero:renderShape"
+    BROW = "|hero:ROOT|hero:Face_GRP|hero:Eyebrow_L_GEO|hero:renderShape"
     EYE_LEFT_OWNER = EYE_LEFT.rsplit("|", 1)[0]
     EYE_RIGHT_OWNER = EYE_RIGHT.rsplit("|", 1)[0]
     BODY_OWNER = BODY.rsplit("|", 1)[0]
@@ -631,7 +631,7 @@ class EyeMidgrayCmds(MidgrayCmds):
 
     def nodeType(self, node, **kwargs):
         result = super().nodeType(node)
-        return ["dagNode", "shape", result] if kwargs.get("inherited") and result == "mesh" else result
+        return ["dagNode", "shape", result] if kwargs.get("inherited") and result in ("mesh", "nurbsSurface") else result
 
     def duplicate(self, node, inputConnections=False, name="", **kwargs):
         assert inputConnections and not kwargs
@@ -750,11 +750,11 @@ class EyeMidgrayCmds(MidgrayCmds):
         ))
 
 
-# Namespace text is not an eye name. Anonymous shapes inherit semantic DAG
-# ancestors; an eyebrow remains body geometry even beneath an Eyes group.
-for name in ("hero:Eye_L_GEO", "hero:eyeBall02Shape", "hero:Iris_GEO", "hero:PupilShape", "hero:Cornea", "hero:Sclera"):
+# Only the two explicit group names grant an Original material exception.
+for name in ("eye_GEO_GRP", "eye_GRP", "hero:eye_GEO_GRP", "hero:rig:eye_GRP"):
     assert runner._original_eye_semantic(name), name
-for name in ("hero:Eyebrow_L_GEO", "hero:eyeBrowShape", "eye:Body_GEO", "eyes:headShape", "hero:bodyShape"):
+for name in ("hero:Eye_L_GEO", "hero:eyeBall02Shape", "hero:Iris_GEO", "hero:PupilShape", "hero:Cornea", "hero:Sclera",
+             "hero:Eyebrow_L_GEO", "eye_GRP:Body_GEO", "hero:Eyes_GRP", "hero:eye_GRP_extra", "hero:Eye_GRP", "EyeMat"):
     assert not runner._original_eye_semantic(name), name
 with tempfile.TemporaryDirectory(prefix="hmb-authored-eye-") as texture_root:
     texture_directory = Path(texture_root)
@@ -808,11 +808,60 @@ with tempfile.TemporaryDirectory(prefix="hmb-authored-eye-") as texture_root:
     assert eye_only_controller.finish()["restore_ok"]
     assert eye_only.snapshot() == eye_only_before
 
-    # A generic head mesh can use an explicit eye-material face assignment.
-    # The same EyeMat on a whole body object grants no eye classification.
+    # Both exact group names work with no namespace and nested namespaces, for
+    # nested mesh/NURBS surfaces whose own names say body or brow. Native eye
+    # shaders, SG links, memberships and their inputs remain byte-for-byte exact.
+    for group_name in ("eye_GEO_GRP", "eye_GRP"):
+        for namespace in ("", "studio:hero:"):
+            for surface_type in ("mesh", "nurbsSurface"):
+                grouped = EyeMidgrayCmds(texture_directory)
+                surface = "|ROOT|{0}{1}|nested_GRP|Body_Eyebrow_GEO|surfaceShape".format(namespace, group_name)
+                segments = surface.split("|")[1:]
+                for index in range(1, len(segments)):
+                    grouped.node_types["|" + "|".join(segments[:index])] = "transform"
+                grouped.node_types[surface] = surface_type
+                owner = surface.rsplit("|", 1)[0]
+                grouped.members = {"eyeOnlySG": [owner + ".f[0:3]" if surface_type == "mesh" else owner]}
+                grouped_before = grouped.snapshot()
+                grouped_controller = controller_for(grouped, [surface])
+                assert runner._original_eye_shape(surface), surface
+                grouped_report = grouped_controller.apply()
+                assert grouped_report["preserved_eye_shape_count"] == 1
+                assert grouped_report["preserved_eye_component_count"] == (4 if surface_type == "mesh" else 0)
+                assert grouped_report["temporary_lambert_count"] == 0
+                assert not grouped.assignment_calls and not grouped_controller.created_nodes
+                assert grouped.snapshot() == grouped_before
+                assert grouped_controller.finish()["restore_ok"]
+                assert grouped.snapshot() == grouped_before
+
+    # Eye-like mesh/SG/shader names and face assignments outside the explicit
+    # groups must become gray. Neither prefix matches nor namespace text count.
+    for outside_group in ("Eyes_GRP", "eye_GEO_GRP_extra", "eye_GRP2", "Eye_GRP", "eye_GRP:Body_GRP"):
+        outside = EyeMidgrayCmds(texture_directory)
+        surface = "|ROOT|" + outside_group + "|Iris_GEO|eyeShape"
+        segments = surface.split("|")[1:]
+        for index in range(1, len(segments)):
+            outside.node_types["|" + "|".join(segments[:index])] = "transform"
+        outside.node_types[surface] = "mesh"
+        outside.members = {"sharedEyeBodySG": [surface.rsplit("|", 1)[0] + ".f[0:3]"]}
+        outside_before = outside.snapshot()
+        outside_controller = controller_for(outside, [surface])
+        assert not runner._original_eye_shape(surface), surface
+        outside_report = outside_controller.apply()
+        assert outside_report["preserved_eye_shape_count"] == 0
+        assert outside_report["preserved_eye_shading_engine_count"] == 0
+        assert outside_report["temporary_lambert_count"] == 1
+        assert outside.connections["sharedEyeBodySG.surfaceShader"].startswith("HMB_Original_")
+        assert outside_controller.finish()["restore_ok"]
+        assert outside.snapshot() == outside_before
+    outside.node_types["|ROOT|eye_GRP"] = "mesh"
+    assert not runner._original_eye_shape("|ROOT|eye_GRP"), "A surface name is not a pass group."
+
+    # Group ancestry preserves even body/brow-named meshes and face assignments.
+    # The same EyeMat on an object outside the group grants no exception.
     combined = EyeMidgrayCmds(texture_directory)
-    head = "|hero:ROOT|hero:Head_GEO|hero:HeadShape"
-    combined.node_types["|hero:ROOT|hero:Head_GEO"] = "transform"
+    head = "|hero:ROOT|hero:Face_GRP|hero:eye_GRP|hero:Body_Eyebrow_GEO|hero:HeadShape"
+    combined.node_types[head.rsplit("|", 1)[0]] = "transform"
     combined.node_types[head] = "mesh"
     head_owner = head.rsplit("|", 1)[0]
     eye_face_member = head_owner + ".f[0:3]"
@@ -1253,6 +1302,7 @@ for field, value in (
     ("profile", "per_source_material_lambert_texture_preserving_v1"),
     ("profile", "maya-midgray-solid-studio-v1"),
     ("profile", "maya-midgray-solid-studio-v2"),
+    ("profile", "maya-midgray-solid-studio-v3"),
     ("requested", False), ("status", "applied"), ("restore_ok", False),
     ("base_color", [0.4, 0.5, 0.5]), ("diffuse", 0.9),
     ("fill_color", [0.0, 0.0, 0.0]), ("soft_shading_verified", False),

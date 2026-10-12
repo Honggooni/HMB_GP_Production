@@ -34,6 +34,7 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "_hmb_build_diagnostics.py",
     "_hmb_library_bootstrap.py",
     "_hmb_review.py",
+    "_hmb_web_rerender.py",
     "_hmb_shot_routing.py",
     "_hmb_mp4_verify.py",
     "_hmb_common.py",

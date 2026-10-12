@@ -1130,9 +1130,11 @@ assert.match(
 );
 assert.ok(
   applyPropsSource.indexOf("if (nextProps?.value === previousPropValue)")
-    < applyPropsSource.indexOf("const incomingState = normalizeState(nextProps?.value)"),
-  "A callback-only same-value update must return before full catalog normalization.",
+    < applyPropsSource.indexOf("const rawIncoming = parseValue(nextProps?.value)"),
+  "A callback-only same-value update must return before parsing or normalizing the catalog.",
 );
+assert.match(applyPropsSource, /const incomingState = normalizeState\(rawIncoming\)/,
+  "The compact-envelope guard and state normalizer must reuse one parsed host value.");
 const consumeEchoStart = assetSource.indexOf(
   "export function hmbConsumeImageAssetStateEcho(container, nextProps = {}) {",
 );

@@ -118,7 +118,7 @@ PROXY_H264_LEVEL = "4.2"
 FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE = "hmb_full_smooth_geometry_v2"
 ORIGINAL_VIEWPORT_QUALITY_PROFILE = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
 ORIGINAL_MATERIAL_OVERRIDE_PROFILE = (
-    "maya-midgray-solid-studio-v3"
+    "maya-midgray-solid-studio-v4-eye-groups"
 )
 ORIGINAL_EYE_FALLBACK_POLICY = (
     "maya_default_shader_for_unavailable_eye_dependencies_v1"
@@ -15802,6 +15802,7 @@ class HMBVideoPickerLibrary(DataNode):
         *,
         state_snapshot: Optional[Dict[str, Any]] = None,
         probe_cache: Optional[Dict[str, Optional[Path]]] = None,
+        validate_media: bool = True,
     ) -> Dict[str, Any]:
         lock = getattr(self, "_hmb_shot_snapshot_lock", None)
         if lock is None:
@@ -15820,6 +15821,7 @@ class HMBVideoPickerLibrary(DataNode):
                 expected_channel_uuid,
                 state_snapshot=state_snapshot,
                 probe_cache=probe_cache,
+                validate_media=validate_media,
             )
 
     def _hmb_shot_routing_snapshot_locked(
@@ -15828,6 +15830,7 @@ class HMBVideoPickerLibrary(DataNode):
         *,
         state_snapshot: Optional[Dict[str, Any]] = None,
         probe_cache: Optional[Dict[str, Optional[Path]]] = None,
+        validate_media: bool = True,
     ) -> Dict[str, Any]:
         # Output publication supplies its exact immutable state revision here.
         # Falling back to ``_picker_state`` remains the public read contract,
@@ -15876,7 +15879,9 @@ class HMBVideoPickerLibrary(DataNode):
             uid = _clean(item.get("video_uid") or item.get("source_uid"))
             media = _select_synchronized_video_media(
                 item,
-                enforce_media_availability=True,
+                # A web readiness snapshot reads authored source identity only.
+                # Its worker separately checks local bytes before Agent/render.
+                enforce_media_availability=validate_media,
                 probe_cache=probe_cache,
             )
             if not uid or not media or uid in source_items:
@@ -15951,7 +15956,7 @@ class HMBVideoPickerLibrary(DataNode):
                 shot_state["videos"].append(item)
             picker_payload, shot_media = _build_synchronized_video_outputs(
                 shot_state,
-                enforce_media_availability=True,
+                enforce_media_availability=validate_media,
                 probe_cache=probe_cache,
             )
             if shot_media != [source_media_by_uid[uid] for uid in selected_uids]:
@@ -15998,7 +16003,9 @@ class HMBVideoPickerLibrary(DataNode):
             "semantic": semantic_identity,
             "media_descriptors": media_descriptors,
         })
-        generation = self._hmb_allocate_shot_snapshot_generation(identity)
+        # The private web readiness view does not advance the publisher's
+        # generation counter. Its complete metadata/media hashes identify it.
+        generation = self._hmb_allocate_shot_snapshot_generation(identity) if validate_media else 1
         metadata_document = {
             "channel_uuid": channel,
             "generation": generation,

@@ -117,6 +117,13 @@
       "reason": "Requires installed SDK/project scope; run explicitly in an isolated local host audit."
     },
     {
+      "name": "HMB_Agent_Web_Rerender_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Includes native installed Standard Agent lifecycle checks after portable core contracts; explicitly audited locally so skipped SDK coverage is not counted as a hostless CI success."
+    },
+    {
       "name": "HMB_All_15_Composition_Runtime_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
@@ -455,6 +462,12 @@
       "name": "HMB_Image_Asset_Resolved_Selection_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Asset_Selection_Continuity_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
       "required": true
     },
     {
@@ -1062,6 +1075,12 @@
     },
     {
       "name": "HMB_Seedance_Submission_Identity_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Web_Rerender_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
       "required": true
@@ -1726,6 +1745,18 @@
     },
     {
       "name": "HMB_Video_Tools_Engine_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Web_Rerender_Transport_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Web_Rerender_Worker_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
       "required": true

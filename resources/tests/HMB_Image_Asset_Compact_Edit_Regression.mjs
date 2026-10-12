@@ -35,6 +35,11 @@ assert.equal(request.edits.shot_routing.shots[0].shot_uuid, state.shot_routing.s
 assert.equal(request.selected_source_uids.length, 2);
 assert.ok(!('assets' in request) && !('projects' in request));
 assert.ok(wire.length < stringify(state).length / 20);
+const pendingEchoes = container.__hmbImageAssetPendingStateEchoes;
+assert.equal(hmbConsumeImageAssetStateEcho(container, { value: wire }), true);
+assert.equal(container.__hmbImageAssetPendingStateEchoes, pendingEchoes,
+  'An optimistic compact command echo cannot consume the later canonical acknowledgement.');
+assert.equal(hmbConsumeImageAssetStateEcho(container, { value: JSON.parse(wire) }), true);
 assert.equal(hmbConsumeImageAssetStateEcho(container, { value: stringify(state) }), true);
 assert.equal(hmbBuildImageAssetCompactEdit({ ...state, project_uid: 'different' }, identity), null);
 assert.equal(hmbBuildImageAssetCompactEdit({ ...state, edit_transport_schema: '' }, identity), null);

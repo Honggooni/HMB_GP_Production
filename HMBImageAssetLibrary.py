@@ -8348,6 +8348,7 @@ class HMBImageAssetLibrary(DataNode):
         *,
         force: bool = False,
         normalized: bool = False,
+        cached_only: bool = False,
     ) -> Dict[str, Any]:
         import_media = getattr(self, "_hmb_import_media_by_uid", {})
         if not isinstance(import_media, dict):
@@ -8395,6 +8396,10 @@ class HMBImageAssetLibrary(DataNode):
         ):
             _apply_shot_routing_state_facts(state, cached_snapshot)
             return cached_snapshot
+        if cached_only:
+            # Readiness must never resolve a network project on the engine
+            # event loop. Normal source publication refreshes this cache.
+            raise ValueError("ImageAsset Shot publication is still preparing.")
         probe = _build_shot_routing_snapshot(
             normalized_state,
             import_media,
@@ -8466,9 +8471,11 @@ class HMBImageAssetLibrary(DataNode):
     def _hmb_shot_routing_snapshot(
         self,
         expected_channel_uuid: str = "",
+        *,
+        cached_only: bool = False,
     ) -> Dict[str, Any]:
         """Return a private atomic shot metadata/media snapshot."""
-        snapshot = self._cache_shot_routing_snapshot(self._current_state())
+        snapshot = self._cache_shot_routing_snapshot(self._current_state(), cached_only=cached_only)
         expected = _clean(expected_channel_uuid)
         if expected and expected != snapshot["channel_uuid"]:
             raise ValueError(
