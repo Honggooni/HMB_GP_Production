@@ -2,9 +2,22 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 
-const source = fs.readFileSync(new URL("../../widgets/HMBSeedanceGenerationWidget.js", import.meta.url), "utf8");
+const argument = (name) => { const index = process.argv.indexOf(name); return index < 0 ? "" : process.argv[index + 1] || ""; };
+const libraryRoot = path.resolve(argument("--library-root") || fileURLToPath(new URL("../..", import.meta.url)));
+const sourcePath = path.join(libraryRoot, "widgets/HMBSeedanceGenerationWidget.js");
+const sourceBytes = fs.readFileSync(sourcePath);
+const source = sourceBytes.toString("utf8");
+const sha = (value) => crypto.createHash("sha256").update(value).digest("hex");
+const evidenceDir = argument("--evidence-dir") || process.env.HMB_SEEDANCE_BROKER_EVIDENCE_DIR;
+if (evidenceDir) fs.mkdirSync(evidenceDir, { recursive: true });
+const lifecycleEvidence = { schema: "hmb-seedance-broker-modal-ownership", version: 1, source_root: libraryRoot,
+  source_sha256: sha(sourceBytes), scope: "Actual Chrome native-row fixtures with controlled pending transport and second-node modal click event; no live engine, credentials, network or paid API",
+  provider_paid_calls: 0, cases: [] };
+const saveEvidence = () => { if (evidenceDir) fs.writeFileSync(path.join(evidenceDir, "modal-ownership-receipt.json"), JSON.stringify(lifecycleEvidence, null, 2)); };
 const require = createRequire(import.meta.url);
 let playwright;
 try { playwright = require("playwright"); }
@@ -26,6 +39,7 @@ if (!fs.existsSync(executablePath)) {
 const browser = await playwright.chromium.launch({ executablePath, headless: true });
 try {
   const page = await browser.newPage();
+  await page.route("**/*", (route) => route.abort());
   const assertCompactModelSpacing = async (reason) => {
     const layout = await page.evaluate(() => {
       const bounds = (id) => document.getElementById(id).getBoundingClientRect();
@@ -114,16 +128,24 @@ try {
   }, uri);
   const model = page.locator("#model");
   const icon = model.locator(".hmb-seedance-broker-icon");
+  const gallery = model.locator(".hmb-seedance-gallery-icon");
   await icon.waitFor();
+  await gallery.waitFor();
+  assert.equal(await gallery.count(), 1, "Exactly one gallery action beside Broker settings");
   await assertCompactModelSpacing("Initial real host allocation");
   assert.equal(await page.locator("#model-select").inputValue(), "Seedance 2.5");
   assert.equal(await page.locator("#model-select option").count(), 2);
   const bounds = await page.evaluate(() => {
     const select = document.getElementById("model-select").getBoundingClientRect();
     const icon = document.querySelector(".hmb-seedance-broker-icon").getBoundingClientRect();
-    return { selectRight: select.right, iconLeft: icon.left };
+    const gallery = document.querySelector(".hmb-seedance-gallery-icon").getBoundingClientRect();
+    return { selectRight: select.right, iconLeft: icon.left, galleryLeft: gallery.left, galleryRight: gallery.right,
+      gearSize: [icon.width, icon.height], gallerySize: [gallery.width, gallery.height], aligned: icon.top === gallery.top };
   });
-  assert.ok(bounds.selectRight <= bounds.iconLeft, "Broker icon must not cover native Model selector");
+  assert.ok(bounds.selectRight <= bounds.galleryLeft && bounds.galleryRight <= bounds.iconLeft, "Neither icon may cover the native selector or each other");
+  assert.deepEqual(bounds.gearSize, [29, 29]);
+  assert.deepEqual(bounds.gallerySize, bounds.gearSize);
+  assert.equal(bounds.aligned, true);
   assert.equal(await page.locator("#task-select").inputValue(), "Reference to Video");
   assert.equal(await page.locator("#prompt-input").inputValue(), "Preserve this prompt");
   if (process.env.HMB_SEEDANCE_SPACING_SCREENSHOT) {
@@ -131,6 +153,20 @@ try {
   }
 
   await assertRefreshTransport("Initial collapsed carriers");
+  const beforeGallery = await page.evaluate(() => ({ count: window.refreshCommands.length, urls: window.savedUrls }));
+  await gallery.click();
+  await page.waitForFunction((count) => window.refreshCommands.length === count + 1, beforeGallery.count);
+  const galleryCommand = await page.evaluate(() => window.refreshCommands.at(-1));
+  assert.equal(galleryCommand.action, "open_gallery");
+  assert.equal(galleryCommand.schema, "hmb-seedance-refresh-command");
+  assert.deepEqual(Object.keys(galleryCommand).sort(), ["action", "action_id", "issued_at_ms", "schema", "version"]);
+  assert.deepEqual(await page.evaluate(() => window.savedUrls), beforeGallery.urls);
+  assert.equal(await page.locator("#prompt-input").inputValue(), "Preserve this prompt");
+  assert.equal(await page.evaluate(() => window.nodePointerDowns), 0, "Gallery click must not start graph drag");
+  // React may remove only the injected gallery action while retaining Model/gear.
+  await page.evaluate(() => document.querySelector(".hmb-seedance-gallery-icon").remove());
+  await page.waitForFunction(() => document.querySelectorAll("#model .hmb-seedance-gallery-icon").length === 1);
+  assert.equal(await icon.count(), 1);
 
   await page.evaluate(() => {
     for (const id of ["command-slot", "broker-slot"]) {
@@ -184,6 +220,7 @@ try {
     old.replaceWith(replacement);
   });
   await page.waitForFunction(() => document.querySelectorAll("#model .hmb-seedance-broker-icon").length === 1);
+  assert.equal(await gallery.count(), 1);
   await assertCompactModelSpacing("Native Model React rerender");
   await icon.click();
   await dialog.waitFor();
@@ -214,8 +251,78 @@ try {
   await dialog.waitFor();
   await dialog.locator("[data-broker-url]").press("Escape");
   await dialog.waitFor({ state: "detached" });
+
+  // Model a host opening node B's settings while A's previous save is pending.
+  // The actual production click handler replaces the document-owned dialog.
+  // An old success must not focus A's gear through the newly active B dialog.
+  await page.evaluate(() => {
+    window.modalPending = [];
+    window.seedanceWidget.update({ value: "", onChange: () => new Promise((resolve, reject) => window.modalPending.push({ resolve, reject })) });
+    const second = document.createElement("div");
+    second.className = "react-flow__node";
+    second.id = "second-node";
+    second.innerHTML = '<div data-parameter-name="model_id" id="second-model"><label>Model B</label><select><option>Seedance 2.5</option></select></div><div data-parameter-name="broker_server_url"><div id="second-broker-container"></div></div>';
+    document.body.appendChild(second);
+    window.secondBrokerWidget = window.seedance.default(document.getElementById("second-broker-container"), {
+      value: "https://second.example.com", onChange: () => Promise.resolve(),
+    });
+  });
+  for (const outcome of ["resolve", "reject"]) {
+    await icon.click();
+    await dialog.locator("[data-broker-url]").fill("https://first.example.com");
+    await dialog.locator("[data-broker-save]").click();
+    await page.evaluate(() => {
+      document.querySelector("#second-model .hmb-seedance-broker-icon").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    assert.equal(await dialog.locator("[data-broker-url]").inputValue(), "https://second.example.com");
+    const before = await page.evaluate(() => ({ active_in_dialog: Boolean(document.activeElement?.closest('.hmb-seedance-broker-dialog')),
+      active_is_input: document.activeElement?.hasAttribute('data-broker-url'), dialogs: document.querySelectorAll('.hmb-seedance-broker-dialog').length }));
+    assert.equal(before.active_is_input, true);
+    await page.evaluate(async (outcome) => {
+      const pending = window.modalPending.at(-1);
+      if (outcome === "resolve") pending.resolve(); else pending.reject(new Error("obsolete settings failure"));
+      await Promise.resolve(); await Promise.resolve();
+    }, outcome);
+    const after = await page.evaluate(() => ({ active_in_dialog: Boolean(document.activeElement?.closest('.hmb-seedance-broker-dialog')),
+      active_is_input: document.activeElement?.hasAttribute('data-broker-url'), dialogs: document.querySelectorAll('.hmb-seedance-broker-dialog').length,
+      current_value: document.querySelector('[data-broker-url]')?.value, current_error: document.querySelector('[data-broker-error]')?.textContent,
+      focused_node: document.activeElement?.closest('.react-flow__node')?.id || '' }));
+    lifecycleEvidence.cases.push({ case: `closed-A-${outcome}-while-B-active`, before, after });
+    saveEvidence();
+    if (evidenceDir && outcome === "resolve") await page.screenshot({ path: path.join(evidenceDir, "cross-node-pending-completion.png") });
+    assert.equal(after.active_is_input, true, "A closed dialog's delayed completion must not steal the new dialog's input focus.");
+    assert.equal(after.dialogs, 1);
+    assert.equal(after.current_value, "https://second.example.com");
+    assert.equal(after.current_error, "");
+    await dialog.locator("[data-broker-cancel]").click();
+  }
+
+  // Cleanup closes A and restores its carrier. A late response cannot acquire
+  // the replacement mount or its fresh settings dialog on the same container.
+  await icon.click();
+  await dialog.locator("[data-broker-url]").fill("https://first.example.com");
+  await dialog.locator("[data-broker-save]").click();
+  await page.evaluate(() => {
+    window.retiredModal = window.modalPending.at(-1);
+    window.seedanceWidget.cleanup();
+    window.seedanceWidget = window.seedance.default(document.getElementById("broker-container"), {
+      value: "https://replacement.example.com", onChange: () => Promise.resolve(),
+    });
+  });
+  await icon.click();
+  await page.evaluate(async () => { window.retiredModal.resolve(); await Promise.resolve(); await Promise.resolve(); });
+  const replacement = await page.evaluate(() => ({ input_focused: document.activeElement?.hasAttribute('data-broker-url'),
+    value: document.querySelector('[data-broker-url]')?.value, dialogs: document.querySelectorAll('.hmb-seedance-broker-dialog').length }));
+  assert.deepEqual(replacement, { input_focused: true, value: "https://replacement.example.com", dialogs: 1 });
+  lifecycleEvidence.cases.push({ case: "retired-A-completion-with-replacement-dialog", after: replacement });
+  await dialog.locator("[data-broker-cancel]").click();
+  await page.evaluate(() => { window.secondBrokerWidget.cleanup(); document.getElementById('second-node').remove(); });
+  lifecycleEvidence.source_sha256_after = sha(fs.readFileSync(sourcePath));
+  assert.equal(lifecycleEvidence.source_sha256_after, lifecycleEvidence.source_sha256);
+  lifecycleEvidence.result = "PASS"; saveEvidence();
   await page.evaluate(() => { window.seedanceWidget.cleanup(); window.commandWidget.cleanup(); });
   assert.equal(await model.locator(".hmb-seedance-broker-icon").count(), 0);
+  assert.equal(await model.locator(".hmb-seedance-gallery-icon").count(), 0);
   assert.equal(await model.evaluate((row) => row.style.paddingRight), "");
   const restored = await page.evaluate(() => ["command-slot", "broker-slot"].map((id) => ({
     height: document.getElementById(id).getBoundingClientRect().height,
@@ -223,7 +330,7 @@ try {
     ariaHidden: document.getElementById(id).getAttribute("aria-hidden"),
   })));
   assert.deepEqual(restored, [{ height: 40, margin: "4px", ariaHidden: null }, { height: 40, margin: "4px", ariaHidden: null }], "Cleanup must restore host-owned carrier styles and accessibility");
-  console.log("HMB Seedance Broker settings UI: PASS");
+  console.log("HMB Seedance Broker settings/gallery UI: PASS (real Chrome native-row fixture, both icons 29px; settings/refresh/rerender/cleanup and cross-node pending modal ownership preserved)");
 } finally {
   await browser.close();
 }

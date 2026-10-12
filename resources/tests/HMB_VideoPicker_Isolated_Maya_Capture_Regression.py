@@ -25,6 +25,7 @@ PASS = picker.HMBVideoPickerLibrary._execute_maya_capture_passes
 
 
 class Controller:
+    _run_shared_maya_capture = picker.HMBVideoPickerLibrary._run_shared_maya_capture
     def __init__(self):
         self._hmb_cancel_requested = threading.Event()
         self.state = {"language": "en"}
@@ -32,6 +33,8 @@ class Controller:
         self.active = None
         self.registered_pids = []
         self.cleaned_pids = []
+        self.registered_handles = []
+        self.cleaned_handles = []
         self.cleanup_paths = []
 
     def _assert_operation_current(self, _context, _stage):
@@ -51,11 +54,13 @@ class Controller:
         assert self.active is None, "Capture processes must run sequentially."
         self.active = process
         self.registered_pids.append(process.pid)
+        self.registered_handles.append(process)
 
     def _clear_active_process(self, process):
         assert self.active is process
         self.active = None
         self.cleaned_pids.append(process.pid)
+        self.cleaned_handles.append(process)
 
     def _wait_for_process_with_progress(self, process, _progress, _overall, _stall, _label, *, activity_paths):
         assert tuple(activity_paths) == (process.frames_folder,)
@@ -156,7 +161,10 @@ def exercise(root: Path, outcomes=None, *, stop_role="", stale_role="", bad_path
     finally:
         picker.subprocess.Popen = original_popen
     assert node.active is None
-    assert node.registered_pids == node.cleaned_pids
+    # Queue registration can precede the shared producer PID. The exact
+    # owner subscription, rather than a later shared PID, must be cleared.
+    assert node.registered_handles == node.cleaned_handles
+    assert len(node.registered_pids) == len(node.cleaned_pids)
     assert len({call[2] for call in calls}) == len(calls)
     assert len({call[3]["result_path"] for call in calls}) == len(calls)
     assert len({call[3]["progress_path"] for call in calls}) == len(calls)

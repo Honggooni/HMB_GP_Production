@@ -376,9 +376,11 @@ with tempfile.TemporaryDirectory(
         *,
         transaction_records=None,
         backup_folder=None,
+        defer_metadata=False,
     ):
         assert transaction_records is not None
         assert backup_folder is not None
+        assert defer_metadata is True, "Import copies must publish before metadata enrichment."
         target = Path(temporary) / f"project_copy_{len(project_copies) + 1}.mp4"
         target.write_bytes(Path(path).read_bytes())
         project_copies.append(target)

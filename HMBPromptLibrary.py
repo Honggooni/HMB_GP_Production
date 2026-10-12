@@ -861,6 +861,8 @@ _PICKER_FRAME_METADATA_KEYS = frozenset({
     "video_slot",
     "video_uid",
     "source_uid",
+    "bundle_run_id",
+    "pair_run_id",
     "selection_order",
     "order_key",
     "fps",
@@ -2026,6 +2028,8 @@ def _normalize_frame_metadata(value: Any) -> List[Dict[str, Any]]:
             "video_slot": f"@video{slot}",
             "video_uid": _clean_string(raw.get("video_uid") or raw.get("source_uid")),
             "source_uid": _clean_string(raw.get("video_uid") or raw.get("source_uid")),
+            "bundle_run_id": _clean_string(raw.get("bundle_run_id")),
+            "pair_run_id": _clean_string(raw.get("pair_run_id")),
             "selection_order": slot,
             "order_key": _clean_string(raw.get("order_key"))
             or _clean_string(raw.get("video_uid") or raw.get("source_uid")),
@@ -8143,6 +8147,15 @@ def _apply_picker_payload(state: Dict[str, Any], payload: Dict[str, Any], connec
         seen_frame_metadata_slots.add(metadata_slot)
         structured_metadata = dict(raw_metadata)
         structured_metadata["video_slot"] = metadata_slot
+        # Retain pairing provenance from this exact selected Picker row, never
+        # borrow IDs from a top-level active run or an unrelated metadata row.
+        selected_row = payload_videos_by_slot.get(metadata_slot, {})
+        selected_uid = _picker_video_uid(selected_row)
+        provenance_matches = bool(selected_uid and metadata_uid == selected_uid)
+        for pairing_field in ("bundle_run_id", "pair_run_id"):
+            structured_metadata[pairing_field] = (
+                _clean_string(selected_row.get(pairing_field)) if provenance_matches else ""
+            )
         if metadata_uid:
             structured_metadata["video_uid"] = metadata_uid
             structured_metadata["source_uid"] = metadata_uid
@@ -11592,6 +11605,201 @@ class HMBPromptLibrary(DataNode):
             }
             self._hmb_agent_pair_local.pair = None
             return context
+
+    def _hmb_agent_reference_media(self, expected_machine: Any) -> Dict[str, Any]:
+        """Expose only media paired with this exact private Agent generation.
+
+        Sources are the same ordered values sent to the generator. Paths from
+        labels, user prose, dormant rows, or another Shot are never candidates.
+        The consumer owns bounded decoding and continuation on missing media.
+        """
+
+        try:
+            incoming = str(getattr(expected_machine, "value", expected_machine) or "")
+            with self._hmb_sync_lock:
+                state, _visible, machine, _fingerprint = self._compile_current_prompt_pair(
+                    refresh_sources=False
+                )
+                if incoming.rstrip("\r\n") != machine.rstrip("\r\n"):
+                    return {}
+                image_media = list(getattr(self, "_hmb_current_shot_images", []))
+                video_media = list(getattr(self, "_hmb_current_shot_videos", []))
+                lines = machine.splitlines()
+                job = json.loads(lines[lines.index(PUBLIC_JOB_CONTRACT_HEADER) + 1])
+                fx = json.loads(lines[lines.index(FX_TIMING_CONTRACT_HEADER) + 1])
+                metadata = {
+                    row["video_slot"]: copy.deepcopy(row)
+                    for row in state.get("picker", {}).get("frame_metadata", [])
+                    if isinstance(row, dict) and row.get("video_slot")
+                }
+                timing = {
+                    row["video"]: copy.deepcopy(row)
+                    for row in fx.get("sources", [])
+                    if isinstance(row, dict) and row.get("video")
+                }
+                result: Dict[str, Any] = {
+                    "schema": "hmb-agent-reference-media",
+                    "version": 1,
+                    "machine_sha256": hashlib.sha256(incoming.encode("utf-8")).hexdigest(),
+                    "images": [],
+                    "videos": [],
+                }
+                for kind, sources in (("image", image_media), ("video", video_media)):
+                    for record in job.get(kind + "s", []):
+                        token = str(record.get(kind) or "")
+                        match = re.fullmatch(r"@" + kind + r"([1-9][0-9]*)", token)
+                        if not match:
+                            continue
+                        slot = int(match.group(1)) - 1
+                        if slot >= len(sources) or not isinstance(sources[slot], str) or not sources[slot]:
+                            continue
+                        entry = {
+                            **copy.deepcopy(record),
+                            "token": token,
+                            "source": sources[slot],
+                            "frame_ranges": [
+                                copy.deepcopy(row)
+                                for row in job.get("frame_ranges", [])
+                                if row.get(kind) == token
+                            ],
+                        }
+                        if kind == "video":
+                            entry["frame_metadata"] = metadata.get(token, {})
+                            entry["timing"] = timing.get(token, {})
+                            entry["control_bindings"] = [
+                                copy.deepcopy(row)
+                                for row in job.get("control_only_bindings", [])
+                                if row.get("video") == token
+                            ]
+                        result[kind + "s"].append(entry)
+                return result
+        except Exception:
+            # Optional visual evidence cannot turn an otherwise valid textual
+            # instruction into an execution gate.
+            return {}
+
+    def _hmb_agent_generation_context(self, expected_machine: Any) -> Dict[str, Any]:
+        """Read current settings from exact same-Shot generators, with no edges.
+
+        Different generators may render the same Shot at different settings.
+        Retain their separate requests and publish common values only when all
+        observed sources agree. Never select a winner by discovery order.
+        """
+
+        try:
+            incoming = str(getattr(expected_machine, "value", expected_machine) or "")
+            with self._hmb_sync_lock:
+                state, _visible, machine, _fingerprint = self._compile_current_prompt_pair(
+                    refresh_sources=False
+                )
+                if incoming.rstrip("\r\n") != machine.rstrip("\r\n"):
+                    return {}
+                shot = _normalize_shot_selection(state.get("shot"))
+            if not shot["channel_uuid"] or not shot["shot_uuid"]:
+                return {}
+            from _hmb_shot_routing import _same_flow_nodes, _subscription_for
+
+            flow_name, nodes = _same_flow_nodes(self)
+            if not flow_name:
+                return {}
+            fields = ("model_id", "task", "duration_seconds", "duration_mode", "aspect_ratio", "resolution")
+            observed = []
+            for candidate in nodes:
+                subscription = _subscription_for(candidate)
+                if (
+                    subscription is None
+                    or not subscription.enabled
+                    or subscription.channel_uuid != shot["channel_uuid"]
+                    or subscription.shot_uuid != shot["shot_uuid"]
+                    or subscription.shot_number != shot["number"]
+                    or subscription.shot_name != shot["name"]
+                ):
+                    continue
+                getter = getattr(candidate, "_hmb_agent_generation_settings", None)
+                if not callable(getter):
+                    continue
+                try:
+                    settings = getter()
+                except Exception:
+                    continue
+                if _subscription_for(candidate) != subscription:
+                    # A concurrent Shot switch cannot lend its settings to the
+                    # request whose source identity was just matched.
+                    continue
+                # This capability is shared by compatible settings publishers;
+                # participant kind, model and task labels do not select one.
+                # Keep only the typed settings contract so a publisher cannot
+                # replace its registered identity or inject unrelated metadata.
+                if not isinstance(settings, dict) or not all(key in settings for key in fields):
+                    continue
+                if not all(
+                    isinstance(settings[key], str)
+                    and settings[key].strip()
+                    and len(settings[key]) <= 512
+                    and "\x00" not in settings[key]
+                    for key in ("model_id", "task", "duration_mode", "aspect_ratio", "resolution")
+                ):
+                    continue
+                duration = settings["duration_seconds"]
+                if settings["duration_mode"] == "explicit":
+                    try:
+                        finite_duration = math.isfinite(duration)
+                    except (TypeError, ValueError, OverflowError):
+                        finite_duration = False
+                    if (
+                        not isinstance(duration, (int, float))
+                        or isinstance(duration, bool)
+                        or not finite_duration
+                        or duration <= 0
+                    ):
+                        continue
+                elif settings["duration_mode"] != "provider_smart" or duration is not None:
+                    continue
+                observed.append((subscription, {key: settings[key] for key in fields}))
+            current_flow_name, current_nodes = _same_flow_nodes(self)
+            if current_flow_name != flow_name:
+                return {}
+            sources = [
+                {"generator": subscription.node_name, **settings}
+                for subscription, settings in observed
+                if any(node is subscription.node for node in current_nodes)
+                and _subscription_for(subscription.node) == subscription
+            ]
+            if not sources:
+                return {}
+            with self._hmb_sync_lock:
+                current_state, _visible, current_machine, current_fingerprint = self._compile_current_prompt_pair(
+                    refresh_sources=False
+                )
+                if (
+                    incoming.rstrip("\r\n") != current_machine.rstrip("\r\n")
+                    or current_fingerprint != _fingerprint
+                    or _normalize_shot_selection(current_state.get("shot")) != shot
+                ):
+                    return {}
+            sources.sort(key=lambda item: item["generator"])
+            common = {
+                key: sources[0][key]
+                for key in fields
+                if key in sources[0] and all(row.get(key) == sources[0][key] for row in sources)
+            }
+            return {
+                "schema": "hmb-agent-generation-context",
+                "version": 1,
+                "sources": sources,
+                "common": common,
+                "conflicting_fields": [key for key in fields if key not in common],
+                "settings_sha256": _canonical_sha256({"sources": sources}),
+                "interpretation": (
+                    "Read-only requested output settings. Adaptive aspect ratio and provider-smart "
+                    "duration are unresolved output values. Compare source timing and framing only "
+                    "where both source evidence and an explicit common output value are available. "
+                    "Retain each differing generator request separately; continue the user's "
+                    "instruction without inventing a shared crop, retiming, or source measurements."
+                ),
+            }
+        except Exception:
+            return {}
 
     def _hmb_generator_shot_snapshot(
         self,

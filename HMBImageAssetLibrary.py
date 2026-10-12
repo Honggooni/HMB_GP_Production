@@ -125,6 +125,14 @@ RESET_HANDOFF_IDENTITY_CONTRACT = (
     "preserve-channel-shot-new-publisher-runtime-v1"
 )
 UI_EDIT_REVISION_KEY = "ui_edit_revision"
+IMAGE_ASSET_EDIT_SCHEMA = "hmb-image-asset-edit-v1"
+IMAGE_ASSET_EDIT_FIELDS = (
+    "root_edit_enabled", "selected_folder_path", "expanded_folders",
+    "selected_main_type", "selected_sub_type", "selected_source_view",
+    "search", "language", "asset_view_mode", "refresh_revision",
+    "thumbnail_request", "asset_registration_request", "asset_cleanup_request",
+    "disconnect_import_uid", "shot_routing",
+)
 MAX_UI_EDIT_REVISION = (1 << 53) - 1
 OUTPUT_VERSION = 4
 IMAGE_BINDING_CAPABILITY_SCHEMA = "hmb-image-source-binding-capabilities"
@@ -3493,6 +3501,7 @@ def _default_state() -> Dict[str, Any]:
     state = {
         "schema": STATE_SCHEMA,
         "version": STATE_VERSION,
+        "edit_transport_schema": IMAGE_ASSET_EDIT_SCHEMA,
         "catalog_root": str(DEFAULT_PROJECTS_ROOT).replace("\\", "/"),
         "projects": [],
         "project_root": "",
@@ -4439,6 +4448,16 @@ def _catalog_index_path(project_root: Any) -> Path:
     return Path(_ASSET_CATALOG_INDEX_ROOT) / f"{digest}.json"
 
 
+def _catalog_index_path_for_verified_uid(project_cache_uid: Any) -> Path:
+    """Compute a local write path without revisiting the project filesystem."""
+
+    identity = _valid_project_cache_uid(project_cache_uid)
+    if not identity:
+        raise ValueError("A verified project cache identity is required.")
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return Path(_ASSET_CATALOG_INDEX_ROOT) / f"{digest}.json"
+
+
 def _catalog_index_projection(
     state: Dict[str, Any],
     *,
@@ -4487,7 +4506,12 @@ def _write_catalog_index(
         payload = _json_text(projection).encode("utf-8")
         if len(payload) > _ASSET_CATALOG_INDEX_MAX_BYTES:
             return
-        index_path = _catalog_index_path(project_root)
+        # Runtime writes follow worker-side identity verification.  In
+        # particular, calculating this local filename must not stat/resolve an
+        # unavailable UNC project again on a retained completion callback.
+        index_path = _catalog_index_path_for_verified_uid(
+            projection.get("project_cache_uid")
+        )
         with _ASSET_CATALOG_INDEX_LOCK:
             index_path.parent.mkdir(parents=True, exist_ok=True)
             temporary = index_path.parent / f".{index_path.name}.{uuid.uuid4().hex}.tmp"
@@ -4498,6 +4522,35 @@ def _write_catalog_index(
                 temporary.unlink(missing_ok=True)
     except Exception as exc:
         _diagnostic_warning("Local catalog index write failed", exc)
+
+
+def _prepare_catalog_scan_index(
+    state: Dict[str, Any],
+    *,
+    normalized: bool = False,
+) -> None:
+    """Verify and persist scan facts on the filesystem worker, never the host loop.
+
+    The identity supplied by a live widget edit is not write authority.  Confirm
+    it against the actual project here; the read path independently verifies
+    the catalog, project, manifest, folder signature and contained asset paths.
+    A replaced project gets a different local filename, so a late old worker
+    cannot overwrite that replacement's index.
+    """
+
+    normalized_state = state if normalized else _normalize_state(state)
+    root_text = _clean(normalized_state.get("project_root"))
+    identity = _valid_project_cache_uid(normalized_state.get("project_cache_uid"))
+    if not root_text or not identity or _clean(normalized_state.get("error")):
+        return
+    try:
+        if _project_cache_uid(Path(root_text)) != identity:
+            return
+        _write_catalog_index(normalized_state, normalized=True)
+    except Exception as exc:
+        # A local cache failure must not turn a successful catalog into an
+        # offline/error result or delay the host loop with a retry.
+        _diagnostic_warning("Local catalog index preparation failed", exc)
 
 
 def _read_catalog_index(
@@ -6006,6 +6059,131 @@ def _import_connection_snapshot(node: Any) -> Any:
     return result
 
 
+def _ensure_import_child_removal_observers(node: Any) -> Dict[str, Any]:
+    """Observe native removals before their nested disconnect callbacks run.
+
+    A next-loop callback is not an operation-completion barrier: the native
+    RemoveParameter handler may still be disconnecting its child on a worker.
+    Only proven, successfully removed UUID children are idempotent here.
+    """
+    state = getattr(node, "_hmb_import_child_removal_state", None)
+    if not isinstance(state, dict):
+        state = {"lock": threading.RLock(), "active": {}, "retired": {}, "pending": {}, "generations": {}}
+        node._hmb_import_child_removal_state = state
+    state.setdefault("generations", {})
+    try:
+        from griptape_nodes.retained_mode.events.parameter_events import (
+            RemoveParameterFromNodeRequest, RemoveParameterFromNodeResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        manager = GriptapeNodes.EventManager()
+        if state.get("manager") is manager:
+            return state
+        if not all(callable(getattr(manager, name, None)) for name in (
+            "add_pre_dispatch_hook", "remove_pre_dispatch_hook",
+            "add_post_dispatch_hook", "remove_post_dispatch_hook",
+        )):
+            return state
+        owner_ref = weakref.ref(node)
+
+        def before_remove(request: Any, _context: Any) -> Any:
+            # Observer exceptions must never prevent unrelated host operations.
+            try:
+                owner = owner_ref()
+                if (owner is None or not isinstance(request, RemoveParameterFromNodeRequest)
+                    or _clean(getattr(request, "node_name", "")) != _clean(owner.name)
+                    or not owner._scan_owner_is_current() or bool(getattr(owner, "lock", False))):
+                    return None
+                name = _clean(getattr(request, "parameter_name", ""))
+                if not name or name == IMAGE_IMPORT_PARAMETER:
+                    return None
+                child = _get_parameter_obj(owner, name)
+                with state["lock"]:
+                    generation = state["generations"].get(name)
+                    if child is None and generation is not None and (
+                        state["retired"].get(name) is generation[1] or any(
+                            entry[1] == name and entry[3] is generation[1]
+                            for entry in state["active"].values()
+                        )
+                    ):
+                        return RemoveParameterFromNodeResultSuccess(
+                            result_details="The image input was already removed."
+                        )
+                    if child is not None and _is_image_import_parameter(child):
+                        if generation is None or generation[0]() is not child:
+                            generation = (weakref.ref(child), object())
+                            state["generations"][name] = generation
+                            state["retired"].pop(name, None)
+                        state["active"][id(request)] = (request, name, generation[0], generation[1])
+                    elif child is not None:
+                        state["retired"].pop(name, None)
+                        state["generations"].pop(name, None)
+                    while len(state["generations"]) > MAX_SELECTED_IMAGES * 8:
+                        oldest = next(iter(state["generations"]))
+                        state["generations"].pop(oldest)
+                        state["retired"].pop(oldest, None)
+                return None
+            except Exception:
+                return None
+
+        def after_remove(request: Any, result: Any) -> None:
+            try:
+                with state["lock"]:
+                    entry = state["active"].pop(id(request), None)
+                    if entry is None or entry[0] is not request:
+                        return
+                    owner = owner_ref()
+                    name = entry[1]
+                    generation = state["generations"].get(name)
+                    if (owner is not None and isinstance(result, RemoveParameterFromNodeResultSuccess)
+                        and generation is not None and generation[1] is entry[3]
+                        and _get_parameter_obj(owner, name) is None):
+                        state["retired"][name] = entry[3]
+                        while len(state["retired"]) > MAX_SELECTED_IMAGES * 8:
+                            state["retired"].pop(next(iter(state["retired"])))
+            except Exception:
+                return
+
+        manager.add_pre_dispatch_hook(before_remove)
+        try:
+            manager.add_post_dispatch_hook(RemoveParameterFromNodeRequest, after_remove)
+        except Exception:
+            manager.remove_pre_dispatch_hook(before_remove)
+            return state
+
+        def unregister() -> None:
+            try:
+                manager.remove_pre_dispatch_hook(before_remove)
+                manager.remove_post_dispatch_hook(RemoveParameterFromNodeRequest, after_remove)
+            except Exception:
+                pass
+
+        previous_finalizer = state.get("finalizer")
+        if callable(previous_finalizer):
+            previous_finalizer()
+        state["manager"] = manager
+        state["finalizer"] = weakref.finalize(node, unregister)
+    except Exception:
+        # Older hosts retain explicit registration cleanup, but must not race a
+        # native minus operation through an unobserved asynchronous callback.
+        pass
+    return state
+
+
+def _release_import_child_removal_observers(node: Any) -> None:
+    state = getattr(node, "_hmb_import_child_removal_state", None)
+    if not isinstance(state, dict):
+        return
+    finalizer = state.get("finalizer")
+    if callable(finalizer):
+        finalizer()
+    with state["lock"]:
+        for key in ("active", "retired", "pending", "generations"):
+            state[key].clear()
+        state["manager"] = None
+
+
 def _remove_import_child_parameter(node: Any, parameter_name: str) -> bool:
     """Remove only an empty, disconnected child; never its aggregate parent."""
     from griptape_nodes.retained_mode.events.parameter_events import (
@@ -6023,7 +6201,18 @@ def _remove_import_child_parameter(node: Any, parameter_name: str) -> bool:
     child = _get_parameter_obj(node, name)
     if child is None or not _is_image_import_parameter(child):
         raise RuntimeError("The input no longer belongs to IMAGE_IMPORT_IN.")
+    removal_state = _ensure_import_child_removal_observers(node)
+    with removal_state["lock"]:
+        if any(entry[1] == name for entry in removal_state["active"].values()):
+            return False
     snapshot = _import_connection_snapshot(node)
+    # Listing connections dispatches another host request. Its callbacks may
+    # remove or replace this exact child before control returns here.
+    if _get_parameter_obj(node, name) is not child:
+        return False
+    with removal_state["lock"]:
+        if any(entry[1] == name for entry in removal_state["active"].values()):
+            return False
     if any(_clean(getattr(edge, "target_parameter_name", "")) == name
            for edge in snapshot.incoming_connections) or any(
         _clean(getattr(edge, "source_parameter_name", "")) == name
@@ -6032,10 +6221,17 @@ def _remove_import_child_parameter(node: Any, parameter_name: str) -> bool:
         raise RuntimeError("The input is still connected; it was not removed.")
     if _flatten_import_values(_get_parameter_raw(node, name)):
         raise RuntimeError("The input still contains media; it was not removed.")
-    result = GriptapeNodes.handle_request(RemoveParameterFromNodeRequest(
-        node_name=_clean(getattr(node, "name", "")), parameter_name=name,
-    ))
+    previous_guard = bool(getattr(node, "_hmb_import_cleanup_active", False))
+    node._hmb_import_cleanup_active = True
+    try:
+        result = GriptapeNodes.handle_request(RemoveParameterFromNodeRequest(
+            node_name=_clean(getattr(node, "name", "")), parameter_name=name,
+        ))
+    finally:
+        node._hmb_import_cleanup_active = previous_guard
     if not isinstance(result, RemoveParameterFromNodeResultSuccess):
+        if _get_parameter_obj(node, name) is None:
+            return False
         raise RuntimeError("Griptape could not remove the empty image input.")
     if name in _image_import_target_parameter_names(node):
         raise RuntimeError("The empty image input is still present.")
@@ -6107,26 +6303,50 @@ def _capture_import_registration_edges(node: Any, source_uid: str) -> List[tuple
 def _defer_empty_import_child_cleanup(node: Any, parameter_name: str) -> None:
     """Wait for a native minus request to finish before pruning a detached slot."""
     name = _clean(parameter_name)
+    state = _ensure_import_child_removal_observers(node)
+    if state.get("manager") is None:
+        return
+    child = _get_parameter_obj(node, name)
+    if child is None:
+        return
+    child_ref = weakref.ref(child)
+    with state["lock"]:
+        if name in state["pending"] or any(entry[1] == name for entry in state["active"].values()):
+            return
+        state["pending"][name] = child_ref
     node_ref = weakref.ref(node)
     host_context = contextvars.copy_context()
 
     def cleanup() -> None:
-        owner = node_ref()
-        if owner is None or not owner._scan_owner_is_current():
-            return
         try:
+            owner = node_ref()
+            expected_child = child_ref()
+            with state["lock"]:
+                if state["pending"].get(name) is not child_ref:
+                    return
+            if (owner is None or not owner._scan_owner_is_current()
+                or expected_child is None or _get_parameter_obj(owner, name) is not expected_child):
+                return
             _remove_import_child_parameter(owner, name)
         except Exception as exc:
             _diagnostic_warning("Empty image input cleanup deferred", exc)
+        finally:
+            with state["lock"]:
+                if state["pending"].get(name) is child_ref:
+                    state["pending"].pop(name, None)
 
     try:
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
         loop = GriptapeNodes.EventManager().event_loop
         if loop is not None and loop.is_running() and not loop.is_closed():
             loop.call_soon_threadsafe(host_context.run, cleanup)
+            return
     except Exception as exc:
         # No worker-thread graph mutation or nested parameter deletion fallback.
         _diagnostic_warning("Empty image input cleanup unavailable", exc)
+    with state["lock"]:
+        if state["pending"].get(name) is child_ref:
+            state["pending"].pop(name, None)
 
 
 def _resolved_media_value(media_value: Any) -> str:
@@ -7183,6 +7403,7 @@ def _add_shot_asset_output(node: Any) -> None:
 
 
 def _add_image_import_input(node: Any) -> None:
+    _ensure_import_child_removal_observers(node)
     if parameter_exists(node, IMAGE_IMPORT_PARAMETER):
         return
     tooltip = (
@@ -8536,7 +8757,7 @@ class HMBImageAssetLibrary(DataNode):
         """Publish one worker result and adopt only a fresh registered scan.
 
         The request has already passed generation, key, deletion, and exact
-        NodeManager identity checks at both call sites.  Clearing the key here
+        NodeManager identity checks at every call site.  Clearing the key here
         makes the late-discovery advertisement exactly once.
         """
 
@@ -8555,11 +8776,25 @@ class HMBImageAssetLibrary(DataNode):
         if fresh_registration:
             self._hmb_hydration_adopted = True
         normalized_state = _normalize_state(state)
+        if key.startswith("project:") and not normalized_state.get("scan_busy"):
+            live = self._current_state()
+            if (live.get("scan_busy")
+                and _project_root_text(live.get("project_root")).casefold()
+                == _project_root_text(normalized_state.get("project_root")).casefold()):
+                # A cache hit preserves the source snapshot's scan clock.
+                # Completion must still supersede its empty/busy ACK, which
+                # the editor can deliver after these terminal catalog facts.
+                normalized_state["scan_revision"] = max(
+                    _non_negative_int(normalized_state.get("scan_revision")),
+                    _non_negative_int(live.get("scan_revision")) + 1,
+                )
         if not _clean(normalized_state.get("error")) and _clean(
             normalized_state.get("project_root")
         ):
             _store_shared_catalog_snapshot(normalized_state, normalized=True)
-            _write_catalog_index(normalized_state, normalized=True)
+            # Durable cache IO was completed on the scan/probe worker.  This
+            # retained callback also handles pending results and cache hits;
+            # none of those routes may revisit a project path or write a file.
         try:
             return self._publish_state(normalized_state, normalized=True)
         except TypeError as exc:
@@ -8584,11 +8819,100 @@ class HMBImageAssetLibrary(DataNode):
         )
 
     def _accept_widget_state_baseline(self, value: Any) -> None:
-        raw = _parse_mapping(value)
+        raw = self._expand_widget_edit(value)
         if not raw:
             return
         normalized_state = _normalize_state(raw)
         self._accept_normalized_widget_state_baseline(normalized_state)
+
+    def _expand_widget_edit(self, value: Any) -> Dict[str, Any]:
+        """Expand a catalog-free edit against this node's accepted authority.
+
+        A client can edit selection/presentation and send existing explicit
+        commands; it cannot supply catalog rows, source paths or media facts.
+        Legacy full snapshots keep their existing hydration/scan contract.
+        """
+        raw = dict(_parse_mapping(value))
+        if raw.get("schema") != IMAGE_ASSET_EDIT_SCHEMA:
+            return raw
+        revision = raw.get(UI_EDIT_REVISION_KEY)
+        if (raw.get("version") != 1 or isinstance(raw.get("version"), bool)
+                or not isinstance(revision, int) or isinstance(revision, bool)
+                or not 0 <= revision <= MAX_UI_EDIT_REVISION):
+            raise ValueError("Image asset edit has an invalid protocol/revision.")
+        base = dict(_parse_mapping(self._hmb_last_accepted_widget_state))
+        if not base or base.get("schema") != STATE_SCHEMA:
+            raise ValueError("Image asset edit requires an accepted catalog; refresh and retry.")
+        identity = raw.get("catalog_identity")
+        if not isinstance(identity, dict):
+            raise ValueError("Image asset edit is missing its catalog identity.")
+        for field in ("catalog_root", "project_root", "project_uid", "project_cache_uid",
+                      "manifest_signature", "folder_signature", "scan_revision"):
+            supplied, current = identity.get(field), base.get(field)
+            if field == "scan_revision":
+                matches = isinstance(supplied, int) and not isinstance(supplied, bool) and supplied == _non_negative_int(current)
+            elif field in {"catalog_root", "project_root"}:
+                matches = isinstance(supplied, str) and _project_root_text(supplied).replace("\\", "/").casefold() == _project_root_text(current).replace("\\", "/").casefold()
+            else:
+                matches = isinstance(supplied, str) and supplied == _clean(current)
+            if not matches:
+                raise ValueError("Image asset catalog changed; refresh and retry this edit.")
+        clock = dict(raw, scan_revision=identity["scan_revision"],
+                     thumbnail_revision=base.get("thumbnail_revision", 0))
+        if self._widget_state_is_stale(clock):
+            raise ValueError("Image asset edit is older than the accepted state.")
+        edits = raw.get("edits")
+        selected = raw.get("selected_source_uids")
+        if not isinstance(edits, dict) or set(edits) - set(IMAGE_ASSET_EDIT_FIELDS):
+            raise ValueError("Image asset edit contains unsupported fields.")
+        if (not isinstance(selected, list) or len(selected) > MAX_SELECTED_IMAGES
+                or any(not isinstance(uid, str) or not uid for uid in selected)
+                or len(set(selected)) != len(selected)):
+            raise ValueError("Image asset edit has invalid source identities.")
+        known = {_clean(item.get("source_uid")) for item in base.get("assets", [])}
+        if any(uid not in known for uid in selected):
+            raise ValueError("Image asset source changed; refresh and retry this edit.")
+        routing = edits.get("shot_routing")
+        current_routing = base.get("shot_routing") or {}
+        if not isinstance(routing, dict) or not isinstance(routing.get("shots"), list):
+            raise ValueError("Image asset edit is missing Shot ownership.")
+        for field in ("publisher_instance_uuid", "channel_uuid"):
+            if routing.get(field) != current_routing.get(field):
+                raise ValueError("Image asset edit belongs to a different Shot publisher.")
+        rows = routing["shots"]
+        if (not 1 <= len(rows) <= MAX_SHOTS
+                or any(not isinstance(row, dict) or not _uuid_text(row.get("shot_uuid")) for row in rows)
+                or len({row["shot_uuid"] for row in rows}) != len(rows)):
+            raise ValueError("Image asset edit has invalid Shot identities.")
+        old_rows = {row["shot_uuid"]: row for row in current_routing.get("shots", [])}
+        new_generation = _non_negative_int(routing.get("generation"))
+        old_generation = _non_negative_int(current_routing.get("generation"))
+        if new_generation < old_generation:
+            raise ValueError("Image asset Shot structure changed; refresh and retry.")
+        if ([row["shot_uuid"] for row in current_routing.get("shots", [])]
+                != [row["shot_uuid"] for row in rows] and new_generation <= old_generation):
+            raise ValueError("Image asset Shot structure requires a newer structure revision.")
+        for row in rows:
+            previous = old_rows.get(row["shot_uuid"])
+            if previous is not None and _non_negative_int(row.get("revision")) < _non_negative_int(previous.get("revision")):
+                raise ValueError("Image asset Shot edit is older than the accepted Shot.")
+            members = row.get("selected_source_uids")
+            if (not isinstance(members, list) or len(members) > MAX_SHOT_IMAGES
+                    or any(uid not in selected for uid in members) or len(set(members)) != len(members)):
+                raise ValueError("Image asset Shot contains an unselected source identity.")
+            if (previous is not None and _non_negative_int(row.get("revision")) == _non_negative_int(previous.get("revision"))
+                    and any(row.get(field) != previous.get(field)
+                            for field in ("name", "name_is_custom", "selected_source_uids"))):
+                raise ValueError("Image asset Shot membership/name requires a newer Shot revision.")
+        if routing.get("active_shot_uuid") not in {row["shot_uuid"] for row in rows}:
+            raise ValueError("Image asset active Shot is no longer present.")
+        base.update(edits)
+        base[UI_EDIT_REVISION_KEY] = raw.get(UI_EDIT_REVISION_KEY)
+        order = {uid: index + 1 for index, uid in enumerate(selected)}
+        base["assets"] = [dict(item, selected=_clean(item.get("source_uid")) in order,
+                               selection_order=order.get(_clean(item.get("source_uid")), 0))
+                          for item in base.get("assets", [])]
+        return base
 
     def _accept_normalized_widget_state_baseline(
         self,
@@ -8603,6 +8927,65 @@ class HMBImageAssetLibrary(DataNode):
         self._hmb_last_accepted_thumbnail_revision = _non_negative_int(
             normalized_state.get("thumbnail_revision")
         )
+
+    @staticmethod
+    def _rebase_fresh_project_selection(
+        value: Any, previous: Dict[str, Any], latest: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        """Carry only a fresh selection intent across an older scan completion."""
+        raw = _parse_mapping(value)
+        revision = raw.get(UI_EDIT_REVISION_KEY)
+        target = _clean(raw.get("project_root")).replace("\\", "/")
+        catalog = _project_root_text(raw.get("catalog_root")).replace("\\", "/").casefold()
+        if (raw.get("schema") != STATE_SCHEMA or not target
+                or _non_negative_int(raw.get("scan_revision")) != _non_negative_int(previous.get("scan_revision"))
+                or _non_negative_int(latest.get("scan_revision")) <= _non_negative_int(previous.get("scan_revision"))
+                or not isinstance(revision, int) or isinstance(revision, bool)
+                or not 0 <= revision <= MAX_UI_EDIT_REVISION
+                or revision <= max(_non_negative_int(previous.get(UI_EDIT_REVISION_KEY)),
+                                   _non_negative_int(latest.get(UI_EDIT_REVISION_KEY)))
+                or target.casefold() == _clean(previous.get("project_root")).replace("\\", "/").casefold()
+                or any(_clean(raw.get(key)) for key in ("project_id", "project_uid", "project_cache_uid"))
+                or not catalog or any(catalog != _project_root_text(state.get("catalog_root")).replace("\\", "/").casefold()
+                                      for state in (previous, latest))):
+            return None
+        selected = next((row for row in latest.get("projects", [])
+                         if _clean(row.get("path")).replace("\\", "/").casefold() == target.casefold()), None)
+        if selected is None or _clean(latest.get("error")):
+            return None
+        rebased = dict(latest)
+        rebased.update(project_root=selected["path"], project_id="", project_uid="", project_cache_uid="",
+                       folder_signature="", selected_folder_path="", expanded_folders=["$root"],
+                       selected_main_type="", selected_sub_type="", selected_source_view="project")
+        rebased[UI_EDIT_REVISION_KEY] = revision
+        return rebased
+
+    def _take_pending_project_selection(self, value: Any, previous: Dict[str, Any]) -> Dict[str, Any] | None:
+        """Retire a pure ready scan without emitting its old selection first."""
+        if (bool(getattr(self, "_hmb_catalog_completion_active", False))
+                or getattr(self, "_hmb_scan_pending_result", None) is None):
+            return None
+        with self._hmb_scan_lock:
+            pending = self._hmb_scan_pending_result
+            if pending is None or not self._scan_owner_is_current():
+                return None
+            generation, key, _request_id, payload = pending
+            if (generation != self._hmb_scan_generation or key != self._hmb_scan_pending_key
+                    or payload.get("result_merger") is not None or payload.get("on_published") is not None
+                    or payload.get("media_by_uid") or getattr(self, "_hmb_import_media_by_uid", {})):
+                return None  # Mutations/import handoffs keep their normal completion callbacks.
+            latest = _merge_async_scan_result_with_live_state(payload.get("state"), payload.get("scan_base"), self._current_state())
+            rebased = HMBImageAssetLibrary._rebase_fresh_project_selection(value, previous, latest)
+            if rebased is None:
+                return None
+            self._hmb_scan_generation += 1  # Invalidate the already queued completion callback too.
+            self._hmb_scan_pending_result = None
+            self._hmb_scan_pending_key = ""
+            self._hmb_scan_thread = None
+            if key == getattr(self, "_hmb_fresh_registration_scan_key", ""):
+                self._hmb_fresh_registration_scan_key = ""
+                self._hmb_hydration_adopted = True
+            return rebased
 
     def _widget_state_is_stale(self, value: Any) -> bool:
         incoming = self._widget_revision_pair(value)
@@ -9344,6 +9727,17 @@ class HMBImageAssetLibrary(DataNode):
                     or bool(getattr(owner, "_hmb_node_deleted", False))
                 ):
                     return
+            if outcome == "changed" and isinstance(result_state, dict):
+                _prepare_catalog_scan_index(result_state)
+            with owner._hmb_catalog_probe_lock:
+                # Never hold the node lock during filesystem IO.  A newer
+                # request/deletion can proceed while cache preparation waits.
+                if (
+                    generation != owner._hmb_catalog_probe_generation
+                    or key != owner._hmb_catalog_probe_pending_key
+                    or bool(getattr(owner, "_hmb_node_deleted", False))
+                ):
+                    return
                 owner._hmb_catalog_probe_pending_result = (
                     generation,
                     key,
@@ -9979,6 +10373,14 @@ class HMBImageAssetLibrary(DataNode):
                     and not bool(getattr(owner, "_hmb_node_deleted", False))
                 )
                 if not is_current:
+                    return
+            _prepare_catalog_scan_index(result, normalized=True)
+            with owner._hmb_scan_lock:
+                if (
+                    generation != owner._hmb_scan_generation
+                    or key != owner._hmb_scan_pending_key
+                    or bool(getattr(owner, "_hmb_node_deleted", False))
+                ):
                     return
                 # Retain before enqueue for the same loop-stop race handled by
                 # thumbnail hydration. A later retained callback and the
@@ -10646,7 +11048,7 @@ class HMBImageAssetLibrary(DataNode):
         )
 
     def _apply_widget_state(self, value: Any) -> Dict[str, Any]:
-        state = _normalize_state(value)
+        state = _normalize_state(self._expand_widget_edit(value))
         cleanup_request = dict(state.get("asset_cleanup_request") or {})
         state["asset_cleanup_request"] = {}
         # A displayed report is not a durable permission to modify a project.
@@ -11051,15 +11453,43 @@ class HMBImageAssetLibrary(DataNode):
         )
 
     def before_value_set(self, parameter: Any, value: Any) -> Any:
+        name = _clean(getattr(parameter, "name", ""))
+        previous: Dict[str, Any] = {}
+        external_state = name == WIDGET_STATE_PARAMETER and not (
+            bool(getattr(self, "_hmb_state_syncing", False)) or bool(getattr(self, "_hmb_restoring_widget_state", False))
+        )
+        if external_state:
+            value = dict(_parse_mapping(value))
+            if (value.get("schema") == STATE_SCHEMA and _clean(value.get("project_root"))
+                    and not any(_clean(value.get(key)) for key in ("project_id", "project_uid", "project_cache_uid"))):
+                previous = dict(_parse_mapping(getattr(self, "_hmb_last_accepted_widget_state", None)))
+        original_value = value
+        taken_selection = None
         if not bool(getattr(self, "_hmb_state_syncing", False)) and not bool(
             getattr(self, "_hmb_restoring_widget_state", False)
         ):
+            if previous:
+                rebased = HMBImageAssetLibrary._take_pending_project_selection(self, value, previous)
+                if rebased is not None:
+                    taken_selection = rebased
+                    value = rebased
             self._consume_pending_catalog_scan_result()
             self._consume_pending_thumbnail_result()
             self._consume_pending_catalog_probe_result()
-        name = _clean(getattr(parameter, "name", ""))
+            if taken_selection is not None:
+                latest = dict(_parse_mapping(self._hmb_last_accepted_widget_state))
+                if latest != previous:
+                    # A later probe/thumbnail completion owns these facts, even
+                    # when it used the same scan clock. Preserve the ready
+                    # scan's proven clock, but never overwrite newer facts.
+                    latest["scan_revision"] = max(_non_negative_int(latest.get("scan_revision")),
+                                                  _non_negative_int(taken_selection.get("scan_revision")))
+                    rebased = HMBImageAssetLibrary._rebase_fresh_project_selection(original_value, previous, latest)
+                    if rebased is None or not self._scan_owner_is_current():
+                        return self._hmb_last_accepted_widget_state
+                    value = rebased
         if name == WIDGET_STATE_PARAMETER:
-            raw_state = dict(_parse_mapping(value))
+            raw_state = self._expand_widget_edit(value)
             poll_nonce = _clean(raw_state.pop("__hmb_manifest_poll_nonce", ""))[:128]
             # Poll flags describe this exact value-set only.  In particular,
             # never leave a pending flag behind when an unchanged canonical
@@ -11068,7 +11498,11 @@ class HMBImageAssetLibrary(DataNode):
             self._hmb_manifest_poll_pending = False
             if not poll_nonce:
                 if self._widget_state_is_stale(raw_state):
-                    return self._hmb_last_accepted_widget_state
+                    latest = dict(_parse_mapping(self._hmb_last_accepted_widget_state))
+                    rebased = HMBImageAssetLibrary._rebase_fresh_project_selection(original_value, previous, latest) if previous else None
+                    if rebased is None or not self._scan_owner_is_current():
+                        return self._hmb_last_accepted_widget_state
+                    raw_state = rebased
                 raw_state = self._preserve_newer_thumbnail_baseline(raw_state)
                 normalized = _normalize_state(raw_state)
                 self._accept_widget_state_baseline(normalized)
@@ -11154,6 +11588,12 @@ class HMBImageAssetLibrary(DataNode):
             elif name == IMAGE_IMPORT_PARAMETER:
                 self._apply_import_value(value)
             elif name == WIDGET_STATE_PARAMETER:
+                if _parse_mapping(value).get("schema") == IMAGE_ASSET_EDIT_SCHEMA:
+                    try:
+                        value = _json_text(self._expand_widget_edit(value))
+                    except ValueError:
+                        self._restore_accepted_widget_state()
+                        raise
                 if (
                     not self._hmb_state_syncing
                     and not self._hmb_restoring_widget_state
@@ -11255,6 +11695,11 @@ class HMBImageAssetLibrary(DataNode):
 
     def after_deserialize(self, *args: Any, **kwargs: Any) -> Any:
         self._hmb_refresh_authority = None
+        removal_state = getattr(self, "_hmb_import_child_removal_state", None)
+        if isinstance(removal_state, dict):
+            with removal_state["lock"]:
+                for key in ("retired", "generations", "pending"):
+                    removal_state[key].clear()
         result = None
         try:
             parent = getattr(super(), "after_deserialize", None)
@@ -11398,6 +11843,7 @@ class HMBImageAssetLibrary(DataNode):
         first_delete = not bool(getattr(self, "_hmb_node_deleted", False))
         if first_delete:
             self._hmb_node_deleted = True
+            _release_import_child_removal_observers(self)
             self._hmb_reserved_shot_catalog_identity = ""
             self._hmb_fresh_registration_scan_key = ""
             release = getattr(

@@ -1627,6 +1627,29 @@ async def assert_blocking_stage_is_background_and_cleanup_safe() -> None:
     # temporary objects after the caller's finally-cleanup has run.
     assert completed == ["background", "cancelled"]
 
+    started = threading.Event()
+    release = threading.Event()
+    def latched_upload() -> None:
+        started.set()
+        assert release.wait(3), "Repeated-cancel fixture was not released."
+        completed.append("uploaded-after-cancel")
+    repeated = asyncio.create_task(stage_node._run_blocking_generation_stage(latched_upload))
+    try:
+        while not started.is_set():
+            await asyncio.sleep(0.005)
+        repeated.cancel()
+        await asyncio.sleep(0.01)
+        repeated.cancel()
+        await asyncio.sleep(0.01)
+        assert not repeated.done(), "Repeated cancel let cleanup run before the upload thread finished."
+    finally:
+        release.set()
+        try:
+            await repeated
+        except asyncio.CancelledError:
+            pass
+    assert completed[-1] == "uploaded-after-cancel"
+
 
 asyncio.run(assert_blocking_stage_is_background_and_cleanup_safe())
 

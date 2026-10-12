@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
+import inspect
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -116,7 +119,10 @@ def main() -> int:
     node = picker.HMBVideoPickerLibrary(name=f"HMBVideoPickerLive_{time.time_ns()}")
     if GriptapeNodes is not None and ControlFlow is not None:
         GriptapeNodes.EventManager().initialize_queue()
-        flow = ControlFlow(name=f"HMBVideoPickerLiveFlow_{time.time_ns()}")
+        flow_options = {"name": f"HMBVideoPickerLiveFlow_{time.time_ns()}"}
+        if "engine" in inspect.signature(ControlFlow).parameters:
+            flow_options["engine"] = GriptapeNodes.EventManager().engine
+        flow = ControlFlow(**flow_options)
         flow.add_node(node)
         GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
         GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
@@ -346,6 +352,8 @@ def main() -> int:
             ):
                 raise RuntimeError(f"Live SNAPSHOT did not create a still frame: {snapshot_path}")
             result["snapshot"]["snapshot_size"] = snapshot_path.stat().st_size
+            snapshot_uid = str(rendered_snapshot_state.get("active_snapshot_uid") or "")
+            snapshot_sha256 = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
 
             node._hmb_cancel_requested.clear()
             node._start_ui_operation("run_video", node._picker_state())
@@ -367,13 +375,22 @@ def main() -> int:
                     raise RuntimeError(
                         "Live PLAYBLAST retained an oversized UI warning."
                     )
-            video_path = Path(str(playblast_state.get("video_path") or ""))
-            expected_playblast = scene_copy.parent / scene_copy.stem / f"{scene_copy.stem}_playblast_1.mp4"
-            expected_playblast_sidecar = (
-                scene_copy.parent
-                / scene_copy.stem
-                / f"{scene_copy.stem}_playblast_1.hmb.json"
-            )
+            # History is typed by pass and uses unique run tokens.  The active
+            # viewport can remain on Depth; it is not Mask artifact authority.
+            mask_rows = [
+                item for item in playblast_state.get("videos", [])
+                if item.get("generation_role") == "mask"
+                and item.get("picker_shot_uuid") == playblast_state.get("active_picker_shot_uuid")
+            ]
+            if len(mask_rows) != 1:
+                raise RuntimeError("Live PLAYBLAST did not append exactly one Shot-owned Mask row.")
+            video_path = Path(str(mask_rows[0].get("video_path") or ""))
+            match = re.fullmatch(re.escape(scene_copy.stem) + r"_playblast_([0-9a-f]+)\.mp4", video_path.name)
+            if match is None:
+                raise RuntimeError(f"Live PLAYBLAST used the wrong tokenized output name: {video_path}")
+            run_token = match.group(1)
+            expected_playblast = scene_copy.parent / scene_copy.stem / f"{scene_copy.stem}_playblast_{run_token}.mp4"
+            expected_playblast_sidecar = expected_playblast.with_suffix(".hmb.json")
             if str(playblast_state.get("status") or "").upper() != "VIDEO_READY":
                 raise RuntimeError(
                     f"Live PLAYBLAST did not retain VIDEO_READY: {playblast_state.get('message')}"
@@ -401,7 +418,7 @@ def main() -> int:
                     "Live PLAYBLAST did not verify full-detail Smooth Preview 3."
                 )
             screen_report = playblast_metadata.get("screen_space_postprocess") or {}
-            if (
+            if screen_report and (
                 screen_report.get("profile")
                 != picker.SCREEN_SPACE_PATTERN_PROFILE
                 or bool(screen_report.get("uv_dependent"))
@@ -410,14 +427,33 @@ def main() -> int:
                 raise RuntimeError(
                     "Live PLAYBLAST did not publish the screen-space pattern contract."
                 )
+            if not args.no_assignment and not any(
+                marker.get("color") == "Red"
+                and marker.get("shader_model") == "lambert"
+                and marker.get("visual_profile") == "color_stable_lambert_profile"
+                for marker in playblast_metadata.get("markers", [])
+            ):
+                raise RuntimeError("Live PLAYBLAST did not verify the requested native Red Lambert marker.")
+            layer_report = playblast_metadata.get("capture_render_layer") or {}
+            if (
+                layer_report.get("capture_layer") != "defaultRenderLayer"
+                or layer_report.get("default_layer_verified") is not True
+                or layer_report.get("restore_ok") is not True
+            ):
+                raise RuntimeError("Live PLAYBLAST did not verify isolated native render-layer restoration.")
             if (playblast_metadata.get("video_format") or {}).get("crf") != picker.PROXY_ENCODER_CRF:
                 raise RuntimeError("Live PLAYBLAST did not use the high-quality CRF profile.")
             if int(playblast_metadata.get("frame_count") or 0) != int(
                 playblast_state.get("output_frame_count") or 0
             ):
                 raise RuntimeError("Live PLAYBLAST sidecar frame count disagrees with Picker state.")
-            if playblast_state.get("snapshot_active") or snapshot_path.exists():
-                raise RuntimeError("Live PLAYBLAST did not clear the snapshot cache.")
+            if playblast_state.get("snapshot_active"):
+                raise RuntimeError("Live PLAYBLAST did not switch away from the active still view.")
+            if not any(
+                item.get("snapshot_uid") == snapshot_uid
+                for item in playblast_state.get("snapshots", [])
+            ) or not snapshot_path.is_file() or hashlib.sha256(snapshot_path.read_bytes()).hexdigest() != snapshot_sha256:
+                raise RuntimeError("Live PLAYBLAST changed or removed the prior Shot snapshot history.")
             result["playblast"]["video_size"] = video_path.stat().st_size
             if args.depth:
                 depth_slot = int(playblast_state.get("depth_video_slot") or 0)
@@ -429,12 +465,12 @@ def main() -> int:
                 expected_depth = (
                     scene_copy.parent
                     / scene_copy.stem
-                    / f"{scene_copy.stem}_depth_playblast_{depth_slot}.mp4"
+                    / f"{scene_copy.stem}_depth_playblast_{run_token}.mp4"
                 )
                 expected_depth_sidecar = (
                     scene_copy.parent
                     / scene_copy.stem
-                    / f"{scene_copy.stem}_depth_playblast_{depth_slot}.hmb.json"
+                    / f"{scene_copy.stem}_depth_playblast_{run_token}.hmb.json"
                 )
                 if not expected_depth.is_file() or expected_depth.stat().st_size <= 0:
                     raise RuntimeError(
@@ -484,7 +520,9 @@ def main() -> int:
                     (
                         item
                         for item in playblast_state.get("videos", [])
-                        if int(item.get("video_slot") or 0) == depth_slot
+                        if item.get("generation_role") == "depth"
+                        and item.get("picker_shot_uuid") == mask_rows[0].get("picker_shot_uuid")
+                        and Path(str(item.get("video_path") or "")) == expected_depth
                     ),
                     None,
                 )
@@ -501,12 +539,12 @@ def main() -> int:
                     (
                         item
                         for item in picker_payload.get("videos", [])
-                        if int(item.get("video_slot") or 0) == depth_slot
+                        if item.get("generation_role") == "depth"
                     ),
                     None,
                 )
                 if (
-                    picker_payload.get("schema_version") != 4
+                    picker_payload.get("schema_version") != 5
                     or not depth_payload
                     or depth_payload.get("source_type_hint")
                     != picker.DEPTH_SOURCE_TYPE
@@ -543,12 +581,12 @@ def main() -> int:
                 expected_motion = (
                     scene_copy.parent
                     / scene_copy.stem
-                    / f"{scene_copy.stem}_motion_guide_{motion_slot}.mp4"
+                    / f"{scene_copy.stem}_motion_guide_{run_token}.mp4"
                 )
                 expected_motion_sidecar = (
                     scene_copy.parent
                     / scene_copy.stem
-                    / f"{scene_copy.stem}_motion_guide_{motion_slot}.hmb.json"
+                    / f"{scene_copy.stem}_motion_guide_{run_token}.hmb.json"
                 )
                 if (
                     not expected_motion.is_file()
@@ -599,7 +637,9 @@ def main() -> int:
                     (
                         item
                         for item in playblast_state.get("videos", [])
-                        if int(item.get("video_slot") or 0) == motion_slot
+                        if item.get("generation_role") == "motion_guide"
+                        and item.get("picker_shot_uuid") == mask_rows[0].get("picker_shot_uuid")
+                        and Path(str(item.get("video_path") or "")) == expected_motion
                     ),
                     None,
                 )
@@ -637,12 +677,12 @@ def main() -> int:
                     (
                         item
                         for item in picker_payload.get("videos", [])
-                        if int(item.get("video_slot") or 0) == motion_slot
+                        if item.get("generation_role") == "motion_guide"
                     ),
                     None,
                 )
                 if (
-                    picker_payload.get("schema_version") != 4
+                    picker_payload.get("schema_version") != 5
                     or not motion_payload
                     or motion_payload.get("source_type_hint")
                     != picker.MOTION_GUIDE_SOURCE_TYPE

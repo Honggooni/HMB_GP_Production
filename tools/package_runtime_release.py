@@ -18,8 +18,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-RELEASE_LABEL = "v0.7.80"
-RELEASE_VERSION = "0.7.80"
+RELEASE_LABEL = "v0.7.85"
+RELEASE_VERSION = "0.7.85"
 ARCHIVE_NAME = f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
 ARCHIVE_PATH = DIST / ARCHIVE_NAME
 ARCHIVE_ROOT = "HMB_GP_Production"
@@ -48,7 +48,11 @@ RUNTIME_INSTALL_FILES = (
     "HMBPromptLibrary.py",
     "HMBSeedanceGeneration.py",
     "HMBVideoPickerLibrary.py",
+    "_hmb_agent_media.py",
     "_hmb_agent_session.py",
+    "_hmb_build_diagnostics.py",
+    "_hmb_library_bootstrap.py",
+    "_hmb_review.py",
     "_hmb_shot_routing.py",
     "_hmb_mp4_verify.py",
     "_hmb_common.py",
@@ -85,7 +89,7 @@ CANONICAL_LF_SOURCE_FILES = {
     if PurePosixPath(relative).suffix.casefold() in {".py", ".js", ".json", ".md"}
     or relative == "LICENSE"
 }
-if len(RUNTIME_INSTALL_FILES) != 29 or len(DISTRIBUTION_ONLY_FILES) != 4:
+if len(RUNTIME_INSTALL_FILES) != 33 or len(DISTRIBUTION_ONLY_FILES) != 4:
     raise RuntimeError("Runtime/distribution release boundary count mismatch.")
 if set(RUNTIME_INSTALL_FILES) & set(DISTRIBUTION_ONLY_FILES):
     raise RuntimeError("Runtime and distribution-only release files overlap.")
@@ -549,7 +553,13 @@ def validate_no_policy_artifacts_in_zip(
 
 
 def validate_sources() -> tuple[str, list[dict[str, Any]]]:
-    policy_identity = synchronize_bundled_agent_policy()
+    # Package checks are read-only for the approved signed DAT. A Manager
+    # mirror is an explicit authoring operation, not an incidental side effect
+    # of validating or comparing a release from another chat.
+    policy_path = ROOT / Path(BUNDLED_AGENT_POLICY_MEMBER.as_posix())
+    if not policy_path.is_file() or policy_path.is_symlink():
+        raise RuntimeError("Bundled signed Agent policy is unavailable.")
+    policy_identity = verify_signed_agent_policy_bytes(policy_path.read_bytes())
     validate_release_identity()
     library_manifest = json.loads(
         (ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8")
@@ -696,6 +706,7 @@ def make_release_records(
         "shot_routing_protocol": SHOT_ROUTING_PROTOCOL_VERSION,
         "version": 1,
     }
+    manifest.update(build_identity_fields(source_records))
     manifest_data = (
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
@@ -719,6 +730,21 @@ def make_release_records(
         "sha256": digest(checksum_data),
     }
     return [*checksummed_records, checksum_record]
+
+
+def build_identity_fields(source_records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Reproducible fingerprints, independent of Git availability or host paths."""
+    def fingerprint(rows: list[dict[str, Any]]) -> str:
+        inventory = sorted(
+            ({"path": str(r["path"]), "bytes": int(r["bytes"]), "sha256": str(r["sha256"])}
+             for r in rows), key=lambda row: row["path"],
+        )
+        return digest(json.dumps(inventory, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    installed = [row for row in source_records if row.get("install") is True]
+    policy = next(row for row in source_records if row["path"] == BUNDLED_AGENT_POLICY_MEMBER.as_posix())
+    return {"build_fingerprint_sha256": fingerprint(source_records),
+            "runtime_fingerprint_sha256": fingerprint(installed),
+            "policy_identity": verify_signed_agent_policy_bytes(policy["data"])}
 
 
 def validate_release_inventory(
@@ -748,6 +774,10 @@ def validate_release_inventory(
         or any(type(flag) is not bool for flag in manifest_install_flags)
     ):
         raise RuntimeError("Runtime release closure manifest is inconsistent.")
+    if any(manifest.get(key) != value for key, value in build_identity_fields(
+        [record for record in records if str(record["path"]) in SOURCE_FILES]
+    ).items()):
+        raise RuntimeError("Runtime release build or signed-policy fingerprint is inconsistent.")
     for item in manifest["files"]:
         record = by_path.get(str(item["path"]))
         if (

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createRequire } from "node:module";
 
 
 const ASSET_WIDGET_PATH = new URL(
@@ -2382,4 +2385,184 @@ assert.match(
   /__hmbImageAssetCanonicalSerialization[\s\S]*?scanRevision[\s\S]*?uiEditRevision[\s\S]*?hmbCachedImageAssetSerialization/,
   "Canonical full-state serialization reuse must be guarded by both authority revisions.",
 );
+// The Editor renders both a visible parameter row and a hidden measurement
+// row. A bridge result must reach every still-mounted recipient, even if a
+// sibling retires or fails while another recipient is processing that result.
+{
+  const registry = thumbnailBridgeWidget.hmbImageAssetThumbnailPatchBridgeRegistry();
+  const runtime = "dual-owner-boundary";
+  const calls = [];
+  const consumers = new Map();
+  consumers.set("first", () => { calls.push("first"); consumers.delete("retired"); });
+  consumers.set("retired", () => calls.push("retired"));
+  consumers.set("survivor", () => calls.push("survivor"));
+  registry.set(runtime, { consumers });
+  const container = { style: { setProperty() {} }, setAttribute() {} };
+  const bridge = thumbnailBridgeWidget.default(container, { value: { runtime_instance_id: runtime }, onChange() {} });
+  const result = { schema: "hmb-image-asset-thumbnail-bridge", operation: "hydrate", phase: "result",
+    runtime_instance_id: runtime, request_id: "retire-during-result", thumbnail_revision: 1, completed_assets: [] };
+  bridge.update({ value: result, onChange() {} });
+  assert.deepEqual(calls, ["first", "survivor"]);
+  consumers.clear();
+  consumers.set("failure", () => { throw null; });
+  consumers.set("survivor", () => calls.push("after-failure"));
+  let caught = false;
+  try { bridge.update({ value: { ...result, request_id: "failure-fanout", thumbnail_revision: 2 }, onChange() {} }); }
+  catch (error) { caught = true; assert.equal(error, null); }
+  assert.equal(caught, true, "Consumer errors remain observable after other live owners receive the result.");
+  assert.equal(calls.at(-1), "after-failure");
+  bridge.cleanup();
+  assert.equal(registry.get(runtime)?.consumers, consumers, "Bridge teardown cannot delete mounted main-widget owners.");
+  assert.equal(registry.get(runtime)?.dispatch, undefined);
+  registry.delete(runtime);
+}
+
+{
+  const registry = thumbnailBridgeWidget.hmbImageAssetThumbnailPatchBridgeRegistry();
+  const runtime = "reentrant-bridge-replacement";
+  const inert = () => ({ style: { setProperty() {} }, setAttribute() {} });
+  const oldCalls = [], newCalls = [];
+  let replacement;
+  const originalPending = { request_id: "old-pending" };
+  registry.set(runtime, { pendingResult: originalPending, consumer() {
+    replacement = thumbnailBridgeWidget.default(inert(), {
+      value: { runtime_instance_id: runtime }, onChange(request) { newCalls.push(request); },
+    });
+  }});
+  const first = thumbnailBridgeWidget.default(inert(), {
+    value: { runtime_instance_id: runtime }, onChange(request) { oldCalls.push(request); },
+  });
+  const firstToken = registry.get(runtime).bridgeToken;
+  first.update({ value: { schema: "hmb-image-asset-thumbnail-bridge", operation: "hydrate", phase: "result",
+    runtime_instance_id: runtime, request_id: "replacement-result", thumbnail_revision: 1, completed_assets: [] },
+    onChange(request) { oldCalls.push(request); } });
+  const current = registry.get(runtime);
+  assert.notEqual(current.bridgeToken, firstToken, "Clearing a pending envelope cannot resurrect the retired bridge owner.");
+  assert.equal(current.pendingResult, undefined);
+  current.dispatch({ operation: "hydrate", runtime_instance_id: runtime, request_id: "post-replacement",
+    project_uid: "project", manifest_signature: "manifest", scan_revision: 1, asset_library_ids: ["asset"] });
+  assert.equal(oldCalls.length, 0);
+  assert.equal(newCalls.length, 1);
+  first.cleanup();
+  assert.equal(registry.get(runtime).bridgeToken, current.bridgeToken, "A late old cleanup cannot remove the replacement dispatcher.");
+  const newerPending = { request_id: "newer-pending" };
+  registry.set(runtime, { ...registry.get(runtime), pendingResult: originalPending, consumer() {
+    const live = registry.get(runtime);
+    registry.set(runtime, { ...live, pendingResult: newerPending });
+  }});
+  replacement.update({ value: { schema: "hmb-image-asset-thumbnail-bridge", operation: "hydrate", phase: "result",
+    runtime_instance_id: runtime, request_id: "newer-envelope-result", thumbnail_revision: 2, completed_assets: [] },
+    onChange(request) { newCalls.push(request); } });
+  assert.equal(registry.get(runtime).pendingResult, newerPending, "A callback's newer envelope cannot be deleted by an older delivery.");
+  replacement.cleanup();
+  registry.delete(runtime);
+}
+
+const dualRequire = createRequire(import.meta.url);
+let dualPlaywright;
+try { dualPlaywright = dualRequire("playwright"); }
+catch {
+  try { dualPlaywright = dualRequire(path.join(os.homedir(), ".cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright")); }
+  catch { /* Hostless tests above remain useful without a browser. */ }
+}
+const dualBrowserPath = process.env.HMB_IMAGE_ASSET_TEST_BROWSER || "C:/Program Files/Google/Chrome/Application/chrome.exe";
+if (!dualPlaywright || !fs.existsSync(dualBrowserPath)) {
+  assert.notEqual(process.env.HMB_IMAGE_ASSET_REQUIRE_BROWSER, "1", "Required native dual-mount browser fixture is unavailable.");
+  console.log("ImageAsset visible/measurement thumbnail fanout Chrome: NOT RUN (browser unavailable)");
+} else {
+  const browser = await dualPlaywright.chromium.launch({ executablePath: dualBrowserPath, headless: true });
+  const cases = [];
+  const pageErrors = [];
+  let remoteRequests = 0;
+  try {
+    for (const mode of ["visible-first", "visible-last", "hidden-cleanup", "visible-cleanup", "default-measurement"]) {
+      const page = await browser.newPage({ viewport: { width: 1200, height: 850 } });
+      page.setDefaultTimeout(5000);
+      page.on("pageerror", (error) => pageErrors.push(String(error)));
+      await page.route("**/*", (route) => { remoteRequests++; return route.abort(); });
+      await page.setContent('<style>.react-flow__node{width:1100px;height:740px}#visible{height:720px}#measure{position:absolute;left:0;right:0;visibility:hidden;pointer-events:none;height:40px}</style><div class="react-flow__node" data-id="DualMountFixture"><div id="visible"></div><div id="measure"></div><div id="bridge"></div></div>');
+      await page.evaluate(async ({ mainUri, bridgeUri, mode }) => {
+        const main = await import(mainUri), bridge = await import(bridgeUri);
+        const canvas = document.createElement("canvas"); canvas.width = 16; canvas.height = 16;
+        const ctx = canvas.getContext("2d"); ctx.fillStyle = "#00cc44"; ctx.fillRect(0, 0, 16, 16);
+        const image = canvas.toDataURL("image/png");
+        const base = main.hmbNormalizeImageAssetState({ catalog_root: "C:/fixture", project_root: "C:/fixture/ProjectB",
+          project_id: "Project B", project_uid: `project-${mode}`, project_cache_uid: `cache-${mode}`,
+          manifest_signature: "fixture-manifest", scan_revision: 7, ui_edit_revision: 9,
+          projects: [{ path: "C:/fixture/ProjectB", name: "Project B", project_id: "Project B" }],
+          assets: Array.from({ length: 3 }, (_, i) => ({ asset_library_id: `dual-${i}`, asset_id: `Hero${i}`, image_name: `Hero ${i}`,
+            source_uid: `source-${i}`, source_kind: "project", registered: true, relative_path: `Hero${i}.png`,
+            path: "", media_signature: `signature-${i}`, thumbnail_url: "" })) });
+        const f = { base, image, main, bridge, requests: [], writes: [],
+          visible: document.querySelector("#visible"), measure: document.querySelector("#measure") };
+        f.props = (state) => ({ value: JSON.stringify(state), onChange(value) { f.writes.push(value); return Promise.resolve(); } });
+        f.bridgeProps = (value) => ({ value, onChange(request) { f.requests.push(structuredClone(request)); return Promise.resolve(); } });
+        f.bridgeController = bridge.default(document.querySelector("#bridge"), f.bridgeProps({ runtime_instance_id: base.shot_routing.publisher_instance_uuid }));
+        if (mode === "visible-last" || mode === "visible-cleanup") {
+          f.hiddenController = main.default(f.measure, { ...f.props(base), height: 40 });
+          f.visibleController = main.default(f.visible, f.props(base));
+        } else {
+          f.visibleController = main.default(f.visible, f.props(base));
+          f.hiddenController = main.default(f.measure, mode === "default-measurement"
+            ? { height: 40, onChange(value) { f.writes.push(value); return Promise.resolve(); } }
+            : { ...f.props(base), height: 40 });
+        }
+        f.view = (container) => ({ root: container.__hmbImageAssetLatestState?.project_root || "",
+          cards: container.querySelectorAll("[data-asset-key]").length,
+          hydrated: container.__hmbImageAssetLatestState?.assets.filter((a) => a.thumbnail_url === image).length || 0,
+          decoded: [...container.querySelectorAll(".asset-grid img")].filter((i) => i.getAttribute("src") === image && i.complete && i.naturalWidth > 0).length,
+          selected: container.querySelector("[data-project-select] option:checked")?.textContent || "" });
+        window.dualFixture = f;
+      }, { mode, mainUri: "data:text/javascript;base64," + Buffer.from(assetSource).toString("base64"),
+        bridgeUri: "data:text/javascript;base64," + Buffer.from(fs.readFileSync(THUMBNAIL_BRIDGE_WIDGET_PATH, "utf8")).toString("base64") });
+      await page.waitForFunction(() => dualFixture.requests.some((r) => r.operation === "hydrate"));
+      const before = await page.evaluate(() => dualFixture.view(dualFixture.visible));
+      assert.equal(before.cards, 3);
+      await page.evaluate((mode) => {
+        const f = dualFixture;
+        if (mode === "hidden-cleanup") f.hiddenController.cleanup();
+        if (mode === "visible-cleanup") f.visibleController.cleanup();
+        f.result = { ...f.requests.find((r) => r.operation === "hydrate"), phase: "result", thumbnail_revision: 1,
+          completed_assets: f.base.assets.map((a) => ({ asset_library_id: a.asset_library_id, source_uid: a.source_uid,
+            media_signature: a.media_signature, relative_path: a.relative_path, thumbnail_url: f.image })), failed_asset_library_ids: [] };
+        f.bridgeController.update(f.bridgeProps(f.result));
+      }, mode);
+      await page.waitForFunction((mode) => dualFixture.view(mode === "visible-cleanup" ? dualFixture.measure : dualFixture.visible).decoded === 3, mode);
+      const result = await page.evaluate((mode) => {
+        const f = dualFixture;
+        const survivor = mode === "visible-cleanup" ? f.measure : f.visible;
+        const controller = mode === "visible-cleanup" ? f.hiddenController : f.visibleController;
+        controller.update(f.props(f.base)); // Exactly the same value: no structural props repaint.
+        const beforeInvalid = f.view(survivor);
+        for (const changed of [{ project_uid: "other-project" }, { runtime_instance_id: "other-runtime" },
+          { scan_revision: 6 }, { manifest_signature: "old-manifest" }, { completed_assets: f.result.completed_assets.map((a) => ({ ...a, media_signature: "old-media" })) }]) {
+          f.bridgeController.update(f.bridgeProps({ ...f.result, ...changed, request_id: `invalid-${JSON.stringify(changed)}`, thumbnail_revision: 2 }));
+        }
+        return { mode, beforeInvalid, afterInvalid: f.view(survivor), visible: f.view(f.visible), measurement: f.view(f.measure),
+          writes: f.writes.length, requests: f.requests.filter((r) => r.operation === "hydrate").length };
+      }, mode);
+      assert.equal(result.beforeInvalid.root, "C:/fixture/ProjectB");
+      assert.equal(result.beforeInvalid.selected, "Project B");
+      assert.equal(result.beforeInvalid.cards, 3);
+      assert.equal(result.beforeInvalid.hydrated, 3);
+      assert.equal(result.beforeInvalid.decoded, 3);
+      assert.deepEqual(result.afterInvalid, result.beforeInvalid, "Each mount retains its exact project/runtime/scan/media validation.");
+      assert.equal(result.writes, 0, "Neither a measurement mount nor default props can publish a default project state.");
+      assert.equal(result.requests, 1, "Shared presentation tracking keeps the dual mount's hydration request coalesced.");
+      cases.push(result);
+      await page.evaluate(() => { dualFixture.visibleController.cleanup(); dualFixture.hiddenController.cleanup(); dualFixture.bridgeController.cleanup(); });
+      await page.close();
+    }
+    assert.deepEqual(pageErrors, []);
+    assert.equal(remoteRequests, 0, "Synthetic PNG hydration must not contact a server or user media path.");
+    const evidenceDir = process.env.HMB_IMAGE_ASSET_DUAL_MOUNT_EVIDENCE_DIR;
+    if (evidenceDir) {
+      fs.mkdirSync(evidenceDir, { recursive: true });
+      fs.writeFileSync(path.join(evidenceDir, "dual-mount-browser.json"), JSON.stringify({
+        scope: "Production modules in Chrome, synthetic visible/hidden measurement mount and transport; native engine not run",
+        cases, remote_requests: remoteRequests, page_errors: pageErrors, result: "PASS" }, null, 2));
+    }
+    console.log(`ImageAsset visible/measurement thumbnail fanout Chrome: PASS (${cases.length} cases, both mount/cleanup orders, same-value update, default props, stale identity)`);
+  } finally { await browser.close(); }
+}
 console.log("HMB ImageAsset immediate feedback + no-remount performance regression: PASS");

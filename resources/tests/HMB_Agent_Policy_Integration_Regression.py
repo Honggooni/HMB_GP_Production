@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import importlib.util
 import json
 import sys
@@ -17,6 +18,31 @@ from _hmb_bundled_policy_session import (
 ROOT = Path(__file__).resolve().parents[2]
 EXPECTED_RELEASE_VERSION = json.loads((ROOT / "griptape-nodes-library.json").read_text(encoding="utf-8"))["metadata"]["library_version"]
 EXPECTED_SIGNING_KEY_ID = "hmb-policy-local-2026-08-r1"
+
+# Authorization failure is terminal and performs no load. Control-flow
+# exceptions still cancel/stop the caller, instead of becoming a policy error.
+for _index, _control in enumerate((KeyboardInterrupt(), SystemExit(23), asyncio.CancelledError())):
+    _spec = importlib.util.spec_from_file_location(
+        f"_isolated_hmb_policy_control_{_index}", ROOT / "_hmb_agent_session.py"
+    )
+    _session = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_session)
+    _calls = []
+    def _authorization():
+        _calls.append("authorization")
+        raise _control
+    try:
+        _session.bootstrap_once_authorized(_authorization, lambda: _calls.append("loader") or {})
+        raise AssertionError("Authorization control exception was suppressed")
+    except BaseException as _actual:
+        assert _actual is _control
+    assert _session._status_for_regression() == ("failed", 0)
+    try:
+        _session.bootstrap_once_authorized(lambda: _calls.append("retry") or True, lambda: {})
+        raise AssertionError("Cancelled authorization was retried")
+    except RuntimeError:
+        pass
+    assert _calls == ["authorization"]
 
 
 def load(name: str):

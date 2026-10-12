@@ -1,6 +1,7 @@
 {
   "name": "HMB_GP_Production",
   "library_schema_version": "0.10.0",
+  "advanced_library_path": "_hmb_library_bootstrap.py",
   "metadata": {
     "declarations": [
       {
@@ -278,15 +279,15 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.7.80",
+    "library_version": "0.7.85",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
-      "archive_source_count": 33,
+      "archive_source_count": 37,
       "mode": "bundled_signed_dat",
       "runtime_path": "resources/agent/hmb_agent_core.dat",
-      "policy_version": "2026-09-22.agent-shot-quality.v5.5",
-      "envelope_sha256": "f47adfebdaab6440aa34f0b1674e6eaeb391bdbb851db8ee0faff602190b5454",
-      "contract_sha256": "c25efff25acf1357d3c307ec07d8fd5258c0779609f839009f5e463bd711f20c",
+      "policy_version": "2026-10-09.agent-shot-quality.v5.6",
+      "envelope_sha256": "c057451e9a430144ca321c4764abe4958f129ba305c65deb1c5a7d6b63f24c82",
+      "contract_sha256": "181c81d6096bff9603d229243bc0183354035e4c6612981eaa5d1e9045fb7741",
       "verification": "rsa3072_sha256_v3_contract_once_per_process"
     },
     "tags": [
@@ -491,8 +492,19 @@
         "min_width": 760,
         "min_height": 700,
         "resizable": true,
-        "tags": ["HMB", "color-lut", "video", "post-production"],
-        "ui_options": {"width": 1220, "height": 1080, "min_width": 760, "min_height": 700, "resizable": true}
+        "tags": [
+          "HMB",
+          "color-lut",
+          "video",
+          "post-production"
+        ],
+        "ui_options": {
+          "width": 1220,
+          "height": 1080,
+          "min_width": 760,
+          "min_height": 700,
+          "resizable": true
+        }
       }
     },
     {

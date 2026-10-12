@@ -34,7 +34,13 @@ assert "_broker_load_bearer_token_readonly" in seedance_source
 
 assert delivery["mode"] == "bundled_signed_dat"
 assert delivery["runtime_path"] == "resources/agent/hmb_agent_core.dat"
-assert delivery["archive_source_count"] == 33
+packager_spec = importlib.util.spec_from_file_location(
+    "_hmb_bundled_policy_packager", ROOT / "tools" / "package_runtime_release.py"
+)
+assert packager_spec is not None and packager_spec.loader is not None
+packager = importlib.util.module_from_spec(packager_spec)
+packager_spec.loader.exec_module(packager)
+assert delivery["archive_source_count"] == len(packager.SOURCE_FILES)
 assert delivery["verification"] == "rsa3072_sha256_v3_contract_once_per_process"
 
 encoded = common._read_agent_policy_envelope()

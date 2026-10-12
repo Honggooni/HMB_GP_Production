@@ -1261,6 +1261,88 @@ def assert_only_shot_task_and_reference_state_contract() -> None:
     assert empty_video_params["video_reference_slots"] == []
 
 
+def assert_only_extension_ratio_and_shot_transition_contract() -> None:
+    """Only Extension repairs fixed ratios without changing Shot authorship."""
+
+    node = target.HMBSeedanceGeneration(name="Only Extension Ratio Regression")
+    node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_5)
+    node.set_parameter_value("ratio", "16:9")
+    manual_videos = ["https://cdn.example/extension-source.mp4"]
+    node.set_parameter_value(target.VIDEO_REFERENCES_PARAMETER, manual_videos)
+    node.set_parameter_value("prompt", "Continue the approved source motion.")
+    assert node._hmb_shot_channel_subscription()["enabled"] is False
+
+    node.set_parameter_value("task", target.TASK_VIDEO_EXTENSION)
+    ratio_parameter = node.get_parameter_by_name("ratio")
+    assert node.get_parameter_value("ratio") == "adaptive"
+    assert ratio_parameter.ui_options["simple_dropdown"] == ["adaptive"]
+    for duration in (-1, 4, 30):
+        node.set_parameter_value("duration", duration)
+        params = node._get_parameters()
+        node._validate_parameters(params)
+        payload = node._build_broker_payload(params)
+        assert payload["task"] == target.TASK_VIDEO_EXTENSION
+        assert payload["aspect_ratio"] == "adaptive"
+        assert payload["duration_seconds"] == duration
+        assert payload["video_urls"] == manual_videos
+
+    fixed_ratio_params = dict(params, ratio="16:9")
+    try:
+        node._validate_parameters(fixed_ratio_params)
+    except ValueError as exc:
+        assert "requires adaptive ratio" in str(exc)
+    else:
+        raise AssertionError("Only Video Extension accepted a fixed request ratio")
+
+    # Hydrate an actual Shot identity without touching shared routing state.
+    with mock.patch.object(
+        target._shot_routing,
+        "schedule_post_hydration_reconcile",
+        return_value=False,
+    ):
+        for name, value in (
+            (target.SHOT_CHANNEL_UUID_PARAMETER, "00000000-0000-4000-8000-000000000011"),
+            (target.SHOT_UUID_PARAMETER, "00000000-0000-4000-8000-000000000012"),
+            (target.SHOT_NUMBER_PARAMETER, 3),
+            (target.SHOT_NAME_PARAMETER, "Shot 3"),
+        ):
+            node.set_parameter_value(name, value, initial_setup=True)
+    assert node._hmb_shot_channel_subscription()["enabled"] is True
+    node._update_parameter_visibility()
+    assert node.get_parameter_value("task") == target.TASK_VIDEO_EXTENSION
+    assert ratio_parameter.ui_options["simple_dropdown"] == list(target.RATIOS)
+
+    node.set_parameter_value("task", target.TASK_REFERENCE_TO_VIDEO)
+    node.set_parameter_value("ratio", "9:16")
+    node.set_parameter_value("task", target.TASK_VIDEO_EXTENSION)
+    node._update_parameter_visibility()
+    assert node.get_parameter_value("ratio") == "9:16"
+    assert node.get_parameter_value("task") == target.TASK_VIDEO_EXTENSION
+    assert ratio_parameter.ui_options["simple_dropdown"] == list(target.RATIOS)
+    assert node._get_parameters()["ratio"] == "9:16"
+    assert node.get_parameter_value(target.VIDEO_REFERENCES_PARAMETER) == manual_videos
+
+    with mock.patch.object(
+        target._shot_routing,
+        "schedule_post_hydration_reconcile",
+        return_value=False,
+    ):
+        for name, value in (
+            (target.SHOT_CHANNEL_UUID_PARAMETER, ""),
+            (target.SHOT_UUID_PARAMETER, ""),
+            (target.SHOT_NUMBER_PARAMETER, 0),
+            (target.SHOT_NAME_PARAMETER, ""),
+        ):
+            node.set_parameter_value(name, value, initial_setup=True)
+    assert node._hmb_shot_channel_subscription()["enabled"] is False
+    node._update_parameter_visibility()
+    assert node.get_parameter_value("task") == target.TASK_VIDEO_EXTENSION
+    assert node.get_parameter_value("ratio") == "adaptive"
+    assert ratio_parameter.ui_options["simple_dropdown"] == ["adaptive"]
+    assert node.get_parameter_value(target.VIDEO_REFERENCES_PARAMETER) == manual_videos
+    node._validate_parameters(node._get_parameters())
+
+
 def assert_seedance_recreate_widget_and_list_lifecycle_contract() -> None:
     """A fresh generator publishes Shot 1 and preserves connected list rows."""
 
@@ -4658,9 +4740,68 @@ def assert_broker_server_accounting_contract() -> None:
 
 
 
+def assert_hidden_task_evidence_and_gallery_contract() -> None:
+    with tempfile.TemporaryDirectory(prefix="hmb-task-feedback-node-") as directory:
+        base = Path(directory)
+        bridge = FakeBrokerBridge([])
+        node = BrokerScriptedNode(bridge)
+        node._hmb_review_inputs = {"settings": {"duration": 5}, "references": []}
+        original_root = target._review.review_root
+        with mock.patch.object(target._review, "review_root", side_effect=lambda root=None: original_root(root or base)), \
+             mock.patch.object(target, "_get_build_diagnostics", return_value={"library_version": "0.7.82"}), \
+             mock.patch.object(target._HMBAIBrokerBridge, "_request_json", side_effect=AssertionError("Feedback contacted Broker")):
+            node._start_review_case("feedback-client", "exact final submitted prompt")
+            node._record_review_stage("submitting", "feedback-client")
+            node._record_review_stage("queued", "feedback-task")
+            node.parameter_output_values["generation_id"] = "feedback-task"
+            case = target._review.read_case("feedback-task")
+            assert case["submitted_prompt"] == "exact final submitted prompt"
+            assert not case["reviews"] and not bridge.generate_payloads
+            assert not hasattr(node, "_on_review_save_clicked")
+            for name in ("review_task_id", "review_score", "review_category", "review_note", "review_save",
+                         "review_diagnostics", "review_details"):
+                assert node.get_parameter_by_name(name) is None, "Native feedback UI must live on the web only"
+
+    # The installed SDK's real retained SetParameter handler returns success;
+    # the action is routed to the exact registered node and contains no URL authority.
+    GriptapeNodes.EventManager().initialize_queue()
+    stamp = time.time_ns()
+    ensured = GriptapeNodes.handle_request(EnsureWorkflowAndFlowRequest(
+        display_name=f"Gallery callback {stamp}", flow_name=f"GalleryCallback_{stamp}"))
+    assert isinstance(ensured, EnsureWorkflowAndFlowResultSuccess)
+    flow = GriptapeNodes.FlowManager().get_flow_by_name(ensured.flow_name)
+    try:
+        native = target.HMBSeedanceGeneration(name=f"NativeGallery_{stamp}")
+        flow.add_node(native)
+        GriptapeNodes.ObjectManager().add_object_by_name(native.name, native)
+        GriptapeNodes.NodeManager()._name_to_parent_flow_name[native.name] = flow.name
+        native.set_parameter_value(target.BROKER_SERVER_URL_PARAMETER, "https://gallery.example")
+        captures = []
+        command = {"schema": target.SEEDANCE_REFRESH_COMMAND_SCHEMA, "version": 1,
+                   "action": "open_gallery", "action_id": f"gallery-{stamp}", "issued_at_ms": 1,
+                   "url": "https://attacker.example/?token=SECRET", "task_id": "browser-owned-task"}
+        with mock.patch.object(native, "_schedule_open_review_gallery", side_effect=captures.append), \
+             mock.patch.object(target._HMBAIBrokerBridge, "_request_json", side_effect=AssertionError("Native callback contacted Broker")), \
+             mock.patch.object(target.webbrowser, "open", side_effect=AssertionError("Callback opened browser synchronously")):
+            for _repeat in range(2):
+                result = GriptapeNodes.handle_request(SetParameterValueRequest(
+                    node_name=native.name, parameter_name=target.SEEDANCE_REFRESH_COMMAND_PARAMETER,
+                    value=command, data_type="dict"))
+                assert isinstance(result, SetParameterValueResultSuccess), result
+            assert captures == ["https://gallery.example"], "Duplicate pulse or browser origin must not launch another request"
+            stored = native.get_parameter_value(target.SEEDANCE_REFRESH_COMMAND_PARAMETER)
+            assert set(stored) == {"schema", "version", "action", "action_id", "issued_at_ms"}
+            assert "SECRET" not in json.dumps(stored) and "browser-owned" not in json.dumps(stored)
+    finally:
+        deleted = asyncio.run(GriptapeNodes.ahandle_request(DeleteWorkflowRequest(name=ensured.workflow_name)))
+        assert isinstance(deleted, DeleteWorkflowResultSuccess)
+
+
+assert_hidden_task_evidence_and_gallery_contract()
 assert_constructor_and_public_contract()
 assert_seedance_25_output_format_and_last_frame_ui_contract()
 assert_only_shot_task_and_reference_state_contract()
+assert_only_extension_ratio_and_shot_transition_contract()
 assert_seedance_recreate_widget_and_list_lifecycle_contract()
 assert_image_asset_single_wire_host_contract()
 assert_video_picker_single_wire_host_contract()

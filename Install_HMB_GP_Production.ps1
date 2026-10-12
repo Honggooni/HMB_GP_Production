@@ -55,6 +55,22 @@ function Assert-HmbRelativeMember {
     }
 }
 
+function Get-HmbInventoryFingerprint {
+    param([Parameter(Mandatory = $true)][object[]]$Items)
+    $byPath = @{}
+    foreach ($item in $Items) { $byPath[[string]$item.path] = $item }
+    [string[]]$names = @($byPath.Keys)
+    [System.Array]::Sort($names, [System.StringComparer]::Ordinal)
+    $rows = @(foreach ($name in $names) {
+        $item = $byPath[$name]
+        [ordered]@{ bytes = [long]$item.bytes; path = [string]$item.path; sha256 = [string]$item.sha256 }
+    })
+    $encoded = [System.Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $rows -Depth 4 -Compress))
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try { return ([System.BitConverter]::ToString($hasher.ComputeHash($encoded))).Replace('-', '').ToLowerInvariant() }
+    finally { $hasher.Dispose() }
+}
+
 $source = Get-HmbFullPath -Path $SourceRoot
 $target = Get-HmbFullPath -Path $TargetRoot
 $expectedParent = Get-HmbFullPath -Path (
@@ -108,9 +124,9 @@ if ($records.Count -ne [int]$manifest.file_count) {
     throw 'HMB release manifest file_count does not match its file list.'
 }
 if (
-    [int]$manifest.install_file_count -ne 29 -or
+    [int]$manifest.install_file_count -ne 33 -or
     [int]$manifest.distribution_file_count -ne 4 -or
-    $records.Count -ne 33
+    $records.Count -ne 37
 ) {
     throw 'HMB release manifest install/distribution boundary mismatch.'
 }
@@ -134,7 +150,9 @@ foreach ($record in $records) {
         throw "Missing HMB release member: $relative"
     }
     $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceFile).Hash
-    if ($actual -ne ([string]$record.sha256).ToUpperInvariant()) {
+    if ([string]$record.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $actual -ne ([string]$record.sha256).ToUpperInvariant() -or
+        (Get-Item -LiteralPath $sourceFile).Length -ne [long]$record.bytes) {
         throw "HMB release member hash mismatch: $relative"
     }
     if ($installProperty.Value -and -not $installMembers.Add($relative)) {
@@ -161,9 +179,23 @@ if (
 ) {
     throw 'HMB release manifest distribution-only members are invalid.'
 }
+if ((Get-HmbInventoryFingerprint -Items $records) -cne [string]$manifest.build_fingerprint_sha256 -or
+    (Get-HmbInventoryFingerprint -Items $installRecords) -cne [string]$manifest.runtime_fingerprint_sha256) {
+    throw 'HMB release build fingerprint mismatch.'
+}
+$manifestSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $manifestPath).Hash.ToLowerInvariant()
+$expectedChecksums = @($records | ForEach-Object { '{0}  {1}' -f $_.sha256, $_.path })
+$expectedChecksums += "$manifestSha256  release-manifest.json"
+$actualChecksums = @(Get-Content -LiteralPath $checksumsPath)
+if ($actualChecksums.Count -ne $expectedChecksums.Count -or
+    @(Compare-Object $expectedChecksums $actualChecksums -CaseSensitive).Count -ne 0) {
+    throw 'HMB release checksums inventory mismatch.'
+}
 
 $rollback = $null
 $preservedVenv = $null
+$preservedUserMembers = @()
+$relocatedUserMembers = New-Object 'System.Collections.Generic.List[string]'
 if (Test-Path -LiteralPath $target) {
     $reparsePoints = Get-ChildItem -LiteralPath $target -Force -Recurse -ErrorAction Stop |
         Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint }
@@ -185,6 +217,16 @@ if (Test-Path -LiteralPath $target) {
     if (Test-Path -LiteralPath $candidateVenv -PathType Container) {
         $preservedVenv = $candidateVenv
     }
+    # Runtime code is replaced only from the verified package. Carry legacy
+    # user reports forward; current recovery/review data lives in LocalAppData
+    # and project media lives outside this target, so neither is touched.
+    $preservedUserMembers = @(Get-ChildItem -LiteralPath $rollback -Force | Where-Object {
+        $relative = [string]$_.Name
+        if ($installMembers.Contains($relative) -or $relative -eq '.hmb-install-receipt.json' -or
+            $relative -eq 'release-manifest.json' -or $relative -eq 'SHA256SUMS') { return $false }
+        if ($_.PSIsContainer) { return $relative -in @('reports', 'reviews', 'user-data') }
+        return $_.Extension.ToLowerInvariant() -in @('.json', '.txt', '.md', '.csv', '.log')
+    } | ForEach-Object { [string]$_.Name })
 }
 
 try {
@@ -230,10 +272,41 @@ try {
 
     if ($preservedVenv) {
         Move-Item -LiteralPath $preservedVenv -Destination (Join-Path $target '.venv')
+        $relocatedUserMembers.Add('.venv')
     }
+    foreach ($relative in $preservedUserMembers) {
+        Assert-HmbRelativeMember -Path $relative
+        Move-Item -LiteralPath (Join-Path $rollback $relative) -Destination (Join-Path $target $relative)
+        $relocatedUserMembers.Add($relative)
+    }
+    $receipt = [ordered]@{
+        schema = 'hmb-install-receipt'; version = 1
+        release_version = [string]$manifest.release_version
+        installed_at = [DateTime]::UtcNow.ToString('o')
+        source_manifest_sha256 = $manifestSha256
+        build_fingerprint_sha256 = [string]$manifest.build_fingerprint_sha256
+        runtime_fingerprint_sha256 = [string]$manifest.runtime_fingerprint_sha256
+        policy_identity = $manifest.policy_identity
+        verification = 'file_hashes_and_inventory_matched_unsigned_local_record'
+        runtime_files = @($installRecords | ForEach-Object {
+            [ordered]@{ path = [string]$_.path; bytes = [long]$_.bytes; sha256 = [string]$_.sha256 }
+        })
+        preserved_user_members = @($relocatedUserMembers)
+    }
+    $receiptPath = Join-Path $target '.hmb-install-receipt.json'
+    [System.IO.File]::WriteAllText($receiptPath, (ConvertTo-Json -InputObject $receipt -Depth 8),
+        (New-Object System.Text.UTF8Encoding($false)))
 }
 catch {
     if ($rollback -and (Test-Path -LiteralPath $rollback)) {
+        # If receipt writing fails after carrying user data forward, put those
+        # exact paths back before restoring the old library.
+        foreach ($relative in $relocatedUserMembers) {
+            $moved = Join-Path $target $relative
+            if (Test-Path -LiteralPath $moved) {
+                Move-Item -LiteralPath $moved -Destination (Join-Path $rollback $relative)
+            }
+        }
         $failedTarget = Join-Path $rollbackRootPath (
             'failed-new-{0}-{1}' -f (
                 (Get-Date).ToString('yyyyMMdd-HHmmss'),
@@ -254,3 +327,8 @@ Write-Output ("VERSION=$($manifest.release_version)")
 Write-Output ("RUNTIME_FILES=$($installRecords.Count)")
 Write-Output ("RESOURCE_FILES=$($resourceMembers.Count)")
 Write-Output ("ROLLBACK=$rollback")
+Write-Output ("RUNTIME_FINGERPRINT=$($manifest.runtime_fingerprint_sha256)")
+Write-Output ("BUILD_FINGERPRINT=$($manifest.build_fingerprint_sha256)")
+Write-Output ("SOURCE_MANIFEST_SHA256=$manifestSha256")
+Write-Output ("PRESERVED_USER_MEMBERS=$($relocatedUserMembers.Count)")
+Write-Output ("RECEIPT=$receiptPath")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import asyncio
+import copy
 import hashlib
 import hmac
 import importlib.util
@@ -918,6 +919,77 @@ def _with_english_agent_output_contract(final_prompt: Any) -> str:
     return _AGENT_ENGLISH_OUTPUT_CONTRACT
 
 
+def _run_native_with_literal_hmb_input(native_processor: Any, agent: Any, prompt: Any) -> Any:
+    """Keep the exact verified request literal at the native Task boundary.
+
+    Standard PromptTask renders every TextArtifact as Jinja, including text
+    inside multimodal lists. The HMB envelope and reference labels are data,
+    so only this request object bypasses that second interpretation. Other
+    native inputs/templates keep the original processor, and the instance
+    hook is restored when that native run finishes. A cancelled streaming UI
+    may return before its native worker; the worker's own finish event retains
+    protection through its final input/memory reads without delaying cancel.
+    """
+
+    task = None
+    try:
+        from griptape.artifacts import BaseArtifact, TextArtifact
+        from griptape.events import EventListener, FinishStructureRunEvent, StartStructureRunEvent
+        from griptape.tasks import PromptTask
+
+        candidate = agent.tasks[0]
+        if isinstance(candidate, PromptTask):
+            original = candidate._process_task_input
+            previous_instance_hook = candidate.__dict__.get("_process_task_input")
+
+            def literal_input(value: Any) -> Any:
+                if value is prompt:
+                    return value if isinstance(value, BaseArtifact) else TextArtifact(value)
+                return original(value)
+
+            candidate._process_task_input = literal_input
+            task = candidate
+    except (ImportError, AttributeError, IndexError, TypeError):
+        pass
+    if task is None:
+        return native_processor(agent, prompt)
+    run_started = False
+    run_finished = False
+
+    def restore_input() -> None:
+        try:
+            if task.__dict__.get("_process_task_input") is literal_input:
+                if previous_instance_hook is None:
+                    del task._process_task_input
+                else:
+                    task._process_task_input = previous_instance_hook
+        except (AttributeError, TypeError):
+            pass
+
+    def observe_run(event: Any) -> Any:
+        nonlocal run_started, run_finished
+        if getattr(event, "structure_id", None) == agent.id:
+            if isinstance(event, StartStructureRunEvent):
+                run_started = True
+            elif isinstance(event, FinishStructureRunEvent):
+                run_finished = True
+                restore_input()
+                listener.__exit__(None, None, None)
+        return event
+
+    listener = EventListener(observe_run, event_types=[StartStructureRunEvent, FinishStructureRunEvent])
+    listener.__enter__()
+    try:
+        return native_processor(agent, prompt)
+    finally:
+        # EventBus uses context-local listener lists. Removing this listener
+        # from the UI context leaves the native worker's copied context intact
+        # until its matching finish event restores the hook after cancellation.
+        listener.__exit__(None, None, None)
+        if not run_started or run_finished:
+            restore_input()
+
+
 def _paired_machine_prompt(node: Any, prompt_value: Any) -> str:
     """Return the machine envelope paired with one visible ``PROMPT_OUT``.
 
@@ -1295,6 +1367,8 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_native_failure_stage = ""
         self._hmb_native_failure_code = ""
         self._hmb_execution_result: dict[str, Any] = {}
+        self._hmb_reference_observation: dict[str, Any] = {}
+        self._hmb_reference_observation_run_id = ""
         self._hmb_shot_context: dict[str, Any] = {}
         self._hmb_shot_catalog_snapshot: dict[str, Any] = {}
         # Instance-local execution authority.  Display widget writes and
@@ -1366,19 +1440,71 @@ class HMBAgentLibrary(_BaseAgent):
         result = getattr(self, "_hmb_execution_result", None)
         if not isinstance(result, dict) or not result:
             result = getattr(self, "parameter_values", {}).get(_AGENT_EXECUTION_RESULT_PARAMETER)
-        return dict(result) if isinstance(result, dict) else {}
+        return copy.deepcopy(result) if isinstance(result, dict) else {}
+
+    def _hmb_agent_reference_observation_snapshot(self) -> dict[str, Any]:
+        """Read-only observations for the current Agent run, never source access."""
+        report = getattr(self, "_hmb_reference_observation", {})
+        return copy.deepcopy(report) if isinstance(report, dict) else {}
+
+    def _begin_hmb_reference_observation(self, machine: str) -> str:
+        result = self._hmb_execution_result_snapshot()
+        run_id = str(result.get("run_id") or "") if result.get("status") == "running" else secrets.token_hex(16)
+        self._hmb_reference_observation_run_id = run_id
+        self._hmb_reference_observation = {
+            "schema": "hmb-agent-reference-observation", "version": 1, "run_id": run_id,
+            "machine_sha256": _prompt_text_sha256(machine), "status": "unobserved",
+            "coverage": [], "skips": [], "groups": [], "budget_summary": {},
+        }
+        return run_id
+
+    def _store_hmb_reference_observation(self, report: dict[str, Any], run_id: str,
+                                         generation: int, machine_hash: str) -> None:
+        if (not self._hmb_lifecycle_is_live(generation)
+                or (bool(getattr(self, "is_cancellation_requested", False))
+                    and (not isinstance(report, dict) or report.get("status") != "cancelled" or report.get("coverage")))
+                or str(getattr(self, "_hmb_reference_observation_run_id", "")) != run_id
+                or _prompt_text_sha256(str(getattr(self, "_hmb_runtime_prompt", "") or "")) != machine_hash
+                or not isinstance(report, dict) or report.get("machine_sha256") != machine_hash
+                or report.get("schema") != "hmb-agent-reference-observation" or report.get("version") != 1):
+            return
+        self._hmb_reference_observation = copy.deepcopy(report)
+        self._hmb_reference_observation["run_id"] = run_id
+
+    def _mark_hmb_reference_observation_submission(self, run_id: str, submitted: bool) -> None:
+        report = getattr(self, "_hmb_reference_observation", {})
+        if not run_id or not isinstance(report, dict) or report.get("run_id") != run_id:
+            return
+        if submitted:
+            report["native_input_status"] = "passed_to_native_processor"
+        else:
+            report["native_input_status"] = "not_submitted"
+            report["status"] = "cancelled"
+            for row in report.get("coverage", []):
+                report.setdefault("skips", []).append({**row, "reason": "cancelled_before_native_submission"})
+            report["coverage"] = []
+            report["groups"] = []
+            report.setdefault("budget_summary", {})["attachments_delivered"] = 0
 
     def _set_hmb_execution_result(self, status: str, *, code: str = "", message: str = "") -> None:
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return
         output = str(getattr(self, "parameter_output_values", {}).get("output") or "").strip()
         previous = self._hmb_execution_result_snapshot()
+        if status == "running":
+            self._hmb_reference_observation = {}
+            self._hmb_reference_observation_run_id = ""
         result = {
             "schema": "hmb-agent-execution-result", "version": 1,
             "status": status, "code": code, "message": message,
             "run_id": secrets.token_hex(16) if status == "running" else str(previous.get("run_id") or ""),
             "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest() if status == "succeeded" else "",
         }
+        observation = self._hmb_agent_reference_observation_snapshot()
+        if observation and observation.get("run_id") == result["run_id"]:
+            observation["agent_status"] = status
+            self._hmb_reference_observation = copy.deepcopy(observation)
+            result["reference_observation"] = observation
         # The host clears output values before scheduling a new run. Preserve
         # the handled result in an instance-owned value and serializable property.
         self._hmb_execution_result = result
@@ -3002,16 +3128,76 @@ class HMBAgentLibrary(_BaseAgent):
     def _process(self, agent: Any, prompt: Any) -> Any:
         """Use the Standard processor; constrain only canonical HMB output prose."""
 
+        hmb_request = bool(self._hmb_rules_active)
         native_processor = getattr(super(), "_process", None)
         if not callable(native_processor):
             # Import-only/test fallback. Official Griptape always supplies the
             # native processor; never emulate a second, HMB-specific model path.
             return agent
-        if self._hmb_rules_active:
+        if hmb_request:
             # Standard Agent has already merged any typed additional_context at
             # this point. Canonical HMB dictionaries are delimited literal data;
             # numeric/string context and non-HMB templates retain native behavior.
+            lifecycle_generation = int(getattr(self, "_hmb_lifecycle_generation", 0) or 0)
+            if (
+                not self._hmb_lifecycle_is_live(lifecycle_generation)
+                or bool(getattr(self, "is_cancellation_requested", False))
+            ):
+                return agent
             prompt = _with_english_agent_output_contract(prompt)
+            # Optional execution facts and reference pixels augment the same
+            # native call. Their absence never invalidates the authenticated
+            # source text, changes the user's model, or launches an analysis
+            # Agent. Source getters revalidate the exact machine snapshot.
+            source = getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
+            machine = str(getattr(self, "_hmb_runtime_prompt", "") or "")
+            observation_begin = getattr(self, "_begin_hmb_reference_observation", None)
+            observation_run = observation_begin(machine) if callable(observation_begin) else ""
+            observation_store = getattr(self, "_store_hmb_reference_observation", None)
+            machine_hash = _prompt_text_sha256(machine)
+            settings_getter = getattr(source, "_hmb_agent_generation_context", None)
+            if callable(settings_getter):
+                try:
+                    settings = settings_getter(machine)
+                    if isinstance(settings, dict) and settings:
+                        prompt += (
+                            "\n\nHMB CURRENT GENERATOR SETTINGS (READ-ONLY DATA):\n"
+                            + json.dumps(settings, ensure_ascii=False, separators=(",", ":"))
+                        )
+                except Exception:
+                    pass
+            media_getter = getattr(source, "_hmb_agent_reference_media", None)
+            if callable(media_getter):
+                try:
+                    from _hmb_agent_media import augment_prompt
+
+                    media = media_getter(machine)
+                    if (
+                        isinstance(media, dict)
+                        and media.get("machine_sha256") == _prompt_text_sha256(machine)
+                    ):
+                        prompt = augment_prompt(
+                            prompt, media, agent,
+                            is_live=lambda: self._hmb_lifecycle_is_live(lifecycle_generation)
+                            and not bool(getattr(self, "is_cancellation_requested", False)),
+                            report_sink=(lambda report: observation_store(report, observation_run,
+                                lifecycle_generation, machine_hash)) if callable(observation_store) else None,
+                        )
+                except Exception:
+                    pass
+        if hmb_request:
+            if (
+                not self._hmb_lifecycle_is_live(lifecycle_generation)
+                or bool(getattr(self, "is_cancellation_requested", False))
+            ):
+                marker = getattr(self, "_mark_hmb_reference_observation_submission", None)
+                if callable(marker):
+                    marker(observation_run, False)
+                return agent
+            marker = getattr(self, "_mark_hmb_reference_observation_submission", None)
+            if callable(marker):
+                marker(observation_run, True)
+            return _run_native_with_literal_hmb_input(native_processor, agent, prompt)
         return native_processor(agent, prompt)
 
     def _run_native_agent_once(self, lifecycle_generation: int | None = None):
@@ -3244,6 +3430,8 @@ class HMBAgentLibrary(_BaseAgent):
         )
         self._hmb_native_calls_this_process = 0
         self._hmb_last_sanitizer_status = "clean"
+        self._hmb_reference_observation = {}
+        self._hmb_reference_observation_run_id = ""
         self._hmb_suppress_visible_publication = False
         self._hmb_native_failure_stage = ""
         self._hmb_native_failure_code = ""

@@ -85,6 +85,7 @@ class ImportList(SimpleNamespace):
 
 
 class Target:
+    _expand_widget_edit = library.HMBImageAssetLibrary._expand_widget_edit
     def __init__(self):
         self.name = "isolated_image_asset_target"
         self.lock = False
@@ -98,8 +99,11 @@ class Target:
             "shot_routing": [{"selected_source_uids": ["project:registered-b"]}],
         }
         self.applied_values = []
+        self.raise_for_missing_parameter = False
 
     def get_parameter_by_name(self, name):
+        if self.raise_for_missing_parameter and name not in self.parameters:
+            raise ValueError(f"Parameter '{name}' does not exist")
         return self.parameters.get(name)
 
     def get_parameter_value(self, name):
@@ -137,6 +141,33 @@ class FakeEventLoop:
             callback(*args)
 
 
+class FakeEventManager:
+    """The SDK's public dispatch hooks, without importing a live engine."""
+
+    def __init__(self, loop):
+        self.event_loop = loop
+        self.pre_hooks = []
+        self.post_hooks = {}
+
+    def add_pre_dispatch_hook(self, callback):
+        if callback not in self.pre_hooks:
+            self.pre_hooks.append(callback)
+
+    def remove_pre_dispatch_hook(self, callback):
+        if callback in self.pre_hooks:
+            self.pre_hooks.remove(callback)
+
+    def add_post_dispatch_hook(self, event_type, callback):
+        callbacks = self.post_hooks.setdefault(event_type, [])
+        if callback not in callbacks:
+            callbacks.append(callback)
+
+    def remove_post_dispatch_hook(self, event_type, callback):
+        callbacks = self.post_hooks.get(event_type, [])
+        if callback in callbacks:
+            callbacks.remove(callback)
+
+
 class FakeRetainedHost:
     def __init__(self, target):
         self.target = target
@@ -144,6 +175,7 @@ class FakeRetainedHost:
             f"source_{key}": SimpleNamespace(parameter_output_values={"IMAGE_OUT": image})
             for key, image in zip("abc", target.images)
         }
+        self.nodes[target.name] = target
         self.incoming = [
             Payload(
                 source_node_name=f"source_{key}",
@@ -160,17 +192,61 @@ class FakeRetainedHost:
         self.delete_cleanup_flags = []
         self.invoke_removal_hook = False
         self.loop = FakeEventLoop()
+        self.event_manager = FakeEventManager(self.loop)
+        self.dispatch_requests = []
+        self.dispatch_results = []
+        self.drain_during_native_remove = False
+        self.defer_post_hooks = False
+        self.pending_post_hooks = []
+        self.supports_dispatch_hooks = True
+        self.legacy_event_manager = SimpleNamespace(event_loop=self.loop)
         self.before_delete = None
+        self.after_list = None
+        self.before_remove = None
+        self.remove_results = []
+
+    def forget_child(self, name):
+        """Finish an already-owned native deletion without another request."""
+        self.target.children[:] = [p for p in self.target.children if p.name != name]
+        self.target.parameters.pop(name, None)
+        self.target.parameter_values.pop(name, None)
 
     def get_node_by_name(self, name):
         return self.nodes[name]
 
     def handle_request(self, request):
+        self.dispatch_requests.append(request)
+        result = None
+        for callback in list(self.event_manager.pre_hooks):
+            result = callback(request, SimpleNamespace())
+            if result is not None:
+                break
+        if result is None:
+            result = self._handle_request_impl(request)
+        self.dispatch_results.append((request, result))
+        for callback in list(self.event_manager.post_hooks.get(type(request), [])):
+            if self.defer_post_hooks:
+                self.pending_post_hooks.append((callback, request, result))
+            else:
+                callback(request, result)
+        return result
+
+    def drain_post_hooks(self, *, reverse=False):
+        while self.pending_post_hooks:
+            index = -1 if reverse else 0
+            callback, request, result = self.pending_post_hooks.pop(index)
+            callback(request, result)
+
+    def _handle_request_impl(self, request):
         if isinstance(request, ListConnectionsForNodeRequest):
             self.events.append(("list", request.node_name))
-            return ListConnectionsForNodeResultSuccess(
+            result = ListConnectionsForNodeResultSuccess(
                 incoming_connections=list(self.incoming), outgoing_connections=list(self.outgoing)
             )
+            if self.after_list is not None:
+                callback, self.after_list = self.after_list, None
+                callback()
+            return result
         if isinstance(request, DeleteConnectionRequest):
             self.events.append(("delete", request.target_parameter_name))
             self.delete_cleanup_flags.append(bool(getattr(self.target, "_hmb_import_cleanup_active", False)))
@@ -200,19 +276,61 @@ class FakeRetainedHost:
                     )
             return DeleteConnectionResultSuccess()
         if isinstance(request, RemoveParameterFromNodeRequest):
+            if request.node_name != self.target.name:
+                return RemoveParameterFromNodeResultFailure(result_details="Unknown native node")
             self.events.append(("remove", request.parameter_name))
+            if self.before_remove is not None:
+                callback, self.before_remove = self.before_remove, None
+                callback()
             if self.remove_failure:
-                return RemoveParameterFromNodeResultFailure(result_details="injected remove failure")
-            # Removal must reach the host only after the exact child is disconnected.
-            assert not any(e.target_parameter_name == request.parameter_name for e in self.incoming)
+                result = RemoveParameterFromNodeResultFailure(result_details="injected remove failure")
+                self.remove_results.append(result)
+                return result
+            if request.parameter_name not in self.target.parameters:
+                result = RemoveParameterFromNodeResultFailure(
+                    result_details=f"Parameter '{request.parameter_name}' does not exist"
+                )
+                self.remove_results.append(result)
+                return result
+            if not self.target.parameters[request.parameter_name].user_defined:
+                result = RemoveParameterFromNodeResultFailure(
+                    result_details="Native host cannot remove a built-in parameter"
+                )
+                self.remove_results.append(result)
+                return result
+            # The actual SDK removes matching wires first, emitting the node's
+            # disconnection callback, and only then removes the captured child.
+            for edge in list(self.incoming):
+                if edge.target_parameter_name == request.parameter_name:
+                    result = self.handle_request(DeleteConnectionRequest(
+                        source_node_name=edge.source_node_name,
+                        source_parameter_name=edge.source_parameter_name,
+                        target_node_name=self.target.name,
+                        target_parameter_name=edge.target_parameter_name,
+                    ))
+                    if not isinstance(result, DeleteConnectionResultSuccess):
+                        failure = RemoveParameterFromNodeResultFailure(
+                            result_details="native nested connection deletion failed"
+                        )
+                        self.remove_results.append(failure)
+                        return failure
             assert not any(e.source_parameter_name == request.parameter_name for e in self.outgoing)
-            self.target.children[:] = [p for p in self.target.children if p.name != request.parameter_name]
-            self.target.parameters.pop(request.parameter_name, None)
-            return RemoveParameterFromNodeResultSuccess()
+            if self.drain_during_native_remove:
+                self.loop.drain()
+            if request.parameter_name not in self.target.parameters:
+                result = RemoveParameterFromNodeResultFailure(
+                    result_details="Native child removal lost its captured element to a nested removal"
+                )
+                self.remove_results.append(result)
+                return result
+            self.forget_child(request.parameter_name)
+            result = RemoveParameterFromNodeResultSuccess()
+            self.remove_results.append(result)
+            return result
         raise AssertionError(f"Unexpected retained request: {request!r}")
 
     @contextmanager
-    def installed(self):
+    def installed(self, *, observe_native_removals=True):
         names = (
             "griptape_nodes",
             "griptape_nodes.retained_mode",
@@ -239,9 +357,15 @@ class FakeRetainedHost:
         modules[names[5]].GriptapeNodes = SimpleNamespace(
             handle_request=self.handle_request,
             NodeManager=lambda: self,
-            EventManager=lambda: SimpleNamespace(event_loop=self.loop),
+            EventManager=lambda: (
+                self.event_manager if self.supports_dispatch_hooks else self.legacy_event_manager
+            ),
         )
         with patch.dict(sys.modules, modules), patch.object(library, "ParameterList", ImportList):
+            if observe_native_removals:
+                ensure_observers = getattr(library, "_ensure_import_child_removal_observers", None)
+                if callable(ensure_observers):
+                    ensure_observers(self.target)
             yield self
 
 
@@ -343,6 +467,309 @@ class ImportChildCleanupRegression(unittest.TestCase):
         self.target.parameters.pop(self.names[1])
         with self.host.installed():
             self.assertFalse(self.remove(self.names[1]))
+        self.assertEqual(self.mutations(), [])
+
+    def test_missing_child_sdk_lookup_failure_is_an_idempotent_noop(self):
+        self.target.raise_for_missing_parameter = True
+        self.host.incoming.pop(1)
+        self.host.forget_child(self.names[1])
+        with self.host.installed():
+            self.assertFalse(self.remove(self.names[1]))
+            self.assertFalse(self.remove(self.names[1]))
+        self.assertEqual(self.mutations(), [])
+        self.assert_survivors()
+
+    def test_duplicate_disconnect_callbacks_remove_exact_child_once(self):
+        child = self.target.children[1]
+        self.host.incoming.pop(1)
+        self.target.parameter_values[child.name] = []
+        with self.host.installed():
+            for _ in range(2):
+                library.HMBImageAssetLibrary.after_incoming_connection_removed(
+                    self.target, self.host.nodes["source_b"], Payload(name="IMAGE_OUT"), child
+                )
+            self.host.loop.drain()
+        self.assertEqual(self.mutations(), [("remove", child.name)])
+        self.assertEqual(len(self.host.remove_results), 1)
+        self.assertIsInstance(self.host.remove_results[0], RemoveParameterFromNodeResultSuccess)
+        self.assert_survivors()
+
+    def test_deferred_cleanup_preserves_reconnected_child_and_latest_media(self):
+        child = self.target.children[1]
+        old_edge = self.host.incoming.pop(1)
+        self.target.parameter_values[child.name] = []
+        with self.host.installed(), patch.object(library, "_diagnostic_warning"):
+            library.HMBImageAssetLibrary.after_incoming_connection_removed(
+                self.target, self.host.nodes["source_b"], Payload(name="IMAGE_OUT"), child
+            )
+            self.host.incoming.insert(1, old_edge)
+            new_image = "https://example.test/reconnected-image.png"
+            self.target.parameter_values[child.name] = new_image
+            self.host.nodes["source_b"].parameter_output_values["IMAGE_OUT"] = new_image
+            self.host.loop.drain()
+        self.assertEqual(self.mutations(), [])
+        self.assertEqual([p.name for p in self.target.children], self.names)
+        self.assertEqual(self.target.parameter_values[child.name], new_image)
+        self.assertEqual(self.target.state, self.state)
+
+    def test_deferred_cleanup_does_not_mutate_a_stale_node_owner(self):
+        child = self.target.children[1]
+        self.host.incoming.pop(1)
+        self.target.parameter_values[child.name] = []
+        with self.host.installed():
+            library.HMBImageAssetLibrary.after_incoming_connection_removed(
+                self.target, self.host.nodes["source_b"], Payload(name="IMAGE_OUT"), child
+            )
+            self.target._scan_owner_is_current = lambda: False
+            self.host.loop.drain()
+        self.assertEqual(self.mutations(), [])
+        self.assertEqual([p.name for p in self.target.children], self.names)
+        self.assertEqual(self.target.state, self.state)
+
+    def test_native_deletion_wins_before_empty_child_remove_request(self):
+        self.host.incoming.pop(1)
+        self.target.parameter_values[self.names[1]] = []
+        self.host.before_remove = lambda: self.host.forget_child(self.names[1])
+        with self.host.installed():
+            self.assertFalse(self.remove(self.names[1]))
+        self.assertEqual(self.mutations(), [("remove", self.names[1])])
+        self.assertIsInstance(self.host.remove_results[0], RemoveParameterFromNodeResultFailure)
+        self.assert_survivors()
+
+    def test_native_remove_during_nested_disconnect_never_reenters_child_deletion(self):
+        self.host.invoke_removal_hook = True
+        self.host.drain_during_native_remove = True
+        with self.host.installed():
+            result = self.host.handle_request(RemoveParameterFromNodeRequest(
+                node_name=self.target.name, parameter_name=self.names[1]
+            ))
+            self.host.loop.drain()
+        self.assertIsInstance(result, RemoveParameterFromNodeResultSuccess)
+        self.assertEqual(self.mutations(), [("remove", self.names[1]), ("delete", self.names[1])])
+        self.assertEqual(len(self.host.remove_results), 1)
+        self.assertEqual(self.host.loop.pending, [])
+        self.assert_survivors()
+
+    def test_successful_native_removal_makes_late_duplicate_requests_noops(self):
+        self.host.invoke_removal_hook = True
+        with self.host.installed():
+            request = RemoveParameterFromNodeRequest(
+                node_name=self.target.name, parameter_name=self.names[1]
+            )
+            self.assertIsInstance(self.host.handle_request(request), RemoveParameterFromNodeResultSuccess)
+            self.host.loop.drain()
+            for _ in range(2):
+                self.assertIsInstance(self.host.handle_request(request), RemoveParameterFromNodeResultSuccess)
+        self.assertEqual(self.mutations(), [("remove", self.names[1]), ("delete", self.names[1])])
+        self.assertEqual(len(self.host.remove_results), 1)
+        self.assert_survivors()
+
+    def test_successful_owned_cleanup_makes_late_duplicate_request_a_noop(self):
+        with self.host.installed():
+            self.retire()
+            result = self.host.handle_request(RemoveParameterFromNodeRequest(
+                node_name=self.target.name, parameter_name=self.names[1]
+            ))
+        self.assertIsInstance(result, RemoveParameterFromNodeResultSuccess)
+        self.assertEqual(self.mutations(), [("delete", self.names[1]), ("remove", self.names[1])])
+        self.assertEqual(len(self.host.remove_results), 1)
+        self.assert_survivors()
+
+    def test_unknown_child_and_aggregate_native_failures_are_not_intercepted(self):
+        with self.host.installed():
+            for name in (f"{IMPORT}_ParameterListUniqueParamID_never_seen", IMPORT):
+                self.assertIsInstance(self.host.handle_request(RemoveParameterFromNodeRequest(
+                    node_name=self.target.name, parameter_name=name
+                )), RemoveParameterFromNodeResultFailure)
+        self.assertEqual([p.name for p in self.target.children], self.names)
+        self.assertIs(self.target.parameters[IMPORT], self.target.parent)
+        self.assertEqual(self.target.state, self.state)
+
+    def test_foreign_child_removal_does_not_authorize_its_late_duplicate(self):
+        foreign = Child("foreign", parent="OTHER_INPUT")
+        self.target.parameters[foreign.name] = foreign
+        with self.host.installed():
+            request = RemoveParameterFromNodeRequest(
+                node_name=self.target.name, parameter_name=foreign.name
+            )
+            self.assertIsInstance(self.host.handle_request(request), RemoveParameterFromNodeResultSuccess)
+            self.assertIsInstance(self.host.handle_request(request), RemoveParameterFromNodeResultFailure)
+        self.assertEqual([p.name for p in self.target.children], self.names)
+        self.assertEqual(self.target.state, self.state)
+
+    def test_native_result_before_delayed_post_still_protects_late_duplicate(self):
+        self.host.invoke_removal_hook = True
+        self.host.defer_post_hooks = True
+        with self.host.installed():
+            first = RemoveParameterFromNodeRequest(
+                node_name=self.target.name, parameter_name=self.names[1]
+            )
+            self.assertIsInstance(self.host.handle_request(first), RemoveParameterFromNodeResultSuccess)
+            state = self.target._hmb_import_child_removal_state
+            self.assertIn(id(first), state["active"])
+            self.assertNotIn(self.names[1], state["retired"])
+            duplicate = RemoveParameterFromNodeRequest(
+                node_name=self.target.name, parameter_name=self.names[1]
+            )
+            self.assertIsInstance(self.host.handle_request(duplicate), RemoveParameterFromNodeResultSuccess)
+            self.host.drain_post_hooks(reverse=True)
+            self.host.loop.drain()
+        self.assertEqual(state["active"], {})
+        self.assertIn(self.names[1], state["retired"])
+        self.assertEqual(self.mutations(), [("remove", self.names[1]), ("delete", self.names[1])])
+        self.assertEqual(len(self.host.remove_results), 1)
+        self.assert_survivors()
+
+    def test_out_of_order_posts_release_only_their_matching_native_request(self):
+        self.host.invoke_removal_hook = True
+        self.host.defer_post_hooks = True
+        with self.host.installed():
+            first = RemoveParameterFromNodeRequest(
+                node_name=self.target.name, parameter_name=self.names[1]
+            )
+            second = RemoveParameterFromNodeRequest(
+                node_name=self.target.name, parameter_name=self.names[2]
+            )
+            self.assertIsInstance(self.host.handle_request(first), RemoveParameterFromNodeResultSuccess)
+            self.assertIsInstance(self.host.handle_request(second), RemoveParameterFromNodeResultSuccess)
+            state = self.target._hmb_import_child_removal_state
+            self.assertEqual(set(state["active"]), {id(first), id(second)})
+            callback, request, result = self.host.pending_post_hooks.pop()
+            callback(request, result)
+            self.assertEqual(set(state["active"]), {id(first)})
+            self.assertIn(self.names[2], state["retired"])
+            self.assertNotIn(self.names[1], state["retired"])
+            for name in (self.names[1], self.names[2]):
+                self.assertIsInstance(self.host.handle_request(RemoveParameterFromNodeRequest(
+                    node_name=self.target.name, parameter_name=name
+                )), RemoveParameterFromNodeResultSuccess)
+            self.host.drain_post_hooks(reverse=True)
+            self.host.loop.drain()
+        self.assertEqual(state["active"], {})
+        self.assertEqual(set(state["retired"]), {self.names[1], self.names[2]})
+        self.assertEqual(len(self.host.remove_results), 2)
+        self.assertEqual([p.name for p in self.target.children], [self.names[0]])
+        self.assertEqual([e.source_node_name for e in self.host.incoming], ["source_a"])
+        self.assertEqual(self.target.state, self.state)
+
+    def test_reused_child_uuid_cannot_inherit_an_old_success_after_new_failure(self):
+        with self.host.installed():
+            old_request = RemoveParameterFromNodeRequest(
+                node_name=self.target.name, parameter_name=self.names[1]
+            )
+            self.assertIsInstance(self.host.handle_request(old_request), RemoveParameterFromNodeResultSuccess)
+            state = self.target._hmb_import_child_removal_state
+            self.assertIn(self.names[1], state["retired"])
+            replacement = Child("b")
+            self.target.children.insert(1, replacement)
+            self.target.parameters[replacement.name] = replacement
+            self.target.parameter_values[replacement.name] = []
+            # The new generation disappears before its native request resolves;
+            # that request reports failure, not a successful removal proof.
+            self.host.before_remove = lambda: self.host.forget_child(replacement.name)
+            failed_request = RemoveParameterFromNodeRequest(
+                node_name=self.target.name, parameter_name=replacement.name
+            )
+            self.assertIsInstance(self.host.handle_request(failed_request), RemoveParameterFromNodeResultFailure)
+            self.assertEqual(state["active"], {})
+            self.assertNotIn(replacement.name, state["retired"])
+            self.assertIsInstance(self.host.handle_request(RemoveParameterFromNodeRequest(
+                node_name=self.target.name, parameter_name=replacement.name
+            )), RemoveParameterFromNodeResultFailure)
+        self.assertEqual(len(self.host.remove_results), 3)
+        self.assert_survivors()
+
+    def test_old_success_post_cannot_retire_a_new_failed_child_generation(self):
+        self.host.defer_post_hooks = True
+        with self.host.installed():
+            old_request = RemoveParameterFromNodeRequest(
+                node_name=self.target.name, parameter_name=self.names[1]
+            )
+            self.assertIsInstance(self.host.handle_request(old_request), RemoveParameterFromNodeResultSuccess)
+            state = self.target._hmb_import_child_removal_state
+            replacement = Child("b")
+            self.target.children.insert(1, replacement)
+            self.target.parameters[replacement.name] = replacement
+            self.target.parameter_values[replacement.name] = []
+            self.host.before_remove = lambda: self.host.forget_child(replacement.name)
+            failed_request = RemoveParameterFromNodeRequest(
+                node_name=self.target.name, parameter_name=replacement.name
+            )
+            self.assertIsInstance(self.host.handle_request(failed_request), RemoveParameterFromNodeResultFailure)
+            # Resolve the new failure first while the old success post is still
+            # detached. Its old active token cannot authorize the new UUID use.
+            callback, request, result = self.host.pending_post_hooks.pop()
+            self.assertIs(request, failed_request)
+            callback(request, result)
+            self.assertEqual(set(state["active"]), {id(old_request)})
+            self.assertIsInstance(self.host.handle_request(RemoveParameterFromNodeRequest(
+                node_name=self.target.name, parameter_name=replacement.name
+            )), RemoveParameterFromNodeResultFailure)
+            self.host.drain_post_hooks(reverse=True)
+            self.assertEqual(state["active"], {})
+            self.assertNotIn(replacement.name, state["retired"])
+            self.assertIsInstance(self.host.handle_request(RemoveParameterFromNodeRequest(
+                node_name=self.target.name, parameter_name=replacement.name
+            )), RemoveParameterFromNodeResultFailure)
+            self.host.drain_post_hooks()
+        self.assertEqual(len(self.host.remove_results), 4)
+        self.assert_survivors()
+
+    def test_child_replaced_during_connection_snapshot_is_preserved(self):
+        self.host.incoming.pop(1)
+        self.target.parameter_values[self.names[1]] = []
+        replacement = Child("b")
+
+        def replace_child():
+            self.target.children[1] = replacement
+            self.target.parameters[replacement.name] = replacement
+            self.target.parameter_values[replacement.name] = "https://example.test/newer-local-child.png"
+
+        self.host.after_list = replace_child
+        with self.host.installed():
+            self.assertFalse(self.remove(self.names[1]))
+        self.assertEqual(self.mutations(), [])
+        self.assertIs(self.target.children[1], replacement)
+        self.assertEqual(self.target.parameter_values[replacement.name], "https://example.test/newer-local-child.png")
+        self.assertEqual(self.target.state, self.state)
+
+    def test_older_sdk_without_dispatch_hooks_keeps_native_removal_safe(self):
+        self.host.supports_dispatch_hooks = False
+        self.host.invoke_removal_hook = True
+        self.host.drain_during_native_remove = True
+        with self.host.installed():
+            result = self.host.handle_request(RemoveParameterFromNodeRequest(
+                node_name=self.target.name, parameter_name=self.names[1]
+            ))
+            self.host.loop.drain()
+        self.assertIsInstance(result, RemoveParameterFromNodeResultSuccess)
+        self.assertEqual(self.host.loop.pending, [])
+        self.assertEqual(self.mutations(), [("remove", self.names[1]), ("delete", self.names[1])])
+        self.assertEqual(len(self.host.remove_results), 1)
+        self.assert_survivors()
+
+    def test_older_sdk_keeps_explicit_registered_import_cleanup(self):
+        self.host.supports_dispatch_hooks = False
+        self.host.invoke_removal_hook = True
+        with self.host.installed():
+            self.retire()
+            self.host.loop.drain()
+        self.assertEqual(self.mutations(), [("delete", self.names[1]), ("remove", self.names[1])])
+        self.assert_survivors()
+
+    def test_observer_ensure_is_idempotent_and_finalizer_keeps_unrelated_hooks(self):
+        sentinel_pre = lambda request, context: None
+        sentinel_post = lambda request, result: None
+        self.host.event_manager.add_pre_dispatch_hook(sentinel_pre)
+        self.host.event_manager.add_post_dispatch_hook(RemoveParameterFromNodeRequest, sentinel_post)
+        with self.host.installed():
+            for _ in range(3):
+                state = library._ensure_import_child_removal_observers(self.target)
+            self.assertEqual(len(self.host.event_manager.pre_hooks), 2)
+            self.assertEqual(len(self.host.event_manager.post_hooks[RemoveParameterFromNodeRequest]), 2)
+            state["finalizer"]()
+        self.assertEqual(self.host.event_manager.pre_hooks, [sentinel_pre])
+        self.assertEqual(self.host.event_manager.post_hooks[RemoveParameterFromNodeRequest], [sentinel_post])
         self.assertEqual(self.mutations(), [])
 
     def test_connected_child_cannot_be_removed(self):

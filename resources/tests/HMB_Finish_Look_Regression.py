@@ -140,6 +140,8 @@ else:
 
 for field, value in (
     (("beauty", "saturation"), float("nan")),
+    (("beauty", "saturation"), 10**1000),
+    (("beauty", "saturation"), -(10**1000)),
     (("beauty", "soften_shadows"), 1.01),
     (("beauty", "brightness"), -1),
     (("beauty", "reduce_shine"), 1.01),
@@ -676,6 +678,20 @@ assert reentrant_node._hmb_finish_live_values[target.FINISH_LOOK_STATE_OUTPUT_PA
 assert [value for name, value in reentrant_publications if name == target.FINISH_LOOK_OUTPUT_PARAMETER_NAME] == [
     reentrant_node.parameter_output_values[target.FINISH_LOOK_OUTPUT_PARAMETER_NAME]
 ]
+
+# A saved/imported widget can contain a JSON integer too large for float.
+# Reject it through the normal UI lifecycle and retain the last valid look.
+overflow_node = target.HMBFinishLookLibrary(name="Finish Look Oversized Numeric State")
+overflow_before = copy.deepcopy(overflow_node._widget_state)
+overflow_state = copy.deepcopy(overflow_before)
+overflow_state["finish_look"]["beauty"]["brightness"] = 10**1000
+restored_state = overflow_node.before_value_set(
+    parameter_map(overflow_node)[target.WIDGET_PARAMETER_NAME], overflow_state
+)
+assert restored_state == overflow_before
+assert overflow_node._widget_state == overflow_before
+assert overflow_node._remote_status["status"] == "rejected"
+assert overflow_node._remote_status["code"] == "invalid_ui_state"
 
 print(
     "HMB Finish Look regression: PASS "

@@ -19,6 +19,52 @@ function bridgeRegistry() {
   return root[HMB_IMAGE_ASSET_THUMBNAIL_BRIDGE_REGISTRY_KEY];
 }
 
+function hasConsumers(entry) {
+  return Boolean(
+    typeof entry?.consumer === "function"
+    || typeof entry?.catalogConsumer === "function"
+    || (entry?.consumers instanceof Map && entry.consumers.size)
+    || (entry?.catalogConsumers instanceof Map && entry.catalogConsumers.size),
+  );
+}
+
+function deliverToConsumers(entry, catalog, value) {
+  const consumers = catalog ? entry?.catalogConsumers : entry?.consumers;
+  const legacy = catalog ? entry?.catalogConsumer : entry?.consumer;
+  const delivered = new Set();
+  let firstError;
+  let hasError = false;
+  const deliver = (consumer) => {
+    if (typeof consumer !== "function" || delivered.has(consumer)) return;
+    delivered.add(consumer);
+    try { consumer(value); } catch (error) {
+      if (!hasError) { firstError = error; hasError = true; }
+    }
+  };
+  deliver(legacy);
+  if (consumers instanceof Map) {
+    for (const [token, item] of Array.from(consumers.entries())) {
+      if (consumers.get(token) !== item) continue;
+      deliver(catalog ? item.consumer : item);
+    }
+  }
+  if (hasError) throw firstError;
+  return delivered.size > 0;
+}
+
+function wakeCatalogConsumers(entry) {
+  const wakes = new Set();
+  if (typeof entry?.catalogWake === "function") wakes.add(entry.catalogWake);
+  if (entry?.catalogConsumers instanceof Map) {
+    for (const item of entry.catalogConsumers.values()) {
+      if (typeof item.wake === "function") wakes.add(item.wake);
+    }
+  }
+  for (const wake of wakes) {
+    try { wake(); } catch (_error) {}
+  }
+}
+
 function presentationRegistry() {
   const root = typeof globalThis !== "undefined" ? globalThis : null;
   if (!root) return null;
@@ -173,10 +219,7 @@ export default function HMBImageAssetThumbnailPatchBridgeWidget(container, props
     if (!resultKey || resultKey === deliveredResultKey) return false;
     const current = registry?.get(runtimeId) || {};
     if (operation === "hydrate") rememberThumbnailResult(value);
-    const consumer = operation === "catalog_probe"
-      ? current.catalogConsumer
-      : current.consumer;
-    if (typeof consumer !== "function") {
+    if (!deliverToConsumers(current, operation === "catalog_probe", value)) {
       // A result can race the main widget mount/remount. Retain one bounded
       // envelope; the consumer validates request/context/revision before use.
       const pendingKey = operation === "catalog_probe"
@@ -186,15 +229,19 @@ export default function HMBImageAssetThumbnailPatchBridgeWidget(container, props
       deliveredResultKey = resultKey;
       return false;
     }
-    consumer(value);
     deliveredResultKey = resultKey;
     const pendingKey = operation === "catalog_probe"
         ? "catalogPendingResult"
         : "pendingResult";
     if (current[pendingKey]) {
-      const withoutPending = { ...current };
-      delete withoutPending[pendingKey];
-      registry?.set(runtimeId, withoutPending);
+      // A consumer may synchronously replace the bridge or enqueue a newer
+      // envelope. Retire only the exact envelope on the current owner entry.
+      const latest = registry?.get(runtimeId);
+      if (latest?.[pendingKey] === current[pendingKey]) {
+        const withoutPending = { ...latest };
+        delete withoutPending[pendingKey];
+        registry?.set(runtimeId, withoutPending);
+      }
     }
     return true;
   };
@@ -209,7 +256,7 @@ export default function HMBImageAssetThumbnailPatchBridgeWidget(container, props
           dispatch: _dispatch,
           ...consumerEntry
         } = prior;
-        if (consumerEntry.consumer || consumerEntry.catalogConsumer) {
+        if (hasConsumers(consumerEntry)) {
           registry.set(runtimeId, consumerEntry);
         }
         else registry.delete(runtimeId);
@@ -219,7 +266,7 @@ export default function HMBImageAssetThumbnailPatchBridgeWidget(container, props
     if (runtimeId && registry) {
       const prior = registry.get(runtimeId) || {};
       registry.set(runtimeId, { ...prior, bridgeToken: token, dispatch });
-      try { prior.catalogWake?.(); } catch (_error) {}
+      wakeCatalogConsumers(prior);
     }
     deliverResult(value);
   };
@@ -233,7 +280,7 @@ export default function HMBImageAssetThumbnailPatchBridgeWidget(container, props
         dispatch: _dispatch,
         ...consumerEntry
       } = current;
-      if (consumerEntry.consumer || consumerEntry.catalogConsumer) {
+      if (hasConsumers(consumerEntry)) {
         registry.set(runtimeId, consumerEntry);
       } else registry.delete(runtimeId);
     }

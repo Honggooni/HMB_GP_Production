@@ -331,7 +331,10 @@ def _number(
 ) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise FinishLookValidationError(f"{field} must be numeric.")
-    result = float(value)
+    try:
+        result = float(value)
+    except OverflowError as exc:
+        raise FinishLookValidationError(f"{field} must be finite.") from exc
     if not math.isfinite(result):
         raise FinishLookValidationError(f"{field} must be finite.")
     if minimum is not None and result < minimum:
@@ -552,7 +555,11 @@ def compile_beauty_prompt(state: Mapping[str, Any]) -> str:
         )
     parts.append(
         "Preserve a clean, natural, polished character appearance with stable color fidelity and intact "
-        "local detail. Every Character Beauty control in this block is character-only and must not spill, "
+        "local detail under the authored color and brightness adjustments. Retain facial structure, "
+        "feature placement, proportions, silhouette, material boundaries, markings, and asymmetries "
+        "through the resolved expression, deformation, perspective, and occlusion. Keep subject "
+        "animation and camera movement on their resolved timing; character-surface soft-focus "
+        "diffusion changes optical treatment only. Every Character Beauty control in this block is character-only and must not spill, "
         "feather, or propagate beyond the character matte into the background or environment."
     )
     return "CHARACTER BEAUTY — CHARACTER-MATTE-ONLY SCOPE\n" + join_sentences(parts)

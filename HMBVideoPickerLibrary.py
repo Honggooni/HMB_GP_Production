@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import uuid
+import zlib
 from dataclasses import dataclass
 from contextlib import contextmanager, suppress
 from fractions import Fraction
@@ -232,6 +233,7 @@ MAX_PICKER_VIDEO_ASSETS = (
 VIDEO_THUMBNAIL_WIDTH = 320
 VIDEO_THUMBNAIL_HEIGHT = 180
 VIDEO_THUMBNAIL_TIMEOUT_SECONDS = 20.0
+VIDEO_IMPORT_METADATA_TIMEOUT_SECONDS = 3.0
 # StaticFilesManager URLs belong to one Python/static-server lifetime.  The
 # token is serialized beside each URL so a workflow reopened by a later engine
 # can discard only that process-local URL while retaining all durable media and
@@ -244,6 +246,13 @@ _VIDEO_THUMBNAIL_SOURCE_LOCKS: Dict[str, threading.Lock] = {}
 _VIDEO_THUMBNAIL_DECODE_SLOTS = threading.BoundedSemaphore(2)
 _VIDEO_THUMBNAIL_FFMPEG: Optional[Path] = None
 _VIDEO_THUMBNAIL_FFMPEG_RESOLVED = False
+_VIDEO_MEDIA_CACHE_LOCK = threading.RLock()
+_VIDEO_METADATA_SOURCE_LOCKS: Dict[str, threading.Lock] = {}
+_VIDEO_METADATA_PROBE_SLOTS = threading.BoundedSemaphore(2)
+VIDEO_MEDIA_CACHE_SCHEMA = "hmb-video-media-cache-v2"
+VIDEO_MEDIA_SOURCE_SAMPLE_BYTES = 64 * 1024
+VIDEO_MEDIA_CACHE_MAX_ENTRIES = 512
+VIDEO_MEDIA_CACHE_MAX_BYTES = 256 * 1024 * 1024
 PICKER_DEFAULT_WORKSPACE_UUID = "00000000-0000-4000-8000-000000000001"
 VIDEO_REFERENCE_CAPABILITY_SCHEMA = "hmb-video-reference-capabilities"
 VIDEO_REFERENCE_CAPABILITY_VERSION = 1
@@ -7721,16 +7730,18 @@ def _assert_picker_workspace_capacity(
 
 
 def _video_import_source_key(value: Any) -> str:
-    """Return a stable same-file key for user-imported MP4 provenance."""
+    """Compare already-resolved provenance without filesystem I/O.
+
+    The import worker resolves and validates the actual source before it is
+    stored. Catalog comparisons also run while committing UI state, where a
+    second Path.resolve() could wait on an unavailable UNC server.
+    """
 
     text = _clean(value)
     if not text:
         return ""
-    try:
-        text = str(Path(text).expanduser().resolve(strict=False))
-    except Exception:
-        pass
-    return os.path.normcase(os.path.normpath(text)).replace("\\", "/")
+    text = os.path.expandvars(os.path.expanduser(text))
+    return os.path.normcase(os.path.abspath(text)).replace("\\", "/")
 
 
 def _picker_workspace_imported_asset(
@@ -10885,19 +10896,159 @@ def _resolved_video_asset_path(value: Any) -> Optional[Path]:
 
 
 def _video_thumbnail_signature(path: Path) -> str:
-    """Return a durable source signature without retaining the local path."""
+    """Hash path/stat plus bounded content; no local path is persisted.
+
+    Files up to 128 KiB are hashed completely, larger files use their first
+    and last 64 KiB. This is a partial-content cache identity, not a full MP4
+    integrity hash; structural/media publication checks remain independent.
+    """
 
     try:
         resolved = path.resolve()
         details = resolved.stat()
+        size = int(details.st_size)
+        with resolved.open("rb") as handle:
+            if size <= VIDEO_MEDIA_SOURCE_SAMPLE_BYTES * 2:
+                sample = b"full|" + handle.read(VIDEO_MEDIA_SOURCE_SAMPLE_BYTES * 2)
+            else:
+                sample = b"head-tail|" + handle.read(VIDEO_MEDIA_SOURCE_SAMPLE_BYTES)
+                handle.seek(size - VIDEO_MEDIA_SOURCE_SAMPLE_BYTES)
+                sample += handle.read(VIDEO_MEDIA_SOURCE_SAMPLE_BYTES)
+        after = resolved.stat()
+        if (after.st_size, after.st_mtime_ns) != (details.st_size, details.st_mtime_ns):
+            return ""
         signature_text = "|".join((
             str(resolved).replace("\\", "/").casefold(),
             str(int(details.st_size)),
             str(int(details.st_mtime_ns)),
+            hashlib.sha256(sample).hexdigest(),
         ))
     except Exception:
         return ""
     return hashlib.sha256(signature_text.encode("utf-8")).hexdigest()[:24]
+
+
+def _video_media_cache_path(signature: str, kind: str) -> Optional[Path]:
+    """Cache bytes/facts only; static-server URLs never survive a runtime."""
+    if not re.fullmatch(r"[0-9a-f]{24}", signature) or kind not in {"poster", "metadata"}:
+        return None
+    root = _clean(os.environ.get("HMB_VIDEO_MEDIA_CACHE_DIR"))
+    if not root:
+        root = str(Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+                   / "HMB_GP_Production" / "Cache" / "video-media-v2")
+    key = hashlib.sha256(
+        f"{VIDEO_MEDIA_CACHE_SCHEMA}|{VIDEO_THUMBNAIL_WIDTH}x{VIDEO_THUMBNAIL_HEIGHT}|{signature}".encode()
+    ).hexdigest()
+    return Path(root) / f"{key}.{'png' if kind == 'poster' else 'json'}"
+
+
+def _valid_video_poster_bytes(value: bytes) -> bool:
+    if not (24 <= len(value) <= 8 * 1024 * 1024
+            and value.startswith(b"\x89PNG\r\n\x1a\n")
+            and value[12:16] == b"IHDR"
+            and int.from_bytes(value[16:20], "big") == VIDEO_THUMBNAIL_WIDTH
+            and int.from_bytes(value[20:24], "big") == VIDEO_THUMBNAIL_HEIGHT):
+        return False
+    offset, has_data = 8, False
+    while offset + 12 <= len(value):
+        length = int.from_bytes(value[offset:offset + 4], "big")
+        end = offset + 12 + length
+        if end > len(value):
+            return False
+        kind = value[offset + 4:offset + 8]
+        data = value[offset + 8:offset + 8 + length]
+        crc = int.from_bytes(value[offset + 8 + length:end], "big")
+        if zlib.crc32(kind + data) != crc:
+            return False
+        if kind == b"IDAT":
+            has_data = has_data or bool(data)
+        if kind == b"IEND":
+            return has_data and length == 0 and end == len(value)
+        offset = end
+    return False
+
+
+def _read_video_media_cache(signature: str, kind: str) -> Any:
+    path = _video_media_cache_path(signature, kind)
+    if path is None:
+        return None
+    try:
+        limit = 8 * 1024 * 1024 if kind == "poster" else 64 * 1024
+        if not 0 < path.stat().st_size <= limit:
+            return None
+        data = path.read_bytes()
+        if kind == "poster":
+            return data if _valid_video_poster_bytes(data) else None
+        payload = json.loads(data)
+        if (payload.get("schema") == VIDEO_MEDIA_CACHE_SCHEMA
+                and payload.get("source_signature") == signature
+                and isinstance(payload.get("metadata"), dict)):
+            metadata = payload["metadata"]
+            # Persist only ffprobe facts, never URL/path or caller-authored data.
+            allowed = {"width", "height", "codec", "color_space", "frame_rate",
+                       "duration_seconds", "file_size", "format"}
+            if metadata and set(metadata) <= allowed:
+                for field, value in metadata.items():
+                    if field in {"codec", "color_space", "format"}:
+                        if not isinstance(value, str) or not value or len(value) > 128:
+                            return None
+                    elif (isinstance(value, bool) or not isinstance(value, (int, float))
+                          or not math.isfinite(value) or value <= 0):
+                        return None
+                    elif field in {"width", "height", "file_size"} and not isinstance(value, int):
+                        return None
+                return metadata
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+        pass
+    return None
+
+
+def _write_video_media_cache(signature: str, kind: str, value: Any) -> None:
+    path = _video_media_cache_path(signature, kind)
+    if path is None or not value:
+        return
+    temporary: Optional[Path] = None
+    try:
+        data = (bytes(value) if kind == "poster" else json.dumps({
+            "schema": VIDEO_MEDIA_CACHE_SCHEMA, "source_signature": signature,
+            "metadata": value,
+        }, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8"))
+        if kind == "poster" and not _valid_video_poster_bytes(data):
+            return
+        with _VIDEO_MEDIA_CACHE_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            temporary.write_bytes(data)
+            os.replace(temporary, path)
+            # Only this cache's hash-named entries are eligible for bounded
+            # eviction. No catalog/project/source files are visited or removed.
+            entries = []
+            for item in path.parent.iterdir():
+                if re.fullmatch(r"[0-9a-f]{64}\.(?:png|json)", item.name):
+                    try:
+                        details = item.stat()
+                        entries.append((details.st_mtime_ns, details.st_size, item))
+                    except OSError:
+                        continue
+            total = sum(row[1] for row in entries)
+            remaining = len(entries)
+            for _modified, size, item in sorted(entries):
+                if remaining <= VIDEO_MEDIA_CACHE_MAX_ENTRIES and total <= VIDEO_MEDIA_CACHE_MAX_BYTES:
+                    break
+                try:
+                    item.unlink()
+                    total -= size
+                    remaining -= 1
+                except OSError:
+                    continue
+    except (OSError, ValueError, TypeError) as exc:
+        _diagnostic_exception("Optional video media cache write failed", exc)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _video_thumbnail_ffmpeg() -> Optional[Path]:
@@ -10919,7 +11070,7 @@ def _video_asset_thumbnail_url(
 ) -> tuple[str, str]:
     """Decode and publish one cached 320x180 PNG poster for a local video.
 
-    Cache identity follows file path, size, and mtime. Workers for the same
+    Cache identity follows file path, size, mtime and bounded content. Workers for the same
     source share one lock; two different sources may decode concurrently.
     Static-file publication and cache mutation remain serialized.
     Failures are non-fatal because the video card and playback URL remain the
@@ -10963,57 +11114,56 @@ def _video_asset_thumbnail_url(
                     pass
             _VIDEO_THUMBNAIL_ATTEMPTED.add(signature)
         try:
-            ffmpeg = _video_thumbnail_ffmpeg()
-        except Exception as exc:
-            _diagnostic_exception("Video thumbnail FFmpeg lookup failed", exc)
-            release_source_lock()
-            return "", signature
-        if ffmpeg is None:
-            release_source_lock()
-            return "", signature
-        command = [
-            str(ffmpeg),
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(resolved),
-            "-map",
-            "0:v:0",
-            "-frames:v",
-            "1",
-            "-vf",
-            (
-                f"scale={VIDEO_THUMBNAIL_WIDTH}:{VIDEO_THUMBNAIL_HEIGHT}:"
-                "force_original_aspect_ratio=decrease,"
-                f"pad={VIDEO_THUMBNAIL_WIDTH}:{VIDEO_THUMBNAIL_HEIGHT}:"
-                "(ow-iw)/2:(oh-ih)/2:color=black"
-            ),
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "png",
-            "pipe:1",
-        ]
-        try:
-            with _VIDEO_THUMBNAIL_DECODE_SLOTS:
-                completed = subprocess.run(
-                    command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=VIDEO_THUMBNAIL_TIMEOUT_SECONDS,
-                    check=False,
-                    creationflags=_creation_flags(),
-                )
-            png_bytes = bytes(completed.stdout or b"")
-            if (
-                completed.returncode != 0
-                or not png_bytes.startswith(b"\x89PNG\r\n\x1a\n")
-                or len(png_bytes) > 8 * 1024 * 1024
-            ):
-                return "", signature
+            png_bytes = _read_video_media_cache(signature, "poster")
+            if png_bytes is None:
+                ffmpeg = _video_thumbnail_ffmpeg()
+                if ffmpeg is None:
+                    return "", signature
+                command = [
+                    str(ffmpeg),
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(resolved),
+                    "-map",
+                    "0:v:0",
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    (
+                        f"scale={VIDEO_THUMBNAIL_WIDTH}:{VIDEO_THUMBNAIL_HEIGHT}:"
+                        "force_original_aspect_ratio=decrease,"
+                        f"pad={VIDEO_THUMBNAIL_WIDTH}:{VIDEO_THUMBNAIL_HEIGHT}:"
+                        "(ow-iw)/2:(oh-ih)/2:color=black"
+                    ),
+                    "-f",
+                    "image2pipe",
+                    "-vcodec",
+                    "png",
+                    "pipe:1",
+                ]
+                with _VIDEO_THUMBNAIL_DECODE_SLOTS:
+                    completed = subprocess.run(
+                        command,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=VIDEO_THUMBNAIL_TIMEOUT_SECONDS,
+                        check=False,
+                        creationflags=_creation_flags(),
+                    )
+                png_bytes = bytes(completed.stdout or b"")
+                if (
+                    completed.returncode != 0
+                    or not png_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+                    or len(png_bytes) > 8 * 1024 * 1024
+                ):
+                    return "", signature
+                if _video_thumbnail_signature(resolved) != signature:
+                    return "", signature
+                _write_video_media_cache(signature, "poster", png_bytes)
             from griptape_nodes.retained_mode.griptape_nodes import (  # type: ignore
                 GriptapeNodes,
             )
@@ -11351,6 +11501,17 @@ def _find_ffprobe(ffmpeg: Optional[Path] = None) -> Optional[Path]:
             ffmpeg.with_name("ffprobe.exe"),
             ffmpeg.with_name("ffprobe"),
         ])
+    # Discover installed package files directly. The Standard library's
+    # get_ffprobe_path() may download a large executable archive during Load.
+    try:
+        import static_ffmpeg  # type: ignore
+
+        static_root = Path(static_ffmpeg.__file__).resolve().parent
+        for platform_folder in (("win32", "win64") if os.name == "nt" else ("linux", "darwin")):
+            for executable_name in (("ffprobe.exe", "ffprobe") if os.name == "nt" else ("ffprobe",)):
+                candidates.append(static_root / "bin" / platform_folder / executable_name)
+    except (ImportError, OSError, RuntimeError, TypeError):
+        pass
     for candidate in candidates:
         try:
             if candidate.is_file():
@@ -11358,6 +11519,91 @@ def _find_ffprobe(ffmpeg: Optional[Path] = None) -> Optional[Path]:
         except OSError:
             continue
     return None
+
+
+def _local_video_player_metadata(path: Path) -> Dict[str, Any]:
+    """Reuse durable facts for an unchanged file, with bounded probe workers."""
+    signature = _video_thumbnail_signature(path)
+    if not signature:
+        return _probe_local_video_player_metadata(path)
+    cached = _read_video_media_cache(signature, "metadata")
+    if isinstance(cached, dict):
+        return dict(cached)
+    with _VIDEO_MEDIA_CACHE_LOCK:
+        source_lock = _VIDEO_METADATA_SOURCE_LOCKS.setdefault(signature, threading.Lock())
+    with source_lock:
+        cached = _read_video_media_cache(signature, "metadata")
+        if isinstance(cached, dict):
+            return dict(cached)
+        with _VIDEO_METADATA_PROBE_SLOTS:
+            metadata = _probe_local_video_player_metadata(path)
+        if _video_thumbnail_signature(path) != signature:
+            return {}
+        if metadata:
+            _write_video_media_cache(signature, "metadata", metadata)
+        # Bound lock bookkeeping. Waiters keep their own strong reference.
+        with _VIDEO_MEDIA_CACHE_LOCK:
+            if len(_VIDEO_METADATA_SOURCE_LOCKS) > VIDEO_MEDIA_CACHE_MAX_ENTRIES:
+                for key, lock in list(_VIDEO_METADATA_SOURCE_LOCKS.items()):
+                    if key != signature and not lock.locked():
+                        _VIDEO_METADATA_SOURCE_LOCKS.pop(key, None)
+        return dict(metadata)
+
+
+def _probe_local_video_player_metadata(path: Path) -> Dict[str, Any]:
+    """Read optional player facts with installed tools and a bounded probe.
+
+    Source/container and publication integrity are validated independently.
+    Missing metadata remains unknown; loading a video never provisions tools
+    or invents frame rates/durations to compensate for an unavailable probe.
+    """
+    try:
+        ffprobe = _find_ffprobe(_video_thumbnail_ffmpeg())
+        if ffprobe is None:
+            return {}
+        completed = subprocess.run([
+            str(ffprobe), "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,codec_name,color_space,avg_frame_rate,r_frame_rate,duration:format=duration,size,format_name",
+            "-of", "json", str(path),
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=VIDEO_IMPORT_METADATA_TIMEOUT_SECONDS, check=False,
+            creationflags=_creation_flags())
+        if completed.returncode != 0:
+            return {}
+        payload = json.loads(completed.stdout)
+        stream = next(iter(payload.get("streams") or []), {})
+        fmt = payload.get("format") or {}
+        metadata: Dict[str, Any] = {}
+        for field in ("width", "height"):
+            value = stream.get(field)
+            if isinstance(value, int) and value > 0:
+                metadata[field] = value
+        for source, destination in (("codec_name", "codec"), ("color_space", "color_space")):
+            value = _clean(stream.get(source))
+            if value:
+                metadata[destination] = value
+        for rate in (stream.get("avg_frame_rate"), stream.get("r_frame_rate")):
+            try:
+                numeric = float(Fraction(str(rate)))
+                if math.isfinite(numeric) and numeric > 0:
+                    metadata["frame_rate"] = numeric
+                    break
+            except (ValueError, TypeError, ZeroDivisionError, OverflowError):
+                continue
+        for value, field in ((fmt.get("duration") or stream.get("duration"), "duration_seconds"),
+                             (fmt.get("size"), "file_size")):
+            try:
+                numeric = float(value)
+                if math.isfinite(numeric) and numeric > 0:
+                    metadata[field] = int(numeric) if field == "file_size" else numeric
+            except (TypeError, ValueError, OverflowError):
+                continue
+        if _clean(fmt.get("format_name")):
+            metadata["format"] = _clean(fmt["format_name"]).split(",")[0]
+        return metadata
+    except Exception as exc:
+        _diagnostic_exception("Optional local video metadata unavailable", exc)
+        return {}
 
 
 def _find_maya_project(scene_path: Path) -> Optional[Path]:
@@ -11653,6 +11899,10 @@ def _creation_flags() -> int:
 
 
 def _terminate_process(process: subprocess.Popen[Any]) -> None:
+    cancel_subscription = getattr(process, "_hmb_cancel_subscription", None)
+    if callable(cancel_subscription):
+        cancel_subscription()
+        return
     if process.poll() is not None:
         return
     if os.name == "nt":
@@ -11675,6 +11925,210 @@ def _terminate_process(process: subprocess.Popen[Any]) -> None:
         process.wait(timeout=20)
     except Exception as exc:
         _diagnostic_exception(f"Process wait after termination failed for PID {getattr(process, 'pid', 0)}", exc)
+
+
+class _MayaCaptureFlight:
+    def __init__(self, key: str, producer: Any) -> None:
+        self.key, self.producer = key, producer
+        self.done, self.abort = threading.Event(), threading.Event()
+        self.subscribers = 0
+        self.started = False
+        self.process: Any = None
+        self.root: Optional[Path] = None
+        self.return_code: Optional[int] = None
+        self.error: Optional[BaseException] = None
+        self.message = "Waiting for an available Maya capture worker."
+
+
+class _MayaCaptureSubscription:
+    """STOP releases one subscription; it never taskkills a shared PID."""
+    def __init__(self, flight: _MayaCaptureFlight) -> None:
+        self.flight = flight
+        self.cancelled = threading.Event()
+
+    @property
+    def pid(self) -> int:
+        return max(0, int(getattr(self.flight.process, "pid", 0) or 0))
+
+    def poll(self) -> Optional[int]:
+        if self.cancelled.is_set():
+            return -1
+        return self.flight.return_code if self.flight.done.is_set() else None
+
+    def _hmb_cancel_subscription(self) -> None:
+        self.cancelled.set()
+
+    kill = _hmb_cancel_subscription
+    terminate = _hmb_cancel_subscription
+
+
+class _MayaCaptureCoordinator:
+    """Host-wide bounded workers/queue and in-flight-only result retention."""
+    def __init__(self, workers: int = 1, max_queued: int = 8, max_wait: float = 300.0) -> None:
+        self.workers = max(1, min(2, int(workers)))
+        self.max_wait = max(0.1, float(max_wait))
+        self.pending: Any = queue.Queue(maxsize=max(1, min(32, int(max_queued))))
+        self.lock = threading.RLock()
+        self.flights: Dict[str, _MayaCaptureFlight] = {}
+        self.threads: List[threading.Thread] = []
+        self.active = self.peak_active = self.peak_queued = self.shared_requests = 0
+
+    def subscribe(self, key: str, producer: Any) -> _MayaCaptureSubscription:
+        with self.lock:
+            flight = self.flights.get(key)
+            if flight is not None and not flight.abort.is_set() and flight.error is None:
+                if flight.subscribers >= 128:
+                    raise RuntimeError("Maya capture has too many subscribers; retry after current captures finish.")
+                self.shared_requests += 1
+            else:
+                flight = _MayaCaptureFlight(key, producer)
+                try:
+                    self.pending.put_nowait(flight)
+                except queue.Full:
+                    raise RuntimeError("Maya capture queue is full; retry after current captures finish.") from None
+                self.flights[key] = flight
+                self.peak_queued = max(self.peak_queued, self.pending.qsize())
+            flight.subscribers += 1
+            self.threads = [worker for worker in self.threads if worker.is_alive()]
+            while len(self.threads) < self.workers:
+                worker = threading.Thread(target=self._work, name="HMBPicker-MayaCapture", daemon=True)
+                self.threads.append(worker)
+                worker.start()
+            return _MayaCaptureSubscription(flight)
+
+    def _work(self) -> None:
+        while True:
+            # Workers remain asleep on the queue. A timed retirement can race
+            # subscribe() observing is_alive(), stranding its newly queued job.
+            flight = self.pending.get()
+            try:
+                with self.lock:
+                    if flight.abort.is_set() or not flight.subscribers:
+                        continue
+                    flight.started = True
+                    self.active += 1
+                    self.peak_active = max(self.peak_active, self.active)
+                try:
+                    flight.return_code = flight.producer(flight)
+                except BaseException as exc:
+                    # Keep the reason/stale category, not the producer traceback
+                    # which contains its first node and detached watchdog.
+                    error_type = _StaleOperationError if isinstance(exc, _StaleOperationError) else RuntimeError
+                    flight.error = error_type(str(exc))
+                finally:
+                    with self.lock:
+                        self.active -= 1
+            finally:
+                with self.lock:
+                    flight.producer = None  # Completed flights must not retain their first node.
+                    flight.done.set()
+                    if flight.error is not None or flight.return_code not in (0, None):
+                        if self.flights.get(flight.key) is flight:
+                            self.flights.pop(flight.key, None)
+                    cleanup = not flight.subscribers
+                if cleanup:
+                    self._cleanup(flight)
+                self.pending.task_done()
+
+    def release(self, subscription: _MayaCaptureSubscription) -> None:
+        flight = subscription.flight
+        with self.lock:
+            flight.subscribers = max(0, flight.subscribers - 1)
+            if not flight.subscribers:
+                flight.abort.set()
+                if self.flights.get(flight.key) is flight:
+                    self.flights.pop(flight.key, None)
+                if not flight.started:
+                    # A cancelled queued job releases queue capacity promptly;
+                    # it must not occupy one of eight tickets for a long render.
+                    with self.pending.mutex:
+                        try:
+                            self.pending.queue.remove(flight)
+                        except ValueError:
+                            pass  # A worker already took it; it sees abort.
+                        else:
+                            self.pending.unfinished_tasks -= 1
+                            if not self.pending.unfinished_tasks:
+                                self.pending.all_tasks_done.notify_all()
+                            self.pending.not_full.notify()
+                            flight.producer = None
+                            flight.done.set()
+            cleanup = not flight.subscribers and flight.done.is_set()
+        if cleanup:
+            self._cleanup(flight)
+
+    @staticmethod
+    def _cleanup(flight: _MayaCaptureFlight) -> None:
+        if flight.root is not None:
+            with suppress(Exception):
+                _safe_remove_private_tree(flight.root)
+
+
+_MAYA_CAPTURE_COORDINATOR: Optional[_MayaCaptureCoordinator] = None
+_MAYA_CAPTURE_COORDINATOR_LOCK = threading.Lock()
+
+
+def _maya_capture_coordinator() -> _MayaCaptureCoordinator:
+    global _MAYA_CAPTURE_COORDINATOR
+    with _MAYA_CAPTURE_COORDINATOR_LOCK:
+        if _MAYA_CAPTURE_COORDINATOR is None:
+            def setting(name: str, default: int, lower: int, upper: int) -> int:
+                try:
+                    return max(lower, min(upper, int(os.environ.get(name, default))))
+                except (TypeError, ValueError):
+                    return default
+            _MAYA_CAPTURE_COORDINATOR = _MayaCaptureCoordinator(
+                setting("HMB_MAYA_CAPTURE_WORKERS", 1, 1, 2),
+                setting("HMB_MAYA_CAPTURE_QUEUE_LIMIT", 8, 1, 32),
+                setting("HMB_MAYA_CAPTURE_QUEUE_WAIT_SECONDS", 300, 30, 1800),
+            )
+        return _MAYA_CAPTURE_COORDINATOR
+
+
+def _rebase_capture_payload(value: Any, source_root: Path, destination_root: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _rebase_capture_payload(item, source_root, destination_root) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_rebase_capture_payload(item, source_root, destination_root) for item in value]
+    if isinstance(value, str):
+        source = str(source_root.absolute()).replace("\\", "/").rstrip("/")
+        normalized = value.replace("\\", "/")
+        if normalized.casefold() == source.casefold() or normalized.casefold().startswith(source.casefold() + "/"):
+            return str(destination_root).replace("\\", "/").rstrip("/") + normalized[len(source):]
+    return value
+
+
+def _maya_capture_identity(job: Dict[str, Any], command: Sequence[str],
+                           private_folder: Path, state: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+    scene = Path(job["scene_path"])
+    native = state.get("native_metadata") if isinstance(state.get("native_metadata"), dict) else {}
+    dependencies = _current_scene_dependency_summary(scene, native)
+    scene_fingerprint = _scene_fingerprint(scene)
+    try:
+        manifest = _read_json(Path(dependencies.get("manifest_path", "")))
+        current_manifest = manifest.get("scene_fingerprint") == scene_fingerprint
+    except (OSError, ValueError, TypeError):
+        current_manifest = False
+    environment = {key: os.environ.get(key, "") for key in (
+        "MAYA_VP2_DEVICE_OVERRIDE", "HMB_MAYA_VP2_DEVICE_OVERRIDE", "MAYA_MODULE_PATH",
+        "MAYA_PLUG_IN_PATH", "MAYA_SCRIPT_PATH", "OCIO", "MAYA_LOCATION")}
+    proof = {"scene": scene_fingerprint, "dependencies": dependencies.get("fingerprint", ""),
+             "complete": bool(dependencies.get("complete")) and current_manifest and not dependencies.get("scan_truncated", False),
+             "runner": hashlib.sha256(MAYA_RUNNER.read_bytes()).hexdigest(),
+             "markers": hashlib.sha256(MARKER_CATALOG_PATH.read_bytes()).hexdigest(),
+             "executable": _scene_fingerprint(command[0]), "environment": environment}
+    payload = {
+        "schema": "hmb-maya-capture-flight-v1",
+        "job": _rebase_capture_payload(job, private_folder, "$CAPTURE"),
+        "command": list(command), "source": proof,
+    }
+    key = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                    separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+    # Unknown/truncated dependency closure can still use the bounded worker,
+    # but cannot be shared with another request as if it had complete identity.
+    if not proof["complete"]:
+        key += ":" + uuid.uuid4().hex
+    return key, proof
 
 
 def _progress_signature(payload: Dict[str, Any]) -> str:
@@ -13157,10 +13611,10 @@ def _copy_video_to_griptape_project(
     *,
     transaction_records: Optional[List[tuple[Path, Path, bool]]] = None,
     backup_folder: Optional[Path] = None,
+    defer_metadata: bool = False,
 ) -> tuple[Any, str]:
     """Return a project artifact and optionally enroll its files in rollback."""
     try:
-        from griptape_nodes_library.utils import ffmpeg_utils  # type: ignore
         from griptape_nodes_library.utils.macro_path_utils import (  # type: ignore
             resolve_to_macro_path,
         )
@@ -13168,7 +13622,7 @@ def _copy_video_to_griptape_project(
         value = str(path.resolve())
         return _video_artifact_value(value), value
 
-    metadata = ffmpeg_utils.extract_video_player_metadata(str(path.resolve()))
+    metadata = {} if defer_metadata else _local_video_player_metadata(path)
     resolved = resolve_to_macro_path(str(path.resolve()))
     if not resolved.is_external:
         return _video_artifact_value(resolved.resolved_path, metadata), resolved.resolved_path
@@ -13572,7 +14026,11 @@ class HMBVideoPickerLibrary(DataNode):
         # overwrite another import or resurrect an ImageAsset-deleted Shot.
         self._hmb_catalog_commit_lock = threading.RLock()
         self._hmb_video_import_io_lock = threading.Lock()
+        self._hmb_video_browse_lock = threading.Lock()
         self._hmb_video_import_jobs: Dict[str, Dict[str, Any]] = {}
+        self._hmb_video_import_poster_lock = threading.Lock()
+        self._hmb_video_import_posters: Dict[str, Dict[str, Any]] = {}
+        self._hmb_video_import_poster_worker: Optional[threading.Thread] = None
         self._hmb_shot_snapshot_lock = threading.RLock()
         self._hmb_thumbnail_worker_lock = threading.Lock()
         self._hmb_thumbnail_worker: Optional[threading.Thread] = None
@@ -17723,6 +18181,7 @@ class HMBVideoPickerLibrary(DataNode):
                 1,
                 transaction_records=project_records,
                 backup_folder=backup_folder,
+                defer_metadata=True,
             )
             video_metadata = dict(getattr(project_artifact, "meta", {}) or {})
             resolved_project_video = _resolve_readable_video_reference(
@@ -18147,52 +18606,161 @@ class HMBVideoPickerLibrary(DataNode):
                 _append_activity_log(state, "WARNING", warning)
             self._write_state(state)
         self._schedule_video_removal_output_sync()
-        # The ready card is visible before poster extraction. Enrich only the
-        # exact surviving UID; a deleted card must never be appended again.
-        pending_posters: Dict[str, tuple[str, str]] = {}
+        # Import batches keep copying while optional posters decode. A slow or
+        # unreadable poster must not retain the serial import I/O lock and hold
+        # every later selected file behind it.
+        if import_job is not None:
+            self._schedule_video_import_posters(pending_records)
+        else:
+            self._publish_video_import_posters(pending_records)
+        return self._picker_state()
+
+    def _schedule_video_import_posters(self, records: Sequence[Dict[str, Any]]) -> None:
+        """Coalesce ready-card enrichment into one optional worker per node."""
+        if not records or self._hmb_node_deleted:
+            return
+        with self._hmb_video_import_poster_lock:
+            for record in records:
+                uid = _clean(record.get("video_uid"))
+                if uid:
+                    self._hmb_video_import_posters[uid] = dict(record)
+            if self._hmb_video_import_poster_worker is not None:
+                return
+            generation = self._hmb_lifecycle_generation
+
+            def enrich() -> None:
+                try:
+                    while True:
+                        with self._hmb_video_import_poster_lock:
+                            if self._hmb_node_deleted or generation != self._hmb_lifecycle_generation:
+                                self._hmb_video_import_posters.clear()
+                            if not self._hmb_video_import_posters:
+                                self._hmb_video_import_poster_worker = None
+                                return
+                            uids = list(self._hmb_video_import_posters)[:4]
+                            batch = [self._hmb_video_import_posters.pop(uid) for uid in uids]
+                        try:
+                            self._publish_video_import_posters(batch, owner_generation=generation)
+                        except Exception as exc:
+                            # A retained publication can fail after its card has
+                            # committed.  Keep serving imports queued during that
+                            # batch; exiting here strands them with no worker.
+                            _diagnostic_exception("Optional imported-video poster batch failed", exc)
+                except Exception as exc:
+                    # The playable cards have already committed successfully.
+                    _diagnostic_exception("Optional imported-video posters failed", exc)
+                finally:
+                    with self._hmb_video_import_poster_lock:
+                        if self._hmb_video_import_poster_worker is threading.current_thread():
+                            self._hmb_video_import_poster_worker = None
+
+            worker = threading.Thread(target=enrich, name="HMBPicker-ImportPosters", daemon=True)
+            self._hmb_video_import_poster_worker = worker
+            worker.start()
+
+    def _publish_video_import_posters(
+        self, records: Sequence[Dict[str, Any]], *, owner_generation: Optional[int] = None,
+    ) -> None:
+        """Enrich surviving UIDs; all file probes stay outside catalog locks."""
+        generation = self._hmb_lifecycle_generation if owner_generation is None else owner_generation
+
+        def alive() -> bool:
+            return not self._hmb_node_deleted and generation == self._hmb_lifecycle_generation
+
+        def source_identity(record: Dict[str, Any]) -> tuple[str, ...]:
+            return tuple(_clean(record.get(field)) for field in (
+                "picker_shot_uuid", "import_request_id", "project_video_path",
+                "video_path", "import_source_path",
+            ))
+
+        pending_posters: Dict[str, tuple[str, str, Dict[str, Any]]] = {}
 
         def publish_posters() -> None:
-            if not pending_posters or self._hmb_node_deleted:
+            if not pending_posters or not alive():
                 pending_posters.clear()
                 return
+            verified = {}
+            for item in self._picker_state().get("videos", []):
+                uid = _clean(item.get("video_uid"))
+                poster = pending_posters.get(uid)
+                if poster is None:
+                    continue
+                current_path = _resolved_video_asset_path(item)
+                if current_path is not None and _video_thumbnail_signature(current_path) == poster[1]:
+                    verified[uid] = (poster, source_identity(item))
             with self._hmb_catalog_state_commit():
+                if not alive():
+                    pending_posters.clear()
+                    return
                 latest = self._picker_state()
                 changed = False
+                metadata_changed = False
                 for surviving in latest.get("videos", []):
                     uid = _clean(surviving.get("video_uid"))
-                    poster = pending_posters.get(uid)
-                    if poster is None:
+                    checked = verified.get(uid)
+                    if checked is None:
                         continue
-                    url, signature = poster
-                    current_path = _resolved_video_asset_path(surviving)
-                    if (
-                        current_path is None
-                        or _video_thumbnail_signature(current_path) != signature
-                    ):
+                    poster, identity = checked
+                    url, signature, metadata = poster
+                    if source_identity(surviving) != identity:
                         continue
-                    surviving.update(
-                        thumbnail_url=url,
-                        thumbnail_runtime_id=_VIDEO_THUMBNAIL_RUNTIME_ID,
-                        thumbnail_source_signature=signature,
-                    )
+                    if metadata:
+                        metadata_changed = metadata_changed or (
+                            surviving.get("video_metadata") != metadata
+                            or surviving.get("video_metadata_source_signature") != signature
+                        )
+                        surviving["video_metadata"] = metadata
+                        surviving["video_metadata_source_signature"] = signature
+                    if url:
+                        surviving.update(
+                            thumbnail_url=url,
+                            thumbnail_runtime_id=_VIDEO_THUMBNAIL_RUNTIME_ID,
+                            thumbnail_source_signature=signature,
+                        )
                     changed = True
-                if changed and not self._hmb_node_deleted:
+                if changed and alive():
                     self._write_state(latest)
+            if metadata_changed and alive():
+                # Reuse the existing coalesced ownership-checked output worker;
+                # optional probes never run in its publication/catalog locks.
+                self._schedule_video_removal_output_sync()
             pending_posters.clear()
 
-        for record in pending_records:
-            path = _resolved_video_asset_path(record)
-            if path is None or self._hmb_node_deleted:
-                continue
+        for record in records:
+            if not alive():
+                break
             uid = _clean(record.get("video_uid"))
-            url, signature = _video_asset_thumbnail_url(path, uid)
-            if not url or not signature:
+            # A pending poster may outlive Cancel/Delete or a source rebind.
+            current = next((item for item in self._picker_state().get("videos", [])
+                            if item.get("video_uid") == uid), None)
+            if current is None or source_identity(current) != source_identity(record):
                 continue
-            pending_posters[uid] = (url, signature)
+            path = _resolved_video_asset_path(record)
+            if path is None or not alive():
+                continue
+            signature = _video_thumbnail_signature(path)
+            if not signature:
+                continue
+            try:
+                metadata = _local_video_player_metadata(path)
+            except Exception as exc:
+                _diagnostic_exception("Optional imported-video metadata failed", exc)
+                metadata = {}
+            try:
+                url, poster_signature = _video_asset_thumbnail_url(path, uid)
+                if poster_signature != signature:
+                    url = ""
+            except Exception as exc:
+                _diagnostic_exception("Optional imported-video poster failed", exc)
+                url = ""
+            if not alive() or _video_thumbnail_signature(path) != signature:
+                continue
+            if not url and not metadata:
+                continue
+            pending_posters[uid] = (url, signature, metadata)
             if len(pending_posters) >= 4:
                 publish_posters()
         publish_posters()
-        return self._picker_state()
 
     def _acknowledge_video_import_failure(
         self,
@@ -19053,10 +19621,23 @@ class HMBVideoPickerLibrary(DataNode):
                     or payload.get("file_path")
                     or payload.get("path")
                 )
-                sources = [
-                    {"source_path": source_path, "label": ""}
-                    for source_path in _choose_video_asset_files(initial_path)
-                ]
+                # Rapid clicks while PowerShell/WinForms starts should keep
+                # one native dialog instead of queuing several modal windows.
+                if not self._hmb_video_browse_lock.acquire(blocking=False):
+                    self._acknowledge_video_import_failure(
+                        action_id, "The MP4 browser is already open; finish its current selection first."
+                    )
+                    return
+                try:
+                    sources = [
+                        {"source_path": source_path, "label": ""}
+                        for source_path in _choose_video_asset_files(initial_path)
+                    ]
+                except Exception as exc:
+                    self._acknowledge_video_import_failure(action_id, exc)
+                    return
+                finally:
+                    self._hmb_video_browse_lock.release()
                 _diagnostic(f"native video selection returned: {action_id}; files={len(sources)}")
             elif isinstance(payload.get("sources"), list):
                 for raw_source in payload["sources"][:MAX_VIDEO_IMPORT_BATCH]:
@@ -19514,6 +20095,20 @@ class HMBVideoPickerLibrary(DataNode):
             if not published:
                 return
 
+            # UNC/file probes can stall even for a cached poster. Verify them
+            # before the commit lock, then compare only captured source fields
+            # against the latest card while merging.
+            verified = {}
+            identity_fields = ("picker_shot_uuid", "project_video_path", "video_path", "import_source_path")
+            for item in self._picker_state().get("videos", []):
+                uid = _clean(item.get("video_uid") or item.get("source_uid"))
+                result = published.get(uid)
+                if result is None:
+                    continue
+                local_video = _resolved_video_asset_path(item)
+                if local_video is not None and _video_thumbnail_signature(local_video) == result[1]:
+                    verified[uid] = (result, tuple(_clean(item.get(field)) for field in identity_fields))
+
             with self._hmb_catalog_state_commit():
                 if (
                     getattr(self, "_hmb_node_deleted", False)
@@ -19534,8 +20129,8 @@ class HMBVideoPickerLibrary(DataNode):
                     uid = _clean(
                         item.get("video_uid") or item.get("source_uid")
                     )
-                    result = published.get(uid)
-                    if result is None:
+                    checked = verified.get(uid)
+                    if checked is None:
                         continue
                     if (
                         _clean(item.get("thumbnail_url"))
@@ -19543,14 +20138,10 @@ class HMBVideoPickerLibrary(DataNode):
                         == _VIDEO_THUMBNAIL_RUNTIME_ID
                     ):
                         continue
-                    local_video = _resolved_video_asset_path(item)
-                    if local_video is None:
+                    result, identity = checked
+                    if tuple(_clean(item.get(field)) for field in identity_fields) != identity:
                         continue
                     url, source_signature = result
-                    if _video_thumbnail_signature(local_video) != source_signature:
-                        # The card's source changed while FFmpeg was decoding;
-                        # never attach the previous source's frame to that UID.
-                        continue
                     item.update({
                         "thumbnail_url": url,
                         "thumbnail_runtime_id": _VIDEO_THUMBNAIL_RUNTIME_ID,
@@ -20887,26 +21478,12 @@ class HMBVideoPickerLibrary(DataNode):
                 + "\n\n"
             )
             log_handle.flush()
-            process = subprocess.Popen(
-                command,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                env=env,
-                cwd=str(job_path.parent),
-                creationflags=_creation_flags(),
-            )
-            self._register_active_process(process, "Maya")
-            try:
-                return_code = self._wait_for_process_with_progress(
-                    process,
-                    progress_path,
-                    PLAYBLAST_OVERALL_TIMEOUT_SECONDS,
-                    PLAYBLAST_STALL_TIMEOUT_SECONDS,
-                    "Maya Original Preview",
-                    activity_paths=(frames_folder,),
-                )
-            finally:
-                self._clear_active_process(process)
+        return_code = self._run_shared_maya_capture(
+            job=_read_json(job_path), command=command, job_path=job_path,
+            result_path=result_path, progress_path=progress_path, log_path=log_path,
+            activity_paths=(frames_folder,), context=context, operation_label="Maya Original Preview",
+            source_state=state,
+        )
 
         self._assert_operation_current(context, "ORIGINAL PREVIEW Maya completion")
         if not result_path.is_file():
@@ -21480,6 +22057,156 @@ class HMBVideoPickerLibrary(DataNode):
         _append_activity_log(state, "INFO", state["message"])
         self._write_state(state)
 
+    def _run_shared_maya_capture(
+        self, *, job: Dict[str, Any], command: Sequence[str], job_path: Path,
+        result_path: Path, progress_path: Path, log_path: Path,
+        activity_paths: Sequence[Path], context: Optional[_OperationContext],
+        operation_label: str,
+        source_state: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        """Capture into detached staging, then copy to each surviving owner.
+
+        Native passes remain separate processes. Only requests with the same
+        complete dependency closure and complete capture job share one process;
+        unknown closures still obey the host queue without sharing results.
+        """
+        private_folder = _assert_safe_private_path(job_path.parent)
+        owner_generation = int(getattr(self, "_hmb_lifecycle_generation", 0) or 0)
+        def assert_subscriber(stage: str, subscription: Any = None) -> None:
+            self._assert_operation_current(context, stage)
+            if (getattr(self, "_hmb_node_deleted", False)
+                    or int(getattr(self, "_hmb_lifecycle_generation", 0) or 0) != owner_generation
+                    or self._hmb_cancel_requested.is_set()
+                    or (subscription is not None and subscription.cancelled.is_set())):
+                raise RuntimeError(f"{operation_label} cancelled by user or node lifecycle change.")
+        assert_subscriber(f"{operation_label} shared capture preflight")
+        state = copy.deepcopy(source_state) if isinstance(source_state, dict) else self._picker_state()
+        key, proof = _maya_capture_identity(job, command, private_folder, state)
+        coordinator = _maya_capture_coordinator()
+
+        def producer(flight: _MayaCaptureFlight) -> Optional[int]:
+            shared_root = (Path(tempfile.gettempdir()).resolve() / ".hmb_video_picker"
+                           / f"shared_capture_{uuid.uuid4().hex}")
+            _assert_safe_private_path(shared_root)
+            shared_root.mkdir(parents=True, exist_ok=False)
+            flight.root = shared_root
+            shared_job = _rebase_capture_payload(job, private_folder, shared_root)
+            shared_job_path = shared_root / job_path.relative_to(private_folder)
+            shared_result_path = shared_root / result_path.relative_to(private_folder)
+            shared_progress_path = shared_root / progress_path.relative_to(private_folder)
+            _write_json(shared_job_path, shared_job)
+            env = _maya_subprocess_environment(shared_job_path)
+            # The watchdog needs its existing timeout/output-activity semantics,
+            # but its UI/cancel authority belongs to the flight, not owner A.
+            watchdog = copy.copy(self)
+            watchdog._hmb_cancel_requested = flight.abort
+            watchdog_state = copy.deepcopy(state)
+            watchdog._picker_state = lambda: copy.deepcopy(watchdog_state)
+            def retain_progress(next_state: Dict[str, Any]) -> Dict[str, Any]:
+                watchdog_state.clear()
+                watchdog_state.update(next_state)
+                flight.message = _clean(next_state.get("message")) or flight.message
+                return next_state
+            watchdog._write_state = retain_progress
+            if flight.abort.is_set():
+                raise RuntimeError("Maya capture cancelled because all subscribers left.")
+            with (shared_root / "shared-capture.log").open("w", encoding="utf-8", errors="replace") as output:
+                output.write(_command_text(command) + "\n\n")
+                output.flush()
+                process = subprocess.Popen(list(command), stdout=output, stderr=subprocess.STDOUT,
+                                           env=env, cwd=str(shared_root), creationflags=_creation_flags())
+                flight.process = process
+                flight.message = f"{operation_label} is rendering in an isolated Maya process."
+                try:
+                    return_code = watchdog._wait_for_process_with_progress(
+                        process, shared_progress_path, PLAYBLAST_OVERALL_TIMEOUT_SECONDS,
+                        PLAYBLAST_STALL_TIMEOUT_SECONDS, operation_label,
+                        activity_paths=tuple(Path(_rebase_capture_payload(str(path), private_folder, shared_root))
+                                             for path in activity_paths),
+                    )
+                except BaseException:
+                    with suppress(Exception):
+                        if process.poll() is None:
+                            _terminate_process(process)
+                    raise
+            if flight.abort.is_set():
+                raise RuntimeError("Maya capture cancelled because all subscribers left.")
+            _unused_key, current_proof = _maya_capture_identity(job, command, private_folder, state)
+            if current_proof != proof:
+                raise _StaleOperationError("Maya capture source/dependencies changed while rendering; run READ and retry.")
+            if return_code in (0, None):
+                result = _read_json(shared_result_path) if shared_result_path.is_file() else {}
+                if not result.get("ok"):
+                    raise RuntimeError(_clean(result.get("error")) or "Maya did not write a successful capture result.")
+                # Full per-role frame/material/depth validation remains mandatory
+                # in each caller before any public catalog/file publication.
+                expected_pass = _clean(shared_job.get("capture_pass"))
+                if _clean(result.get("capture_pass")) != expected_pass:
+                    raise RuntimeError("Shared Maya capture returned a different pass.")
+            return return_code
+
+        subscription = coordinator.subscribe(key, producer)
+        flight = subscription.flight
+        registered = False
+        queued_at, last_ui_at = time.monotonic(), 0.0
+        try:
+            self._register_active_process(subscription, "Maya capture subscription")
+            registered = True
+            while not flight.done.wait(0.1):
+                assert_subscriber(f"{operation_label} shared capture wait", subscription)
+                now = time.monotonic()
+                if not flight.started and now - queued_at > coordinator.max_wait:
+                    raise RuntimeError("Maya capture queue wait timed out; retry after current captures finish.")
+                if now - last_ui_at >= 4.0:
+                    latest = self._picker_state()
+                    latest.update(message=flight.message, active_process_pid=subscription.pid)
+                    self._write_state(latest)
+                    last_ui_at = now
+            assert_subscriber(f"{operation_label} shared capture completion", subscription)
+            if flight.root is not None:
+                shared_log = flight.root / "shared-capture.log"
+                if shared_log.is_file():
+                    with log_path.open("a", encoding="utf-8", errors="replace") as output:
+                        output.write("\nHMB SHARED MAYA CAPTURE\n")
+                        with shared_log.open("r", encoding="utf-8", errors="replace") as captured:
+                            shutil.copyfileobj(captured, output)
+            if flight.error is not None:
+                if isinstance(flight.error, _StaleOperationError):
+                    raise _StaleOperationError(str(flight.error))
+                raise RuntimeError(str(flight.error)) from flight.error
+            if flight.root is None:
+                raise RuntimeError("Maya capture staging was not created.")
+            # Every node/Shot owns its own copies and cleanup registration.
+            # A failed/cancelled caller cannot remove another owner's frames.
+            for source in flight.root.rglob("*"):
+                if source.name == "shared-capture.log" or source.suffix == ".tmp":
+                    continue
+                if _is_reparse_or_symlink(source):
+                    raise RuntimeError("Maya capture staging contains a symlink/junction.")
+                relative = source.relative_to(flight.root)
+                destination = _assert_safe_private_path(private_folder / relative)
+                if not _path_is_within(destination, private_folder):
+                    raise RuntimeError("Shared capture copy escaped the subscriber staging folder.")
+                if source.is_dir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                elif source.is_file():
+                    assert_subscriber(f"{operation_label} staging copy", subscription)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if source.suffix == ".json":
+                        _write_json(destination, _rebase_capture_payload(_read_json(source), flight.root, private_folder))
+                    else:
+                        shutil.copy2(source, destination)
+            _unused_key, current_proof = _maya_capture_identity(job, command, private_folder, state)
+            if current_proof != proof:
+                raise _StaleOperationError("Maya capture source/dependencies changed before publication; run READ and retry.")
+            return flight.return_code
+        finally:
+            try:
+                if registered:
+                    self._clear_active_process(subscription)
+            finally:
+                coordinator.release(subscription)
+
     def _capture_maya_snapshot_role(
         self, *, role: str, scene_path: Path, state: Dict[str, Any],
         frame: float, binding_slot: int, job_folder: Path, log_path: Path,
@@ -21552,16 +22279,12 @@ class HMBVideoPickerLibrary(DataNode):
         with log_path.open("a", encoding="utf-8", errors="replace") as log_handle:
             log_handle.write(f"\nMAYA {role.upper()} SNAPSHOT COMMAND\n" + _command_text(command) + "\n\n")
             log_handle.flush()
-            process = subprocess.Popen(command, stdout=log_handle, stderr=subprocess.STDOUT,
-                                       env=env, cwd=str(job_folder), creationflags=_creation_flags())
-            self._register_active_process(process, "Maya")
-            try:
-                return_code = self._wait_for_process_with_progress(
-                    process, progress_path, PLAYBLAST_OVERALL_TIMEOUT_SECONDS,
-                    PLAYBLAST_STALL_TIMEOUT_SECONDS, f"Maya {role.title()} Snapshot",
-                    activity_paths=(captured_frames_folder,))
-            finally:
-                self._clear_active_process(process)
+        return_code = self._run_shared_maya_capture(
+            job=job, command=command, job_path=job_path, result_path=result_path,
+            progress_path=progress_path, log_path=log_path, activity_paths=(captured_frames_folder,),
+            context=context, operation_label=f"Maya {role.title()} Snapshot",
+            source_state=state,
+        )
         self._assert_operation_current(context, f"SNAPSHOT {role} completion")
         result = _read_json(result_path) if result_path.is_file() else {}
         if return_code not in (0, None) or not result.get("ok"):
@@ -21878,19 +22601,13 @@ class HMBVideoPickerLibrary(DataNode):
                     log_handle.write("MAYA VP2 DEVICE OVERRIDE\n" + (_clean(env.get("MAYA_VP2_DEVICE_OVERRIDE")) or "user preference") + "\n\n")
                     log_handle.flush()
                     assert_current(f"{label} isolated Maya process launch")
-                    process = subprocess.Popen(
-                        list(command), stdout=log_handle, stderr=subprocess.STDOUT,
-                        env=env, cwd=str(pass_job_path.parent), creationflags=_creation_flags(),
-                    )
-                    self._register_active_process(process, "Maya")
-                    try:
-                        return_code = self._wait_for_process_with_progress(
-                            process, pass_progress_path,
-                            PLAYBLAST_OVERALL_TIMEOUT_SECONDS, PLAYBLAST_STALL_TIMEOUT_SECONDS,
-                            f"Maya isolated {label}", activity_paths=(expected_frames,),
-                        )
-                    finally:
-                        self._clear_active_process(process)
+                return_code = self._run_shared_maya_capture(
+                    job=pass_job, command=command, job_path=pass_job_path,
+                    result_path=pass_result_path, progress_path=pass_progress_path,
+                    log_path=log_path, activity_paths=(expected_frames,), context=context,
+                    operation_label=f"Maya isolated {label}",
+                    source_state=self._operation_stage_state(context) if context is not None else None,
+                )
                 assert_current(f"{label} isolated Maya completion")
                 if evaluation_mode == "serial" and return_code is not None and native_crash(return_code):
                     warning = f"Maya {label} crashed with native exit code {return_code}; retrying only {label} with DG evaluation."

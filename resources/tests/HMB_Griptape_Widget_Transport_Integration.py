@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import inspect
 import json
 import shutil
 import sys
@@ -70,7 +71,10 @@ async def run(scene: Path, timeout_seconds: float, keep: bool) -> dict[str, Any]
 
     GriptapeNodes.EventManager().initialize_queue()
     node = picker.HMBVideoPickerLibrary(name=f"HMBVideoPickerTransport_{time.time_ns()}")
-    flow = ControlFlow(name=f"HMBTransportFlow_{time.time_ns()}")
+    flow_options = {"name": f"HMBTransportFlow_{time.time_ns()}"}
+    if "engine" in inspect.signature(ControlFlow).parameters:
+        flow_options["engine"] = GriptapeNodes.EventManager().engine
+    flow = ControlFlow(**flow_options)
     flow.add_node(node)
     GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
     GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)

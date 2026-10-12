@@ -44,6 +44,10 @@ jobs:
           $browser = node -p "require('playwright').chromium.executablePath()"
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "$browser")) { throw "Browser-test Chromium is unavailable." }
           Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_IMAGE_ASSET_TEST_BROWSER=$browser"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_IMAGE_ASSET_REQUIRE_BROWSER=1"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_COLOR_LUT_TEST_BROWSER=$browser"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_WIDGET_TEST_BROWSER=$browser"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_PROMPT_TEST_BROWSER=$browser"
           Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_PICKER_TEST_BROWSER=$browser"
           Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_PICKER_REQUIRE_BROWSER=1"
           Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_SEEDANCE_TEST_BROWSER=$browser"
@@ -108,166 +112,35 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Could not install the CI media tools." }
           ffprobe -version
           if ($LASTEXITCODE -ne 0) { throw "FFprobe is unavailable in the CI PATH." }
-      - name: Python release regressions
+          $ffmpeg = (Get-Command ffmpeg -ErrorAction Stop).Source
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Value "HMB_COLOR_LUT_TEST_FFMPEG=$ffmpeg"
+      - name: Require complete regression registration
+        shell: pwsh
+        run: python tools/audit_regression_coverage.py --check
+      - name: Python release regressions with coverage receipts
         shell: pwsh
         env:
           HMB_IMAGE_PROJECTS_ROOT: ${{ github.workspace }}
-        run: |
-          # Public CI verifies the exact bundled signed DAT and package boundary.
-          $tests = @(
-            "HMB_Color_LUT_Engine_Regression.py",
-            "HMB_Color_LUT_Node_Regression.py",
-            "HMB_Color_LUT_Routing_Regression.py",
-            "HMB_Prompt_Surface_2D_Regression.py",
-            "HMB_Agent_Failure_Diagnostic_Regression.py",
-            "HMB_Seedance_Sidecar_API_Regression.py",
-            "HMB_Seedance_New_Node_Defaults_Regression.py",
-            "HMB_Seedance_Broker_Server_Selection_Regression.py",
-            "HMB_Finish_Look_Regression.py",
-            "HMB_Finish_Look_Steps_Regression.py",
-            "HMB_Picker_Video_Tools_Regression.py",
-            "HMB_Picker_Video_Tools_Source_Lifecycle_Regression.py",
-            "HMB_Picker_Tools_Output_Path_Regression.py",
-            "HMB_Picker_Concatenate_Result_Shot_Regression.py",
-            "HMB_Picker_Edit_Delete_RoundTrip_Regression.py",
-            "HMB_VideoPicker_Shared_Maya_Async_Regression.py",
-            "HMB_VideoPicker_Shared_Maya_RoundTrip_Regression.py",
-            "HMB_Video_Tools_Engine_Regression.py",
-            "HMB_Seedance_Gateway_Recovery_Regression.py",
-            "HMB_Seedance_Error_Details_Regression.py",
-            "HMB_Seedance_Submission_Identity_Regression.py",
-              "HMB_Seedance_Native_Save_Regression.py",
-            "HMB_Seedance_Reset_Delete_Fresh_State_Regression.py",
-            "HMB_Seedance_Discarded_Workflow_Recovery_Regression.py",
-            "HMB_Four_Library_Flow_Regression.py",
-            "HMB_Three_Library_Flow_Regression.py",
-            "HMB_Agent_Policy_Integration_Regression.py",
-            "HMB_All_15_Composition_Runtime_Regression.py",
-            "HMB_Hybrid_Composition_Regression.py",
-            "HMB_Motion_Face_Safety_Regression.py",
-            "HMB_Color_Playblast_Appearance_Isolation_Regression.py",
-            "HMB_Agent_Result_Skip_Regression.py",
-            "HMB_Look_Attribute_Scope_Regression.py",
-            "HMB_Data_Only_Prompt_Security_Regression.py",
-            "HMB_Agent_Paired_Prompt_Snapshot_Regression.py",
-            "HMB_Agent_Literal_Context_Regression.py",
-            "HMB_FX_Timing_Range_Contract_Regression.py",
-            "HMB_Frame_Range_Regression.py",
-            "HMB_Optional_Frame_Range_Contract_Regression.py",
-            "HMB_Prompt_Free_Frame_Range_Contract_Regression.py",
-            "HMB_Four_Library_Generator_Neutrality_Regression.py",
-            "HMB_Real_Standard_Agent_Boundary_Regression.py",
-            "HMB_Server_Policy_Boundary_Regression.py",
-            "HMB_Signed_Policy_Hot_Update_Regression.py",
-            "HMB_Public_Release_Security_Regression.py",
-            "HMB_State_Normalization_Property_Regression.py",
-            "HMB_Image_Asset_Import_Order_Regression.py",
-            "HMB_Image_Asset_Import_Thumbnail_Async_Regression.py",
-            "HMB_Image_Asset_Project_Root_Relocation_Regression.py",
-            "HMB_Image_Asset_Staged_Loading_Regression.py",
-            "HMB_Image_Asset_Shared_Catalog_Cache_Regression.py",
-            "HMB_Image_Asset_Resolved_Selection_Regression.py",
-            "HMB_Prompt_No_Loss_Connection_Regression.py",
-            "HMB_Image_Asset_Registration_Regression.py",
-            "HMB_Image_Asset_Import_Child_Cleanup_Regression.py",
-            "HMB_Image_Asset_Disconnect_Regression.py",
-            "HMB_Image_Asset_Refresh_Cleanup_Regression.py",
-            "HMB_Prompt_Registration_Identity_Regression.py",
-            "HMB_Image_Asset_Background_Mutation_Regression.py",
-            "HMB_Image_Asset_Server_Sharing_Regression.py",
-            "HMB_Image_Asset_Process_Lock_Regression.py",
-            "HMB_Image_Asset_State_Echo_Regression.py",
-            "HMB_Image_Taxonomy_Regression.py",
-            "HMB_Cutout_Transparency_Regression.py",
-            "HMB_Depth_Companion_Regression.py",
-            "HMB_Picker_Depth_Range_Mesh_Regression.py",
-            "HMB_VideoPicker_Snapshot_Navigation_Revision_Regression.py",
-            "HMB_VideoPicker_Reliability_Regression.py",
-            "HMB_VideoPicker_Isolated_Maya_Capture_Regression.py",
-            "HMB_VideoPicker_Blender_Cross_Shot_Mask_Regression.py",
-            "HMB_VideoPicker_Generate_Terminal_Selection_Regression.py",
-            "HMB_VideoPicker_Multi_Selection_Snapshot_Regression.py",
-            "HMB_VideoPicker_Visibility_And_Recolor_Regression.py",
-            "HMB_VideoPicker_Clear_Color_Regression.py",
-            "HMB_VideoPicker_Ghost_Flat_Shader_Regression.py",
-            "HMB_Depth_Visual_Contract_Regression.py",
-            "HMB_Screen_Space_Pattern_Regression.py",
-            "HMB_Maya_Depth_Close_Focus_Regression.py",
-            "HMB_Maya_Depth_Visible_Floor_Regression.py",
-            "HMB_Maya_Runner_Performance_Regression.py",
-            "HMB_Maya_Capture_Pass_Isolation_Regression.py",
-            "HMB_Maya_Render_Layer_Isolation_Regression.py",
-            "HMB_Mouth_Card_Inner_Patch_Regression.py",
-            "HMB_Motion_Guide_Regression.py",
-            "HMB_Prompt_Field_Authority_Regression.py",
-            "HMB_Prompt_Output_Coalescing_Regression.py",
-            "HMB_Prompt_Source_Reconcile_NoOp_Regression.py",
-            "HMB_Prompt_Revision_Axis_Regression.py",
-            "HMB_Prompt_Picker_Disconnect_Restore_Regression.py",
-            "HMB_Prompt_Blender_Picker_Binding_Regression.py",
-            "HMB_Prompt_Public_Prompt_Boundary_Regression.py",
-            "HMB_Picker_Prompt_Agent_Live_Host_Regression.py",
-            "HMB_Picker_State_Compaction_Regression.py",
-            "HMB_VideoPicker_Media_Availability_Regression.py",
-            "HMB_VideoPicker_Native_Size_Migration_Regression.py",
-            "HMB_VideoPicker_Python_Geometry_Hydration_Regression.py",
-            "HMB_VideoPicker_High_Quality_Original_Regression.py",
-            "HMB_VideoPicker_Original_Lambert_Override_Regression.py",
-            "HMB_VideoPicker_Maya_Shot_Authoring_Regression.py",
-            "HMB_VideoPicker_Save_Reload_Regression.py",
-            "HMB_VideoPicker_Real_Saved_Workflow_Replay_Regression.py",
-            "HMB_VideoPicker_Five_Shot_Recursive_Save_Reload_Regression.py",
-            "HMB_VideoPicker_Five_Shot_Recursive_RoundTrip_Regression.py",
-            "HMB_Runtime_Resource_Cleanliness_Regression.py",
-            "HMB_Typed_Auxiliary_Video_Slots_Regression.py",
-            "HMB_Video_Taxonomy_Regression.py",
-            "HMB_Agent_Authenticated_Broker_Regression.py",
-            "HMB_Agent_Cloud_Nonstreaming_Regression.py",
-            "HMB_Agent_Policy_Collision_Retry_Regression.py",
-            "HMB_Agent_English_Video_Progression_Regression.py",
-            "HMB_Agent_Generator_Semantic_Integrity_Regression.py",
-            "HMB_Policy_Identity_Distinctiveness_Regression.py",
-            "HMB_Agent_Runtime_Prompt_UI_Isolation_Regression.py",
-            "HMB_Agent_Shot_Binding_Regression.py",
-            "HMB_Seedance_MP4_Verifier_Portability_Regression.py",
-            "HMB_Seedance_Crash_Reopen_Recovery_Regression.py",
-            "HMB_Seedance_Direct_Shot_Source_Regression.py",
-            "HMB_Seedance_Explicit_Run_Regression.py",
-            "HMB_Seedance_Five_Node_Full_Lifecycle_Concurrency_Regression.py",
-            "HMB_Seedance_Five_Shot_Submission_Concurrency_Regression.py",
-            "HMB_Seedance_Media_Preflight_Regression.py",
-            "HMB_Seedance_Refresh_Command_Regression.py",
-            "HMB_Seedance_Retrieve_UI_Nonblocking_Regression.py",
-            "HMB_Five_Library_Shot_Routing_Regression.py",
-            "HMB_Shot_Picker_Dict_Port_Migration_Regression.py",
-            "HMB_Shot_Routing_Flow_Isolation_Regression.py",
-            "HMB_Shot_Routing_Pass_Cache_Regression.py",
-            "HMB_Shot_Routing_Reconcile_Acknowledgement_Regression.py",
-            "HMB_Singleton_Reset_Lifecycle_Regression.py",
-            "HMB_Singleton_Reset_Media_Preservation_Regression.py",
-            "HMB_VideoPicker_Asset_Catalog_Regression.py",
-            "HMB_VideoPicker_Delete_Lifecycle_Regression.py",
-            "HMB_VideoPicker_Staged_Import_Regression.py",
-            "HMB_VideoPicker_Staged_Import_Host_Regression.py",
-            "HMB_VideoPicker_Five_Shot_Deletion_Permutation_Regression.py",
-            "HMB_VideoPicker_Five_Shot_Output_Cohesion_Regression.py",
-            "HMB_VideoPicker_Live_Output_Regression.py",
-            "HMB_VideoPicker_No_Loss_State_Regression.py",
-            "HMB_VideoPicker_Publisher_Replacement_Regression.py",
-            "HMB_VideoPicker_Server_Media_Reload_Regression.py",
-            "HMB_VideoPicker_Snapshot_History_Regression.py",
-            "HMB_VideoPicker_Selected_Pass_Snapshot_Regression.py"
-          )
-          foreach ($test in $tests) {
-            python (Join-Path "resources/tests" $test)
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-      - name: JavaScript widget regressions
+        run: python tools/audit_regression_coverage.py --run python --report "${{ runner.temp }}/hmb-coverage/python.json"
+      - name: JavaScript widget regressions with required browser coverage
+        shell: pwsh
+        run: python tools/audit_regression_coverage.py --run javascript --report "${{ runner.temp }}/hmb-coverage/javascript.json"
+      - name: Upload pass and unexecuted coverage receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hmb-regression-coverage-${{ github.run_id }}
+          path: ${{ runner.temp }}/hmb-coverage/*.json
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Summarize actual regression coverage
+        if: always()
         shell: pwsh
         run: |
-          Get-ChildItem resources/tests -Filter "*.mjs" | Sort-Object Name | ForEach-Object {
-            node $_.FullName
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem "${{ runner.temp }}/hmb-coverage" -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object {
+            $coverage = Get-Content -Raw -LiteralPath $_.FullName | ConvertFrom-Json
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "### HMB $($coverage.language) coverage"
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "Passed: $($coverage.summary.passed); failed: $($coverage.summary.failed); not run: $($coverage.summary.not_run). Native SDK/DCC coverage is counted only when actually executed."
           }
       - name: Runtime package static syntax audit
         shell: pwsh
@@ -358,28 +231,16 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
-            "- Fixes Maya Original PNG capture when scenes use EXR and isolates Mask, Depth and Motion capture failures; verified Serial evaluation with one DG retry preserves completed outputs, existing visibility scope, timing and source scenes.",
-            "- Extends the same Video Picker to Blender .blend scenes with automatic installed-engine selection, camera/frame/FPS discovery, snapshots and Original/Mask/Depth/Motion outputs; existing Maya .mb/.ma commands remain supported.",
-            "- Keeps generated companions in the Shot and scene bundle captured at Generate, including delayed terminal results and cross-Shot Blender mask bindings.",
-            "- Prevents stale Snapshot history and delayed replies from flashing the previous image during navigation; preserves playback, frame stepping and video editing controls.",
-            "- Updates Picker color assignment, clearing, multi-selection and local controls in-place; prevents stale replies from reverting Shot, tab, palette or editing choices.",
-            "- Preserves focused Prompt controls and open type selectors through updates, hydrates imported image thumbnails asynchronously and spreads Color LUT preview work across short tasks.",
-            "- Uses temporary mid-gray Original shading while preserving authored Eye materials, with Maya Lambert fallback when the shader plugin is unavailable; source scene materials are restored after capture.",
-            "- Preserves Ghost flat-color and Actor shading behavior, character-only Finish Look Beauty controls and authoritative progress/error updates across libraries.",
-            "- New Seedance nodes use Seedance 2.5, 720p, 16:9, four seconds, audio off and MOV; saved workflow settings and Seedance 2.0 MP4 compatibility are preserved.",
-            "- Adds a Broker settings icon beside Model with per-node HTTPS server selection, origin-specific login tokens and saved-task server binding; hidden command/settings rows no longer leave blank spacing.",
-            "- Keeps the Agent public Prompt limited to connection summaries and usage while preserving complete protected execution input and literal user text such as {{SIGN}}.",
-            "- With Resume Task ID empty, an explicit Seedance Run submits a fresh request after the active local execution ends. Refresh or an explicit Resume retrieves only the existing task; starting again after an uncertain response may duplicate a still-running server render and its charges.",
-            "- Preserves sanitized Broker/provider failure details and exact workflow/Shot recovery identity without overwriting saved results with discarded newer recovery records.",
-            "- Includes the compact signed Agent policy v5.5 with the Super Wings default look, shared Actor colors, scoped user overrides, and unchanged Maya camera/motion authority.",
-            "- Keeps Agent models in exact parity with the installed Standard Agent manifest and preserves five-Shot routing, image registration, and independent video editing tools.",
-            "- Adds Cyan Actor and Lavender Ghost presets with distinct color identities throughout Picker, Prompt binding and Maya/Blender outputs; existing presets and shaders remain unchanged.",
-            "- Prevents delayed Color LUT state/command failures from overwriting newer edits or accepted Project/Shot results, including pending slider edits and leave-and-return navigation; current errors remain visible.",
-            "- Refreshes persistence, sanitizer and Picker-to-Seedance fixtures for current host APIs and model limits, and adds production-controller asynchronous ownership regression coverage.",
-            "- Fixes compact Video Picker and Color LUT bottom clipping after delayed host size allocation and preserves expanded layouts.",
-            "- Captures only checked Original, Mask and Depth Snapshot passes and applies assigned Outliner Mask colors; Snapshot deletion updates immediately with rollback and stale-response protection.",
-            "- Corrects black oversized Depth floors using visible mesh surfaces and emphasizes close characters and nearby context without excluding distant scene geometry; keeps flat grayscale per mesh and a stable sequence range.",
-            "- Includes the manifest-verified runtime installer and SHA256 checksum. Private policy source files, signing keys, and server configuration are not distributed.",
+            "- Preserves existing saved workflows, five-Shot routing, model choices and Maya/Blender capture contracts while applying the targeted updates below.",
+            "- Preserves ImageAsset project choices through the first paint, orders cached scan completion ahead of delayed loading acknowledgements, and shares thumbnail results across visible and measurement widgets.",
+            "- Moves ImageAsset catalog-index filesystem work off the engine callback loop while preserving project, catalog and Shot authority.",
+            "- Prevents duplicate ImageAsset import-child removal and stale lifecycle callbacks from affecting replacement nodes; keeps catalog, asset and Shot authority intact.",
+            "- Aligns sampled Original/Mask/Depth reference groups using available timing metadata, budgets observation roles, and records coverage and skipped inputs for completed Task evidence.",
+            "- Adds one web gallery icon beside Broker settings for private videos, stored prompts, reviews and downloads; optional Task evidence sync uses the Task's saved server and does not block generation when review sync is unavailable.",
+            "- Initializes Workflow/Flow context only for a fresh HMB Generator with no existing nodes or flows, preserving current projects and saved workflows.",
+            "- Keeps upload cleanup ordered through repeated cancellation, continues later optional poster batches after a failed publication, and prevents closed Broker dialogs from stealing a replacement dialog's focus.",
+            "- Handles oversized/non-finite Finish Look and review evidence values safely while preserving valid zero/OFF settings and historical Task timing.",
+            "- Ships the signed Agent policy v5.6 with protected execution input, literal user text and source authority preserved, plus the verified runtime installer and SHA256 checksum.",
             "",
             "Close Griptape completely before running the included installer."
           ) | Set-Content -LiteralPath $notesPath -Encoding utf8

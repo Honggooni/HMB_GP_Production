@@ -187,6 +187,17 @@ module.HMBAgentLibrary._has_canonical_hmb_prompt_connection = (
 )
 
 
+if module.ParameterMode is None:
+    # This suite already substitutes the Standard Agent with its host double.
+    # Supply its public parameter modes as well so constructing the current
+    # hidden execution-result property exercises the same fixture API surface.
+    module.ParameterMode = types.SimpleNamespace(
+        INPUT="INPUT", PROPERTY="PROPERTY", OUTPUT="OUTPUT"
+    )
+if module.ParameterMessage is None:
+    module.ParameterMessage = lambda **kwargs: types.SimpleNamespace(**kwargs)
+
+
 def canonical_hmb_agent():
     instance = module.HMBAgentLibrary()
     instance._test_canonical_hmb_prompt = True

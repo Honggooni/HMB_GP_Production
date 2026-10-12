@@ -8,7 +8,9 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import threading
 import time
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -208,6 +210,201 @@ with tempfile.TemporaryDirectory(prefix="hmb_shared_catalog_") as temporary:
     previous_for_index = {**asset_library._default_state(), **rescanned}
     previous_for_index["catalog_root"] = str(catalog_a)
     assert asset_library._read_catalog_index(project_a, previous_for_index) is None
+
+    # Completion publication, including a cache hit/pending drain/probe result,
+    # must never resolve a project or persist an index on the host loop.  Cache
+    # preparation is worker-owned, and live edits cannot supply its identity.
+    cache_state = asset_library._load_project_catalog(
+        catalog_a, previous_for_index, use_shared_cache=False
+    )
+    # A real cached project selection owns new verified rows, even though the
+    # cache-adoption helper deliberately preserves its caller's source clock.
+    asset_library._store_shared_catalog_snapshot(cache_state)
+    busy_ack = deepcopy(cache_state)
+    busy_ack.update(project_id="", project_uid="", project_cache_uid="",
+                    manifest_signature="", folder_signature="", assets=[],
+                    scan_busy=True, scan_revision=7, ui_edit_revision=42)
+    cached_selection = asset_library._select_catalog_project(busy_ack, str(project_a))
+    assert cached_selection["scan_revision"] == 7
+    assert cached_selection["assets"]
+    cached_selection["scan_busy"] = False  # All scheduler completion callers do this.
+    cached_before_publication = deepcopy(cached_selection)
+    current_publication = [deepcopy(busy_ack)]
+
+    def publish_selection(payload, **_kwargs):
+        current_publication[0] = deepcopy(payload)
+        return deepcopy(payload)
+
+    selection_publisher = SimpleNamespace(
+        _hmb_scan_lock=threading.RLock(), _hmb_fresh_registration_scan_key="",
+        _hmb_node_deleted=False,
+        _current_state=lambda: deepcopy(current_publication[0]),
+        _publish_state=publish_selection,
+    )
+    completed_selection = asset_library.HMBImageAssetLibrary._publish_completed_catalog_scan(
+        selection_publisher, cached_selection, "project:verified-cache-hit"
+    )
+    assert completed_selection["scan_revision"] == 8
+    assert completed_selection["ui_edit_revision"] == 42
+    assert completed_selection["assets"] == cached_selection["assets"]
+    assert cached_selection == cached_before_publication, "Cache source was mutated"
+    authority = SimpleNamespace(
+        _widget_revision_pair=asset_library.HMBImageAssetLibrary._widget_revision_pair,
+        _hmb_last_accepted_widget_state=asset_library._json_text(completed_selection),
+        _hmb_last_accepted_widget_revisions=(8, 42),
+        _hmb_last_accepted_thumbnail_revision=0,
+    )
+    assert asset_library.HMBImageAssetLibrary._widget_state_is_stale(authority, busy_ack), (
+        "A late empty native ACK must not erase completed cached image rows"
+    )
+    repeated = asset_library.HMBImageAssetLibrary._publish_completed_catalog_scan(
+        selection_publisher, completed_selection, "project:verified-cache-hit"
+    )
+    assert repeated == completed_selection, "Completed snapshots must not oscillate clocks"
+    for key, live, result in (
+        ("manifest:unchanged", busy_ack, cached_selection),
+        ("probe:changed", busy_ack, cached_selection),
+        ("project:other-root", {**busy_ack, "project_root": str(project_b)}, cached_selection),
+    ):
+        current_publication[0] = deepcopy(live)
+        unchanged = asset_library.HMBImageAssetLibrary._publish_completed_catalog_scan(
+            selection_publisher, result, key
+        )
+        assert unchanged["scan_revision"] == result["scan_revision"], key
+    current_publication[0] = {**busy_ack, "scan_revision": 9}
+    caught_up = asset_library.HMBImageAssetLibrary._publish_completed_catalog_scan(
+        selection_publisher, cached_selection, "project:poll-progress"
+    )
+    assert caught_up["scan_revision"] == 10
+    current_publication[0] = deepcopy(busy_ack)
+    cold_result = {**cached_selection, "scan_revision": 8}
+    cold_complete = asset_library.HMBImageAssetLibrary._publish_completed_catalog_scan(
+        selection_publisher, cold_result, "project:cold-scan"
+    )
+    assert cold_complete["scan_revision"] == 8, "Cold scans must not gain an extra revision"
+    for key, result in (
+        ("project:empty", {**cached_selection, "assets": []}),
+        ("project:failed", {**cached_selection, "assets": [], "error": "unavailable"}),
+    ):
+        current_publication[0] = deepcopy(busy_ack)
+        terminal = asset_library.HMBImageAssetLibrary._publish_completed_catalog_scan(
+            selection_publisher, result, key
+        )
+        assert terminal["scan_revision"] == 8 and terminal["scan_busy"] is False
+        assert terminal["assets"] == [] and terminal["error"] == result["error"]
+    # Loading/reloading from either local index or shared cache keeps the source
+    # clock; the terminal publisher advances only the actual selected operation.
+    reopened = asset_library._select_catalog_project(completed_selection, str(project_a))
+    assert reopened["scan_revision"] == completed_selection["scan_revision"]
+    assert reopened["project_cache_uid"] == completed_selection["project_cache_uid"]
+    asset_library._write_catalog_index(cache_state)
+    indexed_reopen = asset_library._read_catalog_index(project_a, completed_selection)
+    assert indexed_reopen is not None
+    assert indexed_reopen["scan_revision"] == completed_selection["scan_revision"]
+    unchanged_poll, media = asset_library.HMBImageAssetLibrary._compute_manifest_poll(
+        SimpleNamespace(_hmb_last_manifest_poll_error=""), completed_selection
+    )
+    assert unchanged_poll == completed_selection and media is None
+    verified_uid = cache_state["project_cache_uid"]
+    expected_index = asset_library._catalog_index_path(project_a)
+    assert expected_index == asset_library._catalog_index_path_for_verified_uid(
+        verified_uid
+    )
+    original_uid_lookup = asset_library._project_cache_uid
+    original_writer = asset_library._write_catalog_index
+    original_index_lookup = asset_library._catalog_index_path
+    host_thread = threading.get_ident()
+    lookup_started = threading.Event()
+    allow_lookup = threading.Event()
+    worker_errors = []
+    writer_threads = []
+    lookup_calls = []
+
+    def worker_uid_lookup(root):
+        assert threading.get_ident() != host_thread, "project IO ran on host"
+        lookup_calls.append(str(root))
+        lookup_started.set()
+        assert allow_lookup.wait(5), "worker lookup latch timed out"
+        return original_uid_lookup(root)
+
+    def worker_writer(payload, **kwargs):
+        assert threading.get_ident() != host_thread, "durable IO ran on host"
+        writer_threads.append(threading.get_ident())
+        original_writer(payload, **kwargs)
+
+    def forbidden_index_lookup(*_args, **_kwargs):
+        raise AssertionError("writer revisited the project to calculate a local filename")
+
+    publisher = SimpleNamespace(
+        _hmb_scan_lock=threading.RLock(),
+        _hmb_fresh_registration_scan_key="",
+        _hmb_node_deleted=False,
+        _publish_state=lambda payload, **_kwargs: deepcopy(payload),
+    )
+
+    def prepare_in_worker(payload):
+        try:
+            asset_library._prepare_catalog_scan_index(payload, normalized=True)
+        except BaseException as exc:
+            worker_errors.append(exc)
+
+    asset_library._project_cache_uid = worker_uid_lookup
+    asset_library._write_catalog_index = worker_writer
+    asset_library._catalog_index_path = forbidden_index_lookup
+    try:
+        thread = threading.Thread(target=prepare_in_worker, args=(cache_state,))
+        thread.start()
+        assert lookup_started.wait(5)
+        # A slow share is still waiting on the worker.  Each actual publisher
+        # path remains available and retains the scan-owned cache UID.
+        for key in ("ready-cache", "thread-completion", "pending-drain", "probe:changed"):
+            published = asset_library.HMBImageAssetLibrary._publish_completed_catalog_scan(
+                publisher, cache_state, key
+            )
+            assert published["project_cache_uid"] == verified_uid
+            assert published["project_id"] == cache_state["project_id"]
+        assert not writer_threads
+        allow_lookup.set()
+        thread.join(5)
+        assert not thread.is_alive() and not worker_errors
+        assert len(lookup_calls) == len(writer_threads) == 1
+        assert expected_index.is_file()
+
+        # A syntactically valid client UID still has no cache-write authority.
+        forged_uid = "hmbpc1:" + ("a" * 32 if verified_uid[-32:] != "a" * 32 else "b" * 32)
+        forged_state = {**cache_state, "project_cache_uid": forged_uid}
+        forged_index = asset_library._catalog_index_path_for_verified_uid(forged_uid)
+        thread = threading.Thread(target=prepare_in_worker, args=(forged_state,))
+        thread.start(); thread.join(5)
+        assert not thread.is_alive() and not worker_errors
+        assert len(writer_threads) == 1 and not forged_index.exists()
+
+        # Same-root replacement with a new verified identity uses a new file;
+        # the old worker cannot overwrite that new identity's snapshot.
+        asset_library._project_cache_uid = lambda _root: forged_uid
+        prepare_in_worker(cache_state)
+        assert len(writer_threads) == 1
+        replacement_state = {**cache_state, "project_cache_uid": forged_uid}
+        thread = threading.Thread(target=prepare_in_worker, args=(replacement_state,))
+        thread.start(); thread.join(5)
+        assert not thread.is_alive() and not worker_errors
+        assert len(writer_threads) == 2 and forged_index.is_file()
+        assert forged_index != expected_index
+    finally:
+        allow_lookup.set()
+        if thread.is_alive():
+            thread.join(5)
+        asset_library._project_cache_uid = original_uid_lookup
+        asset_library._write_catalog_index = original_writer
+        asset_library._catalog_index_path = original_index_lookup
+
+    # The write-side fast filename does not relax authoritative read-side
+    # rejection of another identity or fresh raw filesystem changes.
+    assert asset_library._read_catalog_index(project_a, cache_state) is not None
+    wrong_raw = __import__("json").loads(expected_index.read_text(encoding="utf-8"))
+    wrong_raw["project_cache_uid"] = forged_uid
+    expected_index.write_text(__import__("json").dumps(wrong_raw), encoding="utf-8")
+    assert asset_library._read_catalog_index(project_a, cache_state) is None
 
 
 print("HMB shared catalog/cache/probe/portable media identity regression: PASS")

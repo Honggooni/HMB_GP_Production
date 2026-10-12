@@ -154,10 +154,14 @@ def bootstrap_once_authorized(
             raise _unavailable()
         try:
             enabled = authorization_probe() is True
-        except BaseException:
+        except BaseException as exc:
             _state = _STATE_FAILED
             _condition.notify_all()
-            raise _unavailable() from None
+            if isinstance(exc, Exception):
+                raise _unavailable() from None
+            # Keep the session terminal and unavailable while honoring the
+            # caller's cancellation/shutdown, as the loader path already does.
+            raise
         if not enabled:
             _state = _STATE_FAILED
             _condition.notify_all()

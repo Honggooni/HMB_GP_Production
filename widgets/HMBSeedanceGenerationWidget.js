@@ -769,8 +769,9 @@ function hmbSeedanceInstallBrokerStyles(ownerDocument) {
   const style = ownerDocument.createElement("style");
   style.id = "hmb-seedance-broker-settings-style";
   style.textContent = `
-    .hmb-seedance-broker-icon{position:absolute;right:8px;top:50%;transform:translateY(-50%);z-index:2;width:29px;height:29px;padding:0;display:grid;place-items:center;border:1px solid #64748b;border-radius:7px;background:#151c2b;color:#dbeafe;font:18px system-ui;line-height:1;cursor:pointer}
-    .hmb-seedance-broker-icon:hover,.hmb-seedance-broker-icon:focus-visible{border-color:#f472b6;color:#fff;outline:2px solid transparent;box-shadow:0 0 0 2px rgba(244,114,182,.25)}
+    .hmb-seedance-broker-icon,.hmb-seedance-gallery-icon{position:absolute;right:8px;top:50%;transform:translateY(-50%);z-index:2;width:29px;height:29px;padding:0;display:grid;place-items:center;border:1px solid #64748b;border-radius:7px;background:#151c2b;color:#dbeafe;font:18px system-ui;line-height:1;cursor:pointer}
+    .hmb-seedance-gallery-icon{right:46px}.hmb-seedance-gallery-icon:disabled{opacity:.55;cursor:wait}
+    .hmb-seedance-broker-icon:hover,.hmb-seedance-broker-icon:focus-visible,.hmb-seedance-gallery-icon:hover,.hmb-seedance-gallery-icon:focus-visible{border-color:#f472b6;color:#fff;outline:2px solid transparent;box-shadow:0 0 0 2px rgba(244,114,182,.25)}
     .hmb-seedance-broker-backdrop{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(1,5,14,.78);font-family:Inter,"Noto Sans KR",system-ui,sans-serif;color:#e7edf7}
     .hmb-seedance-broker-dialog{width:min(520px,100%);padding:20px;border:1px solid #9b4d7d;border-radius:13px;background:#0b1120;box-shadow:0 20px 50px rgba(0,0,0,.55)}
     .hmb-seedance-broker-dialog h2{margin:0 0 12px;font-size:18px}.hmb-seedance-broker-dialog p{margin:0 0 16px;color:#b5c2d5;font-size:12px;line-height:1.55}
@@ -794,6 +795,7 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
   let nodeRoot = null;
   let modelRow = null;
   let button = null;
+  let galleryButton = null;
   let modelStyle = null;
   let observer = null;
   let observedRoot = null;
@@ -803,6 +805,7 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
 
   const detachButton = () => {
     if (button) button.remove();
+    if (galleryButton) galleryButton.remove();
     if (modelRow?.style && modelStyle) {
       for (const [property, value, priority] of modelStyle) {
         if (value) modelRow.style.setProperty(property, value, priority);
@@ -812,6 +815,7 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
     modelRow = null;
     modelStyle = null;
     button = null;
+    galleryButton = null;
   };
 
   const openDialog = () => {
@@ -836,13 +840,17 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
     const save = backdrop.querySelector("[data-broker-save]");
     const cancel = backdrop.querySelector("[data-broker-cancel]");
     let pending = false;
+    let closed = false;
     const close = () => {
+      if (closed) return;
+      closed = true;
+      const ownsDialog = HMB_SEEDANCE_BROKER_DIALOGS.get(ownerDocument) === close;
       backdrop.remove();
-      if (HMB_SEEDANCE_BROKER_DIALOGS.get(ownerDocument) === close) {
+      if (ownsDialog) {
         HMB_SEEDANCE_BROKER_DIALOGS.delete(ownerDocument);
       }
       if (closeDialog === close) closeDialog = null;
-      button?.focus?.();
+      if (!disposed && ownsDialog) button?.focus?.();
     };
     closeDialog = close;
     HMB_SEEDANCE_BROKER_DIALOGS.set(ownerDocument, close);
@@ -888,6 +896,7 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
         await latestProps.onChange(parsed.value);
         close();
       } catch {
+        if (disposed || closed) return;
         error.textContent = "브로커 주소를 저장하지 못했습니다. 주소와 연결 상태를 확인하세요.";
         pending = false;
         save.disabled = false;
@@ -905,7 +914,7 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
     const nextRow = nodeRoot?.querySelector?.(
       '[data-parameter-name="model_id"], [data-parameter="model_id"], .model_id',
     ) || null;
-    if (!nextRow || (nextRow === modelRow && button?.isConnected)) return;
+    if (!nextRow || (nextRow === modelRow && button?.isConnected && galleryButton?.isConnected)) return;
     detachButton();
     if (!nextRow || !nextRow.style) return;
     hmbSeedanceInstallBrokerStyles(container.ownerDocument);
@@ -917,7 +926,7 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
     ]);
     const computedPadding = container.ownerDocument?.defaultView?.getComputedStyle?.(modelRow)?.paddingRight || "0px";
     modelRow.style.setProperty("position", "relative");
-    modelRow.style.setProperty("padding-right", `calc(${computedPadding} + 38px)`);
+    modelRow.style.setProperty("padding-right", `calc(${computedPadding} + 76px)`);
     button = container.ownerDocument.createElement("button");
     button.type = "button";
     button.className = "hmb-seedance-broker-icon nodrag";
@@ -932,6 +941,36 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
       openDialog();
     });
     modelRow.appendChild(button);
+    galleryButton = container.ownerDocument.createElement("button");
+    galleryButton.type = "button";
+    galleryButton.className = "hmb-seedance-gallery-icon nodrag";
+    galleryButton.textContent = "▦";
+    galleryButton.setAttribute("aria-label", "내 영상 / 리뷰 웹 갤러리");
+    galleryButton.title = "내 영상 / 리뷰 웹 갤러리";
+    galleryButton.addEventListener("pointerdown", (event) => event.stopPropagation?.());
+    galleryButton.addEventListener("click", async (event) => {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      const clicked = galleryButton;
+      if (disposed || clicked.disabled) return;
+      const bridge = hmbSeedanceRefreshCommandBridge(container);
+      if (!bridge || typeof bridge.dispatch !== "function") {
+        clicked.title = "갤러리 연결 기능을 사용할 수 없습니다. 노드를 다시 열어주세요.";
+        return;
+      }
+      clicked.disabled = true;
+      try {
+        // Backend resolves this exact node's validated origin. Credentials,
+        // URLs and Task IDs never cross the browser command boundary.
+        await bridge.dispatch({ action: "open_gallery", action_id: `gallery-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          issued_at_ms: Date.now() });
+      } catch {
+        if (!disposed && clicked.isConnected) clicked.title = "웹 갤러리를 열지 못했습니다. 연결 상태를 확인하세요.";
+      } finally {
+        if (!disposed && clicked.isConnected) clicked.disabled = false;
+      }
+    });
+    modelRow.appendChild(galleryButton);
   };
 
   const scheduleSync = () => {
@@ -947,7 +986,7 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
     observedRoot = nodeRoot;
     if (!nodeRoot) return;
     observer = new Observer(() => {
-      if (!modelRow?.isConnected || !button?.isConnected) scheduleSync();
+      if (!modelRow?.isConnected || !button?.isConnected || !galleryButton?.isConnected) scheduleSync();
     });
     observer.observe(nodeRoot, { childList: true, subtree: true });
   };
@@ -1095,7 +1134,7 @@ function hmbSeedanceCommandBridgeWidget(container, props) {
         const source = rawCommand && typeof rawCommand === "object" ? rawCommand : {};
         const action = text(source.action, 48).toLowerCase();
         const actionId = text(source.action_id, 128);
-        if (action !== "refresh_existing" || !actionId) {
+        if (!["refresh_existing", "open_gallery"].includes(action) || !actionId) {
           throw new Error("Seedance refresh command is invalid.");
         }
         return latestProps.onChange({

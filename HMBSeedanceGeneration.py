@@ -31,8 +31,8 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import quote, urljoin, urlparse
-from uuid import uuid4
+from urllib.parse import quote, urlencode, urljoin, urlparse
+from uuid import UUID, uuid4
 
 import httpx
 from griptape.artifacts import ImageUrlArtifact
@@ -118,6 +118,8 @@ from _hmb_mp4_verify import (
     validate_decodable_mp4_file as _validate_decodable_mp4_file,
 )
 import _hmb_shot_routing as _shot_routing
+import _hmb_review as _review
+from _hmb_build_diagnostics import get_build_diagnostics as _get_build_diagnostics
 from _hmb_common import (
     _broker_load_bearer_token_readonly,
     _broker_load_bearer_token_from_path_readonly,
@@ -650,7 +652,7 @@ def _seedance_refresh_command_value(value: Any = None) -> dict[str, Any]:
     if (
         source.get("schema") != SEEDANCE_REFRESH_COMMAND_SCHEMA
         or source.get("version") != SEEDANCE_REFRESH_COMMAND_VERSION
-        or action != "refresh_existing"
+        or action not in {"refresh_existing", "open_gallery"}
         or not action_id
         or len(action_id) > 128
         or _TASK_ID_PATTERN.fullmatch(action_id) is None
@@ -1766,6 +1768,71 @@ class _HMBAIBrokerBridge:
     def server_url(self) -> str:
         return self._server_url
 
+    @staticmethod
+    def _review_task_path(task_id: str) -> str:
+        if not isinstance(task_id, str) or _TASK_ID_PATTERN.fullmatch(task_id) is None or len(task_id) > 256:
+            raise _BrokerProtocolError("Invalid review Task ID.")
+        return "/api/v1/reviews/tasks/" + quote(task_id, safe="")
+
+    def review_capabilities(self) -> dict[str, Any]:
+        result = self._request_json("GET", "/api/v1/reviews/capabilities", payload=None, timeout=5)
+        if (result.get("schema") != "hmb-review-portal" or type(result.get("version")) is not int
+                or result["version"] != 1 or result.get("review_portal") is not True
+                or result.get("page_url") != "/reviews" or result.get("page_size") != 20
+                or result.get("retention_days") != 30):
+            raise _BrokerProtocolError("Broker review portal capabilities are unsupported.")
+        return result
+
+    def put_task_casecard(self, task_id: str, evidence: dict[str, Any]) -> dict[str, Any]:
+        if evidence.get("schema") != _review.SCHEMA or evidence.get("version") != 1:
+            raise _BrokerProtocolError("Invalid supplemental casecard.")
+        evidence = _review.public_evidence(evidence)
+        result = self._request_json("PUT", self._review_task_path(task_id) + "/casecard",
+                                    payload=evidence, timeout=5,
+                                    idempotency_key=_review._digest(evidence))
+        if (result.get("casecard") != evidence or type(result.get("created")) is not bool
+                or result.get("task_id", task_id) != task_id):
+            raise _BrokerProtocolError("Broker did not acknowledge the exact supplemental casecard.")
+        return result
+
+    def post_task_feedback(self, task_id: str, review: dict[str, Any], *, library_version: str = "") -> dict[str, Any]:
+        try:
+            review_id = str(UUID(str(review.get("review_id") or review.get("client_review_id") or "")))
+        except (ValueError, AttributeError, TypeError):
+            raise _BrokerProtocolError("Invalid review identity.") from None
+        score, category = review.get("score"), review.get("category")
+        if type(score) is not int or score not in {1, 2, 3, 4, 5} or category not in {
+            "identity", "motion", "camera", "material", "environment", "other"}:
+            raise _BrokerProtocolError("Invalid review score or category.")
+        body = {"client_review_id": review_id, "score": score, "category": category,
+                "note": str(review.get("note") or "")[:4000],
+                "input_evidence_sha256": _review._hash(review.get("input_evidence_sha256")),
+                "library_version": _review._public_text(library_version, 80)}
+        return self._request_json("POST", self._review_task_path(task_id) + "/feedback",
+                                  payload=body, timeout=5, idempotency_key=review_id)
+
+    def task_feedback(self, task_id: str, *, is_live: Any = lambda: True) -> dict[str, Any]:
+        path = self._review_task_path(task_id) + "/feedback"
+        rows, cursor, seen = [], "", set()
+        for _page in range(5):
+            if not is_live():
+                return {"items": rows, "has_more": True, "cancelled": True}
+            result = self._request_json("GET", path + ("?" + urlencode({"cursor": cursor}) if cursor else ""),
+                                        payload=None, timeout=5)
+            items = result.get("items")
+            if not isinstance(items, list) or len(items) > 20 or result.get("task_id", task_id) != task_id:
+                raise _BrokerProtocolError("Invalid feedback page.")
+            rows.extend(items)
+            more = result.get("has_more") is True
+            next_cursor = result.get("next_cursor")
+            if not more:
+                return {"items": rows, "has_more": False}
+            if not isinstance(next_cursor, str) or not next_cursor or len(next_cursor) > 2048 or next_cursor in seen:
+                raise _BrokerProtocolError("Invalid feedback pagination.")
+            seen.add(next_cursor)
+            cursor = next_cursor
+        return {"items": rows, "has_more": True}
+
     def _load_access_token(self) -> str:
         # Preserve the original default-server call contract for installed
         # integrations while explicitly scoping alternate-server credentials.
@@ -2429,6 +2496,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._hmb_generated_video_source: dict[str, Any] = {}
         self._hmb_generated_video_source_published: dict[str, Any] = {}
         self._hmb_generation_run_origin: dict[str, Any] = {}
+        self._hmb_review_case_id = ""
+        self._hmb_review_inputs: dict[str, Any] = {}
+        self._hmb_review_stage = ""
+        self._hmb_review_stage_started = time.monotonic()
+        self._hmb_review_stage_seconds: dict[str, float] = {}
+        self._hmb_review_sync_lock = threading.Lock()
+        self._hmb_review_sync_jobs: set[tuple[str, str]] = set()
+        self._hmb_review_sync_epoch = 0
         self._hmb_last_success_last_frame_url: ImageUrlArtifact | None = None
         self._hmb_output_format_initial_setup_seen = False
         self._hmb_return_last_frame_initial_setup_seen = False
@@ -2436,6 +2511,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._hmb_pending_generation_action = False
         self._hmb_generation_action_only_update = False
         self._hmb_pending_generation_command_id = ""
+        self._hmb_pending_generation_command_action = ""
+        self._hmb_pending_gallery_origin = ""
         self._hmb_processed_generation_command_ids: set[str] = set()
         self._hmb_node_deleted = False
         self._hmb_delete_parent_called = False
@@ -4169,6 +4246,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             checkpoint,
             emit_change=False,
         )
+        try:
+            _review.bind_task_origin(checkpoint["task_id"], checkpoint["broker_server_url"])
+        except (OSError, ValueError, TypeError):
+            # Optional review routing never replaces the paid recovery journal
+            # or changes submission/retrieval success.
+            logger.warning("Optional Task review origin could not be recorded.")
         self._hmb_generation_recovery_restore_fingerprint = None
         return checkpoint
 
@@ -4410,7 +4493,171 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             }
         )
         self._hmb_generation_preview_state = state
+        self._record_review_stage(phase, job_id)
         self._sync_seedance_shot_widget(emit_change=True)
+
+    def _record_review_stage(self, phase: str, task_id: str = "") -> None:
+        """Observe status transitions without changing recovery or billing authority."""
+        previous = getattr(self, "_hmb_review_stage", "")
+        if phase == previous:
+            return
+        now = time.monotonic()
+        durations = getattr(self, "_hmb_review_stage_seconds", {})
+        if previous:
+            durations[previous] = durations.get(previous, 0.) + max(0., now - getattr(self, "_hmb_review_stage_started", now))
+        self._hmb_review_stage = phase
+        self._hmb_review_stage_started = now
+        self._hmb_review_stage_seconds = durations
+        if task_id:
+            try:
+                _review.update_case(task_id, case_id=getattr(self, "_hmb_review_case_id", ""),
+                                    status=phase, stage_elapsed_seconds=durations)
+            except (OSError, ValueError, TypeError):
+                logger.warning("Local task evidence update unavailable (%s).", phase)
+
+    def _start_review_case(self, client_request_id: str, submitted_prompt: str) -> None:
+        try:
+            source = self._manual_agent_prompt_source()
+            getter = getattr(source, "_hmb_agent_reference_observation_snapshot", None)
+            observation = getter() if callable(getter) else {"status": "not_available"}
+            self._hmb_review_case_id = _review.start_case(
+                client_request_id, getattr(self, "_hmb_review_inputs", {}), submitted_prompt,
+                _get_build_diagnostics(), observation if isinstance(observation, dict) else {},
+            )
+        except Exception as exc:
+            # Optional evidence failure must not change the paid-task protocol.
+            self._hmb_review_case_id = ""
+            logger.warning("Local task evidence preparation unavailable (%s).", type(exc).__name__)
+
+    def _review_origin_for_task(self, task_id: str) -> str:
+        self._validate_task_id(task_id)
+        pinned = _review.task_origin(task_id)
+        checkpoint = self._generation_recovery_state()
+        if pinned:
+            origin = _broker_validated_server_url(pinned)
+            if (checkpoint.get("task_id") == task_id and checkpoint.get("broker_server_url")
+                    and _broker_validated_server_url(checkpoint["broker_server_url"]) != origin):
+                raise _BrokerProtocolError("This Task has conflicting Broker origin evidence.")
+            return origin
+        if checkpoint.get("task_id") == task_id and checkpoint.get("broker_server_url"):
+            origin = _broker_validated_server_url(checkpoint["broker_server_url"])
+            _review.bind_task_origin(task_id, origin)
+            return origin
+        # The current settings panel is never authority for an older Task.
+        raise _BrokerProtocolError("This Task has no recorded Broker origin.")
+
+    def _review_sync_is_live(self, epoch: int) -> bool:
+        return (self._runtime_node_is_live(require_registered=True)
+                and int(getattr(self, "_hmb_review_sync_epoch", 0)) == epoch)
+
+    def _sync_review_task(self, task_id: str, origin: str, epoch: int) -> None:
+        """Optional metadata only; never create/refresh/download a generation."""
+        live = lambda: self._review_sync_is_live(epoch)
+        if not live():
+            return
+        record = _review.read_case(task_id)
+        try:
+            if record:
+                _review.mark_server_sync(task_id, status="pending")
+            bridge = self._create_broker_bridge(server_url=origin)
+            bridge.review_capabilities()
+            if not live():
+                return
+            if record:
+                evidence = _review.public_evidence(record)
+                digest = _review._digest(evidence)
+                synced = record.get("server_sync", {})
+                if synced.get("status") != "synced" or synced.get("evidence_sha256") != digest:
+                    result = bridge.put_task_casecard(task_id, evidence)
+                    if result.get("task_id", task_id) != task_id:
+                        raise _BrokerProtocolError("Review evidence response belongs to another Task.")
+                    if not live():
+                        return
+                _review.mark_server_sync(task_id, status="synced", evidence_sha256=digest)
+                for row in record.get("reviews", []):
+                    if not live():
+                        return
+                    if row.get("server_sync", {}).get("status") == "synced":
+                        continue
+                    try:
+                        bridge.post_task_feedback(task_id, row,
+                                                  library_version=record.get("build", {}).get("library_version", ""))
+                    except _BrokerError:
+                        if live():
+                            _review.mark_review_sync(task_id, row["review_id"], status="failed", reason="broker_request_failed")
+                        raise
+                    if live():
+                        _review.mark_review_sync(task_id, row["review_id"], status="synced")
+            feedback = bridge.task_feedback(task_id, is_live=live)
+            if live() and not feedback.get("cancelled"):
+                _review.cache_server_feedback(task_id, feedback["items"], has_more=feedback["has_more"])
+        except Exception as exc:
+            status = ("login_required" if isinstance(exc, _BrokerAuthenticationError) else
+                      "unsupported" if isinstance(exc, _BrokerError) and getattr(exc, "status_code", 0) in {404, 405, 501}
+                      else "failed")
+            if live() and record:
+                with suppress(OSError, ValueError, TypeError):
+                    _review.mark_server_sync(task_id, status=status,
+                                             reason="portal_" + status)
+            logger.warning("Optional Task review sync unavailable (%s).", type(exc).__name__)
+
+    def _schedule_review_sync(self, task_id: str) -> bool:
+        if not self._runtime_node_is_live(require_registered=True):
+            return False
+        try:
+            origin = self._review_origin_for_task(task_id)
+        except (OSError, ValueError, TypeError, _BrokerError):
+            return False
+        key = (hashlib.sha256(origin.encode()).hexdigest(), task_id)
+        epoch = int(getattr(self, "_hmb_review_sync_epoch", 0))
+        lock = getattr(self, "_hmb_review_sync_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._hmb_review_sync_lock = lock
+            self._hmb_review_sync_jobs = set()
+        with lock:
+            if key in self._hmb_review_sync_jobs:
+                return False
+            self._hmb_review_sync_jobs.add(key)
+        def worker() -> None:
+            try:
+                self._sync_review_task(task_id, origin, epoch)
+            finally:
+                with lock:
+                    self._hmb_review_sync_jobs.discard(key)
+        try:
+            threading.Thread(target=worker, name=f"{self.name}-review-sync", daemon=True).start()
+            return True
+        except Exception:
+            with lock:
+                self._hmb_review_sync_jobs.discard(key)
+            return False
+
+    def _schedule_open_review_gallery(self, origin: str) -> None:
+        """Acknowledge command first; open only an ordinary authenticated page."""
+        epoch = int(getattr(self, "_hmb_review_sync_epoch", 0))
+        origin = _broker_validated_server_url(origin)
+        def launch() -> None:
+            if not self._review_sync_is_live(epoch):
+                return
+            try:
+                if self._selected_broker_server_url() != origin:
+                    return
+                webbrowser.open(origin + "/reviews", new=2, autoraise=True)
+                task_id = self._authoritative_existing_generation_id()
+                if task_id:
+                    self._schedule_review_sync(task_id)
+            except Exception as exc:
+                logger.warning("Review gallery could not open (%s).", type(exc).__name__)
+        try:
+            event_loop = getattr(GriptapeNodes.EventManager(), "event_loop", None)
+            if event_loop is not None and event_loop.is_running():
+                event_loop.call_soon_threadsafe(lambda: threading.Thread(
+                    target=launch, name=f"{self.name}-gallery-open", daemon=True).start())
+                return
+        except Exception:
+            pass
+        threading.Thread(target=launch, name=f"{self.name}-gallery-open", daemon=True).start()
 
     def _restore_generation_recovery_preview(self) -> None:
         """Recreate only the same-task UI action after workflow hydration."""
@@ -5534,6 +5781,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         elif parameter.name == SEEDANCE_REFRESH_COMMAND_PARAMETER:
             normalized = _seedance_refresh_command_value(value)
             self._hmb_pending_generation_command_id = ""
+            self._hmb_pending_generation_command_action = ""
+            self._hmb_pending_gallery_origin = ""
             action_id = normalized["action_id"]
             processed_ids = getattr(
                 self,
@@ -5544,7 +5793,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self._hmb_generation_preview_state
             )
             authoritative_id = self._authoritative_existing_generation_id()
-            if (
+            if (normalized["action"] == "open_gallery" and action_id and action_id not in processed_ids
+                    and self._runtime_node_is_live(require_registered=True)):
+                self._hmb_pending_generation_command_id = action_id
+                self._hmb_pending_generation_command_action = "open_gallery"
+                self._hmb_pending_gallery_origin = self._selected_broker_server_url()
+            elif (
                 normalized["action"] == "refresh_existing"
                 and action_id
                 and action_id not in processed_ids
@@ -5559,6 +5813,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     pass
                 else:
                     self._hmb_pending_generation_command_id = action_id
+                    self._hmb_pending_generation_command_action = "refresh_existing"
         elif parameter.name == SEEDANCE_SHOT_WIDGET_PARAMETER:
             request = value.get("request") if isinstance(value, dict) else None
             action_only = bool(
@@ -5731,6 +5986,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 getattr(self, "_hmb_pending_generation_command_id", "") or ""
             ).strip()
             self._hmb_pending_generation_command_id = ""
+            command_action = str(getattr(self, "_hmb_pending_generation_command_action", ""))
+            gallery_origin = str(getattr(self, "_hmb_pending_gallery_origin", ""))
+            self._hmb_pending_generation_command_action = ""
+            self._hmb_pending_gallery_origin = ""
             if action_id:
                 processed_ids = getattr(
                     self,
@@ -5745,7 +6004,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     retained = set(tuple(processed_ids)[-127:])
                     retained.add(action_id)
                     self._hmb_processed_generation_command_ids = retained
-                self._schedule_existing_generation_refresh()
+                if command_action == "open_gallery":
+                    self._schedule_open_review_gallery(gallery_origin)
+                else:
+                    self._schedule_existing_generation_refresh()
         elif parameter.name == SEEDANCE_SHOT_WIDGET_PARAMETER:
             action_requested = self._hmb_pending_generation_action
             self._hmb_pending_generation_action = False
@@ -6339,13 +6601,20 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     -1 if current_task == TASK_VIDEO_EDITING else 5,
                 )
 
-        # Video Editing inherits the source video's frame dimensions. Keep the
-        # authored control valid as soon as the task is selected instead of
-        # waiting for execution-time validation to reject a fixed ratio.
+        # Video Editing and Only-mode Extension inherit the source video's
+        # frame dimensions. Keep the authored control valid when selected.
+        # Shot executes Reference to Video, so its Extension-authored ratio
+        # remains independent until the node returns to Only mode.
         ratio_choices = (
             ("adaptive",)
             if model_id == SEEDANCE_2_5_MODEL_ID
-            and current_task == TASK_VIDEO_EDITING
+            and (
+                current_task == TASK_VIDEO_EDITING
+                or (
+                    current_task == TASK_VIDEO_EXTENSION
+                    and not self._hmb_shot_channel_subscription().get("enabled")
+                )
+            )
             else RATIOS
         )
         ratio_parameter = self.get_parameter_by_name("ratio")
@@ -7006,8 +7275,77 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "the camera image as a whole. It must not alter "
             "character identity, design, geometry, camera, framing, animation, timing, FX "
             "placement, environment content, or the Global Look's lighting direction and "
-            "composition."
+            "composition. Preserve the resolved character's facial structure, feature "
+            "placement, proportions, silhouette, material boundaries, markings, and "
+            "asymmetries through authored expressions, deformation, perspective, and "
+            "occlusion. Apply the user's stated brightness, saturation, glow, diffusion, "
+            "and other Beauty values inside that scope while retaining those design "
+            "features. Character-surface soft focus affects optical treatment only; "
+            "continue the resolved subject and camera motion and source timing."
         )
+
+    def _hmb_agent_generation_settings(self) -> dict[str, Any]:
+        """Read this Shot's execution settings without changing graph or controls.
+
+        Mirror model-control normalization and the Shot Reference-to-Video
+        execution copy. Calling ``_get_parameters`` here would run setters and
+        could recursively wake the upstream Agent; this optional context must
+        remain a read-only observation of the downstream request.
+        """
+
+        subscription = self._hmb_shot_channel_subscription()
+        if not subscription.get("enabled"):
+            return {}
+        raw_model = str(
+            self.get_parameter_value("model_id") or MODEL_NAME_SEEDANCE_2_0
+        ).strip()
+        model_id = MODEL_ID_ALIASES.get(raw_model, raw_model)
+        if model_id not in MODEL_RESOLUTIONS:
+            return {}
+        resolution = str(self.get_parameter_value("resolution") or "")
+        previous_model = str(getattr(self, "_hmb_model_switch_previous_id", "") or "")
+        if (
+            raw_model in RETIRED_SEEDANCE_MODEL_VALUES
+            or bool(getattr(self, "_hmb_retired_model_migration_pending", False))
+            or resolution not in MODEL_RESOLUTIONS[model_id]
+            or (
+                previous_model
+                and previous_model != model_id
+                and resolution == MODEL_DEFAULT_RESOLUTIONS.get(previous_model)
+            )
+        ):
+            resolution = MODEL_DEFAULT_RESOLUTIONS[model_id]
+        authored_task = str(self.get_parameter_value(TASK_PARAMETER) or TASK_REFERENCE_TO_VIDEO)
+        if authored_task not in MODEL_TASK_CHOICES[model_id]:
+            authored_task = TASK_REFERENCE_TO_VIDEO
+        duration_choices = MODEL_DURATION_CHOICES[model_id]
+        if model_id == SEEDANCE_2_5_MODEL_ID:
+            if authored_task == TASK_VIDEO_EDITING:
+                duration_choices = (-1,)
+            elif authored_task == TASK_VIDEO_EXTENSION:
+                duration_choices = DURATION_STORAGE_CHOICES
+        duration = self.get_parameter_value("duration")
+        if (
+            not isinstance(duration, int)
+            or isinstance(duration, bool)
+            or duration not in duration_choices
+        ):
+            duration = -1 if authored_task == TASK_VIDEO_EDITING else 5
+        if duration not in MODEL_DURATION_CHOICES[model_id]:
+            duration = 5
+        ratio = str(self.get_parameter_value("ratio") or "adaptive")
+        if ratio not in RATIOS or (
+            model_id == SEEDANCE_2_5_MODEL_ID and authored_task == TASK_VIDEO_EDITING
+        ):
+            ratio = "adaptive"
+        return {
+            "model_id": model_id,
+            "task": TASK_REFERENCE_TO_VIDEO,
+            "duration_seconds": duration if duration > 0 else None,
+            "duration_mode": "explicit" if duration > 0 else "provider_smart",
+            "aspect_ratio": ratio,
+            "resolution": resolution,
+        }
 
     def _resolve_exact_shot_generation_inputs(
         self,
@@ -9288,8 +9626,18 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
-            with suppress(Exception):
-                await task
+            # More than one cancellation can arrive while the upload/cleanup
+            # thread is still running. Keep shielding every wait: cancelling
+            # its Task does not stop that thread or its late temporary writes.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            with suppress(Exception, asyncio.CancelledError):
+                task.result()
             raise
 
     @staticmethod
@@ -9946,6 +10294,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # Stage the verified source before the persistence await. Normal workflow
         # saves retain this property; the journal retains the pending origin.
         self._record_completed_video_source(completed_origin, generation_id, saved)
+        try:
+            _review.update_case(generation_id, case_id=getattr(self, "_hmb_review_case_id", ""),
+                                status="succeeded", output=saved.location,
+                                stage_elapsed_seconds=getattr(self, "_hmb_review_stage_seconds", {}))
+        except (OSError, ValueError, TypeError):
+            logger.warning("Local completed-task evidence is unavailable.")
         await self._force_save_generation_recovery_checkpoint(
             required=False,
             reason="local_succeeded",
@@ -9953,6 +10307,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._submission_outcome_unknown = False
         if not self._runtime_node_is_live(require_registered=True):
             return
+        with suppress(Exception):
+            self._schedule_review_sync(generation_id)
         self._set_status_results(
             was_successful=True,
             result_details=(
@@ -10328,6 +10684,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._discard_dangling_owned_list_connections_before_delete()
         if not bool(getattr(self, "_hmb_node_deleted", False)):
             self._hmb_node_deleted = True
+            self._hmb_review_sync_epoch = int(getattr(self, "_hmb_review_sync_epoch", 0)) + 1
             with self._generation_refresh_lock:
                 self._generation_run_active.clear()
                 self._generation_refresh_running = False
@@ -10351,6 +10708,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         return parent(*args, **kwargs) if callable(parent) else None
 
     async def _process_generation(self) -> None:
+        self._hmb_review_case_id = ""
+        self._hmb_review_inputs = {}
+        self._hmb_review_stage = ""
+        self._hmb_review_stage_started = time.monotonic()
+        self._hmb_review_stage_seconds = {}
         self._hmb_generation_run_origin = (
             {} if str(self.get_parameter_value("resume_generation_id") or "").strip()
             else self._capture_generated_video_origin()
@@ -10530,6 +10892,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if not self._runtime_node_is_live(require_registered=True):
                 return
             self._set_generation_status("preparing_media", generation_id="")
+            try:
+                self._hmb_review_inputs = await self._run_blocking_generation_stage(
+                    _review.capture_inputs, params,
+                )
+            except (OSError, ValueError, TypeError):
+                self._hmb_review_inputs = {"status": "capture_unavailable"}
             params = await self._run_blocking_generation_stage(
                 self._prepare_video_references_for_run,
                 params,
@@ -10543,6 +10911,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self._assert_agent_result_available(str(params.get("prompt") or ""), allow_resume=False)
             client_request_id = "hmb-" + uuid4().hex
             payload["client_request_id"] = client_request_id
+            await self._run_blocking_generation_stage(
+                self._start_review_case, client_request_id, str(payload.get("prompt") or ""),
+            )
             if not self._runtime_node_is_live(require_registered=True):
                 return
             self._set_broker_task_outputs(

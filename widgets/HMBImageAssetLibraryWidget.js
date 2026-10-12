@@ -60,6 +60,7 @@ const SHOT_ROUTING_SCHEMA = "hmb-shot-routing";
 const SHOT_ROUTING_VERSION = 1;
 const MAX_IMAGE_ASSET_REVISION = Number.MAX_SAFE_INTEGER;
 const IMAGE_ASSET_UI_EDIT_REVISION_KEY = "ui_edit_revision";
+const IMAGE_ASSET_EDIT_SCHEMA = "hmb-image-asset-edit-v1";
 const ROOT_FOLDER_KEY = "$root";
 const IMAGE_ASSET_STATE_VERSION = 4;
 const IMAGE_TAXONOMY_SCHEMA = "hmb-image-taxonomy";
@@ -236,21 +237,58 @@ export function hmbImageAssetPresentationCacheRegistry() {
   return imageAssetPresentationCacheRegistry();
 }
 
+function hmbImageAssetBridgeHasConsumers(entry) {
+  return Boolean(
+    typeof entry?.consumer === "function"
+    || typeof entry?.catalogConsumer === "function"
+    || (entry?.consumers instanceof Map && entry.consumers.size)
+    || (entry?.catalogConsumers instanceof Map && entry.catalogConsumers.size),
+  );
+}
+
+function hmbDeliverImageAssetBridgeConsumers(entry, catalog, value) {
+  const consumers = catalog ? entry?.catalogConsumers : entry?.consumers;
+  const legacy = catalog ? entry?.catalogConsumer : entry?.consumer;
+  const delivered = new Set();
+  let firstError;
+  let hasError = false;
+  const deliver = (consumer) => {
+    if (typeof consumer !== "function" || delivered.has(consumer)) return;
+    delivered.add(consumer);
+    try { consumer(value); } catch (error) {
+      if (!hasError) { firstError = error; hasError = true; }
+    }
+  };
+  deliver(legacy);
+  if (consumers instanceof Map) {
+    for (const [token, item] of Array.from(consumers.entries())) {
+      // Another consumer can synchronously unmount a sibling while receiving
+      // the same result. Never call a removed mount from the copied iteration.
+      if (consumers.get(token) !== item) continue;
+      deliver(catalog ? item.consumer : item);
+    }
+  }
+  if (hasError) throw firstError;
+}
+
 function hmbUnregisterImageAssetThumbnailConsumer(container) {
   const registry = imageAssetThumbnailBridgeRegistry();
   const runtimeId = clean(container?.__hmbImageAssetThumbnailConsumerRuntimeId);
   const token = container?.__hmbImageAssetThumbnailConsumerToken;
   const current = runtimeId ? registry?.get(runtimeId) : null;
-  if (current && token && current.consumerToken === token) {
-    if (current.dispatch) {
-      const { consumer: _consumer, consumerToken: _consumerToken, ...bridge } = current;
-      registry.set(runtimeId, bridge);
-    } else {
-      registry.delete(runtimeId);
+  if (current && token) {
+    const bridge = { ...current };
+    bridge.consumers?.delete?.(token);
+    if (bridge.consumerToken === token) {
+      delete bridge.consumer;
+      delete bridge.consumerToken;
     }
+    if (bridge.dispatch || hmbImageAssetBridgeHasConsumers(bridge)) registry.set(runtimeId, bridge);
+    else registry.delete(runtimeId);
   }
   delete container?.__hmbImageAssetThumbnailConsumerRuntimeId;
   delete container?.__hmbImageAssetThumbnailConsumerToken;
+  delete container?.__hmbImageAssetThumbnailConsumer;
 }
 
 function hmbUnregisterImageAssetCatalogProbeConsumer(container) {
@@ -258,14 +296,15 @@ function hmbUnregisterImageAssetCatalogProbeConsumer(container) {
   const runtimeId = clean(container?.__hmbImageAssetCatalogProbeRuntimeId);
   const token = container?.__hmbImageAssetCatalogProbeConsumerToken;
   const current = runtimeId ? registry?.get(runtimeId) : null;
-  if (current && token && current.catalogConsumerToken === token) {
-    const {
-      catalogConsumer: _catalogConsumer,
-      catalogConsumerToken: _catalogConsumerToken,
-      catalogWake: _catalogWake,
-      ...bridge
-    } = current;
-    if (bridge.dispatch || bridge.consumer) registry.set(runtimeId, bridge);
+  if (current && token) {
+    const bridge = { ...current };
+    bridge.catalogConsumers?.delete?.(token);
+    if (bridge.catalogConsumerToken === token) {
+      delete bridge.catalogConsumer;
+      delete bridge.catalogConsumerToken;
+      delete bridge.catalogWake;
+    }
+    if (bridge.dispatch || hmbImageAssetBridgeHasConsumers(bridge)) registry.set(runtimeId, bridge);
     else registry.delete(runtimeId);
   }
   delete container?.__hmbImageAssetCatalogProbeRuntimeId;
@@ -288,16 +327,18 @@ function hmbRegisterImageAssetCatalogProbeConsumer(
   if (
     container.__hmbImageAssetCatalogProbeRuntimeId === runtimeId
     && container.__hmbImageAssetCatalogProbeConsumer === consumer
+    && imageAssetThumbnailBridgeRegistry()?.get(runtimeId)?.catalogConsumers
+      ?.get(container.__hmbImageAssetCatalogProbeConsumerToken)?.consumer === consumer
   ) return true;
   hmbUnregisterImageAssetCatalogProbeConsumer(container);
   const registry = imageAssetThumbnailBridgeRegistry();
   const token = `hmb-image-catalog-consumer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const current = registry?.get(runtimeId) || {};
+  const consumers = current.catalogConsumers instanceof Map ? current.catalogConsumers : new Map();
+  consumers.set(token, { consumer, wake: typeof wake === "function" ? wake : null });
   registry?.set(runtimeId, {
     ...current,
-    catalogConsumer: consumer,
-    catalogConsumerToken: token,
-    catalogWake: typeof wake === "function" ? wake : null,
+    catalogConsumers: consumers,
   });
   container.__hmbImageAssetCatalogProbeRuntimeId = runtimeId;
   container.__hmbImageAssetCatalogProbeConsumerToken = token;
@@ -306,7 +347,7 @@ function hmbRegisterImageAssetCatalogProbeConsumer(
     const registered = registry?.get(runtimeId) || {};
     const { catalogPendingResult: _pending, ...withoutPending } = registered;
     registry?.set(runtimeId, withoutPending);
-    consumer(current.catalogPendingResult);
+    hmbDeliverImageAssetBridgeConsumers(withoutPending, true, current.catalogPendingResult);
   }
   if (typeof current.dispatch === "function" && typeof wake === "function") wake();
   return true;
@@ -322,12 +363,16 @@ function hmbRegisterImageAssetThumbnailConsumer(container, state, consumer) {
   if (
     container.__hmbImageAssetThumbnailConsumerRuntimeId === runtimeId
     && container.__hmbImageAssetThumbnailConsumer === consumer
+    && imageAssetThumbnailBridgeRegistry()?.get(runtimeId)?.consumers
+      ?.get(container.__hmbImageAssetThumbnailConsumerToken) === consumer
   ) return true;
   hmbUnregisterImageAssetThumbnailConsumer(container);
   const registry = imageAssetThumbnailBridgeRegistry();
   const token = `hmb-image-thumbnail-consumer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const current = registry?.get(runtimeId) || {};
-  registry?.set(runtimeId, { ...current, consumer, consumerToken: token });
+  const consumers = current.consumers instanceof Map ? current.consumers : new Map();
+  consumers.set(token, consumer);
+  registry?.set(runtimeId, { ...current, consumers });
   container.__hmbImageAssetThumbnailConsumerRuntimeId = runtimeId;
   container.__hmbImageAssetThumbnailConsumerToken = token;
   container.__hmbImageAssetThumbnailConsumer = consumer;
@@ -337,7 +382,7 @@ function hmbRegisterImageAssetThumbnailConsumer(container, state, consumer) {
     const registered = registry?.get(runtimeId) || {};
     const { pendingResult: _pendingResult, ...withoutPending } = registered;
     registry?.set(runtimeId, withoutPending);
-    consumer(current.pendingResult);
+    hmbDeliverImageAssetBridgeConsumers(withoutPending, false, current.pendingResult);
   }
   return true;
 }
@@ -1070,6 +1115,8 @@ function normalizeState(value) {
   return markCanonicalImageAssetState({
     schema: "hmb-image-asset-library-state",
     version: IMAGE_ASSET_STATE_VERSION,
+    edit_transport_schema: clean(input.edit_transport_schema) === IMAGE_ASSET_EDIT_SCHEMA
+      ? IMAGE_ASSET_EDIT_SCHEMA : "",
     catalog_root: hmbRelocateImageProjectPath(
       input.catalog_root || PRODUCTION_PROJECTS_ROOT,
     ).replaceAll("\\", "/"),
@@ -1831,14 +1878,14 @@ function hmbForgetImageAssetStateEcho(container, publicationToken = null) {
   return next.length !== prior.length;
 }
 
-function hmbRememberImageAssetStateEcho(container, value, publicationToken) {
+function hmbRememberImageAssetStateEcho(container, value, publicationToken, compact = false) {
   if (!container || typeof value !== "string") return false;
   const prior = Array.isArray(container.__hmbImageAssetPendingStateEchoes)
     ? container.__hmbImageAssetPendingStateEchoes
     : [];
   container.__hmbImageAssetPendingStateEchoes = [
     ...prior.filter((item) => item?.value !== value),
-    { value, publicationToken },
+    { value, publicationToken, compact },
   ].slice(-16);
   if (container.__hmbImageAssetStateEchoTimer != null) {
     try { clearTimeout(container.__hmbImageAssetStateEchoTimer); } catch (_error) {}
@@ -1878,6 +1925,17 @@ export function hmbConsumeImageAssetStateEcho(container, nextProps = {}) {
   if (!Array.isArray(pending) || !pending.length) {
     return false;
   }
+  if (pending.some((item) => item?.compact)) {
+    const compact = hmbBuildImageAssetCompactEdit(
+      incomingState, imageAssetEditCatalogIdentity(incomingState),
+    );
+    const incomingCompact = compact ? JSON.stringify(compact) : "";
+    const match = pending.find((item) => item?.compact && item.value === incomingCompact);
+    if (match) {
+      hmbForgetImageAssetStateEcho(container, match.publicationToken);
+      return true;
+    }
+  }
   let incoming = "";
   try {
     incoming = JSON.stringify(incomingState);
@@ -1892,6 +1950,35 @@ export function hmbConsumeImageAssetStateEcho(container, nextProps = {}) {
   delete container.__hmbImageAssetIncomingSerialized;
   hmbForgetImageAssetStateEcho(container, match.publicationToken);
   return true;
+}
+
+function imageAssetEditCatalogIdentity(state) {
+  return {
+    catalog_root: clean(state?.catalog_root), project_root: clean(state?.project_root),
+    project_uid: clean(state?.project_uid), project_cache_uid: clean(state?.project_cache_uid),
+    manifest_signature: clean(state?.manifest_signature), folder_signature: clean(state?.folder_signature),
+    scan_revision: hmbNormalizeImageAssetRevision(state?.scan_revision),
+  };
+}
+
+export function hmbBuildImageAssetCompactEdit(state, acceptedIdentity) {
+  if (state?.edit_transport_schema !== IMAGE_ASSET_EDIT_SCHEMA || !acceptedIdentity) return null;
+  const identity = imageAssetEditCatalogIdentity(state);
+  if (Object.keys(identity).some((field) => identity[field] !== acceptedIdentity[field])) return null;
+  const edits = {};
+  for (const field of [
+    "root_edit_enabled", "selected_folder_path", "expanded_folders", "selected_main_type",
+    "selected_sub_type", "selected_source_view", "search", "language", "asset_view_mode",
+    "refresh_revision", "thumbnail_request", "asset_registration_request",
+    "asset_cleanup_request", "disconnect_import_uid", "shot_routing",
+  ]) edits[field] = state[field];
+  return {
+    schema: IMAGE_ASSET_EDIT_SCHEMA, version: 1,
+    catalog_identity: identity, scan_revision: identity.scan_revision,
+    [IMAGE_ASSET_UI_EDIT_REVISION_KEY]: state[IMAGE_ASSET_UI_EDIT_REVISION_KEY],
+    thumbnail_revision: hmbNormalizeImageAssetRevision(state?.thumbnail_revision),
+    selected_source_uids: selectedAssets(state).map((asset) => asset.source_uid), edits,
+  };
 }
 
 export function hmbPublishImageAssetState(
@@ -1929,7 +2016,10 @@ export function hmbPublishImageAssetState(
     : hmbNextImageAssetUiEditRevision(container, normalized);
   normalized[IMAGE_ASSET_UI_EDIT_REVISION_KEY] = nextUiEditRevision;
   hmbRememberImageAssetRevisionState(container, normalized, !preserveUiEditRevision);
-  const value = JSON.stringify(normalized);
+  const compactEdit = hmbBuildImageAssetCompactEdit(
+    normalized, container?.__hmbImageAssetAcceptedEditCatalogIdentity,
+  );
+  const value = JSON.stringify(compactEdit || normalized);
   if (container) {
     // Cache only the exact canonical snapshot that is about to become host
     // authority. Live state remains mutable; callers may reuse this string only
@@ -1942,13 +2032,13 @@ export function hmbPublishImageAssetState(
       uiEditRevision: hmbNormalizeImageAssetRevision(
         normalized[IMAGE_ASSET_UI_EDIT_REVISION_KEY],
       ),
-      value,
+      value: compactEdit ? "" : value,
     };
   }
   const publicationToken = ++imageAssetPublicationSequence;
   if (container) container.__hmbImageAssetPublicationOwner = publicationToken;
   if (options?.suppressMatchingEcho === true) {
-    hmbRememberImageAssetStateEcho(container, value, publicationToken);
+    hmbRememberImageAssetStateEcho(container, value, publicationToken, Boolean(compactEdit));
   }
   let attemptCount = 0;
   const maxRetries = typeof onFailure === "function" ? 0 : 1;
@@ -2098,15 +2188,47 @@ export function hmbUpdateImageAssetPropsReference(current, next, preserveValue =
   return target;
 }
 
+function imageAssetProjectPathKey(value) {
+  const path = clean(value).replaceAll("\\", "/");
+  // Display comparison only: retain drive/absolute roots while ignoring a
+  // trailing directory separator. Never rewrite backend project authority.
+  return (/^(?:[a-z]:)?\/+$/i.test(path) ? path : path.replace(/\/+$/, "")).toLowerCase();
+}
+
 function projectOptions(state) {
   const options = [`<option value="">${escapeHtml(imageAssetText(state, "select_project"))}</option>`];
+  const selectedPath = clean(state.project_root).replaceAll("\\", "/");
+  const selectedKey = imageAssetProjectPathKey(selectedPath);
+  let hasSelected = false;
   state.projects.forEach((project) => {
-    const selected = project.path.toLowerCase() === state.project_root.toLowerCase();
+    const selected = !hasSelected && imageAssetProjectPathKey(project.path) === selectedKey;
+    if (selected) hasSelected = true;
     options.push(
       `<option value="${escapeHtml(project.path)}" ${selected ? "selected" : ""}>${escapeHtml(project.name)}</option>`,
     );
   });
+  if (selectedPath && !hasSelected) {
+    // A partial catalog may omit the current path during a scan. Render its
+    // existing selection without adding a project record or fabricating UID.
+    const label = hmbImageAssetProjectDisplayName(state)
+      || selectedPath.split("/").filter(Boolean).pop() || selectedPath;
+    options.push(`<option value="${escapeHtml(selectedPath)}" selected disabled data-project-selection-display>${escapeHtml(label)}</option>`);
+  }
   return options.join("");
+}
+
+export function hmbImageAssetProjectDisplayName(state) {
+  const resolvedName = clean(state?.project_id);
+  if (resolvedName) return resolvedName;
+  const selectedPath = imageAssetProjectPathKey(state?.project_root);
+  if (!selectedPath) return "";
+  const project = (Array.isArray(state?.projects) ? state.projects : []).find((item) => (
+    imageAssetProjectPathKey(item?.path) === selectedPath
+  ));
+  // A selected catalog entry already supplies its display name while the scan
+  // resolves media authority. Keep that name out of state: UID/cache/manifest
+  // ownership must still come only from the backend's completed snapshot.
+  return project ? clean(project.name) || clean(project.project_id) : "";
 }
 
 function buildFolderTree(state) {
@@ -2114,7 +2236,7 @@ function buildFolderTree(state) {
   const root = {
     key: ROOT_FOLDER_KEY,
     path: "",
-    label: state.project_id || imageAssetText(state, "select_project"),
+    label: hmbImageAssetProjectDisplayName(state) || imageAssetText(state, "select_project"),
     children: [],
     assetCount: projectAssets.length,
   };
@@ -2382,6 +2504,7 @@ function hmbSyncImageAssetAttributes(current, desired) {
   if ("checked" in current) current.checked = Boolean(desired.checked);
   if (
     "value" in current
+    && current.tagName !== "SELECT"
     && !current.matches?.("[data-search],[data-shot-rename-input]")
     && current.value !== desired.value
   ) current.value = desired.value;
@@ -2449,6 +2572,12 @@ export function hmbPatchImageAssetElement(current, desired) {
   original.forEach((child) => {
     if (!retained.has(child) && child.parentNode === current) child.remove?.();
   });
+  // Option nodes are retained by position. Updating their values/selected
+  // attributes (or removing an earlier option) can clear or move selection.
+  // Apply the desired value only after the final option list is in place.
+  if (current.tagName === "SELECT" && current.value !== desired.value) {
+    current.value = desired.value;
+  }
   return true;
 }
 
@@ -4900,7 +5029,7 @@ function hmbSetImageAssetCompactThumbnailsActive(summary, active) {
 function renderImageAssetFixedTop(state) {
   return `<header class="top" data-library-toggle-surface="header">
       <div class="mark">IA</div>
-      <div class="heading"><b>HMBImageAssetLibrary</b><span>${escapeHtml(displayWindowsPath(state.catalog_root))} → ${escapeHtml(state.project_id || imageAssetText(state, "select_a_project"))}</span></div>
+      <div class="heading"><b>HMBImageAssetLibrary</b><span>${escapeHtml(displayWindowsPath(state.catalog_root))} → ${escapeHtml(hmbImageAssetProjectDisplayName(state) || imageAssetText(state, "select_a_project"))}</span></div>
       <div class="project-switch">
         <div class="project-actions">
           <button type="button" class="project-action" data-project-set aria-label="${escapeHtml(imageAssetText(state, "project_set"))}" title="${escapeHtml(imageAssetText(state, "project_set"))}" ${state.scan_busy ? "disabled" : ""}>S</button>
@@ -5028,7 +5157,7 @@ function render(
       <div class="library-expanded" data-library-expanded>
       <main class="workspace">
         <aside class="panel tree-panel">
-          <div class="panel-title"><span>${escapeHtml(imageAssetText(state, "project_folders"))}</span><b>${escapeHtml(state.project_id || imageAssetText(state, "ready"))}</b></div>
+          <div class="panel-title"><span>${escapeHtml(imageAssetText(state, "project_folders"))}</span><b>${escapeHtml(hmbImageAssetProjectDisplayName(state) || imageAssetText(state, "ready"))}</b></div>
           <div class="tree">${renderFolderNode(buildFolderTree(state), state)}</div>
         </aside>
         <section class="panel assets-panel">
@@ -6222,28 +6351,52 @@ function installEvents(container, state, props, remount, listeners) {
       selectedAssets: imageAssetShotAssets(state, activeImageAssetShot(state)),
     },
   );
-  const commitSlowProjectMutation = (mutate) => {
+  const commitSlowProjectMutation = (mutate, action = {}) => {
     if (container.__hmbImageAssetBusy || container.__hmbImageAssetRefreshCleanupPending || typeof mutate !== "function") return false;
-    const previous = {
-      catalog_root: state.catalog_root,
-      project_root: state.project_root,
-      project_id: state.project_id,
-      project_uid: state.project_uid,
-      project_cache_uid: state.project_cache_uid,
-      manifest_signature: state.manifest_signature,
-      folder_signature: state.folder_signature,
-      selected_folder_path: state.selected_folder_path,
-      expanded_folders: [...state.expanded_folders],
-      selected_main_type: state.selected_main_type,
-      selected_sub_type: state.selected_sub_type,
-      selected_source_view: state.selected_source_view,
-      refresh_revision: state.refresh_revision,
-    };
     const token = `${Date.now()}-${Math.random()}`;
+    const pendingAction = {
+      token,
+      mountToken: container.__hmbImageAssetMountToken,
+      runtimeId: imageAssetThumbnailRuntimeId(state),
+      channelUuid: clean(state.shot_routing?.channel_uuid),
+      catalogRoot: state.catalog_root,
+      projectRoot: state.project_root,
+      targetProjectRoot: clean(action.projectRoot),
+      projects: state.projects.map((project) => ({ ...project })),
+      scanRevision: hmbNormalizeImageAssetRevision(state.scan_revision),
+      uiEditRevision: hmbNormalizeImageAssetRevision(state[IMAGE_ASSET_UI_EDIT_REVISION_KEY]),
+    };
+    container.__hmbImageAssetPendingSlowAction = pendingAction;
     container.__hmbImageAssetSlowActionToken = token;
     hmbSetImageAssetBusy(container, true, imageAssetText(state, "busy_loading"));
     hmbAfterImageAssetPaint(() => {
-      if (container.__hmbImageAssetSlowActionToken !== token) return;
+      if (
+        container.__hmbImageAssetSlowActionToken !== token
+        || container.__hmbImageAssetPendingSlowAction !== pendingAction
+        || container.__hmbImageAssetMountToken !== pendingAction.mountToken
+        || imageAssetThumbnailRuntimeId(container.__hmbImageAssetLatestState) !== pendingAction.runtimeId
+        || clean(container.__hmbImageAssetLatestState?.shot_routing?.channel_uuid) !== pendingAction.channelUuid
+      ) return;
+      // Same-project metadata may arrive between the click and its first
+      // paint. Publish through the latest callbacks/state, rather than losing
+      // the click or overwriting that newer catalog with the pre-click object.
+      state = container.__hmbImageAssetLatestState || state;
+      const previous = {
+        catalog_root: state.catalog_root,
+        project_root: state.project_root,
+        project_id: state.project_id,
+        project_uid: state.project_uid,
+        project_cache_uid: state.project_cache_uid,
+        manifest_signature: state.manifest_signature,
+        folder_signature: state.folder_signature,
+        selected_folder_path: state.selected_folder_path,
+        expanded_folders: [...state.expanded_folders],
+        selected_main_type: state.selected_main_type,
+        selected_sub_type: state.selected_sub_type,
+        selected_source_view: state.selected_source_view,
+        refresh_revision: state.refresh_revision,
+      };
+      delete container.__hmbImageAssetPendingSlowAction;
       mutate();
       container.__hmbImageAssetRenderLimit = IMAGE_ASSET_RENDER_WINDOW;
       container.__hmbImageAssetRenderOffset = 0;
@@ -6380,7 +6533,7 @@ function installEvents(container, state, props, remount, listeners) {
   on(projectSelect, "change", () => {
     state = container.__hmbImageAssetLatestState || state;
     const path = clean(projectSelect.value).replaceAll("\\", "/");
-    if (!path || path === state.project_root) return;
+    if (!path || imageAssetProjectPathKey(path) === imageAssetProjectPathKey(state.project_root)) return;
     commitSlowProjectMutation(() => {
       state.project_root = path;
       state.project_id = "";
@@ -6392,7 +6545,7 @@ function installEvents(container, state, props, remount, listeners) {
       state.selected_main_type = "";
       state.selected_sub_type = "";
       state.selected_source_view = "project";
-    });
+    }, { projectRoot: path });
   });
 
   on(container.querySelector("[data-language-toggle]"), "click", (event) => {
@@ -6984,6 +7137,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
   rememberNodeInternalsUpdater(props);
   const cleanupImportHandles = hmbInstallImageAssetImportHandleDecoration(container);
   let state = normalizeState(props?.value);
+  container.__hmbImageAssetAcceptedEditCatalogIdentity = imageAssetEditCatalogIdentity(state);
   hmbRememberImageAssetPresentation(state);
   hmbAdoptImageAssetPresentation(state);
   container.__hmbImageAssetLatestState = state;
@@ -7203,6 +7357,9 @@ export default function HMBImageAssetLibraryWidget(container, props) {
       return;
     }
     const incomingState = normalizeState(nextProps?.value);
+    if (hmbImageAssetRevisionDisposition(container, incomingState) !== "stale") {
+      container.__hmbImageAssetAcceptedEditCatalogIdentity = imageAssetEditCatalogIdentity(incomingState);
+    }
     hmbRememberImageAssetPresentation(incomingState);
     hmbAdoptImageAssetPresentation(incomingState);
     if (imageAssetThumbnailOnlyTransition(
@@ -7264,6 +7421,49 @@ export default function HMBImageAssetLibraryWidget(container, props) {
       }
       props = hmbUpdateImageAssetPropsReference(props, nextProps);
       return;
+    }
+    const pendingSlowAction = container.__hmbImageAssetPendingSlowAction;
+    if (
+      pendingSlowAction
+      && pendingSlowAction.token === container.__hmbImageAssetSlowActionToken
+      && pendingSlowAction.mountToken === container.__hmbImageAssetMountToken
+    ) {
+      const sameCatalog = imageAssetProjectPathKey(incomingState.catalog_root)
+        === imageAssetProjectPathKey(pendingSlowAction.catalogRoot);
+      const sameProject = imageAssetProjectPathKey(incomingState.project_root)
+        === imageAssetProjectPathKey(pendingSlowAction.projectRoot);
+      const sameOwner = imageAssetThumbnailRuntimeId(incomingState) === pendingSlowAction.runtimeId
+        && clean(incomingState.shot_routing?.channel_uuid) === pendingSlowAction.channelUuid;
+      const targetKey = imageAssetProjectPathKey(pendingSlowAction.targetProjectRoot);
+      const targetPresent = !targetKey || incomingState.projects.some((project) => (
+        imageAssetProjectPathKey(project.path) === targetKey
+      ));
+      const advancedClock = hmbNormalizeImageAssetRevision(incomingState.scan_revision)
+        > pendingSlowAction.scanRevision
+        || hmbNormalizeImageAssetRevision(incomingState[IMAGE_ASSET_UI_EDIT_REVISION_KEY])
+          > pendingSlowAction.uiEditRevision;
+      if (
+        sameOwner && sameCatalog && sameProject
+        && (targetPresent || (!incomingState.projects.length && !advancedClock))
+      ) {
+        // Keep the selected DOM and loading feedback for this bounded paint
+        // interval. Metadata stays authoritative and becomes the command's
+        // base; an old non-busy echo cannot cancel the deferred user action.
+        props = hmbUpdateImageAssetPropsReference(props, nextProps);
+        hmbInvalidateImageAssetPublication(container);
+        state = !targetPresent && !incomingState.projects.length && !advancedClock
+          ? normalizeState({ ...incomingState, projects: pendingSlowAction.projects })
+          : incomingState;
+        container.__hmbImageAssetLatestState = state;
+        hmbRememberImageAssetRevisionState(container, state, false);
+        hmbAcceptImageAssetThumbnailResult(container, state);
+        return;
+      }
+      // A different authoritative context or removal of the selected target
+      // wins over an unpublished action. Its scheduled callback is now inert.
+      delete container.__hmbImageAssetPendingSlowAction;
+      delete container.__hmbImageAssetSlowActionToken;
+      hmbSetImageAssetBusy(container, false);
     }
     if (container.__hmbImageAssetSelectionCommitPending) {
       // Preserve the latest authoritative snapshot and merge only the local
@@ -7331,6 +7531,7 @@ export default function HMBImageAssetLibraryWidget(container, props) {
     hmbCancelImageAssetThumbnailRequest(container);
     // Invalidate an explicit project action that was queued for the next paint.
     // Its bounded RAF/task may still run, but the token guard makes it inert.
+    delete container.__hmbImageAssetPendingSlowAction;
     delete container.__hmbImageAssetSlowActionToken;
     clearListeners();
     container.__hmbImageAssetRefreshReviewCleanup?.();

@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 from contextlib import nullcontext
 import hashlib
+import inspect
 import os
 from pathlib import Path
 import sys
@@ -262,6 +263,22 @@ class BlenderScissorsPickerIntegration(unittest.TestCase):
                     "shot_name": "Shot 1",
                 })
                 node = picker.HMBVideoPickerLibrary(name="BlenderScissorsPickerIntegration")
+                try:
+                    from griptape_nodes.exe_types.flow import ControlFlow
+                    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+                except ImportError:
+                    pass
+                else:
+                    manager = GriptapeNodes.EventManager()
+                    manager.initialize_queue()
+                    options = {"name": f"BlenderFixtureFlow_{uuid.uuid4().hex}"}
+                    if "engine" in inspect.signature(ControlFlow).parameters:
+                        options["engine"] = manager.engine
+                    flow = ControlFlow(**options)
+                    flow.add_node(node)
+                    GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
+                    GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
+                    GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = flow.name
                 node._hmb_shot_catalog_snapshot = copy.deepcopy(catalog)
                 node._hmb_shot_route_status = {"ok": True, "code": "ready"}
                 node._write_state(state)
