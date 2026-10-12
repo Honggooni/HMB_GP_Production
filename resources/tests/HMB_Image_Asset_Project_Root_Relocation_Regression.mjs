@@ -565,6 +565,66 @@ if (!playwright || !fs.existsSync(executablePath)) {
       }
     }
 
+    // Owner clocks may restart at zero when the same host container receives a
+    // replacement runtime. Cancel only that unpublished owner's action before
+    // stale detection; a lower clock from the same owner must remain stale.
+    for (const replaceOwner of [true, false]) {
+      await page.evaluate((replaceOwner) => {
+        const f = fixture; f.uncMount('superwings12', false);
+        f.mount({ ...f.container.__hmbImageAssetLatestState, scan_revision: 5, ui_edit_revision: 7 });
+        f.dropdownTimeline = []; f.ownerBaseline = JSON.parse(JSON.stringify(f.container.__hmbImageAssetLatestState));
+        f.container.__hmbImageAssetLatestLocalUiEditRevision = 7;
+        f.container.__hmbImageAssetPendingStateEchoes = [{ value: 'old-owner-echo', publicationToken: 0 }];
+        f.prepaintHandler = (event) => {
+          if (!event.target.matches('#widget [data-project-select]')) return;
+          const incoming = JSON.parse(JSON.stringify(f.ownerBaseline)); incoming.scan_revision = 0; incoming.ui_edit_revision = 0;
+          if (replaceOwner) incoming.shot_routing.publisher_instance_uuid = '20000000-0000-4000-8000-000000000002';
+          f.ownerIncoming = incoming;
+          f.controller.update({ value: JSON.stringify(incoming), onChange: (value) => {
+            const promise = f.onChange(value); f.writes.at(-1).callback_owner = 'replacement'; return promise;
+          } });
+          f.dropdownSnap('owner-clock-echo');
+        };
+        document.addEventListener('change', f.prepaintHandler);
+      }, replaceOwner);
+      await page.selectOption('#widget [data-project-select]', '//192.168.200.19/v/projects/Ai_Ct_image/Dinoster5');
+      const ownerOutcome = await page.evaluate(async () => {
+        const f = fixture; await f.dropdownFrames('owner-deferred-paint'); await new Promise((resolve) => setTimeout(resolve, 30));
+        document.removeEventListener('change', f.prepaintHandler); f.dropdownSnap('after-owner-deferred-command');
+        const state = f.container.__hmbImageAssetLatestState;
+        return { timeline: f.dropdownTimeline, runtime_id: state.shot_routing.publisher_instance_uuid,
+          original_runtime_id: f.ownerBaseline.shot_routing.publisher_instance_uuid, incoming_runtime_id: f.ownerIncoming.shot_routing.publisher_instance_uuid,
+          scan_revision: state.scan_revision, ui_edit_revision: state.ui_edit_revision, busy: Boolean(f.container.__hmbImageAssetBusy),
+          latest_local_revision: Number(f.container.__hmbImageAssetLatestLocalUiEditRevision) || 0,
+          old_echo_count: f.container.__hmbImageAssetPendingStateEchoes?.length || 0,
+          selection_writes: f.writes.filter((row) => row.state.project_root === f.uncProjects[0].path).map((row) => ({
+            callback_owner: row.callback_owner || 'original', runtime_id: row.state.shot_routing.publisher_instance_uuid,
+            scan_revision: row.state.scan_revision, ui_edit_revision: row.state.ui_edit_revision })) };
+      });
+      const caseName = replaceOwner ? 'prepaint-new-owner-lower-clock-cancels-old-action' : 'prepaint-same-owner-lower-clock-remains-stale';
+      evidence.active_case = { case: caseName, ...ownerOutcome };
+      if (replaceOwner) {
+        assert.equal(ownerOutcome.selection_writes.length, 0, 'A lower-revision replacement owner cannot publish the old owner action or callback.');
+        assert.equal(ownerOutcome.runtime_id, ownerOutcome.incoming_runtime_id);
+        assert.deepEqual([ownerOutcome.scan_revision, ownerOutcome.ui_edit_revision, ownerOutcome.latest_local_revision, ownerOutcome.old_echo_count], [0, 0, 0, 0]);
+        assert.equal(ownerOutcome.busy, false);
+        const followup = await page.evaluate(() => {
+          const f = fixture, state = { ...f.ownerIncoming, project_root: f.uncProjects[1].path, project_id: 'Katuri8', ui_edit_revision: 1 };
+          f.controller.update({ value: JSON.stringify(state), onChange: f.onChange });
+          return f.dropdownSnap('new-owner-revision-one');
+        });
+        assert.equal(followup.select_label, 'Katuri8', 'The retired owner watermark cannot block the new owner revision one.');
+        ownerOutcome.followup = followup;
+      } else {
+        assert.equal(ownerOutcome.selection_writes.length, 1);
+        assert.deepEqual(ownerOutcome.selection_writes[0], { callback_owner: 'original', runtime_id: ownerOutcome.original_runtime_id, scan_revision: 5, ui_edit_revision: 8 });
+        assert.equal(ownerOutcome.runtime_id, ownerOutcome.original_runtime_id);
+        assert.equal(ownerOutcome.busy, true);
+      }
+      evidence.cases.push({ case: caseName, ...ownerOutcome });
+      delete evidence.active_case;
+    }
+
     await page.evaluate(() => {
       fixture.uncMount('', false);
       fixture.prepaintHandler = (event) => {

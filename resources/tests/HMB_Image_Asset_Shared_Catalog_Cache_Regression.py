@@ -34,7 +34,9 @@ def png_bytes(color: tuple[int, int, int]) -> bytes:
 
 
 with tempfile.TemporaryDirectory(prefix="hmb_shared_catalog_") as temporary:
-    temporary_root = Path(temporary)
+    # Windows CI TEMP may use an 8.3 alias. Match the canonical paths emitted
+    # by project discovery, just as a native dropdown selection does.
+    temporary_root = Path(temporary).resolve()
     asset_library._ASSET_CATALOG_INDEX_ROOT = temporary_root / "cache" / "image_catalogs"
     asset_library._ASSET_THUMBNAIL_CACHE_ROOT = temporary_root / "cache" / "image_thumbnails"
     catalog_a = temporary_root / "MountA"

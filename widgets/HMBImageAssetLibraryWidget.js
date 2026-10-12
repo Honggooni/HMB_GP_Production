@@ -7357,6 +7357,35 @@ export default function HMBImageAssetLibraryWidget(container, props) {
       return;
     }
     const incomingState = normalizeState(nextProps?.value);
+    const queuedOwnerAction = container.__hmbImageAssetPendingSlowAction;
+    if (
+      queuedOwnerAction
+      && queuedOwnerAction.token === container.__hmbImageAssetSlowActionToken
+      && queuedOwnerAction.mountToken === container.__hmbImageAssetMountToken
+    ) {
+      // Revision clocks belong to an owner. Only an explicit replacement while
+      // a project action awaits its first paint can reset these watermarks;
+      // ordinary lower-revision echoes keep the existing stale-state policy.
+      const rawRouting = parseValue(nextProps?.value)?.shot_routing;
+      const incomingRuntime = imageAssetThumbnailRuntimeId(incomingState);
+      const incomingChannel = clean(incomingState.shot_routing?.channel_uuid);
+      const runtimeChanged = queuedOwnerAction.runtimeId && incomingRuntime
+        && clean(rawRouting?.publisher_instance_uuid) === incomingRuntime
+        && incomingRuntime !== queuedOwnerAction.runtimeId;
+      const channelChanged = queuedOwnerAction.channelUuid && incomingChannel
+        && clean(rawRouting?.channel_uuid) === incomingChannel
+        && incomingChannel !== queuedOwnerAction.channelUuid;
+      if (runtimeChanged || channelChanged) {
+        delete container.__hmbImageAssetPendingSlowAction;
+        delete container.__hmbImageAssetSlowActionToken;
+        hmbSetImageAssetBusy(container, false);
+        hmbForgetImageAssetStateEcho(container);
+        delete container.__hmbImageAssetCurrentScanRevision;
+        delete container.__hmbImageAssetCurrentUiEditRevision;
+        delete container.__hmbImageAssetLatestLocalUiEditRevision;
+        delete container.__hmbImageAssetCanonicalSerialization;
+      }
+    }
     if (hmbImageAssetRevisionDisposition(container, incomingState) !== "stale") {
       container.__hmbImageAssetAcceptedEditCatalogIdentity = imageAssetEditCatalogIdentity(incomingState);
     }
