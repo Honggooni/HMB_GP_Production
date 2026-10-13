@@ -119,6 +119,7 @@ from _hmb_mp4_verify import (
 )
 import _hmb_shot_routing as _shot_routing
 import _hmb_review as _review
+from _hmb_project import project_from_asset_payload, resolve_project
 from _hmb_build_diagnostics import get_build_diagnostics as _get_build_diagnostics
 from _hmb_common import (
     _broker_load_bearer_token_readonly,
@@ -147,7 +148,7 @@ AI_BROKER_DEVICE_POLL_MAX_CONSECUTIVE_TRANSPORT_ERRORS = 3
 # same-account creates that arrive less than one second apart.  The lock is
 # released before network I/O, so accepted remote renders continue together.
 AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 1.20
-_BROKER_SUBMISSION_CADENCE_LOCK = threading.Lock()
+_BROKER_SUBMISSION_CADENCE_LOCK = threading.RLock()
 _BROKER_SUBMISSION_LAST_STARTED = 0.0
 _WORKFLOW_CHECKPOINT_LOCKS: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, asyncio.Lock
@@ -155,6 +156,8 @@ _WORKFLOW_CHECKPOINT_LOCKS: weakref.WeakKeyDictionary[
 _WORKFLOW_CHECKPOINT_LOCKS_GUARD = threading.Lock()
 _RECOVERY_JOURNAL_OWNERS: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
 _RECOVERY_JOURNAL_OWNERS_GUARD = threading.Lock()
+_DRAFT_OWNERS: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
+_DRAFT_OWNERS_GUARD = threading.Lock()
 
 LOCAL_VIDEO_UPLOAD_GRIPTAPE = "Griptape Cloud (Existing)"
 LOCAL_VIDEO_UPLOAD_TOS = "Volcengine TOS"
@@ -335,6 +338,22 @@ TASK_OMNI_REFERENCE_TYPES = {
 BROKER_SEEDANCE_CAPABILITIES_PATH = "/api/v1/generate/video/capabilities"
 BROKER_SEEDANCE_CAPABILITIES_SCHEMA = "hmb-seedance-generation-capabilities"
 BROKER_SEEDANCE_CAPABILITIES_VERSION = 2
+BROKER_SEEDANCE_DRAFT_CAPABILITIES_VERSION = 3
+DRAFT_ACTION_OFF = "Off"
+DRAFT_ACTION_PREVIEW = "Draft 480p"
+DRAFT_ACTION_FINAL = "Finalize Draft 1080p"
+DRAFT_ACTION_CHOICES = (DRAFT_ACTION_OFF, DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL)
+DRAFT_SOURCE_PARAMETER = "HMB_SEEDANCE_DRAFT_SOURCE"
+DRAFT_SOURCES_PARAMETER = "HMB_SEEDANCE_DRAFT_SOURCES"
+PROJECT_SELECTION_SCHEMA = "hmb-imageasset-project-selection-v1"
+
+
+class _ProjectSelectionChanged(ValueError):
+    """The captured local selection lost authority before a create request."""
+
+
+DRAFT_OWNER_PARAMETER = "HMB_SEEDANCE_DRAFT_OWNER"
+DRAFT_SOURCE_TTL_MS = 604800000
 INPUT_MODE_TASKS = {
     INPUT_MODE_TEXT_ONLY: TASK_TEXT_ONLY,
     INPUT_MODE_FIRST_LAST_FRAME: TASK_FIRST_LAST_FRAME,
@@ -406,9 +425,8 @@ MODEL_DISPLAY_NAME_BY_ID = {
 MODEL_RESOLUTIONS = {
     SEEDANCE_2_0_MODEL_ID: ("4k", "1080p", "720p", "480p"),
     SEEDANCE_2_0_FAST_MODEL_ID: ("720p", "480p"),
-    # Seedance 2.5 production contract: 720p default and optional 1080p
-    # (10-bit HEVC).  480p is intentionally not exposed.
-    SEEDANCE_2_5_MODEL_ID: ("720p", "1080p"),
+    # Ordinary 480p is independent from the explicit, separately billed Draft flow.
+    SEEDANCE_2_5_MODEL_ID: ("480p", "720p", "1080p"),
 }
 
 MODEL_DEFAULT_RESOLUTIONS = {
@@ -653,7 +671,7 @@ def _seedance_refresh_command_value(value: Any = None) -> dict[str, Any]:
     if (
         source.get("schema") != SEEDANCE_REFRESH_COMMAND_SCHEMA
         or source.get("version") != SEEDANCE_REFRESH_COMMAND_VERSION
-        or action not in {"refresh_existing", "open_gallery"}
+        or action not in {"refresh_existing", "open_gallery", "finalize_draft", "cancel_draft_final"}
         or not action_id
         or len(action_id) > 128
         or _TASK_ID_PATTERN.fullmatch(action_id) is None
@@ -664,13 +682,20 @@ def _seedance_refresh_command_value(value: Any = None) -> dict[str, Any]:
     if not isinstance(issued_at_ms, int) or isinstance(issued_at_ms, bool):
         issued_at_ms = 0
     issued_at_ms = min(9_999_999_999_999, max(0, issued_at_ms))
-    return {
+    result = {
         "schema": SEEDANCE_REFRESH_COMMAND_SCHEMA,
         "version": SEEDANCE_REFRESH_COMMAND_VERSION,
         "action": action,
         "action_id": action_id,
         "issued_at_ms": issued_at_ms,
     }
+    if action in {"finalize_draft", "cancel_draft_final"}:
+        expected = source.get("expected_draft_job_id")
+        if not isinstance(expected, str) or re.fullmatch(r"job-[0-9a-f]{32}", expected) is None:
+            result.update(action="", action_id="")
+        else:
+            result["expected_draft_job_id"] = expected
+    return result
 
 
 def _generated_video_origin(value: Any = None) -> dict[str, Any]:
@@ -708,6 +733,66 @@ def _generated_video_source_value(value: Any = None) -> dict[str, Any]:
             "generation_id": task_id, "task_id": task_id,
             "result_revision": revision, "path": path, "url": path,
             "completed": True}
+
+
+def _seedance_draft_source_value(value: Any = None) -> dict[str, Any]:
+    """Retain only local job identity, project and origin; never prompt or media URLs."""
+    if (not isinstance(value, dict) or not isinstance(value.get("broker_server_url"), str)
+            or not value["broker_server_url"]
+            or re.fullmatch(r"job-[0-9a-f]{32}", str(value.get("draft_job_id") or "")) is None):
+        return {}
+    try:
+        project = resolve_project(value, default_legacy=False)
+        if any(value.get(key) != project[key] for key in ("project_id", "project_name")):
+            return {}
+        origin = _broker_validated_server_url(str(value.get("broker_server_url") or ""))
+    except (ValueError, TypeError, _BrokerError):
+        return {}
+    result = {"draft_job_id": value["draft_job_id"],
+              **{key: project[key] for key in ("project_id", "project_name")}, "broker_server_url": origin}
+    if "generation_origin" in value:
+        generation_origin = _generated_video_origin(value.get("generation_origin"))
+        owner = _seedance_uuid_text(value.get("owner_id"))
+        created = value.get("created_at_ms")
+        if (not owner or type(created) is not int or not 0 < created < 9_999_999_999_999
+                or value.get("completed") is not True
+                or (value.get("generation_origin") != {} and not generation_origin)):
+            return {}
+        result.update(generation_origin=generation_origin, owner_id=owner,
+                      created_at_ms=created, completed=True)
+        bindings = value.get("source_bindings", {})
+        if not isinstance(bindings, dict) or set(bindings) - {"image_asset", "video_picker"}:
+            return {}
+        if any(not _seedance_uuid_text(item) for item in bindings.values()):
+            return {}
+        result["source_bindings"] = dict(bindings)
+    for name in ("final_request_id", "final_job_id"):
+        identifier = value.get(name)
+        if identifier:
+            if not isinstance(identifier, str) or _TASK_ID_PATTERN.fullmatch(identifier) is None:
+                return {}
+            result[name] = identifier
+    return result
+
+
+def _seedance_draft_final_request_id(draft_job_id: str) -> str:
+    """Share one Final intent with the authenticated web review workflow."""
+    if not isinstance(draft_job_id, str) or re.fullmatch(r"job-[0-9a-f]{32}", draft_job_id) is None:
+        raise ValueError("Finalization requires a canonical Broker Draft task ID.")
+    return "hmb-draft-final-v1-" + draft_job_id
+
+
+class _SeedanceDraftOutputDestination:
+    """A distinct no-overwrite MP4 path for each explicit paid Draft action."""
+    _existing_file_policy = ExistingFilePolicy.FAIL
+    _append = False
+    _create_parents = True
+
+    def __init__(self, location: str) -> None:
+        self.location = location
+
+    def resolve(self) -> str:
+        return self.location
 
 
 def _seedance_recovery_value(value: Any = None) -> dict[str, Any]:
@@ -783,7 +868,7 @@ def _seedance_recovery_value(value: Any = None) -> dict[str, Any]:
             return 0
         return min(maximum, max(0, raw))
 
-    return {
+    checkpoint = {
         "schema": SEEDANCE_RECOVERY_SCHEMA,
         "version": SEEDANCE_RECOVERY_VERSION,
         "journal_id": _seedance_uuid_text(source.get("journal_id")),
@@ -803,6 +888,22 @@ def _seedance_recovery_value(value: Any = None) -> dict[str, Any]:
         "broker_server_url": broker_server_url,
         "generation_origin": _generated_video_origin(source.get("generation_origin")) if task_id else {},
     }
+    if source.get("draft_action") in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}:
+        checkpoint["draft_action"] = source["draft_action"]
+        try:
+            checkpoint["draft_project"] = resolve_project(source.get("draft_project"), default_legacy=False)
+        except (ValueError, TypeError):
+            checkpoint["draft_project"] = {}
+        bindings = source.get("draft_source_bindings")
+        if isinstance(bindings, dict) and not set(bindings) - {"image_asset", "video_picker"} and all(_seedance_uuid_text(item) for item in bindings.values()):
+            checkpoint["draft_source_bindings"] = dict(bindings)
+        started = source.get("draft_started_at_ms")
+        if type(started) is int and 0 < started < 9_999_999_999_999:
+            checkpoint["draft_started_at_ms"] = started
+    draft_source = _seedance_draft_source_value(source.get("draft_source"))
+    if draft_source:
+        checkpoint["draft_source"] = draft_source
+    return checkpoint
 
 
 def _workflow_checkpoint_lock() -> asyncio.Lock:
@@ -928,6 +1029,7 @@ def _seedance_widget_value(
     shot_catalog: Any = None,
     generation: Any = None,
     remote_prompt_route: Any = None,
+    draft: Any = None,
 ) -> dict[str, Any]:
     """Build the sole backend-authoritative Seedance custom-widget value."""
 
@@ -953,10 +1055,25 @@ def _seedance_widget_value(
         "shot_catalog": catalog,
         "shot": shot_value,
         "generation": _seedance_generation_preview_value(generation),
+        "draft": _seedance_draft_ui_value(draft),
         "remote_prompt_route": _seedance_remote_prompt_route_value(
             remote_prompt_route
         ),
     }
+
+
+def _seedance_draft_ui_value(value: Any = None) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    return {"visible": source.get("visible") is True,
+            "action": source.get("action") if source.get("action") in DRAFT_ACTION_CHOICES else DRAFT_ACTION_OFF,
+            "preview_available": source.get("preview_available") is True,
+            "final_available": source.get("final_available") is True,
+            "job_id": str(source.get("job_id") or "")[:128],
+            "effective_resolution": str(source.get("effective_resolution") or "")[:16],
+            "busy": source.get("busy") is True,
+            "cancel_available": source.get("cancel_available") is True,
+            "active_job_id": str(source.get("active_job_id") or "")[:128],
+            "reason": str(source.get("reason") or "")[:400]}
 
 
 def _seedance_remote_prompt_route_value(value: Any = None) -> dict[str, Any]:
@@ -1716,6 +1833,11 @@ class _HMBAIBrokerBridge:
             "execution_expires_after",
             "priority",
             "client_request_id",
+            "project_id",
+            "project_name",
+            "project_selection_schema",
+            "draft",
+            "draft_job_id",
         }
     )
     _COMMON_SEEDANCE_FIELDS = frozenset(
@@ -1735,6 +1857,9 @@ class _HMBAIBrokerBridge:
             "web_search",
             "content_filter",
             "client_request_id",
+            "project_id",
+            "project_name",
+            "project_selection_schema",
         }
     )
     _REFERENCE_MODE_FIELDS = frozenset(
@@ -1756,7 +1881,8 @@ class _HMBAIBrokerBridge:
         | _REFERENCE_MODE_FIELDS,
         SEEDANCE_2_5_MODEL_ID: _COMMON_SEEDANCE_FIELDS
         | _REFERENCE_MODE_FIELDS
-        | _SEEDANCE_V2_FIELDS,
+        | _SEEDANCE_V2_FIELDS
+        | frozenset({"draft", "draft_job_id"}),
     }
     def __init__(
         self, *, opener: Any | None = None, server_url: str | None = None,
@@ -2064,21 +2190,28 @@ class _HMBAIBrokerBridge:
             # The POST has already crossed the transport boundary. An invalid
             # JSON/origin response cannot prove that it was never accepted.
             # HTTP rejections are classified separately above; preflight errors
-            # occur before this try block and must not acquire this flag.
-            if submission:
+            # normally occur before this try block. The command-bound web
+            # opener also completes a separate prepared handshake inside open;
+            # only its internal exception marker proves the create never began.
+            # Response bodies and caller payloads cannot set this marker.
+            if submission and getattr(exc, "_hmb_web_submission_not_started", False) is not True:
                 exc.submission_outcome_unknown = True
             raise
         except (TimeoutError, urllib.error.URLError, OSError) as exc:
+            not_started = getattr(exc, "_hmb_web_submission_not_started", False) is True
             _broker_log_transport_error(
-                stage="broker_submission" if submission else "broker_request",
+                stage="broker_web_prepared" if not_started else "broker_submission" if submission else "broker_request",
                 attempt=1,
                 exc=exc,
                 server_url=self.server_url,
             )
-            raise _BrokerUnavailableError(
+            unavailable = _BrokerUnavailableError(
                 "FN AI Broker did not respond.",
-                submission_outcome_unknown=submission,
-            ) from exc
+                submission_outcome_unknown=bool(submission and not not_started),
+            )
+            if not_started:
+                unavailable._hmb_web_submission_not_started = True
+            raise unavailable from exc
         if not isinstance(result, dict):
             raise _BrokerProtocolError(
                 "FN AI Broker returned an invalid response.",
@@ -2192,7 +2325,8 @@ class _HMBAIBrokerBridge:
             if (
                 not isinstance(response, dict)
                 or response.get("schema") != BROKER_SEEDANCE_CAPABILITIES_SCHEMA
-                or response.get("version") != BROKER_SEEDANCE_CAPABILITIES_VERSION
+                or type(response.get("version")) is not int
+                or response.get("version") not in {BROKER_SEEDANCE_CAPABILITIES_VERSION, BROKER_SEEDANCE_DRAFT_CAPABILITIES_VERSION}
                 or not isinstance(response.get("models"), dict)
             ):
                 raise _BrokerProtocolError(
@@ -2239,6 +2373,28 @@ class _HMBAIBrokerBridge:
                 "FN AI Broker has not enabled returned Seedance last frames."
             )
 
+    def require_seedance_draft_features(self, *, timeout: float = 10.0) -> None:
+        """Authenticate the exact Draft contract before uploads or either paid POST."""
+        response = self._request_json(
+            "GET", BROKER_SEEDANCE_CAPABILITIES_PATH + "?draft=1", payload=None,
+            timeout=max(1.0, min(float(timeout), 30.0)),
+        )
+        profile = response.get("models", {}).get(SEEDANCE_2_5_MODEL_ID) if isinstance(response, dict) and isinstance(response.get("models"), dict) else None
+        if (not isinstance(response, dict)
+                or response.get("schema") != BROKER_SEEDANCE_CAPABILITIES_SCHEMA
+                or type(response.get("version")) is not int
+                or response.get("version") != BROKER_SEEDANCE_DRAFT_CAPABILITIES_VERSION
+                or not isinstance(profile, dict)
+                or profile.get("draft_generation") is not True
+                or profile.get("draft_preview_resolution") != "480p"
+                or profile.get("draft_final_resolution") != "1080p"
+                or profile.get("draft_source_reference") != "broker_job_id"
+                or type(profile.get("draft_source_ttl_seconds")) is not int
+                or profile.get("draft_source_ttl_seconds") != 604800):
+            raise _BrokerProtocolError(
+                "FN AI Broker has not enabled Seedance 2.5 Draft. No render was submitted."
+            )
+
     def generate_seedance(
         self,
         payload: dict[str, Any],
@@ -2254,6 +2410,15 @@ class _HMBAIBrokerBridge:
             for key, value in payload.items()
             if value is not None and value != []
         }
+        if "project_id" in request_payload or "project_name" in request_payload:
+            project = resolve_project(request_payload, default_legacy=False)
+            if any(request_payload.get(key) != project[key] for key in ("project_id", "project_name")):
+                raise _BrokerProtocolError("Seedance Broker project metadata is not canonical.")
+        if "project_selection_schema" in request_payload and (
+            request_payload["project_selection_schema"] != PROJECT_SELECTION_SCHEMA
+            or not all(key in request_payload for key in ("project_id", "project_name"))
+        ):
+            raise _BrokerProtocolError("Seedance Broker selected-project provenance is invalid.")
         request_payload["provider"] = "volcengine_ark"
         model = str(request_payload.get("model") or "").strip()
         if not model:
@@ -2263,6 +2428,26 @@ class _HMBAIBrokerBridge:
             raise _BrokerProtocolError(
                 "Selected Seedance model is not supported by the HMB Broker contract."
             )
+        draft_source = request_payload.get("draft_job_id")
+        draft = request_payload.get("draft", False)
+        if type(draft) is not bool or ("draft" in request_payload and model != SEEDANCE_2_5_MODEL_ID):
+            raise _BrokerProtocolError("Draft requires Seedance 2.5 and a literal boolean.")
+        if draft_source is not None:
+            allowed = {"provider", "model", "draft_job_id", "quality", "client_request_id", "project_id", "project_name"}
+            if (model != SEEDANCE_2_5_MODEL_ID or not isinstance(draft_source, str)
+                    or re.fullmatch(r"job-[0-9a-f]{32}", draft_source) is None
+                    or request_payload.get("quality") != "1080p"
+                    or not isinstance(request_payload.get("client_request_id"), str)
+                    or _TASK_ID_PATTERN.fullmatch(request_payload["client_request_id"]) is None
+                    or set(request_payload) - allowed):
+                raise _BrokerProtocolError("Draft final submission must contain only a local Broker Draft ID and 1080p target.")
+            self.require_seedance_draft_features(timeout=min(float(timeout), 30.0))
+            return self._request_json("POST", "/api/v1/generate/video", payload=request_payload, timeout=timeout,
+                                      idempotency_key=str(request_payload.get("client_request_id") or ""))
+        if draft:
+            if request_payload.get("quality") != "480p" or request_payload.get("resolution") != "480p":
+                raise _BrokerProtocolError("Draft previews require 480p.")
+            self.require_seedance_draft_features(timeout=min(float(timeout), 30.0))
         task = str(request_payload.get(TASK_PARAMETER) or "").strip()
         if task:
             if task not in TASK_STORAGE_CHOICES:
@@ -2483,6 +2668,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._generation_refresh_lock = threading.Lock()
         self._generation_refresh_running = False
         self._generation_run_active = threading.Event()
+        self._hmb_draft_finalize_pending = False
+        self._hmb_draft_finalize_task = None
+        self._hmb_draft_final_context = None
+        self._hmb_draft_controls_syncing = False
+        self._hmb_draft_pending_source = {}
         self._hmb_generation_preview_state = _seedance_generation_preview_value()
         self._hmb_generation_recovery_restore_fingerprint: (
             tuple[Any, ...] | None
@@ -3179,10 +3369,20 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 default_value=MODEL_DEFAULT_RESOLUTIONS[SEEDANCE_2_5_MODEL_ID],
                 tooltip=(
                     "Seedance 2.0 defaults to 1080p. Seedance 2.5 and Fast "
-                    "default to 720p; 2.5 also offers 1080p 10-bit HEVC."
+                    "default to 720p; 2.5 also offers 480p and 1080p."
                 ),
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
                 traits={Options(choices=list(MODEL_RESOLUTIONS[SEEDANCE_2_5_MODEL_ID]))},
+            )
+            ParameterString(
+                name="draft_action", default_value=DRAFT_ACTION_OFF,
+                tooltip=("Seedance 2.5 Only or Shot at 480p. Draft 480p creates an MP4 preview; "
+                         "after reviewing it, use the dedicated Draft final button once to run only this Generator at 1080p. "
+                         "Both stages are separate paid renders. No automatic final render is submitted."),
+                allowed_modes={ParameterMode.PROPERTY},
+                traits={Options(choices=list(DRAFT_ACTION_CHOICES))},
+                ui_options={"display_name": "Draft Action (MP4)", "simple_dropdown": [DRAFT_ACTION_OFF, DRAFT_ACTION_PREVIEW]},
+                hide=True,
             )
             ParameterString(
                 name="ratio",
@@ -3241,6 +3441,29 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self.add_node_element(generation_settings)
 
         with ParameterGroup(name="Volcengine Advanced") as advanced_settings:
+            ParameterString(
+                name="draft_job_id", default_value="",
+                tooltip=("Completed Draft LOCAL Broker job ID (job-...). Stored after Draft success. "
+                         "Finalization reuses its original prompt/media/settings on the Broker; "
+                         "current Generator settings are not resubmitted. Source valid for 7 days."),
+                allowed_modes={ParameterMode.PROPERTY},
+                ui_options={"display_name": "Draft Broker Job ID", "readonly": True}, hide=True,
+            )
+            ParameterDict(
+                name=DRAFT_SOURCE_PARAMETER, default_value={},
+                allowed_modes={ParameterMode.PROPERTY}, hide=True,
+                ui_options={"hide": True, "hide_property": True, "hide_label": True, "hide_handles": True},
+            )
+            ParameterDict(
+                name=DRAFT_SOURCES_PARAMETER, default_value={"version": 1, "sources": {}},
+                allowed_modes={ParameterMode.PROPERTY}, hide=True,
+                ui_options={"hide": True, "hide_property": True, "hide_label": True, "hide_handles": True},
+            )
+            ParameterString(
+                name=DRAFT_OWNER_PARAMETER, default_value=str(uuid4()),
+                allowed_modes={ParameterMode.PROPERTY}, hide=True,
+                ui_options={"hide": True, "hide_property": True, "hide_label": True, "hide_handles": True},
+            )
             ParameterString(
                 name="resume_generation_id",
                 default_value="",
@@ -3834,6 +4057,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
         checkpoint_task_id = str(checkpoint.get("task_id") or "").strip()
         output_file = str(persisted.get("output_file") or "").strip()
+        if (checkpoint_task_id and persisted.get("task_id") == checkpoint_task_id
+                and persisted.get("draft_action") in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}):
+            if not output_file:
+                raise _BrokerProtocolError("The saved Draft output path is unavailable. No new render was submitted.")
+            # Refresh and explicit Resume share the exact paid-stage path and
+            # reject collisions instead of inheriting project overwrite policy.
+            return _SeedanceDraftOutputDestination(output_file)
         if (
             not checkpoint_task_id
             or persisted.get("task_id") != checkpoint_task_id
@@ -3869,6 +4099,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return False
         if bool(getattr(self, "is_cancellation_requested", False)):
             return False
+        self._assert_operation_project_selection()
+        context = getattr(self, "_hmb_draft_final_context", None)
+        if isinstance(context, dict):
+            try:
+                source = self._validated_draft_final_source(context["source"], allow_reserved=True)
+                if self._draft_source_record().get("draft_job_id") != source["draft_job_id"]:
+                    return False
+            except (ValueError, RuntimeError):
+                return False
         return bool(
             not require_registered
             or self._runtime_node_is_live(require_registered=True)
@@ -3876,7 +4115,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     async def _discard_unsent_generation_checkpoint(self, *, reason: str) -> None:
         """Clear a provisional identity after proving no create call began."""
-
+        self._release_unsubmitted_draft_reservation()
         self.parameter_output_values["generation_id"] = ""
         self.parameter_output_values["generation_status"] = ""
         self.parameter_output_values["provider_response"] = None
@@ -4191,7 +4430,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # render across that transition.  Every later stage therefore retains
         # the submitted destination even if the user edits the visible field.
         previous_output_file = str(previous.get("output_file") or "")
-        current_output_file = self._current_recovery_output_file()
+        current_output_file = str(source_params.get("_hmb_output_file") or self._current_recovery_output_file())
         default_output_file = str(
             getattr(self._output_file, "_default_filename", "") or ""
         ).strip()
@@ -4233,6 +4472,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "return_last_frame": return_last_frame,
                 "output_file": output_file,
                 "broker_server_url": broker_server_url,
+                "draft_action": previous.get("draft_action", source_params.get("draft_action")) if stage != "pre_submit" else source_params.get("draft_action"),
+                "draft_project": source_params.get("_hmb_draft_project", previous.get("draft_project")),
+                "draft_source": source_params.get("_hmb_draft_source", previous.get("draft_source")),
+                "draft_source_bindings": source_params.get("_hmb_draft_source_bindings", previous.get("draft_source_bindings")),
+                "draft_started_at_ms": source_params.get("_hmb_draft_started_at_ms", previous.get("draft_started_at_ms")),
                 "generation_origin": (
                     source_params.get("_hmb_generation_origin")
                     if "_hmb_generation_origin" in source_params
@@ -4249,6 +4493,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
         try:
             _review.bind_task_origin(checkpoint["task_id"], checkpoint["broker_server_url"])
+            if source_params.get("project_id"):
+                _review.bind_task_project(checkpoint["task_id"], source_params)
         except (OSError, ValueError, TypeError):
             # Optional review routing never replaces the paid recovery journal
             # or changes submission/retrieval success.
@@ -4518,7 +4764,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     def _start_review_case(self, client_request_id: str, submitted_prompt: str) -> None:
         try:
-            source = self._manual_agent_prompt_source()
+            source = None if self._draft_final_requested() else self._manual_agent_prompt_source()
             getter = getattr(source, "_hmb_agent_reference_observation_snapshot", None)
             observation = getter() if callable(getter) else {"status": "not_available"}
             self._hmb_review_case_id = _review.start_case(
@@ -4948,6 +5194,137 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             daemon=True,
         ).start()
 
+    def _on_finalize_draft_clicked(self, _button: Any, _details: Any, *, action_id: str = "",
+                                   expected_draft_job_id: str = "") -> Any:
+        """Capture one exact completed Draft and dispatch only this Generator."""
+        reserved_here = False
+        try:
+            if not self._runtime_node_is_live(require_registered=True):
+                raise ValueError("The Generator is inactive.")
+            self._assert_draft_final_flow_idle()
+            source = self._validated_draft_final_source()
+            if expected_draft_job_id != source["draft_job_id"]:
+                raise ValueError("The selected Draft changed. Review the current Shot before finalizing.")
+            event_loop = getattr(GriptapeNodes.EventManager(), "event_loop", None)
+            if event_loop is None or not event_loop.is_running():
+                raise ValueError("The engine event loop is unavailable; no Final was submitted.")
+            with self._generation_refresh_lock:
+                if (self._generation_run_active.is_set() or self._generation_refresh_running
+                        or self._hmb_draft_finalize_pending):
+                    return NodeMessageResult(success=True, details="Generator is busy; no duplicate Final was scheduled.",
+                                             response=_details, altered_workflow_state=False)
+                self._hmb_draft_finalize_pending = True
+                self._hmb_draft_pending_source = deepcopy(source)
+                reserved_here = True
+            clear = getattr(self, "clear_cancellation", None)
+            if callable(clear):
+                clear()
+            command_id = action_id or "final-" + uuid4().hex
+            future = asyncio.run_coroutine_threadsafe(self._run_draft_final(source, command_id), event_loop)
+            self._hmb_draft_finalize_future = future
+            def finished(_future: Any) -> None:
+                # Cancellation before the coroutine's first instruction has
+                # no finally block, so release only that unstarted dispatch.
+                def release_unstarted() -> None:
+                    if (getattr(self, "_hmb_draft_finalize_future", None) is _future
+                            and self._hmb_draft_finalize_task is None):
+                        with self._generation_refresh_lock:
+                            self._hmb_draft_finalize_pending = False
+                            self._hmb_draft_pending_source = {}
+                        with suppress(Exception):
+                            self._sync_seedance_shot_widget(emit_change=True)
+                if _future.cancelled():
+                    event_loop.call_soon_threadsafe(release_unstarted)
+            future.add_done_callback(finished)
+            with suppress(Exception):
+                self._sync_seedance_shot_widget(emit_change=True)
+            return NodeMessageResult(success=True, details="Finalize 1080p was scheduled for this Draft only.",
+                                     response=_details, altered_workflow_state=False)
+        except Exception as exc:
+            if reserved_here:
+                with self._generation_refresh_lock:
+                    self._hmb_draft_finalize_pending = False
+                    self._hmb_draft_pending_source = {}
+            return NodeMessageResult(success=False, details=str(exc), response=_details, altered_workflow_state=False)
+
+    async def _run_draft_final(self, source: dict[str, Any], action_id: str) -> None:
+        """No StartFlow/ResolveNode or upstream execution is invoked here."""
+        self._hmb_draft_finalize_task = asyncio.current_task()
+        try:
+            if not self._runtime_node_is_live(require_registered=True) or self.is_cancellation_requested:
+                raise ValueError("Finalization was cancelled before execution.")
+            self._assert_draft_final_flow_idle()
+            source = self._validated_draft_final_source(source)
+            current = self._draft_source_record()
+            if current.get("draft_job_id") != source["draft_job_id"]:
+                raise ValueError("The completed Draft changed before Finalization started.")
+            params = self._get_parameters()
+            params.update(draft_action=DRAFT_ACTION_FINAL, draft_job_id=source["draft_job_id"],
+                          _hmb_draft_source=deepcopy(source), _hmb_draft_supported=True,
+                          model_id=SEEDANCE_2_5_MODEL_ID, resolution="1080p", output_format="mp4",
+                          return_last_frame=False, resume_generation_id="", prompt="", first_frame=None,
+                          last_frame=None, reference_images=[], video_references=[], video_reference_slots=[], reference_audio=[],
+                          _hmb_generation_origin=deepcopy(source.get("generation_origin", {})))
+            self._hmb_draft_final_context = {"source": source, "params": params,
+                "client_request_id": _seedance_draft_final_request_id(source["draft_job_id"]),
+                "action_id": action_id}
+            await self.aprocess()
+        except Exception as exc:
+            logger.warning("%s Finalization was not started: %s", self.name, str(exc))
+            self._set_status_results(was_successful=False, result_details=str(exc))
+        finally:
+            self._hmb_draft_final_context = None
+            self._hmb_draft_finalize_task = None
+            with self._generation_refresh_lock:
+                self._hmb_draft_finalize_pending = False
+                self._hmb_draft_pending_source = {}
+            with suppress(Exception):
+                self._update_parameter_visibility()
+                self._sync_seedance_shot_widget(emit_change=True)
+
+    def _cancel_draft_final(self, expected_draft_job_id: str) -> Any:
+        active = self._active_draft_job_id()
+        if not active or active != expected_draft_job_id or not self._hmb_draft_finalize_pending:
+            return NodeMessageResult(success=False, details="The active Draft Final changed; nothing was cancelled.",
+                                     response=None, altered_workflow_state=False)
+        cancel = getattr(self, "request_cancellation", None)
+        if callable(cancel):
+            cancel()
+        future = getattr(self, "_hmb_draft_finalize_future", None)
+        if future is not None:
+            future.cancel()
+        return NodeMessageResult(success=True,
+            details="Final stop requested. An accepted remote task remains available through Refresh / Retrieve Result.",
+            response=None, altered_workflow_state=False)
+
+    def _active_draft_job_id(self) -> str:
+        context = getattr(self, "_hmb_draft_final_context", None)
+        source = context.get("source", {}) if isinstance(context, dict) else getattr(self, "_hmb_draft_pending_source", {})
+        return str(source.get("draft_job_id") or "") if self._hmb_draft_finalize_pending else ""
+
+    @staticmethod
+    def _assert_draft_final_flow_idle() -> None:
+        try:
+            manager = GriptapeNodes.FlowManager()
+            check = getattr(manager, "check_for_existing_running_flow", None)
+            if not callable(check):
+                raise ValueError("Engine execution state is unavailable.")
+            if check():
+                raise ValueError("Wait for the current workflow to finish before Finalize 1080p.")
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("Engine execution state is unavailable; no Final was submitted.") from exc
+
+    def _release_unsubmitted_draft_reservation(self) -> None:
+        """Release only when no POST began or create was definitively rejected."""
+        recovery = self._generation_recovery_state()
+        source = _seedance_draft_source_value(recovery.get("draft_source"))
+        if (source and source.get("final_request_id") == recovery.get("task_id")
+                and recovery.get("task_identity") == "client_request"):
+            source.pop("final_request_id", None)
+            self._store_draft_source(source)
+
     def _sync_seedance_shot_widget(self, *, emit_change: bool = False) -> None:
         parameter = self.get_parameter_by_name(SEEDANCE_SHOT_WIDGET_PARAMETER)
         if parameter is None:
@@ -4964,6 +5341,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             available_catalog,
             self._hmb_generation_preview_state,
             getattr(self, "_hmb_remote_prompt_route", None),
+            self._draft_ui_state(),
         )
         try:
             current = self.get_parameter_value(SEEDANCE_SHOT_WIDGET_PARAMETER)
@@ -5799,6 +6177,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self._hmb_pending_generation_command_id = action_id
                 self._hmb_pending_generation_command_action = "open_gallery"
                 self._hmb_pending_gallery_origin = self._selected_broker_server_url()
+            elif (normalized["action"] == "finalize_draft" and action_id and action_id not in processed_ids
+                    and self._runtime_node_is_live(require_registered=True)
+                    and self._draft_ui_state()["final_available"]
+                    and self._draft_source_record().get("draft_job_id") == normalized.get("expected_draft_job_id")):
+                self._hmb_pending_generation_command_id = action_id
+                self._hmb_pending_generation_command_action = "finalize_draft"
+            elif (normalized["action"] == "cancel_draft_final" and action_id and action_id not in processed_ids
+                    and self._hmb_draft_finalize_pending
+                    and self._active_draft_job_id() == normalized.get("expected_draft_job_id")):
+                self._hmb_pending_generation_command_id = action_id
+                self._hmb_pending_generation_command_action = "cancel_draft_final"
             elif (
                 normalized["action"] == "refresh_existing"
                 and action_id
@@ -5881,6 +6270,39 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     def after_value_set(self, parameter: Parameter, value: Any) -> None:
         """Mirror Standard Seedance media visibility for the selected mode."""
+        authored_draft = self.get_parameter_value("draft_action")
+        expected_resolution = "480p" if authored_draft == DRAFT_ACTION_PREVIEW else "1080p"
+        if (parameter.name == "resolution" and str(value) != expected_resolution
+                and not self._hmb_draft_controls_syncing
+                and authored_draft in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}):
+            model = str(self.get_parameter_value("model_id") or "")
+            if MODEL_ID_ALIASES.get(model, model) == SEEDANCE_2_5_MODEL_ID:
+                self.set_parameter_value("draft_action", DRAFT_ACTION_OFF, emit_change=False)
+                self.publish_update_to_parameter("draft_action", DRAFT_ACTION_OFF)
+        if (not self._hmb_draft_controls_syncing and authored_draft in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}
+                and (parameter.name == "output_format" and value != "mp4"
+                     or parameter.name == "return_last_frame" and value is True)):
+            model = str(self.get_parameter_value("model_id") or "")
+            if MODEL_ID_ALIASES.get(model, model) == SEEDANCE_2_5_MODEL_ID and self._draft_mode_supported():
+                self._hmb_draft_controls_syncing = True
+                try:
+                    setting = "mp4" if parameter.name == "output_format" else False
+                    self.set_parameter_value(parameter.name, setting, emit_change=False)
+                    self.publish_update_to_parameter(parameter.name, setting)
+                finally:
+                    self._hmb_draft_controls_syncing = False
+        if parameter.name == "draft_action" and not self._hmb_draft_controls_syncing:
+            model = str(self.get_parameter_value("model_id") or "")
+            if (MODEL_ID_ALIASES.get(model, model) == SEEDANCE_2_5_MODEL_ID and self._draft_mode_supported()
+                    and value in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}):
+                self._hmb_draft_controls_syncing = True
+                try:
+                    for key, setting in (("resolution", "480p" if value == DRAFT_ACTION_PREVIEW else "1080p"),
+                                         ("output_format", "mp4"), ("return_last_frame", False)):
+                        self.set_parameter_value(key, setting, emit_change=False)
+                        self.publish_update_to_parameter(key, setting)
+                finally:
+                    self._hmb_draft_controls_syncing = False
         if parameter.name == "model_id" and self._hmb_retired_model_migration_pending:
             resolution_parameter = self.get_parameter_by_name("resolution")
             if resolution_parameter is not None:
@@ -5923,6 +6345,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "output_format",
             "return_last_frame",
             "local_video_upload_service",
+            "draft_action",
+            "resolution",
+            "draft_job_id",
+            DRAFT_SOURCE_PARAMETER,
+            DRAFT_SOURCES_PARAMETER,
             SHOT_CHANNEL_UUID_PARAMETER,
             SHOT_UUID_PARAMETER,
             SHOT_NUMBER_PARAMETER,
@@ -6007,6 +6434,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     self._hmb_processed_generation_command_ids = retained
                 if command_action == "open_gallery":
                     self._schedule_open_review_gallery(gallery_origin)
+                elif command_action == "finalize_draft":
+                    expected = value.get("expected_draft_job_id") if isinstance(value, dict) else ""
+                    self._on_finalize_draft_clicked(None, None, action_id=action_id, expected_draft_job_id=expected)
+                elif command_action == "cancel_draft_final":
+                    expected = value.get("expected_draft_job_id") if isinstance(value, dict) else ""
+                    self._cancel_draft_final(str(expected or ""))
                 else:
                     self._schedule_existing_generation_refresh()
         elif parameter.name == SEEDANCE_SHOT_WIDGET_PARAMETER:
@@ -6015,6 +6448,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self._hmb_generation_action_only_update = False
             if action_requested:
                 self._schedule_existing_generation_refresh()
+        if not self._hmb_shot_syncing and parameter.name in {"draft_action", "resolution", "draft_job_id", DRAFT_SOURCE_PARAMETER,
+                               DRAFT_SOURCES_PARAMETER, "model_id", SHOT_SELECTOR_PARAMETER,
+                               SHOT_UUID_PARAMETER, SHOT_CHANNEL_UUID_PARAMETER, BROKER_SERVER_URL_PARAMETER}:
+            with suppress(Exception):
+                self._sync_seedance_shot_widget(emit_change=True)
         return result
 
     def _restore_seedance_shot_route(self) -> None:
@@ -6209,7 +6647,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     def _on_broker_connect_clicked(self, _button: Any, _details: Any) -> None:
         if not self._runtime_node_is_live(require_registered=True):
             return
-        if self._generation_run_active.is_set() or self._generation_refresh_running:
+        if self._generation_run_active.is_set() or self._generation_refresh_running or self._hmb_draft_finalize_pending:
             return
         with self._broker_action_lock:
             if self._broker_action_running:
@@ -6387,6 +6825,23 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             self._hmb_output_contract_syncing = False
 
     def _update_parameter_visibility(self) -> None:
+        if getattr(self, "_hmb_parameter_visibility_syncing", False):
+            self._hmb_parameter_visibility_pending = True
+            return
+        self._hmb_parameter_visibility_syncing = True
+        try:
+            # SDK Options traits can restore their storage-union choices when
+            # a dependent task/resolution value is normalized. Reapply the
+            # visible choices after those callbacks, without recursive updates.
+            for _ in range(3):
+                self._hmb_parameter_visibility_pending = False
+                self._update_parameter_visibility_impl()
+                if not self._hmb_parameter_visibility_pending:
+                    break
+        finally:
+            self._hmb_parameter_visibility_syncing = False
+
+    def _update_parameter_visibility_impl(self) -> None:
         model_id = self._synchronize_model_resolution()
         task = str(
             self.get_parameter_value(TASK_PARAMETER) or TASK_REFERENCE_TO_VIDEO
@@ -6474,6 +6929,23 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         ).strip()
         model_id = MODEL_ID_ALIASES.get(raw_model, raw_model)
         seedance_25_active = model_id == SEEDANCE_2_5_MODEL_ID
+        draft_state = self._draft_ui_state()
+        draft_parameter = self.get_parameter_by_name("draft_action")
+        if draft_parameter is not None:
+            choices = [DRAFT_ACTION_OFF]
+            if draft_state["preview_available"] or (draft_state["busy"] and draft_state["action"] == DRAFT_ACTION_PREVIEW):
+                choices.append(DRAFT_ACTION_PREVIEW)
+            if draft_state["final_available"] or (draft_state["busy"] and draft_state["action"] == DRAFT_ACTION_FINAL):
+                choices.append(DRAFT_ACTION_FINAL)
+            draft_parameter.ui_options = {**draft_parameter.ui_options, "simple_dropdown": choices}
+        if draft_state["visible"]:
+            self.show_parameter_by_name("draft_action")
+            if draft_state["job_id"]:
+                self.show_parameter_by_name("draft_job_id")
+            else:
+                self.hide_parameter_by_name("draft_job_id")
+        else:
+            self.hide_parameter_by_name(["draft_action", "draft_job_id"])
         if seedance_25_active:
             self.show_parameter_by_name(["output_format", "return_last_frame"])
         else:
@@ -6986,7 +7458,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "generation", "metadata_sha256", "media_sha256", "shots",
             records_key, "media_by_source_uid",
         }
-        if not isinstance(value, dict) or set(value) != required:
+        if not isinstance(value, dict) or (set(value) != required and not (
+                source_kind == "image_asset" and set(value) == required | {"project_id"})):
             raise RuntimeError(
                 f"Seedance {source_kind} Shot snapshot has unknown or missing fields."
             )
@@ -7098,6 +7571,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "shots": shots,
             records_key: records,
         }
+        project_fields = {}
+        if source_kind == "image_asset" and "project_id" in value:
+            project_id = value["project_id"]
+            if not isinstance(project_id, str) or len(project_id) > 256:
+                raise RuntimeError("Seedance ImageAsset project identity is invalid.")
+            project_fields["project_id"] = project_id
+            metadata_document.update(project_fields)
         descriptors = [
             {
                 "source_uid": uid,
@@ -7120,6 +7600,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "shots": shots,
             records_key: records,
             "media_by_source_uid": media,
+            **project_fields,
         }
 
     @staticmethod
@@ -7356,6 +7837,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # durable quartet. Reconcile the same-flow catalog before deciding
         # whether remote execution can proceed; a missing catalog fails closed.
         self._reconcile_shared_shot_routing(strict=True)
+        selection = self._capture_imageasset_project_selection()
+        params = {**params, **selection["project"], "_hmb_imageasset_project_selection": selection}
         subscription = self._hmb_shot_channel_subscription()
         if not subscription["enabled"]:
             resolved = dict(params)
@@ -7416,6 +7899,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
         images: list[str] = []
         videos: list[str] = []
+        draft_source_bindings: dict[str, str] = {}
         for source_node, source_kind in (
             (image_node, "image_asset"),
             (picker_node, "video_picker"),
@@ -7444,6 +7928,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 source_kind=source_kind,
                 expected_channel_uuid=subscription["channel_uuid"],
             )
+            draft_source_bindings[source_kind] = source_snapshot["publisher_instance_uuid"]
+            if source_kind == "image_asset" and "project_id" in source_snapshot:
+                snapshot_project = resolve_project(source_snapshot, default_legacy=False)
+                if snapshot_project["project_id"] != params["project_id"]:
+                    raise RuntimeError("The selected ImageAsset project changed during input preparation.")
             source_shot = next(
                 (
                     item for item in source_snapshot["shots"]
@@ -7552,9 +8041,176 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         resolved["video_reference_slots"] = []
         resolved["reference_audio"] = []
         resolved["input_mode"] = INPUT_MODE_MULTIMODAL_REFERENCES
+        if params.get("draft_action") == DRAFT_ACTION_PREVIEW:
+            resolved["_hmb_draft_source_bindings"] = draft_source_bindings
         return resolved
 
+    def _project_incoming_connections(self, node: Any) -> list[Any]:
+        """Read registered edges, including hidden/list-child inputs, without reconciliation."""
+        from griptape_nodes.retained_mode.events.connection_events import (
+            ListConnectionsForNodeRequest, ListConnectionsForNodeResultSuccess,
+        )
+        result = GriptapeNodes.handle_request(ListConnectionsForNodeRequest(
+            node_name=str(node.name), include_internal=True, broadcast_result=False,
+            failure_log_level=logging.DEBUG,
+        ))
+        if not isinstance(result, ListConnectionsForNodeResultSuccess):
+            raise ValueError("ImageAsset project connections are unavailable. No render was submitted.")
+        incoming = getattr(result, "incoming_connections", None)
+        if not isinstance(incoming, (list, tuple)) or len(incoming) > 256:
+            raise ValueError("ImageAsset project connection data is invalid.")
+        return list(incoming)
+
+    def _capture_imageasset_project_selection(self) -> dict[str, Any]:
+        """Resolve only exact registered ImageAsset paths in this Generator's flow.
+
+        Neither Agent execution caches nor Prompt text/media are project authority.
+        The private snapshot pins node instances and edges for this operation only.
+        """
+        if isinstance(self, _HMBWebRerenderExecution):
+            return self._web_owner._capture_imageasset_project_selection()
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+        manager = GriptapeNodes.NodeManager()
+        owner_name = str(self.name)
+        if manager.get_node_by_name(owner_name) is not self or getattr(self, "_hmb_node_deleted", False):
+            raise ValueError("Generator project source is not registered.")
+        flow_name = manager.get_node_parent_flow_by_name(owner_name)
+        if not isinstance(flow_name, str) or not flow_name:
+            raise ValueError("Generator project flow is unavailable.")
+        classes: dict[str, type] = {}
+        visited: set[int] = set()
+        active: set[int] = set()
+        sources: dict[int, dict[str, Any]] = {}
+        edges: set[tuple[int, str, int, str]] = set()
+        supported = {"HMBImageAssetLibrary", "HMBPromptLibrary", "HMBAgentLibrary"}
+
+        def registered(node: Any) -> None:
+            name = str(getattr(node, "name", "") or "")
+            if (not name or manager.get_node_by_name(name) is not node
+                    or getattr(node, "_hmb_node_deleted", False)
+                    or manager.get_node_parent_flow_by_name(name) != flow_name):
+                raise ValueError("ImageAsset project source was removed, replaced, or belongs to another flow.")
+
+        def kind(node: Any) -> str:
+            registered(node)
+            metadata = getattr(node, "metadata", None)
+            if not isinstance(metadata, dict) or metadata.get("library") != "HMB_GP_Production":
+                return ""
+            name = metadata.get("node_type")
+            if name not in supported:
+                return ""
+            if name not in classes:
+                classes[name] = LibraryRegistry.get_library("HMB_GP_Production").get_node_class(name)
+            if not isinstance(classes[name], type) or type(node) is not classes[name]:
+                raise ValueError("ImageAsset project source class is not the registered library class.")
+            return str(name)
+
+        def walk(node: Any, node_kind: str, depth: int = 0) -> None:
+            if depth > 3 or id(node) in active or len(visited) > 32:
+                raise ValueError("ImageAsset project source topology is cyclic or too large.")
+            registered(node)
+            if id(node) in visited:
+                return
+            active.add(id(node))
+            if node_kind == "HMBImageAssetLibrary":
+                getter = getattr(node, "_hmb_project_identity", None)
+                if not callable(getter):
+                    raise ValueError("Selected ImageAsset project identity is unavailable.")
+                project = resolve_project(getter(), default_legacy=False)
+                sources[id(node)] = {key: project[key] for key in ("project_id", "project_name")}
+            else:
+                for edge in self._project_incoming_connections(node):
+                    # SDK IncomingConnection omits target_node_name; the typed
+                    # node-scoped response supplies that identity.
+                    if str(getattr(edge, "target_node_name", node.name) or "") != str(node.name):
+                        raise ValueError("ImageAsset project edge target does not match its registered node.")
+                    target = str(getattr(edge, "target_parameter_name", "") or "")
+                    source_port = str(getattr(edge, "source_parameter_name", "") or "")
+                    allowed: dict[str, set[str]] = {}
+                    strict = False
+                    if node_kind == "generator":
+                        if target == SHOT_ASSET_INPUT_PARAMETER:
+                            allowed = {"HMBImageAssetLibrary": {"SHOT_ASSET_OUT"}}; strict = True
+                        elif self._connection_targets_parameter_or_list_child("reference_images", target):
+                            allowed = {"HMBImageAssetLibrary": {"IMAGE_OUT"}}
+                        elif target in {"prompt", "SHOT_PROMPT_IN"}:
+                            allowed = {"HMBAgentLibrary": {"output"}, "HMBPromptLibrary": {"PROMPT_OUT"}}
+                            strict = target == "SHOT_PROMPT_IN"
+                        elif target == "SHOT_IMAGE_IN":
+                            allowed = {"HMBPromptLibrary": {"SHOT_IMAGE_OUT"}}; strict = True
+                    elif node_kind == "HMBAgentLibrary" and target == "SHOT_PROMPT_IN":
+                        allowed = {"HMBPromptLibrary": {"PROMPT_OUT"}}; strict = True
+                    elif node_kind == "HMBPromptLibrary":
+                        if target == "SHOT_ASSET_IN":
+                            allowed = {"HMBImageAssetLibrary": {"SHOT_ASSET_OUT"}}; strict = True
+                        elif target == "IMAGE_ASSET_IN":
+                            allowed = {"HMBImageAssetLibrary": {"IMAGE_ASSET_OUT", "IMAGE_OUT"}}
+                    if not allowed:
+                        continue
+                    source_name = str(getattr(edge, "source_node_name", "") or "")
+                    source = manager.get_node_by_name(source_name) if source_name else None
+                    if source is None:
+                        raise ValueError("ImageAsset project edge source is unavailable.")
+                    source_kind = kind(source)
+                    if source_kind not in allowed:
+                        if strict or source_kind:
+                            raise ValueError("ImageAsset project route uses an unsupported source.")
+                        continue  # Ordinary text/media cannot assert a selected project.
+                    if source_port not in allowed[source_kind]:
+                        raise ValueError("ImageAsset project route uses the wrong source port.")
+                    edges.add((id(source), source_port, id(node), target))
+                    walk(source, source_kind, depth + 1)
+            active.remove(id(node))
+            visited.add(id(node))
+
+        walk(self, "generator")
+        if not sources:
+            raise ValueError("Select and connect an ImageAsset library project before rendering.")
+        identities = list(sources.values())
+        if any(identity != identities[0] for identity in identities[1:]):
+            raise ValueError("Connected ImageAsset sources belong to different projects.")
+        return {"schema": PROJECT_SELECTION_SCHEMA, "project": dict(identities[0]),
+                "flow": flow_name, "owner": id(self),
+                "sources": sorted(sources), "edges": sorted(edges)}
+
+    def _hmb_generation_project(self) -> dict[str, str]:
+        return dict(self._capture_imageasset_project_selection()["project"])
+
+    def _assert_imageasset_project_selection(self, selection: dict[str, Any]) -> None:
+        try:
+            current = self._capture_imageasset_project_selection()
+        except Exception as exc:
+            raise _ProjectSelectionChanged("The selected ImageAsset project is unavailable. No render was submitted.") from exc
+        if selection != current:
+            raise _ProjectSelectionChanged("The selected ImageAsset project or connection changed. Run again with the selected project.")
+
+    def _assert_operation_project_selection(self) -> None:
+        guard = getattr(self, "_hmb_project_selection_guard", None)
+        if not isinstance(guard, dict):
+            return  # Final, Resume and authenticated Web use original task provenance.
+        if threading.get_ident() == guard["thread"]:
+            self._assert_imageasset_project_selection(guard["selection"])
+            return
+        async def validate() -> None:
+            self._assert_imageasset_project_selection(guard["selection"])
+        loop = guard["loop"]
+        if not loop.is_running():
+            raise _ProjectSelectionChanged("Project selection validation is unavailable. No render was submitted.")
+        pending = asyncio.run_coroutine_threadsafe(validate(), loop)
+        try:
+            pending.result(timeout=10.0)
+        except TimeoutError as exc:
+            raise _ProjectSelectionChanged("Project selection validation timed out. No render was submitted.") from exc
+        finally:
+            if not pending.done():
+                pending.cancel()
+
     def _get_parameters(self) -> dict[str, Any]:
+        final_context = self._active_draft_final_context()
+        if final_context is not None:
+            self._validated_draft_final_source(final_context["source"], allow_reserved=True)
+            return deepcopy(final_context["params"])
         model_id = self._synchronize_model_resolution()
         legacy_video_slots = [
             self.get_parameter_value(f"reference_video_{index}")
@@ -7576,11 +8232,16 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 for value in legacy_video_slots
                 if self._has_reference_value(value)
             ]
-        return {
+        params = {
             "resume_generation_id": str(
                 self.get_parameter_value("resume_generation_id") or ""
             ).strip(),
             "model_id": model_id,
+            "draft_action": self.get_parameter_value("draft_action") or DRAFT_ACTION_OFF,
+            "draft_job_id": str(self.get_parameter_value("draft_job_id") or "").strip(),
+            "_hmb_draft_only": self._draft_only_mode(),
+            "_hmb_draft_supported": self._draft_mode_supported(),
+            "_hmb_draft_source": self._draft_source_record(),
             TASK_PARAMETER: str(
                 self.get_parameter_value(TASK_PARAMETER)
                 or TASK_REFERENCE_TO_VIDEO
@@ -7637,6 +8298,206 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "tos_url_validity_seconds"
             ),
         }
+        # Hidden Only-only controls are dormant outside their supported mode.
+        # Preserve the authored selection for a lossless return to Only, but
+        # never let it override or block an ordinary Shot/2.0 run.
+        if model_id != SEEDANCE_2_5_MODEL_ID or params["_hmb_draft_supported"] is not True:
+            params["draft_action"] = DRAFT_ACTION_OFF
+        if params["draft_action"] in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}:
+            params["resolution"] = "480p" if params["draft_action"] == DRAFT_ACTION_PREVIEW else "1080p"
+            params["output_format"] = "mp4"
+            params["return_last_frame"] = False
+        if params["draft_action"] == DRAFT_ACTION_FINAL and not params["resume_generation_id"]:
+            source = self._validated_draft_final_source()
+            params["_hmb_draft_source"] = source
+            params["draft_job_id"] = source["draft_job_id"]
+        return params
+
+    def _draft_only_mode(self) -> bool:
+        identity = self._shot_identity()
+        return bool(not identity.get("shot_uuid") and self.get_parameter_value(SHOT_SELECTOR_PARAMETER) == SHOT_ONLY_LABEL)
+
+    def _draft_mode_supported(self) -> bool:
+        identity = self._shot_identity()
+        return bool(self._draft_only_mode() or (identity.get("channel_uuid") and identity.get("shot_uuid")))
+
+    def _draft_owner_id(self) -> str:
+        identifier = _seedance_uuid_text(self.get_parameter_value(DRAFT_OWNER_PARAMETER))
+        if not identifier:
+            return ""
+        changed = False
+        with _DRAFT_OWNERS_GUARD:
+            owner = _DRAFT_OWNERS.get(identifier)
+            if owner is not None and owner is not self and owner._runtime_node_is_live(require_registered=True):
+                identifier = str(uuid4())
+                changed = True
+            _DRAFT_OWNERS[identifier] = self
+        if changed:
+            # A live duplicate gets a new owner; a genuine reopen retains its
+            # serialized owner after the old runtime object has gone away.
+            self.set_parameter_value(DRAFT_OWNER_PARAMETER, identifier, emit_change=False)
+        return identifier
+
+    def _draft_source_key(self, source: dict[str, Any] | None = None) -> str:
+        origin = (source.get("generation_origin") or {}) if source is not None else self._shot_identity()
+        owner = (source or {}).get("owner_id") or self._draft_owner_id()
+        return ":".join((str(origin.get("channel_uuid") or "only"), str(origin.get("shot_uuid") or "only"), str(owner)))
+
+    def _store_draft_source(self, value: dict[str, Any]) -> None:
+        source = _seedance_draft_source_value(value)
+        if not source:
+            raise ValueError("The completed Draft source record is invalid.")
+        raw = self.get_parameter_value(DRAFT_SOURCES_PARAMETER)
+        records = dict(raw.get("sources", {})) if isinstance(raw, dict) and isinstance(raw.get("sources"), dict) else {}
+        records[self._draft_source_key(source)] = source
+        # Five production Shots plus Only; bounded even after channel changes.
+        records = dict(list(records.items())[-64:])
+        self.set_parameter_value(DRAFT_SOURCES_PARAMETER, {"version": 1, "sources": records}, emit_change=False)
+        if not source.get("generation_origin"):
+            self.set_parameter_value(DRAFT_SOURCE_PARAMETER, source, emit_change=False)
+
+    def _active_draft_final_context(self) -> dict[str, Any] | None:
+        context = getattr(self, "_hmb_draft_final_context", None)
+        try:
+            own_task = asyncio.current_task() is getattr(self, "_hmb_draft_finalize_task", None)
+        except RuntimeError:
+            own_task = False
+        # Blocking submission helpers execute in a worker thread; their source
+        # is separately fenced by _submission_start_is_authorized.
+        return context if isinstance(context, dict) and own_task else None
+
+    def _draft_source_record(self) -> dict[str, Any]:
+        if getattr(self, "_web_owner", None) is not None:
+            return {}
+        raw = self.get_parameter_value(DRAFT_SOURCES_PARAMETER)
+        records = raw.get("sources", {}) if isinstance(raw, dict) else {}
+        source = _seedance_draft_source_value(records.get(self._draft_source_key())) if isinstance(records, dict) else {}
+        if not source and self._draft_only_mode():
+            source = _seedance_draft_source_value(self.get_parameter_value(DRAFT_SOURCE_PARAMETER))
+            if source.get("generation_origin"):
+                source = {}
+        recovered = _seedance_draft_source_value(self._generation_recovery_state().get("draft_source"))
+        if recovered and (not recovered.get("generation_origin") and self._draft_only_mode()
+                          or recovered.get("generation_origin") and self._draft_source_key(recovered) == self._draft_source_key()):
+            if not source or (source["draft_job_id"] == recovered["draft_job_id"] and recovered.get("final_request_id")):
+                source = recovered
+        return source
+
+    def _validate_draft_shot_binding(self, source: dict[str, Any]) -> None:
+        origin = source.get("generation_origin") or {}
+        current = self._shot_identity()
+        if (source.get("owner_id") != self._draft_owner_id()
+                or (origin.get("channel_uuid"), origin.get("shot_uuid")) !=
+                (current.get("channel_uuid"), current.get("shot_uuid"))):
+            raise ValueError("This Draft belongs to a different Generator or Shot.")
+        catalog = _seedance_widget_catalog(getattr(self, "_hmb_shot_catalog_snapshot", None))
+        if (not catalog or catalog["channel_uuid"] != origin["channel_uuid"]
+                or not any(item["shot_uuid"] == origin["shot_uuid"] for item in catalog["shots"])):
+            raise ValueError("The Draft Shot was deleted or its channel is unavailable.")
+        bindings: dict[str, str] = {}
+        for parameter, port, kind in ((SHOT_ASSET_INPUT_PARAMETER, "SHOT_ASSET_OUT", "image_asset"),
+                                      (SHOT_PICKER_INPUT_PARAMETER, "SHOT_PICKER_OUT", "video_picker")):
+            node = self._exact_incoming_source(parameter, port, required=False)
+            if node is None:
+                continue
+            if getattr(node, "_hmb_node_deleted", False):
+                raise ValueError("The Draft Shot source was deleted.")
+            subscription = self._direct_source_subscription(node, kind)
+            if subscription.get("channel_uuid") != origin["channel_uuid"]:
+                raise ValueError("The Draft Shot source was rebound to another channel.")
+            snapshot_api = getattr(node, "_hmb_shot_routing_catalog" if kind == "image_asset" else "_hmb_shot_routing_snapshot", None)
+            if not callable(snapshot_api):
+                raise ValueError("The Draft Shot source identity is unavailable.")
+            snapshot = snapshot_api() if kind == "image_asset" else snapshot_api(origin["channel_uuid"], validate_media=False)
+            if (not isinstance(snapshot, dict) or snapshot.get("channel_uuid") != origin["channel_uuid"]
+                    or not any(isinstance(item, dict) and item.get("shot_uuid") == origin["shot_uuid"]
+                               for item in snapshot.get("shots", []))):
+                raise ValueError("The completed Draft Shot is missing from its source.")
+            publisher = _seedance_uuid_text(snapshot.get("publisher_instance_uuid"))
+            if not publisher:
+                raise ValueError("The Draft source publisher identity is unavailable.")
+            bindings[kind] = publisher
+        if not bindings:
+            raise ValueError("The Draft Shot source is disconnected.")
+        if bindings != source.get("source_bindings"):
+            raise ValueError("The Draft Shot source publisher was replaced or disconnected.")
+        project = self._hmb_generation_project()
+        if any(project.get(key) != source.get(key) for key in ("project_id", "project_name")):
+            raise ValueError("The selected project does not match the completed Draft.")
+
+    def _validated_draft_final_source(self, source: dict[str, Any] | None = None, *, allow_reserved: bool = False) -> dict[str, Any]:
+        model = str(self.get_parameter_value("model_id") or "")
+        if MODEL_ID_ALIASES.get(model, model) != SEEDANCE_2_5_MODEL_ID:
+            raise ValueError("Draft finalization requires Seedance 2.5.")
+        record = _seedance_draft_source_value(source if source is not None else self._draft_source_record())
+        if not record:
+            raise ValueError("Complete a Draft for this Shot before finalizing.")
+        if record.get("owner_id") and record["owner_id"] != self._draft_owner_id():
+            raise ValueError("This Draft belongs to a different Generator.")
+        if record.get("generation_origin"):
+            self._validate_draft_shot_binding(record)
+        elif not self._draft_only_mode():
+            raise ValueError("This Draft has no verified Shot identity.")
+        created = record.get("created_at_ms")
+        if created is not None and (created > int(time.time() * 1000) or int(time.time() * 1000) >= created + DRAFT_SOURCE_TTL_MS):
+            raise ValueError("This Draft has expired. Create a new 480p Draft.")
+        if record.get("final_request_id") and not allow_reserved:
+            raise ValueError("This Draft already has a Final request. Use Refresh / Retrieve Result for that task.")
+        # Legacy Only records retain their original Broker; Shot mode must
+        # still be bound to the same configured production endpoint.
+        if record.get("generation_origin") and record["broker_server_url"] != self._selected_broker_server_url():
+            raise ValueError("The selected Broker does not match the completed Draft.")
+        return deepcopy(record)
+
+    def _draft_ui_state(self) -> dict[str, Any]:
+        model = str(self.get_parameter_value("model_id") or "")
+        supported = MODEL_ID_ALIASES.get(model, model) == SEEDANCE_2_5_MODEL_ID and self._draft_mode_supported()
+        resolution = str(self.get_parameter_value("resolution") or "")
+        action = self.get_parameter_value("draft_action") or DRAFT_ACTION_OFF
+        source = self._draft_source_record() if supported else {}
+        busy = bool(self._generation_run_active.is_set() or self._generation_refresh_running
+                    or getattr(self, "_hmb_draft_finalize_pending", False))
+        final_available = False
+        reason = ""
+        if supported and source:
+            try:
+                self._validated_draft_final_source(source)
+                final_available = not busy
+            except (ValueError, RuntimeError) as exc:
+                reason = str(exc)
+        elif supported:
+            reason = "Complete a 480p Draft to enable Finalize 1080p."
+        return _seedance_draft_ui_value({"visible": supported and (resolution == "480p" or bool(source)),
+            "action": action if supported else DRAFT_ACTION_OFF,
+            "preview_available": supported and resolution == "480p" and not busy,
+            "final_available": final_available, "job_id": source.get("draft_job_id", ""),
+            "effective_resolution": "1080p" if action == DRAFT_ACTION_FINAL else "480p" if action == DRAFT_ACTION_PREVIEW and supported else resolution,
+            "busy": busy, "cancel_available": bool(self._hmb_draft_finalize_pending and self._active_draft_job_id()),
+            "active_job_id": self._active_draft_job_id(), "reason": "Generator is busy." if busy else reason})
+
+    def _draft_final_requested(self) -> bool:
+        if isinstance(getattr(self, "_hmb_draft_final_context", None), dict):
+            return True
+        model = str(self.get_parameter_value("model_id") or "")
+        return bool(self.get_parameter_value("draft_action") == DRAFT_ACTION_FINAL
+                    and MODEL_ID_ALIASES.get(model, model) == SEEDANCE_2_5_MODEL_ID
+                    and self._draft_mode_supported())
+
+    @staticmethod
+    def _validate_draft_parameters(params: dict[str, Any]) -> str:
+        action = params.get("draft_action", DRAFT_ACTION_OFF)
+        if action not in DRAFT_ACTION_CHOICES:
+            raise ValueError("Unsupported Draft action.")
+        if action == DRAFT_ACTION_OFF:
+            return action
+        if params.get("model_id") != SEEDANCE_2_5_MODEL_ID or not (params.get("_hmb_draft_only") is True or params.get("_hmb_draft_supported") is True):
+            raise ValueError("Draft requires Seedance 2.5 in Only or a verified Shot.")
+        expected = "480p" if action == DRAFT_ACTION_PREVIEW else "1080p"
+        if params.get("resolution") != expected or params.get("output_format") != "mp4" or params.get("return_last_frame") is not False:
+            raise ValueError("Draft uses a 480p MP4 preview or 1080p MP4 final, without last-frame output.")
+        if action == DRAFT_ACTION_FINAL and re.fullmatch(r"job-[0-9a-f]{32}", params.get("draft_job_id", "")) is None:
+            raise ValueError("Finalize Draft requires a completed LOCAL Broker Draft job ID (job-...).")
+        return action
 
     def _validate_parameters(self, params: dict[str, Any]) -> None:
         poll_interval = params["poll_interval_seconds"]
@@ -7659,6 +8520,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             # stale or incomplete TOS authoring settings must not make an
             # already-submitted result unrecoverable.
             self._validate_task_id(resume_generation_id)
+            return
+
+        if self._validate_draft_parameters(params) == DRAFT_ACTION_FINAL:
+            # Finalization sends no new prompt/media/input/duration/audio settings.
             return
 
         upload_service = params.get(
@@ -7864,7 +8729,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         """Resolve safe graph inputs without requiring an upstream result yet."""
 
         params = self._get_parameters()
-        if params.get("resume_generation_id"):
+        if params.get("resume_generation_id") or params.get("draft_action") == DRAFT_ACTION_FINAL:
             return params
         # Hidden ImageAsset/VideoPicker Shot wires are authoritative but are not
         # represented in the public parameter lists. Resolve them during
@@ -8732,7 +9597,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         cloud_driver: Any = _CLOUD_DRIVER_UNSET,
     ) -> dict[str, Any]:
         """Prepare image/video transport without changing selected media order."""
-
+        self._assert_operation_project_selection()
         params, cloud_driver = self._prepare_image_references_for_run(
             params,
             cloud_driver,
@@ -8869,8 +9734,16 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
     def _build_broker_payload(self, params: dict[str, Any]) -> dict[str, Any]:
         """Map the HMB media contract to the FN AI Broker Seedance schema."""
+        self._assert_operation_project_selection()
         self._validate_parameters(params)
         self._validate_broker_model(params.get("model_id"))
+        if params.get("draft_action") == DRAFT_ACTION_FINAL:
+            source = _seedance_draft_source_value(params.get("_hmb_draft_source"))
+            resolved_project = (source if source.get("draft_job_id") == params["draft_job_id"] else resolve_project(params))
+            project = {key: resolved_project[key] for key in ("project_id", "project_name")}
+            params["_hmb_draft_project"] = dict(project)
+            return {"provider": "volcengine_ark", "model": SEEDANCE_2_5_MODEL_ID,
+                    "draft_job_id": params["draft_job_id"], "quality": "1080p", **project}
         submitted_prompt = self._compose_finish_look_prompt(
             params.get("prompt"),
             params.get("_hmb_finish_look_out"),
@@ -8908,6 +9781,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "content_filter": True,
             "execution_expires_after": params["execution_expires_after"],
         }
+        project = resolve_project(params)
+        payload.update({key: project[key] for key in ("project_id", "project_name")})
+        selection = params.get("_hmb_imageasset_project_selection")
+        if not isinstance(self, _HMBWebRerenderExecution) and isinstance(selection, dict):
+            if (selection.get("schema") != PROJECT_SELECTION_SCHEMA
+                    or selection.get("project") != {key: project[key] for key in ("project_id", "project_name")}):
+                raise ValueError("The captured ImageAsset project does not match the generation request.")
+            payload["project_selection_schema"] = PROJECT_SELECTION_SCHEMA
+        if params.get("draft_action") == DRAFT_ACTION_PREVIEW:
+            payload["draft"] = True
+            params["_hmb_draft_project"] = {key: project[key] for key in ("project_id", "project_name")}
         if params["model_id"] == SEEDANCE_2_5_MODEL_ID:
             payload["output_format"] = str(
                 params.get("output_format") or DEFAULT_OUTPUT_FORMAT
@@ -9678,6 +10562,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
         return HMBSeedanceGeneration._normalized_video_output_path(value, "mp4")
 
+    def _build_generation_output_destination(self, *, draft: bool = False) -> Any:
+        build = self._output_file.build_file
+        parameters = inspect.signature(build).parameters
+        accepts_index = "_index" in parameters or any(
+            item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+        )
+        # Draft adds its immutable task suffix before publication. Seed the
+        # SDK's required save_node_output index before resolving that base;
+        # ProjectFileParameter still preserves any connected destination policy.
+        return build(_index=1) if draft and accepts_index else build()
+
     @classmethod
     def _output_destination_candidate_records(
         cls,
@@ -9871,18 +10766,25 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
         def invoke_paced_submission() -> Any:
             nonlocal submission_started
-            _broker_wait_for_submission_slot()
-            with start_state_lock:
-                if cancel_before_start.is_set() or not self._submission_start_is_authorized(
-                    require_registered=False
-                ):
-                    raise _SubmissionCancelledBeforeStart()
-                # The cadence gate can wait for several sibling submissions.
-                # Recheck the captured upstream run after that wait, before a
-                # billable request can begin. Manual inputs have no run token.
-                if getattr(self, "_hmb_expected_agent_result", None) is not None:
-                    self._assert_agent_result_available(submission_prompt, allow_resume=False)
-                submission_started = True
+            global _BROKER_SUBMISSION_LAST_STARTED
+            # Project validation can await the engine loop after a reserved
+            # slot. Keep that wait inside the cadence boundary so later slots
+            # cannot overtake it and bunch their actual create starts together.
+            with _BROKER_SUBMISSION_CADENCE_LOCK:
+                _broker_wait_for_submission_slot()
+                with start_state_lock:
+                    if cancel_before_start.is_set() or not self._submission_start_is_authorized(
+                        require_registered=False
+                    ):
+                        raise _SubmissionCancelledBeforeStart()
+                    # The cadence gate can wait for several sibling submissions.
+                    # Recheck the captured upstream run after that wait, before a
+                    # billable request can begin. Manual inputs have no run token.
+                    if getattr(self, "_hmb_expected_agent_result", None) is not None:
+                        self._assert_agent_result_available(submission_prompt, allow_resume=False)
+                    submission_started = True
+                _BROKER_SUBMISSION_LAST_STARTED = time.monotonic()
+            # Transport runs outside the lock so sibling renders can overlap.
             return function(*args, **kwargs)
 
         operation = asyncio.create_task(asyncio.to_thread(invoke_paced_submission))
@@ -10274,6 +11176,39 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "succeeded",
             generation_id=generation_id,
         )
+        completed_draft_source = {}
+        if recovery_at_download.get("draft_action") == DRAFT_ACTION_PREVIEW:
+            completed_draft_source = _seedance_draft_source_value({
+                "draft_job_id": generation_id,
+                **recovery_at_download.get("draft_project", {}),
+                "broker_server_url": recovery_at_download.get("broker_server_url"),
+                "generation_origin": completed_origin,
+                "owner_id": self._draft_owner_id(),
+                "completed": True,
+                "created_at_ms": recovery_at_download.get("draft_started_at_ms") or recovery_at_download.get("updated_at_ms"),
+                "source_bindings": recovery_at_download.get("draft_source_bindings", {}),
+            })
+            if completed_draft_source:
+                self._store_draft_source(completed_draft_source)
+                current = self._draft_source_record()
+                displayed_id = current.get("draft_job_id", "")
+                self.set_parameter_value("draft_job_id", displayed_id, emit_change=False)
+                with suppress(Exception):
+                    self.publish_update_to_parameter("draft_job_id", displayed_id)
+                if (displayed_id == generation_id and self.get_parameter_value("draft_action") == DRAFT_ACTION_PREVIEW
+                        and MODEL_ID_ALIASES.get(str(self.get_parameter_value("model_id") or ""), self.get_parameter_value("model_id")) == SEEDANCE_2_5_MODEL_ID):
+                    # Make the next explicit step visible. This only changes
+                    # authoring controls; it never schedules a paid request.
+                    for key, setting in (("draft_action", DRAFT_ACTION_FINAL), ("resolution", "1080p"),
+                                         ("output_format", "mp4"), ("return_last_frame", False)):
+                        self.set_parameter_value(key, setting, emit_change=False)
+                        with suppress(Exception):
+                            self.publish_update_to_parameter(key, setting)
+        elif recovery_at_download.get("draft_action") == DRAFT_ACTION_FINAL:
+            completed_draft_source = _seedance_draft_source_value(recovery_at_download.get("draft_source"))
+            if completed_draft_source:
+                completed_draft_source["final_job_id"] = generation_id
+                self._store_draft_source(completed_draft_source)
         self._set_generation_recovery_checkpoint(
             stage="local_succeeded",
             task_id=generation_id,
@@ -10290,6 +11225,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "output_format": effective_output_format,
                 "return_last_frame": requested_last_frame,
                 "_hmb_generation_origin": completed_origin,
+                **({"_hmb_draft_source": completed_draft_source} if completed_draft_source else {}),
             },
         )
         # Stage the verified source before the persistence await. Normal workflow
@@ -10305,6 +11241,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             required=False,
             reason="local_succeeded",
         )
+        with suppress(Exception):
+            self._update_parameter_visibility()
+            self._sync_seedance_shot_widget(emit_change=True)
         self._submission_outcome_unknown = False
         if not self._runtime_node_is_live(require_registered=True):
             return
@@ -10601,6 +11540,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if (
                 self._generation_refresh_running
                 or self._generation_run_active.is_set()
+                or self._hmb_draft_finalize_pending
             ):
                 return NodeMessageResult(
                     success=True,
@@ -10685,6 +11625,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._discard_dangling_owned_list_connections_before_delete()
         if not bool(getattr(self, "_hmb_node_deleted", False)):
             self._hmb_node_deleted = True
+            final_future = getattr(self, "_hmb_draft_finalize_future", None)
+            if final_future is not None:
+                final_future.cancel()
             self._hmb_review_sync_epoch = int(getattr(self, "_hmb_review_sync_epoch", 0)) + 1
             with self._generation_refresh_lock:
                 self._generation_run_active.clear()
@@ -10709,6 +11652,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         return parent(*args, **kwargs) if callable(parent) else None
 
     async def _process_generation(self) -> None:
+        self._hmb_project_selection_guard = None
         self._hmb_review_case_id = ""
         self._hmb_review_inputs = {}
         self._hmb_review_stage = ""
@@ -10725,6 +11669,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         try:
             await self._process_generation_impl()
         finally:
+            self._hmb_project_selection_guard = None
             if self._submission_outcome_unknown:
                 self._defer_temporary_video_upload_cleanup()
             else:
@@ -10771,11 +11716,21 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._begin_generation_preview()
         self._set_generation_status("resolving_inputs", generation_id="")
         params = self._get_parameters()
-        if not params["resume_generation_id"]:
+        self._hmb_project_selection_guard = None
+        draft_action = params.get("draft_action", DRAFT_ACTION_OFF)
+        draft_final = draft_action == DRAFT_ACTION_FINAL
+        if not params["resume_generation_id"] and not draft_final:
             # Resolve and validate the selected ImageAsset/VideoPicker Shot
             # before destination preparation, authentication, uploads, or a
             # billable Broker create-task request. Prompt text remains manual.
             params = self._resolve_exact_shot_generation_inputs(params)
+            if not isinstance(self, _HMBWebRerenderExecution):
+                selection = params.get("_hmb_imageasset_project_selection")
+                if not isinstance(selection, dict):
+                    raise ValueError("A verified selected ImageAsset project is required before rendering.")
+                self._assert_imageasset_project_selection(selection)
+                self._hmb_project_selection_guard = {"selection": deepcopy(selection),
+                    "loop": asyncio.get_running_loop(), "thread": threading.get_ident()}
             resolved_origin = self._capture_generated_video_origin()
             captured_origin = _generated_video_origin(getattr(self, "_hmb_generation_run_origin", None))
             if captured_origin and captured_origin != resolved_origin:
@@ -10783,6 +11738,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             params["_hmb_generation_origin"] = captured_origin or resolved_origin
         else:
             params["_hmb_generation_origin"] = _generated_video_origin(
+                params.get("_hmb_draft_source", {}).get("generation_origin") if draft_final and not params["resume_generation_id"] else
                 recovery_before_run.get("generation_origin")
                 if recovery_before_run.get("task_id") == params["resume_generation_id"] else None
             )
@@ -10792,13 +11748,39 @@ class HMBSeedanceGeneration(SuccessFailureNode):
 
         # Resolve the save target before the billable Broker POST.
         self._set_generation_status("preparing_output", generation_id="")
-        destination = self._output_file.build_file()
+        resume_draft_checkpoint = bool(
+            resume_generation_id and recovery_before_run.get("task_id") == resume_generation_id
+            and recovery_before_run.get("draft_action") in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}
+        )
+        if resume_draft_checkpoint:
+            if not recovery_before_run.get("output_file"):
+                raise _BrokerProtocolError("The saved Draft output path is unavailable. No new render was submitted.")
+            destination = self._build_recovery_output_destination(recovery_before_run)
+            params["_hmb_output_file"] = recovery_before_run["output_file"]
+            params["output_format"] = "mp4"
+            params["return_last_frame"] = False
+        else:
+            destination = self._build_generation_output_destination(draft=draft_action != DRAFT_ACTION_OFF)
+        draft_client_request_id = ""
+        if not resume_generation_id and draft_action != DRAFT_ACTION_OFF:
+            context = self._active_draft_final_context()
+            draft_client_request_id = (context["client_request_id"] if context is not None else
+                _seedance_draft_final_request_id(params["draft_job_id"]) if draft_action == DRAFT_ACTION_FINAL else
+                self._new_generation_client_request_id())
+            if draft_action == DRAFT_ACTION_PREVIEW:
+                params["_hmb_draft_started_at_ms"] = int(time.time() * 1000)
+            base = self._normalized_video_output_path(destination.resolve(), "mp4")
+            phase = "draft480p" if draft_action == DRAFT_ACTION_PREVIEW else "final1080p"
+            unique_path = base.with_name(f"{base.stem}-{phase}-{draft_client_request_id}.mp4")
+            destination = _SeedanceDraftOutputDestination(str(unique_path))
+            params["_hmb_output_file"] = str(unique_path)
         self._preflight_output_destination(
             destination,
             str(params.get("output_format") or DEFAULT_OUTPUT_FORMAT),
         )
         advanced_seedance_v2 = bool(
             not resume_generation_id
+            and not draft_final
             and params.get("model_id") == SEEDANCE_2_5_MODEL_ID
             and _HMBAIBrokerBridge._seedance_v2_requested(
                 task=str(
@@ -10832,6 +11814,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 resume_generation_id, checkpoint=recovery_before_run,
             ) if resume_generation_id else self._selected_broker_server_url()
         )
+        draft_source = _seedance_draft_source_value(params.get("_hmb_draft_source"))
+        if (not resume_generation_id and draft_final
+                and draft_source.get("draft_job_id") == params.get("draft_job_id")):
+            broker_origin = draft_source["broker_server_url"]
         if broker_origin == self._selected_broker_server_url():
             bridge = await self._ensure_broker_connected()
         else:
@@ -10854,6 +11840,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 return_last_frame=bool(params.get("return_last_frame")),
                 timeout=10.0,
             )
+            if not self._runtime_node_is_live(require_registered=True):
+                return
+
+        if not resume_generation_id and draft_action != DRAFT_ACTION_OFF:
+            await asyncio.to_thread(bridge.require_seedance_draft_features, timeout=10.0)
             if not self._runtime_node_is_live(require_registered=True):
                 return
 
@@ -10893,16 +11884,19 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if not self._runtime_node_is_live(require_registered=True):
                 return
             self._set_generation_status("preparing_media", generation_id="")
-            try:
-                self._hmb_review_inputs = await self._run_blocking_generation_stage(
-                    _review.capture_inputs, params,
+            if not draft_final:
+                self._assert_operation_project_selection()
+                try:
+                    self._hmb_review_inputs = await self._run_blocking_generation_stage(
+                        _review.capture_inputs, params,
+                    )
+                except (OSError, ValueError, TypeError):
+                    self._hmb_review_inputs = {"status": "capture_unavailable"}
+                params = await self._run_blocking_generation_stage(
+                    self._prepare_video_references_for_run,
+                    params,
                 )
-            except (OSError, ValueError, TypeError):
-                self._hmb_review_inputs = {"status": "capture_unavailable"}
-            params = await self._run_blocking_generation_stage(
-                self._prepare_video_references_for_run,
-                params,
-            )
+                self._assert_operation_project_selection()
             if not self._runtime_node_is_live(require_registered=True):
                 return
             payload = await self._run_blocking_generation_stage(
@@ -10910,7 +11904,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 params,
             )
             self._assert_agent_result_available(str(params.get("prompt") or ""), allow_resume=False)
-            client_request_id = self._new_generation_client_request_id()
+            client_request_id = draft_client_request_id or self._new_generation_client_request_id()
             payload["client_request_id"] = client_request_id
             await self._run_blocking_generation_stage(
                 self._start_review_case, client_request_id, str(payload.get("prompt") or ""),
@@ -10922,6 +11916,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 generation_id=client_request_id,
                 status="submitting",
             )
+            if draft_final:
+                final_source = _seedance_draft_source_value(params.get("_hmb_draft_source"))
+                if final_source:
+                    final_source["final_request_id"] = client_request_id
+                    params["_hmb_draft_source"] = final_source
+                    self._store_draft_source(final_source)
             self._set_generation_recovery_checkpoint(
                 stage="pre_submit",
                 task_id=client_request_id,
@@ -10944,6 +11944,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 # mutation; the user's workflow is never written by HMB.
                 self.parameter_output_values["generation_id"] = ""
                 self.parameter_output_values["provider_response"] = None
+                self._release_unsubmitted_draft_reservation()
                 self._clear_generation_recovery_checkpoint()
                 self._set_generation_status(
                     "failed",
@@ -10956,9 +11957,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             except _AgentResultUnavailable:
                 await self._discard_unsent_generation_checkpoint(reason="agent_result_changed_before_submission")
                 raise
-            if not self._submission_start_is_authorized(
-                require_registered=True
-            ):
+            try:
+                authorized = self._submission_start_is_authorized(require_registered=True)
+            except _ProjectSelectionChanged:
+                await self._discard_unsent_generation_checkpoint(reason="project_selection_changed_before_submission")
+                raise
+            if not authorized:
                 await self._discard_unsent_generation_checkpoint(
                     reason="cancelled_after_pre_submit_save",
                 )
@@ -10987,6 +11991,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         "Submission could not be confirmed; use Refresh / Retrieve Result.",
                         submission_outcome_unknown=True,
                     ) from exc
+            except _ProjectSelectionChanged:
+                await self._discard_unsent_generation_checkpoint(reason="project_selection_changed_at_submission_gate")
+                raise
             except _AgentResultUnavailable:
                 await self._discard_unsent_generation_checkpoint(
                     reason="agent_result_changed_at_submission_gate",
@@ -11008,7 +12015,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             except _BrokerError as exc:
                 if not self._runtime_node_is_live(require_registered=True):
                     return
-                if exc.submission_outcome_unknown:
+                if getattr(exc, "_hmb_web_submission_not_started", False) is True:
+                    # The web prepared handshake failed before the normal
+                    # create transport. Its provisional key is not a task.
+                    await self._discard_unsent_generation_checkpoint(
+                        reason="web_prepared_not_submitted",
+                    )
+                    self._set_generation_status("failed", generation_id="", preview_action="none")
+                elif exc.submission_outcome_unknown:
                     if not self._runtime_node_is_live(require_registered=True):
                         return
                     self._submission_outcome_unknown = True
@@ -11042,6 +12056,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     # hmb-* value is only this client's idempotency key until a
                     # successful Broker response returns an authoritative job ID.
                     exc.definitive_submission_rejection = True
+                    self._release_unsubmitted_draft_reservation()
                     self.parameter_output_values["generation_id"] = ""
                     self.parameter_output_values["provider_response"] = None
                     self._set_generation_status(
@@ -11327,6 +12342,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "session_epoch": _WEB_RERENDER_SESSION_EPOCH,
             "agent_name": str(agent.name),
             "agent_instance_id": str(id(agent)),
+            "project_id": params["project_id"],
             "shot_selection": {key: _web_rerender_plain(self.get_parameter_value(key)) for key in (
                 SHOT_SELECTOR_PARAMETER, SHOT_CHANNEL_UUID_PARAMETER, SHOT_UUID_PARAMETER,
                 SHOT_NUMBER_PARAMETER, SHOT_NAME_PARAMETER)},
@@ -11375,6 +12391,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     if subtype:
                         record["video_sub_type"] = subtype
         return {"schema": "hmb-web-rerender-generator-snapshot", "version": 1,
+                "project": {key: params[key] for key in ("project_id", "project_name")},
                 "target": target, "params": deepcopy(params), "media_snapshot": deepcopy(media),
                 "generation_settings": {key: deepcopy(params[key]) for key in _review.SETTINGS if key in params},
                 "agent_name": str(agent.name), "source_bindings": source_bindings,
@@ -11385,7 +12402,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         reason = ""
         try:
             with self._generation_refresh_lock:
-                if self._generation_run_active.is_set() or self._generation_refresh_running:
+                if self._generation_run_active.is_set() or self._generation_refresh_running or self._hmb_draft_finalize_pending:
                     raise RuntimeError("The connected Generator is busy.")
             if self._hmb_web_rerender_recovery_blocked():
                 raise RuntimeError("An earlier Generator submission still requires confirmation.")
@@ -11418,7 +12435,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     async def _hmb_web_rerender_claim(self, snapshot: dict[str, Any]):
         """Serialize web Agent + render with native Run and native Refresh."""
         with self._generation_refresh_lock:
-            if self._generation_run_active.is_set() or self._generation_refresh_running:
+            if self._generation_run_active.is_set() or self._generation_refresh_running or self._hmb_draft_finalize_pending:
                 raise RuntimeError("The connected Generator is busy.")
             if self._hmb_web_rerender_recovery_blocked():
                 raise RuntimeError("An earlier Generator submission still requires confirmation.")
@@ -11454,6 +12471,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise RuntimeError("A web rerender reference changed after the request was prepared.")
         claim.media_identity = identity
         prepared = deepcopy(claim.snapshot["params"])
+        if claim.parent_settings is None:
+            raise ValueError("web_rerender_parent_settings_contract_required")
+        prepared = _web_rerender_apply_parent_settings(prepared, claim.parent_settings)
         replacements = {}
         for row in identity:
             if "resolved_path" not in row:
@@ -11476,6 +12496,21 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         for row in media["images"] + media["videos"]:
             row["source"] = replacements.get(row["source"], row["source"])
         return media
+
+    def _hmb_web_rerender_bind_parent_settings(self, claim: Any, frozen: dict[str, Any]) -> None:
+        """Bind verified sparse wire controls before invoking either paid stage."""
+        self._hmb_web_rerender_validate_claim(claim)
+        if claim.parent_wire_settings is not None and _web_rerender_digest(claim.parent_wire_settings) != _web_rerender_digest(frozen):
+            raise ValueError("web_rerender_parent_settings_changed")
+        settings, context = _web_rerender_parent_execution_settings(frozen)
+        candidate = _web_rerender_apply_parent_settings(claim.snapshot["params"], settings)
+        validated = dict(deepcopy(candidate), prompt="Web rerender validation")
+        _HMBWebRerenderExecution.read_view(self)._validate_parameters(validated)
+        if {key: validated[key] for key in _WEB_RERENDER_PARENT_SETTINGS} != settings:
+            raise ValueError("web_rerender_parent_settings_would_change")
+        claim.parent_wire_settings = deepcopy(frozen)
+        claim.parent_settings = settings
+        claim.parent_generation_context = context
 
     async def _hmb_web_rerender_execute(
         self, claim: Any, agent_result: dict[str, Any], *, client_request_id: str,
@@ -11516,6 +12551,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 await run._force_save_generation_recovery_checkpoint(required=False, reason="web_interrupted")
             raise
         return {"task_id": str(run.parameter_output_values.get("generation_id") or ""),
+                "project_id": claim.snapshot["project"]["project_id"],
+                "project_name": claim.snapshot["project"]["project_name"],
                 "client_request_id": client_request_id, "parent_task_id": parent_task_id,
                 "command_id": command_id, "case_id": run._hmb_review_case_id,
                 "status": str(run.parameter_output_values.get("generation_status") or ""),
@@ -11530,6 +12567,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if (
                 self._generation_refresh_running
                 or self._generation_run_active.is_set()
+                or (self._hmb_draft_finalize_pending and asyncio.current_task() is not self._hmb_draft_finalize_task)
             ):
                 return
             self._generation_run_active.set()
@@ -11538,6 +12576,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         finally:
             with self._generation_refresh_lock:
                 self._generation_run_active.clear()
+            with suppress(Exception):
+                self._update_parameter_visibility()
+                self._sync_seedance_shot_widget(emit_change=True)
 
     async def _aprocess_impl(self) -> None:
         if not self._runtime_node_is_live(require_registered=True):
@@ -11690,6 +12731,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         """Gate only failed/pending Agent results, never prompt meaning or roles."""
         if allow_resume and str(self.get_parameter_value("resume_generation_id") or "").strip():
             return  # Retrieving an already submitted task does not need an Agent.
+        if self._draft_final_requested():
+            return  # Explicit Draft finalization inherits the Broker's immutable source inputs.
         text = str((self.get_parameter_value("prompt") if prompt is None else prompt) or "").strip()
         reserved_errors = (
             "[HMB EXECUTION FAILED]", "[HMB EXECUTION CANCELLED]",
@@ -11813,6 +12856,89 @@ def _web_rerender_reference_identity(params: dict[str, Any], inspect_files: bool
     return result
 
 
+_WEB_RERENDER_PARENT_SETTINGS = frozenset({
+    "model_id", "task", "input_mode", "resolution", "ratio", "duration",
+    "generate_audio", "watermark", "output_format", "return_last_frame",
+    "execution_expires_after", "priority",
+})
+
+
+def _web_rerender_parent_execution_settings(frozen: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Map parent wire values without reading any current node controls.
+
+    Absent optional controls below are execution-facade scaffolding only. The
+    command-bound final opener restores the parent's sparse wire key set and
+    the Agent context includes only values actually present in that request.
+    """
+    from _hmb_web_rerender import PARENT_SETTINGS_FIELDS
+    if not isinstance(frozen, dict) or set(frozen) - PARENT_SETTINGS_FIELDS:
+        raise ValueError("web_rerender_parent_settings_unsupported")
+    mode = frozen.get("input_mode")
+    task = INPUT_MODE_TASKS.get(mode)
+    omni = frozen.get("omni_reference_task_type")
+    if omni is not None:
+        task = {value: key for key, value in TASK_OMNI_REFERENCE_TYPES.items()}.get(omni)
+        if mode != INPUT_MODE_MULTIMODAL_REFERENCES or task is None:
+            raise ValueError("web_rerender_parent_task_mode_mismatch")
+    if task is None:
+        raise ValueError("web_rerender_parent_input_mode_unsupported")
+    model = frozen.get("model")
+    resolution = frozen.get("quality", frozen.get("resolution"))
+    if model not in MODEL_RESOLUTIONS or resolution not in MODEL_RESOLUTIONS[model]:
+        raise ValueError("web_rerender_parent_resolution_unsupported")
+    if model == SEEDANCE_2_5_MODEL_ID and "quality" in frozen and "resolution" in frozen and frozen["quality"] != frozen["resolution"]:
+        raise ValueError("web_rerender_parent_resolution_conflict")
+    if model != SEEDANCE_2_5_MODEL_ID and omni is not None:
+        raise ValueError("web_rerender_parent_task_unsupported")
+    mappings = {"model": "model_id", "input_mode": "input_mode", "quality": "resolution",
+                "aspect_ratio": "ratio", "ratio": "ratio", "duration_seconds": "duration", "duration": "duration",
+                "generate_audio": "generate_audio", "watermark": "watermark", "output_format": "output_format",
+                "return_last_frame": "return_last_frame", "execution_expires_after": "execution_expires_after", "priority": "priority"}
+    context = {mappings[key]: deepcopy(value) for key, value in frozen.items() if key in mappings}
+    context.update(model_id=model, resolution=resolution, task=task, input_mode=mode)
+    # These are never advertised as authoritative parent settings when absent.
+    settings = {"ratio": "adaptive", "watermark": False, "output_format": "mp4", "return_last_frame": False,
+                "execution_expires_after": 86400, "priority": 0, **context}
+    if not {"duration", "generate_audio"}.issubset(settings):
+        raise ValueError("web_rerender_parent_settings_incomplete")
+    return settings, context
+
+
+def _web_rerender_apply_parent_settings(
+    params: dict[str, Any], settings: dict[str, Any],
+) -> dict[str, Any]:
+    """Replace rendering controls while preserving the connected source snapshot.
+
+    This receives a verified Broker contract, never browser-controlled values.
+    Exact types and a complete key set prevent missing values, False, and zero
+    from turning into the current Generator's authoring defaults.
+    """
+    if not isinstance(settings, dict) or set(settings) != _WEB_RERENDER_PARENT_SETTINGS:
+        raise ValueError("web_rerender_parent_settings_unsupported_or_incomplete")
+    for key in ("model_id", "task", "input_mode", "resolution", "ratio", "output_format"):
+        if type(settings[key]) is not str or not settings[key]:
+            raise ValueError("web_rerender_parent_settings_invalid_type")
+    for key in ("duration", "execution_expires_after", "priority"):
+        if type(settings[key]) is not int:
+            raise ValueError("web_rerender_parent_settings_invalid_type")
+    for key in ("generate_audio", "watermark", "return_last_frame"):
+        if type(settings[key]) is not bool:
+            raise ValueError("web_rerender_parent_settings_invalid_type")
+    if settings["model_id"] not in BROKER_SUPPORTED_MODEL_IDS:
+        raise ValueError("web_rerender_parent_model_unsupported")
+    if TASK_INPUT_MODES.get(settings["task"]) != settings["input_mode"]:
+        raise ValueError("web_rerender_parent_task_mode_mismatch")
+    if settings["model_id"] != SEEDANCE_2_5_MODEL_ID and (
+        settings["output_format"] != DEFAULT_OUTPUT_FORMAT or settings["return_last_frame"] is not False
+    ):
+        raise ValueError("web_rerender_parent_output_settings_unsupported")
+    result = deepcopy(params)
+    for key in _review.SETTINGS:
+        result.pop(key, None)
+    result.update(deepcopy(settings))
+    return result
+
+
 @dataclass(eq=False)
 class _HMBWebRerenderClaim:
     owner: Any
@@ -11821,6 +12947,9 @@ class _HMBWebRerenderClaim:
     executed: bool = False
     media_identity: Any = None
     prepared_params: Any = None
+    parent_wire_settings: Any = None
+    parent_settings: Any = None
+    parent_generation_context: Any = None
 
 
 class _HMBWebRerenderOutput:
@@ -11866,7 +12995,14 @@ class _HMBWebRerenderExecution(HMBSeedanceGeneration):
         view._web_owner = owner
         view._web_request = False
         view._web_claim = None
-        view._web_parameter_cache = {}
+        view._hmb_draft_final_context = None
+        view._hmb_draft_finalize_task = None
+        view._hmb_draft_finalize_pending = False
+        view._hmb_project_selection_guard = None
+        # Web rerenders use immutable parent settings, not the owner's local
+        # Draft controls. Disable before capturing inputs / binding the claim;
+        # doing this only in for_request is too late for readiness validation.
+        view._web_parameter_cache = {"draft_action": DRAFT_ACTION_OFF, "draft_job_id": ""}
         view._web_source_snapshots = {}
         view.parameter_values = deepcopy(getattr(owner, "parameter_values", {}))
         view.parameter_output_values = {}
@@ -11889,6 +13025,8 @@ class _HMBWebRerenderExecution(HMBSeedanceGeneration):
         run._web_params = deepcopy(claim.prepared_params)
         run._web_params["prompt"] = agent_result["text"]
         run._web_params["resume_generation_id"] = ""
+        run._web_params["draft_action"] = DRAFT_ACTION_OFF
+        run._web_params["draft_job_id"] = ""
         run._web_parameter_cache.update(run._web_params)
         run._web_parameter_cache[BROKER_SERVER_URL_PARAMETER] = run._web_params["_hmb_broker_server_url"]
         run._web_parameter_cache[SEEDANCE_RECOVERY_PARAMETER] = _seedance_recovery_value({"journal_id": str(uuid4())})
@@ -12031,7 +13169,8 @@ class _HMBWebRerenderExecution(HMBSeedanceGeneration):
     async def _force_save_generation_recovery_checkpoint(self, *, required: bool, reason: str) -> bool:
         checkpoint = deepcopy(self._generation_recovery_state())
         checkpoint.update(parent_task_id=self._web_parent_task_id, command_id=self._web_command_id,
-                          client_request_id=self._web_client_request_id, case_id=self._hmb_review_case_id)
+                          client_request_id=self._web_client_request_id, case_id=self._hmb_review_case_id,
+                          project_id=self._web_params["project_id"], project_name=self._web_params["project_name"])
         try:
             result = self._web_checkpoint_sink(checkpoint, reason=reason, required=required)
             if inspect.isawaitable(result):

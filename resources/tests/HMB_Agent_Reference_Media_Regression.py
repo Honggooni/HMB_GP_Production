@@ -1,7 +1,6 @@
 """Offline native artifact, selected-source, bounded decode and continuation checks."""
 from __future__ import annotations
 
-import ast
 import hashlib
 import json
 import logging
@@ -182,38 +181,34 @@ class MediaTests(unittest.TestCase):
 
 class NativeSeamTests(unittest.TestCase):
     def test_native_called_once_and_optional_failure_never_changes_plain_path(self):
-        tree = ast.parse((ROOT / "HMBAgentLibrary.py").read_text(encoding="utf-8"))
-        source_class = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "HMBAgentLibrary")
-        method = next(n for n in source_class.body if isinstance(n, ast.FunctionDef) and n.name == "_process")
+        import HMBAgentLibrary as hmb_agent
         native_calls = []
-        class Native:
-            def _process(self, model_agent, prompt):
-                native_calls.append(prompt)
-                return prompt
-        adapted = ast.ClassDef(name="Adapter", bases=[ast.Name(id="Native", ctx=ast.Load())],
-                               keywords=[], body=[method], decorator_list=[])
-        namespace = {"Native": Native, "Any": object, "json": json,
-                     "_VERIFIED_PROMPT_SOURCE_ATTRIBUTE": "source",
-                     "_prompt_text_sha256": lambda v: hashlib.sha256(v.encode()).hexdigest(),
-                     "_run_native_with_literal_hmb_input": lambda native, target, value: native(target, value),
-                     "_with_english_agent_output_contract": lambda v: str(v) + "\nENGLISH CONTRACT"}
-        exec(compile(ast.fix_missing_locations(ast.Module(body=[adapted], type_ignores=[])), "native_seam", "exec"), namespace)
-        node = namespace["Adapter"]()
+        def native_process(_self, model_agent, prompt):
+            native_calls.append(prompt)
+            return prompt
+        # Exercise the real method/class boundary, including the web-facade
+        # identity check. Replace only the final native model invocation.
+        node = object.__new__(hmb_agent.HMBAgentLibrary)
         node._hmb_rules_active = True
         node._hmb_runtime_prompt = "machine"
         node._hmb_lifecycle_generation = 1
         node._hmb_lifecycle_is_live = lambda generation: True
-        node.source = SimpleNamespace(
+        node._begin_hmb_reference_observation = lambda machine: "offline-run"
+        node._mark_hmb_reference_observation_submission = lambda *args: None
+        node._hmb_verified_prompt_source_node = SimpleNamespace(
             _hmb_agent_generation_context=lambda value: {"common": {"duration_seconds": 8}},
             _hmb_agent_reference_media=lambda value: {"machine_sha256": "stale"})
-        with patch.object(media, "augment_prompt", side_effect=AssertionError("stale must not decode")):
+        with patch.object(hmb_agent._BaseAgent, "_process", native_process, create=True), \
+             patch.object(hmb_agent, "_run_native_with_literal_hmb_input", side_effect=lambda native, target, value: native(target, value)), \
+             patch.object(media, "augment_prompt", side_effect=AssertionError("stale must not decode")) as decode:
             result = node._process(agent(), "native additional_context")
-        self.assertEqual(len(native_calls), 1)
-        self.assertIn('"duration_seconds":8', result)
-        self.assertTrue(result.startswith("native additional_context"))
-        node._hmb_rules_active = False
-        self.assertEqual(node._process(agent(), "plain native input"), "plain native input")
-        self.assertEqual(len(native_calls), 2)
+            self.assertEqual(len(native_calls), 1)
+            self.assertIn('"duration_seconds":8', result)
+            self.assertTrue(result.startswith("native additional_context"))
+            node._hmb_rules_active = False
+            self.assertEqual(node._process(agent(), "plain native input"), "plain native input")
+            self.assertEqual(len(native_calls), 2)
+            decode.assert_not_called()
 
 
 if __name__ == "__main__":

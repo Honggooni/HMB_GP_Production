@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import mount, {
   hmbColorLUTState,
   HMB_COLOR_LUT_COMMAND_FIELD,
+  HMB_COLOR_LUT_ONLY_SHOT_VALUE,
 } from "../../widgets/HMBColorLUTLibraryWidget.js";
 
 const catalog = {
@@ -145,6 +146,39 @@ async function obsoleteMustNotChange(ui, old, label) {
 }
 
 for (const kind of ["publication", "command", "command-fallback"]) {
+  await check(`${kind}: authoritative project switch retires an unpublished slider edit`, async () => {
+    const ui = harness(kind);
+    ui.input(9);
+    assert.equal(ui.timers.size, 1);
+    ui.update(state({ revision: 100, project_id: "async-project-B", project: { name: "Async Project B" }, settings: { precision_version: 2, enabled: true, exposure: 0.5 } }));
+    assert.equal(ui.snapshot().project, "async-project-B");
+    assert.equal(ui.snapshot().exposure, "2");
+    ui.flushCommit();
+    assert.equal(ui.requests.length, 0, "A delayed edit from Project A must never be published under Project B.");
+    ui.update(state({ revision: 10 }));
+    assert.equal(ui.snapshot().project, "async-project-B", "Old host echoes cannot restore the previous project.");
+    assert.equal(ui.container.mounts, 1, "Project switches retain the preview DOM.");
+    ui.controller.cleanup();
+  });
+  await check(`${kind}: backend project revision remains authoritative when local edits run ahead`, async () => {
+    const ui = harness(kind);
+    ui.input(1, true); ui.input(2, true); ui.input(3, true); ui.input(4);
+    ui.update(state({ revision: 11, project_id: "async-project-B", settings: { precision_version: 2, exposure: 0.5 } }));
+    assert.equal(ui.snapshot().project, "async-project-B");
+    assert.equal(ui.snapshot().exposure, "2");
+    ui.flushCommit();
+    assert.equal(ui.requests.length, 3);
+    ui.controller.cleanup();
+  });
+  await check(`${kind}: deleting the edited Shot retires its pending slider publication`, async () => {
+    const ui = harness(kind); ui.input(9);
+    ui.update(state({ revision: 100, shot: {},
+      shot_catalog: { ...catalog, generation: 2, shots: catalog.shots.filter(shot => shot.shot_uuid !== "async-shot-1") } }));
+    assert.equal(ui.snapshot().shot, HMB_COLOR_LUT_ONLY_SHOT_VALUE);
+    ui.flushCommit();
+    assert.equal(ui.requests.length, 0, "A removed Shot's pending grade must never be reassigned to Only.");
+    ui.controller.cleanup();
+  });
   await check(`${kind}: newer committed edit owns status`, async () => {
     const ui = harness(kind), old = ui.issue();
     ui.input(8, true); ui.requests.at(-1).resolve(); await settle();

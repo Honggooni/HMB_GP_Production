@@ -6,7 +6,6 @@ cloud uploads, native workflow writes or paid renders are performed.
 from __future__ import annotations
 
 import asyncio
-import ast
 import copy
 from collections import OrderedDict
 import hashlib
@@ -25,6 +24,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _hmb_seedance_clean_ci_stubs import install_clean_ci_griptape_stubs
+from _hmb_web_rerender_settings_fixtures import wire_settings, freeze_command
 
 install_clean_ci_griptape_stubs()
 spec = importlib.util.spec_from_file_location("seedance_web_rerender", ROOT / "HMBSeedanceGeneration.py")
@@ -44,6 +44,12 @@ worker_spec.loader.exec_module(worker)
 
 def new_node():
     node = Base(name="Web Rerender Test")
+    # This execution fixture has no retained graph. Exact registered project
+    # topology is exercised by HMB_Seedance_Project_Source_Routing_Regression.
+    node._capture_imageasset_project_selection = lambda: {
+        "schema": target.PROJECT_SELECTION_SCHEMA,
+        "project": {"project_id": "superwings12", "project_name": "슈퍼윙즈12"},
+    }
     node.parameter_values.update({
         "model_id": target.SEEDANCE_2_0_MODEL_ID,
         "resolution": target.MODEL_DEFAULT_RESOLUTIONS[target.SEEDANCE_2_0_MODEL_ID],
@@ -70,7 +76,8 @@ def unchanged(node):
 
 def result(text="WEB AGENT RESULT {{LITERAL}}"):
     return {"text": text, "run_id": "agent-web-1", "output_sha256": hashlib.sha256(text.encode()).hexdigest(),
-            "policy_identity": {"version": "signed-policy"}, "observation": {"status": "observed"}}
+            "policy_identity": {"mode": "preserved_parent", "reinjected": False},
+            "observation": {"status": "observed"}}
 
 
 async def fake_save(self, final_task, generation_id, destination, *args, **kwargs):
@@ -115,6 +122,7 @@ async def checks(root):
         checkpoints.append((copy.deepcopy(checkpoint), reason, required))
     bridge = Broker(checkpoints)
     async with node._hmb_web_rerender_claim(snapshot) as claim:
+        node._hmb_web_rerender_bind_parent_settings(claim, wire_settings(claim.snapshot["generation_settings"]))
         assert node._generation_run_active.is_set()
         assert not node._hmb_web_rerender_readiness()["ready"]
         native = mock.AsyncMock()
@@ -167,6 +175,7 @@ async def checks(root):
     wire_bridge._load_access_token = lambda: "offline-test"
     wire_bridge.account_snapshot = lambda **kwargs: SimpleNamespace(connected=True)
     async with node._hmb_web_rerender_claim(snapshot) as claim:
+        node._hmb_web_rerender_bind_parent_settings(claim, wire_settings(claim.snapshot["generation_settings"]))
         await node._hmb_web_rerender_prepare_media(claim)
         response = await node._hmb_web_rerender_execute(claim, result("  WEB {{LITERAL}} \n"), client_request_id="hmb-wire-intent",
             output_directory=root, checkpoint_sink=sink, submission_bridge=wire_bridge)
@@ -181,6 +190,7 @@ async def checks(root):
         node = new_node()
         snapshot = node._hmb_web_rerender_capture_inputs()
         async with node._hmb_web_rerender_claim(snapshot) as claim:
+            node._hmb_web_rerender_bind_parent_settings(claim, wire_settings(claim.snapshot["generation_settings"]))
             node.parameter_values[field] = value
             try:
                 node._hmb_web_rerender_validate_claim(claim)
@@ -195,6 +205,7 @@ async def checks(root):
     node.parameter_values["reference_images"] = [str(local)]
     snapshot = node._hmb_web_rerender_capture_inputs()
     async with node._hmb_web_rerender_claim(snapshot) as claim:
+        node._hmb_web_rerender_bind_parent_settings(claim, wire_settings(claim.snapshot["generation_settings"]))
         await node._hmb_web_rerender_prepare_media(claim)
         local.write_bytes(b"different bytes")
         try:
@@ -210,6 +221,7 @@ async def checks(root):
         raise OSError("simulated journal disk failure")
     failed_bridge = Broker([])
     async with node._hmb_web_rerender_claim(snapshot) as claim:
+        node._hmb_web_rerender_bind_parent_settings(claim, wire_settings(claim.snapshot["generation_settings"]))
         await node._hmb_web_rerender_prepare_media(claim)
         try:
             await node._hmb_web_rerender_execute(claim, result(), client_request_id="hmb-fixed-web-2",
@@ -242,6 +254,7 @@ async def checks(root):
         raise target._BrokerUnavailableError("synthetic timeout", submission_outcome_unknown=True)
     uncertain.generate_seedance = unknown_create
     async with node._hmb_web_rerender_claim(snapshot) as claim:
+        node._hmb_web_rerender_bind_parent_settings(claim, wire_settings(claim.snapshot["generation_settings"]))
         await node._hmb_web_rerender_prepare_media(claim)
         try:
             await node._hmb_web_rerender_execute(claim, result(), client_request_id="hmb-fixed-unknown",
@@ -265,6 +278,7 @@ async def checks(root):
         # must return to the engine loop after the queued user edit.
         loop.call_soon_threadsafe(node.parameter_values.__setitem__, "duration", 4)
     async with node._hmb_web_rerender_claim(snapshot) as claim:
+        node._hmb_web_rerender_bind_parent_settings(claim, wire_settings(claim.snapshot["generation_settings"]))
         await node._hmb_web_rerender_prepare_media(claim)
         with mock.patch.object(target, "_broker_wait_for_submission_slot", change_during_cadence):
             try:
@@ -282,6 +296,7 @@ async def checks(root):
     with mock.patch.object(Path, "is_file", side_effect=AssertionError("Readiness touched filesystem")):
         fast = node._hmb_web_rerender_capture_inputs()
     async with node._hmb_web_rerender_claim(fast) as claim:
+        node._hmb_web_rerender_bind_parent_settings(claim, wire_settings(claim.snapshot["generation_settings"]))
         try:
             await node._hmb_web_rerender_prepare_media(claim)
             raise AssertionError("Missing media was accepted for execution")
@@ -292,6 +307,7 @@ async def checks(root):
     node = new_node()
     snapshot = node._hmb_web_rerender_capture_inputs()
     async with node._hmb_web_rerender_claim(snapshot) as claim:
+        node._hmb_web_rerender_bind_parent_settings(claim, wire_settings(claim.snapshot["generation_settings"]))
         await node._hmb_web_rerender_prepare_media(claim)
         node._hmb_node_deleted = True
         try:
@@ -321,6 +337,7 @@ async def command_submission_contracts(root):
     def sink(checkpoint, *, reason, required):
         checkpoints.append((copy.deepcopy(checkpoint), reason, required))
     command = {"render_key": "hmb-wire-finish-intent", "operation_id": "web-operation",
+               "project_id": "superwings12", "project_name": "슈퍼윙즈12",
                "lease_id": "web-lease", "fence": 7}
     lease = threading.Event()
     lease.set()
@@ -341,7 +358,9 @@ async def command_submission_contracts(root):
             assert not any(key.startswith("_hmb_") for key in body), "Private snapshot fields leaked into provider request"
             assert checkpoints[-1][1] == "pre_submit"
             assert prepared == [{"agent_output": raw["text"], "agent_output_sha256": raw["output_sha256"],
-                                 "render_payload_sha256": worker.request_fingerprint(body)}]
+                                 "render_payload_sha256": worker.request_fingerprint(body),
+                                 "policy_application": "preserved_parent", "policy_reinjected": False,
+                                 "project_id": "superwings12", "project_name": "슈퍼윙즈12"}]
             assert transitions == [("local-operation", {"render_preparing"}, "submitting")]
             wire_calls.append(body)
             return Response(json.dumps({"job_id": "web-finish-task", "status": "succeeded",
@@ -354,13 +373,15 @@ async def command_submission_contracts(root):
         prepared.append(fields)
     protocol = SimpleNamespace(bridge=bare, result=record_prepared)
     journal = SimpleNamespace(transition=lambda *args: transitions.append(args))
-    bridge = worker.command_bridge(protocol, command, journal, "local-operation", raw, lease,
-                                   submitted_prompt=composed)
     with mock.patch.object(Execution, "_resolve_exact_shot_generation_inputs", resolve_snapshot):
         node = new_node()
         snapshot = node._hmb_web_rerender_capture_inputs()
         assert snapshot["params"]["_hmb_finish_look_out"] == finish
+        command["parent_task_id"] = "original-task"
+        command.update(freeze_command(command, wire_settings(snapshot["generation_settings"])))
+        bridge = worker.command_bridge(protocol, command, journal, "local-operation", raw, lease, submitted_prompt=composed)
         async with node._hmb_web_rerender_claim(snapshot) as claim:
+            node._hmb_web_rerender_bind_parent_settings(claim, wire_settings(claim.snapshot["generation_settings"]))
             await node._hmb_web_rerender_prepare_media(claim)
             response = await node._hmb_web_rerender_execute(claim, raw,
                 client_request_id=command["render_key"], output_directory=root,
@@ -390,67 +411,73 @@ async def command_submission_contracts(root):
 
 
 def source_readiness_contracts():
-    """Exercise the actual source method bodies with filesystem traps."""
-    tree = ast.parse((ROOT / "HMBVideoPickerLibrary.py").read_text(encoding="utf-8-sig"))
-    picker_cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "HMBVideoPickerLibrary")
-    methods = [node for node in picker_cls.body if isinstance(node, ast.FunctionDef) and node.name in {
-        "_hmb_shot_routing_snapshot", "_hmb_shot_routing_snapshot_locked"}]
-    selector = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_select_synchronized_video_media")
-    probes = []
+    """Run real source methods with I/O traps, including their module globals."""
+    def load_source(name, filename):
+        spec = importlib.util.spec_from_file_location(name, ROOT / filename)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    picker_module = load_source("web_readiness_picker", "HMBVideoPickerLibrary.py")
+    image_module = load_source("web_readiness_image", "HMBImageAssetLibrary.py")
+    probes, scheduled = [], []
     def probe(*args, **kwargs):
         probes.append(True)
         return None
     def outputs(state, *, enforce_media_availability, probe_cache):
         assert enforce_media_availability is False, "Fast view's nested output builder re-enabled filesystem checks"
         return {}, [row["video_path"] for row in state["videos"] if row["selected"]]
-    scope = {"Any": Any, "Dict": Dict, "List": List, "Optional": Optional, "Path": Path,
-             "threading": threading, "hashlib": hashlib, "_clean": lambda value: str(value or ""),
-             "_uuid_text": lambda value: str(value or ""), "_parse_state": copy.deepcopy,
-             "_state_sync_local": lambda node: SimpleNamespace(), "_sha256_canonical": target._web_rerender_digest,
-             "_is_remote_video_reference": lambda value: value.startswith("https://"),
-             "_resolve_readable_video_reference": probe,
-             "_picker_representative_video_uids": lambda selected, preview: list(selected),
-             "SHOT_ROUTING_SNAPSHOT_SCHEMA": "hmb-picker-shot-routing-snapshot", "SHOT_ROUTING_SNAPSHOT_VERSION": 1,
-             "_build_synchronized_video_outputs": outputs}
-    executable = ast.Module(body=[selector, ast.ClassDef(name="PickerRead", bases=[], keywords=[], body=methods, decorator_list=[])], type_ignores=[])
-    exec(compile(ast.fix_missing_locations(executable), "<production-picker-readiness>", "exec"), scope)
-    picker = scope["PickerRead"]()
-    state = {"channel_uuid": "channel", "shot_publisher_instance_uuid": "publisher",
-             "videos": [{"video_uid": "video-one", "video_path": "C:/not-present/video.mp4"}],
-             "picker_shots": [{"bound_shot_uuid": "shot", "selected_video_uids": ["video-one"]}]}
-    picker._picker_state = lambda: copy.deepcopy(state)
-    picker._hmb_shot_catalog_snapshot = {"channel_uuid": "channel", "publisher_instance_uuid": "publisher",
-                                         "shots": [{"shot_uuid": "shot", "number": 1, "name": "Shot 1"}]}
-    picker._hmb_picker_publisher_uuid = "picker"
-    picker._shot_video_metadata = lambda row: {}
-    picker._hmb_allocate_shot_snapshot_generation = lambda identity: (_ for _ in ()).throw(AssertionError("Fast read advanced generation"))
-    snapshot = picker._hmb_shot_routing_snapshot("channel", validate_media=False)
-    assert snapshot["media_by_source_uid"]["video-one"] == "C:/not-present/video.mp4" and not probes
-    try:
-        picker._hmb_shot_routing_snapshot("channel")
-        raise AssertionError("Ordinary Picker availability checks were bypassed")
-    except ValueError as exc:
-        assert "unavailable" in str(exc) and probes
 
-    tree = ast.parse((ROOT / "HMBImageAssetLibrary.py").read_text(encoding="utf-8-sig"))
-    image_cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "HMBImageAssetLibrary")
-    method = next(node for node in image_cls.body if isinstance(node, ast.FunctionDef) and node.name == "_cache_shot_routing_snapshot")
-    image_scope = {"Any": Any, "Dict": Dict, "OrderedDict": OrderedDict, "_normalize_state": copy.deepcopy,
-                   "_non_negative_int": lambda value: int(value or 0), "_sha256_canonical": lambda value: "same-memory-identity",
-                   "_project_output_fingerprint": lambda *args: "memory-only",
-                   "_apply_shot_routing_state_facts": lambda *args: None,
-                   "_build_shot_routing_snapshot": lambda *a, **kw: (_ for _ in ()).throw(AssertionError("Readiness resolved project files"))}
-    exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])), "<production-image-readiness>", "exec"), image_scope)
-    image = SimpleNamespace(_hmb_resolution_cache=OrderedDict())
-    state = {"shot_routing": {"publisher_instance_uuid": "publisher", "channel_uuid": "channel", "shots": []}}
-    try:
-        image_scope["_cache_shot_routing_snapshot"](image, state, cached_only=True)
-        raise AssertionError("Unpublished ImageAsset state was declared ready")
-    except ValueError as exc:
-        assert "preparing" in str(exc)
-    image._hmb_shot_routing_input_identity = "same-memory-identity"
-    image._hmb_shot_routing_cache = {"safe": "cached snapshot"}
-    assert image_scope["_cache_shot_routing_snapshot"](image, state, cached_only=True) == image._hmb_shot_routing_cache
+    channel = "11111111-1111-4111-8111-111111111111"
+    publisher = "22222222-2222-4222-8222-222222222222"
+    shot = "33333333-3333-4333-8333-333333333333"
+    picker = object.__new__(picker_module.HMBVideoPickerLibrary)
+    state = {"channel_uuid": channel, "shot_publisher_instance_uuid": publisher,
+             "videos": [{"video_uid": "video-one", "video_path": "C:/not-present/video.mp4"}],
+             "picker_shots": [{"bound_shot_uuid": shot, "selected_video_uids": ["video-one"]}]}
+    picker._picker_state = lambda: copy.deepcopy(state)
+    picker._hmb_shot_catalog_snapshot = {"channel_uuid": channel, "publisher_instance_uuid": publisher,
+                                         "shots": [{"shot_uuid": shot, "number": 1, "name": "Shot 1"}]}
+    picker._hmb_picker_publisher_uuid = publisher
+    picker._shot_video_metadata = lambda row: {}
+    picker._schedule_video_removal_output_sync = lambda: scheduled.append(True)
+    picker._hmb_allocate_shot_snapshot_generation = lambda identity: (_ for _ in ()).throw(AssertionError("Fast read advanced generation"))
+    with mock.patch.object(picker_module, "_parse_state", copy.deepcopy), \
+         mock.patch.object(picker_module, "_resolve_readable_video_reference", probe), \
+         mock.patch.object(picker_module, "_build_synchronized_video_outputs", outputs):
+        snapshot = picker._hmb_shot_routing_snapshot(channel, validate_media=False)
+        assert snapshot["media_by_source_uid"]["video-one"] == "C:/not-present/video.mp4" and not probes
+        try:
+            picker._hmb_shot_routing_snapshot(channel)
+            raise AssertionError("Unprepared async Picker state was declared ready")
+        except picker_module._HMBPickerMediaPreparing:
+            assert scheduled and not probes, "Engine-loop readiness performed filesystem I/O"
+        # Legacy synchronous callers retain strict availability validation.
+        with mock.patch.object(picker_module, "_picker_running_loop", lambda: None):
+            try:
+                picker._hmb_shot_routing_snapshot(channel)
+                raise AssertionError("Ordinary Picker availability checks were bypassed")
+            except ValueError as exc:
+                assert "unavailable" in str(exc) and probes
+
+    image = object.__new__(image_module.HMBImageAssetLibrary)
+    image._hmb_resolution_cache = OrderedDict()
+    state = {"shot_routing": {"publisher_instance_uuid": publisher, "channel_uuid": channel, "shots": []}}
+    with mock.patch.object(image_module, "_normalize_state", copy.deepcopy), \
+         mock.patch.object(image_module, "_sha256_canonical", lambda value: "same-memory-identity"), \
+         mock.patch.object(image_module, "_project_output_fingerprint", lambda *args: "memory-only"), \
+         mock.patch.object(image_module, "_apply_shot_routing_state_facts", lambda *args: None), \
+         mock.patch.object(image_module, "_build_shot_routing_snapshot", side_effect=AssertionError("Readiness resolved project files")) as build:
+        try:
+            image._cache_shot_routing_snapshot(state, cached_only=True)
+            raise AssertionError("Unpublished ImageAsset state was declared ready")
+        except image_module._ImageAssetSelectionPreparing as exc:
+            assert "preparing" in str(exc)
+        image._hmb_shot_routing_input_identity = "same-memory-identity"
+        image._hmb_shot_routing_cache = {"safe": "cached snapshot"}
+        assert image._cache_shot_routing_snapshot(state, cached_only=True) == image._hmb_shot_routing_cache
+        build.assert_not_called()
     return 2
 
 

@@ -14,6 +14,8 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from _hmb_project import resolve_project
+
 SCHEMA = "hmb-generation-casecard"
 VERSION = 1
 MAX_RECORD_BYTES = 2 * 1024 * 1024
@@ -60,7 +62,8 @@ def public_evidence(record: dict[str, Any]) -> dict[str, Any]:
         flat = record.get("build") if isinstance(record.get("build"), dict) else {}
         record = {**record, "prompt_sha256": record.get("client_prompt_sha256"),
                   "inputs": {"settings": record.get("settings"), "references": record.get("references"),
-                             "generation_origin": record.get("shot")},
+                             "generation_origin": record.get("shot"),
+                             "project_id": record.get("project_id"), "project_name": record.get("project_name")},
                   "build": {"library_version": flat.get("library_version"), "channel": flat.get("channel"),
                             "runtime": {"fingerprint_sha256": flat.get("runtime_fingerprint_sha256")},
                             "package": {"build_fingerprint_sha256": flat.get("build_fingerprint_sha256")},
@@ -69,6 +72,7 @@ def public_evidence(record: dict[str, Any]) -> dict[str, Any]:
                                        "envelope_sha256": flat.get("policy_envelope_sha256"),
                                        "signature_status": flat.get("policy_signature_status")}}}
     inputs = record.get("inputs") if isinstance(record.get("inputs"), dict) else {}
+    project = resolve_project(inputs)
     build = record.get("build") if isinstance(record.get("build"), dict) else {}
     references = []
     raw_references = inputs.get("references")
@@ -143,6 +147,7 @@ def public_evidence(record: dict[str, Any]) -> dict[str, Any]:
             ("attachment_limit", "image_limit", "encoded_byte_limit", "preparation_seconds_limit", "attachments_prepared",
              "attachments_delivered", "encoded_bytes_prepared", "elapsed_seconds") if key in budget} if isinstance(budget, dict) else {}
     return {"schema": SCHEMA, "version": 1,
+            "project_id": project["project_id"], "project_name": project["project_name"],
             "case_id": _hash(record.get("case_id")), "input_evidence_sha256": _hash(record.get("input_evidence_sha256")),
             "client_prompt_sha256": _hash(record.get("prompt_sha256")), "build": public_build,
             "shot": shot, "settings": settings, "references": references, "agent_observation": observation}
@@ -174,6 +179,40 @@ def task_origin(task_id: str, *, root: Path | str | None = None) -> str:
         return ""
     record = _read(review_root(root) / "task-origins" / (hashlib.sha256(task_id.encode()).hexdigest() + ".json"))
     return str(record.get("origin") or "") if record and record.get("schema") == "hmb-private-task-origin" and record.get("task_id") == task_id else ""
+
+
+def bind_task_project(task_id: str, project: Any, *, root: Path | str | None = None) -> None:
+    """Immutable source-project identity, independent of optional case capture."""
+    if not _public_id(task_id):
+        raise ValueError("Invalid Task ID.")
+    identity = resolve_project(project, default_legacy=False)
+    public = {key: identity[key] for key in ("project_id", "project_name")}
+    path = review_root(root) / "task-projects" / (hashlib.sha256(task_id.encode()).hexdigest() + ".json")
+    with _LOCK:
+        previous = _read(path)
+        if path.exists() and previous is None:
+            raise ValueError("Task project record is unreadable.")
+        if previous and (previous.get("task_id") != task_id or
+                         resolve_project(previous, default_legacy=False) != identity):
+            raise ValueError("Task project is immutable.")
+        if previous is None:
+            _write(path, {"schema": "hmb-private-task-project", "version": 1,
+                          "task_id": task_id, **public})
+
+
+def task_project(task_id: str, *, root: Path | str | None = None) -> dict[str, str]:
+    if not _public_id(task_id):
+        raise ValueError("Invalid Task ID.")
+    path = review_root(root) / "task-projects" / (hashlib.sha256(task_id.encode()).hexdigest() + ".json")
+    record = _read(path)
+    if path.exists():
+        if not record or record.get("schema") != "hmb-private-task-project" or record.get("task_id") != task_id:
+            raise ValueError("Task project record is unreadable.")
+        return resolve_project(record, default_legacy=False)
+    case = read_case(task_id, root=root)
+    # All historical unpartitioned Tasks belong to Superwings12. Never use
+    # today's selected ImageAsset project to rewrite that historical identity.
+    return resolve_project(case.get("inputs") if case else None)
 
 
 def mark_server_sync(task_id: str, *, status: str, evidence_sha256: str = "", reason: str = "",
@@ -322,6 +361,7 @@ def describe_reference(value: Any, *, role: str, index: int) -> dict[str, Any]:
 
 
 def capture_inputs(params: dict[str, Any]) -> dict[str, Any]:
+    project = resolve_project(params)
     references = []
     for role, field in (("image", "reference_images"), ("video", "video_references"),
                         ("audio", "reference_audio"), ("first_frame", "first_frame"),
@@ -333,6 +373,7 @@ def capture_inputs(params: dict[str, Any]) -> dict[str, Any]:
     settings = {name: params[name] for name in SETTINGS
                 if name in params and isinstance(params[name], (str, bool, int, float, type(None)))}
     return {"settings": settings, "references": references,
+            "project_id": project["project_id"], "project_name": project["project_name"],
             "generation_origin": deepcopy(params.get("_hmb_generation_origin") or {})}
 
 

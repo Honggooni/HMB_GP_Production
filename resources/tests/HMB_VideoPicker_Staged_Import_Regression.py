@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import os
 import sys
 import threading
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,7 +16,23 @@ import HMBVideoPickerLibrary as picker
 
 
 def node_state():
-    node = picker.HMBVideoPickerLibrary(name="Staged import regression")
+    node = picker.HMBVideoPickerLibrary(name=f"Staged import regression {uuid.uuid4().hex}")
+    try:
+        from griptape_nodes.exe_types.flow import ControlFlow
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    except ImportError:
+        pass  # Hostless fallback has no retained-mode registry.
+    else:
+        manager = GriptapeNodes.EventManager()
+        manager.initialize_queue()
+        options = {"name": f"StagedImportFixture_{uuid.uuid4().hex}"}
+        if "engine" in inspect.signature(ControlFlow).parameters:
+            options["engine"] = manager.engine
+        flow = ControlFlow(**options)
+        flow.add_node(node)
+        GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
+        GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
+        GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = flow.name
     state = node._picker_state()
     first = state["active_picker_shot_uuid"]
     state["picker_shots"][0]["bound_shot_uuid"] = "10000000-0000-4000-8000-000000000001"

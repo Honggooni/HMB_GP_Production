@@ -116,6 +116,7 @@ class FakePortal:
             assert request.method == "PUT"
             assert body == review.public_evidence(body), "Wire evidence must be the exact public projection"
             assert set(body) == {"schema", "version", "case_id", "input_evidence_sha256", "client_prompt_sha256",
+                                 "project_id", "project_name",
                                  "build", "shot", "settings", "references", "agent_observation"}
             assert call["idempotency_key"] == review._digest(body)
             previous = self.casecards.get(task)

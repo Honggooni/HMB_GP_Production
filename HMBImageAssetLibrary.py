@@ -7026,6 +7026,7 @@ def _build_shot_routing_snapshot(
     metadata_document = {
         "channel_uuid": routing["channel_uuid"],
         "generation": resolved_generation,
+        "project_id": _clean(normalized.get("project_id")),
         "shots": shots,
         "ordered_assets": ordered_assets,
     }
@@ -7041,6 +7042,7 @@ def _build_shot_routing_snapshot(
         "publisher_instance_uuid": routing["publisher_instance_uuid"],
         "channel_uuid": routing["channel_uuid"],
         "generation": resolved_generation,
+        "project_id": metadata_document["project_id"],
         "metadata_sha256": _sha256_canonical(metadata_document),
         "media_sha256": _sha256_canonical(media_document),
         "shots": shots,
@@ -7996,6 +7998,10 @@ def _stage_and_notify_image_output_pair(
         ) from notification_errors[0][1]
 
 
+class _ImageAssetSelectionPreparing(ValueError):
+    hmb_image_asset_selection_preparing = True
+
+
 class HMBImageAssetLibrary(DataNode):
     """Independent project image library and optional metadata source.
 
@@ -8342,6 +8348,12 @@ class HMBImageAssetLibrary(DataNode):
             _get_parameter_raw(self, WIDGET_STATE_PARAMETER)
         )
 
+    def _hmb_project_identity(self) -> Dict[str, str]:
+        """Read the selected project without scanning, publishing, or changing UI."""
+        from _hmb_project import project_from_asset_payload
+
+        return project_from_asset_payload(self._current_state(), default_legacy=False)
+
     def _cache_shot_routing_snapshot(
         self,
         state: Dict[str, Any],
@@ -8399,7 +8411,7 @@ class HMBImageAssetLibrary(DataNode):
         if cached_only:
             # Readiness must never resolve a network project on the engine
             # event loop. Normal source publication refreshes this cache.
-            raise ValueError("ImageAsset Shot publication is still preparing.")
+            raise _ImageAssetSelectionPreparing("ImageAsset Shot publication is still preparing.")
         probe = _build_shot_routing_snapshot(
             normalized_state,
             import_media,
@@ -8416,6 +8428,7 @@ class HMBImageAssetLibrary(DataNode):
             {
                 "publisher_instance_uuid": probe["publisher_instance_uuid"],
                 "channel_uuid": probe["channel_uuid"],
+                "project_id": probe["project_id"],
                 "shots": probe["shots"],
                 "ordered_assets": probe["ordered_assets"],
                 "media_descriptors": media_descriptors,
@@ -8475,7 +8488,15 @@ class HMBImageAssetLibrary(DataNode):
         cached_only: bool = False,
     ) -> Dict[str, Any]:
         """Return a private atomic shot metadata/media snapshot."""
-        snapshot = self._cache_shot_routing_snapshot(self._current_state(), cached_only=cached_only)
+        state = self._current_state()
+        if not cached_only:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None and self._defer_project_selection_resolution(state):
+                raise _ImageAssetSelectionPreparing("ImageAsset Shot publication is still preparing.")
+        snapshot = self._cache_shot_routing_snapshot(state, cached_only=cached_only)
         expected = _clean(expected_channel_uuid)
         if expected and expected != snapshot["channel_uuid"]:
             raise ValueError(
@@ -8488,6 +8509,7 @@ class HMBImageAssetLibrary(DataNode):
             "publisher_instance_uuid": snapshot["publisher_instance_uuid"],
             "channel_uuid": snapshot["channel_uuid"],
             "generation": snapshot["generation"],
+            "project_id": snapshot["project_id"],
             "metadata_sha256": snapshot["metadata_sha256"],
             "media_sha256": snapshot["media_sha256"],
             "shots": [
@@ -8513,7 +8535,18 @@ class HMBImageAssetLibrary(DataNode):
     def _hmb_shot_routing_catalog(self) -> Dict[str, Any]:
         """Return the bounded, media-free Shot catalog used by same-flow peers."""
 
-        snapshot = self._cache_shot_routing_snapshot(self._current_state())
+        state = self._current_state()
+        try:
+            snapshot = self._cache_shot_routing_snapshot(state, cached_only=True)
+        except ValueError:
+            # Discovery needs only authored Shot names/IDs. Resolving images
+            # here would put UNC IO back on the event loop while a selection
+            # worker is preparing that separate media snapshot.
+            snapshot = dict(state["shot_routing"])
+            snapshot["generation"] = max(
+                1, _non_negative_int(snapshot.get("generation")),
+                _non_negative_int(getattr(self, "_hmb_shot_routing_generation", 0)),
+            )
         shots = [
             {
                 "shot_uuid": item["shot_uuid"],
@@ -9108,6 +9141,153 @@ class HMBImageAssetLibrary(DataNode):
             self._hmb_import_media_identity = identity
         self._hmb_import_media_by_uid = normalized_media
 
+    def _resolution_cache_for_state(self, state: Dict[str, Any]) -> OrderedDict:
+        cache = getattr(self, "_hmb_resolution_cache", None)
+        if not isinstance(cache, OrderedDict):
+            cache = OrderedDict()
+            self._hmb_resolution_cache = cache
+        identity = _resolution_cache_state_identity(state)
+        if identity != getattr(self, "_hmb_resolution_cache_identity", ""):
+            cache.clear()
+            self._hmb_resolution_cache_identity = identity
+        return cache
+
+    def _consume_selection_resolution(self, *, publish: bool = False) -> bool:
+        work = getattr(self, "_hmb_selection_resolution_work", None)
+        if not isinstance(work, dict):
+            return False
+        with work["lock"]:
+            ready = work.get("ready")
+            work["ready"] = None
+        if ready is None or not self._scan_owner_is_current():
+            return False
+        identity, epoch, entries = ready
+        live = self._current_state()
+        if (identity != _resolution_cache_state_identity(live)
+            or epoch != work["epoch"]):
+            return False
+        cache = self._resolution_cache_for_state(live)
+        for key, entry in entries.items():
+            _resolution_cache_put(cache, key, entry)
+        if publish and not live.get("scan_busy"):
+            # Only the current selection owns publication. A late completion
+            # can warm its exact project cache, never restore a previous click.
+            self._sync_output(live, normalized=True)
+            self._reconcile_hmb_shot_routing(
+                _shot_routing_catalog_identity(live, normalized=True)
+            )
+        return True
+
+    def _defer_project_selection_resolution(self, state: Dict[str, Any]) -> bool:
+        """Keep first-selection UNC verification off the retained event loop."""
+        self._consume_selection_resolution()
+        cache = self._resolution_cache_for_state(state)
+        revision = _non_negative_int(getattr(self, "_hmb_import_revision", 0))
+        missing = [
+            _asset_resolution_cache_key(asset, state, revision)
+            for asset in state.get("assets", [])
+            if asset.get("selected")
+            and _clean(asset.get("source_kind")).casefold() == "project"
+            and _asset_resolution_cache_key(asset, state, revision) not in cache
+        ]
+        if not missing:
+            return False
+        loop = None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        if loop is None:
+            try:
+                from griptape_nodes.retained_mode.engine import has_current_engine
+                from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+                if has_current_engine():
+                    loop = GriptapeNodes.EventManager().event_loop
+            except ImportError:
+                pass
+        if loop is None or not loop.is_running() or loop.is_closed():
+            # Synchronous legacy hosts and process(force=True) retain their
+            # existing verification contract; never construct an Engine here.
+            return False
+        work = getattr(self, "_hmb_selection_resolution_work", None)
+        if not isinstance(work, dict):
+            work = {"lock": threading.RLock(), "active": False,
+                    "key": "", "queued": None, "ready": None, "epoch": 0}
+            self._hmb_selection_resolution_work = work
+        identity = _resolution_cache_state_identity(state)
+        key = _sha256_canonical([identity, sorted(missing), work["epoch"]])
+        task = (key, identity, work["epoch"], copy.deepcopy(state),
+                dict(getattr(self, "_hmb_import_media_by_uid", {}) or {}), revision)
+        with work["lock"]:
+            if key == work["key"]:
+                work["queued"] = None
+                return True
+            if work["queued"] and work["queued"][0] == key:
+                return True
+            if work["active"]:
+                # Bound a stalled share to one worker and retain only the
+                # newest pending selection instead of spawning on every click.
+                work["queued"] = task
+                return True
+            work["active"] = True
+            work["key"] = key
+        node_ref = weakref.ref(self)
+        host_context = contextvars.copy_context()
+
+        def publish_ready() -> None:
+            owner = node_ref()
+            if owner is not None:
+                owner._consume_selection_resolution(publish=True)
+
+        def worker() -> None:
+            current_task = task
+            try:
+                while current_task is not None:
+                    _, project_identity, epoch, snapshot, imports, import_revision = current_task
+                    resolved_cache: OrderedDict = OrderedDict()
+                    try:
+                        _resolve_selected_assets(
+                            snapshot, imports, resolution_cache=resolved_cache,
+                            import_revision=import_revision, normalized=True,
+                        )
+                    except Exception as exc:
+                        # A failed task must release its slot and still drain a
+                        # newer queued selection. Never publish a partial cache.
+                        _diagnostic_exception("Selected project image verification failed", exc)
+                    else:
+                        with work["lock"]:
+                            if epoch == work["epoch"]:
+                                work["ready"] = (project_identity, epoch, resolved_cache)
+                        try:
+                            loop.call_soon_threadsafe(host_context.copy().run, publish_ready)
+                        except RuntimeError:
+                            # A retained callback will consume the ready cache if
+                            # the host loop stopped between lookup and handoff.
+                            pass
+                    with work["lock"]:
+                        current_task = work["queued"]
+                        work["queued"] = None
+                        work["key"] = current_task[0] if current_task else ""
+                        if current_task is None:
+                            work["active"] = False
+                            return
+            finally:
+                with work["lock"]:
+                    if current_task is not None and work["key"] == current_task[0]:
+                        work["active"] = False
+                        work["key"] = ""
+
+        thread = threading.Thread(target=worker, name="HMBImageAssetSelection", daemon=True)
+        try:
+            thread.start()
+        except Exception:
+            with work["lock"]:
+                work["active"] = False
+                work["key"] = ""
+            raise
+        return True
+
     def _sync_output(
         self,
         state: Dict[str, Any],
@@ -9117,18 +9297,16 @@ class HMBImageAssetLibrary(DataNode):
     ) -> Dict[str, Any]:
         normalized_state = state if normalized else _normalize_state(state)
         normalized = normalized_state
-        resolution_cache = getattr(self, "_hmb_resolution_cache", None)
-        if not isinstance(resolution_cache, OrderedDict):
-            resolution_cache = OrderedDict()
-            self._hmb_resolution_cache = resolution_cache
-        resolution_identity = _resolution_cache_state_identity(normalized)
-        if resolution_identity != getattr(
-            self,
-            "_hmb_resolution_cache_identity",
-            "",
-        ):
-            resolution_cache.clear()
-            self._hmb_resolution_cache_identity = resolution_identity
+        resolution_cache = self._resolution_cache_for_state(normalized)
+        if force:
+            work = getattr(self, "_hmb_selection_resolution_work", None)
+            if isinstance(work, dict):
+                with work["lock"]:
+                    work["epoch"] += 1
+                    work["queued"] = None
+                    work["ready"] = None
+        elif self._defer_project_selection_resolution(normalized):
+            return normalized
         import_media = getattr(self, "_hmb_import_media_by_uid", {})
         if not isinstance(import_media, dict):
             import_media = {}
@@ -9384,6 +9562,8 @@ class HMBImageAssetLibrary(DataNode):
         pending_only = bool(
             normalized.get("scan_busy") or normalized.get("thumbnail_busy")
         )
+        if not pending_only:
+            pending_only = self._defer_project_selection_resolution(normalized)
         if not pending_only:
             # Resolve the compact shot facts before serialization.  The private
             # cache retains media while widget state receives hashes/counts only.
@@ -11909,6 +12089,133 @@ class HMBImageAssetLibrary(DataNode):
         self._hmb_delete_parent_called = True
         parent = getattr(super(), "after_node_deleted", None)
         return parent(*args, **kwargs) if callable(parent) else None
+
+    def _execution_preparation_identity(self) -> str:
+        state = self._current_state()
+        imports = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
+        return _sha256_canonical({
+            "root": _project_root_text(_get_parameter_raw(self, PROJECT_ROOT_PARAMETER)),
+            "selection": _project_output_fingerprint(
+                state, getattr(self, "_hmb_import_media_by_uid", {}),
+                _non_negative_int(getattr(self, "_hmb_import_revision", 0)),
+            ),
+            "imports": _canonical_import_input_identity(imports),
+            "import_revision": _non_negative_int(getattr(self, "_hmb_import_revision", 0)),
+            "routing": _shot_routing_catalog_identity(state, normalized=True),
+            "shot_membership": [list(shot["selected_source_uids"])
+                                for shot in state["shot_routing"]["shots"]],
+        })
+
+    @staticmethod
+    def _prepare_execution_files(
+        current: Dict[str, Any], root_value: str, import_value: Any,
+        import_media: Dict[str, Any], import_revision: int,
+    ) -> tuple[Dict[str, Any], Dict[str, Any], int, OrderedDict]:
+        """Detached filesystem preparation: no node, ports, or graph mutation."""
+        requested = root_value.replace("\\", "/").rstrip("/").casefold()
+        current_root = _project_root_text(current.get("catalog_root")).rstrip("/").casefold()
+        root_matches = bool(requested and requested == current_root)
+        belongs = _state_project_belongs_to_catalog(current, root_value)
+        if root_matches and belongs and _state_catalog_is_current(current):
+            state = current
+        elif root_matches and belongs:
+            state = _read_catalog_index(current.get("project_root"), current)
+            if state is None:
+                state = _load_project_catalog(root_value, current)
+        else:
+            state = _load_project_catalog(root_value, current)
+        media = import_media
+        revision = import_revision
+        if _flatten_import_values(import_value):
+            state, media = _merge_import_input(state, import_value, defer_thumbnail=True)
+            if _import_media_map_identity(media) != _import_media_map_identity(import_media):
+                revision += 1
+        state = _normalize_state(state)
+        cache: OrderedDict = OrderedDict()
+        _resolve_selected_assets(
+            state, media, resolution_cache=cache, import_revision=revision,
+            force=True, normalized=True,
+        )
+        return state, media, revision, cache
+
+    async def aprocess(self) -> None:
+        """Verify shared files off-loop, then publish one current pair on-loop."""
+        self._hmb_hydration_adopted = True
+        self._consume_pending_catalog_scan_result()
+        self._consume_pending_thumbnail_result()
+        self._consume_pending_import_thumbnail_result()
+        self._consume_pending_catalog_probe_result()
+        self._ensure_parameters()
+        generation = _non_negative_int(getattr(self, "_hmb_execution_prepare_generation", 0)) + 1
+        self._hmb_execution_prepare_generation = generation
+        work = getattr(self, "_hmb_selection_resolution_work", None)
+        if isinstance(work, dict):
+            with work["lock"]:
+                work["epoch"] += 1
+                work["queued"] = None
+                work["ready"] = None
+        if bool(getattr(self, "is_cancellation_requested", False)):
+            raise asyncio.CancelledError()
+        base = self._current_state()
+        if base.get("scan_busy"):
+            raise _ImageAssetSelectionPreparing("ImageAsset project catalog is still preparing.")
+        identity = self._execution_preparation_identity()
+        root_value = _project_root_text(_get_parameter_raw(self, PROJECT_ROOT_PARAMETER)) or str(DEFAULT_PROJECTS_ROOT)
+        import_value = _get_parameter_raw(self, IMAGE_IMPORT_PARAMETER)
+        media = dict(getattr(self, "_hmb_import_media_by_uid", {}) or {})
+        revision = _non_negative_int(getattr(self, "_hmb_import_revision", 0))
+        prepared, prepared_media, prepared_revision, cache = await asyncio.to_thread(
+            self._prepare_execution_files, base, root_value, import_value, media, revision,
+        )
+        if bool(getattr(self, "is_cancellation_requested", False)):
+            raise asyncio.CancelledError()
+        if (generation != getattr(self, "_hmb_execution_prepare_generation", 0)
+            or not self._scan_owner_is_current()
+            or self._current_state().get("scan_busy")
+            or identity != self._execution_preparation_identity()):
+            raise ValueError("ImageAsset inputs changed while preparing execution; run again with the current selection.")
+        live = self._current_state()
+        worker_state = prepared
+        prepared = _merge_async_scan_result_with_live_state(prepared, base, live)
+        if _flatten_import_values(import_value):
+            # Unlike a background catalog scan, execution already proved that
+            # IMAGE_IMPORT_IN is unchanged. Preserve its freshly prepared rows
+            # even when a legacy/programmatic write skipped the input callback.
+            prepared["assets"] = [row for row in prepared["assets"] if not (
+                _clean(row.get("source_kind")) == "user"
+                and _non_negative_int(row.get("import_index")) > 0
+            )] + [dict(row) for row in worker_state["assets"] if (
+                _clean(row.get("source_kind")) == "user"
+                and _non_negative_int(row.get("import_index")) > 0
+            )]
+            prepared["shot_routing"] = copy.deepcopy(worker_state["shot_routing"])
+            prepared["shot_routing"]["expanded"] = live["shot_routing"]["expanded"]
+            prepared = _normalize_state(prepared)
+        # The merge may retain newer presentation facts, but every selected
+        # project row must still have the exact worker-verified cache key.
+        if any(
+            row.get("selected") and _clean(row.get("source_kind")).casefold() == "project"
+            and _asset_resolution_cache_key(row, prepared, prepared_revision) not in cache
+            for row in prepared.get("assets", [])
+        ):
+            raise ValueError("ImageAsset selection changed during verification; run again.")
+        if _flatten_import_values(import_value):
+            self._replace_import_media(prepared_media)
+            if self._hmb_import_revision != prepared_revision:
+                raise ValueError("ImageAsset imports changed during verification; run again.")
+            self._hmb_last_applied_import_identity = _canonical_import_input_identity(import_value)
+        self._hmb_resolution_cache = cache
+        self._hmb_resolution_cache_identity = _resolution_cache_state_identity(prepared)
+        self._hmb_last_output_fingerprint = ""
+        self._hmb_shot_routing_input_identity = ""
+        published = self._publish_state(prepared, normalized=True)
+        # Thumbnail hydration is presentation work and may still be busy.
+        # _publish_state intentionally preserves old outputs for a busy UI
+        # acknowledgement; execution must stage the verified pair regardless.
+        synchronized = self._sync_output(published, normalized=True)
+        self._reconcile_hmb_shot_routing(_shot_routing_catalog_identity(synchronized, normalized=True))
+        if _flatten_import_values(import_value):
+            self._schedule_live_import_thumbnail_hydration(published)
 
     def process(self) -> None:
         self._hmb_hydration_adopted = True

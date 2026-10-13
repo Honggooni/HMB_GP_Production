@@ -151,7 +151,7 @@ def assert_no_runtime_fetch_and_prebilling_order() -> None:
     )
     method = generator_source.index("async def _process_generation_impl")
     new_run_guard = generator_source.index(
-        'if not params["resume_generation_id"]:', method
+        'if not params["resume_generation_id"] and not draft_final:', method
     )
     shot_resolution = generator_source.index(
         "params = self._resolve_exact_shot_generation_inputs(params)",
@@ -161,7 +161,7 @@ def assert_no_runtime_fetch_and_prebilling_order() -> None:
         "self._validate_parameters(params)", shot_resolution
     )
     destination = generator_source.index(
-        "destination = self._output_file.build_file()", validation
+        "destination = self._build_generation_output_destination(", validation
     )
     verifier_guard = generator_source.index(
         "if not resume_generation_id:", destination

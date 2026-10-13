@@ -800,8 +800,15 @@ def _render(job, scene_path):
     scene.render.film_transparent = False
     objects = _object_index()
     marker_mode = bool(job.get("apply_marker_shaders", True))
+    capture_pass = _clean(job.get("capture_pass"))
+    if capture_pass not in ("", "color", "depth", "motion_guide"):
+        raise ValueError("Unsupported Blender capture pass: " + capture_pass)
+    auxiliary_only = capture_pass in ("depth", "motion_guide")
     depth_requested = bool(job.get("generate_depth_playblast"))
     motion_requested = bool(job.get("generate_motion_guide"))
+    if capture_pass:
+        depth_requested = capture_pass == "depth"
+        motion_requested = capture_pass == "motion_guide"
     if job.get("screen_space_patterns"):
         raise RuntimeError("Maya screen-space patterns are not supported for Blender input.")
     catalog, markers = _catalog(job)
@@ -810,9 +817,9 @@ def _render(job, scene_path):
     if marker_mode:
         active, hidden = _visible_scope(job, bindings, objects)
         uses_patterns = any(row["kind"] == "pattern" for row in active.values())
-        if uses_patterns:
+        if uses_patterns and not auxiliary_only:
             _configure_pattern_eevee(scene, active, objects)
-        else:
+        elif not auxiliary_only:
             _configure_workbench(scene, True, active)
     else:
         hidden = []
@@ -824,8 +831,10 @@ def _render(job, scene_path):
         raise RuntimeError("Blender Depth must accompany an assigned Mask render.")
     if motion_requested and not marker_mode:
         raise RuntimeError("Blender Motion Guide must accompany an assigned Mask render.")
-    _progress(job, "rendering_frames", "Rendering Blender {} frames.".format("Mask" if marker_mode else "Original"), frame_count=len(frames), completed_frames=0)
-    frame_map = _render_sequence(job, scene, frames, job["frames_folder"], name, "rendering_frames")
+    frame_map = []
+    if not auxiliary_only:
+        _progress(job, "rendering_frames", "Rendering Blender {} frames.".format("Mask" if marker_mode else "Original"), frame_count=len(frames), completed_frames=0)
+        frame_map = _render_sequence(job, scene, frames, job["frames_folder"], name, "rendering_frames")
     dependencies, dependency_warnings = _dependencies()
     warnings = list(dependency_warnings)
     profile = (PATTERN_PROFILE if uses_patterns else COLOR_PROFILE) if marker_mode else ORIGINAL_PROFILE
@@ -835,14 +844,14 @@ def _render(job, scene_path):
         "blender_version": bpy.app.version_string,
         "camera": _object_path(camera),
         "fps": fps,
-        "frame_count": len(frame_map),
+        "frame_count": len(frames) if auxiliary_only else len(frame_map),
         "frames_folder": str(Path(job["frames_folder"]).resolve()).replace("\\", "/"),
         "sidecar_path": str(Path(job["sidecar_path"]).resolve()).replace("\\", "/"),
         "frame_map": frame_map,
         "warnings": warnings,
         "render_profile": profile,
         "artifacts": {
-            "color": {"requested": True, "ok": True, "error": ""},
+            "color": {"requested": not auxiliary_only, "ok": not auxiliary_only, "error": ""},
             "depth": {"requested": depth_requested, "ok": False, "error": ""},
             "motion_guide": {"requested": motion_requested, "ok": False, "error": ""},
         },
@@ -865,7 +874,7 @@ def _render(job, scene_path):
         "marker_catalog_version": int(catalog.get("version") or 0),
         "fps": fps,
         "start_frame": frames[0], "end_frame": frames[-1],
-        "frame_count": len(frame_map),
+        "frame_count": len(frames) if auxiliary_only else len(frame_map),
         "resolution": {"width": width, "height": height},
         "video_format": {"container": "MPEG-4", "codec": "H.264", "encoder": "libx264"},
         "frame_pattern": str(Path(job["frames_folder"]) / (name + ".%06d.png")).replace("\\", "/"),
@@ -876,7 +885,8 @@ def _render(job, scene_path):
         "scene_dependency_paths": dependencies,
         "script_node_report": script_report,
     }
-    _write_json(job["sidecar_path"], sidecar)
+    if not auxiliary_only:
+        _write_json(job["sidecar_path"], sidecar)
 
     if depth_requested:
         near, far = _depth_range(scene, camera, active, frames, objects)
@@ -894,6 +904,7 @@ def _render(job, scene_path):
             "assignment_mode": "temporary_camera_depth_material_override",
             "frame_pattern": str(Path(job["depth_frames_folder"]) / (depth_name + ".%06d.png")).replace("\\", "/"),
             "frame_map": depth_map,
+            "frame_count": len(depth_map),
             "depth_range_report": depth_report,
         })
         _write_json(job["depth_sidecar_path"], depth_sidecar)
@@ -923,6 +934,7 @@ def _render(job, scene_path):
             "assignment_mode": "blender_spatial_guide_no_face_semantics",
             "frame_pattern": str(Path(job["motion_guide_frames_folder"]) / (motion_name + ".%06d.png")).replace("\\", "/"),
             "frame_map": motion_map,
+            "frame_count": len(motion_map),
             "motion_guide_report": motion_report,
             "warnings": warnings,
         })
@@ -938,8 +950,19 @@ def _render(job, scene_path):
         })
         result["artifacts"]["motion_guide"]["ok"] = True
 
+    if auxiliary_only:
+        prefix = capture_pass
+        result.update({
+            "frames_folder": result[prefix + "_frames_folder"],
+            "output_name": result[prefix + "_output_name"],
+            "sidecar_path": result[prefix + "_sidecar_path"],
+            "frame_count": result[prefix + "_frame_count"],
+            "frame_map": result[prefix + "_frame_map"],
+            "render_profile": result[prefix + "_profile"],
+            "capture_pass": capture_pass,
+        })
     _write_json(job["result_path"], result)
-    _progress(job, "render_complete", "Blender frame generation completed.", frame_count=len(frame_map), depth_frame_count=result.get("depth_frame_count", 0), motion_guide_frame_count=result.get("motion_guide_frame_count", 0))
+    _progress(job, "render_complete", "Blender frame generation completed.", frame_count=result["frame_count"], depth_frame_count=result.get("depth_frame_count", 0), motion_guide_frame_count=result.get("motion_guide_frame_count", 0))
     return result
 
 

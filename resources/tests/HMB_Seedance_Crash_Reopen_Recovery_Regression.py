@@ -13,6 +13,7 @@ import atexit
 import importlib.util
 import sys
 import tempfile
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -932,6 +933,16 @@ class NoPostBridge:
         raise AssertionError("POST crossed a failed recovery-save boundary.")
 
 
+def bind_recovery_fixture_project(node) -> None:
+    """Keep recovery/Stop gates reachable without inventing a retained graph."""
+    selection = {"schema": target.PROJECT_SELECTION_SCHEMA,
+                 "project": {"project_id": "superwings12", "project_name": "슈퍼윙즈12"}}
+    node._capture_imageasset_project_selection = lambda: deepcopy(selection)
+    node._resolve_exact_shot_generation_inputs = lambda params: {
+        **params, **selection["project"],
+        "_hmb_imageasset_project_selection": deepcopy(selection)}
+
+
 # The durable pre-submit save is a hard billing boundary. A host save failure
 # clears the unsent provisional identity and reaches neither the Broker create
 # method nor the submission wrapper, so a corrected retry is not blocked.
@@ -952,7 +963,7 @@ pre_submit._get_parameters = lambda: {
     "generation_timeout_seconds": 600,
     "poll_interval_seconds": 5,
 }
-pre_submit._resolve_exact_shot_generation_inputs = lambda params: dict(params)
+bind_recovery_fixture_project(pre_submit)
 pre_submit._validate_parameters = lambda _params: None
 pre_submit._preflight_output_destination = lambda *_args: None
 pre_submit._ensure_broker_connected = mock.AsyncMock(
@@ -1209,7 +1220,7 @@ async def verify_submission_liveness_gates() -> None:
         "generation_timeout_seconds": 600,
         "poll_interval_seconds": 5,
     }
-    saved_node._resolve_exact_shot_generation_inputs = lambda params: dict(params)
+    bind_recovery_fixture_project(saved_node)
     saved_node._validate_parameters = lambda _params: None
     saved_node._preflight_output_destination = lambda *_args: None
     saved_node._ensure_broker_connected = mock.AsyncMock(
@@ -1269,7 +1280,7 @@ async def verify_submission_liveness_gates() -> None:
         "generation_timeout_seconds": 600,
         "poll_interval_seconds": 5,
     }
-    stopped_node._resolve_exact_shot_generation_inputs = lambda params: dict(params)
+    bind_recovery_fixture_project(stopped_node)
     stopped_node._validate_parameters = lambda _params: None
     stopped_node._preflight_output_destination = lambda *_args: None
     stopped_node._ensure_broker_connected = mock.AsyncMock(return_value=NoPostBridge())

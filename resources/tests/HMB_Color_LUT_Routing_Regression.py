@@ -202,7 +202,13 @@ async def provenance_tests():
     early._begin_generation_preview = mock.Mock()
     early._set_generation_status = mock.Mock()
     early._get_parameters = lambda: {"resume_generation_id": ""}
-    early._resolve_exact_shot_generation_inputs = lambda params: params
+    # Isolate the Shot-origin race with a stable explicit project selection;
+    # retained graph/project-source validation has its dedicated regression.
+    project_selection = {"schema": target.PROJECT_SELECTION_SCHEMA,
+                         "project": {"project_id": "superwings12", "project_name": "슈퍼윙즈12"}}
+    early._capture_imageasset_project_selection = lambda: deepcopy(project_selection)
+    early._resolve_exact_shot_generation_inputs = lambda params: {
+        **params, "_hmb_imageasset_project_selection": deepcopy(project_selection)}
     early._validate_parameters = mock.Mock(side_effect=AssertionError("must fail before validation"))
     early._cleanup_temporary_video_uploads = mock.Mock()
 

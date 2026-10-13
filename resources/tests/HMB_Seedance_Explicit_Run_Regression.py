@@ -27,8 +27,16 @@ spec.loader.exec_module(target)
 target.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0
 
 
+class ExplicitRunSeedance(target.HMBSeedanceGeneration):
+    @property
+    def is_cancellation_requested(self):
+        # The minimal CI host provides the Event; the installed SDK exposes
+        # this property backed by that same Event.
+        return self._cancellation_requested.is_set()
+
+
 def make_node(shot=1):
-    node = target.HMBSeedanceGeneration(name=f"Explicit Run Shot {shot}")
+    node = ExplicitRunSeedance(name=f"Explicit Run Shot {shot}")
     if hasattr(node, "_cancellation_requested"):
         node._cancellation_requested.clear()
     else:
@@ -51,7 +59,14 @@ def make_node(shot=1):
         "output_format": "mp4", "return_last_frame": False,
         "generation_timeout_seconds": 30, "poll_interval_seconds": 1,
     }
-    node._resolve_exact_shot_generation_inputs = lambda params: dict(params)
+    # Explicit-Run transport fixture has no retained graph. Keep the selected
+    # project snapshot and production boundary comparisons explicit.
+    selection = {"schema": target.PROJECT_SELECTION_SCHEMA,
+                 "project": {"project_id": "superwings12", "project_name": "슈퍼윙즈12"}}
+    node._capture_imageasset_project_selection = lambda: copy.deepcopy(selection)
+    node._resolve_exact_shot_generation_inputs = lambda params: {
+        **params, **selection["project"],
+        "_hmb_imageasset_project_selection": copy.deepcopy(selection)}
     node._validate_parameters = mock.Mock()
     node._preflight_output_destination = mock.Mock()
     node._prepare_video_references_for_run = lambda params: params

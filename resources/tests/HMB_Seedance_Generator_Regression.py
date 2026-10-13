@@ -192,12 +192,30 @@ class FakeBrokerBridge:
 
 
 class RuntimeRegisteredSeedance(target.HMBSeedanceGeneration):
+    def _capture_imageasset_project_selection(self) -> dict:
+        # These standalone SDK fixtures have no retained graph. The dedicated
+        # Project_Source_Routing suite exercises registered sources and guards.
+        return {"schema": target.PROJECT_SELECTION_SCHEMA,
+                "project": {"project_id": "superwings12", "project_name": "슈퍼윙즈12"}}
+
     """Exercise live-node paths without weakening production liveness guards."""
 
     def _manual_agent_prompt_source(self):
         # Broker/media fixtures have no retained graph or Agent input. The real
         # failed-Agent gate remains covered by the dedicated host DAG suite.
         return None
+
+    def _exact_incoming_source(self, target_parameter_name, expected_source_parameter_name, *, required=True):
+        # Synthetic output/Broker cases deliberately have no retained graph.
+        # Model that absence for optional project lookup; registered host-wire
+        # cases still exercise the production connection/provenance reader.
+        try:
+            registered = GriptapeNodes.NodeManager().get_node_by_name(self.name)
+        except Exception:
+            registered = None
+        if registered is not self and not required:
+            return None
+        return super()._exact_incoming_source(target_parameter_name, expected_source_parameter_name, required=required)
 
     def _runtime_node_is_live(self, *, require_registered: bool = False) -> bool:
         del require_registered
@@ -244,7 +262,13 @@ class BrokerScriptedNode(RuntimeRegisteredSeedance):
         # covered by the dedicated routing regression and must not erase the
         # synthetic references used here.
         del verify_agent_prompt
-        return dict(params)
+        return {**params, "_hmb_imageasset_project_selection": self._capture_imageasset_project_selection()}
+
+    def _capture_imageasset_project_selection(self) -> dict:
+        # Scripted transport fixtures run without a retained graph. The exact
+        # source/edge validation and no-source failures have a separate suite.
+        return {"schema": target.PROJECT_SELECTION_SCHEMA,
+                "project": {"project_id": "superwings12", "project_name": "슈퍼윙즈12"}}
 
     async def _download_video(self, url: str) -> bytes:
         self.downloads.append(url)
@@ -348,6 +372,7 @@ def assert_constructor_and_public_contract() -> None:
         "480p",
     )
     assert target.MODEL_RESOLUTIONS[target.SEEDANCE_2_5_MODEL_ID] == (
+        "480p",
         "720p",
         "1080p",
     )
@@ -622,6 +647,7 @@ def assert_constructor_and_public_contract() -> None:
     assert input_mode_parameter.ui_options["display_name"] == ""
     assert node.get_parameter_value("resolution") == "720p"
     assert node.get_parameter_by_name("resolution").ui_options["simple_dropdown"] == [
+        "480p",
         "720p",
         "1080p",
     ]
@@ -635,6 +661,7 @@ def assert_constructor_and_public_contract() -> None:
     assert node.get_parameter_value("task") == target.TASK_VIDEO_EDITING
     assert node.get_parameter_value("resolution") == "720p"
     assert node.get_parameter_by_name("resolution").ui_options["simple_dropdown"] == [
+        "480p",
         "720p",
         "1080p",
     ]
@@ -2587,6 +2614,7 @@ def assert_seedance_25_model_contract() -> None:
     assert node._get_parameters()["model_id"] == target.SEEDANCE_2_5_MODEL_ID
     assert node.get_parameter_value("resolution") == "720p"
     assert node.get_parameter_by_name("resolution").ui_options["simple_dropdown"] == [
+        "480p",
         "720p",
         "1080p",
     ]
@@ -2655,14 +2683,22 @@ def assert_seedance_25_model_contract() -> None:
     assert high_definition_payload["resolution"] == "1080p"
     assert high_definition_payload["aspect_ratio"] == "9:16"
 
+    low_definition = dict(params)
+    low_definition["resolution"] = "480p"
+    node._validate_parameters(low_definition)
+    low_definition_payload = node._build_broker_payload(low_definition)
+    assert low_definition_payload["quality"] == "480p"
+    assert low_definition_payload["resolution"] == "480p"
+    assert "draft" not in low_definition_payload
+
     unsupported_resolution = dict(params)
-    unsupported_resolution["resolution"] = "480p"
+    unsupported_resolution["resolution"] = "4k"
     try:
         node._validate_parameters(unsupported_resolution)
     except ValueError as exc:
-        assert "does not support 480p" in str(exc)
+        assert "does not support 4k" in str(exc)
     else:
-        raise AssertionError("Seedance 2.5 accepted 480p")
+        raise AssertionError("Seedance 2.5 accepted 4k")
 
     editing = dict(params)
     editing.update(

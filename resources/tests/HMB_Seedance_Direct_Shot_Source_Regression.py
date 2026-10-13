@@ -275,6 +275,9 @@ class Source:
         self.kind = kind
         self.value = value
 
+    def _hmb_project_identity(self) -> dict[str, str]:
+        return {"project_id": "superwings12", "project_name": "슈퍼윙즈12"}
+
     def _hmb_shot_channel_subscription(self) -> dict[str, Any]:
         return {
             "participant_kind": self.kind,
@@ -347,6 +350,12 @@ def generator(
     finish: FinishSource | None = None,
 ) -> target.HMBSeedanceGeneration:
     node = object.__new__(target.HMBSeedanceGeneration)
+    # Isolate Shot media/Finish Look contracts from the selected-project graph;
+    # the dedicated Project_Source_Routing suite validates that authority.
+    node._capture_imageasset_project_selection = lambda: {
+        "schema": target.PROJECT_SELECTION_SCHEMA,
+        "project": {"project_id": "superwings12", "project_name": "슈퍼윙즈12"},
+    }
     node._reconcile_shared_shot_routing = lambda strict=False: {  # type: ignore[method-assign]
         "ok": True,
         "code": "ready",
@@ -651,9 +660,15 @@ legacy_saved_widget["shot"] = {
 legacy_saved_widget["finish_look"] = legacy_saved_state
 hydrated_finish = object.__new__(finish_target.HMBFinishLookLibrary)
 hydrated_finish.name = "Offline Hydrated Finish Look"
-hydrated_finish.parameters = {
-    finish_target.WIDGET_PARAMETER_NAME: types.SimpleNamespace(default_value=deepcopy(legacy_saved_widget)),
+hydrated_finish_parameters = {
+    finish_target.WIDGET_PARAMETER_NAME: types.SimpleNamespace(
+        name=finish_target.WIDGET_PARAMETER_NAME, default_value=deepcopy(legacy_saved_widget)
+    ),
 }
+# The SDK exposes parameters as a read-only UI-tree view. This isolated
+# hydration fixture supplies its host storage through the supported lookup
+# method, while real migration/publication and snapshot validation stay intact.
+hydrated_finish.get_parameter_by_name = lambda name: hydrated_finish_parameters.get(name)
 hydrated_finish.parameter_output_values = {}
 hydrated_finish._state_lock = threading.RLock()
 hydrated_finish._last_valid_state = finish_target.default_finish_look_state()
@@ -672,8 +687,8 @@ hydrated_finish._hmb_finish_route_ready = False
 hydrated_finish._hmb_finish_snapshot = {}
 hydrated_finish._repair_ui_contract = lambda: None
 hydrated_finish.get_parameter_value = lambda name: deepcopy(
-    hydrated_finish.parameters[name].default_value
-    if name in hydrated_finish.parameters else hydrated_finish.parameter_output_values.get(name)
+    hydrated_finish_parameters[name].default_value
+    if name in hydrated_finish_parameters else hydrated_finish.parameter_output_values.get(name)
 )
 hydrated_finish._hmb_available_finish_shot_catalog = lambda *_args: deepcopy(legacy_saved_widget["shot_catalog"])
 hydration_publications = []
@@ -755,6 +770,7 @@ assert target.MODEL_DISPLAY_NAME_BY_ID[SEEDANCE_2_5_MODEL_ID] == (
     target.MODEL_NAME_SEEDANCE_2_5
 )
 assert target.MODEL_RESOLUTIONS[SEEDANCE_2_5_MODEL_ID] == (
+    "480p",
     "720p",
     "1080p",
 )

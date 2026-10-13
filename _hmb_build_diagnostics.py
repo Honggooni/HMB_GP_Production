@@ -24,7 +24,7 @@ RUNTIME_FILE_PATHS = (
     "HMBColorLUTLibrary.py", "HMBFinishLookLibrary.py", "HMBImageAssetLibrary.py",
     "HMBPromptLibrary.py", "HMBSeedanceGeneration.py", "HMBVideoPickerLibrary.py",
     "_hmb_agent_media.py", "_hmb_agent_session.py", "_hmb_build_diagnostics.py",
-    "_hmb_library_bootstrap.py", "_hmb_review.py", "_hmb_web_rerender.py", "_hmb_shot_routing.py", "_hmb_mp4_verify.py", "_hmb_common.py",
+    "_hmb_library_bootstrap.py", "_hmb_project.py", "_hmb_review.py", "_hmb_web_rerender.py", "_hmb_shot_routing.py", "_hmb_mp4_verify.py", "_hmb_common.py",
     "_hmb_color_lut.py", "_hmb_screen_space.py", "_hmb_video_tools.py",
     "widgets/HMBAgentLibraryWidget.js", "widgets/HMBColorLUTLibraryWidget.js",
     "widgets/HMBFinishLookLibraryWidget.js", "widgets/HMBImageAssetLibraryWidget.js",
@@ -34,10 +34,17 @@ RUNTIME_FILE_PATHS = (
     "widgets/HMBVideoPickerLibraryWidget_v032.js",
     "resources/maya/HMB_Maya_Background_Preview.py",
     "resources/blender/HMB_Blender_Background_Preview.py",
-    "resources/picker/HMB_Marker_Catalog.json", "resources/agent/hmb_agent_core.dat",
+    "resources/picker/HMB_Marker_Catalog.json", "resources/agent/superwings12/hmb_agent_core.dat",
+    "resources/agent/Dinoster5/project.json", "resources/agent/Katuri8/project.json",
+    "resources/agent/superwings12/project.json",
 )
 _MAX_FILE_BYTES = 16 * 1024 * 1024
 _HEX = re.compile(r"[0-9a-f]{64}")
+_PROJECTS = (
+    ("dinoster5", "Dinoster5", "다이노스터"),
+    ("katuri8", "Katuri8", "까투리8"),
+    ("superwings12", "superwings12", "슈퍼윙즈12"),
+)
 
 
 def inventory_fingerprint(records: list[dict[str, Any]]) -> str:
@@ -100,7 +107,7 @@ def _expected_records(value: Any) -> list[dict[str, Any]]:
     return rows
 
 
-def _verify_policy(root: Path, encoded: bytes) -> dict[str, str]:
+def _verify_policy(root: Path, encoded: bytes, *, project_id: str = "superwings12") -> dict[str, str]:
     # Execute only the production pure trust functions, byte-for-byte as AST
     # definitions. Do not import SDK, create .pyc, initialize a policy session,
     # fetch a DAT or read the credential helpers in this shared module.
@@ -121,7 +128,11 @@ def _verify_policy(root: Path, encoded: bytes) -> dict[str, str]:
     namespace: dict[str, Any] = {"base64": base64, "hashlib": hashlib, "hmac": hmac,
                                  "json": json, "re": re, "zlib": zlib, "Any": Any, "Dict": dict}
     exec(compile(definitions, "<production-policy-verifier>", "exec"), namespace)
-    payload = namespace["_validate_agent_policy_payload"](namespace["_decode_signed_agent_policy_envelope"](encoded))
+    decoded = namespace["_decode_signed_agent_policy_envelope"](encoded)
+    claimed_project = decoded.get("project_id")
+    if claimed_project != project_id and not (project_id == "superwings12" and claimed_project in (None, "")):
+        raise ValueError("policy_project_mismatch")
+    payload = namespace["_validate_agent_policy_payload"](decoded)
     return {"policy_version": str(payload["final_policy_version"]),
             "policy_pair_sha256": str(payload["policy_pair_sha256"])}
 
@@ -156,7 +167,7 @@ def get_build_diagnostics(root: str | Path | None = None, *, verify_policy: bool
     delivery = metadata.get("agent_policy_delivery", {})
     if not isinstance(delivery, dict):
         delivery = {}
-    policy = {"envelope_sha256": hashes.get("resources/agent/hmb_agent_core.dat", ""),
+    policy = {"envelope_sha256": hashes.get("resources/agent/superwings12/hmb_agent_core.dat", ""),
               "signature_status": "not_checked", "policy_version": "", "policy_pair_sha256": "",
               "declared_version": str(delivery.get("policy_version") or "")[:120],
               "declared_contract_sha256": _sha(delivery.get("contract_sha256")),
@@ -164,7 +175,7 @@ def get_build_diagnostics(root: str | Path | None = None, *, verify_policy: bool
               "verification_basis": "diagnostic_bundle_production_trust_anchor"}
     if verify_policy:
         try:
-            encoded = _read(directory, "resources/agent/hmb_agent_core.dat", 128 * 1024)
+            encoded = _read(directory, "resources/agent/superwings12/hmb_agent_core.dat", 128 * 1024)
             policy.update(_verify_policy(directory, encoded))
             policy["signature_status"] = "verified"
             policy["status"] = ("verified" if policy["policy_version"] == policy["declared_version"]
@@ -176,6 +187,28 @@ def get_build_diagnostics(root: str | Path | None = None, *, verify_policy: bool
         except Exception:
             # Error text can contain decoded policy. Return a stable code only.
             policy["signature_status"] = policy["status"] = "invalid_or_verifier_unavailable"
+    projects = []
+    for project_id, folder, name in _PROJECTS:
+        relative = f"resources/agent/{folder}/hmb_agent_core.dat"
+        entry = {"project_id": project_id, "project_name": name, "project_folder": folder,
+                 "runtime_path": relative, "status": "pending", "signature_status": "unavailable",
+                 "envelope_sha256": "", "policy_version": "", "policy_pair_sha256": ""}
+        if project_id == "superwings12":
+            entry.update({key: policy[key] for key in ("status", "signature_status", "envelope_sha256",
+                                                       "policy_version", "policy_pair_sha256")})
+        else:
+            try:
+                encoded = _read(directory, relative, 128 * 1024)
+                entry["envelope_sha256"] = hashlib.sha256(encoded).hexdigest()
+                entry["status"] = entry["signature_status"] = "not_checked"
+                if verify_policy:
+                    entry.update(_verify_policy(directory, encoded, project_id=project_id))
+                    entry["status"] = entry["signature_status"] = "verified"
+            except FileNotFoundError:
+                pass
+            except Exception:
+                entry["status"] = entry["signature_status"] = "invalid_or_verifier_unavailable"
+        projects.append(entry)
     package = {"manifest_status": "not_available", "verification_status": "not_checked",
                "declared_fingerprint_sha256": "", "build_fingerprint_sha256": "", "mismatch_paths": []}
     install = {"receipt_status": "not_available", "installed_at": "", "source_manifest_sha256": ""}
@@ -224,7 +257,7 @@ def get_build_diagnostics(root: str | Path | None = None, *, verify_policy: bool
             "runtime": {"fingerprint_sha256": fingerprint, "file_count": len(RUNTIME_FILE_PATHS),
                         "present_count": len(records), "file_sha256": hashes,
                         "missing_paths": missing, "unreadable_paths": unreadable},
-            "policy": policy, "package": package, "install": install}
+            "policy": policy, "projects": projects, "package": package, "install": install}
 
 
 if __name__ == "__main__":

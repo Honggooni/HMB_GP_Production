@@ -39,16 +39,23 @@ with tempfile.TemporaryDirectory(prefix="hmb-build-diag-") as directory:
     assert result["policy"]["source_status"] == "not_inspected"
     assert untouched == {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
     (root/"_hmb_common.py").write_bytes((ROOT/"_hmb_common.py").read_bytes())
-    (root/"resources/agent/hmb_agent_core.dat").write_bytes((ROOT/"resources/agent/hmb_agent_core.dat").read_bytes())
+    (root/"resources/agent/superwings12/hmb_agent_core.dat").write_bytes((ROOT/"resources/agent/superwings12/hmb_agent_core.dat").read_bytes())
     # Standalone signed verification must not initialize SDK/session modules or
     # produce bytecode in an otherwise empty diagnostic directory.
     paths_before = {str(path.relative_to(root)) for path in root.rglob("*")}
     standalone = diag.get_build_diagnostics(root)
     assert standalone["policy"]["signature_status"] == "verified"
     assert paths_before == {str(path.relative_to(root)) for path in root.rglob("*")}
+    # A valid legacy SW signature cannot authorize either pending project.
+    wrong_project = root / "resources/agent/Katuri8/hmb_agent_core.dat"
+    wrong_project.write_bytes((ROOT/"resources/agent/superwings12/hmb_agent_core.dat").read_bytes())
+    projects = {row["project_id"]: row for row in diag.get_build_diagnostics(root)["projects"]}
+    assert projects["katuri8"]["signature_status"] == "invalid_or_verifier_unavailable"
+    assert projects["katuri8"]["policy_version"] == ""
+    wrong_project.unlink()
     (root/"_hmb_common.py").write_text("raise AssertionError('candidate trust code must never execute')", encoding="utf-8")
     assert diag.get_build_diagnostics(root)["policy"]["signature_status"] == "verified"
-    for relative in ("_hmb_common.py", "resources/agent/hmb_agent_core.dat"):
+    for relative in ("_hmb_common.py", "resources/agent/superwings12/hmb_agent_core.dat"):
         (root/relative).write_bytes(untouched[root/relative])
     # Same version changed source bytes must be distinguishable and show only
     # a relative member identity, never source contents or machine paths.
@@ -69,10 +76,17 @@ with tempfile.TemporaryDirectory(prefix="hmb-build-diag-") as directory:
 
 # Real production signed DAT verification is read-only and does not synchronize
 # the external Manager. An invalid signature must never become "verified".
-before = (ROOT/"resources/agent/hmb_agent_core.dat").read_bytes()
+before = (ROOT/"resources/agent/superwings12/hmb_agent_core.dat").read_bytes()
 actual = diag.get_build_diagnostics(ROOT)
 assert actual["policy"]["signature_status"] == "verified", actual["policy"]
-assert before == (ROOT/"resources/agent/hmb_agent_core.dat").read_bytes()
+project_status = {row["project_id"]: row for row in actual["projects"]}
+assert project_status["superwings12"]["signature_status"] == "verified"
+for project_id in ("dinoster5", "katuri8"):
+    assert project_status[project_id]["status"] == "pending"
+    assert project_status[project_id]["signature_status"] == "unavailable"
+    assert project_status[project_id]["policy_version"] == ""
+    assert project_status[project_id]["envelope_sha256"] == ""
+assert before == (ROOT/"resources/agent/superwings12/hmb_agent_core.dat").read_bytes()
 with mock.patch.object(diag, "_verify_policy", side_effect=ValueError("private decoded source")):
     invalid = diag.get_build_diagnostics(ROOT)
     assert invalid["policy"]["signature_status"] == "invalid_or_verifier_unavailable"
@@ -86,14 +100,14 @@ if os.name == "nt":
     assert shell, "Windows PowerShell parser required"
     rows = [{"path": "_hmb_review.py", "bytes": 1, "sha256": "a"*64},
             {"path": "HMBAgentLibrary.py", "bytes": 2, "sha256": "b"*64},
-            {"path": "resources/agent/hmb_agent_core.dat", "bytes": 3, "sha256": "c"*64}]
+            {"path": "resources/agent/superwings12/hmb_agent_core.dat", "bytes": 3, "sha256": "c"*64}]
     command = r"""
 $errors = $null; $tokens = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw 'Installer parse errors' }
 $definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-HmbInventoryFingerprint' }, $true)
 Invoke-Expression $definition.Extent.Text
-$rows = @([pscustomobject]@{path='_hmb_review.py';bytes=1;sha256=('a'*64)}, [pscustomobject]@{path='HMBAgentLibrary.py';bytes=2;sha256=('b'*64)}, [pscustomobject]@{path='resources/agent/hmb_agent_core.dat';bytes=3;sha256=('c'*64)})
+$rows = @([pscustomobject]@{path='_hmb_review.py';bytes=1;sha256=('a'*64)}, [pscustomobject]@{path='HMBAgentLibrary.py';bytes=2;sha256=('b'*64)}, [pscustomobject]@{path='resources/agent/superwings12/hmb_agent_core.dat';bytes=3;sha256=('c'*64)})
 Get-HmbInventoryFingerprint -Items $rows
 """
     # Use environment for the fixed local file path, avoiding shell-built path

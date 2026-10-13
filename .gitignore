@@ -21,7 +21,7 @@ dist/
 resources/policy/
 policies/
 **/hmb_agent_core.dat
-!resources/agent/hmb_agent_core.dat
+!resources/agent/superwings12/hmb_agent_core.dat
 
 # Credentials and machine-local configuration
 .env

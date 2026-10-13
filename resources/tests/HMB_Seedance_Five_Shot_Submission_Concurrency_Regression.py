@@ -114,6 +114,11 @@ class FiveShotNode(target.HMBSeedanceGeneration):
         self._generation_refresh_lock = threading.Lock()
         self._generation_refresh_running = False
         self._generation_run_active = threading.Event()
+        self._hmb_draft_finalize_pending = False
+        self._hmb_draft_finalize_task = None
+        self._hmb_draft_final_context = None
+        self._hmb_draft_controls_syncing = False
+        self._hmb_draft_pending_source = {}
         self._submission_outcome_unknown = False
         self._detached_submission_tasks = set()
         self.parameter_output_values = {}

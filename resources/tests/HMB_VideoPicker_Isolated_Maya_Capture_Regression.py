@@ -63,7 +63,9 @@ class Controller:
         self.cleaned_handles.append(process)
 
     def _wait_for_process_with_progress(self, process, _progress, _overall, _stall, _label, *, activity_paths):
-        assert tuple(activity_paths) == (process.frames_folder,)
+        assert tuple(activity_paths) == (
+            process.frames_folder, process.frames_folder.parent / "shared-capture.txt",
+        )
         process.complete()
         return process.return_code
 

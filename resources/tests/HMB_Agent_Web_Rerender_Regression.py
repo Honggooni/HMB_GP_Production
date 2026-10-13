@@ -1,4 +1,4 @@
-"""Isolated web Agent policy/lifecycle contracts; never invokes a provider."""
+"""Isolated web revision bypass/lifecycle contracts; never invokes a provider."""
 from __future__ import annotations
 
 import asyncio
@@ -66,17 +66,25 @@ def authority(node, suffix="one"):
     return node._hmb_issue_web_rerender_authority(request_id="web-" + suffix, generator=generator, owner_key="owner-1")
 
 
+def reply(text, prompt=web_prompt):
+    return json.dumps({"contract": module._WEB_RERENDER_OUTPUT_CONTRACT,
+                       "source_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                       "instruction": text}, ensure_ascii=False)
+
+
 def fake_native_process(self):
     facades.append(self)
     assert self.parameter_values["model"] == "native-selected-model"
-    assert self.get_parameter_value("output_schema") == {"type": "object"}
+    assert self.get_parameter_value("output_schema") == module._web_rerender_output_schema(self._hmb_runtime_prompt)
     assert self.get_parameter_list_value("tools") == [{"name": "native-tool"}]
     rules = self.get_parameter_list_value("rulesets")
-    assert len(rules) == 3 and len(rules[-1]["rules"]) == 4 and len(rules[-2]["rules"]) == 4
+    assert rules == [{"name": "user", "rules": ["user rule"]}, module._web_rerender_output_rules(self._hmb_runtime_prompt)]
+    assert not self._hmb_rules_active and not self._hmb_policy_identity
+    assert not self._hmb_policy and not self._hmb_binding
     prompt = self._handle_additional_context(self.get_parameter_value("prompt"), self.get_parameter_value("additional_context"))
     self.append_value_to_parameter("logs", "private log")
     yield lambda: self._process(SimpleNamespace(tasks=[]), prompt)
-    self.set_parameter_value("output", "New generator instruction.")
+    self.set_parameter_value("output", reply("New generator instruction.", self._hmb_runtime_prompt))
     self.parameter_output_values["agent"] = {"tools": "native-private-state"}
 
 
@@ -124,11 +132,15 @@ async def core():
         raise AssertionError("authority accepted for another agent")
     except RuntimeError:
         pass
-    with patch.object(base, "process", fake_native_process, create=True), patch.object(base, "_process", fake_model, create=True), patch.object(_hmb_agent_media, "augment_prompt", fake_augment):
+    with patch.object(base, "process", fake_native_process, create=True), patch.object(base, "_process", fake_model, create=True), patch.object(_hmb_agent_media, "augment_prompt", fake_augment), \
+            patch.object(module._hmb, "_bootstrap_agent_policy_session", side_effect=AssertionError("web bootstrapped policy")), \
+            patch.object(module._hmb, "_read_agent_policy_envelope", side_effect=AssertionError("web read policy")), \
+            patch.object(module._hmb, "_load_agent_rule_payload", side_effect=AssertionError("web loaded policy")), \
+            patch.object(module, "_with_english_agent_output_contract", side_effect=AssertionError("web injected English policy")):
         result = await node._hmb_run_web_rerender(web_prompt, media, settings, cap)
         assert result["text"] == "New generator instruction."
         assert result["output_sha256"] == hashlib.sha256(result["text"].encode()).hexdigest()
-        assert result["policy_identity"]["contract_sha256"]
+        assert result["policy_identity"] == {"mode": "preserved_parent", "reinjected": False}
         assert result["observation"]["source_count"] == 2
         assert captures[0].startswith(web_prompt)
         assert "NEVER_MODEL_CONTEXT" not in captures[0] and '"seed":0' in captures[0] and '"generate_audio":false' in captures[0]
@@ -192,52 +204,39 @@ async def core():
             except asyncio.CancelledError:
                 pass
             assert not node._hmb_web_rerender_busy()
-        # Policy file/provenance/signature work runs off the engine loop too.
-        # Cancellation must drain that thread before clearing its facade and
-        # releasing the shared reservation, and must never reach the model.
-        policy_entered = threading.Event()
-        policy_release = threading.Event()
-        policy_facades = []
+        # Native invocation preserves engine context and runs off the event
+        # loop even though no policy bootstrap/load precedes it anymore.
         loop_thread = threading.get_ident()
-        context = contextvars.ContextVar("web_rerender_policy_test", default="missing")
+        context = contextvars.ContextVar("web_rerender_revision_test", default="missing")
         token = context.set("engine-context")
-        original_loader = module._HMBWebRerenderExecution._load_hmb_rules
-        def blocking_policy():
+        def contextual_model(self, agent, prompt):
             assert threading.get_ident() != loop_thread
             assert context.get() == "engine-context"
-            policy_entered.set()
-            assert policy_release.wait(5)
-        def observed_load(self):
-            assert threading.get_ident() != loop_thread
-            assert context.get() == "engine-context"
-            policy_facades.append(self)
-            return original_loader(self)
-        previous = len(captures)
+            return fake_model(self, agent, prompt)
         try:
-            with patch.object(module._hmb, "_bootstrap_agent_policy_session", blocking_policy), patch.object(module._HMBWebRerenderExecution, "_load_hmb_rules", observed_load):
-                task = asyncio.create_task(node._hmb_run_web_rerender(web_prompt, media, settings, authority(node, "cancel-policy")))
-                try:
-                    assert await asyncio.to_thread(policy_entered.wait, 2)
-                    await asyncio.sleep(0.01)  # The engine loop remains responsive.
-                    assert node._hmb_web_rerender_busy()
-                    task.cancel()
-                    await asyncio.sleep(0.01)
-                    task.cancel()  # Repeated cancellation cannot release early.
-                    await asyncio.sleep(0.01)
-                    assert not task.done() and node._hmb_web_rerender_busy()
-                finally:
-                    policy_release.set()
-                try:
-                    await task
-                    raise AssertionError("cancelled policy load reached execution")
-                except asyncio.CancelledError:
-                    pass
+            with patch.object(base, "_process", contextual_model):
+                revised = await node._hmb_run_web_rerender(web_prompt, media, settings, authority(node, "context"))
+                assert revised["policy_identity"]["mode"] == "preserved_parent"
         finally:
             context.reset(token)
-        assert len(captures) == previous and not node._hmb_web_rerender_busy()
-        assert len(policy_facades) == 1
-        assert not policy_facades[0]._hmb_policy_identity and not policy_facades[0]._hmb_rules_active
-        assert policy_facades[0].parameter_values == {} and policy_facades[0].parameter_output_values == {}
+        # Stale runtime HMB rules from the owner (or a wrapped incoming Agent)
+        # never become caller rules in the isolated revision facade.
+        stale = owner()
+        stale._hmb_rules_active = True
+        stale._hmb_ruleset_names = ("transient-project", "transient-shot")
+        stale._hmb_policy = "STALE SEALED POLICY"
+        stale._hmb_binding = "STALE SEALED BINDING"
+        transient = [{"name": name, "rules": ["STALE SEALED POLICY"]} for name in stale._hmb_ruleset_names]
+        stale.parameter_values["rulesets"] += copy.deepcopy(transient)
+        stale.parameter_values["agent"] = {"agent": {}, "rulesets": copy.deepcopy(stale.parameter_values["rulesets"])}
+        stale_before = copy.deepcopy(stale.parameter_values)
+        def stale_model(self, agent, prompt):
+            assert self.get_parameter_value("agent")["rulesets"] == [{"name": "user", "rules": ["user rule"]}]
+            assert "STALE SEALED" not in str(prompt)
+            return fake_model(self, agent, prompt)
+        with patch.object(base, "_process", stale_model):
+            await stale._hmb_run_web_rerender(web_prompt, media, settings, authority(stale, "stale"))
+        assert stale.parameter_values == stale_before and stale._hmb_rules_active
         # Provider payloads cannot escape the web-facing error.
         def failed_model(*args):
             raise RuntimeError("secret-api-key and private policy")
@@ -247,14 +246,6 @@ async def core():
                 raise AssertionError("provider failure returned success")
             except RuntimeError as exc:
                 assert "secret-api-key" not in str(exc) and "private policy" not in str(exc)
-        with patch.object(module._hmb, "_bootstrap_agent_policy_session", side_effect=RuntimeError("policy bytes")):
-            previous = len(captures)
-            try:
-                await node._hmb_run_web_rerender(web_prompt, media, settings, authority(node, "policy"))
-                raise AssertionError("missing policy admitted")
-            except RuntimeError as exc:
-                assert str(exc) == module._HMB_POLICY_UNAVAILABLE_MESSAGE
-            assert len(captures) == previous
         # The web contract combines up to 50k recorded prompt + 4k review;
         # provider-ready Agent output must still fit the 50k Generator limit.
         with patch.object(_hmb_agent_media, "augment_prompt", lambda prompt, *_args, **_kwargs: prompt):
@@ -282,7 +273,7 @@ async def core():
     for facade in facades:
         assert facade.parameter_values == {} and facade.parameter_output_values == {}
         assert not facade._hmb_rules_active and facade._hmb_runtime_prompt == ""
-    print("HMB_AGENT_WEB_RERENDER_CORE=PASS (authority, signed policy, snapshots, isolation, serialization, cancellation, cleanup)")
+    print("HMB_AGENT_WEB_RERENDER_CORE=PASS (authority, parent policy preserved without reinjection, snapshots, isolation, serialization, cancellation, cleanup)")
 
 
 asyncio.run(core())
@@ -305,16 +296,21 @@ def native_model(self, agent, prompt):
     literal = agent.tasks[0]._process_task_input(prompt)
     value = str(getattr(literal, "value", literal))
     assert value.startswith(web_prompt) and "{{SIGN}}" in value and "{% include" in value
-    assert len(agent.rulesets) >= 2
+    assert [rule.name for rule in agent.rulesets] == [module._WEB_RERENDER_OUTPUT_RULESET] and not self._hmb_rules_active
+    schema = agent.tasks[0].output_schema.model_json_schema()
+    assert set(schema["properties"]) == {"contract", "source_sha256", "instruction"}
     observed.append((self, value))
-    agent.tasks[0].output = native.TextArtifact(value="Native web instruction.")
-    self._last_raw_output = "Native web instruction."
+    agent.tasks[0].output = native.TextArtifact(value=reply("Native web instruction."))
+    self._last_raw_output = reply("Native web instruction.")
     return agent
 
 
 with patch.object(base, "_process", native_model), patch.object(native, "resolve_cloud_api_key", lambda: "offline-non-billable"), patch.object(native, "require_model_invocation_sync", lambda *args, **kwargs: None), patch.object(native, "try_throw_error", lambda *args, **kwargs: None):
     import _hmb_agent_media
-    with patch.object(_hmb_agent_media, "augment_prompt", fake_augment):
+    with patch.object(_hmb_agent_media, "augment_prompt", fake_augment), \
+            patch.object(module._hmb, "_bootstrap_agent_policy_session", side_effect=AssertionError("native web bootstrapped policy")), \
+            patch.object(module._hmb, "_read_agent_policy_envelope", side_effect=AssertionError("native web read policy")), \
+            patch.object(module._hmb, "_load_agent_rule_payload", side_effect=AssertionError("native web loaded policy")):
         native_result = asyncio.run(live._hmb_run_web_rerender(web_prompt, media, settings, authority(live, "native")))
 assert native_result["text"] == "Native web instruction." and len(observed) == 1
 assert prior == (live.parameter_values, dict(live.parameter_output_values))

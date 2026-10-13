@@ -87,8 +87,14 @@ jobs:
         shell: pwsh
         run: |
           $tracked = @(git ls-files)
+          $approvedAgentRuntimeMembers = @(
+            'resources/agent/superwings12/hmb_agent_core.dat',
+            'resources/agent/Dinoster5/project.json',
+            'resources/agent/Katuri8/project.json',
+            'resources/agent/superwings12/project.json'
+          )
           $forbidden = @($tracked | Where-Object {
-            if ($_ -eq 'resources/agent/hmb_agent_core.dat') { return $false }
+            if ($approvedAgentRuntimeMembers -ccontains $_) { return $false }
             $_ -match '(^|/)(\.tmp|\.venv|backups|dist|GriptapeNodes|resources/agent|resources/policy|policies?)/' -or
             $_ -match '(^|/)hmb_agent_core\.dat$' -or
             $_ -match '(?i)(^|/)HMB_Agent_Polic(?:y|ies)[^/]*\.(txt|tex|md)$' -or
@@ -233,12 +239,15 @@ jobs:
             "",
             "- Preserves existing saved workflows, five-Shot routing, model choices and Maya/Blender capture contracts while applying the targeted updates below.",
             "- Keeps ImageAsset cards and the selected project visible while image-selection commands are echoed by the host, including rapid clicks and delayed acknowledgements.",
-            "- Preserves authored Original-pass materials under the exact Maya groups eye_GEO_GRP and eye_GRP, including namespaced groups and descendants; invalidates older Original previews. The existing Maya fallback remains available when a required renderer plug-in is absent.",
-            "- Adds the local half of the web-review rerender protocol: the connected Agent runs in the background with the web prompt, signed HMB policy, connected image/video references and existing generation settings. Authored Prompt nodes and previous results remain intact.",
+            "- Fixes compact Picker clipping, stale snapshot flashing, delayed deletion and selected-output publication. Original preserves authored materials for AIPicker_SET members; Mask, Depth and Motion keep their own pass behavior.",
+            "- Adds authenticated web-review rerender execution with original parent settings and connected references preserved. Authored Prompt nodes and previous results remain intact; Final does not run the Agent again.",
             "- Journals each rerender operation, binds it to the authenticated owner and target snapshot, and prevents duplicate submission after repeated clicks, cancellation, lost leases or uncertain responses.",
             "- Moves web Agent policy loading off the engine event loop and drains pending native work before releasing execution locks.",
-            "- Keeps normal Run behavior available with older Brokers. The compatible server v1 source and package have passed offline checks; production server activation and the paid end-to-end video test remain pending.",
-            "- Ships the signed Agent policy v5.6 with protected execution input, literal user text and source authority preserved, plus the verified runtime installer and SHA256 checksum.",
+            "- Supports Seedance 2.5 Draft 480p followed by the one-use Draft final button. Web and local Final share one sparse request and idempotency key; accepted or uncertain jobs are retrieved instead of duplicated.",
+            "- Routes each new render by the connected ImageAsset project's selected identity. Strict server validation requires this updated client; older client versions must update before new renders.",
+            "- Includes verified real Shot Draft-to-Final generation at 480p and 1080p with the Agent run ID and output hash unchanged during Final.",
+            "- Organizes project policies into separate folders: Superwings12 uses verified signed Agent policy v5.6, while Dinoster5 and Katuri8 remain pending their project policies.",
+            "- Preserves literal user text, zero/OFF values, source authority and verified model registration metadata, with the runtime installer and SHA256 checksum.",
             "",
             "Close Griptape completely before running the included installer."
           ) | Set-Content -LiteralPath $notesPath -Encoding utf8

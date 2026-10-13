@@ -492,18 +492,8 @@ assert len(long_user["EMOTION_INTENT"]) == prompt.MAX_DESCRIPTION_CHARS
 assert len(long_user["VIDEO_VFX"]) == prompt.MAX_VIDEO_VFX_CHARS
 
 
-# Instantiate and execute the three cheap standalone data paths. Use an empty
-# temporary project root so the Image library does not depend on a studio mount.
-with tempfile.TemporaryDirectory(prefix="hmb-hybrid-composition-") as temp_root:
-    image.DEFAULT_PROJECTS_ROOT = Path(temp_root)
-    image_node = image.HMBImageAssetLibrary(name="hybrid_composition_image")
-    assert image_node.process() is None
-    image_payload = json.loads(
-        image_node.parameter_output_values[image.OUTPUT_PARAMETER]
-    )
-    assert image_payload["mode"] == "image_asset"
-    assert image_payload["media_resolution"]["selected_count"] == 0
-
+# Instantiate and execute the standalone data paths. The Image fixture below
+# keeps its temporary project root alive through both execution entry points.
 picker_node = picker.HMBVideoPickerLibrary(name="hybrid_composition_picker")
 
 # process() is an output synchronizer only. Guard the real subprocess API while
@@ -558,10 +548,19 @@ process_warning_capture = _ProcessContractWarningCapture()
 root_logger = logging.getLogger()
 root_logger.addHandler(process_warning_capture)
 try:
-    for node in (image_node, picker_node, prompt_node):
-        async_process = getattr(node, "aprocess", None)
-        if callable(async_process):
-            asyncio.run(async_process())
+    with tempfile.TemporaryDirectory(prefix="hmb-hybrid-composition-") as temp_root:
+        image.DEFAULT_PROJECTS_ROOT = Path(temp_root)
+        image_node = image.HMBImageAssetLibrary(name="hybrid_composition_image")
+        assert image_node.process() is None
+        image_payload = json.loads(
+            image_node.parameter_output_values[image.OUTPUT_PARAMETER]
+        )
+        assert image_payload["mode"] == "image_asset"
+        assert image_payload["media_resolution"]["selected_count"] == 0
+        for node in (image_node, picker_node, prompt_node):
+            async_process = getattr(node, "aprocess", None)
+            if callable(async_process):
+                asyncio.run(async_process())
 finally:
     root_logger.removeHandler(process_warning_capture)
 assert process_warning_capture.messages == []

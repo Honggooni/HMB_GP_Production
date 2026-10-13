@@ -124,9 +124,9 @@ if ($records.Count -ne [int]$manifest.file_count) {
     throw 'HMB release manifest file_count does not match its file list.'
 }
 if (
-    [int]$manifest.install_file_count -ne 34 -or
+    [int]$manifest.install_file_count -ne 38 -or
     [int]$manifest.distribution_file_count -ne 4 -or
-    $records.Count -ne 38
+    $records.Count -ne 42
 ) {
     throw 'HMB release manifest install/distribution boundary mismatch.'
 }
@@ -178,6 +178,16 @@ if (
     @(Compare-Object $expectedDistributionOnlyMembers $distributionOnlyMembers).Count -ne 0
 ) {
     throw 'HMB release manifest distribution-only members are invalid.'
+}
+$expectedAgentMembers = @(
+    'resources\agent\Dinoster5\project.json',
+    'resources\agent\Katuri8\project.json',
+    'resources\agent\superwings12\project.json',
+    'resources\agent\superwings12\hmb_agent_core.dat'
+)
+$actualAgentMembers = @($installMembers | Where-Object { $_ -like 'resources\agent\*' })
+if (@(Compare-Object $expectedAgentMembers $actualAgentMembers -CaseSensitive).Count -ne 0) {
+    throw 'HMB project policy folders do not match the release closure.'
 }
 if ((Get-HmbInventoryFingerprint -Items $records) -cne [string]$manifest.build_fingerprint_sha256 -or
     (Get-HmbInventoryFingerprint -Items $installRecords) -cne [string]$manifest.runtime_fingerprint_sha256) {

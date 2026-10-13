@@ -2483,6 +2483,11 @@ with tempfile.TemporaryDirectory(prefix="hmb_maya_runner_regression_") as temp_d
 class RunCmds:
     def __init__(self):
         self.evaluation_mode = "parallel"
+        self.current_frame = None
+
+    def currentTime(self, frame, *, edit=False, update=False):
+        assert edit is True and update is True
+        self.current_frame = float(frame)
 
     def evaluationManager(self, query=False, mode=None):
         if query:
@@ -2558,6 +2563,7 @@ with tempfile.TemporaryDirectory(prefix="hmb_maya_depth_run_") as temp_dir:
 
     def fake_color_frames(**kwargs):
         run_calls.append("color")
+        assert runner.cmds.current_frame == kwargs["frame_values"][0]
         folder = Path(kwargs["frames_folder"])
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / (kwargs["output_name"] + ".000000.png")

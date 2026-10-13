@@ -41,6 +41,8 @@ CHARACTER_OUT_RIM_LINE_OFFSET = 0.0
 CHARACTER_OUT_RIM_SCREENSPACE_RESAMPLING = 0.0
 CHARACTER_OUT_RIM_LOCAL_OCCLUSION = 2
 FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE = "hmb_full_smooth_geometry_v2"
+SMOOTH_PREVIEW_GEOMETRY_BUDGET_FACES = 10000000
+SMOOTH_PREVIEW_GEOMETRY_BUDGET_POLICY = "hmb_smooth_preview_geometry_budget_v1"
 ORIGINAL_VIEWPORT_QUALITY_PROFILE = FULL_SMOOTH_VIEWPORT_QUALITY_PROFILE
 ORIGINAL_MATERIAL_OVERRIDE_PROFILE = (
     "maya-midgray-solid-studio-v4-eye-groups"
@@ -66,6 +68,7 @@ WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS = (
 WORLD_PATTERN_MIN_CELL_WORLD_UNITS = 1.0e-3
 WORLD_PATTERN_MAX_CELL_WORLD_UNITS = 1.0e6
 WORLD_PATTERN_MAX_TEXTURE_REPEAT = 4096.0
+WORLD_PATTERN_REPEAT_SAFETY_POLICY = "vp2_repeat_safe_cell_v1"
 DEPTH_PLAYBLAST_PROFILE = "hmb_camera_space_depth_v8"
 # Production Depth uses the full 0.0..0.9 signal range.  The final 0.1 is
 # deliberately left unused so near-plane/bounds approximation cannot turn a
@@ -4556,36 +4559,58 @@ def _original_wire_record(
     return "texture"
 
 
-def _original_eye_semantic(value):
-    """Match the two authored-material pass groups, excluding namespaces."""
-    leaf = _clean(value).rsplit("|", 1)[-1].rsplit(":", 1)[-1]
-    return leaf in ("eye_GEO_GRP", "eye_GRP")
+def _original_pass_set_shapes():
+    """Resolve authored AIPicker_SET membership to exact final surface paths."""
+    shapes = set()
+    visited_sets = set()
 
+    def add_surface(path):
+        if cmds.nodeType(path) in ("mesh", "nurbsSurface") and not _is_intermediate_shape(path):
+            shapes.add(path)
 
-def _original_eye_shape(shape):
-    """Preserve surfaces below an explicit pass group, regardless of mesh names."""
-    path = _clean(shape)
-    try:
-        if cmds.nodeType(path) not in ("mesh", "nurbsSurface"):
-            return False
-    except Exception:
-        return False
-    visited = set()
-    while path and path not in visited:
-        visited.add(path)
+    def visit_set(set_name):
+        if set_name in visited_sets:
+            return
+        visited_sets.add(set_name)
         try:
-            # Keep the current instance's ancestry when a concrete DAG path is
-            # available; listRelatives may otherwise choose another instance.
-            if path.startswith("|"):
-                path = path.rsplit("|", 1)[0]
-            else:
-                parents = cmds.listRelatives(path, parent=True, fullPath=True) or []
-                path = _clean(parents[0]) if len(parents) == 1 else ""
-            if path and _original_eye_semantic(path) and cmds.nodeType(path) == "transform":
-                return True
-        except Exception:
-            break
-    return False
+            members = cmds.sets(set_name, query=True) or []
+        except Exception as exc:
+            raise RuntimeError("Original could not read AIPicker_SET membership: {0} ({1})".format(set_name, exc))
+        for member in members:
+            owner = _clean(member).split(".", 1)[0]
+            if not owner:
+                continue
+            paths = sorted(set(cmds.ls(owner, long=True, allPaths=True) or []))
+            if owner.startswith("|"):
+                paths = [path for path in paths if path == owner]
+            if len(paths) != 1:
+                raise RuntimeError("AIPicker_SET member must identify one exact object path: " + _clean(member))
+            path = paths[0]
+            kind = cmds.nodeType(path)
+            if kind == "objectSet":
+                visit_set(path)
+            elif kind in ("mesh", "nurbsSurface"):
+                add_surface(path)
+            elif kind in ("transform", "joint"):
+                descendants = cmds.listRelatives(path, allDescendents=True, fullPath=True) or []
+                for descendant in descendants:
+                    # A concrete member never grants another instance or its
+                    # ancestors a material exception.
+                    if _clean(descendant).startswith(path + "|"):
+                        add_surface(descendant)
+
+    for set_name in cmds.ls(type="objectSet", long=True) or []:
+        if (_clean(set_name).rsplit(":", 1)[-1] == "AIPicker_SET"
+                and cmds.nodeType(set_name) == "objectSet"):
+            visit_set(set_name)
+    return shapes
+
+
+def _original_eye_shape(shape, preserved_shapes=None):
+    """Legacy report interface; membership alone owns Original preservation."""
+    path = _clean(shape)
+    selected = _original_pass_set_shapes() if preserved_shapes is None else preserved_shapes
+    return path in selected
 
 
 def _original_eye_dependency_error(report):
@@ -4633,7 +4658,7 @@ def _original_eye_dependency_error(report):
 
 
 class _OriginalLambertOverrideController(object):
-    """Render a neutral body while preserving the scene's authored eye shaders.
+    """Render a neutral body while preserving AIPicker_SET materials.
 
     Eye SG connections stay untouched. A shared eye/body SG is split using
     exact body memberships, then restored before publication. No scene is saved.
@@ -4683,6 +4708,8 @@ class _OriginalLambertOverrideController(object):
             "preserved_eye_shape_count": 0,
             "preserved_eye_component_count": 0,
             "preserved_eye_shading_engine_count": 0,
+            "material_pass_source": "AIPicker_SET",
+            "material_pass_shape_count": 0,
             "split_shading_engine_count": 0,
             "split_body_member_count": 0,
             "eye_materials_preserved": True,
@@ -4771,7 +4798,9 @@ class _OriginalLambertOverrideController(object):
         return last - first + 1
 
     def _eye_group_plan(self, active_groups):
-        named_eye_shapes = [shape for shape in self.scope_shapes if _original_eye_shape(shape)]
+        preserved_shapes = _original_pass_set_shapes()
+        named_eye_shapes = [shape for shape in self.scope_shapes if _original_eye_shape(shape, preserved_shapes)]
+        self.report["material_pass_shape_count"] = len(named_eye_shapes)
         named_eye_groups = set()
         for shape in named_eye_shapes:
             named_eye_groups.update(_shape_shading_groups(shape))
@@ -4786,7 +4815,7 @@ class _OriginalLambertOverrideController(object):
             eye_member_count = 0
             for member in members:
                 shape = self._member_shape(member)
-                if _original_eye_shape(shape):
+                if _original_eye_shape(shape, preserved_shapes):
                     eye_member_count += 1
                     retained_shapes.add(shape)
                     # Count concrete face components rather than range strings.
@@ -5722,6 +5751,46 @@ def _projected_surface_group(name, projection, transparency_source=""):
     return shading_group
 
 
+def _world_pattern_safe_projection_layout(projection_type, width, height, depth, requested_cell_units):
+    """Fix cell density once at the reference frame, keeping VP2 repeats safe."""
+    if projection_type == "Planar":
+        projector_scale = [width, depth, max(height * 2.0, requested_cell_units)]
+        texture_extents = [width, depth]
+    elif projection_type == "TriPlanar":
+        extent = max(width, height, depth, requested_cell_units)
+        projector_scale = [extent, extent, extent]
+        texture_extents = [extent, extent]
+    else:
+        raise RuntimeError("Unsupported Maya world projection type: {0}".format(projection_type))
+    if any(not math.isfinite(float(value)) or float(value) <= 0.0
+           for value in projector_scale + [requested_cell_units]):
+        raise RuntimeError("Maya world pattern projection extent or cell size is invalid.")
+    requested_repeats = [max(value / requested_cell_units, 1.0) for value in texture_extents]
+    effective_cell_units = requested_cell_units
+    adapted = max(requested_repeats) > WORLD_PATTERN_MAX_TEXTURE_REPEAT
+    if adapted:
+        # A tiny upward rounding prevents 4096.000000000001 after division.
+        # Bounds/phase/root constraints stay unchanged; only this disposable
+        # capture's cell spacing increases. Never alter Maya scene units.
+        effective_cell_units = math.nextafter(
+            max(texture_extents) / WORLD_PATTERN_MAX_TEXTURE_REPEAT, math.inf,
+        )
+    if effective_cell_units > WORLD_PATTERN_MAX_CELL_WORLD_UNITS:
+        raise RuntimeError("Maya world pattern requires an unsupported safe cell size: {0}".format(effective_cell_units))
+    repeats = [max(value / effective_cell_units, 1.0) for value in texture_extents]
+    if any(not math.isfinite(value) or value > WORLD_PATTERN_MAX_TEXTURE_REPEAT for value in repeats):
+        raise RuntimeError("Maya world pattern could not satisfy the safe VP2 repeat limit.")
+    return projector_scale, repeats, {
+        "repeat_safety_policy": WORLD_PATTERN_REPEAT_SAFETY_POLICY,
+        "texture_repeat_limit": WORLD_PATTERN_MAX_TEXTURE_REPEAT,
+        "requested_cell_size_world_units": requested_cell_units,
+        "effective_cell_size_world_units": effective_cell_units,
+        "cell_scale_factor": effective_cell_units / requested_cell_units,
+        "requested_repeat_count": requested_repeats,
+        "adaptive_cell_applied": adapted,
+    }
+
+
 def _world_projected_pattern_group(
     name,
     pattern,
@@ -5735,22 +5804,10 @@ def _world_projected_pattern_group(
         shapes,
         cell_units,
     )
-    if projection_type == "Planar":
-        projector_scale = [width, depth, max(height * 2.0, cell_units)]
-        repeat_u = max(width / cell_units, 1.0)
-        repeat_v = max(depth / cell_units, 1.0)
-    else:
-        extent = max(width, height, depth, cell_units)
-        projector_scale = [extent, extent, extent]
-        repeat_u = repeat_v = max(extent / cell_units, 1.0)
-    if max(repeat_u, repeat_v) > WORLD_PATTERN_MAX_TEXTURE_REPEAT:
-        raise RuntimeError(
-            "Maya world pattern repeat exceeds the safe VP2 limit ({0:.3f} > "
-            "{1:.0f}). Check the scene linear unit or background scale.".format(
-                max(repeat_u, repeat_v),
-                WORLD_PATTERN_MAX_TEXTURE_REPEAT,
-            )
-        )
+    projector_scale, repeats, repeat_safety = _world_pattern_safe_projection_layout(
+        projection_type, width, height, depth, cell_units,
+    )
+    repeat_u, repeat_v = repeats
 
     place2d, texture = _world_pattern_texture(
         name,
@@ -5831,7 +5888,7 @@ def _world_projected_pattern_group(
         # Maya's Planar image plane is XY/local-Z. +90 X makes it XZ/top-Y.
         cmds.setAttr(projector + ".rotateX", 90.0)
     # Follow root scale for placement/phase while cancelling it from the
-    # projector's world extent. This keeps each cell at 5 Maya world units,
+    # projector's world extent. This keeps each cell at its fixed effective size,
     # including under animated or non-uniform background-root scale.
     scale_compensator = cmds.shadingNode(
         "multiplyDivide",
@@ -5874,7 +5931,8 @@ def _world_projected_pattern_group(
         "root_transform": root_transform,
         "projection_type": projection_type,
         "projection_axis": projection_axis,
-        "cell_size_world_units": cell_units,
+        "cell_size_world_units": repeat_safety["effective_cell_size_world_units"],
+        **repeat_safety,
         "baked_repeat_count": [repeat_u, repeat_v],
         "projector_extent_world_units": projector_scale,
         "world_bounds": bounds,
@@ -6346,6 +6404,19 @@ def _apply_marker_shaders(bindings, job):
                         variant_cache,
                     )
                 )
+                if pattern_record.get("adaptive_cell_applied"):
+                    warnings.append(
+                        "Maya {0} pattern on {1}: cell spacing safely increased from "
+                        "{2:g} to {3:g} scene units at the reference frame "
+                        "(requested repeat {4:.3f}, VP2 limit {5:g}). "
+                        "Pattern type and background-root anchoring are preserved.".format(
+                            pattern, root,
+                            pattern_record["requested_cell_size_world_units"],
+                            pattern_record["effective_cell_size_world_units"],
+                            max(pattern_record["requested_repeat_count"]),
+                            WORLD_PATTERN_MAX_TEXTURE_REPEAT,
+                        )
+                    )
                 warnings.extend(marker_warnings)
                 verified_cutout_shapes.extend(cutout_shapes)
                 pattern_record.update({
@@ -6418,6 +6489,10 @@ def _apply_marker_shaders(bindings, job):
             "base_cell_world_units": WORLD_PATTERN_BASE_CELL_WORLD_UNITS,
             "density_multiplier": WORLD_PATTERN_DENSITY_MULTIPLIER,
             "cell_size_world_units": world_cell_units,
+            "requested_cell_size_world_units": world_cell_units,
+            "repeat_safety_policy": WORLD_PATTERN_REPEAT_SAFETY_POLICY,
+            "texture_repeat_limit": WORLD_PATTERN_MAX_TEXTURE_REPEAT,
+            "adaptive_binding_count": sum(1 for record in world_pattern_records if record.get("adaptive_cell_applied")),
             "reference_frame": float(
                 (job or {}).get("_world_pattern_reference_frame") or 0.0
             ),
@@ -9445,6 +9520,151 @@ def _visible_technical_dummy_meshes():
     return sorted(set(result))
 
 
+class _SmoothPreviewGeometryBudgetError(RuntimeError):
+    error_code = "smooth_preview_geometry_budget_exceeded"
+
+    def __init__(self, message, report):
+        RuntimeError.__init__(self, message)
+        self.report = report
+
+
+def _smooth_preview_mesh_face_counts(shape, mesh=None):
+    """Read topology without generating a smoothed mesh or changing the scene."""
+    if mesh is None:
+        _om, _path, mesh = _depth_mesh_api(shape)
+    values = []
+    for name in ("numPolygons", "numFaceVertices"):
+        value = getattr(mesh, name)
+        value = value() if callable(value) else value
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("Invalid mesh topology count: {0}".format(name))
+        values.append(value)
+    if values[1] < 3 * values[0]:
+        raise ValueError("Mesh face-vertex count is inconsistent.")
+    return tuple(values)
+
+
+def _preflight_smooth_geometry_budget(job, actual_frame=False, maya_frame=None):
+    """Estimate polygon growth; this operational budget is not a Maya limit."""
+    budget = (job or {}).get("smooth_preview_geometry_budget_faces", SMOOTH_PREVIEW_GEOMETRY_BUDGET_FACES)
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
+        raise ValueError("Smooth Preview geometry budget must be a positive integer.")
+    if _clean((job or {}).get("capture_pass")) == "motion_guide":
+        # Motion Guide draws an RGB canvas from evaluated rig evidence. It
+        # never sends the source meshes to OGS, so their subdivision estimate
+        # is not a render budget for this isolated pass.
+        report = {
+            "policy": SMOOTH_PREVIEW_GEOMETRY_BUDGET_POLICY,
+            "budget_faces": budget, "status": "not_applicable",
+            "reason": "motion_guide_software_raster", "warnings": [],
+        }
+        job["_smooth_geometry_budget_report"] = report
+        return report
+    scope = (job or {}).get("_render_scope_shapes" if actual_frame else "_viewport_quality_scope_shapes")
+    if not isinstance(scope, list):
+        scope = (job or {}).get("_render_scope_shapes")
+    unknown = []
+    try:
+        shapes = list(scope) if isinstance(scope, list) else (cmds.ls(dag=True, type="mesh", long=True, allPaths=True) or [])
+        shapes = [shape for shape in shapes if cmds.nodeType(shape) == "mesh"]
+        authored_visible = (job or {}).get("_auxiliary_authored_visible_shapes")
+        if actual_frame:
+            shapes = [shape for shape in shapes if not _is_intermediate_shape(shape)]
+        elif isinstance(scope, list) and isinstance(authored_visible, list):
+            # The capture scope was verified before its disposable exclusion
+            # layer was applied. Do not mistake that layer for authored hiding.
+            visible_set = set(authored_visible)
+            shapes = [shape for shape in shapes if shape in visible_set and not _is_intermediate_shape(shape)]
+        else:
+            shapes = _marker_renderable_shapes(shapes)
+    except Exception as exc:
+        shapes = []
+        unknown.append({"shape": "<scope>", "reason": _clean(exc)[:240]})
+    shapes = sorted(set(shapes))  # Full DAG paths retain distinct instances.
+    # Frame checks use actual display modes after preparation. They do not
+    # repeat material/card discovery, nor assume that a depth-expanded scope
+    # still matches the earlier Mask-only scope.
+    cutouts = {} if actual_frame else _ensure_authored_cutout_snapshot(job, shapes)
+    report = {
+        "policy": SMOOTH_PREVIEW_GEOMETRY_BUDGET_POLICY,
+        "budget_faces": budget, "budget_kind": "library_operational_default_not_maya_limit",
+        "estimate_kind": "catmull_clark_face_vertex_growth_not_actual_tessellation",
+        "base_faces": 0, "estimated_faces": 0,
+        "candidate_mesh_path_count": len(shapes),
+        "mesh_path_count": 0, "counted_mesh_path_count": 0,
+        "preserved_cutout_count": 0, "unknown_mesh_paths": unknown,
+        "complete": False, "status": "incomplete", "warnings": [],
+        "evaluation": "actual_frame" if actual_frame else "planned_full_smooth",
+        "maya_frame": maya_frame,
+    }
+    for shape in shapes:
+        try:
+            # Marker candidates retain animated-hidden shapes for assignment,
+            # but only this evaluated frame's visible DAG paths contribute to
+            # its budget. Later frames are checked again immediately before OGS.
+            _om, dag_path, mesh = _depth_mesh_api(shape)
+            visible = getattr(dag_path, "isVisible", None)
+            templated = getattr(dag_path, "isTemplated", None)
+            if visible is None:
+                if not _motion_path_visible(shape):
+                    continue
+            elif not bool(visible() if callable(visible) else visible):
+                continue
+            if templated is not None and bool(templated() if callable(templated) else templated):
+                continue
+            report["mesh_path_count"] += 1
+            record = cutouts.get(shape) or {}
+            preserved = bool(record.get("alpha_driven")) or (
+                _mouth_semantic_cutout_candidate(shape, record)
+                and (record.get("unsupported") or record.get("ambiguous"))
+            )
+            mode = 3
+            if preserved or actual_frame:
+                if preserved:
+                    report["preserved_cutout_count"] += 1
+                mode = _first_display_smoothness_value(cmds.displaySmoothness(shape, query=True, polygonObject=True))
+                if mode not in (1, 2, 3):
+                    raise ValueError("Authored cutout Smooth Preview mode is unavailable.")
+            faces, face_vertices = _smooth_preview_mesh_face_counts(shape, mesh=mesh)
+            report["base_faces"] += faces
+            level = 0 if mode == 1 else cmds.getAttr(shape + ".smoothLevel")
+            if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= 64:
+                raise ValueError("Authored smoothLevel is invalid or unavailable.")
+            estimated = faces if level == 0 else face_vertices * (4 ** (level - 1))
+            report["estimated_faces"] += estimated
+            report["counted_mesh_path_count"] += 1
+        except Exception as exc:
+            unknown.append({"shape": shape, "reason": _clean(exc)[:240]})
+    report["complete"] = not unknown
+    exceeded = report["estimated_faces"] > budget
+    report["status"] = "exceeded" if exceeded else "within_budget" if report["complete"] else "incomplete"
+    job["_smooth_geometry_budget_report"] = report
+    if exceeded:
+        message = (
+            "Smooth Preview geometry budget exceeded: estimated {0:,} vs {1:,} faces "
+            "(base faces {2:,}; {3} mesh paths). This is the library operational budget, "
+            "not an official Maya limit; the estimate is not measured tessellation. "
+            "Keep the authored detail without forcing Smooth Preview, or simplify the background. "
+            "No quality setting was automatically reduced."
+        ).format(report["estimated_faces"], budget, report["base_faces"], report["mesh_path_count"])
+        _write_progress(job, "error", message, error_code=_SmoothPreviewGeometryBudgetError.error_code,
+                        smooth_geometry_budget_report=report)
+        _emit_console("ERROR", message)
+        raise _SmoothPreviewGeometryBudgetError(message, report)
+    if unknown:
+        warning = (
+            "Smooth Preview geometry budget could not be fully verified: {0} mesh/scope queries unavailable; "
+            "known estimated faces {1:,} of the {2:,} operational budget. "
+            "Continuing the existing best-effort quality policy; this is not a verified-safe estimate."
+        ).format(len(unknown), report["estimated_faces"], budget)
+        report["warnings"].append(warning)
+        if not actual_frame or not job.get("_smooth_geometry_budget_frame_warning_emitted"):
+            _emit_console("WARNING", warning)
+            if actual_frame:
+                job["_smooth_geometry_budget_frame_warning_emitted"] = True
+    return report
+
+
 def _apply_full_smooth_viewport(job):
     """Force full-detail Smooth Preview 3 without saving the source scene."""
     requested_profile = _clean((job or {}).get("viewport_quality_profile"))
@@ -9458,6 +9678,7 @@ def _apply_full_smooth_viewport(job):
             )
         )
 
+    geometry_budget_report = _preflight_smooth_geometry_budget(job)
     restore_state = {
         "attributes": [],
         "global_distance_lod": None,
@@ -9483,7 +9704,8 @@ def _apply_full_smooth_viewport(job):
         "unresolved_proxy_nodes": [],
         "unresolved_proxy_plugin_pass_through": False,
         "proxy_preview_recovery": _empty_proxy_preview_recovery_report(),
-        "warnings": [],
+        "warnings": list(geometry_budget_report.get("warnings") or []),
+        "smooth_geometry_budget_report": geometry_budget_report,
         "reference_loading": dict((job or {}).get("_reference_report") or {}),
     }
     failures = []
@@ -10278,6 +10500,8 @@ def _render_frames(
             try:
                 if pre_frame_callback is not None:
                     pre_frame_callback(frame, index, frame_count)
+                if bool((job or {}).get("force_high_quality_viewport")):
+                    _preflight_smooth_geometry_budget(job, actual_frame=True, maya_frame=frame)
                 render_options = {
                     "camera": camera_shape,
                     "frame": float(frame),
@@ -10297,7 +10521,7 @@ def _render_frames(
                     raise RuntimeError(
                         "ogsRender returned False at frame {0}".format(frame)
                     )
-            except _MouthCardRestorationError:
+            except (_MouthCardRestorationError, _SmoothPreviewGeometryBudgetError):
                 raise
             except Exception as exc:
                 raise RuntimeError(
@@ -15191,6 +15415,14 @@ def _motion_draw_face_frame(canvas, width, height, face_frame):
 
 
 def _write_motion_guide_png(path, width, height, canvas):
+    # Maya's embedded Python can lack Windows long-path awareness. Shared
+    # capture staging plus the scene name can exceed MAX_PATH even though the
+    # frame directory exists. Use the native file syntax only for this write;
+    # published frame paths and FFmpeg inputs retain their normal spelling.
+    if os.name == "nt":
+        path = os.path.abspath(path)
+        if len(path) >= 260 and not path.startswith("\\\\?\\"):
+            path = "\\\\?\\UNC\\" + path[2:] if path.startswith("\\\\") else "\\\\?\\" + path
     raw = bytearray()
     row_size = int(width) * 3
     for row in range(int(height)):
@@ -16256,10 +16488,12 @@ def _marker_payload(
     bindings,
     character_outline_mode=CHARACTER_OUTLINE_NATIVE,
     pattern_profile=MAYA_WORLD_PATTERN_PROFILE,
+    world_pattern_report=None,
 ):
     outline_mode = _character_outline_mode(
         {"character_outline_mode": character_outline_mode}
     )
+    pattern_rows = (world_pattern_report or {}).get("patterns") or []
     result = []
     for record in bindings:
         color = record["color"]
@@ -16318,6 +16552,24 @@ def _marker_payload(
                     "uv_dependent": False,
                     "occlusion": "viewport2_depth",
                 }
+                # Keep the public marker description consistent with the
+                # shader actually baked for this exact root and pattern.
+                matching_rows = [row for row in pattern_rows
+                                 if isinstance(row, dict)
+                                 and row.get("subject_root") == record["subject_root"]
+                                 and row.get("pattern") == pattern]
+                if len(matching_rows) == 1:
+                    applied = matching_rows[0]
+                    for field in (
+                        "cell_size_world_units", "requested_cell_size_world_units",
+                        "effective_cell_size_world_units", "cell_scale_factor",
+                        "repeat_safety_policy", "texture_repeat_limit",
+                        "requested_repeat_count", "baked_repeat_count",
+                        "adaptive_cell_applied",
+                    ):
+                        if field in applied:
+                            value = applied[field]
+                            shading_profile[field] = list(value) if isinstance(value, list) else value
             else:
                 shading_profile = {
                     "profile": SCREEN_SPACE_PATTERN_PROFILE,
@@ -16745,6 +16997,9 @@ def run(job_path):
         quality_restore = None
         quality_report = {}
         if force_high_quality_viewport:
+            # Budget and authored visibility must describe the requested
+            # first output frame, not the scene's last saved time.
+            cmds.currentTime(frames[0], edit=True, update=True)
             _write_progress(
                 job,
                 "preparing_full_smooth_geometry",
@@ -16928,7 +17183,7 @@ def run(job_path):
             _write_progress(
                 job,
                 "preparing_original_lambert_materials",
-                "Applying a soft midgray body while preserving authored eye shaders.",
+                "Applying a soft midgray body while preserving AIPicker_SET materials.",
             )
             try:
                 original_material_controller = (
@@ -17102,7 +17357,7 @@ def run(job_path):
                             "Depth frame timing does not match the color frame timing."
                         )
                     artifact_status["depth"]["ok"] = True
-                except _MouthCardRestorationError:
+                except (_MouthCardRestorationError, _SmoothPreviewGeometryBudgetError):
                     # A later Motion pass must never run on a scene whose
                     # temporary mouth geometry/layer state may be contaminated.
                     raise
@@ -17226,6 +17481,7 @@ def run(job_path):
                     if world_space_patterns
                     else SCREEN_SPACE_PATTERN_PROFILE
                 ),
+                world_pattern_report=job.get("_world_pattern_report") if world_space_patterns else None,
             ),
             "hidden_paths": hidden_paths,
             "warnings": warnings,
@@ -17470,6 +17726,9 @@ def run(job_path):
             "error": str(exc),
             "traceback": traceback.format_exc(),
         })
+        if isinstance(exc, _SmoothPreviewGeometryBudgetError):
+            result["error_code"] = exc.error_code
+            result["smooth_geometry_budget_report"] = dict(exc.report)
         original_failure_report = job.get("_original_material_override_report")
         if isinstance(original_failure_report, dict) and original_failure_report:
             result["original_material_override_report"] = dict(original_failure_report)

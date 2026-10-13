@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DAT_PATH = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
+DAT_PATH = ROOT / "resources" / "agent" / "superwings12" / "hmb_agent_core.dat"
 
 
 def load_common():
@@ -33,7 +33,7 @@ assert "_broker_load_bearer_token_readonly" in common_source
 assert "_broker_load_bearer_token_readonly" in seedance_source
 
 assert delivery["mode"] == "bundled_signed_dat"
-assert delivery["runtime_path"] == "resources/agent/hmb_agent_core.dat"
+assert delivery["runtime_path"] == "resources/agent/superwings12/hmb_agent_core.dat"
 packager_spec = importlib.util.spec_from_file_location(
     "_hmb_bundled_policy_packager", ROOT / "tools" / "package_runtime_release.py"
 )

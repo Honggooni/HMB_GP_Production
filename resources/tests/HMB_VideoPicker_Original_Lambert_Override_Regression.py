@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import fnmatch
 import importlib.util
 import json
 import sys
@@ -155,8 +156,8 @@ class FakeMaterialCmds(types.ModuleType):
     def ls(self, *nodes, **kwargs):
         if nodes:
             return [str(node) for node in nodes]
-        if kwargs.get("type") == "shadingEngine":
-            return sorted(self.members)
+        if kwargs.get("type"):
+            return sorted(node for node, kind in self.node_types.items() if kind == kwargs["type"])
         return []
 
     def sets(self, group, query=False, **_kwargs):
@@ -491,7 +492,7 @@ class MidgrayCmds(FakeMaterialCmds):
         if (node not in self.members
                 and node not in ("hardwareRenderingGlobals", "defaultRenderGlobals")
                 and not node.startswith("HMB_Original_")
-                and self.node_types.get(node) not in ("mesh", "nurbsSurface", "transform")):
+                and self.node_types.get(node) not in ("mesh", "nurbsSurface", "nurbsCurve", "locator", "joint", "transform", "objectSet")):
             self.authored_reads.append((operation, node))
             raise AssertionError("Original must not evaluate authored appearance: " + node)
 
@@ -562,6 +563,8 @@ class EyeMidgrayCmds(MidgrayCmds):
         self.split_moves = 0
         self.assignment_calls = []
         self.alias_paths = {}
+        self.object_sets = {"AIPicker_SET": [self.EYE_LEFT_OWNER, self.EYE_RIGHT_OWNER]}
+        self.set_query_count = 0
         self.eye_nodes = {
             "EyeMat", "EyeBump", "EyeColor", "EyeAlpha", "EyeNormal", "EyeDisplacement",
         }
@@ -571,6 +574,7 @@ class EyeMidgrayCmds(MidgrayCmds):
                 self.node_types["|" + "|".join(segments[:index])] = "transform"
             self.node_types[shape] = "mesh"
         self.node_types.update({
+            "AIPicker_SET": "objectSet",
             "eyeOnlySG": "shadingEngine", "sharedEyeBodySG": "shadingEngine",
             "browSG": "shadingEngine", "EyeMat": "lambert", "EyeBump": "bump2d",
             "EyeColor": "file", "EyeAlpha": "file", "EyeNormal": "file",
@@ -625,8 +629,19 @@ class EyeMidgrayCmds(MidgrayCmds):
                 if isinstance(node, (tuple, list)):
                     result.extend(self.ls(*node, **kwargs))
                 else:
-                    result.extend(self.alias_paths.get(str(node), [str(node)] if str(node) in self.node_types else []))
-            return result
+                    name = str(node)
+                    owner, separator, component = name.partition(".")
+                    matches = self.alias_paths.get(owner)
+                    if matches is None:
+                        matches = [owner] if owner in self.node_types else [candidate for candidate in self.node_types if fnmatch.fnmatchcase(candidate, owner)]
+                    if kwargs.get("dag"):
+                        matches = [candidate for candidate in self.node_types if any(candidate == path or candidate.startswith(path + "|") for path in matches)]
+                    if kwargs.get("type"):
+                        matches = [candidate for candidate in matches if self.node_types.get(candidate) == kwargs["type"]]
+                    if kwargs.get("shapes"):
+                        matches = [candidate for candidate in matches if self.node_types.get(candidate) in ("mesh", "nurbsSurface", "nurbsCurve")]
+                    result.extend(candidate + ("." + component if separator else "") for candidate in matches)
+            return sorted(set(result))
         return super().ls(**kwargs)
 
     def nodeType(self, node, **kwargs):
@@ -687,7 +702,7 @@ class EyeMidgrayCmds(MidgrayCmds):
         node = str(node)
         if kwargs.get("parent"):
             return [node.rsplit("|", 1)[0]] if "|" in node and node.rsplit("|", 1)[0] else []
-        children = [candidate for candidate in self.node_types if candidate.startswith(node + "|") and candidate.rsplit("|", 1)[0] == node]
+        children = [candidate for candidate in self.node_types if candidate.startswith(node + "|") and (kwargs.get("allDescendents") or kwargs.get("ad") or candidate.rsplit("|", 1)[0] == node)]
         if kwargs.get("shapes"):
             children = [candidate for candidate in children if self.node_types[candidate] in ("mesh", "nurbsSurface")]
         if kwargs.get("noIntermediate"):
@@ -698,6 +713,9 @@ class EyeMidgrayCmds(MidgrayCmds):
 
     def sets(self, group=None, query=False, **kwargs):
         if query:
+            if self.node_types.get(group) == "objectSet":
+                self.set_query_count += 1
+                return list(self.object_sets.get(group, []))
             return list(self.members.get(group, []))
         if kwargs.get("empty"):
             assert kwargs.get("renderable") and kwargs.get("noSurfaceShader")
@@ -740,7 +758,7 @@ class EyeMidgrayCmds(MidgrayCmds):
         return super().delete(node)
 
     def snapshot(self):
-        return copy.deepcopy((self.node_types, self.members, self.connections, self.values, self.attr_types))
+        return copy.deepcopy((self.node_types, self.members, self.connections, self.values, self.attr_types, self.object_sets))
 
     def authored_eye_snapshot(self):
         return copy.deepcopy((
@@ -750,14 +768,134 @@ class EyeMidgrayCmds(MidgrayCmds):
         ))
 
 
-# Only the two explicit group names grant an Original material exception.
-for name in ("eye_GEO_GRP", "eye_GRP", "hero:eye_GEO_GRP", "hero:rig:eye_GRP"):
-    assert runner._original_eye_semantic(name), name
-for name in ("hero:Eye_L_GEO", "hero:eyeBall02Shape", "hero:Iris_GEO", "hero:PupilShape", "hero:Cornea", "hero:Sclera",
-             "hero:Eyebrow_L_GEO", "eye_GRP:Body_GEO", "hero:Eyes_GRP", "hero:eye_GRP_extra", "hero:Eye_GRP", "EyeMat"):
-    assert not runner._original_eye_semantic(name), name
+def configure_pass_sets(fake, sets):
+    for name in list(fake.node_types):
+        if fake.node_types[name] == "objectSet":
+            fake.node_types.pop(name)
+    fake.object_sets = copy.deepcopy(sets)
+    fake.node_types.update({name: "objectSet" for name in sets})
+
+
+def add_surface(fake, path, kind="mesh"):
+    segments = path.split("|")[1:]
+    for index in range(1, len(segments)):
+        fake.node_types["|" + "|".join(segments[:index])] = "transform"
+    fake.node_types[path] = kind
+    return path
+
+
+# Original material preservation is governed solely by exact AIPicker_SET
+# objectSet membership. Legacy names never implicitly preserve a surface.
 with tempfile.TemporaryDirectory(prefix="hmb-authored-eye-") as texture_root:
     texture_directory = Path(texture_root)
+    # No set, an empty set, and similarly named sets are all deliberate no-pass
+    # states. Neither legacy group grants a fallback material exception.
+    for set_names in ({}, {"AIPicker_SET": []}, {"aipicker_set": [EyeMidgrayCmds.EYE_LEFT_OWNER]},
+                      {"AIPicker_SET_extra": [EyeMidgrayCmds.EYE_LEFT_OWNER]},
+                      {"hero:AIPicker_set": [EyeMidgrayCmds.EYE_LEFT_OWNER]}):
+        no_pass = EyeMidgrayCmds(texture_directory)
+        configure_pass_sets(no_pass, set_names)
+        runner.cmds = no_pass
+        before = no_pass.snapshot()
+        assert runner._original_pass_set_shapes() == set(), set_names
+        assert not runner._original_eye_shape(no_pass.EYE_LEFT)
+        assert not runner._original_eye_shape(no_pass.EYE_RIGHT)
+        assert no_pass.snapshot() == before
+    no_pass.node_types["|ROOT|AIPicker_SET"] = "transform"
+    add_surface(no_pass, "|ROOT|AIPicker_SET|geometry|surfaceShape")
+    assert runner._original_pass_set_shapes() == set(), "A same-name DAG group is not an objectSet."
+
+    # Recursively nested sets, including a cycle, preserve exactly their members.
+    # An unreferenced set must not expand the pass merely because it exists.
+    nested = EyeMidgrayCmds(texture_directory)
+    configure_pass_sets(nested, {
+        "AIPicker_SET": ["Parts_SET", nested.EYE_LEFT_OWNER],
+        "Parts_SET": ["Inner_SET", nested.EYE_LEFT_OWNER],
+        "Inner_SET": ["AIPicker_SET", nested.EYE_RIGHT],
+        "Unrelated_SET": [nested.BODY_OWNER],
+    })
+    runner.cmds = nested
+    before = nested.snapshot()
+    assert runner._original_pass_set_shapes() == {nested.EYE_LEFT, nested.EYE_RIGHT}
+    assert nested.set_query_count == 3, "Cycle detection must visit each reachable set once."
+    assert nested.snapshot() == before
+    nested.set_query_count = 0
+    assert not runner._original_eye_shape(nested.EYE_LEFT, set()), "A supplied empty cache is authoritative."
+    assert nested.set_query_count == 0, "Do not reread sets when a cache was supplied."
+
+    # Each exact namespaced set contributes only its explicit members.
+    namespaced = EyeMidgrayCmds(texture_directory)
+    other = add_surface(namespaced, "|other:ROOT|other:Body_GRP|other:renderShape")
+    configure_pass_sets(namespaced, {
+        "studio:hero:AIPicker_SET": [namespaced.EYE_LEFT_OWNER],
+        "other:AIPicker_SET": [other],
+        "other:AIPicker_SET_old": [namespaced.BODY],
+    })
+    runner.cmds = namespaced
+    assert runner._original_pass_set_shapes() == {namespaced.EYE_LEFT, other}
+    assert not runner._original_eye_shape(namespaced.EYE_RIGHT), "Do not expand a namespace to sibling objects."
+    assert not runner._original_eye_shape(namespaced.BODY)
+
+    # Group members expand all final drawable descendants, with construction
+    # meshes and control curves excluded. The group name itself is unrestricted.
+    descendants = EyeMidgrayCmds(texture_directory)
+    first = add_surface(descendants, "|setRoot|Any_GRP|nested_GRP|meshOwner|meshShape")
+    second = add_surface(descendants, "|setRoot|Any_GRP|nested_GRP|nurbsOwner|nurbsShape", "nurbsSurface")
+    history = add_surface(descendants, "|setRoot|Any_GRP|nested_GRP|meshOwner|historyShape")
+    descendants.values[history + ".intermediateObject"] = 1
+    add_surface(descendants, "|setRoot|Any_GRP|control|controlShape", "nurbsCurve")
+    configure_pass_sets(descendants, {"AIPicker_SET": ["|setRoot|Any_GRP"]})
+    runner.cmds = descendants
+    assert runner._original_pass_set_shapes() == {first, second}
+
+    # Component membership expresses an object pass, rather than shading only
+    # selected faces. It must not spill into any other surface of an ancestor.
+    for component in (EyeMidgrayCmds.EYE_LEFT + ".f[0:3]", EyeMidgrayCmds.EYE_LEFT_OWNER + ".f[0:3]",
+                      EyeMidgrayCmds.EYE_LEFT + ".vtx[1:2]"):
+        component_pass = EyeMidgrayCmds(texture_directory)
+        configure_pass_sets(component_pass, {"AIPicker_SET": [component]})
+        runner.cmds = component_pass
+        assert runner._original_pass_set_shapes() == {component_pass.EYE_LEFT}, component
+
+    # A concrete instance member preserves only that concrete DAG instance.
+    # allPaths on the object's short name must never broaden an exact member.
+    instance = EyeMidgrayCmds(texture_directory)
+    instance_a = add_surface(instance, "|instanceA|sharedOwner|sharedShape")
+    instance_b = add_surface(instance, "|instanceB|sharedOwner|sharedShape")
+    instance.alias_paths["sharedShape"] = [instance_a, instance_b]
+    instance.alias_paths["sharedOwner"] = [instance_a.rsplit("|", 1)[0], instance_b.rsplit("|", 1)[0]]
+    configure_pass_sets(instance, {"AIPicker_SET": [instance_a]})
+    runner.cmds = instance
+    assert runner._original_pass_set_shapes() == {instance_a}
+    assert runner._original_eye_shape(instance_a)
+    assert not runner._original_eye_shape(instance_b)
+    configure_pass_sets(instance, {"AIPicker_SET": [instance_a.rsplit("|", 1)[0]]})
+    assert runner._original_pass_set_shapes() == {instance_a}
+    for ambiguous_member in ("sharedShape", "sharedOwner"):
+        configure_pass_sets(instance, {"AIPicker_SET": [ambiguous_member]})
+        before = instance.snapshot()
+        try:
+            runner._original_pass_set_shapes()
+        except RuntimeError as exc:
+            assert "AIPicker_SET" in str(exc)
+        else:
+            raise AssertionError("Ambiguous set membership must fail before material edits: " + ambiguous_member)
+        assert instance.snapshot() == before
+    configure_pass_sets(instance, {"AIPicker_SET": ["deletedOrUnloadedObject"]})
+    try:
+        runner._original_pass_set_shapes()
+    except RuntimeError as exc:
+        assert "one exact object path" in str(exc)
+    else:
+        raise AssertionError("Missing pass members must fail closed, not silently become gray.")
+    with mock.patch.object(instance, "sets", side_effect=RuntimeError("set membership unavailable")):
+        try:
+            runner._original_pass_set_shapes()
+        except RuntimeError as exc:
+            assert "could not read AIPicker_SET membership" in str(exc)
+        else:
+            raise AssertionError("Unreadable pass-set membership must fail before material edits.")
+
     eyes = EyeMidgrayCmds(texture_directory)
     original_eye_graph = eyes.authored_eye_snapshot()
     all_before = eyes.snapshot()
@@ -766,7 +904,12 @@ with tempfile.TemporaryDirectory(prefix="hmb-authored-eye-") as texture_root:
     assert runner._original_eye_shape(eyes.EYE_RIGHT)
     assert not runner._original_eye_shape(eyes.BROW)
     assert not runner._original_eye_shape(eyes.BODY)
+    assert runner._original_pass_set_shapes() == {eyes.EYE_LEFT, eyes.EYE_RIGHT}
+    eyes.set_query_count = 0
     eye_applied = eye_controller.apply()
+    assert eyes.set_query_count == 1, "Resolve each pass set once per controller capture, not once per SG member."
+    assert eye_applied["material_pass_source"] == "AIPicker_SET"
+    assert eye_applied["material_pass_shape_count"] == 2
     assert eye_applied["preserved_eye_shape_count"] == 2
     assert eye_applied["preserved_eye_component_count"] == 8
     assert eye_applied["preserved_eye_shading_engine_count"] == 2
@@ -808,10 +951,9 @@ with tempfile.TemporaryDirectory(prefix="hmb-authored-eye-") as texture_root:
     assert eye_only_controller.finish()["restore_ok"]
     assert eye_only.snapshot() == eye_only_before
 
-    # Both exact group names work with no namespace and nested namespaces, for
-    # nested mesh/NURBS surfaces whose own names say body or brow. Native eye
-    # shaders, SG links, memberships and their inputs remain byte-for-byte exact.
-    for group_name in ("eye_GEO_GRP", "eye_GRP"):
+    # Arbitrarily named group members recursively preserve mesh/NURBS surfaces.
+    # Exact set names also work with nested namespaces; DAG names are irrelevant.
+    for group_name in ("Unrelated_GRP", "Body_GRP"):
         for namespace in ("", "studio:hero:"):
             for surface_type in ("mesh", "nurbsSurface"):
                 grouped = EyeMidgrayCmds(texture_directory)
@@ -822,6 +964,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-authored-eye-") as texture_root:
                 grouped.node_types[surface] = surface_type
                 owner = surface.rsplit("|", 1)[0]
                 grouped.members = {"eyeOnlySG": [owner + ".f[0:3]" if surface_type == "mesh" else owner]}
+                configure_pass_sets(grouped, {namespace + "AIPicker_SET": ["|ROOT|" + namespace + group_name]})
                 grouped_before = grouped.snapshot()
                 grouped_controller = controller_for(grouped, [surface])
                 assert runner._original_eye_shape(surface), surface
@@ -834,9 +977,9 @@ with tempfile.TemporaryDirectory(prefix="hmb-authored-eye-") as texture_root:
                 assert grouped_controller.finish()["restore_ok"]
                 assert grouped.snapshot() == grouped_before
 
-    # Eye-like mesh/SG/shader names and face assignments outside the explicit
-    # groups must become gray. Neither prefix matches nor namespace text count.
-    for outside_group in ("Eyes_GRP", "eye_GEO_GRP_extra", "eye_GRP2", "Eye_GRP", "eye_GRP:Body_GRP"):
+    # Both former exact names, eye-like names, and face assignments outside the
+    # set must become gray. Shader sharing and group ancestry grant no exception.
+    for outside_group in ("eye_GEO_GRP", "eye_GRP", "Eyes_GRP", "eye_GEO_GRP_extra", "eye_GRP2", "Eye_GRP", "eye_GRP:Body_GRP"):
         outside = EyeMidgrayCmds(texture_directory)
         surface = "|ROOT|" + outside_group + "|Iris_GEO|eyeShape"
         segments = surface.split("|")[1:]
@@ -857,8 +1000,8 @@ with tempfile.TemporaryDirectory(prefix="hmb-authored-eye-") as texture_root:
     outside.node_types["|ROOT|eye_GRP"] = "mesh"
     assert not runner._original_eye_shape("|ROOT|eye_GRP"), "A surface name is not a pass group."
 
-    # Group ancestry preserves even body/brow-named meshes and face assignments.
-    # The same EyeMat on an object outside the group grants no exception.
+    # Set group descendants preserve body/brow-named meshes and face assignments.
+    # The same EyeMat on an object outside the set grants no exception.
     combined = EyeMidgrayCmds(texture_directory)
     head = "|hero:ROOT|hero:Face_GRP|hero:eye_GRP|hero:Body_Eyebrow_GEO|hero:HeadShape"
     combined.node_types[head.rsplit("|", 1)[0]] = "transform"
@@ -866,6 +1009,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-authored-eye-") as texture_root:
     head_owner = head.rsplit("|", 1)[0]
     eye_face_member = head_owner + ".f[0:3]"
     combined.members = {"sharedEyeBodySG": [eye_face_member, combined.BODY_OWNER]}
+    configure_pass_sets(combined, {"AIPicker_SET": [head_owner]})
     combined.values[combined.BODY_OWNER + ".visibility"] = 0
     history_shape = head_owner + "|hero:HeadOrigShape"
     combined.node_types[history_shape] = "mesh"
@@ -1402,4 +1546,52 @@ for field, value in (("eye_fallback_applied", True), ("eye_fallback_verified", T
     invalid[field] = value
     assert not picker._original_material_report_is_valid(invalid), field
 
-print("HMB VideoPicker neutral-body/authored-eye Original regression passed.")
+# Keeping the report profile for saved-workflow compatibility must not reuse
+# an old name-based Original cache. Invalidation is read-only and never deletes
+# the user's prior validated MP4 or its sidecar.
+with tempfile.TemporaryDirectory(prefix="hmb-aipicker-cache-") as cache_dir:
+    cache_root = Path(cache_dir)
+    cache_scene = cache_root / "asset.mb"
+    cache_scene.write_bytes(b"scene-cache-fixture")
+    cache_state = picker._default_widget_state()
+    cache_state.update(scene_path=str(cache_scene), scene_request_path=str(cache_scene),
+                       selected_camera="|shotCam", camera="|shotCam", start_frame=1.0,
+                       end_frame=2.0, source_fps=24.0, output_width=640, output_height=360,
+                       native_metadata={"scene_path": str(cache_scene), "start_frame": 1.0,
+                                        "end_frame": 2.0, "fps": 24.0})
+    manifest = picker._scene_dependency_manifest_path(cache_scene)
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps({"schema": picker.ORIGINAL_DEPENDENCY_MANIFEST_SCHEMA,
+                                   "version": picker.ORIGINAL_DEPENDENCY_MANIFEST_VERSION,
+                                   "scene_path": str(cache_scene), "paths": [str(cache_scene)]}), encoding="utf-8")
+    cache_state["native_metadata"]["dependency_manifest_path"] = str(manifest)
+    cache_fields = picker._original_preview_cache_fields(cache_scene, cache_state)
+    assert cache_fields["original_material_pass_source"] == "AIPicker_SET"
+    cache_video, cache_sidecar = picker._original_preview_paths(cache_scene)
+    cache_video.parent.mkdir(parents=True, exist_ok=True)
+    def cache_box(kind, payload):
+        return (8 + len(payload)).to_bytes(4, "big") + kind + payload
+    original_cache_bytes = cache_box(b"ftyp", b"isom\x00\x00\x02\x00isom") + cache_box(b"mdat", b"fixture") + cache_box(b"moov", b"meta")
+    cache_video.write_bytes(original_cache_bytes)
+    new_metadata = {"schema": "hmb-original-playblast", **cache_fields,
+                    "assignment_mode": picker.ORIGINAL_LAMBERT_ASSIGNMENT_MODE,
+                    "original_material_override_report": copy.deepcopy(valid_report),
+                    "accepted_read_dependency_fingerprint": cache_fields["scene_dependency_fingerprint"],
+                    "scene_dependency_paths": [str(cache_scene)], "video_size_bytes": len(original_cache_bytes)}
+    cache_sidecar.write_text(json.dumps(new_metadata), encoding="utf-8")
+    assert picker._original_preview_cache_is_valid(cache_scene, cache_state, cache_video, cache_sidecar)
+    for target, missing in (("metadata", True), ("metadata", False), ("report", True), ("report", False)):
+        legacy = copy.deepcopy(new_metadata)
+        holder = legacy if target == "metadata" else legacy["original_material_override_report"]
+        key = "original_material_pass_source" if target == "metadata" else "material_pass_source"
+        if missing:
+            holder.pop(key, None)
+        else:
+            holder[key] = "eye_GEO_GRP|eye_GRP"
+        serialized = json.dumps(legacy)
+        cache_sidecar.write_text(serialized, encoding="utf-8")
+        assert not picker._original_preview_cache_is_valid(cache_scene, cache_state, cache_video, cache_sidecar), (target, missing)
+        assert cache_video.read_bytes() == original_cache_bytes
+        assert cache_sidecar.read_text(encoding="utf-8") == serialized
+
+print("HMB VideoPicker neutral-body/AIPicker_SET authored-material Original regression passed.")

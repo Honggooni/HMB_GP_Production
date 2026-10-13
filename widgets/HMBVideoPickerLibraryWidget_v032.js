@@ -119,6 +119,7 @@ const hmbVideoPickerRegistryScopeIds = new WeakMap();
 const hmbVideoPickerRegistryNodeShellIds = new WeakMap();
 const hmbVideoPickerNodeInternalsSchedulers = new WeakMap();
 const hmbVideoPickerCompactTailReclaims = new WeakMap();
+const hmbVideoPickerCompactContainerMinimums = new WeakMap();
 const hmbVideoPickerExpandedHostHeightPropagations = new WeakMap();
 const hmbVideoPickerFitElementIds = new WeakMap();
 let hmbVideoPickerPaintFirstSequence = 0;
@@ -6972,6 +6973,7 @@ function hmbSetPickerStyleIfChanged(element, property, value, priority = "") {
 }
 
 function hmbApplyPickerHostSizing(container, requiredInnerHeight = null) {
+  hmbRestoreVideoPickerCompactContainerMinimum(container);
   // Expanded mode stays inline. The exact HMB_PICKER_STATE allocator row is
   // allowed to follow the Picker, but React Flow workspace/canvas ancestors
   // remain immutable. The React Flow shell is repaired only at an explicit
@@ -8249,6 +8251,18 @@ export function hmbRestoreVideoPickerDom(container, nodes) {
   return true;
 }
 
+function hmbRestoreVideoPickerCompactContainerMinimum(container) {
+  const record = hmbVideoPickerCompactContainerMinimums.get(container);
+  if (!record) return;
+  const current = hmbVideoPickerHybridStyleValue(container, "min-height");
+  if (current.value === record.applied && current.priority === "important") {
+    if (record.saved.value) {
+      container.style.setProperty("min-height", record.saved.value, record.saved.priority);
+    } else container.style.removeProperty("min-height");
+  }
+  hmbVideoPickerCompactContainerMinimums.delete(container);
+}
+
 export function hmbApplyVideoPickerCompactHostSizing(container, stateValue = undefined) {
   if (
     !container?.style
@@ -8259,6 +8273,14 @@ export function hmbApplyVideoPickerCompactHostSizing(container, stateValue = und
   const picker = container.querySelector?.(".hmbvp");
   const clip = container.querySelector?.(".hmbvp-clip");
   if (clean(picker?.getAttribute?.("data-picker-view")) !== "compact") return 0;
+  const currentMinimum = hmbVideoPickerHybridStyleValue(container, "min-height");
+  let minimumRecord = hmbVideoPickerCompactContainerMinimums.get(container);
+  if (!minimumRecord) {
+    minimumRecord = { saved: currentMinimum, applied: "" };
+    hmbVideoPickerCompactContainerMinimums.set(container, minimumRecord);
+  } else if (currentMinimum.value !== minimumRecord.applied || currentMinimum.priority !== "important") {
+    minimumRecord.saved = currentMinimum;
+  }
   const resetCompactBox = (element) => {
     if (!element?.style) return;
     hmbSetPickerStyleIfChanged(element, "height", "auto");
@@ -8299,6 +8321,12 @@ export function hmbApplyVideoPickerCompactHostSizing(container, stateValue = und
     ? measuredVisible
     : HMB_VIDEO_PICKER_COMPACT_ONE_SHOT_CONTENT_HEIGHT);
   const measuredPixels = `${measured}px`;
+  // The Editor writes its allocator height onto the raw widget container
+  // again after the hidden measurement changes, without calling update().
+  // Protect this innermost host too: the row alone cannot stop that stale
+  // height from clipping the authored frame on expanded -> compact switches.
+  hmbSetPickerStyleIfChanged(container, "min-height", measuredPixels, "important");
+  minimumRecord.applied = measuredPixels;
   // Keep the exact Shot-derived height inside the authored widget. The hybrid
   // transition separately sizes only its exact React Flow node.
   for (const element of [clip, picker]) {
@@ -12132,6 +12160,7 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     hmbRestoreVideoPickerExpandedHostHeightPropagation(container);
     hmbRestoreVideoPickerCompactTailReclaim(container);
     activeCleanup.forEach((fn) => { try { fn(); } catch (_error) {} });
+    hmbRestoreVideoPickerCompactContainerMinimum(container);
     activeCleanup = [];
     if (resizeObserver) {
       try { resizeObserver.disconnect(); } catch (_error) {}
@@ -12541,8 +12570,10 @@ export default function HMBVideoPickerLibraryWidget(container, props) {
     // copy already owns the adaptive row allocation; the two settled RAFs
     // below only reconcile late font/media layout and never touch that row.
     hmbApplyVideoPickerCompactHostSizing(container, state);
-    hmbInstallVideoPickerCompactHostSizing(container, activeCleanup, props || {}, state);
   }
+  // Every factory mounts the expanded subtree first, even for compact view.
+  // Register outside that branch so later mode switches have a settled fit.
+  hmbInstallVideoPickerCompactHostSizing(container, activeCleanup, props || {}, state);
   // Node internals publish is deferred to the single settled scheduler below;
   // never expose the pre-fit mount frame to the host allocator.
   const replacementViewportVideo = container.querySelector("#picker-video");

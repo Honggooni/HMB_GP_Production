@@ -65,22 +65,23 @@ def start_generation(node, media, request_target=None):
     captured = {}
     node._prepare_run_state = lambda *_a, **_k: None
 
-    def maya_stage(_scene, _slot, context=None, **_kwargs):
+    def maya_stage(_scene, _slot, context=None, selected_role=None, **_kwargs):
+        assert selected_role == "mask"
         captured["context"] = context
         stale = node._operation_stage_state(context)
         captured["state"] = copy.deepcopy(stale)
         entered.set()
         assert release.wait(10), "test timed out waiting for navigation"
         node._assert_operation_current(context, "simulated Maya completion")
-        stale = picker._append_video_asset(stale, {
+        generated_item = {
             "video_path": str(media), "video_url": media.as_uri(),
             "generation_role": "mask", "media_kind": picker.MASK_MEDIA_KIND,
             "source_fps": 24, "source_frame_count": 62, "camera": "cameraA",
             "start_frame": 101, "end_frame": 162,
-        }, picker_shot_uuid=context.picker_shot_uuid)
-        node._write_state(stale)
+        }
         captured["post_progress"] = node._picker_state()
-        return {"depth_succeeded": False, "motion_guide_succeeded": False}
+        return {"depth_succeeded": False, "motion_guide_succeeded": False,
+                "generated_item": generated_item}
 
     node._maya_mode = maya_stage
     state = node._picker_state()

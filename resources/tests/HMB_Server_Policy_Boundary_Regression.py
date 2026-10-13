@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DAT_PATH = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
+DAT_PATH = ROOT / "resources" / "agent" / "superwings12" / "hmb_agent_core.dat"
 
 
 def load(name: str):

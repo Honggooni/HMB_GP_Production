@@ -45,9 +45,14 @@ class EvaluationCmds:
         self.ignore_set = set(ignore_set)
         self.fail_read = fail_read
         self.set_calls = []
+        self.frame_calls = []
 
     def about(self, version=False):
         return "2027" if version else ""
+
+    def currentTime(self, value, *, edit=False, update=False):
+        assert edit is True and update is True
+        self.frame_calls.append(float(value))
 
     def evaluationManager(self, query=False, mode=None):
         if query:
@@ -96,6 +101,7 @@ def mocked_capture(cmds, calls, *, open_mode=None, fail_role="", wrong_role="", 
     def capture(role, **kwargs):
         calls.append(role)
         assert cmds.mode == kwargs["job"].get("maya_evaluation_mode", "serial")
+        assert cmds.frame_calls[-1] == kwargs["frame_values"][0]
         assert kwargs["camera"] == "|shotCamera"
         assert (kwargs["width"], kwargs["height"]) == (1280, 720)
         assert kwargs["frame_values"] == [101.25, 102.25, 103.25, 103.75]

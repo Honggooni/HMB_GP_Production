@@ -274,6 +274,7 @@ export default function HMBColorLUTLibraryWidget(container, props = {}) {
   let latestProps = props, state = hmbColorLUTState(props), disposed = false, visible = true, sourceRevision = 0;
   let renderer = null, video = null, sourceKey = "", drawFrame = 0, playbackFrame = 0, videoFrame = 0, commitTimer = 0;
   let mode = "compare", wipe = 0.5, cubeKey = "", pendingCube = null, pendingShot = null, localMessage = "", pendingEdit = false, lastSeek = 0, responseRevision = 0;
+  let lastHostRevision = state.revision;
   const cleanups = [], videoCleanups = [], settingsCache = new Map(), cubeCache = new Map();
   const doc = container.ownerDocument || globalThis.document, win = doc?.defaultView || globalThis;
   const raf = (fn) => win.requestAnimationFrame(fn), caf = (id) => { if (id) win.cancelAnimationFrame(id); };
@@ -483,6 +484,32 @@ export default function HMBColorLUTLibraryWidget(container, props = {}) {
       if (disposed) return;
       latestProps = nextProps; const incoming = hmbColorLUTState(nextProps), sameShot = incoming.shot.channel_uuid === state.shot.channel_uuid && incoming.shot.shot_uuid === state.shot.shot_uuid;
       const previousResponseState = responseStateKey();
+      if (incoming.project_id !== state.project_id) {
+        // Project selection belongs to ImageAsset. A local slider revision may
+        // run ahead while its debounce is pending, so compare host revisions
+        // separately and retire the old project's timer before adopting it.
+        if (incoming.revision <= lastHostRevision) return;
+        lastHostRevision = incoming.revision;
+        if (commitTimer) { win.clearTimeout(commitTimer); commitTimer = 0; }
+        pendingEdit = false; pendingShot = null;
+        settingsCache.set(cacheKey(), copy(state.settings)); pause();
+        state = incoming; settingsCache.set(cacheKey(), copy(state.settings));
+        localMessage = ""; acceptResponseState(previousResponseState); sync(); return;
+      }
+      lastHostRevision = Math.max(lastHostRevision, incoming.revision);
+      const editedShotRemoved = pendingEdit && state.shot.shot_uuid
+        && Number(incoming.shot_catalog.generation || 0) > Number(state.shot_catalog.generation || 0)
+        && !(incoming.shot_catalog.shots || []).some(shot =>
+          incoming.shot_catalog.channel_uuid === state.shot.channel_uuid && shot.shot_uuid === state.shot.shot_uuid);
+      if (editedShotRemoved) {
+        // The displayed fallback may already be Only while a debounce still
+        // owns the deleted Shot. Retire that edit before accepting the catalog.
+        if (commitTimer) { win.clearTimeout(commitTimer); commitTimer = 0; }
+        pendingEdit = false; pendingShot = null;
+        settingsCache.set(cacheKey(), copy(state.settings)); pause();
+        state = incoming; settingsCache.set(cacheKey(), copy(state.settings));
+        localMessage = ""; acceptResponseState(previousResponseState); sync(); return;
+      }
       if (pendingShot) {
         const incomingKey = shotKey(incoming);
         if (incomingKey === pendingShot.targetKey) pendingShot = null;

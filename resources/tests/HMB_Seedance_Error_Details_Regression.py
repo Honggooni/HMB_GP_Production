@@ -203,7 +203,14 @@ class ErrorDetailTests(unittest.TestCase):
                 "output_format": "mp4", "return_last_frame": False,
                 "generation_timeout_seconds": 600, "poll_interval_seconds": 5,
             }
-            node._resolve_exact_shot_generation_inputs = lambda params: dict(params)
+            # Transport/retry fixture: retained graph provenance is covered by
+            # the project-source suite; keep operation snapshot guards active.
+            selection = {"schema": target.PROJECT_SELECTION_SCHEMA,
+                         "project": {"project_id": "superwings12", "project_name": "슈퍼윙즈12"}}
+            node._capture_imageasset_project_selection = lambda: deepcopy(selection)
+            node._resolve_exact_shot_generation_inputs = lambda params: {
+                **params, **selection["project"],
+                "_hmb_imageasset_project_selection": deepcopy(selection)}
             node._validate_parameters = lambda params: None
             node._preflight_output_destination = lambda *args: None
             node._prepare_video_references_for_run = lambda params: params

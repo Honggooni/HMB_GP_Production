@@ -3543,10 +3543,16 @@ def _validate_shot_routing_snapshot(
         "ordered_assets",
         "media_by_source_uid",
     }
-    if set(value) != required:
+    if set(value) not in (required, required | {"project_id"}):
         raise _ShotRoutingContractError(
             "Shot routing snapshot has an unknown or missing field."
         )
+    project_fields: Dict[str, str] = {}
+    if "project_id" in value:
+        project_id = value["project_id"]
+        if not isinstance(project_id, str) or len(project_id) > 256 or project_id != project_id.strip():
+            raise _ShotRoutingContractError("Shot routing project identity is invalid.")
+        project_fields["project_id"] = project_id
     if (
         value.get("schema") != SHOT_ROUTING_SNAPSHOT_SCHEMA
         or value.get("version") != SHOT_ROUTING_SNAPSHOT_VERSION
@@ -3686,6 +3692,7 @@ def _validate_shot_routing_snapshot(
         "generation": generation,
         "shots": shots,
         "ordered_assets": ordered_assets,
+        **project_fields,
     }
     if _clean_string(value.get("metadata_sha256")) != _canonical_sha256(
         metadata_contract
@@ -3715,6 +3722,7 @@ def _validate_shot_routing_snapshot(
         "shots": shots,
         "ordered_assets": ordered_assets,
         "media_by_source_uid": media_by_source_uid,
+        **project_fields,
     }
 
 
@@ -4106,7 +4114,7 @@ def _shot_image_payload_from_snapshot(
         "schema": "hmb-image-asset-library-binding",
         "version": 2,
         "mode": "image_asset",
-        "project_id": _clean_string(first_metadata.get("project_id")),
+        "project_id": _clean_string(snapshot.get("project_id", first_metadata.get("project_id"))),
         "project_uid": _clean_string(
             first_metadata.get("project_uid")
             or first_metadata.get("asset_project_uid")
@@ -11912,6 +11920,7 @@ class HMBPromptLibrary(DataNode):
             self._hmb_sync_queued_source_burst = bool(source_burst)
 
         def run_sync() -> None:
+            publish_media = False
             try:
                 with self._hmb_sync_lock:
                     if (
@@ -11933,6 +11942,24 @@ class HMBPromptLibrary(DataNode):
                     else:
                         self._sync_prompt_output_from_state()
             except Exception as exc:
+                if (
+                    isinstance(exc, ValueError)
+                    and (
+                        getattr(exc, "hmb_image_asset_selection_preparing", False) is True
+                        or getattr(exc, "hmb_picker_media_preparing", False) is True
+                    )
+                ):
+                    # The exact media source is verifying this selection
+                    # off-thread. Keep authored state and the previous atomic
+                    # output pair until its dependency publication retries us.
+                    # Explicit process() retains the exception and cannot run
+                    # a paid consumer with the previous selection by accident.
+                    with self._hmb_sync_lock:
+                        if not bool(getattr(self, "_hmb_node_deleted", False)):
+                            self._hmb_sync_publish_shot_media_pending = bool(
+                                self._hmb_sync_publish_shot_media_pending or publish_media
+                            )
+                    return
                 _diagnostic_exception("Deferred PROMPT_OUT synchronization failed", exc)
 
         try:

@@ -94,6 +94,121 @@ class BlenderWorkerRegression(unittest.TestCase):
         self.assertTrue(Path(job["result_path"]).is_file(), run.stdout + run.stderr)
         return job, json.loads(Path(job["result_path"]).read_text(encoding="utf-8")), run
 
+    def _assert_auxiliary_only_capture(self, capture_pass):
+        """A selected pass owns all publication aliases and writes no Mask files."""
+        with tempfile.TemporaryDirectory(prefix="hmb-blender-single-pass-") as temporary:
+            directory = Path(temporary)
+            scene = self._make_scene(directory)
+            source_before = digest(scene)
+            root = directory / "render"
+            markers = [{"group_name": "Cube", "full_dag_path": "|Cube",
+                        "asset_id": "Cube", "color": "Red", "enabled": True}]
+            job, result, process = self._run_job(
+                directory, scene, "render", capture_pass=capture_pass,
+                start_frame=1, end_frame=3, apply_marker_shaders=True,
+                bindings=markers,
+                # Explicit capture_pass must override both enabled legacy flags.
+                generate_depth_playblast=True,
+                depth_frames_folder=str(root / "depth"),
+                depth_sidecar_path=str(root / "depth.json"),
+                depth_output_name="depth_only",
+                generate_motion_guide=True,
+                motion_guide_frames_folder=str(root / "motion"),
+                motion_guide_sidecar_path=str(root / "motion.json"),
+                motion_guide_output_name="motion_only",
+            )
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            self.assertTrue(result["ok"], result.get("error"))
+            self.assertEqual(result["capture_pass"], capture_pass)
+            self.assertEqual(result["frame_count"], 3)
+            self.assertEqual(result["fps"], 24)
+            self.assertEqual(result["camera"], "|Camera")
+            for role in ("color", "depth", "motion_guide"):
+                self.assertEqual(result["artifacts"][role]["requested"], role == capture_pass)
+                self.assertEqual(result["artifacts"][role]["ok"], role == capture_pass)
+            for field in ("frames_folder", "sidecar_path", "output_name", "frame_count", "frame_map"):
+                self.assertEqual(result[field], result[capture_pass + "_" + field])
+            expected_profile = (
+                "hmb_blender_camera_depth_v1" if capture_pass == "depth"
+                else "hmb_blender_motion_guide_v1"
+            )
+            self.assertEqual(result["render_profile"], expected_profile)
+            self.assertEqual(result["render_profile"], result[capture_pass + "_profile"])
+            self.assertFalse(Path(job["frames_folder"]).exists(), "An auxiliary pass rendered a Mask folder")
+            self.assertFalse(Path(job["sidecar_path"]).exists(), "An auxiliary pass published a Mask sidecar")
+            unselected = "motion_guide" if capture_pass == "depth" else "depth"
+            self.assertFalse(Path(job[unselected + "_frames_folder"]).exists())
+            self.assertFalse(Path(job[unselected + "_sidecar_path"]).exists())
+            self.assertNotIn(unselected + "_frame_map", result)
+            self.assertNotIn("[rendering_frames]", process.stdout)
+            self.assertNotIn("[rendering_" + unselected + "]", process.stdout)
+            sidecar = json.loads(Path(result["sidecar_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(sidecar["profile"], expected_profile)
+            self.assertEqual(sidecar["frame_count"], 3)
+            self.assertEqual(sidecar["frame_map"], result["frame_map"])
+            self.assertEqual(sidecar["resolution"], {"width": 96, "height": 64})
+            self.assertEqual([row["blender_frame"] for row in result["frame_map"]], [1, 2, 3])
+            self.assertEqual([row["sequence_index"] for row in result["frame_map"]], [0, 1, 2])
+            files = sorted(Path(result["frames_folder"]).glob("*.png"))
+            self.assertEqual(len(files), 3)
+            self.assertEqual(set(root.rglob("*.png")), set(files), "An unselected pass wrote PNG output")
+            for index, frame in enumerate(files):
+                self.assertEqual(frame.name, result["output_name"] + ".{:06d}.png".format(index))
+                self.assertEqual(result["frame_map"][index]["file"], frame.name)
+                with Image.open(frame) as image:
+                    self.assertEqual(image.size, (96, 64))
+                    self.assertGreater(max(ImageStat.Stat(image.convert("RGB")).stddev), 1)
+            if capture_pass == "depth":
+                self.assertEqual(result["depth_range_report"]["sampled_frame_count"], 3)
+            else:
+                self.assertTrue(result["motion_guide_report"]["motion_detected"])
+            self.assertEqual(digest(scene), source_before)
+
+    def test_depth_only_capture_writes_only_depth_artifacts(self):
+        self._assert_auxiliary_only_capture("depth")
+
+    def test_motion_only_capture_writes_only_motion_artifacts(self):
+        self._assert_auxiliary_only_capture("motion_guide")
+
+    def test_explicit_color_capture_overrides_enabled_auxiliary_flags(self):
+        with tempfile.TemporaryDirectory(prefix="hmb-blender-color-only-") as temporary:
+            directory = Path(temporary)
+            scene = self._make_scene(directory)
+            root = directory / "render"
+            job, result, process = self._run_job(
+                directory, scene, "render", capture_pass="color",
+                apply_marker_shaders=True,
+                bindings=[{"full_dag_path": "|Cube", "color": "Red", "enabled": True}],
+                generate_depth_playblast=True,
+                depth_frames_folder=str(root / "depth"),
+                depth_sidecar_path=str(root / "depth.json"),
+                generate_motion_guide=True,
+                motion_guide_frames_folder=str(root / "motion"),
+                motion_guide_sidecar_path=str(root / "motion.json"),
+            )
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            self.assertTrue(result["ok"], result.get("error"))
+            self.assertEqual(result["render_profile"], "hmb_blender_workbench_flat_markers_v1")
+            self.assertEqual(result["frame_count"], 2)
+            self.assertTrue(Path(job["sidecar_path"]).is_file())
+            self.assertEqual(len(list(Path(job["frames_folder"]).glob("*.png"))), 2)
+            for role in ("depth", "motion_guide"):
+                self.assertFalse(result["artifacts"][role]["requested"])
+                self.assertFalse(result["artifacts"][role]["ok"])
+                self.assertFalse(Path(job[role + "_frames_folder"]).exists())
+                self.assertFalse(Path(job[role + "_sidecar_path"]).exists())
+
+    def test_invalid_capture_pass_fails_before_frame_publication(self):
+        with tempfile.TemporaryDirectory(prefix="hmb-blender-invalid-pass-") as temporary:
+            directory = Path(temporary)
+            scene = self._make_scene(directory)
+            job, result, process = self._run_job(directory, scene, "render", capture_pass="unknown")
+            self.assertNotEqual(process.returncode, 0)
+            self.assertFalse(result["ok"])
+            self.assertIn("Unsupported Blender capture pass", result["error"])
+            self.assertFalse(Path(job["frames_folder"]).exists())
+            self.assertFalse(Path(job["sidecar_path"]).exists())
+
     def test_scan_render_snapshot_and_auxiliary_profiles(self):
         with tempfile.TemporaryDirectory(prefix="hmb-blender-worker-") as temporary:
             directory = Path(temporary)

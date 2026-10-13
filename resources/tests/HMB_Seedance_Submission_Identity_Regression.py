@@ -5,6 +5,7 @@ import asyncio
 import importlib.util
 import io
 import json
+from copy import deepcopy
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -125,7 +126,14 @@ async def verify_bad_create(response):
     item._output_file = SimpleNamespace(build_file=lambda: object(), _default_filename="output.mp4")
     item._get_parameters = lambda: {"resume_generation_id": "", "model_id": target.SEEDANCE_2_0_MODEL_ID, target.TASK_PARAMETER: target.TASK_TEXT_ONLY,
                                     "output_format": "mp4", "return_last_frame": False, "generation_timeout_seconds": 600, "poll_interval_seconds": 5}
-    item._resolve_exact_shot_generation_inputs = lambda params: dict(params)
+    # This malformed-create fixture isolates acceptance/recovery, with an
+    # explicit stable project snapshot and the real snapshot comparison guard.
+    selection = {"schema": target.PROJECT_SELECTION_SCHEMA,
+                 "project": {"project_id": "superwings12", "project_name": "슈퍼윙즈12"}}
+    item._capture_imageasset_project_selection = lambda: deepcopy(selection)
+    item._resolve_exact_shot_generation_inputs = lambda params: {
+        **params, **selection["project"],
+        "_hmb_imageasset_project_selection": deepcopy(selection)}
     item._validate_parameters = lambda params: None
     item._preflight_output_destination = lambda *args: None
     item._build_broker_payload = lambda params: {}

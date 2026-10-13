@@ -219,10 +219,24 @@ try {
   await checkHeightAllocation(minimumWidgetHeight, 430, 'declared minimum / narrow');
   await page.evaluate(() => window.controller.update({value:{...window.state,revision:1010,language:'en',shot:{},source:{}},onChange:value=>window.publications.push(value)}));
   await checkHeightAllocation(minimumWidgetHeight, initialWidth, 'declared minimum after props update');
+  const projectSwitch = await page.evaluate(async () => {
+    const before = window.publications.length;
+    const slider = document.querySelector('[data-adjust="exposure"]');
+    slider.value = '9'; slider.dispatchEvent(new Event('input', { bubbles: true }));
+    window.controller.update({ value: { ...window.state, revision: 1020,
+      project_id: 'isolated-project-B', project: { name: 'Isolated Project B' }, shot: {}, source: {},
+      settings: { precision_version: 2, enabled: true, exposure: .5 } }, onChange: value => window.publications.push(value) });
+    await new Promise(resolve => setTimeout(resolve, 250));
+    return { project: document.querySelector('[data-project]').value,
+      exposure: document.querySelector('[data-adjust="exposure"]').value,
+      latePublications: window.publications.length - before,
+      retainedCanvas: document.querySelector('[data-preview]') === window.originalCanvas };
+  });
+  assert.deepEqual(projectSwitch, { project: 'isolated-project-B', exposure: '2', latePublications: 0, retainedCanvas: true });
   await page.evaluate(() => window.controller.cleanup());
   assert.equal(await page.locator("#widget").innerHTML(), "");
   assert.deepEqual(failures, []);
-  console.log(JSON.stringify({ result: "PASS", initialLayouts, heightAllocations, realWebGL2: true, difference, decodedPlayback: true, seekFrame: 25, capturedExport: true, retainedCanvas: true, shots: true, screenshots: [wideScreenshot, narrowScreenshot] }, null, 2));
+  console.log(JSON.stringify({ result: "PASS", initialLayouts, heightAllocations, projectSwitch, realWebGL2: true, difference, decodedPlayback: true, seekFrame: 25, capturedExport: true, retainedCanvas: true, shots: true, screenshots: [wideScreenshot, narrowScreenshot] }, null, 2));
 } finally {
   await browser?.close();
   await new Promise((resolve) => server.close(resolve));

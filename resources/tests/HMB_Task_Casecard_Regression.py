@@ -97,6 +97,7 @@ def main() -> None:
         assert projected["client_prompt_sha256"] == record["prompt_sha256"]
         assert not any(value in json.dumps(projected) for value in (str(base), "SECRET", "private.invalid", "exact submitted prompt"))
         assert set(projected) == {"schema", "version", "case_id", "input_evidence_sha256", "client_prompt_sha256",
+                                  "project_id", "project_name",
                                   "build", "shot", "settings", "references", "agent_observation"}
         hostile = {**projected, "authorization": "SECRET", "prompt": "overwrite", "broker_server_url": "https://private.invalid",
                    "agent_observation": {"coverage": None, "skips": "https://private.invalid", "groups": {"url": "secret"}}}

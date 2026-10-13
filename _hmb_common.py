@@ -17,6 +17,26 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type
 
+def _load_project_identity_module() -> Any:
+    """Support direct file loading without depending on the caller's sys.path."""
+    path = Path(__file__).resolve().with_name("_hmb_project.py")
+    name = "_hmb_project"
+    existing = sys.modules.get(name)
+    if existing is not None and Path(getattr(existing, "__file__", "")).resolve() == path:
+        return existing
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError("HMB project identity helper is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_project_identity = _load_project_identity_module()
+ProjectPolicyPendingError = _project_identity.ProjectPolicyPendingError
+resolve_project = _project_identity.resolve_project
+
 try:
     from griptape_nodes.exe_types.core_types import Parameter, ParameterGroup, ParameterMode
     from griptape_nodes.exe_types.node_types import DataNode
@@ -67,7 +87,7 @@ except Exception:  # Local validation fallback only.
 
 
 ROOT = Path(__file__).resolve().parent
-_AGENT_POLICY_FILE = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
+_AGENT_POLICY_FILE = ROOT / "resources" / "agent" / "superwings12" / "hmb_agent_core.dat"
 _AGENT_POLICY_MAX_ENVELOPE_BYTES = 128 * 1024
 _AGENT_POLICY_MAX_DECOMPRESSED_BYTES = 512 * 1024
 _AGENT_POLICY_MAX_DPAPI_FILE_BYTES = 64 * 1024
@@ -1045,13 +1065,14 @@ def _agent_policy_path_is_reparse(value: os.stat_result) -> bool:
     )
 
 
-def _read_agent_policy_envelope() -> bytes:
-    """Read the one signed DAT bundled with this installed HMB runtime."""
+def _read_agent_policy_envelope(project_id: Any = None) -> bytes:
+    """Read only the selected known project's installed signed DAT."""
 
     _agent_policy_log_stage("local_dat_read_enter")
-    expected = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
+    project = resolve_project(project_id)
+    expected = ROOT / "resources" / "agent" / project["project_folder"] / "hmb_agent_core.dat"
     try:
-        if not _agent_policy_exact_windows_path(str(_AGENT_POLICY_FILE), expected):
+        if project["project_id"] == "superwings12" and not _agent_policy_exact_windows_path(str(_AGENT_POLICY_FILE), expected):
             raise RuntimeError("HMB Agent policy DAT is unavailable.")
         target = Path(os.path.abspath(str(expected)))
         root = Path(os.path.abspath(str(ROOT)))
@@ -1111,6 +1132,9 @@ def _read_agent_policy_envelope() -> bytes:
     except RuntimeError:
         _agent_policy_log_stage("local_dat_read_failed")
         raise
+    except FileNotFoundError as exc:
+        _agent_policy_log_stage("local_dat_read_failed")
+        raise ProjectPolicyPendingError("Selected project policy has not been supplied.") from exc
     except OSError as exc:
         _agent_policy_log_stage("local_dat_read_failed")
         raise RuntimeError("HMB Agent policy DAT is unavailable.") from exc
@@ -1290,18 +1314,28 @@ def _validate_agent_policy_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _load_verified_agent_rule_payload() -> Dict[str, Any]:
-    """Perform the process's sole bundled DAT read and signature verification."""
+def _load_verified_agent_rule_payload(project_id: Any = None) -> Dict[str, Any]:
+    """Read and verify an exact project artifact without changing its session."""
 
+    project = resolve_project(project_id)
     try:
-        encoded = bytearray(_read_agent_policy_envelope())
+        encoded = bytearray(_read_agent_policy_envelope() if project["project_id"] == "superwings12" else _read_agent_policy_envelope(project["project_id"]))
     except Exception:
         raise
     try:
         _agent_policy_log_stage("policy_verify_enter")
-        validated = _validate_agent_policy_payload(
-            _decode_signed_agent_policy_envelope(encoded)
-        )
+        decoded = _decode_signed_agent_policy_envelope(encoded)
+        signed_project = decoded.get("project_id")
+        # The historical signed artifact belongs exclusively to Super Wings
+        # 12. Every future project DAT must bind its identity inside the signed
+        # payload, so copying another project's DAT never grants that policy.
+        if signed_project in (None, ""):
+            if project["project_id"] != "superwings12":
+                raise RuntimeError("HMB Agent policy project identity is unavailable.")
+        elif resolve_project(signed_project, default_legacy=False)["project_id"] != project["project_id"]:
+            raise RuntimeError("HMB Agent policy project identity does not match.")
+        validated = _validate_agent_policy_payload(decoded)
+        validated["project_id"] = project["project_id"]
         validated["envelope_sha256"] = hashlib.sha256(encoded).hexdigest()
         _agent_policy_log_stage("policy_verified")
         return validated
@@ -1312,18 +1346,21 @@ def _load_verified_agent_rule_payload() -> Dict[str, Any]:
         _wipe_agent_policy_buffer(encoded)
 
 
-def _load_agent_rule_payload() -> Dict[str, Any]:
+def _load_agent_rule_payload(project_id: Any = None) -> Dict[str, Any]:
     """Copy READY state only; Agent execution never performs a policy fetch."""
 
     try:
-        return _agent_process_session.read_ready()
+        project = resolve_project(project_id)
+        if project["project_id"] == "superwings12":
+            return _agent_process_session.read_ready()
+        return _agent_process_session.read_ready(project_id=project["project_id"])
     except Exception as exc:
         raise RuntimeError(
             "HMB_GP_Agent_Library internal rule payload could not be loaded."
         ) from exc
 
 
-def _bootstrap_agent_policy_session() -> None:
+def _bootstrap_agent_policy_session(project_id: Any = None) -> None:
     """Initialize once inside the exact packaged Griptape engine process.
 
     Exact executable, command-line and parent-process provenance is the sole
@@ -1332,7 +1369,8 @@ def _bootstrap_agent_policy_session() -> None:
     """
 
     _agent_policy_log_stage("bootstrap_enter")
-    state = str(_agent_process_session._status_for_regression()[0]).casefold()
+    project = resolve_project(project_id)
+    state = _agent_policy_session_state(project["project_id"]).casefold()
     _agent_policy_log_stage(
         f"bootstrap_state_{state}"
         if state in {"empty", "loading", "ready", "failed", "closed"}
@@ -1342,32 +1380,42 @@ def _bootstrap_agent_policy_session() -> None:
         # Claim EMPTY -> LOADING using exact packaged-process provenance. The
         # bundled DAT read and signature verification then run outside the
         # shared condition so status/READY readers do not freeze during I/O.
-        _agent_process_session.bootstrap_once_authorized(
-            _agent_policy_process_provenance_valid,
-            _load_verified_agent_rule_payload,
-        )
+        if project["project_id"] == "superwings12":
+            _agent_process_session.bootstrap_once_authorized(
+                _agent_policy_process_provenance_valid,
+                _load_verified_agent_rule_payload,
+            )
+        else:
+            _agent_process_session.bootstrap_once_authorized(
+                _agent_policy_process_provenance_valid,
+                lambda: _load_verified_agent_rule_payload(project["project_id"]),
+                project_id=project["project_id"],
+            )
         _agent_policy_log_stage("session_ready")
     except Exception as exc:
         _agent_policy_log_stage("bootstrap_failed")
         raise RuntimeError("HMB Agent policy session bootstrap failed.") from exc
 
 
-def _agent_policy_session_state() -> str:
-    return str(_agent_process_session._status_for_regression()[0]).upper()
+def _agent_policy_session_state(project_id: Any = None) -> str:
+    project = resolve_project(project_id)
+    if project["project_id"] == "superwings12":
+        return str(_agent_process_session._status_for_regression()[0]).upper()
+    return str(_agent_process_session._status_for_regression(project_id=project["project_id"])[0]).upper()
 
 
 def _shutdown_agent_policy_session() -> None:
     _agent_process_session._expire_for_process_shutdown()
 
 
-def _load_verified_behavior_documents() -> tuple[str, str]:
+def _load_verified_behavior_documents(project_id: Any = None) -> tuple[str, str]:
     """Return the two documents from the immutable process-scoped snapshot."""
-    payload = _load_agent_rule_payload()
+    payload = _load_agent_rule_payload(project_id)
     return str(payload["policy"]), str(payload["binding"])
 
 
-def get_internal_policy_identity() -> Dict[str, str]:
-    payload = _load_agent_rule_payload()
+def get_internal_policy_identity(project_id: Any = None) -> Dict[str, str]:
+    payload = _load_agent_rule_payload(project_id)
     return {
         "version": str(payload["final_policy_version"]),
         "contract_sha256": str(payload["policy_pair_sha256"]),

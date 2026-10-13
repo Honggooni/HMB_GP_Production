@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import asyncio
 import base64
 import copy
 import hashlib
@@ -23,6 +24,7 @@ import zlib
 from dataclasses import dataclass
 from contextlib import contextmanager, suppress
 from fractions import Fraction
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import quote, unquote, urlparse
 
@@ -83,6 +85,20 @@ BLENDER_RUNNER = _THIS_DIR / "resources" / "blender" / "HMB_Blender_Background_P
 MARKER_CATALOG_PATH = _THIS_DIR / "resources" / "picker" / "HMB_Marker_Catalog.json"
 WIDGET_NAME = "HMBVideoPickerLibraryWidget"
 WIDGET_LIBRARY_NAME = "HMB_GP_Production"
+
+
+class _HMBPickerMediaPreparing(ValueError):
+    """Retained consumers must wait for verified media, without clearing intent."""
+
+    hmb_picker_media_preparing = True
+
+
+def _picker_running_loop() -> Any:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
 WIDGET_STATE_PARAMETER = "HMB_PICKER_STATE"
 WIDGET_COMMAND_PARAMETER = "HMB_PICKER_COMMAND"
 WIDGET_STATE_EMBEDDED_COMMAND_FIELD = "__hmb_picker_command__"
@@ -135,6 +151,9 @@ WORLD_PATTERN_DENSITY_MULTIPLIER = 3.0
 WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS = (
     WORLD_PATTERN_BASE_CELL_WORLD_UNITS / WORLD_PATTERN_DENSITY_MULTIPLIER
 )
+WORLD_PATTERN_MAX_TEXTURE_REPEAT = 4096.0
+WORLD_PATTERN_MAX_CELL_WORLD_UNITS = 1.0e6
+WORLD_PATTERN_REPEAT_SAFETY_POLICY = "vp2_repeat_safe_cell_v1"
 MAYA_WORLD_PATTERN_PROJECTIONS = {
     "floor_grid": ("Planar", "XZ"),
     "direction_checker": ("TriPlanar", "XYZ"),
@@ -590,7 +609,7 @@ def _validate_world_pattern_runner_confirmation(
         rel_tol=0.0,
         abs_tol=1.0e-9,
     ):
-        errors.append("5-unit effective cell")
+        errors.append("5-unit requested cell")
     try:
         reference_frame = float(report.get("reference_frame"))
     except (TypeError, ValueError):
@@ -601,6 +620,31 @@ def _validate_world_pattern_runner_confirmation(
     if not isinstance(pattern_rows, list):
         pattern_rows = []
         errors.append("pattern rows")
+    has_repeat_safety = bool(report.get("repeat_safety_policy")) or any(
+        isinstance(row, dict) and any(key in row for key in (
+            "repeat_safety_policy", "effective_cell_size_world_units", "adaptive_cell_applied",
+        )) for row in pattern_rows
+    )
+
+    def finite_number(value: Any) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return float("nan")
+        return float(value) if math.isfinite(float(value)) else float("nan")
+
+    def same_number(left: Any, right: Any) -> bool:
+        return math.isclose(finite_number(left), finite_number(right), rel_tol=1.0e-12, abs_tol=1.0e-9)
+
+    if has_repeat_safety:
+        if (
+            report.get("repeat_safety_policy") != WORLD_PATTERN_REPEAT_SAFETY_POLICY
+            or not same_number(report.get("texture_repeat_limit"), WORLD_PATTERN_MAX_TEXTURE_REPEAT)
+            or not same_number(report.get("requested_cell_size_world_units"), WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS)
+        ):
+            errors.append("repeat safety policy")
+        sidecar_report = sidecar_payload.get("world_pattern_report")
+        if isinstance(sidecar_report, dict) and sidecar_report != report:
+            errors.append("repeat safety result/sidecar agreement")
+    adaptive_count = 0
     for row in pattern_rows:
         if not isinstance(row, dict):
             errors.append("pattern row schema")
@@ -613,6 +657,43 @@ def _validate_world_pattern_runner_confirmation(
         )
         if expected is None or actual != expected:
             errors.append(f"{pattern or '<blank>'} projection mapping")
+        if has_repeat_safety:
+            requested_cell = finite_number(row.get("requested_cell_size_world_units"))
+            effective_cell = finite_number(row.get("effective_cell_size_world_units"))
+            requested_repeats = row.get("requested_repeat_count")
+            baked_repeats = row.get("baked_repeat_count")
+            extents = row.get("projector_extent_world_units")
+            if (
+                row.get("repeat_safety_policy") != WORLD_PATTERN_REPEAT_SAFETY_POLICY
+                or not same_number(row.get("texture_repeat_limit"), WORLD_PATTERN_MAX_TEXTURE_REPEAT)
+                or not same_number(requested_cell, WORLD_PATTERN_DEFAULT_CELL_WORLD_UNITS)
+                or not requested_cell <= effective_cell <= WORLD_PATTERN_MAX_CELL_WORLD_UNITS
+                or not same_number(row.get("cell_size_world_units"), effective_cell)
+                or not same_number(row.get("cell_scale_factor"), effective_cell / requested_cell if requested_cell > 0 else float("nan"))
+                or not isinstance(row.get("adaptive_cell_applied"), bool)
+            ):
+                errors.append(f"{pattern or '<blank>'} effective cell")
+            repeat_vectors = ((requested_repeats, 2), (baked_repeats, 2), (extents, 3))
+            if any(not isinstance(values, list) or len(values) != count
+                   or any(not finite_number(value) > 0 for value in values)
+                   for values, count in repeat_vectors):
+                errors.append(f"{pattern or '<blank>'} repeat geometry")
+            elif requested_cell > 0 and effective_cell > 0:
+                texture_extents = extents[:2]
+                if actual[0] == "TriPlanar" and not all(same_number(value, extents[0]) for value in extents):
+                    errors.append(f"{pattern or '<blank>'} triplanar extent")
+                expected_requested = [max(value / requested_cell, 1.0) for value in texture_extents]
+                expected_baked = [max(value / effective_cell, 1.0) for value in texture_extents]
+                adapted = max(expected_requested) > WORLD_PATTERN_MAX_TEXTURE_REPEAT
+                expected_effective = (math.nextafter(max(texture_extents) / WORLD_PATTERN_MAX_TEXTURE_REPEAT, math.inf)
+                                      if adapted else requested_cell)
+                if (not all(same_number(value, wanted) for value, wanted in zip(requested_repeats, expected_requested))
+                        or not all(same_number(value, wanted) for value, wanted in zip(baked_repeats, expected_baked))
+                        or any(value > WORLD_PATTERN_MAX_TEXTURE_REPEAT for value in baked_repeats)
+                        or not same_number(effective_cell, expected_effective)
+                        or row.get("adaptive_cell_applied") is not adapted):
+                    errors.append(f"{pattern or '<blank>'} safe repeat/cell agreement")
+            adaptive_count += int(row.get("adaptive_cell_applied") is True)
         if row.get("camera_anchored") is not False:
             errors.append(f"{pattern or '<blank>'} camera independence")
         if row.get("uv_dependent") is not False:
@@ -643,6 +724,10 @@ def _validate_world_pattern_runner_confirmation(
             if not _clean(row.get(node_field)):
                 errors.append(f"{pattern or '<blank>'} {node_field}")
     pattern_count = len(pattern_rows)
+    if has_repeat_safety and (isinstance(report.get("adaptive_binding_count"), bool)
+                             or not isinstance(report.get("adaptive_binding_count"), int)
+                             or report.get("adaptive_binding_count") != adaptive_count):
+        errors.append("adaptive pattern binding count")
     if int(report.get("pattern_binding_count") or 0) != pattern_count:
         errors.append("pattern binding count")
     if int(report.get("projection_node_count") or 0) != pattern_count:
@@ -1043,6 +1128,7 @@ def _validate_depth_companion_inputs(
     expected_end_frame: float,
     expected_width: int,
     expected_height: int,
+    standalone: bool = False,
 ) -> Dict[str, Any]:
     """Validate paired Maya shader Depth and diagnose its visible tone detail.
 
@@ -1868,7 +1954,7 @@ def _validate_depth_companion_inputs(
         )
 
     if (
-        len(color_frame_paths) != expected_frame_count
+        (not standalone and len(color_frame_paths) != expected_frame_count)
         or len(depth_frame_paths) != expected_frame_count
     ):
         raise RuntimeError("Color/Depth frame path counts do not match the paired run.")
@@ -1877,7 +1963,7 @@ def _validate_depth_companion_inputs(
     )
     expected_size = (int(expected_width), int(expected_height))
     for label, paths in (
-        ("Color", color_frame_paths),
+        ("Color", () if standalone else color_frame_paths),
         ("Depth", depth_frame_paths),
     ):
         for index, frame_path in enumerate(paths):
@@ -10716,6 +10802,25 @@ def _safe_scene_name(value: str) -> str:
     return text or "scene"
 
 
+def _picker_diagnostic_path(scene_path: Path, operation: str, token: str = "") -> Path:
+    """Keep Picker diagnostics local, outside production scene/media folders.
+
+    The public last_log_path/log_folder fields remain compatible. Diagnostics
+    use .txt; no Picker operation creates a .log file in a project folder.
+    Each operation has its own file so concurrent requests never truncate one
+    another's stdout, failure details or encoder diagnostics.
+    """
+    local_root = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+    scene_key = hashlib.sha256(
+        str(scene_path).replace("\\", "/").casefold().encode("utf-8")
+    ).hexdigest()[:12]
+    folder = (local_root / "HMB_GP_Production" / "Diagnostics" / "VideoPicker"
+              / f"{_safe_scene_name(scene_path.stem)[:60]}_{scene_key}")
+    folder.mkdir(parents=True, exist_ok=True)
+    request_key = _safe_scene_name(token)[:40] if token else uuid.uuid4().hex[:12]
+    return folder / f"{_safe_scene_name(operation)[:40]}_{request_key}.txt"
+
+
 def _is_reparse_or_symlink(path: Path) -> bool:
     """Return True for symlinks and Windows junction/reparse entries."""
     try:
@@ -11927,6 +12032,32 @@ def _terminate_process(process: subprocess.Popen[Any]) -> None:
         _diagnostic_exception(f"Process wait after termination failed for PID {getattr(process, 'pid', 0)}", exc)
 
 
+class _MayaNativeCaptureError(RuntimeError):
+    def __init__(self, message: str, error_code: str = "", report: Any = None) -> None:
+        super().__init__(message)
+        self.error_code = _clean(error_code)
+        self.smooth_geometry_budget_report = copy.deepcopy(report) if isinstance(report, dict) else {}
+
+
+def _maya_native_crash(return_code: Optional[int]) -> bool:
+    if return_code is None:
+        return False
+    if os.name == "nt":
+        return (int(return_code) & 0xFFFFFFFF) in {
+            0xC0000005, 0xC000001D, 0xC0000094, 0xC0000096,
+            0xC00000FD, 0xC0000374, 0xC0000409,
+        }
+    return int(return_code) in {-4, -6, -7, -8, -11}
+
+
+def _maya_native_result_error(result: Dict[str, Any], fallback: str) -> _MayaNativeCaptureError:
+    return _MayaNativeCaptureError(
+        _clean(result.get("error")) or fallback,
+        _clean(result.get("error_code")),
+        result.get("smooth_geometry_budget_report"),
+    )
+
+
 class _MayaCaptureFlight:
     def __init__(self, key: str, producer: Any) -> None:
         self.key, self.producer = key, producer
@@ -12013,8 +12144,11 @@ class _MayaCaptureCoordinator:
                 except BaseException as exc:
                     # Keep the reason/stale category, not the producer traceback
                     # which contains its first node and detached watchdog.
-                    error_type = _StaleOperationError if isinstance(exc, _StaleOperationError) else RuntimeError
-                    flight.error = error_type(str(exc))
+                    if isinstance(exc, _MayaNativeCaptureError):
+                        flight.error = _MayaNativeCaptureError(str(exc), exc.error_code, exc.smooth_geometry_budget_report)
+                    else:
+                        error_type = _StaleOperationError if isinstance(exc, _StaleOperationError) else RuntimeError
+                        flight.error = error_type(str(exc))
                 finally:
                     with self.lock:
                         self.active -= 1
@@ -12138,15 +12272,60 @@ def _progress_signature(payload: Dict[str, Any]) -> str:
         return repr(payload)
 
 
+@lru_cache(maxsize=1)
+def _windows_process_cpu_query():
+    """Bind the read-only Windows API once; unavailable hosts keep file progress."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        library = ctypes.WinDLL("kernel32", use_last_error=True)
+        query = library.GetProcessTimes
+        query.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        query.restype = wintypes.BOOL
+        return ctypes, wintypes, query
+    except (AttributeError, ImportError, OSError):
+        return None
+
+
+def _process_cpu_seconds(process: Any) -> Optional[float]:
+    """Read cumulative CPU from this Popen handle without opening another process.
+
+    This is liveness evidence, not completed rendering progress. The watchdog's
+    overall deadline still bounds a process that is busy without useful output.
+    """
+    handle = getattr(process, "_handle", None)
+    if handle is None:
+        return None
+    binding = _windows_process_cpu_query()
+    if binding is None:
+        return None
+    ctypes, wintypes, query = binding
+    try:
+        creation, exit_time, kernel, user = (wintypes.FILETIME() for _index in range(4))
+        if not query(int(handle), *(ctypes.byref(item) for item in (creation, exit_time, kernel, user))):
+            return None
+        ticks = sum((int(item.dwHighDateTime) << 32) + int(item.dwLowDateTime)
+                    for item in (kernel, user))
+        return ticks / 10_000_000.0
+    except (AttributeError, OSError, TypeError, ValueError):
+        # A process can exit/close its handle between poll() and this best-effort
+        # sample. Failed reads must never keep it alive or break cancellation.
+        return None
+
+
 def _filesystem_activity_snapshot(paths: Sequence[Path]) -> tuple[str, int, int]:
-    """Summarize completed files directly beneath operation output folders.
+    """Summarize output files and logs for actual external-process activity.
 
     Maya moves every completed frame into the top-level frames folder. Direct
     child names/counts/sizes/mtimes are reliable on Windows even when the parent
     directory mtime is not. The watchdog calls this fallback only after primary
     JSON/console progress has been quiet for a substantial part of the stall
     window, so the normal per-frame JSON path never repeatedly scans a growing
-    image sequence.
+    image sequence. A directly watched console log also counts: isolated Maya
+    and Blender redirect stdout to a file instead of supplying a console queue.
     """
     records: List[tuple[str, str, int, int]] = []
     file_count = 0
@@ -12758,6 +12937,7 @@ def _original_preview_cache_fields(scene_path: Path, state: Dict[str, Any]) -> D
         "encoding_profile": PROXY_ENCODING_PROFILE,
         "viewport_quality_profile": ORIGINAL_VIEWPORT_QUALITY_PROFILE,
         "original_material_override_profile": ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
+        "original_material_pass_source": "AIPicker_SET",
         "mouth_card_inner_patch_policy": MOUTH_CARD_INNER_PATCH_POLICY,
         "dependency_manifest_version": ORIGINAL_DEPENDENCY_MANIFEST_VERSION,
         "scene_dependency_complete": bool(dependency_summary["complete"]),
@@ -12879,13 +13059,15 @@ def _original_eye_fallback_report_is_valid(
 
 
 def _original_material_report_is_valid(report: Any) -> bool:
-    """Accept a restored neutral body pass with usable eye shaders.
+    """Accept a restored neutral body pass with usable AIPicker_SET materials.
 
     The versioned profile invalidates gray-eye and pre-fallback caches. Authored
     eyes remain intact when usable; unavailable plug-ins need a verified native
     eye fallback, followed by exact original connection and assignment restore.
     """
     source = report if isinstance(report, dict) else {}
+    if _clean(source.get("material_pass_source")) != "AIPicker_SET":
+        return False
     count_keys = (
         "inspected_shading_engine_count",
         "contributing_shading_engine_count",
@@ -13031,6 +13213,8 @@ def _original_preview_cache_is_valid(
             != expected["original_material_override_profile"]
         ):
             return False
+        if _clean(metadata.get("original_material_pass_source")) != expected["original_material_pass_source"]:
+            return False
         if (
             _clean(metadata.get("assignment_mode"))
             != ORIGINAL_LAMBERT_ASSIGNMENT_MODE
@@ -13113,6 +13297,7 @@ def _original_view_metadata(metadata: Any) -> Dict[str, Any]:
         "original_material_override_profile": _clean(
             source.get("original_material_override_profile")
         ),
+        "original_material_pass_source": _clean(source.get("original_material_pass_source")),
         "original_material_override_report": (
             dict(source.get("original_material_override_report"))
             if isinstance(source.get("original_material_override_report"), dict)
@@ -14309,6 +14494,74 @@ class HMBVideoPickerLibrary(DataNode):
             with state_lock:
                 yield
 
+    def _record_operation_routing_invalidation(
+        self, state: Dict[str, Any], context: _OperationContext,
+    ) -> None:
+        """Keep one precise, local diagnostic for a captured target change."""
+        previous = getattr(self, "_hmb_last_routing_invalidation", None)
+        if not isinstance(previous, dict) or previous.get("operation_id") != context.operation_id:
+            target = next((
+                row for row in state.get("picker_shots", [])
+                if isinstance(row, dict)
+                and _uuid_text(row.get("workspace_uuid")) == context.picker_shot_uuid
+            ), None)
+            current_bound = _uuid_text(target.get("bound_shot_uuid")) if target is not None else ""
+            current_channel = _uuid_text(state.get("channel_uuid"))
+            current_active = _uuid_text(state.get("active_picker_shot_uuid"))
+            changes = []
+            if target is None:
+                changes.append("captured workspace removed")
+            elif current_bound != context.target_bound_shot_uuid:
+                changes.append("Shot binding changed")
+            if current_channel != context.target_channel_uuid:
+                changes.append("channel changed")
+            reason = (
+                f"Pending {context.kind} result discarded: {', '.join(changes)}. "
+                f"Captured workspace={context.picker_shot_uuid or '<none>'}, "
+                f"bound={context.target_bound_shot_uuid or '<unbound>'}, "
+                f"channel={context.target_channel_uuid or '<unbound>'}. "
+                f"Current active workspace={current_active or '<none>'}, "
+                f"captured workspace={'present' if target is not None else 'absent'}, "
+                f"bound={current_bound or '<unbound>'}, channel={current_channel or '<unbound>'}."
+            )
+            previous = {"operation_id": context.operation_id, "reason": reason, "log_path": ""}
+            # Reserve the first observation before best-effort logging. A full
+            # disk or later terminal write must not repeat the warning or let a
+            # diagnostic failure interfere with cancellation.
+            self._hmb_last_routing_invalidation = previous
+            _append_activity_log(state, "WARNING", reason)
+            evidence = {
+                "operation_id": context.operation_id, "kind": context.kind,
+                "scene_path": context.scene_path, "changes": changes,
+                "captured": {
+                    "workspace_uuid": context.picker_shot_uuid,
+                    "bound_shot_uuid": context.target_bound_shot_uuid,
+                    "channel_uuid": context.target_channel_uuid,
+                    "state_revision": context.accepted_state_revision,
+                },
+                "current": {
+                    "active_workspace_uuid": current_active,
+                    "captured_workspace_present": target is not None,
+                    "bound_shot_uuid": current_bound, "channel_uuid": current_channel,
+                    "state_revision": int(state.get("state_revision") or 0),
+                },
+            }
+            try:
+                log_path = _picker_diagnostic_path(
+                    Path(context.scene_path), "maya_invalidation", context.operation_id,
+                )
+                _append_full_diagnostic_log(
+                    log_path, "HMB CAPTURED SHOT INVALIDATION",
+                    json.dumps(evidence, ensure_ascii=False, indent=2),
+                )
+                previous["log_path"] = str(log_path).replace("\\", "/")
+            except Exception as exc:
+                _diagnostic_exception("captured Shot invalidation diagnostic failed", exc)
+        state["operation_invalidation_reason"] = previous["reason"]
+        if previous.get("log_path"):
+            state["last_log_path"] = previous["log_path"]
+            state["log_folder"] = str(Path(previous["log_path"]).parent).replace("\\", "/")
+
     def _write_state(self, state: Dict[str, Any]) -> None:
         """Publish one serialized state snapshot.
 
@@ -14400,7 +14653,7 @@ class HMBVideoPickerLibrary(DataNode):
                     # result may be republished into a replacement workspace.
                     self._hmb_cancel_requested.set()
                     normalized["operation_invalidated"] = True
-                    normalized["operation_invalidation_reason"] = "The captured Picker Shot was deleted or rebound. The pending Maya result is discarded."
+                    self._record_operation_routing_invalidation(normalized, active_context)
             logged_messages = {
                 _clean(entry.get("message"))
                 for entry in _normalize_activity_log(
@@ -15815,7 +16068,22 @@ class HMBVideoPickerLibrary(DataNode):
                 None,
             )
             if not isinstance(probe_cache, dict):
-                probe_cache = {}
+                loop = _picker_running_loop()
+                if validate_media and loop is not None:
+                    self._hmb_output_owner_loop = loop
+                    state = state_snapshot if isinstance(state_snapshot, dict) else self._picker_state()
+                    identity = self._execution_media_identity(state)
+                    prepared = getattr(self, "_hmb_verified_media", None)
+                    if isinstance(prepared, tuple) and prepared[0] == identity:
+                        probe_cache = dict(prepared[1])
+                        # The cache and snapshot must use the very same read;
+                        # a concurrent UI worker may replace state after this.
+                        state_snapshot = state
+                    else:
+                        self._schedule_video_removal_output_sync()
+                        raise _HMBPickerMediaPreparing("VideoPicker media is still preparing; keep the current Shot selection.")
+                else:
+                    probe_cache = {}
         with lock:
             return self._hmb_shot_routing_snapshot_locked(
                 expected_channel_uuid,
@@ -16071,6 +16339,17 @@ class HMBVideoPickerLibrary(DataNode):
     ) -> str:
         if getattr(self, "_hmb_node_deleted", False):
             return ""
+        # UI/routing callbacks run on the retained event loop too. They must
+        # never wait for a network drive while holding the publication lock.
+        if _prepared_publication is None and enforce_media_availability:
+            sync_local = _state_sync_local(self)
+            if bool(getattr(sync_local, "defer_execution_outputs", False)):
+                return ""
+            loop = _picker_running_loop()
+            if loop is not None:
+                self._hmb_output_owner_loop = loop
+                self._schedule_video_removal_output_sync()
+                return ""
         # Serialize sibling output staging/notification. Lifecycle invalidation
         # never waits for this lock; generation checks make deletion win.
         with self._hmb_state_write_lock:
@@ -16092,6 +16371,12 @@ class HMBVideoPickerLibrary(DataNode):
             if _prepared_publication is not None:
                 payload, media_values, shot_envelope = _prepared_publication
             else:
+                identity_reader = getattr(self, "_execution_media_identity", None)
+                verified_identity = identity_reader(state) if callable(identity_reader) else ""
+                if enforce_media_availability and verified_identity:
+                    # A failed fresh sync verification must invalidate an older
+                    # success even when the authored path itself is unchanged.
+                    self._hmb_verified_media = None
                 probe_cache: Dict[str, Optional[Path]] = {}
                 sync_local = _state_sync_local(self)
                 previous_probe_cache = getattr(sync_local, "media_probe_cache", None)
@@ -16118,6 +16403,15 @@ class HMBVideoPickerLibrary(DataNode):
                             pass
                     else:
                         sync_local.media_probe_cache = previous_probe_cache
+                # Legacy synchronous callbacks/CLI runs also perform complete
+                # verification. Retain that exact result for their subsequent
+                # async Prompt/Generator read, before notifying those edges.
+                if (enforce_media_availability and verified_identity
+                    and int(shot_envelope.get("generation") or 0) > 0
+                    and still_owned()
+                    and verified_identity == identity_reader(state)
+                    and verified_identity == identity_reader(self._picker_state())):
+                    self._hmb_verified_media = (verified_identity, dict(probe_cache))
             if not still_owned():
                 return ""
             text = _json_text(payload)
@@ -16495,6 +16789,7 @@ class HMBVideoPickerLibrary(DataNode):
         if active is None or active.operation_id != context.operation_id:
             return
         state = self._picker_state()
+        reason = _clean(state.get("operation_invalidation_reason")) or reason
         state = self._mark_operation_finished(state)
         if context.kind == "render_original_preview":
             ready_stage = "VIDEO_READY" if state.get("videos") else "OUTLINER_READY"
@@ -16897,6 +17192,8 @@ class HMBVideoPickerLibrary(DataNode):
         source_engine_label = "Blender" if _picker_scene_engine(context.scene_path) == "blender" else "Maya"
         incoming = self._mark_operation_started(incoming, action)
         incoming.update({
+            "native_error_code": "",
+            "native_error_report": {},
             "operation_id": context.operation_id,
             "operation_input_digest": context.input_digest,
             "operation_scene_fingerprint": context.scene_fingerprint,
@@ -17031,245 +17328,122 @@ class HMBVideoPickerLibrary(DataNode):
                     "depth_enabled": "depth" in context.selected_roles,
                     "motion_guide_enabled": "motion_guide" in context.selected_roles,
                 }
-                generated_by_role: Dict[str, Dict[str, Any]] = {}
-                original_cache_state: Dict[str, Any] = {}
+                completed_roles: List[str] = []
                 generation_warnings: List[str] = []
-                if "original" in selected_roles:
+                mask_uid = ""
+                for role in selected_roles:
+                    self._assert_operation_current(context, f"{role} generation start")
                     try:
-                        if blender_scene:
-                            self._blender_render_original_preview_mode(
-                                scene_text, context=context, publish_public=False,
+                        if role == "original":
+                            producer = (self._blender_render_original_preview_mode
+                                        if blender_scene else self._render_original_preview_mode)
+                            producer(scene_text, context=context, publish_public=False)
+                            original_state = _snapshot_original_preview_asset(
+                                _norm_path(scene_text), self._picker_state(),
                             )
+                            generated_item = _original_video_item_from_state(original_state)
                         else:
-                            self._render_original_preview_mode(
-                                scene_text, context=context, publish_public=False,
+                            producer = self._blender_mode if blender_scene else self._maya_mode
+                            produced = producer(
+                                scene_text, context.video_slot, context=context,
+                                publish_public=False, selected_role=role,
                             )
-                        original_state = self._picker_state()
-                        original_state = _snapshot_original_preview_asset(
-                            _norm_path(scene_text),
-                            original_state,
-                        )
-                        original_cache_state = {
-                            "original_video_path": _clean(
-                                original_state.get("original_video_path")
-                            ),
-                            "original_video_url": _clean(
-                                original_state.get("original_video_url")
-                            ),
-                            "original_metadata": dict(
-                                original_state.get("original_metadata") or {}
-                            ),
-                        }
-                        generated_by_role["original"] = (
-                            _original_video_item_from_state(original_state)
-                        )
+                            generated_item = produced.get("generated_item")
+                        stage = self._picker_state()
+                        stage.update(accepted_generation_flags)
+                        self._write_state(stage)
+                        self._assert_operation_current(context, f"{role} generation completion")
+                        if not isinstance(generated_item, dict) or not _clean(generated_item.get("video_path")):
+                            raise RuntimeError(f"{role.title()} did not produce a validated video.")
+                        # Publish exactly one immutable asset against the newest
+                        # catalog, before the next renderer can start. Never
+                        # replace the click-time catalog over user edits.
+                        with self._hmb_catalog_state_commit():
+                            self._assert_operation_current(context, f"{role} catalog publication")
+                            current = self._picker_state()
+                            current.update(accepted_generation_flags)
+                            previous_row = next((row for row in current.get("picker_shots", [])
+                                                 if _uuid_text(row.get("workspace_uuid")) == context.picker_shot_uuid), {})
+                            previous_preview = _clean(previous_row.get("preview_video_uid"))
+                            if role == "original":
+                                for field in ("original_video_path", "original_video_url", "original_metadata"):
+                                    current[field] = copy.deepcopy(original_state.get(field))
+                            current = _append_selected_generation_videos(
+                                current, {role: generated_item}, selected_roles=(role,),
+                                picker_shot_uuid=context.picker_shot_uuid,
+                            )
+                            published_item = current["videos"][-1]
+                            if role == "mask":
+                                mask_uid = _clean(published_item.get("video_uid"))
+                            elif role in {"depth", "motion_guide"} and mask_uid:
+                                published_item["companion_video_uid"] = mask_uid
+                                published_item["source_video_uid"] = mask_uid
+                            if completed_roles and previous_preview:
+                                for row in current.get("picker_shots", []):
+                                    if (_uuid_text(row.get("workspace_uuid")) == context.picker_shot_uuid
+                                            and previous_preview in row.get("video_asset_uids", [])):
+                                        row["preview_video_uid"] = previous_preview
+                                        selected = row.get("selected_video_uids", [])
+                                        row["selected_video_slot"] = selected.index(previous_preview) + 1 if previous_preview in selected else 1
+                                        if _uuid_text(current.get("active_picker_shot_uuid")) == context.picker_shot_uuid:
+                                            current["preview_video_uid"] = previous_preview
+                                            current["selected_video_uid"] = previous_preview
+                                            current["selected_video_slot"] = row["selected_video_slot"]
+                                current = self._apply_selected_view_fields(_parse_state(current))
+                            completed_roles.append(role)
+                            current.update({
+                                "status": "RUNNING", "scene_stage": "RUNNING",
+                                "original_preview_enabled": False,
+                                "generation_output_roles": list(completed_roles),
+                                "message": f"{role.replace('_', ' ').title()} added to the Picker Loader. Continuing checked outputs.",
+                            })
+                            _append_activity_log(current, "SUCCESS", current["message"])
+                            self._write_state(current)
+                            self._sync_outputs_from_state(current)
                     except _StaleOperationError:
                         raise
                     except Exception as exc:
-                        detail = _clean(exc) or exc.__class__.__name__
-                        raise RuntimeError(
-                            "Selected Original failed, so Generate Playblast did "
-                            "not publish a partial Mask/Depth/Motion result. "
-                            f"{detail}"
-                        ) from exc
-                if any(
-                    role in selected_roles
-                    for role in ("mask", "depth", "motion_guide")
-                ):
-                    accepted_stage_state = self._picker_state()
-                    accepted_stage_state.update(accepted_generation_flags)
-                    self._write_state(accepted_stage_state)
-                    core_generation_succeeded = False
-                    core_result: Dict[str, Any] = {}
-                    try:
-                        if blender_scene:
-                            core_result = self._blender_mode(
-                                scene_text, context.video_slot,
-                                context=context, publish_public=False,
-                            )
-                        else:
-                            self._prepare_run_state(
-                                scene_text,
-                                context.video_slot,
-                                context=context,
-                                publish_public=False,
-                            )
-                            core_result = self._maya_mode(
-                                scene_text,
-                                context.video_slot,
-                                context=context,
-                                publish_public=False,
-                            )
-                        core_generation_succeeded = True
-                    except _StaleOperationError:
-                        raise
-                    except Exception as exc:
-                        if not generated_by_role or self._hmb_cancel_requested.is_set():
+                        # STOP and authoring/Shot changes end the whole request;
+                        # an ordinary role failure only ends that role.
+                        self._assert_operation_current(context, f"{role} generation failure")
+                        if self._hmb_cancel_requested.is_set():
                             raise
-                        partial_state = self._picker_state()
-                        warning = (
-                            "Mask/Depth/Motion generation failed; preserving the "
-                            f"validated Original output. {_clean(exc) or exc.__class__.__name__}"
-                        )
-                        merged_warnings = [
-                            _clean(item)
-                            for item in partial_state.get("warnings", [])
-                            if _clean(item)
-                        ]
-                        if warning not in merged_warnings:
-                            merged_warnings.append(warning)
-                        if warning not in generation_warnings:
-                            generation_warnings.append(warning)
-                        partial_state["warnings"] = merged_warnings[-20:]
-                        _append_activity_log(partial_state, "WARNING", warning)
-                        self._write_state(partial_state)
-                    generated_state = self._picker_state()
-                    if blender_scene and core_generation_succeeded:
-                        for role in ("mask", "depth", "motion_guide"):
-                            if role not in selected_roles:
-                                continue
-                            generated_by_role[role] = _blender_generated_item_for_result(
-                                generated_state.get("videos", []),
-                                role,
-                                core_result,
-                                context.picker_shot_uuid,
-                            )
-                    elif not blender_scene:
-                        mask_item = next(
-                            (
-                                dict(item)
-                                for item in reversed(generated_state.get("videos", []))
-                                if isinstance(item, dict)
-                                and _clean(item.get("generation_role")) == "mask"
-                            ),
-                            {},
-                        )
-                        if core_generation_succeeded and mask_item:
-                            generated_by_role["mask"] = mask_item
-                        depth_item = next(
-                            (
-                                dict(item)
-                                for item in reversed(generated_state.get("videos", []))
-                                if isinstance(item, dict)
-                                and _is_generated_depth_video_item(item)
-                            ),
-                            {},
-                        )
-                        if (
-                            core_generation_succeeded
-                            and bool(core_result.get("depth_succeeded"))
-                            and depth_item
-                        ):
-                            generated_by_role["depth"] = depth_item
-                        motion_item = next(
-                            (
-                                dict(item)
-                                for item in reversed(generated_state.get("videos", []))
-                                if isinstance(item, dict)
-                                and _is_generated_motion_guide_video_item(item)
-                            ),
-                            {},
-                        )
-                        if (
-                            core_generation_succeeded
-                            and bool(core_result.get("motion_guide_succeeded"))
-                            and motion_item
-                        ):
-                            generated_by_role["motion_guide"] = motion_item
-
-                final_base_state = self._picker_state()
-                final_base_state.update(accepted_generation_flags)
-                if original_cache_state:
-                    final_base_state.update(original_cache_state)
-                final_base_warnings = [
-                    _clean(item)
-                    for item in final_base_state.get("warnings", [])
-                    if _clean(item)
-                ]
-                for warning in generation_warnings:
-                    if warning not in final_base_warnings:
-                        final_base_warnings.append(warning)
-                final_base_state["warnings"] = final_base_warnings[-20:]
-                terminal_provisional_uids = [
-                    _clean(source.get("video_uid") or source.get("source_uid"))
-                    for source in generated_by_role.values()
-                    if isinstance(source, dict)
-                    and _clean(
-                        source.get("video_uid") or source.get("source_uid")
-                    )
-                ]
-                generation_base_state = _remove_video_asset_uids(
-                    final_base_state,
-                    terminal_provisional_uids,
-                )
-                generation_base_uids = {
-                    _clean(item.get("video_uid") or item.get("source_uid"))
-                    for item in generation_base_state.get("videos", [])
-                    if isinstance(item, dict)
-                    and _clean(
-                        item.get("video_uid") or item.get("source_uid")
-                    )
-                }
-                final_state = _append_selected_generation_videos(
-                    final_base_state,
-                    generated_by_role,
-                    selected_roles=context.selected_roles,
-                    picker_shot_uuid=context.picker_shot_uuid,
-                )
-                # Appended Generate results use the catalog viewer. The legacy
-                # preview flag would otherwise force Original over the selected
-                # Mask/Depth/Motion history card.
+                        warning = (f"Selected {role.replace('_', ' ').title()} failed; "
+                                   f"completed outputs were preserved. {_clean(exc) or exc.__class__.__name__}")
+                        generation_warnings.append(warning)
+                        current = self._picker_state()
+                        if isinstance(exc, _MayaNativeCaptureError):
+                            current["native_error_code"] = exc.error_code
+                            current["native_error_report"] = copy.deepcopy(exc.smooth_geometry_budget_report)
+                        warnings = _normalize_ui_warnings(current.get("warnings"))
+                        current["warnings"] = [*warnings, warning][-20:]
+                        current.update(status="RUNNING", scene_stage="RUNNING", message=warning)
+                        _append_activity_log(current, "ERROR", warning)
+                        self._write_state(current)
+                self._assert_operation_current(context, "Generate completion")
+                final_state = self._picker_state()
+                final_state.update(accepted_generation_flags)
+                warnings = _normalize_ui_warnings(final_state.get("warnings"))
+                final_state["warnings"] = list(dict.fromkeys([*warnings, *generation_warnings]))[-20:]
+                final_state["generation_output_roles"] = completed_roles
                 final_state["original_preview_enabled"] = False
-                new_generation_items = [
-                    item
-                    for item in final_state.get("videos", [])
-                    if isinstance(item, dict)
-                    and _clean(
-                        item.get("video_uid") or item.get("source_uid")
-                    ) not in generation_base_uids
-                    and _clean(item.get("generation_role"))
-                    in set(context.selected_roles)
-                ]
-                terminal_generation_records = [
-                    copy.deepcopy(item) for item in new_generation_items
-                ]
-                actual_roles = [
-                    _clean(item.get("generation_role"))
-                    for item in new_generation_items
-                ]
-                final_state["generation_output_roles"] = actual_roles
-                final_state["status"] = (
-                    "VIDEO_READY" if final_state.get("videos") else "OUTLINER_READY"
-                )
+                final_state["status"] = ("VIDEO_READY" if completed_roles else "FAILED")
                 final_state["scene_stage"] = final_state["status"]
-                if new_generation_items:
-                    final_state["message"] = (
-                        "Generate Playblast appended to video history: "
-                        + ", ".join(
-                            _clean(item.get("generation_role"))
-                            .replace("_", " ")
-                            .title()
-                            for item in new_generation_items
-                        )
-                        + "."
-                    )
-                else:
-                    final_state["message"] = (
-                        "Generate Playblast completed without a validated video. "
-                        "See Activity Log."
+                final_state["message"] = (
+                    "Generate Playblast added to the Picker Loader: "
+                    + ", ".join(role.replace("_", " ").title() for role in completed_roles) + "."
+                    if completed_roles else
+                    "Generate Playblast completed without a validated video. See Activity Log."
+                )
+                if generation_warnings:
+                    final_state["message"] += (
+                        f" ERROR: {len(generation_warnings)} selected output(s) failed. "
+                        + " | ".join(generation_warnings)
                     )
                 final_state["snapshot_request_video_uid"] = ""
-                final_state = _apply_active_snapshot_projection(
-                    final_state,
-                    viewport_mode="video",
-                )
+                final_state = _apply_active_snapshot_projection(final_state, viewport_mode="video")
                 final_state = self._mark_operation_finished(final_state)
-                final_state = self._apply_selected_view_fields(final_state)
-                # Keep the widget visibly busy until process cleanup and all
-                # in-memory operation reservations have been retired. Without
-                # this terminal boundary, an immediate post-success recolor can
-                # be mistaken for a mutation of the already-finished run.
-                terminal_success_state = final_state
+                terminal_success_state = self._apply_selected_view_fields(final_state)
         except _StaleOperationError as exc:
             if bool(self._picker_state().get("operation_invalidated")):
                 self._set_stale_discarded_state(context, str(exc))
@@ -17683,10 +17857,32 @@ class HMBVideoPickerLibrary(DataNode):
         state = self._picker_state()
         state["active_process_pid"] = max(0, int(getattr(process, "pid", 0) or 0))
         state["active_process_kind"] = _clean(kind)
+        pid = state["active_process_pid"]
+        subscription = callable(getattr(process, "_hmb_cancel_subscription", None))
+        if subscription and not pid:
+            message = (
+                "Maya capture requested; waiting for a capture worker. "
+                "STOP cancels this request. Other active subscribers remain unaffected."
+            )
+        elif subscription:
+            message = (
+                f"Maya capture is running with PID {pid}. STOP cancels this subscription; "
+                "Maya stops when no subscribers remain."
+            )
+        elif pid:
+            message = (
+                f"{state['active_process_kind'] or 'External'} process started with PID {pid}. "
+                "STOP can terminate this process."
+            )
+        else:
+            message = (
+                f"{state['active_process_kind'] or 'External'} process requested; "
+                "waiting for its process ID. STOP cancels the operation."
+            )
         _append_activity_log(
             state,
-            "SUCCESS",
-            f"{state['active_process_kind'] or 'External'} process launched with PID {state['active_process_pid']}. STOP can now terminate that process.",
+            "INFO",
+            message,
         )
         self._write_state(state)
 
@@ -18789,6 +18985,10 @@ class HMBVideoPickerLibrary(DataNode):
 
     def _schedule_video_removal_output_sync(self) -> None:
         """Coalesce deletes; media probes run outside the UI/catalog state lock."""
+        loop = _picker_running_loop()
+        if loop is not None:
+            self._hmb_output_owner_loop = loop
+        owner_loop = getattr(self, "_hmb_output_owner_loop", None)
         with self._hmb_command_lock:
             self._hmb_video_removal_sync_token = int(getattr(self, "_hmb_video_removal_sync_token", 0)) + 1
             if getattr(self, "_hmb_video_removal_sync_running", False):
@@ -18801,21 +19001,42 @@ class HMBVideoPickerLibrary(DataNode):
                 while not self._hmb_node_deleted:
                     token = self._hmb_video_removal_sync_token
                     state = self._picker_state()
-                    state_signature = _sha256_canonical(state)
-                    probe_cache = {}
-                    # Populate every Shot's cache before taking the Shot
-                    # snapshot lock; a slow drive must not block navigation.
-                    for item in state.get("videos", []):
-                        _select_synchronized_video_media(item, enforce_media_availability=True, probe_cache=probe_cache)
-                    payload, media = _build_synchronized_video_outputs(state, probe_cache=probe_cache)
-                    envelope = self._shot_picker_dependency_envelope(state_snapshot=state, probe_cache=probe_cache)
-                    with self._hmb_state_write_lock:
-                        if self._hmb_node_deleted:
+                    identity = self._execution_media_identity(state)
+                    execution = int(getattr(self, "_hmb_execution_prepare_generation", 0))
+                    payload, media, probe_cache = self._prepare_execution_media(state)
+
+                    def publish() -> bool:
+                        with self._hmb_state_write_lock:
+                            if self._hmb_node_deleted:
+                                return True
+                            if (token != self._hmb_video_removal_sync_token
+                                or identity != self._execution_media_identity(self._picker_state())):
+                                return False
+                            # A Run owns its fresh output once it has started;
+                            # older UI probes cannot overwrite that result.
+                            if (execution != int(getattr(self, "_hmb_execution_prepare_generation", 0))
+                                or bool(getattr(self, "_hmb_execution_preparing", False))):
+                                return True
+                            self._hmb_verified_media = (identity, dict(probe_cache))
+                            envelope = self._shot_picker_dependency_envelope(state_snapshot=state, probe_cache=probe_cache)
+                            self._sync_outputs_from_state(state, _prepared_publication=(payload, media, envelope))
+                            return True
+
+                    if owner_loop is not None:
+                        if owner_loop.is_closed() or not owner_loop.is_running():
                             return
-                        latest = self._picker_state()
-                        if token != self._hmb_video_removal_sync_token or state_signature != _sha256_canonical(latest):
-                            continue
-                        self._sync_outputs_from_state(state, _prepared_publication=(payload, media, envelope))
+                        async def publish_on_owner() -> bool:
+                            return publish()
+                        future = asyncio.run_coroutine_threadsafe(publish_on_owner(), owner_loop)
+                        try:
+                            published = future.result(timeout=30)
+                        except BaseException:
+                            future.cancel()
+                            raise
+                    else:
+                        published = publish()
+                    if not published:
+                        continue
                     with self._hmb_command_lock:
                         if token == self._hmb_video_removal_sync_token:
                             self._hmb_video_removal_sync_running = False
@@ -19978,6 +20199,9 @@ class HMBVideoPickerLibrary(DataNode):
         state = self._picker_state()
         operation_kind = _clean(state.get("operation_kind"))
         message = _clean(exc) or exc.__class__.__name__
+        if isinstance(exc, _MayaNativeCaptureError):
+            state["native_error_code"] = exc.error_code
+            state["native_error_report"] = copy.deepcopy(exc.smooth_geometry_budget_report)
         last_log_path = _clean(state.get("last_log_path"))
         if last_log_path:
             try:
@@ -19993,10 +20217,12 @@ class HMBVideoPickerLibrary(DataNode):
         if operation_kind == "render_original_preview":
             state = self._mark_operation_finished(state)
             ready_stage = "VIDEO_READY" if state.get("videos") else "OUTLINER_READY"
+            if isinstance(exc, _MayaNativeCaptureError) and exc.error_code == "smooth_preview_geometry_budget_exceeded":
+                ready_stage = "FAILED"
             state.update({
                 "status": ready_stage,
                 "scene_stage": ready_stage,
-                "scene_request_status": "COMPLETE",
+                "scene_request_status": "FAILED" if ready_stage == "FAILED" else "COMPLETE",
                 "message": (
                     "Original preview generation failed; completed READ metadata and "
                     f"existing outputs were preserved. {message}"
@@ -20542,6 +20768,7 @@ class HMBVideoPickerLibrary(DataNode):
         process_label = _clean(process_name) or "External"
         started = time.monotonic()
         last_progress_at = started
+        last_primary_progress_at = started
         last_signature = ""
         last_stage = f"{process_label} startup"
         last_heartbeat_at = started
@@ -20553,6 +20780,7 @@ class HMBVideoPickerLibrary(DataNode):
             watched_activity_paths
         )
         last_activity_scan_at = started
+        last_cpu_seconds: Optional[float] = None
         activity_quiet_seconds = max(
             0.0,
             float(stall_timeout) * PROCESS_OUTPUT_ACTIVITY_QUIET_FRACTION,
@@ -20579,7 +20807,7 @@ class HMBVideoPickerLibrary(DataNode):
             last_ui_publish_at = now
 
         def drain_console() -> bool:
-            nonlocal last_progress_at, last_stage, stream_eof
+            nonlocal last_progress_at, last_primary_progress_at, last_cpu_seconds, last_stage, stream_eof
             if output_queue is None:
                 return False
             lines: List[str] = []
@@ -20598,6 +20826,8 @@ class HMBVideoPickerLibrary(DataNode):
                 return False
             now = time.monotonic()
             last_progress_at = now
+            last_primary_progress_at = now
+            last_cpu_seconds = None
             last_stage = lines[-1]
             for text in lines:
                 if output_log_handle is not None:
@@ -20649,6 +20879,8 @@ class HMBVideoPickerLibrary(DataNode):
                 if signature != last_signature:
                     last_signature = signature
                     last_progress_at = now
+                    last_primary_progress_at = now
+                    last_cpu_seconds = None
                     stage = _clean(payload.get("stage")) or "external_progress"
                     message = _clean(payload.get("message")) or stage
                     last_stage = message
@@ -20662,26 +20894,45 @@ class HMBVideoPickerLibrary(DataNode):
             except Exception as exc:
                 _diagnostic_exception(f"{process_label} progress read failed", exc)
             if (
-                watched_activity_paths
-                and now - last_progress_at >= activity_quiet_seconds
+                now - last_primary_progress_at >= activity_quiet_seconds
                 and now - last_activity_scan_at >= activity_scan_interval
             ):
                 last_activity_scan_at = now
                 next_signature, activity_file_count, activity_size = _filesystem_activity_snapshot(
                     watched_activity_paths
                 )
-                if next_signature != activity_signature:
+                output_activity_changed = next_signature != activity_signature
+                if output_activity_changed:
                     activity_signature = next_signature
                     last_progress_at = now
                     last_stage = (
                         f"{process_label} output activity detected "
-                        f"({activity_file_count} completed file(s), {activity_size} byte(s))"
+                        f"({activity_file_count} output/log file(s), {activity_size} byte(s))"
                     )
                     pending_ui_lines.append((
                         "INFO",
                         f"{process_label.upper()} OUTPUT | {last_stage}",
                     ))
                     publish_runtime_ui(last_stage)
+                # Scene loading, shader preparation and a long first frame may
+                # legitimately be silent. Query only after quiet progress and
+                # at the bounded fallback cadence. File/CPU evidence does not
+                # restart the primary quiet gate: after monitoring begins, keep
+                # sampling so a stopped calculation expires within one scan of
+                # the configured stall window. The first CPU reading is only a
+                # baseline; only a subsequent increase counts.
+                cpu_seconds = _process_cpu_seconds(process)
+                if cpu_seconds is not None:
+                    if (
+                        last_cpu_seconds is not None
+                        and cpu_seconds > last_cpu_seconds
+                    ):
+                        last_progress_at = now
+                        if not output_activity_changed:
+                            last_stage = f"{process_label} CPU activity detected; waiting for capture progress"
+                            pending_ui_lines.append(("INFO", f"{process_label.upper()} ACTIVITY | {last_stage}"))
+                            publish_runtime_ui(last_stage)
+                    last_cpu_seconds = cpu_seconds
             if self._hmb_cancel_requested.is_set():
                 _terminate_process(process)
                 raise RuntimeError(f"{operation_label} cancelled by user.")
@@ -20760,7 +21011,7 @@ class HMBVideoPickerLibrary(DataNode):
         job_path = job_folder / "read.job.json"
         result_path = job_folder / "read.result.json"
         progress_path = job_folder / "read.progress.json"
-        log_path = output_folder / f"Read_{_safe_scene_name(scene_path.stem)}.log"
+        log_path = _picker_diagnostic_path(scene_path, "maya_read", token)
         self._register_cleanup_dir(job_folder)
         self._register_cleanup_file(job_path)
         self._register_cleanup_file(result_path)
@@ -20797,7 +21048,7 @@ class HMBVideoPickerLibrary(DataNode):
             "maya_executable": str(mayabatch).replace("\\", "/"),
             "maya_version": maya_version,
             "last_log_path": str(log_path).replace("\\", "/"),
-            "log_folder": str(output_folder).replace("\\", "/"),
+            "log_folder": str(log_path.parent).replace("\\", "/"),
         })
         scene_info = _inspect_maya_scene_file(scene_path)
         _append_activity_log(state, "INFO", f"Scene preflight: {scene_info.get('size_mb', 0):.1f} MB" + (f", saved by Maya {scene_info.get('source_version')}" if scene_info.get("source_version") else ""))
@@ -20885,7 +21136,7 @@ class HMBVideoPickerLibrary(DataNode):
             )
             output_reader.start()
             state = self._picker_state()
-            _append_activity_log(state, "SUCCESS", f"Maya process launched with PID {process.pid}. STOP is active.")
+            _append_activity_log(state, "INFO", f"Maya process launched with PID {process.pid}. STOP is active.")
             try:
                 return_code = self._wait_for_process_with_progress(
                     process,
@@ -21034,7 +21285,7 @@ class HMBVideoPickerLibrary(DataNode):
             "scene_stage": "OUTLINER_READY",
             "message": (
                 f"Maya Outliner loaded with {len(outliner_nodes)} selectable asset roots. "
-                "Enable Original Playblast for a neutral midgray body with scene eye shaders, using Maya defaults when their renderer is unavailable."
+                "Enable Original Playblast for a neutral midgray body with AIPicker_SET materials, using Maya defaults when their renderer is unavailable."
             ),
             "scene_path": str(scene_path).replace("\\", "/"),
             "scene_draft_path": str(scene_path).replace("\\", "/"),
@@ -21047,7 +21298,7 @@ class HMBVideoPickerLibrary(DataNode):
             "maya_executable": str(mayabatch).replace("\\", "/"),
             "maya_version": actual_maya_version,
             "last_log_path": str(log_path).replace("\\", "/"),
-            "log_folder": str(output_folder).replace("\\", "/"),
+            "log_folder": str(log_path.parent).replace("\\", "/"),
             "camera": _clean(result.get("selected_camera")),
             "selected_camera": _clean(result.get("selected_camera")),
             "cameras": cameras,
@@ -21393,7 +21644,7 @@ class HMBVideoPickerLibrary(DataNode):
         progress_path = job_folder / "original.progress.json"
         staged_video_path = job_folder / "original.partial.mp4"
         staged_sidecar_path = job_folder / "original.partial.hmb.json"
-        log_path = output_folder / f"{_safe_scene_name(scene_path.stem)}_Orignal.log"
+        log_path = _picker_diagnostic_path(scene_path, "maya_original", token)
         for transient in (
             job_folder,
             frames_folder,
@@ -21451,12 +21702,12 @@ class HMBVideoPickerLibrary(DataNode):
         state.update({
             "status": "GENERATING_ORIGINAL",
             "scene_stage": "GENERATING_ORIGINAL",
-            "message": f"Maya {maya_version} is rendering the midgray Original body and scene eye shaders with Maya fallback for unavailable renderers.",
+            "message": f"Maya {maya_version} is rendering the midgray Original body and AIPicker_SET materials with Maya fallback for unavailable renderers.",
             "original_preview_enabled": False,
             "maya_executable": str(mayabatch).replace("\\", "/"),
             "maya_version": maya_version,
             "last_log_path": str(log_path).replace("\\", "/"),
-            "log_folder": str(output_folder).replace("\\", "/"),
+            "log_folder": str(log_path.parent).replace("\\", "/"),
         })
         state = self._apply_selected_view_fields(state)
         # _apply_selected_view_fields also projects a selected slot's media
@@ -21471,7 +21722,7 @@ class HMBVideoPickerLibrary(DataNode):
                 f"Original preview Maya render started with camera {camera}, frames "
                 f"{start_frame:g}-{end_frame:g}, {source_fps:g} FPS, and forced "
                 f"full-detail viewport profile {ORIGINAL_VIEWPORT_QUALITY_PROFILE} "
-                "with a neutral Maya Lambert body and scene eye shaders or verified Maya fallback for unavailable renderers."
+                "with a neutral Maya Lambert body and AIPicker_SET materials or verified Maya fallback for unavailable renderers."
             ),
         )
         self._write_state(state)
@@ -21497,9 +21748,7 @@ class HMBVideoPickerLibrary(DataNode):
             raise RuntimeError(f"Maya did not write the original preview result. Exit code={return_code}. See {log_path}")
         result = _read_json(result_path)
         if not result.get("ok") or return_code not in (0, None):
-            raise RuntimeError(
-                f"{_clean(result.get('error')) or f'Maya exited with code {return_code}.'} See {log_path}"
-            )
+            raise _maya_native_result_error(result, f"Maya exited with code {return_code}. See {log_path}")
         actual_frames_folder = Path(_clean(result.get("frames_folder")) or frames_folder)
         actual_sidecar_path = Path(_clean(result.get("sidecar_path")) or staged_sidecar_path)
         if _scene_path_key(actual_frames_folder) != _scene_path_key(frames_folder):
@@ -22117,7 +22366,7 @@ class HMBVideoPickerLibrary(DataNode):
             watchdog._write_state = retain_progress
             if flight.abort.is_set():
                 raise RuntimeError("Maya capture cancelled because all subscribers left.")
-            with (shared_root / "shared-capture.log").open("w", encoding="utf-8", errors="replace") as output:
+            with (shared_root / "shared-capture.txt").open("w", encoding="utf-8", errors="replace") as output:
                 output.write(_command_text(command) + "\n\n")
                 output.flush()
                 process = subprocess.Popen(list(command), stdout=output, stderr=subprocess.STDOUT,
@@ -22128,8 +22377,11 @@ class HMBVideoPickerLibrary(DataNode):
                     return_code = watchdog._wait_for_process_with_progress(
                         process, shared_progress_path, PLAYBLAST_OVERALL_TIMEOUT_SECONDS,
                         PLAYBLAST_STALL_TIMEOUT_SECONDS, operation_label,
-                        activity_paths=tuple(Path(_rebase_capture_payload(str(path), private_folder, shared_root))
-                                             for path in activity_paths),
+                        activity_paths=(
+                            *(Path(_rebase_capture_payload(str(path), private_folder, shared_root))
+                              for path in activity_paths),
+                            shared_root / "shared-capture.txt",
+                        ),
                     )
                 except BaseException:
                     with suppress(Exception):
@@ -22141,10 +22393,21 @@ class HMBVideoPickerLibrary(DataNode):
             _unused_key, current_proof = _maya_capture_identity(job, command, private_folder, state)
             if current_proof != proof:
                 raise _StaleOperationError("Maya capture source/dependencies changed while rendering; run READ and retry.")
+            result = {}
+            if shared_result_path.is_file():
+                try:
+                    result = _read_json(shared_result_path)
+                except Exception:
+                    # A native crash can leave a truncated result. Preserve its
+                    # existing isolated Serial -> DG retry rather than masking
+                    # the exit code with a JSON decoder failure.
+                    if not _maya_native_crash(return_code):
+                        raise
+            if not _maya_native_crash(return_code) and not result.get("ok") and _clean(result.get("error")):
+                raise _maya_native_result_error(result, "Maya capture failed.")
             if return_code in (0, None):
-                result = _read_json(shared_result_path) if shared_result_path.is_file() else {}
                 if not result.get("ok"):
-                    raise RuntimeError(_clean(result.get("error")) or "Maya did not write a successful capture result.")
+                    raise _maya_native_result_error(result, "Maya did not write a successful capture result.")
                 # Full per-role frame/material/depth validation remains mandatory
                 # in each caller before any public catalog/file publication.
                 expected_pass = _clean(shared_job.get("capture_pass"))
@@ -22171,7 +22434,7 @@ class HMBVideoPickerLibrary(DataNode):
                     last_ui_at = now
             assert_subscriber(f"{operation_label} shared capture completion", subscription)
             if flight.root is not None:
-                shared_log = flight.root / "shared-capture.log"
+                shared_log = flight.root / "shared-capture.txt"
                 if shared_log.is_file():
                     with log_path.open("a", encoding="utf-8", errors="replace") as output:
                         output.write("\nHMB SHARED MAYA CAPTURE\n")
@@ -22180,13 +22443,17 @@ class HMBVideoPickerLibrary(DataNode):
             if flight.error is not None:
                 if isinstance(flight.error, _StaleOperationError):
                     raise _StaleOperationError(str(flight.error))
+                if isinstance(flight.error, _MayaNativeCaptureError):
+                    raise _MayaNativeCaptureError(
+                        str(flight.error), flight.error.error_code, flight.error.smooth_geometry_budget_report,
+                    ) from flight.error
                 raise RuntimeError(str(flight.error)) from flight.error
             if flight.root is None:
                 raise RuntimeError("Maya capture staging was not created.")
             # Every node/Shot owns its own copies and cleanup registration.
             # A failed/cancelled caller cannot remove another owner's frames.
             for source in flight.root.rglob("*"):
-                if source.name == "shared-capture.log" or source.suffix == ".tmp":
+                if source.name == "shared-capture.txt" or source.suffix == ".tmp":
                     continue
                 if _is_reparse_or_symlink(source):
                     raise RuntimeError("Maya capture staging contains a symlink/junction.")
@@ -22200,7 +22467,13 @@ class HMBVideoPickerLibrary(DataNode):
                     assert_subscriber(f"{operation_label} staging copy", subscription)
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     if source.suffix == ".json":
-                        _write_json(destination, _rebase_capture_payload(_read_json(source), flight.root, private_folder))
+                        try:
+                            payload = _read_json(source)
+                        except Exception:
+                            if _maya_native_crash(flight.return_code):
+                                continue
+                            raise
+                        _write_json(destination, _rebase_capture_payload(payload, flight.root, private_folder))
                     else:
                         shutil.copy2(source, destination)
             _unused_key, current_proof = _maya_capture_identity(job, command, private_folder, state)
@@ -22295,7 +22568,7 @@ class HMBVideoPickerLibrary(DataNode):
         self._assert_operation_current(context, f"SNAPSHOT {role} completion")
         result = _read_json(result_path) if result_path.is_file() else {}
         if return_code not in (0, None) or not result.get("ok"):
-            raise RuntimeError(f"{_clean(result.get('error')) or 'Maya did not complete the requested Snapshot.'} See {log_path}")
+            raise _maya_native_result_error(result, f"Maya did not complete the requested Snapshot. See {log_path}")
         _validated_runner_result_path(result, "frames_folder", captured_frames_folder)
         _validated_runner_result_path(result, "sidecar_path", captured_sidecar_path)
         if role == "depth":
@@ -22339,7 +22612,7 @@ class HMBVideoPickerLibrary(DataNode):
                 raise RuntimeError("Mask Snapshot did not retain the requested Color Assignment.")
         elif role == "original":
             if _clean(sidecar.get("original_material_override_profile")) != ORIGINAL_MATERIAL_OVERRIDE_PROFILE or not _original_material_report_is_valid(sidecar.get("original_material_override_report")):
-                raise RuntimeError("Original Snapshot did not verify neutral body, usable eye shaders, and original shader restoration.")
+                raise RuntimeError("Original Snapshot did not verify neutral body, usable AIPicker_SET materials, and original shader restoration.")
             if sidecar.get("markers"):
                 raise RuntimeError("Original Snapshot inherited Color Assignment markers.")
         else:
@@ -22387,12 +22660,12 @@ class HMBVideoPickerLibrary(DataNode):
         job_folder = output_folder / ".hmb_video_picker" / batch_uid
         self._register_cleanup_dir(job_folder)
         _ensure_private_job_folder(job_folder, output_folder)
-        log_path = output_folder / f"Snapshot_{_safe_scene_name(scene_path.stem)}_Video{PRIMARY_COLOR_VIDEO_SLOT}.log"
+        log_path = _picker_diagnostic_path(scene_path, "maya_snapshot", batch_uid)
         log_path.write_text("MAYA SELECTED SNAPSHOT OUTPUTS: " + ", ".join(roles) + "\n", encoding="utf-8")
         state.update(status="SNAPSHOT_RENDERING", scene_stage="SNAPSHOT_RENDERING",
                      message=f"Rendering {', '.join(role.title() for role in roles)} snapshots at Maya frame {frame:g}.",
                      snapshot_frame=frame, snapshot_video_slot=PRIMARY_COLOR_VIDEO_SLOT,
-                     last_log_path=str(log_path).replace("\\", "/"), log_folder=str(output_folder).replace("\\", "/"))
+                     last_log_path=str(log_path).replace("\\", "/"), log_folder=str(log_path.parent).replace("\\", "/"))
         self._write_state(state)
         staged = []
         warnings = []
@@ -22550,12 +22823,7 @@ class HMBVideoPickerLibrary(DataNode):
         def native_crash(return_code: int) -> bool:
             # Ordinary Python/worker errors and user termination do not justify
             # a second capture. Windows may expose NTSTATUS signed or unsigned.
-            if os.name == "nt":
-                return (int(return_code) & 0xFFFFFFFF) in {
-                    0xC0000005, 0xC000001D, 0xC0000094, 0xC0000096,
-                    0xC00000FD, 0xC0000374, 0xC0000409,
-                }
-            return int(return_code) in {-4, -6, -7, -8, -11}
+            return _maya_native_crash(return_code)
 
         def capture(capture_pass: str) -> Dict[str, Any]:
             label = {"color": "Mask", "depth": "Depth", "motion_guide": "Motion Guide"}[capture_pass]
@@ -22591,7 +22859,7 @@ class HMBVideoPickerLibrary(DataNode):
                     # both auxiliaries; Motion-only retained the assigned scope.
                     "motion_guide_full_scene_scope": (
                         capture_pass == "motion_guide"
-                        and bool(job.get("generate_depth_playblast"))
+                        and bool(job.get("motion_guide_full_scene_scope", job.get("generate_depth_playblast")))
                     ),
                     "result_path": str(pass_result_path),
                     "progress_path": str(pass_progress_path),
@@ -22624,13 +22892,13 @@ class HMBVideoPickerLibrary(DataNode):
                     self._write_state(state)
                     _append_full_diagnostic_log(log_path, "HMB MAYA NATIVE CRASH RETRY", warning)
                     continue
+                pass_result = _read_json(pass_result_path) if pass_result_path.is_file() else {}
                 if return_code not in (0, None):
-                    raise RuntimeError(f"Maya {label} exited with code {return_code}. See {log_path}")
+                    raise _maya_native_result_error(pass_result, f"Maya {label} exited with code {return_code}. See {log_path}")
                 if not pass_result_path.is_file():
                     raise RuntimeError(f"Maya did not write the {label} result. See {log_path}")
-                pass_result = _read_json(pass_result_path)
                 if not pass_result.get("ok"):
-                    raise RuntimeError(f"{_clean(pass_result.get('error')) or f'Maya {label} capture failed.'} See {log_path}")
+                    raise _maya_native_result_error(pass_result, f"Maya {label} capture failed. See {log_path}")
                 if _clean(pass_result.get("capture_pass")) != capture_pass:
                     raise RuntimeError(f"Maya returned a different capture pass for {label}.")
                 if _clean(pass_result.get("scene_path")) and _scene_path_key(pass_result.get("scene_path")) != _scene_path_key(job["scene_path"]):
@@ -22644,6 +22912,15 @@ class HMBVideoPickerLibrary(DataNode):
                     raise RuntimeError(f"Maya did not create the {label} sidecar. See {log_path}")
                 return pass_result
             raise RuntimeError(f"Maya {label} capture did not complete.")
+
+        selected_pass = _clean(job.get("capture_pass"))
+        if selected_pass:
+            if selected_pass not in {"color", "depth", "motion_guide"}:
+                raise ValueError("Unsupported isolated Maya capture pass.")
+            result = capture(selected_pass)
+            result["capture_warnings"] = capture_warnings
+            _write_json(result_path, result)
+            return result
 
         # The primary Mask remains the strict frame/timing/visibility authority.
         # Optional failures never throw away its complete frames or sidecar.
@@ -22678,6 +22955,171 @@ class HMBVideoPickerLibrary(DataNode):
         _write_json(result_path, result)
         return result
 
+    def _maya_selected_role_artifact(
+        self, *, role: str, job: Dict[str, Any], command: Sequence[str],
+        job_path: Path, result_path: Path, log_path: Path, ffmpeg: Path,
+        scene_path: Path, output_folder: Path, context: Optional[_OperationContext],
+    ) -> Dict[str, Any]:
+        """Finish one selected pass without publishing a provisional catalog row."""
+        label = role.replace("_", " ").title()
+        prefix = "" if role == "mask" else f"{role}_"
+        camera = _clean(job.get("camera"))
+        try:
+            first, last, fps = (float(job[key]) for key in ("start_frame", "end_frame", "fps"))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("Run READ before generating selected Maya outputs.") from exc
+        if not camera or last < first or fps <= 0 or not all(math.isfinite(v) for v in (first, last, fps)):
+            raise RuntimeError("Maya READ has no valid camera, frame range, or FPS.")
+        count = _maya_sequence_frame_count(first, last)
+        width, height = int(job["width"]), int(job["height"])
+        result = self._execute_maya_capture_passes(
+            job=job, command=command, job_path=job_path, result_path=result_path,
+            log_path=log_path, context=context,
+        )
+        self._assert_operation_current(context, f"{label} capture completion")
+        frames = _validated_runner_result_path(result, "frames_folder", Path(job[f"{prefix}frames_folder"]))
+        sidecar_path = _validated_runner_result_path(result, "sidecar_path", Path(job[f"{prefix}sidecar_path"]))
+        output_name = _clean(job[f"{prefix}output_name"])
+        sidecar = _read_json(sidecar_path)
+        resolution = sidecar.get("resolution") if isinstance(sidecar.get("resolution"), dict) else {}
+        expected_frames = [min(first + i, last) for i in range(count)]
+        expected_map = [{"sequence_index": i, "maya_frame": frame} for i, frame in enumerate(expected_frames)]
+        reference = {
+            "camera": camera, "start_frame": first, "end_frame": last,
+            "fps": fps, "frame_count": count, "frame_map": expected_map,
+            "resolution": {"width": width, "height": height},
+            "hidden_paths": list(job.get("hidden_paths") or []),
+        }
+        if (
+            not all(math.isfinite(float(sidecar.get(key, float("nan")))) for key in ("fps", "start_frame", "end_frame"))
+            or not math.isfinite(float(result.get("fps", float("nan"))))
+            or int(result.get("frame_count") or 0) != count
+            or abs(float(result.get("fps") or 0) - fps) > 1e-6
+            or int(sidecar.get("frame_count") or 0) != count
+            or abs(float(sidecar.get("fps") or 0) - fps) > 1e-6
+            or abs(float(sidecar.get("start_frame", float("nan"))) - first) > 1e-6
+            or abs(float(sidecar.get("end_frame", float("nan"))) - last) > 1e-6
+            or _clean(sidecar.get("camera")) != camera
+            or int(resolution.get("width") or 0) != width
+            or int(resolution.get("height") or 0) != height
+            or _scene_path_key(sidecar.get("scene_path")) != _scene_path_key(scene_path)
+        ):
+            raise RuntimeError(f"Maya {label} sidecar disagrees with READ or the accepted job.")
+        frame_map = sidecar.get("frame_map")
+        if not isinstance(frame_map, list) or len(frame_map) != count or any(
+            not isinstance(row, dict) or row.get("sequence_index") != i
+            or not math.isfinite(float(row.get("maya_frame", float("nan"))))
+            or abs(float(row.get("maya_frame")) - expected_frames[i]) > 1e-6
+            for i, row in enumerate(frame_map)
+        ):
+            raise RuntimeError(f"Maya {label} frame map disagrees with the accepted timeline.")
+        paths = [frames / f"{output_name}.{index:06d}.png" for index in range(count)]
+        validation: Dict[str, Any] = {}
+        _validate_full_smooth_confirmation(result, sidecar, label=f"{label} Playblast")
+        if role == "mask":
+            _validate_world_pattern_runner_confirmation(result, sidecar)
+            Image, _chops, _draw, image_error, _version = _screen_space._require_pillow()
+            for index, path in enumerate(paths):
+                if not path.is_file() or not path.stat().st_size:
+                    raise RuntimeError(f"Mask frame {index} is missing or empty.")
+                try:
+                    with Image.open(path) as image:
+                        if image.size != (width, height):
+                            raise RuntimeError(f"Mask frame {index} has the wrong raster size.")
+                        image.verify()
+                except image_error as exc:
+                    raise RuntimeError(f"Mask frame {index} is not a valid image.") from exc
+        elif role == "depth":
+            # The reference is the accepted READ timeline, not a fabricated
+            # Mask image. All Depth shader/range/grayscale checks still apply.
+            validation = _validate_depth_companion_inputs(
+                result=result, color_sidecar=reference, depth_sidecar=sidecar,
+                color_frame_paths=(), depth_frame_paths=paths, standalone=True,
+                expected_frame_count=count, expected_fps=fps,
+                expected_start_frame=first, expected_end_frame=last,
+                expected_width=width, expected_height=height,
+            )
+        else:
+            validation = _validate_motion_guide_inputs(
+                result=result, color_sidecar=reference, motion_sidecar=sidecar,
+                motion_frame_paths=paths, expected_frame_count=count,
+                expected_fps=fps, expected_start_frame=first, expected_end_frame=last,
+                expected_width=width, expected_height=height,
+            )
+        staged_video = job_path.parent / f"{role}.selected.partial.mp4"
+        self._register_cleanup_file(staged_video)
+        self._assert_operation_current(context, f"{label} encode start")
+        self._encode_playblast_sequence(
+            ffmpeg=ffmpeg, frame_pattern=frames / f"{output_name}.%06d.png",
+            staged_video_path=staged_video, source_fps=fps, frame_count=count,
+            width=width, height=height, log_path=log_path,
+            output_folder=output_folder, label=label,
+        )
+        stream = _validate_encoded_playblast(
+            staged_video, ffmpeg=ffmpeg, expected_fps=fps,
+            expected_frame_count=count, expected_width=width,
+            expected_height=height, label=label,
+        )
+        target = output_folder / f"{output_name}.mp4"
+        target_sidecar = target.with_suffix(".hmb.json")
+        media_kind, video_role, source_hint, control_hint = {
+            "mask": (MASK_MEDIA_KIND, "maya_color_assignment_mask", "Color Assignment Mask / Segmentation Reference", "Object and Character Region Guidance"),
+            "depth": (DEPTH_MEDIA_KIND, "maya_depth_companion", DEPTH_SOURCE_TYPE, DEPTH_CONTROL_ROLE),
+            "motion_guide": (MOTION_GUIDE_MEDIA_KIND, "maya_motion_guide_companion", MOTION_GUIDE_SOURCE_TYPE, MOTION_GUIDE_CONTROL_ROLE),
+        }[role]
+        sidecar.pop("frame_pattern", None)
+        sidecar.update({
+            "mode": "maya" if role == "mask" else f"maya_{role}",
+            "scene_engine": "maya", "generation_role": role,
+            "media_kind": media_kind, "video_role": video_role,
+            "source_type_hint": source_hint, "control_role_hint": control_hint,
+            "video": target.name, "video_path": target.as_posix(),
+            "source_fps": fps, "output_fps": fps,
+            "source_frame_count": count, "output_frame_count": count,
+            "source_duration_seconds": count / fps, "output_duration_seconds": count / fps,
+            "duration_policy": "exact_source_timing", "frame_sequence_transient": True,
+            "encoded_stream_validation": stream,
+            "bundle_run_id": context.operation_id if context else output_name,
+            "pair_run_id": context.operation_id if context and "depth" in context.selected_roles else "",
+            "companion_of_video_slot": PRIMARY_COLOR_VIDEO_SLOT if role != "mask" else 0,
+            "source_video_slot": PRIMARY_COLOR_VIDEO_SLOT if role != "mask" else 0,
+        })
+        if role != "mask":
+            sidecar[f"{role}_validation_report"] = validation
+            sidecar[f"{role}_profile"] = DEPTH_PLAYBLAST_PROFILE if role == "depth" else MOTION_GUIDE_PROFILE
+        _write_json(sidecar_path, sidecar)
+        self._assert_operation_current(context, f"{label} artifact publication")
+        records: List[tuple[Path, Path, bool]] = []
+        project_records: List[tuple[Path, Path, bool]] = []
+        with _playblast_publish_guard(scene_path):
+            try:
+                records = self._publish_validated_playblast_artifact(
+                    staged_video=staged_video, staged_sidecar=sidecar_path,
+                    target_video=target, target_sidecar=target_sidecar,
+                    backup_folder=job_path.parent / "selected-publish-backup", label=label,
+                )
+                slot = PRIMARY_COLOR_VIDEO_SLOT if role == "mask" else int(job[f"{role}_video_slot"])
+                artifact, project_path = _copy_video_to_griptape_project(
+                    self, target, slot, transaction_records=project_records,
+                    backup_folder=job_path.parent / "selected-project-backup",
+                )
+                self._assert_operation_current(context, f"{label} artifact completion")
+            except Exception:
+                self._restore_playblast_bundle(project_records)
+                self._restore_playblast_bundle(records)
+                raise
+        item = {
+            **{key: value for key, value in sidecar.items()
+               if key in _SHOT_VIDEO_METADATA_FIELDS or key in {"video_path", "warnings", "duration_policy"}},
+            "label": label, "video_url": _external_media_url(target),
+            "project_video_path": project_path,
+            "video_metadata": dict(getattr(artifact, "meta", {}) or {}),
+            "output_width": width, "output_height": height,
+            "decoded_frame_count": count, "has_maya_frame_range": True,
+            "markers": list(sidecar.get("markers") or []) if role == "mask" else [],
+        }
+        return {"generated_item": item, "video": target.as_posix(), "json": target_sidecar.as_posix()}
+
     def _maya_mode(
         self,
         scene_text: str,
@@ -22685,15 +23127,18 @@ class HMBVideoPickerLibrary(DataNode):
         context: Optional[_OperationContext] = None,
         *,
         publish_public: bool = True,
+        selected_role: Optional[str] = None,
     ) -> Dict[str, Any]:
         self._assert_operation_current(context, "PLAYBLAST preflight")
         state = self._operation_stage_state(context)
-        depth_enabled = bool(state.get("depth_enabled"))
-        motion_guide_enabled = bool(state.get("motion_guide_enabled"))
+        if selected_role is not None and selected_role not in {"mask", "depth", "motion_guide"}:
+            raise ValueError("Unsupported selected Maya generation role.")
+        depth_enabled = selected_role == "depth" if selected_role else bool(state.get("depth_enabled"))
+        motion_guide_enabled = selected_role == "motion_guide" if selected_role else bool(state.get("motion_guide_enabled"))
         video_slot = PRIMARY_COLOR_VIDEO_SLOT
         if context is not None:
-            depth_video_slot = context.depth_video_slot
-            motion_guide_video_slot = context.motion_guide_video_slot
+            depth_video_slot = context.depth_video_slot if depth_enabled else 0
+            motion_guide_video_slot = context.motion_guide_video_slot if motion_guide_enabled else 0
         elif depth_enabled or motion_guide_enabled:
             (
                 depth_video_slot,
@@ -22755,7 +23200,7 @@ class HMBVideoPickerLibrary(DataNode):
         job_path = job_folder / "render.job.json"
         result_path = job_folder / "render.result.json"
         progress_path = job_folder / "render.progress.json"
-        log_path = output_folder / f"{output_name}.log"
+        log_path = _picker_diagnostic_path(scene_path, "maya_playblast", token)
         video_path = output_folder / f"{scene_path.stem}_playblast_{token}.mp4"
         sidecar_path = output_folder / f"{scene_path.stem}_playblast_{token}.hmb.json"
         depth_video_path = (
@@ -22825,7 +23270,8 @@ class HMBVideoPickerLibrary(DataNode):
             state,
             mask_authoring_slot,
         )
-        _world_pattern_preflight(job_bindings)
+        if selected_role in (None, "mask"):
+            _world_pattern_preflight(job_bindings)
 
         _write_json(job_path, {
             "operation": "render",
@@ -22933,7 +23379,7 @@ class HMBVideoPickerLibrary(DataNode):
             "maya_executable": str(mayabatch).replace("\\", "/"),
             "maya_version": maya_version,
             "last_log_path": str(log_path).replace("\\", "/"),
-            "log_folder": str(output_folder).replace("\\", "/"),
+            "log_folder": str(log_path.parent).replace("\\", "/"),
         })
         _append_activity_log(
             state,
@@ -22966,6 +23412,22 @@ class HMBVideoPickerLibrary(DataNode):
         _ensure_private_job_folder(job_folder, output_folder)
         with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
             log_handle.write("MAYA COMMAND\n" + _command_text(command) + "\n\n")
+        if selected_role:
+            selected_job = _read_json(job_path)
+            native = state.get("native_metadata") if isinstance(state.get("native_metadata"), dict) else {}
+            selected_job.update({
+                "capture_pass": "color" if selected_role == "mask" else selected_role,
+                "start_frame": native.get("start_frame", state.get("start_frame")),
+                "end_frame": native.get("end_frame", state.get("end_frame")),
+                "fps": native.get("fps", state.get("source_fps")),
+                "motion_guide_full_scene_scope": bool(context and "depth" in context.selected_roles),
+            })
+            return self._maya_selected_role_artifact(
+                role=selected_role, job=selected_job, command=command,
+                job_path=job_path, result_path=result_path, log_path=log_path,
+                ffmpeg=ffmpeg, scene_path=scene_path, output_folder=output_folder,
+                context=context,
+            )
         result = self._execute_maya_capture_passes(
             job=_read_json(job_path), command=command, job_path=job_path,
             result_path=result_path, log_path=log_path, context=context,
@@ -24115,7 +24577,7 @@ class HMBVideoPickerLibrary(DataNode):
         job_path = job_folder / "job.json"
         result_path = job_folder / "result.json"
         progress_path = job_folder / "progress.json"
-        log_path = output_folder / f"Blender_{_safe_scene_name(scene_path.stem)}_{operation}_{token}.log"
+        log_path = _picker_diagnostic_path(scene_path, f"blender_{operation}", token)
         options = dict(options)
         job: Dict[str, Any] = {
             "operation": operation,
@@ -24151,7 +24613,7 @@ class HMBVideoPickerLibrary(DataNode):
             "blender_version": _blender_display_version(blender),
             "blender_available": True,
             "last_log_path": str(log_path).replace("\\", "/"),
-            "log_folder": str(output_folder).replace("\\", "/"),
+            "log_folder": str(log_path.parent).replace("\\", "/"),
         })
         _append_activity_log(state, "INFO", f"Blender {operation} started for {scene_path.name}.")
         self._write_state(state)
@@ -24169,10 +24631,11 @@ class HMBVideoPickerLibrary(DataNode):
                     PLAYBLAST_OVERALL_TIMEOUT_SECONDS,
                     PLAYBLAST_STALL_TIMEOUT_SECONDS,
                     f"Blender {operation}",
-                    activity_paths=tuple(
-                        Path(job[key]) for key in (
+                    activity_paths=(
+                        *(Path(job[key]) for key in (
                             "frames_folder", "depth_frames_folder", "motion_guide_frames_folder"
-                        ) if _clean(job.get(key))
+                        ) if _clean(job.get(key))),
+                        log_path,
                     ),
                     process_name="Blender",
                 )
@@ -24566,18 +25029,22 @@ class HMBVideoPickerLibrary(DataNode):
     def _blender_mode(
         self, scene_text: str, video_slot: int,
         context: Optional[_OperationContext] = None, *, publish_public: bool = True,
+        selected_role: Optional[str] = None,
     ) -> Dict[str, Any]:
         scene_path = _norm_path(_maya_scene_path_text(scene_text))
         state = self._operation_stage_state(context)
         camera, first, last, fps, width, height = self._blender_render_inputs(scene_path, state)
         frame_count = _maya_sequence_frame_count(first, last)
-        mask_requested = bool(state.get("mask_enabled"))
-        depth_requested = bool(state.get("depth_enabled"))
-        motion_requested = bool(state.get("motion_guide_enabled"))
+        if selected_role is not None and selected_role not in {"mask", "depth", "motion_guide"}:
+            raise ValueError("Unsupported selected Blender generation role.")
+        mask_requested = selected_role == "mask" if selected_role else bool(state.get("mask_enabled"))
+        depth_requested = selected_role == "depth" if selected_role else bool(state.get("depth_enabled"))
+        motion_requested = selected_role == "motion_guide" if selected_role else bool(state.get("motion_guide_enabled"))
         if not (mask_requested or depth_requested or motion_requested):
             raise RuntimeError("Select a Blender Mask, Depth, or Motion Guide output first.")
         if context is not None:
-            depth_slot, motion_slot = context.depth_video_slot, context.motion_guide_video_slot
+            depth_slot = context.depth_video_slot if depth_requested else 0
+            motion_slot = context.motion_guide_video_slot if motion_requested else 0
             mask_slot = context.mask_authoring_slot
         else:
             depth_slot, motion_slot = _resolve_generated_companion_slots(
@@ -24595,8 +25062,9 @@ class HMBVideoPickerLibrary(DataNode):
             raise FileNotFoundError("FFmpeg is required to encode Blender Mask/Depth/Motion frames.")
         output_folder = _ensure_scene_output_folder(scene_path)
         token = hashlib.sha256(f"blender-bundle|{scene_path}|{time.time_ns()}".encode("utf-8")).hexdigest()[:12]
-        bundle_run_id = f"blender-{token}"
+        bundle_run_id = context.operation_id if selected_role and context else f"blender-{token}"
         result, job, folder, log_path = self._blender_execute_job(scene_path, "render", {
+            "capture_pass": ("color" if selected_role == "mask" else selected_role) or "",
             "camera": camera, "width": width, "height": height,
             "start_frame": first, "end_frame": last, "fps": fps,
             "apply_marker_shaders": True, "marker_catalog_path": str(MARKER_CATALOG_PATH),
@@ -24606,11 +25074,11 @@ class HMBVideoPickerLibrary(DataNode):
             "generate_motion_guide": motion_requested,
         }, context)
         artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), dict) else {}
-        for key, requested in (("color", True), ("depth", depth_requested), ("motion_guide", motion_requested)):
+        for key, requested in (("color", mask_requested if selected_role else True), ("depth", depth_requested), ("motion_guide", motion_requested)):
             status = artifacts.get(key) if isinstance(artifacts.get(key), dict) else {}
             if bool(status.get("requested")) != requested or (requested and not bool(status.get("ok"))):
                 raise RuntimeError(f"Blender {key} artifact did not confirm the accepted request: {_clean(status.get('error'))}")
-        roles = ["mask"] + (["depth"] if depth_requested else []) + (["motion_guide"] if motion_requested else [])
+        roles = [selected_role] if selected_role else ["mask"] + (["depth"] if depth_requested else []) + (["motion_guide"] if motion_requested else [])
         role_prefix = {"mask": "", "depth": "depth", "motion_guide": "motion_guide"}
         role_meta = {
             "mask": (BLENDER_MASK_MEDIA_KIND, "blender_color_assignment_mask", "Color Assignment Mask / Segmentation Reference", "Object and Character Region Guidance"),
@@ -24670,6 +25138,22 @@ class HMBVideoPickerLibrary(DataNode):
                     item = role_assets[role]
                     if not _is_structurally_valid_mp4(item["video"]) or not item["sidecar"].is_file():
                         raise RuntimeError(f"Published Blender {role} pair failed final validation.")
+                if selected_role:
+                    self._assert_operation_current(context, f"Blender {selected_role} artifact completion")
+                    asset = role_assets[selected_role]
+                    metadata_row = asset["metadata"]
+                    return {"generated_item": {
+                        **{key: value for key, value in metadata_row.items()
+                           if key in _SHOT_VIDEO_METADATA_FIELDS or key in {"video_path", "warnings", "duration_policy"}},
+                        "generation_role": selected_role,
+                        "scene_engine": "blender", "video_url": _external_media_url(asset["video"]),
+                        "output_width": width, "output_height": height,
+                        "decoded_frame_count": frame_count, "has_maya_frame_range": True,
+                        "markers": list(metadata_row.get("markers") or []) if selected_role == "mask" else [],
+                        "depth_profile": BLENDER_DEPTH_PROFILE if selected_role == "depth" else "",
+                        "motion_guide_profile": BLENDER_MOTION_GUIDE_PROFILE if selected_role == "motion_guide" else "",
+                        "label": selected_role.replace("_", " ").title(),
+                    }, "video": str(asset["video"]), "json": str(asset["sidecar"])}
                 current = _apply_active_snapshot_projection(self._picker_state(), viewport_mode="video")
                 mask_asset = role_assets["mask"]
                 mask_metadata = mask_asset["metadata"]
@@ -24772,6 +25256,79 @@ class HMBVideoPickerLibrary(DataNode):
             "motion_guide_video": str(role_assets["motion_guide"]["video"]) if motion_requested else "",
             "motion_guide_profile": BLENDER_MOTION_GUIDE_PROFILE if motion_requested else "",
         }
+
+    def _execution_media_identity(self, state: Dict[str, Any]) -> str:
+        """Bind verification to sources, selection, route/project and lifetime."""
+        return _sha256_canonical({
+            "videos": state.get("videos", []),
+            "workspaces": [{key: row.get(key) for key in (
+                "workspace_uuid", "bound_shot_uuid", "number", "name",
+                "video_asset_uids", "selected_video_uids",
+            )} for row in state.get("picker_shots", []) if isinstance(row, dict)],
+            "selection": {key: state.get(key) for key in (
+                "active_picker_shot_uuid", "channel_uuid", "shot_uuid", "shot_number",
+                "shot_name", "shot_publisher_instance_uuid", "shot_selections",
+                "accepted_shot_catalog_generation", "accepted_shot_catalog_metadata_sha256",
+            )},
+            "catalog": getattr(self, "_hmb_shot_catalog_snapshot", None),
+            "route_status": getattr(self, "_hmb_shot_route_status", None),
+            "lifecycle": getattr(self, "_hmb_lifecycle_generation", 0),
+            "runtime": getattr(self, "_hmb_runtime_instance_id", ""),
+        })
+
+    @staticmethod
+    def _prepare_execution_media(state: Dict[str, Any]) -> tuple[Any, Any, Any]:
+        """Detached I/O only: never mutate state, node caches or graph outputs."""
+        probe_cache: Dict[str, Optional[Path]] = {}
+        for raw in state.get("videos", []):
+            if isinstance(raw, dict):
+                _select_synchronized_video_media(dict(raw), enforce_media_availability=True, probe_cache=probe_cache)
+        payload, media = _build_synchronized_video_outputs(
+            state, enforce_media_availability=True, probe_cache=probe_cache,
+        )
+        return payload, media, probe_cache
+
+    async def aprocess(self) -> None:
+        """Verify local/shared files off-loop; stage one current pair on-loop."""
+        self._hmb_output_owner_loop = asyncio.get_running_loop()
+        self._ensure_parameters()
+        generation = int(getattr(self, "_hmb_execution_prepare_generation", 0)) + 1
+        self._hmb_execution_prepare_generation = generation
+        self._hmb_execution_preparing = True
+        self._hmb_verified_media = None
+        try:
+            if bool(getattr(self, "is_cancellation_requested", False)):
+                raise asyncio.CancelledError()
+            local = _state_sync_local(self)
+            previous_defer = getattr(local, "defer_execution_outputs", False)
+            local.defer_execution_outputs = True
+            try:
+                self._reconcile_shared_shot_routing()
+            finally:
+                local.defer_execution_outputs = previous_defer
+            state = self._apply_selected_view_fields(self._picker_state())
+            identity = self._execution_media_identity(state)
+            payload, media, probe_cache = await asyncio.to_thread(self._prepare_execution_media, copy.deepcopy(state))
+            if bool(getattr(self, "is_cancellation_requested", False)):
+                raise asyncio.CancelledError()
+            with self._hmb_state_write_lock:
+                current = self._apply_selected_view_fields(self._picker_state())
+                if (self._hmb_node_deleted or generation != self._hmb_execution_prepare_generation
+                    or identity != self._execution_media_identity(current)):
+                    raise ValueError("VideoPicker sources or Shot changed while preparing; run again with the current selection.")
+                self._hmb_verified_media = (identity, dict(probe_cache))
+                envelope = self._shot_picker_dependency_envelope(state_snapshot=state, probe_cache=probe_cache)
+                self._sync_outputs_from_state(state, propagate_connections=False,
+                    _prepared_publication=(payload, media, envelope))
+        except BaseException:
+            if generation == self._hmb_execution_prepare_generation:
+                self._hmb_verified_media = None
+                self._hmb_execution_preparing = False
+                self._hmb_execution_prepare_generation += 1
+            raise
+        finally:
+            if generation == self._hmb_execution_prepare_generation:
+                self._hmb_execution_preparing = False
 
     def process(self) -> None:
         """Refresh Picker/Video outputs without starting Maya or FFmpeg.

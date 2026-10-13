@@ -294,7 +294,15 @@ class FullLifecycleNode(target.HMBSeedanceGeneration):
         verify_agent_prompt: bool = True,
     ) -> dict:
         del verify_agent_prompt
-        return dict(params)
+        selection = self._capture_imageasset_project_selection()
+        return {**params, **selection["project"],
+                "_hmb_imageasset_project_selection": selection}
+
+    def _capture_imageasset_project_selection(self) -> dict:
+        # Synthetic five-node transport covers concurrency, polling, decoding
+        # and publication; the dedicated project-source suite owns real edges.
+        return {"schema": target.PROJECT_SELECTION_SCHEMA,
+                "project": {"project_id": "superwings12", "project_name": "슈퍼윙즈12"}}
 
     def _sync_seedance_shot_widget(self, *, emit_change: bool = False) -> None:
         del emit_change
@@ -398,6 +406,31 @@ assert target.SHOT_ROUTING_MAX_SHOTS == NODE_COUNT
 target.AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 0.05
 target._BROKER_SUBMISSION_LAST_STARTED = 0.0
 asyncio.run(run_full_lifecycle())
+
+# A late project read must not let a later reserved slot overtake the actual
+# first POST. Delay only the first worker's real project-validation boundary;
+# keep all five real submission wrappers and the measured start-gap assertion.
+original_project_guard = target.HMBSeedanceGeneration._assert_operation_project_selection
+project_guard_lock = threading.Lock()
+project_guard_stalled = False
+
+
+def delayed_project_guard(self):
+    global project_guard_stalled
+    guard = getattr(self, "_hmb_project_selection_guard", None)
+    if isinstance(guard, dict) and threading.get_ident() != guard["thread"]:
+        with project_guard_lock:
+            stall = not project_guard_stalled
+            project_guard_stalled = True
+        if stall:
+            time.sleep(0.20)
+    return original_project_guard(self)
+
+
+target._BROKER_SUBMISSION_LAST_STARTED = 0.0
+with mock.patch.object(target.HMBSeedanceGeneration, "_assert_operation_project_selection", delayed_project_guard):
+    asyncio.run(run_full_lifecycle())
+assert project_guard_stalled
 
 print(
     "HMB Seedance five-node full lifecycle concurrency regression: PASS "

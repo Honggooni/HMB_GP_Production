@@ -59,8 +59,8 @@ for retired_symbol in (
     assert retired_symbol not in agent_source, retired_symbol
 assert "[HMB LOCAL POLICY REQUIRED]" in agent_source
 assert "사용자 로컬에 동봉된 hmb_agent_core.dat" not in agent_source
-assert "_bootstrap_agent_policy_session()" in agent_source
-assert '"resources" / "agent" / "hmb_agent_core.dat"' in common_source
+assert "_bootstrap_agent_policy_session(" in agent_source
+assert '"resources" / "agent" / "superwings12" / "hmb_agent_core.dat"' in common_source
 
 def prompt_sections(payload: str):
     lines = payload.splitlines()

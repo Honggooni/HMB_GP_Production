@@ -48,6 +48,25 @@ SHOT_B = dict(channel_uuid="channel-1", shot_uuid="shot-b", number=2, name="Shot
 
 
 class ColorLUTNodeRegression(unittest.TestCase):
+    def test_late_prior_project_edit_cannot_overwrite_new_project(self):
+        self.node._hmb_follow_image_asset_project({"id": "project-A", "name": "A"})
+        self.apply(settings={"precision_version": 2, "enabled": True, "exposure": 0.5})
+        old = copy.deepcopy(self.node._hmb_color_lut_state)
+        self.node._hmb_follow_image_asset_project({"id": "project-B", "name": "B"})
+        expected = copy.deepcopy(self.node._hmb_color_lut_state)
+        old["revision"] = expected["revision"] + 100
+        old["settings"]["exposure"] = 2.0
+        self.node._apply_ui(old)
+        self.assertEqual(self.node._hmb_color_lut_state, expected)
+
+    def test_late_prior_project_command_cannot_run_in_new_project(self):
+        self.node._hmb_follow_image_asset_project({"id": "project-A", "name": "A"})
+        old = copy.deepcopy(self.node._hmb_color_lut_state)
+        self.node._hmb_follow_image_asset_project({"id": "project-B", "name": "B"})
+        with mock.patch.object(self.node, "_save_profile") as save:
+            self.node._command({"id": "late-project-command", "action": "save_profile", "state": old})
+            save.assert_not_called()
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="hmb_lut_node_")
         self.root = Path(self.temporary.name)

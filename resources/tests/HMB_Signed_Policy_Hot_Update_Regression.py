@@ -219,6 +219,7 @@ try:
     assert len(policy_rules) == len(binding_rules) == 4
     assert policy == loaded_a["policy"] and binding == loaded_a["binding"]
     assert node._hmb_policy_identity == {
+        "project_id": "superwings12",
         "version": loaded_a["final_policy_version"],
         "contract_sha256": loaded_a["policy_pair_sha256"],
         "envelope_sha256": hashlib.sha256(revision_a).hexdigest(),

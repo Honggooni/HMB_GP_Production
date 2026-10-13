@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import threading
 import types
 from typing import Any
 
 
 def install_clean_ci_griptape_stubs() -> None:
     """Install test-only modules when public CI has no Griptape host packages."""
+    if getattr(sys.modules.get("griptape_nodes.retained_mode.griptape_nodes"), "_hmb_clean_ci_stub", False):
+        return
 
     def surface_missing(name: str) -> bool:
         try:
@@ -97,6 +100,13 @@ def install_clean_ci_griptape_stubs() -> None:
             self.parameter_values: dict[str, Any] = {}
             self.parameter_output_values: dict[str, Any] = {}
             self.metadata: dict[str, Any] = {}
+            self._cancellation_requested = threading.Event()
+
+        def request_cancellation(self) -> None:
+            self._cancellation_requested.set()
+
+        def clear_cancellation(self) -> None:
+            self._cancellation_requested.clear()
 
         def add_parameter(self, parameter: Any) -> None:
             self.parameters[parameter.name] = parameter
@@ -227,7 +237,10 @@ def install_clean_ci_griptape_stubs() -> None:
             raise NotImplementedError
 
     class StubGriptapeNodes:
-        pass
+        NodeManager = staticmethod(lambda: None)
+        handle_request = staticmethod(lambda _request: None)
+        EventManager = staticmethod(lambda: types.SimpleNamespace(event_loop=None))
+        FlowManager = staticmethod(lambda: types.SimpleNamespace(check_for_existing_running_flow=lambda: False))
 
     class StubSaveWorkflowRequest(StubValue):
         def __init__(
@@ -320,13 +333,24 @@ def install_clean_ci_griptape_stubs() -> None:
         SaveWorkflowResultSuccess=StubSaveWorkflowResultSuccess,
     )
     module(
+        "griptape_nodes.retained_mode.events.connection_events",
+        IncomingConnection=StubValue,
+        ListConnectionsForNodeRequest=StubValue,
+        ListConnectionsForNodeResultSuccess=type("StubListConnectionsSuccess", (StubValue,), {}),
+    )
+    module(
+        "griptape_nodes.node_library.library_registry",
+        LibraryRegistry=types.SimpleNamespace(get_library=lambda _name: None),
+    )
+    module(
         "griptape_nodes.retained_mode.file_metadata.sidecar_metadata",
         write_sidecar=lambda *_args, **_kwargs: None,
     )
-    module(
+    stub_nodes = module(
         "griptape_nodes.retained_mode.griptape_nodes",
         GriptapeNodes=StubGriptapeNodes,
     )
+    stub_nodes._hmb_clean_ci_stub = True
     # Standalone fixtures represent property-only manual inputs unless a test
     # supplies actual source connections. Match the host's empty topology shape.
     module(

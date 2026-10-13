@@ -6,7 +6,7 @@ from typing import Any, Callable
 
 
 ROOT = Path(__file__).resolve().parents[2]
-BUNDLED_POLICY_DAT = ROOT / "resources" / "agent" / "hmb_agent_core.dat"
+BUNDLED_POLICY_DAT = ROOT / "resources" / "agent" / "superwings12" / "hmb_agent_core.dat"
 
 
 def read_bundled_policy_artifact() -> bytes:

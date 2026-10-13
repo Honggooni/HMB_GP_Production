@@ -343,10 +343,8 @@ except ValueError as exc:
 else:
     raise AssertionError("Backend accepted Generate with no selected output.")
 
-# The real multi-stage Generate path freezes the four accepted choices. A
-# successful Original snapshot and the shared Mask/Depth/Motion stage must
-# reach one final four-role commit even if a private stage mutates its working
-# copy of a choice flag.
+# Generate freezes the accepted choices, then publishes each completed role
+# before starting the next. Private producers cannot redefine those choices.
 def install_direct_picker_state_writes(node):
     raw_write_state = node._write_state
 
@@ -428,28 +426,26 @@ with tempfile.TemporaryDirectory() as orchestration_temp_text:
     orchestration_node._render_original_preview_mode = successful_original_stage
     orchestration_node._prepare_run_state = lambda *_args, **_kwargs: None
 
-    def successful_core_stage(*_args, **_kwargs):
-        stage_state = orchestration_node._picker_state()
-        for role, path, media_kind in (
-            ("mask", orchestration_temp / "mask.mp4", picker.MASK_MEDIA_KIND),
-            ("depth", orchestration_temp / "depth.mp4", picker.DEPTH_MEDIA_KIND),
-            (
-                "motion_guide",
-                orchestration_temp / "motion.mp4",
-                picker.MOTION_GUIDE_MEDIA_KIND,
-            ),
-        ):
-            item = {
-                "video_path": str(path),
-                "video_url": path.as_uri(),
-                "generation_role": role,
-                "media_kind": media_kind,
-                "source_fps": 24,
-                "source_frame_count": 2,
-            }
-            stage_state = picker._append_video_asset(stage_state, item)
-        orchestration_node._write_state(stage_state)
-        return {"depth_succeeded": True, "motion_guide_succeeded": True}
+    def mock_completed_role(target_node, role):
+        assert role in ("mask", "depth", "motion_guide")
+        path = orchestration_temp / f"{target_node.name}-{role}.mp4"
+        path.write_bytes(b"producer-validated-" + role.encode())
+        media_kind = {"mask": picker.MASK_MEDIA_KIND, "depth": picker.DEPTH_MEDIA_KIND,
+                      "motion_guide": picker.MOTION_GUIDE_MEDIA_KIND}[role]
+        item = {"video_path": str(path), "video_url": path.as_uri(), "generation_role": role,
+                "media_kind": media_kind, "source_fps": 24, "source_frame_count": 2}
+        return {"video": str(path) if role == "mask" else "",
+                "depth_video": str(path) if role == "depth" else "",
+                "motion_guide_video": str(path) if role == "motion_guide" else "",
+                "depth_succeeded": role == "depth", "motion_guide_succeeded": role == "motion_guide",
+                "generated_item": item}
+
+    def successful_core_stage(*_args, selected_role=None, **_kwargs):
+        completed = {"mask": ["original"], "depth": ["original", "mask"],
+                     "motion_guide": ["original", "mask", "depth"]}[selected_role]
+        assert orchestration_syncs
+        assert [item.get("generation_role") for item in orchestration_syncs[-1]["videos"]] == completed
+        return mock_completed_role(orchestration_node, selected_role)
 
     orchestration_node._maya_mode = successful_core_stage
     orchestration_node._start_ui_operation(
@@ -467,12 +463,12 @@ with tempfile.TemporaryDirectory() as orchestration_temp_text:
     assert orchestration_result["generation_output_roles"] == [
         "original", "mask", "depth", "motion_guide",
     ]
-    assert len(orchestration_syncs) == 1
+    assert len(orchestration_syncs) >= 4
 
-    # A selected Original failure is terminal. The shared core stage must not
-    # run and no subset of the remaining three checked roles may be published.
+    # An Original failure affects that role only. The other checked outputs
+    # still run once and publish progressively; existing manual media survives.
     failure_node = install_direct_picker_state_writes(
-        picker.HMBVideoPickerLibrary(name="original_failure_no_partial")
+        picker.HMBVideoPickerLibrary(name="original_failure_continue")
     )
     failure_syncs = []
     failure_node._sync_outputs_from_state = (
@@ -507,33 +503,27 @@ with tempfile.TemporaryDirectory() as orchestration_temp_text:
         raise RuntimeError("simulated Original renderer failure")
 
     failure_node._render_original_preview_mode = failed_original_stage
-    failure_node._prepare_run_state = lambda *_args, **_kwargs: core_calls.append(
-        "prepare"
-    )
-    failure_node._maya_mode = lambda *_args, **_kwargs: core_calls.append(
-        "maya"
-    )
+    failure_node._prepare_run_state = lambda *_args, **_kwargs: None
+
+    def failure_core_stage(*_args, selected_role=None, **_kwargs):
+        core_calls.append(selected_role)
+        return mock_completed_role(failure_node, selected_role)
+
+    failure_node._maya_mode = failure_core_stage
     failure_node._start_ui_operation("run_video", failure_node._picker_state())
     failure_result = failure_node._picker_state()
-    assert failure_result["status"] == "FAILED"
-    assert core_calls == []
-    assert [item.get("label") for item in failure_result["videos"]] == [
-        "Existing Manual"
-    ]
-    assert not any(
-        item.get("generation_role")
-        for item in failure_result["videos"]
-    )
-    assert "did not publish a partial Mask/Depth/Motion result" in failure_result[
-        "message"
-    ]
-    assert failure_syncs == []
+    assert failure_result["status"] == "VIDEO_READY"
+    assert core_calls == ["mask", "depth", "motion_guide"]
+    assert failure_result["videos"][0].get("label") == "Existing Manual"
+    assert [item.get("generation_role") for item in failure_result["videos"][1:]] == core_calls
+    assert "simulated Original renderer failure" in " ".join(failure_result.get("warnings", []))
+    assert len(failure_syncs) >= 3
 
-    # Snapshotting is part of the same mandatory Original stage. A renderer
-    # success followed by an immutable-snapshot failure must be just as
-    # terminal as a renderer failure, with no core work or partial publish.
+    # This is an immutable MP4/sidecar catalog copy, not the Snapshot button.
+    # If it fails, never publish the mutable Original cache. Continue only the
+    # other selected roles, preserving independent still-Snapshot atomicity.
     snapshot_failure_node = install_direct_picker_state_writes(
-        picker.HMBVideoPickerLibrary(name="original_snapshot_failure_no_partial")
+        picker.HMBVideoPickerLibrary(name="original_catalog_copy_failure_continue")
     )
     snapshot_failure_syncs = []
     snapshot_failure_node._sync_outputs_from_state = (
@@ -568,12 +558,13 @@ with tempfile.TemporaryDirectory() as orchestration_temp_text:
     snapshot_failure_node._render_original_preview_mode = (
         lambda *_args, **_kwargs: {"mode": "original_preview_cache"}
     )
-    snapshot_failure_node._prepare_run_state = (
-        lambda *_args, **_kwargs: snapshot_core_calls.append("prepare")
-    )
-    snapshot_failure_node._maya_mode = (
-        lambda *_args, **_kwargs: snapshot_core_calls.append("maya")
-    )
+    snapshot_failure_node._prepare_run_state = lambda *_args, **_kwargs: None
+
+    def snapshot_failure_core_stage(*_args, selected_role=None, **_kwargs):
+        snapshot_core_calls.append(selected_role)
+        return mock_completed_role(snapshot_failure_node, selected_role)
+
+    snapshot_failure_node._maya_mode = snapshot_failure_core_stage
     original_snapshot_helper = picker._snapshot_original_preview_asset
 
     def failed_original_snapshot(*_args, **_kwargs):
@@ -588,25 +579,15 @@ with tempfile.TemporaryDirectory() as orchestration_temp_text:
     finally:
         picker._snapshot_original_preview_asset = original_snapshot_helper
     snapshot_failure_result = snapshot_failure_node._picker_state()
-    assert snapshot_failure_result["status"] == "FAILED"
-    assert snapshot_core_calls == []
-    assert [
-        item.get("label") for item in snapshot_failure_result["videos"]
-    ] == ["Existing Snapshot Manual"]
-    assert not any(
-        item.get("generation_role")
-        for item in snapshot_failure_result["videos"]
-    )
-    assert "did not publish a partial Mask/Depth/Motion result" in (
-        snapshot_failure_result["message"]
-    )
-    assert "simulated Original snapshot failure" in snapshot_failure_result[
-        "message"
-    ]
-    assert snapshot_failure_syncs == []
+    assert snapshot_failure_result["status"] == "VIDEO_READY"
+    assert snapshot_core_calls == ["mask", "depth", "motion_guide"]
+    assert snapshot_failure_result["videos"][0].get("label") == "Existing Snapshot Manual"
+    assert [item.get("generation_role") for item in snapshot_failure_result["videos"][1:]] == snapshot_core_calls
+    assert "simulated Original snapshot failure" in " ".join(snapshot_failure_result.get("warnings", []))
+    assert len(snapshot_failure_syncs) >= 3
 
-# Private multi-stage generation may write its staging state, but it must not
-# publish VIDEO/PICKER outputs until the final packed commit.
+# A private producer may write staging state but does not own external
+# publication. The worker publishes each completed role at its commit boundary.
 atomic_probe = object.__new__(picker.HMBVideoPickerLibrary)
 atomic_writes = []
 atomic_sync_calls = []
@@ -1832,8 +1813,11 @@ with tempfile.TemporaryDirectory() as temp_dir:
                          "original_material_override_profile": (
                              picker.ORIGINAL_MATERIAL_OVERRIDE_PROFILE
                          ),
+                         "original_material_pass_source": "AIPicker_SET",
                          "original_material_override_report": {
                              "profile": picker.ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
+                             "material_pass_source": "AIPicker_SET",
+                             "material_pass_shape_count": 0,
                              "requested": True,
                              "status": "restored",
                              "restore_ok": True,

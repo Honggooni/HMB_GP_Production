@@ -21,8 +21,24 @@ from typing import Any
 from uuid import UUID, uuid4
 import weakref
 
+import _hmb_review as _review
+from _hmb_project import resolve_project
+
 logger = logging.getLogger(__name__)
 PROTOCOL = "hmb-web-rerender-v1"
+POLICY_APPLICATION = "preserved_parent"
+PROJECT_ROUTING_SCHEMA = "hmb-project-routing-v1"
+PROJECT_IDS = frozenset({"dinoster5", "katuri8", "superwings12"})
+PARENT_SETTINGS_SCHEMA = "hmb-rerender-parent-settings-v1"
+PARENT_SETTINGS_FIELDS = frozenset({
+    "model", "input_mode", "quality", "resolution", "aspect_ratio", "ratio",
+    "duration_seconds", "duration", "generate_audio", "output_format", "watermark",
+    "return_last_frame", "execution_expires_after", "priority", "omni_reference_task_type",
+})
+PARENT_SETTINGS_CONTRACT_FIELDS = (
+    "frozen_generation_settings_schema", "frozen_generation_settings",
+    "frozen_generation_settings_sha256", "frozen_generation_settings_binding_sha256",
+)
 API_ROOT = "/api/v1/reviews/rerender"
 _ID = re.compile(r"[A-Za-z0-9_.:-]{1,200}\Z")
 _MAX_DOCUMENT = 8 * 1024 * 1024
@@ -44,6 +60,51 @@ def _identifier(value: Any) -> str:
     if not isinstance(value, str) or _ID.fullmatch(value) is None:
         raise ValueError("invalid_web_rerender_identity")
     return value
+
+
+def _require_parent_policy_identity(value: Any) -> None:
+    if (not isinstance(value, dict) or value.get("mode") != POLICY_APPLICATION
+            or value.get("reinjected") is not False):
+        raise ValueError("web_rerender_policy_mode_mismatch")
+
+
+def parent_generation_settings(command: Any) -> dict[str, Any]:
+    """Verify the Broker's sparse original request, including parent binding."""
+    if not isinstance(command, dict) or command.get("frozen_generation_settings_schema") != PARENT_SETTINGS_SCHEMA:
+        raise ValueError("web_rerender_parent_settings_contract_required")
+    settings = command.get("frozen_generation_settings")
+    if not isinstance(settings, dict) or set(settings) - PARENT_SETTINGS_FIELDS:
+        raise ValueError("web_rerender_parent_settings_unsupported")
+    if not {"model", "input_mode", "generate_audio"}.issubset(settings) or not (
+        {"quality", "resolution"} & settings.keys()
+    ) or not ({"duration", "duration_seconds"} & settings.keys()):
+        raise ValueError("web_rerender_parent_settings_incomplete")
+    for key, value in settings.items():
+        expected = (bool if key in {"generate_audio", "watermark", "return_last_frame"}
+                    else int if key in {"duration", "duration_seconds", "execution_expires_after", "priority"}
+                    else str)
+        if type(value) is not expected or (expected is str and (not value or len(value) > 256)):
+            raise ValueError("web_rerender_parent_settings_invalid_type")
+    for left, right in (("duration", "duration_seconds"), ("ratio", "aspect_ratio")):
+        if left in settings and right in settings and settings[left] != settings[right]:
+            raise ValueError("web_rerender_parent_settings_alias_conflict")
+    digest = _digest(settings)
+    if command.get("frozen_generation_settings_sha256") != digest:
+        raise ValueError("web_rerender_parent_settings_integrity_failed")
+    project = _project_identity(command, strict=True)
+    binding = {"schema": PARENT_SETTINGS_SCHEMA, "parent_task_id": _identifier(command.get("parent_task_id")),
+               **project, "frozen_generation_settings_sha256": digest}
+    if command.get("frozen_generation_settings_binding_sha256") != _digest(binding):
+        raise ValueError("web_rerender_parent_settings_binding_mismatch")
+    return deepcopy(settings)
+
+
+def _project_identity(value: Any, *, strict: bool = False) -> dict[str, str]:
+    identity = resolve_project(value, default_legacy=not strict)
+    public = {key: identity[key] for key in ("project_id", "project_name")}
+    if strict and (not isinstance(value, dict) or any(value.get(key) != item for key, item in public.items())):
+        raise ValueError("web_rerender_project_identity_mismatch")
+    return public
 
 
 def runtime_root() -> Path:
@@ -80,16 +141,32 @@ class OperationJournal:
             connection.execute("INSERT OR IGNORE INTO identity VALUES('worker_id', ?)", (str(uuid4()),))
             return _uuid(connection.execute("SELECT value FROM identity WHERE name='worker_id'").fetchone()[0])
 
-    def descendants(self, origin: str, owner_key: str, parent: str) -> list[str]:
-        """Recover authenticated child lineage without restoring node outputs."""
+    def descendants(self, origin: str, owner_key: str, parent: str, project_id: str = "") -> list[str]:
+        """Recover confirmed Broker jobs, never provisional submission keys."""
         with closing(self._connect()) as connection:
-            rows = connection.execute("SELECT document FROM operations WHERE origin=? AND owner_key=? "
+            rows = connection.execute("SELECT state,render_key,document FROM operations WHERE origin=? AND owner_key=? "
                                       "ORDER BY updated_at DESC LIMIT 1000", (origin, owner_key)).fetchall()
         edges = []
         for row in rows:
-            document = json.loads(row[0])
-            child = str((document.get("result") or {}).get("task_id")
-                        or (document.get("checkpoint") or {}).get("task_id") or "")
+            document = json.loads(row["document"])
+            if project_id and _project_identity(document.get("command"))["project_id"] != project_id:
+                continue
+            # execute writes result only after the Broker acknowledges child
+            # identity. A failed/unknown operation's arbitrary result is not
+            # that acknowledgement, and its client key is never a child job.
+            result = document.get("result") or {}
+            child = str(result.get("task_id") or "") if row["state"] in {"submitted", "completed"} else ""
+            if not child or child == row["render_key"]:
+                child = ""
+                checkpoint = document.get("checkpoint") or {}
+                if (checkpoint.get("task_identity") == "broker_task"
+                        and checkpoint.get("stage") in {"accepted", "remote_succeeded", "local_succeeded",
+                                                        "terminal", "cancelled_locally", "timed_out"}
+                        and checkpoint.get("status") not in {"submitting", "submission_unknown"}
+                        and checkpoint.get("broker_server_url") == origin):
+                    candidate = str(checkpoint.get("task_id") or "")
+                    if candidate != row["render_key"]:
+                        child = candidate
             source = str(document["command"].get("parent_task_id") or "")
             if _ID.fullmatch(child) and _ID.fullmatch(source):
                 edges.append((source, child))
@@ -117,7 +194,8 @@ class OperationJournal:
         # Lease credentials and transport timestamps are deliberately excluded.
         authored = {key: deepcopy(command.get(key)) for key in (
             "command_id", "render_key", "parent_task_id", "review_id",
-            "target_id", "binding_fingerprint", "prompt")}
+            "target_id", "binding_fingerprint", "prompt", "project_id", "project_name")}
+        authored.update({field: deepcopy(command[field]) for field in PARENT_SETTINGS_CONTRACT_FIELDS if field in command})
         fingerprint = _digest(authored)
         key = self.key(origin, owner_key, command_id)
         document = {"command": authored, "agent_result": None, "checkpoint": None,
@@ -191,7 +269,11 @@ def request_fingerprint(payload: dict[str, Any]) -> str:
     canonical = {key: value for key, value in payload.items() if str(key).lower() not in ignored}
     canonical["model"] = str(payload.get("model") or "")
     canonical["provider"] = "volcengine_ark"
-    return _digest(canonical)
+    # The Generator already bounds the full media request at 64 MiB. Its
+    # canonical fingerprint must not inherit the journal's 8 MiB record limit.
+    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _uuid(value: Any) -> str:
@@ -206,6 +288,8 @@ class BrokerProtocol:
         self.worker_id = _uuid(worker_id)
         self.session_id = _uuid(session_id)
         self.owner_key = ""
+        self.project_routing_ready = False
+        self.parent_settings_ready = False
 
     def request(self, method: str, suffix: str, body: Any = None) -> dict[str, Any]:
         if not suffix.startswith("/") or ".." in suffix or "?" in suffix:
@@ -216,6 +300,15 @@ class BrokerProtocol:
         return result
 
     def heartbeat(self, targets: list[dict[str, Any]], *, register: bool = False) -> None:
+        # Read-only discovery must precede registration on an older strict
+        # server; it must not clear the old worker's advertised targets.
+        if not self.project_routing_ready or not self.parent_settings_ready:
+            capabilities = self.bridge._request_json("GET", "/api/v1/reviews/capabilities", payload=None, timeout=10)
+            if not self._project_capability(capabilities):
+                raise ValueError("web_rerender_project_server_upgrade_required")
+            if capabilities.get("parent_settings_contract") != PARENT_SETTINGS_SCHEMA:
+                raise ValueError("web_rerender_parent_settings_server_upgrade_required")
+            self.parent_settings_ready = True
         body = {"worker_id": self.worker_id, "session_id": self.session_id, "targets": targets[:16]}
         reply = self.request("POST", "/worker/register" if register else "/worker/heartbeat", body)
         if (reply.get("schema") != PROTOCOL or reply.get("worker_id") != self.worker_id
@@ -228,6 +321,20 @@ class BrokerProtocol:
         if self.owner_key and owner != self.owner_key:
             raise ValueError("web_rerender_account_changed")
         self.owner_key = owner
+        self.project_routing_ready = self._project_capability(reply)
+        if not self.project_routing_ready:
+            raise ValueError("web_rerender_project_server_upgrade_required")
+        self.parent_settings_ready = reply.get("parent_settings_contract") == PARENT_SETTINGS_SCHEMA
+        if not self.parent_settings_ready:
+            raise ValueError("web_rerender_parent_settings_server_upgrade_required")
+
+    @staticmethod
+    def _project_capability(reply: Any) -> bool:
+        capability = reply.get("project_routing") if isinstance(reply, dict) else None
+        ids = capability.get("project_ids") if isinstance(capability, dict) else None
+        return bool(isinstance(capability, dict) and capability.get("schema") == PROJECT_ROUTING_SCHEMA
+                    and isinstance(ids, list) and all(isinstance(item, str) for item in ids)
+                    and len(ids) == len(PROJECT_IDS) and set(ids) == PROJECT_IDS)
 
     def claim(self, target_id: str) -> dict[str, Any] | None:
         reply = self.request("POST", "/worker/claim", {
@@ -251,9 +358,12 @@ class BrokerProtocol:
             raise ValueError("web_rerender_prompt_integrity_failed")
         # The execution mode is never decided by arbitrary caller fields.
         for field, expected in (("exclude_authored_prompt", True), ("preserve_connected_sources", True),
-                                ("policy_required", True), ("input_mode", "web_only")):
+                                ("policy_required", False), ("input_mode", "web_only"),
+                                ("policy_application", POLICY_APPLICATION), ("policy_reinjected", False)):
             if (command.get(field) is not expected if isinstance(expected, bool) else command.get(field) != expected):
                 raise ValueError("web_rerender_execution_contract_mismatch")
+        _project_identity(command, strict=True)
+        parent_generation_settings(command)
         return command
 
     def credentials(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -307,11 +417,37 @@ class CommandSubmissionOpener:
             digest = self.agent_result.get("output_sha256")
             if not isinstance(text, str) or digest != hashlib.sha256(text.encode("utf-8")).hexdigest():
                 raise ValueError("web_rerender_agent_result_integrity_failed")
+            _require_parent_policy_identity(self.agent_result.get("policy_identity"))
             expected_prompt = text if self.submitted_prompt is None else self.submitted_prompt
             if body.get("prompt") != expected_prompt:
                 raise ValueError("web_rerender_submitted_prompt_mismatch")
-            self.protocol.result(self.command, "prepared", agent_output=text,
-                                 agent_output_sha256=digest, render_payload_sha256=request_fingerprint(body))
+            project = _project_identity(self.command, strict=True)
+            if _project_identity(body, strict=True) != project:
+                raise ValueError("web_rerender_submitted_project_mismatch")
+            frozen = parent_generation_settings(self.command)
+            if set(body) & {"seed", "camera_fixed", "codec", "video_codec", "task"}:
+                raise ValueError("web_rerender_submitted_settings_unsupported")
+            if body.get("model") != frozen["model"]:
+                raise ValueError("web_rerender_submitted_model_mismatch")
+            # The normal bridge may omit model-specific defaults or use wire
+            # aliases. Restore exactly the parent's present settings keys;
+            # never leak facade-only validation values into the child request.
+            for field in PARENT_SETTINGS_FIELDS:
+                body.pop(field, None)
+            body.update(frozen)
+            request.data = json.dumps(body, ensure_ascii=False, sort_keys=True,
+                                      separators=(",", ":"), allow_nan=False).encode("utf-8")
+            request.remove_header("Content-length")
+            try:
+                self.protocol.result(self.command, "prepared", agent_output=text,
+                                     agent_output_sha256=digest, render_payload_sha256=request_fingerprint(body),
+                                     policy_application=POLICY_APPLICATION, policy_reinjected=False, **project)
+            except Exception as exc:
+                # Host-only provenance: this acknowledgement failed before the
+                # actual video POST. Never add this marker to request JSON or
+                # to errors raised after delegating the final create request.
+                exc._hmb_web_submission_not_started = True
+                raise
             self.journal.transition(self.key, {"render_preparing"}, "submitting")
             self._attempted = True
             # No retry below this line: the provider may have accepted the call.
@@ -346,6 +482,8 @@ class EngineWorker:
         self.session_id = str(uuid4())
         self.protocols: dict[str, BrokerProtocol] = {}
         self.targets: Any = weakref.WeakKeyDictionary()
+        self.target_origins: Any = weakref.WeakKeyDictionary()
+        self.target_projects: Any = weakref.WeakKeyDictionary()
         self.policy_cache: Any = weakref.WeakKeyDictionary()
         self.active: dict[str, asyncio.Task] = {}
         self.leases: dict[str, threading.Event] = {}
@@ -373,20 +511,66 @@ class EngineWorker:
                 continue
         return nodes[:16]
 
-    async def _policy(self, agent: Any) -> dict[str, Any]:
-        cached = self.policy_cache.get(agent)
+    async def _policy(self, agent: Any, project_id: str) -> dict[str, Any]:
+        cache = self.policy_cache.setdefault(agent, {})
+        cached = cache.get(project_id)
         now = time.monotonic()
         if cached is not None and now - cached[0] < 30:
             return cached[1]
-        status = await asyncio.to_thread(agent._hmb_web_rerender_policy_status)
-        self.policy_cache[agent] = (now, status)
+        status = await asyncio.to_thread(agent._hmb_web_rerender_policy_status, project_id=project_id)
+        cache[project_id] = (now, status)
         return status
+
+    async def _parent_task_id(self, node: Any, origin: str) -> str:
+        """Read output/recovery identity without adopting a journal or Resume input.
+
+        Native get_parameter_value reads inputs/defaults, not output-only Task
+        IDs. Keep filesystem evidence off the engine loop, and never advertise
+        a saved Task on a different Broker merely because settings changed.
+        These local facts establish routing only; the Broker checks ownership.
+        """
+        outputs = getattr(node, "parameter_output_values", {})
+        checkpoint = node.get_parameter_value("HMB_SEEDANCE_RECOVERY")
+        checkpoint = checkpoint if isinstance(checkpoint, dict) else {}
+        checkpoint_id = str(checkpoint.get("task_id") or "").strip()
+        if checkpoint.get("updated_at_ms") and not checkpoint_id:
+            return ""  # An explicit cleared recovery record is a tombstone.
+        output_id = str(outputs.get("generation_id") or "").strip()
+        parent = output_id or checkpoint_id
+        if _ID.fullmatch(parent) is None:
+            return ""
+        pinned = await asyncio.to_thread(_review.task_origin, parent)
+        saved = str(checkpoint.get("broker_server_url") or "") if checkpoint_id == parent else ""
+        if pinned and saved and pinned.rstrip("/") != saved.rstrip("/"):
+            return ""
+        recorded = pinned or saved
+        return parent if recorded and recorded.rstrip("/") == origin.rstrip("/") else ""
+
+    def _rotate_target(self, node: Any, origin: str) -> str:
+        """Fence the old binding; its task callback retains cleanup ownership."""
+        previous = self.targets.get(node)
+        if previous is not None:
+            live = self.leases.get(previous)
+            if live is not None:
+                live.clear()
+            active = self.active.get(previous)
+            if active is not None:
+                active.cancel()
+            self.children.pop(previous, None)
+        target_id = str(uuid4())
+        self.targets[node] = target_id
+        self.target_origins[node] = origin
+        return target_id
 
     async def _target(self, node: Any) -> tuple[BrokerProtocol, dict[str, Any], dict[str, Any], Any] | None:
         engine = self.engine()
         if engine is None:
             return None
         origin = node._selected_broker_server_url()
+        if self.target_origins.get(node) != origin:
+            # Rotate before authentication: even an unreachable new Broker must
+            # immediately lose the old command's authority and child lineage.
+            self._rotate_target(node, origin)
         protocol = self.protocols.get(origin)
         if protocol is None:
             bridge = node._create_broker_bridge(server_url=origin)
@@ -409,24 +593,38 @@ class EngineWorker:
                         task.cancel()
             protocol = BrokerProtocol(node._create_broker_bridge(server_url=origin), self.worker_id, str(uuid4()))
             self.protocols[origin] = protocol
-            for bound_node, old_target in tuple(self.targets.items()):
+            for bound_node in tuple(self.targets):
                 if bound_node._selected_broker_server_url() == origin:
-                    self.children.pop(old_target, None)
-                    self.targets[bound_node] = str(uuid4())
-        target_id = self.targets.setdefault(node, str(uuid4()))
+                    self._rotate_target(bound_node, origin)
+        target_id = self.targets[node]
         # This snapshot is strictly metadata-only. Byte availability and content
         # are verified separately by prepare_media after taking the node claim.
         snapshot = node._hmb_web_rerender_capture_inputs()
+        project = _project_identity(snapshot.get("project"))
+        if self.target_projects.get(node) != project["project_id"]:
+            target_id = self._rotate_target(node, origin)
+            self.target_projects[node] = project["project_id"]
         agent = engine.node_manager.get_node_by_name(snapshot["agent_name"])
-        policy = await self._policy(agent)
+        policy = await self._policy(agent, project["project_id"])
         readiness = node._hmb_web_rerender_readiness()
         own_busy = target_id in self.active
         busy = own_busy or bool(agent._hmb_web_rerender_busy()) or not readiness.get("ready")
-        parent = str(node.get_parameter_value("generation_id") or "")
-        descendants = (await asyncio.to_thread(self.journal.descendants, origin, protocol.owner_key, parent)
+        parent = await self._parent_task_id(node, origin)
+        if parent:
+            recorded_project = await asyncio.to_thread(_review.task_project, parent)
+            if recorded_project["project_id"] != project["project_id"]:
+                parent = ""
+        descendants = (await asyncio.to_thread(self.journal.descendants, origin, protocol.owner_key, parent, project["project_id"])
                        if protocol.owner_key and parent else [])
         parents = [p for p in [parent, *descendants, *self.children.get(target_id, [])] if _ID.fullmatch(p or "")]
         parents = list(dict.fromkeys(parents))[-32:]
+        current_origin = node._selected_broker_server_url()
+        current_snapshot = node._hmb_web_rerender_capture_inputs()
+        if current_origin != origin or current_snapshot["binding_fingerprint"] != snapshot["binding_fingerprint"]:
+            # Authentication, policy and journal reads yield to the engine.
+            # Discard a descriptor if settings changed during those awaits.
+            self._rotate_target(node, current_origin)
+            return None
         target = snapshot["target"]
         try:
             workflow = str(engine.context_manager.get_current_workflow_name())
@@ -440,6 +638,9 @@ class EngineWorker:
             "parent_task_ids": parents, "ready": bool(not busy and parents and policy.get("ready") is True),
             "busy": busy, "policy_verified": policy.get("ready") is True,
             "policy_version": str(policy.get("version") or "")[:200],
+            "policy_application": POLICY_APPLICATION, "policy_reinjected": False,
+            "frozen_generation_settings_schema": PARENT_SETTINGS_SCHEMA,
+            **project,
         }
         return protocol, descriptor, snapshot, agent
 
@@ -455,6 +656,8 @@ class EngineWorker:
             except Exception:
                 # Removing unavailable targets from the heartbeat disables old
                 # buttons. Never leak node paths or exception text to the web.
+                if node in self.targets:
+                    self._rotate_target(node, self.target_origins.get(node, ""))
                 self.last_error = "target_unavailable"
         for origin, items in grouped.items():
             protocol = self.protocols[origin]
@@ -469,15 +672,19 @@ class EngineWorker:
                     if command is None:
                         continue
                     if (command.get("snapshot_sha256") != snapshot["binding_fingerprint"]
-                            or command.get("parent_task_id") not in descriptor["parent_task_ids"]):
+                            or command.get("parent_task_id") not in descriptor["parent_task_ids"]
+                            or _project_identity(command, strict=True) != _project_identity(descriptor, strict=True)):
                         await asyncio.to_thread(protocol.result, command, "failed", error_code="target_changed")
                         continue
                     task = asyncio.create_task(self.execute(node, agent, snapshot, protocol, command))
                     self.active[target_id] = task
                     self.active_origins[target_id] = origin
                     task.add_done_callback(lambda done, target=target_id: self._finished(target, done))
-            except Exception:
-                self.last_error = "broker_unavailable_or_auth_required"
+            except Exception as exc:
+                protocol.parent_settings_ready = False
+                self.last_error = ("parent_settings_server_upgrade_required"
+                                   if isinstance(exc, ValueError) and str(exc) == "web_rerender_parent_settings_server_upgrade_required"
+                                   else "broker_unavailable_or_auth_required")
         await asyncio.to_thread(self._save_status, grouped)
 
     def _finished(self, target_id: str, task: asyncio.Task) -> None:
@@ -491,7 +698,8 @@ class EngineWorker:
         document = {"schema": PROTOCOL, "session_id": self.session_id,
                     "updated_at": time.time(), "active_commands": len(self.active),
                     "error_code": self.last_error,
-                    "targets": [entry[1] for items in grouped.values() for entry in items]}
+                    "targets": [{**entry[1], "ready": bool(entry[1]["ready"] and self.protocols[origin].parent_settings_ready)}
+                                for origin, items in grouped.items() for entry in items]}
         path = self.journal.root / ("worker-" + self.session_id + ".json")
         temporary = path.with_suffix(".tmp")
         temporary.write_text(_json(document), encoding="utf-8")
@@ -517,10 +725,14 @@ class EngineWorker:
     async def execute(self, node: Any, agent: Any, snapshot: dict[str, Any],
                       protocol: BrokerProtocol, command: dict[str, Any]) -> None:
         target_id = command["target_id"]
+        project = _project_identity(command, strict=True)
+        if project != _project_identity(snapshot.get("project")):
+            raise ValueError("web_rerender_source_project_mismatch")
         normalized = {"command_id": command["operation_id"], "render_key": command["render_key"],
                       "parent_task_id": command["parent_task_id"], "review_id": command["review_id"],
                       "target_id": target_id, "binding_fingerprint": command["snapshot_sha256"],
-                      "prompt": command["web_prompt"]}
+                      "prompt": command["web_prompt"], **project}
+        normalized.update({field: deepcopy(command[field]) for field in PARENT_SETTINGS_CONTRACT_FIELDS if field in command})
         record = await asyncio.to_thread(self.journal.accept, origin=protocol.bridge.server_url,
                                          owner_key=protocol.owner_key, command=normalized)
         key = record["operation_key"]
@@ -538,6 +750,8 @@ class EngineWorker:
         renew = asyncio.create_task(self._renew(protocol, command, live, asyncio.current_task()))
         try:
             async with node._hmb_web_rerender_claim(snapshot) as claim:
+                frozen_settings = parent_generation_settings(command)
+                node._hmb_web_rerender_bind_parent_settings(claim, frozen_settings)
                 media = await node._hmb_web_rerender_prepare_media(claim)
                 if not live.is_set() or self.stopped:
                     raise RuntimeError("lease_lost")
@@ -548,7 +762,8 @@ class EngineWorker:
                 authority = agent._hmb_issue_web_rerender_authority(
                     request_id=command["operation_id"], generator=node, owner_key=protocol.owner_key)
                 result = await agent._hmb_run_web_rerender(
-                    command["web_prompt"], media, snapshot["generation_settings"], authority)
+                    command["web_prompt"], media, deepcopy(claim.parent_generation_context), authority)
+                _require_parent_policy_identity(result.get("policy_identity"))
                 # Store only safe output identity. Observations may contain
                 # implementation details and policy content stays in Agent.
                 saved = {field: deepcopy(result.get(field)) for field in
@@ -571,7 +786,7 @@ class EngineWorker:
                     checkpoint_sink=checkpoint, submission_bridge=bridge,
                     parent_task_id=command["parent_task_id"], command_id=command["operation_id"])
                 task_id = str(output.get("task_id") or "")
-                if not _ID.fullmatch(task_id):
+                if not _ID.fullmatch(task_id) or task_id == command["parent_task_id"]:
                     raise RuntimeError("missing_child_task")
                 self.children.setdefault(target_id, []).append(task_id)
                 # Broker is authoritative for provider completion. A local
@@ -585,11 +800,20 @@ class EngineWorker:
             if row["state"] not in _TERMINAL and row["state"] != "submitted":
                 uncertain = row["state"] in {"agent_running", "submitting"}
                 state = "uncertain" if uncertain else "failed"
+                error_code = "execution_uncertain" if uncertain else "execution_failed"
+                if (row["state"] == "agent_running"
+                        and getattr(exc, "_hmb_web_output_contract_failed", False) is True):
+                    state, error_code = "failed", "web_rerender_output_contract_invalid"
+                if (row["state"] == "render_preparing"
+                        and getattr(exc, "_hmb_web_submission_not_started", False) is True):
+                    status = getattr(exc, "status_code", None)
+                    error_code = (f"prepared_http_{status}" if type(status) is int and 100 <= status <= 599
+                                  else "prepared_request_failed")
                 await asyncio.to_thread(self.journal.transition, key, {row["state"]}, state,
-                                         error_code="execution_uncertain" if uncertain else "execution_failed")
+                                         error_code=error_code)
                 try:
                     await asyncio.to_thread(protocol.result, command, "failed",
-                                             error_code="execution_uncertain" if uncertain else "execution_failed")
+                                             error_code=error_code)
                 except Exception:
                     pass  # Lease expiry still fences all future submissions.
             if isinstance(exc, asyncio.CancelledError):

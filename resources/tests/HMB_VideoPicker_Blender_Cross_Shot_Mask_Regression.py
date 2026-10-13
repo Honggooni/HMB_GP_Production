@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 from pathlib import Path
 import sys
 import tempfile
@@ -24,6 +25,26 @@ SHOT_UUIDS = [
 
 def shot_row(state: dict, number: int) -> dict:
     return next(row for row in state["picker_shots"] if row["number"] == number)
+
+
+def registered_node():
+    node = picker.HMBVideoPickerLibrary(name="blender_cross_shot_mask_regression")
+    try:
+        from griptape_nodes.exe_types.flow import ControlFlow
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    except ImportError:
+        return node  # Hostless fallback has no retained-mode registry.
+    manager = GriptapeNodes.EventManager()
+    manager.initialize_queue()
+    options = {"name": "BlenderCrossShotMaskFixture"}
+    if "engine" in inspect.signature(ControlFlow).parameters:
+        options["engine"] = manager.engine
+    flow = ControlFlow(**options)
+    flow.add_node(node)
+    GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
+    GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
+    GriptapeNodes.NodeManager()._name_to_parent_flow_name[node.name] = flow.name
+    return node
 
 
 def run() -> None:
@@ -72,13 +93,14 @@ def run() -> None:
         state.update({"mask_enabled": False, "original_enabled": False,
                       "depth_enabled": True, "motion_guide_enabled": True})
 
-        node = picker.HMBVideoPickerLibrary(name="blender_cross_shot_mask_regression")
+        node = registered_node()
         node._write_state(state)
 
-        def generated_companions(_scene_text, _video_slot, context=None, *, publish_public=True):
+        def generated_companions(_scene_text, _video_slot, context=None, *, publish_public=True, selected_role=None):
             del publish_public
             assert context is not None and context.picker_shot_uuid == shot4
-            current = node._picker_state()
+            assert selected_role in ("depth", "motion_guide")
+            generated_item = None
             for role, kind, video_role, profile_key, profile in (
                 ("depth", picker.BLENDER_DEPTH_MEDIA_KIND, "blender_depth_companion",
                  "depth_profile", picker.BLENDER_DEPTH_PROFILE),
@@ -86,7 +108,9 @@ def run() -> None:
                  "blender_motion_guide_companion", "motion_guide_profile",
                  picker.BLENDER_MOTION_GUIDE_PROFILE),
             ):
-                current = picker._append_video_asset(current, {
+                if role != selected_role:
+                    continue
+                generated_item = {
                     "video_uid": f"provisional-shot4-{role}",
                     "video_url": f"https://media.example/new-shot4-{role}.mp4",
                     "video_path": f"https://media.example/new-shot4-{role}.mp4",
@@ -96,15 +120,16 @@ def run() -> None:
                     "scene_engine": "blender",
                     "bundle_run_id": "blender-new-shot4-bundle",
                     profile_key: profile,
-                }, picker_shot_uuid=shot4)
-            node._write_state(current)
+                }
+            assert generated_item is not None
             return {
                 "mode": "blender", "video": "",
-                "depth_video": "https://media.example/new-shot4-depth.mp4",
-                "motion_guide_video": "https://media.example/new-shot4-motion_guide.mp4",
-                "depth_succeeded": True,
-                "motion_guide_succeeded": True,
+                "depth_video": generated_item["video_path"] if selected_role == "depth" else "",
+                "motion_guide_video": generated_item["video_path"] if selected_role == "motion_guide" else "",
+                "depth_succeeded": selected_role == "depth",
+                "motion_guide_succeeded": selected_role == "motion_guide",
                 "bundle_run_id": "blender-new-shot4-bundle",
+                "generated_item": generated_item,
             }
 
         incoming = copy.deepcopy(node._picker_state())

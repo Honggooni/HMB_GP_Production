@@ -1,18 +1,21 @@
 """Offline durable web-rerender journal and actual Broker transport contracts."""
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, ExitStack
 from copy import deepcopy
 import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from urllib.request import Request
@@ -21,6 +24,7 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 import _hmb_web_rerender as target
+from _hmb_web_rerender_settings_fixtures import freeze_command, wire_settings
 from _hmb_seedance_clean_ci_stubs import install_clean_ci_griptape_stubs
 
 install_clean_ci_griptape_stubs()
@@ -35,7 +39,7 @@ TEXT = '한국어 수정 {{SIGN}} / {% include "literal" %}'
 
 
 def command():
-    return {
+    return freeze_command({
         "operation_id": OPERATION, "command_id": OPERATION, "target_id": TARGET,
         "session_id": SESSION, "lease_id": LEASE, "fence": 3,
         "render_key": "hmb-web-rerender-" + OPERATION,
@@ -43,8 +47,15 @@ def command():
         "binding_fingerprint": "a" * 64, "prompt": TEXT, "web_prompt": TEXT,
         "web_prompt_sha256": hashlib.sha256(TEXT.encode()).hexdigest(),
         "exclude_authored_prompt": True, "preserve_connected_sources": True,
-        "policy_required": True, "input_mode": "web_only",
-    }
+        "policy_required": False, "input_mode": "web_only",
+        "policy_application": "preserved_parent", "policy_reinjected": False,
+        "project_id": "superwings12", "project_name": "슈퍼윙즈12",
+    })
+
+
+def agent_result():
+    return {"text": TEXT, "output_sha256": hashlib.sha256(TEXT.encode()).hexdigest(),
+            "policy_identity": {"mode": "preserved_parent", "reinjected": False}}
 
 
 class ProtocolBridge:
@@ -111,7 +122,7 @@ class TransportRegression(unittest.TestCase):
         underlying = underlying or RecordingOpener()
         protocol = PreparedProtocol(type("Bridge", (), {"server_url": ORIGIN})(), hook=hook)
         live = threading.Event(); live.set()
-        result = {"text": TEXT, "output_sha256": hashlib.sha256(TEXT.encode()).hexdigest()}
+        result = agent_result()
         opener = target.CommandSubmissionOpener(underlying, protocol, current, self.journal, key, result, live)
         return opener, underlying, protocol, live, key
 
@@ -119,6 +130,7 @@ class TransportRegression(unittest.TestCase):
     def request(current=None, **extra):
         current = current or command()
         body = {"model": generator.SEEDANCE_2_5_MODEL_ID, "prompt": TEXT,
+                "project_id": current["project_id"], "project_name": current["project_name"],
                 "client_request_id": current["render_key"], "generate_audio": False, **extra}
         return Request(ORIGIN + "/api/v1/generate/video", data=json.dumps(body, ensure_ascii=False).encode(),
                        headers={"Idempotency-Key": current["render_key"]}, method="POST")
@@ -178,6 +190,9 @@ class TransportRegression(unittest.TestCase):
     def test_protocol_registration_owner_binding_and_routes(self):
         bridge = ProtocolBridge(); protocol = target.BrokerProtocol(bridge, WORKER, SESSION)
         bridge.response = {"schema": target.PROTOCOL, "worker_id": WORKER, "session_id": SESSION,
+                           "parent_settings_contract": target.PARENT_SETTINGS_SCHEMA,
+                           "project_routing": {"schema": target.PROJECT_ROUTING_SCHEMA,
+                                               "project_ids": sorted(target.PROJECT_IDS)},
                            "registered": True, "user_id": 123}
         protocol.heartbeat([], register=True)
         self.assertEqual(protocol.owner_key, "123")
@@ -194,6 +209,74 @@ class TransportRegression(unittest.TestCase):
             with self.subTest(route=route), self.assertRaises(ValueError):
                 protocol.request("POST", route, {})
 
+    def test_first_registration_uses_actual_bridge_get_signature_and_bound_reply(self):
+        capability = {"parent_settings_contract": target.PARENT_SETTINGS_SCHEMA,
+                           "project_routing": {"schema": target.PROJECT_ROUTING_SCHEMA,
+                                           "project_ids": sorted(target.PROJECT_IDS)}}
+        descriptor = {"target_id": TARGET, "project_id": "superwings12", "project_name": "슈퍼윙즈12"}
+        registration = {"schema": target.PROTOCOL, "worker_id": WORKER, "session_id": SESSION,
+                        "registered": True, "user_id": 123, **capability}
+        calls = []
+        reply = deepcopy(registration)
+        advertised_capability = deepcopy(capability)
+
+        def open_request(request, *, timeout):
+            self.assertEqual(timeout, 10)
+            self.assertEqual(request.get_header("Authorization"), "Bearer synthetic-registration-only")
+            method, url = request.get_method(), request.full_url
+            calls.append((method, url, deepcopy(request.data)))
+            if method == "GET":
+                self.assertEqual(url, ORIGIN + "/api/v1/reviews/capabilities")
+                self.assertIsNone(request.data, "Capability GET must not serialize an empty JSON body")
+                self.assertIsNone(request.get_header("Content-type"))
+                body = advertised_capability
+            else:
+                self.assertEqual(method, "POST")
+                self.assertIn(url, (ORIGIN + target.API_ROOT + "/worker/register",
+                                    ORIGIN + target.API_ROOT + "/worker/heartbeat"))
+                self.assertEqual(json.loads(request.data), {"worker_id": WORKER, "session_id": SESSION,
+                                                           "targets": [descriptor]})
+                body = reply
+            response = io.BytesIO(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+            response.status = 200
+            response.geturl = lambda: url
+            return response
+
+        # Keep the real request_json method and its mandatory payload keyword;
+        # only the credential fixture and wire opener are replaced. A permissive
+        # **kwargs bridge double would miss the production GET signature error.
+        bridge = generator._HMBAIBrokerBridge(opener=SimpleNamespace(open=open_request), server_url=ORIGIN)
+        with patch.object(bridge, "_load_access_token", return_value="synthetic-registration-only"), \
+             patch("socket.create_connection", side_effect=AssertionError("External network forbidden")), \
+             patch("socket.socket.connect", side_effect=AssertionError("External network forbidden")):
+            protocol = target.BrokerProtocol(bridge, WORKER, SESSION)
+            protocol.heartbeat([descriptor], register=True)
+            self.assertEqual([method for method, _, _ in calls], ["GET", "POST"])
+            self.assertEqual(protocol.owner_key, "123")
+            self.assertTrue(protocol.project_routing_ready)
+            protocol.heartbeat([descriptor])
+            self.assertEqual([method for method, _, _ in calls], ["GET", "POST", "POST"])
+            self.assertTrue(calls[-1][1].endswith("/worker/heartbeat"))
+
+            for field, value in (("worker_id", str(uuid4())), ("session_id", str(uuid4())),
+                                 ("schema", "foreign-protocol"), ("registered", 1)):
+                with self.subTest(binding_field=field):
+                    calls.clear(); reply = {**registration, field: value}
+                    fresh = target.BrokerProtocol(bridge, WORKER, SESSION)
+                    with self.assertRaisesRegex(ValueError, "invalid_web_rerender_registration"):
+                        fresh.heartbeat([descriptor], register=True)
+                    self.assertEqual([method for method, _, _ in calls], ["GET", "POST"])
+                    self.assertEqual(fresh.owner_key, "")
+                    self.assertFalse(fresh.project_routing_ready)
+
+            calls.clear(); advertised_capability = {}
+            fresh = target.BrokerProtocol(bridge, WORKER, SESSION)
+            with self.assertRaisesRegex(ValueError, "project_server_upgrade_required"):
+                fresh.heartbeat([descriptor], register=True)
+            self.assertEqual([method for method, _, _ in calls], ["GET"])
+            self.assertEqual(fresh.owner_key, "")
+        self.assertEqual(self.journal.descendants(ORIGIN, "123", "previous-render-task"), [])
+
     def test_protocol_rejects_malformed_leases_prompts_and_contracts(self):
         bridge = ProtocolBridge(); protocol = target.BrokerProtocol(bridge, WORKER, SESSION)
         bridge.response = {"command": command()}
@@ -206,13 +289,20 @@ class TransportRegression(unittest.TestCase):
             ("web_prompt", ""), ("web_prompt", "  \n"), ("web_prompt", 42),
             ("web_prompt", "x" * 54001), ("web_prompt_sha256", "0" * 64),
             ("exclude_authored_prompt", False), ("preserve_connected_sources", False),
-            ("policy_required", False), ("input_mode", "native"),
+            ("policy_required", True), ("input_mode", "native"),
             ("exclude_authored_prompt", 1), ("preserve_connected_sources", 1), ("policy_required", 1),
+            ("policy_required", 0), ("policy_application", "reinjected"),
+            ("policy_application", None), ("policy_reinjected", True), ("policy_reinjected", 0),
         ]
         for field, value in edits:
             changed = command(); changed[field] = value
             bridge.response = {"command": changed}
             with self.subTest(field=field, value=str(value)[:40]), self.assertRaises(ValueError):
+                protocol.claim(TARGET)
+        for field in ("policy_application", "policy_reinjected"):
+            missing = command(); missing.pop(field)
+            bridge.response = {"command": missing}
+            with self.subTest(missing=field), self.assertRaises(ValueError):
                 protocol.claim(TARGET)
         for length in (50000, 54000):
             good = command(); good["web_prompt"] = "x" * length
@@ -275,6 +365,128 @@ class TransportRegression(unittest.TestCase):
         self.assertEqual(len(wire.requests), 1)
         self.assertEqual(target.OperationJournal(self.root).read(key)["state"], "submitting")
 
+    def test_prepared_rejection_and_timeout_keep_create_unstarted(self):
+        for failure in ("conflict", "translated_timeout", "raw_timeout"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as folder:
+                journal = target.OperationJournal(folder)
+                current = command()
+                row = journal.accept(origin=ORIGIN, owner_key="123", command=current)
+                key = row["operation_key"]
+                journal.transition(key, {"accepted"}, "render_preparing")
+                wire = RecordingOpener()
+                bare = generator._HMBAIBrokerBridge(opener=wire, server_url=ORIGIN)
+                bare._load_access_token = lambda: "offline-fixture-only"
+                error = (generator._BrokerError("prepared conflict", status_code=409)
+                         if failure == "conflict" else
+                         generator._BrokerUnavailableError("prepared timeout")
+                         if failure == "translated_timeout" else TimeoutError("prepared timeout"))
+                protocol = PreparedProtocol(bare, hook=lambda: (_ for _ in ()).throw(error))
+                live = threading.Event(); live.set()
+                result = agent_result()
+                bridge = target.command_bridge(protocol, current, journal, key, result, live)
+                with self.assertRaises(generator._BrokerError) as raised:
+                    bridge._request_json("POST", "/api/v1/generate/video", timeout=1,
+                                         payload={"model": current["frozen_generation_settings"]["model"], "prompt": TEXT, "client_request_id": current["render_key"],
+                                                  "project_id": current["project_id"], "project_name": current["project_name"]},
+                                         submission=True, idempotency_key=current["render_key"])
+                self.assertIs(raised.exception._hmb_web_submission_not_started, True)
+                self.assertIs(raised.exception.submission_outcome_unknown, False)
+                if failure == "conflict":
+                    self.assertEqual(raised.exception.status_code, 409)
+                self.assertEqual(wire.requests, [])
+                self.assertEqual(journal.read(key)["state"], "render_preparing")
+
+    def test_real_create_errors_remain_unknown_without_preflight_marker(self):
+        for failure in ("timeout", "protocol"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as folder:
+                journal = target.OperationJournal(folder)
+                current = command()
+                key = journal.accept(origin=ORIGIN, owner_key="123", command=current)["operation_key"]
+                journal.transition(key, {"accepted"}, "render_preparing")
+                wire = RecordingOpener(fail=failure == "timeout")
+                if failure == "protocol":
+                    def invalid_response(request, *, timeout):
+                        wire.requests.append(request)
+                        # An arbitrary response field cannot grant the internal
+                        # exception authority to say a POST never happened.
+                        response = io.BytesIO(b'[{"_hmb_web_submission_not_started":true}]')
+                        response.status = 200
+                        response.geturl = lambda: request.full_url
+                        return response
+                    wire.open = invalid_response
+                bare = generator._HMBAIBrokerBridge(opener=wire, server_url=ORIGIN)
+                bare._load_access_token = lambda: "offline-fixture-only"
+                protocol = PreparedProtocol(bare)
+                live = threading.Event(); live.set()
+                result = agent_result()
+                bridge = target.command_bridge(protocol, current, journal, key, result, live)
+                with self.assertRaises(generator._BrokerError) as raised:
+                    bridge._request_json("POST", "/api/v1/generate/video", timeout=1,
+                                         payload={"model": current["frozen_generation_settings"]["model"], "prompt": TEXT, "client_request_id": current["render_key"],
+                                                  "project_id": current["project_id"], "project_name": current["project_name"]},
+                                         submission=True, idempotency_key=current["render_key"])
+                self.assertIs(raised.exception.submission_outcome_unknown, True)
+                self.assertIsNot(getattr(raised.exception, "_hmb_web_submission_not_started", None), True)
+                self.assertEqual(len(wire.requests), 1)
+                self.assertEqual(journal.read(key)["state"], "submitting")
+
+    def test_prepared_failure_discards_provisional_checkpoint_without_changing_node(self):
+        # Reuse the real Generator fixture's isolated native-node environment.
+        spec = importlib.util.spec_from_file_location(
+            "_transport_preflight_generator_fixture", ROOT / "resources/tests/HMB_Seedance_Web_Rerender_Regression.py")
+        fixture = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = fixture
+        spec.loader.exec_module(fixture)
+        module, base, execution = fixture.target, fixture.Base, fixture.Execution
+        with ExitStack() as stack:
+            folder = stack.enter_context(tempfile.TemporaryDirectory())
+            stack.enter_context(patch.dict(os.environ, {"LOCALAPPDATA": folder}))
+            for owner, name, replacement in (
+                (base, "_runtime_node_is_live", lambda self, **kw: not self._hmb_node_deleted),
+                (base, "_manual_agent_prompt_source", lambda self: fixture.agent),
+                (base, "_exact_incoming_source", lambda self, *a, **kw: None),
+                (base, "_has_incoming_parameter_connection", lambda self, name: False),
+                (base, "_generation_recovery_blocks_new_submission", lambda self: False),
+                (module.GriptapeNodes, "NodeManager", lambda: SimpleNamespace(get_node_parent_flow_by_name=lambda name: "flow-web")),
+                (execution, "_preflight_output_destination", lambda *a, **kw: None),
+                (execution, "_prepare_video_references_for_run", lambda self, params: params),
+                (module._HMBWebRerenderOutput, "build_file", lambda self: object()),
+                (module, "_resolve_mp4_decode_verifier", lambda: SimpleNamespace(executable="offline", backend="offline")),
+                (module, "_get_build_diagnostics", lambda: {}),
+            ):
+                stack.enter_context(patch.object(owner, name, replacement, create=True))
+
+            async def verify():
+                for failure in ("conflict", "timeout"):
+                    node = fixture.new_node()
+                    checkpoints = []
+                    def sink(value, *, reason, required):
+                        checkpoints.append((deepcopy(value), reason))
+                    bridge = fixture.Broker(checkpoints)
+                    error = (module._BrokerError("prepared rejected", status_code=409) if failure == "conflict"
+                             else module._BrokerUnavailableError("prepared timeout"))
+                    error._hmb_web_submission_not_started = True
+                    def reject(*args, **kwargs):
+                        raise error
+                    bridge.generate_seedance = reject
+                    snapshot = node._hmb_web_rerender_capture_inputs()
+                    with self.subTest(failure=failure):
+                        async with node._hmb_web_rerender_claim(snapshot) as claim:
+                            node._hmb_web_rerender_bind_parent_settings(claim, wire_settings(snapshot["generation_settings"]))
+                            await node._hmb_web_rerender_prepare_media(claim)
+                            with self.assertRaises(module._BrokerError) as raised:
+                                await node._hmb_web_rerender_execute(claim, fixture.result(),
+                                    client_request_id="hmb-preflight-" + failure, output_directory=folder,
+                                    checkpoint_sink=sink, submission_bridge=bridge, parent_task_id="original-task")
+                        self.assertIs(raised.exception, error)
+                        self.assertIs(raised.exception.submission_outcome_unknown, False)
+                        self.assertEqual(bridge.calls, [])
+                        self.assertIn("web_prepared_not_submitted", [reason for _, reason in checkpoints])
+                        self.assertFalse(checkpoints[-1][0].get("task_id"))
+                        self.assertNotIn("submission_unknown", [value.get("status") for value, _ in checkpoints])
+                        fixture.unchanged(node)
+            asyncio.run(verify())
+
     def test_claim_headers_are_bound_to_exact_create_endpoint(self):
         opener, wire, protocol, live, key = self.opener()
         for url, method in ((ORIGIN + "/api/v1/jobs/old/refresh", "POST"),
@@ -292,11 +504,15 @@ class TransportRegression(unittest.TestCase):
         with patch.object(generator, "_broker_load_token", return_value="offline-synthetic-token"), patch.object(generator, "_broker_validated_server_url", return_value=ORIGIN):
             bridge = generator._HMBAIBrokerBridge(opener=wire, server_url=ORIGIN)
             protocol = PreparedProtocol(bridge)
-            key = self.prepared()
+            current = freeze_command(command(), {"model": generator.SEEDANCE_2_0_MODEL_ID,
+                "input_mode": generator.INPUT_MODE_TEXT_ONLY, "resolution": "1080p",
+                "duration_seconds": 4, "aspect_ratio": "16:9", "generate_audio": False})
+            key = self.prepared(current)
             live = threading.Event(); live.set()
-            result = {"text": TEXT, "output_sha256": hashlib.sha256(TEXT.encode()).hexdigest()}
-            wrapped = target.command_bridge(protocol, command(), self.journal, key, result, live)
+            result = agent_result()
+            wrapped = target.command_bridge(protocol, current, self.journal, key, result, live)
             payload = {"model": generator.SEEDANCE_2_0_MODEL_ID, "provider": "volcengine_ark",
+                       "project_id": "superwings12", "project_name": "슈퍼윙즈12",
                        "prompt": TEXT, "task": generator.TASK_TEXT_ONLY,
                        "output_format": "mp4", "return_last_frame": True,
                        "client_request_id": command()["render_key"], "generate_audio": False,

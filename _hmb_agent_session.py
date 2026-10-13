@@ -22,6 +22,92 @@ _state = _STATE_EMPTY
 _payload_bytes: bytearray | None = None
 
 
+class _ProjectSession:
+    """One terminal authenticated session, isolated from every other project."""
+
+    def __init__(self) -> None:
+        self.condition = threading.Condition(threading.RLock())
+        self.state = _STATE_EMPTY
+        self.payload: bytearray | None = None
+
+    def bootstrap(self, authorization_probe, loader) -> None:
+        if not callable(authorization_probe) or not callable(loader):
+            raise TypeError("Agent policy bootstrap callbacks must be callable")
+        with self.condition:
+            while self.state == _STATE_LOADING:
+                self.condition.wait()
+            if self.state == _STATE_READY:
+                return
+            if self.state != _STATE_EMPTY:
+                raise _unavailable()
+            try:
+                if authorization_probe() is not True:
+                    raise _unavailable()
+            except BaseException as exc:
+                self.state = _STATE_FAILED
+                self.condition.notify_all()
+                if isinstance(exc, Exception):
+                    raise _unavailable() from None
+                raise
+            self.state = _STATE_LOADING
+        candidate = None
+        try:
+            candidate = _encode_private_snapshot(loader())
+        except BaseException as exc:
+            with self.condition:
+                if self.state != _STATE_CLOSED:
+                    self.state = _STATE_FAILED
+                self.condition.notify_all()
+            _wipe(candidate)
+            if isinstance(exc, Exception):
+                raise _unavailable() from None
+            raise
+        with self.condition:
+            if self.state == _STATE_CLOSED:
+                _wipe(candidate)
+                raise _unavailable()
+            self.payload = candidate
+            self.state = _STATE_READY
+            self.condition.notify_all()
+
+    def read(self) -> dict[str, Any]:
+        with self.condition:
+            if self.state != _STATE_READY or self.payload is None:
+                raise _unavailable()
+            try:
+                return _decode_private_snapshot(self.payload)
+            except Exception:
+                _wipe(self.payload)
+                self.payload = None
+                self.state = _STATE_FAILED
+                self.condition.notify_all()
+                raise _unavailable() from None
+
+    def close(self) -> None:
+        with self.condition:
+            _wipe(self.payload)
+            self.payload = None
+            self.state = _STATE_CLOSED
+            self.condition.notify_all()
+
+    def status(self) -> tuple[str, int]:
+        with self.condition:
+            return self.state, len(self.payload) if self.payload is not None else 0
+
+
+_project_sessions = {name: _ProjectSession() for name in ("dinoster5", "katuri8")}
+
+
+def _project_session(project_id: str | None):
+    # Keep the historic default cell for saved workflows and callers that do
+    # not yet carry project metadata. Its only identity is Super Wings 12.
+    if project_id in (None, "superwings12"):
+        return None
+    if project_id not in _project_sessions:
+        raise ValueError("project_unknown")
+    return _project_sessions[project_id]
+
+
 def _wipe(value: bytearray | None) -> None:
     """Overwrite one owned mutable buffer without making a best-effort claim absolute."""
 
@@ -125,6 +211,8 @@ def bootstrap_once(
 def bootstrap_once_authorized(
     authorization_probe: Callable[[], bool],
     loader: Callable[[], dict[str, Any]],
+    *,
+    project_id: str | None = None,
 ) -> None:
     """Claim the one-shot session atomically, then load outside its lock.
 
@@ -137,6 +225,9 @@ def bootstrap_once_authorized(
     result.
     """
 
+    project = _project_session(project_id)
+    if project is not None:
+        return project.bootstrap(authorization_probe, loader)
     if not callable(authorization_probe) or not callable(loader):
         raise TypeError("Agent policy bootstrap callbacks must be callable")
 
@@ -191,9 +282,12 @@ def bootstrap_once_authorized(
         _condition.notify_all()
 
 
-def read_ready() -> dict[str, Any]:
+def read_ready(*, project_id: str | None = None) -> dict[str, Any]:
     """Return a defensive copy of READY state and never invoke a loader."""
 
+    project = _project_session(project_id)
+    if project is not None:
+        return project.read()
     global _payload_bytes, _state
     with _condition:
         if _state != _STATE_READY or _payload_bytes is None:
@@ -213,6 +307,8 @@ def _expire_for_process_shutdown() -> None:
     """Expire the in-memory snapshot when the Griptape engine process exits."""
 
     global _payload_bytes, _state
+    for project in _project_sessions.values():
+        project.close()
     with _condition:
         owned = _payload_bytes
         _payload_bytes = None
@@ -221,9 +317,12 @@ def _expire_for_process_shutdown() -> None:
         _condition.notify_all()
 
 
-def _status_for_regression() -> tuple[str, int]:
+def _status_for_regression(*, project_id: str | None = None) -> tuple[str, int]:
     """Expose no policy bytes; return only bounded lifecycle diagnostics."""
 
+    project = _project_session(project_id)
+    if project is not None:
+        return project.status()
     with _condition:
         return _state, len(_payload_bytes) if _payload_bytes is not None else 0
 

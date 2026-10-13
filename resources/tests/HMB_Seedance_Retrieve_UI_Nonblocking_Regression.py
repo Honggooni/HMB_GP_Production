@@ -112,6 +112,11 @@ def make_node(name, bridge):
     node._generation_refresh_lock = threading.Lock()
     node._generation_refresh_running = False
     node._generation_run_active = threading.Event()
+    node._hmb_draft_finalize_pending = False
+    node._hmb_draft_finalize_task = None
+    node._hmb_draft_final_context = None
+    node._hmb_draft_controls_syncing = False
+    node._hmb_draft_pending_source = {}
     node._hmb_generation_started_monotonic = None
     node._hmb_generation_started_at_ms = 0
     node.parameter_output_values = {
@@ -252,6 +257,7 @@ sync_node = SimpleNamespace(
         "shot_name": "Only",
     },
     _hmb_available_seedance_shot_catalog=lambda _snapshot: {},
+    _draft_ui_state=lambda: target._seedance_draft_ui_value(),
     get_parameter_value=lambda name: sync_values.get(name),
     _set_shot_value=sync_setter,
     publish_update_to_parameter=sync_publisher,

@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import math
 import re
 import secrets
 import sys
@@ -35,6 +36,7 @@ def _load_hmb_common():
 
 
 _hmb = _load_hmb_common()
+from _hmb_project import ProjectPolicyPendingError, project_from_asset_payload, resolve_project
 DataNode = _hmb.DataNode
 Parameter = _hmb.Parameter
 ParameterMode = _hmb.ParameterMode
@@ -75,6 +77,10 @@ _HMB_POLICY_UNAVAILABLE_MESSAGE = (
     "[HMB LOCAL POLICY REQUIRED] The signed local Agent policy is unavailable "
     "or invalid. Reinstall or update HMB_GP_Production from the approved "
     "package, then restart the official Griptape Desktop application."
+)
+_HMB_PROJECT_POLICY_PENDING_MESSAGE = (
+    "[HMB PROJECT POLICY PENDING] 선택한 프로젝트의 정책이 준비 중입니다. "
+    "다이노스터·까투리8 정책을 해당 프로젝트 폴더에 설치한 후 다시 실행하세요."
 )
 _HMB_SOURCE_CONTRACT_INVALID_MESSAGE = (
     "[HMB SOURCE CONTRACT INVALID] 구조화된 HMB 소스 데이터의 형식 또는 주소가 "
@@ -169,14 +175,14 @@ async def _acquire_agent_execution_gate(node):
 
 
 async def _run_web_rerender_worker(execution, callback):
-    """Keep policy/model I/O off the loop and drain before facade cleanup."""
+    """Keep native model I/O off the loop and drain before facade cleanup."""
     pending = asyncio.create_task(asyncio.to_thread(callback))
     try:
         return await asyncio.shield(pending)
     except asyncio.CancelledError:
         execution._hmb_web_cancelled = True
-        # Neither a policy load nor native stream may outlive its reservation
-        # and write into a cleared facade. Repeated cancellation remains safe.
+        # A native stream must not outlive its reservation and write into a
+        # cleared facade. Repeated cancellation remains safe.
         while not pending.done():
             try:
                 await asyncio.shield(pending)
@@ -1611,24 +1617,85 @@ class HMBAgentLibrary(_BaseAgent):
     def _hmb_web_rerender_busy(self) -> bool:
         return _agent_execution_gate(self).locked()
 
-    def _hmb_web_rerender_policy_status(self) -> dict[str, Any]:
+    def _hmb_selected_project(self) -> dict[str, str]:
+        """Resolve only the verified Prompt's connected ImageAsset identity."""
+        source = getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
+        project_getter = getattr(source, "_hmb_project_identity", None)
+        if callable(project_getter):
+            return resolve_project(project_getter(), default_legacy=False)
+        sources = getattr(source, "_hmb_connected_source_nodes", {})
+        selected = []
+        if isinstance(sources, dict):
+            for key in ("SHOT_ASSET_IN", "IMAGE_ASSET_IN"):
+                asset = sources.get(key)
+                if asset is not None and not any(asset is other for other in selected):
+                    selected.append(asset)
+        if len(selected) > 1:
+            raise ValueError("project_source_ambiguous")
+        if selected:
+            asset = selected[0]
+            identity = getattr(asset, "_hmb_project_identity", None)
+            if callable(identity):
+                return resolve_project(identity(), default_legacy=False)
+            getter = getattr(asset, "get_parameter_value", None)
+            if not callable(getter):
+                raise ValueError("project_source_unavailable")
+            return project_from_asset_payload(getter("HMB_IMAGE_ASSET_STATE"), default_legacy=False)
+        # Old Prompt-only workflows have no asset project. A legacy rich
+        # ImageAsset input may still carry one; do not infer from user prose.
+        getter = getattr(source, "get_parameter_value", None)
+        projects = []
+        if callable(getter):
+            for key in ("SHOT_ASSET_IN", "IMAGE_ASSET_IN"):
+                try:
+                    value = getter(key)
+                except Exception:
+                    continue
+                if value is None or value == "":
+                    continue
+                # Legacy IMAGE_ASSET_IN is a wildcard and may contain ordinary
+                # media values/data URIs/lists, with no library identity at
+                # all. Only object-shaped project payloads participate here;
+                # malformed JSON objects still fail instead of becoming SW.
+                if isinstance(value, str) and not value.lstrip().startswith("{"):
+                    continue
+                if isinstance(value, (list, tuple)):
+                    project_fields = {"project_id", "project_name", "project_folder", "project_root", "project"}
+                    if any(isinstance(item, dict) and project_fields.intersection(item) for item in value):
+                        raise ValueError("project_payload_invalid")
+                    continue
+                if not isinstance(value, (dict, str)):
+                    continue
+                try:
+                    projects.append(project_from_asset_payload(value, default_legacy=False))
+                except ValueError as exc:
+                    if str(exc) != "project_required":
+                        raise
+        if projects and any(item["project_id"] != projects[0]["project_id"] for item in projects):
+            raise ValueError("project_identity_mismatch")
+        return projects[0] if projects else resolve_project()
+
+    def _hmb_web_rerender_policy_status(self, project_id=None) -> dict[str, Any]:
         """Read-only signed artifact readiness; no model call or session claim.
 
-        The worker may call this in to_thread for heartbeat publication. Actual
-        execution still performs the authenticated session bootstrap and load.
+        The worker may call this in to_thread for heartbeat publication. This
+        verifies the installed artifact only; web revision never loads its
+        rules into the Agent or applies them again to the recorded prompt.
         """
         try:
-            state = _hmb._agent_process_session._status_for_regression()[0]
+            project = resolve_project(project_id) if project_id is not None else self._hmb_selected_project()
+            payload = _hmb._load_verified_agent_rule_payload(project["project_id"])
+            state = _hmb._agent_policy_session_state(project["project_id"])
             if str(state).casefold() in {"failed", "closed"}:
                 return {"ready": False, "version": "", "sha256": "", "reason": "policy_session_unavailable"}
-            encoded = _hmb._read_agent_policy_envelope()
-            payload = _hmb._validate_agent_policy_payload(_hmb._decode_signed_agent_policy_envelope(encoded))
             return {
                 "ready": True,
                 "version": str(payload.get("final_policy_version") or ""),
-                "sha256": hashlib.sha256(encoded).hexdigest(),
+                "sha256": str(payload.get("envelope_sha256") or ""),
                 "reason": "",
             }
+        except ProjectPolicyPendingError:
+            return {"ready": False, "version": "", "sha256": "", "reason": "project_policy_pending"}
         except Exception:
             return {"ready": False, "version": "", "sha256": "", "reason": "policy_unavailable"}
 
@@ -1638,9 +1705,10 @@ class HMBAgentLibrary(_BaseAgent):
         """Run one authenticated web prompt without publishing or editing nodes.
 
         The engine worker reserves and verifies the exact Generator first. A
-        local capability, never request JSON, authorizes the separate policy
-        path. Original Prompt text and paired snapshots are intentionally not
-        consulted. Ordinary editor execution retains its canonical edge gate.
+        local capability, never request JSON, authorizes revision of the
+        already-policy-applied parent prompt. No HMB policy is loaded or
+        reinjected. Original Prompt text and paired snapshots are intentionally
+        not consulted. Ordinary editor execution retains its canonical edge gate.
         """
         if type(request_identity) is not _HMBWebRerenderAuthority:
             raise TypeError("Web rerender requires engine-issued authority.")
@@ -1656,22 +1724,7 @@ class HMBAgentLibrary(_BaseAgent):
             if bool(getattr(request_identity.generator, "_hmb_node_deleted", False)):
                 raise RuntimeError("Web rerender Generator is unavailable.")
             execution = _HMBWebRerenderExecution._from_owner(self, prompt, media, settings)
-            try:
-                def load_policy():
-                    _hmb._bootstrap_agent_policy_session()
-                    return execution._load_hmb_rules()
-
-                (
-                    execution._hmb_policy,
-                    execution._hmb_binding,
-                    execution._hmb_policy_rules,
-                    execution._hmb_binding_rules,
-                ) = await _run_web_rerender_worker(execution, load_policy)
-            except Exception:
-                raise RuntimeError(_HMB_POLICY_UNAVAILABLE_MESSAGE) from None
-            execution._hmb_ruleset_names = (secrets.token_hex(16), secrets.token_hex(16))
-            execution._hmb_rules_active = True
-            policy_identity = dict(execution._hmb_policy_identity)
+            policy_identity = {"mode": "preserved_parent", "reinjected": False}
             run_id = secrets.token_hex(16)
             execution._hmb_execution_result = {"status": "running", "run_id": run_id}
             iterator = execution._run_native_agent_once()
@@ -1689,8 +1742,9 @@ class HMBAgentLibrary(_BaseAgent):
                 raise asyncio.CancelledError()
             execution._secure_hmb_outputs()
             text = execution.parameter_output_values.get("output")
-            if execution._hmb_last_sanitizer_status != "clean" or not isinstance(text, str) or not text.strip() or len(text) > 50000:
+            if execution._hmb_last_sanitizer_status != "clean":
                 raise RuntimeError(_HMB_EXECUTION_FAILED_MESSAGE)
+            text = _web_rerender_instruction(text, prompt)
             return {
                 "text": text,
                 "run_id": run_id,
@@ -1700,6 +1754,11 @@ class HMBAgentLibrary(_BaseAgent):
             }
         except asyncio.CancelledError:
             raise
+        except _HMBWebRerenderOutputContractError:
+            raise _HMBWebRerenderOutputContractError(
+                "WEB_RERENDER_OUTPUT_CONTRACT: The Agent did not return a valid final "
+                "Generator instruction. No video generation was submitted."
+            ) from None
         except Exception as exc:
             if str(exc) == _HMB_POLICY_UNAVAILABLE_MESSAGE:
                 raise
@@ -1746,6 +1805,7 @@ class HMBAgentLibrary(_BaseAgent):
             code = str(getattr(self, "_hmb_native_failure_code", "") or _hmb_native_failure_code(exc))
             known = {
                 _HMB_POLICY_UNAVAILABLE_MESSAGE: "POLICY_UNAVAILABLE",
+                _HMB_PROJECT_POLICY_PENDING_MESSAGE: "PROJECT_POLICY_PENDING",
                 _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE: "SOURCE_UNAVAILABLE",
                 _HMB_SOURCE_CONTRACT_INVALID_MESSAGE: "SOURCE_UNAVAILABLE",
             }
@@ -3112,7 +3172,8 @@ class HMBAgentLibrary(_BaseAgent):
         # The signed policy session supplies the bundled DAT. Decoded
         # rule text exists only for this native call and is cleared immediately
         # afterward; no plaintext policy is persisted on the node.
-        payload = _hmb._load_agent_rule_payload()
+        project_id = getattr(self, "_hmb_execution_project_id", "") or "superwings12"
+        payload = _hmb._load_agent_rule_payload() if project_id == "superwings12" else _hmb._load_agent_rule_payload(project_id)
         policy = str(payload.get("policy") or "").strip()
         binding = str(payload.get("binding") or "").strip()
         if not policy or not binding:
@@ -3120,6 +3181,7 @@ class HMBAgentLibrary(_BaseAgent):
         policy_rules = _split_behavior_rules(policy, 4)
         binding_rules = _split_behavior_rules(binding, 4)
         self._hmb_policy_identity = {
+            "project_id": project_id,
             "version": str(payload.get("final_policy_version") or ""),
             "contract_sha256": str(
                 payload.get("policy_pair_sha256") or ""
@@ -3149,6 +3211,7 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_binding_rules = []
         self._hmb_ruleset_names = ("", "")
         self._hmb_policy_identity = {}
+        self._hmb_execution_project_id = ""
         self._hmb_runtime_prompt = ""
         self._hmb_native_prompt_read_active = False
         self._hmb_verified_prompt_source_node = None
@@ -3309,7 +3372,7 @@ class HMBAgentLibrary(_BaseAgent):
     def _handle_additional_context(self, prompt: str, additional_context: Any) -> str:
         """Keep verified HMB machine data literal; preserve ordinary Agent templates."""
 
-        if self._hmb_rules_active and isinstance(additional_context, dict):
+        if (self._hmb_rules_active or isinstance(self, _HMBWebRerenderExecution)) and isinstance(additional_context, dict):
             # process() enables this flag only after validating the canonical
             # Prompt's paired snapshot. That machine envelope contains user data,
             # not a Jinja template: rendering it would consume literal {{...}}
@@ -3331,7 +3394,8 @@ class HMBAgentLibrary(_BaseAgent):
     def _process(self, agent: Any, prompt: Any) -> Any:
         """Use the Standard processor; constrain only canonical HMB output prose."""
 
-        hmb_request = bool(self._hmb_rules_active)
+        web_revision = isinstance(self, _HMBWebRerenderExecution)
+        hmb_request = bool(self._hmb_rules_active) or web_revision
         native_processor = getattr(super(), "_process", None)
         if not callable(native_processor):
             # Import-only/test fallback. Official Griptape always supplies the
@@ -3347,7 +3411,8 @@ class HMBAgentLibrary(_BaseAgent):
                 or bool(getattr(self, "is_cancellation_requested", False))
             ):
                 return agent
-            prompt = _with_english_agent_output_contract(prompt)
+            if not web_revision:
+                prompt = _with_english_agent_output_contract(prompt)
             # Optional execution facts and reference pixels augment the same
             # native call. Their absence never invalidates the authenticated
             # source text, changes the user's model, or launches an analysis
@@ -3363,8 +3428,10 @@ class HMBAgentLibrary(_BaseAgent):
                 try:
                     settings = settings_getter(machine)
                     if isinstance(settings, dict) and settings:
+                        heading = ("HMB RECORDED PARENT GENERATOR SETTINGS (READ-ONLY DATA):"
+                                   if web_revision else "HMB CURRENT GENERATOR SETTINGS (READ-ONLY DATA):")
                         prompt += (
-                            "\n\nHMB CURRENT GENERATOR SETTINGS (READ-ONLY DATA):\n"
+                            "\n\n" + heading + "\n"
                             + json.dumps(settings, ensure_ascii=False, separators=(",", ":"))
                         )
                 except Exception:
@@ -3417,7 +3484,7 @@ class HMBAgentLibrary(_BaseAgent):
             )
         self._hmb_native_calls_this_process += 1
         native_iterator = super().process()
-        if not self._hmb_rules_active:
+        if not self._hmb_rules_active and not isinstance(self, _HMBWebRerenderExecution):
             send_value: Any = None
             first_step = True
             try:
@@ -3675,7 +3742,20 @@ class HMBAgentLibrary(_BaseAgent):
             # packaged Griptape engine process. Only a canonical HMB Prompt ->
             # Agent execution can initialize the protected in-memory session.
             self._set_agent_execution_phase("authorizing")
-            _hmb._bootstrap_agent_policy_session()
+            self._hmb_execution_project_id = self._hmb_selected_project()["project_id"]
+            if self._hmb_execution_project_id != "superwings12":
+                # Readiness verifies only the installed artifact. An expected
+                # pending project must not consume its terminal authorization
+                # cell or silently substitute the Super Wings policy.
+                if self._hmb_web_rerender_policy_status(self._hmb_execution_project_id).get("reason") == "project_policy_pending":
+                    raise ProjectPolicyPendingError("Selected project policy has not been supplied.")
+            if self._hmb_execution_project_id == "superwings12":
+                _hmb._bootstrap_agent_policy_session()
+            else:
+                _hmb._bootstrap_agent_policy_session(self._hmb_execution_project_id)
+        except ProjectPolicyPendingError:
+            self._publish_hmb_execution_block(_HMB_PROJECT_POLICY_PENDING_MESSAGE)
+            raise RuntimeError(_HMB_PROJECT_POLICY_PENDING_MESSAGE) from None
         except Exception:
             self._publish_hmb_execution_block(_HMB_POLICY_UNAVAILABLE_MESSAGE)
             raise RuntimeError(_HMB_POLICY_UNAVAILABLE_MESSAGE) from None
@@ -3708,6 +3788,8 @@ class HMBAgentLibrary(_BaseAgent):
                 _AGENT_SHOT_PROMPT_INPUT_PARAMETER
             )
             machine_prompt = _paired_machine_prompt(self, prompt_value)
+            if self._hmb_selected_project()["project_id"] != self._hmb_execution_project_id:
+                raise RuntimeError("HMB selected project changed while preparing the Agent.")
             source_node = getattr(self, _VERIFIED_PROMPT_SOURCE_ATTRIBUTE, None)
             context_getter = getattr(source_node, "_hmb_agent_shot_context", None)
             if callable(context_getter):
@@ -3867,6 +3949,86 @@ class HMBAgentLibrary(_BaseAgent):
         return result
 
 
+_WEB_RERENDER_OUTPUT_CONTRACT = "hmb-web-rerender-instruction-v1"
+_WEB_RERENDER_OUTPUT_RULESET = "hmb-web-rerender-output-contract-v1"
+
+
+class _HMBWebRerenderOutputContractError(RuntimeError):
+    """A request-local output failed validation before the Generator can run."""
+    _hmb_web_output_contract_failed = True
+    _hmb_web_output_contract_code = "web_rerender_output_contract_invalid"
+
+
+def _web_rerender_output_schema(prompt):
+    """Use the installed Standard Agent's structured-output implementation."""
+    return {
+        "type": "object",
+        "properties": {
+            "contract": {"type": "string", "enum": [_WEB_RERENDER_OUTPUT_CONTRACT]},
+            "source_sha256": {"type": "string", "enum": [_prompt_text_sha256(prompt)]},
+            "instruction": {"type": "string", "minLength": 1, "maxLength": 50000,
+                "description": "The complete revised final video Generator instruction, with no analysis or commentary."},
+        },
+        "required": ["contract", "source_sha256", "instruction"],
+        "additionalProperties": False,
+    }
+
+
+def _web_rerender_output_rules(prompt):
+    # This is a transport/output contract, not project policy. The recorded
+    # parent already contains its approved policy; never reload or restate it.
+    return {"name": _WEB_RERENDER_OUTPUT_RULESET, "rules": [
+        "Revise the recorded final video Generator instruction using its appended Review. "
+        "Return the complete revised Generator instruction ready for immediate video generation. "
+        "Apply the review as an edit to that instruction; do not answer the reviewer, assess the "
+        "feedback, explain your reasoning, or provide a recommendation or settings report. "
+        "Preserve the parent instruction's established project treatment and every unaffected "
+        "requirement. Use the connected reference media and the read-only recorded parent Generator settings; "
+        "do not invent or change sources, settings, durations, or OFF/false/0 values. "
+        "Preserve literal user text, names, Korean text, reference tokens and template-like text. "
+        "If the review cannot justify a change, return the complete parent instruction unchanged. "
+        "The required JSON envelope is an output protocol only. Return exactly contract, "
+        "source_sha256, and instruction, with no surrounding prose or Markdown fence. "
+        "Only instruction will be sent to the video Generator. Set contract to "
+        + _WEB_RERENDER_OUTPUT_CONTRACT + " and copy the host-provided source_sha256 "
+        + _prompt_text_sha256(prompt) + " exactly; do not calculate a hash yourself."
+    ]}
+
+
+def _web_rerender_instruction(value, prompt):
+    """Fail closed on a prose answer or a malformed/mismatched envelope.
+
+    No heading/language heuristic can establish that prose is a usable render
+    instruction. Require the native structured contract instead, then publish
+    only its instruction string without normalization or template expansion.
+    """
+    def unique_object(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise _HMBWebRerenderOutputContractError()
+            result[key] = item
+        return result
+
+    # A non-BMP character can occupy twelve ASCII JSON characters as a
+    # surrogate-pair escape, while still being one instruction character.
+    if not isinstance(value, str) or not value.strip() or len(value) > 610000:
+        raise _HMBWebRerenderOutputContractError()
+    try:
+        parsed = json.loads(value, object_pairs_hook=unique_object)
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise _HMBWebRerenderOutputContractError() from exc
+    if (not isinstance(parsed, dict)
+            or set(parsed) != {"contract", "source_sha256", "instruction"}
+            or parsed["contract"] != _WEB_RERENDER_OUTPUT_CONTRACT
+            or parsed["source_sha256"] != _prompt_text_sha256(prompt)
+            or not isinstance(parsed["instruction"], str)
+            or not parsed["instruction"].strip()
+            or len(parsed["instruction"]) > 50000):
+        raise _HMBWebRerenderOutputContractError()
+    return parsed["instruction"]
+
+
 def _web_rerender_snapshots(media_snapshot, generation_settings, prompt):
     if (
         not isinstance(media_snapshot, dict)
@@ -3891,11 +4053,26 @@ def _web_rerender_snapshots(media_snapshot, generation_settings, prompt):
         media[kind + "s"] = records
     media["machine_sha256"] = _prompt_text_sha256(prompt)
     allowed = {
-        "model_id", "task", "duration", "duration_seconds", "duration_mode",
+        "model", "model_id", "task", "input_mode", "quality", "omni_reference_task_type",
+        "duration", "duration_seconds", "duration_mode", "execution_expires_after", "priority",
         "aspect_ratio", "ratio", "resolution", "output_format", "seed",
         "return_last_frame", "generate_audio", "camera_fixed", "watermark",
     }
-    settings = {key: copy.deepcopy(value) for key, value in generation_settings.items() if key in allowed}
+    settings = {}
+    boolean_fields = {"return_last_frame", "generate_audio", "camera_fixed", "watermark"}
+    numeric_fields = {"duration", "duration_seconds", "execution_expires_after", "priority", "seed"}
+    for key, value in generation_settings.items():
+        if key not in allowed:
+            continue
+        if key in boolean_fields:
+            valid = type(value) is bool
+        elif key in numeric_fields:
+            valid = type(value) in {int, float} and abs(value) <= 10**15 and math.isfinite(value)
+        else:
+            valid = isinstance(value, str) and 0 < len(value) <= 256
+        if not valid:
+            raise ValueError("Web rerender generation settings must contain bounded scalar values.")
+        settings[key] = value
     # These snapshots cross no policy/auth boundary and contain data only. Do
     # not carry a client instance, credential or executable object to the LLM.
     json.dumps(media, ensure_ascii=False, allow_nan=False)
@@ -3948,6 +4125,27 @@ class _HMBWebRerenderExecution(HMBAgentLibrary):
             node.parameter_values[key] = copy.deepcopy(owner.get_parameter_value(key))
         for key in ("tools", "rulesets"):
             node.parameter_values[key] = copy.deepcopy(owner.get_parameter_list_value(key))
+        # A stale owner execution may still expose its ephemeral HMB rule
+        # scopes through the getter. Preserve caller rules, never carry these
+        # runtime additions into revision of an already processed prompt.
+        runtime_scopes = {name for name in getattr(owner, "_hmb_ruleset_names", ()) if name}
+        if runtime_scopes:
+            def caller_rules(values):
+                return [value for value in values if (
+                    value.get("name") if isinstance(value, dict) else getattr(value, "name", None)
+                ) not in runtime_scopes]
+
+            node.parameter_values["rulesets"] = caller_rules(node.parameter_values["rulesets"] or [])
+            incoming_agent = node.parameter_values.get("agent")
+            if isinstance(incoming_agent, dict) and isinstance(incoming_agent.get("rulesets"), list):
+                incoming_agent["rulesets"] = caller_rules(incoming_agent["rulesets"])
+        # The facade owns this output protocol. Preserve the retained node's
+        # schema and rules while requiring a complete render instruction from
+        # this background revision, rather than an unconstrained chat answer.
+        node.parameter_values["output_schema"] = _web_rerender_output_schema(prompt)
+        node.parameter_values["rulesets"] = list(node.parameter_values["rulesets"] or []) + [
+            _web_rerender_output_rules(prompt)
+        ]
         for key in ("_model_access", "_provider"):
             component = getattr(owner, key, None)
             if component is not None:
@@ -3983,18 +4181,15 @@ class _HMBWebRerenderExecution(HMBAgentLibrary):
         )
 
     def get_parameter_value(self, name):
-        if str(name).casefold() == "prompt" and self._hmb_rules_active:
+        if str(name).casefold() == "prompt":
             return self._hmb_runtime_prompt
         return self.parameter_values.get(name)
 
     def get_parameter_list_value(self, name):
-        values = list(self.parameter_values.get(name) or [])
-        if name == "rulesets" and self._hmb_rules_active:
-            values.extend([
-                {"name": self._hmb_ruleset_names[0], "rules": list(self._hmb_policy_rules)},
-                {"name": self._hmb_ruleset_names[1], "rules": list(self._hmb_binding_rules)},
-            ])
-        return values
+        return list(self.parameter_values.get(name) or [])
+
+    def _load_hmb_rules(self):
+        raise RuntimeError("Web revision preserves parent policy; policy reload is unavailable.")
 
     def set_parameter_value(self, name, value, *args, **kwargs):
         key = self._publication_parameter_name(name)

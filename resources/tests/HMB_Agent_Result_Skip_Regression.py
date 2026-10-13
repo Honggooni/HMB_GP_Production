@@ -109,6 +109,11 @@ def make_generator(source, number: int = 1):
     node._generation_refresh_lock = threading.Lock()
     node._generation_refresh_running = False
     node._generation_run_active = threading.Event()
+    node._hmb_draft_finalize_pending = False
+    node._hmb_draft_finalize_task = None
+    node._hmb_draft_final_context = None
+    node._hmb_draft_controls_syncing = False
+    node._hmb_draft_pending_source = {}
     node._detached_submission_tasks = set()
     node._hmb_expected_agent_result = None
     node.source = source
@@ -165,7 +170,19 @@ def make_generator(source, number: int = 1):
         "output_format": "mp4", "return_last_frame": False,
         "generation_timeout_seconds": 60, "poll_interval_seconds": 1,
     }
-    node._resolve_exact_shot_generation_inputs = lambda params: dict(params)
+    # These Agent-result/Broker fixtures have no retained host graph. Supply an
+    # explicit selected-project snapshot while retaining the production checks
+    # that compare it at each operation boundary. Real graph provenance remains
+    # covered by HMB_Seedance_Project_Source_Routing_Regression.py.
+    project_selection = {
+        "schema": seedance_module.PROJECT_SELECTION_SCHEMA,
+        "project": {"project_id": "superwings12", "project_name": "슈퍼윙즈12"},
+    }
+    node._capture_imageasset_project_selection = lambda: copy.deepcopy(project_selection)
+    node._resolve_exact_shot_generation_inputs = lambda params: {
+        **params, **project_selection["project"],
+        "_hmb_imageasset_project_selection": copy.deepcopy(project_selection),
+    }
     node._validate_parameters = lambda _params: None
     node._prepare_video_references_for_run = lambda params: dict(params)
     node._build_broker_payload = lambda params: {"prompt": params["prompt"]}
@@ -236,7 +253,7 @@ async def five_branches(failed_number: int, *, generation_failure: bool = False)
                 assert generator.broker.creates == []
                 generator._ensure_broker_connected.assert_not_awaited()
         else:
-            assert generator.result["was_successful"] is True
+            assert generator.result["was_successful"] is True, generator.result
             assert generator.completed == [f"offline-job-{agent.number}"]
             assert len(generator.broker.creates) == 1
             assert generator.broker.creates[0]["prompt"] == agent.parameter_output_values["output"]
@@ -326,6 +343,21 @@ async def cadence_change(mutation: str):
 
 
 async def run():
+    # Preserve a pending-project diagnostic through the real async host
+    # boundary, then prove its downstream Generator submits no request.
+    pending_agent = make_agent()
+    async def pending_policy(_node):
+        raise RuntimeError(agent_module._HMB_PROJECT_POLICY_PENDING_MESSAGE)
+    with mock.patch.object(agent_module._BaseAgent, "aprocess", pending_policy, create=True):
+        await pending_agent.aprocess()
+    assert pending_agent._hmb_execution_result_snapshot()["code"] == "PROJECT_POLICY_PENDING"
+    assert pending_agent.parameter_output_values["output"] == agent_module._HMB_PROJECT_POLICY_PENDING_MESSAGE
+    pending_generator = make_generator(pending_agent)
+    pending_generator.parameter_values["prompt"] = pending_agent.parameter_output_values["output"]
+    await pending_generator.aprocess()
+    assert pending_generator.result["result_details"].startswith("SKIPPED:")
+    assert pending_generator.broker.creates == []
+    pending_generator._ensure_broker_connected.assert_not_awaited()
     for failed_number in range(1, 6):
         await five_branches(failed_number)
         await five_branches(failed_number, generation_failure=True)

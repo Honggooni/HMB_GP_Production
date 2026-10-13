@@ -240,6 +240,7 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
     assert cache_fields[ORIGINAL_MATERIAL_PROFILE_FIELD] == (
         picker.ORIGINAL_MATERIAL_OVERRIDE_PROFILE
     )
+    assert cache_fields["original_material_pass_source"] == "AIPicker_SET"
 
     video_path, sidecar_path = picker._original_preview_paths(scene_path)
     video_path.parent.mkdir(parents=True, exist_ok=True)
@@ -257,6 +258,8 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
         "assignment_mode": picker.ORIGINAL_LAMBERT_ASSIGNMENT_MODE,
         "original_material_override_report": {
             "profile": picker.ORIGINAL_MATERIAL_OVERRIDE_PROFILE,
+            "material_pass_source": "AIPicker_SET",
+            "material_pass_shape_count": 0,
             "requested": True,
             "status": "restored",
             "restore_ok": True,
@@ -317,11 +320,31 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Cache_") as cache_dir:
         scene_path, state, video_path, sidecar_path
     )
 
+    # Older group-name caches cannot substitute for the newly authored set.
+    # Reject them without deleting existing media or changing cache profiles.
+    media_before_pass_check = video_path.read_bytes()
+    for missing_field in ("original_material_pass_source", "material_pass_source"):
+        legacy = copy.deepcopy(current_sidecar)
+        if missing_field == "material_pass_source":
+            legacy["original_material_override_report"].pop(missing_field)
+        else:
+            legacy.pop(missing_field)
+        sidecar_path.write_text(json.dumps(legacy), encoding="utf-8")
+        assert not picker._original_preview_cache_is_valid(scene_path, state, video_path, sidecar_path)
+        assert video_path.read_bytes() == media_before_pass_check
+    for incorrect_source in ("eye_GEO_GRP", "eye_GRP", "aipicker_set"):
+        invalid_source = copy.deepcopy(current_sidecar)
+        invalid_source["original_material_pass_source"] = incorrect_source
+        sidecar_path.write_text(json.dumps(invalid_source), encoding="utf-8")
+        assert not picker._original_preview_cache_is_valid(scene_path, state, video_path, sidecar_path)
+    sidecar_path.write_text(json.dumps(current_sidecar), encoding="utf-8")
+
     # A fully restored shared head-eye/body capture can use textured VP2.
     # Cache reuse requires explicit proof that only authored eyes kept textures.
     eye_sidecar = copy.deepcopy(current_sidecar)
     eye_report = eye_sidecar["original_material_override_report"]
     eye_report.update({
+        "material_pass_shape_count": 1,
         "solid_render_mode_verified": False,
         "textured_render_mode_verified": True,
         "eye_textures_enabled": True,
@@ -662,6 +685,8 @@ class FakeMayaCmds(types.ModuleType):
         }
         self.settable = {name: True for name in self.values}
         self.set_calls: list[tuple[str, Any]] = []
+        self.current_frame = 1.0
+        self.frame_visits: list[float] = []
         self.smooth_modes = {name: 1 for name in self.quality_nodes}
         self.visible_nurbs = "|Nurbs_GRP|VisibleNurbsShape"
         self.history_nurbs = "|Nurbs_GRP|VisibleNurbsShapeOrig"
@@ -685,6 +710,14 @@ class FakeMayaCmds(types.ModuleType):
 
     def about(self, version: bool = False, **_kwargs):
         return "2027" if version else ""
+
+    def currentTime(self, value=None, *, query=False, edit=False, update=False):
+        if query:
+            return self.current_frame
+        assert edit and update, "Capture preflight must evaluate the requested frame."
+        self.current_frame = float(value)
+        self.frame_visits.append(self.current_frame)
+        return self.current_frame
 
     def ls(self, *patterns, **kwargs):
         if kwargs.get("type") == "nurbsSurface":
@@ -1107,6 +1140,7 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Runner_") as runner_dir
         force_high_quality=True,
     )
     runner.run(str(color_job_path))
+    assert fake_cmds.frame_visits[-1] == json.loads(color_job_path.read_text(encoding="utf-8"))["start_frame"]
     assert observations[-1] == ("preview", True)
     assert authored_quality_snapshot() == authored
     assert fake_cmds.nurbs_smoothness[fake_cmds.visible_nurbs] == {
@@ -1137,6 +1171,7 @@ with tempfile.TemporaryDirectory(prefix="HMB_HQ_Original_Runner_") as runner_dir
         force_high_quality=True,
     )
     runner.run(str(original_job_path))
+    assert fake_cmds.frame_visits[-1] == json.loads(original_job_path.read_text(encoding="utf-8"))["start_frame"]
     assert observations[-1] == ("preview", True)
     assert authored_quality_snapshot() == authored
     original_sidecar = json.loads(original_sidecar_path.read_text(encoding="utf-8"))

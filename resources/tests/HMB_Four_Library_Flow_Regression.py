@@ -370,7 +370,7 @@ try:
     assert len(policy_identity["contract_sha256"]) == 64
     assert policy.encode("utf-8") not in sealed_policy
     assert common._AGENT_POLICY_FILE == (
-        ROOT / "resources" / "agent" / "hmb_agent_core.dat"
+        ROOT / "resources" / "agent" / "superwings12" / "hmb_agent_core.dat"
     )
 finally:
     shutil.rmtree(project_root, ignore_errors=True)

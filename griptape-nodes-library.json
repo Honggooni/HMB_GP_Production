@@ -279,16 +279,37 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.7.88",
+    "library_version": "0.7.91",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
-      "archive_source_count": 38,
+      "archive_source_count": 42,
       "mode": "bundled_signed_dat",
-      "runtime_path": "resources/agent/hmb_agent_core.dat",
+      "runtime_path": "resources/agent/superwings12/hmb_agent_core.dat",
       "policy_version": "2026-10-09.agent-shot-quality.v5.6",
       "envelope_sha256": "c057451e9a430144ca321c4764abe4958f129ba305c65deb1c5a7d6b63f24c82",
       "contract_sha256": "181c81d6096bff9603d229243bc0183354035e4c6612981eaa5d1e9045fb7741",
-      "verification": "rsa3072_sha256_v3_contract_once_per_process"
+      "verification": "rsa3072_sha256_v3_contract_once_per_process",
+      "default_project_id": "superwings12",
+      "projects": [
+        {
+          "project_id": "dinoster5",
+          "project_name": "다이노스터",
+          "status": "pending",
+          "folder": "Dinoster5"
+        },
+        {
+          "project_id": "katuri8",
+          "project_name": "까투리8",
+          "status": "pending",
+          "folder": "Katuri8"
+        },
+        {
+          "project_id": "superwings12",
+          "project_name": "슈퍼윙즈12",
+          "status": "ready",
+          "folder": "superwings12"
+        }
+      ]
     },
     "tags": [
       "Griptape",

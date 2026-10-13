@@ -7,7 +7,10 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import tempfile
+import textwrap
 import tomllib
 import zipfile
 import zlib
@@ -33,6 +36,7 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "_hmb_agent_session.py",
     "_hmb_build_diagnostics.py",
     "_hmb_library_bootstrap.py",
+    "_hmb_project.py",
     "_hmb_review.py",
     "_hmb_web_rerender.py",
     "_hmb_shot_routing.py",
@@ -53,7 +57,10 @@ EXPECTED_RUNTIME_INSTALL_FILES = (
     "resources/maya/HMB_Maya_Background_Preview.py",
     "resources/blender/HMB_Blender_Background_Preview.py",
     "resources/picker/HMB_Marker_Catalog.json",
-    "resources/agent/hmb_agent_core.dat",
+    "resources/agent/superwings12/hmb_agent_core.dat",
+    "resources/agent/Dinoster5/project.json",
+    "resources/agent/Katuri8/project.json",
+    "resources/agent/superwings12/project.json",
 )
 EXPECTED_DISTRIBUTION_ONLY_FILES = (
     "Install_HMB_GP_Production.ps1",
@@ -212,7 +219,7 @@ assert all(value == "" for value in registered_secrets.values())
 delivery = manifest["metadata"]["agent_policy_delivery"]
 assert delivery["archive_source_count"] == len(EXPECTED_SOURCE_FILES)
 assert delivery["mode"] == "bundled_signed_dat"
-assert delivery["runtime_path"] == "resources/agent/hmb_agent_core.dat"
+assert delivery["runtime_path"] == "resources/agent/superwings12/hmb_agent_core.dat"
 assert delivery["verification"] == "rsa3072_sha256_v3_contract_once_per_process"
 assert "launcher_path" not in delivery
 assert "bootstrap_marker" not in delivery
@@ -393,6 +400,95 @@ assert (
     "python tools/package_runtime_release.py --check-parity-proof "
     ".github/hmb-release-parity.json"
 ) in workflow_text
+
+# Execute the CI's actual PowerShell gate against disposable path inventories.
+# Package member checks do not prove that git ls-files accepts only that boundary.
+tracked_gate_match = re.search(
+    r"(?m)^      - name: Reject private or generated tracked content\r?\n"
+    r"        shell: pwsh\r?\n        run: \|\r?\n"
+    r"(?P<body>(?:          [^\r\n]*(?:\r?\n|$))+)",
+    workflow_text,
+)
+assert tracked_gate_match is not None, "CI tracked-content gate is missing."
+tracked_gate = textwrap.dedent(tracked_gate_match.group("body"))
+approved_agent_members = [
+    "resources/agent/superwings12/hmb_agent_core.dat",
+    "resources/agent/Dinoster5/project.json",
+    "resources/agent/Katuri8/project.json",
+    "resources/agent/superwings12/project.json",
+]
+assert set(approved_agent_members) == {
+    builder.BUNDLED_AGENT_POLICY_MEMBER.as_posix(),
+    *(member.as_posix() for member in builder.PROJECT_METADATA),
+}
+forbidden_tracked_members = [
+    "resources/agent/hmb_agent_core.dat",
+    "resources/agent/Dinoster5/hmb_agent_core.dat",
+    "resources/agent/Katuri8/hmb_agent_core.dat",
+    "resources/agent/superwings12/backup/hmb_agent_core.dat",
+    "resources/agent/superwings12/HMB_AGENT_CORE.DAT",
+    "resources/agent/dinoster5/project.json",
+    "resources/agent/unregistered/project.json",
+    "resources/agent/superwings12/project.json.bak",
+    "resources/agent/superwings12/policy.txt",
+    "resources/policy/HMB_GP_Production_Rule.txt",
+    "policies/HMB_Agent_Policies_8_EN.txt",
+    "HMB_Agent_Policies_8_EN.txt",
+    "Agent_policy_ko.md",
+    "extra/hmb_agent_core.dat",
+    "extra/hmb_agent_core.DAT",
+    "extra/policy.pem",
+    "extra/private.key",
+    "extra/credentials.json",
+    "extra/secrets-prod.json",
+    "extra/.env.production",
+    ".venv/Lib/site-packages/local.py",
+    "backups/runtime.py",
+    "dist/release.zip",
+]
+pwsh = shutil.which("pwsh") or shutil.which("powershell")
+assert pwsh is not None, "Actual PowerShell CI security coverage is required."
+fixture_json = json.dumps(
+    {"allowed": [*approved_agent_members, "HMBAgentLibrary.py"],
+     "forbidden": forbidden_tracked_members},
+    ensure_ascii=False,
+).encode("utf-8")
+encoded_fixture = base64.b64encode(fixture_json).decode("ascii")
+gate_script = (
+    "$ErrorActionPreference = 'Stop'\n"
+    "function Test-HmbTrackedReleaseMembers {\n"
+    "  param([string[]]$FixtureMembers)\n"
+    "  function git {\n"
+    "    if ($args.Count -ne 1 -or $args[0] -cne 'ls-files') { throw 'Unexpected Git operation.' }\n"
+    "    return $FixtureMembers\n"
+    "  }\n"
+    + tracked_gate
+    + "}\n"
+    + "$fixture = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"
+    + encoded_fixture
+    + "')) | ConvertFrom-Json\n"
+    + "Test-HmbTrackedReleaseMembers -FixtureMembers @($fixture.allowed)\n"
+    + "foreach ($member in $fixture.forbidden) {\n"
+    + "  $rejected = $false\n"
+    + "  try { Test-HmbTrackedReleaseMembers -FixtureMembers @($member) }\n"
+    + "  catch {\n"
+    + "    if ($_.Exception.Message -notlike 'Forbidden private/generated tracked paths:*') { throw }\n"
+    + "    $rejected = $true\n"
+    + "  }\n"
+    + "  if (-not $rejected) { throw ('CI tracked-content gate accepted: ' + $member) }\n"
+    + "}\n"
+    + "Write-Output ('HMB_CI_TRACKED_GATE_PASS allowed=' + $fixture.allowed.Count + ' rejected=' + $fixture.forbidden.Count)\n"
+)
+with tempfile.TemporaryDirectory(prefix="hmb-ci-tracked-content-") as temporary:
+    gate_path = Path(temporary) / "gate.ps1"
+    gate_path.write_text(gate_script, encoding="utf-8-sig")
+    gate_result = subprocess.run(
+        [pwsh, "-NoProfile", "-NonInteractive", "-File", str(gate_path)],
+        cwd=temporary, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=60,
+    )
+assert gate_result.returncode == 0, gate_result.stdout + gate_result.stderr
+assert "HMB_CI_TRACKED_GATE_PASS allowed=5 rejected=23" in gate_result.stdout
 
 release_version, records = builder.validate_sources()
 record_paths = tuple(str(record["path"]) for record in records)
@@ -774,8 +870,8 @@ with zipfile.ZipFile(io.BytesIO(first_archive), "r") as archive:
         if PurePosixPath(info.filename).suffix.casefold() == ".dat"
     ]
     assert len(dat_members) == 1
-    assert PurePosixPath(dat_members[0].filename).parts[-3:] == (
-        "resources", "agent", "hmb_agent_core.dat"
+    assert PurePosixPath(dat_members[0].filename).parts[-4:] == (
+        "resources", "agent", "superwings12", "hmb_agent_core.dat"
     )
 
     for info in infos:
@@ -791,7 +887,8 @@ with zipfile.ZipFile(io.BytesIO(first_archive), "r") as archive:
         else:
             assert member.suffix.casefold() not in FORBIDDEN_SUFFIXES
         if "/resources/agent/" in f"/{lowered}":
-            assert relative == builder.BUNDLED_AGENT_POLICY_MEMBER.as_posix()
+            assert (relative == builder.BUNDLED_AGENT_POLICY_MEMBER.as_posix()
+                    or PurePosixPath(relative) in builder.PROJECT_METADATA)
         assert "/resources/policy/" not in f"/{lowered}"
         assert "/policies/" not in f"/{lowered}"
         assert not re.search(
@@ -816,17 +913,39 @@ builder.validate_no_policy_artifacts_in_zip(
     zip_bytes({"package/safe.zip": safe_nested})
 )
 assert_forbidden_archive(zip_bytes({"package/hmb_agent_core.dat": b"sealed"}))
-signed_dat = (ROOT / "resources" / "agent" / "hmb_agent_core.dat").read_bytes()
+signed_dat = (ROOT / "resources" / "agent" / "superwings12" / "hmb_agent_core.dat").read_bytes()
 builder.verify_signed_agent_policy_bytes(signed_dat)
+for member, expected in builder.PROJECT_METADATA.items():
+    descriptor = (ROOT / Path(member)).read_bytes()
+    assert json.loads(descriptor) == expected
+    builder.validate_no_policy_artifacts_in_zip(zip_bytes({f"HMB_GP_Production/{member}": descriptor}))
+    for invalid in (
+        {**expected, "policy": "must never embed plaintext policy"},
+        {**expected, "runtime_path": "../../outside.dat"},
+        {**expected, "project_id": "unregistered"},
+        {**expected, "status": "ready" if expected["status"] == "pending" else "pending"},
+    ):
+        malicious = zip_bytes({f"HMB_GP_Production/{member}": json.dumps(invalid).encode()})
+        assert_forbidden_archive(zip_bytes({"package/library.zip": malicious}))
+    duplicate = descriptor.rstrip().rstrip(b"}") + b', "status": "pending"}'
+    assert_forbidden_archive(zip_bytes({str(member): duplicate}))
+for forbidden in (
+    "resources/agent/hmb_agent_core.dat",
+    "resources/agent/Dinoster5/hmb_agent_core.dat",
+    "resources/agent/Katuri8/hmb_agent_core.dat",
+    "resources/agent/unregistered/project.json",
+    "resources/agent/superwings12/policy.txt",
+):
+    assert_forbidden_archive(zip_bytes({forbidden: signed_dat}))
 builder.make_archive(
-    [{"path": "resources/agent/hmb_agent_core.dat", "data": signed_dat}],
+    [{"path": "resources/agent/superwings12/hmb_agent_core.dat", "data": signed_dat}],
     archive_date_time,
 )
 builder.validate_no_policy_artifacts_in_zip(
     zip_bytes(
         {
             "package/library.zip": zip_bytes(
-                {"HMB_GP_Production/resources/agent/hmb_agent_core.dat": signed_dat}
+                {"HMB_GP_Production/resources/agent/superwings12/hmb_agent_core.dat": signed_dat}
             )
         }
     )
@@ -860,6 +979,6 @@ gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
 assert "resources/policy/" in gitignore
 assert "policies/" in gitignore
 assert "**/hmb_agent_core.dat" in gitignore
-assert "!resources/agent/hmb_agent_core.dat" in gitignore
+assert "!resources/agent/superwings12/hmb_agent_core.dat" in gitignore
 
 print("HMB bundled signed-DAT release/credential boundary regression: PASS")

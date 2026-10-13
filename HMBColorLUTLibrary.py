@@ -247,6 +247,15 @@ class HMBColorLUTLibrary(DataNode):
             # back from that first compact edit after automatic routing.
             initial = not self._hydrated and isinstance(value.get("shot_states"), Mapping)
             self._hydrated = True
+            supplied_project = str(value.get("project_id") or "")
+            current_project = self._hmb_color_lut_state["project_id"]
+            if ("project_id" in value and supplied_project != current_project
+                    and (not initial or (self._project_authoritative and supplied_project))):
+                # A debounced edit/command can arrive after ImageAsset has
+                # changed the project. Never reinterpret its settings as an
+                # edit of the newly selected project, even at a higher UI rev.
+                self._publish()
+                return
             if initial:
                 self._hydrated = True
                 histories = value.get("shot_states")
@@ -383,6 +392,10 @@ class HMBColorLUTLibrary(DataNode):
             # Commands may arrive before the debounced property update. Capture the
             # current UI settings, but never trust a UI-supplied source/provenance.
             authored = value.get("state")
+            if isinstance(authored, Mapping) and _selection_key(authored) != _selection_key(captured):
+                # Delayed buttons belong to their original Project/Shot.
+                # Cancellation was handled above and may still stop that job.
+                return
             if isinstance(authored, Mapping) and _selection_key(authored) == _selection_key(captured):
                 captured["settings"] = normalize_settings(authored.get("settings", captured["settings"]))
                 captured["preset_name"] = str(authored.get("preset_name") or "")[:80]

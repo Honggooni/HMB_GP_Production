@@ -3,6 +3,18 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_Seedance_Web_Draft_Final_Parity_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Project_Source_Routing_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_Agent_Authenticated_Broker_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
@@ -115,6 +127,13 @@
       "coverage": "installed_sdk",
       "required": false,
       "reason": "Requires installed SDK/project scope; run explicitly in an isolated local host audit."
+    },
+    {
+      "name": "HMB_Agent_Web_Rerender_Output_Contract_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Validates the installed Standard Agent structured-output schema and actual rerender worker no-submission boundary in isolated fixtures."
     },
     {
       "name": "HMB_Agent_Web_Rerender_Regression.py",
@@ -471,6 +490,19 @@
       "required": true
     },
     {
+      "name": "HMB_Image_Asset_Selection_Resolution_Async_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Image_Asset_Selection_Resolution_Host_Integration.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Requires actual retained SDK callback, heartbeat and downstream resolution; run only in a disposable engine and guarded offline process."
+    },
+    {
       "name": "HMB_Image_Asset_Server_Sharing_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
@@ -573,6 +605,12 @@
           "reason": "Native capture extension was not invoked; --live-maya requires an isolated local Maya audit."
         }
       ]
+    },
+    {
+      "name": "HMB_Maya_Motion_PNG_Long_Path_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
     },
     {
       "name": "HMB_Maya_Render_Layer_Isolation_Regression.py",
@@ -756,6 +794,24 @@
       "reason": "Current typed Seedance/Agent imports require the installed Desktop SDK; root executes this offline native validation locally rather than adding CI mocks."
     },
     {
+      "name": "HMB_Project_Generation_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Project_Policy_Routing_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Project_Shot_Snapshot_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_Prompt_Background_Execution_Boundary_Regression.mjs",
       "mode": "ci",
       "coverage": "javascript_contract",
@@ -800,6 +856,12 @@
     },
     {
       "name": "HMB_Prompt_Free_Frame_Range_Contract_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Prompt_Image_Preparation_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
       "required": true
@@ -952,17 +1014,17 @@
       "required": true
     },
     {
+      "name": "HMB_Seedance_Crash_Reopen_Recovery_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_Seedance_Create_Context_Regression.py",
       "mode": "manual",
       "coverage": "installed_sdk",
       "required": false,
       "reason": "Runs the real installed Griptape dispatcher and lazy library lifecycle in isolated processes; a hostless stub cannot reproduce the CreateNode empty-context guard."
-    },
-    {
-      "name": "HMB_Seedance_Crash_Reopen_Recovery_Regression.py",
-      "mode": "ci",
-      "coverage": "python_contract",
-      "required": true
     },
     {
       "name": "HMB_Seedance_Direct_Shot_Source_Regression.py",
@@ -972,6 +1034,18 @@
     },
     {
       "name": "HMB_Seedance_Discarded_Workflow_Recovery_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Draft_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Draft_Shot_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
       "required": true
@@ -1086,6 +1160,12 @@
       "required": true
     },
     {
+      "name": "HMB_Seedance_Widget_Draft_Regression.mjs",
+      "mode": "ci",
+      "coverage": "javascript_contract",
+      "required": true
+    },
+    {
       "name": "HMB_Server_Policy_Boundary_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
@@ -1196,6 +1276,12 @@
       "required": true
     },
     {
+      "name": "HMB_VideoPicker_Async_Execution_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_VideoPicker_Blender_Cross_Shot_Mask_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
@@ -1275,6 +1361,12 @@
       "required": true
     },
     {
+      "name": "HMB_VideoPicker_Compact_Raw_Host_Clip_Browser_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
       "name": "HMB_VideoPicker_Delete_Lifecycle_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
@@ -1284,6 +1376,12 @@
       "name": "HMB_VideoPicker_Delete_Lifecycle_UI_Regression.mjs",
       "mode": "ci",
       "coverage": "javascript_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_VideoPicker_Diagnostic_Log_Routing_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
       "required": true
     },
     {
@@ -1349,6 +1447,12 @@
     },
     {
       "name": "HMB_VideoPicker_Generate_Terminal_Selection_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_VideoPicker_Geometry_Budget_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
       "required": true
@@ -1524,6 +1628,12 @@
       "required": true
     },
     {
+      "name": "HMB_VideoPicker_Progressive_Selected_Generation_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_VideoPicker_Python_Geometry_Hydration_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
@@ -1561,6 +1671,12 @@
     },
     {
       "name": "HMB_VideoPicker_Selected_Pass_Snapshot_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_VideoPicker_Selected_Role_Artifact_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
       "required": true
@@ -1719,6 +1835,12 @@
       "required": true
     },
     {
+      "name": "HMB_VideoPicker_Watchdog_Activity_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_VideoPicker_Workspace_Viewport_Stability_Regression.mjs",
       "mode": "ci",
       "coverage": "javascript_contract",
@@ -1730,6 +1852,12 @@
       "coverage": "python_contract",
       "required": false,
       "reason": "Outside the current public CI baseline; explicitly retained for the local full regression audit."
+    },
+    {
+      "name": "HMB_VideoPicker_World_Pattern_Large_Bounds_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
     },
     {
       "name": "HMB_Video_Taxonomy_Regression.mjs",
@@ -1745,6 +1873,12 @@
     },
     {
       "name": "HMB_Video_Tools_Engine_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Web_Rerender_Parent_Settings_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
       "required": true
