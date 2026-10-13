@@ -260,7 +260,22 @@ def assert_host_connection_reorder_and_payload() -> None:
         # billable POST. Guard the current Broker route, not the retired node
         # _request_json method. Both guarded call counts must remain zero.
         destination.set_parameter_value("model_id", seedance.SEEDANCE_2_0_MODEL_ID)
+        # This retained SDK fixture contains the Picker/Generator video route,
+        # while Project_Source_Routing independently tests ImageAsset authority.
+        # Supply that required selected-project snapshot so the existing model
+        # video-limit assertion still reaches its intended preflight boundary.
+        selected_project = {
+            "schema": seedance.PROJECT_SELECTION_SCHEMA,
+            "project": {"project_id": "superwings12", "project_name": "슈퍼윙즈12"},
+            "flow": flow.name,
+            "owner": id(destination),
+            "sources": [],
+            "edges": [],
+        }
         with mock.patch.object(
+            destination, "_capture_imageasset_project_selection",
+            return_value=selected_project,
+        ) as project_selection, mock.patch.object(
             destination, "_ensure_broker_connected",
             side_effect=AssertionError("Broker authentication occurred before local preflight"),
         ) as broker_connect, mock.patch.object(
@@ -276,6 +291,7 @@ def assert_host_connection_reorder_and_payload() -> None:
                 raise AssertionError("Four connected Picker videos were accepted by explicit 2.0")
             assert broker_connect.call_count == 0
             assert broker_request.call_count == 0
+            assert project_selection.call_count >= 1
         assert destination.get_parameter_value(seedance.VIDEO_REFERENCES_PARAMETER) == reordered_four
 
         # Deselecting only the fourth-position item leaves the requested 4->1
