@@ -36,7 +36,7 @@ def production_namespace(queued: list, opened: list, tokens: list) -> dict:
              "_broker_validated_server_url", "_broker_read_json", "_broker_require_exact_response_url"}
     definitions = [item for item in tree.body if isinstance(item, (ast.FunctionDef, ast.ClassDef)) and item.name in names]
     bridge = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == "_HMBAIBrokerBridge")
-    methods = {"__init__", "server_url", "_review_task_path", "review_capabilities", "put_task_casecard",
+    methods = {"__init__", "server_url", "_review_task_path", "review_capabilities", "put_task_casecard", "get_task_casecard",
                "post_task_feedback", "task_feedback", "_load_access_token", "_clear_access_token", "_request_json"}
     definitions.append(ast.ClassDef(name="Bridge", bases=[], keywords=[], decorator_list=[], body=[
         item for item in bridge.body if isinstance(item, ast.FunctionDef) and item.name in methods]))
@@ -113,6 +113,9 @@ class FakePortal:
             return Response(request.full_url, self.capabilities)
         task = parsed.path.split("/")[-2]
         if parsed.path.endswith("/casecard"):
+            if request.method == "GET":
+                return Response(request.full_url, {"task_id": self.ack_task or task,
+                    "casecard": deepcopy(self.casecards.get(task))})
             assert request.method == "PUT"
             assert body == review.public_evidence(body), "Wire evidence must be the exact public projection"
             assert set(body) == {"schema", "version", "case_id", "input_evidence_sha256", "client_prompt_sha256",
@@ -169,7 +172,8 @@ def main() -> None:
             case = review.start_case("client-a", {"settings": {"model_id": "seedance-2.5", "duration": 5},
                 "references": [{"role": "video", "kind": "local", "path": "C:/private/source.mp4",
                                 "source_identity_sha256": "1" * 64, "content_sha256": "2" * 64}],
-                "generation_origin": {"channel_uuid": "channel-a", "shot_uuid": "shot-a", "number": 2}},
+                "generation_origin": {"channel_uuid": "channel-a", "shot_uuid": "shot-a", "number": 2,
+                                      "name": "컷 02 · 원본 이름 🎬"}},
                 "SERVER PROMPT MUST NOT BE OVERWRITTEN", {"library_version": "0.7.82", "runtime": {"fingerprint_sha256": "3" * 64}},
                 {"run_id": "agent-a", "coverage": [{"media_token": "@video1", "observation_role": "original",
                   "bundle_run_id": "bundle-a", "sample_group_id": "pair-a", "decoded_pts_seconds": 2.125,
@@ -190,6 +194,7 @@ def main() -> None:
             wire = portal.casecards["task-a"]
             assert wire["agent_observation"]["coverage"][0]["decoded_pts_seconds"] == 2.125
             assert wire["shot"]["shot_uuid"] == "shot-a"
+            assert wire["shot"]["name"] == "컷 02 · 원본 이름 🎬"
             assert not any(v in json.dumps(wire) for v in ("SECRET", "private", "C:/", "SERVER PROMPT"))
             assert tokens and set(tokens) == {"https://old.example"}
             checks += 6
@@ -198,7 +203,62 @@ def main() -> None:
             assert sum(call["method"] == "PUT" for call in portal.calls) == put_count
             assert review.read_case("task-a")["server_sync"]["status"] == "synced", "Identical retry cannot leave pending"
             checks += 2
+            # Pre-name bindings keep their immutable payload, including when a
+            # prior login failure erased the old client's local sync digest.
+            for known_digest, sparse in ((True, False), (False, False), (True, True), (False, True)):
+                suffix = ("known" if known_digest else "lost") + ("-sparse" if sparse else "")
+                task = "legacy-task-" + suffix
+                frozen = review.capture_inputs({"_hmb_generation_origin": {
+                    "channel_uuid": "legacy-channel", "shot_uuid": "legacy-shot", "number": 1,
+                    "name": "생성 당시 슬롯 이름"}})
+                original_case = review.start_case("legacy-client-" + suffix, frozen, "original", {}, None if sparse else {})
+                review.update_case(task, case_id=original_case, status="succeeded")
+                review.bind_task_origin(task, "https://old.example")
+                old = review.public_evidence(review.read_case(task))
+                old["shot"].pop("name")
+                old_wire = review.public_evidence(old)
+                portal.casecards[task] = deepcopy(old_wire)
+                if known_digest:
+                    review.mark_server_sync(task, status="synced", evidence_sha256=review._digest(old))
+                else:
+                    review.mark_server_sync(task, status="login_required")
+                before_record = review.read_case(task)
+                local_feedback = review.save_review(task, score=4, category="identity", note="retained review")
+                before_calls = len(portal.calls)
+                node._sync_review_task(task, "https://old.example", 0)
+                calls = portal.calls[before_calls:]
+                assert not any(call["method"] == "PUT" for call in calls)
+                assert sum(call["method"] == "GET" and call["path"].endswith("/casecard") for call in calls) == (not known_digest)
+                after_record = review.read_case(task)
+                assert after_record["server_sync"]["status"] == "synced"
+                assert after_record["server_sync"]["evidence_sha256"] == review._digest(old)
+                assert after_record["inputs"] == before_record["inputs"]
+                assert after_record["input_evidence_sha256"] == before_record["input_evidence_sha256"]
+                assert after_record["reviews"][0]["server_sync"]["status"] == "synced"
+                assert portal.casecards[task] == old_wire
+                checks += 8
+                if not known_digest:
+                    # Only the absent name can differ; another source/hash
+                    # difference remains a failure and cannot write metadata.
+                    portal.casecards[task]["client_prompt_sha256"] = "f" * 64
+                    review.mark_server_sync(task, status="failed", evidence_sha256="a" * 64)
+                    before_calls = len(portal.calls)
+                    node._sync_review_task(task, "https://old.example", 0)
+                    assert review.read_case(task)["server_sync"]["status"] == "failed"
+                    assert not any(call["method"] != "GET" for call in portal.calls[before_calls:])
+                    assert review.read_case(task)["inputs"] == before_record["inputs"]
+                    checks += 3
+            portal.reviews.clear()
             bridge = ns["Bridge"](opener=portal, server_url="https://old.example")
+            assert bridge.get_task_casecard("task-a") == wire
+            portal.ack_task = "foreign-task"
+            try:
+                bridge.get_task_casecard("task-a")
+            except ns["_BrokerProtocolError"]:
+                checks += 1
+            else:
+                raise AssertionError("Foreign Task casecard GET accepted")
+            portal.ack_task = None
             assert bridge.put_task_casecard("task-a", wire)["_http_status"] == 200
             for modifier in (lambda result: {**result, "task_id": "foreign-task"},
                              lambda result: {**result, "casecard": {**result["casecard"], "client_prompt_sha256": "f" * 64}},

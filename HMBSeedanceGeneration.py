@@ -1922,6 +1922,17 @@ class _HMBAIBrokerBridge:
             raise _BrokerProtocolError("Broker did not acknowledge the exact supplemental casecard.")
         return result
 
+    def get_task_casecard(self, task_id: str) -> dict[str, Any] | None:
+        result = self._request_json("GET", self._review_task_path(task_id) + "/casecard",
+                                    payload=None, timeout=5)
+        card = result.get("casecard")
+        if ("casecard" not in result or result.get("task_id", task_id) != task_id
+                or card is not None and (not isinstance(card, dict)
+                    or card.get("schema") != _review.SCHEMA or type(card.get("version")) is not int
+                    or card["version"] != 1 or _review.public_evidence(card) != card)):
+            raise _BrokerProtocolError("Broker returned an invalid supplemental casecard.")
+        return card
+
     def post_task_feedback(self, task_id: str, review: dict[str, Any], *, library_version: str = "") -> dict[str, Any]:
         try:
             review_id = str(UUID(str(review.get("review_id") or review.get("client_review_id") or "")))
@@ -4814,7 +4825,30 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 evidence = _review.public_evidence(record)
                 digest = _review._digest(evidence)
                 synced = record.get("server_sync", {})
-                if synced.get("status") != "synced" or synced.get("evidence_sha256") != digest:
+                binding_confirmed = False
+                # A pre-name binding is immutable. Reuse only its exact saved
+                # digest; no current Shot lookup or retrospective title write.
+                if "name" in evidence.get("shot", {}):
+                    legacy = deepcopy(evidence)
+                    legacy["shot"].pop("name")
+                    legacy_digest = _review._digest(legacy)
+                    if synced.get("evidence_sha256") == legacy_digest:
+                        evidence = legacy
+                        digest = legacy_digest
+                    elif synced.get("status") != "synced" or synced.get("evidence_sha256") != digest:
+                        existing = bridge.get_task_casecard(task_id)
+                        if not live():
+                            return
+                        if existing is not None:
+                            # Bridge PUT applies the existing projection once
+                            # more (e.g. sparse observation defaults). Compare
+                            # that exact wire shape while keeping saved hashes.
+                            if existing == _review.public_evidence(legacy):
+                                evidence, digest = legacy, legacy_digest
+                            elif existing != _review.public_evidence(evidence):
+                                raise _BrokerProtocolError("The immutable casecard differs from the saved Task inputs.")
+                            binding_confirmed = True
+                if not binding_confirmed and (synced.get("status") != "synced" or synced.get("evidence_sha256") != digest):
                     result = bridge.put_task_casecard(task_id, evidence)
                     if result.get("task_id", task_id) != task_id:
                         raise _BrokerProtocolError("Review evidence response belongs to another Task.")

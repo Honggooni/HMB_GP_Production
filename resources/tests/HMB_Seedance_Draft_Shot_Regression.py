@@ -330,8 +330,10 @@ class DraftShotTests(unittest.TestCase):
 
     def test_final_runs_only_generator_with_sparse_wire_and_preserved_origin(self):
         node = Node()
+        node.bind(name='생성 당시 샷 이름 🎬')
         source = completed_source(node)
         node._store_draft_source(source)
+        node.bind(name='현재 변경된 슬롯 이름')
         node.parameter_values.update(prompt='must not be resent', duration=29, ratio='9:16',
                                      generate_audio=True, output_format='mov')
         forbid_upstream_work(node)
@@ -350,6 +352,7 @@ class DraftShotTests(unittest.TestCase):
         node._resolve_exact_shot_generation_inputs.assert_not_called()
         node._manual_agent_prompt_source.assert_not_called()
         self.assertEqual(node._generation_recovery_state()['generation_origin'], source['generation_origin'])
+        self.assertEqual(node._generation_recovery_state()['generation_origin']['name'], '생성 당시 샷 이름 🎬')
         self.assertEqual(node.get_parameter_value('prompt'), 'must not be resent')
         self.assertEqual(node.get_parameter_value('output_format'), 'mov')
         self.assertEqual(len(node.saved), 1)
