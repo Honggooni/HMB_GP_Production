@@ -1912,6 +1912,24 @@
       "mode": "ci",
       "coverage": "javascript_contract",
       "required": true
+    },
+    {
+      "name": "HMB_Agent_Created_State_Regression.py",
+      "coverage": "python_contract",
+      "mode": "ci",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Five_Agent_Result_Consistency_Regression.py",
+      "coverage": "python_contract",
+      "mode": "ci",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Image_Pixel_Limits_Regression.py",
+      "coverage": "python_contract",
+      "mode": "ci",
+      "required": true
     }
   ]
 }

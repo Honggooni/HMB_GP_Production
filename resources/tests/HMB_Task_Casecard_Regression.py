@@ -25,7 +25,7 @@ def main() -> None:
         media.write_bytes(b"verified-source-identity")
         inputs = review.capture_inputs({"task": "Video Editing", "duration": 10,
             "video_references": [str(media), "https://private.invalid/video?token=SECRET"],
-            "_hmb_generation_origin": {"shot_uuid": "shot-A"}, "broker_token": "SECRET"})
+            "_hmb_generation_origin": {"shot_uuid": "shot-A", "name": "컷 01 · 점프 🎬"}, "broker_token": "SECRET"})
         local, remote = inputs["references"]
         assert local["content_sha256"] == hashlib.sha256(media.read_bytes()).hexdigest()
         assert local["content_status"] == "full_sha256"
@@ -39,6 +39,7 @@ def main() -> None:
         evidence = record["input_evidence_sha256"]
         assert review.start_case("client-A", {}, "changed current prompt", {}, {}, root=base) == case_id
         assert review.read_case("client-A", root=base)["submitted_prompt"] == "exact submitted prompt"
+        assert review.read_case("client-A", root=base)["inputs"]["generation_origin"]["name"] == "컷 01 · 점프 🎬"
         checks += 3
         assert review.update_case("broker-A", case_id=case_id, status="running", root=base)
         assert review.read_case("broker-A", root=base)["inputs"] == inputs
@@ -94,6 +95,7 @@ def main() -> None:
         assert projected == review.public_evidence(projected)
         assert projected["references"][0]["content_sha256"] == local["content_sha256"]
         assert projected["shot"]["shot_uuid"] == "shot-A"
+        assert projected["shot"]["name"] == "컷 01 · 점프 🎬"
         assert projected["client_prompt_sha256"] == record["prompt_sha256"]
         assert not any(value in json.dumps(projected) for value in (str(base), "SECRET", "private.invalid", "exact submitted prompt"))
         assert set(projected) == {"schema", "version", "case_id", "input_evidence_sha256", "client_prompt_sha256",
@@ -105,6 +107,28 @@ def main() -> None:
         assert not any(value in json.dumps(clean) for value in ("SECRET", "overwrite", "private.invalid"))
         assert clean["agent_observation"]["coverage"] == []
         checks += 8
+        # Snapshot names survive caller mutation and repeated public projection.
+        for name in ("Shot 1", "컷 02 · 카메라 고정 🎬", "é", "e\u0301", "가" * 128):
+            source = {"shot_uuid": "shot-snapshot", "name": name}
+            captured = review.capture_inputs({"_hmb_generation_origin": source})
+            source["name"] = "Current renamed slot"
+            card = review.public_evidence({"inputs": captured, "agent_observation": {}})
+            assert card["shot"]["name"] == name
+            assert review.public_evidence(card) == card
+            checks += 2
+        for name in (None, True, 42, {}, [], "", "   ", "가" * 129, "C:\\private\\a.mb",
+                     "/tmp/private", "https://private.invalid", "file://private", "data:secret",
+                     "label\nprivate", "label\x7f", "Bearer TOKEN", "api_key=TOKEN", "password: TOKEN"):
+            card = review.public_evidence({"inputs": {"generation_origin": {"name": name, "number": 1}}})
+            assert "name" not in card["shot"] and card["shot"]["number"] == 1
+            checks += 1
+        bound_digest = "e" * 64
+        review.mark_server_sync("broker-A", status="synced", evidence_sha256=bound_digest, root=base)
+        for state in ("pending", "login_required", "failed"):
+            review.mark_server_sync("broker-A", status=state, root=base)
+            assert review.read_case("broker-A", root=base)["server_sync"]["evidence_sha256"] == bound_digest
+            assert review.read_case("broker-A", root=base)["input_evidence_sha256"] == evidence
+            checks += 2
         # Oversized JSON numbers and non-finite values are invalid evidence,
         # while authored zero and OFF remain valid. Optional review sync must
         # not crash merely because a stored observation has a huge integer.

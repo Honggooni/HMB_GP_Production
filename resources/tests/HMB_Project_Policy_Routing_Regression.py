@@ -101,14 +101,19 @@ class ProjectIdentity(unittest.TestCase):
 
 
 class SignedProjectArtifact(unittest.TestCase):
-    def test_installed_sw_signed_bytes_exact_and_other_projects_pending(self):
+    def test_installed_sw_signed_bytes_exact_and_absent_project_runtime_is_usable(self):
         encoded = (ROOT / "resources/agent/superwings12/hmb_agent_core.dat").read_bytes()
         self.assertEqual(common._read_agent_policy_envelope(), encoded)
         self.assertEqual(common._load_verified_agent_rule_payload()["project_id"], "superwings12")
         for project in ("dinoster5", "katuri8"):
             with self.assertRaises(ProjectPolicyPendingError):
                 common._read_agent_policy_envelope(project)
-            self.assertEqual(bare_agent()._hmb_web_rerender_policy_status(project)["reason"], "project_policy_pending")
+            status = bare_agent()._hmb_web_rerender_policy_status(project)
+            self.assertEqual(status["reason"], "project_policy_pending")
+            self.assertTrue(status["ready"])
+            self.assertFalse(status["policy_verified"])
+            self.assertEqual(status["policy_status"], "absent")
+            self.assertEqual((status["version"], status["sha256"]), ("", ""))
 
     def test_copied_sw_dat_cannot_become_another_project_policy(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -134,6 +139,8 @@ class SignedProjectArtifact(unittest.TestCase):
         with patch.object(common, "_agent_process_session", session):
             status = bare_agent()._hmb_web_rerender_policy_status("superwings12")
             self.assertTrue(status["ready"])
+            self.assertTrue(status["policy_verified"])
+            self.assertEqual(status["policy_status"], "available")
             self.assertEqual(session._status_for_regression(), ("empty", 0))
             self.assertEqual(session._status_for_regression(project_id="dinoster5"), ("empty", 0))
 
@@ -143,7 +150,40 @@ class SignedProjectArtifact(unittest.TestCase):
                 common._load_verified_agent_rule_payload("../../superwings12")
             reader.assert_not_called()
 
-    def test_pending_manual_run_then_sw_keeps_original_prompt(self):
+    def test_absent_policy_readiness_never_initializes_the_project_session(self):
+        session = fresh_session()
+        with patch.object(common, "_agent_process_session", session):
+            status = bare_agent()._hmb_web_rerender_policy_status("katuri8")
+            self.assertTrue(status["ready"])
+            self.assertFalse(status["policy_verified"])
+            self.assertEqual(session._status_for_regression(project_id="katuri8"), ("empty", 0))
+
+    def test_invalid_present_policy_readiness_stays_unusable(self):
+        with patch.object(common, "_agent_policy_session_state", return_value="EMPTY"), \
+             patch.object(common, "_load_verified_agent_rule_payload", side_effect=RuntimeError("invalid signature")):
+            status = bare_agent()._hmb_web_rerender_policy_status("katuri8")
+        self.assertFalse(status["ready"])
+        self.assertFalse(status["policy_verified"])
+        self.assertEqual(status["reason"], "policy_unavailable")
+
+    def test_closed_or_failed_policy_session_never_becomes_ready_by_absence(self):
+        for state in ("FAILED", "CLOSED"):
+            with self.subTest(state=state), patch.object(common, "_agent_policy_session_state", return_value=state), \
+                 patch.object(common, "_load_verified_agent_rule_payload", side_effect=ProjectPolicyPendingError()) as reader:
+                status = bare_agent()._hmb_web_rerender_policy_status("katuri8")
+                self.assertFalse(status["ready"])
+                self.assertEqual(status["reason"], "policy_session_unavailable")
+                reader.assert_not_called()
+
+    def test_unknown_source_project_readiness_stays_unusable(self):
+        source = SimpleNamespace(_hmb_project_identity=lambda: {"project_id": "unregistered"})
+        with patch.object(common, "_load_verified_agent_rule_payload") as reader:
+            status = bare_agent(source)._hmb_web_rerender_policy_status()
+            self.assertFalse(status["ready"])
+            self.assertFalse(status["policy_verified"])
+            reader.assert_not_called()
+
+    def test_missing_project_policy_continues_without_rules_then_sw_keeps_original_prompt(self):
         current = {"project_id": "dinoster5"}
         asset = SimpleNamespace(_hmb_project_identity=lambda: resolve_project(current))
         source = SimpleNamespace(_hmb_connected_source_nodes={"SHOT_ASSET_IN": asset})
@@ -161,7 +201,7 @@ class SignedProjectArtifact(unittest.TestCase):
         node._secure_hmb_outputs = lambda: None
         native_calls = []
         def native():
-            native_calls.append(node._hmb_policy_identity["project_id"])
+            native_calls.append((node._hmb_execution_project_id, not node._hmb_policy_omitted))
             node.parameter_output_values["output"] = "Completed offline check"
             if False:
                 yield None
@@ -169,14 +209,13 @@ class SignedProjectArtifact(unittest.TestCase):
         node._run_native_agent_once = native
         session = fresh_session()
         with patch.object(common, "_agent_process_session", session), patch.object(common, "_agent_policy_process_provenance_valid", return_value=True), patch.object(agent, "_paired_machine_prompt", return_value=before["prompt"]):
-            with self.assertRaisesRegex(RuntimeError, "HMB PROJECT POLICY PENDING"):
-                list(node.process())
-            self.assertFalse(native_calls)
-            self.assertEqual(node.parameter_output_values["output"], agent._HMB_PROJECT_POLICY_PENDING_MESSAGE)
+            list(node.process())
+            self.assertEqual(native_calls, [("dinoster5", False)])
+            self.assertEqual(node.parameter_output_values["output"], "Completed offline check")
             self.assertEqual(session._status_for_regression(project_id="dinoster5"), ("empty", 0))
             current["project_id"] = "superwings12"
             list(node.process())
-            self.assertEqual(native_calls, ["superwings12"])
+            self.assertEqual(native_calls, [("dinoster5", False), ("superwings12", True)])
             self.assertEqual(node.parameter_values, before)
 
 

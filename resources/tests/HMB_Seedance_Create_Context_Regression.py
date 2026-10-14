@@ -12,6 +12,7 @@ import builtins
 from concurrent.futures import ThreadPoolExecutor
 import copy
 import importlib.metadata
+import inspect
 import json
 import logging
 import os
@@ -143,15 +144,27 @@ class Fixture:
             selected.append(definition)
         raw["nodes"] = selected
         self.schema = LibrarySchema.model_validate(raw)
-        self.advanced = engine.library_manager._load_advanced_library_module(self.schema, self.directory)
+        # Engine 0.104 moved the real loader into a component. Both paths call
+        # the SDK implementation; fixture setup must not mock its lifecycle.
+        module_loading = getattr(engine.library_manager, "module_loading", engine.library_manager)
+        advanced_loader = getattr(module_loading, "load_advanced_library_module", None)
+        if advanced_loader is None:
+            advanced_loader = engine.library_manager._load_advanced_library_module
+        self.advanced = advanced_loader(self.schema, self.directory)
         self.library = LibraryRegistry.generate_new_library(self.schema, advanced_library=self.advanced)
+        worker_fields = {"executes_in_worker": False}
+        if "requires_worker" in inspect.signature(LibraryManager.LibraryInfo).parameters:
+            worker_fields["requires_worker"] = False
         self.info = LibraryManager.LibraryInfo(
             lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
             library_path=str(self.directory / "manifest.json"), is_sandbox=False,
             library_name=name, library_version=self.schema.metadata.library_version,
             fitness=LibraryManager.LibraryFitness.NOT_EVALUATED, problems=[],
-            requires_worker=False, executes_in_worker=False)
-        engine.library_manager._attempt_load_nodes_from_library(
+            **worker_fields)
+        nodes_loader = getattr(module_loading, "attempt_load_nodes_from_library", None)
+        if nodes_loader is None:
+            nodes_loader = engine.library_manager._attempt_load_nodes_from_library
+        nodes_loader(
             self.schema, self.library, self.directory, self.info, lazy_loading=True)
         assert not self.info.problems, [type(problem).__name__ for problem in self.info.problems]
         assert self.library._node_types["HMBSeedanceGeneration"]._resolved is None, "Fixture was not lazy"

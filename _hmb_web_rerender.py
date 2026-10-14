@@ -290,6 +290,23 @@ class BrokerProtocol:
         self.owner_key = ""
         self.project_routing_ready = False
         self.parent_settings_ready = False
+        self.optional_policy_status_supported = False
+        self.policy_status_capability_checked = False
+        self.policy_status_capability_checked_at = 0.0
+
+    def discover_capabilities(self) -> None:
+        capabilities = self.bridge._request_json("GET", "/api/v1/reviews/capabilities", payload=None, timeout=10)
+        if not self._project_capability(capabilities):
+            raise ValueError("web_rerender_project_server_upgrade_required")
+        if capabilities.get("parent_settings_contract") != PARENT_SETTINGS_SCHEMA:
+            raise ValueError("web_rerender_parent_settings_server_upgrade_required")
+        self.parent_settings_ready = True
+        self.optional_policy_status_supported = (
+            capabilities.get("optional_project_policy_status_supported") is True
+            and capabilities.get("optional_project_policy_status_schema") == "hmb-optional-agent-policy-status-v1"
+        )
+        self.policy_status_capability_checked = True
+        self.policy_status_capability_checked_at = time.monotonic()
 
     def request(self, method: str, suffix: str, body: Any = None) -> dict[str, Any]:
         if not suffix.startswith("/") or ".." in suffix or "?" in suffix:
@@ -303,13 +320,16 @@ class BrokerProtocol:
         # Read-only discovery must precede registration on an older strict
         # server; it must not clear the old worker's advertised targets.
         if not self.project_routing_ready or not self.parent_settings_ready:
-            capabilities = self.bridge._request_json("GET", "/api/v1/reviews/capabilities", payload=None, timeout=10)
-            if not self._project_capability(capabilities):
-                raise ValueError("web_rerender_project_server_upgrade_required")
-            if capabilities.get("parent_settings_contract") != PARENT_SETTINGS_SCHEMA:
-                raise ValueError("web_rerender_parent_settings_server_upgrade_required")
-            self.parent_settings_ready = True
-        body = {"worker_id": self.worker_id, "session_id": self.session_id, "targets": targets[:16]}
+            self.discover_capabilities()
+        compatible_targets = []
+        for target in targets[:16]:
+            target = dict(target)
+            if not self.optional_policy_status_supported:
+                if target.get("policy_status") == "absent":
+                    continue
+                target.pop("policy_status", None)
+            compatible_targets.append(target)
+        body = {"worker_id": self.worker_id, "session_id": self.session_id, "targets": compatible_targets}
         reply = self.request("POST", "/worker/register" if register else "/worker/heartbeat", body)
         if (reply.get("schema") != PROTOCOL or reply.get("worker_id") != self.worker_id
                 or reply.get("session_id") != self.session_id or reply.get("registered") is not True):
@@ -606,6 +626,18 @@ class EngineWorker:
             self.target_projects[node] = project["project_id"]
         agent = engine.node_manager.get_node_by_name(snapshot["agent_name"])
         policy = await self._policy(agent, project["project_id"])
+        policy_status = str(policy.get("policy_status") or (
+            "available" if policy.get("policy_verified", policy.get("ready")) is True else "unavailable"
+        ))
+        if policy_status == "absent" and (
+                not protocol.policy_status_capability_checked
+                or (not protocol.optional_policy_status_supported
+                    and time.monotonic() - protocol.policy_status_capability_checked_at >= 30.0)):
+            await asyncio.to_thread(protocol.discover_capabilities)
+        if policy_status == "absent" and not protocol.optional_policy_status_supported:
+            # Older strict servers cannot accept the truthful absent-policy
+            # descriptor. Keep their wire contract until support is advertised.
+            return None
         readiness = node._hmb_web_rerender_readiness()
         own_busy = target_id in self.active
         busy = own_busy or bool(agent._hmb_web_rerender_busy()) or not readiness.get("ready")
@@ -636,12 +668,14 @@ class EngineWorker:
             "graph_revision": _digest([target, snapshot["source_bindings"]]),
             "snapshot_sha256": snapshot["binding_fingerprint"],
             "parent_task_ids": parents, "ready": bool(not busy and parents and policy.get("ready") is True),
-            "busy": busy, "policy_verified": policy.get("ready") is True,
+            "busy": busy, "policy_verified": policy.get("policy_verified", policy.get("ready")) is True,
             "policy_version": str(policy.get("version") or "")[:200],
             "policy_application": POLICY_APPLICATION, "policy_reinjected": False,
             "frozen_generation_settings_schema": PARENT_SETTINGS_SCHEMA,
             **project,
         }
+        if protocol.optional_policy_status_supported:
+            descriptor["policy_status"] = policy_status
         return protocol, descriptor, snapshot, agent
 
     async def tick(self) -> None:
@@ -666,7 +700,9 @@ class EngineWorker:
                 self.last_error = ""
                 for node, descriptor, snapshot, agent in items:
                     target_id = descriptor["target_id"]
-                    if not descriptor["ready"] or target_id in self.active or self.stopped:
+                    if (not descriptor["ready"] or target_id in self.active or self.stopped
+                            or (descriptor.get("policy_status") == "absent"
+                                and not protocol.optional_policy_status_supported)):
                         continue
                     command = await asyncio.to_thread(protocol.claim, target_id)
                     if command is None:

@@ -185,11 +185,28 @@ class DraftShotTests(unittest.TestCase):
         node.parameter_values.update(draft_action=t.DRAFT_ACTION_PREVIEW, output_format='mov', return_last_frame=True)
         values = node._get_parameters()
         self.assertEqual((values['draft_action'], values['resolution'], values['output_format'],
-                          values['return_last_frame']), (t.DRAFT_ACTION_PREVIEW, '480p', 'mp4', False))
+                          values['return_last_frame']), (t.DRAFT_ACTION_PREVIEW, '480p', 'mov', False))
         self.assertIs(values['_hmb_draft_supported'], True)
         wire = node._build_broker_payload(values)
         self.assertIs(wire['draft'], True)
         self.assertEqual(wire['quality'], '480p')
+        self.assertEqual(wire['output_format'], 'mov')
+
+    def test_only_and_shot_final_parameter_snapshot_selects_1080p_mov(self):
+        for shot in (False, True):
+            with self.subTest(shot=shot):
+                node = Node(shot=shot)
+                node._store_draft_source(completed_source(node))
+                node.parameter_values.update(draft_action=t.DRAFT_ACTION_FINAL,
+                                             resolution='480p', output_format='mp4')
+                values = node._get_parameters()
+                self.assertEqual((values['resolution'], values['output_format']), ('1080p', 'mov'))
+                wire = node._build_broker_payload(values)
+                self.assertEqual((wire['resolution'], wire['output_format']), ('1080p', 'mov'))
+                self.assertNotIn('quality', wire)
+                self.assertNotIn('prompt', wire)
+                self.assertNotIn('reference_images', wire)
+                self.assertNotIn('reference_videos', wire)
 
     def test_completed_matching_shot_enables_final_at_480_and_1080(self):
         node = Node()
@@ -330,8 +347,10 @@ class DraftShotTests(unittest.TestCase):
 
     def test_final_runs_only_generator_with_sparse_wire_and_preserved_origin(self):
         node = Node()
+        node.bind(name='생성 당시 샷 이름 🎬')
         source = completed_source(node)
         node._store_draft_source(source)
+        node.bind(name='현재 변경된 슬롯 이름')
         node.parameter_values.update(prompt='must not be resent', duration=29, ratio='9:16',
                                      generate_audio=True, output_format='mov')
         forbid_upstream_work(node)
@@ -342,18 +361,21 @@ class DraftShotTests(unittest.TestCase):
             asyncio.run(node._run_draft_final(source, 'synthetic-final-01'))
         self.assertEqual(len(node.bridge.posts), 1, node._set_status_results.call_args_list)
         wire = node.bridge.posts[0]
-        self.assertEqual(set(wire), {'provider', 'model', 'draft_job_id', 'quality', 'project_id', 'project_name', 'client_request_id'})
+        self.assertEqual(set(wire), {'provider', 'model', 'draft_job_id', 'resolution', 'output_format', 'project_id', 'project_name', 'client_request_id'})
         self.assertEqual({key: wire[key] for key in PROJECT}, PROJECT)
-        self.assertEqual((wire['quality'], wire['draft_job_id']), ('1080p', JOB))
+        self.assertEqual((wire['resolution'], wire['output_format'], wire['draft_job_id']), ('1080p', 'mov', JOB))
         self.assertEqual(node.upload_calls, 0)
         node._prepare_video_references_for_run.assert_not_called()
         node._resolve_exact_shot_generation_inputs.assert_not_called()
         node._manual_agent_prompt_source.assert_not_called()
         self.assertEqual(node._generation_recovery_state()['generation_origin'], source['generation_origin'])
+        self.assertEqual(node._generation_recovery_state()['generation_origin']['name'], '생성 당시 샷 이름 🎬')
         self.assertEqual(node.get_parameter_value('prompt'), 'must not be resent')
         self.assertEqual(node.get_parameter_value('output_format'), 'mov')
         self.assertEqual(len(node.saved), 1)
         self.assertIn('final1080p', node.saved[0][1])
+        self.assertTrue(node.saved[0][1].endswith('.mov'))
+        self.assertEqual(node.saved[0][2]['output_format'], 'mov')
         self.assertFalse(Path(node.base.name, 'original.mp4').exists())
 
     def test_double_click_schedules_one_final_and_later_click_cannot_repeat_it(self):
@@ -377,6 +399,94 @@ class DraftShotTests(unittest.TestCase):
                 self.assertEqual(len(node.bridge.posts), 1)
         asyncio.run(scenario())
 
+    def test_supported_format_preview_then_direct_final_freezes_inputs_and_runs_generator_once(self):
+        async def scenario(shot, ordinary_formats, draft_formats, expected_format):
+            node = Node(shot=shot)
+            profile = node.bridge.capability_response['models'][t.SEEDANCE_2_5_MODEL_ID]
+            profile['output_formats'] = deepcopy(ordinary_formats)
+            profile['draft_output_formats'] = deepcopy(draft_formats)
+            node.parameter_values.update(draft_action=t.DRAFT_ACTION_PREVIEW,
+                                         resolution='480p', output_format='mov')
+            selection = {'schema': t.PROJECT_SELECTION_SCHEMA, 'project': deepcopy(PROJECT)}
+            origin = node._capture_generated_video_origin()
+            node._capture_imageasset_project_selection = mock.Mock(return_value=selection)
+            node._resolve_exact_shot_generation_inputs = mock.Mock(side_effect=lambda values: {
+                **values, **PROJECT, '_hmb_imageasset_project_selection': deepcopy(selection),
+                '_hmb_generation_origin': deepcopy(origin),
+                '_hmb_draft_source_bindings': {} if not shot else {'image_asset': PUBLISHER}})
+            final_job = 'job-'+'c'*32
+
+            def submit(payload, *, timeout):
+                node.bridge.posts.append(deepcopy(payload))
+                return {'id': JOB if len(node.bridge.posts) == 1 else final_job,
+                        'status': 'succeeded', 'video_url': 'synthetic-boundary'}
+
+            async def save_verified_boundary(task, job_id, destination, *args, **kwargs):
+                # The transport/publication boundaries are synthetic. Actual
+                # Draft publication and metadata validation have separate tests.
+                path = Path(destination.resolve())
+                path.write_bytes(b'IMMUTABLE-DRAFT-BYTES' if job_id == JOB else b'FINAL-BYTES')
+                node.saved.append((job_id, str(path), kwargs))
+                if job_id == JOB:
+                    node._store_draft_source(completed_source(node, draft_job_id=JOB))
+
+            node.bridge.generate_seedance = submit
+            node._save_completed_task = save_verified_boundary
+            with run_boundaries(node):
+                await node._process_generation_impl()
+            self.assertEqual(len(node.bridge.posts), 1)
+            preview_body = deepcopy(node.bridge.posts[0])
+            self.assertEqual((preview_body['resolution'], preview_body.get('output_format', 'mp4')),
+                             ('480p', expected_format))
+            self.assertIs(preview_body['draft'], True)
+            self.assertIn(('draft', 'mov', expected_format), node.bridge.format_resolution_calls)
+            draft_path = Path(node.saved[0][1])
+            self.assertEqual(draft_path.suffix, '.'+expected_format)
+            self.assertEqual(node.saved[0][2]['output_format'], expected_format)
+            self.assertTrue(node._draft_ui_state()['final_available'])
+
+            node.parameter_values.update(prompt='changed after Draft {{SIGN}}', duration=29,
+                                         ratio='9:16', output_format='mp4')
+            forbid_upstream_work(node)
+            with run_boundaries(node), engine_loop_patch(asyncio.get_running_loop()), \
+                 mock.patch.object(t.GriptapeNodes, 'handle_request',
+                    side_effect=AssertionError('Final executed upstream graph'), create=True), \
+                 mock.patch.object(t.GriptapeNodes, 'ahandle_request',
+                    side_effect=AssertionError('Final executed upstream graph'), create=True):
+                first = node._on_finalize_draft_clicked(None, None,
+                    action_id='mov-final-click', expected_draft_job_id=JOB)
+                future = node._hmb_draft_finalize_future
+                duplicate = node._on_finalize_draft_clicked(None, None,
+                    action_id='mov-final-double-click', expected_draft_job_id=JOB)
+                self.assertTrue(first.success)
+                self.assertTrue(duplicate.success)
+                self.assertIs(node._hmb_draft_finalize_future, future)
+                await asyncio.wrap_future(future)
+
+            self.assertEqual(len(node.bridge.posts), 2, node._set_status_results.call_args_list)
+            final_body = node.bridge.posts[1]
+            self.assertEqual(final_body, {'provider': 'volcengine_ark',
+                'model': t.SEEDANCE_2_5_MODEL_ID, 'draft_job_id': JOB,
+                'resolution': '1080p', 'output_format': expected_format, **PROJECT,
+                'client_request_id': t._seedance_draft_final_request_id(JOB)})
+            self.assertEqual(node.bridge.posts[0], preview_body)
+            self.assertEqual(node.saved[1][2]['output_format'], expected_format)
+            self.assertTrue(node.saved[1][1].endswith('.'+expected_format))
+            self.assertNotEqual(node.saved[1][1], str(draft_path))
+            self.assertEqual(draft_path.read_bytes(), b'IMMUTABLE-DRAFT-BYTES')
+            node._manual_agent_prompt_source.assert_not_called()
+            node._resolve_exact_shot_generation_inputs.assert_not_called()
+            node._prepare_video_references_for_run.assert_not_called()
+            self.assertFalse(node._draft_ui_state()['final_available'])
+
+        for shot in (False, True):
+            for ordinary, draft, expected in ((['mp4', 'mov'], ['mp4', 'mov'], 'mov'),
+                                              (['mp4'], ['mp4'], 'mp4'),
+                                              (['mp4'], ['mp4', 'mov'], 'mov'),
+                                              (['mp4', 'mov'], ['mp4'], 'mp4')):
+                with self.subTest(shot=shot, ordinary_formats=ordinary, draft_formats=draft):
+                    asyncio.run(scenario(shot, ordinary, draft, expected))
+
     def test_stale_shot_a_click_cannot_finalize_current_shot_b(self):
         async def scenario():
             node = Node()
@@ -390,6 +500,36 @@ class DraftShotTests(unittest.TestCase):
             self.assertEqual(node.bridge.posts, [])
             self.assertFalse(node._hmb_draft_finalize_pending)
         asyncio.run(scenario())
+
+    def test_invalid_final_capability_never_falls_back_uploads_or_posts(self):
+        async def scenario(shot, failure):
+            node = Node(shot=shot)
+            node._store_draft_source(completed_source(node))
+            if failure is None:
+                node.bridge.capability_response = {}
+            else:
+                node.bridge.capability_error = failure
+            forbid_upstream_work(node)
+            build = mock.Mock(side_effect=AssertionError('Unproven Final format froze a destination'))
+            node._output_file.build_file = build
+            with run_boundaries(node), engine_loop_patch(asyncio.get_running_loop()):
+                response = node._on_finalize_draft_clicked(None, None,
+                    action_id='unsupported-final-format', expected_draft_job_id=JOB)
+                self.assertTrue(response.success)
+                await asyncio.wrap_future(node._hmb_draft_finalize_future)
+            self.assertEqual(node.bridge.posts, [])
+            self.assertEqual(node.saved, [])
+            self.assertEqual(node.upload_calls, 0)
+            build.assert_not_called()
+            node._manual_agent_prompt_source.assert_not_called()
+            node._prepare_video_references_for_run.assert_not_called()
+            self.assertNotIn('final_request_id', node._draft_source_record())
+
+        for shot in (False, True):
+            for failure in (None, t._BrokerError('Synthetic Final capability 401', status_code=401),
+                            t._BrokerError('Synthetic Final capability 503', status_code=503)):
+                with self.subTest(shot=shot, failure=repr(failure)):
+                    asyncio.run(scenario(shot, failure))
 
     def test_switch_after_callback_before_worker_revalidation_submits_nothing(self):
         async def scenario():
@@ -445,7 +585,8 @@ class DraftShotTests(unittest.TestCase):
             source = completed_source(node)
             node._store_draft_source(source)
             forbid_upstream_work(node)
-            capability = mock.Mock(side_effect=t._BrokerProtocolError('Synthetic server has not enabled Draft'))
+            capability = mock.Mock(side_effect=t._BrokerProtocolError('Synthetic server has not enabled Draft'),
+                                   return_value='mov')
             node.bridge.require_seedance_draft_features = capability
             with run_boundaries(node), engine_loop_patch(asyncio.get_running_loop()):
                 first = node._on_finalize_draft_clicked(None, None, action_id='unsupported', expected_draft_job_id=JOB)
@@ -543,13 +684,45 @@ class DraftShotTests(unittest.TestCase):
         self.assertEqual(node.bridge.posts, [])
         self.assertEqual(node.saved[0][1], path)
 
+    def test_legacy_mp4_draft_starts_distinct_mov_final_without_rewriting_preview(self):
+        node = Node()
+        source = completed_source(node)
+        node._store_draft_source(source)
+        preview_path = Path(node.base.name, 'legacy-frozen-draft480p.mp4')
+        preview_path.write_bytes(b'EXISTING-MP4-DRAFT-UNCHANGED')
+        values = base.params(t.DRAFT_ACTION_PREVIEW)
+        values.update(resolution='480p', output_format='mp4',
+                      _hmb_output_file=str(preview_path), _hmb_broker_server_url=ORIGIN,
+                      _hmb_draft_project=PROJECT, _hmb_generation_origin=source['generation_origin'])
+        node._set_generation_recovery_checkpoint(stage='pre_submit', task_id='hmb-legacy-mp4',
+            task_identity='client_request', status='submitting', params=values)
+        node._set_generation_recovery_checkpoint(stage='accepted', task_id=JOB,
+            task_identity='broker_task', status='succeeded', params=values)
+        self.assertEqual(node._generation_recovery_state()['output_format'], 'mp4')
+        forbid_upstream_work(node)
+        with run_boundaries(node):
+            asyncio.run(node._run_draft_final(source, 'legacy-mp4-new-mov-final'))
+        self.assertEqual(len(node.bridge.posts), 1, node._set_status_results.call_args_list)
+        self.assertEqual((node.bridge.posts[0]['resolution'], node.bridge.posts[0]['output_format']),
+                         ('1080p', 'mov'))
+        self.assertEqual(node.saved[0][2]['output_format'], 'mov')
+        self.assertTrue(node.saved[0][1].endswith('.mov'))
+        self.assertNotEqual(node.saved[0][1], str(preview_path))
+        self.assertEqual(preview_path.read_bytes(), b'EXISTING-MP4-DRAFT-UNCHANGED')
+        node._manual_agent_prompt_source.assert_not_called()
+        node._prepare_video_references_for_run.assert_not_called()
+
     def test_completed_preview_publishes_shot_source_and_enables_final_without_post(self):
         node = Node()
         origin = node._capture_generated_video_origin()
+        # A real Draft records submission time before remote generation. The
+        # journal's monotonically increasing update time is not its start time.
+        started_at_ms = int(time.time()*1000)-1000
         node.parameter_values['draft_action'] = t.DRAFT_ACTION_PREVIEW
         values = base.params(t.DRAFT_ACTION_PREVIEW)
         values.update(resolution='480p', _hmb_draft_project=PROJECT, _hmb_broker_server_url=ORIGIN,
-                      _hmb_generation_origin=origin, _hmb_draft_source_bindings={'image_asset': PUBLISHER})
+                      _hmb_generation_origin=origin, _hmb_draft_source_bindings={'image_asset': PUBLISHER},
+                      _hmb_draft_started_at_ms=started_at_ms)
         node._set_generation_recovery_checkpoint(stage='pre_submit', task_id='hmb-preview',
             task_identity='client_request', status='submitting', params=values)
         node._set_generation_recovery_checkpoint(stage='remote_succeeded', task_id=JOB,
@@ -571,7 +744,7 @@ class DraftShotTests(unittest.TestCase):
         self.assertEqual(source['generation_origin'], origin)
         self.assertEqual(source['source_bindings'], {'image_asset': PUBLISHER})
         self.assertIs(source['completed'], True)
-        self.assertGreater(source['created_at_ms'], 0)
+        self.assertEqual(source['created_at_ms'], started_at_ms)
         self.assertTrue(node._draft_ui_state()['final_available'])
         self.assertEqual((node.get_parameter_value('resolution'), node.get_parameter_value('draft_action')),
                          ('1080p', t.DRAFT_ACTION_FINAL))

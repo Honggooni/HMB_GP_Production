@@ -301,6 +301,95 @@ async def output_parent_readiness():
     return len(cases)
 
 
+async def optional_project_policy_readiness():
+    """Policy absence is truthful metadata after explicit server negotiation."""
+    origin = "https://broker.example"
+    project = {"project_id": "katuri8", "project_name": "까투리8"}
+    capability = {"parent_settings_contract": web.PARENT_SETTINGS_SCHEMA,
+                  "project_routing": {"schema": web.PROJECT_ROUTING_SCHEMA,
+                                      "project_ids": sorted(web.PROJECT_IDS)}}
+    cases = (
+        ("absent_supported", {"ready": True, "policy_verified": False, "policy_status": "absent", "version": ""}, True),
+        ("absent_legacy", {"ready": True, "policy_verified": False, "policy_status": "absent", "version": ""}, False),
+        ("available_legacy", {"ready": True, "policy_verified": True, "policy_status": "available", "version": "test"}, False),
+        ("invalid_policy", {"ready": False, "policy_verified": False, "policy_status": "unavailable", "version": ""}, True),
+    )
+    for kind, policy, supported in cases:
+        with tempfile.TemporaryDirectory(prefix="hmb-web-optional-policy-") as directory:
+            engine, node, agent = Engine(), Generator(), Agent()
+            node.name, agent.name = "generator", "agent"
+            agent._hmb_web_rerender_policy_status = lambda project_id=None, value=policy: deepcopy(value)
+            agent._hmb_web_rerender_busy = lambda: False
+            engine.node_manager = SimpleNamespace(get_node_by_name=lambda name: agent)
+            engine.context_manager = SimpleNamespace(get_current_workflow_name=lambda: "workflow")
+            requests = []
+            def get_capability(method, route, *, payload, timeout):
+                assert method == "GET" and route == "/api/v1/reviews/capabilities"
+                assert payload is None and timeout == 10
+                requests.append((method, route))
+                return {**deepcopy(capability), **({
+                    "optional_project_policy_status_supported": True,
+                    "optional_project_policy_status_schema": "hmb-optional-agent-policy-status-v1",
+                } if supported else {})}
+            bridge = SimpleNamespace(server_url=origin, _load_access_token=lambda: "offline-optional-policy-token",
+                                     _request_json=get_capability)
+            node._selected_broker_server_url = lambda: origin
+            node._create_broker_bridge = lambda **kwargs: bridge
+            snapshot = {"agent_name": "agent", "target": {"flow_name": "flow"}, "project": project,
+                        "source_bindings": [], "binding_fingerprint": "a" * 64}
+            node._hmb_web_rerender_capture_inputs = lambda: deepcopy(snapshot)
+            node._hmb_web_rerender_readiness = lambda: {"ready": True}
+            node.parameter_output_values = {"generation_id": "job-parent"}
+            node.get_parameter_value = lambda key: None
+            before = deepcopy((node.original, node.parameter_output_values, agent.original))
+            worker = web.EngineWorker(engine, web.OperationJournal(directory))
+            with patch.object(web._review, "task_origin", lambda task_id: origin), \
+                 patch.object(web._review, "task_project", lambda task_id: deepcopy(project)):
+                info = await worker._target(node)
+                if kind == "absent_legacy":
+                    assert info is None, "An older strict server received an unsupported absent-policy descriptor"
+                    protocol = worker.protocols[origin]
+                    checked = protocol.policy_status_capability_checked_at
+                    with patch.object(web.time, "monotonic", return_value=checked + 29):
+                        assert await worker._target(node) is None
+                    assert requests == [("GET", "/api/v1/reviews/capabilities")]
+                    # Server deployment can advertise optional status while
+                    # the desktop remains open. Rediscovery is read-only and
+                    # bounded; the user graph/session need no forced reset.
+                    supported = True
+                    with patch.object(web.time, "monotonic", return_value=checked + 31):
+                        _, upgraded, *_ = await worker._target(node)
+                    assert upgraded["ready"] is True and upgraded["policy_verified"] is False
+                    assert upgraded["policy_status"] == "absent"
+                    assert requests == [("GET", "/api/v1/reviews/capabilities")] * 2
+                else:
+                    protocol, descriptor, *_ = info
+                    assert descriptor["parent_task_ids"] == ["job-parent"]
+                    assert descriptor["policy_verified"] is policy["policy_verified"]
+                    assert descriptor["ready"] is policy["ready"]
+                    assert descriptor["policy_version"] == policy["version"]
+                    assert descriptor["policy_application"] == "preserved_parent"
+                    assert descriptor["policy_reinjected"] is False
+                    assert protocol.owner_key == "", "Local readiness inferred authenticated ownership"
+                    if kind == "absent_supported":
+                        assert descriptor["policy_status"] == "absent"
+                        _, repeated, *_ = await worker._target(node)
+                        assert repeated == descriptor
+                        assert requests == [("GET", "/api/v1/reviews/capabilities")]
+                        # Policy absence cannot bypass the parent project fence.
+                        with patch.object(web._review, "task_project", lambda task_id: {
+                            "project_id": "superwings12", "project_name": "슈퍼윙즈12"}):
+                            _, mismatched, *_ = await worker._target(node)
+                        assert mismatched["parent_task_ids"] == [] and mismatched["ready"] is False
+                    else:
+                        assert "policy_status" not in descriptor
+                        assert requests == [], "Legacy available/invalid metadata triggered capability I/O"
+            assert agent.calls == 0 and node.executions == 0
+            assert before == (node.original, node.parameter_output_values, agent.original)
+            assert not worker.active and not worker.leases
+    return len(cases)
+
+
 async def broker_origin_rotation():
     """Fence an in-flight A command and recover only authenticated A lineage."""
     origin_a, origin_b = "https://broker.example", "https://different.example"
@@ -682,13 +771,14 @@ async def main():
     unload_pending()
     await account_rotation()
     parent_cases = await output_parent_readiness()
+    optional_policy_cases = await optional_project_policy_readiness()
     origin_cases = await broker_origin_rotation()
     lineage_cases = await confirmed_descendant_lineage()
     prepared_cases = await prepared_acknowledgement_errors()
     policy_cases = await preserved_parent_provenance()
     await lease_lost_while_waiting_for_agent()
     media_cases = large_inline_media_fingerprint()
-    print(f"PASS web rerender worker: {11 + parent_cases + origin_cases + lineage_cases + prepared_cases + policy_cases + media_cases} offline lifecycle, preserved-parent provenance, prepared acknowledgement errors, confirmed child lineage, output/recovery parent origin, Broker switch and callback fences, account/lease/unload, queued-Agent lease cancellation, large inline media and bounded journal, restart/replay and immutable-node cases; paid calls 0")
+    print(f"PASS web rerender worker: {11 + parent_cases + optional_policy_cases + origin_cases + lineage_cases + prepared_cases + policy_cases + media_cases} offline lifecycle, optional-policy negotiation and truthful absent status, preserved-parent provenance, prepared acknowledgement errors, confirmed child lineage, output/recovery parent origin, Broker switch and callback fences, account/lease/unload, queued-Agent lease cancellation, large inline media and bounded journal, restart/replay and immutable-node cases; paid calls 0")
 
 
 if __name__ == "__main__":

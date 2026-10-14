@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import httpx
+from PIL import Image
 from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
@@ -1101,7 +1102,8 @@ def assert_seedance_25_output_format_and_last_frame_ui_contract() -> None:
             timeout=1,
         )
     except target._BrokerProtocolError as exc:
-        assert "No media was uploaded" in str(exc)
+        assert "capabilities could not be verified" in str(exc)
+        assert "No render was submitted" in str(exc)
     else:
         raise AssertionError("Missing Broker capabilities were accepted")
     assert unsupported_calls == [
@@ -2214,7 +2216,10 @@ def assert_payload_and_media_contract() -> None:
         image_path = temporary_path / "reference.png"
         audio_path = temporary_path / "reference.wav"
         video_path = temporary_path / "reference.mp4"
-        image_bytes = b"\x89PNG\r\n\x1a\nimage-regression"
+        image_stream = io.BytesIO()
+        with Image.new("RGB", (32, 16), (24, 105, 188)) as image:
+            image.save(image_stream, format="PNG")
+        image_bytes = image_stream.getvalue()
         audio_bytes = b"RIFFaudio-regression"
         image_path.write_bytes(image_bytes)
         audio_path.write_bytes(audio_bytes)

@@ -46,6 +46,19 @@ def _public_text(value: Any, limit: int = 128) -> str:
     return text
 
 
+def _public_shot_name(value: Any) -> str:
+    """Optional display name from the immutable creation snapshot only."""
+    if not isinstance(value, str):
+        return ""
+    text = _public_text(value, 128)
+    if (not text.strip() or "\x7f" in text or re.search(
+        r"(?i)\b(authorization|api[_ -]?key|access[_ -]?token|bearer|password|"
+        r"secret|session[_ -]?token)\b\s*[:=]?\s*\S+", text
+    )):
+        return ""
+    return text
+
+
 def _public_number(value: Any) -> int | float | None:
     # JSON integers need not fit a float. Reject out-of-range values before
     # isfinite converts them, so optional evidence cannot fail with overflow.
@@ -101,6 +114,9 @@ def public_evidence(record: dict[str, Any]) -> dict[str, Any]:
     shot = {key: _public_id(origin.get(key)) for key in ("channel_uuid", "shot_uuid", "source_node_instance_id")}
     if type(origin.get("number")) is int and 1 <= origin["number"] <= 5:
         shot["number"] = origin["number"]
+    name = _public_shot_name(origin.get("name"))
+    if name:
+        shot["name"] = name
     policy = build.get("policy") if isinstance(build.get("policy"), dict) else {}
     runtime = build.get("runtime") if isinstance(build.get("runtime"), dict) else {}
     package = build.get("package") if isinstance(build.get("package"), dict) else {}
@@ -223,7 +239,12 @@ def mark_server_sync(task_id: str, *, status: str, evidence_sha256: str = "", re
         record = read_case(task_id, root=root)
         if not record:
             return None
-        record["server_sync"] = {"status": status, "evidence_sha256": _hash(evidence_sha256),
+        # Retry/login state does not erase the last successful immutable
+        # binding. It is used only when the full public projection matches.
+        previous = record.get("server_sync")
+        previous = previous if isinstance(previous, dict) else {}
+        bound_digest = _hash(evidence_sha256) or _hash(previous.get("evidence_sha256"))
+        record["server_sync"] = {"status": status, "evidence_sha256": bound_digest,
                                  "reason": _public_id(reason), "updated_at": _now()}
         _write(review_root(root) / "cases" / (record["case_id"] + ".json"), record)
         return deepcopy(record["server_sync"])

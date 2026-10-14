@@ -209,6 +209,80 @@ class TransportRegression(unittest.TestCase):
             with self.subTest(route=route), self.assertRaises(ValueError):
                 protocol.request("POST", route, {})
 
+    def test_optional_policy_capability_requires_exact_schema_and_literal_true(self):
+        base = {"parent_settings_contract": target.PARENT_SETTINGS_SCHEMA,
+                "project_routing": {"schema": target.PROJECT_ROUTING_SCHEMA,
+                                    "project_ids": sorted(target.PROJECT_IDS)}}
+        cases = (
+            (True, "hmb-optional-agent-policy-status-v1", True),
+            (True, "foreign-v1", False),
+            (1, "hmb-optional-agent-policy-status-v1", False),
+            (False, "hmb-optional-agent-policy-status-v1", False),
+            ("true", "hmb-optional-agent-policy-status-v1", False),
+            (None, None, False),
+        )
+        for flag, schema, expected in cases:
+            bridge = ProtocolBridge()
+            bridge.response = {**deepcopy(base), "optional_project_policy_status_supported": flag,
+                               "optional_project_policy_status_schema": schema}
+            before = deepcopy(bridge.response)
+            protocol = target.BrokerProtocol(bridge, WORKER, SESSION)
+            protocol.discover_capabilities()
+            self.assertIs(protocol.optional_policy_status_supported, expected)
+            self.assertTrue(protocol.policy_status_capability_checked)
+            self.assertTrue(protocol.parent_settings_ready)
+            self.assertEqual(protocol.owner_key, "")
+            self.assertEqual(bridge.response, before)
+            self.assertEqual(len(bridge.calls), 1)
+            self.assertEqual(bridge.calls[0][:2], ("GET", "/api/v1/reviews/capabilities"))
+            self.assertIsNone(bridge.calls[0][2]["payload"])
+
+    def test_optional_policy_discovery_refresh_does_not_retain_stale_support(self):
+        bridge = ProtocolBridge()
+        base = {"parent_settings_contract": target.PARENT_SETTINGS_SCHEMA,
+                "project_routing": {"schema": target.PROJECT_ROUTING_SCHEMA,
+                                    "project_ids": sorted(target.PROJECT_IDS)}}
+        protocol = target.BrokerProtocol(bridge, WORKER, SESSION)
+        bridge.response = {**base, "optional_project_policy_status_supported": True,
+                           "optional_project_policy_status_schema": "hmb-optional-agent-policy-status-v1"}
+        protocol.discover_capabilities()
+        self.assertTrue(protocol.optional_policy_status_supported)
+        bridge.response = deepcopy(base)
+        protocol.discover_capabilities()
+        self.assertFalse(protocol.optional_policy_status_supported)
+        self.assertTrue(protocol.policy_status_capability_checked)
+        self.assertEqual([call[0] for call in bridge.calls], ["GET", "GET"])
+        self.assertEqual(protocol.owner_key, "")
+
+    def test_legacy_heartbeat_omits_absent_targets_and_new_optional_fields(self):
+        capability = {"parent_settings_contract": target.PARENT_SETTINGS_SCHEMA,
+                      "project_routing": {"schema": target.PROJECT_ROUTING_SCHEMA,
+                                          "project_ids": sorted(target.PROJECT_IDS)}}
+        absent = {"target_id": str(uuid4()), "project_id": "katuri8", "project_name": "까투리8",
+                  "policy_status": "absent", "policy_verified": False, "policy_version": "", "ready": True}
+        available = {"target_id": TARGET, "project_id": "superwings12", "project_name": "슈퍼윙즈12",
+                     "policy_status": "available", "policy_verified": True, "policy_version": "test", "ready": True}
+        originals = deepcopy([absent, available])
+        calls = []
+        def request(method, route, *, payload, timeout):
+            calls.append((method, route, deepcopy(payload)))
+            if method == "GET":
+                self.assertIsNone(payload)
+                return deepcopy(capability)
+            self.assertEqual(route, target.API_ROOT + "/worker/register")
+            return {"schema": target.PROTOCOL, "worker_id": WORKER, "session_id": SESSION,
+                    "registered": True, "user_id": 123, **capability}
+        bridge = SimpleNamespace(server_url=ORIGIN, _request_json=request)
+        protocol = target.BrokerProtocol(bridge, WORKER, SESSION)
+        protocol.heartbeat([absent, available], register=True)
+        self.assertEqual([call[0] for call in calls], ["GET", "POST"])
+        expected = deepcopy(available)
+        expected.pop("policy_status")
+        self.assertEqual(calls[-1][2]["targets"], [expected])
+        self.assertEqual([absent, available], originals)
+        self.assertFalse(protocol.optional_policy_status_supported)
+        self.assertEqual(protocol.owner_key, "123")
+
     def test_first_registration_uses_actual_bridge_get_signature_and_bound_reply(self):
         capability = {"parent_settings_contract": target.PARENT_SETTINGS_SCHEMA,
                            "project_routing": {"schema": target.PROJECT_ROUTING_SCHEMA,

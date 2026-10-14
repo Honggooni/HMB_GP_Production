@@ -23,8 +23,11 @@ class FinalParityTests(unittest.TestCase):
         while base.TEMPORARIES:
             base.TEMPORARIES.pop().cleanup()
 
-    def header_final(self):
+    def header_final(self, *, formats=("mp4", "mov")):
         node = fixture.Node()
+        profile = node.bridge.capability_response['models'][t.SEEDANCE_2_5_MODEL_ID]
+        profile['output_formats'] = list(formats)
+        profile['draft_output_formats'] = list(formats)
         source = fixture.completed_source(node)
         node._store_draft_source(source)
         fixture.forbid_upstream_work(node)
@@ -37,14 +40,15 @@ class FinalParityTests(unittest.TestCase):
         node, body = self.header_final()
         key = 'hmb-draft-final-v1-' + base.JOB
         self.assertEqual(body, {'provider': 'volcengine_ark', 'model': t.SEEDANCE_2_5_MODEL_ID,
-            'quality': '1080p', 'draft_job_id': base.JOB,
+            'resolution': '1080p', 'output_format': 'mov', 'draft_job_id': base.JOB,
             **base.PROJECT, 'client_request_id': key})
         self.assertEqual(node.upload_calls, 0)
         node._manual_agent_prompt_source.assert_not_called()
         node._resolve_exact_shot_generation_inputs.assert_not_called()
         self.assertNotIn('prompt', body)
-        self.assertNotIn('resolution', body)
-        self.assertNotIn('output_format', body)
+        self.assertNotIn('quality', body)
+        self.assertNotIn('reference_images', body)
+        self.assertNotIn('reference_videos', body)
 
     def test_same_draft_different_generator_owner_has_identical_web_intent(self):
         first, one = self.header_final()
@@ -57,13 +61,33 @@ class FinalParityTests(unittest.TestCase):
     def test_header_and_authored_final_share_key_and_body(self):
         _, header_body = self.header_final()
         values = base.params(t.DRAFT_ACTION_FINAL)
-        values['resolution'] = '1080p'
+        values.update(resolution='1080p', output_format='mov')
         node = base.Node(values)
         node._prepare_video_references_for_run = mock.Mock(side_effect=AssertionError('media upload'))
         node._resolve_exact_shot_generation_inputs = mock.Mock(side_effect=AssertionError('new inputs'))
         with mock.patch.object(t, '_resolve_mp4_decode_verifier', return_value=SimpleNamespace(executable='fixture', backend='test')):
             asyncio.run(node._process_generation_impl())
         self.assertEqual(node.bridge.posts, [header_body])
+
+    def test_header_and_authored_final_share_declared_mp4_fallback_body(self):
+        header, header_body = self.header_final(formats=('mp4',))
+        self.assertEqual(header_body['output_format'], 'mp4')
+        self.assertTrue(header.saved[0][1].endswith('.mp4'))
+        values = base.params(t.DRAFT_ACTION_FINAL)
+        values.update(resolution='1080p', output_format='mov')
+        node = base.Node(values)
+        profile = node.bridge.capability_response['models'][t.SEEDANCE_2_5_MODEL_ID]
+        profile['output_formats'] = ['mp4']
+        profile['draft_output_formats'] = ['mp4']
+        fixture.forbid_upstream_work(node)
+        with mock.patch.object(t, '_resolve_mp4_decode_verifier',
+                return_value=SimpleNamespace(executable='fixture', backend='test')):
+            asyncio.run(node._process_generation_impl())
+        self.assertEqual(node.bridge.posts, [header_body])
+        self.assertEqual(node.saved[0][2]['output_format'], 'mp4')
+        self.assertTrue(node.saved[0][1].endswith('.mp4'))
+        self.assertEqual(node.upload_calls, 0)
+        node._manual_agent_prompt_source.assert_not_called()
 
     def test_transport_idempotency_header_matches_body(self):
         _, body = self.header_final()

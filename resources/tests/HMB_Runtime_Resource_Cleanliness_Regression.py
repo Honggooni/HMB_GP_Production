@@ -42,10 +42,10 @@ packager = load_packager()
 source_files = tuple(packager.SOURCE_FILES)
 runtime_install_files = tuple(packager.RUNTIME_INSTALL_FILES)
 distribution_only_files = tuple(packager.DISTRIBUTION_ONLY_FILES)
-assert len(runtime_install_files) == 38
+assert len(runtime_install_files) == 39
 assert distribution_only_files == DISTRIBUTION_ONLY_FILES
 assert source_files == (*runtime_install_files, *distribution_only_files)
-assert len(source_files) == 42
+assert len(source_files) == 43
 assert not EXCLUDED_PACKAGE_FILES.intersection(source_files)
 assert not set(runtime_install_files).intersection(distribution_only_files)
 assert {
@@ -83,11 +83,12 @@ assert "LocalApplicationData" in installer
 assert "Rollback data must be stored outside the Griptape libraries folder" in installer
 assert "MyInvocation.MyCommand.Path" in installer
 assert "Could not resolve the extracted HMB package directory" in installer
-assert "[int]$manifest.install_file_count -ne 38" in installer
-assert "$records.Count -ne 42" in installer
+assert "[int]$manifest.install_file_count -ne 39" in installer
+assert "$records.Count -ne 43" in installer
 assert "_hmb_agent_media.py" in runtime_install_files
 assert "_hmb_build_diagnostics.py" in runtime_install_files
 assert "_hmb_library_bootstrap.py" in runtime_install_files
+assert "_hmb_image_limits.py" in runtime_install_files
 assert "_hmb_review.py" in runtime_install_files
 assert "_hmb_web_rerender.py" in runtime_install_files
 assert "hmb-install-receipt" in installer

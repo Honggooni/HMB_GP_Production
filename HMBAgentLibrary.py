@@ -71,6 +71,16 @@ _HMB_POLICY_WARNING_NAME = "HMB_AGENT_POLICY_REQUIRED_WARNING"
 _HMB_TOPOLOGY_WARNING_NAME = "HMB_AGENT_CONNECTION_CHECK_WARNING"
 _AGENT_EXECUTION_RESULT_PARAMETER = "HMB_AGENT_EXECUTION_RESULT"
 _AGENT_EXECUTION_FAILED_WARNING = "HMB_AGENT_EXECUTION_FAILED_WARNING"
+_AGENT_CREATED_WARNING = "HMB_AGENT_CREATED_WARNING"
+_AGENT_PROJECT_POLICY_ABSENT_WARNING = "HMB_AGENT_PROJECT_POLICY_ABSENT_WARNING"
+_AGENT_PROJECT_POLICY_ABSENT_MESSAGE = (
+    "선택한 프로젝트의 정책이 없습니다. 프로젝트 정책을 적용하지 않고 원본 샷 입력으로 계속 실행합니다. "
+    "다른 프로젝트의 정책은 대신 적용하지 않습니다."
+)
+_AGENT_CREATED_MESSAGE = (
+    "Agent 객체만 생성되었습니다. 모델 추론과 HMB 프로젝트 정책 적용은 실행되지 않았습니다. "
+    "HMB 샷 작업은 해당 샷의 Prompt 연결과 프로젝트 정책 준비 상태를 확인하세요."
+)
 _FINAL_TEXT_DISPLAY_NAME = "FINAL TEXT · GENERATOR"
 _AGENT_STATE_DISPLAY_NAME = "AGENT STATE · CHAIN ONLY"
 _HMB_POLICY_UNAVAILABLE_MESSAGE = (
@@ -1447,6 +1457,13 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_native_prompt_read_active = False
         self._hmb_verified_prompt_source_node = None
         self._hmb_native_calls_this_process = 0
+        self._hmb_native_inference_started = False
+        self._hmb_native_run_completed = False
+        self._hmb_run_hmb_source = False
+        self._hmb_run_policy_applied = False
+        self._hmb_policy_omitted = False
+        self._hmb_run_policy_omitted = False
+        self._hmb_run_project_identity: dict[str, str] = {}
         self._hmb_last_sanitizer_status = "clean"
         self._hmb_suppress_visible_publication = False
         self._hmb_capture_publications = False
@@ -1526,12 +1543,41 @@ class HMBAgentLibrary(_BaseAgent):
                     variant="error", hide=True,
                     value="This Agent failed. Its new render is skipped; independent shots continue. See FINAL TEXT for the reason.",
                 ))
+            if not any(getattr(child, "name", "") == _AGENT_CREATED_WARNING for child in children):
+                self.add_node_element(ParameterMessage(
+                    name=_AGENT_CREATED_WARNING,
+                    title="Agent 객체 생성 · 모델 추론 없음",
+                    variant="warning", hide=True, value=_AGENT_CREATED_MESSAGE,
+                ))
+            if not any(getattr(child, "name", "") == _AGENT_PROJECT_POLICY_ABSENT_WARNING for child in children):
+                self.add_node_element(ParameterMessage(
+                    name=_AGENT_PROJECT_POLICY_ABSENT_WARNING,
+                    title="프로젝트 정책 없음 · 계속 실행",
+                    variant="info", hide=True, value=_AGENT_PROJECT_POLICY_ABSENT_MESSAGE,
+                ))
+        self._refresh_hmb_execution_result_messages()
 
     def _hmb_execution_result_snapshot(self) -> dict[str, Any]:
         result = getattr(self, "_hmb_execution_result", None)
         if not isinstance(result, dict) or not result:
             result = getattr(self, "parameter_values", {}).get(_AGENT_EXECUTION_RESULT_PARAMETER)
         return copy.deepcopy(result) if isinstance(result, dict) else {}
+
+    def _refresh_hmb_execution_result_messages(self) -> None:
+        """Restore result advisories from saved facts, never displayed output."""
+        result = self._hmb_execution_result_snapshot()
+        created = (result.get("status") == "created" and result.get("code") == "AGENT_CREATED"
+                   and result.get("inference_started") is False and result.get("policy_applied") is False)
+        for name, visible in ((_AGENT_EXECUTION_FAILED_WARNING, result.get("status") == "failed"),
+                              (_AGENT_CREATED_WARNING, created),
+                              (_AGENT_PROJECT_POLICY_ABSENT_WARNING, result.get("policy_status") == "absent")):
+            try:
+                if visible:
+                    self.show_message_by_name(name)
+                else:
+                    self.hide_message_by_name(name)
+            except Exception:
+                pass
 
     def _hmb_agent_reference_observation_snapshot(self) -> dict[str, Any]:
         """Read-only observations for the current Agent run, never source access."""
@@ -1590,7 +1636,14 @@ class HMBAgentLibrary(_BaseAgent):
             "status": status, "code": code, "message": message,
             "run_id": secrets.token_hex(16) if status == "running" else str(previous.get("run_id") or ""),
             "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest() if status == "succeeded" else "",
+            "inference_started": bool(getattr(self, "_hmb_native_inference_started", False)),
+            "policy_applied": bool(getattr(self, "_hmb_run_policy_applied", False)),
+            "policy_status": ("absent" if getattr(self, "_hmb_run_policy_omitted", False)
+                              else "applied" if getattr(self, "_hmb_run_policy_applied", False) else "not_applied"),
         }
+        project = getattr(self, "_hmb_run_project_identity", {})
+        if isinstance(project, dict) and project.get("project_id"):
+            result.update(project_id=project["project_id"], project_name=project.get("project_name", ""))
         observation = self._hmb_agent_reference_observation_snapshot()
         if observation and observation.get("run_id") == result["run_id"]:
             observation["agent_status"] = status
@@ -1601,13 +1654,7 @@ class HMBAgentLibrary(_BaseAgent):
         self._hmb_execution_result = result
         self.parameter_values[_AGENT_EXECUTION_RESULT_PARAMETER] = dict(result)
         self.parameter_output_values[_AGENT_EXECUTION_RESULT_PARAMETER] = dict(result)
-        try:
-            if status == "failed":
-                self.show_message_by_name(_AGENT_EXECUTION_FAILED_WARNING)
-            else:
-                self.hide_message_by_name(_AGENT_EXECUTION_FAILED_WARNING)
-        except Exception:
-            pass
+        self._refresh_hmb_execution_result_messages()
 
     def _hmb_issue_web_rerender_authority(self, *, request_id, generator, owner_key):
         return _issue_hmb_web_rerender_authority(
@@ -1676,28 +1723,33 @@ class HMBAgentLibrary(_BaseAgent):
         return projects[0] if projects else resolve_project()
 
     def _hmb_web_rerender_policy_status(self, project_id=None) -> dict[str, Any]:
-        """Read-only signed artifact readiness; no model call or session claim.
+        """Read-only runtime usability and policy evidence; no session claim.
 
         The worker may call this in to_thread for heartbeat publication. This
-        verifies the installed artifact only; web revision never loads its
-        rules into the Agent or applies them again to the recorded prompt.
+        verifies any present artifact. Missing project rules are optional;
+        web revision never reinjects them into the recorded parent prompt.
         """
         try:
             project = resolve_project(project_id) if project_id is not None else self._hmb_selected_project()
-            payload = _hmb._load_verified_agent_rule_payload(project["project_id"])
             state = _hmb._agent_policy_session_state(project["project_id"])
             if str(state).casefold() in {"failed", "closed"}:
-                return {"ready": False, "version": "", "sha256": "", "reason": "policy_session_unavailable"}
+                return {"ready": False, "version": "", "sha256": "", "reason": "policy_session_unavailable",
+                        "policy_verified": False, "policy_status": "unavailable"}
+            payload = _hmb._load_verified_agent_rule_payload(project["project_id"])
             return {
                 "ready": True,
                 "version": str(payload.get("final_policy_version") or ""),
                 "sha256": str(payload.get("envelope_sha256") or ""),
                 "reason": "",
+                "policy_verified": True,
+                "policy_status": "available",
             }
         except ProjectPolicyPendingError:
-            return {"ready": False, "version": "", "sha256": "", "reason": "project_policy_pending"}
+            return {"ready": True, "version": "", "sha256": "", "reason": "project_policy_pending",
+                    "policy_verified": False, "policy_status": "absent"}
         except Exception:
-            return {"ready": False, "version": "", "sha256": "", "reason": "policy_unavailable"}
+            return {"ready": False, "version": "", "sha256": "", "reason": "policy_unavailable",
+                    "policy_verified": False, "policy_status": "unavailable"}
 
     async def _hmb_run_web_rerender(
         self, prompt, media_snapshot, generation_settings, request_identity
@@ -1789,6 +1841,13 @@ class HMBAgentLibrary(_BaseAgent):
         """
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return
+        self._hmb_native_inference_started = False
+        self._hmb_native_run_completed = False
+        self._hmb_run_hmb_source = False
+        self._hmb_run_policy_applied = False
+        self._hmb_policy_omitted = False
+        self._hmb_run_policy_omitted = False
+        self._hmb_run_project_identity = {}
         self._set_hmb_execution_result("running")
         self._set_visible_output("")
         self.parameter_output_values["agent"] = {}
@@ -1818,6 +1877,18 @@ class HMBAgentLibrary(_BaseAgent):
             return
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return
+        if (getattr(self, "_hmb_native_run_completed", False)
+                and not getattr(self, "_hmb_native_inference_started", False)):
+            # Standard Agent completes its empty-prompt branch by constructing
+            # an Agent object. Completion is observed at the native iterator;
+            # final text never decides whether model inference actually ran.
+            if not getattr(self, "_hmb_run_hmb_source", False):
+                self._set_hmb_execution_result("created", code="AGENT_CREATED", message=_AGENT_CREATED_MESSAGE)
+                return
+            message = _hmb_execution_failure_message("EMPTY_OUTPUT")
+            self._publish_hmb_execution_block(message)
+            self._set_hmb_execution_result("failed", code="EMPTY_OUTPUT", message=message)
+            return
         output = self.parameter_output_values.get("output")
         if not isinstance(output, str) or not output.strip() or output == _PUBLIC_OUTPUT_BLOCKED:
             code = "EMPTY_OUTPUT" if not output else "OUTPUT_UNAVAILABLE"
@@ -1825,7 +1896,10 @@ class HMBAgentLibrary(_BaseAgent):
             self._publish_hmb_execution_block(message)
             self._set_hmb_execution_result("failed", code=code, message=message)
             return
-        self._set_hmb_execution_result("succeeded")
+        self._set_hmb_execution_result(
+            "succeeded", code="NO_PROJECT_POLICY" if self._hmb_run_policy_omitted else "",
+            message=_AGENT_PROJECT_POLICY_ABSENT_MESSAGE if self._hmb_run_policy_omitted else "",
+        )
 
     def _ensure_hmb_shot_prompt_input(self) -> None:
         """Register the private, router-owned Prompt dependency port.
@@ -3135,7 +3209,8 @@ class HMBAgentLibrary(_BaseAgent):
         """Add sealed policy rules without changing Standard Agent inputs."""
         normalized_name = str(name or "").strip().casefold()
         parent_getter = getattr(super(), "get_parameter_list_value", None)
-        if normalized_name != "rulesets" or not self._hmb_rules_active:
+        if (normalized_name != "rulesets" or not self._hmb_rules_active
+                or bool(getattr(self, "_hmb_policy_omitted", False))):
             return parent_getter(name) if callable(parent_getter) else []
         project_name, shot_name = self._hmb_ruleset_names
         if not project_name or not shot_name or project_name == shot_name:
@@ -3205,6 +3280,7 @@ class HMBAgentLibrary(_BaseAgent):
         """Discard all expanded policy text immediately after one native call."""
         self._hmb_capture_publications = False
         self._hmb_rules_active = False
+        self._hmb_policy_omitted = False
         self._hmb_policy = ""
         self._hmb_binding = ""
         self._hmb_policy_rules = []
@@ -3467,7 +3543,10 @@ class HMBAgentLibrary(_BaseAgent):
             marker = getattr(self, "_mark_hmb_reference_observation_submission", None)
             if callable(marker):
                 marker(observation_run, True)
+            self._hmb_native_inference_started = True
+            self._hmb_run_policy_applied = bool(self._hmb_rules_active) and not bool(getattr(self, "_hmb_policy_omitted", False))
             return _run_native_with_literal_hmb_input(native_processor, agent, prompt)
+        self._hmb_native_inference_started = True
         return native_processor(agent, prompt)
 
     def _run_native_agent_once(self, lifecycle_generation: int | None = None):
@@ -3496,6 +3575,7 @@ class HMBAgentLibrary(_BaseAgent):
                         else:
                             pending = native_iterator.send(send_value)
                     except StopIteration as stop:
+                        self._hmb_native_run_completed = True
                         return stop.value
                     if callable(pending):
 
@@ -3538,6 +3618,7 @@ class HMBAgentLibrary(_BaseAgent):
                     else:
                         pending = native_iterator.send(send_value)
                 except StopIteration as stop:
+                    self._hmb_native_run_completed = True
                     return stop.value
                 finally:
                     self._hmb_native_prompt_read_active = False
@@ -3687,11 +3768,12 @@ class HMBAgentLibrary(_BaseAgent):
         sealed HMB policy is not read, injected, filtered, or used to rewrite its
         output.  Only the direct registered
         ``HMBPromptLibrary.PROMPT_OUT -> HMBAgentLibrary.SHOT_PROMPT_IN`` edge opts into
-        the four project rules plus four shot rules.  The Prompt owns all four
+        the available four project rules plus four shot rules. The Prompt owns all four
         valid source modes (Prompt only, +Asset, +Picker, +Asset+Picker), so the
         Agent does not infer its siblings from payload text. Once that canonical
-        edge is present, policy availability and verification are mandatory: a
-        failure is reported and native execution is not attempted.
+        edge is present, missing project rules are reported and the verified
+        source still runs. Present invalid policy and source verification
+        failures are reported before native execution.
         """
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return None
@@ -3699,6 +3781,13 @@ class HMBAgentLibrary(_BaseAgent):
             getattr(self, "_hmb_lifecycle_generation", 0) or 0
         )
         self._hmb_native_calls_this_process = 0
+        self._hmb_native_inference_started = False
+        self._hmb_native_run_completed = False
+        self._hmb_run_hmb_source = False
+        self._hmb_run_policy_applied = False
+        self._hmb_policy_omitted = False
+        self._hmb_run_policy_omitted = False
+        self._hmb_run_project_identity = {}
         self._hmb_last_sanitizer_status = "clean"
         self._hmb_reference_observation = {}
         self._hmb_reference_observation_run_id = ""
@@ -3717,6 +3806,7 @@ class HMBAgentLibrary(_BaseAgent):
             if not self._hmb_lifecycle_is_live(lifecycle_generation):
                 return None
             is_hmb = self._has_canonical_hmb_prompt_connection()
+            self._hmb_run_hmb_source = bool(is_hmb)
         except Exception:
             self._publish_hmb_execution_block(_HMB_TOPOLOGY_UNAVAILABLE_MESSAGE)
             raise RuntimeError(_HMB_TOPOLOGY_UNAVAILABLE_MESSAGE) from None
@@ -3742,20 +3832,37 @@ class HMBAgentLibrary(_BaseAgent):
             # packaged Griptape engine process. Only a canonical HMB Prompt ->
             # Agent execution can initialize the protected in-memory session.
             self._set_agent_execution_phase("authorizing")
-            self._hmb_execution_project_id = self._hmb_selected_project()["project_id"]
-            if self._hmb_execution_project_id != "superwings12":
-                # Readiness verifies only the installed artifact. An expected
-                # pending project must not consume its terminal authorization
-                # cell or silently substitute the Super Wings policy.
-                if self._hmb_web_rerender_policy_status(self._hmb_execution_project_id).get("reason") == "project_policy_pending":
-                    raise ProjectPolicyPendingError("Selected project policy has not been supplied.")
+            selected_project = self._hmb_selected_project()
+            self._hmb_execution_project_id = selected_project["project_id"]
+            self._hmb_run_project_identity = {key: selected_project[key] for key in ("project_id", "project_name")}
+            # Detect genuine absence before claiming any project's session.
+            # A present invalid DAT or failed/closed authorization stays blocked,
+            # including when an earlier valid policy was cached in this process.
+            readiness = self._hmb_web_rerender_policy_status(self._hmb_execution_project_id)
+            if readiness.get("reason") == "project_policy_pending":
+                raise ProjectPolicyPendingError("Selected project policy has not been supplied.")
+            if readiness.get("ready") is not True:
+                raise RuntimeError("Selected project policy verification is unavailable.")
             if self._hmb_execution_project_id == "superwings12":
                 _hmb._bootstrap_agent_policy_session()
             else:
                 _hmb._bootstrap_agent_policy_session(self._hmb_execution_project_id)
         except ProjectPolicyPendingError:
-            self._publish_hmb_execution_block(_HMB_PROJECT_POLICY_PENDING_MESSAGE)
-            raise RuntimeError(_HMB_PROJECT_POLICY_PENDING_MESSAGE) from None
+            # A missing project DAT is informational. Continue with the same
+            # verified source snapshot and host processing, without substituting
+            # any other project's rules or consuming its authorization session.
+            self._hmb_policy_omitted = True
+            self._hmb_run_policy_omitted = True
+            self._hmb_policy = self._hmb_binding = ""
+            self._hmb_policy_rules = []
+            self._hmb_binding_rules = []
+            self._hmb_policy_identity = {}
+            self._hmb_ruleset_names = ("", "")
+            try:
+                self.show_message_by_name(_AGENT_PROJECT_POLICY_ABSENT_WARNING)
+            except Exception:
+                pass
+            print(f"[HMB_PRODUCTION][INFO] PROJECT_POLICY_ABSENT project_id={self._hmb_execution_project_id}")
         except Exception:
             self._publish_hmb_execution_block(_HMB_POLICY_UNAVAILABLE_MESSAGE)
             raise RuntimeError(_HMB_POLICY_UNAVAILABLE_MESSAGE) from None
@@ -3765,17 +3872,18 @@ class HMBAgentLibrary(_BaseAgent):
             self._clear_execution_shot_binding()
             return None
         self._set_agent_execution_phase("preparing")
-        try:
-            (
-                self._hmb_policy,
-                self._hmb_binding,
-                self._hmb_policy_rules,
-                self._hmb_binding_rules,
-            ) = self._load_hmb_rules()
-            self._hmb_ruleset_names = (secrets.token_hex(16), secrets.token_hex(16))
-        except Exception:
-            self._publish_hmb_execution_block(_HMB_POLICY_UNAVAILABLE_MESSAGE)
-            raise RuntimeError(_HMB_POLICY_UNAVAILABLE_MESSAGE) from None
+        if not self._hmb_policy_omitted:
+            try:
+                (
+                    self._hmb_policy,
+                    self._hmb_binding,
+                    self._hmb_policy_rules,
+                    self._hmb_binding_rules,
+                ) = self._load_hmb_rules()
+                self._hmb_ruleset_names = (secrets.token_hex(16), secrets.token_hex(16))
+            except Exception:
+                self._publish_hmb_execution_block(_HMB_POLICY_UNAVAILABLE_MESSAGE)
+                raise RuntimeError(_HMB_POLICY_UNAVAILABLE_MESSAGE) from None
 
         if not self._hmb_lifecycle_is_live(lifecycle_generation):
             self._clear_hmb_runtime_policy()

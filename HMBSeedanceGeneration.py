@@ -119,6 +119,7 @@ from _hmb_mp4_verify import (
 )
 import _hmb_shot_routing as _shot_routing
 import _hmb_review as _review
+from _hmb_image_limits import inspect_seedance_image_payload
 from _hmb_project import project_from_asset_payload, resolve_project
 from _hmb_build_diagnostics import get_build_diagnostics as _get_build_diagnostics
 from _hmb_common import (
@@ -783,7 +784,7 @@ def _seedance_draft_final_request_id(draft_job_id: str) -> str:
 
 
 class _SeedanceDraftOutputDestination:
-    """A distinct no-overwrite MP4 path for each explicit paid Draft action."""
+    """A distinct no-overwrite video path for each explicit paid Draft action."""
     _existing_file_policy = ExistingFilePolicy.FAIL
     _append = False
     _create_parents = True
@@ -793,6 +794,20 @@ class _SeedanceDraftOutputDestination:
 
     def resolve(self) -> str:
         return self.location
+
+
+class _SeedanceResolvedOutputDestination:
+    """Freeze the effective save path while retaining the SDK file policy."""
+
+    def __init__(self, destination: Any, location: str) -> None:
+        self._destination = destination
+        self.location = location
+
+    def resolve(self) -> str:
+        return self.location
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._destination, name)
 
 
 def _seedance_recovery_value(value: Any = None) -> dict[str, Any]:
@@ -1805,6 +1820,108 @@ def _broker_device_login(
     )
 
 
+def _captured_display_title_operation_id(task_id: str, casecard_sha256: str, name: str) -> str:
+    """One stable metadata operation per original Task, snapshot and literal name."""
+    from uuid import NAMESPACE_URL, uuid5
+
+    identity = json.dumps({"task_id": task_id, "casecard_sha256": casecard_sha256, "name": name},
+                          ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return str(uuid5(NAMESPACE_URL, "hmb-captured-display-title-v1:" + identity))
+
+
+def _captured_display_title_request(task_id: str, record: dict[str, Any],
+                                   legacy_wire: dict[str, Any]) -> dict[str, Any]:
+    """Attest only the saved creation name; never consult a live node or media."""
+    if (not isinstance(record, dict) or record.get("task_id") != task_id
+            or not isinstance(task_id, str) or _TASK_ID_PATTERN.fullmatch(task_id) is None):
+        raise _BrokerProtocolError("Captured title has no exact original Task binding.")
+    public = _review.public_evidence(record)
+    name = public.get("shot", {}).get("name")
+    if not isinstance(name, str) or not name:
+        raise _BrokerProtocolError("Captured title has no saved public creation name.")
+    legacy = deepcopy(public)
+    legacy["shot"].pop("name")
+    if legacy_wire != _review.public_evidence(legacy):
+        raise _BrokerProtocolError("Captured title differs from the immutable casecard.")
+    digest = _review._digest(legacy_wire)
+    payload = {"schema": "hmb-captured-display-title", "version": 1,
+               "operation_id": _captured_display_title_operation_id(task_id, digest, name),
+               "name": name, "expected_casecard_sha256": digest,
+               "case_id": public.get("case_id"), "input_evidence_sha256": public.get("input_evidence_sha256"),
+               "project_id": public.get("project_id"), "project_name": public.get("project_name"),
+               "provider": "volcengine_ark", "model": public.get("settings", {}).get("model_id"),
+               "shot": {key: public.get("shot", {}).get(key) for key in
+                        ("channel_uuid", "shot_uuid", "source_node_instance_id", "number")}}
+    _validate_captured_display_title_request(task_id, payload)
+    return payload
+
+
+def _validate_captured_display_title_request(task_id: str, payload: dict[str, Any]) -> None:
+    expected = {"schema", "version", "operation_id", "name", "expected_casecard_sha256", "case_id",
+                "input_evidence_sha256", "project_id", "project_name", "provider", "model", "shot"}
+    if (not isinstance(payload, dict) or set(payload) != expected
+            or payload.get("schema") != "hmb-captured-display-title"
+            or type(payload.get("version")) is not int or payload["version"] != 1
+            or payload.get("provider") != "volcengine_ark"
+            or payload.get("model") not in {SEEDANCE_2_0_MODEL_ID, SEEDANCE_2_0_FAST_MODEL_ID, SEEDANCE_2_5_MODEL_ID}
+            or not isinstance(payload.get("name"), str)
+            or _review._public_shot_name(payload["name"]) != payload["name"] or not payload["name"]
+            or not _review._public_id(payload.get("case_id"))
+            or not _review._hash(payload.get("expected_casecard_sha256"))
+            or not _review._hash(payload.get("input_evidence_sha256"))):
+        raise _BrokerProtocolError("Invalid captured display-title metadata.")
+    shot = payload.get("shot")
+    if (not isinstance(shot, dict) or set(shot) != {"channel_uuid", "shot_uuid", "source_node_instance_id", "number"}
+            or any(not isinstance(shot[key], str) or not _review._public_id(shot[key]) for key in
+                   ("channel_uuid", "shot_uuid", "source_node_instance_id"))
+            or type(shot["number"]) is not int or not 1 <= shot["number"] <= 5):
+        raise _BrokerProtocolError("Captured display-title Shot binding is invalid.")
+    try:
+        project = _review.resolve_project(payload, default_legacy=False)
+    except (ValueError, TypeError):
+        raise _BrokerProtocolError("Captured display-title project is invalid.") from None
+    if any(payload.get(key) != project[key] for key in ("project_id", "project_name")):
+        raise _BrokerProtocolError("Captured display-title project is not canonical.")
+    expected_operation = _captured_display_title_operation_id(task_id, payload["expected_casecard_sha256"], payload["name"])
+    if payload.get("operation_id") != expected_operation:
+        raise _BrokerProtocolError("Captured display-title operation is not bound to the original snapshot.")
+
+
+def _validate_captured_display_title_response(result: dict[str, Any], task_id: str,
+                                             *, request: dict[str, Any] | None = None) -> None:
+    expected = {"schema", "version", "task_id", "captured_title", "_http_status"}
+    if request is not None:
+        expected.add("created")
+    if (not isinstance(result, dict) or set(result) != expected
+            or result.get("schema") != "hmb-captured-display-title"
+            or type(result.get("version")) is not int or result["version"] != 1
+            or result.get("task_id") != task_id
+            or type(result.get("_http_status")) is not int
+            or result["_http_status"] not in ({200, 201} if request is not None else {200})
+            or request is not None and (type(result.get("created")) is not bool
+                or result["created"] != (result["_http_status"] == 201))):
+        raise _BrokerProtocolError("Broker returned an invalid captured display-title response.")
+    title = result.get("captured_title")
+    if title is None and request is None:
+        return
+    expected_title = {"operation_id", "name", "provenance", "verified_generation_input", "created_at"}
+    if (not isinstance(title, dict) or set(title) != expected_title
+            or not isinstance(title.get("name"), str) or not title["name"]
+            or _review._public_shot_name(title["name"]) != title["name"]
+            or title.get("provenance") != "owner_attested_creation_snapshot"
+            or title.get("verified_generation_input") is not False
+            or type(title.get("created_at")) is not int or not 0 < title["created_at"] <= 10**15):
+        raise _BrokerProtocolError("Broker returned invalid captured-title provenance.")
+    try:
+        operation = str(UUID(title.get("operation_id")))
+    except (ValueError, TypeError, AttributeError):
+        raise _BrokerProtocolError("Broker returned an invalid captured-title operation.") from None
+    if operation != title["operation_id"]:
+        raise _BrokerProtocolError("Broker returned a noncanonical captured-title operation.")
+    if request is not None and any(title[key] != request[key] for key in ("operation_id", "name")):
+        raise _BrokerProtocolError("Broker acknowledged another captured-title snapshot.")
+
+
 class _HMBAIBrokerBridge:
     _MAX_ERROR_CLASSIFICATION_BYTES = 64 * 1024
     _ALLOWED_GENERATION_FIELDS = frozenset(
@@ -1920,6 +2037,30 @@ class _HMBAIBrokerBridge:
         if (result.get("casecard") != evidence or type(result.get("created")) is not bool
                 or result.get("task_id", task_id) != task_id):
             raise _BrokerProtocolError("Broker did not acknowledge the exact supplemental casecard.")
+        return result
+
+    def get_task_casecard(self, task_id: str) -> dict[str, Any] | None:
+        result = self._request_json("GET", self._review_task_path(task_id) + "/casecard",
+                                    payload=None, timeout=5)
+        card = result.get("casecard")
+        if ("casecard" not in result or result.get("task_id", task_id) != task_id
+                or card is not None and (not isinstance(card, dict)
+                    or card.get("schema") != _review.SCHEMA or type(card.get("version")) is not int
+                    or card["version"] != 1 or _review.public_evidence(card) != card)):
+            raise _BrokerProtocolError("Broker returned an invalid supplemental casecard.")
+        return card
+
+    def get_task_captured_title(self, task_id: str) -> dict[str, Any] | None:
+        result = self._request_json("GET", self._review_task_path(task_id) + "/captured-title",
+                                    payload=None, timeout=5)
+        _validate_captured_display_title_response(result, task_id)
+        return result["captured_title"]
+
+    def post_task_captured_title(self, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        _validate_captured_display_title_request(task_id, payload)
+        result = self._request_json("POST", self._review_task_path(task_id) + "/captured-title",
+                                    payload=payload, timeout=5, idempotency_key=payload["operation_id"])
+        _validate_captured_display_title_response(result, task_id, request=payload)
         return result
 
     def post_task_feedback(self, task_id: str, review: dict[str, Any], *, library_version: str = "") -> dict[str, Any]:
@@ -2272,6 +2413,18 @@ class _HMBAIBrokerBridge:
             or return_last_frame
         )
 
+    @staticmethod
+    def _resolve_advertised_output_format(requested_format: str, formats: Any) -> str:
+        """Resolve only an explicit valid provider list, never a failed lookup."""
+        if (not isinstance(formats, (list, tuple, set, frozenset)) or not formats
+                or any(not isinstance(value, str) or value not in OUTPUT_FORMAT_CHOICES for value in formats)):
+            raise _BrokerProtocolError("FN AI Broker output format capabilities are malformed.")
+        if requested_format in formats:
+            return requested_format
+        if requested_format == "mov" and "mp4" in formats:
+            return "mp4"
+        raise _BrokerProtocolError("FN AI Broker has not enabled the selected Seedance output format.")
+
     def require_seedance_features(
         self,
         *,
@@ -2280,7 +2433,10 @@ class _HMBAIBrokerBridge:
         output_format: str,
         return_last_frame: bool,
         timeout: float = 10.0,
-    ) -> None:
+        allow_output_fallback: bool = False,
+        refresh: bool = False,
+        draft: bool = False,
+    ) -> str:
         """Prove advanced 2.5 support before upload or billable submission.
 
         The currently deployed Broker can continue serving the established v1
@@ -2300,14 +2456,16 @@ class _HMBAIBrokerBridge:
             task=authored_task,
             output_format=requested_format,
             return_last_frame=bool(return_last_frame),
-        ):
-            return
+        ) and not (refresh and model == SEEDANCE_2_5_MODEL_ID and self._seedance_capabilities is not None):
+            return requested_format
         if model != SEEDANCE_2_5_MODEL_ID:
             raise _BrokerProtocolError(
                 "Advanced Seedance task/output features require Seedance 2.5."
             )
 
-        capability = self._seedance_capabilities
+        capability = (None if refresh else
+                      getattr(self, "_seedance_draft_task_capabilities", None) if draft else
+                      self._seedance_capabilities)
         if capability is None:
             try:
                 response = self._request_json(
@@ -2318,9 +2476,8 @@ class _HMBAIBrokerBridge:
                 )
             except Exception as exc:
                 raise _BrokerProtocolError(
-                    "FN AI Broker has not enabled the Seedance 2.5 advanced "
-                    "generation contract. No media was uploaded and no render "
-                    "was submitted."
+                    "FN AI Broker Seedance 2.5 capabilities could not be verified. "
+                    "No render was submitted."
                 ) from exc
             if (
                 not isinstance(response, dict)
@@ -2339,12 +2496,17 @@ class _HMBAIBrokerBridge:
                     "FN AI Broker does not advertise the Seedance 2.5 profile."
                 )
             tasks = profile.get("tasks")
-            formats = profile.get("output_formats")
+            formats = profile.get("draft_output_formats") if draft else profile.get("output_formats")
+            if draft and "draft_output_formats" not in profile and requested_format == "mp4" and not getattr(self, "_seedance_draft_formats_declared", False):
+                # Legacy authenticated Draft contracts predate the format list
+                # and permit only the established MP4 request.
+                formats = ["mp4"]
             if (
                 not isinstance(tasks, list)
                 or not all(isinstance(value, str) for value in tasks)
                 or not isinstance(formats, list)
-                or not all(isinstance(value, str) for value in formats)
+                or not formats
+                or not all(isinstance(value, str) and value in OUTPUT_FORMAT_CHOICES for value in formats)
                 or not isinstance(profile.get("return_last_frame"), bool)
             ):
                 raise _BrokerProtocolError(
@@ -2357,14 +2519,18 @@ class _HMBAIBrokerBridge:
                 ),
                 "return_last_frame": profile["return_last_frame"],
             }
-            self._seedance_capabilities = capability
+            if draft:
+                self._seedance_draft_task_capabilities = capability
+            else:
+                self._seedance_capabilities = capability
 
         task_slug = TASK_BROKER_SLUGS[authored_task]
         if task_slug not in capability["tasks"]:
             raise _BrokerProtocolError(
                 "FN AI Broker has not enabled the selected Seedance 2.5 task."
             )
-        if requested_format not in capability["output_formats"]:
+        effective_format = self._resolve_advertised_output_format(requested_format, capability["output_formats"])
+        if effective_format != requested_format and not allow_output_fallback:
             raise _BrokerProtocolError(
                 "FN AI Broker has not enabled the selected Seedance output format."
             )
@@ -2372,9 +2538,15 @@ class _HMBAIBrokerBridge:
             raise _BrokerProtocolError(
                 "FN AI Broker has not enabled returned Seedance last frames."
             )
+        return effective_format
 
-    def require_seedance_draft_features(self, *, timeout: float = 10.0) -> None:
+    def require_seedance_draft_features(self, *, timeout: float = 10.0,
+                                       output_format: str = DEFAULT_OUTPUT_FORMAT,
+                                       allow_output_fallback: bool = False) -> str:
         """Authenticate the exact Draft contract before uploads or either paid POST."""
+        requested_format = str(output_format or "").strip().lower()
+        if requested_format not in OUTPUT_FORMAT_CHOICES:
+            raise _BrokerProtocolError("Unsupported Seedance Draft output format. No render was submitted.")
         response = self._request_json(
             "GET", BROKER_SEEDANCE_CAPABILITIES_PATH + "?draft=1", payload=None,
             timeout=max(1.0, min(float(timeout), 30.0)),
@@ -2394,6 +2566,24 @@ class _HMBAIBrokerBridge:
             raise _BrokerProtocolError(
                 "FN AI Broker has not enabled Seedance 2.5 Draft. No render was submitted."
             )
+        # A missing legacy list proves no MOV limitation. Keep old MP4 callers,
+        # but stop fresh MOV requests until the server declares its actual formats.
+        draft_formats = profile.get("draft_output_formats")
+        if "draft_output_formats" not in profile:
+            if requested_format == "mp4" and not getattr(self, "_seedance_draft_formats_declared", False):
+                return requested_format
+            raise _BrokerProtocolError(
+                "FN AI Broker has not enabled MOV Draft/Final. Update the Broker before rendering. No render was submitted."
+            )
+        if not isinstance(draft_formats, list):
+            raise _BrokerProtocolError("FN AI Broker Draft output format capabilities are malformed. No render was submitted.")
+        effective_format = self._resolve_advertised_output_format(requested_format, draft_formats)
+        self._seedance_draft_formats_declared = True
+        if effective_format != requested_format and not allow_output_fallback:
+            raise _BrokerProtocolError(
+                "FN AI Broker has not enabled MOV Draft/Final. No render was submitted."
+            )
+        return effective_format
 
     def generate_seedance(
         self,
@@ -2433,21 +2623,30 @@ class _HMBAIBrokerBridge:
         if type(draft) is not bool or ("draft" in request_payload and model != SEEDANCE_2_5_MODEL_ID):
             raise _BrokerProtocolError("Draft requires Seedance 2.5 and a literal boolean.")
         if draft_source is not None:
-            allowed = {"provider", "model", "draft_job_id", "quality", "client_request_id", "project_id", "project_name"}
+            allowed = {"provider", "model", "draft_job_id", "quality", "resolution", "output_format", "client_request_id", "project_id", "project_name"}
+            final_resolution = request_payload.get("resolution", request_payload.get("quality"))
             if (model != SEEDANCE_2_5_MODEL_ID or not isinstance(draft_source, str)
                     or re.fullmatch(r"job-[0-9a-f]{32}", draft_source) is None
-                    or request_payload.get("quality") != "1080p"
+                    or final_resolution != "1080p"
+                    or ("quality" in request_payload and request_payload["quality"] != final_resolution)
+                    or request_payload.get("output_format", DEFAULT_OUTPUT_FORMAT) not in OUTPUT_FORMAT_CHOICES
                     or not isinstance(request_payload.get("client_request_id"), str)
                     or _TASK_ID_PATTERN.fullmatch(request_payload["client_request_id"]) is None
                     or set(request_payload) - allowed):
-                raise _BrokerProtocolError("Draft final submission must contain only a local Broker Draft ID and 1080p target.")
-            self.require_seedance_draft_features(timeout=min(float(timeout), 30.0))
+                raise _BrokerProtocolError("Draft final submission must contain only a local Broker Draft ID, 1080p target and supported output format.")
+            self.require_seedance_draft_features(
+                timeout=min(float(timeout), 30.0),
+                output_format=str(request_payload.get("output_format", DEFAULT_OUTPUT_FORMAT)),
+            )
             return self._request_json("POST", "/api/v1/generate/video", payload=request_payload, timeout=timeout,
                                       idempotency_key=str(request_payload.get("client_request_id") or ""))
         if draft:
             if request_payload.get("quality") != "480p" or request_payload.get("resolution") != "480p":
                 raise _BrokerProtocolError("Draft previews require 480p.")
-            self.require_seedance_draft_features(timeout=min(float(timeout), 30.0))
+            self.require_seedance_draft_features(
+                timeout=min(float(timeout), 30.0),
+                output_format=str(request_payload.get("output_format", DEFAULT_OUTPUT_FORMAT)),
+            )
         task = str(request_payload.get(TASK_PARAMETER) or "").strip()
         if task:
             if task not in TASK_STORAGE_CHOICES:
@@ -2478,14 +2677,17 @@ class _HMBAIBrokerBridge:
                 output_format=requested_format,
                 return_last_frame=requested_last_frame,
             )
-            if advanced_v2:
+            if advanced_v2 or self._seedance_capabilities is not None:
                 self.require_seedance_features(
                     model_id=model,
                     task=task,
                     output_format=requested_format,
                     return_last_frame=requested_last_frame,
                     timeout=min(float(timeout), 30.0),
+                    refresh=True,
+                    draft=bool(draft),
                 )
+            if advanced_v2:
                 # Task is an HMB authoring value, not a Volcengine request
                 # field. Stock Seedance 2.5 declares only the three reference
                 # subtasks through omni_reference_task_type; text and frame
@@ -3376,12 +3578,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
             ParameterString(
                 name="draft_action", default_value=DRAFT_ACTION_OFF,
-                tooltip=("Seedance 2.5 Only or Shot at 480p. Draft 480p creates an MP4 preview; "
-                         "after reviewing it, use the dedicated Draft final button once to run only this Generator at 1080p. "
+                tooltip=("Seedance 2.5 Only or Shot at 480p. MOV is the default; an explicit MP4-only provider support list uses MP4. "
+                         "After reviewing the Draft, use the dedicated Draft final button once to run only this Generator at 1080p. "
                          "Both stages are separate paid renders. No automatic final render is submitted."),
                 allowed_modes={ParameterMode.PROPERTY},
                 traits={Options(choices=list(DRAFT_ACTION_CHOICES))},
-                ui_options={"display_name": "Draft Action (MP4)", "simple_dropdown": [DRAFT_ACTION_OFF, DRAFT_ACTION_PREVIEW]},
+                ui_options={"display_name": "Draft Action", "simple_dropdown": [DRAFT_ACTION_OFF, DRAFT_ACTION_PREVIEW]},
                 hide=True,
             )
             ParameterString(
@@ -4797,6 +4999,83 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         return (self._runtime_node_is_live(require_registered=True)
                 and int(getattr(self, "_hmb_review_sync_epoch", 0)) == epoch)
 
+    def _set_captured_title_sync_state(self, task_id: str, status: str, reason: str = "") -> None:
+        """Keep title metadata separate from generation and casecard status."""
+        self._hmb_captured_title_sync_state = {"task_id": task_id, "status": status, "reason": reason}
+        notice = "[CAPTURED_TITLE_SYNC] The saved video name could not be synchronized. Review metadata can be retried."
+        try:
+            # A background result must not replace another Task's active render status.
+            current = self._authoritative_existing_generation_id()
+            active = getattr(self, "_generation_run_active", None)
+            if current != task_id or callable(getattr(active, "is_set", None)) and active.is_set():
+                return
+            getter = getattr(self, "get_parameter_value", None)
+            publisher = getattr(self, "publish_update_to_parameter", None)
+            if not callable(getter) or not callable(publisher):
+                return
+            previous = str(getter("status_details") or "")
+            lines = [line for line in previous.splitlines() if line != notice]
+            if status in {"failed", "login_required"}:
+                lines.append(notice)
+            updated = "\n".join(lines)
+            if updated != previous:
+                setter = getattr(self, "set_parameter_value", None)
+                if callable(setter):
+                    setter("status_details", updated)
+                publisher("status_details", updated)
+        except Exception:
+            # Optional display publication cannot turn a completed render into failure.
+            pass
+
+    def _sync_captured_display_title(self, bridge: _HMBAIBrokerBridge, task_id: str,
+                                     record: dict[str, Any], capabilities: dict[str, Any],
+                                     *, is_live: Any) -> None:
+        if not (capabilities.get("captured_title_supported") is True
+                and capabilities.get("captured_title_schema") == "hmb-captured-display-title"
+                and type(capabilities.get("captured_title_version")) is int
+                and capabilities["captured_title_version"] == 1):
+            if is_live():
+                self._set_captured_title_sync_state(task_id, "unsupported")
+            return
+        try:
+            evidence = _review.public_evidence(record)
+            if not evidence.get("shot", {}).get("name"):
+                if is_live():
+                    self._set_captured_title_sync_state(task_id, "not_available")
+                return
+            # This authenticated whole-record lookup is mandatory even if an old
+            # local sync digest is known. The digest alone is not owner authority.
+            existing = bridge.get_task_casecard(task_id)
+            if not is_live():
+                return
+            if existing == _review.public_evidence(evidence):
+                self._set_captured_title_sync_state(task_id, "embedded")
+                return
+            legacy = deepcopy(evidence)
+            legacy["shot"].pop("name")
+            legacy_wire = _review.public_evidence(legacy)
+            if existing != legacy_wire:
+                raise _BrokerProtocolError("The immutable captured-title casecard does not match.")
+            payload = _captured_display_title_request(task_id, record, legacy_wire)
+            title = bridge.get_task_captured_title(task_id)
+            if not is_live():
+                return
+            if title is not None:
+                # Preserve any existing attestation; never replace it with today's
+                # mutable Library title or write a competing metadata operation.
+                if title.get("name") != payload["name"]:
+                    raise _BrokerProtocolError("The Task already has another captured display name.")
+            else:
+                bridge.post_task_captured_title(task_id, payload)
+                if not is_live():
+                    return
+            self._set_captured_title_sync_state(task_id, "synced")
+        except Exception as exc:
+            if is_live():
+                status = "login_required" if isinstance(exc, _BrokerAuthenticationError) else "failed"
+                self._set_captured_title_sync_state(task_id, status, "portal_title_" + status)
+                logger.warning("Optional captured video name sync unavailable (%s).", type(exc).__name__)
+
     def _sync_review_task(self, task_id: str, origin: str, epoch: int) -> None:
         """Optional metadata only; never create/refresh/download a generation."""
         live = lambda: self._review_sync_is_live(epoch)
@@ -4807,20 +5086,46 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if record:
                 _review.mark_server_sync(task_id, status="pending")
             bridge = self._create_broker_bridge(server_url=origin)
-            bridge.review_capabilities()
+            capabilities = bridge.review_capabilities()
             if not live():
                 return
             if record:
                 evidence = _review.public_evidence(record)
                 digest = _review._digest(evidence)
                 synced = record.get("server_sync", {})
-                if synced.get("status") != "synced" or synced.get("evidence_sha256") != digest:
+                binding_confirmed = False
+                # A pre-name binding is immutable. Reuse only its exact saved
+                # digest; no current Shot lookup or retrospective title write.
+                if "name" in evidence.get("shot", {}):
+                    legacy = deepcopy(evidence)
+                    legacy["shot"].pop("name")
+                    legacy_digest = _review._digest(legacy)
+                    if synced.get("evidence_sha256") == legacy_digest:
+                        evidence = legacy
+                        digest = legacy_digest
+                    elif synced.get("status") != "synced" or synced.get("evidence_sha256") != digest:
+                        existing = bridge.get_task_casecard(task_id)
+                        if not live():
+                            return
+                        if existing is not None:
+                            # Bridge PUT applies the existing projection once
+                            # more (e.g. sparse observation defaults). Compare
+                            # that exact wire shape while keeping saved hashes.
+                            if existing == _review.public_evidence(legacy):
+                                evidence, digest = legacy, legacy_digest
+                            elif existing != _review.public_evidence(evidence):
+                                raise _BrokerProtocolError("The immutable casecard differs from the saved Task inputs.")
+                            binding_confirmed = True
+                if not binding_confirmed and (synced.get("status") != "synced" or synced.get("evidence_sha256") != digest):
                     result = bridge.put_task_casecard(task_id, evidence)
                     if result.get("task_id", task_id) != task_id:
                         raise _BrokerProtocolError("Review evidence response belongs to another Task.")
                     if not live():
                         return
                 _review.mark_server_sync(task_id, status="synced", evidence_sha256=digest)
+                self._sync_captured_display_title(bridge, task_id, record, capabilities, is_live=live)
+                if not live():
+                    return
                 for row in record.get("reviews", []):
                     if not live():
                         return
@@ -5261,7 +5566,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             params = self._get_parameters()
             params.update(draft_action=DRAFT_ACTION_FINAL, draft_job_id=source["draft_job_id"],
                           _hmb_draft_source=deepcopy(source), _hmb_draft_supported=True,
-                          model_id=SEEDANCE_2_5_MODEL_ID, resolution="1080p", output_format="mp4",
+                          model_id=SEEDANCE_2_5_MODEL_ID, resolution="1080p", output_format="mov",
                           return_last_frame=False, resume_generation_id="", prompt="", first_frame=None,
                           last_frame=None, reference_images=[], video_references=[], video_reference_slots=[], reference_audio=[],
                           _hmb_generation_origin=deepcopy(source.get("generation_origin", {})))
@@ -6280,13 +6585,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self.set_parameter_value("draft_action", DRAFT_ACTION_OFF, emit_change=False)
                 self.publish_update_to_parameter("draft_action", DRAFT_ACTION_OFF)
         if (not self._hmb_draft_controls_syncing and authored_draft in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}
-                and (parameter.name == "output_format" and value != "mp4"
+                and (parameter.name == "output_format" and value != "mov"
                      or parameter.name == "return_last_frame" and value is True)):
             model = str(self.get_parameter_value("model_id") or "")
             if MODEL_ID_ALIASES.get(model, model) == SEEDANCE_2_5_MODEL_ID and self._draft_mode_supported():
                 self._hmb_draft_controls_syncing = True
                 try:
-                    setting = "mp4" if parameter.name == "output_format" else False
+                    setting = "mov" if parameter.name == "output_format" else False
                     self.set_parameter_value(parameter.name, setting, emit_change=False)
                     self.publish_update_to_parameter(parameter.name, setting)
                 finally:
@@ -6298,7 +6603,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self._hmb_draft_controls_syncing = True
                 try:
                     for key, setting in (("resolution", "480p" if value == DRAFT_ACTION_PREVIEW else "1080p"),
-                                         ("output_format", "mp4"), ("return_last_frame", False)):
+                                         ("output_format", "mov"), ("return_last_frame", False)):
                         self.set_parameter_value(key, setting, emit_change=False)
                         self.publish_update_to_parameter(key, setting)
                 finally:
@@ -8266,7 +8571,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "generate_audio": bool(self.get_parameter_value("generate_audio")),
             "watermark": bool(self.get_parameter_value("watermark")),
             "output_format": str(
-                self.get_parameter_value("output_format") or DEFAULT_OUTPUT_FORMAT
+                self.get_parameter_value("output_format")
+                or (NEW_NODE_OUTPUT_FORMAT if model_id == SEEDANCE_2_5_MODEL_ID else DEFAULT_OUTPUT_FORMAT)
             ).strip().lower(),
             "return_last_frame": bool(
                 self.get_parameter_value("return_last_frame")
@@ -8305,7 +8611,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             params["draft_action"] = DRAFT_ACTION_OFF
         if params["draft_action"] in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}:
             params["resolution"] = "480p" if params["draft_action"] == DRAFT_ACTION_PREVIEW else "1080p"
-            params["output_format"] = "mp4"
+            if not params["resume_generation_id"]:
+                params["output_format"] = "mov"
             params["return_last_frame"] = False
         if params["draft_action"] == DRAFT_ACTION_FINAL and not params["resume_generation_id"]:
             source = self._validated_draft_final_source()
@@ -8493,8 +8800,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if params.get("model_id") != SEEDANCE_2_5_MODEL_ID or not (params.get("_hmb_draft_only") is True or params.get("_hmb_draft_supported") is True):
             raise ValueError("Draft requires Seedance 2.5 in Only or a verified Shot.")
         expected = "480p" if action == DRAFT_ACTION_PREVIEW else "1080p"
-        if params.get("resolution") != expected or params.get("output_format") != "mp4" or params.get("return_last_frame") is not False:
-            raise ValueError("Draft uses a 480p MP4 preview or 1080p MP4 final, without last-frame output.")
+        if params.get("resolution") != expected or params.get("output_format") not in OUTPUT_FORMAT_CHOICES or params.get("return_last_frame") is not False:
+            raise ValueError("Draft uses a 480p preview or 1080p final in MOV or legacy MP4, without last-frame output.")
         if action == DRAFT_ACTION_FINAL and re.fullmatch(r"job-[0-9a-f]{32}", params.get("draft_job_id", "")) is None:
             raise ValueError("Finalize Draft requires a completed LOCAL Broker Draft job ID (job-...).")
         return action
@@ -8812,7 +9119,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
 
     @classmethod
-    def _validate_data_uri(cls, kind: str, value: str) -> str:
+    def _validate_data_uri(cls, kind: str, value: str, *, reference_ordinal: int = 1) -> str:
         match = _DATA_URI_PATTERN.fullmatch(value)
         if match is None:
             raise ValueError(
@@ -8845,8 +9152,24 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 f"{kind.capitalize()} reference must be "
                 f"{'smaller than' if kind == 'image' else 'no larger than'} {limit_mb} MB."
             )
+        if kind == "image":
+            cls._validate_image_content(decoded, mime, reference_ordinal=reference_ordinal)
         encoded = base64.b64encode(decoded).decode("ascii")
         return f"data:{mime};base64,{encoded}"
+
+    @staticmethod
+    def _validate_image_content(content: bytes, mime: str, *, media_name: str = "",
+                                reference_ordinal: int = 1) -> dict[str, Any]:
+        info = inspect_seedance_image_payload(
+            content, media_name=media_name, reference_ordinal=reference_ordinal,
+        )
+        actual = info["mime_type"]
+        aliases = {"image/heic": "image/heif"}
+        if aliases.get(mime, mime) != aliases.get(actual, actual):
+            raise ValueError(
+                f"Image reference {reference_ordinal} has a file type different from its declared MIME type."
+            )
+        return info
 
     @staticmethod
     def _encode_local_media_data_uri(path: Path, mime: str) -> str:
@@ -9058,6 +9381,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 f"{limit_mb} MB: {path.name}"
             )
         try:
+            if kind == "image":
+                cls._validate_image_content(path.read_bytes(), mime, media_name=path.name)
             return cls._encode_local_media_data_uri(path, mime)
         except OSError as exc:
             raise ValueError(
@@ -9331,13 +9656,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     def _read_image_for_cloud_upload(
         cls,
         value: Any,
+        *, reference_ordinal: int = 1,
     ) -> tuple[bytes, str, str]:
         """Read one bounded image candidate without changing saved parameters."""
 
         reference = cls._coerce_reference_value(value)
         text = str(reference).strip()
         if text.startswith("data:"):
-            normalized = cls._validate_data_uri("image", text)
+            normalized = cls._validate_data_uri("image", text, reference_ordinal=reference_ordinal)
             match = _DATA_URI_PATTERN.fullmatch(normalized)
             if match is None:  # _validate_data_uri already guarantees this.
                 raise ValueError("Image data URI is invalid.")
@@ -9377,7 +9703,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 f"{MAX_IMAGE_BYTES // (1024 * 1024)} MB: {path.name}"
             )
         try:
-            return path.read_bytes(), mime, path.name
+            content = path.read_bytes()
+            cls._validate_image_content(content, mime, media_name=path.name,
+                                        reference_ordinal=reference_ordinal)
+            return content, mime, path.name
         except OSError as exc:
             raise ValueError(f"Image reference cannot be read: {path}") from exc
 
@@ -9558,12 +9887,18 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             *(params.get("reference_images") or []),
         ]
         candidates: list[Any] = []
+        ordinal = 0
         for value in values:
             if not self._has_reference_value(value):
                 continue
+            ordinal += 1
             text = str(self._coerce_reference_value(value)).strip()
             if text.startswith(("http://", "https://", "asset://")):
                 continue
+            # Validate all local inputs before creating any upload. In
+            # particular, a later oversized reference must not leave earlier
+            # references partially uploaded before its error is reported.
+            self._read_image_for_cloud_upload(value, reference_ordinal=ordinal)
             candidates.append(value)
 
         if not candidates:
@@ -9743,7 +10078,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             project = {key: resolved_project[key] for key in ("project_id", "project_name")}
             params["_hmb_draft_project"] = dict(project)
             return {"provider": "volcengine_ark", "model": SEEDANCE_2_5_MODEL_ID,
-                    "draft_job_id": params["draft_job_id"], "quality": "1080p", **project}
+                    "draft_job_id": params["draft_job_id"], "resolution": "1080p", "output_format": params["output_format"], **project}
         submitted_prompt = self._compose_finish_look_prompt(
             params.get("prompt"),
             params.get("_hmb_finish_look_out"),
@@ -11200,7 +11535,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     # Make the next explicit step visible. This only changes
                     # authoring controls; it never schedules a paid request.
                     for key, setting in (("draft_action", DRAFT_ACTION_FINAL), ("resolution", "1080p"),
-                                         ("output_format", "mp4"), ("return_last_frame", False)):
+                                         ("output_format", "mov"), ("return_last_frame", False)):
                         self.set_parameter_value(key, setting, emit_change=False)
                         with suppress(Exception):
                             self.publish_update_to_parameter(key, setting)
@@ -11746,38 +12081,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         resume_generation_id = params["resume_generation_id"]
         decode_verifier: _MP4DecodeVerifier | None = None
 
-        # Resolve the save target before the billable Broker POST.
-        self._set_generation_status("preparing_output", generation_id="")
-        resume_draft_checkpoint = bool(
-            resume_generation_id and recovery_before_run.get("task_id") == resume_generation_id
-            and recovery_before_run.get("draft_action") in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}
-        )
-        if resume_draft_checkpoint:
-            if not recovery_before_run.get("output_file"):
-                raise _BrokerProtocolError("The saved Draft output path is unavailable. No new render was submitted.")
-            destination = self._build_recovery_output_destination(recovery_before_run)
-            params["_hmb_output_file"] = recovery_before_run["output_file"]
-            params["output_format"] = "mp4"
-            params["return_last_frame"] = False
-        else:
-            destination = self._build_generation_output_destination(draft=draft_action != DRAFT_ACTION_OFF)
-        draft_client_request_id = ""
-        if not resume_generation_id and draft_action != DRAFT_ACTION_OFF:
-            context = self._active_draft_final_context()
-            draft_client_request_id = (context["client_request_id"] if context is not None else
-                _seedance_draft_final_request_id(params["draft_job_id"]) if draft_action == DRAFT_ACTION_FINAL else
-                self._new_generation_client_request_id())
-            if draft_action == DRAFT_ACTION_PREVIEW:
-                params["_hmb_draft_started_at_ms"] = int(time.time() * 1000)
-            base = self._normalized_video_output_path(destination.resolve(), "mp4")
-            phase = "draft480p" if draft_action == DRAFT_ACTION_PREVIEW else "final1080p"
-            unique_path = base.with_name(f"{base.stem}-{phase}-{draft_client_request_id}.mp4")
-            destination = _SeedanceDraftOutputDestination(str(unique_path))
-            params["_hmb_output_file"] = str(unique_path)
-        self._preflight_output_destination(
-            destination,
-            str(params.get("output_format") or DEFAULT_OUTPUT_FORMAT),
-        )
         advanced_seedance_v2 = bool(
             not resume_generation_id
             and not draft_final
@@ -11808,6 +12111,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 decode_verifier.backend,
             )
         # The Broker generation request is the sole usage/quota/accounting authority.
+        prevalidated_destination = None
+        if (not resume_generation_id and draft_action == DRAFT_ACTION_OFF
+                and params.get("output_format") == DEFAULT_OUTPUT_FORMAT):
+            # MP4 cannot fall back to another format. Preserve the established
+            # local output rejection before Broker authentication for this path.
+            prevalidated_destination = self._build_generation_output_destination()
+            self._preflight_output_destination(prevalidated_destination, DEFAULT_OUTPUT_FORMAT)
+
         self._set_generation_status("connecting_broker", generation_id="")
         broker_origin = (
             self._broker_server_for_task(
@@ -11825,12 +12136,21 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         params["_hmb_broker_server_url"] = broker_origin
         if not self._runtime_node_is_live(require_registered=True):
             return
+        authored_output_format = str(params.get("output_format") or DEFAULT_OUTPUT_FORMAT)
+        if not resume_generation_id and draft_action != DRAFT_ACTION_OFF:
+            params["output_format"] = await asyncio.to_thread(
+                bridge.require_seedance_draft_features, timeout=10.0,
+                output_format=str(params.get("output_format") or DEFAULT_OUTPUT_FORMAT),
+                allow_output_fallback=True,
+            )
+            if not self._runtime_node_is_live(require_registered=True):
+                return
         if advanced_seedance_v2:
             # Task-declared 2.5 modes must be advertised by the authenticated
             # Broker before any reference media is uploaded or any billable
             # create-task request can be made. The legacy Text/Frame v1 contract
             # returns immediately.
-            await asyncio.to_thread(
+            params["output_format"] = await asyncio.to_thread(
                 bridge.require_seedance_features,
                 model_id=str(params["model_id"]),
                 task=str(params.get(TASK_PARAMETER) or TASK_REFERENCE_TO_VIDEO),
@@ -11839,14 +12159,69 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 ),
                 return_last_frame=bool(params.get("return_last_frame")),
                 timeout=10.0,
+                allow_output_fallback=draft_action == DRAFT_ACTION_OFF,
+                refresh=True,
+                draft=draft_action != DRAFT_ACTION_OFF,
             )
             if not self._runtime_node_is_live(require_registered=True):
                 return
 
+        if not resume_generation_id and params["output_format"] != authored_output_format:
+            logger.info("%s using provider-supported %s for this request and save target; authored %s is unchanged.",
+                        self.name, str(params["output_format"]).upper(), authored_output_format.upper())
+        # Freeze the request and save target together only after authenticated
+        # format selection. Resume uses its original format and never resolves anew.
+        self._set_generation_status("preparing_output", generation_id="")
+        resume_draft_checkpoint = bool(
+            resume_generation_id and recovery_before_run.get("task_id") == resume_generation_id
+            and recovery_before_run.get("draft_action") in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}
+        )
+        resume_output_checkpoint = bool(
+            resume_generation_id and recovery_before_run.get("task_id") == resume_generation_id
+            and recovery_before_run.get("output_file")
+        )
+        if resume_draft_checkpoint and not recovery_before_run.get("output_file"):
+            raise _BrokerProtocolError("The saved Draft output path is unavailable. No new render was submitted.")
+        if resume_output_checkpoint:
+            if not recovery_before_run.get("output_file"):
+                raise _BrokerProtocolError("The saved Draft output path is unavailable. No new render was submitted.")
+            destination = self._build_recovery_output_destination(recovery_before_run)
+            params["_hmb_output_file"] = recovery_before_run["output_file"]
+            saved_format = str(recovery_before_run.get("output_format") or "").strip().lower()
+            if saved_format not in OUTPUT_FORMAT_CHOICES:
+                saved_suffix = Path(recovery_before_run["output_file"]).suffix.lower().lstrip(".")
+                saved_format = saved_suffix if saved_suffix in OUTPUT_FORMAT_CHOICES else DEFAULT_OUTPUT_FORMAT
+            params["output_format"] = saved_format
+            if resume_draft_checkpoint:
+                params["return_last_frame"] = False
+            elif type(recovery_before_run.get("return_last_frame")) is bool:
+                params["return_last_frame"] = recovery_before_run["return_last_frame"]
+        else:
+            destination = (prevalidated_destination if prevalidated_destination is not None else
+                           self._build_generation_output_destination(draft=draft_action != DRAFT_ACTION_OFF))
+        draft_client_request_id = ""
         if not resume_generation_id and draft_action != DRAFT_ACTION_OFF:
-            await asyncio.to_thread(bridge.require_seedance_draft_features, timeout=10.0)
-            if not self._runtime_node_is_live(require_registered=True):
-                return
+            context = self._active_draft_final_context()
+            draft_client_request_id = (context["client_request_id"] if context is not None else
+                _seedance_draft_final_request_id(params["draft_job_id"]) if draft_action == DRAFT_ACTION_FINAL else
+                self._new_generation_client_request_id())
+            if draft_action == DRAFT_ACTION_PREVIEW:
+                params["_hmb_draft_started_at_ms"] = int(time.time() * 1000)
+            draft_output_format = str(params["output_format"])
+            base = self._normalized_video_output_path(destination.resolve(), draft_output_format)
+            phase = "draft480p" if draft_action == DRAFT_ACTION_PREVIEW else "final1080p"
+            unique_path = base.with_name(f"{base.stem}-{phase}-{draft_client_request_id}.{draft_output_format}")
+            destination = _SeedanceDraftOutputDestination(str(unique_path))
+            params["_hmb_output_file"] = str(unique_path)
+        preflight_output = self._preflight_output_destination(
+            destination,
+            str(params.get("output_format") or DEFAULT_OUTPUT_FORMAT),
+        )
+        if not resume_generation_id and draft_action == DRAFT_ACTION_OFF:
+            destination = _SeedanceResolvedOutputDestination(
+                destination, str(preflight_output),
+            )
+            params["_hmb_output_file"] = str(preflight_output)
 
         started = self._monotonic()
         timeout = params["generation_timeout_seconds"]
@@ -12738,6 +13113,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "[HMB EXECUTION FAILED]", "[HMB EXECUTION CANCELLED]",
             "[HMB OUTPUT BLOCKED]", "[HMB LOCAL POLICY REQUIRED]",
             "[HMB CONNECTION CHECK FAILED]", "[HMB SOURCE CONTRACT INVALID]",
+            "[HMB PROJECT POLICY PENDING]",
         )
         try:
             source = self._manual_agent_prompt_source()
@@ -12761,6 +13137,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if not isinstance(snapshot, dict):
             raise _AgentResultUnavailable("Agent execution result is unavailable. No new render was submitted.")
         status = snapshot.get("status")
+        if status == "created" or snapshot.get("code") == "AGENT_CREATED":
+            raise _AgentResultUnavailable(
+                "Upstream Agent only created an object (AGENT_CREATED); no model result is available. "
+                "Connect the intended HMB Prompt/Shot and run the Agent before rendering. "
+                "No new render was submitted."
+            )
         if status in {"failed", "running"}:
             fallback_code = "AGENT_RUNNING" if status == "running" else "AGENT_FAILED"
             code = str(snapshot.get("code") or fallback_code)
@@ -12768,6 +13150,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "MODEL_TIMEOUT", "MODEL_CREDENTIAL", "MODEL_ACCESS", "MODEL_RATE_LIMIT",
                 "MODEL_NETWORK", "MODEL_PROVIDER", "HOST_ADAPTER", "EMPTY_OUTPUT",
                 "OUTPUT_UNAVAILABLE", "POLICY_UNAVAILABLE", "SOURCE_UNAVAILABLE", "CANCELLED",
+                "PROJECT_POLICY_PENDING",
             }:
                 code = fallback_code
             raise _AgentResultUnavailable(

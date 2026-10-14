@@ -7,8 +7,11 @@ import importlib.util
 import json
 import sys
 import tempfile
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+
+from PIL import Image
 
 from _hmb_seedance_clean_ci_stubs import install_clean_ci_griptape_stubs
 
@@ -168,7 +171,10 @@ with tempfile.TemporaryDirectory() as temporary:
     # images/data URIs become HTTPS references, while an existing public HTTPS
     # image is preserved byte-for-byte and saved parameter values stay untouched.
     image_path = folder / "cloud-reference.png"
-    image_bytes = b"\x89PNG\r\n\x1a\ncloud-reference"
+    image_stream = BytesIO()
+    with Image.new("RGB", (32, 16), (24, 105, 188)) as image:
+        image.save(image_stream, format="PNG")
+    image_bytes = image_stream.getvalue()
     image_path.write_bytes(image_bytes)
     image_data_uri = (
         "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
