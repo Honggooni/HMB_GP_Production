@@ -223,13 +223,17 @@ with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
     picker.os.environ, {"LOCALAPPDATA": temporary},
 ):
     log_path = picker._picker_diagnostic_path(Path(temporary) / "scene.mb", "optional_artifact", "full-detail")
+    # Windows CI TEMP can contain an 8.3 alias; the append helper returns the
+    # resolved path to the same managed file, rather than the lexical spelling.
+    canonical_log_path = log_path.resolve(strict=False)
     actual_path = picker._append_full_diagnostic_log(
         log_path,
         "HMB OPTIONAL ARTIFACT ERROR",
         full_depth_error,
     )
     disk_text = log_path.read_text(encoding="utf-8")
-    assert actual_path == log_path
+    assert actual_path == canonical_log_path
+    assert actual_path.samefile(log_path)
     assert log_path.suffix == ".txt"
     assert "CTRL_147" in disk_text
     assert full_depth_error in disk_text
