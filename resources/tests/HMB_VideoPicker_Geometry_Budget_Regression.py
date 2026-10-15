@@ -406,7 +406,7 @@ class GeometryBudgetTests(unittest.TestCase):
                            "progress_path": str(private / "progress.json")}
                     job_path = private / "job.json"
                     job_path.write_text(json.dumps(job), encoding="utf-8")
-                    log = picker._picker_diagnostic_path(scene, kind, "geometry-budget")
+                    log = picker._picker_diagnostic_path(scene, kind, "geometry-budget").resolve(strict=False)
                     log.write_text("capture requested\n", encoding="utf-8")
                     host = CaptureHost(kind, log)
                     launches = []

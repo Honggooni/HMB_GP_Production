@@ -76,8 +76,8 @@ def snapshot_context(node):
 class DiagnosticLogRoutingTests(unittest.TestCase):
     def test_configured_root_alias_keeps_same_file_but_nested_reparse_is_rehomed(self):
         with tempfile.TemporaryDirectory(prefix="hmb-configured-root-alias-") as temporary, \
-                mock.patch.dict(os.environ, {"LOCALAPPDATA": str(Path(temporary) / "local")}):
-            base = Path(temporary)
+                mock.patch.dict(os.environ, {"LOCALAPPDATA": str(Path(temporary).resolve() / "local")}):
+            base = Path(temporary).resolve()
             raw_root = base / "local" / "HMB_GP_Production" / "Diagnostics" / "VideoPicker"
             resolved_root = base / "relocated-diagnostics"
             canonical = resolved_root / "scene" / "maya_read_same-operation.txt"
@@ -121,8 +121,10 @@ class DiagnosticLogRoutingTests(unittest.TestCase):
 
     def test_untrusted_serialized_paths_are_rehomed_before_filesystem_metadata_queries(self):
         with tempfile.TemporaryDirectory(prefix="hmb-no-unc-probe-") as temporary, \
-                mock.patch.dict(os.environ, {"LOCALAPPDATA": str(Path(temporary) / "local")}):
-            base = Path(temporary)
+                mock.patch.dict(os.environ, {"LOCALAPPDATA": str(Path(temporary).resolve() / "local")}):
+            # Resolve the fixture root before installing strict metadata traps;
+            # a Windows TEMP 8.3 alias is still the same managed directory.
+            base = Path(temporary).resolve()
             allowed = base / "local" / "HMB_GP_Production" / "Diagnostics" / "VideoPicker"
             allowed.mkdir(parents=True)
             public = base / "production"
@@ -282,7 +284,7 @@ class DiagnosticLogRoutingTests(unittest.TestCase):
                 mock.patch.object(picker, "_request_parameter_value", return_value=False):
             scene = Path(temporary) / "scene.mb"
             scene.write_bytes(b"scene")
-            path = picker._picker_diagnostic_path(scene, "maya_read", "same-operation")
+            path = picker._picker_diagnostic_path(scene, "maya_read", "same-operation").resolve(strict=False)
             path.write_text("existing operation evidence\n", encoding="utf-8")
             node = diagnostic_node(scene)
             state = node._picker_state()
@@ -340,7 +342,8 @@ class DiagnosticLogRoutingTests(unittest.TestCase):
                     self.assertFalse(original.parent.exists())
                 with mock.patch.dict(os.environ, {"LOCALAPPDATA": str(local)}):
                     second = picker._append_full_diagnostic_log(actual, "SECOND ENTRY", "same canonical target")
-                self.assertEqual(second, actual)
+                self.assertEqual(second, actual.resolve(strict=True))
+                self.assertTrue(second.samefile(actual))
                 self.assertIn("same canonical target", actual.read_text(encoding="utf-8"))
 
     def test_logging_does_not_need_project_folder_write_access(self):
