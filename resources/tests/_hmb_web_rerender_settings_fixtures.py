@@ -14,7 +14,9 @@ def wire_settings(settings=None):
                 "omni_reference_task_type": "reference"}
     aliases = {"model_id": "model", "resolution": "quality", "ratio": "aspect_ratio", "duration": "duration_seconds"}
     result = {aliases.get(key, key): deepcopy(value) for key, value in settings.items()
-              if key not in {"task", "seed", "camera_fixed"}}
+              if key not in {"task", "seed", "camera_fixed", "draft_action"}}
+    if settings.get("draft_action") == "Draft 480p":
+        result["draft"] = True
     task = settings.get("task")
     if settings["model_id"] == "doubao-seedance-2-5-260628" and task in {
         "Reference to Video", "Video Editing", "Video Extension"

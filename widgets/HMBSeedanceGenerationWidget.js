@@ -133,7 +133,7 @@ export function hmbSeedancePreviewPresentation(value, options = {}) {
   const base = {
     visible: true,
     phase: generation.phase,
-    mode: generation.has_existing_video && visibleVideo ? "badge" : "center",
+    mode: generation.has_existing_video && visibleVideo && playableVideo ? "badge" : "center",
     title: "",
     detail: generation.guidance,
     elapsed: "",
@@ -186,11 +186,11 @@ export function hmbSeedancePreviewPresentation(value, options = {}) {
       };
     case "succeeded":
       if (playableVideo) return { ...base, visible: false, action: "none" };
-      if (previewError && mediaFormat === "mov") {
+      if (previewError) {
         return {
           ...base,
-          title: "MOV 저장 완료 · 내장 미리보기 불가",
-          detail: "파일은 정상 저장되었습니다. 외부 플레이어에서 MOV 파일을 여세요.",
+          title: `${mediaFormat === "mov" ? "MOV" : "영상"} 저장 완료 · 내장 미리보기 불가`,
+          detail: `파일은 정상 저장되었습니다. 외부 플레이어에서 ${mediaFormat === "mov" ? "MOV 파일" : "영상 파일"}을 여세요.`,
           busy: false,
           tone: "warning",
           action: "none",
@@ -392,6 +392,8 @@ export function hmbSeedanceDraftState(value) {
     job_id: text(source.job_id, 160),
     effective_resolution: text(source.effective_resolution, 16),
     busy: source.busy === true,
+    final_busy: source.final_busy === true,
+    active_action: text(source.active_action, 80),
     cancel_available: source.cancel_available === true,
     active_job_id: text(source.active_job_id, 160),
     reason: text(source.reason, 360),
@@ -497,6 +499,8 @@ function render(state) {
       .hmb-seedance-shot__final{flex:0 0 auto;height:36px;padding:0 10px;border:1px solid rgba(var(--shot-rgb),.7);border-radius:7px;background:rgba(var(--shot-rgb),.2);color:var(--shot-soft);font-size:11px;font-weight:850;cursor:pointer;white-space:nowrap}.hmb-seedance-shot__final:hover{background:rgba(var(--shot-rgb),.34)}.hmb-seedance-shot__final:disabled{cursor:default;opacity:.55}.hmb-seedance-shot__final[hidden]{display:none}
       .hmb-seedance-preview-overlay{position:absolute;inset:0;z-index:24;display:flex;align-items:center;justify-content:center;padding:18px;pointer-events:none;color:#f8fafc;font-family:"Pretendard Variable",Pretendard,Inter,"Noto Sans KR",system-ui,-apple-system,"Segoe UI",sans-serif}
       .hmb-seedance-preview-overlay[data-mode="center"]{background:radial-gradient(circle at 50% 42%,rgba(30,41,59,.34),rgba(0,0,0,.76) 74%)}
+      [data-hmb-seedance-preview-static="true"]>:not(.hmb-seedance-preview-overlay),[data-hmb-seedance-preview-static="true"]>:not(.hmb-seedance-preview-overlay) *{visibility:hidden!important;pointer-events:none!important}
+      .hmb-seedance-preview-overlay[data-static="true"]{background:#080d17}
       .hmb-seedance-preview-overlay[data-mode="badge"]{align-items:flex-start;justify-content:flex-start;padding:10px;background:linear-gradient(180deg,rgba(0,0,0,.38),transparent 44%)}
       .hmb-seedance-preview-overlay__panel{display:flex;flex-direction:column;align-items:center;gap:7px;max-width:min(420px,88%);padding:15px 18px;border:1px solid rgba(148,163,184,.2);border-radius:12px;background:rgba(3,7,18,.8);box-shadow:0 14px 34px rgba(0,0,0,.32);backdrop-filter:blur(8px);text-align:center}
       .hmb-seedance-preview-overlay[data-mode="badge"] .hmb-seedance-preview-overlay__panel{align-items:flex-start;max-width:min(360px,78%);padding:8px 11px;gap:3px;border-radius:8px;text-align:left;background:rgba(3,7,18,.76)}
@@ -1343,6 +1347,7 @@ function bindPreviewVideo(container, video) {
     identity,
     canPlay: Number(video.readyState) >= 3,
     previewError: Boolean(video.error),
+    mediaKey: "",
     awaitingRevision: null,
     confirmedRevision: null,
     onCanPlay: null,
@@ -1352,6 +1357,9 @@ function bindPreviewVideo(container, video) {
   binding.onCanPlay = () => {
     binding.canPlay = true;
     binding.previewError = false;
+    if (container.__hmbSeedancePreviewFailure?.key === binding.mediaKey) {
+      delete container.__hmbSeedancePreviewFailure;
+    }
     if (binding.awaitingRevision !== null) {
       binding.confirmedRevision = binding.awaitingRevision;
     }
@@ -1359,12 +1367,17 @@ function bindPreviewVideo(container, video) {
   };
   binding.onEmptied = () => {
     binding.canPlay = false;
-    binding.previewError = false;
+    // Native players reset after a decode error and may remount on each host
+    // echo. That reset is not evidence that this same saved file is playable.
+    binding.previewError = container.__hmbSeedancePreviewFailure?.key === binding.mediaKey;
     schedulePreviewSync(container);
   };
   binding.onError = () => {
     binding.canPlay = false;
     binding.previewError = true;
+    if (binding.mediaKey) container.__hmbSeedancePreviewFailure = {
+      key: binding.mediaKey, identity: binding.identity, media_revision: binding.mediaRevision,
+    };
     schedulePreviewSync(container);
   };
   video.addEventListener?.("canplay", binding.onCanPlay);
@@ -1374,22 +1387,25 @@ function bindPreviewVideo(container, video) {
   container.__hmbSeedancePreviewVideoBinding = binding;
 }
 
-function armSameSourceRevisionReload(container, generation, identity, video, binding) {
+function armSameSourceRevisionReload(container, generation, identity, video, binding, previousFailure = null) {
   const confirmed = container?.__hmbSeedanceConfirmedPreviewMedia;
+  const previous = confirmed?.identity === identity ? confirmed : previousFailure;
   if (
     !container
     || generation.phase !== "succeeded"
-    || !confirmed
-    || confirmed.identity !== identity
-    || confirmed.media_revision === generation.media_revision
+    || !previous
+    || previous.identity !== identity
+    || previous.media_revision === generation.media_revision
     || !binding
   ) return false;
   const key = `${generation.media_revision}\u001f${identity}`;
+  if (container.__hmbSeedancePreviewFailure?.key === key) return false;
   if (container.__hmbSeedancePreviewReloadKey !== key) {
     container.__hmbSeedancePreviewReloadKey = key;
     binding.awaitingRevision = generation.media_revision;
     binding.confirmedRevision = null;
     binding.canPlay = false;
+    binding.previewError = false;
     try { video?.load?.(); } catch { /* Keep the overlay; retrieval remains safe. */ }
   }
   return binding.confirmedRevision !== generation.media_revision;
@@ -1487,12 +1503,12 @@ export function hmbSeedanceSyncDraftAction(container, state) {
   const waiting = Boolean(container.__hmbSeedanceDraftPending);
   button.hidden = !cancelling && (!state.draft.visible || !state.draft.job_id || Boolean(container.__hmbSeedancePendingShot));
   button.disabled = button.hidden || waiting || (!cancelling && (!state.draft.final_available || state.draft.busy));
-  button.setAttribute?.("aria-busy", waiting || (!cancelling && state.draft.busy) ? "true" : "false");
+  button.setAttribute?.("aria-busy", waiting || (!cancelling && state.draft.final_busy) ? "true" : "false");
   button.title = container.__hmbSeedanceDraftError?.message || (cancelling
     ? "로컬 Final 조회를 중지합니다. 접수된 서버 렌더는 계속될 수 있습니다."
     : state.draft.reason || "완료된 Draft로 현재 Generator만 1회 실행해 1080p로 받습니다. 현재 프롬프트·소스·설정은 다시 전송하지 않으며 Agent도 재실행하지 않습니다. MOV 기본 · MOV 미지원 시 MP4.");
   setElementText(button, cancelling ? (waiting ? "중지 요청 중…" : "Final 중지")
-    : waiting || state.draft.busy ? "Final 처리 중…" : "Draft final");
+    : waiting || state.draft.final_busy ? "Final 처리 중…" : "Draft final");
   return !button.hidden;
 }
 
@@ -1714,6 +1730,7 @@ export function hmbSeedanceSyncPreviewOverlay(container, state, onRetrieve = nul
   const previousRegion = container.__hmbSeedancePreviewRegion;
   if (previousRegion && previousRegion !== region) {
     previousRegion.querySelector?.(".hmb-seedance-preview-overlay")?.remove?.();
+    previousRegion.removeAttribute?.("data-hmb-seedance-preview-static");
     restorePreviewRegionPosition(previousRegion);
   }
   container.__hmbSeedancePreviewRegion = region;
@@ -1723,18 +1740,35 @@ export function hmbSeedanceSyncPreviewOverlay(container, state, onRetrieve = nul
   const binding = container.__hmbSeedancePreviewVideoBinding;
   const identity = videoIdentity(video);
   const visibleVideo = Boolean(video && identity);
+  const previousFailure = container.__hmbSeedancePreviewFailure;
+  if (binding) {
+    binding.mediaKey = `${generation.media_revision}\u001f${identity}`;
+    binding.mediaRevision = generation.media_revision;
+    if (container.__hmbSeedancePreviewFailure?.key === binding.mediaKey) {
+      binding.previewError = true;
+    } else {
+      delete container.__hmbSeedancePreviewFailure;
+    }
+  }
   const waitingForSameSourceReload = armSameSourceRevisionReload(
     container,
     generation,
     identity,
     video,
     binding,
+    previousFailure,
   );
   const nativePlayable = Boolean(
     visibleVideo
       && !waitingForSameSourceReload
+      && binding?.previewError !== true
       && (Number(video.readyState) >= 3 || binding?.canPlay === true),
   );
+  if (binding?.previewError && binding.mediaKey) {
+    container.__hmbSeedancePreviewFailure = {
+      key: binding.mediaKey, identity: binding.identity, media_revision: generation.media_revision,
+    };
+  }
   const playableVideo = completedPreviewIsPlayable(
     container,
     generation,
@@ -1750,6 +1784,7 @@ export function hmbSeedanceSyncPreviewOverlay(container, state, onRetrieve = nul
   });
   let overlay = region.querySelector?.(".hmb-seedance-preview-overlay");
   if (!presentation.visible) {
+    region.removeAttribute?.("data-hmb-seedance-preview-static");
     overlay?.remove?.();
     return true;
   }
@@ -1757,6 +1792,15 @@ export function hmbSeedanceSyncPreviewOverlay(container, state, onRetrieve = nul
   if (!overlay) return false;
   const pending = previewActionPending(container, generation);
   const visiblyBusy = presentation.busy || pending;
+  const staticPreview = !playableVideo && (!presentation.busy || binding?.previewError === true);
+  if (staticPreview) {
+    if (region.getAttribute?.("data-hmb-seedance-preview-static") !== "true") {
+      region.setAttribute?.("data-hmb-seedance-preview-static", "true");
+    }
+  } else {
+    region.removeAttribute?.("data-hmb-seedance-preview-static");
+  }
+  overlay.dataset.static = staticPreview ? "true" : "false";
   overlay.dataset.phase = presentation.phase;
   overlay.dataset.mode = presentation.mode;
   overlay.dataset.busy = visiblyBusy ? "true" : "false";
@@ -1892,6 +1936,7 @@ export function hmbSeedanceCleanupPreviewOverlay(container) {
   removePreviewVideoListeners(container);
   const region = container.__hmbSeedancePreviewRegion;
   region?.querySelector?.(".hmb-seedance-preview-overlay")?.remove?.();
+  region?.removeAttribute?.("data-hmb-seedance-preview-static");
   restorePreviewRegionPosition(region);
   delete container.__hmbSeedancePreviewRegion;
   delete container.__hmbSeedancePreviewOnRetrieve;
@@ -1899,6 +1944,7 @@ export function hmbSeedanceCleanupPreviewOverlay(container) {
   delete container.__hmbSeedancePreviewActionError;
   delete container.__hmbSeedanceConfirmedPreviewMedia;
   delete container.__hmbSeedancePreviewReloadKey;
+  delete container.__hmbSeedancePreviewFailure;
   delete container.__hmbSeedancePreviewSyncScheduled;
   return true;
 }

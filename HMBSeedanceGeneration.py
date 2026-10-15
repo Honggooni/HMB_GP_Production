@@ -151,6 +151,15 @@ AI_BROKER_DEVICE_POLL_MAX_CONSECUTIVE_TRANSPORT_ERRORS = 3
 AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS = 1.20
 _BROKER_SUBMISSION_CADENCE_LOCK = threading.RLock()
 _BROKER_SUBMISSION_LAST_STARTED = 0.0
+# This second boundary is after capability checks and JSON serialization.
+# Opaque in-memory credential digests separate local Broker account queues;
+# the server remains authoritative across clients and provider snapshots.
+_BROKER_HTTP_SUBMISSION_GUARD = threading.Lock()
+_BROKER_HTTP_SUBMISSION_STATES: dict[tuple[str, str], dict[str, Any]] = {}
+_BROKER_NATIVE_SUBMISSION_CONTEXT = threading.local()
+AI_BROKER_INTERVAL_RETRY_MAX_ATTEMPTS = 5
+AI_BROKER_INTERVAL_RETRY_MAX_SECONDS = 15.0
+AI_BROKER_INTERVAL_RETRY_MARGIN_SECONDS = 0.20
 _WORKFLOW_CHECKPOINT_LOCKS: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, asyncio.Lock
 ] = weakref.WeakKeyDictionary()
@@ -1130,6 +1139,8 @@ def _seedance_draft_ui_value(value: Any = None) -> dict[str, Any]:
             "job_id": str(source.get("job_id") or "")[:128],
             "effective_resolution": str(source.get("effective_resolution") or "")[:16],
             "busy": source.get("busy") is True,
+            "final_busy": source.get("final_busy") is True,
+            "active_action": source.get("active_action") if source.get("active_action") in DRAFT_ACTION_CHOICES else DRAFT_ACTION_OFF,
             "cancel_available": source.get("cancel_available") is True,
             "active_job_id": str(source.get("active_job_id") or "")[:128],
             "reason": str(source.get("reason") or "")[:400]}
@@ -1459,6 +1470,75 @@ def _broker_wait_for_submission_slot() -> None:
         if remaining > 0:
             time.sleep(remaining)
         _BROKER_SUBMISSION_LAST_STARTED = time.monotonic()
+
+
+def _broker_check_native_submission() -> None:
+    callbacks = getattr(_BROKER_NATIVE_SUBMISSION_CONTEXT, "callbacks", None)
+    if callbacks is not None:
+        callbacks[0]()
+
+
+def _broker_note_native_interval_rejection() -> None:
+    callbacks = getattr(_BROKER_NATIVE_SUBMISSION_CONTEXT, "callbacks", None)
+    if callbacks is not None:
+        callbacks[1]()
+
+
+def _broker_note_native_http_start() -> None:
+    callbacks = getattr(_BROKER_NATIVE_SUBMISSION_CONTEXT, "callbacks", None)
+    if callbacks is not None:
+        callbacks[2]()
+
+
+def _broker_wait_for_http_submission(request: Any, origin: str, *, deadline: float | None = None) -> bool:
+    identity = hashlib.sha256(str(request.get_header("Authorization") or "").encode("utf-8")).hexdigest()
+    key = (origin, identity)
+    with _BROKER_HTTP_SUBMISSION_GUARD:
+        state = _BROKER_HTTP_SUBMISSION_STATES.setdefault(key, {"lock": threading.Lock(), "last": 0.0})
+    while not state["lock"].acquire(timeout=0.10):
+        _broker_check_native_submission()
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+    try:
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        slot_time = state["last"] + AI_BROKER_SUBMISSION_MIN_INTERVAL_SECONDS
+        while time.monotonic() < slot_time:
+            _broker_check_native_submission()
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            time.sleep(min(0.10, max(0.0, slot_time - time.monotonic())))
+        _broker_check_native_submission()
+        state["last"] = time.monotonic()
+        return True
+    finally:
+        state["lock"].release()
+
+
+def _broker_interval_rejection_delay(body: bytes) -> float | None:
+    """Recognize only the Broker's pre-provider minimum-interval rejection."""
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeError):
+        return None
+    if not isinstance(payload, dict) or any(payload.get(key) for key in ("job_id", "provider_job_id", "task_id")):
+        return None
+    if payload.get("error_code") == "submission_interval_limited":
+        milliseconds = payload.get("retry_after_ms")
+        if (payload.get("retryable") is True and payload.get("provider_create_sent") is False
+                and type(milliseconds) is int and 0 <= milliseconds <= 5_000):
+            return milliseconds / 1000.0
+        return None
+    if set(payload) - {"error", "request_id"}:
+        return None
+    # The existing Broker emits this exact, single-purpose Korean sentence.
+    # Quota, concurrency, maintenance and arbitrary 429 messages are excluded.
+    message = payload.get("error")
+    match = re.fullmatch(r"다음 요청까지 ([0-9]+\.[0-9])초 기다려야 합니다\.", message or "") if isinstance(message, str) else None
+    if not match:
+        return None
+    delay = float(match.group(1))
+    return delay if 0.0 <= delay <= 5.0 else None
 
 
 def _broker_log_transport_error(
@@ -2268,6 +2348,52 @@ class _HMBAIBrokerBridge:
             "Check the model settings and connected reference media."
         )
 
+    def _open_create_request(self, request: Any, *, timeout: float) -> Any:
+        """Retry only an exact, same-origin, pre-provider interval rejection."""
+        from _hmb_web_rerender import CommandSubmissionOpener
+
+        # A leased web operation permits one attempted POST. Its server row
+        # and fence must never be bypassed by native cooldown retry logic.
+        if isinstance(self._opener, CommandSubmissionOpener):
+            _broker_wait_for_http_submission(request, self.server_url)
+            _broker_note_native_http_start()
+            return self._opener.open(request, timeout=timeout)
+        started = time.monotonic()
+        last_rejection = None
+        for attempt in range(AI_BROKER_INTERVAL_RETRY_MAX_ATTEMPTS):
+            deadline = started + AI_BROKER_INTERVAL_RETRY_MAX_SECONDS if attempt else None
+            available = _broker_wait_for_http_submission(request, self.server_url, deadline=deadline)
+            if attempt and (not available or time.monotonic() >= deadline):
+                last_rejection._hmb_interval_retry_exhausted = True
+                raise last_rejection
+            try:
+                _broker_note_native_http_start()
+                return self._opener.open(request, timeout=timeout)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 429:
+                    raise
+                _broker_require_exact_response_url(exc, request.full_url)
+                body = exc.read(self._MAX_ERROR_CLASSIFICATION_BYTES + 1)
+                if len(body) > self._MAX_ERROR_CLASSIFICATION_BYTES:
+                    body = b""
+                # Retain the bounded body for the normal diagnostic path.
+                exc._hmb_interval_response_body = body
+                delay = _broker_interval_rejection_delay(body)
+                if delay is None:
+                    raise
+                last_rejection = exc
+                _broker_note_native_interval_rejection()
+                pause = delay + AI_BROKER_INTERVAL_RETRY_MARGIN_SECONDS
+                if (attempt + 1 >= AI_BROKER_INTERVAL_RETRY_MAX_ATTEMPTS
+                        or time.monotonic() - started + pause > AI_BROKER_INTERVAL_RETRY_MAX_SECONDS):
+                    exc._hmb_interval_retry_exhausted = True
+                    raise
+                deadline = time.monotonic() + pause
+                while time.monotonic() < deadline:
+                    _broker_check_native_submission()
+                    time.sleep(min(0.10, max(0.0, deadline - time.monotonic())))
+        raise AssertionError("Broker submission retry budget was not enforced.")
+
     def _request_json(
         self,
         method: str,
@@ -2308,7 +2434,9 @@ class _HMBAIBrokerBridge:
             method=method.upper(),
         )
         try:
-            with self._opener.open(request, timeout=timeout) as response:
+            open_request = self._open_create_request if (submission and method.upper() == "POST"
+                                                        and path == "/api/v1/generate/video") else self._opener.open
+            with open_request(request, timeout=timeout) as response:
                 _broker_require_exact_response_url(response, request.full_url)
                 result = _broker_read_json(
                     response, max_bytes=AI_BROKER_MAX_JSON_BYTES
@@ -2325,7 +2453,7 @@ class _HMBAIBrokerBridge:
                     ),
                     status_code=401,
                 ) from exc
-            error_body: bytes | None = None
+            error_body: bytes | None = getattr(exc, "_hmb_interval_response_body", None)
             if (
                 not submission
                 and method.upper() == "POST"
@@ -2358,10 +2486,13 @@ class _HMBAIBrokerBridge:
                 ):
                     terminal_result["_http_status"] = int(exc.code)
                     return terminal_result
-            raise _BrokerError(
-                self._safe_http_error_message(
+            message = self._safe_http_error_message(
                     exc, body=error_body, secret=headers["Authorization"][7:]
-                ),
+                )
+            if getattr(exc, "_hmb_interval_retry_exhausted", False):
+                message += "\nBroker submission cooldown retry limit reached. These interval-rejected requests did not start a provider render."
+            raise _BrokerError(
+                message,
                 status_code=exc.code,
                 # A gateway/server failure does not prove that an idempotent
                 # create was never accepted upstream. Preserve the provisional
@@ -2683,6 +2814,7 @@ class _HMBAIBrokerBridge:
                 output_format=str(request_payload.get("output_format", DEFAULT_OUTPUT_FORMAT)),
             )
             return self._request_json("POST", "/api/v1/generate/video", payload=request_payload, timeout=timeout,
+                                      submission=True,
                                       idempotency_key=str(request_payload.get("client_request_id") or ""))
         if draft:
             if request_payload.get("quality") != "480p" or request_payload.get("resolution") != "480p":
@@ -8702,6 +8834,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         return ":".join((str(origin.get("channel_uuid") or "only"), str(origin.get("shot_uuid") or "only"), str(owner)))
 
     def _store_draft_source(self, value: dict[str, Any]) -> None:
+        # Web-created Drafts belong to their server operation journal. Never
+        # publish them as native one-use Final sources on the retained node.
+        if getattr(self, "_web_owner", None) is not None:
+            return
         source = _seedance_draft_source_value(value)
         if not source:
             raise ValueError("The completed Draft source record is invalid.")
@@ -8799,7 +8935,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         created = record.get("created_at_ms")
         if created is not None and (created > int(time.time() * 1000) or int(time.time() * 1000) >= created + DRAFT_SOURCE_TTL_MS):
             raise ValueError("This Draft has expired. Create a new 480p Draft.")
-        if record.get("final_request_id") and not allow_reserved:
+        if record.get("final_job_id") or (record.get("final_request_id") and not allow_reserved):
             raise ValueError("This Draft already has a Final request. Use Refresh / Retrieve Result for that task.")
         # Legacy Only records retain their original Broker; Shot mode must
         # still be bound to the same configured production endpoint.
@@ -8815,6 +8951,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         source = self._draft_source_record() if supported else {}
         busy = bool(self._generation_run_active.is_set() or self._generation_refresh_running
                     or getattr(self, "_hmb_draft_finalize_pending", False))
+        active_action = getattr(self, "_hmb_active_draft_action", DRAFT_ACTION_OFF) if busy else DRAFT_ACTION_OFF
+        if self._hmb_draft_finalize_pending or isinstance(getattr(self, "_hmb_draft_final_context", None), dict):
+            active_action = DRAFT_ACTION_FINAL
+        final_busy = bool(busy and supported and active_action == DRAFT_ACTION_FINAL)
         final_available = False
         reason = ""
         if supported and source:
@@ -8830,7 +8970,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "preview_available": supported and resolution == "480p" and not busy,
             "final_available": final_available, "job_id": source.get("draft_job_id", ""),
             "effective_resolution": "1080p" if action == DRAFT_ACTION_FINAL else "480p" if action == DRAFT_ACTION_PREVIEW and supported else resolution,
-            "busy": busy, "cancel_available": bool(self._hmb_draft_finalize_pending and self._active_draft_job_id()),
+            "busy": busy, "final_busy": final_busy, "active_action": active_action,
+            "cancel_available": bool(self._hmb_draft_finalize_pending and self._active_draft_job_id()),
             "active_job_id": self._active_draft_job_id(), "reason": "Generator is busy." if busy else reason})
 
     def _draft_final_requested(self) -> bool:
@@ -11142,7 +11283,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # delayed OS reschedule cannot compress two creates back together.
         # A small state lock lets local cancellation win safely while the
         # worker is still queued behind the cadence gate.
-        start_state_lock = threading.Lock()
+        start_state_lock = threading.RLock()
         cancel_before_start = threading.Event()
         submission_started = False
         submission_prompt = getattr(self, "_hmb_agent_submission_prompt", None)
@@ -11167,8 +11308,32 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         self._assert_agent_result_available(submission_prompt, allow_resume=False)
                     submission_started = True
                 _BROKER_SUBMISSION_LAST_STARTED = time.monotonic()
-            # Transport runs outside the lock so sibling renders can overlap.
-            return function(*args, **kwargs)
+            def check_before_http() -> None:
+                with start_state_lock:
+                    if cancel_before_start.is_set() or not self._submission_start_is_authorized(require_registered=False):
+                        raise _SubmissionCancelledBeforeStart()
+                    if getattr(self, "_hmb_expected_agent_result", None) is not None:
+                        self._assert_agent_result_available(submission_prompt, allow_resume=False)
+
+            def note_rejected() -> None:
+                nonlocal submission_started
+                with start_state_lock:
+                    submission_started = False
+
+            def note_started() -> None:
+                nonlocal submission_started
+                with start_state_lock:
+                    check_before_http()
+                    submission_started = True
+
+            previous = getattr(_BROKER_NATIVE_SUBMISSION_CONTEXT, "callbacks", None)
+            _BROKER_NATIVE_SUBMISSION_CONTEXT.callbacks = (check_before_http, note_rejected, note_started)
+            try:
+                # Capability refreshes happen here. The transport additionally
+                # paces actual POSTs and rechecks this native run after waits.
+                return function(*args, **kwargs)
+            finally:
+                _BROKER_NATIVE_SUBMISSION_CONTEXT.callbacks = previous
 
         operation = asyncio.create_task(asyncio.to_thread(invoke_paced_submission))
         try:
@@ -11578,15 +11743,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self.set_parameter_value("draft_job_id", displayed_id, emit_change=False)
                 with suppress(Exception):
                     self.publish_update_to_parameter("draft_job_id", displayed_id)
-                if (displayed_id == generation_id and self.get_parameter_value("draft_action") == DRAFT_ACTION_PREVIEW
-                        and MODEL_ID_ALIASES.get(str(self.get_parameter_value("model_id") or ""), self.get_parameter_value("model_id")) == SEEDANCE_2_5_MODEL_ID):
-                    # Make the next explicit step visible. This only changes
-                    # authoring controls; it never schedules a paid request.
-                    for key, setting in (("draft_action", DRAFT_ACTION_FINAL), ("resolution", "1080p"),
-                                         ("output_format", "mov"), ("return_last_frame", False)):
-                        self.set_parameter_value(key, setting, emit_change=False)
-                        with suppress(Exception):
-                            self.publish_update_to_parameter(key, setting)
+                # The retained one-use Draft final button advertises the next
+                # action. Keep every authored generation setting unchanged;
+                # its 1080p override belongs only to the explicit Final request.
         elif recovery_at_download.get("draft_action") == DRAFT_ACTION_FINAL:
             completed_draft_source = _seedance_draft_source_value(recovery_at_download.get("draft_source"))
             if completed_draft_source:
@@ -11699,10 +11858,22 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if not self._runtime_node_is_live(require_registered=True):
                 return
             status = str(task["status"])
-            refresh_params = self._get_parameters()
-            refresh_params["_hmb_broker_server_url"] = broker_origin
             recovery_contract = self._generation_recovery_state()
             requested_generation_id = generation_id
+            # Retrieval is not a new Final submission. In particular an
+            # authored Final menu, expired source or consumed final_request_id
+            # must not prevent downloading this already accepted task.
+            same_task = recovery_contract.get("task_id") == requested_generation_id
+            raw_model = str((recovery_contract.get("model_id") if same_task else "")
+                            or self.get_parameter_value("model_id") or MODEL_NAME_SEEDANCE_2_0)
+            refresh_params = {
+                "model_id": MODEL_ID_ALIASES.get(raw_model, raw_model),
+                "output_format": (recovery_contract.get("output_format") if same_task else "")
+                    or self.get_parameter_value("output_format") or DEFAULT_OUTPUT_FORMAT,
+                "return_last_frame": bool(recovery_contract.get("return_last_frame")) if same_task
+                    else bool(self.get_parameter_value("return_last_frame")),
+                "_hmb_broker_server_url": broker_origin,
+            }
             refresh_params["_hmb_generation_origin"] = _generated_video_origin(
                 recovery_contract.get("generation_origin")
                 if recovery_contract.get("task_id") == requested_generation_id else None
@@ -12101,6 +12272,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         params = self._get_parameters()
         self._hmb_project_selection_guard = None
         draft_action = params.get("draft_action", DRAFT_ACTION_OFF)
+        self._hmb_active_draft_action = draft_action
         draft_final = draft_action == DRAFT_ACTION_FINAL
         if not params["resume_generation_id"] and not draft_final:
             # Resolve and validate the selected ImageAsset/VideoPicker Shot
@@ -12865,6 +13037,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             claim = _HMBWebRerenderClaim(self, deepcopy(snapshot))
             self._hmb_web_rerender_active_claim = claim
             self._generation_run_active.set()
+            self._hmb_active_draft_action = DRAFT_ACTION_OFF
         try:
             self._hmb_web_rerender_validate_claim(claim)
             yield claim
@@ -12994,11 +13167,13 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             ):
                 return
             self._generation_run_active.set()
+            self._hmb_active_draft_action = DRAFT_ACTION_OFF
         try:
             await self._aprocess_impl()
         finally:
             with self._generation_refresh_lock:
                 self._generation_run_active.clear()
+                self._hmb_active_draft_action = DRAFT_ACTION_OFF
             with suppress(Exception):
                 self._update_parameter_visibility()
                 self._sync_seedance_shot_widget(emit_change=True)
@@ -13291,6 +13466,7 @@ _WEB_RERENDER_PARENT_SETTINGS = frozenset({
     "model_id", "task", "input_mode", "resolution", "ratio", "duration",
     "generate_audio", "watermark", "output_format", "return_last_frame",
     "execution_expires_after", "priority",
+    "draft_action",
 })
 
 
@@ -13321,15 +13497,24 @@ def _web_rerender_parent_execution_settings(frozen: dict[str, Any]) -> tuple[dic
         raise ValueError("web_rerender_parent_resolution_conflict")
     if model != SEEDANCE_2_5_MODEL_ID and omni is not None:
         raise ValueError("web_rerender_parent_task_unsupported")
+    if "draft" in frozen and type(frozen["draft"]) is not bool:
+        raise ValueError("web_rerender_parent_draft_invalid_type")
+    if frozen.get("draft") is True and (
+        model != SEEDANCE_2_5_MODEL_ID or resolution != "480p"
+        or any(frozen[key] != "480p" for key in ("quality", "resolution") if key in frozen)
+    ):
+        raise ValueError("web_rerender_parent_draft_requires_seedance25_480p")
     mappings = {"model": "model_id", "input_mode": "input_mode", "quality": "resolution",
                 "aspect_ratio": "ratio", "ratio": "ratio", "duration_seconds": "duration", "duration": "duration",
                 "generate_audio": "generate_audio", "watermark": "watermark", "output_format": "output_format",
                 "return_last_frame": "return_last_frame", "execution_expires_after": "execution_expires_after", "priority": "priority"}
     context = {mappings[key]: deepcopy(value) for key, value in frozen.items() if key in mappings}
     context.update(model_id=model, resolution=resolution, task=task, input_mode=mode)
+    if "draft" in frozen:
+        context["draft_action"] = DRAFT_ACTION_PREVIEW if frozen["draft"] else DRAFT_ACTION_OFF
     # These are never advertised as authoritative parent settings when absent.
     settings = {"ratio": "adaptive", "watermark": False, "output_format": "mp4", "return_last_frame": False,
-                "execution_expires_after": 86400, "priority": 0, **context}
+                "execution_expires_after": 86400, "priority": 0, "draft_action": DRAFT_ACTION_OFF, **context}
     if not {"duration", "generate_audio"}.issubset(settings):
         raise ValueError("web_rerender_parent_settings_incomplete")
     return settings, context
@@ -13355,6 +13540,12 @@ def _web_rerender_apply_parent_settings(
     for key in ("generate_audio", "watermark", "return_last_frame"):
         if type(settings[key]) is not bool:
             raise ValueError("web_rerender_parent_settings_invalid_type")
+    if settings["draft_action"] not in {DRAFT_ACTION_OFF, DRAFT_ACTION_PREVIEW}:
+        raise ValueError("web_rerender_parent_draft_action_unsupported")
+    if settings["draft_action"] == DRAFT_ACTION_PREVIEW and (
+        settings["model_id"] != SEEDANCE_2_5_MODEL_ID or settings["resolution"] != "480p"
+    ):
+        raise ValueError("web_rerender_parent_draft_requires_seedance25_480p")
     if settings["model_id"] not in BROKER_SUPPORTED_MODEL_IDS:
         raise ValueError("web_rerender_parent_model_unsupported")
     if TASK_INPUT_MODES.get(settings["task"]) != settings["input_mode"]:
@@ -13367,6 +13558,10 @@ def _web_rerender_apply_parent_settings(
     for key in _review.SETTINGS:
         result.pop(key, None)
     result.update(deepcopy(settings))
+    result["draft_job_id"] = ""
+    result.pop("_hmb_draft_source", None)
+    if settings["draft_action"] == DRAFT_ACTION_PREVIEW:
+        result["_hmb_draft_supported"] = True
     return result
 
 
@@ -13456,7 +13651,9 @@ class _HMBWebRerenderExecution(HMBSeedanceGeneration):
         run._web_params = deepcopy(claim.prepared_params)
         run._web_params["prompt"] = agent_result["text"]
         run._web_params["resume_generation_id"] = ""
-        run._web_params["draft_action"] = DRAFT_ACTION_OFF
+        if run._web_params.get("draft_action", DRAFT_ACTION_OFF) not in {DRAFT_ACTION_OFF, DRAFT_ACTION_PREVIEW}:
+            raise ValueError("web_rerender_parent_draft_action_unsupported")
+        run._web_params.setdefault("draft_action", DRAFT_ACTION_OFF)
         run._web_params["draft_job_id"] = ""
         run._web_parameter_cache.update(run._web_params)
         run._web_parameter_cache[BROKER_SERVER_URL_PARAMETER] = run._web_params["_hmb_broker_server_url"]

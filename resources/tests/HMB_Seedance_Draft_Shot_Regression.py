@@ -747,7 +747,7 @@ class DraftShotTests(unittest.TestCase):
         self.assertEqual(source['created_at_ms'], started_at_ms)
         self.assertTrue(node._draft_ui_state()['final_available'])
         self.assertEqual((node.get_parameter_value('resolution'), node.get_parameter_value('draft_action')),
-                         ('1080p', t.DRAFT_ACTION_FINAL))
+                         ('480p', t.DRAFT_ACTION_PREVIEW))
         published = node.get_parameter_value(t.GENERATED_VIDEO_SOURCE_PARAMETER)
         self.assertEqual((published['channel_uuid'], published['shot_uuid'], published['generation_id']),
                          (CHANNEL, SHOT_A, JOB))

@@ -34,6 +34,7 @@ PARENT_SETTINGS_FIELDS = frozenset({
     "model", "input_mode", "quality", "resolution", "aspect_ratio", "ratio",
     "duration_seconds", "duration", "generate_audio", "output_format", "watermark",
     "return_last_frame", "execution_expires_after", "priority", "omni_reference_task_type",
+    "draft",
 })
 PARENT_SETTINGS_CONTRACT_FIELDS = (
     "frozen_generation_settings_schema", "frozen_generation_settings",
@@ -80,7 +81,7 @@ def parent_generation_settings(command: Any) -> dict[str, Any]:
     ) or not ({"duration", "duration_seconds"} & settings.keys()):
         raise ValueError("web_rerender_parent_settings_incomplete")
     for key, value in settings.items():
-        expected = (bool if key in {"generate_audio", "watermark", "return_last_frame"}
+        expected = (bool if key in {"generate_audio", "watermark", "return_last_frame", "draft"}
                     else int if key in {"duration", "duration_seconds", "execution_expires_after", "priority"}
                     else str)
         if type(value) is not expected or (expected is str and (not value or len(value) > 256)):
@@ -88,6 +89,11 @@ def parent_generation_settings(command: Any) -> dict[str, Any]:
     for left, right in (("duration", "duration_seconds"), ("ratio", "aspect_ratio")):
         if left in settings and right in settings and settings[left] != settings[right]:
             raise ValueError("web_rerender_parent_settings_alias_conflict")
+    if settings.get("draft") is True and (
+        settings.get("model") != "doubao-seedance-2-5-260628"
+        or any(settings[key] != "480p" for key in ("quality", "resolution") if key in settings)
+    ):
+        raise ValueError("web_rerender_parent_draft_requires_seedance25_480p")
     digest = _digest(settings)
     if command.get("frozen_generation_settings_sha256") != digest:
         raise ValueError("web_rerender_parent_settings_integrity_failed")
@@ -135,6 +141,100 @@ class OperationJournal:
                 state TEXT NOT NULL, document TEXT NOT NULL,
                 created_at REAL NOT NULL, updated_at REAL NOT NULL
             )""")
+            # This is a rebuildable projection, not a second submission ledger.
+            # Triggers also notice writes from an older local worker, without
+            # changing any saved command, checkpoint, result or paid intent.
+            connection.execute("""CREATE TABLE IF NOT EXISTS confirmed_task_links_v1 (
+                operation_key TEXT PRIMARY KEY, origin TEXT NOT NULL,
+                owner_key TEXT NOT NULL, project_id TEXT NOT NULL,
+                parent_task_id TEXT NOT NULL, child_task_id TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )""")
+            connection.execute("""CREATE INDEX IF NOT EXISTS confirmed_task_links_parent_v1
+                ON confirmed_task_links_v1(origin,owner_key,project_id,parent_task_id)""")
+            connection.execute("""CREATE TABLE IF NOT EXISTS confirmed_task_link_dirty_v1 (
+                operation_key TEXT PRIMARY KEY
+            )""")
+            for event in ("INSERT", "UPDATE"):
+                connection.execute(f"""CREATE TRIGGER IF NOT EXISTS confirmed_task_link_{event.lower()}_v1
+                    AFTER {event} ON operations BEGIN
+                        INSERT OR IGNORE INTO confirmed_task_link_dirty_v1(operation_key)
+                        VALUES(NEW.operation_key);
+                    END""")
+            connection.execute("""CREATE TRIGGER IF NOT EXISTS confirmed_task_link_delete_v1
+                AFTER DELETE ON operations BEGIN
+                    DELETE FROM confirmed_task_links_v1 WHERE operation_key=OLD.operation_key;
+                    DELETE FROM confirmed_task_link_dirty_v1 WHERE operation_key=OLD.operation_key;
+                END""")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                migrated = connection.execute(
+                    "SELECT value FROM identity WHERE name='confirmed_task_links_v1_migrated'").fetchone()
+                if migrated is None:
+                    connection.execute("""INSERT OR IGNORE INTO confirmed_task_link_dirty_v1(operation_key)
+                        SELECT operation_key FROM operations""")
+                self._sync_confirmed_task_links(connection)
+                connection.execute("INSERT OR IGNORE INTO identity VALUES('confirmed_task_links_v1_migrated','1')")
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    @staticmethod
+    def _confirmed_task_link(row: sqlite3.Row) -> tuple[str, str, str] | None:
+        raw = row["document"]
+        if not isinstance(raw, str) or len(raw.encode("utf-8")) > _MAX_DOCUMENT:
+            return None
+        try:
+            document = json.loads(raw)
+            command = document.get("command") if isinstance(document, dict) else None
+            if not isinstance(command, dict):
+                return None
+            project_id = _project_identity(command)["project_id"]
+        except (TypeError, ValueError, KeyError):
+            return None
+        # Only an acknowledged Broker identity or a same-origin confirmed
+        # checkpoint may create an edge. Client request keys are never jobs.
+        result = document.get("result")
+        child = (str(result.get("task_id") or "")
+                 if row["state"] in {"submitted", "completed"} and isinstance(result, dict) else "")
+        if not child or child == row["render_key"]:
+            child = ""
+            checkpoint = document.get("checkpoint")
+            if (isinstance(checkpoint, dict) and checkpoint.get("task_identity") == "broker_task"
+                    and checkpoint.get("stage") in {"accepted", "remote_succeeded", "local_succeeded",
+                                                    "terminal", "cancelled_locally", "timed_out"}
+                    and checkpoint.get("status") not in {"submitting", "submission_unknown"}
+                    and checkpoint.get("broker_server_url") == row["origin"]):
+                candidate = str(checkpoint.get("task_id") or "")
+                if candidate != row["render_key"]:
+                    child = candidate
+        parent = str(command.get("parent_task_id") or "")
+        if not _ID.fullmatch(parent) or not _ID.fullmatch(child) or parent == child:
+            return None
+        return project_id, parent, child
+
+    @classmethod
+    def _sync_confirmed_task_links(cls, connection: sqlite3.Connection) -> None:
+        # Bound Python memory independently of journal age and chain depth.
+        # A transaction serializes projection updates against all writers.
+        while True:
+            keys = connection.execute(
+                "SELECT operation_key FROM confirmed_task_link_dirty_v1 ORDER BY operation_key LIMIT 128").fetchall()
+            if not keys:
+                return
+            for item in keys:
+                key = item["operation_key"]
+                row = connection.execute("SELECT * FROM operations WHERE operation_key=?", (key,)).fetchone()
+                link = cls._confirmed_task_link(row) if row is not None else None
+                if link is None:
+                    connection.execute("DELETE FROM confirmed_task_links_v1 WHERE operation_key=?", (key,))
+                else:
+                    project_id, parent, child = link
+                    connection.execute("""INSERT OR REPLACE INTO confirmed_task_links_v1
+                        VALUES(?,?,?,?,?,?,?)""", (key, row["origin"], row["owner_key"], project_id,
+                                                  parent, child, row["updated_at"]))
+                connection.execute("DELETE FROM confirmed_task_link_dirty_v1 WHERE operation_key=?", (key,))
 
     def worker_id(self) -> str:
         with closing(self._connect()) as connection:
@@ -142,41 +242,33 @@ class OperationJournal:
             return _uuid(connection.execute("SELECT value FROM identity WHERE name='worker_id'").fetchone()[0])
 
     def descendants(self, origin: str, owner_key: str, parent: str, project_id: str = "") -> list[str]:
-        """Recover confirmed Broker jobs, never provisional submission keys."""
+        """Advertise the newest 31 reachable jobs without limiting chain depth."""
+        if not _ID.fullmatch(parent or ""):
+            return []
         with closing(self._connect()) as connection:
-            rows = connection.execute("SELECT state,render_key,document FROM operations WHERE origin=? AND owner_key=? "
-                                      "ORDER BY updated_at DESC LIMIT 1000", (origin, owner_key)).fetchall()
-        edges = []
-        for row in rows:
-            document = json.loads(row["document"])
-            if project_id and _project_identity(document.get("command"))["project_id"] != project_id:
-                continue
-            # execute writes result only after the Broker acknowledges child
-            # identity. A failed/unknown operation's arbitrary result is not
-            # that acknowledgement, and its client key is never a child job.
-            result = document.get("result") or {}
-            child = str(result.get("task_id") or "") if row["state"] in {"submitted", "completed"} else ""
-            if not child or child == row["render_key"]:
-                child = ""
-                checkpoint = document.get("checkpoint") or {}
-                if (checkpoint.get("task_identity") == "broker_task"
-                        and checkpoint.get("stage") in {"accepted", "remote_succeeded", "local_succeeded",
-                                                        "terminal", "cancelled_locally", "timed_out"}
-                        and checkpoint.get("status") not in {"submitting", "submission_unknown"}
-                        and checkpoint.get("broker_server_url") == origin):
-                    candidate = str(checkpoint.get("task_id") or "")
-                    if candidate != row["render_key"]:
-                        child = candidate
-            source = str(document["command"].get("parent_task_id") or "")
-            if _ID.fullmatch(child) and _ID.fullmatch(source):
-                edges.append((source, child))
-        found = [parent]
-        for _ in range(32):
-            added = [child for source, child in edges if source in found and child not in found]
-            if not added:
-                break
-            found = list(dict.fromkeys([*found, *added]))[:32]
-        return found[1:]
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._sync_confirmed_task_links(connection)
+                # UNION is the visited set: cycles cannot repeat indefinitely.
+                # SQLite traverses indexed links, not every saved 8 MiB record.
+                rows = connection.execute("""WITH RECURSIVE reachable(task_id) AS (
+                    VALUES(?) UNION
+                    SELECT link.child_task_id FROM confirmed_task_links_v1 AS link
+                    JOIN reachable AS known ON link.parent_task_id=known.task_id
+                    WHERE link.origin=? AND link.owner_key=? AND (?='' OR link.project_id=?)
+                ) SELECT link.child_task_id,MAX(link.updated_at) AS latest
+                FROM confirmed_task_links_v1 AS link
+                JOIN reachable AS known ON link.parent_task_id=known.task_id
+                WHERE link.origin=? AND link.owner_key=? AND (?='' OR link.project_id=?)
+                    AND link.child_task_id<>?
+                GROUP BY link.child_task_id ORDER BY latest DESC,link.child_task_id DESC LIMIT 31""",
+                    (parent, origin, owner_key, project_id, project_id,
+                     origin, owner_key, project_id, project_id, parent)).fetchall()
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return [row["child_task_id"] for row in reversed(rows)]
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10, isolation_level=None)
@@ -242,6 +334,7 @@ class OperationJournal:
                 document.update(deepcopy(updates))
                 connection.execute("UPDATE operations SET state=?,document=?,updated_at=? WHERE operation_key=?",
                                    (state, _json(document), time.time(), key))
+                self._sync_confirmed_task_links(connection)
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -290,6 +383,7 @@ class BrokerProtocol:
         self.owner_key = ""
         self.project_routing_ready = False
         self.parent_settings_ready = False
+        self.parent_draft_preserved = False
         self.optional_policy_status_supported = False
         self.policy_status_capability_checked = False
         self.policy_status_capability_checked_at = 0.0
@@ -301,6 +395,7 @@ class BrokerProtocol:
         if capabilities.get("parent_settings_contract") != PARENT_SETTINGS_SCHEMA:
             raise ValueError("web_rerender_parent_settings_server_upgrade_required")
         self.parent_settings_ready = True
+        self.parent_draft_preserved = capabilities.get("parent_draft_preserved") is True
         self.optional_policy_status_supported = (
             capabilities.get("optional_project_policy_status_supported") is True
             and capabilities.get("optional_project_policy_status_schema") == "hmb-optional-agent-policy-status-v1"
@@ -324,6 +419,10 @@ class BrokerProtocol:
         compatible_targets = []
         for target in targets[:16]:
             target = dict(target)
+            if self.parent_draft_preserved:
+                target["supports_draft_parent_settings"] = True
+            else:
+                target.pop("supports_draft_parent_settings", None)
             if not self.optional_policy_status_supported:
                 if target.get("policy_status") == "absent":
                     continue
@@ -345,6 +444,7 @@ class BrokerProtocol:
         if not self.project_routing_ready:
             raise ValueError("web_rerender_project_server_upgrade_required")
         self.parent_settings_ready = reply.get("parent_settings_contract") == PARENT_SETTINGS_SCHEMA
+        self.parent_draft_preserved = reply.get("parent_draft_preserved") is True
         if not self.parent_settings_ready:
             raise ValueError("web_rerender_parent_settings_server_upgrade_required")
 
@@ -648,8 +748,9 @@ class EngineWorker:
                 parent = ""
         descendants = (await asyncio.to_thread(self.journal.descendants, origin, protocol.owner_key, parent, project["project_id"])
                        if protocol.owner_key and parent else [])
-        parents = [p for p in [parent, *descendants, *self.children.get(target_id, [])] if _ID.fullmatch(p or "")]
-        parents = list(dict.fromkeys(parents))[-32:]
+        recent = [p for p in [*self.children.get(target_id, []), *descendants]
+                  if _ID.fullmatch(p or "") and p != parent]
+        parents = ([parent] if parent else []) + list(dict.fromkeys(recent))[-31:]
         current_origin = node._selected_broker_server_url()
         current_snapshot = node._hmb_web_rerender_capture_inputs()
         if current_origin != origin or current_snapshot["binding_fingerprint"] != snapshot["binding_fingerprint"]:
@@ -674,6 +775,10 @@ class EngineWorker:
             "frozen_generation_settings_schema": PARENT_SETTINGS_SCHEMA,
             **project,
         }
+        settings = snapshot.get("generation_settings", {})
+        if (settings.get("model_id") == "doubao-seedance-2-5-260628"
+                and settings.get("resolution") == "480p" and not protocol.parent_draft_preserved):
+            descriptor["ready"] = False
         if protocol.optional_policy_status_supported:
             descriptor["policy_status"] = policy_status
         return protocol, descriptor, snapshot, agent
@@ -787,6 +892,10 @@ class EngineWorker:
         try:
             async with node._hmb_web_rerender_claim(snapshot) as claim:
                 frozen_settings = parent_generation_settings(command)
+                if (frozen_settings.get("model") == "doubao-seedance-2-5-260628"
+                        and frozen_settings.get("quality", frozen_settings.get("resolution")) == "480p"
+                        and not getattr(protocol, "parent_draft_preserved", False)):
+                    raise ValueError("web_rerender_parent_draft_server_upgrade_required")
                 node._hmb_web_rerender_bind_parent_settings(claim, frozen_settings)
                 media = await node._hmb_web_rerender_prepare_media(claim)
                 if not live.is_set() or self.stopped:
@@ -822,15 +931,16 @@ class EngineWorker:
                     checkpoint_sink=checkpoint, submission_bridge=bridge,
                     parent_task_id=command["parent_task_id"], command_id=command["operation_id"])
                 task_id = str(output.get("task_id") or "")
-                if not _ID.fullmatch(task_id) or task_id == command["parent_task_id"]:
+                if (not _ID.fullmatch(task_id) or task_id == command["parent_task_id"]
+                        or task_id == command["render_key"]):
                     raise RuntimeError("missing_child_task")
-                self.children.setdefault(target_id, []).append(task_id)
                 # Broker is authoritative for provider completion. A local
                 # download failure must not rewrite a succeeded provider job.
                 ack = await asyncio.to_thread(protocol.result, command, "ack", child_task_id=task_id)
                 state = "completed" if ack.get("state") == "completed" else "submitted"
                 await asyncio.to_thread(self.journal.transition, key,
                                          {"submitting", "render_preparing"}, state, result=output)
+                self.children[target_id] = [*self.children.get(target_id, []), task_id][-31:]
         except BaseException as exc:
             row = await asyncio.to_thread(self.journal.read, key)
             if row["state"] not in _TERMINAL and row["state"] != "submitted":

@@ -76,7 +76,7 @@ assert.equal(
 assert.equal(
   widget.hmbSeedancePreviewPresentation(generation("running", {
     has_existing_video: true,
-  }), { visibleVideo: true }).mode,
+  }), { visibleVideo: true, playableVideo: true }).mode,
   "badge",
   "A new render must retain the previous playable frame and use only a badge.",
 );

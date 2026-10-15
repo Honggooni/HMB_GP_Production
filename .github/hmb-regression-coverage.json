@@ -3,6 +3,24 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_Seedance_Web_Draft_Chain_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Interval_Admission_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Draft_Final_Authoring_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_Seedance_Last_Frame_Formats_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",

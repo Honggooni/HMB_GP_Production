@@ -27,6 +27,54 @@ g = fixture.target
 
 
 class ParentSettingsRegression(unittest.TestCase):
+    def test_draft_parent_capability_is_literal_optional_and_downgrade_safe(self):
+        command = worker_fixture.command()
+        for offered in (True, False, "true", None):
+            calls = []
+            capability = {"project_routing": {"schema": web.PROJECT_ROUTING_SCHEMA, "project_ids": sorted(web.PROJECT_IDS)},
+                          "parent_settings_contract": web.PARENT_SETTINGS_SCHEMA}
+            if offered is not None: capability["parent_draft_preserved"] = offered
+            reply = {**capability, "schema": web.PROTOCOL, "worker_id": command["operation_id"],
+                     "session_id": command["session_id"], "registered": True, "user_id": 17}
+            def request(method, path, **kwargs):
+                calls.append((method, deepcopy(kwargs.get("payload"))))
+                return deepcopy(capability if method == "GET" else reply)
+            protocol = web.BrokerProtocol(SimpleNamespace(_request_json=request), command["operation_id"], command["session_id"])
+            with self.subTest(offered=offered):
+                protocol.heartbeat([{"target_id": command["target_id"], "supports_draft_parent_settings": True}], register=True)
+                self.assertIs(protocol.parent_draft_preserved, offered is True)
+                sent = calls[-1][1]["targets"][0]
+                self.assertEqual(sent.get("supports_draft_parent_settings"), True if offered is True else None)
+                self.assertTrue(protocol.parent_settings_ready)  # Ordinary remains compatible.
+                reply.pop("parent_draft_preserved", None)
+                protocol.heartbeat([])
+                self.assertIs(protocol.parent_draft_preserved, False)
+
+    def test_optional_draft_flag_is_literal_and_requires_25_480(self):
+        request = worker_fixture.command()
+        draft = {**wire_settings(), "quality": "480p", "resolution": "480p", "draft": True}
+        accepted = web.parent_generation_settings(freeze_command(request, draft))
+        self.assertIs(accepted["draft"], True)
+        settings, context = g._web_rerender_parent_execution_settings(accepted)
+        self.assertEqual(settings["draft_action"], g.DRAFT_ACTION_PREVIEW)
+        self.assertEqual(context["draft_action"], g.DRAFT_ACTION_PREVIEW)
+        for bad in ({**draft, "draft": "true"}, {**draft, "draft": 1}, {**draft, "draft": None},
+                    {**draft, "quality": "720p"}, {**draft, "resolution": "1080p"},
+                    {**draft, "model": g.SEEDANCE_2_0_MODEL_ID}, {**draft, "draft_job_id": "job-" + "a" * 32}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                web.parent_generation_settings(freeze_command(request, bad))
+
+    def test_ordinary_absent_or_false_draft_remains_off_without_source_inheritance(self):
+        for frozen in (wire_settings(), {**wire_settings(), "draft": False}):
+            settings, _ = g._web_rerender_parent_execution_settings(frozen)
+            params = g._web_rerender_apply_parent_settings(
+                {"draft_job_id": "job-" + "a" * 32, "_hmb_draft_source": {"completed": True},
+                 "reference_images": ["same-image"]}, settings)
+            self.assertEqual(params["draft_action"], g.DRAFT_ACTION_OFF)
+            self.assertEqual(params["draft_job_id"], "")
+            self.assertNotIn("_hmb_draft_source", params)
+            self.assertEqual(params["reference_images"], ["same-image"])
+
     def test_strict_digest_and_parent_project_binding(self):
         request = worker_fixture.command()
         self.assertEqual(web.parent_generation_settings(request), request["frozen_generation_settings"])

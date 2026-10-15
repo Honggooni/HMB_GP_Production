@@ -11,6 +11,7 @@ const libraryRoot = path.resolve(argument("--library-root") || fileURLToPath(new
 const sourcePath = path.join(libraryRoot, "widgets/HMBSeedanceGenerationWidget.js");
 const source = fs.readFileSync(sourcePath, "utf8");
 const evidenceDir = argument("--evidence-dir");
+const receiptPath = argument("--receipt-path");
 const require = createRequire(import.meta.url);
 let playwright;
 try { playwright = require("playwright"); }
@@ -66,6 +67,61 @@ try {
     window.view = (f) => ({ hidden: f.button().hidden, disabled: f.button().disabled,
       text: f.button().textContent, title: f.button().title, busy: f.button().getAttribute("aria-busy"),
       error: f.container.querySelector(".hmb-seedance-shot__status").textContent });
+    window.addUnsupportedPreview = async (f) => {
+      const parameter = document.createElement("div"); parameter.dataset.parameterName = "video_url";
+      parameter.innerHTML = '<div data-vp-video-area style="width:600px;height:240px;background:#000"><div data-native-player><video controls width="600" height="240"></video><span data-native-spinner>0:00 · loading</span></div></div>';
+      f.node.append(parameter); f.region = parameter.firstElementChild;
+      f.video = f.region.querySelector("video"); f.loads = 0;
+      const nativeLoad = f.video.load.bind(f.video);
+      f.video.load = () => { f.loads += 1; nativeLoad(); };
+      f.video.setAttribute("data-raw-video-value", "https://fixture.invalid/saved.mov?token=synthetic-canary");
+      f.update(f.state);
+      const failed = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("Native Chromium did not report the invalid MOV")), 3000);
+        f.video.addEventListener("error", () => { clearTimeout(timeout); resolve(); }, { once: true });
+      });
+      // An in-memory invalid fixture exercises Chromium's real MediaError;
+      // it does not fetch a provider URL or transcode a production video.
+      f.video.src = "data:video/quicktime;base64,AAAAFGZ0eXBxdCAgAAAAAHF0ICA=";
+      await failed; await Promise.resolve(); await Promise.resolve();
+      return f;
+    };
+    window.previewView = (f) => {
+      const overlay = f.region.querySelector(".hmb-seedance-preview-overlay");
+      return { mode: overlay?.dataset.mode, busy: overlay?.dataset.busy,
+        title: overlay?.querySelector(".hmb-seedance-preview-overlay__title")?.textContent,
+        static: f.region.getAttribute("data-hmb-seedance-preview-static"),
+        nativeVisibility: getComputedStyle(f.region.querySelector("[data-native-player]")).visibility,
+        loads: f.loads, commands: f.commands.length };
+    };
+    window.makePlayablePreviewVideo = async () => {
+      const canvas = document.createElement("canvas"); canvas.width = 32; canvas.height = 24;
+      const context = canvas.getContext("2d"); context.fillStyle = "#10b981"; context.fillRect(0, 0, 32, 24);
+      const stream = canvas.captureStream(8);
+      const recorder = new MediaRecorder(stream, { mimeType: "video/webm;codecs=vp8" });
+      const chunks = []; recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
+      const stopped = new Promise((resolve) => recorder.addEventListener("stop", resolve, { once: true }));
+      recorder.start(); await new Promise((resolve) => setTimeout(resolve, 180)); recorder.stop(); await stopped;
+      stream.getTracks().forEach((track) => track.stop());
+      const video = document.createElement("video"); video.width = 600; video.height = 240; video.muted = true;
+      video.setAttribute("data-raw-video-value", "https://fixture.invalid/retained.mp4");
+      const ready = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("Native Chromium fixture did not reach canplay")), 3000);
+        video.addEventListener("canplay", () => { clearTimeout(timeout); resolve(); }, { once: true });
+      });
+      video.src = URL.createObjectURL(new Blob(chunks, { type: "video/webm" }));
+      await ready; return video;
+    };
+    window.addPlayablePreview = async (f) => {
+      const video = await makePlayablePreviewVideo();
+      const parameter = document.createElement("div"); parameter.dataset.parameterName = "video_url";
+      parameter.innerHTML = '<div data-vp-video-area style="width:600px;height:240px;background:#000"><div data-native-player></div></div>';
+      f.node.append(parameter); f.region = parameter.firstElementChild; f.video = video; f.loads = 0;
+      const nativeLoad = video.load.bind(video); video.load = () => { f.loads += 1; nativeLoad(); };
+      f.region.firstElementChild.append(video); f.update(f.state);
+      const cleanup = f.cleanup; f.cleanup = () => { cleanup(); URL.revokeObjectURL(video.src); };
+      return f;
+    };
   }, source);
   const check = async (name, callback) => {
     await callback(); receipt.cases.push({ name, passed: true });
@@ -269,6 +325,157 @@ try {
     });
     assert.deepEqual(counts, [0, 0]);
   });
+  await check("five-Generator-MOV-errors-remain-static-through-empty-events-and-identical-polls", async () => {
+    const result = await page.evaluate(async () => {
+      const all = await Promise.all(Array.from({ length: 5 }, (_, index) => {
+        const state = makeState(0, { visible: false, final_available: false });
+        Object.assign(state.generation, { phase: index < 3 ? "succeeded" : "failed",
+          has_existing_video: true, media_revision: 8, guidance: index < 3 ? "" : "HTTP 429" });
+        return addUnsupportedPreview(createFixture(state));
+      }));
+      const before = all.map(previewView);
+      const overlays = all.map((f) => f.region.querySelector(".hmb-seedance-preview-overlay"));
+      for (let n = 0; n < 60; n += 1) {
+        for (const f of all) {
+          if (n === 30) {
+            const replacement = f.video.cloneNode(false);
+            const nativeLoad = replacement.load.bind(replacement);
+            replacement.load = () => { f.loads += 1; nativeLoad(); };
+            f.video.replaceWith(replacement); f.video = replacement;
+          }
+          f.video.dispatchEvent(new Event("emptied"));
+          f.update(structuredClone(f.state));
+        }
+        await Promise.resolve(); await Promise.resolve();
+      }
+      return { before, after: all.map(previewView), retained: all.map((f, index) => f.region.querySelector(".hmb-seedance-preview-overlay") === overlays[index]) };
+    });
+    receipt.five_generator_media_error_replay = result;
+    for (const item of [...result.before, ...result.after]) {
+      assert.equal(item.mode, "center"); assert.equal(item.busy, "false");
+      assert.equal(item.static, "true"); assert.equal(item.nativeVisibility, "hidden");
+      assert.equal(item.loads, 0); assert.equal(item.commands, 0);
+      assert.doesNotMatch(item.title, /fixture|token=/);
+    }
+    assert.ok(result.retained.every(Boolean));
+    result.after.slice(0, 3).forEach((item) => assert.match(item.title, /MOV 저장 완료/));
+    result.after.slice(3).forEach((item) => assert.match(item.title, /생성에 실패/));
+  });
+  await check("playable-result-survives-rerender-progress-and-429-without-native-reload", async () => {
+    const result = await page.evaluate(async () => {
+      const state = makeState(0, { visible: false }); Object.assign(state.generation, { has_existing_video: true, media_revision: 4 });
+      const f = await addPlayablePreview(createFixture(state)); const video = f.video; const src = video.src;
+      let overlay; let retained = true;
+      for (let n = 0; n < 90; n += 1) {
+        const next = structuredClone(state); next.generation.phase = ["queued", "running", "failed"][n % 3];
+        next.generation.elapsed_seconds = n; next.generation.guidance = n % 3 === 2 ? "HTTP 429" : "";
+        f.update(next); const current = f.region.querySelector(".hmb-seedance-preview-overlay");
+        if (overlay && current !== overlay) retained = false; overlay = current;
+      }
+      return { ...previewView(f), retained, videoRetained: f.region.querySelector("video") === video,
+        sourceRetained: video.src === src, readyState: video.readyState };
+    });
+    assert.equal(result.mode, "badge"); assert.equal(result.busy, "false");
+    assert.equal(result.nativeVisibility, "visible"); assert.equal(result.static, null);
+    assert.equal(result.loads, 0); assert.equal(result.commands, 0); assert.ok(result.readyState >= 3);
+    assert.ok(result.retained && result.videoRetained && result.sourceRetained);
+  });
+  await check("same-URL-new-media-revision-loads-once-and-identical-polls-do-not-reload", async () => {
+    const result = await page.evaluate(async () => {
+      const state = makeState(0, { visible: false }); Object.assign(state.generation, { has_existing_video: true, media_revision: 4 });
+      const f = await addPlayablePreview(createFixture(state)); const video = f.video; const src = video.src;
+      const canPlay = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("Reloaded fixture did not reach canplay")), 3000);
+        video.addEventListener("canplay", () => { clearTimeout(timeout); resolve(); }, { once: true });
+      });
+      const next = structuredClone(state); next.generation.media_revision = 5;
+      f.update(next); await canPlay; await Promise.resolve(); await Promise.resolve();
+      for (let n = 0; n < 90; n += 1) f.update(structuredClone(next));
+      return { loads: f.loads, sourceRetained: video.src === src, videoRetained: f.region.querySelector("video") === video,
+        overlay: Boolean(f.region.querySelector(".hmb-seedance-preview-overlay")), commands: f.commands.length };
+    });
+    assert.equal(result.loads, 1); assert.ok(result.sourceRetained && result.videoRetained);
+    assert.equal(result.overlay, false); assert.equal(result.commands, 0);
+  });
+  await check("new-playable-source-clears-static-failure-and-cleanup-restores-native-host", async () => {
+    const result = await page.evaluate(async () => {
+      const state = makeState(0, { visible: false }); Object.assign(state.generation, { has_existing_video: true, media_revision: 8 });
+      const f = await addUnsupportedPreview(createFixture(state));
+      const failed = previewView(f); const video = await makePlayablePreviewVideo();
+      f.region.querySelector("[data-native-player]").replaceChild(video, f.video); f.video = video;
+      const next = structuredClone(state); next.generation.media_revision = 9;
+      f.update(next); await Promise.resolve(); await Promise.resolve();
+      const recovered = { ...previewView(f), overlay: Boolean(f.region.querySelector(".hmb-seedance-preview-overlay")) };
+      f.controller.cleanup(); URL.revokeObjectURL(video.src);
+      return { failed, recovered, cleaned: f.region.hasAttribute("data-hmb-seedance-preview-static") };
+    });
+    assert.equal(result.failed.static, "true"); assert.equal(result.recovered.overlay, false);
+    assert.equal(result.recovered.static, null); assert.equal(result.recovered.nativeVisibility, "visible");
+    assert.equal(result.cleaned, false);
+  });
+  await check("Final-action-preserves-authored-480p-controls-through-completion", async () => {
+    const result = await page.evaluate(async () => {
+      const f = createFixture(); const input = document.createElement("input");
+      input.dataset.parameterName = "resolution"; input.value = "480p"; f.node.append(input);
+      const draft = document.createElement("input"); draft.dataset.parameterName = "draft_action"; draft.value = "Draft 480p"; f.node.append(draft);
+      f.button().click(); f.button().click(); await flushFrames();
+      f.update(makeState(1, { busy: true, final_available: false }));
+      f.update(makeState(1, { final_available: false, reason: "Final already requested" }));
+      f.button().click(); await flushFrames();
+      return { resolution: input.value, action: draft.value, commands: f.commands, authored: f.authored };
+    });
+    assert.equal(result.resolution, "480p"); assert.equal(result.action, "Draft 480p");
+    assert.equal(result.commands.length, 1); assert.equal(result.commands[0].action, "finalize_draft");
+    assert.deepEqual(result.authored, []);
+  });
+  await check("general-and-480p-Draft-busy-never-display-a-Final-operation-label", async () => {
+    const results = await page.evaluate(() => [
+      { busy: true, final_busy: false, active_action: "Off" },
+      { busy: true, final_busy: false, active_action: "Draft 480p" },
+      { busy: true },
+      { busy: true, final_busy: true, active_action: "Finalize Draft 1080p" },
+    ].map((changes) => {
+      const f = createFixture(makeState(1, { final_available: false, ...changes }));
+      f.button().click(); return { ...view(f), commands: f.commands.length };
+    }));
+    results.slice(0, 3).forEach((result) => {
+      assert.equal(result.text, "Draft final"); assert.equal(result.busy, "false");
+    });
+    assert.equal(results[3].text, "Final 처리 중…"); assert.equal(results[3].busy, "true");
+    results.forEach((result) => { assert.equal(result.disabled, true); assert.equal(result.commands, 0); });
+  });
+  await check("web-Draft-has-no-native-Final-action-while-a-local-Draft-has-one", async () => {
+    const result = await page.evaluate(async () => {
+      const web = createFixture(makeState(1, { final_available: false, reason: "웹 Draft는 웹에서 Final을 실행하세요." }));
+      const local = createFixture();
+      const rejected = widget.hmbSeedanceRequestDraftFinal(web.container);
+      web.button().click(); local.button().click(); local.button().click(); await flushFrames();
+      return { web: view(web), rejected, webCommands: web.commands.length, localCommands: local.commands, authored: local.authored };
+    });
+    assert.equal(result.web.disabled, true); assert.match(result.web.title, /웹 Draft/);
+    assert.equal(result.rejected, false); assert.equal(result.webCommands, 0);
+    assert.equal(result.localCommands.length, 1); assert.equal(result.localCommands[0].action, "finalize_draft");
+    assert.deepEqual(result.authored, []);
+  });
+  await check("failed-same-URL-new-revision-can-recover-with-one-native-load", async () => {
+    const result = await page.evaluate(async () => {
+      const state = makeState(0, { visible: false }); Object.assign(state.generation, { has_existing_video: true, media_revision: 8 });
+      const f = await addUnsupportedPreview(createFixture(state)); const video = await makePlayablePreviewVideo();
+      video.setAttribute("data-raw-video-value", f.video.getAttribute("data-raw-video-value"));
+      const nativeLoad = video.load.bind(video); video.load = () => { f.loads += 1; nativeLoad(); };
+      f.region.querySelector("[data-native-player]").replaceChild(video, f.video); f.video = video;
+      const ready = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("New revision did not recover")), 3000);
+        video.addEventListener("canplay", () => { clearTimeout(timeout); resolve(); }, { once: true });
+      });
+      const next = structuredClone(state); next.generation.media_revision = 9;
+      f.update(next); await ready; await Promise.resolve(); await Promise.resolve();
+      for (let n = 0; n < 40; n += 1) f.update(structuredClone(next));
+      const result = { loads: f.loads, overlay: Boolean(f.region.querySelector(".hmb-seedance-preview-overlay")), static: f.region.getAttribute("data-hmb-seedance-preview-static") };
+      URL.revokeObjectURL(video.src); return result;
+    });
+    assert.equal(result.loads, 1); assert.equal(result.overlay, false); assert.equal(result.static, null);
+  });
   await check("header-geometry-600-and-360-retains-Shot-selector-and-Final", async () => {
     const results = await page.evaluate(() => [600, 360].map((width) => {
       const f = createFixture(); f.node.style.width = `${width}px`;
@@ -300,4 +507,5 @@ try {
 finally {
   await browser.close();
   if (evidenceDir) { fs.mkdirSync(evidenceDir, { recursive: true }); fs.writeFileSync(path.join(evidenceDir, "widget-draft-receipt.json"), JSON.stringify(receipt, null, 2)); }
+  if (receiptPath) { fs.mkdirSync(path.dirname(receiptPath), { recursive: true }); fs.writeFileSync(receiptPath, JSON.stringify(receipt, null, 2)); }
 }
