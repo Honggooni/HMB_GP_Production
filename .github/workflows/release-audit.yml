@@ -246,7 +246,7 @@ jobs:
             "- Corrects runtime diagnostics to include all 39 installed runtime files. Signed project policy resources and the 39-entry Agent model catalog remain unchanged.",
             "- Completed 13 actual provider generations across all model/task paths, including Editing, Extension and Draft 480p to Final 1080p. Verified delivered files, dimensions, duration, audio selection and playable decoding without modifying the active user graph.",
             "- Validated 586 offline submission combinations plus invalid-input boundaries, 173 Python regression checks, 92 JavaScript checks, actual installed SDK behavior and browser Draft behavior. No new codec or bit-depth qualification was imposed.",
-            "- Includes a signed runtime package, SHA256 checksum and audited even-to-team-release functional parity. Existing workflows, literal inputs, original media and policy protections are preserved.",
+            "- Bundles the signed policy DAT with SHA256 package integrity checks and audited even-to-team-release functional parity. Existing workflows, literal inputs, original media and policy protections are preserved.",
             "",
             "Close Griptape completely before running the included installer."
           ) | Set-Content -LiteralPath $notesPath -Encoding utf8
