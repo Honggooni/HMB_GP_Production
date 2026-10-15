@@ -73,7 +73,7 @@ try {
   };
   await check("completed-current-Shot-and-Only-visible-without-preview-option", async () => {
     const results = await page.evaluate(() => [1, 0].map((shot) => window.view(createFixture(makeState(shot)))));
-    results.forEach((result) => { assert.equal(result.hidden, false); assert.equal(result.disabled, false); assert.equal(result.text, "Draft final"); assert.match(result.title, /Generator만 1회/); assert.match(result.title, /1080p/); assert.match(result.title, /MOV 기본/); assert.match(result.title, /MOV 미지원 시 MP4/); });
+    results.forEach((result) => { assert.equal(result.hidden, false); assert.equal(result.disabled, false); assert.equal(result.text, "Draft final"); assert.match(result.title, /Generator만 1회/); assert.match(result.title, /1080p/); assert.match(result.title, /현재 프롬프트·소스·설정은 다시 전송하지/); assert.match(result.title, /Agent도 재실행하지/); assert.match(result.title, /MOV 기본/); assert.match(result.title, /MOV 미지원 시 MP4/); });
   });
   await check("absent-legacy-pending-invalid-deleted-source-fail-closed", async () => {
     const results = await page.evaluate(() => {

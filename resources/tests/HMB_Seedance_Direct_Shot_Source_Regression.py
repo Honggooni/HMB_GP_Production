@@ -1105,13 +1105,14 @@ def assert_invalid_seedance_params(
 
 # Model-specific limits must expand only 2.5.  Full/Fast 2.0 retain their
 # existing 4..15 second and 9-image/3-video/3-audio bounds.
-seedance_2_5_audio_only = valid_params(prompt="2.5 audio-only reference")
-seedance_2_5_audio_only.update(
+seedance_2_5_audio_visual = valid_params(prompt="2.5 visual and audio reference capacity")
+seedance_2_5_audio_visual.update(
     {
         "model_id": SEEDANCE_2_5_MODEL_ID,
         "task": TASK_REFERENCE_TO_VIDEO,
         "input_mode": target.INPUT_MODE_MULTIMODAL_REFERENCES,
         "duration": 30,
+        "reference_images": ["https://media.example/audio-visual-image.png"],
         "reference_audio": [
             f"https://media.example/audio-{index:02d}.wav"
             for index in range(1, 11)
@@ -1119,7 +1120,14 @@ seedance_2_5_audio_only.update(
     }
 )
 validation_probe = object.__new__(target.HMBSeedanceGeneration)
-validation_probe._validate_parameters(seedance_2_5_audio_only)
+validation_probe._validate_parameters(seedance_2_5_audio_visual)
+for model_id in (target.SEEDANCE_2_0_MODEL_ID, target.SEEDANCE_2_0_FAST_MODEL_ID, SEEDANCE_2_5_MODEL_ID):
+    unsupported_audio_only = deepcopy(seedance_2_5_audio_visual)
+    unsupported_audio_only.update(model_id=model_id, duration=4,
+                                  reference_images=[], video_references=[],
+                                  reference_audio=["https://media.example/audio-only.wav"])
+    assert_invalid_seedance_params(unsupported_audio_only,
+                                  description=f"audio without visual source for {model_id}")
 
 
 def task_params(model_id: str, task_name: str) -> dict[str, Any]:
@@ -1259,20 +1267,20 @@ else:
 # authority.
 try:
     generator(None, None)._resolve_exact_shot_generation_inputs(
-        seedance_2_5_audio_only,
+        seedance_2_5_audio_visual,
     )
 except RuntimeError as exc:
     assert "direct media source" in str(exc)
 else:
     raise AssertionError("Shot mode accepted hidden Only-mode reference audio.")
 
-# Audio-only remains valid in 2.5 Only mode and reaches the ordinary reference
-# payload without any Shot identity.
-seedance_2_5_audio_routed = deepcopy(seedance_2_5_audio_only)
-audio_only_payload = validation_probe._build_broker_payload(
+# Visual-plus-audio remains valid in 2.5 Only mode and reaches the ordinary
+# reference payload without any Shot identity.
+seedance_2_5_audio_routed = deepcopy(seedance_2_5_audio_visual)
+audio_visual_payload = validation_probe._build_broker_payload(
     seedance_2_5_audio_routed
 )
-assert audio_only_payload["audio_urls"] == seedance_2_5_audio_only[
+assert audio_visual_payload["audio_urls"] == seedance_2_5_audio_visual[
     "reference_audio"
 ]
 
@@ -1282,18 +1290,18 @@ seedance_2_5_unrouted_probe._hmb_shot_channel_subscription = lambda: {  # type: 
 }
 seedance_2_5_audio_unrouted = (
     seedance_2_5_unrouted_probe._resolve_exact_shot_generation_inputs(
-        seedance_2_5_audio_only,
+        seedance_2_5_audio_visual,
     )
 )
 assert seedance_2_5_audio_unrouted["input_mode"] == (
     target.INPUT_MODE_MULTIMODAL_REFERENCES
 )
 assert seedance_2_5_audio_unrouted["reference_audio"] == (
-    seedance_2_5_audio_only["reference_audio"]
+    seedance_2_5_audio_visual["reference_audio"]
 )
 validation_probe._validate_parameters(seedance_2_5_audio_unrouted)
 
-seedance_2_5_smart_duration = deepcopy(seedance_2_5_audio_only)
+seedance_2_5_smart_duration = deepcopy(seedance_2_5_audio_visual)
 seedance_2_5_smart_duration["duration"] = -1
 try:
     validation_probe._validate_parameters(seedance_2_5_smart_duration)
@@ -1303,7 +1311,7 @@ else:
     raise AssertionError("Seedance 2.5 must reject smart duration (-1).")
 
 for invalid_duration in (3, 31):
-    invalid = deepcopy(seedance_2_5_audio_only)
+    invalid = deepcopy(seedance_2_5_audio_visual)
     invalid["duration"] = invalid_duration
     assert_invalid_seedance_params(
         invalid,
@@ -1325,7 +1333,7 @@ assert_invalid_seedance_params(
     description="2.5 non-adaptive First/Last Frame",
 )
 
-seedance_2_5_priority = deepcopy(seedance_2_5_audio_only)
+seedance_2_5_priority = deepcopy(seedance_2_5_audio_visual)
 seedance_2_5_priority["priority"] = 1
 assert_invalid_seedance_params(
     seedance_2_5_priority,
@@ -1346,7 +1354,7 @@ for field, values in (
         [f"https://media.example/audio-{index:02d}.wav" for index in range(11)],
     ),
 ):
-    invalid = deepcopy(seedance_2_5_audio_only)
+    invalid = deepcopy(seedance_2_5_audio_visual)
     invalid[field] = values
     assert_invalid_seedance_params(
         invalid,

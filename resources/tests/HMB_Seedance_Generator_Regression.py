@@ -831,6 +831,116 @@ def assert_constructor_and_public_contract() -> None:
     )
 
 
+def assert_priority_model_visibility_and_saved_value_contract() -> None:
+    """Unsupported models hide priority without losing a saved full-2.0 value."""
+
+    for hydration_order in (
+        (("model_id", target.MODEL_NAME_SEEDANCE_2_0), ("priority", 7)),
+        (("priority", 7), ("model_id", target.MODEL_NAME_SEEDANCE_2_0)),
+    ):
+        node = target.HMBSeedanceGeneration(name="Priority Model Hydration Regression")
+        for name, value in hydration_order:
+            node.set_parameter_value(name, value, initial_setup=True, emit_change=False)
+        for model, effective_priority, visible in (
+            (target.MODEL_NAME_SEEDANCE_2_0, 7, True),
+            (target.MODEL_NAME_SEEDANCE_2_0_FAST, 0, False),
+            (target.MODEL_NAME_SEEDANCE_2_5, 0, False),
+            (target.MODEL_NAME_SEEDANCE_2_0, 7, True),
+        ):
+            node.set_parameter_value("model_id", model)
+            node._update_parameter_visibility()
+            assert node.get_parameter_value("priority") == 7
+            assert node._get_parameters()["priority"] == effective_priority
+            parameter = node.get_parameter_by_name("priority")
+            assert parameter.hide is (not visible)
+            assert parameter.serializable is True
+
+
+def assert_only_first_last_frame_ratio_ui_contract() -> None:
+    """2.5 frame generation follows source dimensions; Shot keeps its ratio."""
+
+    node = target.HMBSeedanceGeneration(name="Only First Last Ratio Regression")
+    node.set_parameter_value("ratio", "16:9")
+    node.set_parameter_value(target.TASK_PARAMETER, target.TASK_FIRST_LAST_FRAME)
+    ratio = node.get_parameter_by_name("ratio")
+    assert node.get_parameter_value("ratio") == "adaptive"
+    assert ratio.ui_options["simple_dropdown"] == ["adaptive"]
+
+    with mock.patch.object(target._shot_routing, "schedule_post_hydration_reconcile", return_value=False):
+        for name, value in (
+            (target.SHOT_CHANNEL_UUID_PARAMETER, "00000000-0000-4000-8000-000000000021"),
+            (target.SHOT_UUID_PARAMETER, "00000000-0000-4000-8000-000000000022"),
+            (target.SHOT_NUMBER_PARAMETER, 1),
+            (target.SHOT_NAME_PARAMETER, "Frame Ratio Shot"),
+        ):
+            node.set_parameter_value(name, value, initial_setup=True)
+    node.set_parameter_value(target.TASK_PARAMETER, target.TASK_REFERENCE_TO_VIDEO)
+    node.set_parameter_value("ratio", "9:16")
+    node.set_parameter_value(target.TASK_PARAMETER, target.TASK_FIRST_LAST_FRAME)
+    node._update_parameter_visibility()
+    assert node.get_parameter_value("ratio") == "9:16"
+    assert ratio.ui_options["simple_dropdown"] == list(target.RATIOS)
+    assert node.get_parameter_by_name(target.TASK_PARAMETER).hide is True
+
+    with mock.patch.object(target._shot_routing, "schedule_post_hydration_reconcile", return_value=False):
+        for name, value in (
+            (target.SHOT_CHANNEL_UUID_PARAMETER, ""),
+            (target.SHOT_UUID_PARAMETER, ""),
+            (target.SHOT_NUMBER_PARAMETER, 0),
+            (target.SHOT_NAME_PARAMETER, ""),
+        ):
+            node.set_parameter_value(name, value, initial_setup=True)
+    node._update_parameter_visibility()
+    assert node.get_parameter_value("ratio") == "adaptive"
+    assert ratio.ui_options["simple_dropdown"] == ["adaptive"]
+
+    node.set_parameter_value("model_id", target.MODEL_NAME_SEEDANCE_2_0)
+    node.set_parameter_value("ratio", "16:9")
+    assert node.get_parameter_value("ratio") == "16:9"
+    assert ratio.ui_options["simple_dropdown"] == list(target.RATIOS)
+
+
+def assert_draft_hides_inapplicable_output_controls_without_losing_authorship() -> None:
+    """Draft's fixed outputs must not look like editable ordinary-render fields."""
+
+    node = target.HMBSeedanceGeneration(name="Draft Output Controls Regression")
+    node.set_parameter_value("resolution", "480p")
+    node.set_parameter_value("output_format", "mp4")
+    node.set_parameter_value("return_last_frame", True)
+
+    def check_visibility(visible: bool) -> None:
+        for name in ("output_format", "return_last_frame", "last_frame_url", "last_frame_file"):
+            assert node.get_parameter_by_name(name).hide is (not visible), name
+        assert node.get_parameter_value("output_format") == "mp4"
+        assert node.get_parameter_value("return_last_frame") is True
+
+    check_visibility(True)
+    source = {"draft_job_id": "job-" + "a" * 32}
+    with mock.patch.object(node, "_draft_source_record", return_value=source), \
+         mock.patch.object(node, "_validated_draft_final_source", return_value=source):
+        for action in (target.DRAFT_ACTION_PREVIEW, target.DRAFT_ACTION_FINAL):
+            node.set_parameter_value("draft_action", action)
+            node._update_parameter_visibility()
+            check_visibility(False)
+            params = node._get_parameters()
+            assert params["output_format"] == "mov"
+            assert params["return_last_frame"] is False
+            node.set_parameter_value("draft_action", target.DRAFT_ACTION_OFF)
+            node._update_parameter_visibility()
+            check_visibility(True)
+        # A header-button Final leaves the authored dropdown Off. Its pending
+        # dispatch still fixes the output contract until that one request ends.
+        node._hmb_draft_finalize_pending = True
+        try:
+            node._update_parameter_visibility()
+            check_visibility(False)
+            assert node.get_parameter_value("draft_action") == target.DRAFT_ACTION_OFF
+        finally:
+            node._hmb_draft_finalize_pending = False
+            node._update_parameter_visibility()
+        check_visibility(True)
+
+
 def assert_seedance_25_output_format_and_last_frame_ui_contract() -> None:
     """Freeze the stock 2.5 surface without leaking it into either 2.0 model."""
 
@@ -2775,6 +2885,22 @@ def assert_seedance_25_model_contract() -> None:
             assert expected_message in str(exc)
         else:
             raise AssertionError(f"Seedance 2.5 accepted overflow: {field_name}")
+
+    for model_id in (target.SEEDANCE_2_0_MODEL_ID, target.SEEDANCE_2_0_FAST_MODEL_ID,
+                     target.SEEDANCE_2_5_MODEL_ID):
+        audio_only = dict(params)
+        audio_only.update(model_id=model_id, duration=4, reference_images=[],
+                          video_references=[], reference_audio=["https://cdn.example/audio-only.wav"])
+        try:
+            node._validate_parameters(audio_only)
+        except ValueError as exc:
+            assert "Reference audio requires" in str(exc)
+        else:
+            raise AssertionError(f"{model_id} accepted audio without a visual reference")
+        for visual_field in ("reference_images", "video_references"):
+            audio_visual = dict(audio_only)
+            audio_visual[visual_field] = ["https://cdn.example/audio-visual-reference"]
+            node._validate_parameters(audio_visual)
 
 
 def assert_broker_generation_contract() -> None:
@@ -4840,6 +4966,9 @@ def assert_hidden_task_evidence_and_gallery_contract() -> None:
 
 assert_hidden_task_evidence_and_gallery_contract()
 assert_constructor_and_public_contract()
+assert_priority_model_visibility_and_saved_value_contract()
+assert_only_first_last_frame_ratio_ui_contract()
+assert_draft_hides_inapplicable_output_controls_without_losing_authorship()
 assert_seedance_25_output_format_and_last_frame_ui_contract()
 assert_only_shot_task_and_reference_state_contract()
 assert_only_extension_ratio_and_shot_transition_contract()

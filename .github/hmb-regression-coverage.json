@@ -3,6 +3,24 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_Seedance_Last_Frame_Formats_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Render_Options_Matrix_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Advanced_Transport_Options_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_Seedance_Web_Draft_Final_Parity_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",
@@ -1927,6 +1945,12 @@
     },
     {
       "name": "HMB_Seedance_Image_Pixel_Limits_Regression.py",
+      "coverage": "python_contract",
+      "mode": "ci",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Capability_Routing_Regression.py",
       "coverage": "python_contract",
       "mode": "ci",
       "required": true

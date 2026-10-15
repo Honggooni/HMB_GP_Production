@@ -15,15 +15,26 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 import _hmb_build_diagnostics as diag
 
+packager_spec = importlib.util.spec_from_file_location(
+    "_hmb_build_diag_packager", ROOT / "tools" / "package_runtime_release.py"
+)
+assert packager_spec is not None and packager_spec.loader is not None
+packager = importlib.util.module_from_spec(packager_spec)
+packager_spec.loader.exec_module(packager)
+# The receipt fixture follows the shipped closure, independently of the reader.
+# Building it from diag.RUNTIME_FILE_PATHS concealed an omitted runtime member.
+runtime_paths = tuple(packager.RUNTIME_INSTALL_FILES)
+assert len(runtime_paths) == 39
+
 with tempfile.TemporaryDirectory(prefix="hmb-build-diag-") as directory:
     root = Path(directory)
-    for name in diag.RUNTIME_FILE_PATHS:
+    for name in runtime_paths:
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"synthetic runtime " + name.encode())
     (root / "griptape-nodes-library.json").write_text(json.dumps({"metadata": {"library_version": "0.7.82"}}), encoding="utf-8")
     files = [{"path": name, "bytes": (root/name).stat().st_size,
-              "sha256": hashlib.sha256((root/name).read_bytes()).hexdigest()} for name in diag.RUNTIME_FILE_PATHS]
+              "sha256": hashlib.sha256((root/name).read_bytes()).hexdigest()} for name in runtime_paths]
     expected = diag.inventory_fingerprint(files)
     receipt = {"schema": "hmb-install-receipt", "version": 1, "release_version": "0.7.82",
                "runtime_fingerprint_sha256": expected, "build_fingerprint_sha256": "a"*64,
@@ -32,12 +43,21 @@ with tempfile.TemporaryDirectory(prefix="hmb-build-diag-") as directory:
     untouched = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
     with mock.patch.object(diag, "_verify_policy", side_effect=AssertionError("explicitly disabled")):
         result = diag.get_build_diagnostics(root, verify_policy=False)
-    assert result["runtime"]["fingerprint_sha256"] == expected
     assert result["install"]["receipt_status"] == "matches_recorded_inventory"
+    assert result["runtime"]["fingerprint_sha256"] == expected
+    assert result["runtime"]["file_count"] == result["runtime"]["present_count"] == 39
+    assert "_hmb_image_limits.py" in result["runtime"]["file_sha256"]
     assert result["channel"] == "local_even"
     assert result["policy"]["signature_status"] == "not_checked"
     assert result["policy"]["source_status"] == "not_inspected"
     assert untouched == {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    # The image budget helper is part of the installed identity, including drift.
+    limits_path = root / "_hmb_image_limits.py"
+    limits_path.write_bytes(b"changed image budget fixture")
+    limits_drift = diag.get_build_diagnostics(root, verify_policy=False)
+    assert limits_drift["install"]["receipt_status"] == "mismatch"
+    assert limits_drift["package"]["mismatch_paths"] == ["_hmb_image_limits.py"]
+    limits_path.write_bytes(untouched[limits_path])
     (root/"_hmb_common.py").write_bytes((ROOT/"_hmb_common.py").read_bytes())
     (root/"resources/agent/superwings12/hmb_agent_core.dat").write_bytes((ROOT/"resources/agent/superwings12/hmb_agent_core.dat").read_bytes())
     # Standalone signed verification must not initialize SDK/session modules or

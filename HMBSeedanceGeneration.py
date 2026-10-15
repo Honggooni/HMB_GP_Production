@@ -496,6 +496,50 @@ MAX_AUDIO_BYTES = 15 * 1024 * 1024
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024
 MAX_LAST_FRAME_BYTES = 64 * 1024 * 1024
+
+
+def _normalize_returned_last_frame(
+    data: bytes | bytearray, max_bytes: int = MAX_LAST_FRAME_BYTES,
+) -> bytes:
+    """Accept bounded provider JPEG/PNG frames; publish a validated PNG."""
+    from io import BytesIO
+    import warnings
+    from PIL import Image, UnidentifiedImageError
+
+    raw = bytes(data)
+    if not raw or len(raw) > max_bytes:
+        raise RuntimeError("Returned last-frame image exceeds the size limit or is empty.")
+
+    class BoundedPNGBuffer(BytesIO):
+        def write(self, value):
+            if self.tell() + len(value) > max_bytes:
+                raise RuntimeError("Converted last-frame PNG exceeds the size limit.")
+            return super().write(value)
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(raw)) as image:
+                kind = str(image.format or "").upper()
+                width, height = image.size
+                if kind not in {"PNG", "JPEG"} or not (width > 0 and height > 0 and width * height <= 100_000_000):
+                    raise RuntimeError("Returned last frame must be a bounded PNG or JPEG image.")
+                image.verify()
+            with Image.open(BytesIO(raw)) as image:
+                image.load()
+                if kind == "PNG":
+                    if not _is_valid_png(raw):
+                        raise RuntimeError("Returned last-frame PNG is invalid.")
+                    return raw
+                with BoundedPNGBuffer() as output:
+                    image.convert("RGB").save(output, format="PNG")
+                    normalized = output.getvalue()
+        if not _is_valid_png(normalized):
+            raise RuntimeError("Converted last-frame PNG is invalid.")
+        return normalized
+    except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise RuntimeError("Returned last frame is not a valid PNG or JPEG image.") from exc
+
 MEDIA_BASE64_READ_CHUNK_BYTES = 3 * 256 * 1024
 CLOUD_UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 MAX_ATOMIC_OUTPUT_CANDIDATES = 10_000
@@ -2470,7 +2514,7 @@ class _HMBAIBrokerBridge:
             try:
                 response = self._request_json(
                     "GET",
-                    BROKER_SEEDANCE_CAPABILITIES_PATH,
+                    BROKER_SEEDANCE_CAPABILITIES_PATH + ("?draft=1" if draft else ""),
                     payload=None,
                     timeout=max(1.0, min(float(timeout), 30.0)),
                 )
@@ -2786,7 +2830,7 @@ class _HMBAIBrokerBridge:
                 "Broker authorization was refused for an external URL."
             )
         if media_type == "image":
-            accept = "image/png,application/octet-stream"
+            accept = "image/png,image/jpeg,application/octet-stream"
         elif media_type == "video":
             accept = "video/mp4,video/quicktime,application/octet-stream"
         else:
@@ -2826,10 +2870,13 @@ class _HMBAIBrokerBridge:
             raise _BrokerProtocolError(
                 "Downloaded result is not a valid video container."
             )
-        if media_type == "image" and not _is_valid_png(raw):
-            raise _BrokerProtocolError(
-                "Downloaded result is not a valid PNG image."
-            )
+        if media_type == "image":
+            try:
+                return _normalize_returned_last_frame(raw, max_bytes=max_bytes)
+            except RuntimeError as exc:
+                raise _BrokerProtocolError(
+                    "Downloaded result is not a valid PNG image."
+                ) from exc
         return raw
 
 
@@ -3549,8 +3596,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 default_value=[],
                 tooltip=(
                     "Optional ordered reference audio. Seedance 2.5 accepts up to "
-                    "10 files and permits audio-only reference input; 2.0 models "
-                    "retain the 3-file limit and require image or video context."
+                    "10 files; 2.0 models retain the 3-file limit. All models "
+                    "require at least one reference image or video with audio."
                 ),
                 allowed_modes={ParameterMode.INPUT},
                 hide=False,
@@ -6584,28 +6631,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if MODEL_ID_ALIASES.get(model, model) == SEEDANCE_2_5_MODEL_ID:
                 self.set_parameter_value("draft_action", DRAFT_ACTION_OFF, emit_change=False)
                 self.publish_update_to_parameter("draft_action", DRAFT_ACTION_OFF)
-        if (not self._hmb_draft_controls_syncing and authored_draft in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}
-                and (parameter.name == "output_format" and value != "mov"
-                     or parameter.name == "return_last_frame" and value is True)):
-            model = str(self.get_parameter_value("model_id") or "")
-            if MODEL_ID_ALIASES.get(model, model) == SEEDANCE_2_5_MODEL_ID and self._draft_mode_supported():
-                self._hmb_draft_controls_syncing = True
-                try:
-                    setting = "mov" if parameter.name == "output_format" else False
-                    self.set_parameter_value(parameter.name, setting, emit_change=False)
-                    self.publish_update_to_parameter(parameter.name, setting)
-                finally:
-                    self._hmb_draft_controls_syncing = False
         if parameter.name == "draft_action" and not self._hmb_draft_controls_syncing:
             model = str(self.get_parameter_value("model_id") or "")
             if (MODEL_ID_ALIASES.get(model, model) == SEEDANCE_2_5_MODEL_ID and self._draft_mode_supported()
                     and value in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}):
                 self._hmb_draft_controls_syncing = True
                 try:
-                    for key, setting in (("resolution", "480p" if value == DRAFT_ACTION_PREVIEW else "1080p"),
-                                         ("output_format", "mov"), ("return_last_frame", False)):
-                        self.set_parameter_value(key, setting, emit_change=False)
-                        self.publish_update_to_parameter(key, setting)
+                    resolution = "480p" if value == DRAFT_ACTION_PREVIEW else "1080p"
+                    self.set_parameter_value("resolution", resolution, emit_change=False)
+                    self.publish_update_to_parameter("resolution", resolution)
                 finally:
                     self._hmb_draft_controls_syncing = False
         if parameter.name == "model_id" and self._hmb_retired_model_migration_pending:
@@ -7251,11 +7285,25 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self.hide_parameter_by_name("draft_job_id")
         else:
             self.hide_parameter_by_name(["draft_action", "draft_job_id"])
-        if seedance_25_active:
+        draft_output_fixed = (
+            seedance_25_active
+            and self._draft_mode_supported()
+            and (
+                draft_state["action"] in {DRAFT_ACTION_PREVIEW, DRAFT_ACTION_FINAL}
+                or self._hmb_draft_finalize_pending
+                or isinstance(self._hmb_draft_final_context, dict)
+            )
+        )
+        manual_output_controls = seedance_25_active and not draft_output_fixed
+        if manual_output_controls:
             self.show_parameter_by_name(["output_format", "return_last_frame"])
         else:
             self.hide_parameter_by_name(["output_format", "return_last_frame"])
-        if seedance_25_active and bool(
+        if model_id == SEEDANCE_2_0_MODEL_ID:
+            self.show_parameter_by_name("priority")
+        else:
+            self.hide_parameter_by_name("priority")
+        if manual_output_controls and bool(
             self.get_parameter_value("return_last_frame")
         ):
             self.show_parameter_by_name(["last_frame_url", "last_frame_file"])
@@ -7379,17 +7427,16 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     -1 if current_task == TASK_VIDEO_EDITING else 5,
                 )
 
-        # Video Editing and Only-mode Extension inherit the source video's
-        # frame dimensions. Keep the authored control valid when selected.
-        # Shot executes Reference to Video, so its Extension-authored ratio
-        # remains independent until the node returns to Only mode.
+        # Editing, Only-mode First/Last Frame and Extension require adaptive
+        # ratio. Shot executes Reference to Video, so its authored frame/extend
+        # ratio remains independent until the node returns to Only mode.
         ratio_choices = (
             ("adaptive",)
             if model_id == SEEDANCE_2_5_MODEL_ID
             and (
                 current_task == TASK_VIDEO_EDITING
                 or (
-                    current_task == TASK_VIDEO_EXTENSION
+                    current_task in {TASK_FIRST_LAST_FRAME, TASK_VIDEO_EXTENSION}
                     and not self._hmb_shot_channel_subscription().get("enabled")
                 )
             )
@@ -8580,7 +8627,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "execution_expires_after": self.get_parameter_value(
                 "execution_expires_after"
             ),
-            "priority": self.get_parameter_value("priority"),
+            "priority": (
+                self.get_parameter_value("priority")
+                if model_id == SEEDANCE_2_0_MODEL_ID
+                else 0
+            ),
             "poll_interval_seconds": self.get_parameter_value(
                 "poll_interval_seconds"
             ),
@@ -8975,11 +9026,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 raise ValueError(
                     "Multimodal References mode does not accept first_frame/last_frame."
                 )
-            if (
-                model_id != SEEDANCE_2_5_MODEL_ID
-                and audio
-                and not (images or videos)
-            ):
+            if audio and not (images or videos):
                 raise ValueError(
                     "Reference audio requires at least one reference image or video."
                 )
@@ -10762,13 +10809,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
     async def _download_image(self, url: str) -> bytes:
         image_bytes = await self._download_external_media(
             url,
-            accept="image/png,application/octet-stream",
+            accept="image/png,image/jpeg,application/octet-stream",
             max_bytes=MAX_LAST_FRAME_BYTES,
             media_label="Last-frame image",
         )
-        if not _is_valid_png(image_bytes):
-            raise RuntimeError("Downloaded last frame is not a valid PNG image.")
-        return image_bytes
+        try:
+            return _normalize_returned_last_frame(image_bytes)
+        except RuntimeError as exc:
+            raise RuntimeError("Downloaded last frame is not a valid PNG image.") from exc
 
     @staticmethod
     def _extract_video_url(task: dict[str, Any]) -> str | None:

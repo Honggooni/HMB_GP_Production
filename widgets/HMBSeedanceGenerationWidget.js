@@ -520,7 +520,7 @@ function render(state) {
         <div class="hmb-seedance-shot__mark" aria-hidden="true">SD</div>
         <div class="hmb-seedance-shot__title">HMBSeedanceGeneration</div>
         <span class="hmb-seedance-shot__status" role="status" aria-live="polite" aria-atomic="true"></span>
-        <button type="button" class="hmb-seedance-shot__final nodrag" data-hmb-seedance-finalize-draft hidden disabled title="완료된 Draft로 현재 Generator만 1회 실행해 1080p로 받습니다. MOV 기본 · MOV 미지원 시 MP4.">Draft final</button>
+        <button type="button" class="hmb-seedance-shot__final nodrag" data-hmb-seedance-finalize-draft hidden disabled title="완료된 Draft로 현재 Generator만 1회 실행해 1080p로 받습니다. 현재 프롬프트·소스·설정은 다시 전송하지 않으며 Agent도 재실행하지 않습니다. MOV 기본 · MOV 미지원 시 MP4.">Draft final</button>
         <span class="hmb-seedance-shot__number" data-seedance-shot-number>${state.shot.shot_uuid ? String(state.shot.number).padStart(2, "0") : "Only"}</span>
         <select class="hmb-seedance-shot__select nodrag" aria-label="Shot">${optionMarkup(state)}</select>
       </div>
@@ -1490,7 +1490,7 @@ export function hmbSeedanceSyncDraftAction(container, state) {
   button.setAttribute?.("aria-busy", waiting || (!cancelling && state.draft.busy) ? "true" : "false");
   button.title = container.__hmbSeedanceDraftError?.message || (cancelling
     ? "로컬 Final 조회를 중지합니다. 접수된 서버 렌더는 계속될 수 있습니다."
-    : state.draft.reason || "완료된 Draft로 현재 Generator만 1회 실행해 1080p로 받습니다. MOV 기본 · MOV 미지원 시 MP4.");
+    : state.draft.reason || "완료된 Draft로 현재 Generator만 1회 실행해 1080p로 받습니다. 현재 프롬프트·소스·설정은 다시 전송하지 않으며 Agent도 재실행하지 않습니다. MOV 기본 · MOV 미지원 시 MP4.");
   setElementText(button, cancelling ? (waiting ? "중지 요청 중…" : "Final 중지")
     : waiting || state.draft.busy ? "Final 처리 중…" : "Draft final");
   return !button.hidden;

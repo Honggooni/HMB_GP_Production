@@ -41,6 +41,16 @@ assert not (ROOT / "resources" / "build_developer_release.py").exists()
 packager = load_packager()
 source_files = tuple(packager.SOURCE_FILES)
 runtime_install_files = tuple(packager.RUNTIME_INSTALL_FILES)
+diagnostics_spec = importlib.util.spec_from_file_location(
+    "_hmb_runtime_diagnostics", ROOT / "_hmb_build_diagnostics.py"
+)
+assert diagnostics_spec is not None and diagnostics_spec.loader is not None
+diagnostics = importlib.util.module_from_spec(diagnostics_spec)
+diagnostics_spec.loader.exec_module(diagnostics)
+# The diagnostic receipt reader must recognize the same independently packaged
+# members. A valid installer receipt must not be rejected as an extra-file list.
+assert len(diagnostics.RUNTIME_FILE_PATHS) == len(set(diagnostics.RUNTIME_FILE_PATHS)) == 39
+assert set(diagnostics.RUNTIME_FILE_PATHS) == set(runtime_install_files)
 distribution_only_files = tuple(packager.DISTRIBUTION_ONLY_FILES)
 assert len(runtime_install_files) == 39
 assert distribution_only_files == DISTRIBUTION_ONLY_FILES
