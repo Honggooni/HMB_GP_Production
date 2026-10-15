@@ -4,6 +4,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -218,14 +219,18 @@ assert warning_state["activity_log"][-1]["level"] == "ERROR"
 assert len(warning_state["activity_log"][-1]["message"]) <= picker._UI_ACTIVITY_MESSAGE_LIMIT
 assert "CTRL_147" not in warning_state["activity_log"][-1]["message"]
 
-with tempfile.TemporaryDirectory() as temporary:
-    log_path = Path(temporary) / "picker.log"
-    picker._append_full_diagnostic_log(
+with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+    picker.os.environ, {"LOCALAPPDATA": temporary},
+):
+    log_path = picker._picker_diagnostic_path(Path(temporary) / "scene.mb", "optional_artifact", "full-detail")
+    actual_path = picker._append_full_diagnostic_log(
         log_path,
         "HMB OPTIONAL ARTIFACT ERROR",
         full_depth_error,
     )
     disk_text = log_path.read_text(encoding="utf-8")
+    assert actual_path == log_path
+    assert log_path.suffix == ".txt"
     assert "CTRL_147" in disk_text
     assert full_depth_error in disk_text
 

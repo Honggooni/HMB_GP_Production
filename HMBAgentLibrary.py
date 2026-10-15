@@ -4165,6 +4165,7 @@ def _web_rerender_snapshots(media_snapshot, generation_settings, prompt):
         "duration", "duration_seconds", "duration_mode", "execution_expires_after", "priority",
         "aspect_ratio", "ratio", "resolution", "output_format", "seed",
         "return_last_frame", "generate_audio", "camera_fixed", "watermark",
+        "draft_action",
     }
     settings = {}
     boolean_fields = {"return_last_frame", "generate_audio", "camera_fixed", "watermark"}

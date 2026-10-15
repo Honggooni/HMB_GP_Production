@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import nullcontext
 import hashlib
 import importlib.util
 import io
@@ -14,6 +15,7 @@ import textwrap
 import tomllib
 import zipfile
 import zlib
+from unittest import mock
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
@@ -21,7 +23,8 @@ from pathlib import Path, PurePosixPath
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE_VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 assert re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", RELEASE_VERSION)
-RELEASE_LABEL = f"v{RELEASE_VERSION}"
+RELEASE_PARTS = tuple(int(part) for part in RELEASE_VERSION.split("."))
+RELEASE_LABEL = f"v{RELEASE_PARTS[0]}.{RELEASE_PARTS[1]}.{RELEASE_PARTS[2]:02d}"
 EXPECTED_RUNTIME_INSTALL_FILES = (
     "__init__.py",
     "griptape-nodes-library.json",
@@ -177,6 +180,8 @@ assert builder.release_label_for_version(RELEASE_VERSION) == RELEASE_LABEL
 builder.validate_release_identity(RELEASE_LABEL, RELEASE_VERSION)
 for invalid_version in (
     "0.7.01",
+    "0.8.01",
+    "0.8.02",
     "0.07.1",
     "00.7.1",
     "0.7.1-alpha",
@@ -196,6 +201,13 @@ for mismatched_label in (f"v0{RELEASE_VERSION}", f"{RELEASE_LABEL}-wrong", RELEA
     else:
         raise AssertionError(f"Mismatched public release label was accepted: {mismatched_label}")
 assert builder.ARCHIVE_NAME == f"HMB_GP_Production_{RELEASE_LABEL}_Runtime.zip"
+for technical_version, public_label in (
+    ("0.8.0", "v0.8.00"),
+    ("0.8.1", "v0.8.01"),
+    ("0.8.2", "v0.8.02"),
+):
+    assert builder.release_label_for_version(technical_version) == public_label
+    builder.validate_release_identity(public_label, technical_version)
 assert builder.POLICY_DELIVERY == "bundled-signed-dat"
 for retired_name in (
     "POLICY_RELATIVE",
@@ -660,41 +672,38 @@ assert record_by_path[builder.BUNDLED_AGENT_POLICY_MEMBER.as_posix()]["data"] ==
     ROOT / Path(builder.BUNDLED_AGENT_POLICY_MEMBER)
 ).read_bytes()
 
+def sources_at_version(source_records, version):
+    versioned = []
+    for record in source_records:
+        updated = dict(record)
+        data = bytes(record["data"])
+        if record["path"] == "griptape-nodes-library.json":
+            payload = json.loads(data.decode("utf-8"))
+            payload["metadata"]["library_version"] = version
+            data = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        elif record["path"] == "SBOM.spdx.json":
+            payload = json.loads(data.decode("utf-8"))
+            payload["name"] = f"HMB_GP_Production-{version}"
+            payload["documentNamespace"] = f"https://hmb.local/spdx/HMB_GP_Production/{version}"
+            next(item for item in payload["packages"]
+                 if item["SPDXID"] == "SPDXRef-HMB-GP-Production")["versionInfo"] = version
+            data = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        updated.update(bytes=len(data), data=data, sha256=builder.digest(data))
+        versioned.append(updated)
+    return versioned
+
+
 previous_version_parts = builder.release_version_parts(RELEASE_VERSION)
-previous_version = (
-    f"{previous_version_parts[0]}.{previous_version_parts[1]}."
-    f"{previous_version_parts[2] - 1}"
-)
-previous_source_records = []
-for record in records:
-    previous_record = dict(record)
-    previous_data = bytes(record["data"])
-    if record["path"] == "griptape-nodes-library.json":
-        previous_payload = json.loads(previous_data.decode("utf-8"))
-        previous_payload["metadata"]["library_version"] = previous_version
-        previous_data = (
-            json.dumps(previous_payload, ensure_ascii=False, indent=2) + "\n"
-        ).encode("utf-8")
-    elif record["path"] == "SBOM.spdx.json":
-        previous_payload = json.loads(previous_data.decode("utf-8"))
-        previous_payload["name"] = f"HMB_GP_Production-{previous_version}"
-        previous_payload["documentNamespace"] = (
-            f"https://hmb.local/spdx/HMB_GP_Production/{previous_version}"
-        )
-        next(
-            item
-            for item in previous_payload["packages"]
-            if item["SPDXID"] == "SPDXRef-HMB-GP-Production"
-        )["versionInfo"] = previous_version
-        previous_data = (
-            json.dumps(previous_payload, ensure_ascii=False, indent=2) + "\n"
-        ).encode("utf-8")
-    previous_record.update(
-        bytes=len(previous_data),
-        data=previous_data,
-        sha256=builder.digest(previous_data),
-    )
-    previous_source_records.append(previous_record)
+# Patch zero has no preceding technical patch. Exercise its real 0 -> 1 pair
+# with complete, version-stamped archives rather than inventing patch -1 or
+# allowing a cross-minor predecessor.
+zero_patch = previous_version_parts[2] == 0
+previous_version = (RELEASE_VERSION if zero_patch else
+    f"{previous_version_parts[0]}.{previous_version_parts[1]}.{previous_version_parts[2] - 1}")
+pair_current_version = (f"{previous_version_parts[0]}.{previous_version_parts[1]}.1"
+                        if zero_patch else RELEASE_VERSION)
+pair_current_records = sources_at_version(records, pair_current_version) if zero_patch else records
+previous_source_records = sources_at_version(records, previous_version)
 previous_release_records = builder.make_release_records(
     previous_version, previous_source_records
 )
@@ -702,12 +711,23 @@ builder.validate_release_inventory(previous_version, previous_release_records)
 previous_archive = builder.make_archive(previous_release_records, archive_date_time)
 parity_result = builder.validate_release_pair_parity(
     previous_archive,
-    RELEASE_VERSION,
-    records,
+    pair_current_version,
+    pair_current_records,
 )
 assert parity_result["reference_version"] == previous_version
-assert parity_result["current_version"] == RELEASE_VERSION
+assert parity_result["current_version"] == pair_current_version
 assert parity_result["functional_file_count"] == len(EXPECTED_SOURCE_FILES)
+for invalid_current in (
+    f"{previous_version_parts[0]}.{previous_version_parts[1]}.{builder.release_version_parts(previous_version)[2] + 2}",
+    f"{previous_version_parts[0]}.{previous_version_parts[1] + 1}.1",
+):
+    try:
+        builder.validate_release_pair_parity(previous_archive, invalid_current,
+                                             sources_at_version(records, invalid_current))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Release parity accepted a skipped patch or cross-minor pair.")
 
 lf_previous_sources = [dict(record) for record in previous_source_records]
 for lf_record in lf_previous_sources:
@@ -726,8 +746,8 @@ lf_previous_archive = builder.make_archive(
 )
 builder.validate_release_pair_parity(
     lf_previous_archive,
-    RELEASE_VERSION,
-    records,
+    pair_current_version,
+    pair_current_records,
 )
 
 tampered_previous_sources = [dict(record) for record in previous_source_records]
@@ -752,8 +772,8 @@ tampered_previous_archive = builder.make_archive(
 try:
     builder.validate_release_pair_parity(
         tampered_previous_archive,
-        RELEASE_VERSION,
-        records,
+        pair_current_version,
+        pair_current_records,
     )
 except RuntimeError:
     pass
@@ -767,17 +787,23 @@ with tempfile.TemporaryDirectory(prefix="hmb-release-parity-") as temporary_root
         "_Runtime.zip"
     )
     previous_archive_path.write_bytes(previous_archive)
-    checked_pair = builder.check_parity(
-        previous_archive_path,
-        builder.digest(previous_archive),
-    )
-    assert checked_pair["parity"] is True
-    try:
-        builder.check_parity(previous_archive_path, "0" * 64)
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError("Release parity accepted the wrong trusted ZIP SHA256.")
+    # The zero-patch fixture's next odd source tree differs only by the two
+    # version fields. All ZIP, hash, signature and parity checks remain real.
+    validation_context = (mock.patch.object(builder, "validate_sources",
+        return_value=(pair_current_version, pair_current_records)) if zero_patch else nullcontext())
+    label_context = (mock.patch.object(builder, "RELEASE_LABEL",
+        builder.release_label_for_version(pair_current_version)) if zero_patch else nullcontext())
+    with validation_context, label_context:
+        checked_pair = builder.check_parity(previous_archive_path, builder.digest(previous_archive))
+        assert checked_pair["parity"] is True
+        assert checked_pair["current_release_version"] == pair_current_version
+        assert checked_pair["current_release_label"] == builder.release_label_for_version(pair_current_version)
+        try:
+            builder.check_parity(previous_archive_path, "0" * 64)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Release parity accepted the wrong trusted ZIP SHA256.")
     current_parts = builder.release_version_parts(RELEASE_VERSION)
     if current_parts[2] % 2 == 0:
         current_archive_path = temporary_path / builder.ARCHIVE_NAME

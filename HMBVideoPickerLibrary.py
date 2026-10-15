@@ -7155,10 +7155,10 @@ def _compact_auxiliary_failure_warning(
     )
 
 
-def _append_full_diagnostic_log(path: Any, label: Any, detail: Any) -> None:
+def _append_full_diagnostic_log(path: Any, label: Any, detail: Any) -> Optional[Path]:
     """Best-effort append of full diagnostics that are intentionally not UI state."""
     try:
-        log_path = Path(path)
+        log_path = _canonical_picker_diagnostic_path(path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8", errors="replace") as handle:
             handle.write(
@@ -7168,8 +7168,10 @@ def _append_full_diagnostic_log(path: Any, label: Any, detail: Any) -> None:
                     _clean(detail),
                 )
             )
+        return log_path
     except Exception as exc:
         _diagnostic_exception("full diagnostic log append failed", exc)
+        return None
 
 
 def _normalize_activity_log(value: Any) -> List[Dict[str, str]]:
@@ -10821,6 +10823,35 @@ def _picker_diagnostic_path(scene_path: Path, operation: str, token: str = "") -
     return folder / f"{_safe_scene_name(operation)[:40]}_{request_key}.txt"
 
 
+def _canonical_picker_diagnostic_path(
+    path: Any, scene_path: Any = None, operation: str = "recovered_diagnostic",
+) -> Path:
+    """Never append diagnostics through a serialized legacy/project path."""
+    text = _clean(path)
+    raw_root = (Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+                / "HMB_GP_Production" / "Diagnostics" / "VideoPicker").absolute()
+    root = raw_root.resolve(strict=False)
+    if text:
+        try:
+            candidate = Path(text)
+            for lexical_root in (raw_root, root):
+                if candidate.is_absolute() and candidate.suffix.lower() == ".txt" and candidate.is_relative_to(lexical_root):
+                    break
+            else:
+                raise ValueError("Not a managed diagnostic path.")
+            if ".." in candidate.relative_to(lexical_root).parts:
+                raise ValueError("Diagnostic traversal is not allowed.")
+            resolved = candidate.resolve(strict=False)
+            if (_path_is_within(resolved, root)
+                    and not any(_is_reparse_or_symlink(parent) for parent in (candidate, *candidate.parents)
+                                if lexical_root in parent.parents)):
+                return resolved
+        except (OSError, ValueError, RuntimeError):
+            pass
+    token = hashlib.sha256(text.replace("\\", "/").casefold().encode("utf-8")).hexdigest()[:12] if text else ""
+    return _picker_diagnostic_path(Path(_clean(scene_path) or "unknown_scene"), operation, token)
+
+
 def _is_reparse_or_symlink(path: Path) -> bool:
     """Return True for symlinks and Windows junction/reparse entries."""
     try:
@@ -11739,6 +11770,16 @@ def _maya_subprocess_environment(job_path: Path) -> Dict[str, str]:
     env["MAYA_DISABLE_CIP"] = "1"
     env["MAYA_DISABLE_CER"] = "1"
     env["MAYA_DISABLE_ADP"] = "1"
+    # Vendor licensing/renderer temp files must not follow a parent TEMP that
+    # points into the public scene-output folder. Keep APPDATA/license intact.
+    cache_root = Path(env.get("LOCALAPPDATA") or (
+        Path(env.get("USERPROFILE") or Path.home()) / "AppData" / "Local"
+        if os.name == "nt" else Path.home() / ".cache"
+    ))
+    maya_temp = cache_root / "HMB_GP_Production" / "Cache" / "MayaTemp"
+    maya_temp.mkdir(parents=True, exist_ok=True)
+    for key in ("TEMP", "TMP", "TMPDIR"):
+        env[key] = str(maya_temp)
 
     # The production crash report showed Maya 2027 failing inside
     # nvoglv64.dll while ogsRender presented the first OpenGL frame. Autodesk
@@ -13513,6 +13554,20 @@ class _OperationContext:
 
 class _StaleOperationError(RuntimeError):
     pass
+
+
+def _proxy_video_format_metadata(source_fps: float) -> Dict[str, Any]:
+    """Describe the host encoder settings used for every published Maya pass."""
+    return {
+        "container": "MPEG-4", "codec": "H.264", "encoder": "libx264",
+        "pixel_format": "yuv420p", "profile": PROXY_H264_PROFILE,
+        "level": PROXY_H264_LEVEL, "preset": PROXY_ENCODER_PRESET,
+        "crf": PROXY_ENCODER_CRF, "color_range": "tv",
+        "color_space": "bt709", "color_transfer": "bt709", "color_primaries": "bt709",
+        "frame_rate": _fps_timebase(source_fps),
+        "track_timescale": _video_track_timescale(source_fps),
+        "gop_frames": max(1, int(round(source_fps))), "fps_mode": "passthrough",
+    }
 
 
 def _build_ffmpeg_encode_command(
@@ -20202,18 +20257,16 @@ class HMBVideoPickerLibrary(DataNode):
         if isinstance(exc, _MayaNativeCaptureError):
             state["native_error_code"] = exc.error_code
             state["native_error_report"] = copy.deepcopy(exc.smooth_geometry_budget_report)
-        last_log_path = _clean(state.get("last_log_path"))
-        if last_log_path:
-            try:
-                failure_log = Path(last_log_path)
-                failure_log.parent.mkdir(parents=True, exist_ok=True)
-                with failure_log.open("a", encoding="utf-8", errors="replace") as log_handle:
-                    log_handle.write(
-                        f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-                        f"HMB OPERATION ERROR: {message}\n"
-                    )
-            except Exception as log_exc:
-                _diagnostic_exception("failed to append operation error log", log_exc)
+        try:
+            failure_log = _canonical_picker_diagnostic_path(
+                state.get("last_log_path"), state.get("scene_path") or state.get("scene_request_path"),
+                operation_kind or "operation_error",
+            )
+            state["last_log_path"] = failure_log.as_posix()
+            state["log_folder"] = failure_log.parent.as_posix()
+            _append_full_diagnostic_log(failure_log, f"HMB OPERATION ERROR: {message}", "")
+        except Exception as log_exc:
+            _diagnostic_exception("failed to append operation error log", log_exc)
         if operation_kind == "render_original_preview":
             state = self._mark_operation_finished(state)
             ready_stage = "VIDEO_READY" if state.get("videos") else "OUTLINER_READY"
@@ -21937,24 +21990,7 @@ class HMBVideoPickerLibrary(DataNode):
             "viewport_quality_report": viewport_quality_report,
             "duration_policy": "exact_source_timing",
             "warnings": warnings,
-            "video_format": {
-                "container": "MPEG-4",
-                "codec": "H.264",
-                "encoder": "libx264",
-                "pixel_format": "yuv420p",
-                "profile": PROXY_H264_PROFILE,
-                "level": PROXY_H264_LEVEL,
-                "preset": PROXY_ENCODER_PRESET,
-                "crf": PROXY_ENCODER_CRF,
-                "color_range": "tv",
-                "color_space": "bt709",
-                "color_transfer": "bt709",
-                "color_primaries": "bt709",
-                "frame_rate": _fps_timebase(source_fps),
-                "track_timescale": _video_track_timescale(source_fps),
-                "gop_frames": max(1, int(round(source_fps))),
-                "fps_mode": "passthrough",
-            },
+            "video_format": _proxy_video_format_metadata(source_fps),
         }
         _write_json(actual_sidecar_path, original_metadata)
 
@@ -23079,12 +23115,28 @@ class HMBVideoPickerLibrary(DataNode):
             "source_duration_seconds": count / fps, "output_duration_seconds": count / fps,
             "duration_policy": "exact_source_timing", "frame_sequence_transient": True,
             "encoded_stream_validation": stream,
+            "video_format": _proxy_video_format_metadata(fps),
             "bundle_run_id": context.operation_id if context else output_name,
             "pair_run_id": context.operation_id if context and "depth" in context.selected_roles else "",
             "companion_of_video_slot": PRIMARY_COLOR_VIDEO_SLOT if role != "mask" else 0,
             "source_video_slot": PRIMARY_COLOR_VIDEO_SLOT if role != "mask" else 0,
         })
         if role != "mask":
+            sidecar.update({
+                "schema": "hmb-depth-playblast" if role == "depth" else "hmb-motion-guide",
+                "schema_version": 1 if role == "depth" else MOTION_GUIDE_SIDECAR_SCHEMA_VERSION,
+                "video_slot": int(job[f"{role}_video_slot"]),
+                "markers": [], "available_color_picks": [],
+            })
+            sidecar.update({
+                "background_value": 0.0,
+                "depth_semantics": "camera_space_near_white_far_black",
+                "normalization_scope": "fixed_full_shot",
+            } if role == "depth" else {
+                "background_rgb": [0, 0, 0],
+                "appearance_authority": "zero",
+                "motion_authority": "derived_decoder_of_video1_only",
+            })
             sidecar[f"{role}_validation_report"] = validation
             sidecar[f"{role}_profile"] = DEPTH_PLAYBLAST_PROFILE if role == "depth" else MOTION_GUIDE_PROFILE
         _write_json(sidecar_path, sidecar)
@@ -23881,24 +23933,7 @@ class HMBVideoPickerLibrary(DataNode):
             ),
             "duration_policy": "exact_source_timing",
             "marker_catalog_version": int(MARKER_CATALOG["version"]),
-            "video_format": {
-                "container": "MPEG-4",
-                "codec": "H.264",
-                "encoder": "libx264",
-                "pixel_format": "yuv420p",
-                "profile": PROXY_H264_PROFILE,
-                "level": PROXY_H264_LEVEL,
-                "preset": PROXY_ENCODER_PRESET,
-                "crf": PROXY_ENCODER_CRF,
-                "color_range": "tv",
-                "color_space": "bt709",
-                "color_transfer": "bt709",
-                "color_primaries": "bt709",
-                "frame_rate": _fps_timebase(output_fps),
-                "track_timescale": _video_track_timescale(output_fps),
-                "gop_frames": max(1, int(round(output_fps))),
-                "fps_mode": "passthrough",
-            },
+            "video_format": _proxy_video_format_metadata(output_fps),
         })
         _write_json(actual_sidecar, sidecar)
 

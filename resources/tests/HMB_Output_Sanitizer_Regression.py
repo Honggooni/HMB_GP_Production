@@ -76,8 +76,15 @@ class Agent:
     def hide_message_by_name(self, name):
         self.hidden_messages.append(name)
 
-    def process(self):
+    def _process(self, agent, _prompt):
+        """Non-billable native seam; HMB owns inference-entry marking."""
         self.native_calls += 1
+        return agent
+
+    def process(self):
+        # Match Standard Agent's actual delegation so successful fixture text
+        # cannot be mistaken for its no-inference Agent-created branch.
+        self._process(self, self.get_parameter_value("prompt"))
         rules = self.get_parameter_list_value("rulesets")
         self.captured_rules = list(rules)
         self.captured_additional_context = self.get_parameter_value(
@@ -236,6 +243,15 @@ visible_prompt = "Describe the selected shot in production-ready English."
 module._paired_machine_prompt = lambda _node, prompt_value: str(prompt_value or "")
 
 node = canonical_hmb_agent()
+result_advisories = (
+    module._AGENT_EXECUTION_FAILED_WARNING,
+    module._AGENT_CREATED_WARNING,
+    module._AGENT_PROJECT_POLICY_ABSENT_WARNING,
+)
+for warning in result_advisories:
+    assert node.hidden_messages.count(warning) == 1
+    assert warning not in node.shown_messages
+    assert any(getattr(element, "name", "") == warning for element in node.root_ui_element.children)
 assert any(
     getattr(element, "name", "") == module._AGENT_EXECUTION_FAILED_WARNING
     for element in node.root_ui_element.children
@@ -268,8 +284,10 @@ assert display_target.name == "text"
 assert display_target.input_types == ["any"]
 node.after_outgoing_connection(agent_source, object(), chain_target)
 assert node.shown_messages == [module._AGENT_STATE_WARNING_NAME]
+hidden_before_removal = list(node.hidden_messages)
 node.after_outgoing_connection_removed(agent_source, object(), display_target)
-assert node.hidden_messages == [module._AGENT_STATE_WARNING_NAME]
+assert node.hidden_messages[:len(hidden_before_removal)] == hidden_before_removal
+assert node.hidden_messages[len(hidden_before_removal):] == [module._AGENT_STATE_WARNING_NAME]
 
 agent_widget_parameter = node.get_parameter_by_name(module._AGENT_WIDGET_PARAMETER)
 assert agent_widget_parameter.ui_options["height"] == 64

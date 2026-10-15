@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import types
+from unittest import mock
 
 from _hmb_bundled_policy_session import install_bundled_policy_session
 
@@ -1325,14 +1326,35 @@ assert "PID 9876" in active_state["message"]
 active_node._clear_active_process(fake_process)
 assert active_node._picker_state()["active_process_pid"] == 0
 
-# Backend failures remain diagnosable in the operation log.
-with tempfile.TemporaryDirectory() as failure_log_dir:
-    failure_log_path = Path(failure_log_dir) / "Read_failure.log"
-    failed_state = node._picker_state()
-    failed_state["last_log_path"] = str(failure_log_path)
-    node._write_state(failed_state)
-    node._set_failed_state(RuntimeError("persistent read diagnostic"))
-    assert "HMB OPERATION ERROR: persistent read diagnostic" in failure_log_path.read_text(encoding="utf-8")
+# Old saved log paths never create/append files in the production folder.
+# Full backend errors remain available through the updated local diagnostic.
+with tempfile.TemporaryDirectory() as failure_log_dir, mock.patch.dict(
+    picker.os.environ, {"LOCALAPPDATA": str(Path(failure_log_dir) / "local")},
+):
+    project = Path(failure_log_dir) / "production"
+    project.mkdir()
+    scene = project / "scene.mb"
+    scene.write_bytes(b"original scene")
+    for exists in (False, True):
+        failure_log_path = project / "Read_failure.log"
+        if exists:
+            failure_log_path.write_bytes(b"existing log preserved")
+        failed_state = node._picker_state()
+        failed_state.update(scene_path=str(scene), scene_request_path=str(scene),
+                            last_log_path=str(failure_log_path))
+        node._write_state(failed_state)
+        node._set_failed_state(RuntimeError("persistent read diagnostic"))
+        current = node._picker_state()
+        local_diagnostic = Path(current["last_log_path"])
+        assert Path(failure_log_dir) / "local" in local_diagnostic.parents
+        assert local_diagnostic.suffix == ".txt"
+        assert Path(current["log_folder"]) == local_diagnostic.parent
+        assert "HMB OPERATION ERROR: persistent read diagnostic" in local_diagnostic.read_text(encoding="utf-8")
+        if exists:
+            assert failure_log_path.read_bytes() == b"existing log preserved"
+        else:
+            assert not failure_log_path.exists()
+        assert scene.read_bytes() == b"original scene"
 
 # ---------------------------------------------------------------------------
 # Retained-mode request and post-transaction worker scheduling simulation.

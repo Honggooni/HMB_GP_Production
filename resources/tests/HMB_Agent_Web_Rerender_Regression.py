@@ -110,10 +110,12 @@ async def core():
     before = copy.deepcopy((node.parameter_values, node.parameter_output_values, node._hmb_execution_result, media, settings))
     status = node._hmb_web_rerender_policy_status()
     assert status["ready"] and status["version"] and len(status["sha256"]) == 64
-    assert set(status) == {"ready", "version", "sha256", "reason"}
+    assert set(status) == {"ready", "version", "sha256", "reason", "policy_verified", "policy_status"}
+    assert status["policy_verified"] is True and status["policy_status"] == "available"
     with patch.object(module._hmb, "_read_agent_policy_envelope", side_effect=RuntimeError("private policy bytes")):
         unavailable = node._hmb_web_rerender_policy_status()
-        assert unavailable == {"ready": False, "version": "", "sha256": "", "reason": "policy_unavailable"}
+        assert unavailable == {"ready": False, "version": "", "sha256": "", "reason": "policy_unavailable",
+                               "policy_verified": False, "policy_status": "unavailable"}
     cap = authority(node)
     try:
         pickle.dumps(cap)

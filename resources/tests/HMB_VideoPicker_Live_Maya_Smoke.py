@@ -406,6 +406,71 @@ def main() -> int:
             playblast_metadata = json.loads(
                 expected_playblast_sidecar.read_text(encoding="utf-8")
             )
+            picker_payload = node._build_picker_payload(playblast_state)
+
+            def selected_artifact(role: str, expected_slot: int, stem: str):
+                # Each progressive pass owns its filename/token. The Shot's
+                # typed selected history is authority, not the last active pass.
+                items = [
+                    item for item in playblast_state.get("videos", [])
+                    if item.get("generation_role") == role
+                    and item.get("picker_shot_uuid") == mask_rows[0].get("picker_shot_uuid")
+                ]
+                payload_items = [item for item in picker_payload.get("videos", [])
+                                 if item.get("generation_role") == role]
+                if len(items) != 1 or len(payload_items) != 1:
+                    raise RuntimeError(f"Live PLAYBLAST did not retain exactly one selected {role} artifact.")
+                item, payload_item = items[0], payload_items[0]
+                slot = int(payload_item.get("video_slot") or 0)
+                if slot != expected_slot or payload_item.get("video_uid") != item.get("video_uid"):
+                    raise RuntimeError(f"Live {role} history and packed @video{expected_slot} disagree.")
+                path = Path(str(item.get("video_path") or ""))
+                match = re.fullmatch(re.escape(scene_copy.stem + stem) + r"([0-9a-f]+)\.mp4", path.name)
+                if match is None or path.parent != expected_playblast.parent:
+                    raise RuntimeError(f"Live {role} did not retain its own tokenized output path: {path}")
+                if not path.is_file() or not path.stat().st_size:
+                    raise RuntimeError(f"Live {role} history points at missing media: {path}")
+                metadata = json.loads(path.with_suffix(".hmb.json").read_text(encoding="utf-8"))
+                if (metadata.get("generation_role") != role
+                        or metadata.get("bundle_run_id") != playblast_metadata.get("bundle_run_id")
+                        or not metadata.get("bundle_run_id")):
+                    raise RuntimeError(f"Live {role} metadata does not belong to this Generate operation.")
+                count = int(metadata.get("frame_count") or 0)
+                if count <= 0 or any(int(item.get(field) or 0) != count for field in (
+                    "source_frame_count", "output_frame_count", "decoded_frame_count",
+                )) or int(payload_item.get("frame_count") or 0) != count:
+                    raise RuntimeError(f"Live {role} sidecar, immutable history and output frame counts disagree.")
+                if any(float(item.get(field) or 0) != float(metadata.get("fps") or 0)
+                       for field in ("source_fps", "output_fps")):
+                    raise RuntimeError(f"Live {role} history and sidecar FPS disagree.")
+                video_format = metadata.get("video_format") or {}
+                log_parent = Path(str(playblast_state.get("last_log_path") or "")).parent
+                logs = [candidate for candidate in log_parent.glob("*" + match.group(1) + "*")
+                        if candidate.suffix.lower() in {".txt", ".log"}]
+                if len(logs) != 1:
+                    raise RuntimeError(f"Live {role} encoder diagnostic is missing or ambiguous.")
+                diagnostic = logs[0].read_text(encoding="utf-8", errors="replace")
+                for field, flag in (("encoder", "-c:v"), ("pixel_format", "-pix_fmt"),
+                                    ("profile", "-profile:v"), ("level", "-level:v"),
+                                    ("preset", "-preset"), ("crf", "-crf"),
+                                    ("color_range", "-color_range"), ("color_space", "-colorspace"),
+                                    ("color_transfer", "-color_trc"), ("color_primaries", "-color_primaries"),
+                                    ("frame_rate", "-framerate"), ("track_timescale", "-video_track_timescale"),
+                                    ("gop_frames", "-g"), ("fps_mode", "-fps_mode")):
+                    if field not in video_format or not re.search(
+                        r"(?:^|\s)" + re.escape(flag) + r"\s+" + re.escape(str(video_format[field])) + r"(?:\s|$)", diagnostic,
+                    ):
+                        raise RuntimeError(f"Live {role} {field} metadata differs from its actual encoder command.")
+                result.setdefault("selected_artifacts", {})[role] = {
+                    "video_uid": item.get("video_uid"), "video_path": str(path),
+                    "video_slot": slot, "run_token": match.group(1),
+                    "frame_count": count, "fps": metadata.get("fps"),
+                    "bundle_run_id": metadata.get("bundle_run_id"),
+                    "video_format": video_format, "actual_encoder_fields_matched": 14,
+                }
+                return item, slot, path
+
+            selected_artifact("mask", 1, "_playblast_")
             quality_report = playblast_metadata.get("viewport_quality_report") or {}
             if (
                 playblast_metadata.get("viewport_quality_profile")
@@ -444,9 +509,9 @@ def main() -> int:
             if (playblast_metadata.get("video_format") or {}).get("crf") != picker.PROXY_ENCODER_CRF:
                 raise RuntimeError("Live PLAYBLAST did not use the high-quality CRF profile.")
             if int(playblast_metadata.get("frame_count") or 0) != int(
-                playblast_state.get("output_frame_count") or 0
+                mask_rows[0].get("output_frame_count") or 0
             ):
-                raise RuntimeError("Live PLAYBLAST sidecar frame count disagrees with Picker state.")
+                raise RuntimeError("Live PLAYBLAST sidecar frame count disagrees with its immutable Mask history.")
             if playblast_state.get("snapshot_active"):
                 raise RuntimeError("Live PLAYBLAST did not switch away from the active still view.")
             if not any(
@@ -456,22 +521,8 @@ def main() -> int:
                 raise RuntimeError("Live PLAYBLAST changed or removed the prior Shot snapshot history.")
             result["playblast"]["video_size"] = video_path.stat().st_size
             if args.depth:
-                depth_slot = int(playblast_state.get("depth_video_slot") or 0)
-                if depth_slot != 2:
-                    raise RuntimeError(
-                        "Live Depth did not publish to canonical @video2: "
-                        f"{depth_slot}"
-                    )
-                expected_depth = (
-                    scene_copy.parent
-                    / scene_copy.stem
-                    / f"{scene_copy.stem}_depth_playblast_{run_token}.mp4"
-                )
-                expected_depth_sidecar = (
-                    scene_copy.parent
-                    / scene_copy.stem
-                    / f"{scene_copy.stem}_depth_playblast_{run_token}.hmb.json"
-                )
+                _depth_item, depth_slot, expected_depth = selected_artifact("depth", 2, "_depth_playblast_")
+                expected_depth_sidecar = expected_depth.with_suffix(".hmb.json")
                 if not expected_depth.is_file() or expected_depth.stat().st_size <= 0:
                     raise RuntimeError(
                         f"Live Depth did not create @video{depth_slot}: {expected_depth}"
@@ -564,30 +615,15 @@ def main() -> int:
                     "video_slot": depth_slot,
                 }
             if args.motion_guide:
-                motion_slot = int(
-                    playblast_state.get("motion_guide_video_slot") or 0
-                )
                 expected_motion_slot = 3 if args.depth else 2
-                if motion_slot != expected_motion_slot:
-                    raise RuntimeError(
-                        "Live Motion Guide did not publish to its canonical packed "
-                        f"slot @{expected_motion_slot}: {motion_slot}"
-                    )
-                depth_slot = int(playblast_state.get("depth_video_slot") or 0)
+                _motion_item, motion_slot, expected_motion = selected_artifact(
+                    "motion_guide", expected_motion_slot, "_motion_guide_",
+                )
                 if args.depth and motion_slot == depth_slot:
                     raise RuntimeError(
                         "Live Motion Guide and Depth occupied the same auxiliary slot."
                     )
-                expected_motion = (
-                    scene_copy.parent
-                    / scene_copy.stem
-                    / f"{scene_copy.stem}_motion_guide_{run_token}.mp4"
-                )
-                expected_motion_sidecar = (
-                    scene_copy.parent
-                    / scene_copy.stem
-                    / f"{scene_copy.stem}_motion_guide_{run_token}.hmb.json"
-                )
+                expected_motion_sidecar = expected_motion.with_suffix(".hmb.json")
                 if (
                     not expected_motion.is_file()
                     or expected_motion.stat().st_size <= 0

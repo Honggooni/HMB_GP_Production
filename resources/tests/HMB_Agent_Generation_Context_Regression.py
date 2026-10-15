@@ -75,6 +75,25 @@ only._hmb_shot_channel_subscription = lambda: subscription(enabled=False)
 assert only._hmb_agent_generation_settings() == {}
 assert make_generator(model_id="unknown")._hmb_agent_generation_settings() == {}
 
+# The Agent receives the requested audio/container/Draft state without any
+# setter, media submission or promotion of the author's next render settings.
+draft_node = make_generator(resolution="480p", generate_audio=False, output_format="mov",
+                            draft_action=generator.DRAFT_ACTION_PREVIEW, return_last_frame=True)
+draft_before = copy.deepcopy(draft_node.values)
+draft_settings = draft_node._hmb_agent_generation_settings()
+assert draft_settings["generate_audio"] is False
+assert draft_settings["output_format"] == "mov"
+assert draft_settings["draft_action"] == generator.DRAFT_ACTION_PREVIEW
+assert draft_settings["return_last_frame"] is True
+assert draft_settings["resolution"] == "480p" and draft_node.values == draft_before
+legacy_model = make_generator(model_id=generator.MODEL_NAME_SEEDANCE_2_0,
+                              output_format="mov", return_last_frame=True,
+                              draft_action=generator.DRAFT_ACTION_PREVIEW, generate_audio=True)
+legacy_settings = legacy_model._hmb_agent_generation_settings()
+assert legacy_settings["output_format"] == "mp4" and legacy_settings["generate_audio"] is True
+assert legacy_settings["return_last_frame"] is False
+assert legacy_settings["draft_action"] == generator.DRAFT_ACTION_OFF
+
 # Compare the read-only observer against the real existing UI synchronizer for
 # model/task migrations and hydrated values; no engine graph is involved.
 normalization_count = 0
@@ -154,12 +173,26 @@ with patch.object(routing, "_same_flow_nodes", return_value=("flow-1", [render_a
     assert refreshed["settings_sha256"] != first["settings_sha256"]
     assert get_context("stale") == {}
     render_a.values["duration"] = 8
+    before_audio_hash = get_context()["settings_sha256"]
+    render_a.values.update(generate_audio=True, output_format="mov")
+    with_audio = get_context()
+    assert with_audio["common"]["generate_audio"] is True
+    assert with_audio["common"]["output_format"] == "mov"
+    assert with_audio["settings_sha256"] != before_audio_hash
+    render_a.values.pop("generate_audio")
+    render_a.values.pop("output_format")
 with patch.object(routing, "_same_flow_nodes", return_value=("flow-1", [render_b, render_a])):
     multiple = get_context()
     assert multiple["common"]["resolution"] == "1080p"
     assert set(multiple["conflicting_fields"]) == {"duration_seconds", "aspect_ratio"}
     assert "duration_seconds" not in multiple["common"]
     assert [row["generator"] for row in multiple["sources"]] == ["Render A", "Render B"]
+
+with patch.object(routing, "_same_flow_nodes", return_value=("flow-1", [render_a, draft_node])):
+    differing = get_context()
+    assert {"resolution", "output_format", "draft_action", "return_last_frame"} <= set(differing["conflicting_fields"])
+    assert differing["common"]["generate_audio"] is False
+    assert "draft_action" not in differing["common"]
 
 # A compatible publisher is discovered by its callable typed settings
 # capability. Its participant kind and arbitrary model/task labels are not a
@@ -201,6 +234,20 @@ with patch.object(routing, "_same_flow_nodes", return_value=("flow-1", [generic,
     assert unresolved["common"]["duration_seconds"] is None
     assert unresolved["common"]["aspect_ratio"] == "adaptive"
     assert unresolved["settings_sha256"] != generic_context["settings_sha256"]
+generic.values = copy.deepcopy(generic_values)
+
+# Old six-field publishers remain compatible. Unknown optional values cannot
+# become agreed settings or replace a valid sibling's explicit False.
+with patch.object(routing, "_same_flow_nodes", return_value=("flow-1", [generic, render_a])):
+    partial = get_context()
+    assert "generate_audio" not in partial["common"]
+    assert "generate_audio" in partial["conflicting_fields"]
+    assert "generate_audio" not in next(row for row in partial["sources"] if row["generator"] == generic.name)
+generic.values.update(generate_audio="false", return_last_frame=0, output_format={"mov": True}, draft_action="bad\x00value")
+with patch.object(routing, "_same_flow_nodes", return_value=("flow-1", [generic])):
+    bounded = get_context()
+    assert not {"generate_audio", "return_last_frame", "output_format", "draft_action"} & bounded["common"].keys()
+    assert len(bounded["sources"]) == 1
 generic.values = copy.deepcopy(generic_values)
 
 # Malformed capabilities are isolated; they cannot contribute partial or

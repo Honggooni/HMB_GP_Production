@@ -99,13 +99,20 @@ class SelectedRoleArtifactRegression(unittest.TestCase):
                     job_path=self.private/'job.json',result_path=self.private/'result.json',log_path=self.root/'capture.log',context=None)
                 self.assertEqual(calls,[role])
 
-    def mask_helper(self, *, first=101.,last=102.,bad=None):
+    def mask_helper(self, *, first=101.,last=102.,bad=None,role='mask',role_slot=2):
         count=picker._maya_sequence_frame_count(first,last)
         folder=self.private/'mask';folder.mkdir(exist_ok=True)
         job=dict(camera='|shotCam',start_frame=first,end_frame=last,fps=24.,width=64,height=36,
                  output_name='mask',frames_folder=str(folder),sidecar_path=str(self.private/'mask.json'))
+        if role != 'mask':
+            job.update({role+'_output_name': job['output_name'], role+'_frames_folder': job['frames_folder'],
+                        role+'_sidecar_path': job['sidecar_path'], role+'_video_slot': role_slot})
+        self.raw_markers=[{'color':'Red','asset_id':'Actor','shading_profile':{'profile':'source-mask-marker'}}]
         sidecar=dict(camera='|shotCam',scene_path=str(self.scene),fps=24.,start_frame=first,end_frame=last,
                      frame_count=count,resolution={'width':64,'height':36},
+                     schema='raw-runner-schema',schema_version=99,video_slot=9,
+                     markers=copy.deepcopy(self.raw_markers),available_color_picks=['Red'],
+                     assignment_mode='raw-assignment-must-remain',profile='raw-profile-must-remain',
                      frame_map=[dict(sequence_index=i,maya_frame=min(first+i,last)) for i in range(count)])
         for i in range(count): Image.new('RGB',(64,36),(255,0,0)).save(folder/f'mask.{i:06d}.png')
         if bad=='camera':sidecar['camera']='|bad'
@@ -116,14 +123,21 @@ class SelectedRoleArtifactRegression(unittest.TestCase):
         node=mock.Mock()
         node._execute_maya_capture_passes.return_value=dict(ok=True,frames_folder=str(folder),sidecar_path=job['sidecar_path'],fps=24.,frame_count=count)
         node._publish_validated_playblast_artifact=picker.HMBVideoPickerLibrary._publish_validated_playblast_artifact
-        def encode(**kwargs):kwargs['staged_video_path'].write_bytes(b'offline-encoded-mp4')
+        def encode(**kwargs):
+            self.last_encode_command = picker._build_ffmpeg_encode_command(
+                ffmpeg=kwargs['ffmpeg'], frame_pattern=kwargs['frame_pattern'],
+                output_path=kwargs['staged_video_path'], source_fps=kwargs['source_fps'],
+                frame_count=kwargs['frame_count'], width=kwargs['width'], height=kwargs['height'])
+            kwargs['staged_video_path'].write_bytes(b'offline-encoded-mp4')
         node._encode_playblast_sequence.side_effect=encode
         with mock.patch.multiple(picker,
             _validate_full_smooth_confirmation=mock.Mock(),_validate_world_pattern_runner_confirmation=mock.Mock(),
+            _validate_depth_companion_inputs=mock.Mock(return_value={'validated':True}),
+            _validate_motion_guide_inputs=mock.Mock(return_value={'validated':True}),
             _validate_encoded_playblast=lambda *a,**k:{'ok':True},
             _is_structurally_valid_mp4=lambda p:Path(p).is_file() and Path(p).read_bytes()==b'offline-encoded-mp4',
             _copy_video_to_griptape_project=lambda *a,**k:(None,''),_external_media_url=lambda p:Path(p).as_uri()):
-            value=picker.HMBVideoPickerLibrary._maya_selected_role_artifact(node,role='mask',job=job,command=['offline'],
+            value=picker.HMBVideoPickerLibrary._maya_selected_role_artifact(node,role=role,job=job,command=['offline'],
                 job_path=self.private/'job.json',result_path=self.private/'result.json',log_path=self.root/'log',
                 ffmpeg=Path('offline'),scene_path=self.scene,output_folder=self.root,context=None)
         node._write_state.assert_not_called()
@@ -135,6 +149,55 @@ class SelectedRoleArtifactRegression(unittest.TestCase):
         self.assertEqual(value['generated_item']['generation_role'],'mask')
         self.assertTrue(Path(value['video']).is_file())
         self.assertTrue(Path(value['json']).is_file())
+
+    def test_every_selected_role_publishes_the_actual_host_encoder_settings(self):
+        for role in ('mask','depth','motion_guide'):
+            with self.subTest(role=role):
+                value=self.mask_helper(role=role)
+                metadata=json.loads(Path(value['json']).read_text())['video_format']
+                command=self.last_encode_command
+                for field, flag in (('encoder','-c:v'),('pixel_format','-pix_fmt'),('profile','-profile:v'),
+                                    ('level','-level:v'),('preset','-preset'),('crf','-crf'),
+                                    ('color_range','-color_range'),('color_space','-colorspace'),
+                                    ('color_transfer','-color_trc'),('color_primaries','-color_primaries'),
+                                    ('frame_rate','-framerate'),('track_timescale','-video_track_timescale'),
+                                    ('gop_frames','-g'),('fps_mode','-fps_mode')):
+                    self.assertEqual(str(metadata[field]),command[command.index(flag)+1],(role,field))
+                self.assertEqual(metadata['container'],'MPEG-4')
+                self.assertEqual(metadata['codec'],'H.264')
+
+    def test_auxiliary_sidecars_are_marker_free_and_mask_metadata_is_preserved(self):
+        for role in ('mask','depth','motion_guide'):
+            with self.subTest(role=role):
+                value=self.mask_helper(role=role)
+                metadata=json.loads(Path(value['json']).read_text())
+                self.assertEqual(metadata['markers'],self.raw_markers if role=='mask' else [])
+                self.assertEqual(metadata['available_color_picks'],['Red'] if role=='mask' else [])
+                self.assertEqual(metadata['assignment_mode'],'raw-assignment-must-remain')
+                self.assertEqual(metadata['profile'],'raw-profile-must-remain')
+                if role=='mask':
+                    self.assertEqual(metadata['schema'],'raw-runner-schema')
+                    self.assertEqual(metadata['schema_version'],99)
+                    self.assertEqual(metadata['video_slot'],9)
+
+    def test_auxiliary_public_semantics_use_own_job_slot_and_fractional_timeline(self):
+        for role in ('depth','motion_guide'):
+            for slot in (2,3):
+                with self.subTest(role=role,slot=slot):
+                    value=self.mask_helper(role=role,role_slot=slot,first=101.25,last=102.75)
+                    metadata=json.loads(Path(value['json']).read_text())
+                    expected=(dict(schema='hmb-depth-playblast',schema_version=1,background_value=0.0,
+                                   depth_semantics='camera_space_near_white_far_black',normalization_scope='fixed_full_shot')
+                              if role=='depth' else
+                              dict(schema='hmb-motion-guide',schema_version=picker.MOTION_GUIDE_SIDECAR_SCHEMA_VERSION,
+                                   background_rgb=[0,0,0],appearance_authority='zero',motion_authority='derived_decoder_of_video1_only'))
+                    for key,expected_value in expected.items():
+                        self.assertEqual(metadata[key],expected_value,(role,key))
+                    self.assertEqual(metadata['video_slot'],slot)
+                    self.assertEqual(metadata['frame_count'],3)
+                    self.assertEqual(metadata['frame_map'][-1]['maya_frame'],102.75)
+                    self.assertEqual(value['generated_item']['output_frame_count'],3)
+                    self.assertEqual(value['generated_item']['source_fps'],24.)
 
     def test_selected_helper_preserves_fractional_endpoint(self):
         value=self.mask_helper(first=101.25,last=102.75)

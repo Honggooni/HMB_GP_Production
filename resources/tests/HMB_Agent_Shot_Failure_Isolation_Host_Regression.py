@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import ExitStack
 import importlib.util
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -62,25 +63,22 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
         with event_lock:
             events.append((kind, number, time.monotonic()))
 
-    def native_model_fixture(self):
+    def native_model_fixture(self, agent, _prompt):
         number = self._regression_shot_number
-
-        def model_step():
-            record("agent_started", number)
-            if number == 1:
-                # Fail only after another branch entered generation, proving
-                # its active async polling survives as well as queued work.
-                assert sibling_generation_started.wait(timeout=5.0)
-                time.sleep(0.02)
-                record("agent_failed", number)
-                raise TimeoutError("Read timed out: PRIVATE_PROVIDER_PAYLOAD")
-            time.sleep(0.06)
-            return f"Valid generator instruction for shot {number}."
-
-        result = yield model_step
-        self.set_parameter_value("output", result)
-        self.parameter_output_values["output"] = result
+        record("agent_started", number)
+        if number == 1:
+            # Fail only after another branch entered generation, proving
+            # its active async polling survives as well as queued work.
+            assert sibling_generation_started.wait(timeout=5.0)
+            time.sleep(0.02)
+            record("agent_failed", number)
+            raise TimeoutError("Read timed out: PRIVATE_PROVIDER_PAYLOAD")
+        time.sleep(0.06)
+        result = f"Valid generator instruction for shot {number}."
+        agent.tasks[0].output = standard_module.TextArtifact(value=result)
+        self._last_raw_output = result
         record("agent_finished", number)
+        return agent
 
     async def generation_fixture(self):
         number = self._regression_shot_number
@@ -106,6 +104,8 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
     agents = []
     generators = []
     native_base = agent_module.HMBAgentLibrary.__mro__[1]
+    standard_module = inspect.getmodule(native_base)
+    assert standard_module is not None
 
     with ExitStack() as stack:
         # Hold the five supplied edges fixed; selector ownership/reconciliation
@@ -115,7 +115,13 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
             shot_routing, "reconcile_shot_routing",
             lambda *_args, **_kwargs: {"ok": True, "code": "ready", "changed": 0},
         ))
-        stack.enter_context(mock.patch.object(native_base, "process", native_model_fixture))
+        # Keep the installed Standard process, callable-yield contract and real
+        # HMB _process inference marker. Replace only billable model work and
+        # its account prerequisites, never protected execution-result flags.
+        stack.enter_context(mock.patch.object(native_base, "_process", native_model_fixture))
+        stack.enter_context(mock.patch.object(standard_module, "resolve_cloud_api_key", lambda: "offline-fixture-key"))
+        stack.enter_context(mock.patch.object(standard_module, "require_model_invocation_sync", lambda *_a, **_k: None))
+        stack.enter_context(mock.patch.object(standard_module, "try_throw_error", lambda *_a, **_k: None))
         stack.enter_context(mock.patch.object(
             seedance_module.HMBSeedanceGeneration, "_process_generation", generation_fixture,
         ))
@@ -130,6 +136,7 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
         ))
         for number in range(1, 6):
             agent = agent_module.HMBAgentLibrary(name=f"offline_shot_{number}_agent")
+            stack.enter_context(mock.patch.object(agent._model_access, "raise_if_selection_denied", lambda: None))
             generator = seedance_module.HMBSeedanceGeneration(name=f"offline_shot_{number}_generator")
             for node in (agent, generator):
                 node._regression_shot_number = number
@@ -179,6 +186,8 @@ async def exercise_host(engine, agent_module, seedance_module) -> None:
         assert "skip" in details.casefold(), details
         assert "PRIVATE_PROVIDER_PAYLOAD" not in details
         assert all(g.parameter_output_values.get("was_successful") is True for g in generators[1:])
+        assert all(a._hmb_execution_result_snapshot()["status"] == "succeeded" for a in agents[1:])
+        assert all(a._hmb_execution_result_snapshot()["inference_started"] is True for a in agents)
 
         # Single-node resolution ignores control branching in this host. The
         # actual runtime prompt guard must still reject the known failed source.

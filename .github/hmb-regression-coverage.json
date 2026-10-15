@@ -3,6 +3,12 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_Agent_V7_Execution_Context_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_Seedance_Web_Draft_Chain_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",

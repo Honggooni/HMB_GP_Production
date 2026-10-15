@@ -8304,6 +8304,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             model_id == SEEDANCE_2_5_MODEL_ID and authored_task == TASK_VIDEO_EDITING
         ):
             ratio = "adaptive"
+        output_format = str(
+            self.get_parameter_value("output_format") or DEFAULT_OUTPUT_FORMAT
+        ).strip().lower()
+        if output_format not in OUTPUT_FORMAT_CHOICES or model_id != SEEDANCE_2_5_MODEL_ID:
+            output_format = DEFAULT_OUTPUT_FORMAT
+        draft_action = self.get_parameter_value("draft_action") or DRAFT_ACTION_OFF
+        if draft_action not in DRAFT_ACTION_CHOICES or model_id != SEEDANCE_2_5_MODEL_ID:
+            draft_action = DRAFT_ACTION_OFF
         return {
             "model_id": model_id,
             "task": TASK_REFERENCE_TO_VIDEO,
@@ -8311,6 +8319,11 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "duration_mode": "explicit" if duration > 0 else "provider_smart",
             "aspect_ratio": ratio,
             "resolution": resolution,
+            "generate_audio": bool(self.get_parameter_value("generate_audio")),
+            "output_format": output_format,
+            "draft_action": draft_action,
+            "return_last_frame": bool(self.get_parameter_value("return_last_frame"))
+            if model_id == SEEDANCE_2_5_MODEL_ID else False,
         }
 
     def _resolve_exact_shot_generation_inputs(

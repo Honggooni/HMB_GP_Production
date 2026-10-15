@@ -387,7 +387,8 @@ class GeometryBudgetTests(unittest.TestCase):
         report = {"policy": POLICY, "budget_faces": LIMIT, "estimated_faces": LIMIT + 16,
                   "status": "exceeded", "complete": True}
         error_text = "Smooth Preview geometry budget exceeded: estimated 10,000,016 vs 10,000,000 faces."
-        with tempfile.TemporaryDirectory(prefix="hmb-geometry-host-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="hmb-geometry-host-") as temporary, \
+                mock.patch.dict(picker.os.environ, {"LOCALAPPDATA": str(Path(temporary) / "local")}):
             root = Path(temporary)
             scene = root / "scene.ma"
             scene.write_text("// isolated capture metadata fixture", encoding="utf-8")
@@ -405,7 +406,7 @@ class GeometryBudgetTests(unittest.TestCase):
                            "progress_path": str(private / "progress.json")}
                     job_path = private / "job.json"
                     job_path.write_text(json.dumps(job), encoding="utf-8")
-                    log = root / (kind + ".txt")
+                    log = picker._picker_diagnostic_path(scene, kind, "geometry-budget")
                     log.write_text("capture requested\n", encoding="utf-8")
                     host = CaptureHost(kind, log)
                     launches = []
@@ -448,6 +449,9 @@ class GeometryBudgetTests(unittest.TestCase):
                     self.assertEqual(host.state["native_metadata"], {"quality": "authored high detail"})
                     self.assertEqual(host.state["snapshots"], [{"snapshot_uid": "existing-result"}])
                     self.assertNotIn("exited with code 1", host.state["message"])
+                    self.assertEqual(Path(host.state["last_log_path"]), log)
+                    self.assertEqual(Path(host.state["log_folder"]), log.parent)
+                    self.assertIn("capture requested", log.read_text(encoding="utf-8"))
                     self.assertIn(error_text, log.read_text(encoding="utf-8"))
                     self.assertEqual(list(private.rglob("*.png")), [])
 

@@ -11711,6 +11711,7 @@ class HMBPromptLibrary(DataNode):
             if not flow_name:
                 return {}
             fields = ("model_id", "task", "duration_seconds", "duration_mode", "aspect_ratio", "resolution")
+            optional_fields = ("generate_audio", "output_format", "draft_action", "return_last_frame")
             observed = []
             for candidate in nodes:
                 subscription = _subscription_for(candidate)
@@ -11763,7 +11764,21 @@ class HMBPromptLibrary(DataNode):
                         continue
                 elif settings["duration_mode"] != "provider_smart" or duration is not None:
                     continue
-                observed.append((subscription, {key: settings[key] for key in fields}))
+                snapshot = {key: settings[key] for key in fields}
+                for key in optional_fields:
+                    if key not in settings:
+                        continue
+                    value = settings[key]
+                    if key in {"generate_audio", "return_last_frame"}:
+                        valid = type(value) is bool
+                    else:
+                        valid = (
+                            isinstance(value, str) and bool(value.strip())
+                            and len(value) <= 256 and "\x00" not in value
+                        )
+                    if valid:
+                        snapshot[key] = value
+                observed.append((subscription, snapshot))
             current_flow_name, current_nodes = _same_flow_nodes(self)
             if current_flow_name != flow_name:
                 return {}
@@ -11786,17 +11801,18 @@ class HMBPromptLibrary(DataNode):
                 ):
                     return {}
             sources.sort(key=lambda item: item["generator"])
+            context_fields = (*fields, *(key for key in optional_fields if any(key in row for row in sources)))
             common = {
                 key: sources[0][key]
-                for key in fields
-                if key in sources[0] and all(row.get(key) == sources[0][key] for row in sources)
+                for key in context_fields
+                if key in sources[0] and all(key in row and row[key] == sources[0][key] for row in sources)
             }
             return {
                 "schema": "hmb-agent-generation-context",
                 "version": 1,
                 "sources": sources,
                 "common": common,
-                "conflicting_fields": [key for key in fields if key not in common],
+                "conflicting_fields": [key for key in context_fields if key not in common],
                 "settings_sha256": _canonical_sha256({"sources": sources}),
                 "interpretation": (
                     "Read-only requested output settings. Adaptive aspect ratio and provider-smart "
