@@ -60,7 +60,10 @@ class InstallerRepair(unittest.TestCase):
     def fake_uv(self,args,**kwargs):
         self.calls.append(args)
         self.assertEqual(args[1:7],["-I","-B","-m","uv","pip","uninstall"])
-        self.assertEqual(args[7:9],["--python",str(self.root/".venv/Scripts/python.exe")])
+        self.assertEqual(args[7],"--python")
+        # Windows runners may expose TEMP through its 8.3 alias. The repair
+        # resolves the library root; both spellings must identify this exact exe.
+        self.assertEqual(Path(args[8]).resolve(),(self.root/".venv/Scripts/python.exe").resolve())
         removals=set(args[9:])
         for dist in list(metadata.distributions(path=[str(self.site)])):
             name=re.sub(r"[-_.]+","-",dist.metadata["Name"]).lower()
