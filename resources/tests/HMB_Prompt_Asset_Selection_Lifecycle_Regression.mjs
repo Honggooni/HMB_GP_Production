@@ -25,7 +25,8 @@ let external=0;const failures=[];
 try{
  const page=await browser.newPage({viewport:{width:1900,height:1700},hasTouch:true});page.setDefaultTimeout(5000);
  await page.route("**/*",route=>{if(new URL(route.request().url()).hostname!=="127.0.0.1"){external++;return route.abort();}return route.continue();});
- page.on('pageerror',error=>failures.push(error.message));await page.goto(`http://127.0.0.1:${server.address().port}`);await page.waitForFunction(()=>window.ready);
+ // CI browser/document startup has a separate budget; UI actions stay at 5s.
+ page.on('pageerror',error=>failures.push(error.message));await page.goto(`http://127.0.0.1:${server.address().port}`,{timeout:30000});await page.waitForFunction(()=>window.ready,null,{timeout:30000});
  const labels=()=>page.locator('.source-row.image .source-label-input').evaluateAll(inputs=>inputs.map(input=>input.value));
  const accepted=async(images)=>{
   await page.evaluate(images=>{const state=structuredClone(window.latest);state.source_sync_revision++;state.image_asset.shot_catalog_routing.generation++;state.image_asset.shot_catalog_routing.metadata_sha256=String(state.source_sync_revision).padStart(64,'a');state.images=images;state.image_asset.enabled=true;state.image_asset.order_managed=true;state.image_asset.selected_assets=images.length;state.image_asset.verified_assets=images.length;state.image_asset.ordered_source_uids=images.map(item=>item.asset_source_uid);state.shot.selected_source_uids=[...state.image_asset.ordered_source_uids];window.accept(state);},images);

@@ -10,14 +10,24 @@ const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..');
 const require=createRequire(import.meta.url);let playwright;
 try{playwright=require('playwright');}catch{playwright=require(path.join(os.homedir(),'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'));}
 const report=path.join(root,'reports/feature123-local804-20261016/finish');fs.mkdirSync(report,{recursive:true});
-const worker=spawn(path.join(root,'.venv/Scripts/python.exe'),['-B','-u',path.join(root,'resources/tests/HMB_Finish_UI_Transport_Regression.py'),'--bridge'],{cwd:root,windowsHide:true,stdio:['pipe','pipe','pipe']});
+const regressionPython=process.env.HMB_REGRESSION_PYTHON||path.join(root,'.venv/Scripts/python.exe');
+const worker=spawn(regressionPython,['-B','-u',path.join(root,'resources/tests/HMB_Finish_UI_Transport_Regression.py'),'--bridge'],{cwd:root,windowsHide:true,stdio:['pipe','pipe','pipe']});
 let stderr='';worker.stderr.on('data',chunk=>stderr+=chunk.toString());
-const waiting=[];readline.createInterface({input:worker.stdout}).on('line',line=>{
- const target=waiting.shift();if(!target)return;try{const value=JSON.parse(line);if(!value.ok)target.reject(Error(value.error));else target.resolve(value);}catch(error){target.reject(error);}
+let workerFailure=null;
+const waiting=[];
+const failWorker=error=>{if(!workerFailure)workerFailure=error;for(const target of waiting.splice(0)){clearTimeout(target.timer);target.reject(workerFailure);}return workerFailure;};
+readline.createInterface({input:worker.stdout}).on('line',line=>{
+ const target=waiting.shift();if(!target)return;clearTimeout(target.timer);try{const value=JSON.parse(line);if(!value.ok)target.reject(Error(value.error));else target.resolve(value);}catch(error){target.reject(error);}
 });
-worker.on('exit',code=>{for(const target of waiting.splice(0))target.reject(Error('Python fixture exited '+code+': '+stderr));});
-worker.on('error',error=>{for(const target of waiting.splice(0))target.reject(error);});
-const backend=message=>new Promise((resolve,reject)=>{waiting.push({resolve,reject});worker.stdin.write(JSON.stringify(message)+'\n');});
+worker.on('exit',(code,signal)=>failWorker(Error('Python fixture exited '+code+(signal?' ('+signal+')':'')+': '+stderr)));
+worker.on('error',failWorker);worker.stdin.on('error',failWorker);
+const backend=message=>new Promise((resolve,reject)=>{
+ if(workerFailure){reject(workerFailure);return;}
+ if(worker.exitCode!==null||worker.signalCode!==null||worker.stdin.destroyed||!worker.stdin.writable){reject(failWorker(Error('Python fixture is unavailable: '+stderr)));return;}
+ const target={resolve,reject,timer:setTimeout(()=>{failWorker(Error('Python fixture response timed out after 15000ms'));worker.kill();},15000)};
+ waiting.push(target);
+ try{worker.stdin.write(JSON.stringify(message)+'\n',error=>{if(error)failWorker(error);});}catch(error){failWorker(error);}
+});
 const browser=await playwright.chromium.launch({headless:true,executablePath:process.env.HMB_WIDGET_TEST_BROWSER||'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'});
 const receipt={schema:'hmb-finish-ui-transport-browser-v1',paid_calls:0,external_requests:0,live_graph_actions:0,cases:[]};
 try{

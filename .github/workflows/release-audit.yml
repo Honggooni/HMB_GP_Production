@@ -123,14 +123,14 @@ jobs:
       - name: Require complete regression registration
         shell: pwsh
         run: python tools/audit_regression_coverage.py --check
+      - name: JavaScript widget regressions with required browser coverage
+        shell: pwsh
+        run: python tools/audit_regression_coverage.py --run javascript --report "${{ runner.temp }}/hmb-coverage/javascript.json"
       - name: Python release regressions with coverage receipts
         shell: pwsh
         env:
           HMB_IMAGE_PROJECTS_ROOT: ${{ github.workspace }}
         run: python tools/audit_regression_coverage.py --run python --report "${{ runner.temp }}/hmb-coverage/python.json"
-      - name: JavaScript widget regressions with required browser coverage
-        shell: pwsh
-        run: python tools/audit_regression_coverage.py --run javascript --report "${{ runner.temp }}/hmb-coverage/javascript.json"
       - name: Upload pass and unexecuted coverage receipts
         if: always()
         uses: actions/upload-artifact@v4

@@ -97,7 +97,10 @@ def run_registered(root: Path, rows: list[dict[str, Any]], language: str,
         command = [sys.executable if language == "python" else node, str(root / "resources/tests" / row["name"])]
         start = time.monotonic()
         try:
-            child_env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+            # Browser-to-Python fixtures also run on CI without a repository
+            # .venv; their worker must use the interpreter selected here.
+            child_env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8",
+                             HMB_REGRESSION_PYTHON=sys.executable)
             completed = subprocess.run(command, cwd=root, text=True, encoding="utf-8", errors="replace",
                                        capture_output=True, timeout=900, env=child_env)
             output = completed.stdout + completed.stderr

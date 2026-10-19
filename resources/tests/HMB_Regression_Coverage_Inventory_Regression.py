@@ -16,7 +16,7 @@ with tempfile.TemporaryDirectory(prefix="hmb-coverage-inventory-") as directory:
     (root/"resources/tests").mkdir(parents=True)
     (root/".github").mkdir()
     test = root/"resources/tests/HMB_Example_Regression.py"
-    test.write_text("import os\nassert os.environ['PYTHONUTF8']=='1'\nassert os.environ['PYTHONIOENCODING']=='utf-8'\nprint('PASS 한글 😀 \\ufffd fixture')", encoding="utf-8")
+    test.write_text("import os, sys\nfrom pathlib import Path\nassert os.environ['PYTHONUTF8']=='1'\nassert os.environ['PYTHONIOENCODING']=='utf-8'\nassert Path(os.environ['HMB_REGRESSION_PYTHON']).resolve()==Path(sys.executable).resolve()\nprint('PASS 한글 😀 \\ufffd fixture')", encoding="utf-8")
     row = {"name": test.name, "mode": "ci", "coverage": "python_contract", "required": True,
            "manual_extensions": [{"coverage": "native_maya", "args": ["--live-maya"], "reason": "Maya not part of hostless CI"}]}
     registry = root/coverage.REGISTRY

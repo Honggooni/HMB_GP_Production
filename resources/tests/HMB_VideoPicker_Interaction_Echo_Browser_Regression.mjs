@@ -103,7 +103,8 @@ try {
   await page.route('**/*',route=>route.request().url().startsWith(origin)?route.continue():route.abort());
   page.on('pageerror',error=>failures.push('pageerror: '+error.message));
   page.setDefaultTimeout(5000);
-  await page.goto(origin);await page.waitForFunction(()=>window.ready);
+  // CI browser/document startup has a separate budget; UI actions stay at 5s.
+  await page.goto(origin,{timeout:30000});await page.waitForFunction(()=>window.ready,null,{timeout:30000});
   const reset=async(media=false)=>{
     await page.evaluate(value=>window.start(value),typeof media==='object'?media:fixture(media));
     if(await page.locator('.hmbvp').getAttribute('data-picker-view')!=='expanded') await page.locator('[data-picker-toggle-surface="header"]').dispatchEvent('dblclick');

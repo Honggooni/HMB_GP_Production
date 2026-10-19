@@ -106,7 +106,8 @@ try {
   await page.route("**/*", route => route.request().url().startsWith(origin) ? route.continue() : route.abort());
   page.on("pageerror", error => errors.push(error.message));
   page.setDefaultTimeout(5000);
-  await page.goto(origin); await page.waitForFunction(() => window.ready);
+  // CI browser/document startup has a separate budget; UI actions stay at 5s.
+  await page.goto(origin, {timeout:30000}); await page.waitForFunction(() => window.ready, null, {timeout:30000});
   const fixture = () => ({ runtime_instance_id: "snapshot-browser", state_revision: 10, state_writer: "python", language: "en",
     scene_path: "D:/AI/test/e201s095c001__.mb", scene_request_path: "D:/AI/test/e201s095c001__.mb", native_read_ready: true,
     scene_stage: "OUTLINER_READY", status: "READY", maya_available: true, selected_camera: "shotCamera",
