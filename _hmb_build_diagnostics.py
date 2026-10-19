@@ -237,7 +237,23 @@ def get_build_diagnostics(root: str | Path | None = None, *, verify_policy: bool
                 rows = _expected_records([r for r in document.get("files", []) if isinstance(r, dict) and r.get("install") is True])
                 package["manifest_status"] = "observed"
             declared = _sha(document.get("runtime_fingerprint_sha256"))
-            if declared != inventory_fingerprint(rows) or document.get("release_version") != version:
+            if declared != inventory_fingerprint(rows):
+                raise ValueError("identity_mismatch")
+            recorded_version = str(document.get("release_version") or "")
+            if recorded_version != version:
+                # A Git Override preserves the prior installer observation.
+                # Keep that historical file intact without presenting it as
+                # verification of the newly observed runtime. Same-version
+                # drift and malformed/future identities still fail below.
+                parts = lambda value: tuple(int(part) for part in value.split("."))
+                semver = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+                if (re.fullmatch(semver, recorded_version) and re.fullmatch(semver, version)
+                        and parts(recorded_version) < parts(version)):
+                    if kind == "receipt":
+                        install.update(receipt_status="historical_record", recorded_library_version=recorded_version)
+                    else:
+                        package["manifest_status"] = "historical_record"
+                    continue
                 raise ValueError("identity_mismatch")
             differences = sorted(r["path"] for r in rows if hashes.get(r["path"]) != r["sha256"])
             package.update(declared_fingerprint_sha256=declared,

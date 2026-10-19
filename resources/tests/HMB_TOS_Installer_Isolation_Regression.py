@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+import ast
 import importlib.metadata as metadata
 import io
 import json
@@ -17,8 +18,13 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 TEXT = (ROOT / "Install_HMB_GP_Production.ps1").read_text(encoding="utf-8-sig")
 SCRIPTS = re.findall(r"(?ms)^    \$repair = @'\n(.*?)^'@\n", TEXT)
-assert len(SCRIPTS) == 1, "The installer must expose one bounded repair literal"
-REPAIR = compile(SCRIPTS[0], "<exact-public-installer-TOS-repair>", "exec")
+assert len(SCRIPTS) == 1, "The installer must expose one bounded shared-repair loader"
+assert "_HMB_TOS_ENVIRONMENT_REPAIR_SOURCE" in SCRIPTS[0]
+TREE = ast.parse((ROOT / "_hmb_library_bootstrap.py").read_text(encoding="utf-8-sig"))
+CORES = [ast.literal_eval(node.value) for node in TREE.body if isinstance(node, ast.Assign)
+         and any(isinstance(target, ast.Name) and target.id == "_HMB_TOS_ENVIRONMENT_REPAIR_SOURCE" for target in node.targets)]
+assert len(CORES) == 1
+REPAIR = compile(CORES[0], "<exact-shared-installer-TOS-repair>", "exec")
 ENGINE = {"anyio":"4.15.1", "charset-normalizer":"3.5.2", "idna":"3.20", "urllib3":"2.8.0"}
 OLD = {"anyio":"4.14.2", "charset-normalizer":"3.5.1", "idna":"3.19", "urllib3":"2.7.0"}
 
@@ -29,6 +35,7 @@ class InstallerRepair(unittest.TestCase):
         self.root = Path(self.tmp.name) / "HMB_GP_Production"
         self.site = self.root / ".venv/Lib/site-packages"
         self.site.mkdir(parents=True)
+        (self.root/"griptape-nodes-library.json").write_text('{"name":"HMB_GP_Production"}',encoding="utf-8")
         python = self.root / ".venv/Scripts/python.exe"
         python.parent.mkdir(parents=True)
         python.write_bytes(b"Never executed: fixture only")
@@ -77,9 +84,10 @@ class InstallerRepair(unittest.TestCase):
 
     def run_repair(self,*,version=(3,12,13),root=None):
         output=io.StringIO()
-        with mock.patch.object(sys,"argv",["repair",str(root or self.root),"0","1"]), mock.patch.object(sys,"version_info",version), mock.patch.object(metadata,"version",side_effect=lambda name:ENGINE[name]), mock.patch.object(subprocess,"run",side_effect=self.fake_uv), redirect_stdout(output):
-            exec(REPAIR,{"__name__":"_fixture_exact_installer_repair"})
-        return json.loads(output.getvalue())
+        with mock.patch.object(sys,"version_info",version), mock.patch.object(metadata,"version",side_effect=lambda name:ENGINE[name]), mock.patch.object(subprocess,"run",side_effect=self.fake_uv), redirect_stdout(output):
+            namespace={"__name__":"_fixture_exact_installer_repair"}
+            exec(REPAIR,namespace)
+            return namespace["_repair_request"]({"version":1,"operation":"install","library_root":str(root or self.root),"clean_legacy":True,"prepare_runtime":False})
 
     def test_legacy_three_only_and_removed_versions_are_captured_before_deletion(self):
         self.legacy();self.package("custom","1.0")
@@ -159,10 +167,11 @@ class InstallerRepair(unittest.TestCase):
 
     def test_unsupported_python_or_root_is_rejected_before_uv(self):
         self.legacy()
-        with self.assertRaisesRegex(SystemExit,"Unsupported"):
+        with self.assertRaisesRegex(RuntimeError,"Unsupported"):
             self.run_repair(version=(3,13,0))
         wrong=self.root.parent/"wrong-library";wrong.mkdir()
-        with self.assertRaisesRegex(SystemExit,"Unsupported"):
+        (wrong/"griptape-nodes-library.json").write_text('{"name":"OtherLibrary"}',encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError,"Unsupported"):
             self.run_repair(root=wrong)
         self.assertEqual(self.calls,[])
 

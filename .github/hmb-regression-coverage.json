@@ -3,6 +3,32 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_Override_Environment_Coordinator_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Actual installed SDK cold Advanced registration, loaded-extension deferral and cleanup use disposable environments and explicit offline guards; no user graph or provider requests."
+    },
+    {
+      "name": "HMB_Override_Environment_Coordinator_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_TOS_Auto_Environment_Migration_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Override_Environment_Hook_Order_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Actual SDK registration order, cold-load migration and active-module deferral require the installed engine; disposable environments only, no provider or user-graph changes."
+    },
+    {
       "name": "HMB_TOS_Installer_Isolation_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",

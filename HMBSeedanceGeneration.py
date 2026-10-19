@@ -1525,8 +1525,10 @@ def _isolated_tos_runtime_python() -> Path:
         return python
     except (OSError, ValueError, RuntimeError):
         raise RuntimeError(
-            "The isolated Volcengine TOS runtime is not ready. Run the HMB TOS runtime setup "
-            "for this installed library (.venv-tos); no TOS upload or render was submitted."
+            "The isolated Volcengine TOS runtime is not ready. Automatic preparation may still be running; "
+            "retry after it finishes or restart Griptape to complete the guarded setup. "
+            "The HMB installer -PrepareTosRuntime option can also prepare .venv-tos. "
+            "No TOS upload or render was submitted."
         ) from None
 
 

@@ -1,6 +1,14 @@
 # Local runtimes, caches, and generated state
 .venv/
 .venv-tos/
+.venv-tos-stage-*/
+.hmb-environment-backups/
+.hmb-tos-migration.lock
+.hmb-tos-prepare.lock
+.hmb-tos-runtime-needed.json
+.hmb-tos-runtime-ready.json
+.hmb-tos-runtime-*.json.*.tmp
+.hmb-install-receipt.json
 .tmp/
 __pycache__/
 *.py[cod]

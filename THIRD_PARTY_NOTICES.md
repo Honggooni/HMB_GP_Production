@@ -13,9 +13,13 @@ Optional Volcengine TOS uploads run in a separate `.venv-tos` interpreter:
 - Volcengine TOS Python SDK 2.9.2 — Apache-2.0 license
 - Its dependencies, including wrapt 1.16.0, belong only to that isolated
   interpreter. They are not imported into the Griptape engine environment.
-- The included installer migrates a previous TOS installation automatically.
-  On a new installation, use `-PrepareTosRuntime` to provision this optional
-  runtime before selecting TOS uploads. Normal rendering does not install packages.
+- After a normal Git Update/Override, the next cold library load safely
+  migrates known legacy TOS editor dependencies with a verified recovery copy.
+  Loaded dependencies defer migration until Griptape is restarted. Optional
+  TOS preparation runs separately from Cloud generation and saved-result playback.
+- The included installer is an alternative for explicit installation and recovery.
+  On a fresh installation, `-PrepareTosRuntime` provisions this optional runtime.
+  Rendering does not install packages.
 
 Griptape Nodes, Griptape Standard Library, Autodesk Maya, Volcengine Ark,
 Volcengine TOS, and Seedance are separate products or services governed by their

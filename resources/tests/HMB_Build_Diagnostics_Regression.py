@@ -94,6 +94,36 @@ with tempfile.TemporaryDirectory(prefix="hmb-build-diag-") as directory:
     (root/diag.RECEIPT_NAME).write_text(json.dumps(receipt), encoding="utf-8")
     assert diag.get_build_diagnostics(root, verify_policy=False)["install"]["receipt_status"] == "invalid"
 
+# A genuine file-only Override retains the previous installer observation.
+# Its hashes cannot authenticate the new release, and the diagnostic must not
+# rewrite it or mistake expected version advancement for same-version drift.
+with tempfile.TemporaryDirectory(prefix="hmb-build-override-") as directory:
+    root = Path(directory)
+    for name in runtime_paths:
+        path = root/name; path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"old runtime " + name.encode())
+    manifest_path = root/"griptape-nodes-library.json"
+    manifest_path.write_text(json.dumps({"metadata":{"library_version":"0.8.9"}}), encoding="utf-8")
+    rows = [{"path":name,"bytes":(root/name).stat().st_size,
+             "sha256":hashlib.sha256((root/name).read_bytes()).hexdigest()} for name in runtime_paths]
+    old_receipt = {"schema":"hmb-install-receipt","version":1,"release_version":"0.8.9",
+                   "runtime_files":rows,"runtime_fingerprint_sha256":diag.inventory_fingerprint(rows)}
+    receipt_path = root/diag.RECEIPT_NAME
+    receipt_path.write_text(json.dumps(old_receipt), encoding="utf-8")
+    saved_receipt = receipt_path.read_bytes()
+    manifest_path.write_text(json.dumps({"metadata":{"library_version":"0.8.11"}}), encoding="utf-8")
+    (root/"HMBSeedanceGeneration.py").write_bytes(b"new release runtime")
+    updated = diag.get_build_diagnostics(root, verify_policy=False)
+    assert updated["library_version"] == "0.8.11"
+    assert updated["install"]["receipt_status"] == "historical_record"
+    assert updated["install"]["recorded_library_version"] == "0.8.9"
+    assert updated["package"]["verification_status"] == "not_checked"
+    assert receipt_path.read_bytes() == saved_receipt
+    # An unobserved future version is not a historical update record.
+    old_receipt["release_version"] = "0.8.13"
+    receipt_path.write_text(json.dumps(old_receipt), encoding="utf-8")
+    assert diag.get_build_diagnostics(root, verify_policy=False)["install"]["receipt_status"] == "invalid"
+
 # Real production signed DAT verification is read-only and does not synchronize
 # the external Manager. An invalid signature must never become "verified".
 before = (ROOT/"resources/agent/superwings12/hmb_agent_core.dat").read_bytes()

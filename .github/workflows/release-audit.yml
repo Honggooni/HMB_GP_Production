@@ -237,7 +237,8 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
-            "- Isolates optional TOS uploads in a dedicated .venv-tos child interpreter. TOS and its wrapt pin no longer replace editor-process dependencies. The installer migrates legacy environments while retaining a rollback copy.",
+            "- Supports normal Git Update/Override without requiring the ZIP installer. The next cold library load checks known legacy editor dependencies, preserves a verified recovery copy and performs targeted cleanup. Loaded modules defer cleanup until a full Griptape restart; unknown or customized dependency layouts are preserved.",
+            "- Keeps optional TOS uploads in a dedicated .venv-tos child interpreter. TOS preparation runs separately from Cloud generation, saved Tasks and local previews; rendering never installs packages. Interrupted or unverifiable migration cannot be mistaken for successful cleanup.",
             "- Applies Griptape's disabled state to all nine HMB widgets, including same-value updates and retired callbacks. Playback, available result retrieval and cancellation remain usable; existing palettes, dimensions and native local-video previews are preserved.",
             "- Isolates a Shot's HMB render admission failure before managed Agent execution or generation submission. A waiting binding, missing project or invalid option skips that Shot while healthy peers continue. Native structural validation remains authoritative.",
             "- Persists explicit Only and exact Shot identity through save/open, source deletion, recreation and rapid selection. Only stays independent; a waiting Shot cannot silently switch to a different UUID. Metadata-free legacy workflows retain automatic routing compatibility.",
@@ -247,7 +248,7 @@ jobs:
             "- Release validation does not submit new paid provider generations or deploy the Broker. Offline render-state and request-contract tests do not establish provider availability, LLM policy reasoning or animation aesthetic quality.",
             "- Includes SHA256 integrity checks and audited even-to-team-release functional parity. Private policy sources, signing material, credentials and local reports are excluded from the runtime distribution.",
             "",
-            "Close Griptape completely and run the included Install_HMB_GP_Production.ps1 after extracting the Runtime ZIP. File-only replacement does not remove legacy editor-environment dependencies. Existing TOS installations prepare the isolated runtime automatically; a fresh TOS installation can use -PrepareTosRuntime. Package downloads occur only during this explicit setup, never during rendering. Normal installation exceptions restore the prior library and environment."
+            "Use Griptape Git Update/Override and then fully restart Griptape once. The cold-load check migrates known legacy environments automatically; an initial stale dependency warning may require a normal library Refresh after successful cleanup. The Runtime ZIP and included Install_HMB_GP_Production.ps1 remain available for explicit installation and recovery. Fresh optional TOS setup can use -PrepareTosRuntime. Do not replace files while a workflow is executing."
           ) | Set-Content -LiteralPath $notesPath -Encoding utf8
           gh release view $env:GITHUB_REF_NAME --repo $repository *> $null
           if ($LASTEXITCODE -eq 0) {

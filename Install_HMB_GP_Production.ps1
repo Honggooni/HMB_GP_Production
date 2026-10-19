@@ -87,114 +87,31 @@ function Repair-HmbTosIsolation {
     # This installer-only migration keeps TOS in a dedicated child interpreter.
     # The original edit environment remains in the rollback directory intact.
     $repair = @'
-import ast, csv, importlib.metadata as metadata, io, json, os, pathlib, re, subprocess, sys
+import ast, hashlib, json, pathlib, sys
 root = pathlib.Path(sys.argv[1]).resolve()
-prepare, clean = sys.argv[2] == '1', sys.argv[3] == '1'
-if sys.version_info[:2] != (3, 12) or root.name != 'HMB_GP_Production' or not root.is_dir():
-    raise SystemExit('Unsupported installer runtime or library root')
-flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-def run(args, *, data=None, timeout=300):
-    result = subprocess.run(args, input=data, capture_output=True, text=True,
-                            timeout=timeout, creationflags=flags)
-    if result.returncode:
-        raise RuntimeError('Isolated dependency setup failed; no credentials or provider request was used')
-    return result.stdout
-def local(path):
-    current = path
-    while current != root:
-        if current.is_symlink() or getattr(current, 'is_junction', lambda: False)():
-            raise RuntimeError('Linked dependency environment is not supported')
-        if current == current.parent or not current.resolve().is_relative_to(root):
-            raise RuntimeError('Dependency environment escaped the installed library')
-        current = current.parent
-    return path
-tos_root = local(root / '.venv-tos')
-tos_python = tos_root / 'Scripts/python.exe'
-report = {'schema': 'hmb-tos-isolation-install/v1', 'prepared': False, 'legacy_packages_removed': [],
-          'engine_backed_duplicates_removed': [], 'removed_versions': {},
-          'provider_calls': 0, 'credentials_read': False}
-if prepare:
-    if not tos_python.is_file():
-        if tos_root.exists():
-            raise RuntimeError('An incomplete TOS environment already exists; its files were preserved')
-        run([sys.executable, '-I', '-B', '-m', 'uv', 'venv', '--python', sys.executable, str(tos_root)])
-        run([sys.executable, '-I', '-B', '-m', 'uv', 'pip', 'install', '--python', str(tos_python), 'tos==2.9.2'])
-    tree = ast.parse((root / 'HMBSeedanceGeneration.py').read_text('utf-8-sig'))
-    values = [ast.literal_eval(item.value) for item in tree.body if isinstance(item, ast.Assign)
-              and any(isinstance(target, ast.Name) and target.id == '_TOS_HELPER_SOURCE' for target in item.targets)]
-    if len(values) != 1 or type(values[0]) is not str or len(values[0]) > 65536:
-        raise RuntimeError('The verified TOS helper is unavailable')
-    request = json.dumps({'version': 1, 'runtime_root': str(tos_root), 'operation': 'probe'})
-    output = run([str(tos_python), '-I', '-B', '-c', values[0]], data=request, timeout=30)
-    if len(output) > 32768:
-        raise RuntimeError('TOS runtime probe exceeded its response limit')
-    probe = json.loads(output)
-    if not (probe.get('version') == 1 and probe.get('ok') is True and probe.get('isolated') is True
-            and pathlib.Path(probe.get('runtime_root', '')).resolve() == tos_root
-            and probe.get('tos_version') == '2.9.2' and probe.get('wrapt_version') == '1.16.0'):
-        raise RuntimeError('TOS runtime isolation probe failed')
-    report['prepared'] = True
-    report['runtime_probe'] = probe
-if clean:
-    edit = local(root / '.venv')
-    site = edit / 'Lib/site-packages'
-    python = edit / 'Scripts/python.exe'
-    if not python.is_file() or not site.is_dir():
-        raise RuntimeError('The legacy edit environment is incomplete; rollback retains it')
-    def norm(value):
-        return re.sub(r'[-_.]+', '-', value).lower()
-    distributions = {norm(item.metadata['Name']): item for item in metadata.distributions(path=[str(site)])}
-    legacy = {'tos', 'wrapt', 'deprecated'} & distributions.keys()
-    from packaging.version import Version
-    known_engine_backed = {'anyio', 'charset-normalizer', 'idna', 'urllib3'}
-    engine_versions = {name: metadata.version(name) for name in known_engine_backed}
-    engine_backed = {name for name in known_engine_backed & distributions.keys()
-                     if Version(distributions[name].version) < Version(engine_versions[name])}
-    removable = legacy | engine_backed
-    removed_versions = {name: distributions[name].version for name in sorted(removable)}
-    # Preserve custom packages rather than silently removing their requirements.
-    # The engine already supplies its own compatible wrapt outside this venv.
-    from packaging.requirements import Requirement
-    for name, item in distributions.items():
-        if name in removable:
-            continue
-        for raw in item.requires or []:
-            requirement = Requirement(raw)
-            if requirement.marker is not None and not requirement.marker.evaluate({'extra': ''}):
-                continue
-            dependency = norm(requirement.name)
-            if dependency in legacy:
-                raise RuntimeError('A custom edit dependency needs a legacy TOS package; original environment preserved')
-            if dependency in engine_backed and (requirement.url is not None or
-                    not requirement.specifier.contains(engine_versions[dependency], prereleases=True)):
-                raise RuntimeError('A custom edit dependency rejects the engine component; original environment preserved')
-    # uv follows wheel RECORD paths while uninstalling. Prove every removable
-    # file stays in the disposable edit copy, including normal Scripts entries.
-    # Missing/foreign records are not permission to delete unverified files.
-    for name in sorted(removable):
-        record = distributions[name].read_text('RECORD')
-        if record is None or not record or len(record) > 2 * 1024 * 1024:
-            raise RuntimeError('A removable package has no file inventory; original environment preserved')
-        # Distribution.files filters out missing paths in Python 3.12. Inspect
-        # the raw CSV as well so a currently absent foreign target is rejected.
-        for member in csv.reader(io.StringIO(record)):
-            if not member or not member[0] or len(member) != 3:
-                raise RuntimeError('A removable package has an invalid file inventory; original environment preserved')
-            file_path = pathlib.Path(distributions[name].locate_file(member[0]))
-            try:
-                file_path.resolve().relative_to(edit.resolve())
-            except (OSError, ValueError):
-                raise RuntimeError('A package file escaped its edit environment; original environment preserved') from None
-            local(file_path)
-    if removable:
-        run([sys.executable, '-I', '-B', '-m', 'uv', 'pip', 'uninstall', '--python', str(python), *sorted(removable)])
-    remaining = {norm(item.metadata['Name']) for item in metadata.distributions(path=[str(site)])}
-    if removable & remaining:
-        raise RuntimeError('Legacy TOS editor packages were not removed')
-    report['legacy_packages_removed'] = sorted(legacy)
-    report['engine_backed_duplicates_removed'] = sorted(engine_backed)
-    report['removed_versions'] = removed_versions
-print(json.dumps(report, ensure_ascii=False))
+source = root / '_hmb_library_bootstrap.py'
+if source.stat().st_size > 1024 * 1024:
+    raise SystemExit('The shared dependency repair exceeds its source limit')
+tree = ast.parse(source.read_text('utf-8-sig'))
+values = [ast.literal_eval(item.value) for item in tree.body if isinstance(item, ast.Assign)
+          and any(isinstance(target, ast.Name) and target.id == '_HMB_TOS_ENVIRONMENT_REPAIR_SOURCE' for target in item.targets)]
+if len(values) != 1 or type(values[0]) is not str or len(values[0]) > 256 * 1024:
+    raise SystemExit('The shared dependency repair is unavailable')
+namespace = {'__name__': '_hmb_installer_shared_repair'}
+exec(compile(values[0], '<HMB isolated environment repair>', 'exec'), namespace)
+request = {'version': 1, 'operation': 'install', 'library_root': str(root),
+           'prepare_runtime': sys.argv[2] == '1', 'clean_legacy': sys.argv[3] == '1',
+           'expected_manifest_sha256': hashlib.sha256((root / 'griptape-nodes-library.json').read_bytes()).hexdigest()}
+try:
+    report = namespace['_repair_request'](request)
+except Exception:
+    raise SystemExit('Isolated dependency migration failed; original rollback data was preserved') from None
+output = json.dumps(report, ensure_ascii=True)
+if len(output.encode()) > 1024 * 1024:
+    raise SystemExit('The shared dependency repair exceeded its response limit')
+print(output)
+if report.get('ok') is not True:
+    raise SystemExit(1)
 '@
     $output = & $python -I -B -c $repair $LibraryRoot ([int]$PrepareRuntime) ([int]$CleanLegacyEnvironment)
     if ($LASTEXITCODE -ne 0) {
@@ -343,6 +260,11 @@ $environmentMigration = $null
 $preservedUserMembers = @()
 $relocatedUserMembers = New-Object 'System.Collections.Generic.List[string]'
 if (Test-Path -LiteralPath $target) {
+    foreach ($migrationLock in @('.hmb-tos-migration.lock', '.hmb-tos-prepare.lock')) {
+        if (Test-Path -LiteralPath (Join-Path $target $migrationLock)) {
+            throw 'An environment migration lock remains. Close Griptape and let its guarded recovery finish before installing; existing files were preserved.'
+        }
+    }
     $reparsePoints = Get-ChildItem -LiteralPath $target -Force -Recurse -ErrorAction Stop |
         Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint }
     if ($reparsePoints) {
@@ -387,7 +309,7 @@ if (Test-Path -LiteralPath $target) {
         $relative = [string]$_.Name
         if ($installMembers.Contains($relative) -or $relative -eq '.hmb-install-receipt.json' -or
             $relative -eq 'release-manifest.json' -or $relative -eq 'SHA256SUMS') { return $false }
-        if ($_.PSIsContainer) { return $relative -in @('reports', 'reviews', 'user-data') }
+        if ($_.PSIsContainer) { return $relative -in @('reports', 'reviews', 'user-data', '.hmb-environment-backups') }
         return $_.Extension.ToLowerInvariant() -in @('.json', '.txt', '.md', '.csv', '.log')
     } | ForEach-Object { [string]$_.Name })
 }

@@ -106,7 +106,17 @@ assert "hmb-install-receipt" in installer
 assert "runtime_fingerprint_sha256" in installer
 assert "foreach ($relative in $relocatedUserMembers)" in installer
 assert "Remove-Item" not in installer
-assert "backup" not in installer.casefold()
+# Recovery journals are preserved user state, never shipped runtime members.
+# Their directory name must not weaken the explicit archive allowlist.
+assert "'.hmb-environment-backups'" in installer
+assert not any("backup" in path.casefold() for path in source_files)
+ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+for generated in (".venv-tos-stage-*/", ".hmb-environment-backups/",
+                  ".hmb-tos-migration.lock", ".hmb-tos-prepare.lock",
+                  ".hmb-tos-runtime-needed.json", ".hmb-tos-runtime-ready.json",
+                  ".hmb-tos-runtime-*.json.*.tmp",
+                  ".hmb-install-receipt.json"):
+    assert generated in ignore.splitlines(), generated
 
 picker = (ROOT / "HMBVideoPickerLibrary.py").read_text(encoding="utf-8")
 assert not (ROOT / "HMB_Agent_Griptape.bat").exists()
