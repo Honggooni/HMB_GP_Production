@@ -45,7 +45,10 @@ normalize_generation = NAMESPACE['_seedance_generation_preview_value']
 
 class LocalDriver:
     def __init__(self, workspace, *, base_url='http://127.0.0.1:8124/workspace'):
-        self.workspace_directory, self.base_url = workspace, base_url
+        # The real LocalStorageDriver compares a resolved workspace when
+        # minting read URLs. Canonicalize this fake as well: a CI TEMP short
+        # path or another alias must not incorrectly mint an external URL.
+        self.workspace_directory, self.base_url = Path(workspace).resolve(), base_url
         self.calls, self.override = [], None
 
     def create_signed_download_url(self, path):
@@ -200,6 +203,20 @@ class LocalOriginalPreviewTests(unittest.TestCase):
         self.assertEqual(result['source'], str(external))
         self.assertIn('/external/', result['url'])
         self.assertEqual(external.read_bytes(), b'external-original')
+
+    def test_workspace_alias_mints_the_same_internal_read_route(self):
+        alias = self.workspace / '..' / 'workspace'
+        self.assertNotEqual(str(alias), str(self.workspace.resolve()))
+        driver = LocalDriver(alias)
+        source = str(self.path)
+        before = self.identity()
+        result = Node(driver, source)._local_original_generation_preview()
+        self.assertEqual(driver.workspace_directory, self.workspace.resolve())
+        self.assertEqual(result['source'], source)
+        self.assertEqual(result['url'], self.driver.create_signed_download_url(self.path.resolve()))
+        self.assertTrue(result['url'].startswith('http://127.0.0.1:8124/workspace/'))
+        self.assertEqual(driver.calls, [self.path.resolve()])
+        self.assertEqual(self.identity(), before)
 
     def test_driver_mismatch_origin_resource_or_fragment_fails_closed(self):
         node = Node(self.driver, str(self.path))
