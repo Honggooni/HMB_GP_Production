@@ -12,7 +12,7 @@ Seedance widget. Media and prompt payloads never enter a process-global
 registry.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from contextlib import contextmanager
 import logging
 import json
@@ -200,6 +200,51 @@ def _bounded_int(value: Any, minimum: int, maximum: int, default: int) -> int:
     return max(minimum, min(maximum, number))
 
 
+def _seedance_execution_mode(node: Any) -> str:
+    """Read durable execution intent without guessing for legacy participants."""
+    getter = getattr(node, "_hmb_seedance_execution_mode", None)
+    if not callable(getter):
+        return ""
+    try:
+        mode = getter()
+    except Exception:
+        return "waiting"
+    return mode if isinstance(mode, str) and mode in {"auto", "only", "shot", "waiting"} else "waiting"
+
+
+def _seedance_requested_identity(node: Any) -> dict[str, Any]:
+    getter = getattr(node, "_hmb_seedance_requested_shot_identity", None)
+    try:
+        identity = getter() if callable(getter) else None
+    except Exception:
+        identity = None
+    return identity if isinstance(identity, dict) else {}
+
+
+def _seedance_catalog_allowed(node: Any, snapshot: Any) -> bool:
+    """Waiting may restore its exact UUID, never a replacement publisher/Shot.
+
+    Only still receives choice metadata. Its node-owned callback is responsible
+    for keeping those choices separate from the user's execution intent.
+    """
+    mode = _seedance_execution_mode(node)
+    if mode not in {"shot", "waiting"}:
+        return True
+    requested = _seedance_requested_identity(node)
+    channel = _clean(requested.get("channel_uuid"), 128)
+    shot = _clean(requested.get("shot_uuid"), 128)
+    if (not channel or not shot or not isinstance(snapshot, dict)
+            or _clean(snapshot.get("channel_uuid"), 128) != channel):
+        return False
+    # A selected Shot must see a same-channel deletion so its node can enter
+    # waiting. Once waiting, only the exact requested Shot can restore it.
+    shots = snapshot.get("shots")
+    return mode == "shot" or isinstance(shots, list) and any(
+        isinstance(row, dict) and _clean(row.get("shot_uuid"), 128) == shot
+        for row in shots
+    )
+
+
 def _subscription_for(node: Any) -> ShotSubscription | None:
     # The host calls ``after_node_deleted`` before removing the object from its
     # retained-mode flow.  Excluding that exact object here prevents one final
@@ -214,6 +259,19 @@ def _subscription_for(node: Any) -> ShotSubscription | None:
     except Exception:
         return None
     normalized = _normalize_subscription(node, raw)
+    if normalized is not None and normalized.kind == KIND_SEEDANCE:
+        mode = _seedance_execution_mode(node)
+        if mode == "only":
+            # Serialized quartet/callback order is never authority to undo an
+            # explicit Only choice or to schedule a managed upstream Agent.
+            normalized = replace(normalized, enabled=False, channel_uuid="", shot_uuid="")
+        elif mode == "waiting":
+            requested = _seedance_requested_identity(node)
+            normalized = replace(
+                normalized, enabled=False,
+                channel_uuid=_clean(requested.get("channel_uuid"), 128),
+                shot_uuid=_clean(requested.get("shot_uuid"), 128),
+            )
     if (normalized is not None
             and normalized.kind in {KIND_PROMPT, KIND_AGENT, KIND_FINISH_LOOK}
             and _is_shot_manager(node)):
@@ -326,6 +384,8 @@ def resolve_shot_agent_owner(node: Any, channel_uuid: str, shot_uuid: str) -> An
 
 
 def _resolve_shot_owner(node: Any, kind: str, channel_uuid: str, shot_uuid: str) -> Any | None:
+    if _seedance_execution_mode(node) in {"only", "waiting"}:
+        return None
     flow_name, nodes = _same_flow_nodes(node)
     if not flow_name or not channel_uuid or not shot_uuid:
         return None
@@ -1185,6 +1245,8 @@ def _create_connection(edge: ShotEdge) -> bool:
 
 
 def _ensure_edge(edge: ShotEdge, subscriptions: dict[str, ShotSubscription]) -> tuple[bool, str]:
+    if _seedance_execution_mode(edge.target) in {"only", "waiting"}:
+        return False, "Seedance execution mode does not accept a managed Shot route"
     if not _has_parameter(edge.source, edge.source_parameter):
         return False, f"missing source parameter {edge.source_parameter}"
     if not _has_parameter(edge.target, edge.target_parameter):
@@ -2071,11 +2133,14 @@ def reconcile_shot_routing(
                         "publisher_unavailable" if not image_sources else "channel_replaced",
                         subscription=recipient,
                     )
+                    waiting_for_shot = _seedance_execution_mode(recipient.node) == "waiting"
                     _notify_status(
                         recipient.node,
-                        ok=True,
-                        code="only",
-                        details="No media Shot publisher is active; prompt-only mode is available.",
+                        ok=not waiting_for_shot,
+                        code="remote_waiting" if waiting_for_shot else "only",
+                        details=("The requested Shot publisher is unavailable; its exact identity is retained."
+                                 if waiting_for_shot
+                                 else "No media Shot publisher is active; prompt-only mode is available."),
                     )
                     continue
                 if (
@@ -2166,9 +2231,13 @@ def reconcile_shot_routing(
                 for recipient in catalog_recipients:
                     if recipient.node is source.node:
                         continue
+                    if (recipient.kind == KIND_SEEDANCE
+                            and not _seedance_catalog_allowed(recipient.node, snapshot)):
+                        continue
                     orphan_replacement = False
                     suspended = getattr(recipient.node, "_hmb_suspended_shot_identity", None)
                     if (recipient.kind == KIND_SEEDANCE and not recipient.enabled
+                            and _seedance_execution_mode(recipient.node) != "only"
                             and isinstance(suspended, dict)
                             and suspended.get("channel_uuid") != source.channel_uuid
                             and len(image_sources) == 1):
@@ -2189,8 +2258,8 @@ def reconcile_shot_routing(
                     # adopt the publisher's active Shot through its guarded
                     # one-shot hook; hydrated/saved Prompts keep their stored
                     # selection. Picker and Agent otherwise retain their own
-                    # subscription, while Seedance adopts the first valid
-                    # remote Shot because it has no standalone mode.
+                    # subscription. Seedance's node-owned callback separates
+                    # explicit Only choices from fresh automatic discovery.
                     if not recipient.channel_uuid and len(image_sources) != 1:
                         continue
                     if recipient.kind == KIND_PROMPT and not recipient.channel_uuid:
@@ -2370,8 +2439,13 @@ def reconcile_shot_routing(
                 for recipient in catalog_recipients:
                     if recipient.kind not in {KIND_SEEDANCE, KIND_COLOR_LUT}:
                         continue
+                    if (recipient.kind == KIND_SEEDANCE
+                            and not _seedance_catalog_allowed(recipient.node, snapshot)):
+                        continue
                     suspended = getattr(recipient.node, "_hmb_suspended_shot_identity", None)
-                    if (recipient.kind == KIND_SEEDANCE and isinstance(suspended, dict)
+                    if (recipient.kind == KIND_SEEDANCE
+                            and _seedance_execution_mode(recipient.node) != "only"
+                            and isinstance(suspended, dict)
                             and suspended.get("channel_uuid") != source.channel_uuid):
                         continue
                     replacement = bool(
@@ -2469,11 +2543,16 @@ def reconcile_shot_routing(
                     # Publish the disconnected UI state only after retained
                     # mode has removed the real edge. Otherwise the widget
                     # would unhide a still-live cable during Shot -> Only.
+                    waiting_for_shot = _seedance_execution_mode(recipient.node) == "waiting"
                     _notify_status(
                         recipient.node,
-                        ok=not clear_failures,
-                        code="only" if not clear_failures else "route_incomplete",
+                        ok=not clear_failures and not waiting_for_shot,
+                        code=("route_incomplete" if clear_failures else "remote_waiting"
+                              if waiting_for_shot else "only"),
                         details=(
+                            "The requested Shot is unavailable; Only has not been selected."
+                            if not clear_failures and waiting_for_shot
+                            else
                             "Only mode has no managed Agent prompt connection."
                             if not clear_failures
                             else "; ".join(clear_failures)
@@ -3108,6 +3187,8 @@ def reconcile_shot_routing(
                     )
                     if not isinstance(snapshot, dict) or not callable(callback):
                         continue
+                    if not _seedance_catalog_allowed(candidate, snapshot):
+                        continue
                     try:
                         callback(snapshot)
                         _mark_authoritative(candidate)
@@ -3144,9 +3225,12 @@ def reconcile_shot_routing(
                 for item in routable_values
                 if item.kind == KIND_SEEDANCE
                 and item.enabled
+                and _seedance_execution_mode(item.node) not in {"only", "waiting"}
                 and id(item.node) not in unresolved_seedance_ids
             ]
             for target in seedance_nodes:
+                if _seedance_execution_mode(target.node) in {"only", "waiting"}:
+                    continue
                 # Only is a real independent mode. A previously assigned
                 # manager's exact physical edge remains its durable ownership
                 # while paused; another available manager must not silently

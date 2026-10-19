@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -578,6 +579,9 @@ FINISH_LOOK_SHOT_SNAPSHOT_SCHEMA = "hmb-finish-look-shot-snapshot"
 FINISH_LOOK_SHOT_SNAPSHOT_VERSION = 2
 SHOT_PICKER_LEGACY_JSON_MAX_BYTES = 1024 * 1024
 SHOT_AUTOCLAIM_ENABLED_PARAMETER = "HMB_SHOT_AUTOCLAIM_ENABLED"
+SEEDANCE_EXECUTION_MODE_METADATA = "hmb_seedance_execution_mode"
+SEEDANCE_EXECUTION_MODE_SCHEMA = "hmb-seedance-execution-mode"
+SEEDANCE_MODE_SELECTION_SCHEMA = "hmb-seedance-mode-selection"
 SHOT_SELECTOR_PARAMETER = "shot_selector"
 SEEDANCE_SHOT_WIDGET_PARAMETER = "HMB_SEEDANCE_SHOT_UI"
 SEEDANCE_SHOT_WIDGET_NAME = "HMBSeedanceGenerationWidget"
@@ -1398,6 +1402,233 @@ AUDIO_MIME_ALIASES = {
 _TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _BROKER_PUBLIC_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _TOS_BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
+
+_TOS_RPC_BYTES = 32 * 1024
+_TOS_RUNTIME_REQUIREMENT = "tos==2.9.2"
+_TOS_HELPER_SOURCE = r'''
+import contextlib, importlib, importlib.metadata, importlib.util, json, logging, re, sys
+from pathlib import Path
+from urllib.parse import urlparse
+
+protocol = sys.stdout
+class DiscardOutput:
+    def write(self, value):
+        return len(value)
+    def flush(self):
+        pass
+sys.stdout = DiscardOutput()
+logging.disable(logging.CRITICAL)
+client = None
+request = {}
+reply = {"version": 1, "ok": False}
+try:
+    raw = sys.stdin.buffer.read(32769)
+    if len(raw) > 32768:
+        raise ValueError("request")
+    request = json.loads(raw)
+    if not isinstance(request, dict) or type(request.get("version")) is not int or request.get("version") != 1:
+        raise ValueError("protocol")
+    root = Path(request["runtime_root"]).resolve(strict=True)
+    if Path(sys.prefix).resolve() != root or sys.prefix == sys.base_prefix or sys.version_info[:2] != (3, 12):
+        raise ValueError("environment")
+    for name, version in (("tos", "2.9.2"), ("wrapt", "1.16.0")):
+        if importlib.metadata.version(name) != version:
+            raise ValueError("dependency")
+        spec = importlib.util.find_spec(name)
+        Path(spec.origin).resolve(strict=True).relative_to(root)
+    if request.get("operation") == "probe":
+        importlib.import_module("tos")
+        importlib.import_module("wrapt")
+        reply = {"version": 1, "ok": True, "runtime_root": str(root),
+                 "python": sys.version.split()[0], "tos_version": "2.9.2",
+                 "wrapt_version": "1.16.0", "isolated": True}
+    else:
+        auth = request["auth"]
+        if not isinstance(auth, dict) or any(not isinstance(auth.get(k), str) or not 0 < len(auth[k]) <= 4096 for k in ("ak", "sk", "endpoint", "region")):
+            raise ValueError("auth")
+        endpoint = urlparse("https://" + auth["endpoint"])
+        if (not re.fullmatch(r"tos(?:-[a-z0-9]+)+\.volces\.com", auth["endpoint"])
+                or endpoint.netloc != auth["endpoint"] or endpoint.path or endpoint.query or endpoint.fragment):
+            raise ValueError("endpoint")
+        bucket, key = request["bucket"], request["key"]
+        if (not isinstance(bucket, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", bucket)
+                or not isinstance(key, str) or not re.fullmatch(r"hmb-seedance-temp/[0-9a-f]{32}\.[a-z0-9]{1,12}", key)):
+            raise ValueError("object")
+        operation = request["operation"]
+        if operation not in {"put", "presign", "delete"}:
+            raise ValueError("operation")
+        tos_module = importlib.import_module("tos")
+        client = tos_module.TosClientV2(auth["ak"], auth["sk"], auth["endpoint"], auth["region"],
+            connection_time=10, socket_timeout=30, max_retry_count=0)
+        if operation == "put":
+            path = Path(request["path"]).resolve(strict=True)
+            if not path.is_file() or not 0 < path.stat().st_size <= 1073741824:
+                raise ValueError("file")
+            content_type = request["content_type"]
+            if not isinstance(content_type, str) or not re.fullmatch(r"[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+", content_type):
+                raise ValueError("content_type")
+            response = client.put_object_from_file(bucket, key, str(path), content_type=content_type)
+            status = int(getattr(response, "status_code", 200) or 200)
+            if not 200 <= status < 300:
+                raise ValueError("upload")
+            reply = {"version": 1, "ok": True, "status_code": status}
+        elif operation == "presign":
+            expires = request["expires"]
+            if type(expires) is not int or not 3600 <= expires <= 2592000:
+                raise ValueError("expires")
+            response = client.pre_signed_url(tos_module.HttpMethodType.Http_Method_Get, bucket, key, expires=expires)
+            value = str(getattr(response, "signed_url", "") or "").strip()
+            parsed = urlparse(value)
+            if (not 0 < len(value) <= 16384 or parsed.scheme != "https" or not parsed.hostname
+                    or parsed.username or parsed.password or parsed.fragment):
+                raise ValueError("signed_url")
+            reply = {"version": 1, "ok": True, "signed_url": value}
+        else:
+            client.delete_object(bucket, key)
+            reply = {"version": 1, "ok": True}
+except BaseException:
+    reply = {"version": 1, "ok": False}
+    # A failed put may have reached storage even when its response was lost.
+    if client is not None and isinstance(request, dict) and request.get("operation") == "put":
+        with contextlib.suppress(Exception):
+            client.delete_object(request["bucket"], request["key"])
+finally:
+    if client is not None:
+        with contextlib.suppress(Exception):
+            client.close()
+    encoded = json.dumps(reply, ensure_ascii=True, separators=(",", ":"))
+    protocol.write(encoded if len(encoded) <= 32768 else '{"version":1,"ok":false}')
+    protocol.flush()
+'''
+
+
+def _isolated_tos_runtime_python() -> Path:
+    """Return only the dedicated, non-system-site-packages TOS environment."""
+    try:
+        library_root = _THIS_DIR.resolve(strict=True)
+        runtime = (library_root / ".venv-tos").resolve(strict=True)
+        runtime.relative_to(library_root)
+        configuration = runtime / "pyvenv.cfg"
+        if configuration.stat().st_size > 16384:
+            raise ValueError("TOS runtime configuration is oversized")
+        data = configuration.read_text(encoding="utf-8")
+        isolation = re.findall(r"(?im)^include-system-site-packages\s*=\s*([^\r\n]+)", data)
+        if [value.strip().lower() for value in isolation] != ["false"]:
+            raise ValueError("TOS runtime must be isolated")
+        # A normal POSIX venv interpreter is a symlink to its base Python.
+        # Invoke the venv entry path so Python reads this environment's cfg;
+        # the child verifies its actual sys.prefix before reading credentials.
+        python = runtime / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        python.parent.resolve(strict=True).relative_to(runtime)
+        if not python.is_file():
+            raise ValueError("TOS runtime interpreter is missing")
+        return python
+    except (OSError, ValueError, RuntimeError):
+        raise RuntimeError(
+            "The isolated Volcengine TOS runtime is not ready. Run the HMB TOS runtime setup "
+            "for this installed library (.venv-tos); no TOS upload or render was submitted."
+        ) from None
+
+
+@dataclass
+class _IsolatedTOSResponse:
+    status_code: int = 200
+    signed_url: str = ""
+
+
+class _IsolatedTOSModule:
+    class HttpMethodType:
+        Http_Method_Get = "GET"
+
+
+class _IsolatedTOSClient:
+    """One bounded stdio child per operation; no TOS import in the engine."""
+
+    def __init__(self, python: Path, auth: dict[str, str], *, is_live: Any) -> None:
+        self._python = python
+        self._runtime_root = python.parent.parent
+        self._auth = dict(auth)
+        self._is_live = is_live
+        self._lock = threading.RLock()
+        self._closed = False
+
+    def _request(self, operation: str, bucket: str, key: str, **arguments: Any) -> dict[str, Any]:
+        with self._lock:
+            if self._closed or operation != "delete" and not self._is_live():
+                raise RuntimeError("TOS media preparation was cancelled; no render was submitted.")
+            request = {"version": 1, "runtime_root": str(self._runtime_root), "auth": self._auth,
+                       "operation": operation, "bucket": bucket, "key": key, **arguments}
+            raw = json.dumps(request, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+            if len(raw) > _TOS_RPC_BYTES:
+                raise RuntimeError("TOS helper request exceeds its bounded contract.")
+            # Proxy variables and unrelated API credentials must not reach this
+            # process. The selected TOS credentials travel only through stdin.
+            environment = {name: os.environ[name] for name in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP") if name in os.environ}
+            process = None
+            try:
+                process = subprocess.Popen(
+                    [str(self._python), "-I", "-B", "-c", _TOS_HELPER_SOURCE],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    cwd=str(self._runtime_root), env=environment, close_fds=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                deadline = time.monotonic() + (180.0 if operation == "put" else 45.0)
+                first = True
+                while True:
+                    if time.monotonic() >= deadline or operation != "delete" and not self._is_live():
+                        raise RuntimeError("TOS helper timed out or media preparation was cancelled.")
+                    try:
+                        output, _unused = process.communicate(input=raw if first else None, timeout=0.1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        first = False
+                if operation != "delete" and not self._is_live():
+                    raise RuntimeError("TOS media preparation was cancelled.")
+                if process.returncode != 0 or len(output) > _TOS_RPC_BYTES:
+                    raise ValueError("TOS helper response")
+                result = json.loads(output)
+                if (not isinstance(result, dict) or type(result.get("version")) is not int or result.get("version") != 1
+                        or result.get("ok") is not True):
+                    raise ValueError("TOS helper operation failed")
+                return result
+            except Exception:
+                # Never propagate SDK stderr, credentials or signed URLs in an
+                # exception chain owned by the native editor.
+                raise RuntimeError("The isolated TOS operation failed or was cancelled. Check its runtime and storage settings.") from None
+            finally:
+                if process is not None and process.poll() is None:
+                    with suppress(Exception):
+                        process.kill()
+                    with suppress(Exception):
+                        process.communicate(timeout=2.0)
+
+    def put_object_from_file(self, bucket: str, key: str, path: str, *, content_type: str) -> _IsolatedTOSResponse:
+        try:
+            result = self._request("put", bucket, key, path=path, content_type=content_type)
+            return _IsolatedTOSResponse(status_code=int(result.get("status_code", 200)))
+        except Exception:
+            with suppress(Exception):
+                self.delete_object(bucket, key)
+            raise
+
+    def pre_signed_url(self, method: Any, bucket: str, key: str, *, expires: int) -> _IsolatedTOSResponse:
+        if method != "GET":
+            raise ValueError("TOS media signing supports only GET.")
+        result = self._request("presign", bucket, key, expires=expires)
+        value = result.get("signed_url")
+        parsed = urlparse(value) if isinstance(value, str) else None
+        if (parsed is None or len(value) > 16384 or parsed.scheme != "https" or not parsed.hostname
+                or parsed.username or parsed.password or parsed.fragment):
+            raise RuntimeError("TOS did not return a signed HTTPS URL.")
+        return _IsolatedTOSResponse(signed_url=value)
+
+    def delete_object(self, bucket: str, key: str) -> None:
+        self._request("delete", bucket, key)
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            self._auth.clear()
 _BEARER_PATTERN = re.compile(r"(?i)Bearer\s+[A-Za-z0-9._~+/=-]+")
 _SIGNED_URL_QUERY_PATTERN = re.compile(
     r"(?i)(?P<base>https?://[^\s'\"<>?#]+)\?[^\s'\"<>#]*"
@@ -3311,6 +3542,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._hmb_shot_route_status: dict[str, Any] = {}
         self._hmb_remote_prompt_route = _seedance_remote_prompt_route_value()
         self._hmb_autoclaim_in_progress = False
+        self._hmb_mode_instance_id = uuid4().hex
+        self._hmb_mode_state_revision = 0
+        self._hmb_mode_state_key = None
 
         self.add_parameter(
             ParameterString(
@@ -6174,6 +6408,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             getattr(self, "_hmb_remote_prompt_route", None),
             self._draft_ui_state(),
         )
+        mode_fields = getattr(self, "_hmb_seedance_mode_widget_fields", None)
+        if callable(mode_fields):
+            next_value.update(mode_fields())
         try:
             current = self.get_parameter_value(SEEDANCE_SHOT_WIDGET_PARAMETER)
         except Exception:
@@ -6297,7 +6534,123 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # equal backend value still reaches a newly mounted React widget once.
         self._sync_seedance_shot_widget()
 
+    def _hmb_seedance_mode_intent(self) -> dict[str, Any]:
+        """Read optional author intent; never treat it as source/media authority.
+
+        Native node metadata is already preserved by old workflow loaders.  No
+        new required parameter or changed legacy save command is introduced.
+        """
+        metadata = getattr(self, "metadata", None)
+        if not isinstance(metadata, dict) or SEEDANCE_EXECUTION_MODE_METADATA not in metadata:
+            return {}
+        raw = metadata[SEEDANCE_EXECUTION_MODE_METADATA]
+        if (not isinstance(raw, dict) or raw.get("schema") != SEEDANCE_EXECUTION_MODE_SCHEMA
+                or type(raw.get("version")) is not int or raw.get("version") != 1 or type(raw.get("revision")) is not int
+                or not 0 < raw["revision"] <= 9007199254740991
+                or type(raw.get("mode")) is not str
+                or raw.get("mode") not in {"only", "shot"}):
+            return {"mode": "invalid", "revision": 0}
+        value = {"mode": raw["mode"], "revision": raw["revision"]}
+        if value["mode"] == "shot":
+            channel, shot = self._shot_uuid(raw.get("channel_uuid")), self._shot_uuid(raw.get("shot_uuid"))
+            if not channel or not shot:
+                return {"mode": "invalid", "revision": raw["revision"]}
+            value.update(channel_uuid=channel, shot_uuid=shot,
+                         shot_number=raw.get("shot_number", 1), shot_name=str(raw.get("shot_name") or "")[:128])
+        return value
+
+    def _hmb_seedance_requested_shot_identity(self) -> dict[str, Any]:
+        intent = self._hmb_seedance_mode_intent()
+        if intent.get("mode") == "shot":
+            return {key: intent[key] for key in ("channel_uuid", "shot_uuid", "shot_number", "shot_name")}
+        if intent:
+            return {}
+        suspended = getattr(self, "_hmb_suspended_shot_identity", None)
+        if isinstance(suspended, dict) and self._shot_uuid(suspended.get("channel_uuid")) and self._shot_uuid(suspended.get("shot_uuid")):
+            return dict(suspended)
+        identity = self._shot_identity()
+        return identity if identity.get("channel_uuid") and identity.get("shot_uuid") else {}
+
+    def _hmb_seedance_execution_mode(self) -> str:
+        intent = self._hmb_seedance_mode_intent()
+        if intent.get("mode") == "only":
+            return "only"
+        if intent.get("mode") == "invalid":
+            return "waiting"
+        identity = self._shot_identity()
+        if intent.get("mode") == "shot":
+            catalog = getattr(self, "_hmb_shot_catalog_snapshot", None)
+            matched = (isinstance(catalog, dict) and catalog.get("channel_uuid") == intent["channel_uuid"]
+                       and any(isinstance(row, dict) and row.get("shot_uuid") == intent["shot_uuid"]
+                               for row in catalog.get("shots", [])))
+            return "shot" if (matched and all(identity.get(key) == intent[key] for key in ("channel_uuid", "shot_uuid"))) else "waiting"
+        if identity.get("channel_uuid") and identity.get("shot_uuid"):
+            return "shot"
+        if self._hmb_seedance_requested_shot_identity():
+            return "waiting"
+        return "auto" if self.get_parameter_value(SHOT_AUTOCLAIM_ENABLED_PARAMETER) is True else "only"
+
+    def _hmb_commit_seedance_mode(self, requested_uuid: str = "") -> None:
+        """Commit one explicit selection without touching media, tasks or controls."""
+        selected = None
+        catalog = getattr(self, "_hmb_shot_catalog_snapshot", None)
+        if requested_uuid:
+            available = self._hmb_available_seedance_shot_catalog(catalog)
+            selected = next((row for row in (available or {}).get("shots", [])
+                             if row.get("shot_uuid") == requested_uuid), None)
+            if selected is None:
+                raise ValueError("The requested Shot is no longer available. Select it again.")
+        revision = self._hmb_seedance_mode_intent().get("revision", 0) + 1
+        if revision > 9007199254740991:
+            raise ValueError("Generator selection revision is exhausted.")
+        value = {"schema": SEEDANCE_EXECUTION_MODE_SCHEMA, "version": 1,
+                 "revision": revision, "mode": "shot" if selected else "only"}
+        if selected is not None:
+            value.update(channel_uuid=catalog["channel_uuid"], shot_uuid=selected["shot_uuid"],
+                         shot_number=selected["number"], shot_name=selected["name"])
+        self.metadata = {**dict(getattr(self, "metadata", {}) or {}), SEEDANCE_EXECUTION_MODE_METADATA: value}
+
+    def _hmb_seedance_mode_widget_fields(self) -> dict[str, Any]:
+        intent = self._hmb_seedance_mode_intent()
+        mode = self._hmb_seedance_execution_mode()
+        pending = self._hmb_seedance_requested_shot_identity()
+        # A legacy bound UUID absent from the UI catalog is a pending Shot,
+        # never evidence that the user explicitly chose independent Only.
+        catalog = getattr(self, "_hmb_shot_catalog_snapshot", None)
+        if mode == "shot" and (not isinstance(catalog, dict)
+                or catalog.get("channel_uuid") != pending.get("channel_uuid")
+                or not any(row.get("shot_uuid") == pending.get("shot_uuid") for row in catalog.get("shots", []) if isinstance(row, dict))):
+            mode = "waiting"
+        requested = ("shot" if intent.get("mode") == "invalid" else intent.get("mode")) or ("shot" if pending else "only" if mode == "only" else "auto")
+        fields = {"execution_mode": mode, "requested_mode": requested,
+                  "execution_mode_revision": intent.get("revision", 0),
+                  "pending_shot": {"channel_uuid": str(pending.get("channel_uuid") or ""),
+                                   "shot_uuid": str(pending.get("shot_uuid") or ""),
+                                   "number": pending.get("shot_number", 1), "name": str(pending.get("shot_name") or "")[:128]}}
+        key = json.dumps(fields, sort_keys=True, ensure_ascii=False)
+        if key != getattr(self, "_hmb_mode_state_key", None):
+            self._hmb_mode_state_key = key
+            self._hmb_mode_state_revision = int(getattr(self, "_hmb_mode_state_revision", 0)) + 1
+        if not getattr(self, "_hmb_mode_instance_id", ""):
+            self._hmb_mode_instance_id = uuid4().hex
+        return {**fields, "execution_mode_state_revision": self._hmb_mode_state_revision,
+                "execution_mode_instance": self._hmb_mode_instance_id}
+
+    def _assert_only_mode_inputs(self) -> None:
+        """Only never invokes a shared Shot Agent/Prompt manager implicitly."""
+        if self._hmb_seedance_execution_mode() != "only":
+            return
+        source = self._manual_agent_prompt_source()
+        manager_api = getattr(source, "_hmb_shot_manager_enabled", None)
+        if callable(manager_api) and manager_api():
+            raise _AgentResultUnavailable(
+                "Only mode cannot run the shared HMB Shot Agent. Use a Standard Agent or a direct prompt, or explicitly select a Shot.")
+
     def _shot_identity(self) -> dict[str, Any]:
+        intent_getter = getattr(self, "_hmb_seedance_mode_intent", None)
+        intent = intent_getter() if callable(intent_getter) else {}
+        if intent.get("mode") == "only":
+            return {"channel_uuid": "", "shot_uuid": "", "shot_number": 1, "shot_name": SHOT_ONLY_LABEL}
         channel = self._shot_uuid(self.get_parameter_value(SHOT_CHANNEL_UUID_PARAMETER))
         shot_uuid = self._shot_uuid(self.get_parameter_value(SHOT_UUID_PARAMETER))
         bound = bool(channel and shot_uuid)
@@ -6464,6 +6817,20 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         snapshot = self._validate_shot_catalog_snapshot(routing_snapshot)
         identity = self._shot_identity()
         suspended = getattr(self, "_hmb_suspended_shot_identity", None)
+        intent_getter = getattr(self, "_hmb_seedance_mode_intent", None)
+        intent = intent_getter() if callable(intent_getter) else {}
+        if intent.get("mode") == "invalid":
+            self._hmb_shot_route_status = {"ok": False, "code": "mode_invalid", "details": "Select Only or a valid Shot again."}
+            return
+        if intent.get("mode") == "only":
+            identity = {"channel_uuid": "", "shot_uuid": ""}
+            suspended = None
+        elif intent.get("mode") == "shot":
+            identity = {key: intent[key] for key in ("channel_uuid", "shot_uuid", "shot_number", "shot_name")}
+            if identity["channel_uuid"] != snapshot["channel_uuid"]:
+                self._hmb_shot_route_status = {"ok": False, "code": "remote_waiting", "details": "Waiting for the selected Shot publisher."}
+                return
+            suspended = identity
         if (not identity["shot_uuid"] and isinstance(suspended, dict)
                 and suspended.get("channel_uuid") == snapshot["channel_uuid"]):
             identity = suspended
@@ -6507,7 +6874,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # inherited its display number; only a fresh, still-auto-claiming node
         # may adopt the first available UUID.
         fallback_to_available = bool(
-            not identity.get("shot_uuid")
+            not intent
+            and not identity.get("shot_uuid")
             and not isinstance(suspended, dict)
             and self.get_parameter_value(SHOT_AUTOCLAIM_ENABLED_PARAMETER)
         )
@@ -6588,6 +6956,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             "code": "remote_waiting",
             "details": str(reason or "publisher_unavailable").strip()[:128],
         }
+        mode_getter = getattr(self, "_hmb_seedance_execution_mode", None)
+        if callable(mode_getter) and mode_getter() == "only":
+            self._hmb_shot_route_status.update(ok=True, code="only", details="Only mode has no managed Shot dependency.")
         return self._hmb_shot_channel_subscription()
 
     def _hmb_reject_duplicate_shot_selection(
@@ -7089,6 +7460,37 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     self._hmb_pending_generation_command_id = action_id
                     self._hmb_pending_generation_command_action = "refresh_existing"
         elif parameter.name == SEEDANCE_SHOT_WIDGET_PARAMETER:
+            self._hmb_generation_action_only_update = False
+            selection_request = value.get("selection_request") if isinstance(value, dict) else None
+            current_mode = getattr(self, "_hmb_seedance_mode_widget_fields", None)
+            if (not self._hmb_shot_syncing and callable(current_mode)
+                    and isinstance(value, dict)
+                    and (selection_request is not None or "execution_mode" in value)):
+                fields = current_mode()
+                raw_shot = value.get("shot") if isinstance(value.get("shot"), dict) else {}
+                requested_uuid = self._shot_uuid(raw_shot.get("shot_uuid"))
+                valid_request = (
+                    isinstance(selection_request, dict)
+                    and selection_request.get("schema") == SEEDANCE_MODE_SELECTION_SCHEMA
+                    and selection_request.get("version") == 1
+                    and type(selection_request.get("expected_revision")) is int
+                    and selection_request["expected_revision"] == fields["execution_mode_revision"]
+                    and selection_request.get("expected_instance") == fields["execution_mode_instance"]
+                    and selection_request.get("mode") == ("shot" if requested_uuid else "only")
+                )
+                if valid_request and requested_uuid:
+                    available = self._hmb_available_seedance_shot_catalog(self._hmb_shot_catalog_snapshot) or {}
+                    valid_request = (self._shot_uuid(raw_shot.get("channel_uuid")) == available.get("channel_uuid")
+                                     and any(row.get("shot_uuid") == requested_uuid for row in available.get("shots", [])))
+                if not valid_request and value.get("request") != {"action": "refresh_existing"}:
+                    # Progress/property echoes are not user mode selections.
+                    # Return the canonical state without advancing mode intent.
+                    self._hmb_generation_action_only_update = True
+                    canonical = _seedance_widget_value(
+                        self._shot_identity(), self._hmb_available_seedance_shot_catalog(self._hmb_shot_catalog_snapshot),
+                        self._generation_preview_for_widget(), getattr(self, "_hmb_remote_prompt_route", None), self._draft_ui_state())
+                    canonical.update(fields)
+                    return canonical
             request = value.get("request") if isinstance(value, dict) else None
             action_only = bool(
                 isinstance(request, dict)
@@ -7145,6 +7547,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 self._generation_preview_for_widget(),
                 getattr(self, "_hmb_remote_prompt_route", None),
             )
+            if callable(current_mode):
+                normalized.update(current_mode())
+            if isinstance(selection_request, dict) and not action_only:
+                normalized["selection_request"] = dict(selection_request)
         parent = getattr(super(), "before_value_set", None)
         if callable(parent):
             parent_value = parent(parameter, normalized)
@@ -7247,6 +7653,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 if isinstance(value, dict) and isinstance(value.get("shot"), dict)
                 else ""
             )
+            commit_mode = getattr(self, "_hmb_commit_seedance_mode", None)
+            if not self._hmb_autoclaim_in_progress and callable(commit_mode):
+                commit_mode(self._shot_uuid(requested))
             self._apply_seedance_shot_selection(
                 requested,
                 fallback_to_available=bool(requested),
@@ -7261,6 +7670,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     False,
                 )
             selected = self._hmb_shot_selector_map.get(str(value or ""))
+            commit_mode = getattr(self, "_hmb_commit_seedance_mode", None)
+            if not self._hmb_autoclaim_in_progress and callable(commit_mode):
+                commit_mode(selected.get("shot_uuid", "") if isinstance(selected, dict) else "")
             self._apply_seedance_shot_selection(
                 selected.get("shot_uuid") if isinstance(selected, dict) else "",
                 fallback_to_available=isinstance(selected, dict),
@@ -8788,7 +9200,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # A newly added or deserialized Seedance node may still have a blank
         # durable quartet. Reconcile the same-flow catalog before deciding
         # whether remote execution can proceed; a missing catalog fails closed.
-        self._reconcile_shared_shot_routing(strict=True)
+        mode_getter = getattr(self, "_hmb_seedance_execution_mode", None)
+        if not callable(mode_getter) or mode_getter() != "only":
+            self._reconcile_shared_shot_routing(strict=True)
+        if callable(mode_getter) and mode_getter() == "waiting":
+            raise ValueError("The selected Shot is waiting for its original library binding. Restore that Shot, or explicitly select Only.")
+        only_guard = getattr(self, "_assert_only_mode_inputs", None)
+        if callable(only_guard):
+            only_guard()
         selection = self._capture_imageasset_project_selection()
         params = {**params, **selection["project"], "_hmb_imageasset_project_selection": selection}
         subscription = self._hmb_shot_channel_subscription()
@@ -9036,6 +9455,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         sources: dict[int, dict[str, Any]] = {}
         edges: set[tuple[int, str, int, str]] = set()
         supported = {"HMBImageAssetLibrary", "HMBPromptLibrary", "HMBAgentLibrary"}
+        intent_getter = getattr(self, "_hmb_seedance_mode_intent", None)
+        mode_intent = intent_getter() if callable(intent_getter) else {}
+        independent = mode_intent.get("mode") == "only"
+        mode_guard = ({"mode_guard": {key: mode_intent.get(key) for key in
+                       ("mode", "channel_uuid", "shot_uuid")}}
+                      if mode_intent.get("mode") in {"only", "shot"} else {})
 
         def registered(node: Any) -> None:
             name = str(getattr(node, "name", "") or "")
@@ -9079,6 +9504,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         raise ValueError("ImageAsset project edge target does not match its registered node.")
                     target = str(getattr(edge, "target_parameter_name", "") or "")
                     source_port = str(getattr(edge, "source_parameter_name", "") or "")
+                    if independent and node_kind == "generator" and target in {
+                        SHOT_ASSET_INPUT_PARAMETER, "SHOT_PROMPT_IN", "SHOT_IMAGE_IN", "SHOT_VIDEO_IN", "prompt"
+                    }:
+                        # Only's project comes from its explicit selector or a
+                        # manually connected IMAGE_OUT, never a managed Shot chain.
+                        continue
                     allowed: dict[str, set[str]] = {}
                     strict = False
                     if node_kind == "generator":
@@ -9122,7 +9553,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             if explicit_project:
                 return {"schema": ONLY_PROJECT_SELECTION_SCHEMA, "project": explicit_project,
                         "flow": flow_name, "owner": id(self), "sources": [], "edges": [],
-                        "selection_source": "only_explicit"}
+                        "selection_source": "only_explicit", **mode_guard}
             if self._draft_only_mode():
                 raise _ProjectSelectionRequired(
                     "Select Project (Only), or connect an ImageAsset library project, before rendering.")
@@ -9134,7 +9565,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise ValueError("The Only project selection does not match the connected ImageAsset project.")
         return {"schema": PROJECT_SELECTION_SCHEMA, "project": dict(identities[0]),
                 "flow": flow_name, "owner": id(self),
-                "sources": sorted(sources), "edges": sorted(edges)}
+                "sources": sorted(sources), "edges": sorted(edges), **mode_guard}
 
     def _selected_only_project(self) -> dict[str, str]:
         value = self.get_parameter_value(ONLY_PROJECT_PARAMETER)
@@ -9682,6 +10113,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         return params
 
     def _draft_only_mode(self) -> bool:
+        mode_getter = getattr(self, "_hmb_seedance_execution_mode", None)
+        mode = mode_getter() if callable(mode_getter) else ""
+        if mode == "only":
+            return True
+        if mode == "waiting":
+            return False
         identity = self._shot_identity()
         return bool(not identity.get("shot_uuid") and self.get_parameter_value(SHOT_SELECTOR_PARAMETER) == SHOT_ONLY_LABEL)
 
@@ -10245,6 +10682,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         params = self._get_parameters()
         if params.get("resume_generation_id") or params.get("draft_action") == DRAFT_ACTION_FINAL:
             return params
+        only_guard = getattr(self, "_assert_only_mode_inputs", None)
+        if callable(only_guard):
+            only_guard()
         # Hidden ImageAsset/VideoPicker Shot wires are authoritative but are not
         # represented in the public parameter lists. Resolve them during
         # StartFlow validation as well as execution so a valid media-backed Shot
@@ -10262,15 +10702,34 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             params["prompt"] = "HMB connected prompt pending execution"
         return params
 
+    def _validate_local_render_preflight(self) -> dict[str, Any]:
+        """Validate this render before its managed Agent or billable submission."""
+        params = self._get_parameters_for_start_validation()
+        self._validate_parameters(params)
+        if not params.get("resume_generation_id"):
+            self._validate_broker_model(params.get("model_id"))
+        return params
+
+    def _record_local_render_preflight(self) -> None:
+        # SDK validation exceptions reject the entire Flow, including unrelated
+        # Shots. Keep native structural errors global, but recheck HMB render
+        # admission at execution and publish this Shot's explicit Skipped result.
+        # This record is diagnostic only: a later repaired binding must recover.
+        try:
+            self._validate_local_render_preflight()
+        except Exception as exc:
+            self._hmb_local_preflight_failure = self._safe_exception_message(exc)
+        else:
+            self._hmb_local_preflight_failure = ""
+
+    def validate_before_workflow_run(self) -> list[Exception] | None:
+        exceptions = super().validate_before_workflow_run() or []
+        self._record_local_render_preflight()
+        return exceptions or None
+
     def validate_before_node_run(self) -> list[Exception] | None:
         exceptions = super().validate_before_node_run() or []
-        try:
-            params = self._get_parameters_for_start_validation()
-            self._validate_parameters(params)
-            if not params.get("resume_generation_id"):
-                self._validate_broker_model(params.get("model_id"))
-        except Exception as exc:
-            exceptions.append(exc)
+        self._record_local_render_preflight()
         return exceptions or None
 
     @staticmethod
@@ -10772,26 +11231,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             )
         endpoint = self._normalize_tos_endpoint(params["tos_endpoint"])
         region = str(params["tos_region"] or "").strip()
-        try:
-            tos_module = importlib.import_module("tos")
-        except ImportError as exc:
-            raise RuntimeError(
-                "The Volcengine TOS Python SDK is not installed. Reinstall or "
-                "upgrade the HMB library so its pinned tos dependency is installed."
-            ) from exc
-        try:
-            client = tos_module.TosClientV2(
-                access_key,
-                secret_key,
-                endpoint,
-                region,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "Could not initialize the Volcengine TOS client. Check TOS Region, "
-                "Endpoint, and the separately scoped TOS credentials."
-            ) from exc
-        return tos_module, client, bucket_name
+        python = _isolated_tos_runtime_python()
+        client = _IsolatedTOSClient(
+            python,
+            {"ak": access_key, "sk": secret_key, "endpoint": endpoint, "region": region},
+            is_live=lambda: not bool(getattr(self, "_hmb_node_deleted", False))
+            and not bool(getattr(self, "is_cancellation_requested", False))
+            and self._runtime_node_is_live(require_registered=True),
+        )
+        return _IsolatedTOSModule, client, bucket_name
 
     @staticmethod
     def _resolve_local_video_path(value: str) -> Path:
@@ -14395,6 +14843,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         self._hmb_agent_submission_prompt = None
         self._hmb_managed_agent_request = None
         try:
+            try:
+                self._validate_local_render_preflight()
+            except Exception as exc:
+                self._hmb_local_preflight_failure = self._safe_exception_message(exc)
+                self._publish_agent_result_skipped(
+                    "Render preflight failed before Agent execution or submission: "
+                    + self._hmb_local_preflight_failure
+                    + " Independent Shots continue."
+                )
+                return
+            self._hmb_local_preflight_failure = ""
             await self._prepare_managed_agent_shot()
             self._assert_agent_result_available()
             await self._process_generation()
@@ -14558,6 +15017,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         their normal upstream execution contract.
         """
         if str(self.get_parameter_value("resume_generation_id") or "").strip() or self._draft_final_requested():
+            return
+        mode_getter = getattr(self, "_hmb_seedance_execution_mode", None)
+        if callable(mode_getter) and mode_getter() == "only":
+            self._assert_only_mode_inputs()
             return
         source = self._manual_agent_prompt_source()
         enabled = getattr(source, "_hmb_shot_manager_enabled", None)

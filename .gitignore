@@ -1,5 +1,6 @@
 # Local runtimes, caches, and generated state
 .venv/
+.venv-tos/
 .tmp/
 __pycache__/
 *.py[cod]

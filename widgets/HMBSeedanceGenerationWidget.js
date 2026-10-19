@@ -1,4 +1,6 @@
 const HMB_SHOT_ONLY_KEY = "__hmb_shot_only__";
+const HMB_SHOT_WAITING_KEY = "__hmb_shot_waiting__";
+const HMB_SEEDANCE_MODE_SELECTION_SCHEMA = "hmb-seedance-mode-selection";
 const HMB_SEEDANCE_PREVIEW_SCHEMA = "hmb-seedance-generation-preview";
 const HMB_SEEDANCE_PREVIEW_VERSION = 1;
 const HMB_SEEDANCE_COMMAND_SCHEMA = "hmb-seedance-refresh-command";
@@ -375,6 +377,45 @@ export function hmbSeedanceShotCatalog(value) {
   };
 }
 
+function hmbSeedanceModeFields(source) {
+  if (!Object.prototype.hasOwnProperty.call(source, "execution_mode")) return null;
+  const valid = ["auto", "only", "shot", "waiting"].includes(source.execution_mode)
+    && ["auto", "only", "shot"].includes(source.requested_mode)
+    && (source.execution_mode !== "only" || source.requested_mode === "only")
+    && (source.requested_mode !== "only" || source.execution_mode === "only")
+    && Number.isSafeInteger(source.execution_mode_revision) && source.execution_mode_revision >= 0
+    && Number.isSafeInteger(source.execution_mode_state_revision) && source.execution_mode_state_revision >= 0
+    && /^[0-9a-f]{32}$/.test(String(source.execution_mode_instance || ""));
+  // A partial modern snapshot cannot assert independent execution. Old hosts
+  // without mode fields retain the legacy selector contract below.
+  return valid ? {
+    execution_mode: source.execution_mode,
+    requested_mode: source.requested_mode,
+    execution_mode_revision: source.execution_mode_revision,
+    execution_mode_state_revision: source.execution_mode_state_revision,
+    execution_mode_instance: source.execution_mode_instance,
+  } : { execution_mode: "auto", requested_mode: "auto", execution_mode_revision: 0,
+    execution_mode_state_revision: 0, execution_mode_instance: "" };
+}
+
+function hmbSeedanceShotIdentity(value) {
+  const channel = uuid(value?.channel_uuid);
+  const shot = uuid(value?.shot_uuid);
+  if (!channel || !shot) return null;
+  return { channel_uuid: channel, shot_uuid: shot,
+    number: boundedInteger(value.number, { min: 1, max: 5 }), name: text(value.name, 160) };
+}
+
+function hmbSeedanceSelectionRequest(source, mode) {
+  const request = source.selection_request;
+  return mode?.execution_mode_instance && request?.schema === HMB_SEEDANCE_MODE_SELECTION_SCHEMA
+    && request.version === 1 && ["only", "shot"].includes(request.mode)
+    && request.expected_revision === mode.execution_mode_revision
+    && request.expected_instance === mode.execution_mode_instance
+    ? { schema: HMB_SEEDANCE_MODE_SELECTION_SCHEMA, version: 1, mode: request.mode,
+      expected_revision: request.expected_revision, expected_instance: request.expected_instance } : null;
+}
+
 export function hmbSeedanceShotState(props) {
   const candidate = props?.value ?? props?.parameterValue ?? props?.defaultValue;
   let raw = candidate;
@@ -386,11 +427,17 @@ export function hmbSeedanceShotState(props) {
   const requested = source.shot && typeof source.shot === "object" ? source.shot : {};
   const requestedChannel = uuid(requested.channel_uuid);
   const requestedUuid = uuid(requested.shot_uuid);
-  const requestedSelection = catalog.channel_uuid === requestedChannel
-    ? catalog.shots?.find((shot) => shot.shot_uuid === requestedUuid) || null
+  const mode = hmbSeedanceModeFields(source);
+  const request = hmbSeedanceSelectionRequest(source, mode);
+  const pendingShot = hmbSeedanceShotIdentity(source.pending_shot) || hmbSeedanceShotIdentity(requested);
+  const selection = mode?.requested_mode === "shot" && !request ? pendingShot : null;
+  const selectionChannel = selection?.channel_uuid || requestedChannel;
+  const selectionUuid = selection?.shot_uuid || requestedUuid;
+  const requestedSelection = catalog.channel_uuid === selectionChannel
+    ? catalog.shots?.find((shot) => shot.shot_uuid === selectionUuid) || null
     : null;
-  const selected = requestedSelection || null;
-  return {
+  const selected = mode?.execution_mode === "only" && !request ? null : requestedSelection || null;
+  const state = {
     schema: "hmb-seedance-shot-ui",
     schema_version: 2,
     shot_catalog: catalog,
@@ -399,7 +446,7 @@ export function hmbSeedanceShotState(props) {
       shot_uuid: selected.shot_uuid,
       number: selected.number,
       name: selected.name,
-    } : {
+    } : mode && (request?.mode === "shot" || mode.requested_mode === "shot") && pendingShot ? pendingShot : {
       channel_uuid: "",
       shot_uuid: "",
       number: 1,
@@ -411,6 +458,12 @@ export function hmbSeedanceShotState(props) {
       : source.draft),
     remote_prompt_route: hmbSeedanceRemotePromptRoute(source),
   };
+  if (mode) {
+    Object.assign(state, mode);
+    state.pending_shot = pendingShot || { channel_uuid: "", shot_uuid: "", number: 1, name: "" };
+    if (request) state.selection_request = request;
+  }
+  return state;
 }
 
 export function hmbSeedanceDraftState(value) {
@@ -445,6 +498,8 @@ export function hmbSeedanceShotOptions(state) {
     only: true,
     waiting: false,
   }];
+  if (hmbSeedanceShotWaiting(state)) options.unshift({ key: HMB_SHOT_WAITING_KEY,
+    channel_uuid: "", shot_uuid: "", number: 1, name: hmbSeedanceModeLabel(state), only: false, waiting: true });
   if (!catalog?.channel_uuid || !Array.isArray(catalog.shots) || !catalog.shots.length) {
     return options;
   }
@@ -463,6 +518,10 @@ export function hmbSeedancePaletteShotNumber(state) {
   const shot = state?.shot && typeof state.shot === "object" ? state.shot : {};
   const catalog = state?.shot_catalog && typeof state.shot_catalog === "object"
     ? state.shot_catalog : {};
+  if (state?.execution_mode && hmbSeedanceShotWaiting(state)) {
+    const pending = state.pending_shot || shot;
+    return HMB_SEEDANCE_JEWEL_NIGHT_PALETTE[pending.number] ? pending.number : 1;
+  }
   if (!shot.channel_uuid || !shot.shot_uuid || catalog.channel_uuid !== shot.channel_uuid) return 1;
   const selected = (catalog.shots || []).find((item) => item.shot_uuid === shot.shot_uuid);
   return selected && HMB_SEEDANCE_JEWEL_NIGHT_PALETTE[selected.number] ? selected.number : 1;
@@ -473,13 +532,13 @@ export function hmbSeedanceShotAccent(state) {
 }
 
 function optionLabel(item) {
+  if (item.waiting) return item.name;
   if (item.only) return "Only";
   return `${String(item.number).padStart(2, "0")} · ${item.name}`;
 }
 
 function optionMarkup(state) {
-  const currentKey = state.shot.channel_uuid && state.shot.shot_uuid
-    ? `${state.shot.channel_uuid}\u001f${state.shot.shot_uuid}` : HMB_SHOT_ONLY_KEY;
+  const currentKey = hmbSeedanceShotKey(state);
   return hmbSeedanceShotOptions(state).map((item) => {
     const label = optionLabel(item);
     return `<option value="${escapeHtml(item.key)}"${item.key === currentKey ? " selected" : ""}${item.waiting ? " disabled" : ""}>${escapeHtml(label)}</option>`;
@@ -491,18 +550,18 @@ export function hmbSeedanceSyncShotSelect(select, state) {
   const desired = hmbSeedanceShotOptions(state).map((item) => ({
     value: item.key,
     label: optionLabel(item),
+    disabled: item.waiting === true,
   }));
   const current = Array.from(select.options || []);
   const optionsChanged = current.length !== desired.length || desired.some((item, index) => {
     const option = current[index];
     return !option
       || String(option.value) !== item.value
-      || String(option.textContent ?? option.text ?? "") !== item.label;
+      || String(option.textContent ?? option.text ?? "") !== item.label
+      || Boolean(option.disabled) !== item.disabled;
   });
   if (optionsChanged) select.innerHTML = optionMarkup(state);
-  const expected = state.shot.channel_uuid && state.shot.shot_uuid
-    ? `${state.shot.channel_uuid}\u001f${state.shot.shot_uuid}`
-    : HMB_SHOT_ONLY_KEY;
+  const expected = hmbSeedanceShotKey(state);
   if (String(select.value || "") !== expected) select.value = expected;
   select.disabled = false;
   return optionsChanged;
@@ -559,7 +618,7 @@ function render(state) {
         <div class="hmb-seedance-shot__title">HMBSeedanceGeneration</div>
         <span class="hmb-seedance-shot__status" role="status" aria-live="polite" aria-atomic="true"></span>
         <button type="button" class="hmb-seedance-shot__final nodrag" data-hmb-seedance-finalize-draft hidden disabled title="완료된 Draft로 현재 Generator만 1회 실행해 1080p로 받습니다. 현재 프롬프트·소스·설정은 다시 전송하지 않으며 Agent도 재실행하지 않습니다. MOV 기본 · MOV 미지원 시 MP4.">Draft final</button>
-        <span class="hmb-seedance-shot__number" data-seedance-shot-number>${state.shot.shot_uuid ? String(state.shot.number).padStart(2, "0") : "Only"}</span>
+        <span class="hmb-seedance-shot__number" data-seedance-shot-number>${hmbSeedanceShotBadge(state)}</span>
         <select class="hmb-seedance-shot__select nodrag" aria-label="Shot">${optionMarkup(state)}</select>
       </div>
     </div>`;
@@ -860,6 +919,7 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
   let observedRoot = null;
   let syncQueued = false;
   let closeDialog = null;
+  let syncDialogDisabled = null;
   let disposed = false;
 
   const detachButton = () => {
@@ -909,9 +969,18 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
         HMB_SEEDANCE_BROKER_DIALOGS.delete(ownerDocument);
       }
       if (closeDialog === close) closeDialog = null;
+      if (syncDialogDisabled === syncDisabled) syncDialogDisabled = null;
       if (!disposed && ownsDialog) button?.focus?.();
     };
     closeDialog = close;
+    const syncDisabled = () => {
+      if (closed || pending) return;
+      const disabled = Boolean(latestProps?.disabled);
+      if (input.disabled !== disabled) input.disabled = disabled;
+      if (save.disabled !== disabled) save.disabled = disabled;
+    };
+    syncDialogDisabled = syncDisabled;
+    syncDisabled();
     HMB_SEEDANCE_BROKER_DIALOGS.set(ownerDocument, close);
     const stop = (event) => event.stopPropagation?.();
     backdrop.addEventListener("pointerdown", stop);
@@ -940,7 +1009,7 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
     form.addEventListener("submit", async (event) => {
       event.preventDefault?.();
       event.stopPropagation?.();
-      if (pending) return;
+      if (pending || latestProps?.disabled) return;
       const parsed = hmbSeedanceNormalizeBrokerUrl(input.value);
       if (!parsed.ok) { error.textContent = parsed.error; input.focus?.(); return; }
       if (typeof latestProps?.onChange !== "function") {
@@ -958,7 +1027,7 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
         if (disposed || closed) return;
         error.textContent = "브로커 주소를 저장하지 못했습니다. 주소와 연결 상태를 확인하세요.";
         pending = false;
-        save.disabled = false;
+        save.disabled = Boolean(latestProps?.disabled);
         cancel.disabled = false;
       }
     });
@@ -1063,6 +1132,7 @@ function hmbSeedanceBrokerSettingsWidget(container, props) {
     cleanup,
     update(nextProps) {
       latestProps = nextProps || {};
+      syncDialogDisabled?.();
       hmbSeedanceMakeCommandContainerInert(container);
       syncButton();
       observeRoot();
@@ -2136,34 +2206,114 @@ function refresh(container, props) {
   if (select) hmbSeedanceSyncShotSelect(select, state);
   const numberBadge = root.querySelector?.("[data-seedance-shot-number]");
   if (numberBadge) {
-    numberBadge.textContent = state.shot.shot_uuid
-      ? String(state.shot.number).padStart(2, "0")
-      : "Only";
+    numberBadge.textContent = hmbSeedanceShotBadge(state);
   }
   hmbSeedanceSyncDraftAction(container, state);
   const error = container.__hmbSeedanceShotChangeError || "";
   const draftError = container.__hmbSeedanceDraftError?.message || "";
   hmbSeedanceSetStatus(
     container,
-    error ? "Save failed · previous Shot restored" : draftError,
-    error || draftError,
+    error ? "Save failed · previous Shot restored" : container.__hmbSeedanceModeSelectionError || draftError,
+    error || container.__hmbSeedanceModeSelectionError || draftError,
   );
   hmbSeedanceSyncPreviewOverlay(container, state);
   installPreviewObserver(container);
   hmbSeedanceSyncRemotePromptEdge(container, state);
+  container.__hmbSeedanceFlushShotQueue?.();
   return true;
 }
 
+function hmbSeedanceShotWaiting(state) {
+  if (!state?.execution_mode) return false;
+  if (state.selection_request) return true;
+  if (state.execution_mode === "only") return false;
+  return state.execution_mode !== "shot" || !state.shot?.shot_uuid
+    || state.shot_catalog?.channel_uuid !== state.shot.channel_uuid
+    || !(state.shot_catalog.shots || []).some((shot) => shot.shot_uuid === state.shot.shot_uuid);
+}
+
+function hmbSeedanceModeLabel(state) {
+  if (state.selection_request?.mode === "only") return "Only · 적용 중";
+  if (state.selection_request?.mode === "shot") return "샷 선택 적용 중";
+  return state.requested_mode === "shot" || state.execution_mode === "waiting" ? "샷 연결 대기" : "선택 대기";
+}
+
+function hmbSeedanceShotBadge(state) {
+  if (hmbSeedanceShotWaiting(state)) return "대기";
+  return state.shot.shot_uuid ? String(state.shot.number).padStart(2, "0") : "Only";
+}
+
 function hmbSeedanceShotKey(state) {
+  if (hmbSeedanceShotWaiting(state)) return HMB_SHOT_WAITING_KEY;
   return state?.shot?.shot_uuid
     ? `${state.shot.channel_uuid}\u001f${state.shot.shot_uuid}` : HMB_SHOT_ONLY_KEY;
 }
 
+function hmbSeedanceModeIntentKey(state) {
+  if (state.requested_mode !== "shot") return state.requested_mode;
+  const shot = state.pending_shot || state.shot;
+  return `shot\u001f${shot.channel_uuid}\u001f${shot.shot_uuid}`;
+}
+
+function hmbSeedanceClearShotSelection(container, clearQueue = false) {
+  clearTimeout(container.__hmbSeedanceShotSelectionTimeout);
+  delete container.__hmbSeedanceShotSelectionTimeout;
+  delete container.__hmbSeedancePendingShot;
+  if (clearQueue) delete container.__hmbSeedanceQueuedShot;
+}
+
 function hmbSeedanceResolveShotEcho(container, incomingProps) {
   const pending = container.__hmbSeedancePendingShot;
-  if (!pending || incomingProps === container.__hmbSeedanceLatestProps) return { props: incomingProps, stale: false };
   const incoming = hmbSeedanceShotState(incomingProps);
-  const retained = hmbSeedanceShotState(container.__hmbSeedanceLatestProps);
+  const retainedProps = container.__hmbSeedanceLatestProps;
+  const retained = hmbSeedanceShotState(retainedProps);
+  const reject = () => ({ props: retainedProps, stale: true });
+  const instance = incoming.execution_mode_instance;
+  const baseline = container.__hmbSeedanceModeBaseline;
+  if (baseline && (!instance || container.__hmbSeedanceRetiredModeInstances?.has(instance))) return reject();
+  if (instance) {
+    if (baseline?.execution_mode_instance === instance) {
+      if (incoming.execution_mode_revision < baseline.execution_mode_revision
+        || incoming.execution_mode_state_revision < baseline.execution_mode_state_revision
+        || (incoming.execution_mode_revision === baseline.execution_mode_revision
+          && hmbSeedanceModeIntentKey(incoming) !== hmbSeedanceModeIntentKey(baseline))
+        || (incoming.execution_mode_state_revision === baseline.execution_mode_state_revision
+          && (incoming.execution_mode !== baseline.execution_mode
+            || incoming.execution_mode_revision !== baseline.execution_mode_revision))) return reject();
+    } else if (baseline) {
+      const retired = container.__hmbSeedanceRetiredModeInstances || new Set();
+      retired.add(baseline.execution_mode_instance);
+      container.__hmbSeedanceRetiredModeInstances = retired;
+      hmbSeedanceClearShotSelection(container, true);
+      delete container.__hmbSeedanceShotChangeError;
+      delete container.__hmbSeedanceModeSelectionError;
+      delete container.__hmbSeedanceUnconfirmedSelection;
+      hmbSeedanceNextChangeOwner(container);
+    }
+    const unconfirmed = container.__hmbSeedanceUnconfirmedSelection;
+    if (unconfirmed && instance === unconfirmed.expectedInstance
+      && incoming.execution_mode_revision > unconfirmed.expectedRevision
+      && incoming.execution_mode === unconfirmed.targetMode
+      && hmbSeedanceShotKey(incoming) === unconfirmed.targetKey) {
+      if (container.__hmbSeedanceModeSelectionError === unconfirmed.message) delete container.__hmbSeedanceModeSelectionError;
+      delete container.__hmbSeedanceUnconfirmedSelection;
+    }
+    // Store only backend authority. The optimistic selection payload keeps this
+    // baseline unchanged until a matching, newer intent is acknowledged.
+    if (!incoming.selection_request) container.__hmbSeedanceModeBaseline = incoming;
+    if (pending?.expectedInstance && baseline?.execution_mode_instance === instance) {
+      const targetMatches = incoming.execution_mode === pending.targetMode
+        && (pending.targetMode === "only" || hmbSeedanceShotKey(incoming) === pending.targetKey);
+      if (incoming.execution_mode_revision <= pending.expectedRevision) return reject();
+      // A newer authoritative selection may supersede this request. It must
+      // invalidate a rejected transport promise as well as the pending label.
+      if (targetMatches || incoming.execution_mode_revision > pending.expectedRevision) {
+        hmbSeedanceClearShotSelection(container);
+        return { props: incomingProps, stale: false };
+      }
+    }
+  }
+  if (!pending || incomingProps === retainedProps || pending.expectedInstance) return { props: incomingProps, stale: false };
   const catalogOlder = incoming.shot_catalog.channel_uuid === retained.shot_catalog.channel_uuid
     && Number(incoming.shot_catalog.generation || 0) < Number(retained.shot_catalog.generation || 0);
   const catalog = catalogOlder ? retained.shot_catalog : incoming.shot_catalog;
@@ -2260,7 +2410,7 @@ function hmbSeedancePreflightWidget(container,initialProps) {
   container.__hmbSeedancePreflightHandle=handle;syncSummary();return handle;
 }
 
-export default function HMBSeedanceGenerationWidget(container, props) {
+function hmbNativeUiImplementation(container, props) {
   if (!container) return { cleanup() {}, update() {} };
   if(hmbSeedancePreflightContainer(container,props))return hmbSeedancePreflightWidget(container,props);
   if (hmbSeedanceCommandProps(props) || hmbSeedanceCommandContainer(container)) {
@@ -2282,6 +2432,7 @@ export default function HMBSeedanceGenerationWidget(container, props) {
     return {
       cleanup: container.__hmbSeedanceCleanupProxy,
       update(nextProps) {
+        if (container.__hmbSeedanceCleanup !== previousCleanup) return;
         const incoming = nextProps || container.__hmbSeedanceLatestProps || {};
         const next = hmbSeedanceResolveShotEcho(container, incoming);
         if (!next.stale) hmbSeedanceNextChangeOwner(container);
@@ -2336,25 +2487,66 @@ export default function HMBSeedanceGenerationWidget(container, props) {
       number: selected.number,
       name: selected.name,
     };
+    if (previousState.execution_mode) {
+      if (!previousState.execution_mode_instance) { refresh(container, liveProps); return; }
+      next.selection_request = { schema: HMB_SEEDANCE_MODE_SELECTION_SCHEMA, version: 1,
+        expected_revision: previousState.execution_mode_revision,
+        expected_instance: previousState.execution_mode_instance, mode: selected.only ? "only" : "shot" };
+    }
     // An optimistic Shot change cannot carry the previous Shot's completed Draft.
     next.draft = hmbSeedanceDraftState({ cancel_available: next.draft.cancel_available, active_job_id: next.draft.active_job_id });
+    const optimisticProps = { ...liveProps, value: next, parameterValue: next, defaultValue: next };
+    if (previousState.execution_mode_instance && container.__hmbSeedancePendingShot?.expectedInstance) {
+      // Keep only the user's latest choice while one CAS request is awaiting
+      // acknowledgement. Sending it now would reuse the old intent revision.
+      const key = selected.only ? HMB_SHOT_ONLY_KEY : selected.key;
+      if (key === container.__hmbSeedancePendingShot.targetKey) delete container.__hmbSeedanceQueuedShot;
+      else container.__hmbSeedanceQueuedShot = { key, channel_uuid: selected.channel_uuid, shot_uuid: selected.shot_uuid };
+      container.__hmbSeedanceLatestProps = optimisticProps;
+      refresh(container, optimisticProps);
+      return;
+    }
     // Preserve the prior descriptor until retained mode has removed or
     // replaced the real edge. This prevents a cable flash during transition.
     const owner = hmbSeedanceNextChangeOwner(container);
     const previousKey = hmbSeedanceShotKey(previousState);
     const blockedKeys = new Set(container.__hmbSeedancePendingShot?.blockedKeys || []);
     blockedKeys.add(previousKey);
-    container.__hmbSeedancePendingShot = { targetKey: hmbSeedanceShotKey(next), blockedKeys };
-    const optimisticProps = { ...liveProps, value: next, parameterValue: next, defaultValue: next };
+    container.__hmbSeedancePendingShot = {
+      targetKey: selected.only ? HMB_SHOT_ONLY_KEY : selected.key, blockedKeys,
+      ...(previousState.execution_mode_instance ? {
+        expectedInstance: previousState.execution_mode_instance,
+        expectedRevision: previousState.execution_mode_revision,
+        targetMode: selected.only ? "only" : "shot",
+      } : {}),
+    };
+    if (previousState.execution_mode_instance) {
+      const ticket = container.__hmbSeedancePendingShot;
+      container.__hmbSeedanceShotSelectionTimeout = setTimeout(() => {
+        if (container.__hmbSeedancePendingShot !== ticket) return;
+        hmbSeedanceClearShotSelection(container, true);
+        hmbSeedanceNextChangeOwner(container);
+        const canonical = container.__hmbSeedanceModeBaseline || previousState;
+        const currentProps = container.__hmbSeedanceLatestProps || liveProps;
+        container.__hmbSeedanceLatestProps = { ...currentProps, value: canonical, parameterValue: canonical, defaultValue: canonical };
+        const message = "선택 적용 응답을 확인하지 못했습니다. 다시 선택하세요.";
+        container.__hmbSeedanceUnconfirmedSelection = { ...ticket, message };
+        container.__hmbSeedanceModeSelectionError = message;
+        refresh(container, container.__hmbSeedanceLatestProps);
+      }, HMB_SEEDANCE_PREVIEW_ACTION_WATCHDOG_MS);
+      container.__hmbSeedanceShotSelectionTimeout?.unref?.();
+    }
     const accept = () => {
       if (!hmbSeedanceOwnsChange(container, owner)) return;
       container.__hmbSeedanceLatestProps = optimisticProps;
       delete container.__hmbSeedanceShotChangeError;
+      delete container.__hmbSeedanceModeSelectionError;
+      delete container.__hmbSeedanceUnconfirmedSelection;
       refresh(container, optimisticProps);
     };
     const rollback = (error) => {
       if (!hmbSeedanceOwnsChange(container, owner)) return;
-      delete container.__hmbSeedancePendingShot;
+      hmbSeedanceClearShotSelection(container, true);
       container.__hmbSeedanceLatestProps = previousProps;
       container.__hmbSeedanceShotChangeError = String(
         error?.message || error || "Shot selection publication failed",
@@ -2365,6 +2557,21 @@ export default function HMBSeedanceGenerationWidget(container, props) {
     let result;
     try { result = liveProps.onChange(next); } catch (error) { rollback(error); return; }
     if (result && typeof result.then === "function") Promise.resolve(result).catch(rollback);
+  };
+  container.__hmbSeedanceFlushShotQueue = () => {
+    const queued = container.__hmbSeedanceQueuedShot;
+    if (!queued || container.__hmbSeedancePendingShot) return;
+    delete container.__hmbSeedanceQueuedShot;
+    const state = hmbSeedanceShotState(container.__hmbSeedanceLatestProps || {});
+    if (hmbSeedanceShotKey(state) === queued.key) return;
+    const target = hmbSeedanceShotOptions(state).find((option) => !option.waiting && option.key === queued.key);
+    if (!target) {
+      container.__hmbSeedanceModeSelectionError = "선택한 샷을 사용할 수 없습니다. 다시 선택하세요.";
+      hmbSeedanceSetStatus(container, container.__hmbSeedanceModeSelectionError);
+      return;
+    }
+    if (select) select.value = target.key;
+    onShotChange();
   };
   select?.addEventListener?.("change", onShotChange);
   const guardDelete = (event) => hmbGuardSelectedNodeKeyboardDelete(container, event);
@@ -2392,7 +2599,12 @@ export default function HMBSeedanceGenerationWidget(container, props) {
     if (container.__hmbSeedanceCleanup === cleanup) delete container.__hmbSeedanceCleanup;
     delete container.__hmbSeedanceLatestProps;
     delete container.__hmbSeedanceShotChangeError;
-    delete container.__hmbSeedancePendingShot;
+    hmbSeedanceClearShotSelection(container, true);
+    delete container.__hmbSeedanceFlushShotQueue;
+    delete container.__hmbSeedanceModeSelectionError;
+    delete container.__hmbSeedanceUnconfirmedSelection;
+    delete container.__hmbSeedanceModeBaseline;
+    delete container.__hmbSeedanceRetiredModeInstances;
     // Invalidate promise callbacks from this lifecycle without resetting the
     // monotonic token. A remount can otherwise reuse owner=1 and let an old
     // rejection roll the new selector back.
@@ -2403,6 +2615,7 @@ export default function HMBSeedanceGenerationWidget(container, props) {
   return {
     cleanup: container.__hmbSeedanceCleanupProxy,
     update(nextProps) {
+      if (container.__hmbSeedanceCleanup !== cleanup) return;
       const incoming = nextProps || container.__hmbSeedanceLatestProps || {};
       const next = hmbSeedanceResolveShotEcho(container, incoming);
       if (!next.stale) hmbSeedanceNextChangeOwner(container);
@@ -2412,4 +2625,113 @@ export default function HMBSeedanceGenerationWidget(container, props) {
       }
     },
   };
+}
+
+
+// HMB_NATIVE_DISABLED_ADAPTER_V1_BEGIN -- identical module-local adapter.
+const HMB_NATIVE_UI_CALLBACKS = new WeakMap();
+function hmbNativeUiReadCommand(value, kind) {
+  let v = value;
+  if (typeof v === "string") { try { v = JSON.parse(v); } catch { return false; } }
+  if (!v || typeof v !== "object") return false;
+  if (kind === "thumbnail") return v.schema === "hmb-image-asset-thumbnail-bridge"
+    && ["hydrate", "catalog_probe", "catalog_page"].includes(v.operation);
+  if (kind === "seedance") return (v.schema === "hmb-seedance-refresh-command"
+    && ["refresh_existing", "cancel_draft_final", "open_gallery"].includes(v.action))
+    || (v.schema === "hmb-seedance-render-preflight" && ["inspect", "cancel"].includes(v.action))
+    || (v.schema === "hmb-seedance-shot-ui" && v.request?.action === "refresh_existing");
+  if (kind === "agent") return v.schema === "hmb-agent-shot-row"
+    && ["refresh", "cancel_selected"].includes(v.action?.kind);
+  if (kind === "finish") return v.ui_transport?.schema === "hmb-finish-ui-transport"
+    && v.ui_transport.operation === "refresh";
+  if (kind === "lut") return (v.__hmb_color_lut_command__ || v).action === "cancel";
+  const command = v.__hmb_picker_command__ || v;
+  return ["picker", "picker-bridge"].includes(kind) && command.schema === "hmb-picker-command"
+    && (["stop_read", "cancel_pending", "cancel_video_import"].includes(command.action)
+      || (command.action === "video_tools" && command.payload?.op === "cancel"));
+}
+function hmbNativeUiContract(container, props, mount, policy) {
+  if (!container) return mount(container, props);
+  let c = container.__hmbNativeUiContract;
+  if (c && c.kind !== policy.kind) { c.proxy.cleanup(); c = null; }
+  if (!c) {
+    c = { kind: policy.kind, active: true, props: {}, handle: null, originals: new Map(), observer: null, listening: false };
+    const events = ["pointerdown", "mousedown", "click", "dblclick", "keydown", "beforeinput", "input", "change", "paste", "drop", "dragstart", "submit"];
+    c.allowed = target => Boolean(target?.matches?.("video,audio")) || Boolean(policy.allowControl?.(target, c.props, container));
+    c.guard = event => {
+      if (!c.active || !c.props.disabled || c.allowed(event.target)) return;
+      event.preventDefault?.(); event.stopImmediatePropagation?.(); event.stopPropagation?.();
+    };
+    c.restore = () => {
+      c.observer?.disconnect?.();
+      if (c.listening) { for (const name of events) container.removeEventListener?.(name, c.guard, true); c.listening = false; }
+      for (const [el, old] of c.originals) {
+        if ("disabled" in el && el.disabled !== old.disabled) el.disabled = old.disabled;
+        if (old.editable !== null && el.getAttribute?.("contenteditable") !== old.editable) el.setAttribute?.("contenteditable", old.editable);
+      }
+      c.originals.clear();
+    };
+    c.sync = () => {
+      // The normal enabled path adds no observers, DOM queries/writes or timers.
+      if (!c.active || !c.props.disabled) return;
+      if (!c.listening) { for (const name of events) container.addEventListener?.(name, c.guard, true); c.listening = true; }
+      for (const [el] of c.originals) if (container.contains && !container.contains(el)) c.originals.delete(el);
+      for (const el of container.querySelectorAll?.("button,input,select,textarea,[contenteditable='true']") || []) {
+        if (c.allowed(el)) continue;
+        if (!c.originals.has(el)) c.originals.set(el, { disabled: Boolean(el.disabled), editable: el.getAttribute?.("contenteditable") ?? null });
+        if ("disabled" in el && !el.disabled) el.disabled = true;
+        if (el.getAttribute?.("contenteditable") === "true") el.setAttribute?.("contenteditable", "false");
+      }
+      if (!c.observer) {
+        const Observer = container.ownerDocument?.defaultView?.MutationObserver;
+        if (Observer) c.observer = new Observer(() => c.sync());
+      }
+      c.observer?.observe?.(container, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled", "contenteditable"] });
+    };
+    c.wrap = () => {
+      const p = { ...c.props };
+      for (const name of ["onChange", "onCommand"]) if (typeof p[name] === "function") {
+        const callback = HMB_NATIVE_UI_CALLBACKS.get(p[name]) || p[name];
+        const fn = (...args) => {
+          if (!c.active) throw new Error("This widget is no longer mounted.");
+          if (c.props.disabled && !hmbNativeUiReadCommand(args[0], c.kind)) throw new Error("This control is disabled by Griptape.");
+          return callback?.(...args);
+        };
+        HMB_NATIVE_UI_CALLBACKS.set(fn, HMB_NATIVE_UI_CALLBACKS.get(p[name]) || p[name]); p[name] = fn;
+      }
+      return p;
+    };
+    c.proxy = {
+      update(nextProps) {
+        if (!c.active || c.closing) return;
+        c.restore(); c.props = nextProps || {}; const next = c.wrap();
+        if (typeof c.handle?.update === "function") c.handle.update(next);
+        else c.handle = mount(container, next);
+        c.sync();
+      },
+      cleanup() {
+        if (!c.active || c.closing) return; c.closing = true; c.restore();
+        try {
+          // Preserve the implementation's synchronous final authored-value flush.
+          if (typeof c.handle === "function") c.handle(); else c.handle?.cleanup?.();
+        } finally {
+          c.active = false;
+          if (container.__hmbNativeUiContract === c) delete container.__hmbNativeUiContract;
+        }
+      },
+    };
+    container.__hmbNativeUiContract = c;
+  }
+  c.restore(); c.props = props || c.props || {}; c.handle = mount(container, c.wrap()); c.sync(); return c.proxy;
+}
+// HMB_NATIVE_DISABLED_ADAPTER_V1_END
+
+export default function HMBSeedanceGenerationWidget(container, props) {
+  return hmbNativeUiContract(container, props, hmbNativeUiImplementation, { kind: "seedance", allowControl: (target, props) => {
+    const el = target?.closest?.("button,input,select,textarea") || target;
+    const state = hmbSeedanceShotState(props);
+    return Boolean(el?.matches?.("[data-hmb-seedance-preview-action]") && state.generation.action === "refresh_existing")
+      || Boolean(el?.matches?.("[data-hmb-seedance-finalize-draft]") && state.draft.cancel_available)
+      || Boolean(el?.matches?.("[data-preflight-open],[data-preflight-recheck],[data-preflight-cancel],[data-preflight-close]"));
+  } });
 }

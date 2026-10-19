@@ -559,7 +559,8 @@ assert.match(
   /function hmbApplyVideoPickerCompactHostSizing\([\s\S]*?hmbRestoreVideoPickerExpandedHostHeightPropagation\(container\)/,
   "compact sizing must restore expanded host-row declarations before measuring",
 );
-const factoryStart = widgetSource.indexOf("export default function");
+const factoryStart = widgetSource.includes("function hmbNativeUiImplementation(")
+  ? widgetSource.indexOf("function hmbNativeUiImplementation(") : widgetSource.indexOf("export default function");
 const cleanupStart = widgetSource.indexOf("const cleanup = () => {", factoryStart);
 const cleanupEnd = widgetSource.indexOf("container.__hmbVideoPickerCleanup = cleanup;", cleanupStart);
 const cleanupSource = widgetSource.slice(cleanupStart, cleanupEnd);

@@ -1483,7 +1483,10 @@ assert 'id="video-next-frame"' not in widget_source
 assert 'id="video-seek"' in widget_source
 assert "viewportVideo.loop = true" not in widget_source
 assert "media.loop = false;" in widget_source
-assert widget_source.count("ownerDocument?.defaultView?.MutationObserver") == 3
+# The new host-disabled adapter owns one separately tested lock-only observer.
+# Keep the original Picker geometry/lifecycle observer budget unchanged.
+picker_implementation_source = widget_source.split("// HMB_NATIVE_DISABLED_ADAPTER_V1_BEGIN", 1)[0]
+assert picker_implementation_source.count("ownerDocument?.defaultView?.MutationObserver") == 3
 assert "READ_PREVIEW_WIDTH" not in picker_source
 assert "READ_PREVIEW_HEIGHT" not in picker_source
 assert 'f"{scene_path.stem}_Orignal.mp4"' in picker_source

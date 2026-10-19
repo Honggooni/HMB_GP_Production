@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 const source = fs.readFileSync(new URL("../../widgets/HMBVideoPickerLibraryWidget_v032.js", import.meta.url), "utf8");
 const picker = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
-const factoryStart = source.indexOf("export default function HMBVideoPickerLibraryWidget");
+const factoryStart = source.includes("function hmbNativeUiImplementation(")
+  ? source.indexOf("function hmbNativeUiImplementation(") : source.indexOf("export default function HMBVideoPickerLibraryWidget");
 const listenerHelper = source.indexOf("  const on = ", factoryStart);
 const firstRegistration = source.indexOf("  on(", factoryStart);
 assert.ok(listenerHelper > factoryStart && firstRegistration > listenerHelper,

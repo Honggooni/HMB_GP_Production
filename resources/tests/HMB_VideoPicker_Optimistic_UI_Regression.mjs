@@ -116,7 +116,8 @@ for (const eventName of ["pointerdown", "mousedown", "click", "dblclick", "keydo
 // Static handler contracts complement the focused behavioral test: local DOM
 // feedback happens before publication, while structurally incomplete patches
 // retain the normal authoritative morph.
-const mainStart = widgetSource.indexOf("export default function HMBVideoPickerLibraryWidget");
+const mainStart = widgetSource.includes("function hmbNativeUiImplementation(")
+  ? widgetSource.indexOf("function hmbNativeUiImplementation(") : widgetSource.indexOf("export default function HMBVideoPickerLibraryWidget");
 assert.ok(mainStart >= 0);
 const main = widgetSource.slice(mainStart);
 assert.match(main, /outlinerSearchPublishTimer/);

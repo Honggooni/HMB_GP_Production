@@ -2,8 +2,8 @@
   "SPDXID": "SPDXRef-DOCUMENT",
   "spdxVersion": "SPDX-2.3",
   "dataLicense": "CC0-1.0",
-  "name": "HMB_GP_Production-0.8.7",
-  "documentNamespace": "https://hmb.local/spdx/HMB_GP_Production/0.8.7",
+  "name": "HMB_GP_Production-0.8.9",
+  "documentNamespace": "https://hmb.local/spdx/HMB_GP_Production/0.8.9",
   "creationInfo": {
     "created": "2026-08-05T00:00:00Z",
     "creators": [
@@ -15,7 +15,7 @@
     {
       "SPDXID": "SPDXRef-HMB-GP-Production",
       "name": "hmb-gp-production",
-      "versionInfo": "0.8.7",
+      "versionInfo": "0.8.9",
       "downloadLocation": "NOASSERTION",
       "filesAnalyzed": false,
       "licenseConcluded": "LicenseRef-HMB-Internal-1.0",
@@ -60,7 +60,8 @@
       "filesAnalyzed": false,
       "licenseConcluded": "Apache-2.0",
       "licenseDeclared": "Apache-2.0",
-      "copyrightText": "NOASSERTION"
+      "copyrightText": "NOASSERTION",
+      "comment": "Optional local-video upload runtime. Installed only in .venv-tos and executed in an isolated child interpreter; never an editor-process dependency."
     }
   ],
   "relationships": [
@@ -85,9 +86,10 @@
       "relatedSpdxElement": "SPDXRef-httpx"
     },
     {
-      "spdxElementId": "SPDXRef-HMB-GP-Production",
-      "relationshipType": "DEPENDS_ON",
-      "relatedSpdxElement": "SPDXRef-volcengine-tos"
+      "spdxElementId": "SPDXRef-volcengine-tos",
+      "relationshipType": "OPTIONAL_DEPENDENCY_OF",
+      "relatedSpdxElement": "SPDXRef-HMB-GP-Production",
+      "comment": "Only the explicitly selected TOS upload path requires this separate runtime."
     }
   ],
   "hasExtractedLicensingInfos": [

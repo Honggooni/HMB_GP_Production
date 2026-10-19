@@ -600,7 +600,7 @@ assert.deepEqual(
   assetModule.hmbNormalizeImageAssetState(feedbackState),
   "Local selection feedback must keep the live state canonical so an exact host echo skips remount.",
 );
-const assetInstallEventsSource = assetSource.match(/function installEvents\([\s\S]*?\n\}\n\nexport default function HMBImageAssetLibraryWidget/)?.[0] || "";
+const assetInstallEventsSource = assetSource.match(/function installEvents\([\s\S]*?\n\}\n\n(?:export default function HMBImageAssetLibraryWidget|function hmbNativeUiImplementation)/)?.[0] || "";
 assert.match(assetInstallEventsSource, /const assetsByLibraryId = new Map\(/, "Asset event installation must index cards in one linear pass.");
 assert.doesNotMatch(assetInstallEventsSource, /state\.assets\.find\(/, "Delegated card events must not rescan the full asset array.");
 const assetToggleSource = assetInstallEventsSource.match(/const toggleDelegatedAsset = \(card, asset\) => \{[\s\S]*?\n  \};/)?.[0] || "";

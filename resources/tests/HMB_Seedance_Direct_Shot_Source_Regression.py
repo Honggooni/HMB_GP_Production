@@ -1676,6 +1676,18 @@ preflight_image._validate_parameters(preflight_image_params)
 # validation runs. A validation-only sentinel permits scheduling; it never
 # mutates the real parameter value and runtime still rejects an empty result.
 preflight_only = object.__new__(target.HMBSeedanceGeneration)
+preflight_only.metadata = {}
+preflight_only_values = {
+    target.SHOT_CHANNEL_UUID_PARAMETER: "",
+    target.SHOT_UUID_PARAMETER: "",
+    target.SHOT_NUMBER_PARAMETER: 1,
+    target.SHOT_NAME_PARAMETER: target.SHOT_ONLY_LABEL,
+    target.SHOT_AUTOCLAIM_ENABLED_PARAMETER: False,
+}
+preflight_only.get_parameter_value = lambda name: preflight_only_values.get(name)
+# This fixture models an ordinary connected prompt, not a shared Shot manager.
+preflight_only._manual_agent_prompt_source = lambda: None
+assert preflight_only._hmb_seedance_execution_mode() == "only"
 preflight_only_base = valid_params()
 preflight_only._get_parameters = (  # type: ignore[method-assign]
     lambda: deepcopy(preflight_only_base)

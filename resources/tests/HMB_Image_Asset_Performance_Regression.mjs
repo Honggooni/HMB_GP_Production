@@ -2285,7 +2285,7 @@ try {
 }
 
 const installEventsSource = assetSource.match(
-  /function installEvents\([\s\S]*?\n\}\n\nexport default function HMBImageAssetLibraryWidget/,
+  /function installEvents\([\s\S]*?\n\}\n\n(?:export default function HMBImageAssetLibraryWidget|function hmbNativeUiImplementation)/,
 )?.[0] || "";
 const toggleSource = installEventsSource.match(
   /const toggle = \(\) => \{[\s\S]*?\n    \};/,

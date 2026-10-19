@@ -95,7 +95,7 @@ jobs:
           )
           $forbidden = @($tracked | Where-Object {
             if ($approvedAgentRuntimeMembers -ccontains $_) { return $false }
-            $_ -match '(^|/)(\.tmp|\.venv|backups|dist|GriptapeNodes|resources/agent|resources/policy|policies?)/' -or
+            $_ -match '(^|/)(\.tmp|\.venv(?:-tos)?|backups|dist|GriptapeNodes|resources/agent|resources/policy|policies?)/' -or
             $_ -match '(^|/)hmb_agent_core\.dat$' -or
             $_ -match '(?i)(^|/)HMB_Agent_Polic(?:y|ies)[^/]*\.(txt|tex|md)$' -or
             $_ -match '(policy|policies).*(?:_ko(?:\.|$)|korean)' -or
@@ -107,8 +107,8 @@ jobs:
           if ($forbidden.Count -ne 0) {
             throw "Forbidden private/generated tracked paths: $($forbidden -join ', ')"
           }
-      - name: Install pinned direct dependencies
-        run: python -m pip install "Pillow==12.3.0" "imageio-ffmpeg==0.6.0" "httpx==0.28.1" "tos==2.9.2"
+      - name: Install pinned direct and audit dependencies
+        run: python -m pip install "Pillow==12.3.0" "imageio-ffmpeg==0.6.0" "httpx==0.28.1" "packaging==26.3"
       - name: Install pinned media probe for real stream-copy regressions
         shell: pwsh
         run: |
@@ -237,18 +237,17 @@ jobs:
           @(
             "## HMB GP Production $releaseLabel",
             "",
-            "- Consolidates Prompt, Agent and Finish Look shot management, including legacy-workflow migration that preserves shot inputs and connections. Keeps the existing palette, responsive layouts and Prompt start size, with faster selection and reduced redundant updates.",
-            "- Hardens ImageAsset-to-Prompt source synchronization and library deletion, recreation and saved-workflow hydration. Stale source updates and acknowledgements cannot replace a newer shot selection.",
-            "- Adapts the HMB Agent to the Standard Agent's native three-argument execution call and discovers the installed Standard Agent catalog and dependencies without introducing a separate model list.",
-            "- Restores Project (Only) selection for standalone Generators, including workflows saved with the previous team release. Only generation requires an explicit project; optional project-policy availability remains informational.",
-            "- Connects native MOV/MP4 previews to the original completed local file, including rerender completion and saved-workflow reopening. Preserves original media bytes, Task IDs and authored settings, and avoids repeated preview reloads on status echoes.",
-            "- Improves saved-task retrieval, local-save recovery and render preflight feedback. Existing tasks are reused when retrieving results, while uncertain submissions remain protected against automatic duplicate renders.",
+            "- Isolates optional TOS uploads in a dedicated .venv-tos child interpreter. TOS and its wrapt pin no longer replace editor-process dependencies. The installer migrates legacy environments while retaining a rollback copy.",
+            "- Applies Griptape's disabled state to all nine HMB widgets, including same-value updates and retired callbacks. Playback, available result retrieval and cancellation remain usable; existing palettes, dimensions and native local-video previews are preserved.",
+            "- Isolates a Shot's HMB render admission failure before managed Agent execution or generation submission. A waiting binding, missing project or invalid option skips that Shot while healthy peers continue. Native structural validation remains authoritative.",
+            "- Persists explicit Only and exact Shot identity through save/open, source deletion, recreation and rapid selection. Only stays independent; a waiting Shot cannot silently switch to a different UUID. Metadata-free legacy workflows retain automatic routing compatibility.",
+            "- Preserves the existing Standard Agent native adapter and model catalog, original local MOV/MP4 files, Task IDs, project selections and same-task recovery protections.",
             "- Retains authored 480p/Draft settings, the explicit one-use Draft final action, mode-preserving web rerenders, reference media and the bundled signed Superwings12 v7.0 policy. Other project policies retain their existing preparation status.",
             "- Expands registered Python, JavaScript, browser and offline native-host regressions for lifecycle, migration, playback and submission contracts. Refer to this audit run's coverage receipts for actual pass, failure and not-run counts; manual SDK/DCC checks are counted only when executed.",
             "- Release validation does not submit new paid provider generations or deploy the Broker. Offline render-state and request-contract tests do not establish provider availability, LLM policy reasoning or animation aesthetic quality.",
             "- Includes SHA256 integrity checks and audited even-to-team-release functional parity. Private policy sources, signing material, credentials and local reports are excluded from the runtime distribution.",
             "",
-            "Close Griptape completely before running the included installer."
+            "Close Griptape completely and run the included Install_HMB_GP_Production.ps1 after extracting the Runtime ZIP. File-only replacement does not remove legacy editor-environment dependencies. Existing TOS installations prepare the isolated runtime automatically; a fresh TOS installation can use -PrepareTosRuntime. Package downloads occur only during this explicit setup, never during rendering. Normal installation exceptions restore the prior library and environment."
           ) | Set-Content -LiteralPath $notesPath -Encoding utf8
           gh release view $env:GITHUB_REF_NAME --repo $repository *> $null
           if ($LASTEXITCODE -eq 0) {

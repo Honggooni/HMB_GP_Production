@@ -3,6 +3,62 @@
   "version": 1,
   "tests": [
     {
+      "name": "HMB_TOS_Installer_Isolation_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Local_Preflight_Isolation_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_TOS_Isolation_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Native_Widget_Disabled_Contract_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Shot_Routing_Five_Shot_Local_Failure_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Actual SDK whole-Flow execution verifies invalid Shot admission is locally skipped before counted model/generation boundaries while four healthy exact-UUID peers continue; no provider or live transport."
+    },
+    {
+      "name": "HMB_Seedance_Execution_Mode_Host_Regression.py",
+      "mode": "manual",
+      "coverage": "installed_sdk",
+      "required": false,
+      "reason": "Actual installed SDK cold metadata-mode save/open, Only/Shot/waiting lifecycle and native StartFlow validation with provider and live transport denied."
+    },
+    {
+      "name": "HMB_Seedance_Explicit_Only_Mode_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
+      "name": "HMB_Seedance_Execution_Mode_Widget_Regression.mjs",
+      "mode": "ci",
+      "coverage": "host_browser",
+      "required": true
+    },
+    {
+      "name": "HMB_Shot_Routing_Explicit_Only_Regression.py",
+      "mode": "ci",
+      "coverage": "python_contract",
+      "required": true
+    },
+    {
       "name": "HMB_Agent_Native_Adapter_Arity_Regression.py",
       "mode": "ci",
       "coverage": "python_contract",

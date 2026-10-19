@@ -279,7 +279,7 @@
     ],
     "author": "HMB Pipeline",
     "description": "Funny HMB_GP_Production",
-    "library_version": "0.8.7",
+    "library_version": "0.8.9",
     "engine_version": "0.93.0",
     "agent_policy_delivery": {
       "archive_source_count": 44,
@@ -468,8 +468,7 @@
       "pip_dependencies": [
         "imageio-ffmpeg==0.6.0",
         "Pillow==12.3.0",
-        "httpx==0.28.1",
-        "tos==2.9.2"
+        "httpx==0.28.1"
       ]
     }
   },
