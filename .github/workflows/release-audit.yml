@@ -114,8 +114,25 @@ jobs:
         run: |
           # imageio-ffmpeg supplies FFmpeg, but not the FFprobe stream metadata
           # required to test lossless stream copy without mocking the media tool.
-          choco install ffmpeg --version=8.1.1 --yes --no-progress --limit-output
-          if ($LASTEXITCODE -ne 0) { throw "Could not install the CI media tools." }
+          # FFmpeg's download page lists Gyan's Windows builds. Pin both the
+          # release asset and its SHA256 so a package-feed outage cannot bypass
+          # or prevent the actual media checks.
+          $mediaRoot = Join-Path $env:RUNNER_TEMP 'hmb-ffmpeg-8.1.1'
+          $archive = Join-Path $env:RUNNER_TEMP 'hmb-ffmpeg-8.1.1-essentials.zip'
+          $url = 'https://github.com/GyanD/codexffmpeg/releases/download/8.1.1/ffmpeg-8.1.1-essentials_build.zip'
+          Invoke-WebRequest -Uri $url -OutFile $archive -MaximumRetryCount 2 -RetryIntervalSec 3
+          $expected = '6f58ce889f59c311410f7d2b18895b33c03456463486f3b1ebc93d97a0f54541'
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expected) {
+            throw 'The pinned CI media archive failed its SHA256 check.'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $mediaRoot -Force
+          $bin = Join-Path $mediaRoot 'ffmpeg-8.1.1-essentials_build/bin'
+          if (-not (Test-Path -LiteralPath (Join-Path $bin 'ffprobe.exe')) -or
+              -not (Test-Path -LiteralPath (Join-Path $bin 'ffmpeg.exe'))) {
+            throw 'The pinned CI media tools are missing.'
+          }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Encoding utf8 -Value $bin
+          $env:PATH = "$bin;$env:PATH"
           ffprobe -version
           if ($LASTEXITCODE -ne 0) { throw "FFprobe is unavailable in the CI PATH." }
           $ffmpeg = (Get-Command ffmpeg -ErrorAction Stop).Source
